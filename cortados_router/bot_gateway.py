@@ -501,6 +501,11 @@ class Gateway:
         if a.get("permission_mode") not in ALLOWED_PERMISSION_MODES or a.get("allowed_tools") not in (None, [], ""):
             self._refuse("start_task", "permission_mode other than 'plan' and allowed_tools are refused until the "
                                        "per-user boundary (phase 2 B5) ships: children run as the owner's user")
+        if any(a.get(k) not in (None, "") for k in ("repo", "branch", "host")):
+            # Refused, not dropped: the gateway builds the child's arguments itself (cwd confined below), so a silently
+            # ignored repo/branch/host would run the task somewhere other than the bot asked. Full access is #86.
+            self._refuse("start_task", "repo, branch and host are not offered through the bot gateway yet (#86): "
+                                       "pass cwd inside the gateway's workspace root")
         cwd = self._confined(a.get("cwd"))
         if cwd is None:
             self._refuse("start_task", "cwd must be an absolute path inside the gateway's workspace root")
@@ -608,10 +613,11 @@ def tool_list(offered=PHASE1) -> list:
             continue
         if t["name"] == "start_task":
             t = json.loads(json.dumps(t))
-            for k in ("chrome", "connectors", "orchestrator", "permission_mode", "allowed_tools"):
+            for k in ("chrome", "connectors", "orchestrator", "permission_mode", "allowed_tools", "repo", "branch", "host"):
                 t["inputSchema"]["properties"].pop(k, None)
+            t["inputSchema"]["required"] = ["task", "cwd"]
             t["description"] += (" (Bot gateway: cwd must be inside the gateway's workspace root; no chrome, no model "
-                                 "pins, no pre-approved tools.)")
+                                 "pins, no pre-approved tools, no repo/branch/host.)")
         elif t["name"] == "route_task":
             t = json.loads(json.dumps(t))
             t["inputSchema"]["properties"].pop("model", None)

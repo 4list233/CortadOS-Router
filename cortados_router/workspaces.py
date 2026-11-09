@@ -1,0 +1,499 @@
+"""Task workspaces on an execution host (owner decision 2026-11-08, issues #86/#89; layout: ~/CortadOS/README.md there).
+
+  <root>/repos/<name>      one clone per repository; every task worktree branches from it
+  <root>/active/<task_id>  the task's working folder while it runs: a git worktree, or a plain folder (no repo)
+  <root>/archive/<task_id> finished and pushed (or no repository): deleted by cleanup_archive() after ARCHIVE_AGE_S
+  <root>/held/<task_id>    finished with unpushed work: never deleted automatically, listed for the owner
+  <root>/index.jsonl       one line per task (rewritten in place under index.lock, never appended twice for a task)
+
+Only archive/ is ever deleted from, only entries named like a task id, only regular directories directly inside it
+(never a symlink, never through one), only with an index record saying `archived` long enough ago. held/, repos/,
+services/ and everything else are never touched: cleanup_archive() refuses them by construction, not by convention.
+
+Stdlib only. git runs as a subprocess with GIT_TERMINAL_PROMPT=0 (an unauthenticated clone fails instead of hanging).
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import stat
+import subprocess
+import tempfile
+import time
+
+ARCHIVE_AGE_S = 3 * 24 * 3600       # owner decision 2026-11-08: archived (pushed) work is kept three days, then deleted
+TASK_ID_RE = re.compile(r"t\d{14}-[0-9a-f]{8}")     # child_tasks.TASK_ID_RE; repeated here so this module stands alone
+# A clone directory name under repos/: from the URL's last path segment. Dots, dashes and underscores as git hosts
+# allow; no leading dot or dash (hidden dirs, option-looking names); 64 is plenty for any repository name.
+REPO_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+# git check-ref-format, the subset we accept: no control chars/space/~^:?*[\ , no "..", no "@{", no leading "-" or "/",
+# no trailing "/", ".lock" or "."; 128 chars is our bound (a branch name longer than that is pasted text, not a name).
+BRANCH_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/-]{0,127}")
+TASK_BRANCH_PREFIX = "task/"        # a task that names no branch works on task/<task_id>, never on the default branch
+# Timeouts (seconds). A clone over the tailnet of a large repository takes minutes; past these it is stuck, not slow.
+CLONE_TIMEOUT_S = 900
+FETCH_TIMEOUT_S = 300
+GIT_TIMEOUT_S = 60                  # local operations: worktree add/move/remove, status, rev-list
+CLEANUP_MAX_DELETIONS = 100          # daily cleanup stays bounded even after a long outage
+CLEANUP_MAX_SECONDS = 300            # held moves and failures consume this budget too
+GIT = "git"                          # resolved on PATH at call time (the execution host's PATH is set by its entry)
+SUBDIRS = ("repos", "active", "archive", "held")
+
+
+class WorkspaceError(Exception):
+    pass
+
+
+def _git(args, cwd=None, timeout=GIT_TIMEOUT_S) -> str:
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        p = subprocess.run([GIT, *args], cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
+    except FileNotFoundError:
+        raise WorkspaceError("git is not installed or not on PATH on this execution host") from None
+    except subprocess.TimeoutExpired:
+        raise WorkspaceError(f"git {args[0]} did not finish within {timeout} s") from None
+    if p.returncode != 0:
+        raise WorkspaceError(f"git {' '.join(args[:2])} failed (exit {p.returncode}): {p.stderr.strip()[-400:]}")
+    return p.stdout
+
+
+def parse_repo(repo):
+    """(url, name) for a `repo` argument: a clone URL/path (anything with '://', 'git@...' or a '/' in it) gives both;
+    a bare name gives (None, name) and must already be cloned under repos/."""
+    if not isinstance(repo, str) or not repo.strip():
+        raise WorkspaceError("repo must be a clone URL (https://..., git@host:owner/name.git) or the name of an existing clone")
+    repo = repo.strip()
+    if any(c.isspace() for c in repo) or repo.startswith("-"):
+        raise WorkspaceError(f"repo {repo!r} is not a clone URL or a clone name")
+    is_url = "://" in repo or repo.startswith("git@") or "/" in repo or ":" in repo
+    last = repo.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1] if is_url else repo
+    name = last[:-4] if last.endswith(".git") else last
+    if not REPO_NAME_RE.fullmatch(name):
+        raise WorkspaceError(f"cannot derive a clone name from repo {repo!r}: the last path segment must match "
+                             f"{REPO_NAME_RE.pattern}")
+    return (repo if is_url else None), name
+
+
+def check_branch(branch) -> str:
+    if not isinstance(branch, str) or not BRANCH_RE.fullmatch(branch) or ".." in branch or "@{" in branch \
+            or branch.endswith(("/", ".lock", ".")) or "//" in branch:
+        raise WorkspaceError(f"branch {branch!r} is not a valid git branch name")
+    return branch
+
+
+def ensure_root(root: str) -> str:
+    """The workspace root must already exist (it is the host's layout, created by its owner); its four subdirectories
+    are created if missing. index.jsonl is created on first write."""
+    if not os.path.isdir(root):
+        raise WorkspaceError(f"workspace root {root} does not exist on this execution host")
+    for sub in SUBDIRS:
+        os.makedirs(os.path.join(root, sub), exist_ok=True)
+    return root
+
+
+def workspace_spec(task_id: str, repo=None, branch=None) -> dict:
+    """What the runner will prepare: validated now (so start_task refuses a bad name at once), executed by prepare()
+    later (a clone can take minutes; start_task must answer in seconds)."""
+    if not TASK_ID_RE.fullmatch(task_id):
+        raise WorkspaceError(f"invalid task id {task_id!r}")
+    if repo is None:
+        if branch is not None:
+            raise WorkspaceError("branch needs repo")
+        return {"kind": "folder", "task_id": task_id}
+    url, name = parse_repo(repo)
+    return {"kind": "repo", "task_id": task_id, "url": url, "name": name,
+            "branch": check_branch(branch) if branch is not None else None}
+
+
+def _worktree_branches(repo_dir: str) -> dict:
+    """{branch: worktree path} for every worktree of the clone (git worktree list --porcelain)."""
+    out = _git(["worktree", "list", "--porcelain"], cwd=repo_dir)
+    found, path = {}, None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line.startswith("branch refs/heads/") and path:
+            found[line[len("branch refs/heads/"):]] = path
+    return found
+
+
+def _ref_exists(repo_dir: str, ref: str) -> bool:
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    p = subprocess.run([GIT, "rev-parse", "--verify", "--quiet", ref], cwd=repo_dir, capture_output=True, text=True,
+                       timeout=GIT_TIMEOUT_S, env=env)
+    return p.returncode == 0
+
+
+def prepare(spec: dict, root: str) -> dict:
+    """Create the task's working folder under <root>/active/ and return its record (written to the task dir as
+    workspace.json and to index.jsonl). repo: clone into repos/<name> if absent, fetch, then add a worktree."""
+    ensure_root(root)
+    tid = spec["task_id"]
+    path = os.path.join(root, "active", tid)
+    if os.path.lexists(path):
+        raise WorkspaceError(f"{path} already exists")
+    rec = {"task_id": tid, "kind": spec["kind"], "path": path, "state": "active", "created_at": time.time()}
+    if spec["kind"] == "folder":
+        os.mkdir(path)
+        return rec
+    name, url, branch = spec["name"], spec.get("url"), spec.get("branch")
+    repo_dir = os.path.join(root, "repos", name)
+    lock = os.open(os.path.join(root, "repos", f".{name}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        return _prepare_repo_locked(rec, tid, path, repo_dir, name, url, branch, root)
+    finally:
+        os.close(lock)
+
+
+def _prepare_repo_locked(rec, tid, path, repo_dir, name, url, branch, root):
+    """Clone/fetch/add while holding repos/.<name>.lock."""
+    if os.path.islink(repo_dir):
+        raise WorkspaceError(f"repos/{name} is a symlink; refusing to use it")
+    if not os.path.isdir(repo_dir):
+        if not url:
+            raise WorkspaceError(f"no clone named {name!r} under {os.path.join(root, 'repos')}; pass the clone URL as repo")
+        _git(["clone", "--", url, repo_dir], timeout=CLONE_TIMEOUT_S)
+    else:
+        if url:
+            have = _git(["remote", "get-url", "origin"], cwd=repo_dir).strip()
+            if have != url and have != url.rstrip("/") and have + ".git" != url and have != url + ".git":
+                raise WorkspaceError(f"repos/{name} is a clone of {have}, not {url}; use that URL or another name")
+        _git(["fetch", "--prune", "origin"], cwd=repo_dir, timeout=FETCH_TIMEOUT_S)
+    if not _ref_exists(repo_dir, "refs/remotes/origin/HEAD"):
+        _git(["remote", "set-head", "origin", "--auto"], cwd=repo_dir, timeout=FETCH_TIMEOUT_S)
+    taken = _worktree_branches(repo_dir)
+    if branch is None:
+        branch = TASK_BRANCH_PREFIX + tid
+        _git(["worktree", "add", "-b", branch, "--", path, "origin/HEAD"], cwd=repo_dir)
+    elif branch in taken:
+        raise WorkspaceError(f"branch {branch!r} is checked out by another worktree ({taken[branch]}); wait for that "
+                             "task or name another branch")
+    elif _ref_exists(repo_dir, "refs/heads/" + branch):
+        if _ref_exists(repo_dir, "refs/remotes/origin/" + branch):
+            counts = _git(["rev-list", "--left-right", "--count",
+                           branch + "...origin/" + branch], cwd=repo_dir).split()
+            if len(counts) != 2:
+                raise WorkspaceError(f"could not compare local branch {branch!r} with origin/{branch}")
+            local_only, remote_only = map(int, counts)
+            if local_only and remote_only:
+                raise WorkspaceError(f"local branch {branch!r} has diverged from origin/{branch}; refusing to reset "
+                                     "or discard either history")
+            if not local_only and remote_only:
+                _git(["branch", "-f", branch, "origin/" + branch], cwd=repo_dir)
+        # A local branch is owner work even when a remote branch has the same name. Check it out unchanged; never use
+        # `-B`, because resetting to the remote can discard commits that have not been published.
+        _git(["worktree", "add", "--", path, branch], cwd=repo_dir)
+    elif _ref_exists(repo_dir, "refs/remotes/origin/" + branch):
+        _git(["worktree", "add", "-b", branch, "--", path, "origin/" + branch], cwd=repo_dir)
+    else:
+        _git(["worktree", "add", "-b", branch, "--", path, "origin/HEAD"], cwd=repo_dir)   # a new branch
+    rec.update(repo=name, url=url or _git(["remote", "get-url", "origin"], cwd=repo_dir).strip(),
+               repo_dir=repo_dir, branch=branch)
+    return rec
+
+
+def pushed(path: str):
+    """(True, "pushed") only after fresh remote refs prove every byte and commit is published.
+
+    Any git or fetch failure is uncertainty, so the caller holds the workspace rather than risking owner data.
+    """
+    try:
+        remotes = _git(["remote"], cwd=path).split()
+        if not remotes:
+            return False, "could not assess the worktree: it has no remote"
+        for remote in remotes:
+            # An explicit all-heads refspec also prunes stale refs excluded by a locally narrowed fetch refspec.
+            _git(["fetch", "--prune", remote,
+                  f"+refs/heads/*:refs/remotes/{remote}/*"], cwd=path, timeout=FETCH_TIMEOUT_S)
+        submodules = _git(["ls-files", "--stage"], cwd=path)
+        if any(line.startswith("160000 ") for line in submodules.splitlines()):
+            return False, "submodule content cannot be proven published; holding the workspace"
+        # Ignored content is owner data too. No cache (including __pycache__ or node_modules) is exempt: generated and
+        # unpublished content cannot be distinguished safely here, and holding is the required conservative default.
+        flagged = _git(["ls-files", "-v"], cwd=path)
+        hidden = [line for line in flagged.splitlines() if line and (line[0].islower() or line[0] == "S")]
+        if hidden:
+            return False, f"{len(hidden)} tracked file(s) hidden by assume-unchanged or skip-worktree"
+        dirty = _git(["status", "--porcelain", "--untracked-files=all", "--ignored=matching"], cwd=path)
+        if dirty.strip():
+            n = len(dirty.splitlines())
+            return False, f"{n} uncommitted or untracked file(s), including ignored content"
+        ahead = _git(["rev-list", "HEAD", "--not", "--remotes"], cwd=path)
+        if ahead.strip():
+            return False, f"{len(ahead.split())} commit(s) not on any remote"
+    except WorkspaceError as exc:
+        return False, f"could not assess the worktree: {exc}"
+    return True, "pushed"
+
+
+def settle(rec: dict, root: str) -> dict:
+    """Move a finished task's folder out of active/: to archive/ when it is pushed or had no repository, else to
+    held/. Returns the updated record (state archived|held, or still active with `error` if the move failed, in which
+    case the folder stays where it is and nothing is deleted)."""
+    rec = dict(rec)
+    path = rec.get("path")
+    if rec.get("state") != "active" or not path:
+        return rec
+    if not os.path.isdir(path):
+        rec.update(state="missing", settled_at=time.time(), reason="the working folder no longer exists")
+        return rec
+    if rec.get("kind") == "repo":
+        ok, reason = pushed(path)
+    else:
+        ok = not _contains_git_entry(path)
+        reason = "no repository" if ok else "plain folder contains a nested .git entry"
+    dest_dir = os.path.join(root, "archive" if ok else "held")
+    dest = os.path.join(dest_dir, rec["task_id"])
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        if os.path.lexists(dest):
+            raise WorkspaceError(f"{dest} already exists")
+        if rec.get("kind") == "repo" and os.path.isdir(rec.get("repo_dir") or ""):
+            _git(["worktree", "move", "--", path, dest], cwd=rec["repo_dir"])   # keeps the worktree valid at its new path
+        else:
+            os.rename(path, dest)
+    except (OSError, WorkspaceError) as exc:
+        rec["error"] = f"could not move {path} to {dest}: {exc}"
+        return rec
+    rec.update(state="archived" if ok else "held", path=dest, settled_at=time.time(), reason=reason)
+    return rec
+
+
+# --- index.jsonl: one line per task ------------------------------------------------------------------------------
+
+def index_path(root: str) -> str:
+    return os.path.join(root, "index.jsonl")
+
+
+def read_index(root: str) -> dict:
+    """{task_id: record}; a line that is not a JSON object with a task_id is skipped (it is reported by cleanup)."""
+    out = {}
+    try:
+        with open(index_path(root), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and isinstance(rec.get("task_id"), str):
+                    out[rec["task_id"]] = rec
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def update_index(root: str, rec: dict) -> None:
+    """Replace (or add) the task's line, atomically, under index.lock (the runner and a cleanup may write at once)."""
+    if not isinstance(rec.get("task_id"), str):
+        raise WorkspaceError("an index record needs a task_id")
+    lock = os.open(os.path.join(root, "index.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        recs = read_index(root)
+        recs[rec["task_id"]] = {k: v for k, v in rec.items() if k != "error"} if "error" not in rec else dict(rec)
+        fd, tmp = tempfile.mkstemp(prefix=".index.", suffix=".tmp", dir=root)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for tid in sorted(recs):
+                    f.write(json.dumps(recs[tid], sort_keys=True) + "\n")
+            os.replace(tmp, index_path(root))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
+    finally:
+        os.close(lock)
+
+
+# --- cleanup: archive/ only -------------------------------------------------------------------------------------
+
+def _open_dir(path: str, *, dir_fd=None) -> int:
+    """Open a real directory without following its final component."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    return os.open(path, flags, dir_fd=dir_fd)
+
+
+def _same_entry(fd: int, path: str) -> bool:
+    """Whether path still names the directory held by fd (all ancestors included)."""
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    opened = os.fstat(fd)
+    return (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino)
+
+
+def _remove_tree_fd(directory_fd: int) -> None:
+    """Remove a directory's contents relative to an already verified descriptor, never through a symlink."""
+    for name in os.listdir(directory_fd):
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            child_fd = _open_dir(name, dir_fd=directory_fd)
+            try:
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    raise WorkspaceError(f"directory entry {name!r} changed while opening it")
+                _remove_tree_fd(child_fd)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def _contains_git_entry(path: str) -> bool:
+    """Find a .git entry at any depth without traversing symlinks."""
+    for directory, dirs, files in os.walk(path, followlinks=False):
+        if ".git" in dirs or ".git" in files:
+            return True
+        dirs[:] = [name for name in dirs if not os.path.islink(os.path.join(directory, name))]
+    return False
+
+
+def _fd_contains_git_entry(directory_fd: int) -> bool:
+    for name in os.listdir(directory_fd):
+        if name == ".git":
+            return True
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            child_fd = _open_dir(name, dir_fd=directory_fd)
+            try:
+                if _fd_contains_git_entry(child_fd):
+                    return True
+            finally:
+                os.close(child_fd)
+    return False
+
+
+def _prune_worktrees(rec: dict) -> None:
+    repo_dir = rec.get("repo_dir")
+    if rec.get("kind") == "repo" and isinstance(repo_dir, str) and os.path.isdir(repo_dir):
+        try:
+            _git(["worktree", "prune", "--expire", "now"], cwd=repo_dir)
+        except WorkspaceError:
+            pass  # The data operation is complete; stale administrative metadata is safe and can be pruned later.
+
+
+def _hold_changed_archive(root: str, archive_fd: int, name: str, rec: dict, reason: str, now: float) -> dict:
+    """Move a newly changed archived worktree to held/ using anchored source and destination descriptors."""
+    held_path = os.path.join(root, "held", name)
+    held_fd = _open_dir(os.path.join(root, "held"))
+    try:
+        try:
+            os.stat(name, dir_fd=held_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise WorkspaceError(f"held/{name} already exists; archived workspace was not deleted")
+        os.rename(name, name, src_dir_fd=archive_fd, dst_dir_fd=held_fd)
+    finally:
+        os.close(held_fd)
+    updated = {**rec, "state": "held", "path": held_path, "settled_at": now, "reason": reason}
+    update_index(root, updated)
+    repo_dir = rec.get("repo_dir")
+    if rec.get("kind") == "repo" and isinstance(repo_dir, str) and os.path.isdir(repo_dir):
+        try:
+            _git(["worktree", "repair", held_path], cwd=repo_dir)
+        except WorkspaceError:
+            pass  # The workspace is safely held; repair is administrative and must not put data back at risk.
+    return updated
+
+
+def cleanup_archive(root: str, now=None, max_deletions=CLEANUP_MAX_DELETIONS, max_seconds=CLEANUP_MAX_SECONDS) -> dict:
+    """Serialize reassessment through deletion so a concurrent cleanup cannot move an entry being deleted."""
+    lock = os.open(os.path.join(root, "cleanup.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _cleanup_archive_locked(root, now=now, max_deletions=max_deletions, max_seconds=max_seconds)
+    finally:
+        os.close(lock)
+
+
+def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELETIONS,
+                            max_seconds=CLEANUP_MAX_SECONDS) -> dict:
+    """Delete old recorded archive entries through no-follow directory descriptors.
+
+    Repository worktrees are reassessed immediately before deletion. Any change, stale remote, or assessment failure
+    moves the workspace to held/. held/, repos/, services/, and a replacement archive ancestor are never traversed.
+    """
+    started = time.monotonic()
+    now = time.time() if now is None else now
+    archive = os.path.join(root, "archive")
+    out = {"deleted": [], "kept": 0, "refused": [], "errors": []}
+    try:
+        archive_fd = _open_dir(archive)
+    except OSError as exc:
+        out["errors"].append(f"{archive} is not a real directory; nothing deleted ({exc})")
+        return out
+    try:
+        index = read_index(root)
+        names = sorted(os.listdir(archive_fd))
+        for pos, name in enumerate(names):
+            if max_seconds is not None and time.monotonic() - started >= max_seconds:
+                out["kept"] += len(names) - pos
+                break
+            if not TASK_ID_RE.fullmatch(name):
+                out["refused"].append(f"{name}: not a task id")
+                continue
+            try:
+                info = os.stat(name, dir_fd=archive_fd, follow_symlinks=False)
+            except OSError as exc:
+                out["errors"].append(f"{name}: {type(exc).__name__}: {exc}")
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                out["refused"].append(f"{name}: symlink")
+                continue
+            if not stat.S_ISDIR(info.st_mode):
+                out["refused"].append(f"{name}: not a directory")
+                continue
+            rec = index.get(name)
+            if not isinstance(rec, dict) or rec.get("state") != "archived" \
+                    or not isinstance(rec.get("settled_at"), (int, float)):
+                out["refused"].append(f"{name}: no archive record in index.jsonl")
+                continue
+            if now - rec["settled_at"] < ARCHIVE_AGE_S:
+                out["kept"] += 1
+                continue
+            if max_deletions is not None and len(out["deleted"]) >= max_deletions:
+                out["kept"] += 1
+                continue
+            entry_fd = None
+            try:
+                entry_fd = _open_dir(name, dir_fd=archive_fd)
+                path = os.path.join(archive, name)
+                if not _same_entry(entry_fd, path):
+                    raise WorkspaceError("archive path changed after it was opened; refusing deletion")
+                if rec.get("kind") == "folder" and _fd_contains_git_entry(entry_fd):
+                    _hold_changed_archive(root, archive_fd, name, rec,
+                                          "plain folder contains a nested .git entry", now)
+                    out["kept"] += 1
+                    continue
+                if rec.get("kind") == "repo":
+                    ok, reason = pushed(path)
+                    if not _same_entry(entry_fd, path):
+                        raise WorkspaceError("archive path changed during reassessment; refusing deletion")
+                    if not ok:
+                        _hold_changed_archive(root, archive_fd, name, rec, reason, now)
+                        out["kept"] += 1
+                        continue
+                _remove_tree_fd(entry_fd)
+                os.close(entry_fd)
+                entry_fd = None
+                os.rmdir(name, dir_fd=archive_fd)
+                _prune_worktrees(rec)
+            except (OSError, WorkspaceError) as exc:
+                out["errors"].append(f"{name}: {type(exc).__name__}: {exc}")
+                continue
+            finally:
+                if entry_fd is not None:
+                    os.close(entry_fd)
+            update_index(root, {**rec, "state": "deleted", "deleted_at": now})
+            out["deleted"].append(name)
+    finally:
+        os.close(archive_fd)
+    return out

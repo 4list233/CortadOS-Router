@@ -17,6 +17,15 @@ Layout per task (all under a verified private 0700 directory, default ~/.config/
 
 The runner (`python3 -m cortados_router.child_tasks --run <dir>`) is a detached session leader (start_new_session), so
 the child survives the MCP server (the desktop app may restart it) and cancel_task can signal exactly that process group.
+
+Execution host (owner decision 2026-11-08, #89/#86): the child runs on the configured host (exec_hosts.py; default the
+Air), not necessarily on the machine running this server. When that host is another machine, start() forwards the
+request over ssh to this same module in --remote mode there, and keeps a stub (<task_id>/remote.json) so status, wait,
+list and cancel know where to ask. On the host, a task gets a workspace under <root>/active/<task_id> (workspaces.py:
+a git worktree of repos/<name>, or a plain folder) that the runner prepares before the child starts and settles
+(archive/ or held/) after it ends. A chrome child on a `gui` host is launched as a per-task LaunchAgent in the
+desktop session (gui/<uid>), because an ssh session cannot read the login Keychain that holds Claude's login; chrome
+children take a host-wide lock one at a time (Chrome serves one client).
 Stdlib only.
 """
 from __future__ import annotations
@@ -25,6 +34,7 @@ import fcntl
 import hashlib
 import json
 import os
+import plistlib
 import re
 import secrets
 import shutil
@@ -44,7 +54,7 @@ if __name__ == "__main__" and not __package__:
     # environment (it would shadow `tests`, `s1`, `cortados_router` in unrelated repos); put the root on sys.path here.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cortados_router import paths, redact, session  # noqa: E402
+from cortados_router import exec_hosts, paths, redact, session, workspaces  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TASKS_DIR = "~/.config/cortados/tasks"
@@ -128,6 +138,28 @@ _OFFICE_NAME_RE = re.compile(r"[A-Za-z0-9._ -]{1,64}")
 _DEVICE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 PS_TIMEOUT_S = 10                   # guards a hung ps only (see the ASSUMPTION above)
 RUN_FETCH_MIN_S = 1                 # a fetch with less than this left is not worth starting short of zero
+
+# --- execution host, workspaces, launchd (2026-11-08) -------------------------------------------------------------
+REMOTE_STUB = "remote.json"         # in a local task dir: {"host": <name>} — the task lives on that execution host
+WORKSPACE_FILE = "workspace.json"   # in the task dir on the host: the workspaces.prepare()/settle() record
+LAUNCHD_FILE = "launchd.json"       # in the task dir: {"label", "domain", "plist", "booted_out"} for a launchd task
+QUEUED_MARKER = "queued"            # in the task dir while the runner waits for the host's Chrome lock
+LAUNCHCTL = "/bin/launchctl"        # absolute, like PS: MCP servers start with a thin PATH
+LAUNCHD_LABEL_PREFIX = "com.cortados.task."
+# launchctl answers at once; a hung one must not hold start_task (the MCP client's 60 s) hostage.
+LAUNCHCTL_TIMEOUT_S = 20
+# One Chrome per host, one client at a time (Claude in Chrome): chrome children on a host serialize on this lock,
+# in the private tasks dir. Polled, not blocking: the wait must notice a cancel (SIGTERM) and the cancelled marker.
+CHROME_LOCK = "chrome.lock"
+CHROME_QUEUE_POLL_S = 0.5
+# A browser task that has waited this long for Chrome is stale (the orchestrator has moved on); it fails instead of
+# starting hours later unattended. Separate from CHILD_MAX_S, which counts from the spawn.
+CHROME_QUEUE_MAX_S = 6 * 3600
+# A remote wait is shortened by this much so the ssh round trip (connect + reply) still lands inside the local cap.
+SSH_OVERHEAD_S = 3
+# start_task runs the archive cleanup opportunistically (so it happens even where the daily job is not installed)
+# but deletes at most this many entries per call: start_task must answer within the MCP client's timeout.
+_REMOTE_SERVING = False             # set in --remote mode: a request that still resolves to another host is a loop
 
 
 def wait_max_s(env=None) -> float:
@@ -228,17 +260,19 @@ def login_model(name) -> str:
     return model
 
 
-def check_login_settings(cwd: str) -> None:
+def check_login_settings(cwd=None) -> None:
     """Fail closed: refuse a chrome child if a settings file it would load sets an API key/token/base URL in env or an
     apiKeyHelper; each would disable Claude in Chrome or send the session away from the login. Managed policy files
-    outrank every file checked here, so they are checked too (env keys via session.check_managed, plus apiKeyHelper)."""
+    outrank every file checked here, so they are checked too (env keys via session.check_managed, plus apiKeyHelper).
+    cwd None: the project files are not checked yet (the workspace does not exist until the runner prepares it; the
+    runner calls this again with the real cwd before it spawns)."""
     try:
         session.check_managed(LOGIN_BAD_SETTINGS_ENV, MANAGED_DIRS)
         managed = [str(f) for f in session.managed_settings_files(MANAGED_DIRS)]
     except session.SessionError as exc:
         raise TaskError(f"chrome task refused: {exc}") from None
-    for path in managed + [os.path.expanduser(USER_CLAUDE_SETTINGS), os.path.join(cwd, ".claude", "settings.json"),
-                           os.path.join(cwd, ".claude", "settings.local.json")]:
+    project = [os.path.join(cwd, ".claude", "settings.json"), os.path.join(cwd, ".claude", "settings.local.json")] if cwd else []
+    for path in managed + [os.path.expanduser(USER_CLAUDE_SETTINGS)] + project:
         try:
             with open(path, encoding="utf-8") as f:
                 cfg = json.load(f)
@@ -388,14 +422,14 @@ def resolve_permission_mode(permission_mode, orchestrator):
 
 
 def _validate(task, cwd, orchestrator, permission_mode, allowed_tools):
+    """Everything about a request that needs no filesystem (so the requesting machine can refuse before forwarding).
+    cwd: None, or an absolute path; whether it exists is checked on the execution host (_check_cwd_here)."""
     if not isinstance(task, str) or not task.strip():
         raise TaskError("start_task requires a non-empty 'task'")
     if len(task) > MAX_TASK_CHARS:
         raise TaskError(f"task is {len(task)} characters; the limit is {MAX_TASK_CHARS} (put large inputs in files under cwd)")
-    if not isinstance(cwd, str) or not os.path.isabs(cwd):
-        raise TaskError("start_task requires 'cwd', an absolute directory path")
-    if not os.path.isdir(cwd):
-        raise TaskError(f"cwd {cwd!r} is not an existing directory")
+    if cwd is not None and (not isinstance(cwd, str) or not os.path.isabs(cwd)):
+        raise TaskError("cwd, when given, must be an absolute directory path on the execution host")
     pin_model(orchestrator)
     if permission_mode is not None and permission_mode not in PERMISSION_MODES:   # None: resolve_permission_mode picks
         raise TaskError(f"permission_mode {permission_mode!r} is not allowed; choose one of {', '.join(PERMISSION_MODES)} "
@@ -417,6 +451,30 @@ def _new_id() -> str:
     return "t" + time.strftime("%Y%m%d%H%M%S") + "-" + secrets.token_hex(4)
 
 
+def _check_cwd_here(cwd: str, host: "exec_hosts.Host") -> None:
+    """cwd must exist on THIS host (the execution host). The message names the host so a path that exists only on the
+    requesting machine is understood as such (start() adds that it exists there when it does)."""
+    if not os.path.isdir(cwd):
+        raise TaskError(f"cwd {cwd!r} does not exist on execution host {host.describe()}; name a `repo` (and `branch`) "
+                        f"for a workspace under {host.root or '<root>'}/active/<task_id>, or a cwd that exists there")
+
+
+def _workspace_request(task_id, cwd, repo, branch, host: "exec_hosts.Host"):
+    """The workspace spec for a task (None when cwd is given: an existing folder on the host is not ours to move)."""
+    if cwd is not None and (repo is not None or branch is not None):
+        raise TaskError("pass either cwd (an existing directory on the execution host) or repo [+ branch]; not both")
+    if cwd is not None:
+        return None
+    try:
+        spec = workspaces.workspace_spec(task_id, repo, branch)
+    except workspaces.WorkspaceError as exc:
+        raise TaskError(str(exc)) from None
+    if not host.root:
+        raise TaskError(f"execution host {host.describe()} has no workspace `root` configured; pass cwd, or add root "
+                        f"to its entry in {exec_hosts.config_path()}")
+    return spec
+
+
 def connectors_config() -> str:
     return os.path.abspath(os.path.expanduser(os.environ.get("CORTADOS_CONNECTORS_MCP_CONFIG") or CONNECTORS_CONFIG))
 
@@ -433,10 +491,13 @@ def prune(root: str, now: float | None = None, errors: list | None = None) -> li
             if not TASK_ID_RE.fullmatch(name) or os.path.islink(d) or not os.path.isdir(d):
                 continue
             state, meta, _ = _state(d)
-            started = meta.get("started_at")
+            started = meta.get("started_at") if state != "remote" else meta.get("created_at")
             if not isinstance(started, (int, float)):
                 started = os.path.getmtime(d)
+            # A remote stub is only a pointer (the host prunes the task itself): dropped by age alone.
             if state != "running" and started < cutoff:
+                if meta.get("launch") == "launchd":
+                    _launchd_bootout(d)
                 shutil.rmtree(d)
                 removed.append(name)
         except OSError as exc:
@@ -560,21 +621,99 @@ _OFFICE_HEADER_OF = {"session": "x-cortados-session", "project": "x-cortados-pro
                      "title": "x-cortados-task-title"}
 
 
-def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tools=None,
+def _hosts() -> "exec_hosts.Hosts":
+    try:
+        return exec_hosts.load()
+    except exec_hosts.HostError as exc:
+        raise TaskError(str(exc)) from None
+
+
+def _remote(host_name: str, op: str, args: dict, timeout_s=None) -> dict:
+    """One operation on another execution host. Unreachable or failing hosts are TaskErrors with the host named;
+    nothing ever falls back to this machine."""
+    host = _hosts().resolve(host_name)
+    try:
+        out = exec_hosts.call(host, op, args, **({"timeout_s": timeout_s} if timeout_s is not None else {}))
+    except exec_hosts.HostError as exc:            # includes HostUnreachable
+        raise TaskError(str(exc)) from None
+    if not isinstance(out, (dict, list)):
+        raise TaskError(f"execution host {host.describe()} answered {op} with {type(out).__name__}, not a record")
+    return out
+
+
+def _stub(d: str):
+    """The remote stub of a local task dir ({"host": ...}), or None for a task that runs on this machine."""
+    rec = _read_json(os.path.join(d, REMOTE_STUB))
+    return rec if isinstance(rec, dict) and isinstance(rec.get("host"), str) else None
+
+
+def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed_tools=None,
           provider_url="", token_file=None, chrome=False, red=None, connectors=None, client=None,
-          title=None, session_tag=None) -> dict:
+          title=None, session_tag=None, repo=None, branch=None, host=None) -> dict:
     """`client` (optional, e.g. "grokbot" from the bot gateway) is recorded in meta.json and every event line, so usage
     can be attributed to the caller. `red` carries the launch credentials (env token and token file's token as they are now). `permission_mode`
     None picks auto where the model supports it (resolve_permission_mode). `title` (<= 80 chars) and `session_tag`
     (the orchestrator's opaque tag) label the task in the Office view: on its events, and as headers on its routed
-    requests."""
+    requests. `host` names the execution host (default: the configured default); `cwd` an existing directory THERE,
+    or `repo` [+ `branch`] a workspace the host prepares (neither: a plain folder under the host's active/)."""
     if os.environ.get(NESTED_ENV):
         raise TaskError("start_task is not available inside a child task: children may not start children "
                         "(unbounded fan-out would spend subscription quota unattended)")
     tools = _validate(task, cwd, orchestrator, permission_mode, allowed_tools)
-    office = office_tags(cwd, title, session_tag)
     if not isinstance(chrome, bool):
         raise TaskError("chrome must be true or false")
+    if host is not None and not isinstance(host, str):
+        raise TaskError("host must be the name of a configured execution host")
+    target = _hosts().resolve(host)
+    if not target.is_local():
+        if _REMOTE_SERVING:
+            raise TaskError(f"this request reached {exec_hosts.short_hostname()} for host {target.describe()}, but that "
+                            f"entry does not name this machine in `hostnames`; fix {exec_hosts.config_path()} here")
+        # Cheap refusals first (the same checks the host makes), so a bad request never costs an ssh round trip.
+        office_tags(None, title, session_tag)
+        _workspace_request("t00000000000000-00000000", cwd, repo, branch, target)
+        if chrome:
+            login_model(orchestrator)
+            if not target.gui:
+                raise TaskError(f"chrome tasks on execution host {target.describe()} need `gui: true` in its entry: a "
+                                "chrome child must start inside the desktop session (an ssh session cannot read the "
+                                "login Keychain that holds Claude's login)")
+        root = _private_root()  # fail before ssh: a remotely launched task must always be locally trackable
+        args = {"task": task, "cwd": cwd, "orchestrator": orchestrator, "permission_mode": permission_mode,
+                "allowed_tools": allowed_tools, "chrome": chrome, "connectors": connectors, "client": client,
+                "title": title, "session_tag": session_tag, "repo": repo, "branch": branch}
+        try:
+            out = _remote(target.name, "start", args)
+        except TaskError as exc:
+            msg = str(exc)
+            if cwd and "does not exist on execution host" in msg and os.path.isdir(cwd):
+                msg += (f" (it exists on this machine, {exec_hosts.short_hostname()}, only: child tasks run on "
+                        f"{target.describe()}, not here)")
+            raise TaskError(msg) from None
+        tid = out.get("task_id") if isinstance(out, dict) else None
+        if not isinstance(tid, str) or not TASK_ID_RE.fullmatch(tid):
+            raise TaskError(f"execution host {target.describe()} started a task but returned no valid task_id")
+        d = os.path.join(root, tid)
+        try:
+            os.mkdir(d, 0o700)
+            _write_json(os.path.join(d, REMOTE_STUB), {"host": target.name, "created_at": time.time()})
+        except BaseException as exc:
+            shutil.rmtree(d, ignore_errors=True)
+            try:
+                _remote(target.name, "cancel", {"task_id": tid})
+            except TaskError as cancel_exc:
+                raise TaskError(f"remote task {tid} started but local bookkeeping failed ({type(exc).__name__}); "
+                                f"remote cancellation also failed: {cancel_exc}") from None
+            raise TaskError(f"remote task {tid} started but local bookkeeping failed ({type(exc).__name__}); "
+                            "the remote task was cancelled") from None
+        out["host"] = target.name
+        return out
+    task_id = _new_id()
+    ws_spec = _workspace_request(task_id, cwd, repo, branch, target)   # validated before anything is created
+    # The Office "project" is the cwd's basename, or the repository name for a workspace the runner will create.
+    office = office_tags(cwd if cwd else (ws_spec or {}).get("name"), title, session_tag)
+    if cwd is not None:
+        _check_cwd_here(cwd, target)
     login = None
     if chrome:
         login = login_model(orchestrator)
@@ -583,7 +722,7 @@ def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tool
             # silently dropped list would hide that from the caller.
             raise TaskError("connectors are not used with chrome: true (login mode loads the user's claude.ai "
                             "connectors through the login itself); omit connectors")
-        check_login_settings(cwd)
+        check_login_settings(cwd)               # the project files are checked by the runner once the cwd exists
     permission_mode, mode_note = resolve_permission_mode(permission_mode, login or orchestrator)
     selected = select_connectors(None if chrome else connectors)
     if not provider_url and not chrome:
@@ -598,21 +737,32 @@ def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tool
     prune(root, errors=prune_errors)
     # No cap on parallel children. Routed children: capacity is the router's job (S1 and the quota gates refuse or
     # redirect a spent lane). Chrome (login-mode) children bypass S1 and the quota gates, so NOTHING here bounds N of
-    # them against the main Claude subscription; the orchestrator decides how many to run (Claude in Chrome gives each
-    # session its own tab group). A cap would be an [ESCALATE] decision, not added silently.
-    task_id = _new_id()
+    # them against the main Claude subscription; they do run one at a time per host (CHROME_LOCK: Chrome serves one
+    # client), the rest queue. A cap on their number would be an [ESCALATE] decision, not added silently.
+    if ws_spec is not None:
+        try:
+            workspaces.ensure_root(target.root)
+        except workspaces.WorkspaceError as exc:
+            raise TaskError(str(exc)) from None
+    # chrome on a gui host: a LaunchAgent in the desktop session (the only place the login Keychain is readable).
+    launchd = bool(chrome and target.gui)
     d = os.path.join(root, task_id)
     os.mkdir(d, 0o700)
-    # The runner's liveness IS this lock. It is taken before anything about the task is published (so no reader ever
-    # sees meta.json with an unheld lock and mistakes a starting task for a crashed one), handed to the runner as an
-    # inherited fd (same open file description, so the lock moves with it, no gap), and held by the runner until it has
-    # written result.json. A pid alone can be reused.
-    lock_fd = os.open(os.path.join(d, "runner.lock"), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
-    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    lock_fd = None
+    if not launchd:
+        # The runner's liveness IS this lock. It is taken before anything about the task is published (so no reader
+        # ever sees meta.json with an unheld lock and mistakes a starting task for a crashed one), handed to the runner
+        # as an inherited fd (same open file description, so the lock moves with it, no gap), and held by the runner
+        # until it has written result.json. A pid alone can be reused. (A launchd runner cannot inherit an fd: it
+        # takes the lock itself, and readers give it META_GRACE_S to appear, see _recover.)
+        lock_fd = os.open(os.path.join(d, "runner.lock"), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    runner = None
     try:
         meta, env, cmd = _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file,
                                   red or Redactor(),
-                                  chrome, max_s, exe, selected, login, office)
+                                  chrome, max_s, exe, selected, login, office,
+                                  workspace=ws_spec, ws_root=target.root, host_name=target.name, launchd=launchd)
         if client:
             meta["client"] = str(client)[:64]
             # cmd.json's event fields were written by _prepare before the client was known; the runner logs the
@@ -626,40 +776,106 @@ def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tool
             meta["permission_mode_note"] = mode_note
         if client or mode_note:
             _write_json(os.path.join(d, "meta.json"), meta)
-        with open(os.path.join(d, "runner.log"), "ab") as rlog:
-            runner = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "--run", d,
-                                       "--lock-fd", str(lock_fd)],
-                                      cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                      stderr=rlog, start_new_session=True, pass_fds=(lock_fd,))
+        if launchd:
+            _launch_launchd(d, env)
+        else:
+            with open(os.path.join(d, "runner.log"), "ab") as rlog:
+                runner = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "--run", d,
+                                           "--lock-fd", str(lock_fd)],
+                                          cwd=d, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                          stderr=rlog, start_new_session=True, pass_fds=(lock_fd,))
     except BaseException as exc:
         # Pre-spawn failure: nothing runs, so roll back completely (a half-made dir would list forever and could hold
         # a token-bearing settings file).
-        os.close(lock_fd)
+        if lock_fd is not None:
+            os.close(lock_fd)
         shutil.rmtree(d, ignore_errors=True)
         if isinstance(exc, OSError):
             raise TaskError(f"could not start the child task ({type(exc).__name__}: {exc})") from None
         raise
-    os.close(lock_fd)                           # our copy only; the runner's inherited fd keeps the lock
+    if lock_fd is not None:
+        os.close(lock_fd)                       # our copy only; the runner's inherited fd keeps the lock
     try:
-        meta["runner_pid"] = runner.pid
+        current = _read_json(os.path.join(d, "meta.json")) or {}
+        meta = {**meta, **current}  # preserve fields a fast launchd runner wrote after bootstrap, especially its pid
+        if runner is not None:
+            meta["runner_pid"] = runner.pid
         meta["event_log_error"] = log_event("started", **_event_fields(meta))
         _write_json(os.path.join(d, "meta.json"), meta)
     except BaseException as exc:
         # Post-spawn failure: a runner (and maybe claude) is live. Stop and reap them before deleting the dir, so no
         # task keeps running undiscoverable.
-        _abort_runner(runner, d)
+        if runner is not None:
+            _abort_runner(runner, d)
+        else:
+            _launchd_bootout(d)
         shutil.rmtree(d, ignore_errors=True)
         raise TaskError(f"child task bookkeeping failed after spawn; the task was stopped ({type(exc).__name__}: "
                         f"{exc})") from None
-    _REAP[task_id] = runner
-    out = {"task_id": task_id, "state": "running", "dir": d, "permission_mode": permission_mode}
+    if runner is not None:
+        _REAP[task_id] = runner
+    out = {"task_id": task_id, "state": "running", "dir": d, "permission_mode": permission_mode, "host": target.name,
+           "launch": "launchd" if launchd else "spawn"}
+    if ws_spec is not None:
+        out["workspace"] = {"kind": ws_spec["kind"], "path": os.path.join(target.root, "active", task_id),
+                            **({"repo": ws_spec["name"], "branch": ws_spec.get("branch") or workspaces.TASK_BRANCH_PREFIX + task_id}
+                               if ws_spec["kind"] == "repo" else {})}
+    else:
+        out["cwd"] = cwd
     if login:
-        out.update(lane=LOGIN_LANE, model=login)
+        out.update(lane=LOGIN_LANE, model=login, chrome_queue="chrome tasks run one at a time on this host; this one "
+                   "waits for the Chrome lock while another browser task runs (task_status shows phase 'queued')")
     if mode_note:
         out["permission_mode_note"] = mode_note
     if prune_errors:
         out["prune_errors"] = prune_errors[:20]     # bounded: it goes into a tool result
     return out
+
+
+def _launch_launchd(d: str, env: dict) -> None:
+    """Start the runner as a one-shot LaunchAgent in the desktop session (gui/<uid>), so the chrome child it spawns
+    runs where Chrome and the unlocked login Keychain are. The plist (0600, in the task dir: it carries the child's
+    allowlisted env) is bootstrapped by path; launchd forgets it at logout/reboot and we boot it out when the task
+    is final (_launchd_bootout). Why a LaunchAgent and not a Terminal window or `launchctl asuser`: no TCC
+    Automation prompt, no visible window to be closed by someone, and `asuser` needs root."""
+    label = LAUNCHD_LABEL_PREFIX + os.path.basename(d)
+    domain = f"gui/{os.getuid()}"
+    plist = os.path.join(d, "launchd.plist")
+    spec = {"Label": label,
+            "ProgramArguments": [sys.executable, "-B", str(Path(__file__).resolve()), "--run", d],
+            "WorkingDirectory": d,
+            "EnvironmentVariables": {k: str(v) for k, v in env.items()},
+            "RunAtLoad": True, "KeepAlive": False,
+            "StandardOutPath": os.path.join(d, "runner.log"), "StandardErrorPath": os.path.join(d, "runner.log")}
+    with open(os.open(plist, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
+        plistlib.dump(spec, f)
+    _write_json(os.path.join(d, LAUNCHD_FILE), {"label": label, "domain": domain, "plist": plist, "booted_out": False})
+    try:
+        r = subprocess.run([LAUNCHCTL, "bootstrap", domain, plist], capture_output=True, text=True,
+                           timeout=LAUNCHCTL_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise TaskError(f"launchctl bootstrap did not answer within {LAUNCHCTL_TIMEOUT_S} s; the chrome task was not started") from None
+    if r.returncode != 0:
+        raise TaskError(f"could not start the chrome task in the desktop session (launchctl bootstrap {domain} exited "
+                        f"{r.returncode}: {(r.stderr or r.stdout).strip()[-300:]}); is a user logged in to the desktop "
+                        "of this execution host?")
+
+
+def _launchd_bootout(d: str) -> str:
+    """Unload a task's one-shot job once it is final (or when a start failed after bootstrap). Idempotent; a job that
+    launchd no longer knows is fine. Returns what happened (recorded in launchd.json)."""
+    rec = _read_json(os.path.join(d, LAUNCHD_FILE))
+    if not isinstance(rec, dict) or rec.get("booted_out"):
+        return "not a launchd task" if not isinstance(rec, dict) else "already booted out"
+    try:
+        r = subprocess.run([LAUNCHCTL, "bootout", f"{rec['domain']}/{rec['label']}"], capture_output=True, text=True,
+                           timeout=LAUNCHCTL_TIMEOUT_S)
+        note = "booted out" if r.returncode == 0 else f"launchctl bootout exited {r.returncode}: {(r.stderr or '').strip()[-200:]}"
+    except (OSError, subprocess.TimeoutExpired, KeyError) as exc:
+        note = f"launchctl bootout failed: {type(exc).__name__}"
+    rec.update(booted_out=True, bootout_note=note)
+    _write_json(os.path.join(d, LAUNCHD_FILE), rec)
+    return note
 
 
 def _abort_runner(runner, d: str) -> None:
@@ -674,13 +890,21 @@ def _abort_runner(runner, d: str) -> None:
     _stop_recorded_child(d, 0)
 
 
+def _run_spec(cwd, max_s, meta, workspace=None, ws_root=None, launchd=False, chrome=False) -> dict:
+    """cmd.json: what the runner needs. cwd is None until the runner prepares the workspace (it then fills it in)."""
+    return {"cwd": cwd, "max_s": max_s, "grace_s": KILL_GRACE_S, "event": _event_fields(meta),
+            "started_at": meta["started_at"], "workspace": workspace, "workspace_root": ws_root,
+            "launchd": launchd, "chrome": chrome,
+            "chrome_lock": os.path.join(tasks_dir(), CHROME_LOCK) if chrome else None}
+
+
 def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file, red, chrome, max_s,
-             exe, selected=None, login=None, office=None):
+             exe, selected=None, login=None, office=None, workspace=None, ws_root=None, host_name=None, launchd=False):
     """Everything before the spawn: settings, prompt, cmd.json, meta.json. Returns (meta, env, cmd)."""
     os.chmod(d, 0o700)                          # mkdir's mode is masked by umask; the launcher verifies exactly 0700
     if login:
         meta, env, cmd = _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe,
-                                        login, office)
+                                        login, office, workspace, ws_root, host_name, launchd)
         return meta, env, cmd
     launch = ["--orchestrator", orchestrator, "--provider-url", provider_url, "--settings-dir", d, "--run-id", task_id]
     if token_file:
@@ -734,15 +958,17 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
             "allowed_tools": tools, "task_chars": len(task), "task_preview": red.text(task.strip())[:200],   # redact, THEN slice
             "started_at": time.time(), "connectors": sorted(selected) if selected else [],
             "chrome": chrome, "max_s": max_s, "runner_pid": None, "cred_fingerprints": launch_fps,
+            "host": host_name, "launch": "launchd" if launchd else "spawn",
+            "workspace": {"kind": workspace["kind"], "repo": workspace.get("name"), "branch": workspace.get("branch")} if workspace else None,
             # argv carries only the model, settings path and flags; the token lives in the 0600 settings file and env.
             "argv": cmd[1:], **({"office": office} if office else {})}
-    _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, "cwd": cwd, "max_s": max_s, "grace_s": KILL_GRACE_S,
-                                              "event": _event_fields(meta), "started_at": meta["started_at"]})
+    _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, **_run_spec(cwd, max_s, meta, workspace, ws_root, launchd, chrome)})
     _write_json(os.path.join(d, "meta.json"), meta)    # before Popen: a task dir always has its meta
     return meta, env, cmd
 
 
-def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe, model, office=None):
+def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe, model, office=None,
+                   workspace=None, ws_root=None, host_name=None, launchd=False):
     """chrome: true. No launcher, no --settings provider file, no provider env: claude on the user's own login."""
     cmd = [exe, "--model", model, "-p", "--output-format", "stream-json", "--verbose", "--permission-mode",
            permission_mode, "--permission-prompts", "none"]
@@ -766,9 +992,10 @@ def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, 
             "allowed_tools": tools, "task_chars": len(task), "task_preview": red.text(task.strip())[:200],
             "started_at": time.time(), "connectors": [], "chrome": True, "lane": LOGIN_LANE, "model": model,
             # Login-mode children never route through CortadOS, so carry no Office identity into lifecycle events.
-            "max_s": max_s, "runner_pid": None, "cred_fingerprints": launch_fps, "argv": cmd[1:]}
-    _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, "cwd": cwd, "max_s": max_s, "grace_s": KILL_GRACE_S,
-                                              "event": _event_fields(meta), "started_at": meta["started_at"]})
+            "max_s": max_s, "runner_pid": None, "cred_fingerprints": launch_fps, "argv": cmd[1:],
+            "host": host_name, "launch": "launchd" if launchd else "spawn",
+            "workspace": {"kind": workspace["kind"], "repo": workspace.get("name"), "branch": workspace.get("branch")} if workspace else None}
+    _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, **_run_spec(cwd, max_s, meta, workspace, ws_root, launchd, True)})
     _write_json(os.path.join(d, "meta.json"), meta)
     return meta, env, cmd
 
@@ -835,6 +1062,9 @@ def _state(d: str):
     tid = os.path.basename(d)
     if tid in _REAP and _REAP[tid].poll() is not None:
         _REAP.pop(tid, None)
+    stub = _stub(d)
+    if stub:
+        return "remote", stub, None             # lives on another execution host; callers ask there
     meta = _read_json(os.path.join(d, "meta.json"))
     res = _read_json(os.path.join(d, "result.json"))
     if res is None and meta is None:
@@ -846,6 +1076,8 @@ def _state(d: str):
         res = _recover(d, meta)
         if res is None:
             return "running", meta, None
+    if meta.get("launch") == "launchd":
+        _launchd_bootout(d)                     # final: the one-shot job is unloaded (idempotent)
     return classify(res), meta, res
 
 
@@ -892,11 +1124,16 @@ def _recover(d: str, meta: dict):
         if os.path.exists(os.path.join(d, "cancelled")):
             res = {"cancelled": True, "settings_removed": removed, "ended_at": time.time(),
                    "error": "cancelled before the runner recorded a result; no child output"}
+        elif fd is None and meta.get("launch") == "launchd":
+            res = {"error": f"the desktop-session runner (launchd) did not start within {META_GRACE_S} s; see "
+                            "runner.log and `launchctl print gui/<uid>/" + LAUNCHD_LABEL_PREFIX + os.path.basename(d) + "`",
+                   "settings_removed": removed, "ended_at": time.time()}
         else:
             res = {"error": "the runner exited without recording a result (killed or crashed); see runner.log",
                    "settings_removed": removed, "ended_at": time.time()}
         res["child_cleanup"] = child
         res["logs_unredacted"] = True           # the runner never redacted them; see status()
+        res["workspace"] = _settle_workspace(d)  # the child is stopped: its folder is archived or held, never left behind
         _write_json(os.path.join(d, "result.json"), res)
         return res
     finally:
@@ -960,6 +1197,12 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
     RUN_FETCH_MIN_S, so wait_task's reply lands inside the client's request timeout."""
     red = red or Redactor((token,) if token else ())
     d = task_path(task_id)
+    stub = _stub(d)
+    if stub:
+        out = _remote(stub["host"], "status", {"task_id": task_id},
+                      timeout_s=max(RUN_FETCH_MIN_S, deadline - time.monotonic()) if deadline else None)
+        out["host"] = stub["host"]
+        return out
     state, meta, res = _state(d)
     withheld = bool(res and res.get("logs_unredacted")) and not _release_recovered_logs(d, meta, res, red)
     started = meta.get("started_at") or os.path.getmtime(d)
@@ -967,9 +1210,17 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
     out = {"task_id": task_id, "state": state, "elapsed_s": round((ended or time.time()) - started, 1),
            "cwd": meta.get("cwd"), "orchestrator": meta.get("orchestrator"),
            "permission_mode": meta.get("permission_mode"), "dir": d,
-           "stdout_log": os.path.join(d, "stdout.log"), "stderr_log": os.path.join(d, "stderr.log")}
+           "stdout_log": os.path.join(d, "stdout.log"), "stderr_log": os.path.join(d, "stderr.log"),
+           "host": meta.get("host"), "launch": meta.get("launch")}
     if meta.get("lane"):
         out.update(lane=meta["lane"], model=meta.get("model"))
+    ws = _read_json(os.path.join(d, WORKSPACE_FILE))
+    if isinstance(ws, dict):
+        out["workspace"] = {k: ws.get(k) for k in ("kind", "state", "path", "repo", "branch", "reason", "error") if ws.get(k) is not None}
+    elif meta.get("workspace"):
+        out["workspace"] = {**meta["workspace"], "state": "preparing" if state == "running" else "not created"}
+    if state == "running" and os.path.exists(os.path.join(d, QUEUED_MARKER)):
+        out["phase"] = "queued: waiting for the host's Chrome (one browser task at a time)"
     if res is not None:
         o = res.get("output") or {}
         out["exit_code"] = res.get("exit_code")
@@ -1109,6 +1360,16 @@ def wait(task_id, timeout_s=None, red=None, poll_s=0.5, provider_url="", token="
                         "call wait_task again to keep waiting")
     d = task_path(task_id)
     end = start + t
+    stub = _stub(d)
+    if stub:
+        # The host waits (one ssh session held open), shortened by the round trip so the reply lands inside our cap;
+        # its own cap is given explicitly so a raised CORTADOS_WAIT_MAX_S here is honoured there.
+        out = _remote(stub["host"], "wait", {"task_id": task_id, "timeout_s": max(0.0, t - SSH_OVERHEAD_S), "max_s": cap},
+                      timeout_s=t + POST_WAIT_RESERVE_S)
+        out["host"] = stub["host"]
+        if out.get("state") == "running" and "wait_ended" not in out:
+            out["wait_ended"] = f"waited {t:g} s; the task is still running: call wait_task again to keep waiting"
+        return out
     while time.monotonic() < end and _state(d)[0] == "running":     # deadline first: no state read past it
         time.sleep(max(0.0, min(poll_s, end - time.monotonic())))
     # The fetch gets what the reserve leaves after a possible recovery (RECOVERY_GRACE_S): at most ~5 s past the loop,
@@ -1133,23 +1394,55 @@ def list_recent(n=20, ids=None) -> list:
         wanted = {x for x in ids if isinstance(x, str)}
         names = (x for x in names if x in wanted)
     ids = sorted(names, reverse=True)[:n]
-    rows = []
+    rows, by_host = [], {}
     for tid in ids:
         state, meta, res = _state(os.path.join(root, tid))
+        if state == "remote":
+            by_host.setdefault(meta["host"], []).append(tid)
+            rows.append({"task_id": tid, "host": meta["host"], "state": "unknown"})   # filled in from the host below
+            continue
         rows.append({"task_id": tid, "state": state, "cwd": meta.get("cwd"), "orchestrator": meta.get("orchestrator"),
-                     "task_preview": meta.get("task_preview")})
+                     "task_preview": meta.get("task_preview"), "host": meta.get("host"),
+                     **({"workspace": meta["workspace"]} if meta.get("workspace") else {})})
+    for host, tids in by_host.items():         # one round trip per host, never one per task
+        try:
+            remote = _remote(host, "list", {"limit": len(tids), "ids": tids})
+            found = {r.get("task_id"): r for r in remote if isinstance(r, dict)} if isinstance(remote, list) else {}
+            err = None
+        except TaskError as exc:
+            found, err = {}, str(exc)
+        for row in rows:
+            if row.get("host") == host and row["state"] == "unknown":
+                if row["task_id"] in found:
+                    row.update(found[row["task_id"]], host=host)
+                else:
+                    row["error"] = err or f"not listed by execution host '{host}' (pruned there?)"
     return rows
 
 
 def cancel(task_id) -> dict:
     d = task_path(task_id)
     state, meta, _ = _state(d)
+    if state == "remote":
+        out = _remote(meta["host"], "cancel", {"task_id": task_id})
+        out["host"] = meta["host"]
+        return out
     if state != "running":
         return {"task_id": task_id, "state": state, "cancelled": False, "reason": f"task is already {state}"}
     pid = meta.get("runner_pid")
     # Signal ONLY while the runner's lock is held AND the pid's command line is this task's runner: a recorded pid can
     # belong to an unrelated session leader after a reboot or a SIGKILL.
     if not _lock_held(d) or not _is_our_runner(pid, d):
+        if meta.get("launch") == "launchd":
+            # The desktop-session runner has not taken its lock yet (launchd has not started it, or it is between exec
+            # and flock): the marker makes it exit before any spawn, and the job is unloaded so it does not start.
+            open(os.path.join(d, "cancelled"), "w").close()
+            note = _launchd_bootout(d)
+            err = log_event("cancelled", **_event_fields(meta))
+            out = {"task_id": task_id, "state": "cancelling", "cancelled": True, "note": f"runner not started yet; {note}"}
+            if err:
+                out["event_log_error"] = err
+            return out
         return {"task_id": task_id, "state": state, "cancelled": False,
                 "reason": "the recorded pid is not this task's runner; refusing to signal it"}
     open(os.path.join(d, "cancelled"), "w").close()
@@ -1162,6 +1455,30 @@ def cancel(task_id) -> dict:
     if err:
         out["event_log_error"] = err
     return out
+
+
+def _settle_workspace(d: str):
+    """Move the task's workspace out of active/ (workspaces.settle) once the child is over, and record it in the
+    host's index.jsonl. Idempotent: a folder already settled (or a task with none) is left alone. Returns the
+    workspace record, or None when the task has no managed workspace. Never raises: the task's result stands."""
+    ws = _read_json(os.path.join(d, WORKSPACE_FILE))
+    spec = _read_json(os.path.join(d, "cmd.json")) or {}
+    root = spec.get("workspace_root")
+    if not isinstance(ws, dict) or not isinstance(root, str):
+        return None
+    if ws.get("state") != "active":
+        return ws
+    try:
+        ws = workspaces.settle(ws, root)
+        _write_json(os.path.join(d, WORKSPACE_FILE), ws)
+        workspaces.update_index(root, {**ws, "settled_from": "runner" if ws.get("state") != "active" else None})
+    except (OSError, workspaces.WorkspaceError) as exc:
+        ws = {**ws, "error": f"settle failed: {type(exc).__name__}: {exc}"}
+        try:
+            _write_json(os.path.join(d, WORKSPACE_FILE), ws)
+        except OSError:
+            pass
+    return ws
 
 
 # --- runner (detached child process) -------------------------------------------------------------------------------
@@ -1517,6 +1834,63 @@ class _CancelledBeforeSpawn(Exception):
     pass
 
 
+class _QueueTimeout(Exception):
+    pass
+
+
+def _acquire_chrome_lock(d: str, path: str, flag: dict):
+    """Take the host's Chrome lock (one browser child at a time), polling so a cancel is noticed while queued. The
+    QUEUED_MARKER in the task dir shows the wait in task_status. Returns the lock fd (closing it releases the lock)."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    marker = os.path.join(d, QUEUED_MARKER)
+    end = time.monotonic() + CHROME_QUEUE_MAX_S
+    queued = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                pass
+            if not queued:
+                open(marker, "w").close()
+                queued = True
+            if flag["pre"] or os.path.exists(os.path.join(d, "cancelled")):
+                raise _CancelledBeforeSpawn()
+            if time.monotonic() >= end:
+                raise _QueueTimeout()
+            time.sleep(CHROME_QUEUE_POLL_S)
+    except BaseException:
+        os.close(fd)
+        raise
+    finally:
+        if queued:
+            try:
+                os.unlink(marker)
+            except FileNotFoundError:
+                pass
+
+
+def _prepare_run(d: str, spec: dict) -> None:
+    """Before the spawn, on the execution host: create the workspace (clone/fetch/worktree or plain folder) and
+    point the spec and meta at it; then, for a chrome child, the fail-closed project settings check the start could
+    not make while the folder did not exist. Raises WorkspaceError / TaskError: the task fails without a spawn."""
+    ws_spec, root = spec.get("workspace"), spec.get("workspace_root")
+    if ws_spec:
+        ws = workspaces.prepare(ws_spec, root)
+        _write_json(os.path.join(d, WORKSPACE_FILE), ws)
+        ev = spec.get("event") or {}
+        workspaces.update_index(root, {**ws, **({"client": ev["client"]} if ev.get("client") else {})})
+        spec["cwd"] = ws["path"]
+        spec["event"]["cwd"] = ws["path"]
+        _write_json(os.path.join(d, "cmd.json"), spec)
+        meta = _read_json(os.path.join(d, "meta.json")) or {}
+        meta["cwd"] = ws["path"]
+        _write_json(os.path.join(d, "meta.json"), meta)
+    if spec.get("chrome"):
+        check_login_settings(spec["cwd"])
+
+
 def _run(d: str, lock_fd=None) -> int:
     flag = {"term": False, "pre": False}
     holder = {"proc": None}
@@ -1534,7 +1908,19 @@ def _run(d: str, lock_fd=None) -> int:
     spec = _read_json(os.path.join(d, "cmd.json"))
     max_s, grace = spec.get("max_s") or CHILD_MAX_S_DEFAULT, spec.get("grace_s") or KILL_GRACE_S
     result = {"exit_code": None, "cancelled": False}
+    if spec.get("launchd"):
+        # launchd spawned this runner, so start() could not record the pid; cancel() needs it (with the lock and the
+        # command-line check, as for a spawned runner).
+        meta = _read_json(os.path.join(d, "meta.json")) or {}
+        meta["runner_pid"] = os.getpid()
+        _write_json(os.path.join(d, "meta.json"), meta)
+    chrome_fd = None
     try:
+        if flag["pre"] or os.path.exists(os.path.join(d, "cancelled")):
+            raise _CancelledBeforeSpawn()       # checked before any clone: a cancelled task costs no fetch
+        _prepare_run(d, spec)
+        if spec.get("chrome_lock"):
+            chrome_fd = _acquire_chrome_lock(d, spec["chrome_lock"], flag)
         with open(os.path.join(d, "prompt.txt"), "rb") as stdin, \
                 open(os.path.join(d, "stdout.log"), "ab") as so, open(os.path.join(d, "stderr.log"), "ab") as se:
             if flag["pre"] or os.path.exists(os.path.join(d, "cancelled")):
@@ -1569,9 +1955,16 @@ def _run(d: str, lock_fd=None) -> int:
     except _CancelledBeforeSpawn:
         result["cancelled"] = True
         result["error"] = "cancelled before the child was started"
+    except _QueueTimeout:
+        result["error"] = (f"waited {CHROME_QUEUE_MAX_S} s for the host's Chrome (another browser task held it the whole "
+                           "time) and gave up; the child was never started")
+    except (workspaces.WorkspaceError, TaskError) as exc:
+        result["error"] = f"could not prepare the task on this host: {exc}"
     except (OSError, subprocess.SubprocessError) as exc:   # SubprocessError: e.g. preexec_fn failed in the child
         result["error"] = f"could not start the child: {type(exc).__name__}: {exc}"
     finally:
+        if chrome_fd is not None:
+            os.close(chrome_fd)                 # releases the Chrome lock to the next queued browser task
         # The settings file holds the provider token; once the child has exited (normally, cancelled or timed out)
         # nothing needs it, so it does not stay at rest. (A SIGKILLed runner cannot do this; _state() does it then.)
         result["settings_removed"] = _remove_settings(d)
@@ -1605,11 +1998,16 @@ def _run(d: str, lock_fd=None) -> int:
     if err:
         result["output_error"] = err
     try:
-        result["activity"], n = red.deep_count(summarize_stream(os.path.join(d, "stdout.log"), spec["cwd"]))
+        result["activity"], n = red.deep_count(summarize_stream(os.path.join(d, "stdout.log"), spec.get("cwd") or d))
         if n:
             result["redact_unparsed_lines"] = result.get("redact_unparsed_lines", 0) + n
     except OSError as exc:                       # no stdout at all (the child never started): nothing to summarize
         result["activity_error"] = f"could not read stdout.log: {type(exc).__name__}"
+    # The child is over: its workspace leaves active/ (archive/ when pushed or no repository, else held/) before the
+    # result is published, so a caller that sees the final state also sees where the folder went.
+    ws = _settle_workspace(d)
+    if ws is not None:
+        result["workspace"] = ws
     result["ended_at"] = time.time()
     final = classify(result)
     started = spec.get("started_at")
@@ -1622,9 +2020,126 @@ def _run(d: str, lock_fd=None) -> int:
     return 0
 
 
+# --- remote mode (the execution host's side of exec_hosts.call) ---------------------------------------------------
+
+def _apply_host_env(host: "exec_hosts.Host") -> None:
+    """An ssh session gets a bare environment: the host's entry supplies what children need there."""
+    if host.path:
+        os.environ["PATH"] = host.path
+    if host.claude:
+        os.environ["CORTADOS_CHILD_CLAUDE_BIN"] = host.claude
+    if host.provider_url:
+        os.environ["CORTADOS_PROVIDER_URL"] = host.provider_url
+
+
+def _host_tokens() -> list:
+    """This host's provider credentials (env and token file), for redaction of what leaves over ssh."""
+    toks = [(os.environ.get("CORTADOS_PROVIDER_TOKEN") or "").strip()]
+    try:
+        toks.append(session.read_token(os.environ.get("CORTADOS_PROVIDER_TOKEN_FILE") or session.DEFAULT_TOKEN_FILE))
+    except session.SessionError:
+        pass
+    return [t for t in toks if t]
+
+
+def serve_remote(stdin=None, stdout=None) -> int:
+    """Answer ONE request from exec_hosts.call: {"v", "op", "host", "args"} on stdin, one JSON line on stdout. This
+    machine must be the named host (its entry's hostnames include this hostname), else the request is refused: a
+    misrouted ssh alias must not run tasks on the wrong machine or bounce them on again."""
+    global _REMOTE_SERVING
+    stdin = sys.stdin if stdin is None else stdin
+    stdout = sys.stdout if stdout is None else stdout
+
+    def reply(ok, payload):
+        stdout.write(json.dumps({"v": exec_hosts.PROTOCOL, "ok": ok, ("result" if ok else "error"): payload}) + "\n")
+        stdout.flush()
+        return 0 if ok else 1
+
+    try:
+        req = json.load(stdin)
+    except (ValueError, RecursionError):
+        return reply(False, "remote request is not JSON")
+    if not isinstance(req, dict) or req.get("v") != exec_hosts.PROTOCOL:
+        return reply(False, f"remote request protocol {req.get('v') if isinstance(req, dict) else None!r} != {exec_hosts.PROTOCOL}: "
+                            "update the cortados-router checkout on both machines")
+    op, args = req.get("op"), req.get("args") if isinstance(req.get("args"), dict) else {}
+    try:
+        host = exec_hosts.load().resolve(req.get("host"))
+        if not host.is_local():
+            raise exec_hosts.HostError(f"this machine ({exec_hosts.short_hostname()}) is not execution host "
+                                       f"{host.describe()}: add its hostname to that entry's `hostnames` in "
+                                       f"{exec_hosts.config_path()} here, or fix the ssh alias")
+    except exec_hosts.HostError as exc:
+        return reply(False, str(exc))
+    _REMOTE_SERVING = True
+    _apply_host_env(host)
+    tokens = _host_tokens()
+    try:
+        red = Redactor(tokens)
+        token = tokens[0] if tokens else ""
+        try:
+            url = session.resolve_provider_url()
+        except session.ProviderURLError:
+            url = ""
+        if op == "start":
+            out = start(args.get("task"), args.get("cwd"), args.get("orchestrator") or "cortados",
+                        args.get("permission_mode") or None, args.get("allowed_tools"), "", None,
+                        args.get("chrome", False), red, args.get("connectors"), client=args.get("client"),
+                        title=args.get("title"), session_tag=args.get("session_tag"), repo=args.get("repo"),
+                        branch=args.get("branch"), host=host.name)
+        elif op == "status":
+            out = status(args.get("task_id"), red, url, token)
+        elif op == "wait":
+            out = wait(args.get("task_id"), args.get("timeout_s"), red, provider_url=url, token=token,
+                       max_s=args.get("max_s"))
+        elif op == "list":
+            ids = args.get("ids")
+            out = list_recent(args.get("limit", 20), ids if isinstance(ids, list) else None)
+        elif op == "cancel":
+            out = cancel(args.get("task_id"))
+        else:
+            return reply(False, f"unknown remote operation {op!r}")
+    except TaskError as exc:
+        return reply(False, Redactor(tokens).text(str(exc)) if tokens else str(exc))
+    except Exception as exc:                    # the type only: the text is unscrubbed and could echo configuration
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return reply(False, f"internal error on execution host {host.name} ({type(exc).__name__})")
+    return reply(True, red.tree(out))
+
+
+def cleanup_main(argv: list) -> int:
+    """`--cleanup-archive [--root <dir>]`: the daily archive cleanup (integrations/launchd/com.cortados.archive-cleanup.plist).
+    The root is the local host entry's unless given. Prints the report as JSON; exit 1 if anything errored."""
+    root = None
+    if argv[:1] == ["--root"] and len(argv) == 2:
+        root = argv[1]
+    elif argv:
+        print("usage: python3 cortados_router/child_tasks.py --cleanup-archive [--root <workspace root>]", file=sys.stderr)
+        return 2
+    if root is None:
+        try:
+            me = exec_hosts.load().local_entry()
+        except exec_hosts.HostError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if me is None or not me.root:
+            print(f"no entry in {exec_hosts.config_path()} names this machine with a workspace root; pass --root", file=sys.stderr)
+            return 2
+        root = me.root
+    report = workspaces.cleanup_archive(root)
+    print(json.dumps({"root": root, **report}, indent=2))
+    return 1 if report["errors"] else 0
+
+
 if __name__ == "__main__":
     a = sys.argv[1:]
     if len(a) in (2, 4) and a[0] == "--run" and (len(a) == 2 or a[2] == "--lock-fd"):
         sys.exit(_run(a[1], int(a[3]) if len(a) == 4 else None))
-    print("usage: python3 cortados_router/child_tasks.py --run <task dir> [--lock-fd N]", file=sys.stderr)
+    if a == ["--remote"]:
+        sys.exit(serve_remote())
+    if a[:1] == ["--cleanup-archive"]:
+        sys.exit(cleanup_main(a[1:]))
+    print("usage: python3 cortados_router/child_tasks.py --run <task dir> [--lock-fd N] | --remote | "
+          "--cleanup-archive [--root <dir>]", file=sys.stderr)
     sys.exit(2)
