@@ -86,8 +86,9 @@ MAX_ALLOWED_TOOLS = 64              # an allowlist longer than this is not a rev
 # Our bound, not claude's (it documents none): real patterns are short (`Bash(npm test:*)`, `mcp__server__tool`); 200
 # leaves room for long MCP names while keeping a pasted blob out of argv and meta.json.
 MAX_TOOL_PATTERN = 200
-# Orchestrator: 'cortados', an alias, or a model id. The longest pinnable id is ~30 chars; 81 (1 + 80) is our bound
-# that keeps a pasted blob out of argv, and the charset keeps it a plain model id.
+# Orchestrator: 'cortados', an alias, a model id, or a friendly name with its spaces already turned into dashes
+# (pin_model). The longest pinnable id is ~30 chars; 81 (1 + 80) is our bound that keeps a pasted blob out of argv,
+# and the charset keeps it a plain model id.
 ORCHESTRATOR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:-]{0,80}")
 MIN_TOKEN_LEN = 8                   # same floor as subagent_mcp.route_task: shorter is not a provider token, and a
                                     # shorter one could not be redacted without mangling ordinary words
@@ -335,8 +336,14 @@ def pin_model(name) -> str:
     """The ONE validation for a model name a tool accepts (start_task's orchestrator, route_task's model): 'cortados'
     (S1 routes) or a pinnable model or alias (fable, opus, sonnet, claude-*, gpt-*, ...). Returns the provider model id:
     'cortados' or 'sub/<id>' (session.resolve_model, which uses the provider's own alias table)."""
-    if not isinstance(name, str) or not ORCHESTRATOR_RE.fullmatch(name):
+    if not isinstance(name, str):
         raise TaskError(f"invalid model {name!r}: use 'cortados' or a pinnable model name (e.g. fable, opus, gpt-6.1-sol)")
+    # A friendly name's spaces become dashes (`GPT 6.1` -> `gpt-6.1`): the provider's resolver (routing.resolve_pin)
+    # reads the two alike, and the id then stays one argv token for the child's --model.
+    name = re.sub(r"\s+", "-", name.strip()).lower()
+    if not ORCHESTRATOR_RE.fullmatch(name):
+        raise TaskError(f"invalid model {name!r}: use 'cortados' or a pinnable model name (e.g. fable, opus, gpt-6.1-sol, "
+                        "'GPT 6.1', 'ollama 27b q3km')")
     try:
         return session.resolve_model(name)
     except session.SessionError as exc:

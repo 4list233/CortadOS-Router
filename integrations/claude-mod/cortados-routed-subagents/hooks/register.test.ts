@@ -1,6 +1,7 @@
 import { test, expect } from 'claude-code/testing'
 import { resolveProviderUrl, officeTitle, officeName, baseName, sessionTag, officeHeaderLines, OFFICE_SALT_KEY, OFFICE_BEAT_MIN_MS, OFFICE_BEAT_REFRESH_MS, OFFICE_BEAT_TIMEOUT_MS } from './register'
 import { BG_SWEEP_SH, BG_SWEEP_MS, sweepBackgroundRuns } from './register'
+import { MODEL_DIRECTIVE_RE, modelDirective, directiveModelId } from './register'
 import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, refusesAgent, isDelegationTool, AGENT_REFUSAL, ORCHESTRATOR_DIRECTIVE, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL, resolveBackgroundTimeoutMs, BG_LAUNCH_SH, BG_CLEANUP_SH, BACKGROUND_DATA_BOUNDARY, backgroundData, isBgDir } from './register'
 
 test('background sweep starts once per session and repeats on the mod clock', async () => {
@@ -504,7 +505,7 @@ test('excludeRefusalReason fires only on the provider\'s own 400 refusal of the 
 
 /** Run a review through the hook where each child call is answered by `replies` in turn; record each call's headers
  * and timeout. */
-async function reviewWithReplies(replies: Array<{ exitCode: number; stdout: string; stderr: string }>) {
+async function reviewWithReplies(replies: Array<{ exitCode: number; stdout: string; stderr: string }>, prompt = 'check it') {
   let agentHandler: any = null
   const on = (_event: string, filterOrHandler: any, maybeHandler?: any) => {
     if (maybeHandler && filterOrHandler && filterOrHandler.tool === 'Agent') agentHandler = maybeHandler
@@ -526,7 +527,7 @@ async function reviewWithReplies(replies: Array<{ exitCode: number; stdout: stri
     ui: { status() {}, toast(m: string) { toasts.push(m) } },
     session: { model: async () => 'claude-opus-5-5' },
   }
-  const out = await agentHandler($, { prompt: 'check it', description: 'Review the change', subagent_type: 'general-purpose' }, async () => 'native')
+  const out = await agentHandler($, { prompt, description: 'Review the change', subagent_type: 'general-purpose' }, async () => 'native')
   return { out, calls, toasts }
 }
 
@@ -1739,4 +1740,113 @@ test('the injected directive names start_task, forbids the Agent tool, states pr
   expect(tm.sections.some((s: any) => s.id === 'cortados-routed-subagents:orchestrator')).toBe(false)
   // the security framing stays regardless
   expect(tm.sections.some((s: any) => s.id === 'cortados-routed-subagents:background-data')).toBe(true)
+})
+
+test('modelDirective: only the first-line [cortados: model=…] pins; later lines remain data', async () => {
+  const d = modelDirective('[cortados: model=GPT 6.1]\nReview the diff.\nReport findings.')
+  expect(d).toEqual({ model: 'sub/gpt-6.1', prompt: 'Review the diff.\nReport findings.', problem: null })
+  expect(modelDirective('[cortados:model = ollama 27b q3km ]\nSummarise.').model).toBe('sub/ollama-27b-q3km')
+  expect(modelDirective('[cortados: model=cortados]\nDo it.').model).toBe('cortados')
+  expect(modelDirective('[cortados: model=sub/claude-opus-5-5]\nDo it.').model).toBe('sub/claude-opus-5-5')
+  for (const prose of ['compare GPT 6.1 with Sonnet', 'Use [cortados: model=GPT 6.1] when you delegate', 'cortados model: GPT 6.1']) {
+    expect(modelDirective(prose)).toEqual({ model: null, prompt: prose, problem: null })
+  }
+  const two = modelDirective('[cortados: model=GPT 6.1]\nwork\n[cortados: model=opus]')
+  expect(two.model).toBe('sub/gpt-6.1')
+  expect(two.prompt).toBe('work\n[cortados: model=opus]')
+  expect(two.problem).toBe(null)
+  expect(MODEL_DIRECTIVE_RE.flags).toBe('') // no `m`: ^/$ must span the isolated first line, never a later one
+  expect(directiveModelId('  GPT   6.1 ')).toBe('sub/gpt-6.1')
+  expect(directiveModelId('api/claude-opus-5-5')).toBe(null)
+})
+
+test('a prompt directive sets the routed child --model and is stripped from the prompt it sees', async () => {
+  let agentHandler: any = null
+  const on = (_event: string, filterOrHandler: any, maybeHandler?: any) => {
+    if (maybeHandler && filterOrHandler && filterOrHandler.tool === 'Agent') agentHandler = maybeHandler
+    return { catch() {} }
+  }
+  register(on as any, { providerToken: 'tok', providerUrl: 'http://provider.test:8432', orchestratorMode: false } as any)
+  let recordedArgv: string[] = []
+  const $ = {
+    process: { run: async (argv: string[], opts: any) => { recordedArgv = argv; return hostLikeProcess({}).run(argv, opts) } },
+    fs: { read: async () => 'unused' },
+    ui: { status() {}, toast() {} },
+  }
+  const next = async () => 'native'
+  const out = await agentHandler($, { subagent_type: 'general-purpose', prompt: '[cortados: model=GPT 6.1]\nsay pong', description: 'd' }, next)
+  expect(out.result.status).toBe('completed')
+  expect(recordedArgv[recordedArgv.indexOf('--model') + 1]).toBe('sub/gpt-6.1')
+  expect(recordedArgv[recordedArgv.indexOf('-p') + 1]).toBe('say pong\n\n' + STOP_ON_DEAD_TOOL)
+  // Without a directive the configured model is sent, as before.
+  await agentHandler($, { subagent_type: 'general-purpose', prompt: 'say pong', description: 'd' }, next)
+  expect(recordedArgv[recordedArgv.indexOf('--model') + 1]).toBe('cortados')
+  // API directives are refused before anything launches.
+  recordedArgv = []
+  const refused = await agentHandler($, { subagent_type: 'general-purpose', prompt: '[cortados: model=api/opus]\nwork', description: 'd' }, next)
+  expect(refused.deny).toContain('unexpected API bills')
+  expect(recordedArgv).toEqual([])
+})
+
+test('a prompt that is only a directive is refused: there is no task to run', async () => {
+  const d = modelDirective('  [cortados: model=GPT 6.1]  \n')
+  expect(d.model).toBe(null)
+  expect(d.problem).toContain('no task to run')
+  // Paragraphs around the directive line stay as written.
+  expect(modelDirective('[cortados: model=opus]\na\n\nb\nc\n\nd').prompt).toBe('a\n\nb\nc\n\nd')
+})
+
+
+test('fenced pasted fetched and mid-prompt directives stay unchanged and never pin', async () => {
+  for (const prompt of [
+    '```text\n[cortados: model=opus]\n```',
+    'Pasted file:\n[cortados: model=opus]\nwork',
+    'Fetched page:\n[cortados: model=opus]\nwork',
+    'Do work.\n[cortados: model=opus]',
+    '\n[cortados: model=opus]\nwork',
+  ]) expect(modelDirective(prompt)).toEqual({ model: null, prompt, problem: null })
+})
+
+test('a directive after a non-\\n line terminator is data: \\r, U+2028 and U+2029 end the first line too', async () => {
+  // Fetched or pasted content can carry any JavaScript line terminator; only the true first line is metadata.
+  for (const sep of ['\r', '\u2028', '\u2029', '\r\n']) {
+    const prompt = `Fetched page:${sep}[cortados: model=opus]\nSummarize this page.`
+    expect(modelDirective(prompt)).toEqual({ model: null, prompt, problem: null })
+    expect(modelDirective(`${sep}[cortados: model=opus]\nwork`)).toEqual({ model: null, prompt: `${sep}[cortados: model=opus]\nwork`, problem: null })
+  }
+  // A real first-line directive ended by \r\n still pins and is stripped whole.
+  expect(modelDirective('[cortados: model=opus]\r\nwork')).toEqual({ model: 'sub/opus', prompt: 'work', problem: null })
+})
+
+test('api directives are refused to prevent unexpected bills', async () => {
+  for (const name of ['api/claude-opus-5-5', 'API/opus']) {
+    expect(directiveModelId(name)).toBe(null)
+    expect(modelDirective(`[cortados: model=${name}]\nwork`).problem).toContain('unexpected API bills')
+  }
+})
+
+test('a directive-pinned excluded review is denied without retry', async () => {
+  const { out, calls, toasts } = await reviewWithReplies([
+    { exitCode: 1, stdout: JSON.stringify({ is_error: true, result: 'API Error: 400 sub/claude-opus-5-5 is the excluded model (x-cortados-exclude-model)' }), stderr: '' },
+  ], '[cortados: model=opus]\ncheck it')
+  expect(calls.length).toBe(1)
+  expect(calls[0].headers).toContain('x-cortados-exclude-model: claude-opus-5-5')
+  expect(out.deny).toContain('did not complete cleanly')
+  expect(toasts).toEqual([])
+})
+
+
+test('a background directive-pinned excluded review fails without retry', async () => {
+  resetWorkerModels()
+  const { $, seen, done } = bgHost()
+  $.fs.read = async (path: string) => {
+    if (path.endsWith('/exit')) return '1'
+    if (path.endsWith('/stdout')) return JSON.stringify({ is_error: true, result: 'API Error: 400 sub/claude-opus-5-5 is the excluded model (x-cortados-exclude-model)' })
+    if (path.endsWith('/stderr')) return ''
+    throw new Error('ENOENT')
+  }
+  ;($ as any).session = { model: async () => 'claude-opus-5-5' }
+  await agentHandlerFor({})($, { ...bgEvent, prompt: '[cortados: model=opus]\ncheck it', description: 'review' }, async () => 'native')
+  expect(await done).toContain('did not complete cleanly')
+  expect(seen.cleaned).toEqual([BG_DIR])
 })

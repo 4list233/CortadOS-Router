@@ -1254,6 +1254,15 @@ class Handler(BaseHTTPRequestHandler):
             from cortados_router import core, resources     # the resource-pool snapshot: cached usage + scarcity + local devices + model-fit
             snap = resources.snapshot(core, local_config=getenv("CORTADOS_LOCAL_RESOURCES_CONFIG"))
             return self._json(200, snap)
+        if self.path.split("?")[0] == "/v1/cortados/tasks":
+            if not self._authorized():
+                return self._error(401, "authentication_error", "bad or missing token")
+            try:
+                body = json.dumps(self.server.tasks_view(self.server.registry), allow_nan=False).encode()
+            except Exception as exc:
+                logger.warning("tasks: view failed: %s", type(exc).__name__)
+                return self._error(500, "api_error", "cortados: tasks view unavailable (see provider log)")
+            return self._json(200, body)
         if self.path.split("?")[0] == "/v1/cortados/usage":
             if not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
@@ -2107,18 +2116,31 @@ class Handler(BaseHTTPRequestHandler):
             return None
         r = getattr(session, "route", None) or {}
         local = r.get("local")
+        # As typed first; a friendly spelling (`sub/gpt-6.1`) is resolved only when that misses (_resolved_pin).
         if local:                       # a local pin answers to its alias or its tag, case-insensitively
             names = {local["model"]["id"].casefold(), local_lane.pin_id(local["model"]).casefold()}
-            if r.get("pinned") and pinned.strip().casefold() in names:
+            if r.get("pinned") and (pinned.strip().casefold() in names
+                                    or Handler._resolved_pin(pinned).casefold() in names):
                 return None
             shown = local_lane.pin_id(local["model"])
         else:
-            if r.get("pinned") and r.get("model") == pinned:
+            if r.get("pinned") and (r.get("model") == pinned or r.get("model") == Handler._resolved_pin(pinned)):
                 return None
             shown = r.get("model")
         now = f"pinned to sub/{shown}" if r.get("pinned") else f"routed by S1 to {r.get('model') or 'its model'}"
         return (f"cortados: the model is fixed per conversation: this one is {now}, and this request asks for "
                 f"sub/{pinned}; start a new conversation to change models")
+
+    @staticmethod
+    def _resolved_pin(pinned: str) -> str:
+        """The pin name a continuation's `sub/<name>` means, through the same resolver the opener went through
+        (routing.resolve_pin), so a friendly pin (`sub/gpt-6.1`) continues on the model it opened on. Only reached when
+        the name did not match as typed. An ambiguous or unknown name resolves to itself (and so is refused)."""
+        from cortados_router import core
+        try:
+            return routing.resolve_pin(core, pinned) or pinned
+        except routing.AmbiguousPin:
+            return pinned
 
     def _reveal(self, session) -> str | None:   # api/-pinned requests reveal in _serve_api_lane (api_reveal_suffix)
         try:
@@ -2160,6 +2182,12 @@ class ProviderServer(ThreadingHTTPServer):
             errors.append({"source": "child_tasks", "error": type(exc).__name__})
             events = []
         return registry.office.view(events, now=now, errors=errors)
+
+    def tasks_view(self, registry: Registry) -> dict[str, Any]:
+        """GET /v1/cortados/tasks: read-only recorded decisions; no registry/live routing lock."""
+        from cortados_router import paths
+        from cortados_router.provider import tasks
+        return tasks.collect(paths.state_dir())
 
     def usage_view(self, registry: Registry) -> dict[str, Any] | bytes:
         """GET /v1/cortados/usage (provider/usage.py): cache-only reads plus one short S1 health call. Tests replace it."""

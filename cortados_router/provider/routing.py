@@ -189,6 +189,96 @@ def canonical_model(name: str | None) -> str | None:
 RESERVED_NAMES = ("sub", "api", "cortados", "opusplan", "default")
 
 
+class AmbiguousPin(ValueError):
+    """A friendly pin name that fits more than one pool model. `candidates` are the pin names it could mean; the
+    router never guesses among them (the person asked for one model, and a guess could spend the wrong quota)."""
+
+    def __init__(self, name: str, candidates: list[str]):
+        super().__init__(f"sub/{name} is ambiguous: it could be {', '.join(candidates)}; pin one of them by its full name")
+        self.name, self.candidates = name, candidates
+
+
+# Words that name a lane rather than a model. In a friendly name they narrow the candidates to that lane and are not
+# matched as tokens (`ollama 27b q3km` means the local 27b q3km; no local tag carries the word "ollama").
+LANE_WORDS = {"ollama": "local", "local": "local", "claude": "claude-cli", "anthropic": "claude-cli",
+              "codex": "codex-cli", "openai": "codex-cli", "chatgpt": "codex-cli"}
+# A friendly name is split on these, never on `.`: `6.1` and `qwen3.8` are single tokens, so `GPT 6.1` cannot mean
+# `gpt-6-sol`.
+_SEPARATORS = re.compile(r"[\s\-_:/]+")
+
+
+def name_tokens(name: str) -> list[str]:
+    """The words of a model name, casefolded, split on spaces, dashes, underscores, colons and slashes. Consecutive
+    all-digit words merge into one version (`claude-fable-5-1` -> `5.1`), so a dashed Claude version and a dotted
+    friendly one compare equal. A trailing `-YYYYMMDD` release date is dropped first (model_key)."""
+    parts = [p for p in _SEPARATORS.split(model_key(name) or "") if p]
+    out: list[str] = []
+    for p in parts:
+        if p.isdigit() and out and out[-1].replace(".", "").isdigit():
+            out[-1] += "." + p
+        else:
+            out.append(p)
+    return out
+
+
+def pin_candidates(core) -> list[tuple[str, str, set[str]]]:
+    """Every name a client may pin, as `(pin name, lane, tokens)`: the served models (pinnable_models) under their
+    PIN_VENDORS provider, and the local pins (alias or tag) under `local`, each with the words of its id, alias and
+    display name. A broken local config contributes no local candidates (choose_pinned reports it)."""
+    out = [(m, p, set(name_tokens(m))) for p, m in pinnable_models(core)]
+    try:
+        local = local_lane.pins()
+    except local_lane.LocalConfigError:
+        local = []
+    for _node, m in local:
+        words = set(name_tokens(m["id"])) | set(name_tokens(m.get("alias") or "")) | set(name_tokens(m.get("name") or ""))
+        out.append((local_lane.pin_id(m), "local", words))
+    return out
+
+
+def resolve_pin(core, name: str) -> str | None:
+    """THE resolver for a pinned model name, exact or friendly: the one pin name (a served model id, or a local alias
+    or tag, as choose_pinned and local_lane.find take it) that `name` means, None when it means none, AmbiguousPin
+    when it fits several. Exact first: a SUB_ALIASES key, a served id (release date optional), a local alias or tag,
+    case-insensitively. Then friendly: every word of the name must be a word of the candidate (`GPT 6.1` ->
+    gpt-6.1-sol; `Sonnet 5` -> claude-sonnet-5; `ollama 27b q3km` -> the local 27b q3km tag), a lane word (LANE_WORDS)
+    only narrows the lane. The model field is the only input: prompt text is never searched, so a passing mention of
+    a model in a request cannot pin it."""
+    raw = (name or "").strip()
+    key = model_key(raw)
+    if not key:
+        return None
+    if key in SUB_ALIASES:
+        return SUB_ALIASES[key]
+    candidates = pin_candidates(core)
+    # A set: a name that is both a served id and a local pin is one exact name here, and choose_pinned refuses the
+    # clash as a config error (local_clashes), not as an ambiguity the client could resolve.
+    exact = sorted({pin for pin, _lane, _words in candidates if model_key(pin) == key})
+    if not exact:
+        try:                                   # a local tag pinned by its alias's model, or the other way round
+            loc = local_lane.find(raw)
+        except local_lane.LocalConfigError:
+            loc = None
+        if loc:
+            return local_lane.pin_id(loc[1])
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        raise AmbiguousPin(raw, sorted(exact))
+    words = name_tokens(raw)
+    lanes = {LANE_WORDS[w] for w in words if w in LANE_WORDS}
+    words = [w for w in words if w not in LANE_WORDS]
+    if not words and not lanes:
+        return None
+    hits = [pin for pin, lane, have in candidates
+            if (not lanes or lane in lanes) and all(w in have for w in words)]
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        raise AmbiguousPin(raw, sorted(hits))
+    return None
+
+
 def local_clashes(core) -> dict[str, str]:
     """Local pin names (alias or tag, as model keys) that equal a model this endpoint serves, a SUB_ALIASES key or a
     reserved name, mapped to their node. A clash would let a local entry take over `sub/<served id>` and blur model
@@ -514,6 +604,12 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
     names = ", ".join(excluded_models)            # one model: exactly the single-model wording
     pinned = sub_pin(body)
     if pinned:
+        # A friendly or undated name becomes its one pin name here, before the exclusion check, so that check sees the
+        # model the pin means. A name that means nothing stays as typed: choose_pinned refuses it with the pinnable list.
+        try:
+            pinned = resolve_pin(core, pinned) or pinned
+        except AmbiguousPin as exc:
+            return {"router": execution_routing.ROUTER, "client_error": True, "error": str(exc)}
         if hit(pinned):
             return {"router": execution_routing.ROUTER, "client_error": True,
                     "error": f"sub/{pinned} is the excluded model (x-cortados-exclude-model); pin another model or use cortados"}

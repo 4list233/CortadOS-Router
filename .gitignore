@@ -22,3 +22,5 @@ tables/resources.json
 tables/benchmarks/raw/
 # Claude Code worktrees are per-session scratch checkouts
 .claude/worktrees/
+# Provider credential; must never be committed
+cortados_router/provider-token
