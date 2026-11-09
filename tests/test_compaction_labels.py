@@ -161,8 +161,55 @@ class LabelTests(unittest.TestCase):
         for c in ('git -C /repo commit -m fix\necho "unterminated', "touch f\necho 'open", "git -C r add .\necho a\\"):
             self.assertTrue(command_has_side_effect(c), c)
         for c in ('git -C /repo status\necho "unterminated', 'echo "unterminated'):
-            self.assertFalse(command_has_side_effect(c), c)
-        self.assertTrue(command_has_side_effect('echo "x && rm -rf y'))     # unparsed tail: the regex still decides
+            # Incomplete syntax is now conservative, not confidently read-only.
+            self.assertTrue(command_has_side_effect(c), c)
+        self.assertTrue(command_has_side_effect('echo "x && rm -rf y'))
+
+    def test_shell_comments_preserve_command_boundary(self):
+        self.assertTrue(command_has_side_effect("echo ok # user's note\ntouch marker"))
+        for c in ("true # noop; touch marker", "true # user's note", "echo '# touch marker'",
+                  'echo "# touch marker"', "echo x#not-comment", r"echo \#literal"):
+            with self.subTest(command=c):
+                self.assertFalse(command_has_side_effect(c))
+
+    def test_env_split_string_is_conservative(self):
+        for option in ("-S 'touch marker'", "--split-string 'touch marker'",
+                       "--split-string=touch", "-Stouch", "-iS 'touch marker'", "-S 'true'"):
+            with self.subTest(option=option):
+                self.assertTrue(command_has_side_effect("env " + option))
+                self.assertTrue(command_has_side_effect("sudo env " + option))
+
+    def test_unknown_wrapper_options_are_conservative(self):
+        for c in ("env --argv0 name touch marker", "sudo --user root touch marker",
+                  "time -f format touch marker", "env --unknown true"):
+            with self.subTest(command=c):
+                self.assertTrue(command_has_side_effect(c))
+        # A normal program's -S option is not env's split-string syntax.
+        self.assertFalse(command_has_side_effect("git log -S needle"))
+
+    def test_redirect_operands_do_not_hide_executable(self):
+        for c in ("< /dev/null touch marker", "0</dev/null touch marker", ">/dev/null touch marker",
+                  "2>&1 touch marker", "env < /dev/null touch marker", "< /dev/null git add .",
+                  "true\n< /dev/null touch marker"):
+            with self.subTest(command=c):
+                self.assertTrue(command_has_side_effect(c))
+        for c in ("< /dev/null cat", "0</dev/null cat", "cat < input", "env < input git status",
+                  "true > /dev/null\ncat < input"):
+            with self.subTest(command=c):
+                self.assertFalse(command_has_side_effect(c))
+
+    def test_unmodelled_shell_syntax_is_conservative(self):
+        for c in ("echo $(touch marker)", "echo $COMMAND", "echo <(touch marker)",
+                  "cat <<EOF\ntext\nEOF", "cat <<< text", "(true)", "{ true; }",
+                  "if true; then touch marker; fi", "for x in a; do touch marker; done",
+                  "eval 'touch marker'", "sh -c 'touch marker'", "source script", ". script",
+                  "coproc touch marker", "builtin eval touch marker", "echo `touch marker`",
+                  "echo *", "true >>> file", "cat <", 'echo "unfinished'):
+            with self.subTest(command=c):
+                self.assertTrue(command_has_side_effect(c))
+        for c in ("echo '$COMMAND'", "echo '$(literal)'", "echo '{literal}'"):
+            with self.subTest(command=c):
+                self.assertFalse(command_has_side_effect(c))
 
     def test_target_kinds(self):
         self.assertEqual(target(ev(0, 0, "Grep", {"pattern": " a  b "})), ("query", "grep:a b"))

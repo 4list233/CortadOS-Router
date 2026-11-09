@@ -35,14 +35,7 @@ QUERY_KEYS = ("pattern", "query", "url", "q")
 # Tools whose call changes something outside the context: the fact that they ran must survive compaction.
 SIDE_EFFECT_TOOLS = {"write", "edit", "multiedit", "notebookedit", "apply_patch", "str_replace_editor", "create_file",
                      "delete_file", "todowrite"}
-# Shell commands that change state. Conservative on purpose: a missed side effect drops a call that mattered.
-SIDE_EFFECT_COMMAND = re.compile(
-    r"(^|[;&|]\s*)(git\s+(commit|push|merge|rebase|checkout|reset|add|rm|mv|tag|stash)|rm|mv|cp|mkdir|touch|chmod|"
-    r"pip\s+install|npm\s+(install|i)|brew\s+install|sed\s+-i|tee|curl\s+.*-X\s*(POST|PUT|DELETE|PATCH))\b"
-    r"|[^>]>{1,2}\s*[\w./~-]", re.I)
-
-# Tokenized check (preferred; the regex above is the fallback for commands shlex cannot parse). Git takes global
-# options before its subcommand (`git -C /repo commit`), which a "git <sub>" regex misses.
+# Known simple-command effects. Shell grammar outside the supported subset is conservative.
 GIT_MUTATING = {"commit", "push", "merge", "rebase", "checkout", "switch", "reset", "add", "rm", "mv", "tag", "stash",
                 "cherry-pick", "revert", "pull", "clean", "restore", "apply", "am", "init", "clone", "fetch"}
 GIT_OPTS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env",
@@ -54,7 +47,7 @@ INSTALLERS = {"pip": {"install", "uninstall"}, "pip3": {"install", "uninstall"},
 # unquoted newline survives as a command boundary: as whitespace it vanished and `git status\ngit -C /repo commit`
 # read as one `git status` with extra arguments.
 PUNCTUATION = "();<>|&\n"
-# Any token made only of PUNCTUATION chars that is not a redirect ends the command (";", "&&", "|&", "(", "\n", ...).
+# Only explicitly supported punctuation operators are accepted below; all others are conservative.
 WRITE_REDIRECTS = {">", ">>", ">|", "&>", "&>>"}
 # `>&` writes a file (`echo hi >&out.txt`) unless its target is a descriptor: digits (`2>&1`, `>&2`) or `-` (close).
 DUP_REDIRECT = ">&"
@@ -71,6 +64,18 @@ WRAPPERS = {
 }
 # `timeout DURATION cmd`: the first non-option argument is the duration, not the program.
 WRAPPERS_WITH_POSITIONAL = {"timeout": {"-s", "-k", "--signal", "--kill-after"}}
+# Unknown wrapper options may consume the real executable (env -S was one example). Only
+# these no-argument flags and the separate-argument options above are safely modelled.
+WRAPPER_FLAGS = {
+    "sudo": {"-E", "-H", "-n", "-S", "-b", "-k", "-K", "-v"},
+    "env": {"-i", "--ignore-environment", "-0", "--null"},
+    "exec": {"-c", "-l"},
+    "time": {"-p"},
+    "command": {"-p", "-v", "-V"},
+    "nohup": set(),
+    "nice": set(),
+    "timeout": {"--preserve-status", "--foreground", "-v", "--verbose"},
+}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
@@ -87,7 +92,7 @@ def _git_subcommand(args: list[str]):
     return None
 
 
-def _unwrap(seg: list[str]) -> list[str]:
+def _unwrap(seg: list[str]) -> Optional[list[str]]:
     """Strip VAR=value assignments and wrapper programs (with their options) until the real program is first.
     Iterative on purpose: `env FOO=1 git commit` carries the assignment AFTER the wrapper, and `sudo env X=1 cmd`
     nests wrappers. Every iteration drops at least one token, so the loop ends."""
@@ -106,7 +111,15 @@ def _unwrap(seg: list[str]) -> list[str]:
             if seg[i] == "--":
                 i += 1
                 break
-            i += 2 if seg[i] in with_arg else 1
+            option = seg[i]
+            if name == "env" and option in {"-S", "--split-string"}:
+                return None  # env has a separate expansion language, not ordinary wrapper arguments
+            if option in with_arg:
+                i += 2
+            elif option in WRAPPER_FLAGS[name]:
+                i += 1
+            else:
+                return None  # attached/grouped/unknown options cannot safely be skipped
         if name in WRAPPERS_WITH_POSITIONAL:
             i += 1                  # the positional (timeout's DURATION)
     return seg[i:]
@@ -114,9 +127,16 @@ def _unwrap(seg: list[str]) -> list[str]:
 
 def _segment_mutates(seg: list[str]) -> bool:
     seg = _unwrap(seg)
+    if seg is None:
+        return True
     if not seg:
         return False
     prog, args = os.path.basename(seg[0]), seg[1:]
+    # Compound shell grammar and code-evaluating builtins are not simple executable arguments.
+    if prog in {"if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+                "select", "function", "coproc", "repeat", "!", "[[", "eval", "source", ".",
+                "builtin", "bash", "sh", "zsh", "dash"}:
+        return True
     if prog == "git":
         return _git_subcommand(args) in GIT_MUTATING
     if prog in MUTATING_PROGRAMS:
@@ -132,54 +152,105 @@ def _segment_mutates(seg: list[str]) -> bool:
     return False
 
 
+def _shell_subset(cmd: str) -> tuple[str, bool]:
+    """Strip comments without losing newlines; reject syntax shlex does not model.
+
+    This is a lexical guard, not a shell parser. Expansions, compound constructs, continuations and
+    nontrivial redirects must never acquire a read-only label just because shlex accepts them.
+    Quotes/escapes are tracked here because shlex discards that information.
+    """
+    out: list[str] = []
+    quote = ""
+    word_start = True
+    i = 0
+    while i < len(cmd):
+        c = cmd[i]
+        if c == "#" and not quote and word_start:
+            end = cmd.find("\n", i)
+            i = len(cmd) if end < 0 else end
+            continue
+        if c == "\\" and quote != "'":
+            if i + 1 >= len(cmd) or cmd[i + 1] == "\n":
+                return "".join(out), False
+            out.extend(cmd[i:i + 2])
+            i += 2
+            word_start = False
+            continue
+        if c in "'\"" and (not quote or quote == c):
+            quote = "" if quote else c
+        elif quote != "'" and c in "$`":
+            return "".join(out), False
+        elif not quote and c in "{}*?[]~":
+            return "".join(out), False
+        out.append(c)
+        word_start = not quote and c in " \t\r\n;|&()<>"
+        i += 1
+    return "".join(out), not quote
+
+
 def _tokens(cmd: str) -> tuple[list[str], bool]:
-    """Shell tokens of `cmd` and whether the whole command parsed. On a parse error (unbalanced quote, trailing
-    backslash) the tokens emitted BEFORE the error are returned: those commands are complete and a shell may well have
-    run them before reaching the bad line, so they still get classified instead of being lost to the fallback."""
+    cmd, supported = _shell_subset(cmd)
+    if not supported:
+        return [], False
     lex = shlex.shlex(cmd, posix=True, punctuation_chars=PUNCTUATION)
     lex.whitespace_split = True
-    lex.whitespace = " \t\r"       # not "\n": the newline is a punctuation token (command boundary), see PUNCTUATION
-    lex.commenters = ""            # a comment would swallow its newline and glue the next line onto this command
-    tokens: list[str] = []
+    lex.whitespace = " \t\r"
+    lex.commenters = ""  # comments were removed above, retaining their terminating newline
     try:
+        # Split punctuation runs so a redirect next to a newline cannot erase the command boundary.
+        tokens = []
         for t in lex:
-            tokens.append(t)
+            if "\n" in t and all(c in PUNCTUATION for c in t):
+                tokens.extend(re.findall(r"[^\n]+|\n", t))
+            else:
+                tokens.append(t)
+        return tokens, True
     except ValueError:
-        return tokens, False
-    return tokens, True
+        return [], False
 
 
 def _tokens_mutate(tokens: list[str]) -> bool:
     seg: list[str] = []
-    for i, t in enumerate(tokens):
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
         if t and all(c in PUNCTUATION for c in t):
-            op = t.replace("\n", "")   # ";\n", "&&\n", "\n>" ... : the operator, if any, decides
-            nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
-            if op in WRITE_REDIRECTS:
-                if nxt != "/dev/null":
+            if t in WRITE_REDIRECTS or t in {DUP_REDIRECT, "<", "<&"}:
+                if i + 1 >= len(tokens):
+                    return True  # incomplete syntax cannot prove read-only
+                target = tokens[i + 1]
+                if not target or all(c in PUNCTUATION for c in target):
                     return True
+                if t in WRITE_REDIRECTS and target != "/dev/null":
+                    return True
+                if t == ">&" and not (target.isdigit() or target in {"-", "/dev/null"}):
+                    return True
+                if t == "<&" and not (target.isdigit() or target == "-"):
+                    return True
+                # A leading IO number belongs to the redirect, not the executable.
+                if seg and seg[-1].isdigit():
+                    seg.pop()
+                i += 2
                 continue
-            if op == DUP_REDIRECT:
-                if not (nxt.isdigit() or nxt == "-") and nxt != "/dev/null":
-                    return True    # `>&file` creates/truncates file; `2>&1` / `>&-` only move descriptors
-                continue
-            if op.startswith("<"):
-                continue           # input redirects (`<`, `<<`, `<<<`, `<&`) read; the word after them stays an argument
+            if t not in {";", "&&", "||", "|", "&", "|&", "\n"}:
+                return True  # heredocs, here strings, groups and unknown operators are unmodelled
             if _segment_mutates(seg):
                 return True
             seg = []
-            continue
-        seg.append(t)
+        else:
+            seg.append(t)
+        i += 1
     return _segment_mutates(seg)
 
 
 def command_has_side_effect(cmd: str) -> bool:
+    """True means known mutation OR unmodelled shell syntax (there is no uncertain label).
+
+    Only a completely parsed supported command may return False. A regex fallback cannot establish
+    safety for a shell program and previously turned parser gaps into incorrect training labels.
+    """
     tokens, complete = _tokens(cmd)
-    if _tokens_mutate(tokens):
-        return True
-    if not complete:
-        return bool(SIDE_EFFECT_COMMAND.search(cmd))   # the unparsed tail: regex is the best remaining evidence
-    return False
+    return not complete or _tokens_mutate(tokens)
 
 
 # Distinctive identifiers: git-like hashes, uuids, slash paths, long id-like tokens mixing letters and digits.
