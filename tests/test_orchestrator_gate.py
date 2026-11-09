@@ -3,6 +3,7 @@ import io
 import json
 import os
 from pathlib import Path
+import socket
 import stat
 import subprocess
 import sys
@@ -22,10 +23,12 @@ class GateTests(unittest.TestCase):
         self.event = {"session_id": "session", "prompt_id": "prompt", "tool_name": "Bash",
                       "tool_input": {"command": "true"}, "hook_event_name": "PreToolUse"}
 
-    def call(self, event=None, env=None):
+    def call(self, event=None, env=None, probe=None):
         out, err = io.StringIO(), io.StringIO()
+        # Default probe: any real probe in these tests is a test failure (no network, no provider is ever opened).
         rc = gate.main(io.StringIO(json.dumps(self.event if event is None else event)),
-                       out, err, {} if env is None else env, self.directory)
+                       out, err, {} if env is None else env, self.directory,
+                       probe or (lambda url: self.fail(f"unexpected provider probe of {url}")))
         # Fail-open exits 1 so Claude Code shows the stderr line yet still allows the tool; normal decisions exit 0.
         self.assertEqual(rc, 1 if err.getvalue() else 0)
         return out.getvalue(), err.getvalue()
@@ -43,35 +46,42 @@ class GateTests(unittest.TestCase):
                                            {"CORTADOS_DELEGATE_BUDGET": "0"}), ("", ""))
         self.assertFalse(self.directory.exists())
 
-    def test_fork_denied_in_main_loop_without_budget(self):
+    def test_agent_and_task_denied_in_main_loop_without_spending_budget(self):
+        """The owner's rule: the top-level session never delegates with the Agent tool. Denied whatever the
+        subagent type or input shape, with a reason that names start_task and the no-router fallback."""
         for tool in ("Agent", "Task"):
-            for kind in ("fork", " Fork ", "FORK", "f_ork", "f-ork", "f ork", "F.o.r.k", "f2ork"):
-                out, err = self.call(dict(self.event, tool_name=tool,
-                                          tool_input={"subagent_type": kind, "prompt": "x"}))
+            for tool_input in ({"subagent_type": "general-purpose", "prompt": "x"}, {"subagent_type": "fork"},
+                               {"prompt": "x"}, "not a dict", None):
+                out, err = self.call(dict(self.event, tool_name=tool, tool_input=tool_input),
+                                     {"CORTADOS_DELEGATE_BUDGET": "3"})
                 self.assertEqual(err, "")
                 self.assertEqual(json.loads(out), {"hookSpecificOutput": {
                     "hookEventName": "PreToolUse", "permissionDecision": "deny",
-                    "permissionDecisionReason": gate.FORK_DENY_REASON}})
+                    "permissionDecisionReason": gate.AGENT_DENY_REASON}})
+        self.assertIn("mcp__cortados-route__start_task", gate.AGENT_DENY_REASON)
+        self.assertIn("tell the owner in one line and do the work directly", gate.AGENT_DENY_REASON)
+        self.assertFalse(self.directory.exists(), "a refused Agent call spends no budget")
+        self.assertEqual(self.call(), ("", ""), "the budget is intact after the refusals")
+
+    def test_agent_allowed_inside_subagent(self):
+        for tool_input in ({"subagent_type": "fork"}, {"subagent_type": "general-purpose"}):
+            self.assertEqual(self.call(dict(self.event, tool_name="Agent", tool_input=tool_input, agent_id="child"),
+                                       {"CORTADOS_DELEGATE_BUDGET": "0"}), ("", ""))
         self.assertFalse(self.directory.exists())
 
-    def test_non_ascii_agent_type_denied_without_budget(self):
-        for kind in ("f\u2014ork", "f\u2e5dork", "\U0001CCDBork", "\uff46\uff4f\uff52\uff4b", "g\u00e9n\u00e9ral"):
-            for tool in ("Agent", "Task"):
-                out, err = self.call(dict(self.event, tool_name=tool, tool_input={"subagent_type": kind}),
-                                     {"CORTADOS_DELEGATE_BUDGET": "0"})
-                self.assertEqual(err, "")
-                self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"],
-                                 gate.NON_ASCII_DENY_REASON)
-        self.assertFalse(self.directory.exists())
-
-    def test_fork_allowed_inside_subagent_and_other_agents_unbudgeted(self):
-        fork = dict(self.event, tool_name="Agent", tool_input={"subagent_type": "fork"})
-        self.assertEqual(self.call(dict(fork, agent_id="child")), ("", ""))
-        for tool_input in ({"subagent_type": "general-purpose"}, {"subagent_type": "forked"}, {"prompt": "x"}, "not a dict", None):
+    def test_cortados_route_tools_unlimited_and_exact_prefix(self):
+        for tool in ("mcp__cortados-route__start_task", "mcp__cortados-route__route_task",
+                     "mcp__cortados-route__wait_task", "mcp__cortados-route__task_status",
+                     "mcp__cortados-route__list_tasks", "mcp__cortados-route__cancel_task"):
             for _ in range(5):
-                self.assertEqual(self.call(dict(self.event, tool_name="Agent", tool_input=tool_input),
+                self.assertEqual(self.call(dict(self.event, tool_name=tool),
                                            {"CORTADOS_DELEGATE_BUDGET": "0"}), ("", ""))
         self.assertFalse(self.directory.exists())
+        # Another server's start_task (a workspace connector) is ordinary work and spends the budget.
+        for tool in ("mcp__velox-workspace__start_task", "mcp__cortados-routex__start_task", "mcp__cortados__route_task"):
+            out, err = self.call(dict(self.event, tool_name=tool), {"CORTADOS_DELEGATE_BUDGET": "0"})
+            self.assertEqual(err, "")
+            self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny", tool)
 
     def test_budget_then_exact_deny(self):
         for _ in range(3):
@@ -80,8 +90,11 @@ class GateTests(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertEqual(json.loads(out), {"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "deny",
-            "permissionDecisionReason": "orchestrator: you have used your 3 direct work calls for this prompt; "
-            "delegate this to a subagent with the Agent tool (subagents have every tool, MCP included)"}})
+            "permissionDecisionReason": gate.budget_deny_reason(3)}})
+        reason = gate.budget_deny_reason(3)
+        self.assertIn("used your 3 direct work calls", reason)
+        self.assertIn("mcp__cortados-route__start_task", reason)
+        self.assertNotIn("Agent tool", reason)
         self.assertEqual(stat.S_IMODE(self.directory.stat().st_mode), 0o700)
         path = gate.state_path(self.directory, "session")
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
@@ -169,6 +182,8 @@ class GateTests(unittest.TestCase):
 
     def test_absolute_script_unknown_cwd_and_parallel_budget(self):
         env = dict(os.environ, HOME=str(self.home), CORTADOS_DELEGATE_BUDGET="3")
+        for key in ("CORTADOS_PROVIDER_URL", "ANTHROPIC_BASE_URL"):     # no provider target: no real probe
+            env.pop(key, None)
         script = str(Path(gate.__file__).resolve())
 
         def invoke(_):
@@ -179,6 +194,99 @@ class GateTests(unittest.TestCase):
         self.assertTrue(all(r.returncode == 0 and not r.stderr for r in results))
         self.assertEqual(sum(not r.stdout for r in results), 3)
         self.assertEqual(sum(bool(r.stdout) for r in results), 9)
+
+    def test_router_outage_releases_budget_but_agent_stays_refused(self):
+        """Regression (review P2): with the budget spent and cortados-route unavailable, the session could neither
+        delegate nor work directly. While the provider is unreachable the gate now allows direct work past the budget,
+        visibly (stderr, exit 1), without counting it; Agent/Task stay refused; recovery restores the denial."""
+        env = {"CORTADOS_DELEGATE_BUDGET": "3", "ANTHROPIC_BASE_URL": "http://user:secret@provider.example:8432/x"}
+        probed = []
+        down = lambda url: probed.append(url) or "cannot connect to provider.example:8432 (ConnectionRefusedError)"
+        for _ in range(3):
+            self.assertEqual(self.call(env=env, probe=down), ("", ""))
+        self.assertEqual(probed, [], "no probe while the budget lasts")
+        for _ in range(2):
+            out, err = self.call(env=env, probe=down)
+            self.assertEqual(out, "")
+            self.assertIn("provider http://provider.example:8432 unreachable", err)
+            self.assertIn("Agent stays refused", err)
+            self.assertNotIn("secret", err)
+            self.assertNotIn("fail open", err)
+        self.assertEqual(len(probed), 2)
+        self.assertEqual(json.loads(gate.state_path(self.directory, "session").read_text()), {"prompt": 3},
+                         "outage calls do not spend the budget")
+        for tool in ("Agent", "Task"):
+            out, err = self.call(dict(self.event, tool_name=tool, tool_input={"prompt": "x"}), env, down)
+            self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"],
+                             gate.AGENT_DENY_REASON)
+            self.assertEqual(err, "")
+        self.assertEqual(len(probed), 2, "an Agent refusal never probes")
+        # Provider back: the budget denial returns, and its reason explains the recovery path.
+        out, err = self.call(env=env, probe=lambda url: None)
+        self.assertEqual(err, "")
+        reason = json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(reason, gate.budget_deny_reason(3, "http://provider.example:8432"))
+        self.assertIn("unreachable this gate releases the budget", reason)
+        self.assertIn("Agent and Task stay refused", reason)
+        self.assertIn("--no-gate", reason)
+        self.assertNotIn("secret", reason)
+
+    def test_cortados_provider_url_preferred_and_no_target_no_release(self):
+        seen = []
+        env = {"CORTADOS_DELEGATE_BUDGET": "0", "CORTADOS_PROVIDER_URL": "https://route.example",
+               "ANTHROPIC_BASE_URL": "http://other.example:1"}
+        self.assertIn("unreachable", self.call(env=env, probe=lambda url: seen.append(url) or "down")[1])
+        self.assertEqual(seen, ["https://route.example"])
+        # No provider configured at all: nothing to check, so the budget holds (no silent release).
+        out, err = self.call(env={"CORTADOS_DELEGATE_BUDGET": "0"})
+        self.assertEqual(err, "")
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_slow_resolver_deadline_keeps_budget_and_does_not_hold_hook_open(self):
+        # No real host: the resolver stays blocked beyond hook exit. This also catches
+        # non-daemon workers that hold Python shutdown open.
+        script = """
+import io
+import json
+import socket
+import sys
+import time
+from cortados_router import orchestrator_gate as gate
+
+def slow_resolver(*args, **kwargs):
+    time.sleep(10)
+    raise socket.gaierror("fake resolver stalled")
+
+socket.getaddrinfo = slow_resolver
+event = {"session_id": "deadline", "prompt_id": "p", "tool_name": "Bash"}
+env = {"CORTADOS_DELEGATE_BUDGET": "0", "CORTADOS_PROVIDER_URL": "http://fake.invalid"}
+start = time.monotonic()
+rc = gate.main(io.StringIO(json.dumps(event)), env=env, directory=sys.argv[1],
+               probe=lambda url: gate.provider_unreachable(url, timeout=0.1))
+assert time.monotonic() - start < 1.0, "probe exceeded wall-clock deadline"
+sys.exit(rc)
+"""
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", script, str(self.directory)],
+            cwd=str(Path(gate.__file__).resolve().parent.parent),
+            text=True, capture_output=True, timeout=2,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_real_probe_against_local_sockets(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        try:
+            self.assertIsNone(gate.provider_unreachable(f"http://127.0.0.1:{port}"))
+        finally:
+            listener.close()
+        self.assertIn("cannot connect to 127.0.0.1", gate.provider_unreachable(f"http://127.0.0.1:{port}", 1.0))
+        for url in ("not a url", "ftp://host", "http://", "http://h:99999"):
+            self.assertEqual(gate.provider_unreachable(url), "provider URL is malformed", url)
 
 
 if __name__ == "__main__":

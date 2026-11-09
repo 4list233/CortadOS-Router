@@ -3,8 +3,10 @@
     python3 -m cortados_router.session [--orchestrator fable|opus|sonnet|<model id>|cortados]
         [--provider-url URL] [--token-file PATH] [--no-delegate-directive] [--print-env] [-- <claude args>]
 
-The main loop (the orchestrator) is pinned to a subscription model (`sub/<id>`, no S1). Claude Code's NATIVE
-subagents, which keep every tool including MCP, are sent to `cortados` so S1 routes each one. Stdlib only.
+The main loop (the orchestrator) is pinned to a subscription model (`sub/<id>`, no S1) and delegates through the
+cortados-route MCP tools (start_task / route_task); its own Agent calls are refused by the gate (orchestrator_gate.py).
+Claude Code's NATIVE subagents, which keep every tool including MCP, are sent to `cortados` so S1 routes each one
+(this matters for child tasks, launched through this module with the gate off, whose subagents are allowed). Stdlib only.
 """
 from __future__ import annotations
 

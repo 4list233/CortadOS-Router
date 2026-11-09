@@ -50,7 +50,9 @@ TOOL = {
             "context": {"type": "string", "description": "Optional extra input or background to include with the task."},
             "max_tokens": {"type": "integer", "description": f"Max tokens for the answer (default {DEFAULT_MAX_TOKENS})."},
             "model": {"type": "string", "description": "Optional. Omitted or 'cortados': S1 routes the subtask. Otherwise "
-                      "a pinnable model or alias (fable, opus, sonnet, claude-*, gpt-*), sent as sub/<id> (no S1)."},
+                      "a pinnable model or alias (fable, opus, sonnet, claude-*, gpt-*) or a friendly name ('GPT 6.1', "
+                      "'Sonnet 5', 'ollama 27b q3km': every word must belong to exactly one pool model; an ambiguous "
+                      "name is refused with its candidates), sent as sub/<id> (no S1)."},
         },
         "required": ["task"],
     },
@@ -93,8 +95,9 @@ CHILD_TOOLS = [
          "title": {"type": "string", "description": "Optional short label for the task (1-80 printable ASCII "
                    "characters), shown in the CortadOS Office view. A label only: never secrets or file contents."},
          "orchestrator": {"type": "string", "description": "'cortados' (default: S1 routes every turn) or a pinnable "
-                          "model such as fable, opus, sonnet, gpt-6.1-sol: that pins the child's MAIN model; the "
-                          "child's subagents are still routed by S1."},
+                          "model such as fable, opus, sonnet, gpt-6.1-sol, or a friendly name ('GPT 6.1', 'Sonnet 5', "
+                          "'ollama 27b q3km'; an ambiguous name is refused with its candidates): that pins the child's "
+                          "MAIN model; the child's subagents are still routed by S1."},
          "permission_mode": {"type": "string", "enum": _MODES, "description": "auto (default where the model "
                              "supports it): a safety classifier approves or denies each action (haiku models other "
                              "than claude-haiku-5-5 have no auto mode: unset, they get acceptEdits; 'auto' is refused); acceptEdits: edits in cwd allowed, other approval-needing "

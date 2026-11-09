@@ -28,7 +28,10 @@ is the long form.
   `office.py` is the Office view (`GET /v1/cortados/office`, metadata-only floors per routing session, fed by the
   `x-cortados-session/-project/-device/-task-title` headers, child-tasks.jsonl and `POST /v1/cortados/office/heartbeat`);
   `clients.py` holds the scoped per-client tokens (`clients.json`, hashes + named scopes; only `office:read` today; the
-  owner token is checked first and unchanged).
+  owner token is checked first and unchanged). `usage.py` builds `GET /v1/cortados/usage` and `tasks.py` builds
+  `GET /v1/cortados/tasks` (the latest 200 `routes` rows as metadata: model, band, S1 reason by category, elapsed, % routed
+  per session; never the request text; tokens are not recorded per route), both behind the owner token and both read by
+  `dashboard.html` (`GET /dashboard`).
 - `tables/` — routing table, budgets, generated model scores and tiers (`*.generated.json` are built
   nightly by `tables/benchmarks/build_tiers.py`; do not hand-edit them).
 - `s1/` — S1 scorer: dataset, labelling, SFT, evaluation, serving, nightly job.
@@ -69,6 +72,19 @@ is the long form.
 ## Verification
 After the suite passes, follow `.claude/skills/verify-router/SKILL.md` and paste its evidence block
 into the handback / PR. Codex and Cursor: read that file and follow it the same way.
+
+## Project todos
+- The "Live status" section at the top of issue #60 on 4list233/CortadOS-Router is the one todo list. Every item has
+  an issue; pause notes and memory link to #60 and hold no lists of their own (reason: separate lists drifted from
+  the tracker for five days in November 2026).
+- The top-level orchestrator is the only writer of #60. It updates the section when a branch merges, a review lands,
+  a decision is made or a session pauses. Delegates and child tasks report back; they do not edit it.
+- The drift check runs at session start and before any merge:
+  `python3 -B scripts/tracker_check.py`
+  It is read-only (`gh issue list` / `gh issue view` and local git refs) and reports open issues whose branch is
+  already merged, unmerged local branches that no open issue mentions, and the age of the Live status date (warning
+  past 2 days). Exit 0 clean, 1 drift, 2 the check could not run; a failed check is never a clean result. Tests:
+  `tests/test_tracker_check.py` (fakes only, no GitHub call).
 
 ## Delegating subtasks through the router (route_task)
 

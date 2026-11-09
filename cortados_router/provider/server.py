@@ -45,6 +45,7 @@ if __package__ in (None, ""):                           # run as a file: make th
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from cortados_router.compat import getenv
+from cortados_router.compaction import prune as compaction_prune, store as compaction_store
 from cortados_router.provider import anthropic_wire, clients, local_lane, office, responses_wire, routing, search_lane
 from cortados_router.provider.bridge import BridgeError, BridgeSession, ToolWaitExpired, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
@@ -910,6 +911,7 @@ class Registry:
 
     def note_closed(self, s, reason: str) -> None:
         """Remember a closed conversation for _lost_diagnostic (see self.closed)."""
+        compaction_prune.shadow_decide_async(str(s.id))     # background thread; no-op unless the store is on
         hist = getattr(s, "history", None)
         if hist:
             with self._lock:
@@ -999,6 +1001,8 @@ class Registry:
                         hist = getattr(s, "history", None)
                         if hist:
                             self.closed.append((time.time(), "reaped", hist[0], len(hist)))
+                if expired:
+                    compaction_prune.shadow_decide_async(str(s.id))   # background thread; no-op unless the store is on
                 if expired:
                     logger.info("closing idle conversation %s (awaiting_tool_result=%s, ttl=%ss)",
                                 s.id[:8], getattr(s, "awaiting_tool_result", False), ttl)
@@ -1254,6 +1258,15 @@ class Handler(BaseHTTPRequestHandler):
             from cortados_router import core, resources     # the resource-pool snapshot: cached usage + scarcity + local devices + model-fit
             snap = resources.snapshot(core, local_config=getenv("CORTADOS_LOCAL_RESOURCES_CONFIG"))
             return self._json(200, snap)
+        if self.path.split("?")[0] == "/v1/cortados/tasks":
+            if not self._authorized():
+                return self._error(401, "authentication_error", "bad or missing token")
+            try:
+                body = json.dumps(self.server.tasks_view(self.server.registry), allow_nan=False).encode()
+            except Exception as exc:
+                logger.warning("tasks: view failed: %s", type(exc).__name__)
+                return self._error(500, "api_error", "cortados: tasks view unavailable (see provider log)")
+            return self._json(200, body)
         if self.path.split("?")[0] == "/v1/cortados/usage":
             if not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
@@ -1878,6 +1891,10 @@ class Handler(BaseHTTPRequestHandler):
                 outcome["turn"] = session.run_turn(deadline - time.time())
                 _turn_ms = int((time.time() - _turn_t0) * 1000)
                 _remember_reply(session, turn, msg_id, model, outcome["turn"])
+                # Compaction content store (shadow, off unless CORTADOS_COMPACTION_STORE=1): the one point where the
+                # turn's new user content / tool results and the backend's reply are both known. It only reads them
+                # and enqueues for the store's background writer; it never raises or blocks (failures are counted).
+                self._compaction_record(session, turn, outcome["turn"][0], wire)
                 try:
                     _ledger_turn(session, outcome["turn"][2])
                 except Exception as exc:
@@ -2073,6 +2090,23 @@ class Handler(BaseHTTPRequestHandler):
                 parts.append(f"{name}={v}")
         return "\n".join(parts) or None
 
+    def _compaction_record(self, session, turn, blocks, w: Wire) -> None:
+        """Hand the turn to the compaction store (shadow). Only enqueues for its background writer; every failure is
+        contained here, so turn finalization (history, ledger, route log) always runs after it."""
+        try:
+            if not compaction_store.enabled():
+                return
+            rid, rid_ok = self._run_id()
+            meta = {"run_id": rid if rid_ok else None,
+                    "session": (self.headers.get("x-cortados-session") or "").strip()[:200] or None,
+                    "client": self._client()}
+            compaction_store.STORE.record_turn(
+                str(session.id), source="codex" if w is RESPONSES else "claude-code",
+                user_content=turn.content, tool_results=turn.tool_results, assistant_blocks=blocks, meta=meta)
+        except Exception as exc:   # never interrupts the turn; counted like any store scheduling failure
+            compaction_store.STORE._count("schedule_failures",
+                                          f"turn not handed to the store: {type(exc).__name__}: {exc}")
+
     def _run_id(self) -> tuple[str | None, bool]:
         """The x-cortados-run-id header: (id or None when absent/empty, valid)."""
         v = (self.headers.get(RUN_ID_HEADER) or "").strip()
@@ -2107,18 +2141,31 @@ class Handler(BaseHTTPRequestHandler):
             return None
         r = getattr(session, "route", None) or {}
         local = r.get("local")
+        # As typed first; a friendly spelling (`sub/gpt-6.1`) is resolved only when that misses (_resolved_pin).
         if local:                       # a local pin answers to its alias or its tag, case-insensitively
             names = {local["model"]["id"].casefold(), local_lane.pin_id(local["model"]).casefold()}
-            if r.get("pinned") and pinned.strip().casefold() in names:
+            if r.get("pinned") and (pinned.strip().casefold() in names
+                                    or Handler._resolved_pin(pinned).casefold() in names):
                 return None
             shown = local_lane.pin_id(local["model"])
         else:
-            if r.get("pinned") and r.get("model") == pinned:
+            if r.get("pinned") and (r.get("model") == pinned or r.get("model") == Handler._resolved_pin(pinned)):
                 return None
             shown = r.get("model")
         now = f"pinned to sub/{shown}" if r.get("pinned") else f"routed by S1 to {r.get('model') or 'its model'}"
         return (f"cortados: the model is fixed per conversation: this one is {now}, and this request asks for "
                 f"sub/{pinned}; start a new conversation to change models")
+
+    @staticmethod
+    def _resolved_pin(pinned: str) -> str:
+        """The pin name a continuation's `sub/<name>` means, through the same resolver the opener went through
+        (routing.resolve_pin), so a friendly pin (`sub/gpt-6.1`) continues on the model it opened on. Only reached when
+        the name did not match as typed. An ambiguous or unknown name resolves to itself (and so is refused)."""
+        from cortados_router import core
+        try:
+            return routing.resolve_pin(core, pinned) or pinned
+        except routing.AmbiguousPin:
+            return pinned
 
     def _reveal(self, session) -> str | None:   # api/-pinned requests reveal in _serve_api_lane (api_reveal_suffix)
         try:
@@ -2160,6 +2207,12 @@ class ProviderServer(ThreadingHTTPServer):
             errors.append({"source": "child_tasks", "error": type(exc).__name__})
             events = []
         return registry.office.view(events, now=now, errors=errors)
+
+    def tasks_view(self, registry: Registry) -> dict[str, Any]:
+        """GET /v1/cortados/tasks: read-only recorded decisions; no registry/live routing lock."""
+        from cortados_router import paths
+        from cortados_router.provider import tasks
+        return tasks.collect(paths.state_dir())
 
     def usage_view(self, registry: Registry) -> dict[str, Any] | bytes:
         """GET /v1/cortados/usage (provider/usage.py): cache-only reads plus one short S1 health call. Tests replace it."""
@@ -2211,13 +2264,15 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
             registry.reap(IDLE_S)
 
     threading.Thread(target=reaper, daemon=True, name="cortados-provider-reaper").start()
+    compaction_store.STORE.maybe_prune_async()          # retention at start; record_turn re-runs it at most hourly
     logger.info("cortados provider on http://%s:%d (model %s, %s)", host, port, wire.MODEL_ID,
                 f"fixed to claude CLI {fixed_model}, no routing" if fixed_model else "routed by S1")
     try:
         httpd.serve_forever()
     finally:
         for s in list(registry.sessions.values()):
-            registry.drop(s)
+            registry.drop(s)                                # each drop enqueues that conversation's shadow decisions
+        compaction_store.STORE.shutdown()                   # then drain them (bounded) and count what did not run
 
 
 def main(argv=None) -> None:

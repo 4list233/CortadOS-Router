@@ -1,7 +1,8 @@
 import { test, expect } from 'claude-code/testing'
 import { resolveProviderUrl, officeTitle, officeName, baseName, sessionTag, officeHeaderLines, OFFICE_SALT_KEY, OFFICE_BEAT_MIN_MS, OFFICE_BEAT_REFRESH_MS, OFFICE_BEAT_TIMEOUT_MS } from './register'
 import { BG_SWEEP_SH, BG_SWEEP_MS, sweepBackgroundRuns } from './register'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL, resolveBackgroundTimeoutMs, BG_LAUNCH_SH, BG_CLEANUP_SH, BACKGROUND_DATA_BOUNDARY, backgroundData, isBgDir } from './register'
+import { MODEL_DIRECTIVE_RE, modelDirective, directiveModelId } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, refusesAgent, isDelegationTool, AGENT_REFUSAL, ORCHESTRATOR_DIRECTIVE, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL, resolveBackgroundTimeoutMs, BG_LAUNCH_SH, BG_CLEANUP_SH, BACKGROUND_DATA_BOUNDARY, backgroundData, isBgDir } from './register'
 
 test('background sweep starts once per session and repeats on the mod clock', async () => {
   let start: any
@@ -115,13 +116,14 @@ test('resolveAllowSet drops malformed tokens and falls back to defaults when emp
   expect(a.has('Read')).toBe(true)
   expect(a.has('Glob')).toBe(true)
   expect(a.has('Bash!')).toBe(false)
-  // all-malformed -> fallback to the default set (so Read/Grep/Agent still work)
+  // all-malformed -> fallback to the default set (so Read/Grep/ToolSearch still work)
   const fb = resolveAllowSet('[Read,Grep]')
   expect(fb.has('Read')).toBe(true)
   expect(fb.has('Grep')).toBe(true)
-  expect(fb.has('Agent')).toBe(true)
+  expect(fb.has('ToolSearch')).toBe(true)
+  expect(fb.has('Agent')).toBe(false)                           // Agent is never on the brain's allowlist
   // whitespace-only -> fallback
-  expect(resolveAllowSet('   ').has('Agent')).toBe(true)
+  expect(resolveAllowSet('   ').has('Read')).toBe(true)
 })
 
 test('parseList splits on commas and whitespace and drops empties', async () => {
@@ -131,26 +133,49 @@ test('parseList splits on commas and whitespace and drops empties', async () => 
   expect(parseList('')).toEqual([])
 })
 
-test('mainLoopAllows gates only the main loop, allowlist-style, with Agent always allowed', async () => {
-  const allow = new Set(['Read', 'Grep', 'TodoWrite'])
+test('mainLoopAllows gates only the main loop, allowlist-style, with Agent always refused', async () => {
+  const allow = new Set(['Read', 'Grep', 'TodoWrite', 'Agent'])  // Agent listed on purpose: the list cannot admit it
   // main loop (no agentId): allowlisted -> allow; non-listed work tool -> deny
   expect(mainLoopAllows('Read', undefined, allow, true)).toBe(true)
   expect(mainLoopAllows('Bash', undefined, allow, true)).toBe(false)
   expect(mainLoopAllows('Monitor', undefined, allow, true)).toBe(false) // denylist would have missed this
   expect(mainLoopAllows('mcp__x__write', undefined, allow, true)).toBe(false) // and this
-  // Agent is always allowed so delegation is never locked out, even if absent from the allowlist
-  expect(mainLoopAllows('Agent', undefined, allow, true)).toBe(true)
-  // a non-main loop (agentId present) is never gated
+  // Agent is refused on the main loop (owner rule: delegate with start_task), even when the allowlist names it
+  expect(mainLoopAllows('Agent', undefined, allow, true)).toBe(false)
+  // a non-main loop (agentId present) is never gated, Agent included
   expect(mainLoopAllows('Bash', 'agent-123', allow, true)).toBe(true)
+  expect(mainLoopAllows('Agent', 'agent-123', allow, true)).toBe(true)
   // mode off -> everything allowed
   expect(mainLoopAllows('Bash', undefined, allow, false)).toBe(true)
+  expect(mainLoopAllows('Agent', undefined, allow, false)).toBe(true)
 })
 
-test('route_task is a delegation primitive, always allowed on the brain even if not in the allowlist', async () => {
-  const allow = new Set(['Read', 'Grep'])                       // route_task deliberately absent from this set
-  expect(mainLoopAllows('mcp__cortados-route__route_task', undefined, allow, true)).toBe(true)
-  // the default allow-set also lists it, so a default config advertises it
-  expect(resolveAllowSet('').has('mcp__cortados-route__route_task')).toBe(true)
+test('the cortados-route tools are the delegation primitives: always allowed on the brain, exact server prefix', async () => {
+  const allow = new Set(['Read', 'Grep'])                       // deliberately absent from this set
+  for (const t of ['start_task', 'route_task', 'wait_task', 'task_status', 'list_tasks', 'cancel_task']) {
+    expect(isDelegationTool(`mcp__cortados-route__${t}`)).toBe(true)
+    expect(mainLoopAllows(`mcp__cortados-route__${t}`, undefined, allow, true)).toBe(true)
+  }
+  // another server's start_task (a workspace connector) is ordinary work
+  for (const t of ['mcp__velox-workspace__start_task', 'mcp__cortados-routex__start_task', 'mcp__cortados__route_task', 'start_task']) {
+    expect(isDelegationTool(t)).toBe(false)
+    expect(mainLoopAllows(t, undefined, allow, true)).toBe(false)
+  }
+  // the default allow-set no longer needs to list them (and never lists Agent)
+  const d = resolveAllowSet('')
+  expect(d.has('Agent')).toBe(false)
+  expect(d.has('Read')).toBe(true)
+})
+
+test('refusesAgent: only the top-level session in orchestrator mode', async () => {
+  expect(refusesAgent(true, undefined)).toBe(true)
+  expect(refusesAgent(true, null)).toBe(true)
+  expect(refusesAgent(true, 'agent-1')).toBe(false)
+  expect(refusesAgent(true, '')).toBe(false)                    // an empty agentId is still "not the main loop"
+  expect(refusesAgent(false, undefined)).toBe(false)
+  expect(AGENT_REFUSAL).toContain('mcp__cortados-route__start_task')
+  expect(AGENT_REFUSAL).toContain('mcp__cortados-route__route_task')
+  expect(AGENT_REFUSAL).toContain('tell the owner in one line and do the work directly')
 })
 
 test('host-app plumbing: only the exact desktop turn tools pass an enforced gate', async () => {
@@ -480,7 +505,7 @@ test('excludeRefusalReason fires only on the provider\'s own 400 refusal of the 
 
 /** Run a review through the hook where each child call is answered by `replies` in turn; record each call's headers
  * and timeout. */
-async function reviewWithReplies(replies: Array<{ exitCode: number; stdout: string; stderr: string }>) {
+async function reviewWithReplies(replies: Array<{ exitCode: number; stdout: string; stderr: string }>, prompt = 'check it') {
   let agentHandler: any = null
   const on = (_event: string, filterOrHandler: any, maybeHandler?: any) => {
     if (maybeHandler && filterOrHandler && filterOrHandler.tool === 'Agent') agentHandler = maybeHandler
@@ -502,7 +527,7 @@ async function reviewWithReplies(replies: Array<{ exitCode: number; stdout: stri
     ui: { status() {}, toast(m: string) { toasts.push(m) } },
     session: { model: async () => 'claude-opus-5-5' },
   }
-  const out = await agentHandler($, { prompt: 'check it', description: 'Review the change', subagent_type: 'general-purpose' }, async () => 'native')
+  const out = await agentHandler($, { prompt, description: 'Review the change', subagent_type: 'general-purpose' }, async () => 'native')
   return { out, calls, toasts }
 }
 
@@ -1593,4 +1618,235 @@ test('a failing heartbeat is reported once and never breaks the tool call', asyn
   expect(h.logs.length).toBe(1)
   expect(h.logs[0]).toContain('office heartbeat failed')
   expect(h.logs[0]).not.toContain('tok')
+})
+
+// ---- Orchestrator mode: the top-level session delegates through cortados-route, never the Agent tool -------------
+// Owner rule (CORTADOS-ORCHESTRATOR.md, 2026-11-08): six Agent-tool builders aborted with this session's hooks.
+
+/** Register the mod with orchestrator mode ON (the default) and hand back its handlers by tool / event. */
+function orchestratorHandlers(opts: Record<string, unknown> = {}) {
+  const h: Record<string, any> = {}
+  const on: any = (ev: string, a: any, b?: any) => {
+    const fn = b ?? a
+    if (ev === 'tool.call') h[b ? String(a?.tool) : '*'] = fn
+    else if (ev === 'prompt.compose') h.compose = fn
+    return { catch() {} }
+  }
+  register(on, { providerToken: 'tok', providerUrl: 'http://provider.test:8432', mainSessionGuard: false, officeView: false, ...opts } as any)
+  return h
+}
+
+const childDone = { exitCode: 0, stdout: JSON.stringify({ result: 'done', model: 'm' }), stderr: '', isStdoutTruncated: false }
+
+/** A $ whose routed child would succeed; `launched` counts how many were started. */
+function routedDollar() {
+  const launched: string[][] = []
+  const $: any = {
+    store: { get: async () => undefined, set: async () => {} },
+    clock: { now: async () => 5 },
+    process: { run: async (argv: string[]) => { if (argv[0] !== 'sh') launched.push(argv); return argv[0] === 'sh' ? { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false } : childDone } },
+    fs: { read: async () => '' },
+    http: { fetch: async () => ({ ok: false, status: 404, headers: {}, text: '{}' }) },
+    session: { model: async () => 'claude-opus' },
+    ui: { status() {}, toast() {}, log() {} },
+  }
+  return { $, launched }
+}
+
+const nativeNeverRuns = async () => { throw new Error('native must not run') }
+
+test('orchestrator mode: a top-level Agent call is refused naming start_task; nothing is launched or run natively', async () => {
+  const h = orchestratorHandlers()
+  const w = routedDollar()
+  for (const call of [
+    { prompt: 'build it', description: 'build thing', subagent_type: 'general-purpose' },
+    { prompt: 'build it', description: 'build thing', subagent_type: 'fork' },          // refused before the fork pass-through
+    { prompt: 'build it', description: 'review thing', isolation: 'worktree' },          // and before the isolation pass-through
+    { prompt: 'build it', description: 'bg', run_in_background: true },
+    { prompt: '', description: 'empty' },
+  ]) {
+    const out: any = await h.Agent(w.$, call, nativeNeverRuns)
+    expect(out).toEqual({ deny: AGENT_REFUSAL })
+  }
+  expect(w.launched).toEqual([])
+  expect(AGENT_REFUSAL).toContain('mcp__cortados-route__start_task')
+})
+
+test("orchestrator mode: a subagent's own Agent call (agentId) is not gated and is routed as before", async () => {
+  const h = orchestratorHandlers()
+  const w = routedDollar()
+  const out: any = await h.Agent(w.$, { prompt: 'p', description: 'd', agentId: 'agent-7' }, nativeNeverRuns)
+  expect(out.result.status).toBe('completed')
+  expect(w.launched.length).toBe(1)
+})
+
+test('orchestrator mode off: the top-level Agent call is routed, not refused', async () => {
+  const h = orchestratorHandlers({ orchestratorMode: false })
+  const w = routedDollar()
+  const out: any = await h.Agent(w.$, { prompt: 'p', description: 'd' }, nativeNeverRuns)
+  expect(out.result.status).toBe('completed')
+  expect(w.launched.length).toBe(1)
+})
+
+test('with orchestratorEnforce off (the default) no allowlist gate is registered: Bash on the main loop runs', async () => {
+  // This is why a session with orchestratorMode true and no orchestratorEnforce ran Bash directly (2026-11-08): the
+  // matcher-less hook only gates when enforce is on. With officeView off too, it is not registered at all.
+  const h = orchestratorHandlers()
+  expect(h['*']).toBe(undefined)
+})
+
+test('enforced gate: Bash and other work refused naming start_task; cortados-route tools allowed; Agent refused; subagents untouched', async () => {
+  const h = orchestratorHandlers({ orchestratorEnforce: true })
+  const gate = h['*']
+  expect(typeof gate).toBe('function')
+  const ran: string[] = []
+  const next: any = async (e: any) => { ran.push(e.tool); return { result: 'ran' } }
+  const $: any = { ui: { status() {}, toast() {}, log() {} } }
+  for (const tool of ['mcp__cortados-route__start_task', 'mcp__cortados-route__route_task', 'mcp__cortados-route__wait_task', 'Read', 'ToolSearch']) {
+    expect(await gate($, { tool }, next)).toEqual({ result: 'ran' })
+  }
+  const bash: any = await gate($, { tool: 'Bash', command: 'make test' }, next)
+  expect(bash.deny).toMatch(/does not run Bash itself/)
+  expect(bash.deny).toContain('mcp__cortados-route__start_task')
+  expect(bash.deny).toContain('tell the owner in one line')
+  expect(bash.deny).not.toMatch(/Agent tool/)
+  const agent: any = await gate($, { tool: 'Agent', prompt: 'p' }, next)
+  expect(agent).toEqual({ deny: AGENT_REFUSAL })
+  const other: any = await gate($, { tool: 'mcp__velox-workspace__start_task' }, next)
+  expect(other.deny).toContain('mcp__cortados-route__start_task')
+  // a subagent (agentId) passes everything, Agent and Bash included
+  expect(await gate($, { tool: 'Bash', agentId: 'a1' }, next)).toEqual({ result: 'ran' })
+  expect(await gate($, { tool: 'Agent', agentId: 'a1' }, next)).toEqual({ result: 'ran' })
+  expect(ran).toEqual(['mcp__cortados-route__start_task', 'mcp__cortados-route__route_task', 'mcp__cortados-route__wait_task', 'Read', 'ToolSearch', 'Bash', 'Agent'])
+})
+
+test('the injected directive names start_task, forbids the Agent tool, states precedence, and skips teammates', async () => {
+  const h = orchestratorHandlers()
+  const next = async () => ({ sections: [{ id: 'host', text: 'base' }] })
+  const r: any = await h.compose({} as any, { traits: [] }, next)
+  const sec = r.sections.find((s: any) => s.id === 'cortados-routed-subagents:orchestrator')
+  expect(sec.text).toBe(ORCHESTRATOR_DIRECTIVE)
+  expect(sec.scope).toBe('session')
+  expect(sec.text).toContain('mcp__cortados-route__start_task')
+  expect(sec.text).toContain('mcp__cortados-route__route_task')
+  expect(sec.text).toContain('Do NOT delegate with the Agent tool')
+  expect(sec.text).toContain('If cortados-route is not connected or a call fails, say so in one line and do the work yourself')
+  expect(sec.text).toContain('~/.config/ai-coding/CORTADOS-ORCHESTRATOR.md outranks this directive')
+  expect(sec.text).toContain('tell the owner about the conflict')
+  expect(sec.text).toContain('top-level session only')
+  // no instruction to delegate via the Agent tool survives
+  expect(sec.text).not.toMatch(/via the Agent tool|hand EACH to a subagent|Spawn a subagent with the Agent/)
+  const tm: any = await h.compose({} as any, { traits: ['teammate'] }, next)
+  expect(tm.sections.some((s: any) => s.id === 'cortados-routed-subagents:orchestrator')).toBe(false)
+  // the security framing stays regardless
+  expect(tm.sections.some((s: any) => s.id === 'cortados-routed-subagents:background-data')).toBe(true)
+})
+
+test('modelDirective: only the first-line [cortados: model=…] pins; later lines remain data', async () => {
+  const d = modelDirective('[cortados: model=GPT 6.1]\nReview the diff.\nReport findings.')
+  expect(d).toEqual({ model: 'sub/gpt-6.1', prompt: 'Review the diff.\nReport findings.', problem: null })
+  expect(modelDirective('[cortados:model = ollama 27b q3km ]\nSummarise.').model).toBe('sub/ollama-27b-q3km')
+  expect(modelDirective('[cortados: model=cortados]\nDo it.').model).toBe('cortados')
+  expect(modelDirective('[cortados: model=sub/claude-opus-5-5]\nDo it.').model).toBe('sub/claude-opus-5-5')
+  for (const prose of ['compare GPT 6.1 with Sonnet', 'Use [cortados: model=GPT 6.1] when you delegate', 'cortados model: GPT 6.1']) {
+    expect(modelDirective(prose)).toEqual({ model: null, prompt: prose, problem: null })
+  }
+  const two = modelDirective('[cortados: model=GPT 6.1]\nwork\n[cortados: model=opus]')
+  expect(two.model).toBe('sub/gpt-6.1')
+  expect(two.prompt).toBe('work\n[cortados: model=opus]')
+  expect(two.problem).toBe(null)
+  expect(MODEL_DIRECTIVE_RE.flags).toBe('') // no `m`: ^/$ must span the isolated first line, never a later one
+  expect(directiveModelId('  GPT   6.1 ')).toBe('sub/gpt-6.1')
+  expect(directiveModelId('api/claude-opus-5-5')).toBe(null)
+})
+
+test('a prompt directive sets the routed child --model and is stripped from the prompt it sees', async () => {
+  let agentHandler: any = null
+  const on = (_event: string, filterOrHandler: any, maybeHandler?: any) => {
+    if (maybeHandler && filterOrHandler && filterOrHandler.tool === 'Agent') agentHandler = maybeHandler
+    return { catch() {} }
+  }
+  register(on as any, { providerToken: 'tok', providerUrl: 'http://provider.test:8432', orchestratorMode: false } as any)
+  let recordedArgv: string[] = []
+  const $ = {
+    process: { run: async (argv: string[], opts: any) => { recordedArgv = argv; return hostLikeProcess({}).run(argv, opts) } },
+    fs: { read: async () => 'unused' },
+    ui: { status() {}, toast() {} },
+  }
+  const next = async () => 'native'
+  const out = await agentHandler($, { subagent_type: 'general-purpose', prompt: '[cortados: model=GPT 6.1]\nsay pong', description: 'd' }, next)
+  expect(out.result.status).toBe('completed')
+  expect(recordedArgv[recordedArgv.indexOf('--model') + 1]).toBe('sub/gpt-6.1')
+  expect(recordedArgv[recordedArgv.indexOf('-p') + 1]).toBe('say pong\n\n' + STOP_ON_DEAD_TOOL)
+  // Without a directive the configured model is sent, as before.
+  await agentHandler($, { subagent_type: 'general-purpose', prompt: 'say pong', description: 'd' }, next)
+  expect(recordedArgv[recordedArgv.indexOf('--model') + 1]).toBe('cortados')
+  // API directives are refused before anything launches.
+  recordedArgv = []
+  const refused = await agentHandler($, { subagent_type: 'general-purpose', prompt: '[cortados: model=api/opus]\nwork', description: 'd' }, next)
+  expect(refused.deny).toContain('unexpected API bills')
+  expect(recordedArgv).toEqual([])
+})
+
+test('a prompt that is only a directive is refused: there is no task to run', async () => {
+  const d = modelDirective('  [cortados: model=GPT 6.1]  \n')
+  expect(d.model).toBe(null)
+  expect(d.problem).toContain('no task to run')
+  // Paragraphs around the directive line stay as written.
+  expect(modelDirective('[cortados: model=opus]\na\n\nb\nc\n\nd').prompt).toBe('a\n\nb\nc\n\nd')
+})
+
+
+test('fenced pasted fetched and mid-prompt directives stay unchanged and never pin', async () => {
+  for (const prompt of [
+    '```text\n[cortados: model=opus]\n```',
+    'Pasted file:\n[cortados: model=opus]\nwork',
+    'Fetched page:\n[cortados: model=opus]\nwork',
+    'Do work.\n[cortados: model=opus]',
+    '\n[cortados: model=opus]\nwork',
+  ]) expect(modelDirective(prompt)).toEqual({ model: null, prompt, problem: null })
+})
+
+test('a directive after a non-\\n line terminator is data: \\r, U+2028 and U+2029 end the first line too', async () => {
+  // Fetched or pasted content can carry any JavaScript line terminator; only the true first line is metadata.
+  for (const sep of ['\r', '\u2028', '\u2029', '\r\n']) {
+    const prompt = `Fetched page:${sep}[cortados: model=opus]\nSummarize this page.`
+    expect(modelDirective(prompt)).toEqual({ model: null, prompt, problem: null })
+    expect(modelDirective(`${sep}[cortados: model=opus]\nwork`)).toEqual({ model: null, prompt: `${sep}[cortados: model=opus]\nwork`, problem: null })
+  }
+  // A real first-line directive ended by \r\n still pins and is stripped whole.
+  expect(modelDirective('[cortados: model=opus]\r\nwork')).toEqual({ model: 'sub/opus', prompt: 'work', problem: null })
+})
+
+test('api directives are refused to prevent unexpected bills', async () => {
+  for (const name of ['api/claude-opus-5-5', 'API/opus']) {
+    expect(directiveModelId(name)).toBe(null)
+    expect(modelDirective(`[cortados: model=${name}]\nwork`).problem).toContain('unexpected API bills')
+  }
+})
+
+test('a directive-pinned excluded review is denied without retry', async () => {
+  const { out, calls, toasts } = await reviewWithReplies([
+    { exitCode: 1, stdout: JSON.stringify({ is_error: true, result: 'API Error: 400 sub/claude-opus-5-5 is the excluded model (x-cortados-exclude-model)' }), stderr: '' },
+  ], '[cortados: model=opus]\ncheck it')
+  expect(calls.length).toBe(1)
+  expect(calls[0].headers).toContain('x-cortados-exclude-model: claude-opus-5-5')
+  expect(out.deny).toContain('did not complete cleanly')
+  expect(toasts).toEqual([])
+})
+
+
+test('a background directive-pinned excluded review fails without retry', async () => {
+  resetWorkerModels()
+  const { $, seen, done } = bgHost()
+  $.fs.read = async (path: string) => {
+    if (path.endsWith('/exit')) return '1'
+    if (path.endsWith('/stdout')) return JSON.stringify({ is_error: true, result: 'API Error: 400 sub/claude-opus-5-5 is the excluded model (x-cortados-exclude-model)' })
+    if (path.endsWith('/stderr')) return ''
+    throw new Error('ENOENT')
+  }
+  ;($ as any).session = { model: async () => 'claude-opus-5-5' }
+  await agentHandlerFor({})($, { ...bgEvent, prompt: '[cortados: model=opus]\ncheck it', description: 'review' }, async () => 'native')
+  expect(await done).toContain('did not complete cleanly')
+  expect(seen.cleaned).toEqual([BG_DIR])
 })

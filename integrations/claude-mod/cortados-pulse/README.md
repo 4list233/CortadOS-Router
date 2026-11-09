@@ -1,30 +1,62 @@
 # cortados-pulse — a Claude Code pane for the router
 
 A mod: a pane beside the chat that polls the CortadOS provider's `GET /resources` every 20 seconds and shows the live
-resource pool — routes logged, degraded rate, S1 latency, each subscription's scarcity and expiring credit, and the
-online local devices with their GPU headroom and how many local models fit.
+resource pool:
 
-It reads the same data as the served dashboard (`GET /dashboard` in a browser, reachable from any device on the tailnet);
-this is the in-terminal version that stays beside the chat.
+- **usage** — routes logged, degraded rate, S1 latency (median / p90 over the last scored turns), the top lanes;
+- **subscriptions** — one row per lane as the provider's scarcity cache knows it: `claude` and `claude#<id>` (one per
+  Claude account, labelled with the reading's config folder when present), `codex`, `cursor`, `antigravity`; each with
+  ok/SPENT or explicit unknown quota, scarcity, expiring credit, the age of its usage sample, and every cached window's
+  **% left** (weekly, 5-hourly, the Fable pool, …) — the same figures the S1 outcome loop's quota door reads. The `local`
+  lane shows routing eligibility and its measured-resource reason; `/resources` does not expose deployment counts;
+- **devices** — the online local nodes with their GPU headroom, utilisation and how many local models fit, plus the pool.
 
-## Load it
+`/resources` is cache-only on the provider (it never opens a vendor CLI), so the poll is cheap. The served dashboard
+(`GET /dashboard`) reads the richer `/v1/cortados/usage`; this pane is the in-terminal view that stays beside the chat.
 
-```bash
-claude --plugin-dir /path/to/CortadOS-Router/integrations/claude-mod/cortados-pulse
-```
-
-Set the mod's config `providerUrl` (the provider base URL, e.g. the Air on the tailnet) and `providerToken`
-(`CORTADOS_PROVIDER_TOKEN`, the same token the dashboard and the `route_task` MCP use). Open the pane with the
-`/cortados-pulse` command; it also opens on session start.
-
-No address or token is committed; both come from the mod's config.
-
-## Install (Claude Code / Claude desktop app)
-
-One step on Claude Code 2.1.275 or later:
+## Install
 
 ```
-/plugin install cortados-pulse --marketplace 4list233/CortadOS-Router
+/plugin marketplace add 4list233/CortadOS-Router
+/plugin install cortados-pulse@cortados-router
 ```
 
-Then set the two config values when prompted: **Provider URL** (your CortadOS provider base URL, e.g. `http://<provider-host>:8432` — the machine running the provider on your tailnet) and **Provider token** (`CORTADOS_PROVIDER_TOKEN`). The pane opens beside the chat and refreshes every few seconds.
+or, from a checkout, `claude --plugin-dir /path/to/CortadOS-Router/integrations/claude-mod/cortados-pulse`.
+
+Then put the provider's address and token where the mod looks (below), restart Claude Code, and the pane opens beside
+the chat on session start; `/cortados-pulse` opens it again.
+
+## Configuration
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `providerUrl` | *(unset)* | Explicit override. Otherwise `CORTADOS_PROVIDER_URL`, then the URL file: `CORTADOS_PROVIDER_URL_FILE` or `~/.config/cortados/provider-url`. One `http://` or `https://` URL with a host; anything else is refused and named in the pane — there is no guessed address, because the provider runs on another host. |
+| `providerTokenFile` | `~/.config/cortados/provider-token` | File holding `CORTADOS_PROVIDER_TOKEN`, read fresh on every poll (a rotated token is picked up without a restart). `~` expands to `$HOME`. |
+| `providerToken` | *(unset)* | Optional inline override (stored as a sensitive setting). Prefer the file. |
+
+The same files serve `cortados-routed-subagents` and the `cortados-route` MCP server, so one machine is configured once:
+
+```sh
+mkdir -p ~/.config/cortados
+printf '%s\n' 'http://<provider-host>:8432' > ~/.config/cortados/provider-url
+printf '%s\n' "$CORTADOS_PROVIDER_TOKEN" > ~/.config/cortados/provider-token
+chmod 600 ~/.config/cortados/provider-token
+```
+
+The token is sent only as the `Authorization: Bearer` header of each poll. It is never logged, rendered or kept in the
+mod's state, and every message the pane shows is scrubbed of it. A `401`/`403` is reported as "provider rejected the
+token" naming the token source (file path or `providerToken`), never the token.
+
+## Tests
+
+Run the mod's tests in the native hook host (no model calls, no network):
+
+```sh
+CORTADOS_HOME=$(mktemp -d) CORTADOS_SCARCITY_REFRESH=off claude plugin test integrations/claude-mod/cortados-pulse
+```
+
+`claude plugin validate integrations/claude-mod/cortados-pulse` lists what the module touches (`$.env.get` of
+`CORTADOS_PROVIDER_URL`, `CORTADOS_PROVIDER_URL_FILE`, `HOME`; `$.fs.read`; `$.http.fetch`). To type-check, load the mod
+once with `--plugin-dir` (the engine lays its typings in `.claude-plugin/types/`, git-ignored) and run `tsc -p
+tsconfig.json` from the mod folder. `tests/test_mod_manifest.py` in the repository suite checks that every setting the
+hooks read is declared in `plugin.json` with the same default.

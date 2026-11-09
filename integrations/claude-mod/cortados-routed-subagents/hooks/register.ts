@@ -1,10 +1,17 @@
 /**
  * cortados-routed-subagents
  *
- * Every subagent the session spawns is intercepted at the Agent tool call and run instead as a headless `claude`
- * subprocess ON THIS MACHINE, pointed at the CortadOS provider (ANTHROPIC_BASE_URL). The provider scores the task
- * with S1 and runs the chosen model headless on the provider host; that model's tool calls are bridged back and
- * executed by this subprocess, here, against this machine's files. The main session keeps its own direct model.
+ * In orchestrator mode (the default) the main session is the CortadOS orchestrator: a standing directive tells it to
+ * delegate through the cortados-route MCP tools (start_task / route_task), and its own Agent tool calls are REFUSED
+ * (owner rule, ~/.config/ai-coding/CORTADOS-ORCHESTRATOR.md: a routed Agent child dies with the session's hooks;
+ * 2026-11-08, six builders aborted). Only the top-level session is gated: a subagent carries an agentId and a CortadOS
+ * child task runs with this plugin disabled.
+ *
+ * Every other subagent the session spawns (below the main loop, or with orchestrator mode off) is intercepted at the
+ * Agent tool call and run instead as a headless `claude` subprocess ON THIS MACHINE, pointed at the CortadOS provider
+ * (ANTHROPIC_BASE_URL). The provider scores the task with S1 and runs the chosen model headless on the provider host;
+ * that model's tool calls are bridged back and executed by this subprocess, here, against this machine's files. The
+ * main session keeps its own direct model.
  *
  * Claude Code has no per-subagent provider endpoint (an agent.spawn hook or AgentSpec can set model/tools/mode but
  * not a base URL), so a subprocess is the only way to route a subagent while the parent stays direct.
@@ -60,18 +67,20 @@ const FALLBACK: Cfg = {
   // Owner decision 2026-11-04: every subagent goes through S1, background ones included. They run detached under
   // their own, longer limit (backgroundTimeoutMs), so the foreground 10-minute cap no longer argues for native.
   routeBackground: true,
-  // Orchestrator mode: the main session (the "brain") is DIRECTED to plan and delegate work to routed subagents,
-  // via a standing system-prompt directive. By default this is GUIDANCE, not a cage: the brain keeps its tools and
-  // may act directly when that is clearly the sensible choice (a trivial edit, its own bookkeeping) — delegation is
-  // the strong default, not an absolute rule. Turn on `orchestratorEnforce` to additionally HARD-BLOCK every tool
-  // outside `orchestratorAllowedTools` on the main loop (an allowlist, so even Monitor / memory_write / mcp__ tools /
-  // future tools are refused) for a strict brain that cannot act even if it tried.
+  // Orchestrator mode: the main session (the "brain") is DIRECTED to plan and delegate work through the cortados-route
+  // MCP tools (start_task / route_task), via a standing system-prompt directive, and its own Agent tool calls are
+  // REFUSED (owner rule, CORTADOS-ORCHESTRATOR.md 2026-11-08: a routed Agent child dies with this session's hooks;
+  // six builders aborted that day). For every other tool this is GUIDANCE, not a cage: the brain keeps them and may
+  // act directly when that is clearly the sensible choice (a trivial edit, its own bookkeeping, or when cortados-route
+  // is not connected) — delegation is the strong default, not an absolute rule. Turn on `orchestratorEnforce` to
+  // additionally HARD-BLOCK every tool outside `orchestratorAllowedTools` on the main loop (an allowlist, so even
+  // Monitor / memory_write / mcp__ tools / future tools are refused) for a strict brain that cannot act even if it tried.
   orchestratorMode: true,
   orchestratorEnforce: false,
-  // route_task is a delegation primitive too (it hands a self-contained text subtask to the router and returns the
-  // answer), so it belongs with Agent in the brain's allowed set: a lightweight text delegation should not have to pay
-  // for a full routed-subagent subprocess. Listed here for visibility; ALWAYS_ALLOWED guarantees it regardless of config.
-  orchestratorAllowedTools: 'Read,Grep,Glob,TodoWrite,Agent,mcp__cortados-route__route_task,AskUserQuestion,ExitPlanMode,Skill,ToolSearch',
+  // The cortados-route tools (mcp__cortados-route__*) are the delegation primitives and are always allowed by
+  // isDelegationTool(), whatever this list says, so they are not repeated here. Agent is NOT in this list: it is
+  // refused on the main loop in orchestrator mode (see mainLoopAllows).
+  orchestratorAllowedTools: 'Read,Grep,Glob,TodoWrite,AskUserQuestion,ExitPlanMode,Skill,ToolSearch',
   // How long a routed subagent subprocess may run before it is aborted. The default is the host's own ceiling
   // (MAX_SUBAGENT_TIMEOUT_MS): a larger value is rejected by $.process.run and the subagent never launches.
   // Background routed work is separate (backgroundTimeoutMs).
@@ -120,8 +129,25 @@ const BG_GRACE_MS = 60_000
 const BG_NOTIFY_MAX_CHARS = 50_000
 
 // Delegation must never be gated off, whatever the allowlist config says, or the brain could not delegate at all.
-// Both the Agent tool and the route_task MCP tool are delegation primitives.
-const ALWAYS_ALLOWED = ['Agent', 'mcp__cortados-route__route_task']
+// The delegation primitives are the cortados-route MCP server's tools (start_task, route_task, wait_task, task_status,
+// list_tasks, cancel_task): the owner's rule (CORTADOS-ORCHESTRATOR.md) makes them THE delegation path of a top-level
+// session. The prefix carries the whole server name plus the `__` separator, so a tool of another server cannot ride
+// it (unlike a bare `mcp__ccd_` prefix, see HOST_PLUMBING_TOOLS). Other connectors expose tools with the same short
+// names (a workspace `start_task`); only this server's count.
+export const DELEGATION_TOOL_PREFIX = 'mcp__cortados-route__'
+export function isDelegationTool(tool: string): boolean {
+  return tool.startsWith(DELEGATION_TOOL_PREFIX)
+}
+
+/** Why the Agent tool is refused on the main loop in orchestrator mode. Names the tool to use instead, and what to do
+ * when it is missing, so the session is never left unable to work: the owner's rule says to report the missing
+ * router in one line and do the work directly. */
+export const AGENT_REFUSAL =
+  'Orchestrator mode: the Agent tool is not the delegation path on this session (owner rule, CORTADOS-ORCHESTRATOR.md; ' +
+  'a routed Agent subagent dies with this session\'s hooks). Delegate with mcp__cortados-route__start_task (a CortadOS ' +
+  'child session with files, shell and tools on this machine) or mcp__cortados-route__route_task (a text answer, no ' +
+  'tools); if they are deferred, load them with ToolSearch first. If cortados-route is not connected, tell the owner ' +
+  'in one line and do the work directly.'
 
 // Host-app plumbing, not work: the Claude desktop app's turn tools that the main loop must call itself (a subagent
 // cannot update the parent's plan or end its turn). Seen 2026-10-30: the strict gate refused wrap_up and the desktop
@@ -134,23 +160,30 @@ const HOST_PLUMBING_TOOLS: ReadonlySet<string> = new Set([
 ])
 
 /** The standing directive injected into the orchestrator's system prompt so it delegates by default, every session.
- * Keep in step with integrations/orchestrator-directive.md (the whole-session launcher's copy, adapted: there
- * subagents DO have MCP tools). The plugin is paused; the two must match in intent. */
-const ORCHESTRATOR_DIRECTIVE =
-  'You are operating as an ORCHESTRATOR — the planning "brain" of a routed system. Your job is to decide and ' +
-  'DELEGATE: decompose the request into self-contained subtasks and hand EACH to a subagent via the Agent tool (or a ' +
-  'self-contained text subtask via route_task). Those subagents are automatically routed to the CortadOS model pool ' +
-  'and carry out the work on this machine, so pushing work to them — instead of doing it yourself — is the whole ' +
-  'point of this mode: it keeps the expensive brain model free and runs each piece on the cheapest capable model. ' +
-  'DELEGATE BY DEFAULT for anything substantive: editing or writing files beyond a trivial touch, running commands, ' +
-  'building, broad searching, web access, long analyses. You MAY act directly when delegating would clearly be ' +
-  'wasteful or slower — a one-line edit, your own planning and bookkeeping, a quick read or check — but treat that ' +
-  'as the exception, and never let it become a habit of quietly doing the work yourself. IMPORTANT: routed subagents ' +
-  'have ONLY built-in tools (files, shell, web search/fetch) — no MCP tools: no browser/Chrome, no connectors (Slack, ' +
-  'Gmail, Drive, …), no app tools. Any step that needs one of those (e.g. driving the signed-in browser) cannot be ' +
-  'delegated; do that step yourself and delegate only the rest. Give each subagent a ' +
-  'complete, standalone task (it cannot see this conversation or your context). When subagents report back, ' +
-  'synthesize their results and plan the next step.'
+ * Keep in step with integrations/orchestrator-directive.md (the whole-session launcher's copy; its gate paragraph
+ * differs). Both restate the owner's rule in ~/.config/ai-coding/CORTADOS-ORCHESTRATOR.md, which outranks them. */
+export const ORCHESTRATOR_DIRECTIVE =
+  'You are operating as an ORCHESTRATOR — the planning brain of the CortadOS router. Your job is to understand the ' +
+  'request, decompose it, DELEGATE the work through the cortados-route MCP server, verify what comes back and deliver ' +
+  'the result. Delegation tools (only this server\'s; other connectors have tools with the same short names): ' +
+  'mcp__cortados-route__start_task hands a whole task to a CortadOS child session on this machine — it has files, ' +
+  'shell, the owner\'s connectors and MCP tools, and Chrome on request — so use it for anything that edits, runs, ' +
+  'builds, searches, browses or touches a service, and run independent tasks in parallel; mcp__cortados-route__route_task ' +
+  'returns a self-contained TEXT answer (an analysis, a draft, a focused question) with no tools. S1 scores each task ' +
+  'and runs it on the cheapest capable model, so delegating keeps this expensive model free. Before the first ' +
+  'delegation load the mcp__cortados-route__* tools (they may be deferred: use ToolSearch). Do NOT delegate with the ' +
+  'Agent tool: this session\'s gate refuses it, and a routed Agent subagent dies with this session\'s hooks (2026-11-08: ' +
+  'six builders aborted). If cortados-route is not connected or a call fails, say so in one line and do the work ' +
+  'yourself. Act directly only when the step is trivial (a one-line answer, a quick lookup, a single small edit), when ' +
+  'it needs something only this session has (this conversation\'s context, a connector CortadOS lacks, a decision that ' +
+  'is the owner\'s), or when delegating would clearly cost more. Every task must stand on its own — the delegate cannot ' +
+  'see this conversation: state the goal, the context (paths, names, prior decisions), the scope and difficulty ' +
+  'plainly, every outward effect (sends, posts, pays, deletes, deploys) explicitly, an acceptance check, and for ' +
+  'start_task the working folder. Read every result and check it against the acceptance check before reporting; say ' +
+  'what was done and by which model, and flag anything left undone. PRECEDENCE: the owner\'s ' +
+  '~/.config/ai-coding/CORTADOS-ORCHESTRATOR.md outranks this directive; if any instruction conflicts with it, follow ' +
+  'that file and tell the owner about the conflict in your next message — never resolve a conflict silently. This ' +
+  'directive is for the top-level session only: a subagent or a CortadOS child task does its work directly.'
 
 /** Split a comma/space-separated tool list into clean names. */
 export function parseList(s: string): string[] {
@@ -173,16 +206,66 @@ export function resolveAllowSet(configStr: string): Set<string> {
   return new Set(parsed.length ? parsed : parseList(FALLBACK.orchestratorAllowedTools))
 }
 
-/** Whether a tool call may run on the MAIN loop under orchestrator mode. True = allow, false = refuse (delegate).
- * Off-mode and any non-main loop (agentId present) always allow; Agent is always allowed so delegation works. */
+/** Whether the main loop's Agent call is refused: orchestrator mode on and no agentId (the top-level session). A
+ * subagent, teammate or engine fork carries an agentId and is never gated; a CortadOS child task runs with this plugin
+ * disabled (session.py writes `enabledPlugins: false`), so it never reaches here. */
+export function refusesAgent(orchestratorMode: boolean, agentId: string | null | undefined): boolean {
+  return Boolean(orchestratorMode) && agentId == null
+}
+
+/** Whether a tool call may run on the MAIN loop under the ENFORCED orchestrator gate. True = allow, false = refuse
+ * (delegate). Off-mode and any non-main loop (agentId present) always allow; the cortados-route tools are always
+ * allowed so delegation works; Agent is always refused (refusesAgent), whatever the allowlist says. */
 export function mainLoopAllows(tool: string, agentId: string | null | undefined, allow: ReadonlySet<string>, orchestratorMode: boolean): boolean {
   if (!orchestratorMode) return true
   if (agentId != null) return true // not the main loop (subagent/teammate/engine fork)
-  return ALWAYS_ALLOWED.includes(tool) || HOST_PLUMBING_TOOLS.has(tool) || allow.has(tool)
+  if (tool === 'Agent') return false
+  return isDelegationTool(tool) || HOST_PLUMBING_TOOLS.has(tool) || allow.has(tool)
 }
 
 /** Appended to every routed child's prompt: a child stuck on a broken tool should report, not burn its budget. */
 export const STOP_ON_DEAD_TOOL = 'If a tool returns nothing useful twice in a row, stop and report what you have and what failed.'
+
+/** The ONE explicit way a subagent prompt names its model: `[cortados: model=<name>]` on the very first line of the prompt. Only
+ * this form counts, so prose that merely mentions a model ("compare GPT 6.1 with Sonnet") or quotes the directive
+ * mid-sentence never pins anything. `<name>` is a pool model id, a `sub/` alias, or a friendly name the provider's
+ * resolver (routing.resolve_pin) reads: `GPT 6.1`, `Sonnet 5`, `ollama 27b q3km`; `cortados` asks S1 to route. The
+ * name is 1-80 characters of letters, digits, space . _ : / - : a model name is short, and anything longer or wider
+ * is not one. Kept as a single literal so tests/test_mod_directive.py can run the same pattern. No `m` flag: the
+ * pattern is run against the isolated first line only, so `^`/`$` mean the whole line; with `m` they would match
+ * after any line terminator left in the inspected string, letting fetched content pin the child. */
+export const MODEL_DIRECTIVE_RE = /^[ \t]*\[cortados:[ \t]*model[ \t]*=[ \t]*([A-Za-z0-9][A-Za-z0-9 ._:\/-]{0,79})[ \t]*\][ \t]*$/
+
+/** Every JavaScript line terminator (\n, \r, \r\n, U+2028, U+2029): the first line ends at the first of them, so
+ * content pasted or fetched with a foreign terminator cannot smuggle a directive onto "line one". */
+export const LINE_TERMINATOR_RE = /\r\n|[\n\r\u2028\u2029]/
+
+/** The provider model id a directive name becomes: spaces collapse to dashes and case folds (`GPT 6.1` -> `gpt-6.1`),
+ * so the id is one argv token and the provider reads it as the friendly name; `cortados` stays S1-routed and an
+ * explicit `sub/` pin is kept as written; `api/` is refused. */
+export function directiveModelId(name: string): string | null {
+  const slug = name.trim().replace(/\s+/g, '-').toLowerCase()
+  // Directives must never spend API credit: the owner forbids unexpected bills.
+  if (slug.startsWith('api/')) return null
+  if (slug === 'cortados' || slug.startsWith('sub/')) return slug
+  return 'sub/' + slug
+}
+
+/** Remove only first-line model metadata. All later lines remain task data, including pasted directives. */
+export function modelDirective(prompt: string): { model: string | null; prompt: string; problem: string | null } {
+  // Only the first line is control metadata, never later pasted or fenced content. The line ends at the first
+  // terminator of any kind, and the anchored pattern must cover that whole line.
+  const brk = LINE_TERMINATOR_RE.exec(prompt)
+  const firstLine = brk ? prompt.slice(0, brk.index) : prompt
+  const m = MODEL_DIRECTIVE_RE.exec(firstLine)
+  if (!m) return { model: null, prompt, problem: null }
+  // The whole line and its terminator go, so the prompt's own paragraphs stay as written.
+  const rest = (brk ? prompt.slice(brk.index + brk[0].length) : '').trim()
+  if (!rest) return { model: null, prompt, problem: 'the prompt is only a [cortados: model=…] directive; there is no task to run' }
+  const model = directiveModelId(m[1])
+  if (!model) return { model: null, prompt, problem: 'api/ model directives are forbidden to prevent unexpected API bills' }
+  return { model, prompt: rest, problem: null }
+}
 
 /** The --max-turns value from config: a positive integer, or null (flag off) for 0/negative/invalid. */
 export function resolveMaxTurns(v: unknown): number | null {
@@ -991,7 +1074,7 @@ export function guardStatusText(edits: number, runs: number): string | undefined
   const parts: string[] = []
   if (edits) parts.push(`${edits} big edit${edits === 1 ? '' : 's'}`)
   if (runs) parts.push(`${runs} build/test run${runs === 1 ? '' : 's'}`)
-  return parts.length ? `main did ${parts.join(', ')}; delegate to routed subagents` : undefined
+  return parts.length ? `main did ${parts.join(', ')}; delegate with start_task` : undefined
 }
 
 /** The guard's toggle from /cortados-guard's argument: true/false, or null for anything else. */
@@ -1319,17 +1402,31 @@ export const register: Register = (on, options) => {
     (guard.override ?? guardDefault) ? guardStatusText(guard.edits, guard.runs) : undefined
 
   on('tool.call', { tool: 'Agent' }, async ($: any, e: any, next: any) => {
+    // The top-level session delegates through cortados-route, never the Agent tool (owner rule): refused before any
+    // pass-through or launch, whether or not the enforced gate is on. A subagent's own Agent call (agentId present)
+    // is routed below as before.
+    if (refusesAgent(cfg.orchestratorMode, e?.agentId)) return { deny: AGENT_REFUSAL }
+
     const subagentType = String(e.subagent_type ?? '')
     const background = Boolean(e.run_in_background)
-    const prompt = String(e.prompt ?? '')
+    const rawPrompt = String(e.prompt ?? '')
     const description = String(e.description ?? 'routed subagent')
 
     // Pass through BEFORE launching anything — these cannot or should not be routed. After the launch below the
-    // hook never returns next(e), because the child will already have acted and native would re-run it.
-    if (subagentType === 'fork' || !prompt.trim()) return next(e)
+    // hook never returns next(e), because the child will already have acted and native would re-run it. A passed-
+    // through call keeps its prompt as written: a model directive in it is the native runner's to ignore.
+    if (subagentType === 'fork' || !rawPrompt.trim()) return next(e)
     if (background && !cfg.routeBackground) return next(e)
     if (e.isolation) return next(e) // worktree/remote: let the native runner own isolation
     if (e.name) return next(e) // a named agent stays addressable by SendMessage only if the parent spawns it
+
+    // The prompt's own model directive (`[cortados: model=<name>]` on a line of its own, see MODEL_DIRECTIVE_RE)
+    // pins this one child; otherwise the mod's configured model. The directive line is stripped from what the child
+    // sees. An unknown or ambiguous name is the provider's to refuse (it answers with the candidates).
+    const directive = modelDirective(rawPrompt)
+    if (directive.problem) return { deny: `routed-subagents: ${directive.problem}` }
+    const prompt = directive.prompt
+    const childModel = directive.model ?? String(cfg.model)
 
     // Per-call copy: concurrent agents must use the same resolved URL for launch and run-record lookup.
     let resolvedUrl: string
@@ -1377,7 +1474,7 @@ export const register: Register = (on, options) => {
     const tools = String(cfg.allowedTools)
     const args = [
       '-p', prompt + '\n\n' + STOP_ON_DEAD_TOOL,
-      '--model', String(cfg.model),
+      '--model', childModel,
       '--permission-mode', String(cfg.permissionMode),
       '--tools', tools,
       '--allowedTools', tools,
@@ -1557,12 +1654,13 @@ export const register: Register = (on, options) => {
           let res = await waitDetached(firstDir, backgroundTimeoutMs)
           let p = parseResult(res.stdout)
           let note = ''
+          // Directive pins preserve review independence and never retry without exclusions.
           // As in the foreground: an exclude header the router refused is retried ONCE without it, in what is left
           // of the one overall budget.
           if (excluded.length && !res.timedOut && !res.overflow && !res.supervisorFailed && !cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
             const reason = excludeRefusalReason(`${p.isError ? p.text ?? '' : ''}\n${res.stderr}`)
             const remainingMs = Math.floor(backgroundTimeoutMs - (Date.now() - startedAt))
-            if (reason && remainingMs >= MIN_RETRY_MS) {
+            if (reason && directive.model === null && remainingMs >= MIN_RETRY_MS) {
               $.ui.toast(`routed-subagents: the router refused to keep this review off ${excludedNames} (${reason}); ran it without the exclusion`)
               note = `[review NOT kept off ${excludedNames}: ${reason}]\n`
               const dir = await launchDetached('x-cortados-reveal: 1', remainingMs)
@@ -1639,6 +1737,7 @@ export const register: Register = (on, options) => {
       let res = await runChild(customHeaders, subagentTimeoutMs)
       let p = parseResult(res.stdout)
       let note = ''
+      // Only owner-configured global pins may relax exclusions; directive pins fail closed.
       // Fallback: the provider refuses (HTTP 400) an exclude header naming no model it serves — e.g. after a model
       // rename — or one that leaves nothing usable. Without this every review would fail. Retry ONCE without the
       // exclusion, and tell the user and the parent model that independence was NOT enforced. The refusal comes on
@@ -1648,7 +1747,7 @@ export const register: Register = (on, options) => {
         // Only an error result or stderr is read: a successful-looking result text is the child's own words.
         const reason = excludeRefusalReason(`${p.isError ? p.text ?? '' : ''}\n${res.stderr}`)
         const remainingMs = Math.floor(subagentTimeoutMs - (Date.now() - startedAt))
-        if (reason && remainingMs >= MIN_RETRY_MS) {
+        if (reason && directive.model === null && remainingMs >= MIN_RETRY_MS) {
           $.ui.toast(`routed-subagents: the router refused to keep this review off ${excludedNames} (${reason}); ran it without the exclusion`)
           note = `[review NOT kept off ${excludedNames}: ${reason}]\n`
           res = await runChild('x-cortados-reveal: 1', Math.min(MAX_SUBAGENT_TIMEOUT_MS, remainingMs))
@@ -1729,8 +1828,8 @@ export const register: Register = (on, options) => {
           if (Number.isFinite(now) && now - guard.lastToastAt >= GUARD_TOAST_INTERVAL_MS) {
             guard.lastToastAt = now
             const text = kind === 'edit'
-              ? 'main session did a large edit; delegate this kind of work to a routed subagent'
-              : 'main session ran a build/test; delegate this kind of work to a routed subagent'
+              ? 'main session did a large edit; delegate this kind of work with mcp__cortados-route__start_task'
+              : 'main session ran a build/test; delegate this kind of work with mcp__cortados-route__start_task'
             guardTry($, guard, 'toast', () => $.ui.toast(text))
           }
         }
@@ -1815,31 +1914,35 @@ export const register: Register = (on, options) => {
   // ONE matcher-less tool.call hook (the engine refuses a second): the Office 'working' beat for every main-loop call,
   // and, under orchestratorEnforce, the gate. With the gate off it only beats and passes the call on.
   // HARD ENFORCEMENT is opt-in (orchestratorEnforce). By default the directive above is trusted and the brain keeps
-  // full tool access — it may act directly when that is clearly sensible. With enforce on, EVERY tool call on the
-  // main loop is gated against the allowlist (an allowlist, not a denylist, so Monitor/memory_write/ExitWorktree/
-  // mcp__ tools/future tools are refused unless listed). Non-main loops and allowed tools pass straight through.
+  // full tool access except Agent (refused in the Agent hook above) — it may act directly when that is clearly
+  // sensible, and must when cortados-route is not connected. With enforce on, EVERY tool call on the main loop is
+  // gated against the allowlist (an allowlist, not a denylist, so Monitor/memory_write/ExitWorktree/mcp__ tools/future
+  // tools are refused unless listed). Non-main loops, the cortados-route tools and allowed tools pass straight through.
+  // Enforce is a cage by choice: with it on and cortados-route missing, the brain cannot work until it is turned off,
+  // and the refusal says so.
   if (officeOn || enforce) {
-    // An empty/malformed allowlist would lock out every tool (including Agent); resolveAllowSet drops malformed
-    // tokens and falls back to the default set so the brain can always at least read and delegate.
+    // An empty/malformed allowlist would lock out every tool; resolveAllowSet drops malformed tokens and falls back to
+    // the default set so the brain can always at least read, and the cortados-route tools are allowed regardless.
     const allow: ReadonlySet<string> = resolveAllowSet(cfg.orchestratorAllowedTools)
+    const enforceDeny = (tool: string) => tool === 'Agent'
+      ? AGENT_REFUSAL
+      : `Orchestrator mode (enforced): the brain plans and delegates — it does not run ${tool} itself. ` +
+        `Delegate with mcp__cortados-route__start_task (a CortadOS child session with tools on this machine) or ` +
+        `mcp__cortados-route__route_task (a text answer) instead of calling ${tool} directly. If cortados-route is ` +
+        `not connected, tell the owner in one line: direct work needs orchestratorEnforce turned off.`
     on('tool.call', async ($: any, e: any, next: any) => {
       // The main loop's 'working' beat with the tool NAME it calls; fire-and-forget (officeBeat never throws).
       if (officeOn && e?.agentId == null) void officeBeat($, cfg, office, 'working', String(e?.tool ?? '') || null)
       if (!enforce || mainLoopAllows(String(e.tool), e.agentId, allow, true)) return next(e)
-      return {
-        deny:
-          `Orchestrator mode (enforced): the brain plans and delegates — it does not run ${e.tool} itself. ` +
-          `Spawn a subagent with the Agent tool (it is routed to the CortadOS pool and runs the work here) ` +
-          `instead of calling ${e.tool} directly.`,
-      }
+      return { deny: enforceDeny(String(e.tool)) }
       // Fail CLOSED for work tools: if the gate throws before deciding, refuse a non-allowed tool (never let it run
-      // on a guard failure) but still let an allowed tool (Agent/Read/...) through so the session is not bricked.
+      // on a guard failure) but still let an allowed tool (start_task/Read/...) through so the session is not bricked.
     }).catch(($: any, e: any, next: any) =>
       next.called
         ? undefined
         : !enforce || mainLoopAllows(String(e.tool), e.agentId, allow, true)
           ? next(e)
-          : { deny: 'Orchestrator mode gate failed; refusing this tool. Delegate it to a subagent.' },
+          : { deny: 'Orchestrator mode gate failed; refusing this tool. Delegate it with mcp__cortados-route__start_task.' },
     )
   }
 }
