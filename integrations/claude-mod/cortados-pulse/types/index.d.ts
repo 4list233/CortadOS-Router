@@ -30,22 +30,15 @@ export interface PulseUsage {
   error?: string
 }
 
-/** core.lane_health's row for one lane (`claude`, `claude#<id>` per extra Claude account, `codex`, `cursor`,
- * `antigravity`, `local`). `pools` are the lane's separately metered pools (Claude's Fable week, Cursor's model pools);
- * `config_dir` is the login the reading came from; the `local` lane is resource-managed and carries `deployments`. */
+/** resources.snapshot subscription projection; account identity and pools come from readings. */
 export interface PulseHealthRow {
   ok?: boolean
   why?: string | null
   scarcity?: number | null
-  tightest?: { window?: string; used_pct?: number; resets_at?: string } | Record<string, never>
-  expiring_pct?: number
+  tightest?: { window?: string; used_pct?: number; resets_at?: string } | Record<string, never> | null
+  expiring_pct?: number | null
 }
-export interface PulseLaneHealth extends PulseHealthRow {
-  pools?: Record<string, PulseHealthRow>
-  config_dir?: string | null
-  resource_managed?: boolean
-  deployments?: Record<string, unknown>
-}
+export interface PulseLaneHealth extends PulseHealthRow {}
 
 /** core.subscription_readings: the lane's cached usage reading window by window, for a door that applies its own
  * stop rule. `headroom_pct` is what is left; an older provider sends only `used_pct`. */

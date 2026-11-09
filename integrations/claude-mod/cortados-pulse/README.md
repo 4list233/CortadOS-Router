@@ -5,10 +5,10 @@ resource pool:
 
 - **usage** — routes logged, degraded rate, S1 latency (median / p90 over the last scored turns), the top lanes;
 - **subscriptions** — one row per lane as the provider's scarcity cache knows it: `claude` and `claude#<id>` (one per
-  Claude account, labelled with the login's config folder), `codex`, `cursor`, `antigravity`; each with ok/SPENT,
-  scarcity, expiring credit, the age of its usage sample, and every cached window's **% left** (weekly, 5-hourly, the
-  Fable pool, …) — the same figures the S1 outcome loop's quota door reads; the `local` lane shows its verified
-  deployments;
+  Claude account, labelled with the reading's config folder when present), `codex`, `cursor`, `antigravity`; each with
+  ok/SPENT or explicit unknown quota, scarcity, expiring credit, the age of its usage sample, and every cached window's
+  **% left** (weekly, 5-hourly, the Fable pool, …) — the same figures the S1 outcome loop's quota door reads. The `local`
+  lane shows routing eligibility and its measured-resource reason; `/resources` does not expose deployment counts;
 - **devices** — the online local nodes with their GPU headroom, utilisation and how many local models fit, plus the pool.
 
 `/resources` is cache-only on the provider (it never opens a vendor CLI), so the poll is cheap. The served dashboard

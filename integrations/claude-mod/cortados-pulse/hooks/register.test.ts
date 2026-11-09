@@ -142,33 +142,43 @@ test('formatting helpers', () => {
   expect(laneOrder(['local', 'codex', 'claude#b', 'cursor', 'claude'])).toEqual(['claude', 'claude#b', 'codex', 'cursor', 'local'])
 })
 
-test('lane lines: per-account Claude with weekly windows and pools, Codex, a spent lane, the local lane', () => {
-  const now = 1_700_000_000
-  const claudeB = laneLines('claude#b', { ok: true, scarcity: -0.3, expiring_pct: 34, config_dir: '/Users/me/.claude-acctB', pools: { 'claude:fable': { ok: true, scarcity: 0.1 } } },
-    { fetched_at: now - 600, failed: false, windows: [
-      { window: 'week (all models)', pool: 'all', headroom_pct: 62.4, reset_epoch: now + 86400 },
-      { window: 'week (fable)', pool: 'fable', used_pct: 70, stale: true },
-      { window: '5h', pool: 'all', headroom_pct: 91 }] }, now)
-  expect(claudeB).toEqual([
-    'claude#b @.claude-acctB: ok · scarcity -0.30 · expiring 34% · sample 10 min old',
-    '  week (all models): 62% left',
-    '  week (fable) [fable]: 30% left (stale)',
-    '  5h: 91% left',
-  ])
+test('unknown or missing quota never renders as healthy', () => {
+  for (const health of [{ ok: true, scarcity: null }, { ok: true }, {}]) {
+    expect(laneLines('codex', health, undefined, 1700000000)).toEqual(['codex: quota unknown'])
+  }
+})
+
+import fixture from './resources.fixture'
+
+test('provider-generated snapshot preserves account and pool readings and local admission reason', () => {
+  const s = fixture
+  expect(laneLines('claude#b', s.subscriptions['claude#b'], s.readings['claude#b'], s.generated_at)).toEqual([
+    'claude#b @.claude-acctB: ok · scarcity -0.20 · sample 60 s old', '  week [fable]: 55% left'])
+  expect(laneLines('local', s.subscriptions.local, undefined, s.generated_at)).toEqual([
+    'local: eligible · available: measured local resources'])
+  expect(laneLines('codex', s.subscriptions.codex, undefined, s.generated_at)).toEqual(['codex: quota unknown'])
+})
+
+test('poll redacts all response strings and keys before storage and rendering', async () => {
+  const snap = { usage: { error: TOKEN, by_lane: { [TOKEN]: 2 } }, subscriptions: { error: TOKEN,
+    codex: { ok: false, why: TOKEN } }, readings: { error: TOKEN }, devices: { status: 'unavailable', error: TOKEN } }
+  const $ = fakeDollar({ http: () => ({ status: 200, ok: true, text: JSON.stringify(snap) }) })
+  await poll($ as any, { ...FALLBACK, providerUrl: 'http://example.test', providerToken: TOKEN })
+  expect(JSON.stringify($.held()).includes(TOKEN)).toBe(false)
+  expect($.held().data).toEqual({ usage: { error: '***', by_lane: { '***': 2 } }, subscriptions: { error: '***',
+    codex: { ok: false, why: '***' } }, readings: { error: '***' }, devices: { status: 'unavailable', error: '***' } })
+})
+
+test('lane samples retain age, failure, stale windows and spent reasons', () => {
+  const now = 1700000000
+  expect(laneLines('codex', { ok: true, scarcity: 0.05 }, { fetched_at: now - 4000, failed: true, windows: [] }, now))
+    .toEqual(['codex: ok · scarcity 0.05 · last sample FAILED · sample 67 min old (stale)'])
+  expect(laneLines('cursor', { ok: false, scarcity: 1.2, why: 'month spent' }, { windows: [
+    { window: 'month', pool: 'other', used_pct: 70, stale: true }, { window: '5h', pool: 'all', headroom_pct: 91 }] }, now))
+    .toEqual(['cursor: SPENT · scarcity 1.20', '  month spent', '  month [other]: 30% left (stale)', '  5h: 91% left'])
+  expect(laneLines('local', { ok: false, why: 'no verified deployment' }, undefined, now))
+    .toEqual(['local: unavailable · no verified deployment'])
   expect(laneLabel('claude', {})).toBe('claude')
-  const codex = laneLines('codex', { ok: true, scarcity: 0.05, expiring_pct: 0 }, { fetched_at: now - 4000, failed: true, windows: [] }, now)
-  expect(codex[0]).toBe('codex: ok · scarcity 0.05 · last sample FAILED · sample 67 min old (stale)')
-  expect(codex.length).toBe(1)
-  const spent = laneLines('cursor', { ok: false, why: 'month 100% used, resets 2026-12-01', scarcity: 1.2, pools: { 'cursor:cursor-models': { ok: false, scarcity: 1.2 }, 'cursor:other-models': { ok: true, scarcity: 0.2 } } }, undefined, now)
-  expect(spent).toEqual([
-    'cursor: SPENT · scarcity 1.20',
-    '  month 100% used, resets 2026-12-01',
-    '  pool cursor:cursor-models: SPENT · scarcity 1.20',
-    '  pool cursor:other-models: ok · scarcity 0.20',
-  ])
-  expect(laneLines('local', { resource_managed: true, deployments: { 'studio/qwen3-4b': {} }, why: 'available: measured local resources' }, undefined, now))
-    .toEqual(['local: 1 verified deployment · available: measured local resources'])
-  expect(laneLines('local', { resource_managed: true, deployments: {} }, undefined, now)).toEqual(['local: 0 verified deployments'])
 })
 
 test('usage and device lines', () => {

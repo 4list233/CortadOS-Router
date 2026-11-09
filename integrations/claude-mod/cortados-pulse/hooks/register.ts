@@ -94,6 +94,15 @@ export function scrub(text: string, token: string): string {
   return token ? text.split(token).join('***') : text
 }
 
+/** Scrub parsed strings AND keys before state storage; JSON escapes cannot bypass token redaction. */
+export function scrubResponse(value: unknown, token: string): unknown {
+  if (typeof value === 'string') return scrub(value, token)
+  if (Array.isArray(value)) return value.map(v => scrubResponse(v, token))
+  if (value && typeof value === 'object') return Object.fromEntries(
+    Object.entries(value).map(([k, v]) => [scrub(k, token), scrubResponse(v, token)]))
+  return value
+}
+
 export function readConfig(options: unknown): Cfg {
   const o = (options ?? {}) as Partial<Record<keyof Cfg, unknown>>
   return {
@@ -118,7 +127,7 @@ export async function poll($: Pick<EngineInterface, 'env' | 'fs' | 'http' | 'sta
       await update($, err, () => 'provider returned HTTP ' + r.status)
       return
     }
-    const data = JSON.parse(r.text) as unknown
+    const data = scrubResponse(JSON.parse(r.text), token)
     if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('/resources did not return a JSON object')
     const at = await $.clock.now()
     await update($, held, () => ({ data: data as Pulse, at }))
@@ -149,24 +158,22 @@ export function leftPct(w: { headroom_pct?: number | null; used_pct?: number | n
   return null
 }
 
-/** The lane's label with the account it was sampled from: lane_health's config_dir is the login's config folder, so
- * `claude#b @.claude-acctB` tells two Claude accounts apart. */
-export function laneLabel(lane: string, health: PulseLaneHealth): string {
+/** Account identity is exposed in readings, not the subscription projection. */
+export function laneLabel(lane: string, health: Pick<PulseReading, 'config_dir'>): string {
   const dir = typeof health.config_dir === 'string' ? health.config_dir.replace(/\/+$/, '') : ''
   const base = dir.slice(dir.lastIndexOf('/') + 1)
   return base ? lane + ' @' + base : lane
 }
 
-/** One lane as lines: the headline (ok/SPENT, scarcity, expiring credit), then each cached window's % left, then the
- * separately metered pools. `nowS` is the pane's clock in seconds, for the reading's age. */
+/** One lane as lines: the headline (quota state, scarcity, expiring credit), then each cached window's % left with
+ * its separately metered pool. `nowS` is the pane's clock in seconds, for the reading's age. */
 export function laneLines(lane: string, health: PulseLaneHealth, reading: PulseReading | undefined, nowS: number): string[] {
   const out: string[] = []
-  if (health.resource_managed) {
-    const n = Object.keys(health.deployments ?? {}).length
-    out.push(`${lane}: ${n} verified deployment${n === 1 ? '' : 's'}` + (health.why ? ` · ${health.why}` : ''))
-    return out
-  }
-  const bits = [health.ok === false ? 'SPENT' : 'ok']
+  // The projection exposes local admission and its reason, not deployment counts. Never infer quota from admission.
+  if (lane === 'local') return [`local: ${health.ok === false ? 'unavailable' : health.ok === true ? 'eligible' : 'unknown'}` +
+    (health.why ? ` · ${health.why}` : '')]
+  const known = typeof health.scarcity === 'number' || (reading?.windows ?? []).some(w => leftPct(w) !== null)
+  const bits = [health.ok === false ? 'SPENT' : known ? 'ok' : 'quota unknown']
   if (typeof health.scarcity === 'number') bits.push('scarcity ' + health.scarcity.toFixed(2))
   if (typeof health.expiring_pct === 'number' && health.expiring_pct > 0) bits.push('expiring ' + Math.round(health.expiring_pct) + '%')
   if (reading) {
@@ -176,16 +183,11 @@ export function laneLines(lane: string, health: PulseLaneHealth, reading: PulseR
       bits.push('sample ' + age(s) + ' old' + (s > STALE_AFTER_S ? ' (stale)' : ''))
     }
   }
-  out.push(laneLabel(lane, health) + ': ' + bits.join(' · '))
+  out.push(laneLabel(lane, reading ?? {}) + ': ' + bits.join(' · '))
   if (health.ok === false && health.why) out.push('  ' + health.why)
   for (const w of reading?.windows ?? []) {
     const name = (w.window || 'window') + (w.pool && w.pool !== 'all' ? ` [${w.pool}]` : '')
     out.push(`  ${name}: ${pct(leftPct(w))} left` + (w.stale ? ' (stale)' : ''))
-  }
-  if (!reading?.windows?.length) {
-    for (const [p, row] of Object.entries(health.pools ?? {})) {
-      out.push(`  pool ${p}: ` + (row.ok === false ? 'SPENT' : 'ok') + (typeof row.scarcity === 'number' ? ` · scarcity ${row.scarcity.toFixed(2)}` : ''))
-    }
   }
   return out
 }
