@@ -159,7 +159,6 @@ CHROME_QUEUE_MAX_S = 6 * 3600
 SSH_OVERHEAD_S = 3
 # start_task runs the archive cleanup opportunistically (so it happens even where the daily job is not installed)
 # but deletes at most this many entries per call: start_task must answer within the MCP client's timeout.
-CLEANUP_PER_START = 3
 _REMOTE_SERVING = False             # set in --remote mode: a request that still resolves to another host is a loop
 
 
@@ -679,6 +678,7 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
                 raise TaskError(f"chrome tasks on execution host {target.describe()} need `gui: true` in its entry: a "
                                 "chrome child must start inside the desktop session (an ssh session cannot read the "
                                 "login Keychain that holds Claude's login)")
+        root = _private_root()  # fail before ssh: a remotely launched task must always be locally trackable
         args = {"task": task, "cwd": cwd, "orchestrator": orchestrator, "permission_mode": permission_mode,
                 "allowed_tools": allowed_tools, "chrome": chrome, "connectors": connectors, "client": client,
                 "title": title, "session_tag": session_tag, "repo": repo, "branch": branch}
@@ -693,10 +693,19 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
         tid = out.get("task_id") if isinstance(out, dict) else None
         if not isinstance(tid, str) or not TASK_ID_RE.fullmatch(tid):
             raise TaskError(f"execution host {target.describe()} started a task but returned no valid task_id")
-        root = _private_root()
         d = os.path.join(root, tid)
-        os.mkdir(d, 0o700)
-        _write_json(os.path.join(d, REMOTE_STUB), {"host": target.name, "created_at": time.time()})
+        try:
+            os.mkdir(d, 0o700)
+            _write_json(os.path.join(d, REMOTE_STUB), {"host": target.name, "created_at": time.time()})
+        except BaseException as exc:
+            shutil.rmtree(d, ignore_errors=True)
+            try:
+                _remote(target.name, "cancel", {"task_id": tid})
+            except TaskError as cancel_exc:
+                raise TaskError(f"remote task {tid} started but local bookkeeping failed ({type(exc).__name__}); "
+                                f"remote cancellation also failed: {cancel_exc}") from None
+            raise TaskError(f"remote task {tid} started but local bookkeeping failed ({type(exc).__name__}); "
+                            "the remote task was cancelled") from None
         out["host"] = target.name
         return out
     task_id = _new_id()
@@ -726,9 +735,6 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
     root = _private_root()
     prune_errors: list = []
     prune(root, errors=prune_errors)
-    cleanup = None
-    if target.root and os.path.isdir(target.root):
-        cleanup = workspaces.cleanup_archive(target.root, max_deletions=CLEANUP_PER_START)
     # No cap on parallel children. Routed children: capacity is the router's job (S1 and the quota gates refuse or
     # redirect a spent lane). Chrome (login-mode) children bypass S1 and the quota gates, so NOTHING here bounds N of
     # them against the main Claude subscription; they do run one at a time per host (CHROME_LOCK: Chrome serves one
@@ -790,7 +796,10 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
     if lock_fd is not None:
         os.close(lock_fd)                       # our copy only; the runner's inherited fd keeps the lock
     try:
-        meta["runner_pid"] = runner.pid if runner is not None else None   # a launchd runner records its own pid
+        current = _read_json(os.path.join(d, "meta.json")) or {}
+        meta = {**meta, **current}  # preserve fields a fast launchd runner wrote after bootstrap, especially its pid
+        if runner is not None:
+            meta["runner_pid"] = runner.pid
         meta["event_log_error"] = log_event("started", **_event_fields(meta))
         _write_json(os.path.join(d, "meta.json"), meta)
     except BaseException as exc:
@@ -820,8 +829,6 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
         out["permission_mode_note"] = mode_note
     if prune_errors:
         out["prune_errors"] = prune_errors[:20]     # bounded: it goes into a tool result
-    if cleanup and (cleanup["deleted"] or cleanup["errors"]):
-        out["archive_cleanup"] = {"deleted": cleanup["deleted"], "errors": cleanup["errors"][:20]}
     return out
 
 

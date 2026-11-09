@@ -108,7 +108,8 @@ EXECUTION HOST (`cortados_router/exec_hosts.py`; `~/.config/cortados/exec-hosts.
 is reached by `ssh` running this module's `--remote` mode there; never a silent fallback to the requesting machine)
 through the provider (every child spends subscription quota). Workspaces (`cortados_router/workspaces.py`): `repo`
 [+ `branch`] gives a git worktree under `<root>/active/<task_id>`, settled to `archive/` (pushed) or `held/`
-(unpushed) when the task ends; only `archive/` is ever cleaned up (3 days). `chrome: true` on a `gui` host launches
+(unpushed, or a plain folder containing a nested `.git`) when the task ends; only `archive/` is ever cleaned up (3 days),
+by the daily cleanup job rather than task startup. `chrome: true` on a `gui` host launches
 through `launchctl bootstrap gui/<uid>` and chrome children queue on one lock per host. Child traffic carries
 `x-cortados-run-id: <task_id>`; lifecycle events go to `$CORTADOS_HOME/child-tasks.jsonl` (tests must use a throwaway
 `CORTADOS_HOME`). Registration snippets (desktop app and `claude mcp add -s user`) are in README.md under the same

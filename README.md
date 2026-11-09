@@ -476,12 +476,15 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   answers at once; a failed clone fails the task with the reason) and, when the child ends, moves the folder to
   `archive/` (every commit on a remote and nothing uncommitted or untracked, or no repository) or `held/` (anything
   else, or a worktree git cannot assess) with `git worktree move`, and records it in `<root>/index.jsonl` (one line per
-  task, rewritten under `index.lock`). `task_status` shows `workspace` (kind, state, path, reason).
+  task, rewritten under `index.lock`). A plain folder containing a `.git` entry at any depth is conservatively moved
+  to `held/` too (symlinks are never followed). `task_status` shows `workspace` (kind, state, path, reason).
 - Archive cleanup: `python3 cortados_router/child_tasks.py --cleanup-archive [--root <dir>]` deletes `archive/<task_id>`
   entries whose index record says archived more than 3 days ago, and nothing else: not a name that is not a task id,
   not a symlink (never followed), not a non-directory, not an entry resolving outside `archive/`, not one without an
-  archive record, never anything in `held/`, `repos/`, `services/`. `integrations/launchd/com.cortados.archive-cleanup.plist`
-  runs it daily on the Air; start_task also runs it (at most 3 deletions per call) so a missed day is caught up.
+  archive record, never anything in `held/`, `repos/`, `services/`. It has per-run deletion and elapsed-time limits;
+  reassessed work moved to `held/` and errors consume the same time budget. The cleanup rechecks plain folders for a
+  nested `.git` immediately before deletion. `integrations/launchd/com.cortados.archive-cleanup.plist` runs it daily on
+  the Air; task startup never runs cleanup, so starting a task is not delayed by cleanup locks or remote fetches.
 - `chrome: true` on a `gui` host runs the child as a per-task LaunchAgent in the desktop session
   (`launchctl bootstrap gui/<uid> <task dir>/launchd.plist`, label `com.cortados.task.<task_id>`, booted out when the
   task is final): an ssh session cannot read the login Keychain that holds Claude's login, and Claude in Chrome needs

@@ -36,6 +36,8 @@ TASK_BRANCH_PREFIX = "task/"        # a task that names no branch works on task/
 CLONE_TIMEOUT_S = 900
 FETCH_TIMEOUT_S = 300
 GIT_TIMEOUT_S = 60                  # local operations: worktree add/move/remove, status, rev-list
+CLEANUP_MAX_DELETIONS = 100          # daily cleanup stays bounded even after a long outage
+CLEANUP_MAX_SECONDS = 300            # held moves and failures consume this budget too
 GIT = "git"                          # resolved on PATH at call time (the execution host's PATH is set by its entry)
 SUBDIRS = ("repos", "active", "archive", "held")
 
@@ -138,6 +140,16 @@ def prepare(spec: dict, root: str) -> dict:
         return rec
     name, url, branch = spec["name"], spec.get("url"), spec.get("branch")
     repo_dir = os.path.join(root, "repos", name)
+    lock = os.open(os.path.join(root, "repos", f".{name}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        return _prepare_repo_locked(rec, tid, path, repo_dir, name, url, branch, root)
+    finally:
+        os.close(lock)
+
+
+def _prepare_repo_locked(rec, tid, path, repo_dir, name, url, branch, root):
+    """Clone/fetch/add while holding repos/.<name>.lock."""
     if os.path.islink(repo_dir):
         raise WorkspaceError(f"repos/{name} is a symlink; refusing to use it")
     if not os.path.isdir(repo_dir):
@@ -231,7 +243,8 @@ def settle(rec: dict, root: str) -> dict:
     if rec.get("kind") == "repo":
         ok, reason = pushed(path)
     else:
-        ok, reason = True, "no repository"
+        ok = not _contains_git_entry(path)
+        reason = "no repository" if ok else "plain folder contains a nested .git entry"
     dest_dir = os.path.join(root, "archive" if ok else "held")
     dest = os.path.join(dest_dir, rec["task_id"])
     try:
@@ -333,6 +346,30 @@ def _remove_tree_fd(directory_fd: int) -> None:
             os.unlink(name, dir_fd=directory_fd)
 
 
+def _contains_git_entry(path: str) -> bool:
+    """Find a .git entry at any depth without traversing symlinks."""
+    for directory, dirs, files in os.walk(path, followlinks=False):
+        if ".git" in dirs or ".git" in files:
+            return True
+        dirs[:] = [name for name in dirs if not os.path.islink(os.path.join(directory, name))]
+    return False
+
+
+def _fd_contains_git_entry(directory_fd: int) -> bool:
+    for name in os.listdir(directory_fd):
+        if name == ".git":
+            return True
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            child_fd = _open_dir(name, dir_fd=directory_fd)
+            try:
+                if _fd_contains_git_entry(child_fd):
+                    return True
+            finally:
+                os.close(child_fd)
+    return False
+
+
 def _prune_worktrees(rec: dict) -> None:
     repo_dir = rec.get("repo_dir")
     if rec.get("kind") == "repo" and isinstance(repo_dir, str) and os.path.isdir(repo_dir):
@@ -367,22 +404,24 @@ def _hold_changed_archive(root: str, archive_fd: int, name: str, rec: dict, reas
     return updated
 
 
-def cleanup_archive(root: str, now=None, max_deletions=None) -> dict:
+def cleanup_archive(root: str, now=None, max_deletions=CLEANUP_MAX_DELETIONS, max_seconds=CLEANUP_MAX_SECONDS) -> dict:
     """Serialize reassessment through deletion so a concurrent cleanup cannot move an entry being deleted."""
     lock = os.open(os.path.join(root, "cleanup.lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return _cleanup_archive_locked(root, now=now, max_deletions=max_deletions)
+        return _cleanup_archive_locked(root, now=now, max_deletions=max_deletions, max_seconds=max_seconds)
     finally:
         os.close(lock)
 
 
-def _cleanup_archive_locked(root: str, now=None, max_deletions=None) -> dict:
+def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELETIONS,
+                            max_seconds=CLEANUP_MAX_SECONDS) -> dict:
     """Delete old recorded archive entries through no-follow directory descriptors.
 
     Repository worktrees are reassessed immediately before deletion. Any change, stale remote, or assessment failure
     moves the workspace to held/. held/, repos/, services/, and a replacement archive ancestor are never traversed.
     """
+    started = time.monotonic()
     now = time.time() if now is None else now
     archive = os.path.join(root, "archive")
     out = {"deleted": [], "kept": 0, "refused": [], "errors": []}
@@ -393,7 +432,11 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=None) -> dict:
         return out
     try:
         index = read_index(root)
-        for name in sorted(os.listdir(archive_fd)):
+        names = sorted(os.listdir(archive_fd))
+        for pos, name in enumerate(names):
+            if max_seconds is not None and time.monotonic() - started >= max_seconds:
+                out["kept"] += len(names) - pos
+                break
             if not TASK_ID_RE.fullmatch(name):
                 out["refused"].append(f"{name}: not a task id")
                 continue
@@ -425,6 +468,11 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=None) -> dict:
                 path = os.path.join(archive, name)
                 if not _same_entry(entry_fd, path):
                     raise WorkspaceError("archive path changed after it was opened; refusing deletion")
+                if rec.get("kind") == "folder" and _fd_contains_git_entry(entry_fd):
+                    _hold_changed_archive(root, archive_fd, name, rec,
+                                          "plain folder contains a nested .git entry", now)
+                    out["kept"] += 1
+                    continue
                 if rec.get("kind") == "repo":
                     ok, reason = pushed(path)
                     if not _same_entry(entry_fd, path):

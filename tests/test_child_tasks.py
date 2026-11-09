@@ -589,6 +589,11 @@ class ChildTaskTests(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.join(self.tmp, "tasks")) if os.path.isdir(os.path.join(self.tmp, "tasks")) else [], [])
         self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")))
 
+    def test_start_never_runs_archive_cleanup(self):
+        with mock.patch.object(ct.workspaces, "cleanup_archive", side_effect=AssertionError("cleanup called")):
+            tid = self.start(cwd=self.work)
+            self.call("wait_task", task_id=tid, timeout_s=30)
+
     def test_no_cwd_gets_a_plain_folder_that_is_archived_when_done(self):
         r, out = self.call("start_task", task="hello")
         self.assertFalse(r.get("isError"), r)
@@ -743,6 +748,34 @@ class ChildTaskTests(unittest.TestCase):
         self.assertEqual(w2["state"], "cancelled")
         self.assertGreaterEqual(len(self.transport_calls), 6)
 
+    def test_remote_start_cancels_when_local_stub_write_fails(self):
+        calls = []
+        tid = "t20261109000000-000000aa"
+
+        def transport(argv, stdin, timeout):
+            request = json.loads(stdin)
+            calls.append(request["op"])
+            body = {"v": ct.exec_hosts.PROTOCOL, "ok": True,
+                    "result": {"task_id": tid, "state": "running"} if request["op"] == "start"
+                    else {"task_id": tid, "cancelled": True}}
+            return 0, json.dumps(body).encode(), b""
+
+        self._air(transport=transport)
+        real_write = ct._write_json
+        with mock.patch.object(ct, "_write_json", side_effect=lambda path, obj: (_ for _ in ()).throw(OSError("disk full"))
+                               if path.endswith(ct.REMOTE_STUB) else real_write(path, obj)):
+            r, _ = self.call("start_task", task="x")
+        self.assertTrue(r.get("isError"))
+        self.assertIn("remote task was cancelled", r["content"][0]["text"])
+        self.assertEqual(calls, ["start", "cancel"])
+        self.assertFalse(os.path.exists(os.path.join(ct.tasks_dir(), tid)))
+
+    def test_remote_start_checks_private_root_before_transport(self):
+        self._air(transport=lambda a, s, t: self.fail("transport must not run"))
+        with mock.patch.object(ct, "_private_root", side_effect=ct.TaskError("private root unavailable")):
+            r, _ = self.call("start_task", task="x")
+        self.assertIn("private root unavailable", r["content"][0]["text"])
+
     def test_a_cwd_that_exists_only_here_is_refused_with_both_facts(self):
         # The fake remote shares this filesystem, so the host's refusal (_check_cwd_here, exercised in
         # test_a_cwd_missing_on_the_host_is_refused_naming_the_host) is replayed as the Air would send it.
@@ -865,6 +898,20 @@ class ChildTaskTests(unittest.TestCase):
     def _launchctl_calls(self):
         with open(self.launchctl_log) as f:
             return [json.loads(x) for x in f]
+
+    def test_fast_launchd_runner_pid_is_not_overwritten_by_start(self):
+        self._gui_host(mode="noop")
+        fake_pid = 424242
+
+        def launch_and_record(d, env):
+            meta = _load(os.path.join(d, "meta.json"))
+            meta["runner_pid"] = fake_pid
+            ct._write_json(os.path.join(d, "meta.json"), meta)
+
+        with mock.patch.object(ct, "_launch_launchd", side_effect=launch_and_record):
+            r, out = self.call("start_task", task="browse", cwd=self.work, chrome=True)
+        self.assertFalse(r.get("isError"), r)
+        self.assertEqual(_load(os.path.join(ct.task_path(out["task_id"]), "meta.json"))["runner_pid"], fake_pid)
 
     def test_chrome_on_a_gui_host_runs_as_a_launchagent_in_the_gui_domain(self):
         self._gui_host()

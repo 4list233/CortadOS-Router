@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -114,6 +115,26 @@ class PrepareTests(_Base):
         self.assertIn(path, listed)
         self.assertIn(rec2["path"], listed)
 
+    def test_concurrent_first_tasks_share_one_clone_safely(self):
+        barrier = threading.Barrier(2)
+        records, errors = [], []
+
+        def run(tid):
+            try:
+                barrier.wait()
+                records.append(self.prepare(tid, repo=self.origin))
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run, args=(tid,)) for tid in (TID, TID2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual({rec["task_id"] for rec in records}, {TID, TID2})
+        self.assertTrue(all(os.path.isdir(rec["path"]) for rec in records))
+
     def test_named_branches(self):
         rec = self.prepare(repo=self.origin, branch="feature")     # exists on origin: checked out from it
         self.assertTrue(os.path.exists(os.path.join(rec["path"], "f.txt")))
@@ -204,6 +225,24 @@ class SettleTests(_Base):
         shutil.rmtree(settled["path"])
         gone = ws.settle({**rec}, self.root)
         self.assertEqual(gone["state"], "missing")
+
+    def test_plain_folder_with_nested_git_entry_is_held_at_settle_and_cleanup(self):
+        rec = self.prepare()
+        nested = os.path.join(rec["path"], "nested")
+        os.makedirs(os.path.join(nested, ".git"))
+        settled = ws.settle(rec, self.root)
+        self.assertEqual(settled["state"], "held")
+        self.assertIn("nested .git", settled["reason"])
+
+        path = self.prepare(TID2)["path"]
+        archived = ws.settle({"task_id": TID2, "kind": "folder", "path": path, "state": "active"}, self.root)
+        archived["settled_at"] = 0
+        ws.update_index(self.root, archived)
+        os.makedirs(os.path.join(archived["path"], "late", ".git"))
+        report = ws.cleanup_archive(self.root, now=ws.ARCHIVE_AGE_S + 1)
+        self.assertEqual(report["deleted"], [])
+        self.assertEqual(ws.read_index(self.root)[TID2]["state"], "held")
+        self.assertTrue(os.path.isdir(os.path.join(self.root, "held", TID2, "late", ".git")))
 
     def test_ignored_files_are_unpublished_work(self):
         rec = self.prepare(repo=self.origin, branch="feature")
@@ -310,6 +349,15 @@ class CleanupTests(_Base):
         self.assertEqual(len(report["deleted"]), 2)
         self.assertEqual(report["kept"], 1)
         self.assertEqual(len(ws.cleanup_archive(self.root)["deleted"]), 1)
+
+    def test_cleanup_time_budget_counts_held_reassessments(self):
+        for tid in (TID, TID2):
+            path = self.archived(tid, ws.ARCHIVE_AGE_S + 60)
+            os.makedirs(os.path.join(path, ".git"))
+        with mock.patch.object(ws.time, "monotonic", side_effect=[0, 0, 2]):
+            report = ws.cleanup_archive(self.root, max_seconds=1)
+        self.assertEqual(len([r for r in ws.read_index(self.root).values() if r["state"] == "held"]), 1)
+        self.assertEqual(report["kept"], 2)
 
     def test_archive_dir_itself_must_be_real(self):
         ws.ensure_root(self.root)

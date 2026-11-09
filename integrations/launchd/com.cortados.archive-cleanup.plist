@@ -9,7 +9,7 @@
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cortados.archive-cleanup.plist
   Run once by hand: /usr/bin/python3 -B ~/cortados-router/cortados_router/child_tasks.py - -cleanup-archive
   (the root comes from the entry naming this machine in ~/.config/cortados/exec-hosts.json; or pass - -root <dir>).
-  start_task also runs the same cleanup opportunistically (at most 3 deletions per call), so a missed day is caught up.
+  This daily job is the sole automatic cleanup path; start_task never waits on cleanup work.
 -->
 <plist version="1.0"><dict>
   <key>Label</key><string>com.cortados.archive-cleanup</string>
