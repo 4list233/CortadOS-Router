@@ -958,7 +958,7 @@ class ChildTaskTests(unittest.TestCase):
                 jobs[p["Label"]] = None                       # loaded but never started
             else:
                 out = open(p["StandardOutPath"], "ab"); err = open(p["StandardErrorPath"], "ab")
-                proc = subprocess.Popen(p["ProgramArguments"], cwd=p["WorkingDirectory"], env=p["EnvironmentVariables"],
+                proc = subprocess.Popen(p["ProgramArguments"], cwd=p["WorkingDirectory"], env=p.get("EnvironmentVariables", {{}}),
                                         stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
                 jobs[p["Label"]] = proc.pid
         elif cmd in ("bootout", "kill"):
@@ -1122,6 +1122,125 @@ class ChildTaskTests(unittest.TestCase):
         self.assertIn("ANTHROPIC_BASE_URL", w["error"])
         self.assertEqual(w["workspace"]["state"], "archived")   # a clean worktree: nothing to hold
         self.assertFalse(glob.glob(os.path.join(self.ws_root, "*", "*", "fake-argv.json")), "no child was spawned")
+
+    # -- connectors on a gui host: the same LaunchAgent path, but routed (no chrome lock, no login mode) --
+
+    def _connectors_config(self):
+        conn = os.path.join(self.tmp, "connectors.mcp.json")
+        with open(conn, "w") as f:
+            json.dump({"mcpServers": {"wispr-flow": {"type": "http", "url": "https://wispr.example/mcp"},
+                                      "velox": {"type": "http", "url": "https://velox.example/mcp"}}}, f)
+        os.environ["CORTADOS_CONNECTORS_MCP_CONFIG"] = conn
+
+    def test_connectors_on_a_gui_host_launch_via_launchd_routed_and_without_the_chrome_lock(self):
+        self._gui_host()
+        self._connectors_config()
+        token = "tok-test-000000001"
+        os.environ["CORTADOS_PROVIDER_TOKEN"] = token          # the server's own copy: must not reach any file
+        os.environ["FAKE_SERVER_SECRET"] = "server-secret-value-123"
+        # another browser task holds the host's Chrome lock the whole time: a connectors task must not wait for it
+        os.makedirs(ct.tasks_dir(), mode=0o700, exist_ok=True)
+        os.chmod(ct.tasks_dir(), 0o700)
+        lock = os.open(os.path.join(ct.tasks_dir(), ct.CHROME_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, lock)
+        import fcntl
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        r, out = self.call("start_task", task="read my notes", cwd=self.work, connectors=["wispr-flow", "velox"])
+        self.assertFalse(r.get("isError"), r)
+        tid = out["task_id"]
+        d = ct.task_path(tid)
+        self.assertEqual(out["launch"], "launchd")
+        for k in ("lane", "chrome_queue", "warnings"):
+            self.assertNotIn(k, out)                         # routed, not login mode; no queue; gui: no warning
+        self.assertEqual(self._launchctl_calls()[0], ["bootstrap", f"gui/{os.getuid()}", os.path.join(d, "launchd.plist")])
+        spec = _load(os.path.join(d, "cmd.json"))
+        self.assertIsNone(spec["chrome_lock"])
+        self.assertFalse(spec["chrome"])
+        self.assertTrue(spec["launchd"])
+        plist_path = os.path.join(d, "launchd.plist")
+        self.assertEqual(stat.S_IMODE(os.stat(plist_path).st_mode), 0o600)
+        with open(plist_path, "rb") as f:
+            raw = f.read()
+        import plistlib
+        plist = plistlib.loads(raw)
+        self.assertNotIn("EnvironmentVariables", plist)      # no env value at all in the plist
+        self.assertEqual(plist["ProgramArguments"][-2:], ["--run", d])
+        for secret in (token.encode(), b"server-secret-value-123"):
+            self.assertNotIn(secret, raw)
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        self.assertEqual(w["launch"], "launchd")
+        self.assertNotIn("lane", w)
+        seen = _load(os.path.join(self.work, "fake-argv.json"))
+        a = seen["argv"]
+        # the routed lane, exactly as a spawned child: cortados model, provider settings file, S1-routed subagents
+        self.assertEqual(a[a.index("--model") + 1], "cortados")
+        self.assertIn("--no-chrome", a)
+        self.assertNotIn("--chrome", a)
+        self.assertEqual(seen["settings"]["mode"], 0o600)
+        self.assertEqual(seen["settings"]["body"]["env"]["ANTHROPIC_AUTH_TOKEN"], token)
+        self.assertEqual(seen["env"]["ANTHROPIC_AUTH_TOKEN"], token)
+        self.assertEqual(seen["env"]["ANTHROPIC_BASE_URL"], self.cfg["url"])
+        self.assertEqual(seen["env"]["CORTADOS_PROVIDER_TOKEN"], token)     # restored from the settings file
+        self.assertEqual(seen["env"]["HOME"], self.tmp)
+        self.assertEqual(seen["nested"], "1")
+        self.assertEqual(seen["subagent"], "cortados")
+        self.assertIsNone(seen["claudecode"])
+        self.assertIn(f"x-cortados-run-id: {tid}", seen["headers"])
+        conn = _load(os.path.join(d, "meta.json"))
+        self.assertEqual(conn["connectors"], ["velox", "wispr-flow"])
+        self.assertIn("--mcp-config", a)
+        # the env file and the settings file (both token-free / token-bearing 0600 session-*.json) are gone after
+        self.assertFalse([n for n in os.listdir(d) if n.startswith("session-")])
+        self.assertTrue(_load(os.path.join(d, ct.LAUNCHD_FILE))["booted_out"])
+        self.assertTrue(_events()[-1]["status"] == "succeeded")   # logged under the task's CORTADOS_HOME
+
+    def test_routed_runner_env_file_is_private_and_holds_no_token(self):
+        self._gui_host(mode="noop")                        # launchd accepts the job but never starts it
+        self._connectors_config()
+        token = "tok-test-000000001"
+        os.environ["CORTADOS_PROVIDER_TOKEN"] = token
+        r, out = self.call("start_task", task="x", cwd=self.work, connectors=["velox"])
+        self.assertFalse(r.get("isError"), r)
+        d = ct.task_path(out["task_id"])
+        path = os.path.join(d, ct.RUNNER_ENV_FILE)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        with open(path) as f:
+            body = f.read()
+        self.assertNotIn(token, body)
+        rec = json.loads(body)
+        self.assertEqual(rec["from_settings_token"], ["CORTADOS_PROVIDER_TOKEN"])
+        self.assertEqual(rec["env"]["CORTADOS_CHILD_TASK"], "1")
+        for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDECODE"):
+            self.assertNotIn(k, rec["env"])
+        # a loosened env file is refused by the runner: the child is never started
+        os.chmod(path, 0o644)
+        with self.assertRaises(ct.TaskError):
+            ct._load_runner_env(_load(os.path.join(d, "cmd.json")))
+        self.call("cancel_task", task_id=out["task_id"])
+
+    def test_no_connectors_on_a_gui_host_still_spawns(self):
+        self._gui_host()
+        self._connectors_config()
+        r, out = self.call("start_task", task="x", cwd=self.work)
+        self.assertFalse(r.get("isError"), r)
+        self.assertEqual(out["launch"], "spawn")
+        _, w = self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        self.assertFalse(os.path.exists(self.launchctl_log))  # launchctl never ran
+        self.assertFalse(os.path.exists(os.path.join(ct.task_path(out["task_id"]), "launchd.plist")))
+
+    def test_connectors_on_a_host_without_gui_spawn_with_a_warning(self):
+        self._connectors_config()
+        r, out = self.call("start_task", task="x", cwd=self.work, connectors=["velox"])
+        self.assertFalse(r.get("isError"), r)
+        self.assertEqual(out["launch"], "spawn")
+        self.assertIn(ct.CONNECTORS_NO_GUI_WARNING, out["warnings"])
+        _, w = self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        self.assertIn(ct.CONNECTORS_NO_GUI_WARNING, w["warnings"])
+        self.assertIn("--mcp-config", _load(os.path.join(self.work, "fake-argv.json"))["argv"])
+        self.assertFalse(os.path.exists(os.path.join(ct.task_path(out["task_id"]), ct.RUNNER_ENV_FILE)))
 
     def test_router_run_id_header_and_run_record(self):
         tid = self.start(task="secret-ish prompt text")

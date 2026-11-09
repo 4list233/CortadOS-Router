@@ -110,7 +110,10 @@ through the provider (every child spends subscription quota). Workspaces (`corta
 [+ `branch`] gives a git worktree under `<root>/active/<task_id>`, settled to `archive/` (pushed) or `held/`
 (unpushed, or a plain folder containing a nested `.git`) when the task ends; only `archive/` is ever cleaned up (3 days),
 by the daily cleanup job rather than task startup. `chrome: true` on a `gui` host launches
-through `launchctl bootstrap gui/<uid>` and chrome children queue on one lock per host. Child traffic carries
+through `launchctl bootstrap gui/<uid>` and chrome children queue on one lock per host. A routed task with
+`connectors` on a `gui` host takes the same LaunchAgent path (MCP OAuth tokens live in the login Keychain) but stays
+routed, without the chrome lock; its plist holds no env (the runner loads a 0600 `session-runner-env.json` plus the
+settings file). Without connectors, or on a non-gui host (with a warning), it is a plain detached spawn. Child traffic carries
 `x-cortados-run-id: <task_id>`; lifecycle events go to `$CORTADOS_HOME/child-tasks.jsonl` (tests must use a throwaway
 `CORTADOS_HOME`). Registration snippets (desktop app and `claude mcp add -s user`) are in README.md under the same
 heading. Tests use a fake claude binary, a fake transport in place of ssh and a fake launchctl

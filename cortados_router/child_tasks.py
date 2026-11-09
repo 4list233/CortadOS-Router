@@ -25,7 +25,9 @@ list and cancel know where to ask. On the host, a task gets a workspace under <r
 a git worktree of repos/<name>, or a plain folder) that the runner prepares before the child starts and settles
 (archive/ or held/) after it ends. A chrome child on a `gui` host is launched as a per-task LaunchAgent in the
 desktop session (gui/<uid>), because an ssh session cannot read the login Keychain that holds Claude's login; chrome
-children take a host-wide lock one at a time (Chrome serves one client).
+children take a host-wide lock one at a time (Chrome serves one client). A routed child that names `connectors` on a
+`gui` host takes the same LaunchAgent path (the connectors' MCP OAuth tokens are in that Keychain too) but stays
+routed: no chrome lock, no login mode; its env reaches the runner through 0600 task-dir files, never the plist.
 Stdlib only.
 """
 from __future__ import annotations
@@ -39,6 +41,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import signal
 import subprocess
 import sys
@@ -155,6 +158,17 @@ CHROME_QUEUE_POLL_S = 0.5
 # A browser task that has waited this long for Chrome is stale (the orchestrator has moved on); it fails instead of
 # starting hours later unattended. Separate from CHILD_MAX_S, which counts from the spawn.
 CHROME_QUEUE_MAX_S = 6 * 3600
+# A routed launchd runner (connectors on a gui host) gets its env from this 0600 file, not from the plist: the plist
+# would otherwise carry whatever the server's env holds. session-*.json, so _remove_settings deletes it with the
+# settings file. It omits every key the launcher's 0600 settings file sets (the provider token among them): the runner
+# takes those from the settings file, so the token is at rest in one file only.
+RUNNER_ENV_FILE = "session-runner-env.json"
+# Observed on the Air 2026-11-09: a child spawned from an ssh session got no tools from its connectors and
+# CREDENTIAL_STORE_UNAVAILABLE, because Claude Code keeps MCP OAuth tokens in the login Keychain.
+CONNECTORS_NO_GUI_WARNING = ("connectors were requested on an execution host without `gui: true`: the child is spawned "
+                             "outside the desktop session and may not reach the login Keychain where Claude Code keeps "
+                             "MCP OAuth tokens, so OAuth connectors may load no tools (CREDENTIAL_STORE_UNAVAILABLE); "
+                             "set `gui: true` on the host if a user is logged in to its desktop")
 # A remote wait is shortened by this much so the ssh round trip (connect + reply) still lands inside the local cap.
 SSH_OVERHEAD_S = 3
 # start_task runs the archive cleanup opportunistically (so it happens even where the daily job is not installed)
@@ -750,8 +764,11 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
             workspaces.ensure_root(target.root)
         except workspaces.WorkspaceError as exc:
             raise TaskError(str(exc)) from None
-    # chrome on a gui host: a LaunchAgent in the desktop session (the only place the login Keychain is readable).
-    launchd = bool(chrome and target.gui)
+    # chrome, or a routed task with connectors, on a gui host: a LaunchAgent in the desktop session (the only place
+    # the login Keychain is readable: Claude's login for chrome, the connectors' MCP OAuth tokens otherwise). A
+    # connectors task stays routed: no chrome lock, no login mode.
+    launchd = bool(target.gui and (chrome or selected))
+    launch_warning = CONNECTORS_NO_GUI_WARNING if (selected and not target.gui) else None
     d = os.path.join(root, task_id)
     os.mkdir(d, 0o700)
     lock_fd = None
@@ -780,10 +797,14 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
             _write_json(cmd_path, spec)
         if mode_note:
             meta["permission_mode_note"] = mode_note
-        if client or mode_note:
+        if launch_warning:
+            meta["launch_warning"] = launch_warning
+        if client or mode_note or launch_warning:
             _write_json(os.path.join(d, "meta.json"), meta)
         if launchd:
-            _launch_launchd(d, env)
+            # chrome: the allowlisted login env (no credential) rides in the plist; routed: nothing does (_prepare
+            # wrote it to RUNNER_ENV_FILE and the runner loads it).
+            _launch_launchd(d, env if login else {})
         else:
             with open(os.path.join(d, "runner.log"), "ab") as rlog:
                 runner = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "--run", d,
@@ -833,15 +854,18 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
                    "waits for the Chrome lock while another browser task runs (task_status shows phase 'queued')")
     if mode_note:
         out["permission_mode_note"] = mode_note
+    if launch_warning:
+        out["warnings"] = [launch_warning]
     if prune_errors:
         out["prune_errors"] = prune_errors[:20]     # bounded: it goes into a tool result
     return out
 
 
 def _launch_launchd(d: str, env: dict) -> None:
-    """Start the runner as a one-shot LaunchAgent in the desktop session (gui/<uid>), so the chrome child it spawns
-    runs where Chrome and the unlocked login Keychain are. The plist (0600, in the task dir: it carries the child's
-    allowlisted env) is bootstrapped by path; launchd forgets it at logout/reboot and we boot it out when the task
+    """Start the runner as a one-shot LaunchAgent in the desktop session (gui/<uid>), so the child it spawns (chrome,
+    or routed with connectors) runs where Chrome and the unlocked login Keychain are. The plist (0600, in the task
+    dir) carries only `env`: a chrome child's allowlisted login env, nothing for a routed child (whose env the runner
+    loads from RUNNER_ENV_FILE and the settings file). It is bootstrapped by path; launchd forgets it at logout/reboot and we boot it out when the task
     is final (_launchd_bootout). Why a LaunchAgent and not a Terminal window or `launchctl asuser`: no TCC
     Automation prompt, no visible window to be closed by someone, and `asuser` needs root."""
     label = LAUNCHD_LABEL_PREFIX + os.path.basename(d)
@@ -850,7 +874,7 @@ def _launch_launchd(d: str, env: dict) -> None:
     spec = {"Label": label,
             "ProgramArguments": [sys.executable, "-B", str(Path(__file__).resolve()), "--run", d],
             "WorkingDirectory": d,
-            "EnvironmentVariables": {k: str(v) for k, v in env.items()},
+            **({"EnvironmentVariables": {k: str(v) for k, v in env.items()}} if env else {}),
             "RunAtLoad": True, "KeepAlive": False,
             "StandardOutPath": os.path.join(d, "runner.log"), "StandardErrorPath": os.path.join(d, "runner.log")}
     with open(os.open(plist, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
@@ -860,9 +884,9 @@ def _launch_launchd(d: str, env: dict) -> None:
         r = subprocess.run([LAUNCHCTL, "bootstrap", domain, plist], capture_output=True, text=True,
                            timeout=LAUNCHCTL_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        raise TaskError(f"launchctl bootstrap did not answer within {LAUNCHCTL_TIMEOUT_S} s; the chrome task was not started") from None
+        raise TaskError(f"launchctl bootstrap did not answer within {LAUNCHCTL_TIMEOUT_S} s; the task was not started") from None
     if r.returncode != 0:
-        raise TaskError(f"could not start the chrome task in the desktop session (launchctl bootstrap {domain} exited "
+        raise TaskError(f"could not start the task in the desktop session (launchctl bootstrap {domain} exited "
                         f"{r.returncode}: {(r.stderr or r.stdout).strip()[-300:]}); is a user logged in to the desktop "
                         "of this execution host?")
 
@@ -954,6 +978,7 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
     # Fingerprints (sha256, never the secrets) of the credentials this child runs with: if the runner dies before it
     # redacts the logs, they may be shown later only when today's credentials provably cover all of these.
     launch_fps = credential_fingerprints(launch_tokens(env))
+    env_file = _write_runner_env(d, env, cmd) if launchd else None
     if conn_note:
         with open(os.path.join(d, "runner.log"), "a", encoding="utf-8") as f:
             f.write(conn_note)
@@ -968,9 +993,56 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
             "workspace": {"kind": workspace["kind"], "repo": workspace.get("name"), "branch": workspace.get("branch")} if workspace else None,
             # argv carries only the model, settings path and flags; the token lives in the 0600 settings file and env.
             "argv": cmd[1:], **({"office": office} if office else {})}
-    _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, **_run_spec(cwd, max_s, meta, workspace, ws_root, launchd, chrome)})
+    _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, **_run_spec(cwd, max_s, meta, workspace, ws_root, launchd, chrome),
+                                              **({"env_file": env_file} if env_file else {})})
     _write_json(os.path.join(d, "meta.json"), meta)    # before Popen: a task dir always has its meta
     return meta, env, cmd
+
+
+def _settings_path(cmd: list) -> str:
+    return cmd[cmd.index("--settings") + 1]
+
+
+def _write_runner_env(d: str, env: dict, cmd: list) -> str:
+    """A routed launchd runner's env, minus what the 0600 settings file already holds (the runner merges that back):
+    a variable the settings file sets is dropped, and a LAUNCH_TOKEN_KEYS variable that equals the provider token is
+    recorded by name only. So no copy of the provider token is written here, and nothing at all goes in the plist."""
+    with open(_settings_path(cmd), encoding="utf-8") as f:
+        senv = json.load(f).get("env") or {}
+    token = senv.get("ANTHROPIC_AUTH_TOKEN") or ""
+    from_token = sorted(k for k in LAUNCH_TOKEN_KEYS if k not in senv and token and env.get(k) == token)
+    base = {k: str(v) for k, v in env.items() if k not in senv and k not in from_token}
+    path = os.path.join(d, RUNNER_ENV_FILE)
+    with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as f:
+        json.dump({"env": base, "from_settings_token": from_token}, f)
+    return path
+
+
+def _private_json(path: str):
+    """A 0600 JSON file of this user (not a symlink), or TaskError."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise TaskError(f"cannot open {os.path.basename(path)}: {type(exc).__name__}") from None
+    with open(fd, encoding="utf-8") as f:
+        st = os.fstat(f.fileno())
+        if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600:
+            raise TaskError(f"{os.path.basename(path)} is not a private 0600 file of this user")
+        return json.load(f)
+
+
+def _load_runner_env(spec: dict) -> None:
+    """In a routed launchd runner, before anything reads the environment: make os.environ exactly the env the spawned
+    runner would have inherited (RUNNER_ENV_FILE + the settings file's env), so the child and the redaction see it."""
+    rec = _private_json(spec["env_file"])
+    senv = _private_json(_settings_path(spec["argv"])).get("env") or {}
+    env = dict(rec.get("env") or {})
+    env.update({k: str(v) for k, v in senv.items()})
+    for k in rec.get("from_settings_token") or ():
+        if k in LAUNCH_TOKEN_KEYS:
+            env[k] = str(senv.get("ANTHROPIC_AUTH_TOKEN", ""))
+    os.environ.clear()
+    os.environ.update(env)
 
 
 def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe, model, office=None,
@@ -1253,7 +1325,8 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
             for k in ("num_turns", "total_cost_usd", "session_id", "subtype"):
                 if k in o:
                     out[k] = o[k]
-        warnings = _activity(out, o, res.get("activity"), meta)
+        warnings = ([meta["launch_warning"]] if meta.get("launch_warning") else []) + \
+            _activity(out, o, res.get("activity"), meta)
         if warnings:
             out["warnings"] = warnings
         if res.get("output_error"):
@@ -1980,6 +2053,8 @@ def _run(d: str, lock_fd=None) -> int:
         _write_json(os.path.join(d, "meta.json"), meta)
     chrome_fd = None
     try:
+        if spec.get("env_file"):
+            _load_runner_env(spec)              # a routed launchd runner: launchd gave it no env of the task's
         if flag["pre"] or os.path.exists(os.path.join(d, "cancelled")):
             raise _CancelledBeforeSpawn()       # checked before any clone: a cancelled task costs no fetch
         _prepare_run(d, spec)

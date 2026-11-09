@@ -493,6 +493,14 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   main-subscription lane) are unchanged. Chrome serves one client at a time, so chrome children on a host take
   `<tasks dir>/chrome.lock` one at a time: the others wait (`task_status` phase `queued`, cancellable while waiting,
   given up after 6 h). Chrome on an ssh host without `gui: true` is refused before any round trip.
+- A routed (non-chrome) task that names `connectors` on a `gui` host takes the same LaunchAgent path, because Claude
+  Code keeps MCP OAuth tokens in the login Keychain too (seen on the Air 2026-11-09: a child spawned from ssh got no
+  tools from its connectors and `CREDENTIAL_STORE_UNAVAILABLE`). It stays routed: S1, the provider URL and token from
+  the 0600 settings file, the same env as a spawned child; no chrome lock or queue, no login mode. Its plist carries
+  no env at all: the runner rebuilds its env from `<task dir>/session-runner-env.json` (0600, without the provider
+  token or any variable the settings file sets) plus the settings file, and both are removed when the child exits. On
+  a host without `gui: true` such a task spawns as before and its start and status carry a warning that connector
+  OAuth may be unavailable. Tasks without connectors always spawn (`launch: "spawn"`).
 
 - `orchestrator`: `cortados` (default, S1 routes every turn) or a pinnable model (`fable`, `opus`, `gpt-6.1-sol`,
   or a friendly name such as `GPT 6.1` or `ollama 27b q3km`, see **Friendly model names**), which pins the child's
