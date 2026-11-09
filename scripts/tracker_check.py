@@ -113,11 +113,23 @@ def parse_live_status_date(body: str) -> dt.date | None:
         raise CheckError(f"Live status date {m.group(1)!r} is not a calendar date: {exc}") from exc
 
 
+# These characters can continue a Git branch name in prose. Keep punctuation such as commas and periods
+# available as delimiters, while preventing a short branch from matching the prefix of names like ``foo+bar``.
+_BRANCH_TOKEN_CONTINUATION = r"\w/.\-+@=$"
+_BRANCH_TOKEN_AFTER = r"\w/\-+@=$"
+
+
 def mentions(text: str, branch: str) -> bool:
-    """True when `branch` appears in `text` as a whole token (bounded by whitespace, backticks or punctuation that
-    cannot be part of a branch name). Substring matching would let `foo` claim `foo-bar`. A dot after the name ends a
-    sentence unless another name character follows it (`foo.bar` is a longer name, `foo.` is a mention of `foo`)."""
-    return re.search(r"(?<![\w/.\-])" + re.escape(branch) + r"(?![\w/\-]|\.[\w/\-])", text or "") is not None
+    """True when `branch` appears in `text` as a whole token.
+
+    Substring matching would let ``foo`` claim ``foo-bar`` or ``foo+bar``. A dot after the name ends a sentence
+    unless another branch-name character follows it (``foo.bar`` is a longer name, ``foo.`` is a mention of ``foo``).
+    """
+    return re.search(
+        r"(?<![" + _BRANCH_TOKEN_CONTINUATION + r"])" + re.escape(branch)
+        + r"(?![" + _BRANCH_TOKEN_AFTER + r"]|\.[" + _BRANCH_TOKEN_CONTINUATION + r"])",
+        text or "",
+    ) is not None
 
 
 def parse_issue_list(raw: str) -> list[Issue]:

@@ -79,6 +79,9 @@ class ParsingTests(unittest.TestCase):
         self.assertFalse(tc.mentions("see foo", "foo-bar"))
         self.assertFalse(tc.mentions("fix/teacher-identity-two", "fix/teacher-identity"))
         self.assertTrue(tc.mentions("tag fix/teacher-identity.", "fix/teacher-identity"))
+        for suffix in ("+bar", "@bar", "=bar", "$bar"):
+            self.assertFalse(tc.mentions("see foo" + suffix, "foo"))
+            self.assertTrue(tc.mentions("see foo" + suffix, "foo" + suffix))
 
     def test_parse_branches_classifies_merged_unmerged_and_empty(self):
         b = tc.parse_branches(REFS, MERGED, "main")
