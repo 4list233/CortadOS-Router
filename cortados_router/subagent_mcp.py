@@ -211,10 +211,19 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
         else:
             out = ct.cancel(a.get("task_id"))
     except ct.TaskError as exc:
-        return _err(red.text(f"{name}: {exc}"))
+        res = _err(red.text(f"{name}: {exc}"))
+        if getattr(exc, "ambiguous", False):
+            # The request may have reached the execution host (e.g. it timed out after sending a start): a child may
+            # be running. Machine-readable for callers that hold a slot for it (bot_gateway); MCP's _meta is the
+            # protocol's place for such extensions, and clients ignore keys they do not know.
+            res["_meta"] = {AMBIGUOUS_META: True}
+        return res
     # Redact the structure's strings BEFORE serializing: json.dumps escapes quotes and backslashes, so a token holding
     # either would no longer match once serialized.
     return {"content": [{"type": "text", "text": json.dumps(red.tree(out), indent=2)}]}
+
+
+AMBIGUOUS_META = "cortados/ambiguous"     # call_child_tool's _meta key: the failed operation may have taken effect
 
 
 def _err(text: str) -> dict:

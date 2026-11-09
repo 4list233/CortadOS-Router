@@ -629,9 +629,10 @@ claude mcp add -s user cortados-route \
 
 ## Bot gateway on the Air
 
-`integrations/bot-gateway/install.sh` runs the bot gateway (`cortados_router/bot_gateway.py`, phase 1: `route_task`
-only; design in `docs/GROKBOT-BRIDGE.md`) as the LaunchAgent `com.cortados.bot-gateway`, as the Air's normal user, on
-the Air's tailnet address, port 8434. Run these on the Air, from the checkout, in order:
+`integrations/bot-gateway/install.sh` runs the bot gateway (`cortados_router/bot_gateway.py`: the full task surface
+for Grok Bot since #86, design and decisions in `docs/GROKBOT-BRIDGE.md` section 0) as the LaunchAgent
+`com.cortados.bot-gateway`, as the Air's normal user, on loopback port 8434 behind Tailscale Funnel. Run these on the
+Air, from the checkout, in order:
 
 ```bash
 cd ~/cortados-router && git pull
@@ -647,12 +648,15 @@ secret field. The system prompt is in `docs/BOT-INSTRUCTIONS.md`. `install.sh un
 The plist holds `RunAtLoad`, `KeepAlive` (it keeps retrying while Tailscale is not up yet), logs to
 `~/.cortados/bot-gateway.out`, `CORTADOS_PROVIDER_URL=http://127.0.0.1:8432` (the gateway runs on the provider's
 host, and the provider listens on loopback only; other machines reach it through a tailnet-only Tailscale Serve), and
-the gateway flags `--host 127.0.0.1 --port 8434 --token-file ~/.config/cortados/bot-gateway-token --workspace-root
-~/cortados-bot-workspace`. Set `CORTADOS_BOT_PROVIDER_URL` before `plist` to point the gateway elsewhere; it must be an
-http(s) URL with a host and no credentials, query or fragment (anything else is refused). Rerun `plist` and `load`
-after changing it. There is no `--enable-start-task`, and no `--children-run-as-me` (the gateway
-binds loopback, so it does not need it). In phase 1 the gateway starts
-no child, so no task runs as the owner on a bot's behalf. The plist holds no secret values.
+the gateway flags `--host 127.0.0.1 --port 8434 --token-file ~/.config/cortados/bot-gateway-token`. Set
+`CORTADOS_BOT_PROVIDER_URL` before `plist` to point the gateway elsewhere; it must be an http(s) URL with a host and no
+credentials, query or fragment (anything else is refused). Rerun `plist` and `load` after changing it. There is no
+`--children-run-as-me` (the gateway binds loopback, so it does not need it). Since #86 the gateway starts children as
+the owner on Grok Bot's behalf: tasks run on the Air's configured execution host (`~/.config/cortados/exec-hosts.json`
+there) in `CortadOS/active/<task_id>` workspaces or any existing folder the bot names, with the caps and the
+owner-approval rule described in `docs/GROKBOT-BRIDGE.md` section 0. A plist written before #86 carries
+`--workspace-root`, which the gateway now ignores (it says so on stderr); rerun `plist` and `load` to drop it. The plist
+holds no secret values.
 
 **Provider token for route_task: design (a), read from `~/.cortados/provider.env` as data.** The provider's own
 LaunchAgent already keeps its token in that file, so the gateway uses the same file and there is no second copy of the
@@ -676,9 +680,9 @@ Both designs run the same stdlib launcher: `/usr/bin/python3 -I integrations/bot
 - requires the token to be non-empty printable ASCII with no spaces. A symlink, a file owned by someone else, a file
   that others may write (or, for the token file, read), or a missing `HOME`, `CORTADOS_HOME` or
   `CORTADOS_PROVIDER_URL` also exits 78;
-- passes gateway flags only if each is an exact phase-1 spelling (`--host`, `--port`, `--token-file`,
-  `--workspace-root`, `--children-run-as-me`). So no abbreviation of `--enable-start-task` gets through, and the
-  gateway's own argparse no longer expands abbreviations either (`allow_abbrev=False`);
+- passes gateway flags only if each is an exact allowed spelling (`--host`, `--port`, `--token-file`,
+  `--allowed-host`, `--workspace-root` for an old plist, `--children-run-as-me`). So the plist alone configures the
+  gateway, and the gateway's own argparse does not expand abbreviations either (`allow_abbrev=False`);
 - `os.execve`s the gateway as `python3 -I -S -B -c <bootstrap>`. The fixed bootstrap puts only this checkout on
   `sys.path` and runs `cortados_router.bot_gateway` with `runpy`. `-I -S` keep the child from loading any
   `sitecustomize` / `usercustomize` from the user site under `HOME` or from `PYTHONPATH`, code that would see the

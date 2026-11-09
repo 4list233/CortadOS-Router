@@ -1,16 +1,36 @@
-"""CortadOS bot gateway (phase 1): MCP "streamable HTTP" JSON-RPC on POST /mcp for Grok Bots.
+"""CortadOS bot gateway: MCP "streamable HTTP" JSON-RPC on POST /mcp for Grok Bot.
 
-Owner decisions (docs/GROKBOT-BRIDGE.md): ONE shared bearer token for every Grok Bot; all of them are attributed as the
-single client "grokbot"; usage is tracked in $CORTADOS_HOME/bot-usage.jsonl; Chrome (login mode) is never allowed.
+Owner decisions (docs/GROKBOT-BRIDGE.md section 0; issue #86, 2026-11-08): ONE shared bearer token for every Grok Bot,
+all attributed as the single client "grokbot"; usage tracked in $CORTADOS_HOME/bot-usage.jsonl. Grok Bot is the owner's
+own agent, like Codex or Claude Code, so it gets the full task surface on the Air: start_task with auto permission mode,
+repo/branch workspaces, any existing cwd on the execution host, model pins, connectors, allowed_tools and chrome (login
+mode: unrouted, on the owner's claude.ai login); the task tools; route_task with pins. It reuses the cortados-route tool
+implementations (subagent_mcp.call_child_tool / route_task), so a bot task is the same code path as the owner's.
 
-It reuses the cortados-route tool implementations (subagent_mcp.call_child_tool / route_task). Phase 1 offers ONLY
-route_task (owner decision 2026-11-03: bots must not act on their own yet): start_task, and with it wait_task /
-task_status / list_tasks / cancel_task, is disabled until per-bot filesystem/account isolation (phase 2, B5) exists.
-The start_task path stays behind --enable-start-task (only together with --children-run-as-me), and even then every
-child is forced to plan mode. Policy is enforced here BEFORE a tool runs: chrome refused, cwd confined to
---workspace-root, a client only sees the tasks it started, and caps (concurrency, tasks/day, route_task/day).
+The phase-1 limits are gone, each for the reason recorded here: route_task only and start_task behind a flag (owner
+decision 2026-11-03 "bots do not act on their own yet", reversed by #86); every child forced to plan mode and
+permission_mode/allowed_tools refused (plan mode was not an isolation boundary, and a bot was not yet the owner's
+agent: #86 makes it one); cwd confined to --workspace-root (a remote bot was not to reach the owner's folders: #86
+allows any existing folder on the Air); chrome refused (it acts in the owner's signed-in browser: #86 allows browser
+tasks); repo/branch/host refused (not built then; built in 0d609d6); model pins refused ("bots are routed only":
+#86 allows pins); results and errors scrubbed to an allowlist (owner paths were not to reach a remote bot: the
+owner's agent needs them to work). The caps were 2 running / 30 tasks/day / 200 routes/day.
 
-Run: python3 -B -m cortados_router.bot_gateway --token-file F --workspace-root DIR [--port 8434] [--host 127.0.0.1]
+What this file still enforces, and why:
+  - authentication, fail-closed: the gateway is reachable from the public internet through Tailscale Funnel, so a
+    request without the exact bearer token is 401 (throttled per client), never a tool call or a tools/list;
+  - volume caps (DEFAULTS), high ceilings whose one purpose is to protect the Air and the subscriptions from a runaway
+    loop: an unattended bot can retry forever, an owner at a keyboard cannot;
+  - the owner-approval rule (APPROVAL_DIRECTIVE): paying, posting, sending, deleting and similar actions need the
+    owner's approval, asked for in chat. The gateway is not in the child's tool loop, so it enforces what it can see:
+    every child prompt carries the rule; an approval reaches the child only through the structured `owner_approval`
+    argument (quoted, bounded, never inferred from the task text) and is recorded in the usage log. Whether Grok asked
+    before passing it rests on its instructions (docs/BOT-INSTRUCTIONS.md), as does the child honouring the rule;
+  - ownership: task_status/wait_task/cancel_task/list_tasks only on tasks this gateway started. Its concurrency
+    accounting and attribution depend on knowing its own tasks, and the owner's other sessions' tasks are not the
+    bot's to cancel.
+
+Run: python3 -B -m cortados_router.bot_gateway --token-file F [--port 8434] [--host 127.0.0.1]
 """
 from __future__ import annotations
 
@@ -32,21 +52,27 @@ from cortados_router import child_tasks, paths, subagent_mcp
 
 CLIENT = "grokbot"                       # fixed: one shared token means one attributable client (owner decision)
 EXPOSED = ("start_task", "wait_task", "task_status", "list_tasks", "cancel_task", "route_task")
-# Phase 1 surface. Reason: children run as the owner's user with the owner's files and MCP servers, and plan mode is
-# not an isolation boundary (review r2 P1-2), so until phase 2 B5 a bot only gets text answers.
-PHASE1 = ("route_task",)
-START_DISABLED = ("start_task is disabled until per-bot filesystem/account isolation (phase 2, B5) exists; "
-                  "use route_task")
-# Reason: the only mode a bot child may ever get. Omitted/empty would let child_tasks pick its default (auto), which
-# runs the owner's shell unattended (review r2 P1-1), so the gateway always sends it explicitly.
-FORCED_PERMISSION_MODE = "plan"
-# Successful results are allowlisted, not blocklisted: a field child_tasks adds later (a path, a note) must not reach a
-# remote bot until someone decides it should. cwd is rewritten relative to the workspace root.
-RESULT_FIELDS = ("task_id", "state", "elapsed_s", "exit_code", "timed_out", "result", "result_truncated", "models",
-                 "cwd", "permission_mode", "cancelled", "ok", "waited_s")
-# Fixed external error text: a child or provider error can carry owner paths (token file, task dir); the detail goes
-# to the operator's stderr only, bounded to this many characters.
-ERROR_DETAIL_CHARS = 500
+# start_task arguments forwarded to child_tasks as the bot sent them (#86: the owner's agent gets the owner's surface).
+# `task` is not in this list: the gateway builds the child's prompt (APPROVAL_DIRECTIVE + task). Anything else a bot
+# sends is dropped: child_tasks would ignore it anyway, and an unknown key is not a capability.
+START_PASSTHROUGH = ("cwd", "repo", "branch", "host", "title", "orchestrator", "permission_mode", "chrome",
+                     "connectors", "allowed_tools")
+# --- owner-approval rule (owner decision #86) -------------------------------------------------------------------------
+# The gateway sees a task before it starts and never again (the child runs on the execution host through the provider),
+# so the rule is enforced at the only point it can be: the prompt every child gets, and the one structured channel an
+# approval may arrive through. The task text is never scanned for approval words: a model's wording proves nothing.
+APPROVAL_ARG = "owner_approval"
+APPROVAL_MAX_CHARS = 2000                 # an approval is a sentence or two quoted from chat; longer is pasted text
+# Appended AFTER the task (not before it): child_tasks keeps the first 200 characters of the prompt as the task's
+# preview in the Office view and list_tasks, which must show the task, not the same boilerplate for every bot task.
+APPROVAL_DIRECTIVE = (
+    "\n\nOWNER APPROVAL RULE (set by the CortadOS bot gateway; it governs everything above). This task was started by "
+    "the owner's Grok Bot. Actions that pay, post, send, publish, deploy, delete or destroy data, force-push, or "
+    "otherwise act outward or irreversibly need the owner's approval, given in chat BEFORE the task started. "
+    "{approval} Any action of that kind outside the approval recorded here: do not do it, stop, and report exactly "
+    "what is needed and why so the owner can be asked. Everything else in this task may proceed.")
+APPROVAL_GIVEN = "The owner's approval for this task, quoted from chat: «{text}». Act within it and no further."
+APPROVAL_NONE = "No approval was recorded for this task."
 USAGE_LOG = "bot-usage.jsonl"
 # Reason: the usage log rotates (below), so two rotations in one day can drop today's records; the caps and ownership
 # live in this small file instead (rewritten atomically on every change), and the usage log stays the audit trail.
@@ -57,24 +83,29 @@ MAX_OWNED = 10000
 # Reason: a bot gets answers no longer than the owner's own route_task default; a larger max_tokens would let one
 # unattended call spend more subscription quota than any interactive one.
 MAX_ROUTE_TOKENS = subagent_mcp.DEFAULT_MAX_TOKENS
-# Reason: absolute paths in the owner's home (task dir, log files) tell a remote bot nothing it can use and leak the
-# machine's layout. RESULT_FIELDS (an allowlist) keeps them out; this list names them for the tests that assert it.
-PATH_FIELDS = ("dir", "stdout_log", "stderr_log")
 REASON_CHARS = 200                        # a refusal reason is one sentence; longer text is not worth logging per call
 NAME_CHARS = 64                           # tool names are short identifiers; a longer one is junk echoed into the log
 # Reason: the usage log is appended on every call by an unattended client; bound it so a chatty bot cannot fill the
 # disk. Past the limit the file is rotated once to .1 (the previous .1 is dropped), keeping roughly 2x this on disk.
 USAGE_MAX_BYTES = 5 * 1024 * 1024
 MAX_BODY = 1024 * 1024                    # a JSON-RPC request larger than this is not a tool call; refuse it
-DEFAULTS = {"max_concurrent": 2,          # bounds unattended subscription spend running at once (tasks and routes each)
-            "max_tasks_per_day": 30,      # bounds child sessions per UTC day
-            "max_routes_per_day": 200}    # route_task is cheaper (one text answer), so a higher daily bound
+# Volume caps (#86: high ceilings, kept only where the reason is the machine or the subscriptions; a cap that only
+# limited what the bot may do is gone). All three are overridable on the command line.
+DEFAULTS = {
+    # Running at once (child tasks, and separately route_task calls in flight). Reason: THE MACHINE. Every child is a
+    # Claude Code process with its tool servers (a chrome child also holds the host's Chrome) on a MacBook Air that
+    # also runs the provider; eight unattended children is more than the owner runs by hand and about what the Air
+    # can hold without starving the provider.
+    "max_concurrent": 8,
+    # Per UTC day. Reason: THE SUBSCRIPTIONS. A child spends quota for its whole run (a chrome child spends the main
+    # Claude subscription, unrouted), and a bot in a retry loop could start one a second; 200 is several times the
+    # busiest day the owner has had by hand, so it never blocks real work.
+    "max_tasks_per_day": 200,
+    # Per UTC day. Reason: THE SUBSCRIPTIONS, as above; route_task is one text answer, so a higher bound.
+    "max_routes_per_day": 1000,
+}
 POLICY_ERROR = -32001                     # JSON-RPC server-defined error code for a policy refusal
 FINAL_STATES = ("succeeded", "failed", "cancelled")
-ROUTED = (None, "", "cortados")           # GROKBOT-BRIDGE.md 3.3: bots are routed only, never sub/ or api/ pins
-# Reason: children run as the owner's user until the per-user boundary (phase 2 B5) ships, so a bot may only get a
-# read-only planning child; any other mode (or a pre-approved tool list) would hand a remote bot the owner's shell.
-ALLOWED_PERMISSION_MODES = (None, "", "plan")
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
 MAX_BATCH = 20                            # MCP batches are a handful of calls; a longer list is not a real client
 MAX_INFLIGHT = 16                         # bounds connection threads at once (taken at accept); past it: 503
@@ -196,14 +227,11 @@ def _day() -> str:
 class Gateway:
     """Policy + accounting. One instance per server; thread-safe."""
 
-    def __init__(self, token: str, workspace_root: str, cfg: dict, limits: dict | None = None,
-                 child=None, route=None, enable_start_task: bool = False):
-        if not workspace_root:
-            raise GatewayError("no workspace root: pass --workspace-root (the gateway refuses to run tasks anywhere)")
-        root = os.path.realpath(workspace_root)
-        if not os.path.isdir(root):
-            raise GatewayError("the workspace root is not an existing directory")
-        self.token, self.root, self.cfg = token, root, cfg
+    def __init__(self, token: str, cfg: dict, limits: dict | None = None, child=None, route=None):
+        if not isinstance(token, str) or len(token) < subagent_mcp.MIN_TOKEN_LEN:
+            # Fail closed at construction: a gateway with a short or missing token must not come up at all.
+            raise GatewayError(f"the bot token must be at least {subagent_mcp.MIN_TOKEN_LEN} characters")
+        self.token, self.cfg = token, cfg
         self.limits = {**DEFAULTS, **(limits or {})}
         self.child = child or subagent_mcp.call_child_tool
         self.route = route or subagent_mcp.route_task
@@ -212,7 +240,6 @@ class Gateway:
         self.running: set = set()         # task ids not yet seen in a final state (+ pending start placeholders)
         self.routes_inflight = 0          # route_task calls currently waiting on the provider
         self.counts: dict = {}            # (day, kind) -> n  kind: tasks | routes | refused
-        self.offered = EXPOSED if enable_start_task else PHASE1
         # Launch reservations (slot -> wall time), persisted BEFORE a child is spawned: if the gateway dies between the
         # spawn and recording the task id, the reservation survives the restart and keeps the concurrency slot held.
         self.reserved: dict = {}
@@ -237,8 +264,9 @@ class Gateway:
     def usage_path(self) -> str:
         return str(paths.state_dir() / USAGE_LOG)
 
-    def record(self, tool: str, outcome: str, task_id=None, reason=None) -> None:
-        rec = {"ts": round(time.time(), 3), "client": CLIENT, "tool": tool, "task_id": task_id, "outcome": outcome}
+    def record(self, tool: str, outcome: str, task_id=None, reason=None, **extra) -> None:
+        rec = {"ts": round(time.time(), 3), "client": CLIENT, "tool": tool, "task_id": task_id, "outcome": outcome,
+               **extra}
         if reason:
             rec["reason"] = reason[:REASON_CHARS]
         p = self.usage_path()
@@ -368,14 +396,6 @@ class Gateway:
         self.record(tool, "refused", task_id, reason)
         raise PolicyRefusal(reason)
 
-    def _confined(self, cwd):
-        """The cwd resolved ONCE, or None when it is not inside the root. The caller forwards exactly this value, so a
-        symlink swapped after the check cannot redirect the child (review r2 P2-3)."""
-        if not isinstance(cwd, str) or not os.path.isabs(cwd):
-            return None
-        real = os.path.realpath(cwd)
-        return real if real == self.root or real.startswith(self.root + os.sep) else None
-
     def _refresh_running(self) -> None:
         """Drop finished tasks from self.running. Called WITHOUT self.lock held: task_status may take seconds."""
         with self.lock:
@@ -409,22 +429,16 @@ class Gateway:
     def call(self, name: str, a: dict) -> dict:
         if name not in EXPOSED:
             self._refuse(str(name)[:NAME_CHARS], f"tool {str(name)[:NAME_CHARS]!r} is not offered by the bot gateway")
-        if name not in self.offered:
-            self._refuse(name, START_DISABLED if name == "start_task" else
-                         f"{name} has nothing to act on: {START_DISABLED}")
         if name == "start_task":
             return self._start(a)
         if name == "route_task":
-            if a.get("model") not in ROUTED:
-                self._refuse(name, "model pins are not allowed through the bot gateway: bots are routed only "
-                                   "(cortados), never sub/ or api/ pins")
             with self.lock:
                 if self.routes_inflight >= self.limits["max_concurrent"]:
                     reason = (f"route_task concurrency cap reached ({self.limits['max_concurrent']} in flight): it "
-                              "bounds unattended subscription spend at once")
+                              "protects the provider's lanes from a burst of unattended calls; wait for one to return")
                 elif self.count("routes") >= self.limits["max_routes_per_day"]:
-                    reason = (f"route_task daily cap reached ({self.limits['max_routes_per_day']}/day): "
-                              "it bounds unattended subscription spend")
+                    reason = (f"route_task daily cap reached ({self.limits['max_routes_per_day']}/day): it protects "
+                              "the subscriptions from a runaway loop; tell the owner")
                 else:
                     reason = None
                     self._bump("routes")
@@ -435,13 +449,14 @@ class Gateway:
             mx = (min(mx, MAX_ROUTE_TOKENS) if isinstance(mx, int) and not isinstance(mx, bool) and mx > 0
                   else MAX_ROUTE_TOKENS)
             try:
+                # The pin (if any) goes through as given: #86 allows model pins; subagent_mcp validates the name.
                 res = self.route(self.cfg.get("url", ""), self.cfg.get("token", ""), a.get("task", ""),
-                                 a.get("context", ""), mx, client=CLIENT)
+                                 a.get("context", ""), mx, model=a.get("model") or None, client=CLIENT)
             finally:
                 with self.lock:
                     self.routes_inflight -= 1
             self.record(name, "error" if res.get("isError") else "ok")
-            return _external(name, res) if res.get("isError") else res
+            return res
         if name == "list_tasks":
             with self.lock:
                 mine = {t for t, c in self.tasks.items() if c == CLIENT}
@@ -453,12 +468,12 @@ class Gateway:
             if not res.get("isError"):
                 try:
                     tasks = json.loads(_text(res)).get("tasks", [])
-                    tasks = [self._scrub(t) for t in tasks if isinstance(t, dict) and t.get("task_id") in mine][:lim]
+                    tasks = [t for t in tasks if isinstance(t, dict) and t.get("task_id") in mine][:lim]
                     res = {"content": [{"type": "text", "text": json.dumps({"tasks": tasks}, indent=2)}]}
                 except (ValueError, TypeError, AttributeError, RecursionError):
                     res = subagent_mcp._err("list_tasks: unexpected result from the task store")
             self.record(name, "error" if res.get("isError") else "ok")
-            return _external(name, res) if res.get("isError") else res
+            return res
         # task_status / wait_task / cancel_task: only on tasks this client started
         tid = a.get("task_id")
         with self.lock:
@@ -468,56 +483,22 @@ class Gateway:
                          else None)
         res = self.child(name, a, self.cfg)
         self.record(name, "error" if res.get("isError") else "ok", tid)
-        return _external(name, res) if res.get("isError") else self._scrub_result(res)
-
-    def _scrub(self, d: dict) -> dict:
-        d = {k: v for k, v in d.items() if k in RESULT_FIELDS}
-        if isinstance(d.get("cwd"), str):
-            real = os.path.realpath(d["cwd"])
-            d["cwd"] = (os.path.relpath(real, self.root) if real == self.root or real.startswith(self.root + os.sep)
-                        else "(outside the workspace root)")
-        return d
-
-    def _scrub_result(self, res: dict) -> dict:
-        """Allowlist the fields of a successful JSON tool result. Anything else (not JSON, not an object) is not passed
-        through: its text is unscrubbed, so the bot gets a fixed message and the operator the detail."""
-        try:
-            obj = json.loads(_text(res))
-        except (ValueError, RecursionError):
-            obj = None
-        if not isinstance(obj, dict):
-            return _external("result", subagent_mcp._err(_text(res)))
-        out = dict(res)
-        out["content"] = [{"type": "text", "text": json.dumps(self._scrub(obj), indent=2)}]
-        return out
+        # Passed through as the owner's own sessions get it (paths, warnings, logs tail, error text): child_tasks has
+        # already redacted the provider credentials from every string (Redactor), and the owner's agent needs the rest.
+        return res
 
     def _start(self, a: dict) -> dict:
-        if a.get("chrome") not in (None, False):
-            self._refuse("start_task", "chrome is never allowed through the bot gateway (it would act in the "
-                                       "owner's signed-in browser on the main subscription)")
-        if a.get("orchestrator") not in ROUTED:
-            self._refuse("start_task", "model pins are not allowed through the bot gateway: bots are routed only "
-                                       "(cortados), never sub/ or api/ pins")
-        if a.get("permission_mode") not in ALLOWED_PERMISSION_MODES or a.get("allowed_tools") not in (None, [], ""):
-            self._refuse("start_task", "permission_mode other than 'plan' and allowed_tools are refused until the "
-                                       "per-user boundary (phase 2 B5) ships: children run as the owner's user")
-        if any(a.get(k) not in (None, "") for k in ("repo", "branch", "host")):
-            # Refused, not dropped: the gateway builds the child's arguments itself (cwd confined below), so a silently
-            # ignored repo/branch/host would run the task somewhere other than the bot asked. Full access is #86.
-            self._refuse("start_task", "repo, branch and host are not offered through the bot gateway yet (#86): "
-                                       "pass cwd inside the gateway's workspace root")
-        cwd = self._confined(a.get("cwd"))
-        if cwd is None:
-            self._refuse("start_task", "cwd must be an absolute path inside the gateway's workspace root")
+        prompt, approval = self.child_prompt(a)
         self._refresh_running()
         # pid + thread + clock: unique across restarts too, since reservations are persisted.
         slot = f"{_PENDING}{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
         with self.lock:
             if len(self.running) >= self.limits["max_concurrent"]:
-                reason = (f"concurrency cap reached ({self.limits['max_concurrent']} running): it bounds unattended "
-                          "subscription spend at once")
+                reason = (f"concurrency cap reached ({self.limits['max_concurrent']} tasks running): it protects the "
+                          "Air from more unattended children than it can hold; wait for one to finish")
             elif self.count("tasks") >= self.limits["max_tasks_per_day"]:
-                reason = f"daily task cap reached ({self.limits['max_tasks_per_day']}/day)"
+                reason = (f"daily task cap reached ({self.limits['max_tasks_per_day']}/day): it protects the "
+                          "subscriptions from a runaway loop; tell the owner")
             else:
                 reason = None
                 self.running.add(slot)    # reserve the slot now, so parallel starts cannot all pass the cap
@@ -525,8 +506,12 @@ class Gateway:
                 self._bump("tasks")       # also persists the reservation (bot-counters.json) before the spawn
         if reason:
             self._refuse("start_task", reason)
-        args = {"task": a.get("task"), "cwd": cwd, "chrome": False, "permission_mode": FORCED_PERMISSION_MODE}
-        tid = None
+        # Forwarded as sent (#86): child_tasks validates each (cwd exists on the host, repo/branch names, host entry,
+        # pin names, permission mode, connectors, chrome's login checks) and refuses with its own message, which the
+        # bot gets verbatim. An omitted permission_mode resolves there to the child default (auto where supported).
+        args = {k: a[k] for k in START_PASSTHROUGH if k in a}
+        args["task"] = prompt
+        tid, ambiguous = None, False
         try:
             res = self.child("start_task", args, {**self.cfg, "client": CLIENT})
             if not res.get("isError"):
@@ -534,16 +519,51 @@ class Gateway:
                     tid = json.loads(res["content"][0]["text"]).get("task_id")
                 except (ValueError, KeyError, IndexError, TypeError, AttributeError):
                     tid = None
+            else:
+                meta = res.get("_meta")
+                ambiguous = isinstance(meta, dict) and meta.get(subagent_mcp.AMBIGUOUS_META) is True
         finally:
             with self.lock:
-                self.running.discard(slot)
-                self.reserved.pop(slot, None)
+                if not ambiguous:
+                    # Success (the task id takes the slot over) or a definite failure (refused or invalid before
+                    # anything ran on the host): the reservation is released.
+                    self.running.discard(slot)
+                    self.reserved.pop(slot, None)
+                # else: an ambiguous failure (e.g. the host timed out after the start was sent) may have launched a
+                # child we hold no id for. The reservation stays, persisted, and expires in _refresh_running after
+                # reservation_ttl from its creation (the child's max runtime + kill grace + 60 s). Reason: a child
+                # that did start is killed by its runner by then, so the slot is provably free; releasing it now
+                # would let retries start more children than max_concurrent.
                 if tid:
                     self.tasks[tid] = CLIENT
                     self.running.add(tid)
                 self._save_counters()
-        self.record("start_task", "ok" if tid else "error", tid)
-        return self._scrub_result(res) if tid else _external("start_task", res)
+        extra = {"launch": "ambiguous"} if ambiguous else {}
+        self.record("start_task", "ok" if tid else "error", tid, owner_approval=approval, **extra)
+        return res
+
+    def child_prompt(self, a: dict):
+        """(prompt, approval_recorded) for a start_task: the bot's task, then APPROVAL_DIRECTIVE. The approval text,
+        when given, must be a bounded printable string; anything else is refused (not dropped: a dropped approval
+        would start a task the bot believes is approved under a prompt that says it is not)."""
+        task = a.get("task")
+        if not isinstance(task, str) or not task.strip():
+            self._refuse("start_task", "start_task requires a non-empty 'task'")
+        text = a.get(APPROVAL_ARG)
+        if text in (None, ""):
+            approval = None
+        elif not isinstance(text, str) or len(text) > APPROVAL_MAX_CHARS or not text.isprintable():
+            self._refuse("start_task", f"{APPROVAL_ARG} must be the owner's approval quoted from chat as one printable "
+                                       f"string (no line breaks) of at most {APPROVAL_MAX_CHARS} characters")
+        else:
+            approval = text.strip()
+        directive = APPROVAL_DIRECTIVE.format(approval=APPROVAL_GIVEN.format(text=approval) if approval
+                                              else APPROVAL_NONE)
+        prompt = task.rstrip() + directive
+        if len(prompt) > child_tasks.MAX_TASK_CHARS:
+            self._refuse("start_task", f"task is {len(task)} characters; with the gateway's approval rule "
+                                       f"({len(directive)} characters) the limit is {child_tasks.MAX_TASK_CHARS}")
+        return prompt, bool(approval)
 
     # -- JSON-RPC --------------------------------------------------------------------------------------------------
     def handle(self, msg) -> dict | None:
@@ -575,7 +595,7 @@ class Gateway:
         if method == "ping":
             return {**base, "result": {}}
         if method == "tools/list":
-            return {**base, "result": {"tools": tool_list(self.offered)}}
+            return {**base, "result": {"tools": tool_list()}}
         if method == "tools/call":
             a = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
             try:
@@ -597,31 +617,24 @@ def _text(res) -> str:
     return t if isinstance(t, str) else ""
 
 
-def _external(tool: str, res: dict) -> dict:
-    """A fixed error for the bot; the unscrubbed detail (it may name owner paths) goes to the operator's stderr."""
-    detail = _text(res).replace("\n", " ")[:ERROR_DETAIL_CHARS]
-    sys.stderr.write(f"bot-gateway: {tool} error: {detail}\n")
-    return subagent_mcp._err(f"{tool} failed inside the gateway; the operator's gateway log has the details")
-
-
-def tool_list(offered=PHASE1) -> list:
-    """The offered tools, with the refused arguments (chrome, connectors, pins, permission/tool grants) removed."""
-    tools = [subagent_mcp.TOOL] + subagent_mcp._child_tools()
+def tool_list() -> list:
+    """The six tools with the owner's full schemas (#86); start_task gains the gateway's `owner_approval` argument.
+    The shared schema objects are copied, never mutated."""
     out = []
-    for t in tools:
-        if t["name"] not in offered:
+    for t in [subagent_mcp.TOOL] + subagent_mcp._child_tools():
+        if t["name"] not in EXPOSED:
             continue
         if t["name"] == "start_task":
             t = json.loads(json.dumps(t))
-            for k in ("chrome", "connectors", "orchestrator", "permission_mode", "allowed_tools", "repo", "branch", "host"):
-                t["inputSchema"]["properties"].pop(k, None)
-            t["inputSchema"]["required"] = ["task", "cwd"]
-            t["description"] += (" (Bot gateway: cwd must be inside the gateway's workspace root; no chrome, no model "
-                                 "pins, no pre-approved tools, no repo/branch/host.)")
-        elif t["name"] == "route_task":
-            t = json.loads(json.dumps(t))
-            t["inputSchema"]["properties"].pop("model", None)
-            t["description"] += " (Bot gateway: routed only, no model pins.)"
+            t["inputSchema"]["properties"][APPROVAL_ARG] = {
+                "type": "string",
+                "description": ("The owner's approval for any action in this task that pays, posts, sends, publishes, "
+                                "deploys, deletes or force-pushes, quoted from chat (at most "
+                                f"{APPROVAL_MAX_CHARS} characters). Ask the owner in chat first; omit it when the task "
+                                "does none of those things. The child is told exactly what was approved and refuses "
+                                "such actions outside it.")}
+            t["description"] += (" (Bot gateway: the owner-approval rule is appended to the child's prompt; pass "
+                                 f"{APPROVAL_ARG} for approved outward actions.)")
         out.append(t)
     return out
 
@@ -809,38 +822,42 @@ def main(argv=None) -> int:
     # (integrations/bot-gateway/launch.py) allowlists exact spellings, and this keeps the two parsers in agreement.
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     ap.add_argument("--token-file", default=os.environ.get("CORTADOS_BOT_TOKEN_FILE", ""))
-    ap.add_argument("--workspace-root", default=os.environ.get("CORTADOS_BOT_WORKSPACE_ROOT", ""))
+    # Accepted so a plist written before #86 still starts; it no longer confines anything (cwd may be any existing
+    # directory on the execution host). Regenerate the plist (install.sh plist) and the flag goes away.
+    ap.add_argument("--workspace-root", default="",
+                    help="ignored since #86 (kept so an installed plist keeps starting); cwd is no longer confined")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8434)
     env_host = os.environ.get("CORTADOS_BOT_ALLOWED_HOST")
     ap.add_argument("--allowed-host", action="append", default=[env_host] if env_host else [],
                     help="exact permitted Host header (repeatable); unset accepts any Host")
     ap.add_argument("--children-run-as-me", action="store_true",
-                    help="allow a non-loopback --host although children run as the owner's user (no per-user "
-                         "boundary until phase 2 B5)")
-    ap.add_argument("--enable-start-task", action="store_true",
-                    help="offer start_task (and the task tools) again; only with --children-run-as-me, and every "
-                         "child is still forced to plan mode. Off in phase 1 (owner decision 2026-11-03)")
+                    help="allow a non-loopback --host. The gateway speaks plain HTTP with a bearer token and hands "
+                         "whoever holds it the owner's full task surface; the install binds loopback behind "
+                         "Tailscale Funnel (TLS on 443). Another address is a deliberate choice, so it is spelled out")
     ap.add_argument("--max-concurrent", type=int, default=DEFAULTS["max_concurrent"])
     ap.add_argument("--max-tasks-per-day", type=int, default=DEFAULTS["max_tasks_per_day"])
     ap.add_argument("--max-routes-per-day", type=int, default=DEFAULTS["max_routes_per_day"])
     o = ap.parse_args(argv)
     if o.host not in LOOPBACK and not o.children_run_as_me:
-        sys.stderr.write(f"bot-gateway: refusing to listen on {o.host!r}: children run as the owner's user and the "
-                         "per-user boundary (phase 2 B5) is not built yet; pass --children-run-as-me to accept that\n")
+        sys.stderr.write(f"bot-gateway: refusing to listen on {o.host!r}: the gateway offers the owner's full task "
+                         "surface over plain HTTP with a bearer token and is meant to bind loopback behind Tailscale "
+                         "Funnel; pass --children-run-as-me to bind another address on purpose\n")
         return 2
-    if o.enable_start_task and not o.children_run_as_me:
-        sys.stderr.write("bot-gateway: --enable-start-task needs --children-run-as-me: a child runs as the owner's "
-                         "user with the owner's files until phase 2 B5\n")
-        return 2
+    if o.workspace_root:
+        sys.stderr.write("bot-gateway: --workspace-root is ignored since #86 (cwd is no longer confined); regenerate "
+                         "the plist with install.sh plist to drop it\n")
+    for name in ("max_concurrent", "max_tasks_per_day", "max_routes_per_day"):
+        if getattr(o, name) < 1:
+            sys.stderr.write(f"bot-gateway: --{name.replace('_', '-')} must be at least 1 (a zero cap would refuse "
+                             "everything; stop the gateway instead)\n")
+            return 2
     try:
         token = read_token_file(o.token_file)
         cfg = {"url": subagent_mcp._resolve_url(), "token": subagent_mcp._resolve_token(),
                "token_file": os.environ.get("CORTADOS_PROVIDER_TOKEN_FILE") or None}
-        gw = Gateway(token, o.workspace_root, cfg, {"max_concurrent": o.max_concurrent,
-                                                     "max_tasks_per_day": o.max_tasks_per_day,
-                                                     "max_routes_per_day": o.max_routes_per_day},
-                     enable_start_task=o.enable_start_task)
+        gw = Gateway(token, cfg, {"max_concurrent": o.max_concurrent, "max_tasks_per_day": o.max_tasks_per_day,
+                                  "max_routes_per_day": o.max_routes_per_day})
     except (GatewayError, subagent_mcp.ProviderURLError) as exc:
         sys.stderr.write(f"bot-gateway: refusing to start: {exc}\n")
         return 2

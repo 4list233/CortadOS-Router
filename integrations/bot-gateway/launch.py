@@ -15,8 +15,8 @@ add variables to the gateway's environment. Here the file is data:
     backslash, a repeated name or any other line (a command, a function, a trap, set -x) refuses the whole file;
   - only CORTADOS_PROVIDER_TOKEN is used; it must be non-empty printable ASCII with no spaces.
 The token file (design b) holds the token alone, optionally followed by one LF or CRLF; nothing else is trimmed.
-Gateway flags are checked against the phase-1 allowlist (exact spellings, separate values), so no abbreviation the
-gateway's own argparse would expand (e.g. --enable-start-t) can get through.
+Gateway flags are checked against an allowlist (exact spellings, separate values), so no abbreviation the gateway's
+own argparse would expand can get through and the plist alone configures the gateway.
 
 Every config failure exits 78 (EX_CONFIG) with a message that names a line NUMBER at most, never a line's content or
 the token. The gateway gets exactly HOME, a fixed PATH, CORTADOS_HOME, CORTADOS_PROVIDER_URL (resolved from the environment or shared URL file)
@@ -39,9 +39,11 @@ FIXED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 FROM_PLIST = ("HOME", "CORTADOS_HOME")   # required from plist/launchd; URL may come from the shared file
 OPTIONAL_FROM_PLIST = ("CORTADOS_BOT_ALLOWED_HOST",)                 # public hostname; omitted means no Host allowlist
 MAX_BYTES = 64 * 1024            # provider.env is a few lines; a bigger file is not one we wrote
-# Phase-1 gateway flags, exact spellings: flag -> takes a value. Anything else (notably --enable-start-task or any
-# prefix of it, which the gateway's argparse would expand) is refused: phase 1 is route_task only (owner decision
-# 2026-11-03). --children-run-as-me is required by the gateway for a tailnet --host; with no start_task it starts no child.
+# Gateway flags the plist may carry, exact spellings: flag -> takes a value. Anything else is refused, so the plist
+# (and only the plist) decides how the gateway is configured and no abbreviation the gateway's argparse would expand
+# gets through. Since #86 the gateway offers the full task surface by default: there is no enabling flag to allow
+# here, and the caps keep their defaults (bot_gateway.DEFAULTS). --workspace-root stays accepted for a plist written
+# before #86 (the gateway ignores it); --children-run-as-me is the gateway's acknowledgement for a non-loopback bind.
 # The checkout this launcher lives in (integrations/bot-gateway/launch.py -> the repo root): the only sys.path entry the
 # gateway child gets besides the standard library.
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -133,12 +135,12 @@ def token_from_file(text: str) -> str:
 
 
 def check_flags(flags) -> list:
-    """The gateway flags, if every one is an exact phase-1 spelling with its value as a separate argument."""
+    """The gateway flags, if every one is an exact allowed spelling with its value as a separate argument."""
     i = 0
     while i < len(flags):
         f = flags[i]
         if f not in ALLOWED_FLAGS:
-            raise ConfigError(f"gateway argument {i + 1} is not an allowed phase-1 flag")
+            raise ConfigError(f"gateway argument {i + 1} is not an allowed gateway flag")
         if ALLOWED_FLAGS[f]:
             if i + 1 >= len(flags) or flags[i + 1].startswith("-") or not flags[i + 1]:
                 raise ConfigError(f"gateway argument {i + 1} needs a value")

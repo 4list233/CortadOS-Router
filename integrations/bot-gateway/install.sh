@@ -36,7 +36,8 @@ PROVIDER_TOKEN_FILE="$TOKEN_DIR/bot-gateway-provider-token"
 PROVIDER_ENV="$HOME/.cortados/provider.env"
 STATE_DIR="$HOME/.cortados"
 LOG="$STATE_DIR/bot-gateway.out"
-WORKSPACE="$HOME/cortados-bot-workspace"
+# No --workspace-root since #86: tasks run in the Air's CortadOS workspaces (exec-hosts.json `root`) or any existing
+# folder the bot names; the old ~/cortados-bot-workspace is neither created nor passed.
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 FUNNEL_OWNER="$STATE_DIR/bot-gateway-funnel-owner"
 DOMAIN="gui/$(id -u)"
@@ -121,16 +122,15 @@ cmd_plist() {
     die "no provider token for route_task: $PROVIDER_ENV does not assign CORTADOS_PROVIDER_TOKEN, and there is no 0600 $PROVIDER_TOKEN_FILE. Create that file yourself (umask 077; then write the provider token into it) and rerun"
   fi
   url="$(provider_url "${CORTADOS_BOT_PROVIDER_URL:-http://127.0.0.1:8432}")"
-  ( umask 077; mkdir -p "$STATE_DIR" "$WORKSPACE" "$HOME/Library/LaunchAgents" )
-  chmod 700 "$WORKSPACE"
+  ( umask 077; mkdir -p "$STATE_DIR" "$HOME/Library/LaunchAgents" )
   [ -e "$LOG" ] || ( umask 077; : > "$LOG" )
-  python3 -I - "$PLIST" "$LABEL" "$mode" "$url" "$PORT" "$REPO" "$PYBIN" "$TOKEN_FILE" "$WORKSPACE" "$LOG" \
+  python3 -I - "$PLIST" "$LABEL" "$mode" "$url" "$PORT" "$REPO" "$PYBIN" "$TOKEN_FILE" "$LOG" \
     "$PROVIDER_ENV" "$PROVIDER_TOKEN_FILE" "$STATE_DIR" "$ALLOWED_HOST" <<'PY'
 import os, plistlib, sys
-(plist, label, mode, url, port, repo, py, token_file, workspace, log,
- provider_env, provider_token_file, state_dir, allowed_host) = sys.argv[1:15]
+(plist, label, mode, url, port, repo, py, token_file, log,
+ provider_env, provider_token_file, state_dir, allowed_host) = sys.argv[1:14]
 gateway = [py, "-B", "-m", "cortados_router.bot_gateway", "--host", "127.0.0.1", "--port", port,
-           "--token-file", token_file, "--workspace-root", workspace]
+           "--token-file", token_file]
 env = {"CORTADOS_PROVIDER_URL": url, "CORTADOS_HOME": state_dir, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
 if allowed_host:
     env["CORTADOS_BOT_ALLOWED_HOST"] = allowed_host
