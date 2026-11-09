@@ -1088,6 +1088,11 @@ def classify(res: dict) -> str:
         return "cancelled"
     if res.get("timed_out") or res.get("error") or res.get("output_error") or res.get("redact_error"):
         return "failed"
+    act = res.get("activity")
+    if isinstance(act, dict) and act.get("browser_disconnected"):
+        # The browser tools answered that no extension was connected: the browser work did not happen, so a clean
+        # exit and a confident result record do not make this a success (read from the tool results, not the text).
+        return "failed"
     # Success needs exit 0 AND a valid claude result record that says it is not an error (parse_output's rules):
     # empty stdout, malformed JSON, a scalar or a record of the wrong shape is a failure, not a quiet success.
     out = res.get("output")
@@ -1312,6 +1317,8 @@ def _activity(out: dict, o: dict, act, meta: dict) -> list:
                             "attempted through a tool; check before trusting it")
         if act.get("files_written"):
             out["files_written"] = act["files_written"]
+        if act.get("browser_disconnected"):
+            out["browser_disconnected"] = act["browser_disconnected"]   # the state is failed; this says which calls
         mode = act.get("effective_permission_mode")
         if mode:
             out["effective_permission_mode"] = mode
@@ -1779,6 +1786,30 @@ def parse_output(raw: str):
 # Tools whose input names the file they change, and the input key holding it (Claude Code 2.1.316 built-ins).
 WRITE_TOOLS = {"Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path"}
 MAX_ACTIVITY_PATHS = 50     # paths kept per list: enough to see what happened, bounded because it goes into status
+# Claude in Chrome's tools (a chrome child's only browser surface) and what they answer while the extension is not
+# attached to the browser. A child whose browser calls all came back with this did no browser work, whatever its result
+# text then claims (seen live 2026-11-08: `tabs_context_mcp` answered it and the task ended "succeeded"). It is matched
+# in the TOOL RESULTS of those tools only, never in the model's own text.
+CHROME_TOOL_PREFIX = "mcp__claude-in-chrome__"
+BROWSER_DISCONNECTED = "Browser extension is not connected"
+
+
+def _result_text(block: dict) -> str:
+    """The text of a tool_result block: a plain string, or the text parts of a content list."""
+    c = block.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "\n".join(p["text"] for p in c if isinstance(p, dict) and isinstance(p.get("text"), str))
+    return ""
+
+
+def browser_disconnected_reason(calls: dict) -> str:
+    """The task's error text when its Claude in Chrome tools reported no connected extension."""
+    names = ", ".join(sorted(t[len(CHROME_TOOL_PREFIX):] if t.startswith(CHROME_TOOL_PREFIX) else t for t in calls))
+    return (f"Claude in Chrome was not connected: {sum(calls.values())} browser tool call(s) ({names}) returned "
+            f"'{BROWSER_DISCONNECTED}', so no browser work was done, whatever the result text says. Open Chrome on the "
+            "host with the Claude extension attached and start the task again.")
 
 
 def summarize_stream(path: str, cwd: str) -> dict:
@@ -1792,6 +1823,8 @@ def summarize_stream(path: str, cwd: str) -> dict:
     mode = None
     attempts: dict = {}                     # tool_use id -> resolved path, in call order (dicts keep insertion order)
     outcome: dict = {}                      # tool_use id -> "ok" | "failed"
+    names: dict = {}                        # tool_use id -> tool name (to read a tool_result as its tool's answer)
+    disconnected: dict = {}                 # chrome tool name -> results saying BROWSER_DISCONNECTED
     root = os.path.realpath(cwd)
     with open(path, encoding="utf-8", errors="replace", newline="\n") as f:   # records end in "\n" only
         for line in f:
@@ -1815,19 +1848,28 @@ def summarize_stream(path: str, cwd: str) -> dict:
                     target = (b.get("input") or {}).get(key) if key and isinstance(b.get("input"), dict) else None
                     if isinstance(target, str) and target and isinstance(b.get("id"), str):
                         attempts[b["id"]] = os.path.realpath(os.path.join(cwd, os.path.expanduser(target)))
+                    if isinstance(b.get("id"), str):
+                        names[b["id"]] = name
                 elif kind == "user" and b.get("type") == "tool_result":
                     if b.get("is_error"):
                         errors += 1
                     tid = b.get("tool_use_id")
                     if tid in attempts and tid not in outcome:
                         outcome[tid] = "failed" if b.get("is_error") else "ok"
+                    tool = names.get(tid)
+                    if (isinstance(tool, str) and tool.startswith(CHROME_TOOL_PREFIX)
+                            and BROWSER_DISCONNECTED in _result_text(b)):
+                        disconnected[tool] = disconnected.get(tool, 0) + 1
     written = [p for i, p in attempts.items() if outcome.get(i) == "ok"]
     unconfirmed = [{"path": p, "outcome": outcome.get(i, "unresolved")} for i, p in attempts.items()
                    if outcome.get(i) != "ok"]
     outside = [p for p in written if os.path.commonpath([root, p]) != root]
-    return {"tool_uses": tool_uses, "tool_errors": errors, "effective_permission_mode": mode,
-            "files_written": written[:MAX_ACTIVITY_PATHS], "writes_outside_cwd": outside[:MAX_ACTIVITY_PATHS],
-            "write_attempts_unconfirmed": unconfirmed[:MAX_ACTIVITY_PATHS]}
+    out = {"tool_uses": tool_uses, "tool_errors": errors, "effective_permission_mode": mode,
+           "files_written": written[:MAX_ACTIVITY_PATHS], "writes_outside_cwd": outside[:MAX_ACTIVITY_PATHS],
+           "write_attempts_unconfirmed": unconfirmed[:MAX_ACTIVITY_PATHS]}
+    if disconnected:
+        out["browser_disconnected"] = disconnected   # present only when seen: classify() fails the task on it
+    return out
 
 
 class _CancelledBeforeSpawn(Exception):
@@ -2001,6 +2043,9 @@ def _run(d: str, lock_fd=None) -> int:
         result["activity"], n = red.deep_count(summarize_stream(os.path.join(d, "stdout.log"), spec.get("cwd") or d))
         if n:
             result["redact_unparsed_lines"] = result.get("redact_unparsed_lines", 0) + n
+        calls = result["activity"].get("browser_disconnected") if isinstance(result["activity"], dict) else None
+        if calls and not result.get("error"):
+            result["error"] = browser_disconnected_reason(calls)   # the task fails (classify) with this as its reason
     except OSError as exc:                       # no stdout at all (the child never started): nothing to summarize
         result["activity_error"] = f"could not read stdout.log: {type(exc).__name__}"
     # The child is over: its workspace leaves active/ (archive/ when pushed or no repository, else held/) before the

@@ -103,14 +103,14 @@ class PlistTest(InstallerHarness):
         self.assertEqual(doc["StandardErrorPath"], log)
         self.assertEqual(doc["EnvironmentVariables"]["CORTADOS_PROVIDER_URL"], "http://127.0.0.1:8432")
         self.assertNotIn("CORTADOS_PROVIDER_TOKEN", doc["EnvironmentVariables"])
-        self.assertTrue((self.home / "cortados-bot-workspace").is_dir())
+        self.assertFalse((self.home / "cortados-bot-workspace").exists())   # #86: no confined workspace root
         self.assertEqual(stat.S_IMODE(self.token_path().stat().st_mode), 0o600)
         return doc
 
     def gateway_args(self, cmdline):
         self.assertIn("--host 127.0.0.1 --port 8434", cmdline)
         self.assertIn(f"--token-file {self.token_path()}", cmdline)
-        self.assertIn(f"--workspace-root {self.home / 'cortados-bot-workspace'}", cmdline)
+        self.assertNotIn("--workspace-root", cmdline)
 
     def test_design_a_runs_the_data_launcher(self):
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\nOTHER=1\n")

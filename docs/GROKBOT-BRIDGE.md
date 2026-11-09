@@ -3,19 +3,53 @@
 Status: PLAN ONLY (2026-11-03). Nothing here is built or deployed. Values marked [ESCALATE] are Forest's to set.
 Machines are named Pro, Air and Studio only; no addresses, hostnames or secrets appear in this file.
 
-## 0. Owner decisions and phase 1 status (2026-11-03) — these override sections 3–5 below
+## 0. Owner decisions — these override sections 3–5 below
+
+**2026-11-08, issue #86 (supersedes the 2026-11-03 phase-1 decisions below): Grok Bot has full task access.** Grok
+Bot is the owner's own agent, like Codex or Claude Code, and may do anything those can, with tasks on the Air. Built
+on branch `grok-full-access`:
+
+- The gateway offers all six tools by default (`start_task`, `task_status`, `wait_task`, `list_tasks`, `cancel_task`,
+  `route_task`) with the owner's full schemas. `start_task` forwards `cwd` (any existing directory on the execution
+  host), `repo`/`branch` (a worktree under the Air's `CortadOS/active/<task_id>`, archived after 3 days when pushed,
+  held when not), `host`, `orchestrator` (model pins), `permission_mode` (unset resolves to the child default, auto),
+  `allowed_tools`, `connectors`, `chrome` (login mode on the owner's signed-in Chrome, unrouted) and `title` exactly as
+  sent; `route_task` forwards `model`. Results and errors reach the bot as the owner's sessions get them (child_tasks
+  redacts the provider credentials from every string).
+- Removed, each with its recorded reason: `route_task` only and `--enable-start-task` ("bots do not act on their own
+  yet", reversed by #86); forced plan mode and refused `permission_mode`/`allowed_tools` (plan mode was no isolation
+  boundary and the bot was not yet the owner's agent); `--workspace-root` confinement of `cwd` (a remote bot was not
+  to reach the owner's folders); chrome refused (acts in the owner's browser); repo/branch/host refused (not built
+  then); model pins refused ("routed only"); allowlisted result fields and fixed error texts (owner paths were not to
+  reach a remote bot; the owner's agent needs them). The installer no longer creates `~/cortados-bot-workspace` or
+  passes `--workspace-root`; the gateway still accepts the flag (ignored, noted on stderr) so an installed plist keeps
+  starting until it is regenerated.
+- Kept: bearer-token authentication, fail-closed (401, throttled; the gateway is on the public internet through
+  Tailscale Funnel on `/mcp`); ownership (status/wait/cancel/list only on the gateway's own tasks: its accounting and
+  attribution depend on it); the usage log; and volume caps as high ceilings whose only reason is the machine or the
+  subscriptions: **8 running at once** (tasks, and separately `route_task` calls in flight; each child is a Claude Code
+  process with tool servers on the Air), **200 tasks/day** and **1000 `route_task`/day** (a bot in a retry loop could
+  start one a second; the owner's busiest day by hand is several times smaller). All three are flags.
+- **Owner-approval rule.** Paying, posting, sending, deleting and similarly flaggable actions need the owner's
+  approval, asked for by Grok in chat. The gateway is not in the child's tool loop, so it enforces what it can see:
+  every child prompt carries the rule (`APPROVAL_DIRECTIVE`, appended after the task so the task's preview stays its
+  own); an approval reaches the child only through the
+  structured `owner_approval` argument (printable, ≤ 2000 characters, quoted into the prompt, never inferred from the
+  task text; a malformed one is refused, not dropped) and is recorded in `bot-usage.jsonl`. That Grok asks first, and
+  that the child honours the rule (backed in auto mode by Claude Code's action classifier), rest on
+  [`BOT-INSTRUCTIONS.md`](BOT-INSTRUCTIONS.md).
+- A chrome task whose Claude in Chrome tool results said "Browser extension is not connected" ends `failed` with
+  that reason (`child_tasks.summarize_stream` reads the tool results, never the model's text).
+
+Earlier decisions, still in force unless changed above:
 
 - **One shared token for all Grok Bots.** No per-bot tokens, principals or scopes: every bot is the single client
   `grokbot`. Sections 3.3 and ticket B2's per-client tokens are superseded. Usage by bots is still tracked and shown.
-- **Chrome is never allowed through the gateway** (refused, and removed from the advertised `start_task` schema).
-- **Phase 1 offers `route_task` only** (owner decision 2026-11-03: Grok Bots must not act on their own yet).
-  `start_task` arrives with phase 2: plan mode is not an isolation boundary (a child runs as the owner, reads the
-  owner's files and inherits the owner's MCP servers), so it waits for per-bot filesystem/account isolation (B5).
-  `start_task` is not listed in `tools/list` and is refused if called, with the reason "start_task is disabled until
-  per-bot filesystem/account isolation (phase 2, B5) exists; use route_task"; the task tools are refused likewise.
-  The code path stays behind `--enable-start-task` (accepted only together with `--children-run-as-me`), and even
-  then every child is sent `permission_mode: "plan"` explicitly (an omitted mode would resolve to `auto`).
-- The gateway will run on the Air on port 8434; phase 1 only builds and tests it.
+- ~~Chrome is never allowed through the gateway~~ (2026-11-03; reversed by #86).
+- ~~Phase 1 offers `route_task` only~~ (2026-11-03: "Grok Bots must not act on their own yet"; reversed by #86. The
+  reasoning then: plan mode is not an isolation boundary, so `start_task` was to wait for per-bot isolation, B5. The
+  owner's 2026-11-08 decision is that Grok Bot is the owner's agent and needs no boundary from the owner.)
+- The gateway runs on the Air on port 8434.
 - **Funnel exposure (owner decision 2026-11-06):** the installed gateway binds only
   `127.0.0.1:8434`; Tailscale Funnel uses public HTTPS port 443 (outside bots' egress proxies
   commonly pass only 443) and maps only `/mcp` to the local `/mcp`; private tailnet-only Serve (the provider) uses
@@ -39,19 +73,20 @@ Machines are named Pro, Air and Studio only; no addresses, hostnames or secrets 
   loopback), with bounded in-memory state. Valid credentials bypass cooldown so shared egress cannot cause lockout;
   the aggregate failure threshold is 429 response signalling, not token-comparison admission control. The access log
   prints method, path, status and client address, never headers or tokens.
-- Tools, reusing `subagent_mcp`: phase 1 lists `route_task` only. With `--enable-start-task` (not for phase 1) six:
-  `start_task`, `wait_task`, `task_status`, `list_tasks`, `cancel_task`, `route_task`.
+- Tools, reusing `subagent_mcp`: all six (`start_task`, `wait_task`, `task_status`, `list_tasks`, `cancel_task`,
+  `route_task`) since #86; phase 1 listed `route_task` only.
 - HTTP admission: capacity (16 connections) is taken at accept, before a worker thread exists or a header is parsed
   (a full server answers 503 at once); the request line and headers must arrive within 10 s and the body within 30 s
   (absolute deadlines, as in `local_gate`), one request per connection.
-- Errors from a child or the provider reach the bot as a fixed text; the detail goes to the gateway's stderr.
-  Successful task results are allowlisted field by field (no owner paths). A `start_task` launch reservation is
-  written to `bot-counters.json` before the spawn, so a gateway crash mid-start keeps the slot held after restart
-  (until the child's max runtime has passed).
-- Policy before any tool runs (refusals are JSON-RPC error `-32001`, counted and logged): `chrome` refused; `cwd` must
-  resolve inside `--workspace-root` (no root = refuse to start); status/wait/cancel only on tasks the gateway started
-  (`list_tasks` filtered likewise); caps: 2 concurrent tasks, 30 tasks/day, 200 `route_task`/day (UTC days, rebuilt
-  from `bot-counters.json` and the usage log at start so a restart neither resets caps nor orphans tasks).
+- Errors from a child or the provider, and task results, reach the bot as the owner's sessions get them (#86; phase 1
+  replaced errors with a fixed text and allowlisted result fields). A `start_task` launch reservation is written to
+  `bot-counters.json` before the spawn, so a gateway crash mid-start keeps the slot held after restart (until the
+  child's max runtime has passed).
+- Policy before any tool runs (refusals are JSON-RPC error `-32001`, counted and logged): the owner-approval
+  directive is appended to every child prompt and `owner_approval` validated; status/wait/cancel only on tasks the
+  gateway started (`list_tasks` filtered likewise); caps: 8 concurrent tasks, 200 tasks/day, 1000 `route_task`/day
+  (UTC days, rebuilt from `bot-counters.json` and the usage log at start so a restart neither resets caps nor orphans
+  tasks). Phase 1 also refused `chrome` and confined `cwd` to `--workspace-root`, with caps 2 / 30 / 200.
 - Attribution: `start_task` passes `client="grokbot"` to `child_tasks.start`, which records it in the task's
   `meta.json` and every `child-tasks.jsonl` event line; `route_task` sends `x-cortados-client: grokbot` to the
   provider. The gateway appends one line per call to `$CORTADOS_HOME/bot-usage.jsonl`

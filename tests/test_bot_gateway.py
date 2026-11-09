@@ -1,5 +1,6 @@
-"""Bot gateway (cortados_router/bot_gateway.py): auth, the six-tool surface, policy, caps, usage log. Fakes only: the
-child-task and route_task implementations are injected, so no claude/codex child and no provider is ever started."""
+"""Bot gateway (cortados_router/bot_gateway.py): fail-closed auth, the full six-tool surface (#86), the owner-approval
+rule, caps, usage log. Fakes only: the child-task and route_task implementations are injected, so no claude/codex child
+and no provider is ever started."""
 import io
 import json
 import os
@@ -41,18 +42,15 @@ class FakeChild:
 class GatewayTest(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
-        self.root = tempfile.mkdtemp()
         self.env = mock.patch.dict(os.environ, {"CORTADOS_HOME": self.home, "CORTADOS_SCARCITY_REFRESH": "off"})
         self.env.start()
         self.child = FakeChild()
         self.routes = []
 
         def route(url, token, task, context="", max_tokens=0, model=None, client=None):
-            self.routes.append({"task": task, "client": client})
+            self.routes.append({"task": task, "client": client, "model": model})
             return {"content": [{"type": "text", "text": "answer"}]}
-        # The start_task path is tested with it switched on (--enable-start-task); PhaseOneTest covers the default.
-        self.gw = bg.Gateway(TOKEN, self.root, {"url": "http://fake", "token": "prov-token-xyz123"},
-                             child=self.child, route=route, enable_start_task=True)
+        self.gw = bg.Gateway(TOKEN, {"url": "http://fake", "token": "prov-token-xyz123"}, child=self.child, route=route)
 
     def tearDown(self):
         self.env.stop()
@@ -69,47 +67,114 @@ class GatewayTest(unittest.TestCase):
             return [json.loads(l) for l in f]
 
     def start(self, **kw):
-        a = {"task": "do it", "cwd": self.root, **kw}
-        return self.tcall("start_task", **a)
+        return self.tcall("start_task", **{"task": "do it", **kw})
 
-    def test_tools_list_is_exactly_six(self):
+    def finish_all(self):
+        for t in self.child.states:
+            self.child.states[t] = "succeeded"
+
+    # -- the surface (#86) -----------------------------------------------------------------------------------------
+    def test_tools_list_is_the_full_six_with_the_owners_schemas(self):
         r = self.gw.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
-        names = sorted(t["name"] for t in r["result"]["tools"])
-        self.assertEqual(names, sorted(bg.EXPOSED))
-        st = [t for t in r["result"]["tools"] if t["name"] == "start_task"][0]
-        self.assertNotIn("chrome", st["inputSchema"]["properties"])
-        # the shared schema is not mutated
-        self.assertIn("chrome", subagent_mcp.CHILD_TOOLS[0]["inputSchema"]["properties"])
+        tools = {t["name"]: t for t in r["result"]["tools"]}
+        self.assertEqual(sorted(tools), sorted(bg.EXPOSED))
+        props = tools["start_task"]["inputSchema"]["properties"]
+        for k in ("chrome", "repo", "branch", "host", "cwd", "orchestrator", "permission_mode", "connectors",
+                  "allowed_tools", "title", bg.APPROVAL_ARG):
+            self.assertIn(k, props, k)
+        self.assertEqual(tools["start_task"]["inputSchema"]["required"], ["task"])
+        self.assertIn("model", tools["route_task"]["inputSchema"]["properties"])
+        # the shared schema is copied, not mutated
+        self.assertNotIn(bg.APPROVAL_ARG, subagent_mcp.CHILD_TOOLS[0]["inputSchema"]["properties"])
 
     def test_initialize_and_notification(self):
         r = self.gw.handle({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}})
         self.assertEqual(r["result"]["serverInfo"]["name"], "cortados-bot-gateway")
         self.assertIsNone(self.gw.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
 
-    def test_chrome_refused(self):
-        r = self.start(chrome=True)
-        self.assertEqual(r["error"]["code"], bg.POLICY_ERROR)
-        self.assertIn("chrome", r["error"]["message"])
-        self.assertEqual(self.child.calls, [])
-        self.assertEqual(self.usage()[-1]["outcome"], "refused")
-
-    def test_cwd_outside_root_refused(self):
-        for cwd in ("/tmp", self.root + "/../", "relative/path", None):
-            r = self.tcall("start_task", task="x", cwd=cwd)
-            self.assertEqual(r["error"]["code"], bg.POLICY_ERROR, cwd)
-        sub = os.path.join(self.root, "repo")
-        os.mkdir(sub)
-        self.assertIn("result", self.tcall("start_task", task="x", cwd=sub))
-
-    def test_start_is_attributed_and_chrome_forced_false(self):
-        r = self.start()
+    def test_every_capability_is_forwarded_as_sent(self):
+        """Each formerly refused start_task argument (chrome, repo, branch, host, pins, permission mode, connectors,
+        allowed_tools) reaches child_tasks exactly as the bot sent it, attributed to grokbot."""
+        sent = {"chrome": True, "repo": "https://github.com/o/r.git", "branch": "feature/x", "host": "air",
+                "orchestrator": "opus", "permission_mode": "auto", "connectors": ["vercel"],
+                "allowed_tools": ["Bash(npm test:*)"], "title": "Try it"}
+        r = self.start(**sent)
         self.assertIn("result", r)
         name, a, cfg = self.child.calls[-1]
-        self.assertEqual((name, a["chrome"], cfg["client"]), ("start_task", False, "grokbot"))
+        self.assertEqual((name, cfg["client"]), ("start_task", "grokbot"))
+        for k, v in sent.items():
+            self.assertEqual(a[k], v, k)
+        self.assertTrue(a["task"].startswith("do it"))
         u = self.usage()[-1]
-        self.assertEqual((u["client"], u["tool"], u["outcome"], u["task_id"]),
-                         ("grokbot", "start_task", "ok", "task-0001-abcdef"))
+        self.assertEqual((u["client"], u["tool"], u["outcome"], u["task_id"], u["owner_approval"]),
+                         ("grokbot", "start_task", "ok", "task-0001-abcdef", False))
 
+    def test_cwd_anywhere_on_the_host_and_omitted_cwd(self):
+        self.assertIn("result", self.start(cwd="/Users/owner/code/project"))
+        self.assertEqual(self.child.calls[-1][1]["cwd"], "/Users/owner/code/project")   # not confined, not rewritten
+        self.finish_all()
+        self.assertIn("result", self.start())
+        self.assertNotIn("cwd", self.child.calls[-1][1])          # child_tasks gives a plain folder under active/
+
+    def test_omitted_permission_mode_resolves_to_the_child_default(self):
+        self.start()
+        fwd = self.child.calls[-1][1]
+        self.assertNotIn("permission_mode", fwd)
+        mode, _ = ct.resolve_permission_mode(fwd.get("permission_mode"), "cortados")
+        self.assertEqual(mode, ct.DEFAULT_PERMISSION_MODE)          # auto: the owner's own default
+
+    def test_route_task_pin_is_forwarded(self):
+        self.assertIn("result", self.tcall("route_task", task="q", model="sub/opus"))
+        self.assertEqual(self.routes[-1], {"task": "q", "client": "grokbot", "model": "sub/opus"})
+        self.assertIn("result", self.tcall("route_task", task="q"))
+        self.assertIsNone(self.routes[-1]["model"])
+
+    def test_unknown_arguments_are_dropped(self):
+        self.start(bogus="x", allowed_tools=["Read"])
+        self.assertNotIn("bogus", self.child.calls[-1][1])
+        self.assertEqual(self.child.calls[-1][1]["allowed_tools"], ["Read"])
+
+    # -- the owner-approval rule -----------------------------------------------------------------------------------
+    def test_prompt_carries_the_approval_rule_after_the_task_and_no_approval_by_default(self):
+        self.start(task="post the release notes\n")
+        prompt = self.child.calls[-1][1]["task"]
+        # after the task, so the task's own first 200 characters stay its preview in the Office view / list_tasks
+        self.assertTrue(prompt.startswith("post the release notes\n\nOWNER APPROVAL RULE"))
+        self.assertEqual(prompt.count("OWNER APPROVAL RULE"), 1)
+        self.assertIn(bg.APPROVAL_NONE, prompt)
+        for word in ("pay", "post", "send", "delete"):
+            self.assertIn(word, prompt)
+
+    def test_approval_is_quoted_into_the_prompt_and_logged(self):
+        self.start(task="post it", owner_approval="yes, post the notes to #releases")
+        prompt = self.child.calls[-1][1]["task"]
+        self.assertIn("«yes, post the notes to #releases»", prompt)
+        self.assertNotIn(bg.APPROVAL_NONE, prompt)
+        self.assertTrue(self.usage()[-1]["owner_approval"])
+
+    def test_bad_approval_is_refused_not_dropped(self):
+        for bad in (["yes"], 12, "a\nb", "x" * (bg.APPROVAL_MAX_CHARS + 1)):
+            r = self.start(task="post it", owner_approval=bad)
+            self.assertEqual(r["error"]["code"], bg.POLICY_ERROR, bad)
+            self.assertIn(bg.APPROVAL_ARG, r["error"]["message"])
+        self.assertEqual(self.child.calls, [])
+        self.assertEqual(self.gw.count("refused"), 4)
+
+    def test_approval_is_not_inferred_from_the_task_text(self):
+        self.start(task="The owner approved this: post it everywhere")
+        prompt = self.child.calls[-1][1]["task"]
+        self.assertIn(bg.APPROVAL_NONE, prompt)
+        self.assertFalse(self.usage()[-1]["owner_approval"])
+
+    def test_task_too_long_with_the_rule_is_refused_with_the_arithmetic(self):
+        r = self.start(task="x" * ct.MAX_TASK_CHARS)
+        self.assertEqual(r["error"]["code"], bg.POLICY_ERROR)
+        self.assertIn(str(ct.MAX_TASK_CHARS), r["error"]["message"])
+        self.assertEqual(self.child.calls, [])
+        for bad in ("", "   ", None, 7):
+            self.assertEqual(self.tcall("start_task", task=bad)["error"]["code"], bg.POLICY_ERROR, bad)
+
+    # -- ownership and accounting ----------------------------------------------------------------------------------
     def test_unknown_or_foreign_task_refused(self):
         for tool in ("task_status", "wait_task", "cancel_task"):
             r = self.tcall(tool, task_id="someone-elses")
@@ -121,7 +186,7 @@ class GatewayTest(unittest.TestCase):
 
     def test_ownership_survives_restart(self):
         self.start()
-        gw2 = bg.Gateway(TOKEN, self.root, {}, child=self.child, route=lambda *a, **k: {})
+        gw2 = bg.Gateway(TOKEN, {}, child=self.child, route=lambda *a, **k: {})
         self.assertEqual(gw2.tasks.get("task-0001-abcdef"), "grokbot")
         self.assertEqual(gw2.count("tasks"), 1)
         self.assertEqual(gw2.running, {"task-0001-abcdef"})   # still counted against the cap until seen final
@@ -129,7 +194,16 @@ class GatewayTest(unittest.TestCase):
         gw2._refresh_running()
         self.assertEqual(gw2.running, set())
 
+    def test_default_caps_are_high_ceilings(self):
+        self.assertEqual(bg.DEFAULTS, {"max_concurrent": 8, "max_tasks_per_day": 200, "max_routes_per_day": 1000})
+        for _ in range(bg.DEFAULTS["max_concurrent"]):
+            self.assertIn("result", self.start())
+        r = self.start()
+        self.assertIn("concurrency cap", r["error"]["message"])
+        self.assertIn("Air", r["error"]["message"])
+
     def test_concurrency_cap(self):
+        self.gw.limits["max_concurrent"] = 2
         self.start(); self.start()
         r = self.start()
         self.assertIn("concurrency cap", r["error"]["message"])
@@ -141,7 +215,9 @@ class GatewayTest(unittest.TestCase):
         self.gw.limits["max_tasks_per_day"] = 1
         self.start()
         self.child.states["task-0001-abcdef"] = "succeeded"
-        self.assertIn("daily task cap", self.start()["error"]["message"])
+        r = self.start()
+        self.assertIn("daily task cap", r["error"]["message"])
+        self.assertIn("subscriptions", r["error"]["message"])
 
     def test_route_task_cap_and_client(self):
         self.gw.limits["max_routes_per_day"] = 2
@@ -163,36 +239,8 @@ class GatewayTest(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.home, bg.USAGE_LOG + ".1")))
         self.assertLess(os.path.getsize(os.path.join(self.home, bg.USAGE_LOG)), 400)
 
-    def test_model_pins_refused(self):
-        for pin in ("sub/opus", "api/claude-opus", "gpt-6"):
-            r = self.start(orchestrator=pin)
-            self.assertIn("model pins", r["error"]["message"], pin)
-            r = self.tcall("route_task", task="q", model=pin)
-            self.assertIn("model pins", r["error"]["message"], pin)
-        self.assertEqual(self.child.calls, [])
-        self.assertEqual(self.routes, [])
-        self.assertIn("result", self.start(orchestrator="cortados"))
-        self.assertNotIn("orchestrator", self.child.calls[-1][1])
-        self.assertIn("result", self.tcall("route_task", task="q", model="cortados"))
-        tools = {t["name"]: t for t in bg.tool_list(bg.EXPOSED)}
-        self.assertNotIn("orchestrator", tools["start_task"]["inputSchema"]["properties"])
-        self.assertNotIn("model", tools["route_task"]["inputSchema"]["properties"])
-        self.assertIn("model", subagent_mcp.TOOL["inputSchema"]["properties"])
-
-    def test_permission_grants_refused(self):
-        for kw in ({"permission_mode": "dontAsk"}, {"permission_mode": "bypassPermissions"},
-                   {"allowed_tools": ["Bash"]}, {"allowed_tools": "Bash"}):
-            r = self.start(**kw)
-            self.assertIn("phase 2 B5", r["error"]["message"], kw)
-        self.assertEqual(self.child.calls, [])
-        self.assertIn("result", self.start(permission_mode="plan"))
-        a = self.child.calls[-1][1]
-        self.assertEqual(a.get("permission_mode"), "plan")
-        self.assertNotIn("allowed_tools", a)
-        props = {t["name"]: t for t in bg.tool_list(bg.EXPOSED)}["start_task"]["inputSchema"]["properties"]
-        self.assertFalse({"permission_mode", "allowed_tools"} & set(props))
-
     def test_parallel_starts_respect_cap(self):
+        self.gw.limits["max_concurrent"] = 2
         self.start()                                  # 1 of 2 running
         gate, entered = threading.Event(), []
         inner = self.child
@@ -227,13 +275,12 @@ class GatewayTest(unittest.TestCase):
         self.gw.child = boom
         with redirect_stderr(io.StringIO()):
             r = self.start()
-        # item 7: a non-TaskError is a JSON-RPC -32603 naming only the type, not a dropped connection
+        # a non-TaskError is a JSON-RPC -32603 naming only the type, not a dropped connection
         self.assertEqual(r["error"]["code"], -32603)
         self.assertEqual(r["error"]["message"], "internal error (RuntimeError)")
         self.assertNotIn("child died", json.dumps(r))
         self.assertEqual(self.gw.running, set())
 
-    # -- review round P3 -------------------------------------------------------------------------------------------
     def test_load_skips_bad_lines(self):
         self.start()
         with open(os.path.join(self.home, bg.USAGE_LOG), "a") as f:
@@ -241,7 +288,7 @@ class GatewayTest(unittest.TestCase):
                     + "[" * 100000 + "\n")
         err = io.StringIO()
         with redirect_stderr(err):
-            gw2 = bg.Gateway(TOKEN, self.root, {}, child=self.child, route=lambda *a, **k: {})
+            gw2 = bg.Gateway(TOKEN, {}, child=self.child, route=lambda *a, **k: {})
         self.assertIn("skipped 6", err.getvalue())
         self.assertEqual(gw2.count("tasks"), 1)
         self.assertEqual(gw2.tasks.get("task-0001-abcdef"), "grokbot")
@@ -252,7 +299,7 @@ class GatewayTest(unittest.TestCase):
         with open(os.path.join(self.home, bg.COUNTERS_FILE)) as f:
             saved = json.load(f)
         self.assertEqual(saved["owned"], ["task-0001-abcdef"])
-        gw2 = bg.Gateway(TOKEN, self.root, {}, child=self.child, route=lambda *a, **k: {})
+        gw2 = bg.Gateway(TOKEN, {}, child=self.child, route=lambda *a, **k: {})
         self.assertEqual(gw2.count("tasks"), 1)
         self.assertEqual(gw2.count("routes"), 1)
         self.assertEqual(gw2.tasks.get("task-0001-abcdef"), "grokbot")
@@ -268,40 +315,14 @@ class GatewayTest(unittest.TestCase):
         self.gw._refresh_running()
         self.assertEqual(self.gw.running, set())
 
-    # -- review round 2 --------------------------------------------------------------------------------------------
-    def test_permission_mode_always_plan_through_real_resolution(self):
-        # P1-1: omitted / null / empty must not reach child_tasks as "unset" (which resolves to auto).
-        for kw in ({}, {"permission_mode": None}, {"permission_mode": ""}, {"permission_mode": "plan"}):
-            self.assertIn("result", self.start(**kw), kw)
-            fwd = self.child.calls[-1][1]
-            mode, _ = ct.resolve_permission_mode(fwd.get("permission_mode"), "cortados")
-            self.assertEqual(mode, "plan", kw)
-            for t in self.child.states:        # finish it, freeing the concurrency slot for the next start
-                self.child.states[t] = "succeeded"
-
-    def test_cwd_resolved_once(self):
-        # P2-3: the value checked is the value forwarded; a second realpath after the check would see a swapped link.
-        real = os.path.join(self.root, "real")
-        os.mkdir(real)
-        calls = []
-        orig = os.path.realpath
-
-        def counting(p, *a, **k):
-            calls.append(p)
-            return orig(p, *a, **k)
-        with mock.patch.object(bg.os.path, "realpath", counting):
-            self.start(cwd=real)
-        self.assertEqual(calls.count(real), 1)
-        self.assertEqual(self.child.calls[-1][1]["cwd"], orig(real))
-
     def test_reservation_persisted_before_spawn(self):
-        # P2-5: if the gateway dies after spawning but before recording the task id, a restarted gateway still holds
-        # the slot (the reservation was on disk before the child launched).
+        # if the gateway dies after spawning but before recording the task id, a restarted gateway still holds the
+        # slot (the reservation was on disk before the child launched).
         seen = {}
 
         def crashing(name, a, cfg):
             if name == "start_task":
-                seen["restart"] = bg.Gateway(TOKEN, self.root, {}, child=FakeChild(), enable_start_task=True)
+                seen["restart"] = bg.Gateway(TOKEN, {}, child=FakeChild())
                 raise SystemExit("gateway killed mid-start")
             return self.child(name, a, cfg)
         self.gw.child = crashing
@@ -312,38 +333,31 @@ class GatewayTest(unittest.TestCase):
         self.assertTrue(all(s.startswith(bg._PENDING) for s in again.running))
         with mock.patch.dict(again.limits, {"max_concurrent": 1}):
             self.assertIn("concurrency cap", again.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": {"name": "start_task", "arguments": {"task": "t", "cwd": self.root}}})["error"]["message"])
+                "params": {"name": "start_task", "arguments": {"task": "t"}}})["error"]["message"])
         # Past the child's max runtime the reservation is provably dead and expires.
         again.reservation_ttl = 0
         again._refresh_running()
         self.assertEqual((again.reserved, again.running), ({}, set()))
 
-    def test_errors_are_fixed_text(self):
-        # P3-6: a failed start (or any child error) never shows the bot the raw text; stderr gets the detail.
-        leak = {"content": [{"type": "text", "text": "cannot read /Users/o/.cortados/provider-token"}], "isError": True}
-        self.gw.child = lambda n, a, c: leak
-        err = io.StringIO()
-        with redirect_stderr(err):
-            r = self.start()
-        txt = json.dumps(r)
-        self.assertNotIn("/Users/o", txt)
-        self.assertIn("gateway log", txt)
-        self.assertIn("/Users/o/.cortados/provider-token", err.getvalue())
+    # -- results reach the bot as the owner's sessions get them ----------------------------------------------------
+    def test_child_errors_pass_through(self):
+        err = {"content": [{"type": "text", "text": "start_task: cwd '/nope' does not exist on execution host air"}],
+               "isError": True}
+        self.gw.child = lambda n, a, c: err
+        r = self.start(cwd="/nope")
+        self.assertEqual(r["result"], err)
+        self.assertEqual(self.usage()[-1]["outcome"], "error")
+        self.assertEqual(self.gw.running, set())
 
-    def test_success_fields_allowlisted(self):
+    def test_status_fields_pass_through(self):
         self.start()
-        self.gw.child = lambda n, a, c: {"content": [{"type": "text", "text": json.dumps(
-            {"task_id": "task-0001-abcdef", "state": "running", "new_owner_field": "/Users/o/secret"})}]}
+        full = {"task_id": "task-0001-abcdef", "state": "failed", "dir": "/Users/o/.config/cortados/tasks/t",
+                "stdout_log": "/Users/o/x/stdout.log", "cwd": "/Users/o/proj", "warnings": ["w"],
+                "browser_disconnected": {"mcp__claude-in-chrome__tabs_context_mcp": 1}, "error": "why",
+                "workspace": {"kind": "repo", "state": "held", "path": "/Users/o/CortadOS/held/t"}}
+        self.gw.child = lambda n, a, c: {"content": [{"type": "text", "text": json.dumps(full)}]}
         st = json.loads(self.tcall("task_status", task_id="task-0001-abcdef")["result"]["content"][0]["text"])
-        self.assertEqual(set(st), {"task_id", "state"})
-
-    def test_start_forwards_realpath(self):
-        real = os.path.join(self.root, "real")
-        os.mkdir(real)
-        link = os.path.join(self.root, "link")
-        os.symlink(real, link)
-        self.start(cwd=link)
-        self.assertEqual(self.child.calls[-1][1]["cwd"], os.path.realpath(real))
+        self.assertEqual(st, full)
 
     def test_list_asks_for_owned_ids(self):
         self.start()
@@ -351,28 +365,9 @@ class GatewayTest(unittest.TestCase):
         name, a, _ = self.child.calls[-1]
         self.assertEqual((name, a["ids"]), ("list_tasks", ["task-0001-abcdef"]))
 
-    def test_paths_stripped(self):
-        self.start()
-        sub = os.path.join(self.root, "proj")
-        os.mkdir(sub)
-
-        def child(name, a, cfg):
-            row = {"task_id": "task-0001-abcdef", "state": "running", "dir": "/Users/o/.cortados/x",
-                   "stdout_log": "/Users/o/x/stdout.log", "stderr_log": "/Users/o/x/stderr.log", "cwd": sub}
-            if name == "list_tasks":
-                row = {"tasks": [row]}
-            return {"content": [{"type": "text", "text": json.dumps(row)}]}
-        self.gw.child = child
-        st = json.loads(self.tcall("task_status", task_id="task-0001-abcdef")["result"]["content"][0]["text"])
-        lt = json.loads(self.tcall("list_tasks")["result"]["content"][0]["text"])["tasks"][0]
-        for out in (st, lt):
-            for k in bg.PATH_FIELDS:
-                self.assertNotIn(k, out)
-            self.assertEqual(out["cwd"], "proj")
-
     def test_route_max_tokens_clamped(self):
         seen = []
-        self.gw.route = lambda url, tok, task, ctx, mx, client=None: seen.append(mx) or {"content": []}
+        self.gw.route = lambda url, tok, task, ctx, mx, model=None, client=None: seen.append(mx) or {"content": []}
         for v in (10 ** 9, "big", True, -5, 100):
             self.tcall("route_task", task="q", max_tokens=v)
         self.assertEqual(seen, [bg.MAX_ROUTE_TOKENS] * 4 + [100])
@@ -389,6 +384,7 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(held, [False])
 
     def test_route_concurrency_cap(self):
+        self.gw.limits["max_concurrent"] = 2
         gate, out = threading.Event(), []
 
         def slow(url, token, task, context="", max_tokens=0, model=None, client=None):
@@ -410,17 +406,34 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(self.gw.routes_inflight, 0)
         self.assertIn("result", self.tcall("route_task", task="q4"))
 
-    def test_main_refuses_non_loopback_host(self):
+    # -- command line ----------------------------------------------------------------------------------------------
+    def test_main_refuses_non_loopback_host_without_acknowledgement(self):
         err = io.StringIO()
         with redirect_stderr(err):
-            self.assertEqual(bg.main(["--token-file", "/nonexistent", "--workspace-root", self.root,
-                                      "--host", "0.0.0.0"]), 2)
+            self.assertEqual(bg.main(["--token-file", "/nonexistent", "--host", "0.0.0.0"]), 2)
         self.assertIn("--children-run-as-me", err.getvalue())
-        self.assertIn("phase 2 B5", err.getvalue())
+        self.assertIn("Funnel", err.getvalue())
 
-    def test_no_workspace_root_refuses(self):
+    def test_main_needs_no_flag_for_start_task_and_no_workspace_root(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            # parses with only --token-file, then refuses on the missing token file (fail closed), not on a flag
+            self.assertEqual(bg.main(["--token-file", "/nonexistent"]), 2)
+            self.assertIn("cannot open the token file", err.getvalue())
+            with self.assertRaises(SystemExit) as cm:
+                bg.main(["--enable-start-task", "--token-file", "/nonexistent"])   # the phase-1 flag is gone
+            self.assertEqual(cm.exception.code, 2)
+            # an old plist's --workspace-root still starts the parser; it is only noted
+            self.assertEqual(bg.main(["--token-file", "/nonexistent", "--workspace-root", "/w"]), 2)
+            self.assertIn("--workspace-root is ignored", err.getvalue())
+            self.assertEqual(bg.main(["--token-file", "/nonexistent", "--max-concurrent", "0"]), 2)
+            self.assertIn("at least 1", err.getvalue())
+
+    def test_short_token_refused_at_construction(self):
         with self.assertRaises(bg.GatewayError):
-            bg.Gateway(TOKEN, "", {})
+            bg.Gateway("short", {})
+        with self.assertRaises(bg.GatewayError):
+            bg.Gateway(None, {})
 
 
 class RouteTaskHeaderTest(unittest.TestCase):
@@ -443,41 +456,6 @@ class RouteTaskHeaderTest(unittest.TestCase):
     def test_child_event_fields_carry_client(self):
         self.assertEqual(ct._event_fields({"task_id": "t", "client": "grokbot"})["client"], "grokbot")
         self.assertNotIn("client", ct._event_fields({"task_id": "t"}))
-
-
-class PhaseOneTest(unittest.TestCase):
-    """Default (no --enable-start-task): route_task only (owner decision 2026-11-03, review r2 P1-2)."""
-    def setUp(self):
-        self.env = mock.patch.dict(os.environ, {"CORTADOS_HOME": tempfile.mkdtemp()})
-        self.env.start()
-        self.child = FakeChild()
-        self.gw = bg.Gateway(TOKEN, tempfile.mkdtemp(), {}, child=self.child,
-                             route=lambda *a, **k: {"content": [{"type": "text", "text": "answer"}]})
-
-    def tearDown(self):
-        self.env.stop()
-
-    def call(self, name, **a):
-        return self.gw.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                               "params": {"name": name, "arguments": a}})
-
-    def test_only_route_task_offered(self):
-        r = self.gw.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
-        self.assertEqual([t["name"] for t in r["result"]["tools"]], ["route_task"])
-
-    def test_start_and_task_tools_refused(self):
-        r = self.call("start_task", task="x", cwd=self.gw.root)
-        self.assertEqual(r["error"]["message"], "refused by bot gateway policy: " + bg.START_DISABLED)
-        for name in ("wait_task", "task_status", "cancel_task", "list_tasks"):
-            self.assertIn("phase 2, B5", self.call(name, task_id="t")["error"]["message"], name)
-        self.assertEqual(self.child.calls, [])
-        self.assertEqual(self.call("route_task", task="q")["result"]["content"][0]["text"], "answer")
-
-    def test_enable_flag_needs_children_run_as_me(self):
-        err = io.StringIO()
-        with redirect_stderr(err):
-            self.assertEqual(bg.main(["--enable-start-task", "--token-file", "x", "--workspace-root", "/"]), 2)
-        self.assertIn("--children-run-as-me", err.getvalue())
 
 
 class TokenFileTest(unittest.TestCase):
@@ -506,7 +484,7 @@ class TokenFileTest(unittest.TestCase):
         os.chmod(p, 0o640)
         err = io.StringIO()
         with redirect_stderr(err):
-            self.assertEqual(bg.main(["--token-file", p, "--workspace-root", d]), 2)
+            self.assertEqual(bg.main(["--token-file", p]), 2)
         self.assertNotIn(TOKEN, err.getvalue())
 
 
@@ -555,7 +533,8 @@ class HttpTest(unittest.TestCase):
         self.home = tempfile.mkdtemp()
         self.env = mock.patch.dict(os.environ, {"CORTADOS_HOME": self.home})
         self.env.start()
-        self.gw = bg.Gateway(TOKEN, tempfile.mkdtemp(), {}, child=FakeChild(), route=lambda *a, **k: {})
+        self.child = FakeChild()
+        self.gw = bg.Gateway(TOKEN, {}, child=self.child, route=lambda *a, **k: {})
         self.err = io.StringIO()
         self.red = redirect_stderr(self.err)
         self.red.__enter__()
@@ -587,10 +566,36 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(self.post(msg, "wrong-token-0000000000")[0], 401)
         code, body = self.post(msg)
         self.assertEqual(code, 200)
-        self.assertEqual(len(json.loads(body)["result"]["tools"]), 1)    # phase 1: route_task only
+        self.assertEqual(len(json.loads(body)["result"]["tools"]), 6)    # #86: the full surface
         self.assertEqual(self.post({"jsonrpc": "2.0", "method": "notifications/initialized"})[0], 202)
         self.assertNotIn(TOKEN, self.err.getvalue())
         self.assertIn("POST /mcp", self.err.getvalue())
+
+    def test_unauthenticated_start_task_is_401_and_starts_nothing(self):
+        """Fail closed at the public edge: with full task access behind the token, a missing, wrong, prefix-matching
+        or differently cased token must never reach a tool, and must not even reveal the tool list."""
+        call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "start_task", "arguments": {"task": "rm -rf", "chrome": True,
+                                                              "permission_mode": "auto"}}}
+        # The first AUTH_FAILURES wrong tokens from one address are 401; from then on the throttle answers 429 before
+        # the token is even compared. Both are refusals; neither reaches a tool.
+        for i, bad in enumerate((None, "", TOKEN[:-1], TOKEN + "x", TOKEN.upper(), "Bearer " + TOKEN)):
+            code, body = self.post(call, bad)
+            self.assertEqual(code, 401 if i < bg.AUTH_FAILURES else 429, bad)
+            self.assertIn("error", json.loads(body))
+        req = urllib.request.Request(self.url, data=json.dumps(call).encode(),
+                                     headers={"authorization": "Basic " + TOKEN}, method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertIn(cm.exception.code, (401, 429))
+        self.assertEqual(self.child.calls, [])
+        self.assertEqual(self.gw.running, set())
+        self.assertFalse(os.path.exists(os.path.join(self.home, bg.USAGE_LOG)))   # nothing to account for
+        # the same call with the token is accepted and reaches the fake child with every argument
+        code, body = self.post(call)
+        self.assertEqual(code, 200)
+        self.assertIn("result", json.loads(body))
+        self.assertEqual(self.child.calls[-1][1]["chrome"], True)
 
     def test_per_address_throttle_and_valid_other_address(self):
         msg = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
@@ -637,7 +642,7 @@ class HttpTest(unittest.TestCase):
         try:
             self.url = f"http://127.0.0.1:{srv.server_address[1]}/mcp"
             self.assertEqual(self.post({"jsonrpc": "2.0", "id": 1, "method": "ping"})[0], 503)
-            # P2-4: refused at accept, before any header is parsed: a client that sends nothing still gets the 503.
+            # refused at accept, before any header is parsed: a client that sends nothing still gets the 503.
             import socket
             with socket.create_connection(("127.0.0.1", srv.server_address[1]), timeout=5) as s:
                 self.assertTrue(s.recv(100).startswith(b"HTTP/1.1 503"))
@@ -646,7 +651,7 @@ class HttpTest(unittest.TestCase):
             srv.server_close()
 
     def test_header_deadline_closes_trickler(self):
-        # P2-4: a client that never finishes its headers is shut at HEADER_DEADLINE_S, freeing its slot.
+        # a client that never finishes its headers is shut at HEADER_DEADLINE_S, freeing its slot.
         import socket
         import time
         with mock.patch.object(bg, "HEADER_DEADLINE_S", 0.3):

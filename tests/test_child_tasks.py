@@ -157,6 +157,24 @@ FAKE = textwrap.dedent('''\
             ev({{"type": "result", "subtype": "success", "is_error": False, "result": "done", "num_turns": 2,
                 "permission_denials": []}})
         sys.exit(0)
+    if mode == "stream-chrome-disconnected":
+        # a login-mode child whose Claude in Chrome tools answered that the extension is not attached (seen live
+        # 2026-11-08: tabs_context_mcp), and whose model then claims the browser work was done
+        def ev(e):
+            print(json.dumps(e)); sys.stdout.flush()
+        ev({{"type": "system", "subtype": "init", "permissionMode": "auto"}})
+        ev({{"type": "assistant", "message": {{"content": [{{"type": "tool_use", "id": "toolu_1",
+            "name": "mcp__claude-in-chrome__tabs_context_mcp", "input": {{}}}}]}}}})
+        ev({{"type": "user", "message": {{"content": [{{"type": "tool_result", "tool_use_id": "toolu_1", "is_error": True,
+            "content": [{{"type": "text", "text": "Browser extension is not connected. Please ensure the Claude in "
+                                                  "Chrome extension is installed and connected."}}]}}]}}}})
+        ev({{"type": "assistant", "message": {{"content": [{{"type": "tool_use", "id": "toolu_2",
+            "name": "mcp__claude-in-chrome__navigate", "input": {{"url": "https://example.test"}}}}]}}}})
+        ev({{"type": "user", "message": {{"content": [{{"type": "tool_result", "tool_use_id": "toolu_2",
+            "content": "Browser extension is not connected"}}]}}}})
+        ev({{"type": "result", "subtype": "success", "is_error": False, "num_turns": 3,
+            "result": "Done: I opened the page and read its title."}})
+        sys.exit(0)
     if mode == "badjson":
         print("this is not json")
         sys.exit(0)
@@ -555,6 +573,60 @@ class ChildTaskTests(unittest.TestCase):
         for t in (tid2, other):
             self.call("cancel_task", task_id=t)
             self.call("wait_task", task_id=t, timeout_s=30)
+
+    def test_chrome_task_whose_browser_tools_were_disconnected_fails(self):
+        """A login-mode child whose Claude in Chrome tool results said the extension is not connected did no browser
+        work, whatever its result text claims: the task ends failed with that reason, read from the tool results."""
+        os.environ["FAKE_CLAUDE_MODE"] = "stream-chrome-disconnected"
+        tid = self.start(chrome=True)
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "failed", w)
+        self.assertIn(ct.BROWSER_DISCONNECTED, w["error"])
+        self.assertIn("2 browser tool call(s) (navigate, tabs_context_mcp)", w["error"])
+        self.assertIn("no browser work was done", w["error"])
+        self.assertEqual(w["browser_disconnected"], {"mcp__claude-in-chrome__tabs_context_mcp": 1,
+                                                     "mcp__claude-in-chrome__navigate": 1})
+        self.assertEqual(w["exit_code"], 0)                       # a clean exit and a confident result did not count
+        self.assertEqual(w["result"], "Done: I opened the page and read its title.")
+        self.assertIn("stderr_tail", w)                           # shown as for any failed task
+        self.assertEqual(_events()[-1]["status"], "failed")
+        _, listed = self.call("list_tasks")
+        self.assertEqual([t["state"] for t in listed["tasks"] if t["task_id"] == tid], ["failed"])
+
+    def test_browser_disconnected_is_read_from_chrome_tool_results_only(self):
+        """The phrase in the model's own text, or in another tool's result, is not a disconnection; one chrome tool
+        result carrying it is, however the model words its result."""
+        path = os.path.join(self.tmp, "stdout.log")
+        phrase = ct.BROWSER_DISCONNECTED
+
+        def write(events):
+            with open(path, "w") as f:
+                f.write("".join(json.dumps(e) + "\n" for e in events))
+        result = {"type": "result", "subtype": "success", "is_error": False, "result": "all good"}
+        write([{"type": "assistant", "message": {"content": [{"type": "text", "text": phrase + " was my worry"}]}},
+               {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "b1", "name": "Bash",
+                                                               "input": {"command": "echo"}}]}},
+               {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "b1",
+                                                          "content": phrase}]}},
+               {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "c1",
+                                                               "name": "mcp__claude-in-chrome__find", "input": {}}]}},
+               {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "c1",
+                                                          "content": [{"type": "text", "text": "found 3 elements"}]}]}},
+               result])
+        act = ct.summarize_stream(path, self.work)
+        self.assertNotIn("browser_disconnected", act)
+        self.assertEqual(ct.classify({"exit_code": 0, "output": result, "activity": act}), "succeeded")
+        write([{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "c1",
+                                                               "name": "mcp__claude-in-chrome__find", "input": {}}]}},
+               {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "c1",
+                                                          "content": [{"type": "text", "text": "Error: " + phrase}]}]}},
+               {"type": "assistant", "message": {"content": [{"type": "text", "text": "The browser is connected and "
+                                                                                       "I finished the task."}]}},
+               result])
+        act = ct.summarize_stream(path, self.work)
+        self.assertEqual(act["browser_disconnected"], {"mcp__claude-in-chrome__find": 1})
+        self.assertEqual(ct.classify({"exit_code": 0, "output": result, "activity": act}), "failed")
+        self.assertIn("1 browser tool call(s) (find)", ct.browser_disconnected_reason(act["browser_disconnected"]))
 
     def test_a_queued_chrome_task_can_be_cancelled(self):
         os.environ["FAKE_CLAUDE_MODE"] = "sleep"
