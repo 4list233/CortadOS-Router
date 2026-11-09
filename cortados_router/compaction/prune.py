@@ -39,6 +39,44 @@ TABLE_PATH = Path(__file__).resolve().parents[2] / "tables" / "compaction-prune.
 # Chains, pipes, redirections, substitutions and line breaks: not obviously read-only. Newline and CR are separators
 # to the shell but whitespace to shlex.split, which would turn "ls\nrm x" into the tokens of one ls call.
 _CHAIN = re.compile(r"[;&|<>`\n\r]|\$\(")
+# Characters the shell expands OUTSIDE quotes into words shlex never sees: globs (`*?[`: a file named "-delete" turns
+# `find . -name x *` into `find . -name x -delete`), brace expansion (`{-delete,}`) and history (`!`).
+_UNQUOTED_EXPANSION = frozenset("*?[{!")
+
+
+def _has_shell_expansion(cmd: str) -> bool:
+    """True when the shell could rewrite the words of `cmd` before running it, so its shlex tokens are not the argv
+    the command gets and its shape is uncertain. Why: `find . $FIND_ARGS` tokenized as `find . $FIND_ARGS` (one
+    positional) and passed the allowlist, while the shell ran it with FIND_ARGS='-exec touch marker {} +'. Rejected:
+    `$` and backticks anywhere except inside single quotes (parameter, command and arithmetic expansion, $'..' and
+    $".." quoting; double quotes still expand them, and an escaped one in double quotes is rejected too rather than
+    modelled), and the characters of _UNQUOTED_EXPANSION outside any quotes unless backslash-escaped. Process
+    substitution <( >( is rejected by _CHAIN. Tilde expansion is allowed: it yields a path, never a flag."""
+    quote = None                                  # None, "'" or '"'
+    i, n = 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+        elif quote == '"':
+            if c in "$`":
+                return True
+            if c == "\\":
+                if cmd[i + 1:i + 2] in ("$", "`"):
+                    return True                   # escaped expansion: rejected, not modelled (see the docstring)
+                i += 1                            # \" and \\ do not end or change the double-quoted string
+            elif c == '"':
+                quote = None
+        else:
+            if c in "$`" or c in _UNQUOTED_EXPANSION:
+                return True
+            if c == "\\":
+                i += 1                            # the next character is literal
+            elif c in "'\"":
+                quote = c
+        i += 1
+    return False
 
 
 @lru_cache(maxsize=4)
@@ -67,8 +105,9 @@ def readonly_bash(cmd: str, table: dict[str, Any]) -> bool:
     """True only when the command matches an allowlisted shape (tables/compaction-prune.json readonly_bash): the
     shlex tokens start with a listed command ("git log" takes two tokens), every flag is listed, and positionals
     appear only where the shape allows them. Everything else, including any command holding a shell separator or a
-    line break (a second command may hide after it), is not read-only."""
-    if not cmd or _CHAIN.search(cmd):
+    line break (a second command may hide after it) or a shell expansion that could change its words
+    (_has_shell_expansion), is not read-only: the shape is checked only once the tokens are the real argv."""
+    if not cmd or _CHAIN.search(cmd) or _has_shell_expansion(cmd):
         return False
     try:
         toks = shlex.split(cmd)

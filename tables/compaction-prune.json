@@ -291,6 +291,6 @@
         "positionals": false
       }
     },
-    "why": "read-only commands as an ALLOWLIST of command + argument shapes, checked on the shlex-tokenized command: every flag must be listed (short-flag clusters like -rn are split; --opt=value is checked by --opt), positionals are allowed only where the command takes paths/patterns/refs (git branch/status take none, so `git branch x` creates and is a side effect). Anything else, any unknown flag (find -delete/-exec, git branch -D, sed -i, git diff --output), a parse failure, or any ; & | < > ` $( is a side effect: keeping a call by mistake costs tokens, dropping a side effect by mistake loses state."
+    "why": "read-only commands as an ALLOWLIST of command + argument shapes, checked on the shlex-tokenized command: every flag must be listed (short-flag clusters like -rn are split; --opt=value is checked by --opt), positionals are allowed only where the command takes paths/patterns/refs (git branch/status take none, so `git branch x` creates and is a side effect). Anything else, any unknown flag (find -delete/-exec, git branch -D, sed -i, git diff --output), a parse failure, any ; & | < > ` $( or line break, or any shell expansion that could change the words the command receives ($ or ` outside single quotes, unquoted * ? [ { !; e.g. `find . $FIND_ARGS`) is a side effect: keeping a call by mistake costs tokens, dropping a side effect by mistake loses state."
   }
 }

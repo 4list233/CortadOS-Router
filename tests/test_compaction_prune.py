@@ -67,6 +67,28 @@ class RuleTests(unittest.TestCase):
                            result_chars=0, is_error=False, interrupted=False)
             self.assertTrue(prune.is_side_effect(ev, T), c)
 
+    def test_shell_expansion_is_never_read_only(self):
+        """`find . $FIND_ARGS` used to pass as `find` + one positional; the shell ran it with
+        FIND_ARGS='-exec touch marker {} +'. Any expansion that can change the argv makes the shape uncertain."""
+        expanding = ["find . $FIND_ARGS", "find . ${FIND_ARGS}", "ls $HOME", "cat \"$F\"", "cat \"a\\$b\"",
+                     "ls $'\\x2d\\x2ddelete'", "ls $\"x\"", "echo $((1+1))", "cat \"`rm x`\"", "cat a$IFS-x",
+                     "find . -name x *", "ls *.py", "cat a?", "ls [ab]", "find . {-delete,}", "ls {a,b}",
+                     "ls !1", "cat <(rm x)", "cat >(rm x)", "find . -name x $@", "grep foo $1"]
+        for c in expanding:
+            with self.subTest(c=c):
+                self.assertFalse(prune.readonly_bash(c, T), c)
+                ev = ToolEvent(session="s", index=0, message_index=3, name="Bash", input={"command": c},
+                               result_text="", result_chars=0, is_error=False, interrupted=False)
+                self.assertTrue(prune.is_side_effect(ev, T), c)
+                self.assertFalse(prune.is_rerunnable(ev, T), c)
+        # quoted or escaped, the same characters are literal to the shell and the shape is certain
+        literal = ["find . -name '*.py'", "find . -name \"*.py\"", "grep -rn 'foo$' .", "grep -n 'a{2}' f",
+                   "ls a\\*", "grep -e 'a$' f", "cat ~/notes.txt", "git diff --stat HEAD~1",
+                   "grep -n \"a[0-9]\" f", "grep -n 'it''s' f"]
+        for c in literal:
+            with self.subTest(c=c):
+                self.assertTrue(prune.readonly_bash(c, T), c)
+
     def test_superseded_read_dropped_even_if_small(self):
         out = prune.decide(session([(3, "Read", {"file_path": "a"}, 100, False),
                                     (5, "Read", {"file_path": "a"}, 100, False)] + FILLER), table=T)

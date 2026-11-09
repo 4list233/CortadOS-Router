@@ -223,6 +223,72 @@ class StoreTests(unittest.TestCase):
             time.sleep(0.1)
             self.assertFalse(s._thread.is_alive())                         # closed and empty: the writer exits
 
+    def test_shutdown_counts_a_job_taken_but_not_yet_started(self):
+        """Queue.get() released the mutex between removing a job and the writer marking it in flight; a writer
+        paused there left a job neither queued nor in flight, and shutdown returned lost=0 for a job that never ran.
+        The writer is paused right after it takes the job and before it runs it: shutdown must count that job."""
+        s = store.Store()
+        taken, gate, ran = threading.Event(), threading.Event(), []
+        real_next = s._next_job
+
+        def next_then_pause():
+            item = real_next()
+            if item is not None and item is not store._STOP and item[0] == "taken":
+                taken.set()
+                gate.wait(5)                                              # paused after the dequeue
+            return item
+        with Env(CORTADOS_COMPACTION_STORE="1"), mock.patch.object(s, "_next_job", next_then_pause):
+            self.assertTrue(s.submit("taken", lambda: ran.append(1), nbytes=7))
+            self.assertTrue(taken.wait(2))
+            with s._q.mutex:                                              # neither queued nor lost from view
+                self.assertEqual((s._q._qsize(), s._inflight), (0, "taken"))
+            with self.assertLogs(store.logger, "WARNING") as logs:
+                self.assertEqual(s.shutdown(timeout=0.2), 1)
+            self.assertIn("taken (writer still in it)", "\n".join(logs.output))
+            self.assertEqual(s.lost, 1)
+            gate.set()
+            s._thread.join(2)
+            self.assertFalse(s._thread.is_alive())                        # closed and empty: the writer exits
+        self.assertEqual(s.shutdown(timeout=0.05), 0)                     # counted once
+        self.assertEqual(s.stats()["queued_bytes"], 0)
+
+    def test_every_accepted_job_is_queued_in_flight_or_done(self):
+        """Seen from any other thread under the queue mutex, no accepted job is ever missing: queued + in flight +
+        done >= accepted. The old get()-then-mark writer broke this in the window between the two steps."""
+        s = store.Store()
+        done, gaps, stop = [0], [], threading.Event()
+        accepted = [0]
+
+        def job():
+            done[0] += 1
+
+        def observe():
+            while not stop.is_set():
+                with s._q.mutex:
+                    seen = s._q._qsize() + (s._inflight is not None) + done[0]
+                    if seen < accepted[0]:
+                        gaps.append((seen, accepted[0]))
+        old = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)                                       # interleave the threads as often as possible
+        obs = threading.Thread(target=observe, daemon=True)
+        real_put = s._q._put
+
+        def counted_put(item):                                            # runs under the mutex, in admission
+            accepted[0] += 1
+            real_put(item)
+        try:
+            with Env(CORTADOS_COMPACTION_STORE="1"), mock.patch.object(s._q, "_put", counted_put):
+                obs.start()
+                for _ in range(3000):
+                    s.submit("j", job)
+                self.assertTrue(s.flush(10))
+        finally:
+            stop.set()
+            obs.join(5)
+            sys.setswitchinterval(old)
+        self.assertEqual(gaps, [])
+        self.assertEqual(done[0], accepted[0])
+
     def test_shutdown_drains_accepted_writes_at_process_exit(self):
         """The writer is a daemon thread, which the interpreter freezes at exit: a turn accepted right before the
         process ends (Registry.drop enqueues decisions on the way out) used to vanish. A real process, not flush()."""
@@ -317,6 +383,59 @@ class StoreTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 store.prune_expired(time.time())
         self.assertTrue(os.path.exists(victim))
+
+    def test_symlinked_ancestor_of_home_refused_for_writes_reads_and_retention(self):
+        """O_NOFOLLOW on the absolute home protected only its last component: with CORTADOS_HOME=<base>/link/home and
+        link -> <base>/real, writes, reads and retention deletions all happened in <base>/real/home."""
+        base = tempfile.mkdtemp()
+        real_sessions = os.path.join(base, "real", "home", "compaction", "sessions")
+        os.makedirs(real_sessions)
+        victim = os.path.join(real_sessions, "victim.jsonl")
+        Path(victim).write_text(json.dumps({"kind": "turn", "source": "codex"}) + "\n")
+        os.utime(victim, (1, 1))                                          # long past retention
+        os.symlink(os.path.join(base, "real"), os.path.join(base, "link"))
+        with Env(CORTADOS_HOME=os.path.join(base, "link", "home"), CORTADOS_COMPACTION_STORE="1"):
+            s = store.Store()
+            self.assertTrue(s.record_turn("conv", **turn()))
+            self.assertTrue(s.flush())
+            self.assertEqual(s.write_failures, 2)                         # the turn and its retention pass
+            self.assertEqual(sorted(os.listdir(real_sessions)), ["victim.jsonl"])
+            with self.assertRaises(OSError):
+                store.read_session(store.sessions_dir() / "victim.jsonl")
+            with self.assertRaises(OSError):
+                store.prune_expired(time.time())
+            with self.assertRaises(OSError):
+                store.append_decisions("x\n")
+        self.assertTrue(os.path.exists(victim))
+        self.assertEqual(sorted(os.listdir(os.path.join(base, "real", "home", "compaction"))), ["sessions"])
+
+    def test_missing_ancestors_of_home_are_created_without_following_links(self):
+        home = os.path.join(tempfile.mkdtemp(), "a", "b", "home")
+        with Env(CORTADOS_HOME=home, CORTADOS_COMPACTION_STORE="1"):
+            s = store.Store()
+            self.assertTrue(s.record_turn("conv", **turn()))
+            self.assertTrue(s.flush())
+            self.assertEqual(s.write_failures, 0)
+            self.assertTrue(store.session_path("conv").exists())
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(home)).st_mode), 0o700)
+
+    @unittest.skipUnless(sys.platform == "darwin", "the OS alias list is macOS-only")
+    def test_only_the_expected_os_alias_is_crossed(self):
+        with Env(CORTADOS_HOME="/var/folders/x/home"):
+            self.assertEqual(store._home_components()[:3], ["private", "var", "folders"])
+            with mock.patch.object(store.os, "readlink", return_value="/Users/evil"):
+                with self.assertRaisesRegex(OSError, "not the OS alias"):
+                    store._home_components()
+            real_lstat = os.lstat
+
+            def foreign_owner(p, *a, **k):
+                st = real_lstat(p, *a, **k)
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 501) + tuple(st)[5:])
+            with mock.patch.object(store.os, "lstat", foreign_owner):
+                with self.assertRaisesRegex(OSError, "owned by uid 501"):
+                    store._home_components()
+        with Env(CORTADOS_HOME="/Users/nobody/home"):
+            self.assertEqual(store._home_components(), ["Users", "nobody", "home"])
 
     def test_retention_rechecks_before_unlink(self):
         with Env(CORTADOS_COMPACTION_STORE="1"):

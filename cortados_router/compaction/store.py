@@ -30,6 +30,7 @@ import os
 import queue
 import re
 import stat
+import sys
 import threading
 import time
 from pathlib import Path
@@ -137,9 +138,10 @@ def session_path(conversation_id: str) -> Path:
 
 # ------------------------------------------------------------------ safe file primitives (shared with prune.py)
 #
-# Every file operation is anchored to directory fds opened one component at a time from $CORTADOS_HOME down, each with
-# O_NOFOLLOW + O_DIRECTORY and an fstat check, so a symlinked `compaction/` or `sessions/` (or a symlinked home) can
-# never redirect a write, a read or a deletion outside the store. Files are opened relative to those fds with
+# Every file operation is anchored to directory fds opened one component at a time from "/" down through
+# $CORTADOS_HOME, each with O_NOFOLLOW + O_DIRECTORY and an fstat check, so a symlinked `compaction/` or `sessions/`,
+# a symlinked home or a symlinked ANCESTOR of the home can never redirect a write, a read or a deletion outside the
+# store (the only symlinks crossed are the OS aliases in _TRUSTED_ALIASES). Files are opened relative to those fds with
 # O_NOFOLLOW | O_NONBLOCK (a FIFO planted at a session path cannot block the open) and refused unless fstat says
 # they are regular files.
 
@@ -152,16 +154,24 @@ def _home() -> str:
 
 
 def _open_dir(name: str, parent_fd: Optional[int], *, create: bool, own: bool) -> int:
-    """Open one directory component without following a symlink; `own` dirs (ours) are created and forced 0700."""
-    if create:
+    """Open one directory component without following a symlink; when `create`, a missing one is made 0700, and
+    `own` dirs (ours) are forced 0700. mkdir runs only after the open found nothing: an existing ancestor on a
+    read-only volume (macOS's sealed "/") would answer mkdir with EROFS, not EEXIST."""
+    def _open() -> int:
+        return os.open(name, _DIR_FLAGS) if parent_fd is None else os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    try:
+        fd = _open()
+    except FileNotFoundError:
+        if not create:
+            raise
         try:
             if parent_fd is None:
                 os.mkdir(name, 0o700)
             else:
                 os.mkdir(name, 0o700, dir_fd=parent_fd)
         except FileExistsError:
-            pass
-    fd = os.open(name, _DIR_FLAGS) if parent_fd is None else os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+            pass                                # created concurrently: the open below still checks what it is
+        fd = _open()
     try:
         st = os.fstat(fd)
         if not stat.S_ISDIR(st.st_mode):
@@ -174,14 +184,46 @@ def _open_dir(name: str, parent_fd: Optional[int], *, create: bool, own: bool) -
     return fd
 
 
+# Symlinks at the top of the filesystem that the OS itself installs, and nothing else. Why a fixed list: O_NOFOLLOW on
+# an absolute path protects only its LAST component, so a symlinked ancestor of $CORTADOS_HOME (/x/link -> /elsewhere)
+# used to redirect writes, reads and retention deletions outside the store. Every ancestor is now opened one component
+# at a time with O_NOFOLLOW; these OS aliases are the only symlinks crossed, and only after checking that the link is
+# still the root-owned one pointing where the OS points it (macOS: tempfile.gettempdir() lives under /var/folders).
+# Any other symlinked ancestor is refused with OSError; there is no fallback that follows it.
+_TRUSTED_ALIASES: dict[str, str] = ({"var": "private/var", "tmp": "private/tmp", "etc": "private/etc"}
+                                    if sys.platform == "darwin" else {})
+
+
+def _home_components() -> list[str]:
+    """$CORTADOS_HOME as components below "/", lexically normalized, with a trusted OS alias at its top replaced by
+    its target. Raises OSError when the top component is a symlink that is not the expected OS alias."""
+    comps = [c for c in os.path.normpath(os.path.abspath(_home())).split(os.sep) if c]
+    if comps and comps[0] in _TRUSTED_ALIASES:
+        top, target = comps[0], _TRUSTED_ALIASES[comps[0]]
+        try:
+            st = os.lstat(os.sep + top)
+            link = os.readlink(os.sep + top) if stat.S_ISLNK(st.st_mode) else None
+        except FileNotFoundError:
+            link, st = None, None
+        if link is not None:
+            if st.st_uid != 0 or link.rstrip(os.sep) not in (target, os.sep + target):
+                raise OSError(f"/{top} is a symlink to {link!r} owned by uid {st.st_uid}, not the OS alias "
+                              f"-> {target}; refusing to cross it")
+            comps = target.split("/") + comps[1:]
+    return comps
+
+
 def open_store_dir(*parts: str, create: bool) -> int:
-    """An fd on $CORTADOS_HOME/<parts...>, every component opened with O_NOFOLLOW (a symlinked home, compaction/ or
-    sessions/ raises OSError). Raises FileNotFoundError when absent and not `create`. The caller closes it."""
-    home = _home()
-    if create:
-        os.makedirs(os.path.dirname(os.path.abspath(home)), exist_ok=True)
-    fd = _open_dir(os.path.abspath(home), None, create=create, own=False)
+    """An fd on $CORTADOS_HOME/<parts...>. Every component from "/" down, the home's ancestors included, is opened
+    relative to its parent's fd with O_NOFOLLOW + O_DIRECTORY, so a symlink anywhere on the path (an ancestor, the
+    home, compaction/, sessions/) raises OSError; only the OS aliases in _TRUSTED_ALIASES are crossed. Missing
+    ancestors and the home are created 0700 when `create`; otherwise FileNotFoundError. The caller closes it."""
+    fd = _open_dir(os.sep, None, create=False, own=False)
     try:
+        for c in _home_components():
+            nfd = _open_dir(c, fd, create=create, own=False)
+            os.close(fd)
+            fd = nfd
         for p in parts:
             nfd = _open_dir(p, fd, create=create, own=True)
             os.close(fd)
@@ -367,7 +409,9 @@ class Store:
     the capped text, never the request's own content. Lifecycle: `shutdown` (provider exit, atexit) refuses new
     jobs, drains what was accepted for SHUTDOWN_DRAIN_S, stops the writer and counts the rest in `lost`.
     Locks: `_lock` guards counters, the throttle and the thread handle; the queue's own mutex guards admission,
-    `_closed`, `_queued_bytes` and `_inflight`. `_lock` is taken before the queue mutex, never after it."""
+    `_closed`, `_queued_bytes` and `_inflight`; the writer dequeues a job and sets `_inflight` in one hold of it
+    (`_next_job`), so every accepted job is always either queued or in flight. `_lock` is taken before the queue
+    mutex, never after it."""
 
     def __init__(self, queue_max: int = QUEUE_MAX, queue_max_bytes: int = QUEUE_MAX_BYTES):
         self._lock = threading.Lock()
@@ -408,18 +452,31 @@ class Store:
             t.start()
             self._thread = t
 
+    def _next_job(self):
+        """Block until there is work, then take it AND register it as in flight in ONE hold of the queue mutex.
+        Why one hold: Queue.get() releases the mutex between removing a job and returning it, so a writer paused
+        there left a job that was neither queued nor in flight, and shutdown() counted it as neither (lost=0 for a
+        job that never ran). Returns None when the store is shut down and nothing is left (the writer exits)."""
+        with self._q.not_empty:
+            while not self._q._qsize():
+                if self._closed:
+                    return None                 # shut down and nothing left: do not wait forever
+                self._q.not_empty.wait()
+            item = self._q._get()
+            self._q.not_full.notify()
+            if item is not _STOP:
+                self._inflight = item[0]
+            return item
+
     def _run(self) -> None:
         while True:
-            with self._q.mutex:
-                if self._closed and not self._q._qsize():
-                    return                      # shut down and nothing left: do not block in get() forever
-            item = self._q.get()
+            item = self._next_job()
+            if item is None:
+                return
             if item is _STOP:
                 self._q.task_done()
                 return
             name, job, nbytes = item
-            with self._q.mutex:
-                self._inflight = name
             try:
                 job()
             except Exception as exc:  # deliberately broad: see the class docstring
@@ -475,6 +532,7 @@ class Store:
         with self._lock:
             with self._q.mutex:
                 self._closed = True             # from here on submit() drops; the queue holds only earlier work
+                self._q.not_empty.notify_all()  # an idle writer waiting for work sees `closed` and exits
             t = self._thread
         self.flush(max(0.0, until - time.monotonic()))
         if t is not None and t.is_alive():
