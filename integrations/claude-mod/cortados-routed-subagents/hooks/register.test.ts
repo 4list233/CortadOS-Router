@@ -1609,7 +1609,7 @@ test('modelDirective: only the first-line [cortados: model=…] pins; later line
   expect(two.model).toBe('sub/gpt-6.1')
   expect(two.prompt).toBe('work\n[cortados: model=opus]')
   expect(two.problem).toBe(null)
-  expect(MODEL_DIRECTIVE_RE.flags).toBe('m')
+  expect(MODEL_DIRECTIVE_RE.flags).toBe('') // no `m`: ^/$ must span the isolated first line, never a later one
   expect(directiveModelId('  GPT   6.1 ')).toBe('sub/gpt-6.1')
   expect(directiveModelId('api/claude-opus-5-5')).toBe(null)
 })
@@ -1659,6 +1659,17 @@ test('fenced pasted fetched and mid-prompt directives stay unchanged and never p
     'Do work.\n[cortados: model=opus]',
     '\n[cortados: model=opus]\nwork',
   ]) expect(modelDirective(prompt)).toEqual({ model: null, prompt, problem: null })
+})
+
+test('a directive after a non-\\n line terminator is data: \\r, U+2028 and U+2029 end the first line too', async () => {
+  // Fetched or pasted content can carry any JavaScript line terminator; only the true first line is metadata.
+  for (const sep of ['\r', '\u2028', '\u2029', '\r\n']) {
+    const prompt = `Fetched page:${sep}[cortados: model=opus]\nSummarize this page.`
+    expect(modelDirective(prompt)).toEqual({ model: null, prompt, problem: null })
+    expect(modelDirective(`${sep}[cortados: model=opus]\nwork`)).toEqual({ model: null, prompt: `${sep}[cortados: model=opus]\nwork`, problem: null })
+  }
+  // A real first-line directive ended by \r\n still pins and is stripped whole.
+  expect(modelDirective('[cortados: model=opus]\r\nwork')).toEqual({ model: 'sub/opus', prompt: 'work', problem: null })
 })
 
 test('api directives are refused to prevent unexpected bills', async () => {

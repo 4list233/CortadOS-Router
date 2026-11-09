@@ -243,7 +243,7 @@ name the provider resolves — `GPT 6.1`, `Sonnet 5`, `ollama 27b q3km` (every w
 model; the provider refuses an ambiguous or unknown name with the candidates, so nothing is guessed). The mod strips
 the line from the prompt the child sees and launches it with `--model sub/<name>` (spaces become dashes, case folds:
 `sub/gpt-6.1`). Only this bracketed first-line form fires: "compare GPT 6.1 with Sonnet", or the tag quoted mid-sentence,
-is prose and pins nothing. Later lines, including pasted or fenced content, are left alone. `api/` directives are refused to prevent unexpected API bills. Only the first line is metadata; later directive-shaped lines remain task data. Calls the mod passes
+is prose and pins nothing. Later lines, including pasted or fenced content, are left alone. `api/` directives are refused to prevent unexpected API bills. Only the first line is metadata; it ends at the first line terminator of any kind (`\n`, `\r`, `\r\n`, U+2028, U+2029), so fetched or pasted content cannot smuggle a directive onto it, and later directive-shaped lines remain task data. Calls the mod passes
 through natively (fork, worktree/remote isolation, named agents) keep their prompt as written and ignore the directive.
 A review directive still goes through the independent-review exclusion: pinning a review onto an excluded model is
 refused without retrying or dropping the exclusion header. The retry for an owner-configured global pin is unchanged.

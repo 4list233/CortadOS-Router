@@ -189,8 +189,14 @@ export const STOP_ON_DEAD_TOOL = 'If a tool returns nothing useful twice in a ro
  * mid-sentence never pins anything. `<name>` is a pool model id, a `sub/` alias, or a friendly name the provider's
  * resolver (routing.resolve_pin) reads: `GPT 6.1`, `Sonnet 5`, `ollama 27b q3km`; `cortados` asks S1 to route. The
  * name is 1-80 characters of letters, digits, space . _ : / - : a model name is short, and anything longer or wider
- * is not one. Kept as a single literal so tests/test_mod_directive.py can run the same pattern. */
-export const MODEL_DIRECTIVE_RE = /^[ \t]*\[cortados:[ \t]*model[ \t]*=[ \t]*([A-Za-z0-9][A-Za-z0-9 ._:\/-]{0,79})[ \t]*\][ \t]*$/m
+ * is not one. Kept as a single literal so tests/test_mod_directive.py can run the same pattern. No `m` flag: the
+ * pattern is run against the isolated first line only, so `^`/`$` mean the whole line; with `m` they would match
+ * after any line terminator left in the inspected string, letting fetched content pin the child. */
+export const MODEL_DIRECTIVE_RE = /^[ \t]*\[cortados:[ \t]*model[ \t]*=[ \t]*([A-Za-z0-9][A-Za-z0-9 ._:\/-]{0,79})[ \t]*\][ \t]*$/
+
+/** Every JavaScript line terminator (\n, \r, \r\n, U+2028, U+2029): the first line ends at the first of them, so
+ * content pasted or fetched with a foreign terminator cannot smuggle a directive onto "line one". */
+export const LINE_TERMINATOR_RE = /\r\n|[\n\r\u2028\u2029]/
 
 /** The provider model id a directive name becomes: spaces collapse to dashes and case folds (`GPT 6.1` -> `gpt-6.1`),
  * so the id is one argv token and the provider reads it as the friendly name; `cortados` stays S1-routed and an
@@ -205,12 +211,14 @@ export function directiveModelId(name: string): string | null {
 
 /** Remove only first-line model metadata. All later lines remain task data, including pasted directives. */
 export function modelDirective(prompt: string): { model: string | null; prompt: string; problem: string | null } {
-  // Only the first line is control metadata, never later pasted or fenced content.
-  const m = MODEL_DIRECTIVE_RE.exec(prompt.split('\n', 1)[0])
+  // Only the first line is control metadata, never later pasted or fenced content. The line ends at the first
+  // terminator of any kind, and the anchored pattern must cover that whole line.
+  const brk = LINE_TERMINATOR_RE.exec(prompt)
+  const firstLine = brk ? prompt.slice(0, brk.index) : prompt
+  const m = MODEL_DIRECTIVE_RE.exec(firstLine)
   if (!m) return { model: null, prompt, problem: null }
-  let end = m.index + m[0].length
-  if (prompt[end] === '\n') end += 1                 // the whole line goes, so the prompt's own paragraphs stay as written
-  const rest = (prompt.slice(0, m.index) + prompt.slice(end)).trim()
+  // The whole line and its terminator go, so the prompt's own paragraphs stay as written.
+  const rest = (brk ? prompt.slice(brk.index + brk[0].length) : '').trim()
   if (!rest) return { model: null, prompt, problem: 'the prompt is only a [cortados: model=…] directive; there is no task to run' }
   const model = directiveModelId(m[1])
   if (!model) return { model: null, prompt, problem: 'api/ model directives are forbidden to prevent unexpected API bills' }
