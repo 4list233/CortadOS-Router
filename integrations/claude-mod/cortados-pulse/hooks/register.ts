@@ -172,9 +172,10 @@ export function laneLines(lane: string, health: PulseLaneHealth, reading: PulseR
   // The projection exposes local admission and its reason, not deployment counts. Never infer quota from admission.
   if (lane === 'local') return [`local: ${health.ok === false ? 'unavailable' : health.ok === true ? 'eligible' : 'unknown'}` +
     (health.why ? ` · ${health.why}` : '')]
-  const known = typeof health.scarcity === 'number' || (reading?.windows ?? []).some(w => leftPct(w) !== null)
+  // Only the provider's valid projection establishes quota; historical windows survive freshness invalidation.
+  const known = typeof health.scarcity === 'number' && Number.isFinite(health.scarcity)
   const bits = [health.ok === false ? 'SPENT' : known ? 'ok' : 'quota unknown']
-  if (typeof health.scarcity === 'number') bits.push('scarcity ' + health.scarcity.toFixed(2))
+  if (known) bits.push('scarcity ' + health.scarcity!.toFixed(2))
   if (typeof health.expiring_pct === 'number' && health.expiring_pct > 0) bits.push('expiring ' + Math.round(health.expiring_pct) + '%')
   if (reading) {
     if (reading.failed) bits.push('last sample FAILED')

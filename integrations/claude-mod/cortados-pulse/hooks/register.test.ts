@@ -148,6 +148,25 @@ test('unknown or missing quota never renders as healthy', () => {
   }
 })
 
+import staleFixture from './stale-resources.fixture'
+
+test('real failed seven-hour-old projection cannot restore healthy quota from historical windows', () => {
+  const s = staleFixture
+  expect(s.subscriptions.codex.ok).toBe(true)
+  expect(s.subscriptions.codex.scarcity).toBe(null)
+  expect(laneLines('codex', s.subscriptions.codex, s.readings.codex, s.generated_at)).toEqual([
+    'codex: quota unknown · last sample FAILED · sample 7.0 h old (stale)',
+    '  week: 0% left',
+  ])
+})
+
+test('missing and non-finite scarcity stays unknown even with historical window headroom', () => {
+  for (const scarcity of [undefined, null, NaN, Infinity, -Infinity]) {
+    expect(laneLines('codex', { ok: true, scarcity }, { windows: [{ headroom_pct: 50 }] }, 1700000000))
+      .toEqual(['codex: quota unknown', '  window: 50% left'])
+  }
+})
+
 import fixture from './resources.fixture'
 
 test('provider-generated snapshot preserves account and pool readings and local admission reason', () => {

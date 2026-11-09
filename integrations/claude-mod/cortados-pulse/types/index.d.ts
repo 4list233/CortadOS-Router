@@ -48,7 +48,7 @@ export interface PulseWindow {
   used_pct?: number | null
   headroom_pct?: number | null
   reset_epoch?: number | null
-  stale?: boolean
+  stale?: boolean | null
 }
 export interface PulseReading {
   fetched_at?: number | null
