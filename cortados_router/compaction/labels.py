@@ -35,14 +35,508 @@ QUERY_KEYS = ("pattern", "query", "url", "q")
 # Tools whose call changes something outside the context: the fact that they ran must survive compaction.
 SIDE_EFFECT_TOOLS = {"write", "edit", "multiedit", "notebookedit", "apply_patch", "str_replace_editor", "create_file",
                      "delete_file", "todowrite"}
-# Known simple-command effects. Shell grammar outside the supported subset is conservative.
-GIT_MUTATING = {"commit", "push", "merge", "rebase", "checkout", "switch", "reset", "add", "rm", "mv", "tag", "stash",
-                "cherry-pick", "revert", "pull", "clean", "restore", "apply", "am", "init", "clone", "fetch"}
-GIT_OPTS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env",
-                     "--super-prefix", "--list-cmds"}
-MUTATING_PROGRAMS = {"rm", "mv", "cp", "mkdir", "touch", "chmod", "chown", "ln", "tee", "rmdir", "truncate", "dd"}
-INSTALLERS = {"pip": {"install", "uninstall"}, "pip3": {"install", "uninstall"}, "npm": {"install", "i", "ci", "uninstall"},
-              "brew": {"install", "uninstall", "upgrade"}, "uv": {"add", "remove", "pip"}}
+
+# Shell commands are classified by an ALLOWLIST: a command is "no side effect" only when every simple command of a
+# fully parsed chain is a listed read-only program whose arguments pass that program's check. Every other program,
+# including any unknown one, is a side effect. Reason: the two errors are not symmetric. Keeping a read-only call by
+# mistake costs some tokens; labelling a write, an install or a push "read-only" drops the only evidence that it
+# happened and poisons the training labels. The previous denylist (`rm`, `git commit`, ...) let `git branch -D`,
+# `xargs rm`, `python3 -c`, `curl -d`, `tar xf` and every unknown program through as read-only.
+#
+# Each entry maps the program name to a checker: args -> True when the call is read-only with those arguments.
+# The checker exists where the program can write or execute given the right arguments (find -delete, sed -i,
+# sort -o, git branch -D, curl -o); programs that can only ever read take `_any_args`.
+
+PUNCT_SHORT = re.compile(r"^-[^-=]+$")   # a short option or cluster: -n, -la, -n5, -ofile (not --long, not -k=v)
+
+
+def _cluster(arg: str) -> str:
+    """The letters of a short option cluster (`-rnI` -> `rnI`), or '' for anything else. An attached value is
+    included on purpose (`-ofile` -> `ofile`): refusing a letter in a value over-refuses, never under-refuses."""
+    return arg[1:] if PUNCT_SHORT.match(arg) else ""
+
+
+def _any_args(args: list[str]) -> bool:
+    return True
+
+
+def _refusing(exact=(), prefixes=(), letters=""):
+    """Checker that refuses the listed exact options, option prefixes and short-cluster letters."""
+    def check(args: list[str]) -> bool:
+        for a in args:
+            if a in exact or a.startswith(tuple(prefixes)):
+                return False
+            if letters and any(ch in letters for ch in _cluster(a)):
+                return False
+        return True
+    return check
+
+
+# --- git -------------------------------------------------------------------------------------------------------
+# Global options: `-c key=value` (sets any config, including core.pager, diff.external and aliases), `--config-env`,
+# `--exec-path=DIR` (replaces the git subprograms) and `-p/--paginate` (forces the configured pager even on a pipe)
+# make the subcommand run something we cannot see: refused. Aliases are refused by construction, because only the
+# named subcommands below pass and git does not let an alias shadow a builtin.
+GIT_GLOBAL_WITH_ARG = {"-C", "--git-dir", "--work-tree", "--namespace"}
+GIT_GLOBAL_FLAGS = {"--no-pager", "--bare", "--no-replace-objects", "--literal-pathspecs", "--glob-pathspecs",
+                    "--noglob-pathspecs", "--icase-pathspecs", "--no-optional-locks", "--no-lazy-fetch", "--no-advice"}
+GIT_GLOBAL_PREFIXES = ("--git-dir=", "--work-tree=", "--namespace=")
+# `--output=FILE` writes the diff/log to a file; `--ext-diff` runs the configured external diff program.
+GIT_ARGS_REFUSED = ("--output", "--ext-diff")
+GIT_BRANCH_LIST = {"-a", "-r", "-v", "-vv", "--list", "--show-current", "--all", "--remotes", "--verbose",
+                   "--color", "--no-color", "--abbrev", "--no-abbrev", "--merged", "--no-merged", "--contains",
+                   "--no-contains", "--points-at", "-i", "--ignore-case", "--column", "--no-column", "--format",
+                   "--sort"}
+GIT_TAG_LIST = {"-l", "--list", "-n", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at",
+                "--sort", "--format", "--column", "--no-column", "--color", "-i", "--ignore-case", "--omit-empty"}
+GIT_LIST_PREFIXES = ("--color=", "--abbrev=", "--format=", "--sort=", "--column=", "--merged=", "--no-merged=",
+                     "--contains=", "--no-contains=", "--points-at=", "-n")
+GIT_CONFIG_READ = {"--get", "--get-all", "--get-regexp", "--list", "-l", "--get-urlmatch", "--get-color",
+                   "--get-colorbool"}
+GIT_CONFIG_SCOPE = {"--global", "--local", "--system", "--worktree", "--show-origin", "--show-scope", "-z", "--null",
+                    "--name-only", "--includes", "--no-includes", "--bool", "--int", "--path", "--bool-or-int",
+                    "--type", "--default", "-f", "--file"}
+GIT_CONFIG_PREFIXES = ("--type=", "--default=", "--file=")
+
+
+def _git_split(args: list[str]) -> Optional[tuple[str, list[str]]]:
+    """(subcommand, its arguments) after the global options, or None when a global option is refused or unknown."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in GIT_GLOBAL_WITH_ARG:
+            i += 2
+        elif a in GIT_GLOBAL_FLAGS or a.startswith(GIT_GLOBAL_PREFIXES):
+            i += 1
+        elif a == "--version":
+            return "version", args[i + 1:]
+        elif a.startswith("-"):
+            return None             # -c, -p, --paginate, --exec-path, --config-env, --super-prefix, anything new
+        else:
+            return a, args[i + 1:]
+    return None                     # bare `git` prints usage; nothing to allowlist
+
+
+def _git_branch(rest: list[str]) -> bool:
+    listing = "--list" in rest
+    for a in rest:
+        if a in GIT_BRANCH_LIST or a.startswith(GIT_LIST_PREFIXES):
+            continue
+        if a.startswith("-") or not listing:
+            return False            # -D/-d/-m/-c/-u/--set-upstream-to..., or a positional that creates a branch
+    return True
+
+
+def _git_tag(rest: list[str]) -> bool:
+    if not rest:
+        return True
+    listing = "-l" in rest or "--list" in rest
+    for a in rest:
+        if a in GIT_TAG_LIST or a.startswith(GIT_LIST_PREFIXES):
+            continue
+        if a.startswith("-") or not listing:
+            return False            # -d/-a/-s/-f/-m..., or a positional that creates a tag
+    return True
+
+
+def _git_config(rest: list[str]) -> bool:
+    positionals = [a for a in rest if not a.startswith("-")]
+    reading = bool(GIT_CONFIG_READ.intersection(rest)) or (positionals and positionals[0] in {"get", "list"})
+    if not reading:
+        return False                # `git config key value` writes; `git config key` alone is not worth modelling
+    return all(a in GIT_CONFIG_READ or a in GIT_CONFIG_SCOPE or a.startswith(GIT_CONFIG_PREFIXES) or
+               not a.startswith("-") for a in rest)
+
+
+def _git_remote(rest: list[str]) -> bool:
+    positionals = [a for a in rest if not a.startswith("-")]
+    flags = [a for a in rest if a.startswith("-")]
+    if not positionals:
+        return all(a in {"-v", "--verbose"} for a in flags)
+    return positionals[0] in {"show", "get-url"} and all(a in {"-v", "--verbose", "-n", "--push", "--all"} for a in flags)
+
+
+def _first_positional_in(allowed: set):
+    def check(rest: list[str]) -> bool:
+        return bool(rest) and rest[0] in allowed
+    return check
+
+
+GIT_READ_ONLY = {
+    "status": _any_args, "log": _any_args, "show": _any_args, "diff": _any_args, "blame": _any_args,
+    "shortlog": _any_args, "rev-parse": _any_args, "rev-list": _any_args, "ls-files": _any_args,
+    "ls-tree": _any_args, "cat-file": _any_args, "describe": _any_args, "name-rev": _any_args,
+    "merge-base": _any_args, "show-ref": _any_args, "for-each-ref": _any_args, "diff-tree": _any_args,
+    "diff-index": _any_args, "diff-files": _any_args, "count-objects": _any_args, "check-ignore": _any_args,
+    "var": _any_args, "ls-remote": _any_args, "version": _any_args,
+    "grep": _refusing(prefixes=("-O", "--open-files-in-pager")),      # opens the matches in the pager/editor
+    "branch": _git_branch,
+    "tag": _git_tag,
+    "config": _git_config,
+    "remote": _git_remote,
+    "stash": _first_positional_in({"list", "show"}),
+    "worktree": _first_positional_in({"list"}),
+    "reflog": lambda rest: not {"expire", "delete"}.intersection(rest),
+}
+
+
+def _git(args: list[str]) -> bool:
+    split = _git_split(args)
+    if split is None:
+        return False
+    sub, rest = split
+    check = GIT_READ_ONLY.get(sub.casefold())
+    if check is None or any(a.startswith(GIT_ARGS_REFUSED) for a in rest):
+        return False
+    return check(rest)
+
+
+# --- sed -------------------------------------------------------------------------------------------------------
+# sed is read-only only without in-place editing (-i, -I on BSD, --in-place, any cluster holding i/I), without a
+# script file (-f: its contents are unseen), and when every script parses under a small sed grammar in which the
+# `w`/`W` (write file), `e` (execute) commands and the `w`/`e` flags of `s` do not occur. Scripts are the -e values,
+# or the first positional when there is no -e; the remaining positionals are input files.
+SED_FLAGS = set("nErsuz")                       # single-letter options that take no argument
+SED_LONG_FLAGS = {"--quiet", "--silent", "--regexp-extended", "--null-data", "--separate", "--unbuffered",
+                  "--posix", "--debug", "--sandbox", "--follow-symlinks"}
+SED_SIMPLE = set("dDgGhHnNpPxz=F")              # commands without an argument
+SED_TO_EOL = set("aic")                         # text commands: the rest of the line is text ("a\" continues)
+SED_TO_SEP = set(":btTvlLqQrR")                 # label / branch / number / file-name arguments to `;` or newline
+
+
+def _sed_scripts(args: list[str]) -> Optional[list[str]]:
+    scripts: list[str] = []
+    positionals: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            positionals.extend(args[i + 1:])
+            break
+        if a.startswith("--"):
+            name, eq, value = a.partition("=")
+            if name == "--expression":
+                if eq:
+                    scripts.append(value)
+                else:
+                    if i + 1 >= len(args):
+                        return None
+                    scripts.append(args[i + 1])
+                    i += 1
+            elif a in SED_LONG_FLAGS or name in {"--line-length"}:
+                pass
+            else:
+                return None         # --in-place, --file, anything unknown
+        elif a.startswith("-") and len(a) > 1:
+            letters = a[1:]
+            j = 0
+            while j < len(letters):
+                ch = letters[j]
+                if ch == "e":
+                    rest = letters[j + 1:]
+                    if rest:
+                        scripts.append(rest)
+                    else:
+                        if i + 1 >= len(args):
+                            return None
+                        scripts.append(args[i + 1])
+                        i += 1
+                    break
+                if ch == "l":
+                    break           # -l N (line length): the rest of the cluster or the next argument is a number
+                if ch not in SED_FLAGS:
+                    return None     # i, I, f, and anything unknown
+                j += 1
+        else:
+            positionals.append(a)
+        i += 1
+    if not scripts:
+        if not positionals:
+            return None
+        scripts.append(positionals[0])
+    return scripts
+
+
+def _sed_skip_regex(s: str, i: int, delim: str) -> int:
+    """Index just past the closing delimiter of a regex/field that starts at s[i] (after the opening delimiter).
+    Backslash escapes the next character; a bracket expression is skipped whole because the delimiter is literal
+    inside it. Returns -1 when the field never closes."""
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == delim:
+            return i + 1
+        if c == "[":
+            j = i + 1
+            if j < n and s[j] == "^":
+                j += 1
+            if j < n and s[j] == "]":
+                j += 1
+            close = s.find("]", j)
+            if close < 0:
+                return -1
+            i = close + 1
+            continue
+        i += 1
+    return -1
+
+
+def _sed_skip_address(s: str, i: int) -> int:
+    """Index after one address (number[~step], $, /re/IM, \\cREc) starting at s[i]; i itself when none."""
+    n = len(s)
+    if i >= n:
+        return i
+    c = s[i]
+    if c.isdigit():
+        while i < n and (s[i].isdigit() or s[i] == "~"):
+            i += 1
+        return i
+    if c == "$":
+        return i + 1
+    if c == "+" or c == "~":        # addr2 forms `+N`, `~N`
+        i += 1
+        while i < n and s[i].isdigit():
+            i += 1
+        return i
+    if c in "/\\":
+        if c == "\\":
+            i += 1
+            if i >= n:
+                return -1
+        delim = s[i]
+        i = _sed_skip_regex(s, i + 1, delim)
+        if i < 0:
+            return -1
+        while i < n and s[i] in "IM":
+            i += 1
+        return i
+    return i
+
+
+def _sed_script_read_only(s: str) -> bool:
+    n = len(s)
+    i = 0
+    while i < n:
+        while i < n and s[i] in " \t\n;":
+            i += 1
+        if i >= n:
+            break
+        if s[i] == "#":
+            end = s.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        if s[i] == "}":
+            i += 1
+            continue
+        j = _sed_skip_address(s, i)
+        if j < 0:
+            return False
+        if j > i and j < n and s[j] == ",":
+            j = _sed_skip_address(s, j + 1)
+            if j < 0:
+                return False
+        i = j
+        while i < n and s[i] in " \t!":
+            i += 1
+        if i >= n:
+            return False            # an address without a command is a syntax error: not provably read-only
+        c = s[i]
+        i += 1
+        if c == "{":
+            continue
+        if c in "wWe":
+            return False
+        if c in SED_SIMPLE:
+            pass
+        elif c in SED_TO_EOL:
+            while True:
+                end = s.find("\n", i)
+                line = s[i:] if end < 0 else s[i:end]
+                i = n if end < 0 else end + 1
+                if not line.endswith("\\") or end < 0:
+                    break
+            continue
+        elif c in SED_TO_SEP:
+            while i < n and s[i] not in ";\n":
+                i += 1
+            continue
+        elif c in "sy":
+            if i >= n:
+                return False
+            delim = s[i]
+            if delim in "\n\\":
+                return False
+            i = _sed_skip_regex(s, i + 1, delim)
+            if i < 0:
+                return False
+            i = _sed_skip_regex(s, i, delim)
+            if i < 0:
+                return False
+            if c == "s":
+                while i < n and s[i] in "gpImM0123456789":
+                    i += 1
+                if i < n and s[i] in "we":
+                    return False
+        else:
+            return False            # unknown command letter
+        while i < n and s[i] in " \t":
+            i += 1
+        if i < n and s[i] not in ";\n}#":
+            return False            # trailing garbage after a command (`p w file` would be rejected by sed; so are we)
+    return True
+
+
+def _sed(args: list[str]) -> bool:
+    scripts = _sed_scripts(args)
+    return scripts is not None and all(_sed_script_read_only(s) for s in scripts)
+
+
+# --- curl / gh -------------------------------------------------------------------------------------------------
+# curl is read-only only as a GET/HEAD fetch to stdout. Any option that sends a body (-d -F -T --json), writes a
+# file (-o -O -J -c -D --trace* --libcurl --etag-save), reads an unseen config (-K/-q are not enough) or changes
+# the method is refused; so is every option not listed, because curl has hundreds and some send mail or FTP
+# commands. Positionals are URLs.
+CURL_FLAGS = set("sSLIikfgvG46N#")
+CURL_WITH_ARG = set("HAumwxebrzEyYX")           # the value is the rest of the cluster or the next argument
+CURL_LONG_FLAGS = {"--silent", "--show-error", "--location", "--head", "--include", "--insecure", "--fail",
+                   "--fail-with-body", "--globoff", "--verbose", "--get", "--compressed", "--http1.1", "--http2",
+                   "--http3", "--http0.9", "--ipv4", "--ipv6", "--no-buffer", "--no-progress-meter", "--progress-bar",
+                   "--tlsv1.2", "--tlsv1.3", "--path-as-is", "--no-keepalive", "--tcp-nodelay", "--tr-encoding",
+                   "--raw", "--basic", "--digest", "--ntlm", "--negotiate", "--anyauth", "--disable", "--retry-connrefused"}
+CURL_LONG_WITH_ARG = {"--header", "--user-agent", "--user", "--max-time", "--connect-timeout", "--write-out",
+                      "--proxy", "--referer", "--cookie", "--range", "--time-cond", "--retry", "--retry-delay",
+                      "--retry-max-time", "--url", "--resolve", "--max-redirs", "--cacert", "--capath", "--cert",
+                      "--key", "--proto", "--unix-socket", "--abstract-unix-socket", "--speed-limit", "--speed-time",
+                      "--limit-rate", "--oauth2-bearer", "--doh-url", "--interface", "--local-port",
+                      "--keepalive-time", "--request"}
+READ_METHODS = {"GET", "HEAD"}
+
+
+def _curl(args: list[str]) -> bool:
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return True             # only URLs follow
+        if a.startswith("--"):
+            name, eq, value = a.partition("=")
+            if name in CURL_LONG_FLAGS:
+                pass
+            elif name in CURL_LONG_WITH_ARG:
+                if not eq:
+                    if i + 1 >= len(args):
+                        return False
+                    value = args[i + 1]
+                    i += 1
+                if name == "--request" and value.upper() not in READ_METHODS:
+                    return False
+            else:
+                return False
+        elif a.startswith("-") and len(a) > 1:
+            letters = a[1:]
+            j = 0
+            while j < len(letters):
+                ch = letters[j]
+                if ch in CURL_WITH_ARG:
+                    value = letters[j + 1:]
+                    if not value:
+                        if i + 1 >= len(args):
+                            return False
+                        value = args[i + 1]
+                        i += 1
+                    if ch == "X" and value.upper() not in READ_METHODS:
+                        return False
+                    break
+                if ch not in CURL_FLAGS:
+                    return False    # -d -F -T -o -O -J -c -D -K -q and anything unknown
+                j += 1
+        i += 1
+    return True
+
+
+# gh: named read subcommands only; `-w/--web` opens a browser; `gh api` must stay a GET without a body.
+GH_READ = {("pr", "view"), ("pr", "list"), ("pr", "status"), ("pr", "diff"), ("pr", "checks"), ("issue", "view"),
+           ("issue", "list"), ("issue", "status"), ("repo", "view"), ("run", "list"), ("run", "view"),
+           ("release", "list"), ("release", "view"), ("auth", "status"), ("search", "issues"), ("search", "prs"),
+           ("search", "repos"), ("search", "code")}
+GH_API_REFUSED = ("-f", "-F", "--field", "--raw-field", "--input", "--method", "-X")
+
+
+def _gh(args: list[str]) -> bool:
+    if any(a in {"-w", "--web"} for a in args):
+        return False
+    if len(args) >= 2 and (args[0], args[1]) in GH_READ:
+        return True
+    if args and args[0] == "api":
+        rest = args[1:]
+        for k, a in enumerate(rest):
+            if a.startswith(GH_API_REFUSED):
+                if a in {"-X", "--method"} and k + 1 < len(rest) and rest[k + 1].upper() in READ_METHODS:
+                    continue
+                name, eq, value = a.partition("=")
+                if eq and name in {"-X", "--method"} and value.upper() in READ_METHODS:
+                    continue
+                return False
+        return True
+    return args[:1] == ["--version"]
+
+
+# --- the allowlist ---------------------------------------------------------------------------------------------
+# Interpreters never pass with code (`python3 -c`, `node -e`, `perl -pi -e`, `awk 'system()'`); only a version query.
+INTERPRETERS = {"python", "python2", "python3", "node", "ruby", "perl", "php", "java", "go", "cargo", "rustc",
+                "deno", "bun", "lua", "awk", "gawk", "mawk", "nawk"}
+VERSION_ONLY = ({"--version"}, {"-V"}, {"-v"}, {"version"}, {"-version"})
+PACKAGE_READS = {"pip": {"list", "show", "freeze", "check", "--version", "-V"},
+                 "pip3": {"list", "show", "freeze", "check", "--version", "-V"},
+                 "npm": {"ls", "list", "ll", "la", "view", "info", "show", "outdated", "why", "explain",
+                         "--version", "-v"},
+                 "brew": {"list", "ls", "info", "outdated", "deps", "search", "--version", "-v"}}
+# `date` sets the clock with -s/--set or a bare positional (root); only format and display options are read-only.
+DATE_FLAGS = {"-u", "--utc", "--universal", "-R", "--rfc-2822", "--rfc-email", "-j"}
+DATE_PREFIXES = ("+", "-I", "--iso-8601", "--rfc-3339")
+HOSTNAME_FLAGS = {"-s", "-f", "-d", "-i", "-I", "-a", "-A", "-y", "--short", "--fqdn", "--long", "--domain",
+                  "--ip-address", "--all-ip-addresses", "--alias", "--all-fqdns"}
+
+
+def _version_only(args: list[str]) -> bool:
+    return any(set(args) == v and len(args) == 1 for v in VERSION_ONLY)
+
+
+def _package_reads(prog: str):
+    allowed = PACKAGE_READS[prog]
+    return lambda args: bool(args) and args[0] in allowed
+
+
+READ_ONLY_PROGRAMS = {
+    # reads of files, directories and system state: cannot write or execute whatever the arguments
+    **{p: _any_args for p in (
+        "cat", "ls", "head", "tail", "wc", "pwd", "echo", "printf", "true", "false", ":", "test", "stat",
+        "du", "df", "whoami", "id", "uname", "nproc", "uptime", "ps", "lsof", "which",
+        "whereis", "type", "basename", "dirname", "realpath", "readlink", "grep", "egrep", "fgrep", "cut", "tr",
+        "column", "nl", "rev", "comm", "diff", "cmp", "md5", "md5sum", "shasum", "sha1sum", "sha256sum", "jq",
+        "seq", "sleep", "printenv", "od", "hexdump", "strings", "sw_vers", "cd")},
+    # `cd` changes only the shell's working directory (the next command's paths show it); it writes nothing.
+    "file": _refusing(exact=("--compile",), letters="C"),         # -C compiles a magic file into the cwd
+    "tree": _refusing(prefixes=("--output",), letters="o"),      # -o FILE writes the listing to a file
+    "hostname": lambda args: all(a in HOSTNAME_FLAGS for a in args),   # a positional or -F FILE sets the hostname
+    "arch": lambda args: not args,                               # macOS `arch -x86_64 CMD` runs CMD
+    "find": _refusing(exact=("-delete",), prefixes=("-exec", "-ok", "-fprint", "-fls")),
+    "fd": _refusing(exact=("-x", "-X"), prefixes=("--exec",), letters="xX"),
+    "rg": _refusing(prefixes=("--pre",)),                 # --pre runs a preprocessor command on every file
+    "sort": _refusing(prefixes=("--output",), letters="o"),   # -o FILE writes the result to a file
+    "uniq": lambda args: len([a for a in args if not a.startswith("-")]) <= 1,   # the second positional is an output
+    "date": lambda args: all(a in DATE_FLAGS or a.startswith(DATE_PREFIXES) for a in args),
+    "sed": _sed,
+    "git": _git,
+    "curl": _curl,
+    "gh": _gh,
+    **{p: _version_only for p in INTERPRETERS},
+    **{p: _package_reads(p) for p in PACKAGE_READS},
+}
+
 # Characters shlex emits as punctuation tokens. "\n" is among them (and removed from the whitespace set) so an
 # unquoted newline survives as a command boundary: as whitespace it vanished and `git status\ngit -C /repo commit`
 # read as one `git status` with extra arguments.
@@ -76,33 +570,32 @@ WRAPPER_FLAGS = {
     "nice": set(),
     "timeout": {"--preserve-status", "--foreground", "-v", "--verbose"},
 }
-ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-
-
-def _git_subcommand(args: list[str]):
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a in GIT_OPTS_WITH_ARG:
-            i += 2
-        elif a.startswith("-"):
-            i += 1                  # --no-pager, --bare, -p, --git-dir=/x, --work-tree=/y, ...
-        else:
-            return a
-    return None
+ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
+# Assignments that change WHICH program runs or make a read-only program execute something: `PATH=/tmp/x ls` runs
+# /tmp/x/ls, `HOME=/tmp/x git diff` reads a planted .gitconfig (diff.external), `PAGER='touch m' git -p log`.
+UNSAFE_ASSIGNMENTS = {"PATH", "HOME", "IFS", "ENV", "BASH_ENV", "CDPATH", "SHELL", "ZDOTDIR", "PAGER", "GIT_PAGER",
+                      "EDITOR", "VISUAL", "GIT_EDITOR", "GIT_EXEC_PATH", "GIT_SSH", "GIT_SSH_COMMAND",
+                      "GIT_EXTERNAL_DIFF", "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+                      "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "XDG_CONFIG_HOME", "CURL_HOME", "PERL5OPT",
+                      "PYTHONSTARTUP", "NODE_OPTIONS", "LESSOPEN", "LESSCLOSE"}
+UNSAFE_ASSIGNMENT_PREFIXES = ("LD_", "DYLD_", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 
 
 def _unwrap(seg: list[str]) -> Optional[list[str]]:
     """Strip VAR=value assignments and wrapper programs (with their options) until the real program is first.
     Iterative on purpose: `env FOO=1 git commit` carries the assignment AFTER the wrapper, and `sudo env X=1 cmd`
-    nests wrappers. Every iteration drops at least one token, so the loop ends."""
+    nests wrappers. Every iteration drops at least one token, so the loop ends. None means "not modelled"."""
     i = 0
     while i < len(seg):
         t = seg[i]
-        if ASSIGNMENT.match(t):
+        m = ASSIGNMENT.match(t)
+        if m:
+            var = m.group(1)
+            if var in UNSAFE_ASSIGNMENTS or var.startswith(UNSAFE_ASSIGNMENT_PREFIXES):
+                return None
             i += 1
             continue
-        name = os.path.basename(t)
+        name = os.path.basename(t).casefold()
         if name not in WRAPPERS and name not in WRAPPERS_WITH_POSITIONAL:
             break
         with_arg = WRAPPERS[name] if name in WRAPPERS else WRAPPERS_WITH_POSITIONAL[name]
@@ -114,6 +607,8 @@ def _unwrap(seg: list[str]) -> Optional[list[str]]:
             option = seg[i]
             if name == "env" and option in {"-S", "--split-string"}:
                 return None  # env has a separate expansion language, not ordinary wrapper arguments
+            if name == "command" and option in {"-v", "-V"}:
+                return []    # `command -v prog` only describes prog, it never runs it
             if option in with_arg:
                 i += 2
             elif option in WRAPPER_FLAGS[name]:
@@ -125,31 +620,19 @@ def _unwrap(seg: list[str]) -> Optional[list[str]]:
     return seg[i:]
 
 
-def _segment_mutates(seg: list[str]) -> bool:
+def _segment_has_side_effect(seg: list[str]) -> bool:
+    """True unless the simple command is an allowlisted read-only program with arguments its checker accepts.
+    Shell keywords, builtins that evaluate code, interpreters, executors (xargs, find -exec) and every unknown
+    program are side effects by falling through. The program name is matched case-insensitively because on a
+    case-insensitive filesystem `LS` runs ls; a name that then matches nothing is a side effect anyway."""
     seg = _unwrap(seg)
     if seg is None:
         return True
     if not seg:
-        return False
-    prog, args = os.path.basename(seg[0]), seg[1:]
-    # Compound shell grammar and code-evaluating builtins are not simple executable arguments.
-    if prog in {"if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
-                "select", "function", "coproc", "repeat", "!", "[[", "eval", "source", ".",
-                "builtin", "bash", "sh", "zsh", "dash"}:
-        return True
-    if prog == "git":
-        return _git_subcommand(args) in GIT_MUTATING
-    if prog in MUTATING_PROGRAMS:
-        return True
-    if prog in INSTALLERS:
-        return bool(args) and args[0] in INSTALLERS[prog]
-    if prog in ("sed", "perl") and any(a == "-i" or a.startswith("-i") for a in args):
-        return True
-    if prog == "curl":
-        up = [a.upper() for a in args]
-        return any(m in up for m in ("POST", "PUT", "DELETE", "PATCH")) or any(
-            a.upper().startswith("-X") and a[2:].upper() in ("POST", "PUT", "DELETE", "PATCH") for a in args)
-    return False
+        return False                # only assignments/wrapper options: nothing ran
+    prog, args = os.path.basename(seg[0]).casefold(), seg[1:]
+    check = READ_ONLY_PROGRAMS.get(prog)
+    return check is None or not check(args)
 
 
 def _shell_subset(cmd: str) -> tuple[str, bool]:
@@ -157,11 +640,24 @@ def _shell_subset(cmd: str) -> tuple[str, bool]:
 
     This is a lexical guard, not a shell parser. Expansions, compound constructs, continuations and
     nontrivial redirects must never acquire a read-only label just because shlex accepts them.
-    Quotes/escapes are tracked here because shlex discards that information.
+    Quotes/escapes are tracked here because shlex discards that information. Two word-level decisions
+    that need adjacency are also made here:
+    - an unquoted all-digit word immediately followed by `<` or `>` is an IO number (`2>&1`, `0</dev/null`) and
+      is dropped, so it never looks like an argument; a digit word followed by a space (`timeout 5 </dev/null rm x`)
+      is an ordinary argument and stays;
+    - a quoted or escaped word made only of operator characters (`'<'`, `\\;`) is reported as unsupported, because
+      shlex would hand it back as a bare operator and `git -C '<' commit` would read as a redirect.
     """
     out: list[str] = []
     quote = ""
     word_start = True
+    word_begin = 0              # index in `out` where the current word began
+    word_quoted = False         # the current word held a quote or an escape
+    content: list[str] = []     # the literal characters of the current word, as shlex would yield them
+
+    def quoted_operator() -> bool:
+        return word_quoted and bool(content) and all(ch in PUNCTUATION for ch in content)
+
     i = 0
     while i < len(cmd):
         c = cmd[i]
@@ -173,19 +669,43 @@ def _shell_subset(cmd: str) -> tuple[str, bool]:
             if i + 1 >= len(cmd) or cmd[i + 1] == "\n":
                 return "".join(out), False
             out.extend(cmd[i:i + 2])
+            content.append(cmd[i + 1])
+            word_quoted = True
             i += 2
             word_start = False
             continue
         if c in "'\"" and (not quote or quote == c):
             quote = "" if quote else c
-        elif quote != "'" and c in "$`":
+            word_quoted = True
+            out.append(c)
+            word_start = False
+            i += 1
+            continue
+        if quote != "'" and c in "$`":
             return "".join(out), False
-        elif not quote and c in "{}*?[]~":
+        if not quote and c in "{}*?[]~":
             return "".join(out), False
+        if not quote and c == "=" and word_start:
+            return "".join(out), False      # zsh `=prog` expands to the program's path
+        if not quote and c in " \t\r\n;|&()<>":
+            if c in "<>" and content and not word_quoted and all(ch.isdigit() for ch in content):
+                del out[word_begin:]        # IO number: part of the redirect, not an argument
+            elif quoted_operator():
+                return "".join(out), False
+            out.append(c)
+            content = []
+            word_quoted = False
+            word_start = True
+            word_begin = len(out)
+            i += 1
+            continue
         out.append(c)
-        word_start = not quote and c in " \t\r\n;|&()<>"
+        content.append(c)
+        word_start = False
         i += 1
-    return "".join(out), not quote
+    if quote or quoted_operator():
+        return "".join(out), False
+    return "".join(out), True
 
 
 def _tokens(cmd: str) -> tuple[list[str], bool]:
@@ -227,27 +747,25 @@ def _tokens_mutate(tokens: list[str]) -> bool:
                     return True
                 if t == "<&" and not (target.isdigit() or target == "-"):
                     return True
-                # A leading IO number belongs to the redirect, not the executable.
-                if seg and seg[-1].isdigit():
-                    seg.pop()
                 i += 2
                 continue
             if t not in {";", "&&", "||", "|", "&", "|&", "\n"}:
                 return True  # heredocs, here strings, groups and unknown operators are unmodelled
-            if _segment_mutates(seg):
+            if _segment_has_side_effect(seg):
                 return True
             seg = []
         else:
             seg.append(t)
         i += 1
-    return _segment_mutates(seg)
+    return _segment_has_side_effect(seg)
 
 
 def command_has_side_effect(cmd: str) -> bool:
-    """True means known mutation OR unmodelled shell syntax (there is no uncertain label).
+    """True means known mutation, an unlisted program, OR unmodelled shell syntax (there is no uncertain label).
 
-    Only a completely parsed supported command may return False. A regex fallback cannot establish
-    safety for a shell program and previously turned parser gaps into incorrect training labels.
+    Only a completely parsed supported command whose every simple command is an allowlisted read-only program
+    may return False. A regex fallback cannot establish safety for a shell program and previously turned parser
+    gaps into incorrect training labels.
     """
     tokens, complete = _tokens(cmd)
     return not complete or _tokens_mutate(tokens)
@@ -292,7 +810,14 @@ def target(e: ToolEvent) -> Optional[tuple[str, str]]:
 def has_side_effect(e: ToolEvent) -> bool:
     if e.name.lower() in SIDE_EFFECT_TOOLS:
         return True
-    c = _first(e.input if isinstance(e.input, dict) else {}, COMMAND_KEYS)
+    inp = e.input if isinstance(e.input, dict) else {}
+    for k in COMMAND_KEYS:
+        v = inp.get(k)
+        if v is not None and not isinstance(v, str):
+            # {"command": ["bash", "-lc", "git push"]}: an argv list or any other shape is a command we did not
+            # parse, so it cannot be proven read-only (it was silently read-only before).
+            return True
+    c = _first(inp, COMMAND_KEYS)
     return bool(c and command_has_side_effect(c))
 
 
