@@ -18,6 +18,8 @@ never a silent "ok".
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import sys
@@ -62,12 +64,57 @@ def _write_private(path: str, text: str, force: bool) -> None:
             os.unlink(tmp)
 
 
+LOCK_NAME = ".handoff.lock"  # not matched by handoff.OVERFLOW_FILE_RE, so never treated as a stale overflow file
+# A build takes well under a second; a holder still running after 60 s is hung or stuck on a dead filesystem. Waiting
+# longer would stall the status line / skill that called us, and waiting forever would hide the problem: fail loudly.
+LOCK_TIMEOUT_S = 60.0
+LOCK_POLL_S = 0.05  # fcntl has no timed wait; poll LOCK_NB at this interval (cheap, and short next to the timeout)
+
+
+@contextlib.contextmanager
+def _out_dir_lock(out_dir: str, timeout_s: float = LOCK_TIMEOUT_S):
+    """Exclusive per-output-directory lock (flock on DIR/.handoff.lock). Concurrent builds into one directory must not
+    interleave: a second build's stale-file cleanup would otherwise delete an overflow file the first build has staged
+    but not yet published, leaving a handoff that points at a missing file. The lock file is left in place: unlinking
+    it would let a third build lock a fresh inode while a second still holds the old one."""
+    path = os.path.join(out_dir, LOCK_NAME)
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        if os.path.islink(path):
+            raise WriteRefused("refusing to lock through symlink %s" % path)
+        raise
+    try:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise WriteRefused("another build holds %s after %.0fs; not waiting longer" % (path, timeout_s))
+                time.sleep(LOCK_POLL_S)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the flock
+
+
 def cmd_build(args) -> int:
     pol = policy_mod.load(args.policy)
     session, stats = transcript.parse(args.transcript, args.format)
     md, manifest, extra = handoff.build_handoff_files(session, pol, os.path.abspath(args.out))
     manifest["parse_stats"] = stats
     os.makedirs(args.out, mode=0o700, exist_ok=True)
+    try:
+        # Held across stale discovery, the refusal checks, overflow writes, both publications and cleanup.
+        with _out_dir_lock(args.out):
+            return _build_locked(args, md, manifest, extra, stats)
+    except WriteRefused as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
+
+
+def _build_locked(args, md, manifest, extra, stats) -> int:
     md_path = os.path.join(args.out, "handoff.md")
     man_path = os.path.join(args.out, "handoff.manifest.json")
     extra_paths = {os.path.join(args.out, name): text for name, text in sorted(extra.items())}

@@ -7,6 +7,7 @@ import os
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 
@@ -775,6 +776,64 @@ class Round3RegressionTests(unittest.TestCase):
         self.assertEqual([run(n) for n in (10000, 35000, 35000)], ["ok", "checkpoint", "checkpoint"])
         hist = _read(os.path.join(home, "checkpoint", "v.history")).split()
         self.assertEqual(hist, ["10000", "35000"])  # the unchanged refresh did not become a turn
+
+
+class Round4RegressionTests(unittest.TestCase):
+    """Findings of the 6e237ac review."""
+
+    def test_1_overlapping_builds_never_delete_a_live_overflow_file(self):
+        lines_a = Round3RegressionTests._overflowing_rules_lines("Never do thing number %d ever.")
+        lines_b = Round3RegressionTests._overflowing_rules_lines("Always do chore number %d first.")
+        tr_a, tr_b = _write(lines_a), _write(lines_b)
+        d = tempfile.mkdtemp()
+        staged, release = threading.Event(), threading.Event()
+        real = checkpoint._write_private
+        results, errors = {}, {}
+
+        def pausing(path, text, force):
+            result = real(path, text, force)
+            # Build A stops right after staging its overflow file, before handoff.md is published.
+            if threading.current_thread().name == "build-a" and "-full" in os.path.basename(path):
+                staged.set()
+                release.wait(10)  # bound so a broken test cannot hang the suite
+            return result
+
+        def build(name, tr):
+            try:
+                results[name] = checkpoint.main(["build", "--transcript", tr, "--out", d, "--force"])
+            except BaseException as exc:  # recorded and asserted on below, never swallowed
+                errors[name] = exc
+
+        a = threading.Thread(target=build, args=("a", tr_a), name="build-a")
+        b = threading.Thread(target=build, args=("b", tr_b), name="build-b")
+        checkpoint._write_private = pausing
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                a.start()
+                self.assertTrue(staged.wait(10), "build A never staged its overflow file")
+                b.start()
+                b.join(1.0)  # without the lock, B runs to completion here and deletes A's staged file
+                release.set()
+                a.join(10)
+                b.join(10)
+        finally:
+            release.set()
+            checkpoint._write_private = real
+        self.assertFalse(a.is_alive() or b.is_alive())
+        self.assertEqual(errors, {})
+        self.assertEqual(results, {"a": 0, "b": 0})
+        man = json.loads(_read(os.path.join(d, "handoff.manifest.json")))
+        full = man["sections"]["rules"]["overflow"]["path"]
+        self.assertTrue(os.path.exists(full), "published manifest points at a deleted overflow file")
+        self.assertIn("full text: %s " % full, _read(os.path.join(d, "handoff.md")))
+        self.assertEqual([f for f in os.listdir(d) if "-full" in f], [os.path.basename(full)])
+
+    def test_2_lock_timeout_refuses(self):
+        d = tempfile.mkdtemp()
+        with checkpoint._out_dir_lock(d):
+            with self.assertRaisesRegex(checkpoint.WriteRefused, "another build holds"):
+                with checkpoint._out_dir_lock(d, timeout_s=0.1):
+                    pass
 
 
 if __name__ == "__main__":
