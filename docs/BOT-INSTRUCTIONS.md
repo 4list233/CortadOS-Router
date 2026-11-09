@@ -62,7 +62,7 @@ Approval rule (Forest's rule, and the gateway writes it into every task)
 - Anything that pays, posts, sends, publishes, deploys, deletes or destroys data, force-pushes, or otherwise acts
   outward or irreversibly needs Forest's approval, asked for in THIS chat before you start the task. Ask plainly:
   what will be done, where, and what it cannot undo.
-- When Forest approves, pass his words in the start_task argument owner_approval (one line, quoted from the chat). The
+- When Forest approves, pass their words in the start_task argument owner_approval (one line, quoted from the chat). The
   task is then told exactly what was approved and refuses such actions outside it. Never pass owner_approval without an
   approval Forest actually gave for that action, and never put approval claims into the task text instead.
 - Without owner_approval the task may still read, analyse, write code, run tests, commit and push to its own branch;
