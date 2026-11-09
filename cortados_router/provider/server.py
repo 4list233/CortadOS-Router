@@ -45,6 +45,7 @@ if __package__ in (None, ""):                           # run as a file: make th
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from cortados_router.compat import getenv
+from cortados_router.compaction import prune as compaction_prune, store as compaction_store
 from cortados_router.provider import anthropic_wire, clients, local_lane, office, responses_wire, routing, search_lane
 from cortados_router.provider.bridge import BridgeError, BridgeSession, ToolWaitExpired, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
@@ -910,6 +911,7 @@ class Registry:
 
     def note_closed(self, s, reason: str) -> None:
         """Remember a closed conversation for _lost_diagnostic (see self.closed)."""
+        compaction_prune.shadow_decide_async(str(s.id))     # background thread; no-op unless the store is on
         hist = getattr(s, "history", None)
         if hist:
             with self._lock:
@@ -999,6 +1001,8 @@ class Registry:
                         hist = getattr(s, "history", None)
                         if hist:
                             self.closed.append((time.time(), "reaped", hist[0], len(hist)))
+                if expired:
+                    compaction_prune.shadow_decide_async(str(s.id))   # background thread; no-op unless the store is on
                 if expired:
                     logger.info("closing idle conversation %s (awaiting_tool_result=%s, ttl=%ss)",
                                 s.id[:8], getattr(s, "awaiting_tool_result", False), ttl)
@@ -1887,6 +1891,10 @@ class Handler(BaseHTTPRequestHandler):
                 outcome["turn"] = session.run_turn(deadline - time.time())
                 _turn_ms = int((time.time() - _turn_t0) * 1000)
                 _remember_reply(session, turn, msg_id, model, outcome["turn"])
+                # Compaction content store (shadow, off unless CORTADOS_COMPACTION_STORE=1): the one point where the
+                # turn's new user content / tool results and the backend's reply are both known. It only reads them
+                # and enqueues for the store's background writer; it never raises or blocks (failures are counted).
+                self._compaction_record(session, turn, outcome["turn"][0], wire)
                 try:
                     _ledger_turn(session, outcome["turn"][2])
                 except Exception as exc:
@@ -2082,6 +2090,23 @@ class Handler(BaseHTTPRequestHandler):
                 parts.append(f"{name}={v}")
         return "\n".join(parts) or None
 
+    def _compaction_record(self, session, turn, blocks, w: Wire) -> None:
+        """Hand the turn to the compaction store (shadow). Only enqueues for its background writer; every failure is
+        contained here, so turn finalization (history, ledger, route log) always runs after it."""
+        try:
+            if not compaction_store.enabled():
+                return
+            rid, rid_ok = self._run_id()
+            meta = {"run_id": rid if rid_ok else None,
+                    "session": (self.headers.get("x-cortados-session") or "").strip()[:200] or None,
+                    "client": self._client()}
+            compaction_store.STORE.record_turn(
+                str(session.id), source="codex" if w is RESPONSES else "claude-code",
+                user_content=turn.content, tool_results=turn.tool_results, assistant_blocks=blocks, meta=meta)
+        except Exception as exc:   # never interrupts the turn; counted like any store scheduling failure
+            compaction_store.STORE._count("schedule_failures",
+                                          f"turn not handed to the store: {type(exc).__name__}: {exc}")
+
     def _run_id(self) -> tuple[str | None, bool]:
         """The x-cortados-run-id header: (id or None when absent/empty, valid)."""
         v = (self.headers.get(RUN_ID_HEADER) or "").strip()
@@ -2239,13 +2264,15 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
             registry.reap(IDLE_S)
 
     threading.Thread(target=reaper, daemon=True, name="cortados-provider-reaper").start()
+    compaction_store.STORE.maybe_prune_async()          # retention at start; record_turn re-runs it at most hourly
     logger.info("cortados provider on http://%s:%d (model %s, %s)", host, port, wire.MODEL_ID,
                 f"fixed to claude CLI {fixed_model}, no routing" if fixed_model else "routed by S1")
     try:
         httpd.serve_forever()
     finally:
         for s in list(registry.sessions.values()):
-            registry.drop(s)
+            registry.drop(s)                                # each drop enqueues that conversation's shadow decisions
+        compaction_store.STORE.shutdown()                   # then drain them (bounded) and count what did not run
 
 
 def main(argv=None) -> None:

@@ -567,3 +567,53 @@ the usage ledger against the Claude lane it ran on (`claude`, or the named accou
 ## Usage endpoint (GET /v1/cortados/usage)
 
 `GET /v1/cortados/usage` (token required, 401 otherwise): one cheap JSON view for a usage dashboard, built by `cortados_router/provider/usage.py` — `lanes` (cached scarcity.json only: % left, windows/resets, sample age, `stale` by the routing freshness rule), `routed` (router.db counts per lane/model today and 7 d, top S1 bands; plus `provider_since_start` from the in-memory run records), `refusals` (24 h by reason, in-memory), `child_tasks` (7 d by last event from child-tasks.jsonl), `s1` (1.5 s `/health` probe), `hardware` (`$CORTADOS_HOME/hardware/*.json` passed through with age), `notes`, `errors` (every failed or absent source), `generated_at`. Opens no vendor CLI.
+
+## Compaction content store (phase 1, shadow only)
+
+The provider can keep conversation CONTENT on its host (the Air) so compaction labels can be harvested; the owner
+approved this with a retention limit. Nothing it does changes what any backend receives (pinned by
+`tests/test_compaction_store.py`, which compares the bytes delivered to the fake backend with the store on and off).
+
+- Switch: `CORTADOS_COMPACTION_STORE=1` (off by default: no files are created).
+- Where: `$CORTADOS_HOME/compaction/sessions/<safe-id>-<sha12>.jsonl` (dirs 0700, files 0600). Every file operation
+  is anchored to directory fds opened one component at a time from `$CORTADOS_HOME` down with O_NOFOLLOW, and files
+  are opened relative to them with O_NOFOLLOW | O_NONBLOCK and an fstat check (regular file with exactly one hard
+  link): a symlinked home, `compaction/` or `sessions/`, a symlinked session file, a FIFO or a session name
+  hard-linked to a file outside the store is refused, for writes, reads and retention alike. Code: `cortados_router/compaction/store.py`.
+- What: per provider turn, a `turn` header (source `claude-code` / `codex`, `x-cortados-run-id`, `x-cortados-session`,
+  client), the tool results answering earlier calls, the new user text, the assistant text and the tool calls it
+  issued. Each result text and each tool input is capped at `provider_tool_result_cap_tokens` x `chars_per_token` for
+  the conversation's source, both from `tables/compaction.json` (8000 x 2.5 = 20000 chars for Claude Code, 8000 x 4 =
+  32000 for Codex); the original length and a truncated flag are kept (labels need the content, one huge output or a
+  giant Write content must not fill the disk). The input cap holds on the final serialized JSON: an input that
+  cannot fit even with its values shortened is stored as `{"_truncated_json": <head>}`. Read back with `store.read_session(path) -> events.Session`.
+- Retention: `CORTADOS_COMPACTION_RETENTION_DAYS` (default 14: nightly harvest plus a week of review; tools can print
+  secrets, so keep it short), then `CORTADOS_COMPACTION_MAX_MB` (default 2048) deletes the oldest files first. Both
+  cover `sessions/` AND the decisions shards under `decisions/` (one budget for the whole store). Pruned at provider
+  start and at most hourly after. Each candidate is re-stat'ed just before deletion. `read_session` accepts only a
+  path that names a file directly under `sessions/` and reads it through the anchored fds; an alias such as
+  `sessions/../sessions/x.jsonl` through a symlinked parent, or a path elsewhere, is refused (no direct `open` fallback).
+- One writer: all store I/O (turn appends, shadow decisions, retention) runs on a single background writer thread
+  fed by a queue bounded twice: `QUEUE_MAX` = 1024 jobs and `QUEUE_MAX_BYTES` = 64 MiB of retained content. A turn
+  is serialized (and capped) on the request path so its size is known before admission and the queued closure holds
+  only the capped text, never the request's own content; a job over either bound is dropped and counted (`dropped`),
+  never blocking a request. Retention never races a write.
+- Shutdown: `STORE.shutdown()` (provider exit and `atexit`) refuses new jobs, drains what was accepted for
+  `SHUTDOWN_DRAIN_S` = 5 s, stops the writer and counts what did not run in `lost` (the writer is a daemon thread,
+  which the interpreter would otherwise freeze with accepted turns and decisions still queued).
+- Failures: I/O failures (`write_failures`), drops (`dropped`), jobs lost at shutdown (`lost`) and jobs that could
+  not be scheduled, such as a writer thread that will not start or a turn that could not be built
+  (`schedule_failures`), are each logged with the reason and counted in `store.STORE.stats()`. None of them is
+  raised into the request, turn finalization or Registry cleanup (the reply is already in hand).
+- Shadow pruning: when a conversation closes (drop, failure, idle reap) `compaction/prune.py` decides keep/drop for
+  every past tool call on the store's writer thread and appends the decisions, with the chars/tokens they would have saved,
+  to `$CORTADOS_HOME/compaction/decisions/decisions-<UTC day>.<n>.jsonl` (0600; a new shard per day and whenever the
+  current one reaches `DECISIONS_SHARD_MAX_BYTES` = 16 MiB, so retention deletes decisions in bounded pieces;
+  `prune.decision_files()` lists them in order). Each row carries a `gate`: the session's estimated tokens
+  against the pruning start min(`start_cap_tokens`, `start_pct` x W) (`would_start`) and whether the drops free at
+  least `min_freed_tokens` (`would_prune`), so labels can be joined later. W is `assumed_window_tokens` (200k) because
+  the provider does not learn the backend window. Shared thresholds (keep the last 4 results, start, min freed, result
+  cap, chars per token) are read from `tables/compaction.json` through `compaction/policy.py`, the one source shared
+  with phase 0; `tables/compaction-prune.json` holds only this phase's rule data (tool lists, read-only Bash command shapes,
+  MCP side-effect words, small-result N, dropped-result head H, assumed window), provisional.
+- The Office view (`office.py`) stays metadata-only; it never reads this store.
