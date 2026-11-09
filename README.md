@@ -28,7 +28,7 @@ Claude Code's WebSearch (a request whose only tool is the `web_search_*` server 
 
 Two more pieces build on the provider, both delegating work rather than routing a whole session:
 
-- **The `cortados-routed-subagents` Claude Code mod** (`integrations/claude-mod/cortados-routed-subagents/`) intercepts every Agent-tool subagent the session spawns and runs it as a headless `claude` against the provider instead: S1 scores and routes the subagent's model, while its tools still execute on your machine. Built-in tools only (no MCP, no browser); worktree-isolated, remote, forked and named agents pass through unrouted; a routed subagent runs under a 10-minute cap. An optional **orchestrator mode** directs the main session to plan and delegate rather than do substantive work itself (guidance by default; `orchestratorEnforce` makes it a hard allowlist). Each run's real backend model and the lane's remaining window are shown via the run record (below), not just `cortados`.
+- **The `cortados-routed-subagents` Claude Code mod** (`integrations/claude-mod/cortados-routed-subagents/`). In its default **orchestrator mode** it directs the main session to plan and delegate through the cortados-route MCP tools (`start_task` / `route_task`) rather than do substantive work itself, and refuses the main session's own Agent-tool calls (the owner's rule; a routed Agent child dies with the session's hooks). Guidance for every other tool by default; `orchestratorEnforce` makes it a hard allowlist. Agent-tool subagents spawned below the main loop (or with orchestrator mode off) are intercepted and run as a headless `claude` against the provider instead: S1 scores and routes the subagent's model, while its tools still execute on your machine. Built-in tools only (no MCP, no browser); worktree-isolated, remote, forked and named agents pass through unrouted; a routed subagent runs under a 10-minute cap. Each run's real backend model and the lane's remaining window are shown via the run record (below), not just `cortados`.
 - **The `cortados-route` MCP tool**, `route_task(task, context?, max_tokens?, model?)` (`cortados_router/subagent_mcp.py`), is text-only delegation: the main session keeps its own model and tools, and hands a self-contained subtask to the provider for S1 to score and route; the answer comes back as text, with no tool access of its own. `model` (optional) pins a model instead of S1: any name `start_task`'s `orchestrator` accepts (`fable`, `opus`, `claude-*`, `gpt-*`, or a friendly name such as `GPT 6.1` or `ollama 27b q3km` — see **Friendly model names**; one validation, `child_tasks.pin_model`), sent as `sub/<id>`; the result's `_meta` carries the requested and the routed model, and the text ends with `[cortados: S1 → <model> · <pct>% left]` (routed) or `[cortados: <model> · <pct>% left]` (pinned): route_task asks the provider to reveal the backend model. Token from `CORTADOS_PROVIDER_TOKEN`/`_FILE` or `~/.config/cortados/provider-token` by default. Setup below (Delegating sub-agent work).
 
 **Recommended setup:** pin the main session to a strong model with `claude --model sub/opus` against the provider, and let the routed-subagents mod send its workers through S1 (`model: cortados` in the mod config, the default). S1 only scores a conversation's first message and the route is then fixed for that conversation — good for a worker whose task is stated up front, not for an orchestrating session whose first message ("let's get started") is too thin to score well. Pinning the planner sidesteps that; routing the workers still gets each one the cheapest capable model.
@@ -229,7 +229,7 @@ s1/                        CortadOS Router S1: dataset, label, build_sft, evalua
 tables/                    routing table, budgets, use cases, generated scores, benchmarks/, community/, inventory/,
                            s1-endpoints.example.json, resources.example.json, local-models.json
 integrations/hermes/       the frozen Hermes plugin (reference only)
-integrations/claude-mod/   cortados-routed-subagents: routes Agent-tool subagents through the provider; cortados-pulse:
+integrations/claude-mod/   cortados-routed-subagents: orchestrator directive + gate (delegate via cortados-route, Agent refused at top level), routes lower Agent-tool subagents through the provider; cortados-pulse:
                            a Claude Code pane that shows the resource pool beside the chat
 tests/                     stdlib unittest suite; tests/integration needs a Hermes host and skips without it
 ```
@@ -364,14 +364,25 @@ What runs where:
   directive is not added twice.
 - **Delegation gate:** a standalone stdlib PreToolUse command in that settings file allows the main loop
   `--delegate-budget N` direct work calls per user prompt (default **3**; **0** is strict), then denies further
-  work and asks it to delegate with Agent. Subagents (hook input contains `agent_id`) keep every tool without a
-  budget. Agent, Task, TodoWrite, Read, Grep, Glob, ToolSearch, Skill, AskUserQuestion, ExitPlanMode and EnterPlanMode
-  are unlimited; every other tool, including unknown future tools, Bash, edits, web and MCP, spends the budget.
+  work and asks it to delegate with `mcp__cortados-route__start_task` / `route_task`. Subagents (hook input contains
+  `agent_id`) keep every tool without a budget. The cortados-route tools (`mcp__cortados-route__*`, exact server
+  prefix), TodoWrite, Read, Grep, Glob, ToolSearch, Skill, AskUserQuestion, ExitPlanMode and EnterPlanMode are
+  unlimited; every other tool, including unknown future tools, Bash, edits, web and MCP, spends the budget.
   Set `CORTADOS_DELEGATE_ALLOW_MCP` to a comma-separated list of **exact** `mcp__...` tool names to exempt owner-approved
   MCP tools (default none; no wildcards). The launcher writes `CORTADOS_DELEGATE_BUDGET` into settings env.
   `--no-gate` disables enforcement independently of `--no-delegate-directive`.
-  Fork subagents (`subagent_type: "fork"`) are always denied in the main loop, budget or not: a fork inherits the
-  pinned orchestrator model and its history, so it skips S1 and collides with the parent's backend conversation (409).
+  **Router outage:** once the budget is spent, the gate opens a TCP connection to the provider cortados-route
+  delegates through (`CORTADOS_PROVIDER_URL`, else the launcher's `ANTHROPIC_BASE_URL`; 2 s timeout). If it cannot
+  connect, the call is allowed and not counted, with a one-line stderr notice to the owner, so the session can do the
+  work directly as the owner's rule says; Agent/Task stay refused. With no provider URL in the hook env there is
+  nothing to check and the budget holds. If the provider is up but cortados-route is missing, the only override is the
+  owner's: relaunch with `--no-gate` or a larger `--delegate-budget` (a switch the model cannot flip).
+  The **Agent and Task tools are always denied in the main loop**, budget or not, with a reason naming `start_task`
+  and the fallback when cortados-route is not connected (tell the owner in one line, do the work directly): the
+  owner's rule (`~/.config/ai-coding/CORTADOS-ORCHESTRATOR.md`) makes cortados-route the only delegation path, and a
+  routed Agent child dies with the session's hooks (2026-11-08, six builders aborted). This also covers fork
+  subagents, which used to be denied separately (a fork inherits the pinned orchestrator model and history, skips S1
+  and collides with the parent's backend conversation, 409).
   Counters live in `~/.config/cortados/gate/` (0700 directory, 0600 files), keyed by a hashed session ID and then
   prompt ID (missing prompt ID uses `none`). Atomic replacements and a shared file lock protect parallel calls;
   counter files older than seven days are pruned. Any internal error **fails open** with one stderr diagnostic:

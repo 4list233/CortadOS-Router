@@ -1,7 +1,7 @@
 {
   "name": "cortados-routed-subagents",
   "version": "0.1.0",
-  "description": "Routes every subagent spawned from this session through the CortadOS provider: S1 picks the cheapest capable model, it runs headless on the provider host, and its tool calls are bridged back to run on this machine. The main session stays on direct Claude.",
+  "description": "Makes the main session a CortadOS orchestrator: it delegates through the cortados-route MCP tools (start_task / route_task) and its own Agent tool calls are refused. Subagents spawned below the main loop are routed through the CortadOS provider: S1 picks the cheapest capable model, it runs headless on the provider host, and its tool calls are bridged back to run on this machine. The main session stays on direct Claude.",
   "author": {
     "name": "Forest Li",
     "url": "https://github.com/4list233"
@@ -60,19 +60,19 @@
       "type": "boolean",
       "title": "Orchestrator mode (brain only plans and delegates)",
       "default": true,
-      "description": "When on, a standing directive tells the main session to plan and delegate work to routed subagents. It is guidance, not a cage: the brain keeps its tools and may act directly when delegating is clearly wasteful, and it does browser/MCP steps itself (routed subagents have only built-in tools). Turn on orchestratorEnforce for a hard tool block. Subagents are unaffected."
+      "description": "When on, a standing directive tells the main session to plan and delegate work through the cortados-route MCP tools (start_task / route_task), and the main session's own Agent tool calls are refused (owner rule: a routed Agent subagent dies with the session's hooks). For every other tool it is guidance, not a cage: the brain keeps them and may act directly when delegating is clearly wasteful or cortados-route is not connected. Turn on orchestratorEnforce for a hard tool block. Subagents and CortadOS child tasks are unaffected."
     },
     "orchestratorEnforce": {
       "type": "boolean",
       "title": "Orchestrator enforce (hard-block non-allowlisted tools)",
       "default": false,
-      "description": "Off by default. When on together with orchestratorMode, every main-loop tool outside orchestratorAllowedTools is refused, so the brain cannot act even if it tried. Leave off unless you want a strict plan-only brain; it also blocks browser and connector tools the brain may need."
+      "description": "Off by default. When on together with orchestratorMode, every main-loop tool outside orchestratorAllowedTools is refused (the cortados-route tools always pass), so the brain cannot act even if it tried. Leave off unless you want a strict plan-only brain; it also blocks browser and connector tools the brain may need, and with cortados-route not connected the brain cannot work until this is turned off."
     },
     "orchestratorAllowedTools": {
       "type": "string",
       "title": "Tools the brain MAY use itself on the main loop",
-      "default": "Read,Grep,Glob,TodoWrite,Agent,mcp__cortados-route__route_task,AskUserQuestion,ExitPlanMode,Skill,ToolSearch",
-      "description": "Used only when orchestratorEnforce is on: comma/space-separated allowlist of tools the main loop may run itself. Everything else (edits, shell, web, MCP tools, future tools) is refused and must be delegated. Agent and route_task are always allowed, and the desktop app's turn plumbing (update_plan, wrap_up, mark_chapter) is never blocked. An empty/invalid value falls back to the default."
+      "default": "Read,Grep,Glob,TodoWrite,AskUserQuestion,ExitPlanMode,Skill,ToolSearch",
+      "description": "Used only when orchestratorEnforce is on: comma/space-separated allowlist of tools the main loop may run itself. Everything else (edits, shell, web, MCP tools, future tools) is refused and must be delegated. The cortados-route tools (mcp__cortados-route__*) are always allowed, Agent is always refused, and the desktop app's turn plumbing (update_plan, wrap_up, mark_chapter) is never blocked. An empty/invalid value falls back to the default."
     },
     "subagentTimeoutMs": {
       "type": "number",
