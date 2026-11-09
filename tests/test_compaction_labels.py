@@ -126,6 +126,39 @@ class LabelTests(unittest.TestCase):
         self.assertTrue(r[0]["needed_call"])
         self.assertEqual(r[0]["evidence"][0]["rule"], "side_effect")
 
+    def test_executable_paths_do_not_inherit_trusted_basenames(self):
+        for c in ("./test", "./cat f", "./git status", "tools/cat f", "/tmp/git status",
+                  "./env cat f", "/bin/../tmp/cat f", "/usr/bin-extra/cat f"):
+            with self.subTest(command=c):
+                self.assertTrue(command_has_side_effect(c), c)
+        for c in ("cat f", "git status", "/bin/cat f", "/usr/bin/git status",
+                  "/opt/homebrew/bin/cat f", "/usr/bin/env cat f"):
+            with self.subTest(command=c):
+                self.assertFalse(command_has_side_effect(c), c)
+
+    def test_curl_write_out_is_a_side_effect(self):
+        for option in ("-w '%output{out.txt}written'", "'-w%output{out.txt}written'",
+                       "'-sw%output{out.txt}written'", "--write-out '%output{out.txt}written'",
+                       "'--write-out=%output{out.txt}written'"):
+            with self.subTest(option=option):
+                self.assertTrue(command_has_side_effect("curl -s URL " + option))
+
+    def test_git_grep_pager_options_are_side_effects(self):
+        for option in ("-O", "-O/path/to/pager", "-nO/path/to/pager",
+                       "--open-files-in-pager", "--open-files-in-pager=/path/to/pager"):
+            with self.subTest(option=option):
+                self.assertTrue(command_has_side_effect("git grep " + option + " needle"))
+        self.assertFalse(command_has_side_effect("git grep -n needle"))
+
+    def test_git_reflog_only_known_read_forms_are_allowed(self):
+        for c in ("git reflog drop HEAD", "git reflog write HEAD old new message",
+                  "git reflog unknown HEAD"):
+            with self.subTest(command=c):
+                self.assertTrue(command_has_side_effect(c), c)
+        for c in ("git reflog", "git reflog show", "git reflog exists HEAD"):
+            with self.subTest(command=c):
+                self.assertFalse(command_has_side_effect(c), c)
+
     def test_read_only_commands_are_not_side_effects(self):
         for c in ("git -C /repo status", "git -C /repo log --oneline -5", "git --no-pager diff",
                   "git --git-dir=/r/.git show HEAD", "ls > /dev/null 2>&1", "grep commit file", "cat a | grep rm",

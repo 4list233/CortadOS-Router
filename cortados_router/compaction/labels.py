@@ -162,6 +162,8 @@ def _first_positional_in(allowed: set):
     return check
 
 
+# A repository-configured textconv driver can run on diff/log/show. This is an accepted limitation:
+# the impact is a training label, and textconv requires prior configuration changes in the repository.
 GIT_READ_ONLY = {
     "status": _any_args, "log": _any_args, "show": _any_args, "diff": _any_args, "blame": _any_args,
     "shortlog": _any_args, "rev-parse": _any_args, "rev-list": _any_args, "ls-files": _any_args,
@@ -169,14 +171,14 @@ GIT_READ_ONLY = {
     "merge-base": _any_args, "show-ref": _any_args, "for-each-ref": _any_args, "diff-tree": _any_args,
     "diff-index": _any_args, "diff-files": _any_args, "count-objects": _any_args, "check-ignore": _any_args,
     "var": _any_args, "ls-remote": _any_args, "version": _any_args,
-    "grep": _refusing(prefixes=("-O", "--open-files-in-pager")),      # opens the matches in the pager/editor
+    "grep": _refusing(prefixes=("--open-files-in-pager",), letters="O"),      # opens the matches in the pager/editor
     "branch": _git_branch,
     "tag": _git_tag,
     "config": _git_config,
     "remote": _git_remote,
     "stash": _first_positional_in({"list", "show"}),
     "worktree": _first_positional_in({"list"}),
-    "reflog": lambda rest: not {"expire", "delete"}.intersection(rest),
+    "reflog": lambda rest: not rest or rest[0] in {"show", "exists"},  # other forms can mutate refs
 }
 
 
@@ -396,17 +398,17 @@ def _sed(args: list[str]) -> bool:
 
 # --- curl / gh -------------------------------------------------------------------------------------------------
 # curl is read-only only as a GET/HEAD fetch to stdout. Any option that sends a body (-d -F -T --json), writes a
-# file (-o -O -J -c -D --trace* --libcurl --etag-save), reads an unseen config (-K/-q are not enough) or changes
+# file (-o -O -J -c -D -w/--write-out --trace* --libcurl --etag-save), reads an unseen config (-K/-q are not enough) or changes
 # the method is refused; so is every option not listed, because curl has hundreds and some send mail or FTP
 # commands. Positionals are URLs.
 CURL_FLAGS = set("sSLIikfgvG46N#")
-CURL_WITH_ARG = set("HAumwxebrzEyYX")           # the value is the rest of the cluster or the next argument
+CURL_WITH_ARG = set("HAumxebrzEyYX")           # the value is the rest of the cluster or the next argument
 CURL_LONG_FLAGS = {"--silent", "--show-error", "--location", "--head", "--include", "--insecure", "--fail",
                    "--fail-with-body", "--globoff", "--verbose", "--get", "--compressed", "--http1.1", "--http2",
                    "--http3", "--http0.9", "--ipv4", "--ipv6", "--no-buffer", "--no-progress-meter", "--progress-bar",
                    "--tlsv1.2", "--tlsv1.3", "--path-as-is", "--no-keepalive", "--tcp-nodelay", "--tr-encoding",
                    "--raw", "--basic", "--digest", "--ntlm", "--negotiate", "--anyauth", "--disable", "--retry-connrefused"}
-CURL_LONG_WITH_ARG = {"--header", "--user-agent", "--user", "--max-time", "--connect-timeout", "--write-out",
+CURL_LONG_WITH_ARG = {"--header", "--user-agent", "--user", "--max-time", "--connect-timeout",
                       "--proxy", "--referer", "--cookie", "--range", "--time-cond", "--retry", "--retry-delay",
                       "--retry-max-time", "--url", "--resolve", "--max-redirs", "--cacert", "--capath", "--cert",
                       "--key", "--proto", "--unix-socket", "--abstract-unix-socket", "--speed-limit", "--speed-time",
@@ -595,6 +597,11 @@ def _unwrap(seg: list[str]) -> Optional[list[str]]:
                 return None
             i += 1
             continue
+        # Paths outside trusted system directories must not inherit an allowlisted basename,
+        # even for wrappers: ./env or ./cat may be arbitrary repository executables.
+        if "/" in t and not (os.path.isabs(t) and os.path.normpath(t).startswith(
+                ("/bin/", "/usr/bin/", "/opt/homebrew/bin/"))):
+            return None
         name = os.path.basename(t).casefold()
         if name not in WRAPPERS and name not in WRAPPERS_WITH_POSITIONAL:
             break
