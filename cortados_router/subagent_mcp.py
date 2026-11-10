@@ -100,6 +100,9 @@ CHILD_TOOLS = [
                   "(~/.config/cortados/exec-hosts.json). Default: the file's default, the Air."},
          "title": {"type": "string", "description": "Optional short label for the task (1-80 printable ASCII "
                    "characters), shown in the CortadOS Office view. A label only: never secrets or file contents."},
+         "parent_task_id": {"type": "string", "description": "Optional: the task id (t<14 digits>-<8 hex>) of the "
+                            "task this one is part of, recorded in the run export. Omitted: CORTADOS_PARENT_TASK_ID "
+                            "if this session sets it, else the export marks the parent as missing."},
          "orchestrator": {"type": "string", "description": "'cortados' (default: S1 routes every turn) or a pinnable "
                           "model such as fable, opus, sonnet, gpt-6.1-sol, or a friendly name ('GPT 6.1', 'Sonnet 5', "
                           "'ollama 27b q3km'; an ambiguous name is refused with its candidates): that pins the child's "
@@ -205,7 +208,7 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
                            cfg.get("url", ""), cfg.get("token_file"), a.get("chrome", False), red,
                            a.get("connectors"), client=cfg.get("client"), title=a.get("title"),
                            session_tag=cfg.get("session_tag"), repo=a.get("repo"), branch=a.get("branch"),
-                           host=a.get("host"))
+                           host=a.get("host"), parent_task_id=a.get("parent_task_id"))
         elif name == "task_status":
             out = ct.status(a.get("task_id"), red, cfg.get("url", ""), token)
         elif name == "wait_task":

@@ -323,6 +323,8 @@ def _child_tasks(path: Path, now: float) -> dict[str, Any]:
             continue
         if recent:
             tid = str(rec["task_id"])
+            if str(rec.get("event")).startswith("task_"):
+                continue                               # the run export's bookkeeping (#91), not a lifecycle step
             last[tid] = str(rec.get("event"))          # child_tasks.log_event writes {"ts", "event", **fields}
             if rec.get("client"):                      # bot_gateway's tasks carry client (e.g. grokbot); others do not
                 client[tid] = str(rec["client"])

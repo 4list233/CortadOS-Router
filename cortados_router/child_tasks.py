@@ -9,11 +9,16 @@ after putting the repo root on sys.path, so route_task keeps working even if thi
 
 Layout per task (all under a verified private 0700 directory, default ~/.config/cortados/tasks/<task_id>/):
   meta.json     what was asked (task text length, cwd, orchestrator, permission mode, runner pid, start time)
-  prompt.txt    the task text, fed to `claude -p` on stdin (never argv: argv is world-readable in `ps` and size-capped)
+  prompt.txt    the task text, fed to `claude -p` on stdin (never argv: argv is world-readable in `ps` and size-capped);
+                redacted in place by the runner with the logs once the child has exited
   session-*.json the launcher's 0600 settings (holds the provider token; never printed)
   stdout.log    claude's `--output-format stream-json` events, ending in its result record;  stderr.log  claude's diagnostics
   result.json   written by the runner when the child ends: exit code, end time, cancelled/timed-out flags
   cancelled     marker written by cancel_task before it signals the runner's process group
+
+Run export (#91): when a task ends, the runner appends one finalized, redacted record of the run (prompt, assistant
+text, tool calls and results, result, metadata, run-level model info) to the host's append-only export file
+($CORTADOS_HOME/exports/task-runs.jsonl, or CORTADOS_TASK_EXPORT) for Grounds to capture; see "task run export" below.
 
 The runner (`python3 -m cortados_router.child_tasks --run <dir>`) is a detached session leader (start_new_session), so
 the child survives the MCP server (the desktop app may restart it) and cancel_task can signal exactly that process group.
@@ -48,6 +53,7 @@ import shlex
 import shutil
 import socket
 import stat
+import string
 import signal
 import subprocess
 import sys
@@ -254,7 +260,7 @@ LOGIN_DEFAULT_MODEL = "claude-sonnet-5-5"
 # plus the bookkeeping paths the runner (same env) reads so its state stays in the caller's (test's) throwaway dirs.
 LOGIN_ENV_ALLOW = ("HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM", "COLORTERM",
                    "__CF_USER_TEXT_ENCODING",
-                   "CORTADOS_HOME", "CORTADOS_HERMES_HOME", "CORTADOS_TASKS_DIR",
+                   "CORTADOS_HOME", "CORTADOS_HERMES_HOME", "CORTADOS_TASKS_DIR", "CORTADOS_TASK_EXPORT",
                    # Network config: without it a proxied or custom-CA network cannot reach claude.ai. These carry no
                    # credential, EXCEPT a proxy URL with userinfo (http://user:pass@host): login_env drops those.
                    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
@@ -553,23 +559,55 @@ def connectors_config() -> str:
     return os.path.abspath(os.path.expanduser(os.environ.get("CORTADOS_CONNECTORS_MCP_CONFIG") or CONNECTORS_CONFIG))
 
 
-def prune(root: str, now: float | None = None, errors: list | None = None) -> list:
+def _prune_export(d: str, meta: dict, res, red, budget: dict) -> str | None:
+    """Before a finished task dir is deleted: its run export (#91) must have succeeded. If it has not, try once more
+    (a recovered task's logs are released first when this process's credentials cover the launch ones, else the
+    record is written with the logs withheld). All of one prune's retries share `budget`: at most
+    PRUNE_EXPORT_RETRIES of them within PRUNE_EXPORT_BUDGET_S seconds (the export lock is polled only for what is
+    left), so a stuck export lock cannot hold start_task. Returns None when the dir may go, else why it stays."""
+    if isinstance(res, dict) and (res.get("export") or {}).get("ok"):
+        return None
+    if budget["left"] <= 0:
+        return f"export not retried in this prune (at most {PRUNE_EXPORT_RETRIES} per call)"
+    if budget["until"] - time.monotonic() <= 0:
+        return f"export not retried in this prune (its {PRUNE_EXPORT_BUDGET_S:g} s budget for export retries is used up)"
+    budget["left"] -= 1
+    try:
+        cur = _current_redactor(red)
+    except TaskError as exc:
+        return f"export not retried ({exc})"
+    if isinstance(res, dict) and res.get("logs_unredacted"):
+        try:
+            _release_recovered_logs(d, meta, res, cur)   # on failure the record goes out with the logs withheld
+        except OSError:
+            pass
+    ex = _export_locked(d, meta, cur, EXPORT_LATE_ROUTER_RUN, res, lock_wait_s=budget["until"] - time.monotonic())
+    if ex is None:
+        return "export not retried (the task's runner still holds its lock)"
+    return None if ex.get("ok") else f"export failed ({ex.get('error')})"
+
+
+def prune(root: str, now: float | None = None, errors: list | None = None, red=None) -> list:
     """Remove task dirs whose task started more than PRUNE_AGE_S ago and is not running. Returns the removed ids. Each
     dir is handled on its own: one that cannot be read or removed is recorded in `errors` and skipped, so it never
     blocks every later start_task (#94). An unreadable record (RecordError) is never deleted automatically, whatever
     its age or lock: a corrupt meta.json means the child's pid cannot be read, so the dir may still belong to a live
     child whose runner died (a free runner.lock and an old dir mtime prove nothing; appending to logs does not touch
     the dir's mtime), and removing it would take away the records _recover() / cancel need to stop that child. It
-    stays, reported in `errors` and logged by id, file and type (never content), until a person removes it."""
+    stays, reported in `errors` and logged by id, file and type (never content), until a person removes it.
+    A finished task whose run export (#91) has not succeeded is not deleted either: the export is retried once per
+    prune (_prune_export, at most PRUNE_EXPORT_RETRIES tasks within PRUNE_EXPORT_BUDGET_S per call); while it fails
+    the dir stays, reported in `errors` and logged as `task_kept_unexported`."""
     cutoff = (time.time() if now is None else now) - PRUNE_AGE_S
     removed = []
+    budget = {"left": PRUNE_EXPORT_RETRIES, "until": time.monotonic() + PRUNE_EXPORT_BUDGET_S}
     for name in os.listdir(root):
         d = os.path.join(root, name)
         try:
             if not TASK_ID_RE.fullmatch(name) or os.path.islink(d) or not os.path.isdir(d):
                 continue
             try:
-                state, meta, _ = _state(d)
+                state, meta, res = _state(d)
             except RecordError as exc:
                 if errors is not None:
                     errors.append(_note_unreadable(exc))
@@ -581,6 +619,12 @@ def prune(root: str, now: float | None = None, errors: list | None = None) -> li
                 started = os.path.getmtime(d)
             # A remote stub is only a pointer (the host prunes the task itself): dropped by age alone.
             if state != "running" and started < cutoff:
+                why = _prune_export(d, meta, res, red, budget) if state != "remote" else None
+                if why:
+                    log_event("task_kept_unexported", task_id=name, reason=why)
+                    if errors is not None:
+                        errors.append(f"{name}: not pruned: {why}")
+                    continue
                 if meta.get("launch") == "launchd":
                     _launchd_bootout(d)         # idempotent; a corrupt launchd.json already raised from _state() above
                 shutil.rmtree(d)
@@ -734,17 +778,20 @@ def _stub(d: str):
 
 def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed_tools=None,
           provider_url="", token_file=None, chrome=False, red=None, connectors=None, client=None,
-          title=None, session_tag=None, repo=None, branch=None, host=None) -> dict:
+          title=None, session_tag=None, repo=None, branch=None, host=None, parent_task_id=None) -> dict:
     """`client` (optional, e.g. "grokbot" from the bot gateway) is recorded in meta.json and every event line, so usage
     can be attributed to the caller. `red` carries the launch credentials (env token and token file's token as they are now). `permission_mode`
     None picks auto where the model supports it (resolve_permission_mode). `title` (<= 80 chars) and `session_tag`
     (the orchestrator's opaque tag) label the task in the Office view: on its events, and as headers on its routed
     requests. `host` names the execution host (default: the configured default); `cwd` an existing directory THERE,
-    or `repo` [+ `branch`] a workspace the host prepares (neither: a plain folder under the host's active/)."""
+    or `repo` [+ `branch`] a workspace the host prepares (neither: a plain folder under the host's active/).
+    `parent_task_id` (else CORTADOS_PARENT_TASK_ID) names the task that started this one, for the run export (#91);
+    none known is recorded as an explicit missing parent."""
     if os.environ.get(NESTED_ENV):
         raise TaskError("start_task is not available inside a child task: children may not start children "
                         "(unbounded fan-out would spend subscription quota unattended)")
     tools = _validate(task, cwd, orchestrator, permission_mode, allowed_tools)
+    parent_id, parent_note = resolve_parent(parent_task_id)
     if not isinstance(chrome, bool):
         raise TaskError("chrome must be true or false")
     if host is not None and not isinstance(host, str):
@@ -764,9 +811,17 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
                                 "chrome child must start inside the desktop session (an ssh session cannot read the "
                                 "login Keychain that holds Claude's login)")
         root = _private_root()  # fail before ssh: a remotely launched task must always be locally trackable
-        args = {"task": task, "cwd": cwd, "orchestrator": orchestrator, "permission_mode": permission_mode,
-                "allowed_tools": allowed_tools, "chrome": chrome, "connectors": connectors, "client": client,
-                "title": title, "session_tag": session_tag, "repo": repo, "branch": branch}
+        # The host redacts with ITS credentials only: this machine's are checked here, by the local rules (#91 review
+        # round 3, P1): what the task runs with is refused, labels and the prompt are redacted before they leave.
+        start_red = _start_redactor(red)
+        _refuse_credentials(start_red, {"cwd": cwd, "repo": repo, "branch": branch, "orchestrator": orchestrator,
+                                        "allowed_tools": tools, "session": session_tag})
+        args = {"task": start_red.text(task), "cwd": cwd, "orchestrator": orchestrator,
+                "permission_mode": permission_mode, "allowed_tools": allowed_tools, "chrome": chrome,
+                "connectors": connectors, "client": start_red.text(str(client)) if client else client,
+                "title": start_red.text(title) if isinstance(title, str) else title,
+                "session_tag": session_tag, "repo": repo, "branch": branch,
+                "parent_task_id": parent_id}   # resolved here: the host's own env does not know this session
         try:
             out = _remote(target.name, "start", args)
         except TaskError as exc:
@@ -799,6 +854,13 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
     ws_spec = _workspace_request(task_id, cwd, repo, branch, target)   # validated before anything is created
     # The Office "project" is the cwd's basename, or the repository name for a workspace the runner will create.
     office = office_tags(cwd if cwd else (ws_spec or {}).get("name"), title, session_tag)
+    # Caller text is checked against every known credential before anything about the task exists: a credential in
+    # what the task runs with is refused, one in a label (the title) is redacted (#91 review round 2, P1).
+    caller_fields = {"cwd": cwd, "repo": repo, "branch": branch, "orchestrator": orchestrator, "allowed_tools": tools,
+                     "session": session_tag}
+    start_red = _start_redactor(red)
+    _refuse_credentials(start_red, caller_fields)
+    office = {k: start_red.text(v) for k, v in office.items()}
     if cwd is not None:
         _check_cwd_here(cwd, target)
     login = None
@@ -821,7 +883,7 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
     exe = claude_bin()
     root = _private_root()
     prune_errors: list = []
-    prune(root, errors=prune_errors)
+    prune(root, errors=prune_errors, red=red)
     # No cap on parallel children. Routed children: capacity is the router's job (S1 and the quota gates refuse or
     # redirect a spent lane). Chrome (login-mode) children bypass S1 and the quota gates, so NOTHING here bounds N of
     # them against the main Claude subscription; they do run one at a time per host (CHROME_LOCK: Chrome serves one
@@ -850,24 +912,36 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
     runner = None
     try:
         meta, env, cmd = _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file,
-                                  red or Redactor(),
+                                  start_red,
                                   chrome, max_s, exe, selected, login, office,
                                   workspace=ws_spec, ws_root=target.root, host_name=target.name, launchd=launchd)
+        # Again with the child's launch env known: its credentials are the ones the export is checked against.
+        launch_red = _start_redactor(red, env)
+        _refuse_credentials(launch_red, caller_fields)
         if client:
-            meta["client"] = str(client)[:64]
-            # cmd.json's event fields were written by _prepare before the client was known; the runner logs the
-            # finished event from them, so rewrite them or that event loses its attribution (review r2 P3-8).
-            cmd_path = os.path.join(d, "cmd.json")
-            with open(cmd_path, encoding="utf-8") as f:
-                spec = json.load(f)
-            spec["event"] = _event_fields(meta)
-            _write_json(cmd_path, spec)
+            meta["client"] = launch_red.text(str(client))[:64]     # redact, THEN slice (a cut token would pass)
+        if meta.get("office"):
+            meta["office"] = {k: launch_red.text(v) for k, v in meta["office"].items()}
+        meta["task_preview"] = launch_red.text(task.strip())[:200]
+        # cmd.json's event fields were written by _prepare before the client was known; the runner logs the finished
+        # event from them, so rewrite them or that event loses its attribution (review r2 P3-8).
+        cmd_path = os.path.join(d, "cmd.json")
+        with open(cmd_path, encoding="utf-8") as f:
+            spec = json.load(f)
+        spec["event"] = _event_fields(meta)
+        _write_json(cmd_path, spec)
         if mode_note:
             meta["permission_mode_note"] = mode_note
         if launch_warning:
             meta["launch_warning"] = launch_warning
-        if client or mode_note or launch_warning:
-            _write_json(os.path.join(d, "meta.json"), meta)
+        # For the run export (#91): the task that started this one (or why none is known), and the Office title.
+        meta["parent_task_id"] = parent_id
+        if parent_note:
+            meta["parent_note"] = parent_note
+        if office.get("title"):
+            meta["title"] = launch_red.text(office["title"])
+        meta[META_TEXT_MARK] = True             # every caller text above was redacted or refused with launch_red
+        _write_json(os.path.join(d, "meta.json"), meta)   # before the spawn: the runner's export reads these
         if launchd:
             # chrome: the allowlisted login env (no credential) rides in the plist; routed: nothing does (_prepare
             # wrote it to RUNNER_ENV_FILE and the runner loads it).
@@ -1284,6 +1358,9 @@ def _recover(d: str, meta: dict):
         res["child_cleanup"] = child
         res["logs_unredacted"] = True           # the runner never redacted them; see status()
         res["workspace"] = _settle_workspace(d)  # the child is stopped: its folder is archived or held, never left behind
+        # Its run export waits for the logs: status() exports it once it may release them (_release_recovered_logs),
+        # prune() with the logs withheld if that never happens before the dir would be deleted.
+        res["export"] = {"ok": False, "at": round(time.time(), 3), "error": EXPORT_PENDING}
         _write_json(os.path.join(d, "result.json"), res)
         return res
     finally:
@@ -1311,8 +1388,7 @@ def _release_recovered_logs(d: str, meta: dict, res: dict, red: "Redactor") -> b
     provably include every launch credential (by fingerprint); then they are redacted on disk and released."""
     # None = an old/odd meta: withhold. [] = the child provably ran with no launch credential (login mode), so nothing
     # needs covering and the logs are released after the usual redaction instead of being withheld forever.
-    launch = meta.get("cred_fingerprints")
-    if not isinstance(launch, list) or not set(launch) <= set(credential_fingerprints(red.raw)):
+    if not launch_covered(meta, red):
         return False
     stdout = os.path.join(d, "stdout.log")
     structural_error = None
@@ -1321,10 +1397,11 @@ def _release_recovered_logs(d: str, meta: dict, res: dict, red: "Redactor") -> b
     except Exception as exc:                    # as in _run: recorded, and the raw pass below still runs
         unparsed, structural_error = 0, f"could not redact stdout.log structurally: {type(exc).__name__}"
     try:
-        for name in ("stdout.log", "stderr.log"):
+        for name in ("stdout.log", "stderr.log", "prompt.txt"):
             redact_file(os.path.join(d, name), red)
     except OSError:
         return False
+    res["prompt_redacted"] = True
     if structural_error:
         res["redact_error"] = structural_error   # the task fails and its logs stay withheld
         _write_json(os.path.join(d, "result.json"), res)
@@ -1338,8 +1415,16 @@ def _release_recovered_logs(d: str, meta: dict, res: dict, red: "Redactor") -> b
     except OSError as exc:
         res["activity_error"] = f"could not read stdout.log: {type(exc).__name__}"
     res["logs_unredacted"] = False
+    res["logs_redacted"] = True
     _write_json(os.path.join(d, "result.json"), res)
     return True
+
+
+def launch_covered(meta: dict, red: "Redactor") -> bool:
+    """Whether `red` provably holds every launch credential (sha256 fingerprints in meta.json). None = an old/odd
+    meta: not covered. [] = the child ran with no launch credential (login mode): covered."""
+    launch = meta.get("cred_fingerprints") if isinstance(meta, dict) else None
+    return isinstance(launch, list) and set(launch) <= set(credential_fingerprints(red.raw))
 
 
 def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
@@ -1416,6 +1501,13 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
         # A login-mode (chrome) task never went through the provider: there is no run record to fetch.
         out["router_run"] = ({"note": "login mode: not routed, no provider run record"} if meta.get("lane")
                              else fetch_run(provider_url, token, task_id, _fetch_timeout(deadline)))
+        ex = res.get("export")
+        if (ex is None or (isinstance(ex, dict) and ex.get("error") == EXPORT_PENDING)) and not res.get("logs_unredacted"):
+            # Its run export (#91) is due here when the runner could not make it: a recovered task whose logs were just
+            # released, or a runner that died between result.json and its export (logs already redacted). Under the
+            # task lock: while the runner holds it, the runner is still exporting and this returns None.
+            ex = _export_locked(d, meta, red, out["router_run"], res) or ex
+        out["export"] = ex if isinstance(ex, dict) else {"pending": "the runner records its export right after the result"}
         # Why the provider refused (Claude Code replaces a 413's message with its own "images" text, so the child's
         # result never says): the most recent refusal recorded under this run, plus a hint for the known cause.
         refusals = out["router_run"].get("refusals") if isinstance(out["router_run"], dict) else None
@@ -1891,6 +1983,620 @@ def _settle_workspace(d: str):
         except OSError:
             pass
     return ws
+
+
+# --- task run export (#91: a finalized, redacted, append-only record per run, for Grounds to capture) ---------------
+#
+# One JSONL file per execution host: $CORTADOS_HOME/exports/task-runs.jsonl (CORTADOS_TASK_EXPORT names another file).
+# One line per finished task (any terminal state), written ONCE, only after the run's logs were redacted and its
+# result.json is final: by the runner itself, else (a runner that died) by the first status call that can release the
+# logs, else by prune just before the task dir would be deleted (then with the logs withheld). This code only ever
+# appends: one os.write of the whole line, under an flock on <file>.lock, so concurrent runners never interleave. A
+# sidecar <file>.ids (task id + file size after the line, under the same lock) makes a retry idempotent. Every text
+# in the record went through the same Redactor that produced result.json, redacted BEFORE it was capped; the raw
+# stdout.log content is never written. A task dir whose export has not succeeded is never pruned (it is reported).
+
+EXPORT_SCHEMA = "cortados.task-run/1"
+EXPORT_ENV = "CORTADOS_TASK_EXPORT"         # a file path; unset: paths.state_dir()/EXPORT_FILE
+EXPORT_FILE = os.path.join("exports", "task-runs.jsonl")
+PARENT_ENV = "CORTADOS_PARENT_TASK_ID"      # set by a launching session that is itself a task (start_task arg wins)
+EXPORT_TEXT_CHARS = 32_000                  # per text field (prompt, a tool input string, a tool result, the result)
+EXPORT_MAX_EVENTS = 2_000                   # per record; later events are counted in events_dropped, not written
+EXPORT_LOCK_WAIT_S = 30                     # an export lock held longer than this is a stuck writer: fail, retry later
+PRUNE_EXPORT_RETRIES = 10                   # export retries per prune: prune runs inside start_task, which must answer
+PRUNE_EXPORT_BUDGET_S = 5.0                 # all of one prune's export retries together, lock waits included
+EXPORT_PENDING = "LogsUnredacted"           # export error of a recovered task whose logs are not released yet
+EXPORT_LATE_ROUTER_RUN = {"note": "not fetched: exported after the runner (the provider's run record is in memory "
+                                  "only); see the router logs"}
+EXPORT_LOGS_WITHHELD = "logs withheld: they could not be redacted with the launch credentials"
+EXPORT_PROMPT_WITHHELD = ("prompt withheld: the runner did not redact it, and the current credentials do not match the "
+                          "launch ones")
+EXPORT_REDACT_FAILED = "logs withheld: the runner could not redact them"
+EXPORT_FIELDS_WITHHELD = ("caller text withheld: it was not redacted with the launch credentials when the task started, "
+                          "and the current credentials do not match the launch ones")
+META_TEXT_MARK = "caller_text_redacted"      # meta.json: every caller-supplied text in it was checked at start (#91)
+# Record fields that carry caller-supplied text (or text derived from it). A late export includes them only when the
+# task's meta is marked (start_task redacted or refused every credential in them with the launch credentials) or the
+# current credentials provably cover the launch ones; otherwise they are null and named in withheld_fields.
+EXPORT_CALLER_TEXT = ("title", "client", "cwd", "orchestrator", "model", "error", "parent_note")
+EXPORT_CALLER_WORKSPACE = ("repo", "branch", "reason")
+
+# Best-effort scrub of well-known secret shapes, applied to export text only, AFTER the known-value redaction and
+# BEFORE the cap. Not a guarantee: a secret of any other shape passes. Each match becomes [scrubbed:<type>], counted.
+# Linear time on any input (#91 review round 2, P2: a lookahead over the whole run made `"sk-" * N` quadratic). Every
+# pattern starts at a fixed prefix behind a word boundary and either fails within a bounded number of characters
+# (bounded quantifiers only, no nested or overlapping repetition) or ends with a greedy run of ONE character class
+# with nothing after it, so a match that reaches its run always succeeds and swallows the whole run: no start inside
+# that run is ever tried again. A shape that needs more than its run (an OpenAI key's digit, a JWT's dotted parts)
+# is checked by the replacement callback on the matched run, in one linear pass (_Cap._sub).
+SCRUB_PATTERNS = (
+    ("private_key", re.compile(r"-----BEGIN [A-Z0-9 ]{0,64}PRIVATE KEY-----.*?"
+                               r"(?:-----END [A-Z0-9 ]{0,64}PRIVATE KEY-----|\Z)", re.S)),
+    ("authorization", re.compile(r"(?i)\b(?:proxy-)?authorization[\"']?\s{0,16}[:=]\s{0,16}[\"']?([^\r\n\"',;]+)")),
+    ("bearer", re.compile(r"(?i)\bbearer\s{1,16}([A-Za-z0-9._~+/-]{8,}=*)")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_.-]{4,}")),                  # the whole dotted run; _Cap._jwt finds the JWTs
+    ("anthropic_key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{8,}")),
+    ("openai_key", re.compile(r"\bsk-[A-Za-z0-9_-]{16,}")),            # with a digit: checked on the match
+    ("github_token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
+    ("slack_token", re.compile(r"\bxox[abpr]-[A-Za-z0-9-]{10,}")),
+    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+)
+SCRUB_SLACK_CHARS = 4_096                    # scrubbed past the cap, so a secret straddling the cut is still caught
+_TOKEN_CHARS = string.ascii_letters + string.digits + "._~+/=-"   # a secret's characters: stripped at a scrub cut
+SCRUB_KEYS = ("authorization", "proxy-authorization", "x-api-key")   # a dict value under such a key is scrubbed whole
+_ALREADY_MASKED = re.compile(r"\s*(?:[A-Za-z]+\s+)?(?:\*\*\*|\[scrubbed:[a-z_]+\])\s*")
+
+
+class _ExportLeak(Exception):
+    """The encoded record still matched a credential: never written."""
+
+
+def export_path():
+    """(path, kind): the export file and whether it is the default or CORTADOS_TASK_EXPORT's."""
+    raw = (os.environ.get(EXPORT_ENV) or "").strip()
+    if raw:
+        return os.path.abspath(os.path.expanduser(raw)), "env"
+    return os.path.join(str(paths.state_dir()), EXPORT_FILE), "default"
+
+
+def resolve_parent(arg):
+    """(parent_task_id or None, note or None) for a new task: start_task's parent_task_id (validated: a bad one is
+    refused), else CORTADOS_PARENT_TASK_ID when the launching session sets it (a malformed one is ignored, with a
+    note: it must not block every start_task)."""
+    if arg is not None:
+        if not isinstance(arg, str) or not TASK_ID_RE.fullmatch(arg):
+            raise TaskError("parent_task_id must be a task id (t<14 digits>-<8 hex>)")
+        return arg, None
+    env = (os.environ.get(PARENT_ENV) or "").strip()
+    if not env:
+        return None, None
+    if TASK_ID_RE.fullmatch(env):
+        return env, None
+    return None, f"{PARENT_ENV} is set but is not a task id; the parent is recorded as missing"
+
+
+def _start_redactor(red, env=None) -> "Redactor":
+    """Every credential a new task can know of at start: `red`'s (the caller's env token and token file), this
+    process's (launch env, host token env and file) and, once it exists, the child's launch env (LAUNCH_TOKEN_KEYS).
+    Caller text is redacted, or refused, with this before meta.json holds it (#91 review round 2, P1)."""
+    toks = set(red.raw if red is not None else ()) | set(launch_tokens(os.environ)) | set(_host_tokens())
+    if env is not None:
+        toks |= set(launch_tokens(env))
+    return Redactor([t for t in toks if len(t) >= MIN_TOKEN_LEN])
+
+
+def _refuse_credentials(red: "Redactor", fields: dict) -> None:
+    """Caller strings the task runs with (a path, a branch, a model, tool patterns, a session tag) cannot be redacted
+    without breaking the task, and would be stored in meta.json and exported: one that holds a credential is refused.
+    The message names the field only, never its value."""
+    for name, v in fields.items():
+        for x in (v if isinstance(v, list) else [v]):
+            if isinstance(x, str) and red.text(x) != x:
+                raise TaskError(f"{name} contains a provider credential; the task is refused (it would be stored in "
+                                "the task record and its run export)")
+
+
+class _Cap:
+    """For already-redacted export text: scrubs well-known secret shapes (SCRUB_PATTERNS, counted by type in
+    `scrubbed`), then caps it at EXPORT_TEXT_CHARS with a marker, counting every cut. Callers pass text only after the
+    known-value Redactor ran on it, so a known credential is masked as such, never reshaped by the scrub first."""
+
+    def __init__(self, limit=None):
+        self.limit = EXPORT_TEXT_CHARS if limit is None else limit
+        self.truncated = 0
+        self.scrubbed = {}
+
+    def _mark(self, kind: str) -> str:
+        self.scrubbed[kind] = self.scrubbed.get(kind, 0) + 1
+        return f"[scrubbed:{kind}]"
+
+    def _jwt(self, run: str) -> str:
+        """The JWTs (eyJ<4+>.eyJ<4+>.<sig>, the first part starting at a word boundary) in one dotted run of token
+        characters, each replaced by its marker. One pass over the run's parts: linear in its length."""
+        parts = run.split(".")
+        out, i = [], 0
+        while i < len(parts):
+            p = parts[i]
+            j = -1
+            if i + 2 < len(parts) and parts[i + 1].startswith("eyJ") and len(parts[i + 1]) >= 7:
+                k = p.find("eyJ")
+                while k != -1 and j == -1:
+                    if (k == 0 or p[k - 1] == "-") and len(p) - k >= 7:
+                        j = k
+                    else:
+                        k = p.find("eyJ", k + 1)
+            if j == -1:
+                out.append(p)
+                i += 1
+                continue
+            out.append(p[:j] + self._mark("jwt"))
+            i += 3                              # header, payload and signature are the one marker
+        return ".".join(out)
+
+    def _sub(self, kind: str, m) -> str:
+        if kind == "jwt":
+            return self._jwt(m.group(0))
+        if kind == "openai_key" and not any(c.isdigit() for c in m.group(0)[3:]):
+            return m.group(0)                   # sk-<run> with no digit: prose such as sk-learn-style, left alone
+        if m.lastindex:                         # the secret is group 1; the label before it stays readable
+            if _ALREADY_MASKED.fullmatch(m.group(1)):
+                return m.group(0)
+            return m.group(0)[:m.start(1) - m.start(0)] + self._mark(kind)
+        return self._mark(kind)
+
+    def scrub_one(self, kind: str, rx, s: str) -> str:
+        return rx.sub(lambda m: self._sub(kind, m), s)
+
+    def scrub(self, s: str) -> str:
+        for kind, rx in SCRUB_PATTERNS:
+            s = self.scrub_one(kind, rx, s)
+        return s
+
+    def _keyed(self, key, v: str):
+        """A value under an Authorization-like key is a credential whatever its shape: scrubbed whole."""
+        if isinstance(key, str) and key.lower() in SCRUB_KEYS and v and not _ALREADY_MASKED.fullmatch(v):
+            return self._mark("authorization")
+        return None
+
+    def scrub_tree(self, v, key=None):
+        if isinstance(v, str):
+            keyed = self._keyed(key, v)
+            return keyed if keyed is not None else self.scrub(v)
+        if isinstance(v, list):
+            return [self.scrub_tree(x) for x in v]
+        if isinstance(v, dict):
+            return {self.scrub(str(k)): self.scrub_tree(x, str(k)) for k, x in v.items()}
+        return v
+
+    def cut(self, s: str, total=None) -> str:
+        """s capped at the limit; `total` is the length of the text s was taken from (text() scrubs only a prefix)."""
+        total = max(len(s), total or 0)
+        if total <= self.limit:
+            return s
+        self.truncated += 1
+        return s[:self.limit] + f"\n[truncated by cortados: {total - self.limit} of {total} characters cut]"
+
+    def text(self, s: str) -> str:
+        """Scrubbed, then capped. Only the first limit + SCRUB_SLACK_CHARS characters are scrubbed: the rest is cut
+        anyway, and the slack still catches a secret that straddles the cut. When the prefix was cut and the scrub
+        shrank it, its trailing run of token characters goes too: it may be a secret's start, too short for its
+        pattern, that the shrink moved in front of the cap (#91 review round 3, P2)."""
+        n, end = len(s), self.limit + SCRUB_SLACK_CHARS
+        head = self.scrub(s[:end])
+        if n > end and len(head) < end:
+            head = head.rstrip(_TOKEN_CHARS)
+        return self.cut(head, n)
+
+    def tree(self, v, key=None):
+        if isinstance(v, str):
+            keyed = self._keyed(key, v)
+            return keyed if keyed is not None else self.text(v)
+        if isinstance(v, list):
+            return [self.tree(x) for x in v]
+        if isinstance(v, dict):
+            return {self.text(str(k)): self.tree(x, str(k)) for k, x in v.items()}
+        return v
+
+
+def _home_relative(p):
+    """An absolute path under $HOME as ~/...: the export carries no home directory beyond that."""
+    if not isinstance(p, str):
+        return p
+    home = os.path.expanduser("~")
+    if home and home != "/" and (p == home or p.startswith(home.rstrip("/") + "/")):
+        return "~" + p[len(home.rstrip("/")):]
+    return p
+
+
+def _export_events(path: str, red: "Redactor", cap):
+    """(events, counts, extra_withheld, dropped) from a REDACTED stdout.log: assistant text, tool_use (name + input),
+    tool_result (content as text, is_error) and the result record, in stream order. Each record is redacted again
+    (redact_record, the runner's own rules) and only then capped. A line that does not parse, and the runner's
+    WITHHELD_EVENT, become a `withheld` event; a record the second pass withholds is counted in extra_withheld.
+    cap None: counts only, for logs that are withheld. Their content is then neither redacted, scrubbed nor kept (the
+    events come back empty), so withheld material costs one JSON parse per line and nothing else."""
+    events, counts = [], {}
+    extra = dropped = 0
+    try:
+        with open(path, encoding="utf-8", errors="replace", newline="") as f:
+            whole = f.read()
+    except FileNotFoundError:
+        return events, counts, 0, 0
+    try:
+        legacy = json.loads(whole) if whole.strip() else None
+    except (ValueError, RecursionError):
+        legacy = None
+    lines = [None] if isinstance(legacy, dict) else whole.split("\n")
+
+    kept = 0
+
+    def add(ev):
+        nonlocal dropped, kept
+        if kept >= EXPORT_MAX_EVENTS:
+            dropped += 1
+            return
+        kept += 1
+        if cap is not None:
+            events.append(ev)
+        counts[ev["type"]] = counts.get(ev["type"], 0) + 1
+
+    if cap is None:
+        def text_(_s):
+            return None
+
+        def tree(_v, key=None):
+            return None
+    else:
+        text_, tree = cap.text, cap.tree
+
+    for line in lines:
+        if line is None:
+            record = legacy
+        else:
+            body = line.rstrip("\r")
+            if not body.strip():
+                continue
+            try:
+                record = json.loads(body)
+            except (ValueError, RecursionError):
+                extra += 1                       # never redacted structurally (no credential to redact with): not shown
+                add({"type": "withheld"})
+                continue
+        if isinstance(record, dict) and record.get("type") == "cortados_withheld":
+            add({"type": "withheld"})            # the runner withheld it (already counted in redact_unparsed_lines)
+            continue
+        if cap is None:
+            cleaned, n = record, 0               # counted, never shown: nothing to redact
+        else:
+            try:
+                cleaned, n = redact_record(red, record)
+            except (ValueError, RecursionError):
+                cleaned, n = redact.WITHHELD, 1
+        extra += n
+        if not isinstance(cleaned, dict):
+            if cleaned == redact.WITHHELD:
+                add({"type": "withheld"})
+            continue
+        kind = cleaned.get("type")
+        if kind == "result":
+            t = cleaned.get("result")
+            add({"type": "result", "subtype": cleaned.get("subtype"), "is_error": cleaned.get("is_error"),
+                 "num_turns": cleaned.get("num_turns"), "text": text_(t) if isinstance(t, str) else None})
+            continue
+        message = cleaned.get("message")
+        content = message.get("content") if isinstance(message, dict) and kind in ("assistant", "user") else None
+        for b in content if isinstance(content, list) else []:
+            if not isinstance(b, dict):
+                continue
+            if kind == "assistant" and b.get("type") == "text" and isinstance(b.get("text"), str):
+                add({"type": "text", "text": text_(b["text"])})
+            elif kind == "assistant" and b.get("type") == "tool_use":
+                add({"type": "tool_use", "id": tree(b.get("id")), "name": text_(str(b.get("name") or "?")),
+                     "input": tree(b.get("input"))})
+            elif kind == "user" and b.get("type") == "tool_result":
+                c = b.get("content")
+                ev = {"type": "tool_result", "tool_use_id": tree(b.get("tool_use_id")), "is_error": b.get("is_error") is True,
+                      "content": text_(_result_text(b)) if cap is not None else None}
+                if isinstance(c, list):
+                    other = sum(1 for p in c if not (isinstance(p, dict) and isinstance(p.get("text"), str)))
+                    if other:
+                        ev["omitted_parts"] = other  # images and other non-text parts are not exported
+                add(ev)
+    return events, counts, extra, dropped
+
+
+def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_run) -> dict:
+    """The export record of a finished task (schema EXPORT_SCHEMA). Prompt and logs are read only when they are
+    marked redacted with the launch credentials (`prompt_redacted` / `logs_redacted`, by the runner or a recovery
+    that proved the launch fingerprints), or when `red` itself provably covers the launch credentials (then it
+    redacts them here); otherwise they are withheld (`withheld_reason`; event counts and the run's metadata stay).
+    `red` alone is never trusted with unredacted material: after a rotation it no longer knows the old token.
+    The caller-supplied text in meta (title, client, cwd, workspace names, ...: EXPORT_CALLER_TEXT) follows the same
+    rule: included when meta.json is marked META_TEXT_MARK (start_task redacted it, or refused the task, with the
+    launch credentials) or `red` covers the launch ones, else null and named in `withheld_fields`.
+    The caller encodes it; nothing here is the raw stdout.log."""
+    cap = _Cap()
+    tid = os.path.basename(d)
+    covered = launch_covered(meta, red)
+    logs = (not res.get("redact_error") and not res.get("logs_unredacted")
+            and (res.get("logs_redacted") is True or covered))
+    prompt_ok = res.get("prompt_redacted") is True or covered
+    # Caller text (title, client, cwd, workspace names, ...): the same rule as prompt and logs. It is only ever
+    # redacted here with `red`, which after a rotation no longer knows the old token (#91 review round 2, P1).
+    text_ok = covered or meta.get(META_TEXT_MARK) is True
+    started, ended = meta.get("started_at"), res.get("ended_at")
+    parent = meta.get("parent_task_id")
+    parent = parent if isinstance(parent, str) and TASK_ID_RE.fullmatch(parent) else None
+    ws = res.get("workspace") if isinstance(res.get("workspace"), dict) else None
+    ws_fallback = ws is None                    # workspace.json / meta: never redacted with the launch credentials
+    if ws_fallback:
+        ws = _read_json(os.path.join(d, WORKSPACE_FILE))
+        if not isinstance(ws, dict):
+            ws = meta.get("workspace") if isinstance(meta.get("workspace"), dict) else None
+    act = res.get("activity") if isinstance(res.get("activity"), dict) else {}
+    # Metadata: ids, names, flags and the provider's run record; redacted as text (a title such as "[WIP] x" is not
+    # JSON to decode), never capped.
+    head = {
+        "task_id": tid, "parent_task_id": parent, "parent": "known" if parent else "missing",
+        **({"parent_note": meta["parent_note"]} if meta.get("parent_note") else {}),
+        "title": meta.get("title"), "host": meta.get("host"), "client": meta.get("client"),
+        "state": classify(res), "exit_code": res.get("exit_code"), "cancelled": bool(res.get("cancelled")),
+        "timed_out": bool(res.get("timed_out")),
+        "started_at": started, "ended_at": ended,
+        "elapsed_s": round(ended - started, 1) if isinstance(started, (int, float)) and isinstance(ended, (int, float)) else None,
+        "cwd": _home_relative(meta.get("cwd")),
+        "workspace": {k: ws.get(k) for k in ("kind", "state", "repo", "branch", "reason") if ws.get(k) is not None} if ws else None,
+        "orchestrator": meta.get("orchestrator"), "permission_mode": meta.get("permission_mode"),
+        "effective_permission_mode": act.get("effective_permission_mode"),
+        "chrome": bool(meta.get("chrome")), "launch": meta.get("launch"),
+        **({"lane": meta.get("lane"), "model": meta.get("model")} if meta.get("lane") else {}),
+        "router_run": router_run if isinstance(router_run, dict) else None,
+        "tool_uses": act.get("tool_uses") or {}, "tool_errors": act.get("tool_errors") or 0,
+    }
+    error = res.get("error") or res.get("output_error") or res.get("redact_error")
+    if isinstance(error, str):
+        head["error"] = error
+    withheld_fields = []
+    if not text_ok:                             # dropped before any processing: nothing of it reaches the record
+        for k in EXPORT_CALLER_TEXT:
+            if head.get(k) is not None:
+                head[k] = None
+                withheld_fields.append(k)
+        for k in EXPORT_CALLER_WORKSPACE:
+            if isinstance(head.get("workspace"), dict) and head["workspace"].get(k) is not None:
+                head["workspace"][k] = None
+                withheld_fields.append("workspace." + k)
+    if ws_fallback and not covered and isinstance(head.get("workspace"), dict):
+        # Only `red` could redact it, and after a rotation it no longer knows the launch token (#91 review round 3, P2).
+        for k in EXPORT_CALLER_WORKSPACE:
+            if head["workspace"].get(k) is not None:
+                head["workspace"][k] = None
+                withheld_fields.append("workspace." + k)
+    extra = 0
+    error = head.pop("error", None)
+    head = cap.scrub_tree(red.tree(head))
+    if isinstance(error, str):
+        text, n = _text_result(red, error)
+        head["error"], extra = cap.text(text), extra + n
+    else:
+        head["error"] = None                    # always present: null when there is none or it is withheld
+    prompt = None
+    if logs and prompt_ok:
+        try:
+            with open(os.path.join(d, "prompt.txt"), encoding="utf-8", errors="replace") as f:
+                raw_prompt = f.read()
+        except FileNotFoundError:
+            raw_prompt = None
+        if raw_prompt is not None:
+            text, n = _text_result(red, raw_prompt)
+            prompt, extra = cap.text(text), extra + n
+    stdout = os.path.join(d, "stdout.log")
+    if logs:
+        events, counts, more, dropped = _export_events(stdout, red, cap)
+        extra += more
+    else:
+        # Counts only (event types): no content of it goes into the record, so none of it is redacted or scrubbed
+        # either (withheld material must not cost the export time, #91 review round 2, P2).
+        _, counts, _, dropped = _export_events(stdout, red, None)
+        events = []
+    reason = (EXPORT_FIELDS_WITHHELD if withheld_fields else None) if logs and prompt_ok else (
+              EXPORT_REDACT_FAILED if res.get("redact_error") else
+              EXPORT_LOGS_WITHHELD if not logs else EXPORT_PROMPT_WITHHELD)
+    unparsed = res.get("redact_unparsed_lines") or 0
+    return {"schema": EXPORT_SCHEMA, **head, "exported_at": round(time.time(), 3),
+            "logs": "included" if logs else EXPORT_LOGS_WITHHELD,
+            **({"withheld_reason": reason} if reason else {}),
+            **({"withheld_fields": withheld_fields} if withheld_fields else {}),
+            "prompt": prompt, "events": events, "event_counts": counts,
+            **({"events_dropped": dropped} if dropped else {}),
+            "redact_unparsed_lines": unparsed, "withheld": unparsed + extra, "truncated": cap.truncated,
+            "scrubbed": dict(sorted(cap.scrubbed.items()))}
+
+
+def _flock_wait(fd: int, wait_s: float) -> None:
+    end = time.monotonic() + wait_s
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= end:
+                raise TimeoutError("export lock busy") from None
+            time.sleep(0.05)
+
+
+def _open_private(path: str, flags: int, label: str, tightened: list) -> int:
+    """Open (creating 0600) an export file without following a symlink; it must be a regular file of this user. A
+    mode with any group/other bit is tightened to 0600 through the open fd (recorded in `tightened`); if that fails,
+    the file is refused."""
+    fd = os.open(path, flags | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise PermissionError(f"export {label} is not a regular file of this user")
+        if st.st_mode & 0o077:
+            os.fchmod(fd, 0o600)                # an OSError here refuses the file: never appended to while readable
+            tightened.append(label)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _export_dir(parent: str, kind: str, tightened: list) -> None:
+    """The default export dir is ours: a real directory of this user, exactly 0700 (tightened if looser). An override
+    (CORTADOS_TASK_EXPORT) names any directory, but never one that group or others can write (they could swap the
+    file or its sidecars)."""
+    if not os.path.isdir(parent):
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+    st = os.lstat(parent) if kind == "default" else os.stat(parent)
+    if not stat.S_ISDIR(st.st_mode):
+        raise PermissionError("the export directory is not a directory")
+    if kind == "default":
+        if st.st_uid != os.getuid():
+            raise PermissionError("the export directory is not owned by this user")
+        if stat.S_IMODE(st.st_mode) != 0o700:
+            os.chmod(parent, 0o700)             # makedirs' mode is masked by umask; an existing one may be looser
+            if st.st_mode & 0o077:
+                tightened.append("dir")
+    elif st.st_mode & 0o022:
+        raise PermissionError(f"the {EXPORT_ENV} directory is writable by group or others")
+
+
+def _exported_ids(fd: int, ids_fd: int) -> set:
+    """Task ids already in the export file (open as `fd`), from the sidecar <path>.ids (`ids_fd`); lines the sidecar
+    does not cover (a writer that died between the line and its id) are read from the file's tail and added to it.
+    Call under the lock."""
+    ids, end = set(), 0
+    with os.fdopen(os.dup(ids_fd), "rb") as f:
+        f.seek(0)
+        for row in f:
+            parts = row.decode("ascii", "replace").split()
+            if parts and TASK_ID_RE.fullmatch(parts[0]):
+                ids.add(parts[0])
+            if len(parts) > 1 and parts[1].isdigit():
+                end = int(parts[1])             # "-" rows only move the baseline (a rescanned tail with no ids)
+    size = os.fstat(fd).st_size
+    if size == end:
+        return ids
+    start = end if end < size else 0            # smaller: the file was replaced by its reader; rescan it whole
+    found = []
+    with os.fdopen(os.dup(fd), "rb") as f:
+        f.seek(start)
+        for line in f:
+            try:
+                tid = json.loads(line).get("task_id")
+            except (ValueError, RecursionError, AttributeError):
+                continue                        # a partial first line of the tail, or not ours
+            if isinstance(tid, str) and TASK_ID_RE.fullmatch(tid) and tid not in ids:
+                ids.add(tid)
+                found.append(tid)
+    _append_ids(ids_fd, found or [None], size)
+    return ids
+
+
+def _append_ids(ids_fd: int, tids, end: int) -> None:
+    os.write(ids_fd, "".join(f"{t or '-'} {end}\n" for t in tids).encode("ascii"))
+
+
+def append_export(line: bytes, task_id: str, lock_wait_s=None):
+    """Append one encoded record to the export file, once per task id. Returns (path_kind, already_there, tightened):
+    tightened names what had group/other permission bits and was set to 0600/0700 ("dir", "file", "lock", "ids").
+    lock_wait_s (prune's remaining budget) shortens the lock wait below EXPORT_LOCK_WAIT_S."""
+    path, kind = export_path()
+    tightened: list = []
+    _export_dir(os.path.dirname(path), kind, tightened)
+    lock = _open_private(path + ".lock", os.O_RDWR, "lock", tightened)
+    try:
+        _flock_wait(lock, EXPORT_LOCK_WAIT_S if lock_wait_s is None else max(0.0, min(EXPORT_LOCK_WAIT_S, lock_wait_s)))
+        fd = _open_private(path, os.O_RDWR | os.O_APPEND, "file", tightened)
+        try:
+            ids_fd = _open_private(path + ".ids", os.O_RDWR | os.O_APPEND, "ids", tightened)
+            try:
+                if task_id in _exported_ids(fd, ids_fd):
+                    return kind, True, tightened
+                st = os.fstat(fd)
+                if st.st_size and os.pread(fd, 1, st.st_size - 1) != b"\n":
+                    os.write(fd, b"\n")         # a torn line from a dead writer: ours starts on a line of its own
+                if os.write(fd, line) != len(line):
+                    raise OSError("short write to the export file")
+                _append_ids(ids_fd, [task_id], os.fstat(fd).st_size)
+                return kind, False, tightened
+            finally:
+                os.close(ids_fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(lock)                          # releases the flock
+
+
+def _export_task(d: str, meta: dict, res: dict, red: "Redactor", router_run, lock_wait_s=None) -> dict:
+    """Build, check and append the task's export record; returns the `export` status for result.json and logs
+    task_exported / task_export_failed. Never raises (the task's result stands); errors are recorded by type only."""
+    tid = os.path.basename(d)
+    try:
+        rec = build_export_record(d, meta, res, red, router_run)
+        line = json.dumps(rec, ensure_ascii=True, separators=(",", ":")) + "\n"
+        if red._re is not None and red._re.search(line):
+            raise _ExportLeak()                 # belt and braces: a credential spelling survived; write nothing
+        kind, already, tightened = append_export(line.encode("ascii"), tid, lock_wait_s)
+    except Exception as exc:
+        err = type(exc).__name__
+        log_event("task_export_failed", task_id=tid, error=err)
+        return {"ok": False, "at": round(time.time(), 3), "error": err}
+    extra = {**({"already": True} if already else {}), **({"tightened": tightened} if tightened else {})}
+    log_event("task_exported", task_id=tid, path_kind=kind, events=len(rec["events"]), logs=rec["logs"] == "included",
+              **extra)
+    return {"ok": True, "at": round(time.time(), 3), "path_kind": kind, **extra,
+            **({"logs_withheld": True} if rec["logs"] != "included" else {}),
+            **({"prompt_withheld": True} if rec["prompt"] is None
+               and rec.get("withheld_reason") not in (None, EXPORT_FIELDS_WITHHELD) else {}),
+            **({"fields_withheld": rec["withheld_fields"]} if rec.get("withheld_fields") else {})}
+
+
+def _export_locked(d: str, meta: dict, red: "Redactor", router_run, res=None, lock_wait_s=None):
+    """Export a finished task from outside its runner (status after a recovered task's logs were released, prune),
+    holding the task's runner.lock so it never races the runner's own export or a recoverer. Returns the export
+    status, or None when the lock is held (the runner is still finishing: it exports itself)."""
+    fd = None
+    try:
+        fd = os.open(os.path.join(d, "runner.lock"), os.O_RDWR)
+    except FileNotFoundError:
+        pass
+    if fd is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return None
+    try:
+        cur = _read_json(os.path.join(d, "result.json"))
+        if isinstance(cur, dict):
+            res = cur
+        if not isinstance(res, dict):
+            return None
+        if (res.get("export") or {}).get("ok"):
+            return res["export"]
+        res["export"] = _export_task(d, meta, res, red, router_run, lock_wait_s)
+        _write_json(os.path.join(d, "result.json"), res)
+        return res["export"]
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _current_redactor(red=None) -> "Redactor":
+    """This process's credentials (its launch env, the host's token env and file) plus `red`'s."""
+    toks = set(launch_tokens(os.environ)) | set(_host_tokens()) | set(red.raw if red is not None else ())
+    return Redactor([t for t in toks if len(t) >= MIN_TOKEN_LEN])
+
+
+def _runner_router_run(meta: dict, task_id: str) -> dict:
+    """The provider's run record, fetched by the runner with its own launch env (the provider forgets it on restart,
+    so it is taken while the run is fresh). A login-mode task never went through the provider."""
+    if meta.get("lane"):
+        return {"note": "login mode: not routed, no provider run record"}
+    return fetch_run(os.environ.get("ANTHROPIC_BASE_URL") or "", os.environ.get("ANTHROPIC_AUTH_TOKEN") or "", task_id)
 
 
 # --- runner (detached child process) -------------------------------------------------------------------------------
@@ -2449,6 +3155,15 @@ def _run(d: str, lock_fd=None) -> int:
             redact_file(os.path.join(d, name), red)
         except OSError as exc:
             result["redact_error"] = f"could not redact {name}: {type(exc).__name__}"
+    result["logs_redacted"] = not result.get("redact_error")
+    # The prompt too (in place: temp file 0600, atomic rename): a late export (status after a crash, prune after the
+    # credentials rotated) may only know other credentials, so nothing raw may stay for it to read (#91 review, P1).
+    try:
+        redact_file(os.path.join(d, "prompt.txt"), red)
+        result["prompt_redacted"] = True
+    except OSError as exc:
+        result["prompt_redacted"] = False
+        result["prompt_redact_error"] = f"could not redact prompt.txt: {type(exc).__name__}"
     raw = ""
     try:
         with open(os.path.join(d, "stdout.log"), encoding="utf-8", errors="replace") as f:
@@ -2476,6 +3191,13 @@ def _run(d: str, lock_fd=None) -> int:
     ws = _settle_workspace(d)
     if ws is not None:
         result["workspace"] = ws
+    # Free text of the result redacted on disk with the launch credentials too: a late export only knows the
+    # credentials of its own time (#91 review round 2, P1).
+    for k in ("error", "output_error", "activity_error"):
+        if isinstance(result.get(k), str):
+            result[k] = red.text(result[k])
+    if isinstance(result.get("workspace"), dict):
+        result["workspace"] = red.tree(result["workspace"])
     result["ended_at"] = time.time()
     final = classify(result)
     started = spec.get("started_at")
@@ -2484,6 +3206,18 @@ def _run(d: str, lock_fd=None) -> int:
         timed_out=bool(result.get("timed_out")),
         duration_s=round(result["ended_at"] - started, 1) if isinstance(started, (int, float)) else None)
     _write_json(os.path.join(d, "result.json"), result)
+    # The run export (#91): only now, with the logs redacted and result.json final, and still under the task lock (so
+    # no status call or prune exports it in parallel). Its outcome is added to result.json; a failure is retried by
+    # prune, which never deletes an unexported task.
+    try:
+        meta = _read_json(os.path.join(d, "meta.json")) or {}
+    except RecordError:
+        meta = {}
+    result["export"] = _export_task(d, meta, result, red, _runner_router_run(meta, os.path.basename(d)))
+    try:
+        _write_json(os.path.join(d, "result.json"), result)
+    except OSError:
+        pass                                    # the export line stands; prune finds it by id and marks it then
     os.close(lock_fd)                           # release only after result.json exists
     return 0
 
@@ -2554,7 +3288,7 @@ def serve_remote(stdin=None, stdout=None) -> int:
                         args.get("permission_mode") or None, args.get("allowed_tools"), "", None,
                         args.get("chrome", False), red, args.get("connectors"), client=args.get("client"),
                         title=args.get("title"), session_tag=args.get("session_tag"), repo=args.get("repo"),
-                        branch=args.get("branch"), host=host.name)
+                        branch=args.get("branch"), host=host.name, parent_task_id=args.get("parent_task_id"))
         elif op == "status":
             out = status(args.get("task_id"), red, url, token)
         elif op == "wait":

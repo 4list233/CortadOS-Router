@@ -644,7 +644,8 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   both (the full message still goes to the client in the error response).
   `task_status` shows the last one as `provider_refusal` (and a `hint` for a 413).
 - State: `~/.config/cortados/tasks/<task_id>/` (0700; logs, `result.json`). The token-bearing settings file is deleted
-  when the child exits; finished task dirs older than 14 days are pruned on the next `start_task`. A task record that
+  when the child exits; finished task dirs older than 14 days are pruned on the next `start_task`, once their run
+export succeeded (see "Task run export" below). A task record that
   exists but cannot be read (corrupt `meta.json` / `result.json`) never blocks `start_task` or `list_tasks`: it is
   skipped, logged to `child-tasks.jsonl` as `record_unreadable` (id, file, exception type; never content), reported
   in `start_task`'s `prune_errors` and shown by `list_tasks` as an `unreadable` row — and it is never pruned
@@ -670,6 +671,81 @@ run, 512 runs) and forgotten on a provider restart. Each lifecycle event (`start
 and duration, `cancelled`) is also appended as one JSON line to `$CORTADOS_HOME/child-tasks.jsonl` (default
 `~/.cortados`): task id, cwd, orchestrator, permission mode, chrome flag, status and timings; never the prompt or a
 secret.
+
+### Task run export (Grounds capture)
+
+Each finished child task (any terminal state) is exported as one JSON line for another system (Grounds) to capture
+(#91). The export is written by the task runner, outside the child; the child's isolation is unchanged.
+
+- Path: `$CORTADOS_HOME/exports/task-runs.jsonl` on the execution host the task ran on (dir 0700, file 0600), or the
+  file named by `CORTADOS_TASK_EXPORT`. A remote task is exported on its host; `task_status` shows its `export`
+  field. There is no network handoff: Grounds reads the file.
+- Schema `cortados.task-run/1`, one object per line: `task_id`, `parent_task_id` plus `parent` (`known`, or the
+  explicit marker `missing` when no parent is known; the parent comes from `start_task`'s optional `parent_task_id`, else
+  `CORTADOS_PARENT_TASK_ID` in the launching session, validated as a task id), `title`, `host`, `client`, `state`,
+  `exit_code`, `cancelled`, `timed_out`, `started_at` / `ended_at` / `elapsed_s`, `cwd` (home shown as `~`),
+  `workspace` (kind, state, repo, branch, reason; no path), `orchestrator`, `permission_mode`,
+  `effective_permission_mode`, `chrome`, `launch`, `lane` / `model` (login mode), `router_run` (model, label, provider
+  with account alias such as `claude-cli#b`, models, builder_models, refusals; fetched by the runner while the
+  provider still holds it, else a note or an error field), `tool_uses`, `tool_errors`, `error`, `prompt`, `events` in
+  stream order (`text`, `tool_use` with name and input, `tool_result` with content as text, `is_error` and
+  `omitted_parts` for non-text parts, `withheld`, and `result` with the final text), `event_counts`,
+  `events_dropped` (past 2000 events), `redact_unparsed_lines` (what the runner's redaction withheld), `withheld`
+  (that plus anything the export's own pass withheld), `truncated` (fields cut), `scrubbed` (pattern-scrub matches by
+  type, below), `logs` (`included` or why withheld), `withheld_reason` (only when prompt, events or caller fields are
+  withheld), `withheld_fields` (only when caller fields are, below), `exported_at`.
+- Finalized and redacted: the line is written only after the run's logs were redacted and `result.json` is final.
+  The runner redacts `stdout.log`, `stderr.log` and `prompt.txt` in place (temp file 0600, atomic rename) with the
+  exact launch credentials before it writes the final `result.json`, and records `logs_redacted` / `prompt_redacted`
+  there. Every text then goes through the Redactor that produced `result.json` and the pattern scrub, in that order,
+  before it is capped at 32,000 characters per field (the cut is marked `[truncated by cortados: N of M characters
+  cut]` and counted). A line that still matches a current credential is not written; that check knows only the
+  credentials of the export's own time, so it is no protection against a token that has rotated since (the rules
+  below are). Raw `stdout.log` content is never written.
+- Caller text: `start_task` checks what the caller supplies against every credential it knows, including the child's
+  launch credentials, before `meta.json` exists. A label (the title, the client name, the Office tags) is redacted
+  there; a value the task runs with (`cwd`, `repo`, `branch`, the orchestrator, `allowed_tools`, the session tag) that
+  holds a credential is refused, naming the field, never the value. `meta.json` is then marked `caller_text_redacted`,
+  and the runner redacts `result.json`'s error and workspace text with the launch credentials too. A task started for
+  another execution host is checked the same way on this machine before the request leaves (the host knows only its
+  own credentials): labels and the task prompt are redacted, a value the task runs with is refused.
+- A late export (a status call after the runner died, or the cleanup retry) reads prompt and logs only when they are
+  marked redacted, or when the current credentials provably include the launch ones (sha256 fingerprints in
+  `meta.json`); it never redacts raw material with credentials that may have rotated since. Otherwise the record goes
+  out with `prompt: null`, no events and a `withheld_reason`, keeping the metadata and `event_counts`. The caller
+  fields (`title`, `client`, `cwd`, `orchestrator`, `model`, `error`, `parent_note`, the workspace's `repo`, `branch`
+  and `reason`) follow the same rule: without the `caller_text_redacted` mark (a task started before it existed) and
+  without matching credentials they are null and listed in `withheld_fields`. A workspace read from `workspace.json`
+  or `meta.json` (no workspace in `result.json`) was never redacted with the launch credentials: its `repo`,
+  `branch` and `reason` are included only with matching credentials. `error` is always present, null when there is
+  none or it is withheld. Withheld logs are only counted: they
+  are parsed for `event_counts`, never redacted, scrubbed or kept. A runner that
+  died before redaction: its task is exported by the first status call that can release its logs, else just before
+  cleanup with them withheld.
+- Best-effort pattern scrub, export only: after the known-value redaction, `Authorization:` / `Proxy-Authorization:`
+  header values (and a value under such a key in a tool input), `Bearer <token>`, and the shapes `sk-…`, `sk-ant-…`,
+  `ghp_`/`gho_`/`ghs_`/`github_pat_…`, `xox[abpr]-…`, `AKIA…`, `-----BEGIN … PRIVATE KEY-----` blocks and JWTs
+  (`eyJ….eyJ….…`) become `[scrubbed:<type>]`, counted in `scrubbed`. The patterns run in linear time on any input
+  (bounded quantifiers; a run of token characters is matched once, and a key's digit or a JWT's dotted parts are
+  checked on that match), and only the first 32,000 + 4,096 characters of a field are scrubbed: the rest is cut, and
+  the slack still catches a secret that straddles the cut. This is best effort, not a guarantee: the
+  known-value redaction covers only the provider credentials (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`,
+  `CORTADOS_PROVIDER_TOKEN`), and any other secret of another shape passes. **The export holds far more than
+  `result.json`: the full prompt and every tool input and result (file contents, command output, fetched pages) up
+  to the field cap.** Treat the file as you would the task's workspace.
+- Append-only, written once: one `os.write` of the whole line under an `flock` on `<file>.lock`, so concurrent
+  runners never interleave. The file, the lock and the index are opened without following symlinks and must be
+  regular files of this user; one with group/other permission bits is set to 0600 first (or refused if that fails),
+  and the default directory to 0700; each tightening is listed in the outcome's `tightened`. A
+  `CORTADOS_TASK_EXPORT` file in a directory that group or others can write is refused. The file is never rewritten or truncated by the router. A sidecar `<file>.ids` (same
+  lock) holds the exported task ids, so a retry never appends a task twice.
+- Outcome: `result.json` gets `export: {"ok": true, "at", "path_kind": "default"|"env"}` (plus `tightened`,
+  `logs_withheld`, `prompt_withheld` when they apply) or
+  `{"ok": false, "error": "<exception type>"}`; `child-tasks.jsonl` gets `task_exported` / `task_export_failed`.
+- Never pruned unexported: the 14-day cleanup first retries a failed export (up to 10 per `start_task`, all within one
+  5 s budget that includes the export-lock waits, so a stuck lock cannot hold `start_task`; the rest wait for the next
+  start). A task whose export still fails or was not retried is kept, reported in `start_task`'s `prune_errors` and
+  logged as `task_kept_unexported`.
 
 Claude desktop app (`claude_desktop_config.json`, under `mcpServers`):
 
