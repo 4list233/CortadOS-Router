@@ -158,7 +158,7 @@ class NightlyEndToEnd(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.s1 = self.tmp / "repo" / "s1"
         (self.s1 / "data").mkdir(parents=True)
-        for name in ("nightly.sh", "nightly_state.py", "common.py"):     # nightly_state counts labels with common's teacher filter
+        for name in ("nightly.sh", "nightly_state.py", "common.py", "sweep_request.py"):   # nightly_state counts labels with common's teacher filter
             shutil.copy(S1 / name, self.s1 / name)
         for name in ("cortados_router", "tables"):                         # common.py loads the router's question set
             (self.tmp / "repo" / name).symlink_to(S1.parent / name)
@@ -684,6 +684,7 @@ PY
     # --- calibration sweep request (s1/calibrate.py): FIRST in an in-window cycle (#74; more in tests/test_s1_sweep_first.py) ---
     CALIBRATE_STUB = (
         "import sys\n"
+        "if '--check-done' in sys.argv: sys.exit(0)\n"     # the completion check: no finished sweep, run it
         "open('data/sweep-count', 'a').write('x')\n"
         "open('data/sweep-args', 'w').write(' '.join(sys.argv[1:]))\n"
         "print('sweep: 4 settings; chosen on teacher: cand-t0.1; would promote: False')\n"
@@ -1534,14 +1535,15 @@ sys.exit(child.returncode)
 # calibrate.py stand-in: long sleep when STUB_CAL_SLEEP is set (the sweep a stop interrupts), exit STUB_CAL_RC when set (a failed
 # sweep), else a finished sweep line
 CALIBRATE_STUB = ("import os, sys, time\n"
+                  "if '--check-done' in sys.argv: print('sweep check: no finished sweep'); sys.exit(0)\n"   # ungated, no model
                   "if os.environ.get('STUB_CAL_SLEEP'): time.sleep(float(os.environ['STUB_CAL_SLEEP']))\n"
                   "if os.environ.get('STUB_CAL_RC'): print('calibrate failed'); sys.exit(int(os.environ['STUB_CAL_RC']))\n"
                   "print('sweep: 2 settings')\n")
 
-# python3 wrapper put first on PATH: when nightly.sh parses the sweep request (`python3 - data/sweep-request.json`) it marks
-# the moment and holds, so the test can deliver TERM during parsing, before the launch.
+# python3 wrapper put first on PATH: when nightly.sh validates the sweep request (`python3 -B ./sweep_request.py validate
+# data/sweep-request.json`) it marks the moment and holds, so the test can deliver TERM during parsing, before the launch.
 PARSE_HOOK = """#!/bin/bash
-if [ "$1" = - ] && [ "${2:-}" = data/sweep-request.json ] && [ -n "${STUB_PARSE_MARK:-}" ]; then
+if [ "$*" = "-B ./sweep_request.py validate data/sweep-request.json" ] && [ -n "${STUB_PARSE_MARK:-}" ]; then
   touch "$STUB_PARSE_MARK"; /bin/sleep 2
 fi
 exec "$SWEEP_REAL_PY" "$@"

@@ -18,6 +18,8 @@ S1 = Path(__file__).resolve().parents[1] / "s1"
 sys.path.insert(0, str(S1))
 
 import calibrate as cal  # noqa: E402
+import common  # noqa: E402
+import sweep_request as sr  # noqa: E402
 import evaluate as ev  # noqa: E402
 from common import QUESTIONS, core  # noqa: E402
 from student import N_OPTIONS, decode  # noqa: E402
@@ -144,6 +146,56 @@ class ResumableSweep(SweepFixture, unittest.TestCase):
         self.sweep(f)
         self.assertEqual([a for a, _ in f.calls].count(Path(self.cand).name), 2)
 
+    def test_a_torn_last_line_survives_two_restarts(self):
+        with self.assertRaises(Interrupted):
+            self.sweep(Fleet(fail_after=self.ROWS + 2))           # live done, 2 candidate rows
+        scores = self.run / "sweep/cand/scores.jsonl"
+        scores.write_text(scores.read_text() + '{"k": "h:r2:abc", "p": {"answ')   # a kill mid-write
+        with self.assertRaises(Interrupted):
+            self.sweep(Fleet(fail_after=1))                      # restart 1: one more candidate row, then stopped again
+        self.assertTrue(scores.read_text().endswith("\n"))
+        self.assertNotIn('"p": {"answ{', scores.read_text(), "the next record was not glued onto the fragment")
+        f = Fleet()
+        self.sweep(f)                                            # restart 2: the row scored on restart 1 is still cached
+        self.assertEqual([a for a, _ in f.calls].count(Path(self.cand).name), 1)
+
+    def _live(self, cfg='{"lora_parameters": {"scale": 20}}'):
+        live = self.tmp / "live"
+        live.mkdir(exist_ok=True)
+        (live / "adapter_config.json").write_text(cfg)
+        (live / "adapters.safetensors").write_text("L")
+        return str(live)
+
+    def test_adapter_config_change_invalidates_exactly_the_versions_built_from_it(self):
+        live = self._live()
+        self.sweep(Fleet(), live=live)
+        (self.cand / "adapter_config.json").write_text('{"lora_parameters": {"scale": 10}}')   # other LoRA scale, same weights
+        f = Fleet()
+        self.sweep(f, live=live)
+        self.assertNotIn("live", f.loads)
+        self.assertEqual(len(f.calls), self.ROWS * (self.VERSIONS - 1))
+        stale = list((self.run / "sweep/cand").glob("stale-*"))
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(sorted(p.name for p in stale[0].iterdir()), ["scores.done", "scores.jsonl", "scores.meta.json"])
+        self._live('{"lora_parameters": {"scale": 16}}')
+        f = Fleet()
+        self.sweep(f, live=live)
+        self.assertEqual(sorted(set(f.loads)), ["blend0.7", "live"])   # the blend reads the live adapter; cand / scale do not
+
+    def test_validation_change_refits_the_candidate_versions_and_moves_their_temps_aside(self):
+        self.sweep(Fleet(), fit_identity={"valid": "A"})
+        temps = self.run / "sweep/cand/temps.json"
+        temps.write_text(json.dumps({"valid": "A", "T": {"all": 2.0}}))
+        f = Fleet()
+        self.sweep(f)
+        self.assertEqual(len(f.calls), self.ROWS * (self.VERSIONS - 1))   # dropping / changing the key also invalidates
+        f = Fleet()
+        self.sweep(f, fit_identity={"valid": "B"})
+        self.assertNotIn("live", f.loads, "the live adapter's temperatures are the pointer's: the validation rows do not touch it")
+        self.assertEqual(len(f.calls), self.ROWS * (self.VERSIONS - 1))
+        self.assertFalse(temps.exists())
+        self.assertTrue(any((d / "temps.json").exists() for d in (self.run / "sweep/cand").glob("stale-*")), "moved, not deleted")
+
     def test_changed_identity_starts_the_version_over(self):
         self.sweep(Fleet())
         f = Fleet()
@@ -202,8 +254,15 @@ class ResumableSweep(SweepFixture, unittest.TestCase):
             temps = self.tmp / "v/temps.json"
             self.assertEqual(make(str(self.cand), temps).T, {"all": 2.0})
             self.assertEqual(make(str(self.cand), temps).T, {"all": 2.0})
-        self.assertEqual(len(fits), 1)
-        self.assertEqual(json.loads(temps.read_text()), {"all": 2.0})
+            self.assertEqual(len(fits), 1)
+            self.assertEqual(json.loads(temps.read_text()), {"valid": cal.data_hash([]), "T": {"all": 2.0}})
+            other = cal.scorer_factory(live=str(live), base="b", valid=[({"id": "v1"}, [])],
+                                       pointer={"adapter": str(live), "base": "b"})
+            other(str(self.cand), temps)                           # other validation rows: refitted, not reused
+            self.assertEqual(len(fits), 2)
+            temps.write_text(json.dumps({"all": 3.0}))             # the unkeyed format of the first version: refitted
+            make(str(self.cand), temps)
+            self.assertEqual(len(fits), 3)
 
 
 class CandidateResolution(unittest.TestCase):
@@ -258,6 +317,29 @@ class CandidateResolution(unittest.TestCase):
         self.touch("adapters.safetensors")
         self.assertEqual(cal.candidate_view(self.dir, self.dir / "adapters.safetensors", self.run / "x"), self.dir)
 
+    def test_checkpoint_symlink_leaving_the_run_is_refused(self):
+        outside = self.run.parent.parent / "elsewhere_adapters.safetensors"
+        outside.write_text("someone else's weights")
+        (self.dir / "0001500_adapters.safetensors").symlink_to(outside)
+        with self.assertRaisesRegex(cal.CandidateError, "outside the candidate adapter dir"):
+            cal.resolve_candidate(self.dir)
+        with self.assertRaises(cal.CandidateError):
+            cal.candidate_view(self.dir, self.dir / "0001500_adapters.safetensors", self.run / "sweep/cand-weights")
+        self.assertFalse((self.run / "sweep").exists())
+        with mock.patch("builtins.print", lambda *a, **k: None):
+            rc = cal.main(["--candidate", str(self.dir), "--live", "x", "--out", str(self.run / "sweep.json")])
+        self.assertEqual(rc, cal.EXIT_REFUSED)
+        self.assertFalse((self.run / "sweep").exists())
+
+    def test_checkpoint_symlink_onto_the_warm_start_copy_is_refused(self):
+        self.touch("0000000_adapters.safetensors")
+        (self.dir / "0001500_adapters.safetensors").symlink_to(self.dir / "0000000_adapters.safetensors")
+        with self.assertRaisesRegex(cal.CandidateError, "warm-start copy"):
+            cal.resolve_candidate(self.dir)
+        (self.dir / "adapters.safetensors").symlink_to(self.dir / "0000000_adapters.safetensors")
+        with self.assertRaisesRegex(cal.CandidateError, "warm-start copy"):
+            cal.resolve_candidate(self.dir)
+
     def test_main_refuses_with_exit_4_before_loading_anything(self):
         out = []
         with mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
@@ -269,6 +351,116 @@ class CandidateResolution(unittest.TestCase):
     def test_cli_default_has_no_extra_scales(self):
         self.assertEqual([n for n, _ in cal.variants_for([1.0, 0.85, 0.7, 0.5], [])],
                          ["live", "cand", "blend0.85", "blend0.7", "blend0.5"])    # the request's 24 configs: 5 passes
+
+
+class CheckDone(SweepFixture, unittest.TestCase):
+    """calibrate.py --check-done (nightly.sh's "already complete"): 10 only for a sweep.json whose input fingerprint equals
+    what the same arguments give now; reads files only."""
+
+    def setUp(self):
+        super().setUp()
+        self.valid = [({"id": "v1", "request": "val1", "unit_kind": "interactive", "split": "train"}, [{"q": 1}])]
+        self.live = self.tmp / "live"
+        self.live.mkdir()
+        (self.live / "adapter_config.json").write_text("{}")
+        (self.live / "adapters.safetensors").write_text("L")
+        self.pointer = self.tmp / "current.json"
+        self.pointer.write_text(json.dumps({"adapter": str(self.live), "base": "b", "temperatures": {"all": 1.0}}))
+
+    def main(self, *extra):
+        argv = ["--candidate", str(self.cand), "--live", str(self.live), "--out", str(self.run / "sweep.json"), "--base", "b",
+                "--tilts", "0", "0.1", "--alphas", "1.0", "0.7", "--fail-up", "0.6", *extra]
+        with mock.patch.object(common, "read_jsonl", lambda p: []), mock.patch.object(common, "read_labels", lambda: []), \
+                mock.patch.object(ev, "build_eval_sets", lambda reqs, labels: (self.holdout, self.valid)), \
+                mock.patch.object(ev, "outcome_holdout", lambda: self.o_holdout), \
+                mock.patch.object(ev, "current_pointer", lambda: self.pointer), \
+                mock.patch.object(cal, "scorer_factory", lambda **kw: Fleet()), \
+                mock.patch.object(cal, "blend_adapters", fake_blend), mock.patch("builtins.print", lambda *a, **k: None):
+            return cal.main(list(argv))
+
+    def check(self, *extra):
+        return self.main("--check-done", *extra)
+
+    def test_only_a_sweep_of_exactly_these_inputs_is_complete(self):
+        self.assertEqual(self.check(), 0, "no sweep.json yet")
+        self.assertEqual(self.main(), 0)
+        self.assertIsInstance(json.loads((self.run / "sweep.json").read_text())["fingerprint"], dict)
+        snapshot = sorted(str(p) for p in self.tmp.rglob("*"))
+        self.assertEqual(self.check(), cal.EXIT_ALREADY_DONE)
+        self.assertEqual(sorted(str(p) for p in self.tmp.rglob("*")), snapshot, "--check-done writes nothing")
+
+        def stale(change, undo, why):
+            change()
+            with self.subTest(why):
+                self.assertEqual(self.check(), 0, why)
+            undo()
+            self.assertEqual(self.check(), cal.EXIT_ALREADY_DONE, f"undone: {why}")
+
+        w = self.cand / "0001500_adapters.safetensors"
+        st = w.stat()
+
+        def rewrite(text):          # same size and the old mtime: only the content hash can tell
+            w.write_text(text)
+            os.utime(w, ns=(st.st_atime_ns, st.st_mtime_ns))
+        stale(lambda: rewrite("v"), lambda: rewrite("w"), "candidate weights rewritten (same size, same mtime)")
+        new = self.cand / "0002000_adapters.safetensors"
+        stale(lambda: new.write_text("w"), new.unlink, "the candidate run advanced to a later checkpoint")
+        cfg = self.cand / "adapter_config.json"
+        stale(lambda: cfg.write_text('{"x": 1}'), lambda: cfg.write_text("{}"), "candidate adapter_config.json changed")
+        lcfg = self.live / "adapter_config.json"
+        stale(lambda: lcfg.write_text('{"x": 1}'), lambda: lcfg.write_text("{}"), "live adapter_config.json changed")
+        row = ({"id": "r9", "request": "req9", "unit_kind": "interactive"}, self.holdout[0][1])
+        stale(lambda: self.holdout.append(row), self.holdout.pop, "holdout changed")
+        orow = ({"id": "o2", "request": "out2", "unit_kind": "interactive"}, "R1")
+        stale(lambda: self.o_holdout.append(orow), self.o_holdout.pop, "outcome holdout changed")
+        vrow = ({"id": "v2", "request": "val2", "unit_kind": "interactive", "split": "train"}, [{"q": 0}])
+        stale(lambda: self.valid.append(vrow), self.valid.pop, "validation rows changed")
+        ptr = self.pointer.read_text()
+        stale(lambda: self.pointer.write_text(ptr.replace("1.0", "1.5")), lambda: self.pointer.write_text(ptr),
+              "live pointer temperatures changed")
+        p = mock.patch.object(ev, "OUTWARD_AT", ev.OUTWARD_AT + 0.1)
+        stale(p.start, p.stop, "outward threshold changed")
+        with self.subTest("fail-up threshold changed"):
+            self.assertEqual(self.check("--fail-up", "0.7"), 0)
+        with self.subTest("request changed"):
+            self.assertEqual(self.check("--scales", "0.5"), 0)
+        v = mock.patch.object(cal, "CALIBRATE_VERSION", cal.CALIBRATE_VERSION + 1)
+        stale(v.start, v.stop, "calibrate.py version changed")
+
+    def test_a_sweep_json_without_a_fingerprint_is_not_complete(self):
+        self.main()
+        out = self.run / "sweep.json"
+        old = json.loads(out.read_text())
+        old.pop("fingerprint")
+        out.write_text(json.dumps(old))                     # written before fingerprints existed; request and live match
+        self.assertEqual(self.check(), 0)
+
+
+class RequestValidation(unittest.TestCase):
+    def argv(self, **r):
+        return sr.validate({"candidate": "runs/c/adapter", "live": "runs/l/adapter", **r})
+
+    def test_valid_request_gives_the_calibrate_argv(self):
+        self.assertEqual(self.argv(tilts=[0, 0.1], alphas=[1.0, 0.5]),
+                         ["--candidate", "runs/c/adapter", "--live", "runs/l/adapter", "--out", "runs/c/sweep.json",
+                          "--tilts", "0", "0.1", "--alphas", "1.0", "0.5", "--scales"])
+        self.argv(tilts=[sr.MAX_TILT], alphas=[1], scales=[0.5, 1.0])
+
+    def test_out_of_range_non_finite_empty_and_oversized_grids_are_invalid(self):
+        bad = [dict(alphas=[2]), dict(alphas=[0]), dict(alphas=[-0.5]), dict(tilts=[-0.1]), dict(tilts=[sr.MAX_TILT + 0.5]),
+               dict(alphas=[float("nan")]), dict(tilts=[float("inf")]), dict(scales=[0]), dict(scales=[1.5]),
+               dict(alphas=[]), dict(tilts=[]), dict(tilts=[i / 100 for i in range(sr.MAX_GRID + 1)]),
+               dict(alphas=[1.0, 1]), dict(alphas=[True]), dict(tilts="0.1"), dict(candidate="a\nb"), dict(live=""),
+               dict(candidate="x" * (sr.MAX_PATH + 1))]
+        for b in bad:
+            with self.subTest(b), self.assertRaises(ValueError):
+                self.argv(**b)
+
+    def test_calibrate_rejects_the_same_grids_with_exit_2(self):
+        for extra in (["--alphas", "2"], ["--tilts", "nan"], ["--tilts", "-0.1"], ["--scales", "0"], ["--alphas"]):
+            with self.subTest(extra), mock.patch("sys.stderr"), self.assertRaises(SystemExit) as cm:
+                cal.main(["--candidate", "c", "--live", "l", "--out", "o/sweep.json", *extra])
+            self.assertEqual(cm.exception.code, 2)
 
 
 # --- overnight.py -----------------------------------------------------------------------------------------------------------
@@ -334,6 +526,17 @@ class SweepCooldown(unittest.TestCase):
 # --- nightly.sh -------------------------------------------------------------------------------------------------------------
 CAL_STUB = (
     "import json, os, sys\n"
+    "a = sys.argv[1:]\n"
+    "if '--check-done' in a:\n"           # stands in for the fingerprint comparison (tested above against the real calibrate.py)
+    "    open('data/check-count', 'a').write('x')\n"
+    "    try:\n"
+    "        fp = json.load(open(a[a.index('--out') + 1])).get('fingerprint')\n"
+    "    except (OSError, ValueError):\n"
+    "        fp = None\n"
+    "    if fp == 'now':\n"
+    "        print('sweep check: a finished sweep of exactly these inputs'); sys.exit(10)\n"
+    "    print('sweep check: ' + ('no finished sweep' if fp is None else 'computed from other inputs'))\n"
+    "    sys.exit(int(os.environ.get('STUB_CHECK_RC', '0')))\n"
     "open('data/sweep-count', 'a').write('x')\n"
     "open('data/sweep-args', 'w').write(' '.join(sys.argv[1:]))\n"
     "rc = int(os.environ.get('STUB_CAL_RC', '0'))\n"
@@ -406,12 +609,31 @@ class SweepFirstNightly(unittest.TestCase):
         r = json.loads(req.read_text())
         (self.s1 / "runs/2026-11-08").mkdir(parents=True)
         (self.s1 / "runs/2026-11-08/sweep.json").write_text(json.dumps(
-            {"live": r["live"], "request": {"tilts": r["tilts"], "alphas": [1, 0.85, 0.7, 0.5], "scales": []}}))
+            {"live": r["live"], "request": {"tilts": r["tilts"], "alphas": [1, 0.85, 0.7, 0.5], "scales": []},
+             "fingerprint": "now"}))
         rc, log, _ = self.run_night(STUB_NEW_LABELS=5)
         self.assertEqual(rc, 0, log)
         self.assertFalse((self.s1 / "data/sweep-count").exists(), log)
         self.assertEqual(len(list((self.s1 / "data").glob("sweep-request.done-*.json"))), 1, log)
         self.assertIn("training tonight", log)                 # nothing was swept: the night trains
+
+    def test_a_sweep_json_of_other_inputs_for_the_same_request_still_runs(self):
+        # same live path and grid (what the old shortcut compared), but the fingerprint says the inputs changed, or is absent
+        for fp in ("before-the-candidate-advanced", None):
+            with self.subTest(fp=fp):
+                req = self.request()
+                r = json.loads(req.read_text())
+                (self.s1 / "runs/2026-11-08").mkdir(parents=True, exist_ok=True)
+                done = {"live": r["live"], "request": {"tilts": r["tilts"], "alphas": r["alphas"], "scales": []}}
+                if fp:
+                    done["fingerprint"] = fp
+                (self.s1 / "runs/2026-11-08/sweep.json").write_text(json.dumps(done))
+                (self.s1 / "data/sweep-count").unlink(missing_ok=True)
+                rc, log, _ = self.run_night(STUB_NEW_LABELS=0)
+                self.assertEqual(rc, 0, log)
+                self.assertEqual((self.s1 / "data/sweep-count").read_text(), "x", log)
+                self.assertIn("sweep check: ", log)
+                self.assertIn("sweep finished", log)
 
     def test_a_different_request_for_the_same_candidate_still_runs(self):
         self.request(scales=[0.5])
@@ -440,6 +662,100 @@ class SweepFirstNightly(unittest.TestCase):
         self.assertEqual(len(list((self.s1 / "data").glob("sweep-request.invalid-*.json"))), 1, log)
         self.assertFalse((self.s1 / "data/sweep-count").exists())
         self.assertIn("training tonight", log)
+
+    def test_numerically_invalid_requests_are_set_aside_before_calibrate_and_the_night_trains(self):
+        for i, bad in enumerate((dict(alphas=[2]), dict(tilts=[-0.1]), dict(alphas=[float("nan")]), dict(alphas=[]),
+                                 dict(scales=[0]))):
+            with self.subTest(bad=bad):
+                for f in (self.s1 / "data").glob("sweep-request.invalid-*.json"):
+                    f.unlink()
+                self.request(**bad)
+                rc, log, _ = self.run_night(STUB_NEW_LABELS=5 if i == 0 else 0)
+                self.assertEqual(rc, 0, log)
+                self.assertIn("SWEEP REQUEST INVALID: sweep request invalid:", log)
+                aside = list((self.s1 / "data").glob("sweep-request.invalid-*.json"))
+                self.assertEqual(len(aside), 1, log)
+                self.assertFalse((self.s1 / "data/sweep-request.json").exists())
+                self.assertFalse((self.s1 / "data/sweep-count").exists(), log)
+                self.assertFalse((self.s1 / "data/check-count").exists(), "calibrate.py is never started for it")
+                if i == 0:
+                    self.assertIn("training tonight", log)
+                    self.assertIn("--train", self.lora())
+                    self.assertIn("invalid_at", json.loads(aside[0].read_text()))
+
+    def test_calibrate_exit_2_sets_the_request_aside_instead_of_retrying(self):
+        for env, ran in ((dict(STUB_CHECK_RC=2), False), (dict(STUB_CAL_RC=2), True)):
+            with self.subTest(env=env):
+                for f in (self.s1 / "data").glob("sweep-request.invalid-*.json"):
+                    f.unlink()
+                (self.s1 / "data/sweep-count").unlink(missing_ok=True)
+                self.request()
+                rc, log, _ = self.run_night(STUB_NEW_LABELS=5, **env)
+                self.assertEqual(rc, 0, log)
+                self.assertIn("calibrate.py rejected the arguments (exit 2)", log)
+                self.assertEqual(len(list((self.s1 / "data").glob("sweep-request.invalid-*.json"))), 1, log)
+                self.assertEqual((self.s1 / "data/sweep-count").exists(), ran, log)
+                self.assertIn("training tonight", log)
+
+    def test_three_failed_nights_set_the_request_aside_with_an_alert_and_the_night_trains(self):
+        req = self.request()
+        for night, n in (("2026-11-09", 1), ("2026-11-09", 2), ("2026-11-10", 3)):   # two failed cycles in one night count once
+            rc, log, _ = self.run_night(STUB_NEW_LABELS=5, STUB_CAL_RC=1, CORTADOS_S1_NIGHT_DATE=night)
+            self.assertEqual(rc, 1, log)
+            self.assertTrue(req.exists(), log)
+            self.assertEqual(self.lora(), "", log)
+        rec = json.loads((self.s1 / "data/sweep-request.failures.json").read_text())
+        self.assertEqual(sorted(rec["nights"]), ["2026-11-09", "2026-11-10"])
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=5, STUB_CAL_RC=1, CORTADOS_S1_NIGHT_DATE="2026-11-11")
+        self.assertEqual(rc, 0, log)
+        self.assertFalse(req.exists(), log)
+        aside = list((self.s1 / "data").glob("sweep-request.failed-*.json"))
+        self.assertEqual(len(aside), 1, log)
+        rec = json.loads(aside[0].read_text())
+        self.assertEqual(sorted(rec["failed_nights"]), ["2026-11-09", "2026-11-10", "2026-11-11"])
+        self.assertIn("rc=1: Traceback: boom", rec["failed_nights"]["2026-11-11"])
+        self.assertIn("failed_at", rec)
+        self.assertFalse((self.s1 / "data/sweep-request.failures.json").exists())
+        self.assertIn("ALERT: calibration sweep failed on 3 nights", log)
+        self.assertIn("training tonight", log)
+        self.assertIn("--train", self.lora())
+        status = json.loads((self.s1 / "data/status.json").read_text())
+        self.assertIn("sweep_set_aside", status.get("alerts", {}), status)
+
+    def test_a_new_request_starts_its_failure_count_over(self):
+        self.request()
+        self.run_night(STUB_NEW_LABELS=0, STUB_CAL_RC=1, CORTADOS_S1_NIGHT_DATE="2026-11-09")
+        self.run_night(STUB_NEW_LABELS=0, STUB_CAL_RC=1, CORTADOS_S1_NIGHT_DATE="2026-11-10")
+        self.request(scales=[0.5])                              # replaced by the operator
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, STUB_CAL_RC=1, CORTADOS_S1_NIGHT_DATE="2026-11-11")
+        self.assertEqual(rc, 1, log)
+        self.assertTrue((self.s1 / "data/sweep-request.json").exists(), log)
+        self.assertIn("failed on 1 of 3 nights", log)
+
+    def test_far_future_sweep_night_marker_is_capped_at_the_window_end(self):
+        marker = self.s1 / "data/sweep-night-until"
+        until = int(time.time()) + 3600
+        marker.write_text(f"{int(time.time()) + 10 * 86400}\n")
+        rc, log, _, _ = self._cycle(STUB_NEW_LABELS=5, CORTADOS_S1_TRAIN_ALLOWED=1, CORTADOS_S1_TRAIN_UNTIL=until)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("past this window's end", log)
+        self.assertIn("tonight's window went to the calibration sweep", log)     # tonight still belongs to the sweep
+        self.assertEqual(marker.read_text().strip(), str(until))
+        # without a window end to compare with, a marker more than a day ahead is ignored and removed
+        marker.write_text(f"{int(time.time()) + 10 * 86400}\n")
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=5)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("more than a day ahead: ignored", log)
+        self.assertIn("training tonight", log)
+        self.assertFalse(marker.exists())
+
+    def test_a_finished_sweep_never_writes_a_marker_past_a_day(self):
+        self.request()
+        rc, log, _, _ = self._cycle(STUB_NEW_LABELS=0, CORTADOS_S1_TRAIN_ALLOWED=1,
+                                    CORTADOS_S1_TRAIN_UNTIL=int(time.time()) + 10 * 86400)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("sweep finished", log)
+        self.assertFalse((self.s1 / "data/sweep-night-until").exists(), log)
 
     def test_failed_sweep_keeps_the_request_and_fails_the_cycle_without_labeling(self):
         req = self.request()

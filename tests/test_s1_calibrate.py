@@ -271,13 +271,14 @@ class NightlySweepStep(unittest.TestCase):
     def run_step(self, allowed, with_request=True):
         tmp = Path(tempfile.mkdtemp(prefix="s1-sweep-"))
         (tmp / "data").mkdir()
+        (tmp / "sweep_request.py").write_text((S1 / "sweep_request.py").read_text())   # validation and set-aside records
         if with_request:
             (tmp / "data/sweep-request.json").write_text(json.dumps(
                 {"candidate": "runs/2026-11-08/adapter", "live": "runs/2026-10-16-0130/adapter", "tilts": [0, 0.1], "alphas": [1.0, 0.7]}))
         # stand-in for the gate interpreter: sweep_request runs "$GATE_PY" -B -m cortados_router.studio_capacity gate -- ...
         (tmp / "fake-gate").write_text("#!/bin/bash\necho \"$*\" > data/gated.log; echo 'sweep: 4 settings'\n")
         (tmp / "fake-gate").chmod(0o755)
-        script = ("GATE_PY=./fake-gate; GATE_ROOT=.\n"
+        script = ("GATE_PY=./fake-gate; GATE_ROOT=.\n"   # PY names no program: the completion check fails, so the sweep runs
                   "PY=fake-py; BASE=base\n" + sweep_fn() + "sweep_request\n")
         out = subprocess.run(["/bin/bash", "-c", script], cwd=tmp, capture_output=True, text=True, timeout=30,
                              env={"PATH": os.environ["PATH"], "CORTADOS_S1_TRAIN_ALLOWED": allowed})

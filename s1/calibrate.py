@@ -16,14 +16,28 @@ Candidate weights (resolve_candidate): <candidate>/adapters.safetensors when mlx
 highest-numbered step checkpoint NNNNNNN_adapters.safetensors in the same dir (never 0000000, the warm-start copy of the live
 adapter), logged with the run's segment-target. The candidate dir is never written: a checkpoint is loaded through
 <run>/sweep/cand-weights/, two symlinks (adapter_config.json, adapters.safetensors -> the checkpoint). Neither file -> exit 4.
+The chosen weights must resolve (realpath) to a file inside the candidate adapter dir that is not the 0000000 warm-start copy:
+a symlink leading out of the run, or onto 0000000, is refused (exit 4), never loaded.
 
 Resumable, one model at a time (#74): each adapter version (live, cand, blend<a>, scale<s>) is scored once per holdout row and
 every scored row is appended to <run>/sweep/<version>/scores.jsonl as it completes (scores.done when the version is complete,
-temps.json once its temperatures are fitted). A rerun reuses every cached row whose version identity (weights files, base,
-fail-up/outward thresholds, live temperatures) still matches and scores only the missing ones; a changed identity starts that
-version over. Each model is released (gc + MLX cache cleared) before the next is loaded, so only one is ever resident.
-The tilts reuse the cached scores. sweep.md then sweep.json are written atomically (tmp + rename) only when every version is
-complete, so an existing sweep.json always describes a finished sweep. Exit codes: 0 done, 4 refused (bad candidate), else failed."""
+temps.json once its temperatures are fitted). A rerun reuses every cached row whose version identity still matches and scores
+only the missing ones. The identity: the weights files (resolved path, size, mtime, hash of the first and last MiB) and each
+adapter's adapter_config.json hash, the blend/scale parameters, base, fail-up/outward thresholds, live temperatures, and for
+every candidate version (whose temperatures are fitted) the hash of the validation rows. temps.json carries that validation
+hash too and is refitted when it differs. A changed identity moves the version's cache (scores, done marker, temps) aside
+into <version>/stale-<stamp>/ and starts that version over. A torn last line (a kill mid-write) is cut off on load, so the
+next append starts on a fresh line. Each model is released (gc + MLX cache cleared) before the next is loaded, so only one
+is ever resident. The tilts reuse the cached scores. sweep.md then sweep.json are written atomically (tmp + rename) only when
+every version is complete, so an existing sweep.json always describes a finished sweep.
+
+sweep.json carries "fingerprint", every input the result depends on (fingerprint()): the request (candidate, live, tilts,
+alphas, scales), the candidate weights and both adapter configs, the teacher/outcome holdouts, the validation rows, the
+inference thresholds and live pointer, and CALIBRATE_VERSION. `--check-done` (same arguments, reads files only, never
+loads a model or writes anything) exits 10 when <out> exists with the fingerprint the arguments give now, else 0 (the
+sweep must run; the cache decides what is reused). nightly.sh marks a request done without a run only on 10.
+Exit codes: 0 done, 2 arguments rejected (argparse, or a grid outside sweep_request.check_grid), 4 refused (bad candidate),
+10 --check-done: already complete, else failed."""
 from __future__ import annotations
 
 import argparse
@@ -46,6 +60,10 @@ DEFAULT_ALPHAS = [1.0, 0.85, 0.7, 0.5]
 # request lists the scales it wants.
 DEFAULT_SCALES = [0.75, 0.5]
 EXIT_REFUSED = 4          # the request cannot be run as given (no candidate weights); nightly.sh sets it aside, never retries it
+EXIT_ALREADY_DONE = 10    # --check-done: <out> is a finished sweep of exactly these inputs
+# Bumped whenever what calibrate.py computes for the same inputs changes (grading, selection, sweep.json layout): a sweep.json
+# from an older version is then not accepted as complete. 2: fingerprint + keyed caches (#74 review).
+CALIBRATE_VERSION = 2
 
 
 # --- candidate weights --------------------------------------------------------------------------------------------------
@@ -65,12 +83,14 @@ def resolve_candidate(cand_dir: Path) -> tuple[Path, str]:
         raise CandidateError(f"candidate {cand_dir} has no adapter_config.json")
     final = cand_dir / "adapters.safetensors"
     if final.is_file():
+        check_weights(cand_dir, final)
         return final, f"candidate weights: {final} (final adapter)"
     steps = sorted((int(m[1]), p) for p in cand_dir.iterdir() if (m := CHECKPOINT_RE.match(p.name)) and int(m[1]) > 0 and p.is_file())
     if not steps:
         raise CandidateError(f"candidate {cand_dir} has no adapters.safetensors and no NNNNNNN_adapters.safetensors step "
                              "checkpoint (0000000 is the warm-start copy and is not used)")
     step, path = steps[-1]
+    check_weights(cand_dir, path)
     run = cand_dir.parent
     target = (run / "segment-target").read_text().strip() if (run / "segment-target").is_file() else ""
     base = (run / "iters-base").read_text().strip() if (run / "iters-base").is_file() else ""
@@ -82,14 +102,31 @@ def resolve_candidate(cand_dir: Path) -> tuple[Path, str]:
     return path, f"candidate {cand_dir} has no adapters.safetensors; using checkpoint {path.name} (step {step}; {rec})"
 
 
+def check_weights(cand_dir: Path, weights: Path) -> Path:
+    """The weights file resolved (realpath, every symlink followed); CandidateError unless it lies inside the candidate adapter
+    dir (also resolved) and is not the 0000000 warm-start copy. A checkpoint symlinked out of the run, or onto the warm-start
+    copy, would sweep some other adapter under this candidate's name."""
+    real, root = Path(os.path.realpath(weights)), Path(os.path.realpath(cand_dir))
+    if root not in real.parents:
+        raise CandidateError(f"candidate weights {weights} resolve to {real}, outside the candidate adapter dir {root}")
+    m = CHECKPOINT_RE.match(real.name)
+    if m and int(m[1]) == 0:
+        raise CandidateError(f"candidate weights {weights} resolve to the warm-start copy {real.name}")
+    if not real.is_file():
+        raise CandidateError(f"candidate weights {weights} resolve to {real}, which is not a file")
+    return real
+
+
 def candidate_view(cand_dir: Path, weights: Path, view: Path) -> Path:
     """The adapter dir to load: cand_dir itself for its final file, else `view` holding two symlinks (config + the checkpoint)
-    so mlx_lm reads the checkpoint in place. Nothing is ever written into cand_dir."""
+    so mlx_lm reads the checkpoint in place. Nothing is ever written into cand_dir. The weights are checked (check_weights)
+    first; the view links to the resolved file."""
+    real = check_weights(cand_dir, weights)
     if weights == Path(cand_dir) / "adapters.safetensors":
         return Path(cand_dir)
     view.mkdir(parents=True, exist_ok=True)
     for name, target in (("adapter_config.json", Path(cand_dir).resolve() / "adapter_config.json"),
-                         ("adapters.safetensors", Path(weights).resolve())):
+                         ("adapters.safetensors", real)):
         link = view / name
         if link.is_symlink() or link.exists():
             if link.is_symlink() and Path(os.readlink(link)) == target:
@@ -99,11 +136,40 @@ def candidate_view(cand_dir: Path, weights: Path, view: Path) -> Path:
     return view
 
 
+ENDS = 1 << 20   # file_id hashes this many bytes at each end: a rewrite with the same size and a restored mtime still changes it
+
+
 def file_id(path: Path) -> dict:
-    """Identity of a weights file for the score cache: resolved path, size, mtime. A retrained / replaced file changes it."""
+    """Identity of a weights file: resolved path, size, mtime and a sha256 of its first and last MiB (the whole file for
+    small ones). A retrained / replaced file changes it; reading 2 MiB keeps it cheap for multi-GB adapters."""
     p = Path(path).resolve()
     st = p.stat()
-    return {"path": str(p), "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        h.update(f.read(ENDS))
+        if st.st_size > ENDS:
+            f.seek(max(ENDS, st.st_size - ENDS))
+            h.update(f.read(ENDS))
+    return {"path": str(p), "size": st.st_size, "mtime_ns": st.st_mtime_ns, "ends_sha256": h.hexdigest()}
+
+
+def file_hash(path: Path) -> str | None:
+    """sha256 of a small file's content (adapter_config.json), None when it is missing."""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def data_hash(obj) -> str:
+    """sha256 of rows (holdouts, validation set) in a canonical JSON form; order-independent at the top level."""
+    rows = sorted(json.dumps(x, sort_keys=True, default=str) for x in obj)
+    return hashlib.sha256("\n".join(rows).encode()).hexdigest()
+
+
+def weights_id(path: Path) -> dict:
+    """file_id, or {"path", "missing": True} when there is no such file (the run then fails or refuses on its own)."""
+    return file_id(path) if Path(path).is_file() else {"path": str(path), "missing": True}
 
 
 def release_model() -> None:
@@ -245,19 +311,22 @@ def scorer_factory(*, live: str, base: str, valid: list, pointer: dict):
     if not pointer.get("adapter") or Path(pointer["adapter"]).resolve() != Path(live).resolve():
         raise ValueError(f"--live {live!r} is not the promoted adapter {pointer.get('adapter')!r} in {ev.current_pointer()}")
 
+    fit = data_hash(valid)
+
     def make_scorer(adapter: str, temps: Path | None = None):
-        """temps: the version's temps.json. Fitted temperatures are saved there (atomic) and reused on a resumed sweep, so a
-        restart does not pay the ~22 min fit again. The live adapter never has any: its temperatures are the pointer's."""
+        """temps: the version's temps.json, {"valid": <validation rows hash>, "T": {...}}. Fitted temperatures are saved there
+        (atomic) and reused on a resumed sweep only while the validation rows are the same, so a restart does not pay the
+        ~22 min fit again. The live adapter never has any: its temperatures are the pointer's."""
         if Path(adapter).resolve() == Path(live).resolve():
             return ev.incumbent_scorer(pointer)
         s = ev.Scorer(base, adapter)
         cached = _read_json(temps) if temps else None
-        if isinstance(cached, dict) and cached:
-            s.T = cached
+        if isinstance(cached, dict) and cached.get("valid") == fit and isinstance(cached.get("T"), dict) and cached["T"]:
+            s.T = cached["T"]
         else:
             s.T = ev.fit_temperatures(s, valid)          # what evaluate.py does for the candidate it grades
             if temps:
-                write_atomic(temps, json.dumps(s.T))
+                write_atomic(temps, json.dumps({"valid": fit, "T": s.T}))
         return s
     return make_scorer
 
@@ -292,7 +361,8 @@ def row_key(kind: str, r: dict) -> str:
 class ScoreCache:
     """<run>/sweep/<version>/: scores.meta.json (the version identity), scores.jsonl (one {"k", "p"} line per scored row,
     appended and fsynced as each row finishes), scores.done (written once every requested row is cached) and temps.json.
-    A different identity discards the version's cache (and temps) before anything is reused."""
+    A different identity moves the version's cache (meta, scores, done, temps) aside into stale-<stamp>/ before anything is
+    reused: the dependents go with the scores, so no file of the old identity is read again."""
 
     def __init__(self, vdir: Path, identity: dict, log=print):
         self.dir, self.identity, self.log = Path(vdir), identity, log
@@ -301,17 +371,32 @@ class ScoreCache:
         self.rows: dict[str, dict] = {}
         if _read_json(self.meta) == identity:
             self._load()
-        elif self.meta.exists() or self.scores.exists():
-            self.log(f"sweep: {self.dir.name}: cached scores are for another adapter/settings; starting this version over")
-            for p in (self.scores, self.done, self.temps):
-                p.unlink(missing_ok=True)
+        elif any(p.exists() for p in (self.meta, self.scores, self.done, self.temps)):
+            stale = self.dir / time.strftime("stale-%Y%m%d-%H%M%S")
+            n = 0
+            while stale.exists():
+                n += 1
+                stale = self.dir / (time.strftime("stale-%Y%m%d-%H%M%S") + f"-{n}")
+            stale.mkdir(parents=True)
+            for p in (self.meta, self.scores, self.done, self.temps):
+                if p.exists():
+                    os.replace(p, stale / p.name)
+            self.log(f"sweep: {self.dir.name}: cached scores are for another adapter/settings/data; moved aside to "
+                     f"{stale.name}, starting this version over")
 
     def _load(self) -> None:
         try:
-            lines = self.scores.read_text().splitlines()
+            data = self.scores.read_bytes()
         except FileNotFoundError:
             return
-        for line in lines:     # a line cut by a kill mid-write is dropped (rescored), never trusted
+        end = data.rfind(b"\n") + 1
+        if end < len(data):    # a kill mid-write left a torn last line: cut it off so the next append starts a fresh line
+            with open(self.scores, "r+b") as f:
+                f.truncate(end)
+                f.flush()
+                os.fsync(f.fileno())
+            data = data[:end]
+        for line in data.decode(errors="replace").splitlines():     # a damaged line is dropped (rescored), never trusted
             try:
                 o = json.loads(line)
                 self.rows[o["k"]] = o["p"]
@@ -356,29 +441,33 @@ def variants_for(alphas: list[float], scales: list[float]) -> list[tuple[str, tu
 
 def run_sweep(*, candidate: str, live: str, tilts: list[float], alphas: list[float], scales: list[float], out: Path,
               holdout: list, o_holdout: list, make_scorer, fail_up: float, identity: dict | None = None,
+              fit_identity: dict | None = None, fingerprint: dict | None = None,
               candidate_file: str | None = None, release=release_model, log=lambda m: None) -> dict:
     """make_scorer(adapter_dir, temps_path) -> object with .score(request, unit_kind) (temperatures already fitted, or read
     from temps_path). Each adapter version is scored once per holdout row into its ScoreCache; the model is then dropped and
     `release` frees it before the next version loads, so one model is resident at a time. A version whose cache already holds
     every row is not loaded at all. The tilts and all grading read the cached scores. Grading and the promotion rule are
-    evaluate.py's. `identity` (base, thresholds, live temperatures) joins each version's cache identity."""
+    evaluate.py's. `identity` (base, thresholds, live temperatures) joins each version's cache identity; `fit_identity` (the
+    validation rows hash) joins only the candidate versions', whose temperatures are fitted. `fingerprint` (see fingerprint())
+    is written into sweep.json for nightly.sh's --check-done."""
     import evaluate as ev
     from common import core
     run_dir = out.parent
     rows_dir = run_dir / "sweep"     # per-setting row files: <run>/sweep/<setting>/{holdout,outcome}-rows.jsonl, joined by id
     common_id = {"fail_up": fail_up, "outward_at": ev.OUTWARD_AT, **(identity or {})}
-    live_id = file_id(Path(live) / "adapters.safetensors") if (Path(live) / "adapters.safetensors").exists() else {"path": str(live)}
+    live_id = {"live": weights_id(Path(live) / "adapters.safetensors"), "live_config": file_hash(Path(live) / "adapter_config.json")}
     cand_w = Path(candidate_file) if candidate_file else Path(candidate) / "adapters.safetensors"
-    cand_id = file_id(cand_w) if cand_w.exists() else {"path": str(cand_w)}
+    cand_id = {"candidate": weights_id(cand_w), "candidate_config": file_hash(Path(candidate) / "adapter_config.json"),
+               **(fit_identity or {})}
     wanted = [("h", r) for r, _ in holdout] + [("o", r) for r, _ in o_holdout]
     keys = [row_key(kind, r) for kind, r in wanted]
     scores: dict[str, ScoreCache] = {}
     adapters: dict[str, str] = {}
     for name, how in variants_for(alphas, scales):
         vdir = rows_dir / name
-        weights = {"live": live_id} if name == "live" else {"candidate": cand_id}
+        weights = dict(live_id) if name == "live" else dict(cand_id)
         if how and how[0] == "blend":
-            weights["live"] = live_id
+            weights.update(live_id)
         cache = ScoreCache(vdir, {"version": name, "how": list(how) if how else None, **weights, **common_id}, log=log)
         scores[name] = cache
         adapter = live if name == "live" else (candidate if how is None else str(vdir))
@@ -428,13 +517,56 @@ def run_sweep(*, candidate: str, live: str, tilts: list[float], alphas: list[flo
              "selection": "teacher holdout only (select_on_teacher); outcome holdout used only to confirm via promotion_report",
              "holdout_rows": len(holdout), "outcome_holdout_rows": len(o_holdout), "live_teacher": live_teacher,
              "live_outcome": live_outcome, "chosen": chosen, "settings": rows,
-             "chosen_would_promote": next((r["report"]["promote"] for r in rows if r["setting"] == chosen), None)}
+             "chosen_would_promote": next((r["report"]["promote"] for r in rows if r["setting"] == chosen), None),
+             "fingerprint": fingerprint}
     write_atomic(out.with_suffix(".md"), markdown(sweep))
     write_atomic(out, json.dumps(sweep, indent=1))      # last: an existing sweep.json means the sweep finished
     return sweep
 
 
+def fingerprint(*, candidate: str, weights: Path, live: str, base: str, fail_up: float, tilts: list[float], alphas: list[float],
+                scales: list[float], holdout: list, o_holdout: list, valid: list, pointer: dict) -> dict:
+    """Every input a finished sweep.json depends on. A completed sweep is accepted (--check-done) only when this is equal now:
+    the request as given; the resolved candidate weights (file_id: path, size, mtime, first/last MiB hash) and both adapter
+    configs; the live weights; the teacher holdout (rows + teacher truth), the outcome holdout and the validation rows the
+    candidate temperatures are fitted on; the inference thresholds, the grading/promotion constants and the live pointer
+    (base, frozen temperatures); and CALIBRATE_VERSION."""
+    import evaluate as ev
+    return {
+        "calibrate_version": CALIBRATE_VERSION,
+        "request": {"candidate": candidate, "live": live, "tilts": [float(x) for x in tilts],
+                    "alphas": [float(x) for x in alphas], "scales": [float(x) for x in scales]},
+        "candidate_weights": weights_id(weights),
+        "candidate_config": file_hash(Path(candidate) / "adapter_config.json"),
+        "live_weights": weights_id(Path(live) / "adapters.safetensors"),
+        "live_config": file_hash(Path(live) / "adapter_config.json"),
+        "holdout": data_hash([[r, tv] for r, tv in holdout]),
+        "outcome_holdout": data_hash([[r, b] for r, b in o_holdout]),
+        "valid": data_hash(valid),
+        "inference": {"base": base, "fail_up": fail_up, "outward_at": ev.OUTWARD_AT,
+                      "teacher_under_max_rise": ev.TEACHER_UNDER_MAX_RISE, "outward_recall_floor": ev.OUTWARD_RECALL_FLOOR,
+                      "min_outcome_holdout": ev.MIN_OUTCOME_HOLDOUT, "live_pointer": {
+                          "adapter": pointer.get("adapter"), "base": pointer.get("base"),
+                          "temperatures": pointer.get("temperatures")}},
+    }
+
+
+def check_done(out: Path, fp: dict) -> tuple[bool, str]:
+    """(True, note) when <out> is a finished sweep with exactly this fingerprint; else (False, which inputs differ)."""
+    done = _read_json(out)
+    if not isinstance(done, dict):
+        return False, f"no finished sweep at {out}"
+    old = done.get("fingerprint")
+    if not isinstance(old, dict):
+        return False, f"{out} has no input fingerprint (written before it was recorded)"
+    diff = sorted(k for k in set(fp) | set(old) if fp.get(k) != old.get(k))
+    if diff:
+        return False, f"{out} was computed from other inputs ({', '.join(diff)} changed)"
+    return True, f"{out} is a finished sweep of exactly these inputs"
+
+
 def main(argv: list[str] | None = None) -> int:
+    from sweep_request import check_grid
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--candidate", required=True); ap.add_argument("--live", required=True); ap.add_argument("--out", required=True)
     ap.add_argument("--base", default=os.environ.get("CORTADOS_S1_BASE", "mlx-community/Qwen3-4B-Instruct-2507-4bit"))
@@ -442,29 +574,40 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--alphas", type=float, nargs="*", default=DEFAULT_ALPHAS)
     ap.add_argument("--scales", type=float, nargs="*", default=[])   # none unless asked (#74); DEFAULT_SCALES are suggestions
     ap.add_argument("--fail-up", type=float, default=float(os.environ.get("CORTADOS_S1_FAIL_UP", "0.6")))
+    ap.add_argument("--check-done", action="store_true",
+                    help="exit 10 when --out is a finished sweep of exactly these inputs, else 0; loads no model, writes nothing")
     a = ap.parse_args(argv)
-    for x in a.alphas + a.scales:
-        if not 0.0 <= x <= 1.0:
-            ap.error(f"alpha/scale {x} outside [0, 1]")
+    try:     # the same limits nightly.sh's request validation applies (NaN, out-of-range, empty, oversized grids)
+        check_grid(a.tilts, a.alphas, a.scales)
+    except ValueError as e:
+        ap.error(str(e))
     out = Path(a.out)
     try:
         weights, note = resolve_candidate(Path(a.candidate))
+        candidate = a.candidate if a.check_done else str(candidate_view(Path(a.candidate), weights, out.parent / "sweep" / "cand-weights"))
     except (CandidateError, OSError) as e:
         print(f"sweep refused: {e}", flush=True)
         return EXIT_REFUSED
     print(note, flush=True)
-    candidate = str(candidate_view(Path(a.candidate), weights, out.parent / "sweep" / "cand-weights"))
     import evaluate as ev
     from common import DATA, read_jsonl, read_labels
     reqs = {r["id"]: r for r in read_jsonl(DATA / "requests.jsonl")}
     holdout, valid = ev.build_eval_sets(reqs, read_labels())
+    o_holdout = ev.outcome_holdout()
 
     cur = json.loads(ev.current_pointer().read_text())   # unreadable or missing pointer: let it raise; there is no live baseline without it
+    fp = fingerprint(candidate=a.candidate, weights=weights, live=a.live, base=a.base, fail_up=a.fail_up, tilts=a.tilts,
+                     alphas=a.alphas, scales=a.scales, holdout=holdout, o_holdout=o_holdout, valid=valid, pointer=cur)
+    if a.check_done:
+        ok, why = check_done(out, fp)
+        print(f"sweep check: {why}", flush=True)
+        return EXIT_ALREADY_DONE if ok else 0
     make_scorer = scorer_factory(live=a.live, base=a.base, valid=valid, pointer=cur)
     identity = {"base": a.base, "live_base": cur.get("base"), "live_temperatures": cur.get("temperatures")}
     sweep = run_sweep(candidate=candidate, live=a.live, tilts=a.tilts, alphas=a.alphas, scales=a.scales, out=out,
-                      holdout=holdout, o_holdout=ev.outcome_holdout(), make_scorer=make_scorer, fail_up=a.fail_up,
-                      identity=identity, candidate_file=str(weights), log=lambda m: print(m, flush=True))
+                      holdout=holdout, o_holdout=o_holdout, make_scorer=make_scorer, fail_up=a.fail_up,
+                      identity=identity, fit_identity={"valid": data_hash(valid)}, fingerprint=fp,
+                      candidate_file=str(weights), log=lambda m: print(m, flush=True))
     print(f"sweep: {len(sweep['settings'])} settings; chosen on teacher: {sweep['chosen']}; would promote: {sweep['chosen_would_promote']}")
     return 0
 
