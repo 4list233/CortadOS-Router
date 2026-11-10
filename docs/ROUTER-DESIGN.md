@@ -352,6 +352,38 @@ evaluation/promotion was attempted) or `quota` (label.py stopped at the Claude h
 | `CORTADOS_S1_MIN_LEFT_PCT` | 15 | label.py per-account quota floor, 0-100 (invalid → logged, 15) |
 | `CORTADOS_S1_BENCH_REFRESH_S` | 86400 | benchmark/tiers refresh at most this often (a future-dated stamp counts as due) |
 
+Calibration sweep first (#74). A request in `s1/data/sweep-request.json`
+(`{"candidate": "runs/<c>/adapter", "live": "runs/<l>/adapter", "tilts": [...], "alphas": [...], "scales": [...]}`, scales
+default to none) is run by `s1/calibrate.py` as the FIRST and only job of the next in-window cycle: no labeling, training or
+evaluation in that cycle. Finished, the request is renamed `sweep-request.done-<stamp>.json` with `done_at` inside, and
+`data/sweep-night-until` keeps training off for the rest of that night; normal cycles resume the next night. While a request is
+pending the supervisor skips the `quota` cooldown inside the window and never sleeps past the next window start outside it, and
+the retention pass keeps the candidate's run. calibrate.py scores one adapter version at a time (the model is freed before the
+next loads), appends every scored row to `<run>/sweep/<version>/scores.jsonl` (`scores.done` when complete, `temps.json` for the
+fitted temperatures), so a stop (window end, `nightly.sh --stop`) loses at most one row and the next night resumes (the
+free-memory pause only suspends it); `sweep.json` is written atomically, last. A candidate without `adapters.safetensors` is swept from its
+highest-numbered step checkpoint (logged with the run's segment-target; loaded in place through symlinks, the adapter dir is never
+written); with neither, or when the chosen weights resolve (realpath) outside the candidate adapter dir or onto the `0000000`
+warm-start copy, calibrate.py exits 4 and the request is set aside as `sweep-request.refused-<stamp>.json`. A request outside the
+limits in `s1/sweep_request.py` (finite numbers; alphas and scales in (0, 1]; tilts in [0, 1]; non-empty tilts and alphas; at
+most 12 values per list, no duplicates) or rejected by calibrate.py's arguments (exit 2) is set aside as
+`sweep-request.invalid-<stamp>.json` and the cycle trains normally. A failing sweep exits the cycle 1 (failure backoff) and keeps
+the request; on the 3rd night with a failure (several in one night count once, a stopped night does not count) it is set aside
+as `sweep-request.failed-<stamp>.json` with each night's reason inside, an ALERT (`sweep_set_aside`) is raised and the cycle
+trains normally. `data/sweep-night-until` never reaches past the current window's end: a later marker is cut back to it, and one
+more than a day ahead with no window end to compare with is ignored.
+A request is marked done without a run only when `runs/<c>/sweep.json` carries the input fingerprint `calibrate.py --check-done`
+computes now (reads files only): the request, the candidate weights (path, size, mtime, first/last MiB hash) and both
+`adapter_config.json` hashes, the live weights, the teacher and outcome holdouts, the validation rows, the inference thresholds
+and live pointer, and `CALIBRATE_VERSION`. Each version's score cache is keyed the same way (weights + adapter config + blend
+parameters; candidate versions also on the validation rows, which `temps.json` records too); a changed key moves that version's
+scores, done marker and temperatures aside into `<version>/stale-<stamp>/`. A torn last cache line is cut off on load, so the next
+append starts a fresh line.
+Runtime on the Studio (~2.7 s/row; ~975 rows per pass = ~44 min; ~22 min to fit a candidate version's temperatures on ~470 valid
+rows; tilts reuse the scores): the 6 tilts x 4 alphas request (24 settings) is 5 passes (live 44 min + 4 x 66 min) = ~5.1 h of
+the 6 h window, plus a 30 s gate wait (set `CORTADOS_STUDIO_ACK_WAIT=0` in `data/train-config.env` to skip it; the gate still
+unloads and confirms residency itself). Each extra scale adds ~66 min.
+
 Alerts: `guard_forced_resume` (a pause hit `CORTADOS_S1_MAX_PAUSE_S` or the scorer stayed unreadable; the detail counts forced
 releases in a row, reset by a normal resume), `scorer_probe_config` (the probe settings are unusable; alerts and logs name the setting
 that chose the URL, `CORTADOS_S1_URL` / `CORTADOS_S1_ENDPOINT` / default, never the URL itself), `scorer_probe_crashed`

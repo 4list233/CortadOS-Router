@@ -158,7 +158,7 @@ class NightlyEndToEnd(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.s1 = self.tmp / "repo" / "s1"
         (self.s1 / "data").mkdir(parents=True)
-        for name in ("nightly.sh", "nightly_state.py", "common.py"):     # nightly_state counts labels with common's teacher filter
+        for name in ("nightly.sh", "nightly_state.py", "common.py", "sweep_request.py"):   # nightly_state counts labels with common's teacher filter
             shutil.copy(S1 / name, self.s1 / name)
         for name in ("cortados_router", "tables"):                         # common.py loads the router's question set
             (self.tmp / "repo" / name).symlink_to(S1.parent / name)
@@ -681,9 +681,10 @@ PY
         self.assertNotIn("not evaluating", log)
         self.assertTrue((run / "report.json").exists(), log)
 
-    # --- calibration sweep request (s1/calibrate.py), run from the EXIT trap of any in-window cycle ---------------------
+    # --- calibration sweep request (s1/calibrate.py): FIRST in an in-window cycle (#74; more in tests/test_s1_sweep_first.py) ---
     CALIBRATE_STUB = (
         "import sys\n"
+        "if '--check-done' in sys.argv: sys.exit(0)\n"     # the completion check: no finished sweep, run it
         "open('data/sweep-count', 'a').write('x')\n"
         "open('data/sweep-args', 'w').write(' '.join(sys.argv[1:]))\n"
         "print('sweep: 4 settings; chosen on teacher: cand-t0.1; would promote: False')\n"
@@ -696,20 +697,23 @@ PY
                                    "tilts": [0, 0.1], "alphas": [1.0, 0.7]}))
         return req
 
-    def test_sweep_runs_once_on_no_new_labels_exit_inside_window(self):
+    def test_sweep_runs_once_first_inside_window(self):
         rc, log, _ = self.run_night(STUB_NEW_LABELS=5)                  # first night trains; no request yet
         self.assertEqual(rc, 0, log)
         req = self._sweep_request()
+        (self.s1 / "data/label-args").unlink()
         rc, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_TRAIN_ALLOWED=1)
         self.assertEqual(rc, 0, log)
-        self.assertIn("skipped: no new labels", log)                   # the early-exit path, not the train+evaluate path
+        self.assertIn("the sweep runs first", log)
+        self.assertFalse((self.s1 / "data/label-args").exists(), "the sweep cycle makes no labeling calls: " + log)
         self.assertEqual((self.s1 / "data/sweep-count").read_text(), "x", log)
-        self.assertIn("--out runs/2026-11-08/sweep.json --tilts 0 0.1 --alphas 1.0 0.7", (self.s1 / "data/sweep-args").read_text())
+        self.assertIn("--out runs/2026-11-08/sweep.json --tilts 0 0.1 --alphas 1.0 0.7 --scales", (self.s1 / "data/sweep-args").read_text())
         self.assertIn("sweep: 4 settings", log)
         self.assertFalse(req.exists())
         self.assertEqual(len(list((self.s1 / "data").glob("sweep-request.done-*.json"))), 1)
         rc, log, _ = self.run_night(STUB_NEW_LABELS=0)                  # request consumed: no second sweep
         self.assertEqual((self.s1 / "data/sweep-count").read_text(), "x", log)
+        self.assertIn("skipped: no new labels", log)
 
     def test_sweep_never_runs_when_training_not_allowed(self):
         req = self._sweep_request()
@@ -717,13 +721,7 @@ PY
         self.assertEqual(rc, 0, log)
         self.assertFalse((self.s1 / "data/sweep-count").exists(), log)
         self.assertTrue(req.exists())
-
-    def test_sigterm_during_cycle_does_not_start_sweep(self):
-        req = self._sweep_request()
-        rc, log, _ = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_TERM=1)  # window-end TERM mid-evaluation
-        self.assertIn("stop requested", log)
-        self.assertFalse((self.s1 / "data/sweep-count").exists(), log)
-        self.assertTrue(req.exists())
+        self.assertTrue((self.s1 / "data/label-args").exists(), "outside the window the cycle labels as usual")
 
     def test_no_new_labels_skips_training(self):
         rc, log, run = self.run_night(STUB_NEW_LABELS=5)
@@ -1537,14 +1535,15 @@ sys.exit(child.returncode)
 # calibrate.py stand-in: long sleep when STUB_CAL_SLEEP is set (the sweep a stop interrupts), exit STUB_CAL_RC when set (a failed
 # sweep), else a finished sweep line
 CALIBRATE_STUB = ("import os, sys, time\n"
+                  "if '--check-done' in sys.argv: print('sweep check: no finished sweep'); sys.exit(0)\n"   # ungated, no model
                   "if os.environ.get('STUB_CAL_SLEEP'): time.sleep(float(os.environ['STUB_CAL_SLEEP']))\n"
                   "if os.environ.get('STUB_CAL_RC'): print('calibrate failed'); sys.exit(int(os.environ['STUB_CAL_RC']))\n"
                   "print('sweep: 2 settings')\n")
 
-# python3 wrapper put first on PATH: when nightly.sh parses the sweep request (`python3 - data/sweep-request.json`) it marks
-# the moment and holds, so the test can deliver TERM during parsing, before the launch.
+# python3 wrapper put first on PATH: when nightly.sh validates the sweep request (`python3 -B ./sweep_request.py validate
+# data/sweep-request.json`) it marks the moment and holds, so the test can deliver TERM during parsing, before the launch.
 PARSE_HOOK = """#!/bin/bash
-if [ "$1" = - ] && [ "${2:-}" = data/sweep-request.json ] && [ -n "${STUB_PARSE_MARK:-}" ]; then
+if [ "$*" = "-B ./sweep_request.py validate data/sweep-request.json" ] && [ -n "${STUB_PARSE_MARK:-}" ]; then
   touch "$STUB_PARSE_MARK"; /bin/sleep 2
 fi
 exec "$SWEEP_REAL_PY" "$@"
@@ -1581,7 +1580,11 @@ class NightlySweepStop(unittest.TestCase):
 
         def reap():   # bounded teardown: never leave the shell or a stub gate/child running after a failure
             if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGKILL); proc.wait(5)
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass      # gone, or (macOS EPERM) only its zombie leader is left: nothing to kill
+                proc.wait(5)
             if self.pids.exists():
                 gate, child = map(int, self.pids.read_text().split())
                 for kill, target in ((os.kill, gate), (os.killpg, child)):   # the child leads its own group
@@ -1623,7 +1626,8 @@ class NightlySweepStop(unittest.TestCase):
         finally:
             os.close(fd)
         self.assertTrue((self.s1 / "data/sweep-request.json").exists(), self._log())
-        self.assertIn("rc=143", self._log())
+        self.assertIn("stop requested", self._log())     # the cycle's TERM trap (exit 130) after the gate returned 143
+        self.assertEqual(proc.returncode, 130)
         self.assertFalse(list((self.s1 / "data").glob("sweep-request.done-*.json")))
 
     def test_group_term_during_request_parsing_never_starts_the_sweep(self):
@@ -1634,7 +1638,7 @@ class NightlySweepStop(unittest.TestCase):
         self._stop_cycle(proc)
         self.assertFalse(self.pids.exists(), "the gate started after a stop; log:\n" + self._log())
         self.assertTrue((self.s1 / "data/sweep-request.json").exists())
-        self.assertIn("SWEEP NOT STARTED", self._log())
+        self.assertIn("stop requested", self._log())
 
     def test_finished_sweep_renames_the_request_and_logs_the_summary(self):
         proc = self._start(self._prepare())
@@ -1669,8 +1673,8 @@ class NightlySweepStop(unittest.TestCase):
         while proc.poll() is None and time.time() < end:
             try:
                 os.killpg(proc.pid, signal.SIGTERM); sent += 1
-            except ProcessLookupError:
-                break                                     # the group is gone: cleanup finished between checks
+            except (ProcessLookupError, PermissionError):
+                break    # the group is gone (or, macOS EPERM, only its unreaped zombie leader is left): cleanup finished
             time.sleep(0.1)
         proc.wait(10)
         self.assertGreaterEqual(sent, 5)

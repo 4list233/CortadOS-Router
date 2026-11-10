@@ -22,7 +22,12 @@ the cycle is idle (sleeps CORTADOS_S1_CYCLE_IDLE_S) unless labels were added. An
 trainer's checkpoints stay, and the next cycle starts at once (it labels, then skips training until the next window); nightly.sh
 carries that run folder across nights and resumes it from its newest checkpoint (cross-night resume).
 The window-end stop ends the whole cycle, including any labeling still running; the next cycle redoes it at once.
-The window is read once per cycle at its start: a cycle begun just before the window opens does not train; the next one does."""
+The window is read once per cycle at its start: a cycle begun just before the window opens does not train; the next one does.
+
+Calibration sweep (#74): while s1/data/sweep-request.json exists, the next in-window cycle runs only the sweep (nightly.sh
+"Sweep first"), which makes no labeling calls. So sweep_delay drops a 'quota' cooldown inside the window and caps any sleep
+outside it at the next window start: an evening quota stop no longer eats the sweep's night. Each cycle also gets
+CORTADOS_S1_TRAIN_UNTIL (the window end, epoch s; empty outside it), which keeps training off after a finished sweep."""
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta, timezone
@@ -753,7 +758,9 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
     print(f"overnight: {why}", flush=True)
     env = dict(os.environ, CORTADOS_NIGHTLY_SUPERVISED="1", TZ="America/Toronto", CORTADOS_S1_CONTINUOUS="1",
                CORTADOS_S1_CYCLE_RESULT=str(result_file), CORTADOS_S1_TRAIN_ALLOWED="1" if allowed else "0",
-               CORTADOS_S1_TRAIN_SKIP_REASON="" if allowed else why)
+               CORTADOS_S1_TRAIN_SKIP_REASON="" if allowed else why,
+               # the window end (epoch s): a finished sweep keeps training off until then (nightly.sh "Sweep first")
+               CORTADOS_S1_TRAIN_UNTIL=str(int(deadline.timestamp())) if deadline is not None else "")
     guard.new_cycle()
     child = subprocess.Popen(command, env=env, start_new_session=True)
     window_ended = False
@@ -873,6 +880,36 @@ def next_delay(rc: int, worked, idle_s: float, failures: int, quota_s: float = Q
     return (0.0 if result == "worked" else idle_s), 0
 
 
+def sweep_delay(delay: float, rc: int, result, now: datetime, *, window_raw: str | None = None,
+                switch_raw: str | None = None, zone=None) -> tuple[float, str | None]:
+    """The sleep before the next cycle while a calibration sweep request is pending (#74): (delay, note or None).
+    The next in-window cycle runs ONLY the sweep, which makes no labeling calls, so the labeler's quota cooldown has nothing to
+    protect there: inside the window (or with training allowed any time) a rc-0 'quota' cycle is followed at once. Outside the
+    window the next cycle labels, so the cooldown stands, but no delay (cooldown, failure backoff or idle) may run past the
+    next window start: the sweep needs the whole window (2026-11-09: a 5 h cooldown from an evening quota stop ate 3 h of it).
+    A failure inside the window keeps its backoff: retrying a failing sweep at once would hot-loop."""
+    allowed, _, _ = train_policy(now, window_raw=window_raw, switch_raw=switch_raw, zone=zone)
+    if allowed:
+        if rc == 0 and result == "quota" and delay:
+            return 0.0, "a sweep request is pending: the next cycle runs only the sweep (no labeling), so no quota cooldown"
+        return delay, None
+    raw = os.environ.get("CORTADOS_S1_NIGHT_WINDOW", "") if window_raw is None else window_raw
+    try:
+        window = parse_night_window(raw.strip() or DEFAULT_NIGHT_WINDOW)
+    except ValueError:
+        return delay, None      # no valid window: nothing to wait for (train_policy already fails closed)
+    if window is None:
+        return delay, None
+    start = _next_start(window, now, zone=zone)
+    # aware: absolute instants (same-tzinfo subtraction would use wall time and be an hour off across DST); naive: test clocks
+    gap = start.timestamp() - now.timestamp() if now.tzinfo is not None else (start - now).total_seconds()
+    left = max(0.0, gap) + 1.0    # +1 s: land inside the window, not on its edge
+    if delay > left:
+        return left, (f"a sweep request is pending: next cycle at the night window start "
+                      f"{start.strftime('%H:%M')} instead of in {delay:g}s")
+    return delay, None
+
+
 def _failures_file(result_file: Path) -> Path:
     return result_file.with_name(result_file.name + ".failures")
 
@@ -901,7 +938,8 @@ def _save_failures(result_file: Path, failures: int) -> None:
 
 def run_continuous(command: list[str], guard: Guard | None = None, *, result_file: Path, idle_s: float | None = None,
                    sleep=_time.sleep, cycles: int | None = None, poll_s: float = 1.0, stopflag: Path | None = None,
-                   pidfile: Path | None = None, quota_s: float | None = None) -> int:
+                   pidfile: Path | None = None, quota_s: float | None = None, sweep_request: Path | None = None) -> int:
+    """sweep_request: data/sweep-request.json; while it exists, sweep_delay shortens the sleep between cycles."""
     guard = guard or Guard()
     # >= 60 s: a 0 s idle interval is a hot relaunch loop against the scorer and the accounts.
     idle_s = _env_float("CORTADOS_S1_CYCLE_IDLE_S", 900.0, minimum=60) if idle_s is None else idle_s
@@ -931,6 +969,10 @@ def run_continuous(command: list[str], guard: Guard | None = None, *, result_fil
             print(f"overnight: cycle {n} ended 130 without a stop flag (external TERM); treating as a failure", flush=True)
         delay, failures = next_delay(rc, result, idle_s, failures, quota_s)
         _save_failures(result_file, failures)
+        if sweep_request is not None and delay and sweep_request.exists():
+            delay, note = sweep_delay(delay, rc, result, guard.wall())
+            if note:
+                print(f"overnight: {note}", flush=True)
         what = f"failure #{failures}, backing off" if rc else {"worked": "worked", "quota": "quota stop, cooling down"}.get(
             result if isinstance(result, str) else ("worked" if result else "idle"), "idle")
         print(f"overnight: cycle {n} ended rc {rc} ({what}); next cycle in {delay:g}s", flush=True)
@@ -956,7 +998,7 @@ def main(argv: list[str]) -> int:
         recover_pidfile(data / "nightly.pid")
         # Same PIDFILE/STOPFLAG paths nightly.sh uses (PIDFILE=data/nightly.pid; STOPFLAG=data/nightly.stop, run in s1/).
         return run_continuous(command, result_file=data / "cycle-result", stopflag=data / "nightly.stop",
-                              pidfile=data / "nightly.pid")
+                              pidfile=data / "nightly.pid", sweep_request=data / "sweep-request.json")
     if argv == ["--check-window"]:
         print(f"seconds left in Toronto overnight window: {seconds_left():.0f}")
         return 0

@@ -127,7 +127,7 @@ class Selection(unittest.TestCase):
 
 
 class FakeScorer:
-    def __init__(self, adapter):
+    def __init__(self, adapter, temps=None):     # run_sweep's make_scorer(adapter_dir, temps_path)
         self.adapter = adapter
 
     def score(self, request, unit_kind):
@@ -157,7 +157,7 @@ class SweepNeverPromotes(unittest.TestCase):
         self.assertEqual((pointer.read_text(), pointer.stat().st_mtime_ns), before)
         self.assertEqual([r["setting"] for r in sweep["settings"]], ["cand-t0", "cand-t0.1"])
         self.assertTrue((run / "sweep.json").exists() and (run / "sweep.md").exists())
-        self.assertEqual(sorted(p.name for p in run.iterdir()), ["sweep", "sweep.json", "sweep.md"])
+        self.assertEqual(sorted(p.name for p in run.iterdir()), ["sweep", "sweep.json", "sweep.md"])   # no temp files left
         for setting in ("live", "cand-t0", "cand-t0.1"):    # per-row files for the morning join, nothing else under sweep/
             for f in ("holdout-rows.jsonl", "outcome-rows.jsonl"):
                 self.assertTrue((run / "sweep" / setting / f).exists(), (setting, f))
@@ -261,23 +261,25 @@ class RowsReport(unittest.TestCase):
 
 def sweep_fn() -> str:
     src = (S1 / "nightly.sh").read_text()
-    start = src.index("gated() {")   # sweep_request runs its step through gated(), so extract both
+    start = src.index("gated() {")   # sweep_request runs its step through gated() and marks through sweep_mark: extract all
     end = src.index("\n}\n", src.index("sweep_request() {")) + 3
     gated = src[start:src.index("\n}\n", start) + 3]
-    return gated + src[src.index("sweep_request() {"):end]
+    return gated + src[src.index("sweep_mark() {"):end]
 
 
 class NightlySweepStep(unittest.TestCase):
     def run_step(self, allowed, with_request=True):
         tmp = Path(tempfile.mkdtemp(prefix="s1-sweep-"))
         (tmp / "data").mkdir()
+        (tmp / "sweep_request.py").write_text((S1 / "sweep_request.py").read_text())   # validation and set-aside records
+        (tmp / "calibrate.py").write_text("")   # must exist and be readable (a missing one is a failed night); the fake gate never runs it
         if with_request:
             (tmp / "data/sweep-request.json").write_text(json.dumps(
                 {"candidate": "runs/2026-11-08/adapter", "live": "runs/2026-10-16-0130/adapter", "tilts": [0, 0.1], "alphas": [1.0, 0.7]}))
         # stand-in for the gate interpreter: sweep_request runs "$GATE_PY" -B -m cortados_router.studio_capacity gate -- ...
         (tmp / "fake-gate").write_text("#!/bin/bash\necho \"$*\" > data/gated.log; echo 'sweep: 4 settings'\n")
         (tmp / "fake-gate").chmod(0o755)
-        script = ("GATE_PY=./fake-gate; GATE_ROOT=.; SWEEP_CANCELLED=0\n"
+        script = ("GATE_PY=./fake-gate; GATE_ROOT=.\n"   # PY names no program: the completion check fails, so the sweep runs
                   "PY=fake-py; BASE=base\n" + sweep_fn() + "sweep_request\n")
         out = subprocess.run(["/bin/bash", "-c", script], cwd=tmp, capture_output=True, text=True, timeout=30,
                              env={"PATH": os.environ["PATH"], "CORTADOS_S1_TRAIN_ALLOWED": allowed})
@@ -289,9 +291,11 @@ class NightlySweepStep(unittest.TestCase):
         self.assertIn("sweep: 4 settings", out.stdout)
         call = (tmp / "data/gated.log").read_text()
         self.assertIn("calibrate.py --base base --candidate runs/2026-11-08/adapter", call)
-        self.assertIn("--out runs/2026-11-08/sweep.json --tilts 0 0.1 --alphas 1.0 0.7", call)
+        self.assertIn("--out runs/2026-11-08/sweep.json --tilts 0 0.1 --alphas 1.0 0.7 --scales\n", call + "\n")   # no scales asked
         self.assertFalse((tmp / "data/sweep-request.json").exists())
-        self.assertEqual(len(list((tmp / "data").glob("sweep-request.done-*.json"))), 1)
+        done = list((tmp / "data").glob("sweep-request.done-*.json"))
+        self.assertEqual(len(done), 1)
+        self.assertIn("done_at", json.loads(done[0].read_text()))     # marked done with a timestamp, not deleted
 
     def test_not_allowed_outside_night_window(self):
         tmp, out = self.run_step("0")
@@ -300,12 +304,14 @@ class NightlySweepStep(unittest.TestCase):
 
     def test_no_request_no_run(self):
         tmp, out = self.run_step("1", with_request=False)
-        self.assertEqual(out.returncode, 0)
+        self.assertEqual(out.returncode, 3)    # sweep_request: 3 = nothing started
         self.assertFalse((tmp / "data/gated.log").exists())
 
-    def test_runs_from_the_exit_trap_before_teardown(self):
+    def test_no_longer_runs_from_the_exit_trap(self):
+        # #74: the sweep runs FIRST in the cycle; from the EXIT trap it only ever got the window's leftovers
         src = (S1 / "nightly.sh").read_text()
-        self.assertIn('cleanup() {\n  local rc=$?\n  sweep_on_exit "$rc"\n  trap \'\' TERM INT\n  stop_deadline;', src)
+        self.assertIn("cleanup() {\n  trap '' TERM INT\n  stop_deadline;", src)
+        self.assertNotIn("sweep_on_exit", src)
 
 
 if __name__ == "__main__":
