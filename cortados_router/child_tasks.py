@@ -1467,8 +1467,10 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
         out["router_run"] = ({"note": "login mode: not routed, no provider run record"} if meta.get("lane")
                              else fetch_run(provider_url, token, task_id, _fetch_timeout(deadline)))
         ex = res.get("export")
-        if isinstance(ex, dict) and ex.get("error") == EXPORT_PENDING and not res.get("logs_unredacted"):
-            # A recovered task whose logs were just released: its run export happens now (#91).
+        if (ex is None or (isinstance(ex, dict) and ex.get("error") == EXPORT_PENDING)) and not res.get("logs_unredacted"):
+            # Its run export (#91) is due here when the runner could not make it: a recovered task whose logs were just
+            # released, or a runner that died between result.json and its export (logs already redacted). Under the
+            # task lock: while the runner holds it, the runner is still exporting and this returns None.
             ex = _export_locked(d, meta, red, out["router_run"], res) or ex
         out["export"] = ex if isinstance(ex, dict) else {"pending": "the runner records its export right after the result"}
         # Why the provider refused (Claude Code replaces a 413's message with its own "images" text, so the child's

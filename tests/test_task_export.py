@@ -280,6 +280,20 @@ class TaskExportTests(ChildTaskBase):
         self.call("task_status", task_id=tid)                     # a second recovery look appends nothing
         self.assertEqual(len(self.lines()), 1)
 
+    def test_a_runner_that_died_after_its_result_is_exported_by_status(self):
+        tid, d, res = self.run_export_task()
+        os.unlink(self.export_file())                             # as if the export never happened
+        os.unlink(self.export_file() + ".ids")
+        del res["export"]
+        ct._write_json(os.path.join(d, "result.json"), res)
+        _, st = self.call("task_status", task_id=tid)
+        self.assertTrue(st["export"]["ok"], st["export"])
+        [rec] = self.records()
+        self.assertEqual((rec["task_id"], rec["logs"]), (tid, "included"))
+        self.assertNotIn(TOKEN, json.dumps(rec))
+        self.call("task_status", task_id=tid)
+        self.assertEqual(len(self.lines()), 1)
+
     def test_recovered_task_with_rotated_credentials_is_exported_logs_withheld_before_prune(self):
         os.environ["FAKE_CLAUDE_MODE"] = "echo-sleep"
         tid = self.start()
