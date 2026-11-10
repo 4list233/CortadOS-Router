@@ -823,49 +823,65 @@ class CleanupTests(_Base):
         self.assert_valid_held_worktree(held, sha, repo_dir)
         self.assertTrue(os.path.exists(os.path.join(held, "late.txt")))
 
-    def test_failed_repair_moves_the_entry_back_to_archive_and_is_reported(self):
-        """The index is written only once the worktree is in held/ with a correct registry entry. A repair that fails
-        undoes the move: the entry stays archived (reassessed next run), nothing is deleted, the error is reported."""
+    def admin_dir(self, worktree):
+        with open(os.path.join(worktree, ".git")) as f:
+            return f.read().split("gitdir: ", 1)[1].strip()
+
+    def age_and_gc(self, repo_dir, admin):
+        """What an auto-gc does to worktree metadata a year old: `git gc` runs `git worktree prune` with
+        gc.worktreePruneExpire (default 3 months), dropping entries whose path is missing; then everything
+        unreachable goes."""
+        old = time.time() - 365 * 24 * 3600
+        for leaf in ("index", "gitdir", "HEAD"):
+            if os.path.exists(os.path.join(admin, leaf)):
+                os.utime(os.path.join(admin, leaf), (old, old))
+        git("reflog", "expire", "--expire=now", "--all", cwd=repo_dir)
+        git("gc", "-q", "--prune=now", cwd=repo_dir)
+
+    def clean_archive(self, tid):
+        return self.archived(tid, ws.ARCHIVE_AGE_S + 60, kind="repo")
+
+    def test_repair_that_wrote_the_registry_then_timed_out_keeps_the_entry_held(self):
+        """#93 review finding 1: a repair can time out after it has written the registry. The old rollback renamed the
+        worktree back to archive/ under a registry naming held/, and the next prune deleted its admin dir. Now there
+        is no rollback: it stays in held/ (never deleted), the failure is recorded and reported, and it survives
+        later cleanups and an aggressive gc."""
         first, sha = self.unpushed_commit_in_archive(TID)
         repo_dir = ws.read_index(self.root)[TID]["repo_dir"]
-        before = ws.read_index(self.root)[TID]
         real_git = ws._git
 
-        def failing_repair(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+        def repair_then_timeout(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+            out = real_git(args, cwd=cwd, timeout=timeout)
             if args[:2] == ["worktree", "repair"]:
                 raise ws.GitTimeoutError("git worktree did not finish within 60 s")
-            return real_git(args, cwd=cwd, timeout=timeout)
+            return out
 
-        with mock.patch.object(ws, "_git", side_effect=failing_repair):
+        with mock.patch.object(ws, "_git", side_effect=repair_then_timeout):
             report = ws.cleanup_archive(self.root)
+        held = os.path.join(self.root, "held", TID)
         self.assertEqual(report["deleted"], [])
         self.assertEqual(len(report["errors"]), 1)
         self.assertIn(TID, report["errors"][0])
         self.assertIn("repair", report["errors"][0])
-        self.assertIn("moved back to archive/", report["errors"][0])
-        self.assertTrue(os.path.isdir(first))
-        self.assertEqual(os.listdir(os.path.join(self.root, "held")), [])
-        self.assertEqual(ws.read_index(self.root)[TID], before)
-        self.assertEqual(git("rev-parse", "HEAD", cwd=first).strip(), sha)
-        self.assertNotIn("prunable", git("worktree", "list", "--porcelain", cwd=repo_dir))
-        # with a working git the next run holds it properly
+        self.assertFalse(os.path.exists(first))
+        rec = ws.read_index(self.root)[TID]
+        self.assertEqual((rec["state"], rec["path"]), ("held", held))
+        self.assertIn("repair_error", rec)
+        # a later cleanup deletes another entry of the same clone, then gc runs: the held worktree is intact
+        self.clean_archive(TID2)
         report = ws.cleanup_archive(self.root)
-        held = os.path.join(self.root, "held", TID)
+        self.assertEqual(report["deleted"], [TID2])
         self.assertEqual(report["errors"], [])
-        self.assertEqual(ws.read_index(self.root)[TID]["state"], "held")
+        self.assertNotIn("repair_error", ws.read_index(self.root)[TID])     # registry right: the record is cleared
+        self.age_and_gc(repo_dir, self.admin_dir(held))
         self.assert_valid_held_worktree(held, sha, repo_dir)
 
-    def test_prune_repairs_a_held_worktree_still_registered_at_archive_first(self):
-        """A held/ directory whose registry entry still names archive/ (a crash between the move and its repair, or a
-        legacy hold) is repaired before any prune; if that repair fails nothing is pruned and the error is reported."""
+    def test_failed_repair_leaves_a_stale_entry_that_survives_and_is_repaired_later(self):
+        """A held move whose repair fails outright keeps the worktree in held/ with a stale registry entry. Nothing
+        prunes it: not the deletion of another entry, not gc on year-old metadata. The next cleanup repairs it."""
         first, sha = self.unpushed_commit_in_archive(TID)
-        self.archived(TID2, ws.ARCHIVE_AGE_S + 60, kind="repo")
-        rec = ws.read_index(self.root)[TID]
-        repo_dir = rec["repo_dir"]
-        held = os.path.join(self.root, "held", TID)
-        os.rename(first, held)                                         # a bare move: the registry still names archive/
-        ws.update_index(self.root, {**rec, "state": "held", "path": held})
-        self.assertIn("prunable", git("worktree", "list", "--porcelain", cwd=repo_dir))
+        self.clean_archive(TID2)
+        repo_dir = ws.read_index(self.root)[TID]["repo_dir"]
         real_git = ws._git
 
         def failing_repair(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
@@ -875,20 +891,210 @@ class CleanupTests(_Base):
 
         with mock.patch.object(ws, "_git", side_effect=failing_repair):
             report = ws.cleanup_archive(self.root)
-        self.assertEqual(report["deleted"], [TID2])                   # the deletion itself is complete
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual(report["deleted"], [TID2])
         self.assertEqual(len(report["errors"]), 1)
-        self.assertIn("could not be repaired", report["errors"][0])
-        self.assertIn("not pruning", report["errors"][0])
-        listing = git("worktree", "list", "--porcelain", cwd=repo_dir)
-        self.assertIn(f"worktree {first}\n", listing)                 # not pruned: the held worktree's admin dir is intact
-        self.assertEqual(git("rev-parse", "HEAD", cwd=held).strip(), sha)
-        # the next deletion in this clone repairs it and only then prunes
-        self.archived("t20261108120200-0000000c", ws.ARCHIVE_AGE_S + 60, kind="repo")
+        self.assertIn("repair", report["errors"][0])
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "held")
+        self.assertIn("repair_error", ws.read_index(self.root)[TID])
+        self.assertIn(f"worktree {first}\n", git("worktree", "list", "--porcelain", cwd=repo_dir))   # stale, kept
+        self.age_and_gc(repo_dir, self.admin_dir(held))
+        self.assertTrue(os.path.isdir(self.admin_dir(held)))
         report = ws.cleanup_archive(self.root)
-        self.assertEqual(report["deleted"], ["t20261108120200-0000000c"])
+        self.assertEqual(report["repaired"], [held])
         self.assertEqual(report["errors"], [])
-        self.assertNotIn(f"worktree {first}\n", git("worktree", "list", "--porcelain", cwd=repo_dir))
+        self.assertNotIn("repair_error", ws.read_index(self.root)[TID])
         self.assert_valid_held_worktree(held, sha, repo_dir)
+
+    def test_clones_are_protected_from_gc_pruning_worktree_metadata(self):
+        """#93 review finding 2: the auto-gc a fetch can start runs `git worktree prune` with gc.worktreePruneExpire
+        (3 months) and drops a moved, unrepaired worktree's admin dir. Every managed clone sets it to never: on
+        clone, and on prepare (before the fetch) for a clone that lacks it."""
+        rec = self.prepare(TID, repo=self.origin)
+        repo_dir = rec["repo_dir"]
+        self.assertEqual(git("config", "--local", "--get", "gc.worktreePruneExpire", cwd=repo_dir).strip(), "never")
+        git("config", "--local", "--unset", "gc.worktreePruneExpire", cwd=repo_dir)
+        calls, real_git = [], ws._git
+
+        def recording_git(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+            calls.append(list(args))
+            return real_git(args, cwd=cwd, timeout=timeout)
+
+        with mock.patch.object(ws, "_git", side_effect=recording_git):
+            self.prepare(TID2, repo="demo")
+        self.assertEqual(git("config", "--local", "--get", "gc.worktreePruneExpire", cwd=repo_dir).strip(), "never")
+        fetches = [i for i, c in enumerate(calls) if c[0] == "fetch"]
+        config = [i for i, c in enumerate(calls) if c[:2] == ["config", "--local"]]
+        self.assertTrue(fetches and config and config[0] < fetches[0])
+        # aged metadata of a worktree moved without a repair survives gc; without the setting the same gc drops it
+        with open(os.path.join(rec["path"], "w.txt"), "w") as f:
+            f.write("unpublished\n")
+        git("add", ".", cwd=rec["path"])
+        git("commit", "-q", "-m", "w", cwd=rec["path"])
+        sha = git("rev-parse", "HEAD", cwd=rec["path"]).strip()
+        held = os.path.join(self.root, "held", TID)
+        os.rename(rec["path"], held)
+        admin = self.admin_dir(held)
+        self.age_and_gc(repo_dir, admin)
+        self.assertTrue(os.path.isdir(admin))
+        git("cat-file", "-e", sha + "^{commit}", cwd=repo_dir)
+        git("config", "--local", "--unset", "gc.worktreePruneExpire", cwd=repo_dir)
+        self.age_and_gc(repo_dir, admin)
+        self.assertFalse(os.path.isdir(admin))           # the reproduction: default gc deletes it
+
+    def test_cleanup_protects_every_clone_and_never_runs_worktree_prune(self):
+        """No code path runs `git worktree prune` (or gc): a git wrapper logs every invocation over a full lifecycle
+        (prepare, settle to archive and held, cleanup deleting one and holding one), and the source never names it."""
+        log = os.path.join(self.tmp, "git.log")
+        wrapper = os.path.join(self.tmp, "git-logging")
+        with open(wrapper, "w") as f:
+            f.write(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{log}"\nexec git "$@"\n')
+        os.chmod(wrapper, 0o755)
+        with mock.patch.object(ws, "GIT", wrapper):
+            self.unpushed_commit_in_archive(TID)
+            self.clean_archive(TID2)
+            rec = self.prepare("t20261108120200-0000000c", repo="demo")
+            with open(os.path.join(rec["path"], "x.txt"), "w") as f:
+                f.write("x")
+            self.assertEqual(ws.settle(rec, self.root)["state"], "held")
+            git("config", "--local", "--unset", "gc.worktreePruneExpire", cwd=rec["repo_dir"])
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [TID2])
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(git("config", "--local", "--get", "gc.worktreePruneExpire", cwd=rec["repo_dir"]).strip(),
+                         "never")
+        with open(log) as f:
+            lines = f.read().splitlines()
+        self.assertTrue(any(line.startswith("worktree repair") for line in lines))
+        self.assertFalse([line for line in lines if "worktree prune" in line or line.split()[:1] == ["gc"]])
+        with open(ws.__file__) as f:
+            source = f.read()
+        self.assertNotIn('"worktree", "prune"', source)
+        self.assertNotIn("'worktree', 'prune'", source)
+        self.assertNotIn('["gc"', source)
+
+    def test_deletion_removes_only_its_own_admin_dir(self):
+        """The deleted worktree's admin dir goes; a stale entry of another worktree (moved, unrepaired) stays."""
+        path = self.clean_archive(TID)
+        repo_dir = ws.read_index(self.root)[TID]["repo_dir"]
+        admin = self.admin_dir(path)
+        other = self.prepare(TID2, repo="demo")
+        other_admin = self.admin_dir(other["path"])
+        with mock.patch.object(ws, "repair_registry", return_value={"repaired": [], "errors": []}):
+            os.rename(other["path"], os.path.join(self.tmp, "elsewhere"))           # stale: path missing
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [TID])
+        self.assertFalse(os.path.exists(admin))
+        self.assertTrue(os.path.isdir(other_admin))
+        self.assertIn("prunable", git("worktree", "list", "--porcelain", cwd=repo_dir))
+
+    def test_archive_whose_admin_dir_names_another_path_is_not_deleted(self):
+        path = self.clean_archive(TID)
+        admin = self.admin_dir(path)
+        with open(os.path.join(admin, "gitdir"), "w") as f:
+            f.write(os.path.join(self.tmp, "somewhere-else", ".git") + "\n")
+        with mock.patch.object(ws, "repair_registry", return_value={"repaired": [], "errors": []}):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertIn("left alone", report["errors"][0])
+        self.assertTrue(os.path.isdir(path))
+        self.assertTrue(os.path.isdir(admin))
+        # the normal run repairs the entry first, then deletes it
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual((report["repaired"], report["deleted"], report["errors"]), ([path], [TID], []))
+        self.assertFalse(os.path.exists(admin))
+
+    def test_move_between_cleanup_scan_and_deletion_cannot_lose_the_moved_worktree(self):
+        """#93 review finding 3: cleanup lists the registry, a settle renames a worktree, cleanup prunes: the moved
+        worktree lost its admin dir. Now nothing prunes: a bare rename (what the unlocked settle did) after the
+        cleanup's listing leaves its admin dir in place, and the next run repairs the registry entry."""
+        self.clean_archive(TID)
+        rec = self.prepare(TID2, repo="demo")
+        repo_dir = rec["repo_dir"]
+        with open(os.path.join(rec["path"], "w.txt"), "w") as f:
+            f.write("unpublished\n")
+        git("add", ".", cwd=rec["path"])
+        git("commit", "-q", "-m", "w", cwd=rec["path"])
+        sha = git("rev-parse", "HEAD", cwd=rec["path"]).strip()
+        held = os.path.join(self.root, "held", TID2)
+        real_git, moved = ws._git, []
+
+        def settle_move():          # what an unlocked settle did: rename, registry not yet repaired
+            if not moved:
+                os.rename(rec["path"], held)
+                moved.append(held)
+
+        def move_before_prune(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+            if args[:2] == ["worktree", "prune"]:
+                settle_move()        # the reviewer's interleave: after the cleanup listed the registry
+            return real_git(args, cwd=cwd, timeout=timeout)
+
+        with mock.patch.object(ws, "_git", side_effect=move_before_prune):
+            report = ws.cleanup_archive(self.root)
+        settle_move()                # no prune exists any more: the move simply lands after the run
+        self.assertEqual(report["deleted"], [TID])
+        self.assertTrue(os.path.isdir(self.admin_dir(held)))
+        self.age_and_gc(repo_dir, self.admin_dir(held))
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["repaired"], [held])
+        self.assert_valid_held_worktree(held, sha, repo_dir)
+
+    def test_settle_waits_for_the_cleanup_lock_and_defers_when_it_stays_held(self):
+        """#93 finding 3: settle()'s move takes cleanup.lock (bounded). Busy: the folder stays in active/, marked
+        settle_deferred, and the next cleanup settles it with a correct registry."""
+        rec = self.prepare(TID, repo=self.origin)
+        with open(os.path.join(rec["path"], "w.txt"), "w") as f:
+            f.write("unpublished\n")
+        fd = os.open(os.path.join(self.root, "cleanup.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            t0 = time.monotonic()
+            out = ws.settle(rec, self.root, lock_wait=0.3)
+            self.assertLess(time.monotonic() - t0, 10)
+        finally:
+            os.close(fd)
+        self.assertEqual(out["state"], "active")
+        self.assertTrue(out["settle_deferred"])
+        self.assertIn("cleanup", out["error"])
+        self.assertTrue(os.path.isdir(rec["path"]))
+        ws.update_index(self.root, out)
+        report = ws.cleanup_archive(self.root)
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual(report["settled"], [TID])
+        self.assertEqual(report["errors"], [])
+        done = ws.read_index(self.root)[TID]
+        self.assertEqual((done["state"], done["path"]), ("held", held))
+        self.assertNotIn("settle_deferred", done)
+        self.assertIn(f"worktree {held}\n", git("worktree", "list", "--porcelain", cwd=rec["repo_dir"]))
+        self.assertTrue(os.path.exists(os.path.join(held, "w.txt")))
+        # the runner's own retry with its stale record finds the settled one instead of calling it missing
+        self.assertEqual(ws.settle(out, self.root)["state"], "held")
+
+    def test_settle_with_a_failed_repair_records_it_and_cleanup_repairs_it(self):
+        rec = self.prepare(TID, repo=self.origin)
+        real_git = ws._git
+
+        def failing_repair(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+            if args[:2] == ["worktree", "repair"]:
+                raise ws.GitTimeoutError("git worktree did not finish within 60 s")
+            return real_git(args, cwd=cwd, timeout=timeout)
+
+        with mock.patch.object(ws, "_git", side_effect=failing_repair):
+            out = ws.settle(rec, self.root)
+        self.assertEqual(out["state"], "archived")
+        self.assertIn("repair_error", out)
+        ws.update_index(self.root, out)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["repaired"], [out["path"]])
+        self.assertNotIn("repair_error", ws.read_index(self.root)[TID])
+        self.assertIn(f"worktree {out['path']}\n", git("worktree", "list", "--porcelain", cwd=rec["repo_dir"]))
+
+    def test_start_repairs_its_clone_registry_when_cleanup_is_idle(self):
+        rec = self.prepare(TID, repo=self.origin)
+        moved = os.path.join(self.root, "held", TID)
+        os.rename(rec["path"], moved)
+        self.prepare(TID2, repo="demo")
+        self.assertIn(f"worktree {moved}\n", git("worktree", "list", "--porcelain", cwd=rec["repo_dir"]))
 
     def test_record_without_settled_time_or_wrong_state_is_kept(self):
         path = self.archived(TID, ws.ARCHIVE_AGE_S + 60)

@@ -524,7 +524,13 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   reassessed work moved to `held/` and errors consume the same time budget, and the time left in the budget is every
   git call's subprocess timeout, so one hung fetch cannot hold `cleanup.lock` past it (#93). An entry whose
   reassessment times out is left exactly as it is (reported under `timed_out`, counted as kept, retried by the next
-  run), never deleted or moved. The cleanup rechecks plain folders for a nested `.git` immediately before deletion. `integrations/launchd/com.cortados.archive-cleanup.plist` runs it daily on
+  run), never deleted or moved. The cleanup rechecks plain folders for a nested `.git` immediately before deletion.
+  Worktree metadata is never pruned globally (#93): `git worktree prune` is never run, every clone has
+  `gc.worktreePruneExpire=never`, a deleted worktree's own admin dir is removed alone, every move is followed by
+  `git worktree repair` (a failure is recorded as `repair_error`, never rolled back), and each cleanup (and each start
+  that finds `cleanup.lock` free) repairs any stale registry entry under `active/`, `archive/` or `held/`. `settle()`
+  moves under `cleanup.lock` (waits at most 60 s; past it the folder stays in `active/` marked `settle_deferred` and
+  the next cleanup settles it). Lock order: clone lock -> `cleanup.lock` -> `index.lock`. `integrations/launchd/com.cortados.archive-cleanup.plist` runs it daily on
   the Air; task startup never runs cleanup, so starting a task is not delayed by cleanup locks or remote fetches.
 - `chrome: true` on a `gui` host runs the child as a per-task LaunchAgent in the desktop session
   (`launchctl bootstrap gui/<uid> <task dir>/launchd.plist`, label `com.cortados.task.<task_id>`, booted out when the
