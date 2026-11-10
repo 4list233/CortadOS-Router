@@ -529,7 +529,8 @@ def fingerprint(*, candidate: str, weights: Path, live: str, base: str, fail_up:
     """Every input a finished sweep.json depends on. A completed sweep is accepted (--check-done) only when this is equal now:
     the request as given; the resolved candidate weights (file_id: path, size, mtime, first/last MiB hash) and both adapter
     configs; the live weights; the teacher holdout (rows + teacher truth), the outcome holdout and the validation rows the
-    candidate temperatures are fitted on; the inference thresholds, the grading/promotion constants and the live pointer
+    candidate temperatures are fitted on; the inference thresholds, every constant promotion_report() reads (MIN_TEACHER_HOLDOUT,
+    MIN_OUTCOME_HOLDOUT, OUTCOME_OVER_MIN_DROP, TEACHER_UNDER_MAX_RISE, OUTWARD_RECALL_FLOOR, _EPS) and the live pointer
     (base, frozen temperatures); and CALIBRATE_VERSION."""
     import evaluate as ev
     return {
@@ -545,7 +546,8 @@ def fingerprint(*, candidate: str, weights: Path, live: str, base: str, fail_up:
         "valid": data_hash(valid),
         "inference": {"base": base, "fail_up": fail_up, "outward_at": ev.OUTWARD_AT,
                       "teacher_under_max_rise": ev.TEACHER_UNDER_MAX_RISE, "outward_recall_floor": ev.OUTWARD_RECALL_FLOOR,
-                      "min_outcome_holdout": ev.MIN_OUTCOME_HOLDOUT, "live_pointer": {
+                      "min_outcome_holdout": ev.MIN_OUTCOME_HOLDOUT, "min_teacher_holdout": ev.MIN_TEACHER_HOLDOUT,
+                      "outcome_over_min_drop": ev.OUTCOME_OVER_MIN_DROP, "eps": ev._EPS, "live_pointer": {
                           "adapter": pointer.get("adapter"), "base": pointer.get("base"),
                           "temperatures": pointer.get("temperatures")}},
     }

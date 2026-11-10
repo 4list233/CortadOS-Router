@@ -368,7 +368,7 @@ gated() {
 # calibrate.py's score cache lets the next night resume it.
 # sweep_request returns 0 finished (request marked done), 10 already complete (runs/<c>/sweep.json's input fingerprint matches:
 # marked done without a run), 4 set aside (invalid, rejected by calibrate.py exit 2, or refused by exit 4), 1 failed (request
-# kept), 5 set aside after failing on SWEEP_FAIL_NIGHTS nights (alert; the cycle trains normally), 3 not started.
+# kept; also a missing or unreadable calibrate.py, checked before any exit 2 is trusted), 5 set aside after failing on SWEEP_FAIL_NIGHTS nights (alert; the cycle trains normally), 3 not started.
 sweep_mark() {   # sweep_mark done|invalid|refused|failed <note>: move the request aside with a timestamp (never deleted)
   local stamp dest
   stamp=$(date +%Y%m%d-%H%M%S); dest="data/sweep-request.$1-$stamp.json"
@@ -378,8 +378,18 @@ sweep_mark() {   # sweep_mark done|invalid|refused|failed <note>: move the reque
   python3 -B ./sweep_request.py mark "$dest" "$1" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$2" || echo "WARNING: could not record $1_at in $dest"
   if [ "$1" = done ]; then echo "sweep request marked done: $dest ($2)"; else echo "sweep request set aside as $dest ($2)"; fi
 }
+sweep_failed_night() {   # sweep_failed_night <why>: a runtime failure; the request is kept (1) or set aside on the 3rd night (5)
+  local frc
+  echo "SWEEP FAILED or interrupted $1; request kept for the next cycle"
+  # Starvation bound: a request that fails on SWEEP_FAIL_NIGHTS distinct nights is set aside, so training gets its nights back.
+  python3 -B ./sweep_request.py failed data/sweep-request.json "$NIGHT" "$1" "$SWEEP_FAIL_NIGHTS"; frc=$?
+  [ $frc -eq 0 ] && return 1
+  [ $frc -eq 10 ] || { echo "WARNING: recording the failed sweep night failed (rc $frc): the request stays pending"; return 1; }
+  sweep_mark failed "calibration sweep failed on $SWEEP_FAIL_NIGHTS nights"
+  return 5
+}
 sweep_request() {
-  local req=data/sweep-request.json args prc rc crc frc why
+  local req=data/sweep-request.json args prc rc crc why
   [ -f "$req" ] || return 3
   [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 1 ] || { echo "sweep request waits: training not allowed now"; return 3; }
   # Shape and ranges (sweep_request.py: finite numbers, alphas/scales in (0, 1], tilts in [0, 1], non-empty tilts/alphas, size
@@ -390,6 +400,11 @@ sweep_request() {
     sweep_mark invalid "${why:-validation rc=$prc}"; echo "SWEEP REQUEST INVALID: ${why:-validation rc=$prc}"; return 4
   fi
   local IFS=$'\n'; set -f; local -a argv=($args); set +f; unset IFS
+  # Exit 2 below means calibrate.py rejected the request, but python also exits 2 when it cannot open the script: a missing or
+  # unreadable calibrate.py is a broken install (runtime failure, counted toward SWEEP_FAIL_NIGHTS), never an invalid request.
+  if [ ! -f calibrate.py ] || [ ! -r calibrate.py ]; then
+    sweep_failed_night "calibrate.py missing or unreadable in $PWD"; return
+  fi
   # Already complete? Only when runs/<c>/sweep.json records the input fingerprint calibrate.py computes NOW from the same
   # arguments and environment (request, candidate weights and configs, holdouts, validation rows, thresholds, version): a changed
   # candidate, holdout or threshold runs the sweep again (its score cache decides what is reused). Reads files only, no model,
@@ -416,14 +431,7 @@ sweep_request() {
   elif [ $rc -eq 2 ]; then   # argparse / grid rejection: the same request fails the same way every night, so it is not retried
     echo "SWEEP REQUEST INVALID: $(tail -1 data/sweep-last.log | cut -c1-200)"; sweep_mark invalid "calibrate.py rejected the arguments (exit 2)"; return 4
   elif [ $rc -ne 0 ]; then
-    why="rc=$rc: $(tail -1 data/sweep-last.log | cut -c1-200)"
-    echo "SWEEP FAILED or interrupted $why; request kept for the next cycle"
-    # Starvation bound: a request that fails on SWEEP_FAIL_NIGHTS distinct nights is set aside, so training gets its nights back.
-    python3 -B ./sweep_request.py failed "$req" "$NIGHT" "$why" "$SWEEP_FAIL_NIGHTS"; frc=$?
-    [ $frc -eq 0 ] && return 1
-    [ $frc -eq 10 ] || { echo "WARNING: recording the failed sweep night failed (rc $frc): the request stays pending"; return 1; }
-    sweep_mark failed "calibration sweep failed on $SWEEP_FAIL_NIGHTS nights"
-    return 5
+    sweep_failed_night "rc=$rc: $(tail -1 data/sweep-last.log | cut -c1-200)"; return
   fi
   sweep_mark done "sweep finished"
   grep '^sweep:' data/sweep-last.log | tail -1   # summary only; the outcome above is already decided by rc

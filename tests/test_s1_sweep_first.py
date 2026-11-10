@@ -2,6 +2,7 @@
 cache, one model resident at a time, atomic sweep.json), nightly.sh (sweep first, the rest of the night off, scales from the
 request, retention keeps the candidate) and overnight.py (no quota cooldown past the window start while a sweep is pending).
 Fakes only: no MLX, no model, no real ~/cortados or ~/.cortados, no Studio."""
+import importlib
 import importlib.util
 import json
 import os
@@ -420,12 +421,32 @@ class CheckDone(SweepFixture, unittest.TestCase):
               "live pointer temperatures changed")
         p = mock.patch.object(ev, "OUTWARD_AT", ev.OUTWARD_AT + 0.1)
         stale(p.start, p.stop, "outward threshold changed")
+        for name, bump in (("MIN_TEACHER_HOLDOUT", 1), ("MIN_OUTCOME_HOLDOUT", 1), ("OUTCOME_OVER_MIN_DROP", 0.01),
+                           ("TEACHER_UNDER_MAX_RISE", 0.01), ("OUTWARD_RECALL_FLOOR", 0.01), ("_EPS", 1e-9)):
+            p = mock.patch.object(ev, name, getattr(ev, name) + bump)
+            stale(p.start, p.stop, f"promotion constant {name} changed")
         with self.subTest("fail-up threshold changed"):
             self.assertEqual(self.check("--fail-up", "0.7"), 0)
         with self.subTest("request changed"):
             self.assertEqual(self.check("--scales", "0.5"), 0)
         v = mock.patch.object(cal, "CALIBRATE_VERSION", cal.CALIBRATE_VERSION + 1)
         stale(v.start, v.stop, "calibrate.py version changed")
+
+    def test_raising_the_teacher_holdout_minimum_after_a_finished_sweep_runs_it_again(self):
+        """#74 review: CORTADOS_S1_MIN_HOLDOUT is read at import; a sweep whose reports were computed under the old minimum is
+        not complete once the minimum changes."""
+        self.assertEqual(self.main(), 0)
+        self.assertEqual(self.check(), cal.EXIT_ALREADY_DONE)
+        old = ev.MIN_TEACHER_HOLDOUT
+        try:
+            with mock.patch.dict(os.environ, {"CORTADOS_S1_MIN_HOLDOUT": str(old + 50)}):
+                importlib.reload(ev)       # the environment is read once, as a fresh calibrate.py process would
+                self.assertEqual(ev.MIN_TEACHER_HOLDOUT, old + 50)
+                self.assertEqual(self.check(), 0)
+        finally:
+            importlib.reload(ev)
+        self.assertEqual(ev.MIN_TEACHER_HOLDOUT, old)
+        self.assertEqual(self.check(), cal.EXIT_ALREADY_DONE)
 
     def test_a_sweep_json_without_a_fingerprint_is_not_complete(self):
         self.main()
@@ -696,6 +717,46 @@ class SweepFirstNightly(unittest.TestCase):
                 self.assertEqual(len(list((self.s1 / "data").glob("sweep-request.invalid-*.json"))), 1, log)
                 self.assertEqual((self.s1 / "data/sweep-count").exists(), ran, log)
                 self.assertIn("training tonight", log)
+
+    def test_missing_or_unreadable_calibrate_is_a_failed_night_not_an_invalid_request(self):
+        """#74 review: python exits 2 when it cannot open calibrate.py, the same code as a rejected request. A broken install
+        is retried and counted toward SWEEP_FAIL_NIGHTS; the valid request is never set aside as invalid."""
+        cal_py = self.s1 / "calibrate.py"
+
+        def missing():
+            cal_py.unlink()
+
+        def unreadable():
+            cal_py.chmod(0)
+        for night, (why, breaks) in zip(("2026-11-09", "2026-11-10", "2026-11-11"),
+                                        (("missing", missing), ("unreadable", unreadable), ("missing", missing))):
+            req = self.request()
+            breaks()
+            try:
+                rc, log, _ = self.run_night(STUB_NEW_LABELS=5, CORTADOS_S1_NIGHT_DATE=night)
+            finally:
+                if cal_py.exists():
+                    cal_py.chmod(0o644)
+            with self.subTest(night=night, why=why):
+                self.assertNotIn("SWEEP REQUEST INVALID", log)
+                self.assertNotIn("rejected the arguments", log)
+                self.assertEqual(list((self.s1 / "data").glob("sweep-request.invalid-*.json")), [], log)
+                self.assertIn("calibrate.py missing or unreadable", log)
+                self.assertFalse((self.s1 / "data/check-count").exists(), log)
+                self.assertFalse((self.s1 / "data/sweep-count").exists(), log)
+                if night != "2026-11-11":
+                    self.assertEqual(rc, 1, log)
+                    self.assertTrue(req.exists(), log)
+                    self.assertEqual(self.lora(), "", log)
+        self.assertEqual(rc, 0, log)                              # third failed night: set aside as failed, the night trains
+        self.assertFalse(req.exists(), log)
+        aside = list((self.s1 / "data").glob("sweep-request.failed-*.json"))
+        self.assertEqual(len(aside), 1, log)
+        rec = json.loads(aside[0].read_text())
+        self.assertEqual(sorted(rec["failed_nights"]), ["2026-11-09", "2026-11-10", "2026-11-11"])
+        self.assertIn("calibrate.py missing or unreadable", rec["failed_nights"]["2026-11-10"])
+        self.assertIn("ALERT: calibration sweep failed on 3 nights", log)
+        self.assertIn("--train", self.lora())
 
     def test_three_failed_nights_set_the_request_aside_with_an_alert_and_the_night_trains(self):
         req = self.request()

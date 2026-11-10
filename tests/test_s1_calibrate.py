@@ -272,6 +272,7 @@ class NightlySweepStep(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp(prefix="s1-sweep-"))
         (tmp / "data").mkdir()
         (tmp / "sweep_request.py").write_text((S1 / "sweep_request.py").read_text())   # validation and set-aside records
+        (tmp / "calibrate.py").write_text("")   # must exist and be readable (a missing one is a failed night); the fake gate never runs it
         if with_request:
             (tmp / "data/sweep-request.json").write_text(json.dumps(
                 {"candidate": "runs/2026-11-08/adapter", "live": "runs/2026-10-16-0130/adapter", "tilts": [0, 0.1], "alphas": [1.0, 0.7]}))
