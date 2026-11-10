@@ -40,6 +40,21 @@
 #   CORTADOS_S1_TRAIN_ONLY_IN_WINDOW  continuous mode: gated training/eval only inside CORTADOS_S1_NIGHT_WINDOW (default 1;
 #                               0 = any time; Forest 2026-11-08). overnight.py decides per cycle and passes CORTADOS_S1_TRAIN_ALLOWED
 #                               (0 = label/dataset only, every gated step skipped, rc 0) and stops the cycle at the window end.
+#   CORTADOS_S1_TRAIN_UNTIL     set by overnight.py: epoch seconds of the current night window's end (empty when there is none);
+#                               a finished sweep keeps training off until then (see "Sweep first" below)
+#   CORTADOS_STUDIO_ACK_WAIT    the studio gate's wait for the capacity daemon's ack, 0-30 s (default 30; read by
+#                               cortados_router/studio_capacity.py, which may only shorten it). 0 in data/train-config.env skips the
+#                               wait: the gate still unloads every resident Ollama model itself and confirms it, as it does after
+#                               every ack or timeout, so only the daemon's own unload is no longer waited for. Daemon unchanged.
+# Sweep first (#74): when data/sweep-request.json is pending and training is allowed, the cycle runs the calibration sweep
+#   (calibrate.py) BEFORE anything else and ends: no labeling, training or evaluation in that cycle. Finished: the request is
+#   renamed sweep-request.done-<stamp>.json with done_at recorded, and data/sweep-night-until (= CORTADOS_S1_TRAIN_UNTIL) keeps
+#   training off for the rest of that night, so normal cycles resume the next night. Stopped (window end, --stop): the request
+#   stays and the next night resumes it (calibrate.py keeps every scored row). Failed: exit 1 (request kept, ALERT after
+#   CORTADOS_S1_EVAL_FAIL_NIGHTS nights of failures; remove the request to give the nights back to training). Invalid or refused
+#   (calibrate.py exit 4, e.g. no candidate weights): set aside as sweep-request.invalid-/refused-<stamp>.json; the cycle goes on.
+#   Request: {"candidate": "runs/<c>/adapter", "live": "runs/<l>/adapter", "tilts": [...], "alphas": [...], "scales": [...]};
+#   scales default to none. Its candidate run is kept by the retention pass while the request is pending.
 # Exit codes: 0 ok / skipped, 3 labeling failed, 1 other failure, 2 base model missing, 130 stopped.
 set -u
 cd "$(dirname "$0")" || exit 1
@@ -211,15 +226,30 @@ newest_unfinished_run() {   # most recent run stopped mid-training: a segment be
       && compgen -G "$d/adapter/*_adapters.safetensors" >/dev/null && { echo "$d"; return; }
   done
 }
+sweep_candidate_run() {   # the run dir of a pending sweep request's candidate (as written, and normalised), or nothing
+  [ -f data/sweep-request.json ] || return 0
+  python3 -c 'import json, os.path, sys
+try:
+    c = json.load(open(sys.argv[1]))["candidate"]
+except Exception:
+    sys.exit(0)
+if isinstance(c, str) and c.strip("/"):
+    print(os.path.normpath(os.path.dirname(c.rstrip("/"))))' data/sweep-request.json 2>/dev/null
+}
 prune_unresumable_runs() {   # only tonight's run is ever resumed, so other unfinished runs' checkpoints (~0.65 GB each) are dead weight
-  local d promoted pending_run=""
+  local d promoted pending_run="" sweep_run
   promoted=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['adapter'])" "${SERVE_POINTER:-current.json}" 2>/dev/null)
   # a pending candidate (e.g. its evaluation crashed, so it has no report.json) is kept: it is re-evaluated, not retrained
   read_pending && pending_run=$p_run
+  # a pending sweep's candidate is often an unfinished run (step checkpoints only, #74): deleting it would leave nothing to sweep
+  sweep_run=$(sweep_candidate_run)
   for d in runs/20*/; do
     d=${d%/}
     [ "$d" = "$RUN" ] || [ -f "$d/report.json" ] || [ ! -d "$d/adapter" ] && continue
     [ -n "$pending_run" ] && [ "$d" = "$pending_run" ] && continue
+    if [ -n "$sweep_run" ] && { [ "$d" = "$sweep_run" ] || [ "$PWD/$d" = "$sweep_run" ]; }; then
+      echo "retention: keeping $d (candidate of the pending sweep request)"; continue
+    fi
     case "$promoted" in *"/$d/"*) continue ;; esac
     rm -rf -- "$d/adapter" && echo "retention: removed checkpoints of unfinished $d (logs kept)"
   done
@@ -311,7 +341,8 @@ GATE_ROOT="$(cd .. && pwd)"   # repo root, fixed here: gated also runs from insi
 # The gate interpreter is resolved to an absolute path HERE (cwd s1/): $PY defaults to ../.venv-mlx/bin/python, which
 # would resolve to s1/.venv-mlx after the laya branch's `cd laya`. A bare name (python3) stays a PATH lookup.
 case "$PY" in /*) GATE_PY="$PY" ;; */*) GATE_PY="$(cd "$(dirname "$PY")" 2>/dev/null && pwd)/$(basename "$PY")" || GATE_PY="$PY" ;; *) GATE_PY="$PY" ;; esac
-# Test-only: CORTADOS_STUDIO_ACK_WAIT / CORTADOS_STUDIO_OLLAMA_PORT (see studio_capacity.py) pass through the environment.
+# CORTADOS_STUDIO_ACK_WAIT (0-30 s; 0 is fine in data/train-config.env, see the header) and the test-only
+# CORTADOS_STUDIO_OLLAMA_PORT (see studio_capacity.py) pass through the environment.
 # Exit 75 = the gate refused (model residency could not be confirmed absent); the command did not run.
 # CORTADOS_S1_TRAIN_ALLOWED=0 (set by overnight.py outside the night window) is enforced again here so no gated step can slip
 # through a future code path; the main flow exits before the first gated step, so reaching this refusal is a bug, not a skip.
@@ -319,70 +350,82 @@ gated() {
   [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 0 ] && { echo "gated step refused: ${CORTADOS_S1_TRAIN_SKIP_REASON:-training not allowed now}"; return 75; }
   PYTHONPATH="$GATE_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$GATE_PY" -B -m cortados_router.studio_capacity gate -- "$@"
 }
-# Calibration sweep (evaluation only, never promotes): when data/sweep-request.json exists
-#   {"candidate": "runs/<c>/adapter", "live": "runs/<l>/adapter", "tilts": [...], "alphas": [...]}
-# calibrate.py grades the requested tilt/blend settings and writes runs/<c>/sweep.json (+ sweep.md). Gated, so it holds the
-# training lock and refuses when CORTADOS_S1_TRAIN_ALLOWED=0. When: from the EXIT trap (sweep_on_exit), so it runs on EVERY
-# in-window cycle whatever path ended it (no new labels, pending candidate, laya night, resume, full train+evaluate), always
-# AFTER that cycle's own work: it can delay the next cycle, never replace this one's training. A failed or interrupted sweep
-# keeps the request for the next cycle (logged); a finished one renames it sweep-request.done-<stamp>.json.
+# Calibration sweep (evaluation only, never promotes): data/sweep-request.json
+#   {"candidate": "runs/<c>/adapter", "live": "runs/<l>/adapter", "tilts": [...], "alphas": [...], "scales": [...]}
+# calibrate.py grades the requested tilt/blend/scale settings and writes runs/<c>/sweep.json (+ sweep.md). Gated, so it holds the
+# training lock and refuses when CORTADOS_S1_TRAIN_ALLOWED=0. When: FIRST in an in-window cycle (#74, "Sweep first" in the header):
+# it used to run from the EXIT trap after the cycle's training and evaluation, which fill the window, so it never finished.
 # Stops need no bash process management here: the sweep runs in the FOREGROUND through gated(), like every other gated step.
 # A stop (overnight.py's stop_group_drained) TERMs the whole cycle process group, which includes the gate wrapper; the gate
 # stops its own command group (own session, inherited lock fd) within its 30 s grace and exits 128+signum, and bash runs the
-# TERM/INT trap only after that foreground gate has returned. So a stopped sweep always returns nonzero and keeps the request.
+# TERM/INT trap (exit 130) only after that foreground gate has returned. So a stopped sweep never marks the request done, and
+# calibrate.py's score cache lets the next night resume it.
+# sweep_request returns 0 finished (request marked done), 10 already complete (runs/<c>/sweep.json matches the request: marked
+# done without a run), 4 set aside (invalid, or refused by calibrate.py exit 4), 1 failed (request kept), 3 not started.
+sweep_mark() {   # sweep_mark done|invalid|refused <note>: move the request aside with a timestamp (never deleted)
+  local stamp dest
+  stamp=$(date +%Y%m%d-%H%M%S); dest="data/sweep-request.$1-$stamp.json"
+  mv data/sweep-request.json "$dest" || { echo "WARNING: could not move data/sweep-request.json to $dest"; return 1; }
+  [ "$1" = done ] || { echo "sweep request set aside as $dest ($2)"; return 0; }
+  # done_at inside the file too, so the record survives a copy or a rename (atomic rewrite)
+  python3 - "$dest" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$2" <<'PY' || echo "WARNING: could not record done_at in $dest"
+import json, os, sys
+p = sys.argv[1]
+r = json.load(open(p))
+r.update(done_at=sys.argv[2], done=sys.argv[3])
+open(p + ".tmp", "w").write(json.dumps(r, indent=1) + "\n")
+os.replace(p + ".tmp", p)
+PY
+  echo "sweep request marked done: $dest ($2)"
+}
 sweep_request() {
   local req=data/sweep-request.json args prc rc
-  [ -f "$req" ] || return 0
-  [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 1 ] || { echo "sweep request waits: training not allowed now"; return 0; }
+  [ -f "$req" ] || return 3
+  [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 1 ] || { echo "sweep request waits: training not allowed now"; return 3; }
   args=$(python3 - "$req" <<'PY'
 import json, sys
 from pathlib import Path
-r = json.load(open(sys.argv[1]))
-if not isinstance(r.get("candidate"), str) or not isinstance(r.get("live"), str):
+try:
+    r = json.load(open(sys.argv[1]))
+except (OSError, ValueError) as e:
+    sys.exit(f"sweep request unreadable: {e}")
+if not isinstance(r, dict) or not isinstance(r.get("candidate"), str) or not isinstance(r.get("live"), str):
     sys.exit("sweep request needs string candidate and live")
-for k in ("tilts", "alphas"):
-    if not isinstance(r.get(k, []), list) or not all(isinstance(x, (int, float)) for x in r.get(k, [])):
+for k in ("tilts", "alphas", "scales"):
+    v = r.get(k, [])
+    if not isinstance(v, list) or not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v):
         sys.exit(f"sweep request {k} must be a list of numbers")
+want = {"tilts": r.get("tilts", [0]), "alphas": r.get("alphas", [1.0]), "scales": r.get("scales", [])}   # scales: none unless asked
 out = Path(r["candidate"]).parent / "sweep.json"
+try:   # a finished sweep for exactly this request (e.g. the rename after it failed): nothing to run
+    done = json.load(open(out))
+    if done.get("live") == r["live"] and {k: [float(x) for x in v] for k, v in (done.get("request") or {}).items()} == \
+            {k: [float(x) for x in v] for k, v in want.items()}:
+        sys.exit(10)
+except (OSError, ValueError, AttributeError, TypeError):
+    pass
 print("\n".join(["--candidate", r["candidate"], "--live", r["live"], "--out", str(out),
-                  "--tilts", *map(str, r.get("tilts", [0])), "--alphas", *map(str, r.get("alphas", [1.0]))]))
+                 "--tilts", *map(str, want["tilts"]), "--alphas", *map(str, want["alphas"]), "--scales", *map(str, want["scales"])]))
 PY
   ); prc=$?
-  # A TERM/INT during parsing also kills the parser (same process group); the latch is checked first so that is logged as a
-  # stop, not as an invalid request. Checked once more right before the launch.
-  [ "$SWEEP_CANCELLED" = 1 ] && { echo "SWEEP NOT STARTED: stop requested; request kept for the next cycle"; return 0; }
-  [ $prc -eq 0 ] || { echo "SWEEP REQUEST INVALID ($req, parse rc=$prc); left in place"; return 0; }
+  if [ $prc -eq 10 ]; then sweep_mark done "runs/<c>/sweep.json already complete for this request"; return 10; fi
+  if [ $prc -ne 0 ]; then sweep_mark invalid "parse rc=$prc"; echo "SWEEP REQUEST INVALID (parse rc=$prc)"; return 4; fi
   local IFS=$'\n'; set -f; local -a argv=($args); set +f; unset IFS
   HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" \
     gated "$PY" calibrate.py --base "$BASE" "${argv[@]}" > data/sweep-last.log 2>&1
   rc=$?
-  # The rename depends on rc ALONE, decided before any logging. rc 0 means the gate returned success, so the sweep finished;
-  # a TERM arriving after that (even one whose trap already set SWEEP_CANCELLED) is harmless and renaming is correct.
-  # A TERM during the sweep makes the gate exit 143, so the request is kept.
-  if [ $rc -ne 0 ]; then
+  grep -E '^(candidate|sweep refused)' data/sweep-last.log | head -2   # which weights were used (or why refused)
+  # The outcome depends on rc ALONE. rc 0 means the gate returned success, so the sweep finished and wrote sweep.json.
+  # A TERM during the sweep makes the gate exit 143 and the trap ends the cycle (exit 130): the request is kept.
+  if [ $rc -eq 4 ]; then
+    echo "SWEEP REFUSED: $(tail -1 data/sweep-last.log | cut -c1-200)"; sweep_mark refused "calibrate.py exit 4"; return 4
+  elif [ $rc -ne 0 ]; then
     echo "SWEEP FAILED or interrupted rc=$rc: $(tail -1 data/sweep-last.log | cut -c1-200); request kept for the next cycle"
-    return 0
+    return 1
   fi
-  mv "$req" "data/sweep-request.done-$(date +%Y%m%d-%H%M%S).json" || { echo "SWEEP DONE but rename of $req failed"; return 0; }
-  grep '^sweep:' data/sweep-last.log | tail -1   # summary only; the rename above is already decided by rc
-}
-# Armed once the cycle's traps are in place and only when CORTADOS_S1_TRAIN_ALLOWED=1; the TERM/INT trap disarms it, so a stop
-# (window end, supervisor, --stop) never starts a sweep. Runs at most once (disarmed before it starts). Not after exit 130
-# (stop requested) or a signal death (>128), nor while the stop flag is present. During the sweep TERM/INT only latch
-# SWEEP_CANCELLED (no exit inside the EXIT handler): the gate stops itself on the same group TERM, the request is kept, and
-# cleanup finishes normally.
-SWEEP_ARMED=0; SWEEP_CANCELLED=0
-sweep_on_exit() {
-  local rc=$1
-  [ "$SWEEP_ARMED" = 1 ] || return 0
-  SWEEP_ARMED=0
-  [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 1 ] || return 0
-  [ "$rc" -lt 128 ] || return 0
-  [ -f "${STOPFLAG:-/nonexistent}" ] && return 0
-  [ -f data/sweep-request.json ] || return 0
-  trap 'echo "stop requested during sweep"; SWEEP_CANCELLED=1' TERM INT
-  echo "=== $(date) sweep request (after this cycle's work)"
-  sweep_request
+  sweep_mark done "sweep finished"
+  grep '^sweep:' data/sweep-last.log | tail -1   # summary only; the outcome above is already decided by rc
+  return 0
 }
 evaluate_run() {   # grade <run>/adapter against the CURRENT incumbent and holdout; writes <run>/report.json
   worked_cycle
@@ -448,12 +491,10 @@ stop_deadline() {
     deadline=""
   fi
 }
-# TERM/INT are ignored only AFTER sweep_on_exit returns: the sweep itself must stay stoppable, but overnight.py re-sends TERM to
-# the cycle group every 5 s while draining, and one landing in the tail would run the exit-130 trap (or kill a step) and cut
-# cleanup short: watcher not reaped, scorer not reloaded, pidfile left behind. The tail is short and bounded, so it finishes.
+# TERM/INT are ignored during cleanup: overnight.py re-sends TERM to the cycle group every 5 s while draining, and one landing
+# in the tail would run the exit-130 trap (or kill a step) and cut cleanup short: watcher not reaped, scorer not reloaded,
+# pidfile left behind. The tail is short and bounded, so it finishes.
 cleanup() {
-  local rc=$?
-  sweep_on_exit "$rc"
   trap '' TERM INT
   stop_deadline; pkill -TERM -P $$ 2>/dev/null; gpu_share; rm -f "$PIDFILE"
 }
@@ -462,8 +503,33 @@ trap cleanup EXIT
 # relaunch while it exists. A TERM here can also be the supervisor's own stop_tree (launchctl unload/kickstart -k, logout,
 # shutdown): flagging that would leave continuous training stopped for good after a reboot, so the trap does not touch it.
 # Window mode keeps the old behaviour (a TERM is a stop for tonight; the next night clears the flag).
-trap 'echo "stop requested"; SWEEP_ARMED=0; [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] || touch "$STOPFLAG"; exit 130' TERM INT
-[ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 1 ] && SWEEP_ARMED=1   # the sweep request runs from cleanup on a normal end of this cycle
+# The message goes to the run log by name: bash runs this trap inside a redirected function call (the sweep's gated step writes
+# to data/sweep-last.log), where stdout is not the log.
+trap 'echo "stop requested" >> "$RUN/nightly.log"; [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] || touch "$STOPFLAG"; exit 130' TERM INT
+# Sweep first (#74; header "Sweep first"): a pending request takes the whole cycle, before labeling, training and evaluation.
+# Its only Studio work is the gated calibrate.py run and it makes no labeling calls, so overnight.py starts it at the window
+# start even after an evening quota stop. Finished: training stays off for the rest of this night (data/sweep-night-until).
+if [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 1 ] && [ -f data/sweep-request.json ]; then
+  echo "=== $(date) sweep request pending: the sweep runs first; no labeling, training or evaluation in this cycle"
+  sweep_request; src=$?
+  case "$src" in
+    0)
+      worked_cycle   # the next cycle starts at once: it labels, and skips training while data/sweep-night-until is ahead
+      night_end="${CORTADOS_S1_TRAIN_UNTIL:-}"   # empty without a window (window mode, or training allowed any time)
+      if [[ "$night_end" =~ ^[0-9]{1,12}$ ]]; then
+        if echo "$night_end" > data/sweep-night-until.tmp && mv data/sweep-night-until.tmp data/sweep-night-until; then
+          echo "training stays off until this night window ends (epoch $night_end); normal cycles resume the next night"
+        else echo "WARNING: could not write data/sweep-night-until: the next cycle may train tonight"; fi
+      fi
+      state event "$STATUS" sweep "calibration sweep finished"; streak sweep_failed clear "$EVAL_FAIL_NIGHTS"
+      echo "=== $(date) nightly end"; exit 0 ;;
+    1)
+      state event "$STATUS" sweep_failure "calibrate.py failed; request kept"
+      streak sweep_failed hit "$EVAL_FAIL_NIGHTS" "calibration sweep failed; training waits while data/sweep-request.json is pending"
+      echo "=== $(date) nightly end"; exit 1 ;;
+    *) echo "no sweep to run (sweep_request rc $src); this cycle goes on normally" ;;
+  esac
+fi
 # unitcost / refresh-tiers live in the router checkout; a missing one is logged, never fatal (labelling and training do not need them)
 if [ -f "$REPO_ROOT/cortados_router/unitcost.py" ]; then python3 "$REPO_ROOT/cortados_router/unitcost.py" > /dev/null 2>&1 || echo "unitcost.py failed (rc $?)"   # daily re-normalisation: tokens per percent per pool
 else echo "unitcost.py not found under $REPO_ROOT: skipped"; fi
@@ -580,6 +646,16 @@ fi
 if [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 0 ]; then
   echo "${CORTADOS_S1_TRAIN_SKIP_REASON:-training skipped: outside the night window}"
   echo "=== $(date) nightly end"; exit 0
+fi
+# The night a calibration sweep finished belongs to the sweep (#74): labeling above still ran, every gated step waits for the next
+# night. The marker holds that night window's end (epoch); once it has passed it is removed and the cycle goes on normally.
+if [ -f data/sweep-night-until ]; then
+  sweep_until=$(head -c 20 data/sweep-night-until | tr -cd '0-9')
+  if [[ "$sweep_until" =~ ^[0-9]{1,12}$ ]] && [ "$(date +%s)" -lt "$sweep_until" ]; then
+    echo "training skipped: tonight's window went to the calibration sweep; normal training resumes the next night"
+    state event "$STATUS" skip "sweep night"; echo "=== $(date) nightly end"; exit 0
+  fi
+  rm -f data/sweep-night-until
 fi
 force="${1:-}"; [ -f data/force-train ] && force="--train" && rm -f data/force-train
 if [ -f data/pending-candidate ] && [ "$force" = "--train" ]; then
