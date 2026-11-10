@@ -699,20 +699,26 @@ Each finished child task (any terminal state) is exported as one JSON line for a
   exact launch credentials before it writes the final `result.json`, and records `logs_redacted` / `prompt_redacted`
   there. Every text then goes through the Redactor that produced `result.json` and the pattern scrub, in that order,
   before it is capped at 32,000 characters per field (the cut is marked `[truncated by cortados: N of M characters
-  cut]` and counted). A line that still matches a credential is not written. Raw `stdout.log` content is never
-  written.
+  cut]` and counted). A line that still matches a current credential is not written; that check knows only the
+  credentials of the export's own time, so it is no protection against a token that has rotated since (the rules
+  below are). Raw `stdout.log` content is never written.
 - Caller text: `start_task` checks what the caller supplies against every credential it knows, including the child's
   launch credentials, before `meta.json` exists. A label (the title, the client name, the Office tags) is redacted
   there; a value the task runs with (`cwd`, `repo`, `branch`, the orchestrator, `allowed_tools`, the session tag) that
   holds a credential is refused, naming the field, never the value. `meta.json` is then marked `caller_text_redacted`,
-  and the runner redacts `result.json`'s error and workspace text with the launch credentials too.
+  and the runner redacts `result.json`'s error and workspace text with the launch credentials too. A task started for
+  another execution host is checked the same way on this machine before the request leaves (the host knows only its
+  own credentials): labels and the task prompt are redacted, a value the task runs with is refused.
 - A late export (a status call after the runner died, or the cleanup retry) reads prompt and logs only when they are
   marked redacted, or when the current credentials provably include the launch ones (sha256 fingerprints in
   `meta.json`); it never redacts raw material with credentials that may have rotated since. Otherwise the record goes
   out with `prompt: null`, no events and a `withheld_reason`, keeping the metadata and `event_counts`. The caller
   fields (`title`, `client`, `cwd`, `orchestrator`, `model`, `error`, `parent_note`, the workspace's `repo`, `branch`
   and `reason`) follow the same rule: without the `caller_text_redacted` mark (a task started before it existed) and
-  without matching credentials they are null and listed in `withheld_fields`. Withheld logs are only counted: they
+  without matching credentials they are null and listed in `withheld_fields`. A workspace read from `workspace.json`
+  or `meta.json` (no workspace in `result.json`) was never redacted with the launch credentials: its `repo`,
+  `branch` and `reason` are included only with matching credentials. `error` is always present, null when there is
+  none or it is withheld. Withheld logs are only counted: they
   are parsed for `event_counts`, never redacted, scrubbed or kept. A runner that
   died before redaction: its task is exported by the first status call that can release its logs, else just before
   cleanup with them withheld.

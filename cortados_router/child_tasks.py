@@ -53,6 +53,7 @@ import shlex
 import shutil
 import socket
 import stat
+import string
 import signal
 import subprocess
 import sys
@@ -810,9 +811,16 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
                                 "chrome child must start inside the desktop session (an ssh session cannot read the "
                                 "login Keychain that holds Claude's login)")
         root = _private_root()  # fail before ssh: a remotely launched task must always be locally trackable
-        args = {"task": task, "cwd": cwd, "orchestrator": orchestrator, "permission_mode": permission_mode,
-                "allowed_tools": allowed_tools, "chrome": chrome, "connectors": connectors, "client": client,
-                "title": title, "session_tag": session_tag, "repo": repo, "branch": branch,
+        # The host redacts with ITS credentials only: this machine's are checked here, by the local rules (#91 review
+        # round 3, P1): what the task runs with is refused, labels and the prompt are redacted before they leave.
+        start_red = _start_redactor(red)
+        _refuse_credentials(start_red, {"cwd": cwd, "repo": repo, "branch": branch, "orchestrator": orchestrator,
+                                        "allowed_tools": tools, "session": session_tag})
+        args = {"task": start_red.text(task), "cwd": cwd, "orchestrator": orchestrator,
+                "permission_mode": permission_mode, "allowed_tools": allowed_tools, "chrome": chrome,
+                "connectors": connectors, "client": start_red.text(str(client)) if client else client,
+                "title": start_red.text(title) if isinstance(title, str) else title,
+                "session_tag": session_tag, "repo": repo, "branch": branch,
                 "parent_task_id": parent_id}   # resolved here: the host's own env does not know this session
         try:
             out = _remote(target.name, "start", args)
@@ -2034,6 +2042,7 @@ SCRUB_PATTERNS = (
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
 )
 SCRUB_SLACK_CHARS = 4_096                    # scrubbed past the cap, so a secret straddling the cut is still caught
+_TOKEN_CHARS = string.ascii_letters + string.digits + "._~+/=-"   # a secret's characters: stripped at a scrub cut
 SCRUB_KEYS = ("authorization", "proxy-authorization", "x-api-key")   # a dict value under such a key is scrubbed whole
 _ALREADY_MASKED = re.compile(r"\s*(?:[A-Za-z]+\s+)?(?:\*\*\*|\[scrubbed:[a-z_]+\])\s*")
 
@@ -2169,9 +2178,14 @@ class _Cap:
 
     def text(self, s: str) -> str:
         """Scrubbed, then capped. Only the first limit + SCRUB_SLACK_CHARS characters are scrubbed: the rest is cut
-        anyway, and the slack still catches a secret that straddles the cut."""
-        n = len(s)
-        return self.cut(self.scrub(s[:self.limit + SCRUB_SLACK_CHARS]), n)
+        anyway, and the slack still catches a secret that straddles the cut. When the prefix was cut and the scrub
+        shrank it, its trailing run of token characters goes too: it may be a secret's start, too short for its
+        pattern, that the shrink moved in front of the cap (#91 review round 3, P2)."""
+        n, end = len(s), self.limit + SCRUB_SLACK_CHARS
+        head = self.scrub(s[:end])
+        if n > end and len(head) < end:
+            head = head.rstrip(_TOKEN_CHARS)
+        return self.cut(head, n)
 
     def tree(self, v, key=None):
         if isinstance(v, str):
@@ -2313,9 +2327,12 @@ def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_r
     started, ended = meta.get("started_at"), res.get("ended_at")
     parent = meta.get("parent_task_id")
     parent = parent if isinstance(parent, str) and TASK_ID_RE.fullmatch(parent) else None
-    ws = res.get("workspace") if isinstance(res.get("workspace"), dict) else _read_json(os.path.join(d, WORKSPACE_FILE))
-    if not isinstance(ws, dict):
-        ws = meta.get("workspace") if isinstance(meta.get("workspace"), dict) else None
+    ws = res.get("workspace") if isinstance(res.get("workspace"), dict) else None
+    ws_fallback = ws is None                    # workspace.json / meta: never redacted with the launch credentials
+    if ws_fallback:
+        ws = _read_json(os.path.join(d, WORKSPACE_FILE))
+        if not isinstance(ws, dict):
+            ws = meta.get("workspace") if isinstance(meta.get("workspace"), dict) else None
     act = res.get("activity") if isinstance(res.get("activity"), dict) else {}
     # Metadata: ids, names, flags and the provider's run record; redacted as text (a title such as "[WIP] x" is not
     # JSON to decode), never capped.
@@ -2349,14 +2366,20 @@ def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_r
             if isinstance(head.get("workspace"), dict) and head["workspace"].get(k) is not None:
                 head["workspace"][k] = None
                 withheld_fields.append("workspace." + k)
+    if ws_fallback and not covered and isinstance(head.get("workspace"), dict):
+        # Only `red` could redact it, and after a rotation it no longer knows the launch token (#91 review round 3, P2).
+        for k in EXPORT_CALLER_WORKSPACE:
+            if head["workspace"].get(k) is not None:
+                head["workspace"][k] = None
+                withheld_fields.append("workspace." + k)
     extra = 0
     error = head.pop("error", None)
     head = cap.scrub_tree(red.tree(head))
     if isinstance(error, str):
         text, n = _text_result(red, error)
         head["error"], extra = cap.text(text), extra + n
-    elif "error" in withheld_fields:
-        head["error"] = None
+    else:
+        head["error"] = None                    # always present: null when there is none or it is withheld
     prompt = None
     if logs and prompt_ok:
         try:

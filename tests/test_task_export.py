@@ -515,6 +515,67 @@ class TaskExportTests(ChildTaskBase):
         self.assertIn("branch contains a provider credential", str(cm.exception))
         self.assertNotIn(TOKEN, str(cm.exception))
 
+    def test_a_remote_start_never_forwards_this_machines_credentials(self):
+        """#91 review round 3, P1: the host redacts with its own credentials only, so this machine's token in the
+        caller text is redacted (labels, prompt) or refused (what the task runs with) before the request leaves."""
+        self._air()
+        self.cfg["client"] = f"bot {TOKEN}"
+        r, out = self.call("start_task", task=f"secret {TOKEN}", title=f"Fix {TOKEN} now")
+        self.assertFalse(r.get("isError"), r)
+        tid = out["task_id"]
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        end = time.time() + 30
+        while not w.get("export", {}).get("ok") and time.time() < end:
+            time.sleep(0.2)
+            _, w = self.call("task_status", task_id=tid)
+        self.assertTrue(w["export"]["ok"], w.get("export"))
+        for base, _, files in os.walk(self.air_home):
+            for name in files:
+                with open(os.path.join(base, name), "rb") as f:
+                    self.assertNotIn(TOKEN.encode(), f.read(), os.path.join(base, name))
+        path = os.path.join(self.air_home, "state", "exports", "task-runs.jsonl")
+        [rec] = self.records(path)
+        self.assertEqual((rec["title"], rec["client"], rec["prompt"]), ("Fix *** now", "bot ***", "secret ***"))
+        calls = len(self.transport_calls)
+        for kw in ({"branch": f"b{TOKEN}", "repo": "r"}, {"orchestrator": f"gpt-{TOKEN}"},
+                   {"allowed_tools": [f"Bash(echo {TOKEN})"]}):
+            with self.subTest(kw=kw):
+                r, _ = self.call("start_task", task="x", **kw)
+                self.assertTrue(r.get("isError"), r)
+                self.assertIn("contains a provider credential", r["content"][0]["text"])
+                self.assertNotIn(TOKEN, r["content"][0]["text"])
+        self.assertEqual(len(self.transport_calls), calls)          # refused here: nothing reached the host
+
+    def test_a_workspace_fallback_is_exported_only_with_the_launch_credentials(self):
+        """#91 review round 3, P2: workspace.json (or meta's workspace) is not redacted by the runner, so without
+        result.json's workspace its free text is included only when the current credentials cover the launch ones."""
+        tid, d, res = self.run_export_task(task="x")
+        res.pop("workspace", None)
+        res.pop("error", None)
+        ct._write_json(os.path.join(d, ct.WORKSPACE_FILE), {"kind": "repo", "state": "held", "repo": f"r{TOKEN}",
+                                                            "branch": "b", "reason": f"unpushed {TOKEN}"})
+        for rotated in (False, True):
+            with self.subTest(rotated=rotated):
+                self._forget_export(d, res)
+                if rotated:
+                    self._rotate()
+                _, st = self.call("task_status", task_id=tid)
+                self.assertTrue(st["export"]["ok"], st["export"])
+                with open(self.export_file()) as f:
+                    self._assert_no_token(f.read())
+                [rec] = self.records()
+                self.assertIn("error", rec)
+                self.assertIsNone(rec["error"])
+                if rotated:
+                    self.assertEqual(rec["workspace"], {"kind": "repo", "state": "held", "repo": None, "branch": None,
+                                                        "reason": None})
+                    self.assertEqual(rec["withheld_fields"], ["workspace.repo", "workspace.branch", "workspace.reason"])
+                else:
+                    self.assertEqual(rec["workspace"], {"kind": "repo", "state": "held", "repo": "r***", "branch": "b",
+                                                        "reason": "unpushed ***"})
+                    self.assertNotIn("withheld_fields", rec)
+                res = _load(os.path.join(d, "result.json"))
+
     # --- export file permissions -----------------------------------------------------------------------------------
     def test_loose_export_files_and_dir_are_tightened_and_recorded(self):
         path = self.export_file()
@@ -660,6 +721,19 @@ class TaskExportTests(ChildTaskBase):
         self.assertEqual(cap.scrubbed, {"anthropic_key": 1})
         self.assertNotIn("Z9Z9", out)
         self.assertEqual(cap.truncated, 2)
+
+    def test_a_partial_secret_at_the_scrub_cut_never_survives_a_shrunk_prefix(self):
+        """#91 review round 3, P2: a scrub that shrank the prefix below the cap must not leave the start of a secret
+        that the prefix cut too short for its pattern."""
+        cap = ct._Cap(100)
+        end = 100 + ct.SCRUB_SLACK_CHARS                                 # where text() stops scrubbing
+        head = "sk-ant-" + "a" * (end - 7 - 11) + "\nsk-ant-api"          # one long key, then a key cut at `end`
+        self.assertEqual(len(head), end)
+        s = head + "03-" + "Z9" * 40 + " tail"
+        out = cap.text(s)
+        self.assertNotIn("sk-ant", out)
+        self.assertIn("[scrubbed:anthropic_key]", out)
+        self.assertIn(f"of {len(s)} characters cut", out)
 
     def test_jwt_and_openai_shapes_need_their_digit_and_dots(self):
         cap = ct._Cap()
