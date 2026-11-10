@@ -1578,7 +1578,11 @@ class NightlySweepStop(unittest.TestCase):
 
         def reap():   # bounded teardown: never leave the shell or a stub gate/child running after a failure
             if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGKILL); proc.wait(5)
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass      # gone, or (macOS EPERM) only its zombie leader is left: nothing to kill
+                proc.wait(5)
             if self.pids.exists():
                 gate, child = map(int, self.pids.read_text().split())
                 for kill, target in ((os.kill, gate), (os.killpg, child)):   # the child leads its own group
@@ -1667,8 +1671,8 @@ class NightlySweepStop(unittest.TestCase):
         while proc.poll() is None and time.time() < end:
             try:
                 os.killpg(proc.pid, signal.SIGTERM); sent += 1
-            except ProcessLookupError:
-                break                                     # the group is gone: cleanup finished between checks
+            except (ProcessLookupError, PermissionError):
+                break    # the group is gone (or, macOS EPERM, only its unreaped zombie leader is left): cleanup finished
             time.sleep(0.1)
         proc.wait(10)
         self.assertGreaterEqual(sent, 5)
