@@ -691,21 +691,43 @@ Each finished child task (any terminal state) is exported as one JSON line for a
   stream order (`text`, `tool_use` with name and input, `tool_result` with content as text, `is_error` and
   `omitted_parts` for non-text parts, `withheld`, and `result` with the final text), `event_counts`,
   `events_dropped` (past 2000 events), `redact_unparsed_lines` (what the runner's redaction withheld), `withheld`
-  (that plus anything the export's own pass withheld), `truncated` (fields cut), `logs` (`included` or why withheld),
+  (that plus anything the export's own pass withheld), `truncated` (fields cut), `scrubbed` (pattern-scrub matches by
+  type, below), `logs` (`included` or why withheld), `withheld_reason` (only when prompt or events are withheld),
   `exported_at`.
 - Finalized and redacted: the line is written only after the run's logs were redacted and `result.json` is final.
-  Every text goes through the Redactor that produced `result.json`, redacted before it is capped at 32,000 characters
-  per field (the cut is marked `[truncated by cortados: N of M characters cut]` and counted). A line that still
-  matches a credential is not written. Raw `stdout.log` content is never written. A runner that died leaves
-  unredacted logs: its task is exported by the first status call that can release them (the launch credentials'
-  fingerprints match), else just before cleanup with `logs` withheld (no prompt, no events).
+  The runner redacts `stdout.log`, `stderr.log` and `prompt.txt` in place (temp file 0600, atomic rename) with the
+  exact launch credentials before it writes the final `result.json`, and records `logs_redacted` / `prompt_redacted`
+  there. Every text then goes through the Redactor that produced `result.json` and the pattern scrub, in that order,
+  before it is capped at 32,000 characters per field (the cut is marked `[truncated by cortados: N of M characters
+  cut]` and counted). A line that still matches a credential is not written. Raw `stdout.log` content is never
+  written.
+- A late export (a status call after the runner died, or the cleanup retry) reads prompt and logs only when they are
+  marked redacted, or when the current credentials provably include the launch ones (sha256 fingerprints in
+  `meta.json`); it never redacts raw material with credentials that may have rotated since. Otherwise the record goes
+  out with `prompt: null`, no events and a `withheld_reason`, keeping the metadata and `event_counts`. A runner that
+  died before redaction: its task is exported by the first status call that can release its logs, else just before
+  cleanup with them withheld.
+- Best-effort pattern scrub, export only: after the known-value redaction, `Authorization:` / `Proxy-Authorization:`
+  header values (and a value under such a key in a tool input), `Bearer <token>`, and the shapes `sk-…`, `sk-ant-…`,
+  `ghp_`/`gho_`/`ghs_`/`github_pat_…`, `xox[abpr]-…`, `AKIA…`, `-----BEGIN … PRIVATE KEY-----` blocks and JWTs
+  (`eyJ….eyJ….…`) become `[scrubbed:<type>]`, counted in `scrubbed`. This is best effort, not a guarantee: the
+  known-value redaction covers only the provider credentials (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`,
+  `CORTADOS_PROVIDER_TOKEN`), and any other secret of another shape passes. **The export holds far more than
+  `result.json`: the full prompt and every tool input and result (file contents, command output, fetched pages) up
+  to the field cap.** Treat the file as you would the task's workspace.
 - Append-only, written once: one `os.write` of the whole line under an `flock` on `<file>.lock`, so concurrent
-  runners never interleave. The file is never rewritten or truncated by the router. A sidecar `<file>.ids` (same
+  runners never interleave. The file, the lock and the index are opened without following symlinks and must be
+  regular files of this user; one with group/other permission bits is set to 0600 first (or refused if that fails),
+  and the default directory to 0700; each tightening is listed in the outcome's `tightened`. A
+  `CORTADOS_TASK_EXPORT` file in a directory that group or others can write is refused. The file is never rewritten or truncated by the router. A sidecar `<file>.ids` (same
   lock) holds the exported task ids, so a retry never appends a task twice.
-- Outcome: `result.json` gets `export: {"ok": true, "at", "path_kind": "default"|"env"}` or
+- Outcome: `result.json` gets `export: {"ok": true, "at", "path_kind": "default"|"env"}` (plus `tightened`,
+  `logs_withheld`, `prompt_withheld` when they apply) or
   `{"ok": false, "error": "<exception type>"}`; `child-tasks.jsonl` gets `task_exported` / `task_export_failed`.
-- Never pruned unexported: the 14-day cleanup first retries a failed export (up to 10 per `start_task`). A task whose
-  export still fails is kept, reported in `start_task`'s `prune_errors` and logged as `task_kept_unexported`.
+- Never pruned unexported: the 14-day cleanup first retries a failed export (up to 10 per `start_task`, all within one
+  5 s budget that includes the export-lock waits, so a stuck lock cannot hold `start_task`; the rest wait for the next
+  start). A task whose export still fails or was not retried is kept, reported in `start_task`'s `prune_errors` and
+  logged as `task_kept_unexported`.
 
 Claude desktop app (`claude_desktop_config.json`, under `mcpServers`):
 

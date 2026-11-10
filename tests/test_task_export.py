@@ -309,9 +309,229 @@ class TaskExportTests(ChildTaskBase):
         self.assertEqual(ct.prune(ct._private_root(), now=later), [tid])
         [rec] = self.records()
         self.assertEqual(rec["logs"], ct.EXPORT_LOGS_WITHHELD)
+        self.assertEqual(rec["withheld_reason"], ct.EXPORT_LOGS_WITHHELD)
         self.assertIsNone(rec["prompt"])
         self.assertEqual(rec["events"], [])
         self.assertNotIn(TOKEN, json.dumps(rec))
+
+    # --- the prompt is redacted by the runner; a late export never redacts raw material with other credentials -------
+    def _rotate(self):
+        with open(self.cfg["token_file"], "w") as f:
+            f.write("a-rotated-token-0005")
+        self.cfg["token"] = "a-rotated-token-0005"
+
+    def _forget_export(self, d, res, **drop):
+        """As if the runner died between the final result.json and its export."""
+        for p in (self.export_file(), self.export_file() + ".ids"):
+            if os.path.exists(p):
+                os.unlink(p)
+        res.pop("export", None)
+        for k in drop:
+            res.pop(k, None)
+        ct._write_json(os.path.join(d, "result.json"), res)
+
+    def test_runner_redacts_the_prompt_in_place(self):
+        tid, d, res = self.run_export_task(task=f"use {TOKEN} please")
+        self.assertIs(res["prompt_redacted"], True)
+        self.assertIs(res["logs_redacted"], True)
+        p = os.path.join(d, "prompt.txt")
+        with open(p) as f:
+            self.assertEqual(f.read(), "use *** please")
+        self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
+        [rec] = self.records()
+        self.assertEqual(rec["prompt"], "use *** please")
+        self.assertNotIn("withheld_reason", rec)
+
+    def test_rotated_token_and_a_crash_after_the_final_result_never_export_the_old_token(self):
+        """#91 review P1: the runner died after result.json, the credentials rotated, then status exported late."""
+        tid, d, res = self.run_export_task(task=f"secret {TOKEN}")
+        self._forget_export(d, res)
+        self._rotate()
+        _, st = self.call("task_status", task_id=tid)
+        self.assertTrue(st["export"]["ok"], st["export"])
+        with open(self.export_file()) as f:
+            raw = f.read()
+        self.assertNotIn(TOKEN, raw)
+        self.assertNotIn("000000001", raw)
+        [rec] = self.records()
+        self.assertEqual(rec["prompt"], "secret ***")            # redacted on disk by the runner, with the launch token
+        self.assertEqual(rec["logs"], "included")
+
+    def test_an_unmarked_prompt_is_withheld_when_the_credentials_rotated(self):
+        """A prompt and logs the runner never marked redacted (its prompt pass failed, or an older runner): with
+        rotated credentials the late export (status, then prune) withholds them instead of redacting with the new
+        token; the counts stay."""
+        tid, d, res = self.run_export_task(task="x")
+        with open(os.path.join(d, "prompt.txt"), "w") as f:
+            f.write(f"raw {TOKEN}")
+        self._forget_export(d, res, prompt_redacted=True, logs_redacted=True)
+        self._rotate()
+        _, st = self.call("task_status", task_id=tid)
+        self.assertTrue(st["export"]["ok"], st["export"])
+        self.assertTrue(st["export"]["logs_withheld"])
+        self.assertTrue(st["export"]["prompt_withheld"])
+        with open(self.export_file()) as f:
+            self.assertNotIn(TOKEN, f.read())
+        [rec] = self.records()
+        self.assertIsNone(rec["prompt"])
+        self.assertEqual(rec["events"], [])
+        self.assertEqual(rec["withheld_reason"], ct.EXPORT_LOGS_WITHHELD)
+        self.assertEqual(rec["event_counts"].get("tool_use"), 1)    # counts kept
+        self.assertEqual(rec["tool_uses"], {"Bash": 1})
+        # the same through prune's retry
+        self._forget_export(d, _load(os.path.join(d, "result.json")))
+        self.assertEqual(ct.prune(ct._private_root(), now=time.time() + ct.PRUNE_AGE_S + 60), [tid])
+        [rec] = self.records()
+        self.assertIsNone(rec["prompt"])
+        self.assertNotIn(TOKEN, json.dumps(rec))
+
+    def test_an_unmarked_prompt_is_redacted_when_the_launch_credentials_match(self):
+        tid, d, res = self.run_export_task(task="x")
+        with open(os.path.join(d, "prompt.txt"), "w") as f:
+            f.write(f"raw {TOKEN}")
+        self._forget_export(d, res, prompt_redacted=True, logs_redacted=True)
+        _, st = self.call("task_status", task_id=tid)              # same credentials as at launch
+        self.assertTrue(st["export"]["ok"], st["export"])
+        [rec] = self.records()
+        self.assertEqual(rec["prompt"], "raw ***")
+        self.assertEqual(rec["logs"], "included")
+        self.assertNotIn(TOKEN, json.dumps(rec))
+
+    # --- export file permissions -----------------------------------------------------------------------------------
+    def test_loose_export_files_and_dir_are_tightened_and_recorded(self):
+        path = self.export_file()
+        os.makedirs(os.path.dirname(path), mode=0o700)
+        os.chmod(os.path.dirname(path), 0o755)
+        for p in (path, path + ".lock", path + ".ids"):
+            with open(p, "w"):
+                pass
+            os.chmod(p, 0o644)
+        tid, d, res = self.run_export_task()
+        self.assertTrue(res["export"]["ok"], res["export"])
+        self.assertEqual(sorted(res["export"]["tightened"]), ["dir", "file", "ids", "lock"])
+        for p in (path, path + ".lock", path + ".ids"):
+            self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600, p)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode), 0o700)
+        ev = [e for e in _events(all_events=True) if e.get("task_id") == tid and e["event"] == "task_exported"]
+        self.assertEqual(sorted(ev[0]["tightened"]), ["dir", "file", "ids", "lock"])
+
+    def test_an_export_file_that_cannot_be_tightened_is_refused(self):
+        path = self.export_file()
+        os.makedirs(os.path.dirname(path), mode=0o700)
+        with open(path, "w"):
+            pass
+        os.chmod(path, 0o644)
+        with mock.patch.object(ct.os, "fchmod", side_effect=PermissionError("no")):
+            with self.assertRaises(PermissionError):
+                ct.append_export(b'{"task_id":"t20200101000000-0000000d"}\n', "t20200101000000-0000000d")
+        self.assertEqual(os.path.getsize(path), 0)
+
+    def test_a_symlinked_export_file_is_refused(self):
+        path = self.export_file()
+        os.makedirs(os.path.dirname(path), mode=0o700)
+        target = os.path.join(self.tmp, "elsewhere.jsonl")
+        with open(target, "w"):
+            pass
+        os.symlink(target, path)
+        with self.assertRaises(OSError):
+            ct.append_export(b'{"task_id":"t20200101000000-0000000e"}\n', "t20200101000000-0000000e")
+        self.assertEqual(os.path.getsize(target), 0)
+
+    def test_an_override_in_a_group_or_world_writable_dir_is_refused(self):
+        shared = os.path.join(self.tmp, "shared")
+        os.mkdir(shared)
+        os.chmod(shared, 0o777)
+        os.environ[ct.EXPORT_ENV] = os.path.join(shared, "runs.jsonl")
+        with self.assertRaises(PermissionError):
+            ct.append_export(b'{"task_id":"t20200101000000-0000000f"}\n', "t20200101000000-0000000f")
+        self.assertEqual(os.listdir(shared), [])
+        os.chmod(shared, 0o755)                                   # readable by others is the owner's choice
+        kind, already, _ = ct.append_export(b'{"task_id":"t20200101000000-0000000f"}\n', "t20200101000000-0000000f")
+        self.assertEqual((kind, already), ("env", False))
+
+    # --- prune's export retries share one time budget ----------------------------------------------------------------
+    def test_a_stuck_export_lock_does_not_hold_start_task(self):
+        root = ct._private_root()
+        tids = [f"t20200101000000-0000020{i}" for i in range(3)]
+        for t in tids:
+            os.mkdir(os.path.join(root, t), 0o700)
+            ct._write_json(os.path.join(root, t, "meta.json"), {"task_id": t, "started_at": 1.0, "runner_pid": 0})
+            ct._write_json(os.path.join(root, t, "result.json"), {"exit_code": 0, "ended_at": 2.0})
+        path = self.export_file()
+        os.makedirs(os.path.dirname(path), mode=0o700)
+        held = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, held)
+        import fcntl
+        fcntl.flock(held, fcntl.LOCK_EX)
+        os.environ["FAKE_CLAUDE_MODE"] = "ok"
+        with mock.patch.object(ct, "PRUNE_EXPORT_BUDGET_S", 1.0):
+            t0 = time.monotonic()
+            r, out = self.call("start_task", task="hello", cwd=self.work)
+            took = time.monotonic() - t0
+        self.assertFalse(r.get("isError"), r)
+        self.assertLess(took, 8, took)                          # unbounded: 3 x EXPORT_LOCK_WAIT_S = 90 s
+        errs = [e for e in out.get("prune_errors", []) if "not pruned" in e]
+        self.assertEqual(len(errs), 3, out.get("prune_errors"))
+        self.assertEqual(sum("TimeoutError" in e for e in errs), 1, errs)
+        self.assertEqual(sum("budget" in e for e in errs), 2, errs)
+        for t in tids:
+            self.assertTrue(os.path.isdir(os.path.join(root, t)))   # kept for the next start
+        fcntl.flock(held, fcntl.LOCK_UN)
+        self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        _wait_export(ct.task_path(out["task_id"]))
+
+    # --- best-effort scrub of well-known secret shapes ----------------------------------------------------------------
+    SCRUB_CASES = [
+        ("authorization", 'curl -H "Authorization: token abcdef0123456789" https://x', "Authorization: [scrubbed:authorization]"),
+        ("authorization", "Proxy-Authorization: Basic dXNlcjpwYXNzd29yZA==", "Proxy-Authorization: [scrubbed:authorization]"),
+        ("bearer", "use Bearer abcdefgh12345678.xyz now", "use Bearer [scrubbed:bearer] now"),
+        ("anthropic_key", "key sk-ant-api03-AbCdEfGh123456_-x end", "key [scrubbed:anthropic_key] end"),
+        ("openai_key", "key sk-proj-AbCdEfGh1234567890 end", "key [scrubbed:openai_key] end"),
+        ("github_token", "ghp_" + "a1" * 18 + " gho_" + "b2" * 18 + " ghs_" + "c3" * 18,
+         "[scrubbed:github_token] [scrubbed:github_token] [scrubbed:github_token]"),
+        ("github_token", "github_pat_11ABCDEFG0123456789_abcdefghij", "[scrubbed:github_token]"),
+        ("slack_token", "xoxb-123456789012-abcdef and xoxp-1-2-3-abcdefgh", "[scrubbed:slack_token] and [scrubbed:slack_token]"),
+        ("aws_access_key", "id AKIAIOSFODNN7EXAMPLE.", "id [scrubbed:aws_access_key]."),
+        ("private_key", "a\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNz\naGtleQ==\n-----END OPENSSH PRIVATE KEY-----\nz",
+         "a\n[scrubbed:private_key]\nz"),
+        ("jwt", "t=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJl;", "t=[scrubbed:jwt];"),
+    ]
+
+    def test_each_scrub_pattern(self):
+        for kind, text, want in self.SCRUB_CASES:
+            with self.subTest(kind=kind, text=text):
+                cap = ct._Cap()
+                got = cap.scrub(text)
+                self.assertIn(want, got)
+                self.assertIn(kind, cap.scrubbed)
+        cap = ct._Cap()
+        prose = "a task-runner, sk-learn-style docs, Authorization: ***, Bearer ***, the bearer of news"
+        self.assertEqual(cap.scrub(prose), prose)                 # already masked or not a token shape: untouched
+        self.assertEqual(cap.scrubbed, {})
+        self.assertEqual(cap.tree({"headers": {"Authorization": "opaque0123456789", "Accept": "x"}}),
+                         {"headers": {"Authorization": "[scrubbed:authorization]", "Accept": "x"}})
+
+    def _record_for(self, prompt, tokens=(TOKEN,)):
+        tid, d = self._manual_task("ok")
+        with open(os.path.join(d, "prompt.txt"), "w") as f:
+            f.write(prompt)
+        res = {"exit_code": 0, "ended_at": time.time(), "prompt_redacted": True, "logs_redacted": True}
+        return ct.build_export_record(d, {}, res, ct.Redactor(tokens), None)
+
+    def test_scrub_applies_to_export_text_before_the_cap_and_is_counted(self):
+        key = "sk-ant-api03-" + "Z9" * 20
+        with mock.patch.object(ct, "EXPORT_TEXT_CHARS", 30):
+            rec = self._record_for("x" * 19 + " " + key)         # cut first, a key prefix would stay
+        self.assertTrue(rec["prompt"].startswith("x" * 19 + " [scrubbed"), rec["prompt"])
+        self.assertNotIn("Z9Z9", rec["prompt"])
+        self.assertEqual(rec["scrubbed"], {"anthropic_key": 1})
+        self.assertEqual(rec["truncated"], 1)
+
+    def test_scrub_never_runs_before_the_known_value_redaction(self):
+        known = "sk-ant-api03-KNOWNknown0123456789"
+        rec = self._record_for(f"a {known} b", tokens=(known,))
+        self.assertEqual(rec["prompt"], "a *** b")               # the known credential's mask, not a scrub marker
+        self.assertEqual(rec["scrubbed"], {})
 
     # --- pieces ------------------------------------------------------------------------------------------------------
     def test_cap_marks_and_counts_every_cut(self):

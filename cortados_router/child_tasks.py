@@ -9,7 +9,8 @@ after putting the repo root on sys.path, so route_task keeps working even if thi
 
 Layout per task (all under a verified private 0700 directory, default ~/.config/cortados/tasks/<task_id>/):
   meta.json     what was asked (task text length, cwd, orchestrator, permission mode, runner pid, start time)
-  prompt.txt    the task text, fed to `claude -p` on stdin (never argv: argv is world-readable in `ps` and size-capped)
+  prompt.txt    the task text, fed to `claude -p` on stdin (never argv: argv is world-readable in `ps` and size-capped);
+                redacted in place by the runner with the logs once the child has exited
   session-*.json the launcher's 0600 settings (holds the provider token; never printed)
   stdout.log    claude's `--output-format stream-json` events, ending in its result record;  stderr.log  claude's diagnostics
   result.json   written by the runner when the child ends: exit code, end time, cancelled/timed-out flags
@@ -557,15 +558,19 @@ def connectors_config() -> str:
     return os.path.abspath(os.path.expanduser(os.environ.get("CORTADOS_CONNECTORS_MCP_CONFIG") or CONNECTORS_CONFIG))
 
 
-def _prune_export(d: str, meta: dict, res, red, retries: list) -> str | None:
+def _prune_export(d: str, meta: dict, res, red, budget: dict) -> str | None:
     """Before a finished task dir is deleted: its run export (#91) must have succeeded. If it has not, try once more
     (a recovered task's logs are released first when this process's credentials cover the launch ones, else the
-    record is written with the logs withheld). Returns None when the dir may go, else why it stays."""
+    record is written with the logs withheld). All of one prune's retries share `budget`: at most
+    PRUNE_EXPORT_RETRIES of them within PRUNE_EXPORT_BUDGET_S seconds (the export lock is polled only for what is
+    left), so a stuck export lock cannot hold start_task. Returns None when the dir may go, else why it stays."""
     if isinstance(res, dict) and (res.get("export") or {}).get("ok"):
         return None
-    if retries[0] <= 0:
+    if budget["left"] <= 0:
         return f"export not retried in this prune (at most {PRUNE_EXPORT_RETRIES} per call)"
-    retries[0] -= 1
+    if budget["until"] - time.monotonic() <= 0:
+        return f"export not retried in this prune (its {PRUNE_EXPORT_BUDGET_S:g} s budget for export retries is used up)"
+    budget["left"] -= 1
     try:
         cur = _current_redactor(red)
     except TaskError as exc:
@@ -575,7 +580,7 @@ def _prune_export(d: str, meta: dict, res, red, retries: list) -> str | None:
             _release_recovered_logs(d, meta, res, cur)   # on failure the record goes out with the logs withheld
         except OSError:
             pass
-    ex = _export_locked(d, meta, cur, EXPORT_LATE_ROUTER_RUN, res)
+    ex = _export_locked(d, meta, cur, EXPORT_LATE_ROUTER_RUN, res, lock_wait_s=budget["until"] - time.monotonic())
     if ex is None:
         return "export not retried (the task's runner still holds its lock)"
     return None if ex.get("ok") else f"export failed ({ex.get('error')})"
@@ -590,11 +595,11 @@ def prune(root: str, now: float | None = None, errors: list | None = None, red=N
     the dir's mtime), and removing it would take away the records _recover() / cancel need to stop that child. It
     stays, reported in `errors` and logged by id, file and type (never content), until a person removes it.
     A finished task whose run export (#91) has not succeeded is not deleted either: the export is retried once per
-    prune (_prune_export, at most PRUNE_EXPORT_RETRIES tasks per call); while it fails the dir stays, reported in `errors` and logged as
-    `task_kept_unexported`."""
+    prune (_prune_export, at most PRUNE_EXPORT_RETRIES tasks within PRUNE_EXPORT_BUDGET_S per call); while it fails
+    the dir stays, reported in `errors` and logged as `task_kept_unexported`."""
     cutoff = (time.time() if now is None else now) - PRUNE_AGE_S
     removed = []
-    retries = [PRUNE_EXPORT_RETRIES]
+    budget = {"left": PRUNE_EXPORT_RETRIES, "until": time.monotonic() + PRUNE_EXPORT_BUDGET_S}
     for name in os.listdir(root):
         d = os.path.join(root, name)
         try:
@@ -613,7 +618,7 @@ def prune(root: str, now: float | None = None, errors: list | None = None, red=N
                 started = os.path.getmtime(d)
             # A remote stub is only a pointer (the host prunes the task itself): dropped by age alone.
             if state != "running" and started < cutoff:
-                why = _prune_export(d, meta, res, red, retries) if state != "remote" else None
+                why = _prune_export(d, meta, res, red, budget) if state != "remote" else None
                 if why:
                     log_event("task_kept_unexported", task_id=name, reason=why)
                     if errors is not None:
@@ -1361,8 +1366,7 @@ def _release_recovered_logs(d: str, meta: dict, res: dict, red: "Redactor") -> b
     provably include every launch credential (by fingerprint); then they are redacted on disk and released."""
     # None = an old/odd meta: withhold. [] = the child provably ran with no launch credential (login mode), so nothing
     # needs covering and the logs are released after the usual redaction instead of being withheld forever.
-    launch = meta.get("cred_fingerprints")
-    if not isinstance(launch, list) or not set(launch) <= set(credential_fingerprints(red.raw)):
+    if not launch_covered(meta, red):
         return False
     stdout = os.path.join(d, "stdout.log")
     structural_error = None
@@ -1371,10 +1375,11 @@ def _release_recovered_logs(d: str, meta: dict, res: dict, red: "Redactor") -> b
     except Exception as exc:                    # as in _run: recorded, and the raw pass below still runs
         unparsed, structural_error = 0, f"could not redact stdout.log structurally: {type(exc).__name__}"
     try:
-        for name in ("stdout.log", "stderr.log"):
+        for name in ("stdout.log", "stderr.log", "prompt.txt"):
             redact_file(os.path.join(d, name), red)
     except OSError:
         return False
+    res["prompt_redacted"] = True
     if structural_error:
         res["redact_error"] = structural_error   # the task fails and its logs stay withheld
         _write_json(os.path.join(d, "result.json"), res)
@@ -1388,8 +1393,16 @@ def _release_recovered_logs(d: str, meta: dict, res: dict, red: "Redactor") -> b
     except OSError as exc:
         res["activity_error"] = f"could not read stdout.log: {type(exc).__name__}"
     res["logs_unredacted"] = False
+    res["logs_redacted"] = True
     _write_json(os.path.join(d, "result.json"), res)
     return True
+
+
+def launch_covered(meta: dict, red: "Redactor") -> bool:
+    """Whether `red` provably holds every launch credential (sha256 fingerprints in meta.json). None = an old/odd
+    meta: not covered. [] = the child ran with no launch credential (login mode): covered."""
+    launch = meta.get("cred_fingerprints") if isinstance(meta, dict) else None
+    return isinstance(launch, list) and set(launch) <= set(credential_fingerprints(red.raw))
 
 
 def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
@@ -1969,10 +1982,31 @@ EXPORT_TEXT_CHARS = 32_000                  # per text field (prompt, a tool inp
 EXPORT_MAX_EVENTS = 2_000                   # per record; later events are counted in events_dropped, not written
 EXPORT_LOCK_WAIT_S = 30                     # an export lock held longer than this is a stuck writer: fail, retry later
 PRUNE_EXPORT_RETRIES = 10                   # export retries per prune: prune runs inside start_task, which must answer
+PRUNE_EXPORT_BUDGET_S = 5.0                 # all of one prune's export retries together, lock waits included
 EXPORT_PENDING = "LogsUnredacted"           # export error of a recovered task whose logs are not released yet
 EXPORT_LATE_ROUTER_RUN = {"note": "not fetched: exported after the runner (the provider's run record is in memory "
                                   "only); see the router logs"}
 EXPORT_LOGS_WITHHELD = "logs withheld: they could not be redacted with the launch credentials"
+EXPORT_PROMPT_WITHHELD = ("prompt withheld: the runner did not redact it, and the current credentials do not match the "
+                          "launch ones")
+EXPORT_REDACT_FAILED = "logs withheld: the runner could not redact them"
+
+# Best-effort scrub of well-known secret shapes, applied to export text only, AFTER the known-value redaction and
+# BEFORE the cap. Not a guarantee: a secret of any other shape passes. Each match becomes [scrubbed:<type>], counted.
+SCRUB_PATTERNS = (
+    ("private_key", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)",
+                               re.S)),
+    ("authorization", re.compile(r"(?i)\b(?:proxy-)?authorization[\"']?\s*[:=]\s*[\"']?([^\r\n\"',;]+)")),
+    ("bearer", re.compile(r"(?i)\bbearer\s+([A-Za-z0-9._~+/-]{8,}=*)")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*")),
+    ("anthropic_key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{8,}")),
+    ("openai_key", re.compile(r"\bsk-(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{16,}")),
+    ("github_token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
+    ("slack_token", re.compile(r"\bxox[abpr]-[A-Za-z0-9-]{10,}")),
+    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+)
+SCRUB_KEYS = ("authorization", "proxy-authorization", "x-api-key")   # a dict value under such a key is scrubbed whole
+_ALREADY_MASKED = re.compile(r"\s*(?:[A-Za-z]+\s+)?(?:\*\*\*|\[scrubbed:[a-z_]+\])\s*")
 
 
 class _ExportLeak(Exception):
@@ -2004,25 +2038,63 @@ def resolve_parent(arg):
 
 
 class _Cap:
-    """Caps already-redacted text at EXPORT_TEXT_CHARS with a marker, counting every cut."""
+    """For already-redacted export text: scrubs well-known secret shapes (SCRUB_PATTERNS, counted by type in
+    `scrubbed`), then caps it at EXPORT_TEXT_CHARS with a marker, counting every cut. Callers pass text only after the
+    known-value Redactor ran on it, so a known credential is masked as such, never reshaped by the scrub first."""
 
     def __init__(self, limit=None):
         self.limit = EXPORT_TEXT_CHARS if limit is None else limit
         self.truncated = 0
+        self.scrubbed = {}
 
-    def text(self, s: str) -> str:
+    def _mark(self, kind: str) -> str:
+        self.scrubbed[kind] = self.scrubbed.get(kind, 0) + 1
+        return f"[scrubbed:{kind}]"
+
+    def scrub(self, s: str) -> str:
+        for kind, rx in SCRUB_PATTERNS:
+            def sub(m, kind=kind):
+                if m.lastindex:                 # the secret is group 1; the label before it stays readable
+                    if _ALREADY_MASKED.fullmatch(m.group(1)):
+                        return m.group(0)
+                    return m.group(0)[:m.start(1) - m.start(0)] + self._mark(kind)
+                return self._mark(kind)
+            s = rx.sub(sub, s)
+        return s
+
+    def _keyed(self, key, v: str):
+        """A value under an Authorization-like key is a credential whatever its shape: scrubbed whole."""
+        if isinstance(key, str) and key.lower() in SCRUB_KEYS and v and not _ALREADY_MASKED.fullmatch(v):
+            return self._mark("authorization")
+        return None
+
+    def scrub_tree(self, v, key=None):
+        if isinstance(v, str):
+            keyed = self._keyed(key, v)
+            return keyed if keyed is not None else self.scrub(v)
+        if isinstance(v, list):
+            return [self.scrub_tree(x) for x in v]
+        if isinstance(v, dict):
+            return {self.scrub(str(k)): self.scrub_tree(x, str(k)) for k, x in v.items()}
+        return v
+
+    def cut(self, s: str) -> str:
         if len(s) <= self.limit:
             return s
         self.truncated += 1
         return s[:self.limit] + f"\n[truncated by cortados: {len(s) - self.limit} of {len(s)} characters cut]"
 
-    def tree(self, v):
+    def text(self, s: str) -> str:
+        return self.cut(self.scrub(s))
+
+    def tree(self, v, key=None):
         if isinstance(v, str):
-            return self.text(v)
+            keyed = self._keyed(key, v)
+            return keyed if keyed is not None else self.text(v)
         if isinstance(v, list):
             return [self.tree(x) for x in v]
         if isinstance(v, dict):
-            return {self.text(str(k)): self.tree(x) for k, x in v.items()}
+            return {self.text(str(k)): self.tree(x, str(k)) for k, x in v.items()}
         return v
 
 
@@ -2116,12 +2188,18 @@ def _export_events(path: str, red: "Redactor", cap: "_Cap"):
 
 
 def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_run) -> dict:
-    """The export record of a finished task (schema EXPORT_SCHEMA). Its logs are included only when they were
-    redacted with the launch credentials (no redact_error, not logs_unredacted); else events and prompt are withheld.
+    """The export record of a finished task (schema EXPORT_SCHEMA). Prompt and logs are read only when they are
+    marked redacted with the launch credentials (`prompt_redacted` / `logs_redacted`, by the runner or a recovery
+    that proved the launch fingerprints), or when `red` itself provably covers the launch credentials (then it
+    redacts them here); otherwise they are withheld (`withheld_reason`; event counts and the run's metadata stay).
+    `red` alone is never trusted with unredacted material: after a rotation it no longer knows the old token.
     The caller encodes it; nothing here is the raw stdout.log."""
     cap = _Cap()
     tid = os.path.basename(d)
-    logs = not res.get("redact_error") and not res.get("logs_unredacted")
+    covered = launch_covered(meta, red)
+    logs = (not res.get("redact_error") and not res.get("logs_unredacted")
+            and (res.get("logs_redacted") is True or covered))
+    prompt_ok = res.get("prompt_redacted") is True or covered
     started, ended = meta.get("started_at"), res.get("ended_at")
     parent = meta.get("parent_task_id")
     parent = parent if isinstance(parent, str) and TASK_ID_RE.fullmatch(parent) else None
@@ -2131,7 +2209,7 @@ def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_r
     act = res.get("activity") if isinstance(res.get("activity"), dict) else {}
     # Metadata: ids, names, flags and the provider's run record; redacted as text (a title such as "[WIP] x" is not
     # JSON to decode), never capped.
-    head = red.tree({
+    head = cap.scrub_tree(red.tree({
         "task_id": tid, "parent_task_id": parent, "parent": "known" if parent else "missing",
         **({"parent_note": meta["parent_note"]} if meta.get("parent_note") else {}),
         "title": meta.get("title"), "host": meta.get("host"), "client": meta.get("client"),
@@ -2147,14 +2225,14 @@ def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_r
         **({"lane": meta.get("lane"), "model": meta.get("model")} if meta.get("lane") else {}),
         "router_run": router_run if isinstance(router_run, dict) else None,
         "tool_uses": act.get("tool_uses") or {}, "tool_errors": act.get("tool_errors") or 0,
-    })
+    }))
     extra = 0
     error = res.get("error") or res.get("output_error") or res.get("redact_error")
     if isinstance(error, str):
         text, n = _text_result(red, error)
         head["error"], extra = cap.text(text), extra + n
     prompt = None
-    if logs:
+    if logs and prompt_ok:
         try:
             with open(os.path.join(d, "prompt.txt"), encoding="utf-8", errors="replace") as f:
                 raw_prompt = f.read()
@@ -2163,16 +2241,26 @@ def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_r
         if raw_prompt is not None:
             text, n = _text_result(red, raw_prompt)
             prompt, extra = cap.text(text), extra + n
-        events, counts, more, dropped = _export_events(os.path.join(d, "stdout.log"), red, cap)
+    stdout = os.path.join(d, "stdout.log")
+    if logs:
+        events, counts, more, dropped = _export_events(stdout, red, cap)
         extra += more
     else:
-        events, counts, dropped = [], {}, 0
+        # Counts only (event types): no content of it goes into the record, and a throwaway cap keeps the record's
+        # truncated/scrubbed counts about what the record actually holds.
+        _, counts, _, dropped = _export_events(stdout, red, _Cap())
+        events = []
+    reason = (None if logs and prompt_ok else
+              EXPORT_REDACT_FAILED if res.get("redact_error") else
+              EXPORT_LOGS_WITHHELD if not logs else EXPORT_PROMPT_WITHHELD)
     unparsed = res.get("redact_unparsed_lines") or 0
     return {"schema": EXPORT_SCHEMA, **head, "exported_at": round(time.time(), 3),
             "logs": "included" if logs else EXPORT_LOGS_WITHHELD,
+            **({"withheld_reason": reason} if reason else {}),
             "prompt": prompt, "events": events, "event_counts": counts,
             **({"events_dropped": dropped} if dropped else {}),
-            "redact_unparsed_lines": unparsed, "withheld": unparsed + extra, "truncated": cap.truncated}
+            "redact_unparsed_lines": unparsed, "withheld": unparsed + extra, "truncated": cap.truncated,
+            "scrubbed": dict(sorted(cap.scrubbed.items()))}
 
 
 def _flock_wait(fd: int, wait_s: float) -> None:
@@ -2187,29 +2275,63 @@ def _flock_wait(fd: int, wait_s: float) -> None:
             time.sleep(0.05)
 
 
-def _exported_ids(path: str) -> set:
-    """Task ids already in the export file, from the sidecar <path>.ids; lines the sidecar does not cover (a writer
-    that died between the line and its id) are read from the file's tail and added to it. Call under the lock."""
+def _open_private(path: str, flags: int, label: str, tightened: list) -> int:
+    """Open (creating 0600) an export file without following a symlink; it must be a regular file of this user. A
+    mode with any group/other bit is tightened to 0600 through the open fd (recorded in `tightened`); if that fails,
+    the file is refused."""
+    fd = os.open(path, flags | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise PermissionError(f"export {label} is not a regular file of this user")
+        if st.st_mode & 0o077:
+            os.fchmod(fd, 0o600)                # an OSError here refuses the file: never appended to while readable
+            tightened.append(label)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _export_dir(parent: str, kind: str, tightened: list) -> None:
+    """The default export dir is ours: a real directory of this user, exactly 0700 (tightened if looser). An override
+    (CORTADOS_TASK_EXPORT) names any directory, but never one that group or others can write (they could swap the
+    file or its sidecars)."""
+    if not os.path.isdir(parent):
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+    st = os.lstat(parent) if kind == "default" else os.stat(parent)
+    if not stat.S_ISDIR(st.st_mode):
+        raise PermissionError("the export directory is not a directory")
+    if kind == "default":
+        if st.st_uid != os.getuid():
+            raise PermissionError("the export directory is not owned by this user")
+        if stat.S_IMODE(st.st_mode) != 0o700:
+            os.chmod(parent, 0o700)             # makedirs' mode is masked by umask; an existing one may be looser
+            if st.st_mode & 0o077:
+                tightened.append("dir")
+    elif st.st_mode & 0o022:
+        raise PermissionError(f"the {EXPORT_ENV} directory is writable by group or others")
+
+
+def _exported_ids(fd: int, ids_fd: int) -> set:
+    """Task ids already in the export file (open as `fd`), from the sidecar <path>.ids (`ids_fd`); lines the sidecar
+    does not cover (a writer that died between the line and its id) are read from the file's tail and added to it.
+    Call under the lock."""
     ids, end = set(), 0
-    try:
-        with open(path + ".ids", encoding="utf-8") as f:
-            for row in f:
-                parts = row.split()
-                if parts and TASK_ID_RE.fullmatch(parts[0]):
-                    ids.add(parts[0])
-                if len(parts) > 1 and parts[1].isdigit():
-                    end = int(parts[1])         # "-" rows only move the baseline (a rescanned tail with no ids)
-    except FileNotFoundError:
-        pass
-    try:
-        size = os.stat(path).st_size
-    except FileNotFoundError:
-        return ids
+    with os.fdopen(os.dup(ids_fd), "rb") as f:
+        f.seek(0)
+        for row in f:
+            parts = row.decode("ascii", "replace").split()
+            if parts and TASK_ID_RE.fullmatch(parts[0]):
+                ids.add(parts[0])
+            if len(parts) > 1 and parts[1].isdigit():
+                end = int(parts[1])             # "-" rows only move the baseline (a rescanned tail with no ids)
+    size = os.fstat(fd).st_size
     if size == end:
         return ids
     start = end if end < size else 0            # smaller: the file was replaced by its reader; rescan it whole
     found = []
-    with open(path, "rb") as f:
+    with os.fdopen(os.dup(fd), "rb") as f:
         f.seek(start)
         for line in f:
             try:
@@ -2219,50 +2341,46 @@ def _exported_ids(path: str) -> set:
             if isinstance(tid, str) and TASK_ID_RE.fullmatch(tid) and tid not in ids:
                 ids.add(tid)
                 found.append(tid)
-    _append_ids(path, found or [None], size)
+    _append_ids(ids_fd, found or [None], size)
     return ids
 
 
-def _append_ids(path: str, tids, end: int) -> None:
-    fd = os.open(path + ".ids", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    try:
-        os.write(fd, "".join(f"{t or '-'} {end}\n" for t in tids).encode("ascii"))
-    finally:
-        os.close(fd)
+def _append_ids(ids_fd: int, tids, end: int) -> None:
+    os.write(ids_fd, "".join(f"{t or '-'} {end}\n" for t in tids).encode("ascii"))
 
 
-def append_export(line: bytes, task_id: str):
-    """Append one encoded record to the export file, once per task id. Returns (path_kind, already_there)."""
+def append_export(line: bytes, task_id: str, lock_wait_s=None):
+    """Append one encoded record to the export file, once per task id. Returns (path_kind, already_there, tightened):
+    tightened names what had group/other permission bits and was set to 0600/0700 ("dir", "file", "lock", "ids").
+    lock_wait_s (prune's remaining budget) shortens the lock wait below EXPORT_LOCK_WAIT_S."""
     path, kind = export_path()
-    parent = os.path.dirname(path)
-    if not os.path.isdir(parent):
-        os.makedirs(parent, mode=0o700, exist_ok=True)
-    if kind == "default":
-        os.chmod(parent, 0o700)                 # ours: exactly 0700 (makedirs' mode is masked by umask)
-    lock = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    tightened: list = []
+    _export_dir(os.path.dirname(path), kind, tightened)
+    lock = _open_private(path + ".lock", os.O_RDWR, "lock", tightened)
     try:
-        _flock_wait(lock, EXPORT_LOCK_WAIT_S)
-        if task_id in _exported_ids(path):
-            return kind, True
-        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        _flock_wait(lock, EXPORT_LOCK_WAIT_S if lock_wait_s is None else max(0.0, min(EXPORT_LOCK_WAIT_S, lock_wait_s)))
+        fd = _open_private(path, os.O_RDWR | os.O_APPEND, "file", tightened)
         try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
-                raise PermissionError("export file is not a regular file of this user")
-            if st.st_size and os.pread(fd, 1, st.st_size - 1) != b"\n":
-                os.write(fd, b"\n")             # a torn line from a dead writer: ours starts on a line of its own
-            if os.write(fd, line) != len(line):
-                raise OSError("short write to the export file")
-            end = os.fstat(fd).st_size
+            ids_fd = _open_private(path + ".ids", os.O_RDWR | os.O_APPEND, "ids", tightened)
+            try:
+                if task_id in _exported_ids(fd, ids_fd):
+                    return kind, True, tightened
+                st = os.fstat(fd)
+                if st.st_size and os.pread(fd, 1, st.st_size - 1) != b"\n":
+                    os.write(fd, b"\n")         # a torn line from a dead writer: ours starts on a line of its own
+                if os.write(fd, line) != len(line):
+                    raise OSError("short write to the export file")
+                _append_ids(ids_fd, [task_id], os.fstat(fd).st_size)
+                return kind, False, tightened
+            finally:
+                os.close(ids_fd)
         finally:
             os.close(fd)
-        _append_ids(path, [task_id], end)
-        return kind, False
     finally:
         os.close(lock)                          # releases the flock
 
 
-def _export_task(d: str, meta: dict, res: dict, red: "Redactor", router_run) -> dict:
+def _export_task(d: str, meta: dict, res: dict, red: "Redactor", router_run, lock_wait_s=None) -> dict:
     """Build, check and append the task's export record; returns the `export` status for result.json and logs
     task_exported / task_export_failed. Never raises (the task's result stands); errors are recorded by type only."""
     tid = os.path.basename(d)
@@ -2271,18 +2389,20 @@ def _export_task(d: str, meta: dict, res: dict, red: "Redactor", router_run) -> 
         line = json.dumps(rec, ensure_ascii=True, separators=(",", ":")) + "\n"
         if red._re is not None and red._re.search(line):
             raise _ExportLeak()                 # belt and braces: a credential spelling survived; write nothing
-        kind, already = append_export(line.encode("ascii"), tid)
+        kind, already, tightened = append_export(line.encode("ascii"), tid, lock_wait_s)
     except Exception as exc:
         err = type(exc).__name__
         log_event("task_export_failed", task_id=tid, error=err)
         return {"ok": False, "at": round(time.time(), 3), "error": err}
+    extra = {**({"already": True} if already else {}), **({"tightened": tightened} if tightened else {})}
     log_event("task_exported", task_id=tid, path_kind=kind, events=len(rec["events"]), logs=rec["logs"] == "included",
-              **({"already": True} if already else {}))
-    return {"ok": True, "at": round(time.time(), 3), "path_kind": kind,
-            **({"already": True} if already else {}), **({"logs_withheld": True} if rec["logs"] != "included" else {})}
+              **extra)
+    return {"ok": True, "at": round(time.time(), 3), "path_kind": kind, **extra,
+            **({"logs_withheld": True} if rec["logs"] != "included" else {}),
+            **({"prompt_withheld": True} if rec["prompt"] is None and rec.get("withheld_reason") else {})}
 
 
-def _export_locked(d: str, meta: dict, red: "Redactor", router_run, res=None):
+def _export_locked(d: str, meta: dict, red: "Redactor", router_run, res=None, lock_wait_s=None):
     """Export a finished task from outside its runner (status after a recovered task's logs were released, prune),
     holding the task's runner.lock so it never races the runner's own export or a recoverer. Returns the export
     status, or None when the lock is held (the runner is still finishing: it exports itself)."""
@@ -2305,7 +2425,7 @@ def _export_locked(d: str, meta: dict, red: "Redactor", router_run, res=None):
             return None
         if (res.get("export") or {}).get("ok"):
             return res["export"]
-        res["export"] = _export_task(d, meta, res, red, router_run)
+        res["export"] = _export_task(d, meta, res, red, router_run, lock_wait_s)
         _write_json(os.path.join(d, "result.json"), res)
         return res["export"]
     finally:
@@ -2883,6 +3003,15 @@ def _run(d: str, lock_fd=None) -> int:
             redact_file(os.path.join(d, name), red)
         except OSError as exc:
             result["redact_error"] = f"could not redact {name}: {type(exc).__name__}"
+    result["logs_redacted"] = not result.get("redact_error")
+    # The prompt too (in place: temp file 0600, atomic rename): a late export (status after a crash, prune after the
+    # credentials rotated) may only know other credentials, so nothing raw may stay for it to read (#91 review, P1).
+    try:
+        redact_file(os.path.join(d, "prompt.txt"), red)
+        result["prompt_redacted"] = True
+    except OSError as exc:
+        result["prompt_redacted"] = False
+        result["prompt_redact_error"] = f"could not redact prompt.txt: {type(exc).__name__}"
     raw = ""
     try:
         with open(os.path.join(d, "stdout.log"), encoding="utf-8", errors="replace") as f:
