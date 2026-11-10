@@ -2457,6 +2457,76 @@ class ChildTaskTests(ChildTaskBase):
         self.assertNotIn(good, names)
         self.call("wait_task", task_id=out["task_id"], timeout_s=30)
 
+    def test_corrupt_records_beside_good_ones_block_neither_start_nor_list(self):
+        """#94: one corrupt meta.json (or a truncated result.json) under the tasks root used to raise JSONDecodeError
+        out of prune() and fail every later start_task. Now both records are skipped, left on disk, and logged by id
+        and exception type only; the good record and the new task are listed; status() of a corrupt task is a clear
+        TaskError, never the file's content."""
+        root = ct._private_root()
+        bad_meta, bad_res, good = "t20200101000000-000000d1", "t20200101000000-000000d2", "t20200101000000-000000d3"
+        recent = time.time() - 60
+        for tid in (bad_meta, bad_res, good):
+            os.mkdir(os.path.join(root, tid), 0o700)
+        with open(os.path.join(root, bad_meta, "meta.json"), "w") as f:
+            f.write('{"cwd": "/Users/someone/secret-path", "started_at": ')      # a crash mid-write
+        ct._write_json(os.path.join(root, bad_res, "meta.json"), {"started_at": recent, "runner_pid": None, "cwd": "/w"})
+        with open(os.path.join(root, bad_res, "result.json"), "w") as f:
+            f.write('{"exit_code": 0, "output": {"result": "secret-answer"')     # truncated
+        ct._write_json(os.path.join(root, good, "meta.json"), {"started_at": recent, "runner_pid": None, "cwd": "/w"})
+        ct._write_json(os.path.join(root, good, "result.json"), {"exit_code": 0, "ended_at": recent + 1})
+        r, out = self.call("start_task", task="x", cwd=self.work)
+        self.assertFalse(r.get("isError"), r)
+        errs = out["prune_errors"]
+        self.assertEqual(sorted(e.split(":")[0] for e in errs), sorted(f"task {t}" for t in (bad_meta, bad_res)))
+        self.assertTrue(all("JSONDecodeError" in e for e in errs), errs)
+        self.assertNotIn("secret", json.dumps(out))
+        for tid in (bad_meta, bad_res, good):
+            self.assertTrue(os.path.isdir(os.path.join(root, tid)))               # never deleted on a guess
+        _, lst = self.call("list_tasks")
+        rows = lst["tasks"]
+        by = {row["task_id"]: row for row in rows}
+        self.assertEqual(by[good]["state"], "failed")                            # listed, as before
+        self.assertEqual(by[out["task_id"]]["task_id"], out["task_id"])
+        self.assertEqual(by[bad_meta]["state"], "unreadable")
+        self.assertIn("meta.json is unreadable (JSONDecodeError)", by[bad_meta]["error"])
+        self.assertEqual(by[bad_res]["state"], "unreadable")
+        self.assertIn("result.json is unreadable (JSONDecodeError)", by[bad_res]["error"])
+        self.assertNotIn("secret", json.dumps(rows))
+        logged = [e for e in _events() if e["event"] == "record_unreadable"]
+        self.assertEqual({(e["task_id"], e["file"], e["error"]) for e in logged},
+                         {(bad_meta, "meta.json", "JSONDecodeError"), (bad_res, "result.json", "JSONDecodeError")})
+        self.assertNotIn("secret", json.dumps(logged))
+        # status() of the corrupt task itself: a TaskError-shaped message naming id, file and type, not a traceback
+        r, _ = self.call("task_status", task_id=bad_meta)
+        self.assertTrue(r.get("isError"), r)
+        text = r["content"][0]["text"]
+        self.assertIn(f"task {bad_meta}: meta.json is unreadable (JSONDecodeError)", text)
+        self.assertNotIn("secret", text)
+        with self.assertRaises(ct.TaskError):
+            ct.status(bad_res)
+        self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+
+    def test_unreadable_record_is_pruned_only_past_the_prune_age_and_unlocked(self):
+        root = ct._private_root()
+        old, locked, fresh = "t20200101000000-000000e1", "t20200101000000-000000e2", "t20200101000000-000000e3"
+        for tid in (old, locked, fresh):
+            os.mkdir(os.path.join(root, tid), 0o700)
+            with open(os.path.join(root, tid, "meta.json"), "w") as f:
+                f.write("garbage")
+        import fcntl
+        fd = os.open(os.path.join(root, locked, "runner.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        ancient = time.time() - ct.PRUNE_AGE_S - 3600
+        for tid in (old, locked):
+            os.utime(os.path.join(root, tid), (ancient, ancient))
+        errors = []
+        removed = ct.prune(root, errors=errors)
+        self.assertEqual(removed, [old])                   # unchanged for two weeks and no runner: the normal rule
+        self.assertEqual(sorted(os.listdir(root)), [locked, fresh])     # a held lock or a fresh dir: kept
+        self.assertEqual(sorted(e.split(":")[0] for e in errors), sorted(f"task {t}" for t in (old, locked, fresh)))
+        self.assertTrue(all("(JSONDecodeError)" in e for e in errors), errors)
+
     def test_provider_refusal_surfaced_in_status(self):
         os.environ["FAKE_CLAUDE_MODE"] = "too-large"
         tid = self.start()

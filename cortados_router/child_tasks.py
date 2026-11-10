@@ -298,6 +298,25 @@ class TaskError(Exception):
         self.ambiguous = ambiguous
 
 
+class RecordError(TaskError):
+    """A task record on disk (meta.json, result.json, remote.json, ...) that exists but cannot be read: corrupt JSON
+    (a crash mid-write, a stray edit) or an OS error other than "missing". Names the task id, the file and the
+    exception TYPE only: a JSONDecodeError's message quotes the content, which may be a path or a prompt (#94).
+    A TaskError, so status() of that one task answers with a clear message; prune() and list_recent() skip the
+    record instead of failing every later start_task, and --watch treats it as a local read error, not the host's
+    answer."""
+
+    def __init__(self, task_id: str, file: str, exc: BaseException):
+        self.task_id, self.file, self.kind = task_id, file, type(exc).__name__
+        super().__init__(f"task {task_id}: {file} is unreadable ({self.kind}); the record is left in place")
+
+
+def _note_unreadable(exc: "RecordError") -> str:
+    """One lifecycle-log line per unreadable record seen (id, file, type: never content); returns the errors entry."""
+    log_event("record_unreadable", task_id=exc.task_id, file=exc.file, error=exc.kind)
+    return str(exc)
+
+
 def login_model(name) -> str:
     """The model a chrome (login-mode) child runs: `cortados` -> LOGIN_DEFAULT_MODEL (S1 cannot route a login session);
     a Claude model or sub/<claude model> -> that model id; anything else is refused (the login only runs Claude)."""
@@ -381,11 +400,15 @@ def task_path(task_id) -> str:
 
 
 def _read_json(path: str):
+    """A task-dir record: None when the file does not exist, RecordError (a TaskError) when it exists but cannot be
+    read or parsed. Never a raw JSONDecodeError: its text quotes the file."""
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
         return None
+    except (OSError, ValueError, RecursionError) as exc:
+        raise RecordError(os.path.basename(os.path.dirname(path)), os.path.basename(path), exc) from None
 
 
 def _write_json(path: str, obj) -> None:
@@ -533,7 +556,9 @@ def connectors_config() -> str:
 def prune(root: str, now: float | None = None, errors: list | None = None) -> list:
     """Remove task dirs whose task started more than PRUNE_AGE_S ago and is not running. Returns the removed ids. Each
     dir is handled on its own: one that cannot be read or removed is recorded in `errors` and skipped, so it never
-    blocks every later start_task."""
+    blocks every later start_task (#94). An unreadable record (RecordError) is never deleted on a guess, it may be a
+    live task's: it stays, logged by id and type, unless nothing in its dir has changed for PRUNE_AGE_S (dir mtime)
+    and no runner holds its lock; then it goes as any finished task of that age would."""
     cutoff = (time.time() if now is None else now) - PRUNE_AGE_S
     removed = []
     for name in os.listdir(root):
@@ -541,14 +566,27 @@ def prune(root: str, now: float | None = None, errors: list | None = None) -> li
         try:
             if not TASK_ID_RE.fullmatch(name) or os.path.islink(d) or not os.path.isdir(d):
                 continue
-            state, meta, _ = _state(d)
-            started = meta.get("started_at") if state != "remote" else meta.get("created_at")
-            if not isinstance(started, (int, float)):
-                started = os.path.getmtime(d)
+            try:
+                state, meta, _ = _state(d)
+            except RecordError as exc:
+                if errors is not None:
+                    errors.append(_note_unreadable(exc))
+                else:
+                    _note_unreadable(exc)
+                if os.path.getmtime(d) >= cutoff or _lock_held(d):
+                    continue
+                state, meta, started = "unreadable", {}, 0.0
+            else:
+                started = meta.get("started_at") if state != "remote" else meta.get("created_at")
+                if not isinstance(started, (int, float)):
+                    started = os.path.getmtime(d)
             # A remote stub is only a pointer (the host prunes the task itself): dropped by age alone.
             if state != "running" and started < cutoff:
-                if meta.get("launch") == "launchd":
-                    _launchd_bootout(d)
+                if meta.get("launch") == "launchd" or state == "unreadable":
+                    try:
+                        _launchd_bootout(d)     # idempotent; "not a launchd task" when there is no launchd.json
+                    except RecordError:
+                        pass                    # launchd.json unreadable too: the dir still goes
                 shutil.rmtree(d)
                 removed.append(name)
         except OSError as exc:
@@ -1563,9 +1601,10 @@ def watch(task_ids, timeout_s=None, interval_s=WATCH_INTERVAL_S, stall_s=WATCH_S
     WATCH_CONNECT_ATTEMPTS tries, or an unexpected error); 3 timeout_s passed with tasks still pending (those are
     written with "watch": "timeout"). 2 outranks 3 outranks 1, whichever way the watch ends: an orchestrator reading
     the code can read every line too. Ids must be known before the first poll: one bad id and nothing is watched.
-    Stall rules: WATCH_STALL_S and WATCH_QUEUED_STALL_S above. A status() that raises anything but a TaskError (a
-    corrupt meta.json, a task dir removed between two reads, a permission) counts as an unreadable poll for that task,
-    named by exception type only; so does a reply that is not a record (a host answering with a list). A task that was
+    Stall rules: WATCH_STALL_S and WATCH_QUEUED_STALL_S above. A status() that raises anything but a TaskError (a task
+    dir removed between two reads, a permission), or a RecordError (a corrupt meta.json: a TaskError by shape, a local
+    read by nature), counts as an unreadable poll for that task, named by exception type only; so does a reply that is
+    not a record (a host answering with a list). A task that was
     readable and then was not for the stall window is `stalled` (exit 1) when any of those polls was the host's or the
     id's answer (a TaskError: the task may still be running there), but `unwatchable` (exit 2) when every one of them
     was a local read error: this side cannot read the record, which says nothing about the task. The deadline is
@@ -1625,10 +1664,11 @@ def watch(task_ids, timeout_s=None, interval_s=WATCH_INTERVAL_S, stall_s=WATCH_S
                     raise TaskError(f"status answered with {type(st).__name__}, not a record")
             except Exception as exc:
                 # A TaskError carries the host's or the id's message (names, never credentials). Anything else is a
-                # reading problem on this side (corrupt JSON, a dir that vanished mid-read, a permission): type only.
+                # reading problem on this side (a dir that vanished mid-read, a permission): type only. A RecordError
+                # (corrupt JSON in this machine's copy of the record) is a TaskError by shape but a local read too.
                 why = str(exc) if isinstance(exc, TaskError) else type(exc).__name__
                 p["fails"] += 1
-                p["local"] = p["local"] and not isinstance(exc, TaskError)
+                p["local"] = p["local"] and (isinstance(exc, RecordError) or not isinstance(exc, TaskError))
                 if not p["read"] and p["fails"] >= WATCH_CONNECT_ATTEMPTS:
                     emit({"task_id": tid, "state": "unwatchable", "watched_s": round(now - start, 1),
                           "error": f"status could not be read in {p['fails']} attempts: {why}"})
@@ -1749,7 +1789,11 @@ def list_recent(n=20, ids=None) -> list:
     ids = sorted(names, reverse=True)[:n]
     rows, by_host = [], {}
     for tid in ids:
-        state, meta, res = _state(os.path.join(root, tid))
+        try:
+            state, meta, res = _state(os.path.join(root, tid))
+        except RecordError as exc:                  # one corrupt record must not hide every other task (#94)
+            rows.append({"task_id": tid, "state": "unreadable", "error": _note_unreadable(exc)})
+            continue
         if state == "remote":
             by_host.setdefault(meta["host"], []).append(tid)
             rows.append({"task_id": tid, "host": meta["host"], "state": "unknown"})   # filled in from the host below
