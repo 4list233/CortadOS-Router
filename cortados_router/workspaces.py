@@ -16,6 +16,9 @@ services/ and everything else are never touched: cleanup_archive() refuses them 
 archived worktree. The cleanup's run budget (CLEANUP_MAX_SECONDS) bounds how long it holds the lock, because every git
 call it makes gets the time left as its timeout; a start waits for the lock at most CLEANUP_LOCK_WAIT_S and is then
 refused with a retryable reason (#93). An assessment that times out is an unknown: nothing is deleted or moved on it.
+The budget never cuts a move short: once an entry is renamed to held/, the `git worktree repair` that points the clone's
+registry at the new path runs under its own fixed cap and is undone (back to archive/) if it fails, and no
+`git worktree prune` runs while a registry entry names a missing path whose directory is in held/.
 
 Stdlib only. git runs as a subprocess with GIT_TERMINAL_PROMPT=0 (an unauthenticated clone fails instead of hanging).
 """
@@ -593,18 +596,74 @@ def _fd_contains_git_entry(directory_fd: int) -> bool:
     return False
 
 
-def _prune_worktrees(rec: dict, deadline=None) -> None:
-    repo_dir = rec.get("repo_dir")
-    if rec.get("kind") == "repo" and isinstance(repo_dir, str) and os.path.isdir(repo_dir):
+def _moved_held_worktrees(repo_dir: str, root: str, deadline=None) -> list:
+    """Paths under <root>/held/ of worktrees whose registry entry in repo_dir still names a path with no .git: an
+    archived worktree that was renamed to held/ but whose `git worktree repair` never ran (a crash or an earlier
+    failure). `git worktree prune` would delete their admin dirs (index, detached HEAD, reflog), so they are repaired
+    before any prune. The listing itself gets the budget: with no time left this raises GitTimeoutError and the
+    caller skips the prune (stale admin metadata is harmless; a moved worktree is not)."""
+    out = _git(["worktree", "list", "--porcelain"], cwd=repo_dir, timeout=_within(deadline, GIT_TIMEOUT_S))
+    held_layout = os.path.join(root, "held")
+    moved = []
+    for line in out.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        path = line[len("worktree "):]
+        name = os.path.basename(os.path.normpath(path))
+        if not TASK_ID_RE.fullmatch(name) or os.path.exists(os.path.join(path, ".git")):
+            continue
+        held_path = os.path.join(held_layout, name)
         try:
-            _git(["worktree", "prune", "--expire", "now"], cwd=repo_dir, timeout=_within(deadline, GIT_TIMEOUT_S))
-        except WorkspaceError:
-            pass  # The data operation is complete; stale administrative metadata is safe and can be pruned later.
+            info = os.lstat(held_path)
+        except OSError:
+            continue                                  # really gone (a deleted archive entry): prunable
+        if stat.S_ISDIR(info.st_mode) and os.path.isfile(os.path.join(held_path, ".git")):
+            moved.append(held_path)
+    return moved
 
 
-def _hold_changed_archive(root: str, archive_fd: int, name: str, rec: dict, reason: str, now: float,
-                          deadline=None) -> dict:
-    """Move a newly changed archived worktree to held/ using anchored source and destination descriptors."""
+def _repair_worktree(held_path: str, repo_dir: str) -> None:
+    """Point the clone's registry at a worktree's new path. Local and fast; it gets its own fixed cap, never the
+    cleanup budget, because skipping it leaves a registry entry at a missing path that the next prune would delete
+    along with the worktree's admin dir. Raises WorkspaceError (GitTimeoutError included) when it did not succeed."""
+    _git(["worktree", "repair", held_path], cwd=repo_dir, timeout=GIT_TIMEOUT_S)
+
+
+def _prune_worktrees(rec: dict, root: str, deadline=None) -> list:
+    """Drop the registry entry of the worktree just deleted. Never runs while a registry entry names a missing path
+    whose directory is in held/: those are repaired first (fixed cap), and if one cannot be repaired nothing is
+    pruned. Returns a list of error strings (the deletion itself is complete either way; a prune skipped for lack
+    of budget is not an error, a repair that failed is)."""
+    repo_dir = rec.get("repo_dir")
+    if rec.get("kind") != "repo" or not isinstance(repo_dir, str) or not os.path.isdir(repo_dir):
+        return []
+    try:
+        moved = _moved_held_worktrees(repo_dir, root, deadline=deadline)
+    except WorkspaceError:
+        return []       # could not list (or no time left): nothing pruned, stale admin metadata can be pruned later
+    errors = []
+    for held_path in moved:
+        try:
+            _repair_worktree(held_path, repo_dir)
+        except WorkspaceError as exc:
+            errors.append(f"{os.path.basename(held_path)}: held worktree {held_path} is registered at a missing path "
+                          f"and could not be repaired ({exc}); not pruning {repo_dir} until it is")
+    if errors:
+        return errors
+    try:
+        _git(["worktree", "prune", "--expire", "now"], cwd=repo_dir, timeout=_within(deadline, GIT_TIMEOUT_S))
+    except WorkspaceError:
+        pass  # The data operation is complete; stale administrative metadata is safe and can be pruned later.
+    return []
+
+
+def _hold_changed_archive(root: str, archive_fd: int, name: str, rec: dict, reason: str, now: float) -> dict:
+    """Move a newly changed archived worktree to held/ using anchored source and destination descriptors, then repair
+    the clone's registry so it names the new path. The repair is never skipped (it runs under its own fixed cap, not
+    the cleanup budget): a held worktree the registry still lists at archive/<name> would lose its admin dir to the
+    next `git worktree prune`. If the repair fails the move is undone (the entry goes back to archive/, where the
+    next cleanup reassesses it again) and the failure is raised for the cleanup report; the index is only written
+    once the worktree is in held/ with a correct registry entry."""
     held_path = os.path.join(root, "held", name)
     held_fd = _open_dir(os.path.join(root, "held"))
     try:
@@ -615,16 +674,27 @@ def _hold_changed_archive(root: str, archive_fd: int, name: str, rec: dict, reas
         else:
             raise WorkspaceError(f"held/{name} already exists; archived workspace was not deleted")
         os.rename(name, name, src_dir_fd=archive_fd, dst_dir_fd=held_fd)
+        updated = {**rec, "state": "held", "path": held_path, "settled_at": now, "reason": reason}
+        repo_dir = rec.get("repo_dir")
+        if rec.get("kind") == "repo" and isinstance(repo_dir, str) and os.path.isdir(repo_dir):
+            try:
+                _repair_worktree(held_path, repo_dir)
+            except WorkspaceError as exc:
+                try:
+                    os.rename(name, name, src_dir_fd=held_fd, dst_dir_fd=archive_fd)
+                except OSError as back:
+                    # Worst case: in held/ with a registry entry at the old path. Record it so the owner sees it in
+                    # the held listing; _prune_worktrees() repairs it before any prune of this clone.
+                    updated["repair_error"] = str(exc)
+                    update_index(root, updated)
+                    raise WorkspaceError(f"moved to held/ but `git worktree repair` failed ({exc}) and moving it back "
+                                         f"to archive/ failed too ({back}); its registry entry still names "
+                                         f"{os.path.join(root, 'archive', name)}") from None
+                raise WorkspaceError(f"not held: `git worktree repair` failed after the move ({exc}); moved back to "
+                                     "archive/ for the next cleanup to reassess") from None
     finally:
         os.close(held_fd)
-    updated = {**rec, "state": "held", "path": held_path, "settled_at": now, "reason": reason}
     update_index(root, updated)
-    repo_dir = rec.get("repo_dir")
-    if rec.get("kind") == "repo" and isinstance(repo_dir, str) and os.path.isdir(repo_dir):
-        try:
-            _git(["worktree", "repair", held_path], cwd=repo_dir, timeout=_within(deadline, GIT_TIMEOUT_S))
-        except WorkspaceError:
-            pass  # The workspace is safely held; repair is administrative and must not put data back at risk.
     return updated
 
 
@@ -646,7 +716,10 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
 
     `max_seconds` is a whole-run deadline: checked between entries, and given to every git call an entry makes as
     its subprocess timeout (min of the call's own cap and the time left), so the run — and the cleanup lock it holds,
-    which a task start may be waiting for — ends within the budget plus one local command.
+    which a task start may be waiting for — ends within the budget plus one local command. Two steps are never cut
+    short by it, because a half-done sequence would leave a held worktree's registry entry at a missing path for a
+    prune to destroy: the repair after a move to held/ (_hold_changed_archive, fixed cap, rolled back on failure) and
+    the repair of any such entry before a prune (_prune_worktrees, which otherwise skips the prune and reports).
     """
     started = time.monotonic()
     deadline = None if max_seconds is None else started + max_seconds
@@ -698,7 +771,7 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
                     raise WorkspaceError("archive path changed after it was opened; refusing deletion")
                 if rec.get("kind") == "folder" and _fd_contains_git_entry(entry_fd):
                     _hold_changed_archive(root, archive_fd, name, rec,
-                                          "plain folder contains a nested .git entry", now, deadline=deadline)
+                                          "plain folder contains a nested .git entry", now)
                     out["kept"] += 1
                     continue
                 if rec.get("kind") == "repo":
@@ -712,14 +785,14 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
                         out["kept"] += 1
                         continue
                     if not ok:
-                        _hold_changed_archive(root, archive_fd, name, rec, reason, now, deadline=deadline)
+                        _hold_changed_archive(root, archive_fd, name, rec, reason, now)
                         out["kept"] += 1
                         continue
                 _remove_tree_fd(entry_fd)
                 os.close(entry_fd)
                 entry_fd = None
                 os.rmdir(name, dir_fd=archive_fd)
-                _prune_worktrees(rec, deadline=deadline)
+                out["errors"].extend(_prune_worktrees(rec, root, deadline=deadline))
             except (OSError, WorkspaceError) as exc:
                 out["errors"].append(f"{name}: {type(exc).__name__}: {exc}")
                 continue

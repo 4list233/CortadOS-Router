@@ -763,6 +763,133 @@ class CleanupTests(_Base):
         self.assertTrue(os.path.isdir(held))
         self.assertFalse(os.path.islink(held))
 
+    def unpushed_commit_in_archive(self, tid):
+        """An old archived repo entry that has since gained a commit on its detached HEAD (unpublished work the
+        reassessment must hold). Returns (path, sha)."""
+        path = self.archived(tid, ws.ARCHIVE_AGE_S + 60, kind="repo")
+        with open(os.path.join(path, "late.txt"), "w") as f:
+            f.write("unpublished\n")
+        git("add", ".", cwd=path)
+        git("commit", "-q", "-m", "unpublished", cwd=path)
+        return path, git("rev-parse", "HEAD", cwd=path).strip()
+
+    def exhaust_budget_after_reassessment(self, budget):
+        """Patches for one cleanup run: time.monotonic jumps past `budget` the moment pushed() returns, so the entry it
+        assessed is handled with no budget left (the reviewer's reproduction of the held-worktree data loss)."""
+        real_monotonic, real_pushed, offset = time.monotonic, ws.pushed, [0.0]
+
+        def pushed_then_exhaust(path, deadline=None):
+            result = real_pushed(path, deadline=deadline)
+            offset[0] = budget + 1
+            return result
+
+        return (mock.patch.object(ws.time, "monotonic", side_effect=lambda: real_monotonic() + offset[0]),
+                mock.patch.object(ws, "pushed", side_effect=pushed_then_exhaust))
+
+    def assert_valid_held_worktree(self, held, sha, repo_dir):
+        """held is a working worktree of repo_dir at sha, and sha survives an aggressive gc of the clone."""
+        self.assertEqual(git("rev-parse", "HEAD", cwd=held).strip(), sha)
+        git("status", "--porcelain", cwd=held)
+        self.assertIn(f"worktree {held}\n", git("worktree", "list", "--porcelain", cwd=repo_dir))
+        self.assertNotIn("prunable", git("worktree", "list", "--porcelain", cwd=repo_dir))
+        git("reflog", "expire", "--expire=now", "--all", cwd=repo_dir)
+        git("gc", "-q", "--prune=now", cwd=repo_dir)
+        git("cat-file", "-e", sha + "^{commit}", cwd=repo_dir)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=held).strip(), sha)
+
+    def test_held_move_with_no_budget_left_still_repairs_the_registry_so_a_later_prune_cannot_break_it(self):
+        """#93 review (data loss): reassessment finds unpublished work just before the deadline. The move to held/
+        must still repair the clone's registry; otherwise a later cleanup's `git worktree prune` deletes the held
+        worktree's admin dir (index, detached HEAD, reflog) and its unpublished commit becomes garbage."""
+        first, sha = self.unpushed_commit_in_archive(TID)
+        self.archived(TID2, ws.ARCHIVE_AGE_S + 60, kind="repo")      # clean: deleted (and pruned) by the second run
+        repo_dir = ws.read_index(self.root)[TID]["repo_dir"]
+        clock, pushed = self.exhaust_budget_after_reassessment(budget=30)
+        with clock, pushed:
+            report = ws.cleanup_archive(self.root, max_seconds=30)
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual(report["deleted"], [])
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(report["kept"], 2)                            # TID held, TID2 not started (budget gone)
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "held")
+        self.assertTrue(os.path.isdir(held))
+        self.assertFalse(os.path.exists(first))
+        listing = git("worktree", "list", "--porcelain", cwd=repo_dir)
+        self.assertIn(f"worktree {held}\n", listing)                 # registry repaired despite the exhausted budget
+        self.assertNotIn(f"worktree {first}\n", listing)
+        second = ws.cleanup_archive(self.root)                        # deletes TID2 and prunes the clone's registry
+        self.assertEqual(second["deleted"], [TID2])
+        self.assertEqual(second["errors"], [])
+        self.assert_valid_held_worktree(held, sha, repo_dir)
+        self.assertTrue(os.path.exists(os.path.join(held, "late.txt")))
+
+    def test_failed_repair_moves_the_entry_back_to_archive_and_is_reported(self):
+        """The index is written only once the worktree is in held/ with a correct registry entry. A repair that fails
+        undoes the move: the entry stays archived (reassessed next run), nothing is deleted, the error is reported."""
+        first, sha = self.unpushed_commit_in_archive(TID)
+        repo_dir = ws.read_index(self.root)[TID]["repo_dir"]
+        before = ws.read_index(self.root)[TID]
+        real_git = ws._git
+
+        def failing_repair(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+            if args[:2] == ["worktree", "repair"]:
+                raise ws.GitTimeoutError("git worktree did not finish within 60 s")
+            return real_git(args, cwd=cwd, timeout=timeout)
+
+        with mock.patch.object(ws, "_git", side_effect=failing_repair):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertIn(TID, report["errors"][0])
+        self.assertIn("repair", report["errors"][0])
+        self.assertIn("moved back to archive/", report["errors"][0])
+        self.assertTrue(os.path.isdir(first))
+        self.assertEqual(os.listdir(os.path.join(self.root, "held")), [])
+        self.assertEqual(ws.read_index(self.root)[TID], before)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=first).strip(), sha)
+        self.assertNotIn("prunable", git("worktree", "list", "--porcelain", cwd=repo_dir))
+        # with a working git the next run holds it properly
+        report = ws.cleanup_archive(self.root)
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "held")
+        self.assert_valid_held_worktree(held, sha, repo_dir)
+
+    def test_prune_repairs_a_held_worktree_still_registered_at_archive_first(self):
+        """A held/ directory whose registry entry still names archive/ (a crash between the move and its repair, or a
+        legacy hold) is repaired before any prune; if that repair fails nothing is pruned and the error is reported."""
+        first, sha = self.unpushed_commit_in_archive(TID)
+        self.archived(TID2, ws.ARCHIVE_AGE_S + 60, kind="repo")
+        rec = ws.read_index(self.root)[TID]
+        repo_dir = rec["repo_dir"]
+        held = os.path.join(self.root, "held", TID)
+        os.rename(first, held)                                         # a bare move: the registry still names archive/
+        ws.update_index(self.root, {**rec, "state": "held", "path": held})
+        self.assertIn("prunable", git("worktree", "list", "--porcelain", cwd=repo_dir))
+        real_git = ws._git
+
+        def failing_repair(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+            if args[:2] == ["worktree", "repair"]:
+                raise ws.WorkspaceError("git worktree failed (exit 1): simulated")
+            return real_git(args, cwd=cwd, timeout=timeout)
+
+        with mock.patch.object(ws, "_git", side_effect=failing_repair):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [TID2])                   # the deletion itself is complete
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertIn("could not be repaired", report["errors"][0])
+        self.assertIn("not pruning", report["errors"][0])
+        listing = git("worktree", "list", "--porcelain", cwd=repo_dir)
+        self.assertIn(f"worktree {first}\n", listing)                 # not pruned: the held worktree's admin dir is intact
+        self.assertEqual(git("rev-parse", "HEAD", cwd=held).strip(), sha)
+        # the next deletion in this clone repairs it and only then prunes
+        self.archived("t20261108120200-0000000c", ws.ARCHIVE_AGE_S + 60, kind="repo")
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], ["t20261108120200-0000000c"])
+        self.assertEqual(report["errors"], [])
+        self.assertNotIn(f"worktree {first}\n", git("worktree", "list", "--porcelain", cwd=repo_dir))
+        self.assert_valid_held_worktree(held, sha, repo_dir)
+
     def test_record_without_settled_time_or_wrong_state_is_kept(self):
         path = self.archived(TID, ws.ARCHIVE_AGE_S + 60)
         ws.update_index(self.root, {"task_id": TID, "state": "held", "settled_at": 0, "path": path})
