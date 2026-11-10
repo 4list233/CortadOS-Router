@@ -58,6 +58,34 @@ class WatchTests(ChildTaskBase):
         self.assertEqual((rows[0]["state"], rows[0]["exit_code"]), ("failed", 3))
         self.assertNotIn("boom", text)
 
+    def test_a_result_that_is_an_api_error_exits_1_with_the_error_line_only(self):
+        """#97: the child exited 0 with is_error false, but its result text IS the API error: failed, exit 1. The
+        line carries `error` (the first line of the error, metadata) and never the result text itself."""
+        os.environ["FAKE_CLAUDE_MODE"] = "api-error"
+        tid = self.start()
+        rc, rows, text = self.watch(tid)
+        self.assertEqual(rc, 1, text)
+        row = rows[0]
+        self.assertEqual((row["state"], row["exit_code"]), ("failed", 0))
+        self.assertTrue(row["error"].startswith("API Error: 400 cortados: conversation 44d0c934 failed at"), row)
+        self.assertNotIn("result", row)
+        self.assertEqual(text.count("start a new conversation"), 1)   # the error line once; not the (twice-printed) result
+
+    def test_a_real_answer_that_begins_like_an_api_error_exits_0(self):
+        """The reviewer's false positive on #97: the model's own answer begins "API Error: 429 means ..."; the child's
+        last message is not the CLI's synthetic one, so the task succeeded and --watch exits 0."""
+        os.environ["FAKE_CLAUDE_MODE"] = "api-error"
+        os.environ["FAKE_RESULT"] = "API Error: 429 means the provider rate limit was exceeded; back off and retry."
+        os.environ["FAKE_ANSWERED"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_RESULT", None)
+        self.addCleanup(os.environ.pop, "FAKE_ANSWERED", None)
+        tid = self.start()
+        rc, rows, text = self.watch(tid)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual((rows[0]["state"], rows[0]["exit_code"]), ("succeeded", 0))
+        self.assertNotIn("error", rows[0])
+        self.assertNotIn("result", rows[0])                 # metadata only, as ever
+
     def test_cancelled_exits_1(self):
         tid = self.start_sleeping()
         _, c = self.call("cancel_task", task_id=tid)
