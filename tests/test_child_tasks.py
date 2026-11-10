@@ -177,8 +177,9 @@ FAKE = textwrap.dedent('''\
         sys.exit(0)
     if mode == "api-error":
         # #97, as seen live 2026-11-10: the child's last request failed at the API, and Claude Code printed the error
-        # as the RESULT TEXT (twice), subtype "success", is_error false (FAKE_IS_ERROR=1: true, as other versions do),
-        # exit 0. FAKE_RESULT replaces the text. The stream ends with the tool results that request was to answer.
+        # as an assistant message of its own (model "<synthetic>", as the real CLI marks it) and as the RESULT TEXT
+        # (twice), subtype "success", is_error false (FAKE_IS_ERROR=1: true, as other versions do), exit 0.
+        # FAKE_RESULT replaces the text; FAKE_ANSWERED=1 makes it the model's real answer (a real model name).
         text = os.environ.get("FAKE_RESULT") or (
             "API Error: 400 cortados: conversation 44d0c934 failed at 06:35:49 (codex_turn_failed: the Codex turn "
             "failed (ContentFlag); details are in the provider log) and was closed: start a new conversation")
@@ -191,8 +192,8 @@ FAKE = textwrap.dedent('''\
             "input": {{"command": "ls"}}}}]}}}})
         ev({{"type": "user", "message": {{"content": [{{"type": "tool_result", "tool_use_id": "toolu_1",
             "content": "a.txt"}}]}}}})
-        if os.environ.get("FAKE_ANSWERED"):
-            ev({{"type": "assistant", "message": {{"content": [{{"type": "text", "text": text}}]}}}})
+        model = "claude-fable-5-1" if os.environ.get("FAKE_ANSWERED") else "<synthetic>"
+        ev({{"type": "assistant", "message": {{"model": model, "content": [{{"type": "text", "text": text}}]}}}})
         ev({{"type": "result", "subtype": "success", "is_error": bool(os.environ.get("FAKE_IS_ERROR")),
             "result": text, "num_turns": 3}})
         sys.exit(0)
@@ -2833,6 +2834,11 @@ API_ERROR_TEXT = ("API Error: 400 cortados: conversation 44d0c934 failed at 06:3
 TERMINAL_REFUSAL = {"status": 400, "type": "invalid_request_error", "at": 1.0,
                     "reason": "the conversation already failed (terminal): codex_turn_failed: the Codex turn failed "
                               "(ContentFlag)"}
+# A real answer that begins like an API error (the reviewer's false positive on the first version of #97).
+ANSWER_LIKE_ERROR = ("API Error: 429 means the provider rate limit was exceeded; the client should back off and retry "
+                     "after the Retry-After delay.\nIn this repo the retry lives in transport.py.")
+SYNTHETIC = {"last_message": "assistant", "last_message_synthetic": True}      # the CLI wrote the last message
+ANSWERED = {"last_message": "assistant", "last_message_synthetic": False}      # the model did
 
 
 class ApiErrorResultTests(ChildTaskBase):
@@ -2844,36 +2850,60 @@ class ApiErrorResultTests(ChildTaskBase):
 
     # ---- classify() on records (pure)
     def test_classify_fails_an_error_record_and_an_error_text_and_keeps_a_quoting_answer(self):
-        ok = {"exit_code": 0}
+        ok = {"exit_code": 0, "activity": SYNTHETIC}      # the stream shows the CLI wrote the child's last message
         rec = lambda **k: {"type": "result", "subtype": "success", "is_error": False, "result": "fine", **k}  # noqa: E731
         self.assertEqual(ct.classify({**ok, "output": rec()}), "succeeded")
-        # (a) is_error true, whatever the subtype and the exit status say
+        # (a) is_error true, whatever the subtype, the exit status and the stream say
         self.assertEqual(ct.classify({**ok, "output": rec(is_error=True)}), "failed")
+        self.assertEqual(ct.classify({"exit_code": 0, "activity": ANSWERED, "output": rec(is_error=True)}), "failed")
         self.assertEqual(ct.result_error(rec(is_error=True, result="")),
                          "the child's result record is an error (subtype 'success') with no text")
+        self.assertEqual(ct.result_error(rec(is_error=True, result=ANSWER_LIKE_ERROR), ANSWERED),
+                         ANSWER_LIKE_ERROR.split("\n")[0])
         # (b) the text IS the error: Claude Code's prefix (printed twice, as seen live), with is_error false
         twice = API_ERROR_TEXT + "\n" + API_ERROR_TEXT
         self.assertEqual(ct.classify({**ok, "output": rec(result=twice)}), "failed")
-        self.assertEqual(ct.result_error(rec(result=twice)), API_ERROR_TEXT)      # the first line only
+        self.assertEqual(ct.result_error(rec(result=twice), SYNTHETIC), API_ERROR_TEXT)      # the first line only
         # (b) the provider's terminal refusals without the prefix (another client, another version)
         for text in (API_ERROR_TEXT[len("API Error: 400 "):],
                      "cortados: the conversation was closed while this request waited for it; start a new conversation"):
             self.assertEqual(ct.classify({**ok, "output": rec(result=text)}), "failed", text)
-            self.assertEqual(ct.result_error(rec(result=text)), text)
+            self.assertEqual(ct.result_error(rec(result=text), SYNTHETIC), text)
         # leading blank lines do not hide the error; a long line is capped with the full text left in `result`
-        self.assertEqual(ct.result_error(rec(result="\n\n  " + API_ERROR_TEXT)), API_ERROR_TEXT)
+        self.assertEqual(ct.result_error(rec(result="\n\n  " + API_ERROR_TEXT), SYNTHETIC), API_ERROR_TEXT)
         long = "API Error: 500 " + "x" * 2000
-        err = ct.result_error(rec(result=long))
+        err = ct.result_error(rec(result=long), SYNTHETIC)
         self.assertEqual((len(err), err[-1], err[:15]), (ct.ERROR_LINE_CHARS, "…", "API Error: 500 "))
         # an answer that merely QUOTES an API error after its first line is a normal answer
         quoting = ("Summary of the run:\n- the first attempt ended with `" + API_ERROR_TEXT + "`\n"
                    "- the retry went through and the files are in place.\nDone.")
         self.assertEqual(ct.classify({**ok, "output": rec(result=quoting)}), "succeeded")
-        self.assertIsNone(ct.result_error(rec(result=quoting)))
-        self.assertIsNone(ct.result_error(rec(result="conversation starters: start a new conversation with a joke")))
+        self.assertIsNone(ct.result_error(rec(result=quoting), SYNTHETIC))
+        self.assertIsNone(ct.result_error(rec(result="conversation starters: start a new conversation with a joke"),
+                                          SYNTHETIC))
         # not a record at all: nothing to say (parse_output's rules already fail it)
-        self.assertIsNone(ct.result_error(None))
-        self.assertIsNone(ct.result_error({"type": "system"}))
+        self.assertIsNone(ct.result_error(None, SYNTHETIC))
+        self.assertIsNone(ct.result_error({"type": "system"}, SYNTHETIC))
+
+    def test_the_text_rule_needs_the_childs_last_message_to_be_the_clis_own(self):
+        """The reviewer's false positive: a real answer that begins "API Error: 429 means ..." (the model wrote the
+        last message) is a success. The text decides only with the stream's evidence that Claude Code wrote the
+        child's last message (model "<synthetic>"); a record without that evidence (an older runner's, or no stream
+        summary at all) is never failed on its text."""
+        rec = lambda **k: {"type": "result", "subtype": "success", "is_error": False, "result": "fine", **k}  # noqa: E731
+        for text in (ANSWER_LIKE_ERROR, API_ERROR_TEXT, API_ERROR_TEXT + "\n" + API_ERROR_TEXT,
+                     API_ERROR_TEXT[len("API Error: 400 "):]):
+            for activity in (ANSWERED, {"last_message": "user", "last_message_synthetic": False},
+                             {"last_message": "assistant"}, {"last_message": None, "last_message_synthetic": None},
+                             {}, None, "not a summary", {"last_message_synthetic": "true"}):
+                self.assertIsNone(ct.result_error(rec(result=text), activity), (text[:40], activity))
+                self.assertEqual(ct.classify({"exit_code": 0, "activity": activity, "output": rec(result=text)}),
+                                 "succeeded", (text[:40], activity))
+            self.assertEqual(ct.classify({"exit_code": 0, "output": rec(result=text)}), "succeeded", text[:40])
+        # the same text with the evidence: failed (the observed case), the reviewer's text included
+        for text in (ANSWER_LIKE_ERROR, API_ERROR_TEXT):
+            self.assertEqual(ct.result_error(rec(result=text), SYNTHETIC), text.split("\n")[0])
+            self.assertEqual(ct.classify({"exit_code": 0, "activity": SYNTHETIC, "output": rec(result=text)}), "failed")
 
     def test_terminal_refusal_rule_needs_an_unanswered_conversation(self):
         unanswered = {"last_message": "user"}
@@ -2903,17 +2933,31 @@ class ApiErrorResultTests(ChildTaskBase):
         def write(events):
             with open(path, "w") as f:
                 f.write("".join(json.dumps(e) + "\n" for e in events))
-        asst = {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}}
+        asst = {"type": "assistant", "message": {"model": "claude-fable-5-1",
+                                                 "content": [{"type": "text", "text": "done"}]}}
+        # the CLI's own message, as the real one marks it (seen live 2026-11-10: the "API Error: ..." text)
+        synth = {"type": "assistant", "message": {"model": "<synthetic>",
+                                                  "content": [{"type": "text", "text": API_ERROR_TEXT}]}}
         tool = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "x"}]}}
         sub = {"type": "user", "parent_tool_use_id": "t1", "message": {"content": [{"type": "tool_result",
                                                                                      "tool_use_id": "t9", "content": "y"}]}}
+        subsynth = {**synth, "parent_tool_use_id": "t1"}
         result = {"type": "result", "subtype": "success", "is_error": False, "result": "done"}
+        last = lambda: {k: ct.summarize_stream(path, self.work)[k] for k in ("last_message", "last_message_synthetic")}  # noqa: E731
         write([{"type": "system", "subtype": "init"}, result])
-        self.assertIsNone(ct.summarize_stream(path, self.work)["last_message"])
+        self.assertEqual(last(), {"last_message": None, "last_message_synthetic": None})
         write([asst, tool, result])
-        self.assertEqual(ct.summarize_stream(path, self.work)["last_message"], "user")
+        self.assertEqual(last(), {"last_message": "user", "last_message_synthetic": False})
         write([asst, tool, asst, sub, result])             # a subagent's late event is not the child's own
-        self.assertEqual(ct.summarize_stream(path, self.work)["last_message"], "assistant")
+        self.assertEqual(last(), {"last_message": "assistant", "last_message_synthetic": False})
+        write([asst, tool, synth, result])                 # the observed failure: the CLI wrote the last message
+        self.assertEqual(last(), {"last_message": "assistant", "last_message_synthetic": True})
+        write([asst, tool, synth, asst, result])           # ... and the model answered after it
+        self.assertEqual(last(), {"last_message": "assistant", "last_message_synthetic": False})
+        write([asst, tool, asst, subsynth, result])        # a subagent's API error is not the child's own
+        self.assertEqual(last(), {"last_message": "assistant", "last_message_synthetic": False})
+        write([asst, tool, synth, tool, result])           # a tool result after it: not answered, not synthetic
+        self.assertEqual(last(), {"last_message": "user", "last_message_synthetic": False})
 
     # ---- through start_task / wait_task (the runner, the fake claude)
     def test_api_error_text_with_subtype_success_and_exit_0_is_failed(self):
@@ -2927,6 +2971,33 @@ class ApiErrorResultTests(ChildTaskBase):
         self.assertEqual(_events()[-1]["status"], "failed")
         res = _load(os.path.join(ct.task_path(w["task_id"]), "result.json"))
         self.assertEqual(res["error"], API_ERROR_TEXT)                      # recorded by the runner, not computed late
+        self.assertEqual((res["activity"]["last_message"], res["activity"]["last_message_synthetic"]),
+                         ("assistant", True))                              # the evidence, stored with the record
+
+    def test_a_real_answer_that_begins_like_an_api_error_stays_succeeded(self):
+        """The reviewer's false positive: exit 0, is_error false, subtype success, and the child's last message is the
+        model's own answer, which happens to begin "API Error: 429 means ...". Succeeded, no error, result kept."""
+        os.environ["FAKE_CLAUDE_MODE"] = "api-error"
+        os.environ["FAKE_RESULT"] = ANSWER_LIKE_ERROR
+        os.environ["FAKE_ANSWERED"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_RESULT", None)
+        self.addCleanup(os.environ.pop, "FAKE_ANSWERED", None)
+        tid = self.start()
+        w = self.wait(tid)
+        self.assertEqual((w["state"], w["exit_code"], w["subtype"]), ("succeeded", 0, "success"))
+        self.assertNotIn("error", w)
+        self.assertEqual(w["result"], ANSWER_LIKE_ERROR)
+        self.assertEqual(_events()[-1]["status"], "succeeded")
+        p = os.path.join(ct.task_path(tid), "result.json")
+        res = _load(p)
+        self.assertNotIn("error", res)
+        self.assertEqual(res["activity"]["last_message_synthetic"], False)
+        # the same record as an older runner would have stored it (no stream evidence either way): still succeeded
+        del res["activity"]["last_message_synthetic"]
+        ct._write_json(p, res)
+        _, w = self.call("task_status", task_id=tid)
+        self.assertEqual(w["state"], "succeeded")
+        self.assertNotIn("error", w)
 
     def test_is_error_true_with_subtype_success_is_failed_with_the_error_line(self):
         os.environ["FAKE_CLAUDE_MODE"] = "api-error"
@@ -2971,6 +3042,27 @@ class ApiErrorResultTests(ChildTaskBase):
         ct._write_json(p, res)
         _, w = self.call("task_status", task_id=tid)
         self.assertEqual((w["state"], w["error"]), ("failed", API_ERROR_TEXT))
+
+    def test_a_past_success_without_stream_evidence_is_never_flipped_on_its_text(self):
+        """A result.json from a runner older than the evidence (no last_message_synthetic in its activity, or no
+        activity at all) with an is_error-false "API Error: ..." text: status() keeps it succeeded. The text alone
+        never reclassifies a past success."""
+        os.environ["FAKE_CLAUDE_MODE"] = "api-error"
+        tid = self.start()
+        self.wait(tid)
+        p = os.path.join(ct.task_path(tid), "result.json")
+        res = _load(p)
+        del res["error"]
+        for activity in ({k: v for k, v in res["activity"].items() if k != "last_message_synthetic"}, None):
+            if activity is None:
+                res.pop("activity")
+            else:
+                res["activity"] = activity
+            ct._write_json(p, res)
+            _, w = self.call("task_status", task_id=tid)
+            self.assertEqual(w["state"], "succeeded", activity)
+            self.assertNotIn("error", w)
+            self.assertTrue(w["result"].startswith(API_ERROR_TEXT))
 
     def _serve_run(self, record):
         """A local provider stand-in for the RUNNER's own run-record fetch (a detached process, out of reach of the

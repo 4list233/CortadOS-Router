@@ -1315,9 +1315,10 @@ def classify(res: dict) -> str:
     # Success needs exit 0 AND a valid claude result record that says it is not an error (parse_output's rules):
     # empty stdout, malformed JSON, a scalar or a record of the wrong shape is a failure, not a quiet success.
     out = res.get("output")
-    if result_error(out) is not None:
-        # The record is an error, or its text is one (an "API Error: ..." the CLI printed as the result, #97): the
-        # child's last request failed, whatever is_error and the exit status say.
+    if result_error(out, act) is not None:
+        # The record is an error, or its text is one (an "API Error: ..." the CLI printed as the result, #97, with
+        # the stream showing it was the CLI's own message): the child's last request failed, whatever is_error and
+        # the exit status say.
         return "failed"
     if (res.get("exit_code") == 0 and isinstance(out, dict) and out.get("type") == "result"
             and out.get("is_error") is False and isinstance(out.get("result"), str)):
@@ -1501,8 +1502,9 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
             out["redact_unparsed_lines"] = out.get("redact_unparsed_lines", 0) + res["redact_unparsed_lines"]
         if res.get("error"):
             out["error"] = res["error"]
-        elif state == "failed" and result_error(o) is not None:
-            out["error"] = result_error(o)      # a record from a runner that did not surface it (#97); redacted below
+        elif state == "failed" and result_error(o, res.get("activity")) is not None:
+            # a record from a runner that did not surface it (#97); redacted below
+            out["error"] = result_error(o, res.get("activity"))
         # The router's own record of what this child was routed to (its requests carried x-cortados-run-id: task_id).
         # A login-mode (chrome) task never went through the provider: there is no run record to fetch.
         out["router_run"] = ({"note": "login mode: not routed, no provider run record"} if meta.get("lane")
@@ -2963,6 +2965,10 @@ TERMINAL_REFUSAL_PREFIX = "the conversation already failed (terminal)"
 TERMINAL_REFUSAL_STATUS = 400
 TERMINAL_REFUSAL_TYPE = "invalid_request_error"
 ERROR_LINE_CHARS = 500              # the `error` text made from a result: one line, capped (the full text stays in result)
+# The `message.model` Claude Code puts on an assistant message IT wrote (its API-error text), not the model: the
+# text rule of result_error() needs the child's own last message to be one (summarize_stream's last_message_synthetic),
+# because a real answer can begin with "API Error: 429 means ..." (a false positive reported on the first version).
+SYNTHETIC_MODEL = "<synthetic>"
 
 
 def _error_line(text: str) -> str:
@@ -2971,17 +2977,21 @@ def _error_line(text: str) -> str:
     return first if len(first) <= ERROR_LINE_CHARS else first[:ERROR_LINE_CHARS - 1] + "…"
 
 
-def result_error(out) -> "str | None":
+def result_error(out, activity=None) -> "str | None":
     """Why a parsed result record is an error, else None (#97): the record says so (is_error true), or its text IS an
-    API error (first line "API Error: ..." as Claude Code prints one, or the provider's terminal-conversation refusal).
-    A result that only quotes an API error inside a normal answer is not matched: the first line decides."""
+    API error (first line "API Error: ..." as Claude Code prints one, or the provider's terminal-conversation refusal)
+    AND the stream summary (`activity`) shows the child's own last message was Claude Code's synthetic error message
+    (last_message_synthetic). The text alone never decides: a model's answer may begin "API Error: 429 means ...",
+    and a stored record with no stream evidence (an older runner's) keeps its state. A result that only quotes an
+    API error inside a normal answer is not matched either: the first line decides."""
     if not isinstance(out, dict) or out.get("type") != "result":
         return None
     text = out.get("result")
     first = _error_line(text) if isinstance(text, str) else ""
     if out.get("is_error") is True:
         return first or f"the child's result record is an error (subtype {out.get('subtype')!r}) with no text"
-    if first.startswith(API_ERROR_PREFIX) or TERMINAL_CONVERSATION_RE.search(first):
+    synthetic = isinstance(activity, dict) and activity.get("last_message_synthetic") is True
+    if synthetic and (first.startswith(API_ERROR_PREFIX) or TERMINAL_CONVERSATION_RE.search(first)):
         return first
     return None
 
@@ -3029,6 +3039,7 @@ def summarize_stream(path: str, cwd: str) -> dict:
     names: dict = {}                        # tool_use id -> tool name (to read a tool_result as its tool's answer)
     disconnected: dict = {}                 # chrome tool name -> results saying BROWSER_DISCONNECTED
     last_message = None                     # type of the child's OWN last message event (subagent events excluded)
+    last_synthetic = None                   # ... and whether it is Claude Code's own (model "<synthetic>") message
     root = os.path.realpath(cwd)
     with open(path, encoding="utf-8", errors="replace", newline="\n") as f:   # records end in "\n" only
         for line in f:
@@ -3045,7 +3056,10 @@ def summarize_stream(path: str, cwd: str) -> dict:
                 # A conversation that ended answered ends with an assistant message; one whose last request failed
                 # ends with the tool results it delivered (a user message), or with no message at all (#97, rule c).
                 # A subagent's events carry parent_tool_use_id and say nothing about the child's own conversation.
+                # An assistant message the CLI wrote itself (its "API Error: ..." text) carries model "<synthetic>";
+                # that, not the text, is what lets result_error() call a result text an error.
                 last_message = kind
+                last_synthetic = kind == "assistant" and (ev.get("message") or {}).get("model") == SYNTHETIC_MODEL
             content = (ev.get("message") or {}).get("content") if kind in ("assistant", "user") else None
             for b in content if isinstance(content, list) else []:
                 if not isinstance(b, dict):
@@ -3075,7 +3089,8 @@ def summarize_stream(path: str, cwd: str) -> dict:
     outside = [p for p in written if os.path.commonpath([root, p]) != root]
     out = {"tool_uses": tool_uses, "tool_errors": errors, "effective_permission_mode": mode,
            "files_written": written[:MAX_ACTIVITY_PATHS], "writes_outside_cwd": outside[:MAX_ACTIVITY_PATHS],
-           "write_attempts_unconfirmed": unconfirmed[:MAX_ACTIVITY_PATHS], "last_message": last_message}
+           "write_attempts_unconfirmed": unconfirmed[:MAX_ACTIVITY_PATHS], "last_message": last_message,
+           "last_message_synthetic": last_synthetic}
     if disconnected:
         out["browser_disconnected"] = disconnected   # present only when seen: classify() fails the task on it
     return out
@@ -3280,7 +3295,7 @@ def _run(d: str, lock_fd=None) -> int:
         # error (Claude Code's "API Error: ...", with is_error false in some versions), or the provider's record shows
         # the run's last request refused as terminal and the child's own conversation never answered after it. The
         # reason is the task's error (classify fails it on `error`); the result text is kept as it is.
-        reason = result_error(result.get("output"))
+        reason = result_error(result.get("output"), result.get("activity"))
         if reason is None:
             reason = unanswered_terminal_refusal(router_run, result.get("activity"))
         if reason is not None:

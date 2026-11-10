@@ -647,10 +647,13 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   2026-11-10: a Codex turn failed, the provider closed the conversation, and Claude Code printed the error as the
   result text with `is_error: false` and exit 0). The task fails when the result record says `is_error: true`, when
   the first line of its result text is an `API Error: …` or the provider's terminal-conversation refusal
-  (`conversation <id> failed at … start a new conversation`), or when the provider's run record shows the run's last
-  request refused as terminal and the child's own conversation never answered after it. `error` carries the first
-  line of the error (capped); `result` keeps the text; `--watch` exits 1. An answer that merely quotes an API error
-  below its first line is a normal answer.
+  (`conversation <id> failed at … start a new conversation`) AND the stream shows the child's own last message was
+  Claude Code's synthetic error message (`message.model` `<synthetic>`; `activity.last_message_synthetic`), or when
+  the provider's run record shows the run's last request refused as terminal and the child's own conversation never
+  answered after it. `error` carries the first line of the error (capped); `result` keeps the text; `--watch` exits
+  1. The text alone never fails a task: a real answer that begins `API Error: 429 means …` is a success, one that
+  merely quotes an API error below its first line too, and a record written by an older runner (no stream evidence)
+  keeps its state.
 - State: `~/.config/cortados/tasks/<task_id>/` (0700; logs, `result.json`). The token-bearing settings file is deleted
   when the child exits; finished task dirs older than 14 days are pruned on the next `start_task`, once their run
 export succeeded (see "Task run export" below). A task record that
