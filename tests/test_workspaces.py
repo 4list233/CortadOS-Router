@@ -434,22 +434,69 @@ class BranchReleaseTests(_Base):
         report = ws.cleanup_archive(self.root, now=ws.ARCHIVE_AGE_S + 1)
         self.assertEqual(report["deleted"], [TID])
 
-    def test_legacy_release_waits_for_the_cleanup_lock(self):
-        path, _ = self.legacy()
+    def hold_cleanup_lock(self):
+        """What a cleanup in its reassess-through-delete section holds; released by closing the descriptor."""
         lock = os.open(os.path.join(self.root, "cleanup.lock"), os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(lock, fcntl.LOCK_EX)                     # a cleanup in its reassess-through-delete section
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return lock
+
+    def test_legacy_release_waits_for_the_cleanup_lock(self):
+        """#93: the wait is bounded, and a lock that frees within the bound lets the start proceed."""
+        path, _ = self.legacy()
+        lock = self.hold_cleanup_lock()
         out = []
         thread = threading.Thread(target=lambda: out.append(self.prepare(TID2, repo="demo", branch="feature")))
-        try:
-            thread.start()
-            thread.join(1.5)
-            self.assertTrue(thread.is_alive(), "start released the archive while cleanup held its lock")
-            self.assertTrue(self.attached(path))
-        finally:
-            os.close(lock)
-            thread.join(30)
+        with mock.patch.object(ws, "CLEANUP_LOCK_WAIT_S", 20):
+            try:
+                thread.start()
+                thread.join(1.5)
+                self.assertTrue(thread.is_alive(), "start released the archive while cleanup held its lock")
+                self.assertTrue(self.attached(path))
+            finally:
+                os.close(lock)
+                thread.join(30)
         self.assertEqual(out[0]["freed_from_archive"], path)
         self.assertFalse(self.attached(path))
+
+    def test_legacy_release_is_refused_when_the_cleanup_lock_stays_held(self):
+        """#93: a cleanup that holds its lock past CLEANUP_LOCK_WAIT_S refuses the start with a retryable reason; the
+        start never proceeds without the lock and leaves the archive exactly as it was."""
+        path, commit = self.legacy()
+        lock = self.hold_cleanup_lock()
+        try:
+            with mock.patch.object(ws, "CLEANUP_LOCK_WAIT_S", 0.5):
+                t0 = time.monotonic()
+                with self.assertRaises(ws.WorkspaceError) as cm:
+                    self.prepare(TID2, repo="demo", branch="feature")
+                waited = time.monotonic() - t0
+        finally:
+            os.close(lock)
+        msg = str(cm.exception)
+        self.assertIn("archive cleanup is running; retry in a minute", msg)
+        self.assertIn("'feature'", msg)
+        self.assertIn(path, msg)
+        self.assertGreaterEqual(waited, 0.5)
+        self.assertLess(waited, 10, "the start kept waiting after the limit")
+        self.assertTrue(self.attached(path))
+        self.assertEqual(self.head(path), commit)
+        self.assertFalse(os.path.lexists(os.path.join(self.root, "active", TID2)))
+        # the refusal is retryable: with the lock free, the same start succeeds (and left no lock of its own behind)
+        rec2 = self.prepare(TID2, repo="demo", branch="feature")
+        self.assertEqual(rec2["freed_from_archive"], path)
+        self.assertFalse(self.attached(path))
+
+    def test_cleanup_lock_poll_never_takes_the_lock_after_giving_up(self):
+        lock = self.hold_cleanup_lock()
+        try:
+            with self.assertRaises(ws.CleanupBusyError):
+                with ws._cleanup_lock(self.root, timeout=0.2):
+                    self.fail("entered the locked section while another holder had cleanup.lock")
+        finally:
+            os.close(lock)
+        with ws._cleanup_lock(self.root, timeout=0.2):      # free now: acquired at once
+            with self.assertRaises(ws.CleanupBusyError):    # and held by us: a second bounded taker is refused
+                with ws._cleanup_lock(self.root, timeout=0.2):
+                    pass
 
     def test_narrowed_refspec_and_force_moved_remote_is_refused(self):
         path, commit = self.legacy()
@@ -587,6 +634,74 @@ class CleanupTests(_Base):
             report = ws.cleanup_archive(self.root, max_seconds=1)
         self.assertEqual(len([r for r in ws.read_index(self.root).values() if r["state"] == "held"]), 1)
         self.assertEqual(report["kept"], 2)
+
+    def hanging_fetch_git(self):
+        """A git whose `fetch` never returns (exec sleep: the subprocess timeout kills the sleep itself, so no orphan
+        keeps the captured pipes open); every other command is the real git."""
+        script = os.path.join(self.tmp, "git-hanging-fetch")
+        with open(script, "w") as f:
+            f.write('#!/bin/sh\nif [ "$1" = fetch ]; then exec sleep 60; fi\nexec git "$@"\n')
+        os.chmod(script, 0o755)
+        return script
+
+    def test_hung_fetch_in_cleanup_times_out_within_the_budget_and_keeps_the_entry(self):
+        """#93: the run budget is each git call's timeout too. A hung fetch ends at the budget, the entry it was
+        assessing is neither deleted nor moved to held/, later entries are kept, and the run returns in time."""
+        first = self.archived(TID, ws.ARCHIVE_AGE_S + 60, kind="repo")
+        second = self.archived(TID2, ws.ARCHIVE_AGE_S + 60, kind="repo")
+        before = {tid: ws.read_index(self.root)[tid] for tid in (TID, TID2)}
+        timeouts, real_git = [], ws._git
+
+        def recording_git(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+            if args[0] == "fetch":
+                timeouts.append(timeout)
+            return real_git(args, cwd=cwd, timeout=timeout)
+
+        budget = 2
+        with mock.patch.object(ws, "GIT", self.hanging_fetch_git()), \
+                mock.patch.object(ws, "_git", side_effect=recording_git):
+            t0 = time.monotonic()
+            report = ws.cleanup_archive(self.root, max_seconds=budget)
+            elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, budget + 5, "cleanup held its lock past the budget")
+        self.assertEqual(len(timeouts), 1)                   # the second entry was not even started
+        self.assertGreater(timeouts[0], 0)
+        self.assertLessEqual(timeouts[0], budget)            # min(FETCH_TIMEOUT_S, time left), not the 300 s cap
+        self.assertEqual(report["deleted"], [])
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(report["kept"], 2)
+        self.assertEqual(len(report["timed_out"]), 1)
+        self.assertIn(TID, report["timed_out"][0])
+        self.assertIn("did not finish within", report["timed_out"][0])
+        for path in (first, second):
+            self.assertTrue(os.path.isdir(path))
+            self.assertTrue(os.path.exists(os.path.join(path, "README.md")))
+        self.assertEqual(os.listdir(os.path.join(self.root, "held")), [])
+        self.assertEqual({tid: ws.read_index(self.root)[tid] for tid in (TID, TID2)}, before)
+        # with a working git the same entries are deleted by the next run
+        self.assertEqual(ws.cleanup_archive(self.root)["deleted"], [TID, TID2])
+
+    def test_no_budget_left_skips_the_git_call_instead_of_starting_it(self):
+        with self.assertRaises(ws.GitTimeoutError):
+            ws._within(time.monotonic() - 1, ws.FETCH_TIMEOUT_S)
+        self.assertEqual(ws._within(None, 7), 7)
+        self.assertLessEqual(ws._within(time.monotonic() + 1, ws.FETCH_TIMEOUT_S), 1)
+        self.assertEqual(ws._within(time.monotonic() + 1000, 7), 7)
+
+    def test_settle_holds_a_worktree_whose_assessment_timed_out(self):
+        rec = self.prepare(TID, repo=self.origin)
+        real_git = ws._git
+
+        def timing_out_fetch(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+            if args[0] == "fetch":
+                raise ws.GitTimeoutError("git fetch did not finish within 300 s")
+            return real_git(args, cwd=cwd, timeout=timeout)
+
+        with mock.patch.object(ws, "_git", side_effect=timing_out_fetch):
+            self.assertEqual(ws.pushed(rec["path"])[0], None)
+            settled = ws.settle(rec, self.root)
+        self.assertEqual(settled["state"], "held")          # unknown is held at settle, never archived
+        self.assertIn("in time", settled["reason"])
 
     def test_archive_dir_itself_must_be_real(self):
         ws.ensure_root(self.root)

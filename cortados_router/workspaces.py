@@ -12,6 +12,11 @@ Only archive/ is ever deleted from, only entries named like a task id, only regu
 (never a symlink, never through one), only with an index record saying `archived` long enough ago. held/, repos/,
 services/ and everything else are never touched: cleanup_archive() refuses them by construction, not by convention.
 
+<root>/cleanup.lock serializes the cleanup's reassess-through-delete section with a task start that frees a legacy
+archived worktree. The cleanup's run budget (CLEANUP_MAX_SECONDS) bounds how long it holds the lock, because every git
+call it makes gets the time left as its timeout; a start waits for the lock at most CLEANUP_LOCK_WAIT_S and is then
+refused with a retryable reason (#93). An assessment that times out is an unknown: nothing is deleted or moved on it.
+
 Stdlib only. git runs as a subprocess with GIT_TERMINAL_PROMPT=0 (an unauthenticated clone fails instead of hanging).
 """
 from __future__ import annotations
@@ -39,13 +44,25 @@ CLONE_TIMEOUT_S = 900
 FETCH_TIMEOUT_S = 300
 GIT_TIMEOUT_S = 60                  # local operations: worktree add/move/remove, status, rev-list
 CLEANUP_MAX_DELETIONS = 100          # daily cleanup stays bounded even after a long outage
+# The cleanup's whole-run budget. It is checked between entries and, since #93, carried into every git call an entry
+# makes (each call gets min(its own cap, time left)), so one hung fetch cannot hold cleanup.lock past the budget.
 CLEANUP_MAX_SECONDS = 300            # held moves and failures consume this budget too
+# How long a task start waits for cleanup.lock before it is refused (#93). A cleanup entry normally holds the lock for
+# one fetch plus a few local commands (seconds); 60 s covers a slow one, while a start that waited the full cleanup
+# budget (300 s) would already have failed its caller's expectations. The refusal is retryable, never a bypass.
+CLEANUP_LOCK_WAIT_S = 60
+CLEANUP_LOCK_POLL_S = 0.1            # between non-blocking flock attempts: no spin, and at most 0.1 s added after release
 GIT = "git"                          # resolved on PATH at call time (the execution host's PATH is set by its entry)
 SUBDIRS = ("repos", "active", "archive", "held")
 
 
 class WorkspaceError(Exception):
     pass
+
+
+class GitTimeoutError(WorkspaceError):
+    """A git call hit its timeout (or had no time left before it started). Nothing is known about what it would have
+    reported, so callers that act on git's answer must treat this as "unknown", never as "clean" or "not pushed"."""
 
 
 def _git(args, cwd=None, timeout=GIT_TIMEOUT_S) -> str:
@@ -55,10 +72,22 @@ def _git(args, cwd=None, timeout=GIT_TIMEOUT_S) -> str:
     except FileNotFoundError:
         raise WorkspaceError("git is not installed or not on PATH on this execution host") from None
     except subprocess.TimeoutExpired:
-        raise WorkspaceError(f"git {args[0]} did not finish within {timeout} s") from None
+        raise GitTimeoutError(f"git {args[0]} did not finish within {timeout:g} s") from None
     if p.returncode != 0:
         raise WorkspaceError(f"git {' '.join(args[:2])} failed (exit {p.returncode}): {p.stderr.strip()[-400:]}")
     return p.stdout
+
+
+def _within(deadline, cap: float) -> float:
+    """The timeout for one git call under an overall deadline (a time.monotonic() value, or None for no deadline):
+    the call's own cap, or less when the deadline comes first. Raises GitTimeoutError when no time is left, so a call
+    that could not finish anyway is not started (and the caller handles it exactly like a call that timed out)."""
+    if deadline is None:
+        return cap
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise GitTimeoutError("no time left in the cleanup budget before this git call started")
+    return min(cap, left)
 
 
 def parse_repo(repo):
@@ -171,10 +200,16 @@ def _prepare_repo_locked(rec, tid, path, repo_dir, name, url, branch, root):
         if _settled_under(taken[branch], root) == "archive":
             # Releasing a legacy archived worktree must not interleave with the archive cleanup's reassess-then-delete
             # section: take its lock, then look again (cleanup may have deleted and pruned the holder meanwhile).
-            with _cleanup_lock(root):
-                taken = _worktree_branches(repo_dir)
-                if branch in taken:
-                    _release_branch(rec, taken[branch], branch, repo_dir, root)
+            # The wait is bounded (#93): a cleanup that is slow keeps the lock, and the start is refused with a
+            # retryable reason rather than blocking for the cleanup's whole budget. It never proceeds without the lock.
+            try:
+                with _cleanup_lock(root, timeout=CLEANUP_LOCK_WAIT_S):
+                    taken = _worktree_branches(repo_dir)
+                    if branch in taken:
+                        _release_branch(rec, taken[branch], branch, repo_dir, root)
+            except CleanupBusyError as exc:       # only __enter__ raises it: the body was never run
+                raise WorkspaceError(f"branch {branch!r} is checked out by an archived worktree ({taken[branch]}) "
+                                     f"that was not released: {exc}") from None
         else:
             _release_branch(rec, taken[branch], branch, repo_dir, root)
     if branch is None:
@@ -221,20 +256,43 @@ def _release_branch(rec, holder, branch, repo_dir, root):
     rec["freed_from_archive"] = holder
 
 
+class CleanupBusyError(WorkspaceError):
+    """cleanup.lock stayed held for the whole bounded wait. The operation that wanted it was not run; it can be retried."""
+
+
 class _cleanup_lock:
     """<root>/cleanup.lock, held by cleanup_archive() from reassessment through deletion and by a start that releases
-    a legacy archived worktree, so neither can act on an entry the other is examining or has just changed."""
+    a legacy archived worktree, so neither can act on an entry the other is examining or has just changed.
 
-    def __init__(self, root: str):
+    timeout=None blocks until the lock is free (the cleanup itself: a second cleanup simply runs after the first).
+    A timeout in seconds polls a non-blocking flock every CLEANUP_LOCK_POLL_S and raises CleanupBusyError once it is
+    exceeded (a start: see CLEANUP_LOCK_WAIT_S). flock itself has no timed variant, hence the poll."""
+
+    def __init__(self, root: str, timeout=None):
         self.root = root
+        self.timeout = timeout
         self.fd = None
 
     def __enter__(self):
         self.fd = os.open(os.path.join(self.root, "cleanup.lock"), os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            fcntl.flock(self.fd, fcntl.LOCK_EX)
+            if self.timeout is None:
+                fcntl.flock(self.fd, fcntl.LOCK_EX)
+            else:
+                deadline = time.monotonic() + self.timeout
+                while True:
+                    try:
+                        fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:                        # EWOULDBLOCK: another process holds it
+                        if time.monotonic() >= deadline:
+                            raise CleanupBusyError("archive cleanup is running; retry in a minute (waited "
+                                                   f"{self.timeout:g} s for {os.path.join(self.root, 'cleanup.lock')})") \
+                                from None
+                        time.sleep(min(CLEANUP_LOCK_POLL_S, max(0.0, deadline - time.monotonic())))
         except BaseException:
             os.close(self.fd)
+            self.fd = None
             raise
         return self
 
@@ -344,35 +402,42 @@ def _free_archived_branch(path: str, branch: str, repo_dir: str, root: str):
         os.close(layout_fd)
 
 
-def pushed(path: str):
+def pushed(path: str, deadline=None):
     """(True, "pushed") only after fresh remote refs prove every byte and commit is published.
 
-    Any git or fetch failure is uncertainty, so the caller holds the workspace rather than risking owner data.
+    (False, reason): not proven published; any git or fetch failure is uncertainty too, so the caller holds the
+    workspace rather than risking owner data. (None, reason): the assessment did not finish (a git call timed out, or
+    `deadline` — a time.monotonic() value — left no time for one), so nothing is known either way; a caller that
+    would otherwise move or delete must leave the workspace exactly as it is. `None` is falsy on purpose: a caller
+    that only asks "proven pushed?" (settle) holds, which is the conservative answer.
     """
     try:
-        remotes = _git(["remote"], cwd=path).split()
+        remotes = _git(["remote"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S)).split()
         if not remotes:
             return False, "could not assess the worktree: it has no remote"
         for remote in remotes:
             # An explicit all-heads refspec also prunes stale refs excluded by a locally narrowed fetch refspec.
             _git(["fetch", "--prune", remote,
-                  f"+refs/heads/*:refs/remotes/{remote}/*"], cwd=path, timeout=FETCH_TIMEOUT_S)
-        submodules = _git(["ls-files", "--stage"], cwd=path)
+                  f"+refs/heads/*:refs/remotes/{remote}/*"], cwd=path, timeout=_within(deadline, FETCH_TIMEOUT_S))
+        submodules = _git(["ls-files", "--stage"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
         if any(line.startswith("160000 ") for line in submodules.splitlines()):
             return False, "submodule content cannot be proven published; holding the workspace"
         # Ignored content is owner data too. No cache (including __pycache__ or node_modules) is exempt: generated and
         # unpublished content cannot be distinguished safely here, and holding is the required conservative default.
-        flagged = _git(["ls-files", "-v"], cwd=path)
+        flagged = _git(["ls-files", "-v"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
         hidden = [line for line in flagged.splitlines() if line and (line[0].islower() or line[0] == "S")]
         if hidden:
             return False, f"{len(hidden)} tracked file(s) hidden by assume-unchanged or skip-worktree"
-        dirty = _git(["status", "--porcelain", "--untracked-files=all", "--ignored=matching"], cwd=path)
+        dirty = _git(["status", "--porcelain", "--untracked-files=all", "--ignored=matching"], cwd=path,
+                     timeout=_within(deadline, GIT_TIMEOUT_S))
         if dirty.strip():
             n = len(dirty.splitlines())
             return False, f"{n} uncommitted or untracked file(s), including ignored content"
-        ahead = _git(["rev-list", "HEAD", "--not", "--remotes"], cwd=path)
+        ahead = _git(["rev-list", "HEAD", "--not", "--remotes"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
         if ahead.strip():
             return False, f"{len(ahead.split())} commit(s) not on any remote"
+    except GitTimeoutError as exc:
+        return None, f"could not assess the worktree in time: {exc}"
     except WorkspaceError as exc:
         return False, f"could not assess the worktree: {exc}"
     return True, "pushed"
@@ -528,16 +593,17 @@ def _fd_contains_git_entry(directory_fd: int) -> bool:
     return False
 
 
-def _prune_worktrees(rec: dict) -> None:
+def _prune_worktrees(rec: dict, deadline=None) -> None:
     repo_dir = rec.get("repo_dir")
     if rec.get("kind") == "repo" and isinstance(repo_dir, str) and os.path.isdir(repo_dir):
         try:
-            _git(["worktree", "prune", "--expire", "now"], cwd=repo_dir)
+            _git(["worktree", "prune", "--expire", "now"], cwd=repo_dir, timeout=_within(deadline, GIT_TIMEOUT_S))
         except WorkspaceError:
             pass  # The data operation is complete; stale administrative metadata is safe and can be pruned later.
 
 
-def _hold_changed_archive(root: str, archive_fd: int, name: str, rec: dict, reason: str, now: float) -> dict:
+def _hold_changed_archive(root: str, archive_fd: int, name: str, rec: dict, reason: str, now: float,
+                          deadline=None) -> dict:
     """Move a newly changed archived worktree to held/ using anchored source and destination descriptors."""
     held_path = os.path.join(root, "held", name)
     held_fd = _open_dir(os.path.join(root, "held"))
@@ -556,7 +622,7 @@ def _hold_changed_archive(root: str, archive_fd: int, name: str, rec: dict, reas
     repo_dir = rec.get("repo_dir")
     if rec.get("kind") == "repo" and isinstance(repo_dir, str) and os.path.isdir(repo_dir):
         try:
-            _git(["worktree", "repair", held_path], cwd=repo_dir)
+            _git(["worktree", "repair", held_path], cwd=repo_dir, timeout=_within(deadline, GIT_TIMEOUT_S))
         except WorkspaceError:
             pass  # The workspace is safely held; repair is administrative and must not put data back at risk.
     return updated
@@ -574,12 +640,19 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
     """Delete old recorded archive entries through no-follow directory descriptors.
 
     Repository worktrees are reassessed immediately before deletion. Any change, stale remote, or assessment failure
-    moves the workspace to held/. held/, repos/, services/, and a replacement archive ancestor are never traversed.
+    moves the workspace to held/. An assessment that does not finish in time (a hung fetch, or no budget left) is
+    not a failure but an unknown: the entry is left exactly as it is, counted in `kept` and named in `timed_out`,
+    and tried again by a later run. held/, repos/, services/, and a replacement archive ancestor are never traversed.
+
+    `max_seconds` is a whole-run deadline: checked between entries, and given to every git call an entry makes as
+    its subprocess timeout (min of the call's own cap and the time left), so the run — and the cleanup lock it holds,
+    which a task start may be waiting for — ends within the budget plus one local command.
     """
     started = time.monotonic()
+    deadline = None if max_seconds is None else started + max_seconds
     now = time.time() if now is None else now
     archive = os.path.join(root, "archive")
-    out = {"deleted": [], "kept": 0, "refused": [], "errors": []}
+    out = {"deleted": [], "kept": 0, "refused": [], "errors": [], "timed_out": []}
     try:
         archive_fd = _open_dir(archive)
     except OSError as exc:
@@ -625,22 +698,28 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
                     raise WorkspaceError("archive path changed after it was opened; refusing deletion")
                 if rec.get("kind") == "folder" and _fd_contains_git_entry(entry_fd):
                     _hold_changed_archive(root, archive_fd, name, rec,
-                                          "plain folder contains a nested .git entry", now)
+                                          "plain folder contains a nested .git entry", now, deadline=deadline)
                     out["kept"] += 1
                     continue
                 if rec.get("kind") == "repo":
-                    ok, reason = pushed(path)
+                    ok, reason = pushed(path, deadline=deadline)
                     if not _same_entry(entry_fd, path):
                         raise WorkspaceError("archive path changed during reassessment; refusing deletion")
+                    if ok is None:
+                        # Timed out: nothing is known about the worktree, so it is neither deleted nor moved. Not an
+                        # error either (the daily job exits non-zero on errors): a later run reassesses it.
+                        out["timed_out"].append(f"{name}: {reason}")
+                        out["kept"] += 1
+                        continue
                     if not ok:
-                        _hold_changed_archive(root, archive_fd, name, rec, reason, now)
+                        _hold_changed_archive(root, archive_fd, name, rec, reason, now, deadline=deadline)
                         out["kept"] += 1
                         continue
                 _remove_tree_fd(entry_fd)
                 os.close(entry_fd)
                 entry_fd = None
                 os.rmdir(name, dir_fd=archive_fd)
-                _prune_worktrees(rec)
+                _prune_worktrees(rec, deadline=deadline)
             except (OSError, WorkspaceError) as exc:
                 out["errors"].append(f"{name}: {type(exc).__name__}: {exc}")
                 continue

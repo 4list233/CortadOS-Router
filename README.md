@@ -513,14 +513,18 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   entry from before this that still holds the branch is detached when a new task asks for it, under the archive
   cleanup's lock, only if its tree is clean and its HEAD is the `origin/<branch>` tip fetched just then with an
   explicit all-heads refspec (a failed fetch refuses), and only if `active/`, `archive/` and `held/` are real
-  directories and the entry is unchanged between assessment and detach; otherwise the start is refused.
+  directories and the entry is unchanged between assessment and detach; otherwise the start is refused. The start
+  waits at most 60 s (`CLEANUP_LOCK_WAIT_S`) for that lock; past it the start is refused with "archive cleanup is
+  running; retry in a minute" and never proceeds without the lock (#93).
   `task_status` shows `workspace` (kind, state, path, reason).
 - Archive cleanup: `python3 cortados_router/child_tasks.py --cleanup-archive [--root <dir>]` deletes `archive/<task_id>`
   entries whose index record says archived more than 3 days ago, and nothing else: not a name that is not a task id,
   not a symlink (never followed), not a non-directory, not an entry resolving outside `archive/`, not one without an
   archive record, never anything in `held/`, `repos/`, `services/`. It has per-run deletion and elapsed-time limits;
-  reassessed work moved to `held/` and errors consume the same time budget. The cleanup rechecks plain folders for a
-  nested `.git` immediately before deletion. `integrations/launchd/com.cortados.archive-cleanup.plist` runs it daily on
+  reassessed work moved to `held/` and errors consume the same time budget, and the time left in the budget is every
+  git call's subprocess timeout, so one hung fetch cannot hold `cleanup.lock` past it (#93). An entry whose
+  reassessment times out is left exactly as it is (reported under `timed_out`, counted as kept, retried by the next
+  run), never deleted or moved. The cleanup rechecks plain folders for a nested `.git` immediately before deletion. `integrations/launchd/com.cortados.archive-cleanup.plist` runs it daily on
   the Air; task startup never runs cleanup, so starting a task is not delayed by cleanup locks or remote fetches.
 - `chrome: true` on a `gui` host runs the child as a per-task LaunchAgent in the desktop session
   (`launchctl bootstrap gui/<uid> <task dir>/launchd.plist`, label `com.cortados.task.<task_id>`, booted out when the
