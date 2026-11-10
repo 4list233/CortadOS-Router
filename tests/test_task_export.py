@@ -397,6 +397,124 @@ class TaskExportTests(ChildTaskBase):
         self.assertEqual(rec["logs"], "included")
         self.assertNotIn(TOKEN, json.dumps(rec))
 
+    # --- caller text: redacted or refused at start; a late export never redacts it with rotated credentials ---------
+    def _assert_no_token(self, raw):
+        self.assertNotIn(TOKEN, raw)
+        self.assertNotIn("000000001", raw)
+        self.assertNotIn(json.dumps(TOKEN)[1:-1], raw)
+
+    def test_caller_text_is_redacted_at_start_and_exported_late_without_the_old_token(self):
+        """#91 review round 2, P1: the title (and client, office tags, preview) is redacted with the launch credentials
+        before meta.json holds it, so a late export after a rotation (status, then prune) never sees the old token."""
+        self.cfg["client"] = f"bot {TOKEN}"
+        tid, d, res = self.run_export_task(task=f"secret {TOKEN}", title=f"Fix {TOKEN} now",
+                                           parent_task_id="t20261110000000-0123abcd")
+        for name in ("meta.json", "cmd.json"):
+            with open(os.path.join(d, name)) as f:
+                self._assert_no_token(f.read())
+        with open(os.path.join(os.environ["CORTADOS_HOME"], "child-tasks.jsonl")) as f:
+            self._assert_no_token(f.read())
+        meta = _load(os.path.join(d, "meta.json"))
+        self.assertIs(meta[ct.META_TEXT_MARK], True)
+        self.assertEqual(meta["title"], "Fix *** now")
+        for via in ("status", "prune"):
+            with self.subTest(via=via):
+                self._forget_export(d, _load(os.path.join(d, "result.json")))
+                self._rotate()
+                if via == "status":
+                    _, st = self.call("task_status", task_id=tid)
+                    self.assertTrue(st["export"]["ok"], st["export"])
+                else:
+                    self.assertEqual(ct.prune(ct._private_root(), now=time.time() + ct.PRUNE_AGE_S + 60), [tid])
+                with open(self.export_file()) as f:
+                    self._assert_no_token(f.read())
+                [rec] = self.records()
+                self.assertEqual(rec["title"], "Fix *** now")
+                self.assertEqual(rec["client"], "bot ***")
+                self.assertEqual(rec["prompt"], "secret ***")
+                self.assertEqual(rec["parent_task_id"], "t20261110000000-0123abcd")
+                self.assertNotIn("withheld_fields", rec)
+
+    def test_the_old_token_in_every_caller_field_never_reaches_a_late_export(self):
+        """Generic: a task record whose caller-supplied fields all hold the launch token and were never marked redacted
+        (an older start_task, or a hand-edited meta), exported after the credentials rotated, via status and prune.
+        Every such field is null and named in withheld_fields; the token appears nowhere in the line."""
+        tid, d, res = self.run_export_task(task="x")
+        meta = _load(os.path.join(d, "meta.json"))
+        meta.pop(ct.META_TEXT_MARK)
+        planted = f"in {TOKEN} here"
+        meta.update(title=planted, client=planted, cwd=os.path.join(self.work, TOKEN), orchestrator=planted,
+                    parent_task_id=planted, parent_note=planted, task_preview=planted, lane=ct.LOGIN_LANE,
+                    model=planted, office={"title": planted, "session": planted, "project": planted},
+                    workspace={"kind": "repo", "repo": planted, "branch": planted})
+        ct._write_json(os.path.join(d, "meta.json"), meta)
+        with open(os.path.join(d, "prompt.txt"), "w") as f:
+            f.write(planted)
+        res.update(error=planted, workspace={"kind": "repo", "state": "held", "repo": planted, "branch": planted,
+                                             "reason": planted, "path": planted})
+        want = {"title", "client", "cwd", "orchestrator", "model", "error", "parent_note", "workspace.repo",
+                "workspace.branch", "workspace.reason"}
+        for via in ("status", "prune"):
+            with self.subTest(via=via):
+                self._forget_export(d, res, prompt_redacted=True)
+                self._rotate()
+                if via == "status":
+                    _, st = self.call("task_status", task_id=tid)
+                    self.assertTrue(st["export"]["ok"], st["export"])
+                    self.assertEqual(set(st["export"]["fields_withheld"]), want)
+                else:
+                    self.assertEqual(ct.prune(ct._private_root(), now=time.time() + ct.PRUNE_AGE_S + 60), [tid])
+                with open(self.export_file()) as f:
+                    self._assert_no_token(f.read())
+                [rec] = self.records()
+                self.assertEqual(set(rec["withheld_fields"]), want)
+                for k in ("title", "client", "cwd", "orchestrator", "model", "error", "parent_task_id", "prompt"):
+                    self.assertIsNone(rec[k], k)
+                self.assertEqual(rec["withheld_reason"], ct.EXPORT_PROMPT_WITHHELD)
+                self.assertEqual(rec["workspace"], {"kind": "repo", "state": "held", "repo": None, "branch": None,
+                                                    "reason": None})
+                if via == "status":                           # the next round starts from what status left
+                    res = _load(os.path.join(d, "result.json"))
+
+    def test_caller_fields_alone_withheld_name_their_own_reason(self):
+        tid, d, res = self.run_export_task(task="x", title=f"t {TOKEN}")
+        meta = _load(os.path.join(d, "meta.json"))
+        meta.pop(ct.META_TEXT_MARK)
+        meta["title"] = f"t {TOKEN}"                              # as an older start_task stored it
+        ct._write_json(os.path.join(d, "meta.json"), meta)
+        self._forget_export(d, res)
+        self._rotate()
+        _, st = self.call("task_status", task_id=tid)
+        self.assertTrue(st["export"]["ok"], st["export"])
+        self.assertNotIn("prompt_withheld", st["export"])
+        [rec] = self.records()
+        self.assertEqual(rec["withheld_reason"], ct.EXPORT_FIELDS_WITHHELD)
+        self.assertEqual(rec["withheld_fields"], ["title", "cwd", "orchestrator"])   # all caller text, not only the one
+        self.assertEqual(rec["logs"], "included")
+        self.assertNotIn(TOKEN, json.dumps(rec))
+
+    def test_a_credential_in_what_the_task_runs_with_is_refused(self):
+        """cwd, repo, branch, orchestrator, allowed_tools: cannot be redacted without breaking the task, so a value
+        holding a provider credential is refused before anything about the task exists."""
+        tokdir = os.path.join(self.work, TOKEN)
+        os.mkdir(tokdir)
+        cases = [{"cwd": tokdir}, {"cwd": None, "repo": f"r{TOKEN}"}, {"cwd": None, "repo": "r", "branch": f"b{TOKEN}"},
+                 {"orchestrator": f"gpt-{TOKEN}"}, {"allowed_tools": [f"Bash(echo {TOKEN})"]}]
+        for kw in cases:
+            with self.subTest(kw=kw):
+                args = {"task": "x", "cwd": self.work, **kw}
+                args = {k: v for k, v in args.items() if v is not None}
+                r, _ = self.call("start_task", **args)
+                self.assertTrue(r.get("isError"), r)
+                self.assertNotIn(TOKEN, r["content"][0]["text"])
+        tasks = os.environ["CORTADOS_TASKS_DIR"]
+        self.assertEqual([x for x in os.listdir(tasks) if ct.TASK_ID_RE.fullmatch(x)] if os.path.isdir(tasks) else [], [])
+        refused = ct._start_redactor(ct.Redactor([TOKEN]))
+        with self.assertRaises(ct.TaskError) as cm:
+            ct._refuse_credentials(refused, {"branch": f"b{TOKEN}"})
+        self.assertIn("branch contains a provider credential", str(cm.exception))
+        self.assertNotIn(TOKEN, str(cm.exception))
+
     # --- export file permissions -----------------------------------------------------------------------------------
     def test_loose_export_files_and_dir_are_tightened_and_recorded(self):
         path = self.export_file()
@@ -510,6 +628,81 @@ class TaskExportTests(ChildTaskBase):
         self.assertEqual(cap.scrubbed, {})
         self.assertEqual(cap.tree({"headers": {"Authorization": "opaque0123456789", "Accept": "x"}}),
                          {"headers": {"Authorization": "[scrubbed:authorization]", "Accept": "x"}})
+
+    # Adversarial inputs per pattern: repeated prefixes and near misses, the shapes that make a backtracking pattern
+    # quadratic (#91 review round 2, P2: "sk-" * N took 7 s at 66k characters).
+    ADVERSARIAL = ["sk-", "sk-ant-", "sk-ant-a-", "eyJ-", "eyJ", "-eyJ.", "eyJaaaa.", "eyJaaaa.eyJbbbb-", "authorization ",
+                   "authorization:\n", "Authorization: ", "Proxy-Authorization=", "bearer ", "bearer\t", "ghp_", "ghp_-",
+                   "github_pat_", "xoxb-", "xoxb-a ", "AKIA", "AKIAAKIA-", "-----BEGIN ", "-----BEGIN PRIVATE KEY-----",
+                   "-----END ", "-----BEGIN AAAAAAAA", "A", "a ", " ", "\n"]
+
+    def test_every_scrub_pattern_is_linear_on_adversarial_input(self):
+        n = 1 << 20
+        for unit in self.ADVERSARIAL:
+            s = (unit * (n // len(unit) + 1))[:n]
+            for kind, rx in ct.SCRUB_PATTERNS:
+                with self.subTest(unit=unit, kind=kind):
+                    cap = ct._Cap()
+                    t0 = time.perf_counter()
+                    cap.scrub_one(kind, rx, s)
+                    self.assertLess(time.perf_counter() - t0, 0.5)
+
+    def test_text_scrubs_at_most_the_cap_plus_slack(self):
+        cap = ct._Cap(100)
+        key = "sk-ant-api03-" + "Z9" * 20
+        far = "x" * (100 + ct.SCRUB_SLACK_CHARS + 10) + " " + key   # past the slack: cut, never scrubbed
+        out = cap.text(far)
+        self.assertEqual(cap.scrubbed, {})
+        self.assertNotIn("Z9", out)
+        self.assertIn(f"of {len(far)} characters cut", out)
+        straddle = "x" * 90 + " " + key + "y" * 10_000             # straddles the cut: still caught
+        out = cap.text(straddle)
+        self.assertEqual(cap.scrubbed, {"anthropic_key": 1})
+        self.assertNotIn("Z9Z9", out)
+        self.assertEqual(cap.truncated, 2)
+
+    def test_jwt_and_openai_shapes_need_their_digit_and_dots(self):
+        cap = ct._Cap()
+        self.assertEqual(cap.scrub("x-eyJaaaa.eyJbbbb.sig.more and eyJ.eyJ and sk-learn-style-documentation"),
+                         "x-[scrubbed:jwt].more and eyJ.eyJ and sk-learn-style-documentation")
+        self.assertEqual(cap.scrub("a.eyJx.eyJabcd.eyJefgh.sig"), "a.eyJx.[scrubbed:jwt]")
+        self.assertEqual(cap.scrubbed, {"jwt": 2})
+
+    def test_prune_exports_adversarial_tool_output_within_its_budget(self):
+        root = ct._private_root()
+        big = 1 << 20
+        recs = [{"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": ("eyJ-" * big)[:big]},
+                    {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": ("sk-" * big)[:big]}}]}},
+                {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                                                          "content": ("authorization " * big)[:big]}]}},
+                {"type": "result", "subtype": "success", "is_error": False, "num_turns": 1,
+                 "result": ("ghp_-" * big)[:big]}]
+        tids = []
+        for i, marked in enumerate((True, False)):              # logs included; logs withheld (counted only)
+            t = f"t20200101000000-0000020{i}"
+            d = os.path.join(root, t)
+            os.mkdir(d, 0o700)
+            with open(os.path.join(d, "stdout.log"), "w") as f:
+                f.write("\n".join(json.dumps(r) for r in recs) + "\n")
+            with open(os.path.join(d, "prompt.txt"), "w") as f:
+                f.write(("sk-" * big)[:big])
+            ct._write_json(os.path.join(d, "meta.json"), {"task_id": t, "started_at": 1.0, "runner_pid": 0,
+                                                          ct.META_TEXT_MARK: True})
+            ct._write_json(os.path.join(d, "result.json"), {"exit_code": 0, "ended_at": 2.0, "logs_redacted": marked,
+                                                            "prompt_redacted": marked})
+            tids.append(t)
+        t0 = time.monotonic()
+        removed = ct.prune(root)
+        took = time.monotonic() - t0
+        self.assertLess(took, ct.PRUNE_EXPORT_BUDGET_S, took)
+        self.assertEqual(sorted(removed), tids)
+        a, b = sorted(self.records(), key=lambda r: r["task_id"])
+        self.assertEqual(a["logs"], "included")
+        self.assertEqual(len(a["events"]), 4)
+        self.assertGreaterEqual(a["truncated"], 5)
+        self.assertEqual(b["events"], [])
+        self.assertEqual(b["event_counts"], a["event_counts"])
 
     def _record_for(self, prompt, tokens=(TOKEN,)):
         tid, d = self._manual_task("ok")

@@ -846,6 +846,13 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
     ws_spec = _workspace_request(task_id, cwd, repo, branch, target)   # validated before anything is created
     # The Office "project" is the cwd's basename, or the repository name for a workspace the runner will create.
     office = office_tags(cwd if cwd else (ws_spec or {}).get("name"), title, session_tag)
+    # Caller text is checked against every known credential before anything about the task exists: a credential in
+    # what the task runs with is refused, one in a label (the title) is redacted (#91 review round 2, P1).
+    caller_fields = {"cwd": cwd, "repo": repo, "branch": branch, "orchestrator": orchestrator, "allowed_tools": tools,
+                     "session": session_tag}
+    start_red = _start_redactor(red)
+    _refuse_credentials(start_red, caller_fields)
+    office = {k: start_red.text(v) for k, v in office.items()}
     if cwd is not None:
         _check_cwd_here(cwd, target)
     login = None
@@ -897,18 +904,24 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
     runner = None
     try:
         meta, env, cmd = _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file,
-                                  red or Redactor(),
+                                  start_red,
                                   chrome, max_s, exe, selected, login, office,
                                   workspace=ws_spec, ws_root=target.root, host_name=target.name, launchd=launchd)
+        # Again with the child's launch env known: its credentials are the ones the export is checked against.
+        launch_red = _start_redactor(red, env)
+        _refuse_credentials(launch_red, caller_fields)
         if client:
-            meta["client"] = str(client)[:64]
-            # cmd.json's event fields were written by _prepare before the client was known; the runner logs the
-            # finished event from them, so rewrite them or that event loses its attribution (review r2 P3-8).
-            cmd_path = os.path.join(d, "cmd.json")
-            with open(cmd_path, encoding="utf-8") as f:
-                spec = json.load(f)
-            spec["event"] = _event_fields(meta)
-            _write_json(cmd_path, spec)
+            meta["client"] = launch_red.text(str(client))[:64]     # redact, THEN slice (a cut token would pass)
+        if meta.get("office"):
+            meta["office"] = {k: launch_red.text(v) for k, v in meta["office"].items()}
+        meta["task_preview"] = launch_red.text(task.strip())[:200]
+        # cmd.json's event fields were written by _prepare before the client was known; the runner logs the finished
+        # event from them, so rewrite them or that event loses its attribution (review r2 P3-8).
+        cmd_path = os.path.join(d, "cmd.json")
+        with open(cmd_path, encoding="utf-8") as f:
+            spec = json.load(f)
+        spec["event"] = _event_fields(meta)
+        _write_json(cmd_path, spec)
         if mode_note:
             meta["permission_mode_note"] = mode_note
         if launch_warning:
@@ -918,7 +931,8 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
         if parent_note:
             meta["parent_note"] = parent_note
         if office.get("title"):
-            meta["title"] = office["title"]
+            meta["title"] = launch_red.text(office["title"])
+        meta[META_TEXT_MARK] = True             # every caller text above was redacted or refused with launch_red
         _write_json(os.path.join(d, "meta.json"), meta)   # before the spawn: the runner's export reads these
         if launchd:
             # chrome: the allowlisted login env (no credential) rides in the plist; routed: nothing does (_prepare
@@ -1990,21 +2004,36 @@ EXPORT_LOGS_WITHHELD = "logs withheld: they could not be redacted with the launc
 EXPORT_PROMPT_WITHHELD = ("prompt withheld: the runner did not redact it, and the current credentials do not match the "
                           "launch ones")
 EXPORT_REDACT_FAILED = "logs withheld: the runner could not redact them"
+EXPORT_FIELDS_WITHHELD = ("caller text withheld: it was not redacted with the launch credentials when the task started, "
+                          "and the current credentials do not match the launch ones")
+META_TEXT_MARK = "caller_text_redacted"      # meta.json: every caller-supplied text in it was checked at start (#91)
+# Record fields that carry caller-supplied text (or text derived from it). A late export includes them only when the
+# task's meta is marked (start_task redacted or refused every credential in them with the launch credentials) or the
+# current credentials provably cover the launch ones; otherwise they are null and named in withheld_fields.
+EXPORT_CALLER_TEXT = ("title", "client", "cwd", "orchestrator", "model", "error", "parent_note")
+EXPORT_CALLER_WORKSPACE = ("repo", "branch", "reason")
 
 # Best-effort scrub of well-known secret shapes, applied to export text only, AFTER the known-value redaction and
 # BEFORE the cap. Not a guarantee: a secret of any other shape passes. Each match becomes [scrubbed:<type>], counted.
+# Linear time on any input (#91 review round 2, P2: a lookahead over the whole run made `"sk-" * N` quadratic). Every
+# pattern starts at a fixed prefix behind a word boundary and either fails within a bounded number of characters
+# (bounded quantifiers only, no nested or overlapping repetition) or ends with a greedy run of ONE character class
+# with nothing after it, so a match that reaches its run always succeeds and swallows the whole run: no start inside
+# that run is ever tried again. A shape that needs more than its run (an OpenAI key's digit, a JWT's dotted parts)
+# is checked by the replacement callback on the matched run, in one linear pass (_Cap._sub).
 SCRUB_PATTERNS = (
-    ("private_key", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)",
-                               re.S)),
-    ("authorization", re.compile(r"(?i)\b(?:proxy-)?authorization[\"']?\s*[:=]\s*[\"']?([^\r\n\"',;]+)")),
-    ("bearer", re.compile(r"(?i)\bbearer\s+([A-Za-z0-9._~+/-]{8,}=*)")),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*")),
+    ("private_key", re.compile(r"-----BEGIN [A-Z0-9 ]{0,64}PRIVATE KEY-----.*?"
+                               r"(?:-----END [A-Z0-9 ]{0,64}PRIVATE KEY-----|\Z)", re.S)),
+    ("authorization", re.compile(r"(?i)\b(?:proxy-)?authorization[\"']?\s{0,16}[:=]\s{0,16}[\"']?([^\r\n\"',;]+)")),
+    ("bearer", re.compile(r"(?i)\bbearer\s{1,16}([A-Za-z0-9._~+/-]{8,}=*)")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_.-]{4,}")),                  # the whole dotted run; _Cap._jwt finds the JWTs
     ("anthropic_key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{8,}")),
-    ("openai_key", re.compile(r"\bsk-(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{16,}")),
+    ("openai_key", re.compile(r"\bsk-[A-Za-z0-9_-]{16,}")),            # with a digit: checked on the match
     ("github_token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
     ("slack_token", re.compile(r"\bxox[abpr]-[A-Za-z0-9-]{10,}")),
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
 )
+SCRUB_SLACK_CHARS = 4_096                    # scrubbed past the cap, so a secret straddling the cut is still caught
 SCRUB_KEYS = ("authorization", "proxy-authorization", "x-api-key")   # a dict value under such a key is scrubbed whole
 _ALREADY_MASKED = re.compile(r"\s*(?:[A-Za-z]+\s+)?(?:\*\*\*|\[scrubbed:[a-z_]+\])\s*")
 
@@ -2037,6 +2066,27 @@ def resolve_parent(arg):
     return None, f"{PARENT_ENV} is set but is not a task id; the parent is recorded as missing"
 
 
+def _start_redactor(red, env=None) -> "Redactor":
+    """Every credential a new task can know of at start: `red`'s (the caller's env token and token file), this
+    process's (launch env, host token env and file) and, once it exists, the child's launch env (LAUNCH_TOKEN_KEYS).
+    Caller text is redacted, or refused, with this before meta.json holds it (#91 review round 2, P1)."""
+    toks = set(red.raw if red is not None else ()) | set(launch_tokens(os.environ)) | set(_host_tokens())
+    if env is not None:
+        toks |= set(launch_tokens(env))
+    return Redactor([t for t in toks if len(t) >= MIN_TOKEN_LEN])
+
+
+def _refuse_credentials(red: "Redactor", fields: dict) -> None:
+    """Caller strings the task runs with (a path, a branch, a model, tool patterns, a session tag) cannot be redacted
+    without breaking the task, and would be stored in meta.json and exported: one that holds a credential is refused.
+    The message names the field only, never its value."""
+    for name, v in fields.items():
+        for x in (v if isinstance(v, list) else [v]):
+            if isinstance(x, str) and red.text(x) != x:
+                raise TaskError(f"{name} contains a provider credential; the task is refused (it would be stored in "
+                                "the task record and its run export)")
+
+
 class _Cap:
     """For already-redacted export text: scrubs well-known secret shapes (SCRUB_PATTERNS, counted by type in
     `scrubbed`), then caps it at EXPORT_TEXT_CHARS with a marker, counting every cut. Callers pass text only after the
@@ -2051,15 +2101,46 @@ class _Cap:
         self.scrubbed[kind] = self.scrubbed.get(kind, 0) + 1
         return f"[scrubbed:{kind}]"
 
+    def _jwt(self, run: str) -> str:
+        """The JWTs (eyJ<4+>.eyJ<4+>.<sig>, the first part starting at a word boundary) in one dotted run of token
+        characters, each replaced by its marker. One pass over the run's parts: linear in its length."""
+        parts = run.split(".")
+        out, i = [], 0
+        while i < len(parts):
+            p = parts[i]
+            j = -1
+            if i + 2 < len(parts) and parts[i + 1].startswith("eyJ") and len(parts[i + 1]) >= 7:
+                k = p.find("eyJ")
+                while k != -1 and j == -1:
+                    if (k == 0 or p[k - 1] == "-") and len(p) - k >= 7:
+                        j = k
+                    else:
+                        k = p.find("eyJ", k + 1)
+            if j == -1:
+                out.append(p)
+                i += 1
+                continue
+            out.append(p[:j] + self._mark("jwt"))
+            i += 3                              # header, payload and signature are the one marker
+        return ".".join(out)
+
+    def _sub(self, kind: str, m) -> str:
+        if kind == "jwt":
+            return self._jwt(m.group(0))
+        if kind == "openai_key" and not any(c.isdigit() for c in m.group(0)[3:]):
+            return m.group(0)                   # sk-<run> with no digit: prose such as sk-learn-style, left alone
+        if m.lastindex:                         # the secret is group 1; the label before it stays readable
+            if _ALREADY_MASKED.fullmatch(m.group(1)):
+                return m.group(0)
+            return m.group(0)[:m.start(1) - m.start(0)] + self._mark(kind)
+        return self._mark(kind)
+
+    def scrub_one(self, kind: str, rx, s: str) -> str:
+        return rx.sub(lambda m: self._sub(kind, m), s)
+
     def scrub(self, s: str) -> str:
         for kind, rx in SCRUB_PATTERNS:
-            def sub(m, kind=kind):
-                if m.lastindex:                 # the secret is group 1; the label before it stays readable
-                    if _ALREADY_MASKED.fullmatch(m.group(1)):
-                        return m.group(0)
-                    return m.group(0)[:m.start(1) - m.start(0)] + self._mark(kind)
-                return self._mark(kind)
-            s = rx.sub(sub, s)
+            s = self.scrub_one(kind, rx, s)
         return s
 
     def _keyed(self, key, v: str):
@@ -2078,14 +2159,19 @@ class _Cap:
             return {self.scrub(str(k)): self.scrub_tree(x, str(k)) for k, x in v.items()}
         return v
 
-    def cut(self, s: str) -> str:
-        if len(s) <= self.limit:
+    def cut(self, s: str, total=None) -> str:
+        """s capped at the limit; `total` is the length of the text s was taken from (text() scrubs only a prefix)."""
+        total = max(len(s), total or 0)
+        if total <= self.limit:
             return s
         self.truncated += 1
-        return s[:self.limit] + f"\n[truncated by cortados: {len(s) - self.limit} of {len(s)} characters cut]"
+        return s[:self.limit] + f"\n[truncated by cortados: {total - self.limit} of {total} characters cut]"
 
     def text(self, s: str) -> str:
-        return self.cut(self.scrub(s))
+        """Scrubbed, then capped. Only the first limit + SCRUB_SLACK_CHARS characters are scrubbed: the rest is cut
+        anyway, and the slack still catches a secret that straddles the cut."""
+        n = len(s)
+        return self.cut(self.scrub(s[:self.limit + SCRUB_SLACK_CHARS]), n)
 
     def tree(self, v, key=None):
         if isinstance(v, str):
@@ -2108,11 +2194,13 @@ def _home_relative(p):
     return p
 
 
-def _export_events(path: str, red: "Redactor", cap: "_Cap"):
+def _export_events(path: str, red: "Redactor", cap):
     """(events, counts, extra_withheld, dropped) from a REDACTED stdout.log: assistant text, tool_use (name + input),
     tool_result (content as text, is_error) and the result record, in stream order. Each record is redacted again
     (redact_record, the runner's own rules) and only then capped. A line that does not parse, and the runner's
-    WITHHELD_EVENT, become a `withheld` event; a record the second pass withholds is counted in extra_withheld."""
+    WITHHELD_EVENT, become a `withheld` event; a record the second pass withholds is counted in extra_withheld.
+    cap None: counts only, for logs that are withheld. Their content is then neither redacted, scrubbed nor kept (the
+    events come back empty), so withheld material costs one JSON parse per line and nothing else."""
     events, counts = [], {}
     extra = dropped = 0
     try:
@@ -2126,13 +2214,26 @@ def _export_events(path: str, red: "Redactor", cap: "_Cap"):
         legacy = None
     lines = [None] if isinstance(legacy, dict) else whole.split("\n")
 
+    kept = 0
+
     def add(ev):
-        nonlocal dropped
-        if len(events) >= EXPORT_MAX_EVENTS:
+        nonlocal dropped, kept
+        if kept >= EXPORT_MAX_EVENTS:
             dropped += 1
             return
-        events.append(ev)
+        kept += 1
+        if cap is not None:
+            events.append(ev)
         counts[ev["type"]] = counts.get(ev["type"], 0) + 1
+
+    if cap is None:
+        def text_(_s):
+            return None
+
+        def tree(_v, key=None):
+            return None
+    else:
+        text_, tree = cap.text, cap.tree
 
     for line in lines:
         if line is None:
@@ -2150,10 +2251,13 @@ def _export_events(path: str, red: "Redactor", cap: "_Cap"):
         if isinstance(record, dict) and record.get("type") == "cortados_withheld":
             add({"type": "withheld"})            # the runner withheld it (already counted in redact_unparsed_lines)
             continue
-        try:
-            cleaned, n = redact_record(red, record)
-        except (ValueError, RecursionError):
-            cleaned, n = redact.WITHHELD, 1
+        if cap is None:
+            cleaned, n = record, 0               # counted, never shown: nothing to redact
+        else:
+            try:
+                cleaned, n = redact_record(red, record)
+            except (ValueError, RecursionError):
+                cleaned, n = redact.WITHHELD, 1
         extra += n
         if not isinstance(cleaned, dict):
             if cleaned == redact.WITHHELD:
@@ -2161,9 +2265,9 @@ def _export_events(path: str, red: "Redactor", cap: "_Cap"):
             continue
         kind = cleaned.get("type")
         if kind == "result":
-            text = cleaned.get("result")
+            t = cleaned.get("result")
             add({"type": "result", "subtype": cleaned.get("subtype"), "is_error": cleaned.get("is_error"),
-                 "num_turns": cleaned.get("num_turns"), "text": cap.text(text) if isinstance(text, str) else None})
+                 "num_turns": cleaned.get("num_turns"), "text": text_(t) if isinstance(t, str) else None})
             continue
         message = cleaned.get("message")
         content = message.get("content") if isinstance(message, dict) and kind in ("assistant", "user") else None
@@ -2171,14 +2275,14 @@ def _export_events(path: str, red: "Redactor", cap: "_Cap"):
             if not isinstance(b, dict):
                 continue
             if kind == "assistant" and b.get("type") == "text" and isinstance(b.get("text"), str):
-                add({"type": "text", "text": cap.text(b["text"])})
+                add({"type": "text", "text": text_(b["text"])})
             elif kind == "assistant" and b.get("type") == "tool_use":
-                add({"type": "tool_use", "id": cap.tree(b.get("id")), "name": cap.text(str(b.get("name") or "?")),
-                     "input": cap.tree(b.get("input"))})
+                add({"type": "tool_use", "id": tree(b.get("id")), "name": text_(str(b.get("name") or "?")),
+                     "input": tree(b.get("input"))})
             elif kind == "user" and b.get("type") == "tool_result":
                 c = b.get("content")
-                ev = {"type": "tool_result", "tool_use_id": cap.tree(b.get("tool_use_id")), "is_error": b.get("is_error") is True,
-                      "content": cap.text(_result_text(b))}
+                ev = {"type": "tool_result", "tool_use_id": tree(b.get("tool_use_id")), "is_error": b.get("is_error") is True,
+                      "content": text_(_result_text(b)) if cap is not None else None}
                 if isinstance(c, list):
                     other = sum(1 for p in c if not (isinstance(p, dict) and isinstance(p.get("text"), str)))
                     if other:
@@ -2193,6 +2297,9 @@ def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_r
     that proved the launch fingerprints), or when `red` itself provably covers the launch credentials (then it
     redacts them here); otherwise they are withheld (`withheld_reason`; event counts and the run's metadata stay).
     `red` alone is never trusted with unredacted material: after a rotation it no longer knows the old token.
+    The caller-supplied text in meta (title, client, cwd, workspace names, ...: EXPORT_CALLER_TEXT) follows the same
+    rule: included when meta.json is marked META_TEXT_MARK (start_task redacted it, or refused the task, with the
+    launch credentials) or `red` covers the launch ones, else null and named in `withheld_fields`.
     The caller encodes it; nothing here is the raw stdout.log."""
     cap = _Cap()
     tid = os.path.basename(d)
@@ -2200,6 +2307,9 @@ def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_r
     logs = (not res.get("redact_error") and not res.get("logs_unredacted")
             and (res.get("logs_redacted") is True or covered))
     prompt_ok = res.get("prompt_redacted") is True or covered
+    # Caller text (title, client, cwd, workspace names, ...): the same rule as prompt and logs. It is only ever
+    # redacted here with `red`, which after a rotation no longer knows the old token (#91 review round 2, P1).
+    text_ok = covered or meta.get(META_TEXT_MARK) is True
     started, ended = meta.get("started_at"), res.get("ended_at")
     parent = meta.get("parent_task_id")
     parent = parent if isinstance(parent, str) and TASK_ID_RE.fullmatch(parent) else None
@@ -2209,7 +2319,7 @@ def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_r
     act = res.get("activity") if isinstance(res.get("activity"), dict) else {}
     # Metadata: ids, names, flags and the provider's run record; redacted as text (a title such as "[WIP] x" is not
     # JSON to decode), never capped.
-    head = cap.scrub_tree(red.tree({
+    head = {
         "task_id": tid, "parent_task_id": parent, "parent": "known" if parent else "missing",
         **({"parent_note": meta["parent_note"]} if meta.get("parent_note") else {}),
         "title": meta.get("title"), "host": meta.get("host"), "client": meta.get("client"),
@@ -2225,12 +2335,28 @@ def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_r
         **({"lane": meta.get("lane"), "model": meta.get("model")} if meta.get("lane") else {}),
         "router_run": router_run if isinstance(router_run, dict) else None,
         "tool_uses": act.get("tool_uses") or {}, "tool_errors": act.get("tool_errors") or 0,
-    }))
-    extra = 0
+    }
     error = res.get("error") or res.get("output_error") or res.get("redact_error")
+    if isinstance(error, str):
+        head["error"] = error
+    withheld_fields = []
+    if not text_ok:                             # dropped before any processing: nothing of it reaches the record
+        for k in EXPORT_CALLER_TEXT:
+            if head.get(k) is not None:
+                head[k] = None
+                withheld_fields.append(k)
+        for k in EXPORT_CALLER_WORKSPACE:
+            if isinstance(head.get("workspace"), dict) and head["workspace"].get(k) is not None:
+                head["workspace"][k] = None
+                withheld_fields.append("workspace." + k)
+    extra = 0
+    error = head.pop("error", None)
+    head = cap.scrub_tree(red.tree(head))
     if isinstance(error, str):
         text, n = _text_result(red, error)
         head["error"], extra = cap.text(text), extra + n
+    elif "error" in withheld_fields:
+        head["error"] = None
     prompt = None
     if logs and prompt_ok:
         try:
@@ -2246,17 +2372,18 @@ def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_r
         events, counts, more, dropped = _export_events(stdout, red, cap)
         extra += more
     else:
-        # Counts only (event types): no content of it goes into the record, and a throwaway cap keeps the record's
-        # truncated/scrubbed counts about what the record actually holds.
-        _, counts, _, dropped = _export_events(stdout, red, _Cap())
+        # Counts only (event types): no content of it goes into the record, so none of it is redacted or scrubbed
+        # either (withheld material must not cost the export time, #91 review round 2, P2).
+        _, counts, _, dropped = _export_events(stdout, red, None)
         events = []
-    reason = (None if logs and prompt_ok else
+    reason = (EXPORT_FIELDS_WITHHELD if withheld_fields else None) if logs and prompt_ok else (
               EXPORT_REDACT_FAILED if res.get("redact_error") else
               EXPORT_LOGS_WITHHELD if not logs else EXPORT_PROMPT_WITHHELD)
     unparsed = res.get("redact_unparsed_lines") or 0
     return {"schema": EXPORT_SCHEMA, **head, "exported_at": round(time.time(), 3),
             "logs": "included" if logs else EXPORT_LOGS_WITHHELD,
             **({"withheld_reason": reason} if reason else {}),
+            **({"withheld_fields": withheld_fields} if withheld_fields else {}),
             "prompt": prompt, "events": events, "event_counts": counts,
             **({"events_dropped": dropped} if dropped else {}),
             "redact_unparsed_lines": unparsed, "withheld": unparsed + extra, "truncated": cap.truncated,
@@ -2399,7 +2526,9 @@ def _export_task(d: str, meta: dict, res: dict, red: "Redactor", router_run, loc
               **extra)
     return {"ok": True, "at": round(time.time(), 3), "path_kind": kind, **extra,
             **({"logs_withheld": True} if rec["logs"] != "included" else {}),
-            **({"prompt_withheld": True} if rec["prompt"] is None and rec.get("withheld_reason") else {})}
+            **({"prompt_withheld": True} if rec["prompt"] is None
+               and rec.get("withheld_reason") not in (None, EXPORT_FIELDS_WITHHELD) else {}),
+            **({"fields_withheld": rec["withheld_fields"]} if rec.get("withheld_fields") else {})}
 
 
 def _export_locked(d: str, meta: dict, red: "Redactor", router_run, res=None, lock_wait_s=None):
@@ -3039,6 +3168,13 @@ def _run(d: str, lock_fd=None) -> int:
     ws = _settle_workspace(d)
     if ws is not None:
         result["workspace"] = ws
+    # Free text of the result redacted on disk with the launch credentials too: a late export only knows the
+    # credentials of its own time (#91 review round 2, P1).
+    for k in ("error", "output_error", "activity_error"):
+        if isinstance(result.get(k), str):
+            result[k] = red.text(result[k])
+    if isinstance(result.get("workspace"), dict):
+        result["workspace"] = red.tree(result["workspace"])
     result["ended_at"] = time.time()
     final = classify(result)
     started = spec.get("started_at")

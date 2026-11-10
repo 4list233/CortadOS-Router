@@ -692,8 +692,8 @@ Each finished child task (any terminal state) is exported as one JSON line for a
   `omitted_parts` for non-text parts, `withheld`, and `result` with the final text), `event_counts`,
   `events_dropped` (past 2000 events), `redact_unparsed_lines` (what the runner's redaction withheld), `withheld`
   (that plus anything the export's own pass withheld), `truncated` (fields cut), `scrubbed` (pattern-scrub matches by
-  type, below), `logs` (`included` or why withheld), `withheld_reason` (only when prompt or events are withheld),
-  `exported_at`.
+  type, below), `logs` (`included` or why withheld), `withheld_reason` (only when prompt, events or caller fields are
+  withheld), `withheld_fields` (only when caller fields are, below), `exported_at`.
 - Finalized and redacted: the line is written only after the run's logs were redacted and `result.json` is final.
   The runner redacts `stdout.log`, `stderr.log` and `prompt.txt` in place (temp file 0600, atomic rename) with the
   exact launch credentials before it writes the final `result.json`, and records `logs_redacted` / `prompt_redacted`
@@ -701,16 +701,28 @@ Each finished child task (any terminal state) is exported as one JSON line for a
   before it is capped at 32,000 characters per field (the cut is marked `[truncated by cortados: N of M characters
   cut]` and counted). A line that still matches a credential is not written. Raw `stdout.log` content is never
   written.
+- Caller text: `start_task` checks what the caller supplies against every credential it knows, including the child's
+  launch credentials, before `meta.json` exists. A label (the title, the client name, the Office tags) is redacted
+  there; a value the task runs with (`cwd`, `repo`, `branch`, the orchestrator, `allowed_tools`, the session tag) that
+  holds a credential is refused, naming the field, never the value. `meta.json` is then marked `caller_text_redacted`,
+  and the runner redacts `result.json`'s error and workspace text with the launch credentials too.
 - A late export (a status call after the runner died, or the cleanup retry) reads prompt and logs only when they are
   marked redacted, or when the current credentials provably include the launch ones (sha256 fingerprints in
   `meta.json`); it never redacts raw material with credentials that may have rotated since. Otherwise the record goes
-  out with `prompt: null`, no events and a `withheld_reason`, keeping the metadata and `event_counts`. A runner that
+  out with `prompt: null`, no events and a `withheld_reason`, keeping the metadata and `event_counts`. The caller
+  fields (`title`, `client`, `cwd`, `orchestrator`, `model`, `error`, `parent_note`, the workspace's `repo`, `branch`
+  and `reason`) follow the same rule: without the `caller_text_redacted` mark (a task started before it existed) and
+  without matching credentials they are null and listed in `withheld_fields`. Withheld logs are only counted: they
+  are parsed for `event_counts`, never redacted, scrubbed or kept. A runner that
   died before redaction: its task is exported by the first status call that can release its logs, else just before
   cleanup with them withheld.
 - Best-effort pattern scrub, export only: after the known-value redaction, `Authorization:` / `Proxy-Authorization:`
   header values (and a value under such a key in a tool input), `Bearer <token>`, and the shapes `sk-…`, `sk-ant-…`,
   `ghp_`/`gho_`/`ghs_`/`github_pat_…`, `xox[abpr]-…`, `AKIA…`, `-----BEGIN … PRIVATE KEY-----` blocks and JWTs
-  (`eyJ….eyJ….…`) become `[scrubbed:<type>]`, counted in `scrubbed`. This is best effort, not a guarantee: the
+  (`eyJ….eyJ….…`) become `[scrubbed:<type>]`, counted in `scrubbed`. The patterns run in linear time on any input
+  (bounded quantifiers; a run of token characters is matched once, and a key's digit or a JWT's dotted parts are
+  checked on that match), and only the first 32,000 + 4,096 characters of a field are scrubbed: the rest is cut, and
+  the slack still catches a secret that straddles the cut. This is best effort, not a guarantee: the
   known-value redaction covers only the provider credentials (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`,
   `CORTADOS_PROVIDER_TOKEN`), and any other secret of another shape passes. **The export holds far more than
   `result.json`: the full prompt and every tool input and result (file contents, command output, fetched pages) up
