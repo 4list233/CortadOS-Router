@@ -842,8 +842,7 @@ def repair_registry(root: str, repo_dir=None, deadline=None, now=None) -> dict:
             rec = rec if isinstance(rec, dict) and rec.get("path") == path else None
             if _registry_names(path, admin):
                 if rec is not None and any(k in rec for k in _REPAIR_FIELDS):
-                    update_index(root, {**{k: v for k, v in rec.items() if k not in _REPAIR_FIELDS},
-                                        "repaired_at": now})
+                    _note_repair(root, name, path, {"repaired_at": now}, clear=True)
                 continue
             failures = rec.get("repair_failures", 0) if rec is not None else 0
             failures = failures if isinstance(failures, int) else 0
@@ -868,7 +867,7 @@ def repair_registry(root: str, repo_dir=None, deadline=None, now=None) -> dict:
         except RegistryConflictError as exc:
             out["errors"].append(f"{name}: {exc}")
             if rec is not None:
-                update_index(root, {**rec, "registry_conflict": str(exc)})
+                _note_repair(root, name, path, {"registry_conflict": str(exc)})
             continue
         except WorkspaceError as exc:
             failures += 1
@@ -876,13 +875,24 @@ def repair_registry(root: str, repo_dir=None, deadline=None, now=None) -> dict:
             out["errors"].append(f"{name}: the registry of {clone} does not name {path} and could not be repaired "
                                  f"({exc}); not destructive, retried in {wait:g} s or later")
             if rec is not None:
-                update_index(root, {**rec, "repair_failures": failures, "repair_next_at": now + wait,
-                                    "repair_error": f"registry repair failed ({exc}); stale, not destructive"})
+                _note_repair(root, name, path, {"repair_failures": failures, "repair_next_at": now + wait,
+                                                "repair_error": f"registry repair failed ({exc}); stale, not destructive"})
             continue
         out["repaired"].append(path)
         if rec is not None:
-            update_index(root, {**{k: v for k, v in rec.items() if k not in _REPAIR_FIELDS}, "repaired_at": now})
+            _note_repair(root, name, path, {"repaired_at": now}, clear=True)
     return out
+
+
+def _note_repair(root: str, name: str, path: str, fields: dict, clear: bool = False) -> None:
+    """Write repair bookkeeping into the task's CURRENT index record (re-read now, not the run's snapshot, so a
+    record the runner rewrote meanwhile is not overwritten); skipped when the record no longer names `path`."""
+    rec = read_index(root).get(name)
+    if not isinstance(rec, dict) or rec.get("path") != path:
+        return
+    if clear:
+        rec = {k: v for k, v in rec.items() if k not in _REPAIR_FIELDS}
+    update_index(root, {**rec, **fields})
 
 
 _REPAIR_FIELDS = ("repair_error", "repair_failures", "repair_next_at", "registry_conflict")
