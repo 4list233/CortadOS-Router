@@ -147,8 +147,13 @@ WATCH_INTERVAL_S = 30
 # clone, a long build run inside one Bash call) and far below the child's own 3 h cap (CHILD_MAX_S_DEFAULT), so a hung
 # child surfaces hours earlier. The same window applies to a task whose status was readable and then stopped being
 # (the host went away mid-run). Stalled is a REPORT, not a cancel: the task keeps running on its host; the orchestrator
-# decides (task_status, cancel_task, or arm the watch again). A `queued` chrome task is waiting, not stalled.
+# decides (task_status, cancel_task, or arm the watch again).
 WATCH_STALL_S = 30 * 60
+# A task with a `phase` (queued for the host's Chrome lock) is waiting, not working: no log is written while it waits,
+# so the ordinary window would call every queue a stall. It gets this longer one instead: the lock's holder is a chrome
+# child that CHILD_MAX_S_DEFAULT ends within 3 h, so a phase that has not changed for the cap plus the ordinary window
+# is a stuck lock or a runner that died waiting (the runner's own queue cap, CHROME_QUEUE_MAX_S, is 6 h). Same report.
+WATCH_QUEUED_STALL_S = CHILD_MAX_S_DEFAULT + WATCH_STALL_S
 # A task whose status has NEVER been read (bad host, host down from the start) is given this many consecutive attempts,
 # one interval apart, before the watch reports that it cannot watch it (exit 2): a typo or a down host should fail in
 # about a minute, not after the stall window.
@@ -1539,19 +1544,26 @@ def _watch_row(task_id: str, st: dict, watched_s: float) -> dict:
 
 
 def watch(task_ids, timeout_s=None, interval_s=WATCH_INTERVAL_S, stall_s=WATCH_STALL_S, out=None, red=None,
-          provider_url=None, token=None, sleep=time.sleep, clock=time.monotonic) -> int:
+          provider_url=None, token=None, sleep=time.sleep, clock=time.monotonic,
+          queued_stall_s=WATCH_QUEUED_STALL_S) -> int:
     """Follow the named tasks until each is terminal or stalled, writing one compact JSON line per task to `out` as it
     ends. Every task is read through status(), exactly as task_status is: a remote task is asked on its host over
-    ssh, never guessed at here. Exit status: 0 every task succeeded; 1 any failed, cancelled or stalled; 2 the watch
-    itself could not run (an unknown id, or a task whose status never became readable in WATCH_CONNECT_ATTEMPTS
-    tries); 3 timeout_s passed with tasks still pending (those are written with "watch": "timeout"). 2 outranks 3
-    outranks 1: an orchestrator reading the code can read every line too. Ids must be known before the first poll: one
-    bad id and nothing is watched. Stall rules: WATCH_STALL_S above."""
+    ssh, never guessed at here. Exit status: 0 every task ended `succeeded` (the orchestrator still reads each line's
+    `warnings` count and `workspace` state, or task_status, before trusting the result); 1 any failed, cancelled or
+    stalled; 2 the watch itself could not run (an unknown id, a task whose status never became readable in
+    WATCH_CONNECT_ATTEMPTS tries, or an unexpected error); 3 timeout_s passed with tasks still pending (those are
+    written with "watch": "timeout"). 2 outranks 3 outranks 1, whichever way the watch ends: an orchestrator reading
+    the code can read every line too. Ids must be known before the first poll: one bad id and nothing is watched.
+    Stall rules: WATCH_STALL_S and WATCH_QUEUED_STALL_S above. A status() that raises anything but a TaskError (a
+    corrupt meta.json, a task dir removed between two reads, a permission) counts as an unreadable poll for that task,
+    named by exception type only. The deadline is honoured before every poll, and a remote poll's ssh timeout shrinks
+    to the time left, so --timeout is overshot by at most one short poll, not by a full pass of ssh timeouts."""
     out = sys.stdout if out is None else out
     ids = list(dict.fromkeys(task_ids))             # duplicates watched once; order kept
     if not ids:
         raise TaskError("--watch needs at least one task_id")
-    for v, name in ((interval_s, "interval"), (stall_s, "stall")) + (((timeout_s, "timeout"),) if timeout_s is not None else ()):
+    for v, name in ((interval_s, "interval"), (stall_s, "stall"), (queued_stall_s, "queued-stall")) + \
+            (((timeout_s, "timeout"),) if timeout_s is not None else ()):
         try:
             ok = float(v) > 0 and float(v) == float(v) and float(v) != float("inf")
         except (TypeError, ValueError):
@@ -1576,6 +1588,10 @@ def watch(task_ids, timeout_s=None, interval_s=WATCH_INTERVAL_S, stall_s=WATCH_S
 
     start = clock()
     deadline = None if timeout_s is None else start + float(timeout_s)
+
+    def past_deadline(now):
+        return deadline is not None and now >= deadline
+
     # per task: read = status has been readable at least once; fails = consecutive unreadable polls; mark = the last
     # progress fingerprint; since = when it last changed (watcher's clock: the hosts' clocks are not compared)
     pending = {tid: {"read": False, "fails": 0, "mark": None, "since": start, "state": None} for tid in ids}
@@ -1584,19 +1600,26 @@ def watch(task_ids, timeout_s=None, interval_s=WATCH_INTERVAL_S, stall_s=WATCH_S
         for tid in list(pending):
             p = pending[tid]
             now = clock()
+            if past_deadline(now):
+                break                               # checked before each poll, not once per pass (P2-2, #87 review)
             try:
-                st = status(tid, red, provider_url, token)
-            except TaskError as exc:
+                # status()'s deadline is on time.monotonic(): a remote poll's ssh timeout shrinks to what is left
+                st = status(tid, red, provider_url, token,
+                            deadline=None if deadline is None else time.monotonic() + (deadline - now))
+            except Exception as exc:
+                # A TaskError carries the host's or the id's message (names, never credentials). Anything else is a
+                # reading problem on this side (corrupt JSON, a dir that vanished mid-read, a permission): type only.
+                why = str(exc) if isinstance(exc, TaskError) else type(exc).__name__
                 p["fails"] += 1
                 if not p["read"] and p["fails"] >= WATCH_CONNECT_ATTEMPTS:
                     emit({"task_id": tid, "state": "unwatchable", "watched_s": round(now - start, 1),
-                          "error": f"status could not be read in {p['fails']} attempts: {exc}"})
+                          "error": f"status could not be read in {p['fails']} attempts: {why}"})
                     pending.pop(tid)
                     cannot = True
                 elif p["read"] and now - p["since"] >= float(stall_s):
                     emit({"task_id": tid, "state": "stalled", "last_state": p["state"], "watched_s": round(now - start, 1),
                           "stalled_after_s": round(now - p["since"], 1),
-                          "error": f"status unreadable for {round(now - p['since'])} s (last: {exc}); the task may still "
+                          "error": f"status unreadable for {round(now - p['since'])} s (last: {why}); the task may still "
                                    "be running on its host"})
                     pending.pop(tid)
                     any_bad = True
@@ -1607,26 +1630,36 @@ def watch(task_ids, timeout_s=None, interval_s=WATCH_INTERVAL_S, stall_s=WATCH_S
                 pending.pop(tid)
                 any_bad = any_bad or p["state"] != "succeeded"
                 continue
-            mark = (p["state"], st.get("phase"), (st.get("workspace") or {}).get("state") if isinstance(st.get("workspace"), dict) else None,
+            phase = st.get("phase") or None
+            mark = (p["state"], phase, (st.get("workspace") or {}).get("state") if isinstance(st.get("workspace"), dict) else None,
                     st.get("last_output_at"))
             if mark != p["mark"]:
                 p["mark"], p["since"] = mark, now
-            elif not st.get("phase") and now - p["since"] >= float(stall_s):
-                emit({"task_id": tid, "state": "stalled", "last_state": p["state"], "host": st.get("host"),
-                      "watched_s": round(now - start, 1), "stalled_after_s": round(now - p["since"], 1),
-                      "elapsed_s": st.get("elapsed_s"),
-                      "error": f"no change in state, phase, workspace or child output for {round(now - p['since'])} s; "
-                               "the task is still running on its host (task_status / cancel_task to decide)"})
+                continue
+            window = float(queued_stall_s if phase else stall_s)    # a queued task waits; its window is the long one
+            if now - p["since"] >= window:
+                row = {"task_id": tid, "state": "stalled", "last_state": p["state"], "host": st.get("host"),
+                       "watched_s": round(now - start, 1), "stalled_after_s": round(now - p["since"], 1),
+                       "elapsed_s": st.get("elapsed_s")}
+                if phase:
+                    row["last_phase"] = phase
+                    row["error"] = (f"queued ({phase}) with no change for {round(now - p['since'])} s, longer than the "
+                                    "child cap plus the stall window; the host's Chrome lock may be stuck "
+                                    "(task_status / cancel_task to decide)")
+                else:
+                    row["error"] = (f"no change in state, phase, workspace or child output for {round(now - p['since'])} s; "
+                                    "the task is still running on its host (task_status / cancel_task to decide)")
+                emit(row)
                 pending.pop(tid)
                 any_bad = True
         if not pending:
             break
         now = clock()
-        if deadline is not None and now >= deadline:
+        if past_deadline(now):
             for tid, p in pending.items():
                 emit({"task_id": tid, "state": p["state"] or "unknown", "watch": "timeout", "watched_s": round(now - start, 1),
                       "error": f"--timeout {float(timeout_s):g} s passed with the task not yet ended"})
-            return 3
+            return 2 if cannot else 3               # an unwatchable task outranks the timeout, as it does any ending
         sleep(max(0.0, min(float(interval_s), deadline - now) if deadline is not None else float(interval_s)))
     return 2 if cannot else 1 if any_bad else 0
 
@@ -1665,6 +1698,11 @@ def watch_main(argv: list) -> int:
         return 2
     except KeyboardInterrupt:
         return 130
+    except Exception as exc:
+        # Anything watch() did not handle per task is "the watch could not run" (2), never a traceback that exits 1
+        # (= "a task failed"); the type names the problem, the message could carry paths or content.
+        print(f"--watch: could not run: {type(exc).__name__}", file=sys.stderr)
+        return 2
 
 
 def list_recent(n=20, ids=None) -> list:

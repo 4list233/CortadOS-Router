@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -214,6 +215,137 @@ class WatchTests(ChildTaskBase):
             rc, rows, text = self.watch(local, remote)
         self.assertEqual(rc, 2, text)
         self.assertEqual({r["task_id"]: r["state"] for r in rows}, {local: "failed", remote: "unwatchable"})
+
+    # ---- review of 5456e94 (#87): exit precedence, unexpected errors, queued tasks, the deadline
+    def test_an_unwatchable_task_outranks_the_timeout(self):
+        local = self.start_sleeping()                           # still running when the timeout passes
+        self._air()
+        _, out = self.call("start_task", task="hello")
+        remote = out["task_id"]
+        down = lambda argv, stdin, timeout: (255, b"", b"down")
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", down):
+            rc, rows, text = self.watch(local, remote, timeout_s=0.8)
+        self.assertEqual(rc, 2, text)                            # was 3: the timeout branch forgot `cannot`
+        by = {r["task_id"]: r for r in rows}
+        self.assertEqual(by[remote]["state"], "unwatchable")
+        self.assertEqual((by[local]["state"], by[local]["watch"]), ("running", "timeout"))
+
+    def test_a_corrupt_meta_json_is_an_unreadable_poll_named_by_type_only(self):
+        tid = self.start_sleeping()
+        other = self.start_sleeping(cwd=self.tmp)               # both started before anything is corrupted
+        meta = os.path.join(ct.task_path(tid), "meta.json")
+        polls = {"n": 0}
+        real_sleep = time.sleep
+
+        def corrupting_sleep(s):
+            polls["n"] += 1
+            if polls["n"] == 1:                                 # after the first (good) read
+                with open(meta, "w") as f:
+                    f.write("{ not json: /Users/someone/secret-path")
+            real_sleep(s)
+        buf = io.StringIO()
+        rc = ct.watch([tid], interval_s=0.1, stall_s=0.5, out=buf, sleep=corrupting_sleep)
+        text = buf.getvalue()
+        self.assertEqual(rc, 1, text)                            # a stall report, not a traceback and exit 1 by accident
+        row = json.loads(text)
+        self.assertEqual((row["state"], row["last_state"]), ("stalled", "running"))
+        self.assertIn("unreadable", row["error"])
+        self.assertIn("JSONDecodeError", row["error"])
+        self.assertNotIn("secret-path", text)                    # the type, never the message (it quotes the content)
+        self.assertNotIn("not json", text)
+        # never readable at all: the connect rule, exit 2
+        with open(os.path.join(ct.task_path(other), "meta.json"), "w") as f:
+            f.write("garbage")
+        rc, rows, text = self.watch(other)
+        self.assertEqual(rc, 2, text)
+        self.assertEqual(rows[0]["state"], "unwatchable")
+        self.assertIn("JSONDecodeError", rows[0]["error"])
+
+    def test_a_task_dir_that_vanishes_mid_watch_is_a_stall_not_a_crash(self):
+        tid = self.start_sleeping()
+        d = ct.task_path(tid)
+        polls = {"n": 0}
+        real_sleep = time.sleep
+
+        def removing_sleep(s):
+            polls["n"] += 1
+            if polls["n"] == 1:
+                shutil.rmtree(d)
+            real_sleep(s)
+        buf = io.StringIO()
+        rc = ct.watch([tid], interval_s=0.1, stall_s=0.5, out=buf, sleep=removing_sleep)
+        row = json.loads(buf.getvalue())
+        self.assertEqual(rc, 1, buf.getvalue())
+        self.assertEqual((row["state"], row["last_state"]), ("stalled", "running"))
+        self.assertIn("no such task", row["error"])
+        # the narrower race (the dir or a file goes between task_path and a read inside status): any non-TaskError
+        # is the same unreadable poll, reported by type only
+        tid2 = self.start_sleeping(cwd=self.tmp)
+        with mock.patch.object(ct, "_last_output_at", side_effect=PermissionError("/Users/someone/private")):
+            rc, rows, text = self.watch(tid2, stall_s=0.3)
+        self.assertEqual(rc, 2, text)                            # never readable once: the connect rule
+        self.assertIn("PermissionError", rows[0]["error"])
+        self.assertNotIn("/Users/someone", text)
+
+    def test_watch_main_turns_an_unexpected_error_into_exit_2_naming_only_the_type(self):
+        tid = self.start()
+        err = io.StringIO()
+        with mock.patch.object(ct, "watch", side_effect=RuntimeError("/Users/someone/private token-ish text")):
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(ct.watch_main([tid]), 2)
+        self.assertIn("RuntimeError", err.getvalue())
+        self.assertNotIn("private", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_a_queued_task_stalls_only_after_the_long_window(self):
+        self.assertEqual(ct.WATCH_QUEUED_STALL_S, ct.CHILD_MAX_S_DEFAULT + ct.WATCH_STALL_S)
+        tid = self.start_sleeping()
+        open(os.path.join(ct.task_path(tid), ct.QUEUED_MARKER), "w").close()   # as the runner does while it waits
+        _, st = self.call("task_status", task_id=tid)
+        self.assertIn("queued", st["phase"])
+        # the ordinary window does not apply while the task has a phase: this run ends by timeout, not stall
+        rc, rows, text = self.watch(tid, stall_s=0.2, queued_stall_s=60, timeout_s=0.7)
+        self.assertEqual(rc, 3, text)
+        self.assertEqual(rows[0]["watch"], "timeout")
+        # the long window does: a queue that never moves is reported (a report, not a cancel)
+        t0 = time.monotonic()
+        rc, rows, text = self.watch(tid, stall_s=0.2, queued_stall_s=0.6)
+        self.assertEqual(rc, 1, text)
+        row = rows[0]
+        self.assertEqual((row["state"], row["last_state"]), ("stalled", "running"))
+        self.assertIn("queued", row["last_phase"])
+        self.assertIn("queued", row["error"])
+        self.assertGreaterEqual(row["stalled_after_s"], 0.6)
+        self.assertLess(time.monotonic() - t0, 10)
+        _, st = self.call("task_status", task_id=tid)
+        self.assertEqual(st["state"], "running")
+        with self.assertRaises(ct.TaskError):
+            self.watch(tid, queued_stall_s=0)
+
+    def test_the_deadline_is_checked_before_every_poll_and_caps_the_ssh_timeout(self):
+        self._air()
+        tids = []
+        for i in range(4):
+            _, out = self.call("start_task", task=f"hello {i}")
+            tids.append(out["task_id"])
+        calls = []
+
+        def slow(argv, stdin, timeout):
+            calls.append(timeout)
+            time.sleep(0.4)                                     # a slow host: each poll costs 0.4 s
+            tid = json.loads(stdin)["args"]["task_id"]
+            return 0, json.dumps({"v": ct.exec_hosts.PROTOCOL, "ok": True,
+                                  "result": {"task_id": tid, "state": "running", "elapsed_s": 1.0}}).encode(), b""
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", slow):
+            t0 = time.monotonic()
+            rc, rows, text = self.watch(*tids, timeout_s=0.5)
+            took = time.monotonic() - t0
+        self.assertEqual(rc, 3, text)
+        self.assertEqual(sorted(r["task_id"] for r in rows), sorted(tids))    # every task gets its timeout line
+        self.assertTrue(all(r["watch"] == "timeout" for r in rows))
+        self.assertLessEqual(len(calls), 2, calls)              # not one full pass of four slow polls (1.6 s)
+        self.assertLess(took, 1.3, took)
+        self.assertLessEqual(max(calls), max(ct.RUN_FETCH_MIN_S, 0.5))   # ssh timeout shrunk from 30 s to the time left
 
     # ---- the command start_task hands back
     def test_start_task_returns_a_watch_command_for_this_machine_that_runs(self):

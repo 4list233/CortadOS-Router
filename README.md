@@ -462,15 +462,23 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   [--interval S] [--stall S]` polls each task through the same path `task_status` takes (a remote task is asked on its
   host over ssh; never a local guess), every 30 s by default, and prints one compact JSON line per task as it ends
   (`task_id`, `state`, `host`, `elapsed_s`, `exit_code`, `error`, `workspace` state/path/branch, a warnings count;
-  never the result text, the stderr tail or the prompt: `task_status` has those). Exit 0 when every task succeeded;
-  1 when any `failed`, `cancelled` or `stalled`; 2 when the watch itself could not run (an unknown id, or a task
-  whose status was never readable in 3 attempts: a down host or a typo fails in about a minute); 3 when `--timeout`
-  passed with tasks pending (those lines say `"watch": "timeout"`). `stalled` means nothing about a running task
-  changed for 30 minutes (`--stall`): state, phase, workspace state and `last_output_at`, the mtime of the child's
-  logs that `task_status` now reports while a task runs (claude streams an event per tool call and reply, so a
-  working child writes) — or that its status was readable and then was not for that long. Thirty minutes is above
-  any single tool call seen on a child and far below the child's 3 h cap, so a hung child surfaces hours earlier.
-  Stalled is a report, not a cancel: the task keeps running on its host; a `queued` chrome task is waiting, not stalled.
+  never the result text, the stderr tail or the prompt: `task_status` has those). Exit 0 when every task ended
+  `succeeded` — not yet a checked result: read each line's `warnings` count and `workspace` state (`held` means
+  unpushed work), or call `task_status`, before trusting it; 1 when any `failed`, `cancelled` or `stalled`; 2 when
+  the watch itself could not run (an unknown id, a task whose status was never readable in 3 attempts — a down host
+  or a typo fails in about a minute — or an unexpected error, named by type only on stderr); 3 when `--timeout`
+  passed with tasks pending (those lines say `"watch": "timeout"`). 2 outranks 3 outranks 1 however the watch ends.
+  `--timeout` is checked before every poll and caps a remote poll's ssh timeout, so it is overshot by one short poll
+  at most. `stalled` means nothing about a running task changed for 30 minutes (`--stall`): state, phase, workspace
+  state and `last_output_at`, the mtime of the child's logs that `task_status` now reports while a task runs (claude
+  streams an event per tool call and reply, so a working child writes) — or that its status was readable and then
+  was not for that long (a corrupt or vanished task record counts as unreadable). Thirty minutes is above any single
+  tool call seen on a child and far below the child's 3 h cap, so a hung child surfaces hours earlier. A task with a
+  `phase` (`queued` for the host's Chrome lock) writes nothing while it waits, so it gets a longer window: the 3 h
+  child cap plus the 30 min (`WATCH_QUEUED_STALL_S`), after which a lock that never changed hands is reported as
+  stalled too. Stalled is a report, not a cancel: the task keeps running on its host. Several task ids in ONE watch
+  (`--watch <id> <id> ...`, one line per task as each ends) cost less than one watch per task: each remote poll is
+  one ssh call, and one command wakes the session once per ending either way.
 
 - Execution host (owner decision 2026-11-08, #89/#86; `cortados_router/exec_hosts.py`): `~/.config/cortados/exec-hosts.json`
   (`CORTADOS_EXEC_HOSTS_FILE`; copy `tables/exec-hosts.example.json`, which holds the Air entry) names the hosts and the

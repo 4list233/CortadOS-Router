@@ -78,9 +78,12 @@ CHILD_TOOLS = [
                      "on this machine is refused). When the task ends its folder moves to archive/ (pushed, or no repo; "
                      "deleted after 3 days) or held/ (unpushed work; kept). Returns a task_id at once, plus "
                      "`watch_command`: a shell command to run IN THE BACKGROUND on this machine right after every "
-                     "start_task. It blocks until the task ends (one JSON line of metadata; exit 0 succeeded, 1 "
-                     "failed/cancelled/stalled, 2 could not watch, 3 its --timeout), so the session is woken instead "
-                     "of polling task_status / wait_task. Put everything the child needs in `task`: it does not see "
+                     "start_task. It blocks until the task ends (one JSON line of metadata; exit 0 every task ended "
+                     "`succeeded`, 1 failed/cancelled/stalled, 2 could not watch, 3 its --timeout), so the session is "
+                     "woken instead of polling task_status / wait_task. Exit 0 is not yet a checked result: read the "
+                     "line's `warnings` count and `workspace` state (`held` = unpushed work), or call task_status, "
+                     "before trusting it. Watching several ids in ONE command costs less than one watch per task "
+                     "(each remote poll is one ssh call). Put everything the child needs in `task`: it does not see "
                      "this conversation."),
      "inputSchema": {"type": "object", "properties": {
          "task": {"type": "string", "description": "The complete, self-contained task prompt."},
