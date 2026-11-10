@@ -628,7 +628,12 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   both (the full message still goes to the client in the error response).
   `task_status` shows the last one as `provider_refusal` (and a `hint` for a 413).
 - State: `~/.config/cortados/tasks/<task_id>/` (0700; logs, `result.json`). The token-bearing settings file is deleted
-  when the child exits; finished task dirs older than 14 days are pruned on the next `start_task`.
+  when the child exits; finished task dirs older than 14 days are pruned on the next `start_task`. A task record that
+  exists but cannot be read (corrupt `meta.json` / `result.json`) never blocks `start_task` or `list_tasks`: it is
+  skipped, logged to `child-tasks.jsonl` as `record_unreadable` (id, file, exception type; never content), reported
+  in `start_task`'s `prune_errors` and shown by `list_tasks` as an `unreadable` row — and it is never pruned
+  automatically, whatever its age or lock state, since without its pid a still-running child could lose the records
+  its cancellation and recovery need; remove such a dir by hand once sure no child is behind it (#94).
   If the runner itself dies, the next status call stops claude's leftover process group (SIGTERM, then SIGKILL after
   5 s, a shorter grace than the runner's 30 s because recovery runs inside status/list/wait calls; pid and start time
   are checked, so a reused pid is never signalled) and shows the unredacted logs only when the current credentials match
