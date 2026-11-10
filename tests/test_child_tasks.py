@@ -334,7 +334,10 @@ class ChildTaskBase(unittest.TestCase):
             if proc.poll() is None:
                 try:
                     os.killpg(proc.pid, 15)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
+                    # PermissionError: on macOS killpg on a group whose only member is an unreaped zombie is EPERM, as
+                    # ct._killpg knows; a fast child (FAKE_CLAUDE_MODE=fail) exits between poll() and the kill. Seen
+                    # as a one-in-several-runs error in test_unwatchable_outranks_a_failed_sibling (#87 round 2).
                     pass
                 proc.wait()
         ct._REAP.clear()

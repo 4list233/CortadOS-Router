@@ -246,13 +246,19 @@ class WatchTests(ChildTaskBase):
         buf = io.StringIO()
         rc = ct.watch([tid], interval_s=0.1, stall_s=0.5, out=buf, sleep=corrupting_sleep)
         text = buf.getvalue()
-        self.assertEqual(rc, 1, text)                            # a stall report, not a traceback and exit 1 by accident
+        # Round 2 (P2-a): every failed read since the good one raised HERE, so this is "the watcher cannot read the
+        # record" (unwatchable, exit 2), not "the task stalled on its host"; the line says so, by type only.
+        self.assertEqual(rc, 2, text)
         row = json.loads(text)
-        self.assertEqual((row["state"], row["last_state"]), ("stalled", "running"))
-        self.assertIn("unreadable", row["error"])
+        self.assertEqual((row["state"], row["last_state"]), ("unwatchable", "running"))
+        self.assertIn("local read error", row["error"])
+        self.assertIn("on this machine", row["error"])
         self.assertIn("JSONDecodeError", row["error"])
+        self.assertGreaterEqual(row["stalled_after_s"], 0.5)
         self.assertNotIn("secret-path", text)                    # the type, never the message (it quotes the content)
         self.assertNotIn("not json", text)
+        _, st = self.call("task_status", task_id=other)          # the other task is untouched by that verdict
+        self.assertEqual(st["state"], "running")
         # never readable at all: the connect rule, exit 2
         with open(os.path.join(ct.task_path(other), "meta.json"), "w") as f:
             f.write("garbage")
@@ -287,6 +293,82 @@ class WatchTests(ChildTaskBase):
         self.assertIn("PermissionError", rows[0]["error"])
         self.assertNotIn("/Users/someone", text)
 
+    def test_a_local_read_error_mixed_with_a_host_answer_is_still_a_stall(self):
+        # P2-a's exit 2 needs EVERY failed poll since the last good read to be local: once one of them is the host's
+        # or the id's answer (a TaskError: here the dir goes, "no such task"), the task may be running and it is a
+        # stall, exit 1, as before.
+        tid = self.start_sleeping()
+        d = ct.task_path(tid)
+        polls = {"n": 0}
+        real_sleep = time.sleep
+
+        def corrupt_then_remove(s):
+            polls["n"] += 1
+            if polls["n"] == 1:
+                with open(os.path.join(d, "meta.json"), "w") as f:
+                    f.write("garbage")
+            elif polls["n"] == 3:
+                shutil.rmtree(d)
+            real_sleep(s)
+        buf = io.StringIO()
+        rc = ct.watch([tid], interval_s=0.1, stall_s=0.6, out=buf, sleep=corrupt_then_remove)
+        row = json.loads(buf.getvalue())
+        self.assertEqual(rc, 1, buf.getvalue())
+        self.assertEqual((row["state"], row["last_state"]), ("stalled", "running"))
+        self.assertIn("no such task", row["error"])
+        self.assertNotIn("local read error", row["error"])
+        self.assertGreater(polls["n"], 3)
+
+    def test_a_reply_that_is_not_a_record_is_an_unreadable_poll(self):
+        # P2-c: _remote lets a list through; st.get on it must not end the whole watch with a traceback
+        self._air()
+        _, out = self.call("start_task", task="hello")
+        tid = out["task_id"]
+        self.call("wait_task", task_id=tid, timeout_s=30)
+        reads = {"n": 0}
+
+        def listy(argv, stdin, timeout):
+            reads["n"] += 1
+            result = {"task_id": tid, "state": "running", "elapsed_s": 1.0} if reads["n"] == 1 else ["not", "a", "record"]
+            return 0, json.dumps({"v": ct.exec_hosts.PROTOCOL, "ok": True, "result": result}).encode(), b""
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", listy):
+            rc, rows, text = self.watch(tid, stall_s=0.5)       # read once, then unreadable: the host's answer, a stall
+        self.assertEqual(rc, 1, text)
+        self.assertEqual((rows[0]["state"], rows[0]["last_state"]), ("stalled", "running"))
+        self.assertIn("list, not a record", rows[0]["error"])
+        self.assertNotIn("Traceback", text)
+        reads["n"] = 5                                           # never a record: the connect rule, exit 2
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", listy):
+            rc, rows, text = self.watch(tid)
+        self.assertEqual(rc, 2, text)
+        self.assertEqual(rows[0]["state"], "unwatchable")
+        self.assertIn("list, not a record", rows[0]["error"])
+
+    def test_a_far_deadline_never_lengthens_the_ssh_timeout(self):
+        # P1: with --timeout 7000 the remote poll used to get a 7000 s ssh timeout; one hung ssh would starve every
+        # other task's report. Each ssh call is capped at one RPC (exec_hosts.SSH_RPC_TIMEOUT_S).
+        self._air()
+        _, out = self.call("start_task", task="hello")
+        tid = out["task_id"]
+        timeouts = []
+        real = ct.exec_hosts.TRANSPORT
+
+        def recording(argv, stdin, timeout):
+            timeouts.append(timeout)
+            return real(argv, stdin, timeout)
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", recording):
+            rc, rows, text = self.watch(tid, timeout_s=7000)
+        self.assertEqual(rc, 0, text)
+        self.assertTrue(timeouts)
+        self.assertLessEqual(max(timeouts), ct.exec_hosts.SSH_RPC_TIMEOUT_S, timeouts)
+        self.assertGreater(min(timeouts), ct.RUN_FETCH_MIN_S)
+        # wait_task's own status() goes the same way: a deadline under one RPC shrinks the timeout to what is left
+        timeouts.clear()
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", recording):
+            ct.status(tid, deadline=time.monotonic() + 3)
+        self.assertLessEqual(max(timeouts), 3)
+        self.assertGreaterEqual(max(timeouts), ct.RUN_FETCH_MIN_S)
+
     def test_watch_main_turns_an_unexpected_error_into_exit_2_naming_only_the_type(self):
         tid = self.start()
         err = io.StringIO()
@@ -298,7 +380,10 @@ class WatchTests(ChildTaskBase):
         self.assertNotIn("Traceback", err.getvalue())
 
     def test_a_queued_task_stalls_only_after_the_long_window(self):
-        self.assertEqual(ct.WATCH_QUEUED_STALL_S, ct.CHILD_MAX_S_DEFAULT + ct.WATCH_STALL_S)
+        # the queue is not one deep: a third chrome task waits up to the runner's queue cap, so the window is that cap
+        # plus the ordinary one (round 2, P2-b), not the child cap
+        self.assertEqual(ct.WATCH_QUEUED_STALL_S, ct.CHROME_QUEUE_MAX_S + ct.WATCH_STALL_S)
+        self.assertGreater(ct.WATCH_QUEUED_STALL_S, ct.CHILD_MAX_S_DEFAULT + ct.WATCH_STALL_S)
         tid = self.start_sleeping()
         open(os.path.join(ct.task_path(tid), ct.QUEUED_MARKER), "w").close()   # as the runner does while it waits
         _, st = self.call("task_status", task_id=tid)

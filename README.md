@@ -472,11 +472,14 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   at most. `stalled` means nothing about a running task changed for 30 minutes (`--stall`): state, phase, workspace
   state and `last_output_at`, the mtime of the child's logs that `task_status` now reports while a task runs (claude
   streams an event per tool call and reply, so a working child writes) — or that its status was readable and then
-  was not for that long (a corrupt or vanished task record counts as unreadable). Thirty minutes is above any single
-  tool call seen on a child and far below the child's 3 h cap, so a hung child surfaces hours earlier. A task with a
-  `phase` (`queued` for the host's Chrome lock) writes nothing while it waits, so it gets a longer window: the 3 h
-  child cap plus the 30 min (`WATCH_QUEUED_STALL_S`), after which a lock that never changed hands is reported as
-  stalled too. Stalled is a report, not a cancel: the task keeps running on its host. Several task ids in ONE watch
+  was not for that long (a vanished task record or a host that stopped answering counts as unreadable; when every
+  failed read in that window was a local error — a corrupt record on this machine, a permission — the line says so,
+  `unwatchable`, exit 2: the watcher cannot read it, which says nothing about the task). Thirty minutes is above any
+  single tool call seen on a child and far below the child's 3 h cap, so a hung child surfaces hours earlier. A task
+  with a `phase` (`queued` for the host's Chrome lock) writes nothing while it waits, so it gets a longer window: the
+  runner's own 6 h queue cap (`CHROME_QUEUE_MAX_S`: a third chrome task legitimately waits behind two) plus the 30 min
+  (`WATCH_QUEUED_STALL_S`), after which a lock that never changed hands is reported as stalled too. Stalled is a
+  report, not a cancel: the task keeps running on its host. Several task ids in ONE watch
   (`--watch <id> <id> ...`, one line per task as each ends) cost less than one watch per task: each remote poll is
   one ssh call, and one command wakes the session once per ending either way.
 
