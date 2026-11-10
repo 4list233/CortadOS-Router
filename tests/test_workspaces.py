@@ -1,5 +1,6 @@
 """workspaces: repo clone + worktree, archive/held classification, index.jsonl, and the archive cleanup's limits —
 against a real git on a throwaway bare 'origin' in a temp dir (git is on every macOS; nothing leaves the temp dir)."""
+import fcntl
 import json
 import os
 import shutil
@@ -394,6 +395,118 @@ class BranchReleaseTests(_Base):
         self.assertIn("is not the tip of origin/feature", str(cm.exception))
         self.assertTrue(self.attached(path))
         self.assertEqual(self.head(path), ahead)
+
+    def install_hooks(self):
+        """post-checkout and reference-transaction hooks (shared by every worktree of the clone) that create a file in
+        whatever worktree they run in: unpublished data if they ever ran in an archived worktree."""
+        hooks = os.path.join(self.root, "repos", "demo", ".git", "hooks")
+        os.makedirs(hooks, exist_ok=True)
+        for name in ("post-checkout", "reference-transaction"):
+            hook = os.path.join(hooks, name)
+            with open(hook, "w") as f:
+                f.write(f"#!/bin/sh\necho ran > \"$(git rev-parse --show-toplevel)/hook-{name}.txt\"\n")
+            os.chmod(hook, 0o755)
+        return [f"hook-{name}.txt" for name in ("post-checkout", "reference-transaction")]
+
+    def test_settle_detach_runs_no_hook(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        files = self.install_hooks()
+        settled = ws.settle(rec, self.root)
+        self.assertTrue(settled.get("detached"), settled)
+        self.assertFalse(self.attached(settled["path"]))
+        for name in files:
+            self.assertFalse(os.path.exists(os.path.join(settled["path"], name)), name)
+        self.assertEqual(ws.pushed(settled["path"]), (True, "pushed"))
+
+    def test_legacy_release_runs_no_hook_and_cleanup_deletes_nothing_unpublished(self):
+        path, commit = self.legacy()
+        files = self.install_hooks()
+        rec2 = self.prepare(TID2, repo="demo", branch="feature")
+        self.assertEqual(rec2["freed_from_archive"], path)
+        self.assertFalse(self.attached(path))
+        self.assertEqual(self.head(path), commit)
+        for name in files:
+            self.assertFalse(os.path.exists(os.path.join(path, name)), name)
+        # the old archive is still provably published, so cleanup may delete it; nothing unpublished goes with it
+        self.assertEqual(ws.pushed(path), (True, "pushed"))
+        ws.update_index(self.root, {"task_id": TID, "kind": "repo", "path": path, "repo_dir": rec2["repo_dir"],
+                                    "state": "archived", "settled_at": 0})
+        report = ws.cleanup_archive(self.root, now=ws.ARCHIVE_AGE_S + 1)
+        self.assertEqual(report["deleted"], [TID])
+
+    def test_legacy_release_waits_for_the_cleanup_lock(self):
+        path, _ = self.legacy()
+        lock = os.open(os.path.join(self.root, "cleanup.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)                     # a cleanup in its reassess-through-delete section
+        out = []
+        thread = threading.Thread(target=lambda: out.append(self.prepare(TID2, repo="demo", branch="feature")))
+        try:
+            thread.start()
+            thread.join(1.5)
+            self.assertTrue(thread.is_alive(), "start released the archive while cleanup held its lock")
+            self.assertTrue(self.attached(path))
+        finally:
+            os.close(lock)
+            thread.join(30)
+        self.assertEqual(out[0]["freed_from_archive"], path)
+        self.assertFalse(self.attached(path))
+
+    def test_narrowed_refspec_and_force_moved_remote_is_refused(self):
+        path, commit = self.legacy()
+        repo_dir = os.path.join(self.root, "repos", "demo")
+        git("config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main", cwd=repo_dir)
+        main = git("rev-parse", "refs/heads/main", cwd=self.origin).strip()
+        git("update-ref", "refs/heads/feature", main, cwd=self.origin)     # force-moved: commit is now unpublished
+        self.assertEqual(git("rev-parse", "refs/remotes/origin/feature", cwd=repo_dir).strip(), commit)  # stale
+        with self.assertRaises(ws.WorkspaceError) as cm:
+            self.prepare(TID2, repo="demo", branch="feature")
+        self.assertIn("is not the tip of origin/feature", str(cm.exception))
+        self.assertTrue(self.attached(path))
+        self.assertEqual(self.head(path), commit)
+
+    def test_failed_fetch_refuses_release(self):
+        path, _ = self.legacy()
+        real_git = ws._git
+
+        def failing_fetch(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+            if args[:2] == ["fetch", "--prune"] and "+refs/heads/*:refs/remotes/origin/*" in args:
+                raise ws.WorkspaceError("simulated network failure")
+            return real_git(args, cwd=cwd, timeout=timeout)
+
+        with mock.patch.object(ws, "_git", side_effect=failing_fetch):
+            with self.assertRaises(ws.WorkspaceError) as cm:
+                self.prepare(TID2, repo="demo", branch="feature")
+        self.assertIn("not proven current", str(cm.exception))
+        self.assertTrue(self.attached(path))
+
+    def test_archive_symlinked_to_active_is_refused(self):
+        rec = self.prepare(repo=self.origin, branch="feature")       # still running in active/
+        archive = os.path.join(self.root, "archive")
+        os.rmdir(archive)
+        os.symlink(os.path.join(self.root, "active"), archive)
+        with self.assertRaises(ws.WorkspaceError) as cm:
+            self.prepare(TID2, repo="demo", branch="feature")
+        self.assertIn("symlink", str(cm.exception))
+        self.assertTrue(self.attached(rec["path"]))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "active", TID2)))
+
+    def test_archive_entry_replaced_during_assessment_is_not_detached(self):
+        path, _ = self.legacy()
+        aside = os.path.join(self.tmp, "aside")
+        real_git = ws._git
+
+        def swap_after_status(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+            out = real_git(args, cwd=cwd, timeout=timeout)
+            if args[0] == "status" and cwd == path and not os.path.exists(aside):
+                os.rename(path, aside)
+                shutil.copytree(aside, path, symlinks=True)        # same name, same content, another directory
+            return out
+
+        with mock.patch.object(ws, "_git", side_effect=swap_after_status):
+            with self.assertRaises(ws.WorkspaceError) as cm:
+                self.prepare(TID2, repo="demo", branch="feature")
+        self.assertIn("changed while it was being assessed", str(cm.exception))
+        self.assertTrue(self.attached(path))
 
     def test_active_worktree_keeps_original_refusal(self):
         rec = self.prepare(repo=self.origin, branch="feature")

@@ -479,9 +479,12 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   else, or a worktree git cannot assess) with `git worktree move`, and records it in `<root>/index.jsonl` (one line per
   task, rewritten under `index.lock`). A plain folder containing a `.git` entry at any depth is conservatively moved
   to `held/` too (symlinks are never followed). An archived worktree has its HEAD detached at the same commit so its
-  branch is free for the next task (a failed detach is recorded as `detach_error` and loses nothing); a held one keeps
-  its branch. An archive entry from before this that still holds the branch is detached when a new task asks for it,
-  only if its tree is clean and its HEAD is the fetched `origin/<branch>` tip; otherwise the start is refused.
+  branch is free for the next task (`git update-ref --no-deref HEAD` with hooks disabled: no checkout, no file
+  written; a failed detach is recorded as `detach_error` and loses nothing); a held one keeps its branch. An archive
+  entry from before this that still holds the branch is detached when a new task asks for it, under the archive
+  cleanup's lock, only if its tree is clean and its HEAD is the `origin/<branch>` tip fetched just then with an
+  explicit all-heads refspec (a failed fetch refuses), and only if `active/`, `archive/` and `held/` are real
+  directories and the entry is unchanged between assessment and detach; otherwise the start is refused.
   `task_status` shows `workspace` (kind, state, path, reason).
 - Archive cleanup: `python3 cortados_router/child_tasks.py --cleanup-archive [--root <dir>]` deletes `archive/<task_id>`
   entries whose index record says archived more than 3 days ago, and nothing else: not a name that is not a task id,
