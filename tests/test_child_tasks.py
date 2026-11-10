@@ -175,6 +175,48 @@ FAKE = textwrap.dedent('''\
         ev({{"type": "result", "subtype": "success", "is_error": False, "num_turns": 3,
             "result": "Done: I opened the page and read its title."}})
         sys.exit(0)
+    if mode == "api-error":
+        # #97, as seen live 2026-11-10: the child's last request failed at the API, and Claude Code printed the error
+        # as the RESULT TEXT (twice), subtype "success", is_error false (FAKE_IS_ERROR=1: true, as other versions do),
+        # exit 0. FAKE_RESULT replaces the text. The stream ends with the tool results that request was to answer.
+        text = os.environ.get("FAKE_RESULT") or (
+            "API Error: 400 cortados: conversation 44d0c934 failed at 06:35:49 (codex_turn_failed: the Codex turn "
+            "failed (ContentFlag); details are in the provider log) and was closed: start a new conversation")
+        if not os.environ.get("FAKE_RESULT"):
+            text = text + "\\n" + text
+        def ev(e):
+            print(json.dumps(e)); sys.stdout.flush()
+        ev({{"type": "system", "subtype": "init", "permissionMode": "auto"}})
+        ev({{"type": "assistant", "message": {{"content": [{{"type": "tool_use", "id": "toolu_1", "name": "Bash",
+            "input": {{"command": "ls"}}}}]}}}})
+        ev({{"type": "user", "message": {{"content": [{{"type": "tool_result", "tool_use_id": "toolu_1",
+            "content": "a.txt"}}]}}}})
+        if os.environ.get("FAKE_ANSWERED"):
+            ev({{"type": "assistant", "message": {{"content": [{{"type": "text", "text": text}}]}}}})
+        ev({{"type": "result", "subtype": "success", "is_error": bool(os.environ.get("FAKE_IS_ERROR")),
+            "result": text, "num_turns": 3}})
+        sys.exit(0)
+    if mode == "stream-unanswered":
+        # #97 rule (c): a result record that says nothing (empty text, is_error false) after a stream that ends with
+        # tool results nobody answered; FAKE_ANSWERED=1: the child's own conversation answered after a subagent's
+        # (parent_tool_use_id) tool results, and the result is that answer.
+        def ev(e):
+            print(json.dumps(e)); sys.stdout.flush()
+        ev({{"type": "system", "subtype": "init", "permissionMode": "auto"}})
+        ev({{"type": "assistant", "message": {{"content": [{{"type": "tool_use", "id": "toolu_1", "name": "Bash",
+            "input": {{"command": "ls"}}}}]}}}})
+        ev({{"type": "user", "message": {{"content": [{{"type": "tool_result", "tool_use_id": "toolu_1",
+            "content": "a.txt"}}]}}}})
+        if os.environ.get("FAKE_ANSWERED"):
+            ev({{"type": "assistant", "message": {{"content": [{{"type": "text", "text": "the subagent failed; I did "
+                "the rest myself"}}]}}}})
+            ev({{"type": "user", "parent_tool_use_id": "toolu_1", "message": {{"content": [{{"type": "tool_result",
+                "tool_use_id": "toolu_9", "content": "late subagent output"}}]}}}})
+            ev({{"type": "result", "subtype": "success", "is_error": False, "result": "the subagent failed; I did "
+                "the rest myself", "num_turns": 4}})
+        else:
+            ev({{"type": "result", "subtype": "error_during_execution", "is_error": False, "result": "", "num_turns": 2}})
+        sys.exit(0)
     if mode == "stream-export":
         # for the run export (#91): text, a tool call and its result each holding the launch token, an unparseable
         # line holding it too, a text longer than the export's field cap, and a result holding it
@@ -2784,6 +2826,215 @@ class ChildTaskTests(ChildTaskBase):
         self.call("wait_task", task_id=tid, timeout_s=30)
         seen = _load(os.path.join(self.work, "fake-argv.json"))
         self.assertEqual(seen["env"]["ANTHROPIC_BASE_URL"], "https://file-provider.example:8443")
+
+
+API_ERROR_TEXT = ("API Error: 400 cortados: conversation 44d0c934 failed at 06:35:49 (codex_turn_failed: the Codex turn "
+                  "failed (ContentFlag); details are in the provider log) and was closed: start a new conversation")
+TERMINAL_REFUSAL = {"status": 400, "type": "invalid_request_error", "at": 1.0,
+                    "reason": "the conversation already failed (terminal): codex_turn_failed: the Codex turn failed "
+                              "(ContentFlag)"}
+
+
+class ApiErrorResultTests(ChildTaskBase):
+    """Issue #97: a child whose final result is a provider/API error is `failed`, never `succeeded`. Fake claude only."""
+
+    def wait(self, tid):
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        return w
+
+    # ---- classify() on records (pure)
+    def test_classify_fails_an_error_record_and_an_error_text_and_keeps_a_quoting_answer(self):
+        ok = {"exit_code": 0}
+        rec = lambda **k: {"type": "result", "subtype": "success", "is_error": False, "result": "fine", **k}  # noqa: E731
+        self.assertEqual(ct.classify({**ok, "output": rec()}), "succeeded")
+        # (a) is_error true, whatever the subtype and the exit status say
+        self.assertEqual(ct.classify({**ok, "output": rec(is_error=True)}), "failed")
+        self.assertEqual(ct.result_error(rec(is_error=True, result="")),
+                         "the child's result record is an error (subtype 'success') with no text")
+        # (b) the text IS the error: Claude Code's prefix (printed twice, as seen live), with is_error false
+        twice = API_ERROR_TEXT + "\n" + API_ERROR_TEXT
+        self.assertEqual(ct.classify({**ok, "output": rec(result=twice)}), "failed")
+        self.assertEqual(ct.result_error(rec(result=twice)), API_ERROR_TEXT)      # the first line only
+        # (b) the provider's terminal refusals without the prefix (another client, another version)
+        for text in (API_ERROR_TEXT[len("API Error: 400 "):],
+                     "cortados: the conversation was closed while this request waited for it; start a new conversation"):
+            self.assertEqual(ct.classify({**ok, "output": rec(result=text)}), "failed", text)
+            self.assertEqual(ct.result_error(rec(result=text)), text)
+        # leading blank lines do not hide the error; a long line is capped with the full text left in `result`
+        self.assertEqual(ct.result_error(rec(result="\n\n  " + API_ERROR_TEXT)), API_ERROR_TEXT)
+        long = "API Error: 500 " + "x" * 2000
+        err = ct.result_error(rec(result=long))
+        self.assertEqual((len(err), err[-1], err[:15]), (ct.ERROR_LINE_CHARS, "…", "API Error: 500 "))
+        # an answer that merely QUOTES an API error after its first line is a normal answer
+        quoting = ("Summary of the run:\n- the first attempt ended with `" + API_ERROR_TEXT + "`\n"
+                   "- the retry went through and the files are in place.\nDone.")
+        self.assertEqual(ct.classify({**ok, "output": rec(result=quoting)}), "succeeded")
+        self.assertIsNone(ct.result_error(rec(result=quoting)))
+        self.assertIsNone(ct.result_error(rec(result="conversation starters: start a new conversation with a joke")))
+        # not a record at all: nothing to say (parse_output's rules already fail it)
+        self.assertIsNone(ct.result_error(None))
+        self.assertIsNone(ct.result_error({"type": "system"}))
+
+    def test_terminal_refusal_rule_needs_an_unanswered_conversation(self):
+        unanswered = {"last_message": "user"}
+        answered = {"last_message": "assistant"}
+        run = {"model": "gpt-6.1-sol", "refusals": [TERMINAL_REFUSAL]}
+        self.assertEqual(ct.terminal_refusal(run), "HTTP 400 invalid_request_error: " + TERMINAL_REFUSAL["reason"])
+        err = ct.unanswered_terminal_refusal(run, unanswered)
+        self.assertIn("terminal error and the child's last request was never answered", err)
+        self.assertIn("codex_turn_failed", err)
+        self.assertIn(err, [ct.unanswered_terminal_refusal(run, {"last_message": None})])   # never answered at all
+        self.assertIsNone(ct.unanswered_terminal_refusal(run, answered))     # a subagent's failure; the child answered
+        self.assertIsNone(ct.unanswered_terminal_refusal(run, None))         # no stream summary: no claim
+        # only a TERMINAL refusal, and only as the run's LAST one
+        busy = {"status": 529, "type": "overloaded_error", "reason": "the conversation is busy with another request"}
+        for r in ({"refusals": [TERMINAL_REFUSAL, busy]}, {"refusals": [busy]}, {"refusals": []}, {},
+                  {"error": "provider returned HTTP 404"}, {"note": "login mode"}, None,
+                  {"refusals": [{**TERMINAL_REFUSAL, "status": 409}]},
+                  {"refusals": [{**TERMINAL_REFUSAL, "reason": "the request was refused as invalid"}]}):
+            self.assertIsNone(ct.terminal_refusal(r), r)
+            self.assertIsNone(ct.unanswered_terminal_refusal(r, unanswered), r)
+        self.assertEqual(ct.classify({"exit_code": 0, "error": err,
+                                      "output": {"type": "result", "is_error": False, "result": ""}}), "failed")
+
+    def test_summarize_stream_records_the_childs_own_last_message(self):
+        path = os.path.join(self.tmp, "stdout.log")
+
+        def write(events):
+            with open(path, "w") as f:
+                f.write("".join(json.dumps(e) + "\n" for e in events))
+        asst = {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}}
+        tool = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "x"}]}}
+        sub = {"type": "user", "parent_tool_use_id": "t1", "message": {"content": [{"type": "tool_result",
+                                                                                     "tool_use_id": "t9", "content": "y"}]}}
+        result = {"type": "result", "subtype": "success", "is_error": False, "result": "done"}
+        write([{"type": "system", "subtype": "init"}, result])
+        self.assertIsNone(ct.summarize_stream(path, self.work)["last_message"])
+        write([asst, tool, result])
+        self.assertEqual(ct.summarize_stream(path, self.work)["last_message"], "user")
+        write([asst, tool, asst, sub, result])             # a subagent's late event is not the child's own
+        self.assertEqual(ct.summarize_stream(path, self.work)["last_message"], "assistant")
+
+    # ---- through start_task / wait_task (the runner, the fake claude)
+    def test_api_error_text_with_subtype_success_and_exit_0_is_failed(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "api-error"
+        w = self.wait(self.start())
+        self.assertEqual((w["state"], w["exit_code"], w["subtype"]), ("failed", 0, "success"))
+        self.assertEqual(w["error"], API_ERROR_TEXT)                        # one line, redacted
+        self.assertEqual(w["result"], API_ERROR_TEXT + "\n" + API_ERROR_TEXT)   # the text is kept as it was
+        self.assertEqual(w["num_turns"], 3)
+        self.assertIn("stderr_tail", w)
+        self.assertEqual(_events()[-1]["status"], "failed")
+        res = _load(os.path.join(ct.task_path(w["task_id"]), "result.json"))
+        self.assertEqual(res["error"], API_ERROR_TEXT)                      # recorded by the runner, not computed late
+
+    def test_is_error_true_with_subtype_success_is_failed_with_the_error_line(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "api-error"
+        os.environ["FAKE_IS_ERROR"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_IS_ERROR", None)
+        w = self.wait(self.start())
+        self.assertEqual((w["state"], w["exit_code"]), ("failed", 0))
+        self.assertEqual(w["error"], API_ERROR_TEXT)
+        self.assertTrue(w["result"].startswith(API_ERROR_TEXT))
+
+    def test_terminal_conversation_text_without_the_prefix_is_failed(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "api-error"
+        os.environ["FAKE_RESULT"] = API_ERROR_TEXT[len("API Error: 400 "):]
+        self.addCleanup(os.environ.pop, "FAKE_RESULT", None)
+        w = self.wait(self.start())
+        self.assertEqual((w["state"], w["exit_code"]), ("failed", 0))
+        self.assertEqual(w["error"], os.environ["FAKE_RESULT"])
+        self.assertEqual(w["result"], os.environ["FAKE_RESULT"])
+
+    def test_an_answer_quoting_an_api_error_mid_text_stays_succeeded(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "api-error"
+        os.environ["FAKE_RESULT"] = ("Summary of the run:\n- the first attempt ended with `" + API_ERROR_TEXT +
+                                     "`\n- the retry went through.\nDone.")
+        os.environ["FAKE_ANSWERED"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_RESULT", None)
+        self.addCleanup(os.environ.pop, "FAKE_ANSWERED", None)
+        w = self.wait(self.start())
+        self.assertEqual((w["state"], w["exit_code"]), ("succeeded", 0))
+        self.assertNotIn("error", w)
+        self.assertEqual(w["result"], os.environ["FAKE_RESULT"])
+        self.assertEqual(_events()[-1]["status"], "succeeded")
+
+    def test_a_record_from_an_older_runner_is_reclassified_and_its_error_surfaced(self):
+        """A result.json written before #97 (no `error`, an is_error-false API Error text): status() fails it and
+        names the error itself."""
+        os.environ["FAKE_CLAUDE_MODE"] = "api-error"
+        tid = self.start()
+        self.wait(tid)
+        p = os.path.join(ct.task_path(tid), "result.json")
+        res = _load(p)
+        del res["error"]
+        ct._write_json(p, res)
+        _, w = self.call("task_status", task_id=tid)
+        self.assertEqual((w["state"], w["error"]), ("failed", API_ERROR_TEXT))
+
+    def _serve_run(self, record):
+        """A local provider stand-in for the RUNNER's own run-record fetch (a detached process, out of reach of the
+        test's urlopen patch): GET /v1/cortados/runs/<id> answers `record` for any id."""
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self_):
+                body = json.dumps({**record, "run_id": self_.path.rsplit("/", 1)[1]}).encode()
+                self_.send_response(200)
+                self_.send_header("content-type", "application/json")
+                self_.send_header("content-length", str(len(body)))
+                self_.end_headers()
+                self_.wfile.write(body)
+
+            def log_message(self_, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        self.cfg["url"] = f"http://127.0.0.1:{srv.server_address[1]}"
+        self.runs = _AnyRun(record)                         # the test process's own fetch (status) answers the same
+
+    def test_terminal_refusal_with_no_later_answer_is_failed(self):
+        """Rule (c): the result record says nothing (empty text, is_error false, exit 0), the stream ends with tool
+        results nobody answered, and the provider's run record shows the run's last request refused as terminal."""
+        os.environ["FAKE_CLAUDE_MODE"] = "stream-unanswered"
+        self._serve_run({"model": "gpt-6.1-sol", "label": "gpt-6.1-sol", "provider": "codex", "models": ["gpt-6.1-sol"],
+                         "builder_models": ["gpt-6.1-sol"], "refusals": [TERMINAL_REFUSAL]})
+        w = self.wait(self.start())
+        self.assertEqual((w["state"], w["exit_code"], w["result"]), ("failed", 0, ""))
+        self.assertIn("terminal error and the child's last request was never answered", w["error"])
+        self.assertIn("codex_turn_failed", w["error"])
+        self.assertIn("HTTP 400 invalid_request_error", w["provider_refusal"])
+        self.assertEqual(w["router_run"]["model"], "gpt-6.1-sol")
+
+    def test_terminal_refusal_of_a_subagent_after_which_the_child_answered_stays_succeeded(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "stream-unanswered"
+        os.environ["FAKE_ANSWERED"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_ANSWERED", None)
+        self._serve_run({"model": "gpt-6.1-sol", "label": "gpt-6.1-sol", "provider": "codex", "models": ["gpt-6.1-sol"],
+                         "builder_models": ["gpt-6.1-sol"], "refusals": [TERMINAL_REFUSAL]})
+        w = self.wait(self.start())
+        self.assertEqual((w["state"], w["exit_code"]), ("succeeded", 0))
+        self.assertNotIn("error", w)
+        self.assertIn("HTTP 400 invalid_request_error", w["provider_refusal"])   # still reported, as before
+
+
+class _AnyRun(dict):
+    """A `runs` map that answers every id with one record (ChildTaskBase.fake_urlopen)."""
+
+    def __init__(self, record):
+        super().__init__()
+        self.record = record
+
+    def __contains__(self, k):
+        return True
+
+    def __getitem__(self, k):
+        return {**self.record, "run_id": k}
 
 
 if __name__ == "__main__":

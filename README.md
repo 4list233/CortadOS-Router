@@ -643,6 +643,14 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   allowlisted category) are kept, and the log line names an endpoint id, never the path; backend text stays out of
   both (the full message still goes to the client in the error response).
   `task_status` shows the last one as `provider_refusal` (and a `hint` for a 413).
+- A child whose last request failed at the API is `failed`, not `succeeded`, whatever its exit status (#97; seen
+  2026-11-10: a Codex turn failed, the provider closed the conversation, and Claude Code printed the error as the
+  result text with `is_error: false` and exit 0). The task fails when the result record says `is_error: true`, when
+  the first line of its result text is an `API Error: …` or the provider's terminal-conversation refusal
+  (`conversation <id> failed at … start a new conversation`), or when the provider's run record shows the run's last
+  request refused as terminal and the child's own conversation never answered after it. `error` carries the first
+  line of the error (capped); `result` keeps the text; `--watch` exits 1. An answer that merely quotes an API error
+  below its first line is a normal answer.
 - State: `~/.config/cortados/tasks/<task_id>/` (0700; logs, `result.json`). The token-bearing settings file is deleted
   when the child exits; finished task dirs older than 14 days are pruned on the next `start_task`, once their run
 export succeeded (see "Task run export" below). A task record that
