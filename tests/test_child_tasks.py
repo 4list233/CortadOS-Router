@@ -756,6 +756,35 @@ class ChildTaskTests(ChildTaskBase):
         _, rows = self.call("list_tasks")
         self.assertEqual(rows["tasks"][0]["workspace"]["kind"], "folder")
 
+    def test_status_reports_a_deferred_settle_the_cleanup_completed(self):
+        """#93 round 3: the runner's settle was deferred (cleanup.lock busy), so workspace.json says active with the
+        lock-timeout error; the next cleanup settles it and records that in index.jsonl only. task_status must report
+        the settled record, not active, the stale error and a path that no longer exists."""
+        r, out = self.call("start_task", task="hello")
+        self.assertFalse(r.get("isError"), r)
+        tid = out["task_id"]
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["workspace"]["state"], "archived", w)
+        active = os.path.join(self.ws_root, "active", tid)
+        archived = os.path.join(self.ws_root, "archive", tid)
+        # rewind to what a deferred settle leaves: the folder in active/, workspace.json and the index say so
+        os.rename(archived, active)
+        rec = {**ct.workspaces.read_index(self.ws_root)[tid], "state": "active", "path": active,
+               "settle_deferred": True, "error": "not settled yet, left in active/ for the next cleanup to settle"}
+        for k in ("settled_at", "reason", "settled_from"):
+            rec.pop(k, None)
+        ct._write_json(os.path.join(ct.task_path(tid), ct.WORKSPACE_FILE), rec)
+        ct.workspaces.update_index(self.ws_root, rec)
+        before = ct.status(tid)["workspace"]
+        self.assertEqual((before["state"], before["path"]), ("active", active))
+        self.assertIn("next cleanup", before["error"])
+        report = ct.workspaces.cleanup_archive(self.ws_root)
+        self.assertEqual(report["settled"], [tid])
+        after = ct.status(tid)["workspace"]
+        self.assertEqual((after["state"], after["path"]), ("archived", archived))
+        self.assertNotIn("error", after)
+        self.assertTrue(os.path.isdir(after["path"]))
+
     def _origin(self):
         origin = os.path.join(self.tmp, "origin", "demo.git")
         os.makedirs(os.path.dirname(origin))

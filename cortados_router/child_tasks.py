@@ -1369,7 +1369,7 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
            "host": meta.get("host"), "launch": meta.get("launch")}
     if meta.get("lane"):
         out.update(lane=meta["lane"], model=meta.get("model"))
-    ws = _read_json(os.path.join(d, WORKSPACE_FILE))
+    ws = _workspace_record(d, task_id)
     if isinstance(ws, dict):
         out["workspace"] = {k: ws.get(k) for k in ("kind", "state", "path", "repo", "branch", "reason", "error") if ws.get(k) is not None}
     elif meta.get("workspace"):
@@ -1848,6 +1848,25 @@ def cancel(task_id) -> dict:
     if err:
         out["event_log_error"] = err
     return out
+
+
+def _workspace_record(d: str, task_id: str):
+    """The task's workspace record: workspace.json, except when it says the settle was deferred (`settle_deferred`,
+    still active) and the host's index.jsonl says the cleanup has settled it since (#93 round 3): then the index
+    record, which names the real state and path. Read-only; the runner's own retry rewrites workspace.json."""
+    ws = _read_json(os.path.join(d, WORKSPACE_FILE))
+    if not (isinstance(ws, dict) and ws.get("state") == "active" and ws.get("settle_deferred")):
+        return ws
+    root = (_read_json(os.path.join(d, "cmd.json")) or {}).get("workspace_root")
+    if not isinstance(root, str):
+        return ws
+    try:
+        done = workspaces.read_index(root).get(task_id)
+    except (OSError, ValueError):
+        return ws
+    if isinstance(done, dict) and done.get("state") not in (None, "active"):
+        return done
+    return ws
 
 
 def _settle_workspace(d: str):
