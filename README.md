@@ -644,7 +644,8 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   both (the full message still goes to the client in the error response).
   `task_status` shows the last one as `provider_refusal` (and a `hint` for a 413).
 - State: `~/.config/cortados/tasks/<task_id>/` (0700; logs, `result.json`). The token-bearing settings file is deleted
-  when the child exits; finished task dirs older than 14 days are pruned on the next `start_task`. A task record that
+  when the child exits; finished task dirs older than 14 days are pruned on the next `start_task`, once their run
+export succeeded (see "Task run export" below). A task record that
   exists but cannot be read (corrupt `meta.json` / `result.json`) never blocks `start_task` or `list_tasks`: it is
   skipped, logged to `child-tasks.jsonl` as `record_unreadable` (id, file, exception type; never content), reported
   in `start_task`'s `prune_errors` and shown by `list_tasks` as an `unreadable` row — and it is never pruned
@@ -670,6 +671,41 @@ run, 512 runs) and forgotten on a provider restart. Each lifecycle event (`start
 and duration, `cancelled`) is also appended as one JSON line to `$CORTADOS_HOME/child-tasks.jsonl` (default
 `~/.cortados`): task id, cwd, orchestrator, permission mode, chrome flag, status and timings; never the prompt or a
 secret.
+
+### Task run export (Grounds capture)
+
+Each finished child task (any terminal state) is exported as one JSON line for another system (Grounds) to capture
+(#91). The export is written by the task runner, outside the child; the child's isolation is unchanged.
+
+- Path: `$CORTADOS_HOME/exports/task-runs.jsonl` on the execution host the task ran on (dir 0700, file 0600), or the
+  file named by `CORTADOS_TASK_EXPORT`. A remote task is exported on its host; `task_status` shows its `export`
+  field. There is no network handoff: Grounds reads the file.
+- Schema `cortados.task-run/1`, one object per line: `task_id`, `parent_task_id` plus `parent` (`known`, or the
+  explicit marker `missing` when no parent is known; the parent comes from `start_task`'s optional `parent_task_id`, else
+  `CORTADOS_PARENT_TASK_ID` in the launching session, validated as a task id), `title`, `host`, `client`, `state`,
+  `exit_code`, `cancelled`, `timed_out`, `started_at` / `ended_at` / `elapsed_s`, `cwd` (home shown as `~`),
+  `workspace` (kind, state, repo, branch, reason; no path), `orchestrator`, `permission_mode`,
+  `effective_permission_mode`, `chrome`, `launch`, `lane` / `model` (login mode), `router_run` (model, label, provider
+  with account alias such as `claude-cli#b`, models, builder_models, refusals; fetched by the runner while the
+  provider still holds it, else a note or an error field), `tool_uses`, `tool_errors`, `error`, `prompt`, `events` in
+  stream order (`text`, `tool_use` with name and input, `tool_result` with content as text, `is_error` and
+  `omitted_parts` for non-text parts, `withheld`, and `result` with the final text), `event_counts`,
+  `events_dropped` (past 2000 events), `redact_unparsed_lines` (what the runner's redaction withheld), `withheld`
+  (that plus anything the export's own pass withheld), `truncated` (fields cut), `logs` (`included` or why withheld),
+  `exported_at`.
+- Finalized and redacted: the line is written only after the run's logs were redacted and `result.json` is final.
+  Every text goes through the Redactor that produced `result.json`, redacted before it is capped at 32,000 characters
+  per field (the cut is marked `[truncated by cortados: N of M characters cut]` and counted). A line that still
+  matches a credential is not written. Raw `stdout.log` content is never written. A runner that died leaves
+  unredacted logs: its task is exported by the first status call that can release them (the launch credentials'
+  fingerprints match), else just before cleanup with `logs` withheld (no prompt, no events).
+- Append-only, written once: one `os.write` of the whole line under an `flock` on `<file>.lock`, so concurrent
+  runners never interleave. The file is never rewritten or truncated by the router. A sidecar `<file>.ids` (same
+  lock) holds the exported task ids, so a retry never appends a task twice.
+- Outcome: `result.json` gets `export: {"ok": true, "at", "path_kind": "default"|"env"}` or
+  `{"ok": false, "error": "<exception type>"}`; `child-tasks.jsonl` gets `task_exported` / `task_export_failed`.
+- Never pruned unexported: the 14-day cleanup first retries a failed export (up to 10 per `start_task`). A task whose
+  export still fails is kept, reported in `start_task`'s `prune_errors` and logged as `task_kept_unexported`.
 
 Claude desktop app (`claude_desktop_config.json`, under `mcpServers`):
 

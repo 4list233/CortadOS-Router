@@ -16,7 +16,9 @@ is the long form.
   `transport.py`, `local_resources.py`, `local_gate.py` (token-checked reverse proxy run on a local Ollama node: the
   provider's local lane reaches Ollama only through it), `subagent_mcp.py` (stdio MCP server: a `route_task` tool that delegates a
   self-contained subtask to the `cortados` provider endpoint and returns the routed model's text; stdlib, runs standalone),
-  `child_tasks.py` (whole tasks as headless Claude Code children; `--run` runner, `--remote` host side, `--cleanup-archive`),
+  `child_tasks.py` (whole tasks as headless Claude Code children; `--run` runner, `--remote` host side, `--cleanup-archive`;
+  the runner appends each finished run, redacted, to the append-only `$CORTADOS_HOME/exports/task-runs.jsonl` for
+  Grounds (#91, README "Task run export"); a task dir whose export failed is never pruned),
   `exec_hosts.py` (which machine a child runs on: `~/.config/cortados/exec-hosts.json`, ssh transport), `workspaces.py`
   (per-task repo worktrees / folders under `<root>/active`, archive-or-held settling, index.jsonl, archive-only cleanup).
 - `cortados_router/provider/` — the `cortados` model endpoint (design and status: `docs/PROVIDER-PLAN.md`).

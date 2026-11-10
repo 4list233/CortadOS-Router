@@ -175,6 +175,21 @@ FAKE = textwrap.dedent('''\
         ev({{"type": "result", "subtype": "success", "is_error": False, "num_turns": 3,
             "result": "Done: I opened the page and read its title."}})
         sys.exit(0)
+    if mode == "stream-export":
+        # for the run export (#91): text, a tool call and its result each holding the launch token, an unparseable
+        # line holding it too, a text longer than the export's field cap, and a result holding it
+        tok = os.environ["ANTHROPIC_AUTH_TOKEN"]
+        def ev(e):
+            print(json.dumps(e)); sys.stdout.flush()
+        ev({{"type": "system", "subtype": "init", "permissionMode": "auto"}})
+        ev({{"type": "assistant", "message": {{"content": [{{"type": "text", "text": "planning with " + tok}},
+            {{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {{"command": "echo " + tok}}}}]}}}})
+        ev({{"type": "user", "message": {{"content": [{{"type": "tool_result", "tool_use_id": "toolu_1",
+            "content": "out " + tok}}]}}}})
+        print("an unparseable line with " + tok)
+        ev({{"type": "assistant", "message": {{"content": [{{"type": "text", "text": "L" * 40000}}]}}}})
+        ev({{"type": "result", "subtype": "success", "is_error": False, "num_turns": 2, "result": "done " + tok}})
+        sys.exit(0)
     if mode == "badjson":
         print("this is not json")
         sys.exit(0)
@@ -218,9 +233,12 @@ class _Resp:
         return self.b
 
 
-def _events():
+def _events(all_events=False):
+    """The lifecycle log's lines; without all_events, the lifecycle steps only (not the run export's task_* lines,
+    which the runner appends after `finished`: tests/test_task_export.py)."""
     with open(os.path.join(os.environ["CORTADOS_HOME"], "child-tasks.jsonl")) as f:
-        return [json.loads(line) for line in f]
+        rows = [json.loads(line) for line in f]
+    return rows if all_events else [r for r in rows if not str(r.get("event")).startswith("task_")]
 
 
 def _pid_alive(pid):
@@ -867,8 +885,18 @@ class ChildTaskTests(ChildTaskBase):
         self.assertTrue(os.path.isdir(os.path.join(self.air_root, "archive", tid)))
         self.assertTrue(w["dir"].startswith(self.air_home))      # paths in the reply are the host's
         with open(os.path.join(self.air_home, "state", "child-tasks.jsonl")) as f:
-            self.assertEqual([json.loads(x)["event"] for x in f], ["started", "finished"])
+            self.assertEqual([e for e in (json.loads(x)["event"] for x in f) if not e.startswith("task_")],
+                             ["started", "finished"])
         self.assertFalse(os.path.exists(os.path.join(os.environ["CORTADOS_HOME"], "child-tasks.jsonl")))
+        # the run export (#91) is written on the host, by its runner, and task_status shows it from there
+        end = time.time() + 30
+        while not w.get("export", {}).get("ok") and time.time() < end:
+            time.sleep(0.2)
+            _, w = self.call("task_status", task_id=tid)
+        self.assertEqual((w["export"]["ok"], w["export"]["path_kind"]), (True, "default"), w.get("export"))
+        with open(os.path.join(self.air_home, "state", "exports", "task-runs.jsonl")) as f:
+            self.assertEqual([json.loads(x)["task_id"] for x in f], [tid])
+        self.assertFalse(os.path.exists(os.path.join(os.environ["CORTADOS_HOME"], "exports")))
         # list: one round trip for the host, rows carry its state
         _, rows = self.call("list_tasks")
         row = [x for x in rows["tasks"] if x["task_id"] == tid][0]

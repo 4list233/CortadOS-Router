@@ -59,6 +59,7 @@ def fixture_home() -> Path:
     c.commit(); c.close()
     (d / "child-tasks.jsonl").write_text("\n".join(json.dumps(r) for r in [
         {"ts": NOW - 100, "event": "started", "task_id": "t1"}, {"ts": NOW - 50, "event": "finished", "status": "succeeded", "task_id": "t1"},
+        {"ts": NOW - 49, "event": "task_exported", "path_kind": "default", "task_id": "t1"},   # not a lifecycle step
         {"ts": NOW - 40, "event": "started", "task_id": "t2", "client": "grokbot"}]) + "\nnot json\n")
     # usage.db written BY usage_ledger.record (the provider's writer), so the fixture cannot drift from its schema
     usage_ledger.record("claude#b", "sonnet", {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 100},

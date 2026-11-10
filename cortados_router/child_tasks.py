@@ -15,6 +15,10 @@ Layout per task (all under a verified private 0700 directory, default ~/.config/
   result.json   written by the runner when the child ends: exit code, end time, cancelled/timed-out flags
   cancelled     marker written by cancel_task before it signals the runner's process group
 
+Run export (#91): when a task ends, the runner appends one finalized, redacted record of the run (prompt, assistant
+text, tool calls and results, result, metadata, run-level model info) to the host's append-only export file
+($CORTADOS_HOME/exports/task-runs.jsonl, or CORTADOS_TASK_EXPORT) for Grounds to capture; see "task run export" below.
+
 The runner (`python3 -m cortados_router.child_tasks --run <dir>`) is a detached session leader (start_new_session), so
 the child survives the MCP server (the desktop app may restart it) and cancel_task can signal exactly that process group.
 
@@ -254,7 +258,7 @@ LOGIN_DEFAULT_MODEL = "claude-sonnet-5-5"
 # plus the bookkeeping paths the runner (same env) reads so its state stays in the caller's (test's) throwaway dirs.
 LOGIN_ENV_ALLOW = ("HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM", "COLORTERM",
                    "__CF_USER_TEXT_ENCODING",
-                   "CORTADOS_HOME", "CORTADOS_HERMES_HOME", "CORTADOS_TASKS_DIR",
+                   "CORTADOS_HOME", "CORTADOS_HERMES_HOME", "CORTADOS_TASKS_DIR", "CORTADOS_TASK_EXPORT",
                    # Network config: without it a proxied or custom-CA network cannot reach claude.ai. These carry no
                    # credential, EXCEPT a proxy URL with userinfo (http://user:pass@host): login_env drops those.
                    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
@@ -553,23 +557,51 @@ def connectors_config() -> str:
     return os.path.abspath(os.path.expanduser(os.environ.get("CORTADOS_CONNECTORS_MCP_CONFIG") or CONNECTORS_CONFIG))
 
 
-def prune(root: str, now: float | None = None, errors: list | None = None) -> list:
+def _prune_export(d: str, meta: dict, res, red, retries: list) -> str | None:
+    """Before a finished task dir is deleted: its run export (#91) must have succeeded. If it has not, try once more
+    (a recovered task's logs are released first when this process's credentials cover the launch ones, else the
+    record is written with the logs withheld). Returns None when the dir may go, else why it stays."""
+    if isinstance(res, dict) and (res.get("export") or {}).get("ok"):
+        return None
+    if retries[0] <= 0:
+        return f"export not retried in this prune (at most {PRUNE_EXPORT_RETRIES} per call)"
+    retries[0] -= 1
+    try:
+        cur = _current_redactor(red)
+    except TaskError as exc:
+        return f"export not retried ({exc})"
+    if isinstance(res, dict) and res.get("logs_unredacted"):
+        try:
+            _release_recovered_logs(d, meta, res, cur)   # on failure the record goes out with the logs withheld
+        except OSError:
+            pass
+    ex = _export_locked(d, meta, cur, EXPORT_LATE_ROUTER_RUN, res)
+    if ex is None:
+        return "export not retried (the task's runner still holds its lock)"
+    return None if ex.get("ok") else f"export failed ({ex.get('error')})"
+
+
+def prune(root: str, now: float | None = None, errors: list | None = None, red=None) -> list:
     """Remove task dirs whose task started more than PRUNE_AGE_S ago and is not running. Returns the removed ids. Each
     dir is handled on its own: one that cannot be read or removed is recorded in `errors` and skipped, so it never
     blocks every later start_task (#94). An unreadable record (RecordError) is never deleted automatically, whatever
     its age or lock: a corrupt meta.json means the child's pid cannot be read, so the dir may still belong to a live
     child whose runner died (a free runner.lock and an old dir mtime prove nothing; appending to logs does not touch
     the dir's mtime), and removing it would take away the records _recover() / cancel need to stop that child. It
-    stays, reported in `errors` and logged by id, file and type (never content), until a person removes it."""
+    stays, reported in `errors` and logged by id, file and type (never content), until a person removes it.
+    A finished task whose run export (#91) has not succeeded is not deleted either: the export is retried once per
+    prune (_prune_export, at most PRUNE_EXPORT_RETRIES tasks per call); while it fails the dir stays, reported in `errors` and logged as
+    `task_kept_unexported`."""
     cutoff = (time.time() if now is None else now) - PRUNE_AGE_S
     removed = []
+    retries = [PRUNE_EXPORT_RETRIES]
     for name in os.listdir(root):
         d = os.path.join(root, name)
         try:
             if not TASK_ID_RE.fullmatch(name) or os.path.islink(d) or not os.path.isdir(d):
                 continue
             try:
-                state, meta, _ = _state(d)
+                state, meta, res = _state(d)
             except RecordError as exc:
                 if errors is not None:
                     errors.append(_note_unreadable(exc))
@@ -581,6 +613,12 @@ def prune(root: str, now: float | None = None, errors: list | None = None) -> li
                 started = os.path.getmtime(d)
             # A remote stub is only a pointer (the host prunes the task itself): dropped by age alone.
             if state != "running" and started < cutoff:
+                why = _prune_export(d, meta, res, red, retries) if state != "remote" else None
+                if why:
+                    log_event("task_kept_unexported", task_id=name, reason=why)
+                    if errors is not None:
+                        errors.append(f"{name}: not pruned: {why}")
+                    continue
                 if meta.get("launch") == "launchd":
                     _launchd_bootout(d)         # idempotent; a corrupt launchd.json already raised from _state() above
                 shutil.rmtree(d)
@@ -734,17 +772,20 @@ def _stub(d: str):
 
 def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed_tools=None,
           provider_url="", token_file=None, chrome=False, red=None, connectors=None, client=None,
-          title=None, session_tag=None, repo=None, branch=None, host=None) -> dict:
+          title=None, session_tag=None, repo=None, branch=None, host=None, parent_task_id=None) -> dict:
     """`client` (optional, e.g. "grokbot" from the bot gateway) is recorded in meta.json and every event line, so usage
     can be attributed to the caller. `red` carries the launch credentials (env token and token file's token as they are now). `permission_mode`
     None picks auto where the model supports it (resolve_permission_mode). `title` (<= 80 chars) and `session_tag`
     (the orchestrator's opaque tag) label the task in the Office view: on its events, and as headers on its routed
     requests. `host` names the execution host (default: the configured default); `cwd` an existing directory THERE,
-    or `repo` [+ `branch`] a workspace the host prepares (neither: a plain folder under the host's active/)."""
+    or `repo` [+ `branch`] a workspace the host prepares (neither: a plain folder under the host's active/).
+    `parent_task_id` (else CORTADOS_PARENT_TASK_ID) names the task that started this one, for the run export (#91);
+    none known is recorded as an explicit missing parent."""
     if os.environ.get(NESTED_ENV):
         raise TaskError("start_task is not available inside a child task: children may not start children "
                         "(unbounded fan-out would spend subscription quota unattended)")
     tools = _validate(task, cwd, orchestrator, permission_mode, allowed_tools)
+    parent_id, parent_note = resolve_parent(parent_task_id)
     if not isinstance(chrome, bool):
         raise TaskError("chrome must be true or false")
     if host is not None and not isinstance(host, str):
@@ -766,7 +807,8 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
         root = _private_root()  # fail before ssh: a remotely launched task must always be locally trackable
         args = {"task": task, "cwd": cwd, "orchestrator": orchestrator, "permission_mode": permission_mode,
                 "allowed_tools": allowed_tools, "chrome": chrome, "connectors": connectors, "client": client,
-                "title": title, "session_tag": session_tag, "repo": repo, "branch": branch}
+                "title": title, "session_tag": session_tag, "repo": repo, "branch": branch,
+                "parent_task_id": parent_id}   # resolved here: the host's own env does not know this session
         try:
             out = _remote(target.name, "start", args)
         except TaskError as exc:
@@ -821,7 +863,7 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
     exe = claude_bin()
     root = _private_root()
     prune_errors: list = []
-    prune(root, errors=prune_errors)
+    prune(root, errors=prune_errors, red=red)
     # No cap on parallel children. Routed children: capacity is the router's job (S1 and the quota gates refuse or
     # redirect a spent lane). Chrome (login-mode) children bypass S1 and the quota gates, so NOTHING here bounds N of
     # them against the main Claude subscription; they do run one at a time per host (CHROME_LOCK: Chrome serves one
@@ -866,8 +908,13 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
             meta["permission_mode_note"] = mode_note
         if launch_warning:
             meta["launch_warning"] = launch_warning
-        if client or mode_note or launch_warning:
-            _write_json(os.path.join(d, "meta.json"), meta)
+        # For the run export (#91): the task that started this one (or why none is known), and the Office title.
+        meta["parent_task_id"] = parent_id
+        if parent_note:
+            meta["parent_note"] = parent_note
+        if office.get("title"):
+            meta["title"] = office["title"]
+        _write_json(os.path.join(d, "meta.json"), meta)   # before the spawn: the runner's export reads these
         if launchd:
             # chrome: the allowlisted login env (no credential) rides in the plist; routed: nothing does (_prepare
             # wrote it to RUNNER_ENV_FILE and the runner loads it).
@@ -1284,6 +1331,9 @@ def _recover(d: str, meta: dict):
         res["child_cleanup"] = child
         res["logs_unredacted"] = True           # the runner never redacted them; see status()
         res["workspace"] = _settle_workspace(d)  # the child is stopped: its folder is archived or held, never left behind
+        # Its run export waits for the logs: status() exports it once it may release them (_release_recovered_logs),
+        # prune() with the logs withheld if that never happens before the dir would be deleted.
+        res["export"] = {"ok": False, "at": round(time.time(), 3), "error": EXPORT_PENDING}
         _write_json(os.path.join(d, "result.json"), res)
         return res
     finally:
@@ -1416,6 +1466,11 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
         # A login-mode (chrome) task never went through the provider: there is no run record to fetch.
         out["router_run"] = ({"note": "login mode: not routed, no provider run record"} if meta.get("lane")
                              else fetch_run(provider_url, token, task_id, _fetch_timeout(deadline)))
+        ex = res.get("export")
+        if isinstance(ex, dict) and ex.get("error") == EXPORT_PENDING and not res.get("logs_unredacted"):
+            # A recovered task whose logs were just released: its run export happens now (#91).
+            ex = _export_locked(d, meta, red, out["router_run"], res) or ex
+        out["export"] = ex if isinstance(ex, dict) else {"pending": "the runner records its export right after the result"}
         # Why the provider refused (Claude Code replaces a 413's message with its own "images" text, so the child's
         # result never says): the most recent refusal recorded under this run, plus a hint for the known cause.
         refusals = out["router_run"].get("refusals") if isinstance(out["router_run"], dict) else None
@@ -1891,6 +1946,383 @@ def _settle_workspace(d: str):
         except OSError:
             pass
     return ws
+
+
+# --- task run export (#91: a finalized, redacted, append-only record per run, for Grounds to capture) ---------------
+#
+# One JSONL file per execution host: $CORTADOS_HOME/exports/task-runs.jsonl (CORTADOS_TASK_EXPORT names another file).
+# One line per finished task (any terminal state), written ONCE, only after the run's logs were redacted and its
+# result.json is final: by the runner itself, else (a runner that died) by the first status call that can release the
+# logs, else by prune just before the task dir would be deleted (then with the logs withheld). This code only ever
+# appends: one os.write of the whole line, under an flock on <file>.lock, so concurrent runners never interleave. A
+# sidecar <file>.ids (task id + file size after the line, under the same lock) makes a retry idempotent. Every text
+# in the record went through the same Redactor that produced result.json, redacted BEFORE it was capped; the raw
+# stdout.log content is never written. A task dir whose export has not succeeded is never pruned (it is reported).
+
+EXPORT_SCHEMA = "cortados.task-run/1"
+EXPORT_ENV = "CORTADOS_TASK_EXPORT"         # a file path; unset: paths.state_dir()/EXPORT_FILE
+EXPORT_FILE = os.path.join("exports", "task-runs.jsonl")
+PARENT_ENV = "CORTADOS_PARENT_TASK_ID"      # set by a launching session that is itself a task (start_task arg wins)
+EXPORT_TEXT_CHARS = 32_000                  # per text field (prompt, a tool input string, a tool result, the result)
+EXPORT_MAX_EVENTS = 2_000                   # per record; later events are counted in events_dropped, not written
+EXPORT_LOCK_WAIT_S = 30                     # an export lock held longer than this is a stuck writer: fail, retry later
+PRUNE_EXPORT_RETRIES = 10                   # export retries per prune: prune runs inside start_task, which must answer
+EXPORT_PENDING = "LogsUnredacted"           # export error of a recovered task whose logs are not released yet
+EXPORT_LATE_ROUTER_RUN = {"note": "not fetched: exported after the runner (the provider's run record is in memory "
+                                  "only); see the router logs"}
+EXPORT_LOGS_WITHHELD = "logs withheld: they could not be redacted with the launch credentials"
+
+
+class _ExportLeak(Exception):
+    """The encoded record still matched a credential: never written."""
+
+
+def export_path():
+    """(path, kind): the export file and whether it is the default or CORTADOS_TASK_EXPORT's."""
+    raw = (os.environ.get(EXPORT_ENV) or "").strip()
+    if raw:
+        return os.path.abspath(os.path.expanduser(raw)), "env"
+    return os.path.join(str(paths.state_dir()), EXPORT_FILE), "default"
+
+
+def resolve_parent(arg):
+    """(parent_task_id or None, note or None) for a new task: start_task's parent_task_id (validated: a bad one is
+    refused), else CORTADOS_PARENT_TASK_ID when the launching session sets it (a malformed one is ignored, with a
+    note: it must not block every start_task)."""
+    if arg is not None:
+        if not isinstance(arg, str) or not TASK_ID_RE.fullmatch(arg):
+            raise TaskError("parent_task_id must be a task id (t<14 digits>-<8 hex>)")
+        return arg, None
+    env = (os.environ.get(PARENT_ENV) or "").strip()
+    if not env:
+        return None, None
+    if TASK_ID_RE.fullmatch(env):
+        return env, None
+    return None, f"{PARENT_ENV} is set but is not a task id; the parent is recorded as missing"
+
+
+class _Cap:
+    """Caps already-redacted text at EXPORT_TEXT_CHARS with a marker, counting every cut."""
+
+    def __init__(self, limit=None):
+        self.limit = EXPORT_TEXT_CHARS if limit is None else limit
+        self.truncated = 0
+
+    def text(self, s: str) -> str:
+        if len(s) <= self.limit:
+            return s
+        self.truncated += 1
+        return s[:self.limit] + f"\n[truncated by cortados: {len(s) - self.limit} of {len(s)} characters cut]"
+
+    def tree(self, v):
+        if isinstance(v, str):
+            return self.text(v)
+        if isinstance(v, list):
+            return [self.tree(x) for x in v]
+        if isinstance(v, dict):
+            return {self.text(str(k)): self.tree(x) for k, x in v.items()}
+        return v
+
+
+def _home_relative(p):
+    """An absolute path under $HOME as ~/...: the export carries no home directory beyond that."""
+    if not isinstance(p, str):
+        return p
+    home = os.path.expanduser("~")
+    if home and home != "/" and (p == home or p.startswith(home.rstrip("/") + "/")):
+        return "~" + p[len(home.rstrip("/")):]
+    return p
+
+
+def _export_events(path: str, red: "Redactor", cap: "_Cap"):
+    """(events, counts, extra_withheld, dropped) from a REDACTED stdout.log: assistant text, tool_use (name + input),
+    tool_result (content as text, is_error) and the result record, in stream order. Each record is redacted again
+    (redact_record, the runner's own rules) and only then capped. A line that does not parse, and the runner's
+    WITHHELD_EVENT, become a `withheld` event; a record the second pass withholds is counted in extra_withheld."""
+    events, counts = [], {}
+    extra = dropped = 0
+    try:
+        with open(path, encoding="utf-8", errors="replace", newline="") as f:
+            whole = f.read()
+    except FileNotFoundError:
+        return events, counts, 0, 0
+    try:
+        legacy = json.loads(whole) if whole.strip() else None
+    except (ValueError, RecursionError):
+        legacy = None
+    lines = [None] if isinstance(legacy, dict) else whole.split("\n")
+
+    def add(ev):
+        nonlocal dropped
+        if len(events) >= EXPORT_MAX_EVENTS:
+            dropped += 1
+            return
+        events.append(ev)
+        counts[ev["type"]] = counts.get(ev["type"], 0) + 1
+
+    for line in lines:
+        if line is None:
+            record = legacy
+        else:
+            body = line.rstrip("\r")
+            if not body.strip():
+                continue
+            try:
+                record = json.loads(body)
+            except (ValueError, RecursionError):
+                extra += 1                       # never redacted structurally (no credential to redact with): not shown
+                add({"type": "withheld"})
+                continue
+        if isinstance(record, dict) and record.get("type") == "cortados_withheld":
+            add({"type": "withheld"})            # the runner withheld it (already counted in redact_unparsed_lines)
+            continue
+        try:
+            cleaned, n = redact_record(red, record)
+        except (ValueError, RecursionError):
+            cleaned, n = redact.WITHHELD, 1
+        extra += n
+        if not isinstance(cleaned, dict):
+            if cleaned == redact.WITHHELD:
+                add({"type": "withheld"})
+            continue
+        kind = cleaned.get("type")
+        if kind == "result":
+            text = cleaned.get("result")
+            add({"type": "result", "subtype": cleaned.get("subtype"), "is_error": cleaned.get("is_error"),
+                 "num_turns": cleaned.get("num_turns"), "text": cap.text(text) if isinstance(text, str) else None})
+            continue
+        message = cleaned.get("message")
+        content = message.get("content") if isinstance(message, dict) and kind in ("assistant", "user") else None
+        for b in content if isinstance(content, list) else []:
+            if not isinstance(b, dict):
+                continue
+            if kind == "assistant" and b.get("type") == "text" and isinstance(b.get("text"), str):
+                add({"type": "text", "text": cap.text(b["text"])})
+            elif kind == "assistant" and b.get("type") == "tool_use":
+                add({"type": "tool_use", "id": cap.tree(b.get("id")), "name": cap.text(str(b.get("name") or "?")),
+                     "input": cap.tree(b.get("input"))})
+            elif kind == "user" and b.get("type") == "tool_result":
+                c = b.get("content")
+                ev = {"type": "tool_result", "tool_use_id": cap.tree(b.get("tool_use_id")), "is_error": b.get("is_error") is True,
+                      "content": cap.text(_result_text(b))}
+                if isinstance(c, list):
+                    other = sum(1 for p in c if not (isinstance(p, dict) and isinstance(p.get("text"), str)))
+                    if other:
+                        ev["omitted_parts"] = other  # images and other non-text parts are not exported
+                add(ev)
+    return events, counts, extra, dropped
+
+
+def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_run) -> dict:
+    """The export record of a finished task (schema EXPORT_SCHEMA). Its logs are included only when they were
+    redacted with the launch credentials (no redact_error, not logs_unredacted); else events and prompt are withheld.
+    The caller encodes it; nothing here is the raw stdout.log."""
+    cap = _Cap()
+    tid = os.path.basename(d)
+    logs = not res.get("redact_error") and not res.get("logs_unredacted")
+    started, ended = meta.get("started_at"), res.get("ended_at")
+    parent = meta.get("parent_task_id")
+    parent = parent if isinstance(parent, str) and TASK_ID_RE.fullmatch(parent) else None
+    ws = res.get("workspace") if isinstance(res.get("workspace"), dict) else _read_json(os.path.join(d, WORKSPACE_FILE))
+    if not isinstance(ws, dict):
+        ws = meta.get("workspace") if isinstance(meta.get("workspace"), dict) else None
+    act = res.get("activity") if isinstance(res.get("activity"), dict) else {}
+    # Metadata: ids, names, flags and the provider's run record; redacted as text (a title such as "[WIP] x" is not
+    # JSON to decode), never capped.
+    head = red.tree({
+        "task_id": tid, "parent_task_id": parent, "parent": "known" if parent else "missing",
+        **({"parent_note": meta["parent_note"]} if meta.get("parent_note") else {}),
+        "title": meta.get("title"), "host": meta.get("host"), "client": meta.get("client"),
+        "state": classify(res), "exit_code": res.get("exit_code"), "cancelled": bool(res.get("cancelled")),
+        "timed_out": bool(res.get("timed_out")),
+        "started_at": started, "ended_at": ended,
+        "elapsed_s": round(ended - started, 1) if isinstance(started, (int, float)) and isinstance(ended, (int, float)) else None,
+        "cwd": _home_relative(meta.get("cwd")),
+        "workspace": {k: ws.get(k) for k in ("kind", "state", "repo", "branch", "reason") if ws.get(k) is not None} if ws else None,
+        "orchestrator": meta.get("orchestrator"), "permission_mode": meta.get("permission_mode"),
+        "effective_permission_mode": act.get("effective_permission_mode"),
+        "chrome": bool(meta.get("chrome")), "launch": meta.get("launch"),
+        **({"lane": meta.get("lane"), "model": meta.get("model")} if meta.get("lane") else {}),
+        "router_run": router_run if isinstance(router_run, dict) else None,
+        "tool_uses": act.get("tool_uses") or {}, "tool_errors": act.get("tool_errors") or 0,
+    })
+    extra = 0
+    error = res.get("error") or res.get("output_error") or res.get("redact_error")
+    if isinstance(error, str):
+        text, n = _text_result(red, error)
+        head["error"], extra = cap.text(text), extra + n
+    prompt = None
+    if logs:
+        try:
+            with open(os.path.join(d, "prompt.txt"), encoding="utf-8", errors="replace") as f:
+                raw_prompt = f.read()
+        except FileNotFoundError:
+            raw_prompt = None
+        if raw_prompt is not None:
+            text, n = _text_result(red, raw_prompt)
+            prompt, extra = cap.text(text), extra + n
+        events, counts, more, dropped = _export_events(os.path.join(d, "stdout.log"), red, cap)
+        extra += more
+    else:
+        events, counts, dropped = [], {}, 0
+    unparsed = res.get("redact_unparsed_lines") or 0
+    return {"schema": EXPORT_SCHEMA, **head, "exported_at": round(time.time(), 3),
+            "logs": "included" if logs else EXPORT_LOGS_WITHHELD,
+            "prompt": prompt, "events": events, "event_counts": counts,
+            **({"events_dropped": dropped} if dropped else {}),
+            "redact_unparsed_lines": unparsed, "withheld": unparsed + extra, "truncated": cap.truncated}
+
+
+def _flock_wait(fd: int, wait_s: float) -> None:
+    end = time.monotonic() + wait_s
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= end:
+                raise TimeoutError("export lock busy") from None
+            time.sleep(0.05)
+
+
+def _exported_ids(path: str) -> set:
+    """Task ids already in the export file, from the sidecar <path>.ids; lines the sidecar does not cover (a writer
+    that died between the line and its id) are read from the file's tail and added to it. Call under the lock."""
+    ids, end = set(), 0
+    try:
+        with open(path + ".ids", encoding="utf-8") as f:
+            for row in f:
+                parts = row.split()
+                if parts and TASK_ID_RE.fullmatch(parts[0]):
+                    ids.add(parts[0])
+                if len(parts) > 1 and parts[1].isdigit():
+                    end = int(parts[1])         # "-" rows only move the baseline (a rescanned tail with no ids)
+    except FileNotFoundError:
+        pass
+    try:
+        size = os.stat(path).st_size
+    except FileNotFoundError:
+        return ids
+    if size == end:
+        return ids
+    start = end if end < size else 0            # smaller: the file was replaced by its reader; rescan it whole
+    found = []
+    with open(path, "rb") as f:
+        f.seek(start)
+        for line in f:
+            try:
+                tid = json.loads(line).get("task_id")
+            except (ValueError, RecursionError, AttributeError):
+                continue                        # a partial first line of the tail, or not ours
+            if isinstance(tid, str) and TASK_ID_RE.fullmatch(tid) and tid not in ids:
+                ids.add(tid)
+                found.append(tid)
+    _append_ids(path, found or [None], size)
+    return ids
+
+
+def _append_ids(path: str, tids, end: int) -> None:
+    fd = os.open(path + ".ids", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, "".join(f"{t or '-'} {end}\n" for t in tids).encode("ascii"))
+    finally:
+        os.close(fd)
+
+
+def append_export(line: bytes, task_id: str):
+    """Append one encoded record to the export file, once per task id. Returns (path_kind, already_there)."""
+    path, kind = export_path()
+    parent = os.path.dirname(path)
+    if not os.path.isdir(parent):
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+    if kind == "default":
+        os.chmod(parent, 0o700)                 # ours: exactly 0700 (makedirs' mode is masked by umask)
+    lock = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        _flock_wait(lock, EXPORT_LOCK_WAIT_S)
+        if task_id in _exported_ids(path):
+            return kind, True
+        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+                raise PermissionError("export file is not a regular file of this user")
+            if st.st_size and os.pread(fd, 1, st.st_size - 1) != b"\n":
+                os.write(fd, b"\n")             # a torn line from a dead writer: ours starts on a line of its own
+            if os.write(fd, line) != len(line):
+                raise OSError("short write to the export file")
+            end = os.fstat(fd).st_size
+        finally:
+            os.close(fd)
+        _append_ids(path, [task_id], end)
+        return kind, False
+    finally:
+        os.close(lock)                          # releases the flock
+
+
+def _export_task(d: str, meta: dict, res: dict, red: "Redactor", router_run) -> dict:
+    """Build, check and append the task's export record; returns the `export` status for result.json and logs
+    task_exported / task_export_failed. Never raises (the task's result stands); errors are recorded by type only."""
+    tid = os.path.basename(d)
+    try:
+        rec = build_export_record(d, meta, res, red, router_run)
+        line = json.dumps(rec, ensure_ascii=True, separators=(",", ":")) + "\n"
+        if red._re is not None and red._re.search(line):
+            raise _ExportLeak()                 # belt and braces: a credential spelling survived; write nothing
+        kind, already = append_export(line.encode("ascii"), tid)
+    except Exception as exc:
+        err = type(exc).__name__
+        log_event("task_export_failed", task_id=tid, error=err)
+        return {"ok": False, "at": round(time.time(), 3), "error": err}
+    log_event("task_exported", task_id=tid, path_kind=kind, events=len(rec["events"]), logs=rec["logs"] == "included",
+              **({"already": True} if already else {}))
+    return {"ok": True, "at": round(time.time(), 3), "path_kind": kind,
+            **({"already": True} if already else {}), **({"logs_withheld": True} if rec["logs"] != "included" else {})}
+
+
+def _export_locked(d: str, meta: dict, red: "Redactor", router_run, res=None):
+    """Export a finished task from outside its runner (status after a recovered task's logs were released, prune),
+    holding the task's runner.lock so it never races the runner's own export or a recoverer. Returns the export
+    status, or None when the lock is held (the runner is still finishing: it exports itself)."""
+    fd = None
+    try:
+        fd = os.open(os.path.join(d, "runner.lock"), os.O_RDWR)
+    except FileNotFoundError:
+        pass
+    if fd is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return None
+    try:
+        cur = _read_json(os.path.join(d, "result.json"))
+        if isinstance(cur, dict):
+            res = cur
+        if not isinstance(res, dict):
+            return None
+        if (res.get("export") or {}).get("ok"):
+            return res["export"]
+        res["export"] = _export_task(d, meta, res, red, router_run)
+        _write_json(os.path.join(d, "result.json"), res)
+        return res["export"]
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _current_redactor(red=None) -> "Redactor":
+    """This process's credentials (its launch env, the host's token env and file) plus `red`'s."""
+    toks = set(launch_tokens(os.environ)) | set(_host_tokens()) | set(red.raw if red is not None else ())
+    return Redactor([t for t in toks if len(t) >= MIN_TOKEN_LEN])
+
+
+def _runner_router_run(meta: dict, task_id: str) -> dict:
+    """The provider's run record, fetched by the runner with its own launch env (the provider forgets it on restart,
+    so it is taken while the run is fresh). A login-mode task never went through the provider."""
+    if meta.get("lane"):
+        return {"note": "login mode: not routed, no provider run record"}
+    return fetch_run(os.environ.get("ANTHROPIC_BASE_URL") or "", os.environ.get("ANTHROPIC_AUTH_TOKEN") or "", task_id)
 
 
 # --- runner (detached child process) -------------------------------------------------------------------------------
@@ -2484,6 +2916,18 @@ def _run(d: str, lock_fd=None) -> int:
         timed_out=bool(result.get("timed_out")),
         duration_s=round(result["ended_at"] - started, 1) if isinstance(started, (int, float)) else None)
     _write_json(os.path.join(d, "result.json"), result)
+    # The run export (#91): only now, with the logs redacted and result.json final, and still under the task lock (so
+    # no status call or prune exports it in parallel). Its outcome is added to result.json; a failure is retried by
+    # prune, which never deletes an unexported task.
+    try:
+        meta = _read_json(os.path.join(d, "meta.json")) or {}
+    except RecordError:
+        meta = {}
+    result["export"] = _export_task(d, meta, result, red, _runner_router_run(meta, os.path.basename(d)))
+    try:
+        _write_json(os.path.join(d, "result.json"), result)
+    except OSError:
+        pass                                    # the export line stands; prune finds it by id and marks it then
     os.close(lock_fd)                           # release only after result.json exists
     return 0
 
@@ -2554,7 +2998,7 @@ def serve_remote(stdin=None, stdout=None) -> int:
                         args.get("permission_mode") or None, args.get("allowed_tools"), "", None,
                         args.get("chrome", False), red, args.get("connectors"), client=args.get("client"),
                         title=args.get("title"), session_tag=args.get("session_tag"), repo=args.get("repo"),
-                        branch=args.get("branch"), host=host.name)
+                        branch=args.get("branch"), host=host.name, parent_task_id=args.get("parent_task_id"))
         elif op == "status":
             out = status(args.get("task_id"), red, url, token)
         elif op == "wait":
