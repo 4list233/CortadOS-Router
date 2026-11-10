@@ -637,10 +637,13 @@ class CleanupTests(_Base):
 
     def hanging_fetch_git(self):
         """A git whose `fetch` never returns (exec sleep: the subprocess timeout kills the sleep itself, so no orphan
-        keeps the captured pipes open); every other command is the real git."""
+        keeps the captured pipes open); every other command is the real git. A fetch arrives as
+        `-c gc.auto=0 -c maintenance.auto=false fetch ...` (#93 round 4), so the subcommand is the first non -c word."""
         script = os.path.join(self.tmp, "git-hanging-fetch")
         with open(script, "w") as f:
-            f.write('#!/bin/sh\nif [ "$1" = fetch ]; then exec sleep 60; fi\nexec git "$@"\n')
+            f.write('#!/bin/sh\nsub=; skip=; for a in "$@"; do\n'
+                    '  if [ -n "$skip" ]; then skip=; elif [ "$a" = -c ]; then skip=1; else sub=$a; break; fi\n'
+                    'done\nif [ "$sub" = fetch ]; then exec sleep 60; fi\nexec git "$@"\n')
         os.chmod(script, 0o755)
         return script
 
