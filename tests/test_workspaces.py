@@ -980,7 +980,7 @@ class CleanupTests(_Base):
         admin = self.admin_dir(path)
         other = self.prepare(TID2, repo="demo")
         other_admin = self.admin_dir(other["path"])
-        with mock.patch.object(ws, "repair_registry", return_value={"repaired": [], "errors": []}):
+        with mock.patch.object(ws, "repair_registry", return_value={"repaired": [], "errors": [], "skipped": []}):
             os.rename(other["path"], os.path.join(self.tmp, "elsewhere"))           # stale: path missing
             report = ws.cleanup_archive(self.root)
         self.assertEqual(report["deleted"], [TID])
@@ -993,7 +993,7 @@ class CleanupTests(_Base):
         admin = self.admin_dir(path)
         with open(os.path.join(admin, "gitdir"), "w") as f:
             f.write(os.path.join(self.tmp, "somewhere-else", ".git") + "\n")
-        with mock.patch.object(ws, "repair_registry", return_value={"repaired": [], "errors": []}):
+        with mock.patch.object(ws, "repair_registry", return_value={"repaired": [], "errors": [], "skipped": []}):
             report = ws.cleanup_archive(self.root)
         self.assertEqual(report["deleted"], [])
         self.assertIn("left alone", report["errors"][0])
@@ -1104,6 +1104,149 @@ class CleanupTests(_Base):
         self.assertEqual(ws.cleanup_archive(self.root)["deleted"], [])
         self.assertTrue(os.path.isdir(path))
 
+
+
+TID3 = "t20261108120300-0000000d"
+
+
+class RegistryOwnershipTests(_Base):
+    """#93 round 3: a repair or a deletion never takes an admin dir from the worktree that validly owns it, and the
+    registry prepass is bounded (deadline, order, backoff)."""
+    archived = CleanupTests.archived
+    admin_dir = CleanupTests.admin_dir
+
+    def impostor(self, b_commit):
+        """The reviewer's reproduction: archived A (old, clean) whose .git file is a copy of active B's. B optionally
+        has an unpublished commit on its HEAD. Returns (a_path, b_path, b_admin, b_head, repo_dir)."""
+        a = self.archived(TID, ws.ARCHIVE_AGE_S + 60, kind="repo")
+        b = self.prepare(TID2, repo="demo")["path"]
+        if b_commit:
+            with open(os.path.join(b, "b.txt"), "w") as f:
+                f.write("only in B\n")
+            git("add", ".", cwd=b)
+            git("commit", "-q", "-m", "b", cwd=b)
+        shutil.copyfile(os.path.join(b, ".git"), os.path.join(a, ".git"))
+        return a, b, self.admin_dir(b), git("rev-parse", "HEAD", cwd=b).strip(), ws.read_index(self.root)[TID]["repo_dir"]
+
+    def assert_b_intact(self, b, b_admin, b_head, repo_dir):
+        self.assertTrue(os.path.isdir(b_admin))
+        with open(os.path.join(b_admin, "gitdir")) as f:
+            self.assertEqual(os.path.normpath(f.read().strip()), os.path.join(b, ".git"))     # backlink untouched
+        git("reflog", "expire", "--expire=now", "--all", cwd=repo_dir)
+        git("gc", "-q", "--prune=now", cwd=repo_dir)
+        git("status", "--porcelain", cwd=b)                                                   # still a valid repo
+        self.assertEqual(git("rev-parse", "HEAD", cwd=b).strip(), b_head)
+        git("cat-file", "-e", b_head + "^{commit}", cwd=repo_dir)
+        self.assertIn(f"worktree {b}\n", git("worktree", "list", "--porcelain", cwd=repo_dir))
+
+    def test_impostor_with_unpublished_owner_is_held_and_never_takes_the_admin_dir(self):
+        a, b, b_admin, b_head, repo_dir = self.impostor(b_commit=True)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertEqual(report["repaired"], [])
+        conflicts = [e for e in report["errors"] if b in e and "belongs to" in e]
+        self.assertTrue(conflicts, report["errors"])           # loud, naming both paths
+        rec = ws.read_index(self.root)[TID]
+        self.assertIn(rec["state"], ("archived", "held"))
+        self.assertTrue(os.path.isdir(rec["path"]))            # A's files are kept, wherever they are
+        self.assertTrue(any(rec["path"] in e for e in conflicts), (rec["path"], conflicts))
+        self.assertTrue(rec.get("registry_conflict") or rec.get("repair_error"))
+        self.assert_b_intact(b, b_admin, b_head, repo_dir)
+        ws.cleanup_archive(self.root)                          # and again: a second run neither steals nor deletes
+        self.assert_b_intact(b, b_admin, b_head, repo_dir)
+
+    def test_impostor_of_a_clean_owner_is_not_deleted_and_the_owner_keeps_its_admin_dir(self):
+        a, b, b_admin, b_head, repo_dir = self.impostor(b_commit=False)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertEqual(report["repaired"], [])
+        self.assertTrue(any("belongs to" in e and a in e and b in e for e in report["errors"]), report["errors"])
+        self.assertIn("registry_conflict", ws.read_index(self.root)[TID])
+        self.assertTrue(os.path.isdir(a))
+        self.assert_b_intact(b, b_admin, b_head, repo_dir)
+
+    def test_deletion_refuses_an_admin_dir_another_worktree_names_even_when_its_backlink_was_stolen(self):
+        """The state a wrong repair used to leave: B's admin dir backlink rewritten to A. A's deletion must not take B's
+        admin dir, because B's .git file still names it."""
+        a, b, b_admin, b_head, repo_dir = self.impostor(b_commit=False)
+        with open(os.path.join(b_admin, "gitdir"), "w") as f:
+            f.write(os.path.join(a, ".git") + "\n")
+        with mock.patch.object(ws, "repair_registry", return_value={"repaired": [], "errors": [], "skipped": []}):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertTrue(any("also named by" in e and b in e for e in report["errors"]), report["errors"])
+        self.assertTrue(os.path.isdir(a))
+        self.assertTrue(os.path.isdir(b_admin))
+        with open(os.path.join(b_admin, "gitdir"), "w") as f:          # the owner fixes the backlink by hand
+            f.write(os.path.join(b, ".git") + "\n")
+        self.assert_b_intact(b, b_admin, b_head, repo_dir)
+
+    def test_repair_whose_backlink_target_is_gone_still_repairs(self):
+        """Only a valid owner blocks a repair: a backlink naming a missing path (an ordinary unrepaired move) is fixed."""
+        rec = self.prepare(TID, repo=self.origin)
+        held = os.path.join(self.root, "held", TID)
+        os.rename(rec["path"], held)
+        out = ws.repair_registry(self.root)
+        self.assertEqual((out["repaired"], out["errors"]), ([held], []))
+
+    def stale_held(self, rec):
+        """A prepared repo worktree moved to held/ without a repair, recorded there in the index."""
+        tid = rec["task_id"]
+        held = os.path.join(self.root, "held", tid)
+        os.makedirs(os.path.dirname(held), exist_ok=True)
+        os.rename(rec["path"], held)
+        ws.update_index(self.root, {**rec, "state": "held", "path": held, "settled_at": time.time()})
+        return held
+
+    def test_slow_repair_cannot_starve_deferred_settles_or_other_entries_forever(self):
+        recs = [self.prepare(t, repo=self.origin) for t in (TID, TID2, TID3)]    # each start repairs: move after
+        deferred = recs[2]
+        with open(os.path.join(deferred["path"], "w.txt"), "w") as f:
+            f.write("unpublished\n")
+        slow, other = self.stale_held(recs[0]), self.stale_held(recs[1])
+        ws.update_index(self.root, {**deferred, "settle_deferred": True, "error": "not settled yet"})
+        budget = 30
+        real_git, real_monotonic, offset, repairs = ws._git, time.monotonic, [0.0], []
+
+        def slow_git(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+            if args[:2] == ["worktree", "repair"]:
+                repairs.append(args[-1])
+                if args[-1] == slow:                # hangs for its whole fixed cap, which eats the run's budget
+                    offset[0] += budget + 1
+                    raise ws.GitTimeoutError("git worktree did not finish within 60 s")
+            return real_git(args, cwd=cwd, timeout=timeout)
+
+        with mock.patch.object(ws, "_git", side_effect=slow_git), \
+                mock.patch.object(ws.time, "monotonic", side_effect=lambda: real_monotonic() + offset[0]):
+            report = ws.cleanup_archive(self.root, max_seconds=budget)
+        self.assertEqual(report["settled"], [TID3])                    # deferred settle ran before the prepass
+        self.assertEqual(ws.read_index(self.root)[TID3]["state"], "held")
+        self.assertEqual(repairs.count(slow), 1)                        # once per run, then the deadline
+        self.assertNotIn(other, repairs)
+        self.assertTrue(any(TID2 in t and "no budget" in t for t in report["timed_out"]), report["timed_out"])
+        rec = ws.read_index(self.root)[TID]
+        self.assertEqual(rec["repair_failures"], 1)
+        self.assertGreater(rec["repair_next_at"], time.time() + ws.REPAIR_BACKOFF_BASE_S - 60)
+        # next run: the failing entry is backing off, so the other one is repaired, not starved
+        repairs.clear()
+        offset[0] = 0.0
+        with mock.patch.object(ws, "_git", side_effect=slow_git):
+            report = ws.cleanup_archive(self.root, max_seconds=budget)
+        self.assertEqual(repairs, [other])
+        self.assertEqual(report["repaired"], [other])
+        self.assertTrue(any(TID in t and "backing off" in t for t in report["timed_out"]), report["timed_out"])
+        # once the backoff is over it is retried; success clears every repair field
+        ws.update_index(self.root, {**ws.read_index(self.root)[TID], "repair_next_at": time.time() - 1})
+        report = ws.cleanup_archive(self.root, max_seconds=budget)
+        self.assertEqual(report["repaired"], [slow])
+        rec = ws.read_index(self.root)[TID]
+        for k in ("repair_failures", "repair_next_at", "repair_error", "registry_conflict"):
+            self.assertNotIn(k, rec)
+
+    def test_backoff_grows_and_is_capped(self):
+        self.assertEqual(ws._repair_backoff(1), ws.REPAIR_BACKOFF_BASE_S)
+        self.assertEqual(ws._repair_backoff(2), 2 * ws.REPAIR_BACKOFF_BASE_S)
+        self.assertEqual(ws._repair_backoff(50), ws.REPAIR_BACKOFF_MAX_S)
 
 if __name__ == "__main__":
     unittest.main()

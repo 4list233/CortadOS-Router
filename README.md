@@ -528,9 +528,15 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   Worktree metadata is never pruned globally (#93): `git worktree prune` is never run, every clone has
   `gc.worktreePruneExpire=never`, a deleted worktree's own admin dir is removed alone, every move is followed by
   `git worktree repair` (a failure is recorded as `repair_error`, never rolled back), and each cleanup (and each start
-  that finds `cleanup.lock` free) repairs any stale registry entry under `active/`, `archive/` or `held/`. `settle()`
+  that finds `cleanup.lock` free) repairs any stale registry entry under `active/`, `archive/` or `held/`: under the
+  run's deadline, after the deferred settles, with a per-entry backoff in `index.jsonl` (`repair_failures`,
+  `repair_next_at`: 1 h doubling to a week). An admin dir whose backlink names another existing worktree that names it
+  back belongs to that worktree: it is never repaired over (reported, `registry_conflict`) and never deleted with
+  another entry. With the admin dir kept, commits reachable from a worktree's HEAD or index survive any gc; a commit
+  reachable only from reflog entries (committed, then reset away) is lost once git's normal reflog expiry drops those
+  entries. That is acceptable: held work's commits are on its HEAD. `settle()`
   moves under `cleanup.lock` (waits at most 60 s; past it the folder stays in `active/` marked `settle_deferred` and
-  the next cleanup settles it). Lock order: clone lock -> `cleanup.lock` -> `index.lock`. `integrations/launchd/com.cortados.archive-cleanup.plist` runs it daily on
+  the next cleanup settles it; `task_status` then reports the index's settled record). Lock order: clone lock -> `cleanup.lock` -> `index.lock`. `integrations/launchd/com.cortados.archive-cleanup.plist` runs it daily on
   the Air; task startup never runs cleanup, so starting a task is not delayed by cleanup locks or remote fetches.
 - `chrome: true` on a `gui` host runs the child as a per-task LaunchAgent in the desktop session
   (`launchctl bootstrap gui/<uid> <task dir>/launchd.plist`, label `com.cortados.task.<task_id>`, booted out when the

@@ -24,8 +24,8 @@ and may then take cleanup.lock (bounded); the cleanup and settle() take cleanup.
 is a leaf. settle() takes cleanup.lock rather than the clone lock because the cleanup would otherwise need the clone
 lock inside cleanup.lock, the reverse of a start's order.
 
-Worktree admin dirs (<clone>/.git/worktrees/<id>: the worktree's HEAD, index and reflogs, which keep an unpublished
-detached commit reachable) are never pruned globally (#93). `git worktree prune` drops EVERY entry whose path is
+Worktree admin dirs (<clone>/.git/worktrees/<id>: the worktree's HEAD, index and reflogs; HEAD and index keep an
+unpublished detached commit reachable) are never pruned globally (#93). `git worktree prune` drops EVERY entry whose path is
 missing, and a moved but not yet repaired worktree looks exactly like that, so this module never runs it. Instead:
   - the cleanup removes only the admin dir of the worktree it deletes, resolved from that worktree's own .git file and
     checked to be inside the clone and to name the deleted path, through no-follow descriptors;
@@ -34,7 +34,10 @@ missing, and a moved but not yet repaired worktree looks exactly like that, so t
   - every move (settle's, the cleanup's move to held/) is a rename followed by `git worktree repair` of the new path
     under its own fixed cap; a failed repair is recorded (`repair_error`), never rolled back;
   - every cleanup, and every start that finds cleanup.lock free, repairs the registry entry of any worktree under
-    active/, archive/ or held/ whose admin dir names another path.
+    active/, archive/ or held/ whose admin dir names another path, under a deadline and with a per-entry backoff
+    recorded in index.jsonl, unless the path it names is an existing worktree whose .git names the admin dir back:
+    then the admin dir belongs to that worktree, the entry is a conflict (reported, `registry_conflict`), and
+    nothing is rewritten. A deletion likewise refuses an admin dir that any other existing worktree names.
 A registry entry at a stale path is therefore never destructive: it only waits for the next repair.
 
 Stdlib only. git runs as a subprocess with GIT_TERMINAL_PROMPT=0 (an unauthenticated clone fails instead of hanging).
@@ -76,6 +79,11 @@ SETTLE_LOCK_WAIT_S = CLEANUP_LOCK_WAIT_S
 CLEANUP_LOCK_POLL_S = 0.1            # between non-blocking flock attempts: no spin, and at most 0.1 s added after release
 GIT = "git"                          # resolved on PATH at call time (the execution host's PATH is set by its entry)
 SUBDIRS = ("repos", "active", "archive", "held")
+# A registry repair that failed is retried after 1 h, doubling per consecutive failure up to a week (#93 round 3): the
+# daily cleanup still retries a transient failure the next day, and a persistently hanging entry costs one capped
+# attempt per backoff period instead of the front of every run's budget.
+REPAIR_BACKOFF_BASE_S = 3600
+REPAIR_BACKOFF_MAX_S = 7 * 24 * 3600
 
 
 class WorkspaceError(Exception):
@@ -221,7 +229,7 @@ def _prepare_repo_locked(rec, tid, path, repo_dir, name, url, branch, root):
         # lock is held, cleanup.lock is taken second); a running cleanup does the same repair itself.
         try:
             with _cleanup_lock(root, timeout=0):
-                fixed = repair_registry(root, repo_dir=repo_dir)
+                fixed = repair_registry(root, repo_dir=repo_dir, deadline=time.monotonic() + CLEANUP_LOCK_WAIT_S)
             if fixed["errors"]:
                 rec["registry_errors"] = fixed["errors"]
         except CleanupBusyError:
@@ -674,9 +682,11 @@ def protect_clone(repo_dir: str) -> None:
     """Set gc.worktreePruneExpire=never in the clone's own config, so no gc (the auto-gc a fetch starts included) ever
     prunes a worktree admin dir whose path is missing. Idempotent: written only when the local value differs.
 
-    Nothing else is needed: with every admin dir kept, gc treats each worktree's HEAD, index and reflogs as roots, so
-    an unpublished commit on a held worktree's detached HEAD stays reachable whatever gc.pruneExpire and
-    gc.reflogExpireUnreachable say (those only expire objects and reflog entries that nothing references)."""
+    Nothing else is needed: with every admin dir kept, gc treats each worktree's HEAD and index as roots, so an
+    unpublished commit on a held worktree's HEAD (or staged in its index) stays reachable whatever gc.pruneExpire
+    says. Its reflog is NOT a permanent root: a commit reachable only from expired reflog entries (committed, then
+    reset away) is lost to git's normal reflog expiry (gc.reflogExpire*), as in any repository. That is acceptable
+    because held work's commits are on its HEAD."""
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     try:
         have = subprocess.run([GIT, "config", "--local", "--get", "gc.worktreePruneExpire"], cwd=repo_dir,
@@ -737,10 +747,47 @@ def _registry_names(path: str, admin: str) -> bool:
     return recorded is not None and _same_path(recorded, os.path.join(path, ".git"))
 
 
+class RegistryConflictError(WorkspaceError):
+    """A worktree's .git file names an admin dir that another existing worktree validly owns (its `gitdir` backlink
+    names that worktree, whose own .git file names the admin dir back). Repairing would hand the owner's admin dir
+    (HEAD, index, reflogs) to the impostor, and a later deletion of the impostor would delete it (#93 round 3)."""
+
+
+def _gitfile_admin(worktree: str):
+    """The admin dir a worktree's .git file names (no-follow read), or None."""
+    text = _read_small(os.path.join(worktree, ".git"))
+    return None if text is None else _parse_gitfile(text, worktree)
+
+
+def _valid_owner(admin: str, path: str):
+    """The worktree, other than `path`, that validly owns `admin`: the admin dir's `gitdir` names it and its own .git
+    file names the admin dir back. None when the backlink names `path`, is missing, or no longer points back."""
+    text = _read_small(os.path.join(admin, "gitdir"))
+    recorded = None if text is None else _parse_gitfile(text, admin)
+    if recorded is None or _same_path(recorded, os.path.join(path, ".git")):
+        return None
+    owner = os.path.dirname(recorded)
+    back = _gitfile_admin(owner)
+    if back is not None and _same_path(back, admin):
+        return owner
+    return None
+
+
 def _repair_worktree(path: str, repo_dir: str) -> None:
     """Point the clone's registry at a worktree's current path, and check that it does. Local and fast; it gets its own
     fixed cap, never the cleanup budget. Raises WorkspaceError (GitTimeoutError included) when it did not succeed.
-    Even then nothing is lost: the entry is only stale, and the next repair_registry() run tries again."""
+    Even then nothing is lost: the entry is only stale, and the next repair_registry() run tries again.
+
+    Raises RegistryConflictError, and runs nothing, when the admin dir is validly owned by another existing worktree:
+    only a backlink whose target is missing or no longer points back is ever rewritten."""
+    admin = _gitfile_admin(path)
+    if admin is not None:
+        owner = _valid_owner(admin, path)
+        if owner is not None:
+            raise RegistryConflictError(
+                f"{path}/.git names the admin dir {admin}, which belongs to the existing worktree {owner} (its "
+                f"backlink names {owner} and {owner}/.git names it back); not repaired, nothing touched: {path}'s .git "
+                "file is wrong and needs the owner's attention")
     _git(["worktree", "repair", "--", path], cwd=repo_dir, timeout=GIT_TIMEOUT_S)
     text = _read_small(os.path.join(path, ".git"))
     admin = None if text is None else _parse_gitfile(text, path)
@@ -748,13 +795,28 @@ def _repair_worktree(path: str, repo_dir: str) -> None:
         raise WorkspaceError(f"`git worktree repair` ran but the registry still does not name {path}")
 
 
-def repair_registry(root: str, repo_dir=None) -> dict:
+def _repair_backoff(failures: int) -> float:
+    """Seconds before an entry whose repair failed `failures` times in a row is tried again."""
+    return min(REPAIR_BACKOFF_BASE_S * 2 ** max(0, failures - 1), REPAIR_BACKOFF_MAX_S)
+
+
+def repair_registry(root: str, repo_dir=None, deadline=None, now=None) -> dict:
     """Repair the registry entry of every worktree under active/, archive/ or held/ (of `repo_dir` only, when given)
-    whose admin dir names another path: a move whose repair failed or never ran. Clears `repair_error` from the
-    index record once the entry is right. Each repair has its own fixed cap. Returns {"repaired": [...],
-    "errors": [...]}; an error is loud but not destructive (the entry stays stale until a later run)."""
-    out = {"repaired": [], "errors": []}
-    index = None
+    whose admin dir names another path: a move whose repair failed or never ran. Returns {"repaired": [...],
+    "errors": [...], "skipped": [...]}; an error is loud but not destructive (the entry stays stale until a later run).
+
+    Never steals an admin dir: an entry whose admin dir another existing worktree validly owns is not repaired; it is
+    an error naming both paths, recorded as `registry_conflict` in its index record (RegistryConflictError).
+
+    Bounded (#93 round 3): `deadline` (time.monotonic()) is checked before each repair, and a repair, once started,
+    keeps its own fixed cap; entries not reached are `skipped` (not an error; the next run reaches them). Each entry is
+    tried at most once per run. A failed repair is recorded in its index record (`repair_failures`, `repair_next_at`,
+    exponential backoff), entries in backoff are skipped until then, and the entries with the fewest failures go
+    first, so one entry that always hangs cannot take every run's budget. Success clears all of these fields."""
+    now = time.time() if now is None else now
+    out = {"repaired": [], "errors": [], "skipped": []}
+    index = read_index(root)
+    todo = []
     for sub in ("active", "archive", "held"):
         layout = os.path.join(root, sub)
         try:
@@ -772,38 +834,88 @@ def repair_registry(root: str, repo_dir=None) -> dict:
                     continue
             except OSError:
                 continue
-            text = _read_small(os.path.join(path, ".git"))
-            admin = None if text is None else _parse_gitfile(text, path)
+            admin = _gitfile_admin(path)
             clone = None if admin is None else _clone_of_admin(admin, root)
             if clone is None or (repo_dir is not None and not _same_path(clone, repo_dir)):
                 continue                         # a plain folder, a nested repo, or another clone's worktree
-            if not _registry_names(path, admin):
-                if not os.path.isdir(admin):
-                    out["errors"].append(f"{name}: {path} names the admin dir {admin}, which does not exist; "
-                                         "its registry entry cannot be repaired")
-                    continue
-                try:
-                    _repair_worktree(path, clone)
-                except WorkspaceError as exc:
-                    out["errors"].append(f"{name}: the registry of {clone} does not name {path} and could not be "
-                                         f"repaired ({exc}); not destructive, retried next run")
-                    continue
-                out["repaired"].append(path)
-            if index is None:
-                index = read_index(root)
             rec = index.get(name)
-            if isinstance(rec, dict) and "repair_error" in rec and rec.get("path") == path:
-                update_index(root, {**{k: v for k, v in rec.items() if k != "repair_error"},
-                                    "repaired_at": time.time()})
+            rec = rec if isinstance(rec, dict) and rec.get("path") == path else None
+            if _registry_names(path, admin):
+                if rec is not None and any(k in rec for k in _REPAIR_FIELDS):
+                    update_index(root, {**{k: v for k, v in rec.items() if k not in _REPAIR_FIELDS},
+                                        "repaired_at": now})
+                continue
+            failures = rec.get("repair_failures", 0) if rec is not None else 0
+            failures = failures if isinstance(failures, int) else 0
+            # unindexed entries (no backoff can be recorded for them) go last
+            todo.append((rec is None, failures, sub, name, path, admin, clone, rec))
+    todo.sort(key=lambda t: t[:4])
+    for _, failures, sub, name, path, admin, clone, rec in todo:
+        next_at = rec.get("repair_next_at") if rec is not None else None
+        if isinstance(next_at, (int, float)) and next_at > now:
+            out["skipped"].append(f"{name}: registry repair of {path} backing off after {failures} failure(s) until "
+                                  f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(next_at))}")
+            continue
+        if not os.path.isdir(admin):
+            out["errors"].append(f"{name}: {path} names the admin dir {admin}, which does not exist; "
+                                 "its registry entry cannot be repaired")
+            continue
+        if deadline is not None and time.monotonic() >= deadline:
+            out["skipped"].append(f"{name}: registry repair of {path} not started: no budget left this run")
+            continue
+        try:
+            _repair_worktree(path, clone)
+        except RegistryConflictError as exc:
+            out["errors"].append(f"{name}: {exc}")
+            if rec is not None:
+                update_index(root, {**rec, "registry_conflict": str(exc)})
+            continue
+        except WorkspaceError as exc:
+            failures += 1
+            wait = _repair_backoff(failures)
+            out["errors"].append(f"{name}: the registry of {clone} does not name {path} and could not be repaired "
+                                 f"({exc}); not destructive, retried in {wait:g} s or later")
+            if rec is not None:
+                update_index(root, {**rec, "repair_failures": failures, "repair_next_at": now + wait,
+                                    "repair_error": f"registry repair failed ({exc}); stale, not destructive"})
+            continue
+        out["repaired"].append(path)
+        if rec is not None:
+            update_index(root, {**{k: v for k, v in rec.items() if k not in _REPAIR_FIELDS}, "repaired_at": now})
     return out
+
+
+_REPAIR_FIELDS = ("repair_error", "repair_failures", "repair_next_at", "registry_conflict")
+
+
+def _other_referrer(admin: str, path: str, repo_dir: str, root: str):
+    """Another existing worktree whose .git file names `admin`: any entry of active/, archive/ or held/ other than
+    `path`, or the clone itself. None when there is none."""
+    candidates = [repo_dir]
+    for sub in ("active", "archive", "held"):
+        layout = os.path.join(root, sub)
+        try:
+            if stat.S_ISDIR(os.lstat(layout).st_mode):
+                candidates += [os.path.join(layout, n) for n in sorted(os.listdir(layout))]
+        except OSError:
+            continue
+    for cand in candidates:
+        if _same_path(cand, path):
+            continue
+        named = _gitfile_admin(cand)
+        if named is not None and _same_path(named, admin):
+            return cand
+    return None
 
 
 class _AdminDir:
     """The admin dir of exactly one worktree, opened through no-follow descriptors before the worktree is deleted:
-    resolved from the worktree's own .git file, required to sit in <repo_dir>/.git/worktrees/ and to name the
-    worktree's path in its `gitdir` file. Raises WorkspaceError otherwise (the caller then deletes nothing)."""
+    resolved from the worktree's own .git file, required to sit in <repo_dir>/.git/worktrees/, to name the
+    worktree's path in its `gitdir` file, and to be named by no other existing worktree's .git file (under active/,
+    archive/ or held/, or the clone's own top level). Raises WorkspaceError otherwise (the caller then deletes nothing):
+    a backlink alone is not proof of ownership, since a wrong repair could have rewritten it (#93 round 3)."""
 
-    def __init__(self, entry_fd: int, path: str, repo_dir: str):
+    def __init__(self, entry_fd: int, path: str, repo_dir: str, root: str):
         self.fds = []
         try:
             text = _read_small(".git", dir_fd=entry_fd)
@@ -827,6 +939,10 @@ class _AdminDir:
             recorded = None if recorded is None else _parse_gitfile(recorded, admin)
             if recorded is None or not _same_path(recorded, os.path.join(path, ".git")):
                 raise WorkspaceError(f"the admin dir {admin} names {recorded}, not {path}; it is left alone")
+            other = _other_referrer(admin, path, repo_dir, root)
+            if other is not None:
+                raise WorkspaceError(f"the admin dir {admin} is also named by the existing worktree {other}'s .git "
+                                     f"file; neither {path} nor the admin dir is deleted")
         except BaseException:
             self.close()
             raise
@@ -946,8 +1062,9 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
                             max_seconds=CLEANUP_MAX_SECONDS) -> dict:
     """Delete old recorded archive entries through no-follow directory descriptors.
 
-    First, for every clone: gc.worktreePruneExpire=never; then the registry is repaired for every worktree under
-    active/, archive/ and held/ (repair_registry), and deferred settles are completed. Repository worktrees are
+    First, for every clone: gc.worktreePruneExpire=never; then deferred settles are completed, then the registry is
+    repaired for every worktree under active/, archive/ and held/ (repair_registry: bounded by the same deadline,
+    with a per-entry backoff, and never for an admin dir another worktree validly owns). Repository worktrees are
     reassessed immediately before deletion. Any change, stale remote, or assessment failure moves the workspace to
     held/. An assessment that does not finish in time (a hung fetch, or no budget left) is not a failure but an
     unknown: the entry is left exactly as it is, counted in `kept` and named in `timed_out`, and tried again by a
@@ -956,8 +1073,9 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
 
     `max_seconds` is a whole-run deadline: checked between entries, and given to every git call an entry makes as
     its subprocess timeout (min of the call's own cap and the time left), so the run — and the cleanup lock it holds,
-    which a task start or settle may be waiting for — ends within the budget plus a few local commands. Registry
-    repairs are never cut short by it: each has its own fixed cap.
+    which a task start or settle may be waiting for — ends within the budget plus a few local commands. A registry
+    repair is not started past it (named in `timed_out`), but one that has started is not cut short: it has its own
+    fixed cap.
     """
     started = time.monotonic()
     deadline = None if max_seconds is None else started + max_seconds
@@ -965,10 +1083,14 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
     archive = os.path.join(root, "archive")
     out = {"deleted": [], "kept": 0, "refused": [], "errors": [], "timed_out": [], "repaired": [], "settled": []}
     unprotected = _protect_clones(root, out)
-    fixed = repair_registry(root)
+    # Deferred settles first (#93 round 3): a run whose registry repairs are slow must not starve them. Each move
+    # repairs its own entry; the prepass then repairs what is left, under the same deadline (each repair started
+    # keeps its fixed cap), before anything in archive/ is assessed or deleted.
+    _settle_deferred(root, out, deadline, unprotected)
+    fixed = repair_registry(root, deadline=deadline)      # backoff runs on the real clock, not the age test's `now`
     out["repaired"].extend(fixed["repaired"])
     out["errors"].extend(fixed["errors"])
-    _settle_deferred(root, out, deadline, unprotected)
+    out["timed_out"].extend(fixed["skipped"])
     try:
         archive_fd = _open_dir(archive)
     except OSError as exc:
@@ -1039,7 +1161,7 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
                         raise WorkspaceError("its record names no clone; refusing deletion")
                     # Resolved and checked before anything is deleted: a worktree whose admin dir cannot be proven
                     # its own is not deleted at all.
-                    admin = _AdminDir(entry_fd, path, rec["repo_dir"])
+                    admin = _AdminDir(entry_fd, path, rec["repo_dir"], root)
                 _remove_tree_fd(entry_fd)
                 os.close(entry_fd)
                 entry_fd = None
