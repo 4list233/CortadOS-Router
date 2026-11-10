@@ -2506,7 +2506,11 @@ class ChildTaskTests(ChildTaskBase):
             ct.status(bad_res)
         self.call("wait_task", task_id=out["task_id"], timeout_s=30)
 
-    def test_unreadable_record_is_pruned_only_past_the_prune_age_and_unlocked(self):
+    def test_unreadable_record_is_never_pruned_whatever_its_age_or_lock(self):
+        """#94 review: a runner can die leaving its child alive, with the lock free and the dir mtime old (appending
+        to logs does not refresh it). A corrupt meta.json hides the child's pid, so prune must not delete the dir on
+        age alone: that would lose the records _recover()/cancel need to stop the child. Every unreadable record is
+        kept and reported, by id, file and type only."""
         root = ct._private_root()
         old, locked, fresh = "t20200101000000-000000e1", "t20200101000000-000000e2", "t20200101000000-000000e3"
         for tid in (old, locked, fresh):
@@ -2522,10 +2526,40 @@ class ChildTaskTests(ChildTaskBase):
             os.utime(os.path.join(root, tid), (ancient, ancient))
         errors = []
         removed = ct.prune(root, errors=errors)
-        self.assertEqual(removed, [old])                   # unchanged for two weeks and no runner: the normal rule
-        self.assertEqual(sorted(os.listdir(root)), [locked, fresh])     # a held lock or a fresh dir: kept
+        self.assertEqual(removed, [])                      # ancient and unlocked included: never deleted on a guess
+        self.assertEqual(sorted(os.listdir(root)), sorted([old, locked, fresh]))   # all three kept
         self.assertEqual(sorted(e.split(":")[0] for e in errors), sorted(f"task {t}" for t in (old, locked, fresh)))
-        self.assertTrue(all("(JSONDecodeError)" in e for e in errors), errors)
+        self.assertTrue(all("meta.json is unreadable (JSONDecodeError)" in e for e in errors), errors)
+        self.assertFalse(any("garbage" in e for e in errors), errors)
+        logged = [e for e in _events() if e["event"] == "record_unreadable"]
+        self.assertEqual(sorted(e["task_id"] for e in logged), sorted([old, locked, fresh]))
+        self.assertTrue(all(e["file"] == "meta.json" and e["error"] == "JSONDecodeError" for e in logged), logged)
+        self.assertFalse(any("garbage" in json.dumps(e) for e in logged), logged)
+        # the record stays visible: list_tasks keeps its `unreadable` row
+        _, out = self.call("list_tasks")
+        by = {t["task_id"]: t for t in out["tasks"]}
+        for tid in (old, locked, fresh):
+            self.assertEqual(by[tid]["state"], "unreadable", by.get(tid))
+
+    def test_finished_launchd_task_with_corrupt_launchd_json_is_kept_and_reported(self):
+        """A readable, long-finished meta.json whose launchd.json is corrupt: the bootout cannot be recorded, so prune
+        keeps the dir and reports it instead of letting RecordError out (which would block start_task again)."""
+        root = ct._private_root()
+        tid = "t20200101000000-000000e4"
+        d = os.path.join(root, tid)
+        os.mkdir(d, 0o700)
+        ancient = time.time() - ct.PRUNE_AGE_S - 3600
+        ct._write_json(os.path.join(d, "meta.json"), {"task_id": tid, "launch": "launchd", "started_at": ancient,
+                                                       "state": "succeeded"})
+        ct._write_json(os.path.join(d, "result.json"), {"state": "succeeded", "exit_code": 0, "finished_at": ancient})
+        with open(os.path.join(d, ct.LAUNCHD_FILE), "w") as f:
+            f.write("{not json")
+        errors = []
+        self.assertEqual(ct.prune(root, errors=errors), [])
+        self.assertTrue(os.path.isdir(d))
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn(f"task {tid}: launchd.json is unreadable (JSONDecodeError)", errors[0])
+        self.assertNotIn("not json", errors[0])
 
     def test_provider_refusal_surfaced_in_status(self):
         os.environ["FAKE_CLAUDE_MODE"] = "too-large"

@@ -556,9 +556,11 @@ def connectors_config() -> str:
 def prune(root: str, now: float | None = None, errors: list | None = None) -> list:
     """Remove task dirs whose task started more than PRUNE_AGE_S ago and is not running. Returns the removed ids. Each
     dir is handled on its own: one that cannot be read or removed is recorded in `errors` and skipped, so it never
-    blocks every later start_task (#94). An unreadable record (RecordError) is never deleted on a guess, it may be a
-    live task's: it stays, logged by id and type, unless nothing in its dir has changed for PRUNE_AGE_S (dir mtime)
-    and no runner holds its lock; then it goes as any finished task of that age would."""
+    blocks every later start_task (#94). An unreadable record (RecordError) is never deleted automatically, whatever
+    its age or lock: a corrupt meta.json means the child's pid cannot be read, so the dir may still belong to a live
+    child whose runner died (a free runner.lock and an old dir mtime prove nothing; appending to logs does not touch
+    the dir's mtime), and removing it would take away the records _recover() / cancel need to stop that child. It
+    stays, reported in `errors` and logged by id, file and type (never content), until a person removes it."""
     cutoff = (time.time() if now is None else now) - PRUNE_AGE_S
     removed = []
     for name in os.listdir(root):
@@ -573,20 +575,14 @@ def prune(root: str, now: float | None = None, errors: list | None = None) -> li
                     errors.append(_note_unreadable(exc))
                 else:
                     _note_unreadable(exc)
-                if os.path.getmtime(d) >= cutoff or _lock_held(d):
-                    continue
-                state, meta, started = "unreadable", {}, 0.0
-            else:
-                started = meta.get("started_at") if state != "remote" else meta.get("created_at")
-                if not isinstance(started, (int, float)):
-                    started = os.path.getmtime(d)
+                continue                        # kept: see the docstring
+            started = meta.get("started_at") if state != "remote" else meta.get("created_at")
+            if not isinstance(started, (int, float)):
+                started = os.path.getmtime(d)
             # A remote stub is only a pointer (the host prunes the task itself): dropped by age alone.
             if state != "running" and started < cutoff:
-                if meta.get("launch") == "launchd" or state == "unreadable":
-                    try:
-                        _launchd_bootout(d)     # idempotent; "not a launchd task" when there is no launchd.json
-                    except RecordError:
-                        pass                    # launchd.json unreadable too: the dir still goes
+                if meta.get("launch") == "launchd":
+                    _launchd_bootout(d)         # idempotent; a corrupt launchd.json already raised from _state() above
                 shutil.rmtree(d)
                 removed.append(name)
         except OSError as exc:
