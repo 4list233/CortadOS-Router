@@ -29,8 +29,11 @@ unpublished detached commit reachable) are never pruned globally (#93). `git wor
 missing, and a moved but not yet repaired worktree looks exactly like that, so this module never runs it. Instead:
   - the cleanup removes only the admin dir of the worktree it deletes, resolved from that worktree's own .git file and
     checked to be inside the clone and to name the deleted path, through no-follow descriptors;
-  - every managed clone has gc.worktreePruneExpire=never (set on clone, checked on every prepare, settle and cleanup),
-    so the auto-gc a fetch can start never prunes worktree metadata either;
+  - every managed clone has gc.worktreePruneExpire=never and runs no automatic gc or maintenance at all (gc.auto=0,
+    gc.autoDetach=false, maintenance.auto=false; set on clone, checked on every prepare, settle and cleanup; every fetch
+    also passes -c gc.auto=0 -c maintenance.auto=false). Even with an expiry of never, gc's `git worktree prune` drops
+    every registry entry whose backlink duplicates another's (a registry_conflict leaves exactly that), so no gc may run
+    unasked (#93 round 4). An explicit `git gc` by a person is outside this module: fix a registry_conflict first;
   - every move (settle's, the cleanup's move to held/) is a rename followed by `git worktree repair` of the new path
     under its own fixed cap; a failed repair is recorded (`repair_error`), never rolled back;
   - every cleanup, and every start that finds cleanup.lock free, repairs the registry entry of any worktree under
@@ -95,10 +98,16 @@ class GitTimeoutError(WorkspaceError):
     reported, so callers that act on git's answer must treat this as "unknown", never as "clean" or "not pushed"."""
 
 
+# Every fetch runs with automatic gc and maintenance off, whatever the clone's config says (belt and braces next to
+# protect_clone): a fetch ends with `git maintenance run --auto`, whose gc prunes duplicate worktree entries (#93).
+_FETCH_NO_GC = ("-c", "gc.auto=0", "-c", "maintenance.auto=false")
+
+
 def _git(args, cwd=None, timeout=GIT_TIMEOUT_S) -> str:
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    pre = _FETCH_NO_GC if args and args[0] == "fetch" else ()
     try:
-        p = subprocess.run([GIT, *args], cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
+        p = subprocess.run([GIT, *pre, *args], cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
     except FileNotFoundError:
         raise WorkspaceError("git is not installed or not on PATH on this execution host") from None
     except subprocess.TimeoutExpired:
@@ -546,17 +555,25 @@ def _move_settled(rec: dict, root: str, ok: bool, reason: str) -> dict:
     except (OSError, WorkspaceError) as exc:
         rec["error"] = f"could not move {path} to {dest}: {exc}"
         return rec
-    for key in ("error", "settle_deferred"):
+    for key in ("error", "settle_deferred", *_REPAIR_FIELDS):    # the repair below decides these afresh
         rec.pop(key, None)
     rec.update(state="archived" if ok else "held", path=dest, settled_at=time.time(), reason=reason)
     repo_dir = rec.get("repo_dir")
     if rec.get("kind") == "repo" and isinstance(repo_dir, str) and os.path.isdir(repo_dir):
         try:
             _repair_worktree(dest, repo_dir)
+        except RegistryConflictError as exc:
+            rec["registry_conflict"] = str(exc)
         except WorkspaceError as exc:
             rec["repair_error"] = (f"moved to {dest} but `git worktree repair` failed ({exc}); the clone's registry "
                                    "still names the old path until the next cleanup or start repairs it")
-    if ok and rec.get("kind") == "repo":
+    if ok and rec.get("kind") == "repo" and (rec.get("registry_conflict") or rec.get("repair_error")):
+        # #93 round 4: no git operation through a .git that may name another worktree's admin dir: detaching "this"
+        # HEAD would detach that worktree's, freeing its branch. The branch stays held here until the entry is fixed.
+        rec["detached"] = False
+        rec["detach_error"] = ("HEAD not detached: the registry entry was not repaired after the move, so its .git "
+                               "may name another worktree's admin dir; nothing was run through it")
+    elif ok and rec.get("kind") == "repo":
         # Pushed work: free the branch for the next task (the commit stays checked out, detached). Held work keeps
         # its branch, so a new task cannot start on it while it is unpushed. A failed detach loses nothing: the
         # worktree stays archived and attached, and the reason is recorded here and in index.jsonl.
@@ -595,11 +612,22 @@ def update_index(root: str, rec: dict) -> None:
     """Replace (or add) the task's line, atomically, under index.lock (the runner and a cleanup may write at once)."""
     if not isinstance(rec.get("task_id"), str):
         raise WorkspaceError("an index record needs a task_id")
+
+    def replace(recs):
+        recs[rec["task_id"]] = {k: v for k, v in rec.items() if k != "error"} if "error" not in rec else dict(rec)
+        return True
+    _index_transaction(root, replace)
+
+
+def _index_transaction(root: str, change) -> None:
+    """Read index.jsonl, apply change(recs) (which edits the dict in place and returns whether to write) and write it
+    back, all under index.lock: a read-modify-write no other writer can interleave with."""
     lock = os.open(os.path.join(root, "index.lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
         recs = read_index(root)
-        recs[rec["task_id"]] = {k: v for k, v in rec.items() if k != "error"} if "error" not in rec else dict(rec)
+        if not change(recs):
+            return
         fd, tmp = tempfile.mkstemp(prefix=".index.", suffix=".tmp", dir=root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -678,9 +706,16 @@ def _fd_contains_git_entry(directory_fd: int) -> bool:
 
 # --- worktree registry: protect, repair, remove one entry (never `git worktree prune`) ----------------------------
 
+_PROTECT_CONFIG = (("gc.worktreePruneExpire", "never"), ("gc.auto", "0"), ("gc.autoDetach", "false"),
+                   ("maintenance.auto", "false"))
+
+
 def protect_clone(repo_dir: str) -> None:
-    """Set gc.worktreePruneExpire=never in the clone's own config, so no gc (the auto-gc a fetch starts included) ever
-    prunes a worktree admin dir whose path is missing. Idempotent: written only when the local value differs.
+    """Set gc.worktreePruneExpire=never in the clone's own config, so no gc ever prunes a worktree admin dir whose path
+    is missing, and turn automatic gc and maintenance off (gc.auto=0, gc.autoDetach=false, maintenance.auto=false):
+    gc's worktree prune also drops duplicate registry entries whatever the expiry, so the auto-gc a fetch or commit
+    can start must never run in a managed clone (#93 round 4). Idempotent: each key is written only when its local
+    value differs.
 
     Nothing else is needed: with every admin dir kept, gc treats each worktree's HEAD and index as roots, so an
     unpublished commit on a held worktree's HEAD (or staged in its index) stays reachable whatever gc.pruneExpire
@@ -688,15 +723,16 @@ def protect_clone(repo_dir: str) -> None:
     reset away) is lost to git's normal reflog expiry (gc.reflogExpire*), as in any repository. That is acceptable
     because held work's commits are on its HEAD."""
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    try:
-        have = subprocess.run([GIT, "config", "--local", "--get", "gc.worktreePruneExpire"], cwd=repo_dir,
-                              capture_output=True, text=True, timeout=GIT_TIMEOUT_S, env=env).stdout.strip()
-    except FileNotFoundError:
-        raise WorkspaceError("git is not installed or not on PATH on this execution host") from None
-    except subprocess.TimeoutExpired:
-        raise GitTimeoutError(f"git config did not finish within {GIT_TIMEOUT_S:g} s") from None
-    if have != "never":
-        _git(["config", "--local", "gc.worktreePruneExpire", "never"], cwd=repo_dir)
+    for key, value in _PROTECT_CONFIG:
+        try:
+            have = subprocess.run([GIT, "config", "--local", "--get", key], cwd=repo_dir,
+                                  capture_output=True, text=True, timeout=GIT_TIMEOUT_S, env=env).stdout.strip()
+        except FileNotFoundError:
+            raise WorkspaceError("git is not installed or not on PATH on this execution host") from None
+        except subprocess.TimeoutExpired:
+            raise GitTimeoutError(f"git config did not finish within {GIT_TIMEOUT_S:g} s") from None
+        if have != value:
+            _git(["config", "--local", key, value], cwd=repo_dir)
 
 
 def _same_path(a: str, b: str) -> bool:
@@ -787,7 +823,8 @@ def _repair_worktree(path: str, repo_dir: str) -> None:
             raise RegistryConflictError(
                 f"{path}/.git names the admin dir {admin}, which belongs to the existing worktree {owner} (its "
                 f"backlink names {owner} and {owner}/.git names it back); not repaired, nothing touched: {path}'s .git "
-                "file is wrong and needs the owner's attention")
+                "file is wrong and needs the owner's attention; fix it before anyone runs `git gc` or `git worktree "
+                f"prune` in {repo_dir}, which drop a duplicate registry entry even with gc.worktreePruneExpire=never")
     _git(["worktree", "repair", "--", path], cwd=repo_dir, timeout=GIT_TIMEOUT_S)
     text = _read_small(os.path.join(path, ".git"))
     admin = None if text is None else _parse_gitfile(text, path)
@@ -885,14 +922,19 @@ def repair_registry(root: str, repo_dir=None, deadline=None, now=None) -> dict:
 
 
 def _note_repair(root: str, name: str, path: str, fields: dict, clear: bool = False) -> None:
-    """Write repair bookkeeping into the task's CURRENT index record (re-read now, not the run's snapshot, so a
-    record the runner rewrote meanwhile is not overwritten); skipped when the record no longer names `path`."""
-    rec = read_index(root).get(name)
-    if not isinstance(rec, dict) or rec.get("path") != path:
-        return
-    if clear:
-        rec = {k: v for k, v in rec.items() if k not in _REPAIR_FIELDS}
-    update_index(root, {**rec, **fields})
+    """Merge repair bookkeeping into the task's CURRENT index record in one transaction under index.lock (#93 round
+    4): only the repair fields (and `repaired_at`) are written, so a field the runner wrote meanwhile, such as
+    `settle_deferred`, is never erased. Skipped when the record no longer names `path`."""
+    def merge(recs):
+        rec = recs.get(name)
+        if not isinstance(rec, dict) or rec.get("path") != path:
+            return False
+        if clear:
+            for k in _REPAIR_FIELDS:
+                rec.pop(k, None)
+        rec.update(fields)
+        return True
+    _index_transaction(root, merge)
 
 
 _REPAIR_FIELDS = ("repair_error", "repair_failures", "repair_next_at", "registry_conflict")
@@ -1026,7 +1068,7 @@ def _protect_clones(root: str, out: dict) -> set:
             protect_clone(clone)
         except WorkspaceError as exc:
             unprotected.add(os.path.normpath(clone))
-            out["errors"].append(f"repos/{name}: could not set gc.worktreePruneExpire=never ({exc}); its worktrees "
+            out["errors"].append(f"repos/{name}: could not turn off gc worktree pruning and auto gc ({exc}); its worktrees "
                                  "are left alone this run")
     return unprotected
 
@@ -1064,8 +1106,9 @@ def _settle_deferred(root: str, out: dict, deadline, unprotected: set) -> None:
             out["errors"].append(f"{tid}: deferred settle failed: {done.get('error')}")
             continue
         out["settled"].append(tid)
-        if done.get("repair_error"):
-            out["errors"].append(f"{tid}: {done['repair_error']}")
+        for key in ("repair_error", "registry_conflict"):
+            if done.get(key):
+                out["errors"].append(f"{tid}: {done[key]}")
 
 
 def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELETIONS,

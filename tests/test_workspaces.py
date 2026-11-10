@@ -1243,6 +1243,105 @@ class RegistryOwnershipTests(_Base):
         for k in ("repair_failures", "repair_next_at", "repair_error", "registry_conflict"):
             self.assertNotIn(k, rec)
 
+    def test_duplicate_registry_entry_survives_the_fetch_path_because_no_auto_gc_runs(self):
+        """#93 round 4, P1: A's .git names B's admin dir and B's backlink was rewritten to A. That is a duplicate entry,
+        which gc's `git worktree prune` drops even with gc.worktreePruneExpire=never; a fetch ends with an auto
+        maintenance/gc. Managed clones run no automatic gc, so B's admin dir and unpublished commit survive."""
+        a, b, b_admin, b_head, repo_dir = self.impostor(b_commit=True)
+        with open(os.path.join(b_admin, "gitdir"), "w") as f:
+            f.write(os.path.join(a, ".git") + "\n")
+        dry = subprocess.run(["git", "worktree", "prune", "--dry-run", "--verbose", "--expire", "never"], cwd=repo_dir,
+                             capture_output=True, text=True, env=GIT_ENV)
+        self.assertIn("duplicate entry", dry.stdout + dry.stderr)     # what a gc in this clone would drop
+        # make an auto gc due (several packs, limit 1) and synchronous, as a clone without protection would run it
+        for key in ("gc.auto", "maintenance.auto"):
+            subprocess.run(["git", "config", "--local", "--unset", key], cwd=repo_dir, env=GIT_ENV)
+        git("config", "--local", "gc.autoPackLimit", "1", cwd=repo_dir)
+        git("config", "--local", "gc.autoDetach", "false", cwd=repo_dir)
+        for i in range(3):                                     # one extra pack each
+            sha = subprocess.run(["git", "hash-object", "-w", "--stdin"], input=f"blob {i} {time.time()}",
+                                 cwd=repo_dir, check=True, capture_output=True, text=True, env=GIT_ENV).stdout
+            subprocess.run(["git", "pack-objects", "-q", os.path.join(repo_dir, ".git", "objects", "pack", "pack")],
+                           input=sha, cwd=repo_dir, check=True, capture_output=True, text=True, env=GIT_ENV)
+        seed = os.path.join(self.tmp, "seed2")
+        git("clone", "-q", "-b", "main", self.origin, seed)
+        with open(os.path.join(seed, "new.txt"), "w") as f:
+            f.write("new\n")
+        git("add", ".", cwd=seed)
+        git("commit", "-q", "-m", "new", cwd=seed)
+        git("push", "-q", "origin", "HEAD:main", cwd=seed)
+        calls, real_git = [], ws._git
+
+        def recording_git(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+            calls.append(list(args))
+            return real_git(args, cwd=cwd, timeout=timeout)
+
+        log = os.path.join(self.tmp, "git.log")
+        wrapper = os.path.join(self.tmp, "git-logging")
+        with open(wrapper, "w") as f:
+            f.write(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{log}"\nexec git "$@"\n')
+        os.chmod(wrapper, 0o755)
+        with mock.patch.object(ws, "_git", side_effect=recording_git), mock.patch.object(ws, "GIT", wrapper):
+            started = self.prepare(TID3, repo="demo")          # protect, registry prepass, fetch
+        self.assertTrue(any(c[0] == "fetch" for c in calls))
+        with open(log) as f:
+            fetches = [line for line in f.read().splitlines() if " fetch " in f" {line} "]
+        self.assertTrue(fetches)
+        for line in fetches:
+            self.assertTrue(line.startswith("-c gc.auto=0 -c maintenance.auto=false fetch"), line)
+        for key, value in (("gc.auto", "0"), ("gc.autoDetach", "false"), ("maintenance.auto", "false"),
+                           ("gc.worktreePruneExpire", "never")):
+            self.assertEqual(git("config", "--local", "--get", key, cwd=repo_dir).strip(), value)
+        self.assertTrue(os.path.isdir(b_admin))
+        git("cat-file", "-e", b_head + "^{commit}", cwd=repo_dir)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=b).strip(), b_head)
+        conflict = [e for e in started.get("registry_errors", []) if "belongs to" in e]
+        self.assertTrue(conflict, started)
+        self.assertIn("git gc", conflict[0])                   # the error says what not to run until it is fixed
+
+    def test_repair_bookkeeping_never_erases_a_concurrent_runner_write(self):
+        """#93 round 4, P2-a: the runner writes settle_deferred while repair_registry clears stale repair fields; the
+        repair's write is a merge under index.lock, so the runner's field survives whatever the interleaving."""
+        rec = self.prepare(TID, repo=self.origin)
+        ws.update_index(self.root, {**rec, "repair_error": "stale"})
+        real_read, calls, runner = ws.read_index, [0], []
+
+        def runner_write():
+            ws.update_index(self.root, {**rec, "repair_error": "stale", "settle_deferred": True,
+                                        "error": "not settled yet"})
+
+        def interleaving_read(root):
+            calls[0] += 1
+            out = real_read(root)
+            if calls[0] == 2 and not runner:                   # the repair's re-read of the record, then the runner
+                t = threading.Thread(target=runner_write)
+                runner.append(t)
+                t.start()
+                t.join(0.5)                                    # done here unless index.lock blocks it
+            return out
+
+        with mock.patch.object(ws, "read_index", side_effect=interleaving_read):
+            ws.repair_registry(self.root)
+        runner[0].join(10)
+        self.assertFalse(runner[0].is_alive())
+        self.assertTrue(ws.read_index(self.root)[TID].get("settle_deferred"))
+
+    def test_settle_with_a_registry_conflict_never_detaches_the_owner_head(self):
+        """#93 round 4, P2-b: active A's .git names clean active B's admin dir. Settling A moves it and records the
+        conflict, but runs nothing through A's .git: B keeps its branch."""
+        a = self.prepare(TID, repo=self.origin)
+        b = self.prepare(TID2, repo="demo")["path"]
+        shutil.copyfile(os.path.join(b, ".git"), os.path.join(a["path"], ".git"))
+        b_branch = git("symbolic-ref", "HEAD", cwd=b).strip()
+        b_head = git("rev-parse", "HEAD", cwd=b).strip()
+        settled = ws.settle(a, self.root)
+        self.assertEqual(settled["state"], "archived")
+        self.assertIs(settled["detached"], False)
+        self.assertIn("belongs to", settled["registry_conflict"])
+        self.assertIn("detach_error", settled)
+        self.assertEqual(git("symbolic-ref", "HEAD", cwd=b).strip(), b_branch)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=b).strip(), b_head)
+
     def test_backoff_grows_and_is_capped(self):
         self.assertEqual(ws._repair_backoff(1), ws.REPAIR_BACKOFF_BASE_S)
         self.assertEqual(ws._repair_backoff(2), 2 * ws.REPAIR_BACKOFF_BASE_S)
