@@ -265,7 +265,11 @@ class InstalledClaudeTests(unittest.TestCase):
         self.assertIn("--permission-prompts", out)
 
 
-class ChildTaskTests(unittest.TestCase):
+class ChildTaskBase(unittest.TestCase):
+    """Fixtures shared by the child-task suites (this file and tests/test_task_watch.py): a fake claude binary, a
+    throwaway tasks dir / CORTADOS_HOME / hosts file, a local host 'here' and (via _air) a remote host 'air' whose
+    ssh is replaced by a subprocess transport. No test class here: only subclasses define tests."""
+
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp())   # macOS /var is a symlink; the private-dir check refuses symlinks
         self.work = os.path.join(self.tmp, "work")
@@ -330,7 +334,10 @@ class ChildTaskTests(unittest.TestCase):
             if proc.poll() is None:
                 try:
                     os.killpg(proc.pid, 15)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
+                    # PermissionError: on macOS killpg on a group whose only member is an unreaped zombie is EPERM, as
+                    # ct._killpg knows; a fast child (FAKE_CLAUDE_MODE=fail) exits between poll() and the kill. Seen
+                    # as a one-in-several-runs error in test_unwatchable_outranks_a_failed_sibling (#87 round 2).
                     pass
                 proc.wait()
         ct._REAP.clear()
@@ -349,6 +356,43 @@ class ChildTaskTests(unittest.TestCase):
         self.assertFalse(r.get("isError"), r)
         return out["task_id"]
 
+    def _air(self, transport=None):
+        """Configure host 'air' as another machine. Its side (HOME, tasks dir, state, hosts file, token, provider URL)
+        lives under tmp/air; the transport runs `child_tasks.py --remote` there instead of ssh."""
+        self.air_home = os.path.join(self.tmp, "air")
+        os.makedirs(os.path.join(self.air_home, ".config", "cortados"), mode=0o700)
+        os.chmod(self.air_home, 0o700)
+        with open(os.path.join(self.air_home, ".config", "cortados", "provider-token"), "w") as f:
+            f.write("tok-air-0000000001")
+        self.air_root = os.path.join(self.air_home, "CortadOS")
+        os.mkdir(self.air_root)
+        air_hosts = os.path.join(self.air_home, "exec-hosts.json")
+        entry = {"ssh": "air-fake", "router": str(ct.REPO_ROOT), "python": sys.executable, "root": self.air_root,
+                 "claude": os.environ["CORTADOS_CHILD_CLAUDE_BIN"], "provider_url": "http://127.0.0.1:9",
+                 "path": os.environ["PATH"]}
+        with open(air_hosts, "w") as f:      # the Air's own file: its entry names this machine, so it is local THERE
+            json.dump({"default": "air", "hosts": {"air": {**entry, "hostnames": [ct.exec_hosts.short_hostname()]}}}, f)
+        # this machine's file: the Air is another machine
+        self.write_hosts({"default": "air", "hosts": {"air": {**entry, "hostnames": ["not-this-machine"]},
+                                                      "here": {"root": self.ws_root}}})
+        self.transport_calls = []
+
+        def run_remote(argv, stdin, timeout):
+            self.transport_calls.append(argv)
+            self.assertEqual(argv[0], "ssh")
+            self.assertEqual(argv[argv.index("--") + 1], "air-fake")
+            env = {**os.environ, "HOME": self.air_home, "CORTADOS_TASKS_DIR": os.path.join(self.air_home, "tasks"),
+                   "CORTADOS_HOME": os.path.join(self.air_home, "state"), "CORTADOS_EXEC_HOSTS_FILE": air_hosts,
+                   "CORTADOS_PROVIDER_TOKEN": "", "CORTADOS_PROVIDER_TOKEN_FILE": "", "CORTADOS_PROVIDER_URL": ""}
+            p = subprocess.run([sys.executable, "-B", str(Path(ct.__file__)), "--remote"], input=stdin,
+                               capture_output=True, env=env, timeout=timeout)
+            return p.returncode, p.stdout, p.stderr
+        t = mock.patch.object(ct.exec_hosts, "TRANSPORT", transport or run_remote)
+        t.start()
+        self.addCleanup(t.stop)
+
+
+class ChildTaskTests(ChildTaskBase):
     def test_tools_list_includes_child_tools(self):
         r = m.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, self.cfg)
         names = [t["name"] for t in r["result"]["tools"]]
@@ -768,47 +812,15 @@ class ChildTaskTests(unittest.TestCase):
 
     # -- a second machine, reached through a fake transport that runs this module's --remote mode in a subprocess --
 
-    def _air(self, transport=None):
-        """Configure host 'air' as another machine. Its side (HOME, tasks dir, state, hosts file, token, provider URL)
-        lives under tmp/air; the transport runs `child_tasks.py --remote` there instead of ssh."""
-        self.air_home = os.path.join(self.tmp, "air")
-        os.makedirs(os.path.join(self.air_home, ".config", "cortados"), mode=0o700)
-        os.chmod(self.air_home, 0o700)
-        with open(os.path.join(self.air_home, ".config", "cortados", "provider-token"), "w") as f:
-            f.write("tok-air-0000000001")
-        self.air_root = os.path.join(self.air_home, "CortadOS")
-        os.mkdir(self.air_root)
-        air_hosts = os.path.join(self.air_home, "exec-hosts.json")
-        entry = {"ssh": "air-fake", "router": str(ct.REPO_ROOT), "python": sys.executable, "root": self.air_root,
-                 "claude": os.environ["CORTADOS_CHILD_CLAUDE_BIN"], "provider_url": "http://127.0.0.1:9",
-                 "path": os.environ["PATH"]}
-        with open(air_hosts, "w") as f:      # the Air's own file: its entry names this machine, so it is local THERE
-            json.dump({"default": "air", "hosts": {"air": {**entry, "hostnames": [ct.exec_hosts.short_hostname()]}}}, f)
-        # this machine's file: the Air is another machine
-        self.write_hosts({"default": "air", "hosts": {"air": {**entry, "hostnames": ["not-this-machine"]},
-                                                      "here": {"root": self.ws_root}}})
-        self.transport_calls = []
-
-        def run_remote(argv, stdin, timeout):
-            self.transport_calls.append(argv)
-            self.assertEqual(argv[0], "ssh")
-            self.assertEqual(argv[argv.index("--") + 1], "air-fake")
-            env = {**os.environ, "HOME": self.air_home, "CORTADOS_TASKS_DIR": os.path.join(self.air_home, "tasks"),
-                   "CORTADOS_HOME": os.path.join(self.air_home, "state"), "CORTADOS_EXEC_HOSTS_FILE": air_hosts,
-                   "CORTADOS_PROVIDER_TOKEN": "", "CORTADOS_PROVIDER_TOKEN_FILE": "", "CORTADOS_PROVIDER_URL": ""}
-            p = subprocess.run([sys.executable, "-B", str(Path(ct.__file__)), "--remote"], input=stdin,
-                               capture_output=True, env=env, timeout=timeout)
-            return p.returncode, p.stdout, p.stderr
-        t = mock.patch.object(ct.exec_hosts, "TRANSPORT", transport or run_remote)
-        t.start()
-        self.addCleanup(t.stop)
-
     def test_remote_start_status_wait_list_cancel_through_the_fake_transport(self):
         self._air()
         r, out = self.call("start_task", task="hello", title="remote one")
         self.assertFalse(r.get("isError"), r)
         tid = out["task_id"]
         self.assertEqual(out["host"], "air")
+        # the watch command is for THIS machine (its python and checkout), not the Air's
+        self.assertIn(f"--watch {tid}", out["watch_command"])
+        self.assertIn(str(Path(ct.__file__).resolve()), out["watch_command"])
         self.assertEqual(out["workspace"]["path"], os.path.join(self.air_root, "active", tid))
         # a stub here, the task there
         self.assertEqual(_load(os.path.join(ct.task_path(tid), ct.REMOTE_STUB))["host"], "air")
