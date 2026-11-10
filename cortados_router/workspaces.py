@@ -2,8 +2,10 @@
 
   <root>/repos/<name>      one clone per repository; every task worktree branches from it
   <root>/active/<task_id>  the task's working folder while it runs: a git worktree, or a plain folder (no repo)
-  <root>/archive/<task_id> finished and pushed (or no repository): deleted by cleanup_archive() after ARCHIVE_AGE_S
-  <root>/held/<task_id>    finished with unpushed work: never deleted automatically, listed for the owner
+  <root>/archive/<task_id> finished and pushed (or no repository): HEAD detached at its commit so the branch is free
+                           for the next task; deleted by cleanup_archive() after ARCHIVE_AGE_S
+  <root>/held/<task_id>    finished with unpushed work: keeps its branch checked out (a new task on that branch is
+                           refused); never deleted automatically, listed for the owner
   <root>/index.jsonl       one line per task (rewritten in place under index.lock, never appended twice for a task)
 
 Only archive/ is ever deleted from, only entries named like a task id, only regular directories directly inside it
@@ -165,12 +167,19 @@ def _prepare_repo_locked(rec, tid, path, repo_dir, name, url, branch, root):
     if not _ref_exists(repo_dir, "refs/remotes/origin/HEAD"):
         _git(["remote", "set-head", "origin", "--auto"], cwd=repo_dir, timeout=FETCH_TIMEOUT_S)
     taken = _worktree_branches(repo_dir)
+    if branch is not None and branch in taken:
+        if _settled_under(taken[branch], root) == "archive":
+            # Releasing a legacy archived worktree must not interleave with the archive cleanup's reassess-then-delete
+            # section: take its lock, then look again (cleanup may have deleted and pruned the holder meanwhile).
+            with _cleanup_lock(root):
+                taken = _worktree_branches(repo_dir)
+                if branch in taken:
+                    _release_branch(rec, taken[branch], branch, repo_dir, root)
+        else:
+            _release_branch(rec, taken[branch], branch, repo_dir, root)
     if branch is None:
         branch = TASK_BRANCH_PREFIX + tid
         _git(["worktree", "add", "-b", branch, "--", path, "origin/HEAD"], cwd=repo_dir)
-    elif branch in taken:
-        raise WorkspaceError(f"branch {branch!r} is checked out by another worktree ({taken[branch]}); wait for that "
-                             "task or name another branch")
     elif _ref_exists(repo_dir, "refs/heads/" + branch):
         if _ref_exists(repo_dir, "refs/remotes/origin/" + branch):
             counts = _git(["rev-list", "--left-right", "--count",
@@ -193,6 +202,146 @@ def _prepare_repo_locked(rec, tid, path, repo_dir, name, url, branch, root):
     rec.update(repo=name, url=url or _git(["remote", "get-url", "origin"], cwd=repo_dir).strip(),
                repo_dir=repo_dir, branch=branch)
     return rec
+
+
+def _release_branch(rec, holder, branch, repo_dir, root):
+    """`branch` is checked out at `holder`: refuse, unless holder is a legacy archived worktree that can be detached
+    without losing anything (then record it as freed). An archived holder is only released under the cleanup lock."""
+    where = _settled_under(holder, root)
+    if where == "held":
+        raise WorkspaceError(f"branch {branch!r} is checked out by a held worktree with unpushed work ({holder}); "
+                             "publish or recover that work there first, or name another branch")
+    if where != "archive":
+        raise WorkspaceError(f"branch {branch!r} is checked out by another worktree ({holder}); wait for that "
+                             "task or name another branch")
+    why = _free_archived_branch(holder, branch, repo_dir, root)
+    if why:
+        raise WorkspaceError(f"branch {branch!r} is checked out by another worktree ({holder}); it is under "
+                             f"archive/ but was not detached: {why}")
+    rec["freed_from_archive"] = holder
+
+
+class _cleanup_lock:
+    """<root>/cleanup.lock, held by cleanup_archive() from reassessment through deletion and by a start that releases
+    a legacy archived worktree, so neither can act on an entry the other is examining or has just changed."""
+
+    def __init__(self, root: str):
+        self.root = root
+        self.fd = None
+
+    def __enter__(self):
+        self.fd = os.open(os.path.join(self.root, "cleanup.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(self.fd)
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.fd)       # closing the only descriptor releases the flock
+        return False
+
+
+def _settled_under(path: str, root: str):
+    """'archive' or 'held' when path is lexically a direct entry of <root>/archive or <root>/held, else None.
+
+    The layout directories must be real directories: with archive -> active, a still-running worktree would otherwise
+    resolve to "archive" and be detached. A symlinked active/, archive/ or held/ is refused outright. Paths are
+    compared without resolving anything below the root (only the root itself may sit under a symlinked ancestor)."""
+    for sub in ("active", "archive", "held"):
+        layout = os.path.join(root, sub)
+        try:
+            info = os.lstat(layout)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            raise WorkspaceError(f"{layout} is a symlink or not a directory; refusing to classify worktrees under it")
+    parent = os.path.dirname(os.path.normpath(os.path.abspath(path)))
+    roots = {os.path.normpath(os.path.abspath(root)), os.path.realpath(root)}
+    for sub in ("archive", "held"):
+        if parent in {os.path.join(r, sub) for r in roots}:
+            return sub
+    return None
+
+
+def _git_nohooks(args, cwd):
+    """git with every hook disabled (post-checkout, reference-transaction, ...): a hook can create files, and a file
+    created in an archived worktree is unpublished data that the archive cleanup would delete."""
+    return _git(["-c", "core.hooksPath=/dev/null", *args], cwd=cwd)
+
+
+def _detach_head(path: str, expect=None):
+    """Detach the worktree's HEAD at the commit it is on, so its branch is free for another worktree. Plumbing only:
+    `update-ref --no-deref HEAD` rewrites the worktree's own HEAD and nothing else (no checkout, no file, no hook).
+    `expect`, when given, is the commit HEAD must still be on. Returns None on success, else why it did not happen."""
+    try:
+        head = _git(["rev-parse", "--verify", "HEAD^{commit}"], cwd=path).strip()
+        if expect is not None and head != expect:
+            return f"HEAD moved from {expect} to {head} before detaching"
+        _git_nohooks(["update-ref", "--no-deref", "-m", "cortados: detach settled worktree", "HEAD", head, head],
+                     cwd=path)
+        after = _git(["rev-parse", "--verify", "HEAD^{commit}"], cwd=path).strip()
+        attached = subprocess.run([GIT, "symbolic-ref", "--quiet", "HEAD"], cwd=path, capture_output=True,
+                                  text=True, timeout=GIT_TIMEOUT_S,
+                                  env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}).returncode == 0
+    except (WorkspaceError, OSError, subprocess.TimeoutExpired) as exc:
+        return f"could not detach HEAD: {exc}"
+    if after != head:
+        return f"HEAD moved from {head} to {after} while detaching"
+    if attached:
+        return "HEAD is still on a branch after detaching"
+    return None
+
+
+def _free_archived_branch(path: str, branch: str, repo_dir: str, root: str):
+    """A worktree archived before settle() detached HEAD may still hold `branch`. Detach it only when that cannot lose
+    anything: its tree is clean (no untracked, ignored or hidden-modified file) and its HEAD is exactly origin/<branch>
+    as fetched just now with an explicit all-heads refspec (a narrowed remote.origin.fetch would leave it stale; a
+    failed fetch refuses). The archive/ directory and the entry must be the same directories (st_dev/st_ino) from
+    assessment to detach. Called under the cleanup lock. Returns None once detached, else why it was left alone."""
+    layout = os.path.join(root, "archive")
+    name = os.path.basename(os.path.normpath(path))
+    try:
+        layout_fd = _open_dir(layout)
+    except OSError as exc:
+        return f"archive/ is not a real directory ({exc})"
+    entry_fd = None
+    try:
+        try:
+            entry_fd = _open_dir(name, dir_fd=layout_fd)
+        except OSError:
+            return "the archived worktree is missing, a symlink or not a directory"
+        if not (_same_entry(layout_fd, layout) and _same_entry(entry_fd, path)):
+            return "the archived worktree is not the directory at its recorded path"
+        try:
+            if _git(["symbolic-ref", "--quiet", "HEAD"], cwd=path).strip() != "refs/heads/" + branch:
+                return f"its HEAD is not on {branch!r}"
+            head = _git(["rev-parse", "--verify", "HEAD^{commit}"], cwd=path).strip()
+            try:
+                _git(["fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"], cwd=repo_dir,
+                     timeout=FETCH_TIMEOUT_S)
+            except WorkspaceError as exc:
+                return f"could not refresh origin/{branch}, so its tip is not proven current: {exc}"
+            if not _ref_exists(path, "refs/remotes/origin/" + branch):
+                return f"origin/{branch} does not exist, so its commits are not proven published"
+            tip = _git(["rev-parse", "--verify", "refs/remotes/origin/" + branch + "^{commit}"], cwd=path).strip()
+            if head != tip:
+                return f"its HEAD {head[:12]} is not the tip of origin/{branch} ({tip[:12]})"
+            flagged = _git(["ls-files", "-v"], cwd=path)
+            if any(line and (line[0].islower() or line[0] == "S") for line in flagged.splitlines()):
+                return "it has files hidden by assume-unchanged or skip-worktree"
+            if _git(["status", "--porcelain", "--untracked-files=all", "--ignored=matching"], cwd=path).strip():
+                return "it has uncommitted, untracked or ignored files"
+        except WorkspaceError as exc:
+            return f"could not assess it: {exc}"
+        if not (_same_entry(layout_fd, layout) and _same_entry(entry_fd, path)):
+            return "the archived worktree changed while it was being assessed"
+        return _detach_head(path, expect=head)
+    finally:
+        if entry_fd is not None:
+            os.close(entry_fd)
+        os.close(layout_fd)
 
 
 def pushed(path: str):
@@ -259,6 +408,15 @@ def settle(rec: dict, root: str) -> dict:
         rec["error"] = f"could not move {path} to {dest}: {exc}"
         return rec
     rec.update(state="archived" if ok else "held", path=dest, settled_at=time.time(), reason=reason)
+    if ok and rec.get("kind") == "repo":
+        # Pushed work: free the branch for the next task (the commit stays checked out, detached). Held work keeps
+        # its branch, so a new task cannot start on it while it is unpushed. A failed detach loses nothing: the
+        # worktree stays archived and attached, and the reason is recorded here and in index.jsonl.
+        why = _detach_head(dest)
+        if why:
+            rec["detach_error"] = why
+        else:
+            rec["detached"] = True
     return rec
 
 
@@ -405,13 +563,10 @@ def _hold_changed_archive(root: str, archive_fd: int, name: str, rec: dict, reas
 
 
 def cleanup_archive(root: str, now=None, max_deletions=CLEANUP_MAX_DELETIONS, max_seconds=CLEANUP_MAX_SECONDS) -> dict:
-    """Serialize reassessment through deletion so a concurrent cleanup cannot move an entry being deleted."""
-    lock = os.open(os.path.join(root, "cleanup.lock"), os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    """Serialize reassessment through deletion so a concurrent cleanup cannot move an entry being deleted, and so a
+    start releasing a legacy archived worktree (which takes the same lock) cannot change one in between."""
+    with _cleanup_lock(root):
         return _cleanup_archive_locked(root, now=now, max_deletions=max_deletions, max_seconds=max_seconds)
-    finally:
-        os.close(lock)
 
 
 def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELETIONS,
