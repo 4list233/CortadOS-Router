@@ -120,3 +120,13 @@ settings file). Without connectors, or on a non-gui host (with a warning), it is
 heading. Tests use a fake claude binary, a fake transport in place of ssh and a fake launchctl
 (`tests/test_child_tasks.py`, `tests/test_exec_hosts.py`, `tests/test_workspaces.py`); never launch a real child,
 open ssh or call the real launchctl in tests.
+
+Being told when a child ends (#87): `start_task` returns `watch_command`, a blocking CLI for this machine
+(`python3 -B <repo>/cortados_router/child_tasks.py --watch <task_id> [...] [--timeout S] [--interval S] [--stall S]`).
+**After every start_task the orchestrator runs `watch_command` in the background** (a Claude Code session is woken when a
+background command exits; `wait_task` is capped at 50 s by the MCP client timeout, and hand-written `ssh air pgrep` loops
+cannot tell success from failure). It polls `task_status`'s own path (remote tasks over ssh, never a local guess), prints
+one JSON line of metadata per task as it ends and exits 0 all succeeded / 1 any failed, cancelled or stalled (no change
+in state, phase, workspace or child output for 30 min; a report, not a cancel) / 2 could not watch (bad id, host never
+reachable in 3 tries) / 3 `--timeout`. Tests: `tests/test_task_watch.py` (same fakes; the fixtures are
+`tests/test_child_tasks.py`'s `ChildTaskBase`).

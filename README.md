@@ -454,6 +454,24 @@ back; the calling orchestrator verifies it.
 Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_mode?, allowed_tools?, chrome?, connectors?)` returns a `task_id` at once;
 `task_status(task_id)`, `wait_task(task_id, timeout_s≤50)` (50 s default and cap: the Claude desktop app times MCP requests out at 60 s, and the reply, post-wait status work included, lands inside it; `CORTADOS_WAIT_MAX_S` (0-3600 s; a bad value is an error) raises it for clients with a longer timeout; a result with state `running` means call again), `list_tasks(limit?)`, `cancel_task(task_id)`.
 
+- Being woken when a task ends (issue #87): `start_task`'s result carries `watch_command`, the exact shell command for
+  the requesting machine (its absolute python and checkout, plus `CORTADOS_TASKS_DIR` / `CORTADOS_EXEC_HOSTS_FILE`
+  when set), e.g. `/usr/bin/python3 -B /path/to/cortados_router/child_tasks.py --watch <task_id>`. **The orchestrator
+  runs it in the background right after every start_task**: a Claude Code session is woken when a background command
+  it started exits, and `wait_task` cannot block past 50 s. `--watch <task_id> [<task_id> ...] [--timeout S]
+  [--interval S] [--stall S]` polls each task through the same path `task_status` takes (a remote task is asked on its
+  host over ssh; never a local guess), every 30 s by default, and prints one compact JSON line per task as it ends
+  (`task_id`, `state`, `host`, `elapsed_s`, `exit_code`, `error`, `workspace` state/path/branch, a warnings count;
+  never the result text, the stderr tail or the prompt: `task_status` has those). Exit 0 when every task succeeded;
+  1 when any `failed`, `cancelled` or `stalled`; 2 when the watch itself could not run (an unknown id, or a task
+  whose status was never readable in 3 attempts: a down host or a typo fails in about a minute); 3 when `--timeout`
+  passed with tasks pending (those lines say `"watch": "timeout"`). `stalled` means nothing about a running task
+  changed for 30 minutes (`--stall`): state, phase, workspace state and `last_output_at`, the mtime of the child's
+  logs that `task_status` now reports while a task runs (claude streams an event per tool call and reply, so a
+  working child writes) — or that its status was readable and then was not for that long. Thirty minutes is above
+  any single tool call seen on a child and far below the child's 3 h cap, so a hung child surfaces hours earlier.
+  Stalled is a report, not a cancel: the task keeps running on its host; a `queued` chrome task is waiting, not stalled.
+
 - Execution host (owner decision 2026-11-08, #89/#86; `cortados_router/exec_hosts.py`): `~/.config/cortados/exec-hosts.json`
   (`CORTADOS_EXEC_HOSTS_FILE`; copy `tables/exec-hosts.example.json`, which holds the Air entry) names the hosts and the
   `default` new tasks run on; `host` picks another; `CORTADOS_EXEC_HOST` overrides the default. Without the file
