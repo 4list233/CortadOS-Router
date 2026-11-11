@@ -345,9 +345,10 @@ def validate_heartbeat(body: Any) -> tuple[dict[str, Any] | None, str | None]:
     return out, None
 
 
-def read_child_events(path: Path, now: float) -> list[dict[str, Any]]:
-    """The child-task log's recent records (dicts), oldest first. Raises OSError for an unreadable log (the caller
-    reports it in errors[]); a missing log is no events."""
+def read_child_events(path: Path, now: float, window_s: float = CHILD_WINDOW_S) -> list[dict[str, Any]]:
+    """The child-task log's recent records (dicts, the last `window_s`), oldest first. Raises OSError for an unreadable
+    log (the caller reports it in errors[]); a missing log is no events. The live view reads 24 h once and hands the
+    office its own 4 h slice (recent_child_events)."""
     from cortados_router.provider.usage import _tail_lines
     try:
         lines, _ = _tail_lines(path)
@@ -359,14 +360,19 @@ def read_child_events(path: Path, now: float) -> list[dict[str, Any]]:
             rec = json.loads(ln)
         except ValueError:
             continue                                # counted by the usage view; the office shows only good records
-        if isinstance(rec, dict) and _child_timestamp(rec.get("ts"), now):
+        if isinstance(rec, dict) and _child_timestamp(rec.get("ts"), now, window_s):
             out.append(rec)
     return out
 
 
-def _child_timestamp(ts: Any, now: float) -> bool:
+def recent_child_events(events: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
+    """The office's own window (CHILD_WINDOW_S) of records read_child_events returned for a longer one."""
+    return [e for e in events if isinstance(e, dict) and _child_timestamp(e.get("ts"), now)]
+
+
+def _child_timestamp(ts: Any, now: float, window_s: float = CHILD_WINDOW_S) -> bool:
     # The log is local: future events are not real activity. Bound both sides before converting even huge integers.
-    return (type(ts) in (int, float) and now - CHILD_WINDOW_S <= ts <= now and math.isfinite(ts))
+    return (type(ts) in (int, float) and now - window_s <= ts <= now and math.isfinite(ts))
 
 
 def _children(events: list[dict[str, Any]], now: float) -> dict[str, dict[str, Any]]:

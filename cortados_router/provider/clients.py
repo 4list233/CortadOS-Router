@@ -40,10 +40,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_CLIENTS_FILE = "~/.config/cortados/clients.json"
 CLIENTS_ENV = "CORTADOS_PROVIDER_CLIENTS"
 OFFICE_PATH = "/v1/cortados/office"
+LIVE_PATH = "/v1/cortados/live"                       # provider/live.py LIVE_PATH (a test keeps the two equal)
+LIVE_HEARTBEAT_PATH = "/v1/cortados/live/heartbeat"   # provider/live.py HEARTBEAT_PATH
 # Scope -> the (method, path) pairs it opens. Exact paths only (no prefixes): a prefix would open whatever is added
 # under it later. A new reader gets a new scope here, reviewed, never a wildcard.
 SCOPES: dict[str, frozenset[tuple[str, str]]] = {
     "office:read": frozenset({("GET", OFFICE_PATH)}),
+    # the live snapshot (dashboard, pulse pane): read-only metadata, like the office view
+    "live:read": frozenset({("GET", LIVE_PATH)}),
+    # write-only: a host posting its job states (the Studio's S1 jobs) without holding the owner token, which routes
+    "live:heartbeat": frozenset({("POST", LIVE_HEARTBEAT_PATH)}),
 }
 # A client name lands in log lines: short and plain, so it can never carry a token or a path.
 _NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
