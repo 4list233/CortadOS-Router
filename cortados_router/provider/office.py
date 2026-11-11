@@ -74,8 +74,10 @@ FLOOR_TTL_S = 900.0
 DONE_AFTER_S = 60.0
 # Finished (done / error) workers stay visible for 10 min, so a glance at the office shows what just completed or failed.
 WORKER_KEEP_S = 600.0
-# Child tasks run up to CHILD_MAX_S_DEFAULT (3 h); the log is read 4 h back so a running one is still found.
-CHILD_WINDOW_S = 4 * 3600.0
+# A child can wait for the Chrome lock up to 6 h (child_tasks.CHROME_QUEUE_MAX_S) and then run up to 3 h
+# (CHILD_MAX_S_DEFAULT); the log is read 10 h back so an open child's start is still found, and a child with no end
+# event is never turned "done" by the idle heuristic while it can still be running (live.STALE_RUNNING_S, the same).
+CHILD_WINDOW_S = 10 * 3600.0
 # ---- caps: memory is bounded because every key is client-chosen ----
 MAX_FLOORS = 64             # sessions routing at once on one provider: a handful; 64 is far past any real fleet
 MAX_WORKERS = 1024          # all workers across floors and lobby, LRU
@@ -186,7 +188,10 @@ class OfficeBoard:
                 m.update(fields)
                 self.mains[tags["session"]] = m
                 return
-            w = self.workers.pop(key, None) or {"run_id": run_id, "kind": "subagent", "title": None,
+            # untagged work with no run id ('c:' key, the lobby) is a plain conversation, not a subagent
+            w = self.workers.pop(key, None) or {"run_id": run_id,
+                                                 "kind": "conversation" if key.startswith("c:") else "subagent",
+                                                 "title": None,
                                                  "session": tags.get("session"), "started_at": now}
             w.update(fields)
             if tags.get("title"):
@@ -239,7 +244,8 @@ class OfficeBoard:
         now = time.time() if now is None else now
         children = _children(child_events, now)
         with self._lock:
-            self._expire_locked(now)
+            # an open child's idle worker is kept past the idle expiry: dropped, it came back from the log as "working"
+            self._expire_locked(now, keep={"r:" + t for t, c in children.items() if not c.get("final")})
             floors = {s: dict(f) for s, f in self.floors.items()}
             workers = {k: dict(w) for k, w in self.workers.items()}
             mains = {s: dict(m) for s, m in self.mains.items() if s in self.floors}
@@ -306,7 +312,7 @@ class OfficeBoard:
                 "lobby": {"workers": lobby["items"], "workers_hidden": lobby["hidden"]},
                 "dropped_headers": dropped, "errors": list(errors or [])}
 
-    def _expire_locked(self, now: float) -> None:
+    def _expire_locked(self, now: float, keep: set[str] | frozenset = frozenset()) -> None:
         for s in [s for s, f in self.floors.items() if now - f.get("last", now) > FLOOR_TTL_S]:
             del self.floors[s]
             self.mains.pop(s, None)
@@ -314,7 +320,7 @@ class OfficeBoard:
                   if now - h["seen"] > (HEARTBEAT_TTL_S if h.get("status") == "working" else IDLE_HEARTBEAT_TTL_S)]:
             del self.heartbeats[s]
         for k in [k for k, w in self.workers.items()
-                  if now - (w.get("updated") or now) > DONE_AFTER_S + WORKER_KEEP_S]:
+                  if k not in keep and now - (w.get("updated") or now) > DONE_AFTER_S + WORKER_KEEP_S]:
             del self.workers[k]
 
 
@@ -351,7 +357,7 @@ def validate_heartbeat(body: Any) -> tuple[dict[str, Any] | None, str | None]:
 def read_child_events(path: Path, now: float, window_s: float = CHILD_WINDOW_S) -> list[dict[str, Any]]:
     """The child-task log's recent records (dicts, the last `window_s`), oldest first. Raises OSError for an unreadable
     log (the caller reports it in errors[]); a missing log is no events. The live view reads 24 h once and hands the
-    office its own 4 h slice (recent_child_events)."""
+    office its own 10 h slice (recent_child_events)."""
     from cortados_router.provider.usage import _tail_lines
     try:
         lines, _ = _tail_lines(path)

@@ -497,7 +497,8 @@ function renderHosts(box, s, s1) {
       add(c, el("div", "sub", join([hw.chip, isNum(hw.mem_available_bytes) ? (hw.mem_available_bytes / 1073741824).toFixed(1) + " GB free" +
         (isNum(hw.mem_total_bytes) ? " of " + (hw.mem_total_bytes / 1073741824).toFixed(0) : "") : null,
         isNum(hw.load_1m) ? "load " + hw.load_1m.toFixed(2) : null, isNum(hw.disk_free_pct) ? "disk " + pct(hw.disk_free_pct) + " free" : null,
-        "sample " + age(hw.age_s) + " old" + (hw.source === "heartbeat" ? " (heartbeat)" : "")])));
+        "sample " + age(hw.age_s) + " old" + (hw.source === "heartbeat" ? " (heartbeat)" : "") +
+        (hw.filled_by ? ", some fields from an older " + hw.filled_by + " reading" : "")])));
     } else add(c, el("div", "sub muted", "no hardware sample: run scripts/install_live_heartbeat.sh " + h.name + " there"));
     add(grid, c);
   });

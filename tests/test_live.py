@@ -217,7 +217,7 @@ class CollectTest(unittest.TestCase):
             ("subagent", "sub-run-0001", "gpt-6.1", "codex", "working", "provider"),
             ("child_task", RUNNING, "claude-sonnet-5", "claude#b", "working", "provider"),
             ("orchestrator", "c-000000000001", "claude-opus-5", "claude#a", "working", "provider"),
-            ("subagent", None, "qwen3-30b", "local-studio", "idle", "routed"),        # a one-shot: board only
+            ("conversation", None, "qwen3-30b", "local-studio", "idle", "routed"),    # untagged one-shot: board only
             ("conversation", "c-000000000004", "gpt-6.1-mini", "codex", "idle", "provider")])
         by = {x["run_id"]: x for x in c["items"]}
         child = by[RUNNING]
@@ -235,6 +235,13 @@ class CollectTest(unittest.TestCase):
         self.assertEqual((untagged["status"], untagged["phase"], untagged["session"]),
                          ("idle", "waiting for the client", None))
 
+    def test_backend_sessions_counts_the_listed_snapshot(self):
+        # review nit: a separate len(registry.sessions) could disagree with the list taken a moment later
+        c = fixture_view(backend_sessions=99)["conversations"]
+        self.assertEqual((c["backend_sessions"], len([x for x in c["items"] if x["source"] == "provider"])), (4, 4))
+        c = fixture_view(backend_sessions=99, conversations=lambda: 1 / 0)["conversations"]
+        self.assertEqual(c["backend_sessions"], 99)        # the list failed: the registry's own count stands
+
     def test_a_failed_conversation_list_keeps_the_board(self):
         c = fixture_view(conversations=lambda: 1 / 0)["conversations"]
         self.assertEqual(c["status"], "partial")
@@ -248,7 +255,7 @@ class CollectTest(unittest.TestCase):
         self.assertEqual((c["status"], c["backend_sessions"], c["active"], c["working"]), ("ok", 2, 3, 2))
         kinds = [(x["kind"], x["model"], x["status"]) for x in c["items"]]
         self.assertEqual(kinds, [("subagent", "gpt-6.1", "working"), ("orchestrator", "claude-opus-5", "working"),
-                                 ("subagent", "qwen3-30b", "idle")])
+                                 ("conversation", "qwen3-30b", "idle")])
         sub = c["items"][0]
         self.assertEqual((sub["tool"], sub["project"], sub["device"], sub["elapsed_s"], sub["title"]),
                          ("Read", "CortadOS-Router", "pro", 90.0, "Review the diff"))
@@ -319,16 +326,39 @@ class CollectTest(unittest.TestCase):
         # the studio's sample card (30 s old) is fresher than its heartbeat's hardware (100 s): the card stands, and the
         # heartbeat adds the disk figure the card does not have
         self.assertEqual(h["studio"]["hardware"]["age_s"], 30.0)   # tests/test_usage.HW_SAMPLE, host "studio"
-        self.assertEqual((h["studio"]["hardware"]["source"], h["studio"]["hardware"]["disk_free_pct"]), ("sample", 61.5))
+        self.assertEqual((h["studio"]["hardware"]["source"], h["studio"]["hardware"]["disk_free_pct"],
+                          h["studio"]["hardware"]["filled_by"]), ("sample", 61.5, "heartbeat"))
         self.assertEqual(h["studio"]["heartbeat"]["s1"], {**S1_BLOCK})
         # Bug (2026-11-11): the Air, the provider host itself, had no hardware: nothing writes hardware/<host>.json on
         # it. Its heartbeat sender's sample fills the card.
         self.assertEqual(h["air"]["hardware"], {"cpu_busy_pct": 12.5, "gpu_busy_pct": 3.0,
                                                 "mem_available_bytes": 8 * 2 ** 30, "mem_total_bytes": 24 * 2 ** 30,
                                                 "chip": "Apple M4", "load_1m": 2.1, "age_s": 20.0,
-                                                "disk_free_pct": 40.0, "source": "heartbeat"})
+                                                "disk_free_pct": 40.0, "source": "heartbeat", "filled_by": None})
         self.assertEqual((h["pro"]["heartbeat_state"], h["pro"]["heartbeat"], h["pro"]["hardware"]), ("none", None, None))
         self.assertEqual(v["overview"]["hosts_with_heartbeat"], 2)
+
+    def test_a_fresher_sparse_heartbeat_fills_in_without_hiding_the_card(self):
+        # Review (2026-11-11): a fresher heartbeat with only disk_free_pct replaced the studio's richer sample card
+        # wholesale. Now each field comes from the freshest reading that has it.
+        b = heartbeats()
+        hb, bad = live.validate_heartbeat({"host": "studio", "ttl_s": 180, "jobs": [],
+                                           "hardware": {"disk_free_pct": 12.0, "cpu_busy_pct": 5.0,
+                                                        "sampled_at": NOW - 2}}, NOW)
+        self.assertIsNone(bad)
+        b.post(hb, NOW - 1)
+        hw = {x["name"]: x for x in fixture_view(heartbeats=lambda: b.snapshot(NOW))["hosts"]["items"]}["studio"]["hardware"]
+        empty = live.HeartbeatBoard()
+        card = {x["name"]: x for x in fixture_view(heartbeats=lambda: empty.snapshot(NOW))["hosts"]["items"]}[
+            "studio"]["hardware"]                                                     # the sample card alone
+        self.assertEqual((card["source"], card["filled_by"], card["disk_free_pct"]), ("sample", None, None))
+        self.assertEqual((hw["source"], hw["age_s"], hw["filled_by"]), ("heartbeat", 2.0, "sample"))
+        self.assertEqual((hw["cpu_busy_pct"], hw["disk_free_pct"]), (5.0, 12.0))     # the fresher values win
+        kept = [k for k in ("chip", "gpu_busy_pct", "mem_available_bytes", "mem_total_bytes", "load_1m")
+                if card.get(k) is not None]
+        self.assertTrue(kept)
+        for k in kept:
+            self.assertEqual(hw[k], card[k], k)                                      # the card's, not hidden
 
     def test_a_stale_heartbeat_hardware_is_not_shown(self):
         b = heartbeats(at=NOW - 1000)
@@ -638,6 +668,7 @@ class HeartbeatTest(unittest.TestCase):
         self.check({**self.GOOD, "hardware": {"path": "/Users/x"}}, "hardware")
         for k, v in (("cpu_busy_pct", 101), ("disk_free_pct", -1), ("gpu_busy_pct", "5"), ("mem_total_bytes", 2 ** 60),
                      ("load_1m", float("nan")), ("chip", "M4\nMax"), ("chip", "10.0.0.1"), ("sampled_at", NOW + 40 * 86400),
+                     ("sampled_at", NOW + live.SAMPLE_FUTURE_SKEW_S + 1),
                      ("mem_available_bytes", True)):
             self.check({**self.GOOD, "hardware": {k: v}}, "hardware." + k)
         self.check({**self.GOOD, "s1": "up"}, "s1")

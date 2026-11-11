@@ -170,7 +170,8 @@ def launchd_job(label: str, name: str, run: Callable[..., Any] = subprocess.run)
     running = kv.get("state") == "running"
     runs = kv.get("runs") if (kv.get("runs") or "").isdigit() else None
     last = kv.get("last exit code") or kv.get("last exit status")
-    code = int(last) if last and re.fullmatch(r"-?\d{1,6}", last) else None
+    m = re.match(r"(-?\d{1,6})(?!\d)", last or "")   # "78: EX_CONFIG" -> 78; launchd's wording after it is dropped
+    code = int(m.group(1)) if m else None
     if running:
         state = "running"
     elif code is None:

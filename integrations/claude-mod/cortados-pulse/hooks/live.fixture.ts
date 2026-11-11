@@ -226,7 +226,7 @@ export default {
         "elapsed_s": 900.0
       },
       {
-        "kind": "subagent",
+        "kind": "conversation",
         "run_id": null,
         "session": null,
         "project": null,
@@ -540,7 +540,8 @@ export default {
           "load_1m": 2.1,
           "age_s": 20.0,
           "disk_free_pct": 40.0,
-          "source": "heartbeat"
+          "source": "heartbeat",
+          "filled_by": null
         }
       },
       {
@@ -592,7 +593,8 @@ export default {
           "load_1m": 1.5,
           "age_s": 30.0,
           "disk_free_pct": 61.5,
-          "source": "sample"
+          "source": "sample",
+          "filled_by": "heartbeat"
         }
       },
       {

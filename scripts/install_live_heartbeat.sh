@@ -68,18 +68,30 @@ if [ "$DRY" = 0 ]; then
   [ "$mode" = "600" ] || die "$TOKEN_FILE must be mode 600 (chmod 600 it)"
 fi
 
-CONFIG_JSON="$(HOST="$HOST" URL="$URL" LABELS="$LABELS" S1="$S1" S1_DATA="$S1_DATA" "$PYTHON" -I -c '
-import json, os
-cfg = {"version": 1, "host": os.environ["HOST"], "token_file": "~/.config/cortados/live-heartbeat-token",
-       "ttl_s": 180, "jobs": [l for l in os.environ["LABELS"].split(",") if l], "hardware": True, "disk": True}
-if os.environ["URL"]:
-    cfg["provider_url"] = os.environ["URL"]
-if os.environ["S1"] == "1":
-    cfg["s1"] = {"data_dir": os.environ["S1_DATA"]}
-print(json.dumps(cfg, indent=1))')"
-
-PLIST_XML="$(sed -e "s|__LABEL__|$LABEL|g" -e "s|__PYTHON__|$PYTHON|g" -e "s|__CONFIG__|$CONFIG|g" \
-                 -e "s|__REPO__|$REPO|g" -e "s|__LOG__|$LOG|g" "$REPO/scripts/$LABEL.plist.template")"
+# One isolated Python builds both files: the config as JSON and the plist with plistlib, so a path holding &, |, < or
+# any other XML or sed special is written as it is (the old sed substitution of a template corrupted such a plist).
+GENERATED="$(HOST="$HOST" URL="$URL" LABELS="$LABELS" S1="$S1" S1_DATA="$S1_DATA" LABEL="$LABEL" PY="$PYTHON" \
+             CONFIG="$CONFIG" REPO="$REPO" LOG="$LOG" "$PYTHON" -I -c '
+import json, os, plistlib
+e = os.environ
+cfg = {"version": 1, "host": e["HOST"], "token_file": "~/.config/cortados/live-heartbeat-token",
+       "ttl_s": 180, "jobs": [l for l in e["LABELS"].split(",") if l], "hardware": True, "disk": True}
+if e["URL"]:
+    cfg["provider_url"] = e["URL"]
+if e["S1"] == "1":
+    cfg["s1"] = {"data_dir": e["S1_DATA"]}
+# The heartbeat sender of the live view (cortados_router/live_heartbeat.py), one post every 60 s. No secret in it: the
+# sender reads its token from the 0600 file its config names.
+plist = {"Label": e["LABEL"],
+         "ProgramArguments": [e["PY"], "-B", "-m", "cortados_router.live_heartbeat", "--config", e["CONFIG"]],
+         "WorkingDirectory": e["REPO"], "EnvironmentVariables": {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+         "StartInterval": 60, "RunAtLoad": True, "ProcessType": "Background", "LowPriorityIO": True,
+         "StandardOutPath": e["LOG"], "StandardErrorPath": e["LOG"]}
+print(json.dumps(cfg, indent=1))
+print("#--PLIST--")
+print(plistlib.dumps(plist, sort_keys=False).decode(), end="")')"
+CONFIG_JSON="${GENERATED%%$'\n'#--PLIST--*}"
+PLIST_XML="${GENERATED#*#--PLIST--$'\n'}"
 
 if [ "$DRY" = 1 ]; then
   echo "# $CONFIG$( [ -f "$CONFIG" ] && [ "$FORCE" = 0 ] && echo ' (exists: kept)')"

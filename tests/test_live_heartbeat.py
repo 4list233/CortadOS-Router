@@ -47,6 +47,8 @@ PRINT_RUNNING = """gui/501/com.cortados.provider = {
 PRINT_DONE = "gui/501/x = {\n\tstate = not running\n\truns = 4\n\tlast exit code = 0\n}\n"
 PRINT_FAILED = "gui/501/x = {\n\tstate = not running\n\truns = 1\n\tlast exit code = 78: EX_CONFIG\n}\n"
 PRINT_FAILED_NUM = "gui/501/x = {\n\tstate = not running\n\truns = 2\n\tlast exit code = 1\n}\n"
+PRINT_ODD = "gui/501/x = {\n\tstate = not running\n\truns = 1\n\tlast exit code = (signal) SIGKILL\n}\n"
+PRINT_RUNNING_AFTER_FAIL = "gui/501/x = {\n\tstate = running\n\tpid = 9\n\truns = 3\n\tlast exit code = 78: EX_CONFIG\n}\n"
 PRINT_NEVER = "gui/501/x = {\n\tstate = not running\n\truns = 0\n\tlast exit code = (never exited)\n}\n"
 
 
@@ -121,11 +123,15 @@ class Base(unittest.TestCase):
 class LaunchdTest(Base):
     def test_states(self):
         run = fake_launchctl({"a": PRINT_RUNNING, "b": PRINT_DONE, "c": PRINT_FAILED, "d": PRINT_NEVER,
-                              "f": PRINT_FAILED_NUM, "e": OSError("boom")})
-        got = {n: hbs.launchd_job(n, n, run) for n in "abcdef" + "z"}
+                              "f": PRINT_FAILED_NUM, "e": OSError("boom"), "g": PRINT_ODD,
+                              "h": PRINT_RUNNING_AFTER_FAIL})
+        got = {n: hbs.launchd_job(n, n, run) for n in "abcdefgh" + "z"}
         self.assertEqual(got["a"], {"name": "a", "state": "running", "summary": "pid up, 11 runs, never exited"})
         self.assertEqual(got["b"], {"name": "b", "state": "ok", "summary": "4 runs, last exit 0"})
-        self.assertEqual((got["c"]["state"], got["c"]["summary"]), ("idle", "1 run"))   # an odd status: not a guess
+        # launchd words a failure "78: EX_CONFIG": the leading code counts, the wording stays out of the summary
+        self.assertEqual(got["c"], {"name": "c", "state": "failed", "summary": "1 run, last exit 78"})
+        self.assertEqual(got["g"], {"name": "g", "state": "idle", "summary": "1 run"})   # an odd status: not a guess
+        self.assertEqual(got["h"], {"name": "h", "state": "running", "summary": "pid up, 3 runs, last exit 78"})
         self.assertEqual(got["f"], {"name": "f", "state": "failed", "summary": "2 runs, last exit 1"})
         self.assertEqual(got["d"], {"name": "d", "state": "idle", "summary": "0 runs, never exited"})
         self.assertEqual(got["e"], {"name": "e", "state": "stopped", "summary": "launchctl failed: OSError"})
@@ -348,6 +354,22 @@ class InstallTest(unittest.TestCase):
                                         f"bootstrap gui/{uid} {plist_path}"])
         self.assertEqual(hbs.load_config(self.home / ".config" / "cortados" / "heartbeat.json")["host"], "studio")
         self.assertNotIn(TOKEN, r.stdout + r.stderr)
+
+    def test_a_home_with_xml_and_sed_specials_gives_a_valid_plist(self):
+        # Review (2026-11-11): the plist came from sed over a template; a path with & or | corrupted it and XML
+        # specials were not escaped. plistlib writes it now.
+        odd = Path(tempfile.mkdtemp(prefix="h&o|m<e>'\"-"))
+        self.addCleanup(shutil.rmtree, odd, True)
+        self.home, self.token = odd, odd / ".config" / "cortados" / "live-heartbeat-token"
+        self.mint()
+        r = self.install("air")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        import plistlib
+        pl = plistlib.loads((odd / "Library" / "LaunchAgents" / "com.cortados.live-heartbeat.plist").read_bytes())
+        self.assertEqual(pl["ProgramArguments"][-2:], ["--config", str(odd / ".config" / "cortados" / "heartbeat.json")])
+        self.assertEqual(pl["StandardOutPath"], str(odd / ".cortados" / "live-heartbeat.out"))
+        self.assertEqual(pl["StandardErrorPath"], pl["StandardOutPath"])
+        self.assertEqual(json.loads((odd / ".config" / "cortados" / "heartbeat.json").read_text())["host"], "air")
 
     def test_air_has_no_s1_block_and_labels_can_be_given(self):
         self.mint()

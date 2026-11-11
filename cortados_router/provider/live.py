@@ -66,7 +66,7 @@ HEARTBEAT_PATH = "/v1/cortados/live/heartbeat"
 CHILD_WINDOW_S = 24 * 3600.0
 # A child is queued for the Chrome lock up to 6 h (child_tasks.CHROME_QUEUE_MAX_S) and then runs up to 3 h
 # (CHILD_MAX_S_DEFAULT): a start with no end event after 10 h is not shown as running, it is "unknown" and said so.
-STALE_RUNNING_S = 10 * 3600.0
+STALE_RUNNING_S = office.CHILD_WINDOW_S   # 10 h: the Office keeps an open child exactly as long
 RUNNING_MAX = 50            # children running at once: a handful; 50 keeps a runaway fan-out visible but bounded
 RECENT_MAX = 40             # finished in 24 h, newest first: a day's worth at the owner's pace
 PEEK_MAX = 64               # task-dir peeks per snapshot (a few stats each): bounds the poll's disk work
@@ -81,6 +81,7 @@ TTL_MIN_S, TTL_MAX_S = 60, 86400
 JOBS_MAX = 16
 JOB_STATES = ("running", "idle", "ok", "scheduled", "failed", "stopped")
 TIME_SKEW_S = 30 * 86400.0  # job timestamps within a month of the provider's clock; anything else is not a time
+SAMPLE_FUTURE_SKEW_S = 120.0  # a heartbeat hardware sampled_at may run ahead of the provider's clock by this much, no more
 ELSEWHERE_MAX = 50          # remote stubs listed (child_tasks.remote_stubs reads at most its own cap of dirs)
 SCOPE = "provider host"     # the tasks section sees this machine's child-task log only (see the module doc)
 MEMO_S = 2.0                # GET /v1/cortados/live: N pollers (dashboard tabs, pulse panes) share one collect per 2 s
@@ -204,7 +205,9 @@ def _validate_hw(hw: Any, now: float) -> tuple[dict[str, Any] | None, str | None
             if out[k] is None:
                 return None, "." + k
         elif k == "sampled_at":
-            if not (_num(v) and abs(v - now) <= TIME_SKEW_S):
+            # a sample is never from the future: a little clock skew is allowed, a later stamp would make it look
+            # fresher than any real reading (and win the per-field merge in hosts_section)
+            if not (_num(v) and now - TIME_SKEW_S <= v <= now + SAMPLE_FUTURE_SKEW_S):
                 return None, "." + k
             out[k] = round(float(v), 3)
     return out, None
@@ -436,7 +439,12 @@ def _backend_items(backend: list, view: dict[str, Any], now: float) -> tuple[lis
             covered.add("main:" + ident)
             o = floor.get("orchestrator") or {}
             w = {"tool": o.get("tool"), "status": o.get("status")}   # the main loop's tool, as the floor knows it
-        kind = w.get("kind") or ("orchestrator" if kind_of == "main" else "subagent" if kind_of == "r" else "conversation")
+        if kind_of == "main":
+            kind = "orchestrator"
+        elif kind_of == "r":
+            kind = w.get("kind") or "subagent"
+        else:                                       # untagged, no run id: a plain conversation (README "Live view")
+            kind = "conversation"
         busy, waiting = c.get("busy") is True, c.get("awaiting_tool") is True
         status = "working" if busy or waiting else "idle"
         opened = c.get("opened_at") if _num(c.get("opened_at")) else None
@@ -624,6 +632,24 @@ def _match(short: str | None, aliases: dict[str, set[str]]) -> str | None:
 _HW_PICK = ("cpu_busy_pct", "gpu_busy_pct", "mem_available_bytes", "mem_total_bytes", "chip")
 
 
+def _merge_hardware(readings: list[dict[str, Any]]) -> dict[str, Any]:
+    """One host's hardware readings (sample cards, its heartbeat's block) as one card, field by field: each field from
+    the freshest reading that has it, so a fresher but sparse heartbeat never hides what an older sample card knows.
+    `age_s` and `source` are the freshest reading's; `filled_by` names the other source(s) that supplied a field."""
+    ordered = sorted(readings, key=lambda r: r["age_s"] if _num(r.get("age_s")) else float("inf"))
+    out = dict(ordered[0])
+    fillers: list[str] = []
+    for r in ordered[1:]:
+        for k, v in r.items():
+            if k in ("age_s", "source") or v is None or out.get(k) is not None:
+                continue
+            out[k] = v
+            if r["source"] not in fillers:
+                fillers.append(r["source"])
+    out["filled_by"] = "+".join(fillers) or None
+    return out
+
+
 def hosts_section(u: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]], *, names: list[str],
                   exec_hosts: dict[str, list[str]] | None, exec_default: str | None, self_host: str | None,
                   now: float, errors: list | None = None, self_name: str | None = None) -> dict[str, Any]:
@@ -653,6 +679,7 @@ def hosts_section(u: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]
     for n in exec_hosts or {}:
         item(n)["roles"].append("default exec host" if n == exec_default else "exec host")
     unmatched = 0
+    cands: dict[str, list[dict[str, Any]]] = {}     # every hardware reading per known host, merged below
     for card in (u or {}).get("hardware") or []:
         data = card.get("data") if isinstance(card, dict) else None
         if not isinstance(data, dict):
@@ -672,9 +699,7 @@ def hosts_section(u: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]
         hw["age_s"] = card.get("age_s")
         hw["disk_free_pct"] = None
         hw["source"] = "sample"
-        it = item(name)
-        if it["hardware"] is None or (_num(hw["age_s"]) and hw["age_s"] < (it["hardware"].get("age_s") or 1e18)):
-            it["hardware"] = hw
+        cands.setdefault(name, []).append(hw)
     for h, hb in heartbeats.items():
         age = max(0.0, now - hb["received_at"])
         stale = age > hb["ttl_s"]
@@ -688,11 +713,9 @@ def hosts_section(u: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]
             hw = {k: hh.get(k) for k in _HW_PICK if k != "chip"}
             hw.update(chip=hh.get("chip"), load_1m=hh.get("load_1m"), age_s=round(max(0.0, now - at), 1),
                       disk_free_pct=hh.get("disk_free_pct"), source="heartbeat")
-            cur = it["hardware"]
-            if cur is None or not _num(cur.get("age_s")) or hw["age_s"] < cur["age_s"]:
-                it["hardware"] = hw
-            elif cur.get("disk_free_pct") is None:
-                cur["disk_free_pct"] = hw["disk_free_pct"]
+            cands.setdefault(h, []).append(hw)
+    for name, readings in cands.items():
+        item(name)["hardware"] = _merge_hardware(readings)
     errors += [e for e in (u or {}).get("errors") or []
                if isinstance(e, dict) and str(e.get("source", "")).startswith("hardware") and e.get("error") != "absent"]
     if unmatched:
@@ -735,6 +758,8 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
                       elsewhere=_elsewhere(stubs, set(), now))
     conv_errs: list = []
     backend = guard("conversations", conversations, conv_errs) if conversations is not None else None
+    if isinstance(backend, list):
+        backend_sessions = len(backend)             # the count from the same snapshot as the list it heads
     if ov is not None or backend is not None:    # the open conversations stand without the board (partial)
         conv = conversations_section(ov if ov is not None else {"errors": office_errs}, backend_sessions, now,
                                      backend, conv_errs)

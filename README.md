@@ -962,7 +962,7 @@ scripts/install_live_heartbeat.sh pro
 The helper writes `~/.config/cortados/heartbeat.json` (host, provider URL — `--provider-url`, else the host's existing
 `~/.config/cortados/provider-url`, else loopback —, token file, labels — `--labels a,b` to choose —, checks; an existing
 file is kept unless `--force`), checks it with the sender, writes `~/Library/LaunchAgents/com.cortados.live-heartbeat.plist`
-(from `scripts/com.cortados.live-heartbeat.plist.template`; no secret in it) and loads it with `launchctl bootstrap`.
+(built with `plistlib`, so any path is written as it is; no secret in it) and loads it with `launchctl bootstrap`.
 `--dry-run` prints both files and changes nothing. Its log is `~/.cortados/live-heartbeat.out` (one line per failed post;
 a 403 there means the token is bound to another host). Remove: `launchctl bootout gui/$(id -u)/com.cortados.live-heartbeat`
 and delete the plist; revoke the token with `clients remove <name>`.
