@@ -545,7 +545,7 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
                       floors=None, items=[], hidden=0)
     tv_errs: list = []
     tv = guard("router.db", tasks_view, tv_errs)
-    # this process's failed router.db writes (#99): shown even when the read side failed, since a broken db is when
+    # this process's failed router.db writes (#99): shown even when the read side failed, which is when they matter most
     rl_errs: list = []
     rl = route_log_errors(guard("route log", route_log, rl_errs))
     routed = routed_section(tv, now, rl) if tv is not None \
