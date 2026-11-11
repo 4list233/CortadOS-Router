@@ -378,7 +378,27 @@ computes now (reads files only): the request, the candidate weights (path, size,
 and live pointer, and `CALIBRATE_VERSION`. Each version's score cache is keyed the same way (weights + adapter config + blend
 parameters; candidate versions also on the validation rows, which `temps.json` records too); a changed key moves that version's
 scores, done marker and temperatures aside into `<version>/stale-<stamp>/`. A torn last cache line is cut off on load, so the next
-append starts a fresh line.
+append starts a fresh line. Provenance (`CALIBRATE_VERSION` 3): each scoring session first records what it scores with in
+`<version>/scores.provenance.json` (sha256 of `adapters.safetensors` and `adapter_config.json`, the config's content, the
+temperatures the loaded scorer applies); rows cached by an earlier session are kept only when its provenance is identical, else
+(or when they have none) they are moved aside and the version is rescored. `sweep.json` `"versions"` carries each version's
+provenance (null for a version cached before provenance existed).
+Publishing a sweep setting is a manual step: `s1/promote_sweep.py plan` (a dry run; `--write` publishes) builds the pointer from
+the sweep's own files and refuses a tilted setting (serving applies no tilt: serve.py loads base + adapter + temperatures, and
+core.decide_s1 applies only fail-up and the outward threshold), a setting whose promotion_report did not promote, a pointer or
+weights changed since the sweep, a version without recorded provenance, and temperatures, adapter weights or adapter config
+(content, every field) other than the recorded ones; `check` compares the live scorer's bands with the sweep's per-row record and
+fails on any selected row it could not score (missing from requests.jsonl, or degraded). Example:
+`docs/runbooks/s1-promote-2026-11-11.md`.
+Hold promotion (owner 2026-11-11): `s1/data/no-promote` stops every automatic publication. nightly.sh checks it immediately
+before both promotion calls (a pending candidate's and a fresh run's). A passing candidate keeps its `report.json` and stays in
+`data/pending-candidate` with reason `promotion_held` (log `PROMOTION HELD`, status.json `last_promotion_held`). While the flag
+exists a held candidate is not re-evaluated, is not superseded by new labels, and blocks new training, as an `evaluation_pending`
+one does; labeling continues, and `--train` / `data/force-train` still supersede it. Once the flag is removed, the next in-window
+cycle always re-evaluates it against the current incumbent, the current teacher and outcome holdouts and the current promotion
+settings, and publishes it only if that fresh report promotes (else it is dropped, or waits as `holdout_blocked`). The held report
+is never published as is: the eval fingerprint does not cover the outcome holdout or the promotion-policy settings
+(`CORTADOS_S1_MIN_OUTCOME_HOLDOUT` and the like), so an unchanged fingerprint would not prove the old verdict still holds. `data/no-train-tonight` is separate: it stops new training only.
 Runtime on the Studio (~2.7 s/row; ~975 rows per pass = ~44 min; ~22 min to fit a candidate version's temperatures on ~470 valid
 rows; tilts reuse the scores): the 6 tilts x 4 alphas request (24 settings) is 5 passes (live 44 min + 4 x 66 min) = ~5.1 h of
 the 6 h window, plus a 30 s gate wait (set `CORTADOS_STUDIO_ACK_WAIT=0` in `data/train-config.env` to skip it; the gate still

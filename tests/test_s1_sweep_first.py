@@ -177,11 +177,53 @@ class ResumableSweep(SweepFixture, unittest.TestCase):
         self.assertEqual(len(f.calls), self.ROWS * (self.VERSIONS - 1))
         stale = list((self.run / "sweep/cand").glob("stale-*"))
         self.assertEqual(len(stale), 1)
-        self.assertEqual(sorted(p.name for p in stale[0].iterdir()), ["scores.done", "scores.jsonl", "scores.meta.json"])
+        self.assertEqual(sorted(p.name for p in stale[0].iterdir()), ["scores.done", "scores.jsonl", "scores.meta.json",
+                                                                         "scores.provenance.json"])
         self._live('{"lora_parameters": {"scale": 16}}')
         f = Fleet()
         self.sweep(f, live=live)
         self.assertEqual(sorted(set(f.loads)), ["blend0.7", "live"])   # the blend reads the live adapter; cand / scale do not
+
+    def test_sweep_records_each_versions_provenance(self):
+        live = self._live()
+        sweep = self.sweep(Fleet(), live=live)
+        blend = sweep["versions"]["blend0.7"]
+        bdir = self.run / "sweep/blend0.7"
+        self.assertEqual(blend["adapter_sha256"], cal.file_sha256(bdir / "adapters.safetensors"))
+        self.assertEqual(blend["adapter_config_sha256"], cal.file_hash(bdir / "adapter_config.json"))
+        self.assertEqual(blend["adapter_config"], {})
+        self.assertEqual(sweep["versions"]["live"]["adapter_config"], {"lora_parameters": {"scale": 20}})
+        self.assertEqual(json.loads((bdir / "scores.provenance.json").read_text()), blend)
+        again = self.sweep(Fleet(), live=live)                      # all cached: provenance read back, nothing loaded
+        self.assertEqual(again["versions"], sweep["versions"])
+
+    def test_resumed_rows_scored_with_another_artifact_are_rescored(self):
+        with self.assertRaises(Interrupted):
+            self.sweep(Fleet(fail_after=self.ROWS + 2))           # live done, 2 candidate rows cached
+        prov = self.run / "sweep/cand/scores.provenance.json"
+        rec = json.loads(prov.read_text())
+        prov.write_text(json.dumps(dict(rec, T={"steps": 9.0})))  # those rows were scored with other temperatures
+        f = Fleet()
+        self.sweep(f)
+        self.assertEqual([a for a, _ in f.calls].count(Path(self.cand).name), self.ROWS, "all candidate rows rescored")
+        self.assertEqual(json.loads(prov.read_text()), rec)
+        self.assertTrue(list((self.run / "sweep/cand").glob("stale-*/scores.provenance.json")), "moved, not deleted")
+
+    def test_cached_rows_without_provenance_are_rescored_when_scoring_resumes(self):
+        with self.assertRaises(Interrupted):
+            self.sweep(Fleet(fail_after=self.ROWS + 2))
+        (self.run / "sweep/cand/scores.provenance.json").unlink()   # rows cached by a version that recorded none
+        f = Fleet()
+        self.sweep(f)
+        self.assertEqual([a for a, _ in f.calls].count(Path(self.cand).name), self.ROWS)
+
+    def test_a_complete_version_without_provenance_is_reused_but_recorded_as_null(self):
+        self.sweep(Fleet())
+        (self.run / "sweep/blend0.7/scores.provenance.json").unlink()
+        f = Fleet()
+        sweep = self.sweep(f)
+        self.assertEqual(f.loads, [])
+        self.assertIsNone(sweep["versions"]["blend0.7"])
 
     def test_validation_change_refits_the_candidate_versions_and_moves_their_temps_aside(self):
         self.sweep(Fleet(), fit_identity={"valid": "A"})
