@@ -395,9 +395,10 @@ before both promotion calls (a pending candidate's and a fresh run's). A passing
 `data/pending-candidate` with reason `promotion_held` (log `PROMOTION HELD`, status.json `last_promotion_held`). While the flag
 exists a held candidate is not re-evaluated, is not superseded by new labels, and blocks new training, as an `evaluation_pending`
 one does; labeling continues, and `--train` / `data/force-train` still supersede it. Once the flag is removed, the next in-window
-cycle publishes it as is when its eval fingerprint (holdout labels, inference settings, serving incumbent) is unchanged and the
-report still promotes; otherwise it is re-evaluated against the current incumbent first (a hand promotion with promote_sweep.py
-changes the incumbent, so it forces that re-evaluation). `data/no-train-tonight` is separate: it stops new training only.
+cycle always re-evaluates it against the current incumbent, the current teacher and outcome holdouts and the current promotion
+settings, and publishes it only if that fresh report promotes (else it is dropped, or waits as `holdout_blocked`). The held report
+is never published as is: the eval fingerprint does not cover the outcome holdout or the promotion-policy settings
+(`CORTADOS_S1_MIN_OUTCOME_HOLDOUT` and the like), so an unchanged fingerprint would not prove the old verdict still holds. `data/no-train-tonight` is separate: it stops new training only.
 Runtime on the Studio (~2.7 s/row; ~975 rows per pass = ~44 min; ~22 min to fit a candidate version's temperatures on ~470 valid
 rows; tilts reuse the scores): the 6 tilts x 4 alphas request (24 settings) is 5 passes (live 44 min + 4 x 66 min) = ~5.1 h of
 the 6 h window, plus a 30 s gate wait (set `CORTADOS_STUDIO_ACK_WAIT=0` in `data/train-config.env` to skip it; the gate still

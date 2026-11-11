@@ -818,13 +818,14 @@ PY
         self.assertFalse((run2 / "adapter").exists())
         self.assertEqual(self.pointer.read_text(), old)
         self.assertTrue((run1 / "adapter").is_dir(), "the retention pass keeps the held candidate")
-        # lifted: holdout, settings and incumbent unchanged, so its report is published as is
+        # lifted: even with the eval fingerprint unchanged it is re-evaluated first, then published on the fresh report
         flag.unlink()
         rc, log, run3 = self.run_night(STUB_NEW_LABELS=0)
         self.assertEqual(rc, 0, log)
-        self.assertIn("promotion no longer held; holdout, settings and incumbent unchanged", log)
+        self.assertIn("pending runs/2026-01-01: promotion no longer held; re-evaluating before publishing", log)
+        self.assertIn("pending candidate runs/2026-01-01 (promotion_held): re-evaluating", log)
         self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
-        self.assertEqual(self.evals(), 1, "published without re-evaluation")
+        self.assertEqual(self.evals(), 2, "re-evaluated before publishing")
         self.assertEqual(json.loads(self.pointer.read_text())["adapter"], str((run1 / "adapter").resolve()))
         self.assertEqual((self.s1 / "current.json.prev").read_text(), old)
         self.assertFalse((self.s1 / "data/pending-candidate").exists())
@@ -851,7 +852,7 @@ PY
         rc, log, run3 = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_SERVE_POINTER=pointer)
         self.assertEqual(rc, 0, log)
         self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
-        self.assertEqual(self.evals(), 2)
+        self.assertEqual(self.evals(), 3, "re-evaluated again once lifted")
         self.assertEqual(json.loads(pointer.read_text())["adapter"], str((run1 / "adapter").resolve()))
         self.assertFalse((self.s1 / "data/pending-candidate").exists())
         _, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_SERVE_POINTER=pointer)
@@ -867,7 +868,6 @@ PY
         flag.unlink()
         rc, log, _ = self.run_night(STUB_NEW_LABELS=0)
         self.assertEqual(rc, 0, log)
-        self.assertIn("its report is stale", log)
         self.assertIn("pending candidate runs/2026-01-01 (promotion_held): re-evaluating", log)
         self.assertEqual(self.evals(), 2)
         self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
@@ -883,6 +883,28 @@ PY
         self.assertEqual(rc, 0, log)
         self.assertIn("pending runs/2026-01-01 no longer promotes", log)
         self.assertFalse(self.pointer.exists())
+        self.assertFalse((self.s1 / "data/pending-candidate").exists())
+
+    def test_lifted_hold_reevaluates_when_only_the_outcome_holdout_changed(self):
+        # the outcome holdout and promotion-policy settings are outside the eval fingerprint: an unchanged fingerprint must
+        # not publish the held (passing) report when a fresh evaluation now fails
+        flag = self.s1 / "data/no-promote"
+        flag.write_text("")
+        _, log, run1 = self.run_night(STUB_NEW_LABELS=3)
+        self.assertIn("PROMOTION HELD", log)
+        p_before = (self.s1 / "data/pending-candidate").read_text().split()
+        self.assertTrue(json.loads((run1 / "report.json").read_text())["promote"])
+        flag.unlink()
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, STUB_PROMOTE=0)   # outcome rows corrected while held: now fails
+        self.assertEqual(rc, 0, log)
+        self.assertNotIn("EVAL FINGERPRINT", log)
+        self.assertIn("pending candidate runs/2026-01-01 (promotion_held): re-evaluating", log)
+        self.assertEqual(self.evals(), 2)
+        self.assertTrue(p_before[1].startswith("h0-min200-"), p_before)   # teacher holdout, settings and incumbent unchanged
+        self.assertIn("pending runs/2026-01-01 no longer promotes", log)
+        self.assertNotIn("PROMOTED", log)
+        self.assertFalse(self.pointer.exists(), "the stale passing report must not be published")
+        self.assertFalse(json.loads((run1 / "report.json").read_text())["promote"], "the fresh report replaced it")
         self.assertFalse((self.s1 / "data/pending-candidate").exists())
 
     def test_force_train_supersedes_a_held_candidate(self):

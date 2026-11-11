@@ -65,9 +65,9 @@
 #   its report.json stays and it is kept pending with reason promotion_held (log line "PROMOTION HELD", status.json
 #   last_promotion_held). While the flag stays, a held candidate is neither re-evaluated nor superseded by new labels (like
 #   evaluation_pending) and the cycle ends after labeling; --train / data/force-train still supersede it. Once the flag is
-#   removed, the next cycle publishes it without re-evaluation when its eval fingerprint (holdout labels, inference settings,
-#   serving incumbent) is unchanged and its report still promotes; otherwise it is re-evaluated against the current incumbent
-#   first, as any pending candidate. Labeling and evaluation are not affected. Set: touch data/no-promote; lift: rm it (or mv).
+#   removed, the next cycle ALWAYS re-evaluates it against the current incumbent and holdouts (teacher and outcome) and current
+#   promotion settings, and publishes only if that fresh report promotes; the held report is never published as is (the eval
+#   fingerprint does not cover the outcome holdout or promotion-policy settings). Labeling and evaluation are not affected. Set: touch data/no-promote; lift: rm it (or mv).
 # Exit codes: 0 ok / skipped, 3 labeling failed, 1 other failure, 2 base model missing, 130 stopped.
 set -u
 cd "$(dirname "$0")" || exit 1
@@ -664,8 +664,8 @@ fi
 #                            WHATEVER the SFT fingerprint says: labeling adds data every night, so superseding on new data (the
 #                            policy for the other reasons) would discard every trained candidate and the pipeline would never promote.
 #   reason promotion_held:   the report promotes but data/no-promote was set (header "Hold promotion"). Kept whatever the SFT
-#                            fingerprint says while held; published as is when the flag is gone and the eval fingerprint is
-#                            unchanged, else re-evaluated first.
+#                            fingerprint says while held; once the flag is gone it is always re-evaluated first and
+#                            published only if the fresh report promotes.
 #   reason holdout_blocked:  evaluate.py refused for a too-small Claude holdout. Holdout labels never enter the SFT data, so the
 #                            SFT marker cannot notice the backfill; the run waits and is re-evaluated when the eval fingerprint
 #                            (effective holdout labels + settings + serving incumbent) changes.
@@ -729,34 +729,28 @@ if read_pending; then
       state event "$STATUS" skip "pending $p_run waits for holdout ($p_reason)"; holdout_hit
       echo "=== $(date) nightly end"; exit 0
     fi
-    reeval=1
     if [ "$p_reason" = promotion_held ]; then
       if [ -f data/no-promote ]; then
         echo "pending $p_run: promotion held (data/no-promote present); kept pending, not re-evaluated while held"
         state event "$STATUS" skip "pending $p_run: promotion held (data/no-promote)"; echo "=== $(date) nightly end"; exit 0
       fi
-      if [ "$now_eval" = "$p_eval" ] && ! report_unavailable "$p_run" && report_promotes "$p_run"; then
-        reeval=0
-        echo "pending $p_run: promotion no longer held; holdout, settings and incumbent unchanged since its report, which still promotes: publishing it"
-      else
-        echo "pending $p_run: promotion no longer held, but its report is stale (holdout, settings or incumbent changed) or no longer promotes"
-      fi
+      # Never published from its held report: the eval fingerprint does not cover the outcome holdout or the promotion-policy
+      # settings (e.g. CORTADOS_S1_MIN_OUTCOME_HOLDOUT), so an unchanged fingerprint does not prove the old verdict still holds.
+      echo "pending $p_run: promotion no longer held; re-evaluating before publishing"
     fi
-    if [ "$reeval" -eq 1 ]; then
-      if ! eval_time_ok "$p_run" "$p_reason"; then
-        state event "$STATUS" skip "pending $p_run: not enough time to evaluate"; echo "=== $(date) nightly end"; exit 0
-      fi
-      echo "pending candidate $p_run ($p_reason): re-evaluating against the current holdout and incumbent"
-      if ! evaluate_run "$p_run"; then
-        echo "re-evaluation of $p_run failed; retried next night"; state event "$STATUS" pending_failure "$p_run (re-evaluation failed)"; eval_failed; exit 1
-      fi
-      if report_unavailable "$p_run"; then
-        write_pending "$p_sft" "$now_eval" evaluation_failed "$p_run"
-        echo "EVALUATION UNAVAILABLE again for $p_run: $(report_why "$p_run"); retried next night"
-        state event "$STATUS" evaluation_failure "$p_run (retry)"; eval_failed; exit 1
-      fi
-      eval_ok; streak eval_deferred clear "$EVAL_FAIL_NIGHTS"
+    if ! eval_time_ok "$p_run" "$p_reason"; then
+      state event "$STATUS" skip "pending $p_run: not enough time to evaluate"; echo "=== $(date) nightly end"; exit 0
     fi
+    echo "pending candidate $p_run ($p_reason): re-evaluating against the current holdout and incumbent"
+    if ! evaluate_run "$p_run"; then
+      echo "re-evaluation of $p_run failed; retried next night"; state event "$STATUS" pending_failure "$p_run (re-evaluation failed)"; eval_failed; exit 1
+    fi
+    if report_unavailable "$p_run"; then
+      write_pending "$p_sft" "$now_eval" evaluation_failed "$p_run"
+      echo "EVALUATION UNAVAILABLE again for $p_run: $(report_why "$p_run"); retried next night"
+      state event "$STATUS" evaluation_failure "$p_run (retry)"; eval_failed; exit 1
+    fi
+    eval_ok; streak eval_deferred clear "$EVAL_FAIL_NIGHTS"
     if [ "$same_data" -eq 1 ]; then next_msg="no new data, nothing to train"; else next_msg="the newer labels are trained next night"; fi
     if ! report_promotes "$p_run"; then
       if report_blocked "$p_run"; then
