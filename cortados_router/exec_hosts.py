@@ -228,5 +228,12 @@ def call(host: Host, op: str, args: dict, timeout_s: float = SSH_RPC_TIMEOUT_S, 
         raise HostError(f"execution host {host.describe()} runs a cortados-router checkout speaking protocol "
                         f"{reply.get('v')!r}, this one speaks {PROTOCOL}: update the checkout there ({host.router})")
     if not reply.get("ok"):
-        raise HostError(str(reply.get("error") or f"{op} failed on {host.describe()} without a reason"))
+        err = HostError(str(reply.get("error") or f"{op} failed on {host.describe()} without a reason"))
+        failure = reply.get("failure")
+        if isinstance(failure, dict):
+            # An unexpected exception on the host, classified there ({"type", "launched", "task_id"}): the caller
+            # rebuilds the guidance from it. `ambiguous` as for HostUnreachable: the operation may have taken effect.
+            err.failure = failure
+            err.ambiguous = failure.get("launched") in ("maybe", "yes")
+        raise err
     return reply.get("result")

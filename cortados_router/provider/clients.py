@@ -194,6 +194,11 @@ class ClientTokens:
             return
         self._entries = entries
         logger.info("provider clients: %d loaded (%s)", len(entries), ", ".join(c.name for _, c in entries) or "none")
+        bindings = [f"{c.name} -> {c.host}" for _, c in entries if c.host]
+        if bindings:
+            # Which host each heartbeat client may post for (names only, never a token or digest): a heartbeat refused
+            # with 403, or a host card that never fills, is read against this line.
+            logger.info("provider clients: heartbeat bindings: %s", ", ".join(bindings))
 
     def match(self, token: str) -> Client | None:
         if not token or len(token) < MIN_TOKEN_LEN:

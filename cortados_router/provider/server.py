@@ -2309,7 +2309,7 @@ class ProviderServer(ThreadingHTTPServer):
             usage_view=lambda: self.live_usage_view(registry, now),
             heartbeats=lambda: registry.live.snapshot(now), backend_sessions=len(registry.sessions),
             peek=child_tasks.peek_local, exec_hosts=hosts, self_host=exec_hosts.short_hostname(),
-            remote_stubs=child_tasks.remote_stubs)
+            remote_stubs=child_tasks.remote_stubs, lane_enabled=live.lane_enabled)
 
     def live_usage_view(self, registry: Registry, now: float) -> dict[str, Any]:
         """Lanes, S1 and hardware for the live view (usage.collect_live): the same sources usage_view reads."""

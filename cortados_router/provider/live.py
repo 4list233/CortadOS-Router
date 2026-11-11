@@ -14,7 +14,7 @@ It composes views that already exist rather than re-deriving them:
   - conversations  in-flight routed work: the Office view's floors (orchestrators) and workers, minus child tasks.
   - routed         the latest routing decisions, from tasks.collect (router.db, read-only, row-limited).
   - subscriptions  every lane's % left per window, from usage.collect_live (scarcity.json read strictly: cache only,
-                   never a vendor CLI), and the lowest general window across lanes.
+                   never a vendor CLI), and the lowest general window across the lanes routing can use (lane_enabled).
   - s1             the scorer's /health probe usage already memoises (reachable, HTTP status, latency).
   - hosts          the fleet (default air, studio, pro: CORTADOS_LIVE_HOSTS), each with its hardware sample (usage's
                    hardware cards) and its job heartbeat (POST /v1/cortados/live/heartbeat, below), or "none" said so.
@@ -370,8 +370,26 @@ def _general(w: dict[str, Any]) -> bool:
     return w.get("pool") in (None, "all") and not w.get("stale") and _num(w.get("left_pct"))
 
 
-def subscriptions_section(u: dict[str, Any], now: float) -> dict[str, Any]:
+def lane_enabled(lane: Any) -> bool:
+    """Whether the router can send work to `lane` at all, by the checks routing itself makes: the anthropic-api credit
+    lane only with a configured key (the provider refuses every api/ pin without one: server._serve_api_lane), any lane
+    only with a context ceiling above 0 (core.resolve's fit gate refuses every turn on a 0 ceiling: antigravity's
+    containment). A disabled lane's reading (no key: 0 % of a $0 budget) never stands for the fleet's floor."""
+    from cortados_router import api_credits, core
+    if not isinstance(lane, str):
+        return False
+    base = lane.split("#", 1)[0]
+    if base == "anthropic-api":
+        return bool(api_credits.configured_orgs())
+    return core.lane_ceiling(lane) > 0
+
+
+def subscriptions_section(u: dict[str, Any], now: float,
+                          enabled: Callable[[Any], bool] | None = None) -> dict[str, Any]:
+    """`enabled` (lane -> bool, e.g. lane_enabled) keeps disabled lanes out of `lowest`; they are still listed. One
+    that raises is reported (source "lanes") and its lane is kept out too: an unknown lane is not the floor."""
     lanes = []
+    errors: list = []
     for l in u.get("lanes") or []:
         wins = []
         for w in l.get("windows") or []:
@@ -391,13 +409,22 @@ def subscriptions_section(u: dict[str, Any], now: float) -> dict[str, Any]:
     for l in lanes:
         if l["stale"] or l["error"] or not _num(l["left_pct"]):
             continue                                # a stale or failed reading never stands for the fleet's floor
+        if enabled is not None:
+            try:
+                on = enabled(l["lane"])
+            except Exception as exc:
+                errors.append(_err("lanes", exc))
+                on = False
+            if not on:
+                continue
         if lowest is None or l["left_pct"] < lowest["left_pct"]:
             # the window the headline came from: the fresh one nearest it, a general (pool "all") one on a tie
             w = min((w for w in l["windows"] if not w.get("stale") and _num(w.get("left_pct"))),
                     key=lambda w: (abs(w["left_pct"] - l["left_pct"]), not _general(w)), default=None)
             lowest = {"lane": l["lane"], "label": l["label"], "left_pct": l["left_pct"],
                       "window": (w or {}).get("window")}
-    errors = [e for e in u.get("errors") or [] if isinstance(e, dict) and str(e.get("source", "")).startswith("scarcity")]
+    errors = [e for e in u.get("errors") or [] if isinstance(e, dict) and str(e.get("source", "")).startswith("scarcity")] \
+        + errors
     as_of = u.get("generated_at") if _num(u.get("generated_at")) else now
     return _section(as_of, _status(errors, bool(lanes)), errors, lanes=lanes, lowest=lowest)
 
@@ -465,13 +492,17 @@ def hosts_section(u: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]
         item(me)["roles"].append("provider")
     for n in exec_hosts or {}:
         item(n)["roles"].append("default exec host" if n == exec_default else "exec host")
+    unmatched = 0
     for card in (u or {}).get("hardware") or []:
         data = card.get("data") if isinstance(card, dict) else None
         if not isinstance(data, dict):
             continue
         host = data.get("host") if isinstance(data.get("host"), str) else None
-        name = _match(host, aliases) or _slug(host) or _slug(card.get("file"))
+        # A known name only, as for the provider host above: a card whose hostname matches none is dropped and counted
+        # (below), never shown under its raw hostname (which can carry the owner's name).
+        name = _match(host, aliases)
         if not name:
+            unmatched += 1
             continue
         load = data.get("load_avg")
         hw = {k: data.get(k) for k in _HW_PICK if not isinstance(data.get(k), dict)}
@@ -489,6 +520,9 @@ def hosts_section(u: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]
                            "stale": stale, "jobs": hb["jobs"]}
     errors += [e for e in (u or {}).get("errors") or []
                if isinstance(e, dict) and str(e.get("source", "")).startswith("hardware") and e.get("error") != "absent"]
+    if unmatched:
+        # Counted, never named: add the machine's hostname to its exec-hosts.json `hostnames` (or CORTADOS_LIVE_HOSTS).
+        errors.append(_err("hardware", f"{unmatched} hardware sample(s) match no known host name"))
     return _section(now, _status(errors, bool(items)), errors, provider_host=me, items=list(items.values()),
                     heartbeat_path=HEARTBEAT_PATH)
 
@@ -500,7 +534,8 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
             backend_sessions: int | None = None, peek: Callable[[str], dict[str, Any] | None] | None = None,
             exec_hosts: Callable[[], tuple[dict[str, list[str]], str | None]] | None = None,
             self_host: str | None = None, host_names: list[str] | None = None,
-            remote_stubs: Callable[[], list] | None = None) -> dict[str, Any]:
+            remote_stubs: Callable[[], list] | None = None,
+            lane_enabled: Callable[[Any], bool] | None = None) -> dict[str, Any]:
     """The snapshot. Each input is a callable, run under its own guard: one that raises turns ITS section into
     status "error" with the exception's type (never its text: an OSError carries a path), the rest stand."""
     def guard(source: str, fn: Callable[[], Any], errs: list) -> Any:
@@ -530,7 +565,7 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
         else _section(now, "error", tv_errs, calls=[], totals={}, row_limit=None, more=False)
     u_errs: list = []
     u = guard("usage", usage_view, u_errs)
-    subs = subscriptions_section(u, now) if u is not None else _section(now, "error", u_errs, lanes=[], lowest=None)
+    subs = subscriptions_section(u, now, lane_enabled) if u is not None else _section(now, "error", u_errs, lanes=[], lowest=None)
     s1 = s1_section(u, now, u_errs or None)
     hb_errs: list = []
     beats = guard("heartbeats", heartbeats, hb_errs) or {}

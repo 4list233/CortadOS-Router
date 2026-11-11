@@ -3137,6 +3137,12 @@ class StartTaskErrorTextTests(ChildTaskBase):
     """Every start_task failure is a tool result with a specific, non-empty message (2026-11-11: a start_task from
     another session 'came back with an empty error, so nothing launched'). Fakes only: no ssh, no real child."""
 
+    def setUp(self):
+        super().setUp()
+        tb = mock.patch("traceback.print_exc")   # start() logs the unexpected exceptions these tests raise on purpose
+        tb.start()
+        self.addCleanup(tb.stop)
+
     def _text(self, r):
         self.assertTrue(r.get("isError"), r)
         text = r["content"][0]["text"]
@@ -3164,14 +3170,117 @@ class StartTaskErrorTextTests(ChildTaskBase):
         text = self._text(r)
         self.assertIn("TaskError without a message", text)
 
-    def test_an_unexpected_exception_is_a_specific_ambiguous_tool_error_without_its_text(self):
+    def test_an_unexpected_exception_outside_start_is_specific_and_not_ambiguous(self):
+        # start() classifies everything raised by the launch; one that escapes it happened before any launch.
         with mock.patch.object(ct, "start", side_effect=ValueError("secret-record-content")):
             r, _ = self.call("start_task", task="x")
         text = self._text(r)
         self.assertIn("start_task failed: unexpected ValueError in the cortados-route server", text)
+        self.assertIn("Retrying may work", text)
+        self.assertNotIn("secret-record-content", text)
+        self.assertNotIn("_meta", r)
+
+    def test_a_failure_before_any_spawn_says_nothing_is_running(self):
+        # Review finding (gpt-6.1-sol P2): a tasks dir that is a file fails in _private_root (FileExistsError) before
+        # anything is spawned; the reply must not claim a task may be running.
+        bad = os.path.join(self.tmp, "a-file")
+        with open(bad, "w") as f:
+            f.write("x")
+        with mock.patch.dict(os.environ, {"CORTADOS_TASKS_DIR": bad}):
+            r, _ = self.call("start_task", task="x", cwd=self.work)
+        text = self._text(r)
+        self.assertIn("unexpected FileExistsError in the cortados-route server", text)
+        self.assertIn("before any task was launched: nothing is running", text)
+        self.assertNotIn("list_tasks", text)
+        self.assertNotIn("_meta", r)
+
+    def test_a_failure_during_the_spawn_is_ambiguous(self):
+        with mock.patch.object(ct.subprocess, "Popen", side_effect=ValueError("secret-record-content")):
+            r, _ = self.call("start_task", task="x", cwd=self.work)
+        text = self._text(r)
+        self.assertIn("unexpected ValueError", text)
+        self.assertIn("while a task was being launched", text)
         self.assertIn("run list_tasks", text)
         self.assertNotIn("secret-record-content", text)
+        self.assertEqual(r["_meta"], {m.AMBIGUOUS_META: True})
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "tasks")), [])   # the pre-spawn rollback still ran
+
+    def test_a_failure_after_the_launch_names_the_running_task(self):
+        with mock.patch.object(ct, "watch_command", side_effect=ValueError("secret-record-content")):
+            r, _ = self.call("start_task", task="x", cwd=self.work)
+        text = self._text(r)
+        tid = r["_meta"][m.TASK_ID_META]
+        self.assertRegex(tid, ct.TASK_ID_RE)
         self.assertTrue(r["_meta"][m.AMBIGUOUS_META])
+        self.assertIn(f"after task {tid} was launched", text)
+        self.assertIn(f"task_status {tid}", text)
+        self.assertNotIn("secret-record-content", text)
+        _, st = self.call("task_status", task_id=tid)   # it really is trackable
+        self.assertIn(st["state"], ("running", "succeeded"))
+        ct.cancel(tid)
+
+    def _serve(self, req):
+        out = io.StringIO()
+        with mock.patch.object(ct, "_apply_host_env"), mock.patch.object(ct, "_host_tokens", return_value=[]), \
+                mock.patch.object(ct, "_REMOTE_SERVING", False):
+            rc = ct.serve_remote(io.StringIO(json.dumps(req)), out)
+        return rc, json.loads(out.getvalue())
+
+    def test_the_host_carries_the_launch_classification_of_an_unexpected_exception(self):
+        tid = "t20261111000000-0123abcd"
+
+        def boom(progress, *a, **k):
+            progress.update(launched="yes", task_id=tid)
+            raise ValueError("secret-record-content")
+        req = {"v": ct.exec_hosts.PROTOCOL, "op": "start", "host": "here", "args": {"task": "x"}}
+        with mock.patch.object(ct, "_start", side_effect=boom):
+            rc, reply = self._serve(req)
+        self.assertEqual(rc, 1)
+        self.assertEqual(reply["failure"], {"type": "ValueError", "launched": "yes", "task_id": tid})
+        self.assertIn(f"after task {tid} was launched", reply["error"])
+        self.assertNotIn("secret-record-content", json.dumps(reply))
+
+    def test_the_host_classifies_an_exception_outside_start_as_nothing_launched(self):
+        req = {"v": ct.exec_hosts.PROTOCOL, "op": "start", "host": "here", "args": {"task": "x"}}
+        with mock.patch.object(ct.session, "resolve_provider_url", side_effect=ValueError("secret")):
+            rc, reply = self._serve(req)
+        self.assertEqual(reply["failure"], {"type": "ValueError", "launched": "none", "task_id": None})
+        self.assertIn("internal error on execution host here (ValueError)", reply["error"])
+
+    def _air_failure(self, failure):
+        reply = {"v": ct.exec_hosts.PROTOCOL, "ok": False, "error": "host-side words, not shown", "failure": failure}
+        self._air(transport=lambda a, s, t: (1, json.dumps(reply).encode(), b""))
+        return self.call("start_task", task="x")[0]
+
+    def test_a_remote_failure_while_launching_is_ambiguous_with_local_guidance(self):
+        r = self._air_failure({"type": "ValueError", "launched": "maybe", "task_id": None})
+        text = self._text(r)
+        self.assertIn("unexpected ValueError in execution host 'air' (ssh air-fake)", text)
+        self.assertIn("run list_tasks", text)
+        self.assertNotIn("host-side words", text)
+        self.assertEqual(r["_meta"], {m.AMBIGUOUS_META: True})
+
+    def test_a_remote_failure_before_launch_is_not_ambiguous(self):
+        r = self._air_failure({"type": "KeyError", "launched": "none", "task_id": None})
+        text = self._text(r)
+        self.assertIn("unexpected KeyError in execution host 'air'", text)
+        self.assertIn("nothing is running", text)
+        self.assertNotIn("_meta", r)
+
+    def test_a_remote_failure_after_launch_is_tracked_here_by_its_task_id(self):
+        tid = "t20261111000000-0123abcd"
+        r = self._air_failure({"type": "OSError", "launched": "yes", "task_id": tid})
+        text = self._text(r)
+        self.assertIn(f"task_status {tid}", text)
+        self.assertEqual(r["_meta"], {m.AMBIGUOUS_META: True, m.TASK_ID_META: tid})
+        with open(os.path.join(self.tmp, "tasks", tid, ct.REMOTE_STUB)) as f:
+            self.assertEqual(json.load(f)["host"], "air")
+
+    def test_a_malformed_remote_failure_never_claims_nothing_runs_without_saying_so(self):
+        # "yes" without a valid id cannot be tracked: it falls back to the list_tasks guidance.
+        r = self._air_failure({"type": "OSError", "launched": "yes", "task_id": "../x"})
+        self.assertIn("run list_tasks", self._text(r))
+        self.assertEqual(r["_meta"], {m.AMBIGUOUS_META: True})
 
     def test_an_unexpected_exception_in_another_tool_is_not_marked_ambiguous(self):
         with mock.patch.object(ct, "list_recent", side_effect=KeyError()):
