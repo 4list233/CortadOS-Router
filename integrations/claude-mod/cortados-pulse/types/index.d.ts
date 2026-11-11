@@ -84,6 +84,8 @@ export interface PulseLiveTask {
 }
 export interface PulseLiveConversation {
   kind?: string
+  run_id?: string | null
+  phase?: string | null
   title?: string | null
   project?: string | null
   device?: string | null
@@ -97,8 +99,11 @@ export interface PulseLiveJob { name?: string; state?: string; summary?: string 
 export interface PulseLiveHost {
   name?: string
   heartbeat_state?: 'fresh' | 'stale' | 'none' | string
-  heartbeat?: { age_s?: number; jobs?: PulseLiveJob[] } | null
+  heartbeat?: { age_s?: number; jobs?: PulseLiveJob[]; s1?: PulseLiveS1 | null } | null
+  hardware?: { cpu_busy_pct?: number | null; gpu_busy_pct?: number | null; disk_free_pct?: number | null; source?: string; filled_by?: string | null } | null
 }
+/** The S1 host's heartbeat block (provider/live.py): health, the served model, hold flags, a pending candidate's reason. */
+export interface PulseLiveS1 { health?: string; model?: string | null; flags?: string[]; pending?: string | null }
 export interface PulseLive {
   version?: number
   generated_at?: number

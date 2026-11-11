@@ -133,6 +133,8 @@ td.clip { max-width:260px; overflow:hidden; text-overflow:ellipsis; }
 .job:first-of-type { border-top:0; }
 .job .js { grid-column:2; font-size:12px; color:var(--fg2); }
 .job .meter { grid-column:2; height:5px; margin-top:3px; }
+.s1box { margin-top:6px; padding-top:4px; border-top:1px solid var(--line); }
+.s1box .flags { display:flex; flex-wrap:wrap; gap:6px; padding:4px 0 2px; }
 .s1line { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:8px 0 2px; font-size:13px; }
 
 /* usage tab (the existing usage view, unchanged in substance) */
@@ -358,6 +360,8 @@ function renderTasksPanel(box, s, now, host) {
   }
   add(box, P.p);
 }
+// Conversation kinds (live.conversations_section): open provider conversations, joined with the Office board.
+const KINDS = {orchestrator: "main session", child_task: "child task", subagent: "subagent", conversation: "conversation"};
 function renderConversations(box, s) {
   const P = panel("p-conv", "Conversations", "span-4");
   P.meta.textContent = join([isNum(s.working) ? s.working + " working" : null,
@@ -368,15 +372,15 @@ function renderConversations(box, s) {
     const r = el("div", "row");
     add(r, pill(c.status));
     const w = el("div", "what");
-    const kind = c.kind === "orchestrator" ? "main session" : (c.kind || "conversation");
+    const kind = KINDS[c.kind] || c.kind || "conversation";
     add(w, el("div", "t", c.title || join([c.project || (c.session ? null : "lobby"), kind])));
     add(w, el("div", "m", join([c.model ? c.model + (c.lane ? " (" + c.lane + ")" : "") : c.lane, c.device ? "on " + c.device : null,
-      c.tool ? "tool " + c.tool : null, c.title ? kind : null])));
+      c.tool ? "tool " + c.tool : c.phase, c.title ? kind : null, c.kind === "child_task" ? short(c.run_id) : null])));
     add(r, w);
     const e = el("div", "el"); add(e, tick(el("span", "tick"), c.elapsed_s), el("span", "u", "elapsed"));
     add(rows, add(r, e));
   });
-  if (!(s.items || []).length) add(rows, el("div", "empty", s.status === "error" ? "conversations unknown" : "No routed conversation is active."));
+  if (!(s.items || []).length) add(rows, el("div", "empty", s.status === "error" ? "conversations unknown" : "No conversation is open on the provider."));
   if (s.hidden) add(rows, el("div", "sub", s.hidden + " more not listed"));
   add(P.body, rows);
   add(box, P.p);
@@ -431,6 +435,22 @@ function renderSubs(box, s) {
   if (!(s.lanes || []).length) add(P.body, el("div", "empty", s.status === "error" ? "no lane readings (see error above)" : "no lane readings cached"));
   add(box, P.p);
 }
+// The S1 pipeline as its host reports it (live heartbeat `s1`): health, the served model, hold flags, a pending candidate.
+const S1_FLAG_TEXT = {"no-promote": "promotion held", "no-train-tonight": "no training tonight",
+  "nightly-stop": "nightly loop stopping", "sweep-requested": "calibration sweep requested"};
+function renderS1(c, x) {
+  const box = el("div", "s1box");
+  const r = el("div", "job");
+  add(r, pill(x.health === "up" ? "up" : x.health === "down" ? "down" : "unknown"), el("span", "title", "S1"),
+    el("span", "js", join([x.model || "no model loaded", isNum(x.loaded_s) ? "loaded in " + dur(x.loaded_s) : null])));
+  add(box, r);
+  const flags = el("div", "flags");
+  (x.flags || []).forEach(f => add(flags, pill("partial", S1_FLAG_TEXT[f] || f)));
+  if (x.pending) add(flags, pill("queued", "candidate: " + x.pending.replace(/_/g, " ")));
+  if (!(x.flags || []).length && !x.pending) add(flags, el("span", "sub muted", "no hold flags, no pending candidate"));
+  add(box, flags);
+  add(c, box);
+}
 function renderHosts(box, s, s1) {
   const P = panel("p-hosts", "Hosts", "span-12");
   P.meta.textContent = s.provider_host ? "this provider runs on " + s.provider_host : "provider host: not a known host name";
@@ -439,6 +459,10 @@ function renderHosts(box, s, s1) {
   add(line, el("span", "title", "S1 scorer"), pill(s1.status === "up" ? "up" : s1.status === "down" ? "down" : "unknown"),
     el("span", "sub", join([isNum(s1.latency_ms) ? s1.latency_ms + " ms" : null, isNum(s1.http_status) ? "HTTP " + s1.http_status : null,
       s1.status !== "up" ? s1.reason : null])));
+  // the S1 host's own report (its heartbeat's s1 block): what it serves and the pipeline's hold flags
+  (s.items || []).forEach(h => { const x = h.heartbeat && !h.heartbeat.stale && h.heartbeat.s1;
+    if (x) add(line, el("span", "sub", join(["on " + h.name + ": " + (x.model || "no model loaded"),
+      (x.flags || []).length ? x.flags.map(f => S1_FLAG_TEXT[f] || f).join(", ") : null, x.pending ? "candidate " + x.pending.replace(/_/g, " ") : null]))); });
   add(P.body, line);
   const grid = el("div", "hosts");
   (s.items || []).forEach(h => {
@@ -460,6 +484,7 @@ function renderHosts(box, s, s1) {
         add(c, r);
       });
       if (!(hb.jobs || []).length) add(c, el("div", "sub muted", "no jobs reported"));
+      if (hb.s1) renderS1(c, hb.s1);
     } else add(c, el("div", "sub muted", "no heartbeat yet: POST " + (s.heartbeat_path || "/v1/cortados/live/heartbeat")));
     const hw = h.hardware;
     if (hw) {
@@ -471,8 +496,10 @@ function renderHosts(box, s, s1) {
       add(c, kv);
       add(c, el("div", "sub", join([hw.chip, isNum(hw.mem_available_bytes) ? (hw.mem_available_bytes / 1073741824).toFixed(1) + " GB free" +
         (isNum(hw.mem_total_bytes) ? " of " + (hw.mem_total_bytes / 1073741824).toFixed(0) : "") : null,
-        isNum(hw.load_1m) ? "load " + hw.load_1m.toFixed(2) : null, "sample " + age(hw.age_s) + " old"])));
-    } else add(c, el("div", "sub muted", "no hardware sample"));
+        isNum(hw.load_1m) ? "load " + hw.load_1m.toFixed(2) : null, isNum(hw.disk_free_pct) ? "disk " + pct(hw.disk_free_pct) + " free" : null,
+        "sample " + age(hw.age_s) + " old" + (hw.source === "heartbeat" ? " (heartbeat)" : "") +
+        (hw.filled_by ? ", some fields from an older " + hw.filled_by + " reading" : "")])));
+    } else add(c, el("div", "sub muted", "no hardware sample: run scripts/install_live_heartbeat.sh " + h.name + " there"));
     add(grid, c);
   });
   add(P.body, grid);

@@ -1,7 +1,7 @@
 import { test, expect } from 'claude-code/testing'
 import { FALLBACK, POLL_MS, LIVE_POLL_MS, STALE_AFTER_S, expandHome, resolveProviderUrl, resolveToken, scrub, readConfig, poll,
   pollLive, age, pct, gib, dur, leftPct, laneLabel, laneLines, usageLines, deviceLines, laneOrder, taskLine, conversationLine,
-  runningLines, fleetLines } from './register'
+  runningLines, fleetLines, hwText } from './register'
 import liveFixture from './live.fixture'
 
 const TOKEN = 'sekrit-token-123'
@@ -335,21 +335,24 @@ test('elapsed times read at a glance', () => {
 
 test('the Running section from the provider-generated live snapshot', () => {
   expect(runningLines(liveFixture as any, 0)).toEqual([
-    '1 running · 1 queued · 3 conversations (2 working)',
+    '1 running · 1 queued · 5 conversations (3 working)',
     '● Refactor the scarcity reader · on air · claude-sonnet-5 (claude#b) · tool Bash · 2m 05s',
     '◷ Check the release page · on air · queued 10m 00s',
     'tasks on air only',
+    // the running child's own conversation is its task line above, listed once
     '▸ Review the diff · gpt-6.1 (codex) · tool Read · 1m 30s',
-    '▸ CortadOS-Router · main session · claude-opus-5 · tool Edit · 15m 00s',
-    '· subagent · qwen3-30b (local-studio) · idle · 30s',
+    '▸ CortadOS-Router · main session · claude-opus-5 (claude#a) · tool Edit · 15m 00s',
+    '· conversation · qwen3-30b (local-studio) · idle · 30s',
+    '· conversation · gpt-6.1-mini (codex) · idle · 6m 40s',
   ])
   // elapsed keeps counting between polls
   expect(runningLines(liveFixture as any, 60)[1]).toMatch(/· 3m 05s$/)
   expect(fleetLines(liveFixture as any)).toEqual([
     'S1 up · 23 ms',
     'lowest left: cursor (shared with Grok Bot) 70% (month (Cursor models: Grok, Composer, Auto))',
-    'air: no heartbeat yet',
-    'studio: s1-scorer running, s1-continuous running 38%',
+    'air: com.cortados.provider running · cpu 13% · gpu 3% · disk 40% free',
+    'studio: s1-scorer running, s1-continuous running 38% · cpu 30% · gpu 37% · disk 62% free',
+    '  S1 up: CortadOS Router S1 2026-11-09 (run-20261109) · promotion held · candidate promotion held',
     'pro: no heartbeat yet',
   ])
 })
@@ -366,6 +369,15 @@ test('an unreadable section is said, never drawn as nothing running', () => {
   expect(runningLines(many as any, 0).slice(-1)).toEqual(['  +3 more tasks'])
   expect(taskLine({ task_id: 't1', state: 'running' }, 0)).toBe('● task t1 · —')
   expect(conversationLine({ kind: 'orchestrator', status: 'idle' }, 0)).toBe('· main session · idle')
+  expect(conversationLine({ kind: 'child_task', status: 'working', model: 'm' }, 0)).toBe('▸ child task · m')
+  // a child task with no task line (finished in the log, or not on this host) keeps its conversation line
+  expect(runningLines({ overview: {}, tasks: { status: 'ok', running: [] }, conversations: { status: 'ok', items: [
+    { kind: 'child_task', run_id: 't1', status: 'working', model: 'm' }] } } as any, 0)).toContain('▸ child task · m')
+  expect(hwText(null)).toBe(null)
+  expect(hwText({ disk_free_pct: 9.6 })).toBe('disk 10% free')
+  expect(fleetLines({ overview: {}, hosts: { items: [{ name: 'studio', heartbeat_state: 'fresh',
+    heartbeat: { age_s: 5, jobs: [], s1: { health: 'down', flags: ['nightly-stop', 'other'], pending: null } } }] } } as any))
+    .toEqual(['S1 unknown', 'studio: no jobs', '  S1 DOWN: no model loaded · nightly loop stopping · other'])
   expect(fleetLines({ overview: { s1: 'down' }, s1: { reason: 'URLError' }, hosts: { items: [{ name: 'studio',
     heartbeat_state: 'stale', heartbeat: { age_s: 1800, jobs: [] } }] } } as any))
     .toEqual(['S1 DOWN · URLError', 'studio: STALE heartbeat 30 min old · no jobs'])

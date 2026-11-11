@@ -320,6 +320,10 @@ class FloorTests(OfficeHarness):
         self.assertIn("run-lobby-01", lobby)
         self.assertEqual(len(lobby), 2)
         self.assertTrue(any(x.startswith("c-") for x in lobby))
+        # an untagged conversation is not a subagent (review 2026-11-11); a run id in the lobby still is
+        kinds = {w["run_id"]: w["kind"] for w in v["lobby"]["workers"]}
+        self.assertEqual(kinds.pop("run-lobby-01"), "subagent")
+        self.assertEqual(list(kinds.values()), ["conversation"])
         self.assertEqual(v["dropped_headers"], {"x-cortados-project": 1})
         # the office token sees exactly the same view
         self.assertEqual(self.view(OFFICE_TOKEN)[0]["floors"][0]["session"], v["floors"][0]["session"])
@@ -417,6 +421,21 @@ class HeartbeatTests(OfficeHarness):
         self.assertEqual(w(t0 + 1 + office.DONE_AFTER_S + 1)[0]["status"], "done")
         self.assertEqual(w(t0 + 1 + office.DONE_AFTER_S + office.WORKER_KEEP_S + 2), [])
 
+    def test_a_running_child_between_turns_is_idle_not_done(self):
+        # Bug (2026-11-11): a child task waiting on a long background command (its last turn ended, its log has no end
+        # event) read "done" after 60 s while the tasks section said running. Its log says when it ends.
+        b = office.OfficeBoard()
+        t0 = 2_000_000.0
+        tid = "t20261111150000-0a1b2c3d"
+        b.turn_start("r:" + tid, {"session": SESSION}, run_id=tid, provider="claude", lane="claude#b",
+                     model="claude-opus-5", now=t0)
+        b.turn_end("r:" + tid, {"session": SESSION}, status="idle", now=t0 + 1)
+        started = [{"ts": t0, "event": "started", "task_id": tid, "session": SESSION}]
+        at = t0 + 1 + office.DONE_AFTER_S + 30
+        self.assertEqual(b.view(started, now=at)["floors"][0]["workers"][0]["status"], "idle")
+        ended = started + [{"ts": at, "event": "finished", "task_id": tid, "status": "succeeded"}]
+        self.assertEqual(b.view(ended, now=at + 1)["floors"][0]["workers"][0]["status"], "done")
+
 
 class ChildTaskViewTests(OfficeHarness):
     def test_child_events_make_workers_and_floors(self):
@@ -444,6 +463,22 @@ class ChildTaskViewTests(OfficeHarness):
         w = self.view()[0]["floors"][0]["workers"][0]
         self.assertEqual((w["status"], w["tool"]), ("error", None))
         self.assertIsNotNone(w["ended_at"])
+
+    def test_a_long_queued_child_stays_open_until_its_end_event(self):
+        # Review (2026-11-11): the Office read only 4 h of the child log, so a child that waited hours for the Chrome
+        # lock lost its start event and its idle worker turned "done" 11 min after its last turn.
+        self.assertGreaterEqual(office.CHILD_WINDOW_S, child_tasks.CHROME_QUEUE_MAX_S + child_tasks.CHILD_MAX_S_DEFAULT)
+        now, tid = 1_800_000_000.0, "t20261104120000-0a1b2c3f"
+        b = office.OfficeBoard()
+        b.turn_start("r:" + tid, {}, run_id=tid, provider="claude", lane="claude#a", model="claude-sonnet-5",
+                     now=now - 1800)
+        b.turn_end("r:" + tid, {}, status="idle", now=now - 1500)               # idle 25 min (a long Bash)
+        started = [{"event": "started", "task_id": tid, "ts": now - 8 * 3600, "title": "slow one"}]
+        w = b.view(office.recent_child_events(started, now), now=now)["lobby"]["workers"][0]
+        self.assertEqual((w["run_id"], w["kind"], w["status"]), (tid, "child_task", "idle"))
+        done = started + [{"event": "finished", "task_id": tid, "ts": now - 60, "status": "succeeded"}]
+        w = b.view(office.recent_child_events(done, now), now=now)["lobby"]["workers"][0]
+        self.assertEqual(w["status"], "done")
 
     def test_malformed_child_timestamps_never_break_the_http_view(self):
         now = time.time()

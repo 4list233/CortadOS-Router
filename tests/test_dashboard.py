@@ -399,10 +399,16 @@ class DashboardRenderTest(unittest.TestCase):
                      "Refactor the scarcity reader", "on air · claude-sonnet-5 (claude#b) · tool Bash · workspace active",
                      "2m 05s", "queued", "waiting for the host's Chrome", "Last 24 hours", "Write the changelog",
                      "16m 40s", "archived", "Conversations", "gpt-6.1 (codex) · on pro · tool Read", "Review the diff",
-                     "2 backend sessions open", "Subscriptions", "cursor (shared with Grok Bot)", "70%",
+                     "4 backend sessions open", "3 working",
+                     "claude-sonnet-5 (claude#b) · on pro · tool Bash · child task · t20261…aaaaaa",
+                     "CortadOS-Router · main session", "gpt-6.1-mini (codex) · waiting for the client",
+                     "on studio: CortadOS Router S1 2026-11-09 (run-20261109) · promotion held · candidate promotion held",
+                     "CortadOS Router S1 2026-11-09 (run-20261109) · loaded in 41s", "candidate: promotion held",
+                     "Apple M4 · 8.0 GB free of 24 · load 2.10 · disk 40% free · sample 20 s old (heartbeat)",
+                     "no hardware sample: run scripts/install_live_heartbeat.sh pro there", "Subscriptions", "cursor (shared with Grok Bot)", "70%",
                      "Routed calls", "S1 decision; band R2; steps=1", "1.2 s", "Hosts", "this provider runs on air",
                      "provider · default exec host", "s1-continuous", "sweep 3/8 · 38% · for 59m 20s",
-                     "no heartbeat yet: POST /v1/cortados/live/heartbeat", "23 ms", "1 / 3", "none yet: air, pro",
+                     "no heartbeat yet: POST /v1/cortados/live/heartbeat", "23 ms", "2 / 3", "none yet: pro",
                      "Show all 25"):
             self.assertIn(want, out, want)
         for bad in ("[object Object]", "undefined", "NaN", tl.SECRET, "[ERR]"):

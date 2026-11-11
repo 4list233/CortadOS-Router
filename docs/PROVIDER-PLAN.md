@@ -603,8 +603,16 @@ or an exception type, never its message):
                  "started_at", "ended_at", "elapsed_s", "workspace", "browser", "session", "project", "device"}
          (state unknown: a start with no end event after 10 h, or a result on its host with no end event)
      "conversations": {..., "backend_sessions", "active", "working", "floors", "items": [conv], "hidden"},
-         conv = {"kind": orchestrator|subagent, "run_id", "session", "project", "device", "provider", "lane", "model",
-                 "status": working|idle, "tool", "source", "title", "started_at", "last_activity", "elapsed_s"}
+         conv = {"kind": orchestrator|child_task|subagent|conversation, "run_id", "session", "project", "device",
+                 "provider", "lane", "model", "status": working|idle, "phase", "tool",
+                 "source": provider|heartbeat|routed, "title", "started_at", "last_activity", "elapsed_s"}
+         (source provider: a conversation the Registry holds open (Registry.live_conversations: Office key, a digest of
+          its id as run_id when it has no run id, route provider/lane/model, opened/last used, busy = its turn lock is
+          held, awaiting_tool), joined with the Office board by its key; phase "model turn" | "client running a tool" |
+          "waiting for the client". heartbeat/routed: a floor's orchestrator known only from a heartbeat, or a board
+          worker that holds no open conversation (a one-shot call). Child tasks' conversations are included: the bug of
+          2026-11-11 was a running child talking to the provider for an hour while this section said active 0, because
+          it was built from the board alone and the board files children under tasks.)
      "routed": {..., "calls": [{"ts", "task_id", "session_id", "routing_kind", "band", "lane", "model",
                 "actual_model", "elapsed_ms", "degraded", "s1_reason", "request_chars", "response_chars"}] (25),
                 "totals", "row_limit", "more",
@@ -618,12 +626,19 @@ or an exception type, never its message):
      "hosts": {..., "provider_host" (a known host name, else null), "heartbeat_path", "items": [{"name", "roles", "heartbeat_state": fresh|stale|none,
                "heartbeat": {"received_at", "age_s", "ttl_s", "stale", "jobs": [job]} | null,
                "hardware": {"cpu_busy_pct", "gpu_busy_pct", "mem_available_bytes", "mem_total_bytes", "chip",
-                            "load_1m", "age_s"} | null}]}}
+                            "load_1m", "age_s", "disk_free_pct", "source": sample|heartbeat} | null}]}}
+               heartbeat also carries "s1": {"health", "model", "flags", "pending", "loaded_s"} | null
 
 Section status: `ok`; `partial` (data with some errors); `error` (no data: the source failed or is absent). Host names
 are exec-host slugs; a hardware sample's hostname is matched by an exec host's `hostnames` alias, else by a name equal to
 the hostname or one of its words (`forests-mac-studio` -> studio), never by a guess between two. `provider_host` is
 that match or `null`, never the hostname slug itself (it can carry the owner's name, and `live:read` readers see it).
+`CORTADOS_LIVE_SELF=<known name>` names the provider host when its hostname matches none; a sample from that hostname
+is then shown under it. A host's `hardware` is the fresher of its sample file and its FRESH heartbeat's block (a stale
+heartbeat's hardware is not shown); the heartbeat adds `disk_free_pct` to a fresher sample card. The second bug of
+2026-11-11: the Air (the provider host) showed no hardware because nothing on it writes `hardware/<host>.json` (no
+sampler job exists; `usage` reports the directory as `absent`, which the hosts section does not list as an error), so
+the heartbeat sender now carries the sample.
 
 **Heartbeat.** `POST /v1/cortados/live/heartbeat` (owner token or a write-only `live:heartbeat` client token). A
 heartbeat client is bound to one host: the clients.json entry's `"host"` field, else its name when that is a host slug
@@ -638,7 +653,19 @@ token is not bound.
         "state": "running",            # running | idle | ok | scheduled | failed | stopped
         "summary": "sweep 3/8",        # optional, printable ASCII <= 80, no address
         "progress_pct": 37.5,          # optional, 0..100
-        "started_at": 1794400000, "finished_at": null, "next_at": null}]}   # optional epoch s, within 30 d of now
+        "started_at": 1794400000, "finished_at": null, "next_at": null}],   # optional epoch s, within 30 d of now
+     "hardware": {                     # optional; every field optional or null
+        "cpu_busy_pct": 12.5, "gpu_busy_pct": 3.0, "disk_free_pct": 40.0,           # 0..100
+        "mem_available_bytes": 8589934592, "mem_total_bytes": 25769803776,          # 0..2^50
+        "load_1m": 2.1,                                                             # 0..4096
+        "chip": "Apple M4",                                                         # printable ASCII <= 80, no address
+        "sampled_at": 1794400000},                                                  # epoch s, within 30 d of now
+     "s1": {                           # optional; the S1 host's pipeline
+        "health": "up",                # up | down | unknown (default)
+        "model": "CortadOS Router S1 2026-11-09 (run-x)",   # the scorer /health model name, printable ASCII <= 80
+        "flags": ["no-promote"],       # subset of no-promote, no-train-tonight, nightly-stop, sweep-requested
+        "pending": "promotion_held",   # a pending candidate's reason, [a-z0-9][a-z0-9_.-]{0,47}
+        "loaded_s": 41.2}}             # 0..86400
 
 A post replaces the host's previous one. Refusals: 401 without a token, 403 for a token without the scope, 413 over 8 KiB
 (checked from content-length before reading), 400 naming the bad field (`jobs[0].state`), never echoing its value. The
@@ -646,26 +673,18 @@ board is in memory (16 hosts, LRU; a configured host, from `CORTADOS_LIVE_HOSTS`
 is never evicted, so the board holds at most 16 + the configured hosts): after a provider restart each host shows "no
 heartbeat yet" until its next post.
 
-How a Studio job would post (documented only: nothing on the Studio is changed by #73). A LaunchAgent running every
-5 minutes, or a line at the end of each s1-continuous cycle, with a `live:heartbeat` token minted on the provider host
-(`python3 -B -m cortados_router.provider.clients add studio --scope live:heartbeat --token-file <path>`, bound to host
-`studio` by its name; `--host studio` binds a client with another name) and copied to
-the Studio as `~/.config/cortados/live-heartbeat-token` (0600):
-
-    python3 - <<'PY'
-    import json, os, subprocess, urllib.request
-    def state(label):   # a LaunchAgent's state from launchctl: running when it has a pid
-        out = subprocess.run(["launchctl", "list", label], capture_output=True, text=True)
-        return "stopped" if out.returncode else ("running" if '"PID"' in out.stdout else "idle")
-    body = {"host": "studio", "ttl_s": 900, "jobs": [
-        {"name": "s1-scorer", "state": state("com.cortados.s1-scorer")},
-        {"name": "s1-continuous", "state": state("com.cortados.s1-continuous")}]}
-    tok = open(os.path.expanduser("~/.config/cortados/live-heartbeat-token")).read().strip()
-    url = open(os.path.expanduser("~/.config/cortados/provider-url")).read().strip() + "/v1/cortados/live/heartbeat"
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
-                                 headers={"content-type": "application/json", "authorization": "Bearer " + tok})
-    urllib.request.urlopen(req, timeout=10).read()
-    PY
+The sender is `cortados_router/live_heartbeat.py`, run every 60 s by the LaunchAgent that
+`scripts/install_live_heartbeat.sh <host>` writes and loads (README "Live view": minting the host-bound token on the
+provider host, copying it, installing on the Studio, the Air and the Pro). Config `~/.config/cortados/heartbeat.json`:
+`host`, `provider_url` (else `~/.config/cortados/provider-url`, else loopback), `token_file` (0600, owned by the user, or
+the sender refuses it), `ttl_s` (180: three missed posts before stale), `jobs` (launchd labels, or `{label, name}`;
+at most 14), `hardware`, `disk`, `s1` (`data_dir`, `health_url`). Jobs come from `launchctl print gui/<uid>/<label>`
+(top-level `state`, `pid` presence, `runs`, `last exit code` only; nested blocks such as the environment are skipped and
+never sent): running, ok (last exit 0), idle (never exited), failed (non-zero), stopped (not loaded). The body is checked
+with `live.validate_heartbeat` and the byte cap before it is sent; on a 400 from an older provider it is re-sent once
+without `hardware`/`s1`, both folded into job summaries (`hardware`, `s1` are therefore reserved job names). Tests:
+`tests/test_live_heartbeat.py` (fake launchctl, sample, /health, HTTP opener; the install helper in a throwaway HOME
+with a fake launchctl) and `tests/test_live.py` (the sender against the real endpoint).
 
 ## Compaction content store (phase 1, shadow only)
 

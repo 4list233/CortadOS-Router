@@ -806,6 +806,7 @@ class Registry:
         s.wire_path = wire_path                     # the wire it was opened on (/v1/messages, /v1/responses): _replays
         s.tool_names, s.tools_warned = {t["name"] for t in turn.tools}, False   # what the backend was started with
         s.awaiting_tool_result = False
+        s.opened_at = time.time()                   # the live view's elapsed (live_conversations)
         return s
 
     @staticmethod
@@ -996,6 +997,30 @@ class Registry:
     def get(self, session_id: str):
         with self._lock:
             return self.sessions.get(session_id)
+
+    def live_conversations(self) -> list[dict[str, Any]]:
+        """Every conversation this endpoint holds open, as metadata for the live view (provider/live.py): its Office key
+        (the board's join key), a digest of its id (the id itself is never published), the route's provider, lane and
+        model, when it opened and was last used, whether a turn is running on it (its lock is held) and whether it waits
+        for the client's tool results. Never history, system text, tools or paths."""
+        with self._lock:
+            sessions = list(self.sessions.values())
+        out = []
+        for s in sessions:
+            route = getattr(s, "route", None) or {}
+            rp = str(route.get("provider") or "claude-cli")
+            lock = getattr(s, "lock", None)
+            worker = getattr(s, "office_worker", None)
+            out.append({
+                "key": worker[0] if isinstance(worker, tuple) and worker and isinstance(worker[0], str) else None,
+                "ref": "c-" + hashlib.sha256(str(s.id).encode()).hexdigest()[:12],
+                "provider": office.provider_of(rp, local_lane.LANE_PREFIX),
+                "lane": rp if rp.startswith(local_lane.LANE_PREFIX) else (_route_lane(route) if route else None),
+                "model": route.get("model") or getattr(s, "model", None),
+                "opened_at": getattr(s, "opened_at", None), "last_used": getattr(s, "last_used", None),
+                "busy": bool(lock is not None and hasattr(lock, "locked") and lock.locked()),
+                "awaiting_tool": bool(getattr(s, "awaiting_tool_result", False))})
+        return out
 
     def drop(self, s, reason: str = "dropped") -> None:
         self.note_closed(s, reason)
@@ -2309,7 +2334,8 @@ class ProviderServer(ThreadingHTTPServer):
             usage_view=lambda: self.live_usage_view(registry, now),
             heartbeats=lambda: registry.live.snapshot(now), backend_sessions=len(registry.sessions),
             peek=child_tasks.peek_local, exec_hosts=hosts, self_host=exec_hosts.short_hostname(),
-            remote_stubs=child_tasks.remote_stubs, lane_enabled=live.lane_enabled)
+            remote_stubs=child_tasks.remote_stubs, lane_enabled=live.lane_enabled,
+            conversations=registry.live_conversations)
 
     def live_usage_view(self, registry: Registry, now: float) -> dict[str, Any]:
         """Lanes, S1 and hardware for the live view (usage.collect_live): the same sources usage_view reads."""

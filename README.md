@@ -902,7 +902,10 @@ never asked over ssh. The section's `scope` is always `"provider host"`: a task 
 its events into that host's own `child-tasks.jsonl` and is absent here, so the dashboard and the pulse pane say "tasks
 on <provider host> only". Tasks started from the provider host onto another host leave a remote stub in its tasks dir;
 those from the last 10 h are listed as `elsewhere` (task id, host, start time), their state unknown to this view),
-**conversations** (routed work in flight: the Office view's orchestrators and workers),
+**conversations** (every conversation the provider holds open, from its Registry: kind — main session, child task,
+subagent or untagged conversation —, model, lane, status and phase (`model turn` / `client running a tool` / `waiting
+for the client`), elapsed, joined with the Office board for title, session, project and current tool; plus orchestrators
+known only from heartbeats and routed one-shot calls),
 **routed** (the latest 25 decisions from the Tasks view), **subscriptions** (every lane's % left per window from the
 cached scarcity reading, the same builder and publish pass as the usage view, plus the lowest fresh lane), **s1** (the
 memoised `/health` probe: up/down, latency) and **hosts** (air, studio and pro by default, `CORTADOS_LIVE_HOSTS` to
@@ -910,8 +913,11 @@ change; each with its hardware sample and its job heartbeat, or `heartbeat_state
 `as_of`, `status` and `errors`, so a failed source is said in its place and never drawn as an empty success. Never prompt
 or request text, tool arguments, paths, commands, tokens or environment; it opens no vendor CLI. `hosts.provider_host` is
 published only when the provider's hostname matches a known host name (an exec host's `hostnames` alias, or a name from
-`CORTADOS_LIVE_HOSTS`/the defaults, exec-hosts.json or a heartbeat), else `null`: the raw hostname can carry the owner's
-name. The answer is memoised for 2 s with a single flight (any number of tabs and panes cost one collect; a heartbeat
+`CORTADOS_LIVE_HOSTS`/the defaults, exec-hosts.json or a heartbeat) or `CORTADOS_LIVE_SELF` names it, else `null`: the
+raw hostname can carry the owner's name; a hardware sample from the provider's own hostname is shown under that name. A
+host's hardware is the fresher of its `hardware/<host>.json` sample and its fresh heartbeat's `hardware` block (marked
+`source: "sample"` / `"heartbeat"`); nothing writes the sample file on its own, so in practice the heartbeat sender below
+is what fills the cards. The answer is memoised for 2 s with a single flight (any number of tabs and panes cost one collect; a heartbeat
 post refreshes it), and the dashboard and the pane never start a poll while the previous one is still out.
 
 A host whose jobs the provider cannot see (the Mac Studio's S1 scorer and continuous training) reports them with
@@ -921,12 +927,50 @@ bound; `clients add <name> --scope live:heartbeat [--host studio] --token-file <
 `{"host": "studio", "ttl_s": 900, "jobs": [{"name": "s1-scorer", "state": "running", "summary": "serving v12"}]}`.
 Fields are validated strictly (8 KiB body cap, 16 jobs, fixed states, an 80-character summary with no address) and a
 bad one is refused naming the field, never echoing its value. The board keeps 16 hosts (least recently posted out first),
-but never evicts a configured host (`CORTADOS_LIVE_HOSTS` or the defaults, and exec-hosts.json's names). docs/PROVIDER-PLAN.md ("Live view") has the full schema and
-a sender a Studio job could run; nothing on the Studio posts yet, and the page says "no heartbeat yet" until it does.
+but never evicts a configured host (`CORTADOS_LIVE_HOSTS` or the defaults, and exec-hosts.json's names). A heartbeat may
+also carry `hardware` (cpu/gpu busy %, memory bytes, 1-min load, disk free %, chip name, sample time) and `s1` (health,
+the served model's name, the pipeline's hold flags `no-promote` / `no-train-tonight` / `nightly-stop` /
+`sweep-requested`, a pending candidate's reason slug); docs/PROVIDER-PLAN.md ("Live view") has the full schema.
+
+**The heartbeat sender** (`cortados_router/live_heartbeat.py`, stdlib) runs on each host every 60 s from a LaunchAgent.
+It reports the configured launchd jobs from `launchctl print gui/<uid>/<label>` (running / ok / idle / failed / stopped,
+"pid up, 3 runs, last exit 0"), this machine's hardware (`hardware.sample()` plus the home volume's free %), and on the
+Studio the S1 pipeline: which of `data/no-promote`, `data/no-train-tonight`, `data/nightly.stop`,
+`data/sweep-request.json` exist (never their contents), the reason field of `data/pending-candidate`, and the scorer's
+`/health` (its model name). It never sends a token, environment, path or command line; the body is checked against the
+server's own validator and 8 KiB cap before it is sent (`--dry-run` prints it, `--check` checks the config and token
+file only). On a provider that predates the `hardware`/`s1` blocks it falls back to the jobs-only body with both folded
+into job summaries. To install it on a host:
+
+```sh
+# 1. on the PROVIDER host (the Air): mint one host-bound token per host (never printed; written 0600)
+python3 -B -m cortados_router.provider.clients add studio-heartbeat --scope live:heartbeat --host studio \
+    --token-file ~/.config/cortados/heartbeat-tokens/studio
+python3 -B -m cortados_router.provider.clients add pro-heartbeat --scope live:heartbeat --host pro \
+    --token-file ~/.config/cortados/heartbeat-tokens/pro
+python3 -B -m cortados_router.provider.clients add air-heartbeat --scope live:heartbeat --host air \
+    --token-file ~/.config/cortados/live-heartbeat-token          # the Air's own: already in place
+# 2. copy each token to its host as ~/.config/cortados/live-heartbeat-token, mode 600, e.g.
+scp ~/.config/cortados/heartbeat-tokens/studio studio:.config/cortados/live-heartbeat-token
+ssh studio chmod 600 .config/cortados/live-heartbeat-token
+# 3. on each host, from its checkout (the provider reads clients.json fresh: no restart needed for the token)
+scripts/install_live_heartbeat.sh studio      # s1 block on; jobs = every loaded com.cortados.* label there
+scripts/install_live_heartbeat.sh air         # provider, bot gateway, archive cleanup: whatever is loaded
+scripts/install_live_heartbeat.sh pro
+```
+
+The helper writes `~/.config/cortados/heartbeat.json` (host, provider URL — `--provider-url`, else the host's existing
+`~/.config/cortados/provider-url`, else loopback —, token file, labels — `--labels a,b` to choose —, checks; an existing
+file is kept unless `--force`), checks it with the sender, writes `~/Library/LaunchAgents/com.cortados.live-heartbeat.plist`
+(built with `plistlib`, so any path is written as it is; no secret in it) and loads it with `launchctl bootstrap`.
+`--dry-run` prints both files and changes nothing. Its log is `~/.cortados/live-heartbeat.out` (one line per failed post;
+a 403 there means the token is bound to another host). Remove: `launchctl bootout gui/$(id -u)/com.cortados.live-heartbeat`
+and delete the plist; revoke the token with `clients remove <name>`.
 
 The dashboard's **Live** tab reads it every 5 s while the tab is visible: an overview strip (running tasks, active
 conversations, S1 health, the lowest subscription, host heartbeats), the Tasks panel (running first, elapsed ticking each
 second, then the last 24 h), Conversations, Routed calls, Subscriptions (% left bars per window, stale readings hatched)
-and Hosts (heartbeat jobs, CPU/GPU busy, memory). Light and dark themes (the system's, or pinned with the Theme button),
+and Hosts (heartbeat jobs, CPU/GPU busy, memory, disk; on the S1 host its served model, hold flags and pending
+candidate, also summarised on the S1 line). Light and dark themes (the system's, or pinned with the Theme button),
 and it fits a phone. The `cortados-pulse` pane shows the same Running section beside the chat and links the page.
 A scoped reader token: `python3 -B -m cortados_router.provider.clients add phone --scope live:read --token-file <path>`.
