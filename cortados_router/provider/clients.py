@@ -7,6 +7,11 @@ its scopes allow and nothing more.
 
 Clients live in a JSON file (CORTADOS_PROVIDER_CLIENTS, default ~/.config/cortados/clients.json):
     {"version": 1, "clients": [{"name": "claw3d", "token_sha256": "<64 hex>", "scopes": ["office:read"]}]}
+A `live:heartbeat` client is bound to ONE host: it may post heartbeats for that host only (403 for any other), so a leaked
+heartbeat token can neither speak for another machine nor push real hosts off the board. The host is the entry's
+`"host"` field ([a-z][a-z0-9-]{0,31}, the exec-host slug), else the client's own name when that is a valid host name
+(a client named "studio" posts for "studio"); a heartbeat client with neither is refused like any bad entry. `host` on a
+client without live:heartbeat is refused too (it would mean nothing). The owner token is never bound.
 Only the SHA-256 of each token is stored, so the file is not a secret by itself; the token lives in the client's own
 0600 token file. The file is re-read when its size or mtime changes, so adding or revoking a client needs no restart.
 A file that does not parse, or names an unknown scope, loads NO clients (fail closed) and says why in the log: a typo
@@ -14,6 +19,7 @@ must never widen access, and a half-loaded file would be a silent partial fallba
 
 CLI (never prints a token):
     python3 -B -m cortados_router.provider.clients add <name> --scope office:read --token-file <path>
+    python3 -B -m cortados_router.provider.clients add studio-s1 --scope live:heartbeat --host studio --token-file <path>
     python3 -B -m cortados_router.provider.clients remove <name>
     python3 -B -m cortados_router.provider.clients list
 """
@@ -40,14 +46,22 @@ logger = logging.getLogger(__name__)
 DEFAULT_CLIENTS_FILE = "~/.config/cortados/clients.json"
 CLIENTS_ENV = "CORTADOS_PROVIDER_CLIENTS"
 OFFICE_PATH = "/v1/cortados/office"
+LIVE_PATH = "/v1/cortados/live"                       # provider/live.py LIVE_PATH (a test keeps the two equal)
+LIVE_HEARTBEAT_PATH = "/v1/cortados/live/heartbeat"   # provider/live.py HEARTBEAT_PATH
 # Scope -> the (method, path) pairs it opens. Exact paths only (no prefixes): a prefix would open whatever is added
 # under it later. A new reader gets a new scope here, reviewed, never a wildcard.
 SCOPES: dict[str, frozenset[tuple[str, str]]] = {
     "office:read": frozenset({("GET", OFFICE_PATH)}),
+    # the live snapshot (dashboard, pulse pane): read-only metadata, like the office view
+    "live:read": frozenset({("GET", LIVE_PATH)}),
+    # write-only: a host posting its job states (the Studio's S1 jobs) without holding the owner token, which routes
+    "live:heartbeat": frozenset({("POST", LIVE_HEARTBEAT_PATH)}),
 }
 # A client name lands in log lines: short and plain, so it can never carry a token or a path.
 _NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
+_HOST_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")        # live._HOST_RE / exec_hosts.HOST_NAME_RE
+HEARTBEAT_SCOPE = "live:heartbeat"
 # Few clients exist (one today, two planned); a file listing more is not a reviewed list.
 MAX_CLIENTS = 32
 # 32 entries need under 8 KiB in the CLI's format; 64 KiB leaves ample formatting headroom while bounding auth reads.
@@ -64,6 +78,7 @@ class ClientsError(ValueError):
 class Client:
     name: str
     scopes: frozenset[str]
+    host: str | None = None                         # the one host a live:heartbeat client may post for (see above)
 
     def allows(self, method: str, path: str) -> bool:
         return any((method, path) in SCOPES[s] for s in self.scopes)
@@ -105,11 +120,20 @@ def parse(raw: str) -> list[tuple[str, Client]]:
             # Refused, not skipped: a scope this provider does not know is a typo or a newer file, and guessing would
             # either drop access silently or grant something unreviewed.
             raise ClientsError(f"client {name}: unknown scope(s) {', '.join(unknown)} (known: {', '.join(sorted(SCOPES))})")
+        host = e.get("host")
+        if HEARTBEAT_SCOPE in scopes:
+            if host is None and _HOST_RE.fullmatch(name):
+                host = name
+            if not isinstance(host, str) or not _HOST_RE.fullmatch(host):
+                raise ClientsError(f"client {name}: a {HEARTBEAT_SCOPE} client needs a host ([a-z][a-z0-9-]{{0,31}}), "
+                                   "in its \"host\" field or as its name")
+        elif host is not None:
+            raise ClientsError(f"client {name}: \"host\" applies only to a {HEARTBEAT_SCOPE} client")
         if name in names or digest in digests:
             raise ClientsError(f"client {name}: duplicate name or token")
         names.add(name)
         digests.add(digest)
-        out.append((digest, Client(name=name, scopes=frozenset(scopes))))
+        out.append((digest, Client(name=name, scopes=frozenset(scopes), host=host)))
     return out
 
 
@@ -210,6 +234,7 @@ def main(argv=None) -> int:
     a.add_argument("name")
     a.add_argument("--scope", action="append", required=True, choices=sorted(SCOPES))
     a.add_argument("--token-file", required=True)
+    a.add_argument("--host", help=f"the host a {HEARTBEAT_SCOPE} client posts for (default: its name)")
     r = sub.add_parser("remove", help="revoke a client")
     r.add_argument("name")
     sub.add_parser("list", help="client names and scopes")
@@ -232,7 +257,7 @@ def _locked_main(args, p: Path) -> int:
     doc = _load_doc(p)
     if args.cmd == "list":
         for e in doc["clients"]:
-            print(f"{e['name']}: {', '.join(e['scopes'])}")
+            print(f"{e['name']}: {', '.join(e['scopes'])}" + (f" (host {e['host']})" if e.get("host") else ""))
         return 0
     if args.cmd == "remove":
         kept = [e for e in doc["clients"] if e["name"] != args.name]
@@ -251,7 +276,10 @@ def _locked_main(args, p: Path) -> int:
     if len(doc["clients"]) >= MAX_CLIENTS:
         raise ClientsError(f"cannot add more than {MAX_CLIENTS} clients")
     token = secrets.token_urlsafe(32)
-    doc["clients"].append({"name": args.name, "token_sha256": token_digest(token), "scopes": sorted(set(args.scope))})
+    entry = {"name": args.name, "token_sha256": token_digest(token), "scopes": sorted(set(args.scope))}
+    if args.host is not None:
+        entry["host"] = args.host
+    doc["clients"].append(entry)
     candidate = json.dumps(doc, indent=1) + "\n"
     parse(candidate)                                # reject the full candidate BEFORE creating the token file
     tf = Path(os.path.expanduser(args.token_file))

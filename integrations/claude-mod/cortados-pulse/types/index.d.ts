@@ -66,8 +66,65 @@ export interface Pulse {
   devices?: PulseDevices
 }
 
+// The provider's GET /v1/cortados/live (cortados_router/provider/live.py `collect`), the fields this pane reads. Each
+// section carries as_of, status (ok / partial / error; s1: up / down / unknown) and errors [{source, error}].
+export interface PulseLiveError { source?: string; error?: string }
+export interface PulseLiveSection { as_of?: number; status?: string; errors?: PulseLiveError[] }
+export interface PulseLiveTask {
+  task_id?: string
+  title?: string | null
+  state?: string
+  phase?: string | null
+  host?: string | null
+  model?: string | null
+  lane?: string | null
+  tool?: string | null
+  elapsed_s?: number | null
+  ended_at?: number | null
+}
+export interface PulseLiveConversation {
+  kind?: string
+  title?: string | null
+  project?: string | null
+  device?: string | null
+  model?: string | null
+  lane?: string | null
+  status?: string
+  tool?: string | null
+  elapsed_s?: number | null
+}
+export interface PulseLiveJob { name?: string; state?: string; summary?: string | null; progress_pct?: number | null }
+export interface PulseLiveHost {
+  name?: string
+  heartbeat_state?: 'fresh' | 'stale' | 'none' | string
+  heartbeat?: { age_s?: number; jobs?: PulseLiveJob[] } | null
+}
+export interface PulseLive {
+  version?: number
+  generated_at?: number
+  overview?: {
+    running_tasks?: number | null
+    queued_tasks?: number | null
+    active_conversations?: number | null
+    working_conversations?: number | null
+    s1?: string
+    s1_latency_ms?: number | null
+    lowest_subscription?: { lane?: string; label?: string | null; left_pct?: number; window?: string | null } | null
+  }
+  // scope: always "provider host" (tasks on other execution hosts log there); elsewhere: tasks started from the provider
+  // host onto another host in the last 10 h, their state unknown to the view
+  tasks?: PulseLiveSection & { counts?: Record<string, number> | null; running?: PulseLiveTask[]; queued?: PulseLiveTask[]; recent?: PulseLiveTask[]
+    scope?: string; elsewhere?: { task_id?: string; host?: string; started_at?: number }[] }
+  conversations?: PulseLiveSection & { items?: PulseLiveConversation[]; hidden?: number; active?: number | null; working?: number | null }
+  s1?: PulseLiveSection & { latency_ms?: number | null; reason?: string | null }
+  hosts?: PulseLiveSection & { items?: PulseLiveHost[]; provider_host?: string | null }
+}
+
 declare module 'claude-code' {
   interface PluginState {
-    'cortados-pulse': { held: { data: Pulse; at: number } | null; err: string | null }
+    'cortados-pulse': {
+      held: { data: Pulse; at: number } | null; err: string | null
+      live: { data: PulseLive; at: number; base: string } | null; liveErr: string | null
+    }
   }
 }

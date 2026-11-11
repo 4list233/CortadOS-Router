@@ -3,59 +3,195 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CortadOS Router · usage</title>
+<meta name="color-scheme" content="light dark">
+<title>CortadOS Router · live</title>
 <style>
-:root { --bg:#f6f7f9; --card:#fff; --fg:#1b1f24; --muted:#6a737d; --line:#e1e4e8; --bar:#2f7de1; --low:#d9822b; --bad:#d73a49; }
-@media (prefers-color-scheme: dark) { :root { --bg:#0f1115; --card:#181b21; --fg:#e6e8eb; --muted:#8b949e; --line:#2a2f37; --bar:#4c9aff; --low:#e3a04f; --bad:#f06b78; } }
-* { box-sizing: border-box; }
-body { margin:0; font:14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; background:var(--bg); color:var(--fg); }
-header { display:flex; align-items:center; gap:12px; padding:14px 22px; border-bottom:1px solid var(--line); }
-header h1 { font-size:17px; margin:0; }
-#status { color:var(--muted); margin-left:auto; }
-button { font:inherit; padding:4px 10px; border:1px solid var(--line); background:var(--card); color:var(--fg); border-radius:6px; cursor:pointer; }
-main { padding:18px 22px; max-width:1400px; margin:0 auto; }
-h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin:22px 0 8px; }
+/* Two themes from one set of roles. Light is the default; dark follows the system unless the theme button pins one.
+   Status colours (good / warning / serious / critical) are reserved for state and always ship with an icon and a word. */
+:root {
+  --page:#f9f9f7; --card:#fcfcfb; --raise:#ffffff; --fg:#0b0b0b; --fg2:#52514e; --muted:#898781; --line:#e1e0d9;
+  --ring:rgba(11,11,11,.10); --accent:#2a78d6; --track:rgba(42,120,214,.16); --good:#0ca30c; --good-ink:#006300;
+  --warn:#fab219; --warn-ink:#8a5a00; --serious:#ec835a; --crit:#d03b3b; --crit-ink:#b42323; --chip:#f0efea;
+  --shadow:0 1px 2px rgba(11,11,11,.05), 0 4px 16px rgba(11,11,11,.04);
+}
+:root[data-theme="dark"] {
+  --page:#0d0d0d; --card:#1a1a19; --raise:#222220; --fg:#f0efec; --fg2:#c3c2b7; --muted:#898781; --line:#2c2c2a;
+  --ring:rgba(255,255,255,.10); --accent:#3987e5; --track:rgba(57,135,229,.22); --good:#0ca30c; --good-ink:#3fc43f;
+  --warn:#fab219; --warn-ink:#fab219; --serious:#ec835a; --crit:#d03b3b; --crit-ink:#f06b6b; --chip:#262624;
+  --shadow:none;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page:#0d0d0d; --card:#1a1a19; --raise:#222220; --fg:#f0efec; --fg2:#c3c2b7; --muted:#898781; --line:#2c2c2a;
+    --ring:rgba(255,255,255,.10); --accent:#3987e5; --track:rgba(57,135,229,.22); --good:#0ca30c; --good-ink:#3fc43f;
+    --warn:#fab219; --warn-ink:#fab219; --serious:#ec835a; --crit:#d03b3b; --crit-ink:#f06b6b; --chip:#262624;
+    --shadow:none;
+  }
+}
+* { box-sizing:border-box; }
+html, body { margin:0; }
+body { font:14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif; background:var(--page); color:var(--fg); -webkit-font-smoothing:antialiased; }
+.num, .tick, td.num { font-variant-numeric:tabular-nums; }
+button { font:inherit; font-size:13px; padding:5px 11px; border:1px solid var(--line); background:var(--card); color:var(--fg); border-radius:8px; cursor:pointer; }
+button:hover { border-color:var(--muted); }
+button:focus-visible, .tab:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+header { position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; align-items:center; gap:10px 14px; padding:10px 22px; background:var(--page); border-bottom:1px solid var(--line); }
+.brand { display:flex; align-items:center; gap:8px; font-weight:650; font-size:16px; letter-spacing:-.01em; }
+.mark { width:22px; height:22px; border-radius:6px; background:var(--fg); color:var(--page); display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; }
+nav { display:flex; gap:2px; background:var(--chip); padding:3px; border-radius:9px; }
+.tab { border:0; background:transparent; padding:4px 12px; border-radius:7px; color:var(--fg2); }
+.tab.on { background:var(--card); color:var(--fg); box-shadow:0 0 0 1px var(--ring); }
+#status { color:var(--fg2); font-size:12.5px; margin-left:auto; }
+#status.err, #storage { color:var(--crit-ink); }
+#storage { font-size:12.5px; }
+.live-dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--good); margin-right:6px; vertical-align:1px; }
+body.stale .live-dot { background:var(--muted); }
+main { padding:18px 22px 40px; max-width:1440px; margin:0 auto; }
+body.stale main { opacity:.55; }
+h2 { font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:22px 0 8px; }
+.sub { color:var(--fg2); font-size:12.5px; }
+.muted { color:var(--muted); }
+.err { color:var(--crit-ink); }
+.title { font-weight:600; }
+
+/* overview strip */
+.overview { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:12px; margin-bottom:16px; }
+.tile { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px 13px; box-shadow:var(--shadow); min-width:0; }
+.tile .label { font-size:12.5px; color:var(--fg2); }
+.tile .value { font-size:28px; font-weight:650; letter-spacing:-.02em; line-height:1.15; margin-top:4px; font-variant-numeric:tabular-nums; }
+.tile .value.small { font-size:20px; }
+.tile .value.warn { color:var(--warn-ink); }
+.tile .note { font-size:12px; color:var(--muted); margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+/* panels */
+.panels { display:grid; grid-template-columns:repeat(12, minmax(0, 1fr)); gap:14px; align-items:start; }
+.panel { background:var(--card); border:1px solid var(--line); border-radius:12px; box-shadow:var(--shadow); min-width:0; }
+.panel > .head { display:flex; align-items:baseline; flex-wrap:wrap; gap:6px 10px; padding:12px 16px 10px; border-bottom:1px solid var(--line); }
+.panel > .head .name { font-weight:650; font-size:14.5px; }
+.panel > .head .meta { margin-left:auto; font-size:12px; color:var(--muted); }
+.panel > .body { padding:6px 16px 12px; }
+.span-8 { grid-column:span 8; } .span-4 { grid-column:span 4; } .span-7 { grid-column:span 7; } .span-5 { grid-column:span 5; } .span-12 { grid-column:span 12; }
+.secerr { margin:8px 0 2px; padding:7px 10px; border-radius:8px; background:rgba(208,59,59,.08); color:var(--crit-ink); font-size:12.5px; }
+.empty { padding:16px 0 8px; color:var(--muted); font-size:13px; }
+
+/* status pills: icon + word, colour never alone */
+.pill { display:inline-flex; align-items:center; gap:5px; font-size:11.5px; font-weight:600; padding:2px 8px 2px 7px; border-radius:999px; background:var(--chip); color:var(--fg2); white-space:nowrap; }
+.pill .ic { font-size:10px; line-height:1; }
+.pill.run { color:var(--accent); background:var(--track); }
+.pill.run .ic { animation:pulse 1.6s ease-in-out infinite; }
+.pill.ok { color:var(--good-ink); background:rgba(12,163,12,.12); }
+.pill.warn { color:var(--warn-ink); background:rgba(250,178,25,.16); }
+.pill.bad { color:var(--crit-ink); background:rgba(208,59,59,.12); }
+@keyframes pulse { 50% { opacity:.35; } }
+@media (prefers-reduced-motion: reduce) { .pill.run .ic { animation:none; } }
+.chip { display:inline-block; font-size:11.5px; padding:1px 7px; border-radius:6px; background:var(--chip); color:var(--fg2); margin-right:4px; }
+
+/* task / conversation rows */
+.rows { display:flex; flex-direction:column; }
+.row { display:grid; grid-template-columns:auto minmax(0, 1fr) auto; gap:4px 12px; align-items:center; padding:10px 0; border-bottom:1px solid var(--line); }
+.row:last-child { border-bottom:0; }
+.row .what { min-width:0; }
+.row .what .t { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.row .what .m { font-size:12px; color:var(--fg2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.row .el { font-size:18px; font-weight:600; font-variant-numeric:tabular-nums; text-align:right; }
+.row .el .u { display:block; font-size:11px; font-weight:400; color:var(--muted); }
+.group { margin-top:10px; font-size:11.5px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+
+/* tables */
+.wide { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+table { width:100%; border-collapse:collapse; }
+td, th { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:middle; white-space:nowrap; }
+th { color:var(--muted); font-weight:500; font-size:11.5px; }
+td { font-size:13px; }
+td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+td.reason { font-size:12px; color:var(--fg2); white-space:normal; min-width:180px; }
+td.clip { max-width:260px; overflow:hidden; text-overflow:ellipsis; }
+
+/* meters: the fill carries severity, the track is a light step of the accent */
+.meter { height:8px; border-radius:4px; background:var(--track); overflow:hidden; }
+.meter > i { display:block; height:100%; border-radius:4px; background:var(--accent); }
+.meter.low > i { background:var(--warn); } .meter.bad > i { background:var(--crit); }
+.meter.stale { background:repeating-linear-gradient(135deg, var(--line) 0 4px, transparent 4px 8px); }
+.meter.stale > i { background:var(--muted); }
+.lane { padding:10px 0; border-bottom:1px solid var(--line); }
+.lane:last-child { border-bottom:0; }
+.lane .top { display:flex; align-items:baseline; gap:8px; }
+.lane .top .big { margin-left:auto; font-size:20px; font-weight:650; font-variant-numeric:tabular-nums; }
+.win { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:3px 10px; align-items:baseline; margin-top:7px; font-size:12px; color:var(--fg2); }
+.win .p { text-align:right; font-variant-numeric:tabular-nums; color:var(--fg); font-weight:600; }
+.win .meter { grid-column:1 / -1; height:6px; }
+.more { margin-top:8px; }
+
+/* hosts */
+.hosts { display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:12px; padding-top:8px; align-items:start; }
+.host { border:1px solid var(--line); border-radius:10px; padding:12px 13px; background:var(--raise); min-width:0; }
+.host .top { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+.host .top .hn { font-weight:650; font-size:15px; text-transform:capitalize; }
+.host .top .pill { margin-left:auto; }
+.kv { display:grid; grid-template-columns:auto minmax(0, 1fr) auto; gap:4px 8px; align-items:center; font-size:12px; color:var(--fg2); margin-top:6px; }
+.job { display:grid; grid-template-columns:auto minmax(0, 1fr); gap:2px 8px; align-items:center; padding:5px 0; border-top:1px dashed var(--line); font-size:12.5px; }
+.job:first-of-type { border-top:0; }
+.job .js { grid-column:2; font-size:12px; color:var(--fg2); }
+.job .meter { grid-column:2; height:5px; margin-top:3px; }
+.s1line { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:8px 0 2px; font-size:13px; }
+
+/* usage tab (the existing usage view, unchanged in substance) */
 .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(260px, 1fr)); gap:12px; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
 .card.stale { opacity:.55; }
-.title { font-weight:600; }
-.sub { color:var(--muted); font-size:12px; }
-.bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin:6px 0; }
-.bar > div { height:100%; background:var(--bar); }
-.bar.low > div { background:var(--low); } .bar.bad > div { background:var(--bad); }
+.card.errors { border-color:var(--crit); }
+.bar { height:8px; background:var(--track); border-radius:4px; overflow:hidden; margin:6px 0; }
+.bar > div { height:100%; background:var(--accent); border-radius:4px; }
+.bar.low > div { background:var(--warn); } .bar.bad > div { background:var(--crit); }
 .big { font-size:22px; font-weight:600; }
-table { width:100%; border-collapse:collapse; }
-td, th { text-align:left; padding:4px 6px; border-bottom:1px solid var(--line); vertical-align:middle; }
-th { color:var(--muted); font-weight:500; font-size:12px; }
-td.num { text-align:right; font-variant-numeric:tabular-nums; width:60px; }
 td.barcell { width:40%; }
-td.reason { font-size:12px; color:var(--muted); }
-.wide { overflow-x:auto; }
 .cols { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:12px; }
-ul { margin:0; padding-left:18px; } .err { color:var(--bad); }
-.card.errors { border-color:var(--bad); } #status.err, #storage { color:var(--bad); }
-body.stale main { opacity:.55; }
-#login { max-width:360px; margin:80px auto; }
-#login input { width:100%; padding:7px; margin:8px 0; font:inherit; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); }
+ul { margin:0; padding-left:18px; }
+#login { max-width:380px; margin:80px auto; }
+#login input { width:100%; padding:8px; margin:10px 0; font:inherit; border:1px solid var(--line); border-radius:8px; background:var(--page); color:var(--fg); }
+
+@media (max-width: 1100px) {
+  .overview { grid-template-columns:repeat(3, minmax(0, 1fr)); }
+  .span-8, .span-4, .span-7, .span-5 { grid-column:span 12; }
+}
+@media (max-width: 640px) {
+  header { padding:10px 14px; }
+  main { padding:12px 12px 32px; }
+  .overview { grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; }
+  .tile .value { font-size:24px; }
+  .panel > .body, .panel > .head { padding-left:12px; padding-right:12px; }
+  #status { order:5; width:100%; margin-left:0; }
+  td.reason { min-width:140px; }
+}
 </style>
 </head>
 <body>
-<header><h1>CortadOS Router · usage</h1><span id="status"></span><span id="storage" hidden></span><button id="logout" hidden>Forget token</button></header>
+<header>
+  <div class="brand"><span class="mark">C</span>CortadOS</div>
+  <nav id="tabs" hidden><button id="tab-live" class="tab on" type="button">Live</button><button id="tab-usage" class="tab" type="button">Usage</button></nav>
+  <span id="status"></span><span id="storage" hidden></span>
+  <button id="theme" type="button">Theme: auto</button>
+  <button id="logout" type="button" hidden>Forget token</button>
+</header>
 <form id="login" class="card" hidden>
   <div class="title">Provider token</div>
-  <div class="sub">Kept in this tab's sessionStorage only; sent as a Bearer header to /v1/cortados/usage and /v1/cortados/tasks.</div>
+  <div class="sub">Kept in this tab's sessionStorage only; sent as a Bearer header to /v1/cortados/live, /v1/cortados/usage and /v1/cortados/tasks.</div>
   <input id="tok" type="password" autocomplete="off" required>
   <button type="submit">Open dashboard</button>
 </form>
+<main id="live" hidden></main>
 <main id="main" hidden></main>
 <script>
 "use strict";
-// EVERY: the scarcity cache behind the lane cards is refreshed every few minutes and the 7-day counts move slowly, so a
-// 30 s poll shows changes promptly while the server's 2 s collect memo keeps several open tabs from re-scanning its logs.
-// TASKS_URL is fetched on the same poll, after the usage view: its row-limited read of router.db is bounded server-side.
-const KEY = "cortados-usage-token", URL_ = "/v1/cortados/usage", TASKS_URL = "/v1/cortados/tasks", EVERY = 30000;
+// Two views behind one token. LIVE (/v1/cortados/live, provider/live.py) is polled every LIVE_EVERY while its tab is
+// shown and the page is visible: it is a cheap, cache-only snapshot (no router.db aggregates, no vendor CLI). USAGE
+// (/v1/cortados/usage, then /v1/cortados/tasks) keeps its 30 s poll and runs only while its tab is shown: the scarcity
+// cache behind it is refreshed every few minutes and the server's 2 s collect memo keeps tabs from re-scanning logs.
+const KEY = "cortados-usage-token", THEME_KEY = "cortados-theme";
+const LIVE_URL = "/v1/cortados/live", URL_ = "/v1/cortados/usage", TASKS_URL = "/v1/cortados/tasks";
+const LIVE_EVERY = 5000, EVERY = 30000, ROUTED_SHOWN = 10;
 const $ = (id) => document.getElementById(id);
-let timer = null, lastOk = null;
+let timer = null, liveTimer = null, tickTimer = null, lastOk = null, view = "live", usageLoaded = false, routedAll = false, lastLive = null;
 // sessionStorage can throw (storage disabled, some private modes). Then the token lives in memTok for this page only,
 // and the page says so, instead of losing the token and asking for it again on every poll.
 let memTok = "", storageOk = true;
@@ -68,32 +204,339 @@ function getTok() { if (!storageOk) return memTok;
   try { const t = sessionStorage.getItem(KEY); if (t) memTok = t; return t || memTok; } catch (e) { storageFailed(); return memTok; } }
 function setTok(t) { memTok = t || ""; if (!storageOk) return;
   try { if (t) sessionStorage.setItem(KEY, t); else sessionStorage.removeItem(KEY); } catch (e) { storageFailed(); } }
-// Every string from the endpoint goes in through textContent: lane names and errors are data, never markup.
+// Every string from the endpoint goes in through textContent: lane names, titles and errors are data, never markup.
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined && text !== null) e.textContent = String(text); return e; }
 function add(parent, ...kids) { for (const k of kids) if (k) parent.appendChild(k); return parent; }
 function age(s) { if (s === null || s === undefined || isNaN(s)) return "?"; s = Math.round(s); if (s < 90) return s + " s"; if (s < 5400) return Math.round(s / 60) + " min"; if (s < 172800) return Math.round(s / 3600) + " h"; return Math.round(s / 86400) + " d"; }
 function pct(v) { return (typeof v === "number") ? Math.round(v) + "%" : "–"; }
+function isNum(v) { return typeof v === "number" && isFinite(v); }
+
+// ---------------------------------------------------------------- theme (auto follows the system; the button pins one)
+const THEMES = ["auto", "light", "dark"];
+let theme = "auto";
+function applyTheme(t) {
+  theme = THEMES.indexOf(t) >= 0 ? t : "auto";
+  const root = document.documentElement;
+  if (root && root.dataset) { if (theme === "auto") delete root.dataset.theme; else root.dataset.theme = theme; }
+  $("theme").textContent = "Theme: " + theme;
+}
+function loadTheme() { try { applyTheme(sessionStorage.getItem(THEME_KEY) || "auto"); } catch (e) { applyTheme("auto"); } }
+$("theme").addEventListener("click", () => {
+  applyTheme(THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length]);
+  try { sessionStorage.setItem(THEME_KEY, theme); } catch (e) { /* the theme then lasts for this page only */ }
+});
+
+// ---------------------------------------------------------------- live view helpers
+// dur: an elapsed time as the owner reads it at a glance (42s, 3m 05s, 1h 12m, 2d 3h).
+function dur(s) {
+  if (!isNum(s) || s < 0) return "–";
+  s = Math.floor(s);
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m " + String(s % 60).padStart(2, "0") + "s";
+  if (s < 86400) return Math.floor(s / 3600) + "h " + String(Math.floor(s % 3600 / 60)).padStart(2, "0") + "m";
+  return Math.floor(s / 86400) + "d " + Math.floor(s % 86400 / 3600) + "h";
+}
+function ago(ts, now) { return isNum(ts) ? age(Math.max(0, now - ts)) + " ago" : "–"; }
+function ms(v) { return (typeof v === "number") ? (v >= 1000 ? (v / 1000).toFixed(1) + " s" : Math.round(v) + " ms") : "–"; }
+function short(id) { return (typeof id === "string" && id.length > 14) ? id.slice(0, 6) + "…" + id.slice(-6) : (id || "–"); }
+function join(parts) { return parts.filter(x => x !== null && x !== undefined && x !== "").join(" · "); }
+// State words and their icon; the class picks the reserved status colour. Unknown words fall back to a neutral pill.
+const STATES = {
+  running: ["●", "run", "running"], working: ["●", "run", "working"], queued: ["◷", "", "queued"], idle: ["○", "", "idle"],
+  succeeded: ["✓", "ok", "succeeded"], ok: ["✓", "ok", "ok"], up: ["✓", "ok", "up"], fresh: ["✓", "ok", "heartbeat"],
+  failed: ["✕", "bad", "failed"], down: ["✕", "bad", "down"], error: ["✕", "bad", "error"],
+  cancelled: ["⊘", "", "cancelled"], stopped: ["■", "", "stopped"], scheduled: ["◷", "", "scheduled"],
+  unknown: ["?", "warn", "unknown"], stale: ["!", "warn", "stale heartbeat"], none: ["–", "", "no heartbeat yet"],
+  partial: ["!", "warn", "partial"],
+};
+function pill(state, word) {
+  const s = STATES[state] || ["•", "", String(state || "unknown")];
+  const p = el("span", "pill" + (s[1] ? " " + s[1] : ""));
+  add(p, el("span", "ic", s[0]), el("span", null, word || s[2]));
+  return p;
+}
+function meter(v, stale) {
+  const m = el("div", "meter"), f = el("i"), p = Math.max(0, Math.min(100, Number(v) || 0));
+  f.style.width = p + "%";
+  if (stale) m.classList.add("stale"); else if (p < 10) m.classList.add("bad"); else if (p < 30) m.classList.add("low");
+  m.title = isNum(v) ? Math.round(v) + "% left" + (stale ? " (stale)" : "") : "unknown";
+  return add(m, f);
+}
+function busy(v) {
+  const m = el("div", "meter"), f = el("i"), p = Math.max(0, Math.min(100, Number(v) || 0));
+  f.style.width = p + "%";
+  if (p >= 90) m.classList.add("bad"); else if (p >= 70) m.classList.add("low");
+  m.title = Math.round(p) + "% busy";
+  return add(m, f);
+}
+function errText(e) { return (e && typeof e === "object") ? ((e.source || "?") + ": " + (e.error || "error")) : String(e); }
+// A section's own errors, said in red at its top: a failed source is never drawn as an empty success.
+function secErrors(box, sec) {
+  const errs = (sec && sec.errors) || [];
+  if (errs.length) add(box, el("div", "secerr err", (sec.status === "error" ? "unavailable: " : "partial: ") + errs.map(errText).join("; ")));
+}
+function panel(id, name, span) {
+  const p = el("section", "panel " + span); p.id = id;
+  const head = el("div", "head"); add(head, el("span", "name", name));
+  const meta = el("span", "meta"); add(head, meta);
+  const body = el("div", "body");
+  add(p, head, body);
+  return {p, head, meta, body};
+}
+// Elapsed values tick once a second between polls: base seconds as served plus the time since the poll answered.
+let ticks = [];
+function tick(node, base) { if (isNum(base)) { ticks.push({node, base, at: Date.now()}); node.textContent = dur(base); } else node.textContent = "–"; return node; }
+function runTicks() { const n = Date.now(); ticks.forEach(t => { t.node.textContent = dur(t.base + (n - t.at) / 1000); }); }
+
+function tile(label, value, note, cls) {
+  const t = el("div", "tile");
+  add(t, el("div", "label", label));
+  const v = el("div", "value" + (cls ? " " + cls : "")); if (value && typeof value === "object") add(v, value); else v.textContent = value;
+  const n = el("div", "note", note || ""); n.title = note || "";
+  add(t, v, n);
+  return t;
+}
+
+// ---------------------------------------------------------------- live render
+// Shape: cortados_router/provider/live.py collect(): version, generated_at, overview, tasks, conversations, routed,
+// subscriptions, s1, hosts. Each section: {as_of, status, errors[], ...}.
+function taskRow(t, now) {
+  const r = el("div", "row");
+  add(r, pill(t.state));
+  const w = el("div", "what");
+  const title = el("div", "t", t.title || ("task " + short(t.task_id)));
+  title.title = t.task_id || "";
+  add(w, title);
+  const model = t.model ? t.model + (t.lane ? " (" + t.lane + ")" : "") : (t.lane || null);
+  add(w, el("div", "m", join([t.host ? "on " + t.host : null, model, t.tool ? "tool " + t.tool : null, t.phase,
+    t.workspace ? "workspace " + t.workspace : null, t.project, t.browser ? "browser" : null, short(t.task_id)])));
+  add(r, w);
+  const e = el("div", "el");
+  const val = el("span", "tick");
+  if (t.state === "running" || t.state === "queued") tick(val, t.elapsed_s); else val.textContent = dur(t.elapsed_s);
+  add(e, val, el("span", "u", t.state === "running" ? "elapsed" : t.state === "queued" ? "waiting" : ago(t.ended_at, now)));
+  return add(r, e);
+}
+// The tasks section sees the provider host's child-task log only (scope "provider host"): a task running on another
+// execution host is absent, so the panel says whose tasks these are, and lists the tasks started from here elsewhere.
+function scopeText(s, host) { return s.scope === "provider host" ? "tasks on " + (host || "the provider host") + " only" : null; }
+function renderTasksPanel(box, s, now, host) {
+  const P = panel("p-tasks", "Tasks", "span-8");
+  const c = s.counts || {};
+  P.meta.textContent = join([s.counts ? join([(c.running || 0) + " running", (c.queued || 0) + " queued",
+    "24 h: " + (c.succeeded || 0) + " ✓ " + (c.failed || 0) + " ✕ " + (c.cancelled || 0) + " ⊘" + (c.unknown ? " " + c.unknown + " ?" : "")]) : null,
+    scopeText(s, host)]);
+  secErrors(P.body, s);
+  const active = (s.running || []).concat(s.queued || []);
+  const rows = el("div", "rows");
+  active.forEach(t => add(rows, taskRow(t, now)));
+  if (!active.length) add(rows, el("div", "empty", s.status === "error" ? "child tasks unknown" : "No child task is running."));
+  add(P.body, rows);
+  const away = s.elsewhere || [];
+  if (away.length) {
+    add(P.body, el("div", "group", "Started from here on other hosts (last 10 h; their state lives on that host)"));
+    const r = el("div", "rows");
+    away.forEach(t => {
+      const row = el("div", "row"); add(row, pill("unknown", "elsewhere"));
+      const w = el("div", "what"); add(w, el("div", "t", "on " + (t.host || "?")), el("div", "m", short(t.task_id)));
+      add(row, w, add(el("div", "el"), el("span", null, ago(t.started_at, now))));
+      add(r, row);
+    });
+    add(P.body, r);
+  }
+  const recent = s.recent || [];
+  add(P.body, el("div", "group", "Last 24 hours" + (s.truncated ? " (list capped)" : "")));
+  if (!recent.length) add(P.body, el("div", "empty", "nothing finished in the last 24 hours"));
+  else {
+    const wide = el("div", "wide");
+    add(wide, table(recent, [
+      {h: "state", node: t => pill(t.state)}, {h: "task", cls: "clip", v: t => t.title || short(t.task_id)},
+      {h: "host", v: t => t.host || "–"}, {h: "model", v: t => t.model || t.lane || "–"},
+      {h: "took", num: true, v: t => dur(t.elapsed_s)}, {h: "ended", num: true, v: t => ago(t.ended_at, now)},
+      {h: "workspace", v: t => t.workspace || "–"}]));
+    add(P.body, wide);
+  }
+  add(box, P.p);
+}
+function renderConversations(box, s) {
+  const P = panel("p-conv", "Conversations", "span-4");
+  P.meta.textContent = join([isNum(s.working) ? s.working + " working" : null,
+    isNum(s.backend_sessions) ? s.backend_sessions + " backend session" + (s.backend_sessions === 1 ? "" : "s") + " open" : null]);
+  secErrors(P.body, s);
+  const rows = el("div", "rows");
+  (s.items || []).forEach(c => {
+    const r = el("div", "row");
+    add(r, pill(c.status));
+    const w = el("div", "what");
+    const kind = c.kind === "orchestrator" ? "main session" : (c.kind || "conversation");
+    add(w, el("div", "t", c.title || join([c.project || (c.session ? null : "lobby"), kind])));
+    add(w, el("div", "m", join([c.model ? c.model + (c.lane ? " (" + c.lane + ")" : "") : c.lane, c.device ? "on " + c.device : null,
+      c.tool ? "tool " + c.tool : null, c.title ? kind : null])));
+    add(r, w);
+    const e = el("div", "el"); add(e, tick(el("span", "tick"), c.elapsed_s), el("span", "u", "elapsed"));
+    add(rows, add(r, e));
+  });
+  if (!(s.items || []).length) add(rows, el("div", "empty", s.status === "error" ? "conversations unknown" : "No routed conversation is active."));
+  if (s.hidden) add(rows, el("div", "sub", s.hidden + " more not listed"));
+  add(P.body, rows);
+  add(box, P.p);
+}
+function renderRouted(box, s, now) {
+  const P = panel("p-routed", "Routed calls", "span-7");
+  const tot = s.totals || {};
+  P.meta.textContent = isNum(tot.decisions) && tot.decisions ? "routed " + pct(tot.routed_pct) + " of the latest " + tot.decisions + " decisions" : "";
+  secErrors(P.body, s);
+  const calls = s.calls || [];
+  if (!calls.length) add(P.body, el("div", "empty", s.status === "error" ? "routing decisions unknown" : "no routing decision logged yet"));
+  else {
+    const wide = el("div", "wide");
+    add(wide, table(routedAll ? calls : calls.slice(0, ROUTED_SHOWN), [
+      {h: "when", v: x => ago(x.ts, now)}, {h: "band", v: x => x.band || "–"}, {h: "kind", v: x => x.routing_kind || "–"},
+      {h: "model", v: x => x.model ? x.model + (x.lane ? " (" + x.lane + ")" : "") : (x.lane || "–")}, {h: "elapsed", num: true, v: x => ms(x.elapsed_ms)},
+      {h: "S1 reason", cls: "reason", v: x => x.s1_reason || "–"}]));
+    add(P.body, wide);
+    if (calls.length > ROUTED_SHOWN) {
+      const b = el("button", "more", routedAll ? "Show the latest " + ROUTED_SHOWN : "Show all " + calls.length);
+      b.type = "button";
+      b.addEventListener("click", () => { routedAll = !routedAll; if (lastLive) renderLive(lastLive); });
+      add(P.body, b);
+    }
+  }
+  add(box, P.p);
+}
+function renderSubs(box, s) {
+  const P = panel("p-subs", "Subscriptions", "span-5");
+  P.meta.textContent = "% left per window";
+  secErrors(P.body, s);
+  (s.lanes || []).forEach(l => {
+    const d = el("div", "lane");
+    const top = el("div", "top");
+    add(top, el("span", "title", l.label || l.lane));
+    if (l.stale) add(top, pill("unknown", "stale"));
+    if (l.error) add(top, pill("error", l.error));
+    add(top, el("span", "big", pct(l.left_pct)));
+    add(d, top);
+    add(d, el("div", "sub", join([l.account ? "account " + l.account : null,
+      (l.shared_with || []).length ? "shared with " + l.shared_with.join(", ") : null,
+      isNum(l.sample_age_s) ? "sampled " + age(l.sample_age_s) + " ago" : "no sample"])));
+    (l.windows || []).forEach(w => {
+      const r = el("div", "win");
+      add(r, el("span", "n", (w.window || "window") + (w.pool && w.pool !== "all" ? " [" + w.pool + "]" : "") +
+        (isNum(w.resets_in_h) ? " · resets in " + (w.resets_in_h < 1 ? Math.round(w.resets_in_h * 60) + " min" : w.resets_in_h.toFixed(1) + " h") : "")));
+      add(r, el("span", "p", pct(w.left_pct)), meter(w.left_pct, w.stale || l.stale));
+      add(d, r);
+    });
+    add(P.body, d);
+  });
+  if (!(s.lanes || []).length) add(P.body, el("div", "empty", s.status === "error" ? "no lane readings (see error above)" : "no lane readings cached"));
+  add(box, P.p);
+}
+function renderHosts(box, s, s1) {
+  const P = panel("p-hosts", "Hosts", "span-12");
+  P.meta.textContent = s.provider_host ? "this provider runs on " + s.provider_host : "provider host: not a known host name";
+  secErrors(P.body, s);
+  const line = el("div", "s1line");
+  add(line, el("span", "title", "S1 scorer"), pill(s1.status === "up" ? "up" : s1.status === "down" ? "down" : "unknown"),
+    el("span", "sub", join([isNum(s1.latency_ms) ? s1.latency_ms + " ms" : null, isNum(s1.http_status) ? "HTTP " + s1.http_status : null,
+      s1.status !== "up" ? s1.reason : null])));
+  add(P.body, line);
+  const grid = el("div", "hosts");
+  (s.items || []).forEach(h => {
+    const c = el("div", "host");
+    const top = el("div", "top");
+    add(top, el("span", "hn", h.name), pill(h.heartbeat_state));
+    add(c, top);
+    add(c, el("div", "sub", (h.roles || []).length ? h.roles.join(" · ") : "no role known here"));
+    const hb = h.heartbeat;
+    if (hb) {
+      add(c, el("div", "sub", "heartbeat " + age(hb.age_s) + " ago" + (hb.stale ? " (older than its " + age(hb.ttl_s) + " freshness)" : "")));
+      (hb.jobs || []).forEach(j => {
+        const r = el("div", "job");
+        add(r, pill(j.state), el("span", "title", j.name));
+        const txt = join([j.summary, isNum(j.progress_pct) ? Math.round(j.progress_pct) + "%" : null,
+          isNum(j.started_at) && isNum(hb.received_at) ? "for " + dur(hb.received_at - j.started_at) : null]);
+        if (txt) add(r, el("span", "js", txt));
+        if (isNum(j.progress_pct)) add(r, meter(j.progress_pct, false));
+        add(c, r);
+      });
+      if (!(hb.jobs || []).length) add(c, el("div", "sub muted", "no jobs reported"));
+    } else add(c, el("div", "sub muted", "no heartbeat yet: POST " + (s.heartbeat_path || "/v1/cortados/live/heartbeat")));
+    const hw = h.hardware;
+    if (hw) {
+      const kv = el("div", "kv");
+      [["CPU busy", hw.cpu_busy_pct], ["GPU busy", hw.gpu_busy_pct]].forEach(([n, v]) => {
+        if (!isNum(v)) return;
+        add(kv, el("span", null, n), busy(v), el("span", "num", pct(v)));
+      });
+      add(c, kv);
+      add(c, el("div", "sub", join([hw.chip, isNum(hw.mem_available_bytes) ? (hw.mem_available_bytes / 1073741824).toFixed(1) + " GB free" +
+        (isNum(hw.mem_total_bytes) ? " of " + (hw.mem_total_bytes / 1073741824).toFixed(0) : "") : null,
+        isNum(hw.load_1m) ? "load " + hw.load_1m.toFixed(2) : null, "sample " + age(hw.age_s) + " old"])));
+    } else add(c, el("div", "sub muted", "no hardware sample"));
+    add(grid, c);
+  });
+  add(P.body, grid);
+  add(box, P.p);
+}
+function renderLive(d) {
+  lastLive = d;
+  document.body.classList.remove("stale");
+  ticks = [];
+  const box = $("live"); box.replaceChildren();
+  const now = isNum(d.generated_at) ? d.generated_at : Date.now() / 1000;
+  const o = d.overview || {}, s1 = d.s1 || {}, low = o.lowest_subscription;
+  const hosts = (d.hosts && d.hosts.items) || [];
+  const ov = el("div", "overview");
+  const ts = d.tasks || {}, host = (d.hosts || {}).provider_host;
+  add(ov, tile("Running tasks", isNum(o.running_tasks) ? String(o.running_tasks) : "?",
+    isNum(o.queued_tasks) ? join([o.queued_tasks + " queued", ts.status === "partial" ? "partial: see Tasks" : null,
+      (ts.elsewhere || []).length ? ts.elsewhere.length + " started elsewhere" : null, scopeText(ts, host)])
+      : "child-task log unreadable", ts.status === "partial" ? "warn" : null));
+  add(ov, tile("Active conversations", isNum(o.active_conversations) ? String(o.active_conversations) : "?",
+    isNum(o.working_conversations) ? o.working_conversations + " working now" : "office view unavailable"));
+  add(ov, tile("S1 scorer", pill(s1.status === "up" ? "up" : s1.status === "down" ? "down" : "unknown"),
+    s1.status === "up" ? (isNum(s1.latency_ms) ? s1.latency_ms + " ms health check" : "") : (s1.reason || "not reachable"), "small"));
+  add(ov, tile("Lowest subscription", low ? pct(low.left_pct) : "–",
+    low ? join([low.label || low.lane, low.window]) : "no fresh reading"));
+  add(ov, tile("Host heartbeats", (o.hosts_with_heartbeat || 0) + " / " + hosts.length,
+    hosts.filter(h => h.heartbeat_state === "none").map(h => h.name).join(", ") ? "none yet: " + hosts.filter(h => h.heartbeat_state === "none").map(h => h.name).join(", ") : "all reporting"));
+  add(box, ov);
+  const panels = el("div", "panels");
+  renderTasksPanel(panels, ts, now, host);
+  renderConversations(panels, d.conversations || {});
+  renderSubs(panels, d.subscriptions || {});
+  renderRouted(panels, d.routed || {}, now);
+  renderHosts(panels, d.hosts || {}, s1);
+  add(box, panels);
+  lastOk = new Date();
+  const st = $("status"); st.className = o.errors ? "err" : "";
+  st.replaceChildren(el("span", "live-dot"));
+  add(st, el("span", null, "live · updated " + lastOk.toLocaleTimeString() + (o.errors ? " · " + o.errors + " source error" + (o.errors === 1 ? "" : "s") : "")));
+}
+
+// ---------------------------------------------------------------- shared table (both views)
 function bar(v) { const b = el("div", "bar"); const f = el("div"); const p = Math.max(0, Math.min(100, Number(v) || 0)); f.style.width = p + "%"; if (p < 10) b.classList.add("bad"); else if (p < 30) b.classList.add("low"); return add(b, f); }
 function section(title) { return el("h2", null, title); }
 function table(rows, cols, maxOf) {
   const t = el("table"), head = el("tr");
-  cols.forEach(c => add(head, el("th", null, c.h)));
+  cols.forEach(c => add(head, el("th", c.num ? "num" : null, c.h)));
   add(t, head);
   const max = Math.max(1, ...rows.map(maxOf || (() => 0)));
   if (!rows.length) { const tr = el("tr"); const td = el("td", "sub", "none"); td.colSpan = cols.length; add(t, add(tr, td)); }
   rows.forEach(r => { const tr = el("tr"); cols.forEach(c => {
     if (c.bar) { const td = el("td", "barcell"); const b = el("div", "bar"); const f = el("div"); f.style.width = (100 * (Number(c.bar(r)) || 0) / max) + "%"; add(tr, add(td, add(b, f))); }
-    else add(tr, el("td", c.cls || (c.num ? "num" : null), c.v(r)));
+    else if (c.node) add(tr, add(el("td"), c.node(r)));
+    else { const td = el("td", c.cls || (c.num ? "num" : null), c.v(r)); if (c.cls === "clip" || c.cls === "reason") td.title = td.textContent; add(tr, td); }
   }); add(t, tr); });
   return t;
 }
+
+// ---------------------------------------------------------------- usage view (the Usage tab)
 function card(title, sub) { const c = el("div", "card"); add(c, el("div", "title", title)); if (sub) add(c, el("div", "sub", sub)); return c; }
 function countTable(obj, label) { const rows = Object.entries(obj || {}).sort((a, b) => b[1] - a[1]);
   return table(rows, [{h: label, v: r => r[0]}, {h: "", bar: r => r[1]}, {h: "n", num: true, v: r => r[1]}], r => r[1]); }
-
 // Shape: cortados_router/provider/usage.py _VIEW (the publish schema). errors[] = {source, error}: every failed or absent
 // source; it is drawn first and counted in the header, never folded away, so a missing scarcity.json is not read as "no lanes".
-function errText(e) { return (e && typeof e === "object") ? ((e.source || "?") + ": " + (e.error || "error")) : String(e); }
 function when(t) { return (typeof t === "number") ? new Date(t * 1000).toLocaleTimeString() : (t || ""); }
 // A hardware field is its value or the sampler's {available: false, reason} shape.
 function off(v) { return v && typeof v === "object" && !Array.isArray(v) && v.available === false; }
@@ -104,9 +547,7 @@ function hwLine(c, name, v, fmt) {
 }
 function gb(b) { return (typeof b === "number") ? (b / 1073741824).toFixed(1) + " GB" : "–"; }
 function tok(n) { return (typeof n === "number") ? (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n)) : "–"; }
-function ms(v) { return (typeof v === "number") ? (v >= 1000 ? (v / 1000).toFixed(1) + " s" : Math.round(v) + " ms") : "–"; }
 function capped(o, keys) { return keys.some(k => o && o[k]) ? "list capped" : ""; }
-function short(id) { return (typeof id === "string" && id.length > 14) ? id.slice(0, 6) + "…" + id.slice(-6) : (id || "–"); }
 
 // Shape: cortados_router/provider/tasks.py collect(). Rendered into the card render() leaves in place (tasksBox), so a
 // failed tasks poll marks only this section (in red) and the usage view above it stays current. Tokens are not recorded per
@@ -258,16 +699,41 @@ function render(d) {
     (errors.length ? " · " + errors.length + " error" + (errors.length === 1 ? "" : "s") : "");
 }
 
-function showLogin(msg) {
+// ---------------------------------------------------------------- polling, tabs, login
+function stopTimers() {
   if (timer) { clearInterval(timer); timer = null; }
-  $("main").hidden = true; $("logout").hidden = true; $("login").hidden = false;
+  if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+  if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+}
+function showLogin(msg) {
+  stopTimers();
+  $("main").hidden = true; $("live").hidden = true; $("tabs").hidden = true; $("logout").hidden = true; $("login").hidden = false;
   $("status").textContent = msg || ""; $("tok").value = ""; $("tok").focus();
+}
+async function get(url, t) { return fetch(url, {headers: {"Authorization": "Bearer " + t}, cache: "no-store", credentials: "omit"}); }
+// One live poll at a time: a slow answer is not overlapped by the next tick (or a visibilitychange catch-up).
+let liveBusy = false;
+async function refreshLive() {
+  const t = getTok(); if (!t) return showLogin();
+  if (document.hidden) return;                      // a background tab does not poll; visibilitychange catches up
+  if (liveBusy) return;
+  liveBusy = true;
+  try { return await pollLiveOnce(t); } finally { liveBusy = false; }
+}
+async function pollLiveOnce(t) {
+  try {
+    const res = await get(LIVE_URL, t);
+    if (res.status === 401) { setTok(""); return showLogin("Token refused; enter it again."); }
+    if (res.status === 403) return failed("this token's scopes do not cover the live view (needs live:read)");
+    if (!res.ok) return failed("error " + res.status);
+    renderLive(await res.json());
+  } catch (e) { return failed("fetch failed: " + (e && e.message ? e.message : e)); }
 }
 // The tasks view is fetched after a good usage render, with the same token. Its failure never hides the usage view and
 // never forgets the token (a 401 here with a token the usage view just accepted is reported, not acted on).
 async function refreshTasks(t) {
   try {
-    const res = await fetch(TASKS_URL, {headers: {"Authorization": "Bearer " + t}, cache: "no-store", credentials: "omit"});
+    const res = await get(TASKS_URL, t);
     if (!res.ok) return renderTasks(null, "error " + res.status);
     renderTasks(await res.json());
   } catch (e) { renderTasks(null, "fetch failed: " + (e && e.message ? e.message : e)); }
@@ -275,9 +741,10 @@ async function refreshTasks(t) {
 async function refresh() {
   const t = getTok(); if (!t) return showLogin();
   try {
-    const res = await fetch(URL_, {headers: {"Authorization": "Bearer " + t}, cache: "no-store", credentials: "omit"});
+    const res = await get(URL_, t);
     if (res.status === 401) { setTok(""); return showLogin("Token refused; enter it again."); }
     if (!res.ok) return failed("error " + res.status);
+    usageLoaded = true;
     render(await res.json());
   } catch (e) { return failed("fetch failed: " + (e && e.message ? e.message : e)); }
   await refreshTasks(t);
@@ -288,9 +755,23 @@ function failed(msg) {
   const st = $("status"); st.className = "err";
   st.textContent = msg + (lastOk ? " · showing data from " + lastOk.toLocaleTimeString() : "");
 }
-function start() { $("login").hidden = true; $("main").hidden = false; $("logout").hidden = false; refresh(); if (!timer) timer = setInterval(refresh, EVERY); }
+function show(which) {
+  view = which === "usage" ? "usage" : "live";
+  $("tab-live").classList.remove("on"); $("tab-usage").classList.remove("on");
+  $("tab-" + view).classList.add("on");
+  $("live").hidden = view !== "live"; $("main").hidden = view !== "usage";
+  stopTimers();
+  lastOk = null;
+  if (view === "live") { refreshLive(); liveTimer = setInterval(refreshLive, LIVE_EVERY); tickTimer = setInterval(runTicks, 1000); }
+  else { if (!usageLoaded) $("main").replaceChildren(el("div", "empty", "loading usage…")); refresh(); timer = setInterval(refresh, EVERY); }
+}
+function start(which) { $("login").hidden = true; $("tabs").hidden = false; $("logout").hidden = false; show(which || view); }
+$("tab-live").addEventListener("click", () => show("live"));
+$("tab-usage").addEventListener("click", () => show("usage"));
 $("login").addEventListener("submit", (ev) => { ev.preventDefault(); const t = $("tok").value.trim(); if (!t) return; setTok(t); start(); });
 $("logout").addEventListener("click", () => { setTok(""); showLogin("Token forgotten."); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && view === "live" && liveTimer) refreshLive(); });
+loadTheme();
 if (getTok()) start(); else showLogin();
 </script>
 </body>

@@ -1,4 +1,5 @@
 import { test, expect, mock } from 'claude-code/testing'
+import liveFixture from './live.fixture'
 
 const TOKEN = 'sekrit-token-123'
 const SNAP = { generated_at: 1_700_000_000, usage: { total_routes: 5, degraded: { count: 0, of: 5 }, s1_latency_ms: { median: 300, p90: 500, window: 5 } },
@@ -11,14 +12,15 @@ test('the pane draws the lanes from /resources and never the token', { options: 
   const opened: any[] = []
   on('ui.open', async (_$, e) => { opened.push(e); return { value: { isPlaced: true } } })
   const fetched: any[] = []
-  on('http.fetch', async (_$, e) => { fetched.push(e); return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(SNAP) } } })
+  on('http.fetch', async (_$, e) => { fetched.push(e)
+    const body = e.url.endsWith('/v1/cortados/live') ? liveFixture : SNAP
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(body) } } })
   await $.command.run({ command: 'cortados-pulse', args: '' } as any)
   await clock.advance(1)                                        // lets the poll's state write settle
   expect(opened.length).toBe(1)
   expect(opened[0].id).toBe('cortados-pulse')
-  expect(fetched.length).toBe(1)
-  expect(fetched[0].url).toBe('http://air.example:8432/resources')
-  expect(fetched[0].init.headers.authorization).toBe('Bearer ' + TOKEN)
+  expect(fetched.map(f => f.url).sort()).toEqual(['http://air.example:8432/resources', 'http://air.example:8432/v1/cortados/live'])
+  for (const f of fetched) expect(f.init.headers.authorization).toBe('Bearer ' + TOKEN)
   const ui = await $.ui.mount({ plugin: 'cortados-pulse', surface: 'terminal', component: 'Pane', requestId: 'cortados-pulse',
     props: { title: 'CortadOS pulse', isFocused: false, bodyColumns: 80, placement: 'dock' } as any })
   const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
@@ -31,6 +33,15 @@ test('the pane draws the lanes from /resources and never the token', { options: 
   expect(all).toMatch(/studio online · 10.0 GiB free · fits 1/)
   const order = texts.filter(t => /^(claude|claude#b|codex)[ :]/.test(t)).map(t => t.split(/[ :]/)[0])
   expect(order).toEqual(['claude', 'claude#b', 'codex'])
+  // the Running section comes first, the fleet after the devices, the dashboard link last
+  expect(texts[0]).toBe('Running')
+  expect(texts[1]).toBe('1 running · 1 queued · 3 conversations (2 working)')
+  expect(all).toMatch(/● Refactor the scarcity reader · on air · claude-sonnet-5 \(claude#b\) · tool Bash · 2m 05s/)
+  expect(all).toMatch(/studio: s1-scorer running, s1-continuous running 38%/)
+  expect(all).toMatch(/pro: no heartbeat yet/)
+  expect(texts.indexOf('Running')).toBeLessThan(texts.indexOf('Usage'))
+  expect(texts.indexOf('Devices')).toBeLessThan(texts.indexOf('Fleet'))
+  expect(texts[texts.length - 1]).toBe('dashboard http://air.example:8432/dashboard')
   await ui.unmount()
 })
 
@@ -63,5 +74,21 @@ test('response-derived errors and lane reasons are redacted in the mounted pane'
   const all = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\n')
   expect(all.includes(TOKEN)).toBe(false)
   for (const expected of ['usage: ***', 'subscriptions: ***', 'readings: ***', '  ***', 'unavailable: ***']) expect(all.includes(expected)).toBe(true)
+  await ui.unmount()
+})
+
+test('an older provider without the live view still draws the resource pool', { options: { providerUrl: 'http://air.example:8432', providerToken: TOKEN } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  on('ui.open', async () => ({ value: { isPlaced: true } }))
+  on('http.fetch', async (_$, e) => ({ value: e.url.endsWith('/v1/cortados/live')
+    ? { status: 404, ok: false, headers: {}, text: '' } : { status: 200, ok: true, headers: {}, text: JSON.stringify(SNAP) } }))
+  await $.command.run({ command: 'cortados-pulse', args: '' } as any)
+  await clock.advance(1)
+  const ui = await $.ui.mount({ plugin: 'cortados-pulse', surface: 'terminal', component: 'Pane', requestId: 'cortados-pulse',
+    props: { title: 'CortadOS pulse', isFocused: false, bodyColumns: 80, placement: 'dock' } as any })
+  const all = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\n')
+  expect(all).toMatch(/this provider has no live view yet/)
+  expect(all).toMatch(/routes 5 · degraded 0\/5/)
+  expect(all.includes('dashboard http')).toBe(false)          // no link without a live answer
   await ui.unmount()
 })

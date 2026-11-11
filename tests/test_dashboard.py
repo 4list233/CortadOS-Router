@@ -64,6 +64,13 @@ class DashboardTest(unittest.TestCase):
         self.assertIsNone(re.search(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", body))   # no IP addresses
         self.assertIn("/v1/cortados/usage", body)
         self.assertIn("/v1/cortados/tasks", body)
+        self.assertIn("/v1/cortados/live", body)
+        self.assertIn("Forget token", body)
+
+    def test_live_still_needs_auth(self):
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(self.base + "/v1/cortados/live", timeout=10)
+        self.assertEqual(cm.exception.code, 401)
 
     def test_tasks_still_needs_auth(self):
         with self.assertRaises(urllib.error.HTTPError) as cm:
@@ -132,69 +139,124 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, 401)
 
 
-# A minimal DOM for node: enough of document/sessionStorage/fetch for the page's script to run. Modes:
-#   render        render(view) once
-#   fetch500      a good render, then a poll answered 500
-#   fetchthrow    a good render, then a poll whose fetch rejects
-#   storagethrow  sessionStorage throws on every call; the login form is submitted, then the poll answers the view
+# A minimal DOM for the page's script, run by node or, where node is absent, by macOS's JavaScriptCore shell (jsc): the
+# harness body is engine-neutral; a small per-engine prelude supplies its input (HARNESS_IN) and output (out). Modes:
+#   render        render(view) once on the Usage tab
+#   refresh       a usage refresh on the Usage tab (after the tab's own first poll)
+#   fetch500      a good usage render, then a poll answered 500
+#   fetchthrow    a good usage render, then a poll whose fetch rejects
+#   storagethrow  sessionStorage throws on every call; the login form is submitted, then the Usage tab polls
 #   storagelater  sessionStorage works at startup (token "tok"), then throws; the next poll still carries the token
 #   tasks500      the usage poll is good; the tasks poll on the same token answers 500
-# The tasks fetch (/v1/cortados/tasks, made after each good usage render) answers TASKS_VIEW from the environment (an
-# empty view when unset) and is not counted in POLLS, which counts usage polls only.
-# It prints every text node under main (marked [ERR] when its class carries err), then STATUS / BODY / STORAGE / LOGIN.
-_NODE_HARNESS = r"""
-const fs = require("fs");
-const [page, mode] = process.argv.slice(1);
-const view = JSON.parse(fs.readFileSync(0, "utf8"));
-const tasksView = process.env.TASKS_VIEW ? JSON.parse(process.env.TASKS_VIEW) : {tasks: [], sessions: [], errors: []};
-let tasksAuth = "", tasksPolls = 0;
-const html = fs.readFileSync(page, "utf8");
+#   live          the Live tab's startup poll answers the live view (LIVE); ticks run once
+#   live500 / livethrow / live401 / live403   a good live render, then a live poll that fails that way
+#   livebusy      a good live render, then two polls started together: the second is skipped while the first is out
+# POLLS counts usage polls, TASKS the /v1/cortados/tasks polls, LIVE the /v1/cortados/live polls. It prints every text
+# node under the shown view (marked [ERR] when its class carries err), then STATUS / BODY / STORAGE / LOGIN / TASKS / LIVE.
+_HARNESS = r"""
+const IN_ = HARNESS_IN, mode = IN_.mode;
+const view = IN_.view, tasksView = IN_.tasks || {tasks: [], sessions: [], errors: []}, liveView = IN_.live || {};
+const html = IN_.page;
 const js = html.slice(html.indexOf("<script>") + 8, html.indexOf("</script>"));
-function mk(tag) { const n = { tag, kids: [], className: "", style: {}, hidden: false, textContent: "", value: "", on: {},
+let tasksAuth = "", tasksPolls = 0, liveAuth = "", livePolls = 0;
+// textContent is an accessor, as in a DOM: setting it drops the node's children.
+function mk(tag) { const n = { tag, kids: [], className: "", style: {}, hidden: false, _t: "", value: "", on: {}, dataset: {},
+  get textContent() { return this._t; }, set textContent(v) { this._t = v; this.kids = []; },
   classList: { add(c) { if (!n.className.split(" ").includes(c)) n.className = (n.className + " " + c).trim(); },
                remove(c) { n.className = n.className.split(" ").filter(x => x && x !== c).join(" "); } },
-  appendChild(k) { n.kids.push(k); return k; }, replaceChildren() { n.kids = []; },
+  appendChild(k) { n.kids.push(k); return k; }, replaceChildren(...k) { n._t = ""; n.kids = k; },
   addEventListener(ev, f) { n.on[ev] = f; }, focus() {} }; return n; }
 const ids = new Proxy({}, { get: (o, i) => o[i] || (o[i] = mk("div")) });
-global.document = { createElement: mk, getElementById: (i) => ids[i], body: mk("body") };
+global.document = { createElement: mk, getElementById: (i) => ids[i], body: mk("body"), documentElement: mk("html"),
+                    hidden: false, addEventListener() {} };
 const boom = () => { throw new Error("SecurityError"); };
 let broken = mode === "storagethrow";
-global.sessionStorage = { getItem: () => broken ? boom() : "tok", setItem: (k, v) => broken ? boom() : undefined,
-                          removeItem: () => broken ? boom() : undefined };
+global.sessionStorage = { getItem: (k) => broken ? boom() : (k === "cortados-usage-token" ? "tok" : null),
+                          setItem: (k, v) => broken ? boom() : undefined, removeItem: () => broken ? boom() : undefined };
 global.setInterval = () => 1; global.clearInterval = () => {};
 let auth = "", polls = 0;
-const ok = { status: 200, ok: true, json: async () => view };
 global.fetch = async (url, opts) => {
   if (url === "/v1/cortados/tasks") { tasksAuth = opts.headers.Authorization; tasksPolls++;
     if (mode === "tasks500") return { status: 500, ok: false };
     return { status: 200, ok: true, json: async () => tasksView }; }
+  if (url === "/v1/cortados/live") { liveAuth = opts.headers.Authorization; livePolls++;
+    if (livePolls > 1 && mode === "live500") return { status: 500, ok: false };
+    if (livePolls > 1 && mode === "live401") return { status: 401, ok: false };
+    if (livePolls > 1 && mode === "live403") return { status: 403, ok: false };
+    if (livePolls > 1 && mode === "livethrow") throw new Error("network down");
+    return { status: 200, ok: true, json: async () => liveView }; }
   auth = opts.headers.Authorization; polls++;
   if (polls > 1 && mode === "fetch500") return { status: 500, ok: false };
   if (polls > 1 && mode === "fetchthrow") throw new Error("network down");
-  return ok; };
+  return { status: 200, ok: true, json: async () => view }; };
 const tick = () => new Promise(r => setImmediate(r));
 (async () => {
-  eval(js + "\nglobal.render = render; global.refresh = refresh;");
+  eval(js + "\nglobal.render = render; global.refresh = refresh; global.show = show; global.refreshLive = refreshLive; global.runTicks = runTicks;");
   await tick(); await tick();
-  if (mode === "render") { render(view); }
-  else if (mode === "storagethrow") {
+  const liveTab = mode.indexOf("live") === 0;
+  if (mode === "storagethrow") {
     ids.tok.value = "typed-token"; ids.login.on.submit({ preventDefault() {} });
-    await tick(); await tick(); await refresh(); await tick();
-  } else if (mode === "storagelater") { broken = true; await refresh(); await tick(); }
-  else { await refresh(); await tick(); }
+    await tick(); await tick();
+  }
+  if (liveTab) {
+    runTicks();
+    if (mode === "livebusy") { await Promise.all([refreshLive(), refreshLive()]); await tick(); }
+    else if (mode !== "live") { await refreshLive(); await tick(); }
+  } else {
+    if (mode === "storagelater") broken = true;
+    show("usage"); await tick(); await tick();
+    if (mode === "render") { render(view); }
+    else { await refresh(); await tick(); }
+  }
   function text(n, out) { if (n.textContent) out.push((n.className.includes("err") ? "[ERR] " : "") + n.textContent);
     n.kids.forEach(k => text(k, out)); return out; }
-  console.log(text(ids.main, []).join("\n"));
-  console.log("STATUS: " + ids.status.className + " " + ids.status.textContent);
-  console.log("BODY: " + document.body.className);
-  console.log("STORAGE: " + (ids.storage.hidden ? "" : ids.storage.textContent));
-  console.log("LOGIN: " + (ids.login.hidden ? "hidden" : "shown") + " AUTH: " + auth + " POLLS: " + polls);
-  console.log("TASKS: AUTH: " + tasksAuth + " POLLS: " + tasksPolls);
-})().catch(e => { console.error(e); process.exit(1); });
+  out(text(liveTab ? ids.live : ids.main, []).join("\n"));
+  const flat = (n) => n.textContent + n.kids.map(flat).join("");
+  out("STATUS: " + ids.status.className + " " + flat(ids.status));
+  out("BODY: " + document.body.className);
+  out("STORAGE: " + (ids.storage.hidden ? "" : ids.storage.textContent));
+  out("LOGIN: " + (ids.login.hidden ? "hidden" : "shown") + " AUTH: " + auth + " POLLS: " + polls);
+  out("TASKS: AUTH: " + tasksAuth + " POLLS: " + tasksPolls);
+  out("LIVE: AUTH: " + liveAuth + " POLLS: " + livePolls + " TAB: " + (ids.live.hidden ? "hidden" : "shown"));
+})().catch(fail);
 """
+_NODE_PRELUDE = ("const fs = require('fs'); global.HARNESS_IN = JSON.parse(fs.readFileSync(0, 'utf8'));"
+                 "global.out = (s) => console.log(s); global.fail = (e) => { console.error(e); process.exit(1); };\n")
+_JSC = "/System/Library/Frameworks/JavaScriptCore.framework/Versions/Current/Helpers/jsc"
 
 
-@unittest.skipUnless(shutil.which("node"), "node not installed: the page's script is not executed")
+def js_engine():
+    """("node", path) or ("jsc", path) or None: node where installed, else macOS's JavaScriptCore shell."""
+    if shutil.which("node"):
+        return "node", shutil.which("node")
+    if os.access(_JSC, os.X_OK):
+        return "jsc", _JSC
+    return None
+
+
+def run_harness(harness: str, data: dict) -> subprocess.CompletedProcess:
+    """Run an engine-neutral harness body with HARNESS_IN = data. jsc reads no stdin and has no setImmediate, so its
+    prelude carries the input as a literal and maps setImmediate onto setTimeout; a harness error exits non-zero."""
+    kind, exe = js_engine()
+    if kind == "node":
+        return subprocess.run([exe, "-e", _NODE_PRELUDE + harness], input=json.dumps(data), capture_output=True,
+                              text=True, timeout=60)
+    d = tempfile.mkdtemp()
+    try:
+        f = os.path.join(d, "harness.js")
+        Path(f).write_text("var global = this; var HARNESS_IN = " + json.dumps(data) + ";\n"
+                           "var out = function (s) { print(s); }; var setImmediate = function (f) { setTimeout(f, 0); };\n"
+                           "var fail = function (e) { print('HARNESS-ERROR: ' + e + '\\n' + (e && e.stack)); };\n"
+                           + harness)
+        r = subprocess.run([exe, f], capture_output=True, text=True, timeout=60)
+    finally:
+        shutil.rmtree(d, True)
+    if "HARNESS-ERROR:" in r.stdout:
+        r = subprocess.CompletedProcess(r.args, 1, r.stdout, r.stdout[r.stdout.index("HARNESS-ERROR:"):])
+    return r
+
+
+@unittest.skipUnless(js_engine(), "no JavaScript engine (node or jsc): the page's script is not executed")
 class DashboardRenderTest(unittest.TestCase):
     """The page reads the merged usage view (usage._VIEW): each section it publishes, and errors[] shown, not hidden."""
 
@@ -216,12 +278,9 @@ class DashboardRenderTest(unittest.TestCase):
         args.update(kw)
         return usage.collect(**args)
 
-    def run_page(self, view, mode="render", tasks_view=None):
-        env = dict(os.environ)
-        if tasks_view is not None:
-            env["TASKS_VIEW"] = json.dumps(tasks_view)
-        r = subprocess.run(["node", "-e", _NODE_HARNESS, str(server._DASHBOARD_PATH), mode], input=json.dumps(view),
-                           capture_output=True, text=True, timeout=30, env=env)
+    def run_page(self, view, mode="render", tasks_view=None, live_view=None):
+        r = run_harness(_HARNESS, {"page": server._DASHBOARD_PATH.read_text(), "mode": mode, "view": view,
+                                   "tasks": tasks_view, "live": live_view})
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
 
@@ -271,6 +330,13 @@ class DashboardRenderTest(unittest.TestCase):
                     "d.hardware", "d.notes", "d.errors", "s1.reason", "cache_read_tokens"):
             self.assertIn(key, html)
         self.assertNotIn("error_kind", html)        # the merged lane publishes `error` only
+        # the Live tab reads every section live.collect publishes
+        for key in ("d.overview", "d.tasks", "d.conversations", "d.routed", "d.subscriptions", "d.s1", "d.hosts",
+                    "o.lowest_subscription", "s.heartbeat_path", "h.heartbeat_state"):
+            self.assertIn(key, html)
+        from tests import test_live
+        self.assertEqual(set(test_live.fixture_view()) - {"version", "generated_at"},
+                         {"overview", "tasks", "conversations", "routed", "subscriptions", "s1", "hosts"})
         self.assertEqual(set(usage._VIEW.fields) - {"generated_at"},
                          {"lanes", "routed", "refusals", "child_tasks", "ledger", "bots", "s1", "hardware", "notes"})
 
@@ -319,6 +385,80 @@ class DashboardRenderTest(unittest.TestCase):
         self.assertIn("STORAGE: Browser storage unavailable; the token is kept only for this page", out)
         self.assertIn("LOGIN: hidden AUTH: Bearer tok POLLS: 2", out)            # the startup read was kept in memTok
         self.assertIn("Resources (% left)", out)
+
+    # ---------------------------------------------------------------- the Live tab (provider/live.py)
+    def live(self, **kw):
+        from tests import test_live
+        return test_live.fixture_view(**kw)
+
+    def test_live_tab_renders_every_section(self):
+        from tests import test_live as tl
+        v = self.live()
+        out = self.run_page(None, "live", live_view=v)
+        for want in ("Running tasks", "Active conversations", "S1 scorer", "Lowest subscription", "Host heartbeats",
+                     "Refactor the scarcity reader", "on air · claude-sonnet-5 (claude#b) · tool Bash · workspace active",
+                     "2m 05s", "queued", "waiting for the host's Chrome", "Last 24 hours", "Write the changelog",
+                     "16m 40s", "archived", "Conversations", "gpt-6.1 (codex) · on pro · tool Read", "Review the diff",
+                     "2 backend sessions open", "Subscriptions", "cursor (shared with Grok Bot)", "70%",
+                     "Routed calls", "S1 decision; band R2; steps=1", "1.2 s", "Hosts", "this provider runs on air",
+                     "provider · default exec host", "s1-continuous", "sweep 3/8 · 38% · for 59m 20s",
+                     "no heartbeat yet: POST /v1/cortados/live/heartbeat", "23 ms", "1 / 3", "none yet: air, pro",
+                     "Show all 25"):
+            self.assertIn(want, out, want)
+        for bad in ("[object Object]", "undefined", "NaN", tl.SECRET, "[ERR]"):
+            self.assertNotIn(bad, out, bad)
+        self.assertRegex(out, r"STATUS:  live · updated ")
+        self.assertIn("LIVE: AUTH: Bearer tok POLLS: 1 TAB: shown", out)
+        self.assertIn("POLLS: 0", out)                                          # the Usage tab is not polled from Live
+        self.assertLess(out.index("Refactor the scarcity reader"), out.index("Check the release page"))   # running first
+        self.assertEqual(out.count("S1 decision; band R2; steps=1"), 10)       # the latest ten; the rest behind the button
+
+    def test_live_section_errors_are_said_in_their_section(self):
+        def boom():
+            raise OSError("x")
+        out = self.run_page(None, "live", live_view=self.live(tasks_view=boom, child_events=boom))
+        self.assertIn("[ERR] unavailable: router.db: OSError", out)
+        self.assertIn("[ERR] unavailable: child-tasks.jsonl: OSError", out)
+        self.assertIn("child-task log unreadable", out)
+        self.assertRegex(out, r"STATUS: err live · updated .* · 2 source errors")
+        out = self.run_page(None, "live", live_view={})                         # an empty answer never crashes the page
+        self.assertIn("No child task is running.", out)
+
+    def test_live_tasks_scope_elsewhere_and_partial(self):
+        from tests import test_live as tl
+        stubs = [{"task_id": "t20261111091000-11111111", "host": "studio", "created_at": tl.NOW - 120}]
+        out = self.run_page(None, "live", live_view=self.live(remote_stubs=lambda: stubs))
+        self.assertIn("tasks on air only", out)                               # panel meta and overview tile
+        self.assertIn("1 started elsewhere", out)
+        self.assertIn("Started from here on other hosts", out)
+        self.assertIn("on studio", out)
+        self.assertNotIn("partial", out)
+
+        def boom(tid):
+            raise OSError("x")
+        out = self.run_page(None, "live", live_view=self.live(peek=boom, self_host="johns-imac-2"))
+        self.assertIn("partial: see Tasks", out)                               # the overview tile, not only the panel
+        self.assertIn("[ERR] partial: task_dir: OSError", out)
+        self.assertIn("tasks on the provider host only", out)                  # no known name: not the raw hostname
+        self.assertIn("provider host: not a known host name", out)
+        self.assertNotIn("johns", out)
+
+    def test_live_polls_never_overlap(self):
+        out = self.run_page(None, "livebusy", live_view=self.live())
+        self.assertIn("LIVE: AUTH: Bearer tok POLLS: 2 TAB: shown", out)       # startup + one of the two
+
+    def test_live_failed_polls(self):
+        v = self.live()
+        for mode, want in (("live500", "STATUS: err error 500 · showing data from "),
+                           ("livethrow", "STATUS: err fetch failed: network down · showing data from "),
+                           ("live403", "needs live:read")):
+            out = self.run_page(None, mode, live_view=v)
+            self.assertIn(want, out, mode)
+            self.assertIn("Refactor the scarcity reader", out, mode)          # the last good view stays, greyed
+            self.assertIn("BODY: stale", out, mode)
+        out = self.run_page(None, "live401", live_view=v)
+        self.assertIn("STATUS:  Token refused; enter it again.", out)
+        self.assertIn("LOGIN: shown", out)
 
 
 if __name__ == "__main__":

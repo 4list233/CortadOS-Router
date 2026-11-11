@@ -1249,6 +1249,8 @@ def _event_fields(meta: dict) -> dict:
         out["client"] = meta["client"]
     if meta.get("lane"):
         out.update(lane=meta["lane"], model=meta.get("model"))
+    if meta.get("host"):
+        out["host"] = meta["host"]                  # the execution host's name slug (exec_hosts), for the live view
     # Office fields (title, session tag, project, device): metadata the view shows, never the prompt.
     for k, v in (meta.get("office") or {}).items():
         out[k] = v
@@ -1879,6 +1881,51 @@ def watch_main(argv: list) -> int:
         # (= "a task failed"); the type names the problem, the message could carry paths or content.
         print(f"--watch: could not run: {type(exc).__name__}", file=sys.stderr)
         return 2
+
+
+def peek_local(task_id) -> dict | None:
+    """For GET /v1/cortados/live: a running task's phase and workspace state as this machine's task dir shows them, or
+    None (an invalid id, no dir here, or a remote stub: the task lives on another host and is never asked over ssh).
+    Read-only and cheap (a few stats and one small JSON read), unlike _state(), which reaps runners, recovers dead
+    ones and unloads launchd jobs: a 5 s dashboard poll must change nothing. Never creates the tasks root."""
+    if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
+        return None
+    d = os.path.join(tasks_dir(), task_id)
+    if not os.path.isdir(d) or os.path.exists(os.path.join(d, REMOTE_STUB)):
+        return None
+    out = {"phase": "queued" if os.path.exists(os.path.join(d, QUEUED_MARKER)) else None,
+           "ended": os.path.exists(os.path.join(d, "result.json")), "workspace": None}
+    try:
+        ws = _workspace_record(d, task_id)
+    except TaskError:                               # an unreadable record: no state, said as unknown by the view
+        ws = None
+    if isinstance(ws, dict) and isinstance(ws.get("state"), str):
+        out["workspace"] = ws["state"]
+    return out
+
+
+REMOTE_STUBS_SCAN = 200            # newest task dirs looked at per call: a day of tasks at the owner's pace, a few stats each
+
+
+def remote_stubs() -> list:
+    """For GET /v1/cortados/live: the remote stubs among the newest REMOTE_STUBS_SCAN task dirs on this machine, as
+    [{task_id, host, created_at}] — tasks started FROM here onto another execution host. Metadata only, read-only (no
+    ssh, never creates the tasks root; a missing root is no stubs). A stub that cannot be read is skipped: it is a
+    pointer, and the view says the section's scope rather than guessing its task's state."""
+    root = tasks_dir()
+    try:
+        names = sorted((x for x in os.listdir(root) if TASK_ID_RE.fullmatch(x)), reverse=True)[:REMOTE_STUBS_SCAN]
+    except FileNotFoundError:
+        return []
+    out = []
+    for tid in names:
+        try:
+            rec = _stub(os.path.join(root, tid))
+        except TaskError:
+            continue
+        if rec is not None:
+            out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at")})
+    return out
 
 
 def list_recent(n=20, ids=None) -> list:
@@ -3329,6 +3376,7 @@ def _run(d: str, lock_fd=None) -> int:
     result["event_log_error"] = log_event(
         "finished", **(spec.get("event") or {}), status=final, exit_code=result["exit_code"],
         timed_out=bool(result.get("timed_out")),
+        workspace_state=ws.get("state") if isinstance(ws, dict) else None,
         duration_s=round(result["ended_at"] - started, 1) if isinstance(started, (int, float)) else None)
     _write_json(os.path.join(d, "result.json"), result)
     # The run export (#91): only now, with the logs redacted and result.json final, and still under the task lock (so

@@ -29,8 +29,12 @@ is the long form.
   dynamic tools, under the isolation policy of `codex_isolation.py` (command line, config and login checks, aliases).
   `office.py` is the Office view (`GET /v1/cortados/office`, metadata-only floors per routing session, fed by the
   `x-cortados-session/-project/-device/-task-title` headers, child-tasks.jsonl and `POST /v1/cortados/office/heartbeat`);
-  `clients.py` holds the scoped per-client tokens (`clients.json`, hashes + named scopes; only `office:read` today; the
-  owner token is checked first and unchanged). `usage.py` builds `GET /v1/cortados/usage` and `tasks.py` builds
+  `clients.py` holds the scoped per-client tokens (`clients.json`, hashes + named scopes: `office:read`, `live:read`,
+  `live:heartbeat`, a heartbeat client bound to one `host`; the owner token is checked first and unchanged). `live.py` builds `GET /v1/cortados/live` (one
+  metadata-only snapshot of running child tasks, routed conversations, routed calls, subscriptions, S1 and hosts, each
+  section with its own `as_of`/`status`/`errors`, composed from the office, tasks and usage views) and validates
+  `POST /v1/cortados/live/heartbeat` (host job states, e.g. the Studio's S1 jobs); the dashboard's Live tab and the
+  cortados-pulse pane read it. `usage.py` builds `GET /v1/cortados/usage` and `tasks.py` builds
   `GET /v1/cortados/tasks` (the latest 200 `routes` rows as metadata: model, band, S1 reason by category, elapsed, % routed
   per session; never the request text; tokens are not recorded per route), both behind the owner token and both read by
   `dashboard.html` (`GET /dashboard`).

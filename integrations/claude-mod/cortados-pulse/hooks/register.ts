@@ -1,8 +1,10 @@
 /**
- * cortados-pulse: a pane beside the chat over the CortadOS provider's GET /resources (cortados_router/resources.py
- * `snapshot`): logged routes and S1 health, every subscription lane's cached scarcity with its per-window "% left"
- * (one row per lane and per Claude account: `claude`, `claude#<id>`, `codex`, `cursor`, ...), and the online local
- * devices with their GPU headroom and model fit.
+ * cortados-pulse: a pane beside the chat over two of the CortadOS provider's views. GET /v1/cortados/live
+ * (cortados_router/provider/live.py) feeds the RUNNING section: start_task children running or queued, the routed
+ * conversations in flight, S1, the lowest subscription and the hosts' job heartbeats. GET /resources
+ * (cortados_router/resources.py `snapshot`) feeds the rest: logged routes and S1 latency, every subscription lane's
+ * cached scarcity with its per-window "% left" (one row per lane and per Claude account), and the online local devices.
+ * The last line links the browser dashboard (<provider>/dashboard), which shows the same live view in full.
  *
  * Where the provider is comes from the plugin config, else CORTADOS_PROVIDER_URL, else the per-machine URL file
  * (CORTADOS_PROVIDER_URL_FILE or ~/.config/cortados/provider-url): the same chain as cortados-routed-subagents, and
@@ -13,7 +15,8 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { Pulse, PulseDevices, PulseLaneHealth, PulseReading, PulseUsage } from '../types'
+import type { Pulse, PulseDevices, PulseLaneHealth, PulseLive, PulseLiveConversation, PulseLiveTask, PulseReading,
+  PulseUsage } from '../types'
 
 type Cfg = {
   providerUrl: string
@@ -34,6 +37,14 @@ export const FALLBACK: Cfg = {
  * counts move slowly, so 20 s already shows every change promptly; /resources is cache-only on the provider (never
  * opens a vendor CLI), so the poll is cheap on both ends. */
 export const POLL_MS = 20_000
+/** How often the pane re-reads /v1/cortados/live: children start and end and conversations come and go within
+ * seconds, so the Running section is read twice per /resources poll. The live view is cache-only on the provider too
+ * (no vendor CLI, no ssh), and the pane's one timer ticks at this rate, reading /resources every other tick. */
+export const LIVE_POLL_MS = 10_000
+export const LIVE_PATH = '/v1/cortados/live'
+/** Lines the Running section draws per list before it says "+N more": the pane is a side column, not the dashboard. */
+export const RUNNING_MAX = 6
+export const CONVERSATIONS_MAX = 4
 /** A reading older than this is drawn as stale: the sampler's own cycle is at most 30 min (scarcity.MIN_INTERVAL),
  * so an hour-old reading means sampling has stopped, not that the window is quiet. */
 export const STALE_AFTER_S = 3600
@@ -43,6 +54,9 @@ const PANE = 'cortados-pulse'
 type Held = { data: Pulse; at: number }
 const held = atom({ plugin: 'cortados-pulse', key: 'held' } as const, null as Held | null)
 const err = atom({ plugin: 'cortados-pulse', key: 'err' } as const, null as string | null)
+type LiveHeld = { data: PulseLive; at: number; base: string }
+const liveHeld = atom({ plugin: 'cortados-pulse', key: 'live' } as const, null as LiveHeld | null)
+const liveErr = atom({ plugin: 'cortados-pulse', key: 'liveErr' } as const, null as string | null)
 
 /** `~` and `~/...` to $HOME (the only form the config documents; `~user` is left alone). */
 export function expandHome(path: string, home: string | undefined): string {
@@ -112,30 +126,64 @@ export function readConfig(options: unknown): Cfg {
   }
 }
 
-/** One poll: resolve where and how, fetch, keep the snapshot; any failure becomes the pane's one-line problem. */
-export async function poll($: Pick<EngineInterface, 'env' | 'fs' | 'http' | 'state' | 'clock'>, cfg: Cfg): Promise<void> {
+type Fetched = { ok: true; data: object; url: string } | { ok: false; problem: string; status?: number }
+
+/** GET <provider><path> with the Bearer token: the JSON object (scrubbed of the token, strings and keys alike) or the
+ * one-line problem. Shared by both polls so the token rules are written once. */
+export async function fetchView($: Pick<EngineInterface, 'env' | 'fs' | 'http'>, cfg: Cfg, path: string): Promise<Fetched> {
   let token = ''
   try {
     const url = await resolveProviderUrl($, cfg.providerUrl)
     token = await resolveToken($, cfg)
-    const r = await $.http.fetch(url + '/resources', { headers: { authorization: 'Bearer ' + token } })
+    const r = await $.http.fetch(url + path, { headers: { authorization: 'Bearer ' + token } })
     if (r.status === 401 || r.status === 403) {
-      await update($, err, () => 'provider rejected the token (HTTP ' + r.status + '): check ' + (cfg.providerToken ? 'providerToken' : cfg.providerTokenFile))
-      return
+      return { ok: false, status: r.status, problem: 'provider rejected the token (HTTP ' + r.status + '): check ' + (cfg.providerToken ? 'providerToken' : cfg.providerTokenFile) }
     }
-    if (!r.ok) {
-      await update($, err, () => 'provider returned HTTP ' + r.status)
-      return
-    }
+    if (!r.ok) return { ok: false, status: r.status, problem: 'provider returned HTTP ' + r.status }
     const data = scrubResponse(JSON.parse(r.text), token)
-    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('/resources did not return a JSON object')
-    const at = await $.clock.now()
-    await update($, held, () => ({ data: data as Pulse, at }))
-    await update($, err, () => null)
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error(path + ' did not return a JSON object')
+    return { ok: true, data, url }
   } catch (e) {
     const why = (e as Error)?.message ?? String(e)
-    await update($, err, () => scrub('could not read the provider (' + why + ')', token))
+    return { ok: false, problem: scrub('could not read the provider (' + why + ')', token) }
   }
+}
+
+/** One /resources poll: keep the snapshot; any failure becomes the pane's one-line problem. */
+export async function poll($: Pick<EngineInterface, 'env' | 'fs' | 'http' | 'state' | 'clock'>, cfg: Cfg): Promise<void> {
+  const f = await fetchView($, cfg, '/resources')
+  if (!f.ok) {
+    await update($, err, () => f.problem)
+    return
+  }
+  const at = await $.clock.now()
+  await update($, held, () => ({ data: f.data as Pulse, at }))
+  await update($, err, () => null)
+}
+
+let liveInFlight = false
+
+/** One /v1/cortados/live poll. A provider from before the live view answers 404: said as such, never as an outage.
+ * One at a time: a tick that lands while the previous answer is still coming is skipped, never stacked. */
+export async function pollLive($: Pick<EngineInterface, 'env' | 'fs' | 'http' | 'state' | 'clock'>, cfg: Cfg): Promise<void> {
+  if (liveInFlight) return
+  liveInFlight = true
+  try {
+    await pollLiveOnce($, cfg)
+  } finally {
+    liveInFlight = false
+  }
+}
+
+async function pollLiveOnce($: Pick<EngineInterface, 'env' | 'fs' | 'http' | 'state' | 'clock'>, cfg: Cfg): Promise<void> {
+  const f = await fetchView($, cfg, LIVE_PATH)
+  if (!f.ok) {
+    await update($, liveErr, () => f.status === 404 ? 'this provider has no live view yet (update it to show running work)' : 'live: ' + f.problem)
+    return
+  }
+  const at = await $.clock.now()
+  await update($, liveHeld, () => ({ data: f.data as PulseLive, at, base: f.url }))
+  await update($, liveErr, () => null)
 }
 
 // ---- formatting (pure; tested) ----------------------------------------------------------------------------------
@@ -224,6 +272,85 @@ export function deviceLines(dev: PulseDevices): string[] {
   return out
 }
 
+/** An elapsed time at a glance, as the browser dashboard writes it: 42s, 3m 05s, 1h 12m, 2d 3h. */
+export function dur(s?: number | null): string {
+  if (typeof s !== 'number' || !Number.isFinite(s) || s < 0) return '—'
+  s = Math.floor(s)
+  if (s < 60) return s + 's'
+  if (s < 3600) return Math.floor(s / 60) + 'm ' + String(s % 60).padStart(2, '0') + 's'
+  if (s < 86400) return Math.floor(s / 3600) + 'h ' + String(Math.floor((s % 3600) / 60)).padStart(2, '0') + 'm'
+  return Math.floor(s / 86400) + 'd ' + Math.floor((s % 86400) / 3600) + 'h'
+}
+
+const join = (parts: (string | null | undefined | false)[]) => parts.filter(Boolean).join(' · ')
+const errs = (sec?: { errors?: { source?: string; error?: string }[] }) =>
+  (sec?.errors ?? []).map(e => (e.source ?? '?') + ': ' + (e.error ?? 'error')).join('; ')
+const modelOf = (x: { model?: string | null; lane?: string | null }) => x.model ? x.model + (x.lane ? ` (${x.lane})` : '') : (x.lane ?? null)
+
+/** One start_task child: its glyph and state, title (else id), host, model and how long it has run or waited. `since`
+ * is the seconds since the snapshot was fetched, so an elapsed time keeps counting between polls. */
+export function taskLine(t: PulseLiveTask, since: number): string {
+  const queued = t.state === 'queued'
+  const name = t.title || ('task ' + (t.task_id ?? '?'))
+  const elapsed = typeof t.elapsed_s === 'number' ? dur(t.elapsed_s + since) : '—'
+  return (queued ? '◷ ' : '● ') + join([name, t.host ? 'on ' + t.host : null, modelOf(t), t.tool ? 'tool ' + t.tool : null,
+    queued ? 'queued ' + elapsed : elapsed])
+}
+
+export function conversationLine(c: PulseLiveConversation, since: number): string {
+  const kind = c.kind === 'orchestrator' ? 'main session' : (c.kind || 'conversation')
+  const name = c.title || join([c.project, kind])
+  return (c.status === 'working' ? '▸ ' : '· ') + join([name, modelOf(c), c.tool ? 'tool ' + c.tool : null,
+    c.status === 'working' ? null : c.status, typeof c.elapsed_s === 'number' ? dur(c.elapsed_s + since) : null])
+}
+
+/** The Running section: one summary line, the running and queued children, the conversations in flight. A section the
+ * provider could not read says so in its place; it is never drawn as "nothing running". */
+export function runningLines(live: PulseLive, since: number): string[] {
+  const out: string[] = []
+  const t = live.tasks ?? {}, c = live.conversations ?? {}, o = live.overview ?? {}
+  const n = (v: unknown) => typeof v === 'number' ? String(v) : '?'
+  out.push(`${n(o.running_tasks)} running · ${n(o.queued_tasks)} queued · ${n(o.active_conversations)} conversations` +
+    (typeof o.working_conversations === 'number' ? ` (${o.working_conversations} working)` : ''))
+  if (t.status === 'error') out.push('tasks unavailable: ' + errs(t))
+  if (t.status === 'partial') out.push('tasks partial: ' + errs(t))
+  const active = [...(t.running ?? []), ...(t.queued ?? [])]
+  for (const task of active.slice(0, RUNNING_MAX)) out.push(taskLine(task, since))
+  if (active.length > RUNNING_MAX) out.push(`  +${active.length - RUNNING_MAX} more tasks`)
+  // The tasks are the provider host's only (scope): a task on another execution host logs there. Those started from
+  // here are counted by host, state unknown.
+  const away = t.elsewhere ?? []
+  if (t.scope === 'provider host' || away.length) {
+    const hosts = [...new Set(away.map(x => x.host ?? '?'))].join(', ')
+    out.push(join([t.scope === 'provider host' ? `tasks on ${live.hosts?.provider_host || 'the provider host'} only` : null,
+      away.length ? `${away.length} started elsewhere (${hosts})` : null]))
+  }
+  if (c.status === 'error') out.push('conversations unavailable: ' + errs(c))
+  const conv = c.items ?? []
+  for (const x of conv.slice(0, CONVERSATIONS_MAX)) out.push(conversationLine(x, since))
+  const more = conv.length - CONVERSATIONS_MAX + (c.hidden ?? 0)
+  if (more > 0) out.push(`  +${more} more conversations`)
+  if (!active.length && !conv.length && t.status !== 'error' && c.status !== 'error') out.push('nothing running')
+  return out
+}
+
+/** S1, the lowest subscription and each host's heartbeat, one short line each; an absent heartbeat is said. */
+export function fleetLines(live: PulseLive): string[] {
+  const o = live.overview ?? {}, s1 = live.s1 ?? {}
+  const out = [o.s1 === 'up' ? 'S1 up' + (typeof s1.latency_ms === 'number' ? ` · ${s1.latency_ms} ms` : '')
+    : o.s1 === 'down' ? 'S1 DOWN' + (s1.reason ? ' · ' + s1.reason : '') : 'S1 unknown']
+  const low = o.lowest_subscription
+  if (low && typeof low.left_pct === 'number') out.push(`lowest left: ${low.label || low.lane} ${pct(low.left_pct)}` + (low.window ? ` (${low.window})` : ''))
+  for (const h of live.hosts?.items ?? []) {
+    const hb = h.heartbeat
+    if (!hb) { out.push(`${h.name}: no heartbeat yet`); continue }
+    const jobs = (hb.jobs ?? []).map(j => `${j.name} ${j.state}` + (typeof j.progress_pct === 'number' ? ' ' + Math.round(j.progress_pct) + '%' : ''))
+    out.push(`${h.name}: ` + join([h.heartbeat_state === 'stale' ? 'STALE heartbeat ' + age(hb.age_s ?? NaN) + ' old' : null,
+      jobs.length ? jobs.join(', ') : 'no jobs']))
+  }
+  return out
+}
+
 /** Subscription lanes in the order the pane shows them: the Claude accounts first, then the rest alphabetically. */
 export function laneOrder(lanes: string[]): string[] {
   const rank = (l: string) => (l === 'claude' || l.startsWith('claude#')) ? 0 : l === 'local' ? 2 : 1
@@ -233,6 +360,7 @@ export function laneOrder(lanes: string[]): string[] {
 // ---- hooks -------------------------------------------------------------------------------------------------------
 
 let ticking: Timer | null = null
+let ticks = 0
 
 export const register: Register = (on, options) => {
   const cfg = readConfig(options)
@@ -240,14 +368,20 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'cortados-pulse', description: 'Open the CortadOS router pulse pane' })
     void $.ui.open({ id: PANE, title: 'CortadOS pulse' })
+    void pollLive($, cfg)
     void poll($, cfg)
     ticking?.cancel()                                          // a second session.start must not double the polling
-    ticking = $.clock.every(POLL_MS, () => void poll($, cfg))
+    ticks = 0
+    ticking = $.clock.every(LIVE_POLL_MS, () => {              // live every tick, /resources every POLL_MS
+      void pollLive($, cfg)
+      if (++ticks % (POLL_MS / LIVE_POLL_MS) === 0) void poll($, cfg)
+    })
     return next(e)
   })
 
   on('command.run', { command: 'cortados-pulse' }, async $ => {
     await $.ui.open({ id: PANE, title: 'CortadOS pulse' })
+    void pollLive($, cfg)
     void poll($, cfg)
     return { text: 'CortadOS pulse pane opened.' }
   })
@@ -258,11 +392,21 @@ export const register: Register = (on, options) => {
     const { Box, Text } = $.ui.resolve(e)
     const line = (text: string) => Text({ children: text })
     const dim = (text: string) => Text({ dimColor: true, children: text })
+    const head = (text: string) => Text({ bold: true, children: text })
     const h = await read($, held)
     const problem = await read($, err)
-    if (!h) return Box({ flexDirection: 'column', children: [dim(problem || 'loading the resource pool…')] })
-    const s = h.data
+    const lv = await read($, liveHeld)
+    const lvProblem = await read($, liveErr)
     const nowMs = await $.clock.now()
+    const running = [
+      head('Running'),
+      ...(lv ? runningLines(lv.data, (nowMs - lv.at) / 1000).map(line) : lvProblem ? [] : [dim('loading the live view…')]),
+      ...(lvProblem ? [dim(lvProblem + (lv ? ' · showing ' + age((nowMs - lv.at) / 1000) + ' old data' : ''))] : []),
+    ]
+    const fleet = lv ? [head('Fleet'), ...fleetLines(lv.data).map(line)] : []
+    const link = lv ? [dim('dashboard ' + lv.base + '/dashboard')] : []
+    if (!h) return Box({ flexDirection: 'column', children: [...running, ...fleet, dim(problem || 'loading the resource pool…'), ...link] })
+    const s = h.data
     const nowS = typeof s.generated_at === 'number' ? s.generated_at + (nowMs - h.at) / 1000 : nowMs / 1000
     const subs = s.subscriptions ?? {}
     const readings = s.readings ?? {}
@@ -270,16 +414,20 @@ export const register: Register = (on, options) => {
     const subsError = typeof subs.error === 'string' ? subs.error : null
     const readingsError = typeof readings.error === 'string' ? readings.error : null
     const rows = [
+      ...running,
+      head('Usage'),
       ...usageLines(s.usage ?? {}).map(line),
-      dim('— subscriptions —'),
+      head('Subscriptions'),
       ...(subsError ? [dim('subscriptions: ' + subsError)] : []),
       ...(readingsError ? [dim('readings: ' + readingsError)] : []),
       ...(lanes.length === 0 && !subsError ? [dim('none cached')] : []),
       ...lanes.flatMap(lane => laneLines(lane, subs[lane] as PulseLaneHealth,
         typeof readings[lane] === 'object' ? readings[lane] as PulseReading : undefined, nowS)).map(line),
-      dim('— devices —'),
+      head('Devices'),
       ...deviceLines(s.devices ?? { status: 'pending', nodes: [] }).map(line),
+      ...fleet,
       dim('snapshot ' + age((nowMs - h.at) / 1000) + ' old' + (problem ? ' · ' + problem : '')),
+      ...link,
     ]
     return Box({ flexDirection: 'column', children: rows })
   })
