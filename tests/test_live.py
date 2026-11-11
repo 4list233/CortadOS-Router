@@ -2,10 +2,14 @@
 the heartbeat's validation and limits, auth and scopes over the real endpoint with the fake Claude CLI, and that no
 prompt text, path, token or address ever reaches the snapshot. State is a throwaway CORTADOS_HOME / tasks dir; no
 vendor CLI, ssh or S1 probe runs (the usage slice is collected from fixtures or replaced)."""
+import io
 import json
 import os
 import shutil
 import tempfile
+import threading
+import time
+from contextlib import redirect_stderr, redirect_stdout
 os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp())
 os.environ.setdefault("CORTADOS_SCARCITY_REFRESH", "off")
 import unittest
@@ -268,6 +272,150 @@ class CollectTest(unittest.TestCase):
             self.assertNotIn(bad, raw, bad)
 
 
+class ScopeTest(unittest.TestCase):
+    """#73 follow-ups: the tasks section says whose tasks it holds, lists remote stubs, publishes only known host names."""
+
+    def test_tasks_scope_is_the_provider_host(self):
+        t = fixture_view()["tasks"]
+        self.assertEqual((t["scope"], t["elsewhere"]), ("provider host", []))
+        t = fixture_view(child_events=lambda: (_ for _ in ()).throw(OSError("x")))["tasks"]
+        self.assertEqual((t["status"], t["scope"]), ("error", "provider host"))
+
+    def test_remote_stubs_are_listed_elsewhere(self):
+        stubs = [{"task_id": "t20261111091000-11111111", "host": "air", "created_at": NOW - 60},
+                 {"task_id": "t20261111092000-22222222", "host": "studio", "created_at": NOW - 30},
+                 {"task_id": RUNNING, "host": "air", "created_at": NOW - 125},           # in the local log: not twice
+                 {"task_id": "t20261110092000-33333333", "host": "air", "created_at": NOW - 11 * 3600},  # past 10 h
+                 {"task_id": "t20261111093000-44444444", "host": "Forests-MBA", "created_at": NOW - 5},   # not a slug
+                 {"task_id": "../x", "host": "air", "created_at": NOW - 5},
+                 {"task_id": "t20261111094000-55555555", "host": "air", "created_at": "soon"}, "junk"]
+        t = fixture_view(remote_stubs=lambda: stubs)["tasks"]
+        self.assertEqual(t["elsewhere"], [
+            {"task_id": "t20261111092000-22222222", "host": "studio", "started_at": NOW - 30},
+            {"task_id": "t20261111091000-11111111", "host": "air", "started_at": NOW - 60}])
+        self.assertEqual(t["counts"]["running"], 1)                  # never counted as running here
+        self.assertEqual(t["status"], "ok")
+        # stubs alone (nothing in the local log) are data: the section is not "error"
+        t = live.tasks_section([], None, None, NOW, stubs=stubs)
+        self.assertEqual((t["status"], len(t["elsewhere"])), ("ok", 3))
+
+    def test_a_failed_stub_read_is_partial(self):
+        def boom():
+            raise PermissionError("/Users/someone/.cortados/tasks")
+        t = fixture_view(remote_stubs=boom)["tasks"]
+        self.assertEqual(t["status"], "partial")
+        self.assertIn({"source": "task stubs", "error": "PermissionError"}, t["errors"])
+        self.assertNotIn("/Users/", json.dumps(t))
+
+    def test_provider_host_is_published_only_as_a_known_name(self):
+        v = fixture_view(self_host="johns-imac-2")
+        self.assertIsNone(v["hosts"]["provider_host"])
+        self.assertNotIn("johns", json.dumps(v))
+        self.assertEqual([h["name"] for h in v["hosts"]["items"]], ["air", "studio", "pro"])
+        # a word of the hostname that IS a known name is that name (forests-mac-studio -> studio), never the slug
+        v = fixture_view(self_host="forests-mac-studio", exec_hosts=lambda: ({}, None))
+        self.assertEqual(v["hosts"]["provider_host"], "studio")
+        self.assertNotIn("forests", json.dumps(v["hosts"]))
+        v = fixture_view(self_host="forests-mac-studio", host_names=["lab"], exec_hosts=lambda: ({}, None),
+                         heartbeats=lambda: {}, usage_view=lambda: {})
+        self.assertIsNone(v["hosts"]["provider_host"])
+
+
+class StubScanTest(unittest.TestCase):
+    def setUp(self):
+        self.root = os.path.join(tempfile.mkdtemp(), "tasks")
+        self.addCleanup(shutil.rmtree, os.path.dirname(self.root), True)
+        p = mock.patch.dict(os.environ, {"CORTADOS_TASKS_DIR": self.root})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_remote_stubs_read_only(self):
+        self.assertEqual(child_tasks.remote_stubs(), [])
+        self.assertFalse(os.path.exists(self.root))                  # never creates the tasks root
+        os.makedirs(self.root)
+        for tid, stub in (("t20261111090000-aaaaaaaa", {"host": "air", "created_at": NOW}),
+                          ("t20261111091000-bbbbbbbb", None),                      # a local task
+                          ("t20261111092000-cccccccc", "{not json"),
+                          ("not-a-task", {"host": "air"})):
+            os.makedirs(os.path.join(self.root, tid))
+            if stub is not None:
+                Path(self.root, tid, child_tasks.REMOTE_STUB).write_text(stub if isinstance(stub, str) else json.dumps(stub))
+        before = sorted(os.listdir(self.root))
+        self.assertEqual(child_tasks.remote_stubs(),
+                         [{"task_id": "t20261111090000-aaaaaaaa", "host": "air", "created_at": NOW}])
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+
+class MemoTest(unittest.TestCase):
+    def test_ttl_key_and_single_flight(self):
+        clock = [0.0]
+        m = live.Memo(ttl_s=2.0, clock=lambda: clock[0])
+        calls = []
+        build = lambda: (calls.append(1), str(len(calls)).encode())[1]
+        self.assertEqual((m.get("k", build), m.get("k", build)), (b"1", b"1"))
+        self.assertEqual(m.get("k2", build), b"2")                   # another key (a heartbeat posted): rebuilt
+        clock[0] = 2.5
+        self.assertEqual(m.get("k2", build), b"3")                   # expired
+        with self.assertRaises(RuntimeError):
+            m.get("k3", lambda: (_ for _ in ()).throw(RuntimeError("x")))
+        self.assertEqual(m.get("k3", build), b"4")                   # a failure is not memoised
+        gate, started, n = threading.Event(), threading.Event(), []
+
+        def slow():
+            n.append(1)
+            started.set()
+            gate.wait(5)
+            return b"slow"
+        m2 = live.Memo(ttl_s=2.0)
+        out = []
+        ts = [threading.Thread(target=lambda: out.append(m2.get("k", slow))) for _ in range(4)]
+        ts[0].start()
+        started.wait(5)
+        for t in ts[1:]:
+            t.start()
+        time.sleep(0.05)
+        gate.set()
+        for t in ts:
+            t.join(5)
+        self.assertEqual((len(n), out), (1, [b"slow"] * 4))
+
+
+class ClientHostTest(unittest.TestCase):
+    D = "a" * 64
+
+    def entry(self, **kw):
+        return json.dumps({"version": 1, "clients": [{"name": "studio", "token_sha256": self.D,
+                                                      "scopes": ["live:heartbeat"], **kw}]})
+
+    def test_heartbeat_clients_are_bound_to_one_host(self):
+        self.assertEqual(clients.parse(self.entry())[0][1].host, "studio")          # the name, when it is a host name
+        self.assertEqual(clients.parse(self.entry(name="studio-s1", host="studio"))[0][1].host, "studio")
+        for bad in (dict(name="s1_job"), dict(host="Studio"), dict(host="10.0.0.1"), dict(host=7)):
+            with self.assertRaises(clients.ClientsError, msg=bad):
+                clients.parse(self.entry(**bad))
+        with self.assertRaises(clients.ClientsError):                              # host means nothing for a reader
+            clients.parse(self.entry(scopes=["live:read"], host="studio"))
+        self.assertIsNone(clients.parse(self.entry(scopes=["live:read"]))[0][1].host)
+
+    def test_cli_add_with_host(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        cf, tf = os.path.join(d, "clients.json"), os.path.join(d, "beat-token")
+        with mock.patch.dict(os.environ, {"CORTADOS_PROVIDER_CLIENTS": cf}):
+            out = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                self.assertEqual(clients.main(["add", "studio-s1", "--scope", "live:heartbeat", "--host", "studio",
+                                               "--token-file", tf]), 0)
+                self.assertEqual(clients.main(["list"]), 0)
+                # no host and a name that is not one: refused before any token file is made
+                self.assertEqual(clients.main(["add", "s1_job", "--scope", "live:heartbeat", "--token-file",
+                                               tf + "2"]), 1)
+            self.assertIn("studio-s1: live:heartbeat (host studio)", out.getvalue())
+            self.assertFalse(os.path.exists(tf + "2"))
+            token = Path(tf).read_text().strip()
+            self.assertEqual(clients.ClientTokens(path=Path(cf)).match(token).host, "studio")
+
+
 class HeartbeatTest(unittest.TestCase):
     GOOD = {"host": "studio", "jobs": [{"name": "s1-scorer", "state": "running"}]}
 
@@ -313,6 +461,25 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(len(snap), live.HEARTBEAT_HOSTS_MAX)
         self.assertNotIn("h0", snap)
         self.assertEqual(b.snapshot(NOW + live.HEARTBEAT_KEEP_S + 1), {})
+
+    def test_eviction_never_drops_a_configured_host(self):
+        b = live.HeartbeatBoard(protected=lambda: {"air", "studio"})
+        gens = []
+        for h in ["studio", "air"] + [f"x{i}" for i in range(live.HEARTBEAT_HOSTS_MAX + 5)]:
+            b.post(live.validate_heartbeat({"host": h}, NOW)[0], NOW)
+            gens.append(b.generation)
+        snap = b.snapshot(NOW)
+        self.assertEqual(len(snap), live.HEARTBEAT_HOSTS_MAX)
+        self.assertIn("studio", snap)
+        self.assertIn("air", snap)                                   # the oldest posts, kept: configured
+        self.assertNotIn("x0", snap)
+        self.assertEqual(gens, sorted(set(gens)))                    # every post moves the generation
+        def broken():
+            raise OSError("exec-hosts unreadable")
+        b = live.HeartbeatBoard(protected=broken)                    # a failing list: the plain LRU, still bounded
+        for i in range(live.HEARTBEAT_HOSTS_MAX + 2):
+            b.post(live.validate_heartbeat({"host": f"h{i}"}, NOW)[0], NOW)
+        self.assertEqual(len(b.snapshot(NOW)), live.HEARTBEAT_HOSTS_MAX)
 
 
 class PeekTest(unittest.TestCase):
@@ -415,7 +582,10 @@ class EndpointTest(EndpointHarness):
         good = {"host": "studio", "jobs": [{"name": "s1-scorer", "state": "running", "summary": "serving v12"}]}
         code, raw, _ = self.request("POST", live.HEARTBEAT_PATH, BEAT_TOKEN, body=good)
         self.assertEqual((code, json.loads(raw)), (200, {"ok": True, "host": "studio", "jobs": 1, "fresh_for_s": 900}))
-        self.assertEqual(self.request("POST", live.HEARTBEAT_PATH, TOKEN, body={"host": "pro"})[0], 200)
+        self.assertEqual(self.request("POST", live.HEARTBEAT_PATH, TOKEN, body={"host": "pro"})[0], 200)  # owner: any
+        code, raw, _ = self.request("POST", live.HEARTBEAT_PATH, BEAT_TOKEN, body={"host": "air"})
+        self.assertEqual(code, 403, raw)                             # the studio token speaks for studio only
+        self.assertIn("for host studio only", raw)
         code, raw, _ = self.request("POST", live.HEARTBEAT_PATH, TOKEN,
                                     body={"host": "studio", "jobs": [{"name": "x", "state": "running", "summary": SECRET + "\nmore"}]})
         self.assertEqual(code, 400)
@@ -432,6 +602,30 @@ class EndpointTest(EndpointHarness):
         self.assertEqual(h["studio"]["heartbeat"]["jobs"][0]["summary"], "serving v12")
         self.assertEqual((h["pro"]["heartbeat_state"], h["pro"]["heartbeat"]["jobs"]), ("fresh", []))
         self.assertEqual(h["air"]["heartbeat_state"] if "air" in h else "none", "none")
+
+    def test_the_view_is_memoised_and_a_heartbeat_refreshes_it(self):
+        n = []
+        real = self.httpd.live_view
+
+        def counted(reg):
+            n.append(1)
+            return real(reg)
+        self.httpd.live_view = counted
+        for _ in range(3):
+            self.assertEqual(self.request("GET", live.LIVE_PATH, TOKEN)[0], 200)
+        self.assertEqual(len(n), 1)                                  # one collect per live.MEMO_S
+        self.assertEqual(self.request("POST", live.HEARTBEAT_PATH, BEAT_TOKEN, body={"host": "studio"})[0], 200)
+        v = json.loads(self.request("GET", live.LIVE_PATH, LIVE_TOKEN)[1])
+        self.assertEqual(len(n), 2)                                  # the post invalidated it
+        self.assertEqual({x["name"]: x for x in v["hosts"]["items"]}["studio"]["heartbeat_state"], "fresh")
+
+    def test_remote_stubs_reach_the_view(self):
+        tid = "t20261111120000-abcdef01"
+        os.makedirs(os.path.join(self.tasks, tid))
+        Path(self.tasks, tid, child_tasks.REMOTE_STUB).write_text(json.dumps({"host": "air", "created_at": time.time() - 60}))
+        v = json.loads(self.request("GET", live.LIVE_PATH, TOKEN)[1])
+        self.assertEqual([(x["task_id"], x["host"]) for x in v["tasks"]["elsewhere"]], [(tid, "air")])
+        self.assertEqual(v["tasks"]["scope"], "provider host")
 
     def test_routed_prompt_and_child_log_never_reach_the_snapshot(self):
         tags = {"x-cortados-session": SESSION, "x-cortados-project": "CortadOS-Router", "x-cortados-device": "pro",

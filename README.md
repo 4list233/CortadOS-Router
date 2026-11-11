@@ -898,19 +898,30 @@ the read-only `live:read` scope; 401 otherwise, `Cache-Control: no-store`) retur
 `cortados_router/provider/live.py` from views that already exist: **tasks** (start_task children running, queued and
 finished in the last 24 h, from one bounded read of `child-tasks.jsonl`, with the model/lane/tool the Office board saw
 for the same run id and a read-only peek at a local task dir for the queued phase and workspace state; a remote task is
-never asked over ssh), **conversations** (routed work in flight: the Office view's orchestrators and workers),
+never asked over ssh. The section's `scope` is always `"provider host"`: a task running on another execution host writes
+its events into that host's own `child-tasks.jsonl` and is absent here, so the dashboard and the pulse pane say "tasks
+on <provider host> only". Tasks started from the provider host onto another host leave a remote stub in its tasks dir;
+those from the last 10 h are listed as `elsewhere` (task id, host, start time), their state unknown to this view),
+**conversations** (routed work in flight: the Office view's orchestrators and workers),
 **routed** (the latest 25 decisions from the Tasks view), **subscriptions** (every lane's % left per window from the
 cached scarcity reading, the same builder and publish pass as the usage view, plus the lowest fresh lane), **s1** (the
 memoised `/health` probe: up/down, latency) and **hosts** (air, studio and pro by default, `CORTADOS_LIVE_HOSTS` to
 change; each with its hardware sample and its job heartbeat, or `heartbeat_state: "none"`). Every section carries its own
 `as_of`, `status` and `errors`, so a failed source is said in its place and never drawn as an empty success. Never prompt
-or request text, tool arguments, paths, commands, tokens or environment; it opens no vendor CLI.
+or request text, tool arguments, paths, commands, tokens or environment; it opens no vendor CLI. `hosts.provider_host` is
+published only when the provider's hostname matches a known host name (an exec host's `hostnames` alias, or a name from
+`CORTADOS_LIVE_HOSTS`/the defaults, exec-hosts.json or a heartbeat), else `null`: the raw hostname can carry the owner's
+name. The answer is memoised for 2 s with a single flight (any number of tabs and panes cost one collect; a heartbeat
+post refreshes it), and the dashboard and the pane never start a poll while the previous one is still out.
 
 A host whose jobs the provider cannot see (the Mac Studio's S1 scorer and continuous training) reports them with
-`POST /v1/cortados/live/heartbeat` (owner token, or a write-only `live:heartbeat` client token):
+`POST /v1/cortados/live/heartbeat` (owner token, or a write-only `live:heartbeat` client token bound to ONE host: the
+entry's `"host"` in clients.json, else the client's name; a post for any other host is 403, the owner token is never
+bound; `clients add <name> --scope live:heartbeat [--host studio] --token-file <path>`):
 `{"host": "studio", "ttl_s": 900, "jobs": [{"name": "s1-scorer", "state": "running", "summary": "serving v12"}]}`.
 Fields are validated strictly (8 KiB body cap, 16 jobs, fixed states, an 80-character summary with no address) and a
-bad one is refused naming the field, never echoing its value. docs/PROVIDER-PLAN.md ("Live view") has the full schema and
+bad one is refused naming the field, never echoing its value. The board keeps 16 hosts (least recently posted out first),
+but never evicts a configured host (`CORTADOS_LIVE_HOSTS` or the defaults, and exec-hosts.json's names). docs/PROVIDER-PLAN.md ("Live view") has the full schema and
 a sender a Studio job could run; nothing on the Studio posts yet, and the page says "no heartbeat yet" until it does.
 
 The dashboard's **Live** tab reads it every 5 s while the tab is visible: an overview strip (running tasks, active

@@ -30,7 +30,7 @@ is the long form.
   `office.py` is the Office view (`GET /v1/cortados/office`, metadata-only floors per routing session, fed by the
   `x-cortados-session/-project/-device/-task-title` headers, child-tasks.jsonl and `POST /v1/cortados/office/heartbeat`);
   `clients.py` holds the scoped per-client tokens (`clients.json`, hashes + named scopes: `office:read`, `live:read`,
-  `live:heartbeat`; the owner token is checked first and unchanged). `live.py` builds `GET /v1/cortados/live` (one
+  `live:heartbeat`, a heartbeat client bound to one `host`; the owner token is checked first and unchanged). `live.py` builds `GET /v1/cortados/live` (one
   metadata-only snapshot of running child tasks, routed conversations, routed calls, subscriptions, S1 and hosts, each
   section with its own `as_of`/`status`/`errors`, composed from the office, tasks and usage views) and validates
   `POST /v1/cortados/live/heartbeat` (host job states, e.g. the Studio's S1 jobs); the dashboard's Live tab and the

@@ -22,6 +22,7 @@ export default {
     "as_of": 1800000000.0,
     "status": "ok",
     "errors": [],
+    "scope": "provider host",
     "window_s": 86400,
     "counts": {
       "running": 1,
@@ -157,7 +158,8 @@ export default {
         "device": null
       }
     ],
-    "truncated": false
+    "truncated": false,
+    "elsewhere": []
   },
   "conversations": {
     "as_of": 1800000000.0,

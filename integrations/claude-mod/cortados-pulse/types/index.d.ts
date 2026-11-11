@@ -111,10 +111,13 @@ export interface PulseLive {
     s1_latency_ms?: number | null
     lowest_subscription?: { lane?: string; label?: string | null; left_pct?: number; window?: string | null } | null
   }
-  tasks?: PulseLiveSection & { counts?: Record<string, number> | null; running?: PulseLiveTask[]; queued?: PulseLiveTask[]; recent?: PulseLiveTask[] }
+  // scope: always "provider host" (tasks on other execution hosts log there); elsewhere: tasks started from the provider
+  // host onto another host in the last 10 h, their state unknown to the view
+  tasks?: PulseLiveSection & { counts?: Record<string, number> | null; running?: PulseLiveTask[]; queued?: PulseLiveTask[]; recent?: PulseLiveTask[]
+    scope?: string; elsewhere?: { task_id?: string; host?: string; started_at?: number }[] }
   conversations?: PulseLiveSection & { items?: PulseLiveConversation[]; hidden?: number; active?: number | null; working?: number | null }
   s1?: PulseLiveSection & { latency_ms?: number | null; reason?: string | null }
-  hosts?: PulseLiveSection & { items?: PulseLiveHost[] }
+  hosts?: PulseLiveSection & { items?: PulseLiveHost[]; provider_host?: string | null }
 }
 
 declare module 'claude-code' {
