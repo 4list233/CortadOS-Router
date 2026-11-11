@@ -150,6 +150,7 @@ class DashboardTest(unittest.TestCase):
 #   tasks500      the usage poll is good; the tasks poll on the same token answers 500
 #   live          the Live tab's startup poll answers the live view (LIVE); ticks run once
 #   live500 / livethrow / live401 / live403   a good live render, then a live poll that fails that way
+#   livebusy      a good live render, then two polls started together: the second is skipped while the first is out
 # POLLS counts usage polls, TASKS the /v1/cortados/tasks polls, LIVE the /v1/cortados/live polls. It prints every text
 # node under the shown view (marked [ERR] when its class carries err), then STATUS / BODY / STORAGE / LOGIN / TASKS / LIVE.
 _HARNESS = r"""
@@ -199,7 +200,8 @@ const tick = () => new Promise(r => setImmediate(r));
   }
   if (liveTab) {
     runTicks();
-    if (mode !== "live") { await refreshLive(); await tick(); }
+    if (mode === "livebusy") { await Promise.all([refreshLive(), refreshLive()]); await tick(); }
+    else if (mode !== "live") { await refreshLive(); await tick(); }
   } else {
     if (mode === "storagelater") broken = true;
     show("usage"); await tick(); await tick();
@@ -421,6 +423,29 @@ class DashboardRenderTest(unittest.TestCase):
         self.assertRegex(out, r"STATUS: err live · updated .* · 2 source errors")
         out = self.run_page(None, "live", live_view={})                         # an empty answer never crashes the page
         self.assertIn("No child task is running.", out)
+
+    def test_live_tasks_scope_elsewhere_and_partial(self):
+        from tests import test_live as tl
+        stubs = [{"task_id": "t20261111091000-11111111", "host": "studio", "created_at": tl.NOW - 120}]
+        out = self.run_page(None, "live", live_view=self.live(remote_stubs=lambda: stubs))
+        self.assertIn("tasks on air only", out)                               # panel meta and overview tile
+        self.assertIn("1 started elsewhere", out)
+        self.assertIn("Started from here on other hosts", out)
+        self.assertIn("on studio", out)
+        self.assertNotIn("partial", out)
+
+        def boom(tid):
+            raise OSError("x")
+        out = self.run_page(None, "live", live_view=self.live(peek=boom, self_host="johns-imac-2"))
+        self.assertIn("partial: see Tasks", out)                               # the overview tile, not only the panel
+        self.assertIn("[ERR] partial: task_dir: OSError", out)
+        self.assertIn("tasks on the provider host only", out)                  # no known name: not the raw hostname
+        self.assertIn("provider host: not a known host name", out)
+        self.assertNotIn("johns", out)
+
+    def test_live_polls_never_overlap(self):
+        out = self.run_page(None, "livebusy", live_view=self.live())
+        self.assertIn("LIVE: AUTH: Bearer tok POLLS: 2 TAB: shown", out)       # startup + one of the two
 
     def test_live_failed_polls(self):
         v = self.live()

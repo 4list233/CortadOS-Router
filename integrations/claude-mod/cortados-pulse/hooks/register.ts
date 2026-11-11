@@ -161,8 +161,21 @@ export async function poll($: Pick<EngineInterface, 'env' | 'fs' | 'http' | 'sta
   await update($, err, () => null)
 }
 
-/** One /v1/cortados/live poll. A provider from before the live view answers 404: said as such, never as an outage. */
+let liveInFlight = false
+
+/** One /v1/cortados/live poll. A provider from before the live view answers 404: said as such, never as an outage.
+ * One at a time: a tick that lands while the previous answer is still coming is skipped, never stacked. */
 export async function pollLive($: Pick<EngineInterface, 'env' | 'fs' | 'http' | 'state' | 'clock'>, cfg: Cfg): Promise<void> {
+  if (liveInFlight) return
+  liveInFlight = true
+  try {
+    await pollLiveOnce($, cfg)
+  } finally {
+    liveInFlight = false
+  }
+}
+
+async function pollLiveOnce($: Pick<EngineInterface, 'env' | 'fs' | 'http' | 'state' | 'clock'>, cfg: Cfg): Promise<void> {
   const f = await fetchView($, cfg, LIVE_PATH)
   if (!f.ok) {
     await update($, liveErr, () => f.status === 404 ? 'this provider has no live view yet (update it to show running work)' : 'live: ' + f.problem)
@@ -300,9 +313,18 @@ export function runningLines(live: PulseLive, since: number): string[] {
   out.push(`${n(o.running_tasks)} running · ${n(o.queued_tasks)} queued · ${n(o.active_conversations)} conversations` +
     (typeof o.working_conversations === 'number' ? ` (${o.working_conversations} working)` : ''))
   if (t.status === 'error') out.push('tasks unavailable: ' + errs(t))
+  if (t.status === 'partial') out.push('tasks partial: ' + errs(t))
   const active = [...(t.running ?? []), ...(t.queued ?? [])]
   for (const task of active.slice(0, RUNNING_MAX)) out.push(taskLine(task, since))
   if (active.length > RUNNING_MAX) out.push(`  +${active.length - RUNNING_MAX} more tasks`)
+  // The tasks are the provider host's only (scope): a task on another execution host logs there. Those started from
+  // here are counted by host, state unknown.
+  const away = t.elsewhere ?? []
+  if (t.scope === 'provider host' || away.length) {
+    const hosts = [...new Set(away.map(x => x.host ?? '?'))].join(', ')
+    out.push(join([t.scope === 'provider host' ? `tasks on ${live.hosts?.provider_host || 'the provider host'} only` : null,
+      away.length ? `${away.length} started elsewhere (${hosts})` : null]))
+  }
   if (c.status === 'error') out.push('conversations unavailable: ' + errs(c))
   const conv = c.items ?? []
   for (const x of conv.slice(0, CONVERSATIONS_MAX)) out.push(conversationLine(x, since))

@@ -60,6 +60,7 @@ h2 { font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.
 .tile .label { font-size:12.5px; color:var(--fg2); }
 .tile .value { font-size:28px; font-weight:650; letter-spacing:-.02em; line-height:1.15; margin-top:4px; font-variant-numeric:tabular-nums; }
 .tile .value.small { font-size:20px; }
+.tile .value.warn { color:var(--warn-ink); }
 .tile .note { font-size:12px; color:var(--muted); margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
 /* panels */
@@ -316,17 +317,33 @@ function taskRow(t, now) {
   add(e, val, el("span", "u", t.state === "running" ? "elapsed" : t.state === "queued" ? "waiting" : ago(t.ended_at, now)));
   return add(r, e);
 }
-function renderTasksPanel(box, s, now) {
+// The tasks section sees the provider host's child-task log only (scope "provider host"): a task running on another
+// execution host is absent, so the panel says whose tasks these are, and lists the tasks started from here elsewhere.
+function scopeText(s, host) { return s.scope === "provider host" ? "tasks on " + (host || "the provider host") + " only" : null; }
+function renderTasksPanel(box, s, now, host) {
   const P = panel("p-tasks", "Tasks", "span-8");
   const c = s.counts || {};
-  P.meta.textContent = s.counts ? join([(c.running || 0) + " running", (c.queued || 0) + " queued",
-    "24 h: " + (c.succeeded || 0) + " ✓ " + (c.failed || 0) + " ✕ " + (c.cancelled || 0) + " ⊘" + (c.unknown ? " " + c.unknown + " ?" : "")]) : "";
+  P.meta.textContent = join([s.counts ? join([(c.running || 0) + " running", (c.queued || 0) + " queued",
+    "24 h: " + (c.succeeded || 0) + " ✓ " + (c.failed || 0) + " ✕ " + (c.cancelled || 0) + " ⊘" + (c.unknown ? " " + c.unknown + " ?" : "")]) : null,
+    scopeText(s, host)]);
   secErrors(P.body, s);
   const active = (s.running || []).concat(s.queued || []);
   const rows = el("div", "rows");
   active.forEach(t => add(rows, taskRow(t, now)));
   if (!active.length) add(rows, el("div", "empty", s.status === "error" ? "child tasks unknown" : "No child task is running."));
   add(P.body, rows);
+  const away = s.elsewhere || [];
+  if (away.length) {
+    add(P.body, el("div", "group", "Started from here on other hosts (last 10 h; their state lives on that host)"));
+    const r = el("div", "rows");
+    away.forEach(t => {
+      const row = el("div", "row"); add(row, pill("unknown", "elsewhere"));
+      const w = el("div", "what"); add(w, el("div", "t", "on " + (t.host || "?")), el("div", "m", short(t.task_id)));
+      add(row, w, add(el("div", "el"), el("span", null, ago(t.started_at, now))));
+      add(r, row);
+    });
+    add(P.body, r);
+  }
   const recent = s.recent || [];
   add(P.body, el("div", "group", "Last 24 hours" + (s.truncated ? " (list capped)" : "")));
   if (!recent.length) add(P.body, el("div", "empty", "nothing finished in the last 24 hours"));
@@ -416,7 +433,7 @@ function renderSubs(box, s) {
 }
 function renderHosts(box, s, s1) {
   const P = panel("p-hosts", "Hosts", "span-12");
-  P.meta.textContent = s.provider_host ? "this provider runs on " + s.provider_host : "";
+  P.meta.textContent = s.provider_host ? "this provider runs on " + s.provider_host : "provider host: not a known host name";
   secErrors(P.body, s);
   const line = el("div", "s1line");
   add(line, el("span", "title", "S1 scorer"), pill(s1.status === "up" ? "up" : s1.status === "down" ? "down" : "unknown"),
@@ -470,8 +487,11 @@ function renderLive(d) {
   const o = d.overview || {}, s1 = d.s1 || {}, low = o.lowest_subscription;
   const hosts = (d.hosts && d.hosts.items) || [];
   const ov = el("div", "overview");
+  const ts = d.tasks || {}, host = (d.hosts || {}).provider_host;
   add(ov, tile("Running tasks", isNum(o.running_tasks) ? String(o.running_tasks) : "?",
-    isNum(o.queued_tasks) ? o.queued_tasks + " queued" : "child-task log unreadable"));
+    isNum(o.queued_tasks) ? join([o.queued_tasks + " queued", ts.status === "partial" ? "partial: see Tasks" : null,
+      (ts.elsewhere || []).length ? ts.elsewhere.length + " started elsewhere" : null, scopeText(ts, host)])
+      : "child-task log unreadable", ts.status === "partial" ? "warn" : null));
   add(ov, tile("Active conversations", isNum(o.active_conversations) ? String(o.active_conversations) : "?",
     isNum(o.working_conversations) ? o.working_conversations + " working now" : "office view unavailable"));
   add(ov, tile("S1 scorer", pill(s1.status === "up" ? "up" : s1.status === "down" ? "down" : "unknown"),
@@ -482,7 +502,7 @@ function renderLive(d) {
     hosts.filter(h => h.heartbeat_state === "none").map(h => h.name).join(", ") ? "none yet: " + hosts.filter(h => h.heartbeat_state === "none").map(h => h.name).join(", ") : "all reporting"));
   add(box, ov);
   const panels = el("div", "panels");
-  renderTasksPanel(panels, d.tasks || {}, now);
+  renderTasksPanel(panels, ts, now, host);
   renderConversations(panels, d.conversations || {});
   renderSubs(panels, d.subscriptions || {});
   renderRouted(panels, d.routed || {}, now);
@@ -691,9 +711,16 @@ function showLogin(msg) {
   $("status").textContent = msg || ""; $("tok").value = ""; $("tok").focus();
 }
 async function get(url, t) { return fetch(url, {headers: {"Authorization": "Bearer " + t}, cache: "no-store", credentials: "omit"}); }
+// One live poll at a time: a slow answer is not overlapped by the next tick (or a visibilitychange catch-up).
+let liveBusy = false;
 async function refreshLive() {
   const t = getTok(); if (!t) return showLogin();
   if (document.hidden) return;                      // a background tab does not poll; visibilitychange catches up
+  if (liveBusy) return;
+  liveBusy = true;
+  try { return await pollLiveOnce(t); } finally { liveBusy = false; }
+}
+async function pollLiveOnce(t) {
   try {
     const res = await get(LIVE_URL, t);
     if (res.status === 401) { setTok(""); return showLogin("Token refused; enter it again."); }

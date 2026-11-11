@@ -6,6 +6,11 @@ It composes views that already exist rather than re-deriving them:
                    through office.read_child_events (bounded tail), with the routed model/lane the Office board saw for
                    the same run id, and a read-only peek at a running task's dir on this machine (child_tasks.peek_local:
                    queued phase, workspace state). A remote task is never asked over ssh: a 5 s poll must stay local.
+                   So the section's `scope` is always "provider host": a task running on another execution host logs
+                   its events into THAT host's child-tasks.jsonl and is absent here. The one trace of such a task on
+                   this machine, the remote stub a start_task from here leaves in the tasks dir, is listed as
+                   `elsewhere` ({task_id, host, started_at}, the last 10 h): started from here on another host, its
+                   state there unknown to this view.
   - conversations  in-flight routed work: the Office view's floors (orchestrators) and workers, minus child tasks.
   - routed         the latest routing decisions, from tasks.collect (router.db, read-only, row-limited).
   - subscriptions  every lane's % left per window, from usage.collect_live (scarcity.json read strictly: cache only,
@@ -29,7 +34,9 @@ loop) POSTs its job states:
                "started_at": 1762850000}]}
 
 A post replaces that host's previous one. It is shown fresh for ttl_s (default 900, 60..86400), then stale, and is
-forgotten after 24 h. A malformed heartbeat is refused with 400 naming the bad field (never echoing its value), a body
+forgotten after 24 h. A live:heartbeat client token posts for its bound host only (provider/clients.py; 403 otherwise),
+and the board's LRU never evicts a configured host (CORTADOS_LIVE_HOSTS / the defaults, exec-hosts.json), so posts for
+made-up names can only push out other made-up names. A malformed heartbeat is refused with 400 naming the bad field (never echoing its value), a body
 over HEARTBEAT_MAX_BYTES with 413. docs/PROVIDER-PLAN.md ("Live view") shows a sender a Studio job could run.
 """
 from __future__ import annotations
@@ -60,13 +67,16 @@ CONVERSATIONS_MAX = 64      # in-flight conversations listed; the rest are count
 ROUTED_MAX = 25             # latest routing decisions shown; tasks.collect reads at most its own ROW_LIMIT (200)
 # ---- heartbeat rules ----
 HEARTBEAT_MAX_BYTES = 8192  # 16 jobs x ~300 bytes is under 5 KiB; a larger body is not a heartbeat
-HEARTBEAT_HOSTS_MAX = 16    # the fleet is three machines; LRU past this
+HEARTBEAT_HOSTS_MAX = 16    # the fleet is three machines; LRU past this, configured hosts exempt (HeartbeatBoard)
 HEARTBEAT_KEEP_S = 24 * 3600.0
 TTL_DEFAULT_S = 900         # a job loop posting every 5 min misses two posts before it is shown stale
 TTL_MIN_S, TTL_MAX_S = 60, 86400
 JOBS_MAX = 16
 JOB_STATES = ("running", "idle", "ok", "scheduled", "failed", "stopped")
 TIME_SKEW_S = 30 * 86400.0  # job timestamps within a month of the provider's clock; anything else is not a time
+ELSEWHERE_MAX = 50          # remote stubs listed (child_tasks.remote_stubs reads at most its own cap of dirs)
+SCOPE = "provider host"     # the tasks section sees this machine's child-task log only (see the module doc)
+MEMO_S = 2.0                # GET /v1/cortados/live: N pollers (dashboard tabs, pulse panes) share one collect per 2 s
 DEFAULT_HOSTS = ("air", "studio", "pro")
 HOSTS_ENV = "CORTADOS_LIVE_HOSTS"
 
@@ -141,19 +151,32 @@ def validate_heartbeat(body: Any, now: float) -> tuple[dict[str, Any] | None, st
 
 class HeartbeatBoard:
     """In-memory, locked, bounded: host -> its latest validated heartbeat. A restart forgets them (the next post
-    restores each), which the view shows honestly as "no heartbeat yet"."""
+    restores each), which the view shows honestly as "no heartbeat yet".
 
-    def __init__(self):
+    `protected` (optional) names the configured hosts; it is asked only when the board is over HEARTBEAT_HOSTS_MAX, and
+    eviction then drops the least recently posted host that is NOT configured. Configured hosts are the owner's own
+    list, so the board holds at most HEARTBEAT_HOSTS_MAX + their number. A failing `protected` protects nothing (the
+    plain LRU), never an unbounded board. `generation` changes with every post (the live view's memo key)."""
+
+    def __init__(self, protected: Callable[[], Any] | None = None):
         self._lock = threading.Lock()
         self._hosts: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        self._protected = protected
+        self.generation = 0
 
     def post(self, hb: dict[str, Any], now: float | None = None) -> dict[str, Any]:
         now = time.time() if now is None else now
         with self._lock:
             self._hosts.pop(hb["host"], None)
             self._hosts[hb["host"]] = {**hb, "received_at": round(now, 3)}
-            while len(self._hosts) > HEARTBEAT_HOSTS_MAX:
-                self._hosts.popitem(last=False)
+            if len(self._hosts) > HEARTBEAT_HOSTS_MAX:
+                try:
+                    keep = set(self._protected()) if self._protected is not None else set()
+                except Exception:
+                    keep = set()
+                for h in [h for h in self._hosts if h not in keep][:len(self._hosts) - HEARTBEAT_HOSTS_MAX]:
+                    del self._hosts[h]
+            self.generation += 1
         return {"ok": True, "host": hb["host"], "jobs": len(hb["jobs"]), "fresh_for_s": hb["ttl_s"]}
 
     def snapshot(self, now: float | None = None) -> dict[str, dict[str, Any]]:
@@ -226,9 +249,25 @@ def _office_workers(view: dict[str, Any]) -> list[tuple[dict[str, Any] | None, d
     return out
 
 
+def _elsewhere(stubs: list | None, known: set[str], now: float) -> list[dict[str, Any]]:
+    """Remote stubs re-validated (the tasks dir is a file tree, read as untrusted), minus any task the local log already
+    shows, newest first, within STALE_RUNNING_S (no child runs longer: see the constant)."""
+    out = []
+    for s in stubs or []:
+        if not isinstance(s, dict):
+            continue
+        tid, host, at = office.clean(s.get("task_id"), office._RUN_ID_RE), office.clean(s.get("host"), _HOST_RE), \
+            s.get("created_at")
+        if tid is None or host is None or tid in known or not _num(at) or not now - STALE_RUNNING_S <= at <= now:
+            continue
+        out.append({"task_id": tid, "host": host, "started_at": round(float(at), 3)})
+    out.sort(key=lambda x: -x["started_at"])
+    return out[:ELSEWHERE_MAX]
+
+
 def tasks_section(events: list[dict[str, Any]], office_view: dict[str, Any] | None,
                   peek: Callable[[str], dict[str, Any] | None] | None, now: float,
-                  errors: list | None = None) -> dict[str, Any]:
+                  errors: list | None = None, stubs: list | None = None) -> dict[str, Any]:
     errors = list(errors or [])
     by_run = {w.get("run_id"): w for _, w in _office_workers(office_view or {}) if w.get("kind") == "child_task"}
     kids = _children(events, now)
@@ -281,9 +320,10 @@ def tasks_section(events: list[dict[str, Any]], office_view: dict[str, Any] | No
     recent = sorted([r for r in rows if r["state"] not in ("running", "queued")],
                     key=lambda r: -(r["ended_at"] or r["started_at"] or 0))
     truncated = len(running) > RUNNING_MAX or len(queued) > RUNNING_MAX or len(recent) > RECENT_MAX
-    return _section(now, _status(errors, bool(rows)), errors, window_s=int(CHILD_WINDOW_S), counts=counts,
-                    running=running[:RUNNING_MAX], queued=queued[:RUNNING_MAX], recent=recent[:RECENT_MAX],
-                    truncated=truncated)
+    away = _elsewhere(stubs, set(kids), now)
+    return _section(now, _status(errors, bool(rows) or bool(away)), errors, scope=SCOPE, window_s=int(CHILD_WINDOW_S),
+                    counts=counts, running=running[:RUNNING_MAX], queued=queued[:RUNNING_MAX],
+                    recent=recent[:RECENT_MAX], truncated=truncated, elsewhere=away)
 
 
 def conversations_section(view: dict[str, Any], backend_sessions: int | None, now: float) -> dict[str, Any]:
@@ -418,7 +458,9 @@ def hosts_section(u: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]
                                        "hardware": None})
     for n in aliases:
         item(n)
-    me = _match(self_host, aliases) or _slug(self_host)
+    # Only a KNOWN name is published: the raw hostname slug can carry the owner's name (forests-macbook-air), and a
+    # live:read reader is not meant to learn it. An unmatched provider host is null, said as such by the readers.
+    me = _match(self_host, aliases)
     if me:
         item(me)["roles"].append("provider")
     for n in exec_hosts or {}:
@@ -457,7 +499,8 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
             usage_view: Callable[[], dict[str, Any]], heartbeats: Callable[[], dict[str, dict[str, Any]]],
             backend_sessions: int | None = None, peek: Callable[[str], dict[str, Any] | None] | None = None,
             exec_hosts: Callable[[], tuple[dict[str, list[str]], str | None]] | None = None,
-            self_host: str | None = None, host_names: list[str] | None = None) -> dict[str, Any]:
+            self_host: str | None = None, host_names: list[str] | None = None,
+            remote_stubs: Callable[[], list] | None = None) -> dict[str, Any]:
     """The snapshot. Each input is a callable, run under its own guard: one that raises turns ITS section into
     status "error" with the exception's type (never its text: an OSError carries a path), the rest stand."""
     def guard(source: str, fn: Callable[[], Any], errs: list) -> Any:
@@ -471,9 +514,13 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     events = guard("child-tasks.jsonl", child_events, child_errs)
     office_errs: list = []
     ov = guard("office", lambda: office_view(office.recent_child_events(events or [], now)), office_errs)
-    tasks = tasks_section(events or [], ov, peek, now, child_errs + office_errs) if events is not None \
-        else _section(now, "error", child_errs + office_errs, window_s=int(CHILD_WINDOW_S), counts=None, running=[],
-                      queued=[], recent=[], truncated=False)
+    stub_errs: list = []
+    stubs = guard("task stubs", remote_stubs, stub_errs) if remote_stubs is not None else None
+    tasks = tasks_section(events or [], ov, peek, now, child_errs + office_errs + stub_errs, stubs) \
+        if events is not None \
+        else _section(now, "error", child_errs + office_errs + stub_errs, scope=SCOPE, window_s=int(CHILD_WINDOW_S),
+                      counts=None, running=[], queued=[], recent=[], truncated=False,
+                      elsewhere=_elsewhere(stubs, set(), now))
     conv = conversations_section(ov, backend_sessions, now) if ov is not None \
         else _section(now, "error", office_errs, backend_sessions=backend_sessions, active=None, working=None,
                       floors=None, items=[], hidden=0)
@@ -505,3 +552,32 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     }
     return {"version": VERSION, "generated_at": round(now, 3), "overview": overview, "tasks": tasks,
             "conversations": conv, "routed": routed, "subscriptions": subs, "s1": s1, "hosts": hosts}
+
+
+class Memo:
+    """A MEMO_S memo with single flight for the encoded snapshot (as usage.collect has for its view): concurrent GETs
+    wait for the one collect in progress and share its bytes. `key` names what must invalidate it early (the heartbeat
+    board's generation, so a post shows on the next GET). A collect that raises is not memoised."""
+
+    def __init__(self, ttl_s: float = MEMO_S, clock: Callable[[], float] = time.monotonic):
+        self._ttl, self._clock = ttl_s, clock
+        self._lock = threading.Lock()               # guards _hit; never held across a collect
+        self._flight = threading.Lock()             # held across a miss
+        self._hit: tuple[float, Any, bytes] | None = None
+
+    def _fresh(self, key: Any) -> bytes | None:
+        with self._lock:
+            h = self._hit
+            return h[2] if h and h[1] == key and self._clock() - h[0] < self._ttl else None
+
+    def get(self, key: Any, build: Callable[[], bytes]) -> bytes:
+        body = self._fresh(key)
+        if body is not None:
+            return body
+        with self._flight:
+            body = self._fresh(key)
+            if body is None:
+                body = build()
+                with self._lock:
+                    self._hit = (self._clock(), key, body)
+        return body

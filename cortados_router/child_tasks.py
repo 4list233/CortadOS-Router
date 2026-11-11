@@ -1893,6 +1893,30 @@ def peek_local(task_id) -> dict | None:
     return out
 
 
+REMOTE_STUBS_SCAN = 200            # newest task dirs looked at per call: a day of tasks at the owner's pace, a few stats each
+
+
+def remote_stubs() -> list:
+    """For GET /v1/cortados/live: the remote stubs among the newest REMOTE_STUBS_SCAN task dirs on this machine, as
+    [{task_id, host, created_at}] — tasks started FROM here onto another execution host. Metadata only, read-only (no
+    ssh, never creates the tasks root; a missing root is no stubs). A stub that cannot be read is skipped: it is a
+    pointer, and the view says the section's scope rather than guessing its task's state."""
+    root = tasks_dir()
+    try:
+        names = sorted((x for x in os.listdir(root) if TASK_ID_RE.fullmatch(x)), reverse=True)[:REMOTE_STUBS_SCAN]
+    except FileNotFoundError:
+        return []
+    out = []
+    for tid in names:
+        try:
+            rec = _stub(os.path.join(root, tid))
+        except TaskError:
+            continue
+        if rec is not None:
+            out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at")})
+    return out
+
+
 def list_recent(n=20, ids=None) -> list:
     """`ids` (optional): list only these task ids (the bot gateway passes the ids it started, so a client's tasks
     stay listed however many newer tasks the owner has)."""

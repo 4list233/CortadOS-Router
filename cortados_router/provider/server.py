@@ -634,6 +634,19 @@ class LocalSession:
         pass
 
 
+def _configured_live_hosts() -> set[str]:
+    """The hosts the owner configured (CORTADOS_LIVE_HOSTS or the defaults, and exec-hosts.json's names): the heartbeat
+    board never evicts them. Asked only when the board is full; an unreadable exec-hosts file adds nothing."""
+    from cortados_router import exec_hosts
+    names = set(live.known_hosts())
+    try:
+        if os.path.exists(exec_hosts.config_path()):
+            names |= set(exec_hosts.load().hosts)
+    except Exception as exc:
+        logger.warning("live: exec-hosts unreadable for the heartbeat board: %s", type(exc).__name__)
+    return names
+
+
 class Registry:
     """`router(body, client[, exclude_model=])` picks the route of a new conversation (routing.choose); without one every conversation
     runs on `model` with the Claude CLI (the P0 behaviour, kept for testing the bridge alone). `executed(route)`
@@ -665,7 +678,8 @@ class Registry:
         self.tombstones: "OrderedDict[str, tuple[str, float, str]]" = OrderedDict()
         self.runs = RunRecords()                    # x-cortados-run-id -> what its routed requests ran on
         self.office = office.OfficeBoard()          # floors / workers / heartbeats behind GET /v1/cortados/office
-        self.live = live.HeartbeatBoard()           # host job heartbeats behind GET /v1/cortados/live (provider/live.py)
+        # host job heartbeats behind GET /v1/cortados/live (provider/live.py); the LRU never evicts a configured host
+        self.live = live.HeartbeatBoard(protected=_configured_live_hosts)
         # Scoped client tokens (clients.json). Consulted only when the owner token does not match, so the owner's
         # behaviour is unchanged; a client token opens only its scopes' endpoints and gets 403 everywhere else.
         self.clients = clients.ClientTokens(owner_token=token)
@@ -1218,7 +1232,7 @@ class Handler(BaseHTTPRequestHandler):
             if self._scoped is None and not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
             try:
-                body = json.dumps(self.server.live_view(self.server.registry), allow_nan=False).encode()
+                body = self.server.live_body(self.server.registry)
             except Exception as exc:
                 logger.warning("live: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: live view unavailable (see provider log)")
@@ -1375,6 +1389,13 @@ class Handler(BaseHTTPRequestHandler):
         if hb is None:
             return self._error(400, "invalid_request_error", f"cortados: heartbeat field {bad} is invalid",
                                reason="the heartbeat is malformed")
+        c = self._scoped
+        if c is not None and hb["host"] != c.host:
+            # A live:heartbeat client speaks for its bound host only (clients.py); the owner token is never bound.
+            # The posted name is not echoed; the bound one is the client's own configuration.
+            return self._error(403, "permission_error",
+                               f"cortados: this token posts heartbeats for host {c.host or '(none)'} only",
+                               reason="the heartbeat names another host")
         return self._json(200, self.server.registry.live.post(hb, now))
 
     def _bridge_call(self, body: dict[str, Any]) -> None:
@@ -2234,6 +2255,7 @@ class ProviderServer(ThreadingHTTPServer):
         super().__init__(addr, Handler)
         try:
             self.registry = registry
+            self._live_memo = live.Memo()                # GET /v1/cortados/live (live_body)
             # The usage ledger's writer starts with the endpoint, never from a request (record_async only queues).
             from cortados_router import usage_ledger
             if not usage_ledger.start():
@@ -2255,6 +2277,13 @@ class ProviderServer(ThreadingHTTPServer):
             errors.append({"source": "child_tasks", "error": type(exc).__name__})
             events = []
         return registry.office.view(events, now=now, errors=errors)
+
+    def live_body(self, registry: Registry) -> bytes:
+        """The encoded live view, memoised live.MEMO_S with single flight (live.Memo): every dashboard tab and pulse
+        pane polling at once costs one collect. A heartbeat post (the board's generation) invalidates it."""
+        from cortados_router import paths
+        key = (str(paths.state_dir()), id(registry), registry.live.generation)
+        return self._live_memo.get(key, lambda: json.dumps(self.live_view(registry), allow_nan=False).encode())
 
     def live_view(self, registry: Registry) -> dict[str, Any]:
         """GET /v1/cortados/live (provider/live.py): composes the office board, the tasks and the live slice of the usage
@@ -2279,7 +2308,8 @@ class ProviderServer(ThreadingHTTPServer):
             office_view=office_of, tasks_view=lambda: self.tasks_view(registry),
             usage_view=lambda: self.live_usage_view(registry, now),
             heartbeats=lambda: registry.live.snapshot(now), backend_sessions=len(registry.sessions),
-            peek=child_tasks.peek_local, exec_hosts=hosts, self_host=exec_hosts.short_hostname())
+            peek=child_tasks.peek_local, exec_hosts=hosts, self_host=exec_hosts.short_hostname(),
+            remote_stubs=child_tasks.remote_stubs)
 
     def live_usage_view(self, registry: Registry, now: float) -> dict[str, Any]:
         """Lanes, S1 and hardware for the live view (usage.collect_live): the same sources usage_view reads."""

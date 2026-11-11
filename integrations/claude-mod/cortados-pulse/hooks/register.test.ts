@@ -295,6 +295,34 @@ test('pollLive: an older provider (404) is said as such; 401 and failures are sc
   expect(JSON.stringify(leaky.live()).includes(TOKEN)).toBe(false)
 })
 
+test('pollLive: a tick while the previous answer is still out is skipped, not stacked', async () => {
+  let release: () => void = () => {}
+  const gate = new Promise<void>(r => { release = r })
+  const $ = fakeDollar({ env: { HOME: '/tmp/home', CORTADOS_PROVIDER_URL: 'http://air.example:8432' },
+    files: { '/tmp/home/.config/cortados/provider-token': TOKEN },
+    http: async () => { await gate; return { status: 200, ok: true, headers: {}, text: JSON.stringify(liveFixture) } } })
+  const first = pollLive($ as any, FALLBACK)
+  await pollLive($ as any, FALLBACK)                          // returns at once: the first is in flight
+  release()
+  await first
+  expect($.calls.urls.length).toBe(1)
+  await pollLive($ as any, FALLBACK)                          // the guard is released after the answer
+  expect($.calls.urls.length).toBe(2)
+  const boom = fakeDollar({ env: {}, files: {} })               // a failing poll releases it too
+  await pollLive(boom as any, FALLBACK)
+  await pollLive($ as any, FALLBACK)
+  expect($.calls.urls.length).toBe(3)
+})
+
+test('the tasks scope, tasks started elsewhere and a partial tasks section are said', () => {
+  const lines = runningLines({ overview: { running_tasks: 0, queued_tasks: 0, active_conversations: 0 },
+    tasks: { status: 'partial', scope: 'provider host', errors: [{ source: 'task_dir', error: 'TaskError' }],
+      elsewhere: [{ task_id: 't1', host: 'air' }, { task_id: 't2', host: 'studio' }, { task_id: 't3', host: 'air' }] },
+    conversations: { status: 'ok', items: [] }, hosts: { provider_host: null } } as any, 0)
+  expect(lines).toEqual(['0 running · 0 queued · 0 conversations', 'tasks partial: task_dir: TaskError',
+    'tasks on the provider host only · 3 started elsewhere (air, studio)', 'nothing running'])
+})
+
 test('elapsed times read at a glance', () => {
   expect(dur(42)).toBe('42s')
   expect(dur(125)).toBe('2m 05s')
@@ -310,6 +338,7 @@ test('the Running section from the provider-generated live snapshot', () => {
     '1 running · 1 queued · 3 conversations (2 working)',
     '● Refactor the scarcity reader · on air · claude-sonnet-5 (claude#b) · tool Bash · 2m 05s',
     '◷ Check the release page · on air · queued 10m 00s',
+    'tasks on air only',
     '▸ Review the diff · gpt-6.1 (codex) · tool Read · 1m 30s',
     '▸ CortadOS-Router · main session · claude-opus-5 · tool Edit · 15m 00s',
     '· subagent · qwen3-30b (local-studio) · idle · 30s',
