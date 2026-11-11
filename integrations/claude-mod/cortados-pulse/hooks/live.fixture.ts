@@ -15,6 +15,7 @@ export default {
       "left_pct": 70.0,
       "window": "month (Cursor models: Grok, Composer, Auto)"
     },
+    "route_log_errors": 0,
     "hosts_with_heartbeat": 2,
     "errors": 0
   },
@@ -322,7 +323,15 @@ export default {
       "routed_pct": 100.0
     },
     "row_limit": 200,
-    "more": false
+    "more": false,
+    "route_log_errors": {
+      "count": 0,
+      "lost": 0,
+      "recovered": 0,
+      "last_error_type": null,
+      "last_error_at": null,
+      "last_op": null
+    }
   },
   "subscriptions": {
     "as_of": 1800000000.0,
