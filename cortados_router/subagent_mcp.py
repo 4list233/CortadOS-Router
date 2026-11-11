@@ -24,6 +24,7 @@ import http.client
 import json
 import os
 import secrets
+import socket
 import sys
 import threading
 import urllib.error
@@ -220,12 +221,27 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
         else:
             out = ct.cancel(a.get("task_id"))
     except ct.TaskError as exc:
-        res = _err(red.text(f"{name}: {exc}"))
-        if getattr(exc, "ambiguous", False):
+        ambiguous = getattr(exc, "ambiguous", False)
+        detail = str(exc).strip() or f"{type(exc).__name__} without a message (a cortados-router bug: please report it)"
+        text = f"{name}: {detail}"
+        if ambiguous and name == "start_task":
+            text += AMBIGUOUS_START_HINT
+        res = _err(red.text(text))
+        if ambiguous:
             # The request may have reached the execution host (e.g. it timed out after sending a start): a child may
             # be running. Machine-readable for callers that hold a slot for it (bot_gateway); MCP's _meta is the
             # protocol's place for such extensions, and clients ignore keys they do not know.
             res["_meta"] = {AMBIGUOUS_META: True}
+        return res
+    except Exception as exc:
+        # Anything else is a bug, but the caller must still get a specific, non-empty answer as a tool result (a
+        # JSON-RPC 'internal error (X)' reads as an empty failure to a model). The exception TEXT is not passed on:
+        # it is unscrubbed and may quote a record's content (#94); its type and where it happened are.
+        text = (f"{name} failed: unexpected {type(exc).__name__} in the cortados-route server on "
+                f"{_short_host()} (a cortados-router bug: please report it with the time).")
+        res = _err(text + (AMBIGUOUS_START_HINT if name == "start_task" else " Retrying may work."))
+        if name == "start_task":
+            res["_meta"] = {AMBIGUOUS_META: True}   # no task id came back, but the launch may have got far enough to run
         return res
     # Redact the structure's strings BEFORE serializing: json.dumps escapes quotes and backslashes, so a token holding
     # either would no longer match once serialized.
@@ -233,6 +249,15 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
 
 
 AMBIGUOUS_META = "cortados/ambiguous"     # call_child_tool's _meta key: the failed operation may have taken effect
+AMBIGUOUS_START_HINT = (" No task id came back, but a task may have started anyway: run list_tasks and look for it "
+                        "(by title or start time) before calling start_task again, so it does not run twice.")
+
+
+def _short_host() -> str:
+    try:
+        return socket.gethostname().split(".")[0] or "this machine"
+    except OSError:
+        return "this machine"
 
 
 def _err(text: str) -> dict:

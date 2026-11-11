@@ -3131,3 +3131,79 @@ class _AnyRun(dict):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StartTaskErrorTextTests(ChildTaskBase):
+    """Every start_task failure is a tool result with a specific, non-empty message (2026-11-11: a start_task from
+    another session 'came back with an empty error, so nothing launched'). Fakes only: no ssh, no real child."""
+
+    def _text(self, r):
+        self.assertTrue(r.get("isError"), r)
+        text = r["content"][0]["text"]
+        self.assertTrue(text.split(":", 1)[-1].strip(), f"empty error text: {text!r}")
+        return text
+
+    def test_an_unknown_host_argument_is_a_tool_error_naming_the_configured_hosts(self):
+        msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "start_task", "arguments": {"task": "x", "host": "studio"}}}
+        reply = m.handle(msg, self.cfg)
+        self.assertNotIn("error", reply)            # not a JSON-RPC 'internal error (HostError)' with the reason lost
+        text = self._text(reply["result"])
+        self.assertIn("unknown execution host 'studio'", text)
+        self.assertIn("configured: here", text)
+        self.assertFalse(os.path.isdir(os.path.join(self.tmp, "tasks")) and os.listdir(os.path.join(self.tmp, "tasks")))
+
+    def test_an_unknown_cortados_exec_host_is_a_tool_error_too(self):
+        with mock.patch.dict(os.environ, {"CORTADOS_EXEC_HOST": "mbp"}):
+            r, _ = self.call("start_task", task="x")
+        self.assertIn("unknown execution host 'mbp'", self._text(r))
+
+    def test_a_task_error_without_a_message_still_names_what_failed(self):
+        with mock.patch.object(ct, "start", side_effect=ct.TaskError()):
+            r, _ = self.call("start_task", task="x")
+        text = self._text(r)
+        self.assertIn("TaskError without a message", text)
+
+    def test_an_unexpected_exception_is_a_specific_ambiguous_tool_error_without_its_text(self):
+        with mock.patch.object(ct, "start", side_effect=ValueError("secret-record-content")):
+            r, _ = self.call("start_task", task="x")
+        text = self._text(r)
+        self.assertIn("start_task failed: unexpected ValueError in the cortados-route server", text)
+        self.assertIn("run list_tasks", text)
+        self.assertNotIn("secret-record-content", text)
+        self.assertTrue(r["_meta"][m.AMBIGUOUS_META])
+
+    def test_an_unexpected_exception_in_another_tool_is_not_marked_ambiguous(self):
+        with mock.patch.object(ct, "list_recent", side_effect=KeyError()):
+            r, _ = self.call("list_tasks")
+        self.assertIn("list_tasks failed: unexpected KeyError", self._text(r))
+        self.assertNotIn("_meta", r)
+
+    def test_an_ssh_timeout_on_start_says_a_task_may_be_running_and_what_to_do(self):
+        def timeout(argv, stdin, t):
+            raise subprocess.TimeoutExpired(argv, t)
+        self._air(transport=timeout)
+        r, _ = self.call("start_task", task="x")
+        text = self._text(r)
+        self.assertIn("did not answer start within", text)
+        self.assertIn("run list_tasks", text)
+        self.assertTrue(r["_meta"][m.AMBIGUOUS_META])
+
+    def test_a_host_reply_with_an_empty_error_is_not_empty_here(self):
+        self._air(transport=lambda a, s, t: (1, json.dumps({"v": ct.exec_hosts.PROTOCOL, "ok": False,
+                                                            "error": ""}).encode(), b""))
+        r, _ = self.call("start_task", task="x")
+        self.assertIn("start failed on 'air'", self._text(r))
+
+    def test_the_host_never_replies_with_an_empty_error(self):
+        # serve_remote on the host itself: a TaskError without a message becomes a reply naming the op and the host.
+        out = io.StringIO()
+        req = {"v": ct.exec_hosts.PROTOCOL, "op": "start", "host": "here", "args": {"task": "x"}}
+        with mock.patch.object(ct, "start", side_effect=ct.TaskError()), \
+                mock.patch.object(ct, "_apply_host_env"), mock.patch.object(ct, "_host_tokens", return_value=[]), \
+                mock.patch.object(ct, "_REMOTE_SERVING", False):
+            rc = ct.serve_remote(io.StringIO(json.dumps(req)), out)
+        reply = json.loads(out.getvalue())
+        self.assertEqual(rc, 1)
+        self.assertFalse(reply["ok"])
+        self.assertIn("start failed on execution host here: TaskError without a message", reply["error"])

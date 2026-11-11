@@ -757,10 +757,21 @@ def _hosts() -> "exec_hosts.Hosts":
         raise TaskError(str(exc)) from None
 
 
+def _resolve_host(name):
+    """The execution host named `name` (None: CORTADOS_EXEC_HOST or the file's default). An unknown name is a
+    TaskError carrying the configured names: a bare HostError would escape start() and reach the caller as an
+    'internal error (HostError)' with the reason dropped."""
+    hosts = _hosts()
+    try:
+        return hosts.resolve(name)
+    except exec_hosts.HostError as exc:
+        raise TaskError(str(exc)) from None
+
+
 def _remote(host_name: str, op: str, args: dict, timeout_s=None) -> dict:
     """One operation on another execution host. Unreachable or failing hosts are TaskErrors with the host named;
     nothing ever falls back to this machine."""
-    host = _hosts().resolve(host_name)
+    host = _resolve_host(host_name)
     try:
         out = exec_hosts.call(host, op, args, **({"timeout_s": timeout_s} if timeout_s is not None else {}))
     except exec_hosts.HostError as exc:            # includes HostUnreachable
@@ -796,7 +807,7 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
         raise TaskError("chrome must be true or false")
     if host is not None and not isinstance(host, str):
         raise TaskError("host must be the name of a configured execution host")
-    target = _hosts().resolve(host)
+    target = _resolve_host(host)
     if not target.is_local():
         if _REMOTE_SERVING:
             raise TaskError(f"this request reached {exec_hosts.short_hostname()} for host {target.describe()}, but that "
@@ -3412,7 +3423,9 @@ def serve_remote(stdin=None, stdout=None) -> int:
         else:
             return reply(False, f"unknown remote operation {op!r}")
     except TaskError as exc:
-        return reply(False, Redactor(tokens).text(str(exc)) if tokens else str(exc))
+        text = str(exc).strip() or (f"{op} failed on execution host {host.name}: {type(exc).__name__} without a "
+                                    "message (a cortados-router bug: please report it)")
+        return reply(False, Redactor(tokens).text(text) if tokens else text)
     except Exception as exc:                    # the type only: the text is unscrubbed and could echo configuration
         import traceback
         traceback.print_exc(file=sys.stderr)
