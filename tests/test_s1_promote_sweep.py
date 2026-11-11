@@ -46,7 +46,7 @@ class Tree:
         self.pointer.write_text(json.dumps({"base": BASE, "adapter": str(self.live.resolve()), "temperatures": LIVE_T,
                                             "promoted": "2026-10-16 05:40"}))
         cand_id, live_id = cal.file_id(self.cand / "adapters.safetensors"), cal.file_id(self.live / "adapters.safetensors")
-        self.fp = {"calibrate_version": 2, "candidate_weights": cand_id, "live_weights": live_id, "valid": "V",
+        self.fp = {"calibrate_version": 3, "candidate_weights": cand_id, "live_weights": live_id, "valid": "V",
                    "inference": {"base": BASE, "fail_up": 0.75, "outward_at": 0.25,
                                  "live_pointer": {"adapter": str(self.live.resolve()), "base": BASE, "temperatures": LIVE_T}}}
         v = self.run / "sweep" / "blend0.7"
@@ -58,7 +58,9 @@ class Tree:
         (v / "scores.done").write_text("{}")
         (v / "temps.json").write_text(json.dumps({"valid": "V", "T": {"steps": 1.2, "outward": 1.2}}))
         self.vdir = v
+        self.prov = cal.provenance(str(v), type("S", (), {"T": {"steps": 1.2, "outward": 1.2}})())
         self.sweep = {
+            "versions": {"blend0.7": self.prov},
             "fingerprint": self.fp, "fail_up": 0.75, "holdout_rows": 935, "chosen": "blend0.7-t0.3",
             "live_teacher": teacher(0.576, 0.059),
             "settings": [
@@ -133,11 +135,37 @@ class PlanTest(unittest.TestCase):
         (self.t.vdir / "scores.done").unlink()
         self.assertIn("incomplete", self.refused())
 
-    def test_blend_rewritten_after_scoring_is_refused(self):
+    def test_sweep_without_provenance_is_refused(self):
+        del self.t.sweep["versions"]
+        self.t.write_sweep()
+        self.assertIn("recorded no provenance for blend0.7", self.refused())
+        self.t.sweep["versions"] = {"blend0.7": None}          # fully cached before provenance was recorded
+        self.t.write_sweep()
+        self.assertIn("Move", self.refused())
+
+    def test_temps_other_than_the_ones_the_scores_used_are_refused(self):
+        # Same validation rows (the old check passes), other temperatures: the graded scores did not use these.
+        (self.t.vdir / "temps.json").write_text(json.dumps({"valid": "V", "T": {"steps": 1.2, "outward": 1.3}}))
+        self.assertIn("other temperatures than the ones blend0.7 was scored with", self.refused())
+
+    def test_blend_weights_other_than_the_graded_ones_are_refused_even_with_the_old_mtime(self):
         w = self.t.vdir / "adapters.safetensors"
-        later = (self.t.vdir / "scores.meta.json").stat().st_mtime_ns + 10**9
-        os.utime(w, ns=(later, later))
-        self.assertIn("rewritten after its scoring began", self.refused())
+        st = w.stat()
+        w.write_bytes(os.urandom(8192))
+        os.utime(w, ns=(st.st_atime_ns, st.st_mtime_ns))          # mtime restored: only the content says it changed
+        self.assertIn("is not the adapter blend0.7 was scored with", self.refused())
+
+    def test_blend_config_other_than_the_graded_one_is_refused(self):
+        for cfg in ({"model": BASE, "lora_parameters": {"rank": 16, "scale": 10.0}},      # other scale
+                    {"model": BASE, "lora_parameters": {"rank": 8, "scale": 20.0}},       # other rank
+                    {"model": BASE, "lora_parameters": {"rank": 16, "scale": 20.0}, "num_layers": 4}):   # any other field
+            (self.t.vdir / "adapter_config.json").write_text(json.dumps(cfg))
+            self.assertIn("is not the config blend0.7 was scored with", self.refused())
+
+    def test_recorded_config_content_must_match_not_only_its_hash(self):
+        self.t.sweep["versions"]["blend0.7"] = dict(self.t.prov, adapter_config={"model": BASE, "lora_parameters": {"rank": 8}})
+        self.t.write_sweep()
+        self.assertIn("is not the config blend0.7 was scored with", self.refused())
 
     def test_sweep_without_fingerprint_is_refused(self):
         del self.t.sweep["fingerprint"]
@@ -240,6 +268,28 @@ class CheckTest(unittest.TestCase):
         rc, out = self.run_check(bands.get, ms=3500)
         self.assertEqual(rc, 1)
         self.assertIn("OVER BUDGET", out)
+
+    def test_rows_missing_from_requests_fail(self):
+        bands = {r["pred_answers"]["steps"]: r["pred_band"] for r in self.rows}
+        lines = []
+        decide = lambda text, uk: {"answers": {"steps": int(text.split()[-1])}, "degraded": False, "engine_ms": 2400}
+        reqs = {k: v for k, v in self.reqs.items() if k != "r4"}      # the only selected R2 rows: r4 missing, r5 present
+        rc = ps.run_check(ps.pick_rows(self.rows, 2), reqs, decide, lambda a: bands[a["steps"]],
+                          live_median_ms=2409.0, budget_s=1.0, out=lines.append)
+        self.assertEqual(rc, 1)
+        out = "\n".join(lines)
+        self.assertIn("r4: expected R2, NOT CHECKED", out)
+        self.assertIn("4/5 bands match; 1 not checked", out)
+
+    def test_every_row_missing_from_requests_fails(self):
+        lines = []
+        rc = ps.run_check(self.rows[:2], {}, lambda t, u: self.fail("must not score"), lambda a: "R0",
+                          live_median_ms=None, budget_s=1.0, out=lines.append)
+        self.assertEqual(rc, 1)
+        self.assertIn("2 not checked", "\n".join(lines))
+
+    def test_no_selected_rows_cannot_run(self):
+        self.assertEqual(ps.run_check([], self.reqs, None, None, live_median_ms=None, budget_s=1.0, out=lambda m: None), 2)
 
     def test_degraded_scorer_fails(self):
         lines = []

@@ -788,6 +788,113 @@ PY
         _, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_SERVE_POINTER=pointer)
         self.assertIn("skipped: no new labels", log)
 
+    # --- hold promotion (data/no-promote, header "Hold promotion") ---------------------------------------------------------
+    def evals(self):
+        f = self.s1 / "data/eval-count"
+        return len(f.read_text()) if f.exists() else 0
+
+    def test_no_promote_holds_a_fresh_run_then_publishes_it_once_lifted(self):
+        old = '{"adapter": "/old/adapter", "base": "b"}\n'
+        self.pointer.write_text(old)
+        flag = self.s1 / "data/no-promote"
+        flag.write_text("")
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3)
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(self.evals(), 1, "evaluation still runs while promotion is held")
+        self.assertTrue(json.loads((run1 / "report.json").read_text())["promote"], "the report is kept")
+        self.assertIn("PROMOTION HELD: runs/2026-01-01 passes", log)
+        self.assertNotIn("PROMOTED", log)
+        self.assertEqual(self.pointer.read_text(), old, "nothing published while held")
+        self.assertFalse((self.s1 / "current.json.prev").exists())
+        self.assertIn("promotion_held runs/2026-01-01", (self.s1 / "data/pending-candidate").read_text())
+        self.assertEqual(self.status()["last_promotion_held"]["detail"], "runs/2026-01-01")
+        self.assertFalse((self.s1 / "data/last-train-labels").exists(), "a held candidate is not a final outcome")
+        # still held: new labels neither supersede it nor start training, and it is not re-evaluated
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=2)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("pending runs/2026-01-01: promotion held (data/no-promote present)", log)
+        self.assertNotIn("superseded", log)
+        self.assertEqual(self.evals(), 1)
+        self.assertFalse((run2 / "adapter").exists())
+        self.assertEqual(self.pointer.read_text(), old)
+        self.assertTrue((run1 / "adapter").is_dir(), "the retention pass keeps the held candidate")
+        # lifted: holdout, settings and incumbent unchanged, so its report is published as is
+        flag.unlink()
+        rc, log, run3 = self.run_night(STUB_NEW_LABELS=0)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("promotion no longer held; holdout, settings and incumbent unchanged", log)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
+        self.assertEqual(self.evals(), 1, "published without re-evaluation")
+        self.assertEqual(json.loads(self.pointer.read_text())["adapter"], str((run1 / "adapter").resolve()))
+        self.assertEqual((self.s1 / "current.json.prev").read_text(), old)
+        self.assertFalse((self.s1 / "data/pending-candidate").exists())
+        self.assertFalse((run3 / "adapter").exists())
+        self.assertIn("promotion_held", self.status()["last_promotion"]["detail"])
+
+    def test_no_promote_holds_a_pending_candidate_promotion(self):
+        ro = self.tmp / "ro"; ro.mkdir(); pointer = ro / "current.json"
+        ro.chmod(0o500); self.addCleanup(ro.chmod, 0o700)
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, CORTADOS_S1_SERVE_POINTER=pointer)
+        self.assertIn("PROMOTION FAILED", log)
+        ro.chmod(0o700)
+        flag = self.s1 / "data/no-promote"
+        flag.write_text("")
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_SERVE_POINTER=pointer)   # the pending (retry) path
+        self.assertEqual(rc, 0, log)
+        self.assertIn("pending candidate runs/2026-01-01 (promotion_failed): re-evaluating", log)
+        self.assertEqual(self.evals(), 2)
+        self.assertIn("PROMOTION HELD: runs/2026-01-01 passes", log)
+        self.assertFalse(pointer.exists())
+        self.assertIn("promotion_held runs/2026-01-01", (self.s1 / "data/pending-candidate").read_text())
+        self.assertEqual(self.status()["last_promotion_held"]["detail"], "runs/2026-01-01 (pending, promotion_failed)")
+        flag.unlink()
+        rc, log, run3 = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_SERVE_POINTER=pointer)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
+        self.assertEqual(self.evals(), 2)
+        self.assertEqual(json.loads(pointer.read_text())["adapter"], str((run1 / "adapter").resolve()))
+        self.assertFalse((self.s1 / "data/pending-candidate").exists())
+        _, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_SERVE_POINTER=pointer)
+        self.assertIn("skipped: no new labels", log)
+
+    def test_lifted_hold_reevaluates_when_the_incumbent_changed(self):
+        flag = self.s1 / "data/no-promote"
+        flag.write_text("")
+        _, log, run1 = self.run_night(STUB_NEW_LABELS=3)
+        self.assertIn("PROMOTION HELD", log)
+        # meanwhile an operator published another adapter by hand (promote_sweep.py): the report's bar is stale
+        self.pointer.write_text('{"adapter": "/hand/promoted/adapter", "base": "b"}\n')
+        flag.unlink()
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("its report is stale", log)
+        self.assertIn("pending candidate runs/2026-01-01 (promotion_held): re-evaluating", log)
+        self.assertEqual(self.evals(), 2)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
+        self.assertEqual(json.loads(self.pointer.read_text())["adapter"], str((run1 / "adapter").resolve()))
+
+    def test_lifted_hold_drops_a_candidate_that_no_longer_promotes(self):
+        flag = self.s1 / "data/no-promote"
+        flag.write_text("")
+        self.run_night(STUB_NEW_LABELS=3)
+        (self.s1 / "data/stub-holdout").write_text("h1")            # the holdout changed while held
+        flag.unlink()
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, STUB_PROMOTE=0)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("pending runs/2026-01-01 no longer promotes", log)
+        self.assertFalse(self.pointer.exists())
+        self.assertFalse((self.s1 / "data/pending-candidate").exists())
+
+    def test_force_train_supersedes_a_held_candidate(self):
+        (self.s1 / "data/no-promote").write_text("")
+        self.run_night(STUB_NEW_LABELS=3)
+        (self.s1 / "data/force-train").write_text("")
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=0)
+        self.assertIn("forced training: pending candidate runs/2026-01-01 (promotion_held) superseded", log)
+        self.assertTrue((run2 / "adapter").exists(), log)
+        self.assertIn("PROMOTION HELD: runs/2026-01-02", log)
+        self.assertFalse(self.pointer.exists())
+
     def test_train_config_values_are_exported_and_not_logged(self):
         (self.s1 / "data/train-config.env").write_text("# provider teacher\nCORTADOS_PROVIDER_URL=http://cfg.invalid:8432\n")
         _, log, _ = self.run_night(STUB_NEW_LABELS=1)

@@ -27,7 +27,13 @@ adapter's adapter_config.json hash, the blend/scale parameters, base, fail-up/ou
 every candidate version (whose temperatures are fitted) the hash of the validation rows. temps.json carries that validation
 hash too and is refitted when it differs. A changed identity moves the version's cache (scores, done marker, temps) aside
 into <version>/stale-<stamp>/ and starts that version over. A torn last line (a kill mid-write) is cut off on load, so the
-next append starts on a fresh line. Each model is released (gc + MLX cache cleared) before the next is loaded, so only one
+next append starts on a fresh line. Provenance: each scoring session records, before its first row, exactly what it scores
+with: sha256 of the version's adapters.safetensors and adapter_config.json, that config's content, and the temperatures the
+loaded scorer applies (<version>/scores.provenance.json). Rows cached by an earlier session are kept only when that session's
+provenance equals this one's; otherwise (or when cached rows have no provenance at all) they are moved aside and the version is
+rescored, so every row of a version was scored with one recorded artifact. sweep.json "versions" carries each version's
+provenance (null for a version fully cached before provenance was recorded); promote_sweep.py publishes only an adapter and
+temperatures equal to it. Each model is released (gc + MLX cache cleared) before the next is loaded, so only one
 is ever resident. The tilts reuse the cached scores. sweep.md then sweep.json are written atomically (tmp + rename) only when
 every version is complete, so an existing sweep.json always describes a finished sweep.
 
@@ -62,8 +68,9 @@ DEFAULT_SCALES = [0.75, 0.5]
 EXIT_REFUSED = 4          # the request cannot be run as given (no candidate weights); nightly.sh sets it aside, never retries it
 EXIT_ALREADY_DONE = 10    # --check-done: <out> is a finished sweep of exactly these inputs
 # Bumped whenever what calibrate.py computes for the same inputs changes (grading, selection, sweep.json layout): a sweep.json
-# from an older version is then not accepted as complete. 2: fingerprint + keyed caches (#74 review).
-CALIBRATE_VERSION = 2
+# from an older version is then not accepted as complete. 2: fingerprint + keyed caches (#74 review). 3: per-version provenance
+# (the adapter files' sha256, adapter_config.json and temperatures each version was scored with) in sweep.json "versions".
+CALIBRATE_VERSION = 3
 
 
 # --- candidate weights --------------------------------------------------------------------------------------------------
@@ -157,6 +164,18 @@ def file_hash(path: Path) -> str | None:
     """sha256 of a small file's content (adapter_config.json), None when it is missing."""
     try:
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def file_sha256(path: Path) -> str | None:
+    """sha256 of a whole (possibly large) file, streamed; None when it is missing."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
     except OSError:
         return None
 
@@ -368,21 +387,44 @@ class ScoreCache:
         self.dir, self.identity, self.log = Path(vdir), identity, log
         self.scores, self.meta, self.done = self.dir / "scores.jsonl", self.dir / "scores.meta.json", self.dir / "scores.done"
         self.temps = self.dir / "temps.json"
+        self.prov = self.dir / "scores.provenance.json"
         self.rows: dict[str, dict] = {}
         if _read_json(self.meta) == identity:
             self._load()
-        elif any(p.exists() for p in (self.meta, self.scores, self.done, self.temps)):
-            stale = self.dir / time.strftime("stale-%Y%m%d-%H%M%S")
-            n = 0
-            while stale.exists():
-                n += 1
-                stale = self.dir / (time.strftime("stale-%Y%m%d-%H%M%S") + f"-{n}")
-            stale.mkdir(parents=True)
-            for p in (self.meta, self.scores, self.done, self.temps):
-                if p.exists():
-                    os.replace(p, stale / p.name)
+        elif any(p.exists() for p in (self.meta, self.scores, self.done, self.temps, self.prov)):
+            stale = self._aside((self.meta, self.scores, self.done, self.temps, self.prov))
             self.log(f"sweep: {self.dir.name}: cached scores are for another adapter/settings/data; moved aside to "
                      f"{stale.name}, starting this version over")
+
+    def _aside(self, paths) -> Path:
+        stale = self.dir / time.strftime("stale-%Y%m%d-%H%M%S")
+        n = 0
+        while stale.exists():
+            n += 1
+            stale = self.dir / (time.strftime("stale-%Y%m%d-%H%M%S") + f"-{n}")
+        stale.mkdir(parents=True)
+        for p in paths:
+            if p.exists():
+                os.replace(p, stale / p.name)
+        return stale
+
+    def provenance(self):
+        """What the cached rows were scored with (scores.provenance.json), None when not recorded."""
+        return _read_json(self.prov)
+
+    def vouch(self, prov: dict) -> bool:
+        """Before a scoring session: keep the cached rows only when they were scored with exactly `prov`. Rows without a recorded
+        provenance, or with another one, are moved aside (scores, done marker, old provenance; temps.json stays, it is part of
+        `prov`) and the version starts over. False when rows were dropped."""
+        old = self.provenance()
+        if old == prov or not (self.rows or self.scores.exists() or self.done.exists()):
+            return True
+        stale = self._aside((self.scores, self.done, self.prov))
+        self.rows = {}
+        self.log(f"sweep: {self.dir.name}: cached rows were scored with "
+                 f"{'an unrecorded artifact' if old is None else 'another adapter/config/temperatures'}; moved aside to "
+                 f"{stale.name}, rescoring this version")
+        return False
 
     def _load(self) -> None:
         try:
@@ -406,8 +448,10 @@ class ScoreCache:
     def complete(self, keys: list[str]) -> bool:
         return all(k in self.rows for k in keys)
 
-    def begin(self) -> None:
+    def begin(self, prov: dict | None = None) -> None:
         write_atomic(self.meta, json.dumps(self.identity, sort_keys=True))
+        if prov is not None:
+            write_atomic(self.prov, json.dumps(prov, sort_keys=True))
         self.done.unlink(missing_ok=True)
         self._fh = open(self.scores, "a")
 
@@ -429,6 +473,14 @@ class ScoreCache:
         if fh:
             fh.close()
             self._fh = None
+
+
+def provenance(adapter: str, scorer) -> dict:
+    """What a scoring session scores with: sha256 of the adapter dir's two files, the config's content and the temperatures the
+    loaded scorer applies (the pointer's for live, the fitted ones for a candidate version)."""
+    d = Path(adapter)
+    return {"adapter_sha256": file_sha256(d / "adapters.safetensors"), "adapter_config_sha256": file_hash(d / "adapter_config.json"),
+            "adapter_config": _read_json(d / "adapter_config.json"), "T": getattr(scorer, "T", None)}
 
 
 def variants_for(alphas: list[float], scales: list[float]) -> list[tuple[str, tuple | None]]:
@@ -463,6 +515,7 @@ def run_sweep(*, candidate: str, live: str, tilts: list[float], alphas: list[flo
     keys = [row_key(kind, r) for kind, r in wanted]
     scores: dict[str, ScoreCache] = {}
     adapters: dict[str, str] = {}
+    versions: dict[str, dict | None] = {}
     for name, how in variants_for(alphas, scales):
         vdir = rows_dir / name
         weights = dict(live_id) if name == "live" else dict(cand_id)
@@ -480,10 +533,13 @@ def run_sweep(*, candidate: str, live: str, tilts: list[float], alphas: list[flo
             log(f"sweep: {name}: {len(keys) - len(missing)} of {len(keys)} rows cached; scoring {len(missing)}")
             if how:   # blends are rebuilt (seconds) before scoring: a write cut by a stop must not be loaded
                 blend_adapters(Path(candidate), Path(live) if how[0] == "blend" else None, how[1], vdir)
-            cache.begin()
             scorer = None
             try:
                 scorer = make_scorer(adapter, None if name == "live" else cache.temps)
+                prov = provenance(adapter, scorer)
+                if not cache.vouch(prov):
+                    missing = list(zip(keys, (r for _, r in wanted)))
+                cache.begin(prov)
                 for k, r in missing:
                     cache.add(k, ev.failed_up(scorer.score(r["request"], r["unit_kind"]), fail_up))
             finally:
@@ -493,6 +549,11 @@ def run_sweep(*, candidate: str, live: str, tilts: list[float], alphas: list[flo
         else:
             cache.begin()
         cache.finish(len(keys))
+    for name, _ in variants_for(alphas, scales):
+        versions[name] = scores[name].provenance()
+        if versions[name] is None:
+            log(f"sweep: {name}: scored before provenance was recorded; promote_sweep.py refuses it (move sweep/{name}/ "
+                f"aside and rerun to rescore it)")
 
     def pred_for(name: str, kind: str, t: float):
         rows = scores[name].rows
@@ -518,7 +579,7 @@ def run_sweep(*, candidate: str, live: str, tilts: list[float], alphas: list[flo
              "holdout_rows": len(holdout), "outcome_holdout_rows": len(o_holdout), "live_teacher": live_teacher,
              "live_outcome": live_outcome, "chosen": chosen, "settings": rows,
              "chosen_would_promote": next((r["report"]["promote"] for r in rows if r["setting"] == chosen), None),
-             "fingerprint": fingerprint}
+             "versions": versions, "fingerprint": fingerprint}
     write_atomic(out.with_suffix(".md"), markdown(sweep))
     write_atomic(out, json.dumps(sweep, indent=1))      # last: an existing sweep.json means the sweep finished
     return sweep

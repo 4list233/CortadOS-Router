@@ -14,7 +14,12 @@ plan (a dry run unless --write): prints the pointer it would write and every che
   - the live pointer is not the one the sweep graded against (fingerprint.inference.live_pointer: adapter, base, temperatures);
   - the candidate or live weights changed since the sweep (calibrate.file_id against the fingerprint);
   - the version's cache is incomplete or inconsistent (scores.done, scores.meta.json built from those weights, temps.json fitted
-    on the same validation rows as the scores, a blend file written before its scoring began).
+    on the same validation rows as the scores);
+  - the sweep recorded no provenance for the version (sweep.json "versions", calibrate.py CALIBRATE_VERSION 3: what each scoring
+    session scored with), or the files differ from it: temps.json's temperatures must equal the recorded ones exactly, and the
+    adapter's adapters.safetensors and adapter_config.json must have the recorded sha256 and the config the recorded content
+    (rank, scale, every field). A sweep from before provenance is refused: move sweep/<version>/ aside and rerun the sweep, which
+    rescores that version alone.
 --write copies the version's adapter (adapters.safetensors + adapter_config.json) into <run>/promoted/<run>-<version>/adapter,
 read-only: the sweep dir is rebuilt in place by a later sweep of the same candidate, and evaluate.py keys the incumbent bar cache
 by the adapter's parent dir name, which must not be shared with any other adapter. Then it writes the pointer atomically and
@@ -28,8 +33,9 @@ check: scores the holdout rows of one sweep setting dir (e.g. `live` before, `bl
 the router does (core.decide_s1: CORTADOS_S1_URL / CORTADOS_S1_TOKEN from the environment, fail-up, outward threshold; usage
 refresh forced off, so no vendor CLI is opened) and
 compares each band with the band the sweep recorded for that row, by id. Up to --per-band rows per predicted band. Prints ids,
-bands and latency only, never request text. Exit 0 when every band matches and the median latency is within --budget-s of the
-sweep's live median; 1 otherwise; 2 when it cannot run.
+bands and latency only, never request text. A selected row whose id is not in requests.jsonl is a failure (it was not checked),
+as is a degraded answer. Exit 0 when every selected row was scored, every band matches and the median latency is within
+--budget-s of the sweep's live median; 1 otherwise; 2 when it cannot run (inputs unreadable, or no row selected).
 """
 from __future__ import annotations
 
@@ -164,21 +170,35 @@ def plan(sweep_path: Path, setting: str, pointer_path: Path, dest: Path | None =
         raise Refused(f"{vdir}/temps.json has no fitted temperatures")
     if temps.get("valid") != meta.get("valid") or temps.get("valid") != fp.get("valid"):
         raise Refused(f"{vdir}/temps.json was fitted on other validation rows than the scores and the sweep")
-    checks.append(f"{version}: scores complete, built from the fingerprinted weights, temperatures fitted on the same valid rows")
+    prov = (sweep.get("versions") or {}).get(version)
+    if not isinstance(prov, dict):
+        raise Refused(f"the sweep recorded no provenance for {version} (sweep.json \"versions\", calibrate.py CALIBRATE_VERSION 3; "
+                      f"this sweep has calibrate_version {fp.get('calibrate_version')!r}): nothing ties its adapter and temperatures "
+                      f"to the graded scores. Move {vdir} aside and rerun the sweep to rescore {version}")
+    if temps["T"] != prov.get("T"):
+        raise Refused(f"{vdir}/temps.json holds other temperatures than the ones {version} was scored with "
+                      f"(now {temps['T']!r}, recorded {prov.get('T')!r})")
+    checks.append(f"{version}: scores complete, built from the fingerprinted weights, temperatures fitted on the same valid rows "
+                  f"and equal to the ones the scores used")
 
     source = (root / row["adapter"]) if not Path(row["adapter"]).is_absolute() else Path(row["adapter"])
     src_w, src_c = source / "adapters.safetensors", source / "adapter_config.json"
     for p in (src_w, src_c):
         if not p.is_file():
             raise Refused(f"missing {p}")
-    if blend and src_w.stat().st_mtime_ns > (vdir / "scores.meta.json").stat().st_mtime_ns:
-        raise Refused(f"{src_w} was rewritten after its scoring began: it is not the adapter the sweep graded")
     cfg_src = _read(src_c)
+    w_sha, c_sha = sha256(src_w), sha256(src_c)
+    if w_sha != prov.get("adapter_sha256"):
+        raise Refused(f"{src_w} is not the adapter {version} was scored with (sha256 {w_sha}, recorded {prov.get('adapter_sha256')})")
+    if c_sha != prov.get("adapter_config_sha256") or cfg_src != prov.get("adapter_config"):
+        raise Refused(f"{src_c} is not the config {version} was scored with (sha256 {c_sha}, recorded "
+                      f"{prov.get('adapter_config_sha256')}; now {cfg_src!r}, recorded {prov.get('adapter_config')!r})")
     if cfg_src.get("model") != fp["inference"]["base"]:
         raise Refused(f"{src_c} names base {cfg_src.get('model')!r}, the sweep graded {fp['inference']['base']!r}")
     rank = (cfg_src.get("lora_parameters") or {}).get("rank")
-    w_sha, c_sha = sha256(src_w), sha256(src_c)
-    checks.append(f"source adapter {source} (LoRA rank {rank}; adapters.safetensors sha256 {w_sha[:16]}...)")
+    checks.append(f"source adapter {source} is the one {version} was scored with: adapters.safetensors and adapter_config.json "
+                  f"sha256 and config content equal the sweep's record (LoRA rank {rank}, scale "
+                  f"{(cfg_src.get('lora_parameters') or {}).get('scale')}; adapters.safetensors sha256 {w_sha[:16]}...)")
 
     dest = Path(dest) if dest else run_dir / "promoted" / f"{run_dir.name}-{version}" / "adapter"
     if dest.exists():
@@ -250,11 +270,15 @@ def pick_rows(rows: list[dict], per_band: int) -> list[dict]:
 def run_check(rows: list[dict], requests: dict, decide, band_of, *, live_median_ms: float | None, budget_s: float,
               out=print) -> int:
     """decide(request, unit_kind) -> core.decide_s1-shaped dict; band_of(answers) -> band. Prints no request text."""
-    lat, bad, n = [], 0, 0
+    lat, bad, n, missing = [], 0, 0, 0
+    if not rows:
+        out("check: no row selected")
+        return 2
     for r in rows:
         q = requests.get(r["id"])
         if not q:
-            out(f"  {r['id']}: not in requests.jsonl; skipped")
+            missing += 1
+            out(f"  {r['id']}: expected {r['pred_band']}, NOT CHECKED (not in requests.jsonl)")
             continue
         d = decide(q["request"], r.get("unit_kind") or q.get("unit_kind") or "interactive")
         n += 1
@@ -269,14 +293,11 @@ def run_check(rows: list[dict], requests: dict, decide, band_of, *, live_median_
         bad += 0 if ok else 1
         out(f"  {r['id']}: expected {r['pred_band']}, got {band} {'ok' if ok else 'MISMATCH'}"
             f"{'' if same_answers else ' (answers differ from the sweep row)'}; {d.get('engine_ms')} ms")
-    if not n:
-        out("check: no row could be scored")
-        return 2
     med = statistics.median(lat) if lat else None
     lat_ok = med is not None and (live_median_ms is None or med <= live_median_ms + budget_s * 1000)
-    out(f"check: {n - bad}/{n} bands match; median latency {med} ms "
+    out(f"check: {n - bad}/{len(rows)} bands match; {missing} not checked (missing from requests.jsonl); median latency {med} ms "
         f"(sweep live median {live_median_ms} ms, budget +{budget_s:g} s): {'ok' if lat_ok else 'OVER BUDGET'}")
-    return 0 if bad == 0 and lat_ok else 1
+    return 0 if bad == 0 and missing == 0 and lat_ok else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -318,17 +339,17 @@ def main(argv: list[str] | None = None) -> int:
     sys.path.insert(0, str(HERE.parent))
     from cortados_router import core
     sweep_path = Path(a.sweep).resolve()
-    sweep = json.loads(sweep_path.read_text())
     rows_p = sweep_path.parent / "sweep" / a.expect / "holdout-rows.jsonl"
     try:
+        sweep = json.loads(sweep_path.read_text())
         rows = [json.loads(x) for x in rows_p.read_text().splitlines() if x.strip()]
         reqs = {}
         for x in Path(a.requests).read_text().splitlines():
             if x.strip():
                 o = json.loads(x)
                 reqs[o["id"]] = o
-    except (OSError, ValueError) as exc:
-        print(f"check: cannot read inputs ({exc})")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"check: cannot read inputs ({exc!r})")
         return 2
     core.lane_health = lambda **_: {}
 

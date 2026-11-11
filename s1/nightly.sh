@@ -60,6 +60,14 @@
 #   reaches past the current window's end (capped; more than a day ahead without a window: ignored).
 #   Request: {"candidate": "runs/<c>/adapter", "live": "runs/<l>/adapter", "tilts": [...], "alphas": [...], "scales": [...]};
 #   scales default to none. Its candidate run is kept by the retention pass while the request is pending.
+# Hold promotion (owner 2026-11-11): while data/no-promote exists, nothing is published to the serving pointer. The flag is checked
+#   immediately before BOTH promotion calls (a pending candidate's, and a fresh run's). A candidate that passes is NOT discarded:
+#   its report.json stays and it is kept pending with reason promotion_held (log line "PROMOTION HELD", status.json
+#   last_promotion_held). While the flag stays, a held candidate is neither re-evaluated nor superseded by new labels (like
+#   evaluation_pending) and the cycle ends after labeling; --train / data/force-train still supersede it. Once the flag is
+#   removed, the next cycle publishes it without re-evaluation when its eval fingerprint (holdout labels, inference settings,
+#   serving incumbent) is unchanged and its report still promotes; otherwise it is re-evaluated against the current incumbent
+#   first, as any pending candidate. Labeling and evaluation are not affected. Set: touch data/no-promote; lift: rm it (or mv).
 # Exit codes: 0 ok / skipped, 3 labeling failed, 1 other failure, 2 base model missing, 130 stopped.
 set -u
 cd "$(dirname "$0")" || exit 1
@@ -655,6 +663,9 @@ fi
 #                            left). Written BEFORE evaluate_run starts so a TERM mid-evaluation leaves it. Re-evaluated next night
 #                            WHATEVER the SFT fingerprint says: labeling adds data every night, so superseding on new data (the
 #                            policy for the other reasons) would discard every trained candidate and the pipeline would never promote.
+#   reason promotion_held:   the report promotes but data/no-promote was set (header "Hold promotion"). Kept whatever the SFT
+#                            fingerprint says while held; published as is when the flag is gone and the eval fingerprint is
+#                            unchanged, else re-evaluated first.
 #   reason holdout_blocked:  evaluate.py refused for a too-small Claude holdout. Holdout labels never enter the SFT data, so the
 #                            SFT marker cannot notice the backfill; the run waits and is re-evaluated when the eval fingerprint
 #                            (effective holdout labels + settings + serving incumbent) changes.
@@ -700,7 +711,7 @@ if read_pending; then
   if [ ! -d "$p_run/adapter" ]; then
     echo "pending candidate $p_run adapter missing; dropped"; state event "$STATUS" pending_failure "$p_run adapter missing"
     rm -f data/pending-candidate
-  elif [ "$p_sft" = "$sft_hash" ] || [ "$p_reason" = evaluation_pending ]; then
+  elif [ "$p_sft" = "$sft_hash" ] || [ "$p_reason" = evaluation_pending ] || [ "$p_reason" = promotion_held ]; then
     # Convergence: a night with an evaluation_pending candidate spends itself on that evaluation (it starts right after labeling,
     # ~02:45, so 110 min fits) and ends; the next night trains on the newer data. Only a run whose training COMPLETED is protected
     # this way. Mid-training progress on a non-completed run resumes within its own run folder (segment-target / iters-base); in
@@ -718,19 +729,34 @@ if read_pending; then
       state event "$STATUS" skip "pending $p_run waits for holdout ($p_reason)"; holdout_hit
       echo "=== $(date) nightly end"; exit 0
     fi
-    if ! eval_time_ok "$p_run" "$p_reason"; then
-      state event "$STATUS" skip "pending $p_run: not enough time to evaluate"; echo "=== $(date) nightly end"; exit 0
+    reeval=1
+    if [ "$p_reason" = promotion_held ]; then
+      if [ -f data/no-promote ]; then
+        echo "pending $p_run: promotion held (data/no-promote present); kept pending, not re-evaluated while held"
+        state event "$STATUS" skip "pending $p_run: promotion held (data/no-promote)"; echo "=== $(date) nightly end"; exit 0
+      fi
+      if [ "$now_eval" = "$p_eval" ] && ! report_unavailable "$p_run" && report_promotes "$p_run"; then
+        reeval=0
+        echo "pending $p_run: promotion no longer held; holdout, settings and incumbent unchanged since its report, which still promotes: publishing it"
+      else
+        echo "pending $p_run: promotion no longer held, but its report is stale (holdout, settings or incumbent changed) or no longer promotes"
+      fi
     fi
-    echo "pending candidate $p_run ($p_reason): re-evaluating against the current holdout and incumbent"
-    if ! evaluate_run "$p_run"; then
-      echo "re-evaluation of $p_run failed; retried next night"; state event "$STATUS" pending_failure "$p_run (re-evaluation failed)"; eval_failed; exit 1
+    if [ "$reeval" -eq 1 ]; then
+      if ! eval_time_ok "$p_run" "$p_reason"; then
+        state event "$STATUS" skip "pending $p_run: not enough time to evaluate"; echo "=== $(date) nightly end"; exit 0
+      fi
+      echo "pending candidate $p_run ($p_reason): re-evaluating against the current holdout and incumbent"
+      if ! evaluate_run "$p_run"; then
+        echo "re-evaluation of $p_run failed; retried next night"; state event "$STATUS" pending_failure "$p_run (re-evaluation failed)"; eval_failed; exit 1
+      fi
+      if report_unavailable "$p_run"; then
+        write_pending "$p_sft" "$now_eval" evaluation_failed "$p_run"
+        echo "EVALUATION UNAVAILABLE again for $p_run: $(report_why "$p_run"); retried next night"
+        state event "$STATUS" evaluation_failure "$p_run (retry)"; eval_failed; exit 1
+      fi
+      eval_ok; streak eval_deferred clear "$EVAL_FAIL_NIGHTS"
     fi
-    if report_unavailable "$p_run"; then
-      write_pending "$p_sft" "$now_eval" evaluation_failed "$p_run"
-      echo "EVALUATION UNAVAILABLE again for $p_run: $(report_why "$p_run"); retried next night"
-      state event "$STATUS" evaluation_failure "$p_run (retry)"; eval_failed; exit 1
-    fi
-    eval_ok; streak eval_deferred clear "$EVAL_FAIL_NIGHTS"
     if [ "$same_data" -eq 1 ]; then next_msg="no new data, nothing to train"; else next_msg="the newer labels are trained next night"; fi
     if ! report_promotes "$p_run"; then
       if report_blocked "$p_run"; then
@@ -743,6 +769,11 @@ if read_pending; then
         echo "pending $p_run no longer promotes (see $p_run/report.json); incumbent stays; $next_msg"
       fi
       echo "=== $(date) nightly end"; exit 0
+    fi
+    if [ -f data/no-promote ]; then   # header "Hold promotion": checked right before the promotion call
+      write_pending "$p_sft" "$now_eval" promotion_held "$p_run"; holdout_clear
+      echo "PROMOTION HELD: $p_run passes (see $p_run/report.json) but data/no-promote is present; kept pending (promotion_held), published once the flag is removed"
+      state event "$STATUS" promotion_held "$p_run (pending, $p_reason)"; echo "=== $(date) nightly end"; exit 0
     fi
     if state promote "$p_run/report.json" "$PWD/$p_run/adapter" "$SERVE_POINTER"; then
       rm -f data/pending-candidate; state event "$STATUS" promotion "$p_run (pending, $p_reason)"; trained_mark; holdout_clear
@@ -966,6 +997,12 @@ eval_ok; streak eval_deferred clear "$EVAL_FAIL_NIGHTS"
 if report_promotes "$RUN"; then
   # 2026-11-02: write the file the scorer reads (it used to be a copy the scorer never saw). serve.py reloads when its mtime changes;
   # the previous pointer is kept as <pointer>.prev — rollback: mv <pointer>.prev <pointer>.
+  if [ -f data/no-promote ]; then   # header "Hold promotion": checked right before the promotion call
+    write_pending "$sft_hash" "$(eval_fingerprint || echo unknown)" promotion_held "$RUN"; holdout_clear
+    state event "$STATUS" promotion_held "$RUN"
+    echo "PROMOTION HELD: $RUN passes (see $RUN/report.json) but data/no-promote is present; kept pending (promotion_held), published once the flag is removed"
+    echo "=== $(date) nightly end"; exit 0
+  fi
   if state promote "$RUN/report.json" "$PWD/$RUN/adapter" "$SERVE_POINTER"; then
     state event "$STATUS" promotion "$RUN"
     rm -f data/pending-candidate; mark_trained; holdout_clear
