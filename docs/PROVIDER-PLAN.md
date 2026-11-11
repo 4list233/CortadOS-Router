@@ -594,7 +594,7 @@ or an exception type, never its message):
     {"version": 1, "generated_at": <s>,
      "overview": {"running_tasks", "queued_tasks", "active_conversations", "working_conversations", "s1",
                   "s1_latency_ms", "lowest_subscription": {"lane", "label", "left_pct", "window"} | null,
-                  "hosts_with_heartbeat", "errors"},                    # counts are null when their section failed
+                  "route_log_errors", "hosts_with_heartbeat", "errors"},  # counts are null when their section failed
      "tasks": {..., "scope": "provider host", "window_s": 86400,
                "counts": {"running", "queued", "succeeded", "failed", "cancelled", "unknown"},
                "running": [task], "queued": [task], "recent": [task], "truncated",
@@ -607,7 +607,10 @@ or an exception type, never its message):
                  "status": working|idle, "tool", "source", "title", "started_at", "last_activity", "elapsed_s"}
      "routed": {..., "calls": [{"ts", "task_id", "session_id", "routing_kind", "band", "lane", "model",
                 "actual_model", "elapsed_ms", "degraded", "s1_reason", "request_chars", "response_chars"}] (25),
-                "totals", "row_limit", "more"},
+                "totals", "row_limit", "more",
+                "route_log_errors": {"count", "lost", "recovered", "last_error_type", "last_error_at", "last_op"}},
+         (route_log_errors: this provider process's failed router.db writes since start, #99; a failed route log never
+          fails the request, so this and the provider log are where it shows)
      "subscriptions": {..., "lanes": [{"lane", "label", "account", "left_pct", "stale", "error", "sample_age_s",
                        "shared_with", "pools", "windows": [{"window", "pool", "left_pct", "resets_in_h", "stale"}]}],
                        "lowest"},

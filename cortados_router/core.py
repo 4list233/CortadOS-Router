@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from cortados_router import router_db
 from cortados_router.paths import s1_current, tables_dir
 
 REPO = Path(_env_get("CORTADOS_REPO") or Path.home() / "cortados")   # the CortadOS checkout (fleet roster faces.json); not this repo
@@ -1003,46 +1004,66 @@ def _db() -> sqlite3.Connection:
     return c
 
 
-def log_route(turn_id: str, meta: dict[str, Any], decision: dict[str, Any], r: dict[str, Any]) -> None:
-    ch = r.get("chosen") or {}
-    with _db_lock:
-        c = _db()
+ROUTE_LOG_RETRY_S = 0.05     # one brief retry: the lock errors seen in #99 were transient
+
+
+def _write_routes(op: str, write: Callable[[sqlite3.Connection], None], *, raise_final: bool) -> bool:
+    """Run one router.db write (open, write, commit) with one retry after ROUTE_LOG_RETRY_S. Every failed attempt is
+    counted in router_db (published by the usage and live views). After the retry fails: raise when raise_final, else
+    return False. The retry waits outside _db_lock so other writers are not held up."""
+    for attempt in (1, 2):
         try:
-            c.execute("INSERT OR REPLACE INTO routes (turn_id, ts, session_id, platform, unit_kind, actual_model, request, request_chars, history_msgs, "
-                      "engine, engine_ms, degraded, engine_error, answers, features, D, band, orchestrator, lane, provider, model, runner_up, skipped, "
-                      "subagents, verifier, hard_rules, table_version, table_error, scarcity, context) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                      (turn_id, time.time(), meta.get("session_id"), meta.get("platform"), meta.get("unit_kind"), meta.get("actual_model"),
-                       meta.get("request"), len(meta.get("request") or ""), meta.get("history_msgs"), decision["engine"], decision["engine_ms"],
-                       int(decision["degraded"]), decision.get("error"), json.dumps(r.get("answers")), json.dumps(r.get("features")), r.get("D"),
-                       r["band"], r.get("orchestrator"), ch.get("lane"), ch.get("provider"), ch.get("model"), json.dumps(r.get("runner_up")),
-                       json.dumps(r.get("skipped")), r["subagents"], int(r["verifier"]), json.dumps(r["hard_rules"]), r.get("table_version"), r.get("table_error"), json.dumps(r.get("scarcity")), meta.get("context")))
-            c.execute('UPDATE routes SET task_context=? WHERE turn_id=?',
-                      (json.dumps(meta['task_context'], ensure_ascii=False) if meta.get('task_context') is not None else None, turn_id))
-            c.commit()
-        finally:
-            c.close()
+            with _db_lock:
+                c = _db()
+                try:
+                    write(c)
+                    c.commit()
+                finally:
+                    c.close()
+        except sqlite3.Error as exc:
+            router_db.note_error(op, exc, final=attempt == 2)
+            if attempt == 2:
+                if raise_final:
+                    raise
+                return False
+            time.sleep(ROUTE_LOG_RETRY_S)
+        else:
+            if attempt == 2:
+                router_db.note_recovered(op)
+            return True
+    return False   # unreachable
+
+
+def log_route(turn_id: str, meta: dict[str, Any], decision: dict[str, Any], r: dict[str, Any]) -> bool:
+    """Log one routing decision. Never raises sqlite3.Error: a failure to LOG a route must not fail the routed request
+    (#99). Returns False when the row could not be written after one retry; the failure is counted in router_db."""
+    ch = r.get("chosen") or {}
+    row = (turn_id, time.time(), meta.get("session_id"), meta.get("platform"), meta.get("unit_kind"), meta.get("actual_model"),
+           meta.get("request"), len(meta.get("request") or ""), meta.get("history_msgs"), decision["engine"], decision["engine_ms"],
+           int(decision["degraded"]), decision.get("error"), json.dumps(r.get("answers")), json.dumps(r.get("features")), r.get("D"),
+           r["band"], r.get("orchestrator"), ch.get("lane"), ch.get("provider"), ch.get("model"), json.dumps(r.get("runner_up")),
+           json.dumps(r.get("skipped")), r["subagents"], int(r["verifier"]), json.dumps(r["hard_rules"]), r.get("table_version"), r.get("table_error"), json.dumps(r.get("scarcity")), meta.get("context"))
+    task_context = json.dumps(meta['task_context'], ensure_ascii=False) if meta.get('task_context') is not None else None
+
+    def write(c: sqlite3.Connection) -> None:
+        c.execute("INSERT OR REPLACE INTO routes (turn_id, ts, session_id, platform, unit_kind, actual_model, request, request_chars, history_msgs, "
+                  "engine, engine_ms, degraded, engine_error, answers, features, D, band, orchestrator, lane, provider, model, runner_up, skipped, "
+                  "subagents, verifier, hard_rules, table_version, table_error, scarcity, context) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  row)
+        c.execute('UPDATE routes SET task_context=? WHERE turn_id=?', (task_context, turn_id))
+    return _write_routes("log_route", write, raise_final=False)
 
 
 def log_execution(route_id: str, provider: str, model: str) -> None:
-    """Only a completed provider response is evidence of actual execution."""
-    with _db_lock:
-        c = _db()
-        try:
-            c.execute("UPDATE routes SET actual_model=? WHERE turn_id=?",
-                      (f"{provider}/{model}", route_id))
-            c.commit()
-        finally:
-            c.close()
+    """Only a completed provider response is evidence of actual execution. Raises sqlite3.Error after one retry (the
+    provider retries it on the conversation's next turn); every failed attempt is counted in router_db."""
+    _write_routes("log_execution", lambda c: c.execute("UPDATE routes SET actual_model=? WHERE turn_id=?",
+                                                       (f"{provider}/{model}", route_id)), raise_final=True)
 
 
 def log_outcome(turn_id: str, response_chars: int, turn_ms: int) -> None:
-    with _db_lock:
-        c = _db()
-        try:
-            c.execute("UPDATE routes SET response_chars=?, turn_ms=? WHERE turn_id=?", (response_chars, turn_ms, turn_id))
-            c.commit()
-        finally:
-            c.close()
+    _write_routes("log_outcome", lambda c: c.execute("UPDATE routes SET response_chars=?, turn_ms=? WHERE turn_id=?",
+                                                     (response_chars, turn_ms, turn_id)), raise_final=True)
 
 
 def log_call_context(turn_id, api_request_id, *, session_id, model, provider,
@@ -1133,7 +1154,7 @@ def usage_summary(limit: int = 12) -> dict[str, Any]:
     if not path.exists():
         return empty
     try:
-        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)
+        conn = router_db.reader(path, timeout=5)   # not mode=ro: this process may also write router.db (#99)
     except sqlite3.Error as exc:
         return {**empty, "error": f"{type(exc).__name__}: {exc}"}
     conn.row_factory = sqlite3.Row
