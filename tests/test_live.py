@@ -201,6 +201,41 @@ class CollectTest(unittest.TestCase):
         self.assertTrue(s["lowest"]["window"].startswith("month (Cursor models"))
         self.assertEqual(fixture_view()["overview"]["lowest_subscription"], s["lowest"])
 
+    def test_lowest_skips_lanes_routing_cannot_use(self):
+        # Review P3: the anthropic-api lane with no key reads 0 % left (of a $0 budget) and was shown as the floor.
+        def lane(name, left):
+            return {"lane": name, "label": name, "left_pct": left, "stale": False, "error": None,
+                    "windows": [{"window": "1mo", "pool": "all", "left_pct": left}]}
+        u = {"lanes": [lane("anthropic-api", 0.0), lane("antigravity", 5.0), lane("claude", 60.0), lane("codex", 40.0)]}
+        self.assertEqual(live.subscriptions_section(u, NOW)["lowest"]["lane"], "anthropic-api")   # no predicate: as before
+        with mock.patch("cortados_router.api_credits.configured_orgs", return_value=[]):
+            s = live.subscriptions_section(u, NOW, live.lane_enabled)
+        self.assertEqual(s["lowest"]["lane"], "codex")        # antigravity: context ceiling 0, refused by the fit gate
+        self.assertEqual(len(s["lanes"]), 4)                  # still listed, only never the floor
+        with mock.patch("cortados_router.api_credits.configured_orgs", return_value=[("org", "key")]):
+            self.assertEqual(live.subscriptions_section(u, NOW, live.lane_enabled)["lowest"]["lane"], "anthropic-api")
+        s = live.subscriptions_section(u, NOW, lambda l: (_ for _ in ()).throw(KeyError()) if l == "codex" else True)
+        self.assertEqual(s["lowest"]["lane"], "anthropic-api")
+        s = live.subscriptions_section(u, NOW, lambda l: (_ for _ in ()).throw(KeyError()) if l != "claude" else True)
+        self.assertEqual((s["lowest"]["lane"], s["status"]), ("claude", "partial"))
+        self.assertIn({"source": "lanes", "error": "KeyError"}, s["errors"])
+        v = fixture_view(lane_enabled=lambda l: l != "cursor")
+        self.assertEqual(v["overview"]["lowest_subscription"]["lane"], v["subscriptions"]["lowest"]["lane"])
+        self.assertNotEqual(v["subscriptions"]["lowest"]["lane"], "cursor")
+
+    def test_hardware_matching_no_known_host_is_dropped_and_counted(self):
+        u = usage_live()
+        u["hardware"] = list(u.get("hardware") or []) + [
+            {"file": "forests-imac.json", "age_s": 5.0, "data": {"host": "forests-imac", "cpu_busy_pct": 3.0}},
+            {"file": "x.json", "age_s": 5.0, "data": {"host": None}}]
+        v = fixture_view(usage_view=lambda: u)
+        h = v["hosts"]
+        self.assertEqual([x["name"] for x in h["items"]], ["air", "studio", "pro"])
+        self.assertEqual(h["status"], "partial")
+        self.assertIn({"source": "hardware", "error": "2 hardware sample(s) match no known host name"}, h["errors"])
+        self.assertNotIn("imac", json.dumps(h))
+        self.assertEqual({x["name"]: x for x in h["items"]}["studio"]["hardware"]["age_s"], 30.0)
+
     def test_s1_and_hosts(self):
         v = fixture_view()
         self.assertEqual((v["s1"]["status"], v["s1"]["latency_ms"], v["s1"]["http_status"]), ("up", 23, 200))
@@ -414,6 +449,23 @@ class ClientHostTest(unittest.TestCase):
             self.assertFalse(os.path.exists(tf + "2"))
             token = Path(tf).read_text().strip()
             self.assertEqual(clients.ClientTokens(path=Path(cf)).match(token).host, "studio")
+
+    def test_load_logs_heartbeat_bindings_without_tokens(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        cf, tf, rf = (os.path.join(d, n) for n in ("clients.json", "beat-token", "read-token"))
+        with mock.patch.dict(os.environ, {"CORTADOS_PROVIDER_CLIENTS": cf}), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(clients.main(["add", "studio-s1", "--scope", "live:heartbeat", "--host", "studio",
+                                           "--token-file", tf]), 0)
+            self.assertEqual(clients.main(["add", "pulse", "--scope", "live:read", "--token-file", rf]), 0)
+        token = Path(tf).read_text().strip()
+        with self.assertLogs(clients.logger, "INFO") as cm:
+            clients.ClientTokens(path=Path(cf)).match(token)
+        logs = "\n".join(cm.output)
+        self.assertIn("heartbeat bindings: studio-s1 -> studio", logs)
+        self.assertNotIn("pulse ->", logs)
+        self.assertNotIn(token, logs)
 
 
 class HeartbeatTest(unittest.TestCase):

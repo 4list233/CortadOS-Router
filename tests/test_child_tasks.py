@@ -1059,6 +1059,10 @@ class ChildTaskTests(ChildTaskBase):
         jobs = json.load(open(reg)) if os.path.exists(reg) else {{}}
         mode = os.environ.get("FAKE_LAUNCHCTL_MODE", "run")
         cmd = sys.argv[1]
+        if cmd == "print":
+            sys.exit(0 if sys.argv[-1].rsplit("/", 1)[1] in jobs else 113)
+        if cmd == "bootout" and os.environ.get("FAKE_LAUNCHCTL_BOOTOUT") == "fail":
+            sys.stderr.write("Boot-out failed: 5: Input/output error\\n"); sys.exit(5)
         if cmd == "bootstrap":
             if mode == "fail":
                 sys.stderr.write("Bootstrap failed: 5: Input/output error\\n"); sys.exit(5)
@@ -1087,6 +1091,9 @@ class ChildTaskTests(ChildTaskBase):
                 del jobs[label]
         with open(reg, "w") as f:
             json.dump(jobs, f)
+        if cmd == "bootstrap" and os.environ.get("FAKE_LAUNCHCTL_HANG"):
+            import time
+            time.sleep(30)                                    # the job is loaded, but the answer never comes
     ''')
 
     def _gui_host(self, mode="run"):
@@ -1212,6 +1219,125 @@ class ChildTaskTests(ChildTaskBase):
         self.assertEqual(out["launch"], "spawn")
         self.call("wait_task", task_id=out["task_id"], timeout_s=30)
         self.assertEqual(len(self._launchctl_calls()), 1)
+
+    def _hanging_bootstrap(self, mode="run"):
+        self._gui_host(mode=mode)
+        for p in (mock.patch.dict(os.environ, {"FAKE_LAUNCHCTL_HANG": "1"}), mock.patch.object(ct, "LAUNCHCTL_TIMEOUT_S", 1),
+                  mock.patch("traceback.print_exc")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _uncertain_start(self, r):
+        self.assertTrue(r.get("isError"), r)
+        text = r["content"][0]["text"]
+        tid = r["_meta"][m.TASK_ID_META]
+        self.assertTrue(r["_meta"][m.AMBIGUOUS_META])
+        self.assertIn(f"task_status {tid}", text)
+        self.assertIn(f"cancel_task {tid}", text)
+        self.assertNotIn("was not started", text)
+        self.assertNotIn("cortados-router bug", text)
+        self.assertTrue(os.path.isfile(os.path.join(ct.task_path(tid), "meta.json")))   # the record was kept
+        return tid, text
+
+    def test_a_bootstrap_that_loads_the_job_then_times_out_keeps_the_task_trackable(self):
+        # Review P2: launchctl started the runner but did not answer in time. Deleting the record would leave a running
+        # task nobody can see or stop, and the old "the task was not started" invited a duplicate retry.
+        self._hanging_bootstrap()
+        os.environ["FAKE_CLAUDE_MODE"] = "sleep"
+        r, _ = self.call("start_task", task="browse", cwd=self.work, chrome=True)
+        tid, text = self._uncertain_start(r)
+        self.assertIn("launchctl bootstrap did not answer", text)
+        self.assertTrue(_wait_file(os.path.join(self.work, "fake-argv.json")))   # the runner really is running
+        pid = _load(os.path.join(self.work, "fake-argv.json"))["pid"]
+        _, st = self.call("task_status", task_id=tid)
+        self.assertEqual(st["state"], "running")
+        _, c = self.call("cancel_task", task_id=tid)
+        self.assertTrue(c["cancelled"])
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "cancelled")
+        self.assertFalse(_pid_alive(pid))
+        self.assertTrue(_load(os.path.join(ct.task_path(tid), ct.LAUNCHD_FILE))["booted_out"])
+
+    def test_a_bootstrap_timeout_whose_job_never_starts_fails_through_status(self):
+        self._hanging_bootstrap(mode="noop")
+        r, _ = self.call("start_task", task="browse", cwd=self.work, chrome=True)
+        tid, _ = self._uncertain_start(r)
+        with mock.patch.object(ct, "META_GRACE_S", 0):
+            _, st = self.call("task_status", task_id=tid)
+        self.assertEqual(st["state"], "failed")
+        self.assertIn("launchd", st["error"])
+
+    def test_bookkeeping_failure_after_bootstrap_keeps_the_task_when_bootout_fails(self):
+        self._gui_host(mode="noop")
+        for p in (mock.patch.dict(os.environ, {"FAKE_LAUNCHCTL_BOOTOUT": "fail"}), mock.patch("traceback.print_exc"),
+                  mock.patch.object(ct, "log_event", side_effect=ValueError("secret-record-content"))):
+            p.start()
+            self.addCleanup(p.stop)
+        r, _ = self.call("start_task", task="browse", cwd=self.work, chrome=True)
+        tid, text = self._uncertain_start(r)
+        self.assertIn("launchctl bootout could not confirm", text)
+        self.assertNotIn("secret-record-content", text)
+
+    def test_a_failed_bootout_is_not_recorded_as_booted_out_and_cancel_retries_it(self):
+        # Review P2: a failed bootout used to persist booted_out=True, so cancel/cleanup skipped launchctl although the
+        # job could still be loaded.
+        self._gui_host(mode="noop")
+        with mock.patch.dict(os.environ, {"FAKE_LAUNCHCTL_BOOTOUT": "fail"}), mock.patch("traceback.print_exc"), \
+                mock.patch.object(ct, "log_event", side_effect=ValueError("secret-record-content")):
+            r, _ = self.call("start_task", task="browse", cwd=self.work, chrome=True)
+        tid, _ = self._uncertain_start(r)
+        rec_path = os.path.join(ct.task_path(tid), ct.LAUNCHD_FILE)
+        rec = _load(rec_path)
+        self.assertFalse(rec["booted_out"])
+        self.assertIn("may still be loaded", rec["bootout_note"])
+        target = f"gui/{os.getuid()}/{ct.LAUNCHD_LABEL_PREFIX}{tid}"
+        self.assertIn(["print", target], self._launchctl_calls())     # absence was checked, and the job was there
+        _, c = self.call("cancel_task", task_id=tid)
+        self.assertTrue(c["cancelled"], c)
+        self.assertIn("booted out", c["note"])
+        self.assertEqual([x for x in self._launchctl_calls() if x[0] == "bootout"], [["bootout", target]] * 2)
+        self.assertTrue(_load(rec_path)["booted_out"])
+
+    def test_a_failed_bootout_of_a_job_launchd_no_longer_knows_counts_as_gone(self):
+        self._gui_host(mode="noop")
+        d = os.path.join(self.tmp, "t")
+        os.makedirs(d)
+        label = ct.LAUNCHD_LABEL_PREFIX + "t"
+        with open(os.path.join(d, ct.LAUNCHD_FILE), "w") as f:
+            json.dump({"label": label, "domain": "gui/1", "booted_out": False}, f)
+        note = ct._launchd_bootout(d)                    # the fake knows no such job: bootout and print exit 113
+        self.assertIn("not loaded", note)
+        self.assertTrue(ct._launchd_gone(d))
+        self.assertEqual(ct._launchd_bootout(d), "already booted out")
+
+    def test_plain_spawn_bookkeeping_failure_with_a_confirmed_stop_leaves_no_task(self):
+        with mock.patch.object(ct, "log_event", side_effect=ValueError("secret-record-content")):
+            r, _ = self.call("start_task", task="t", cwd=self.work)
+        self.assertTrue(r.get("isError"), r)
+        self.assertIn("the task was stopped (ValueError)", r["content"][0]["text"])
+        self.assertNotIn("secret-record-content", r["content"][0]["text"])
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "tasks")), [])
+
+    def test_plain_spawn_bookkeeping_failure_with_an_unconfirmed_child_stop_keeps_the_task(self):
+        # The child group was left alone (its identity could not be checked): not "stopped", and the record stays.
+        unknown = "start time unknown (ps failed); not signalled; the child may still be running"
+        with mock.patch.object(ct, "log_event", side_effect=ValueError("secret-record-content")), \
+                mock.patch.object(ct, "_stop_recorded_child", return_value=unknown) as stop:
+            r, _ = self.call("start_task", task="t", cwd=self.work)
+        stop.assert_called_once()
+        tid, text = self._uncertain_start(r)
+        self.assertIn("could not be confirmed stopped", text)
+        self.assertNotIn("the task was stopped", text)
+        self.assertNotIn("secret-record-content", text)
+
+    def test_bookkeeping_failure_after_bootstrap_with_a_clean_bootout_leaves_no_task(self):
+        self._gui_host(mode="noop")
+        with mock.patch.object(ct, "log_event", side_effect=ValueError("secret-record-content")):
+            r, _ = self.call("start_task", task="browse", cwd=self.work, chrome=True)
+        self.assertTrue(r.get("isError"), r)
+        self.assertIn("the task was stopped (ValueError)", r["content"][0]["text"])
+        self.assertNotIn("secret-record-content", r["content"][0]["text"])
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "tasks")), [])
 
     def test_chrome_launchd_task_in_a_workspace_checks_project_settings_in_the_runner(self):
         self._gui_host()
@@ -3131,3 +3257,226 @@ class _AnyRun(dict):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StartTaskErrorTextTests(ChildTaskBase):
+    """Every start_task failure is a tool result with a specific, non-empty message (2026-11-11: a start_task from
+    another session 'came back with an empty error, so nothing launched'). Fakes only: no ssh, no real child."""
+
+    def setUp(self):
+        super().setUp()
+        tb = mock.patch("traceback.print_exc")   # start() logs the unexpected exceptions these tests raise on purpose
+        tb.start()
+        self.addCleanup(tb.stop)
+
+    def _text(self, r):
+        self.assertTrue(r.get("isError"), r)
+        text = r["content"][0]["text"]
+        self.assertTrue(text.split(":", 1)[-1].strip(), f"empty error text: {text!r}")
+        return text
+
+    def test_an_unknown_host_argument_is_a_tool_error_naming_the_configured_hosts(self):
+        msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "start_task", "arguments": {"task": "x", "host": "studio"}}}
+        reply = m.handle(msg, self.cfg)
+        self.assertNotIn("error", reply)            # not a JSON-RPC 'internal error (HostError)' with the reason lost
+        text = self._text(reply["result"])
+        self.assertIn("unknown execution host 'studio'", text)
+        self.assertIn("configured: here", text)
+        self.assertFalse(os.path.isdir(os.path.join(self.tmp, "tasks")) and os.listdir(os.path.join(self.tmp, "tasks")))
+
+    def test_an_unknown_cortados_exec_host_is_a_tool_error_too(self):
+        with mock.patch.dict(os.environ, {"CORTADOS_EXEC_HOST": "mbp"}):
+            r, _ = self.call("start_task", task="x")
+        self.assertIn("unknown execution host 'mbp'", self._text(r))
+
+    def test_a_task_error_without_a_message_still_names_what_failed(self):
+        with mock.patch.object(ct, "start", side_effect=ct.TaskError()):
+            r, _ = self.call("start_task", task="x")
+        text = self._text(r)
+        self.assertIn("TaskError without a message", text)
+
+    def test_an_unexpected_exception_outside_start_is_specific_and_not_ambiguous(self):
+        # start() classifies everything raised by the launch; one that escapes it happened before any launch.
+        with mock.patch.object(ct, "start", side_effect=ValueError("secret-record-content")):
+            r, _ = self.call("start_task", task="x")
+        text = self._text(r)
+        self.assertIn("start_task failed: unexpected ValueError in the cortados-route server", text)
+        self.assertIn("Retrying may work", text)
+        self.assertNotIn("secret-record-content", text)
+        self.assertNotIn("_meta", r)
+
+    def test_a_failure_before_any_spawn_says_nothing_is_running(self):
+        # Review finding (gpt-6.1-sol P2): a tasks dir that is a file fails in _private_root (FileExistsError) before
+        # anything is spawned; the reply must not claim a task may be running.
+        bad = os.path.join(self.tmp, "a-file")
+        with open(bad, "w") as f:
+            f.write("x")
+        with mock.patch.dict(os.environ, {"CORTADOS_TASKS_DIR": bad}):
+            r, _ = self.call("start_task", task="x", cwd=self.work)
+        text = self._text(r)
+        self.assertIn("unexpected FileExistsError in the cortados-route server", text)
+        self.assertIn("before any task was launched: nothing is running", text)
+        self.assertNotIn("list_tasks", text)
+        self.assertNotIn("_meta", r)
+
+    def test_a_failure_during_the_spawn_is_ambiguous(self):
+        with mock.patch.object(ct.subprocess, "Popen", side_effect=ValueError("secret-record-content")):
+            r, _ = self.call("start_task", task="x", cwd=self.work)
+        text = self._text(r)
+        self.assertIn("unexpected ValueError", text)
+        self.assertIn("while a task was being launched", text)
+        self.assertIn("run list_tasks", text)
+        self.assertNotIn("secret-record-content", text)
+        self.assertEqual(r["_meta"], {m.AMBIGUOUS_META: True})
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "tasks")), [])   # the pre-spawn rollback still ran
+
+    def test_a_failure_after_the_launch_names_the_running_task(self):
+        with mock.patch.object(ct, "watch_command", side_effect=ValueError("secret-record-content")):
+            r, _ = self.call("start_task", task="x", cwd=self.work)
+        text = self._text(r)
+        tid = r["_meta"][m.TASK_ID_META]
+        self.assertRegex(tid, ct.TASK_ID_RE)
+        self.assertTrue(r["_meta"][m.AMBIGUOUS_META])
+        self.assertIn(f"after task {tid} was launched", text)
+        self.assertIn(f"task_status {tid}", text)
+        self.assertNotIn("secret-record-content", text)
+        _, st = self.call("task_status", task_id=tid)   # it really is trackable
+        self.assertIn(st["state"], ("running", "succeeded"))
+        ct.cancel(tid)
+
+    def _serve(self, req):
+        out = io.StringIO()
+        with mock.patch.object(ct, "_apply_host_env"), mock.patch.object(ct, "_host_tokens", return_value=[]), \
+                mock.patch.object(ct, "_REMOTE_SERVING", False):
+            rc = ct.serve_remote(io.StringIO(json.dumps(req)), out)
+        return rc, json.loads(out.getvalue())
+
+    def test_the_host_carries_the_launch_classification_of_an_unexpected_exception(self):
+        tid = "t20261111000000-0123abcd"
+
+        def boom(progress, *a, **k):
+            progress.update(launched="yes", task_id=tid)
+            raise ValueError("secret-record-content")
+        req = {"v": ct.exec_hosts.PROTOCOL, "op": "start", "host": "here", "args": {"task": "x"}}
+        with mock.patch.object(ct, "_start", side_effect=boom):
+            rc, reply = self._serve(req)
+        self.assertEqual(rc, 1)
+        self.assertEqual(reply["failure"], {"type": "ValueError", "launched": "yes", "task_id": tid})
+        self.assertIn(f"after task {tid} was launched", reply["error"])
+        self.assertNotIn("secret-record-content", json.dumps(reply))
+
+    def test_the_host_classifies_an_exception_outside_start_as_nothing_launched(self):
+        req = {"v": ct.exec_hosts.PROTOCOL, "op": "start", "host": "here", "args": {"task": "x"}}
+        with mock.patch.object(ct.session, "resolve_provider_url", side_effect=ValueError("secret")):
+            rc, reply = self._serve(req)
+        self.assertEqual(reply["failure"], {"type": "ValueError", "launched": "none", "task_id": None})
+        self.assertIn("internal error on execution host here (ValueError)", reply["error"])
+
+    def _air_failure(self, failure):
+        reply = {"v": ct.exec_hosts.PROTOCOL, "ok": False, "error": "host-side words, not shown", "failure": failure}
+        self._air(transport=lambda a, s, t: (1, json.dumps(reply).encode(), b""))
+        return self.call("start_task", task="x")[0]
+
+    def test_a_remote_failure_while_launching_is_ambiguous_with_local_guidance(self):
+        r = self._air_failure({"type": "ValueError", "launched": "maybe", "task_id": None})
+        text = self._text(r)
+        self.assertIn("unexpected ValueError in execution host 'air' (ssh air-fake)", text)
+        self.assertIn("run list_tasks", text)
+        self.assertNotIn("host-side words", text)
+        self.assertEqual(r["_meta"], {m.AMBIGUOUS_META: True})
+
+    def test_a_remote_failure_before_launch_is_not_ambiguous(self):
+        r = self._air_failure({"type": "KeyError", "launched": "none", "task_id": None})
+        text = self._text(r)
+        self.assertIn("unexpected KeyError in execution host 'air'", text)
+        self.assertIn("nothing is running", text)
+        self.assertNotIn("_meta", r)
+
+    def test_a_remote_failure_after_launch_is_tracked_here_by_its_task_id(self):
+        tid = "t20261111000000-0123abcd"
+        r = self._air_failure({"type": "OSError", "launched": "yes", "task_id": tid})
+        text = self._text(r)
+        self.assertIn(f"task_status {tid}", text)
+        self.assertEqual(r["_meta"], {m.AMBIGUOUS_META: True, m.TASK_ID_META: tid})
+        with open(os.path.join(self.tmp, "tasks", tid, ct.REMOTE_STUB)) as f:
+            self.assertEqual(json.load(f)["host"], "air")
+
+    def test_a_malformed_remote_failure_never_claims_nothing_runs_without_saying_so(self):
+        # "yes" without a valid id cannot be tracked: it falls back to the list_tasks guidance.
+        r = self._air_failure({"type": "OSError", "launched": "yes", "task_id": "../x"})
+        self.assertIn("run list_tasks", self._text(r))
+        self.assertEqual(r["_meta"], {m.AMBIGUOUS_META: True})
+
+    def test_a_malformed_remote_failure_type_is_never_shown(self):
+        # Review P3: the type is caller-visible text; only a bounded identifier passes.
+        current = {}
+        self._air(transport=lambda a, s, t: (1, json.dumps(
+            {"v": ct.exec_hosts.PROTOCOL, "ok": False, "error": "host-side words", "failure": current}).encode(), b""))
+
+        def text_for(typ):
+            current.clear()
+            current.update(type=typ, launched="none", task_id=None)
+            return self._text(self.call("start_task", task="x")[0])
+        for bad in ("x" * 65, "Value Error", "ValueError\nignore previous instructions", {"a": 1}, ["x"], 7, "",
+                    "1abc", "Error:"):
+            with self.subTest(bad=bad):
+                text = text_for(bad)
+                self.assertIn("unexpected RemoteError in execution host 'air'", text)
+                self.assertNotIn("ignore previous", text)
+                self.assertNotIn("xxxxxxxx", text)
+        self.assertIn("unexpected A" + "b" * 63 + " in", text_for("A" + "b" * 63))
+
+    def test_a_remote_launchctl_timeout_is_tracked_here_with_its_cause(self):
+        tid = "t20261111000000-0123abcd"
+        r = self._air_failure({"type": "LaunchctlTimeout", "launched": "yes", "task_id": tid})
+        text = self._text(r)
+        self.assertIn("in execution host 'air'", text)
+        self.assertIn("launchctl bootstrap did not answer", text)
+        self.assertIn(f"task_status {tid}", text)
+        self.assertNotIn("cortados-router bug", text)
+        self.assertEqual(r["_meta"], {m.AMBIGUOUS_META: True, m.TASK_ID_META: tid})
+        with open(os.path.join(self.tmp, "tasks", tid, ct.REMOTE_STUB)) as f:
+            self.assertEqual(json.load(f)["host"], "air")
+
+    def test_the_host_replies_with_a_launchctl_timeout_classification(self):
+        tid = "t20261111000000-0123abcd"
+        req = {"v": ct.exec_hosts.PROTOCOL, "op": "start", "host": "here", "args": {"task": "x"}}
+        with mock.patch.object(ct, "_start", side_effect=ct.StartFailed("LaunchctlTimeout", "x", "yes", tid)):
+            rc, reply = self._serve(req)
+        self.assertEqual(reply["failure"], {"type": "LaunchctlTimeout", "launched": "yes", "task_id": tid})
+
+    def test_an_unexpected_exception_in_another_tool_is_not_marked_ambiguous(self):
+        with mock.patch.object(ct, "list_recent", side_effect=KeyError()):
+            r, _ = self.call("list_tasks")
+        self.assertIn("list_tasks failed: unexpected KeyError", self._text(r))
+        self.assertNotIn("_meta", r)
+
+    def test_an_ssh_timeout_on_start_says_a_task_may_be_running_and_what_to_do(self):
+        def timeout(argv, stdin, t):
+            raise subprocess.TimeoutExpired(argv, t)
+        self._air(transport=timeout)
+        r, _ = self.call("start_task", task="x")
+        text = self._text(r)
+        self.assertIn("did not answer start within", text)
+        self.assertIn("run list_tasks", text)
+        self.assertTrue(r["_meta"][m.AMBIGUOUS_META])
+
+    def test_a_host_reply_with_an_empty_error_is_not_empty_here(self):
+        self._air(transport=lambda a, s, t: (1, json.dumps({"v": ct.exec_hosts.PROTOCOL, "ok": False,
+                                                            "error": ""}).encode(), b""))
+        r, _ = self.call("start_task", task="x")
+        self.assertIn("start failed on 'air'", self._text(r))
+
+    def test_the_host_never_replies_with_an_empty_error(self):
+        # serve_remote on the host itself: a TaskError without a message becomes a reply naming the op and the host.
+        out = io.StringIO()
+        req = {"v": ct.exec_hosts.PROTOCOL, "op": "start", "host": "here", "args": {"task": "x"}}
+        with mock.patch.object(ct, "start", side_effect=ct.TaskError()), \
+                mock.patch.object(ct, "_apply_host_env"), mock.patch.object(ct, "_host_tokens", return_value=[]), \
+                mock.patch.object(ct, "_REMOTE_SERVING", False):
+            rc = ct.serve_remote(io.StringIO(json.dumps(req)), out)
+        reply = json.loads(out.getvalue())
+        self.assertEqual(rc, 1)
+        self.assertFalse(reply["ok"])
+        self.assertIn("start failed on execution host here: TaskError without a message", reply["error"])

@@ -24,6 +24,7 @@ import http.client
 import json
 import os
 import secrets
+import socket
 import sys
 import threading
 import urllib.error
@@ -220,19 +221,52 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
         else:
             out = ct.cancel(a.get("task_id"))
     except ct.TaskError as exc:
-        res = _err(red.text(f"{name}: {exc}"))
-        if getattr(exc, "ambiguous", False):
-            # The request may have reached the execution host (e.g. it timed out after sending a start): a child may
-            # be running. Machine-readable for callers that hold a slot for it (bot_gateway); MCP's _meta is the
-            # protocol's place for such extensions, and clients ignore keys they do not know.
+        ambiguous = getattr(exc, "ambiguous", False)
+        if isinstance(exc, ct.StartFailed):
+            # An unexpected exception inside start(), here or on the execution host, classified there by how far the
+            # launch got: its message is already the whole guidance (type, where, what to do).
+            text = str(exc)
+        else:
+            detail = (str(exc).strip()
+                      or f"{type(exc).__name__} without a message (a cortados-router bug: please report it)")
+            text = f"{name}: {detail}"
+            if ambiguous and name == "start_task":
+                text += AMBIGUOUS_START_HINT
+        res = _err(red.text(text))
+        if ambiguous:
+            # The request may have reached the execution host (e.g. it timed out after sending a start), or the
+            # failure came after a possible spawn: a child may be running. Machine-readable for callers that hold a
+            # slot for it (bot_gateway); MCP's _meta is the protocol's place for such extensions, and clients ignore
+            # keys they do not know.
             res["_meta"] = {AMBIGUOUS_META: True}
+            if getattr(exc, "task_id", None):
+                res["_meta"][TASK_ID_META] = exc.task_id
         return res
+    except Exception as exc:
+        # Anything else is a bug, but the caller must still get a specific, non-empty answer as a tool result (a
+        # JSON-RPC 'internal error (X)' reads as an empty failure to a model). The exception TEXT is not passed on:
+        # it is unscrubbed and may quote a record's content (#94); its type and where it happened are. Not ambiguous:
+        # start() classifies every exception from the launch itself (StartFailed, above), so one that reaches here
+        # happened outside it, before anything was launched.
+        text = (f"{name} failed: unexpected {type(exc).__name__} in the cortados-route server on "
+                f"{_short_host()} (a cortados-router bug: please report it with the time).")
+        return _err(text + " Retrying may work.")
     # Redact the structure's strings BEFORE serializing: json.dumps escapes quotes and backslashes, so a token holding
     # either would no longer match once serialized.
     return {"content": [{"type": "text", "text": json.dumps(red.tree(out), indent=2)}]}
 
 
 AMBIGUOUS_META = "cortados/ambiguous"     # call_child_tool's _meta key: the failed operation may have taken effect
+TASK_ID_META = "cortados/task_id"         # with AMBIGUOUS_META: the id of the task that was launched, when one is known
+AMBIGUOUS_START_HINT = (" No task id came back, but a task may have started anyway: run list_tasks and look for it "
+                        "(by title or start time) before calling start_task again, so it does not run twice.")
+
+
+def _short_host() -> str:
+    try:
+        return socket.gethostname().split(".")[0] or "this machine"
+    except OSError:
+        return "this machine"
 
 
 def _err(text: str) -> dict:

@@ -304,6 +304,75 @@ class TaskError(Exception):
         self.ambiguous = ambiguous
 
 
+LAUNCHED = ("none", "maybe", "yes")     # StartFailed.launched: how far start() got before the unexpected exception
+# A StartFailed type from an execution host's reply is shown to the caller: only a bounded identifier passes, anything
+# else (long text, a non-string, a newline) becomes REMOTE_ERROR_TYPE.
+EXC_TYPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+REMOTE_ERROR_TYPE = "RemoteError"
+# StartFailed types that are not a bug but a launch whose outcome is unknown: the guidance names the cause instead of
+# "unexpected X (a cortados-router bug)". Keyed by type so an execution host's reply rebuilds the same words here.
+LAUNCH_UNCERTAIN = {
+    "LaunchctlTimeout": f"launchctl bootstrap did not answer within {LAUNCHCTL_TIMEOUT_S} s, so launchd may have "
+                        "loaded the task's job",
+    "LaunchdBootoutFailed": "the task's bookkeeping failed after its launchd job was loaded, and launchctl bootout "
+                            "could not confirm the job was stopped",
+    "ChildStopUnconfirmed": "the task's bookkeeping failed after its runner was started; the runner was stopped, but "
+                            "its claude process group could not be confirmed stopped",
+}
+
+
+class LaunchUncertain(Exception):
+    """Raised by _launch_launchd when the bootstrap request may have taken effect (launchd may have loaded the job and
+    started the runner) although it did not answer: start() keeps the task record, so the task stays trackable and
+    cancellable, and reports it as launched="yes" with its id. `kind` is the StartFailed type."""
+
+    def __init__(self, kind: str):
+        super().__init__(kind)
+        self.kind = kind
+
+
+def start_failure_text(exc_type: str, where: str, launched: str, task_id=None) -> str:
+    """The guidance for an unexpected exception inside start(): the exception TYPE (its text is unscrubbed and may
+    quote record content, #94), where it happened, and what to do given how far the launch got. Built the same way
+    for a local start and for one on an execution host (from the classification its --remote reply carries)."""
+    cause = LAUNCH_UNCERTAIN.get(exc_type)
+    if cause:
+        head = f"start_task failed in {where}: {cause}"
+        if launched == "yes" and task_id:
+            return (f"{head}. Task {task_id} may be running: check it with task_status {task_id} (cancel_task "
+                    f"{task_id} stops it) instead of calling start_task again.")
+    else:
+        head = (f"start_task failed: unexpected {exc_type} in {where} (a cortados-router bug: please report it with "
+                "the time)")
+    if launched == "yes" and task_id:
+        return (f"{head}, after task {task_id} was launched: it may be running. Check it with task_status "
+                f"{task_id} (cancel_task {task_id} stops it) instead of calling start_task again.")
+    if launched == "none":
+        return f"{head}, before any task was launched: nothing is running, and retrying may work."
+    return (f"{head}, while a task was being launched. No task id came back, but a task may have started anyway: run "
+            "list_tasks and look for it (by title or start time) before calling start_task again, so it does not run "
+            "twice.")
+
+
+class StartFailed(TaskError):
+    """An unexpected (non-TaskError) exception inside start(), classified at the launch boundary: `launched` is
+    "none" (nothing was spawned or sent: retrying is safe), "maybe" (it happened during the spawn or the request to
+    the execution host) or "yes" (after the launch; `task_id` names the task). Only "maybe"/"yes" are ambiguous. The
+    message is complete guidance (start_failure_text); `exc_type` is the original exception's class name."""
+
+    def __init__(self, exc_type: str, where: str, launched: str, task_id=None):
+        launched = launched if launched in LAUNCHED else "maybe"
+        task_id = task_id if isinstance(task_id, str) and TASK_ID_RE.fullmatch(task_id) else None
+        if launched == "yes" and task_id is None:
+            launched = "maybe"
+        super().__init__(start_failure_text(exc_type, where, launched, task_id), ambiguous=launched != "none")
+        self.exc_type, self.where, self.launched, self.task_id = exc_type, where, launched, task_id
+
+    def failure(self) -> dict:
+        """The classification for a --remote reply (no text: the caller rebuilds the guidance with its own words)."""
+        return {"type": self.exc_type, "launched": self.launched, "task_id": self.task_id}
+
+
 class RecordError(TaskError):
     """A task record on disk (meta.json, result.json, remote.json, ...) that exists but cannot be read: corrupt JSON
     (a crash mid-write, a stray edit) or an OS error other than "missing". Names the task id, the file and the
@@ -757,17 +826,44 @@ def _hosts() -> "exec_hosts.Hosts":
         raise TaskError(str(exc)) from None
 
 
+def _resolve_host(name):
+    """The execution host named `name` (None: CORTADOS_EXEC_HOST or the file's default). An unknown name is a
+    TaskError carrying the configured names: a bare HostError would escape start() and reach the caller as an
+    'internal error (HostError)' with the reason dropped."""
+    hosts = _hosts()
+    try:
+        return hosts.resolve(name)
+    except exec_hosts.HostError as exc:
+        raise TaskError(str(exc)) from None
+
+
 def _remote(host_name: str, op: str, args: dict, timeout_s=None) -> dict:
     """One operation on another execution host. Unreachable or failing hosts are TaskErrors with the host named;
     nothing ever falls back to this machine."""
-    host = _hosts().resolve(host_name)
+    host = _resolve_host(host_name)
     try:
         out = exec_hosts.call(host, op, args, **({"timeout_s": timeout_s} if timeout_s is not None else {}))
     except exec_hosts.HostError as exc:            # includes HostUnreachable
+        failure = getattr(exc, "failure", None)
+        if op == "start" and isinstance(failure, dict):
+            # The host hit an unexpected exception inside its start(): the same guidance as here, naming the host.
+            # Its type is shown to the caller: a bounded identifier only, never free text from the reply.
+            exc_type = failure.get("type")
+            if not (isinstance(exc_type, str) and EXC_TYPE_RE.fullmatch(exc_type)):
+                exc_type = REMOTE_ERROR_TYPE
+            raise StartFailed(exc_type, f"execution host {host.describe()}",
+                              failure.get("launched"), failure.get("task_id")) from None
         raise TaskError(str(exc), ambiguous=getattr(exc, "ambiguous", False)) from None
     if not isinstance(out, (dict, list)):
         raise TaskError(f"execution host {host.describe()} answered {op} with {type(out).__name__}, not a record")
     return out
+
+
+def _write_stub(root: str, task_id: str, host_name: str) -> None:
+    """The local record of a task running on execution host `host_name` (status, wait and cancel go there)."""
+    d = os.path.join(root, task_id)
+    os.mkdir(d, 0o700)
+    _write_json(os.path.join(d, REMOTE_STUB), {"host": host_name, "created_at": time.time()})
 
 
 def _stub(d: str):
@@ -776,9 +872,29 @@ def _stub(d: str):
     return rec if isinstance(rec, dict) and isinstance(rec.get("host"), str) else None
 
 
-def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed_tools=None,
-          provider_url="", token_file=None, chrome=False, red=None, connectors=None, client=None,
-          title=None, session_tag=None, repo=None, branch=None, host=None, parent_task_id=None) -> dict:
+def start(*args, **kwargs) -> dict:
+    """Start a child task (_start has the arguments). A TaskError passes through; any other exception becomes a
+    StartFailed classified by how far the launch got (`progress`, advanced by _start at the launch boundary), so the
+    caller is told whether a task may be running, and never the exception's text."""
+    progress = {"launched": "none", "task_id": None}
+    try:
+        return _start(progress, *args, **kwargs)
+    except TaskError:
+        raise
+    except Exception as exc:
+        import traceback
+        traceback.print_exc(file=sys.stderr)    # the full exception for the operator's log, not for the caller
+        raise StartFailed(type(exc).__name__, _start_where(), progress["launched"], progress["task_id"]) from None
+
+
+def _start_where() -> str:
+    return (f"execution host {exec_hosts.short_hostname()}" if _REMOTE_SERVING
+            else f"the cortados-route server on {exec_hosts.short_hostname()}")
+
+
+def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=None, allowed_tools=None,
+           provider_url="", token_file=None, chrome=False, red=None, connectors=None, client=None,
+           title=None, session_tag=None, repo=None, branch=None, host=None, parent_task_id=None) -> dict:
     """`client` (optional, e.g. "grokbot" from the bot gateway) is recorded in meta.json and every event line, so usage
     can be attributed to the caller. `red` carries the launch credentials (env token and token file's token as they are now). `permission_mode`
     None picks auto where the model supports it (resolve_permission_mode). `title` (<= 80 chars) and `session_tag`
@@ -796,7 +912,7 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
         raise TaskError("chrome must be true or false")
     if host is not None and not isinstance(host, str):
         raise TaskError("host must be the name of a configured execution host")
-    target = _hosts().resolve(host)
+    target = _resolve_host(host)
     if not target.is_local():
         if _REMOTE_SERVING:
             raise TaskError(f"this request reached {exec_hosts.short_hostname()} for host {target.describe()}, but that "
@@ -822,8 +938,16 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
                 "title": start_red.text(title) if isinstance(title, str) else title,
                 "session_tag": session_tag, "repo": repo, "branch": branch,
                 "parent_task_id": parent_id}   # resolved here: the host's own env does not know this session
+        progress["launched"] = "maybe"         # from here the request may reach the host and launch a child
         try:
             out = _remote(target.name, "start", args)
+        except StartFailed as exc:
+            if exc.launched == "yes":
+                try:                            # the host has the task: make it trackable here, as a success would
+                    _write_stub(root, exc.task_id, target.name)
+                except Exception:
+                    raise StartFailed(exc.exc_type, exc.where, "maybe") from None
+            raise
         except TaskError as exc:
             msg = str(exc)
             if cwd and "does not exist on execution host" in msg and os.path.isdir(cwd):
@@ -834,10 +958,10 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
         if not isinstance(tid, str) or not TASK_ID_RE.fullmatch(tid):
             raise TaskError(f"execution host {target.describe()} started a task but returned no valid task_id",
                             ambiguous=True)
+        progress.update(launched="yes", task_id=tid)
         d = os.path.join(root, tid)
         try:
-            os.mkdir(d, 0o700)
-            _write_json(os.path.join(d, REMOTE_STUB), {"host": target.name, "created_at": time.time()})
+            _write_stub(root, tid, target.name)
         except BaseException as exc:
             shutil.rmtree(d, ignore_errors=True)
             try:
@@ -942,6 +1066,7 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
             meta["title"] = launch_red.text(office["title"])
         meta[META_TEXT_MARK] = True             # every caller text above was redacted or refused with launch_red
         _write_json(os.path.join(d, "meta.json"), meta)   # before the spawn: the runner's export reads these
+        progress["launched"] = "maybe"         # the spawn itself: a failure inside it may leave a runner behind
         if launchd:
             # chrome: the allowlisted login env (no credential) rides in the plist; routed: nothing does (_prepare
             # wrote it to RUNNER_ENV_FILE and the runner loads it).
@@ -953,14 +1078,26 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
                                           cwd=d, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                           stderr=rlog, start_new_session=True, pass_fds=(lock_fd,))
     except BaseException as exc:
-        # Pre-spawn failure: nothing runs, so roll back completely (a half-made dir would list forever and could hold
-        # a token-bearing settings file).
         if lock_fd is not None:
             os.close(lock_fd)
+        if isinstance(exc, LaunchUncertain):
+            # launchd may have loaded the job and started the runner: the record stays (meta.json and launchd.json are
+            # written), so task_status follows it (a runner that never appears fails it after META_GRACE_S) and
+            # cancel_task boots it out. Deleting it would leave a possibly running task untrackable, and a retry
+            # would run the work twice.
+            progress.update(launched="yes", task_id=task_id)
+            log_event("started", **_event_fields(meta), launch_uncertain=exc.kind)
+            raise StartFailed(exc.kind, _start_where(), "yes", task_id) from None
+        # Failure before or in the spawn, with nothing left running: roll back completely (a half-made dir would list
+        # forever and could hold a token-bearing settings file). A runner Popen did return is ours to stop first.
+        if runner is not None and not _abort_runner(runner, d):
+            progress.update(launched="yes", task_id=task_id)
+            raise StartFailed("ChildStopUnconfirmed", _start_where(), "yes", task_id) from None
         shutil.rmtree(d, ignore_errors=True)
         if isinstance(exc, OSError):
             raise TaskError(f"could not start the child task ({type(exc).__name__}: {exc})") from None
         raise
+    progress.update(launched="yes", task_id=task_id)
     if lock_fd is not None:
         os.close(lock_fd)                       # our copy only; the runner's inherited fd keeps the lock
     try:
@@ -973,13 +1110,18 @@ def start(task, cwd=None, orchestrator="cortados", permission_mode=None, allowed
     except BaseException as exc:
         # Post-spawn failure: a runner (and maybe claude) is live. Stop and reap them before deleting the dir, so no
         # task keeps running undiscoverable.
+        # Only a confirmed stop deletes the record; otherwise it is kept, so the task stays trackable and
+        # cancellable. The reply names the exception TYPE only: its text may quote record content (#94).
         if runner is not None:
-            _abort_runner(runner, d)
+            if not _abort_runner(runner, d):
+                raise StartFailed("ChildStopUnconfirmed", _start_where(), "yes", task_id) from None
         else:
             _launchd_bootout(d)
+            if not _launchd_gone(d):
+                raise StartFailed("LaunchdBootoutFailed", _start_where(), "yes", task_id) from None
         shutil.rmtree(d, ignore_errors=True)
-        raise TaskError(f"child task bookkeeping failed after spawn; the task was stopped ({type(exc).__name__}: "
-                        f"{exc})") from None
+        raise TaskError(f"child task bookkeeping failed after spawn; the task was stopped ({type(exc).__name__})"
+                        ) from None
     if runner is not None:
         _REAP[task_id] = runner
     out = {"task_id": task_id, "state": "running", "dir": d, "permission_mode": permission_mode, "host": target.name,
@@ -1025,40 +1167,74 @@ def _launch_launchd(d: str, env: dict) -> None:
         r = subprocess.run([LAUNCHCTL, "bootstrap", domain, plist], capture_output=True, text=True,
                            timeout=LAUNCHCTL_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        raise TaskError(f"launchctl bootstrap did not answer within {LAUNCHCTL_TIMEOUT_S} s; the task was not started") from None
+        # Killed while waiting for launchd's answer: the request may already have loaded the job (RunAtLoad starts
+        # the runner at once). Not "not started": start() keeps the record and reports the task id.
+        raise LaunchUncertain("LaunchctlTimeout") from None
+    except OSError:
+        raise                                   # launchctl could not be run at all: nothing was sent to launchd
+    except Exception as exc:
+        # After launchctl ran (e.g. its output did not decode): it may have loaded the job.
+        raise LaunchUncertain(type(exc).__name__) from None
+    # A definite answer: a non-zero exit is launchd refusing the job before loading it, so nothing runs.
     if r.returncode != 0:
         raise TaskError(f"could not start the task in the desktop session (launchctl bootstrap {domain} exited "
                         f"{r.returncode}: {(r.stderr or r.stdout).strip()[-300:]}); is a user logged in to the desktop "
                         "of this execution host?")
 
 
+LAUNCHCTL_NO_SUCH_SERVICE = 113        # launchctl's exit status for "Could not find specified service"
+
+
 def _launchd_bootout(d: str) -> str:
     """Unload a task's one-shot job once it is final (or when a start failed after bootstrap). Idempotent; a job that
-    launchd no longer knows is fine. Returns what happened (recorded in launchd.json)."""
+    launchd no longer knows is fine. Returns what happened (recorded in launchd.json). `booted_out` is persisted only
+    once the job is confirmed gone (bootout succeeded, or `launchctl print` no longer finds the label): after a failed
+    bootout the job may still be loaded, so a later status, cancel or cleanup tries again."""
     rec = _read_json(os.path.join(d, LAUNCHD_FILE))
     if not isinstance(rec, dict) or rec.get("booted_out"):
         return "not a launchd task" if not isinstance(rec, dict) else "already booted out"
+    gone = False
     try:
-        r = subprocess.run([LAUNCHCTL, "bootout", f"{rec['domain']}/{rec['label']}"], capture_output=True, text=True,
-                           timeout=LAUNCHCTL_TIMEOUT_S)
-        note = "booted out" if r.returncode == 0 else f"launchctl bootout exited {r.returncode}: {(r.stderr or '').strip()[-200:]}"
+        target = f"{rec['domain']}/{rec['label']}"
+        r = subprocess.run([LAUNCHCTL, "bootout", target], capture_output=True, text=True, timeout=LAUNCHCTL_TIMEOUT_S)
+        if r.returncode == 0:
+            note, gone = "booted out", True
+        else:
+            note = f"launchctl bootout exited {r.returncode}: {(r.stderr or '').strip()[-200:]}"
+            p = subprocess.run([LAUNCHCTL, "print", target], capture_output=True, text=True,
+                               timeout=LAUNCHCTL_TIMEOUT_S)
+            if p.returncode == LAUNCHCTL_NO_SUCH_SERVICE:
+                note, gone = "not loaded (launchd no longer knows the job)", True
+            else:
+                note += "; the job may still be loaded"
     except (OSError, subprocess.TimeoutExpired, KeyError) as exc:
-        note = f"launchctl bootout failed: {type(exc).__name__}"
-    rec.update(booted_out=True, bootout_note=note)
+        note = f"launchctl bootout failed: {type(exc).__name__}; the job may still be loaded"
+    rec.update(booted_out=gone, bootout_note=note)
     _write_json(os.path.join(d, LAUNCHD_FILE), rec)
     return note
 
 
-def _abort_runner(runner, d: str) -> None:
+def _launchd_gone(d: str) -> bool:
+    """Whether the task's launchd job is confirmed unloaded (as recorded by _launchd_bootout)."""
+    rec = _read_json(os.path.join(d, LAUNCHD_FILE))
+    return isinstance(rec, dict) and rec.get("booted_out") is True
+
+
+# _stop_recorded_child notes that leave the child possibly running (its identity could not be checked, so no signal)
+CHILD_STOP_UNCONFIRMED = ("start time unknown",)
+
+
+def _abort_runner(runner, d: str) -> bool:
     """Stop a runner this process just started: SIGTERM (it stops claude's group itself), then SIGKILL it and claude's
-    recorded group if it does not exit in time."""
+    recorded group if it does not exit in time. True when the stop is confirmed: the runner is reaped and claude's
+    group is gone or was signalled; False when the group was left alone because its identity could not be checked."""
     try:
         runner.terminate()
         runner.wait(timeout=KILL_GRACE_S + 10)
     except subprocess.TimeoutExpired:
         runner.kill()
         runner.wait()
-    _stop_recorded_child(d, 0)
+    return not _stop_recorded_child(d, 0).startswith(CHILD_STOP_UNCONFIRMED)
 
 
 def _run_spec(cwd, max_s, meta, workspace=None, ws_root=None, launchd=False, chrome=False) -> dict:
@@ -3410,8 +3586,11 @@ def serve_remote(stdin=None, stdout=None) -> int:
     stdin = sys.stdin if stdin is None else stdin
     stdout = sys.stdout if stdout is None else stdout
 
-    def reply(ok, payload):
-        stdout.write(json.dumps({"v": exec_hosts.PROTOCOL, "ok": ok, ("result" if ok else "error"): payload}) + "\n")
+    def reply(ok, payload, failure=None):
+        rec = {"v": exec_hosts.PROTOCOL, "ok": ok, ("result" if ok else "error"): payload}
+        if failure is not None:
+            rec["failure"] = failure            # an unexpected exception's classification (exec_hosts.call carries it)
+        stdout.write(json.dumps(rec) + "\n")
         stdout.flush()
         return 0 if ok else 1
 
@@ -3459,12 +3638,18 @@ def serve_remote(stdin=None, stdout=None) -> int:
             out = cancel(args.get("task_id"))
         else:
             return reply(False, f"unknown remote operation {op!r}")
+    except StartFailed as exc:                  # classified by start() itself: carry it so the caller can say what to do
+        return reply(False, str(exc), exc.failure())
     except TaskError as exc:
-        return reply(False, Redactor(tokens).text(str(exc)) if tokens else str(exc))
+        text = str(exc).strip() or (f"{op} failed on execution host {host.name}: {type(exc).__name__} without a "
+                                    "message (a cortados-router bug: please report it)")
+        return reply(False, Redactor(tokens).text(text) if tokens else text)
     except Exception as exc:                    # the type only: the text is unscrubbed and could echo configuration
         import traceback
         traceback.print_exc(file=sys.stderr)
-        return reply(False, f"internal error on execution host {host.name} ({type(exc).__name__})")
+        # Outside start() (start classifies its own): for a start request nothing was launched yet.
+        return reply(False, f"internal error on execution host {host.name} ({type(exc).__name__})",
+                     {"type": type(exc).__name__, "launched": "none", "task_id": None})
     return reply(True, red.tree(out))
 
 
