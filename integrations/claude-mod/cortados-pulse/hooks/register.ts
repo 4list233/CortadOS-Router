@@ -297,8 +297,10 @@ export function taskLine(t: PulseLiveTask, since: number): string {
     queued ? 'queued ' + elapsed : elapsed])
 }
 
+const KINDS: Record<string, string> = { orchestrator: 'main session', child_task: 'child task' }
+
 export function conversationLine(c: PulseLiveConversation, since: number): string {
-  const kind = c.kind === 'orchestrator' ? 'main session' : (c.kind || 'conversation')
+  const kind = KINDS[c.kind ?? ''] || c.kind || 'conversation'
   const name = c.title || join([c.project, kind])
   return (c.status === 'working' ? '▸ ' : '· ') + join([name, modelOf(c), c.tool ? 'tool ' + c.tool : null,
     c.status === 'working' ? null : c.status, typeof c.elapsed_s === 'number' ? dur(c.elapsed_s + since) : null])
@@ -326,7 +328,9 @@ export function runningLines(live: PulseLive, since: number): string[] {
       away.length ? `${away.length} started elsewhere (${hosts})` : null]))
   }
   if (c.status === 'error') out.push('conversations unavailable: ' + errs(c))
-  const conv = c.items ?? []
+  // A running child's own conversation is its task line above: listed once (it still counts in the summary).
+  const shown = new Set(active.map(x => x.task_id))
+  const conv = (c.items ?? []).filter(x => !(x.kind === 'child_task' && x.run_id && shown.has(x.run_id)))
   for (const x of conv.slice(0, CONVERSATIONS_MAX)) out.push(conversationLine(x, since))
   const more = conv.length - CONVERSATIONS_MAX + (c.hidden ?? 0)
   if (more > 0) out.push(`  +${more} more conversations`)
@@ -334,7 +338,19 @@ export function runningLines(live: PulseLive, since: number): string[] {
   return out
 }
 
-/** S1, the lowest subscription and each host's heartbeat, one short line each; an absent heartbeat is said. */
+const S1_FLAGS: Record<string, string> = { 'no-promote': 'promotion held', 'no-train-tonight': 'no training tonight',
+  'nightly-stop': 'nightly loop stopping', 'sweep-requested': 'sweep requested' }
+
+/** A host's hardware in a few words: CPU and GPU busy, disk free. */
+export function hwText(hw: PulseLiveHost['hardware']): string | null {
+  if (!hw) return null
+  const p = (n: string, v: unknown) => typeof v === 'number' ? `${n} ${Math.round(v)}%` : null
+  return join([p('cpu', hw.cpu_busy_pct), p('gpu', hw.gpu_busy_pct),
+    typeof hw.disk_free_pct === 'number' ? `disk ${Math.round(hw.disk_free_pct)}% free` : null]) || null
+}
+
+/** S1, the lowest subscription and each host's heartbeat, one short line each (the S1 host's pipeline on its own line);
+ * an absent heartbeat is said. */
 export function fleetLines(live: PulseLive): string[] {
   const o = live.overview ?? {}, s1 = live.s1 ?? {}
   const out = [o.s1 === 'up' ? 'S1 up' + (typeof s1.latency_ms === 'number' ? ` · ${s1.latency_ms} ms` : '')
@@ -346,7 +362,11 @@ export function fleetLines(live: PulseLive): string[] {
     if (!hb) { out.push(`${h.name}: no heartbeat yet`); continue }
     const jobs = (hb.jobs ?? []).map(j => `${j.name} ${j.state}` + (typeof j.progress_pct === 'number' ? ' ' + Math.round(j.progress_pct) + '%' : ''))
     out.push(`${h.name}: ` + join([h.heartbeat_state === 'stale' ? 'STALE heartbeat ' + age(hb.age_s ?? NaN) + ' old' : null,
-      jobs.length ? jobs.join(', ') : 'no jobs']))
+      jobs.length ? jobs.join(', ') : 'no jobs', hwText(h.hardware)]))
+    const s = hb.s1
+    if (s && h.heartbeat_state !== 'stale') out.push(`  S1 ${s.health === 'up' ? 'up' : s.health === 'down' ? 'DOWN' : 'unknown'}: ` +
+      join([s.model || 'no model loaded', ...(s.flags ?? []).map(f => S1_FLAGS[f] || f),
+        s.pending ? 'candidate ' + s.pending.replace(/_/g, ' ') : null]))
   }
   return out
 }

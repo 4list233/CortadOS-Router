@@ -5,8 +5,8 @@ export default {
   "overview": {
     "running_tasks": 1,
     "queued_tasks": 1,
-    "active_conversations": 3,
-    "working_conversations": 2,
+    "active_conversations": 5,
+    "working_conversations": 3,
     "s1": "up",
     "s1_latency_ms": 23,
     "lowest_subscription": {
@@ -15,7 +15,7 @@ export default {
       "left_pct": 70.0,
       "window": "month (Cursor models: Grok, Composer, Auto)"
     },
-    "hosts_with_heartbeat": 1,
+    "hosts_with_heartbeat": 2,
     "errors": 0
   },
   "tasks": {
@@ -165,9 +165,9 @@ export default {
     "as_of": 1800000000.0,
     "status": "ok",
     "errors": [],
-    "backend_sessions": 2,
-    "active": 3,
-    "working": 2,
+    "backend_sessions": 4,
+    "active": 5,
+    "working": 3,
     "floors": 1,
     "items": [
       {
@@ -181,24 +181,45 @@ export default {
         "model": "gpt-6.1",
         "status": "working",
         "tool": "Read",
-        "source": "routed",
+        "phase": "client running a tool",
+        "source": "provider",
         "title": "Review the diff",
         "started_at": 1799999910.0,
-        "last_activity": null,
+        "last_activity": 1799999920.0,
         "elapsed_s": 90.0
       },
       {
-        "kind": "orchestrator",
-        "run_id": null,
+        "kind": "child_task",
+        "run_id": "t20261111090000-aaaaaaaa",
         "session": "3f9a1c2e9b7d4a10",
         "project": "CortadOS-Router",
         "device": "pro",
-        "provider": null,
-        "lane": null,
+        "provider": "claude",
+        "lane": "claude#b",
+        "model": "claude-sonnet-5",
+        "status": "working",
+        "tool": "Bash",
+        "phase": "model turn",
+        "source": "provider",
+        "title": "Refactor the scarcity reader",
+        "started_at": 1799999900.0,
+        "last_activity": 1799999980.0,
+        "elapsed_s": 100.0
+      },
+      {
+        "kind": "orchestrator",
+        "run_id": "c-000000000001",
+        "session": "3f9a1c2e9b7d4a10",
+        "project": "CortadOS-Router",
+        "device": "pro",
+        "provider": "claude",
+        "lane": "claude#a",
         "model": "claude-opus-5",
         "status": "working",
         "tool": "Edit",
-        "source": "heartbeat",
+        "phase": "client running a tool",
+        "source": "provider",
+        "title": null,
         "started_at": 1799999100.0,
         "last_activity": 1799999985.0,
         "elapsed_s": 900.0
@@ -214,11 +235,30 @@ export default {
         "model": "qwen3-30b",
         "status": "idle",
         "tool": null,
+        "phase": null,
         "source": "routed",
         "title": null,
         "started_at": 1799999970.0,
         "last_activity": null,
         "elapsed_s": 30.0
+      },
+      {
+        "kind": "conversation",
+        "run_id": "c-000000000004",
+        "session": null,
+        "project": null,
+        "device": null,
+        "provider": "codex",
+        "lane": "codex",
+        "model": "gpt-6.1-mini",
+        "status": "idle",
+        "tool": null,
+        "phase": "waiting for the client",
+        "source": "provider",
+        "title": null,
+        "started_at": 1799999600.0,
+        "last_activity": 1799999700.0,
+        "elapsed_s": 400.0
       }
     ],
     "hidden": 0
@@ -463,9 +503,36 @@ export default {
           "provider",
           "default exec host"
         ],
-        "heartbeat_state": "none",
-        "heartbeat": null,
-        "hardware": null
+        "heartbeat_state": "fresh",
+        "heartbeat": {
+          "received_at": 1799999990.0,
+          "age_s": 10.0,
+          "ttl_s": 180,
+          "stale": false,
+          "jobs": [
+            {
+              "name": "com.cortados.provider",
+              "state": "running",
+              "summary": "pid up, 3 runs",
+              "started_at": null,
+              "finished_at": null,
+              "next_at": null,
+              "progress_pct": null
+            }
+          ],
+          "s1": null
+        },
+        "hardware": {
+          "cpu_busy_pct": 12.5,
+          "gpu_busy_pct": 3.0,
+          "mem_available_bytes": 8589934592,
+          "mem_total_bytes": 25769803776,
+          "chip": "Apple M4",
+          "load_1m": 2.1,
+          "age_s": 20.0,
+          "disk_free_pct": 40.0,
+          "source": "heartbeat"
+        }
       },
       {
         "name": "studio",
@@ -497,7 +564,16 @@ export default {
               "next_at": null,
               "progress_pct": 37.5
             }
-          ]
+          ],
+          "s1": {
+            "health": "up",
+            "model": "CortadOS Router S1 2026-11-09 (run-20261109)",
+            "flags": [
+              "no-promote"
+            ],
+            "pending": "promotion_held",
+            "loaded_s": 41.2
+          }
         },
         "hardware": {
           "cpu_busy_pct": 30.0,
@@ -505,7 +581,9 @@ export default {
           "mem_available_bytes": 524288000,
           "chip": "Apple M5 Max",
           "load_1m": 1.5,
-          "age_s": 30.0
+          "age_s": 30.0,
+          "disk_free_pct": 61.5,
+          "source": "sample"
         }
       },
       {

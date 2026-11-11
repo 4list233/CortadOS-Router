@@ -5,7 +5,8 @@ provider's views with the same token: `GET /v1/cortados/live` every 10 seconds a
 
 - **Running** (from `/v1/cortados/live`) — one summary line (children running and queued, conversations and how many
   are working), then each running or queued `start_task` child (title, host, model, current tool, elapsed time counting
-  between polls) and the routed conversations in flight (main sessions and subagents: model, tool, elapsed). A section
+  between polls) and every conversation the provider holds open (main sessions, subagents, untagged clients, and a
+  child task's when it has no task line here: model, tool, elapsed). A section
   the provider could not read says so in its place, never "nothing running"; a provider from before the live view
   (404) is named as such and the rest of the pane still draws;
 - **usage** — routes logged, degraded rate, S1 latency (median / p90 over the last scored turns), the top lanes;
@@ -16,7 +17,8 @@ provider's views with the same token: `GET /v1/cortados/live` every 10 seconds a
   lane shows routing eligibility and its measured-resource reason; `/resources` does not expose deployment counts;
 - **devices** — the online local nodes with their GPU headroom, utilisation and how many local models fit, plus the pool;
 - **Fleet** (from `/v1/cortados/live`) — S1 up/down and latency, the lowest fresh subscription window, and each host's job
-  heartbeat (`studio: s1-scorer running, s1-continuous running 38%`) or `no heartbeat yet`;
+  heartbeat (`studio: s1-scorer running, s1-continuous running 38% · cpu 30% · disk 62% free`, and on the S1 host
+  `S1 up: <model> · promotion held · candidate promotion held`) or `no heartbeat yet`;
 - the last line links the browser dashboard, `<provider>/dashboard`, which shows the same live view in full.
 
 Both views are cache-only on the provider (they never open a vendor CLI or ssh), so the polls are cheap. The served

@@ -101,15 +101,49 @@ def usage_live():
                               s1_probe=lambda url: {"available": True, "status": 200, "latency_ms": 23})
 
 
+S1_BLOCK = {"health": "up", "model": "CortadOS Router S1 2026-11-09 (run-20261109)", "flags": ["no-promote"],
+            "pending": "promotion_held", "loaded_s": 41.2}
+
+
 def heartbeats(at=NOW - 40):
     b = live.HeartbeatBoard()
     hb, bad = live.validate_heartbeat({"host": "studio", "ttl_s": 900, "jobs": [
         {"name": "s1-scorer", "state": "running", "summary": "serving v12"},
         {"name": "s1-continuous", "state": "running", "summary": "sweep 3/8", "progress_pct": 37.5,
-         "started_at": NOW - 3600}]}, NOW)
+         "started_at": NOW - 3600}], "s1": S1_BLOCK,
+        "hardware": {"disk_free_pct": 61.5, "sampled_at": NOW - 100, "cpu_busy_pct": 80.0}}, NOW)
     assert bad is None, bad
     b.post(hb, at)
+    # the Air (the provider host) has no hardware/<host>.json: its sender's heartbeat carries the sample
+    hb, bad = live.validate_heartbeat({"host": "air", "ttl_s": 180, "jobs": [
+        {"name": "com.cortados.provider", "state": "running", "summary": "pid up, 3 runs"}],
+        "hardware": {"cpu_busy_pct": 12.5, "gpu_busy_pct": 3.0, "mem_available_bytes": 8 * 2 ** 30,
+                     "mem_total_bytes": 24 * 2 ** 30, "load_1m": 2.1, "disk_free_pct": 40.0, "chip": "Apple M4",
+                     "sampled_at": NOW - 20}}, NOW)
+    assert bad is None, bad
+    b.post(hb, at + 30)
     return b
+
+
+def backend_conversations():
+    """Registry.live_conversations as the server reports them: the floor's routed main loop (waiting for the client's
+    tool), the running child's own conversation (a turn in progress), the routed subagent's, and one opened by a client
+    that sends no office tags (no board key)."""
+    return [
+        {"key": "main:" + SESSION, "ref": "c-000000000001", "provider": "claude", "lane": "claude#a",
+         "model": "claude-opus-5", "opened_at": NOW - 900, "last_used": NOW - 15, "busy": False, "awaiting_tool": True},
+        {"key": "r:" + RUNNING, "ref": "c-000000000002", "provider": "claude", "lane": "claude#b",
+         "model": "claude-sonnet-5", "opened_at": NOW - 100, "last_used": NOW - 20, "busy": True,
+         "awaiting_tool": False},
+        {"key": "r:sub-run-0001", "ref": "c-000000000003", "provider": "codex", "lane": "codex", "model": "gpt-6.1",
+         "opened_at": NOW - 90, "last_used": NOW - 80, "busy": False, "awaiting_tool": True},
+        {"key": None, "ref": "c-000000000004", "provider": "codex", "lane": "codex", "model": "gpt-6.1-mini",
+         "opened_at": NOW - 400, "last_used": NOW - 300, "busy": False, "awaiting_tool": False},
+    ]
+
+
+def _n(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
 
 
 def peek(tid):
@@ -125,7 +159,7 @@ def fixture_view(**over):
     board, beats, tv, u = office_board(), heartbeats(), tasks_view(), usage_live()
     args = dict(now=NOW, child_events=events, office_view=lambda ev: board.view(ev, now=NOW),
                 tasks_view=lambda: tv, usage_view=lambda: u, heartbeats=lambda: beats.snapshot(NOW),
-                backend_sessions=2, peek=peek,
+                backend_sessions=4, peek=peek, conversations=backend_conversations,
                 exec_hosts=lambda: ({"air": ["forests-macbook-air"], "studio": ["forests-mac-studio"]}, "air"),
                 self_host="forests-macbook-air", host_names=["air", "studio", "pro"])
     args.update(over)
@@ -172,8 +206,45 @@ class CollectTest(unittest.TestCase):
         self.assertNotIn("/Users/", json.dumps(t))
         self.assertEqual(t["counts"]["running"], 2)          # without the peek the queued task reads as running
 
-    def test_conversations_from_the_office_view(self):
+    def test_conversations_list_every_open_conversation(self):
+        # Bug (2026-11-11): a running child talked to the provider the whole time and conversations said active 0:
+        # the section was built from the Office board alone, which files child tasks under tasks, and the Registry's
+        # open conversations were only counted (backend_sessions).
         c = fixture_view()["conversations"]
+        self.assertEqual((c["status"], c["backend_sessions"], c["active"], c["working"]), ("ok", 4, 5, 3))
+        rows = [(x["kind"], x["run_id"], x["model"], x["lane"], x["status"], x["source"]) for x in c["items"]]
+        self.assertEqual(rows, [   # working first, newest first
+            ("subagent", "sub-run-0001", "gpt-6.1", "codex", "working", "provider"),
+            ("child_task", RUNNING, "claude-sonnet-5", "claude#b", "working", "provider"),
+            ("orchestrator", "c-000000000001", "claude-opus-5", "claude#a", "working", "provider"),
+            ("subagent", None, "qwen3-30b", "local-studio", "idle", "routed"),        # a one-shot: board only
+            ("conversation", "c-000000000004", "gpt-6.1-mini", "codex", "idle", "provider")])
+        by = {x["run_id"]: x for x in c["items"]}
+        child = by[RUNNING]
+        self.assertEqual((child["title"], child["tool"], child["elapsed_s"], child["phase"], child["session"]),
+                         ("Refactor the scarcity reader", "Bash", 100.0, "model turn", SESSION))
+        sub = by["sub-run-0001"]
+        self.assertEqual((sub["tool"], sub["project"], sub["phase"], sub["elapsed_s"]),
+                         ("Read", "CortadOS-Router", "client running a tool", 90.0))
+        main = by["c-000000000001"]
+        self.assertEqual((main["kind"], main["session"], main["elapsed_s"], main["tool"]),
+                         ("orchestrator", SESSION, 900.0, "Edit"))
+        # the floor's orchestrator is that routed main loop: listed once, not again from the board
+        self.assertEqual(sum(1 for x in c["items"] if x["kind"] == "orchestrator"), 1)
+        untagged = by["c-000000000004"]
+        self.assertEqual((untagged["status"], untagged["phase"], untagged["session"]),
+                         ("idle", "waiting for the client", None))
+
+    def test_a_failed_conversation_list_keeps_the_board(self):
+        c = fixture_view(conversations=lambda: 1 / 0)["conversations"]
+        self.assertEqual(c["status"], "partial")
+        self.assertIn({"source": "conversations", "error": "ZeroDivisionError"}, c["errors"])
+        self.assertEqual(c["active"], 3)                     # the Office board's view, as without the list
+        c = fixture_view(office_view=lambda ev: 1 / 0)["conversations"]
+        self.assertEqual((c["status"], c["active"]), ("partial", 4))   # the open conversations stand without the board
+
+    def test_conversations_from_the_office_view(self):
+        c = fixture_view(conversations=None, backend_sessions=2)["conversations"]
         self.assertEqual((c["status"], c["backend_sessions"], c["active"], c["working"]), ("ok", 2, 3, 2))
         kinds = [(x["kind"], x["model"], x["status"]) for x in c["items"]]
         self.assertEqual(kinds, [("subagent", "gpt-6.1", "working"), ("orchestrator", "claude-opus-5", "working"),
@@ -245,9 +316,47 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(h["air"]["roles"], ["provider", "default exec host"])
         self.assertEqual((h["studio"]["heartbeat_state"], h["studio"]["heartbeat"]["age_s"]), ("fresh", 40.0))
         self.assertEqual([j["name"] for j in h["studio"]["heartbeat"]["jobs"]], ["s1-scorer", "s1-continuous"])
+        # the studio's sample card (30 s old) is fresher than its heartbeat's hardware (100 s): the card stands, and the
+        # heartbeat adds the disk figure the card does not have
         self.assertEqual(h["studio"]["hardware"]["age_s"], 30.0)   # tests/test_usage.HW_SAMPLE, host "studio"
-        self.assertEqual((h["pro"]["heartbeat_state"], h["pro"]["heartbeat"]), ("none", None))
-        self.assertEqual(v["overview"]["hosts_with_heartbeat"], 1)
+        self.assertEqual((h["studio"]["hardware"]["source"], h["studio"]["hardware"]["disk_free_pct"]), ("sample", 61.5))
+        self.assertEqual(h["studio"]["heartbeat"]["s1"], {**S1_BLOCK})
+        # Bug (2026-11-11): the Air, the provider host itself, had no hardware: nothing writes hardware/<host>.json on
+        # it. Its heartbeat sender's sample fills the card.
+        self.assertEqual(h["air"]["hardware"], {"cpu_busy_pct": 12.5, "gpu_busy_pct": 3.0,
+                                                "mem_available_bytes": 8 * 2 ** 30, "mem_total_bytes": 24 * 2 ** 30,
+                                                "chip": "Apple M4", "load_1m": 2.1, "age_s": 20.0,
+                                                "disk_free_pct": 40.0, "source": "heartbeat"})
+        self.assertEqual((h["pro"]["heartbeat_state"], h["pro"]["heartbeat"], h["pro"]["hardware"]), ("none", None, None))
+        self.assertEqual(v["overview"]["hosts_with_heartbeat"], 2)
+
+    def test_a_stale_heartbeat_hardware_is_not_shown(self):
+        b = heartbeats(at=NOW - 1000)
+        h = {x["name"]: x for x in fixture_view(heartbeats=lambda: b.snapshot(NOW))["hosts"]["items"]}
+        self.assertIsNone(h["air"]["hardware"])                   # its 180 s freshness is long past
+        self.assertEqual(h["studio"]["hardware"]["source"], "sample")
+
+    def test_the_provider_hosts_own_sample_maps_to_its_name(self):
+        # a hostname that matches no known name by alias or word: the provider's own card is still shown, under the
+        # name CORTADOS_LIVE_SELF gives it; a different unknown hostname stays dropped and counted
+        u = usage_live()
+        u["hardware"] = [{"file": "x.json", "age_s": 4.0, "data": {"host": "owners-laptop", "cpu_busy_pct": 7.0}},
+                         {"file": "y.json", "age_s": 4.0, "data": {"host": "someone-else", "cpu_busy_pct": 9.0}}]
+        b = live.HeartbeatBoard()
+        v = fixture_view(usage_view=lambda: u, self_host="owners-laptop", exec_hosts=lambda: ({}, None),
+                         heartbeats=lambda: b.snapshot(NOW), self_name="air")
+        h = {x["name"]: x for x in v["hosts"]["items"]}
+        self.assertEqual((v["hosts"]["provider_host"], h["air"]["hardware"]["cpu_busy_pct"]), ("air", 7.0))
+        self.assertIn({"source": "hardware", "error": "1 hardware sample(s) match no known host name"},
+                      v["hosts"]["errors"])
+        self.assertNotIn("owners", json.dumps(v["hosts"]))
+        with mock.patch.dict(os.environ, {"CORTADOS_LIVE_SELF": "Air"}):
+            v = fixture_view(usage_view=lambda: u, self_host="owners-laptop", exec_hosts=lambda: ({}, None),
+                             heartbeats=lambda: b.snapshot(NOW))
+        self.assertEqual(v["hosts"]["provider_host"], "air")
+        v = fixture_view(usage_view=lambda: u, self_host="owners-laptop", exec_hosts=lambda: ({}, None),
+                         heartbeats=lambda: b.snapshot(NOW), self_name="nosuchhost")
+        self.assertIsNone(v["hosts"]["provider_host"])           # only a known name, never a made-up one
 
     def test_a_stale_heartbeat_is_said_so(self):
         b = heartbeats(at=NOW - 1000)
@@ -286,7 +395,7 @@ class CollectTest(unittest.TestCase):
         self.assertEqual((v["subscriptions"]["status"], v["s1"]["status"]), ("error", "unknown"))
         self.assertEqual(v["hosts"]["status"], "partial")
         self.assertIn({"source": "usage", "error": "OSError"}, v["hosts"]["errors"])
-        v = fixture_view(office_view=lambda ev: (_ for _ in ()).throw(RuntimeError("x")))
+        v = fixture_view(office_view=lambda ev: (_ for _ in ()).throw(RuntimeError("x")), conversations=None)
         self.assertEqual((v["conversations"]["status"], v["conversations"]["active"]), ("error", None))
         self.assertEqual(v["tasks"]["status"], "partial")        # the tasks still come from the log
         v = fixture_view(exec_hosts=lambda: (_ for _ in ()).throw(ValueError("bad file")))
@@ -505,6 +614,42 @@ class HeartbeatTest(unittest.TestCase):
         for p in (-1, 101, "50", True):
             self.check({**self.GOOD, "jobs": [{**job, "progress_pct": p}]}, "jobs[0].progress_pct")
 
+    def test_hardware_and_s1_blocks(self):
+        hw = {"cpu_busy_pct": 12.345, "gpu_busy_pct": None, "mem_available_bytes": 2 ** 33, "mem_total_bytes": 2 ** 34,
+              "load_1m": 1.234, "disk_free_pct": 55, "chip": "Apple M4 Max", "sampled_at": NOW - 5}
+        s1 = {"health": "up", "model": "CortadOS Router S1 2026-11-09 (run-a)", "flags": ["nightly-stop", "no-promote"],
+              "pending": "promotion_held", "loaded_s": 3}
+        hb, bad = live.validate_heartbeat({**self.GOOD, "hardware": hw, "s1": s1}, NOW)
+        self.assertIsNone(bad)
+        self.assertEqual(hb["hardware"], {**hw, "cpu_busy_pct": 12.3, "load_1m": 1.23, "disk_free_pct": 55.0})
+        self.assertEqual(hb["s1"], {**s1, "flags": ["no-promote", "nightly-stop"], "loaded_s": 3.0})
+        self.assertEqual(live.validate_heartbeat({**self.GOOD, "s1": {}}, NOW)[0]["s1"],
+                         {"health": "unknown", "model": None, "flags": [], "pending": None, "loaded_s": None})
+        self.assertNotIn("hardware", live.validate_heartbeat(self.GOOD, NOW)[0])
+        # a full sender body (16 jobs with 80-char summaries, both blocks) stays under the byte cap
+        full = {"host": "studio", "ttl_s": 180, "hardware": hw, "s1": s1, "jobs": [
+            {"name": f"com.cortados.job-{i:02d}", "state": "running", "summary": "x" * 80, "started_at": NOW,
+             "finished_at": NOW, "progress_pct": 50.0} for i in range(live.JOBS_MAX)]}
+        self.assertLess(len(json.dumps(full).encode()), live.HEARTBEAT_MAX_BYTES)
+        self.assertIsNone(live.validate_heartbeat(full, NOW)[1])
+
+    def test_hardware_and_s1_refused(self):
+        self.check({**self.GOOD, "hardware": []}, "hardware")
+        self.check({**self.GOOD, "hardware": {"path": "/Users/x"}}, "hardware")
+        for k, v in (("cpu_busy_pct", 101), ("disk_free_pct", -1), ("gpu_busy_pct", "5"), ("mem_total_bytes", 2 ** 60),
+                     ("load_1m", float("nan")), ("chip", "M4\nMax"), ("chip", "10.0.0.1"), ("sampled_at", NOW + 40 * 86400),
+                     ("mem_available_bytes", True)):
+            self.check({**self.GOOD, "hardware": {k: v}}, "hardware." + k)
+        self.check({**self.GOOD, "s1": "up"}, "s1")
+        self.check({**self.GOOD, "s1": {"token": "x"}}, "s1")
+        self.check({**self.GOOD, "s1": {"health": "great"}}, "s1.health")
+        for f in (["no-promote", "no-promote"], ["data/no-promote"], "no-promote", ["x"] * 5):
+            self.check({**self.GOOD, "s1": {"flags": f}}, "s1.flags")
+        for p in ("Promotion Held", "/Users/x/run", "a" * 49):
+            self.check({**self.GOOD, "s1": {"pending": p}}, "s1.pending")
+        self.check({**self.GOOD, "s1": {"model": "line\nbreak"}}, "s1.model")
+        self.check({**self.GOOD, "s1": {"loaded_s": -1}}, "s1.loaded_s")
+
     def test_board_is_bounded_and_forgets(self):
         b = live.HeartbeatBoard()
         for i in range(live.HEARTBEAT_HOSTS_MAX + 3):
@@ -696,6 +841,60 @@ class EndpointTest(EndpointHarness):
         self.assertEqual(v["conversations"]["backend_sessions"], len(self.reg.sessions))
         # the child log in this throwaway home is real input: events() are relative to NOW, so all are outside 24 h now
         self.assertEqual(v["tasks"]["status"], "ok")
+        # a tool-less request is a one-shot (no open conversation): it is listed from the board, by its run id
+        items = {x["run_id"]: x for x in v["conversations"]["items"]}
+        self.assertEqual((items["run-live-0001"]["source"], items["run-live-0001"]["title"]),
+                         ("routed", "Summarise the notes"))
+
+    def test_the_sender_reaches_the_view(self):
+        # cortados_router/live_heartbeat.py end to end: a fake launchctl and sample, the real endpoint and its
+        # host-bound token; the Studio's S1 status and hardware show on its host card
+        from cortados_router import live_heartbeat as hbs
+        from tests.test_live_heartbeat import PRINT_RUNNING, fake_launchctl, fake_sample
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "data").mkdir()
+        (d / "data" / "no-promote").touch()
+        tok = d / "token"
+        tok.write_text(BEAT_TOKEN)
+        os.chmod(tok, 0o600)
+        cfg = d / "heartbeat.json"
+        cfg.write_text(json.dumps({"host": "studio", "provider_url": self.url, "token_file": str(tok), "ttl_s": 180,
+                                   "jobs": [{"label": "com.cortados.s1-serve", "name": "s1-scorer"}],
+                                   "s1": {"data_dir": str(d / "data"), "health_url": "http://s1.test"}}))
+        with redirect_stderr(io.StringIO()):
+            code = hbs.main(["--config", str(cfg)], run=fake_launchctl({"com.cortados.s1-serve": PRINT_RUNNING}),
+                            sample=fake_sample, fetch=lambda u: b'{"ok": true, "model": "CortadOS Router S1 v12"}')
+        self.assertEqual(code, 0)
+        h = {x["name"]: x for x in json.loads(self.request("GET", live.LIVE_PATH, TOKEN)[1])["hosts"]["items"]}
+        st = h["studio"]
+        self.assertEqual((st["heartbeat_state"], st["heartbeat"]["jobs"][0]["state"]), ("fresh", "running"))
+        self.assertEqual((st["heartbeat"]["s1"]["model"], st["heartbeat"]["s1"]["flags"]),
+                         ("CortadOS Router S1 v12", ["no-promote"]))
+        self.assertEqual((st["hardware"]["source"], st["hardware"]["chip"]), ("heartbeat", "Apple M2"))
+
+    def test_open_conversations_reach_the_view(self):
+        # Registry.live_conversations: the open conversation, joined with its board worker by the run id it carries
+        tags = {"x-cortados-session": SESSION, "x-cortados-project": "CortadOS-Router",
+                "x-cortados-run-id": "t20261111160000-0a0b0c0d"}
+        from tests.test_provider import READ_TOOL
+        code, raw, _ = self.request("POST", "/v1/messages", TOKEN, headers=tags, body={
+            "model": "cortados", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "please use tool"}]})
+        self.assertEqual(code, 200, raw)
+        self.assertEqual(len(self.reg.sessions), 1)
+        convs = self.reg.live_conversations()
+        self.assertEqual(len(convs), 1)
+        c = convs[0]
+        self.assertEqual((c["key"], c["busy"], c["awaiting_tool"], c["provider"]),
+                         ("r:t20261111160000-0a0b0c0d", False, True, "claude"))
+        self.assertTrue(c["ref"].startswith("c-") and len(c["ref"]) == 14)
+        self.assertNotIn(next(iter(self.reg.sessions)), json.dumps(convs))   # the session id itself is never published
+        self.assertTrue(_n(c["opened_at"]) and _n(c["last_used"]))
+        v = json.loads(self.request("GET", live.LIVE_PATH, TOKEN)[1])["conversations"]
+        it = {x["run_id"]: x for x in v["items"]}["t20261111160000-0a0b0c0d"]
+        self.assertEqual((it["source"], it["status"], it["phase"], it["tool"], it["session"]),
+                         ("provider", "working", "client running a tool", "Read", SESSION))
+        self.assertEqual((v["backend_sessions"], v["active"]), (1, 1))
 
 
 if __name__ == "__main__":

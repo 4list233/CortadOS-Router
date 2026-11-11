@@ -11,7 +11,10 @@ It composes views that already exist rather than re-deriving them:
                    this machine, the remote stub a start_task from here leaves in the tasks dir, is listed as
                    `elsewhere` ({task_id, host, started_at}, the last 10 h): started from here on another host, its
                    state there unknown to this view.
-  - conversations  in-flight routed work: the Office view's floors (orchestrators) and workers, minus child tasks.
+  - conversations  every conversation the provider holds open right now (Registry.live_conversations: model, lane,
+                   opened, last used, busy), joined with the Office board for its kind, title, session and tool; child
+                   tasks' own conversations included (kind child_task, run id = task id); plus the floors' orchestrators
+                   known from heartbeats and routed one-shot workers the Registry does not hold.
   - routed         the latest routing decisions, from tasks.collect (router.db, read-only, row-limited).
   - subscriptions  every lane's % left per window, from usage.collect_live (scarcity.json read strictly: cache only,
                    never a vendor CLI), and the lowest general window across the lanes routing can use (lane_enabled).
@@ -33,11 +36,14 @@ loop) POSTs its job states:
               {"name": "s1-continuous", "state": "running", "summary": "sweep 3/8", "progress_pct": 37.5,
                "started_at": 1762850000}]}
 
+A heartbeat may also carry the host's `hardware` (cpu/gpu busy %, memory, load, disk free %: numbers and the chip
+name only) and, on the S1 host, an `s1` block (health, the served model's name, the pipeline's hold flags by fixed
+name, a pending candidate's reason slug); cortados_router/live_heartbeat.py is the sender (one per host, every 60 s).
 A post replaces that host's previous one. It is shown fresh for ttl_s (default 900, 60..86400), then stale, and is
 forgotten after 24 h. A live:heartbeat client token posts for its bound host only (provider/clients.py; 403 otherwise),
 and the board's LRU never evicts a configured host (CORTADOS_LIVE_HOSTS / the defaults, exec-hosts.json), so posts for
 made-up names can only push out other made-up names. A malformed heartbeat is refused with 400 naming the bad field (never echoing its value), a body
-over HEARTBEAT_MAX_BYTES with 413. docs/PROVIDER-PLAN.md ("Live view") shows a sender a Studio job could run.
+over HEARTBEAT_MAX_BYTES with 413. docs/PROVIDER-PLAN.md ("Live view") has the schema and the sender.
 """
 from __future__ import annotations
 
@@ -79,6 +85,7 @@ SCOPE = "provider host"     # the tasks section sees this machine's child-task l
 MEMO_S = 2.0                # GET /v1/cortados/live: N pollers (dashboard tabs, pulse panes) share one collect per 2 s
 DEFAULT_HOSTS = ("air", "studio", "pro")
 HOSTS_ENV = "CORTADOS_LIVE_HOSTS"
+SELF_ENV = "CORTADOS_LIVE_SELF"   # the provider host's known name, when its hostname matches none (hosts_section)
 
 _HOST_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")       # exec_hosts.HOST_NAME_RE: one slug per machine everywhere
 _JOB_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,47}")
@@ -86,7 +93,17 @@ _SUMMARY_RE = re.compile(r"[\x20-\x7e]{1,80}")       # office's title rule: prin
 _CLIENT_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 _WS_STATE_RE = re.compile(r"[a-z_-]{1,24}")
 _TASK_STATES = ("succeeded", "failed", "cancelled")   # child_tasks.TERMINAL_STATES
-_HB_KEYS = {"host", "jobs", "ttl_s"}
+_HB_KEYS = {"host", "jobs", "ttl_s", "hardware", "s1"}
+# heartbeat `hardware`: percentages, byte counts, the 1-min load, the chip name and when it was sampled; nothing else
+_HB_PCT = ("cpu_busy_pct", "gpu_busy_pct", "disk_free_pct")
+_HB_BYTES = ("mem_available_bytes", "mem_total_bytes")
+_HB_HW_KEYS = _HB_PCT + _HB_BYTES + ("load_1m", "chip", "sampled_at")
+# heartbeat `s1`: the S1 pipeline's flags by their fixed names (s1/nightly.sh: data/no-promote, data/no-train-tonight,
+# data/nightly.stop, data/sweep-request.json), never a path or a file's contents
+S1_FLAGS = ("no-promote", "no-train-tonight", "nightly-stop", "sweep-requested")
+S1_HEALTH = ("up", "down", "unknown")
+_HB_S1_KEYS = {"health", "model", "flags", "pending", "loaded_s"}
+_REASON_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,47}")   # a pending candidate's reason (evaluation_pending, promotion_held)
 _JOB_KEYS = {"name", "state", "summary", "started_at", "finished_at", "next_at", "progress_pct"}
 
 
@@ -146,7 +163,78 @@ def validate_heartbeat(body: Any, now: float) -> tuple[dict[str, Any] | None, st
         else:
             return None, where + ".progress_pct"
         out_jobs.append(job)
-    return {"host": host, "ttl_s": int(ttl), "jobs": out_jobs}, None
+    out: dict[str, Any] = {"host": host, "ttl_s": int(ttl), "jobs": out_jobs}
+    if body.get("hardware") is not None:
+        hw, bad = _validate_hw(body["hardware"], now)
+        if bad is not None:
+            return None, "hardware" + bad
+        out["hardware"] = hw
+    if body.get("s1") is not None:
+        s1, bad = _validate_s1(body["s1"])
+        if bad is not None:
+            return None, "s1" + bad
+        out["s1"] = s1
+    return out, None
+
+
+def _validate_hw(hw: Any, now: float) -> tuple[dict[str, Any] | None, str | None]:
+    """A heartbeat's hardware block, or (None, ".<bad field>")."""
+    if not isinstance(hw, dict) or set(hw) - set(_HB_HW_KEYS):
+        return None, ""
+    out: dict[str, Any] = {}
+    for k in _HB_HW_KEYS:
+        v = hw.get(k)
+        if v is None:
+            out[k] = None
+        elif k in _HB_PCT:
+            if not (_num(v) and 0 <= v <= 100):
+                return None, "." + k
+            out[k] = round(float(v), 1)
+        elif k in _HB_BYTES:
+            if not (_num(v) and 0 <= v <= 2 ** 50):
+                return None, "." + k
+            out[k] = int(v)
+        elif k == "load_1m":
+            if not (_num(v) and 0 <= v <= 4096):
+                return None, "." + k
+            out[k] = round(float(v), 2)
+        elif k == "chip":
+            out[k] = office.clean(v, _SUMMARY_RE)
+            if out[k] is None:
+                return None, "." + k
+        elif k == "sampled_at":
+            if not (_num(v) and abs(v - now) <= TIME_SKEW_S):
+                return None, "." + k
+            out[k] = round(float(v), 3)
+    return out, None
+
+
+def _validate_s1(s1: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """A heartbeat's s1 block, or (None, ".<bad field>")."""
+    if not isinstance(s1, dict) or set(s1) - _HB_S1_KEYS:
+        return None, ""
+    health = s1.get("health", "unknown")
+    if health not in S1_HEALTH:
+        return None, ".health"
+    out: dict[str, Any] = {"health": health, "model": None, "flags": [], "pending": None, "loaded_s": None}
+    if s1.get("model") not in (None, ""):
+        out["model"] = office.clean(s1["model"], _SUMMARY_RE)
+        if out["model"] is None:
+            return None, ".model"
+    flags = s1.get("flags", [])
+    if not isinstance(flags, list) or len(flags) > len(S1_FLAGS) or any(f not in S1_FLAGS for f in flags) \
+            or len(set(flags)) != len(flags):
+        return None, ".flags"
+    out["flags"] = [f for f in S1_FLAGS if f in flags]
+    if s1.get("pending") not in (None, ""):
+        out["pending"] = office.clean(s1["pending"], _REASON_RE)
+        if out["pending"] is None:
+            return None, ".pending"
+    if s1.get("loaded_s") is not None:
+        if not (_num(s1["loaded_s"]) and 0 <= s1["loaded_s"] <= 86400):
+            return None, ".loaded_s"
+        out["loaded_s"] = round(float(s1["loaded_s"]), 1)
+    return out, None
 
 
 class HeartbeatBoard:
@@ -326,29 +414,78 @@ def tasks_section(events: list[dict[str, Any]], office_view: dict[str, Any] | No
                     recent=recent[:RECENT_MAX], truncated=truncated, elsewhere=away)
 
 
-def conversations_section(view: dict[str, Any], backend_sessions: int | None, now: float) -> dict[str, Any]:
-    """In-flight routed work from the Office view: each floor's orchestrator and every routed worker that is working or
-    idle (child tasks are in the tasks section). Finished workers are left to the Office view."""
-    items = []
+def _backend_items(backend: list, view: dict[str, Any], now: float) -> tuple[list[dict[str, Any]], set[str]]:
+    """One item per conversation the provider holds open (Registry.live_conversations), joined with the Office board by
+    its office key, and the office run ids / main-loop sessions those conversations cover. Every field is re-validated
+    here: these records come from in-memory sessions whose models and lanes the routes chose."""
+    workers = {w.get("run_id"): (f, w) for f, w in _office_workers(view) if w.get("run_id")}
+    floors = {f.get("session"): f for f in view.get("floors") or [] if f.get("session")}
+    items, covered = [], set()
+    for c in backend or []:
+        if not isinstance(c, dict):
+            continue
+        key = c.get("key") if isinstance(c.get("key"), str) else ""
+        kind_of, _, ident = key.partition(":")
+        floor, w = None, {}
+        if kind_of in ("r", "c") and ident in workers:
+            floor, w = workers[ident]
+            covered.add(ident)
+        elif kind_of == "main" and ident in floors:
+            floor = floors[ident]
+            covered.add("main:" + ident)
+            o = floor.get("orchestrator") or {}
+            w = {"tool": o.get("tool"), "status": o.get("status")}   # the main loop's tool, as the floor knows it
+        kind = w.get("kind") or ("orchestrator" if kind_of == "main" else "subagent" if kind_of == "r" else "conversation")
+        busy, waiting = c.get("busy") is True, c.get("awaiting_tool") is True
+        status = "working" if busy or waiting else "idle"
+        opened = c.get("opened_at") if _num(c.get("opened_at")) else None
+        items.append({
+            "kind": kind, "run_id": office.clean(ident, office._RUN_ID_RE) if kind_of == "r" else
+            office.clean(c.get("ref"), office._RUN_ID_RE),
+            "session": (floor or {}).get("session"), "project": (floor or {}).get("project"),
+            "device": (floor or {}).get("device"),
+            "provider": c.get("provider") if c.get("provider") in office.PROVIDERS else w.get("provider"),
+            "lane": office.clean(c.get("lane"), office._LANE_RE) or w.get("lane"),
+            "model": office.clean(c.get("model"), office._MODEL_RE) or w.get("model"),
+            "status": status, "tool": w.get("tool") if status == "working" and w.get("status") == "working" else None,
+            "phase": "model turn" if busy else ("client running a tool" if waiting else "waiting for the client"),
+            "source": "provider", "title": w.get("title"), "started_at": _r(opened, 3),
+            "last_activity": _r(c.get("last_used"), 3)})
+    return items, covered
+
+
+def conversations_section(view: dict[str, Any], backend_sessions: int | None, now: float,
+                          backend: list | None = None, errors: list | None = None) -> dict[str, Any]:
+    """In-flight routed work. With `backend` (the Registry's open conversations), one item per open conversation,
+    child tasks' included; then each floor's orchestrator known from a heartbeat (a main session that does not route
+    itself), and Office workers that are working or idle but hold no open conversation (one-shot calls). Without it,
+    the Office view alone (orchestrators and non-child workers), as before."""
+    items, covered = _backend_items(backend, view, now) if backend is not None else ([], set())
     for f in view.get("floors") or []:
         o = f.get("orchestrator")
+        if "main:" + str(f.get("session")) in covered:
+            continue
         if isinstance(o, dict) and o.get("status") in ("working", "idle"):
             items.append({"kind": "orchestrator", "run_id": None, "session": f.get("session"),
                           "project": f.get("project"), "device": f.get("device"), "provider": None, "lane": None,
-                          "model": o.get("model"), "status": o.get("status"), "tool": o.get("tool"),
-                          "source": o.get("source"), "started_at": f.get("since"), "last_activity": o.get("last_seen")})
+                          "model": o.get("model"), "status": o.get("status"), "tool": o.get("tool"), "phase": None,
+                          "source": o.get("source"), "title": None, "started_at": f.get("since"),
+                          "last_activity": o.get("last_seen")})
     for f, w in _office_workers(view):
-        if w.get("kind") == "child_task" or w.get("status") not in ("working", "idle"):
+        if w.get("run_id") in covered or w.get("status") not in ("working", "idle"):
             continue
+        if w.get("kind") == "child_task":
+            continue                                # a child holds a conversation while it runs; its row is the task's
         items.append({"kind": w.get("kind") or "subagent", "run_id": w.get("run_id"),
                       "session": (f or {}).get("session"), "project": (f or {}).get("project"),
                       "device": (f or {}).get("device"), "provider": w.get("provider"), "lane": w.get("lane"),
-                      "model": w.get("model"), "status": w.get("status"), "tool": w.get("tool"), "source": "routed",
-                      "title": w.get("title"), "started_at": w.get("started_at"), "last_activity": None})
+                      "model": w.get("model"), "status": w.get("status"), "tool": w.get("tool"), "phase": None,
+                      "source": "routed", "title": w.get("title"), "started_at": w.get("started_at"),
+                      "last_activity": None})
     for it in items:
         it["elapsed_s"] = _r(max(0.0, now - it["started_at"])) if _num(it.get("started_at")) else None
     items.sort(key=lambda it: (it["status"] != "working", -(it.get("started_at") or 0)))
-    errors = [e for e in view.get("errors") or [] if isinstance(e, dict)]
+    errors = [e for e in view.get("errors") or [] if isinstance(e, dict)] + list(errors or [])
     return _section(now, _status(errors, True), errors, backend_sessions=backend_sessions,
                     active=len(items), working=sum(1 for it in items if it["status"] == "working"),
                     floors=len(view.get("floors") or []), items=items[:CONVERSATIONS_MAX],
@@ -471,7 +608,10 @@ _HW_PICK = ("cpu_busy_pct", "gpu_busy_pct", "mem_available_bytes", "mem_total_by
 
 def hosts_section(u: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]], *, names: list[str],
                   exec_hosts: dict[str, list[str]] | None, exec_default: str | None, self_host: str | None,
-                  now: float, errors: list | None = None) -> dict[str, Any]:
+                  now: float, errors: list | None = None, self_name: str | None = None) -> dict[str, Any]:
+    """`self_name` (CORTADOS_LIVE_SELF) names the provider host outright when its hostname matches no known name; a
+    hardware card whose hostname is the provider's own is then shown under that name. A host's hardware is the
+    freshest of its sample card (hardware/<host>.json) and its fresh heartbeat's `hardware` block."""
     errors = list(errors or [])
     aliases: dict[str, set[str]] = {n: set() for n in names}
     for n, al in (exec_hosts or {}).items():
@@ -488,6 +628,8 @@ def hosts_section(u: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]
     # Only a KNOWN name is published: the raw hostname slug can carry the owner's name (forests-macbook-air), and a
     # live:read reader is not meant to learn it. An unmatched provider host is null, said as such by the readers.
     me = _match(self_host, aliases)
+    if me is None and self_name in aliases:
+        me = self_name
     if me:
         item(me)["roles"].append("provider")
     for n in exec_hosts or {}:
@@ -501,6 +643,8 @@ def hosts_section(u: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]
         # A known name only, as for the provider host above: a card whose hostname matches none is dropped and counted
         # (below), never shown under its raw hostname (which can carry the owner's name).
         name = _match(host, aliases)
+        if not name and host and self_host and host.lower() == self_host.lower():
+            name = me                               # the provider's own sample, under the provider's known name
         if not name:
             unmatched += 1
             continue
@@ -508,6 +652,8 @@ def hosts_section(u: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]
         hw = {k: data.get(k) for k in _HW_PICK if not isinstance(data.get(k), dict)}
         hw["load_1m"] = load[0] if isinstance(load, list) and load and _num(load[0]) else None
         hw["age_s"] = card.get("age_s")
+        hw["disk_free_pct"] = None
+        hw["source"] = "sample"
         it = item(name)
         if it["hardware"] is None or (_num(hw["age_s"]) and hw["age_s"] < (it["hardware"].get("age_s") or 1e18)):
             it["hardware"] = hw
@@ -517,7 +663,18 @@ def hosts_section(u: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]
         it = item(h)
         it["heartbeat_state"] = "stale" if stale else "fresh"
         it["heartbeat"] = {"received_at": hb["received_at"], "age_s": round(age, 1), "ttl_s": hb["ttl_s"],
-                           "stale": stale, "jobs": hb["jobs"]}
+                           "stale": stale, "jobs": hb["jobs"], "s1": hb.get("s1")}
+        hh = hb.get("hardware")
+        if isinstance(hh, dict) and not stale:
+            at = hh.get("sampled_at") if _num(hh.get("sampled_at")) else hb["received_at"]
+            hw = {k: hh.get(k) for k in _HW_PICK if k != "chip"}
+            hw.update(chip=hh.get("chip"), load_1m=hh.get("load_1m"), age_s=round(max(0.0, now - at), 1),
+                      disk_free_pct=hh.get("disk_free_pct"), source="heartbeat")
+            cur = it["hardware"]
+            if cur is None or not _num(cur.get("age_s")) or hw["age_s"] < cur["age_s"]:
+                it["hardware"] = hw
+            elif cur.get("disk_free_pct") is None:
+                cur["disk_free_pct"] = hw["disk_free_pct"]
     errors += [e for e in (u or {}).get("errors") or []
                if isinstance(e, dict) and str(e.get("source", "")).startswith("hardware") and e.get("error") != "absent"]
     if unmatched:
@@ -535,7 +692,8 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
             exec_hosts: Callable[[], tuple[dict[str, list[str]], str | None]] | None = None,
             self_host: str | None = None, host_names: list[str] | None = None,
             remote_stubs: Callable[[], list] | None = None,
-            lane_enabled: Callable[[Any], bool] | None = None) -> dict[str, Any]:
+            lane_enabled: Callable[[Any], bool] | None = None,
+            conversations: Callable[[], list] | None = None, self_name: str | None = None) -> dict[str, Any]:
     """The snapshot. Each input is a callable, run under its own guard: one that raises turns ITS section into
     status "error" with the exception's type (never its text: an OSError carries a path), the rest stand."""
     def guard(source: str, fn: Callable[[], Any], errs: list) -> Any:
@@ -556,9 +714,14 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
         else _section(now, "error", child_errs + office_errs + stub_errs, scope=SCOPE, window_s=int(CHILD_WINDOW_S),
                       counts=None, running=[], queued=[], recent=[], truncated=False,
                       elsewhere=_elsewhere(stubs, set(), now))
-    conv = conversations_section(ov, backend_sessions, now) if ov is not None \
-        else _section(now, "error", office_errs, backend_sessions=backend_sessions, active=None, working=None,
-                      floors=None, items=[], hidden=0)
+    conv_errs: list = []
+    backend = guard("conversations", conversations, conv_errs) if conversations is not None else None
+    if ov is not None or backend is not None:    # the open conversations stand without the board (partial)
+        conv = conversations_section(ov if ov is not None else {"errors": office_errs}, backend_sessions, now,
+                                     backend, conv_errs)
+    else:
+        conv = _section(now, "error", office_errs + conv_errs, backend_sessions=backend_sessions, active=None,
+                        working=None, floors=None, items=[], hidden=0)
     tv_errs: list = []
     tv = guard("router.db", tasks_view, tv_errs)
     routed = routed_section(tv, now) if tv is not None \
@@ -574,7 +737,8 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     ex_hosts, ex_default = ex if isinstance(ex, tuple) else ({}, None)
     hosts = hosts_section(u, beats, names=host_names if host_names is not None else known_hosts(),
                           exec_hosts=ex_hosts, exec_default=ex_default, self_host=self_host, now=now,
-                          errors=hb_errs + ex_errs + (u_errs if u is None else []))
+                          errors=hb_errs + ex_errs + (u_errs if u is None else []),
+                          self_name=self_name if self_name is not None else _slug(os.environ.get(SELF_ENV)))
     counts = tasks.get("counts") or {}
     overview = {
         "running_tasks": counts.get("running") if tasks["status"] != "error" else None,

@@ -417,6 +417,21 @@ class HeartbeatTests(OfficeHarness):
         self.assertEqual(w(t0 + 1 + office.DONE_AFTER_S + 1)[0]["status"], "done")
         self.assertEqual(w(t0 + 1 + office.DONE_AFTER_S + office.WORKER_KEEP_S + 2), [])
 
+    def test_a_running_child_between_turns_is_idle_not_done(self):
+        # Bug (2026-11-11): a child task waiting on a long background command (its last turn ended, its log has no end
+        # event) read "done" after 60 s while the tasks section said running. Its log says when it ends.
+        b = office.OfficeBoard()
+        t0 = 2_000_000.0
+        tid = "t20261111150000-0a1b2c3d"
+        b.turn_start("r:" + tid, {"session": SESSION}, run_id=tid, provider="claude", lane="claude#b",
+                     model="claude-opus-5", now=t0)
+        b.turn_end("r:" + tid, {"session": SESSION}, status="idle", now=t0 + 1)
+        started = [{"ts": t0, "event": "started", "task_id": tid, "session": SESSION}]
+        at = t0 + 1 + office.DONE_AFTER_S + 30
+        self.assertEqual(b.view(started, now=at)["floors"][0]["workers"][0]["status"], "idle")
+        ended = started + [{"ts": at, "event": "finished", "task_id": tid, "status": "succeeded"}]
+        self.assertEqual(b.view(ended, now=at + 1)["floors"][0]["workers"][0]["status"], "done")
+
 
 class ChildTaskViewTests(OfficeHarness):
     def test_child_events_make_workers_and_floors(self):

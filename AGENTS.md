@@ -34,7 +34,8 @@ is the long form.
   metadata-only snapshot of running child tasks, routed conversations, routed calls, subscriptions, S1 and hosts, each
   section with its own `as_of`/`status`/`errors`, composed from the office, tasks and usage views) and validates
   `POST /v1/cortados/live/heartbeat` (host job states, e.g. the Studio's S1 jobs); the dashboard's Live tab and the
-  cortados-pulse pane read it. `usage.py` builds `GET /v1/cortados/usage` and `tasks.py` builds
+  cortados-pulse pane read it. Its host-side sender is `cortados_router/live_heartbeat.py` (launchd jobs, hardware, the Studio's S1
+  flags and /health; installed per host by `scripts/install_live_heartbeat.sh`, README "Live view"). `usage.py` builds `GET /v1/cortados/usage` and `tasks.py` builds
   `GET /v1/cortados/tasks` (the latest 200 `routes` rows as metadata: model, band, S1 reason by category, elapsed, % routed
   per session; never the request text; tokens are not recorded per route), both behind the owner token and both read by
   `dashboard.html` (`GET /dashboard`).

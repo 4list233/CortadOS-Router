@@ -35,10 +35,11 @@ test('the pane draws the lanes from /resources and never the token', { options: 
   expect(order).toEqual(['claude', 'claude#b', 'codex'])
   // the Running section comes first, the fleet after the devices, the dashboard link last
   expect(texts[0]).toBe('Running')
-  expect(texts[1]).toBe('1 running · 1 queued · 3 conversations (2 working)')
+  expect(texts[1]).toBe('1 running · 1 queued · 5 conversations (3 working)')
   expect(all).toMatch(/● Refactor the scarcity reader · on air · claude-sonnet-5 \(claude#b\) · tool Bash · 2m 05s/)
   expect(all).toMatch(/studio: s1-scorer running, s1-continuous running 38%/)
   expect(all).toMatch(/pro: no heartbeat yet/)
+  expect(all).toMatch(/S1 up: CortadOS Router S1 .* · promotion held/)
   expect(texts.indexOf('Running')).toBeLessThan(texts.indexOf('Usage'))
   expect(texts.indexOf('Devices')).toBeLessThan(texts.indexOf('Fleet'))
   expect(texts[texts.length - 1]).toBe('dashboard http://air.example:8432/dashboard')

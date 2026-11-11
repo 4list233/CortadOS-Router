@@ -258,6 +258,8 @@ class OfficeBoard:
             w["started_at"] = c["started_at"] if c.get("started_at") is not None else w.get("started_at")
             if c.get("final"):
                 w["status"], w["tool"], w["ended_at"] = c["final"], None, c["ts"]
+            else:
+                w["child_open"] = True              # no end event yet: never "done" by the idle heuristic below
             w["updated"] = max(w["updated"], c["ts"])
             workers[key] = w
             s = c.get("session")
@@ -277,7 +279,8 @@ class OfficeBoard:
         eligible = []
         for w in workers.values():
             st = w.get("status")
-            if st == "idle" and now - (w.get("updated") or now) > DONE_AFTER_S:
+            # A child task between turns (waiting on a background command) is idle, not done: its log says when it ends.
+            if st == "idle" and not w.get("child_open") and now - (w.get("updated") or now) > DONE_AFTER_S:
                 w["status"] = "done"
                 w["ended_at"] = w.get("ended_at") or w.get("updated")
             if w["status"] in ("done", "error") and now - (w.get("ended_at") or now) > WORKER_KEEP_S:
