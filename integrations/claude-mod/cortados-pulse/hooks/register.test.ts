@@ -342,7 +342,7 @@ test('the Running section from the provider-generated live snapshot', () => {
     // the running child's own conversation is its task line above, listed once
     '▸ Review the diff · gpt-6.1 (codex) · tool Read · 1m 30s',
     '▸ CortadOS-Router · main session · claude-opus-5 (claude#a) · tool Edit · 15m 00s',
-    '· subagent · qwen3-30b (local-studio) · idle · 30s',
+    '· conversation · qwen3-30b (local-studio) · idle · 30s',
     '· conversation · gpt-6.1-mini (codex) · idle · 6m 40s',
   ])
   // elapsed keeps counting between polls
