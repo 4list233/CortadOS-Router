@@ -729,6 +729,38 @@ def collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], r
     return body if encoded else json.loads(body)
 
 
+def collect_live(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], s1_url: str | None = None,
+                 s1_probe: Callable[[str | None], dict[str, Any]] = _s1, freshness: Callable | None = None,
+                 claude_lanes: list[tuple[str, str | None]] | None = None, now: float) -> dict[str, Any]:
+    """The lanes, s1 and hardware sections of this view and nothing else, for GET /v1/cortados/live (provider/live.py):
+    the same builders and the same publish pass (_VIEW), without the router.db / usage.db / log scans a 5 s poll does
+    not need. Cache-only like collect: scarcity.json is read strictly and no vendor CLI is opened; S1 is the memoised
+    /health probe. Returns {generated_at, lanes, s1, hardware, errors}."""
+    errors: list[dict[str, str]] = []
+    out: dict[str, Any] = {"generated_at": round(now, 3)}
+
+    def guard(name: str, fn: Callable[[], Any], empty: Any) -> Any:
+        try:
+            return fn()
+        except Exception as exc:
+            logger.warning("usage: %s failed: %s", name, exc)
+            errors.append({"source": name, "error": type(exc).__name__})   # the type only, as in _collect
+            return empty
+
+    configured = dict(claude_lanes) if claude_lanes is not None else None
+    out["lanes"] = guard("scarcity", lambda: _lanes(scarcity_reader(), now, freshness, configured), [])
+    out["s1"] = guard("s1", lambda: s1_probe(s1_url), {"available": False, "reason": "probe failed"})
+    if not isinstance(out["s1"], dict) or not out["s1"].get("available"):
+        errors.append({"source": "s1", "error": str(out["s1"].get("reason") if isinstance(out["s1"], dict) else None)})
+    hw = state_dir / "hardware"
+    if hw.is_dir():
+        out["hardware"] = guard("hardware", lambda: _hardware(hw, now, errors), [])
+    else:
+        errors.append({"source": "hardware", "error": "absent"})
+        out["hardware"] = []
+    return _publish(out, errors)
+
+
 def _collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], refusals: list[dict[str, Any]],
              runs_since_start: dict[str, int] | None, s1_url: str | None, s1_probe: Callable[[str | None], dict[str, Any]],
              freshness: Callable | None, claude_lanes: list[tuple[str, str | None]] | None,

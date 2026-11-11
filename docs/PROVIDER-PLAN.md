@@ -568,6 +568,82 @@ the usage ledger against the Claude lane it ran on (`claude`, or the named accou
 
 `GET /v1/cortados/usage` (token required, 401 otherwise): one cheap JSON view for a usage dashboard, built by `cortados_router/provider/usage.py` — `lanes` (cached scarcity.json only: % left, windows/resets, sample age, `stale` by the routing freshness rule), `routed` (router.db counts per lane/model today and 7 d, top S1 bands; plus `provider_since_start` from the in-memory run records), `refusals` (24 h by reason, in-memory), `child_tasks` (7 d by last event from child-tasks.jsonl), `s1` (1.5 s `/health` probe), `hardware` (`$CORTADOS_HOME/hardware/*.json` passed through with age), `notes`, `errors` (every failed or absent source), `generated_at`. Opens no vendor CLI.
 
+## Live view (GET /v1/cortados/live) (2026-11-11, #73)
+
+`cortados_router/provider/live.py` composes one metadata-only snapshot for the dashboard's Live tab and the
+cortados-pulse pane. Owner token or a `live:read` client token (provider/clients.py); `Cache-Control: no-store`; a view
+that fails answers 500 with the exception type in the log. Inputs, each under its own guard: the child-task log (read
+once, 24 h, bounded tail; the Office board gets its 4 h slice of the same read), the Office board, the Tasks view, the
+usage view's lanes/s1/hardware slice (`usage.collect_live`: same builders and publish pass, no router.db/usage.db scans),
+the heartbeat board, the exec-hosts file (for host aliases only; never ssh) and `child_tasks.peek_local` (read-only:
+queued marker, workspace record; never `_state()`, which reaps and recovers).
+
+Schema (version 1). Every section has `as_of` (epoch s), `status` and `errors` [{source, error}] (error = a fixed word
+or an exception type, never its message):
+
+    {"version": 1, "generated_at": <s>,
+     "overview": {"running_tasks", "queued_tasks", "active_conversations", "working_conversations", "s1",
+                  "s1_latency_ms", "lowest_subscription": {"lane", "label", "left_pct", "window"} | null,
+                  "hosts_with_heartbeat", "errors"},                    # counts are null when their section failed
+     "tasks": {..., "window_s": 86400, "counts": {"running", "queued", "succeeded", "failed", "cancelled", "unknown"},
+               "running": [task], "queued": [task], "recent": [task], "truncated"},
+         task = {"task_id", "title", "state", "phase", "host", "client", "provider", "lane", "model", "tool",
+                 "started_at", "ended_at", "elapsed_s", "workspace", "browser", "session", "project", "device"}
+         (state unknown: a start with no end event after 10 h, or a result on its host with no end event)
+     "conversations": {..., "backend_sessions", "active", "working", "floors", "items": [conv], "hidden"},
+         conv = {"kind": orchestrator|subagent, "run_id", "session", "project", "device", "provider", "lane", "model",
+                 "status": working|idle, "tool", "source", "title", "started_at", "last_activity", "elapsed_s"}
+     "routed": {..., "calls": [{"ts", "task_id", "session_id", "routing_kind", "band", "lane", "model",
+                "actual_model", "elapsed_ms", "degraded", "s1_reason", "request_chars", "response_chars"}] (25),
+                "totals", "row_limit", "more"},
+     "subscriptions": {..., "lanes": [{"lane", "label", "account", "left_pct", "stale", "error", "sample_age_s",
+                       "shared_with", "pools", "windows": [{"window", "pool", "left_pct", "resets_in_h", "stale"}]}],
+                       "lowest"},
+     "s1": {..., "status": up|down|unknown, "available", "http_status", "latency_ms", "reason"},
+     "hosts": {..., "provider_host", "heartbeat_path", "items": [{"name", "roles", "heartbeat_state": fresh|stale|none,
+               "heartbeat": {"received_at", "age_s", "ttl_s", "stale", "jobs": [job]} | null,
+               "hardware": {"cpu_busy_pct", "gpu_busy_pct", "mem_available_bytes", "mem_total_bytes", "chip",
+                            "load_1m", "age_s"} | null}]}}
+
+Section status: `ok`; `partial` (data with some errors); `error` (no data: the source failed or is absent). Host names
+are exec-host slugs; a hardware sample's hostname is matched by an exec host's `hostnames` alias, else by a name equal to
+the hostname or one of its words (`forests-mac-studio` -> studio), never by a guess between two.
+
+**Heartbeat.** `POST /v1/cortados/live/heartbeat` (owner token or a write-only `live:heartbeat` client token):
+
+    {"host": "studio",                 # [a-z][a-z0-9-]{0,31}, the exec-host slug
+     "ttl_s": 900,                     # optional, 60..86400: shown fresh this long, then stale; forgotten after 24 h
+     "jobs": [                         # optional, at most 16, unique names
+       {"name": "s1-continuous",       # [a-z0-9][a-z0-9._-]{0,47}
+        "state": "running",            # running | idle | ok | scheduled | failed | stopped
+        "summary": "sweep 3/8",        # optional, printable ASCII <= 80, no address
+        "progress_pct": 37.5,          # optional, 0..100
+        "started_at": 1794400000, "finished_at": null, "next_at": null}]}   # optional epoch s, within 30 d of now
+
+A post replaces the host's previous one. Refusals: 401 without a token, 403 for a token without the scope, 413 over 8 KiB
+(checked from content-length before reading), 400 naming the bad field (`jobs[0].state`), never echoing its value. The
+board is in memory (16 hosts, LRU): after a provider restart each host shows "no heartbeat yet" until its next post.
+
+How a Studio job would post (documented only: nothing on the Studio is changed by #73). A LaunchAgent running every
+5 minutes, or a line at the end of each s1-continuous cycle, with a `live:heartbeat` token minted on the provider host
+(`python3 -B -m cortados_router.provider.clients add studio --scope live:heartbeat --token-file <path>`) and copied to
+the Studio as `~/.config/cortados/live-heartbeat-token` (0600):
+
+    python3 - <<'PY'
+    import json, os, subprocess, urllib.request
+    def state(label):   # a LaunchAgent's state from launchctl: running when it has a pid
+        out = subprocess.run(["launchctl", "list", label], capture_output=True, text=True)
+        return "stopped" if out.returncode else ("running" if '"PID"' in out.stdout else "idle")
+    body = {"host": "studio", "ttl_s": 900, "jobs": [
+        {"name": "s1-scorer", "state": state("com.cortados.s1-scorer")},
+        {"name": "s1-continuous", "state": state("com.cortados.s1-continuous")}]}
+    tok = open(os.path.expanduser("~/.config/cortados/live-heartbeat-token")).read().strip()
+    url = open(os.path.expanduser("~/.config/cortados/provider-url")).read().strip() + "/v1/cortados/live/heartbeat"
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers={"content-type": "application/json", "authorization": "Bearer " + tok})
+    urllib.request.urlopen(req, timeout=10).read()
+    PY
+
 ## Compaction content store (phase 1, shadow only)
 
 The provider can keep conversation CONTENT on its host (the Air) so compaction labels can be harvested; the owner
