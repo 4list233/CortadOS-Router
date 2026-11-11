@@ -1,6 +1,8 @@
 import { test, expect } from 'claude-code/testing'
-import { FALLBACK, POLL_MS, STALE_AFTER_S, expandHome, resolveProviderUrl, resolveToken, scrub, readConfig, poll,
-  age, pct, gib, leftPct, laneLabel, laneLines, usageLines, deviceLines, laneOrder } from './register'
+import { FALLBACK, POLL_MS, LIVE_POLL_MS, STALE_AFTER_S, expandHome, resolveProviderUrl, resolveToken, scrub, readConfig, poll,
+  pollLive, age, pct, gib, dur, leftPct, laneLabel, laneLines, usageLines, deviceLines, laneOrder, taskLine, conversationLine,
+  runningLines, fleetLines } from './register'
+import liveFixture from './live.fixture'
 
 const TOKEN = 'sekrit-token-123'
 
@@ -26,6 +28,8 @@ function fakeDollar(opts: { env?: Record<string, string>; files?: Record<string,
     calls,
     held: () => state.get('cortados-pulse/held')?.value as any,
     err: () => state.get('cortados-pulse/err')?.value as string | null | undefined,
+    live: () => state.get('cortados-pulse/live')?.value as any,
+    liveErr: () => state.get('cortados-pulse/liveErr')?.value as string | null | undefined,
   }
   return $
 }
@@ -35,6 +39,8 @@ test('defaults commit no address and point the token at the per-machine file', (
   expect(FALLBACK.providerTokenFile).toBe('~/.config/cortados/provider-token')
   expect(FALLBACK.providerToken).toBe('')
   expect(POLL_MS).toBe(20_000)
+  expect(LIVE_POLL_MS).toBe(10_000)
+  expect(POLL_MS % LIVE_POLL_MS).toBe(0)                      // /resources rides every other live tick
   expect(STALE_AFTER_S).toBe(3600)
   expect(readConfig(undefined)).toEqual(FALLBACK)
   expect(readConfig({ providerUrl: 'https://x.example', providerTokenFile: '  ' }).providerTokenFile).toBe(FALLBACK.providerTokenFile)
@@ -250,8 +256,8 @@ test('session.start registers the command, opens the pane, polls once and keeps 
   await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
   expect(registered).toEqual([{ name: 'cortados-pulse', description: 'Open the CortadOS router pulse pane' }])
   expect(opened).toEqual([{ id: 'cortados-pulse', title: 'CortadOS pulse' }])
-  expect(every.map(t => t.ms)).toEqual([POLL_MS])
-  expect($.calls.urls).toEqual(['http://air.example:8432/resources'])
+  expect(every.map(t => t.ms)).toEqual([LIVE_POLL_MS])
+  expect($.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live', 'http://air.example:8432/resources'])
   expect($.held().data.usage.total_routes).toBe(1)
   await hooks['session.start']($, {}, async (e: any) => e)
   expect(every.length).toBe(2)
@@ -259,4 +265,79 @@ test('session.start registers the command, opens the pane, polls once and keeps 
   expect(every[1]!.cancelled).toBe(false)
   expect(await hooks['command.run']($, {})).toEqual({ text: 'CortadOS pulse pane opened.' })
   expect(opened.length).toBe(3)
+})
+
+test('pollLive reads /v1/cortados/live with the Bearer token and keeps the provider base for the dashboard link', async () => {
+  const $ = fakeDollar({ env: { HOME: '/tmp/home', CORTADOS_PROVIDER_URL: 'http://air.example:8432/' },
+    files: { '/tmp/home/.config/cortados/provider-token': TOKEN }, http: () => ({ status: 200, ok: true, headers: {}, text: JSON.stringify(liveFixture) }) })
+  await pollLive($ as any, FALLBACK)
+  expect($.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live'])
+  expect($.calls.inits[0].headers.authorization).toBe('Bearer ' + TOKEN)
+  expect($.live().base).toBe('http://air.example:8432')
+  expect($.live().data.overview.running_tasks).toBe(1)
+  expect($.liveErr()).toBe(null)
+  expect($.held()).toBe(undefined)                            // the /resources snapshot is a separate atom
+})
+
+test('pollLive: an older provider (404) is said as such; 401 and failures are scrubbed like /resources', async () => {
+  const base = { env: { HOME: '/tmp/home', CORTADOS_PROVIDER_URL: 'http://air.example:8432' }, files: { '/tmp/home/.config/cortados/provider-token': TOKEN } }
+  const old = fakeDollar({ ...base, http: () => ({ status: 404, ok: false, headers: {}, text: '' }) })
+  await pollLive(old as any, FALLBACK)
+  expect(old.liveErr()).toBe('this provider has no live view yet (update it to show running work)')
+  const unauth = fakeDollar({ ...base, http: () => ({ status: 401, ok: false, headers: {}, text: '' }) })
+  await pollLive(unauth as any, FALLBACK)
+  expect(unauth.liveErr()).toBe('live: provider rejected the token (HTTP 401): check ~/.config/cortados/provider-token')
+  const thrown = fakeDollar({ ...base, http: () => { throw new Error('refused Bearer ' + TOKEN) } })
+  await pollLive(thrown as any, FALLBACK)
+  expect(thrown.liveErr()).toBe('live: could not read the provider (refused Bearer ***)')
+  const leaky = fakeDollar({ ...base, http: () => ({ status: 200, ok: true, headers: {}, text: JSON.stringify({ tasks: { running: [{ title: TOKEN }] } }) }) })
+  await pollLive(leaky as any, FALLBACK)
+  expect(JSON.stringify(leaky.live()).includes(TOKEN)).toBe(false)
+})
+
+test('elapsed times read at a glance', () => {
+  expect(dur(42)).toBe('42s')
+  expect(dur(125)).toBe('2m 05s')
+  expect(dur(4320)).toBe('1h 12m')
+  expect(dur(2 * 86400 + 3 * 3600)).toBe('2d 3h')
+  expect(dur(null)).toBe('—')
+  expect(dur(-1)).toBe('—')
+  expect(dur(NaN)).toBe('—')
+})
+
+test('the Running section from the provider-generated live snapshot', () => {
+  expect(runningLines(liveFixture as any, 0)).toEqual([
+    '1 running · 1 queued · 3 conversations (2 working)',
+    '● Refactor the scarcity reader · on air · claude-sonnet-5 (claude#b) · tool Bash · 2m 05s',
+    '◷ Check the release page · on air · queued 10m 00s',
+    '▸ Review the diff · gpt-6.1 (codex) · tool Read · 1m 30s',
+    '▸ CortadOS-Router · main session · claude-opus-5 · tool Edit · 15m 00s',
+    '· subagent · qwen3-30b (local-studio) · idle · 30s',
+  ])
+  // elapsed keeps counting between polls
+  expect(runningLines(liveFixture as any, 60)[1]).toMatch(/· 3m 05s$/)
+  expect(fleetLines(liveFixture as any)).toEqual([
+    'S1 up · 23 ms',
+    'lowest left: cursor (shared with Grok Bot) 70% (month (Cursor models: Grok, Composer, Auto))',
+    'air: no heartbeat yet',
+    'studio: s1-scorer running, s1-continuous running 38%',
+    'pro: no heartbeat yet',
+  ])
+})
+
+test('an unreadable section is said, never drawn as nothing running', () => {
+  const lines = runningLines({ overview: { running_tasks: null, queued_tasks: null, active_conversations: 0 },
+    tasks: { status: 'error', errors: [{ source: 'child-tasks.jsonl', error: 'PermissionError' }] },
+    conversations: { status: 'ok', items: [] } } as any, 0)
+  expect(lines).toEqual(['? running · ? queued · 0 conversations', 'tasks unavailable: child-tasks.jsonl: PermissionError'])
+  expect(runningLines({ overview: { running_tasks: 0, queued_tasks: 0, active_conversations: 0, working_conversations: 0 },
+    tasks: { status: 'ok' }, conversations: { status: 'ok', items: [] } } as any, 0))
+    .toEqual(['0 running · 0 queued · 0 conversations (0 working)', 'nothing running'])
+  const many = { overview: {}, tasks: { running: Array.from({ length: 9 }, (_, i) => ({ task_id: 't' + i, state: 'running', elapsed_s: i })) } }
+  expect(runningLines(many as any, 0).slice(-1)).toEqual(['  +3 more tasks'])
+  expect(taskLine({ task_id: 't1', state: 'running' }, 0)).toBe('● task t1 · —')
+  expect(conversationLine({ kind: 'orchestrator', status: 'idle' }, 0)).toBe('· main session · idle')
+  expect(fleetLines({ overview: { s1: 'down' }, s1: { reason: 'URLError' }, hosts: { items: [{ name: 'studio',
+    heartbeat_state: 'stale', heartbeat: { age_s: 1800, jobs: [] } }] } } as any))
+    .toEqual(['S1 DOWN · URLError', 'studio: STALE heartbeat 30 min old · no jobs'])
 })
