@@ -316,6 +316,8 @@ LAUNCH_UNCERTAIN = {
                         "loaded the task's job",
     "LaunchdBootoutFailed": "the task's bookkeeping failed after its launchd job was loaded, and launchctl bootout "
                             "could not confirm the job was stopped",
+    "ChildStopUnconfirmed": "the task's bookkeeping failed after its runner was started; the runner was stopped, but "
+                            "its claude process group could not be confirmed stopped",
 }
 
 
@@ -1088,8 +1090,9 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
             raise StartFailed(exc.kind, _start_where(), "yes", task_id) from None
         # Failure before or in the spawn, with nothing left running: roll back completely (a half-made dir would list
         # forever and could hold a token-bearing settings file). A runner Popen did return is ours to stop first.
-        if runner is not None:
-            _abort_runner(runner, d)
+        if runner is not None and not _abort_runner(runner, d):
+            progress.update(launched="yes", task_id=task_id)
+            raise StartFailed("ChildStopUnconfirmed", _start_where(), "yes", task_id) from None
         shutil.rmtree(d, ignore_errors=True)
         if isinstance(exc, OSError):
             raise TaskError(f"could not start the child task ({type(exc).__name__}: {exc})") from None
@@ -1107,14 +1110,18 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
     except BaseException as exc:
         # Post-spawn failure: a runner (and maybe claude) is live. Stop and reap them before deleting the dir, so no
         # task keeps running undiscoverable.
+        # Only a confirmed stop deletes the record; otherwise it is kept, so the task stays trackable and
+        # cancellable. The reply names the exception TYPE only: its text may quote record content (#94).
         if runner is not None:
-            _abort_runner(runner, d)
-        elif _launchd_bootout(d) != "booted out":
-            # The job may still be loaded and running: keep its record so it stays trackable and cancellable.
-            raise StartFailed("LaunchdBootoutFailed", _start_where(), "yes", task_id) from None
+            if not _abort_runner(runner, d):
+                raise StartFailed("ChildStopUnconfirmed", _start_where(), "yes", task_id) from None
+        else:
+            _launchd_bootout(d)
+            if not _launchd_gone(d):
+                raise StartFailed("LaunchdBootoutFailed", _start_where(), "yes", task_id) from None
         shutil.rmtree(d, ignore_errors=True)
-        raise TaskError(f"child task bookkeeping failed after spawn; the task was stopped ({type(exc).__name__}: "
-                        f"{exc})") from None
+        raise TaskError(f"child task bookkeeping failed after spawn; the task was stopped ({type(exc).__name__})"
+                        ) from None
     if runner is not None:
         _REAP[task_id] = runner
     out = {"task_id": task_id, "state": "running", "dir": d, "permission_mode": permission_mode, "host": target.name,
@@ -1175,33 +1182,59 @@ def _launch_launchd(d: str, env: dict) -> None:
                         "of this execution host?")
 
 
+LAUNCHCTL_NO_SUCH_SERVICE = 113        # launchctl's exit status for "Could not find specified service"
+
+
 def _launchd_bootout(d: str) -> str:
     """Unload a task's one-shot job once it is final (or when a start failed after bootstrap). Idempotent; a job that
-    launchd no longer knows is fine. Returns what happened (recorded in launchd.json)."""
+    launchd no longer knows is fine. Returns what happened (recorded in launchd.json). `booted_out` is persisted only
+    once the job is confirmed gone (bootout succeeded, or `launchctl print` no longer finds the label): after a failed
+    bootout the job may still be loaded, so a later status, cancel or cleanup tries again."""
     rec = _read_json(os.path.join(d, LAUNCHD_FILE))
     if not isinstance(rec, dict) or rec.get("booted_out"):
         return "not a launchd task" if not isinstance(rec, dict) else "already booted out"
+    gone = False
     try:
-        r = subprocess.run([LAUNCHCTL, "bootout", f"{rec['domain']}/{rec['label']}"], capture_output=True, text=True,
-                           timeout=LAUNCHCTL_TIMEOUT_S)
-        note = "booted out" if r.returncode == 0 else f"launchctl bootout exited {r.returncode}: {(r.stderr or '').strip()[-200:]}"
+        target = f"{rec['domain']}/{rec['label']}"
+        r = subprocess.run([LAUNCHCTL, "bootout", target], capture_output=True, text=True, timeout=LAUNCHCTL_TIMEOUT_S)
+        if r.returncode == 0:
+            note, gone = "booted out", True
+        else:
+            note = f"launchctl bootout exited {r.returncode}: {(r.stderr or '').strip()[-200:]}"
+            p = subprocess.run([LAUNCHCTL, "print", target], capture_output=True, text=True,
+                               timeout=LAUNCHCTL_TIMEOUT_S)
+            if p.returncode == LAUNCHCTL_NO_SUCH_SERVICE:
+                note, gone = "not loaded (launchd no longer knows the job)", True
+            else:
+                note += "; the job may still be loaded"
     except (OSError, subprocess.TimeoutExpired, KeyError) as exc:
-        note = f"launchctl bootout failed: {type(exc).__name__}"
-    rec.update(booted_out=True, bootout_note=note)
+        note = f"launchctl bootout failed: {type(exc).__name__}; the job may still be loaded"
+    rec.update(booted_out=gone, bootout_note=note)
     _write_json(os.path.join(d, LAUNCHD_FILE), rec)
     return note
 
 
-def _abort_runner(runner, d: str) -> None:
+def _launchd_gone(d: str) -> bool:
+    """Whether the task's launchd job is confirmed unloaded (as recorded by _launchd_bootout)."""
+    rec = _read_json(os.path.join(d, LAUNCHD_FILE))
+    return isinstance(rec, dict) and rec.get("booted_out") is True
+
+
+# _stop_recorded_child notes that leave the child possibly running (its identity could not be checked, so no signal)
+CHILD_STOP_UNCONFIRMED = ("start time unknown",)
+
+
+def _abort_runner(runner, d: str) -> bool:
     """Stop a runner this process just started: SIGTERM (it stops claude's group itself), then SIGKILL it and claude's
-    recorded group if it does not exit in time."""
+    recorded group if it does not exit in time. True when the stop is confirmed: the runner is reaped and claude's
+    group is gone or was signalled; False when the group was left alone because its identity could not be checked."""
     try:
         runner.terminate()
         runner.wait(timeout=KILL_GRACE_S + 10)
     except subprocess.TimeoutExpired:
         runner.kill()
         runner.wait()
-    _stop_recorded_child(d, 0)
+    return not _stop_recorded_child(d, 0).startswith(CHILD_STOP_UNCONFIRMED)
 
 
 def _run_spec(cwd, max_s, meta, workspace=None, ws_root=None, launchd=False, chrome=False) -> dict:

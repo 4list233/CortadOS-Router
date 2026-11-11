@@ -1059,6 +1059,8 @@ class ChildTaskTests(ChildTaskBase):
         jobs = json.load(open(reg)) if os.path.exists(reg) else {{}}
         mode = os.environ.get("FAKE_LAUNCHCTL_MODE", "run")
         cmd = sys.argv[1]
+        if cmd == "print":
+            sys.exit(0 if sys.argv[-1].rsplit("/", 1)[1] in jobs else 113)
         if cmd == "bootout" and os.environ.get("FAKE_LAUNCHCTL_BOOTOUT") == "fail":
             sys.stderr.write("Boot-out failed: 5: Input/output error\\n"); sys.exit(5)
         if cmd == "bootstrap":
@@ -1276,12 +1278,65 @@ class ChildTaskTests(ChildTaskBase):
         self.assertIn("launchctl bootout could not confirm", text)
         self.assertNotIn("secret-record-content", text)
 
+    def test_a_failed_bootout_is_not_recorded_as_booted_out_and_cancel_retries_it(self):
+        # Review P2: a failed bootout used to persist booted_out=True, so cancel/cleanup skipped launchctl although the
+        # job could still be loaded.
+        self._gui_host(mode="noop")
+        with mock.patch.dict(os.environ, {"FAKE_LAUNCHCTL_BOOTOUT": "fail"}), mock.patch("traceback.print_exc"), \
+                mock.patch.object(ct, "log_event", side_effect=ValueError("secret-record-content")):
+            r, _ = self.call("start_task", task="browse", cwd=self.work, chrome=True)
+        tid, _ = self._uncertain_start(r)
+        rec_path = os.path.join(ct.task_path(tid), ct.LAUNCHD_FILE)
+        rec = _load(rec_path)
+        self.assertFalse(rec["booted_out"])
+        self.assertIn("may still be loaded", rec["bootout_note"])
+        target = f"gui/{os.getuid()}/{ct.LAUNCHD_LABEL_PREFIX}{tid}"
+        self.assertIn(["print", target], self._launchctl_calls())     # absence was checked, and the job was there
+        _, c = self.call("cancel_task", task_id=tid)
+        self.assertTrue(c["cancelled"], c)
+        self.assertIn("booted out", c["note"])
+        self.assertEqual([x for x in self._launchctl_calls() if x[0] == "bootout"], [["bootout", target]] * 2)
+        self.assertTrue(_load(rec_path)["booted_out"])
+
+    def test_a_failed_bootout_of_a_job_launchd_no_longer_knows_counts_as_gone(self):
+        self._gui_host(mode="noop")
+        d = os.path.join(self.tmp, "t")
+        os.makedirs(d)
+        label = ct.LAUNCHD_LABEL_PREFIX + "t"
+        with open(os.path.join(d, ct.LAUNCHD_FILE), "w") as f:
+            json.dump({"label": label, "domain": "gui/1", "booted_out": False}, f)
+        note = ct._launchd_bootout(d)                    # the fake knows no such job: bootout and print exit 113
+        self.assertIn("not loaded", note)
+        self.assertTrue(ct._launchd_gone(d))
+        self.assertEqual(ct._launchd_bootout(d), "already booted out")
+
+    def test_plain_spawn_bookkeeping_failure_with_a_confirmed_stop_leaves_no_task(self):
+        with mock.patch.object(ct, "log_event", side_effect=ValueError("secret-record-content")):
+            r, _ = self.call("start_task", task="t", cwd=self.work)
+        self.assertTrue(r.get("isError"), r)
+        self.assertIn("the task was stopped (ValueError)", r["content"][0]["text"])
+        self.assertNotIn("secret-record-content", r["content"][0]["text"])
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "tasks")), [])
+
+    def test_plain_spawn_bookkeeping_failure_with_an_unconfirmed_child_stop_keeps_the_task(self):
+        # The child group was left alone (its identity could not be checked): not "stopped", and the record stays.
+        unknown = "start time unknown (ps failed); not signalled; the child may still be running"
+        with mock.patch.object(ct, "log_event", side_effect=ValueError("secret-record-content")), \
+                mock.patch.object(ct, "_stop_recorded_child", return_value=unknown) as stop:
+            r, _ = self.call("start_task", task="t", cwd=self.work)
+        stop.assert_called_once()
+        tid, text = self._uncertain_start(r)
+        self.assertIn("could not be confirmed stopped", text)
+        self.assertNotIn("the task was stopped", text)
+        self.assertNotIn("secret-record-content", text)
+
     def test_bookkeeping_failure_after_bootstrap_with_a_clean_bootout_leaves_no_task(self):
         self._gui_host(mode="noop")
-        with mock.patch.object(ct, "log_event", side_effect=ValueError("x")):
+        with mock.patch.object(ct, "log_event", side_effect=ValueError("secret-record-content")):
             r, _ = self.call("start_task", task="browse", cwd=self.work, chrome=True)
         self.assertTrue(r.get("isError"), r)
-        self.assertIn("the task was stopped", r["content"][0]["text"])
+        self.assertIn("the task was stopped (ValueError)", r["content"][0]["text"])
+        self.assertNotIn("secret-record-content", r["content"][0]["text"])
         self.assertEqual(os.listdir(os.path.join(self.tmp, "tasks")), [])
 
     def test_chrome_launchd_task_in_a_workspace_checks_project_settings_in_the_runner(self):
