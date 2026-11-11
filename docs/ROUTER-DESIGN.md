@@ -379,6 +379,11 @@ and live pointer, and `CALIBRATE_VERSION`. Each version's score cache is keyed t
 parameters; candidate versions also on the validation rows, which `temps.json` records too); a changed key moves that version's
 scores, done marker and temperatures aside into `<version>/stale-<stamp>/`. A torn last cache line is cut off on load, so the next
 append starts a fresh line.
+Publishing a sweep setting is a manual step: `s1/promote_sweep.py plan` (a dry run; `--write` publishes) builds the pointer from
+the sweep's own files and refuses a tilted setting (serving applies no tilt: serve.py loads base + adapter + temperatures, and
+core.decide_s1 applies only fail-up and the outward threshold), a setting whose promotion_report did not promote, and a pointer or
+weights changed since the sweep; `check` compares the live scorer's bands with the sweep's per-row record. Example:
+`docs/runbooks/s1-promote-2026-11-11.md`.
 Runtime on the Studio (~2.7 s/row; ~975 rows per pass = ~44 min; ~22 min to fit a candidate version's temperatures on ~470 valid
 rows; tilts reuse the scores): the 6 tilts x 4 alphas request (24 settings) is 5 passes (live 44 min + 4 x 66 min) = ~5.1 h of
 the 6 h window, plus a 30 s gate wait (set `CORTADOS_STUDIO_ACK_WAIT=0` in `data/train-config.env` to skip it; the gate still
