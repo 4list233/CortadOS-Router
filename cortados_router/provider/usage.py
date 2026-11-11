@@ -19,6 +19,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
+from cortados_router import router_db
 from cortados_router.bot_gateway import EXPOSED as _BOT_TOOLS
 
 STALE_AFTER_S = 6 * 3600      # scarcity.reading_freshness's routing default: the dashboard calls stale what routing does
@@ -200,17 +201,19 @@ def read_scarcity_cache(path: Path) -> dict[str, Any]:
     return d
 
 
-def _ro_connect(db_path: Path) -> sqlite3.Connection:
+def _ro_connect(db_path: Path, *, router: bool = False) -> sqlite3.Connection:
     """Read-only connection whose queries are interrupted (sqlite3.OperationalError "interrupted", reported by collect's
-    guard as that source's error) once LEDGER_QUERY_S has passed. One helper so router.db and usage.db share the cap."""
-    c = sqlite3.connect(_ro_uri(db_path), uri=True, timeout=DB_TIMEOUT_S)
+    guard as that source's error) once LEDGER_QUERY_S has passed. One helper so router.db and usage.db share the cap.
+    router=True for router.db: opened through router_db.reader (mode=rw + query_only), never mode=ro, because this
+    process also writes it and a same-process mode=ro reader made core.log_route fail with disk I/O error (#99)."""
+    c = router_db.reader(db_path, DB_TIMEOUT_S) if router else sqlite3.connect(_ro_uri(db_path), uri=True, timeout=DB_TIMEOUT_S)
     deadline = time.monotonic() + LEDGER_QUERY_S
     c.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, _PROGRESS_OPS)   # non-zero: interrupt
     return c
 
 
 def _routed(db_path: Path, now: float) -> dict[str, Any]:
-    c = _ro_connect(db_path)
+    c = _ro_connect(db_path, router=True)
     try:
         day0 = time.mktime(  # local midnight
             time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))
@@ -562,6 +565,10 @@ _HW_CARD = _Obj({**{k: _Hw(_text if k in ("host", "os", "chip") else _number) fo
 _ROUTE = _Obj({"lane": _label, "model": _text, "calls": _number})
 _LEDGER_ROW = _Obj({"lane": _label, "model": _text, "turns": _number, "input_tokens": _number, "output_tokens": _number,
                     "cache_read_tokens": _number, "cache_write_tokens": _number})
+# this process's router.db write failures (router_db.stats): logging a route never fails the request (#99), so this is
+# where a failing log shows besides the provider log
+_ROUTE_LOG_ERRORS = _Obj({"count": _number, "lost": _number, "recovered": _number, "last_error_type": _label,
+                          "last_error_at": _number, "last_op": _enum("log_route", "log_execution", "log_outcome")})
 _COUNTS = lambda cut: _Map(_text, _number, MAP_MAX, cut, merge=_add)   # noqa: E731
 _VIEW = _Obj({
     "generated_at": _number,
@@ -570,7 +577,8 @@ _VIEW = _Obj({
                     "last_7d": _List(_ROUTE, ROUTED_TOP, "last_7d_truncated"),
                     "top_bands_7d": _List(_Obj({"band": _text, "calls": _number}), BAND_TOP, "bands_truncated"),
                     "today_truncated": _bool, "last_7d_truncated": _bool, "bands_truncated": _bool,
-                    "provider_since_start": _Map(_run_key, _number, RUNS_MAX, "provider_since_start_truncated", merge=_add)}),
+                    "provider_since_start": _Map(_run_key, _number, RUNS_MAX, "provider_since_start_truncated", merge=_add),
+                    "route_log_errors": _ROUTE_LOG_ERRORS}),
     "refusals": _Obj({"window": _enum("24h"), "by_reason": _Map(_reason, _number, MAP_MAX, "refusals_truncated", merge=_add),
                       "total": _number}),
     "child_tasks": _Obj({"window": _enum("7d"), "by_event": _COUNTS("by_event_truncated"),
@@ -787,6 +795,7 @@ def _collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], 
     else:
         errors.append({"source": "router.db", "error": "absent"})
         out["routed"] = {}
+    out["routed"]["route_log_errors"] = router_db.stats()   # in-process counters: published even when the db is absent
     if runs_since_start is not None:
         out["routed"]["provider_since_start"] = runs_since_start
         notes.append(_NOTE_RUNS)

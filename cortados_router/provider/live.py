@@ -49,6 +49,7 @@ import time
 from collections import OrderedDict
 from typing import Any, Callable
 
+from cortados_router import router_db
 from cortados_router.provider import office
 
 VERSION = 1
@@ -359,11 +360,28 @@ _CALL_KEYS = ("ts", "task_id", "session_id", "routing_kind", "band", "lane", "mo
               "degraded", "s1_reason", "request_chars", "response_chars")
 
 
-def routed_section(view: dict[str, Any], now: float) -> dict[str, Any]:
+_LOG_OPS = ("log_route", "log_execution", "log_outcome")
+_TYPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,63}")
+
+
+def route_log_errors(stats: Any) -> dict[str, Any] | None:
+    """router_db.stats() re-validated: counts, an exception type name, a time and the op; nothing else (#99)."""
+    if not isinstance(stats, dict):
+        return None
+    count = lambda k: stats.get(k) if isinstance(stats.get(k), int) and not isinstance(stats.get(k), bool) and stats.get(k) >= 0 else 0  # noqa: E731
+    t = stats.get("last_error_type")
+    return {"count": count("count"), "lost": count("lost"), "recovered": count("recovered"),
+            "last_error_type": t if isinstance(t, str) and _TYPE_RE.fullmatch(t) else None,
+            "last_error_at": stats.get("last_error_at") if _num(stats.get("last_error_at")) else None,
+            "last_op": stats.get("last_op") if stats.get("last_op") in _LOG_OPS else None}
+
+
+def routed_section(view: dict[str, Any], now: float, log_errors: dict[str, Any] | None = None) -> dict[str, Any]:
     calls = [{k: t.get(k) for k in _CALL_KEYS} for t in (view.get("tasks") or [])[:ROUTED_MAX]]
     errors = [e for e in view.get("errors") or [] if isinstance(e, dict)]
     return _section(now, _status(errors, bool(calls)), errors, calls=calls, totals=view.get("totals") or {},
-                    row_limit=view.get("row_limit"), more=len(view.get("tasks") or []) > ROUTED_MAX)
+                    row_limit=view.get("row_limit"), more=len(view.get("tasks") or []) > ROUTED_MAX,
+                    route_log_errors=log_errors)
 
 
 def _general(w: dict[str, Any]) -> bool:
@@ -535,7 +553,8 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
             exec_hosts: Callable[[], tuple[dict[str, list[str]], str | None]] | None = None,
             self_host: str | None = None, host_names: list[str] | None = None,
             remote_stubs: Callable[[], list] | None = None,
-            lane_enabled: Callable[[Any], bool] | None = None) -> dict[str, Any]:
+            lane_enabled: Callable[[Any], bool] | None = None,
+            route_log: Callable[[], dict[str, Any]] = router_db.stats) -> dict[str, Any]:
     """The snapshot. Each input is a callable, run under its own guard: one that raises turns ITS section into
     status "error" with the exception's type (never its text: an OSError carries a path), the rest stand."""
     def guard(source: str, fn: Callable[[], Any], errs: list) -> Any:
@@ -561,8 +580,12 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
                       floors=None, items=[], hidden=0)
     tv_errs: list = []
     tv = guard("router.db", tasks_view, tv_errs)
-    routed = routed_section(tv, now) if tv is not None \
-        else _section(now, "error", tv_errs, calls=[], totals={}, row_limit=None, more=False)
+    # this process's failed router.db writes (#99): shown even when the read side failed, which is when they matter most
+    rl_errs: list = []
+    rl = route_log_errors(guard("route log", route_log, rl_errs))
+    routed = routed_section(tv, now, rl) if tv is not None \
+        else _section(now, "error", tv_errs, calls=[], totals={}, row_limit=None, more=False, route_log_errors=rl)
+    routed["errors"] += rl_errs
     u_errs: list = []
     u = guard("usage", usage_view, u_errs)
     subs = subscriptions_section(u, now, lane_enabled) if u is not None else _section(now, "error", u_errs, lanes=[], lowest=None)
@@ -582,6 +605,7 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
         "active_conversations": conv.get("active"), "working_conversations": conv.get("working"),
         "s1": s1["status"], "s1_latency_ms": s1.get("latency_ms"),
         "lowest_subscription": subs.get("lowest"),
+        "route_log_errors": (rl or {}).get("count"),
         "hosts_with_heartbeat": sum(1 for h in hosts["items"] if h["heartbeat_state"] == "fresh"),
         "errors": sum(len(s["errors"]) for s in (tasks, conv, routed, subs, s1, hosts)),
     }

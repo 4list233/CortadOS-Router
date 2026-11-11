@@ -185,7 +185,7 @@ def collect(state_dir: Path) -> dict[str, Any]:
         _share(view["totals"])
         return view
     try:
-        conn = usage._ro_connect(path)
+        conn = usage._ro_connect(path, router=True)   # mode=rw + query_only: see router_db (#99)
         try:
             conn.row_factory = sqlite3.Row
             # Explicit projection: request, context, task_context, engine_error, features and every other
