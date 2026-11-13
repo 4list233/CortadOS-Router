@@ -35,8 +35,9 @@ STRIPPED_ENV = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI
 # local endpoint). That describes the backend's own sandbox, which runs nothing; the model read it as a property of the
 # client's tools and refused a write without calling any ("this session's filesystem is read-only"). The sandbox itself
 # stays read-only (thread/start asks for it and the bridge checks the answer); only the misleading text goes.
+# `agents.enabled=false` is THE lever against the multi-agent tools (see the DISABLED_FEATURES comment).
 CONFIG_OVERRIDES = ("notify=[]", 'web_search="disabled"', "include_environment_context=false", "project_doc_max_bytes=0",
-                    'model_provider="openai"', "include_permissions_instructions=false")
+                    'model_provider="openai"', "include_permissions_instructions=false", "agents.enabled=false")
 # What config/read must show before thread/start (the effective config, every layer merged: config.toml, the -c
 # overrides, a managed requirements.toml). The overrides above are asked for and then checked, because a managed layer
 # wins over -c; chatgpt_base_url is the default backend of the ChatGPT login, the one the subscription bills to.
@@ -53,9 +54,30 @@ EXPECTED_ACCOUNT_TYPE = "chatgpt"
 # `--disable <feature>` for every built-in tool and every integration (brief §B, verified: the tool list Codex then
 # builds is exactly request_user_input plus the dynamic tools). code_mode_host stays ON: dynamic tools are served
 # through it, and with it off the model reports them unavailable.
+#
+# multi_agent covers only the v1 collaboration tools (spawn_agent, wait_agent, ...). The v2 set (spawn_agent,
+# followup_task, send_message, list_agents, interrupt_agent and a tool named `wait`) is chosen per thread by
+# Config::multi_agent_version (codex-cli rust-v0.163.0, core/src/config/mod.rs ~1637-1657):
+#     override = Some(V2)       if features.multi_agent_v2 is enabled
+#              = Some(Disabled) if [agents].enabled is false          (default: true)
+#              = None           otherwise
+#     version  = override.or(model catalog's multi_agent_version).unwrap_or(from features)
+# The model catalog says "v2" for gpt-5.6-sol/terra, the gpt-6 models, gpt-6.1-sol and gpt-daybreak-*, both in the
+# server-fetched models_cache.json AND in the catalog bundled into the binary, so no home edit removes it. With
+# multi_agent_v2 false (its default anyway) and agents.enabled unset, the override is None and the catalog's "v2"
+# wins: that is how a routed gpt-5.6-sol thread ran the v2 `wait` (collabAgentToolCall, senderThreadId = that
+# thread's own id; Air provider log 2026-11-12 23:20, conversation de5e4ecc) even under `--disable multi_agent_v2`.
+# The lever is therefore `-c agents.enabled=false` (CONFIG_OVERRIDES), required to read false in the effective config
+# (check_effective_config). The three --disable flags of the family stay: a home's `features.multi_agent_v2 = true`
+# would otherwise force V2 ahead of agents.enabled (the first branch above), and the two under-development members
+# (agent_message_board, multi_agent_v2_dynamic_tools) must not be turned on behind the check. token_budget ("under
+# development" in `codex features list` on 0.163.0) is disabled the same way: it is no tool the bridge serves.
+# config/read on 0.163.0 reports all of them false and agents.enabled false (origin sessionFlags) under this command
+# line (tests/fixtures/codex-config-read-0.163.0.json).
 DISABLED_FEATURES = ("shell_tool", "unified_exec", "unified_exec_tty", "view_image", "image_generation", "apps",
-                     "plugins", "hooks", "multi_agent", "sleep_tool", "skill_search", "tool_suggest", "goals",
-                     "memories", "browser_use", "computer_use", "collaboration_modes")
+                     "plugins", "hooks", "multi_agent", "multi_agent_v2", "multi_agent_v2_dynamic_tools",
+                     "agent_message_board", "token_budget", "sleep_tool", "skill_search", "tool_suggest",
+                     "goals", "memories", "browser_use", "computer_use", "collaboration_modes")
 # `--enable <feature>`: the one feature the dynamic tools need. A home whose config turns it off would start a thread
 # whose advertised client tools cannot run (the first spike, with it off: "Read tool is unavailable"), so it is asked
 # for on the command line and checked in the effective config like the disabled ones.
@@ -77,9 +99,16 @@ DEFAULT_EXEC_YIELD_MS = 1800 * 1000         # server.TURN_TIMEOUT_S's default, f
 EXEC_YIELD_KEY = "default_exec_yield_time_ms"
 EXEC_YIELD_PATH = ("features", "code_mode", EXEC_YIELD_KEY)
 EXEC_YIELD_NAME = ".".join(EXEC_YIELD_PATH)
+# Reasoning efforts turn/start must never carry. "ultra" is described by Codex as "automatic task delegation": the model
+# hands parts of the turn to Codex's own sub-agents, a built-in this bridge must never run. route["effort"] comes from
+# the routing table unchecked, so codex_bridge refuses these before turn/start (compared lower-case).
+REFUSED_EFFORTS = frozenset({"ultra"})
 # Thread items that only a built-in tool produces: their appearance means isolation failed (brief §A.11, plus `sleep`
 # and `imageGeneration`, the items of the sleep_tool and image_generation features: the invariant is "no built-in ran",
 # so every ThreadItem variant a built-in produces is listed, whether or not its feature flag is expected to hold).
+# A leaked item is fatal whatever thread it names: each session owns its own app-server with exactly one thread, so an
+# item of another thread can only come from a thread this one spawned (a multi-agent child running built-ins on its
+# behalf), never from another conversation. Filtering by threadId would hide exactly that case.
 LEAKED_ITEMS = frozenset({"commandExecution", "fileChange", "mcpToolCall", "webSearch", "imageView",
                           "collabAgentToolCall", "subAgentActivity", "sleep", "imageGeneration"})
 # The one mcpToolCall that is not a leak: Codex's own MCP *resource* tools (server "codex"), which it registers
@@ -148,6 +177,13 @@ def _log_yield_unreported() -> None:
                        "the command-line override alone", EXEC_YIELD_NAME)
 
 
+def _feature_off(value: Any) -> bool:
+    """A feature the effective config shows as off: `false`, or a typed feature table (multi_agent_v2's
+    `[features.multi_agent_v2]`, token_budget's, code_mode's) whose `enabled` is false. Anything else, absent
+    included, counts as on: an unreported feature falls back to a default this check cannot see."""
+    return value is False or (isinstance(value, dict) and value.get("enabled") is False)
+
+
 def check_effective_config(cfg: dict[str, Any], exec_yield_ms: int = DEFAULT_EXEC_YIELD_MS) -> None:
     """Refuse an effective config (config/read, every layer merged) under which the thread would not be the isolated
     subscription thread this bridge promises. Runs before thread/start, which is when MCP servers are started, so a
@@ -180,9 +216,15 @@ def check_effective_config(cfg: dict[str, Any], exec_yield_ms: int = DEFAULT_EXE
         bad.append(f"MCP servers still enabled: {enabled} (declared in a form the config.toml reader could not disable, "
                    f"or by a config layer outside it)")
     features = cfg.get("features") or {}
-    on = sorted(f for f in DISABLED_FEATURES if (features.get(f) if isinstance(features, dict) else None) is not False)
+    on = sorted(f for f in DISABLED_FEATURES if not _feature_off(features.get(f) if isinstance(features, dict) else None))
     if on:
         bad.append(f"built-in tool features still enabled: {on}")
+    agents = cfg.get("agents")
+    if not (isinstance(agents, dict) and agents.get("enabled") is False):
+        # Unset (null), an empty table or enabled = true leaves Config::multi_agent_version without an override, and
+        # the model catalog's multi_agent_version ("v2" for gpt-5.6-sol and later) then builds the multi-agent tools.
+        bad.append(f"agents={json.dumps(agents)} (expected agents.enabled=false: otherwise the model catalog's "
+                   f"multi_agent_version decides, and \"v2\" models get Codex's own spawn_agent/wait tools)")
     off = sorted(f for f in ENABLED_FEATURES if (features.get(f) if isinstance(features, dict) else None) is not True)
     if off:
         bad.append(f"features the dynamic tools need are off: {off}")
