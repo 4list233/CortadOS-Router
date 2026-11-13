@@ -25,8 +25,20 @@ from cortados_router.provider.bridge import STRIPPED_ENV as CLAUDE_STRIPPED_ENV,
 
 logger = logging.getLogger(__name__)
 
-# OPENAI_BASE_URL would point the built-in openai provider at another endpoint.
+# OPENAI_BASE_URL would point the built-in openai provider at another endpoint. The named minimum (scarcity and the
+# tests cite it); STRIPPED_ENV_PREFIXES below removes these and every other variable of the same families.
 STRIPPED_ENV = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BASE_URL") + CLAUDE_STRIPPED_ENV
+# Stripped by prefix, not by an exact list (#84): a vendor variable added in a later CLI release passes an exact list
+# unseen. One reason per prefix:
+STRIPPED_ENV_PREFIXES = (
+    "OPENAI_",      # keys, base URLs, org/project ids of the openai provider: would bill or redirect off the home's login
+    "CODEX_",       # Codex's own overrides (API key, access token, sandbox and config knobs): only the home decides
+    "ANTHROPIC_",   # the provider's own client env (base URL, auth token, custom headers): would leak this endpoint
+    "CLAUDE_",      # Claude CLI logins and config dirs (CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CONFIG_DIR): not the child's
+)
+# Kept despite its prefix, because the bridge sets it on purpose: CODEX_HOME names the one home whose auth.json and
+# config.toml the child runs on (child_env sets it; codex_bridge resolves it). Add a variable here only with its reason.
+ALLOWED_ENV = frozenset({"CODEX_HOME"})
 # `-c key=value` overrides (brief §B): no desktop notifications, no web search, no environment/project context in the
 # prompt (the client's system prompt is the whole prompt; project docs would read the scratch cwd anyway), and the
 # built-in openai provider, so a `model_provider` the home's config.toml sets (a mirror, another billing account)
@@ -342,11 +354,19 @@ def command_line(prefix: list[str], codex_home: str, exec_yield_ms: int = DEFAUL
     return args
 
 
+def stripped(name: str) -> bool:
+    """True when `name` is kept out of the Codex child's environment (STRIPPED_ENV, STRIPPED_ENV_PREFIXES, less
+    ALLOWED_ENV). Prefixes are matched case-sensitively, as the vendors read them."""
+    if name in ALLOWED_ENV:
+        return False
+    return name in STRIPPED_ENV or name.startswith(STRIPPED_ENV_PREFIXES)
+
+
 def child_env(home: str) -> dict[str, str]:
-    """The child's environment: STRIPPED_ENV removed and CODEX_HOME set to the one absolute home this process read
-    config.toml from (dedicated, inherited or the user's own), so both readers name the same directory whatever
-    the child's cwd. The home is never copied: a throwaway one has no login, and a copied auth.json would spend the
-    single-use refresh token."""
-    env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
+    """The child's environment: STRIPPED_ENV and every STRIPPED_ENV_PREFIXES variable removed except ALLOWED_ENV, and
+    CODEX_HOME set to the one absolute home this process read config.toml from (dedicated, inherited or the user's
+    own), so both readers name the same directory whatever the child's cwd. The home is never copied: a throwaway one
+    has no login, and a copied auth.json would spend the single-use refresh token."""
+    env = {k: v for k, v in os.environ.items() if not stripped(k)}
     env["CODEX_HOME"] = home
     return env
