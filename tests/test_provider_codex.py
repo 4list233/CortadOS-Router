@@ -418,6 +418,14 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertIn("commandExecution", message)
         self.assertEqual(self.reg.sessions, {})
 
+    def test_a_collab_agent_tool_call_from_another_thread_is_still_a_502(self):
+        # The live failure of 2026-11-12 (multi-agent v2 `wait`). Each session owns its app-server and one thread, so
+        # an item naming another thread is one this thread spawned: never filtered out, always an isolation failure.
+        code, message = self.error_of({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "leak collab"}]})
+        self.assertEqual(code, 502)
+        self.assertIn("collabAgentToolCall", message)
+        self.assertEqual(self.reg.sessions, {})
+
     def test_an_mcp_server_starting_is_an_isolation_failure(self):
         os.environ["FAKE_CODEX_LEAK_MCP"] = "1"
         code, message = self.error_of({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
@@ -481,7 +489,8 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertEqual(argv[0], "app-server")
         disabled = [argv[i + 1] for i, a in enumerate(argv) if a == "--disable"]
         for feature in ("shell_tool", "unified_exec", "unified_exec_tty", "view_image", "image_generation", "apps",
-                        "plugins", "hooks", "multi_agent", "sleep_tool", "skill_search", "tool_suggest", "goals",
+                        "plugins", "hooks", "multi_agent", "multi_agent_v2", "multi_agent_v2_dynamic_tools",
+                        "agent_message_board", "sleep_tool", "skill_search", "tool_suggest", "goals",
                         "memories", "browser_use", "computer_use", "collaboration_modes"):
             self.assertIn(feature, disabled)
         self.assertNotIn("code_mode_host", disabled)                    # dynamic tools are served through it
@@ -968,6 +977,26 @@ class CodexSessionUnitTests(unittest.TestCase):
                 self.session(codex_home=home)
             self.assertEqual(os.listdir(self.scratch), ["codex-home"])  # the scratch dir of the refused session is gone
 
+    def test_multi_agent_v2_must_be_off_in_the_effective_config(self):
+        # The command line before this fix: multi_agent (v1) off, multi_agent_v2 unset. config/read then omits it and
+        # the model catalog's multi_agent_version ("v2" for gpt-5.6-sol) decides: refused.
+        base = {"model_provider": "openai", "model_providers": {}, "chatgpt_base_url": "https://chatgpt.com/backend-api/",
+                "openai_base_url": None, "model_catalog_json": None, "web_search": "disabled", "project_doc_max_bytes": 0,
+                "notify": [], "include_environment_context": False, "include_permissions_instructions": False,
+                "mcp_servers": {}}
+        feats = {**{f: False for f in codex_isolation.DISABLED_FEATURES}, "code_mode_host": True,
+                 "code_mode": {"default_exec_yield_time_ms": codex_isolation.DEFAULT_EXEC_YIELD_MS}}
+        codex_isolation.check_effective_config(dict(base, features=feats))
+        for missing in ("multi_agent_v2", "multi_agent_v2_dynamic_tools", "agent_message_board"):
+            without = {k: v for k, v in feats.items() if k != missing}
+            with self.assertRaisesRegex(BridgeError, f"built-in tool features still enabled: \\['{missing}'\\]"):
+                codex_isolation.check_effective_config(dict(base, features=without))
+        # The typed table form ([features.multi_agent_v2]) counts as off only with enabled = false.
+        codex_isolation.check_effective_config(dict(base, features=dict(feats, multi_agent_v2={"enabled": False})))
+        for on in ({"enabled": True}, {"max_concurrent_threads_per_session": 2}, True, None):
+            with self.assertRaisesRegex(BridgeError, "multi_agent_v2"):
+                codex_isolation.check_effective_config(dict(base, features=dict(feats, multi_agent_v2=on)))
+
     def test_leaked_items_include_the_sleep_and_image_generation_tools(self):
         s = object.__new__(codex_bridge.CodexSession)                    # _note_notification needs no process
         s.dir = Path(tempfile.gettempdir()) / "cortados-codex-unit"   # the scratch dir names_scratch checks
@@ -1280,13 +1309,18 @@ class CodexSessionUnitTests(unittest.TestCase):
                 del os.environ["FAKE_CODEX_CONFIG_PATCH"]
 
     def test_the_real_0_163_0_config_read_reports_the_yield_under_features_and_passes_the_check(self):
-        # Captured on the provider host (codex-cli 0.163.0, throwaway CODEX_HOME, no login, no thread or turn).
+        # Captured on the provider host (codex-cli 0.163.0, throwaway CODEX_HOME, no login, no thread or turn), last
+        # on 2026-11-12 under the bridge's full command line (codex_isolation.command_line).
         capture = json.loads(Path(__file__).with_name("fixtures").joinpath("codex-config-read-0.163.0.json").read_text())
         cfg = capture["response"]["result"]["config"]
-        # The capture predates the include_permissions_instructions=false override; it shows 0.163.0 has the key (at
-        # its default, true), so the override applies there as it does on 0.166.0. Applied here as -c would apply it.
-        self.assertIs(cfg["include_permissions_instructions"], True)
-        cfg["include_permissions_instructions"] = False
+        with tempfile.TemporaryDirectory() as home:
+            self.assertEqual(capture["_capture"]["argv"][1:], codex_isolation.command_line([], home))
+        self.assertIs(cfg["include_permissions_instructions"], False)
+        # Every multi-agent feature reads false under the command line, multi_agent_v2 included (its origin is the
+        # typed table's `enabled` key): the real shape passes the check that refuses an unset multi_agent_v2.
+        for f in ("multi_agent", "multi_agent_v2", "multi_agent_v2_dynamic_tools", "agent_message_board"):
+            self.assertIs(cfg["features"].get(f), False, f)
+        self.assertIn("features.multi_agent_v2.enabled", capture["response"]["result"]["origins"])
         self.assertEqual(cfg["features"]["code_mode"], {"default_exec_yield_time_ms": 1800000})
         self.assertNotIn("code_mode", cfg)                                # the top-level table is not a 0.163.0 key
         self.assertIn("features.code_mode.default_exec_yield_time_ms", capture["response"]["result"]["origins"])

@@ -26,6 +26,9 @@ integers from 0, replies echo the client's string ids. Triggers on the text of t
                    served after them, in order;
   "fail"           turn/completed with status failed and codexErrorInfo usageLimitExceeded;
   "leak builtin"   an item/started carrying a commandExecution item (a built-in tool ran), then a normal completion;
+  "leak collab"    an item/started carrying a collabAgentToolCall item (the multi-agent v2 `wait`, as captured live on
+                   2026-11-12) on a notification whose threadId and senderThreadId are NOT this thread's id, then a
+                   normal completion;
   "reroute"        a model/rerouted notification (Codex moved the turn to another model), then "echo: <text>";
   "ask user"       an item/tool/requestUserInput server request, then "echo: <text>";
   otherwise        "echo: <text>".
@@ -59,7 +62,8 @@ ENV_KEYS = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BAS
             "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CODEX_HOME")
 # Every tool feature the real registry knows; `--disable` turns one off, the rest keep their stable default (on).
 FEATURES = ("shell_tool", "unified_exec", "unified_exec_tty", "view_image", "image_generation", "apps", "plugins", "hooks",
-            "multi_agent", "sleep_tool", "skill_search", "tool_suggest", "goals", "memories", "browser_use", "computer_use",
+            "multi_agent", "multi_agent_v2", "multi_agent_v2_dynamic_tools", "agent_message_board", "sleep_tool",
+            "skill_search", "tool_suggest", "goals", "memories", "browser_use", "computer_use",
             "collaboration_modes", "code_mode_host")
 
 
@@ -209,6 +213,14 @@ def run_turn(mid, params):
         return
     if "leak builtin" in text:
         item(turn_id, "item/started", {"type": "commandExecution", "id": "cmd-1", "command": "ls", "status": "inProgress"})
+        completed(turn_id, "completed")
+        return
+    if "leak collab" in text:
+        notify("item/started", {"threadId": "01a1d316-other-thread", "turnId": turn_id,
+                                "item": {"type": "collabAgentToolCall", "id": "call_collab", "tool": "wait",
+                                         "status": "inProgress", "senderThreadId": "01a1d316-other-thread",
+                                         "receiverThreadIds": [], "prompt": None, "model": None,
+                                         "reasoningEffort": None, "agentsStates": {}}})
         completed(turn_id, "completed")
         return
     if "reroute" in text:

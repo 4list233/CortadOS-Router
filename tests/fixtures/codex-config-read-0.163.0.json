@@ -1,7 +1,7 @@
 {
  "_capture": {
   "cli": "codex-cli 0.163.0 (darwin arm64, the provider host)",
-  "date": "2026-11-02",
+  "date": "2026-11-12",
   "how": "codex app-server under a throwaway CODEX_HOME (no login), stdio JSON-RPC: initialize, initialized, config/read {}; no thread, no turn, no model call",
   "argv": [
    "codex",
@@ -16,6 +16,8 @@
    "project_doc_max_bytes=0",
    "-c",
    "model_provider=\"openai\"",
+   "-c",
+   "include_permissions_instructions=false",
    "-c",
    "features.code_mode.default_exec_yield_time_ms=1800000",
    "--disable",
@@ -36,6 +38,12 @@
    "hooks",
    "--disable",
    "multi_agent",
+   "--disable",
+   "multi_agent_v2",
+   "--disable",
+   "multi_agent_v2_dynamic_tools",
+   "--disable",
+   "agent_message_board",
    "--disable",
    "sleep_tool",
    "--disable",
@@ -58,7 +66,7 @@
   "note": "With -c code_mode.default_exec_yield_time_ms=1800000 (top-level table) instead, the same CLI sent configWarning \"session-flags: `code_mode` is ignored.\" and config/read had no code_mode key: the table lives under features."
  },
  "response": {
-  "id": "c-2",
+  "id": 2,
   "result": {
    "config": {
     "model": null,
@@ -87,60 +95,18 @@
     "browser_use": null,
     "computer_use": null,
     "desktop": null,
-    "include_environment_context_time": true,
-    "profiles": {},
-    "history": {
-     "persistence": "save-all",
-     "max_bytes": null
-    },
-    "auto_review": null,
-    "notify": [],
-    "include_environment_context": false,
-    "mcp_servers": {},
-    "project_doc_max_bytes": 0,
-    "sqlite_home": null,
-    "show_raw_agent_reasoning": null,
-    "experimental_realtime_ws_model": null,
-    "orchestrator": null,
-    "tool_suggest": null,
-    "otel": null,
-    "allow_login_shell": true,
-    "experimental_compact_prompt_file": null,
-    "shell_environment_policy": {
-     "inherit": null,
-     "ignore_default_excludes": null,
-     "exclude": null,
-     "set": null,
-     "include_only": null,
-     "filters": null,
-     "experimental_use_profile": null
-    },
-    "default_permissions": null,
-    "file_opener": "vscode",
-    "marketplaces": {},
-    "disable_paste_burst": null,
-    "model_providers": {},
-    "model_post_turn_compact_threshold_percent": null,
-    "cloud": null,
-    "allow_symlinked_codex_home": null,
-    "experimental_realtime_ws_startup_context": null,
+    "mcp_oauth_credentials_store": "auto",
     "agents": null,
-    "hooks": null,
-    "model_instructions_file": null,
-    "mcp_enterprise_managed_auth": null,
-    "experimental_realtime_webrtc_call_base_url": null,
-    "daybreak": null,
-    "include_permissions_instructions": true,
-    "skills": null,
     "log_dir": null,
-    "windows": null,
     "features": {
      "code_mode": {
       "default_exec_yield_time_ms": 1800000
      },
      "code_mode_host": true,
+     "multi_agent_v2": false,
      "sleep_tool": false,
      "network_proxy": null,
+     "agent_message_board": false,
      "apps": false,
      "browser_use": false,
      "collaboration_modes": false,
@@ -150,6 +116,7 @@
      "image_generation": false,
      "memories": false,
      "multi_agent": false,
+     "multi_agent_v2_dynamic_tools": false,
      "plugins": false,
      "shell_tool": false,
      "skill_search": false,
@@ -168,190 +135,258 @@
      "remote_plugin": true,
      "windows_sandbox_service": false
     },
-    "apps_mcp_product_sku": null,
-    "include_collaboration_mode_instructions": true,
-    "ghost_snapshot": null,
-    "experimental_use_unified_exec_tool": null,
-    "model_catalog_json": null,
-    "audio": null,
-    "include_apps_instructions": true,
-    "openai_base_url": null,
-    "js_repl_node_module_dirs": null,
-    "chatgpt_base_url": "https://chatgpt.com/backend-api/",
-    "thread_unload_delay_secs": null,
-    "cli_auth_credentials_store": "file",
-    "memories": null,
-    "tool_output_token_limit": null,
-    "mcp_oauth_callback_port": null,
-    "plugins": {},
-    "experimental_realtime_ws_backend_prompt": null,
-    "mcp_oauth_credentials_store": "auto",
-    "realtime": null,
-    "permissions": null,
-    "plan_mode_reasoning_effort": null,
-    "background_terminal_max_timeout": 300000,
-    "personality": null,
-    "experimental_realtime_ws_base_url": null,
-    "js_repl_node_path": null,
-    "oss_provider": null,
-    "tui": null,
     "experimental_thread_store": null,
-    "feedback": null,
-    "hide_agent_reasoning": false,
     "mcp_oauth_callback_url": null,
-    "notice": null,
-    "projects": null,
-    "project_doc_fallback_filenames": [],
+    "model_providers": {},
     "responses_api_metadata": null,
-    "mcp_optional_startup_grace_ms": null,
+    "tui": null,
+    "experimental_realtime_ws_startup_context": null,
+    "memories": null,
+    "marketplaces": {},
+    "sqlite_home": null,
+    "disable_paste_burst": null,
+    "windows": null,
+    "shell_environment_policy": {
+     "inherit": null,
+     "ignore_default_excludes": null,
+     "exclude": null,
+     "set": null,
+     "include_only": null,
+     "filters": null,
+     "experimental_use_profile": null
+    },
+    "orchestrator": null,
+    "thread_unload_delay_secs": null,
     "profile": null,
-    "experimental_realtime_start_instructions": null,
-    "experimental_thread_store_endpoint": null,
-    "suppress_unstable_features_warning": null,
-    "goals": null,
     "project_root_markers": [
      ".git"
     ],
+    "audio": null,
+    "experimental_use_unified_exec_tool": null,
+    "experimental_realtime_ws_model": null,
+    "mcp_servers": {},
+    "project_doc_max_bytes": 0,
+    "js_repl_node_path": null,
+    "show_raw_agent_reasoning": null,
+    "experimental_realtime_start_instructions": null,
+    "suppress_unstable_features_warning": null,
+    "file_opener": "vscode",
+    "hide_agent_reasoning": false,
+    "plan_mode_reasoning_effort": null,
+    "tool_output_token_limit": null,
+    "plugins": {},
+    "notice": null,
+    "allow_login_shell": true,
+    "daybreak": null,
+    "profiles": {},
+    "personality": null,
+    "otel": null,
+    "include_apps_instructions": true,
+    "experimental_compact_prompt_file": null,
+    "hooks": null,
+    "chatgpt_base_url": "https://chatgpt.com/backend-api/",
+    "experimental_realtime_ws_base_url": null,
+    "ghost_snapshot": null,
+    "cloud": null,
+    "feedback": null,
+    "include_environment_context_time": true,
+    "oss_provider": null,
+    "js_repl_node_module_dirs": null,
+    "model_instructions_file": null,
+    "experimental_realtime_ws_backend_prompt": null,
+    "allow_symlinked_codex_home": null,
+    "include_environment_context": false,
+    "default_permissions": null,
+    "openai_base_url": null,
+    "notify": [],
+    "mcp_enterprise_managed_auth": null,
+    "mcp_oauth_callback_port": null,
+    "project_doc_fallback_filenames": [],
+    "include_permissions_instructions": false,
+    "include_collaboration_mode_instructions": true,
+    "apps_mcp_product_sku": null,
+    "auto_review": null,
+    "history": {
+     "persistence": "save-all",
+     "max_bytes": null
+    },
+    "mcp_optional_startup_grace_ms": null,
+    "background_terminal_max_timeout": 300000,
+    "model_catalog_json": null,
+    "cli_auth_credentials_store": "file",
+    "realtime": null,
+    "experimental_thread_store_endpoint": null,
+    "tool_suggest": null,
+    "projects": null,
+    "goals": null,
+    "skills": null,
+    "model_post_turn_compact_threshold_percent": null,
+    "permissions": null,
+    "experimental_realtime_webrtc_call_base_url": null,
     "check_for_update_on_startup": null
    },
    "origins": {
-    "include_environment_context": {
+    "features.view_image": {
      "name": {
       "type": "sessionFlags"
      },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
     },
-    "features.code_mode_host": {
+    "features.multi_agent_v2.enabled": {
      "name": {
       "type": "sessionFlags"
      },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "features.shell_tool": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "features.code_mode.default_exec_yield_time_ms": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
     },
     "features.computer_use": {
      "name": {
       "type": "sessionFlags"
      },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "web_search": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "features.multi_agent": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "features.apps": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "features.goals": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "features.view_image": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "features.plugins": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "features.image_generation": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "features.sleep_tool.enabled": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "features.unified_exec": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "features.collaboration_modes": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "model_provider": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "features.skill_search": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
     },
     "project_doc_max_bytes": {
      "name": {
       "type": "sessionFlags"
      },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
     },
-    "features.browser_use": {
+    "features.multi_agent_v2_dynamic_tools": {
      "name": {
       "type": "sessionFlags"
      },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "features.memories": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "features.unified_exec_tty": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
-    },
-    "features.tool_suggest": {
-     "name": {
-      "type": "sessionFlags"
-     },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
     },
     "features.hooks": {
      "name": {
       "type": "sessionFlags"
      },
-     "version": "sha256:0aeb1112be11ef3e8822288ee2e7ea0304a0e58b112702364db027301ca8e347"
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.shell_tool": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.apps": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.unified_exec": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.tool_suggest": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.multi_agent": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.image_generation": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.memories": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "web_search": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.unified_exec_tty": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "include_permissions_instructions": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.skill_search": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.code_mode.default_exec_yield_time_ms": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "model_provider": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.collaboration_modes": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.code_mode_host": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.goals": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "include_environment_context": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.browser_use": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.plugins": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.agent_message_board": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
+    },
+    "features.sleep_tool.enabled": {
+     "name": {
+      "type": "sessionFlags"
+     },
+     "version": "sha256:ab6370e873aa7a9d41001dd466f287b356f3c07cb11edc496939989d722aca43"
     }
    }
   }

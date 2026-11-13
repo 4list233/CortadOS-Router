@@ -53,8 +53,19 @@ EXPECTED_ACCOUNT_TYPE = "chatgpt"
 # `--disable <feature>` for every built-in tool and every integration (brief §B, verified: the tool list Codex then
 # builds is exactly request_user_input plus the dynamic tools). code_mode_host stays ON: dynamic tools are served
 # through it, and with it off the model reports them unavailable.
+#
+# multi_agent covers only the v1 collaboration tools (spawn_agent, wait_agent, ...). The v2 set (spawn_agent,
+# followup_task, send_message, list_agents, interrupt_agent and a tool named `wait`) is its own feature, multi_agent_v2:
+# off in `codex features list`, but the server-fetched model catalog (models_cache.json) carries a per-model
+# multi_agent_version, and gpt-5.6-sol, gpt-5.6-terra and the gpt-6 models say "v2". With only multi_agent disabled, a
+# routed gpt-5.6-sol thread ran the v2 `wait` (collabAgentToolCall item, senderThreadId = that thread's own id; Air
+# provider log 2026-11-12 23:20, conversation de5e4ecc). multi_agent_v2 is therefore disabled explicitly, together
+# with the two under-development features of the same family (agent_message_board, multi_agent_v2_dynamic_tools),
+# which no config may turn on behind the check. config/read on 0.163.0 reports all three as false under these flags
+# (origin `features.multi_agent_v2.enabled`: the v2 feature is a typed table, see _feature_off).
 DISABLED_FEATURES = ("shell_tool", "unified_exec", "unified_exec_tty", "view_image", "image_generation", "apps",
-                     "plugins", "hooks", "multi_agent", "sleep_tool", "skill_search", "tool_suggest", "goals",
+                     "plugins", "hooks", "multi_agent", "multi_agent_v2", "multi_agent_v2_dynamic_tools",
+                     "agent_message_board", "sleep_tool", "skill_search", "tool_suggest", "goals",
                      "memories", "browser_use", "computer_use", "collaboration_modes")
 # `--enable <feature>`: the one feature the dynamic tools need. A home whose config turns it off would start a thread
 # whose advertised client tools cannot run (the first spike, with it off: "Read tool is unavailable"), so it is asked
@@ -80,6 +91,9 @@ EXEC_YIELD_NAME = ".".join(EXEC_YIELD_PATH)
 # Thread items that only a built-in tool produces: their appearance means isolation failed (brief §A.11, plus `sleep`
 # and `imageGeneration`, the items of the sleep_tool and image_generation features: the invariant is "no built-in ran",
 # so every ThreadItem variant a built-in produces is listed, whether or not its feature flag is expected to hold).
+# A leaked item is fatal whatever thread it names: each session owns its own app-server with exactly one thread, so an
+# item of another thread can only come from a thread this one spawned (a multi-agent child running built-ins on its
+# behalf), never from another conversation. Filtering by threadId would hide exactly that case.
 LEAKED_ITEMS = frozenset({"commandExecution", "fileChange", "mcpToolCall", "webSearch", "imageView",
                           "collabAgentToolCall", "subAgentActivity", "sleep", "imageGeneration"})
 # The one mcpToolCall that is not a leak: Codex's own MCP *resource* tools (server "codex"), which it registers
@@ -148,6 +162,13 @@ def _log_yield_unreported() -> None:
                        "the command-line override alone", EXEC_YIELD_NAME)
 
 
+def _feature_off(value: Any) -> bool:
+    """A feature the effective config shows as off: `false`, or a typed feature table (multi_agent_v2's
+    `[features.multi_agent_v2]`, code_mode's) whose `enabled` is false. Anything else, absent included, counts as on:
+    an unreported feature falls back to its default, and for multi_agent_v2 that default is the model catalog's."""
+    return value is False or (isinstance(value, dict) and value.get("enabled") is False)
+
+
 def check_effective_config(cfg: dict[str, Any], exec_yield_ms: int = DEFAULT_EXEC_YIELD_MS) -> None:
     """Refuse an effective config (config/read, every layer merged) under which the thread would not be the isolated
     subscription thread this bridge promises. Runs before thread/start, which is when MCP servers are started, so a
@@ -180,7 +201,7 @@ def check_effective_config(cfg: dict[str, Any], exec_yield_ms: int = DEFAULT_EXE
         bad.append(f"MCP servers still enabled: {enabled} (declared in a form the config.toml reader could not disable, "
                    f"or by a config layer outside it)")
     features = cfg.get("features") or {}
-    on = sorted(f for f in DISABLED_FEATURES if (features.get(f) if isinstance(features, dict) else None) is not False)
+    on = sorted(f for f in DISABLED_FEATURES if not _feature_off(features.get(f) if isinstance(features, dict) else None))
     if on:
         bad.append(f"built-in tool features still enabled: {on}")
     off = sorted(f for f in ENABLED_FEATURES if (features.get(f) if isinstance(features, dict) else None) is not True)
