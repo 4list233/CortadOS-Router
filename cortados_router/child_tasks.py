@@ -24,7 +24,7 @@ The runner (`python3 -m cortados_router.child_tasks --run <dir>`) is a detached 
 the child survives the MCP server (the desktop app may restart it) and cancel_task can signal exactly that process group.
 
 Execution host (owner decision 2026-11-08, #89/#86): the child runs on the configured host (exec_hosts.py; default the
-Air), not necessarily on the machine running this server. When that host is another machine, start() forwards the
+Air; host "here" is the machine running this server, 2026-11-13), not necessarily on the machine running this server. When that host is another machine, start() forwards the
 request over ssh to this same module in --remote mode there, and keeps a stub (<task_id>/remote.json) so status, wait,
 list and cancel know where to ask. On the host, a task gets a workspace under <root>/active/<task_id> (workspaces.py:
 a git worktree of repos/<name>, or a plain folder) that the runner prepares before the child starts and settles
@@ -533,10 +533,11 @@ def pin_model(name) -> str:
         raise TaskError(str(exc)) from None
 
 
-def claude_bin() -> str:
-    """The claude executable: CORTADOS_CHILD_CLAUDE_BIN, else `claude` on PATH. The desktop app starts MCP servers with
-    a thin PATH, so a missing binary is reported (with the variable to set) instead of failing inside the runner."""
-    name = os.environ.get("CORTADOS_CHILD_CLAUDE_BIN") or "claude"
+def claude_bin(host_claude=None) -> str:
+    """The claude executable: CORTADOS_CHILD_CLAUDE_BIN, else the local host entry's `claude` (`host_claude`), else
+    `claude` on PATH. The desktop app starts MCP servers with a thin PATH, so a missing binary is reported (with the
+    variable to set) instead of failing inside the runner."""
+    name = os.environ.get("CORTADOS_CHILD_CLAUDE_BIN") or host_claude or "claude"
     found = shutil.which(name)
     if not found:
         raise TaskError(f"claude executable {name!r} not found on PATH; set CORTADOS_CHILD_CLAUDE_BIN to its absolute path")
@@ -911,7 +912,7 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
     if not isinstance(chrome, bool):
         raise TaskError("chrome must be true or false")
     if host is not None and not isinstance(host, str):
-        raise TaskError("host must be the name of a configured execution host")
+        raise TaskError("host must be the name of a configured execution host, or 'here' for this machine")
     target = _resolve_host(host)
     if not target.is_local():
         if _REMOTE_SERVING:
@@ -1004,7 +1005,7 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
         except session.ProviderURLError as exc:
             raise TaskError(f"start_task is not configured: {exc}") from None
     max_s = _max_s()
-    exe = claude_bin()
+    exe = claude_bin(target.claude)
     root = _private_root()
     prune_errors: list = []
     prune(root, errors=prune_errors, red=red)

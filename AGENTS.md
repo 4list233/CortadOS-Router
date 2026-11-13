@@ -112,8 +112,10 @@ is unconfigured or the provider is unreachable it returns a clear error; fall ba
 ## Delegating whole tasks from the Claude app
 The same server serves `start_task` / `task_status` / `wait_task` / `list_tasks` / `cancel_task`
 (`cortados_router/child_tasks.py`): each task runs as a separate headless Claude Code session on the configured
-EXECUTION HOST (`cortados_router/exec_hosts.py`; `~/.config/cortados/exec-hosts.json`, default the Air; a remote host
-is reached by `ssh` running this module's `--remote` mode there; never a silent fallback to the requesting machine)
+EXECUTION HOST (`cortados_router/exec_hosts.py`; `~/.config/cortados/exec-hosts.json`, the same file on every machine,
+each found by `hostnames`; default the Air; `host: "here"` is the machine that got the call, set up with
+`scripts/install_exec_host.sh`; a remote host is reached by `ssh` running this module's `--remote` mode there; never a
+silent fallback to the requesting machine)
 through the provider (every child spends subscription quota). Workspaces (`cortados_router/workspaces.py`): `repo`
 [+ `branch`] gives a git worktree under `<root>/active/<task_id>`, settled to `archive/` (pushed; HEAD detached so
 the branch is free for the next task) or `held/` (unpushed, or a plain folder containing a nested `.git`; keeps its

@@ -484,10 +484,11 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   one ssh call, and one command wakes the session once per ending either way.
 
 - Execution host (owner decision 2026-11-08, #89/#86; `cortados_router/exec_hosts.py`): `~/.config/cortados/exec-hosts.json`
-  (`CORTADOS_EXEC_HOSTS_FILE`; copy `tables/exec-hosts.example.json`, which holds the Air entry) names the hosts and the
-  `default` new tasks run on; `host` picks another; `CORTADOS_EXEC_HOST` overrides the default. Without the file
-  start_task refuses: a task never quietly runs on the requesting machine. An entry whose `hostnames` include this
-  machine (or has no `ssh`) is local and the child is spawned as before; otherwise start_task runs
+  (`CORTADOS_EXEC_HOSTS_FILE`; copy `tables/exec-hosts.example.json`, which holds the pro, air and studio entries)
+  names the hosts and the `default` new tasks run on; `host` picks another; `CORTADOS_EXEC_HOST` overrides the default.
+  Without the file start_task refuses: a task never quietly runs on the requesting machine. An entry whose `hostnames`
+  include this machine (or that has neither `ssh` nor `hostnames`) is local and the child is spawned as before; an
+  entry with no `ssh` whose `hostnames` name another machine (the Pro, read on the Air) is refused; otherwise start_task runs
   `ssh <entry.ssh> <python> <router>/cortados_router/child_tasks.py --remote` (BatchMode, StrictHostKeyChecking=yes,
   10 s connect, 30 s per call) with a JSON request on stdin, and keeps a stub (`<task_id>/remote.json`) so
   `task_status`, `wait_task` (the host waits; one ssh session held open), `list_tasks` (one round trip per host) and
@@ -495,6 +496,17 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   needs: this checkout at `router` at the same commit (the protocol version is checked), the hosts file with its own
   entry, `~/.config/cortados/provider-url` or `provider_url` in its entry, `~/.config/cortados/provider-token` (routed
   children authenticate to the provider with it; they need no Keychain), `claude` (its ssh PATH is bare: set `path`).
+- Every machine a host (2026-11-13): the hosts file is the SAME on the Pro, the Air and the Studio; each machine finds
+  its own entry by `hostnames`. `host: "here"` (or `"local"`) runs the child on the machine whose cortados-route server
+  got the call: for a task that needs that machine's signed-in Chrome (Duo/SSO sites), local files, local apps or GPU.
+  No entry naming this machine is an error, never another host. The Pro has no `ssh` (nothing ssh-es into the laptop),
+  so its tasks are started on the Pro itself with `here`. A local start uses the entry's `claude` when
+  `CORTADOS_CHILD_CLAUDE_BIN` is unset. Chrome serves one client at a time per machine: while a `here` chrome task runs,
+  the orchestrator does not use Chrome itself. Set a machine up with `scripts/install_exec_host.sh <host> [--ssh ALIAS]
+  [--no-gui] [--dry-run]` run ON it: it creates `~/CortadOS/{active,archive,held}`, installs the daily
+  `com.cortados.archive-cleanup` LaunchAgent as the Air has it, checks (read-only) that `claude` is installed and logged
+  in and that `provider-url` / `provider-token` exist, and prints the machine's entry; exit 1 lists what is left (TODO
+  lines). It never prints the token.
 - Workspaces (`cortados_router/workspaces.py`; layout `~/CortadOS/README.md` on the Air): `repo` (a clone URL, or the
   name of a clone already under `<root>/repos/`) [+ `branch`] gives the task a git worktree at `<root>/active/<task_id>`:
   the host clones to `repos/<name>` if needed, fetches, and checks out `branch` (from `origin/<branch>` when it exists,

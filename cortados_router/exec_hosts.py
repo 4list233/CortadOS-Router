@@ -7,9 +7,14 @@ exactly as before) and, if not, how to reach it: one `ssh` call running the SAME
 (`python3 cortados_router/child_tasks.py --remote`), JSON request on stdin, JSON reply on stdout.
 
 Configuration: ~/.config/cortados/exec-hosts.json (CORTADOS_EXEC_HOSTS_FILE overrides the path), shaped like
-tables/exec-hosts.example.json, which holds the Air entry ready to copy. The file is per machine (it names SSH
-destinations and another machine's paths, which this repository never ships as live config: see tables/*.example.json);
-without it start_task refuses with the path to create, it never quietly runs the child on the requesting machine.
+tables/exec-hosts.example.json (pro, air and studio entries). The same file is installed on every machine; each one
+recognises its own entry by `hostnames` (this repository never ships it as live config: see tables/*.example.json).
+Without it start_task refuses with the path to create, it never quietly runs the child on the requesting machine.
+
+`host: "here"` (or "local"), 2026-11-13: run on the machine whose server received the call, i.e. the entry whose
+`hostnames` name it; no such entry is an error, never a fallback to another host. An entry with no `ssh` but with
+`hostnames` is reachable only from the machine it names (the Pro: no machine ssh-es into the laptop); from anywhere
+else it is refused, not run locally under another machine's name.
 
 Stdlib only. Tests replace TRANSPORT; nothing here opens SSH in tests.
 """
@@ -36,6 +41,9 @@ SSH_CONNECT_TIMEOUT_S = 10
 SSH_RPC_TIMEOUT_S = 30
 STDERR_TAIL = 400                   # of ssh's stderr shown in an error: enough for the cause, not a transcript
 LOCAL_SENTINEL = "local"            # a host entry with no `ssh` runs children on the machine that runs the server
+# start_task's `host` aliases for "the machine this server runs on" (the entry whose hostnames name it). A configured
+# entry with one of these names is that entry (it must then have no ssh: the name promises this machine).
+HERE_ALIASES = ("here", "local")
 
 
 class HostError(Exception):
@@ -93,6 +101,9 @@ class Host:
                             "checkout")
         if self.ssh and (self.ssh.startswith("-") or any(c.isspace() for c in self.ssh)):
             raise HostError(f"exec host {name!r}: ssh must be a destination (an ssh_config alias or user@host), not options")
+        if self.ssh and name in HERE_ALIASES:
+            raise HostError(f"exec host {name!r}: {', '.join(repr(a) for a in HERE_ALIASES)} mean this machine, so an "
+                            "entry with that name cannot have an ssh destination; give it another name")
 
     @staticmethod
     def _opt_str(cfg, key):
@@ -111,11 +122,16 @@ class Host:
         return v
 
     def is_local(self) -> bool:
-        """This machine: an entry with no ssh destination, or one whose hostnames name this machine."""
-        return not self.ssh or short_hostname() in self.hostnames
+        """This machine: an entry whose hostnames name this machine, or one with neither ssh nor hostnames. An ssh-less
+        entry naming OTHER machines is not this one (a shared file's Pro entry, read on the Air)."""
+        if short_hostname() in self.hostnames:
+            return True
+        return not self.ssh and not self.hostnames
 
     def describe(self) -> str:
-        return f"'{self.name}'" + (f" (ssh {self.ssh})" if self.ssh else " (this machine)")
+        if self.ssh:
+            return f"'{self.name}' (ssh {self.ssh})"
+        return f"'{self.name}'" + (" (this machine)" if self.is_local() else f" ({', '.join(self.hostnames)}, no ssh)")
 
     def remote_command(self) -> str:
         """The command ssh runs on the host: this repository's module in --remote mode, from the host's checkout."""
@@ -128,22 +144,38 @@ class Hosts:
         self.hosts = hosts
 
     def resolve(self, name=None, env=None) -> Host:
-        """The host for a start_task call: `name` if given, else CORTADOS_EXEC_HOST, else the file's default."""
+        """The host for a start_task call: `name` if given, else CORTADOS_EXEC_HOST, else the file's default. "here" /
+        "local" (unless an entry has that name) is the entry naming this machine. A host this machine cannot reach (no
+        ssh, and its hostnames name another machine) is refused here, before anything runs."""
         env = os.environ if env is None else env
         chosen = name if name not in (None, "") else (env.get("CORTADOS_EXEC_HOST") or self.default)
-        if not isinstance(chosen, str) or chosen not in self.hosts:
-            raise HostError(f"unknown execution host {chosen!r}; configured: {', '.join(sorted(self.hosts))} "
-                            f"(see {config_path(env)})")
-        return self.hosts[chosen]
+        if isinstance(chosen, str) and chosen in self.hosts:
+            host = self.hosts[chosen]
+        elif chosen in HERE_ALIASES:
+            host = self.local_entry()
+            if host is None:
+                raise HostError(f"host {chosen!r} means this machine ({short_hostname()}), but no entry in "
+                                f"{config_path(env)} names it in `hostnames` (configured: "
+                                f"{', '.join(sorted(self.hosts))}); add this machine's entry (scripts/install_exec_host.sh "
+                                "prints it) or name another host. Nothing runs elsewhere instead.")
+        else:
+            raise HostError(f"unknown execution host {chosen!r}; configured: {', '.join(sorted(self.hosts))}, or "
+                            f"'here' for this machine (see {config_path(env)})")
+        if not host.ssh and not host.is_local():
+            raise HostError(f"execution host {host.describe()} has no ssh destination and is not this machine "
+                            f"({short_hostname()}): start the task on {', '.join(host.hostnames)} itself (host 'here' "
+                            "there), or give the entry an ssh destination this machine can reach")
+        return host
 
     def local_entry(self):
-        """The entry naming this machine (by hostname, or the ssh-less entry), or None."""
+        """The entry naming this machine in `hostnames` (ssh or not), else an entry with neither ssh nor hostnames;
+        None when there is none. Never an entry that names other machines."""
         me = short_hostname()
         for h in self.hosts.values():
-            if h.ssh and me in h.hostnames:
+            if me in h.hostnames:
                 return h
         for h in self.hosts.values():
-            if not h.ssh:
+            if not h.ssh and not h.hostnames:
                 return h
         return None
 
@@ -162,8 +194,8 @@ def load(path=None, env=None) -> Hosts:
         with open(path, encoding="utf-8") as f:
             raw = json.load(f)
     except FileNotFoundError:
-        raise HostError(f"no execution hosts are configured: create {path} (copy {EXAMPLE_FILE}, which holds the Air "
-                        "entry) or set CORTADOS_EXEC_HOSTS_FILE. Child tasks run on the configured host, never "
+        raise HostError(f"no execution hosts are configured: create {path} (copy {EXAMPLE_FILE}, which holds the pro, air "
+                        "and studio entries) or set CORTADOS_EXEC_HOSTS_FILE. Child tasks run on the configured host, never "
                         "silently on this machine.") from None
     except (OSError, ValueError, UnicodeError) as exc:
         raise HostError(f"cannot read the execution hosts file {path}: {type(exc).__name__}") from None
@@ -201,6 +233,8 @@ def call(host: Host, op: str, args: dict, timeout_s: float = SSH_RPC_TIMEOUT_S, 
     HostError for a protocol or remote-side error (the remote's TaskError text). Nothing is retried elsewhere."""
     if host.is_local():
         raise HostError(f"exec host {host.describe()} is this machine; nothing to call over ssh")
+    if not host.ssh:
+        raise HostError(f"exec host {host.describe()} has no ssh destination: it cannot be reached from this machine")
     transport = transport or TRANSPORT
     req = json.dumps({"v": PROTOCOL, "op": op, "host": host.name, "args": args}).encode("utf-8")
     try:

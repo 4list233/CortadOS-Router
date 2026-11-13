@@ -1,7 +1,17 @@
 {
-  "_comment": "Copy to ~/.config/cortados/exec-hosts.json on EVERY machine that runs the cortados-route MCP server or receives tasks (the Air needs it too: it recognises itself by `hostnames`). `default` is the host new start_task calls run on (owner decision 2026-11-08: the always-on Air). An entry reached over ssh needs `router` (its cortados-router checkout) and should set `claude`, `path` (ssh sessions get a bare PATH) and `provider_url` (its own provider; the token is read from ~/.config/cortados/provider-token THERE). `gui: true` means chrome (login-mode) children are launched as per-task LaunchAgents in the desktop session (ssh sessions cannot read the login Keychain). An entry without `ssh` is this machine; add `hostnames` so the same file works when the server runs on that host. Add the Studio as another entry when it is ready.",
+  "_comment": "ONE file, the same on every machine: copy to ~/.config/cortados/exec-hosts.json on the Pro, the Air and the Studio (scripts/install_exec_host.sh prints the entry for the machine it runs on). Each machine recognises its own entry by `hostnames` (short hostname, case-insensitive), so start_task's host \"here\" (or \"local\") means the machine whose cortados-route server got the call; a machine with no entry naming it refuses \"here\" instead of running elsewhere. `default` is where start_task runs without a host (owner decision 2026-11-08: the always-on Air). An entry with `ssh` can be reached from other machines and needs `router` (its cortados-router checkout); set `claude`, `path` (ssh sessions get a bare PATH) and `provider_url` (the token is read from ~/.config/cortados/provider-token ON THAT MACHINE). An entry without `ssh` (the Pro: nothing ssh-es into the laptop) runs only tasks started on that machine itself; from anywhere else it is refused. `gui: true` means chrome (login-mode) and connector children are launched as per-task LaunchAgents in that machine's desktop session; Chrome serves one client at a time per machine.",
   "default": "air",
   "hosts": {
+    "pro": {
+      "hostnames": ["Forests-MacBook-Pro"],
+      "root": "/Users/5425855/CortadOS",
+      "router": "/Users/5425855/Ai/CortadOS-Router",
+      "python": "/usr/bin/python3",
+      "claude": "/Users/5425855/.local/bin/claude",
+      "path": "/Users/5425855/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      "gui": true,
+      "provider_url": "https://air.tailb38028.ts.net:8444"
+    },
     "air": {
       "ssh": "air",
       "hostnames": ["Forests-MacBook-Air"],
@@ -12,6 +22,17 @@
       "path": "/Users/4list/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
       "gui": true,
       "provider_url": "http://127.0.0.1:8432"
+    },
+    "studio": {
+      "ssh": "studio",
+      "hostnames": ["Forests-Mac-Studio"],
+      "root": "/Users/velox/CortadOS",
+      "router": "/Users/velox/cortados-router",
+      "python": "/usr/bin/python3",
+      "claude": "/Users/velox/.local/bin/claude",
+      "path": "/Users/velox/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      "gui": false,
+      "provider_url": "https://air.tailb38028.ts.net:8444"
     }
   }
 }
