@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import sys
 from collections import Counter
@@ -17,6 +18,18 @@ _spec.loader.exec_module(core)
 
 QUESTIONS = core.FEATURES + ["outward", "work_kind", "urgency", "needs_clarification", "parts", "diversity"]
 clean_request = core.clean_request   # one definition, shared with the live hook
+
+
+def bands_only() -> None:
+    """For the s1 tools that use core.resolve only to turn twelve answers into a band (build_sft, evaluate, drift, and
+    calibrate through evaluate): never open a vendor usage probe. Stubbing lane_health alone was not enough: resolve's
+    capacity helpers (_pool_tokens_per_pct, _tokens_left_for) call scarcity.current() with refresh on, and a due reading
+    starts the background sample that opens the claude/codex/cursor-agent/agy CLIs. On the Studio on 2026-11-12 the
+    nightly's SFT build did exactly that ("cortados scarcity: cursor reading failed ..." between the label and SFT log
+    lines). CORTADOS_SCARCITY_REFRESH=off makes every reading cache-only (scarcity.current); the band never depends on
+    usage. Process-wide, so call it only in band-only tools: label.py's cli backend and the outcome loop need live usage."""
+    os.environ["CORTADOS_SCARCITY_REFRESH"] = "off"
+    core.lane_health = lambda **_: {}
 
 
 def split_of(row_id: str) -> str:

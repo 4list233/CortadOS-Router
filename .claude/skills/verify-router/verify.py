@@ -147,6 +147,66 @@ else:
     record("friendly pin resolves to one model, ambiguity is refused", "PASS" if ok_one and ok_many else "FAIL",
            f"sub/GPT 6.1 -> {one.get('provider')}/{one.get('model')} | sub/GPT 6 -> {(many.get('error') or '')[:120]}")
 
+# Local auto-route on the Pro (#75, 2026-11-13): after S1, a conversation in a band the node lists moves to its local model
+# only while the node is available; on battery / switch off / gate down it keeps S1's route; an outward (R3) request
+# never goes local whatever the config says; a degraded decision never goes local and never to Claude. Runs the real
+# provider routing and the real core.decide on a throwaway home and a throwaway local config. The probe is faked in the
+# child (no Ollama, no socket); availability is what the Pro's gate would answer.
+LOCAL_SCENARIO = """
+import json, os, sys, tempfile
+from cortados_router import core
+from cortados_router.provider import local_lane, routing
+cfg = os.path.join(tempfile.mkdtemp(), "resources.json")
+json.dump({"nodes": [{"id": "pro", "ollama": {"base_url": "http://127.0.0.1:9",
+           "auto_route": {"model": "verify-local", "bands": ["R0", "R1", "R2"]},
+           "models": [{"id": "verify/local:tag", "alias": "verify-local", "context_length": 65536}]}}]}, open(cfg, "w"))
+os.environ[local_lane.CONFIG_ENV] = cfg
+state = {"down": None}
+def probe(node):
+    if state["down"]:
+        raise local_lane.LocalUnavailable(state["down"])
+    return {"verify/local:tag"}
+local_lane.probe = probe
+def route(text, down=None):
+    state["down"] = down
+    routing._auto_down.clear()
+    body = {"model": "cortados", "messages": [{"role": "user", "content": text}]}
+    r = routing.choose(core, body, client="verify", conversation_id="verify-local", claude_bin=sys.executable,
+                       codex_bin=sys.executable)
+    return {k: r.get(k) for k in ("provider", "model", "band", "degraded", "error")}
+easy = "rename the variable in utils.py"
+print(json.dumps({"up": route(easy), "battery": route(easy, "node pro: local gate: local disabled: on battery"),
+                  "outward": route("email the signed invoice to the client and mark it paid")}))
+"""
+home = tempfile.mkdtemp(prefix="verify-router-local-")
+PROBE_DIRS.append(Path(home) / "usage-probe")
+p = subprocess.run([sys.executable, "-B", "-c", LOCAL_SCENARIO], cwd=REPO, capture_output=True, text=True, timeout=300,
+                   env={**os.environ, "CORTADOS_HOME": home, "CORTADOS_SCARCITY_REFRESH": "off"})
+try:
+    r = json.loads(p.stdout.strip().splitlines()[-1])
+except (ValueError, IndexError):
+    record("local auto-route only when the Pro is available", "FAIL", (p.stderr or p.stdout).strip()[-300:])
+else:
+    up_r, bat, out = r["up"], r["battery"], r["outward"]
+    served = lambda x: x.get("provider") in ("claude-cli", "codex-cli") and not x.get("error")
+    if up_r.get("degraded"):
+        # No band of its own: never local, and the degraded rule still keeps it off Claude.
+        record("degraded decision is never auto-routed local (nor to Claude)",
+               "PASS" if up_r.get("provider") == "codex-cli" and bat.get("provider") == "codex-cli" else "FAIL",
+               json.dumps(up_r))
+        record("local auto-route only when the Pro is available", "BLOCKED", "S1 degraded: no band to auto-route on")
+    else:
+        ok = up_r.get("provider") == "local-pro" and up_r.get("model") == "verify/local:tag" and served(bat)
+        record("local auto-route only when the Pro is available", "PASS" if ok else "FAIL",
+               f"available -> {up_r.get('provider')}/{up_r.get('model')} band {up_r.get('band')} | "
+               f"on battery -> {bat.get('provider')}/{bat.get('model')}")
+    if out.get("degraded"):
+        record("outward (R3) request never goes local", "BLOCKED", "S1 degraded")
+    else:
+        record("outward (R3) request never goes local",
+               "PASS" if out.get("band") == "R3" and not str(out.get("provider")).startswith("local-") else "FAIL",
+               f"band={out.get('band')} -> {out.get('provider')}/{out.get('model')}")
+
 record("live ~/.cortados untouched", "PASS" if live_state_stamp() == before else "FAIL",
        str(LIVE_HOME))
 record("no vendor CLI probe opened", "PASS" if all(not p.exists() or not any(p.iterdir()) for p in PROBE_DIRS) else "FAIL",

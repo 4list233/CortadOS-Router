@@ -1,15 +1,22 @@
-"""Local model lanes: an Ollama node on the owner's machines, served PIN-ONLY as `sub/<local model id or alias>`.
+"""Local model lanes: an Ollama node on the owner's machines (the Pro, #75), served as `sub/<local model id or alias>`
+pins and, when its config opts in, as an auto-route target after S1 has chosen a band.
 
 Owner of three rules:
   config        the nodes and the models they offer live in the local-resources config (CORTADOS_LOCAL_RESOURCES_CONFIG,
                 the same file local_resources.py samples; schema in docs/LOCAL-RESOURCES.md), under each node's `ollama`
                 block. Addresses are config or env only, never tables or code: the real file is git-ignored.
-  pin-only      a local lane is never offered to S1. `auto_route` is the switch for that and defaults off; turning it
-                on is refused (LocalConfigError) because auto-routing a local lane changes routing decisions and needs
-                an evaluation and routing-table candidates first. A switch that silently did nothing would mislead.
+  auto_route    off (absent or false) by default: the node is pin-only. On, it must be an object naming ONE of the node's
+                models and the S1 bands it may take (`{"model": "<alias or tag>", "bands": ["R0"]}`); there is no default
+                band, because which work runs on a local model is the owner's call. Only AUTO_ROUTE_BANDS may be named:
+                R3 is where core.resolve's hard rules put outward and blast-radius-3 work (Opus-class floor) and R4 is
+                escalation only, so a local model never takes either. `true` and anything malformed are refused
+                (LocalConfigError): a switch that silently did nothing, or did more than it says, would mislead.
+                routing.auto_local applies it; S1 and core.resolve never see a local lane.
   availability  a lane is available when its node answers GET /api/tags within a short timeout and lists the model.
-                The node is a laptop that may be asleep or busy: then the pin fails with a clear 503, and nothing falls
-                back to another model (the person chose this one).
+                On the Pro the gate (local_gate.py) answers that probe with a 503 while on battery or with the manual
+                switch off, so one probe covers AC power, the switch and gate health. A pin to an unavailable node fails
+                with a clear 503 and nothing falls back to another model (the person chose this one); an auto-route to
+                one is simply not taken, and the conversation keeps the route S1 chose.
 
 Ollama implements the Anthropic Messages API at POST /v1/messages, so a turn is relayed as-is (stateless: the client
 sends the whole conversation every turn) with only `model` rewritten to the node's tag. Stdlib only.
@@ -70,9 +77,6 @@ def nodes(path: str | None = None) -> list[dict[str, Any]]:
         nid = str(node.get("id") or "").strip()
         if not nid or not isinstance(block, dict):
             raise LocalConfigError("an `ollama` block needs a node `id` and must be an object")
-        if block.get("auto_route", False) is not False:
-            raise LocalConfigError(f"node {nid}: auto_route is not built yet (local lanes are pin-only until they are "
-                                   "evaluated and given routing-table candidates); set it to false", nid)
         env_name = block.get("base_url_env")
         base = (os.environ.get(env_name) if env_name else None) or block.get("base_url") or ""
         base = base.strip().rstrip("/")
@@ -114,8 +118,46 @@ def nodes(path: str | None = None) -> list[dict[str, Any]]:
                 raise LocalConfigError(f"node {nid}: {key} must be a positive number of seconds", nid)
         out.append({"node": nid, "lane": LANE_PREFIX + nid, "label": block.get("label") or nid.capitalize(),
                     "base_url": base, "models": models, "token": token,
+                    "auto_route": _auto_route(block.get("auto_route", False), models, nid),
                     **timeouts})
     return out
+
+
+# The S1 bands a local model may be auto-routed in. Not R3 (core.resolve floors outward and blast-radius-3 work there,
+# Opus-class) and not R4 (escalation only): those hard rules must hold whatever a node's config says.
+AUTO_ROUTE_BANDS = ("R0", "R1", "R2")
+
+
+def _auto_route(value: Any, models: list[dict[str, Any]], nid: str) -> dict[str, Any] | None:
+    """A node's validated auto_route: None (off) or {"model": <one of its model entries>, "bands": [...]}."""
+    if value is False or value is None:
+        return None
+    if not isinstance(value, dict):
+        raise LocalConfigError(f"node {nid}: auto_route must be false or an object "
+                               '{"model": "<alias or tag>", "bands": [...]} naming the model and the S1 bands it may '
+                               f"take (got {value!r}; there is no default band)", nid)
+    unknown = set(value) - {"model", "bands", "_comment"}
+    if unknown:
+        raise LocalConfigError(f"node {nid}: auto_route has unknown keys {sorted(unknown)}", nid)
+    name = str(value.get("model") or "").strip().casefold()
+    entry = next((m for m in models if name and name in (m["id"].casefold(), (m["alias"] or "").casefold())), None)
+    if entry is None:
+        raise LocalConfigError(f"node {nid}: auto_route.model must name one of this node's models (alias or tag)", nid)
+    bands = value.get("bands")
+    if not isinstance(bands, list) or not bands or not all(isinstance(b, str) for b in bands):
+        raise LocalConfigError(f"node {nid}: auto_route.bands must be a non-empty list of S1 bands from "
+                               f"{', '.join(AUTO_ROUTE_BANDS)} (there is no default)", nid)
+    bad = [b for b in bands if b not in AUTO_ROUTE_BANDS]
+    if bad:
+        raise LocalConfigError(f"node {nid}: auto_route.bands {bad} not allowed: a local model may take only "
+                               f"{', '.join(AUTO_ROUTE_BANDS)} (R3 carries outward and blast-radius-3 work, R4 is "
+                               "escalation only)", nid)
+    return {"model": entry, "bands": list(dict.fromkeys(bands))}
+
+
+def auto_routes(path: str | None = None) -> list[tuple[dict[str, Any], dict[str, Any], list[str]]]:
+    """(node, model, bands) for every node whose auto_route is on, in config order."""
+    return [(n, n["auto_route"]["model"], n["auto_route"]["bands"]) for n in nodes(path) if n.get("auto_route")]
 
 
 DEFAULT_CONTEXT = 32768
@@ -176,6 +218,18 @@ PRO_LOCAL_REFUSALS = {"local gate: local switch off", "local gate: local disable
 
 GATE_REFUSED = ("local gate on node {node} refused the provider token (401): the provider's token file does not "
                 "match the gate's")
+
+
+def _policy_refusal(raw: bytes | None) -> str | None:
+    """The gate's fixed policy reason (PRO_LOCAL_REFUSALS) in a 503 body, or None. Only those fixed strings are ever
+    repeated to a client, never arbitrary upstream text (the same rule as probe)."""
+    try:
+        data = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    error = data.get("error") if isinstance(data, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    return message if isinstance(message, str) and message in PRO_LOCAL_REFUSALS else None
 
 
 def _auth(node: dict[str, Any]) -> dict[str, str]:
@@ -295,14 +349,26 @@ def _fold(reply: list, ev: dict[str, Any]) -> None:
             reply[-1]["text"] = reply[-1].get("text", "") + str(d.get("text", ""))
 
 
+def auto_routed_unavailable(node: dict[str, Any], model: dict[str, Any], reason: str) -> str:
+    """The client's message when the node of an S1 auto-routed (not pinned) conversation is unavailable mid-conversation.
+    Reason: the person never pinned this model, so a "sub/<alias>" message would blame a choice they did not make. The
+    conversation stays bound to the node (re-routing it mid-conversation is an owner decision not taken); a new
+    conversation is routed again, and excluding the model keeps S1's lane even while the node is up."""
+    return (f"cortados: this conversation was auto-routed by S1 to {model['id']} on {node['node']}; the node is "
+            f"{reason}; start a new conversation (it is routed again) or send x-cortados-exclude-model: {pin_id(model)}")
+
+
 def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
-          echo_model: str, reply: list | None = None) -> str:
+          echo_model: str, reply: list | None = None, auto_routed: bool = False) -> str:
     """Relay one turn to the node's /v1/messages and the answer back to the client. Returns the outcome: "completed"
     (a whole message or a parsed message_stop), "rejected" (the node answered an HTTP error, relayed as-is),
     "unreachable" (503 sent), or "incomplete" (the stream broke). The response names `echo_model` (what the client
     asked for), as every other lane does; content, tool_use blocks and stop reasons pass through untouched. `reply`,
     when given, receives the answer's content blocks (text and tool_use, rebuilt from the stream) so the server can
-    fingerprint the reply and continue the conversation by its history, as for every other pin."""
+    fingerprint the reply and continue the conversation by its history, as for every other pin. `auto_routed`: the
+    conversation was moved here by S1's auto-route (routing.auto_local), not pinned; an unavailable node (unreachable,
+    dropping requests, refusing the token, or the gate's fixed policy refusal: battery, switch off) is then worded by
+    auto_routed_unavailable instead of naming a `sub/` pin the person never made."""
     reply = [] if reply is None else reply
     out = dict(body)
     out["model"] = model["id"]
@@ -313,7 +379,9 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
             conn.connect()
         except (OSError, http.client.HTTPException) as exc:
             _refused(handler, 503, "overloaded_error", "the local node is unreachable")
-            _send_json(handler, 503, _error("overloaded_error",
+            _send_json(handler, 503, _error("overloaded_error", auto_routed_unavailable(
+                       node, model, f"unreachable ({type(exc).__name__}: {exc}); it may be asleep or busy")
+                       if auto_routed else
                        f"cortados: local node {node['node']} unreachable for sub/{pin_id(model)} "
                        f"({type(exc).__name__}: {exc}); it may be asleep or busy. No other model was tried."))
             return "unreachable"
@@ -326,18 +394,28 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
         except (OSError, http.client.HTTPException) as exc:
             # Connected, so the node is awake: it (or its gate) refused or dropped the request.
             _refused(handler, 503, "overloaded_error", "the local node refused or dropped the request")
-            _send_json(handler, 503, _error("overloaded_error",
+            _send_json(handler, 503, _error("overloaded_error", auto_routed_unavailable(
+                       node, model, f"refusing or dropping requests ({type(exc).__name__}: {exc})")
+                       if auto_routed else
                        f"cortados: local node {node['node']} accepted the connection for sub/{pin_id(model)}, then "
                        f"refused or dropped the request ({type(exc).__name__}: {exc}). No other model was tried."))
             return "unreachable"
         if resp.status == 401:                                   # the gate's refusal is the provider's problem,
             _bounded_read(resp)                                  # not the client's: a 503 that says so
             _refused(handler, 503, "overloaded_error", "the local gate refused the provider's token")
-            _send_json(handler, 503, _error("overloaded_error", "cortados: " + GATE_REFUSED.format(node=node["node"])
-                                            + "; no other model was tried"))
+            _send_json(handler, 503, _error("overloaded_error", auto_routed_unavailable(
+                       node, model, "refusing the provider's token (401: the provider's token file does not match the "
+                       "gate's)") if auto_routed else
+                       "cortados: " + GATE_REFUSED.format(node=node["node"]) + "; no other model was tried"))
             return "unreachable"
         if resp.status != 200:
             raw = _bounded_read(resp)
+            policy = _policy_refusal(raw) if auto_routed and resp.status == 503 else None
+            if policy:                                           # the gate's fixed reason: battery, switch off, ...
+                _refused(handler, 503, "overloaded_error", "the local gate refused local models")
+                _send_json(handler, 503, _error("overloaded_error", auto_routed_unavailable(
+                           node, model, f"refusing local models ({policy})")))
+                return "rejected"
             if raw is None:                                      # truncated or stalled error body: say so, bounded
                 _refused(handler, 502, "api_error", "the local node's error body was truncated or stalled")
                 _send_json(handler, 502, _error("api_error", f"cortados: local node {node['node']} answered HTTP "
