@@ -192,11 +192,12 @@ def check(core, cand: dict[str, Any], model: str, floor: float, readings: dict |
 
 
 def reserve(core, cand: dict[str, Any], model: str, floor: float, readings: dict | None = None,
-            now: float | None = None, conv: str | None = None) -> str | None:
+            now: float | None = None, conv: str | None = None, rid: str | None = None) -> str | None:
     """Check `cand` under `floor`, counting outstanding reservations, and on yes reserve one run on it: atomically
     (thread lock + flock on the ledger), durably. `conv` (the route_id) makes it idempotent per conversation: while the
     conversation's own reservation still counts, a continuation is rechecked without being charged again; once it has
     aged out of the counting window (the usage reading now shows the work), the next turn reserves afresh.
+    `rid`: a caller-chosen id stamped on the new row so release(rid) can take it back if the run never starts.
     Returns why it was refused, or None when reserved."""
     now = time.time() if now is None else now
     readings = core.subscription_readings() if readings is None else readings
@@ -216,8 +217,36 @@ def reserve(core, cand: dict[str, Any], model: str, floor: float, readings: dict
             return None
         horizon = now - MAX_READING_AGE_S - IN_FLIGHT_S     # rows older than this can no longer count
         keep = [r for r in rows if float(r.get("ts", 0)) >= horizon]
-        keep.append({"ts": now, "lane": cand.get("lane"), "model": model, "keys": keys, "conv": conv})
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in keep))
-        tmp.replace(path)
+        row = {"ts": now, "lane": cand.get("lane"), "model": model, "keys": keys, "conv": conv}
+        if rid:
+            row["rid"] = rid
+        keep.append(row)
+        _write(path, keep)
         return None
+
+
+def _write(path, rows: list[dict]) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
+    tmp.replace(path)
+
+
+def release(core, rid: str) -> bool:
+    """Take back the reservation stamped `rid` (reserve(..., rid=)), under the same locks as reserve. Reason: a
+    reservation only counts once its run actually started (#79); a run whose CLI failed to launch spent nothing, and
+    leaving its row would count it until it aged out, so a burst of launch failures could push a healthy account under
+    the client's floor. Idempotent: True when a row was removed, False when none carries `rid` (already released, aged
+    out, or never reserved), so a second call can never refund a different run."""
+    if not rid:
+        return False
+    path = _ledger(core)
+    if not path.exists():
+        return False
+    with _thread_lock, (path.parent / (LEDGER + ".lock")).open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        rows = _rows(path)
+        keep = [r for r in rows if r.get("rid") != rid]
+        if len(keep) == len(rows):
+            return False
+        _write(path, keep)
+        return True

@@ -298,6 +298,14 @@ codex app-server -c notify=[] -c web_search="disabled" -c include_environment_co
 - The child's environment drops `OPENAI_API_KEY`, `CODEX_API_KEY` and `CODEX_ACCESS_TOKEN` (an API key would bill an
   API account instead of the subscription), `OPENAI_BASE_URL` (it would repoint the openai provider) and the Anthropic
   trio of the Claude bridge.
+  Since #84 it drops every `OPENAI_*`, `CODEX_*`, `ANTHROPIC_*` and `CLAUDE_*` variable by prefix, except the
+  allowlist `codex_isolation.ALLOWED_ENV`: `CODEX_HOME` (set by the bridge) and `CODEX_CA_CERTIFICATE`.
+- `CODEX_CA_CERTIFICATE` (#103, 2026-11-13): the path of a PEM bundle Codex uses as its custom CA set for TLS. The Air
+  provider sets it, in the provider's own environment, to an export of the macOS system roots, because Codex
+  intermittently failed with `invalid peer certificate: UnknownIssuer` without it. It is a file path, not a secret, so
+  it passes the prefix strip. The PEM is a snapshot: re-export it after every macOS update (root certificates change
+  with OS releases), then restart the provider:
+  `security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain > ~/.cortados/certs/macos-system-roots.pem`
 - The command line is asked for, then checked (Codex review of PR #5): before `thread/start` the bridge calls
   `account/read {refreshToken:false}` and requires a `chatgpt` login (an API-key login or none is a 502: the lane bills
   the subscription), and `config/read`, the effective config with every layer merged (config.toml, the `-c`
