@@ -182,6 +182,19 @@ Pin names (aliases and tags, case-insensitive) must be unique across nodes. Beha
   falls back to another model.
 - Not listed in `served_routes`: S1 and `core.resolve` never see a local lane.
 
+**Deploy (moving local chat models from the Studio to the Pro).** In this order; nothing here restarts the provider:
+
+1. On the Air (the provider host), delete the Studio's `ollama` block from the live, git-ignored
+   `tables/resources.json` (the file `CORTADOS_LOCAL_RESOURCES_CONFIG` names). No restart: `local_lane.nodes()` re-reads
+   the file on every call, so the Studio's pins and lane disappear with the next request.
+2. On the Studio, stop its gate and its Ollama (owner decision 2026-11-13: the Studio runs no chat models; S1 does not
+   use either): `launchctl bootout gui/$(id -u)/com.cortados.local-gate`, then quit Ollama (the menu-bar app, or
+   `launchctl bootout` its own job if it was installed as one).
+3. On the Pro: `ollama pull gpt-oss:20b`; set Ollama's context to at least the configured `context_length` (65536):
+   `OLLAMA_CONTEXT_LENGTH=65536` for `ollama serve`, or Ollama.app's context setting, then restart Ollama (see "Context
+   length must match the node" below). Only then set the Pro block's `auto_route` in the Air's `tables/resources.json`
+   (Local auto-route, below); before that the Pro is pin-only.
+
 ### Local auto-route
 
 With `auto_route` set, `routing.auto_local` runs after S1 has routed a new `cortados` conversation (the routed path
@@ -202,10 +215,25 @@ otherwise leaves S1's route exactly as it was:
 6. the request fits the model's `context_length`.
 
 The first node in config order that passes wins. The routes row S1's select wrote is rewritten under the same id
-(lane/provider `local-<node>`, the model's tag, S1's own choice as `runner_up`, a `local auto-route: …` hard-rules
-entry), and the conversation then runs exactly like a local pin (same relay, same per-turn context gate, the model is
-fixed for the conversation, the client's quota floor does not apply). Each skipped condition is logged at INFO
-(`local auto-route: … not taken …`).
+(`INSERT OR REPLACE`: lane/provider `local-<node>`, the model's tag, S1's own choice as `runner_up`, S1's runner_up kept
+as an entry in `skipped`, a `local auto-route: …` hard-rules entry), and the conversation then runs exactly like a local
+pin (same relay, same per-turn context gate, the model is fixed for the conversation, the client's quota floor does not
+apply). Each skipped condition is logged at INFO (`local auto-route: … not taken …`), except a gate 401 (the provider's
+token file does not match the gate's), which is a WARNING: it is a misconfiguration for the owner, not the node's state.
+
+**An auto-routed conversation stays on the Pro until it returns.** The decision is made once, on the opening turn. If
+the Pro then becomes unavailable (asleep, off the tailnet, on battery, switch off, gate refusing the token), the next
+turn fails with a 503 worded for a routed conversation, not a pin: "this conversation was auto-routed by S1 to
+`<model>` on `<node>`; the node is `<reason>`; start a new conversation (it is routed again) or send
+`x-cortados-exclude-model: <alias>`". The conversation keeps its history and continues when the node is back. It is
+**not** re-routed mid-conversation to another lane: whether to do that is an owner decision still pending, so nothing
+falls back silently. (A pinned conversation keeps the pin wording: "local node `<node>` unreachable for
+`sub/<alias>` … No other model was tried".)
+
+**Parallel conversations share one model.** With `OLLAMA_NUM_PARALLEL=1` (the Pro's setting) Ollama runs one request
+at a time: parallel auto-routed openers (or several subagents) serialize on the one loaded model and wait in Ollama's
+queue (`OLLAMA_MAX_QUEUE`), each up to `read_timeout_s` per chunk. They are not refused and not spread to other lanes,
+so many parallel local conversations are slower than the same number on S1's lanes.
 
 Model choice for the Pro (M5 Max, 48 GB unified, reserve 6 GiB; `OLLAMA_NUM_PARALLEL=1`): one auto-route model loaded
 at a time. Recommended, 2026-11-13 (not yet pulled on the Pro; pull them yourself, they are large):

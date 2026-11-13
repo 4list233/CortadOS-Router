@@ -220,6 +220,18 @@ GATE_REFUSED = ("local gate on node {node} refused the provider token (401): the
                 "match the gate's")
 
 
+def _policy_refusal(raw: bytes | None) -> str | None:
+    """The gate's fixed policy reason (PRO_LOCAL_REFUSALS) in a 503 body, or None. Only those fixed strings are ever
+    repeated to a client, never arbitrary upstream text (the same rule as probe)."""
+    try:
+        data = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    error = data.get("error") if isinstance(data, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    return message if isinstance(message, str) and message in PRO_LOCAL_REFUSALS else None
+
+
 def _auth(node: dict[str, Any]) -> dict[str, str]:
     """The gate's credential (local_gate.py), when the node is behind one. Never logged."""
     return {"authorization": f"Bearer {node['token']}"} if node.get("token") else {}
@@ -337,14 +349,26 @@ def _fold(reply: list, ev: dict[str, Any]) -> None:
             reply[-1]["text"] = reply[-1].get("text", "") + str(d.get("text", ""))
 
 
+def auto_routed_unavailable(node: dict[str, Any], model: dict[str, Any], reason: str) -> str:
+    """The client's message when the node of an S1 auto-routed (not pinned) conversation is unavailable mid-conversation.
+    Reason: the person never pinned this model, so a "sub/<alias>" message would blame a choice they did not make. The
+    conversation stays bound to the node (re-routing it mid-conversation is an owner decision not taken); a new
+    conversation is routed again, and excluding the model keeps S1's lane even while the node is up."""
+    return (f"cortados: this conversation was auto-routed by S1 to {model['id']} on {node['node']}; the node is "
+            f"{reason}; start a new conversation (it is routed again) or send x-cortados-exclude-model: {pin_id(model)}")
+
+
 def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
-          echo_model: str, reply: list | None = None) -> str:
+          echo_model: str, reply: list | None = None, auto_routed: bool = False) -> str:
     """Relay one turn to the node's /v1/messages and the answer back to the client. Returns the outcome: "completed"
     (a whole message or a parsed message_stop), "rejected" (the node answered an HTTP error, relayed as-is),
     "unreachable" (503 sent), or "incomplete" (the stream broke). The response names `echo_model` (what the client
     asked for), as every other lane does; content, tool_use blocks and stop reasons pass through untouched. `reply`,
     when given, receives the answer's content blocks (text and tool_use, rebuilt from the stream) so the server can
-    fingerprint the reply and continue the conversation by its history, as for every other pin."""
+    fingerprint the reply and continue the conversation by its history, as for every other pin. `auto_routed`: the
+    conversation was moved here by S1's auto-route (routing.auto_local), not pinned; an unavailable node (unreachable,
+    dropping requests, refusing the token, or the gate's fixed policy refusal: battery, switch off) is then worded by
+    auto_routed_unavailable instead of naming a `sub/` pin the person never made."""
     reply = [] if reply is None else reply
     out = dict(body)
     out["model"] = model["id"]
@@ -355,7 +379,9 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
             conn.connect()
         except (OSError, http.client.HTTPException) as exc:
             _refused(handler, 503, "overloaded_error", "the local node is unreachable")
-            _send_json(handler, 503, _error("overloaded_error",
+            _send_json(handler, 503, _error("overloaded_error", auto_routed_unavailable(
+                       node, model, f"unreachable ({type(exc).__name__}: {exc}); it may be asleep or busy")
+                       if auto_routed else
                        f"cortados: local node {node['node']} unreachable for sub/{pin_id(model)} "
                        f"({type(exc).__name__}: {exc}); it may be asleep or busy. No other model was tried."))
             return "unreachable"
@@ -368,18 +394,28 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
         except (OSError, http.client.HTTPException) as exc:
             # Connected, so the node is awake: it (or its gate) refused or dropped the request.
             _refused(handler, 503, "overloaded_error", "the local node refused or dropped the request")
-            _send_json(handler, 503, _error("overloaded_error",
+            _send_json(handler, 503, _error("overloaded_error", auto_routed_unavailable(
+                       node, model, f"refusing or dropping requests ({type(exc).__name__}: {exc})")
+                       if auto_routed else
                        f"cortados: local node {node['node']} accepted the connection for sub/{pin_id(model)}, then "
                        f"refused or dropped the request ({type(exc).__name__}: {exc}). No other model was tried."))
             return "unreachable"
         if resp.status == 401:                                   # the gate's refusal is the provider's problem,
             _bounded_read(resp)                                  # not the client's: a 503 that says so
             _refused(handler, 503, "overloaded_error", "the local gate refused the provider's token")
-            _send_json(handler, 503, _error("overloaded_error", "cortados: " + GATE_REFUSED.format(node=node["node"])
-                                            + "; no other model was tried"))
+            _send_json(handler, 503, _error("overloaded_error", auto_routed_unavailable(
+                       node, model, "refusing the provider's token (401: the provider's token file does not match the "
+                       "gate's)") if auto_routed else
+                       "cortados: " + GATE_REFUSED.format(node=node["node"]) + "; no other model was tried"))
             return "unreachable"
         if resp.status != 200:
             raw = _bounded_read(resp)
+            policy = _policy_refusal(raw) if auto_routed and resp.status == 503 else None
+            if policy:                                           # the gate's fixed reason: battery, switch off, ...
+                _refused(handler, 503, "overloaded_error", "the local gate refused local models")
+                _send_json(handler, 503, _error("overloaded_error", auto_routed_unavailable(
+                           node, model, f"refusing local models ({policy})")))
+                return "rejected"
             if raw is None:                                      # truncated or stalled error body: say so, bounded
                 _refused(handler, 502, "api_error", "the local node's error body was truncated or stalled")
                 _send_json(handler, 502, _error("api_error", f"cortados: local node {node['node']} answered HTTP "

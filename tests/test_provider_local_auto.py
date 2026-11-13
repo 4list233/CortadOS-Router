@@ -4,6 +4,7 @@ listed, the client did not exclude it, the wire is /v1/messages and the request 
 (the end-to-end case reuses test_provider_local's in-thread fake Ollama on loopback)."""
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 import uuid
@@ -106,6 +107,34 @@ class AutoLocalTakenTests(AutoLocalBase):
         finally:
             routing.floor.reserve = keep
         self.assertEqual(r["provider"], "local-pro")
+
+    def test_s1_runner_up_is_kept_not_overwritten(self):
+        s1_second = {"lane": "claude", "provider": "claude-cli", "model": "claude-sonnet-5"}
+        self.selected = {**S1_ROUTE, "route": {**S1_ROUTE["route"], "runner_up": s1_second}}
+        self.choose()
+        (_, _, _, route), = self.logged
+        self.assertEqual(route["runner_up"]["model"], "gpt-5.6-terra")        # S1's choice: what runs without the node
+        self.assertEqual(route["s1_runner_up"], s1_second)
+        self.assertEqual([s["model"] for s in route["skipped"]], ["claude-sonnet-5"])
+
+    def test_rewrite_replaces_s1_row_under_the_same_route_id(self):
+        core.log_route = self._keep[2]                          # the real writer, on this test's throwaway STATE
+        core.log_route(S1_ROUTE["route_id"], {"request": "list the files"}, S1_ROUTE["decision"],
+                       {**S1_ROUTE["route"], "subagents": 0, "verifier": False})
+        self.assertEqual(self.choose()["provider"], "local-pro")
+        with sqlite3.connect(core.STATE / "router.db") as db:
+            rows = db.execute("SELECT turn_id, lane, model, runner_up FROM routes").fetchall()
+        self.assertEqual([(t, l, m, json.loads(u)["model"]) for t, l, m, u in rows],
+                         [(S1_ROUTE["route_id"], "local-pro", TAG, "gpt-5.6-terra")])
+
+    def test_a_gate_401_is_a_warning_battery_is_info(self):
+        for message, level in ((local_lane.GATE_REFUSED.format(node="pro"), "WARNING"),
+                               ("node pro: local gate: local disabled: on battery", "INFO")):
+            routing._auto_down.clear()
+            self.unavailable = message
+            with self.assertLogs(routing.logger, level="INFO") as cm:
+                self.assertS1Route(self.choose())
+            self.assertEqual([r.levelname for r in cm.records if "not taken" in r.getMessage()], [level])
 
     def test_a_recovered_node_is_probed_again_after_the_down_window(self):
         self.unavailable = "node pro: local gate: local disabled: on battery"
@@ -308,6 +337,120 @@ class AutoLocalEndToEndTests(LocalHarness):
         self.assertEqual((path, sent["model"]), ("/v1/messages", TAG))
         self.assertEqual(got["model"], "cortados")                   # echoes what the client asked for
         self.assertEqual(got["type"], "message")
+
+    TOOLS = [{"name": "Read", "input_schema": {"type": "object"}}]
+
+    def converse_then_lose_the_node(self, model):
+        """Open a tool conversation on `model`, then stop the node: the continuation's error message."""
+        first = {**body("hi"), "model": model, "tools": self.TOOLS}
+        got = self.post(first)
+        self.assertEqual(len(self.reg.sessions), 1)
+        nxt = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": got["content"][-1]["id"],
+                                            "content": "ok"}]}
+        self.ollama.shutdown()
+        self.ollama.server_close()
+        code, msg = self.error_of({**first, "messages": first["messages"] + [
+            {"role": "assistant", "content": got["content"]}, nxt]})
+        self.assertEqual(code, 503)
+        self.assertEqual(len(self.reg.sessions), 1)          # the conversation stays bound to its node
+        return msg
+
+    def test_auto_routed_conversation_losing_its_node_is_not_called_a_pin(self):
+        msg = self.converse_then_lose_the_node("cortados")
+        self.assertIn(f"auto-routed by S1 to {TAG} on pro; the node is unreachable", msg)
+        self.assertIn("start a new conversation (it is routed again)", msg)
+        self.assertIn("x-cortados-exclude-model: qwen-27b", msg)
+        self.assertNotIn("sub/", msg)
+
+    def test_pinned_conversation_losing_its_node_keeps_the_pin_wording(self):
+        msg = self.converse_then_lose_the_node("sub/qwen-27b")
+        self.assertIn("local node pro unreachable for sub/qwen-27b", msg)
+        self.assertIn("No other model was tried", msg)
+        self.assertNotIn("auto-routed", msg)
+
+
+class FakeHandler:
+    def __init__(self):
+        import io
+        self.status, self.wfile = None, io.BytesIO()
+
+    def send_response(self, code):
+        self.status = code
+
+    def send_header(self, *a):
+        pass
+
+    def end_headers(self):
+        pass
+
+    def message(self):
+        return json.loads(self.wfile.getvalue())["error"]["message"]
+
+
+class RelayConnection(FakeConnection):
+    """A connection for local_lane.serve: connects (or fails to), then answers one status."""
+
+    def __init__(self, status=None, raw=b"", connect_error=None):
+        super().__init__(status, raw)
+        self.connect_error = connect_error
+        self.sock = type("Sock", (), {"settimeout": lambda self, t: None})()
+
+    def connect(self):
+        if self.connect_error:
+            raise self.connect_error
+
+
+class RelayUnavailableWordingTests(unittest.TestCase):
+    """local_lane.serve's message when the node is unavailable mid-conversation: an auto-routed conversation is told
+    S1 routed it there (never a `sub/` pin it did not make); a pinned one keeps the pin wording. No socket."""
+
+    NODE = {"node": "pro", "base_url": "http://127.0.0.1:9", "connect_timeout_s": 1.0, "read_timeout_s": 1.0,
+            "token": None}
+    MODEL = {"id": TAG, "alias": "qwen-27b", "context_length": 32768}
+
+    def serve_with(self, conn, auto_routed):
+        keep = local_lane._connection
+        local_lane._connection = lambda base, timeout: conn
+        h = FakeHandler()
+        try:
+            outcome = local_lane.serve(h, body(), self.NODE, self.MODEL, echo_model="cortados",
+                                       auto_routed=auto_routed)
+        finally:
+            local_lane._connection = keep
+        return outcome, h.status, h.message()
+
+    CASES = {
+        "unreachable": lambda: RelayConnection(connect_error=ConnectionRefusedError("refused")),
+        "gate token": lambda: RelayConnection(401, b"{}"),
+        "on battery": lambda: RelayConnection(503, json.dumps({"type": "error", "error": {
+            "type": "overloaded_error", "message": "local gate: local disabled: on battery"}}).encode()),
+    }
+
+    def test_auto_routed_wording(self):
+        for name, conn in self.CASES.items():
+            outcome, status, msg = self.serve_with(conn(), auto_routed=True)
+            self.assertEqual(status, 503, name)
+            self.assertTrue(msg.startswith(f"cortados: this conversation was auto-routed by S1 to {TAG} on pro; "
+                                           "the node is "), (name, msg))
+            self.assertTrue(msg.endswith("; start a new conversation (it is routed again) or send "
+                                         "x-cortados-exclude-model: qwen-27b"), (name, msg))
+            self.assertNotIn("sub/", msg, name)
+        self.assertIn("local disabled: on battery", self.serve_with(self.CASES["on battery"](), True)[2])
+
+    def test_pinned_wording_is_unchanged(self):
+        _, status, msg = self.serve_with(self.CASES["unreachable"](), auto_routed=False)
+        self.assertEqual(status, 503)
+        self.assertIn("local node pro unreachable for sub/qwen-27b", msg)
+        _, _, msg = self.serve_with(self.CASES["gate token"](), auto_routed=False)
+        self.assertEqual(msg, "cortados: " + local_lane.GATE_REFUSED.format(node="pro") + "; no other model was tried")
+        outcome, status, msg = self.serve_with(self.CASES["on battery"](), auto_routed=False)
+        self.assertEqual((outcome, status, msg), ("rejected", 503, "local gate: local disabled: on battery"))
+
+    def test_an_unknown_503_body_is_never_repeated_as_a_policy_reason(self):
+        raw = json.dumps({"type": "error", "error": {"type": "x", "message": "secret upstream text"}}).encode()
+        outcome, status, msg = self.serve_with(RelayConnection(503, raw), auto_routed=True)
+        self.assertEqual((outcome, status), ("rejected", 503))
+        self.assertNotIn("auto-routed", msg)                 # relayed as any node error is, not dressed as policy
 
 
 if __name__ == "__main__":

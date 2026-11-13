@@ -718,7 +718,8 @@ def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, co
     model's context. The first node in config order that passes wins. A skip leaves `r` exactly as it was, with the
     reason logged; a broken local config skips too (logged as a warning), so a config error never blocks S1 routing.
     When moved, the routes row S1's select wrote is rewritten under the same route_id (lane, provider and model of the
-    local node, S1's choice kept as runner_up), so the record names what will run."""
+    local node, S1's choice as runner_up, S1's own runner_up kept as s1_runner_up and a skipped entry), so the record
+    names what will run and loses nothing S1 decided."""
     if body.get(NO_LOCAL_KEY) or r.get("degraded") or not r.get("band") or not r.get("route_id"):
         return r
     try:
@@ -730,7 +731,7 @@ def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, co
     need = None
     for node, entry, bands in targets:
         pin = local_lane.pin_id(entry)
-        why = None
+        why, gate_refused = None, False
         if band not in bands:
             why = f"band {band} is not in its auto_route bands"
         elif excluded(entry["id"]) or excluded(pin):
@@ -743,6 +744,9 @@ def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, co
             except local_lane.LocalUnavailable as exc:
                 _auto_down[node["node"]] = _now() + AUTO_DOWN_S
                 why = f"unavailable ({exc})"
+                # A gate 401 is the provider's misconfiguration (token files out of step), not the node's state: it
+                # needs the owner's attention, so it is a warning, where battery or a switched-off node is routine.
+                gate_refused = str(exc) == local_lane.GATE_REFUSED.format(node=node["node"])
             else:
                 _auto_down.pop(node["node"], None)
                 if entry["id"] not in tags:
@@ -752,12 +756,21 @@ def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, co
             if need > entry["context_length"]:
                 why = f"request ≈{need // 1000}k tokens exceeds its {entry['context_length'] // 1000}k context"
         if why:
-            logger.info("local auto-route: %s/%s not taken for %s: %s", node["lane"], pin, r["route_id"], why)
+            logger.log(logging.WARNING if gate_refused else logging.INFO,
+                       "local auto-route: %s/%s not taken for %s: %s", node["lane"], pin, r["route_id"], why)
             continue
         old = r.get("route") or {}
         chosen = {"lane": node["lane"], "provider": node["lane"], "model": entry["id"], "account": None,
                   "config_dir": None, "reserve": False, "pool": None}
-        route = {**old, "chosen": chosen, "runner_up": old.get("chosen"),
+        # runner_up is S1's choice (what runs when the node is not there); S1's own runner_up is not dropped: it is
+        # kept as s1_runner_up and, so the routes row still shows it, as a skipped entry naming why.
+        s1_runner_up = old.get("runner_up")
+        skipped = list(old.get("skipped") or [])
+        if isinstance(s1_runner_up, dict) and s1_runner_up.get("model"):
+            skipped.append({"lane": s1_runner_up.get("lane"), "model": s1_runner_up.get("model"),
+                            "why": "S1's runner_up (s1_runner_up), behind S1's choice the local auto-route replaced"})
+        route = {**old, "chosen": chosen, "runner_up": old.get("chosen"), "s1_runner_up": s1_runner_up,
+                 "skipped": skipped or None,
                  "hard_rules": list(old.get("hard_rules") or []) + [
                      f"local auto-route: band {band} is in {node['lane']}'s auto_route bands and the node is available; "
                      f"{pin} instead of {r.get('provider')}/{r.get('model')}"]}

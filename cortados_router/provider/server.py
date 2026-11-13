@@ -1575,7 +1575,7 @@ class Handler(BaseHTTPRequestHandler):
             outcome = "incomplete"
             try:
                 outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model,
-                                           reply=reply)
+                                           reply=reply, auto_routed=not route.get("pinned"))
             except Exception as exc:             # serve handles its own I/O; anything else must still clean up
                 logger.exception("local lane: relay failed")
                 outcome = "incomplete"
