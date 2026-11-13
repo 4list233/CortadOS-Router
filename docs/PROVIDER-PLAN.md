@@ -117,9 +117,10 @@ Not yet in P1, each needing a decision or another phase:
 
 - Routing: see P1 status above. `--fixed-model` restores the P0 behaviour (one Claude CLI model, no routing).
 - A conversation lives in one CLI process and is identified by the exact sequence of replies the endpoint wrote
-  (text and tool_use ids). If the endpoint restarts, or the client compacts or edits its history, the next request
-  fails with 409 instead of rebuilding the session from the transcript. Two live conversations with identical
-  histories (same opening, same text-only replies) are refused with 409 rather than guessed between.
+  (text and tool_use ids). If the endpoint restarts the next request fails with 409. If the client compacts or edits
+  its history, the session is REBUILT (issue #43, `Registry._rebuild_or_refuse` / `Registry.rebuild`, see (f) below).
+  Two live conversations with identical histories (same opening, same text-only replies) are refused with 409 rather
+  than guessed between.
   What the match compares (`Registry.find`: `session.history == turn.history`, the list of `reply_fingerprint`s,
   sha256 of each assistant message's trimmed text + tool_use ids) decides each history rewrite (2026-11-03, tests in
   `tests/test_provider.py`): (a) old tool_result content replaced by a placeholder (Claude Code microcompaction) is
@@ -127,7 +128,7 @@ Not yet in P1, each needing a decision or another phase:
   summary user message leaves no assistant message, so the request opens a new conversation (not a 409); a compacted
   history that keeps some but not all earlier assistant messages is a 409. (c) A removed or edited assistant message,
   or a different tool_use id, is a 409: never continued, because the CLI session would answer from a history the
-  client no longer has. Rebuilding (b)/(c) from the transcript is still open. The live 409 bursts of 2026-11-03
+  client no longer has. (b)/(c) are now rebuilt, see (f). The live 409 bursts of 2026-11-03
   (12:32-12:42, ~40 across several long `claude -p` sessions; no restart, no sleep, reaper last ran 12:07) are NOT
   explained by (a) or the reaper. Leading hypothesis: a lost/timed-out response retried by the client. The session
   already holds turn N's reply, the retry's history is one reply shorter, and that 409 poisons every later request.
@@ -151,6 +152,27 @@ Not yet in P1, each needing a decision or another phase:
   several live sessions hold the exact history. From the turn worker, after waiting for the session lock:
   `class=closed_while_waiting` or `class=moved_on_while_waiting` with `conversation=<id> request_len=<n>`
   (and `candidate_len` for the latter). The next burst's log lines say which case it was.
+  (f) Rebuild after a rewritten history (issue #43, 2026-11-13). A continuation that matches no live session exactly,
+  is not a replayable retry and hits no tombstone is served on a REBUILT backend when exactly one live session in the
+  request's scope (wire + client + conversation identity, as for replay) and on its wire wrote the request's LAST
+  reply. The rebuilt backend runs on that session's route (provider, model, account, frozen Codex home: no re-routing,
+  no second route log), with the request's own system prompt and tools, from the same factory as any session (so the
+  Claude CLI's `--tools ""` / strict MCP config and the Codex isolation checks hold unchanged). Its first user message
+  is `anthropic_wire.REBUILD_NOTE`, the client's history before the new turn as a labelled transcript
+  (`<user>`/`<assistant>`/`<operator>`; tool calls and results as text paired by call id; thinking dropped; images
+  named, not carried; any block over `REBUILD_BLOCK_CHARS` = 100k characters cut, the cut stated), then the new turn,
+  its tool results as text by call id (the fresh backend never issued those calls, so nothing is delivered to a
+  pending call) and their images as image blocks. Two shapes: the request's last reply is the session's last reply
+  (compaction, an edited earlier message): the old session is closed once the new one exists, under its turn lock
+  (a running turn answers a retryable 529; a backend that cannot start answers 502 and leaves the old session
+  untouched); or it is an earlier reply (a rewind, an edited message resent): a BRANCH, and the old session is kept,
+  because such a request cannot be told from a side request the client forks from its live loop. Bounded by
+  `REBUILD_MAX` = 5 per conversation lineage (each rebuild replays the whole history uncached). The log line is
+  `conversation <old> rebuilt as <new> ... (compacted: old session closed | branched: old session kept; rebuild n of
+  5; ...)`. 409 remains, with the reason in the message and `rebuild=refused:<code>` on the `409 lost conversation`
+  line, for: `no_identity` (no conversation identity header), `no_writer` (no live session of this client wrote the
+  last reply: restart, reap, an edited last reply), `ambiguous_writer` (more than one did) and `limit`. A full
+  compaction with no assistant message left still opens a new, freshly routed conversation, as in (b).
 - Requests without tools (titles, summaries) always get their own throwaway CLI with the conversation as text.
 - Only `tool_choice: auto` is accepted (400 otherwise). `max_tokens` is not enforced: the CLI has no output-cap flag.
 - Responses are sent as SSE after the turn completes (with pings while waiting), not token by token.
@@ -409,7 +431,8 @@ tool type; optional, later.
    Read ran in the client, the log shows `instructionSources` and no isolation error.
 
 **P2 known limits.**
-- A running CLI keeps the system prompt it started with. A continuation whose system text differs (a changed
+- A running CLI keeps the system prompt it started with (a rebuilt one, #43, starts with the rebuilding request's).
+  A continuation whose system text differs (a changed
   Responses `instructions`, a rewritten developer item before the first reply) is served under the original with a
   WARNING naming the conversation; a developer item after a reply is passed as operator text instead (above).
 - Usage: both bridges report the Messages shape (input excludes cache reads/writes); the Responses wire adds them

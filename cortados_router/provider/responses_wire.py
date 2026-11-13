@@ -314,6 +314,43 @@ def _messages_of(body: dict[str, Any], *, with_tools: bool) -> list[dict[str, An
     return messages
 
 
+def history_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """The input items before the new turn as Anthropic-shaped messages, for a rebuilt backend's seed
+    (anthropic_wire.rebuild_transcript): user and assistant messages, function_call as tool_use and
+    function_call_output as tool_result (paired by call_id). Developer/system items are left out: they are the system
+    prompt the rebuilt backend starts with (ClientTurn.system). Codex's injected context blocks stay: the client meant
+    the model to see them. An earlier item whose content _blocks_of refuses is carried as its JSON, never a 400 (the
+    request already parsed: parse_request validated the shapes a turn needs)."""
+    def blocks_of(content: Any) -> list[dict[str, Any]]:
+        try:
+            return _blocks_of(content)
+        except WireError:
+            return [{"type": "_raw", "content": content}]
+
+    items = [it for it in (body.get("input") or []) if isinstance(it, dict)]
+    kept = [(_classify(it), it) for it in items]
+    kept = [(s, it) for s, it in kept if s != "skip"]
+    start = max((i + 1 for i, (s, _) in enumerate(kept) if s == "assistant"), default=0)
+    messages: list[dict[str, Any]] = []
+    for side, it in kept[:start]:
+        kind = it.get("type", "message")
+        if side == "system":
+            continue
+        if kind == "function_call":
+            role, blocks = "assistant", [_tool_use_block(it)]
+        elif kind == "function_call_output":
+            output = it.get("output")
+            role, blocks = "user", [{"type": "tool_result", "tool_use_id": str(it.get("call_id")),
+                                     "content": blocks_of(output)}]
+        else:
+            role, blocks = side, blocks_of(it.get("content"))
+        if messages and messages[-1]["role"] == role:
+            messages[-1]["content"] += blocks          # consecutive items of one side are one message
+        else:
+            messages.append({"role": role, "content": list(blocks)})
+    return messages
+
+
 def _injected(block: dict[str, Any]) -> bool:
     return block["type"] == "text" and block["text"].lstrip().startswith(CODEX_INJECTED_PREFIXES)
 

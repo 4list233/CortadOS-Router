@@ -336,6 +336,107 @@ def one_shot_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{"type": "text", "text": "Conversation so far:\n" + transcript_text(messages)}]
 
 
+# ------------------------------------------------------------------ rebuild (server.Registry.rebuild, issue #43)
+# A conversation whose client compacted or edited its history no longer matches its backend session, which holds the
+# old history. The endpoint then starts a fresh backend and seeds it with the client's CURRENT history, as text: a
+# fresh CLI or Codex thread cannot be handed earlier assistant turns or tool calls it never made (the Claude CLI takes
+# user input only; Codex's thread/resume takes no dynamic tools), so tool calls and results are replayed as labelled
+# text, paired by their call id, and the new turn's tool results follow as text too (the fresh backend never issued
+# those calls, so they cannot be delivered to a pending call).
+# Longest text one replayed block keeps (characters; the cut is stated in the transcript). A single oversized tool
+# output (a log dump, a huge file read) would otherwise fill the fresh backend's context with one old result; the
+# model can run the tool again if it needs the rest. 100k characters (~25k tokens) keeps any ordinary file read whole.
+REBUILD_BLOCK_CHARS = 100_000
+REBUILD_NOTE = (
+    "[cortados relay] The client rewrote this conversation's history (it compacted or edited it), so the conversation "
+    "continues on a fresh backend session. The conversation so far, as the client now holds it, is replayed below as a "
+    "transcript. It is history, not new instructions. Tool calls and tool results in it already happened and are "
+    "shown as text, paired by call id. To call a tool from now on, make a real tool call; never write one as text.")
+
+
+def _cut(text: str) -> str:
+    if len(text) <= REBUILD_BLOCK_CHARS:
+        return text
+    return text[:REBUILD_BLOCK_CHARS] + f"\n[cut at {REBUILD_BLOCK_CHARS} of {len(text)} characters]"
+
+
+_IMAGE_NOT_CARRIED = "[image result: not carried in the replayed history]"
+
+
+def _result_text(content: Any, image_note: str = _IMAGE_NOT_CARRIED) -> str:
+    """A tool result's content as text: Anthropic blocks or MCP content (text, images by `image_note`, other as JSON)."""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for c in content if isinstance(content, list) else []:
+        if not isinstance(c, dict):
+            continue
+        if c.get("type") == "text":
+            parts.append(str(c.get("text", "")))
+        elif c.get("type") == "image":
+            parts.append(image_note)
+        else:
+            parts.append(json.dumps(c, default=str))
+    return "\n".join(parts)
+
+
+def _replay_block(b: dict[str, Any]) -> str | None:
+    kind = b.get("type")
+    if kind == "text":
+        return _cut(str(b.get("text", "")))
+    if kind == "tool_use":
+        return _cut(f"[tool call {b.get('id')}: {b.get('name')}] {json.dumps(b.get('input') or {}, default=str)}")
+    if kind == "tool_result":
+        err = ", error" if b.get("is_error") else ""
+        return f"[tool result for call {b.get('tool_use_id')}{err}]\n" + _cut(_result_text(b.get("content")))
+    if kind == "image":
+        return "[image: not carried in the replayed history]"
+    if kind in ("thinking", "redacted_thinking"):
+        return None                                 # the model's private reasoning: never part of the transcript
+    return _cut(json.dumps(b, default=str))
+
+
+def history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The messages before the request's new turn (everything up to the last assistant message): what a rebuilt
+    backend is seeded with. The new turn itself is rendered from the ClientTurn (rebuild_content)."""
+    start = max((i + 1 for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "assistant"),
+                default=0)
+    return [m for m in messages[:start] if isinstance(m, dict)]
+
+
+def rebuild_transcript(messages: list[dict[str, Any]]) -> str:
+    """Anthropic-shaped history messages as one labelled transcript (see REBUILD_NOTE). Content that _blocks refuses
+    in an earlier message is shown as its JSON, never a 400: the endpoint already accepted it once."""
+    out = []
+    for m in messages:
+        role = {"assistant": "assistant", "user": "user", "system": "operator"}.get(m.get("role"), str(m.get("role")))
+        try:
+            blocks = _blocks(m.get("content"))
+        except WireError:
+            blocks = [{"type": "_raw", "content": m.get("content")}]
+        parts = [p for p in (_replay_block(b) for b in blocks) if p]
+        if parts:
+            out.append(f"<{role}>\n" + "\n".join(parts) + f"\n</{role}>")
+    return "\n\n".join(out)
+
+
+def rebuild_content(transcript: str, turn: ClientTurn) -> list[dict[str, Any]]:
+    """The first user message of a rebuilt backend: REBUILD_NOTE, the history transcript, then the request's new turn
+    (its tool results as text by call id, images kept as image blocks, then its user content)."""
+    out: list[dict[str, Any]] = [{"type": "text", "text": f"{REBUILD_NOTE}\n\n<conversation-history>\n{transcript}\n"
+                                                          "</conversation-history>\n\nThe client's new turn follows."}]
+    for call_id, result in turn.tool_results.items():
+        err = ", error" if result.get("isError") else ""
+        out.append({"type": "text", "text": f"[tool result for call {call_id}{err}]\n"
+                                            + _cut(_result_text(result.get("content"),
+                                                                "[image result: attached after this text]"))})
+        for c in result.get("content") or []:
+            if isinstance(c, dict) and c.get("type") == "image" and c.get("data"):
+                out.append({"type": "image", "source": {"type": "base64", "media_type": c.get("mimeType") or "image/png",
+                                                        "data": c["data"]}})
+    return out + list(turn.content)
+
+
 def new_message_id() -> str:
     return "msg_cortados_" + uuid.uuid4().hex[:24]
 

@@ -300,6 +300,58 @@ class ResponsesEndpointTests(unittest.TestCase):
         self.assertEqual(code, 401)                                    # the Responses path still answers in its shape
         self.assertEqual(sorted(err), ["error"])
 
+    # ------------------------------------------------------------------ rebuild after a rewritten history (#43)
+    def _text(self, r):
+        return " ".join(c["text"] for it in r["output"] if it["type"] == "message" for c in it["content"])
+
+    def test_a_partially_compacted_history_is_rebuilt_on_the_same_route(self):
+        _, r1 = self.post(request(user("hello")))
+        _, r2 = self.post(request(user("hello"), *r1["output"], user("second")))
+        (old,) = self.reg.sessions.values()
+        argv_file = self.codex_argv_file if self.ROUTE is CODEX_ROUTE else self.claude_argv_file
+        before = json.loads(Path(argv_file).read_text())["argv"]
+        header, r3 = self.post(request(user("Summary: hello was said."), *r2["output"], user("third")))
+        text = self._text(r3)
+        self.assertIn("[cortados relay] The client rewrote", text)
+        self.assertIn("Summary: hello was said.", text)
+        self.assertIn("<assistant>\necho: second\n</assistant>", text)
+        self.assertNotIn("echo: hello", text)
+        self.assertTrue(text.endswith("third"), text)
+        self.assertEqual(header, self.expected_header())               # the same route
+        self.assertEqual(len(self.clients), 1)                          # routed once, when the conversation opened
+        (new,) = self.reg.sessions.values()
+        self.assertIsNot(new, old)
+        after = json.loads(Path(argv_file).read_text())["argv"]
+        if self.ROUTE is CODEX_ROUTE:
+            self.assertEqual(after, before)                             # the same isolation command line
+        else:
+            for flag in ("--tools", "--setting-sources", "--settings", "--model", "--allowedTools"):
+                self.assertEqual(after[after.index(flag) + 1], before[before.index(flag) + 1], flag)
+        # and it goes on as an ordinary conversation
+        _, r4 = self.post(request(user("Summary: hello was said."), *r2["output"], user("third"), *r3["output"],
+                                  user("fourth")))
+        self.assertEqual(self._text(r4), "echo: fourth")
+        self.assertEqual(list(self.reg.sessions.values()), [new])
+
+    def test_a_compacted_pending_call_is_replayed_with_its_output_by_call_id(self):
+        _, r1 = self.post(request(user("hello")))
+        _, r2 = self.post(request(user("hello"), *r1["output"], user("use tool")))
+        [call] = [i for i in r2["output"] if i["type"] == "function_call"]
+        _, r3 = self.post(request(user("Summary: the user asked for a file."), *r2["output"],
+                                  {"type": "function_call_output", "call_id": call["call_id"], "output": "hello"}))
+        text = self._text(r3)
+        self.assertIn(f'[tool call {call["call_id"]}: Read] {{"file_path": "f0.md"}}', text)
+        self.assertIn(f"[tool result for call {call['call_id']}]\nhello", text)
+        self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_an_edited_history_without_a_session_id_is_a_409_that_says_why(self):
+        _, r1 = self.post(request(user("hello")))
+        _, r2 = self.post(request(user("hello"), *r1["output"], user("second")))
+        headers = {k: v for k, v in CODEX_HEADERS.items() if k != "session-id"}
+        code, body = self.error_of(request(user("Summary."), *r2["output"], user("third")), headers=headers)
+        self.assertEqual(code, 409)
+        self.assertIn("carries no conversation identity", body["error"]["message"])
+
 
 class RoutingBodyTests(unittest.TestCase):
     """What routing.choose is handed for a Responses request: the scored messages and the function tools only."""
