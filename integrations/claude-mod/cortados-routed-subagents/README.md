@@ -12,8 +12,11 @@ provider, while the main session keeps its own direct model.
 answer), and a gate that refuses the main session's own Agent-tool calls with a message naming `start_task`. Reason:
 the owner's rule (`~/.config/ai-coding/CORTADOS-ORCHESTRATOR.md`) names cortados-route as the only delegation path of
 the top-level session, and a routed Agent child dies with the session's hooks (2026-11-08: six builders aborted with
-`HooksError: $.process.run(claude) aborted`). Only the top-level session is gated: subagents (any call carrying an
-`agentId`) and CortadOS child tasks (which run with this plugin disabled) do their work directly.
+`HooksError: $.process.run(claude) aborted`). Since 2026-11-12 a **balanced gate** (on by default) also refuses the
+clearly delegatable work on the main loop — web research, big or repeated edits, build/test and long-running Bash —
+and fails open when the router is unreachable (see **Orchestrator gate**). Only the top-level session is gated:
+subagents (any call carrying an `agentId`) and CortadOS child tasks (which run with this plugin disabled, and carry
+`CORTADOS_CHILD_TASK`) do their work directly.
 
 **Routing**: when a loop that is not gated calls the Agent tool to spawn a subagent, this mod intercepts the call and
 instead runs the subagent as a headless `claude` process **on this machine**, pointed at the CortadOS provider
@@ -58,9 +61,11 @@ Then set the provider URL (and, if you keep the token inline rather than in a fi
 
 Runs under the Claude desktop app as well as the CLI: the child is started with `CLAUDE_CODE_ENTRYPOINT=cli` so it authenticates with the provider token rather than the host's claude.ai session.
 The child starts with an empty MCP config (built-in tools only); the parent's MCP servers are never exposed to the provider.
-| `orchestratorMode` | `true` | Direct the main session to plan and delegate through `mcp__cortados-route__start_task` / `route_task`, and **refuse its own Agent-tool calls** (see **Orchestrator mode**). Guidance for every other tool: the brain keeps them. |
-| `orchestratorEnforce` | `false` | Also **hard-block** every tool outside `orchestratorAllowedTools` on the main loop (a strict brain that cannot act even if it tried). Off by default — the directive is trusted, and with cortados-route not connected the brain must be able to do the work itself. |
-| `orchestratorAllowedTools` | `Read,Grep,Glob,TodoWrite,AskUserQuestion,ExitPlanMode,Skill,ToolSearch` | Allowlist used **only when `orchestratorEnforce` is on**: the tools the brain may run itself; everything else is refused and must be delegated. The cortados-route tools (`mcp__cortados-route__*`) are always allowed regardless; `Agent` is always refused. |
+| `orchestratorMode` | `true` | Direct the main session to plan and delegate through `mcp__cortados-route__start_task` / `route_task`, and **refuse its own Agent-tool calls** (see **Orchestrator mode**). Off turns the gate off too. |
+| `orchestratorGate` | `balanced` | The main-loop gate (see **Orchestrator gate**): `balanced` refuses clearly delegatable work and fails open when the router is unreachable; `strict` is the allowlist cage; `off` leaves only the Agent refusal. A mistyped value is `balanced`. `/cortados-gate off\|balanced\|strict` overrides it for one session. |
+| `orchestratorEditBudget` | `2` | Under `balanced`: small edits (`Edit`/`Write`/`MultiEdit`) the main loop may make itself per user turn; the next one is refused. Big edits are refused at once. |
+| `orchestratorEnforce` | `false` | Backward-compatible alias: `true` means `orchestratorGate: strict` (every tool outside `orchestratorAllowedTools` is refused on the main loop). |
+| `orchestratorAllowedTools` | `Read,Grep,Glob,TodoWrite,AskUserQuestion,ExitPlanMode,Skill,ToolSearch` | Allowlist used **only under `strict`**: the tools the brain may run itself; everything else is refused and must be delegated. The cortados-route tools (`mcp__cortados-route__*`) are always allowed regardless; `Agent` is always refused. |
 | `excludeBuilderOnReview` | `true` | When a routed Agent call is a review (see **Independent reviews**), send `x-cortados-exclude-model` to the provider with the **main session's own model** plus the models routed (non-review) subagents built with since the last review (up to 3), so that review is kept off them on every lane. |
 | `mainSessionGuard` | `true` | Warn-only nudge when the **main session** does substantive work itself (see **Main-session guard**). Never blocks. `/cortados-guard on\|off` overrides it. |
 | `officeView` | `true` | Feed the CortadOS **Office view** (`GET /v1/cortados/office`): each routed request carries `x-cortados-session` (sha256 of a per-install salt kept in the mod's store and the session id, cut to 16 hex; never the raw id), `x-cortados-project` (the project folder's name), `x-cortados-device` (`hostname -s`) and `x-cortados-task-title` (the Agent call's description, 80 printable ASCII chars at most); the main session POSTs `/v1/cortados/office/heartbeat` with its status and current tool **name** on session start/end, turn end and tool calls (on change at most every 2 s, else every 30 s; serialized and coalesced with a trailing send; tool hooks never wait, session end flushes and awaits `ended`; a slow fetch is noted after 2 s but retains the send lock until it settles because the host HTTP API cannot cancel requests; a failure is noted once in the transcript). Metadata only: never prompt text, tool input or file contents. Takes effect after a Claude Code restart. |
@@ -85,28 +90,73 @@ is delegated through the `cortados-route` MCP server. Three parts:
   pass-through, whatever the subagent type — with a message naming `mcp__cortados-route__start_task` /
   `route_task` and the fallback above (tell the owner in one line, do the work directly). Reason: the owner's rule, and
   the 2026-11-08 incident where six Agent-tool builders aborted with `HooksError: $.process.run(claude) aborted`. This
-  applies even with `orchestratorEnforce` off. It never applies to a call carrying an `agentId` (a subagent, teammate
+  applies at every gate level, `off` included. It never applies to a call carrying an `agentId` (a subagent, teammate
   or engine fork: those Agent calls are routed as before) nor to a CortadOS child task (it runs with this plugin
   disabled via its settings file, and its directive says to do the work itself).
-- **Hard enforcement is opt-in.** Every tool other than Agent is **guidance, not a cage** by default: the brain keeps
-  Bash, edits, web and MCP tools and may use them (the warn-only guard below nudges it). This is why a session with
-  `orchestratorMode: true` and no `orchestratorEnforce` runs Bash on the main loop: the allowlist gate is only
-  registered when `orchestratorEnforce` is `true`. Set it to additionally refuse, on the main loop, every tool not in
-  `orchestratorAllowedTools` — so a brain that forgets or hallucinates still cannot do the work itself. An allowlist is
-  used (not a denylist) precisely because a denylist would miss mutating tools like `Monitor`, `memory_write`, or
-  `ExitWorktree`; the `mcp__cortados-route__*` tools are always allowed so delegation is never locked out. The refusal
-  names `start_task`. Be aware that enforce is a cage by choice: with it on and cortados-route not connected, the
-  brain cannot work until it is turned off, and the refusal says so. Subagents are never gated — they run the full
-  toolset (and are themselves routed).
+- The **orchestrator gate** (`balanced` by default; below) refuses delegatable work on the main loop.
 
 The result: the top model is the brain and work flows through CortadOS child tasks, while the brain can still handle
-the odd trivial thing itself unless you turn on strict enforcement. Turn the whole thing off with `orchestratorMode:
-false` (the mod then only routes Agent-tool subagents, the main session's included, without directing it at all).
+the odd trivial thing itself (and anything only it can do). Turn the whole thing off with `orchestratorMode: false`
+(the mod then only routes Agent-tool subagents, the main session's included, without directing it at all).
+
+## Orchestrator gate
+
+**Why.** Over 28 h before 2026-11-12, seven main sessions with orchestrator mode on made **zero** `start_task` /
+`route_task` calls and did the work themselves (WebSearch/WebFetch research, ~120 Bash, ~35 edits). The directive is
+guidance and was ignored, so the owner asked for it to be enforced automatically, every session, without repeating it.
+
+**What `balanced` (the default) refuses** on the main loop, with a message naming `mcp__cortados-route__start_task` /
+`route_task`, what to put in the task (goal, working folder, paths and context, outward effects, acceptance check) and
+how to switch the gate off:
+
+| Tool call | Decision | Why |
+| --- | --- | --- |
+| `WebSearch`, `WebFetch` | **deny** | Research: `route_task` returns a researched text answer, `start_task` a child that can browse and write files. |
+| `NotebookEdit` | **deny** | Implementation work. |
+| `Edit` / `Write` / `MultiEdit`, big (over 40 lines or 2000 chars of new content, the guard's thresholds) | **deny** at once | Implementation work. |
+| `Edit` / `Write` / `MultiEdit`, small | allow the first `orchestratorEditBudget` (2) per user turn, **deny** after | One or two touches is a trivial fix; a third in one turn is a stretch of implementation. A new user prompt resets the count. |
+| `Bash` build/test run (`python -m unittest/pytest`, `pytest`, `make`, `npm/yarn/pnpm build/test`, `claude plugin test`, as the guard detects them) | **deny** | Builds and test runs belong to the child that made the change. |
+| `Bash` with `run_in_background`, or `timeout` over 120 s | **deny** | Long-running work. 120 s is the Bash tool's own default timeout: inspection never needs more. |
+| `Bash` that is exactly start_task's `watch_command` (`[env CORTADOS_TASKS_DIR=… CORTADOS_EXEC_HOSTS_FILE=…] <python3> [-B] …/cortados_router/child_tasks.py --watch <task id>… [--timeout\|--interval\|--stall N]…`, optionally `; echo "exit $?"`) | allow, background and long timeout included | The orchestrator must run it in the background after every start_task. Anything else chained, piped, redirected or substituted makes it ordinary Bash again. |
+| other `Bash` (`git status/log/diff`, `ls`, `cat`, `curl …/health`, `ssh host one-liner`) | allow | Inspection. |
+| `Read`, `Grep`, `Glob`, `ToolSearch`, `Skill`, `AskUserQuestion`, `TodoWrite`, `ExitPlanMode`, `Monitor` | allow | Reading and the session's own bookkeeping. |
+| `mcp__cortados-route__*` | allow | Delegation itself. |
+| `mcp__claude-in-chrome__*` and every other MCP connector tool | allow | The signed-in browser and the connectors only exist in the main session; routed children on the Air have none yet. |
+| `mcp__ccd_turn__update_plan`, `mcp__ccd_turn__wrap_up`, `mcp__ccd_session__mark_chapter`, `Artifact*` | allow | Host plumbing and artifacts. |
+| `Agent` | **deny** (Agent gate above) | At every gate level. |
+
+**Fail open.** Before refusing, the gate checks that delegation can work: a `mcp__cortados-route__*` tool is in the
+session's tool pool and the provider's `GET /health` (the mod's `providerUrl` / `CORTADOS_PROVIDER_URL` / URL file; no
+token is sent) answers `{"ok": true}`, the whole check (tool discovery, URL resolution and the health request) within
+one 2 s deadline. The answer is cached for 60 s, so a burst of refusals costs one
+request. If either fails, the call **runs**, a toast says `CortadOS router unreachable (<reason>): gate off …` once per
+outage, and the status line reads `gate balanced; router unreachable: gate off (<reason>)` until the router is back.
+The allow path (reading, inspection, connectors) never makes that check. A bug in the gate itself also fails open (and
+is noted once in the transcript).
+
+**Never gated:** subagents, teammates and engine forks (any call with an `agentId`), CortadOS child tasks
+(`CORTADOS_CHILD_TASK` set; they also run with this plugin disabled), routed subagents (their hooks are disabled), and
+every session with `orchestratorMode` off.
+
+**Status line.** `gate balanced; 2 denied`, joined with the warn guard's counter when it has one
+(`gate balanced; 2 denied · main did 1 big edit; delegate with start_task`).
+
+**Turning it off.** `/cortados-gate off` (or `balanced` / `strict`) changes the level **for this session only**: it is
+kept in the mod's `$.store` under the session id, so it survives a mod reload and a resume of that session, while the
+next session starts at the configured level again (the last 64 sessions' overrides are kept). `/cortados-gate` with no
+argument reports the level, where it comes from and the denied count. To change the default for every session, set
+`orchestratorGate` (or `orchestratorMode: false`) in the plugin's config.
+
+**`strict`** (or `orchestratorEnforce: true`) is the old allowlist cage, unchanged: every main-loop tool outside
+`orchestratorAllowedTools`, the cortados-route tools and the host plumbing is refused — Bash, edits, web, Chrome and
+connector tools, `Monitor`, future tools — an allowlist precisely because a denylist would miss new mutating tools. It
+does **not** fail open (a cage by choice); its refusal says how to lower it (`/cortados-gate balanced` or `off`).
+
 
 ## Main-session guard (warn only)
 
 With `mainSessionGuard` on (the default), the mod watches the **main session's** `Edit`, `Write`, `NotebookEdit`
-and `Bash` calls and nudges it to delegate when one is substantive. It **never blocks, denies or rewrites a call**:
+and `Bash` calls that the orchestrator gate let through and nudges it to delegate when one is substantive. It **never blocks, denies or rewrites a call**:
 every call runs unchanged, and a failure in the guard itself is swallowed. Subagents, teammates and engine forks
 (any call carrying an `agentId`) are never watched.
 
@@ -116,9 +166,11 @@ A call is substantive when:
   lines or more than 2000 characters**. 40 lines is about one function or a screenful, so the directive's "trivial
   touch" (a one-line fix, a config tweak) stays far under it; 2000 characters catches long-but-few-lines content
   (minified JSON, prose) the line count would miss; or
-- a `Bash` command, in any `;`/`&&`/`|` segment and after leading `VAR=value` assignments, starts like a build or test
-  run: `python -m unittest` / `python -m pytest`, `pytest`, `make`, `npm`/`yarn`/`pnpm` `build` or `test` (with or
-  without `run`). A text heuristic, not a shell parse: `grep make Makefile` or `echo pytest` do not count.
+- a `Bash` command, in any `;`/`&&`/`|` segment outside quotes and after leading `VAR=value` assignments, starts like a
+  build or test run: `python -m unittest` / `python -m pytest`, `pytest`, `make`, `npm`/`yarn`/`pnpm` `build` or `test`
+  (with or without `run`), `claude plugin test`. A text heuristic, not a shell parse: `grep make Makefile`, `echo pytest`
+  or `ssh air "grep -E '(pytest|make) failed' log"` do not count, and a command whose quotes do not close is not counted
+  (the gate fails open on doubt).
 
 Each substantive call bumps a session counter shown on the mod's status line (`main did 3 big edits, 1 build/test
 run; delegate with start_task`) and shows a toast at most **once per 10 minutes** (one nudge per stretch of work;
@@ -288,7 +340,7 @@ Run the mod's tests in the native hook host (no model calls):
 CORTADOS_HOME=$(mktemp -d) CORTADOS_SCARCITY_REFRESH=off claude plugin test integrations/claude-mod/cortados-routed-subagents
 ```
 
-Run from the repository root. This covers `hooks/register.test.ts` and `hooks/guard.test.ts`.
+Run from the repository root. This covers `hooks/register.test.ts`, `hooks/guard.test.ts` and `hooks/gate.test.ts`.
 
 ## Notes
 

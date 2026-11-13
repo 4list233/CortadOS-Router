@@ -4,8 +4,9 @@
  * In orchestrator mode (the default) the main session is the CortadOS orchestrator: a standing directive tells it to
  * delegate through the cortados-route MCP tools (start_task / route_task), and its own Agent tool calls are REFUSED
  * (owner rule, ~/.config/ai-coding/CORTADOS-ORCHESTRATOR.md: a routed Agent child dies with the session's hooks;
- * 2026-11-08, six builders aborted). Only the top-level session is gated: a subagent carries an agentId and a CortadOS
- * child task runs with this plugin disabled.
+ * 2026-11-08, six builders aborted). A balanced gate (default, 2026-11-12) also refuses clearly delegatable work on
+ * the main loop and fails open when delegation cannot work (see "Orchestrator gate"). Only the top-level session is
+ * gated: a subagent carries an agentId and a CortadOS child task runs with this plugin disabled.
  *
  * Every other subagent the session spawns (below the main loop, or with orchestrator mode off) is intercepted at the
  * Agent tool call and run instead as a headless `claude` subprocess ON THIS MACHINE, pointed at the CortadOS provider
@@ -47,6 +48,8 @@ type Cfg = {
   routeBackground: boolean
   orchestratorMode: boolean
   orchestratorEnforce: boolean
+  orchestratorGate: string
+  orchestratorEditBudget: number
   orchestratorAllowedTools: string
   subagentTimeoutMs: number
   backgroundTimeoutMs: number
@@ -70,13 +73,20 @@ const FALLBACK: Cfg = {
   // Orchestrator mode: the main session (the "brain") is DIRECTED to plan and delegate work through the cortados-route
   // MCP tools (start_task / route_task), via a standing system-prompt directive, and its own Agent tool calls are
   // REFUSED (owner rule, CORTADOS-ORCHESTRATOR.md 2026-11-08: a routed Agent child dies with this session's hooks;
-  // six builders aborted that day). For every other tool this is GUIDANCE, not a cage: the brain keeps them and may
-  // act directly when that is clearly the sensible choice (a trivial edit, its own bookkeeping, or when cortados-route
-  // is not connected) — delegation is the strong default, not an absolute rule. Turn on `orchestratorEnforce` to
-  // additionally HARD-BLOCK every tool outside `orchestratorAllowedTools` on the main loop (an allowlist, so even
-  // Monitor / memory_write / mcp__ tools / future tools are refused) for a strict brain that cannot act even if it tried.
+  // six builders aborted that day). Every other tool is held by the orchestrator gate below (orchestratorGate): the
+  // brain keeps what only it can do (reading, inspection, Chrome, connectors, a couple of small edits per turn), and
+  // the gate fails open when cortados-route is not connected or the provider is down.
   orchestratorMode: true,
+  // Backward-compatible alias: `orchestratorEnforce: true` is orchestratorGate 'strict' (the allowlist cage).
   orchestratorEnforce: false,
+  // The gate on the main loop (see GATE_* below). 'balanced' (default, owner 2026-11-12: the directive alone was
+  // ignored for 28 h) refuses clearly delegatable work — web research, NotebookEdit, big edits, more than
+  // orchestratorEditBudget small edits per user turn, build/test and long-running Bash — and fails open when
+  // cortados-route or the provider is unavailable. 'strict' is the allowlist cage; 'off' leaves only the Agent refusal.
+  // /cortados-gate off|balanced|strict overrides it for one session.
+  orchestratorGate: 'balanced',
+  // GATE_EDIT_BUDGET_DEFAULT (declared below, with its reason; a literal here, as FALLBACK is built first).
+  orchestratorEditBudget: 2,
   // The cortados-route tools (mcp__cortados-route__*) are the delegation primitives and are always allowed by
   // isDelegationTool(), whatever this list says, so they are not repeated here. Agent is NOT in this list: it is
   // refused on the main loop in orchestrator mode (see mainLoopAllows).
@@ -1037,8 +1047,13 @@ export const GUARD_STORE_KEY = 'mainSessionGuard'
 export const GUARD_COMMAND = 'cortados-guard'
 const GUARD_TOOLS = ['Edit', 'Write', 'NotebookEdit', 'Bash'] as const
 
-/** The new content a file-writing call carries: Edit's new_string, Write's content, NotebookEdit's new_source. */
+/** The new content a file-writing call carries: Edit's new_string, Write's content, NotebookEdit's new_source,
+ * MultiEdit's new_strings joined by newlines (all of them land in one call, so they are one edit's size). */
 export function newContentOf(tool: string, e: any): string {
+  if (tool === 'MultiEdit') {
+    const edits = Array.isArray(e?.edits) ? e.edits : []
+    return edits.map((x: any) => (typeof x?.new_string === 'string' ? x.new_string : '')).join('\n')
+  }
   const v = tool === 'Edit' ? e?.new_string : tool === 'Write' ? e?.content : tool === 'NotebookEdit' ? e?.new_source : ''
   return typeof v === 'string' ? v : ''
 }
@@ -1049,16 +1064,49 @@ export function isBigEdit(content: string): boolean {
   return content.split('\n').length > GUARD_EDIT_MAX_LINES || content.length > GUARD_EDIT_MAX_CHARS
 }
 
-/** A build or test run: python -m unittest/pytest, pytest, make, npm/yarn/pnpm build or test. Checked per command
- * segment (split on ; & | ( ) and newlines) after leading VAR=value assignments, so `cd x && make` matches while
- * `grep make Makefile` or `echo pytest` does not. A heuristic on the command text, not a parse of the shell. */
+/** The command split into its top-level segments on ; & | ( ) and newlines OUTSIDE quotes, or null when the quoting
+ * cannot be followed (an unclosed ' or ", a trailing backslash). Single quotes are literal to the next '; inside double
+ * quotes a backslash escapes the next character; outside quotes it does too. So `ssh air "grep -E '(pytest|make)' x"`
+ * is one segment, not three. Not a shell parser: $( ) and backticks inside double quotes are left inside the segment. */
+export function shellSegments(command: string): string[] | null {
+  const s = String(command ?? '')
+  const out: string[] = []
+  let cur = ''
+  let q: "'" | '"' | null = null
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (q === "'") { cur += ch; if (ch === "'") q = null; continue }
+    if (ch === '\\') {
+      if (i + 1 >= s.length) return null
+      cur += ch + s[++i]
+      continue
+    }
+    if (q === '"') { cur += ch; if (ch === '"') q = null; continue }
+    if (ch === "'" || ch === '"') { q = ch; cur += ch; continue }
+    if (/[;&|()\n]/.test(ch)) { if (cur.trim()) out.push(cur); cur = ''; continue }
+    cur += ch
+  }
+  if (q) return null
+  if (cur.trim()) out.push(cur)
+  return out
+}
+
+/** A build or test run: python -m unittest/pytest, pytest, make, npm/yarn/pnpm build or test, `claude plugin test`.
+ * Checked per top-level command segment (shellSegments: split on unquoted ; & | ( ) and newlines) after leading
+ * VAR=value assignments, so `cd x && make` matches while `grep make Makefile`, `echo pytest` or a quoted pattern like
+ * `ssh air "grep -E '(pytest|make) failed' log"` does not. A heuristic on the command text, not a parse of the shell.
+ * When the quoting cannot be followed the answer is false (allow): this feeds a gate that must fail open and a guard
+ * that only warns, and a command we cannot read is better run than refused with a reason that may be wrong. */
 export function isBuildOrTest(command: string): boolean {
-  for (const raw of String(command ?? '').split(/[;&|()\n]+/)) {
+  const segs = shellSegments(command)
+  if (!segs) return false
+  for (const raw of segs) {
     const seg = raw.trim().replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '')
     if (/^python[0-9.]*\s+(?:-\S+\s+)*-m\s+(?:unittest|pytest)\b/.test(seg)) return true
     if (/^(?:pytest|py\.test)(?:\s|$)/.test(seg)) return true
     if (/^g?make(?:\s|$)/.test(seg)) return true
     if (/^(?:npm|yarn|pnpm)\s+(?:run\s+)?(?:build|test)\b/.test(seg)) return true
+    if (/^claude\s+plugin\s+test(?:\s|$)/.test(seg)) return true
   }
   return false
 }
@@ -1155,6 +1203,314 @@ async function guardEnabled($: any, guard: GuardState, configDefault: boolean): 
 function guardPublish($: any, guard: GuardState, text: string | undefined): void {
   if (guard.routedActive > 0) return
   guardTry($, guard, 'status', () => $.ui.status(text))
+}
+
+// ---- Orchestrator gate (balanced by default): DENY delegatable work on the top-level session ---------------------
+// Owner, 2026-11-12: over 28 h, 7 main sessions with orchestrator mode on made ZERO start_task/route_task calls and
+// did the work directly (web research, ~120 Bash, ~35 Edits). Guidance text is ignored, so the work that is clearly
+// delegatable is refused on the main loop, with a message naming the tool to use. What only the main session can do
+// stays allowed: Chrome and connector MCP tools (routed children have no connectors or signed-in browser yet), reading,
+// short inspection Bash, a couple of small edits per turn. When delegation is impossible (cortados-route not in the
+// session, or the provider's /health fails) the gate FAILS OPEN and says so on the status line; the owner can switch it
+// off for one session with /cortados-gate off. 'strict' is the old orchestratorEnforce allowlist cage, unchanged.
+
+export type GateLevel = 'off' | 'balanced' | 'strict'
+export const GATE_LEVELS: readonly GateLevel[] = ['off', 'balanced', 'strict']
+export const GATE_COMMAND = 'cortados-gate'
+/** $.store key of the per-session /cortados-gate overrides: { [sessionId]: { level, at } }. Keyed by session so the
+ * escape hatch survives a mod reload and `claude --resume` of that session, but never silently turns the gate off for
+ * the owner's NEXT session (the point of the gate is that nobody has to remember to turn it on). */
+export const GATE_STORE_KEY = 'orchestratorGateBySession'
+/** At most this many session overrides are kept (newest first): one per session the owner switched, and 64 covers
+ * weeks of sessions while keeping the store entry a few KB. */
+export const GATE_STORE_MAX_SESSIONS = 64
+/** Small edits the main loop may make itself per user turn before the rest are refused. 2: the directive's "trivial
+ * touch" (fix a typo, bump a value, answer a review nit) is one or two edits; a third edit in the same turn is a
+ * stretch of implementation, which is what start_task is for. Big edits (GUARD_EDIT_MAX_*) are refused at once. */
+export const GATE_EDIT_BUDGET_DEFAULT = 2
+/** A Bash call asking for more than this timeout is a long-running job, refused like a background one. 120 s is the
+ * Bash tool's own default timeout: an inspection command never needs more, and asking for more declares a long run. */
+export const GATE_BASH_MAX_TIMEOUT_MS = 120_000
+/** How long one delegation-availability check (cortados-route tools present + provider /health) is trusted. 60 s: a
+ * provider that goes down is noticed within a minute, and a burst of denied calls costs one health request, not one
+ * each. */
+export const GATE_HEALTH_TTL_MS = 60_000
+/** The provider /health request is given 2 s: it answers from memory in milliseconds on the tailnet, and a tool call
+ * must not wait longer than that on a dead host before the gate fails open. */
+export const GATE_HEALTH_TIMEOUT_MS = 2_000
+
+/** A level from config or the command: 'off' | 'balanced' | 'strict' (case and spaces ignored), else null. */
+export function parseGateLevel(v: unknown): GateLevel | null {
+  const s = String(v ?? '').trim().toLowerCase()
+  return (GATE_LEVELS as readonly string[]).includes(s) ? (s as GateLevel) : null
+}
+
+/** The configured level. orchestratorMode off is always 'off'; `orchestratorEnforce: true` is the backward-compatible
+ * alias for 'strict'; otherwise `orchestratorGate`, where a missing or mistyped value is 'balanced' (a typo must never
+ * silently remove the gate the owner asked to have on by default). */
+export function configGateLevel(cfg: { orchestratorMode?: unknown; orchestratorEnforce?: unknown; orchestratorGate?: unknown }): GateLevel {
+  if (!cfg.orchestratorMode) return 'off'
+  if (cfg.orchestratorEnforce === true || cfg.orchestratorEnforce === 'true') return 'strict' // as the old Boolean(enforce) read it, minus junk
+  return parseGateLevel(cfg.orchestratorGate) ?? 'balanced'
+}
+
+/** The per-turn small-edit budget from config: a non-negative integer, else the default. */
+export function resolveEditBudget(v: unknown): number {
+  const n = typeof v === 'number' || typeof v === 'string' ? Number(v) : NaN
+  if (!Number.isFinite(n) || n < 0 || String(v).trim() === '') return GATE_EDIT_BUDGET_DEFAULT
+  return Math.floor(n)
+}
+
+/** One shell word made of plain path characters, or one single-quoted word (shlex.quote's form; nothing expands). */
+const W_PLAIN = "[A-Za-z0-9_./~+@%:,-]"
+const W_PATH_TO = (tail: string) => `(?:'(?:[^']*/)?${tail}'|(?:${W_PLAIN}*/)?${tail})`
+/** child_tasks.watch_command's shape, optionally followed by `; echo "exit $?"` (how orchestrators note the exit
+ * code): [env] [CORTADOS_TASKS_DIR=… CORTADOS_EXEC_HOSTS_FILE=…] <any python3> [-B] <…/cortados_router/child_tasks.py>
+ * --watch <task id>… [--timeout|--interval|--stall <seconds>]…. Spaces and tabs only (no newline), no other command,
+ * pipe, redirect, substitution or variable: anything else is not the watcher and is classed as usual. */
+const W_TASK_ID = 't[0-9]{14}-[0-9a-f]{8}' // child_tasks.TASK_ID_RE
+const W_FLAG = '--(?:timeout|interval|stall)[ \\t]+[0-9]+(?:\\.[0-9]+)?'
+const TASK_WATCH_RE = new RegExp(
+  '^[ \\t]*(?:env[ \\t]+)?' +
+  `(?:CORTADOS_(?:TASKS_DIR|EXEC_HOSTS_FILE)=(?:'[^']*'|${W_PLAIN}+)[ \\t]+)*` +
+  W_PATH_TO('python3(?:\\.[0-9]+)?') + '(?:[ \\t]+-B)?[ \\t]+' +
+  W_PATH_TO('cortados_router/child_tasks\\.py') + '[ \\t]+--watch' +
+  `(?:[ \\t]+${W_FLAG})*[ \\t]+${W_TASK_ID}(?:[ \\t]+(?:${W_TASK_ID}|${W_FLAG}))*` +
+  '(?:[ \\t]*;[ \\t]*echo[ \\t]+(?:"exit \\$\\?"|exit[ \\t]+\\$\\?))?[ \\t]*$',
+)
+
+/** Whether a Bash command is exactly the task watcher start_task hands back (`watch_command`), which AGENTS.md has
+ * the orchestrator run in the background after every start_task: it only polls task_status, so it is the
+ * orchestrator's own plumbing, not delegatable work, and must pass the background/timeout check. Narrow on purpose
+ * (TASK_WATCH_RE): at least one task id of the t<14 digits>-<8 hex> shape, nothing chained but the exit echo. */
+export function isTaskWatchCommand(command: unknown): boolean {
+  return typeof command === 'string' && TASK_WATCH_RE.test(command)
+}
+
+export type GateClass = 'web' | 'notebook' | 'big-edit' | 'edit' | 'build' | 'long-bash' | null
+
+const EDIT_TOOLS: ReadonlySet<string> = new Set(['Edit', 'Write', 'MultiEdit'])
+
+/** What a main-loop call is under the balanced gate: a deny class, 'edit' (a small edit, refused only past the
+ * per-turn budget), or null (allowed: everything else — reading, inspection Bash, Chrome and connector MCP tools,
+ * host plumbing, the cortados-route tools; Agent is the Agent hook's). Pure, so the allow path costs no $ call. */
+export function balancedClass(tool: string, e: any): GateClass {
+  if (tool === 'WebSearch' || tool === 'WebFetch') return 'web'
+  if (tool === 'NotebookEdit') return 'notebook'
+  if (EDIT_TOOLS.has(tool)) return isBigEdit(newContentOf(tool, e)) ? 'big-edit' : 'edit'
+  if (tool === 'Bash') {
+    if (isTaskWatchCommand(e?.command)) return null // the mandated background watcher: see isTaskWatchCommand
+    if (isBuildOrTest(e?.command)) return 'build'
+    const t = Number(e?.timeout)
+    if (e?.run_in_background === true || (Number.isFinite(t) && t > GATE_BASH_MAX_TIMEOUT_MS)) return 'long-bash'
+  }
+  return null
+}
+
+/** How every deny message ends: what to put in a delegated task, and the per-session escape hatch. */
+const GATE_HOW =
+  'Delegate it: mcp__cortados-route__start_task for work with files, shell or tools (a CortadOS child session; give ' +
+  'it the goal, the working folder, paths and prior decisions, every outward effect, and an acceptance check) or ' +
+  'mcp__cortados-route__route_task for a self-contained text answer (put every fact it needs in the task; it cannot ' +
+  'see this conversation). Load them with ToolSearch if they are deferred. If this step truly needs this session, ask ' +
+  `the owner to type /${GATE_COMMAND} off (this session only).`
+
+/** The deny text for a balanced-gate class. Names the tool, why it is delegated, and GATE_HOW. */
+export function gateDenyMessage(cls: Exclude<GateClass, null>, tool: string, budget: number): string {
+  const what =
+    cls === 'web' ? `${tool} (web research) is delegated work — route_task returns a researched text answer, start_task a child that can browse and write files`
+    : cls === 'notebook' ? 'NotebookEdit is delegated work'
+    : cls === 'big-edit' ? `this ${tool} is a big edit (over ${GUARD_EDIT_MAX_LINES} lines or ${GUARD_EDIT_MAX_CHARS} characters of new content), which is implementation work`
+    : cls === 'edit' ? `this session already made ${budget} small edit${budget === 1 ? '' : 's'} this turn; more is implementation work`
+    : cls === 'build' ? 'this Bash command is a build or test run'
+    : `this Bash command is long-running (run_in_background, or a timeout over ${fmtSecs(GATE_BASH_MAX_TIMEOUT_MS)})`
+  return `CortadOS gate (balanced): ${what}. ${GATE_HOW}`
+}
+
+/** The strict level's deny text (today's orchestratorEnforce cage), with the per-session escape hatch. */
+export function strictDenyMessage(tool: string): string {
+  if (tool === 'Agent') return AGENT_REFUSAL
+  return `Orchestrator mode (enforced): the brain plans and delegates — it does not run ${tool} itself. ` +
+    `Delegate with mcp__cortados-route__start_task (a CortadOS child session with tools on this machine) or ` +
+    `mcp__cortados-route__route_task (a text answer) instead of calling ${tool} directly. If cortados-route is ` +
+    `not connected, tell the owner in one line: direct work needs the gate lowered (/${GATE_COMMAND} balanced or off, ` +
+    `this session only) or orchestratorEnforce turned off.`
+}
+
+/** The gate's part of the status line: undefined until it has something to say (a refusal, or failing open). */
+export function gateStatusText(level: GateLevel, denied: number, unreachable: string | null): string | undefined {
+  if (level === 'off') return undefined
+  const parts: string[] = []
+  if (unreachable) parts.push(`router unreachable: gate off (${unreachable})`)
+  if (denied) parts.push(`${denied} denied`)
+  return parts.length ? `gate ${level}; ${parts.join('; ')}` : undefined
+}
+
+export type Availability = { ok: true } | { ok: false; reason: string }
+
+export type GateState = {
+  /** The /cortados-gate override for this session, once read; undefined = none (the config decides). */
+  override: GateLevel | undefined
+  /** The session id the override was read for; a different id (/clear, resume) reads again. */
+  overrideFor: string | null
+  /** The whole per-session override map as last read or written. */
+  map: Record<string, { level: GateLevel; at: number }> | null
+  gen: number
+  /** Small edits made on the main loop since the last user prompt. */
+  edits: number
+  denied: number
+  /** null while delegation was last found possible; else the one-line reason the gate is failing open. */
+  unreachable: string | null
+  checkedAt: number
+  checking: Promise<Availability> | null
+  /** CORTADOS_CHILD_TASK, read once: a CortadOS child task is never gated (it runs with this plugin disabled anyway). */
+  childTask: boolean | null
+}
+
+export function newGateState(): GateState {
+  return { override: undefined, overrideFor: null, map: null, gen: 0, edits: 0, denied: 0, unreachable: null, checkedAt: -Infinity, checking: null, childTask: null }
+}
+
+/** The override map from the store, cleaned: unknown levels and junk entries dropped. */
+export function parseGateMap(v: unknown): Record<string, { level: GateLevel; at: number }> {
+  const out: Record<string, { level: GateLevel; at: number }> = {}
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return out
+  for (const [k, x] of Object.entries(v as Record<string, any>)) {
+    const level = parseGateLevel(x?.level)
+    if (k && level) out[k] = { level, at: Number.isFinite(Number(x?.at)) ? Number(x.at) : 0 }
+  }
+  return out
+}
+
+/** The map with `id` set to `level`, keeping only the newest GATE_STORE_MAX_SESSIONS entries. */
+export function withGateOverride(map: Record<string, { level: GateLevel; at: number }>, id: string, level: GateLevel, at: number) {
+  const all = { ...map, [id]: { level, at } }
+  const keep = Object.entries(all).sort((a, b) => b[1].at - a[1].at).slice(0, GATE_STORE_MAX_SESSIONS)
+  return Object.fromEntries(keep) as Record<string, { level: GateLevel; at: number }>
+}
+
+/** Whether delegation can work right now: a cortados-route tool is in this session's tool pool, and the provider's
+ * /health answers ok. ONE deadline, GATE_HEALTH_TIMEOUT_MS, covers the whole check (tool discovery, provider-URL
+ * resolution, which may run a process or read a file, and the health request): whichever step hangs, the tool call
+ * waits at most that long before the gate fails open, and the reason names the step. Never throws; the reason is one
+ * short line with no secret in it. The token is not sent: /health is unauthenticated. */
+export async function checkDelegation($: any, providerUrl: string): Promise<Availability> {
+  const step = { name: 'tool list' }
+  let timer: any
+  try {
+    const work = delegationSteps($, providerUrl, step)
+    work.catch(() => {})
+    const timeout = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), GATE_HEALTH_TIMEOUT_MS) })
+    const res = await Promise.race([work, timeout])
+    return res ?? { ok: false, reason: `${step.name} timed out` }
+  } catch {
+    return { ok: false, reason: 'provider unreachable' }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+/** checkDelegation's steps, without the deadline; `step.name` says which one is running when the deadline hits. */
+async function delegationSteps($: any, providerUrl: string, step: { name: string }): Promise<Availability> {
+  try {
+    const tools = await $.tool.list()
+    const names = Array.isArray(tools) ? tools.map((t: any) => String(t?.name ?? '')) : []
+    if (!names.some(isDelegationTool)) return { ok: false, reason: 'cortados-route tools not in this session' }
+  } catch {
+    return { ok: false, reason: 'tool list unreadable' }
+  }
+  step.name = 'provider URL'
+  let url: string
+  try { url = await resolveProviderUrl($, providerUrl) } catch { return { ok: false, reason: 'no provider URL' } }
+  step.name = 'provider health'
+  try {
+    const res: any = await $.http.fetch(url + '/health', { method: 'GET' })
+    if (!res?.ok) return { ok: false, reason: `provider health HTTP ${Number(res?.status) || 'error'}` }
+    try { if (JSON.parse(String(res.text)).ok !== true) return { ok: false, reason: 'provider health not ok' } }
+    catch { return { ok: false, reason: 'provider health unreadable' } }
+    return { ok: true }
+  } catch {
+    return { ok: false, reason: 'provider unreachable' }
+  }
+}
+
+/** What the gate's helpers below share with register(): the closure state, passed explicitly (the engine requires
+ * `$` to be handed only to top-level functions). */
+type GateCtx = { cfg: Cfg; gate: GateState; guard: GuardState; configLevel: GateLevel; resting: () => string | undefined }
+
+function gatePublish($: any, c: GateCtx): void {
+  guardPublish($, c.guard, c.resting())
+}
+
+function gateDeny($: any, c: GateCtx, text: string): { deny: string } {
+  c.gate.denied += 1
+  gatePublish($, c)
+  return { deny: text }
+}
+
+/** This session's level: the /cortados-gate override for the current session id (read once per id), else config. */
+async function gateLevelOf($: any, c: GateCtx): Promise<GateLevel> {
+  const { cfg, gate, guard, configLevel } = c
+  if (!cfg.orchestratorMode) return 'off'
+  let id: string | null = null
+  try {
+    const v = await $.session.id()
+    id = typeof v === 'string' && v ? v : null
+  } catch (err) {
+    guardReport($, guard, 'gate session id', err)
+  }
+  if (id !== null && gate.overrideFor !== id) {
+    const gen = gate.gen
+    try {
+      const map = parseGateMap(await $.store.get(GATE_STORE_KEY))
+      if (gate.gen === gen) {
+        gate.map = map
+        gate.override = map[id]?.level
+        gate.overrideFor = id
+      }
+    } catch (err) {
+      guardReport($, guard, 'gate store read', err)
+      return configLevel
+    }
+  }
+  return (id === gate.overrideFor ? gate.override : undefined) ?? configLevel
+}
+
+/** CORTADOS_CHILD_TASK, read once: set in every CortadOS child task, which does its work directly. */
+async function gateIsChildTask($: any, c: GateCtx): Promise<boolean> {
+  if (c.gate.childTask === null) {
+    try { c.gate.childTask = Boolean(String((await $.env.get('CORTADOS_CHILD_TASK')) ?? '').trim()) }
+    catch (err) { guardReport($, c.guard, 'gate env read', err); return false }
+  }
+  return c.gate.childTask
+}
+
+/** Whether delegation can work now, trusted for GATE_HEALTH_TTL_MS; one check in flight at a time. A change to or
+ * from "unreachable" is put on the status line, and failing open is toasted, so the owner sees the gate is off. */
+async function gateAvailability($: any, c: GateCtx): Promise<Availability> {
+  const { gate, guard } = c
+  let now = NaN
+  try { now = Number(await $.clock.now()) } catch (err) { guardReport($, guard, 'gate clock', err) }
+  if (Number.isFinite(now) && now - gate.checkedAt < GATE_HEALTH_TTL_MS) {
+    return gate.unreachable ? { ok: false, reason: gate.unreachable } : { ok: true }
+  }
+  if (!gate.checking) {
+    const p = checkDelegation($, c.cfg.providerUrl)
+    gate.checking = p
+    p.finally(() => { if (gate.checking === p) gate.checking = null })
+  }
+  const r = await gate.checking
+  gate.checkedAt = Number.isFinite(now) ? now : -Infinity
+  const was = gate.unreachable
+  gate.unreachable = r.ok ? null : r.reason
+  if (gate.unreachable !== was) {
+    gatePublish($, c)
+    if (gate.unreachable) {
+      const text = `CortadOS router unreachable (${gate.unreachable}): gate off, calls run directly until it is back`
+      guardTry($, guard, 'toast', () => $.ui.toast(text))
+    }
+  }
+  return r
 }
 
 // ---- Office view: session tags on routed requests + main-session heartbeats (provider/office.py) ---------------
@@ -1397,9 +1753,19 @@ export const register: Register = (on, options) => {
   // Office state for this session (closure: a reload starts the throttle over; the salt lives in $.store).
   const office: OfficeState = newOfficeState()
   const officeOn = cfg.officeView !== false
-  /** What the status line rests on when the mod has nothing else to show: the guard's counter, if any. */
-  const restingStatus = (): string | undefined =>
-    (guard.override ?? guardDefault) ? guardStatusText(guard.edits, guard.runs) : undefined
+  // Orchestrator gate state for this session (closure: a reload starts the counters over; the per-session level
+  // override lives in $.store and survives it).
+  const gate: GateState = newGateState()
+  const configLevel: GateLevel = configGateLevel(cfg)
+  const editBudget = resolveEditBudget(cfg.orchestratorEditBudget)
+  /** What the status line rests on when the mod has nothing else to show: the gate's note and the guard's counter. */
+  const restingStatus = (): string | undefined => {
+    const parts = [
+      gateStatusText(cfg.orchestratorMode ? (gate.override ?? configLevel) : 'off', gate.denied, gate.unreachable),
+      (guard.override ?? guardDefault) ? guardStatusText(guard.edits, guard.runs) : undefined,
+    ].filter(Boolean)
+    return parts.length ? parts.join(' · ') : undefined
+  }
 
   on('tool.call', { tool: 'Agent' }, async ($: any, e: any, next: any) => {
     // The top-level session delegates through cortados-route, never the Agent tool (owner rule): refused before any
@@ -1806,6 +2172,56 @@ export const register: Register = (on, options) => {
     }
   }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
 
+  // ---- Orchestrator gate (see GATE_* above) -------------------------------------------------------------------------
+  // ONE matcher-less tool.call hook (the engine refuses a second): the Office 'working' beat for every main-loop call,
+  // and the gate. Registered BEFORE the warn-only guard's per-tool hooks so it is the outer one: a refused call never
+  // reaches the guard and is not counted as work the main session did.
+  const allow: ReadonlySet<string> = resolveAllowSet(cfg.orchestratorAllowedTools)
+  const gctx: GateCtx = { cfg, gate, guard, configLevel, resting: restingStatus }
+
+  on('tool.call', async ($: any, e: any, next: any) => {
+    const tool = String(e?.tool ?? '')
+    const main = e?.agentId == null // a subagent, teammate or engine fork carries an agentId: never gated
+    // The main loop's 'working' beat with the tool NAME it calls; fire-and-forget (officeBeat never throws).
+    if (officeOn && main) void officeBeat($, cfg, office, 'working', tool || null)
+    if (!cfg.orchestratorMode || !main) return next(e)
+    const level = await gateLevelOf($, gctx)
+    if (level === 'off' || (await gateIsChildTask($, gctx))) return next(e)
+    if (level === 'strict') {
+      // The allowlist cage, unchanged: no fail-open (it is a cage by choice; the refusal says how to lower it).
+      return mainLoopAllows(tool, e?.agentId, allow, true) ? next(e) : gateDeny($, gctx, strictDenyMessage(tool))
+    }
+    const cls = balancedClass(tool, e)
+    if (cls === null) return next(e)
+    if (cls === 'edit' && gate.edits < editBudget) {
+      gate.edits += 1
+      return next(e)
+    }
+    const avail = await gateAvailability($, gctx)
+    if (!avail.ok) {
+      // FAIL OPEN: delegation cannot work, so the call runs; the status line already says the gate is off.
+      if (cls === 'edit') gate.edits += 1
+      return next(e)
+    }
+    return gateDeny($, gctx, gateDenyMessage(cls, tool, editBudget))
+  }).catch(($: any, e: any, next: any) => {
+    if (next.called) return undefined
+    guardReport($, guard, 'gate', new Error('gate'))
+    // A gate that failed before deciding: balanced FAILS OPEN (the owner's work must not stop on a gate bug), strict
+    // keeps its old fail-closed rule for non-allowed tools, with allowed ones (start_task/Read/...) still let through.
+    const strict = cfg.orchestratorMode && e?.agentId == null && (gate.override ?? configLevel) === 'strict'
+    return !strict || mainLoopAllows(String(e?.tool), e?.agentId, allow, true)
+      ? next(e)
+      : { deny: `Orchestrator mode gate failed; refusing this tool. Delegate it with mcp__cortados-route__start_task, or ask the owner to type /${GATE_COMMAND} off.` }
+  })
+
+  // A new user prompt starts a new turn: the small-edit budget is per turn. Meta prompts (not typed by the person)
+  // do not reset it; this mod's own background notifications never reach its own hooks.
+  on('prompt.submit', async ($: any, e: any, next: any) => {
+    if (!e?.isMeta) gate.edits = 0
+    return next(e)
+  }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
+
   // ---- Main-session guard: WARN ONLY. Every call proceeds unchanged; only a toast and a status counter. ----------
   for (const tool of GUARD_TOOLS) {
     on('tool.call', { tool }, async ($: any, e: any, next: any) => {
@@ -1817,7 +2233,7 @@ export const register: Register = (on, options) => {
         if (kind && (await guardEnabled($, guard, guardDefault))) {
           if (kind === 'edit') guard.edits += 1
           else guard.runs += 1
-          guardPublish($, guard, guardStatusText(guard.edits, guard.runs))
+          guardPublish($, guard, restingStatus())
           let now = NaN
           try {
             now = Number(await $.clock.now())
@@ -1841,7 +2257,7 @@ export const register: Register = (on, options) => {
   }
 
   // ---- Office heartbeats: the main session's status and current tool NAME (never its input) ----------------------
-  // The 'working' beat rides on the ONE matcher-less tool.call hook (the engine allows one per module), registered below
+  // The 'working' beat rides on the ONE matcher-less tool.call hook (the engine allows one per module), registered above
   // with the orchestrator gate.
   if (officeOn) {
     on('turn.complete', async ($: any, e: any, next: any) => {
@@ -1874,6 +2290,11 @@ export const register: Register = (on, options) => {
       // The guard still runs from userConfig without its command; say the toggle is missing.
       guardReport($, guard, `/${GUARD_COMMAND} registration`, err)
     }
+    try {
+      await $.command.register({ name: GATE_COMMAND, description: 'Orchestrator gate for THIS session: off, balanced or strict, or no argument for its state.', argumentHint: '[off|balanced|strict]', immediate: true })
+    } catch (err) {
+      guardReport($, guard, `/${GATE_COMMAND} registration`, err)
+    }
     return r
   }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
 
@@ -1899,6 +2320,42 @@ export const register: Register = (on, options) => {
     return { text: `main-session guard ${on_ ? 'on' : 'off'} (warn only${on_ && counts ? `; ${counts}` : ''}${note})` }
   })
 
+  // /cortados-gate: the per-session escape hatch. Kept in $.store under this session's id, so it survives a mod reload
+  // and a resume of this session, and the owner's next session starts at the configured level again.
+  on('command.run', { command: GATE_COMMAND }, async ($: any, e: any) => {
+    const arg = String(e?.args ?? '').trim()
+    const want = parseGateLevel(arg)
+    if (arg && want === null) return { text: `usage: /${GATE_COMMAND} off|balanced|strict` }
+    if (!cfg.orchestratorMode) return { text: 'orchestrator gate off: orchestratorMode is off in this plugin\'s settings' }
+    let note = ''
+    if (want !== null) {
+      let id: string | null = null
+      try { const v = await $.session.id(); id = typeof v === 'string' && v ? v : null } catch { /* in memory only */ }
+      // In memory first, the generation bumped, so a first store read still in flight cannot undo this.
+      gate.override = want
+      gate.overrideFor = id
+      gate.gen += 1
+      gatePublish($, gctx)
+      if (id === null) note = '; no session id, so not saved: applies until the mod reloads'
+      else {
+        try {
+          let at = 0
+          try { const n = Number(await $.clock.now()); if (Number.isFinite(n)) at = n } catch { /* order by 0 */ }
+          const current = gate.map ?? parseGateMap(await $.store.get(GATE_STORE_KEY))
+          gate.map = withGateOverride(current, id, want, at)
+          await $.store.set(GATE_STORE_KEY, gate.map)
+        } catch (err) {
+          guardReport($, guard, 'gate store write', err)
+          note = '; not saved, applies until the mod reloads'
+        }
+      }
+    }
+    const level = await gateLevelOf($, gctx)
+    const source = gate.override !== undefined && gate.overrideFor !== null ? 'this session' : gate.override !== undefined ? 'this session, unsaved' : 'config'
+    const extra = [gate.denied ? `${gate.denied} denied` : '', gate.unreachable ? `router unreachable: gate off (${gate.unreachable})` : ''].filter(Boolean).join('; ')
+    return { text: `orchestrator gate ${level} (${source}${extra ? `; ${extra}` : ''}${note})` }
+  })
+
   // Security framing is independent of orchestratorMode: turning delegation guidance off must not remove it.
   on('prompt.compose', async ($: any, e: any, next: any) => {
     const r = await next(e)
@@ -1908,41 +2365,4 @@ export const register: Register = (on, options) => {
     }
     return { sections }
   }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
-
-  const enforce = Boolean(cfg.orchestratorMode && cfg.orchestratorEnforce)
-
-  // ONE matcher-less tool.call hook (the engine refuses a second): the Office 'working' beat for every main-loop call,
-  // and, under orchestratorEnforce, the gate. With the gate off it only beats and passes the call on.
-  // HARD ENFORCEMENT is opt-in (orchestratorEnforce). By default the directive above is trusted and the brain keeps
-  // full tool access except Agent (refused in the Agent hook above) — it may act directly when that is clearly
-  // sensible, and must when cortados-route is not connected. With enforce on, EVERY tool call on the main loop is
-  // gated against the allowlist (an allowlist, not a denylist, so Monitor/memory_write/ExitWorktree/mcp__ tools/future
-  // tools are refused unless listed). Non-main loops, the cortados-route tools and allowed tools pass straight through.
-  // Enforce is a cage by choice: with it on and cortados-route missing, the brain cannot work until it is turned off,
-  // and the refusal says so.
-  if (officeOn || enforce) {
-    // An empty/malformed allowlist would lock out every tool; resolveAllowSet drops malformed tokens and falls back to
-    // the default set so the brain can always at least read, and the cortados-route tools are allowed regardless.
-    const allow: ReadonlySet<string> = resolveAllowSet(cfg.orchestratorAllowedTools)
-    const enforceDeny = (tool: string) => tool === 'Agent'
-      ? AGENT_REFUSAL
-      : `Orchestrator mode (enforced): the brain plans and delegates — it does not run ${tool} itself. ` +
-        `Delegate with mcp__cortados-route__start_task (a CortadOS child session with tools on this machine) or ` +
-        `mcp__cortados-route__route_task (a text answer) instead of calling ${tool} directly. If cortados-route is ` +
-        `not connected, tell the owner in one line: direct work needs orchestratorEnforce turned off.`
-    on('tool.call', async ($: any, e: any, next: any) => {
-      // The main loop's 'working' beat with the tool NAME it calls; fire-and-forget (officeBeat never throws).
-      if (officeOn && e?.agentId == null) void officeBeat($, cfg, office, 'working', String(e?.tool ?? '') || null)
-      if (!enforce || mainLoopAllows(String(e.tool), e.agentId, allow, true)) return next(e)
-      return { deny: enforceDeny(String(e.tool)) }
-      // Fail CLOSED for work tools: if the gate throws before deciding, refuse a non-allowed tool (never let it run
-      // on a guard failure) but still let an allowed tool (start_task/Read/...) through so the session is not bricked.
-    }).catch(($: any, e: any, next: any) =>
-      next.called
-        ? undefined
-        : !enforce || mainLoopAllows(String(e.tool), e.agentId, allow, true)
-          ? next(e)
-          : { deny: 'Orchestrator mode gate failed; refusing this tool. Delegate it with mcp__cortados-route__start_task.' },
-    )
-  }
 }
