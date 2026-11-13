@@ -193,10 +193,38 @@ Pin names (aliases and tags, case-insensitive) must be unique across nodes. Beha
    `com.cortados.ollama` were booted out and disabled on the Studio.
 3. On the Pro: nothing is downloaded (owner decision 2026-11-13: the lane uses the models already on the Pro, renamed
    with `ollama cp` to `Qwen27b_heretic`, `Huihui_Qwen_9b`, `Huihui_Qwen3.8` and `Phi_4`; the Pro block's `models` must
-   list these tags). Set Ollama's context to at least the configured `context_length` (65536):
+   list these tags as `ollama list` prints them, e.g. `Qwen27b_heretic:latest`). Set Ollama's context to at least the configured `context_length` (65536):
    `OLLAMA_CONTEXT_LENGTH=65536` for `ollama serve`, or Ollama.app's context setting, then restart Ollama (see "Context
    length must match the node" below). Only then set the Pro block's `auto_route` in the Air's `tables/resources.json`
    (Local auto-route, below); before that the Pro is pin-only.
+
+### The manual switch: three ways to flip it
+
+The Pro admits local models only on AC power with its switch file (`$CORTADOS_HOME/local-enabled` on the Pro) present.
+It can be flipped:
+
+- on the Pro: `python3 -B -m cortados_router.local_resources toggle on|off|status`;
+- from the dashboard's Live tab (**Local models** card, On/Off button; turning off with a model loaded asks first);
+- from any Claude Code session: the `local_switch` MCP tool (`cortados-route`) or `/cortados-local on|off|status` (the
+  `cortados-routed-subagents` mod).
+
+The last two go provider → gate: `GET /v1/cortados/local` and `POST /v1/cortados/local/switch {"node", "on"}` on the
+provider (owner token; `provider/local_switch.py`), which call the node's gate at `GET`/`POST /cortados/local-switch`
+with the node's gate token (`token_file_env` above; a node without one is refused with a 409). On the node the gate
+writes or removes the switch file through `local_resources.set_local_switch` (atomic: a private temp file renamed into
+place; off is one unlink), the same function the CLI uses. The status endpoint answers whatever the switch and power
+say (it is how the state is seen); `/api/tags` and `/v1/messages` keep their 503 while off or on battery. The status
+carries the switch, `allowed` + reason, `power` (`ac`/`battery`/`unknown`), whether an S1 training hold is live, and the
+names (only) of the models Ollama has loaded (`/api/ps` on loopback, 2 s bound). `/api/ps` itself is not forwarded.
+
+Installing the new gate needs it restarted on the Pro (`launchctl kickstart -k gui/$(id -u)/com.cortados.local-gate`)
+and the provider restarted on the Air; the owner/orchestrator does both. Until then the provider reports the Pro's gate
+as an older one (502).
+
+**Model ids and tags.** Write each model's `id` exactly as `ollama list` prints it, tag included
+(`Qwen27b_heretic:latest`). The provider also treats `name` and `name:latest` as the same model
+(`local_lane.normal_tag` / `local_lane.lists`, the one comparison behind "does not list"), because Ollama does; a
+different tag (`name:q8`) is a different model.
 
 ### Local auto-route
 

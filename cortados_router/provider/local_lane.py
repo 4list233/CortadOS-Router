@@ -202,6 +202,22 @@ def find(name: str | None, path: str | None = None) -> tuple[dict[str, Any], dic
     return None
 
 
+def normal_tag(name: str) -> str:
+    """An Ollama model name with its tag made explicit: Ollama treats `name` and `name:latest` as the same model, and
+    `ollama list` / GET /api/tags always print the tag. Only the part after the last `/` is looked at, so a registry
+    host's port (`host:5000/model`) is not mistaken for a tag."""
+    n = (name or "").strip()
+    return n if not n or ":" in n.rsplit("/", 1)[-1] else n + ":latest"
+
+
+def lists(tags: set[str], model_id: str) -> bool:
+    """Whether a node's /api/tags names (probe) include `model_id`, with `name` and `name:latest` the same model: the
+    ONE place the provider decides a node offers a model (a config id without its tag used to be refused with "does not
+    list", a 503, while Ollama would have served it)."""
+    want = normal_tag(model_id)
+    return bool(want) and any(normal_tag(t) == want for t in tags)
+
+
 def _connection(base_url: str, timeout: float) -> http.client.HTTPConnection:
     u = urllib.parse.urlparse(base_url)
     cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection

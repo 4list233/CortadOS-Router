@@ -108,7 +108,7 @@ test('a stored /cortados-guard off silences it across sessions', GATE_OFF, async
 test('/cortados-guard off then on toggles the guard and persists in the store', GATE_OFF, async ($: any, on: any) => {
   const w = engine(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as any)
-  expect(w.commands).toEqual(['cortados-guard', 'cortados-gate'])
+  expect(w.commands).toEqual(['cortados-guard', 'cortados-gate', 'cortados-local'])
   const off: any = await $.command.run({ command: 'cortados-guard', args: 'off' } as any)
   expect(off.text).toMatch(/guard off/)
   expect(w.store.mainSessionGuard).toBe(false)
@@ -246,9 +246,10 @@ test('a failing command registration is reported once per command and session.st
   const r: any = await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as any)
   expect(r.cwd).toBe('/')
   const mine = guardNotices(w.logs)
-  expect(mine.length).toBe(2)
+  expect(mine.length).toBe(3)
   expect(mine[0]).toMatch(/^cortados-routed-subagents: main-session guard \/cortados-guard registration failed \(\w+\)/)
   expect(mine[1]).toMatch(/^cortados-routed-subagents: main-session guard \/cortados-gate registration failed \(\w+\)/)
+  expect(mine[2]).toMatch(/^cortados-routed-subagents: main-session guard \/cortados-local registration failed \(\w+\)/)
   const before = w.ran.length
   const out: any = await $.tool.call(edit(BIG))
   expect(w.ran.length).toBe(before + 1)

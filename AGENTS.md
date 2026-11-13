@@ -15,7 +15,9 @@ is the long form.
   `scarcity.py` quota reading via vendor CLIs (`scarcity_codex.py` parses Codex's `/status`), `unitcost.py`,
   `transport.py`, `router_db.py` (router.db reader opener — `mode=rw` + `query_only`, never `mode=ro` in a process that
   also writes it, #99 — and the route-log error counter), `local_resources.py`, `local_gate.py` (token-checked reverse proxy run on a local Ollama node: the
-  provider's local lane reaches Ollama only through it), `subagent_mcp.py` (stdio MCP server: a `route_task` tool that delegates a
+  provider's local lane reaches Ollama only through it; it also serves the node's manual switch at
+  `/cortados/local-switch`, read and flipped by `provider/local_switch.py` behind `GET /v1/cortados/local` and
+  `POST /v1/cortados/local/switch`), `subagent_mcp.py` (stdio MCP server: a `route_task` tool that delegates a
   self-contained subtask to the `cortados` provider endpoint and returns the routed model's text; stdlib, runs standalone),
   `child_tasks.py` (whole tasks as headless Claude Code children; `--run` runner, `--remote` host side, `--cleanup-archive`;
   the runner appends each finished run, redacted, to the append-only `$CORTADOS_HOME/exports/task-runs.jsonl` for

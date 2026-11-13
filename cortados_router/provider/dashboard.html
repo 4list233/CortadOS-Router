@@ -177,7 +177,7 @@ ul { margin:0; padding-left:18px; }
 </header>
 <form id="login" class="card" hidden>
   <div class="title">Provider token</div>
-  <div class="sub">Kept in this tab's sessionStorage only; sent as a Bearer header to /v1/cortados/live, /v1/cortados/usage and /v1/cortados/tasks.</div>
+  <div class="sub">Kept in this tab's sessionStorage only; sent as a Bearer header to /v1/cortados/live, /v1/cortados/usage, /v1/cortados/tasks and /v1/cortados/local (the Local models switch).</div>
   <input id="tok" type="password" autocomplete="off" required>
   <button type="submit">Open dashboard</button>
 </form>
@@ -192,6 +192,9 @@ ul { margin:0; padding-left:18px; }
 const KEY = "cortados-usage-token", THEME_KEY = "cortados-theme";
 const LIVE_URL = "/v1/cortados/live", URL_ = "/v1/cortados/usage", TASKS_URL = "/v1/cortados/tasks";
 const LIVE_EVERY = 5000, EVERY = 30000, ROUTED_SHOWN = 10;
+// The Local models card (/v1/cortados/local, provider/local_switch.py) asks each node's gate, so it is polled every
+// LOCAL_EVERY on the Live tab, not on every 5 s live poll, and at once after a switch.
+const LOCAL_URL = "/v1/cortados/local", LOCAL_SWITCH_URL = "/v1/cortados/local/switch", LOCAL_EVERY = 30000;
 const $ = (id) => document.getElementById(id);
 let timer = null, liveTimer = null, tickTimer = null, lastOk = null, view = "live", usageLoaded = false, routedAll = false, lastLive = null;
 // sessionStorage can throw (storage disabled, some private modes). Then the token lives in memTok for this page only,
@@ -505,6 +508,72 @@ function renderHosts(box, s, s1) {
   add(P.body, grid);
   add(box, P.p);
 }
+// ---------------------------------------------------------------- Local models card (Live tab)
+// One panel kept across live renders (renderLive re-appends it), filled from the last /v1/cortados/local answer.
+const localP = panel("p-local", "Local models", "span-12");
+let localAt = 0, localBusy = false, localNote = null;
+const POWER_TEXT = {ac: "AC power", battery: "on battery", unknown: "power unknown"};
+function renderLocal(d, failure) {
+  localP.body.replaceChildren();
+  localP.meta.textContent = "switch per node; the gate on each node decides";
+  if (failure) add(localP.body, el("div", "secerr err", "local view unavailable: " + failure));
+  if (localNote) add(localP.body, el("div", localNote.err ? "secerr err" : "sub", localNote.text));
+  if (!d) return;
+  const nodes = d.nodes || [];
+  if (!nodes.length) { add(localP.body, el("div", "sub muted", d.note || "no local node configured")); return; }
+  const grid = el("div", "hosts");
+  nodes.forEach(n => {
+    const c = el("div", "host"), top = el("div", "top");
+    add(top, el("span", "hn", n.label || n.node));
+    add(top, n.reachable ? pill(n.allowed ? "ok" : "stopped", n.allowed ? "allowed" : "refused") : pill("down", "unreachable"));
+    add(c, top);
+    if (n.error) add(c, el("div", "secerr err", n.error));
+    const loaded = n.models_loaded || [];
+    add(c, el("div", "sub", join(["switch " + (n.switch || "unknown"), n.reachable ? POWER_TEXT[n.power] || "power unknown" : null,
+      n.training ? "S1 training holds the node" : null])));
+    if (n.reason) add(c, el("div", "sub muted", n.reason));
+    add(c, el("div", "sub", n.ollama === "up" ? (loaded.length ? "loaded: " + loaded.join(", ") : "no model loaded")
+      : n.reachable ? "Ollama " + (n.ollama || "unknown") : null));
+    const a = n.auto_route;
+    add(c, el("div", "sub muted", a ? "auto_route: " + a.model + " for " + (a.bands || []).join(", ") : "auto_route: off (pin-only)"));
+    if (n.reachable && (n.switch === "on" || n.switch === "off")) {
+      const want = n.switch !== "on";
+      const b = el("button", null, want ? "Turn on" : "Turn off"); b.type = "button";
+      b.addEventListener("click", () => toggleLocal(n, want, b));
+      add(c, b);
+    }
+    add(grid, c);
+  });
+  add(localP.body, grid);
+}
+async function refreshLocal(t, force) {
+  if (localBusy || (!force && Date.now() - localAt < LOCAL_EVERY)) return;
+  localBusy = true; localAt = Date.now();
+  try {
+    const res = await get(LOCAL_URL, t);
+    if (!res.ok) return renderLocal(null, "error " + res.status);
+    renderLocal(await res.json());
+  } catch (e) { renderLocal(null, "fetch failed: " + (e && e.message ? e.message : e)); }
+  finally { localBusy = false; }
+}
+// Turning a node OFF while a model is loaded asks first: local requests are refused at once (the model stays loaded).
+async function toggleLocal(n, on, b) {
+  const loaded = n.models_loaded || [];
+  if (!on && loaded.length && !confirm("Turn local models OFF on " + (n.label || n.node) + "? " + loaded.join(", ") +
+      " is loaded; new local requests will be refused.")) return;
+  const t = getTok(); if (!t) return showLogin();
+  b.disabled = true; b.textContent = on ? "turning on…" : "turning off…";
+  try {
+    const res = await fetch(LOCAL_SWITCH_URL, {method: "POST", cache: "no-store", credentials: "omit",
+      headers: {"Authorization": "Bearer " + t, "content-type": "application/json"}, body: JSON.stringify({node: n.node, on: on})});
+    let msg = "error " + res.status;
+    try { const j = await res.json(); if (j && j.error && typeof j.error.message === "string") msg = j.error.message; } catch (e) {}
+    localNote = res.ok ? {text: (n.label || n.node) + " switched " + (on ? "on" : "off") + " at " + new Date().toLocaleTimeString()}
+                       : {err: true, text: "switch failed: " + msg};
+  } catch (e) { localNote = {err: true, text: "switch failed: " + (e && e.message ? e.message : e)}; }
+  await refreshLocal(t, true);
+}
+
 function renderLive(d) {
   lastLive = d;
   document.body.classList.remove("stale");
@@ -534,6 +603,7 @@ function renderLive(d) {
   renderSubs(panels, d.subscriptions || {});
   renderRouted(panels, d.routed || {}, now);
   renderHosts(panels, d.hosts || {}, s1);
+  add(panels, localP.p);
   add(box, panels);
   lastOk = new Date();
   const st = $("status"); st.className = o.errors ? "err" : "";
@@ -734,6 +804,7 @@ function stopTimers() {
 }
 function showLogin(msg) {
   stopTimers();
+  localAt = 0; localNote = null; localP.body.replaceChildren();   // another token must not see the last one's answer
   $("main").hidden = true; $("live").hidden = true; $("tabs").hidden = true; $("logout").hidden = true; $("login").hidden = false;
   $("status").textContent = msg || ""; $("tok").value = ""; $("tok").focus();
 }
@@ -755,6 +826,7 @@ async function pollLiveOnce(t) {
     if (!res.ok) return failed("error " + res.status);
     renderLive(await res.json());
   } catch (e) { return failed("fetch failed: " + (e && e.message ? e.message : e)); }
+  await refreshLocal(t, false);
 }
 // The tasks view is fetched after a good usage render, with the same token. Its failure never hides the usage view and
 // never forgets the token (a 401 here with a token the usage view just accepted is reported, not acted on).

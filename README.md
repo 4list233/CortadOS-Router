@@ -400,6 +400,8 @@ sub-tasks it chooses to hand off. The repo ships a project MCP server, `cortados
 capable model runs it, and the text comes back. The main session keeps its own model and login.
 `route_task` is refused inside a child task (`CORTADOS_CHILD_TASK` set): children may not route, as they may not start
 children (the child's directive says so too).
+The same server also serves `local_switch(state, node?)` (see **Flipping the switch from anywhere**, under Local
+models), which is allowed in child tasks.
 
 Set two environment variables and have the provider running:
 
@@ -436,14 +438,43 @@ a pin with a clear 503, never a fallback. Ollama has no auth, so it stays on loc
 
 The Pro gate admits probes and inference only on **AC power AND with the manual switch ON**.
 The switch defaults off: `python3 -B -m cortados_router.local_resources toggle on|off|status`
-(run with one of those three states). It uses `$CORTADOS_HOME/local-enabled` (default
-`~/.cortados/local-enabled`); status prints the switch, availability and reason.
+(run with one of those three states), or from anywhere (below). It uses `$CORTADOS_HOME/local-enabled` (default
+`~/.cortados/local-enabled`); status prints the switch, availability, reason and power (`ac`/`battery`/`unknown`).
 Unknown/failed `pmset -g ps` readings fail closed. Power is cached for at most 3 seconds;
 the switch is checked on every request, including again after body upload. Disabled requests
 return 503 without reaching Ollama. Fleet telemetry for node `pro` also includes this policy;
 its deployments are unavailable when the policy is disabled or unknown. This does not
 start/stop Ollama or unload resident models;
 existing in-flight inference is not cancelled. Other fit, busy and exclusion checks still apply.
+
+#### Flipping the switch from anywhere
+
+The switch file lives on the Pro, but it can be flipped from any machine that can reach the provider; every path ends
+in the same code on the node (`local_resources.set_local_switch`, the CLI's own), written atomically:
+
+1. **Dashboard** (`GET /dashboard` on the provider, Live tab): the **Local models** card shows each configured node's
+   switch, AC/battery, whether local models are allowed and why, the model Ollama has loaded and the node's
+   `auto_route`, with an On/Off button. Turning a node off while a model is loaded asks first (the model stays loaded;
+   new local requests are refused at once). The card is refreshed every 30 s and right after a switch.
+2. **MCP tool** `local_switch(state: "on"|"off"|"status", node?)` on the `cortados-route` server (default node `pro`;
+   `status` without a node lists every node). It needs the provider URL and the owner token, like `route_task`, but is
+   **not** refused inside a child task: it routes nothing and spends no quota, so a child may be asked to flip it.
+3. **Slash command** `/cortados-local on|off|status [node]` in the `cortados-routed-subagents` mod, using the mod's own
+   provider URL and token discovery.
+
+Under the hood: the provider's `GET /v1/cortados/local` and `POST /v1/cortados/local/switch` `{"node": "pro", "on":
+true|false}` (`provider/local_switch.py`; owner token only, through the same check as the other `/v1/cortados/*`
+views; a scoped client token gets 403) ask the node's gate at `GET`/`POST /cortados/local-switch` with the node's gate
+token (6 s bound). The gate answers that endpoint even while the switch is off or the Pro is on battery; inference keeps
+its refusal. Only checked fields come back (switch, allowed, reason, power, training, loaded model names), never the
+node's address or token. An asleep node is a 503 "unreachable", an unknown node a 404, a node with no gate configured
+a 409, a gate from before this endpoint a 502 saying to restart it.
+
+**Deploy (owner / orchestrator, not a delegate):** on the Pro, pull the branch and restart the gate so it serves the new
+endpoint: `launchctl kickstart -k gui/$(id -u)/com.cortados.local-gate`. On the Air, pull and restart the provider
+(it serves the endpoints and the new dashboard page). Reload the mod (version 0.3.4) for `/cortados-local`, and restart
+Claude Code sessions (or reconnect the `cortados-route` server) for `local_switch`. Until the Pro's gate is restarted,
+the provider answers the switch with the 502 above; the CLI on the Pro keeps working throughout.
 
 ## Delegating whole tasks from the Claude app
 
@@ -793,6 +824,8 @@ claude mcp add -s user cortados-route \
   --env CORTADOS_CHILD_CLAUDE_BIN="$(command -v claude)" \
   -- python3 /ABSOLUTE/PATH/TO/CortadOS-Router/cortados_router/subagent_mcp.py
 ```
+
+Either registration serves every tool of the server: `route_task`, the child-task tools above and `local_switch`.
 
 ## Bot gateway on the Air
 

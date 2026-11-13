@@ -46,7 +46,8 @@ if __package__ in (None, ""):                           # run as a file: make th
 
 from cortados_router.compat import getenv
 from cortados_router.compaction import prune as compaction_prune, store as compaction_store
-from cortados_router.provider import anthropic_wire, clients, live, local_lane, office, responses_wire, routing, search_lane
+from cortados_router.provider import (anthropic_wire, clients, live, local_lane, local_switch, office, responses_wire,
+                                      routing, search_lane)
 from cortados_router.provider.bridge import BridgeError, BridgeSession, ToolWaitExpired, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
 from cortados_router.provider.timeouts import IDLE_S, TOOL_WAIT_S, TURN_TIMEOUT_S, effective_tool_wait
@@ -395,6 +396,10 @@ def endpoint_id(path: str | None) -> str:
         return "live"
     if p == live.HEARTBEAT_PATH:
         return "live_heartbeat"
+    if p == local_switch.VIEW_PATH:
+        return "local"
+    if p == local_switch.SWITCH_PATH:
+        return "local_switch"
     if p.startswith("/v1/models"):
         return "models"
     if p in ("/health", "/resources", "/bridge/call"):
@@ -1324,6 +1329,20 @@ class Handler(BaseHTTPRequestHandler):
             from cortados_router import core, resources     # the resource-pool snapshot: cached usage + scarcity + local devices + model-fit
             snap = resources.snapshot(core, local_config=getenv("CORTADOS_LOCAL_RESOURCES_CONFIG"))
             return self._json(200, snap)
+        if self.path.split("?")[0] == local_switch.VIEW_PATH:
+            # Owner token only (a scoped client token was already refused by _scope_gate: no scope names this path).
+            if not self._authorized():
+                return self._error(401, "authentication_error", "bad or missing token")
+            try:
+                view = self.server.local_view()
+            except local_lane.LocalConfigError as exc:   # as /v1/models: the node is named, the file path is not
+                logger.warning("local: %s", exc)
+                return self._error(500, "api_error", "cortados: local node "
+                                   f"{getattr(exc, 'node', None) or '?'} is misconfigured on the provider (see provider log)")
+            except Exception as exc:
+                logger.warning("local: view failed: %s", type(exc).__name__)
+                return self._error(500, "api_error", "cortados: local view unavailable (see provider log)")
+            return self._json(200, view, headers={"cache-control": "no-store"})
         if self.path.split("?")[0] == "/v1/cortados/tasks":
             if not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
@@ -1390,6 +1409,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, "invalid_request_error", f"cortados: heartbeat field {bad} is invalid",
                                    reason="the heartbeat is malformed")
             return self._json(200, self.server.registry.office.heartbeat(hb))
+        if path == local_switch.SWITCH_PATH:
+            return self._local_switch(body)
         if path == "/v1/messages/count_tokens":
             # Estimate only (chars / 4): the CLI behind cortados counts its own tokens and exposes no counter.
             return self._json(200, {"input_tokens": len(json.dumps(body)) // 4})
@@ -1434,6 +1455,27 @@ class Handler(BaseHTTPRequestHandler):
                                f"cortados: this token posts heartbeats for host {c.host or '(none)'} only",
                                reason="the heartbeat names another host")
         return self._json(200, self.server.registry.live.post(hb, now))
+
+    def _local_switch(self, body: dict[str, Any]) -> None:
+        """POST /v1/cortados/local/switch {"node", "on"} (owner token, checked by do_POST): flip a local node's manual
+        switch through its gate (provider/local_switch.py). The answer is the node's new status row."""
+        try:
+            row = self.server.local_switch(body.get("node"), body.get("on"))
+        except local_switch.SwitchError as exc:
+            kind = {400: "invalid_request_error", 404: "not_found_error", 409: "invalid_request_error"}.get(
+                exc.status, "api_error")
+            return self._error(exc.status, kind, f"cortados: {exc}",
+                               reason={400: "the switch request is malformed", 404: "unknown local node",
+                                       409: "the local node has no gate configured",
+                                       503: "the local node is unreachable"}.get(exc.status, "the local gate failed"))
+        except local_lane.LocalConfigError as exc:
+            logger.warning("local switch: %s", exc)
+            return self._error(500, "api_error", "cortados: local node "
+                               f"{getattr(exc, 'node', None) or '?'} is misconfigured on the provider (see provider log)")
+        except Exception as exc:
+            logger.warning("local switch failed: %s", type(exc).__name__)
+            return self._error(500, "api_error", "cortados: local switch failed (see provider log)")
+        return self._json(200, row, headers={"cache-control": "no-store"})
 
     def _bridge_call(self, body: dict[str, Any]) -> None:
         s = self.server.registry.get(body.get("session", ""))
@@ -2336,6 +2378,15 @@ class ProviderServer(ThreadingHTTPServer):
             errors.append({"source": "child_tasks", "error": type(exc).__name__})
             events = []
         return registry.office.view(events, now=now, errors=errors)
+
+    def local_view(self) -> dict[str, Any]:
+        """GET /v1/cortados/local (provider/local_switch.py): each local node's switch, asked through its gate. Tests
+        replace it, or point CORTADOS_LOCAL_RESOURCES_CONFIG at a fake gate."""
+        return local_switch.view()
+
+    def local_switch(self, node: Any, on: Any) -> dict[str, Any]:
+        """POST /v1/cortados/local/switch: set a node's switch through its gate (local_switch.switch). Tests replace it."""
+        return local_switch.switch(node, on)
 
     def live_body(self, registry: Registry) -> bytes:
         """The encoded live view, memoised live.MEMO_S with single flight (live.Memo): every dashboard tab and pulse

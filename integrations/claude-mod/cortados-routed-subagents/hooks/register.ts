@@ -1941,6 +1941,84 @@ async function officeSend($: any, cfg: Cfg, office: OfficeState, { status, tool 
   }
 }
 
+// ---------------------------------------------------------------- /cortados-local
+// The Pro's manual local-models switch from any session: the provider's GET /v1/cortados/local and POST
+// /v1/cortados/local/switch (owner token; provider/local_switch.py asks the node's gate). Same provider URL and token
+// discovery as the routed subagents (resolveProviderUrl, resolveToken). Independent of orchestratorMode.
+export const LOCAL_COMMAND = 'cortados-local'
+/** The one local node today (#75); `/cortados-local on <node>` names another. */
+export const LOCAL_DEFAULT_NODE = 'pro'
+/** The provider asks the node's gate with a 6 s bound; 10 s covers that plus the tailnet hop. */
+export const LOCAL_TIMEOUT_MS = 10_000
+const LOCAL_NODE_RE = /^[A-Za-z0-9_.-]{1,40}$/
+
+/** `on|off|status [node]` (case ignored; no argument is status), else null. */
+export function parseLocalArgs(args: unknown): { state: 'on' | 'off' | 'status'; node: string | null } | null {
+  const parts = String(args ?? '').trim().split(/\s+/).filter(Boolean)
+  if (parts.length > 2) return null
+  const state = (parts[0] ?? 'status').toLowerCase()
+  if (state !== 'on' && state !== 'off' && state !== 'status') return null
+  const node = parts[1] ?? null
+  if (node !== null && !LOCAL_NODE_RE.test(node)) return null
+  return { state, node }
+}
+
+const localText = (v: unknown, max = 200): string | null =>
+  typeof v === 'string' && v.length > 0 && v.length <= max && !/[\x00-\x1f\x7f]/.test(v) ? v : null
+
+/** One line per node, from a provider status row: never the raw answer. */
+export function localNodeLine(n: any): string {
+  const name = localText(n?.label, 40) ?? localText(n?.node, 40) ?? '?'
+  if (!n?.reachable) return `${name}: unreachable${localText(n?.error, 300) ? ` (${n.error})` : ''}`
+  const power: Record<string, string> = { ac: 'AC power', battery: 'on battery' }
+  const loaded = Array.isArray(n.models_loaded) ? n.models_loaded.map((m: unknown) => localText(m)).filter(Boolean) : null
+  const auto = n.auto_route && localText(n.auto_route.model) ? `auto_route ${n.auto_route.model} for ${(Array.isArray(n.auto_route.bands) ? n.auto_route.bands : []).filter((b: unknown) => localText(b, 8)).join(', ')}` : 'auto_route off'
+  return [`${name}: switch ${n.switch === 'on' || n.switch === 'off' ? n.switch : 'unknown'}`,
+    n.allowed === true ? 'local models allowed' : `refused${localText(n.reason) ? ` (${n.reason})` : ''}`,
+    power[n.power] ?? 'power unknown',
+    loaded === null ? 'loaded models unknown' : loaded.length ? `loaded: ${loaded.join(', ')}` : 'no model loaded',
+    auto].join(' · ')
+}
+
+/** Run /cortados-local: a status request or a switch, as the text the command shows. Never throws. */
+export async function runLocalCommand($: any, cfg: Cfg, args: unknown): Promise<string> {
+  const want = parseLocalArgs(args)
+  if (want === null) return `usage: /${LOCAL_COMMAND} on|off|status [node]`
+  let timer: any
+  try {
+    const url = await resolveProviderUrl($, cfg.providerUrl)
+    const token = await resolveToken($, cfg)
+    if (!token) return `/${LOCAL_COMMAND}: no provider token (providerTokenFile or providerToken in this plugin's settings)`
+    const headers = { 'content-type': 'application/json', 'x-api-key': token, Authorization: `Bearer ${token}` }
+    const node = want.node ?? LOCAL_DEFAULT_NODE
+    const req = Promise.resolve(want.state === 'status'
+      ? $.http.fetch(url + '/v1/cortados/local', { method: 'GET', headers })
+      : $.http.fetch(url + '/v1/cortados/local/switch', { method: 'POST', headers, body: JSON.stringify({ node, on: want.state === 'on' }) }))
+    req.catch(() => {}) // a late rejection after the timeout must not go unhandled
+    const timeout = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), LOCAL_TIMEOUT_MS) })
+    const res: any = await Promise.race([req, timeout])
+    if (!res) return `/${LOCAL_COMMAND}: the provider did not answer within ${LOCAL_TIMEOUT_MS / 1000} s`
+    let data: any = null
+    try { data = JSON.parse(String(res.text ?? '')) } catch { /* said below */ }
+    if (!res.ok) {
+      const msg = localText(data?.error?.message, 400)
+      return `/${LOCAL_COMMAND}: provider answered HTTP ${Number(res.status) || 0}${msg ? `: ${msg.split(token).join('***')}` : ''}`
+    }
+    if (want.state === 'status') {
+      const rows = (Array.isArray(data?.nodes) ? data.nodes : []).filter((n: any) => !want.node || String(n?.node).toLowerCase() === want.node.toLowerCase())
+      if (!rows.length) return want.node ? `/${LOCAL_COMMAND}: no local node '${want.node}' on the provider` : `local models: ${localText(data?.note, 300) ?? 'no local node configured'}`
+      return rows.map(localNodeLine).join('\n')
+    }
+    return `switched ${want.state}: ${localNodeLine(data)}`
+  } catch (err) {
+    // resolveProviderUrl names the source, never the value; anything else by its type only.
+    const m = err instanceof Error && /provider URL|providerUrl/.test(err.message) ? err.message : (err as any)?.name ?? 'error'
+    return `/${LOCAL_COMMAND}: cannot reach the provider (${m})`
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 export const register: Register = (on, options) => {
   const cfg: Cfg = { ...FALLBACK, ...(options as Partial<Cfg>) }
   const subagentTimeoutMs = resolveTimeoutMs(cfg.subagentTimeoutMs)
@@ -2575,6 +2653,11 @@ export const register: Register = (on, options) => {
     } catch (err) {
       guardReport($, guard, `/${GATE_COMMAND} registration`, err)
     }
+    try {
+      await $.command.register({ name: LOCAL_COMMAND, description: 'Local models switch on the Pro (through the CortadOS provider): on, off, or status.', argumentHint: '[on|off|status] [node]', immediate: true })
+    } catch (err) {
+      guardReport($, guard, `/${LOCAL_COMMAND} registration`, err)
+    }
     return r
   }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
 
@@ -2635,6 +2718,9 @@ export const register: Register = (on, options) => {
     const extra = [gate.denied ? `${gate.denied} denied` : '', gate.unreachable ? `router unreachable: gate off (${gate.unreachable})` : ''].filter(Boolean).join('; ')
     return { text: `orchestrator gate ${level} (${source}${extra ? `; ${extra}` : ''}${note})` }
   })
+
+  // /cortados-local: the local-models switch (see runLocalCommand). Independent of orchestratorMode.
+  on('command.run', { command: LOCAL_COMMAND }, async ($: any, e: any) => ({ text: await runLocalCommand($, cfg, e?.args) }))
 
   // Security framing is independent of orchestratorMode: turning delegation guidance off must not remove it.
   on('prompt.compose', async ($: any, e: any, next: any) => {

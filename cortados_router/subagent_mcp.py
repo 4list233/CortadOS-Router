@@ -4,6 +4,11 @@ calls this tool, which posts the subtask to the `cortados` provider endpoint (S1
 cheapest capable lane in the resource pool, and the chosen model answers), and returns the answer as text. It does not
 replace the session's model or touch its login.
 
+It also serves `local_switch`: see or flip a local node's manual local-models switch (the Pro's), through the
+provider's GET /v1/cortados/local and POST /v1/cortados/local/switch (owner token). Unlike route_task it is NOT refused
+inside a CortadOS child task: it routes nothing and spends no quota, and the owner may hand a child the job of turning
+local models on or off; it works wherever this server has the provider URL and the owner token.
+
 It also serves the child-task tools (start_task, task_status, wait_task, list_tasks, cancel_task): whole tasks run as
 separate headless Claude Code sessions on this machine (see cortados_router/child_tasks.py, imported lazily because it
 needs the package; route_task does not).
@@ -57,6 +62,23 @@ TOOL = {
         },
         "required": ["task"],
     },
+}
+
+
+DEFAULT_LOCAL_NODE = "pro"         # the one local node today (#75); `node` names another
+LOCAL_TIMEOUT_S = 15.0             # the provider asks the node's gate with a 6 s bound (provider/local_switch.py)
+LOCAL_TOOL = {
+    "name": "local_switch",
+    "description": ("See or flip the manual local-models switch of a CortadOS local node (default the Pro), through the "
+                    "provider. 'status' shows every configured node: switch on/off, AC or battery, whether local models "
+                    "are allowed now and why, the models loaded in Ollama, and the node's auto_route setting. 'on' / "
+                    "'off' set the node's switch (on battery the switch can be on while local models stay refused). "
+                    "Turning it off while a model is loaded refuses new local requests at once; it does not unload the "
+                    "model. Routes nothing and spends no subscription quota."),
+    "inputSchema": {"type": "object", "properties": {
+        "state": {"type": "string", "enum": ["on", "off", "status"], "description": "on, off, or status"},
+        "node": {"type": "string", "description": f"Optional local node id (default {DEFAULT_LOCAL_NODE!r})."}},
+        "required": ["state"]},
 }
 
 
@@ -371,6 +393,53 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
             "_meta": {"cortados/routed_model": scrub(model), "cortados/requested_model": requested}}
 
 
+def local_switch(provider_url: str, token: str, state: str, node: str | None = None, urlopen=None) -> dict:
+    """The local_switch tool: GET /v1/cortados/local (status) or POST /v1/cortados/local/switch, as an MCP result.
+    The token is scrubbed from every model-visible string, as in route_task."""
+    provider_url, token = (provider_url or "").strip(), (token or "").strip()
+    scrub = lambda s: s.replace(token, "***") if token else s
+    if state not in ("on", "off", "status"):
+        return _err("local_switch: state must be 'on', 'off' or 'status'")
+    if not (provider_url and token):
+        return _err("local_switch is not configured: set CORTADOS_PROVIDER_URL and CORTADOS_PROVIDER_TOKEN (or the "
+                    "token file)")
+    if len(token) < MIN_TOKEN_LEN or not (token.isascii() and token.isprintable()):
+        return _err("local_switch: the provider token is not a provider token (too short, or not printable ASCII)")
+    named = node not in (None, "")              # status: a named node shows that node only; omitted, every node
+    if named and not (isinstance(node, str) and node.strip()):
+        return _err("local_switch: node must be a node id such as 'pro'")
+    node = node.strip() if named else DEFAULT_LOCAL_NODE
+    headers = {"x-api-key": token, "content-type": "application/json"}
+    base = provider_url.rstrip("/")
+    if state == "status":
+        req = urllib.request.Request(base + "/v1/cortados/local", method="GET", headers=headers)
+    else:
+        req = urllib.request.Request(base + "/v1/cortados/local/switch", method="POST", headers=headers,
+                                     data=json.dumps({"node": node, "on": state == "on"}).encode())
+    try:
+        with (urlopen or urllib.request.urlopen)(req, timeout=LOCAL_TIMEOUT_S) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            msg = json.loads(exc.read()).get("error", {}).get("message")
+            detail = (": " + scrub(msg)[:400]) if isinstance(msg, str) and msg else ""
+        except Exception:
+            pass
+        return _err(scrub(f"local_switch: provider returned HTTP {exc.code}{detail}"))
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+        return _err(scrub(f"local_switch: could not reach the provider ({type(exc).__name__}: {exc})"))
+    if not isinstance(data, dict):
+        return _err("local_switch: unexpected provider response")
+    if state == "status" and named:
+        rows = [n for n in data.get("nodes") or [] if isinstance(n, dict)
+                and str(n.get("node", "")).casefold() == node.casefold()]
+        if not rows:
+            return _err(scrub(f"local_switch: no local node {node[:40]!r} is configured on the provider"))
+        data = {**data, "nodes": rows}
+    return {"content": [{"type": "text", "text": scrub(json.dumps(data, indent=2))}]}
+
+
 def handle(msg: dict, cfg: dict) -> dict | None:
     """One JSON-RPC message in, one reply message out (None for a notification). Pure, for tests. Validates shapes so a
     malformed request yields a JSON-RPC error instead of crashing the session."""
@@ -392,13 +461,18 @@ def handle(msg: dict, cfg: dict) -> dict | None:
         return {**base, "result": {"protocolVersion": version, "capabilities": {"tools": {}},
                                     "serverInfo": {"name": "cortados-route", "version": "0"}}}
     if method == "tools/list":
-        return {**base, "result": {"tools": [TOOL] + _child_tools()}}
+        return {**base, "result": {"tools": [TOOL] + _child_tools() + [LOCAL_TOOL]}}
     if method == "tools/call":
         a = params.get("arguments")
         if not isinstance(a, dict):
             a = {}
         if params.get("name") in _CHILD_NAMES:
             return {**base, "result": call_child_tool(params["name"], a, cfg)}
+        if params.get("name") == "local_switch":
+            if cfg.get("url_error"):
+                return {**base, "result": _err(cfg["url_error"])}
+            return {**base, "result": local_switch(cfg.get("url", ""), cfg.get("token", ""), a.get("state"),
+                                                   a.get("node"))}
         if params.get("name") != "route_task":
             return {**base, "result": _err(f"unknown tool {params.get('name')!r}")}
         if cfg.get("url_error"):

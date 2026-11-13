@@ -8,6 +8,11 @@ Ollama has no authentication, so it listens on 127.0.0.1 only and this gate is t
     (hmac.compare_digest) against a token read from a file that only its owner can read. The check runs before the
     body is read, and a refusal is a fixed 401 that echoes nothing back.
   * The token and request bodies are never logged; a log line is method, path and status.
+  * One more path is the gate's own, never forwarded: GET / POST /cortados/local-switch (SWITCH_PATH), the node's
+    manual local-models switch, behind the same token. GET answers the switch, AC/battery, whether local models are
+    allowed and why, and the models Ollama has loaded (names from /api/ps only); POST {"on": true|false} sets the switch
+    through local_resources.set_local_switch, the toggle CLI's own code. It answers while the switch is off or on
+    battery (it is how the owner sees and changes the state); inference keeps its refusal.
 
 Run:   python3 -m cortados_router.local_gate --listen <tailscale-ip>
 Check: python3 -m cortados_router.local_gate --listen <tailscale-ip> --print-config
@@ -36,6 +41,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from cortados_router import local_resources
 from cortados_router.local_resources import pro_local_allowed
 from cortados_router.studio_capacity import (gate_dir as default_studio_gate_dir, live_intents,
                                              open_node_lock, verify_node_lock)
@@ -78,6 +84,15 @@ BODY_DEADLINE_S = 120.0
 DRAIN_DEADLINE_S = 5.0
 # The only routes the provider's local lane uses (local_lane.probe and local_lane.serve).
 ROUTES = {("GET", "/api/tags"), ("POST", "/v1/messages")}
+# The gate's own switch endpoint (module docstring). Not in ROUTES: it never reaches Ollama as a forwarded request.
+SWITCH_PATH = "/cortados/local-switch"
+# A switch request body is {"on": true} or {"on": false}; 1 KiB is ample, and a larger one is refused unread.
+SWITCH_MAX_BODY = 1024
+# The status asks Ollama which models are loaded (GET /api/ps on loopback). It answers in milliseconds; 2 s bounds a
+# hung Ollama so the status still answers (with the models unknown). At most this many names are reported.
+PS_TIMEOUT_S = 2.0
+PS_MAX_MODELS = 32
+PS_MAX_BYTES = 1024 * 1024
 
 _UNAUTHORIZED = json.dumps({"type": "error", "error": {"type": "authentication_error",
                                                         "message": "local gate: bad or missing token"}}).encode()
@@ -363,6 +378,8 @@ class GateHandler(BaseHTTPRequestHandler):
                 self._send(401, _UNAUTHORIZED)
             return
         path = self.path.split("?", 1)[0]
+        if path == SWITCH_PATH:                  # the gate's own endpoint: no admission check (see docstring)
+            return self._switch(method)
         if (method, path) not in ROUTES:
             return self._error(404, "not_found_error", "not a forwarded path")
         allowed, reason = self._node_free()
@@ -415,6 +432,72 @@ class GateHandler(BaseHTTPRequestHandler):
         finally:
             if lock_fd is not None:
                 os.close(lock_fd)            # releases LOCK_SH
+
+    def _switch(self, method: str) -> None:
+        """GET / POST SWITCH_PATH (authorized by the caller). One implementation of the switch: local_resources."""
+        if method == "POST":
+            try:
+                n = int(self.headers.get("content-length") or "-1")
+            except ValueError:
+                n = -1
+            if n < 0:
+                return self._error(411, "invalid_request_error", "content-length required")
+            if n > SWITCH_MAX_BODY:
+                return self._error(413, "request_too_large", f"a switch body is at most {SWITCH_MAX_BODY} bytes")
+            raw = self._read_body(n, self.server.body_deadline)
+            if raw is None:
+                return
+            try:
+                body = json.loads(raw or b"null")
+            except ValueError:
+                body = None
+            on = body.get("on") if isinstance(body, dict) else None
+            if not isinstance(on, bool):
+                return self._error(400, "invalid_request_error", 'body must be {"on": true} or {"on": false}')
+            try:
+                local_resources.set_local_switch(on)
+            except OSError as exc:
+                logger.warning("local switch change failed: %s", type(exc).__name__)
+                return self._error(500, "api_error", f"cannot change the local switch ({type(exc).__name__})")
+            logger.info("local switch set %s", "on" if on else "off")
+        elif method != "GET":
+            return self._error(405, "invalid_request_error", "the switch takes GET or POST")
+        self._send(200, json.dumps(self.switch_status()).encode())
+
+    def switch_status(self) -> dict:
+        """The switch status: local_resources.local_switch_status, the S1 training hold (a yes/no, no detail), and the
+        models Ollama has loaded."""
+        out = local_resources.local_switch_status()
+        out["training"] = training_hold(self.server.studio_gate_dir) is not None
+        out["models_loaded"], out["ollama"] = self._loaded_models()
+        return out
+
+    def _loaded_models(self) -> tuple[list[str] | None, str]:
+        """(names, "up") from Ollama's GET /api/ps on loopback, or (None, "unreachable" | "unreadable"). Names only:
+        sizes, digests and expiry times stay on the node."""
+        conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port,
+                                          timeout=min(self.server.connect_timeout, PS_TIMEOUT_S))
+        try:
+            try:
+                conn.connect()
+                conn.sock.settimeout(PS_TIMEOUT_S)
+                conn.request("GET", "/api/ps")
+                resp = conn.getresponse()
+                raw = resp.read(PS_MAX_BYTES)
+            except (OSError, http.client.HTTPException):
+                return None, "unreachable"
+            try:
+                data = json.loads(raw) if resp.status == 200 else None
+            except ValueError:
+                data = None
+            models = data.get("models") if isinstance(data, dict) else None
+            if not isinstance(models, list):
+                return None, "unreadable"
+            names = [m.get("name") or m.get("model") for m in models if isinstance(m, dict)]
+            names = [n for n in names if isinstance(n, str) and 0 < len(n) <= 200 and n.isprintable()]
+            return names[:PS_MAX_MODELS], "up"
+        finally:
+            conn.close()
 
     def _forward(self, method: str, path: str, body: bytes | None) -> None:
         conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port,
@@ -492,6 +575,7 @@ def main(argv=None) -> int:
     if a.print_config:
         print(json.dumps({"listen": f"{listen}:{a.port}", "upstream": a.upstream, "token_file": a.token_file,
                           "token": f"ok ({len(token)} chars, mode 0600)", "routes": sorted(f"{m} {p}" for m, p in ROUTES),
+                          "switch_endpoint": f"GET/POST {SWITCH_PATH}",
                           "max_body_bytes": a.max_body_bytes, "max_connections": a.max_connections or "unlimited",
                           "connect_timeout_s": a.connect_timeout, "read_timeout_s": a.read_timeout,
                           "studio_gate_dir": a.studio_gate_dir}, indent=1))
