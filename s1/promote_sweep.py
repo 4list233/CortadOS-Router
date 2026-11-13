@@ -212,9 +212,10 @@ def plan(sweep_path: Path, setting: str, pointer_path: Path, dest: Path | None =
     live_cfg = _read(to_fs(live_w.parent / "adapter_config.json"))
     live_rank = (live_cfg.get("lora_parameters") or {}).get("rank")
     if rank != live_rank:
-        notes.append(f"LoRA rank {rank} differs from the live adapter's {live_rank}: nightly.sh warm-starts the next new run from the "
-                     f"promoted adapter (CORTADOS_S1_INIT) while training at mlx_lm's default rank; mlx_lm resumes with "
-                     f"load_weights(strict=False), which does not check shapes. See the runbook before training resumes.")
+        notes.append(f"LoRA rank {rank} differs from the live adapter's {live_rank}: the next new nightly run warm-starts from the "
+                     f"promoted adapter (CORTADOS_S1_INIT) and trains at rank {rank} (lora_params.py reads it from the weights; "
+                     f"a configured CORTADOS_S1_LORA_RANK that disagrees refuses the night). Each blend adds the ranks; "
+                     f"warm starts above CORTADOS_S1_LORA_MAX_RANK (default 64) are refused.")
 
     t = row["teacher"]
     pointer = {
@@ -226,6 +227,7 @@ def plan(sweep_path: Path, setting: str, pointer_path: Path, dest: Path | None =
         "inference": {"fail_up_below": sweep.get("fail_up"), "outward_at": fp["inference"].get("outward_at")},
         "holdout": {k: t[k] for k in ("band_accuracy", "under_routed", "over_routed", "outward_recall")},
         "holdout_rows": sweep.get("holdout_rows"),
+        "lora": {"rank": rank, "scale": (cfg_src.get("lora_parameters") or {}).get("scale"), "num_layers": cfg_src.get("num_layers")},
         "sweep": {"setting": setting, "version": version, "tilt": row.get("tilt"), "blend": blend,
                   "source": real(source), "adapter_sha256": w_sha, "adapter_config_sha256": c_sha,
                   "outcome": row.get("outcome"), "promotion_rule": rep.get("rule"), "chosen_by_sweep": sweep.get("chosen")},

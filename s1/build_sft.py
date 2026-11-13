@@ -9,7 +9,7 @@ import random
 import sys
 from collections import Counter, defaultdict
 
-from common import DATA, core, read_jsonl, read_labels, valid_answers
+from common import DATA, bands_only, core, read_jsonl, read_labels, valid_answers
 from student import messages
 
 
@@ -21,8 +21,10 @@ for kv in (os.environ.get("CORTADOS_S1_REPS") or "").split(","):      # e.g. "R2
         REPS[kv.split(":")[0]] = int(kv.split(":")[1])
 
 
+bands_only()   # resolve below only maps answers to a band: no vendor usage probe (common.bands_only)
+
+
 def band_of(a: dict) -> str:
-    core.lane_health = lambda: {}
     return core.resolve({"answers": a, "degraded": False, "engine": "teacher", "engine_ms": 0})["band"]
 
 

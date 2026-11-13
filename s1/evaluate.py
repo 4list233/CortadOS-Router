@@ -18,7 +18,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from build_sft import OUTCOME_UNIT_KIND                # the one reading outcome tasks are graded under (interactive)
-from common import DATA, QUESTIONS, core, read_jsonl, read_labels, valid_answers
+from common import DATA, QUESTIONS, bands_only, core, read_jsonl, read_labels, valid_answers
 from student import N_OPTIONS, Scorer, encode
 
 BANDS = ["R0", "R1", "R2", "R3", "R4"]
@@ -47,8 +47,10 @@ def outcome_holdout() -> list[tuple[dict, str]]:
             if o.get("split") == "holdout" and o.get("outcome_band") in BANDS and isinstance(o.get("request"), str)]
 
 
+bands_only()   # resolve below only maps answers to a band: no vendor usage probe (common.bands_only)
+
+
 def band_of(a: dict) -> str:
-    core.lane_health = lambda: {}
     return core.resolve({"answers": a, "degraded": False, "engine": "eval", "engine_ms": 0})["band"]
 
 
