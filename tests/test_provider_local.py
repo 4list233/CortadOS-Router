@@ -367,7 +367,10 @@ class LocalPinTests(LocalHarness):
     def test_a_node_error_echoing_a_token_never_reaches_the_record_or_the_log(self):
         # The node's error body is backend text; one that echoes the gate's token (here past a 300-byte cut, where a
         # slice-then-redact would keep its prefix) must reach neither the run record nor the refusal log line.
-        secret = "gate-token-0123456789abcdef"
+        # Mixed-case consonants, no digits or separators: every 4-character slice is checked below, and a digit run in the
+        # secret matched the log line's epoch timestamp ("2345" in 1794323457.077, #98). The same length as before, so the
+        # secret still straddles the 300-byte cut at every pad.
+        secret = "QzJvKqXwZjPvQkYzWbJqZvKpQjX"
         for pad in (280, 290, 295, 299):
             FakeOllama.error_body = json.dumps({"type": "error", "error": {
                 "type": "invalid_request_error", "message": "x" * pad + secret}}).encode()
