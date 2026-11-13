@@ -74,8 +74,9 @@ const FALLBACK: Cfg = {
   // MCP tools (start_task / route_task), via a standing system-prompt directive, and its own Agent tool calls are
   // REFUSED (owner rule, CORTADOS-ORCHESTRATOR.md 2026-11-08: a routed Agent child dies with this session's hooks;
   // six builders aborted that day). Every other tool is held by the orchestrator gate below (orchestratorGate): the
-  // brain keeps what only it can do (reading, inspection, Chrome, connectors, a couple of small edits per turn), and
-  // the gate fails open when cortados-route is not connected or the provider is down.
+  // brain keeps what only it can do (reading, inspection, Chrome, connectors; no edits by default since 2026-11-13),
+  // and the gate fails open when cortados-route is not connected or the provider is down. The one Agent call allowed
+  // on the main loop is a fork the owner asked for in this turn's prompt (agentDecision).
   orchestratorMode: true,
   // Backward-compatible alias: `orchestratorEnforce: true` is orchestratorGate 'strict' (the allowlist cage).
   orchestratorEnforce: false,
@@ -86,7 +87,7 @@ const FALLBACK: Cfg = {
   // /cortados-gate off|balanced|strict overrides it for one session.
   orchestratorGate: 'balanced',
   // GATE_EDIT_BUDGET_DEFAULT (declared below, with its reason; a literal here, as FALLBACK is built first).
-  orchestratorEditBudget: 2,
+  orchestratorEditBudget: 0,
   // The cortados-route tools (mcp__cortados-route__*) are the delegation primitives and are always allowed by
   // isDelegationTool(), whatever this list says, so they are not repeated here. Agent is NOT in this list: it is
   // refused on the main loop in orchestrator mode (see mainLoopAllows).
@@ -153,11 +154,91 @@ export function isDelegationTool(tool: string): boolean {
  * when it is missing, so the session is never left unable to work: the owner's rule says to report the missing
  * router in one line and do the work directly. */
 export const AGENT_REFUSAL =
-  'Orchestrator mode: the Agent tool is not the delegation path on this session (owner rule, CORTADOS-ORCHESTRATOR.md; ' +
-  'a routed Agent subagent dies with this session\'s hooks). Delegate with mcp__cortados-route__start_task (a CortadOS ' +
-  'child session with files, shell and tools on this machine) or mcp__cortados-route__route_task (a text answer, no ' +
-  'tools); if they are deferred, load them with ToolSearch first. If cortados-route is not connected, tell the owner ' +
-  'in one line and do the work directly.'
+  'Orchestrator mode: the Agent tool is not used on this session — in-process subagents run inside this Claude Code ' +
+  'and die with its hooks (owner rule, CORTADOS-ORCHESTRATOR.md). Delegate with mcp__cortados-route__start_task (a ' +
+  'CortadOS child session with files, shell and tools) or mcp__cortados-route__route_task (a text answer, no tools); ' +
+  'if they are deferred, load them with ToolSearch first. Only the owner can allow an Agent call: saying "fork" in ' +
+  'their message, typed by them outside any pasted block (e.g. "fork a session"), allows a fork (subagent_type ' +
+  '"fork") for that turn. If cortados-route is not connected, tell the owner in one line and do the work directly.'
+
+/** The refusal when the owner did ask to fork this turn but the call is not a fork. */
+export const AGENT_FORK_ONLY =
+  'Orchestrator mode: the owner asked to fork this turn, which allows the Agent tool only as a fork — call it again ' +
+  'with subagent_type "fork". Other subagent types stay refused; delegate them with mcp__cortados-route__start_task.'
+
+/** The owner's explicit fork request: the word "fork" (any case; "fork a session", "/fork", "fork this", "forking"). */
+const FORK_REQUEST_RE = /(?<![A-Za-z0-9_])fork(?:s|ed|ing)?(?![A-Za-z0-9_])/i
+
+/** Tag names the harness (or a host app) wraps around material the owner did not type in this prompt: a paste, a
+ * system reminder, a task notification, a context or memory block, a peer's message, a command's captured output.
+ * Any tag name with `-`, `_`, `:` or `.` in it is treated the same (harness tags are spelled that way); a plain
+ * word tag the owner typed (`<b>`) is text. Over-matching only makes the fork check stricter. */
+const UNTRUSTED_TAGS: ReadonlySet<string> = new Set([
+  'pasted_content', 'system-reminder', 'task-notification', 'context', 'cc-memory', 'teammate-message',
+  'cross-session-message', 'channel', 'document', 'documents', 'attachment', 'file', 'untrusted', 'transcript',
+  'local-command-stdout', 'local-command-stderr', 'local-command-caveat', 'command-name', 'command-message',
+  'command-args', 'bash-input', 'bash-stdout', 'bash-stderr', 'user-prompt-submit-hook', 'tool_result',
+  'function_results', 'autonomous-loop', 'autonomous-loop-dynamic',
+])
+const TAG_START_RE = /<(\/?)([A-Za-z][A-Za-z0-9_:.-]*)/g
+
+function isUntrustedTag(name: string): boolean {
+  const n = name.toLowerCase()
+  return UNTRUSTED_TAGS.has(n) || /[-_:.]/.test(n)
+}
+
+/** The part of a prompt's text the owner typed: tagged blocks (UNTRUSTED_TAGS) removed. Only the text BEFORE the
+ * first such tag and the text AFTER the last one are kept, the latter only when the tags balance and the last one is
+ * a closing (or self-closing) tag that ends with `>`: a pasted block can carry a forged `</pasted_content>` and text
+ * after it, so nothing between two tagged blocks is trusted, and an unterminated block makes the rest untrusted. */
+export function ownerTypedText(text: unknown): string {
+  if (typeof text !== 'string') return ''
+  const tags: Array<{ start: number; end: number; close: boolean; selfClose: boolean }> = []
+  for (const m of text.matchAll(TAG_START_RE)) {
+    if (!isUntrustedTag(m[2])) continue
+    const start = m.index ?? 0
+    const gt = text.indexOf('>', start + m[0].length)
+    if (gt < 0) {
+      tags.push({ start, end: -1, close: false, selfClose: false }) // an unterminated tag: the rest is untrusted
+      break
+    }
+    tags.push({ start, end: gt + 1, close: m[1] === '/', selfClose: text[gt - 1] === '/' })
+  }
+  if (tags.length === 0) return text
+  const prefix = text.slice(0, tags[0].start)
+  let depth = 0
+  for (const t of tags) {
+    if (t.end < 0) return prefix
+    if (t.close) depth = Math.max(0, depth - 1)
+    else if (!t.selfClose) depth += 1
+  }
+  const last = tags[tags.length - 1]
+  return depth === 0 && (last.close || last.selfClose) ? `${prefix}\n${text.slice(last.end)}` : prefix
+}
+
+/** Whether a user prompt's text asks to fork, counting only what the owner typed (ownerTypedText). */
+export function isForkRequest(text: unknown): boolean {
+  return FORK_REQUEST_RE.test(ownerTypedText(text))
+}
+
+/** Prompt origins that are the owner's own words: the terminal, Remote Control, the SDK host (the desktop app) and an
+ * owner Slack ping. Everything else (task notifications, peers, plugins, scheduled triggers, unclassified) is not. */
+const OWNER_PROMPT_ORIGINS: ReadonlySet<string> = new Set(['composer', 'bridge', 'sdk', 'slack-ping'])
+
+/** Whether a prompt.submit is a genuine owner prompt: not meta (system reminders, receipts) and from an owner origin.
+ * An event with no origin (an engine that does not stamp it) counts when it is not meta, as the edit budget did. */
+export function isOwnerPrompt(e: any): boolean {
+  if (!e || e.isMeta) return false
+  const kind = e.origin?.kind
+  return kind == null || OWNER_PROMPT_ORIGINS.has(String(kind))
+}
+
+/** The main loop's Agent call in orchestrator mode: null = allowed (the owner asked to fork this turn and the call is
+ * a fork), else the deny text. */
+export function agentDecision(forkAsked: boolean, e: any): string | null {
+  if (!forkAsked) return AGENT_REFUSAL
+  return String(e?.subagent_type ?? '') === 'fork' ? null : AGENT_FORK_ONLY
+}
 
 // Host-app plumbing, not work: the Claude desktop app's turn tools that the main loop must call itself (a subagent
 // cannot update the parent's plan or end its turn). Seen 2026-10-30: the strict gate refused wrap_up and the desktop
@@ -181,12 +262,14 @@ export const ORCHESTRATOR_DIRECTIVE =
   'builds, searches, browses or touches a service, and run independent tasks in parallel; mcp__cortados-route__route_task ' +
   'returns a self-contained TEXT answer (an analysis, a draft, a focused question) with no tools. S1 scores each task ' +
   'and runs it on the cheapest capable model, so delegating keeps this expensive model free. Before the first ' +
-  'delegation load the mcp__cortados-route__* tools (they may be deferred: use ToolSearch). Do NOT delegate with the ' +
-  'Agent tool: this session\'s gate refuses it, and a routed Agent subagent dies with this session\'s hooks (2026-11-08: ' +
-  'six builders aborted). If cortados-route is not connected or a call fails, say so in one line and do the work ' +
-  'yourself. Act directly only when the step is trivial (a one-line answer, a quick lookup, a single small edit), when ' +
-  'it needs something only this session has (this conversation\'s context, a connector CortadOS lacks, a decision that ' +
-  'is the owner\'s), or when delegating would clearly cost more. Every task must stand on its own — the delegate cannot ' +
+  'delegation load the mcp__cortados-route__* tools (they may be deferred: use ToolSearch). This session PLANS, ' +
+  'DELEGATES, VERIFIES and REPORTS; it does not do the work itself. Act directly only when absolutely necessary: ' +
+  'connector or Chrome work that child tasks cannot do yet, a one-line inspection (a read, a status check), or a ' +
+  'decision only this conversation can make. Every edit, build, test run and web search is delegated; the gate refuses ' +
+  'them here (this session\'s own memory files and plan mode\'s plan file excepted). Do NOT delegate with the ' +
+  'Agent tool: in-process subagents run inside this session and die with its hooks, so the gate refuses Agent unless ' +
+  'the owner explicitly asks to fork in their own message (then use subagent_type "fork"). If cortados-route is not connected or a call fails, say so in one line and do the work yourself. Every ' +
+  'task must stand on its own — the delegate cannot ' +
   'see this conversation: state the goal, the context (paths, names, prior decisions), the scope and difficulty ' +
   'plainly, every outward effect (sends, posts, pays, deletes, deploys) explicitly, an acceptance check, and for ' +
   'start_task the working folder. Read every result and check it against the acceptance check before reporting; say ' +
@@ -1224,10 +1307,10 @@ export const GATE_STORE_KEY = 'orchestratorGateBySession'
 /** At most this many session overrides are kept (newest first): one per session the owner switched, and 64 covers
  * weeks of sessions while keeping the store entry a few KB. */
 export const GATE_STORE_MAX_SESSIONS = 64
-/** Small edits the main loop may make itself per user turn before the rest are refused. 2: the directive's "trivial
- * touch" (fix a typo, bump a value, answer a review nit) is one or two edits; a third edit in the same turn is a
- * stretch of implementation, which is what start_task is for. Big edits (GUARD_EDIT_MAX_*) are refused at once. */
-export const GATE_EDIT_BUDGET_DEFAULT = 2
+/** Small edits the main loop may make itself per user turn before the rest are refused. 0 (owner 2026-11-13: "the main
+ * session mainly plans and never does stuff unless it absolutely needs to"): every edit on the main loop is delegated
+ * work; orchestratorEditBudget raises it. Big edits (GUARD_EDIT_MAX_*) are refused at once whatever the budget. */
+export const GATE_EDIT_BUDGET_DEFAULT = 0
 /** A Bash call asking for more than this timeout is a long-running job, refused like a background one. 120 s is the
  * Bash tool's own default timeout: an inspection command never needs more, and asking for more declares a long run. */
 export const GATE_BASH_MAX_TIMEOUT_MS = 120_000
@@ -1321,7 +1404,9 @@ export function gateDenyMessage(cls: Exclude<GateClass, null>, tool: string, bud
     cls === 'web' ? `${tool} (web research) is delegated work — route_task returns a researched text answer, start_task a child that can browse and write files`
     : cls === 'notebook' ? 'NotebookEdit is delegated work'
     : cls === 'big-edit' ? `this ${tool} is a big edit (over ${GUARD_EDIT_MAX_LINES} lines or ${GUARD_EDIT_MAX_CHARS} characters of new content), which is implementation work`
-    : cls === 'edit' ? `this session already made ${budget} small edit${budget === 1 ? '' : 's'} this turn; more is implementation work`
+    : cls === 'edit' ? (budget === 0
+      ? `${tool} on the main session is implementation work (orchestratorEditBudget is 0: the main session plans and delegates)`
+      : `this session already made ${budget} small edit${budget === 1 ? '' : 's'} this turn; more is implementation work`)
     : cls === 'build' ? 'this Bash command is a build or test run'
     : `this Bash command is long-running (run_in_background, or a timeout over ${fmtSecs(GATE_BASH_MAX_TIMEOUT_MS)})`
   return `CortadOS gate (balanced): ${what}. ${GATE_HOW}`
@@ -1358,6 +1443,15 @@ export type GateState = {
   gen: number
   /** Small edits made on the main loop since the last user prompt. */
   edits: number
+  /** The main loop's running turn (turn.start's turnId), null between turns. A tool call carries no turn id; a
+   * main-loop call runs in this turn. */
+  turnId: string | null
+  /** An idle owner prompt that asked to fork, waiting for the turn it starts (the next main-loop turn.start). */
+  forkPending: { sid: string } | null
+  /** The owner turn that asked to fork: a main-loop Agent fork passes only while this turn runs in this session. */
+  forkTurn: { turnId: string; sid: string } | null
+  /** Plan mode's plan file, from the engine's plan_mode reminder on the main loop; null outside plan mode. */
+  planFile: string | null
   denied: number
   /** null while delegation was last found possible; else the one-line reason the gate is failing open. */
   unreachable: string | null
@@ -1368,7 +1462,7 @@ export type GateState = {
 }
 
 export function newGateState(): GateState {
-  return { override: undefined, overrideFor: null, map: null, gen: 0, edits: 0, denied: 0, unreachable: null, checkedAt: -Infinity, checking: null, childTask: null }
+  return { override: undefined, overrideFor: null, map: null, gen: 0, edits: 0, turnId: null, forkPending: null, forkTurn: null, planFile: null, denied: 0, unreachable: null, checkedAt: -Infinity, checking: null, childTask: null }
 }
 
 /** The override map from the store, cleaned: unknown levels and junk entries dropped. */
@@ -1437,6 +1531,85 @@ async function delegationSteps($: any, providerUrl: string, step: { name: string
 /** What the gate's helpers below share with register(): the closure state, passed explicitly (the engine requires
  * `$` to be handed only to top-level functions). */
 type GateCtx = { cfg: Cfg; gate: GateState; guard: GuardState; configLevel: GateLevel; resting: () => string | undefined }
+
+/** The session id, or null when it cannot be read (a fork is then never granted). */
+async function sessionIdOrNull($: any): Promise<string | null> {
+  try {
+    const v = await $.session.id()
+    return typeof v === 'string' && v ? v : null
+  } catch {
+    return null
+  }
+}
+
+/** Whether a main-loop Agent fork is allowed now: the owner turn that asked to fork is the running main-loop turn,
+ * in this session (a /clear or resume moves to another id). */
+export async function forkGranted($: any, gate: GateState): Promise<boolean> {
+  const g = gate.forkTurn
+  if (!g || gate.turnId === null || g.turnId !== gate.turnId) return false
+  return (await sessionIdOrNull($)) === g.sid
+}
+
+/** Claude Code's project folder name under ~/.claude/projects: the project root with every character that is not
+ * a letter or digit replaced by `-` (`/Users/a/my.repo` → `-Users-a-my-repo`). A root long enough that Claude Code
+ * shortens the name (over 200 characters) does not match, so its memory stays gated. */
+export function claudeProjectSlug(root: string): string {
+  return root.replace(/[^A-Za-z0-9]/g, '-')
+}
+
+/** Where a file path lands, every symbolic link followed and `.`/`..` folded: the file's own real path, or (a file
+ * not there yet) its folder's plus the name. undefined for a relative path, a bare `.`/`..` name, or a folder that
+ * does not resolve — the caller then keeps the call gated. */
+async function placedPath($: any, path: unknown): Promise<string | undefined> {
+  if (typeof path !== 'string' || !path.startsWith('/') || path.includes('\0')) return undefined
+  const cut = path.lastIndexOf('/')
+  const name = path.slice(cut + 1)
+  if (name === '' || name === '.' || name === '..') return undefined
+  const own = await $.fs.stat(path, { resolve: true }).catch(() => undefined)
+  if (own?.realPath) return own.realPath
+  const dir = await $.fs.stat(path.slice(0, cut + 1) || '/', { resolve: true }).catch(() => undefined)
+  if (dir?.kind !== 'dir' || typeof dir.realPath !== 'string') return undefined
+  return `${dir.realPath.replace(/\/$/, '')}/${name}`
+}
+
+/** This session's Claude Code memory folder, resolved: <CLAUDE_CONFIG_DIR or $HOME/.claude>/projects/<slug of the
+ * session's project root>/memory. undefined when any part cannot be read or the folder does not exist. */
+async function sessionMemoryDir($: any): Promise<string | undefined> {
+  try {
+    const root = await $.session.root()
+    if (typeof root !== 'string' || !root.startsWith('/')) return undefined
+    const configured = await $.env.get('CLAUDE_CONFIG_DIR')
+    const home = await $.env.get('HOME')
+    const base = typeof configured === 'string' && configured.startsWith('/') ? configured.replace(/\/+$/, '')
+      : typeof home === 'string' && home.startsWith('/') ? `${home.replace(/\/+$/, '')}/.claude` : null
+    if (base === null) return undefined
+    const st = await $.fs.stat(`${base}/projects/${claudeProjectSlug(root)}/memory`, { resolve: true })
+    return st?.kind === 'dir' && typeof st.realPath === 'string' ? st.realPath.replace(/\/$/, '') : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Whether an Edit/Write/MultiEdit writes what the session itself owns and the orchestrator is told to keep: a file
+ * inside THIS session's Claude Code memory folder, or plan mode's plan file. Both sides are resolved (links, `..`)
+ * and compared by real path; a path that merely contains "memory", a sibling project's memory, or anything that
+ * cannot be resolved is not. The scratchpad and every other file stay gated. */
+export async function isSessionOwnedWrite($: any, gate: GateState, tool: string, e: any): Promise<boolean> {
+  if (!EDIT_TOOLS.has(tool)) return false
+  try {
+    const target = await placedPath($, e?.file_path)
+    if (target === undefined) return false
+    const mem = await sessionMemoryDir($)
+    if (mem !== undefined && target.startsWith(`${mem}/`)) return true
+    if (gate.planFile !== null) {
+      const plan = await placedPath($, gate.planFile)
+      if (plan !== undefined && target === plan) return true
+    }
+  } catch {
+    /* unresolvable: gated */
+  }
+  return false
+}
 
 function gatePublish($: any, c: GateCtx): void {
   guardPublish($, c.guard, c.resting())
@@ -1769,9 +1942,13 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'Agent' }, async ($: any, e: any, next: any) => {
     // The top-level session delegates through cortados-route, never the Agent tool (owner rule): refused before any
-    // pass-through or launch, whether or not the enforced gate is on. A subagent's own Agent call (agentId present)
-    // is routed below as before.
-    if (refusesAgent(cfg.orchestratorMode, e?.agentId)) return { deny: AGENT_REFUSAL }
+    // pass-through or launch, at every gate level — unless the owner said "fork" in this turn's prompt and the call is
+    // a fork, which passes through to the native runner below. A subagent's own Agent call (agentId present) is
+    // routed below as before.
+    if (refusesAgent(cfg.orchestratorMode, e?.agentId)) {
+      const refusal = agentDecision(await forkGranted($, gate), e)
+      if (refusal) return { deny: refusal }
+    }
 
     const subagentType = String(e.subagent_type ?? '')
     const background = Boolean(e.run_in_background)
@@ -2187,12 +2364,16 @@ export const register: Register = (on, options) => {
     if (!cfg.orchestratorMode || !main) return next(e)
     const level = await gateLevelOf($, gctx)
     if (level === 'off' || (await gateIsChildTask($, gctx))) return next(e)
+    // An Agent call reaching here passed the Agent hook (the owner asked to fork): the strict cage lets it through too.
+    if (tool === 'Agent' && agentDecision(await forkGranted($, gate), e) === null) return next(e)
     if (level === 'strict') {
       // The allowlist cage, unchanged: no fail-open (it is a cage by choice; the refusal says how to lower it).
       return mainLoopAllows(tool, e?.agentId, allow, true) ? next(e) : gateDeny($, gctx, strictDenyMessage(tool))
     }
     const cls = balancedClass(tool, e)
     if (cls === null) return next(e)
+    // The session's own memory files and plan mode's plan file: the orchestrator is told to keep them itself.
+    if ((cls === 'edit' || cls === 'big-edit') && (await isSessionOwnedWrite($, gate, tool, e))) return next(e)
     if (cls === 'edit' && gate.edits < editBudget) {
       gate.edits += 1
       return next(e)
@@ -2215,10 +2396,79 @@ export const register: Register = (on, options) => {
       : { deny: `Orchestrator mode gate failed; refusing this tool. Delegate it with mcp__cortados-route__start_task, or ask the owner to type /${GATE_COMMAND} off.` }
   })
 
-  // A new user prompt starts a new turn: the small-edit budget is per turn. Meta prompts (not typed by the person)
-  // do not reset it; this mod's own background notifications never reach its own hooks.
+  // A new owner prompt starts a new turn: the small-edit budget is per owner prompt. The fork permission is bound to
+  // ONE main-loop turn of this session (gate.forkTurn): an owner prompt submitted while idle that asks to fork
+  // (isForkRequest: the owner's own text, pasted and harness blocks removed) marks the turn it starts (turn.start
+  // below); one delivered into a running turn grants that turn if it asks to fork and ends its permission if not.
+  // Meta prompts and other origins (task notifications, peers, plugins) never grant; one that starts a turn of its own
+  // clears what is pending. The turn's end, a session start and a session end clear it all. This mod's own background
+  // notifications never reach its own hooks.
   on('prompt.submit', async ($: any, e: any, next: any) => {
-    if (!e?.isMeta) gate.edits = 0
+    if (isOwnerPrompt(e)) {
+      gate.edits = 0
+      const fork = isForkRequest(e?.text)
+      const sid = fork ? await sessionIdOrNull($) : null
+      if (e?.turnId) {
+        gate.forkPending = null
+        gate.forkTurn = fork && sid !== null ? { turnId: String(e.turnId), sid } : null
+      } else {
+        gate.forkTurn = null
+        gate.forkPending = fork && sid !== null ? { sid } : null
+      }
+    } else if (!e?.turnId) {
+      gate.forkPending = null
+      gate.forkTurn = null
+    }
+    const r = await next(e)
+    if (r && typeof r === 'object' && 'drop' in r) gate.forkPending = null // the prompt never started a turn
+    return r
+  }).catch(($: any, e: any, next: any) => {
+    gate.forkPending = null
+    return next.called ? undefined : next(e)
+  })
+
+  // The main loop's turns: which turn is running (a tool call carries no turn id), and the one a pending fork request
+  // started. A subagent's turn (agentId) changes nothing.
+  on('turn.start', async ($: any, e: any, next: any) => {
+    if (e?.agentId === undefined) {
+      const turnId = typeof e?.turnId === 'string' && e.turnId ? e.turnId : null
+      gate.turnId = turnId
+      const pending = gate.forkPending
+      gate.forkPending = null
+      if (pending && turnId !== null) gate.forkTurn = { turnId, sid: pending.sid }
+      else if (gate.forkTurn && gate.forkTurn.turnId !== turnId) gate.forkTurn = null
+    }
+    return next(e)
+  }).catch(($: any, e: any, next: any) => {
+    gate.forkPending = null
+    gate.forkTurn = null
+    return next.called ? undefined : next(e)
+  })
+
+  // A turn's end (answered, interrupted, refused or errored) ends its fork permission. Also the Office 'idle' beat.
+  on('turn.complete', async ($: any, e: any, next: any) => {
+    if (e?.agentId === undefined) {
+      gate.turnId = null
+      gate.forkPending = null
+      gate.forkTurn = null
+      if (officeOn) void officeBeat($, cfg, office, 'idle', null, true)
+    }
+    return next(e)
+  }).catch(($: any, e: any, next: any) => {
+    gate.turnId = null
+    gate.forkPending = null
+    gate.forkTurn = null
+    return next.called ? undefined : next(e)
+  })
+
+  // Plan mode's plan file, as the engine names it in the main loop's plan-mode reminder; cleared when plan mode ends.
+  on('prompt.attachment', { type: 'plan_mode' }, async ($: any, e: any, next: any) => {
+    const p = e?.detail?.planFilePath
+    if (e?.agentId === undefined && typeof p === 'string' && p.startsWith('/')) gate.planFile = p
+    return next(e)
+  }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
+  on('prompt.attachment', { type: 'plan_mode_exit' }, async ($: any, e: any, next: any) => {
+    if (e?.agentId === undefined) gate.planFile = null
     return next(e)
   }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
 
@@ -2259,19 +2509,22 @@ export const register: Register = (on, options) => {
   // ---- Office heartbeats: the main session's status and current tool NAME (never its input) ----------------------
   // The 'working' beat rides on the ONE matcher-less tool.call hook (the engine allows one per module), registered above
   // with the orchestrator gate.
-  if (officeOn) {
-    on('turn.complete', async ($: any, e: any, next: any) => {
-      if (e?.agentId === undefined) void officeBeat($, cfg, office, 'idle', null, true)
-      return next(e)
-    }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
-    on('session.end', async ($: any, e: any, next: any) => {
-      await officeBeat($, cfg, office, 'ended', null, true)   // flush in order: the process may exit right after
-      return next(e)
-    }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
+  // (The Office 'idle' beat at a turn's end rides on the turn.complete hook above, with the fork bookkeeping.)
+  const clearTurnState = () => {
+    gate.turnId = null
+    gate.forkPending = null
+    gate.forkTurn = null
+    gate.planFile = null
   }
+  on('session.end', async ($: any, e: any, next: any) => {
+    clearTurnState()
+    if (officeOn) await officeBeat($, cfg, office, 'ended', null, true)   // flush in order: the process may exit right after
+    return next(e)
+  }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
 
   let sweepStarted = false
   on('session.start', async ($: any, e: any, next: any) => {
+    clearTurnState() // a new or resumed session: no turn, no fork permission, no plan mode carried over
     const r = await next(e)
     if (!sweepStarted) {
       sweepStarted = true

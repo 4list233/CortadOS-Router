@@ -1414,12 +1414,14 @@ test('routed requests carry the office tags before the run id, never the raw ses
   expect(h.store[OFFICE_SALT_KEY]).toBe(salt)
 })
 
-test('officeView off sends no tags and registers no heartbeat hooks', async () => {
+test('officeView off sends no tags and no heartbeats (turn/session end hooks keep only the gate\'s turn bookkeeping)', async () => {
   const h = officeHarness({ officeView: false })
   await h.handlers['tool.call:Agent'](h.$, { prompt: 'p', description: 'Build', subagent_type: 'general-purpose' }, async () => 'native')
   expect(splitRunId(h.childHeaders[0]).base).toBe('x-cortados-reveal: 1')
-  expect(h.handlers['turn.complete']).toBe(undefined)
-  expect(h.handlers['session.end']).toBe(undefined)
+  await h.handlers['turn.complete'](h.$, { turnId: 't', reason: 'answer' }, async () => ({ text: '' }))
+  await h.handlers['session.end'](h.$, {}, async () => ({}))
+  await h.settle()
+  expect(h.beats).toEqual([])
 })
 
 test('file-only provider URL config also routes Office heartbeats', async () => {
@@ -1734,6 +1736,11 @@ test('the injected directive names start_task, forbids the Agent tool, states pr
   expect(sec.text).toContain('mcp__cortados-route__start_task')
   expect(sec.text).toContain('mcp__cortados-route__route_task')
   expect(sec.text).toContain('Do NOT delegate with the Agent tool')
+  expect(sec.text).toContain('PLANS, DELEGATES, VERIFIES and REPORTS')
+  expect(sec.text).toContain('Act directly only when absolutely necessary')
+  expect(sec.text).toContain('connector or Chrome work that child tasks cannot do yet')
+  expect(sec.text).toContain('unless the owner explicitly asks to fork')
+  expect(sec.text).not.toContain('a single small edit')
   expect(sec.text).toContain('If cortados-route is not connected or a call fails, say so in one line and do the work yourself')
   expect(sec.text).toContain('~/.config/ai-coding/CORTADOS-ORCHESTRATOR.md outranks this directive')
   expect(sec.text).toContain('tell the owner about the conflict')
