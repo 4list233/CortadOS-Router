@@ -58,11 +58,13 @@ class InstallExecHostTest(unittest.TestCase):
             "air": {"ssh": "air", "router": "/r", "hostnames": ["forests-macbook-air"], "root": "/w"},
             "pro": {"hostnames": hostnames, "root": str(self.home / "CortadOS")}}}))
 
-    def install(self, *args, logged_in="true"):
-        env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "CORTADOS_LAUNCHCTL": str(self.fake),
+    def install(self, *args, logged_in="true", cwd=None, home=None):
+        env = {"HOME": home or str(self.home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+               "CORTADOS_LAUNCHCTL": str(self.fake),
                "FAKE_LOG": str(self.log), "FAKE_CLAUDE_LOG": str(self.claude_log), "FAKE_LOGGED_IN": logged_in,
                "CORTADOS_INSTALL_HOSTNAME": "Forests-MacBook-Pro"}
-        p = subprocess.run(["/bin/bash", str(INSTALL), *args], capture_output=True, text=True, env=env, timeout=60)
+        p = subprocess.run(["/bin/bash", str(INSTALL), *args], capture_output=True, text=True, env=env, timeout=60,
+                           cwd=cwd)
         self.assertNotIn(SECRET, p.stdout + p.stderr)
         return p
 
@@ -143,11 +145,31 @@ class InstallExecHostTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn('no entry names Forests-MacBook-Pro in hostnames, so host "here" is refused', p.stdout)
 
+    def test_a_relative_claude_path_is_printed_absolute_and_the_entry_loads(self):
+        # Review finding: `--claude ./bin/claude` passed the checks but printed "claude": "./bin/claude", which
+        # exec_hosts.Host refuses (absolute paths only), so the copied entry broke config loading.
+        from cortados_router import exec_hosts as eh
+        self.add_claude()
+        self.add_provider_files()
+        p = self.install("pro", "--claude", "./.local/bin/claude", "--dry-run", cwd=str(self.home))
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)    # only exec-hosts.json is missing
+        self.assertIn("logged in", p.stdout)                       # the resolved path was the one probed
+        entry = self.entry(p.stdout[p.stdout.index("this machine's entry"):])["pro"]
+        for key in ("claude", "root", "router"):
+            self.assertTrue(os.path.isabs(entry[key]), (key, entry[key]))
+        self.assertNotIn("./", entry["claude"])
+        self.assertEqual(Path(entry["claude"]).resolve(), self.claude.resolve())
+        host = eh.Host("pro", entry)                               # the printed entry is accepted as it is
+        self.assertEqual(host.claude, entry["claude"])
+
     def test_bad_arguments_are_refused(self):
         for args in (["Pro"], ["here"], ["pro", "--ssh", "-oProxyCommand=x"], ["pro", "--nope"]):
             p = self.install(*args)
             self.assertEqual(p.returncode, 2, args)
         self.assertFalse((self.home / "CortadOS").exists())
+        p = self.install("pro", "--dry-run", home="relative-home", cwd=str(self.home))
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("HOME must be an absolute path", p.stderr)
 
 
 if __name__ == "__main__":

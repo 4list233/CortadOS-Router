@@ -9,7 +9,8 @@
 #                   the laptop, so its tasks are started on the Pro itself with host "here")
 #   --gui/--no-gui  whether chrome / connector children may run here (a desktop session is logged in); default --gui
 #   --provider-url  the provider as seen from this machine; default: the content of ~/.config/cortados/provider-url
-#   --claude PATH   the claude CLI; default ~/.local/bin/claude, else `claude` on PATH
+#   --claude PATH   the claude CLI; default ~/.local/bin/claude, else `claude` on PATH; a relative path is made
+#                   absolute against the current directory (exec-hosts.json takes absolute paths only)
 #   --dry-run       print what would be created and loaded; change nothing (the read-only checks still run)
 #
 # Idempotent. What it does:
@@ -59,6 +60,11 @@ done
 if [ -n "$SSH" ]; then
   [[ "$SSH" =~ ^[A-Za-z0-9_.@-]+$ && "$SSH" != -* ]] || die "--ssh must be an ssh_config alias or user@host"
 fi
+# Every path printed into the entry must be absolute (exec_hosts.Host refuses a relative root/router/claude), so a
+# relative one is made absolute against the current directory here, before anything is created or checked.
+abspath() { "$PYTHON" -I -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$1"; }
+[[ "$HOME" == /* ]] || die "HOME must be an absolute path (got '$HOME')"
+[ -z "$CLAUDE" ] || CLAUDE="$(abspath "$CLAUDE")"
 ME="${CORTADOS_INSTALL_HOSTNAME:-$(hostname -s)}"
 [ "$DRY" = 1 ] && say "dry run: nothing is created or loaded"
 say "host '$HOST' on this machine ($ME), user $(id -un), checkout $REPO"
@@ -118,6 +124,7 @@ fi
 # 3. claude CLI (read-only) -------------------------------------------------------------------------------------------
 if [ -z "$CLAUDE" ]; then
   if [ -x "$HOME/.local/bin/claude" ]; then CLAUDE="$HOME/.local/bin/claude"; else CLAUDE="$(command -v claude || true)"; fi
+  [ -z "$CLAUDE" ] || CLAUDE="$(abspath "$CLAUDE")"    # a relative PATH entry gives a relative `command -v`
 fi
 if [ -z "$CLAUDE" ] || [ ! -x "$CLAUDE" ]; then
   todo "install the claude CLI (curl -fsSL https://claude.ai/install.sh | bash), then run 'claude' once and log in"
