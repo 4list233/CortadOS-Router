@@ -262,7 +262,8 @@ export const ORCHESTRATOR_DIRECTIVE =
   'builds, searches, browses or touches a service, and run independent tasks in parallel; mcp__cortados-route__route_task ' +
   'returns a self-contained TEXT answer (an analysis, a draft, a focused question) with no tools. ' +
   'Where a child runs: start_task\'s default host is the always-on Air; pass host "here" when the task needs THIS ' +
-  'machine\'s signed-in browser (e.g. Duo/SSO sites like Quercus), local files or local apps, and host "studio" for ' +
+  'machine\'s signed-in browser (e.g. Duo/SSO sites like Quercus), local files or local apps (with cwd set to that ' +
+  'folder, e.g. this session\'s project root), and host "studio" for ' +
   'heavy local-model/GPU work once the Studio is set up. Chrome serves one client at a time per machine: while a ' +
   '"here" chrome task runs, do not use Chrome yourself. S1 scores each task ' +
   'and runs it on the cheapest capable model, so delegating keeps this expensive model free. Before the first ' +
@@ -272,7 +273,10 @@ export const ORCHESTRATOR_DIRECTIVE =
   'decision only this conversation can make. Every edit, build, test run and web search is delegated; the gate refuses ' +
   'them here (this session\'s own memory files and plan mode\'s plan file excepted). Do NOT delegate with the ' +
   'Agent tool: in-process subagents run inside this session and die with its hooks, so the gate refuses Agent unless ' +
-  'the owner explicitly asks to fork in their own message (then use subagent_type "fork"). If cortados-route is not connected or a call fails, say so in one line and do the work yourself. Every ' +
+  'the owner explicitly asks to fork in their own message (then use subagent_type "fork"). When the gate refuses a ' +
+  'call, delegate it (start_task, host "here" for this machine); never ask the owner to switch the gate off unless ' +
+  'start_task failed or the step truly needs this conversation, and then say why. If cortados-route is not connected ' +
+  'or a call fails, say so in one line and do the work yourself. Every ' +
   'task must stand on its own — the delegate cannot ' +
   'see this conversation: state the goal, the context (paths, names, prior decisions), the scope and difficulty ' +
   'plainly, every outward effect (sends, posts, pays, deletes, deploys) explicitly, an acceptance check, and for ' +
@@ -1394,16 +1398,34 @@ export function balancedClass(tool: string, e: any): GateClass {
   return null
 }
 
-/** How every deny message ends: what to put in a delegated task, and the per-session escape hatch. */
-const GATE_HOW =
-  'Delegate it: mcp__cortados-route__start_task for work with files, shell or tools (a CortadOS child session; give ' +
-  'it the goal, the working folder, paths and prior decisions, every outward effect, and an acceptance check) or ' +
-  'mcp__cortados-route__route_task for a self-contained text answer (put every fact it needs in the task; it cannot ' +
-  'see this conversation). Load them with ToolSearch if they are deferred. If this step truly needs this session, ask ' +
-  `the owner to type /${GATE_COMMAND} off (this session only).`
+/** How every deny message ends: delegate with start_task (host "here" + cwd for this machine's files, apps or
+ * signed-in browser), what to put in the task, route_task for text, and /cortados-gate off as the LAST resort.
+ * Evidence 2026-11-13 (owner's Pro): with the hatch offered as an equal option, a session editing local-only files
+ * asked the owner 9 times to switch the gate off instead of delegating to a child on the same machine. `root` is the
+ * session's project root when the engine exposes it (safeRoot), so the session can pass it as cwd verbatim. */
+export function gateHow(root?: string | null): string {
+  const cwd = root ? `cwd ${JSON.stringify(root)} (this session's project root) or the folder the work is in` : 'cwd set to the folder the work is in'
+  return 'Delegate it with mcp__cortados-route__start_task: give the child the exact edits or goal, the file paths and ' +
+    `an acceptance check. If the files, apps or signed-in browser are on THIS machine, pass host "here" and ${cwd}. ` +
+    'For a self-contained text answer use mcp__cortados-route__route_task (put every fact in the task; it cannot see ' +
+    'this conversation). Load them with ToolSearch if deferred. Last resort only: if start_task failed or the step ' +
+    `truly needs this conversation, tell the owner why delegation won't work and ask them to type /${GATE_COMMAND} off ` +
+    '(this session only).'
+}
 
-/** The deny text for a balanced-gate class. Names the tool, why it is delegated, and GATE_HOW. */
-export function gateDenyMessage(cls: Exclude<GateClass, null>, tool: string, budget: number): string {
+/** The session's project root for a deny message: an absolute path of at most 512 plain characters (no control or
+ * quote characters, which could bend the message), else null. Never throws. */
+export async function safeRoot($: any): Promise<string | null> {
+  try {
+    const r = await $.session.root()
+    return typeof r === 'string' && r.startsWith('/') && r.length <= 512 && !/[\u0000-\u001f\u007f"\\`]/.test(r) ? r : null
+  } catch {
+    return null
+  }
+}
+
+/** The deny text for a balanced-gate class. Names the tool, why it is delegated, and gateHow(root). */
+export function gateDenyMessage(cls: Exclude<GateClass, null>, tool: string, budget: number, root?: string | null): string {
   const what =
     cls === 'web' ? `${tool} (web research) is delegated work — route_task returns a researched text answer, start_task a child that can browse and write files`
     : cls === 'notebook' ? 'NotebookEdit is delegated work'
@@ -1413,14 +1435,15 @@ export function gateDenyMessage(cls: Exclude<GateClass, null>, tool: string, bud
       : `this session already made ${budget} small edit${budget === 1 ? '' : 's'} this turn; more is implementation work`)
     : cls === 'build' ? 'this Bash command is a build or test run'
     : `this Bash command is long-running (run_in_background, or a timeout over ${fmtSecs(GATE_BASH_MAX_TIMEOUT_MS)})`
-  return `CortadOS gate (balanced): ${what}. ${GATE_HOW}`
+  return `CortadOS gate (balanced): ${what}. ${gateHow(root)}`
 }
 
 /** The strict level's deny text (today's orchestratorEnforce cage), with the per-session escape hatch. */
 export function strictDenyMessage(tool: string): string {
   if (tool === 'Agent') return AGENT_REFUSAL
   return `Orchestrator mode (enforced): the brain plans and delegates — it does not run ${tool} itself. ` +
-    `Delegate with mcp__cortados-route__start_task (a CortadOS child session with tools on this machine) or ` +
+    `Delegate with mcp__cortados-route__start_task (a CortadOS child session with tools; host "here" and cwd for ` +
+    `this machine's files, apps or signed-in browser) or ` +
     `mcp__cortados-route__route_task (a text answer) instead of calling ${tool} directly. If cortados-route is ` +
     `not connected, tell the owner in one line: direct work needs the gate lowered (/${GATE_COMMAND} balanced or off, ` +
     `this session only) or orchestratorEnforce turned off.`
@@ -2388,7 +2411,7 @@ export const register: Register = (on, options) => {
       if (cls === 'edit') gate.edits += 1
       return next(e)
     }
-    return gateDeny($, gctx, gateDenyMessage(cls, tool, editBudget))
+    return gateDeny($, gctx, gateDenyMessage(cls, tool, editBudget, await safeRoot($)))
   }).catch(($: any, e: any, next: any) => {
     if (next.called) return undefined
     guardReport($, guard, 'gate', new Error('gate'))
@@ -2397,7 +2420,7 @@ export const register: Register = (on, options) => {
     const strict = cfg.orchestratorMode && e?.agentId == null && (gate.override ?? configLevel) === 'strict'
     return !strict || mainLoopAllows(String(e?.tool), e?.agentId, allow, true)
       ? next(e)
-      : { deny: `Orchestrator mode gate failed; refusing this tool. Delegate it with mcp__cortados-route__start_task, or ask the owner to type /${GATE_COMMAND} off.` }
+      : { deny: `Orchestrator mode gate failed; refusing this tool. Delegate it with mcp__cortados-route__start_task (host "here" for this machine's files); only if that fails, ask the owner to type /${GATE_COMMAND} off.` }
   })
 
   // A new owner prompt starts a new turn: the small-edit budget is per owner prompt. The fork permission is bound to

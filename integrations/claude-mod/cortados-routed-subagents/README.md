@@ -120,8 +120,12 @@ can do (reading and inspection, connectors, Chrome, decisions). Turn the whole t
 guidance and was ignored, so the owner asked for it to be enforced automatically, every session, without repeating it.
 
 **What `balanced` (the default) refuses** on the main loop, with a message naming `mcp__cortados-route__start_task` /
-`route_task`, what to put in the task (goal, working folder, paths and context, outward effects, acceptance check) and
-how to switch the gate off:
+`route_task` and what to put in the task (the exact edits or goal, file paths, acceptance check). Work on **this**
+machine's files, apps or signed-in browser is delegated with `start_task` `host: "here"` and `cwd` set to the folder;
+the refusal names the session's project root when the engine exposes it (a plain absolute path only). Asking the owner
+for `/cortados-gate off` comes last in the message, as the last resort: only after `start_task` failed or when the step
+truly needs this conversation, saying why delegation won't work (2026-11-13: a session editing files that existed only
+on the Pro asked the owner nine times to switch the gate off instead of delegating to a child on the same machine):
 
 | Tool call | Decision | Why |
 | --- | --- | --- |

@@ -142,7 +142,7 @@ const ALLOWED: Array<[string, Record<string, unknown>]> = [
   ['Monitor', { tool: 'Monitor' }],
 ]
 
-test('balanced (the default): every deny class is refused naming start_task, route_task and the escape hatch', async () => {
+test('balanced (the default): every deny class names start_task with host "here" and the project root, route_task, and the hatch last', async () => {
   for (const [name, e] of DENIED) {
     const w = gateWorld()
     const r: any = await w.call(e)
@@ -151,8 +151,22 @@ test('balanced (the default): every deny class is refused naming start_task, rou
     expect(r.deny).toContain('mcp__cortados-route__route_task')
     expect(r.deny).toContain(`/${GATE_COMMAND} off`)
     expect(r.deny).toContain('acceptance check')
+    expect(r.deny).toContain('pass host "here" and cwd "/Users/o/my.repo" (this session\'s project root)')
+    // The owner hatch is the last resort, after delegation, never offered as an equal alternative.
+    expect(r.deny.indexOf(`/${GATE_COMMAND} off`)).toBeGreaterThan(r.deny.indexOf('host "here"'))
+    expect(r.deny).toMatch(/Last resort only: if start_task failed or the step truly needs this conversation, tell the owner why delegation won't work/)
     expect(w.state.ran).toEqual([])
   }
+})
+
+test('deny text: the project root is named only when it is a plain absolute path', async () => {
+  for (const root of ['relative/dir', '/a"b', '/a\nb', '/a`b', '/' + 'x'.repeat(600)]) {
+    const w = gateWorld({}, { root } as any)
+    const r: any = await w.call({ tool: 'WebSearch' })
+    expect(r.deny).toContain('pass host "here" and cwd set to the folder the work is in.')
+    expect(r.deny).not.toContain('project root')
+  }
+  expect(gateDenyMessage('edit', 'Edit', 0, '/Users/o/Velox Systems')).toContain('cwd "/Users/o/Velox Systems" (this session\'s project root)')
 })
 
 test('balanced: reading, inspection Bash, Chrome, connectors, host plumbing, Artifact and delegation run', async () => {
