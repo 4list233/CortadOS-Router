@@ -234,7 +234,9 @@ class ResponsivenessTests(unittest.TestCase):
 
 
 import os
+import shutil
 import subprocess
+import tempfile
 import sys
 from pathlib import Path
 
@@ -371,7 +373,10 @@ class TokenSafetyTests(unittest.TestCase):
 
 class DeepNestCrashTests(unittest.TestCase):
     def test_deeply_nested_line_does_not_crash_the_server(self):
-        env = {**os.environ, "CORTADOS_PROVIDER_URL": "http://127.0.0.1:1", "CORTADOS_PROVIDER_TOKEN": "t-test-0001"}
+        salt_dir = tempfile.mkdtemp()                   # the server creates its Office salt at start: never in ~
+        self.addCleanup(shutil.rmtree, salt_dir, True)
+        env = {**os.environ, "CORTADOS_PROVIDER_URL": "http://127.0.0.1:1", "CORTADOS_PROVIDER_TOKEN": "t-test-0001",
+               "CORTADOS_OFFICE_SALT_FILE": os.path.join(salt_dir, "office-salt")}
         p = subprocess.Popen([sys.executable, str(SERVER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              env=env, text=True, bufsize=1)
         got = {"msg": None}

@@ -34,6 +34,7 @@ import secrets
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from collections import OrderedDict, deque
 from html.parser import HTMLParser
@@ -1256,8 +1257,15 @@ class Handler(BaseHTTPRequestHandler):
             # Owner token, or a scoped token with live:read. Metadata only (provider/live.py), never request text.
             if self._scoped is None and not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
+            # ?session=<tag>: one orchestrating session's tasks and conversations (live.for_session); a bad tag is a 400
+            sess = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("session")
+            if sess is not None and (len(sess) != 1 or live.valid_session(sess[0]) is None):
+                return self._error(400, "invalid_request_error",
+                                   "cortados: session must be one Office session tag (16-64 lowercase hex) or grokbot")
             try:
                 body = self.server.live_body(self.server.registry)
+                if sess:
+                    body = json.dumps(live.for_session(json.loads(body), sess[0]), allow_nan=False).encode()
             except Exception as exc:
                 logger.warning("live: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: live view unavailable (see provider log)")

@@ -1772,8 +1772,29 @@ export function officeHeaderLines(o: { session?: string | null; project?: string
 
 type OfficeBeat = { status: 'working' | 'idle' | 'ended'; tool: string | null; force: boolean }
 
+/** The machine's shared Office salt file (cortados_router/subagent_mcp.py OFFICE_SALT_DEFAULT; the
+ * CORTADOS_OFFICE_SALT_FILE env var overrides it): 32 lowercase hex, 0600, made by the cortados-route MCP server. */
+export const OFFICE_SALT_FILE = '~/.config/cortados/office-salt'
+
+/** The shared salt, or null when it is absent, unreadable or not 32 lowercase hex. Never throws. */
+export async function readSharedSalt($: any): Promise<string | null> {
+  try {
+    let path = String((await $.env.get('CORTADOS_OFFICE_SALT_FILE')) || OFFICE_SALT_FILE).trim()
+    if (path === '~' || path.startsWith('~/')) {
+      const home = await $.env.get('HOME')
+      if (!home) return null
+      path = home + path.slice(1)
+    }
+    const v = String(await $.fs.read(path)).trim()
+    return /^[0-9a-f]{32}$/.test(v) ? v : null
+  } catch {
+    return null
+  }
+}
+
 type OfficeState = {
   salt: string | null
+  saltShared: boolean
   device: string | null
   project: string | null
   reported: Set<string>
@@ -1786,7 +1807,7 @@ type OfficeState = {
 }
 
 export function newOfficeState(): OfficeState {
-  return { salt: null, device: null, project: null, reported: new Set(), last: null, failures: 0,
+  return { salt: null, saltShared: false, device: null, project: null, reported: new Set(), last: null, failures: 0,
     pending: null, running: null, wake: null, ended: false }
 }
 
@@ -1807,6 +1828,16 @@ function officeReport($: any, office: OfficeState, where: string, err: unknown):
 /** This session's Office identity: { session tag, project, device }. Each part that cannot be read is reported once
  * and left out (the provider then shows the work in its lobby or without that label); never throws. */
 async function officeIdentity($: any, office: OfficeState): Promise<{ session: string | null; project: string | null; device: string | null }> {
+  // The machine's shared salt wins over this install's own: the cortados-route MCP server (start_task's origin) and the
+  // cortados-pulse pane derive the same tag from it. Looked for again on every call until found (the MCP server
+  // creates it at its start), then kept; the store's salt serves only while there is none.
+  if (!office.saltShared) {
+    const shared = await readSharedSalt($)
+    if (shared) {
+      office.salt = shared
+      office.saltShared = true
+    }
+  }
   if (office.salt === null) {
     try {
       const v = await $.store.get(OFFICE_SALT_KEY)

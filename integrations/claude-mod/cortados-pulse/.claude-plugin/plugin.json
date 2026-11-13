@@ -1,7 +1,7 @@
 {
   "name": "cortados-pulse",
-  "version": "0.3.0",
-  "description": "A pane beside the chat with what the CortadOS router is running (child tasks, routed conversations, host jobs) and its live resource pool: routes and S1 health, every subscription lane's % left (per Claude account, Codex, Cursor, ...), online devices and model fit, with a link to the browser dashboard.",
+  "version": "0.4.0",
+  "description": "A pane beside the chat with this session's own CortadOS child tasks, then what the router is running (child tasks, routed conversations, host jobs) and its live resource pool: routes and S1 health, every subscription lane's % left (per Claude account, Codex, Cursor, ...), online devices and model fit, with a link to the browser dashboard.",
   "author": {
     "name": "Forest Li",
     "url": "https://github.com/4list233"

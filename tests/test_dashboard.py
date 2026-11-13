@@ -419,6 +419,21 @@ class DashboardRenderTest(unittest.TestCase):
         self.assertLess(out.index("Refactor the scarcity reader"), out.index("Check the release page"))   # running first
         self.assertEqual(out.count("S1 decision; band R2; steps=1"), 10)       # the latest ten; the rest behind the button
 
+    def test_live_tasks_grouped_under_their_main_session(self):
+        from tests import test_live as tl
+        out = self.run_page(None, "live", live_view=self.live())
+        mine = "CortadOS-Router · on pro · session " + tl.SESSION[:8] + " · main session working · tool Edit"
+        self.assertIn(mine, out)
+        self.assertIn("Unattributed · no main session recorded", out)
+        self.assertIn("Grok Bot (bot gateway)", out)
+        # running work: the session's group (its running task) before the unattributed one (the queued browser task)
+        self.assertLess(out.index(mine), out.index("Refactor the scarcity reader"))
+        self.assertLess(out.index("Refactor the scarcity reader"), out.index("Unattributed"))
+        self.assertLess(out.index("Unattributed"), out.index("Check the release page"))
+        self.assertIn("tasks 1 running · 1 done", out)                          # the orchestrator's conversation row
+        out = self.run_page(None, "live", live_view={"tasks": {"running": [{"task_id": "t1", "state": "running"}]}})
+        self.assertNotIn("Unattributed", out)                                   # an older provider: no groups
+
     def test_live_section_errors_are_said_in_their_section(self):
         def boom():
             raise OSError("x")

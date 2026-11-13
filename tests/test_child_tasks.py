@@ -9,6 +9,7 @@ import sys
 import tempfile
 import textwrap
 import io
+import shutil
 import signal
 import time
 import unittest
@@ -1554,6 +1555,100 @@ class ChildTaskTests(ChildTaskBase):
         self.assertEqual([(e["event"], e.get("title"), e.get("session"), e.get("project")) for e in ev],
                          [("started", "draft README section", "3f9a1c2e9b7d4a10", "work"),
                           ("finished", "draft README section", "3f9a1c2e9b7d4a10", "work")])
+
+    # -- the main session that started a task (live view, dashboard, cortados-pulse) --
+
+    SID = "792b087a-1983-4baf-b701-77792e4b77e4"
+    SALT = "0123456789abcdef0123456789abcdef"
+
+    def _session(self, salt=SALT, sid=SID):
+        """This server's session as Claude Code gives it (CLAUDE_CODE_SESSION_ID) and the machine's Office salt file
+        (under the test's HOME)."""
+        if salt is not None:
+            os.makedirs(os.path.join(self.tmp, ".config", "cortados"), exist_ok=True)
+            with open(os.path.join(self.tmp, ".config", "cortados", "office-salt"), "w") as f:
+                f.write(salt + "\n")
+        env = mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid or "", "CLAUDE_PROJECT_DIR": self.work,
+                                           "CORTADOS_OFFICE_SALT_FILE": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_origin_session_on_the_record_both_events_and_the_listing(self):
+        self._session()
+        tag = m.origin_tag(self.SALT, self.SID)
+        self.assertEqual(len(tag), 16)
+        tid = self.start()
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        meta = _load(os.path.join(ct.task_path(tid), "meta.json"))
+        self.assertEqual((meta["origin"]["origin_session"], meta["origin"]["origin_project"]), (tag, "work"))
+        dev = meta["origin"]["origin_device"]
+        self.assertTrue(dev and "." not in dev)
+        ev = [e for e in _events() if e.get("task_id") == tid]
+        self.assertEqual([(e["event"], e.get("origin_session"), e.get("origin_project"), e.get("origin_device"))
+                          for e in ev], [("started", tag, "work", dev), ("finished", tag, "work", dev)])
+        raw = json.dumps(ev) + json.dumps(meta)
+        self.assertNotIn(self.SID, raw)                         # the raw session id (a resume handle) never leaves
+        self.assertNotIn(self.SALT, raw)
+        _, lst = self.call("list_tasks")
+        self.assertEqual(next(r for r in lst["tasks"] if r["task_id"] == tid)["origin_session"], tag)
+
+    def test_origin_without_a_salt_or_a_session_id_is_null_never_guessed(self):
+        for salt, sid in ((None, self.SID), (self.SALT, ""), ("not-a-salt", self.SID), (self.SALT, "bad id;rm")):
+            with self.subTest(salt=salt, sid=sid):
+                self._session(salt, sid)
+                if salt is None:
+                    shutil.rmtree(os.path.join(self.tmp, ".config"), ignore_errors=True)
+                tid = self.start()
+                self.call("wait_task", task_id=tid, timeout_s=30)
+                ev = [e for e in _events() if e.get("task_id") == tid]
+                self.assertTrue(ev)
+                for e in ev:
+                    self.assertNotIn("origin_session", e)
+                    self.assertEqual(e.get("origin_project"), "work")   # the folder and device are facts, still kept
+
+    def test_bot_gateway_tasks_originate_from_grokbot(self):
+        self._session()
+        self.cfg = {**self.cfg, "client": "grokbot"}
+        tid = self.start()
+        self.call("wait_task", task_id=tid, timeout_s=30)
+        ev = [e for e in _events() if e.get("task_id") == tid]
+        self.assertEqual({e.get("origin_session") for e in ev}, {"grokbot"})
+        self.assertFalse(any("origin_project" in e for e in ev))
+
+    def test_clean_origin_keeps_only_valid_metadata(self):
+        self.assertEqual(ct.clean_origin({"session": "ab" * 8, "project": "My Repo", "device": "studio"}),
+                         {"origin_session": "ab" * 8, "origin_project": "My Repo", "origin_device": "studio"})
+        self.assertEqual(ct.clean_origin({"session": "AB" * 8, "project": "/Users/x/repo", "device": "a b"}),
+                         {"origin_session": None, "origin_project": None, "origin_device": None})
+        self.assertEqual(ct.clean_origin("grokbot"), {"origin_session": None, "origin_project": None,
+                                                      "origin_device": None})
+        self.assertEqual(ct.clean_origin({"session": "grokbot"})["origin_session"], "grokbot")
+        self.assertEqual(ct.clean_origin({"session": "x" * 300, "project": "p" * 65})["origin_project"], None)
+
+    def test_ensure_office_salt_creates_one_private_salt_and_keeps_it(self):
+        path = os.path.join(self.tmp, "cfg", "office-salt")
+        env = {"CORTADOS_OFFICE_SALT_FILE": path}
+        salt = m.ensure_office_salt(env)
+        self.assertRegex(salt, r"^[0-9a-f]{32}$")
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertEqual(m.ensure_office_salt(env), salt)        # never replaced
+        with open(path, "w") as f:
+            f.write("junk")
+        self.assertIsNone(m.ensure_office_salt(env))             # a bad file is not repaired: no origin, no guess
+        self.assertIsNone(m.ensure_office_salt({"CORTADOS_OFFICE_SALT_FILE": "/dev/null/x"}))
+
+    def test_remote_task_records_its_origin_on_the_host(self):
+        self._air()
+        self._session()
+        r, out = self.call("start_task", task="hello", title="remote one")
+        self.assertFalse(r.get("isError"), r)
+        tid = out["task_id"]
+        self.call("wait_task", task_id=tid, timeout_s=30)
+        with open(os.path.join(self.air_home, "state", "child-tasks.jsonl")) as f:
+            ev = [json.loads(x) for x in f]
+        started = next(e for e in ev if e["event"] == "started" and e["task_id"] == tid)
+        self.assertEqual(started["origin_session"], m.origin_tag(self.SALT, self.SID))
 
     def test_a_bad_title_or_tag_is_refused_before_anything_runs(self):
         for kw in ({"title": "x" * 81}, {"title": "two\nlines"}, {"title": 7}):

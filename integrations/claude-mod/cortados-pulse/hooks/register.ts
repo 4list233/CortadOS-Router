@@ -6,6 +6,13 @@
  * cached scarcity with its per-window "% left" (one row per lane and per Claude account), and the online local devices.
  * The last line links the browser dashboard (<provider>/dashboard), which shows the same live view in full.
  *
+ * THIS SESSION, at the top: the start_task children this very session started (running and queued, then the last few
+ * finished), picked out of the live view by their origin_session. The pane names its session the way
+ * cortados-routed-subagents names its Office floor and the cortados-route MCP server names a task's origin:
+ * sha256("<salt>:<session id>") cut to 16 hex, the salt read from the machine's shared file
+ * (~/.config/cortados/office-salt, made by the MCP server; CORTADOS_OFFICE_SALT_FILE overrides). The raw session id
+ * never leaves the pane; without the salt file the section says the session cannot be identified.
+ *
  * Where the provider is comes from the plugin config, else CORTADOS_PROVIDER_URL, else the per-machine URL file
  * (CORTADOS_PROVIDER_URL_FILE or ~/.config/cortados/provider-url): the same chain as cortados-routed-subagents, and
  * no address is committed because the provider runs on another host. The token is read from providerTokenFile
@@ -15,8 +22,8 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { Pulse, PulseDevices, PulseLaneHealth, PulseLive, PulseLiveConversation, PulseLiveTask, PulseReading,
-  PulseUsage } from '../types'
+import type { Pulse, PulseDevices, PulseLaneHealth, PulseLive, PulseLiveConversation, PulseLiveHost, PulseLiveTask,
+  PulseReading, PulseUsage } from '../types'
 
 type Cfg = {
   providerUrl: string
@@ -57,6 +64,37 @@ const err = atom({ plugin: 'cortados-pulse', key: 'err' } as const, null as stri
 type LiveHeld = { data: PulseLive; at: number; base: string }
 const liveHeld = atom({ plugin: 'cortados-pulse', key: 'live' } as const, null as LiveHeld | null)
 const liveErr = atom({ plugin: 'cortados-pulse', key: 'liveErr' } as const, null as string | null)
+type Mine = { tag: string | null; why: string | null }
+const mine = atom({ plugin: 'cortados-pulse', key: 'mine' } as const, null as Mine | null)
+
+/** The machine's shared Office salt (cortados_router/subagent_mcp.py OFFICE_SALT_DEFAULT). */
+export const OFFICE_SALT_FILE = '~/.config/cortados/office-salt'
+/** This session's finished tasks shown under its running ones: the last few, the dashboard has the rest. */
+export const MINE_RECENT_MAX = 3
+
+/** sha256("<salt>:<session id>") as hex, cut to 16: cortados-routed-subagents' sessionTag, subagent_mcp's origin_tag. */
+export async function sessionTag(salt: string, sessionId: string): Promise<string> {
+  const buf = await (globalThis as any).crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${salt}:${sessionId}`))
+  return Array.from(new Uint8Array(buf), (b: number) => b.toString(16).padStart(2, '0')).join('').slice(0, 16)
+}
+
+/** This session's tag, or null with why (said in the pane). Never throws; never keeps the raw session id. */
+export async function identify($: Pick<EngineInterface, 'env' | 'fs' | 'session'>): Promise<Mine> {
+  let salt: string | null = null
+  try {
+    const path = expandHome(String((await $.env.get('CORTADOS_OFFICE_SALT_FILE')) || OFFICE_SALT_FILE).trim(), await $.env.get('HOME'))
+    const v = String(await $.fs.read(path)).trim()
+    if (/^[0-9a-f]{32}$/.test(v)) salt = v
+  } catch { /* said below */ }
+  if (!salt) return { tag: null, why: 'session not identified: no ' + OFFICE_SALT_FILE + ' yet (the cortados-route MCP server makes it)' }
+  try {
+    const id = await $.session.id()
+    if (typeof id !== 'string' || !id) throw new Error()
+    return { tag: await sessionTag(salt, id), why: null }
+  } catch {
+    return { tag: null, why: 'session not identified: its id could not be read' }
+  }
+}
 
 /** `~` and `~/...` to $HOME (the only form the config documents; `~user` is left alone). */
 export function expandHome(path: string, home: string | undefined): string {
@@ -165,17 +203,32 @@ let liveInFlight = false
 
 /** One /v1/cortados/live poll. A provider from before the live view answers 404: said as such, never as an outage.
  * One at a time: a tick that lands while the previous answer is still coming is skipped, never stacked. */
-export async function pollLive($: Pick<EngineInterface, 'env' | 'fs' | 'http' | 'state' | 'clock'>, cfg: Cfg): Promise<void> {
+/** What a live poll touches. With `me` (the hooks pass true) it also names this session ($.session), every poll. */
+type LiveDollar = Pick<EngineInterface, 'env' | 'fs' | 'http' | 'state' | 'clock'>
+
+export async function pollLive($: LiveDollar, cfg: Cfg, me = false): Promise<void> {
   if (liveInFlight) return
   liveInFlight = true
   try {
-    await pollLiveOnce($, cfg)
+    await pollLiveOnce($, cfg, me)
   } finally {
     liveInFlight = false
   }
 }
 
-async function pollLiveOnce($: Pick<EngineInterface, 'env' | 'fs' | 'http' | 'state' | 'clock'>, cfg: Cfg): Promise<void> {
+async function pollLiveOnce($: LiveDollar, cfg: Cfg, me: boolean): Promise<void> {
+  try {
+    await fetchLive($, cfg)
+  } finally {
+    // after the fetch, every poll: /clear and resume move the pane to another session id
+    if (me) {
+      const m = await identify($ as Pick<EngineInterface, 'env' | 'fs' | 'session'>)
+      await update($, mine, () => m)
+    }
+  }
+}
+
+async function fetchLive($: LiveDollar, cfg: Cfg): Promise<void> {
   const f = await fetchView($, cfg, LIVE_PATH)
   if (!f.ok) {
     await update($, liveErr, () => f.status === 404 ? 'this provider has no live view yet (update it to show running work)' : 'live: ' + f.problem)
@@ -338,6 +391,28 @@ export function runningLines(live: PulseLive, since: number): string[] {
   return out
 }
 
+/** This session's own tasks: running and queued first (as in the Running section), then the last few finished with
+ * their state and how long they took. `tag` null: the reason the session cannot be identified. */
+export function sessionLines(live: PulseLive, me: Mine | null, since: number): string[] {
+  if (!me) return ['identifying this session…']
+  if (!me.tag) return [me.why || 'session not identified']
+  const t = live.tasks ?? {}
+  if (t.status === 'error') return ['tasks unavailable: ' + errs(t)]
+  const own = (x: PulseLiveTask) => x.origin_session === me.tag
+  const active = [...(t.running ?? []), ...(t.queued ?? [])].filter(own)
+  const done = (t.recent ?? []).filter(own)
+  const out = active.slice(0, RUNNING_MAX).map(x => taskLine(x, since))
+  if (active.length > RUNNING_MAX) out.push(`  +${active.length - RUNNING_MAX} more tasks`)
+  for (const x of done.slice(0, MINE_RECENT_MAX)) {
+    const mark = x.state === 'succeeded' ? '✓ ' : x.state === 'cancelled' ? '⊘ ' : x.state === 'failed' ? '✕ ' : '? '
+    out.push(mark + join([x.title || ('task ' + (x.task_id ?? '?')), x.host ? 'on ' + x.host : null, modelOf(x),
+      x.state, typeof x.elapsed_s === 'number' ? 'took ' + dur(x.elapsed_s) : null]))
+  }
+  if (done.length > MINE_RECENT_MAX) out.push(`  +${done.length - MINE_RECENT_MAX} more finished (dashboard)`)
+  if (!active.length && !done.length) out.push('no task started from this session in the last 24 h')
+  return out
+}
+
 const S1_FLAGS: Record<string, string> = { 'no-promote': 'promotion held', 'no-train-tonight': 'no training tonight',
   'nightly-stop': 'nightly loop stopping', 'sweep-requested': 'sweep requested' }
 
@@ -388,12 +463,12 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'cortados-pulse', description: 'Open the CortadOS router pulse pane' })
     void $.ui.open({ id: PANE, title: 'CortadOS pulse' })
-    void pollLive($, cfg)
+    void pollLive($, cfg, true)
     void poll($, cfg)
     ticking?.cancel()                                          // a second session.start must not double the polling
     ticks = 0
     ticking = $.clock.every(LIVE_POLL_MS, () => {              // live every tick, /resources every POLL_MS
-      void pollLive($, cfg)
+      void pollLive($, cfg, true)
       if (++ticks % (POLL_MS / LIVE_POLL_MS) === 0) void poll($, cfg)
     })
     return next(e)
@@ -401,7 +476,7 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'cortados-pulse' }, async $ => {
     await $.ui.open({ id: PANE, title: 'CortadOS pulse' })
-    void pollLive($, cfg)
+    void pollLive($, cfg, true)
     void poll($, cfg)
     return { text: 'CortadOS pulse pane opened.' }
   })
@@ -417,8 +492,12 @@ export const register: Register = (on, options) => {
     const problem = await read($, err)
     const lv = await read($, liveHeld)
     const lvProblem = await read($, liveErr)
+    const me = await read($, mine)
     const nowMs = await $.clock.now()
     const running = [
+      head('This session'),
+      ...(lv ? sessionLines(lv.data, me, (nowMs - lv.at) / 1000).map(line) : []),
+      ...(lv ? [] : [dim(me && !me.tag ? me.why || '' : 'waiting for the live view…')]),
       head('Running'),
       ...(lv ? runningLines(lv.data, (nowMs - lv.at) / 1000).map(line) : lvProblem ? [] : [dim('loading the live view…')]),
       ...(lvProblem ? [dim(lvProblem + (lv ? ' · showing ' + age((nowMs - lv.at) / 1000) + ' old data' : ''))] : []),

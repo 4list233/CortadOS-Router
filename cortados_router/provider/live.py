@@ -95,6 +95,10 @@ _SUMMARY_RE = re.compile(r"[\x20-\x7e]{1,80}")       # office's title rule: prin
 _CLIENT_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 _WS_STATE_RE = re.compile(r"[a-z_-]{1,24}")
 _TASK_STATES = ("succeeded", "failed", "cancelled")   # child_tasks.TERMINAL_STATES
+# The main session that started a task (child_tasks.clean_origin): its Office tag, or a named origin (the bot gateway)
+_ORIGIN_SESSION_RE = re.compile(r"[0-9a-f]{16,64}|grokbot")
+ORIGINS_MAX = 32            # origin groups listed (sessions with a task in the window); the rest flagged truncated
+ORIGIN_IDS_MAX = 20         # task ids per origin group and per orchestrator item, newest first
 _HB_KEYS = {"host", "jobs", "ttl_s", "hardware", "s1"}
 # heartbeat `hardware`: percentages, byte counts, the 1-min load, the chip name and when it was sampled; nothing else
 _HB_PCT = ("cpu_busy_pct", "gpu_busy_pct", "disk_free_pct")
@@ -323,7 +327,10 @@ def _children(events: list[dict[str, Any]], now: float) -> dict[str, dict[str, A
                             ("lane", office._LANE_RE), ("model", office._MODEL_RE), ("client", _CLIENT_RE),
                             ("session", office._HEADER_RULES[office.SESSION_HEADER]),
                             ("project", office._HEADER_RULES[office.PROJECT_HEADER]),
-                            ("device", office._HEADER_RULES[office.DEVICE_HEADER])):
+                            ("device", office._HEADER_RULES[office.DEVICE_HEADER]),
+                            ("origin_session", _ORIGIN_SESSION_RE),
+                            ("origin_project", office._HEADER_RULES[office.PROJECT_HEADER]),
+                            ("origin_device", office._HEADER_RULES[office.DEVICE_HEADER])):
             v = office.clean(e.get(field), rule)
             if v is not None:
                 c[field] = v
@@ -403,6 +410,9 @@ def tasks_section(events: list[dict[str, Any]], office_view: dict[str, Any] | No
             "session": None if c["chrome"] else c.get("session"),
             "project": None if c["chrome"] else c.get("project"),
             "device": None if c["chrome"] else c.get("device"),
+            # who started it (any task, browser ones too): the orchestrating session's tag, "grokbot", or None
+            "origin_session": c.get("origin_session"), "origin_project": c.get("origin_project"),
+            "origin_device": c.get("origin_device"),
         })
     counts = {k: 0 for k in ("running", "queued", "succeeded", "failed", "cancelled", "unknown")}
     for r in rows:
@@ -415,7 +425,60 @@ def tasks_section(events: list[dict[str, Any]], office_view: dict[str, Any] | No
     away = _elsewhere(stubs, set(kids), now)
     return _section(now, _status(errors, bool(rows) or bool(away)), errors, scope=SCOPE, window_s=int(CHILD_WINDOW_S),
                     counts=counts, running=running[:RUNNING_MAX], queued=queued[:RUNNING_MAX],
-                    recent=recent[:RECENT_MAX], truncated=truncated, elsewhere=away)
+                    recent=recent[:RECENT_MAX], truncated=truncated, elsewhere=away, **origins_of(rows))
+
+
+def origins_of(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The tasks grouped by the main session that started them, from every row in the window (not the capped lists):
+    {origins: [{session, project, device, running, queued, finished, task_ids}], origins_truncated}. `session` None is
+    the unattributed group (tasks from before origins were recorded, or a server that knows no session tag). Groups
+    with a running or queued task first, the unattributed one last among equals, then by their newest task."""
+    groups: dict[Any, dict[str, Any]] = {}
+    for r in sorted(rows, key=lambda r: -(r.get("started_at") or 0)):
+        g = groups.setdefault(r.get("origin_session"), {
+            "session": r.get("origin_session"), "project": None, "device": None, "running": 0, "queued": 0,
+            "finished": 0, "task_ids": [], "_newest": r.get("started_at") or 0})
+        g["project"] = g["project"] or r.get("origin_project")
+        g["device"] = g["device"] or r.get("origin_device")
+        st = r.get("state")
+        g["running" if st == "running" else "queued" if st == "queued" else "finished"] += 1
+        if len(g["task_ids"]) < ORIGIN_IDS_MAX:
+            g["task_ids"].append(r["task_id"])
+    out = sorted(groups.values(), key=lambda g: (not (g["running"] or g["queued"]), g["session"] is None, -g["_newest"]))
+    for g in out:
+        del g["_newest"]
+    return {"origins": out[:ORIGINS_MAX], "origins_truncated": len(out) > ORIGINS_MAX}
+
+
+def link_origins(conv: dict[str, Any], tasks: dict[str, Any]) -> None:
+    """Each orchestrator item gets `tasks`: {running, queued, finished, task_ids} of the tasks its session started in
+    the window (zeros when none; null when the tasks section could not be read)."""
+    by = {g.get("session"): g for g in tasks.get("origins") or [] if g.get("session")}
+    known = tasks.get("status") != "error"
+    for it in conv.get("items") or []:
+        if it.get("kind") != "orchestrator":
+            continue
+        g = (by.get(it.get("session")) if it.get("session") else None) or {}
+        it["tasks"] = {"running": g.get("running", 0), "queued": g.get("queued", 0),
+                       "finished": g.get("finished", 0), "task_ids": list(g.get("task_ids") or [])} if known else None
+
+
+def for_session(snap: dict[str, Any], session: str) -> dict[str, Any]:
+    """GET /v1/cortados/live?session=<tag>: the snapshot narrowed to one orchestrating session: its tasks (running,
+    queued, recent, by origin_session), its origin group, and the conversations on its floor. Counts, overview and
+    the other sections stay fleet-wide. `session` must already be valid (valid_session)."""
+    t = dict(snap.get("tasks") or {})
+    for k in ("running", "queued", "recent"):
+        t[k] = [r for r in t.get(k) or [] if r.get("origin_session") == session]
+    t["origins"] = [g for g in t.get("origins") or [] if g.get("session") == session]
+    c = dict(snap.get("conversations") or {})
+    c["items"] = [it for it in c.get("items") or [] if it.get("session") == session]
+    return {**snap, "session_filter": session, "tasks": t, "conversations": c}
+
+
+def valid_session(v: Any) -> str | None:
+    """A ?session= value the filter accepts (an Office tag or a named origin), else None."""
+    return v if isinstance(v, str) and _ORIGIN_SESSION_RE.fullmatch(v) else None
 
 
 def _backend_items(backend: list, view: dict[str, Any], now: float) -> tuple[list[dict[str, Any]], set[str]]:
@@ -755,7 +818,7 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
         if events is not None \
         else _section(now, "error", child_errs + office_errs + stub_errs, scope=SCOPE, window_s=int(CHILD_WINDOW_S),
                       counts=None, running=[], queued=[], recent=[], truncated=False,
-                      elsewhere=_elsewhere(stubs, set(), now))
+                      elsewhere=_elsewhere(stubs, set(), now), origins=[], origins_truncated=False)
     conv_errs: list = []
     backend = guard("conversations", conversations, conv_errs) if conversations is not None else None
     if isinstance(backend, list):
@@ -766,6 +829,7 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     else:
         conv = _section(now, "error", office_errs + conv_errs, backend_sessions=backend_sessions, active=None,
                         working=None, floors=None, items=[], hidden=0)
+    link_origins(conv, tasks)
     tv_errs: list = []
     tv = guard("router.db", tasks_view, tv_errs)
     # this process's failed router.db writes (#99): shown even when the read side failed, which is when they matter most

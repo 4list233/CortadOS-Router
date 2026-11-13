@@ -81,6 +81,10 @@ export interface PulseLiveTask {
   tool?: string | null
   elapsed_s?: number | null
   ended_at?: number | null
+  // the main session that started it: its Office tag, "grokbot" for the bot gateway, or null (unattributed)
+  origin_session?: string | null
+  origin_project?: string | null
+  origin_device?: string | null
 }
 export interface PulseLiveConversation {
   kind?: string
@@ -130,6 +134,7 @@ declare module 'claude-code' {
     'cortados-pulse': {
       held: { data: Pulse; at: number } | null; err: string | null
       live: { data: PulseLive; at: number; base: string } | null; liveErr: string | null
+      mine: { tag: string | null; why: string | null } | null
     }
   }
 }

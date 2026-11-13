@@ -31,6 +31,7 @@ CANCELLED = "t20261111060000-eeeeeeee"
 LOST = "t20261110060000-ffffffff"          # started 11 h ago, no end event: unknown, never "running"
 OLD = "t20261109060000-99999999"           # outside the 24 h window
 SESSION = "3f9a1c2e9b7d4a10"
+ORIGIN = {"origin_session": SESSION, "origin_project": "CortadOS-Router", "origin_device": "pro"}   # the main session
 
 
 def events():
@@ -42,16 +43,19 @@ def events():
         {"ts": NOW - 30 * 3600, "event": "started", "task_id": OLD, **base, "title": "too old to show"},
         {"ts": NOW - 125, "event": "started", "task_id": RUNNING, **base, "host": "air", "lane": "claude#b",
          "model": "claude-sonnet-5", "title": "Refactor the scarcity reader", "session": SESSION,
-         "project": "CortadOS-Router", "device": "pro"},
+         "project": "CortadOS-Router", "device": "pro", **ORIGIN},
         {"ts": NOW - 600, "event": "started", "task_id": QUEUED, **base, "chrome": True, "host": "air",
          "title": "Check the release page", "session": SESSION},
-        {"ts": NOW - 4000, "event": "started", "task_id": DONE, **base, "host": "air", "title": "Write the changelog"},
+        {"ts": NOW - 4000, "event": "started", "task_id": DONE, **base, "host": "air", "title": "Write the changelog",
+         **ORIGIN},
         {"ts": NOW - 3000, "event": "finished", "task_id": DONE, **base, "host": "air", "title": "Write the changelog",
          "status": "succeeded", "exit_code": 0, "duration_s": 1000.0, "workspace_state": "archived"},
-        {"ts": NOW - 7200, "event": "started", "task_id": FAILED, **base, "title": "Bisect flaky test 10.0.0.7"},
+        {"ts": NOW - 7200, "event": "started", "task_id": FAILED, **base, "title": "Bisect flaky test 10.0.0.7",
+         "origin_session": "/Users/someone", "origin_project": "<b>x</b>"},          # not an origin: unattributed
         {"ts": NOW - 6900, "event": "finished", "task_id": FAILED, **base, "status": "failed", "exit_code": 1,
          "duration_s": 300.0, "workspace_state": "held"},
-        {"ts": NOW - 5000, "event": "cancelled", "task_id": CANCELLED, **base, "client": "grokbot"},
+        {"ts": NOW - 5000, "event": "cancelled", "task_id": CANCELLED, **base, "client": "grokbot",
+         "origin_session": "grokbot"},
         {"ts": NOW - 11 * 3600, "event": "started", "task_id": LOST, **base, "host": "air"},
         {"ts": NOW - 10, "event": "task_exported", "task_id": DONE, "path_kind": "default"},
         {"ts": NOW - 5, "event": "started", "task_id": "../../etc/passwd", "title": SECRET},
@@ -242,6 +246,59 @@ class CollectTest(unittest.TestCase):
         c = fixture_view(backend_sessions=99, conversations=lambda: 1 / 0)["conversations"]
         self.assertEqual(c["backend_sessions"], 99)        # the list failed: the registry's own count stands
 
+    def test_tasks_carry_their_origin_and_are_grouped_by_it(self):
+        t = fixture_view()["tasks"]
+        r = t["running"][0]
+        self.assertEqual((r["origin_session"], r["origin_project"], r["origin_device"]),
+                         (SESSION, "CortadOS-Router", "pro"))
+        recent = {x["task_id"]: x for x in t["recent"]}
+        self.assertEqual(recent[CANCELLED]["origin_session"], "grokbot")
+        self.assertEqual((recent[FAILED]["origin_session"], recent[FAILED]["origin_project"]), (None, None))
+        self.assertIsNone(t["queued"][0]["origin_session"])                  # logged before origins: unattributed
+        groups = {g["session"]: g for g in t["origins"]}
+        self.assertEqual(set(groups), {SESSION, "grokbot", None})
+        mine = groups[SESSION]
+        self.assertEqual((mine["project"], mine["device"], mine["running"], mine["queued"], mine["finished"],
+                          mine["task_ids"]), ("CortadOS-Router", "pro", 1, 0, 1, [RUNNING, DONE]))
+        self.assertEqual((groups[None]["running"], groups[None]["queued"], groups[None]["finished"]), (0, 1, 2))
+        self.assertEqual((groups["grokbot"]["finished"], groups["grokbot"]["task_ids"]), (1, [CANCELLED]))
+        # a group with running or queued work first; the unattributed group after a named one
+        self.assertEqual([g["session"] for g in t["origins"]][:2], [SESSION, None])
+        self.assertFalse(t["origins_truncated"])
+
+    def test_orchestrator_items_count_their_sessions_tasks(self):
+        c = fixture_view()["conversations"]
+        main = next(x for x in c["items"] if x["kind"] == "orchestrator")
+        self.assertEqual(main["tasks"], {"running": 1, "queued": 0, "finished": 1, "task_ids": [RUNNING, DONE]})
+        self.assertNotIn("tasks", next(x for x in c["items"] if x["kind"] == "subagent"))
+        # a floor known only from its heartbeat (no routed main loop) gets the same counts
+        c = fixture_view(conversations=lambda: [])["conversations"]
+        main = next(x for x in c["items"] if x["kind"] == "orchestrator")
+        self.assertEqual((main["source"], main["tasks"]["running"]), ("heartbeat", 1))
+        # the tasks could not be read: the count is unknown, never zero
+        c = fixture_view(child_events=lambda: 1 / 0)["conversations"]
+        self.assertIsNone(next(x for x in c["items"] if x["kind"] == "orchestrator")["tasks"])
+
+    def test_origin_groups_are_capped(self):
+        rows = [{"task_id": f"t2026111109{i:04d}-aaaaaaaa", "state": "succeeded", "started_at": NOW - i,
+                 "origin_session": f"{i:016x}"} for i in range(live.ORIGINS_MAX + 3)]
+        o = live.origins_of(rows)
+        self.assertEqual((len(o["origins"]), o["origins_truncated"]), (live.ORIGINS_MAX, True))
+        self.assertEqual(o["origins"][0]["session"], f"{0:016x}")             # newest first
+
+    def test_for_session_narrows_tasks_and_conversations(self):
+        v = live.for_session(fixture_view(), SESSION)
+        self.assertEqual(v["session_filter"], SESSION)
+        self.assertEqual([x["task_id"] for x in v["tasks"]["running"] + v["tasks"]["queued"] + v["tasks"]["recent"]],
+                         [RUNNING, DONE])
+        self.assertEqual([g["session"] for g in v["tasks"]["origins"]], [SESSION])
+        self.assertTrue(v["conversations"]["items"])
+        self.assertTrue(all(x["session"] == SESSION for x in v["conversations"]["items"]))
+        self.assertEqual(v["tasks"]["counts"], fixture_view()["tasks"]["counts"])   # counts stay fleet-wide
+        self.assertEqual(live.valid_session("grokbot"), "grokbot")
+        for bad in ("", "ABCDEF0123456789", "short", "../x", None, 7):
+            self.assertIsNone(live.valid_session(bad))
+
     def test_a_failed_conversation_list_keeps_the_board(self):
         c = fixture_view(conversations=lambda: 1 / 0)["conversations"]
         self.assertEqual(c["status"], "partial")
@@ -259,7 +316,8 @@ class CollectTest(unittest.TestCase):
         sub = c["items"][0]
         self.assertEqual((sub["tool"], sub["project"], sub["device"], sub["elapsed_s"], sub["title"]),
                          ("Read", "CortadOS-Router", "pro", 90.0, "Review the diff"))
-        self.assertNotIn(RUNNING, json.dumps(c))              # child tasks live in the tasks section
+        # child tasks live in the tasks section: no item of their own, only the ids its orchestrator started
+        self.assertNotIn(RUNNING, json.dumps([{k: v for k, v in x.items() if k != "tasks"} for x in c["items"]]))
 
     def test_routed_calls_capped(self):
         r = fixture_view()["routed"]
@@ -781,6 +839,17 @@ class EndpointTest(EndpointHarness):
                 return r.status, r.read().decode(), r.headers
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode(), e.headers
+
+    def test_session_filter(self):
+        code, raw, _ = self.request("GET", live.LIVE_PATH + "?session=" + SESSION, TOKEN)
+        self.assertEqual(code, 200, raw)
+        self.assertEqual(json.loads(raw)["session_filter"], SESSION)
+        for bad in ("?session=nothex", "?session=" + SESSION + "&session=" + SESSION, "?session="):
+            code, raw, _ = self.request("GET", live.LIVE_PATH + bad, TOKEN)
+            self.assertEqual(code, 400 if bad != "?session=" else 200, (bad, raw))
+            self.assertNotIn("nothex", raw)
+        self.assertEqual(self.request("GET", live.LIVE_PATH + "?session=" + SESSION, LIVE_TOKEN)[0], 200)
+        self.assertEqual(self.request("GET", live.LIVE_PATH + "?session=" + SESSION)[0], 401)
 
     def test_paths_agree(self):
         self.assertEqual((clients.LIVE_PATH, clients.LIVE_HEARTBEAT_PATH), (live.LIVE_PATH, live.HEARTBEAT_PATH))

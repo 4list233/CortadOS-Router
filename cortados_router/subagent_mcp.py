@@ -20,8 +20,10 @@ need be set; CORTADOS_PROVIDER_TOKEN or CORTADOS_PROVIDER_TOKEN_FILE override it
 """
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
+import re
 import os
 import secrets
 import socket
@@ -184,6 +186,88 @@ def _child_module():
     return child_tasks
 
 
+# ---- Task origin: which main session started a task (live view, dashboard, cortados-pulse) -------------------------
+# The orchestrating session is named by the SAME opaque tag its Office floor has: sha256("<salt>:<session id>") cut to
+# 16 hex, as cortados-routed-subagents computes it (hooks/register.ts sessionTag). The salt is one random value per
+# machine in OFFICE_SALT_FILE (0600), created here at server start when missing; the mod and the cortados-pulse pane
+# read the same file, so the three agree on the tag without ever sending the raw session id (which `claude --resume`
+# takes). No salt file or no session id: the origin session is None, never guessed.
+OFFICE_SALT_ENV = "CORTADOS_OFFICE_SALT_FILE"
+OFFICE_SALT_DEFAULT = "~/.config/cortados/office-salt"
+SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID"          # set by Claude Code for the MCP servers a session launches
+ORIGIN_TAG_HEX = 16                                # the mod's OFFICE_TAG_HEX
+BOT_ORIGIN = "grokbot"                             # a bot-gateway task's origin (bot_gateway.CLIENT)
+_SALT_RE = re.compile(r"[0-9a-f]{32}")
+_SESSION_ID_RE = re.compile(r"[0-9A-Za-z-]{8,128}")
+
+
+def office_salt_path(env=None) -> str:
+    env = os.environ if env is None else env
+    path = (env.get(OFFICE_SALT_ENV) or OFFICE_SALT_DEFAULT).strip()
+    if path == "~" or path.startswith("~/"):
+        path = (env.get("HOME") or os.path.expanduser("~")) + path[1:]
+    return path
+
+
+def read_office_salt(env=None):
+    """The machine's Office salt (32 lowercase hex), or None when the file is missing or holds anything else."""
+    try:
+        with open(office_salt_path(env), encoding="ascii") as f:
+            salt = f.read(256).strip()
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return salt if _SALT_RE.fullmatch(salt) else None
+
+
+def ensure_office_salt(env=None):
+    """The salt, created (0600, exclusive: a racing creator's value wins and is read back) when missing. None when it
+    cannot be read or made; never raises, since start_task must work without an origin."""
+    salt = read_office_salt(env)
+    if salt is not None:
+        return salt
+    path = office_salt_path(env)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return read_office_salt(env)
+    except OSError:
+        return None
+    with os.fdopen(fd, "w", encoding="ascii") as f:
+        f.write(secrets.token_hex(16) + "\n")
+    return read_office_salt(env)
+
+
+def origin_tag(salt: str, session_id: str) -> str:
+    """The session's opaque Office tag (cortados-routed-subagents' sessionTag)."""
+    return hashlib.sha256(f"{salt}:{session_id}".encode()).hexdigest()[:ORIGIN_TAG_HEX]
+
+
+def _office_name(s, device=False):
+    """A project or device name as the mod's officeName makes it ([A-Za-z0-9._ -], device without spaces), or None."""
+    t = re.sub(r"[^A-Za-z0-9._-]+" if device else r"[^A-Za-z0-9._ -]+", "-", str(s or "")).strip()[:64]
+    return t if re.search(r"[A-Za-z0-9]", t) else None
+
+
+def origin_identity(env=None) -> dict:
+    """{session, project, device} of the session this server serves: session the Office tag (None without a salt or a
+    session id), project the session's folder name, device this machine's short hostname. Metadata only."""
+    env = os.environ if env is None else env
+    sid = (env.get(SESSION_ID_ENV) or "").strip()
+    salt = read_office_salt(env) if _SESSION_ID_RE.fullmatch(sid) else None
+    root = env.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    return {"session": origin_tag(salt, sid) if salt else None,
+            "project": _office_name(os.path.basename(os.path.normpath(root))),
+            "device": _office_name(socket.gethostname().split(".")[0], device=True)}
+
+
+def task_origin(cfg: dict) -> dict:
+    """The origin recorded on a start_task: the bot gateway's tasks are the bot's; anything else is this session's."""
+    if cfg.get("client") == BOT_ORIGIN:
+        return {"session": BOT_ORIGIN, "project": None, "device": None}
+    return origin_identity()
+
+
 def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
     """Run one child-task tool. Errors come back as isError tool results; the provider token is scrubbed from every
     model-visible string (a child could echo it)."""
@@ -213,7 +297,7 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
                            cfg.get("url", ""), cfg.get("token_file"), a.get("chrome", False), red,
                            a.get("connectors"), client=cfg.get("client"), title=a.get("title"),
                            session_tag=cfg.get("session_tag"), repo=a.get("repo"), branch=a.get("branch"),
-                           host=a.get("host"), parent_task_id=a.get("parent_task_id"))
+                           host=a.get("host"), parent_task_id=a.get("parent_task_id"), origin=task_origin(cfg))
         elif name == "task_status":
             out = ct.status(a.get("task_id"), red, cfg.get("url", ""), token)
         elif name == "wait_task":
@@ -500,6 +584,7 @@ def main() -> None:
            # One opaque Office tag per server process: Claude Code starts one cortados-route server per session, so
            # the children it starts share a floor (provider/office.py). Random, not derived from any session id.
            "session_tag": secrets.token_hex(8)}
+    ensure_office_salt()                                # the task origin's salt, shared with the mods (task_origin)
     try:
         cfg["url"] = _resolve_url()
     except ProviderURLError as exc:
