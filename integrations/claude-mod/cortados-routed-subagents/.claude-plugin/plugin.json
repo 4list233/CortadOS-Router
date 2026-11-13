@@ -1,6 +1,6 @@
 {
   "name": "cortados-routed-subagents",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Makes the main session a CortadOS orchestrator: it delegates through the cortados-route MCP tools (start_task / route_task), its own Agent tool calls are refused, and a balanced gate (on by default, fails open when the router is unreachable, /cortados-gate off for one session) refuses clearly delegatable work on the main loop. Subagents spawned below the main loop are routed through the CortadOS provider: S1 picks the cheapest capable model, it runs headless on the provider host, and its tool calls are bridged back to run on this machine. The main session stays on direct Claude.",
   "author": {
     "name": "Forest Li",
