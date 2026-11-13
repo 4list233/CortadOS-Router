@@ -66,7 +66,7 @@ class Overnight(unittest.TestCase):
 
     def test_resume_interrupted_before_first_save_does_not_double_count(self):
         source=(Path(__file__).resolve().parents[1]/'s1/nightly.sh').read_text()
-        block=source[source.index('  resume=""'):source.index('  HF_HUB_OFFLINE=1 gated "$PY" -m mlx_lm')]
+        block=source[source.index('  resume=""'):source.index('  # LoRA shape (#74')]   # the step count only; LoRA planning: test_s1_lora_params / test_s1_nightly
         with tempfile.TemporaryDirectory() as tmp:
             run=Path(tmp);(run/'adapter').mkdir()
             (run/'adapter/0002400_adapters.safetensors').write_bytes(b'checkpoint-2400')
