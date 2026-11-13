@@ -1688,11 +1688,15 @@ test('orchestrator mode off: the top-level Agent call is routed, not refused', a
   expect(w.launched.length).toBe(1)
 })
 
-test('with orchestratorEnforce off (the default) no allowlist gate is registered: Bash on the main loop runs', async () => {
-  // This is why a session with orchestratorMode true and no orchestratorEnforce ran Bash directly (2026-11-08): the
-  // matcher-less hook only gates when enforce is on. With officeView off too, it is not registered at all.
-  const h = orchestratorHandlers()
-  expect(h['*']).toBe(undefined)
+test('with the gate off and officeView off the matcher-less hook passes every call straight on', async () => {
+  // 2026-11-08 a session with orchestratorMode on and no enforce ran Bash directly; since 2026-11-12 the hook is always
+  // registered in orchestrator mode (balanced by default, gate.test.ts); 'off' leaves only the Agent refusal.
+  const h = orchestratorHandlers({ orchestratorGate: 'off' })
+  const ran: string[] = []
+  const next: any = async (e: any) => { ran.push(e.tool); return { result: 'ran' } }
+  const $: any = { session: { id: async () => 's1' }, store: { get: async () => undefined }, ui: { status() {}, toast() {}, log() {} } }
+  for (const tool of ['Bash', 'WebSearch', 'NotebookEdit']) expect(await h['*']($, { tool, command: 'make test' }, next)).toEqual({ result: 'ran' })
+  expect(ran).toEqual(['Bash', 'WebSearch', 'NotebookEdit'])
 })
 
 test('enforced gate: Bash and other work refused naming start_task; cortados-route tools allowed; Agent refused; subagents untouched', async () => {

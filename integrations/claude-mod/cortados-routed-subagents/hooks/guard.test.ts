@@ -4,6 +4,10 @@ import { register, isBigEdit, isBuildOrTest, substantiveKind, guardStatusText, p
 // Main-session guard: WARN ONLY. These run through the engine's own host (`claude plugin test`): the test's hooks sit
 // beneath the plugin and stand for the engine, so a tool call the test's `tool.call` hook sees is a call that ran.
 
+// These tests are about the warn-only guard, which is what is left on the main loop with the gate off; the
+// orchestrator gate (balanced by default) has its own tests in gate.test.ts.
+const GATE_OFF = { options: { orchestratorGate: 'off' } } as any
+
 const BIG = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n') // 50 lines > 40
 const SMALL = 'x = 1\ny = 2'
 
@@ -29,7 +33,7 @@ function engine(on: any, store: Record<string, unknown> = {}) {
 const edit = (new_string: string, extra: Record<string, unknown> = {}) =>
   ({ tool: 'Edit', file_path: '/tmp/x.py', old_string: 'a', new_string, ...extra }) as any
 
-test('a big main-session Edit warns and still runs unchanged', async ($, on) => {
+test('a big main-session Edit warns and still runs unchanged', GATE_OFF, async ($: any, on: any) => {
   const w = engine(on)
   const out: any = await $.tool.call(edit(BIG))
   expect(out.deny).toBe(undefined)
@@ -40,7 +44,7 @@ test('a big main-session Edit warns and still runs unchanged', async ($, on) => 
   expect(w.statuses.at(-1)).toBe('main did 1 big edit; delegate with start_task')
 })
 
-test('a small main-session Edit is silent', async ($, on) => {
+test('a small main-session Edit is silent', GATE_OFF, async ($: any, on: any) => {
   const w = engine(on)
   await $.tool.call(edit(SMALL))
   expect(w.ran.length).toBe(1)
@@ -48,7 +52,7 @@ test('a small main-session Edit is silent', async ($, on) => {
   expect(w.statuses).toEqual([])
 })
 
-test('a subagent call is silent, big edit or build alike', async ($, on) => {
+test('a subagent call is silent, big edit or build alike', GATE_OFF, async ($: any, on: any) => {
   const w = engine(on)
   await $.tool.call(edit(BIG, { agentId: 'a1' }))
   await $.tool.call({ tool: 'Bash', command: 'python3 -m unittest discover', agentId: 'a1' } as any)
@@ -57,7 +61,7 @@ test('a subagent call is silent, big edit or build alike', async ($, on) => {
   expect(w.statuses).toEqual([])
 })
 
-test('a main-session build/test Bash warns and runs; plain Bash is silent', async ($, on) => {
+test('a main-session build/test Bash warns and runs; plain Bash is silent', GATE_OFF, async ($: any, on: any) => {
   const w = engine(on)
   await $.tool.call({ tool: 'Bash', command: 'ls -la' } as any)
   expect(w.toasts).toEqual([])
@@ -69,7 +73,7 @@ test('a main-session build/test Bash warns and runs; plain Bash is silent', asyn
   expect(w.statuses.at(-1)).toBe('main did 1 build/test run; delegate with start_task')
 })
 
-test('toasts are throttled to one per interval; the counter still counts every call', async ($, on) => {
+test('toasts are throttled to one per interval; the counter still counts every call', GATE_OFF, async ($: any, on: any) => {
   const w = engine(on)
   await $.tool.call(edit(BIG))
   await $.tool.call(edit(BIG))
@@ -86,7 +90,7 @@ test('toasts are throttled to one per interval; the counter still counts every c
   expect(w.statuses.at(-1)).toBe('main did 4 big edits, 1 build/test run; delegate with start_task')
 })
 
-test('userConfig mainSessionGuard off silences the guard; the call still runs', { options: { mainSessionGuard: false } } as any, async ($: any, on: any) => {
+test('userConfig mainSessionGuard off silences the guard; the call still runs', { options: { mainSessionGuard: false, orchestratorGate: 'off' } } as any, async ($: any, on: any) => {
   const w = engine(on)
   await $.tool.call(edit(BIG))
   expect(w.ran.length).toBe(1)
@@ -94,17 +98,17 @@ test('userConfig mainSessionGuard off silences the guard; the call still runs', 
   expect(w.statuses).toEqual([])
 })
 
-test('a stored /cortados-guard off silences it across sessions', async ($, on) => {
+test('a stored /cortados-guard off silences it across sessions', GATE_OFF, async ($: any, on: any) => {
   const w = engine(on, { mainSessionGuard: false })
   await $.tool.call(edit(BIG))
   expect(w.ran.length).toBe(1)
   expect(w.toasts).toEqual([])
 })
 
-test('/cortados-guard off then on toggles the guard and persists in the store', async ($, on) => {
+test('/cortados-guard off then on toggles the guard and persists in the store', GATE_OFF, async ($: any, on: any) => {
   const w = engine(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as any)
-  expect(w.commands).toEqual(['cortados-guard'])
+  expect(w.commands).toEqual(['cortados-guard', 'cortados-gate'])
   const off: any = await $.command.run({ command: 'cortados-guard', args: 'off' } as any)
   expect(off.text).toMatch(/guard off/)
   expect(w.store.mainSessionGuard).toBe(false)
@@ -176,11 +180,12 @@ async function runsUnchanged($: any, w: { ran: any[] }) {
   expect(b).toEqual(baseline)
 }
 
-const guardNotices = (logs: string[]) => logs.filter((l) => l.includes('main-session guard'))
+// The warn guard's own notices; the gate's ("main-session guard gate ...", e.g. no session id in this host) are its own.
+const guardNotices = (logs: string[]) => logs.filter((l) => l.includes('main-session guard') && !l.includes('main-session guard gate '))
 
 // The host hands a plugin a failed call on $ as a HooksError, so the notice names that class.
 for (const [fail, where] of [['store.get', 'store read'], ['clock.now', 'clock']] as const) {
-  test(`a failing ${fail} is reported once, credential-free; every call still runs exactly once, unchanged`, async ($, on) => {
+  test(`a failing ${fail} is reported once, credential-free; every call still runs exactly once, unchanged`, GATE_OFF, async ($: any, on: any) => {
     const w = faulty(on, fail)
     await runsUnchanged($, w)
     const mine = guardNotices(w.logs)
@@ -194,14 +199,14 @@ for (const [fail, where] of [['store.get', 'store read'], ['clock.now', 'clock']
 // call and reports it itself: "$.ui.status dropped: ..."). The guard's own wrapper reports a synchronous throw (see
 // the unit test below); here the point is that the calls are untouched.
 for (const fail of ['ui.status', 'ui.toast'] as const) {
-  test(`a failing ${fail} leaves every call running exactly once, unchanged`, async ($, on) => {
+  test(`a failing ${fail} leaves every call running exactly once, unchanged`, GATE_OFF, async ($: any, on: any) => {
     const w = faulty(on, fail)
     await runsUnchanged($, w)
     expect(guardNotices(w.logs).length).toBeLessThanOrEqual(1)
   })
 }
 
-test('a failing store write keeps the toggle for this session, says so once, and the call still runs', async ($, on) => {
+test('a failing store write keeps the toggle for this session, says so once, and the call still runs', GATE_OFF, async ($: any, on: any) => {
   const w = faulty(on, 'store.set')
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as any)
   const off: any = await $.command.run({ command: 'cortados-guard', args: 'off' } as any)
@@ -236,13 +241,14 @@ test('a synchronous throw from $.ui.status/$.ui.toast is reported once under its
   ])
 })
 
-test('a failing command registration is reported once and session.start still completes', async ($, on) => {
+test('a failing command registration is reported once per command and session.start still completes', GATE_OFF, async ($: any, on: any) => {
   const w = faulty(on, 'command.register')
   const r: any = await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as any)
   expect(r.cwd).toBe('/')
   const mine = guardNotices(w.logs)
-  expect(mine.length).toBe(1)
+  expect(mine.length).toBe(2)
   expect(mine[0]).toMatch(/^cortados-routed-subagents: main-session guard \/cortados-guard registration failed \(\w+\)/)
+  expect(mine[1]).toMatch(/^cortados-routed-subagents: main-session guard \/cortados-gate registration failed \(\w+\)/)
   const before = w.ran.length
   const out: any = await $.tool.call(edit(BIG))
   expect(w.ran.length).toBe(before + 1)
@@ -255,7 +261,7 @@ function handlersOf(opts: Record<string, unknown> = {}) {
   const on: any = (ev: string, a: any, b?: any) => {
     const fn = b ?? a
     if (ev === 'tool.call' && a?.tool) h[a.tool] = fn
-    else if (ev === 'command.run') h.command = fn
+    else if (ev === 'command.run' && a?.command === 'cortados-guard') h.command = fn
     return { catch() {} }
   }
   register(on, { orchestratorMode: false, providerToken: 'tok', providerUrl: 'http://provider.test:8432', ...opts } as any)
