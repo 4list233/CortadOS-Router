@@ -588,20 +588,39 @@ PY
         out = open(self.tmp / f"sup-{time.monotonic_ns()}.log", "w+")
         self.addCleanup(out.close)
         e = {k: v for k, v in self.env.items() if k != "CORTADOS_NIGHTLY_SUPERVISED"}
+        # The latency guard is not under test here (test_overnight covers it): one probe per supervisor start at most, and a
+        # loose budget, so a slow probe under full-suite load can neither SIGSTOP the cycle nor hold a tick for its 30 s timeout.
         e.update({"CORTADOS_S1_URL": f"http://127.0.0.1:{scorer_port}", "CORTADOS_S1_MIN_FREE_GB": "0",
+                  "CORTADOS_S1_PROBE_S": "3600", "CORTADOS_S1_LATENCY_BUDGET_S": "3600",
+                  "CORTADOS_S1_NIGHT_LATENCY_BUDGET_S": "3600",
                   "CORTADOS_S1_CYCLE_IDLE_S": "60", **{k: str(v) for k, v in env.items()}})
         p = subprocess.Popen([sys.executable, "-B", str(self.s1 / "overnight.py"), "--continuous", "--", "/bin/bash",
                               str(self.s1 / "nightly.sh")], cwd=self.tmp, env=e, stdout=out, stderr=subprocess.STDOUT)
         self.addCleanup(lambda: p.poll() is None and (p.kill(), p.wait()))
         return p, out
 
-    def _wait_for(self, what, cond, timeout=30):
+    # Bounds for waits on real events (a file appearing, a supervisor exiting). Each returns as soon as the event happens, so
+    # the bound is only how long a loaded machine may take: the full suite on the Air ran this test past a 40 s exit wait
+    # (#96) while it takes ~5 s alone. Missed signals are still caught, by the assertions rather than by the clock: a TERM
+    # nobody acted on leaves the pidfile behind (the supervisor KILLs after its 60 s grace, skipping the EXIT trap) or ends
+    # a --stop with rc -9 instead of 130, and the stub labeler sleeps far longer than any bound, so it never ends by itself.
+    EVENT_WAIT_S = 120
+    LONG_LABEL_S = 900
+
+    def _wait_for(self, what, cond, timeout=EVENT_WAIT_S):
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             if cond():
                 return
             time.sleep(0.1)
         self.fail(f"timed out waiting for {what}")
+
+    def _exit_of(self, sup, log, what):
+        """The supervisor's exit code once it exits, failing with its log (not a bare TimeoutExpired) past EVENT_WAIT_S."""
+        try:
+            return sup.wait(timeout=self.EVENT_WAIT_S)
+        except subprocess.TimeoutExpired:
+            self.fail(f"supervisor did not exit within {self.EVENT_WAIT_S}s after {what}:\n{log()}")
 
     def test_supervisor_term_leaves_no_stop_flag_and_stop_still_prevents_relaunch(self):
         import http.server, threading
@@ -615,11 +634,21 @@ PY
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
         port, flag, args = srv.server_port, self.s1 / "data/nightly.stop", self.s1 / "data/label-args"
+        pidfile = self.s1 / "data/nightly.pid"
+
+        def kill_cycle_group():
+            # Registered before the supervisors' own kill cleanups, so it runs after them: a failed wait must not orphan
+            # the LONG_LABEL_S stub labeler in the cycle's process group (the cycle leads its group; start_new_session).
+            try:
+                os.killpg(int(pidfile.read_text()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass   # no cycle running, the normal case
+        self.addCleanup(kill_cycle_group)
         text = lambda f: (f.flush(), f.seek(0), f.read())[2]
         # 1. TERM the supervisor mid-cycle (launchctl unload / kickstart -k / logout / shutdown): no stop flag is left behind
-        sup, out = self._supervisor(port, STUB_LABEL_SLEEP=60)
+        sup, out = self._supervisor(port, STUB_LABEL_SLEEP=self.LONG_LABEL_S)
         self._wait_for("the first cycle to start labelling", args.exists)
-        sup.send_signal(signal.SIGTERM); sup.wait(timeout=40)
+        sup.send_signal(signal.SIGTERM); self._exit_of(sup, lambda: text(out), "TERM mid-cycle")
         self.assertFalse(flag.exists(), "a supervisor TERM must not look like nightly.sh --stop: " + text(out))
         self.assertFalse((self.s1 / "data/nightly.pid").exists(), text(out))
         # 2. restarted (launchd KeepAlive / the next boot), it runs a cycle
@@ -627,19 +656,19 @@ PY
         sup, out = self._supervisor(port, STUB_NEW_LABELS=0)
         self._wait_for("a cycle after the restart", lambda: "cycle 1 ended rc 0" in text(out))
         self.assertTrue(args.exists(), text(out))
-        sup.send_signal(signal.SIGTERM); sup.wait(timeout=40)
+        sup.send_signal(signal.SIGTERM); self._exit_of(sup, lambda: text(out), "TERM while idle")
         self.assertFalse(flag.exists(), text(out))
         # 3. nightly.sh --stop during a cycle still flags the stop, and a restarted supervisor does not relaunch
         args.unlink()
-        sup, out = self._supervisor(port, STUB_LABEL_SLEEP=60)
+        sup, out = self._supervisor(port, STUB_LABEL_SLEEP=self.LONG_LABEL_S)
         self._wait_for("the cycle to start labelling", args.exists)
         stop = self._bare("--stop")
         self.assertIn("stopped nightly", stop.stdout, stop.stdout + stop.stderr)
-        self.assertEqual(sup.wait(timeout=40), 130, text(out))
+        self.assertEqual(self._exit_of(sup, lambda: text(out), "nightly.sh --stop"), 130, text(out))
         self.assertTrue(flag.exists())
         args.unlink()
         sup, out = self._supervisor(port)
-        self.assertEqual(sup.wait(timeout=40), 0, text(out))
+        self.assertEqual(self._exit_of(sup, lambda: text(out), "a start with the stop flag set"), 0, text(out))
         self.assertIn("stop flag", text(out))
         self.assertFalse(args.exists(), "no cycle runs while the stop flag is there")
 
