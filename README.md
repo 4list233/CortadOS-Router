@@ -421,12 +421,14 @@ codex mcp add cortados-route \
 No address or token is committed; `.mcp.json` reads both from the environment, and a test (`tests/test_mcp_config.py`)
 fails if a literal value is ever placed there.
 
-## Local models (pin-only)
+## Local models (the Pro)
 
-The owner's machines can serve their Ollama models through the provider as pins: `claude --model sub/qwen-27b`
-relays each turn to that node's Ollama Messages API. S1 never routes there (the `auto_route` switch is off and
-refused when on until local lanes are evaluated); an asleep or busy node fails the pin with a clear 503, never a
-fallback. Ollama has no auth, so it stays on localhost and the node runs a token gate
+Local chat models run on the Pro only (#75; the Studio runs S1 and no chat models). They are served through the
+provider as pins: `claude --model sub/qwen-27b` relays each turn to the Pro's Ollama Messages API. With the node's
+`auto_route` set (`{"model": …, "bands": ["R0"]}`; off by default, no default band, never R3/R4), a new S1-routed
+conversation in a listed band moves to that model while the Pro is available (AC + switch on + gate up), and keeps
+S1's route otherwise (`routing.auto_local`; S1 and `core.resolve` never see a local lane). An asleep or busy node fails
+a pin with a clear 503, never a fallback. Ollama has no auth, so it stays on localhost and the node runs a token gate
 (`python3 -m cortados_router.local_gate`) on its Tailscale address. Config schema, gate and launchd template:
 `docs/LOCAL-RESOURCES.md` ("Local models").
 

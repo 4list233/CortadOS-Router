@@ -279,7 +279,8 @@ RESPONSES = Wire(
     model_id=responses_wire.MODEL_ID, error_type=responses_wire.WireError, parse_request=responses_wire.parse_request,
     one_shot_content=responses_wire.one_shot_content,
     routing_body=lambda body: dict(body, messages=responses_wire.score_messages(body),
-                                   tools=responses_wire.function_tools(body)),
+                                   tools=responses_wire.function_tools(body),
+                                   **{routing.NO_LOCAL_KEY: True}),   # the local relay speaks Messages only
     new_message_id=responses_wire.new_message_id, stream_start=responses_wire.sse_start, stream_ping=responses_wire.sse_ping,
     stream_body=lambda msg_id, model, blocks, stop, usage: responses_wire.sse_body(blocks, stop, usage, msg_id=msg_id, model=model),
     stream_error=lambda msg_id, model, message, terminal=False: responses_wire.sse_error(message, msg_id=msg_id, model=model,

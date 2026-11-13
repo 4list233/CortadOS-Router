@@ -520,10 +520,16 @@ conversation as a `LocalSession` (no backend process: the model binding and repl
 statelessly (`local_lane.serve`: bounded connect and read timeouts, SSE passed line by line, `tool_use` untouched).
 An unreachable node or unlisted model is a 503 naming the cause; an unknown name is a 400 listing every pinnable id,
 local ones included. `GET /v1/models` lists each as `<name> · CortadOS (<node label>)`. S1 never routes to a local
-lane: they are absent from `SERVED_PROVIDERS`, and the config's `auto_route` switch is refused unless `false` until
-local lanes are evaluated. Ollama has no auth, so it stays on `127.0.0.1` and the node runs the token gate
+lane: they are absent from `SERVED_PROVIDERS`. Ollama has no auth, so it stays on `127.0.0.1` and the node runs the token gate
 (`cortados_router/local_gate.py`) on its Tailscale address; the lane sends the gate's token (`token_file_env`) on every
 probe and turn, and a gate 401 is a 503 naming it. `/v1/responses` (Codex) does not take local pins.
+
+**Local auto-route (2026-11-13, #75).** The local node is the Pro; the Studio runs S1 only. A node's `auto_route`
+(`{"model", "bands"}`, off by default, R0–R2 only) lets `routing.auto_local` move a new S1-routed `/v1/messages`
+conversation onto that model after `execution_routing.select` has chosen, when S1 was not degraded, the band is
+listed, the model is not excluded, the node's probe answers (the Pro's gate refuses it on battery or with the switch
+off) and lists the model, and the request fits. Otherwise S1's route stands. The routes row is rewritten under the
+same id with the local lane and S1's choice as `runner_up`. Details: `docs/LOCAL-RESOURCES.md`, "Local auto-route".
 
 ## Web search lane (2026-11-03)
 
