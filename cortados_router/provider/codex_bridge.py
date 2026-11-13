@@ -44,8 +44,9 @@ from typing import Any, Callable
 
 from cortados_router.provider.bridge import SCRATCH_NOTE, SCRATCH_REFUSED, BridgeError, names_scratch, write_line
 from cortados_router.provider.codex_isolation import (BENIGN_MCP_TOOLS, DEFAULT_EXEC_YIELD_MS, LEAKED_ITEMS,
-                                                       V1_APPROVALS, V2_APPROVALS, check_account, check_command_line,
-                                                       check_effective_config, child_env, command_line, tool_aliases)
+                                                       REFUSED_EFFORTS, V1_APPROVALS, V2_APPROVALS, check_account,
+                                                       check_command_line, check_effective_config, child_env,
+                                                       command_line, tool_aliases)
 
 # The dynamic-tools API is experimental: each release is verified by hand before it joins this tuple (the /status
 # parser in scarcity_codex.py pins the same way).
@@ -473,6 +474,9 @@ class CodexSession:
         params: dict[str, Any] = {"threadId": self.thread_id, "summary": "none", "input": items}
         effort = (self.route or {}).get("effort")       # only a route that carries one; otherwise the model default
         if effort:
+            if str(effort).lower() in REFUSED_EFFORTS:
+                raise BridgeError(f"reasoning effort {effort!r} is refused on the Codex backend: it turns on Codex's "
+                                  f"automatic task delegation (its own sub-agents), which this bridge must never run")
             params["effort"] = effort
         # While turn/start waits, a cell of an ended turn may still call a tool; it is refused there and then, so a
         # server that serves requests in order never waits on us (_service_while_waiting).

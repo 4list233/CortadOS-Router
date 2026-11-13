@@ -490,14 +490,15 @@ class CodexEndpointTests(unittest.TestCase):
         disabled = [argv[i + 1] for i, a in enumerate(argv) if a == "--disable"]
         for feature in ("shell_tool", "unified_exec", "unified_exec_tty", "view_image", "image_generation", "apps",
                         "plugins", "hooks", "multi_agent", "multi_agent_v2", "multi_agent_v2_dynamic_tools",
-                        "agent_message_board", "sleep_tool", "skill_search", "tool_suggest", "goals",
+                        "agent_message_board", "token_budget", "sleep_tool", "skill_search", "tool_suggest", "goals",
                         "memories", "browser_use", "computer_use", "collaboration_modes"):
             self.assertIn(feature, disabled)
         self.assertNotIn("code_mode_host", disabled)                    # dynamic tools are served through it
         self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "--enable"], ["code_mode_host"])
         overrides = [argv[i + 1] for i, a in enumerate(argv) if a == "-c"]
         for override in ("notify=[]", 'web_search="disabled"', "include_environment_context=false", "project_doc_max_bytes=0",
-                         'model_provider="openai"', "include_permissions_instructions=false", "mcp_servers.node_repl.enabled=false", "mcp_servers.docs.enabled=false",
+                         'model_provider="openai"', "include_permissions_instructions=false", "agents.enabled=false",
+                         "mcp_servers.node_repl.enabled=false", "mcp_servers.docs.enabled=false",
                          f"features.code_mode.default_exec_yield_time_ms={int(provider_server.TURN_TIMEOUT_S * 1000)}"):
             self.assertIn(override, overrides)
         self.assertEqual(len([o for o in overrides if o.startswith("mcp_servers.")]), 2)   # [mcp_servers.x.env] is not a server
@@ -977,25 +978,69 @@ class CodexSessionUnitTests(unittest.TestCase):
                 self.session(codex_home=home)
             self.assertEqual(os.listdir(self.scratch), ["codex-home"])  # the scratch dir of the refused session is gone
 
-    def test_multi_agent_v2_must_be_off_in_the_effective_config(self):
-        # The command line before this fix: multi_agent (v1) off, multi_agent_v2 unset. config/read then omits it and
-        # the model catalog's multi_agent_version ("v2" for gpt-5.6-sol) decides: refused.
+    def _isolated_config(self):
         base = {"model_provider": "openai", "model_providers": {}, "chatgpt_base_url": "https://chatgpt.com/backend-api/",
                 "openai_base_url": None, "model_catalog_json": None, "web_search": "disabled", "project_doc_max_bytes": 0,
                 "notify": [], "include_environment_context": False, "include_permissions_instructions": False,
-                "mcp_servers": {}}
+                "mcp_servers": {}, "agents": {"enabled": False}}
         feats = {**{f: False for f in codex_isolation.DISABLED_FEATURES}, "code_mode_host": True,
                  "code_mode": {"default_exec_yield_time_ms": codex_isolation.DEFAULT_EXEC_YIELD_MS}}
+        return base, feats
+
+    def test_agents_enabled_must_read_false_in_the_effective_config(self):
+        # The cause of the 2026-11-12 collab `wait` (codex-cli 0.163.0, Config::multi_agent_version): with
+        # multi_agent_v2 off and [agents].enabled unset there is no override, and the model catalog's
+        # multi_agent_version ("v2" for gpt-5.6-sol, bundled in the binary too) builds the v2 tools. Only
+        # agents.enabled = false forces Disabled, so anything else is refused, the command line before this fix
+        # (config/read "agents": null) included.
+        base, feats = self._isolated_config()
         codex_isolation.check_effective_config(dict(base, features=feats))
-        for missing in ("multi_agent_v2", "multi_agent_v2_dynamic_tools", "agent_message_board"):
+        codex_isolation.check_effective_config(dict(base, features=feats, agents={"enabled": False, "max_depth": None}))
+        missing = {k: v for k, v in base.items() if k != "agents"}
+        for cfg in (dict(base, agents=None), missing, dict(base, agents={}), dict(base, agents={"enabled": True}),
+                    dict(base, agents={"enabled": None}), dict(base, agents={"enabled": "false"}),
+                    dict(base, agents={"enabled": 0}), dict(base, agents=False), dict(base, agents=[])):
+            with self.assertRaisesRegex(BridgeError, r"agents=.*expected agents\.enabled=false"):
+                codex_isolation.check_effective_config(dict(cfg, features=feats))
+        self.assertIn("agents.enabled=false", codex_isolation.CONFIG_OVERRIDES)
+
+    def test_the_multi_agent_family_and_token_budget_must_be_off_in_the_effective_config(self):
+        # Kept next to agents.enabled: a home's features.multi_agent_v2 = true forces V2 ahead of it, and the
+        # under-development members (and token_budget) must not be turned on behind the check.
+        base, feats = self._isolated_config()
+        for missing in ("multi_agent_v2", "multi_agent_v2_dynamic_tools", "agent_message_board", "token_budget"):
             without = {k: v for k, v in feats.items() if k != missing}
             with self.assertRaisesRegex(BridgeError, f"built-in tool features still enabled: \\['{missing}'\\]"):
                 codex_isolation.check_effective_config(dict(base, features=without))
-        # The typed table form ([features.multi_agent_v2]) counts as off only with enabled = false.
-        codex_isolation.check_effective_config(dict(base, features=dict(feats, multi_agent_v2={"enabled": False})))
-        for on in ({"enabled": True}, {"max_concurrent_threads_per_session": 2}, True, None):
-            with self.assertRaisesRegex(BridgeError, "multi_agent_v2"):
-                codex_isolation.check_effective_config(dict(base, features=dict(feats, multi_agent_v2=on)))
+        # The typed table form ([features.<name>]) counts as off only with enabled = false.
+        for name in ("multi_agent_v2", "token_budget"):
+            codex_isolation.check_effective_config(dict(base, features=dict(feats, **{name: {"enabled": False}})))
+            for on in ({"enabled": True}, {"max_concurrent_threads_per_session": 2}, {}, True, None, "false", 0):
+                with self.assertRaisesRegex(BridgeError, name):
+                    codex_isolation.check_effective_config(dict(base, features=dict(feats, **{name: on})))
+
+    def test_an_ultra_reasoning_effort_is_refused_before_turn_start(self):
+        # "ultra" is Codex's automatic task delegation (its own sub-agents); route["effort"] reaches turn/start
+        # unchecked otherwise.
+        log = os.path.join(self.scratch, "inbound.jsonl")
+        os.environ["FAKE_CODEX_LOG"] = log
+        self.addCleanup(os.environ.pop, "FAKE_CODEX_LOG", None)
+        for effort in ("ultra", "ULTRA"):
+            s = self.session()
+            try:
+                s.route = {"effort": effort}
+                with self.assertRaisesRegex(BridgeError, "automatic task delegation"):
+                    s.send_user([{"type": "text", "text": "hi"}], 30)
+            finally:
+                s.close()
+        self.assertNotIn('"turn/start"', Path(log).read_text())
+        s = self.session()
+        try:
+            s.route = {"effort": "high"}
+            s.send_user([{"type": "text", "text": "hi"}], 30)           # an ordinary effort still starts the turn
+        finally:
+            s.close()
+        self.assertIn('"turn/start"', Path(log).read_text())
 
     def test_leaked_items_include_the_sleep_and_image_generation_tools(self):
         s = object.__new__(codex_bridge.CodexSession)                    # _note_notification needs no process
@@ -1316,11 +1361,18 @@ class CodexSessionUnitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             self.assertEqual(capture["_capture"]["argv"][1:], codex_isolation.command_line([], home))
         self.assertIs(cfg["include_permissions_instructions"], False)
-        # Every multi-agent feature reads false under the command line, multi_agent_v2 included (its origin is the
-        # typed table's `enabled` key): the real shape passes the check that refuses an unset multi_agent_v2.
-        for f in ("multi_agent", "multi_agent_v2", "multi_agent_v2_dynamic_tools", "agent_message_board"):
+        # agents.enabled reads false from the command line (the lever that keeps the catalog's multi_agent_version
+        # from building the v2 tools), and every multi-agent feature and token_budget read false (multi_agent_v2's
+        # origin is the typed table's `enabled` key). No configWarning: every override was accepted.
+        origins = capture["response"]["result"]["origins"]
+        self.assertIs(cfg["agents"]["enabled"], False)
+        self.assertEqual(origins["agents.enabled"]["name"], {"type": "sessionFlags"})
+        self.assertNotIn("configWarning", capture["_capture"]["notifications"])
+        for f in ("multi_agent", "multi_agent_v2", "multi_agent_v2_dynamic_tools", "agent_message_board", "token_budget"):
             self.assertIs(cfg["features"].get(f), False, f)
-        self.assertIn("features.multi_agent_v2.enabled", capture["response"]["result"]["origins"])
+        self.assertIn("features.multi_agent_v2.enabled", origins)
+        with self.assertRaisesRegex(BridgeError, "agents=null"):     # the shape config/read gave before this fix
+            codex_isolation.check_effective_config(dict(cfg, agents=None), 1800000)
         self.assertEqual(cfg["features"]["code_mode"], {"default_exec_yield_time_ms": 1800000})
         self.assertNotIn("code_mode", cfg)                                # the top-level table is not a 0.163.0 key
         self.assertIn("features.code_mode.default_exec_yield_time_ms", capture["response"]["result"]["origins"])
@@ -1362,7 +1414,7 @@ class CodexSessionUnitTests(unittest.TestCase):
         real = {"model_provider": "openai", "model_providers": {}, "chatgpt_base_url": "https://chatgpt.com/backend-api/",
                 "openai_base_url": None, "model_catalog_json": None,
                 "web_search": "disabled", "project_doc_max_bytes": 0, "notify": [], "include_environment_context": False,
-                "include_permissions_instructions": False,
+                "include_permissions_instructions": False, "agents": {"enabled": False, "max_depth": None},
                 "mcp_servers": {"node_repl": {"enabled": False}, "computer-use": {"enabled": False},
                                 "openaiDeveloperDocs": {"url": "https://developers.openai.com/mcp", "enabled": False}},
                 "features": {**{f: False for f in codex_isolation.DISABLED_FEATURES}, "code_mode_host": True, "mentions_v2": True,
@@ -1371,12 +1423,12 @@ class CodexSessionUnitTests(unittest.TestCase):
         broken = dict(real, model_provider="mirror", chatgpt_base_url="https://mirror.invalid/", web_search="live",
                       model_providers={"openai": {"base_url": "https://mirror.invalid/v1"}},
                       mcp_servers={**real["mcp_servers"], "rogue": {"command": "x", "enabled": True}, "quiet": {"command": "y"}},
-                      features={**real["features"], "shell_tool": True, "apps": None})
+                      features={**real["features"], "shell_tool": True, "apps": None}, agents={"enabled": True})
         with self.assertRaises(BridgeError) as cm:
             codex_isolation.check_effective_config(broken)
         text = str(cm.exception)
         for needle in ('model_provider="mirror"', "chatgpt_base_url", 'web_search="live"', "model_providers.openai",
-                       "['quiet', 'rogue']", "['apps', 'shell_tool']", "--codex-home"):
+                       "['quiet', 'rogue']", "['apps', 'shell_tool']", 'agents={"enabled": true}', "--codex-home"):
             self.assertIn(needle, text)
         # A home or managed layer that keeps the permissions block ("sandbox is read-only", which a model applied to the
         # client's tools and refused a write over) is refused like any other isolation override that did not hold.

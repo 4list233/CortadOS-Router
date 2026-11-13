@@ -62,8 +62,8 @@ ENV_KEYS = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BAS
             "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CODEX_HOME")
 # Every tool feature the real registry knows; `--disable` turns one off, the rest keep their stable default (on).
 FEATURES = ("shell_tool", "unified_exec", "unified_exec_tty", "view_image", "image_generation", "apps", "plugins", "hooks",
-            "multi_agent", "multi_agent_v2", "multi_agent_v2_dynamic_tools", "agent_message_board", "sleep_tool",
-            "skill_search", "tool_suggest", "goals", "memories", "browser_use", "computer_use",
+            "multi_agent", "multi_agent_v2", "multi_agent_v2_dynamic_tools", "agent_message_board", "token_budget",
+            "sleep_tool", "skill_search", "tool_suggest", "goals", "memories", "browser_use", "computer_use",
             "collaboration_modes", "code_mode_host")
 
 
@@ -83,7 +83,7 @@ def effective_config(argv):
     """What config/read answers: the defaults of a real 0.163.0 home with every -c override and --disable applied."""
     cfg = {"model_provider": None, "model_providers": {}, "chatgpt_base_url": "https://chatgpt.com/backend-api/",
            "openai_base_url": None, "model_catalog_json": None,
-           "mcp_servers": {}, "notify": None, "web_search": None, "include_environment_context": True,
+           "mcp_servers": {}, "agents": None, "notify": None, "web_search": None, "include_environment_context": True,
            "include_permissions_instructions": True, "project_doc_max_bytes": 32768, "features": {f: True for f in FEATURES}}
     for i, a in enumerate(argv):
         if a == "-c" and i + 1 < len(argv) and argv[i + 1].split("=", 1)[0].split(".")[0] in IGNORED_TABLES:
@@ -97,7 +97,9 @@ def effective_config(argv):
             key, _, raw = argv[i + 1].partition("=")
             parts, node = key.split("."), cfg
             for part in parts[:-1]:
-                node = node.setdefault(part, {})
+                if not isinstance(node.get(part), dict):
+                    node[part] = {}                 # an unset table (null, like the real "agents": null) gets created
+                node = node[part]
             node[parts[-1]] = toml_value(raw)
     patch = os.environ.get("FAKE_CODEX_CONFIG_PATCH")
     if patch:
