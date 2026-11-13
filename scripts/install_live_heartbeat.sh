@@ -3,7 +3,7 @@
 # every 60 s. Run it on the host itself, from this checkout:
 #
 #   scripts/install_live_heartbeat.sh <host> [--provider-url URL] [--labels a,b,...] [--s1-data DIR] [--no-s1]
-#                                     [--force] [--dry-run]
+#                                     [--orchestrator] [--force] [--dry-run]
 #
 #   <host>          the host's slug on the live view: air | studio | pro (the name its token is bound to)
 #   --provider-url  where the provider answers from this machine; default: ~/.config/cortados/provider-url if present,
@@ -11,6 +11,9 @@
 #   --labels        launchd labels to report; default: every loaded com.cortados.* job here (the sender's own excluded)
 #   --s1-data       the S1 pipeline's data dir (default ~/cortados/train/data); the s1 block is on by default for studio
 #   --no-s1 / --s1  turn the s1 block off / on whatever the host
+#   --orchestrator  also report this machine's main Claude Code sessions' own tokens (the live view's Work split;
+#                   cortados_router/orchestrator_usage.py reads ~/.claude/projects, child-task folders under ~/CortadOS
+#                   excluded). Turn it on where the owner runs his orchestrating sessions; off by default.
 #   --force         overwrite an existing ~/.config/cortados/heartbeat.json (else it is kept as it is)
 #   --dry-run       print what would be written and run; change nothing
 #
@@ -34,10 +37,10 @@ LOG="$HOME/.cortados/live-heartbeat.out"
 
 die() { echo "install_live_heartbeat: $*" >&2; exit 2; }
 
-[ $# -ge 1 ] || die "usage: $0 <host> [--provider-url URL] [--labels a,b] [--s1-data DIR] [--no-s1|--s1] [--force] [--dry-run]"
+[ $# -ge 1 ] || die "usage: $0 <host> [--provider-url URL] [--labels a,b] [--s1-data DIR] [--no-s1|--s1] [--orchestrator] [--force] [--dry-run]"
 HOST="$1"; shift
 [[ "$HOST" =~ ^[a-z][a-z0-9-]{0,31}$ ]] || die "host must be a slug like air, studio, pro"
-URL=""; LABELS=""; S1_DATA="~/cortados/train/data"; FORCE=0; DRY=0
+URL=""; LABELS=""; S1_DATA="~/cortados/train/data"; FORCE=0; DRY=0; ORCH=0
 S1=0; [ "$HOST" = "studio" ] && S1=1
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -46,6 +49,7 @@ while [ $# -gt 0 ]; do
     --s1-data) S1_DATA="${2:?}"; S1=1; shift 2 ;;
     --no-s1) S1=0; shift ;;
     --s1) S1=1; shift ;;
+    --orchestrator) ORCH=1; shift ;;
     --force) FORCE=1; shift ;;
     --dry-run) DRY=1; shift ;;
     *) die "unknown option $1" ;;
@@ -70,7 +74,7 @@ fi
 
 # One isolated Python builds both files: the config as JSON and the plist with plistlib, so a path holding &, |, < or
 # any other XML or sed special is written as it is (the old sed substitution of a template corrupted such a plist).
-GENERATED="$(HOST="$HOST" URL="$URL" LABELS="$LABELS" S1="$S1" S1_DATA="$S1_DATA" LABEL="$LABEL" PY="$PYTHON" \
+GENERATED="$(HOST="$HOST" URL="$URL" LABELS="$LABELS" S1="$S1" S1_DATA="$S1_DATA" ORCH="$ORCH" LABEL="$LABEL" PY="$PYTHON" \
              CONFIG="$CONFIG" REPO="$REPO" LOG="$LOG" "$PYTHON" -I -c '
 import json, os, plistlib
 e = os.environ
@@ -80,6 +84,9 @@ if e["URL"]:
     cfg["provider_url"] = e["URL"]
 if e["S1"] == "1":
     cfg["s1"] = {"data_dir": e["S1_DATA"]}
+if e["ORCH"] == "1":
+    # the default task root (workspaces.py); the reader also skips any <x>/{active,archive,held}/<task id> folder
+    cfg["orchestrator"] = {"task_roots": ["~/CortadOS"]}
 # The heartbeat sender of the live view (cortados_router/live_heartbeat.py), one post every 60 s. No secret in it: the
 # sender reads its token from the 0600 file its config names.
 plist = {"Label": e["LABEL"],

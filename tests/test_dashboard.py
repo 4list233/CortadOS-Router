@@ -336,7 +336,8 @@ class DashboardRenderTest(unittest.TestCase):
             self.assertIn(key, html)
         from tests import test_live
         self.assertEqual(set(test_live.fixture_view()) - {"version", "generated_at"},
-                         {"overview", "tasks", "conversations", "routed", "subscriptions", "s1", "hosts"})
+                         {"overview", "tasks", "conversations", "routed", "subscriptions", "s1", "hosts", "work_split"})
+        self.assertIn("d.work_split", html)
         self.assertEqual(set(usage._VIEW.fields) - {"generated_at"},
                          {"lanes", "routed", "refusals", "child_tasks", "ledger", "bots", "s1", "hardware", "notes"})
 
@@ -418,6 +419,24 @@ class DashboardRenderTest(unittest.TestCase):
         self.assertIn("POLLS: 0", out)                                          # the Usage tab is not polled from Live
         self.assertLess(out.index("Refactor the scarcity reader"), out.index("Check the release page"))   # running first
         self.assertEqual(out.count("S1 decision; band R2; steps=1"), 10)       # the latest ten; the rest behind the button
+
+    def test_live_work_split_panel(self):
+        out = self.run_page(None, "live", live_view=self.live())
+        for want in ("Work split", "% routed by fresh tokens, last 24 hours", "Routed through CortadOS", "10%",
+                     "orchestrator 40.0k fresh (900.0k cache reads) · routed 4.5k fresh (50.0k cache reads) · "
+                     "6% routed counting cache reads · 3 routed conversations · 1 without recorded tokens · "
+                     "500 routed with no main session",
+                     "orchestrator tokens reported by air (2 min ago)", "claude#b/claude-sonnet-5", "codex/gpt-6.1",
+                     "CortadOS-Router · on air", "claude-opus-5", "40.0k", "4.0k", "9%", "Show the last 7 days",
+                     "How this is counted: Tokens, per window"):
+            self.assertIn(want, out, want)
+        self.assertNotIn("Grounds", out)                     # no tokens in the shown window: not listed
+        self.assertNotIn("3f9a1c2e9b7d4a10", out)            # the session tag is never shown whole
+        empty = self.run_page(None, "live", live_view=self.live(heartbeats=lambda: {}, tasks_view=lambda: {}))
+        self.assertIn("[ERR] unavailable: orchestrator: no host has reported orchestrator tokens; "
+                      "router.db: unavailable", empty)
+        self.assertIn("no host reports orchestrator tokens yet", empty)
+        self.assertIn("work split unknown", empty)
 
     def test_live_section_errors_are_said_in_their_section(self):
         def boom():

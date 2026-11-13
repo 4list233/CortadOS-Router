@@ -10,8 +10,12 @@ What it reports, all metadata:
               data/nightly.stop, data/sweep-request.json: present or not, never read), the pending candidate's reason (the
               third field of data/pending-candidate, sent only when it is a plain slug like `promotion_held`), and the
               scorer's /health (up/down, its model name, load time).
+  - orchestrator  on hosts that run the owner's main Claude Code sessions: their own tokens per window, by Office session
+              tag (cortados_router/orchestrator_usage.py; never a raw session id, path or text). The transcript scan
+              runs at most every `every_s` (default 300 s); between scans the cached summary is sent as it was, with
+              its own sampled_at, so the provider shows its age.
 Never a token, environment, path, command line or file contents beyond those fixed names and the validated reason slug.
-The body is checked against the server's own validator (provider/live.validate_heartbeat) and its 8 KiB cap before it is
+The body is checked against the server's own validator (provider/live.validate_heartbeat) and its byte cap before it is
 sent, so a sender bug shows here, not as a 400 on the provider.
 
 Config, ~/.config/cortados/heartbeat.json (CORTADOS_HEARTBEAT_CONFIG; written by the install helper):
@@ -21,14 +25,16 @@ Config, ~/.config/cortados/heartbeat.json (CORTADOS_HEARTBEAT_CONFIG; written by
      "ttl_s": 180,
      "jobs": [{"label": "com.cortados.s1-serve", "name": "s1-scorer"}, "com.cortados.s1-nightly"],
      "hardware": true, "disk": true,
-     "s1": {"data_dir": "~/cortados/train/data", "health_url": "http://127.0.0.1:8431"}}
+     "s1": {"data_dir": "~/cortados/train/data", "health_url": "http://127.0.0.1:8431"},
+     "orchestrator": {"projects": "~/.claude/projects", "task_roots": ["~/CortadOS"], "every_s": 300,
+                      "cache": "~/.cache/cortados/orchestrator-usage.json"}}       (all optional; absent = off)
 `s1.health_url` defaults to the scorer's bind address (s1_endpoint.bind_address; a wildcard bind is asked on loopback).
 The disk measured is the home directory's volume.
 
 CLI:  python3 -B -m cortados_router.live_heartbeat [--config PATH] [--dry-run | --check]
 Exit 0 posted (or printed, --dry-run; or the config, URL and token file are fine, --check), 1 the post failed, 2 the config or body is invalid (nothing sent).
-On an older provider that refuses the `hardware`/`s1` blocks (400), it posts once more with them folded into job
-summaries, so the host still shows while the provider is behind.
+On an older provider that refuses the `orchestrator` block (400), it posts once more without it; one that also refuses
+the `hardware`/`s1` blocks gets them folded into job summaries, so the host still shows while the provider is behind.
 """
 from __future__ import annotations
 
@@ -67,6 +73,11 @@ PENDING_FILE = "pending-candidate"
 PENDING_MAX_BYTES = 4096     # four short fields; more is not the marker
 HEALTH_MAX_BYTES = 4096
 RESERVED_JOBS = ("hardware", "s1")   # legacy(): the blocks folded into jobs for an older provider
+# The transcript scan reads every main-session file touched in the last 7 days: cheap enough every 5 min, wasteful
+# every minute, and the work split is a day/week measure, so a 5 min old figure is current enough.
+ORCH_EVERY_S = 300
+ORCH_EVERY_MIN_S, ORCH_EVERY_MAX_S = 60, 3600
+ORCH_CACHE = "~/.cache/cortados/orchestrator-usage.json"
 _LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _KV = re.compile(r"^\s*(state|pid|runs|last exit code|last exit status)\s*=\s*(.+?)\s*$")
 
@@ -110,8 +121,24 @@ def load_config(path: str | os.PathLike | None = None) -> dict[str, Any]:
     s1 = cfg.get("s1")
     if s1 is not None and not isinstance(s1, dict):
         raise ConfigError(f"{p}: s1 must be an object")
+    orch = cfg.get("orchestrator")
+    if orch is not None:
+        if orch is True:
+            orch = {}
+        if not isinstance(orch, dict) or set(orch) - {"projects", "task_roots", "every_s", "cache"}:
+            raise ConfigError(f"{p}: orchestrator must be an object (projects, task_roots, every_s, cache)")
+        every = orch.get("every_s", ORCH_EVERY_S)
+        if not live._num(every) or not ORCH_EVERY_MIN_S <= every <= ORCH_EVERY_MAX_S:
+            raise ConfigError(f"{p}: orchestrator.every_s must be {ORCH_EVERY_MIN_S}..{ORCH_EVERY_MAX_S}")
+        roots = orch.get("task_roots", [])
+        if not isinstance(roots, list) or not all(isinstance(r, str) and r for r in roots):
+            raise ConfigError(f"{p}: orchestrator.task_roots must be a list of folders")
+        for k in ("projects", "cache"):
+            if orch.get(k) is not None and not (isinstance(orch[k], str) and orch[k]):
+                raise ConfigError(f"{p}: orchestrator.{k} must be a path")
+        orch = {"projects": orch.get("projects"), "task_roots": roots, "every_s": int(every), "cache": orch.get("cache")}
     return {"host": host, "ttl_s": int(ttl), "jobs": jobs, "hardware": cfg.get("hardware", True) is True,
-            "disk": cfg.get("disk", True) is True, "s1": s1,
+            "disk": cfg.get("disk", True) is True, "s1": s1, "orchestrator": orch,
             "provider_url": cfg.get("provider_url"), "token_file": cfg.get("token_file") or DEFAULT_TOKEN_FILE}
 
 
@@ -275,10 +302,47 @@ def _get(url: str) -> bytes:
         return r.read(HEALTH_MAX_BYTES + 1)[:HEALTH_MAX_BYTES]
 
 
+def orchestrator_block(cfg: dict[str, Any], now: float, scan: Callable[..., dict[str, Any]] | None = None,
+                       salt: Callable[[], str | None] | None = None) -> dict[str, Any] | None:
+    """This host's main-session tokens (orchestrator_usage.scan), from the cache when it is younger than every_s.
+    None when the scan fails (said on stderr by type only; the rest of the heartbeat still goes)."""
+    from cortados_router import orchestrator_usage as ou
+    cache = Path(os.path.expanduser(cfg.get("cache") or ORCH_CACHE))
+    try:
+        cached = json.loads(cache.read_text())
+        if isinstance(cached, dict) and live._num(cached.get("sampled_at")) \
+                and 0 <= now - cached["sampled_at"] < cfg["every_s"] \
+                and live.work_split.validate_block(cached, now, live.TIME_SKEW_S)[1] is None:
+            return cached                           # an invalid cache (an older sender's format) is rescanned
+    except (OSError, ValueError):
+        pass                                        # no cache yet, or unreadable: scan
+    try:
+        block = (scan or ou.scan)(cfg.get("projects") or ou.DEFAULT_PROJECTS, now=now,
+                                  salt=(salt or ou.read_salt)(), task_roots=cfg.get("task_roots") or ())
+    except Exception as exc:
+        print(f"live_heartbeat: orchestrator scan failed: {type(exc).__name__}", file=sys.stderr)
+        return None
+    bad = live.work_split.validate_block(block, now, live.TIME_SKEW_S)[1]
+    if bad is not None:                             # a sender bug costs the block, never the heartbeat
+        print(f"live_heartbeat: orchestrator block dropped: field orchestrator{bad} would be refused", file=sys.stderr)
+        return None
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_name(cache.name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(block, fh)
+        os.replace(tmp, cache)
+    except OSError as exc:                          # the block still goes; the next run scans again
+        print(f"live_heartbeat: orchestrator cache not written: {type(exc).__name__}", file=sys.stderr)
+    return block
+
+
 # ================================================================ the body
 def build(cfg: dict[str, Any], *, run: Callable[..., Any] = subprocess.run,
           sample: Callable[[], dict[str, Any]] | None = None, fetch: Callable[[str], bytes] | None = None,
-          disk_usage: Callable[[str], Any] = shutil.disk_usage, now: float | None = None) -> dict[str, Any]:
+          disk_usage: Callable[[str], Any] = shutil.disk_usage, now: float | None = None,
+          scan: Callable[..., dict[str, Any]] | None = None, salt: Callable[[], str | None] | None = None) -> dict[str, Any]:
     now = time.time() if now is None else now
     body: dict[str, Any] = {"host": cfg["host"], "ttl_s": cfg["ttl_s"],
                             "jobs": [launchd_job(label, name, run) for label, name in cfg["jobs"]]}
@@ -292,6 +356,10 @@ def build(cfg: dict[str, Any], *, run: Callable[..., Any] = subprocess.run,
         body["hardware"] = hw
     if cfg.get("s1") is not None:
         body["s1"] = s1_block(cfg["s1"], fetch)
+    if cfg.get("orchestrator") is not None:
+        block = orchestrator_block(cfg["orchestrator"], now, scan, salt)
+        if block is not None:
+            body["orchestrator"] = block
     return body
 
 
@@ -308,7 +376,7 @@ def check(body: dict[str, Any], now: float | None = None) -> bytes:
 
 def legacy(body: dict[str, Any]) -> dict[str, Any]:
     """The same heartbeat for a provider that predates the hardware/s1 blocks: both folded into job summaries."""
-    out = {k: v for k, v in body.items() if k not in ("hardware", "s1")}
+    out = {k: v for k, v in body.items() if k not in ("hardware", "s1", "orchestrator")}
     jobs = list(out.get("jobs") or [])
     hw = body.get("hardware")
     if hw:
@@ -348,7 +416,8 @@ def post(url: str, token: str, raw: bytes, opener: Callable[..., Any] = urllib.r
 
 def main(argv: list[str] | None = None, *, run: Callable[..., Any] = subprocess.run,
          sample: Callable[[], dict[str, Any]] | None = None, fetch: Callable[[str], bytes] | None = None,
-         opener: Callable[..., Any] = urllib.request.urlopen, disk_usage: Callable[[str], Any] = shutil.disk_usage) -> int:
+         opener: Callable[..., Any] = urllib.request.urlopen, disk_usage: Callable[[str], Any] = shutil.disk_usage,
+         scan: Callable[..., dict[str, Any]] | None = None, salt: Callable[[], str | None] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Post this host's heartbeat to the CortadOS live view (never prints a token).")
     ap.add_argument("--config", help=f"default ${CONFIG_ENV} or {DEFAULT_CONFIG}")
     ap.add_argument("--dry-run", action="store_true", help="print the body it would post; send nothing")
@@ -361,7 +430,7 @@ def main(argv: list[str] | None = None, *, run: Callable[..., Any] = subprocess.
             provider_url(cfg), read_token(cfg["token_file"])
             print(f"live_heartbeat: config ok for host {cfg['host']} ({len(cfg['jobs'])} jobs)")
             return 0
-        body = build(cfg, run=run, sample=sample, fetch=fetch, disk_usage=disk_usage)
+        body = build(cfg, run=run, sample=sample, fetch=fetch, disk_usage=disk_usage, scan=scan, salt=salt)
         raw = check(body)
         if a.dry_run:
             print(json.dumps(body, indent=1))
@@ -371,6 +440,17 @@ def main(argv: list[str] | None = None, *, run: Callable[..., Any] = subprocess.
         print(f"live_heartbeat: {exc}", file=sys.stderr)
         return 2
     code, msg = post(url, token, raw, opener)
+    if code == 400 and "orchestrator" in body:
+        # a provider from before the work split: the orchestrator block is an unknown field there
+        print(f"live_heartbeat: provider refused the orchestrator block ({msg or 400}); posting without it",
+              file=sys.stderr)
+        body = {k: v for k, v in body.items() if k != "orchestrator"}
+        try:
+            raw = check(body)
+        except ConfigError as exc:
+            print(f"live_heartbeat: {exc}", file=sys.stderr)
+            return 2
+        code, msg = post(url, token, raw, opener)
     if code == 400 and ("hardware" in body or "s1" in body):
         # an older provider: the extra blocks are an unknown field there. Said once per run, then the legacy body.
         print(f"live_heartbeat: provider refused the full body ({msg or 400}); posting the legacy body", file=sys.stderr)

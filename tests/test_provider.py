@@ -1522,6 +1522,57 @@ class RoutedEndpointTests(RoutedHarness, EndpointTests):
         self.assertFalse(Path(self.argv_file).exists())
 
 
+class TokenLogTests(RoutedHarness):
+    """Work split: every completed backend turn adds its tokens (the fake CLI reports 10 in / 5 out) to the route's
+    router.db row through Registry.log_tokens, with the client's x-cortados-session tag; off the reply's critical path."""
+
+    def post_tagged(self, body, tag=None):
+        h = {"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
+             "user-agent": "claude-cli/2.1.304 (external, cli)"}
+        if tag is not None:
+            h["x-cortados-session"] = tag
+        req = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(body).encode(), method="POST", headers=h)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def test_each_turn_is_logged_on_its_route_with_the_session_tag(self):
+        logged, done = [], threading.Semaphore(0)
+
+        def record(route_id, usage, tag):
+            logged.append((route_id, usage, tag)); done.release()
+        self.reg.log_tokens = record
+        history = [{"role": "user", "content": "please use tool"}]
+        r1 = self.post_tagged({"tools": [READ_TOOL], "messages": history}, "3f9a1c2e9b7d4a10")
+        history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": r1["content"][-1]["id"], "content": "x"}]}]
+        self.post_tagged({"tools": [READ_TOOL], "messages": history}, "NOT A TAG")
+        for _ in range(2):
+            self.assertTrue(done.acquire(timeout=10), "a turn's tokens were never logged")
+        self.assertEqual([(rid, tag) for rid, _, tag in logged], [("r1", "3f9a1c2e9b7d4a10"), ("r1", None)])
+        self.assertEqual(logged[0][1].get("input_tokens"), 10)
+        self.assertEqual(logged[0][1].get("output_tokens"), 5)
+
+    def test_a_failing_token_log_never_breaks_the_reply(self):
+        done = threading.Event()
+
+        def boom(*a):
+            done.set()
+            raise sqlite3.OperationalError("database is locked")
+        self.reg.log_tokens = boom
+        with self.assertLogs("cortados.provider", "ERROR") as cm:
+            r = self.post_tagged({"messages": [{"role": "user", "content": "hello"}]})
+            self.assertTrue(done.wait(10))
+            deadline = time.time() + 10
+            while not any("token log for route r1 failed" in m for m in cm.output) and time.time() < deadline:
+                time.sleep(0.01)
+        self.assertTrue(any("token log for route r1 failed" in m for m in cm.output), cm.output)
+        self.assertEqual(r["stop_reason"], "end_turn")
+
+    def test_unrouted_or_unconfigured_logs_nothing(self):
+        self.reg.log_tokens = None                                   # fixed-model endpoint: tokens are not recorded
+        self.assertEqual(self.post_tagged({"messages": [{"role": "user", "content": "hello"}]})["stop_reason"], "end_turn")
+
+
 class RunRecordTests(RoutedHarness):
     """x-cortados-run-id: each routed request of a client run is recorded; GET /v1/cortados/runs/<id> names the model."""
 

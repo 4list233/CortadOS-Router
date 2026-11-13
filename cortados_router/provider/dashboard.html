@@ -301,7 +301,7 @@ function tile(label, value, note, cls) {
 
 // ---------------------------------------------------------------- live render
 // Shape: cortados_router/provider/live.py collect(): version, generated_at, overview, tasks, conversations, routed,
-// subscriptions, s1, hosts. Each section: {as_of, status, errors[], ...}.
+// subscriptions, s1, hosts, work_split. Each section: {as_of, status, errors[], ...}.
 function taskRow(t, now) {
   const r = el("div", "row");
   add(r, pill(t.state));
@@ -406,6 +406,62 @@ function renderRouted(box, s, now) {
       add(P.body, b);
     }
   }
+  add(box, P.p);
+}
+// Work split (live.py work_split, provider/work_split.py): the main sessions' own tokens against routed tokens, overall,
+// by route and per main session, for one window at a time. The definition is the server's, shown as served.
+let wsWin = "24h";
+function renderWorkSplit(box, s, now) {
+  const P = panel("p-work", "Work split", "span-12");
+  const ov = s.overall || {}, wins = Object.keys(s.windows || {});
+  if (wins.length && wins.indexOf(wsWin) < 0) wsWin = wins[0];
+  const w = ov[wsWin] || {}, o = w.orchestrator || {}, r = w.routed || {};
+  P.meta.textContent = "% routed by fresh tokens, " + (wsWin === "24h" ? "last 24 hours" : wsWin === "7d" ? "last 7 days" : wsWin);
+  secErrors(P.body, s);
+  wins.forEach(k => {
+    if (k === wsWin) return;
+    const b = el("button", "more", "Show " + (k === "24h" ? "the last 24 hours" : k === "7d" ? "the last 7 days" : k));
+    b.type = "button";
+    b.addEventListener("click", () => { wsWin = k; if (lastLive) renderLive(lastLive); });
+    add(P.head, b);
+  });
+  const top = el("div", "lane");
+  const line = el("div", "top");
+  add(line, el("span", "title", "Routed through CortadOS"), el("span", "big", pct(w.routed_pct)));
+  add(top, line, bar(w.routed_pct));
+  add(top, el("div", "sub", join(["orchestrator " + tok(o.fresh) + " fresh (" + tok(o.cache_read) + " cache reads)",
+    "routed " + tok(r.fresh) + " fresh (" + tok(r.cache_read) + " cache reads)",
+    isNum(w.routed_pct_all) ? pct(w.routed_pct_all) + " routed counting cache reads" : null,
+    isNum(w.routed_conversations) ? w.routed_conversations + " routed conversations" : null,
+    w.routed_unrecorded ? w.routed_unrecorded + " without recorded tokens" : null,
+    w.routed_unattributed_fresh ? tok(w.routed_unattributed_fresh) + " routed with no main session" : null])));
+  add(P.body, top);
+  const hosts = s.hosts || [];
+  add(P.body, el("div", "sub", hosts.length ? "orchestrator tokens reported by " + hosts.map(h => h.host + " (" + age(h.age_s) + " ago" +
+    (h.stale ? ", stale" : "") + (h.salt ? "" : ", no session tags") + ")").join(", ") : "no host reports orchestrator tokens yet"));
+  const models = w.routed_by_model || [];
+  if (models.length) {
+    const wide = el("div", "wide");
+    add(wide, table(models, [{h: "routed to", v: x => x.route || "–"}, {h: "", bar: x => x.fresh},
+      {h: "fresh", num: true, v: x => tok(x.fresh)}, {h: "cache reads", num: true, v: x => tok(x.cache_read)},
+      {h: "conversations", num: true, v: x => isNum(x.conversations) ? x.conversations : "–"}], x => x.fresh || 0));
+    add(P.body, wide);
+  }
+  const rows = (s.sessions || []).filter(x => x[wsWin] && ((x[wsWin].orchestrator_fresh || 0) + (x[wsWin].routed_fresh || 0)) > 0);
+  if (rows.length) {
+    const wide = el("div", "wide");
+    add(wide, table(rows, [
+      {h: "main session", v: x => join([x.project || (x.session ? short(x.session) : "untagged"), x.host ? "on " + x.host : null])},
+      {h: "model", v: x => x.model || "–"},
+      {h: "orchestrator", num: true, v: x => x[wsWin].orchestrator_fresh === null ? "not reported" : tok(x[wsWin].orchestrator_fresh)},
+      {h: "routed", num: true, v: x => tok(x[wsWin].routed_fresh)},
+      {h: "% routed", num: true, v: x => pct(x[wsWin].routed_pct)},
+      {h: "conversations", num: true, v: x => x[wsWin].routed_conversations},
+      {h: "last", v: x => ago(x.last_at, now)}]));
+    add(P.body, wide);
+  } else add(P.body, el("div", "empty", s.status === "error" ? "work split unknown" : "no main-session or routed tokens in this window"));
+  if (s.sessions_hidden) add(P.body, el("div", "sub", s.sessions_hidden + " more sessions not listed"));
+  if (s.definition) add(P.body, el("div", "sub muted", "How this is counted: " + s.definition));
   add(box, P.p);
 }
 function renderSubs(box, s) {
@@ -533,6 +589,7 @@ function renderLive(d) {
   renderConversations(panels, d.conversations || {});
   renderSubs(panels, d.subscriptions || {});
   renderRouted(panels, d.routed || {}, now);
+  renderWorkSplit(panels, d.work_split || {}, now);
   renderHosts(panels, d.hosts || {}, s1);
   add(box, panels);
   lastOk = new Date();

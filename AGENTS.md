@@ -20,6 +20,8 @@ is the long form.
   `child_tasks.py` (whole tasks as headless Claude Code children; `--run` runner, `--remote` host side, `--cleanup-archive`;
   the runner appends each finished run, redacted, to the append-only `$CORTADOS_HOME/exports/task-runs.jsonl` for
   Grounds (#91, README "Task run export"); a task dir whose export failed is never pruned),
+  `orchestrator_usage.py` (the owner's main Claude Code sessions' own tokens from local transcripts, child-task and
+  subagent transcripts excluded; sent in the heartbeat's `orchestrator` block, README "Work split"),
   `exec_hosts.py` (which machine a child runs on: `~/.config/cortados/exec-hosts.json`, ssh transport), `workspaces.py`
   (per-task repo worktrees / folders under `<root>/active`, archive-or-held settling, index.jsonl, archive-only cleanup).
 - `cortados_router/provider/` — the `cortados` model endpoint (design and status: `docs/PROVIDER-PLAN.md`).
@@ -36,9 +38,11 @@ is the long form.
   section with its own `as_of`/`status`/`errors`, composed from the office, tasks and usage views) and validates
   `POST /v1/cortados/live/heartbeat` (host job states, e.g. the Studio's S1 jobs); the dashboard's Live tab and the
   cortados-pulse pane read it. Its host-side sender is `cortados_router/live_heartbeat.py` (launchd jobs, hardware, the Studio's S1
-  flags and /health; installed per host by `scripts/install_live_heartbeat.sh`, README "Live view"). `usage.py` builds `GET /v1/cortados/usage` and `tasks.py` builds
+  flags and /health; installed per host by `scripts/install_live_heartbeat.sh`, README "Live view"). `work_split.py` joins routed tokens (router.db `tok_*` columns, written per backend turn by `core.log_tokens`) with the
+  heartbeats' orchestrator tokens into the live view's `work_split` section and the dashboard's Work split panel.
+  `usage.py` builds `GET /v1/cortados/usage` and `tasks.py` builds
   `GET /v1/cortados/tasks` (the latest 200 `routes` rows as metadata: model, band, S1 reason by category, elapsed, % routed
-  per session; never the request text; tokens are not recorded per route), both behind the owner token and both read by
+  per session; never the request text; tokens per routed conversation since the work split, `not recorded` before), both behind the owner token and both read by
   `dashboard.html` (`GET /dashboard`).
 - `tables/` — routing table, budgets, generated model scores and tiers (`*.generated.json` are built
   nightly by `tables/benchmarks/build_tiers.py`; do not hand-edit them).

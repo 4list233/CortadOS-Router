@@ -87,7 +87,44 @@ def tasks_view(n=30):
              "request_chars": 900, "response_chars": 300, "tokens": None, "tokens_status": "not recorded"}
             for i in range(n)]
     return {"tasks": rows, "totals": {"decisions": n, "routed": n, "pinned": 0, "unselected": 0, "routed_pct": 100.0},
-            "row_limit": 200, "truncated": False, "errors": []}
+            "row_limit": 200, "truncated": False, "errors": [], "token_totals": token_totals()}
+
+
+def token_totals():
+    """work_split.routed_tokens over a real `routes` table (core.DDL plus the columns core._db adds): two routed
+    conversations of the main session SESSION, one routed subagent with no session tag, one row not yet recorded."""
+    import sqlite3
+    from cortados_router import core
+    from cortados_router.provider import work_split
+    c = sqlite3.connect(":memory:")
+    c.executescript(core.DDL)
+    for col, kind in (("scarcity", "TEXT"), ("context", "TEXT"), ("task_context", "TEXT"), *core.TOKEN_COLUMNS):
+        c.execute(f"ALTER TABLE routes ADD COLUMN {col} {kind}")
+    for tid, ts, lane, model, tag, tok in (
+            ("r-1", NOW - 600, "claude#b", "claude-sonnet-5", SESSION, (1200, 800, 50000, 2000, 3)),
+            ("r-2", NOW - 3 * 86400, "codex", "gpt-6.1", SESSION, (9000, 1000, 0, 0, 2)),
+            ("r-3", NOW - 900, "codex", "gpt-6.1", None, (300, 200, 0, 0, 1)),
+            ("r-4", NOW - 60, "claude#b", "claude-sonnet-5", None, (None, None, None, None, None))):
+        c.execute("INSERT INTO routes (turn_id, ts, lane, model, office_session, tok_input, tok_output, tok_cache_read, "
+                  "tok_cache_write, tok_turns) VALUES (?,?,?,?,?,?,?,?,?,?)", (tid, ts, lane, model, tag, *tok))
+    try:
+        return work_split.routed_tokens(c, NOW)
+    finally:
+        c.close()
+
+
+# The Air runs the owner's main sessions: its heartbeat carries their own tokens (orchestrator_usage.scan's summary).
+ORCH_BLOCK = {"version": 1, "sampled_at": NOW - 90, "salt": True, "windows": {"24h": 86400, "7d": 604800},
+              "totals": {"24h": {"input": 4000, "output": 6000, "cache_read": 900000, "cache_write": 30000, "sessions": 1},
+                         "7d": {"input": 9000, "output": 16000, "cache_read": 2500000, "cache_write": 75000, "sessions": 2}},
+              "sessions": [{"session": SESSION, "project": "CortadOS-Router", "model": "claude-opus-5", "last_at": NOW - 120,
+                            "24h": {"input": 4000, "output": 6000, "cache_read": 900000, "cache_write": 30000},
+                            "7d": {"input": 5000, "output": 8000, "cache_read": 1500000, "cache_write": 45000}},
+                           {"session": None, "project": "Grounds", "model": "claude-opus-5", "last_at": NOW - 4 * 86400,
+                            "24h": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+                            "7d": {"input": 4000, "output": 8000, "cache_read": 1000000, "cache_write": 30000}}],
+              "sessions_hidden": 0, "excluded": {"child_task_files": 4, "sidechain_entries": 12, "routed_model_entries": 0,
+                                                 "unreadable_files": 0, "bad_lines": 0}}
 
 
 def usage_live():
@@ -119,7 +156,7 @@ def heartbeats(at=NOW - 40):
         {"name": "com.cortados.provider", "state": "running", "summary": "pid up, 3 runs"}],
         "hardware": {"cpu_busy_pct": 12.5, "gpu_busy_pct": 3.0, "mem_available_bytes": 8 * 2 ** 30,
                      "mem_total_bytes": 24 * 2 ** 30, "load_1m": 2.1, "disk_free_pct": 40.0, "chip": "Apple M4",
-                     "sampled_at": NOW - 20}}, NOW)
+                     "sampled_at": NOW - 20}, "orchestrator": ORCH_BLOCK}, NOW)
     assert bad is None, bad
     b.post(hb, at + 30)
     return b

@@ -17,7 +17,8 @@ export default {
     },
     "route_log_errors": 0,
     "hosts_with_heartbeat": 2,
-    "errors": 0
+    "errors": 0,
+    "routed_token_pct_24h": 10.1
   },
   "tasks": {
     "as_of": 1800000000.0,
@@ -320,7 +321,112 @@ export default {
       "routed": 3,
       "pinned": 0,
       "unselected": 0,
-      "routed_pct": 100.0
+      "routed_pct": 100.0,
+      "tokens": {
+        "status": "recorded",
+        "windows": {
+          "24h": 86400,
+          "7d": 604800
+        },
+        "by_window": {
+          "24h": {
+            "totals": {
+              "input": 1500,
+              "output": 1000,
+              "cache_read": 50000,
+              "cache_write": 2000,
+              "fresh": 4500,
+              "all": 54500
+            },
+            "conversations": 3,
+            "recorded": 2,
+            "unrecorded": 1,
+            "unattributed_fresh": 500,
+            "by_session": {
+              "3f9a1c2e9b7d4a10": {
+                "input": 1200,
+                "output": 800,
+                "cache_read": 50000,
+                "cache_write": 2000,
+                "fresh": 4000,
+                "all": 54000,
+                "conversations": 1
+              }
+            },
+            "by_session_hidden": 0,
+            "by_model": [
+              {
+                "route": "claude#b/claude-sonnet-5",
+                "input": 1200,
+                "output": 800,
+                "cache_read": 50000,
+                "cache_write": 2000,
+                "fresh": 4000,
+                "all": 54000,
+                "conversations": 2
+              },
+              {
+                "route": "codex/gpt-6.1",
+                "input": 300,
+                "output": 200,
+                "cache_read": 0,
+                "cache_write": 0,
+                "fresh": 500,
+                "all": 500,
+                "conversations": 1
+              }
+            ]
+          },
+          "7d": {
+            "totals": {
+              "input": 10500,
+              "output": 2000,
+              "cache_read": 50000,
+              "cache_write": 2000,
+              "fresh": 14500,
+              "all": 64500
+            },
+            "conversations": 4,
+            "recorded": 3,
+            "unrecorded": 1,
+            "unattributed_fresh": 500,
+            "by_session": {
+              "3f9a1c2e9b7d4a10": {
+                "input": 10200,
+                "output": 1800,
+                "cache_read": 50000,
+                "cache_write": 2000,
+                "fresh": 14000,
+                "all": 64000,
+                "conversations": 2
+              }
+            },
+            "by_session_hidden": 0,
+            "by_model": [
+              {
+                "route": "codex/gpt-6.1",
+                "input": 9300,
+                "output": 1200,
+                "cache_read": 0,
+                "cache_write": 0,
+                "fresh": 10500,
+                "all": 10500,
+                "conversations": 2
+              },
+              {
+                "route": "claude#b/claude-sonnet-5",
+                "input": 1200,
+                "output": 800,
+                "cache_read": 50000,
+                "cache_write": 2000,
+                "fresh": 4000,
+                "all": 54000,
+                "conversations": 2
+              }
+            ]
+          }
+        }
+      }
     },
     "row_limit": 200,
     "more": false,
@@ -606,5 +712,173 @@ export default {
       }
     ],
     "heartbeat_path": "/v1/cortados/live/heartbeat"
+  },
+  "work_split": {
+    "as_of": 1800000000.0,
+    "status": "ok",
+    "errors": [],
+    "definition": "Tokens, per window (24h, 7d). Orchestrator = what the owner's main Claude Code sessions spent directly with Anthropic, read from their local transcripts (subagent and child-task transcripts excluded) and reported by each host's heartbeat. Routed = what the CortadOS provider's backends reported for routed conversations (child tasks, routed subagents, route_task), joined to the main session by its Office session tag. Fresh tokens = input + output + cache writes; 'all' adds cache reads. % routed = routed fresh ÷ (orchestrator fresh + routed fresh). A routed conversation counts in the window it was routed in; an orchestrator message by its own time. Local-lane and search-lane work, and routed conversations from before token recording, are not recorded and not estimated.",
+    "windows": {
+      "24h": 86400,
+      "7d": 604800
+    },
+    "overall": {
+      "24h": {
+        "orchestrator": {
+          "input": 4000,
+          "output": 6000,
+          "cache_read": 900000,
+          "cache_write": 30000,
+          "fresh": 40000,
+          "all": 940000
+        },
+        "routed": {
+          "input": 1500,
+          "output": 1000,
+          "cache_read": 50000,
+          "cache_write": 2000,
+          "fresh": 4500,
+          "all": 54500
+        },
+        "routed_pct": 10.1,
+        "routed_pct_all": 5.5,
+        "routed_by_model": [
+          {
+            "route": "claude#b/claude-sonnet-5",
+            "input": 1200,
+            "output": 800,
+            "cache_read": 50000,
+            "cache_write": 2000,
+            "fresh": 4000,
+            "all": 54000,
+            "conversations": 2
+          },
+          {
+            "route": "codex/gpt-6.1",
+            "input": 300,
+            "output": 200,
+            "cache_read": 0,
+            "cache_write": 0,
+            "fresh": 500,
+            "all": 500,
+            "conversations": 1
+          }
+        ],
+        "routed_conversations": 3,
+        "routed_unrecorded": 1,
+        "routed_unattributed_fresh": 500
+      },
+      "7d": {
+        "orchestrator": {
+          "input": 9000,
+          "output": 16000,
+          "cache_read": 2500000,
+          "cache_write": 75000,
+          "fresh": 100000,
+          "all": 2600000
+        },
+        "routed": {
+          "input": 10500,
+          "output": 2000,
+          "cache_read": 50000,
+          "cache_write": 2000,
+          "fresh": 14500,
+          "all": 64500
+        },
+        "routed_pct": 12.7,
+        "routed_pct_all": 2.4,
+        "routed_by_model": [
+          {
+            "route": "codex/gpt-6.1",
+            "input": 9300,
+            "output": 1200,
+            "cache_read": 0,
+            "cache_write": 0,
+            "fresh": 10500,
+            "all": 10500,
+            "conversations": 2
+          },
+          {
+            "route": "claude#b/claude-sonnet-5",
+            "input": 1200,
+            "output": 800,
+            "cache_read": 50000,
+            "cache_write": 2000,
+            "fresh": 4000,
+            "all": 54000,
+            "conversations": 2
+          }
+        ],
+        "routed_conversations": 4,
+        "routed_unrecorded": 1,
+        "routed_unattributed_fresh": 500
+      }
+    },
+    "sessions": [
+      {
+        "session": "3f9a1c2e9b7d4a10",
+        "host": "air",
+        "project": "CortadOS-Router",
+        "model": "claude-opus-5",
+        "last_at": 1799999880.0,
+        "24h": {
+          "orchestrator_fresh": 40000,
+          "orchestrator_all": 940000,
+          "routed_fresh": 4000,
+          "routed_all": 54000,
+          "routed_conversations": 1,
+          "routed_pct": 9.1
+        },
+        "7d": {
+          "orchestrator_fresh": 58000,
+          "orchestrator_all": 1558000,
+          "routed_fresh": 14000,
+          "routed_all": 64000,
+          "routed_conversations": 2,
+          "routed_pct": 19.4
+        }
+      },
+      {
+        "session": null,
+        "host": "air",
+        "project": "Grounds",
+        "model": "claude-opus-5",
+        "last_at": 1799654400.0,
+        "24h": {
+          "orchestrator_fresh": 0,
+          "orchestrator_all": 0,
+          "routed_fresh": 0,
+          "routed_all": 0,
+          "routed_conversations": 0,
+          "routed_pct": null
+        },
+        "7d": {
+          "orchestrator_fresh": 42000,
+          "orchestrator_all": 1042000,
+          "routed_fresh": 0,
+          "routed_all": 0,
+          "routed_conversations": 0,
+          "routed_pct": 0.0
+        }
+      }
+    ],
+    "sessions_hidden": 0,
+    "hosts": [
+      {
+        "host": "air",
+        "sampled_at": 1799999910.0,
+        "age_s": 90.0,
+        "stale": false,
+        "salt": true,
+        "sessions_hidden": 0,
+        "excluded": {
+          "child_task_files": 4,
+          "sidechain_entries": 12,
+          "routed_model_entries": 0,
+          "unreadable_files": 0,
+          "bad_lines": 0
+        }
+      }
+    ]
   }
 }
