@@ -94,11 +94,49 @@ fi
 [ "$1" = "-c" ] && exit 0
 if [ "$1" = "-m" ]; then
   echo "$*" >> "$HOME/lora.log"
-  while [ $# -gt 0 ]; do [ "$1" = "--adapter-path" ] && out="$2"; shift; done
-  mkdir -p "$out"; echo w > "$out/0000100_adapters.safetensors"; echo w > "$out/adapters.safetensors"; exit 0
+  exec python3 "$(dirname "$0")/fake-mlx.py" "$@"
 fi
 exec python3 "$@"
 """
+
+
+# what `mlx_lm lora` leaves in --adapter-path, with real safetensors headers: the rank comes from the -c file (mlx_lm's own
+# default 8 without one), as lora_params.py reads it back on the next resume or warm start.
+FAKE_MLX = """import json, struct, sys
+a = sys.argv[1:]
+arg = lambda k, d=None: a[a.index(k) + 1] if k in a else d
+lp = json.load(open(arg("-c")))["lora_parameters"] if "-c" in a else {"rank": 8, "dropout": 0.0, "scale": 20.0}
+out, layers = arg("--adapter-path"), int(arg("--num-layers", "16"))
+import os; os.makedirs(out, exist_ok=True)
+cfg = {"model": arg("--model"), "num_layers": layers, "fine_tune_type": "lora", "lora_parameters": lp,
+       "resume_adapter_file": arg("--resume-adapter-file")}
+open(os.path.join(out, "adapter_config.json"), "w").write(json.dumps(cfg))
+open(os.environ["HOME"] + "/lora.log", "a").write(f"rank {lp['rank']} scale {lp['scale']}\\n")
+h = {}
+for i in range(layers):
+    h[f"model.layers.{i}.self_attn.q_proj.lora_a"] = {"dtype": "F32", "shape": [4, lp["rank"]], "data_offsets": [0, 0]}
+    h[f"model.layers.{i}.self_attn.q_proj.lora_b"] = {"dtype": "F32", "shape": [lp["rank"], 4], "data_offsets": [0, 0]}
+raw = json.dumps(h).encode()
+for n in ("0000100_adapters.safetensors", "adapters.safetensors"):
+    open(os.path.join(out, n), "wb").write(struct.pack("<Q", len(raw)) + raw)
+"""
+
+
+def fake_adapter(adapter_dir: Path, name: str = "adapters.safetensors", rank: int = 8, layers: int = 16,
+                 config_rank: int | None = None, scale: float = 20.0) -> Path:
+    """A LoRA adapter as mlx_lm writes it (safetensors header only, no tensor data needed) + its adapter_config.json."""
+    import struct
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    h = {}
+    for i in range(layers):
+        h[f"model.layers.{i}.self_attn.q_proj.lora_a"] = {"dtype": "F32", "shape": [4, rank], "data_offsets": [0, 0]}
+        h[f"model.layers.{i}.self_attn.q_proj.lora_b"] = {"dtype": "F32", "shape": [rank, 4], "data_offsets": [0, 0]}
+    raw = json.dumps(h).encode()
+    (adapter_dir / name).write_bytes(struct.pack("<Q", len(raw)) + raw)
+    (adapter_dir / "adapter_config.json").write_text(json.dumps({
+        "model": "mlx-community/Qwen3-4B-Instruct-2507-4bit", "num_layers": layers, "fine_tune_type": "lora",
+        "lora_parameters": {"rank": config_rank or rank, "dropout": 0.0, "scale": scale}}))
+    return adapter_dir / name
 
 
 def _exe(path: Path, text: str) -> None:
@@ -158,7 +196,7 @@ class NightlyEndToEnd(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.s1 = self.tmp / "repo" / "s1"
         (self.s1 / "data").mkdir(parents=True)
-        for name in ("nightly.sh", "nightly_state.py", "common.py", "sweep_request.py"):   # nightly_state counts labels with common's teacher filter
+        for name in ("nightly.sh", "nightly_state.py", "common.py", "sweep_request.py", "lora_params.py"):   # nightly_state counts labels with common's teacher filter
             shutil.copy(S1 / name, self.s1 / name)
         for name in ("cortados_router", "tables"):                         # common.py loads the router's question set
             (self.tmp / "repo" / name).symlink_to(S1.parent / name)
@@ -168,6 +206,7 @@ class NightlyEndToEnd(unittest.TestCase):
         (home / ".local/bin").mkdir(parents=True)
         _exe(home / ".local/bin/launchctl", "#!/bin/bash\necho \"launchctl $*\" >> \"$HOME/launchctl.log\"\n")
         _exe(self.tmp / "fake-py", FAKE_PY)
+        (self.tmp / "fake-mlx.py").write_text(FAKE_MLX)
         self.pointer = self.s1 / "current.json"
         keep = {k: v for k, v in os.environ.items() if not k.startswith(("CORTADOS_", "STUB_"))}
         self.env = {**keep, "HOME": str(home), "CORTADOS_NIGHTLY_SUPERVISED": "1", "CORTADOS_S1_PY": str(self.tmp / "fake-py"),
@@ -414,8 +453,7 @@ PY
         """A run as overnight.py leaves it when the night window ends mid-LoRA: checkpoint 0000100, segment-target, no final
         adapters.safetensors, no report.json."""
         run = self.s1 / "runs" / name
-        (run / "adapter").mkdir(parents=True)
-        (run / "adapter/0000100_adapters.safetensors").write_text("w")
+        fake_adapter(run / "adapter", "0000100_adapters.safetensors")
         (run / "segment-target").write_text("300\n")
         if age_s:
             old = _time.time() - age_s
@@ -1241,6 +1279,54 @@ PY
         _, log, _ = self.run_night(STUB_NEW_LABELS=1)
         self.assertIn("retention: removed checkpoints of unfinished runs/2025-12-01", log)
 
+    # --- LoRA shape (#74, 2026-11-13): the live adapter became the rank-16 blend ---------------------------------------
+    def test_fresh_run_trains_at_the_configured_rank_and_records_it(self):
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3)
+        self.assertEqual(rc, 0, log)
+        lora = (Path(self.env["HOME"]) / "lora.log").read_text()
+        self.assertIn(f"-c {run1.relative_to(self.tmp / 'repo' / 's1')}/lora-train.yaml", lora)
+        self.assertIn("rank 8 scale 20.0", lora)
+        self.assertEqual(json.loads((run1 / "lora-params.json").read_text())["rank"], 8)
+        self.assertEqual(json.loads(self.pointer.read_text())["lora"], {"rank": 8, "scale": 20.0, "num_layers": 16})
+
+    def test_warm_start_from_a_rank16_adapter_trains_at_rank16(self):
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3)
+        self.assertIn("PROMOTED", log)
+        fake_adapter(run1 / "adapter", rank=16)          # the promoted adapter is now a rank-16 blend (8 + 8)
+        (Path(self.env["HOME"]) / "lora.log").write_text("")
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=1)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("warm start from", log)
+        self.assertIn("lora: LoRA rank 16, scale 20 from resume_0_adapters.safetensors (tensors)", log)
+        lora = (Path(self.env["HOME"]) / "lora.log").read_text()
+        self.assertIn("rank 16 scale 20.0", lora)
+        self.assertNotIn("rank 8 ", lora)
+        self.assertEqual(json.loads((run2 / "adapter/adapter_config.json").read_text())["lora_parameters"]["rank"], 16)
+
+    def test_configured_rank_that_disagrees_with_the_warm_start_refuses_the_night(self):
+        _, _, run1 = self.run_night(STUB_NEW_LABELS=3)
+        fake_adapter(run1 / "adapter", rank=16)
+        (Path(self.env["HOME"]) / "lora.log").write_text("")
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_LORA_RANK=8)
+        self.assertEqual(rc, 1, log)
+        self.assertIn("LORA REFUSED: CORTADOS_S1_LORA_RANK=8 but the start weights", log)
+        self.assertIn("TRAINING REFUSED for runs/2026-01-02", log)
+        self.assertEqual((Path(self.env["HOME"]) / "lora.log").read_text(), "", "mlx_lm must not be started")
+        st = json.loads((self.s1 / "data/status.json").read_text())
+        self.assertIn("CORTADOS_S1_LORA_RANK=8", st["last_lora_refused"]["detail"])
+        calls = (self.tmp / "home/launchctl.log").read_text().split("\n")
+        self.assertTrue(calls[-2].startswith("launchctl load"), f"the scorer comes back after a refusal: {calls}")
+
+    def test_resume_of_rank16_tensors_under_a_rank8_config_is_refused(self):
+        """What a pre-fix warm start from the blend would have left: rank-16 tensors, mlx_lm's rank-8 adapter_config.json."""
+        run = self.s1 / "runs/2026-01-01"
+        fake_adapter(run / "adapter", "0000100_adapters.safetensors", rank=16, config_rank=8)
+        (run / "segment-target").write_text("300\n")
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=1)
+        self.assertEqual(rc, 1, log)
+        self.assertIn("says LoRA rank 8 but the tensors of", log)
+        self.assertFalse((Path(self.env["HOME"]) / "lora.log").exists(), "mlx_lm must not be started")
+
     def test_pending_candidate_with_a_missing_adapter_is_dropped_not_superseded(self):
         _, _, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_RC=1)
         shutil.rmtree(run1 / "adapter")
@@ -1347,8 +1433,7 @@ PY
 
     def _pending_run(self, segment_target, checkpoint="0000100_adapters.safetensors"):
         run = self.s1 / "runs/2026-01-01"
-        (run / "adapter").mkdir(parents=True)
-        (run / "adapter" / checkpoint).write_text("w")
+        fake_adapter(run / "adapter", checkpoint)
         (run / "segment-target").write_text(segment_target)
         (run / "nightly.log").write_text("")
         return run

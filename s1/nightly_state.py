@@ -146,12 +146,26 @@ def event(path: Path, key: str, detail: str) -> None:
     save_status(path, st)
 
 
+def lora_of(adapter: Path) -> dict | None:
+    """Provenance (#74, 2026-11-13): the LoRA rank/scale/layers the published adapter was trained at, from its own
+    adapter_config.json, so the pointer says what serves (the rank-8 to rank-16 change of 2026-11-12 was visible only by opening
+    the adapter dir). promote_sweep.py records the same field. None when the config is missing or unreadable: serving reads
+    rank and scale from the adapter dir itself, so this field is informational and never blocks a promotion."""
+    try:
+        cfg = json.loads((Path(adapter) / "adapter_config.json").read_text())
+        lp = cfg.get("lora_parameters") or {}
+        return {"rank": lp.get("rank"), "scale": lp.get("scale"), "num_layers": cfg.get("num_layers")}
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def promote(report: Path, adapter: Path, pointer: Path) -> None:
     r = json.loads(report.read_text())
     cfg = {"base": r["base"], "adapter": str(adapter), "temperatures": r["temperatures"], "promoted": r["when"],
            "report": str(report),
            "inference": {"fail_up_below": r.get("fail_up_below"), "outward_at": r.get("outward_at")},
-           "holdout": {k: r["candidate"][k] for k in ("band_accuracy", "under_routed", "over_routed", "outward_recall")}}
+           "holdout": {k: r["candidate"][k] for k in ("band_accuracy", "under_routed", "over_routed", "outward_recall")},
+           "lora": lora_of(adapter)}
     if pointer.exists():
         write_atomic(pointer.with_name(pointer.name + ".prev"), pointer.read_text())
     # mkstemp creates the temp file 0600 and the rename keeps that mode, so the pointer ends up 0600: fine because serve.py

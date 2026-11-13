@@ -37,7 +37,8 @@ def main() -> int:
     # bands of the training labels via the same table
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "cortados_router"))
     import core
-    core.lane_health = lambda: {}
+    os.environ["CORTADOS_SCARCITY_REFRESH"] = "off"   # band only: no vendor usage probe (see common.bands_only)
+    core.lane_health = lambda **_: {}
     tb = collections.Counter(core.resolve({"answers": l["answers"], "degraded": False, "engine": "t", "engine_ms": 0})["band"] for l in read_labels() if l["id"] in reqs)
     score = 0.5 * (tvd(mix(wk), mix(tk)) + tvd(mix(wb), mix(tb)))
     print(f"drift {score:.2f} (threshold {THRESH}) · week kinds {dict(wk.most_common(4))} vs train {dict(tk.most_common(4))} · week bands {dict(wb)} vs train {dict(tb)}")

@@ -104,7 +104,8 @@ class PlanTest(unittest.TestCase):
         self.assertTrue(ptr["adapter"].endswith("runs/cand/promoted/cand-blend0.7/adapter"))
         self.assertEqual(self.t.pointer.read_text(), before)
         self.assertFalse((self.t.run / "promoted").exists())
-        self.assertTrue(any("LoRA rank 16 differs" in n for n in p["notes"]))
+        self.assertTrue(any("LoRA rank 16 differs" in n and "trains at rank 16" in n for n in p["notes"]))
+        self.assertEqual(ptr["lora"], {"rank": 16, "scale": 20.0, "num_layers": None})   # provenance, as nightly promotions record it
 
     def test_tilted_setting_is_refused_and_names_its_untilted_twin(self):
         msg = self.refused("blend0.7-t0.3")
