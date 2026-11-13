@@ -851,8 +851,8 @@ class Registry:
         No match, or more than one, is a LostSession: never continue a conversation on a guess. With no match, a
         tombstone under `failure_key` makes it a FailedSession instead; a retry of the session's last answered turn
         (see Replay) raises Replay with the stored response; a continuation whose client rewrote the history raises
-        Rebuild (_rebuild_or_refuse, which also words the LostSession when no rebuild is possible). More than one such retry candidate is not replayed (it
-        falls through to the ordinary 409, whose diagnostic counts the candidates)."""
+        Rebuild (_rebuild_or_refuse, which also words the LostSession when no rebuild is possible). More than one such
+        retry candidate is not replayed (it falls through to that check)."""
         if not turn.history:
             return None
         with self._lock:
@@ -903,17 +903,21 @@ class Registry:
                 and anchor in s.history]
         code = None                                     # the refusal's category, for the 409 log line
         if scope is None:
-            code, why = "no_identity", ("it carries no conversation identity (one of " + ", ".join(CONVERSATION_ID_HEADERS) +
-                   "), so the conversation it continues cannot be told from a stranger's and is not rebuilt")
+            code, why = "no_identity", (
+                "it carries no conversation identity (one of " + ", ".join(CONVERSATION_ID_HEADERS) + "), so the "
+                "conversation it continues cannot be told from a stranger's and is not rebuilt")
         elif not cands:
-            code, why = "no_writer", ("no live conversation of this client wrote its last reply (the endpoint restarted, the conversation "
-                   "expired, or the reply itself was edited), so there is no route or backend to rebuild from")
+            code, why = "no_writer", (
+                "no live conversation of this client wrote its last reply (the endpoint restarted, the conversation "
+                "expired, or the reply itself was edited), so there is no route or backend to rebuild from")
         elif len(cands) > 1:
-            code, why = "ambiguous_writer", (f"{len(cands)} live conversations of this client wrote its last reply; refusing to pick one to "
-                   "rebuild from")
+            code, why = "ambiguous_writer", (
+                f"{len(cands)} live conversations of this client wrote its last reply; refusing to pick one to "
+                "rebuild from")
         elif getattr(cands[0], "rebuilds", 0) >= REBUILD_MAX:
-            code, why = "limit", (f"the conversation was already rebuilt {REBUILD_MAX} times (REBUILD_MAX) after the client rewrote "
-                   "its history; start a new conversation")
+            code, why = "limit", (
+                f"the conversation was already rebuilt {REBUILD_MAX} times (REBUILD_MAX) after the client rewrote "
+                "its history; start a new conversation")
         if why is None:
             s = cands[0]
             raise Rebuild(s, superseded=s.history[-1] == anchor)
