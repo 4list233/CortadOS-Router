@@ -740,6 +740,54 @@ class HttpTest(unittest.TestCase):
                 self.assertEqual(s.recv(100), b"")
                 self.assertLess(time.monotonic() - t0, 3)
 
+    def test_body_trickled_a_byte_at_a_time_is_dropped_by_the_deadline_and_frees_the_worker(self):
+        # #83: headers in one write, then the body one byte every 50 ms. Each byte resets an idle timeout, so only the
+        # absolute BODY_DEADLINE_S can end it; the gateway must drop the connection by then (not after the 2 s the
+        # trickle would take) and give its only worker slot back for the next client.
+        import socket
+        import time
+        with mock.patch.object(bg, "MAX_INFLIGHT", 1):
+            srv = bg.build_server(self.gw, "127.0.0.1", 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        self.url = f"http://127.0.0.1:{port}/mcp"
+        ping = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        body = json.dumps(ping).encode().ljust(40)
+        stop, sent = threading.Event(), []
+        try:
+            with mock.patch.object(bg, "BODY_DEADLINE_S", 0.5), \
+                    socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+                s.sendall(b"POST /mcp HTTP/1.1\r\nhost: x\r\nauthorization: Bearer " + TOKEN.encode() +
+                          b"\r\ncontent-length: " + str(len(body)).encode() + b"\r\n\r\n")
+
+                def trickle():
+                    try:
+                        for i in range(len(body)):
+                            if stop.wait(0.05):
+                                return
+                            s.sendall(body[i:i + 1])
+                            sent.append(i)
+                    except OSError:
+                        pass                               # the gateway closed it: what the deadline is for
+                t0 = time.monotonic()
+                threading.Thread(target=trickle, daemon=True).start()
+                time.sleep(0.2)
+                self.assertEqual(self.post(ping)[0], 503, "the trickler holds the only worker meanwhile")
+                try:
+                    reply = s.recv(100)
+                except ConnectionResetError:
+                    reply = b""                            # closed with unread bytes in its buffer: a reset
+                elapsed = time.monotonic() - t0
+                self.assertEqual(reply, b"", "dropped without a reply")
+                self.assertLess(elapsed, 1.5, "by the body deadline, not the trickle's own length")
+                self.assertLess(len(sent), len(body), "the body was still arriving when it was dropped")
+                stop.set()
+            self.assertEqual(self.post(ping)[0], 200, "the worker is free again for the next client")
+        finally:
+            stop.set()
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
