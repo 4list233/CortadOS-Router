@@ -94,8 +94,15 @@ is delegated through the `cortados-route` MCP server. Three parts:
   "/fork", "fork this"), an Agent call with `subagent_type: "fork"` passes through to the native fork; any other
   subagent type is refused with a message saying to use `"fork"`. Only a genuine owner prompt counts (not meta: system
   reminders and receipts; origin the terminal, Remote Control, the SDK/desktop host or an owner Slack ping — never a
-  task notification, a peer or plugin message, or a tool result). The permission lasts for that turn: the next owner
-  prompt without "fork", or a notification that starts a turn of its own, ends it. Reason: the owner's rule, and
+  task notification, a peer or plugin message, or a tool result). **The owner must type the word themselves, outside
+  any pasted block:** tagged material inside the prompt (`<pasted_content …>`, `<system-reminder>`,
+  `<task-notification>`, `<context>`, `<cc-memory>`, a peer's or a command's captured output — any tag whose name
+  has `-`, `_`, `:` or `.`) is removed first, and only the text before the first such block and after the last one
+  counts (a paste can forge its own closing tag, so text between two blocks does not; an unterminated block makes
+  the rest of the prompt untrusted). The permission belongs to the one main-loop turn that prompt starts, in this
+  session: it ends when that turn completes (answered, interrupted or failed), at a session start, end, `/clear` or
+  resume, and when an owner message without "fork" is delivered into the running turn. A later turn — a queued
+  message's own, a notification's, or one the engine starts with no prompt — never inherits it. Reason: the owner's rule, and
   the 2026-11-08 incident where six Agent-tool builders aborted with `HooksError: $.process.run(claude) aborted`. This
   applies at every gate level, `off` included. It never applies to a call carrying an `agentId` (a subagent, teammate
   or engine fork: those Agent calls are routed as before) nor to a CortadOS child task (it runs with this plugin
@@ -121,6 +128,7 @@ how to switch the gate off:
 | `WebSearch`, `WebFetch` | **deny** | Research: `route_task` returns a researched text answer, `start_task` a child that can browse and write files. |
 | `NotebookEdit` | **deny** | Implementation work. |
 | `Edit` / `Write` / `MultiEdit`, big (over 40 lines or 2000 chars of new content, the guard's thresholds) | **deny** at once | Implementation work. |
+| `Edit` / `Write` / `MultiEdit` of this session's own memory or plan file | allow, any size, budget untouched | The session keeps them itself: a file inside **this** session's Claude Code memory folder (`<CLAUDE_CONFIG_DIR or ~/.claude>/projects/<project root, every non-alphanumeric character as "-">/memory/`), or plan mode's plan file while plan mode is on (its path from the engine's plan-mode reminder). Both sides are resolved (symbolic links, `..`) and compared by real path; another project's memory, a path that merely contains "memory", a link out of the folder, the scratchpad and everything else stay gated. |
 | `Edit` / `Write` / `MultiEdit`, small | **deny** by default (`orchestratorEditBudget` 0); with a positive budget, allow that many per user turn, **deny** after | Owner 2026-11-13: the main session plans and delegates; editing is a child's work. Raise the budget to allow small touches; a new user prompt resets the count. |
 | `Bash` build/test run (`python -m unittest/pytest`, `pytest`, `make`, `npm/yarn/pnpm build/test`, `claude plugin test`, as the guard detects them) | **deny** | Builds and test runs belong to the child that made the change. |
 | `Bash` with `run_in_background`, or `timeout` over 120 s | **deny** | Long-running work. 120 s is the Bash tool's own default timeout: inspection never needs more. |
