@@ -236,6 +236,23 @@ class CodexBinaryTest(unittest.TestCase):
         self.assertEqual(cm.exception.binary, found)
         self.assertTrue(cm.exception.discovery_notes)
 
+    def test_standalone_install_uses_no_daemon_when_code_mode_host_is_present(self):
+        binary = _exe(self.tmp, "standalone/codex")
+        Path(binary).with_name("codex-code-mode-host").touch()
+        with mock.patch.object(sc, "tui_capture", return_value="screen") as call, \
+             mock.patch.object(sc, "parse_codex_status", return_value=[]), \
+             mock.patch.object(sc.codex_screen, "version", return_value="0.163.0"):
+            sc._codex_probe({}, binary, None, [])
+        self.assertEqual(call.call_args.args[0], [binary, "--no-daemon"])
+
+    def test_other_install_does_not_use_no_daemon(self):
+        binary = _exe(self.tmp, "packaged/codex")
+        with mock.patch.object(sc, "tui_capture", return_value="screen") as call, \
+             mock.patch.object(sc, "parse_codex_status", return_value=[]), \
+             mock.patch.object(sc.codex_screen, "version", return_value="0.163.0"):
+            sc._codex_probe({}, binary, None, [])
+        self.assertEqual(call.call_args.args[0], [binary])
+
     # --- failure labelling ---------------------------------------------------------------------------------------
     def test_failure_kind_is_stable_across_attempts(self):
         a = "RuntimeError: Codex /status empty (attempts=2): stage=boot, eof=True, startup_chars=0, ready_seen=False"
@@ -243,6 +260,9 @@ class CodexBinaryTest(unittest.TestCase):
         self.assertEqual(sc.failure_kind(a), "codex-status-empty:boot")
         self.assertEqual(sc.failure_kind(a), sc.failure_kind(b))
         self.assertEqual(sc.failure_kind("RuntimeError: Codex CLI not found: no `codex` on PATH"), "codex-cli-not-found")
+        self.assertEqual(sc.failure_kind(
+            "RuntimeError: Codex /status empty (attempts=1): stage=boot, eof=True, boot_failure=package"),
+            "codex-status-empty:boot:package")
 
     def test_failure_kind_falls_back_to_the_exception_type_when_there_is_no_message(self):
         self.assertEqual(sc.failure_kind("TimeoutError: "), "timeouterror")

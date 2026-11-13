@@ -137,6 +137,9 @@ class Capture(unittest.TestCase):
     def test_startup_classification_never_copies_private_text(self):
         self.assertEqual(scarcity._boot_failure_kind('Error: The cursor position could not be read within a normal duration'), 'cursor_position')
         self.assertEqual(scarcity._boot_failure_kind('Error loading config: private-token'), 'config')
+        self.assertEqual(scarcity._boot_failure_kind(
+            'this CLI has no complete local package; install a packaged Codex CLI or use the standalone installer'),
+            'package')
         self.assertEqual(scarcity._boot_failure_kind('private-token'), 'unknown')
 
     def test_codex_probe_survives_a_dead_configured_binary(self):

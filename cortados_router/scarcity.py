@@ -116,6 +116,7 @@ def _plain(raw: bytes) -> str:
 def _boot_failure_kind(text: str) -> str:
     """Classify startup failures without persisting terminal text or credentials."""
     for kind, pattern in (
+        ("package", r"no complete local package"),
         ("cursor_position", r"cursor position.*(?:could not|cannot|timed out)|could not.*cursor position"),
         ("terminal", r"termios|inappropriate ioctl|terminal.*(?:failed|not supported)"),
         ("config", r"(?:error|failed).*config|config.*(?:error|invalid)"),
@@ -673,7 +674,12 @@ def _codex_probe(env: dict[str, str], binary: str, missing_bin: str | None, note
         diagnostic: dict = {}
         # The screen prints "Model:" (0.163); the old lowercase pattern never matched, so every probe sat out the full
         # boot wait and retried (67 s a sample on 2026-10-21). The entry's "% left" may wrap onto its own line.
-        text = tui_capture([binary], "/status", r"limit: \[[^\]]*\]\s+\d+%\s+left", env, boot_s=20,
+        # The standalone installer may ship the CLI without its daemon package; its sibling code-mode host identifies
+        # that layout.  --no-daemon keeps /status available without changing auth or requiring a package install.
+        args = [binary]
+        if Path(binary).with_name("codex-code-mode-host").is_file():
+            args.append("--no-daemon")
+        text = tui_capture(args, "/status", r"limit: \[[^\]]*\]\s+\d+%\s+left", env, boot_s=20,
                            ready=r"(?i)model: +(?!loading)\S+", diagnostics=diagnostic)
         if text.strip():
             break
