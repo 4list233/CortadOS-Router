@@ -63,7 +63,7 @@ Runs under the Claude desktop app as well as the CLI: the child is started with 
 The child starts with an empty MCP config (built-in tools only); the parent's MCP servers are never exposed to the provider.
 | `orchestratorMode` | `true` | Direct the main session to plan and delegate through `mcp__cortados-route__start_task` / `route_task`, and **refuse its own Agent-tool calls** (see **Orchestrator mode**). Off turns the gate off too. |
 | `orchestratorGate` | `balanced` | The main-loop gate (see **Orchestrator gate**): `balanced` refuses clearly delegatable work and fails open when the router is unreachable; `strict` is the allowlist cage; `off` leaves only the Agent refusal. A mistyped value is `balanced`. `/cortados-gate off\|balanced\|strict` overrides it for one session. |
-| `orchestratorEditBudget` | `2` | Under `balanced`: small edits (`Edit`/`Write`/`MultiEdit`) the main loop may make itself per user turn; the next one is refused. Big edits are refused at once. |
+| `orchestratorEditBudget` | `0` | Under `balanced`: small edits (`Edit`/`Write`/`MultiEdit`) the main loop may make itself per user turn; the next one is refused. `0` (default since 0.3.0) refuses every edit on the main loop. Big edits are refused at once. |
 | `orchestratorEnforce` | `false` | Backward-compatible alias: `true` means `orchestratorGate: strict` (every tool outside `orchestratorAllowedTools` is refused on the main loop). |
 | `orchestratorAllowedTools` | `Read,Grep,Glob,TodoWrite,AskUserQuestion,ExitPlanMode,Skill,ToolSearch` | Allowlist used **only under `strict`**: the tools the brain may run itself; everything else is refused and must be delegated. The cortados-route tools (`mcp__cortados-route__*`) are always allowed regardless; `Agent` is always refused. |
 | `excludeBuilderOnReview` | `true` | When a routed Agent call is a review (see **Independent reviews**), send `x-cortados-exclude-model` to the provider with the **main session's own model** plus the models routed (non-review) subagents built with since the last review (up to 3), so that review is kept off them on every lane. |
@@ -80,23 +80,30 @@ is delegated through the `cortados-route` MCP server. Three parts:
   minus its gate paragraph): decompose each request and delegate with `mcp__cortados-route__start_task` (a whole task
   in a CortadOS child session on this machine: files, shell, connectors, MCP, Chrome on request) or
   `mcp__cortados-route__route_task` (a text answer, no tools); load the `mcp__cortados-route__*` tools with ToolSearch
-  first if they are deferred; never delegate with the Agent tool; write every task to stand alone (goal, context,
-  scope and difficulty, outward effects, acceptance check, working folder); verify results before reporting. Act
-  directly only when the step is trivial, needs something only this session has, or delegating would clearly cost
-  more — and **if cortados-route is not connected, say so in one line and do the work directly**. **Precedence:** the
+  first if they are deferred; never the Agent tool unless the owner asks to fork; write every task to stand alone
+  (goal, context, scope and difficulty, outward effects, acceptance check, working folder); verify results before
+  reporting. The session plans, delegates, verifies and reports, and acts directly **only when absolutely
+  necessary** (connector or Chrome work child tasks cannot do yet, a one-line inspection, a decision only this
+  conversation can make) — and **if cortados-route is not connected, say so in one line and do the work directly**. **Precedence:** the
   owner's `~/.config/ai-coding/CORTADOS-ORCHESTRATOR.md` outranks the directive, and any conflicting instruction is
   reported to the owner, never resolved silently. The directive is for the top-level session only.
 - The **Agent gate**: in orchestrator mode the main loop's Agent-tool calls are refused — before any routing or
   pass-through, whatever the subagent type — with a message naming `mcp__cortados-route__start_task` /
-  `route_task` and the fallback above (tell the owner in one line, do the work directly). Reason: the owner's rule, and
+  `route_task` and the fallback above (tell the owner in one line, do the work directly). **One exception** (owner
+  2026-11-13): when the owner's own prompt for the current turn contains the word "fork" (any case: "fork a session",
+  "/fork", "fork this"), an Agent call with `subagent_type: "fork"` passes through to the native fork; any other
+  subagent type is refused with a message saying to use `"fork"`. Only a genuine owner prompt counts (not meta: system
+  reminders and receipts; origin the terminal, Remote Control, the SDK/desktop host or an owner Slack ping — never a
+  task notification, a peer or plugin message, or a tool result). The permission lasts for that turn: the next owner
+  prompt without "fork", or a notification that starts a turn of its own, ends it. Reason: the owner's rule, and
   the 2026-11-08 incident where six Agent-tool builders aborted with `HooksError: $.process.run(claude) aborted`. This
   applies at every gate level, `off` included. It never applies to a call carrying an `agentId` (a subagent, teammate
   or engine fork: those Agent calls are routed as before) nor to a CortadOS child task (it runs with this plugin
   disabled via its settings file, and its directive says to do the work itself).
 - The **orchestrator gate** (`balanced` by default; below) refuses delegatable work on the main loop.
 
-The result: the top model is the brain and work flows through CortadOS child tasks, while the brain can still handle
-the odd trivial thing itself (and anything only it can do). Turn the whole thing off with `orchestratorMode: false`
+The result: the top model is the brain and work flows through CortadOS child tasks; the brain keeps only what it alone
+can do (reading and inspection, connectors, Chrome, decisions). Turn the whole thing off with `orchestratorMode: false`
 (the mod then only routes Agent-tool subagents, the main session's included, without directing it at all).
 
 ## Orchestrator gate
@@ -114,7 +121,7 @@ how to switch the gate off:
 | `WebSearch`, `WebFetch` | **deny** | Research: `route_task` returns a researched text answer, `start_task` a child that can browse and write files. |
 | `NotebookEdit` | **deny** | Implementation work. |
 | `Edit` / `Write` / `MultiEdit`, big (over 40 lines or 2000 chars of new content, the guard's thresholds) | **deny** at once | Implementation work. |
-| `Edit` / `Write` / `MultiEdit`, small | allow the first `orchestratorEditBudget` (2) per user turn, **deny** after | One or two touches is a trivial fix; a third in one turn is a stretch of implementation. A new user prompt resets the count. |
+| `Edit` / `Write` / `MultiEdit`, small | **deny** by default (`orchestratorEditBudget` 0); with a positive budget, allow that many per user turn, **deny** after | Owner 2026-11-13: the main session plans and delegates; editing is a child's work. Raise the budget to allow small touches; a new user prompt resets the count. |
 | `Bash` build/test run (`python -m unittest/pytest`, `pytest`, `make`, `npm/yarn/pnpm build/test`, `claude plugin test`, as the guard detects them) | **deny** | Builds and test runs belong to the child that made the change. |
 | `Bash` with `run_in_background`, or `timeout` over 120 s | **deny** | Long-running work. 120 s is the Bash tool's own default timeout: inspection never needs more. |
 | `Bash` that is exactly start_task's `watch_command` (`[env CORTADOS_TASKS_DIR=… CORTADOS_EXEC_HOSTS_FILE=…] <python3> [-B] …/cortados_router/child_tasks.py --watch <task id>… [--timeout\|--interval\|--stall N]…`, optionally `; echo "exit $?"`) | allow, background and long timeout included | The orchestrator must run it in the background after every start_task. Anything else chained, piped, redirected or substituted makes it ordinary Bash again. |
@@ -123,7 +130,7 @@ how to switch the gate off:
 | `mcp__cortados-route__*` | allow | Delegation itself. |
 | `mcp__claude-in-chrome__*` and every other MCP connector tool | allow | The signed-in browser and the connectors only exist in the main session; routed children on the Air have none yet. |
 | `mcp__ccd_turn__update_plan`, `mcp__ccd_turn__wrap_up`, `mcp__ccd_session__mark_chapter`, `Artifact*` | allow | Host plumbing and artifacts. |
-| `Agent` | **deny** (Agent gate above) | At every gate level. |
+| `Agent` | **deny** (Agent gate above); allow `subagent_type: "fork"` when this turn's owner prompt says "fork" | At every gate level, `strict` included. In-process subagents die with this session's hooks. |
 
 **Fail open.** Before refusing, the gate checks that delegation can work: a `mcp__cortados-route__*` tool is in the
 session's tool pool and the provider's `GET /health` (the mod's `providerUrl` / `CORTADOS_PROVIDER_URL` / URL file; no

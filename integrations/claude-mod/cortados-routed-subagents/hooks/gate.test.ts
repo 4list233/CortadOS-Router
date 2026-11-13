@@ -1,7 +1,7 @@
 import { test, expect, mock } from 'claude-code/testing'
 import {
   register, balancedClass, parseGateLevel, configGateLevel, resolveEditBudget, gateStatusText, gateDenyMessage,
-  parseGateMap, withGateOverride, AGENT_REFUSAL, GATE_COMMAND, GATE_STORE_KEY, GATE_STORE_MAX_SESSIONS,
+  parseGateMap, withGateOverride, AGENT_REFUSAL, AGENT_FORK_ONLY, isForkRequest, isOwnerPrompt, agentDecision, GATE_COMMAND, GATE_STORE_KEY, GATE_STORE_MAX_SESSIONS,
   GATE_HEALTH_TTL_MS, GATE_BASH_MAX_TIMEOUT_MS, GATE_EDIT_BUDGET_DEFAULT, GATE_HEALTH_TIMEOUT_MS,
   isTaskWatchCommand, isBuildOrTest, shellSegments, checkDelegation,
 } from './register'
@@ -86,6 +86,10 @@ const DENIED: Array<[string, Record<string, unknown>]> = [
   ['make Bash', { tool: 'Bash', command: 'make -j4' }],
   ['background Bash', { tool: 'Bash', command: 'sleep 1', run_in_background: true }],
   ['long-timeout Bash', { tool: 'Bash', command: 'rsync -a a b', timeout: GATE_BASH_MAX_TIMEOUT_MS + 1 }],
+  // orchestratorEditBudget 0 by default (owner 2026-11-13): even a one-character edit is delegated work.
+  ['small Edit', { tool: 'Edit', file_path: '/a', old_string: 'a', new_string: SMALL }],
+  ['small Write', { tool: 'Write', file_path: '/b', content: SMALL }],
+  ['small MultiEdit', { tool: 'MultiEdit', file_path: '/a', edits: [{ old_string: 'a', new_string: SMALL }] }],
 ]
 
 const ALLOWED: Array<[string, Record<string, unknown>]> = [
@@ -104,7 +108,6 @@ const ALLOWED: Array<[string, Record<string, unknown>]> = [
   ['another server start_task', { tool: 'mcp__velox-workspace__start_task' }],
   ['Artifact', { tool: 'Artifact' }],
   ['ArtifactData', { tool: 'ArtifactData' }],
-  ['small Edit', { tool: 'Edit', file_path: '/a', old_string: 'a', new_string: SMALL }],
   ['Monitor', { tool: 'Monitor' }],
 ]
 
@@ -146,8 +149,28 @@ test('research is pointed at route_task for a text answer', async () => {
 
 // ---- The small-edit budget ---------------------------------------------------------------------------------------
 
-test(`small edits: ${GATE_EDIT_BUDGET_DEFAULT} per user turn, the next is refused; a new user prompt resets the budget`, async () => {
+test('the default edit budget is 0: every small edit on the main loop is refused, saying the session plans and delegates', async () => {
+  expect(GATE_EDIT_BUDGET_DEFAULT).toBe(0)
   const w = gateWorld()
+  for (const e of [{ tool: 'Edit', file_path: '/a', old_string: 'a', new_string: SMALL }, { tool: 'Write', file_path: '/b', content: SMALL }]) {
+    const r: any = await w.call(e)
+    expect(r.deny).toMatch(/on the main session is implementation work \(orchestratorEditBudget is 0: the main session plans and delegates\)/)
+    expect(r.deny).toContain('mcp__cortados-route__start_task')
+    expect(r.deny).toContain(`/${GATE_COMMAND} off`)
+  }
+  // a new user prompt does not open a budget of 0
+  await w.h['prompt.submit'](w.$, { text: 'next request', origin: { kind: 'composer' } }, async () => ({}))
+  expect(isDeny(await w.call({ tool: 'Edit', new_string: SMALL }))).toBe(true)
+  expect(w.state.ran).toEqual([])
+})
+
+test('with the router unreachable an edit still fails open under the default budget of 0', async () => {
+  const w = gateWorld({}, { health: 'down' })
+  expect(await w.call({ tool: 'Edit', file_path: '/a', old_string: 'a', new_string: SMALL })).toEqual({ result: 'ran' })
+})
+
+test('small edits with orchestratorEditBudget 2: 2 per user turn, the next is refused; a new user prompt resets the budget', async () => {
+  const w = gateWorld({ orchestratorEditBudget: 2 })
   const small = { tool: 'Edit', file_path: '/a', old_string: 'a', new_string: SMALL }
   expect(await w.call(small)).toEqual({ result: 'ran' })
   expect(await w.call({ tool: 'Write', file_path: '/b', content: SMALL })).toEqual({ result: 'ran' })
@@ -164,7 +187,7 @@ test(`small edits: ${GATE_EDIT_BUDGET_DEFAULT} per user turn, the next is refuse
 })
 
 test('a big edit is refused at once, even as the first edit of the turn, and does not use the budget', async () => {
-  const w = gateWorld()
+  const w = gateWorld({ orchestratorEditBudget: 2 })
   const r: any = await w.call({ tool: 'Edit', file_path: '/a', old_string: 'a', new_string: BIG })
   expect(r.deny).toMatch(/is a big edit \(over 40 lines or 2000 characters/)
   expect(await w.call({ tool: 'Edit', file_path: '/a', old_string: 'a', new_string: SMALL })).toEqual({ result: 'ran' })
@@ -174,7 +197,12 @@ test('a big edit is refused at once, even as the first edit of the turn, and doe
 test('orchestratorEditBudget is configurable; 0 refuses every edit', async () => {
   const w = gateWorld({ orchestratorEditBudget: 0 })
   const r: any = await w.call({ tool: 'Edit', file_path: '/a', old_string: 'a', new_string: SMALL })
-  expect(r.deny).toMatch(/already made 0 small edits this turn/)
+  expect(r.deny).toMatch(/orchestratorEditBudget is 0/)
+  const w1 = gateWorld({ orchestratorEditBudget: 1 })
+  expect(await w1.call({ tool: 'Edit', new_string: SMALL })).toEqual({ result: 'ran' })
+  expect((await w1.call({ tool: 'Edit', new_string: SMALL }) as any).deny).toMatch(/already made 1 small edit this turn/)
+  for (const bad of [-1, 'x', '']) expect(resolveEditBudget(bad)).toBe(0)
+  expect(resolveEditBudget('3')).toBe(3)
   const w5 = gateWorld({ orchestratorEditBudget: 5 })
   for (let i = 0; i < 5; i++) expect(await w5.call({ tool: 'Edit', new_string: SMALL })).toEqual({ result: 'ran' })
   expect(isDeny(await w5.call({ tool: 'Edit', new_string: SMALL }))).toBe(true)
@@ -544,11 +572,106 @@ test('engine host: the edit budget holds through the host, and /cortados-gate of
   const w = engine(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as any)
   const small = { tool: 'Edit', file_path: '/tmp/x', old_string: 'a', new_string: SMALL } as any
-  await $.tool.call(small)
-  await $.tool.call(small)
-  expect(typeof ((await $.tool.call(small)) as any).deny).toBe('string')
+  expect(typeof ((await $.tool.call(small)) as any).deny).toBe('string') // budget 0 by default
   const off: any = await $.command.run({ command: GATE_COMMAND, args: 'off' } as any)
   expect(off.text).toMatch(/^orchestrator gate off \(this session/)
   expect(((await $.tool.call(small)) as any).deny).toBe(undefined)
-  expect(w.ran.length).toBe(3)
+  expect(w.ran.length).toBe(1)
+})
+
+// ---- The Agent tool: refused on the main loop unless the owner asks to fork this turn (owner 2026-11-13) ----------
+
+const owner = (text: string, kind = 'composer', extra: Record<string, unknown> = {}) => ({ text, origin: { kind }, wait: false, ...extra })
+const FORK_CALL = { tool: 'Agent', subagent_type: 'fork', prompt: 'try the other approach', description: 'fork' }
+const GP_CALL = { tool: 'Agent', subagent_type: 'general-purpose', prompt: 'build it', description: 'build' }
+
+/** The Agent hook (registered first, the outer one) chained into the matcher-less gate, as the engine runs them. */
+async function agentCall(w: ReturnType<typeof gateWorld>, e: Record<string, unknown>) {
+  return w.h.Agent(w.$, e, (x: any) => w.h['*'](w.$, x, w.next))
+}
+async function submit(w: ReturnType<typeof gateWorld>, e: Record<string, unknown>) {
+  return w.h['prompt.submit'](w.$, e, async () => ({}))
+}
+
+test('isForkRequest: the word fork in any case, not inside another word', () => {
+  for (const t of ['fork a session', '/fork', 'Fork this', 'please FORK', 'forking is fine', 'fork-it', 'try (fork)']) expect([t, isForkRequest(t)]).toEqual([t, true])
+  for (const t of ['pitchfork', 'forklift', 'forkbomb', 'nothing here', '', undefined, 42]) expect([t, isForkRequest(t)]).toEqual([t, false])
+})
+
+test('isOwnerPrompt: owner origins and no origin count; meta and every other origin do not', () => {
+  for (const k of ['composer', 'bridge', 'sdk', 'slack-ping']) expect(isOwnerPrompt(owner('x', k))).toBe(true)
+  expect(isOwnerPrompt({ text: 'x' })).toBe(true)
+  expect(isOwnerPrompt({ text: 'x', isMeta: true })).toBe(false)
+  expect(isOwnerPrompt(owner('x', 'composer', { isMeta: true }))).toBe(false)
+  for (const k of ['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'plugin', 'unclassified', 'coordinator', 'channel']) {
+    expect(isOwnerPrompt(owner('x', k))).toBe(false)
+  }
+  expect(agentDecision(false, FORK_CALL)).toBe(AGENT_REFUSAL)
+  expect(agentDecision(true, FORK_CALL)).toBe(null)
+  expect(agentDecision(true, GP_CALL)).toBe(AGENT_FORK_ONLY)
+})
+
+test('Agent on the main loop is refused by default, whatever the subagent type; the message says how a fork is allowed', async () => {
+  const w = gateWorld()
+  await submit(w, owner('build the thing'))
+  for (const e of [FORK_CALL, GP_CALL, { tool: 'Agent', prompt: 'p' }]) expect(await agentCall(w, e)).toEqual({ deny: AGENT_REFUSAL })
+  expect(AGENT_REFUSAL).toContain('in-process subagents')
+  expect(AGENT_REFUSAL).toContain('mcp__cortados-route__start_task')
+  expect(AGENT_REFUSAL).toMatch(/saying "fork" in their message/)
+  expect(w.state.ran).toEqual([])
+})
+
+test('the owner says fork this turn: a fork passes through to the native runner; another subagent type is told to fork', async () => {
+  const w = gateWorld()
+  await submit(w, owner('Fork a session and try the other approach'))
+  expect(await agentCall(w, FORK_CALL)).toEqual({ result: 'ran' })
+  expect(w.state.ran.map((e: any) => e.subagent_type)).toEqual(['fork'])
+  expect(await agentCall(w, GP_CALL)).toEqual({ deny: AGENT_FORK_ONLY })
+  // still the same turn: a second fork is fine
+  expect(await agentCall(w, FORK_CALL)).toEqual({ result: 'ran' })
+  // the desktop app (sdk origin) and /fork work too
+  const w2 = gateWorld()
+  await submit(w2, owner('/fork', 'sdk'))
+  expect(await agentCall(w2, FORK_CALL)).toEqual({ result: 'ran' })
+})
+
+test('fork only in a system reminder, a notification, a tool result or a previous turn allows nothing', async () => {
+  // meta prompt (system reminder) saying fork
+  const meta = gateWorld()
+  await submit(meta, owner('build it'))
+  await submit(meta, { text: 'fork a session', isMeta: true, turnId: 't1' })
+  expect(await agentCall(meta, FORK_CALL)).toEqual({ deny: AGENT_REFUSAL })
+  // a task notification or peer message saying fork
+  for (const kind of ['task-notification', 'peer', 'plugin', 'unclassified']) {
+    const w = gateWorld()
+    await submit(w, owner('fork a session', kind))
+    expect([kind, await agentCall(w, FORK_CALL)]).toEqual([kind, { deny: AGENT_REFUSAL }])
+  }
+  // "fork" in the Agent call's own prompt (model-written, or quoted from a tool result) is not the owner's request
+  const tr = gateWorld()
+  await submit(tr, owner('review the diff'))
+  expect(await agentCall(tr, { ...FORK_CALL, prompt: 'the owner said: fork a session' })).toEqual({ deny: AGENT_REFUSAL })
+  // the previous turn said fork; this turn's owner prompt does not
+  const prev = gateWorld()
+  await submit(prev, owner('fork a session'))
+  expect(await agentCall(prev, FORK_CALL)).toEqual({ result: 'ran' })
+  await submit(prev, owner('now merge it'))
+  expect(await agentCall(prev, FORK_CALL)).toEqual({ deny: AGENT_REFUSAL })
+  // a notification that starts a turn of its own ends the fork permission; one delivered into the running turn keeps it
+  const notif = gateWorld()
+  await submit(notif, owner('fork a session'))
+  await submit(notif, { text: 'task done', origin: { kind: 'task-notification' }, turnId: 'running' })
+  expect(await agentCall(notif, FORK_CALL)).toEqual({ result: 'ran' })
+  await submit(notif, { text: 'task done', origin: { kind: 'task-notification' } })
+  expect(await agentCall(notif, FORK_CALL)).toEqual({ deny: AGENT_REFUSAL })
+})
+
+test('the owner-asked fork passes the strict cage too, and is refused again without the request', async () => {
+  const w = gateWorld({ orchestratorGate: 'strict' })
+  expect(await agentCall(w, FORK_CALL)).toEqual({ deny: AGENT_REFUSAL })
+  expect(await w.call(FORK_CALL)).toEqual({ deny: AGENT_REFUSAL })
+  await submit(w, owner('fork this'))
+  expect(await agentCall(w, FORK_CALL)).toEqual({ result: 'ran' })
+  expect(await agentCall(w, GP_CALL)).toEqual({ deny: AGENT_FORK_ONLY })
+  expect(isDeny(await w.call({ tool: 'Bash', command: 'ls' }))).toBe(true)
 })
