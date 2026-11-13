@@ -1686,7 +1686,9 @@ class Handler(BaseHTTPRequestHandler):
             logger.warning("web search lane failed (%s): %s", exc.kind, exc.detail[:200])
             if exc.kind == "start_failed" and reserved:
                 # The CLI never started, so nothing was spent: refund the reservation, once (#79). Every other failure
-                # ran the CLI (it may have spent quota) and keeps its reservation.
+                # ran the CLI (it may have spent quota) and keeps its reservation. Only an OSError from launching the
+                # CLI becomes start_failed (search_lane._run_cli); any other exception here is a lane bug, logged by
+                # the generic handler below, and its reservation is not refunded: it ages out as before.
                 self._refund_search_floor(reserved)
             reason = ("search busy" if exc.kind == "busy" else "no search was performed" if exc.kind == "no_search"
                       else f"the search lane failed: {exc.kind}")

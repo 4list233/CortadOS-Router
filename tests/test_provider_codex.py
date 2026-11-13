@@ -490,8 +490,25 @@ class CodexEndpointTests(unittest.TestCase):
                 self.assertNotIn(name, env)
         self.assertEqual((env["CODEX_HOME"], env["KEEP_ME"]), ("/abs/home", "1"))
         seen = json.loads(Path(self.argv_file).read_text())
-        self.assertEqual(seen["vendor_env"], ["CODEX_HOME"], "only the bridge's own CODEX_HOME reaches the child")
+        # an allowlisted variable the host itself sets (the Air's CODEX_CA_CERTIFICATE, #103) may reach it too
+        allowed_here = sorted({"CODEX_HOME"} | {k for k in codex_isolation.ALLOWED_ENV if k in os.environ})
+        self.assertEqual(seen["vendor_env"], allowed_here, "only the bridge's own CODEX_HOME reaches the child")
         self.assertEqual(seen["env"]["CODEX_HOME"], os.path.realpath(self.codex_home))
+
+    def test_codex_ca_certificate_reaches_the_child_and_secrets_do_not(self):
+        # #103: the provider sets CODEX_CA_CERTIFICATE to a PEM of the macOS system roots (Codex TLS failed with
+        # UnknownIssuer without it); the #84 prefix strip must keep it while still removing the CODEX_ secrets.
+        extra = {"CODEX_CA_CERTIFICATE": "/ca/macos-system-roots.pem", "CODEX_API_KEY": "sk-x",
+                 "CODEX_ACCESS_TOKEN": "tok"}
+        with mock.patch.dict(os.environ, extra):
+            env = codex_isolation.child_env("/abs/home")
+            self.post({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(env["CODEX_CA_CERTIFICATE"], "/ca/macos-system-roots.pem")
+        seen = json.loads(Path(self.argv_file).read_text())
+        self.assertEqual(seen["vendor_env"], ["CODEX_CA_CERTIFICATE", "CODEX_HOME"], "the real spawn keeps it too")
+        self.assertNotIn("CODEX_API_KEY", env)
+        self.assertNotIn("CODEX_ACCESS_TOKEN", env)
+        self.assertFalse(codex_isolation.stripped("CODEX_CA_CERTIFICATE"))
 
     def test_stripped_names_the_rule(self):
         for name in codex_isolation.STRIPPED_ENV + ("OPENAI_FOO", "CODEX_FOO", "ANTHROPIC_FOO", "CLAUDE_FOO"):

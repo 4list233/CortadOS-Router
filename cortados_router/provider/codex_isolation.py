@@ -36,9 +36,13 @@ STRIPPED_ENV_PREFIXES = (
     "ANTHROPIC_",   # the provider's own client env (base URL, auth token, custom headers): would leak this endpoint
     "CLAUDE_",      # Claude CLI logins and config dirs (CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CONFIG_DIR): not the child's
 )
-# Kept despite its prefix, because the bridge sets it on purpose: CODEX_HOME names the one home whose auth.json and
-# config.toml the child runs on (child_env sets it; codex_bridge resolves it). Add a variable here only with its reason.
-ALLOWED_ENV = frozenset({"CODEX_HOME"})
+# Kept despite their prefix. Add a variable here only with its reason:
+# - CODEX_HOME: the bridge sets it on purpose; it names the one home whose auth.json and config.toml the child runs on
+#   (child_env sets it; codex_bridge resolves it).
+# - CODEX_CA_CERTIFICATE: the path of the PEM bundle Codex trusts for TLS. The Air provider sets it to an export of the
+#   macOS system roots (#103, 2026-11-13) because without it Codex intermittently failed with `invalid peer
+#   certificate: UnknownIssuer`. It is a file path, not a secret, and it changes no login, billing or endpoint.
+ALLOWED_ENV = frozenset({"CODEX_HOME", "CODEX_CA_CERTIFICATE"})
 # `-c key=value` overrides (brief §B): no desktop notifications, no web search, no environment/project context in the
 # prompt (the client's system prompt is the whole prompt; project docs would read the scratch cwd anyway), and the
 # built-in openai provider, so a `model_provider` the home's config.toml sets (a mirror, another billing account)

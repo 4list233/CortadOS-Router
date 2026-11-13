@@ -615,6 +615,16 @@ class HttpTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, e.read()
 
+    def assert_refused_at_accept(self, port):
+        """The over-cap 503 is written at accept and the socket shut at once, so it is observed on a raw socket that
+        sends nothing: an HTTP client (urllib) would still be writing its request when the gateway shuts the socket and
+        under load gets a broken pipe instead of the 503 (4/10 runs with every core busy). Sending nothing also means
+        no unread bytes at close, so no reset can discard the 503 before recv reads it."""
+        import socket
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+            reply = s.recv(100)
+        self.assertTrue(reply.startswith(b"HTTP/1.1 503"), reply)
+
     def test_auth(self):
         msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
         self.assertEqual(self.post(msg, None)[0], 401)
@@ -695,12 +705,8 @@ class HttpTest(unittest.TestCase):
         t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
         try:
-            self.url = f"http://127.0.0.1:{srv.server_address[1]}/mcp"
-            self.assertEqual(self.post({"jsonrpc": "2.0", "id": 1, "method": "ping"})[0], 503)
             # refused at accept, before any header is parsed: a client that sends nothing still gets the 503.
-            import socket
-            with socket.create_connection(("127.0.0.1", srv.server_address[1]), timeout=5) as s:
-                self.assertTrue(s.recv(100).startswith(b"HTTP/1.1 503"))
+            self.assert_refused_at_accept(srv.server_address[1])
         finally:
             srv.shutdown()
             srv.server_close()
@@ -772,7 +778,7 @@ class HttpTest(unittest.TestCase):
                 t0 = time.monotonic()
                 threading.Thread(target=trickle, daemon=True).start()
                 time.sleep(0.2)
-                self.assertEqual(self.post(ping)[0], 503, "the trickler holds the only worker meanwhile")
+                self.assert_refused_at_accept(port)        # the trickler holds the only worker meanwhile
                 try:
                     reply = s.recv(100)
                 except ConnectionResetError:
