@@ -1064,16 +1064,49 @@ export function isBigEdit(content: string): boolean {
   return content.split('\n').length > GUARD_EDIT_MAX_LINES || content.length > GUARD_EDIT_MAX_CHARS
 }
 
-/** A build or test run: python -m unittest/pytest, pytest, make, npm/yarn/pnpm build or test. Checked per command
- * segment (split on ; & | ( ) and newlines) after leading VAR=value assignments, so `cd x && make` matches while
- * `grep make Makefile` or `echo pytest` does not. A heuristic on the command text, not a parse of the shell. */
+/** The command split into its top-level segments on ; & | ( ) and newlines OUTSIDE quotes, or null when the quoting
+ * cannot be followed (an unclosed ' or ", a trailing backslash). Single quotes are literal to the next '; inside double
+ * quotes a backslash escapes the next character; outside quotes it does too. So `ssh air "grep -E '(pytest|make)' x"`
+ * is one segment, not three. Not a shell parser: $( ) and backticks inside double quotes are left inside the segment. */
+export function shellSegments(command: string): string[] | null {
+  const s = String(command ?? '')
+  const out: string[] = []
+  let cur = ''
+  let q: "'" | '"' | null = null
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (q === "'") { cur += ch; if (ch === "'") q = null; continue }
+    if (ch === '\\') {
+      if (i + 1 >= s.length) return null
+      cur += ch + s[++i]
+      continue
+    }
+    if (q === '"') { cur += ch; if (ch === '"') q = null; continue }
+    if (ch === "'" || ch === '"') { q = ch; cur += ch; continue }
+    if (/[;&|()\n]/.test(ch)) { if (cur.trim()) out.push(cur); cur = ''; continue }
+    cur += ch
+  }
+  if (q) return null
+  if (cur.trim()) out.push(cur)
+  return out
+}
+
+/** A build or test run: python -m unittest/pytest, pytest, make, npm/yarn/pnpm build or test, `claude plugin test`.
+ * Checked per top-level command segment (shellSegments: split on unquoted ; & | ( ) and newlines) after leading
+ * VAR=value assignments, so `cd x && make` matches while `grep make Makefile`, `echo pytest` or a quoted pattern like
+ * `ssh air "grep -E '(pytest|make) failed' log"` does not. A heuristic on the command text, not a parse of the shell.
+ * When the quoting cannot be followed the answer is false (allow): this feeds a gate that must fail open and a guard
+ * that only warns, and a command we cannot read is better run than refused with a reason that may be wrong. */
 export function isBuildOrTest(command: string): boolean {
-  for (const raw of String(command ?? '').split(/[;&|()\n]+/)) {
+  const segs = shellSegments(command)
+  if (!segs) return false
+  for (const raw of segs) {
     const seg = raw.trim().replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '')
     if (/^python[0-9.]*\s+(?:-\S+\s+)*-m\s+(?:unittest|pytest)\b/.test(seg)) return true
     if (/^(?:pytest|py\.test)(?:\s|$)/.test(seg)) return true
     if (/^g?make(?:\s|$)/.test(seg)) return true
     if (/^(?:npm|yarn|pnpm)\s+(?:run\s+)?(?:build|test)\b/.test(seg)) return true
+    if (/^claude\s+plugin\s+test(?:\s|$)/.test(seg)) return true
   }
   return false
 }
@@ -1228,6 +1261,32 @@ export function resolveEditBudget(v: unknown): number {
   return Math.floor(n)
 }
 
+/** One shell word made of plain path characters, or one single-quoted word (shlex.quote's form; nothing expands). */
+const W_PLAIN = "[A-Za-z0-9_./~+@%:,-]"
+const W_PATH_TO = (tail: string) => `(?:'(?:[^']*/)?${tail}'|(?:${W_PLAIN}*/)?${tail})`
+/** child_tasks.watch_command's shape, optionally followed by `; echo "exit $?"` (how orchestrators note the exit
+ * code): [env] [CORTADOS_TASKS_DIR=… CORTADOS_EXEC_HOSTS_FILE=…] <any python3> [-B] <…/cortados_router/child_tasks.py>
+ * --watch <task id>… [--timeout|--interval|--stall <seconds>]…. Spaces and tabs only (no newline), no other command,
+ * pipe, redirect, substitution or variable: anything else is not the watcher and is classed as usual. */
+const W_TASK_ID = 't[0-9]{14}-[0-9a-f]{8}' // child_tasks.TASK_ID_RE
+const W_FLAG = '--(?:timeout|interval|stall)[ \\t]+[0-9]+(?:\\.[0-9]+)?'
+const TASK_WATCH_RE = new RegExp(
+  '^[ \\t]*(?:env[ \\t]+)?' +
+  `(?:CORTADOS_(?:TASKS_DIR|EXEC_HOSTS_FILE)=(?:'[^']*'|${W_PLAIN}+)[ \\t]+)*` +
+  W_PATH_TO('python3(?:\\.[0-9]+)?') + '(?:[ \\t]+-B)?[ \\t]+' +
+  W_PATH_TO('cortados_router/child_tasks\\.py') + '[ \\t]+--watch' +
+  `(?:[ \\t]+${W_FLAG})*[ \\t]+${W_TASK_ID}(?:[ \\t]+(?:${W_TASK_ID}|${W_FLAG}))*` +
+  '(?:[ \\t]*;[ \\t]*echo[ \\t]+(?:"exit \\$\\?"|exit[ \\t]+\\$\\?))?[ \\t]*$',
+)
+
+/** Whether a Bash command is exactly the task watcher start_task hands back (`watch_command`), which AGENTS.md has
+ * the orchestrator run in the background after every start_task: it only polls task_status, so it is the
+ * orchestrator's own plumbing, not delegatable work, and must pass the background/timeout check. Narrow on purpose
+ * (TASK_WATCH_RE): at least one task id of the t<14 digits>-<8 hex> shape, nothing chained but the exit echo. */
+export function isTaskWatchCommand(command: unknown): boolean {
+  return typeof command === 'string' && TASK_WATCH_RE.test(command)
+}
+
 export type GateClass = 'web' | 'notebook' | 'big-edit' | 'edit' | 'build' | 'long-bash' | null
 
 const EDIT_TOOLS: ReadonlySet<string> = new Set(['Edit', 'Write', 'MultiEdit'])
@@ -1240,6 +1299,7 @@ export function balancedClass(tool: string, e: any): GateClass {
   if (tool === 'NotebookEdit') return 'notebook'
   if (EDIT_TOOLS.has(tool)) return isBigEdit(newContentOf(tool, e)) ? 'big-edit' : 'edit'
   if (tool === 'Bash') {
+    if (isTaskWatchCommand(e?.command)) return null // the mandated background watcher: see isTaskWatchCommand
     if (isBuildOrTest(e?.command)) return 'build'
     const t = Number(e?.timeout)
     if (e?.run_in_background === true || (Number.isFinite(t) && t > GATE_BASH_MAX_TIMEOUT_MS)) return 'long-bash'
@@ -1330,9 +1390,28 @@ export function withGateOverride(map: Record<string, { level: GateLevel; at: num
 }
 
 /** Whether delegation can work right now: a cortados-route tool is in this session's tool pool, and the provider's
- * /health answers ok within GATE_HEALTH_TIMEOUT_MS. Never throws; the reason is one short line with no secret in it.
- * The token is not sent: /health is unauthenticated. */
+ * /health answers ok. ONE deadline, GATE_HEALTH_TIMEOUT_MS, covers the whole check (tool discovery, provider-URL
+ * resolution, which may run a process or read a file, and the health request): whichever step hangs, the tool call
+ * waits at most that long before the gate fails open, and the reason names the step. Never throws; the reason is one
+ * short line with no secret in it. The token is not sent: /health is unauthenticated. */
 export async function checkDelegation($: any, providerUrl: string): Promise<Availability> {
+  const step = { name: 'tool list' }
+  let timer: any
+  try {
+    const work = delegationSteps($, providerUrl, step)
+    work.catch(() => {})
+    const timeout = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), GATE_HEALTH_TIMEOUT_MS) })
+    const res = await Promise.race([work, timeout])
+    return res ?? { ok: false, reason: `${step.name} timed out` }
+  } catch {
+    return { ok: false, reason: 'provider unreachable' }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+/** checkDelegation's steps, without the deadline; `step.name` says which one is running when the deadline hits. */
+async function delegationSteps($: any, providerUrl: string, step: { name: string }): Promise<Availability> {
   try {
     const tools = await $.tool.list()
     const names = Array.isArray(tools) ? tools.map((t: any) => String(t?.name ?? '')) : []
@@ -1340,23 +1419,18 @@ export async function checkDelegation($: any, providerUrl: string): Promise<Avai
   } catch {
     return { ok: false, reason: 'tool list unreadable' }
   }
+  step.name = 'provider URL'
   let url: string
   try { url = await resolveProviderUrl($, providerUrl) } catch { return { ok: false, reason: 'no provider URL' } }
-  let timer: any
+  step.name = 'provider health'
   try {
-    const req = Promise.resolve($.http.fetch(url + '/health', { method: 'GET' }))
-    req.catch(() => {})
-    const timeout = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), GATE_HEALTH_TIMEOUT_MS) })
-    const res: any = await Promise.race([req, timeout])
-    if (!res) return { ok: false, reason: 'provider health timed out' }
-    if (!res.ok) return { ok: false, reason: `provider health HTTP ${Number(res.status) || 'error'}` }
+    const res: any = await $.http.fetch(url + '/health', { method: 'GET' })
+    if (!res?.ok) return { ok: false, reason: `provider health HTTP ${Number(res?.status) || 'error'}` }
     try { if (JSON.parse(String(res.text)).ok !== true) return { ok: false, reason: 'provider health not ok' } }
     catch { return { ok: false, reason: 'provider health unreadable' } }
     return { ok: true }
   } catch {
     return { ok: false, reason: 'provider unreachable' }
-  } finally {
-    if (timer !== undefined) clearTimeout(timer)
   }
 }
 

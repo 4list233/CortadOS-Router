@@ -115,8 +115,9 @@ how to switch the gate off:
 | `NotebookEdit` | **deny** | Implementation work. |
 | `Edit` / `Write` / `MultiEdit`, big (over 40 lines or 2000 chars of new content, the guard's thresholds) | **deny** at once | Implementation work. |
 | `Edit` / `Write` / `MultiEdit`, small | allow the first `orchestratorEditBudget` (2) per user turn, **deny** after | One or two touches is a trivial fix; a third in one turn is a stretch of implementation. A new user prompt resets the count. |
-| `Bash` build/test run (`python -m unittest/pytest`, `pytest`, `make`, `npm/yarn/pnpm build/test`, as the guard detects them) | **deny** | Builds and test runs belong to the child that made the change. |
+| `Bash` build/test run (`python -m unittest/pytest`, `pytest`, `make`, `npm/yarn/pnpm build/test`, `claude plugin test`, as the guard detects them) | **deny** | Builds and test runs belong to the child that made the change. |
 | `Bash` with `run_in_background`, or `timeout` over 120 s | **deny** | Long-running work. 120 s is the Bash tool's own default timeout: inspection never needs more. |
+| `Bash` that is exactly start_task's `watch_command` (`[env CORTADOS_TASKS_DIR=… CORTADOS_EXEC_HOSTS_FILE=…] <python3> [-B] …/cortados_router/child_tasks.py --watch <task id>… [--timeout\|--interval\|--stall N]…`, optionally `; echo "exit $?"`) | allow, background and long timeout included | The orchestrator must run it in the background after every start_task. Anything else chained, piped, redirected or substituted makes it ordinary Bash again. |
 | other `Bash` (`git status/log/diff`, `ls`, `cat`, `curl …/health`, `ssh host one-liner`) | allow | Inspection. |
 | `Read`, `Grep`, `Glob`, `ToolSearch`, `Skill`, `AskUserQuestion`, `TodoWrite`, `ExitPlanMode`, `Monitor` | allow | Reading and the session's own bookkeeping. |
 | `mcp__cortados-route__*` | allow | Delegation itself. |
@@ -126,7 +127,8 @@ how to switch the gate off:
 
 **Fail open.** Before refusing, the gate checks that delegation can work: a `mcp__cortados-route__*` tool is in the
 session's tool pool and the provider's `GET /health` (the mod's `providerUrl` / `CORTADOS_PROVIDER_URL` / URL file; no
-token is sent) answers `{"ok": true}` within 2 s. The answer is cached for 60 s, so a burst of refusals costs one
+token is sent) answers `{"ok": true}`, the whole check (tool discovery, URL resolution and the health request) within
+one 2 s deadline. The answer is cached for 60 s, so a burst of refusals costs one
 request. If either fails, the call **runs**, a toast says `CortadOS router unreachable (<reason>): gate off …` once per
 outage, and the status line reads `gate balanced; router unreachable: gate off (<reason>)` until the router is back.
 The allow path (reading, inspection, connectors) never makes that check. A bug in the gate itself also fails open (and
@@ -164,9 +166,11 @@ A call is substantive when:
   lines or more than 2000 characters**. 40 lines is about one function or a screenful, so the directive's "trivial
   touch" (a one-line fix, a config tweak) stays far under it; 2000 characters catches long-but-few-lines content
   (minified JSON, prose) the line count would miss; or
-- a `Bash` command, in any `;`/`&&`/`|` segment and after leading `VAR=value` assignments, starts like a build or test
-  run: `python -m unittest` / `python -m pytest`, `pytest`, `make`, `npm`/`yarn`/`pnpm` `build` or `test` (with or
-  without `run`). A text heuristic, not a shell parse: `grep make Makefile` or `echo pytest` do not count.
+- a `Bash` command, in any `;`/`&&`/`|` segment outside quotes and after leading `VAR=value` assignments, starts like a
+  build or test run: `python -m unittest` / `python -m pytest`, `pytest`, `make`, `npm`/`yarn`/`pnpm` `build` or `test`
+  (with or without `run`), `claude plugin test`. A text heuristic, not a shell parse: `grep make Makefile`, `echo pytest`
+  or `ssh air "grep -E '(pytest|make) failed' log"` do not count, and a command whose quotes do not close is not counted
+  (the gate fails open on doubt).
 
 Each substantive call bumps a session counter shown on the mod's status line (`main did 3 big edits, 1 build/test
 run; delegate with start_task`) and shows a toast at most **once per 10 minutes** (one nudge per stretch of work;

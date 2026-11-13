@@ -2,7 +2,8 @@ import { test, expect, mock } from 'claude-code/testing'
 import {
   register, balancedClass, parseGateLevel, configGateLevel, resolveEditBudget, gateStatusText, gateDenyMessage,
   parseGateMap, withGateOverride, AGENT_REFUSAL, GATE_COMMAND, GATE_STORE_KEY, GATE_STORE_MAX_SESSIONS,
-  GATE_HEALTH_TTL_MS, GATE_BASH_MAX_TIMEOUT_MS, GATE_EDIT_BUDGET_DEFAULT,
+  GATE_HEALTH_TTL_MS, GATE_BASH_MAX_TIMEOUT_MS, GATE_EDIT_BUDGET_DEFAULT, GATE_HEALTH_TIMEOUT_MS,
+  isTaskWatchCommand, isBuildOrTest, shellSegments, checkDelegation,
 } from './register'
 
 // The orchestrator gate (balanced by default, owner 2026-11-12). Most tests drive the mod's own handlers with a fake
@@ -233,6 +234,127 @@ test('fail open on an unreadable tool list or no provider URL', async () => {
   const b = gateWorld({ providerUrl: 'not a url' })
   expect(await b.call({ tool: 'WebSearch' })).toEqual({ result: 'ran' })
   expect(b.state.statuses.at(-1)).toMatch(/no provider URL/)
+})
+
+test('one deadline covers the whole availability check: a hanging tool discovery fails open', async () => {
+  const w = gateWorld()
+  w.$.tool.list = () => new Promise(() => {})
+  const r = await w.call({ tool: 'WebSearch', query: 'q' })
+  expect(r).toEqual({ result: 'ran' })
+  expect(w.state.statuses.at(-1)).toMatch(/tool list timed out/)
+  expect(w.state.fetches).toEqual([])
+})
+
+test('one deadline covers the whole availability check: a hanging provider-URL resolution fails open', async () => {
+  const w = gateWorld({ providerUrl: '' }) // no configured URL: resolution runs a process to read the environment
+  w.$.process.run = () => new Promise(() => {})
+  const r = await w.call({ tool: 'WebSearch', query: 'q' })
+  expect(r).toEqual({ result: 'ran' })
+  expect(w.state.statuses.at(-1)).toMatch(/provider URL timed out/)
+  expect(w.state.fetches).toEqual([])
+})
+
+test('the deadline is shared, not per step: slow discovery plus slow health still ends within one timeout', async () => {
+  const w = gateWorld()
+  const half = GATE_HEALTH_TIMEOUT_MS * 0.75
+  w.$.tool.list = () => new Promise((res) => setTimeout(() => res(ROUTE_TOOLS.map((name) => ({ name }))), half))
+  w.$.http.fetch = () => new Promise((res) => setTimeout(() => res({ ok: true, status: 200, text: '{"ok":true}' }), half))
+  const t0 = Date.now()
+  const r = await checkDelegation(w.$, 'http://provider.test:8432')
+  expect(r).toEqual({ ok: false, reason: 'provider health timed out' })
+  expect(Date.now() - t0).toBeLessThan(GATE_HEALTH_TIMEOUT_MS + 500)
+})
+
+// ---- The task watcher start_task hands back (watch_command) runs in the background ------------------------------
+
+const TID = 't20261112234010-189eafa9'
+const XCODE_PY = '/Applications/Xcode.app/Contents/Developer/usr/bin/python3'
+const SCRIPT = '/Users/5425855/Ai/CortadOS-Router/cortados_router/child_tasks.py'
+const WATCHERS = [
+  `${XCODE_PY} -B ${SCRIPT} --watch ${TID}`,
+  `${XCODE_PY} -B ${SCRIPT} --watch ${TID}; echo "exit $?"`,
+  `${XCODE_PY} -B ${SCRIPT} --watch ${TID} t20261112234313-fcb66672 --timeout 7000 --interval 15 --stall 1800 ; echo "exit $?"`,
+  `python3 ${SCRIPT} --watch --timeout 600 ${TID}`,
+  `python3.12 -B cortados_router/child_tasks.py --watch ${TID}`,
+  `env CORTADOS_TASKS_DIR='/Users/x/My Tasks' CORTADOS_EXEC_HOSTS_FILE=/Users/x/hosts.json '/opt/my py/bin/python3' -B ${SCRIPT} --watch ${TID}`,
+]
+const NOT_WATCHERS = [
+  `${XCODE_PY} -B ${SCRIPT} --watch ${TID} && make`,
+  `${XCODE_PY} -B ${SCRIPT} --watch ${TID}; make test`,
+  `${XCODE_PY} -B ${SCRIPT} --watch ${TID} | tee /tmp/x`,
+  `${XCODE_PY} -B ${SCRIPT} --watch ${TID} > /tmp/out`,
+  `${XCODE_PY} -B ${SCRIPT} --watch ${TID}; echo "exit $?"; rm -rf /`,
+  `${XCODE_PY} -B ${SCRIPT} --watch ${TID}\nmake`,
+  `${XCODE_PY} -B ${SCRIPT} --watch ${TID} & sleep 999`,
+  `${XCODE_PY} -B ${SCRIPT} --watch $(make)`,
+  `${XCODE_PY} -B ${SCRIPT} --watch`,
+  `${XCODE_PY} -B ${SCRIPT} --watch --timeout 5`,
+  `${XCODE_PY} -B ${SCRIPT} --watch not-a-task-id`,
+  `${XCODE_PY} -B ${SCRIPT} --watch ${TID} --timeout abc`,
+  `${XCODE_PY} -B ${SCRIPT} --cleanup-archive`,
+  `${XCODE_PY} -B ${SCRIPT} --watch ${TID} --run x`,
+  `${XCODE_PY} -B /tmp/evil.py --watch ${TID}`,
+  `bash -c "python3 ${SCRIPT} --watch ${TID}"`,
+  `make; python3 ${SCRIPT} --watch ${TID}`,
+  `X=$(make) python3 ${SCRIPT} --watch ${TID}`,
+]
+
+test('the task watcher (watch_command, with or without the exit echo) runs in the background and with a long timeout', async () => {
+  for (const command of WATCHERS) {
+    expect([command, isTaskWatchCommand(command)]).toEqual([command, true])
+    for (const extra of [{ run_in_background: true }, { timeout: 600_000 }, { run_in_background: true, timeout: 600_000 }, {}]) {
+      const w = gateWorld()
+      const r: any = await w.call({ tool: 'Bash', command, ...extra })
+      expect([command, extra, r]).toEqual([command, extra, { result: 'ran' }])
+    }
+  }
+})
+
+test('anything chained to, piped from or substituted into the watcher is not exempt and is refused in the background', async () => {
+  for (const command of NOT_WATCHERS) {
+    expect([command, isTaskWatchCommand(command)]).toEqual([command, false])
+    const w = gateWorld()
+    const r: any = await w.call({ tool: 'Bash', command, run_in_background: true })
+    expect([command, isDeny(r)]).toEqual([command, true])
+  }
+  // `&& make` in the foreground is still a build run
+  const w = gateWorld()
+  expect(isDeny(await w.call({ tool: 'Bash', command: `python3 ${SCRIPT} --watch ${TID} && make` }))).toBe(true)
+})
+
+// ---- Build/test detection follows quotes ---------------------------------------------------------------------------
+
+test('a quoted pattern naming pytest or make is inspection, not a build run', async () => {
+  const cmd = `ssh air "grep -E '(pytest|make) failed' /tmp/job.log"`
+  expect(shellSegments(cmd)).toEqual([cmd])
+  expect(isBuildOrTest(cmd)).toBe(false)
+  expect(isBuildOrTest(`grep -E 'a|make' x; echo "b; pytest"`)).toBe(false)
+  expect(isBuildOrTest(`echo "it's (make)" && ls`)).toBe(false)
+  const w = gateWorld()
+  expect(await w.call({ tool: 'Bash', command: cmd })).toEqual({ result: 'ran' })
+})
+
+test('claude plugin test is a test run; claude plugin validate is not', async () => {
+  for (const c of [
+    'claude plugin test integrations/claude-mod/cortados-routed-subagents',
+    'cd /tmp/x && CORTADOS_HOME=/tmp/h CORTADOS_SCARCITY_REFRESH=off claude plugin test .',
+    'claude plugin test',
+  ]) {
+    expect([c, isBuildOrTest(c)]).toEqual([c, true])
+    const w = gateWorld()
+    expect([c, isDeny(await w.call({ tool: 'Bash', command: c }))]).toEqual([c, true])
+  }
+  expect(isBuildOrTest('claude plugin validate .')).toBe(false)
+  expect(isBuildOrTest('echo "claude plugin test"')).toBe(false)
+})
+
+test('unparseable quoting fails open (allowed), as the gate does on any doubt', async () => {
+  for (const c of [`make "unterminated`, `pytest 'open`, 'make \\']) {
+    expect([c, shellSegments(c), isBuildOrTest(c)]).toEqual([c, null, false])
+  }
+  // Quoting that parses still splits on the real separators
+  expect(shellSegments(`a 'x;y' ; b "p|q" && c\\;d`)).toEqual([`a 'x;y' `, ` b "p|q" `, ` c\\;d`])
+  expect(isBuildOrTest(`echo 'done' && make`)).toBe(true)
 })
 
 // ---- Who is never gated -------------------------------------------------------------------------------------------
