@@ -536,10 +536,17 @@ def _ledger_turn(session: Any, usage: dict | None) -> None:
 _ledger_hook_warned: set[str] = set()
 
 
-def _floor_search(core, cand: dict, min_left_pct: float) -> str | None:
-    """One search under the client's floor: a whole run, charged once (no conversation id), on its executing account."""
+def _floor_search(core, cand: dict, min_left_pct: float, rid: str | None = None) -> str | None:
+    """One search under the client's floor: a whole run, charged once (no conversation id), on its executing account.
+    `rid` stamps the reservation so _floor_release can take it back if the CLI never starts (#79)."""
     from cortados_router.provider import floor
-    return floor.reserve(core, cand, search_lane.SEARCH_MODEL, min_left_pct)
+    return floor.reserve(core, cand, search_lane.SEARCH_MODEL, min_left_pct, rid=rid)
+
+
+def _floor_release(core, rid: str) -> bool:
+    """Refund the search reservation `rid` (floor.release): only for a search whose CLI failed to start."""
+    from cortados_router.provider import floor
+    return floor.release(core, rid)
 
 
 def _log_ledger_hook_failure(exc: BaseException) -> None:
@@ -666,7 +673,11 @@ class Registry:
         self.floor_turn: Callable[[dict | None, float], str | None] | None = None
         # floor_search(candidate, min_left_pct) -> refusal or None: checks and reserves the search lane's executing
         # account under the floor before a search launches (floor.reserve). None: a floor on a search fails closed.
-        self.floor_search: Callable[[dict, float], str | None] | None = None
+        # The reservation is stamped with the rid passed in, so floor_release(rid) can refund it (#79).
+        self.floor_search: Callable[[dict, float, str], str | None] | None = None
+        # floor_release(rid) -> bool: refunds a floor_search reservation whose search CLI failed to start (a reservation
+        # only counts once the run started). None: nothing to refund with; the row ages out as before, logged.
+        self.floor_release: Callable[[str], bool] | None = None
         self._factories = SESSION_FACTORIES if session_factories is None else session_factories
         self._lock = threading.Lock()
         # Orders a conversation's backend-exit Office transition against its requests' turn-end writes, so the exit's
@@ -1640,11 +1651,13 @@ class Handler(BaseHTTPRequestHandler):
                                           "this request cannot be searched under that exclusion")
         if refused:
             return self._error(400, "invalid_request_error", refused, wire)
+        reserved: str | None = None                     # the floor reservation's id while it may still need a refund
         try:
             # Query checks and a search slot come first, then the quota floor's reservation: a refused search (no
             # query, too long, all slots busy) must never leave a reservation. The slot is held through the launch.
             query = search_lane.extract_query(body)
             search_lane.check_query(query)
+            allowed, blocked = search_lane.domain_filters(body)   # parsed before reserving: nothing between it and launch
             with search_lane.capacity():
                 who = search_lane.login()               # the login and its ledger lane, resolved together before launch
                 if floor is not None:
@@ -1655,8 +1668,9 @@ class Handler(BaseHTTPRequestHandler):
                         return self._error(429, "rate_limit_error", "cortados: this endpoint cannot check "
                                            "x-cortados-min-left-pct for the search lane", wire,
                                            reason="the client's quota floor cannot be checked here")
+                    rid = uuid.uuid4().hex
                     try:
-                        why = reg.floor_search(who.floor_candidate(), floor)
+                        why = reg.floor_search(who.floor_candidate(), floor, rid)
                     except Exception as exc:
                         logger.exception("search lane: quota floor check failed")
                         return self._error(429, "rate_limit_error", "cortados: the search lane's quota floor check failed "
@@ -1665,11 +1679,15 @@ class Handler(BaseHTTPRequestHandler):
                     if why:
                         return self._error(429, "rate_limit_error", f"cortados: {why}", wire,
                                            reason="the search account is below the client's quota floor")
-                allowed, blocked = search_lane.domain_filters(body)
+                    reserved = rid
                 result = search_lane.run(getattr(reg, "search_bin", None) or reg.claude_bin,
                                          query, who.config_dir, allowed=allowed, blocked=blocked, slot_held=True)
         except search_lane.SearchFailed as exc:
             logger.warning("web search lane failed (%s): %s", exc.kind, exc.detail[:200])
+            if exc.kind == "start_failed" and reserved:
+                # The CLI never started, so nothing was spent: refund the reservation, once (#79). Every other failure
+                # ran the CLI (it may have spent quota) and keeps its reservation.
+                self._refund_search_floor(reserved)
             reason = ("search busy" if exc.kind == "busy" else "no search was performed" if exc.kind == "no_search"
                       else f"the search lane failed: {exc.kind}")
             return self._server_tools_unavailable(turn, names, wire, reason=reason)
@@ -1692,6 +1710,19 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             _log_ledger_hook_failure(exc)               # the ledger never breaks a reply (as _ledger_turn's caller)
         return self._reply_text(turn, result.text, result.usage, wire)
+
+    def _refund_search_floor(self, rid: str) -> None:
+        """Release one search reservation through reg.floor_release. Never raises: a refund that cannot be made leaves
+        the row to age out (the behaviour before #79), and that is logged, not hidden."""
+        release = self.server.registry.floor_release
+        if release is None:
+            logger.warning("search lane: start failed but no floor_release is wired; reservation %s ages out", rid)
+            return
+        try:
+            if not release(rid):
+                logger.warning("search lane: floor reservation %s was not found to refund", rid)
+        except Exception:
+            logger.exception("search lane: refunding floor reservation %s failed; it ages out", rid)
 
     def _server_tools_unavailable(self, turn, names: list[str], wire: Wire, reason: str = "") -> None:
         """A complete, ordinary assistant reply whose text tells the model the server tools did not run. A reply,
@@ -2399,7 +2430,8 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
                         log_outcome=log_turn_outcome)
     if not fixed_model:
         registry.floor_turn = lambda route, floor: routing.floor_turn(core, route, floor, codex_home)
-        registry.floor_search = lambda cand, floor: _floor_search(core, cand, floor)
+        registry.floor_search = lambda cand, floor, rid: _floor_search(core, cand, floor, rid)
+        registry.floor_release = lambda rid: _floor_release(core, rid)
     httpd = ProviderServer((host, port), registry)
 
     def reaper():
