@@ -360,7 +360,29 @@ def _cut(text: str) -> str:
     return text[:REBUILD_BLOCK_CHARS] + f"\n[cut at {REBUILD_BLOCK_CHARS} of {len(text)} characters]"
 
 
-_IMAGE_NOT_CARRIED = "[image result: not carried in the replayed history]"
+# An image the history names but whose data is not in the request (no base64 data, no URL): there is nothing to replay.
+_IMAGE_NOT_CARRIED = "[image: no image data in the client's history, not carried]"
+
+
+def _image_of(c: Any) -> dict[str, Any] | None:
+    """An image (an Anthropic image block, or MCP image content from a tool result) as the Anthropic image block both
+    backends take inside user content (the Claude CLI's stream-json input; codex_bridge._turn_input), or None when it
+    carries no image data. A url source is kept as one: the Claude CLI reads it, and Codex shows it as its JSON text,
+    exactly as for an image in the request's own new turn."""
+    if not isinstance(c, dict) or c.get("type") != "image":
+        return None
+    src = c.get("source")
+    if isinstance(src, dict):
+        if src.get("type") == "base64" and src.get("data"):
+            return {"type": "image", "source": {"type": "base64", "media_type": src.get("media_type") or "image/png",
+                                                "data": src["data"]}}
+        if src.get("type") == "url" and src.get("url"):
+            return {"type": "image", "source": {"type": "url", "url": src["url"]}}
+        return None
+    if c.get("data"):                                   # MCP content: {"type": "image", "data", "mimeType"}
+        return {"type": "image", "source": {"type": "base64", "media_type": c.get("mimeType") or "image/png",
+                                            "data": c["data"]}}
+    return None
 
 
 def _result_text(content: Any, image_note: str = _IMAGE_NOT_CARRIED) -> str:
@@ -380,20 +402,74 @@ def _result_text(content: Any, image_note: str = _IMAGE_NOT_CARRIED) -> str:
     return "\n".join(parts)
 
 
-def _replay_block(b: dict[str, Any]) -> str | None:
+# The replayed history is a list of PARTS (str, or an image block), joined by newlines and then coalesced into content
+# blocks (_coalesce): text stays one text block wherever no image interrupts it, and every historical image stays in
+# place, right after a label that numbers it and says whose it is (a user message, or the tool result of a named
+# call), so the model can tell which turn or result it belongs to (#43 review P2-6: images used to become
+# placeholders, against the stated design "images kept").
+def _image_parts(c: Any, n: list, owner: str) -> list:
+    img = _image_of(c)
+    if img is None:
+        return [_IMAGE_NOT_CARRIED]
+    n[0] += 1
+    return [f"[image {n[0]}: {owner}, follows]", img]
+
+
+def _result_parts(content: Any, call_id: Any, n: list) -> list:
+    """A historical tool result's content: its text (consecutive text items joined, then cut as one) with its images
+    in place between them."""
+    if isinstance(content, str):
+        return [_cut(content)]
+    out, texts = [], []
+    for c in content if isinstance(content, list) else []:
+        if not isinstance(c, dict):
+            continue
+        if c.get("type") == "image":
+            if texts:
+                out.append(_cut("\n".join(texts)))
+                texts = []
+            out += _image_parts(c, n, f"from the tool result for call {call_id}")
+        elif c.get("type") == "text":
+            texts.append(str(c.get("text", "")))
+        else:
+            texts.append(json.dumps(c, default=str))
+    if texts:
+        out.append(_cut("\n".join(texts)))
+    return out
+
+
+def _replay_block(b: dict[str, Any], n: list, role: str) -> list | None:
     kind = b.get("type")
     if kind == "text":
-        return _cut(str(b.get("text", "")))
+        return [_cut(str(b.get("text", "")))]
     if kind == "tool_use":
-        return _cut(f"[tool call {b.get('id')}: {b.get('name')}] {json.dumps(b.get('input') or {}, default=str)}")
+        return [_cut(f"[tool call {b.get('id')}: {b.get('name')}] {json.dumps(b.get('input') or {}, default=str)}")]
     if kind == "tool_result":
         err = ", error" if b.get("is_error") else ""
-        return f"[tool result for call {b.get('tool_use_id')}{err}]\n" + _cut(_result_text(b.get("content")))
+        return [f"[tool result for call {b.get('tool_use_id')}{err}]"] + _result_parts(b.get("content"),
+                                                                                        b.get("tool_use_id"), n)
     if kind == "image":
-        return "[image: not carried in the replayed history]"
+        return _image_parts(b, n, f"in this {role} message")
     if kind in ("thinking", "redacted_thinking"):
         return None                                 # the model's private reasoning: never part of the transcript
-    return _cut(json.dumps(b, default=str))
+    return [_cut(json.dumps(b, default=str))]
+
+
+def _coalesce(parts: list) -> list[dict[str, Any]]:
+    """Parts (str, a text block, or an image block) as content blocks: adjacent text becomes one text block, images
+    stay blocks."""
+    out: list[dict[str, Any]] = []
+    for p in parts:
+        if isinstance(p, dict) and p.get("type") == "text":
+            p = str(p.get("text", ""))
+        if isinstance(p, str):
+            if out and out[-1].get("type") == "text":
+                out[-1] = {"type": "text", "text": out[-1]["text"] + p}
+            elif p:
+                out.append({"type": "text", "text": p})
+        else:
+            out.append(p)
+    return out
 
 
 def history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -404,27 +480,35 @@ def history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [m for m in messages[:start] if isinstance(m, dict)]
 
 
-def rebuild_transcript(messages: list[dict[str, Any]]) -> str:
-    """Anthropic-shaped history messages as one labelled transcript (see REBUILD_NOTE). Content that _blocks refuses
-    in an earlier message is shown as its JSON, never a 400: the endpoint already accepted it once."""
-    out = []
+def rebuild_transcript(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Anthropic-shaped history messages as one labelled transcript (see REBUILD_NOTE), as content blocks: text, with
+    each historical image kept in place as an image block (see _image_parts). Content that _blocks refuses in an
+    earlier message is shown as its JSON, never a 400: the endpoint already accepted it once."""
+    parts: list = []
+    n = [0]                                         # images numbered across the whole transcript
     for m in messages:
         role = {"assistant": "assistant", "user": "user", "system": "operator"}.get(m.get("role"), str(m.get("role")))
         try:
             blocks = _blocks(m.get("content"))
         except WireError:
             blocks = [{"type": "_raw", "content": m.get("content")}]
-        parts = [p for p in (_replay_block(b) for b in blocks) if p]
-        if parts:
-            out.append(f"<{role}>\n" + "\n".join(parts) + f"\n</{role}>")
-    return "\n\n".join(out)
+        body = [p for b in blocks for p in (_replay_block(b, n, role) or [])]
+        if body:
+            if parts:
+                parts.append("\n\n")
+            parts.append(f"<{role}>\n")
+            for i, p in enumerate(body):
+                parts += (["\n"] if i else []) + [p]
+            parts.append(f"\n</{role}>")
+    return _coalesce(parts)
 
 
-def rebuild_content(transcript: str, turn: ClientTurn) -> list[dict[str, Any]]:
-    """The first user message of a rebuilt backend: REBUILD_NOTE, the history transcript, then the request's new turn
-    (its tool results as text by call id, images kept as image blocks, then its user content)."""
-    out: list[dict[str, Any]] = [{"type": "text", "text": f"{REBUILD_NOTE}\n\n<conversation-history>\n{transcript}\n"
-                                                          "</conversation-history>\n\nThe client's new turn follows."}]
+def rebuild_content(transcript: list[dict[str, Any]], turn: ClientTurn) -> list[dict[str, Any]]:
+    """The first user message of a rebuilt backend: REBUILD_NOTE, the history transcript (rebuild_transcript's blocks,
+    images in place), then the request's new turn (its tool results as text by call id, images kept as image blocks,
+    then its user content)."""
+    out = _coalesce([f"{REBUILD_NOTE}\n\n<conversation-history>\n", *transcript,
+                     "\n</conversation-history>\n\nThe client's new turn follows."])
     for call_id, result in turn.tool_results.items():
         err = ", error" if result.get("isError") else ""
         out.append({"type": "text", "text": f"[tool result for call {call_id}{err}]\n"

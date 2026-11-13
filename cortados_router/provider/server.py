@@ -4,10 +4,11 @@ Owner of the conversation registry: which bridge session a request belongs to. A
 starts a new session; any other goes to the one live session whose replies are exactly its assistant history. A
 request whose client compacted or edited that history is served on a REBUILT backend (Registry.rebuild, issue #43:
 a fresh session on the same route, seeded with the client's current history as a transcript). It fails with 409 only
-when no rebuild is possible (no live conversation of the same client wrote its last reply, more than one did, no
-conversation identity, or REBUILD_MAX reached; the message says which), or with a terminal 400 naming the failure's
-category when the request belongs to a conversation closed because its backend failed (a bounded, time-limited
-tombstone keyed by the conversation itself; both wires share the lookup).
+when no rebuild is possible (no live conversation of the same client wrote its last reply, more than one did, or no
+conversation identity; the message says which), and with a terminal 400 when a retry cannot help: the conversation
+reached REBUILD_MAX, its replayed history does not fit its model, or it was closed because its backend failed (a
+bounded, time-limited tombstone keyed by the conversation itself; both wires share the lookup). An exact match is
+looked up only among the request's own scope (wire, client, conversation identity): two clients never share one.
 A request without tools always gets its own throwaway CLI.
 
 Run:  python3 -B -m cortados_router.provider.server [--port 8432]
@@ -80,7 +81,10 @@ TOMBSTONE_MAX = 256
 # Rebuilds per conversation (Registry.rebuild): each one replays the client's whole history, uncached, into a fresh
 # backend, so a client whose history diverges on every request (a client bug, two clients fighting over one identity)
 # must not pay that on every turn. 5 covers several client compactions in one long run (the 409 bursts of #43 were in
-# 70-80 minute builder runs) and is counted along the conversation's lineage: a rebuilt session inherits the count.
+# 70-80 minute builder runs) and is counted along the conversation's lineage: every session rebuilt from it, by
+# compaction or by a branch, shares ONE budget (RebuildBudget), so branching cannot reset it. Reaching it is terminal
+# (TERMINAL_STATUS, never the retried 409): a retry carries the same rewritten history and would be refused again.
+# 0 switches rebuilding off (the pre-#43 409 for every rewritten history).
 REBUILD_MAX = 5
 # Recently closed conversations kept for the 409 diagnostic (Registry.closed): enough to cover the live conversations
 # of a busy endpoint, and an hour, past which a reap no longer explains a 409.
@@ -718,23 +722,29 @@ class Registry:
         return None
 
     def new(self, turn: anthropic_wire.ClientTurn, *, keep: bool, route: dict | None = None,
-            scope: str | None = None, wire_path: str | None = None, admitted: bool = False):
+            scope: str | None = None, wire_path: str | None = None, admitted: bool = False,
+            client: str | None = None):
         if keep and not admitted:
             self.reserve_opening()
         try:
-            s = self._new(turn, keep=keep, route=route, scope=scope, wire_path=wire_path)
+            s = self._new(turn, keep=keep, route=route, scope=scope, wire_path=wire_path, client=client)
         except BaseException:
             if keep:
                 self.release_opening()
             raise
         if keep:
-            # Convert the admission reservation into a live session in one critical section.
-            with self._lock:
-                self.sessions[s.id] = s
-                self._opening -= 1
-            if hasattr(s, "set_exit_handler"):
-                s.set_exit_handler(self._backend_exited)
+            self._publish(s)
         return s
+
+    def _publish(self, s) -> None:
+        """Make a fully initialised session findable: convert its admission reservation into a live session in one
+        critical section. Everything find() and a turn read (history, rebuild_seed, the rebuild budget) must be set
+        before this call: from here on any request can find it and take its turn lock."""
+        with self._lock:
+            self.sessions[s.id] = s
+            self._opening -= 1
+        if hasattr(s, "set_exit_handler"):
+            s.set_exit_handler(self._backend_exited)
 
     def _backend_exited(self, s) -> None:
         """The backend process died on its own (e.g. the shim killed its CLI on a tool deadline): remove the
@@ -789,7 +799,7 @@ class Registry:
         return route
 
     def _new(self, turn: anthropic_wire.ClientTurn, *, keep: bool, route: dict | None,
-             scope: str | None, wire_path: str | None):
+             scope: str | None, wire_path: str | None, client: str | None = None):
         provider = route["provider"] if route else "claude-cli"
         factory = self._factories.get(provider) or self._factories.get(_base_provider(provider))
         if factory is None and route and route.get("local") and provider.startswith(local_lane.LANE_PREFIX):
@@ -818,6 +828,8 @@ class Registry:
         s.route, s.route_logged, s.system = route, False, turn.system
         s.scope = scope                             # conversation_scope of the request that opened it (failure())
         s.wire_path = wire_path                     # the wire it was opened on (/v1/messages, /v1/responses): _replays
+        s.client = client                           # the opener's User-Agent name: find's scope without an identity
+        s.rebuild_budget = RebuildBudget()          # its lineage's rebuilds (REBUILD_MAX), shared on rebuild
         s.tool_names, s.tools_warned = {t["name"] for t in turn.tools}, False   # what the backend was started with
         s.awaiting_tool_result = False
         s.opened_at = time.time()                   # the live view's elapsed (live_conversations)
@@ -846,7 +858,7 @@ class Registry:
         return anthropic_wire.history_digest(wire_path, client, identity) if identity else None
 
     def find(self, turn: anthropic_wire.ClientTurn, failure_key: str | None = None, scope: str | None = None,
-             wire_path: str | None = None):
+             wire_path: str | None = None, client: str | None = None):
         """The live session whose replies are exactly this request's assistant history; None for a new conversation.
         No match, or more than one, is a LostSession: never continue a conversation on a guess. With no match, a
         tombstone under `failure_key` makes it a FailedSession instead; a retry of the session's last answered turn
@@ -856,7 +868,14 @@ class Registry:
         if not turn.history:
             return None
         with self._lock:
-            matches = [s for s in self.sessions.values() if s.history == turn.history]
+            # Only sessions opened in the request's own scope (wire, client, conversation identity) and on its wire:
+            # two clients, or two wires, whose reply histories happen to match must never continue each other's
+            # backend (the same rule _replays and _rebuild_or_refuse apply). A request without an identity (scope
+            # None) matches only identity-less sessions of its own wire and client name (`client`, kept by _new),
+            # since None alone would pool every identity-less client together.
+            matches = [s for s in self.sessions.values() if s.history == turn.history
+                       and getattr(s, "scope", None) == scope and getattr(s, "wire_path", None) == wire_path
+                       and (scope is not None or getattr(s, "client", None) == client)]
             replays = [] if matches else self._replays(turn, scope, wire_path)
             if len(replays) == 1:
                 # A client in a retry loop touches nothing else, so the replay itself must count as use: otherwise the
@@ -902,7 +921,10 @@ class Registry:
                 if getattr(s, "scope", None) == scope and getattr(s, "wire_path", None) == wire_path
                 and anchor in s.history]
         code = None                                     # the refusal's category, for the 409 log line
-        if scope is None:
+        if REBUILD_MAX <= 0:
+            # Rebuilds switched off: the pre-#43 409 (tests use it to pin what find and the replay guard decide alone).
+            code, why = "disabled", "rebuilding a conversation from a rewritten history is switched off (REBUILD_MAX 0)"
+        elif scope is None:
             code, why = "no_identity", (
                 "it carries no conversation identity (one of " + ", ".join(CONVERSATION_ID_HEADERS) + "), so the "
                 "conversation it continues cannot be told from a stranger's and is not rebuilt")
@@ -914,58 +936,102 @@ class Registry:
             code, why = "ambiguous_writer", (
                 f"{len(cands)} live conversations of this client wrote its last reply; refusing to pick one to "
                 "rebuild from")
-        elif getattr(cands[0], "rebuilds", 0) >= REBUILD_MAX:
-            code, why = "limit", (
-                f"the conversation was already rebuilt {REBUILD_MAX} times (REBUILD_MAX) after the client rewrote "
-                "its history; start a new conversation")
         if why is None:
             s = cands[0]
+            if self._budget(s).used >= REBUILD_MAX:
+                # A cheap early refusal; rebuild() reserves the budget atomically and is the one that counts.
+                logger.warning("rebuild refused: conversation %s reached REBUILD_MAX (%d); terminal",
+                               str(s.id)[:8], REBUILD_MAX)
+                raise RebuildLimit(rebuild_limit_message())
             raise Rebuild(s, superseded=s.history[-1] == anchor)
         logger.warning("409 lost conversation: %s rebuild=refused:%s", self._lost_diagnostic(turn), code)
         raise LostSession(f"cortados: a conversation this endpoint no longer holds as sent (its history does not "
                           f"match a live session's), and {why}")
 
-    def rebuild(self, old, turn: anthropic_wire.ClientTurn, *, superseded: bool, transcript: str,
-                scope: str | None, wire_path: str | None):
+    def _budget(self, s) -> "RebuildBudget":
+        """The rebuild budget of `s`'s lineage, created on first use for a session _new did not give one (a test's
+        fake); under the registry lock so two concurrent rebuilds of one parent can never get two budgets."""
+        with self._lock:
+            b = getattr(s, "rebuild_budget", None)
+            if b is None:
+                b = s.rebuild_budget = RebuildBudget()
+            return b
+
+    def rebuild(self, old, turn: anthropic_wire.ClientTurn, *, superseded: bool, transcript: list,
+                scope: str | None, wire_path: str | None, client: str | None = None):
         """A fresh backend for `old`'s conversation, seeded with the client's current history (issue #43): the same
         route (provider, model, account, the frozen Codex home), so the routing decision and its quota reservation
         stand; the request's own system prompt and tools, so the rebuilt backend serves what the client sends now.
         Its history is the request's, so this request and its successors match it exactly (find), and the seed
-        (`rebuild_seed`, the history transcript) is sent with the first turn it runs (Handler work()), together with
-        that turn's tool results as text: the fresh backend never issued those calls. A rebuilt backend is created by
-        the same factory as any other, so every isolation rule (no built-in tools, Codex's policy checks) holds.
+        (`rebuild_seed`, the history transcript as content blocks) is sent with the first turn it runs (Handler
+        work()), together with that turn's tool results as text: the fresh backend never issued those calls. A rebuilt
+        backend is created by the same factory as any other, so every isolation rule (no built-in tools, Codex's
+        policy checks) holds.
+        Budget (review P2-4): one RebuildBudget per lineage, shared by every session rebuilt from it (compacted or
+        branched); a slot is reserved atomically before the backend starts and given back if it does not, so neither
+        branching nor concurrent rebuilds of one parent can exceed REBUILD_MAX. Over it: RebuildLimit (terminal).
         `superseded` (see _rebuild_or_refuse): the old session is closed once the new one runs, under the old one's
         turn lock, so no turn is cut off; a turn running on it raises ConversationBusy (retryable), and so does an old
-        session that vanished meanwhile (another request rebuilt it first: the retry finds the new one). A branch
-        keeps the old session and counts toward MAX_SESSIONS like any new conversation. Raises UnservedProvider /
-        BridgeError when the new backend cannot start; the old session is then untouched."""
-        held = False
-        if superseded:
-            held = old.lock.acquire(blocking=False)
-            if not held:
-                raise ConversationBusy("cortados: conversation busy: a turn is running on the session this request "
-                                       "would replace; retry once it has finished")
+        session that vanished meanwhile (another request rebuilt it first: the retry finds the new one). Under that
+        lock the decision is re-checked (review P1-3): find classified the request before the lock was taken, and a
+        normal turn may have advanced the old session since. Its last reply is then no longer the request's anchor,
+        so the request now continues from an EARLIER reply of that session, which is exactly the branch shape: it is
+        served as a branch and the advanced session is kept (closing it would kill the turn that just advanced it, and
+        a fresh lookup would classify the request as a branch too, so a retryable 529 would only cost a round trip).
+        A branch keeps the old session and counts toward MAX_SESSIONS like any new conversation.
+        Publication (review P1-2): the session is registered only after its history, seed, budget and route state are
+        all set (_publish), so a concurrent find() can never return a half-built session. Its first turn is then
+        atomic by the turn lock: whichever request with this exact history takes the lock first sends the seed and
+        clears it under that lock (work()); any other one finds the conversation moved on, as for any two requests
+        that race on one session. Raises UnservedProvider / BridgeError when the new backend cannot start; the old
+        session is then untouched and the budget slot returned."""
+        anchor = turn.history[-1] if turn.history else None
+        budget = self._budget(old)
+        with self._lock:
+            if budget.used >= REBUILD_MAX:
+                raise RebuildLimit(rebuild_limit_message())
+            budget.used += 1                            # reserved; given back below unless the new session is live
+            number = budget.used
+        live = held = False
         try:
-            if superseded and self.get(old.id) is not old:
-                raise ConversationBusy("cortados: the conversation was rebuilt or closed while this request was "
-                                       "looked up; retry")
+            if superseded:
+                held = old.lock.acquire(blocking=False)
+                if not held:
+                    raise ConversationBusy("cortados: conversation busy: a turn is running on the session this "
+                                           "request would replace; retry once it has finished")
+                if self.get(old.id) is not old:
+                    raise ConversationBusy("cortados: the conversation was rebuilt or closed while this request was "
+                                           "looked up; retry")
+                if not old.history or old.history[-1] != anchor:
+                    logger.info("conversation %s advanced after the rebuild lookup; served as a branch, kept",
+                                str(old.id)[:8])
+                    old.lock.release()
+                    superseded = held = False
             route = getattr(old, "route", None)
             if route and getattr(old, "codex_login", None):
                 route = {**route, "codex_home": old.codex_login}   # the login the conversation already runs on
             if superseded:
                 with self._lock:
                     self._opening += 1          # one-for-one replacement: the cap is not re-checked for it
-            new = self.new(turn, keep=True, route=route, scope=scope, wire_path=wire_path, admitted=superseded)
+            else:
+                self.reserve_opening()          # a branch is one more conversation: UnservedProvider at the cap
+            try:
+                new = self._new(turn, keep=True, route=route, scope=scope, wire_path=wire_path, client=client)
+            except BaseException:
+                self.release_opening()
+                raise
             new.history = list(turn.history)
             new.rebuild_seed = None if isinstance(new, LocalSession) else transcript   # local: the relay is stateless
-            new.rebuilds = getattr(old, "rebuilds", 0) + 1
+            new.rebuild_budget, new.rebuilds = budget, number
             new.route_logged = getattr(old, "route_logged", False)    # the route already ran and was recorded
             if getattr(old, "min_left_pct", None) is not None:
                 new.min_left_pct = old.min_left_pct                   # the tightest client floor carries over
+            self._publish(new)                  # only now findable: every field above is set
+            live = True
             logger.warning("conversation %s rebuilt as %s from the client's rewritten history (%s; rebuild %d of %d; "
                            "request_len=%d candidate_len=%d)", str(old.id)[:8], str(new.id)[:8],
                            "compacted: old session closed" if superseded else "branched: old session kept",
-                           new.rebuilds, REBUILD_MAX, len(turn.history), len(old.history))
+                           number, REBUILD_MAX, len(turn.history), len(old.history))
             if superseded:
                 with self._lock:
                     if self.sessions.get(old.id) is old:
@@ -981,6 +1047,9 @@ class Registry:
         finally:
             if held:
                 old.lock.release()
+            if not live:
+                with self._lock:
+                    budget.used -= 1            # the backend never ran: the slot is the lineage's again
 
     def _replays(self, turn: anthropic_wire.ClientTurn, scope: str | None = None,
                  wire_path: str | None = None) -> list:
@@ -1229,6 +1298,25 @@ class Rebuild(Exception):
         self.session, self.superseded = session, superseded
 
 
+class RebuildBudget:
+    """How many rebuilds one conversation lineage has used (REBUILD_MAX). One object is shared by a session and every
+    session rebuilt from it, compacted or branched; `used` is read and changed only under Registry._lock."""
+
+    def __init__(self):
+        self.used = 0
+
+
+def rebuild_limit_message() -> str:
+    """RebuildLimit's text, read at call time (REBUILD_MAX is a module setting tests rebind)."""
+    return (f"cortados: this conversation reached the rebuild limit ({REBUILD_MAX} rebuilds) after its client rewrote "
+            "the history again and again; retrying cannot help: start a new conversation")
+
+
+class RebuildLimit(LostSession):
+    """The conversation's lineage used all REBUILD_MAX rebuilds: terminal (TERMINAL_STATUS, x-should-retry: false),
+    never the 409 Claude Code retries, because its retry carries the same rewritten history."""
+
+
 class ConversationBusy(Exception):
     """A rebuild could not take over its old session right now (a turn runs on it, or it was just replaced): the
     answer is the retryable BUSY_STATUS, and the retry finds the conversation's current state."""
@@ -1239,6 +1327,10 @@ class FailedSession(LostSession):
     a terminal error (TERMINAL_STATUS / TERMINAL_ERROR) naming the failure's category, not the 409 of a conversation
     this endpoint never held or has forgotten."""
     diagnostic: str | None = None
+
+
+REBUILD_LIMIT_REASON = "the conversation reached its rebuild limit (terminal)"
+REBUILD_TOO_LARGE_REASON = "the rebuilt history does not fit the conversation's model (terminal)"
 
 
 def _failed_reason(exc: object) -> str:
@@ -1905,7 +1997,8 @@ class Handler(BaseHTTPRequestHandler):
             scope = reg.conversation_scope(wire_path=self.path.split("?")[0], client=self._client(), identity=identity)
             rebuild = None
             try:
-                session = None if one_shot else reg.find(turn, fail_key, scope, self.path.split("?")[0])
+                session = None if one_shot else reg.find(turn, fail_key, scope, self.path.split("?")[0],
+                                                         client=self._client())
             except Rebuild as rb:                       # served below, once the request is known to be well-formed
                 session, rebuild = None, rb
             if session is not None and getattr(session, "system", turn.system) != turn.system:
@@ -1932,26 +2025,9 @@ class Handler(BaseHTTPRequestHandler):
                                reason="the request does not parse on this wire")
         except FailedSession as exc:
             logger.info("request on a failed conversation refused: %s", exc)
-            self._note_refusal(TERMINAL_STATUS, TERMINAL_ERROR, reason=_failed_reason(exc))
-            if turn.stream:                             # an SSE error, as a streaming client gets any turn's failure
-                try:
-                    self.send_response(200)
-                    self.send_header("content-type", "text/event-stream")
-                    self.send_header("cache-control", "no-cache")
-                    self.send_header("connection", "close")
-                    self.send_header("x-should-retry", "false")
-                    self.end_headers()
-                    self.close_connection = True
-                    msg_id = wire.new_message_id()
-                    self.wfile.write(wire.stream_start(msg_id, turn.model))
-                    self.wfile.write(wire.stream_error(msg_id, turn.model, str(exc), terminal=True))
-                    self.wfile.flush()
-                except OSError as gone:
-                    logger.info("client gone before the failed-conversation error was sent (%s)", gone)
-                return
-            # Terminal, not retryable: see TERMINAL_ERROR.
-            return self._json(TERMINAL_STATUS, wire.error_json(TERMINAL_ERROR, str(exc)),
-                              headers={"x-should-retry": "false"})
+            return self._terminal(turn, wire, str(exc), reason=_failed_reason(exc))
+        except RebuildLimit as exc:                     # terminal: the retry would carry the same rewritten history
+            return self._terminal(turn, wire, str(exc), reason=REBUILD_LIMIT_REASON)
         except Replay as rp:
             # A retry that also changes the sub/ pin gets the same refusal as any continuation that does: the stored
             # answer came from the conversation's own model, which the request no longer asks for.
@@ -2026,7 +2102,8 @@ class Handler(BaseHTTPRequestHandler):
                             route["band"], " (S1 degraded)" if route.get("degraded") else "")
             try:
                 session = reg.new(turn, keep=not one_shot, route=route, scope=scope,
-                                  wire_path=self.path.split("?")[0], admitted=bool(reg.router and not one_shot))
+                                  wire_path=self.path.split("?")[0], admitted=bool(reg.router and not one_shot),
+                                  client=self._client())
             except UnservedProvider as exc:
                 return self._error(503, "overloaded_error", f"cortados: {exc}", wire)
             except BridgeError as exc:                  # the backend refused to start (version pin, isolation, login)
@@ -2265,6 +2342,29 @@ class Handler(BaseHTTPRequestHandler):
             if one_shot and not outcome.get("closed"):
                 session.close()                         # the worker never got to it (it did not run): close it here
 
+    def _terminal(self, turn, wire: Wire, message: str, *, reason: str) -> None:
+        """A refusal no retry can fix, in each wire's non-retried shape (see TERMINAL_ERROR): HTTP 400
+        invalid_request_error with `x-should-retry: false`, or for a streaming request an SSE error marked terminal
+        (the Responses wire's TERMINAL_CODE). `message` is this endpoint's own text; `reason` the fixed record."""
+        self._note_refusal(TERMINAL_STATUS, TERMINAL_ERROR, reason=reason)
+        if turn.stream:                                 # an SSE error, as a streaming client gets any turn's failure
+            try:
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.send_header("cache-control", "no-cache")
+                self.send_header("connection", "close")
+                self.send_header("x-should-retry", "false")
+                self.end_headers()
+                self.close_connection = True
+                msg_id = wire.new_message_id()
+                self.wfile.write(wire.stream_start(msg_id, turn.model))
+                self.wfile.write(wire.stream_error(msg_id, turn.model, message, terminal=True))
+                self.wfile.flush()
+            except OSError as gone:
+                logger.info("client gone before the terminal error was sent (%s)", gone)
+            return
+        self._json(TERMINAL_STATUS, wire.error_json(TERMINAL_ERROR, message), headers={"x-should-retry": "false"})
+
     def _rebuild(self, rb: "Rebuild", turn, body: dict[str, Any], wire: Wire, scope: str | None):
         """Serve a continuation whose client rewrote the history on a rebuilt backend (Registry.rebuild); the new
         session, or None once a refusal has been answered. The conversation's model is fixed (a changed sub/ pin is
@@ -2280,9 +2380,31 @@ class Handler(BaseHTTPRequestHandler):
             self._error(400, "invalid_request_error", f"cortados: the history cannot be replayed: {exc}", wire,
                         reason="the request does not parse on this wire")
             return None
+        # Review P2-5: the per-block cut does not bound the whole replay. The rebuilt backend's first turn (the seed,
+        # the new turn, the system prompt and the tools) must fit the conversation's frozen route, measured with the
+        # estimator the opening route was fitted with (routing.request_fit, chars / 4 of the JSON body), and refused
+        # BEFORE the old session is closed or replaced. Terminal: a retry replays the same history.
+        # A local pin is skipped: its seed is never sent (the relay re-sends the whole body, under its own per-turn fit
+        # gate in _relay_local).
+        cap = (getattr(rb.session, "route", None) or {}).get("context_length")
+        if cap and not isinstance(rb.session, LocalSession):
+            seed_body = {"system": turn.system, "tools": turn.tools,
+                         "messages": [{"role": "user", "content": anthropic_wire.rebuild_content(transcript, turn)}]}
+            need = int(routing.request_fit(seed_body)["input_tokens"])
+            if need > int(cap):
+                logger.warning("rebuild refused: conversation %s replay ≈%dk tokens exceeds its route's context "
+                               "%dk; terminal", str(rb.session.id)[:8], need // 1000, int(cap) // 1000)
+                self._terminal(turn, wire, f"cortados: the client rewrote this conversation's history, and "
+                               f"replaying it on a fresh backend (≈{need // 1000}k tokens) does not fit the "
+                               f"conversation's model context ({int(cap) // 1000}k tokens); retrying cannot help: "
+                               "start a new conversation or compact it further", reason=REBUILD_TOO_LARGE_REASON)
+                return None
+        # (No context_length: a fixed-model endpoint has no routed limit to check against; the backend reports it.)
         try:
             return reg.rebuild(rb.session, turn, superseded=rb.superseded, transcript=transcript, scope=scope,
-                               wire_path=self.path.split("?")[0])
+                               wire_path=self.path.split("?")[0], client=self._client())
+        except RebuildLimit as exc:                     # the atomic reservation lost to a concurrent rebuild
+            self._terminal(turn, wire, str(exc), reason=REBUILD_LIMIT_REASON)
         except ConversationBusy as exc:
             self._error(BUSY_STATUS, "overloaded_error", str(exc), wire)
         except UnservedProvider as exc:

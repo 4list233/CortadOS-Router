@@ -141,9 +141,10 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertEqual(seen, {})                           # refused before any routing or spend
 
     def send_with(self, body, headers):
+        # The same User-Agent as request(): an identity-less continuation is matched within its client (Registry.find).
         req = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(body).encode(), method="POST",
                                      headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
-                                              **headers})
+                                              "user-agent": "claude-cli/2.1.304 (external, cli)", **headers})
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return r.status, json.loads(r.read())

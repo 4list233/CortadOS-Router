@@ -1258,7 +1258,7 @@ class EndpointTests(EndpointHarness):
         codes = []
 
         def continuation():
-            codes.append(self.status_of(follow))
+            codes.append(self.status_of(follow, headers=self.REPLAY_ID))   # the same scope as the conversation
         session.lock.acquire()
         try:
             with self.assertLogs("cortados.provider", "WARNING") as logs:
@@ -1487,24 +1487,75 @@ class RebuildTests(RoutedHarness):
         main = history + [{"role": "user", "content": "m"}]
         self.assertEqual(self.post({"tools": [READ_TOOL], "messages": main})["content"][0]["text"], "echo: m")
 
-    def test_the_rebuild_limit_ends_in_a_409_that_says_so(self):
+    def compacted(self, history, summary, text):
+        """A request whose client summarised everything before the last reply of `history`, then says `text`."""
+        return {"tools": [READ_TOOL], "messages": [{"role": "user", "content": summary}] + history[-1:]
+                + [{"role": "user", "content": text}]}
+
+    def terminal_error(self, body, stream=False):
+        """(status, error type, message, x-should-retry) of a refused request."""
+        try:
+            self.post(dict(body, stream=True) if stream else body)
+        except urllib.error.HTTPError as exc:
+            return exc.code, *(lambda e: (e["type"], e["message"]))(json.loads(exc.read())["error"]), \
+                exc.headers.get("x-should-retry")
+        self.fail("expected an HTTP error")
+
+    def test_the_rebuild_limit_is_terminal_and_says_so(self):
+        # Review P1-1: Claude Code retries 409, and the retry carries the same rewritten history, so the limit is the
+        # endpoint's terminal 400 (x-should-retry: false), and the message names the limit and the way out.
         history = self.converse("hello", "second")
         with mock.patch.object(server, "REBUILD_MAX", 1):
-            body = {"tools": [READ_TOOL], "messages": [{"role": "user", "content": "Summary 1."}] + history[3:]
-                    + [{"role": "user", "content": "third"}]}
-            r = self.post(body)
+            r = self.post(self.compacted(history, "Summary 1.", "third"))
             again = [{"role": "user", "content": "Summary 2."}, {"role": "assistant", "content": r["content"]},
                      {"role": "user", "content": "fourth"}]
             with self.assertLogs("cortados.provider", "WARNING") as logs:
-                try:
-                    self.post({"tools": [READ_TOOL], "messages": again})
-                    self.fail("rebuilt past REBUILD_MAX")
-                except urllib.error.HTTPError as exc:
-                    self.assertEqual(exc.code, 409)
-                    msg = json.loads(exc.read())["error"]["message"]
-        self.assertIn("already rebuilt 1 times", msg)
-        self.assertTrue(any("409 lost conversation:" in l and "rebuild=refused" in l for l in logs.output))
+                code, kind, msg, retry = self.terminal_error({"tools": [READ_TOOL], "messages": again})
+        self.assertEqual((code, kind, retry), (server.TERMINAL_STATUS, server.TERMINAL_ERROR, "false"))
+        self.assertEqual((code, kind), (400, "invalid_request_error"))
+        self.assertIn("rebuild limit (1 rebuilds)", msg)
+        self.assertIn("start a new conversation", msg)
+        self.assertTrue(any("reached REBUILD_MAX" in l for l in logs.output), logs.output)
+        self.assertFalse(any("409" in l for l in logs.output), logs.output)
         self.assertEqual(len(self.reg.sessions), 1)                    # the live session is untouched
+
+    def test_the_rebuild_limit_on_a_streaming_request_is_a_terminal_sse_error(self):
+        history = self.converse("hello", "second")
+        with mock.patch.object(server, "REBUILD_MAX", 1):
+            r = self.post(self.compacted(history, "Summary 1.", "third"))
+            again = {"tools": [READ_TOOL], "stream": True, "messages": [
+                {"role": "user", "content": "Summary 2."}, {"role": "assistant", "content": r["content"]},
+                {"role": "user", "content": "fourth"}]}
+            raw = self.post(again)
+        self.assertIn("event: error", raw)
+        self.assertIn('"type": "invalid_request_error"', raw)
+        self.assertIn("rebuild limit", raw)
+
+    def test_a_replay_that_does_not_fit_the_route_is_refused_before_the_old_session_is_touched(self):
+        # Review P2-5: each replayed block is under the per-block cut, but together they exceed the route's context
+        # (estimated as the opening route was: routing.request_fit, chars / 4). Refused, terminal, old session kept.
+        history = self.converse("hello", "second")
+        (old,) = self.reg.sessions.values()
+        old.route = dict(old.route, context_length=2000)
+        secret = "PROMPT-TEXT-MUST-NOT-BE-LOGGED "
+        blocks = [{"type": "text", "text": secret + "y" * 870} for _ in range(10)]   # 10 x 900 chars ≈ 2.2k tokens
+        body = {"tools": [READ_TOOL], "messages": [{"role": "user", "content": blocks}] + history[-1:]
+                + [{"role": "user", "content": "third"}]}
+        with mock.patch.object(wire, "REBUILD_BLOCK_CHARS", 1000):
+            with self.assertLogs("cortados.provider", "WARNING") as logs:
+                code, kind, msg, retry = self.terminal_error(body)
+        self.assertEqual((code, kind, retry), (400, "invalid_request_error", "false"))
+        self.assertIn("does not fit the conversation's model context (2k tokens)", msg)
+        self.assertIn("start a new conversation", msg)
+        self.assertTrue(any("rebuild refused" in l and "exceeds its route's context" in l for l in logs.output))
+        self.assertFalse(any(secret.strip() in l for l in logs.output), logs.output)
+        self.assertEqual(list(self.reg.sessions.values()), [old])     # untouched: not closed, not replaced
+        self.assertFalse(old._closed)
+        self.assertEqual(old.rebuild_budget.used, 0)                    # and no rebuild was spent
+        # The same request on a route that has the room is rebuilt.
+        old.route["context_length"] = 200_000
+        with mock.patch.object(wire, "REBUILD_BLOCK_CHARS", 1000):
+            self.assertEqual(self.status_of(body), 200)
 
     def test_without_an_identity_no_rebuild_and_the_409_says_why(self):
         history = self.converse("hello", "second")
@@ -1588,27 +1639,218 @@ class RebuildTests(RoutedHarness):
         self.assertEqual(self.reg._opening, 0)
 
 
+class RebuildRegistryTests(unittest.TestCase):
+    """Registry.find / rebuild under concurrency and isolation (#43 review), with a fake backend factory and hooks at
+    the exact points of each race, never sleeps."""
+
+    SCOPE, WIRE, CLIENT = "scope-a", "/v1/messages", "claude-cli"
+
+    def setUp(self):
+        from types import SimpleNamespace
+        self.on_create = None                       # hook: runs inside the factory (a backend starting)
+        self.fail_create = None                     # an exception the factory raises (a backend refusing to start)
+
+        def factory(reg, **kw):
+            if self.on_create:
+                self.on_create()
+            if self.fail_create:
+                raise self.fail_create
+            return SimpleNamespace(id=uuid.uuid4().hex, lock=threading.Lock(), last_used=time.time(), history=[],
+                                   close=mock.Mock(), _closed=False)
+        self.reg = Registry(gateway_url="", token=TOKEN, session_factories={"claude-cli": factory})
+
+    def opened(self, replies, scope=SCOPE, wire_path=WIRE, client=CLIENT):
+        s = self.reg.new(wire.ClientTurn("", [READ_TOOL], [], {}), keep=True, scope=scope, wire_path=wire_path,
+                         client=client)
+        s.history = list(replies)
+        return s
+
+    def turn(self, history):
+        return wire.ClientTurn("", [READ_TOOL], [{"type": "text", "text": "next"}], {}, history=list(history))
+
+    def rebuild(self, old, history, *, superseded, scope=SCOPE):
+        return self.reg.rebuild(old, self.turn(history), superseded=superseded,
+                                transcript=[{"type": "text", "text": "T"}], scope=scope, wire_path=self.WIRE,
+                                client=self.CLIENT)
+
+    def rebuild_of(self, history, scope=SCOPE):
+        """What find decides for `history`: the Rebuild it raises."""
+        with self.assertRaises(server.Rebuild) as cm:
+            self.reg.find(self.turn(history), None, scope, self.WIRE, client=self.CLIENT)
+        return cm.exception
+
+    # ---- review P1-2: publication only once initialised
+    def test_a_rebuilt_session_is_published_only_once_fully_initialised(self):
+        old = self.opened(["a", "b"])
+        history = ["x", "b"]                                    # the client rewrote the first reply, kept the last
+        seen = {}
+
+        def published(s, handler):
+            """Registry calls set_exit_handler right after a session becomes findable, outside the registry lock: a
+            concurrent request looks it up at exactly that instant and inspects what it would see (the review's race:
+            a find between publication and the seeding of history / rebuild_seed / budget)."""
+            try:
+                found = self.reg.find(self.turn(history), None, self.SCOPE, self.WIRE, client=self.CLIENT)
+            except Exception as exc:                        # the old code: not findable yet, or found half-built
+                seen["found"] = exc
+                return
+            seen.update(found=found, seed=getattr(found, "rebuild_seed", None),
+                        budget=getattr(found, "rebuild_budget", None))
+        create = self.reg._factories["claude-cli"]
+
+        def factory(reg, **kw):
+            s = create(reg, **kw)
+            s.set_exit_handler = lambda handler, s=s: published(s, handler)
+            return s
+        self.reg._factories["claude-cli"] = factory
+        new = self.rebuild(old, history, superseded=True)
+        self.assertIs(seen["found"], new)                       # findable with the request's history...
+        self.assertEqual(seen["seed"], [{"type": "text", "text": "T"}])   # ...and already holding its seed,
+        self.assertIs(seen["budget"], old.rebuild_budget)       # the lineage's budget,
+        self.assertEqual(new.history, history)
+        self.assertEqual(new.rebuilds, 1)
+
+    # ---- review P1-3: a stale superseded decision is revalidated under the old turn lock
+    def test_an_old_session_that_advanced_after_the_lookup_is_kept_and_served_as_a_branch(self):
+        old = self.opened(["a", "b"])
+        history = ["x", "b"]
+        rb = self.rebuild_of(history)
+        self.assertTrue(rb.superseded)                          # classified as a compaction at lookup time
+        # Between that lookup and the rebuild taking the old session's lock, a normal turn advanced it.
+        with old.lock:
+            old.history.append("c")
+        with self.assertLogs("cortados.provider", "INFO") as logs:
+            new = self.rebuild(old, history, superseded=rb.superseded)
+        self.assertTrue(any("advanced after the rebuild lookup; served as a branch" in l for l in logs.output))
+        self.assertTrue(any("branched: old session kept" in l for l in logs.output), logs.output)
+        self.assertIs(self.reg.get(old.id), old)                # the advanced session was NOT closed
+        old.close.assert_not_called()
+        self.assertIs(self.reg.get(new.id), new)
+        self.assertFalse(old.lock.locked())
+        self.assertEqual(self.reg._opening, 0)
+
+    def test_the_revalidation_happens_under_the_old_turn_lock(self):
+        # The advance lands while the rebuild is starting the new backend: by then the old lock is held, so the turn
+        # that would advance it cannot run until the old session has been closed (the compaction stands).
+        old = self.opened(["a", "b"])
+        history = ["x", "b"]
+        self.on_create = lambda: self.assertTrue(old.lock.locked())
+        new = self.rebuild(old, history, superseded=True)
+        self.assertIsNone(self.reg.get(old.id))
+        old.close.assert_called_once()
+        self.assertIs(self.reg.get(new.id), new)
+
+    # ---- review P2-4: one budget per lineage, reserved atomically
+    def test_sequential_branches_share_one_budget(self):
+        old = self.opened(["a", "b", "c", "d"])
+        with mock.patch.object(server, "REBUILD_MAX", 2):
+            b1 = self.rebuild(old, ["a"], superseded=False)
+            b2 = self.rebuild(old, ["a", "b"], superseded=False)
+            self.assertEqual((b1.rebuilds, b2.rebuilds), (1, 2))
+            self.assertIs(b1.rebuild_budget, old.rebuild_budget)
+            with self.assertRaises(server.RebuildLimit):
+                self.rebuild(old, ["a", "b", "c"], superseded=False)
+            with self.assertRaises(server.RebuildLimit):     # a branch of a branch is the same lineage
+                self.rebuild(b1, ["a"], superseded=False)
+            # find refuses up front, terminally, once the lineage is spent
+            with self.assertRaises(server.RebuildLimit):
+                self.reg.find(self.turn(["z", "c"]), None, self.SCOPE, self.WIRE, client=self.CLIENT)
+        self.assertEqual(len(self.reg.sessions), 3)
+
+    def test_concurrent_branches_cannot_both_take_the_last_slot(self):
+        old = self.opened(["a", "b", "c"])
+        entered, release, out = threading.Event(), threading.Event(), {}
+
+        def slow_start():                                   # the first rebuild's backend is starting...
+            entered.set()
+            release.wait(10)
+        self.on_create = slow_start
+        with mock.patch.object(server, "REBUILD_MAX", 1):
+            t = threading.Thread(target=lambda: out.update(first=self.rebuild(old, ["a"], superseded=False)))
+            t.start()
+            self.assertTrue(entered.wait(10))
+            self.on_create = None
+            with self.assertRaises(server.RebuildLimit):    # ...and the second finds the slot already reserved
+                self.rebuild(old, ["a", "b"], superseded=False)
+            release.set()
+            t.join(10)
+        self.assertEqual(out["first"].rebuilds, 1)
+        self.assertEqual(old.rebuild_budget.used, 1)
+
+    def test_a_backend_that_fails_to_start_returns_its_slot(self):
+        old = self.opened(["a", "b"])
+        self.fail_create = BridgeError("cannot start the headless CLI")
+        with mock.patch.object(server, "REBUILD_MAX", 1):
+            with self.assertRaises(BridgeError):
+                self.rebuild(old, ["x", "b"], superseded=True)
+            self.assertEqual(old.rebuild_budget.used, 0)
+            self.assertIs(self.reg.get(old.id), old)            # untouched
+            self.assertFalse(old.lock.locked())
+            self.fail_create = None
+            self.assertEqual(self.rebuild(old, ["x", "b"], superseded=True).rebuilds, 1)
+        self.assertEqual(self.reg._opening, 0)
+
+    def test_a_busy_or_vanished_old_session_returns_its_slot(self):
+        old = self.opened(["a", "b"])
+        with old.lock:
+            with self.assertRaises(server.ConversationBusy):
+                self.rebuild(old, ["x", "b"], superseded=True)
+        self.assertEqual(old.rebuild_budget.used, 0)
+        self.reg.drop(old)
+        with self.assertRaises(server.ConversationBusy):
+            self.rebuild(old, ["x", "b"], superseded=True)
+        self.assertEqual(old.rebuild_budget.used, 0)
+
+    # ---- scope: the exact-match lookup never crosses clients or wires
+    def test_identical_histories_in_two_scopes_never_share_a_session(self):
+        a = self.opened(["r1", "r2"], scope="scope-a")
+        b = self.opened(["r1", "r2"], scope="scope-b")
+        c = self.opened(["r1", "r2"], scope="scope-a", wire_path="/v1/responses")
+        find = lambda scope, wire_path=self.WIRE: self.reg.find(self.turn(["r1", "r2"]), None, scope, wire_path,
+                                                                 client=self.CLIENT)
+        self.assertIs(find("scope-a"), a)                   # used to be a 409: 3 live sessions had this history
+        self.assertIs(find("scope-b"), b)
+        self.assertIs(find("scope-a", "/v1/responses"), c)
+        with self.assertRaises(server.LostSession):         # a stranger finds nothing (and no rebuild either)
+            find("scope-c")
+
+    def test_identity_less_requests_match_only_their_own_client_and_wire(self):
+        mine = self.opened(["r1"], scope=None, client="claude-cli")
+        self.opened(["r1"], scope=None, client="codex_exec")
+        self.opened(["r1"], scope="scope-a", client="claude-cli")
+        self.assertIs(self.reg.find(self.turn(["r1"]), None, None, self.WIRE, client="claude-cli"), mine)
+        with self.assertRaises(server.LostSession):
+            self.reg.find(self.turn(["r1"]), None, None, self.WIRE, client="curl")
+        with self.assertRaises(server.LostSession):
+            self.reg.find(self.turn(["r1"]), None, None, "/v1/responses", client="claude-cli")
+
+
 class TranscriptTests(unittest.TestCase):
     """anthropic_wire's rebuild transcript: labelled roles, tool calls and results paired by id, thinking dropped,
     oversized blocks cut with the cut stated."""
 
+    @staticmethod
+    def text_of(blocks):
+        return "".join(b["text"] for b in blocks if b["type"] == "text")
+
     def test_roles_tools_and_thinking(self):
-        t = wire.rebuild_transcript([
+        t = self.text_of(wire.rebuild_transcript([
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": [{"type": "thinking", "thinking": "secret", "signature": "s"},
                                               {"type": "text", "text": "ok"},
                                               {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"p": 1}}]},
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "is_error": True,
                                           "content": [{"type": "text", "text": "nope"}, {"type": "image", "source": {}}]}]},
-            {"role": "system", "content": "operator note"}])
+            {"role": "system", "content": "operator note"}]))
         self.assertNotIn("secret", t)
         self.assertIn('<assistant>\nok\n[tool call toolu_1: Read] {"p": 1}\n</assistant>', t)
-        self.assertIn("[tool result for call toolu_1, error]\nnope\n[image result: not carried", t)
+        # An image block without any image data has nothing to replay: the placeholder says so.
+        self.assertIn("[tool result for call toolu_1, error]\nnope\n[image: no image data", t)
         self.assertIn("<operator>\noperator note\n</operator>", t)
 
     def test_an_oversized_block_is_cut_and_says_so(self):
         with mock.patch.object(wire, "REBUILD_BLOCK_CHARS", 10):
-            t = wire.rebuild_transcript([{"role": "user", "content": "x" * 25}])
+            t = self.text_of(wire.rebuild_transcript([{"role": "user", "content": "x" * 25}]))
         self.assertIn("x" * 10 + "\n[cut at 10 of 25 characters]", t)
 
     def test_new_turn_results_are_text_and_images_stay_images(self):
@@ -1618,10 +1860,51 @@ class TranscriptTests(unittest.TestCase):
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_9", "content": [
                 {"type": "text", "text": "res"},
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]}]}]})
-        out = wire.rebuild_content("HIST", turn)
+        out = wire.rebuild_content([{"type": "text", "text": "HIST"}], turn)
         self.assertIn("<conversation-history>\nHIST\n</conversation-history>", out[0]["text"])
         self.assertEqual(out[1]["text"], "[tool result for call toolu_9]\nres\n[image result: attached after this text]")
         self.assertEqual(out[2], {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}})
+
+    def test_historical_images_are_kept_in_place_with_their_owner(self):
+        # Review P2-6: an image in an earlier user message and one in an earlier tool result stay image blocks, in
+        # place, each after a label that numbers it and names its turn or tool call.
+        png = {"type": "base64", "media_type": "image/png", "data": "UFVORw=="}
+        jpg = {"type": "base64", "media_type": "image/jpeg", "data": "SlBFRw=="}
+        blocks = wire.rebuild_transcript([
+            {"role": "user", "content": [{"type": "text", "text": "look at this"}, {"type": "image", "source": png}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_s", "name": "Shot", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_s", "content": [
+                {"type": "text", "text": "before"}, {"type": "image", "source": jpg},
+                {"type": "text", "text": "after"}]}]},
+            {"role": "assistant", "content": "seen"}])
+        kinds = [b["type"] for b in blocks]
+        self.assertEqual(kinds, ["text", "image", "text", "image", "text"])
+        self.assertEqual(blocks[1], {"type": "image", "source": png})
+        self.assertEqual(blocks[3], {"type": "image", "source": jpg})
+        self.assertTrue(blocks[0]["text"].endswith("look at this\n[image 1: in this user message, follows]\n"),
+                        blocks[0])
+        self.assertTrue(blocks[2]["text"].endswith(
+            "[tool result for call toolu_s]\nbefore\n[image 2: from the tool result for call toolu_s, follows]\n"),
+            blocks[2])
+        self.assertTrue(blocks[4]["text"].startswith("\nafter\n</user>"), blocks[4])
+        # The seed keeps them in the same place, between the note and the new turn.
+        turn = wire.parse_request({"messages": [{"role": "user", "content": "x"},
+                                                {"role": "assistant", "content": "seen"},
+                                                {"role": "user", "content": "next"}]})
+        out = wire.rebuild_content(blocks, turn)
+        self.assertEqual([b["type"] for b in out], ["text", "image", "text", "image", "text", "text"])
+        self.assertTrue(out[0]["text"].startswith(wire.REBUILD_NOTE))
+        self.assertTrue(out[4]["text"].endswith("</conversation-history>\n\nThe client's new turn follows."))
+
+    def test_a_url_image_is_kept_and_mcp_image_content_becomes_a_block(self):
+        blocks = wire.rebuild_transcript([
+            {"role": "user", "content": [{"type": "image", "source": {"type": "url", "url": "https://x.test/a.png"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": [
+                {"type": "image", "data": "QUJD", "mimeType": "image/gif"}]}]}])
+        images = [b for b in blocks if b["type"] == "image"]
+        self.assertEqual(images, [{"type": "image", "source": {"type": "url", "url": "https://x.test/a.png"}},
+                                  {"type": "image", "source": {"type": "base64", "media_type": "image/gif",
+                                                               "data": "QUJD"}}])
 
 
 class FixedModelFloorTests(EndpointHarness):
@@ -1962,10 +2245,14 @@ class RunRecordTests(RoutedHarness):
         self.assertEqual((code, r1["stop_reason"]), (200, "tool_use"))
         history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": r1["content"][-1]["id"], "content": "x"}]}]
-        code, r2 = self.send({"tools": [READ_TOOL], "messages": history}, "run-continuer")
+        # The run id is part of the conversation identity (CONVERSATION_ID_HEADERS), so another run id is another
+        # scope: it never continues this run's session (Registry.find), and records nothing either way.
+        code, _ = self.send({"tools": [READ_TOOL], "messages": history}, "run-continuer")
+        self.assertEqual(code, 409)
+        self.assertEqual(self.lookup("run-continuer")[1]["models"], [])   # its refusal only, nothing routed
+        code, r2 = self.send({"tools": [READ_TOOL], "messages": history}, "run-opener")
         self.assertEqual((code, r2["content"][0]["text"]), (200, "tool said: x"))
-        self.assertEqual(self.lookup("run-continuer")[0], 404)        # routed when it opened, not by this request
-        self.assertEqual(len(self.reg.runs._runs["run-opener"]), 1)
+        self.assertEqual(len(self.reg.runs._runs["run-opener"]), 1)   # routed when it opened, not by this request
 
     def test_a_backend_start_failure_leaves_no_record(self):
         self.reg.claude_bin = [os.path.join(self.scratch, "no-such-claude")]

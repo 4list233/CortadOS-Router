@@ -19,6 +19,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 from pathlib import Path
 
 from cortados_router.provider import codex_bridge, responses_wire, routing, server
@@ -343,6 +344,38 @@ class ResponsesEndpointTests(unittest.TestCase):
         self.assertIn(f'[tool call {call["call_id"]}: Read] {{"file_path": "f0.md"}}', text)
         self.assertIn(f"[tool result for call {call['call_id']}]\nhello", text)
         self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_the_rebuild_limit_is_terminal_on_the_responses_wire(self):
+        # #43 review P1-1: the limit is the endpoint's non-retried 400 on this wire too (Codex retries a 409 and 5xx).
+        _, r1 = self.post(request(user("hello")))
+        _, r2 = self.post(request(user("hello"), *r1["output"], user("second")))
+        with mock.patch.object(server, "REBUILD_MAX", 1):
+            _, r3 = self.post(request(user("Summary 1."), *r2["output"], user("third")))
+            limited = request(user("Summary 2."), *r3["output"], user("fourth"))
+            code, body = self.error_of(limited)
+            with self.send(dict(limited, stream=True)) as r:
+                streamed = r.read().decode()
+        self.assertEqual((code, body["error"]["type"]), (400, "invalid_request_error"))
+        self.assertIn("rebuild limit (1 rebuilds)", body["error"]["message"])
+        self.assertIn("start a new conversation", body["error"]["message"])
+        self.assertIn("response.failed", streamed)
+        self.assertIn(responses_wire.TERMINAL_CODE, streamed)            # the stream's non-retried code
+        self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_identical_histories_on_two_session_ids_continue_their_own_sessions(self):
+        # Scope (#43 review): the exact-match lookup is filtered by wire + client + conversation identity, so two
+        # Codex sessions whose replies are identical each continue their own backend (it used to be an ambiguous 409).
+        other = dict(CODEX_HEADERS, **{"session-id": "11111111-1111-1111-1111-111111111111"})
+        _, a1 = self.post(request(user("same")))
+        with self.send(request(user("same")), headers=other) as r:
+            b1 = json.loads(r.read())
+        self.assertEqual(len(self.reg.sessions), 2)
+        a, b = list(self.reg.sessions.values())
+        _, a2 = self.post(request(user("same"), *a1["output"], user("on a")))
+        with self.send(request(user("same"), *b1["output"], user("on b")), headers=other) as r:
+            b2 = json.loads(r.read())
+        self.assertEqual((self._text(a2), self._text(b2)), ("echo: on a", "echo: on b"))
+        self.assertEqual((len(a.history), len(b.history)), (2, 2))
 
     def test_an_edited_history_without_a_session_id_is_a_409_that_says_why(self):
         _, r1 = self.post(request(user("hello")))

@@ -119,8 +119,10 @@ Not yet in P1, each needing a decision or another phase:
 - A conversation lives in one CLI process and is identified by the exact sequence of replies the endpoint wrote
   (text and tool_use ids). If the endpoint restarts the next request fails with 409. If the client compacts or edits
   its history, the session is REBUILT (issue #43, `Registry._rebuild_or_refuse` / `Registry.rebuild`, see (f) below).
-  Two live conversations with identical histories (same opening, same text-only replies) are refused with 409 rather
-  than guessed between.
+  The exact match is looked up only within the request's scope (wire + client + conversation identity; a request
+  without an identity only among identity-less sessions of its own wire and User-Agent name), so two clients or two
+  wires never share a session. Two live conversations in ONE scope with identical histories (same opening, same
+  text-only replies) are refused with 409 rather than guessed between.
   What the match compares (`Registry.find`: `session.history == turn.history`, the list of `reply_fingerprint`s,
   sha256 of each assistant message's trimmed text + tool_use ids) decides each history rewrite (2026-11-03, tests in
   `tests/test_provider.py`): (a) old tool_result content replaced by a placeholder (Claude Code microcompaction) is
@@ -159,20 +161,32 @@ Not yet in P1, each needing a decision or another phase:
   no second route log), with the request's own system prompt and tools, from the same factory as any session (so the
   Claude CLI's `--tools ""` / strict MCP config and the Codex isolation checks hold unchanged). Its first user message
   is `anthropic_wire.REBUILD_NOTE`, the client's history before the new turn as a labelled transcript
-  (`<user>`/`<assistant>`/`<operator>`; tool calls and results as text paired by call id; thinking dropped; images
-  named, not carried; any block over `REBUILD_BLOCK_CHARS` = 100k characters cut, the cut stated), then the new turn,
+  (`<user>`/`<assistant>`/`<operator>`; tool calls and results as text paired by call id; thinking dropped; earlier
+  images kept in place as image blocks, each after a numbered label naming its message or the tool call whose result
+  it was — both the Claude CLI and Codex take image blocks in user content; any block over `REBUILD_BLOCK_CHARS` =
+  100k characters cut, the cut stated), then the new turn,
   its tool results as text by call id (the fresh backend never issued those calls, so nothing is delivered to a
   pending call) and their images as image blocks. Two shapes: the request's last reply is the session's last reply
   (compaction, an edited earlier message): the old session is closed once the new one exists, under its turn lock
   (a running turn answers a retryable 529; a backend that cannot start answers 502 and leaves the old session
   untouched); or it is an earlier reply (a rewind, an edited message resent): a BRANCH, and the old session is kept,
-  because such a request cannot be told from a side request the client forks from its live loop. Bounded by
-  `REBUILD_MAX` = 5 per conversation lineage (each rebuild replays the whole history uncached). The log line is
-  `conversation <old> rebuilt as <new> ... (compacted: old session closed | branched: old session kept; rebuild n of
-  5; ...)`. 409 remains, with the reason in the message and `rebuild=refused:<code>` on the `409 lost conversation`
-  line, for: `no_identity` (no conversation identity header), `no_writer` (no live session of this client wrote the
-  last reply: restart, reap, an edited last reply), `ambiguous_writer` (more than one did) and `limit`. A full
-  compaction with no assistant message left still opens a new, freshly routed conversation, as in (b).
+  because such a request cannot be told from a side request the client forks from its live loop. A compaction whose
+  old session advanced between the lookup and the rebuild taking its turn lock is re-checked under that lock and
+  served as a branch (the advanced session is kept). The rebuilt session is published only once its history, seed and
+  budget are set; its first turn goes to whichever request takes its turn lock first. Bounded by `REBUILD_MAX` = 5
+  per conversation lineage (each rebuild replays the whole history uncached): one budget shared by every session
+  rebuilt from the lineage, compacted or branched, reserved before the backend starts and returned if it does not.
+  Before anything is closed or started, the first turn (seed + new turn + system + tools) is measured against the
+  frozen route's `context_length` with the opening route's estimator (`routing.request_fit`, chars / 4). The log
+  line is `conversation <old> rebuilt as <new> ... (compacted: old session closed | branched: old session kept;
+  rebuild n of 5; ...)`. Terminal (HTTP 400 `invalid_request_error` + `x-should-retry: false`, or a terminal SSE
+  error; Codex's `invalid_prompt`), because a retry carries the same history: the lineage reached `REBUILD_MAX`, or
+  the replay does not fit the route. 409 remains, with the reason in the message and `rebuild=refused:<code>` on the
+  `409 lost conversation` line, for: `no_identity` (no conversation identity header), `no_writer` (no live session of
+  this client wrote the last reply: restart, reap, an edited last reply) and `ambiguous_writer` (more than one did);
+  each of these costs the client's retries only a registry lookup, never a backend. `REBUILD_MAX` 0 switches
+  rebuilding off (`disabled`). A full compaction with no assistant message left still opens a new, freshly routed
+  conversation, as in (b).
 - Requests without tools (titles, summaries) always get their own throwaway CLI with the conversation as text.
 - Only `tool_choice: auto` is accepted (400 otherwise). `max_tokens` is not enforced: the CLI has no output-cap flag.
 - Responses are sent as SSE after the turn completes (with pings while waiting), not token by token.
