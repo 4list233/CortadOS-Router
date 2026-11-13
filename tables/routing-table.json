@@ -523,12 +523,12 @@
   },
   "local": {
    "plan": "free (the Pro, M5 Max, 48 GB; only on AC power with the manual switch on). The Studio runs S1 only, no chat models (Forest 2026-11-13, #75)",
-   "source": "ollama list on the Pro, 2026-11-13 (the pinnable and auto-routable set is the local-resources config, docs/LOCAL-RESOURCES.md; recommended additions gpt-oss:20b and qwen3-coder:30b are not pulled yet)",
+   "source": "ollama list on the Pro, 2026-11-13, after the owner renamed them with ollama cp (the pinnable and auto-routable set is the local-resources config, docs/LOCAL-RESOURCES.md; nothing else is downloaded: the owner uses these four)",
    "models": [
-    "huihui_ai/Qwen3.8-abliterated:latest",
-    "hf.co/huihui-ai/Huihui-Qwythos-9B-Claude-Mythos-5-1M-abliterated-GGUF:Q6_K",
-    "hf.co/0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M",
-    "hf.co/ThalisAI/phi-4-heretic:Q4_K_M"
+    "Qwen27b_heretic",
+    "Huihui_Qwen_9b",
+    "Huihui_Qwen3.8",
+    "Phi_4"
    ],
    "training": "S1 training stays on the Studio: MLX 0.32.2 + mlx-lm 0.31.3 in .venv-mlx (installed 2026-09-21)"
   }

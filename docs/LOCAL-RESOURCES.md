@@ -189,8 +189,11 @@ Pin names (aliases and tags, case-insensitive) must be unique across nodes. Beha
    the file on every call, so the Studio's pins and lane disappear with the next request.
 2. On the Studio, stop its gate and its Ollama (owner decision 2026-11-13: the Studio runs no chat models; S1 does not
    use either): `launchctl bootout gui/$(id -u)/com.cortados.local-gate`, then quit Ollama (the menu-bar app, or
-   `launchctl bootout` its own job if it was installed as one).
-3. On the Pro: `ollama pull gpt-oss:20b`; set Ollama's context to at least the configured `context_length` (65536):
+   `launchctl bootout` its own job if it was installed as one). **Done 2026-11-13:** `com.cortados.local-gate` and
+   `com.cortados.ollama` were booted out and disabled on the Studio.
+3. On the Pro: nothing is downloaded (owner decision 2026-11-13: the lane uses the models already on the Pro, renamed
+   with `ollama cp` to `Qwen27b_heretic`, `Huihui_Qwen_9b`, `Huihui_Qwen3.8` and `Phi_4`; the Pro block's `models` must
+   list these tags). Set Ollama's context to at least the configured `context_length` (65536):
    `OLLAMA_CONTEXT_LENGTH=65536` for `ollama serve`, or Ollama.app's context setting, then restart Ollama (see "Context
    length must match the node" below). Only then set the Pro block's `auto_route` in the Air's `tables/resources.json`
    (Local auto-route, below); before that the Pro is pin-only.
@@ -236,16 +239,19 @@ queue (`OLLAMA_MAX_QUEUE`), each up to `read_timeout_s` per chunk. They are not 
 so many parallel local conversations are slower than the same number on S1's lanes.
 
 Model choice for the Pro (M5 Max, 48 GB unified, reserve 6 GiB; `OLLAMA_NUM_PARALLEL=1`): one auto-route model loaded
-at a time. Recommended, 2026-11-13 (not yet pulled on the Pro; pull them yourself, they are large):
+at a time. The lane uses the four models already on the Pro (owner decision 2026-11-13: nothing is downloaded; the
+tags below are the names given with `ollama cp`):
 
-| model | Ollama tag | download | use |
-| --- | --- | --- | --- |
-| gpt-oss 20B (MoE, ~3.6B active) | `gpt-oss:20b` | ≈ 14 GB | auto-route model: fast, native tool calling, 128k context; set `context_length` 65536 |
-| Qwen3 Coder 30B-A3B | `qwen3-coder:30b` | ≈ 19 GB | pin-only (`sub/qwen3-coder-30b`) for code-shaped local work |
+| model | Ollama tag | alias (example config) | size | use |
+| --- | --- | --- | --- | --- |
+| Qwen3.8 27B Heretic, Q4_K_M | `Qwen27b_heretic` | `qwen-27b` | 16 GB | default auto-route model |
+| Huihui Qwythos 9B, Q6_K | `Huihui_Qwen_9b` | `qwythos-9b` | 7.6 GB | fast/small option (auto-route model if the 27B is too slow) |
+| Huihui Qwen3.8 Abliterated | `Huihui_Qwen3.8` | `qwen-abliterated` | 17 GB | pin-only |
+| Phi-4 Heretic, Q4_K_M | `Phi_4` | `phi-4` | 9.1 GB | pin-only |
 
-The four models already on the Pro (Qwen3.8 27B Heretic, Qwen3.8 Abliterated, Qwythos 9B, Phi-4 Heretic) are
-community fine-tunes without a published evaluation; they stay pin-only. Recommended first setting:
-`"auto_route": {"model": "gpt-oss-20b", "bands": ["R0"]}` (reflex work only: D ≤ 2, blast radius 0, small context);
+All four are community fine-tunes without a published evaluation, which is one more reason to start auto-route on
+reflex work only. Recommended first setting:
+`"auto_route": {"model": "qwen-27b", "bands": ["R0"]}` (reflex work only: D ≤ 2, blast radius 0, small context);
 widen to `R1` only after reviewing the `local auto-route` rows in router.db. Which bands go local is the owner's call,
 so the shipped example keeps `auto_route: false`.
 

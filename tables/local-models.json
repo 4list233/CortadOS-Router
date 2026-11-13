@@ -5,8 +5,6 @@
     {"id": "qwen3-8b-4bit", "params_b": 8, "quant": "4bit", "approx_gib": 5.0},
     {"id": "qwen3-14b-4bit", "params_b": 14, "quant": "4bit", "approx_gib": 8.5},
     {"id": "qwen3-32b-4bit", "params_b": 32, "quant": "4bit", "approx_gib": 19.0},
-    {"id": "gpt-oss-20b-mxfp4", "params_b": 21, "quant": "4bit", "approx_gib": 13.0},
-    {"id": "qwen3-coder-30b-a3b-4bit", "params_b": 30, "quant": "4bit", "approx_gib": 17.5},
     {"id": "llama-3.3-70b-4bit", "params_b": 70, "quant": "4bit", "approx_gib": 40.0}
   ]
 }

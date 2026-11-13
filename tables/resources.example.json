@@ -14,17 +14,15 @@
     {"id": "pro", "role": "client", "target": "local", "pool_eligible": false,
      "metal_probe": "/absolute/path/to/metal-budget", "reserve_gib": 6,
      "inventory": {"chip": "M5 Max", "unified_gib": 48, "memory_scope": "unified"},
-     "ollama": {"_comment": "Local models live on the Pro only (#75; owner 2026-11-13: the Studio runs S1, no chat models). The URL is the Pro's local gate (http://<pro tailscale-ip>:11435), from the env var named here (or base_url); the token file path likewise. Never commit a real address or token. The gate refuses on battery or with the manual switch off (local_resources toggle), and the lane is skipped then. auto_route stays false (pin-only) until the owner names the bands; the recommended first setting is {\"model\": \"gpt-oss-20b\", \"bands\": [\"R0\"]} (docs/LOCAL-RESOURCES.md, Local auto-route). context_length must not exceed the Pro's OLLAMA_CONTEXT_LENGTH.",
+     "ollama": {"_comment": "Local models live on the Pro only (#75; owner 2026-11-13: the Studio runs S1, no chat models). The URL is the Pro's local gate (http://<pro tailscale-ip>:11435), from the env var named here (or base_url); the token file path likewise. Never commit a real address or token. The gate refuses on battery or with the manual switch off (local_resources toggle), and the lane is skipped then. The models are the ones already on the Pro (owner 2026-11-13: nothing is downloaded for the router). auto_route stays false (pin-only) until the owner names the bands; the recommended first setting is {\"model\": \"qwen-27b\", \"bands\": [\"R0\"]} (Qwen27b_heretic; Huihui_Qwen_9b is the fast/small option) (docs/LOCAL-RESOURCES.md, Local auto-route). context_length must not exceed the Pro's OLLAMA_CONTEXT_LENGTH.",
                 "base_url_env": "CORTADOS_LOCAL_PRO_OLLAMA_URL", "token_file_env": "CORTADOS_LOCAL_PRO_GATE_TOKEN_FILE",
                 "label": "Pro", "auto_route": false,
                 "probe_timeout_s": 2, "connect_timeout_s": 3, "read_timeout_s": 300,
                 "models": [
-                  {"id": "gpt-oss:20b", "alias": "gpt-oss-20b", "name": "gpt-oss 20B", "context_length": 65536},
-                  {"id": "qwen3-coder:30b", "alias": "qwen3-coder-30b", "name": "Qwen3 Coder 30B-A3B", "context_length": 65536},
-                  {"id": "hf.co/0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M", "alias": "qwen-27b", "name": "Qwen3.8 27B Heretic", "context_length": 65536},
-                  {"id": "huihui_ai/Qwen3.8-abliterated:latest", "alias": "qwen-abliterated", "name": "Qwen3.8 Abliterated", "context_length": 65536},
-                  {"id": "hf.co/huihui-ai/Huihui-Qwythos-9B-Claude-Mythos-5-1M-abliterated-GGUF:Q6_K", "alias": "qwythos-9b", "name": "Qwythos 9B", "context_length": 65536},
-                  {"id": "hf.co/ThalisAI/phi-4-heretic:Q4_K_M", "alias": "phi-4", "name": "Phi-4 Heretic", "context_length": 65536}
+                  {"id": "Qwen27b_heretic", "alias": "qwen-27b", "name": "Qwen3.8 27B Heretic (Q4_K_M, 16 GB)", "context_length": 65536},
+                  {"id": "Huihui_Qwen_9b", "alias": "qwythos-9b", "name": "Huihui Qwythos 9B (Q6_K, 7.6 GB)", "context_length": 65536},
+                  {"id": "Huihui_Qwen3.8", "alias": "qwen-abliterated", "name": "Huihui Qwen3.8 Abliterated (17 GB)", "context_length": 65536},
+                  {"id": "Phi_4", "alias": "phi-4", "name": "Phi-4 Heretic (Q4_K_M, 9.1 GB)", "context_length": 65536}
                 ]}}
   ],
   "deployments": []
