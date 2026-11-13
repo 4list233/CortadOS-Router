@@ -1025,6 +1025,34 @@ class ChildTaskTests(ChildTaskBase):
             self.assertEqual(row["state"], "unknown")
             self.assertIn("unreachable", row["error"])
 
+    def test_host_here_runs_on_the_entry_that_names_this_machine(self):
+        # The shared file (2026-11-13): air over ssh (another machine), the Pro-style entry naming THIS machine.
+        self.write_hosts({"default": "air", "hosts": {
+            "air": {"ssh": "air", "router": "/r", "hostnames": ["not-this-machine"], "root": "/w"},
+            "mine": {"hostnames": [ct.exec_hosts.short_hostname()], "root": self.ws_root}}})
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", lambda a, s, t: self.fail("'here' must not use ssh")):
+            for alias in ("here", "local"):
+                r, out = self.call("start_task", task="x", host=alias, cwd=self.work)
+                self.assertFalse(r.get("isError"), r)
+                self.assertEqual(out["host"], "mine")
+                self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+
+    def test_host_here_without_an_entry_for_this_machine_is_refused_never_sent_elsewhere(self):
+        self.write_hosts({"default": "air", "hosts": {
+            "air": {"ssh": "air", "router": "/r", "hostnames": ["not-this-machine"], "root": "/w"},
+            "pro": {"hostnames": ["some-other-laptop"], "root": "/w"}}})
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", lambda a, s, t: self.fail("no ssh expected")):
+            r, _ = self.call("start_task", task="x", host="here", cwd=self.work)
+            self.assertTrue(r.get("isError"))
+            text = r["content"][0]["text"]
+            self.assertIn("means this machine", text)
+            self.assertIn(ct.exec_hosts.short_hostname(), text)
+            # an ssh-less entry for ANOTHER machine is refused too, not run here under its name
+            r, _ = self.call("start_task", task="x", host="pro", cwd=self.work)
+            self.assertTrue(r.get("isError"))
+            self.assertIn("no ssh destination and is not this machine", r["content"][0]["text"])
+        self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")))
+
     def test_remote_mode_refuses_a_request_for_a_host_that_is_not_this_machine(self):
         import io
         self.write_hosts({"default": "air", "hosts": {"air": {"ssh": "air", "router": "/r", "hostnames": ["not-me"], "root": "/w"}}})

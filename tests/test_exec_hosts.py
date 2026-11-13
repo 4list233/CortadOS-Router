@@ -66,6 +66,62 @@ class HostsFileTests(unittest.TestCase):
         with mock.patch.object(eh, "short_hostname", return_value="elsewhere"):
             self.assertEqual(hosts.local_entry().name, "here")
 
+    def shared(self):
+        """The one file every machine holds (tables/exec-hosts.example.json shape): pro without ssh, air and studio."""
+        return self.write({"default": "air", "hosts": {
+            "pro": {"hostnames": ["Forests-MacBook-Pro"], "root": "/Users/p/CortadOS"},
+            "air": AIR,
+            "studio": {**AIR, "ssh": "studio", "hostnames": ["Forests-Mac-Studio"]}}})
+
+    def test_here_and_local_resolve_to_the_entry_naming_this_machine(self):
+        hosts = eh.load(self.shared())
+        for me, want in (("forests-macbook-pro", "pro"), ("forests-macbook-air", "air"), ("forests-mac-studio", "studio")):
+            with mock.patch.object(eh, "short_hostname", return_value=me):
+                for alias in eh.HERE_ALIASES:
+                    h = hosts.resolve(alias)
+                    self.assertEqual(h.name, want, (me, alias))
+                    self.assertTrue(h.is_local())
+                self.assertEqual(hosts.resolve(env={"CORTADOS_EXEC_HOST": "here"}).name, want)
+                self.assertEqual(hosts.resolve().name, "air")          # the default is still the Air
+
+    def test_here_with_no_entry_for_this_machine_is_an_error_not_a_fallback(self):
+        hosts = eh.load(self.shared())
+        with mock.patch.object(eh, "short_hostname", return_value="someone-elses-mac"):
+            self.assertIsNone(hosts.local_entry())                  # the ssh-less pro entry names another machine
+            with self.assertRaises(eh.HostError) as cm:
+                hosts.resolve("here")
+        msg = str(cm.exception)
+        self.assertIn("someone-elses-mac", msg)
+        self.assertIn("hostnames", msg)
+        self.assertIn("air, pro, studio", msg)
+
+    def test_an_ssh_less_entry_for_another_machine_is_refused_not_run_here(self):
+        hosts = eh.load(self.shared())
+        with mock.patch.object(eh, "short_hostname", return_value="forests-macbook-air"):
+            self.assertFalse(hosts.hosts["pro"].is_local())
+            with self.assertRaises(eh.HostError) as cm:
+                hosts.resolve("pro")
+            self.assertIn("no ssh destination and is not this machine", str(cm.exception))
+            self.assertIn("forests-macbook-pro", str(cm.exception))
+            with self.assertRaises(eh.HostError):
+                eh.call(hosts.hosts["pro"], "list", {}, transport=lambda *a: self.fail("no ssh expected"))
+        with mock.patch.object(eh, "short_hostname", return_value="forests-macbook-pro"):
+            self.assertTrue(hosts.resolve("pro").is_local())
+
+    def test_an_entry_named_like_an_alias_must_be_this_machine(self):
+        self.write({"default": "here", "hosts": {"here": {"ssh": "air", "router": "/r"}}})
+        with self.assertRaises(eh.HostError) as cm:
+            eh.load(self.path)
+        self.assertIn("mean this machine", str(cm.exception))
+
+    def test_example_file_recognises_each_machine(self):
+        hosts = eh.load(str(eh.EXAMPLE_FILE))
+        self.assertEqual(sorted(hosts.hosts), ["air", "pro", "studio"])
+        self.assertIsNone(hosts.hosts["pro"].ssh)                  # nothing ssh-es into the laptop
+        for me, want in (("forests-macbook-pro", "pro"), ("forests-macbook-air", "air"), ("forests-mac-studio", "studio")):
+            with mock.patch.object(eh, "short_hostname", return_value=me):
+                self.assertEqual(hosts.resolve("here").name, want)
+
     def test_invalid_entries_are_refused_with_the_field_named(self):
         bad = [({"default": "a", "hosts": {"a": {"ssh": "a"}}}, "router"),
                ({"default": "a", "hosts": {"a": {"root": "relative"}}}, "absolute path"),

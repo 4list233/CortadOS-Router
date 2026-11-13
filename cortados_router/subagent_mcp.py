@@ -98,7 +98,11 @@ CHILD_TOOLS = [
                  "EXECUTION HOST. Not for repositories (use repo); a path that exists only on the requesting machine "
                  "is refused with a message saying so."},
          "host": {"type": "string", "description": "Optional: the name of a configured execution host "
-                  "(~/.config/cortados/exec-hosts.json). Default: the file's default, the Air."},
+                  "(~/.config/cortados/exec-hosts.json). Default: the file's default, the Air. 'here' (or 'local'): "
+                  "the machine this server runs on; use it when the task needs this machine's signed-in browser "
+                  "(e.g. Duo/SSO sites like Quercus), local files or local apps. 'studio' for heavy local-model/GPU "
+                  "work once set up. Chrome serves one client at a time per machine: while a 'here' chrome task "
+                  "runs, do not use Chrome yourself. No entry for this machine is an error, never another host."},
          "title": {"type": "string", "description": "Optional short label for the task (1-80 printable ASCII "
                    "characters), shown in the CortadOS Office view. A label only: never secrets or file contents."},
          "parent_task_id": {"type": "string", "description": "Optional: the task id (t<14 digits>-<8 hex>) of the "

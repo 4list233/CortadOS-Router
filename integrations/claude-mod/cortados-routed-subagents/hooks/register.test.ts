@@ -1738,6 +1738,8 @@ test('the injected directive names start_task, forbids the Agent tool, states pr
   expect(sec.text).toContain('Do NOT delegate with the Agent tool')
   expect(sec.text).toContain('PLANS, DELEGATES, VERIFIES and REPORTS')
   expect(sec.text).toContain('Act directly only when absolutely necessary')
+  expect(sec.text).toContain('pass host "here" when the task needs THIS machine')
+  expect(sec.text).toContain('do not use Chrome yourself')
   expect(sec.text).toContain('connector or Chrome work that child tasks cannot do yet')
   expect(sec.text).toContain('unless the owner explicitly asks to fork')
   expect(sec.text).not.toContain('a single small edit')
