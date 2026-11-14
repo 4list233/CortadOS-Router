@@ -1348,6 +1348,10 @@ class EndpointTests(EndpointHarness):
         self.assertEqual(cm.exception.code, 401)
 
     def test_dashboard_page_is_served_without_a_token(self):
+        # a throwaway home with no dashboard password: GET /dashboard reads $CORTADOS_HOME/dashboard-auth.json, and a
+        # password set in the real home would serve the login page instead (provider/dashboard_auth.py)
+        home = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, home, True)
+        env = mock.patch.dict(os.environ, {"CORTADOS_HOME": home}); env.start(); self.addCleanup(env.stop)
         req = urllib.request.Request(self.url + "/dashboard")
         with urllib.request.urlopen(req, timeout=30) as r:
             self.assertEqual(r.status, 200)

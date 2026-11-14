@@ -39,7 +39,9 @@ is the long form.
   flags and /health; installed per host by `scripts/install_live_heartbeat.sh`, README "Live view"). `usage.py` builds `GET /v1/cortados/usage` and `tasks.py` builds
   `GET /v1/cortados/tasks` (the latest 200 `routes` rows as metadata: model, band, S1 reason by category, elapsed, % routed
   per session; never the request text; tokens are not recorded per route), both behind the owner token and both read by
-  `dashboard.html` (`GET /dashboard`).
+  `dashboard.html` (`GET /dashboard`). `dashboard_auth.py` is the dashboard's password login (CLI `set-password` /
+  `clear-password` / `status` / `logout-all`; sessions open only the read views and `local:switch` through
+  `Handler._owner_or_session`, never the model endpoints; README "Dashboard password").
 - `tables/` — routing table, budgets, generated model scores and tiers (`*.generated.json` are built
   nightly by `tables/benchmarks/build_tiers.py`; do not hand-edit them).
 - `s1/` — S1 scorer: dataset, labelling, SFT, evaluation, serving, nightly job.

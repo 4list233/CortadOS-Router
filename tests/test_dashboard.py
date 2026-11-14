@@ -11,6 +11,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 from pathlib import Path
 
 from cortados_router.provider import server, usage
@@ -30,6 +31,9 @@ def _csp(header: str) -> dict:
 
 class DashboardTest(unittest.TestCase):
     def setUp(self):
+        # a throwaway home: GET /dashboard reads $CORTADOS_HOME/dashboard-auth.json (provider/dashboard_auth.py)
+        home = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, home, True)
+        env = mock.patch.dict(os.environ, {"CORTADOS_HOME": home}); env.start(); self.addCleanup(env.stop)
         self.reg = Registry(gateway_url="", token=TOKEN, claude_bin=["true"])
         self.httpd = ProviderServer(("127.0.0.1", 0), self.reg)
         self.httpd.usage_view = lambda reg: {"lanes": []}
@@ -133,6 +137,14 @@ class DashboardTest(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/dashboard", timeout=10) as r:   # the real page still serves
             self.assertEqual(r.status, 200)
 
+    def test_token_mode_meta_and_hint(self):
+        with urllib.request.urlopen(self.base + "/dashboard", timeout=10) as r:
+            body = r.read().decode()
+        self.assertIn('<meta id="cortados-auth" name="cortados-auth" content="token">', body)
+        self.assertIn('<meta id="cortados-csrf" name="cortados-csrf" content="">', body)
+        self.assertIn("set a password: python3 -B -m cortados_router.provider.dashboard_auth set-password (on the Air)",
+                      body)
+
     def test_usage_still_needs_auth(self):
         with self.assertRaises(urllib.error.HTTPError) as cm:
             urllib.request.urlopen(self.base + "/v1/cortados/usage", timeout=10)
@@ -167,6 +179,10 @@ function mk(tag) { const n = { tag, kids: [], className: "", style: {}, hidden: 
   appendChild(k) { n.kids.push(k); return k; }, replaceChildren(...k) { n._t = ""; n.kids = k; },
   addEventListener(ev, f) { n.on[ev] = f; }, focus() {} }; return n; }
 const ids = new Proxy({}, { get: (o, i) => o[i] || (o[i] = mk("div")) });
+// IN_.session: the page as served to a logged-in browser (the server's cortados-auth / cortados-csrf meta tags)
+if (IN_.session) { ids["cortados-auth"].content = "session"; ids["cortados-csrf"].content = IN_.session; }
+let replaced = "", creds = "", logoutCall = "";
+global.location = { replace(u) { replaced = u; } };
 global.document = { createElement: mk, getElementById: (i) => ids[i], body: mk("body"), documentElement: mk("html"),
                     hidden: false, addEventListener() {} };
 const boom = () => { throw new Error("SecurityError"); };
@@ -176,16 +192,19 @@ global.sessionStorage = { getItem: (k) => broken ? boom() : (k === "cortados-usa
 global.setInterval = () => 1; global.clearInterval = () => {};
 let auth = "", polls = 0;
 global.fetch = async (url, opts) => {
-  if (url === "/v1/cortados/tasks") { tasksAuth = opts.headers.Authorization; tasksPolls++;
+  creds = opts.credentials;
+  if (url === "/dashboard/logout") { logoutCall = opts.method + " " + (opts.headers || {})["x-cortados-csrf"] + " " + opts.referrerPolicy;
+    return { status: 200, ok: true }; }
+  if (url === "/v1/cortados/tasks") { tasksAuth = (opts.headers || {}).Authorization || ""; tasksPolls++;
     if (mode === "tasks500") return { status: 500, ok: false };
     return { status: 200, ok: true, json: async () => tasksView }; }
-  if (url === "/v1/cortados/live") { liveAuth = opts.headers.Authorization; livePolls++;
+  if (url === "/v1/cortados/live") { liveAuth = (opts.headers || {}).Authorization || ""; livePolls++;
     if (livePolls > 1 && mode === "live500") return { status: 500, ok: false };
     if (livePolls > 1 && mode === "live401") return { status: 401, ok: false };
     if (livePolls > 1 && mode === "live403") return { status: 403, ok: false };
     if (livePolls > 1 && mode === "livethrow") throw new Error("network down");
     return { status: 200, ok: true, json: async () => liveView }; }
-  auth = opts.headers.Authorization; polls++;
+  auth = (opts.headers || {}).Authorization || ""; polls++;
   if (polls > 1 && mode === "fetch500") return { status: 500, ok: false };
   if (polls > 1 && mode === "fetchthrow") throw new Error("network down");
   return { status: 200, ok: true, json: async () => view }; };
@@ -201,6 +220,7 @@ const tick = () => new Promise(r => setImmediate(r));
   if (liveTab) {
     runTicks();
     if (mode === "livebusy") { await Promise.all([refreshLive(), refreshLive()]); await tick(); }
+    else if (mode === "livelogout") { ids.logout.on.click(); await tick(); await tick(); }
     else if (mode !== "live") { await refreshLive(); await tick(); }
   } else {
     if (mode === "storagelater") broken = true;
@@ -218,6 +238,7 @@ const tick = () => new Promise(r => setImmediate(r));
   out("LOGIN: " + (ids.login.hidden ? "hidden" : "shown") + " AUTH: " + auth + " POLLS: " + polls);
   out("TASKS: AUTH: " + tasksAuth + " POLLS: " + tasksPolls);
   out("LIVE: AUTH: " + liveAuth + " POLLS: " + livePolls + " TAB: " + (ids.live.hidden ? "hidden" : "shown"));
+  out("SESSION: creds=" + creds + " replaced=" + replaced + " logout=" + logoutCall + " button=" + ids.logout.textContent);
 })().catch(fail);
 """
 _NODE_PRELUDE = ("const fs = require('fs'); global.HARNESS_IN = JSON.parse(fs.readFileSync(0, 'utf8'));"
@@ -278,9 +299,9 @@ class DashboardRenderTest(unittest.TestCase):
         args.update(kw)
         return usage.collect(**args)
 
-    def run_page(self, view, mode="render", tasks_view=None, live_view=None):
+    def run_page(self, view, mode="render", tasks_view=None, live_view=None, session=None):
         r = run_harness(_HARNESS, {"page": server._DASHBOARD_PATH.read_text(), "mode": mode, "view": view,
-                                   "tasks": tasks_view, "live": live_view})
+                                   "tasks": tasks_view, "live": live_view, "session": session})
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
 
@@ -469,3 +490,32 @@ class DashboardRenderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    # ---------------------------------------------------------------- session mode (a dashboard password is set)
+    def test_token_mode_unchanged(self):
+        out = self.run_page(self.view(), "refresh")
+        self.assertIn("AUTH: Bearer tok", out)
+        self.assertIn("SESSION: creds=omit", out)
+        self.assertIn("button=Forget token", out)
+
+    def test_session_mode_fetches_with_the_cookie_only(self):
+        out = self.run_page(self.view(), "refresh", session="csrf-token-123")
+        self.assertIn("LOGIN: hidden AUTH:  POLLS: ", out)          # no Authorization header at all
+        self.assertIn("TASKS: AUTH:  POLLS: 1", out)
+        self.assertIn("SESSION: creds=same-origin", out)
+        self.assertIn("button=Log out", out)
+        out = self.run_page(None, "live", live_view={"generated_at": 1}, session="csrf-token-123")
+        self.assertIn("LIVE: AUTH:  POLLS: 1", out)
+        self.assertIn("LOGIN: hidden", out)
+
+    def test_session_401_goes_back_to_the_login_page(self):
+        out = self.run_page(None, "live401", live_view={"generated_at": 1}, session="csrf-token-123")
+        self.assertIn("replaced=/dashboard", out)
+        self.assertIn("LOGIN: hidden", out)                          # never the token form in session mode
+
+    def test_session_logout_posts_the_csrf_token(self):
+        out = self.run_page(None, "livelogout", live_view={"generated_at": 1}, session="csrf-token-123")
+        # referrerPolicy same-origin: under the page's no-referrer policy the POST would carry `Origin: null`
+        self.assertIn("logout=POST csrf-token-123 same-origin", out)
+        self.assertIn("replaced=/dashboard", out)
+

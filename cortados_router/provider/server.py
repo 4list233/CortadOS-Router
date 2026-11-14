@@ -26,6 +26,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import html as html_escape
 import json
 import logging
 import os
@@ -46,7 +47,7 @@ if __package__ in (None, ""):                           # run as a file: make th
 
 from cortados_router.compat import getenv
 from cortados_router.compaction import prune as compaction_prune, store as compaction_store
-from cortados_router.provider import anthropic_wire, clients, live, local_lane, office, responses_wire, routing, search_lane
+from cortados_router.provider import anthropic_wire, clients, dashboard_auth, live, local_lane, office, responses_wire, routing, search_lane
 from cortados_router.provider.bridge import BridgeError, BridgeSession, ToolWaitExpired, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
 from cortados_router.provider.timeouts import IDLE_S, TOOL_WAIT_S, TURN_TIMEOUT_S, effective_tool_wait
@@ -235,6 +236,55 @@ def _dashboard_csp() -> str:
     """The Content-Security-Policy for the page _dashboard_html() returned."""
     _dashboard_html()
     return _dashboard_cache["csp"]
+
+
+# The page's auth mode and CSRF token travel in two <meta> tags (outside the script, so the CSP's script hash is the same
+# for every mode). "token": no password is set, the page asks for the provider token as before. "session": a dashboard
+# session (provider/dashboard_auth.py) is open, the page fetches with its cookie and sends the CSRF token on a POST.
+_AUTH_META = b'<meta id="cortados-auth" name="cortados-auth" content="token">'
+_CSRF_META = b'<meta id="cortados-csrf" name="cortados-csrf" content="">'
+
+
+def _dashboard_page(session: "dashboard_auth.Session | None") -> bytes:
+    """The dashboard page for this request: token mode, or session mode carrying that session's CSRF token."""
+    page = _dashboard_html()
+    if session is None:
+        return page
+    if page.count(_AUTH_META) != 1 or page.count(_CSRF_META) != 1:
+        raise ValueError("dashboard page: the auth meta tags are missing")
+    csrf = html_escape.escape(session.csrf, quote=True).encode()   # urlsafe base64 already; escaped all the same
+    return (page.replace(_AUTH_META, _AUTH_META.replace(b'content="token"', b'content="session"'))
+            .replace(_CSRF_META, _CSRF_META.replace(b'content=""', b'content="' + csrf + b'"')))
+
+
+# The login page (a password is set and the request has no valid session): a plain form and no script at all, so its
+# policy allows no script; form-action 'self' is what lets it post to /dashboard/login.
+LOGIN_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+# The login page's referrer policy is same-origin, not the dashboard's no-referrer: under no-referrer a browser sends
+# `Origin: null` on a form POST, and the login's same-origin check (dashboard_auth.same_origin) would refuse the owner.
+# same-origin still sends nothing to another site. (The page's own logout fetch sets referrerPolicy per request.)
+LOGIN_HEADERS = {"Referrer-Policy": "same-origin"}
+LOGIN_PATH, LOGOUT_PATH = "/dashboard/login", "/dashboard/logout"
+# A login body is one short form field; anything bigger is refused before it is read.
+LOGIN_MAX_BYTES = 4096
+_LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark"><title>CortadOS · log in</title>
+<style>body{{font:15px system-ui,sans-serif;max-width:22rem;margin:12vh auto;padding:0 1rem}}
+input,button{{font:inherit;width:100%;box-sizing:border-box;padding:.5rem;margin:.4rem 0}}.msg{{color:#c0392b;min-height:1.2em}}</style>
+</head><body><h1>CortadOS</h1>
+<form method="post" action="/dashboard/login">
+<label for="password">Dashboard password</label>
+<input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+<button type="submit">Log in</button></form>
+<p class="msg">{message}</p>
+</body></html>
+"""
+
+
+def _login_page(message: str = "") -> bytes:
+    """The login page; `message` is one of this module's fixed strings, escaped all the same."""
+    return _LOGIN_PAGE.format(message=html_escape.escape(message, quote=True)).encode()
 # SSE pings while a turn runs, so the client's read timeout does not fire during a long think.
 PING_S = 10.0
 # Seconds a socket read or write may block (http.server applies it to the connection). A client that stops reading
@@ -401,6 +451,14 @@ def endpoint_id(path: str | None) -> str:
         return p[1:].replace("/", "_")
     if p in ("/", "/dashboard"):
         return "dashboard"
+    if p == LOGIN_PATH:
+        return "dashboard_login"
+    if p == LOGOUT_PATH:
+        return "dashboard_logout"
+    if p == dashboard_auth.LOCAL_PATH:
+        return "local"
+    if p == dashboard_auth.LOCAL_SWITCH_PATH:
+        return "local_switch"
     return "other"
 
 
@@ -695,6 +753,9 @@ class Registry:
         # Scoped client tokens (clients.json). Consulted only when the owner token does not match, so the owner's
         # behaviour is unchanged; a client token opens only its scopes' endpoints and gets 403 everywhere else.
         self.clients = clients.ClientTokens(owner_token=token)
+        # Dashboard password and sessions ($CORTADOS_HOME/dashboard-*.json, provider/dashboard_auth.py). A session opens
+        # only the dashboard's views (and local:switch), through Handler._owner_or_session; the owner token is unchanged.
+        self.dashboard = dashboard_auth.DashboardAuth()
         # Recently closed conversations, for the 409 diagnostic only (find -> _lost_diagnostic): (closed_at, reason,
         # first reply fingerprint, history length). A 409 whose first fingerprint is here was a conversation this
         # endpoint closed itself (reaped, dropped, failed), which tells a reap from a lost response or an edited
@@ -1149,6 +1210,132 @@ class Handler(BaseHTTPRequestHandler):
         self._authed = ok                               # per request: do_GET/do_POST reset it first (keep-alive reuse)
         return ok
 
+    def _peer(self) -> str:
+        return self.client_address[0] if self.client_address else ""
+
+    def _dash_session(self) -> "dashboard_auth.Session | None":
+        """The dashboard session this request's cookie names, or None. Only a request that carries no token at all is
+        looked up: a client that sends a token is judged on that token alone, never on a cookie beside it."""
+        if self._credential():
+            return None
+        try:
+            return self.server.registry.dashboard.session(self.headers.get("cookie"))
+        except Exception as exc:                        # fail closed for the cookie; the owner token is unaffected
+            logger.error("dashboard session check failed: %s", type(exc).__name__)
+            return None
+
+    def _owner_or_session(self, method: str) -> bool:
+        """THE auth check of the dashboard's views (live, usage, tasks, office) and of the local switch
+        (/v1/cortados/local and /local/switch, branch local-switch-remote): True for a scoped client token _scope_gate
+        already admitted, for the owner token, or, when the request carries no token, for a dashboard session whose
+        scopes cover (method, path) (dashboard_auth.SESSION_SCOPES). A state-changing method on a session must also pass
+        the same-origin and CSRF-token check (the page's fetch must set referrerPolicy "same-origin", else the
+        browser sends `Origin: null` under the page's no-referrer policy). Everything else (/v1/messages, /v1/responses, heartbeats, runs, models,
+        resources) calls _authorized(), which never reads the cookie. On False, _refuse_auth() answers."""
+        self._auth_refusal = None
+        if self._scoped is not None or self._authorized():
+            return True
+        s = self._dash_session()
+        if s is None or not s.allows(method, self.path.split("?")[0]):
+            return False
+        if method not in dashboard_auth.SAFE_METHODS and not self.server.registry.dashboard.csrf_ok(
+                s, self.headers, self._peer()):
+            self._auth_refusal = (403, "permission_error", "cortados: cross-site or CSRF-less dashboard request refused")
+            return False
+        return True
+
+    def _refuse_auth(self):
+        code, kind, msg = getattr(self, "_auth_refusal", None) or (401, "authentication_error", "bad or missing token")
+        return self._error(code, kind, msg)
+
+    def _html_page(self, code: int, page: bytes, csp: str, headers: dict[str, str] | None = None) -> None:
+        """An HTML page with the dashboard's headers; `headers` replaces a header of the same name, never doubles it."""
+        self.send_response(code)
+        self.send_header("content-type", "text/html; charset=utf-8")
+        self.send_header("content-length", str(len(page)))
+        for k, v in {**DASHBOARD_HEADERS, "Content-Security-Policy": csp, **(headers or {})}.items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(page)
+
+    def _dashboard_get(self) -> None:
+        """GET /dashboard: no password set, the token-paste page (as before); a password set, the dashboard in session
+        mode for a valid session cookie, else the login page. An unusable auth file is a 500, never the token page."""
+        auth = self.server.registry.dashboard
+        try:
+            rec = auth.record()
+        except dashboard_auth.AuthFileError:
+            return self._html_page(500, _login_page("dashboard login unavailable: dashboard-auth.json is unusable "
+                                                    "(see the provider log)"), LOGIN_CSP, LOGIN_HEADERS)
+        session = None
+        if rec is not None:
+            session = self._dash_session()
+            if session is None:
+                return self._html_page(200, _login_page(), LOGIN_CSP, LOGIN_HEADERS)
+        try:
+            page = _dashboard_page(session)
+            csp = _dashboard_csp()
+        except (OSError, ValueError) as exc:
+            logger.warning("dashboard page unavailable: %s", type(exc).__name__)
+            return self._error(500, "api_error", "dashboard page unavailable")
+        return self._html_page(200, page, csp)
+
+    def _dashboard_login(self) -> None:
+        """POST /dashboard/login (form field `password`). Size and origin are checked before the body is read; every
+        refusal before the read closes the connection. The password is never logged (dashboard_auth.login)."""
+        self.close_connection = True                    # one login per connection: nothing unread is parsed later
+        try:
+            n = int(self.headers.get("content-length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0 or n > LOGIN_MAX_BYTES:
+            return self._html_page(413, _login_page("the login request is too large"), LOGIN_CSP, LOGIN_HEADERS)
+        ctype = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if ctype != "application/x-www-form-urlencoded":
+            return self._html_page(415, _login_page("the login form must be posted as a form"), LOGIN_CSP, LOGIN_HEADERS)
+        if not dashboard_auth.same_origin(self.headers, self._peer()):
+            logger.warning("dashboard login refused: not same-origin (origin %r, host %r)",
+                           (self.headers.get("origin") or "")[:100], (self.headers.get("host") or "")[:100])
+            return self._html_page(403, _login_page("cross-site login refused"), LOGIN_CSP, LOGIN_HEADERS)
+        from urllib.parse import parse_qs
+        try:
+            form = parse_qs(self.rfile.read(n).decode("utf-8"), keep_blank_values=True, max_num_fields=4)
+        except ValueError:                              # undecodable bytes or too many fields
+            return self._html_page(400, _login_page("the login form is malformed"), LOGIN_CSP, LOGIN_HEADERS)
+        password = (form.get("password") or [""])[0]
+        addr = dashboard_auth.client_address(self._peer(), self.headers.get("x-forwarded-for") or "")
+        r = self.server.registry.dashboard.login(password, addr)
+        del password, form
+        if r["ok"]:
+            self.send_response(303)
+            self.send_header("Location", "/dashboard")
+            self.send_header("Set-Cookie", dashboard_auth.session_cookie(r["cookie"]))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+        headers = dict(LOGIN_HEADERS, **({"Retry-After": str(r["retry_after"])} if r.get("retry_after") else {}))
+        msg = r["why"] + (f"; try again in {max(1, round(r['retry_after'] / 60))} min" if r.get("retry_after") else "")
+        return self._html_page(r["status"], _login_page(msg), LOGIN_CSP, headers)
+
+    def _dashboard_logout(self) -> None:
+        """POST /dashboard/logout: ends the cookie's session. Needs the session, same origin and its CSRF token."""
+        self.close_connection = True                    # the body (if any) is never read
+        s = self._dash_session()
+        if s is None:
+            return self._error(401, "authentication_error", "no dashboard session")
+        auth = self.server.registry.dashboard
+        if not auth.csrf_ok(s, self.headers, self._peer()):
+            return self._error(403, "permission_error", "cortados: cross-site or CSRF-less dashboard request refused")
+        try:
+            auth.logout(s)
+        except OSError as exc:
+            logger.error("dashboard logout: cannot update the sessions file: %s", type(exc).__name__)
+            return self._error(500, "api_error", "cortados: logout failed (see provider log)")
+        return self._json(200, {"ok": True}, headers={"Set-Cookie": dashboard_auth.clear_cookie(),
+                                                      "Cache-Control": "no-store"})
+
     def _scoped_client(self) -> "clients.Client | None":
         """The scoped client whose token this request carries, or None (no token, the owner token, or an unknown one).
         The owner token is checked first and never reaches the client table."""
@@ -1254,9 +1441,9 @@ class Handler(BaseHTTPRequestHandler):
         if self._scope_gate("GET"):
             return
         if self.path.split("?")[0] == clients.OFFICE_PATH:
-            # The one endpoint a scoped token may open (office:read), and the owner's too. Read-only, metadata only.
-            if self._scoped is None and not self._authorized():
-                return self._error(401, "authentication_error", "bad or missing token")
+            # The owner token, a scoped token with office:read, or a dashboard session. Read-only, metadata only.
+            if not self._owner_or_session("GET"):
+                return self._refuse_auth()
             try:
                 view = self.server.office_view(self.server.registry)
                 body = json.dumps(view, allow_nan=False).encode()
@@ -1265,9 +1452,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(500, "api_error", "cortados: office view unavailable (see provider log)")
             return self._json(200, body)
         if self.path.split("?")[0] == live.LIVE_PATH:
-            # Owner token, or a scoped token with live:read. Metadata only (provider/live.py), never request text.
-            if self._scoped is None and not self._authorized():
-                return self._error(401, "authentication_error", "bad or missing token")
+            # Owner token, a scoped token with live:read, or a dashboard session. Metadata only (provider/live.py).
+            if not self._owner_or_session("GET"):
+                return self._refuse_auth()
             try:
                 body = self.server.live_body(self.server.registry)
             except Exception as exc:
@@ -1277,21 +1464,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             return self._json(200, {"ok": True, "conversations": len(self.server.registry.sessions)})
         if self.path in ("/", "/dashboard"):
-            try:
-                html = _dashboard_html()                # static page; the data it shows (/v1/cortados/usage) still needs the token
-                csp = _dashboard_csp()
-            except (OSError, ValueError) as exc:
-                logger.warning("dashboard page unavailable: %s", type(exc).__name__)
-                return self._error(500, "api_error", "dashboard page unavailable")
-            self.send_response(200)
-            self.send_header("content-type", "text/html; charset=utf-8")
-            self.send_header("content-length", str(len(html)))
-            for k, v in DASHBOARD_HEADERS.items():
-                self.send_header(k, v)
-            self.send_header("Content-Security-Policy", csp)
-            self.end_headers()
-            self.wfile.write(html)
-            return
+            return self._dashboard_get()
         if self.path.startswith("/v1/models"):
             if not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
@@ -1325,8 +1498,8 @@ class Handler(BaseHTTPRequestHandler):
             snap = resources.snapshot(core, local_config=getenv("CORTADOS_LOCAL_RESOURCES_CONFIG"))
             return self._json(200, snap)
         if self.path.split("?")[0] == "/v1/cortados/tasks":
-            if not self._authorized():
-                return self._error(401, "authentication_error", "bad or missing token")
+            if not self._owner_or_session("GET"):        # the owner token or a dashboard session
+                return self._refuse_auth()
             try:
                 body = json.dumps(self.server.tasks_view(self.server.registry), allow_nan=False).encode()
             except Exception as exc:
@@ -1334,8 +1507,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(500, "api_error", "cortados: tasks view unavailable (see provider log)")
             return self._json(200, body)
         if self.path.split("?")[0] == "/v1/cortados/usage":
-            if not self._authorized():
-                return self._error(401, "authentication_error", "bad or missing token")
+            if not self._owner_or_session("GET"):        # the owner token or a dashboard session
+                return self._refuse_auth()
             try:   # a bug in a source must not drop the connection: a clean 500, detail (type only) in the log
                 view = self.server.usage_view(self.server.registry)
                 # the live view arrives encoded (usage.collect memoises the bytes); a dict is encoded strictly here,
@@ -1365,6 +1538,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == live.HEARTBEAT_PATH:
             return self._live_heartbeat()
+        if path == LOGIN_PATH:
+            return self._dashboard_login()
+        if path == LOGOUT_PATH:
+            return self._dashboard_logout()
         # Every error on a wire's path is in that wire's shape, the 401 and the unreadable body included: Codex prints
         # the Responses error body verbatim and would show an Anthropic envelope as noise.
         w = WIRES.get(path, wire)
