@@ -45,6 +45,7 @@ class FakeOllama(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    thinker = None              # "ollama" / "ignores-disabled": answer as a thinking model does (#108)
     mode = "ok"                 # "truncated" / "stalled": a broken error body (review round 2, item 4)
     error_body = None           # bytes: answer every POST with this 400 body
 
@@ -82,6 +83,18 @@ class FakeOllama(BaseHTTPRequestHandler):
             content = [{"type": "tool_use", "id": f"toolu_{uuid.uuid4().hex[:8]}", "name": body["tools"][0]["name"],
                         "input": {"path": "x"}}]
             stop = "tool_use"
+        elif FakeOllama.thinker:
+            # What Ollama 0.40.16's /v1/messages did with Qwen27b_heretic (#108): no `thinking` field means the model
+            # thinks, and the thinking counts against max_tokens (a 20-token budget ends on max_tokens with a thinking
+            # block only); {"type": "disabled"} answers with text alone. "ignores-disabled" stands for a node that
+            # thinks anyway, so the safety net can be exercised.
+            off = (body.get("thinking") or {}).get("type") == "disabled" and FakeOllama.thinker != "ignores-disabled"
+            if off:
+                content, stop = [{"type": "text", "text": "42"}], "end_turn"
+            elif body["max_tokens"] <= 20:
+                content, stop = [{"type": "thinking", "thinking": "The user asks"}], "max_tokens"
+            else:
+                content, stop = [{"type": "thinking", "thinking": "6*7=42."}, {"type": "text", "text": "42"}], "end_turn"
         else:
             content = [{"type": "thinking", "thinking": "hm"}, {"type": "text", "text": "hello from qwen"}]
             stop = "end_turn"
@@ -110,7 +123,7 @@ class FakeOllama(BaseHTTPRequestHandler):
             if b["type"] == "text":                       # text streams as deltas, as Ollama sends it
                 events += [{"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}}]
                 events += [{"type": "content_block_delta", "index": i, "delta": {"type": "text_delta", "text": w}}
-                           for w in ("hello ", "from ", "qwen")]
+                           for w in ((b["text"],) if FakeOllama.thinker else ("hello ", "from ", "qwen"))]
             else:
                 events += [{"type": "content_block_start", "index": i, "content_block": b}]
             events += [{"type": "content_block_stop", "index": i}]
@@ -121,12 +134,13 @@ class FakeOllama(BaseHTTPRequestHandler):
             self.wfile.flush()
 
 
-def write_config(directory, base_url, auto_route=False, token_file=None):
+def write_config(directory, base_url, auto_route=False, token_file=None, thinking=None):
     cfg = {"nodes": [{"id": "pro", "role": "client", "target": "local", "pool_eligible": False,
                       "ollama": {"base_url_env": "TEST_LOCAL_PRO_URL", "auto_route": auto_route, "probe_timeout_s": 1,
                                  "connect_timeout_s": 1, "read_timeout_s": 5,
                                  **({"token_file": token_file} if token_file else {}),
-                                 "models": [{"id": TAG, "alias": "qwen-27b", "name": "Qwen 27B", "context_length": 32768},
+                                 "models": [{"id": TAG, "alias": "qwen-27b", "name": "Qwen 27B", "context_length": 32768,
+                                             **({"thinking": thinking} if thinking else {})},
                                             {"id": "phi:latest"}]}}]}
     p = Path(directory) / "resources.json"
     p.write_text(json.dumps(cfg))
@@ -140,6 +154,7 @@ class LocalHarness(EndpointHarness):
         self.ollama = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllama)
         threading.Thread(target=self.ollama.serve_forever, daemon=True).start()
         FakeOllama.seen = []
+        FakeOllama.thinker = None
         self._env = os.environ.get(local_lane.CONFIG_ENV)
         os.environ[local_lane.CONFIG_ENV] = write_config(self.scratch, f"http://127.0.0.1:{self.ollama.server_port}")
         self._keep = (core.STATE, core.lane_health, core.decide)
@@ -399,6 +414,47 @@ class LocalPinTests(LocalHarness):
         self.assertEqual(code, 502)
         self.assertIn("local relay failed", msg)
         self.assertEqual(self.reg.sessions, {})
+
+
+class LocalThinkingTests(LocalHarness):
+    """#108: a thinking model on Ollama thinks unless told not to, and the thinking eats max_tokens. Under the default
+    `off-unless-asked` the relay sends thinking disabled when the client did not ask; a client's thinking passes
+    through; a pinned conversation gets a thinking-only reply as the node sent it (the person chose the model)."""
+
+    BODY = {"model": "sub/qwen-27b", "max_tokens": 20, "messages": [{"role": "user", "content": "What is 6*7?"}]}
+
+    def setUp(self):
+        super().setUp()
+        FakeOllama.thinker = "ollama"
+
+    def test_small_max_tokens_without_thinking_asks_the_node_not_to_think(self):
+        for stream in (False, True):
+            got = self.post({**self.BODY, "stream": stream})
+            self.assertEqual(FakeOllama.seen[-1][1]["thinking"], {"type": "disabled"})
+            self.assertIn("42", got if stream else got["content"][0]["text"])
+
+    def test_a_disabled_or_odd_thinking_field_is_sent_as_disabled(self):
+        for value in ({"type": "disabled"}, None, "yes"):
+            self.post({**self.BODY, "thinking": value})
+            self.assertEqual(FakeOllama.seen[-1][1]["thinking"], {"type": "disabled"}, value)
+
+    def test_client_thinking_is_passed_through_and_a_thinking_only_pinned_reply_is_relayed(self):
+        asked = {"type": "enabled", "budget_tokens": 1024}
+        got = self.post({**self.BODY, "thinking": asked})
+        self.assertEqual(FakeOllama.seen[-1][1]["thinking"], asked)
+        self.assertEqual((got["stop_reason"], [b["type"] for b in got["content"]]), ("max_tokens", ["thinking"]))
+
+    def test_passthrough_model_is_sent_as_the_client_sent_it(self):
+        write_config(self.scratch, f"http://127.0.0.1:{self.ollama.server_port}", thinking="passthrough")
+        got = self.post(self.BODY)
+        self.assertNotIn("thinking", FakeOllama.seen[-1][1])
+        self.assertEqual(got["stop_reason"], "max_tokens")             # pinned: relayed as the node sent it
+
+    def test_thinking_mode_config(self):
+        self.assertEqual(local_lane.find("qwen-27b")[1]["thinking"], "off-unless-asked")    # the default
+        write_config(self.scratch, "http://127.0.0.1:9", thinking="always")
+        with self.assertRaisesRegex(local_lane.LocalConfigError, "thinking must be one of"):
+            local_lane.nodes()
 
 
 class LocalConversationPinTests(LocalHarness):
