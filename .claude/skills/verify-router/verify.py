@@ -427,11 +427,15 @@ def main():
         local = lambda x: str(x.get("provider")).startswith("local-")
         served = lambda x: x.get("provider") in ("claude-cli", "codex-cli") and not x.get("error")
         degraded_why = unreachable if not up else f"S1 listening at {s1_where} but the decision is degraded"
-        if r["flag"].get("degraded"):
+        # S1 can time out on single calls (#109 merge, 2026-11-14): each call is judged on its own. A degraded call must
+        # stay off local and off Claude; any degraded call leaves the scored check without answers (BLOCKED).
+        degraded = {k: x for k, x in r.items() if x.get("degraded")}
+        if degraded:
             record("degraded decision is never sensitive-routed local (nor to Claude)",
-                   "PASS" if all(x.get("provider") == "codex-cli" for x in r.values()) else "FAIL", json.dumps(r["flag"]))
+                   "PASS" if all(x.get("provider") == "codex-cli" for x in degraded.values()) else "FAIL",
+                   json.dumps(degraded))
             record("sensitive request goes local only with no outward effect", "BLOCKED",
-                   f"no answers to check: {degraded_why}")
+                   f"{len(degraded)} of {len(r)} calls degraded ({', '.join(degraded)}): {degraded_why}")
         else:
             flag, key, plain, down, out = r["flag"], r["keyword"], r["plain"], r["down"], r["outward"]
             ok = (local(flag) and flag.get("rule") == "sensitive: flag" and local(key)
@@ -448,12 +452,14 @@ def main():
     except (ValueError, IndexError):
         record("local-bound continuation is rescored by S1", "FAIL", (p.stderr or p.stdout).strip()[-300:])
     else:
-        if r["degraded"]:
+        # Per turn, as above: a degraded rescore must admit nothing, and any degraded turn leaves the check BLOCKED.
+        degraded = {k: r[k] for k in ("outward", "safe") if "degraded" in str(r[k][1])}
+        if degraded:
             record("degraded scorer admits no local continuation",
-                   "PASS" if not r["outward"][0] and not r["safe"][0] else "FAIL",
-                   f"outward={r['outward']} safe={r['safe']}")
+                   "PASS" if not any(v[0] for v in degraded.values()) else "FAIL",
+                   f"degraded turns: {json.dumps(degraded)}")
             record("local-bound continuation is rescored by S1", "BLOCKED",
-                   unreachable if not up else f"S1 listening at {s1_where} but the decision is degraded")
+                   unreachable if not up else f"S1 listening at {s1_where} but a rescore is degraded")
         else:
             ok = r["outward"][0] is False and r["safe"][0] is True
             record("local-bound continuation is rescored by S1", "PASS" if ok else "FAIL",
