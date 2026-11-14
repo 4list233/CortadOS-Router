@@ -909,7 +909,19 @@ fi
 # gives a new file the source's mode, and the promoted adapter is 0444 on purpose (promote_sweep.py), so the warm-start
 # adapter_config.json came out 0444 and mlx_lm's save_config raised PermissionError on all 20 launches. Via .tmp + mv, so an
 # existing read-only destination is replaced instead of failing the cp. The source's mode is never touched.
-run_copy() { cp "$1" "$2.tmp" && chmod u+w "$2.tmp" && mv -f "$2.tmp" "$2"; }
+# Review 2026-11-14: the temporary is a fresh regular file from mktemp in the destination directory (a predictable
+# "$2.tmp" planted as a symlink to the source made cp overwrite the source), it is removed on any failure, and a destination,
+# or destination directory, that is a symlink (run/adapter -> promoted/adapter) is refused rather than written through.
+run_copy() {
+  local tmp
+  if [ -L "$2" ] || { [ -e "$2" ] && [ ! -f "$2" ]; } || [ -L "$(dirname "$2")" ]; then
+    echo "ERROR: run_copy: $2 or its directory is a symlink, or it is not a regular file; refusing to copy over it" >&2
+    return 1
+  fi
+  tmp=$(mktemp "$(dirname "$2")/.run_copy.XXXXXX") || return 1
+  if cat "$1" > "$tmp" && chmod 0644 "$tmp" && mv -f "$tmp" "$2"; then return 0; fi
+  rm -f "$tmp"; return 1
+}
 if [ -n "${CORTADOS_S1_INIT:-}" ] && [ -f "$CORTADOS_S1_INIT" ]; then
   mkdir -p "$RUN/adapter"; run_copy "$CORTADOS_S1_INIT" "$RUN/adapter/0000000_adapters.safetensors" || { echo "ERROR: warm-start copy of $CORTADOS_S1_INIT failed"; exit 1; }
   init_cfg="$(dirname "$CORTADOS_S1_INIT")/adapter_config.json"

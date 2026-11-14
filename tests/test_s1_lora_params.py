@@ -183,6 +183,29 @@ class Writable(unittest.TestCase):
         self.assertEqual(self.mode(self.src / "adapter_config.json"), 0o444)
         self.assertEqual(self.mode(self.src / "adapters.safetensors"), 0o444)
 
+    def test_a_symlinked_adapter_directory_is_refused_and_the_source_keeps_0444(self):
+        """Review 2026-11-14: run/adapter -> promoted/adapter made the source's files look like the run's own regular files."""
+        self.run_adapter.rmdir()
+        self.run_adapter.symlink_to(self.src, target_is_directory=True)
+        before = {f.name: (f.read_bytes(), self.mode(f)) for f in self.src.iterdir()}
+        changed, problems = lp.make_writable(self.run_adapter)
+        self.assertEqual(changed, [])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("symlink", problems[0])
+        self.assertEqual({f.name: (f.read_bytes(), self.mode(f)) for f in self.src.iterdir()}, before)
+        self.assertEqual(lp.main(["writable", str(self.run_adapter)]), lp.EXIT_REFUSED)
+        self.assertEqual({f.name: self.mode(f) for f in self.src.iterdir()}, {n: 0o444 for n in before})
+
+    def test_a_run_dir_reached_through_a_symlinked_parent_is_still_healed(self):
+        """A symlinked runs/ or run directory is not an alias of the adapter: the copies inside it are the run's own."""
+        real = self.tmp / "elsewhere" / "run"
+        (real / "adapter").mkdir(parents=True)
+        shutil.copy(self.src / "adapter_config.json", real / "adapter" / "adapter_config.json")
+        link = self.tmp / "linked-run"
+        link.symlink_to(real, target_is_directory=True)
+        self.assertEqual(lp.make_writable(link / "adapter"), (["adapter_config.json"], []))
+        self.assertEqual(self.mode(self.src / "adapter_config.json"), 0o444)
+
     def test_cli_exit_codes(self):
         shutil.copy(self.src / "adapter_config.json", self.run_adapter / "adapter_config.json")
         self.assertEqual(lp.main(["writable", str(self.run_adapter)]), 0)

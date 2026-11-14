@@ -150,6 +150,76 @@ def _exe(path: Path, text: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+class RunCopyAliases(unittest.TestCase):
+    """nightly.sh's run_copy never writes through a planted alias of the source (review 2026-11-14)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="s1-runcopy-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.src = self.tmp / "promoted" / "adapters.safetensors"
+        self.src.parent.mkdir()
+        self.src.write_bytes(b"promoted-weights")
+        self.src.chmod(0o644)                         # writable: the case where a write through the alias would succeed
+        self.dest_dir = self.tmp / "run" / "adapter"
+        self.dest_dir.mkdir(parents=True)
+        self.other = self.tmp / "checkpoint"
+        self.other.write_bytes(b"new-checkpoint")
+        source = (S1 / "nightly.sh").read_text()
+        start = source.index("run_copy() {")
+        line = source[start:source.index("\n", start)]
+        self.fn = line if line.rstrip().endswith("}") else source[start:source.index("\n}\n", start) + 2]   # one-line or block
+
+    def run_copy(self, src, dest):
+        return subprocess.run(["/bin/bash", "-c", "set -u\n" + self.fn + '\nrun_copy "$1" "$2"', "t", str(src), str(dest)],
+                              capture_output=True, text=True)
+
+    def test_a_planted_tmp_symlink_to_the_source_is_not_written_through(self):
+        dest = self.dest_dir / "resume_0_adapters.safetensors"
+        Path(str(dest) + ".tmp").symlink_to(self.src)
+        out = self.run_copy(self.other, dest)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.src.read_bytes(), b"promoted-weights", "the source content is untouched")
+        self.assertEqual(stat.S_IMODE(self.src.stat().st_mode), 0o644)
+        self.assertFalse(dest.is_symlink())
+        self.assertEqual(dest.read_bytes(), b"new-checkpoint")
+        self.assertTrue(stat.S_IMODE(dest.stat().st_mode) & stat.S_IWUSR)
+        self.assertEqual(sorted(p.name for p in self.dest_dir.iterdir()), [dest.name, dest.name + ".tmp"], "no temp left")
+
+    def test_a_symlinked_destination_is_refused(self):
+        dest = self.dest_dir / "adapter_config.json"
+        dest.symlink_to(self.src)
+        out = self.run_copy(self.other, dest)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("symlink", out.stderr)
+        self.assertEqual(self.src.read_bytes(), b"promoted-weights")
+        self.assertTrue(dest.is_symlink(), "refused, not replaced")
+        self.assertEqual([p.name for p in self.dest_dir.iterdir()], [dest.name], "no temp left")
+
+    def test_a_symlinked_destination_directory_is_refused(self):
+        alias = self.tmp / "run" / "aliased"
+        alias.symlink_to(self.src.parent, target_is_directory=True)
+        out = self.run_copy(self.other, alias / self.src.name)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(self.src.read_bytes(), b"promoted-weights")
+        self.assertEqual([p.name for p in self.src.parent.iterdir()], [self.src.name], "nothing written into the source dir")
+
+    def test_a_failed_copy_leaves_no_temporary(self):
+        out = self.run_copy(self.tmp / "missing", self.dest_dir / "x.safetensors")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(list(self.dest_dir.iterdir()), [])
+
+    def test_a_read_only_destination_and_source_give_a_writable_copy(self):
+        dest = self.dest_dir / "adapter_config.json"
+        dest.write_text("old")
+        dest.chmod(0o444)
+        self.src.chmod(0o444)
+        out = self.run_copy(self.src, dest)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(dest.read_bytes(), b"promoted-weights")
+        self.assertTrue(stat.S_IMODE(dest.stat().st_mode) & stat.S_IWUSR)
+        self.assertEqual(stat.S_IMODE(self.src.stat().st_mode), 0o444)
+
+
 class DeadlineCleanup(unittest.TestCase):
     def run_cleanup(self, setup):
         # Exercise the production helper with real Bash jobs; log signaling instead of

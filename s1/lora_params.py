@@ -218,14 +218,33 @@ def make_writable(adapter_dir: Path) -> tuple[list[str], list[str]]:
     """(names given u+w, problems) for the files directly in a run's adapter directory. Only regular files with one link are
     changed: chmod follows a symlink and a hard link shares its mode, so either would change the source adapter's mode,
     which is read-only on purpose (promote_sweep.py, the served adapter). Those, and a directory mlx_lm cannot write in,
-    are problems: the trainer would fail on them every time."""
+    are problems: the trainer would fail on them every time.
+    Review 2026-11-14: a SYMLINKED adapter directory (run/adapter -> promoted/adapter) made every entry look like a plain
+    regular file, and the chmod reached the source. The directory itself must not be a symlink, every entry must resolve
+    inside it, and the mode is changed through an O_NOFOLLOW descriptor checked to be the file that was inspected."""
     changed, problems = [], []
-    if not adapter_dir.is_dir():
+    try:
+        dst = os.lstat(adapter_dir)
+    except FileNotFoundError:
         return changed, problems                      # mlx_lm creates it
+    if stat.S_ISLNK(dst.st_mode):
+        problems.append(f"{adapter_dir} is a symlink to {os.readlink(adapter_dir)}: the run would train in, and change, "
+                        "another adapter; replace it with a directory of copies")
+        return changed, problems
+    if not stat.S_ISDIR(dst.st_mode):
+        problems.append(f"{adapter_dir} is not a directory")
+        return changed, problems
+    real_dir = os.path.realpath(adapter_dir)
+    if real_dir != os.path.join(os.path.realpath(adapter_dir.parent), adapter_dir.name):
+        problems.append(f"{adapter_dir} resolves to {real_dir}, outside its run directory: not touching it")
+        return changed, problems
     if not os.access(adapter_dir, os.W_OK | os.X_OK):
         problems.append(f"{adapter_dir} is not writable by this user")
     for f in sorted(adapter_dir.iterdir()):
         st = os.lstat(f)
+        if not stat.S_ISLNK(st.st_mode) and os.path.dirname(os.path.realpath(f)) != real_dir:
+            problems.append(f"{f} resolves outside {adapter_dir}: not touching it")
+            continue
         if os.access(f, os.W_OK, follow_symlinks=False) and not stat.S_ISLNK(st.st_mode):
             continue
         if stat.S_ISLNK(st.st_mode):
@@ -239,10 +258,21 @@ def make_writable(adapter_dir: Path) -> tuple[list[str], list[str]]:
                             "other copy too; replace it with a copy")
             continue
         try:
-            os.chmod(f, stat.S_IMODE(st.st_mode) | stat.S_IWUSR)
+            fd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError as e:
+            problems.append(f"{f}: cannot open it without following links ({e})")
+            continue
+        try:
+            fst = os.fstat(fd)
+            if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(fst.st_mode) or fst.st_nlink > 1:
+                problems.append(f"{f} changed while it was being checked: not touching it")
+                continue
+            os.fchmod(fd, stat.S_IMODE(fst.st_mode) | stat.S_IWUSR)
             changed.append(f.name)
         except OSError as e:
             problems.append(f"{f}: cannot add owner write permission ({e})")
+        finally:
+            os.close(fd)
     return changed, problems
 
 
