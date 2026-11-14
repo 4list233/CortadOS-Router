@@ -312,6 +312,52 @@ class ByteBudgetTests(unittest.TestCase):
         self.assertEqual((self.a.inflight, self.a.reserved), (1, self.short()))
         other.release()
 
+    def test_a_count_slot_first_then_its_bytes(self):
+        # the gate's two phases: a slot (count only) before the token count, the bytes after it
+        t, snap = self.a.acquire_slot()
+        self.assertEqual((self.a.inflight, self.a.reserved, snap["inflight"]), (1, 0, 1))
+        ok, snap = t.reserve(self.long())
+        self.assertTrue(ok)
+        self.assertEqual((self.a.inflight, self.a.reserved, snap["reserved_bytes"]), (1, self.long(), self.long()))
+        t.release()
+        t.release()
+        self.assertEqual((self.a.inflight, self.a.reserved), (0, 0))
+
+    def test_a_slot_whose_bytes_do_not_fit_is_given_back_exactly_once(self):
+        held = [self.a.try_acquire(self.long())[0] for _ in range(2)]       # 19.3 of 25 GiB
+        t, _ = self.a.acquire_slot()
+        ok, snap = t.reserve(self.long())                                   # busy on bytes: retryable
+        self.assertEqual((ok, snap["refused"]), (False, "busy"))
+        self.assertIn("memory budget", snap["reason"])
+        self.assertEqual(self.a.inflight, 2)                                # its slot already given back
+        t.release()                                                         # the gate's finally: a no-op
+        self.assertEqual((self.a.inflight, self.a.reserved), (2, 2 * self.long()))
+        t2, _ = self.a.acquire_slot()
+        ok, snap = t2.reserve(26 * GIB)                                     # never fits: not retryable
+        self.assertEqual((ok, snap["refused"]), (False, "too_large"))
+        t2.release()
+        self.assertEqual((self.a.inflight, self.a.reserved), (2, 2 * self.long()))
+        self.assertEqual(t.reserve(self.short())[0], False)                 # a released ticket reserves nothing
+        self.assertEqual(self.a.inflight, 2)
+        for h in held:
+            h.release()
+        self.assertEqual((self.a.inflight, self.a.reserved), (0, 0))
+
+    def test_slots_are_taken_against_the_count_limit_before_any_bytes(self):
+        active = local_governor.Admission(FixedGovernor(idle_s=5))          # owner active: 2
+        slots = [active.acquire_slot()[0] for _ in range(2)]
+        ticket, snap = active.acquire_slot()
+        self.assertEqual((ticket, snap["refused"]), (None, "busy"))
+        for s in slots:
+            s.release()
+        self.assertEqual(active.inflight, 0)
+        free = local_governor.Admission(None)                               # no governor: unlimited, no bytes
+        t, _ = free.acquire_slot()
+        self.assertEqual(t.reserve(10 ** 15)[0], True)
+        self.assertEqual(free.reserved, 0)
+        t.release()
+        self.assertEqual(free.inflight, 0)
+
     def test_the_report_carries_bytes_and_token_room(self):
         t = self.a.try_acquire(self.long())[0]
         snap = self.a.snapshot()
@@ -520,6 +566,10 @@ class FakeVllm(BaseHTTPRequestHandler):
     count = None                                 # POST /v1/messages/count_tokens answers this; None: ~4 chars a token
     count_answer = None                          # (status, raw bytes) for count_tokens instead (a failing count)
     count_delay = 0.0                            # seconds count_tokens waits before answering (a slow count)
+    count_fn = None                              # body -> int: computes the count (e.g. vllm_count_060)
+    counting = 0                                 # count calls in flight now, and the most ever at once
+    max_counting = 0
+    count_lock = threading.Lock()
 
     def log_message(self, *a):
         pass
@@ -542,8 +592,17 @@ class FakeVllm(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         FakeVllm.seen.append(("POST", self.path, body))
         if self.path == "/v1/messages/count_tokens":
-            if FakeVllm.count_delay:
-                time.sleep(FakeVllm.count_delay)
+            with FakeVllm.count_lock:
+                FakeVllm.counting += 1
+                FakeVllm.max_counting = max(FakeVllm.max_counting, FakeVllm.counting)
+            try:
+                if FakeVllm.count_delay:
+                    time.sleep(FakeVllm.count_delay)
+            finally:
+                with FakeVllm.count_lock:
+                    FakeVllm.counting -= 1
+            if FakeVllm.count_fn is not None:
+                return self._json(200, {"input_tokens": FakeVllm.count_fn(body)})
             if FakeVllm.count_answer is not None:
                 status, raw = FakeVllm.count_answer
                 self.send_response(status)
@@ -592,6 +651,9 @@ def reset_fake():
     FakeVllm.count = None
     FakeVllm.count_answer = None
     FakeVllm.count_delay = 0.0
+    FakeVllm.count_fn = None
+    FakeVllm.counting = 0
+    FakeVllm.max_counting = 0
 
 
 def turns():
@@ -1022,7 +1084,7 @@ class MlxGateTooLargeTests(MlxGateHarness):
         self.assertEqual(self.call("/v1/messages", MSG)[0], 200)        # a short turn still runs
 
 
-# ----------------------------------------------------------------------------- input tokens: exact count or bound
+# ----------------------------------------------------------------------------- input tokens: count + left-out bytes, or bound
 
 
 DENSE = "a!" * 50_000           # 100,000 bytes and, on Qwen's tokenizer, 100,000 tokens (1 byte a token)
@@ -1032,8 +1094,67 @@ def dense_msg(max_tokens=1024):
     return {"model": TAG, "max_tokens": max_tokens, "messages": [{"role": "user", "content": DENSE}]}
 
 
+def dense_tokens(text):
+    """The worst-case tokenizer: one token per UTF-8 byte (what `a!a!...` is on Qwen's tokenizer)."""
+    return len(text.encode("utf-8"))
+
+
+def vllm_count_060(body, tokenize=dense_tokens):
+    """vllm-mlx 0.6.0's server.count_anthropic_tokens, line for line (its tokenizer swapped for `tokenize`): it
+    leaves out a tool_use's name and id, a tool_result's tool_use_id and the STRING items of its content list, and
+    string entries of a system list, all of which its adapter sends to the model."""
+    total = 0
+    system = body.get("system", "")
+    if isinstance(system, str) and system:
+        total += tokenize(system)
+    elif isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and block.get("text", ""):
+                total += tokenize(block["text"])
+    for msg in body.get("messages", []):
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total += tokenize(content) if content else 0
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("text", ""):
+                    total += tokenize(block["text"])
+                if block.get("input"):
+                    total += tokenize(json.dumps(block["input"]))
+                sub = block.get("content", "")
+                if isinstance(sub, str) and sub:
+                    total += tokenize(sub)
+                elif isinstance(sub, list):
+                    for item in sub:
+                        if isinstance(item, dict) and item.get("text", ""):
+                            total += tokenize(item["text"])
+    for tool in body.get("tools", []):
+        for key in ("name", "description"):
+            if tool.get(key, ""):
+                total += tokenize(tool[key])
+        if tool.get("input_schema"):
+            total += tokenize(json.dumps(tool["input_schema"]))
+    return total
+
+
+LONG_NAME = "mcp__" + "a!" * 2_000                 # a 4,005-byte tool name the count never sees
+
+
+def omitted_msg(max_tokens=1024):
+    """The review's case: a token-dense tool_result as string items (100,000 bytes) after a tool_use with a long name.
+    vllm-mlx 0.6.0 counts none of it."""
+    return {"model": TAG, "max_tokens": max_tokens, "messages": [
+        {"role": "user", "content": "read it"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": LONG_NAME, "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                                      "content": [DENSE[:50_000], DENSE[50_000:]]}]}]}
+
+
 class InputTokensTests(unittest.TestCase):
-    """local_governor.input_tokens: the backend's exact count plus the template allowance, else a hard byte bound."""
+    """local_governor.input_tokens: the backend's count plus what it leaves out and the template allowance, else a hard
+    byte bound."""
 
     def test_token_dense_text_is_bounded_by_its_bytes_not_estimated(self):
         body = dense_msg()
@@ -1060,21 +1181,73 @@ class InputTokensTests(unittest.TestCase):
         self.assertGreaterEqual(visible, 3 + 2000 + 3 + 4 + len(json.dumps({"path": "日本"})) + 50 + 40)
         self.assertEqual(tokens, visible + local_governor.template_tokens(body))
 
-    def test_an_exact_count_is_used_with_the_template_allowance(self):
+    def test_a_count_is_used_with_the_template_allowance(self):
         body = dense_msg()
+        self.assertEqual(local_governor.uncounted_bytes(body), 0)       # plain string content: all counted
         self.assertEqual(local_governor.input_tokens(body, 100_000),
-                         (100_000 + local_governor.template_tokens(body), "exact"))
+                         (100_000 + local_governor.template_tokens(body), "counted"))
+        self.assertEqual(local_governor.input_tokens(body, 25_000),     # prose-like: the count, below the bound
+                         (25_000 + local_governor.template_tokens(body), "counted"))
         for junk in (None, -1, True, "5", 2.5):                         # no usable count: the bound
             self.assertEqual(local_governor.input_tokens(body, junk)[1], "bound")
 
-    def test_an_image_is_never_counted_by_the_text_count(self):
-        body = {"messages": [{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A" * 9000}},
-            {"type": "text", "text": "what is this"}]}]}
-        self.assertFalse(local_governor.countable(body))
-        tokens, how = local_governor.input_tokens(body, 3)
-        self.assertEqual(how, "bound")
-        self.assertGreater(tokens, 9000)
+    def test_a_count_is_never_above_the_byte_bound(self):
+        body = dense_msg()                                              # a counter gone wrong: the bound still holds
+        self.assertEqual(local_governor.input_tokens(body, 10 ** 9),
+                         (100_000 + local_governor.template_tokens(body), "counted"))
+
+    def test_what_vllm_mlx_060_leaves_out_is_added_as_bytes(self):
+        body = omitted_msg()
+        counted = vllm_count_060(body)
+        self.assertEqual(counted, len("read it"))                       # the review's repro: the rest counted 0
+        left_out = local_governor.uncounted_bytes(body)
+        self.assertEqual(left_out, len(LONG_NAME) + len("toolu_1") + 2 + len("toolu_1") + 100_000)
+        tokens, how = local_governor.input_tokens(body, counted)
+        self.assertEqual(how, "counted")
+        self.assertGreaterEqual(tokens, 100_000 + len(LONG_NAME))      # >= the dense text's real tokens
+        self.assertEqual(tokens, counted + left_out + local_governor.template_tokens(body))
+        self.assertLessEqual(tokens, local_governor.input_tokens(body)[0])   # and never above the bound
+
+    def test_every_omission_of_the_060_count_is_covered(self):
+        # For each part the 0.6.0 count skips, with a dense tokenizer: count + uncounted bytes >= the tokens of all the
+        # text the adapter sends (the true count, here: every byte of it).
+        cases = {
+            "tool_use name and id": {"messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "i" * 300, "name": "n" * 5000, "input": {"a": 1}}]}]},
+            "tool_result string items": {"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t", "content": ["s" * 7000, {"type": "text", "text": "x"}]}]}]},
+            "system string entries": {"system": ["y" * 6000, {"type": "text", "text": "z"}], "messages": []},
+            "tool without a schema": {"tools": [{"name": "T"}], "messages": []},
+        }
+        sent = {"tool_use name and id": 300 + 5000 + len(json.dumps({"a": 1})),
+                "tool_result string items": 1 + 7000 + 1, "system string entries": 6000 + 1,
+                "tool without a schema": 1 + len(json.dumps({"type": "object", "properties": {}}))}
+        for name, body in cases.items():
+            with self.subTest(name):
+                got = vllm_count_060(body) + local_governor.uncounted_bytes(body)
+                self.assertGreaterEqual(got, sent[name])
+                self.assertLess(vllm_count_060(body), sent[name])       # the count alone falls short
+
+    def test_non_text_content_is_named(self):
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A" * 9000}}
+        self.assertEqual(local_governor.non_text_content({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"}, img]}]}), "image block in message 1")
+        self.assertEqual(local_governor.non_text_content({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "user", "content": [{"type": "document", "source": {"type": "base64", "data": "JVBE"}}]}]}),
+            "document block in message 2")
+        self.assertEqual(local_governor.non_text_content({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t", "content": [{"type": "text", "text": "ok"}, img]}]}]}),
+            "non-text tool_result content in message 1")
+        self.assertEqual(local_governor.non_text_content({"system": [{"type": "image"}], "messages": []}),
+                         "non-text system block")
+        self.assertEqual(local_governor.non_text_content({"messages": [{"role": "user", "content": [
+            {"type": "<script>" * 9}]}]}), "non-text block in message 1")      # never echoes odd type names
+        text_only = omitted_msg()
+        text_only["messages"].append({"role": "assistant", "content": [{"type": "thinking", "thinking": "h"},
+                                                                      {"type": "redacted_thinking", "data": "x"},
+                                                                      {"type": "text", "text": "ok"}]})
+        self.assertIsNone(local_governor.non_text_content(text_only))
 
     def test_a_body_that_is_not_an_object_is_bounded_by_its_length(self):
         self.assertEqual(local_governor.input_tokens(b"not json"), (8, "bound"))
@@ -1082,7 +1255,7 @@ class InputTokensTests(unittest.TestCase):
 
 
 class MlxGateCountTests(MlxGateHarness):
-    """The gate asks vllm-mlx for the exact input count on loopback before admission, and takes the byte bound when it
+    """The gate asks vllm-mlx for the input count on loopback before admission, and takes the byte bound when it
     cannot get one. Owner idle: count 8, 25 GiB beside the weights."""
     GOVERNOR = {"idle_s": 3600.0, "pressure": "normal"}
 
@@ -1122,12 +1295,28 @@ class MlxGateCountTests(MlxGateHarness):
             t.join(5)
         self.assertTrue(wait_for(lambda: (self.gate.admission.inflight, self.gate.admission.reserved) == (0, 0)))
 
-    def test_the_exact_count_sets_the_reservation(self):
+    def test_the_count_sets_the_reservation(self):
         FakeVllm.count = 40
-        t, _ = self.held(MSG)
-        self.assertEqual(self.gate.admission.reserved, self.expect(MSG, 40))
+        body = {**MSG, "messages": [{"role": "user", "content": "word " * 200}]}     # 1,000 bytes, counted 40
+        t, _ = self.held(body)
+        self.assertEqual(self.gate.admission.reserved, self.expect(body, 40))
         FakeVllm.hold.set()
         t.join(5)
+
+    def test_what_the_060_count_leaves_out_is_reserved_too(self):
+        # the re-review's P1: a 100,000-byte token-dense tool_result (string items) and a long tool_use name, which
+        # vllm-mlx 0.6.0's count leaves out (it says 7), were admitted as 1,072 tokens. Now the reservation covers
+        # every byte the count did not see.
+        FakeVllm.count_fn = vllm_count_060
+        body = omitted_msg()
+        t, _ = self.held(body)
+        self.assertEqual(len(self.counts()), 1)
+        need = 7 + local_governor.uncounted_bytes(body)
+        self.assertGreaterEqual(need, 100_000 + len(LONG_NAME))
+        self.assertEqual(self.gate.admission.reserved, self.expect(body, need))
+        FakeVllm.hold.set()
+        t.join(5)
+        self.assertTrue(wait_for(lambda: self.gate.admission.reserved == 0))
 
     def test_falls_back_to_the_byte_bound_when_the_count_fails(self):
         self.gate.count_deadline = 0.3
@@ -1158,15 +1347,33 @@ class MlxGateCountTests(MlxGateHarness):
         FakeVllm.hold.set()
         t.join(5)
 
-    def test_a_request_with_an_image_is_bounded_without_asking_the_count(self):
+    def test_a_request_with_an_image_or_document_is_refused_for_good_and_reaches_nothing(self):
+        # the served 27B is text-only (vision tower excluded at load): an image would be dropped or fail, so the gate
+        # refuses it non-retryably before any admission or count, and the provider routes it elsewhere
+        image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A" * 4000}}
+        for content, why in (([image, {"type": "text", "text": "what"}], "image block in message 1"),
+                             ([{"type": "document", "source": {"type": "base64", "data": "JVBE"}}],
+                              "document block in message 1"),
+                             ([{"type": "tool_result", "tool_use_id": "t", "content": [image]}],
+                              "non-text tool_result content in message 1")):
+            code, raw, headers = self.call("/v1/messages", {**MSG, "messages": [{"role": "user", "content": content}]})
+            h = {k.lower(): v for k, v in headers.items()}
+            self.assertEqual(code, 400)
+            self.assertEqual(h.get("x-should-retry"), "false")
+            self.assertNotIn("retry-after", h)
+            err = json.loads(raw)["error"]
+            self.assertEqual(err["type"], "invalid_request_error")
+            self.assertTrue(err["message"].startswith(local_gate.UNSUPPORTED_MESSAGE), err["message"])
+            self.assertIn(why, err["message"])
+        self.assertEqual(FakeVllm.seen, [])                              # neither counted nor sent
+        self.assertEqual((self.gate.admission.inflight, self.gate.admission.reserved), (0, 0))
+        self.assertEqual(local_lane.GATE_UNSUPPORTED, local_gate.UNSUPPORTED_MESSAGE)
+
+    def test_an_ollama_node_does_not_refuse_images(self):
+        self.gate.backend = {"backend": "ollama", "served_model": None, "governor": None}
         body = {**MSG, "messages": [{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A" * 4000}},
-            {"type": "text", "text": "what"}]}]}
-        t, _ = self.held(body)
-        self.assertEqual(self.counts(), [])
-        self.assertGreaterEqual(self.gate.admission.reserved, self.expect(body, 4000))
-        FakeVllm.hold.set()
-        t.join(5)
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A" * 40}}]}]}
+        self.assertEqual(self.call("/v1/messages", body)[0], 200)        # Ollama's own model decides
 
     def test_a_full_count_is_refused_before_asking_for_tokens(self):
         self.governor.set(idle_s=5)                                      # owner active: 2
@@ -1177,6 +1384,89 @@ class MlxGateCountTests(MlxGateHarness):
         FakeVllm.hold.set()
         for t, _ in held:
             t.join(5)
+
+    def burst(self, n, body=MSG):
+        """n turns sent at once; returns (threads, results)."""
+        results, go = [], threading.Event()
+
+        def one():
+            go.wait(5)
+            results.append(self.call("/v1/messages", body))
+        threads = [threading.Thread(target=one, daemon=True) for _ in range(n)]
+        for t in threads:
+            t.start()
+        go.set()
+        return threads, results
+
+    def test_ten_at_once_with_a_limit_of_two_run_at_most_two_counts(self):
+        # the re-review's P2: counting ran before admission, so 10 turns at once sent 10 count calls (synchronous
+        # tokenization on vllm-mlx's event loop) under a limit of 2. Now each takes its count slot first.
+        self.governor.set(idle_s=5)                                      # owner active: 2
+        FakeVllm.count_delay = 0.3                                       # counts overlap if they can
+        FakeVllm.hold = threading.Event()
+        threads, results = self.burst(10)
+        for _ in range(2):
+            self.assertTrue(FakeVllm.entered.acquire(timeout=5))
+        self.assertTrue(wait_for(lambda: len(results) == 8))
+        self.assertEqual(sorted(r[0] for r in results), [529] * 8)
+        self.assertLessEqual(FakeVllm.max_counting, 2)
+        self.assertEqual(len(self.counts()), 2)                          # the eight refused were never counted
+        self.assertEqual(self.gate.admission.inflight, 2)
+        FakeVllm.hold.set()
+        for t in threads:
+            t.join(5)
+        self.assertEqual(sorted(r[0] for r in results), [200] * 2 + [529] * 8)
+        self.assertTrue(wait_for(lambda: (self.gate.admission.inflight, self.gate.admission.reserved) == (0, 0)))
+
+    def test_count_calls_are_capped_below_a_wide_count_limit(self):
+        # owner idle: 8 slots, but no more than COUNT_CONCURRENCY counts reach vllm-mlx at once
+        FakeVllm.count_delay = 0.2
+        FakeVllm.hold = threading.Event()
+        threads, results = self.burst(8)
+        for _ in range(8):
+            self.assertTrue(FakeVllm.entered.acquire(timeout=10))
+        self.assertLessEqual(FakeVllm.max_counting, local_gate.COUNT_CONCURRENCY)
+        self.assertEqual(len(self.counts()), 8)
+        FakeVllm.hold.set()
+        for t in threads:
+            t.join(5)
+        self.assertEqual([r[0] for r in results], [200] * 8)
+        self.assertTrue(wait_for(lambda: (self.gate.admission.inflight, self.gate.admission.reserved) == (0, 0)))
+
+    def test_a_turn_waiting_past_the_deadline_for_a_count_slot_takes_the_bound(self):
+        self.gate.count_deadline = 0.2
+        for _ in range(local_gate.COUNT_CONCURRENCY):                    # every count slot taken
+            self.gate.count_slots.acquire()
+        try:
+            with self.assertLogs(local_gate.logger, level="INFO") as cm:
+                t, _ = self.held(dense_msg())
+            self.assertTrue(any("count slots busy" in m for m in cm.output), cm.output)
+            self.assertEqual(self.counts(), [])
+            self.assertEqual(self.gate.admission.reserved, self.expect(dense_msg(), 100_000))
+        finally:
+            for _ in range(local_gate.COUNT_CONCURRENCY):
+                self.gate.count_slots.release()
+        FakeVllm.hold.set()
+        t.join(5)
+
+    def test_every_refusal_after_the_count_gives_the_slot_back(self):
+        # busy on bytes (529) and never fits (413): the provisional slot taken before the count is released, once
+        FakeVllm.count = 100_000
+        body = dense_msg()
+        held = [self.held(body) for _ in range(3)]                       # 3 x ~7.9 GiB of the 25 GiB
+        code, raw, _ = self.call("/v1/messages", body)
+        self.assertEqual(code, 529)
+        self.assertIn("memory budget", json.loads(raw)["error"]["message"])
+        self.assertEqual(self.gate.admission.inflight, 3)
+        too_big = {**dense_msg(), "max_tokens": 10 ** 6}                 # ~1.1M tokens: more than the whole budget
+        self.governor.cfg = {**self.governor.cfg, "context_tokens": 10 ** 6}
+        code, raw, headers = self.call("/v1/messages", too_big)
+        self.assertEqual(code, 413)
+        self.assertEqual(self.gate.admission.inflight, 3)
+        FakeVllm.hold.set()
+        for t, _ in held:
+            t.join(5)
+        self.assertTrue(wait_for(lambda: (self.gate.admission.inflight, self.gate.admission.reserved) == (0, 0)))
 
     def test_the_count_route_is_never_reachable_from_outside(self):
         route = local_backend.COUNT_TOKENS["vllm-mlx"]
@@ -1256,6 +1546,37 @@ class ProviderTooLargeGateTests(ProviderBusyGateTests):
     test_a_gate_out_of_memory_room_is_a_529_naming_the_memory_budget = None
 
 
+class ProviderUnsupportedGateTests(ProviderBusyGateTests):
+    """The same harness, a turn carrying an image: the MLX gate's text-only refusal, never a 529 loop."""
+    IMAGE_BODY = {"model": "sub/qwen-27b", "max_tokens": 8, "messages": [{"role": "user", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBO"}},
+        {"type": "text", "text": "what is this"}]}]}
+
+    def test_a_pinned_turn_with_an_image_is_a_terminal_400(self):
+        code, got, headers = self.raw_post(self.IMAGE_BODY)
+        h = {k.lower(): v for k, v in headers.items()}
+        self.assertEqual(code, 400)
+        self.assertEqual(h.get("x-should-retry"), "false")
+        self.assertNotIn("retry-after", h)
+        self.assertEqual(got["error"]["type"], "invalid_request_error")
+        self.assertIn("text-only model", got["error"]["message"])
+        self.assertEqual([x for x in FakeVllm.seen if x[0] == "POST"], [])   # neither counted nor sent
+        self.assertEqual(self.reg.sessions, {})
+        self.assertEqual(self.raw_post(self.BODY)[0], 200)                  # text still served
+
+    def test_the_refusal_fallback_path_treats_it_as_unavailable(self):
+        node = local_lane.nodes()[0]
+        with self.assertRaises(local_lane.LocalUnavailable) as cm:
+            local_lane.complete({**self.IMAGE_BODY, "model": "x"}, node, node["models"][0])
+        self.assertIn("text-only", str(cm.exception))
+
+    test_a_pinned_turn_through_the_mlx_gate_is_served = None
+    test_a_full_gate_is_a_529_with_retry_after_and_marks_the_node_busy = None
+    test_the_refusal_fallback_path_treats_busy_as_unavailable = None
+    test_node_why_reads_the_gate_report_from_the_probe = None
+    test_a_gate_out_of_memory_room_is_a_529_naming_the_memory_budget = None
+
+
 class GateFitTests(unittest.TestCase):
     NODE = {"node": "pro-fit"}
 
@@ -1277,7 +1598,7 @@ class GateFitTests(unittest.TestCase):
         self.assertIsNone(local_lane.gate_fit(self.NODE, 10 ** 6))                # junk room is dropped
 
     def test_the_provider_estimates_by_characters(self):
-        # the provider cannot count tokens: it estimates (routing only); the gate admits on the exact count or bound
+        # the provider cannot count tokens: it estimates (routing only); the gate admits on the count or bound
         body = {"model": "x", "max_tokens": 512, "messages": [{"role": "user", "content": "y" * 7000}]}
         c = local_governor.check_config({})
         est = -(-len(json.dumps(body)) // 3.5)
@@ -1360,6 +1681,51 @@ class ProviderReroutesTooLargeTests(IndexEndToEndTests):
         self.assertEqual(routes[1][0], TAG)                             # with the node's model excluded
         self.assertEqual(local_lane._inflight, {})
         self.assertEqual(local_lane.gate_report(local_lane.nodes()[0])["fit_tokens"], 56000)
+
+
+def _gate_unsupported(handler):
+    """FakeOllama's POST answered as the MLX gate refuses a turn its text-only model cannot read."""
+    length = int(handler.headers["content-length"])
+    FakeOllama.seen.append((handler.path, json.loads(handler.rfile.read(length))))
+    raw = json.dumps({"type": "error", "error": {"type": "invalid_request_error", "message":
+                      local_lane.GATE_UNSUPPORTED + " (image block in message 1; it serves a text-only model)"}}).encode()
+    handler.send_response(400)
+    handler.send_header("content-type", "application/json")
+    handler.send_header("x-should-retry", "false")
+    handler.send_header("content-length", str(len(raw)))
+    handler.end_headers()
+    handler.wfile.write(raw)
+
+
+class ProviderReroutesUnsupportedTests(ProviderReroutesTooLargeTests):
+    """The same S1-routed opening turn, refused by the gate because its text-only model cannot read the content (an
+    image): routed elsewhere with the node's model excluded, the client answered by that route."""
+
+    def setUp(self):
+        super().setUp()
+        p = patch.object(FakeOllama, "do_POST", _gate_unsupported)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_the_opening_turn_is_routed_elsewhere(self):
+        from tests.test_provider_local_auto import body
+        routes = []
+        real = self.reg.router
+
+        def router(b, client, **kw):
+            routes.append((kw.get("exclude_model"), real(b, client, **kw)))
+            return routes[-1][1]
+        self.reg.router = router
+        with self.assertLogs(server.logger, level="INFO") as cm:
+            got = self.post({**body("What is 6*7?"), "max_tokens": 8192})
+        self.assertEqual(got.get("type"), "message")                   # answered, not an error
+        self.assertEqual(len([x for x in FakeOllama.seen if x[0] == "/v1/messages"]), 1)
+        self.assertTrue(any("cannot read the opening turn's content (text-only model); routing it elsewhere" in m
+                            for m in cm.output), cm.output)
+        self.assertEqual([r["provider"] for _, r in routes], ["local-pro", "claude-cli"])
+        self.assertEqual(routes[1][0], TAG)
+        self.assertEqual(local_lane._inflight, {})
+        self.assertFalse(any(isinstance(v, server.LocalSession) for v in self.reg.sessions.values()))
 
 
 if __name__ == "__main__":

@@ -50,7 +50,7 @@ UPSTREAM = {
     "ollama": {("GET", "/api/tags"): ("GET", "/api/tags"), ("POST", "/v1/messages"): ("POST", "/v1/messages")},
     "vllm-mlx": {("GET", "/api/tags"): ("GET", "/v1/models"), ("POST", "/v1/messages"): ("POST", "/v1/messages")},
 }
-# The gate's own call for an exact input token count before admission (local_governor.input_tokens). Gate-internal:
+# The gate's own call for an input token count before admission (local_governor.input_tokens). Gate-internal:
 # not a client route (local_gate.ROUTES) and not in UPSTREAM, so no client request can reach it; the gate sends the
 # body it already admitted for counting. vllm-mlx 0.6.0's server.count_anthropic_tokens encodes the text with the
 # served tokenizer. Ollama has no such route: its requests take the byte bound.

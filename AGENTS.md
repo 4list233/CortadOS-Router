@@ -21,7 +21,7 @@ is the long form.
   `~/.config/cortados/local-backend.json`: fixed upstream routes, thinking → `chat_template_kwargs`, the vllm-mlx
   LaunchAgent for `scripts/install_mlx_backend.sh`), `local_governor.py` (the gate's admission: a count from owner idle
   time and memory pressure, and a byte budget each request reserves its KV cache from; over either a retryable 529, never
-  fitting a non-retryable 413 the provider routes elsewhere; docs/LOCAL-RESOURCES.md "MLX backend"), `subagent_mcp.py` (stdio MCP server: a `route_task` tool that delegates a
+  fitting a non-retryable 413 the provider routes elsewhere; a count slot before the token count, the vllm-mlx count plus the bytes it leaves out; images and documents refused for the text-only model; docs/LOCAL-RESOURCES.md "MLX backend"), `subagent_mcp.py` (stdio MCP server: a `route_task` tool that delegates a
   self-contained subtask to the `cortados` provider endpoint and returns the routed model's text; stdlib, runs standalone),
   `child_tasks.py` (whole tasks as headless Claude Code children; `--run` runner, `--remote` host side, `--cleanup-archive`;
   the runner appends each finished run, redacted, to the append-only `$CORTADOS_HOME/exports/task-runs.jsonl` for

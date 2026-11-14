@@ -333,6 +333,9 @@ def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any]) 
                 if big is not None:
                     _note_gate(node, big.get(GATE_KEY))
                     raise LocalUnavailable(f"node {node['node']}: request too large for its memory budget")
+                if resp.status == 400 and _gate_unsupported_answer(raw) is not None:
+                    raise LocalUnavailable(f"node {node['node']}: its text-only model cannot read this request's "
+                                           "content (an image or document)")
                 raise LocalUnavailable(f"node {node['node']}: {policy}" if policy else
                                        f"node {node['node']} answered /v1/messages with HTTP {resp.status}")
             msg = json.loads(resp.read())
@@ -426,9 +429,15 @@ def think_budget(max_tokens: Any) -> int | None:
 GATE_KEY = "cortados_gate"
 GATE_BUSY = "local gate: busy"
 GATE_TOO_LARGE = "local gate: too large for this node's memory"   # local_gate.TOO_LARGE_MESSAGE: never retried
-# serve's outcome for a turn the gate refused as too large when the caller asked to route it elsewhere (reroute=True):
-# nothing was sent to the client, so the server can open the conversation on another route.
+# local_gate.UNSUPPORTED_MESSAGE: the node's model is text-only and the turn carries an image, a document or another
+# non-text block. Never retried (400, x-should-retry: false); handled as GATE_TOO_LARGE is.
+GATE_UNSUPPORTED = "local gate: content this node's model cannot read"
+# serve's outcome for a turn the gate refused for good when the caller asked to route it elsewhere (reroute=True):
+# nothing was sent to the client, so the server can open the conversation on another route. TOO_LARGE: more memory
+# than the node's whole budget; UNSUPPORTED: content its text-only model cannot read.
 TOO_LARGE = "too_large"
+UNSUPPORTED = "unsupported"
+REROUTE = (TOO_LARGE, UNSUPPORTED)
 GATE_REPORT_TTL_S = 10.0
 BUSY_RETRY_AFTER_S = 5                     # when a 529 from the gate carries no usable Retry-After
 _gate_reports: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -478,8 +487,9 @@ def _busy_why(node: dict[str, Any]) -> str:
 
 # Characters per token for the routing estimate below: prose and code run ~3.5-4.3 bytes per token on Qwen's tokenizer.
 # An ESTIMATE for skipping a node that is plainly full, not the gate's admission: the gate admits on the backend's
-# exact count or a hard byte bound (local_governor.input_tokens), so a turn this estimate lets through may still be
-# refused there, and that refusal is handled (busy: 529 / routed elsewhere; too large: rerouted or a terminal 413).
+# count (plus the bytes it leaves out) or a hard byte bound (local_governor.input_tokens), so a turn this estimate
+# lets through may still be refused there, and that refusal is handled (busy: 529 / routed elsewhere; too large:
+# rerouted or a terminal 413).
 ESTIMATE_CHARS_PER_TOKEN = 3.5
 
 
@@ -527,6 +537,11 @@ def _gate_busy_answer(raw: bytes | None) -> dict[str, Any] | None:
 def _gate_too_large_answer(raw: bytes | None) -> dict[str, Any] | None:
     """The gate's never-fits answer (a 413 whose message starts with GATE_TOO_LARGE), parsed, or None."""
     return _gate_answer(raw, GATE_TOO_LARGE)
+
+
+def _gate_unsupported_answer(raw: bytes | None) -> dict[str, Any] | None:
+    """The gate's text-only refusal (a 400 whose message starts with GATE_UNSUPPORTED), parsed, or None."""
+    return _gate_answer(raw, GATE_UNSUPPORTED)
 
 
 def _retry_after(resp) -> int:
@@ -848,7 +863,9 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
     The gate's never-fits refusal (GATE_TOO_LARGE: the turn needs more memory than the node's whole budget) is not
     retryable. With `reroute` (the opening turn of a conversation a rule moved here) nothing is sent and TOO_LARGE is
     returned, so the server opens the conversation on another route; otherwise the client gets a terminal 413
-    (x-should-retry: false) saying so, never a 529 it would retry forever."""
+    (x-should-retry: false) saying so, never a 529 it would retry forever. The gate's text-only refusal
+    (GATE_UNSUPPORTED: an image or document for a text-only model) is handled the same way: UNSUPPORTED with
+    `reroute`, otherwise a terminal 400."""
     reply = [] if reply is None else reply
     data = json.dumps(_node_body(body, model)).encode()
     # Safety net (#108): an auto-routed turn the client did not ask to think on, which still ended on max_tokens with
@@ -921,6 +938,20 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
                                f"cortados: local node {node['node']} cannot hold this request for sub/{pin_id(model)}: "
                                f"too large for its memory budget{room}. Compact the conversation, lower max_tokens or "
                                "pin a cloud model. No other model was tried."))
+                return "rejected"
+            if resp.status == 400 and _gate_unsupported_answer(raw) is not None:
+                # The node's model is text-only and the turn carries an image or document: retrying cannot help.
+                if reroute:
+                    return UNSUPPORTED                           # the server routes the conversation elsewhere
+                _refused(handler, 400, "invalid_request_error", "the local node's model cannot read this content")
+                _send_terminal(handler, 400, _error("invalid_request_error",
+                               f"cortados: this conversation was auto-routed by S1 to {model['id']} on {node['node']}, "
+                               "a text-only model, and this turn carries an image or document it cannot read; start a "
+                               f"new conversation (it is routed again) or send x-cortados-exclude-model: {pin_id(model)}"
+                               if auto_routed else
+                               f"cortados: local node {node['node']} serves a text-only model for sub/{pin_id(model)} "
+                               "and this turn carries an image or document it cannot read. Pin a model that reads "
+                               "images, or send text only. No other model was tried."))
                 return "rejected"
             policy = _policy_refusal(raw) if auto_routed and resp.status == 503 else None
             if policy:                                           # the gate's fixed reason: battery, switch off, ...

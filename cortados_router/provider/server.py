@@ -2367,8 +2367,8 @@ class Handler(BaseHTTPRequestHandler):
         that fails a turn leaves the conversation as it was: the laptop may wake, and the same history retried
         continues it. A conversation whose opening turn failed is dropped (no reply exists to continue from).
         Returns the lane's outcome (None when refused before the relay). `reroute` (default: an opening turn a rule
-        moved here, not a pin) lets the lane hand back local_lane.TOO_LARGE, unanswered, when the node's gate can never
-        hold the turn; the caller then routes the conversation elsewhere."""
+        moved here, not a pin) lets the lane hand back local_lane.TOO_LARGE or UNSUPPORTED (local_lane.REROUTE),
+        unanswered, when the node's gate can never take the turn; the caller then routes the conversation elsewhere."""
         reg = self.server.registry
         route = session.route or {}
         if not session.lock.acquire(timeout=TURN_TIMEOUT_S):
@@ -2405,7 +2405,7 @@ class Handler(BaseHTTPRequestHandler):
             t0 = time.time()
             office_key = self._office_turn_start(session, one_shot=one_shot)
             outcome = "incomplete"
-            if reroute is None:              # an opening turn a rule moved here may be routed elsewhere (TOO_LARGE)
+            if reroute is None:              # an opening turn a rule moved here may be routed elsewhere (REROUTE)
                 reroute = created and not route.get("pinned")
             try:
                 outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model,
@@ -2789,14 +2789,17 @@ class Handler(BaseHTTPRequestHandler):
             if not created and self._local_continuation_refused(session, body, wire):
                 return
             outcome = self._relay_local(session, turn, body, created=created, one_shot=one_shot, wire=wire)
-            if outcome != local_lane.TOO_LARGE:
+            if outcome not in local_lane.REROUTE:
                 return
-            # The node's gate can never hold this opening turn (more memory than its whole budget): nothing was sent
-            # and the conversation was dropped, so it is routed again with that local model excluded (S1's route, or
-            # another node), once. A second refusal is answered by the lane itself (reroute off).
+            # The node's gate can never take this opening turn (TOO_LARGE: more memory than its whole budget;
+            # UNSUPPORTED: an image or document its text-only model cannot read): nothing was sent and the
+            # conversation was dropped, so it is routed again with that local model excluded (S1's route, or another
+            # node), once. A second refusal is answered by the lane itself (reroute off).
             moved = (session.route or {}).get("local") or {}
-            logger.info("route %s: local node %s cannot hold the opening turn; routing it elsewhere",
-                        (session.route or {}).get("route_id"), (moved.get("node") or {}).get("node"))
+            logger.info("route %s: local node %s %s; routing it elsewhere",
+                        (session.route or {}).get("route_id"), (moved.get("node") or {}).get("node"),
+                        "cannot hold the opening turn" if outcome == local_lane.TOO_LARGE else
+                        "cannot read the opening turn's content (text-only model)")
             session = self._open_conversation(turn, body, wire, one_shot=one_shot, floor=floor, scope=scope,
                                               also_exclude=str((moved.get("model") or {}).get("id") or ""))
             if session is None:

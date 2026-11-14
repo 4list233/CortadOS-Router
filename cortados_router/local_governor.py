@@ -21,16 +21,21 @@ COUNT (owner-approved policy, as `policy()` computes it): how many requests may 
 BYTES (token-aware, `request_bytes()`): each admitted request reserves the memory its context will hold,
   tokens   = min(input tokens + max_tokens, context_tokens)
   reserved = tokens * kv_bytes_per_token + per_seq_state_bytes + prefill_margin_bytes
-input tokens (`input_tokens()`), never an average-case estimate:
-  exact    the backend's own count (vllm-mlx POST /v1/messages/count_tokens, the gate asks it on loopback) plus
-           template_tokens() for what that count leaves out (the chat template's markers and tool preamble);
-  bound    when there is no exact count (Ollama, no endpoint, an error, a timeout, an image in the request): the UTF-8
+input tokens (`input_tokens()`), never an average-case estimate, and never the backend's count alone:
+  counted  the backend's own count (vllm-mlx POST /v1/messages/count_tokens, the gate asks it on loopback) plus the
+           UTF-8 bytes of what vllm-mlx 0.6.0's count leaves out but its adapter sends (uncounted_bytes: tool_use names
+           and ids, tool_result ids and string items, system string entries) plus template_tokens() for the chat
+           template's markers and tool preamble; never more than the bound below;
+  bound    when there is no count (Ollama, no endpoint, an error, a timeout): the UTF-8
            bytes of the text the model will see (input_bound_bytes) plus template_tokens(). A byte-level BPE token
            covers at least one byte, so bytes >= tokens whatever the text: token-dense input (`a!a!...`, 1 byte per
            token on Qwen's tokenizer) cannot be under-reserved. Prose and code run ~4 bytes per token, so the bound
-           reserves ~4x what the exact count does and lowers concurrency, but only while the count is failing.
+           reserves ~4x what the count does and lowers concurrency, but only while the count is failing.
 and a request is admitted only while the reservations in flight plus its own fit in
   memory_budget_bytes - weights_bytes.
+Admission is two-phase (Admission.acquire_slot, then Ticket.reserve): a COUNT slot before the token count is asked,
+the bytes after it, the slot given back if they do not fit. A request a text-only model cannot read (non_text_content:
+an image, a document) is refused by the gate before either.
 Defaults (Qwen3.8 27B, 4-bit): 64 KiB per token (16 full-attention layers x K/V x 4 KV heads x head_dim 256 x fp16),
 0.15 GiB recurrent state, 1.5 GiB prefill margin: a 128k-token request reserves 9.65 GiB, so two fit beside 15 GiB of
 weights in a 40 GiB budget and a third does not, while eight ~9k-token requests (2.2 GiB each) fit.
@@ -116,7 +121,7 @@ FLOAT_KEYS = ("sample_s",)
 # longer mean anything (the fixed per-request size could not see a 128k-token turn).
 REPLACED = {"per_request_gib": "token-aware admission (kv_bytes_per_token, per_seq_state_bytes, prefill_margin_bytes)",
             "memory_budget_gib": "memory_budget_bytes", "weights_gib": "weights_bytes"}
-# Tokens the backend's count leaves out, added to the exact count and to the byte bound alike. vllm-mlx 0.6.0's
+# Template tokens no count or byte sum sees, added to the count and to the byte bound alike. vllm-mlx 0.6.0's
 # count_tokens encodes the text, tool inputs, tool results and tool definitions one by one, without the chat template
 # around them (server.count_anthropic_tokens). Qwen3's template adds <|im_start|>role / <|im_end|> per message (~5
 # tokens), <tool_call> / <tool_response> wrappers and the tool's name per block (~10-20), the OpenAI-shaped
@@ -224,9 +229,9 @@ def _content_bytes(content: Any) -> int:
         elif block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
             total += _utf8(block["thinking"])        # vllm-mlx 0.6.0 drops past thinking; counted all the same
         elif block.get("type") == "tool_use":
-            total += _utf8(block.get("name")) + _json_bytes(block.get("input") or {})
+            total += _utf8(block.get("name")) + _utf8(block.get("id")) + _json_bytes(block.get("input") or {})
         elif block.get("type") == "tool_result":
-            total += _content_bytes(block.get("content"))
+            total += _utf8(block.get("tool_use_id")) + _content_bytes(block.get("content"))
         elif block.get("type") == "image":
             total += _json_bytes(block.get("source"))
         else:
@@ -263,21 +268,110 @@ def input_bound_bytes(body: dict[str, Any]) -> int:
     return total + sum(_json_bytes(t) for t in _tools(body))
 
 
-def countable(body: dict[str, Any]) -> bool:
-    """Whether the backend's count covers the request: it counts text only, so a message carrying an image (which a
-    vision model turns into tokens the count never sees) takes the byte bound instead."""
-    for m in _messages(body):
+# The content block types a text-only model can take (message content): text, past thinking (vllm-mlx 0.6.0 drops it)
+# and the tool blocks. Inside a tool_result's content and in a system list: text blocks and plain strings only.
+TEXT_BLOCKS = ("text", "thinking", "redacted_thinking", "tool_use", "tool_result")
+
+
+def _text_only_list(items: Any) -> bool:
+    """A system list or a tool_result's content list holds text only (text blocks or strings)."""
+    return all(isinstance(i, str) or (isinstance(i, dict) and i.get("type") == "text") for i in items)
+
+
+def non_text_content(body: dict[str, Any]) -> str | None:
+    """What in the request a TEXT-ONLY model cannot see, or None. The Pro's vllm-mlx serves the 27B with its vision
+    tower excluded: an image (top level or inside a tool_result), a document or any other non-text block would be
+    dropped by vllm-mlx 0.6.0's adapter (or turned into image input the loaded model has no tower for), and the model
+    would answer as if it had seen it. The gate refuses such a turn non-retryably (local_gate.UNSUPPORTED_MESSAGE) so
+    the provider routes it elsewhere."""
+    system = body.get("system")
+    if isinstance(system, list) and not _text_only_list(system):
+        return "non-text system block"
+    for i, m in enumerate(_messages(body)):
         content = m.get("content") if isinstance(m, dict) else None
-        if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "image" for b in content):
-            return False
-    return True
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            kind = b.get("type") if isinstance(b, dict) else None
+            if kind not in TEXT_BLOCKS:
+                name = kind if isinstance(kind, str) and kind.isidentifier() and len(kind) <= 40 else "non-text"
+                return f"{name} block in message {i + 1}"
+            if kind == "tool_result" and isinstance(b.get("content"), list) and not _text_only_list(b["content"]):
+                return f"non-text tool_result content in message {i + 1}"
+    return None
+
+
+# What vllm-mlx's adapter (api/anthropic_adapter.anthropic_to_openai) sends for a tool defined without input_schema.
+_DEFAULT_SCHEMA_BYTES = len(json.dumps({"type": "object", "properties": {}}))
+
+
+def uncounted_bytes(body: dict[str, Any]) -> int:
+    """The UTF-8 bytes of what the model will see that vllm-mlx 0.6.0's count leaves out. Read from its source
+    (server.count_anthropic_tokens against api/anthropic_adapter): the count encodes a system string, every system
+    block's "text", a message string, every content block's "text", a truthy "input" (as JSON), a tool_result's string
+    content or its dict items' "text", and each tool's name, description and input_schema. The adapter sends, besides:
+
+      * a tool_use block's name and id (the assistant's tool call) and its input as "{}" when empty;
+      * a tool_result block's tool_use_id, and plain STRING items of its content list (joined into the tool message);
+      * plain string entries of a system list;
+      * the default {"type": "object", "properties": {}} of a tool without input_schema.
+
+    A tool_result whose content is neither a string nor a list (vllm-mlx's model refuses it, but it is counted all the
+    same) and any block the count does not know are added whole. Past thinking is neither counted nor sent (the adapter
+    drops it). Bytes >= tokens (input_bound_bytes), so adding these bytes to the count can only over-reserve."""
+    total = 0
+    system = body.get("system")
+    if isinstance(system, list):
+        for s in system:
+            if isinstance(s, str):
+                total += _utf8(s)
+            elif not isinstance(s, dict) or not (isinstance(s.get("text"), str) and s["text"]):
+                total += _json_bytes(s)
+    for m in _messages(body):
+        if not isinstance(m, dict):
+            total += _json_bytes(m)
+            continue
+        content = m.get("content")
+        if isinstance(content, str) or content is None:
+            continue
+        if not isinstance(content, list):
+            total += _json_bytes(content)
+            continue
+        for b in content:
+            if not isinstance(b, dict):
+                total += _utf8(b) if isinstance(b, str) else _json_bytes(b)
+                continue
+            kind = b.get("type")
+            if kind == "text" or kind in ("thinking", "redacted_thinking"):
+                continue                     # text counted; thinking dropped by the adapter
+            if kind == "tool_use":
+                total += _utf8(b.get("name")) + _utf8(b.get("id")) + (0 if b.get("input") else 2)
+            elif kind == "tool_result":
+                total += _utf8(b.get("tool_use_id"))
+                sub = b.get("content")
+                if isinstance(sub, list):
+                    for item in sub:
+                        if isinstance(item, str):
+                            total += _utf8(item)
+                        elif not (isinstance(item, dict) and isinstance(item.get("text"), str)):
+                            total += _json_bytes(item)
+                elif sub is not None and not isinstance(sub, str):
+                    total += len(str(sub).encode("utf-8", "surrogatepass"))
+            else:
+                total += _json_bytes(b)      # an image, a document, anything unknown: the whole block
+    for t in _tools(body):
+        if isinstance(t, dict) and not t.get("input_schema"):
+            total += _DEFAULT_SCHEMA_BYTES
+    return total
 
 
 def input_tokens(body: Any, counted: Any = None) -> tuple[int, str]:
-    """(input tokens, "exact" | "bound") for a request (module docstring): the backend's count plus the template
-    allowance when `counted` is a non-negative integer and the request is countable, else the byte bound plus the
-    allowance. `body` is the parsed request; anything else (bytes that are not a JSON object) is bounded by its own
-    length."""
+    """(input tokens, "counted" | "bound") for a request (module docstring). The backend's count is never trusted
+    alone: with `counted` a non-negative integer, the input is
+        counted + uncounted_bytes(body) + template_tokens(body)
+    (what the count saw, the bytes of what it left out, the template), never more than the byte bound (a hard upper
+    bound by itself); without one, the byte bound plus the allowance. `body` is the parsed request; anything else (bytes
+    that are not a JSON object) is bounded by its own length."""
     if isinstance(body, (bytes, bytearray)):
         try:
             body = json.loads(body)
@@ -287,9 +381,11 @@ def input_tokens(body: Any, counted: Any = None) -> tuple[int, str]:
             return len(json.dumps(body)), "bound"
     if not isinstance(body, dict):
         return _json_bytes(body), "bound"
-    if isinstance(counted, int) and not isinstance(counted, bool) and counted >= 0 and countable(body):
-        return counted + template_tokens(body), "exact"
-    return input_bound_bytes(body) + template_tokens(body), "bound"
+    allowance = template_tokens(body)
+    bound = input_bound_bytes(body) + allowance
+    if isinstance(counted, int) and not isinstance(counted, bool) and counted >= 0:
+        return min(bound, counted + uncounted_bytes(body) + allowance), "counted"
+    return bound, "bound"
 
 
 def request_tokens(cfg: dict[str, Any], input_tokens: int, max_tokens: Any) -> int:
@@ -389,11 +485,16 @@ NO_GOVERNOR = {"limit": None, "owner": None, "pressure": None, "reason": "no gov
 
 
 class Ticket:
-    """One admitted request's hold on the admission: release() gives its slot and bytes back, once (a second call,
-    from a later finally or error path, does nothing)."""
+    """One request's hold on the admission: a COUNT slot (acquire_slot) and the bytes it reserved (0 until reserve()).
+    release() gives both back, once (a second call, from a later finally or error path, does nothing)."""
 
     def __init__(self, admission: "Admission", reserved: int):
         self._admission, self.reserved, self._done = admission, reserved, False
+
+    def reserve(self, nbytes: int) -> tuple[bool, dict[str, Any]]:
+        """Add the request's byte reservation to its slot: (True, report) when it fits; otherwise (False, report with
+        "refused": "busy" | "too_large") and the slot is released here (Admission._reserve)."""
+        return self._admission._reserve(self, nbytes)
 
     def release(self) -> None:
         self._admission._release(self)
@@ -435,38 +536,71 @@ class Admission:
         """The reservation a request asks for (0 without a governor: nothing is budgeted)."""
         return request_bytes(self.governor.cfg, input_tokens, max_tokens) if self.governor else 0
 
-    def try_acquire(self, reserve: int = 0) -> tuple[Ticket | None, dict[str, Any]]:
-        """(ticket, report) when admitted; (None, report) when not, report["refused"] saying why: "busy" (the count
-        limit or the bytes left; retryable) or "too_large" (more than the whole budget beside the weights: never)."""
+    def acquire_slot(self) -> tuple[Ticket | None, dict[str, Any]]:
+        """Phase one: a COUNT slot holding no bytes yet, (ticket, report), or (None, report with "refused": "busy")
+        when the count limit is reached. The gate takes it BEFORE asking the backend for the token count, so no more
+        counts run than turns may (a count is synchronous tokenization on vllm-mlx's event loop), then calls
+        ticket.reserve(bytes) with the counted size. No governor: always a slot."""
         g = self.governor.current() if self.governor else NO_GOVERNOR
         with self._lock:
-            if self.governor is not None:
-                reserve = max(0, int(reserve))
-                avail = available_bytes(self.governor.cfg)
-                if reserve > avail:
-                    return None, {**self._report(g), "refused": "too_large", "request_bytes": reserve,
-                                  "reason": f"request needs {_gib(reserve)} GiB, more than the {_gib(avail)} GiB "
-                                            "budget beside the weights"}
-                limit = g["limit"]
-                if limit is not None and self.inflight >= limit:
-                    return None, {**self._report(g), "refused": "busy", "request_bytes": reserve}
-                if self.reserved + reserve > avail:
-                    return None, {**self._report(g), "refused": "busy", "request_bytes": reserve,
-                                  "reason": f"memory budget: {_gib(avail - self.reserved)} GiB free, request needs "
-                                            f"{_gib(reserve)} GiB"}
-            else:
-                reserve = 0
+            limit = g["limit"] if self.governor is not None else None
+            if limit is not None and self.inflight >= limit:
+                return None, {**self._report(g), "refused": "busy"}
             self.inflight += 1
-            self.reserved += reserve
-            return Ticket(self, reserve), self._report(g)
+            return Ticket(self, 0), self._report(g)
+
+    def _reserve(self, ticket: Ticket, nbytes: int) -> tuple[bool, dict[str, Any]]:
+        """Phase two (Ticket.reserve): the bytes beside the reservations in flight. Refused: "too_large" (more than
+        the whole budget beside the weights: never) or "busy" (not now); either way the slot is given back here."""
+        g = self.governor.current() if self.governor else NO_GOVERNOR
+        with self._lock:
+            if ticket._done:                 # released meanwhile (never in the gate): nothing to add to
+                return False, {**self._report(g), "refused": "busy"}
+            if self.governor is None:
+                return True, self._report(g)
+            nbytes = max(0, int(nbytes))
+            avail = available_bytes(self.governor.cfg)
+            refused = None
+            if nbytes > avail:
+                refused = {"refused": "too_large", "reason": f"request needs {_gib(nbytes)} GiB, more than the "
+                                                             f"{_gib(avail)} GiB budget beside the weights"}
+            elif self.reserved + nbytes > avail:
+                refused = {"refused": "busy", "reason": f"memory budget: {_gib(avail - self.reserved)} GiB free, "
+                                                        f"request needs {_gib(nbytes)} GiB"}
+            if refused is not None:
+                self._release_locked(ticket)
+                return False, {**self._report(g), **refused, "request_bytes": nbytes}
+            ticket.reserved += nbytes
+            self.reserved += nbytes
+            return True, self._report(g)
+
+    def try_acquire(self, reserve: int = 0) -> tuple[Ticket | None, dict[str, Any]]:
+        """Both phases at once: (ticket, report) when admitted; (None, report) when not, report["refused"] saying why:
+        "busy" (the count limit or the bytes left; retryable) or "too_large" (more than the whole budget beside the
+        weights: never). A request that could never fit is "too_large" even when the count is full."""
+        if self.governor is not None and max(0, int(reserve)) > available_bytes(self.governor.cfg):
+            g = self.governor.current()
+            nbytes, avail = max(0, int(reserve)), available_bytes(self.governor.cfg)
+            with self._lock:
+                return None, {**self._report(g), "refused": "too_large", "request_bytes": nbytes,
+                              "reason": f"request needs {_gib(nbytes)} GiB, more than the {_gib(avail)} GiB budget "
+                                        "beside the weights"}
+        ticket, report = self.acquire_slot()
+        if ticket is None:
+            return None, {**report, "request_bytes": max(0, int(reserve))}
+        ok, report = ticket.reserve(reserve)
+        return (ticket if ok else None), report
+
+    def _release_locked(self, ticket: Ticket) -> None:
+        if ticket._done:
+            return
+        ticket._done = True
+        self.inflight = max(0, self.inflight - 1)
+        self.reserved = max(0, self.reserved - ticket.reserved)
 
     def _release(self, ticket: Ticket) -> None:
         with self._lock:
-            if ticket._done:
-                return
-            ticket._done = True
-            self.inflight = max(0, self.inflight - 1)
-            self.reserved = max(0, self.reserved - ticket.reserved)
+            self._release_locked(ticket)
 
     @property
     def retry_after_s(self) -> int:

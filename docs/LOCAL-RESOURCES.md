@@ -624,26 +624,62 @@ admit    iff  count < count limit  and  reserved in flight + reserved ≤ memory
 token), and the old estimate called them 28,572, so seven such turns were admitted at once while each really holds
 ~7.9 GiB. Now, per turn, before admission:
 
-1. **Exact.** The gate asks vllm-mlx for the count on loopback: `POST /v1/messages/count_tokens` (vllm-mlx 0.6.0,
-   `server.count_anthropic_tokens`: the served tokenizer over the system text, message text, tool inputs, tool results
-   and tool definitions), sending the body it is about to relay, within `COUNT_DEADLINE_S` (5 s, end to end). That
-   count leaves out the chat template, so the gate adds a fixed allowance, about twice what Qwen3's template adds: 1024 +
-   16 per message + 32 per content block + 64 per tool (`TEMPLATE_TOKENS_*`).
-2. **Bound**, when there is no exact count (an Ollama node, the route missing, an error, a timeout, an unreadable
-   answer, or an image in the request, which a text count does not see): the UTF-8 bytes of the text the model will
-   see (system, message text and thinking, tool_use names and input JSON, tool results, tool definitions as JSON, an
-   image's source data) plus the same allowance. A byte-level BPE token covers at least one byte, so the bytes are
-   never fewer than the tokens, whatever the text.
+1. **Counted, never trusted alone.** The gate asks vllm-mlx for the count on loopback: `POST
+   /v1/messages/count_tokens`, sending the body it is about to relay, within `COUNT_DEADLINE_S` (5 s, end to end). That
+   count misses some of what vllm-mlx sends to the model. Read from vllm-mlx 0.6.0's source
+   (`server.count_anthropic_tokens` against `api/anthropic_adapter.anthropic_to_openai`), the counter encodes a system
+   string and each system block's `text`, a message string, each content block's `text`, a non-empty `input` (as JSON),
+   a tool_result's string content or its dict items' `text`, and each tool's name, description and `input_schema`. It
+   leaves out, though the adapter sends them:
+
+   | Left out by the 0.6.0 count | Sent to the model as |
+   |---|---|
+   | a `tool_use` block's `name` and `id` (and `input` when empty) | the assistant's tool call (`function.name`, `id`, `arguments: "{}"`) |
+   | a `tool_result` block's `tool_use_id` | the tool message's `tool_call_id` |
+   | plain **string** items of a `tool_result`'s content list | joined into the tool message |
+   | plain string entries of a `system` list | joined into the system message |
+   | a tool defined without `input_schema` | the default `{"type": "object", "properties": {}}` |
+
+   The gate adds the UTF-8 bytes of all of these to the count (`local_governor.uncounted_bytes`; bytes ≥ tokens, so
+   this can only over-reserve), then the template allowance, which covers what the count never sees: the chat
+   template's markers and tool preamble, about twice what Qwen3's template adds: 1024 + 16 per message + 32 per content
+   block + 64 per tool (`TEMPLATE_TOKENS_*`). The result is never above the byte bound below, which holds by itself. The
+   re-review's case: a 100,000-byte token-dense tool_result as string items after a 4 KB tool name was counted 7 and
+   admitted as ~1k tokens. It now reserves ≥ 104k tokens.
+2. **Bound**, when there is no count (an Ollama node, the route missing, an error, a timeout, an unreadable answer, or
+   no count slot free within the deadline): the UTF-8 bytes of the text the model will see (system, message text and
+   thinking, tool_use names, ids and input JSON, tool_result ids and content, tool definitions as JSON) plus the same
+   allowance. A byte-level BPE token covers at least one byte, so the bytes are never fewer than the tokens, whatever
+   the text.
 
 The trade-off: the bound is very conservative. Prose and code run ~4.3 bytes a token (measured with Qwen3's tokenizer
 on this repository's source), so a turn on the bound reserves about four times its real context, and fewer turns run
-at once. That costs concurrency only while the exact count fails; a working count reserves what the turn holds. The count
+at once. That costs concurrency only while the count fails; a working count reserves what the turn holds. The count
 is cheap: Qwen3's tokenizer encodes ~100 KB in ~25 ms and a full 128k-token context (~400 KB) in ~100 ms on an M-series CPU
-(measured on the Air with `tokenizers` 0.22 and Qwen3's `tokenizer.json`, not on the Pro). vllm-mlx runs it on its
-event loop, so a count can be slowed by a long prefill step; the deadline caps that wait and the bound takes over. A
-turn the count limit already refuses is answered 529 before any count is asked. The count route is gate-internal
-(`local_backend.COUNT_TOKENS`): it is in neither the client routes (`local_gate.ROUTES`) nor `local_backend.UPSTREAM`,
-so a client asking the gate for it gets the gate's 404.
+(measured on the Air with `tokenizers` 0.22 and Qwen3's `tokenizer.json`, not on the Pro). vllm-mlx runs it
+synchronously on its event loop, so the gate keeps counts few:
+
+- **Admission is two-phase.** A turn takes its COUNT slot (`Admission.acquire_slot`) before any count is asked, so no
+  more counts run than turns may run (2 with the owner active), and a turn the count limit refuses is answered 529
+  without being counted. After the count, `Ticket.reserve` adds the turn's bytes. If they do not fit now (529) or
+  never fit (413), the slot is given back right there, and the gate's `finally` release is then a no-op: each slot is
+  released exactly once, on every path.
+- **At most `COUNT_CONCURRENCY` (2) count calls are in flight at once**, whatever the count limit (8 with the owner
+  idle). A turn that cannot start its count within the deadline takes the byte bound.
+
+A long prefill step can still slow a count; the deadline caps that wait and the bound takes over. The count route is
+gate-internal (`local_backend.COUNT_TOKENS`): it is in neither the client routes (`local_gate.ROUTES`) nor
+`local_backend.UPSTREAM`, so a client asking the gate for it gets the gate's 404.
+
+**Text only.** The Pro's vllm-mlx serves the 27B with its vision tower excluded at load. vllm-mlx 0.6.0's adapter
+turns a top-level image into image input, which the loaded model cannot use. It silently drops a document, any other
+non-text block, and an image inside a tool_result, so the model would answer as if it had seen them. On a vllm-mlx
+node the gate therefore refuses a turn carrying any of these (`local_governor.non_text_content`: message blocks other
+than text, thinking, redacted_thinking, tool_use and tool_result; tool_result content or system entries other than text
+blocks and strings). The refusal comes before admission and before any count: `400 invalid_request_error`,
+`x-should-retry: false`, no Retry-After, message `local gate: content this node's model cannot read (image block in
+message 3; it serves a text-only model)` (`local_gate.UNSUPPORTED_MESSAGE`). An Ollama node relays images as before:
+its model decides. The provider treats the refusal like "never fits" (below).
 
 A request without `max_tokens` reserves vllm-mlx's default (`vllm_mlx.serve.max_tokens`, 32768). Per model (a
 `vllm_mlx.models` entry overrides the `governor` default), measured and derived for Qwen3.8 27B (hybrid attention /
@@ -699,13 +735,15 @@ key that replaced them (a gate given an old config does not start; update `~/.co
 from the example).
 
 Enforcement, in the gate on `POST /v1/messages` (the probe is never counted), no turn reaching the backend when refused
-(only its token count, which runs no model):
+(only its token count, which runs no model, and only once the turn holds a count slot):
 
 - over either bound **now**: `529 overloaded_error`, `Retry-After: retry_after_s` (5), message `local gate: busy (n of
   limit running: reason)`; the reason names the memory budget when the bytes refused it (`memory budget: 5.7 GiB free,
   request needs 9.6 GiB`);
 - **never fits**: `413 request_too_large`, `x-should-retry: false`, no Retry-After, message `local gate: too large for
   this node's memory (…; at most N tokens of input + max_tokens fit)`.
+- **content the model cannot read** (vllm-mlx, an image or document; above): `400 invalid_request_error`,
+  `x-should-retry: false`, before admission and count.
 
 Both carry the capacity report. The gate reports `{"backend", "limit", "inflight", "owner", "pressure", "reason",
 "reserved_bytes", "free_bytes", "fit_tokens", "free_tokens"}` read-only as `cortados_gate` in every `GET /api/tags`
@@ -729,9 +767,13 @@ S1's route stands ("routes elsewhere"). A turn the gate still refuses:
   node), and the client gets that route's answer;
 - too large on a **pinned** turn (`sub/<local model>`) or a **continuation**: a terminal `413 request_too_large` with
   `x-should-retry: false`, saying the turn is too large for the node's memory (compact, lower max_tokens, start a new
-  conversation, or pin a cloud model); the conversation is unchanged.
+  conversation, or pin a cloud model); the conversation is unchanged;
+- content the text-only model cannot read (`local_lane.GATE_UNSUPPORTED`), handled the same way: on the opening turn of
+  a conversation a rule moved to the node it is routed again with that local model excluded (`local_lane.UNSUPPORTED`,
+  one of `local_lane.REROUTE`); on a pinned turn or a continuation, a terminal `400 invalid_request_error` with
+  `x-should-retry: false`, saying the node serves a text-only model (pin a model that reads images, or send text only).
 
-The refusal fallback (`local_lane.complete`) treats a busy or too-large node as unavailable.
+The refusal fallback (`local_lane.complete`) treats a busy, too-large or text-only refusal as an unavailable node.
 
 ### Switch the Pro to MLX
 
