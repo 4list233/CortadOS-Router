@@ -19,6 +19,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 from pathlib import Path
 
 from cortados_router.provider import codex_bridge, responses_wire, routing, server
@@ -201,11 +202,11 @@ class ResponsesEndpointTests(unittest.TestCase):
         self.assertEqual(r["output"][0]["content"][0]["text"], "echo: title this")
         self.assertEqual(self.reg.sessions, {})
 
-    def test_a_continuation_the_endpoint_no_longer_holds_is_a_409_in_the_responses_shape(self):
+    def test_a_continuation_the_endpoint_no_longer_holds_is_refused_in_the_responses_shape(self):
         code, body = self.error_of(request(
             user("x"), {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "from before a restart"}]},
             user("go on")))
-        self.assertEqual(code, 409)
+        self.assertEqual(code, 400)                                    # terminal (#43 review): no_writer
         self.assertEqual(sorted(body), ["error"])                      # {"error": {...}}, not Anthropic's {"type": "error", ...}
         self.assertEqual(body["error"]["type"], "invalid_request_error")
         self.assertIn("no longer holds", body["error"]["message"])
@@ -213,7 +214,7 @@ class ResponsesEndpointTests(unittest.TestCase):
         code, body = self.error_of(request(
             user("x"), {"type": "function_call", "call_id": "call_gone", "name": "Read", "arguments": "{}"},
             {"type": "function_call_output", "call_id": "call_gone", "output": "late"}))
-        self.assertEqual(code, 409)
+        self.assertEqual(code, 400)
         self.no_backend_started()
 
     def test_a_failing_router_is_a_503_in_the_responses_shape_and_starts_nothing(self):
@@ -299,6 +300,107 @@ class ResponsesEndpointTests(unittest.TestCase):
         code, err = self.error_of(request(user("x")), headers=dict(headers, authorization="Bearer nope"))
         self.assertEqual(code, 401)                                    # the Responses path still answers in its shape
         self.assertEqual(sorted(err), ["error"])
+
+    # ------------------------------------------------------------------ rebuild after a rewritten history (#43)
+    def _text(self, r):
+        return " ".join(c["text"] for it in r["output"] if it["type"] == "message" for c in it["content"])
+
+    def test_a_partially_compacted_history_is_rebuilt_on_the_same_route(self):
+        _, r1 = self.post(request(user("hello")))
+        _, r2 = self.post(request(user("hello"), *r1["output"], user("second")))
+        (old,) = self.reg.sessions.values()
+        argv_file = self.codex_argv_file if self.ROUTE is CODEX_ROUTE else self.claude_argv_file
+        before = json.loads(Path(argv_file).read_text())["argv"]
+        header, r3 = self.post(request(user("Summary: hello was said."), *r2["output"], user("third")))
+        text = self._text(r3)
+        self.assertIn("[cortados relay] The client rewrote", text)
+        self.assertIn("Summary: hello was said.", text)
+        self.assertIn("<assistant>\necho: second\n</assistant>", text)
+        self.assertNotIn("echo: hello", text)
+        self.assertTrue(text.endswith("third"), text)
+        self.assertEqual(header, self.expected_header())               # the same route
+        self.assertEqual(len(self.clients), 1)                          # routed once, when the conversation opened
+        (new,) = self.reg.sessions.values()
+        self.assertIsNot(new, old)
+        after = json.loads(Path(argv_file).read_text())["argv"]
+        if self.ROUTE is CODEX_ROUTE:
+            self.assertEqual(after, before)                             # the same isolation command line
+        else:
+            for flag in ("--tools", "--setting-sources", "--settings", "--model", "--allowedTools"):
+                self.assertEqual(after[after.index(flag) + 1], before[before.index(flag) + 1], flag)
+        # and it goes on as an ordinary conversation
+        _, r4 = self.post(request(user("Summary: hello was said."), *r2["output"], user("third"), *r3["output"],
+                                  user("fourth")))
+        self.assertEqual(self._text(r4), "echo: fourth")
+        self.assertEqual(list(self.reg.sessions.values()), [new])
+
+    def test_a_compacted_pending_call_is_replayed_with_its_output_by_call_id(self):
+        _, r1 = self.post(request(user("hello")))
+        _, r2 = self.post(request(user("hello"), *r1["output"], user("use tool")))
+        [call] = [i for i in r2["output"] if i["type"] == "function_call"]
+        _, r3 = self.post(request(user("Summary: the user asked for a file."), *r2["output"],
+                                  {"type": "function_call_output", "call_id": call["call_id"], "output": "hello"}))
+        text = self._text(r3)
+        self.assertIn(f'[tool call {call["call_id"]}: Read] {{"file_path": "f0.md"}}', text)
+        self.assertIn(f"[tool result for call {call['call_id']}]\nhello", text)
+        self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_the_rebuild_limit_is_terminal_on_the_responses_wire(self):
+        # #43 review P1-1: the limit is the endpoint's non-retried 400 on this wire too (Codex retries a 409 and 5xx).
+        _, r1 = self.post(request(user("hello")))
+        _, r2 = self.post(request(user("hello"), *r1["output"], user("second")))
+        with mock.patch.object(server, "REBUILD_MAX", 1):
+            _, r3 = self.post(request(user("Summary 1."), *r2["output"], user("third")))
+            limited = request(user("Summary 2."), *r3["output"], user("fourth"))
+            code, body = self.error_of(limited)
+            with self.send(dict(limited, stream=True)) as r:
+                streamed = r.read().decode()
+        self.assertEqual((code, body["error"]["type"]), (400, "invalid_request_error"))
+        self.assertIn("rebuild limit (1 rebuilds)", body["error"]["message"])
+        self.assertIn("start a new conversation", body["error"]["message"])
+        self.assertIn("response.failed", streamed)
+        self.assertIn(responses_wire.TERMINAL_CODE, streamed)            # the stream's non-retried code
+        self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_identical_histories_on_two_session_ids_continue_their_own_sessions(self):
+        # Scope (#43 review): the exact-match lookup is filtered by wire + client + conversation identity, so two
+        # Codex sessions whose replies are identical each continue their own backend (it used to be an ambiguous 409).
+        other = dict(CODEX_HEADERS, **{"session-id": "11111111-1111-1111-1111-111111111111"})
+        _, a1 = self.post(request(user("same")))
+        with self.send(request(user("same")), headers=other) as r:
+            b1 = json.loads(r.read())
+        self.assertEqual(len(self.reg.sessions), 2)
+        a, b = list(self.reg.sessions.values())
+        _, a2 = self.post(request(user("same"), *a1["output"], user("on a")))
+        with self.send(request(user("same"), *b1["output"], user("on b")), headers=other) as r:
+            b2 = json.loads(r.read())
+        self.assertEqual((self._text(a2), self._text(b2)), ("echo: on a", "echo: on b"))
+        self.assertEqual((len(a.history), len(b.history)), (2, 2))
+
+    def test_an_edited_history_without_a_session_id_is_a_terminal_refusal_that_says_why(self):
+        _, r1 = self.post(request(user("hello")))
+        _, r2 = self.post(request(user("hello"), *r1["output"], user("second")))
+        headers = {k: v for k, v in CODEX_HEADERS.items() if k != "session-id"}
+        code, body = self.error_of(request(user("Summary."), *r2["output"], user("third")), headers=headers)
+        self.assertEqual(code, 400)
+        self.assertIn("carries no conversation identity", body["error"]["message"])
+
+    def test_without_a_session_id_only_a_history_holding_a_call_id_continues(self):
+        # #43 review P1-b on this wire: an identity-less continuation is matched only on proof of caller, a
+        # function_call call_id of that session in its history; a text-only one is refused before any backend.
+        no_id = {k: v for k, v in CODEX_HEADERS.items() if k != "session-id"}
+        items = [user("please use tool")]
+        with self.send(request(*items), headers=no_id) as r:
+            r1 = json.loads(r.read())
+        call = next(i for i in r1["output"] if i["type"] == "function_call")
+        items += r1["output"] + [{"type": "function_call_output", "call_id": call["call_id"], "output": "hello"}]
+        with self.send(request(*items), headers=no_id) as r:
+            self.assertEqual(self._text(json.loads(r.read())), "tool said: hello")
+        with self.send(request(user("hi")), headers=no_id) as r:
+            t1 = json.loads(r.read())
+        code, body = self.error_of(request(user("hi"), *t1["output"], user("more")), headers=no_id)
+        self.assertEqual(code, 400)
+        self.assertIn("carries no conversation identity", body["error"]["message"])
 
 
 class RoutingBodyTests(unittest.TestCase):
@@ -422,24 +524,34 @@ class ResponsesOnCodexTests(ResponsesEndpointTests):
         self.assertEqual(error["code"], responses_wire.TERMINAL_CODE)
         self.assertIn("usageLimitExceeded", error["message"])
         self.assertEqual(self.reg.sessions, {})
-        other = [user("another conversation")] + items[1:]             # same reply, another conversation: 409
-        self.assertEqual(self.error_of(request(*other))[0], 409)
+        other = [user("another conversation")] + items[1:]             # same reply, another conversation: no_writer
+        code, body = self.error_of(request(*other))
+        self.assertEqual(code, 400)
+        self.assertNotIn("usageLimitExceeded", body["error"]["message"])  # never the tombstone's failure
         self.assertEqual(len(self.reg.tombstones), 1)                  # keyed by Codex's session-id header
         no_id = {k: v for k, v in CODEX_HEADERS.items() if k != "session-id"}
-        self.assertEqual(self.error_of(request(*items), headers=no_id)[0], 409)   # same history, no identity: no match
+        code, body = self.error_of(request(*items), headers=no_id)     # same history, no identity: no match
+        self.assertEqual(code, 400)
+        self.assertIn("carries no conversation identity", body["error"]["message"])
 
     def test_a_failed_turn_without_a_session_id_leaves_no_tombstone(self):
         # Without a conversation identity the digest alone cannot tell two conversations with the same prefix apart,
-        # so the failure is not published and its retry gets the ordinary 409.
+        # so the failure is not published, and its retry is refused as identity-less (terminal), never the failure.
+        # The conversation reaches its failing turn on the identity-less proof of caller: a call id in its history.
         no_id = {k: v for k, v in CODEX_HEADERS.items() if k != "session-id"}
-        items = [user("hi")]
+        items = [user("please use tool")]
         with self.send(request(*items), headers=no_id) as r:
             r1 = json.loads(r.read())
-        items += r1["output"] + [user("fail")]
+        call = next(i for i in r1["output"] if i["type"] == "function_call")
+        items += r1["output"] + [{"type": "function_call_output", "call_id": call["call_id"], "output": "hello"}]
+        with self.send(request(*items), headers=no_id) as r:
+            r2 = json.loads(r.read())
+        items += r2["output"] + [user("fail")]
         self.assertEqual(self.error_of(request(*items), headers=no_id)[0], 502)
         self.assertEqual((self.reg.sessions, len(self.reg.tombstones)), ({}, 0))
         code, body = self.error_of(request(*items), headers=no_id)
-        self.assertEqual(code, 409)
+        self.assertEqual(code, 400)
+        self.assertIn("carries no conversation identity", body["error"]["message"])
         self.assertNotIn("usageLimitExceeded", body["error"]["message"])
 
 if __name__ == "__main__":
