@@ -12,7 +12,9 @@ Ollama has no authentication, so it listens on 127.0.0.1 only and this gate is t
     routes above stay the same and each backend receives only its fixed upstream routes (local_backend.UPSTREAM).
   * Admission (local_governor.py) bounds the POST /v1/messages running at once when the backend config has a
     `governor`: a COUNT that follows the owner's activity and memory pressure, and a BYTE budget each request reserves
-    its KV cache from (input tokens + max_tokens). A request over either, now, gets a retryable 529 overloaded_error
+    its KV cache from (input tokens + max_tokens; input tokens counted exactly by the backend's own tokenizer on
+    loopback, COUNT_TOKENS, or bounded by the request's UTF-8 bytes when that count is not available). A request over
+    either, now, gets a retryable 529 overloaded_error
     with Retry-After at once (never queued here); one that could not fit the budget even alone gets a non-retryable
     413 request_too_large (TOO_LARGE_MESSAGE), which the provider routes elsewhere. Running requests are never
     stopped; a reservation is released however the request ends. The limit, in-flight count and reserved/free bytes
@@ -120,6 +122,14 @@ PS_CONNECT_S = 1.0
 PS_TIMEOUT_S = 2.0
 PS_MAX_MODELS = 32
 PS_MAX_BYTES = 1024 * 1024
+# The exact input count asked of the backend before admission (local_backend.COUNT_TOKENS, vllm-mlx only). Encoding is
+# fast (Qwen3's tokenizer on an M-series CPU: ~25 ms per 100 KB, ~100 ms for 400 KB, a full 128k-token context), but
+# vllm-mlx runs it on its event loop, which a long prefill step can hold for seconds; past COUNT_DEADLINE_S (end to
+# end, deadline_call) the gate stops waiting and takes the byte bound, a slower answer never holding the turn longer.
+# The answer is {"input_tokens": N}: COUNT_MAX_BYTES is ample.
+COUNT_CONNECT_S = 1.0
+COUNT_DEADLINE_S = 5.0
+COUNT_MAX_BYTES = 4096
 
 class _DeadlineSocket:
     """A connected socket under an absolute monotonic deadline: every send and every receive waits at most the time
@@ -426,6 +436,7 @@ class GateServer(ThreadingHTTPServer):
         if self.backend["backend"] not in local_backend.BACKENDS:
             raise GateConfigError(f"unknown backend {self.backend['backend']!r}")
         self.admission = admission if admission is not None else local_governor.Admission(None)
+        self.count_deadline = COUNT_DEADLINE_S
         super().__init__(addr, GateHandler)
 
     def capacity(self) -> dict:
@@ -624,7 +635,13 @@ class GateHandler(BaseHTTPRequestHandler):
                 return self._error(503, "overloaded_error", reason)
             if method == "POST":             # admission: only a model turn takes a slot, never the probe
                 adm = self.server.admission
-                ticket, snap = adm.try_acquire(adm.request_bytes(n, _max_tokens(body)) if adm.governor else 0)
+                reserve = 0
+                if adm.governor is not None:
+                    pre = adm.snapshot()
+                    if pre["limit"] is not None and pre["inflight"] >= pre["limit"]:
+                        return self._busy({**pre, "refused": "busy"})     # full by count: no need to count tokens
+                    reserve = adm.request_bytes(self._input_tokens(body), _max_tokens(body))
+                ticket, snap = adm.try_acquire(reserve)
                 if ticket is None:
                     return self._too_large(snap) if snap.get("refused") == "too_large" else self._busy(snap)
             self._forward(method, path, body)
@@ -636,9 +653,54 @@ class GateHandler(BaseHTTPRequestHandler):
             if lock_fd is not None:
                 os.close(lock_fd)            # releases LOCK_SH
 
+    def _input_tokens(self, body: bytes) -> int:
+        """The turn's input tokens for its reservation (local_governor.input_tokens): the backend's exact count
+        (COUNT_TOKENS on loopback, within COUNT_DEADLINE_S) plus the template allowance, or, when there is no count
+        (Ollama, the route missing, an error, a timeout, a bad answer, an image in the request), the hard byte bound."""
+        try:
+            data = json.loads(body)
+        except (ValueError, RecursionError):
+            data = None
+        route = local_backend.COUNT_TOKENS.get(self.server.backend["backend"])
+        counted, why = None, "no count route"
+        if route is None:
+            pass
+        elif not isinstance(data, dict):
+            why = "body not an object"
+        elif not local_governor.countable(data):
+            why = "not countable (image)"
+        else:
+            counted, why = self._count(route, body)
+        tokens, how = local_governor.input_tokens(data if isinstance(data, dict) else body, counted)
+        if how == "bound" and route is not None:
+            logger.info("input tokens bounded by bytes (%s): %d", why, tokens)
+        return tokens
+
+    def _count(self, route: tuple, body: bytes) -> tuple:
+        """(input_tokens, "") from the backend's count route, or (None, why) on any failure. Never raises."""
+        method, path = route
+        conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port)
+        try:
+            status, raw = deadline_call(conn, self.server.count_deadline, method, path, body=body,
+                                        headers={"content-type": "application/json"}, max_bytes=COUNT_MAX_BYTES,
+                                        connect_s=min(self.server.connect_timeout, COUNT_CONNECT_S))
+        except (OSError, http.client.HTTPException) as exc:
+            return None, type(exc).__name__
+        finally:
+            conn.close()
+        if status != 200:
+            return None, f"count answered {status}"
+        try:
+            n = json.loads(raw).get("input_tokens")
+        except (ValueError, AttributeError, RecursionError):
+            n = None
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            return None, "count unreadable"
+        return n, ""
+
     def _busy(self, snap: dict) -> None:
         """The over-limit answer: 529 overloaded_error (Anthropic's "busy, retry"), Retry-After, and the capacity report
-        so the provider marks the node busy without another probe. Nothing reached the backend."""
+        so the provider marks the node busy without another probe. No turn reached the backend (its token count may have)."""
         cap = self.server.report(snap)
         body = json.dumps({"type": "error", "error": {"type": "overloaded_error", "message":
                            f"{BUSY_MESSAGE} ({cap['inflight']} of {cap['limit']} running: {cap['reason']})"},
@@ -655,7 +717,7 @@ class GateHandler(BaseHTTPRequestHandler):
     def _too_large(self, snap: dict) -> None:
         """The never-fits answer: the request's reservation exceeds the whole budget beside the weights, so no retry
         can be admitted. 413 request_too_large, x-should-retry: false, no Retry-After, and the capacity report (its
-        fit_tokens says how much would fit). Nothing reached the backend."""
+        fit_tokens says how much would fit). No turn reached the backend (its token count may have)."""
         cap = self.server.report(snap)
         body = json.dumps({"type": "error", "error": {"type": "request_too_large", "message":
                            f"{TOO_LARGE_MESSAGE} ({cap['reason']}; at most {cap['fit_tokens']} tokens of input + "

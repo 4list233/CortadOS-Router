@@ -50,6 +50,11 @@ UPSTREAM = {
     "ollama": {("GET", "/api/tags"): ("GET", "/api/tags"), ("POST", "/v1/messages"): ("POST", "/v1/messages")},
     "vllm-mlx": {("GET", "/api/tags"): ("GET", "/v1/models"), ("POST", "/v1/messages"): ("POST", "/v1/messages")},
 }
+# The gate's own call for an exact input token count before admission (local_governor.input_tokens). Gate-internal:
+# not a client route (local_gate.ROUTES) and not in UPSTREAM, so no client request can reach it; the gate sends the
+# body it already admitted for counting. vllm-mlx 0.6.0's server.count_anthropic_tokens encodes the text with the
+# served tokenizer. Ollama has no such route: its requests take the byte bound.
+COUNT_TOKENS = {"vllm-mlx": ("POST", "/v1/messages/count_tokens")}
 # The switch status's "models loaded" source.
 LOADED = {"ollama": "/api/ps", "vllm-mlx": "/v1/models"}
 LAUNCH_LABEL = "com.cortados.vllm-mlx"
@@ -66,8 +71,65 @@ SERVE_DEFAULTS: dict[str, Any] = {
 }
 
 
+# vllm_mlx.extra_args may add only these vllm-mlx 0.6.0 serve flags (vllm_mlx/cli.py), each matched by its exact name,
+# as `--flag value` or `--flag=value` (True: takes a value) or alone (False). An allowlist, not a denylist: argparse
+# keeps the LAST value of a repeated flag and expands abbreviations (`--ho` is `--host`), so an extra argument could
+# otherwise undo the flags serve_argv sets for safety: --host (a backend with no authentication must stay on loopback
+# behind the gate), --port, --max-num-seqs (the backend's own bound under the gate's admission), --max-tokens and
+# --max-request-tokens (the reservation's default and ceiling), --timeout, the served name and the parsers. Every flag
+# here changes sampling defaults, output pacing or lowers memory, never exposure, admission or the memory per request.
+# Anything else (--api-key, --mcp-config, --kv-cache-quantization, --max-kv-size, ...) belongs in serve or the
+# generator, with a review, not in extra_args.
+EXTRA_ARGS_ALLOWED: dict[str, bool] = {
+    "--default-temperature": True,
+    "--default-top-p": True,
+    "--default-top-k": True,
+    "--default-min-p": True,
+    "--default-presence-penalty": True,
+    "--default-repetition-penalty": True,
+    "--stream-interval": True,            # tokens per streamed chunk
+    "--chunked-prefill-tokens": True,     # prefill in chunks: lowers peak memory
+    "--disable-prefix-cache": False,      # no cross-request prefix cache: less memory
+}
+
+
 class BackendConfigError(ValueError):
     pass
+
+
+def check_extra_args(extra: Any) -> list[str]:
+    """vllm_mlx.extra_args, validated against EXTRA_ARGS_ALLOWED (BackendConfigError naming the first bad entry)."""
+    if not isinstance(extra, list) or not all(isinstance(a, str) for a in extra):
+        raise BackendConfigError("vllm_mlx.extra_args must be a list of strings")
+    allowed = ", ".join(sorted(EXTRA_ARGS_ALLOWED))
+    i = 0
+    while i < len(extra):
+        arg = extra[i]
+        flag, eq, value = arg.partition("=")
+        if flag not in EXTRA_ARGS_ALLOWED:
+            what = f"flag {flag!r}" if flag.startswith("-") else f"argument {arg!r} (not a flag)"
+            raise BackendConfigError(f"vllm_mlx.extra_args: {what} is not allowed (serve_argv sets host, port, "
+                                     f"max-num-seqs, max-tokens and the rest itself); allowed: {allowed}")
+        if EXTRA_ARGS_ALLOWED[flag]:
+            if not eq:
+                if i + 1 >= len(extra):
+                    raise BackendConfigError(f"vllm_mlx.extra_args: {flag} needs a value")
+                i += 1
+                value = extra[i]
+            if not value or (value.startswith("-") and not _number(value)):
+                raise BackendConfigError(f"vllm_mlx.extra_args: {flag} needs a value, got {value!r}")
+        elif eq:
+            raise BackendConfigError(f"vllm_mlx.extra_args: {flag} takes no value")
+        i += 1
+    return list(extra)
+
+
+def _number(v: str) -> bool:
+    try:
+        float(v)
+    except ValueError:
+        return False
+    return True
 
 
 def _expand(p: str) -> str:
@@ -130,9 +192,7 @@ def check(raw: Any, path: str | None = None) -> dict[str, Any]:
         venv = section.get("venv")
         if not isinstance(venv, str) or not venv.strip():
             raise BackendConfigError("vllm_mlx.venv must name the venv holding vllm-mlx")
-        extra = section.get("extra_args", [])
-        if not isinstance(extra, list) or not all(isinstance(a, str) for a in extra):
-            raise BackendConfigError("vllm_mlx.extra_args must be a list of strings")
+        extra = check_extra_args(section.get("extra_args", []))
         out.update(served_model=model["served_model_name"].strip(), model={"key": name, **model}, serve=serve,
                    venv=venv, extra_args=extra)
     # Ollama without an `upstream` key: None, so the gate keeps its own --upstream (today's setting). vllm-mlx: the
@@ -257,7 +317,8 @@ def serve_argv(cfg: dict[str, Any]) -> list[str]:
         argv += ["--reasoning-parser", str(s["reasoning_parser"])]
     if s["default_chat_template_kwargs"]:
         argv += ["--default-chat-template-kwargs", json.dumps(s["default_chat_template_kwargs"])]
-    return argv + list(cfg.get("extra_args") or [])
+    # Re-checked here too: a cfg built without check() must not slip an override past the allowlist.
+    return argv + check_extra_args(list(cfg.get("extra_args") or []))
 
 
 def launch_agent_plist(cfg: dict[str, Any], log_dir: str) -> bytes:

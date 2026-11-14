@@ -106,7 +106,9 @@ class GateSwitchTests(Home):
         super().setUp()
         self.ollama = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllamaPs)
         threading.Thread(target=self.ollama.serve_forever, daemon=True).start()
-        FakeOllama.seen, FakeOllamaPs.loaded, FakeOllamaPs.ps_status, FakeOllamaPs.ps_gets = [], [TAG], 200, 0
+        FakeOllama.reset()                    # the shared fake's knobs, whatever an earlier module left set
+        self.addCleanup(FakeOllama.reset)
+        FakeOllamaPs.loaded, FakeOllamaPs.ps_status, FakeOllamaPs.ps_gets = [TAG], 200, 0
         self.gate = local_gate.GateServer(("127.0.0.1", 0), token=TOKEN,
                                           upstream=f"http://127.0.0.1:{self.ollama.server_port}", read_timeout=5)
         threading.Thread(target=self.gate.serve_forever, daemon=True).start()
@@ -214,6 +216,8 @@ class ProviderSwitchTests(EndpointHarness):
         self.addCleanup(self.home.doCleanups)
         self.ollama = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllamaPs)
         threading.Thread(target=self.ollama.serve_forever, daemon=True).start()
+        FakeOllama.reset()
+        self.addCleanup(FakeOllama.reset)
         FakeOllamaPs.loaded, FakeOllamaPs.ps_status = [TAG], 200
         self.gate = local_gate.GateServer(("127.0.0.1", 0), token=TOKEN,
                                           upstream=f"http://127.0.0.1:{self.ollama.server_port}", read_timeout=5)

@@ -614,10 +614,36 @@ reservations in flight fit beside the weights. The fixed "2 GB per request" cap 
 benchmark prompts, and real Claude Code turns of 30k–130k tokens hold four to sixteen times that.
 
 ```
-tokens   = min(input tokens + max_tokens, context_tokens)      input tokens ≈ request body characters / 3.5
+tokens   = min(input tokens + max_tokens, context_tokens)
 reserved = tokens × kv_bytes_per_token + per_seq_state_bytes + prefill_margin_bytes
 admit    iff  count < count limit  and  reserved in flight + reserved ≤ memory_budget_bytes − weights_bytes
 ```
+
+**Input tokens are counted, or bounded, never estimated** (`local_governor.input_tokens`). An average such as
+"characters / 3.5" is not a bound: 100,000 characters of `a!a!…` are 100,000 tokens on Qwen's tokenizer (1 byte a
+token), and the old estimate called them 28,572, so seven such turns were admitted at once while each really holds
+~7.9 GiB. Now, per turn, before admission:
+
+1. **Exact.** The gate asks vllm-mlx for the count on loopback: `POST /v1/messages/count_tokens` (vllm-mlx 0.6.0,
+   `server.count_anthropic_tokens`: the served tokenizer over the system text, message text, tool inputs, tool results
+   and tool definitions), sending the body it is about to relay, within `COUNT_DEADLINE_S` (5 s, end to end). That
+   count leaves out the chat template, so the gate adds a fixed allowance, about twice what Qwen3's template adds: 1024 +
+   16 per message + 32 per content block + 64 per tool (`TEMPLATE_TOKENS_*`).
+2. **Bound**, when there is no exact count (an Ollama node, the route missing, an error, a timeout, an unreadable
+   answer, or an image in the request, which a text count does not see): the UTF-8 bytes of the text the model will
+   see (system, message text and thinking, tool_use names and input JSON, tool results, tool definitions as JSON, an
+   image's source data) plus the same allowance. A byte-level BPE token covers at least one byte, so the bytes are
+   never fewer than the tokens, whatever the text.
+
+The trade-off: the bound is very conservative. Prose and code run ~4.3 bytes a token (measured with Qwen3's tokenizer
+on this repository's source), so a turn on the bound reserves about four times its real context, and fewer turns run
+at once. That costs concurrency only while the exact count fails; a working count reserves what the turn holds. The count
+is cheap: Qwen3's tokenizer encodes ~100 KB in ~25 ms and a full 128k-token context (~400 KB) in ~100 ms on an M-series CPU
+(measured on the Air with `tokenizers` 0.22 and Qwen3's `tokenizer.json`, not on the Pro). vllm-mlx runs it on its
+event loop, so a count can be slowed by a long prefill step; the deadline caps that wait and the bound takes over. A
+turn the count limit already refuses is answered 529 before any count is asked. The count route is gate-internal
+(`local_backend.COUNT_TOKENS`): it is in neither the client routes (`local_gate.ROUTES`) nor `local_backend.UPSTREAM`,
+so a client asking the gate for it gets the gate's 404.
 
 A request without `max_tokens` reserves vllm-mlx's default (`vllm_mlx.serve.max_tokens`, 32768). Per model (a
 `vllm_mlx.models` entry overrides the `governor` default), measured and derived for Qwen3.8 27B (hybrid attention /
@@ -658,12 +684,22 @@ Rules on top:
   its turn ends: answered, backend error, upstream timeout, backend unreachable, client gone mid-stream, or an
   exception in the relay (a `Ticket`, released once in the gate's `finally`).
 - vllm-mlx's own `--max-num-seqs` is `max_seqs()`: the idle cap, bounded by how many empty-context reservations fit.
+- **`vllm_mlx.extra_args` cannot override what the generator sets.** argparse keeps the last value of a repeated flag
+  and expands abbreviations (`--ho` is `--host`), so `["--host", "0.0.0.0", "--max-num-seqs", "64"]` would expose the
+  unauthenticated backend and lift its bound under the gate. `extra_args` is checked against an allowlist
+  (`local_backend.EXTRA_ARGS_ALLOWED`; exact flag names, `--flag value` or `--flag=value`): `--default-temperature`,
+  `--default-top-p`, `--default-top-k`, `--default-min-p`, `--default-presence-penalty`, `--default-repetition-penalty`,
+  `--stream-interval`, `--chunked-prefill-tokens` and `--disable-prefix-cache`: sampling defaults, output pacing or
+  less memory, never exposure, admission or memory per request. Any other flag (`--host`, `--port`, `--max-num-seqs`,
+  `--max-tokens`, `--api-key`, `--mcp-config`, …) or a bare argument fails config validation (`--print-config`, the
+  gate's start, the install script) with a message naming it and the allowed list; `serve_argv` checks again.
 
 Old configs: the count-only keys `per_request_gib`, `memory_budget_gib` and `weights_gib` are refused by name, with the
 key that replaced them (a gate given an old config does not start; update `~/.config/cortados/local-backend.json`
 from the example).
 
-Enforcement, in the gate on `POST /v1/messages` (the probe is never counted), nothing reaching the backend when refused:
+Enforcement, in the gate on `POST /v1/messages` (the probe is never counted), no turn reaching the backend when refused
+(only its token count, which runs no model):
 
 - over either bound **now**: `529 overloaded_error`, `Retry-After: retry_after_s` (5), message `local gate: busy (n of
   limit running: reason)`; the reason names the memory budget when the bytes refused it (`memory budget: 5.7 GiB free,
@@ -678,8 +714,9 @@ shows "vllm-mlx: n of limit running, R of B GiB reserved (reason)"). `free_bytes
 minus the reservations; `fit_tokens` is the most context one turn may hold alone, `free_tokens` beside what runs now
 (0 when the count is full). Bytes and tokens are null without a governor.
 
-The provider (`local_lane.gate_busy`, `local_lane.gate_fit`) keeps the latest report per node for 10 s and estimates a
-turn's tokens the way the gate does (`local_lane.request_tokens`). A full gate, a turn over `free_tokens` (busy) or
+The provider (`local_lane.gate_busy`, `local_lane.gate_fit`) keeps the latest report per node for 10 s and ESTIMATES a
+turn's tokens (`local_lane.request_tokens`: body characters / 3.5 + max_tokens; it cannot count, and the estimate only
+decides whether to skip the node, so a turn it lets through may still be refused by the gate, below). A full gate, a turn over `free_tokens` (busy) or
 over `fit_tokens` (too large) is skipped by the index route, auto_route and the sensitive moves after their probe, and
 S1's route stands ("routes elsewhere"). A turn the gate still refuses:
 

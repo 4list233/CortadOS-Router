@@ -199,8 +199,9 @@ class AdmissionTests(unittest.TestCase):
 
 
 # A Claude Code turn near the model's whole context, and a benchmark-sized one (~8.5k-token prompt, 512 out).
-LONG_CHARS, LONG_MAX = int(120_000 * 3.5), 32_000          # 152k tokens asked: capped at the 131072-token context
-SHORT_CHARS, SHORT_MAX = int(8_000 * 3.5), 512             # 8,512 tokens
+LONG_IN, LONG_MAX = 120_000, 32_000                         # 152k tokens asked: capped at the 131072-token context
+SHORT_IN, SHORT_MAX = 8_000, 512                            # 8,512 tokens
+LONG_CHARS = int(LONG_IN * 3.5)                             # the gate tests' long message (the fake counts it ~105k)
 
 
 class ByteBudgetTests(unittest.TestCase):
@@ -213,21 +214,21 @@ class ByteBudgetTests(unittest.TestCase):
         self.c = self.g.cfg
 
     def long(self):
-        return self.a.request_bytes(LONG_CHARS, LONG_MAX)
+        return self.a.request_bytes(LONG_IN, LONG_MAX)
 
     def short(self):
-        return self.a.request_bytes(SHORT_CHARS, SHORT_MAX)
+        return self.a.request_bytes(SHORT_IN, SHORT_MAX)
 
     def test_the_defaults_are_the_measured_model(self):
         c = self.c
         self.assertEqual((c["memory_budget_bytes"], c["weights_bytes"]), (40 * GIB, 15 * GIB))
         self.assertEqual(c["kv_bytes_per_token"], 16 * 2 * 4 * 256 * 2)            # 65,536 bytes per token
         self.assertEqual(131072 * c["kv_bytes_per_token"], 8 * GIB)               # a 128k context holds 8 GiB
-        self.assertEqual(local_governor.request_tokens(c, LONG_CHARS, LONG_MAX), 131072)   # capped at the context
+        self.assertEqual(local_governor.request_tokens(c, LONG_IN, LONG_MAX), 131072)   # capped at the context
         self.assertEqual(self.long(), 8 * GIB + int(0.15 * GIB) + int(1.5 * GIB))
-        self.assertEqual(local_governor.request_tokens(c, SHORT_CHARS, SHORT_MAX), 8512)
-        # no max_tokens: the backend's default output is reserved; input rounds up
-        self.assertEqual(local_governor.request_tokens(c, 7, None), 2 + 32768)
+        self.assertEqual(local_governor.request_tokens(c, SHORT_IN, SHORT_MAX), 8512)
+        # no max_tokens: the backend's default output is reserved
+        self.assertEqual(local_governor.request_tokens(c, 2, None), 2 + 32768)
         self.assertEqual(local_governor.max_seqs(c), 8)
 
     def test_two_128k_requests_fit_the_4bit_budget_and_a_third_does_not(self):
@@ -293,13 +294,13 @@ class ByteBudgetTests(unittest.TestCase):
 
     def test_a_request_too_large_to_ever_fit_is_refused_non_retryably(self):
         small = local_governor.Admission(FixedGovernor(idle_s=3600, memory_budget_bytes=20 * GIB))   # 5 GiB room
-        ticket, snap = small.try_acquire(small.request_bytes(LONG_CHARS, LONG_MAX))
+        ticket, snap = small.try_acquire(small.request_bytes(LONG_IN, LONG_MAX))
         self.assertIsNone(ticket)
         self.assertEqual(snap["refused"], "too_large")               # with nothing in flight: never
         self.assertIn("more than the 5.0 GiB budget beside the weights", snap["reason"])
         self.assertEqual(small.inflight, 0)
         self.assertEqual(snap["fit_tokens"], (5 * GIB - int(0.15 * GIB) - int(1.5 * GIB)) // 65536)
-        self.assertIsNotNone(small.try_acquire(small.request_bytes(SHORT_CHARS, SHORT_MAX))[0])
+        self.assertIsNotNone(small.try_acquire(small.request_bytes(SHORT_IN, SHORT_MAX))[0])
 
     def test_release_gives_back_once(self):
         t = self.a.try_acquire(self.long())[0]
@@ -416,6 +417,36 @@ class ConfigTests(unittest.TestCase):
                                               "--print-config"]), 2)
         self.assertIn("backend must be one of", err.getvalue())
 
+    def test_extra_args_may_only_add_allowlisted_flags(self):
+        def with_extra(extra):
+            d = json.loads(json.dumps(self.example))
+            d["vllm_mlx"]["extra_args"] = extra
+            return local_backend.load(self.write(d))
+        # the review's case: overriding the loopback host and the backend's own sequence bound
+        for extra in (["--host", "0.0.0.0", "--max-num-seqs", "64"], ["--host=0.0.0.0"], ["--max-num-seqs=64"],
+                      ["--port", "9000"], ["--ho", "0.0.0.0"],                 # argparse would expand --ho to --host
+                      ["--max-tokens", "999999"], ["--max-request-tokens=999999"], ["--timeout", "0"],
+                      ["--served-model-name", "other"], ["--continuous-batching"], ["--api-key", "x"],
+                      ["--mcp-config", "/tmp/m.json"], ["--kv-cache-quantization"], ["0.0.0.0"],
+                      ["--default-temperature"], ["--default-temperature", "--host"], ["--default-temperature="],
+                      ["--disable-prefix-cache=yes"], ["--default-top-k", "-h"]):
+            with self.assertRaises(local_backend.BackendConfigError, msg=extra) as cm:
+                with_extra(extra)
+            self.assertIn("vllm_mlx.extra_args", str(cm.exception))
+        with self.assertRaises(local_backend.BackendConfigError) as cm:
+            with_extra(["--default-temperature", "0.6", "--host", "0.0.0.0"])
+        self.assertIn("'--host' is not allowed", str(cm.exception))
+        ok = with_extra(["--default-temperature", "0.6", "--default-top-p=0.95", "--default-presence-penalty", "-0.5",
+                         "--disable-prefix-cache", "--chunked-prefill-tokens", "2048"])
+        argv = local_backend.serve_argv(ok)
+        self.assertEqual(argv[-8:], ["--default-temperature", "0.6", "--default-top-p=0.95",
+                                     "--default-presence-penalty", "-0.5", "--disable-prefix-cache",
+                                     "--chunked-prefill-tokens", "2048"])
+        self.assertEqual([a for a in argv if a.startswith("--host")], ["--host"])     # set once, by the generator
+        # a config dict built without check() is refused by the generator too
+        with self.assertRaises(local_backend.BackendConfigError):
+            local_backend.serve_argv({**ok, "extra_args": ["--host", "0.0.0.0"]})
+
     def test_install_script_is_valid_bash_and_never_run_here(self):
         script = ROOT / "scripts" / "install_mlx_backend.sh"
         self.assertTrue(os.access(script, os.X_OK))
@@ -486,6 +517,9 @@ class FakeVllm(BaseHTTPRequestHandler):
     hold = None                                  # set: POST /v1/messages waits on it (a long generation)
     entered: threading.Semaphore = threading.Semaphore(0)
     error = None                                 # (status, body) to answer POSTs with
+    count = None                                 # POST /v1/messages/count_tokens answers this; None: ~4 chars a token
+    count_answer = None                          # (status, raw bytes) for count_tokens instead (a failing count)
+    count_delay = 0.0                            # seconds count_tokens waits before answering (a slow count)
 
     def log_message(self, *a):
         pass
@@ -507,6 +541,19 @@ class FakeVllm(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         FakeVllm.seen.append(("POST", self.path, body))
+        if self.path == "/v1/messages/count_tokens":
+            if FakeVllm.count_delay:
+                time.sleep(FakeVllm.count_delay)
+            if FakeVllm.count_answer is not None:
+                status, raw = FakeVllm.count_answer
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            n = FakeVllm.count if FakeVllm.count is not None else len(json.dumps(body.get("messages"))) // 4
+            return self._json(200, {"input_tokens": n})
         if self.path != "/v1/messages":
             return self._json(404, {"detail": "Not Found"})
         FakeVllm.entered.release()
@@ -542,6 +589,14 @@ def reset_fake():
     FakeVllm.hold = None
     FakeVllm.entered = threading.Semaphore(0)
     FakeVllm.error = None
+    FakeVllm.count = None
+    FakeVllm.count_answer = None
+    FakeVllm.count_delay = 0.0
+
+
+def turns():
+    """The model turns that reached the fake backend (POST /v1/messages; the gate's token counts are not turns)."""
+    return [s for s in FakeVllm.seen if s[:2] == ("POST", "/v1/messages")]
 
 
 class MlxGateHarness(unittest.TestCase):
@@ -610,7 +665,8 @@ class MlxGateRouteTests(MlxGateHarness):
 
     def test_only_the_backend_routes_are_used_and_others_stay_404(self):
         for method, path in (("GET", "/v1/models"), ("POST", "/v1/chat/completions"), ("POST", "/api/generate"),
-                             ("GET", "/health"), ("POST", "/v1/requests/x/cancel")):
+                             ("GET", "/health"), ("POST", "/v1/requests/x/cancel"),
+                             ("POST", "/v1/messages/count_tokens")):
             code, _, _ = self.call(path, {} if method == "POST" else None, method=method)
             self.assertEqual(code, 404, path)
         self.assertEqual(FakeVllm.seen, [])
@@ -668,7 +724,7 @@ class MlxGateAdmissionTests(MlxGateHarness):
         self.assertEqual(data["error"]["type"], "overloaded_error")
         self.assertTrue(data["error"]["message"].startswith(local_gate.BUSY_MESSAGE))
         self.assertEqual((data["cortados_gate"]["limit"], data["cortados_gate"]["inflight"]), (1, 1))
-        self.assertEqual(len([s for s in FakeVllm.seen if s[0] == "POST"]), 1)
+        self.assertEqual(len(turns()), 1)
         # the probe is never counted against the limit and reports the state
         code, raw, _ = self.call("/api/tags")
         self.assertEqual((code, json.loads(raw)["cortados_gate"]["inflight"]), (200, 1))
@@ -751,7 +807,7 @@ class ProviderBusyGateTests(LocalHarness):
         self.assertEqual(got["error"]["type"], "overloaded_error")
         self.assertIn("busy", got["error"]["message"])
         self.assertIn("1 of 1 running at the gate: owner active", got["error"]["message"])
-        self.assertEqual([s for s in FakeVllm.seen if s[0] == "POST"], [])
+        self.assertEqual(turns(), [])
         node = local_lane.nodes()[0]
         self.assertEqual(local_lane.gate_busy(node), "1 of 1 running at the gate: owner active")
         self.assertEqual(self.reg.sessions, {})             # the failed opener left no conversation behind
@@ -771,7 +827,7 @@ class ProviderBusyGateTests(LocalHarness):
         code, got, headers = self.raw_post(self.BODY)
         self.assertEqual(code, 529)
         self.assertIn("is busy for sub/qwen-27b (memory budget: 0.0 GiB free", got["error"]["message"])
-        self.assertEqual([s for s in FakeVllm.seen if s[0] == "POST"], [])
+        self.assertEqual(turns(), [])
         self.gate.admission.reserved = 0
 
     def test_node_why_reads_the_gate_report_from_the_probe(self):
@@ -871,7 +927,7 @@ class MlxGateBytesTests(MlxGateHarness):
 
     def test_a_turn_reserves_its_bytes_reports_them_and_gives_them_back_on_success(self):
         t, results = self.held(LONG_MSG)
-        want = self.gate.admission.request_bytes(len(json.dumps(LONG_MSG)), LONG_MAX)
+        want = self.gate.admission.request_bytes(10 ** 6, LONG_MAX)       # capped at the 131072-token context
         self.assertEqual(self.gate.admission.reserved, want)
         code, raw, _ = self.call("/api/tags")
         report = json.loads(raw)["cortados_gate"]
@@ -893,7 +949,7 @@ class MlxGateBytesTests(MlxGateHarness):
         self.assertTrue(data["error"]["message"].startswith(local_gate.BUSY_MESSAGE))
         self.assertIn("memory budget", data["error"]["message"])
         self.assertEqual(data["cortados_gate"]["inflight"], 2)
-        self.assertEqual(len([x for x in FakeVllm.seen if x[0] == "POST"]), 2)
+        self.assertEqual(len(turns()), 2)
         self.assertGreaterEqual(data["cortados_gate"]["free_tokens"], 8512)   # a short one still fits beside them
         FakeVllm.hold.set()
         a.join(5)
@@ -961,9 +1017,201 @@ class MlxGateTooLargeTests(MlxGateHarness):
         self.assertTrue(data["error"]["message"].startswith(local_lane.GATE_TOO_LARGE))   # the provider's constant
         self.assertEqual(data["cortados_gate"]["inflight"], 0)
         self.assertLess(data["cortados_gate"]["fit_tokens"], 131072)
-        self.assertEqual(FakeVllm.seen, [])
+        self.assertEqual(turns(), [])                                   # counted, never sent
         self.assertEqual((self.gate.admission.inflight, self.gate.admission.reserved), (0, 0))
         self.assertEqual(self.call("/v1/messages", MSG)[0], 200)        # a short turn still runs
+
+
+# ----------------------------------------------------------------------------- input tokens: exact count or bound
+
+
+DENSE = "a!" * 50_000           # 100,000 bytes and, on Qwen's tokenizer, 100,000 tokens (1 byte a token)
+
+
+def dense_msg(max_tokens=1024):
+    return {"model": TAG, "max_tokens": max_tokens, "messages": [{"role": "user", "content": DENSE}]}
+
+
+class InputTokensTests(unittest.TestCase):
+    """local_governor.input_tokens: the backend's exact count plus the template allowance, else a hard byte bound."""
+
+    def test_token_dense_text_is_bounded_by_its_bytes_not_estimated(self):
+        body = dense_msg()
+        tokens, how = local_governor.input_tokens(body)
+        self.assertEqual(how, "bound")
+        self.assertEqual(tokens, 100_000 + local_governor.template_tokens(body))
+        self.assertGreaterEqual(tokens, 100_000)      # the tokenizer's real count; chars / 3.5 said 28,572
+
+    def test_the_bound_counts_utf8_bytes_and_everything_the_model_sees(self):
+        body = {"system": [{"type": "text", "text": "sys"}],
+                "tools": [{"name": "Read", "description": "read a file", "input_schema": {"type": "object"}}],
+                "messages": [{"role": "user", "content": "é" * 1000},
+                             {"role": "assistant", "content": [
+                                 {"type": "thinking", "thinking": "hmm"},
+                                 {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "日本"}}]},
+                             {"role": "user", "content": [
+                                 {"type": "tool_result", "tool_use_id": "t1",
+                                  "content": [{"type": "text", "text": "x" * 50}]},
+                                 {"type": "mystery", "data": "z" * 40}]}]}
+        tokens, how = local_governor.input_tokens(body)
+        self.assertEqual(how, "bound")
+        self.assertEqual(local_governor.template_tokens(body), 1024 + 3 * 16 + (1 + 2 + 2) * 32 + 64)
+        visible = local_governor.input_bound_bytes(body)
+        self.assertGreaterEqual(visible, 3 + 2000 + 3 + 4 + len(json.dumps({"path": "日本"})) + 50 + 40)
+        self.assertEqual(tokens, visible + local_governor.template_tokens(body))
+
+    def test_an_exact_count_is_used_with_the_template_allowance(self):
+        body = dense_msg()
+        self.assertEqual(local_governor.input_tokens(body, 100_000),
+                         (100_000 + local_governor.template_tokens(body), "exact"))
+        for junk in (None, -1, True, "5", 2.5):                         # no usable count: the bound
+            self.assertEqual(local_governor.input_tokens(body, junk)[1], "bound")
+
+    def test_an_image_is_never_counted_by_the_text_count(self):
+        body = {"messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A" * 9000}},
+            {"type": "text", "text": "what is this"}]}]}
+        self.assertFalse(local_governor.countable(body))
+        tokens, how = local_governor.input_tokens(body, 3)
+        self.assertEqual(how, "bound")
+        self.assertGreater(tokens, 9000)
+
+    def test_a_body_that_is_not_an_object_is_bounded_by_its_length(self):
+        self.assertEqual(local_governor.input_tokens(b"not json"), (8, "bound"))
+        self.assertEqual(local_governor.input_tokens(b"[1, 2]")[1], "bound")
+
+
+class MlxGateCountTests(MlxGateHarness):
+    """The gate asks vllm-mlx for the exact input count on loopback before admission, and takes the byte bound when it
+    cannot get one. Owner idle: count 8, 25 GiB beside the weights."""
+    GOVERNOR = {"idle_s": 3600.0, "pressure": "normal"}
+
+    def held(self, body):
+        if FakeVllm.hold is None:
+            FakeVllm.hold = threading.Event()
+        results = []
+        t = threading.Thread(target=lambda: results.append(self.call("/v1/messages", body)), daemon=True)
+        t.start()
+        self.assertTrue(FakeVllm.entered.acquire(timeout=5))
+        return t, results
+
+    def expect(self, body, input_tokens):
+        return self.gate.admission.request_bytes(input_tokens + local_governor.template_tokens(body),
+                                                 body["max_tokens"])
+
+    def counts(self):
+        return [s for s in FakeVllm.seen if s[:2] == ("POST", "/v1/messages/count_tokens")]
+
+    def test_token_dense_input_with_a_high_count_is_not_over_admitted(self):
+        # the review's case: 100,000 chars of `a!` with a tokenizer that counts 100,000 tokens. The old chars / 3.5
+        # estimate (29,103 tokens) admitted 7 at once; each really holds ~7.9 GiB, so 3 fit in 25 GiB and no more.
+        FakeVllm.count = 100_000
+        body = dense_msg()
+        held = [self.held(body) for _ in range(3)]
+        self.assertEqual(self.gate.admission.reserved, 3 * self.expect(body, 100_000))
+        self.assertLessEqual(self.gate.admission.reserved, 25 * GIB)
+        for _ in range(4):
+            code, raw, _ = self.call("/v1/messages", body)
+            self.assertEqual(code, 529)
+            self.assertIn("memory budget", json.loads(raw)["error"]["message"])
+        self.assertEqual((self.gate.admission.inflight, len(turns())), (3, 3))
+        self.assertEqual(len(self.counts()), 7)
+        self.assertEqual(self.counts()[0][2]["model"], SERVED)          # the adapted body is what is counted
+        FakeVllm.hold.set()
+        for t, _ in held:
+            t.join(5)
+        self.assertTrue(wait_for(lambda: (self.gate.admission.inflight, self.gate.admission.reserved) == (0, 0)))
+
+    def test_the_exact_count_sets_the_reservation(self):
+        FakeVllm.count = 40
+        t, _ = self.held(MSG)
+        self.assertEqual(self.gate.admission.reserved, self.expect(MSG, 40))
+        FakeVllm.hold.set()
+        t.join(5)
+
+    def test_falls_back_to_the_byte_bound_when_the_count_fails(self):
+        self.gate.count_deadline = 0.3
+        body = dense_msg()
+        bound = self.expect(body, 100_000)                               # 100,000 bytes of text
+        for setup in (lambda: setattr(FakeVllm, "count_answer", (500, b'{"detail": "boom"}')),
+                      lambda: setattr(FakeVllm, "count_answer", (404, b'{"detail": "Not Found"}')),
+                      lambda: setattr(FakeVllm, "count_answer", (200, b"not json")),
+                      lambda: setattr(FakeVllm, "count_answer", (200, b'{"input_tokens": -4}')),
+                      lambda: setattr(FakeVllm, "count_delay", 1.0)):     # past the count deadline
+            reset_fake()
+            FakeVllm.count = 7                                           # what a working count would have said
+            setup()
+            with self.assertLogs(local_gate.logger, level="INFO") as cm:
+                t, _ = self.held(body)
+            self.assertEqual(self.gate.admission.reserved, bound)
+            self.assertTrue(any("bounded by bytes" in m for m in cm.output))
+            FakeVllm.hold.set()
+            t.join(5)
+            self.assertTrue(wait_for(lambda: self.gate.admission.reserved == 0))
+
+    def test_an_unreachable_count_falls_back_too(self):
+        # the count's connect is refused (the backend gone between two calls): the bound, and _count never raises
+        refused = ConnectionRefusedError("refused")
+        with patch.object(local_gate, "deadline_call", side_effect=refused):
+            t, _ = self.held(dense_msg())
+        self.assertEqual(self.gate.admission.reserved, self.expect(dense_msg(), 100_000))
+        FakeVllm.hold.set()
+        t.join(5)
+
+    def test_a_request_with_an_image_is_bounded_without_asking_the_count(self):
+        body = {**MSG, "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A" * 4000}},
+            {"type": "text", "text": "what"}]}]}
+        t, _ = self.held(body)
+        self.assertEqual(self.counts(), [])
+        self.assertGreaterEqual(self.gate.admission.reserved, self.expect(body, 4000))
+        FakeVllm.hold.set()
+        t.join(5)
+
+    def test_a_full_count_is_refused_before_asking_for_tokens(self):
+        self.governor.set(idle_s=5)                                      # owner active: 2
+        FakeVllm.hold = threading.Event()
+        held = [self.held(MSG) for _ in range(2)]
+        self.assertEqual(self.call("/v1/messages", MSG)[0], 529)
+        self.assertEqual(len(self.counts()), 2)                          # the third was never counted
+        FakeVllm.hold.set()
+        for t, _ in held:
+            t.join(5)
+
+    def test_the_count_route_is_never_reachable_from_outside(self):
+        route = local_backend.COUNT_TOKENS["vllm-mlx"]
+        self.assertNotIn(route, local_gate.ROUTES)
+        self.assertNotIn(route, set(local_backend.UPSTREAM["vllm-mlx"]))
+        for upstream in local_backend.UPSTREAM.values():
+            self.assertNotIn(route, set(upstream.values()))
+        for path in ("/v1/messages/count_tokens", "/v1/messages/count_tokens?x=1", "/v1/messages/../messages/count_tokens"):
+            code, raw, _ = self.call(path, MSG)
+            self.assertEqual(code, 404, path)
+        code, _, _ = self.call("/v1/messages/count_tokens", MSG, token="b" * 40)     # nor without the token
+        self.assertEqual(code, 401)
+        self.assertEqual(FakeVllm.seen, [])
+
+
+class OllamaGovernedGateTests(MlxGateHarness):
+    """An Ollama node with a governor has no count route: its turns reserve the byte bound, and nothing else is asked."""
+    GOVERNOR = {"idle_s": 3600.0, "pressure": "normal"}
+
+    def setUp(self):
+        super().setUp()
+        self.gate.backend = {"backend": "ollama", "served_model": None, "governor": None}
+
+    def test_bound_without_a_count_call(self):
+        if FakeVllm.hold is None:
+            FakeVllm.hold = threading.Event()
+        body = dense_msg()
+        t = threading.Thread(target=lambda: self.call("/v1/messages", body), daemon=True)
+        t.start()
+        self.assertTrue(FakeVllm.entered.acquire(timeout=5))
+        self.assertEqual(self.gate.admission.reserved, self.gate.admission.request_bytes(
+            100_000 + local_governor.template_tokens(body), 1024))
+        self.assertEqual([s[1] for s in FakeVllm.seen], ["/v1/messages"])
+        FakeVllm.hold.set()
+        t.join(5)
 
 
 # ------------------------------------------------------------------------------ the provider and a too-large turn
@@ -985,7 +1233,7 @@ class ProviderTooLargeGateTests(ProviderBusyGateTests):
         self.assertNotIn("retry-after", h)
         self.assertEqual(got["error"]["type"], "request_too_large")
         self.assertIn("too large for its memory budget", got["error"]["message"])
-        self.assertEqual([x for x in FakeVllm.seen if x[0] == "POST"], [])
+        self.assertEqual(turns(), [])
         self.assertEqual(self.reg.sessions, {})
 
     def test_the_refusal_fallback_path_treats_too_large_as_unavailable(self):
@@ -1028,11 +1276,13 @@ class GateFitTests(unittest.TestCase):
         local_lane._note_gate(self.NODE, {"limit": 8, "inflight": 0, "fit_tokens": -1, "free_tokens": True})
         self.assertIsNone(local_lane.gate_fit(self.NODE, 10 ** 6))                # junk room is dropped
 
-    def test_the_provider_estimates_as_the_gate_does(self):
+    def test_the_provider_estimates_by_characters(self):
+        # the provider cannot count tokens: it estimates (routing only); the gate admits on the exact count or bound
         body = {"model": "x", "max_tokens": 512, "messages": [{"role": "user", "content": "y" * 7000}]}
         c = local_governor.check_config({})
+        est = -(-len(json.dumps(body)) // 3.5)
         self.assertEqual(local_lane.request_tokens(body, {"context_length": 131072}),
-                         local_governor.request_tokens(c, len(json.dumps(body)), 512))
+                         local_governor.request_tokens(c, int(est), 512))
         self.assertEqual(local_lane.request_tokens(body, {"context_length": 1000}), 1000)     # capped
 
 

@@ -19,8 +19,16 @@ COUNT (owner-approved policy, as `policy()` computes it): how many requests may 
   any          critical    min(the above, critical_cap)              default 0: nothing new is admitted
 
 BYTES (token-aware, `request_bytes()`): each admitted request reserves the memory its context will hold,
-  tokens   = min(input tokens + max_tokens, context_tokens)     input tokens ~ request body characters / 3.5
+  tokens   = min(input tokens + max_tokens, context_tokens)
   reserved = tokens * kv_bytes_per_token + per_seq_state_bytes + prefill_margin_bytes
+input tokens (`input_tokens()`), never an average-case estimate:
+  exact    the backend's own count (vllm-mlx POST /v1/messages/count_tokens, the gate asks it on loopback) plus
+           template_tokens() for what that count leaves out (the chat template's markers and tool preamble);
+  bound    when there is no exact count (Ollama, no endpoint, an error, a timeout, an image in the request): the UTF-8
+           bytes of the text the model will see (input_bound_bytes) plus template_tokens(). A byte-level BPE token
+           covers at least one byte, so bytes >= tokens whatever the text: token-dense input (`a!a!...`, 1 byte per
+           token on Qwen's tokenizer) cannot be under-reserved. Prose and code run ~4 bytes per token, so the bound
+           reserves ~4x what the exact count does and lowers concurrency, but only while the count is failing.
 and a request is admitted only while the reservations in flight plus its own fit in
   memory_budget_bytes - weights_bytes.
 Defaults (Qwen3.8 27B, 4-bit): 64 KiB per token (16 full-attention layers x K/V x 4 KV heads x head_dim 256 x fp16),
@@ -36,6 +44,7 @@ the limit drops to 2 and nothing new is admitted until fewer than 2 run; the 6 f
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 import subprocess
@@ -107,9 +116,17 @@ FLOAT_KEYS = ("sample_s",)
 # longer mean anything (the fixed per-request size could not see a 128k-token turn).
 REPLACED = {"per_request_gib": "token-aware admission (kv_bytes_per_token, per_seq_state_bytes, prefill_margin_bytes)",
             "memory_budget_gib": "memory_budget_bytes", "weights_gib": "weights_bytes"}
-# Characters per token for the input estimate: English prose and code run ~3.5-4 characters per token on Qwen's
-# tokenizer; the lower figure over-counts slightly, the safe side for a memory reservation.
-CHARS_PER_TOKEN = 3.5
+# Tokens the backend's count leaves out, added to the exact count and to the byte bound alike. vllm-mlx 0.6.0's
+# count_tokens encodes the text, tool inputs, tool results and tool definitions one by one, without the chat template
+# around them (server.count_anthropic_tokens). Qwen3's template adds <|im_start|>role / <|im_end|> per message (~5
+# tokens), <tool_call> / <tool_response> wrappers and the tool's name per block (~10-20), the OpenAI-shaped
+# {"type": "function", "function": ...} wrapper per tool definition (~20) and a fixed tool-use preamble (~300). Each
+# allowance is about double that: 1024 + 16 per message + 32 per block + 64 per tool. At 64 KiB per token the fixed
+# part reserves 64 MiB.
+TEMPLATE_TOKENS_FIXED = 1024
+TEMPLATE_TOKENS_PER_MESSAGE = 16
+TEMPLATE_TOKENS_PER_BLOCK = 32
+TEMPLATE_TOKENS_PER_TOOL = 64
 PRESSURES = ("normal", "warn", "critical")
 PRESSURE_LEVELS = {1: "normal", 2: "warn", 4: "critical"}
 SIGNAL_TIMEOUT_S = 2.0                     # each signal command; ioreg and sysctl answer in milliseconds
@@ -173,17 +190,119 @@ def bytes_tokens(cfg: dict[str, Any], free: int) -> int:
     return 0 if room < 0 else min(cfg["context_tokens"], room // cfg["kv_bytes_per_token"])
 
 
-def request_tokens(cfg: dict[str, Any], body_chars: int, max_tokens: Any) -> int:
-    """The context a request will hold: its input (body characters / CHARS_PER_TOKEN, rounded up) plus the output it
-    may write (max_tokens; default_max_tokens when absent or not a positive integer), capped at context_tokens."""
+def _utf8(s: Any) -> int:
+    return len(s.encode("utf-8", "surrogatepass")) if isinstance(s, str) else 0
+
+
+def _json_bytes(v: Any) -> int:
+    """JSON as the backend renders a tool input or definition (json.dumps, ASCII-escaped: never shorter than the
+    UTF-8 text it stands for)."""
+    try:
+        return len(json.dumps(v))
+    except (TypeError, ValueError, RecursionError):
+        return len(repr(v).encode("utf-8", "surrogatepass"))
+
+
+def _content_bytes(content: Any) -> int:
+    """The bytes of a system prompt, message content or tool_result content the model will see. Text, thinking,
+    tool_use (name + input JSON) and tool_result (its text) by their text; an image by its source (base64 data or URL,
+    far more bytes than the image's tokens); any other block by its whole JSON, so nothing is ever left out."""
+    if content is None:
+        return 0
+    if isinstance(content, str):
+        return _utf8(content)
+    if not isinstance(content, list):
+        return _json_bytes(content)
+    total = 0
+    for block in content:
+        if isinstance(block, str):
+            total += _utf8(block)
+        elif not isinstance(block, dict):
+            total += _json_bytes(block)
+        elif block.get("type") == "text" and isinstance(block.get("text"), str):
+            total += _utf8(block["text"])
+        elif block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
+            total += _utf8(block["thinking"])        # vllm-mlx 0.6.0 drops past thinking; counted all the same
+        elif block.get("type") == "tool_use":
+            total += _utf8(block.get("name")) + _json_bytes(block.get("input") or {})
+        elif block.get("type") == "tool_result":
+            total += _content_bytes(block.get("content"))
+        elif block.get("type") == "image":
+            total += _json_bytes(block.get("source"))
+        else:
+            total += _json_bytes(block)
+    return total
+
+
+def _messages(body: dict[str, Any]) -> list:
+    m = body.get("messages")
+    return m if isinstance(m, list) else []
+
+
+def _tools(body: dict[str, Any]) -> list:
+    t = body.get("tools")
+    return t if isinstance(t, list) else []
+
+
+def template_tokens(body: dict[str, Any]) -> int:
+    """The template allowance for a request (TEMPLATE_TOKENS_*): fixed, per message, per content block, per tool."""
+    msgs = _messages(body)
+    blocks = sum(len(m["content"]) for m in msgs if isinstance(m, dict) and isinstance(m.get("content"), list))
+    system = body.get("system")
+    blocks += len(system) if isinstance(system, list) else 0
+    return (TEMPLATE_TOKENS_FIXED + TEMPLATE_TOKENS_PER_MESSAGE * len(msgs) + TEMPLATE_TOKENS_PER_BLOCK * blocks
+            + TEMPLATE_TOKENS_PER_TOOL * len(_tools(body)))
+
+
+def input_bound_bytes(body: dict[str, Any]) -> int:
+    """The UTF-8 bytes of the text the model will see: system, every message's content (_content_bytes) and every tool
+    definition's JSON. A hard upper bound on its tokens (a BPE token covers at least one byte)."""
+    total = _content_bytes(body.get("system"))
+    for m in _messages(body):
+        total += _content_bytes(m.get("content")) if isinstance(m, dict) else _json_bytes(m)
+    return total + sum(_json_bytes(t) for t in _tools(body))
+
+
+def countable(body: dict[str, Any]) -> bool:
+    """Whether the backend's count covers the request: it counts text only, so a message carrying an image (which a
+    vision model turns into tokens the count never sees) takes the byte bound instead."""
+    for m in _messages(body):
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "image" for b in content):
+            return False
+    return True
+
+
+def input_tokens(body: Any, counted: Any = None) -> tuple[int, str]:
+    """(input tokens, "exact" | "bound") for a request (module docstring): the backend's count plus the template
+    allowance when `counted` is a non-negative integer and the request is countable, else the byte bound plus the
+    allowance. `body` is the parsed request; anything else (bytes that are not a JSON object) is bounded by its own
+    length."""
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            body = json.loads(body)
+        except (ValueError, RecursionError):
+            return len(body), "bound"
+        if not isinstance(body, dict):
+            return len(json.dumps(body)), "bound"
+    if not isinstance(body, dict):
+        return _json_bytes(body), "bound"
+    if isinstance(counted, int) and not isinstance(counted, bool) and counted >= 0 and countable(body):
+        return counted + template_tokens(body), "exact"
+    return input_bound_bytes(body) + template_tokens(body), "bound"
+
+
+def request_tokens(cfg: dict[str, Any], input_tokens: int, max_tokens: Any) -> int:
+    """The context a request will hold: its input tokens (input_tokens(): exact or a hard bound) plus the output it may
+    write (max_tokens; default_max_tokens when absent or not a positive integer), capped at context_tokens."""
     out = max_tokens if isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0 \
         else cfg["default_max_tokens"]
-    return min(cfg["context_tokens"], math.ceil(max(0, body_chars) / CHARS_PER_TOKEN) + out)
+    return min(cfg["context_tokens"], max(0, int(input_tokens)) + out)
 
 
-def request_bytes(cfg: dict[str, Any], body_chars: int, max_tokens: Any) -> int:
+def request_bytes(cfg: dict[str, Any], input_tokens: int, max_tokens: Any) -> int:
     """request_tokens as a reservation in bytes (module docstring)."""
-    return tokens_bytes(cfg, request_tokens(cfg, body_chars, max_tokens))
+    return tokens_bytes(cfg, request_tokens(cfg, input_tokens, max_tokens))
 
 
 def max_seqs(cfg: dict[str, Any]) -> int:
@@ -312,9 +431,9 @@ class Admission:
         with self._lock:
             return self._report(g)
 
-    def request_bytes(self, body_chars: int, max_tokens: Any) -> int:
+    def request_bytes(self, input_tokens: int, max_tokens: Any) -> int:
         """The reservation a request asks for (0 without a governor: nothing is budgeted)."""
-        return request_bytes(self.governor.cfg, body_chars, max_tokens) if self.governor else 0
+        return request_bytes(self.governor.cfg, input_tokens, max_tokens) if self.governor else 0
 
     def try_acquire(self, reserve: int = 0) -> tuple[Ticket | None, dict[str, Any]]:
         """(ticket, report) when admitted; (None, report) when not, report["refused"] saying why: "busy" (the count

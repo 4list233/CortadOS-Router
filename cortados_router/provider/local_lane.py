@@ -476,11 +476,19 @@ def _busy_why(node: dict[str, Any]) -> str:
     return gate_busy(node) or (gate_report(node) or {}).get("reason") or "gate full"
 
 
+# Characters per token for the routing estimate below: prose and code run ~3.5-4.3 bytes per token on Qwen's tokenizer.
+# An ESTIMATE for skipping a node that is plainly full, not the gate's admission: the gate admits on the backend's
+# exact count or a hard byte bound (local_governor.input_tokens), so a turn this estimate lets through may still be
+# refused there, and that refusal is handled (busy: 529 / routed elsewhere; too large: rerouted or a terminal 413).
+ESTIMATE_CHARS_PER_TOKEN = 3.5
+
+
 def request_tokens(body: dict[str, Any], model: dict[str, Any]) -> int:
-    """The context a turn will hold on the node, estimated as the gate's governor does (local_governor.request_tokens:
-    body characters / 3.5 + max_tokens, the backend default when absent), capped at the model's context_length."""
+    """The context a turn will hold on the node, ESTIMATED (body characters / ESTIMATE_CHARS_PER_TOKEN + max_tokens,
+    the backend default when absent; local_governor.request_tokens), capped at the model's context_length."""
     cfg = {**local_governor.DEFAULTS, "context_tokens": int(model.get("context_length") or DEFAULT_CONTEXT)}
-    return local_governor.request_tokens(cfg, len(json.dumps(body)), body.get("max_tokens"))
+    estimate = -(-len(json.dumps(body)) // ESTIMATE_CHARS_PER_TOKEN)
+    return local_governor.request_tokens(cfg, int(estimate), body.get("max_tokens"))
 
 
 def gate_fit(node: dict[str, Any], tokens: int) -> tuple[str, str] | None:
