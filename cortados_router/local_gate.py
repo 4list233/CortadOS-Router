@@ -42,7 +42,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from cortados_router import local_resources
+from cortados_router import http_body, local_resources
 from cortados_router.local_resources import pro_local_allowed
 from cortados_router.studio_capacity import (gate_dir as default_studio_gate_dir, live_intents,
                                              open_node_lock, verify_node_lock)
@@ -167,7 +167,11 @@ def deadline_call(conn: http.client.HTTPConnection, deadline_s: float, method: s
     given only the time left. The body is read incrementally, at most `max_bytes` (the rest is left unread).
     (status, body bytes); OSError (TimeoutError past the deadline) or http.client.HTTPException otherwise. A connect
     failure is passed to `on_connect_error(exc)` first when given, so a caller can tell "not reachable" from "did not
-    answer". Stdlib only: the provider's switch view (provider/local_switch.py) uses it too."""
+    answer". Stdlib only: the provider's switch view (provider/local_switch.py) uses it too.
+    Not http_body.read_within: that is the SERVER side (a body a client sends us, on a socket http.server already
+    accepted, after the request line and headers were read). This is the CLIENT side: the connect, our request, the
+    status line and headers and then the body all share the one deadline, through _DeadlineSocket under http.client's
+    own reader, which a body-only reader on a raw rfile cannot cover."""
     end = time.monotonic() + deadline_s
     conn.timeout = max(0.001, min(deadline_s, connect_s if connect_s is not None else deadline_s))
     try:
@@ -383,28 +387,8 @@ class GateHandler(BaseHTTPRequestHandler):
 
     def _read_body(self, n: int, deadline_s: float) -> bytes | None:
         """n bytes of body within an absolute deadline (BODY_DEADLINE_S / DRAIN_DEADLINE_S), or None when the
-        deadline passes or the client goes away. Each wait is bounded by the time left, so a trickle cannot extend it."""
-        end = time.monotonic() + deadline_s
-        parts, left = [], n
-        try:
-            while left > 0:
-                remaining = end - time.monotonic()
-                if remaining <= 0:
-                    return None
-                self.connection.settimeout(min(self.server.idle_timeout, remaining))
-                chunk = self.rfile.read1(min(left, 65536))
-                if not chunk:
-                    return None
-                parts.append(chunk)
-                left -= len(chunk)
-        except OSError:
-            return None
-        finally:
-            try:
-                self.connection.settimeout(self.server.idle_timeout)
-            except OSError:
-                pass
-        return b"".join(parts)
+        deadline passes or the client goes away (http_body.read_within: a trickle cannot extend it)."""
+        return http_body.read_within(self.connection, self.rfile, n, deadline_s, self.server.idle_timeout)
 
     def log_message(self, fmt, *args):          # http.server's line has the request line only: no token, no body
         logger.info("%s %s", self.address_string(), fmt % args)

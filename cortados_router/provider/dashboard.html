@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<meta id="cortados-auth" name="cortados-auth" content="token">
+<meta id="cortados-csrf" name="cortados-csrf" content="">
 <title>CortadOS Router · live</title>
 <style>
 /* Two themes from one set of roles. Light is the default; dark follows the system unless the theme button pins one.
@@ -182,6 +184,7 @@ ul { margin:0; padding-left:18px; }
   <div class="sub">Kept in this tab's sessionStorage only; sent as a Bearer header to /v1/cortados/live, /v1/cortados/usage, /v1/cortados/tasks and /v1/cortados/local (the Local models switch).</div>
   <input id="tok" type="password" autocomplete="off" required>
   <button type="submit">Open dashboard</button>
+  <div class="sub" id="pwhint">set a password: python3 -B -m cortados_router.provider.dashboard_auth set-password (on the Air)</div>
 </form>
 <main id="live" hidden></main>
 <main id="main" hidden></main>
@@ -198,6 +201,13 @@ const LIVE_EVERY = 5000, EVERY = 30000, ROUTED_SHOWN = 10;
 // LOCAL_EVERY on the Live tab, not on every 5 s live poll, and at once after a switch.
 const LOCAL_URL = "/v1/cortados/local", LOCAL_SWITCH_URL = "/v1/cortados/local/switch", LOCAL_EVERY = 30000;
 const $ = (id) => document.getElementById(id);
+// Auth mode, set by the server in the cortados-auth meta tag. "session": a password is set and this page was served to
+// a logged-in browser; every view is fetched with the HttpOnly session cookie (credentials: same-origin, no token) and
+// a POST carries the session's CSRF token (cortados-csrf meta) in x-cortados-csrf. "token" (or anything else): no
+// password is set; the page asks for the provider token and sends it as a Bearer header, as before.
+const authMeta = $("cortados-auth"), csrfMeta = $("cortados-csrf");
+const SESSION = !!(authMeta && authMeta.content === "session");
+const CSRF = (SESSION && csrfMeta && typeof csrfMeta.content === "string") ? csrfMeta.content : "";
 let timer = null, liveTimer = null, tickTimer = null, lastOk = null, view = "live", usageLoaded = false, routedAll = false, lastLive = null;
 // sessionStorage can throw (storage disabled, some private modes). Then the token lives in memTok for this page only,
 // and the page says so, instead of losing the token and asking for it again on every poll.
@@ -602,11 +612,21 @@ async function toggleLocal(n, on, b) {
   const loaded = n.models_loaded || [];
   if (!on && loaded.length && !confirm("Turn local models OFF on " + (n.label || n.node) + "? " + loaded.join(", ") +
       " is loaded; new local requests will be refused.")) return;
-  const t = getTok(); if (!t) return showLogin();
+  if (!haveAuth()) return showLogin();
+  const t = SESSION ? "" : getTok();
   b.disabled = true; b.textContent = on ? "turning on…" : "turning off…";
+  // Session mode: the HttpOnly cookie (credentials same-origin) plus the session's CSRF token; referrerPolicy
+  // same-origin so the POST carries the page's real Origin (under no-referrer it would be `Origin: null`, refused).
+  // Token mode: the Bearer header and no cookie, as before.
+  const opts = SESSION
+    ? {method: "POST", cache: "no-store", credentials: "same-origin", referrerPolicy: "same-origin",
+       headers: {"x-cortados-csrf": CSRF, "content-type": "application/json"}}
+    : {method: "POST", cache: "no-store", credentials: "omit",
+       headers: {"Authorization": "Bearer " + t, "content-type": "application/json"}};
+  opts.body = JSON.stringify({node: n.node, on: on});
   try {
-    const res = await fetch(LOCAL_SWITCH_URL, {method: "POST", cache: "no-store", credentials: "omit",
-      headers: {"Authorization": "Bearer " + t, "content-type": "application/json"}, body: JSON.stringify({node: n.node, on: on})});
+    const res = await fetch(LOCAL_SWITCH_URL, opts);
+    if (res.status === 401) return authLost();
     let msg = "error " + res.status;
     try { const j = await res.json(); if (j && j.error && typeof j.error.message === "string") msg = j.error.message; } catch (e) {}
     localNote = res.ok ? {text: (n.label || n.node) + " switched " + (on ? "on" : "off") + " at " + new Date().toLocaleTimeString()}
@@ -849,11 +869,34 @@ function showLogin(msg) {
   $("main").hidden = true; $("live").hidden = true; $("tabs").hidden = true; $("logout").hidden = true; $("login").hidden = false;
   $("status").textContent = msg || ""; $("tok").value = ""; $("tok").focus();
 }
-async function get(url, t) { return fetch(url, {headers: {"Authorization": "Bearer " + t}, cache: "no-store", credentials: "omit"}); }
+async function get(url, t) {
+  if (SESSION) return fetch(url, {cache: "no-store", credentials: "same-origin"});
+  return fetch(url, {headers: {"Authorization": "Bearer " + t}, cache: "no-store", credentials: "omit"});
+}
+// Session mode has no token form: a refused or ended session goes back to /dashboard, which serves the login page.
+function relogin() { location.replace("/dashboard"); }
+function authLost() {
+  if (SESSION) { stopTimers(); return relogin(); }
+  setTok(""); return showLogin("Token refused; enter it again.");
+}
+function haveAuth() { return SESSION || !!getTok(); }
+async function logout() {
+  if (!SESSION) { setTok(""); return showLogin("Token forgotten."); }
+  stopTimers();
+  try {
+    // referrerPolicy same-origin: under the page's no-referrer policy a POST would carry `Origin: null`, which the
+    // server's same-origin check refuses; same-origin sends the real Origin here and nothing to any other site.
+    const res = await fetch("/dashboard/logout", {method: "POST", headers: {"x-cortados-csrf": CSRF}, cache: "no-store",
+                                                   credentials: "same-origin", referrerPolicy: "same-origin"});
+    if (!res.ok && res.status !== 401) return failed("log out failed: error " + res.status);
+  } catch (e) { return failed("log out failed: " + (e && e.message ? e.message : e)); }
+  relogin();
+}
 // One live poll at a time: a slow answer is not overlapped by the next tick (or a visibilitychange catch-up).
 let liveBusy = false;
 async function refreshLive() {
-  const t = getTok(); if (!t) return showLogin();
+  if (!haveAuth()) return showLogin();
+  const t = SESSION ? "" : getTok();
   if (document.hidden) return;                      // a background tab does not poll; visibilitychange catches up
   if (liveBusy) return;
   liveBusy = true;
@@ -862,7 +905,7 @@ async function refreshLive() {
 async function pollLiveOnce(t) {
   try {
     const res = await get(LIVE_URL, t);
-    if (res.status === 401) { setTok(""); return showLogin("Token refused; enter it again."); }
+    if (res.status === 401) return authLost();
     if (res.status === 403) return failed("this token's scopes do not cover the live view (needs live:read)");
     if (!res.ok) return failed("error " + res.status);
     renderLive(await res.json());
@@ -879,10 +922,11 @@ async function refreshTasks(t) {
   } catch (e) { renderTasks(null, "fetch failed: " + (e && e.message ? e.message : e)); }
 }
 async function refresh() {
-  const t = getTok(); if (!t) return showLogin();
+  if (!haveAuth()) return showLogin();
+  const t = SESSION ? "" : getTok();
   try {
     const res = await get(URL_, t);
-    if (res.status === 401) { setTok(""); return showLogin("Token refused; enter it again."); }
+    if (res.status === 401) return authLost();
     if (!res.ok) return failed("error " + res.status);
     usageLoaded = true;
     render(await res.json());
@@ -909,10 +953,11 @@ function start(which) { $("login").hidden = true; $("tabs").hidden = false; $("l
 $("tab-live").addEventListener("click", () => show("live"));
 $("tab-usage").addEventListener("click", () => show("usage"));
 $("login").addEventListener("submit", (ev) => { ev.preventDefault(); const t = $("tok").value.trim(); if (!t) return; setTok(t); start(); });
-$("logout").addEventListener("click", () => { setTok(""); showLogin("Token forgotten."); });
+$("logout").addEventListener("click", () => { logout(); });
 document.addEventListener("visibilitychange", () => { if (!document.hidden && view === "live" && liveTimer) refreshLive(); });
 loadTheme();
-if (getTok()) start(); else showLogin();
+if (SESSION) $("logout").textContent = "Log out";
+if (haveAuth()) start(); else showLogin();
 </script>
 </body>
 </html>

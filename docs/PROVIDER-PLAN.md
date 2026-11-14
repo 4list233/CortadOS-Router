@@ -582,6 +582,24 @@ the usage ledger against the Claude lane it ran on (`claude`, or the named accou
 
 `GET /v1/cortados/usage` (token required, 401 otherwise): one cheap JSON view for a usage dashboard, built by `cortados_router/provider/usage.py` — `lanes` (cached scarcity.json only: % left, windows/resets, sample age, `stale` by the routing freshness rule), `routed` (router.db counts per lane/model today and 7 d, top S1 bands; plus `provider_since_start` from the in-memory run records), `refusals` (24 h by reason, in-memory), `child_tasks` (7 d by last event from child-tasks.jsonl), `s1` (1.5 s `/health` probe), `hardware` (`$CORTADOS_HOME/hardware/*.json` passed through with age), `notes`, `errors` (every failed or absent source), `generated_at`. Opens no vendor CLI.
 
+## Dashboard password (2026-11-13)
+
+`cortados_router/provider/dashboard_auth.py`; README "Dashboard password" is the full description. In short: the owner
+runs `python3 -B -m cortados_router.provider.dashboard_auth set-password` **on the Air, in a real terminal** (`--stdin`
+for scripts; `status`, `logout-all`, `clear-password` beside it). Only a salted hash is stored
+(`$CORTADOS_HOME/dashboard-auth.json`, 0600): scrypt where `hashlib.scrypt` exists, else PBKDF2-HMAC-SHA256 at 600,000
+iterations, which is what the Air's LibreSSL Python 3.9 gets (it has no `hashlib.scrypt`); the file names the KDF.
+With a password set, `/dashboard` shows a login page; a good login sets `cortados_dash` (`HttpOnly; Secure;
+SameSite=Strict; Path=/`, 30 days, server keeps only its SHA-256 in `dashboard-sessions.json`, so a restart keeps the
+owner logged in). Failed logins are throttled per address (5 per 15 min, then a growing lockout) and globally (30 per
+15 min). A session opens only the dashboard's read views (live, usage, tasks, office) and the `local:switch` scope
+(`/v1/cortados/local`, `/v1/cortados/local/switch`), through `Handler._owner_or_session`, the one auth helper of those
+endpoints; never `/v1/messages`, `/v1/responses`, heartbeats or anything else, which check only the token header. A
+POST on a session needs same origin plus the session's CSRF token (`x-cortados-csrf`). The owner token is unchanged for
+every client. `logout-all` ends every session; a new or cleared password does too. Funnel (checked on the Air,
+2026-11-13): public only on 443 `/mcp` (bot gateway); `:8444` is tailnet-only Serve, so the dashboard is not public.
+The login is hardened as if it were.
+
 ## Live view (GET /v1/cortados/live) (2026-11-11, #73)
 
 `cortados_router/provider/live.py` composes one metadata-only snapshot for the dashboard's Live tab and the

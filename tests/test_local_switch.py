@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import socket
 import tempfile
 import threading
@@ -18,7 +19,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cortados_router import local_gate, local_resources, subagent_mcp
-from cortados_router.provider import clients, local_lane, local_switch, server
+from cortados_router.provider import clients, dashboard_auth, local_lane, local_switch, server
+from tests.test_dashboard_auth import ServerCase, TOKEN as TOKEN_DA
 from tests.test_local_gate import TOKEN, token_file
 from tests.test_provider import EndpointHarness, TOKEN as OWNER
 from tests.test_provider_local import FakeOllama, LocalHarness, TAG, write_config
@@ -411,6 +413,121 @@ class ProviderSwitchTests(EndpointHarness):
     def test_endpoint_ids(self):
         self.assertEqual(server.endpoint_id(local_switch.VIEW_PATH), "local")
         self.assertEqual(server.endpoint_id(local_switch.SWITCH_PATH + "?x"), "local_switch")
+
+
+class DashboardSessionSwitchTests(ServerCase):
+    """POST /v1/cortados/local/switch through the real Handler with a dashboard session (provider/dashboard_auth.py):
+    the cookie plus the session's CSRF token, same origin (scheme included), flips the switch; every other credential
+    shape is refused from the headers alone, before the switch operation runs (the fake records every call). The owner
+    token keeps working; a scoped client token never can, since no clients.json scope covers the path."""
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+
+        def fake_switch(node, on):
+            self.calls.append((node, on))
+            return {"node": node, "switch": "on" if on else "off"}
+        self.httpd.local_switch = fake_switch
+        self.httpd.local_view = lambda: {"nodes": []}
+        self.set_password()
+        self.ck, self.csrf = self.new_session()
+
+    def new_session(self):
+        status, h, _ = self.login()
+        self.assertEqual(status, 303)
+        ck = self.cookie(h)
+        page = self.req("GET", "/dashboard", headers={"cookie": ck})[2]
+        return ck, re.search(rb'name="cortados-csrf" content="([A-Za-z0-9_-]+)"', page).group(1).decode()
+
+    BODY = json.dumps({"node": "pro", "on": True}).encode()
+
+    def good(self, **over):
+        h = {"cookie": self.ck, "origin": self.origin(), "content-type": "application/json",
+             dashboard_auth.CSRF_HEADER: self.csrf}
+        h.update(over)
+        return {k: v for k, v in h.items() if v is not None}
+
+    def flip(self, headers):
+        status, h, body = self.req("POST", local_switch.SWITCH_PATH, self.BODY, headers)
+        return status, h, json.loads(body or b"null")
+
+    def assert_refused(self, headers, code=403):
+        status, h, body = self.flip(headers)
+        self.assertEqual(status, code, body)
+        self.assertEqual(self.calls, [])                                    # the switch was never called
+
+    def test_cookie_and_csrf_flip_the_switch(self):
+        status, h, body = self.flip(self.good())
+        self.assertEqual((status, body["switch"]), (200, "on"))
+        self.assertEqual(self.calls, [("pro", True)])
+        self.assertEqual(h.get("cache-control"), "private, no-store")
+        self.assertEqual(h.get("vary"), "Cookie, Authorization")
+        status, h, _ = self.req("GET", local_switch.VIEW_PATH, headers={"cookie": self.ck})
+        self.assertEqual(status, 200)
+        self.assertEqual((h.get("cache-control"), h.get("vary")), ("private, no-store", "Cookie, Authorization"))
+
+    def test_refused_missing_csrf_header(self):
+        self.assert_refused(self.good(**{dashboard_auth.CSRF_HEADER: None}))
+
+    def test_refused_empty_csrf_header(self):
+        self.assert_refused(self.good(**{dashboard_auth.CSRF_HEADER: ""}))
+
+    def test_refused_wrong_csrf_token(self):
+        self.assert_refused(self.good(**{dashboard_auth.CSRF_HEADER: "x" * 43}))
+
+    def test_refused_another_sessions_csrf_token(self):
+        other_ck, other_csrf = self.new_session()
+        self.assertNotEqual(other_csrf, self.csrf)
+        self.assert_refused(self.good(**{dashboard_auth.CSRF_HEADER: other_csrf}))         # A's cookie, B's token
+        self.assert_refused(self.good(cookie=other_ck))                                     # B's cookie, A's token
+
+    def test_refused_cross_origin(self):
+        self.assert_refused(self.good(origin="https://evil.example"))
+        self.assert_refused(self.good(origin=f"http://evil.example:{self.port}"))
+        self.assert_refused(self.good(origin=None))                                         # no Origin, no Referer
+        self.assert_refused(self.good(origin=None, referer="https://evil.example/dashboard"))
+        self.assert_refused(self.good(origin="null"))          # what no-referrer would send: the page must not
+
+    def test_refused_scheme_mismatch(self):
+        # same host and port, other scheme: a plain-HTTP request with an https Origin ...
+        self.assert_refused(self.good(origin=f"https://127.0.0.1:{self.port}"))
+        # ... and behind Tailscale Serve (loopback peer, X-Forwarded-Proto https) an http Origin
+        self.assert_refused(self.good(**{"x-forwarded-proto": "https", "x-forwarded-host": "air.example.ts.net",
+                                         "origin": "http://air.example.ts.net"}))
+        status, _, _ = self.flip(self.good(**{"x-forwarded-proto": "https", "x-forwarded-host": "air.example.ts.net",
+                                              "origin": "https://air.example.ts.net"}))
+        self.assertEqual(status, 200)                                       # the matching scheme passes
+
+    def test_refused_without_a_session(self):
+        self.assert_refused(self.good(cookie=None), code=401)
+        self.assert_refused(self.good(cookie="cortados_dash=" + "y" * 43), code=401)
+
+    def test_refused_after_logout(self):
+        self.assertEqual(self.req("POST", "/dashboard/logout", b"", self.good())[0], 200)
+        self.assert_refused(self.good(), code=401)
+
+    def test_refused_scoped_token(self):
+        # every clients.json scope there is, at once: none covers the switch (or its view), so a scoped token is 403
+        everything = clients.Client(name="all", scopes=frozenset(clients.SCOPES), host="air")
+        with patch.object(self.reg.clients, "match", return_value=everything):
+            self.assert_refused({"authorization": "Bearer " + "s" * 40, "content-type": "application/json"})
+            # a scoped token beside a valid cookie and CSRF token is still judged on the token alone
+            self.assert_refused(self.good(authorization="Bearer " + "s" * 40))
+            self.assertEqual(self.req("GET", local_switch.VIEW_PATH,
+                                      headers={"authorization": "Bearer " + "s" * 40})[0], 403)
+
+    def test_refused_wrong_token_beside_a_good_cookie(self):
+        self.assert_refused(self.good(authorization="Bearer nope-nope-nope"), code=401)
+
+    def test_owner_token_still_works(self):
+        status, h, body = self.flip({"authorization": f"Bearer {TOKEN_DA}", "content-type": "application/json"})
+        self.assertEqual((status, body["switch"]), (200, "on"))
+        self.assertEqual(h.get("cache-control"), "private, no-store")
+        self.assertEqual(h.get("vary"), "Cookie, Authorization")
+        # no Origin and no CSRF header needed: a bearer token is not something a browser attaches by itself
+        self.assertEqual(self.flip({"x-api-key": TOKEN_DA, "content-type": "application/json"})[0], 200)
+        self.assertEqual(self.calls, [("pro", True), ("pro", True)])
 
 
 class Trickle:
