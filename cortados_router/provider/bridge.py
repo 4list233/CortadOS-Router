@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import queue
 import shutil
 import subprocess
@@ -23,6 +22,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from cortados_router.provider.child_env import backend_env
 from cortados_router.provider.timeouts import (
     ABORT_TIMEOUT_S, CALL_SLACK_S, CALL_TIMEOUT_S, CLI_TOOL_TIMEOUT_S, IDLE_S, TOOL_WAIT_S, TURN_TIMEOUT_S,
     effective_tool_wait,
@@ -31,13 +31,12 @@ from cortados_router.provider.timeouts import (
 BRIDGE_SERVER = "bridge"
 TOOL_PREFIX = f"mcp__{BRIDGE_SERVER}__"
 SHIM = Path(__file__).with_name("mcp_shim.py")
-# Dropped from the child's environment. BASE_URL and AUTH_TOKEN would send the child back into this endpoint;
-# API_KEY would bill an API key instead of the CLI's subscription login.
+# Never in the child's environment. BASE_URL and AUTH_TOKEN would send the child back into this endpoint; API_KEY
+# would bill an API key instead of the CLI's subscription login. Since #106 the child's environment is an allowlist
+# (child_env.py), which lists none of these nor any other ANTHROPIC_* (e.g. ANTHROPIC_CUSTOM_HEADERS carrying
+# x-cortados-run-id, which the CLI would send to api.anthropic.com); the names stay as the named minimum that the
+# S1 outcome loop and scarcity reuse and the tests cite.
 STRIPPED_ENV = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
-# Every ANTHROPIC_* is stripped by prefix, not only the three above: the provider's own process can carry e.g.
-# ANTHROPIC_CUSTOM_HEADERS (x-cortados-run-id, x-cortados-reveal) from the client that launched it, and the headless
-# CLI would send those to api.anthropic.com. STRIPPED_ENV stays as the named minimum (tests and docs cite it).
-STRIPPED_ENV_PREFIX = "ANTHROPIC_"
 # After the first unanswered tool call, the CLI's stdout may still be delivering other tool_use blocks of the same
 # assistant message (the shim's HTTP call and the CLI's stdout race). Wait this long for stdout to go quiet.
 SETTLE_S = 0.3
@@ -77,14 +76,16 @@ def names_scratch(args: Any, scratch: Path) -> bool:
         return True
 
 
-def claude_env(config_dir: str | None) -> dict[str, str]:
-    """The env a headless Claude CLI runs with: this process's, minus every ANTHROPIC_* (STRIPPED_ENV_PREFIX), on the
-    routed account's login when one is named. One builder, so the login a session runs on can be stated (server
-    reveal) without starting one."""
-    env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV and not k.startswith(STRIPPED_ENV_PREFIX)}
+def claude_env(config_dir: str | None, extra: dict[str, str] | None = None) -> dict[str, str]:
+    """The env a headless Claude CLI runs with: the allowlist of child_env.backend_env("claude") (no ANTHROPIC_*, no
+    provider token, no other secret of this process), on the routed account's login when one is named, plus `extra`
+    (variables the caller sets on purpose, e.g. MCP_TOOL_TIMEOUT). One builder for every Claude spawn site (the bridge,
+    the search lane), so the login a session runs on can be stated (server reveal, floor) without starting one."""
+    env = backend_env("claude")
     if config_dir:
         env["CLAUDE_CONFIG_DIR"] = config_dir       # run this turn on the routed account's login, not the default
         env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)    # an inherited ambient token would override the account's stored login: drop it so config_dir wins
+    env.update(extra or {})
     return env
 
 
@@ -182,8 +183,7 @@ class BridgeSession:
                 args += ["--strict-mcp-config"]
             if model:
                 args += ["--model", model]
-            env = claude_env(config_dir)
-            env["MCP_TOOL_TIMEOUT"] = str(int(CLI_TOOL_TIMEOUT_S * 1000))  # call + abort + startup slack
+            env = claude_env(config_dir, {"MCP_TOOL_TIMEOUT": str(int(CLI_TOOL_TIMEOUT_S * 1000))})  # call + abort + startup slack
             self._stderr = open(self.dir / "stderr.log", "w")
             self.proc = popen(args, cwd=self.dir / SCRATCH_WORK, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=self._stderr, text=True, bufsize=1)

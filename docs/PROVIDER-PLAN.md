@@ -387,10 +387,12 @@ codex app-server -c notify=[] -c web_search="disabled" -c include_environment_co
   trio of the Claude bridge.
   Since #84 it drops every `OPENAI_*`, `CODEX_*`, `ANTHROPIC_*` and `CLAUDE_*` variable by prefix, except the
   allowlist `codex_isolation.ALLOWED_ENV`: `CODEX_HOME` (set by the bridge) and `CODEX_CA_CERTIFICATE`.
+  Since #106 (2026-11-14) the environment is an allowlist instead (see "Backend environment allowlist" below): the
+  child gets the base variables, `CODEX_CA_CERTIFICATE` and the bridge's own `CODEX_HOME`, and nothing else.
 - `CODEX_CA_CERTIFICATE` (#103, 2026-11-13): the path of a PEM bundle Codex uses as its custom CA set for TLS. The Air
   provider sets it, in the provider's own environment, to an export of the macOS system roots, because Codex
   intermittently failed with `invalid peer certificate: UnknownIssuer` without it. It is a file path, not a secret, so
-  it passes the prefix strip. The PEM is a snapshot: re-export it after every macOS update (root certificates change
+  it is on the allowlist. The PEM is a snapshot: re-export it after every macOS update (root certificates change
   with OS releases), then restart the provider:
   `security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain > ~/.cortados/certs/macos-system-roots.pem`
 - The command line is asked for, then checked (Codex review of PR #5): before `thread/start` the bridge calls
@@ -627,12 +629,46 @@ listed, the model is not excluded, the node's probe answers (the Pro's gate refu
 off) and lists the model, and the request fits. Otherwise S1's route stands. The routes row is rewritten under the
 same id with the local lane and S1's choice as `runner_up`. Details: `docs/LOCAL-RESOURCES.md`, "Local auto-route".
 
+## Backend environment allowlist (#106, 2026-11-14)
+
+Every vendor CLI the provider starts runs on an environment built from an explicit allowlist,
+`cortados_router/provider/child_env.py` (`backend_env(backend, extra)`), not on the provider's own environment minus a
+list. The provider holds secrets no backend may see (its bearer token and other `CORTADOS_*`, `GITHUB_TOKEN` / `GH_*`,
+`AWS_*`, `SSH_AUTH_SOCK`, API keys and base URLs under `OPENAI_*` / `ANTHROPIC_*`); with prefix stripping (#84) each
+of those passed unless someone had named its family.
+
+| Set | Variables | Why |
+|---|---|---|
+| base, every backend | `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LC_*`, `TZ` | find the runtime and tools, the user's home and login Keychain, the per-user temp dir, locale and time zone |
+| base, every backend | `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (both cases), `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS` | reach the vendor through a proxy, trust a custom CA bundle |
+| base, every backend | `__CF_USER_TEXT_ENCODING` | macOS CoreFoundation text encoding, set by launchd for every user process |
+| Codex | `CODEX_HOME` (always overridden by the bridge's resolved absolute home), `CODEX_CA_CERTIFICATE` | the home whose `auth.json` / `config.toml` the app-server runs on; the CA bundle of #103 |
+| Claude CLI | `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN` | the default login when the provider itself was started on a non-default config dir or a long-lived subscription token; a routed account replaces the first and drops the second |
+| per call (`extra`) | `CODEX_HOME`; `CLAUDE_CONFIG_DIR` of a routed account; `MCP_TOOL_TIMEOUT` | set on purpose by the bridge for this spawn; always wins |
+
+Spawn sites: `bridge.BridgeSession` and `search_lane.run` (both through `bridge.claude_env`), and
+`codex_bridge.CodexSession` (through `codex_isolation.child_env`). The login readers (`floor.executing_login`, the
+server's reveal) call the same builders, so the login they report is the one the child runs on. The MCP shim the
+Claude CLI starts gets its own variables (`CORTADOS_PROVIDER_TOKEN` and the timeouts) from the session's `mcp.json`,
+not from the inherited environment. No Cursor or Antigravity CLI is started by the provider.
+
+Not covered, on purpose: `child_tasks.py` (whole Claude Code tasks with the owner's tools and connectors, another
+trust level, which has its own login-mode allowlist) and the scarcity / S1 probes; the S1 outcome loop keeps the
+pre-#106 prefix strip (`codex_isolation.prefix_stripped_env`).
+
+**Adding a variable.** Add it to `BASE_ENV` (every backend needs it) or to the backend's set in `BACKEND_ENV` in
+`child_env.py`, with a one-line comment saying why the backend cannot run without it and that it carries no secret the
+backend should not hold; extend `tests/test_child_env.py` (`test_the_lists_hold_no_vendor_secret_family` names every
+vendor-prefixed entry, so a new `CODEX_*` / `CLAUDE_*` / `OPENAI_*` / `ANTHROPIC_*` entry is a deliberate test edit).
+A value the bridge sets for one spawn goes in that call's `extra`, not in the allowlist. Restart the provider to apply.
+The test modules that drive the fake CLIs widen the allowlist by `FAKE_*` only (`tests/provider_fakes.py`).
+
 ## Web search lane (2026-11-03)
 
 Claude Code's WebSearch sends a request whose only tool is the Anthropic server tool `web_search_*` (often with a forced
 `tool_choice`). No bridged backend can run a server tool, so `cortados_router/provider/search_lane.py` serves it on a
 separate one-shot `claude -p` whose only tool is WebSearch (`--tools WebSearch --allowedTools WebSearch`, empty MCP
-config, no setting sources, `dontAsk`, empty scratch cwd, ANTHROPIC_* stripped as in the bridge). This is the one
+config, no setting sources, `dontAsk`, empty scratch cwd, the bridge's allowlisted environment, #106). This is the one
 owner-approved exception to the bridge rule that the headless CLI never runs a tool itself. Model: `SEARCH_MODEL`
 (the routing table's W-fast Claude route, Haiku 4.5). Login (`search_lane.login`, resolved together with the ledger
 lane before launch): the account named by `CORTADOS_PROVIDER_SEARCH_ACCOUNT` (resolved through tables/accounts.json;
@@ -648,8 +684,9 @@ keeps failing with a non-busy error, or exit with rows still queued; each is cou
 (with `ledger.queued`) in /v1/cortados/usage, and logged "LOST". The request's policy headers bind the lane before launch, as on routed calls: `x-cortados-exclude-model`
 naming the search model is a 400, and `x-cortados-min-left-pct` is checked and reserved on the search account through
 `floor.reserve` (429 on refusal; a fixed-model endpoint or a failing check fails closed).
-Hooks are off (`--settings '{"disableAllHooks": true}'`) and every `ANTHROPIC_*` variable is stripped by prefix
-(`bridge.claude_env`), so e.g. `ANTHROPIC_CUSTOM_HEADERS` never reaches api.anthropic.com. The query is capped at 2000
+Hooks are off (`--settings '{"disableAllHooks": true}'`) and the CLI runs on the bridge's allowlisted environment
+(`bridge.claude_env`, #106), which holds no `ANTHROPIC_*` variable, so e.g. `ANTHROPIC_CUSTOM_HEADERS` never reaches
+api.anthropic.com. The query is capped at 2000
 characters (`query_too_long`) and rides in argv, like the bridge's system prompt. The web_search tool's
 `allowed_domains` / `blocked_domains` are carried into the prompt ("only use results from ...; never use results
 from ...") as an instruction to the search model, not an enforced filter.

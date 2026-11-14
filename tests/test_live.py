@@ -20,6 +20,7 @@ from unittest import mock
 
 from cortados_router import child_tasks
 from cortados_router.provider import clients, live, office, usage
+from tests.provider_fakes import setUpModule, tearDownModule  # noqa: F401  (FAKE_* reach the fake CLIs, #106)
 
 NOW = 1_800_000_000.0
 SECRET = "SECRET-PROMPT-TEXT-0042"

@@ -14,6 +14,7 @@ from unittest import mock
 
 from cortados_router.compaction import store
 from cortados_router.compaction.events import Session
+from tests.provider_fakes import setUpModule, tearDownModule  # noqa: F401  (FAKE_* reach the fake CLIs, #106)
 
 FIXTURES = Path(__file__).with_name("fixtures")
 

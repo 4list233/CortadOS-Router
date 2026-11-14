@@ -28,6 +28,7 @@ from cortados_router.provider.bridge import BridgeError, BridgeSession
 from cortados_router import core, scarcity
 from cortados_router.provider import search_lane, server
 from cortados_router.provider.server import Handler, ProviderServer, Registry
+from tests.provider_fakes import setUpModule, tearDownModule  # noqa: F401  (FAKE_* reach the fake CLIs, #106)
 
 FAKE = Path(__file__).with_name("fixtures") / "fake_claude_cli.py"
 TOKEN = "test-token"
@@ -977,13 +978,15 @@ class EndpointTests(EndpointHarness):
         self.assertFalse([k for k in server.claude_env(None) if k.startswith("ANTHROPIC_")])
 
     def test_claude_env_strips_every_anthropic_variable_by_prefix(self):
+        # #84, now by the #106 allowlist: no ANTHROPIC_* and no unlisted variable passes; the default login's token does
         from cortados_router.provider import bridge
         ambient = {k: "" for k in os.environ if k.startswith("ANTHROPIC_")}   # the developer's shell, cleared
         with mock.patch.dict(os.environ, {**ambient, "ANTHROPIC_CUSTOM_HEADERS": "x-cortados-run-id: r1",
                                           "ANTHROPIC_MODEL": "m", "CLAUDE_CODE_OAUTH_TOKEN": "tok", "KEEP_ME": "1"}):
             env = bridge.claude_env(None)
             self.assertFalse([k for k in env if k.startswith("ANTHROPIC_")])
-            self.assertEqual((env["KEEP_ME"], env["CLAUDE_CODE_OAUTH_TOKEN"]), ("1", "tok"))
+            self.assertNotIn("KEEP_ME", env)
+            self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "tok")
             env = bridge.claude_env("/cfg/b")
             self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/cfg/b")
             self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)

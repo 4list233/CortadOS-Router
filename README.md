@@ -264,6 +264,8 @@ CORTADOS_S1_URL=http://<scorer-ip>:8431 CORTADOS_S1_TOKEN=<s1-token> \
     --claude-bin /path/to/claude --codex-bin /path/to/codex
 ```
 
+The backend CLIs the provider starts (headless `claude`, `codex app-server`, the search lane's `claude -p`) do not inherit its environment: they get an explicit allowlist (`cortados_router/provider/child_env.py`, #106) of `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LC_*`, `TZ`, the proxy variables (both cases), the CA bundle variables and `__CF_USER_TEXT_ENCODING`, plus `CODEX_HOME` / `CODEX_CA_CERTIFICATE` for Codex and `CLAUDE_CONFIG_DIR` / `CLAUDE_CODE_OAUTH_TOKEN` for Claude. The provider token, `GITHUB_TOKEN`, `AWS_*`, `SSH_AUTH_SOCK` and every API key stay in the provider. To pass another variable, add it with its reason to `BASE_ENV` or `BACKEND_ENV` in that file and restart the provider (`docs/PROVIDER-PLAN.md`, "Backend environment allowlist").
+
 `CORTADOS_S1_URL` names the scorer; without it (and without a configured endpoints file that selects a remote device) the provider looks for S1 on loopback and routes degraded. On one machine, drop both `CORTADOS_S1_*` and S1 is found on loopback.
 
 **Point a client at it:**

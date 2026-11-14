@@ -19,6 +19,7 @@ os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp())
 from cortados_router import core
 from cortados_router.provider import local_lane, routing, server
 from tests.test_provider import EndpointHarness, TOKEN
+from tests.provider_fakes import setUpModule, tearDownModule  # noqa: F401  (FAKE_* reach the fake CLIs, #106)
 
 TAG = "hf.co/example/Qwen-27B-GGUF:Q4_K_M"
 
