@@ -3695,7 +3695,7 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
 
     def test_a_floor_refusal_on_the_search_account_is_429_before_launch(self):
         seen = []
-        self.reg.floor_search = lambda cand, floor: seen.append((cand, floor)) or "week: 3% left"
+        self.reg.floor_search = lambda cand, floor, rid: seen.append((cand, floor)) or "week: 3% left"
         with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), self._accounts(self.ACCTS):
             code, msg = self._refused({server.MIN_LEFT_HEADER: "50"})
         self.assertEqual(code, 429)
@@ -3705,7 +3705,7 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
                                  50.0)], "the floor is checked on the account the search executes on")
 
     def test_a_failing_floor_check_fails_closed_before_launch(self):
-        def boom(cand, floor):
+        def boom(cand, floor, rid):
             raise RuntimeError("ledger unreadable")
         self.reg.floor_search = boom
         code, msg = self._refused({server.MIN_LEFT_HEADER: "5"})
@@ -3717,7 +3717,7 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
         # All slots busy and a floor header: the busy refusal comes before floor.reserve, so the floor ledger (every
         # reservation goes through floor_search) is unchanged and no CLI starts.
         reserved = []
-        self.reg.floor_search = lambda cand, floor: reserved.append((cand, floor)) or None
+        self.reg.floor_search = lambda cand, floor, rid: reserved.append((cand, floor)) or None
         with mock.patch.object(search_lane, "_slots", threading.BoundedSemaphore(1)):
             search_lane._slots.acquire()
             try:
@@ -3730,10 +3730,73 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
         self.assertEqual(self.search_calls(), [])
 
     def test_a_floor_the_search_account_clears_runs_the_search(self):
-        self.reg.floor_search = lambda cand, floor: None
+        self.reg.floor_search = lambda cand, floor, rid: None
         r = self.post(self.SEARCH, headers={server.MIN_LEFT_HEADER: "5"})
         self.assertIn("https://example.com/c", r["content"][0]["text"])
         self.assertEqual(len(self.search_calls()), 1)
+
+    def _floor_ledger(self):
+        """A floor_search / floor_release pair over an in-memory ledger: rid -> live reservation."""
+        live, released = {}, []
+        self.reg.floor_search = lambda cand, floor, rid: live.__setitem__(rid, cand) or None
+
+        def release(rid):
+            released.append(rid)
+            return live.pop(rid, None) is not None
+        self.reg.floor_release = release
+        return live, released
+
+    def test_a_search_cli_that_fails_to_start_refunds_its_reservation_once(self):
+        # #79: the reservation only counts once the CLI started; a launch failure gives it back, exactly once.
+        live, released = self._floor_ledger()
+        with mock.patch.object(search_lane.subprocess, "Popen", side_effect=OSError("no such file")):
+            r = self.post(self.SEARCH, headers={server.MIN_LEFT_HEADER: "5"})
+        self.assertIn("start_failed", r["content"][0]["text"])
+        self.assertEqual(live, {}, "the ledger is as it was before the search")
+        self.assertEqual(len(released), 1, "refunded exactly once")
+
+    def test_a_search_with_no_scratch_dir_refunds_its_reservation(self):
+        live, released = self._floor_ledger()
+        with mock.patch.object(search_lane.tempfile, "mkdtemp", side_effect=OSError("disk full")):
+            r = self.post(self.SEARCH, headers={server.MIN_LEFT_HEADER: "5"})
+        self.assertIn("start_failed", r["content"][0]["text"])
+        self.assertEqual((live, len(released)), ({}, 1))
+
+    def test_a_search_that_started_and_failed_keeps_its_reservation(self):
+        # The CLI ran (it may have spent quota): a later failure is never refunded.
+        live, released = self._floor_ledger()
+        os.environ["FAKE_SEARCH_MODE"] = "fail"
+        r = self.post(self.SEARCH, headers={server.MIN_LEFT_HEADER: "5"})
+        self.assertIn("exit_3", r["content"][0]["text"])
+        self.assertEqual((len(live), released), (1, []))
+
+    def test_a_completed_search_keeps_its_reservation(self):
+        live, released = self._floor_ledger()
+        self.post(self.SEARCH, headers={server.MIN_LEFT_HEADER: "5"})
+        self.assertEqual((len(live), released), (1, []))
+
+    def test_a_refund_that_fails_still_answers_and_is_logged(self):
+        self.reg.floor_search = lambda cand, floor, rid: None
+        self.reg.floor_release = mock.Mock(side_effect=RuntimeError("ledger locked"))
+        with mock.patch.object(search_lane.subprocess, "Popen", side_effect=OSError("nope")), \
+                self.assertLogs("cortados", "ERROR") as logs:
+            r = self.post(self.SEARCH, headers={server.MIN_LEFT_HEADER: "5"})
+        self.assertIn("start_failed", r["content"][0]["text"])
+        self.assertEqual(self.reg.floor_release.call_count, 1)
+        self.assertTrue(any("refunding floor reservation" in m for m in logs.output))
+
+    def test_floor_release_refunds_through_floor_release(self):
+        # the production wiring: the rid reaches the ledger row and _floor_release removes that row only
+        from cortados_router.provider import floor
+        state = Path(self.scratch) / "state"
+        core_stub = mock.Mock(STATE=state, subscription_readings=mock.Mock(return_value={}))
+        with mock.patch.object(floor, "block", return_value=(None, ["claude|win|week"])):
+            self.assertIsNone(server._floor_search(core_stub, {"lane": "claude"}, 5.0, "abc"))
+        rows = (state / "floor-reservations.jsonl").read_text().splitlines()
+        self.assertEqual([json.loads(x).get("rid") for x in rows], ["abc"])
+        self.assertTrue(server._floor_release(core_stub, "abc"))
+        self.assertFalse(server._floor_release(core_stub, "abc"))
+        self.assertEqual((state / "floor-reservations.jsonl").read_text(), "")
 
     def test_floor_search_reserves_through_floor_reserve(self):
         # the production wiring: floor.reserve on the search model; no usage reading -> held, nothing reserved

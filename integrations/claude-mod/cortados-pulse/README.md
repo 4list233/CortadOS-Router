@@ -3,6 +3,18 @@
 A mod: a pane beside the chat that shows what CortadOS is running and the resource pool behind it. It reads two of the
 provider's views with the same token: `GET /v1/cortados/live` every 10 seconds and `GET /resources` every 20.
 
+- **This session** (from `/v1/cortados/live`, at the top) — the `start_task` children THIS session started: running and
+  queued (title, host, model, tool, elapsed), then the last three finished (state, how long they took). A task names
+  the session that started it in `origin_session`, the session's Office tag: sha256 of the machine's shared salt
+  (`~/.config/cortados/office-salt`, made by the `cortados-route` MCP server; `CORTADOS_OFFICE_SALT_FILE` overrides)
+  and the session id, cut to 16 hex, exactly as `cortados-routed-subagents` names its floor. The pane computes the
+  same tag every poll and never sends or shows the raw session id; without the salt file it says the session cannot
+  be identified. The tasks come from `GET /v1/cortados/live?session=<tag>`, which the provider filters BEFORE its list
+  caps (50 running, 40 finished), so a busy fleet cannot push this session's tasks out; a provider that ignores
+  `?session=` (no `session_filter` in its answer) is filtered in the pane, with a note when its capped lists may hide
+  some. A provider from before task origins (no `tasks.origins`) is said as such, not as "no task started". Under the
+  list, a dim line recalls that after `/clear` earlier tasks stay under the previous session (the dashboard has them).
+  Tasks run on another execution host log there and are not in the provider host's view (see scope);
 - **Running** (from `/v1/cortados/live`) — one summary line (children running and queued, conversations and how many
   are working), then each running or queued `start_task` child (title, host, model, current tool, elapsed time counting
   between polls) and every conversation the provider holds open (main sessions, subagents, untagged clients, and a

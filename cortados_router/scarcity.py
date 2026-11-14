@@ -370,7 +370,8 @@ def claude_login_identity(env: dict[str, str]) -> str | None:
 
 # Env that makes a Codex CLI authenticate with something other than the stored login of its CODEX_HOME (an API key, an
 # access token, another endpoint): with any set, the env cannot be pinned to one stored login. The provider's Codex
-# backend strips exactly these (codex_isolation.STRIPPED_ENV), so its login is always the home's auth.json.
+# backend strips these and every OPENAI_/CODEX_ variable but CODEX_HOME (codex_isolation.stripped), so its login
+# is always the home's auth.json.
 _CODEX_LOGIN_OVERRIDES = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BASE_URL")
 
 

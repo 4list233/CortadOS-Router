@@ -38,6 +38,7 @@ import secrets
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from collections import OrderedDict, deque
 from html.parser import HTMLParser
@@ -296,7 +297,8 @@ RESPONSES = Wire(
     model_id=responses_wire.MODEL_ID, error_type=responses_wire.WireError, parse_request=responses_wire.parse_request,
     one_shot_content=responses_wire.one_shot_content,
     routing_body=lambda body: dict(body, messages=responses_wire.score_messages(body),
-                                   tools=responses_wire.function_tools(body)),
+                                   tools=responses_wire.function_tools(body),
+                                   **{routing.NO_LOCAL_KEY: True}),   # the local relay speaks Messages only
     new_message_id=responses_wire.new_message_id, stream_start=responses_wire.sse_start, stream_ping=responses_wire.sse_ping,
     stream_body=lambda msg_id, model, blocks, stop, usage: responses_wire.sse_body(blocks, stop, usage, msg_id=msg_id, model=model),
     stream_error=lambda msg_id, model, message, terminal=False: responses_wire.sse_error(message, msg_id=msg_id, model=model,
@@ -554,10 +556,17 @@ def _ledger_turn(session: Any, usage: dict | None) -> None:
 _ledger_hook_warned: set[str] = set()
 
 
-def _floor_search(core, cand: dict, min_left_pct: float) -> str | None:
-    """One search under the client's floor: a whole run, charged once (no conversation id), on its executing account."""
+def _floor_search(core, cand: dict, min_left_pct: float, rid: str | None = None) -> str | None:
+    """One search under the client's floor: a whole run, charged once (no conversation id), on its executing account.
+    `rid` stamps the reservation so _floor_release can take it back if the CLI never starts (#79)."""
     from cortados_router.provider import floor
-    return floor.reserve(core, cand, search_lane.SEARCH_MODEL, min_left_pct)
+    return floor.reserve(core, cand, search_lane.SEARCH_MODEL, min_left_pct, rid=rid)
+
+
+def _floor_release(core, rid: str) -> bool:
+    """Refund the search reservation `rid` (floor.release): only for a search whose CLI failed to start."""
+    from cortados_router.provider import floor
+    return floor.release(core, rid)
 
 
 def _log_ledger_hook_failure(exc: BaseException) -> None:
@@ -684,7 +693,11 @@ class Registry:
         self.floor_turn: Callable[[dict | None, float], str | None] | None = None
         # floor_search(candidate, min_left_pct) -> refusal or None: checks and reserves the search lane's executing
         # account under the floor before a search launches (floor.reserve). None: a floor on a search fails closed.
-        self.floor_search: Callable[[dict, float], str | None] | None = None
+        # The reservation is stamped with the rid passed in, so floor_release(rid) can refund it (#79).
+        self.floor_search: Callable[[dict, float, str], str | None] | None = None
+        # floor_release(rid) -> bool: refunds a floor_search reservation whose search CLI failed to start (a reservation
+        # only counts once the run started). None: nothing to refund with; the row ages out as before, logged.
+        self.floor_release: Callable[[str], bool] | None = None
         self._factories = SESSION_FACTORIES if session_factories is None else session_factories
         self._lock = threading.Lock()
         # Orders a conversation's backend-exit Office transition against its requests' turn-end writes, so the exit's
@@ -1481,8 +1494,13 @@ class Handler(BaseHTTPRequestHandler):
             # Owner token, or a scoped token with live:read. Metadata only (provider/live.py), never request text.
             if self._scoped is None and not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
+            # ?session=<tag>: one orchestrating session's tasks and conversations (live.for_session); a bad tag is a 400
+            sess = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("session")
+            if sess is not None and (len(sess) != 1 or live.valid_session(sess[0]) is None):
+                return self._error(400, "invalid_request_error",
+                                   "cortados: session must be " + live.SESSION_FILTER_RULE)
             try:
-                body = self.server.live_body(self.server.registry)
+                body = self.server.live_body(self.server.registry, sess[0] if sess else None)
             except Exception as exc:
                 logger.warning("live: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: live view unavailable (see provider log)")
@@ -1799,7 +1817,7 @@ class Handler(BaseHTTPRequestHandler):
             outcome = "incomplete"
             try:
                 outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model,
-                                           reply=reply)
+                                           reply=reply, auto_routed=not route.get("pinned"))
             except Exception as exc:             # serve handles its own I/O; anything else must still clean up
                 logger.exception("local lane: relay failed")
                 outcome = "incomplete"
@@ -1865,11 +1883,13 @@ class Handler(BaseHTTPRequestHandler):
                                           "this request cannot be searched under that exclusion")
         if refused:
             return self._error(400, "invalid_request_error", refused, wire)
+        reserved: str | None = None                     # the floor reservation's id while it may still need a refund
         try:
             # Query checks and a search slot come first, then the quota floor's reservation: a refused search (no
             # query, too long, all slots busy) must never leave a reservation. The slot is held through the launch.
             query = search_lane.extract_query(body)
             search_lane.check_query(query)
+            allowed, blocked = search_lane.domain_filters(body)   # parsed before reserving: nothing between it and launch
             with search_lane.capacity():
                 who = search_lane.login()               # the login and its ledger lane, resolved together before launch
                 if floor is not None:
@@ -1880,8 +1900,9 @@ class Handler(BaseHTTPRequestHandler):
                         return self._error(429, "rate_limit_error", "cortados: this endpoint cannot check "
                                            "x-cortados-min-left-pct for the search lane", wire,
                                            reason="the client's quota floor cannot be checked here")
+                    rid = uuid.uuid4().hex
                     try:
-                        why = reg.floor_search(who.floor_candidate(), floor)
+                        why = reg.floor_search(who.floor_candidate(), floor, rid)
                     except Exception as exc:
                         logger.exception("search lane: quota floor check failed")
                         return self._error(429, "rate_limit_error", "cortados: the search lane's quota floor check failed "
@@ -1890,11 +1911,17 @@ class Handler(BaseHTTPRequestHandler):
                     if why:
                         return self._error(429, "rate_limit_error", f"cortados: {why}", wire,
                                            reason="the search account is below the client's quota floor")
-                allowed, blocked = search_lane.domain_filters(body)
+                    reserved = rid
                 result = search_lane.run(getattr(reg, "search_bin", None) or reg.claude_bin,
                                          query, who.config_dir, allowed=allowed, blocked=blocked, slot_held=True)
         except search_lane.SearchFailed as exc:
             logger.warning("web search lane failed (%s): %s", exc.kind, exc.detail[:200])
+            if exc.kind == "start_failed" and reserved:
+                # The CLI never started, so nothing was spent: refund the reservation, once (#79). Every other failure
+                # ran the CLI (it may have spent quota) and keeps its reservation. Only an OSError from launching the
+                # CLI becomes start_failed (search_lane._run_cli); any other exception here is a lane bug, logged by
+                # the generic handler below, and its reservation is not refunded: it ages out as before.
+                self._refund_search_floor(reserved)
             reason = ("search busy" if exc.kind == "busy" else "no search was performed" if exc.kind == "no_search"
                       else f"the search lane failed: {exc.kind}")
             return self._server_tools_unavailable(turn, names, wire, reason=reason)
@@ -1917,6 +1944,19 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             _log_ledger_hook_failure(exc)               # the ledger never breaks a reply (as _ledger_turn's caller)
         return self._reply_text(turn, result.text, result.usage, wire)
+
+    def _refund_search_floor(self, rid: str) -> None:
+        """Release one search reservation through reg.floor_release. Never raises: a refund that cannot be made leaves
+        the row to age out (the behaviour before #79), and that is logged, not hidden."""
+        release = self.server.registry.floor_release
+        if release is None:
+            logger.warning("search lane: start failed but no floor_release is wired; reservation %s ages out", rid)
+            return
+        try:
+            if not release(rid):
+                logger.warning("search lane: floor reservation %s was not found to refund", rid)
+        except Exception:
+            logger.exception("search lane: refunding floor reservation %s failed; it ages out", rid)
 
     def _server_tools_unavailable(self, turn, names: list[str], wire: Wire, reason: str = "") -> None:
         """A complete, ordinary assistant reply whose text tells the model the server tools did not run. A reply,
@@ -2599,14 +2639,15 @@ class ProviderServer(ThreadingHTTPServer):
             events = []
         return registry.office.view(events, now=now, errors=errors)
 
-    def live_body(self, registry: Registry) -> bytes:
+    def live_body(self, registry: Registry, session: str | None = None) -> bytes:
         """The encoded live view, memoised live.MEMO_S with single flight (live.Memo): every dashboard tab and pulse
-        pane polling at once costs one collect. A heartbeat post (the board's generation) invalidates it."""
+        pane polling at once costs one collect per view (the fleet, each ?session=). A heartbeat post (the board's
+        generation) invalidates it. `session` must already be valid (live.valid_session)."""
         from cortados_router import paths
-        key = (str(paths.state_dir()), id(registry), registry.live.generation)
-        return self._live_memo.get(key, lambda: json.dumps(self.live_view(registry), allow_nan=False).encode())
+        key = (str(paths.state_dir()), id(registry), registry.live.generation, session)
+        return self._live_memo.get(key, lambda: json.dumps(self.live_view(registry, session), allow_nan=False).encode())
 
-    def live_view(self, registry: Registry) -> dict[str, Any]:
+    def live_view(self, registry: Registry, session: str | None = None) -> dict[str, Any]:
         """GET /v1/cortados/live (provider/live.py): composes the office board, the tasks and the live slice of the usage
         view, the child-task log (read once, 24 h) and the host heartbeats. Cache-only: no vendor CLI, no ssh. Tests
         replace the inputs it calls (office_view's board, tasks_view, live_usage_view) or this method."""
@@ -2631,7 +2672,7 @@ class ProviderServer(ThreadingHTTPServer):
             heartbeats=lambda: registry.live.snapshot(now), backend_sessions=len(registry.sessions),
             peek=child_tasks.peek_local, exec_hosts=hosts, self_host=exec_hosts.short_hostname(),
             remote_stubs=child_tasks.remote_stubs, lane_enabled=live.lane_enabled,
-            conversations=registry.live_conversations)
+            conversations=registry.live_conversations, session=session)
 
     def live_usage_view(self, registry: Registry, now: float) -> dict[str, Any]:
         """Lanes, S1 and hardware for the live view (usage.collect_live): the same sources usage_view reads."""
@@ -2695,7 +2736,8 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
                         log_outcome=log_turn_outcome)
     if not fixed_model:
         registry.floor_turn = lambda route, floor: routing.floor_turn(core, route, floor, codex_home)
-        registry.floor_search = lambda cand, floor: _floor_search(core, cand, floor)
+        registry.floor_search = lambda cand, floor, rid: _floor_search(core, cand, floor, rid)
+        registry.floor_release = lambda rid: _floor_release(core, rid)
     httpd = ProviderServer((host, port), registry)
 
     def reaper():

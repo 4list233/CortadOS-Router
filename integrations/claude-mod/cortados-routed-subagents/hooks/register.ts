@@ -1772,8 +1772,29 @@ export function officeHeaderLines(o: { session?: string | null; project?: string
 
 type OfficeBeat = { status: 'working' | 'idle' | 'ended'; tool: string | null; force: boolean }
 
+/** The machine's shared Office salt file (cortados_router/subagent_mcp.py OFFICE_SALT_DEFAULT; the
+ * CORTADOS_OFFICE_SALT_FILE env var overrides it): 32 lowercase hex, 0600, made by the cortados-route MCP server. */
+export const OFFICE_SALT_FILE = '~/.config/cortados/office-salt'
+
+/** The shared salt, or null when it is absent, unreadable or not 32 lowercase hex. Never throws. */
+export async function readSharedSalt($: any): Promise<string | null> {
+  try {
+    let path = String((await $.env.get('CORTADOS_OFFICE_SALT_FILE')) || OFFICE_SALT_FILE).trim()
+    if (path === '~' || path.startsWith('~/')) {
+      const home = await $.env.get('HOME')
+      if (!home) return null
+      path = home + path.slice(1)
+    }
+    const v = String(await $.fs.read(path)).trim()
+    return /^[0-9a-f]{32}$/.test(v) ? v : null
+  } catch {
+    return null
+  }
+}
+
 type OfficeState = {
-  salt: string | null
+  salt: string | null                   // this install's own salt (the store's), made once and kept
+  pin: { id: string; salt: Promise<string | null> } | null   // the salt chosen for session `id`, kept for that session
   device: string | null
   project: string | null
   reported: Set<string>
@@ -1786,7 +1807,7 @@ type OfficeState = {
 }
 
 export function newOfficeState(): OfficeState {
-  return { salt: null, device: null, project: null, reported: new Set(), last: null, failures: 0,
+  return { salt: null, pin: null, device: null, project: null, reported: new Set(), last: null, failures: 0,
     pending: null, running: null, wake: null, ended: false }
 }
 
@@ -1804,9 +1825,24 @@ function officeReport($: any, office: OfficeState, where: string, err: unknown):
   } catch { /* nowhere left to report */ }
 }
 
-/** This session's Office identity: { session tag, project, device }. Each part that cannot be read is reported once
- * and left out (the provider then shows the work in its lobby or without that label); never throws. */
-async function officeIdentity($: any, office: OfficeState): Promise<{ session: string | null; project: string | null; device: string | null }> {
+/** Tries and spacing for the shared salt read when a session's salt is decided: the cortados-route MCP server makes
+ * the file at its own start, which can land just after this session's first heartbeat. 3 x 500 ms bounds the wait
+ * (once per session, only while the file is missing) well under the 2 s slow-heartbeat note. */
+export const SHARED_SALT_TRIES = 3
+export const SHARED_SALT_RETRY_MS = 500
+
+/** The salt for a new session: the machine's shared one (the cortados-route MCP server's start_task origin and the
+ * cortados-pulse pane derive the same tag from it), read up to SHARED_SALT_TRIES times; else this install's own salt
+ * from the store (made once). null when neither can be had (reported). Never throws. */
+async function officeSessionSalt($: any, office: OfficeState): Promise<string | null> {
+  for (let i = 0; i < SHARED_SALT_TRIES; i++) {
+    const shared = await readSharedSalt($)
+    if (shared) return shared
+    if (i + 1 < SHARED_SALT_TRIES) {
+      try { await $.clock.sleep(SHARED_SALT_RETRY_MS) }
+      catch (err) { officeReport($, office, 'salt retry', err); break }
+    }
+  }
   if (office.salt === null) {
     try {
       const v = await $.store.get(OFFICE_SALT_KEY)
@@ -1821,15 +1857,34 @@ async function officeIdentity($: any, office: OfficeState): Promise<{ session: s
       officeReport($, office, 'salt', err)
     }
   }
+  return office.salt
+}
+
+/** This session's Office identity: { session tag, project, device }. Each part that cannot be read is reported once
+ * and left out (the provider then shows the work in its lobby or without that label); never throws. */
+async function officeIdentity($: any, office: OfficeState): Promise<{ session: string | null; project: string | null; device: string | null }> {
   let session: string | null = null
-  if (office.salt) {
-    try {
-      // Read every time: /clear and resume move the process to another session id, which is another floor.
-      const id = await $.session.id()
-      if (typeof id === 'string' && id) session = await sessionTag(office.salt, id)
-      else throw new Error('no session id')
-    } catch (err) {
-      officeReport($, office, 'session tag', err)
+  let id: string | null = null
+  try {
+    // Read every time: /clear and resume move the process to another session id, which is another floor.
+    const v = await $.session.id()
+    if (typeof v === 'string' && v) id = v
+    else throw new Error('no session id')
+  } catch (err) {
+    officeReport($, office, 'session tag', err)
+  }
+  if (id !== null) {
+    // The salt is decided ONCE per session id and pinned: a session whose tag changed half way would show as two
+    // floors until the old one aged out (FLOOR_TTL_S, 900 s; review 2026-11-13: the session.start heartbeat raced the
+    // MCP server creating the shared file). Concurrent callers share the one decision (a promise, not a value).
+    if (!office.pin || office.pin.id !== id) office.pin = { id, salt: officeSessionSalt($, office) }
+    const pin = office.pin
+    const salt = await pin.salt
+    // No salt at all (store unreadable, reported): no floor was named, so the next call may decide again.
+    if (!salt && office.pin === pin) office.pin = null
+    if (salt) {
+      try { session = await sessionTag(salt, id) }
+      catch (err) { officeReport($, office, 'session tag', err) }
     }
   }
   // Without a tag there is no floor to label: project and device are not looked up (the work shows in the lobby).
