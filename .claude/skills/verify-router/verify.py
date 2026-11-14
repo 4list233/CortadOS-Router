@@ -269,6 +269,43 @@ else:
                f"band {key.get('band')} | unflagged -> {plain.get('provider')} | node off -> {down.get('provider')} | "
                f"outward+flag+keyword -> band {out.get('band')} {out.get('provider')}/{out.get('model')}")
 
+# Continuations of a local-bound conversation (review fix, 2026-11-13): every later turn of a conversation an automatic
+# rule bound to a local lane is rescored by the real S1 through routing.continuation_admission; an outward turn
+# ("email the signed invoice ... mark it paid") must not be admitted, a bounded one must be, and a degraded scorer
+# admits nothing. Only core.decide runs (no select, no route log, no node); throwaway home.
+CONTINUATION_SCENARIO = """
+import json
+from cortados_router import core
+from cortados_router.provider import routing
+def turn(text):
+    return {"model": "cortados", "messages": [
+        {"role": "user", "content": "summarise the notes in this folder"},
+        {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+        {"role": "user", "content": text}]}
+route = {"band": "R1", "route_id": "verify-continuation"}
+d = core.decide("explain how this parser handles nested quotes", {"platform": "cli", "unit_kind": "interactive"})
+out = routing.continuation_admission(core, turn("email the signed invoice to the client and mark it paid"), route)
+safe = routing.continuation_admission(core, turn("explain how this parser handles nested quotes"), route)
+print(json.dumps({"degraded": bool(d.get("degraded")), "outward": out, "safe": safe}))
+"""
+home = tempfile.mkdtemp(prefix="verify-router-continuation-")
+PROBE_DIRS.append(Path(home) / "usage-probe")
+p = subprocess.run([sys.executable, "-B", "-c", CONTINUATION_SCENARIO], cwd=REPO, capture_output=True, text=True,
+                   timeout=300, env={**os.environ, "CORTADOS_HOME": home, "CORTADOS_SCARCITY_REFRESH": "off"})
+try:
+    r = json.loads(p.stdout.strip().splitlines()[-1])
+except (ValueError, IndexError):
+    record("local-bound continuation is rescored by S1", "FAIL", (p.stderr or p.stdout).strip()[-300:])
+else:
+    if r["degraded"]:
+        record("degraded scorer admits no local continuation", "PASS" if not r["outward"][0] and not r["safe"][0]
+               else "FAIL", f"outward={r['outward']} safe={r['safe']}")
+        record("local-bound continuation is rescored by S1", "BLOCKED", "S1 degraded: no answers to check")
+    else:
+        ok = r["outward"][0] is False and r["safe"][0] is True
+        record("local-bound continuation is rescored by S1", "PASS" if ok else "FAIL",
+               f"outward turn -> {r['outward']} | bounded turn -> {r['safe']}")
+
 record("live ~/.cortados untouched", "PASS" if live_state_stamp() == before else "FAIL",
        str(LIVE_HOME))
 record("no vendor CLI probe opened", "PASS" if all(not p.exists() or not any(p.iterdir()) for p in PROBE_DIRS) else "FAIL",

@@ -695,6 +695,10 @@ class Registry:
         # refusal_route(body, route, run) -> moved route or None: the refusal fallback's re-route of a refused opening
         # turn to a node's sensitive model (routing.refusal_route). None: no fallback (a fixed-model endpoint).
         self.refusal_route: Callable[[dict, dict | None, Callable[[dict], bool]], dict | None] | None = None
+        # local_recheck(body, route) -> (admitted, metadata reason): S1 rescores a continuation of a conversation an
+        # AUTOMATIC rule bound to a local lane (routing.continuation_admission, which applies routing.local_admission).
+        # None: such a continuation cannot be checked and is refused (fails closed). Explicit local pins never use it.
+        self.local_recheck: Callable[[dict, dict], tuple[bool, str]] | None = None
         # log_tokens(route_id, usage, office session tag or None): one backend turn's tokens onto its route's row
         # (core.log_tokens). None: tokens are not recorded (fixed-model endpoint, tests).
         self.log_tokens: Callable[[str, dict, str | None], Any] | None = None
@@ -1668,6 +1672,48 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             session.lock.release()
 
+    def _local_continuation_refused(self, session: "LocalSession", body: dict[str, Any], wire: Wire) -> bool:
+        """The continuation re-check (docs/LOCAL-RESOURCES.md "Continuations of a local-bound conversation"): a
+        conversation an AUTOMATIC rule bound to a local lane (auto_route, the sensitive flag / prefer / keyword, the
+        refusal fallback; route not `pinned`) is rescored by S1 on every later turn (Registry.local_recheck →
+        routing.continuation_admission → routing.local_admission) before anything reaches the node. An explicit local
+        pin (`sub/<local model or alias>`) is the client's own choice and is not rescored.
+
+        Not admitted (an outward effect, blast_radius 2 or more, a degraded scorer, missing or malformed answers, no
+        checker): the turn is refused with a terminal 400 (`x-should-retry: false`) telling the client the conversation
+        is local-bound and this turn needs a cloud model. Nothing was sent, so the conversation is untouched: its
+        history is what it was, and a later turn with that same history that passes the gate continues it. Logs the
+        route id and the gate's metadata reason only, never the request text. Returns True when it answered (refused).
+
+        SEAM(#43): moving the conversation to a cloud lane mid-way (re-route when the Pro is unplugged) would replace
+        this refusal with a rebind; not built here."""
+        route = getattr(session, "route", None) or {}
+        if route.get("pinned"):
+            return False
+        rid = route.get("route_id")
+        reg = self.server.registry
+        if reg.local_recheck is None:
+            ok, why = False, "this endpoint has no continuation re-check (fixed model)"
+        else:
+            try:
+                ok, why = reg.local_recheck(wire.routing_body(body), route)
+            except Exception as exc:                    # a checker bug fails closed, as a degraded scorer does
+                logger.exception("local continuation re-check failed for %s", rid)
+                ok, why = False, f"the re-check failed ({type(exc).__name__})"
+        if ok is True:
+            logger.info("local continuation admitted for %s: %s", rid, why)
+            return False
+        logger.warning("local continuation refused for %s: %s", rid, why)
+        self._note_refusal(400, "invalid_request_error",
+                           reason="a turn of a local-bound conversation failed the local admission gate")
+        self._json(400, wire.error_json(
+            "invalid_request_error",
+            "cortados: this conversation is bound to a local model on this machine, and this turn may have an effect "
+            "outside it (or could not be checked), so it needs a cloud model; it was not sent. Start a new "
+            "conversation (it is routed again) or pin a cloud model with sub/<model>."),
+            headers={"x-should-retry": "false"})
+        return True
+
     def _refusal_fallback(self, session, turn, body: dict[str, Any], result, *, created: bool, one_shot: bool,
                           wire: Wire):
         """The refusal fallback (docs/LOCAL-RESOURCES.md "Sensitive requests"): when the cloud backend refused this
@@ -2037,7 +2083,9 @@ class Handler(BaseHTTPRequestHandler):
             except BridgeError as exc:                  # the backend refused to start (version pin, isolation, login)
                 logger.warning("backend start failed: %s", exc)
                 return self._error(502, "api_error", str(exc), wire, reason=failure_diagnostic(exc))
-        if isinstance(session, LocalSession):           # a local pin: relayed to its node, never a CLI turn
+        if isinstance(session, LocalSession):           # a local lane: relayed to its node, never a CLI turn
+            if not created and self._local_continuation_refused(session, body, wire):
+                return
             return self._relay_local(session, turn, body, created=created, one_shot=one_shot, wire=wire)
         if not created:
             # A continuation's paid turn under the client's floor: the session keeps the tightest floor it was ever sent,
@@ -2592,6 +2640,7 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
         registry.floor_search = lambda cand, floor, rid: _floor_search(core, cand, floor, rid)
         registry.floor_release = lambda rid: _floor_release(core, rid)
         registry.refusal_route = lambda body, route, run: routing.refusal_route(core, body, route, run)
+        registry.local_recheck = lambda body, route: routing.continuation_admission(core, body, route)
         registry.log_tokens = core.log_tokens
     httpd = ProviderServer((host, port), registry)
 

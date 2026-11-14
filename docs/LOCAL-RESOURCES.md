@@ -205,8 +205,9 @@ With `auto_route` set, `routing.auto_local` runs after S1 has routed a new `cort
 only; pins are unaffected). It moves the conversation to the node's `auto_route.model` when **all** of these hold, and
 otherwise leaves S1's route exactly as it was:
 
-1. S1 was not degraded (a degraded decision has no band of its own; the "degraded scorer never defaults to Claude" rule
-   is untouched because nothing here ever adds a Claude route);
+1. the shared gate `routing.local_admission` admits S1's decision (Sensitive requests, below): not degraded (a degraded
+   decision has no band of its own; the "degraded scorer never defaults to Claude" rule is untouched because nothing
+   here ever adds a Claude route), `outward` exactly false and `blast_radius` exactly 0 or 1;
 2. S1's band is in `auto_route.bands` (`R0`/`R1`/`R2` only: `R3` is where the hard rules put outward and
    blast-radius-3 work, `R4` is escalation only);
 3. the request came in on `/v1/messages` (the relay speaks the Messages API; `/v1/responses` bodies carry
@@ -222,7 +223,8 @@ The first node in config order that passes wins. The routes row S1's select wrot
 (`INSERT OR REPLACE`: lane/provider `local-<node>`, the model's tag, S1's own choice as `runner_up`, S1's runner_up kept
 as an entry in `skipped`, a `local auto-route: …` hard-rules entry), and the conversation then runs exactly like a local
 pin (same relay, same per-turn context gate, the model is fixed for the conversation, the client's quota floor does not
-apply). Each skipped condition is logged at INFO (`local auto-route: … not taken …`), except a gate 401 (the provider's
+apply), except that every later turn is rescored by S1 first and refused when it is not admitted (Continuations of a
+local-bound conversation, under Sensitive requests). Each skipped condition is logged at INFO (`local auto-route: … not taken …`), except a gate 401 (the provider's
 token file does not match the gate's), which is a WARNING: it is a misconfiguration for the owner, not the node's state.
 
 **An auto-routed conversation stays on the Pro until it returns.** The decision is made once, on the opening turn. If
@@ -289,7 +291,8 @@ are refused (`LocalConfigError`), as for `auto_route`.
    (CLAUDE.md), the same for every conversation of a project: one word there would send every conversation local.
 3. **Refusal fallback** (`refusal_fallback: true`). When the cloud model refuses the **opening turn** of an S1-routed
    conversation on `/v1/messages`, the provider asks the node for a whole answer to the same request, sends the client
-   only that answer, and binds the conversation to the local model (later turns relay there like any local route). The
+   only that answer, and binds the conversation to the local model (later turns relay there after the continuation
+   re-check below). The
    Claude bridge recognises a refusal from the Claude CLI's own markers: an assistant frame with `stop_reason:
    "refusal"` or the `model_refusal_no_fallback` system event (the bridge passes no `--fallback-model`). The Codex
    app-server has no refusal signal (a refused Codex turn completes like any other, with text), and guessing from the
@@ -298,16 +301,51 @@ are refused (`LocalConfigError`), as for `auto_route`.
    `tool_use`), so a tool's effect never repeats. A refusal later in a conversation does not move it (hook
    `HOOK(rebuild-on-409)` in `server.Handler._refusal_fallback`; follow-up once branch `rebuild-on-409`, which seeds a new
    backend from the client's transcript, merges). If the node is unavailable or its answer fails, the refusal stands
-   and reaches the client unchanged.
+   and reaches the client unchanged. An answer counts only when it holds a non-blank text block or a valid tool call (a
+   tool the request declared, with an object input): a thinking-only reply, an empty `content` (e.g. `stop_reason:
+   "max_tokens"` after thinking) or only malformed tool calls is a failed answer, so the original refusal stands and
+   nothing is bound or recorded locally (`local_lane.complete`).
 
 A planned S1 "sensitive" signal plugs in at one place: `routing.S1_SENSITIVE_ANSWER` (None today) names the S1 answer
 key; once set, a request S1 marks is handled as trigger `s1` under exactly the rules below.
 
 **The outward-effect limit.** A sensitive request may go local in **any band**, but **only with no effect outside the
 machine**: S1 answered `outward: false` and `blast_radius` 0 ("words only, nothing changes") or 1 ("a bounded
-reversible workspace change") (`routing.LOCAL_BLAST_MAX`). Level 2 ("a broad or difficult-to-reverse system change") is
+reversible workspace change") (`routing.LOCAL_BLAST_OK`). Level 2 ("a broad or difficult-to-reverse system change") is
 not bounded to the workspace and level 3 is where `core.resolve` floors every outward request, so neither goes local.
-A decision without these answers fails closed. `core.resolve`'s hard rule (outward effects floor the blast radius to 3,
+A decision without these answers fails closed.
+
+**One shared gate: `routing.local_admission`.** Every AUTOMATIC move to a local lane passes the same function:
+
+    routing.local_admission(answers, band, degraded) -> (admitted: bool, reason: str)
+    routing.route_admission(route) -> (admitted, reason)   # the same, reading a route's decision/band/degraded
+
+Callers: `auto_local` (auto_route bands), `sensitive_local` (flag, prefer, keyword, the planned S1 signal),
+`refusal_route` (the refusal fallback, rechecked on the route's own decision even when the marker is there) and
+`continuation_admission` (below); branch `local-published-index`'s `_move_to_local` must call it too. It admits only
+when `degraded` is exactly `False`, `band` is a non-empty string, `answers["outward"]` is exactly `False` and
+`answers["blast_radius"]` is exactly an `int` (not a bool) equal to 0 or 1. Anything else is malformed and not admitted:
+`-1`, `False`, `True`, `1.9`, `1.0`, `"1"`, a missing key, `outward: null`. The reason is metadata only (it is what the
+log and the routes row say). Per-node checks stay with the caller: the node's auto_route band list, the wire, and
+`_node_why` (exclusion, availability, the model listed, the context fit).
+
+**Continuations of a local-bound conversation.** A conversation is routed once, and a conversation bound to a local
+lane by an automatic rule (auto_route, the sensitive flag / prefer / keyword, the refusal fallback) used to relay every
+later turn to the node unchecked, so "now email the signed invoice and mark it paid" after a harmless opening reached
+the node. Now every continuation of such a conversation is rescored by S1 before anything reaches the node
+(`server.Handler._local_continuation_refused` → `Registry.local_recheck` → `routing.continuation_admission` →
+`local_admission`, under the band the conversation was bound with). S1 scores the turn's own words (the latest user
+text, client reminders removed; on a tool-result turn with no words, the latest earlier user words), through
+`core.decide`: the same scorer call, timeout and retry as the opening's routing call, and its degraded result fails
+closed. To bound the added latency in a tool loop, an admission is reused for the same conversation and the same scored
+text for 180 s (`routing.CONTINUATION_CACHE_S`); a refusal is never cached. A turn that is not admitted (outward,
+blast_radius 2 or more, a degraded or failed scorer, missing or garbled answers, no user text at all, no checker
+configured) is refused with a terminal **400** (`x-should-retry: false`, `invalid_request_error`): the conversation is
+bound to a local model and this turn needs a cloud model; start a new conversation (routed again) or pin a cloud model.
+Nothing was sent, so the conversation is untouched: a later turn on the same history that passes the gate continues it.
+The log names the route id and the gate's reason only. **An explicit local pin** (`sub/<local model or alias>`, the
+client's own choice) is **not rescored**. Moving a refused conversation to a cloud lane mid-way is a separate feature
+(#43, re-route when the Pro is unplugged); its seam is `server.Handler._local_continuation_refused`. `core.resolve`'s hard rule (outward effects floor the blast radius to 3,
 strong cloud models) is untouched: an outward request is never moved, whatever the trigger.
 
 **Every local guard still applies.** A degraded scorer never routes local; the request must arrive on `/v1/messages`

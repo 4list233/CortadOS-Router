@@ -430,7 +430,9 @@ conversation in a listed band moves to that model while the Pro is available (AC
 S1's route otherwise (`routing.auto_local`; S1 and `core.resolve` never see a local lane). With a `sensitive` section,
 requests flagged `x-cortados-local: sensitive`, matching the owner's keyword list, or refused by a Claude lane on their
 opening turn move to the node's sensitive model in any band, only when S1 says they have no effect outside the machine
-(`docs/LOCAL-RESOURCES.md`, "Sensitive requests"). An asleep or busy node fails
+(`docs/LOCAL-RESOURCES.md`, "Sensitive requests"; one shared gate, `routing.local_admission`). Every later turn of a
+conversation an automatic rule bound to a local lane is rescored by S1 first and refused with a terminal 400 when it
+may have an outward effect; an explicit `sub/` local pin is not rescored. An asleep or busy node fails
 a pin with a clear 503, never a fallback. Ollama has no auth, so it stays on localhost and the node runs a token gate
 (`python3 -m cortados_router.local_gate`) on its Tailscale address. Config schema, gate and launchd template:
 `docs/LOCAL-RESOURCES.md` ("Local models").

@@ -284,7 +284,8 @@ def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any]) 
     """One whole (non-streaming) answer from the node for `body`, as (blocks, stop_reason, usage) in the shape the
     bridges return: text and tool_use blocks only (thinking is dropped, as the CLI lanes never send it). Used where
     the answer must be written by the server itself: the refusal fallback (server.py), whose stream has already
-    started. LocalUnavailable on any failure (no answer, an HTTP error, an unreadable or non-message answer); the
+    started. LocalUnavailable on any failure (no answer, an HTTP error, an unreadable or non-message answer, or a
+    message holding no usable answer: at least one non-blank text block or a valid tool call, _answered); the
     node's own error text is never repeated, only its status or the gate's fixed policy reason."""
     out = dict(body)
     out["model"] = model["id"]
@@ -313,13 +314,19 @@ def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any]) 
         conn.close()
     if not isinstance(msg, dict) or msg.get("type") != "message" or not isinstance(msg.get("content"), list):
         raise LocalUnavailable(f"node {node['node']} answered something that is not a message")
+    declared = {t.get("name") for t in body.get("tools") or [] if isinstance(t, dict)}
     blocks = []
     for b in msg["content"]:
         if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
             blocks.append({"type": "text", "text": b["text"]})
-        elif isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id") and b.get("name"):
-            blocks.append({"type": "tool_use", "id": str(b["id"]), "name": str(b["name"]),
-                           "input": b.get("input") if isinstance(b.get("input"), dict) else {}})
+        elif (isinstance(b, dict) and b.get("type") == "tool_use" and isinstance(b.get("id"), str) and b["id"]
+              and isinstance(b.get("name"), str) and b["name"] in declared and isinstance(b.get("input"), dict)):
+            # A valid tool call only: a tool the client declared, with an object input. Anything else is dropped.
+            blocks.append({"type": "tool_use", "id": b["id"], "name": b["name"], "input": b["input"]})
+    if not _answered(blocks):
+        # Thinking only, blank text, an empty content list or only malformed tool calls (e.g. stop "max_tokens"
+        # after thinking): not an answer. The caller keeps what it had (the refusal fallback: the original refusal).
+        raise LocalUnavailable(f"node {node['node']} gave no usable answer (no text or valid tool call)")
     usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
     return blocks, str(msg.get("stop_reason") or "end_turn"), usage
 

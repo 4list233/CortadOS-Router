@@ -320,13 +320,19 @@ class RefusalFallbackEndToEndTests(LocalHarness):
         self.marker = {"targets": [{"node": "pro", "model": TAG}], "conversation_id": "c", "client": "t"}
         self.reg.router = self.router
         self.reg.refusal_route = lambda b, route, run: routing.refusal_route(core, b, route, run)
+        # A refusal-bound conversation's continuations are rescored (ContinuationRecheckBase covers the refusals).
+        self.reg.local_recheck = lambda b, route: routing.continuation_admission(core, b, route)
+        self.scored = []
+        core.decide = fake_decide(self.scored)
         self.executed = []
         self.reg.executed = lambda route: self.executed.append((route["provider"], route["model"]))
         routing._auto_down.clear()
+        routing._admitted.clear()
 
     def tearDown(self):
         core.log_route = self._log_route
         routing._auto_down.clear()
+        routing._admitted.clear()
         super().tearDown()
 
     def router(self, b, client, **kw):
@@ -369,6 +375,7 @@ class RefusalFallbackEndToEndTests(LocalHarness):
                                             "content": "ok"}]}
         self.post({**first, "messages": first["messages"] + [{"role": "assistant", "content": got["content"]}, nxt]})
         self.assertEqual(len(self.posts()), 2)                          # the continuation went to the node too
+        self.assertEqual(self.scored, ["please refuse"])   # rescored first: a tool-result turn scores the latest words
 
     def test_refusal_after_tool_use_is_not_rerun(self):
         first = {**body("refuse after tool"), "tools": [READ_TOOL]}
@@ -461,6 +468,396 @@ class McpLocalOptionTests(unittest.TestCase):
         with self.assertRaises(ct.TaskError) as cm:
             ct.start("a task", chrome=True, local="sensitive")
         self.assertIn("chrome", str(cm.exception))
+
+
+# ------------------------------------------------------------------------------------- review fixes (gpt-6.1-sol)
+SAFE = dict(CLEAN)
+OUTWARD_TEXT = "email the signed invoice to the client and mark it paid"
+
+
+class LocalAdmissionTests(unittest.TestCase):
+    """Finding 3: routing.local_admission, the one shared gate, takes only exact values and fails closed."""
+
+    def admit(self, answers, band="R2", degraded=False):
+        ok, why = routing.local_admission(answers, band, degraded)
+        self.assertIsInstance(why, str)
+        return ok
+
+    def test_admits_exactly_zero_or_one_and_outward_false(self):
+        for br in (0, 1):
+            self.assertTrue(self.admit({**SAFE, "blast_radius": br}))
+
+    def test_malformed_blast_radius_is_refused(self):
+        for br in (-1, False, True, 1.9, 1.0, 0.0, "1", "0", None, 2, 3, [0]):
+            self.assertFalse(self.admit({**SAFE, "blast_radius": br}), repr(br))
+
+    def test_outward_must_be_exactly_false(self):
+        for out in (True, 0, None, "false", "", []):
+            self.assertFalse(self.admit({**SAFE, "outward": out}), repr(out))
+
+    def test_missing_answers_degraded_and_band(self):
+        self.assertFalse(self.admit({"D": 1}))
+        self.assertFalse(self.admit({"blast_radius": 0}))
+        self.assertFalse(self.admit({"outward": False}))
+        self.assertFalse(self.admit(None))
+        self.assertFalse(self.admit("garbled"))
+        for deg in (True, None, 0, "no"):
+            self.assertFalse(self.admit(SAFE, degraded=deg), repr(deg))
+        for band in (None, "", 2):
+            self.assertFalse(self.admit(SAFE, band=band), repr(band))
+
+    def test_route_admission_reads_route_and_decision(self):
+        r = {"band": "R1", "degraded": False, "decision": {"answers": dict(SAFE), "degraded": False}}
+        self.assertTrue(routing.route_admission(r)[0])
+        self.assertFalse(routing.route_admission({**r, "decision": {"answers": dict(SAFE), "degraded": True}})[0])
+        self.assertFalse(routing.route_admission({**r, "decision": {"answers": dict(SAFE)}})[0])   # flag missing
+        self.assertTrue(routing.route_admission({"band": "R1", "decision": {"answers": dict(SAFE), "degraded": False}})[0])
+        self.assertFalse(routing.route_admission(None)[0])
+
+
+class SharedGateTests(SensitiveBase):
+    """Finding 2: auto_local passes the same gate as sensitive_local, so one rejecting no longer lets the other move
+    the request. Both reviewer reproductions, plus the refusal fallback reading the gate again."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ[local_lane.CONFIG_ENV] = write_config(
+            self.dir, "http://127.0.0.1:9", sensitive=True, keywords=f"{SECRET_TERM}\n",
+            auto_route={"model": "qwen-27b", "bands": ["R0", "R1", "R2"]})
+
+    def band(self, b):
+        self.selected["band"] = b
+        self.selected["route"]["band"] = b
+
+    def test_r2_blast_two_flag_and_auto_route_stays_cloud(self):
+        self.band("R2")
+        self.answers(blast_radius=2)
+        with self.assertLogs(routing.logger, level="INFO") as cm:
+            self.assertCloud(self.choose(local="sensitive"))
+        self.assertTrue(any("local auto-route not taken" in rec.getMessage() and "blast_radius 2" in rec.getMessage()
+                            for rec in cm.records))
+        self.assertEqual(self.probes, [])
+
+    def test_r0_missing_outward_with_auto_route_stays_cloud(self):
+        self.band("R0")
+        del self.selected["decision"]["answers"]["outward"]
+        self.assertCloud(self.choose())
+        self.assertCloud(self.choose(local="sensitive"))
+        self.assertEqual(self.probes, [])
+
+    def test_r0_safe_still_auto_routes(self):
+        self.band("R0")
+        r = self.choose(body("hello"))
+        self.assertEqual(r["provider"], "local-pro")
+        self.assertTrue(any("local auto-route" in h for h in self.logged[0][3]["hard_rules"]))
+
+    def test_reviewer_blast_radius_values_are_never_local(self):
+        for band in ("R0", "R3"):
+            for br in (-1, False, 1.9):
+                with self.subTest(band=band, br=br):
+                    self.band(band)
+                    self.answers(blast_radius=br)
+                    for kw in ({"local": "sensitive"}, {}):
+                        self.assertCloud(self.choose(**kw))
+        self.assertEqual(self.probes, [])
+
+    def test_refusal_route_rechecks_the_gate_even_with_a_marker(self):
+        r = self.choose(body("hello"))
+        self.assertIn("refusal_fallback", r)
+        r["decision"]["answers"]["outward"] = True                 # a marker on a route the gate refuses
+        self.assertIsNone(routing.refusal_route(core, body("hello"), r, lambda moved: self.fail("must not run")))
+        r["decision"]["answers"].update(outward=False, blast_radius=1.9)
+        self.assertIsNone(routing.refusal_route(core, body("hello"), r, lambda moved: self.fail("must not run")))
+
+
+def fake_decide(calls, *, outward_words=("email", "invoice", "deploy"), degraded=False, answers=None):
+    """A stand-in for core.decide: outward for a text with one of `outward_words`, else CLEAN; records each text."""
+    def decide(text, ctx=None):
+        calls.append(text)
+        if degraded:
+            return {"answers": None, "degraded": True, "engine": "s1", "error": "scorer down"}
+        if answers is not None:
+            return {"answers": dict(answers), "degraded": False, "engine": "s1", "engine_ms": 1}
+        out = any(w in text.lower() for w in outward_words)
+        return {"answers": {**CLEAN, "outward": out, "blast_radius": 3 if out else 0}, "degraded": False,
+                "engine": "s1", "engine_ms": 1}
+    return decide
+
+
+class ContinuationRecheckBase(LocalHarness):
+    """Finding 1, end to end: a conversation an automatic rule bound to the local lane is rescored on every later turn
+    before anything reaches the node. Fake Claude CLI, in-thread fake Ollama, a stubbed select and a fake core.decide."""
+
+    BAND = "R3"
+    HEADERS_OPEN: dict = {}
+
+    def setUp(self):
+        super().setUp()
+        write_config(self.scratch, f"http://127.0.0.1:{self.ollama.server_port}", sensitive=True, keywords="",
+                     auto_route={"model": "qwen-27b", "bands": ["R0", "R1"]})
+        self._select = routing.execution_routing.select
+        selected = {**R3_ROUTE, "band": self.BAND, "route": {**R3_ROUTE["route"], "band": self.BAND}}
+        routing.execution_routing.select = lambda core_, **kw: json.loads(json.dumps(
+            {**selected, "route_id": "execution:provider:call:" + uuid.uuid4().hex[:8]}))
+        self._log_route = core.log_route
+        core.log_route = lambda *a: True
+        self.reg.local_recheck = lambda b, route: routing.continuation_admission(core, b, route)
+        self.reg.refusal_route = lambda b, route, run: routing.refusal_route(core, b, route, run)
+        self.scored = []
+        core.decide = fake_decide(self.scored)
+        routing._auto_down.clear()
+        routing._admitted.clear()
+
+    def tearDown(self):
+        routing.execution_routing.select = self._select
+        core.log_route = self._log_route
+        routing._auto_down.clear()
+        routing._admitted.clear()
+        super().tearDown()
+
+    def node_posts(self):
+        return [p for p, _ in FakeOllama.seen if p == "/v1/messages"]
+
+    def open(self, text="summarise the notes in this folder", model="cortados", **extra):
+        first = {**body(text), "model": model, "tools": [READ_TOOL], **extra}
+        got = self.post(first, headers=self.HEADERS_OPEN)
+        (s,) = self.reg.sessions.values()
+        self.assertIsInstance(s, server.LocalSession)
+        self.assertEqual(len(self.node_posts()), 1)
+        self.scored.clear()                         # the opening's own scoring is select's (stubbed) business
+        return first, got
+
+    def follow(self, first, got, text, stream=False):
+        uses = [b for b in got["content"] if b["type"] == "tool_use"]
+        content = [{"type": "tool_result", "tool_use_id": uses[0]["id"], "content": "ok"}]
+        if text is not None:
+            content.append({"type": "text", "text": text})
+        return {**first, "stream": stream, "messages": first["messages"] + [
+            {"role": "assistant", "content": got["content"]}, {"role": "user", "content": content}]}
+
+    def refused(self, req):
+        req_ = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(req).encode(), method="POST",
+                                      headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}"})
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req_, timeout=30)
+        e = cm.exception
+        self.assertEqual(e.code, 400)
+        self.assertEqual(e.headers.get("x-should-retry"), "false")
+        err = json.loads(e.read())["error"]
+        self.assertEqual(err["type"], "invalid_request_error")
+        self.assertIn("bound to a local model", err["message"])
+        self.assertIn("needs a cloud model", err["message"])
+        return err["message"]
+
+    def assertRefusedOutward(self, stream):
+        first, got = self.open()
+        with self.assertLogs(server.logger, level="INFO") as cm:
+            msg = self.refused(self.follow(first, got, OUTWARD_TEXT, stream=stream))
+        self.assertEqual(len(self.node_posts()), 1)          # the turn never reached the node
+        self.assertEqual(self.scored, [OUTWARD_TEXT])
+        said = "\n".join(rec.getMessage() for rec in cm.records)
+        self.assertIn("local continuation refused", said)
+        for leak in ("invoice", "email", "paid"):            # metadata only, in the log and the message
+            self.assertNotIn(leak, said.lower())
+            self.assertNotIn(leak, msg.lower())
+
+
+class FlagBoundContinuationTests(ContinuationRecheckBase):
+    HEADERS_OPEN = {"x-cortados-local": "sensitive"}
+
+    def test_outward_continuation_is_refused_json(self):
+        self.assertRefusedOutward(stream=False)
+
+    def test_outward_continuation_is_refused_streaming(self):
+        self.assertRefusedOutward(stream=True)
+
+    def test_safe_continuation_is_rescored_and_reaches_the_node(self):
+        first, got = self.open()
+        got2 = self.post(self.follow(first, got, "now list the headings"))
+        self.assertEqual(got2["content"][0]["type"], "tool_use")
+        self.assertEqual(len(self.node_posts()), 2)
+        self.assertEqual(self.scored, ["now list the headings"])   # this turn's own words, not the opening's
+
+    def test_safe_continuation_is_rescored_streaming(self):
+        first, got = self.open()
+        raw = self.post(self.follow(first, got, "now list the headings", stream=True))
+        self.assertIn("tool_use", raw)
+        self.assertEqual(self.scored, ["now list the headings"])
+
+    def test_tool_result_turns_reuse_an_admission_and_bound_latency(self):
+        first, got = self.open()
+        req = self.follow(first, got, "now list the headings")
+        got2 = self.post(req)
+        nxt = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": got2["content"][0]["id"],
+                                            "content": "ok"}]}
+        self.post({**req, "messages": req["messages"] + [{"role": "assistant", "content": got2["content"]}, nxt]})
+        self.assertEqual(len(self.node_posts()), 3)
+        self.assertEqual(self.scored, ["now list the headings"])  # scored once; the tool-result turn reused it
+
+    def test_refused_continuation_leaves_the_session_usable(self):
+        first, got = self.open()
+        self.refused(self.follow(first, got, OUTWARD_TEXT))
+        (s,) = self.reg.sessions.values()
+        self.assertIsInstance(s, server.LocalSession)
+        got2 = self.post(self.follow(first, got, "then just count the files"))   # same history, a safe turn
+        self.assertEqual(got2["content"][0]["type"], "tool_use")
+        self.assertEqual(len(self.node_posts()), 2)
+        self.assertIs(next(iter(self.reg.sessions.values())), s)
+
+    def test_degraded_or_garbled_scorer_fails_closed(self):
+        for decide in (fake_decide(self.scored, degraded=True),
+                       fake_decide(self.scored, answers={"D": 1}),
+                       fake_decide(self.scored, answers={**CLEAN, "blast_radius": 2}),
+                       fake_decide(self.scored, answers={**CLEAN, "blast_radius": -1}),
+                       fake_decide(self.scored, answers={**CLEAN, "outward": None})):
+            routing._admitted.clear()
+            FakeOllama.seen = []
+            for s in list(self.reg.sessions.values()):
+                self.reg.drop(s)
+            core.decide = fake_decide(self.scored)
+            first, got = self.open()
+            core.decide = decide
+            self.refused(self.follow(first, got, "now list the headings"))
+            self.assertEqual(len(self.node_posts()), 1)
+
+    def test_scorer_exception_fails_closed(self):
+        first, got = self.open()
+
+        def boom(text, ctx=None):
+            raise RuntimeError("down")
+        core.decide = boom
+        self.refused(self.follow(first, got, "now list the headings"))
+
+    def test_turn_without_any_user_text_fails_closed(self):
+        req = {"model": "cortados", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "<system-reminder>x</system-reminder>"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}]}
+        self.assertEqual(routing.continuation_admission(core, req, {"band": "R3", "route_id": "r"}),
+                         (False, "no user text to score on this turn"))
+        self.assertEqual(self.scored, [])
+        req["messages"][0]["content"].append({"type": "text", "text": "list them"})   # earlier words are used
+        self.assertTrue(routing.continuation_admission(core, req, {"band": "R3", "route_id": "r"})[0])
+        self.assertEqual(self.scored, ["list them"])
+
+    def test_no_checker_configured_fails_closed(self):
+        first, got = self.open()
+        self.reg.local_recheck = None
+        self.refused(self.follow(first, got, "now list the headings"))
+        self.assertEqual(len(self.node_posts()), 1)
+
+
+class KeywordBoundContinuationTests(ContinuationRecheckBase):
+    def setUp(self):
+        super().setUp()
+        write_config(self.scratch, f"http://127.0.0.1:{self.ollama.server_port}", sensitive=True,
+                     keywords=f"{SECRET_TERM}\n")
+
+    def test_outward_continuation_is_refused(self):
+        first, got = self.open(text=f"explain the {SECRET_TERM}")
+        self.refused(self.follow(first, got, OUTWARD_TEXT))
+        self.assertEqual(len(self.node_posts()), 1)
+
+
+class AutoRouteBoundContinuationTests(ContinuationRecheckBase):
+    """The R0 auto_route bind (main's own case) is covered by the same continuation re-check."""
+    BAND = "R0"
+
+    def test_outward_continuation_is_refused_json(self):
+        self.assertRefusedOutward(stream=False)
+
+    def test_outward_continuation_is_refused_streaming(self):
+        self.assertRefusedOutward(stream=True)
+
+    def test_safe_continuation_continues(self):
+        first, got = self.open()
+        self.post(self.follow(first, got, "and the next file"))
+        self.assertEqual(len(self.node_posts()), 2)
+        self.assertEqual(self.scored, ["and the next file"])
+
+
+class RefusalBoundContinuationTests(ContinuationRecheckBase):
+    def test_outward_continuation_after_a_refusal_bind_is_refused(self):
+        first, got = self.open(text="please refuse")
+        self.refused(self.follow(first, got, OUTWARD_TEXT))
+        self.assertEqual(len(self.node_posts()), 1)
+
+    def test_outward_continuation_after_a_refusal_bind_is_refused_streaming(self):
+        first, got = self.open(text="please refuse")
+        self.refused(self.follow(first, got, OUTWARD_TEXT, stream=True))
+
+
+class ExplicitPinNotRescoredTests(ContinuationRecheckBase):
+    def test_local_pin_continuation_is_not_rescored(self):
+        def no_s1(text, ctx=None):
+            raise AssertionError("an explicit local pin must not be rescored")
+        core.decide = no_s1
+        for model in ("sub/qwen-27b", f"sub/{TAG}"):
+            for s in list(self.reg.sessions.values()):
+                self.reg.drop(s)
+            FakeOllama.seen = []
+            first, got = self.open(model=model)
+            self.post(self.follow(first, got, OUTWARD_TEXT))
+            self.assertEqual(len(self.node_posts()), 2)          # the client's choice: relayed
+
+
+class RefusalFallbackUsableAnswerTests(LocalHarness):
+    """Finding 4: a local fallback answer with no text or valid tool call is not an answer; the original refusal
+    goes to the client and nothing is bound locally or recorded."""
+
+    def setUp(self):
+        super().setUp()
+        write_config(self.scratch, f"http://127.0.0.1:{self.ollama.server_port}", sensitive=True, keywords="")
+        self.route_log = []
+        self._log_route = core.log_route
+        core.log_route = lambda turn_id, meta, decision, r: self.route_log.append((turn_id, r)) or True
+        marker = {"targets": [{"node": "pro", "model": TAG}], "conversation_id": "c", "client": "t"}
+        self.reg.router = lambda b, client, **kw: json.loads(json.dumps(
+            {**R3_ROUTE, "provider": "claude-cli", "model": "claude-test", "refusal_fallback": marker,
+             "route_id": "execution:provider:call:" + uuid.uuid4().hex[:8]}))
+        self.reg.refusal_route = lambda b, route, run: routing.refusal_route(core, b, route, run)
+        self.executed = []
+        self.reg.executed = lambda route: self.executed.append((route["provider"], route["model"]))
+        routing._auto_down.clear()
+
+    def tearDown(self):
+        core.log_route = self._log_route
+        routing._auto_down.clear()
+        super().tearDown()
+
+    def check(self, reply, stream=False, tools=False):
+        FakeOllama.reply = reply
+        req = {**body("please refuse", stream=stream), **({"tools": [READ_TOOL]} if tools else {})}
+        got = self.post(req)
+        if stream:
+            self.assertIn("refusal", got)
+            self.assertNotIn("hello from qwen", got)
+        else:
+            self.assertEqual(got["stop_reason"], "refusal")
+        self.assertEqual(self.route_log, [])
+        self.assertNotIn(("local-pro", TAG), self.executed)
+        self.assertFalse(any(isinstance(s, server.LocalSession) for s in self.reg.sessions.values()))
+
+    def test_thinking_only_max_tokens_keeps_the_refusal(self):
+        self.check(([{"type": "thinking", "thinking": "The user asks"}], "max_tokens"))
+
+    def test_empty_content_keeps_the_refusal_json_and_streaming(self):
+        self.check(([], "max_tokens"))
+        self.check(([], "max_tokens"), stream=True)
+
+    def test_blank_text_or_invalid_tool_calls_keep_the_refusal(self):
+        self.check(([{"type": "text", "text": "   "}], "end_turn"))
+        self.check(([{"type": "tool_use", "id": "t1", "name": "NotDeclared", "input": {}}], "tool_use"), tools=True)
+        self.check(([{"type": "tool_use", "id": "t1", "name": READ_TOOL["name"], "input": "x"}], "tool_use"), tools=True)
+        self.check(([{"type": "tool_use", "id": "", "name": READ_TOOL["name"], "input": {}}], "tool_use"), tools=True)
+
+    def test_usable_text_or_valid_tool_call_is_still_taken(self):
+        FakeOllama.reply = ([{"type": "thinking", "thinking": "x"}, {"type": "text", "text": "ok"}], "end_turn")
+        got = self.post(body("please refuse"))
+        self.assertEqual(got["content"], [{"type": "text", "text": "ok"}])
+        FakeOllama.reply = ([{"type": "tool_use", "id": "t1", "name": READ_TOOL["name"], "input": {"p": 1}}], "tool_use")
+        got = self.post({**body("please refuse"), "tools": [READ_TOOL]})
+        self.assertEqual(got["content"][0]["type"], "tool_use")
 
 
 if __name__ == "__main__":

@@ -10,16 +10,21 @@ Owner of two rules:
                     lane survives (binary missing, capacity spent) the request is refused.
   local pins        `sub/<local model or alias>` names a model a local Ollama node offers (local_lane.py). Local lanes
                     are never in SERVED_PROVIDERS: S1 and core.resolve never see one.
+  local admission   local_admission is THE one gate every automatic move to a local lane passes (auto_local,
+                    sensitive_local, refusal_route, the continuation re-check server.py runs on every later turn of a
+                    conversation an automatic rule bound to a local lane): S1 not degraded, a band, `outward` exactly
+                    False and `blast_radius` exactly the int 0 or 1. A missing or garbled answer is not admitted.
   local auto-route  after S1 has chosen a route (not degraded), auto_local may hand the conversation to a node's
-                    auto_route model instead, only when S1's band is one the node's config lists, the node answers its
-                    probe (on the Pro: AC power + manual switch + gate up) and lists the model, the request fits the
-                    model's context, the client did not exclude it, and the request is on /v1/messages. Otherwise S1's
+                    auto_route model instead, only when local_admission admits it, S1's band is one the node's config
+                    lists, the node answers its probe (on the Pro: AC power + manual switch + gate up) and lists the
+                    model, the request fits the model's context, the client did not exclude it, and the request is on
+                    /v1/messages. Otherwise S1's
                     route stands unchanged: a local node is an extra, never a fallback (#75).
   sensitive         after S1 has chosen a route, sensitive_local may move a request marked sensitive (the
                     x-cortados-local header, the node's keyword list; a planned S1 signal plugs in at S1_SENSITIVE_ANSWER)
                     to the node's `sensitive.model` in ANY band, but only when S1 says it has no effect outside this
-                    machine (no_outward_effect: outward false, blast_radius <= LOCAL_BLAST_MAX, not degraded) and the
-                    local guards pass. refusal_route does the same for an opening turn a cloud model refused (server.py).
+                    machine (local_admission) and the local guards pass. refusal_route does the same for an opening
+                    turn a cloud model refused (server.py).
                     core.resolve's outward floor is untouched: an outward request never reaches a local model.
   sub/ pin          a client that names `sub/<model>` (any model the tables serve on claude-cli or codex-cli) chose the
                     model itself: S1 and the band are skipped, but the served-model, account, capacity, fit and
@@ -27,8 +32,11 @@ Owner of two rules:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import threading
+from collections import OrderedDict
 import shutil
 import logging
 import time
@@ -784,11 +792,133 @@ def _log_moved(core, body: dict[str, Any], moved: dict[str, Any], *, client: str
                    moved["route"])
 
 
+# ----------------------------------------------------------------------------------------------- local admission
+# The S1 blast_radius levels that mean "no effect outside this machine" (core.ANCHORS["blast_radius"]): 0 "words only,
+# nothing changes" and 1 "a bounded reversible workspace change". 2 ("a broad or difficult-to-reverse system change")
+# is not bounded to the workspace and 3 is "law, money, production, or irreversible effects nearby", where core.resolve
+# floors every outward request. Owner rule (Forest, 2026-11-13): the Pro's local models may take any band, sensitive
+# and red-team work included, but only with no effect outside the Pro; the outward floor itself is core.resolve's.
+LOCAL_BLAST_OK = (0, 1)
+
+
+def local_admission(answers: Any, band: Any, degraded: Any) -> tuple[bool, str]:
+    """THE gate for every AUTOMATIC move of a request to a local lane: (admitted, reason). The reason is metadata only
+    (never request text), suitable for logs and the routes row.
+
+    Callers: auto_local (a node's auto_route bands), sensitive_local (flag, prefer, keyword, the planned S1 signal),
+    refusal_route (a refused opening turn), continuation_admission (every later turn of a conversation an automatic
+    rule bound to a local lane; server.py) and, to come, branch local-published-index's _move_to_local (index-based
+    local candidates). An explicit local pin (`sub/<local model or alias>`) is the client's choice and does not pass
+    here. What the gate does not cover is per node and stays with the caller: the node's band list (auto_local), the
+    wire (NO_LOCAL_KEY), and _node_why (exclusion, availability, the model listed, the context fit).
+
+    Admitted only when ALL hold, and fails closed on anything else:
+      degraded   exactly False (a degraded scorer is never local; None or a non-bool is not "not degraded")
+      band       a non-empty string (a decision without a band is not a routed decision)
+      answers    a dict holding `outward` exactly False (not 0, None or a string) and `blast_radius` exactly an int
+                 (not a bool) in LOCAL_BLAST_OK. -1, 1.9, "1", True/False and a missing key are malformed: refused.
+    `answers` are S1's raw answers (decision["answers"], after decide_s1's fail-up), not core.resolve's floored view."""
+    if degraded is not False:
+        return False, "S1 is degraded (a degraded scorer never routes local)" if degraded is True else \
+            "S1's degraded flag is missing or malformed"
+    if not isinstance(band, str) or not band:
+        return False, "no band (S1 did not route this request)"
+    if not isinstance(answers, dict):
+        return False, "S1 gave no answers"
+    if "outward" not in answers or "blast_radius" not in answers:
+        return False, "S1 gave no outward / blast_radius answer"
+    outward, br = answers["outward"], answers["blast_radius"]
+    if outward is True:
+        return False, "outward effect (S1 outward=true): never local"
+    if outward is not False:
+        return False, "S1's outward answer is malformed"
+    if type(br) is not int:                          # bool is an int subclass: excluded by the exact type check
+        return False, "S1's blast_radius answer is malformed"
+    if br not in LOCAL_BLAST_OK:
+        if br > max(LOCAL_BLAST_OK):
+            return False, f"blast_radius {br} > {max(LOCAL_BLAST_OK)} (an effect outside the workspace)"
+        return False, "S1's blast_radius answer is malformed"
+    return True, f"no outward effect (blast_radius {br}, band {band})"
+
+
+def route_admission(r: dict[str, Any] | None) -> tuple[bool, str]:
+    """local_admission for a route or decision as routing builds them (execution_routing.select's result, a _moved
+    route): S1's answers from r["decision"], the band from r["band"], degraded when either r or its decision says so.
+    The decision's own flag must be present (exactly False); a route without a top-level flag defers to it."""
+    r = r if isinstance(r, dict) else {}
+    decision = r.get("decision") if isinstance(r.get("decision"), dict) else {}
+    flags = [r.get("degraded", False), decision.get("degraded")]
+    degraded = True if any(f is True for f in flags) else False if all(f is False for f in flags) else None
+    return local_admission(decision.get("answers"), r.get("band"), degraded)
+
+
+def continuation_text(body: dict[str, Any]) -> str:
+    """What S1 scores for a continuation of a locally bound conversation: the latest user turn's own words (text
+    blocks, client reminders removed), or, on a tool-result turn that has none, the latest earlier user words. The
+    opening request is not rescored as such: it was admitted when the conversation was bound, and scoring it again
+    would hide a new instruction ("now email the invoice") behind the old one."""
+    for m in reversed(body.get("messages") or []):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        text = "\n".join(b.get("text", "") for b in wire._blocks(m.get("content"))
+                         if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
+        text = strip_injected(text).strip()
+        if text:
+            return text
+    return ""
+
+
+# Bounds the re-check's added S1 latency in a tool loop: a turn whose scored text (continuation_text) is the same as
+# one this conversation had admitted within CONTINUATION_CACHE_S reuses that admission (the same window
+# execution_routing.select caches a score for). Only admissions are cached; a refusal is rescored every time.
+CONTINUATION_CACHE_S = 180.0
+_admitted: "OrderedDict[tuple[str, str], tuple[float, str]]" = OrderedDict()
+_admitted_lock = threading.Lock()
+
+
+def continuation_admission(core, body: dict[str, Any], route: dict[str, Any] | None) -> tuple[bool, str]:
+    """A continuation of a conversation an AUTOMATIC rule bound to a local lane (auto_local, sensitive_local,
+    refusal_route): S1 scores this turn (continuation_text) through core.decide, the same scorer call and the same
+    bounded timeout and retry as the opening's routing call (core.S1_TIMEOUT_S, S1_RETRIES), and local_admission
+    judges the answers under the band the conversation was bound with. (admitted, metadata reason). Fails closed: no
+    text to score, a degraded or failed scorer, or any exception is not admitted. server.Handler runs it before every
+    local dispatch of such a conversation; an explicit local pin (route["pinned"]) is never rescored.
+
+    Not admitted, the turn is refused and the conversation stays bound (server.py). Moving the conversation to a cloud
+    lane instead is #43's re-route seam (server.Handler._local_continuation_refused), not built here."""
+    route = route if isinstance(route, dict) else {}
+    text = continuation_text(body)
+    if not text:
+        return False, "no user text to score on this turn"
+    key = (str(route.get("route_id") or ""), hashlib.sha256(text.encode()).hexdigest())
+    with _admitted_lock:
+        hit = _admitted.get(key) if key[0] else None
+        if hit and _now() - hit[0] < CONTINUATION_CACHE_S:
+            return True, hit[1] + " (admitted earlier in this conversation)"
+    try:
+        decision = core.decide(text, {"platform": PLATFORM, "unit_kind": "interactive"})
+    except Exception as exc:                         # the scorer call failed: the same as a degraded scorer
+        return False, f"S1 scoring failed ({type(exc).__name__})"
+    if not isinstance(decision, dict):
+        return False, "S1 gave no decision"
+    deg = decision.get("degraded")
+    ok, why = local_admission(decision.get("answers"), route.get("band"),
+                              True if deg is True else False if deg is False else None)
+    if ok and key[0]:
+        with _admitted_lock:
+            _admitted[key] = (_now(), why)
+            _admitted.move_to_end(key)
+            while len(_admitted) > 256:
+                _admitted.popitem(last=False)
+    return ok, why
+
+
 def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, conversation_id: str,
                excluded: Callable[[str], bool] = lambda name: False) -> dict[str, Any]:
     """S1's route `r`, or the same decision moved to a local node's auto_route model (local_lane.auto_routes) when every
-    condition holds: S1 was not degraded (a degraded decision has no band of its own; it keeps core's no-Claude rule
-    and its route), the band is one the node lists, the request is on a wire the relay serves (no NO_LOCAL_KEY), and
+    condition holds: local_admission admits S1's decision (not degraded, a band, no outward effect: outward exactly
+    False, blast_radius exactly 0 or 1; a degraded decision keeps core's no-Claude rule and its route), the band is
+    one the node lists, the request is on a wire the relay serves (no NO_LOCAL_KEY), and
     the local guards pass (_node_why: not excluded, node available and listing the model, request fits). The first
     node in config order that passes wins. A skip leaves `r` exactly as it was, with the reason logged; a broken local
     config skips too (logged as a warning), so a config error never blocks S1 routing. When moved, the routes row S1's
@@ -800,6 +930,12 @@ def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, co
         targets = local_lane.auto_routes()
     except local_lane.LocalConfigError as exc:
         logger.warning("local auto-route skipped: local config error on node %s: %s", exc.node, exc)
+        return r
+    if not targets:
+        return r
+    ok, why = route_admission(r)
+    if not ok:
+        logger.info("local auto-route not taken for %s: %s", r["route_id"], why)
         return r
     band = r["band"]
     need: list = []
@@ -826,37 +962,10 @@ def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, co
 #   prefer     "local if eligible": the same eligibility and model, recorded as a preference rather than a sensitivity
 LOCAL_HEADER = "x-cortados-local"
 LOCAL_MODES = ("sensitive", "prefer")
-# The S1 blast_radius levels that mean "no effect outside this machine" (core.ANCHORS["blast_radius"]): 0 "words only,
-# nothing changes" and 1 "a bounded reversible workspace change". 2 ("a broad or difficult-to-reverse system change")
-# is not bounded to the workspace and 3 is "law, money, production, or irreversible effects nearby", where core.resolve
-# floors every outward request. Owner rule (2026-11-13): a sensitive request may go local in any band, but only with no
-# effect outside the machine; the outward floor itself is core.resolve's and is not touched here.
-LOCAL_BLAST_MAX = 1
 # HOOK for the planned S1 "sensitive" signal (not built): the name of the S1 answer that marks a request sensitive.
 # None = not wired. When S1 learns the question, set this to its answers key; sensitive_trigger then reports rule "s1"
 # for a request S1 marks, and every eligibility rule below applies to it unchanged.
 S1_SENSITIVE_ANSWER: str | None = None
-
-
-def no_outward_effect(r: dict[str, Any]) -> str | None:
-    """None when S1's decision says the request has no effect outside this machine: not degraded, `outward` answered
-    false, and `blast_radius` answered at most LOCAL_BLAST_MAX (the raw answers, before core.resolve's outward floor).
-    Otherwise why not. Fails closed: a decision without those answers is not eligible."""
-    decision = r.get("decision") or {}
-    if r.get("degraded") or decision.get("degraded"):
-        return "S1 is degraded (a degraded scorer never routes local)"
-    ans = decision.get("answers") or {}
-    if "outward" not in ans or "blast_radius" not in ans:
-        return "S1 gave no outward / blast_radius answer"
-    if ans.get("outward") is not False:
-        return "outward effect (S1 outward=true): never local"
-    try:
-        br = int(ans["blast_radius"])
-    except (TypeError, ValueError):
-        return "S1's blast_radius answer is unreadable"
-    if br > LOCAL_BLAST_MAX:
-        return f"blast_radius {br} > {LOCAL_BLAST_MAX} (an effect outside the workspace)"
-    return None
 
 
 def latest_user_text(body: dict[str, Any]) -> str:
@@ -899,6 +1008,12 @@ def sensitive_trigger(body: dict[str, Any], r: dict[str, Any], section: dict[str
     return None
 
 
+def _not_admitted(r: dict[str, Any]) -> str | None:
+    """route_admission as sensitive_local reads it: None when admitted, else why not."""
+    ok, why = route_admission(r)
+    return None if ok else why
+
+
 def _rule_label(rule: str) -> str:
     return "local: prefer" if rule == "prefer" else f"sensitive: {rule}"
 
@@ -907,7 +1022,7 @@ def sensitive_local(core, body: dict[str, Any], r: dict[str, Any], *, client: st
                     excluded: Callable[[str], bool] = lambda name: False, local: str | None = None) -> dict[str, Any]:
     """S1's route `r`, or the same decision moved to a node's `sensitive.model` when a trigger marks the request
     (sensitive_trigger: flag, prefer, keyword) and it is eligible: on a wire the relay serves (no NO_LOCAL_KEY), with no
-    effect outside this machine (no_outward_effect; this also refuses a degraded scorer), and through the same local
+    effect outside this machine (local_admission; this also refuses a degraded scorer), and through the same local
     guards as auto_local (_node_why). Any band. The first node in config order that passes wins; the routes row is
     rewritten as auto_local does, with a `sensitive: <rule>` hard-rules entry. Every skip is logged as the rule and a
     metadata reason only, never the request text or the matched term.
@@ -929,7 +1044,7 @@ def sensitive_local(core, body: dict[str, Any], r: dict[str, Any], *, client: st
                 "flag" if local == "sensitive" else local), rid)
         return r
     static = "the request came in on /v1/responses (the local relay speaks Messages only)" \
-        if body.get(NO_LOCAL_KEY) else no_outward_effect(r)
+        if body.get(NO_LOCAL_KEY) else _not_admitted(r)
     text = latest_user_text(body)
     need: list = []
     for node, entry, section in targets:
@@ -961,7 +1076,8 @@ def refusal_route(core, body: dict[str, Any], route: dict[str, Any] | None,
     """The opening turn of an S1-routed conversation was refused by its cloud model (server.py checks that it was the
     opening turn, on /v1/messages, with no tool run). Returns the route moved to a node's `sensitive.model`, or None.
     Eligibility was settled when the route was chosen (sensitive_local's `refusal_fallback` marker: no outward effect,
-    not degraded, the client's exclusions); here the node's live state is checked again (_node_why) and `run(moved)`
+    not degraded, the client's exclusions) and local_admission is applied again to the route's own decision; here the
+    node's live state is checked again (_node_why) and `run(moved)`
     must produce the local answer (True) before the routes row is rewritten, so a failed fallback leaves S1's record
     as it was. Logs the rule (`sensitive: refusal`) and metadata reasons only."""
     marker = (route or {}).get("refusal_fallback")
@@ -974,6 +1090,10 @@ def refusal_route(core, body: dict[str, Any], route: dict[str, Any] | None,
         targets = local_lane.sensitive_routes()
     except local_lane.LocalConfigError as exc:
         logger.warning("sensitive: refusal not taken for %s: local config error on node %s: %s", rid, exc.node, exc)
+        return None
+    ok, why = route_admission(route)                 # the shared gate again: the marker alone is not admission
+    if not ok:
+        logger.info("sensitive: refusal not taken for %s: %s", rid, why)
         return None
     wanted = {(t.get("node"), t.get("model")) for t in marker.get("targets") or []}
     need: list = []
