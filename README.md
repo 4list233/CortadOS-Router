@@ -465,7 +465,9 @@ in the same code on the node (`local_resources.set_local_switch`, the CLI's own)
 Under the hood: the provider's `GET /v1/cortados/local` and `POST /v1/cortados/local/switch` `{"node": "pro", "on":
 true|false}` (`provider/local_switch.py`; owner token only, through the same check as the other `/v1/cortados/*`
 views; a scoped client token gets 403) ask the node's gate at `GET`/`POST /cortados/local-switch` with the node's gate
-token (6 s bound). The gate answers that endpoint even while the switch is off or the Pro is on battery; inference keeps
+token (6 s bound end to end: connect, headers and body share one deadline, so a trickling gate cannot stretch it).
+The switch POST's body must carry a content-length (411 without, 400 if not a byte count), is at most 1 KiB (413,
+refused unread) and must arrive within 5 s (408). The gate answers that endpoint even while the switch is off or the Pro is on battery; inference keeps
 its refusal. Only checked fields come back (switch, allowed, reason, power, training, loaded model names), never the
 node's address or token. An asleep node is a 503 "unreachable", an unknown node a 404, a node with no gate configured
 a 409, a gate from before this endpoint a 502 saying to restart it.
@@ -966,6 +968,28 @@ host's hardware is the fresher of its `hardware/<host>.json` sample and its fres
 `source: "sample"` / `"heartbeat"`); nothing writes the sample file on its own, so in practice the heartbeat sender below
 is what fills the cards. The answer is memoised for 2 s with a single flight (any number of tabs and panes cost one collect; a heartbeat
 post refreshes it), and the dashboard and the pane never start a poll while the previous one is still out.
+
+**Which main session started which task.** Every `start_task` records its origin: the `cortados-route` MCP server
+derives the calling session's Office tag from `CLAUDE_CODE_SESSION_ID` (which Claude Code sets for the MCP servers a
+session launches) and the machine's shared salt `~/.config/cortados/office-salt` (32 hex, 0600, created by the server at
+its start; `CORTADOS_OFFICE_SALT_FILE` overrides): sha256(`<salt>:<session id>`) cut to 16 hex, the same tag
+`cortados-routed-subagents` puts on the session's Office floor and `cortados-pulse` computes for its pane. With the
+session's folder name and the machine's short hostname it is stored as `meta.json`'s `origin` and as
+`origin_session` / `origin_project` / `origin_device` on the task's started and finished events (and in `list_tasks`);
+a remote host records what the requesting machine sent. Bot-gateway tasks have `origin_session: "grokbot"`. No salt
+file or no session id: `origin_session` is absent, never guessed; the raw session id is never stored. The salt is
+written whole to a temp file and published with a hard link, so it is never seen empty and a racing creator's value
+wins; a failed write leaves no file and the server still starts (no origins until a later start makes it). In the live view
+each task carries the three fields, `tasks.origins` groups every task in the window by origin (`session` null is the
+unattributed group: tasks from before this, or a server that knows no tag) with running / queued / finished counts and
+up to 20 task ids, and each `orchestrator` conversation item gets `tasks` (the same counts and ids for its session;
+null when the task log could not be read). `GET /v1/cortados/live?session=<tag>` narrows tasks, origins and
+conversations to one session (`session_filter` names it; its task lists are filtered before the running / recent caps,
+so a busy fleet cannot push a session's tasks out of its own view; counts and the other sections stay fleet-wide; a
+malformed tag is 400; the provider memoises up to 16 such views side by side, `live.MEMO_KEYS`). The dashboard's Tasks panel groups running and finished tasks under their session (project, device, short
+tag and whether its main loop is live), Grok Bot and an "Unattributed" group; each session's pulse pane shows its own
+tasks first. One limit: the MCP server reads the session id once, at its start, so tasks started after `/clear` in the
+same process keep the session it was started for.
 
 A host whose jobs the provider cannot see (the Mac Studio's S1 scorer and continuous training) reports them with
 `POST /v1/cortados/live/heartbeat` (owner token, or a write-only `live:heartbeat` client token bound to ONE host: the

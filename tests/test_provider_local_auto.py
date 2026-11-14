@@ -369,6 +369,57 @@ class AutoLocalEndToEndTests(LocalHarness):
         self.assertNotIn("auto-routed", msg)
 
 
+class AutoLocalThinkingTests(AutoLocalEndToEndTests):
+    """#108 on the auto-routed path: R0 reflex requests with small max_tokens reach a thinking model. The node is asked
+    not to think; if it still spends the whole budget thinking, the client gets an error naming the cause, not an
+    empty answer, and no conversation is kept."""
+
+    SMALL = {**body("What is 6*7?"), "max_tokens": 20}
+
+    def setUp(self):
+        super().setUp()
+        FakeOllama.thinker = "ollama"
+
+    def test_small_max_tokens_is_answered_with_thinking_off(self):
+        got = self.post(self.SMALL)
+        self.assertEqual(FakeOllama.seen[-1][1]["thinking"], {"type": "disabled"})
+        self.assertEqual((got["stop_reason"], got["content"]), ("end_turn", [{"type": "text", "text": "42"}]))
+
+    def test_a_thinking_only_reply_is_an_error_not_an_empty_answer(self):
+        FakeOllama.thinker = "ignores-disabled"
+        code, msg = self.error_of(self.SMALL)
+        self.assertEqual(code, 502)
+        self.assertIn(f"auto-routed by S1 to {TAG} on pro, which used the whole max_tokens (20) without writing an "
+                      "answer (thinking only)", msg)
+        self.assertIn("x-cortados-exclude-model: qwen-27b", msg)
+        self.assertNotIn("The user asks", msg)                       # never the model's text
+        self.assertEqual(self.reg.sessions, {})
+
+    def test_a_streamed_thinking_only_reply_ends_in_an_error_event(self):
+        FakeOllama.thinker = "ignores-disabled"
+        raw = self.post({**self.SMALL, "stream": True})
+        events = [json.loads(l[5:]) for l in raw.splitlines() if l.startswith("data:")]
+        self.assertEqual(events[0]["type"], "message_start")
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertIn("without writing an answer (thinking only)", events[-1]["error"]["message"])
+        self.assertNotIn("message_stop", [e["type"] for e in events])
+        self.assertNotIn("message_delta", [e["type"] for e in events])
+        self.assertIn("event: error\n", raw)
+
+    def test_client_thinking_is_passed_through_and_its_reply_relayed(self):
+        asked = {"type": "enabled", "budget_tokens": 1024}
+        got = self.post({**self.SMALL, "thinking": asked})
+        self.assertEqual(FakeOllama.seen[-1][1]["thinking"], asked)
+        self.assertEqual((got["stop_reason"], [b["type"] for b in got["content"]]), ("max_tokens", ["thinking"]))
+
+    def test_what_counts_as_an_answer(self):
+        keep = local_lane._answered
+        self.assertTrue(keep([{"type": "thinking", "thinking": "x"}, {"type": "text", "text": "4"}]))
+        self.assertTrue(keep([{"type": "tool_use", "id": "t", "name": "Read", "input": {}}]))
+        self.assertFalse(keep([{"type": "thinking", "thinking": "x"}, {"type": "text", "text": "  "}]))
+        self.assertFalse(keep([]))
+
+
 class FakeHandler:
     def __init__(self):
         import io

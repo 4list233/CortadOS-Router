@@ -1,7 +1,7 @@
 import { test, expect } from 'claude-code/testing'
 import { FALLBACK, POLL_MS, LIVE_POLL_MS, STALE_AFTER_S, expandHome, resolveProviderUrl, resolveToken, scrub, readConfig, poll,
   pollLive, age, pct, gib, dur, leftPct, laneLabel, laneLines, usageLines, deviceLines, laneOrder, taskLine, conversationLine,
-  runningLines, fleetLines, hwText } from './register'
+  runningLines, fleetLines, hwText, identify, sessionLines, sessionTag, OFFICE_SALT_FILE, MINE_RECENT_MAX, CLEAR_NOTE } from './register'
 import liveFixture from './live.fixture'
 
 const TOKEN = 'sekrit-token-123'
@@ -381,4 +381,125 @@ test('an unreadable section is said, never drawn as nothing running', () => {
   expect(fleetLines({ overview: { s1: 'down' }, s1: { reason: 'URLError' }, hosts: { items: [{ name: 'studio',
     heartbeat_state: 'stale', heartbeat: { age_s: 1800, jobs: [] } }] } } as any))
     .toEqual(['S1 DOWN · URLError', 'studio: STALE heartbeat 30 min old · no jobs'])
+})
+
+const SALT = '0123456789abcdef0123456789abcdef'
+const SID = '792b087a-1983-4baf-b701-77792e4b77e4'
+
+test('this session is named by the shared salt and its id, the way the mod and the MCP server name it', async () => {
+  expect(OFFICE_SALT_FILE).toBe('~/.config/cortados/office-salt')
+  const $ = { ...fakeDollar({ env: { HOME: '/tmp/home' }, files: { '/tmp/home/.config/cortados/office-salt': SALT + '\n' } }),
+    session: { id: async () => SID } }
+  const me = await identify($ as any)
+  // the value tests/test_child_tasks.py pins for subagent_mcp.origin_tag(SALT, SID)
+  expect(me).toEqual({ tag: await sessionTag(SALT, SID), why: null })
+  expect(me.tag).toBe('ea4383005613c21c')        // the cross-language vector (tests/test_child_tasks.py HASH_VECTOR)
+  expect(/^[0-9a-f]{16}$/.test(me.tag!)).toBe(true)
+  expect(JSON.stringify(me).includes(SID)).toBe(false)
+  const none = { ...fakeDollar({ env: { HOME: '/tmp/home' } }), session: { id: async () => SID } }
+  expect((await identify(none as any)).tag).toBe(null)
+  expect((await identify(none as any)).why).toMatch(/no ~\/.config\/cortados\/office-salt yet/)
+  const bad = { ...fakeDollar({ env: { HOME: '/tmp/home' }, files: { '/tmp/home/.config/cortados/office-salt': 'nope' } }), session: { id: async () => SID } }
+  expect((await identify(bad as any)).tag).toBe(null)
+  const noId = { ...fakeDollar({ env: { HOME: '/tmp/home' }, files: { '/tmp/home/.config/cortados/office-salt': SALT } }),
+    session: { id: async () => { throw new Error('x') } } }
+  expect((await identify(noId as any)).why).toMatch(/its id could not be read/)
+  const over = { ...fakeDollar({ env: { HOME: '/tmp/home', CORTADOS_OFFICE_SALT_FILE: '/etc/salt' }, files: { '/etc/salt': SALT } }),
+    session: { id: async () => SID } }
+  expect((await identify(over as any)).tag).toBe(me.tag)
+})
+
+test('pollLive identifies the session every poll, and only with a session to ask', async () => {
+  const $ = { ...fakeDollar({ env: { HOME: '/tmp/home', CORTADOS_PROVIDER_URL: 'http://air.example:8432' },
+    files: { '/tmp/home/.config/cortados/provider-token': TOKEN, '/tmp/home/.config/cortados/office-salt': SALT },
+    http: () => ({ status: 200, ok: true, headers: {}, text: JSON.stringify(liveFixture) }) }), session: { id: async () => SID } }
+  await pollLive($ as any, FALLBACK, true)
+  const mine = await ($ as any).state.get({ plugin: 'cortados-pulse', key: 'mine' })
+  expect(mine.value.tag).toBe(await sessionTag(SALT, SID))
+})
+
+test('this session\'s own tasks: running and queued, then the last finished; others are not shown', () => {
+  const tag = 'aaaaaaaaaaaaaaaa'
+  const live = { tasks: { status: 'ok', origins: [],
+    running: [{ task_id: 'r1', state: 'running', title: 'Mine running', host: 'air', model: 'm1', elapsed_s: 65, origin_session: tag },
+      { task_id: 'r2', state: 'running', title: 'Someone else', origin_session: 'bbbbbbbbbbbbbbbb' }],
+    queued: [{ task_id: 'q1', state: 'queued', title: 'Mine queued', host: 'air', elapsed_s: 5, origin_session: tag }],
+    recent: [{ task_id: 'd1', state: 'succeeded', title: 'Mine done', host: 'studio', elapsed_s: 600, origin_session: tag },
+      { task_id: 'd2', state: 'failed', title: 'Mine failed', elapsed_s: 30, origin_session: tag },
+      { task_id: 'd3', state: 'succeeded', title: 'Unattributed', origin_session: null }] } }
+  expect(sessionLines(live as any, { tag, why: null }, 10)).toEqual([
+    '● Mine running · on air · m1 · 1m 15s',
+    '◷ Mine queued · on air · queued 15s',
+    '✓ Mine done · on studio · succeeded · took 10m 00s',
+    '✕ Mine failed · failed · took 30s',
+  ])
+  expect(sessionLines(live as any, { tag: 'cccccccccccccccc', why: null }, 0)).toEqual(['no task started from this session in the last 24 h'])
+  expect(sessionLines(live as any, { tag: null, why: 'session not identified: x' }, 0)).toEqual(['session not identified: x'])
+  expect(sessionLines(live as any, null, 0)).toEqual(['identifying this session…'])
+  expect(sessionLines({ tasks: { status: 'error', errors: [{ source: 'child-tasks.jsonl', error: 'OSError' }] } } as any, { tag, why: null }, 0))
+    .toEqual(['tasks unavailable: child-tasks.jsonl: OSError'])
+  const many = { tasks: { status: 'ok', origins: [], recent: Array.from({ length: MINE_RECENT_MAX + 2 }, (_, i) => ({ task_id: 'd' + i, state: 'cancelled', origin_session: tag })) } }
+  expect(sessionLines(many as any, { tag, why: null }, 0).slice(-1)).toEqual(['  +2 more finished (dashboard)'])
+})
+
+test('an older provider without task origins is said as such, never as "no task started"', () => {
+  const tag = 'aaaaaaaaaaaaaaaa'
+  expect(sessionLines({ tasks: { status: 'ok', running: [], recent: [] } } as any, { tag, why: null }, 0))
+    .toEqual(['this provider records no task origins yet (update it to see this session\'s tasks)'])
+  expect(sessionLines({ tasks: { status: 'ok', origins: [], running: [], recent: [] } } as any, { tag, why: null }, 0))
+    .toEqual(['no task started from this session in the last 24 h'])
+  expect(CLEAR_NOTE).toMatch(/after a \/clear, earlier tasks stay under the previous session/)
+})
+
+test('the fleet view filtered in the pane says when its capped lists may hide this session\'s tasks', () => {
+  const tag = 'aaaaaaaaaaaaaaaa'
+  const fleet = { tasks: { status: 'ok', origins: [], truncated: true, running: [], recent: [] } }
+  expect(sessionLines(fleet as any, { tag, why: null }, 0).slice(-1)[0]).toMatch(/fleet lists are capped/)
+  // the provider's ?session= view was filtered before its caps: no such warning
+  const own = { session_filter: tag, tasks: { status: 'ok', origins: [], truncated: true, running: [], recent: [] } }
+  expect(sessionLines(own as any, { tag, why: null }, 0)).toEqual(['no task started from this session in the last 24 h'])
+})
+
+test('pollLive asks the provider for this session\'s own view, and keeps it only when the provider filtered it', async () => {
+  // Review 2026-11-13: on a busy fleet the fleet view's lists are capped (50 running, 40 recent) before any filter, so
+  // the pane must read the session's tasks from ?session=, which the provider filters before its caps.
+  const tag = await sessionTag(SALT, SID)
+  const mineTask = { task_id: 't20261111000900-aaaaaaaa', state: 'running', title: 'Mine, pushed out of the fleet list',
+    host: 'air', elapsed_s: 3000, origin_session: tag }
+  const fleet = { tasks: { status: 'ok', origins: [{ session: tag, running: 1, task_ids: [mineTask.task_id] }], truncated: true,
+    running: Array.from({ length: 50 }, (_, i) => ({ task_id: 'o' + i, state: 'running', origin_session: 'b'.repeat(16) })), recent: [] } }
+  const own = { session_filter: tag, tasks: { status: 'ok', origins: fleet.tasks.origins, truncated: false, running: [mineTask], recent: [] } }
+  for (const filtered of [true, false]) {
+    const $ = { ...fakeDollar({ env: { HOME: '/tmp/home', CORTADOS_PROVIDER_URL: 'http://air.example:8432' },
+      files: { '/tmp/home/.config/cortados/provider-token': TOKEN, '/tmp/home/.config/cortados/office-salt': SALT },
+      http: (url: string) => ({ status: 200, ok: true, headers: {},
+        // an older provider ignores ?session= and answers the fleet view
+        text: JSON.stringify(url.includes('?session=') && filtered ? own : fleet) }) }), session: { id: async () => SID } }
+    await pollLive($ as any, FALLBACK, true)
+    expect($.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live', 'http://air.example:8432/v1/cortados/live?session=' + tag])
+    const held = (await ($ as any).state.get({ plugin: 'cortados-pulse', key: 'mineLive' })).value
+    if (filtered) {
+      expect(held.tag).toBe(tag)
+      expect(sessionLines(held.data, { tag, why: null }, 0)).toEqual(['● Mine, pushed out of the fleet list · on air · 50m 00s'])
+    } else {
+      expect(held).toBe(null)                              // the pane falls back to the fleet view and says it is capped
+      expect(sessionLines($.live().data, { tag, why: null }, 0)).toEqual(['no task started from this session in the last 24 h',
+        '  (fleet lists are capped: some of this session\'s tasks may be missing; update the provider)'])
+    }
+  }
+  // no tag: no session request at all
+  const anon = { ...fakeDollar({ env: { HOME: '/tmp/home', CORTADOS_PROVIDER_URL: 'http://air.example:8432' },
+    files: { '/tmp/home/.config/cortados/provider-token': TOKEN }, http: () => ({ status: 200, ok: true, headers: {}, text: JSON.stringify(fleet) }) }),
+    session: { id: async () => SID } }
+  await pollLive(anon as any, FALLBACK, true)
+  expect(anon.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live'])
+})
+
+test('the provider-generated fixture carries origins: its main session sees its own tasks', async () => {
+  const tag = (liveFixture as any).tasks.running[0].origin_session
+  expect(/^[0-9a-f]{16}$/.test(tag)).toBe(true)
+  expect(sessionLines(liveFixture as any, { tag, why: null }, 0)).toEqual([
+    '● Refactor the scarcity reader · on air · claude-sonnet-5 (claude#b) · tool Bash · 2m 05s',
+    '✓ Write the changelog · on air · succeeded · took 16m 40s',
+  ])
 })

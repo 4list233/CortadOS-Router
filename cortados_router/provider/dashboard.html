@@ -96,6 +96,8 @@ h2 { font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.
 .row .el { font-size:18px; font-weight:600; font-variant-numeric:tabular-nums; text-align:right; }
 .row .el .u { display:block; font-size:11px; font-weight:400; color:var(--muted); }
 .group { margin-top:10px; font-size:11.5px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+.group.origin { text-transform:none; letter-spacing:0; font-size:12.5px; color:var(--fg2); border-top:1px solid var(--line); padding-top:8px; }
+.sub.origin { margin-top:8px; font-weight:600; }
 
 /* tables */
 .wide { overflow-x:auto; -webkit-overflow-scrolling:touch; }
@@ -325,7 +327,7 @@ function taskRow(t, now) {
 // The tasks section sees the provider host's child-task log only (scope "provider host"): a task running on another
 // execution host is absent, so the panel says whose tasks these are, and lists the tasks started from here elsewhere.
 function scopeText(s, host) { return s.scope === "provider host" ? "tasks on " + (host || "the provider host") + " only" : null; }
-function renderTasksPanel(box, s, now, host) {
+function renderTasksPanel(box, s, now, host, conv) {
   const P = panel("p-tasks", "Tasks", "span-8");
   const c = s.counts || {};
   P.meta.textContent = join([s.counts ? join([(c.running || 0) + " running", (c.queued || 0) + " queued",
@@ -333,10 +335,14 @@ function renderTasksPanel(box, s, now, host) {
     scopeText(s, host)]);
   secErrors(P.body, s);
   const active = (s.running || []).concat(s.queued || []);
-  const rows = el("div", "rows");
-  active.forEach(t => add(rows, taskRow(t, now)));
-  if (!active.length) add(rows, el("div", "empty", s.status === "error" ? "child tasks unknown" : "No child task is running."));
-  add(P.body, rows);
+  const byOrigin = originGroups(s, active, conv);
+  byOrigin.forEach(g => {
+    if (g.label) add(P.body, el("div", "group origin", g.label));
+    const rows = el("div", "rows");
+    g.tasks.forEach(t => add(rows, taskRow(t, now)));
+    add(P.body, rows);
+  });
+  if (!active.length) add(P.body, el("div", "empty", s.status === "error" ? "child tasks unknown" : "No child task is running."));
   const away = s.elsewhere || [];
   if (away.length) {
     add(P.body, el("div", "group", "Started from here on other hosts (last 10 h; their state lives on that host)"));
@@ -352,16 +358,50 @@ function renderTasksPanel(box, s, now, host) {
   const recent = s.recent || [];
   add(P.body, el("div", "group", "Last 24 hours" + (s.truncated ? " (list capped)" : "")));
   if (!recent.length) add(P.body, el("div", "empty", "nothing finished in the last 24 hours"));
-  else {
+  else originGroups(s, recent, conv).forEach(g => {
+    if (g.label) add(P.body, el("div", "sub origin", g.label));
     const wide = el("div", "wide");
-    add(wide, table(recent, [
+    add(wide, table(g.tasks, [
       {h: "state", node: t => pill(t.state)}, {h: "task", cls: "clip", v: t => t.title || short(t.task_id)},
       {h: "host", v: t => t.host || "–"}, {h: "model", v: t => t.model || t.lane || "–"},
       {h: "took", num: true, v: t => dur(t.elapsed_s)}, {h: "ended", num: true, v: t => ago(t.ended_at, now)},
       {h: "workspace", v: t => t.workspace || "–"}]));
     add(P.body, wide);
-  }
+  });
   add(box, P.p);
+}
+// Tasks under the main session that started them (live.origins_of: tasks.origins, each task's origin_session), in the
+// provider's group order, labelled with the session's project, device and short tag and, when its orchestrator is
+// live (conversations items of kind orchestrator), its state. A provider without origins: one unlabelled group.
+function originLabel(g, conv) {
+  if (g.session === "grokbot") return "Grok Bot (bot gateway)";
+  if (!g.session) return "Unattributed · no main session recorded";
+  const o = ((conv && conv.items) || []).find(x => x.kind === "orchestrator" && x.session === g.session);
+  return join([g.project || "main session", g.device ? "on " + g.device : null, "session " + g.session.slice(0, 8),
+    o ? "main session " + (o.status || "live") + (o.tool ? " · tool " + o.tool : "") : "main session not live"]);
+}
+// An orchestrator item's own tasks (live.link_origins): "tasks 1 running · 2 done", null when it started none.
+function originTasks(t) {
+  if (!t || typeof t !== "object") return null;
+  const n = (t.running || 0) + (t.queued || 0) + (t.finished || 0);
+  return n ? "tasks " + join([t.running ? t.running + " running" : null, t.queued ? t.queued + " queued" : null,
+    t.finished ? t.finished + " done" : null]) : null;
+}
+function originGroups(s, list, conv) {
+  if (!Array.isArray(s.origins)) return [{label: null, tasks: list}];
+  const order = s.origins.map(g => g.session || "");
+  const groups = new Map();
+  list.forEach(t => {
+    const k = t.origin_session || "";
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(t);
+  });
+  const keys = Array.from(groups.keys()).sort((a, b) => {
+    const ia = order.indexOf(a), ib = order.indexOf(b);
+    return (ia < 0 ? 1e9 : ia) - (ib < 0 ? 1e9 : ib);
+  });
+  return keys.map(k => ({label: originLabel(s.origins.find(g => (g.session || "") === k) || {session: k || null}, conv),
+    tasks: groups.get(k)}));
 }
 // Conversation kinds (live.conversations_section): open provider conversations, joined with the Office board.
 const KINDS = {orchestrator: "main session", child_task: "child task", subagent: "subagent", conversation: "conversation"};
@@ -378,7 +418,8 @@ function renderConversations(box, s) {
     const kind = KINDS[c.kind] || c.kind || "conversation";
     add(w, el("div", "t", c.title || join([c.project || (c.session ? null : "lobby"), kind])));
     add(w, el("div", "m", join([c.model ? c.model + (c.lane ? " (" + c.lane + ")" : "") : c.lane, c.device ? "on " + c.device : null,
-      c.tool ? "tool " + c.tool : c.phase, c.title ? kind : null, c.kind === "child_task" ? short(c.run_id) : null])));
+      c.tool ? "tool " + c.tool : c.phase, c.title ? kind : null, c.kind === "child_task" ? short(c.run_id) : null,
+      originTasks(c.tasks)])));
     add(r, w);
     const e = el("div", "el"); add(e, tick(el("span", "tick"), c.elapsed_s), el("span", "u", "elapsed"));
     add(rows, add(r, e));
@@ -598,7 +639,7 @@ function renderLive(d) {
     hosts.filter(h => h.heartbeat_state === "none").map(h => h.name).join(", ") ? "none yet: " + hosts.filter(h => h.heartbeat_state === "none").map(h => h.name).join(", ") : "all reporting"));
   add(box, ov);
   const panels = el("div", "panels");
-  renderTasksPanel(panels, ts, now, host);
+  renderTasksPanel(panels, ts, now, host, d.conversations);
   renderConversations(panels, d.conversations || {});
   renderSubs(panels, d.subscriptions || {});
   renderRouted(panels, d.routed || {}, now);
