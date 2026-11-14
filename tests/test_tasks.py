@@ -70,7 +70,7 @@ class CollectTest(unittest.TestCase):
         raw = json.dumps(v, allow_nan=False)
         self.assertNotIn("SECRET", raw)                          # request, context and the escalation reason stay out
         self.assertEqual(set(v), {"tasks", "sessions", "totals", "row_limit", "truncated", "unassigned_decisions",
-                                  "tokens_status", "percentage_definition", "notes", "errors"})
+                                  "tokens_status", "percentage_definition", "notes", "errors", "token_totals"})
         self.assertEqual(v["errors"], [])
         self.assertEqual(v["row_limit"], tasks.ROW_LIMIT)
         self.assertEqual([t["task_id"] for t in v["tasks"]], ["t-routed", "t-pin"])    # newest first
