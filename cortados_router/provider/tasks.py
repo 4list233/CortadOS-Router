@@ -11,9 +11,10 @@ What is real here and what is not:
   the S1 inputs (answers, hard_rules) are recorded per route and published as metadata.
 - the `request`, `context`, `task_context`, `engine_error` and `features` columns are never read: the
   SELECT names its columns, and the two JSON inputs are reduced to fixed labels before publishing.
-- tokens are NOT recorded per route. usage.db holds tokens per completed backend turn (usage_ledger)
-  but with no turn_id, so a task's tokens cannot be joined; every task says `tokens_status: not
-  recorded` rather than carrying an estimate.
+- tokens: recorded per routed conversation since the work-split change (core.log_tokens sums each backend turn's
+  input / output / cache read / cache write onto the route's row). A row with no recorded turn (older rows, the local
+  lane, a turn that never completed) says `tokens_status: not recorded` and carries no estimate. `token_totals` sums
+  them per window, overall, by orchestrator session tag and by lane/model (provider/work_split.routed_tokens).
 """
 from __future__ import annotations
 
@@ -21,11 +22,12 @@ import json
 import math
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
 from cortados_router import core
-from cortados_router.provider import office, usage
+from cortados_router.provider import office, usage, work_split
 
 # 200 decisions gives a useful recent task table without shipping history on each 30 s dashboard
 # poll. A smaller cap hides recent tasks; a larger one costs DB read time and DOM size. One
@@ -47,8 +49,9 @@ NOTES = [
     "Elapsed is the recorded turn_ms of that decision's turn, not a whole task's duration.",
     "Session IDs are the router's recorded conversation IDs, not Office session tags; titles and Office/child-task "
     "links are not recorded with these decisions.",
-    "Per-task tokens are not recorded: the usage ledger counts tokens per backend turn with no turn_id to join on, "
-    "and no estimate is substituted. Request and response sizes are recorded character counts.",
+    "Tokens are the backends' reported usage summed over a routed conversation's turns; rows from before token "
+    "recording, local-lane rows and conversations with no completed turn show 'not recorded', never an estimate. "
+    "Request and response sizes are recorded character counts.",
     "S1 reason summarises the recorded band, typed answers and hard rules by fixed category, never scorer prose; "
     "rules that can embed free text (escalation reasons, fit failures) are named by category only.",
 ]
@@ -167,7 +170,7 @@ def _share(counts: dict) -> None:
     counts["routed_pct"] = round(100 * counts["routed"] / counts["decisions"], 1) if counts["decisions"] else None
 
 
-def collect(state_dir: Path) -> dict[str, Any]:
+def collect(state_dir: Path, now: float | None = None) -> dict[str, Any]:
     """Bounded metadata projection; absence and errors are explicit entries, never an empty success.
 
     Percentages use this same bounded snapshot (not unbounded session aggregates), so numerator and
@@ -178,6 +181,7 @@ def collect(state_dir: Path) -> dict[str, Any]:
         "tasks": [], "sessions": [], "totals": {"decisions": 0, "routed": 0, "pinned": 0, "unselected": 0},
         "row_limit": ROW_LIMIT, "truncated": False, "unassigned_decisions": 0,
         "tokens_status": "not recorded", "percentage_definition": DEFINITION, "notes": list(NOTES), "errors": [],
+        "token_totals": None,
     }
     path = Path(state_dir) / "router.db"
     if not path.exists():
@@ -190,11 +194,18 @@ def collect(state_dir: Path) -> dict[str, Any]:
             conn.row_factory = sqlite3.Row
             # Explicit projection: request, context, task_context, engine_error, features and every other
             # column stay unread. The two JSON inputs are cut in SQL before any row is loaded.
+            # The token columns exist once the writer has opened the db after the work-split change (core._db);
+            # until then they are read as NULL, i.e. not recorded.
+            has_tok = work_split.has_token_columns(conn)
+            tok_sql = ("tok_input, tok_output, tok_cache_read, tok_cache_write, tok_turns" if has_tok else
+                       "NULL AS tok_input, NULL AS tok_output, NULL AS tok_cache_read, NULL AS tok_cache_write, "
+                       "NULL AS tok_turns")
             rows = conn.execute(
                 "SELECT turn_id, ts, session_id, lane, model, actual_model, band, engine, degraded, turn_ms, "
-                "request_chars, response_chars, substr(answers,1,?) AS answers, substr(hard_rules,1,?) AS hard_rules "
-                "FROM routes ORDER BY ts DESC LIMIT ?", (ANSWERS_MAX, RULES_MAX, ROW_LIMIT + 1),
+                "request_chars, response_chars, substr(answers,1,?) AS answers, substr(hard_rules,1,?) AS hard_rules, "
+                f"{tok_sql} FROM routes ORDER BY ts DESC LIMIT ?", (ANSWERS_MAX, RULES_MAX, ROW_LIMIT + 1),
             ).fetchall()
+            view["token_totals"] = work_split.routed_tokens(conn, now if now is not None else time.time())
         finally:
             conn.close()  # release the SQLite reader before JSON parsing or rendering
     except sqlite3.Error as exc:
@@ -203,6 +214,8 @@ def collect(state_dir: Path) -> dict[str, Any]:
         _share(view["totals"])
         return view
     view["truncated"] = len(rows) > ROW_LIMIT
+    if (view["token_totals"] or {}).get("status") == "recorded":
+        view["tokens_status"] = "recorded per routed conversation"
     sessions: dict[str, dict] = {}
     for raw in rows[:ROW_LIMIT]:
         row = dict(raw)
@@ -219,8 +232,13 @@ def collect(state_dir: Path) -> dict[str, Any]:
         row["elapsed_ms"] = _number(row.pop("turn_ms"))
         row["request_chars"] = _number(row["request_chars"])
         row["response_chars"] = _number(row["response_chars"])
-        row["tokens"] = None
-        row["tokens_status"] = "not recorded"
+        tok = {k: _number(row.pop("tok_" + k)) for k in work_split.TOKEN_FIELDS}
+        if _number(row.pop("tok_turns")):
+            row["tokens"] = {k: int(v or 0) for k, v in tok.items()}
+            row["tokens_status"] = "recorded"
+        else:
+            row["tokens"] = None
+            row["tokens_status"] = "not recorded"
         row["routing_kind"] = _kind(row, pinned)
         view["tasks"].append(row)
         view["totals"]["decisions"] += 1
