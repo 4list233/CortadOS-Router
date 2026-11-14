@@ -117,9 +117,31 @@ Not yet in P1, each needing a decision or another phase:
 
 - Routing: see P1 status above. `--fixed-model` restores the P0 behaviour (one Claude CLI model, no routing).
 - A conversation lives in one CLI process and is identified by the exact sequence of replies the endpoint wrote
-  (text and tool_use ids). If the endpoint restarts, or the client compacts or edits its history, the next request
-  fails with 409 instead of rebuilding the session from the transcript. Two live conversations with identical
-  histories (same opening, same text-only replies) are refused with 409 rather than guessed between.
+  (text and tool_use ids). If the endpoint restarts the next request is refused, terminally (`no_writer`, see the
+  refusal table below). If the client compacts or edits its history, the session is REBUILT (issue #43,
+  `Registry._rebuild_or_refuse` / `Registry.rebuild`, see (f) below).
+  The exact match is looked up only within the request's scope (wire + client + conversation identity), so two
+  clients or two wires never share a session. Two live conversations in ONE scope with identical histories (same
+  opening, same text-only replies) are refused rather than guessed between (terminal; a retryable 529 while a rebuild
+  in that scope is in flight, whose old and new sessions overlap for a moment).
+  Identity-less requests (#43 second review, P1-b): the User-Agent name does not tell two callers apart (every
+  Claude Code sends `claude-cli`), so a continuation without one of `CONVERSATION_ID_HEADERS` is continued only on
+  proof that it is that session's caller: an exact match within identity-less sessions of its own wire and client
+  name whose history carries a tool_use id (`ClientTurn.history_tool_ids`; on the Responses wire a `function_call`
+  call_id). Those ids are the backend's own random ids, so only a client that received that session's output holds
+  them. Anything else identity-less with history (a text-only continuation, no exact match, a rewritten history) is
+  refused terminally (`no_identity`): never continued, replayed or rebuilt. Real clients always send an identifier
+  (list below), so this only affects unknown or very old clients.
+  Identifiers each real client sends (2026-11-13; confirmed against captures 2026-11-02 and the code that sets them):
+  Claude Code (main sessions, subagents, `claude -p`) sends `X-Claude-Code-Session-Id` on every `/v1/messages`
+  request (2.1.316+; main loop and subagents share it); CortadOS child tasks (`session.py` `custom_headers` through
+  `ANTHROPIC_CUSTOM_HEADERS`) and routed subagents (cortados-routed-subagents mod) add `x-cortados-run-id` (a fresh id
+  per run) and the Office tags `x-cortados-session/-project/-device/-task-title`; Codex sends its thread id as
+  `session-id` (also `thread-id`, `x-client-request-id`, `prompt_cache_key`) on `/v1/responses`;
+  `previous_response_id` is refused (400: the endpoint keeps no response store) and the Responses wire has no
+  `conversation` id. `x-cortados-session` is NOT part of the identity: it is a salted tag of the main session sent only
+  alongside the run id or Claude Code's own id, and shared by every subagent of that session. `route_task`
+  (subagent_mcp) sends one tool-less message, a one-shot that never looks a session up.
   What the match compares (`Registry.find`: `session.history == turn.history`, the list of `reply_fingerprint`s,
   sha256 of each assistant message's trimmed text + tool_use ids) decides each history rewrite (2026-11-03, tests in
   `tests/test_provider.py`): (a) old tool_result content replaced by a placeholder (Claude Code microcompaction) is
@@ -127,7 +149,7 @@ Not yet in P1, each needing a decision or another phase:
   summary user message leaves no assistant message, so the request opens a new conversation (not a 409); a compacted
   history that keeps some but not all earlier assistant messages is a 409. (c) A removed or edited assistant message,
   or a different tool_use id, is a 409: never continued, because the CLI session would answer from a history the
-  client no longer has. Rebuilding (b)/(c) from the transcript is still open. The live 409 bursts of 2026-11-03
+  client no longer has. (b)/(c) are now rebuilt, see (f). The live 409 bursts of 2026-11-03
   (12:32-12:42, ~40 across several long `claude -p` sessions; no restart, no sleep, reaper last ran 12:07) are NOT
   explained by (a) or the reaper. Leading hypothesis: a lost/timed-out response retried by the client. The session
   already holds turn N's reply, the retry's history is one reply shorter, and that 409 poisons every later request.
@@ -135,10 +157,10 @@ Not yet in P1, each needing a decision or another phase:
   + tool results, `anthropic_wire.turn_fingerprint`) is the one that reply answered gets the stored last response
   again (same id, content, stop reason, usage), without the backend; logged as "replaying its last response". One
   response per session, at most `REPLAY_MAX_BYTES` (1 MiB; larger replies are not kept and their retry stays a 409).
-  A different user turn on that history is still a 409, and so is a retry that also changes the `sub/` pin (the
-  "model is fixed per conversation" refusal). Replay needs a conversation identity header (one of
-  `CONVERSATION_ID_HEADERS`): a request without one is never replayed and gets the ordinary 409, since identity-less
-  sessions all share the empty scope and a stored reply would go to a stranger. Only sessions in the request's
+  A different user turn on that history is not replayed (a rebuilt branch, see (f)), and a retry that also changes the
+  `sub/` pin gets the terminal "model is fixed per conversation" refusal. Replay needs a conversation identity header
+  (one of `CONVERSATION_ID_HEADERS`): a request without one is never replayed (terminal `no_identity`), since
+  identity-less sessions all share the empty scope and a stored reply would go to a stranger. Only sessions in the request's
   conversation scope (client + identity) opened on the same wire (`/v1/messages` or `/v1/responses`) are replayed, more than one candidate is a 409, and a replay refreshes the conversation's idle clock so the reaper
   does not close it mid-retry. (e) Every lost-conversation 409 logs one `409 lost conversation: class=<c> ...` line
   (counts and lengths only, no content or fingerprints). From `Registry.find`: `class=<c> candidates=<n>
@@ -151,6 +173,71 @@ Not yet in P1, each needing a decision or another phase:
   several live sessions hold the exact history. From the turn worker, after waiting for the session lock:
   `class=closed_while_waiting` or `class=moved_on_while_waiting` with `conversation=<id> request_len=<n>`
   (and `candidate_len` for the latter). The next burst's log lines say which case it was.
+  (f) Rebuild after a rewritten history (issue #43, 2026-11-13). A continuation that matches no live session exactly,
+  is not a replayable retry and hits no tombstone is served on a REBUILT backend when exactly one live session in the
+  request's scope (wire + client + conversation identity, as for replay) and on its wire wrote the request's LAST
+  reply. The rebuilt backend runs on that session's route (provider, model, account, frozen Codex home: no re-routing,
+  no second route log), with the request's own system prompt and tools, from the same factory as any session (so the
+  Claude CLI's `--tools ""` / strict MCP config and the Codex isolation checks hold unchanged). Its first user message
+  is `anthropic_wire.REBUILD_NOTE`, the client's history before the new turn as a labelled transcript
+  (`<user>`/`<assistant>`/`<operator>`; tool calls and results as text paired by call id; thinking dropped; earlier
+  images kept in place as image blocks, each after a numbered label naming its message or the tool call whose result
+  it was — both the Claude CLI and Codex take image blocks in user content; any block over `REBUILD_BLOCK_CHARS` =
+  100k characters cut, the cut stated), then the new turn,
+  its tool results as text by call id (the fresh backend never issued those calls, so nothing is delivered to a
+  pending call) and their images as image blocks. Two shapes: the request's last reply is the session's last reply
+  (compaction, an edited earlier message): the old session is closed once the new one exists, under its turn lock
+  (a running turn answers a retryable 529; a backend that cannot start answers 502 and leaves the old session
+  untouched); or it is an earlier reply (a rewind, an edited message resent): a BRANCH, and the old session is kept,
+  because such a request cannot be told from a side request the client forks from its live loop. A compaction whose
+  old session advanced between the lookup and the rebuild taking its turn lock is re-checked under that lock and
+  served as a branch (the advanced session is kept). The rebuilt session is published only once its history, seed and
+  budget are set. Rebuilds are coordinated in flight (#43 second review, P1-a): one at a time per (scope, wire, anchor
+  reply), on a gate taken before the budget or the old session is touched; after taking it the exact lookup runs again,
+  and a session an identical request published meanwhile is JOINED, never duplicated, so identical concurrent requests
+  share one session and its turn lock (the one that loses the lock is a stale continuation, 409, whose retry is
+  replayed). A twin that reaches the gate only after the first request's rebuilt session has already answered (#43
+  third review, P1) is recognised by the gate key and its new turn's fingerprint (`rebuilt_for`) and gets that stored
+  reply replayed (or, with none kept, the stale 409), never a second backend. A local-lane continuation re-checks under
+  its turn lock that its session is still the registered one (third review, P2); one replaced or closed while it
+  waited is a retryable 529 and nothing reaches the node. Waiting on the gate past `REBUILD_WAIT_S` (60 s) is a
+  retryable 529. Bounded by `REBUILD_MAX` = 5
+  per conversation lineage (each rebuild replays the whole history uncached): one budget shared by every session
+  rebuilt from the lineage, compacted or branched, which keeps committed rebuilds (`used`, a backend that started and
+  was published) apart from starts still pending (`pending`, given back if the start fails; P2-d). Committed usage at
+  the limit is terminal; a limit reached only with pending starts is a retryable 529.
+  Before anything is closed or started, the first turn (seed + new turn + system + tools) is measured against the
+  frozen route's `context_length` with the opening route's estimator (`routing.request_fit`, chars / 4), and measured
+  again under the rebuilt session's turn lock for whichever request actually takes that first turn (P2-c: another
+  request with the same history and a larger turn can take it; it is refused terminally and the seed stays). The log
+  line is `conversation <old> rebuilt as <new> ... (compacted: old session closed | branched: old session kept;
+  rebuild n of 5; ...)`; a refusal logs `refused lost conversation: class=<c> ... rebuild=refused:<code>; terminal`
+  (the pre-#43 `409 lost conversation` line only with rebuilding off). `REBUILD_MAX` 0 switches rebuilding off
+  (`disabled`: the pre-#43 409). A full compaction with no assistant message left still opens a new, freshly routed
+  conversation, as in (b).
+
+  Refusals of a continuation (#43; terminal = HTTP 400 `invalid_request_error` + `x-should-retry: false`, or a
+  terminal SSE error / Codex's `invalid_prompt`, because the retry carries the same history and meets the same state;
+  retryable = what Claude Code and Codex retry by themselves):
+
+  | Refusal | When | Answer | Retryable |
+  |---|---|---|---|
+  | `no_identity` | a continuation with no conversation identity header and no tool_use id of an exactly matching session | 400 | no |
+  | `no_writer` | no live session of this scope wrote the request's last reply (restart, reap, an edited last reply) | 400 | no |
+  | `ambiguous` / `ambiguous_writer` | more than one live session of this scope has the exact history / wrote the last reply | 400 | no |
+  | the same, while a rebuild in that scope is in flight | its old and new sessions overlap for a moment | 529 | yes |
+  | `limit` | the lineage committed `REBUILD_MAX` rebuilds | 400 | no |
+  | limit held only by pending starts | another rebuild of the lineage is still starting | 529 | yes |
+  | replay too large | seed + new turn exceed the route's `context_length` (before the rebuild, or at its first turn) | 400 | no |
+  | model change | a `sub/` pin other than the conversation's model (continuation, replay or rebuild) | 400 | no |
+  | failed conversation | a tombstone: the conversation's backend failed | 400 | no |
+  | old session busy / replaced | a turn runs on the session a compaction replaces, or another request rebuilt it first | 529 | yes |
+  | rebuild gate wait | an identical rebuild still starting after `REBUILD_WAIT_S` | 529 | yes |
+  | session lock wait | another request holds the conversation past `TURN_TIMEOUT_S` | 529 | yes |
+  | stale continuation | `moved_on_while_waiting` / `closed_while_waiting` (the retry is replayed, or meets the table above) | 409 | yes |
+  | rebuilding off | `REBUILD_MAX` 0 (`disabled`) | 409 | yes |
+  | backend cannot start | the rebuilt backend's start failed; the old session is untouched | 502 | yes |
+  | at the session cap | a branch over `MAX_SESSIONS` | 503 | yes |
 - Requests without tools (titles, summaries) always get their own throwaway CLI with the conversation as text.
 - Only `tool_choice: auto` is accepted (400 otherwise). `max_tokens` is not enforced: the CLI has no output-cap flag.
 - Responses are sent as SSE after the turn completes (with pings while waiting), not token by token.
@@ -300,10 +387,12 @@ codex app-server -c notify=[] -c web_search="disabled" -c include_environment_co
   trio of the Claude bridge.
   Since #84 it drops every `OPENAI_*`, `CODEX_*`, `ANTHROPIC_*` and `CLAUDE_*` variable by prefix, except the
   allowlist `codex_isolation.ALLOWED_ENV`: `CODEX_HOME` (set by the bridge) and `CODEX_CA_CERTIFICATE`.
+  Since #106 (2026-11-14) the environment is an allowlist instead (see "Backend environment allowlist" below): the
+  child gets the base variables, `CODEX_CA_CERTIFICATE` and the bridge's own `CODEX_HOME`, and nothing else.
 - `CODEX_CA_CERTIFICATE` (#103, 2026-11-13): the path of a PEM bundle Codex uses as its custom CA set for TLS. The Air
   provider sets it, in the provider's own environment, to an export of the macOS system roots, because Codex
   intermittently failed with `invalid peer certificate: UnknownIssuer` without it. It is a file path, not a secret, so
-  it passes the prefix strip. The PEM is a snapshot: re-export it after every macOS update (root certificates change
+  it is on the allowlist. The PEM is a snapshot: re-export it after every macOS update (root certificates change
   with OS releases), then restart the provider:
   `security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain > ~/.cortados/certs/macos-system-roots.pem`
 - The command line is asked for, then checked (Codex review of PR #5): before `thread/start` the bridge calls
@@ -417,7 +506,8 @@ tool type; optional, later.
    Read ran in the client, the log shows `instructionSources` and no isolation error.
 
 **P2 known limits.**
-- A running CLI keeps the system prompt it started with. A continuation whose system text differs (a changed
+- A running CLI keeps the system prompt it started with (a rebuilt one, #43, starts with the rebuilding request's).
+  A continuation whose system text differs (a changed
   Responses `instructions`, a rewritten developer item before the first reply) is served under the original with a
   WARNING naming the conversation; a developer item after a reply is passed as operator text instead (above).
 - Usage: both bridges report the Messages shape (input excludes cache reads/writes); the Responses wire adds them
@@ -426,7 +516,7 @@ tool type; optional, later.
 - Images: a tool-less single-message request keeps its image blocks on both wires; the text transcript a longer
   tool-less conversation is folded into is text only (P0 behaviour, both wires; images are P4).
 - No resume with tools: `thread/resume` and `thread/fork` take no `dynamicTools`, so a restarted endpoint answers
-  409 for a tool-bearing Codex conversation, exactly as P0 does for Claude.
+  the terminal `no_writer` refusal for a tool-bearing Codex conversation, exactly as P0 does for Claude.
 - `request_user_input` cannot be switched off. The backend answers it empty and logs a warning, so a model that asks
   the user a question gets no answer and carries on.
 - A tool-less request (Codex's own summaries, Claude Code's titles) boots a whole app-server for one turn.
@@ -524,7 +614,7 @@ local-resources config (schema: `docs/LOCAL-RESOURCES.md`, "Local models"). It i
 `choose_pinned` hands a local name to `_choose_local` (node answers `/api/tags` and lists the tag, input fits the
 configured `context_length`, opener logged as a `routes` row on lane `local-<node>`). The registry holds the
 conversation as a `LocalSession` (no backend process: the model binding and reply fingerprints), so `find` and
-`_model_change` keep it on its model like any pin (409 on a switch, in either direction); the server relays each turn
+`_model_change` keep it on its model like any pin (a terminal 400 on a switch, in either direction); the server relays each turn
 statelessly (`local_lane.serve`: bounded connect and read timeouts, SSE passed line by line, `tool_use` untouched).
 An unreachable node or unlisted model is a 503 naming the cause; an unknown name is a 400 listing every pinnable id,
 local ones included. `GET /v1/models` lists each as `<name> · CortadOS (<node label>)`. S1 never routes to a local
@@ -539,12 +629,48 @@ listed, the model is not excluded, the node's probe answers (the Pro's gate refu
 off) and lists the model, and the request fits. Otherwise S1's route stands. The routes row is rewritten under the
 same id with the local lane and S1's choice as `runner_up`. Details: `docs/LOCAL-RESOURCES.md`, "Local auto-route".
 
+## Backend environment allowlist (#106, 2026-11-14)
+
+Every vendor CLI the provider starts runs on an environment built from an explicit allowlist,
+`cortados_router/provider/child_env.py` (`backend_env(backend, extra)`), not on the provider's own environment minus a
+list. The provider holds secrets no backend may see (its bearer token and other `CORTADOS_*`, `GITHUB_TOKEN` / `GH_*`,
+`AWS_*`, `SSH_AUTH_SOCK`, API keys and base URLs under `OPENAI_*` / `ANTHROPIC_*`); with prefix stripping (#84) each
+of those passed unless someone had named its family.
+
+| Set | Variables | Why |
+|---|---|---|
+| base, every backend | `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LC_*`, `TZ` | find the runtime and tools, the user's home and login Keychain, the per-user temp dir, locale and time zone |
+| base, every backend | `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (both cases), `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS` | reach the vendor through a proxy, trust a custom CA bundle |
+| base, every backend | `__CF_USER_TEXT_ENCODING` | macOS CoreFoundation text encoding, set by launchd for every user process |
+| Codex | `CODEX_HOME` (always overridden by the bridge's resolved absolute home), `CODEX_CA_CERTIFICATE` | the home whose `auth.json` / `config.toml` the app-server runs on; the CA bundle of #103 |
+| Claude CLI | `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN` | the default login when the provider itself was started on a non-default config dir or a long-lived subscription token; a routed account replaces the first and drops the second |
+| per call (`extra`) | `CODEX_HOME`; `CLAUDE_CONFIG_DIR` of a routed account; `MCP_TOOL_TIMEOUT` | set on purpose by the bridge for this spawn; always wins |
+
+Spawn sites: `bridge.BridgeSession` and `search_lane.run` (both through `bridge.claude_env`), and
+`codex_bridge.CodexSession` (through `codex_isolation.child_env`). The login readers (`floor.executing_login`, the
+server's reveal) call the same builders, so the login they report is the one the child runs on. The MCP shim the
+Claude CLI starts gets its own variables (`CORTADOS_PROVIDER_BRIDGE_TOKEN` and the timeouts) from the session's
+`mcp.json`, not from the inherited environment. That credential is minted per session (`secrets.token_urlsafe(32)`),
+opens only `POST /bridge/call` for that session and is revoked when the session leaves the registry or closes; the
+owner token is in no backend's `mcp.json`, argv or environment. No Cursor or Antigravity CLI is started by the provider.
+
+Not covered, on purpose: `child_tasks.py` (whole Claude Code tasks with the owner's tools and connectors, another
+trust level, which has its own login-mode allowlist) and the scarcity / S1 probes; the S1 outcome loop keeps the
+pre-#106 prefix strip (`codex_isolation.prefix_stripped_env`).
+
+**Adding a variable.** Add it to `BASE_ENV` (every backend needs it) or to the backend's set in `BACKEND_ENV` in
+`child_env.py`, with a one-line comment saying why the backend cannot run without it and that it carries no secret the
+backend should not hold; extend `tests/test_child_env.py` (`test_the_lists_hold_no_vendor_secret_family` names every
+vendor-prefixed entry, so a new `CODEX_*` / `CLAUDE_*` / `OPENAI_*` / `ANTHROPIC_*` entry is a deliberate test edit).
+A value the bridge sets for one spawn goes in that call's `extra`, not in the allowlist. Restart the provider to apply.
+The test modules that drive the fake CLIs widen the allowlist by `FAKE_*` only (`tests/provider_fakes.py`).
+
 ## Web search lane (2026-11-03)
 
 Claude Code's WebSearch sends a request whose only tool is the Anthropic server tool `web_search_*` (often with a forced
 `tool_choice`). No bridged backend can run a server tool, so `cortados_router/provider/search_lane.py` serves it on a
 separate one-shot `claude -p` whose only tool is WebSearch (`--tools WebSearch --allowedTools WebSearch`, empty MCP
-config, no setting sources, `dontAsk`, empty scratch cwd, ANTHROPIC_* stripped as in the bridge). This is the one
+config, no setting sources, `dontAsk`, empty scratch cwd, the bridge's allowlisted environment, #106). This is the one
 owner-approved exception to the bridge rule that the headless CLI never runs a tool itself. Model: `SEARCH_MODEL`
 (the routing table's W-fast Claude route, Haiku 4.5). Login (`search_lane.login`, resolved together with the ledger
 lane before launch): the account named by `CORTADOS_PROVIDER_SEARCH_ACCOUNT` (resolved through tables/accounts.json;
@@ -560,8 +686,9 @@ keeps failing with a non-busy error, or exit with rows still queued; each is cou
 (with `ledger.queued`) in /v1/cortados/usage, and logged "LOST". The request's policy headers bind the lane before launch, as on routed calls: `x-cortados-exclude-model`
 naming the search model is a 400, and `x-cortados-min-left-pct` is checked and reserved on the search account through
 `floor.reserve` (429 on refusal; a fixed-model endpoint or a failing check fails closed).
-Hooks are off (`--settings '{"disableAllHooks": true}'`) and every `ANTHROPIC_*` variable is stripped by prefix
-(`bridge.claude_env`), so e.g. `ANTHROPIC_CUSTOM_HEADERS` never reaches api.anthropic.com. The query is capped at 2000
+Hooks are off (`--settings '{"disableAllHooks": true}'`) and the CLI runs on the bridge's allowlisted environment
+(`bridge.claude_env`, #106), which holds no `ANTHROPIC_*` variable, so e.g. `ANTHROPIC_CUSTOM_HEADERS` never reaches
+api.anthropic.com. The query is capped at 2000
 characters (`query_too_long`) and rides in argv, like the bridge's system prompt. The web_search tool's
 `allowed_domains` / `blocked_domains` are carried into the prompt ("only use results from ...; never use results
 from ...") as an instruction to the search model, not an enforced filter.
@@ -581,6 +708,24 @@ the usage ledger against the Claude lane it ran on (`claude`, or the named accou
 ## Usage endpoint (GET /v1/cortados/usage)
 
 `GET /v1/cortados/usage` (token required, 401 otherwise): one cheap JSON view for a usage dashboard, built by `cortados_router/provider/usage.py` — `lanes` (cached scarcity.json only: % left, windows/resets, sample age, `stale` by the routing freshness rule), `routed` (router.db counts per lane/model today and 7 d, top S1 bands; plus `provider_since_start` from the in-memory run records), `refusals` (24 h by reason, in-memory), `child_tasks` (7 d by last event from child-tasks.jsonl), `s1` (1.5 s `/health` probe), `hardware` (`$CORTADOS_HOME/hardware/*.json` passed through with age), `notes`, `errors` (every failed or absent source), `generated_at`. Opens no vendor CLI.
+
+## Dashboard password (2026-11-13)
+
+`cortados_router/provider/dashboard_auth.py`; README "Dashboard password" is the full description. In short: the owner
+runs `python3 -B -m cortados_router.provider.dashboard_auth set-password` **on the Air, in a real terminal** (`--stdin`
+for scripts; `status`, `logout-all`, `clear-password` beside it). Only a salted hash is stored
+(`$CORTADOS_HOME/dashboard-auth.json`, 0600): scrypt where `hashlib.scrypt` exists, else PBKDF2-HMAC-SHA256 at 600,000
+iterations, which is what the Air's LibreSSL Python 3.9 gets (it has no `hashlib.scrypt`); the file names the KDF.
+With a password set, `/dashboard` shows a login page; a good login sets `cortados_dash` (`HttpOnly; Secure;
+SameSite=Strict; Path=/`, 30 days, server keeps only its SHA-256 in `dashboard-sessions.json`, so a restart keeps the
+owner logged in). Failed logins are throttled per address (5 per 15 min, then a growing lockout) and globally (30 per
+15 min). A session opens only the dashboard's read views (live, usage, tasks, office) and the `local:switch` scope
+(`/v1/cortados/local`, `/v1/cortados/local/switch`), through `Handler._owner_or_session`, the one auth helper of those
+endpoints; never `/v1/messages`, `/v1/responses`, heartbeats or anything else, which check only the token header. A
+POST on a session needs same origin plus the session's CSRF token (`x-cortados-csrf`). The owner token is unchanged for
+every client. `logout-all` ends every session; a new or cleared password does too. Funnel (checked on the Air,
+2026-11-13): public only on 443 `/mcp` (bot gateway); `:8444` is tailnet-only Serve, so the dashboard is not public.
+The login is hardened as if it were.
 
 ## Live view (GET /v1/cortados/live) (2026-11-11, #73)
 

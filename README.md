@@ -207,7 +207,7 @@ The pipeline is in `s1/`, run nightly by `s1/nightly.sh` (or back to back by `s1
 | collect | `dataset.py` | gathers routed requests from the local `router.db` and any in `CORTADOS_ROUTER_DB_EXTRA` (e.g. rsynced from the provider host); a request's train/holdout split is fixed by its id |
 | label | `label.py` | teacher labels via a stateless CLI, k = 3 soft samples; train split by Sonnet, holdout by a stronger Opus |
 | build | `build_sft.py` | builds the SFT set, oversampling rare bands |
-| train | `mlx_lm lora` | warm-starts from the promoted adapter |
+| train | `mlx_lm lora` | warm-starts from the promoted adapter, through a run-owned copy; a symlinked or hard-linked adapter file fails the night before the trainer writes (guards against accidental aliasing, not a same-user adversary, which could change the promoted adapter directly) |
 | grade | `evaluate.py` | grades on the held-out split: band accuracy, under/over-routing, outward recall, ECE, Brier |
 | promote | `nightly.sh` | promotes only with no regression where mistakes are expensive — under-routing and outward recall never regress, band accuracy holds within noise — measured against the incumbent re-graded on the same rows |
 
@@ -265,6 +265,8 @@ CORTADOS_S1_URL=http://<scorer-ip>:8431 CORTADOS_S1_TOKEN=<s1-token> \
     --host <private-ip> --port 8432 \
     --claude-bin /path/to/claude --codex-bin /path/to/codex
 ```
+
+The backend CLIs the provider starts (headless `claude`, `codex app-server`, the search lane's `claude -p`) do not inherit its environment: they get an explicit allowlist (`cortados_router/provider/child_env.py`, #106) of `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LC_*`, `TZ`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, both cases), the CA bundle variables and `__CF_USER_TEXT_ENCODING`, plus `CODEX_HOME` / `CODEX_CA_CERTIFICATE` for Codex and `CLAUDE_CONFIG_DIR` / `CLAUDE_CODE_OAUTH_TOKEN` for Claude. The provider token, `GITHUB_TOKEN`, `AWS_*`, `SSH_AUTH_SOCK` and every API key stay in the provider. The MCP shim that serves the client's tools to the headless Claude CLI does not get the provider token either: each bridged session mints its own random credential, written to its `mcp.json`, that opens only `POST /bridge/call` for that session (every other endpoint answers 401) and is revoked when the session ends or is retired. One accepted exception: a proxy URL with credentials (`http://user:pass@proxy:3128`) passes to the backends unchanged, since those are proxy credentials the owner configured for them. To pass another variable, add it with its reason to `BASE_ENV` or `BACKEND_ENV` in that file and restart the provider (`docs/PROVIDER-PLAN.md`, "Backend environment allowlist").
 
 `CORTADOS_S1_URL` names the scorer; without it (and without a configured endpoints file that selects a remote device) the provider looks for S1 on loopback and routes degraded. On one machine, drop both `CORTADOS_S1_*` and S1 is found on loopback.
 
@@ -402,6 +404,8 @@ sub-tasks it chooses to hand off. The repo ships a project MCP server, `cortados
 capable model runs it, and the text comes back. The main session keeps its own model and login.
 `route_task` is refused inside a child task (`CORTADOS_CHILD_TASK` set): children may not route, as they may not start
 children (the child's directive says so too).
+The same server also serves `local_switch(state, node?)` (see **Flipping the switch from anywhere**, under Local
+models), which is allowed in child tasks.
 
 Set two environment variables and have the provider running:
 
@@ -436,26 +440,79 @@ available and not busy (`routing.index_local`; the node's `index_route`, on by d
 With a `sensitive` section,
 requests flagged `x-cortados-local: sensitive`, matching the owner's keyword list, or refused by a Claude lane on their
 opening turn move to the node's sensitive model in any band, only when S1 says they have no effect outside the machine
-(`docs/LOCAL-RESOURCES.md`, "Sensitive requests"). Every automatic move (auto route, index route, sensitive) passes one
-shared gate, `routing.local_admission`. Every later turn of a
-conversation an automatic rule bound to a local lane (the index route included) is rescored by S1 first and refused
-with a terminal 400 when it may have an outward effect; an explicit `sub/` local pin is not rescored. An asleep or busy node fails
-a pin with a clear 503, never a fallback. Ollama has no auth, so it stays on localhost and the node runs a token gate
-(`python3 -m cortados_router.local_gate`) on its Tailscale address. Config schema, gate and launchd template:
+(`docs/LOCAL-RESOURCES.md`, "Sensitive requests"), on the published-index variant chosen per request as the index route
+chooses it (`routing.choose_variant`: the lighter variant that clears the required index, else the strongest eligible).
+Every automatic move (auto route, index route, sensitive) passes one shared gate, `routing.local_admission`. Every
+later turn of a conversation an automatic rule bound to a local lane (the index route included) is rescored by S1 first and refused with a terminal 400 when it
+may have an outward effect (the latest user words and any new tool results are scored); an explicit `sub/` local pin is
+not rescored. Every automatic-local turn also passes the effect boundary (`provider/effect_boundary.py`), whose
+profile follows WHY the conversation is local (the route's `bind_reason`, kept on every continuation; owner decision
+2026-11-14). **Sensitive routes** (the sensitive flag, `prefer`, the keyword list, the refusal fallback) get no shell
+at all: the node is offered Read, Glob, Grep, LS, NotebookRead, Edit, MultiEdit, Write, NotebookEdit, TodoWrite and
+ExitPlanMode only. **Cost routes** (R0 `auto_route` and the published-score index route) also keep
+Bash, BashOutput, KillShell and KillBash, and every Bash command is checked against a pattern list (git push and git
+config/aliases, curl uploads, gh writes, ssh, publish, sendmail, interpreter network one-liners, pipes into a shell,
+eval of a substitution, launchctl/crontab, symlinks, writes to hooks and startup files, ...). **That pattern list is
+best-effort: it cannot recognise every outward shell command, and Claude Code's own permission prompts are the last
+guard for what Bash runs.** On both, Write / Edit / MultiEdit / NotebookEdit must target a path inside the
+conversation's project folder (read from the working directory Claude Code names in its system prompt; unknown means
+every write is refused), with no `..`, and never `.git/`, CI files, hook managers, `.envrc`, `.claude/`, `.mcp.json`,
+`setup.py`/`setup.cfg`, a dotfile at the project root, shell startup files, LaunchAgents, `~/.ssh` or crontab;
+`package.json`, `pyproject.toml` and `Makefile` are allowed on cost routes and refused on sensitive ones. WebFetch,
+WebSearch, every `mcp__*` tool and any unknown tool are always dropped. A blocked call is refused with a terminal 400
+(mid-stream: an `error` event, no tool_use). Pins are relayed untouched (`docs/LOCAL-RESOURCES.md`, "Effect
+boundary"). An asleep or busy node fails a pin with a clear 503, never a fallback. Ollama has no auth, so it stays
+on localhost and the node runs a token gate (`python3 -m cortados_router.local_gate`) on its Tailscale address. Config schema, gate and launchd template:
 `docs/LOCAL-RESOURCES.md` ("Local models").
 
 ### Local models on the Pro
 
 The Pro gate admits probes and inference only on **AC power AND with the manual switch ON**.
 The switch defaults off: `python3 -B -m cortados_router.local_resources toggle on|off|status`
-(run with one of those three states). It uses `$CORTADOS_HOME/local-enabled` (default
-`~/.cortados/local-enabled`); status prints the switch, availability and reason.
+(run with one of those three states), or from anywhere (below). It uses `$CORTADOS_HOME/local-enabled` (default
+`~/.cortados/local-enabled`); status prints the switch, availability, reason and power (`ac`/`battery`/`unknown`).
 Unknown/failed `pmset -g ps` readings fail closed. Power is cached for at most 3 seconds;
 the switch is checked on every request, including again after body upload. Disabled requests
 return 503 without reaching Ollama. Fleet telemetry for node `pro` also includes this policy;
 its deployments are unavailable when the policy is disabled or unknown. This does not
 start/stop Ollama or unload resident models;
 existing in-flight inference is not cancelled. Other fit, busy and exclusion checks still apply.
+
+#### Flipping the switch from anywhere
+
+The switch file lives on the Pro, but it can be flipped from any machine that can reach the provider; every path ends
+in the same code on the node (`local_resources.set_local_switch`, the CLI's own), written atomically:
+
+1. **Dashboard** (`GET /dashboard` on the provider, Live tab): the **Local models** card shows each configured node's
+   switch, AC/battery, whether local models are allowed and why, the model Ollama has loaded and the node's
+   `auto_route`, with an On/Off button. Turning a node off while a model is loaded asks first (the model stays loaded;
+   new local requests are refused at once). The card is refreshed every 30 s and right after a switch.
+2. **MCP tool** `local_switch(state: "on"|"off"|"status", node?)` on the `cortados-route` server (default node `pro`;
+   `status` without a node lists every node). It needs the provider URL and the owner token, like `route_task`, but is
+   **not** refused inside a child task: it routes nothing and spends no quota, so a child may be asked to flip it.
+3. **Slash command** `/cortados-local on|off|status [node]` in the `cortados-routed-subagents` mod, using the mod's own
+   provider URL and token discovery.
+
+Under the hood: the provider's `GET /v1/cortados/local` and `POST /v1/cortados/local/switch` `{"node": "pro", "on":
+true|false}` (`provider/local_switch.py`; the owner token, or a dashboard session with the `local:switch` scope, through
+`_owner_or_session` like the other dashboard views; the session's POST must also pass the same-origin + CSRF-token
+check below, refused before the body is read; a scoped client token gets 403, as no `clients.json` scope covers these
+paths, by design; both answers are `Cache-Control: private, no-store`, `Vary: Cookie, Authorization`) ask the node's gate at `GET`/`POST /cortados/local-switch` with the node's gate
+token (6 s bound end to end: connect, headers and body share one deadline, so a trickling gate cannot stretch it).
+The switch POST's body must carry a content-length (411 without, 400 if not a byte count), is at most 1 KiB (413,
+refused unread) and must arrive within 5 s (408; read by `http_body.read_within`, the reader the dashboard login and
+the gate share). `local_gate.deadline_call` stays separate: it is the CLIENT side (the provider asking the gate, the
+gate asking Ollama) and puts the connect, the request, the response headers and the body under one deadline, which a
+server-side body reader cannot. The gate answers that endpoint even while the switch is off or the Pro is on battery; inference keeps
+its refusal. Only checked fields come back (switch, allowed, reason, power, training, loaded model names), never the
+node's address or token. An asleep node is a 503 "unreachable", an unknown node a 404, a node with no gate configured
+a 409, a gate from before this endpoint a 502 saying to restart it.
+
+**Deploy (owner / orchestrator, not a delegate):** on the Pro, pull the branch and restart the gate so it serves the new
+endpoint: `launchctl kickstart -k gui/$(id -u)/com.cortados.local-gate`. On the Air, pull and restart the provider
+(it serves the endpoints and the new dashboard page). Reload the mod (version 0.3.4) for `/cortados-local`, and restart
+Claude Code sessions (or reconnect the `cortados-route` server) for `local_switch`. Until the Pro's gate is restarted,
+the provider answers the switch with the 502 above; the CLI on the Pro keeps working throughout.
 
 ## Delegating whole tasks from the Claude app
 
@@ -809,6 +866,8 @@ claude mcp add -s user cortados-route \
   -- python3 /ABSOLUTE/PATH/TO/CortadOS-Router/cortados_router/subagent_mcp.py
 ```
 
+Either registration serves every tool of the server: `route_task`, the child-task tools above and `local_switch`.
+
 ## Bot gateway on the Air
 
 `integrations/bot-gateway/install.sh` runs the bot gateway (`cortados_router/bot_gateway.py`: the full task surface
@@ -916,9 +975,73 @@ Benchmark scores in `tables/benchmarks/scores*.csv` are derived from public sour
 
 `GET /v1/cortados/usage` (token required, 401 otherwise): one cheap JSON view for a usage dashboard, built by `cortados_router/provider/usage.py` — `lanes` (cached scarcity.json only: headline % left from the general `pool == "all"` windows routing uses — never a stale or per-model pool — per-window `window`/`resets_at`/`reset_epoch`/`headroom_pct`, per-pool headroom, account from the lane key (no paths; a cached Claude reading sampled from another login than the one configured for that key shows no numbers, `stale`, `error: reading_for_other_login`), sanitised `error_kind`, sample age, `stale` by the routing freshness rule; `cursor` carries `shared_with: ["Grok Bot"]`), `routed` (router.db counts per lane/model today and 7 d, top S1 bands, `today_truncated` / `last_7d_truncated` / `bands_truncated` when a list filled its cap; plus `provider_since_start` from the in-memory run records, and `route_log_errors` — this process's failed router.db writes since start: `count` attempts, `lost` rows given up after one retry, `recovered`, `last_error_type`/`last_error_at`/`last_op`; a failure to log a route never fails the request, #99), `refusals` (24 h by reason, in-memory), `child_tasks` (7 d `by_event`/`by_status`/`by_client` from the bounded tail of child-tasks.jsonl — `by_client` counts tasks per attributing client, e.g. `grokbot` for the bot gateway, `direct` for the rest — `truncated` when clipped), `ledger` (usage.db rows from `usage_ledger`: turns and input/output/cache tokens per lane/model today and 7 d; pre-`lane` Hermes rows show under their runtime), `bots` (7 d bot-gateway calls from bot-usage.jsonl and its rotated `.1`: total, `by_client`, `by_tool`, `by_outcome`; absent until the gateway first runs), `s1` (1.5 s `/health` probe, memoised 10 s, no proxy, URL not echoed), `hardware` (`$CORTADOS_HOME/hardware/*.json` written by `cortados_router/hardware.py`, filtered to the sampler's own fields — an unreadable field keeps `available: false` and the reason's kind only when that is identifier-like (an exception type name; anything else becomes `error`), never its message — freshest 32 regular files (a FIFO or symlink is reported `not_a_regular_file` and never opened), with age; a file name that is not plain `[A-Za-z0-9._-]{1,64}` or holds an IPv4-looking address is shown as `<unnamed:<i>>` (its freshest-first position, so two stay distinct); any list field other than `load_avg` (3 numbers) is `available: false, reason: unexpected_type`; a file with none of its fields is reported `no_known_fields`; `errors[].field` is one of the sampler's field names or `unknown` (also for a null or container); an Ollama model name is published per `/` segment (`hf.co/<user>/<repo>:Q4`, at most 4 segments), any failing segment makes it `error`), `notes`, `errors` (every failed or absent source; a lane error scarcity did not classify is `unclassified`), `generated_at`. Every value leaves through one publish pass (`usage._publish` over the declared schema `_VIEW`), whatever section built it: undeclared keys are dropped; a leaf is only its declared type (bool, finite number, enum, or text) and a container where a leaf is expected is null; text is at most 60 chars (refusal reasons 120) of `[A-Za-z0-9 ._:()+%,#'…-]` with no IPv4-, IPv6- (`::` or 3+ colon-separated hex groups) or MAC-looking address, else `"error"` (so no path, `user@host`, markup or serialised object passes); every list and map is capped (lanes 32, windows per lane 16, pools 16, hardware files 32, Ollama models 32, card errors 16, counters 32, `load_avg` 3, `errors` 64 ending in `usage/errors_truncated`) two keys of one map that publish alike are combined (counters add, pool headroom keeps the minimum) and named `keys_merged`; and each cut adds one deduped `errors` entry naming its source (`scarcity/<lane>` + `windows_truncated` / `pools_truncated`, `scarcity` + `lanes_truncated`, `hardware/<file>` + `load_avg_truncated` / `models_truncated` / `errors_truncated`); the body is strict JSON. Memoised 2 s (the encoded bytes, so a GET serialises nothing; least recently used state dirs evicted first) and single-flighted, so concurrent polls run one collect; `router.db` has a `routes(ts)` index for the window counts. A failing view answers 500 `api_error` (the exception type goes to the provider log). Opens no vendor CLI.
 
-Open `http://<provider>:8432/dashboard` in a browser on the tailnet to see it (the page opens on its **Live** tab, described under "Live view" below; this view is its **Usage** tab): one self-contained page (no external assets, served with `Cache-Control: no-store`, `nosniff` and a CSP whose `script-src` is only the sha256 of its one inline script) that asks for the provider token once, keeps it in the tab's sessionStorage only (in page memory, with a notice, when storage is unavailable), and every 30 s fetches `/v1/cortados/usage` with a Bearer header. It shows the view's `errors` first (every failed or absent source, e.g. `scarcity: OSError` when scarcity.json is missing, counted in the header and repeated where the empty section would be, so a missing source never reads as "no usage"), then a card per lane with its % left (stale readings greyed with their age, per-pool headroom, shared pools named, the lane's `error`), routed calls per lane/model today and over 7 days, the top S1 bands, ledger turns and tokens per lane/model, refusals by reason, child tasks by client/status/event, bot-gateway calls by client/tool/outcome, S1 health, HTTP status and latency (or its reason when down), a card per machine (CPU/GPU busy, memory, load, headroom, resident Ollama models, unavailable fields and sampler errors, sample age) and the notes. Capped lists say so; a failed poll greys the last good view and names the failure in red. A 401 forgets the token and asks again.
+Open `http://<provider>:8432/dashboard` in a browser on the tailnet to see it (the page opens on its **Live** tab, described under "Live view" below; this view is its **Usage** tab): one self-contained page (no external assets, served with `Cache-Control: private, no-store`, `nosniff` and a CSP whose `script-src` is only the sha256 of its one inline script) that, when no dashboard password is set, asks for the provider token once (with a password set it opens with a login session instead: "Dashboard password" below), keeps it in the tab's sessionStorage only (in page memory, with a notice, when storage is unavailable), and every 30 s fetches `/v1/cortados/usage` with a Bearer header. It shows the view's `errors` first (every failed or absent source, e.g. `scarcity: OSError` when scarcity.json is missing, counted in the header and repeated where the empty section would be, so a missing source never reads as "no usage"), then a card per lane with its % left (stale readings greyed with their age, per-pool headroom, shared pools named, the lane's `error`), routed calls per lane/model today and over 7 days, the top S1 bands, ledger turns and tokens per lane/model, refusals by reason, child tasks by client/status/event, bot-gateway calls by client/tool/outcome, S1 health, HTTP status and latency (or its reason when down), a card per machine (CPU/GPU busy, memory, load, headroom, resident Ollama models, unavailable fields and sampler errors, sample age) and the notes. Capped lists say so; a failed poll greys the last good view and names the failure in red. A 401 forgets the token and asks again.
 
 `GET /v1/cortados/tasks` (same token, 401 otherwise; built by `cortados_router/provider/tasks.py`) feeds the page's **Tasks** section: the latest 200 routing decisions from `router.db` (`ORDER BY ts DESC` over the `routes(ts)` index, one look-ahead row sets `truncated`; no `COUNT(*)`, no `core._db_lock`, the dashboard's read-only deadline-limited connection), each as metadata only — `task_id`, `ts`, `session_id` (the router's conversation id, not an Office tag), `lane`, `model`, `actual_model`, `band`, `degraded`, `elapsed_ms` (the recorded `turn_ms`), `request_chars`/`response_chars` (recorded sizes), `routing_kind` (`routed` / `pinned` / `unselected`) and `s1_reason`, a fixed-vocabulary summary of the recorded band, the typed S1 answers (`steps=…, work_kind=…, outward=…`) and the hard rules by category (`cheapest qualifying route`, `escalated difficulty floor`, …; a rule's text is never published, since escalation reasons and fit failures can embed user text). The `request`, `context`, `task_context`, `engine_error` and `features` columns are never read. Per-task **tokens** are the backends' reported usage summed over the routed conversation's turns (`tokens: {input, output, cache_read, cache_write}`, `tokens_status: "recorded"`); rows from before token recording, local-lane rows and conversations with no completed turn carry `tokens: null, tokens_status: "not recorded"`, never an estimate. `token_totals` sums them per window (see "Work split" under "Live view"). `sessions[]` gives, per recorded session within that window, `decisions`, `routed`, `pinned`, `unselected` and `routed_pct` = 100 × routed ÷ decisions (pins counted separately, degraded fallbacks counted as routed; the definition is in `percentage_definition` and printed on the page); `totals` is the same over the whole window and `unassigned_decisions` counts rows with no session id (never pooled into an invented session). Identifiers are validated with the Office view's rules (an id or model name holding an address or foreign characters is `null`). A missing or unreadable database is an `errors[]` entry (`router.db: absent` / the sqlite exception class), never an empty success; the page shows a failed tasks poll in red inside its section and leaves the usage view current.
+
+### Dashboard password (instead of the token)
+
+The dashboard can open with a password the owner sets, so the provider's owner token never has to go into a browser
+(`cortados_router/provider/dashboard_auth.py`). Without a password the page asks for the token as before and shows the
+hint `set a password: python3 -B -m cortados_router.provider.dashboard_auth set-password (on the Air)`.
+
+Set it **on the Air** (the provider host), in a real terminal, from the deployed checkout, with the same `python3` the
+provider runs on:
+
+```sh
+cd <the provider's checkout on the Air>
+python3 -B -m cortados_router.provider.dashboard_auth set-password   # prompts twice, no echo, 12+ characters
+python3 -B -m cortados_router.provider.dashboard_auth status         # set / not set, KDF, live sessions; never the hash
+python3 -B -m cortados_router.provider.dashboard_auth logout-all     # end every dashboard session
+python3 -B -m cortados_router.provider.dashboard_auth clear-password # back to the token page; ends every session
+```
+
+`set-password` refuses to run without a terminal unless `--stdin` is given (one line from standard input, for scripts).
+It stores only a salted hash in `$CORTADOS_HOME/dashboard-auth.json` (0600, written atomically): scrypt (n=2^15, r=8,
+p=1, 16-byte salt, 32-byte key) where `hashlib.scrypt` exists. **The Air's provider runs on Apple's CommandLineTools
+Python 3.9, built on LibreSSL, which has no `hashlib.scrypt`**: there it records PBKDF2-HMAC-SHA256 at 600,000
+iterations (about 0.17 s on the Air), names the KDF in the file and says so when it runs. A scrypt hash written by
+another Python is refused by a provider without scrypt (login 500, the log says to rerun `set-password` with the
+provider's own `python3`). Setting a new password or clearing it ends every session. All of these take effect on the
+running provider (the files are re-read when they change); no restart.
+
+Then open `https://air.tailb38028.ts.net:8444/dashboard` (the HTTPS address: the session cookie is `Secure`, so a plain
+`http://<tailnet name>:8432` page cannot keep it; `http://127.0.0.1:8432` on the Air itself works). With a password set:
+
+- `/dashboard` without a valid session is a small login page (a password field, no script) that posts to
+  `/dashboard/login`. Failed logins are rate limited per client address (5 failures in 15 min lock that address out for
+  15 min, doubling per further lockout up to 4 h; a success resets it) and globally (30 failures in 15 min from anywhere
+  refuse every login until the oldest ages out, about two guesses a minute; while that holds the owner cannot log in
+  either, the token still works for everything else). The address is Tailscale Serve's last `X-Forwarded-For` hop,
+  trusted from loopback only. Failures are logged with the address, never the attempted password. The throttle is in
+  memory: a provider restart forgets it. The route is unauthenticated, so it cannot hold a thread: a locked-out address
+  gets its 429 before its body is read, the body (4 KiB at most) must arrive within 5 s of the headers or the
+  connection is dropped, and at most 4 logins are handled at once (the next one is a 503 with `Retry-After`).
+- A good login sets the cookie `cortados_dash` (32 random bytes; `HttpOnly; Secure; SameSite=Strict; Path=/`,
+  30 days). The server keeps only its SHA-256, with its expiry and the password generation, in
+  `$CORTADOS_HOME/dashboard-sessions.json` (0600), so a provider restart does not log the owner out.
+  `SameSite=Strict` means a browser does not send it when the dashboard is opened from a link on another site
+  (a chat app, a mail): that first load shows the login page; open the address directly or from a bookmark instead.
+- **What a session can do:** the dashboard's read views only (`GET /v1/cortados/live`, `/usage`, `/tasks`, `/office`,
+  with their parameters), plus the `local:switch` scope (`GET /v1/cortados/local`, `POST /v1/cortados/local/switch`,
+  above). **What it cannot do:** `/v1/messages`, `/v1/responses`, count_tokens, `/v1/models`,
+  `/resources`, run records, heartbeats, `/bridge/call`, or anything else; those check only the token header. A request
+  that carries a token is judged on the token alone, never on a cookie beside it. The owner token keeps working exactly
+  as before for every client (pulse pane, MCP, scripts); they never need a cookie.
+- Every state-changing request on a session (log out, the local switch) must come from the same origin
+  (`Origin`, else `Referer`: its authority equal to `Host`, or to `X-Forwarded-Host` from loopback, and its scheme the
+  one the request arrived on: `http` for a direct request, `X-Forwarded-Proto` from loopback, which Tailscale Serve sets
+  to `https`) **and** carry the session's CSRF token, which the page receives in a `<meta>` tag and returns in
+  `x-cortados-csrf`. GET views change nothing. The login form passes the same origin check (without a token).
+- The session page and every authenticated view (live, usage, tasks, office; cookie or token) are served
+  `Cache-Control: private, no-store` with `Vary: Cookie, Authorization`, as are the local switch's view and POST.
+- The page's **Log out** button posts `/dashboard/logout`, which deletes the session server-side and clears the cookie.
+
+**Is the dashboard on the public internet? No.** Checked 2026-11-13 on the Air (`tailscale funnel status`, read only):
+Funnel is on for `https://air.tailb38028.ts.net` (port 443) and maps only `/mcp` to the bot gateway
+(`127.0.0.1:8434/mcp`, docs/GROKBOT-BRIDGE.md); `https://air.tailb38028.ts.net:8444` is **tailnet only** (Serve, `/` →
+`127.0.0.1:8432`), and the provider binds `127.0.0.1:8432`. The login is hardened as if it were public anyway
+(throttle, global cap, CSRF, Secure cookie), so a later Funnel change does not open it to guessing; do not funnel 8444.
 
 ### Live view (GET /v1/cortados/live)
 

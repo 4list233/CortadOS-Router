@@ -108,6 +108,12 @@ arg = lambda k, d=None: a[a.index(k) + 1] if k in a else d
 lp = json.load(open(arg("-c")))["lora_parameters"] if "-c" in a else {"rank": 8, "dropout": 0.0, "scale": 20.0}
 out, layers = arg("--adapter-path"), int(arg("--num-layers", "16"))
 import os; os.makedirs(out, exist_ok=True)
+fail = os.environ.get("STUB_LORA_FAIL", "")
+if fail == "permission":   # what any unwritable file raises; the real one: 2026-11-14 on adapter_config.json
+    raise PermissionError(13, "Permission denied", os.path.join(out, "adapter_config.json"))
+if fail == "crash":        # a transient trainer death (Metal allocation): worth a retry
+    raise RuntimeError("[metal::malloc] Resource limit (499000) exceeded")
+# as mlx_lm's save_config: open(..., "w") at every start, so a read-only run-local copy raises PermissionError here
 cfg = {"model": arg("--model"), "num_layers": layers, "fine_tune_type": "lora", "lora_parameters": lp,
        "resume_adapter_file": arg("--resume-adapter-file")}
 open(os.path.join(out, "adapter_config.json"), "w").write(json.dumps(cfg))
@@ -142,6 +148,76 @@ def fake_adapter(adapter_dir: Path, name: str = "adapters.safetensors", rank: in
 def _exe(path: Path, text: str) -> None:
     path.write_text(text)
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+class RunCopyAliases(unittest.TestCase):
+    """nightly.sh's run_copy never writes through a planted alias of the source (review 2026-11-14)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="s1-runcopy-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.src = self.tmp / "promoted" / "adapters.safetensors"
+        self.src.parent.mkdir()
+        self.src.write_bytes(b"promoted-weights")
+        self.src.chmod(0o644)                         # writable: the case where a write through the alias would succeed
+        self.dest_dir = self.tmp / "run" / "adapter"
+        self.dest_dir.mkdir(parents=True)
+        self.other = self.tmp / "checkpoint"
+        self.other.write_bytes(b"new-checkpoint")
+        source = (S1 / "nightly.sh").read_text()
+        start = source.index("run_copy() {")
+        line = source[start:source.index("\n", start)]
+        self.fn = line if line.rstrip().endswith("}") else source[start:source.index("\n}\n", start) + 2]   # one-line or block
+
+    def run_copy(self, src, dest):
+        return subprocess.run(["/bin/bash", "-c", "set -u\n" + self.fn + '\nrun_copy "$1" "$2"', "t", str(src), str(dest)],
+                              capture_output=True, text=True)
+
+    def test_a_planted_tmp_symlink_to_the_source_is_not_written_through(self):
+        dest = self.dest_dir / "resume_0_adapters.safetensors"
+        Path(str(dest) + ".tmp").symlink_to(self.src)
+        out = self.run_copy(self.other, dest)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.src.read_bytes(), b"promoted-weights", "the source content is untouched")
+        self.assertEqual(stat.S_IMODE(self.src.stat().st_mode), 0o644)
+        self.assertFalse(dest.is_symlink())
+        self.assertEqual(dest.read_bytes(), b"new-checkpoint")
+        self.assertTrue(stat.S_IMODE(dest.stat().st_mode) & stat.S_IWUSR)
+        self.assertEqual(sorted(p.name for p in self.dest_dir.iterdir()), [dest.name, dest.name + ".tmp"], "no temp left")
+
+    def test_a_symlinked_destination_is_refused(self):
+        dest = self.dest_dir / "adapter_config.json"
+        dest.symlink_to(self.src)
+        out = self.run_copy(self.other, dest)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("symlink", out.stderr)
+        self.assertEqual(self.src.read_bytes(), b"promoted-weights")
+        self.assertTrue(dest.is_symlink(), "refused, not replaced")
+        self.assertEqual([p.name for p in self.dest_dir.iterdir()], [dest.name], "no temp left")
+
+    def test_a_symlinked_destination_directory_is_refused(self):
+        alias = self.tmp / "run" / "aliased"
+        alias.symlink_to(self.src.parent, target_is_directory=True)
+        out = self.run_copy(self.other, alias / self.src.name)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(self.src.read_bytes(), b"promoted-weights")
+        self.assertEqual([p.name for p in self.src.parent.iterdir()], [self.src.name], "nothing written into the source dir")
+
+    def test_a_failed_copy_leaves_no_temporary(self):
+        out = self.run_copy(self.tmp / "missing", self.dest_dir / "x.safetensors")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(list(self.dest_dir.iterdir()), [])
+
+    def test_a_read_only_destination_and_source_give_a_writable_copy(self):
+        dest = self.dest_dir / "adapter_config.json"
+        dest.write_text("old")
+        dest.chmod(0o444)
+        self.src.chmod(0o444)
+        out = self.run_copy(self.src, dest)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(dest.read_bytes(), b"promoted-weights")
+        self.assertTrue(stat.S_IMODE(dest.stat().st_mode) & stat.S_IWUSR)
+        self.assertEqual(stat.S_IMODE(self.src.stat().st_mode), 0o444)
 
 
 class DeadlineCleanup(unittest.TestCase):
@@ -1355,6 +1431,91 @@ PY
         self.assertEqual(rc, 1, log)
         self.assertIn("says LoRA rank 8 but the tensors of", log)
         self.assertFalse((Path(self.env["HOME"]) / "lora.log").exists(), "mlx_lm must not be started")
+
+    # --- Read-only adapter copies (2026-11-14): the warm start copied the 0444 promoted adapter with plain cp ---------------
+    def _lora_calls(self):
+        log = Path(self.env["HOME"]) / "lora.log"
+        return [l for l in log.read_text().splitlines() if l.startswith("-m mlx_lm")] if log.exists() else []
+
+    def test_read_only_warm_start_source_gives_writable_run_copies_and_trains(self):
+        _, log, run1 = self.run_night(STUB_NEW_LABELS=3)
+        self.assertIn("PROMOTED", log)
+        src = fake_adapter(run1 / "adapter", rank=16)
+        for f in run1.joinpath("adapter").iterdir():           # promote_sweep.py leaves a promoted adapter 0444 on purpose
+            f.chmod(0o444)
+        before = {f.name: (f.read_bytes(), stat.S_IMODE(f.stat().st_mode)) for f in run1.joinpath("adapter").iterdir()}
+        (Path(self.env["HOME"]) / "lora.log").write_text("")
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=1)
+        self.assertEqual(rc, 0, log)
+        self.assertIn(f"warm start from {src.resolve()}", log)
+        self.assertNotIn("PermissionError", log)
+        self.assertNotIn("trainer died", log)
+        self.assertEqual(len(self._lora_calls()), 1, "one trainer launch, and it trained")
+        for name in ("adapter_config.json", "resume_0_adapters.safetensors", "0000000_adapters.safetensors.old"):
+            mode = stat.S_IMODE((run2 / "adapter" / name).stat().st_mode)
+            self.assertTrue(mode & stat.S_IWUSR, f"{name} is {oct(mode)}: the run's own copy must be owner-writable")
+        cfg = json.loads((run2 / "adapter/adapter_config.json").read_text())
+        self.assertEqual(cfg["lora_parameters"]["rank"], 16)
+        self.assertTrue(cfg["resume_adapter_file"].endswith("resume_0_adapters.safetensors"))
+        self.assertTrue((run2 / "adapter/adapters.safetensors").is_file(), "training proceeded to its final adapter")
+        after = {f.name: (f.read_bytes(), stat.S_IMODE(f.stat().st_mode)) for f in run1.joinpath("adapter").iterdir()
+                 if f.name in before}
+        self.assertEqual(after, before, "the source adapter's content and 0444 modes are untouched")
+
+    def test_read_only_copies_left_in_a_run_dir_are_healed_before_the_trainer_starts(self):
+        """Today's Studio run dir as the failed night left it: every adapter file 0444, a resume_0 checkpoint, a segment target."""
+        run = self.s1 / "runs/2026-01-01"
+        fake_adapter(run / "adapter", "resume_0_adapters.safetensors", rank=16)
+        fake_adapter(run / "adapter", "0000000_adapters.safetensors.old", rank=16)
+        (run / "segment-target").write_text("300\n")
+        for f in (run / "adapter").iterdir():
+            f.chmod(0o444)
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=1)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("adapter: gave the run's own copies owner write permission", log)
+        self.assertIn("adapter_config.json", log)
+        self.assertEqual(len(self._lora_calls()), 1)
+        self.assertNotIn("trainer died", log)
+        self.assertEqual(json.loads((run / "adapter/adapter_config.json").read_text())["lora_parameters"]["rank"], 16)
+
+    def test_adapter_config_symlinked_to_a_source_is_refused_before_launch(self):
+        src = self.tmp / "promoted"
+        fake_adapter(src, rank=8)
+        (src / "adapter_config.json").chmod(0o444)
+        run = self.s1 / "runs/2026-01-01"
+        fake_adapter(run / "adapter", "0000100_adapters.safetensors", rank=8)
+        (run / "adapter/adapter_config.json").unlink()
+        (run / "adapter/adapter_config.json").symlink_to(src / "adapter_config.json")
+        (run / "segment-target").write_text("300\n")
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=1)
+        self.assertEqual(rc, 1, log)
+        self.assertIn("TRAINING PREFLIGHT FAILED", log)
+        self.assertEqual(self._lora_calls(), [], "mlx_lm must not be started")
+        self.assertEqual(stat.S_IMODE((src / "adapter_config.json").stat().st_mode), 0o444, "the source keeps its mode")
+        st = json.loads((self.s1 / "data/status.json").read_text())
+        self.assertIn("symlink", st["last_train_failure"]["detail"])
+
+    def test_deterministic_trainer_error_stops_after_one_attempt(self):
+        rc, log, run = self.run_night(STUB_NEW_LABELS=3, STUB_LORA_FAIL="permission", CORTADOS_S1_TRAIN_RETRY_S=0)
+        self.assertEqual(rc, 1, log)
+        self.assertEqual(len(self._lora_calls()), 1, "a deterministic error is not retried")
+        self.assertIn("trainer died (attempt 1)", log)
+        self.assertNotIn("attempt 2", log)
+        self.assertIn("TRAINING FAILED for runs/2026-01-01: deterministic trainer error (PermissionError: [Errno 13] "
+                      "Permission denied:", log)
+        st = json.loads((self.s1 / "data/status.json").read_text())
+        self.assertIn("deterministic trainer error, not retried: PermissionError", st["last_train_failure"]["detail"])
+        calls = (self.tmp / "home/launchctl.log").read_text().split("\n")
+        self.assertTrue(calls[-2].startswith("launchctl load"), f"the scorer comes back: {calls}")
+
+    def test_transient_trainer_death_is_retried_four_times_and_reported(self):
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=3, STUB_LORA_FAIL="crash", CORTADOS_S1_TRAIN_RETRY_S=0)
+        self.assertEqual(rc, 1, log)
+        self.assertEqual(len(self._lora_calls()), 4)
+        self.assertIn("trainer died (attempt 4)", log)
+        self.assertIn("TRAINING FAILED for runs/2026-01-01: trainer died on 4 attempts", log)
+        st = json.loads((self.s1 / "data/status.json").read_text())
+        self.assertIn("trainer died on 4 attempts", st["last_train_failure"]["detail"])
 
     def test_pending_candidate_with_a_missing_adapter_is_dropped_not_superseded(self):
         _, _, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_RC=1)

@@ -15,7 +15,9 @@ is the long form.
   `scarcity.py` quota reading via vendor CLIs (`scarcity_codex.py` parses Codex's `/status`), `unitcost.py`,
   `transport.py`, `router_db.py` (router.db reader opener — `mode=rw` + `query_only`, never `mode=ro` in a process that
   also writes it, #99 — and the route-log error counter), `local_resources.py`, `local_gate.py` (token-checked reverse proxy run on a local Ollama node: the
-  provider's local lane reaches Ollama only through it), `subagent_mcp.py` (stdio MCP server: a `route_task` tool that delegates a
+  provider's local lane reaches Ollama only through it; it also serves the node's manual switch at
+  `/cortados/local-switch`, read and flipped by `provider/local_switch.py` behind `GET /v1/cortados/local` and
+  `POST /v1/cortados/local/switch`), `subagent_mcp.py` (stdio MCP server: a `route_task` tool that delegates a
   self-contained subtask to the `cortados` provider endpoint and returns the routed model's text; stdlib, runs standalone),
   `child_tasks.py` (whole tasks as headless Claude Code children; `--run` runner, `--remote` host side, `--cleanup-archive`;
   the runner appends each finished run, redacted, to the append-only `$CORTADOS_HOME/exports/task-runs.jsonl` for
@@ -23,14 +25,19 @@ is the long form.
   `orchestrator_usage.py` (the owner's main Claude Code sessions' own tokens from local transcripts, direct-model
   subagents included as a sub-total; child-task transcripts, the provider's bridge/search-lane scratch-dir transcripts
   and provider-served messages excluded; sent in the heartbeat's `orchestrator` block, README "Work split"),
+  `boundary_hook.py` (the client-side PreToolUse boundary hook of local-routed turns: asks the provider's
+  `/v1/cortados/boundary/check` about each write/Bash tool_use and resolves paths with realpath on the client; installed
+  by `session.py` in every child and embedded in the routed-subagents mod; docs/BOUNDARY-HOOK.md),
   `exec_hosts.py` (which machine a child runs on: `~/.config/cortados/exec-hosts.json`, ssh transport), `workspaces.py`
   (per-task repo worktrees / folders under `<root>/active`, archive-or-held settling, index.jsonl, archive-only cleanup).
 - `cortados_router/provider/` — the `cortados` model endpoint (design and status: `docs/PROVIDER-PLAN.md`).
   `server.py` HTTP endpoint, `Registry` of conversations and the `Wire` seam; `anthropic_wire.py` (Claude Code,
   `/v1/messages`) and `responses_wire.py` (Codex, `/v1/responses`) turn requests into one `ClientTurn`;
-  `routing.py` picks the lane through the router's execution policy; `bridge.py` drives a headless Claude CLI with
+  `routing.py` picks the lane through the router's execution policy; `effect_boundary.py` is the effect boundary of
+  automatically local-routed turns (a profile per bind reason: sensitive = no shell, cost = Bash with best-effort outward patterns; tool allowlist; project-folder path rules for file writes; applied by `local_lane.serve`/`complete`); `bridge.py` drives a headless Claude CLI with
   `mcp_shim.py` serving the client's tools; `codex_bridge.py` drives `codex app-server` with the client's tools as
   dynamic tools, under the isolation policy of `codex_isolation.py` (command line, config and login checks, aliases).
+  `child_env.py` is the environment allowlist every backend CLI the provider starts runs on (#106).
   `office.py` is the Office view (`GET /v1/cortados/office`, metadata-only floors per routing session, fed by the
   `x-cortados-session/-project/-device/-task-title` headers, child-tasks.jsonl and `POST /v1/cortados/office/heartbeat`);
   `clients.py` holds the scoped per-client tokens (`clients.json`, hashes + named scopes: `office:read`, `live:read`,
@@ -44,7 +51,9 @@ is the long form.
   `usage.py` builds `GET /v1/cortados/usage` and `tasks.py` builds
   `GET /v1/cortados/tasks` (the latest 200 `routes` rows as metadata: model, band, S1 reason by category, elapsed, % routed
   per session; never the request text; tokens per routed conversation since the work split, `not recorded` before), both behind the owner token and both read by
-  `dashboard.html` (`GET /dashboard`).
+  `dashboard.html` (`GET /dashboard`). `dashboard_auth.py` is the dashboard's password login (CLI `set-password` /
+  `clear-password` / `status` / `logout-all`; sessions open only the read views and `local:switch` through
+  `Handler._owner_or_session`, never the model endpoints; README "Dashboard password").
 - `tables/` — routing table, budgets, generated model scores and tiers (`*.generated.json` are built
   nightly by `tables/benchmarks/build_tiers.py`; do not hand-edit them).
 - `s1/` — S1 scorer: dataset, labelling, SFT, evaluation, serving, nightly job.

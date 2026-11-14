@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from cortados_router.provider.bridge import STRIPPED_ENV as CLAUDE_STRIPPED_ENV, BridgeError
+from cortados_router.provider.child_env import backend_env
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,9 @@ logger = logging.getLogger(__name__)
 # tests cite it); STRIPPED_ENV_PREFIXES below removes these and every other variable of the same families.
 STRIPPED_ENV = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BASE_URL") + CLAUDE_STRIPPED_ENV
 # Stripped by prefix, not by an exact list (#84): a vendor variable added in a later CLI release passes an exact list
-# unseen. One reason per prefix:
+# unseen. Since #106 the app-server's environment is an allowlist (child_env.py, codex_isolation.child_env) and these
+# prefixes no longer decide it; they remain the rule of stripped() / prefix_stripped_env (the S1 outcome loop) and the
+# families no allowlist entry may come from without a stated reason. One reason per prefix:
 STRIPPED_ENV_PREFIXES = (
     "OPENAI_",      # keys, base URLs, org/project ids of the openai provider: would bill or redirect off the home's login
     "CODEX_",       # Codex's own overrides (API key, access token, sandbox and config knobs): only the home decides
@@ -367,10 +370,18 @@ def stripped(name: str) -> bool:
 
 
 def child_env(home: str) -> dict[str, str]:
-    """The child's environment: STRIPPED_ENV and every STRIPPED_ENV_PREFIXES variable removed except ALLOWED_ENV, and
-    CODEX_HOME set to the one absolute home this process read config.toml from (dedicated, inherited or the user's
-    own), so both readers name the same directory whatever the child's cwd. The home is never copied: a throwaway one
-    has no login, and a copied auth.json would spend the single-use refresh token."""
+    """The app-server's environment (#106): only the allowlist of child_env.backend_env("codex") (base variables plus
+    CODEX_CA_CERTIFICATE; no OPENAI_*/CODEX_* key or override, no provider token, no other secret of this process),
+    with CODEX_HOME set to the one absolute home this process read config.toml from (dedicated, inherited or the
+    user's own), so both readers name the same directory whatever the child's cwd. The home is never copied: a
+    throwaway one has no login, and a copied auth.json would spend the single-use refresh token."""
+    return backend_env("codex", {"CODEX_HOME": home})
+
+
+def prefix_stripped_env(home: str) -> dict[str, str]:
+    """The pre-#106 rule: this process's environment less every stripped() variable, CODEX_HOME set to `home`. Kept
+    only for the S1 outcome loop (s1/outcome/agents.py), whose Codex task runs #106 left out of scope; the provider's
+    own app-server uses child_env."""
     env = {k: v for k, v in os.environ.items() if not stripped(k)}
     env["CODEX_HOME"] = home
     return env

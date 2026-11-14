@@ -116,11 +116,81 @@ def parse_office_header(item: str) -> tuple[str, str]:
 LOCAL_MODES = ("sensitive", "prefer")
 
 
+# The provider's effect_boundary.HOOK_HEADER (checked by a test): this session's PreToolUse boundary hook is installed,
+# so a sensitive local-routed turn may offer file writes (docs/BOUNDARY-HOOK.md). Without it such a turn is read-only.
+BOUNDARY_HOOK_HEADER = "x-cortados-boundary-hook"
+# The tools the boundary hook checks: the file writers (path containment on this machine) and Bash (profile).
+BOUNDARY_HOOK_MATCHER = "Write|Edit|MultiEdit|NotebookEdit|Bash"
+
+
+BOUNDARY_HOOK_FILE = Path(__file__).resolve().with_name("boundary_hook.py")
+# Where the hook's interpreter is looked for, in order, after the interpreter running this launcher: absolute paths
+# only, never a PATH lookup (a project's bin/, venv or node_modules/.bin may come first on PATH; docs/BOUNDARY-HOOK.md).
+SYSTEM_PYTHONS = ("/usr/bin/python3",)
+# The shell guard around the hook's interpreter (docs/BOUNDARY-HOOK.md "Isolation"). Claude Code treats any hook exit
+# but 2 as a non-blocking error and runs the call, so an interpreter that cannot start (a missing path: 126/127; a
+# broken /usr/bin/python3 shim) would let a provider-marked call through. The guard buffers the event, runs the
+# interpreter in a subshell from /, passes 0 and 2 through, and on any other status decides from the event's
+# tool_use_id FIELD alone: an id starting with toolu_cxb_ (effect_boundary.MARK_PREFIX) is denied (exit 2), any other
+# id allowed (exit 0). An id it cannot read (no single "tool_use_id" key with a plain value; a missing grep or sed)
+# denies when the raw event holds "toolu_cxb_ anywhere: a false block, never a false allow. Helpers by absolute path,
+# never PATH. The mod's hooks/register.ts carries the same two strings (tests/test_boundary_hook.py keeps them equal).
+BOUNDARY_HOOK_GUARD_HEAD = r"""ev=$(/bin/cat) || { printf 'cortados boundary: denied: the hook could not read its input. Nothing was run.\n' >&2; exit 2; }; printf '%s\n' "$ev" | (cd / && exec """
+BOUNDARY_HOOK_GUARD_TAIL = r"""); rc=$?; [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 2 ] && exit 2; f=$(printf '%s' "$ev" | /usr/bin/tr '\n\r\t' '   '); id=; printf '%s\n' "$f" | /usr/bin/grep -q '"tool_use_id"[[:space:]]*:.*"tool_use_id"[[:space:]]*:'; if [ "$?" -eq 1 ]; then id=$(printf '%s\n' "$f" | /usr/bin/sed -n 's/^.*"tool_use_id"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9_-]\{1,\}\)".*$/\1/p'); fi; case $id in toolu_cxb_*) m=1;; ?*) m=0;; *) case $ev in *'"toolu_cxb_'*) m=1;; *) m=0;; esac;; esac; if [ "$m" = 1 ]; then printf 'cortados boundary: denied: the hook did not run (exit %s), and a provider-marked call fails closed. Nothing was run.\n' "$rc" >&2; exit 2; fi; exit 0"""
+
+
+def guarded_hook_command(python: str, args: str) -> str:
+    """The boundary hook's shell command: `<python> -I -S -B <args>` (args already shell-quoted) inside the guard."""
+    return BOUNDARY_HOOK_GUARD_HEAD + shlex.quote(python) + " -I -S -B " + args + BOUNDARY_HOOK_GUARD_TAIL
+
+
+def _within(path: str, folder: str) -> bool:
+    folder = folder.rstrip("/") or "/"
+    return path == folder or path.startswith(folder.rstrip("/") + "/")
+
+
+def _inside_project(path: str, project: str | None) -> bool:
+    """path (lexically or with links followed) is the project folder or lies below it (lexically or real)."""
+    if not project:
+        return False
+    roots = {os.path.normpath(os.path.abspath(project)), os.path.realpath(project)}
+    forms = {os.path.normpath(os.path.abspath(path)), os.path.realpath(path)}
+    return any(_within(p, r) for p in forms for r in roots)
+
+
+def boundary_hook_python(project: str | None = None, candidates=None) -> str:
+    """The absolute interpreter for the boundary hook: the real path of the interpreter running this launcher, else
+    SYSTEM_PYTHONS; one inside the project folder is refused (the model may write there). SessionError when none."""
+    if candidates is None:
+        candidates = ([os.path.realpath(sys.executable)] if sys.executable else []) + list(SYSTEM_PYTHONS)
+    for c in candidates:
+        if (c and os.path.isabs(c) and os.path.isfile(c) and os.access(c, os.X_OK)
+                and not _inside_project(c, project)):
+            return c
+    raise SessionError("no python3 for the boundary hook outside the project folder (tried "
+                       + ", ".join(map(str, candidates)) + ")")
+
+
+def boundary_hook_entry(project: str | None = None, python: str | None = None) -> dict:
+    """The PreToolUse entry running boundary_hook.py: `<absolute python3> -I -S -B <absolute script>` (shell-quoted),
+    from / inside the shell guard (guarded_hook_command). No PATH lookup, isolated mode, no site import, fail closed for
+    a marked call when the interpreter cannot start (docs/BOUNDARY-HOOK.md "Isolation"). A hook script inside
+    the project folder is refused. Timeout 30 s, well past the script's own 5 s provider timeout, so the script always
+    answers (and fails closed) itself."""
+    if _inside_project(str(BOUNDARY_HOOK_FILE), project):
+        raise SessionError("the boundary hook script lies inside the project folder; run the launcher from a router "
+                           "checkout outside it")
+    python = python or boundary_hook_python(project)
+    command = guarded_hook_command(python, shlex.quote(str(BOUNDARY_HOOK_FILE)))
+    return {"matcher": BOUNDARY_HOOK_MATCHER, "hooks": [{"type": "command", "command": command, "timeout": 30}]}
+
+
 def custom_headers(run_id: str | None = None, office_headers=None, local: str | None = None) -> str:
     """ANTHROPIC_CUSTOM_HEADERS (newline-separated `name: value` lines). With a run id, every request of the session is
     recorded by the provider under it (GET /v1/cortados/runs/<id>); office headers (`name: value` items, OFFICE_HEADERS
     only) tag it for the Office view; `local` (LOCAL_MODES only) adds x-cortados-local."""
-    lines = ["x-cortados-reveal: 1"]
+    # The boundary hook (BOUNDARY_HOOK_HEADER): settings_content always installs boundary_hook.py next to this header.
+    lines = ["x-cortados-reveal: 1", BOUNDARY_HOOK_HEADER + ": 1"]
     if run_id:
         if not RUN_ID_RE.fullmatch(run_id):
             raise SessionError(f"run id {run_id!r} does not match the provider's run-id pattern")
@@ -171,13 +241,19 @@ def build_env(base: dict, provider_url: str, token: str, delegate_budget: int = 
 
 
 def settings_content(provider_url: str, token: str, delegate_budget: int = 3, gate: bool = True,
-                     run_id: str | None = None, office_headers=None, local: str | None = None) -> dict:
+                     run_id: str | None = None, office_headers=None, local: str | None = None,
+                     project: str | None = None) -> dict:
+    """project: the session's project folder when known (child tasks: --project-dir); the boundary hook's interpreter
+    and script must lie outside it."""
+    # disableAllHooks false: a user settings file cannot switch the boundary hook off while the header says it runs.
     content = {"env": launcher_env(provider_url, token, delegate_budget, run_id, office_headers, local),
-               "enabledPlugins": {PLUGIN_ID: False}}
+               "enabledPlugins": {PLUGIN_ID: False}, "disableAllHooks": False}
+    pre = [boundary_hook_entry(project)]         # always: the header in env promises it (no hook, no edits)
     if gate:
         # Absolute standalone script: hook cwd need not be this checkout; shell-quote paths with spaces.
         command = "python3 -B " + shlex.quote(str(Path(__file__).resolve().with_name("orchestrator_gate.py")))
-        content["hooks"] = {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": command}]}]}
+        pre.append({"matcher": "*", "hooks": [{"type": "command", "command": command}]})
+    content["hooks"] = {"PreToolUse": pre}
     return content
 
 
@@ -330,6 +406,8 @@ def parse(argv: list):
     ap.add_argument("--office-header", action="append", default=[], help=argparse.SUPPRESS)
     # child tasks: x-cortados-local on every request of the session (start_task's `local` option)
     ap.add_argument("--local", default=None, help=argparse.SUPPRESS)   # checked by custom_headers (SessionError)
+    # child tasks: the child's project folder; the boundary hook's interpreter and script must lie outside it
+    ap.add_argument("--project-dir", default=None, help=argparse.SUPPRESS)
     return ap.parse_args(argv), extra
 
 
@@ -353,7 +431,7 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home
     check_managed(set(launcher_env(url, token, args.delegate_budget, args.run_id, office, args.local)), managed_dirs)
     settings_path = write_settings(args.settings_dir or SETTINGS_DIR,
                                    settings_content(url, token, args.delegate_budget, not args.no_gate, args.run_id,
-                                                    office, args.local), home)
+                                                    office, args.local, args.project_dir), home)
     return (args, build_env(base_env, url, token, args.delegate_budget, args.run_id, office, args.local),
             build_argv(model, directive, extra, settings_path))
 

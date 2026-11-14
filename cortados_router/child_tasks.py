@@ -1316,6 +1316,8 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
         launch += ["--office-header", f"{_OFFICE_HEADER_OF[k]}: {v}"]
     if local:                                   # validated by _start; session.py checks it again
         launch += ["--local", local]
+    if cwd:                                     # the boundary hook's interpreter and script must lie outside it
+        launch += ["--project-dir", cwd]
     # Never the whole-session ORCHESTRATOR directive or its delegation gate, whatever the orchestrator: a child is the
     # delegate and does the work itself (CHILD_DIRECTIVE). A pinned orchestrator only pins the child's main model; its
     # native subagents are still routed by S1 (CLAUDE_CODE_SUBAGENT_MODEL).

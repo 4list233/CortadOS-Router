@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<meta id="cortados-auth" name="cortados-auth" content="token">
+<meta id="cortados-csrf" name="cortados-csrf" content="">
 <title>CortadOS Router · live</title>
 <style>
 /* Two themes from one set of roles. Light is the default; dark follows the system unless the theme button pins one.
@@ -179,9 +181,10 @@ ul { margin:0; padding-left:18px; }
 </header>
 <form id="login" class="card" hidden>
   <div class="title">Provider token</div>
-  <div class="sub">Kept in this tab's sessionStorage only; sent as a Bearer header to /v1/cortados/live, /v1/cortados/usage and /v1/cortados/tasks.</div>
+  <div class="sub">Kept in this tab's sessionStorage only; sent as a Bearer header to /v1/cortados/live, /v1/cortados/usage, /v1/cortados/tasks and /v1/cortados/local (the Local models switch).</div>
   <input id="tok" type="password" autocomplete="off" required>
   <button type="submit">Open dashboard</button>
+  <div class="sub" id="pwhint">set a password: python3 -B -m cortados_router.provider.dashboard_auth set-password (on the Air)</div>
 </form>
 <main id="live" hidden></main>
 <main id="main" hidden></main>
@@ -194,7 +197,17 @@ ul { margin:0; padding-left:18px; }
 const KEY = "cortados-usage-token", THEME_KEY = "cortados-theme";
 const LIVE_URL = "/v1/cortados/live", URL_ = "/v1/cortados/usage", TASKS_URL = "/v1/cortados/tasks";
 const LIVE_EVERY = 5000, EVERY = 30000, ROUTED_SHOWN = 10;
+// The Local models card (/v1/cortados/local, provider/local_switch.py) asks each node's gate, so it is polled every
+// LOCAL_EVERY on the Live tab, not on every 5 s live poll, and at once after a switch.
+const LOCAL_URL = "/v1/cortados/local", LOCAL_SWITCH_URL = "/v1/cortados/local/switch", LOCAL_EVERY = 30000;
 const $ = (id) => document.getElementById(id);
+// Auth mode, set by the server in the cortados-auth meta tag. "session": a password is set and this page was served to
+// a logged-in browser; every view is fetched with the HttpOnly session cookie (credentials: same-origin, no token) and
+// a POST carries the session's CSRF token (cortados-csrf meta) in x-cortados-csrf. "token" (or anything else): no
+// password is set; the page asks for the provider token and sends it as a Bearer header, as before.
+const authMeta = $("cortados-auth"), csrfMeta = $("cortados-csrf");
+const SESSION = !!(authMeta && authMeta.content === "session");
+const CSRF = (SESSION && csrfMeta && typeof csrfMeta.content === "string") ? csrfMeta.content : "";
 let timer = null, liveTimer = null, tickTimer = null, lastOk = null, view = "live", usageLoaded = false, routedAll = false, lastLive = null;
 // sessionStorage can throw (storage disabled, some private modes). Then the token lives in memTok for this page only,
 // and the page says so, instead of losing the token and asking for it again on every poll.
@@ -604,6 +617,82 @@ function renderHosts(box, s, s1) {
   add(P.body, grid);
   add(box, P.p);
 }
+// ---------------------------------------------------------------- Local models card (Live tab)
+// One panel kept across live renders (renderLive re-appends it), filled from the last /v1/cortados/local answer.
+const localP = panel("p-local", "Local models", "span-12");
+let localAt = 0, localBusy = false, localNote = null;
+const POWER_TEXT = {ac: "AC power", battery: "on battery", unknown: "power unknown"};
+function renderLocal(d, failure) {
+  localP.body.replaceChildren();
+  localP.meta.textContent = "switch per node; the gate on each node decides";
+  if (failure) add(localP.body, el("div", "secerr err", "local view unavailable: " + failure));
+  if (localNote) add(localP.body, el("div", localNote.err ? "secerr err" : "sub", localNote.text));
+  if (!d) return;
+  const nodes = d.nodes || [];
+  if (!nodes.length) { add(localP.body, el("div", "sub muted", d.note || "no local node configured")); return; }
+  const grid = el("div", "hosts");
+  nodes.forEach(n => {
+    const c = el("div", "host"), top = el("div", "top");
+    add(top, el("span", "hn", n.label || n.node));
+    add(top, n.reachable ? pill(n.allowed ? "ok" : "stopped", n.allowed ? "allowed" : "refused") : pill("down", "unreachable"));
+    add(c, top);
+    if (n.error) add(c, el("div", "secerr err", n.error));
+    const loaded = n.models_loaded || [];
+    add(c, el("div", "sub", join(["switch " + (n.switch || "unknown"), n.reachable ? POWER_TEXT[n.power] || "power unknown" : null,
+      n.training ? "S1 training holds the node" : null])));
+    if (n.reason) add(c, el("div", "sub muted", n.reason));
+    add(c, el("div", "sub", n.ollama === "up" ? (loaded.length ? "loaded: " + loaded.join(", ") : "no model loaded")
+      : n.reachable ? "Ollama " + (n.ollama || "unknown") : null));
+    const a = n.auto_route;
+    add(c, el("div", "sub muted", a ? "auto_route: " + a.model + " for " + (a.bands || []).join(", ") : "auto_route: off (pin-only)"));
+    if (n.reachable && (n.switch === "on" || n.switch === "off")) {
+      const want = n.switch !== "on";
+      const b = el("button", null, want ? "Turn on" : "Turn off"); b.type = "button";
+      b.addEventListener("click", () => toggleLocal(n, want, b));
+      add(c, b);
+    }
+    add(grid, c);
+  });
+  add(localP.body, grid);
+}
+async function refreshLocal(t, force) {
+  if (localBusy || (!force && Date.now() - localAt < LOCAL_EVERY)) return;
+  localBusy = true; localAt = Date.now();
+  try {
+    const res = await get(LOCAL_URL, t);
+    if (!res.ok) return renderLocal(null, "error " + res.status);
+    renderLocal(await res.json());
+  } catch (e) { renderLocal(null, "fetch failed: " + (e && e.message ? e.message : e)); }
+  finally { localBusy = false; }
+}
+// Turning a node OFF while a model is loaded asks first: local requests are refused at once (the model stays loaded).
+async function toggleLocal(n, on, b) {
+  const loaded = n.models_loaded || [];
+  if (!on && loaded.length && !confirm("Turn local models OFF on " + (n.label || n.node) + "? " + loaded.join(", ") +
+      " is loaded; new local requests will be refused.")) return;
+  if (!haveAuth()) return showLogin();
+  const t = SESSION ? "" : getTok();
+  b.disabled = true; b.textContent = on ? "turning on…" : "turning off…";
+  // Session mode: the HttpOnly cookie (credentials same-origin) plus the session's CSRF token; referrerPolicy
+  // same-origin so the POST carries the page's real Origin (under no-referrer it would be `Origin: null`, refused).
+  // Token mode: the Bearer header and no cookie, as before.
+  const opts = SESSION
+    ? {method: "POST", cache: "no-store", credentials: "same-origin", referrerPolicy: "same-origin",
+       headers: {"x-cortados-csrf": CSRF, "content-type": "application/json"}}
+    : {method: "POST", cache: "no-store", credentials: "omit",
+       headers: {"Authorization": "Bearer " + t, "content-type": "application/json"}};
+  opts.body = JSON.stringify({node: n.node, on: on});
+  try {
+    const res = await fetch(LOCAL_SWITCH_URL, opts);
+    if (res.status === 401) return authLost();
+    let msg = "error " + res.status;
+    try { const j = await res.json(); if (j && j.error && typeof j.error.message === "string") msg = j.error.message; } catch (e) {}
+    localNote = res.ok ? {text: (n.label || n.node) + " switched " + (on ? "on" : "off") + " at " + new Date().toLocaleTimeString()}
+                       : {err: true, text: "switch failed: " + msg};
+  } catch (e) { localNote = {err: true, text: "switch failed: " + (e && e.message ? e.message : e)}; }
+  await refreshLocal(t, true);
+}
+
 function renderLive(d) {
   lastLive = d;
   document.body.classList.remove("stale");
@@ -634,6 +723,7 @@ function renderLive(d) {
   renderRouted(panels, d.routed || {}, now);
   renderWorkSplit(panels, d.work_split || {}, now);
   renderHosts(panels, d.hosts || {}, s1);
+  add(panels, localP.p);
   add(box, panels);
   lastOk = new Date();
   const st = $("status"); st.className = o.errors ? "err" : "";
@@ -834,14 +924,38 @@ function stopTimers() {
 }
 function showLogin(msg) {
   stopTimers();
+  localAt = 0; localNote = null; localP.body.replaceChildren();   // another token must not see the last one's answer
   $("main").hidden = true; $("live").hidden = true; $("tabs").hidden = true; $("logout").hidden = true; $("login").hidden = false;
   $("status").textContent = msg || ""; $("tok").value = ""; $("tok").focus();
 }
-async function get(url, t) { return fetch(url, {headers: {"Authorization": "Bearer " + t}, cache: "no-store", credentials: "omit"}); }
+async function get(url, t) {
+  if (SESSION) return fetch(url, {cache: "no-store", credentials: "same-origin"});
+  return fetch(url, {headers: {"Authorization": "Bearer " + t}, cache: "no-store", credentials: "omit"});
+}
+// Session mode has no token form: a refused or ended session goes back to /dashboard, which serves the login page.
+function relogin() { location.replace("/dashboard"); }
+function authLost() {
+  if (SESSION) { stopTimers(); return relogin(); }
+  setTok(""); return showLogin("Token refused; enter it again.");
+}
+function haveAuth() { return SESSION || !!getTok(); }
+async function logout() {
+  if (!SESSION) { setTok(""); return showLogin("Token forgotten."); }
+  stopTimers();
+  try {
+    // referrerPolicy same-origin: under the page's no-referrer policy a POST would carry `Origin: null`, which the
+    // server's same-origin check refuses; same-origin sends the real Origin here and nothing to any other site.
+    const res = await fetch("/dashboard/logout", {method: "POST", headers: {"x-cortados-csrf": CSRF}, cache: "no-store",
+                                                   credentials: "same-origin", referrerPolicy: "same-origin"});
+    if (!res.ok && res.status !== 401) return failed("log out failed: error " + res.status);
+  } catch (e) { return failed("log out failed: " + (e && e.message ? e.message : e)); }
+  relogin();
+}
 // One live poll at a time: a slow answer is not overlapped by the next tick (or a visibilitychange catch-up).
 let liveBusy = false;
 async function refreshLive() {
-  const t = getTok(); if (!t) return showLogin();
+  if (!haveAuth()) return showLogin();
+  const t = SESSION ? "" : getTok();
   if (document.hidden) return;                      // a background tab does not poll; visibilitychange catches up
   if (liveBusy) return;
   liveBusy = true;
@@ -850,11 +964,12 @@ async function refreshLive() {
 async function pollLiveOnce(t) {
   try {
     const res = await get(LIVE_URL, t);
-    if (res.status === 401) { setTok(""); return showLogin("Token refused; enter it again."); }
+    if (res.status === 401) return authLost();
     if (res.status === 403) return failed("this token's scopes do not cover the live view (needs live:read)");
     if (!res.ok) return failed("error " + res.status);
     renderLive(await res.json());
   } catch (e) { return failed("fetch failed: " + (e && e.message ? e.message : e)); }
+  await refreshLocal(t, false);
 }
 // The tasks view is fetched after a good usage render, with the same token. Its failure never hides the usage view and
 // never forgets the token (a 401 here with a token the usage view just accepted is reported, not acted on).
@@ -866,10 +981,11 @@ async function refreshTasks(t) {
   } catch (e) { renderTasks(null, "fetch failed: " + (e && e.message ? e.message : e)); }
 }
 async function refresh() {
-  const t = getTok(); if (!t) return showLogin();
+  if (!haveAuth()) return showLogin();
+  const t = SESSION ? "" : getTok();
   try {
     const res = await get(URL_, t);
-    if (res.status === 401) { setTok(""); return showLogin("Token refused; enter it again."); }
+    if (res.status === 401) return authLost();
     if (!res.ok) return failed("error " + res.status);
     usageLoaded = true;
     render(await res.json());
@@ -896,10 +1012,11 @@ function start(which) { $("login").hidden = true; $("tabs").hidden = false; $("l
 $("tab-live").addEventListener("click", () => show("live"));
 $("tab-usage").addEventListener("click", () => show("usage"));
 $("login").addEventListener("submit", (ev) => { ev.preventDefault(); const t = $("tok").value.trim(); if (!t) return; setTok(t); start(); });
-$("logout").addEventListener("click", () => { setTok(""); showLogin("Token forgotten."); });
+$("logout").addEventListener("click", () => { logout(); });
 document.addEventListener("visibilitychange", () => { if (!document.hidden && view === "live" && liveTimer) refreshLive(); });
 loadTheme();
-if (getTok()) start(); else showLogin();
+if (SESSION) $("logout").textContent = "Log out";
+if (haveAuth()) start(); else showLogin();
 </script>
 </body>
 </html>

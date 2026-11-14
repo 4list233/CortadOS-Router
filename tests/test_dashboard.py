@@ -11,6 +11,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 from pathlib import Path
 
 from cortados_router.provider import server, usage
@@ -30,6 +31,9 @@ def _csp(header: str) -> dict:
 
 class DashboardTest(unittest.TestCase):
     def setUp(self):
+        # a throwaway home: GET /dashboard reads $CORTADOS_HOME/dashboard-auth.json (provider/dashboard_auth.py)
+        home = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, home, True)
+        env = mock.patch.dict(os.environ, {"CORTADOS_HOME": home}); env.start(); self.addCleanup(env.stop)
         self.reg = Registry(gateway_url="", token=TOKEN, claude_bin=["true"])
         self.httpd = ProviderServer(("127.0.0.1", 0), self.reg)
         self.httpd.usage_view = lambda reg: {"lanes": []}
@@ -43,7 +47,7 @@ class DashboardTest(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/dashboard", timeout=10) as r:
             self.assertEqual(r.status, 200)
             self.assertIn("text/html", r.headers["content-type"])
-            self.assertEqual(r.headers["cache-control"], "no-store")
+            self.assertEqual(r.headers["cache-control"], "private, no-store")
             self.assertEqual(r.headers["x-frame-options"], "DENY")
             self.assertEqual(r.headers["referrer-policy"], "no-referrer")
             self.assertEqual(r.headers["x-content-type-options"], "nosniff")
@@ -133,6 +137,14 @@ class DashboardTest(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/dashboard", timeout=10) as r:   # the real page still serves
             self.assertEqual(r.status, 200)
 
+    def test_token_mode_meta_and_hint(self):
+        with urllib.request.urlopen(self.base + "/dashboard", timeout=10) as r:
+            body = r.read().decode()
+        self.assertIn('<meta id="cortados-auth" name="cortados-auth" content="token">', body)
+        self.assertIn('<meta id="cortados-csrf" name="cortados-csrf" content="">', body)
+        self.assertIn("set a password: python3 -B -m cortados_router.provider.dashboard_auth set-password (on the Air)",
+                      body)
+
     def test_usage_still_needs_auth(self):
         with self.assertRaises(urllib.error.HTTPError) as cm:
             urllib.request.urlopen(self.base + "/v1/cortados/usage", timeout=10)
@@ -151,6 +163,10 @@ class DashboardTest(unittest.TestCase):
 #   live          the Live tab's startup poll answers the live view (LIVE); ticks run once
 #   live500 / livethrow / live401 / live403   a good live render, then a live poll that fails that way
 #   livebusy      a good live render, then two polls started together: the second is skipped while the first is out
+#   livelocal     the live render, then the Local models card's button is clicked once (CONFIRM false declines a confirm)
+#   livelocalfail as livelocal, the switch POST answers 503 with a provider error message
+#   livelocal401  as livelocal, the switch POST answers 401 (session mode: back to /dashboard)
+# LOCAL is the Local models card's input (/v1/cortados/local); after a successful switch the fake flips the node's switch.
 # POLLS counts usage polls, TASKS the /v1/cortados/tasks polls, LIVE the /v1/cortados/live polls. It prints every text
 # node under the shown view (marked [ERR] when its class carries err), then STATUS / BODY / STORAGE / LOGIN / TASKS / LIVE.
 _HARNESS = r"""
@@ -158,7 +174,10 @@ const IN_ = HARNESS_IN, mode = IN_.mode;
 const view = IN_.view, tasksView = IN_.tasks || {tasks: [], sessions: [], errors: []}, liveView = IN_.live || {};
 const html = IN_.page;
 const js = html.slice(html.indexOf("<script>") + 8, html.indexOf("</script>"));
-let tasksAuth = "", tasksPolls = 0, liveAuth = "", livePolls = 0;
+let tasksAuth = "", tasksPolls = 0, liveAuth = "", livePolls = 0, localAuth = "", localPolls = 0;
+let localView = IN_.local || {nodes: []};
+const switches = [], confirms = [];
+global.confirm = (m) => { confirms.push(m); return IN_.confirm !== false; };
 // textContent is an accessor, as in a DOM: setting it drops the node's children.
 function mk(tag) { const n = { tag, kids: [], className: "", style: {}, hidden: false, _t: "", value: "", on: {}, dataset: {},
   get textContent() { return this._t; }, set textContent(v) { this._t = v; this.kids = []; },
@@ -167,6 +186,11 @@ function mk(tag) { const n = { tag, kids: [], className: "", style: {}, hidden: 
   appendChild(k) { n.kids.push(k); return k; }, replaceChildren(...k) { n._t = ""; n.kids = k; },
   addEventListener(ev, f) { n.on[ev] = f; }, focus() {} }; return n; }
 const ids = new Proxy({}, { get: (o, i) => o[i] || (o[i] = mk("div")) });
+// IN_.session: the page as served to a logged-in browser (the server's cortados-auth / cortados-csrf meta tags)
+if (IN_.session) { ids["cortados-auth"].content = "session"; ids["cortados-csrf"].content = IN_.session; }
+ids.logout.textContent = "Forget token";                   // the button's text in the page's HTML
+let replaced = "", creds = "", logoutCall = "";
+global.location = { replace(u) { replaced = u; } };
 global.document = { createElement: mk, getElementById: (i) => ids[i], body: mk("body"), documentElement: mk("html"),
                     hidden: false, addEventListener() {} };
 const boom = () => { throw new Error("SecurityError"); };
@@ -176,16 +200,29 @@ global.sessionStorage = { getItem: (k) => broken ? boom() : (k === "cortados-usa
 global.setInterval = () => 1; global.clearInterval = () => {};
 let auth = "", polls = 0;
 global.fetch = async (url, opts) => {
-  if (url === "/v1/cortados/tasks") { tasksAuth = opts.headers.Authorization; tasksPolls++;
+  creds = opts.credentials;
+  if (url === "/dashboard/logout") { logoutCall = opts.method + " " + (opts.headers || {})["x-cortados-csrf"] + " " + opts.referrerPolicy;
+    return { status: 200, ok: true }; }
+  if (url === "/v1/cortados/tasks") { tasksAuth = (opts.headers || {}).Authorization || ""; tasksPolls++;
     if (mode === "tasks500") return { status: 500, ok: false };
     return { status: 200, ok: true, json: async () => tasksView }; }
-  if (url === "/v1/cortados/live") { liveAuth = opts.headers.Authorization; livePolls++;
+  if (url === "/v1/cortados/local") { localAuth = (opts.headers || {}).Authorization || ""; localPolls++;
+    return { status: 200, ok: true, json: async () => localView }; }
+  if (url === "/v1/cortados/local/switch") { const hd = opts.headers || {};
+    switches.push(opts.method + " " + opts.body + " " + (hd.Authorization || "-") + " csrf=" + (hd["x-cortados-csrf"] || "-") +
+                  " creds=" + opts.credentials + " ref=" + (opts.referrerPolicy || "-"));
+    if (mode === "livelocalfail") return { status: 503, ok: false, json: async () => ({type: "error", error: {type: "api_error", message: "cortados: local node pro unreachable (TimeoutError): it may be asleep or offline"}}) };
+    if (mode === "livelocal401") return { status: 401, ok: false, json: async () => ({}) };
+    const want = JSON.parse(opts.body);
+    localView = {nodes: localView.nodes.map(n => n.node === want.node ? Object.assign({}, n, {switch: want.on ? "on" : "off", allowed: want.on, models_loaded: want.on ? n.models_loaded : []}) : n)};
+    return { status: 200, ok: true, json: async () => ({}) }; }
+  if (url === "/v1/cortados/live") { liveAuth = (opts.headers || {}).Authorization || ""; livePolls++;
     if (livePolls > 1 && mode === "live500") return { status: 500, ok: false };
     if (livePolls > 1 && mode === "live401") return { status: 401, ok: false };
     if (livePolls > 1 && mode === "live403") return { status: 403, ok: false };
     if (livePolls > 1 && mode === "livethrow") throw new Error("network down");
     return { status: 200, ok: true, json: async () => liveView }; }
-  auth = opts.headers.Authorization; polls++;
+  auth = (opts.headers || {}).Authorization || ""; polls++;
   if (polls > 1 && mode === "fetch500") return { status: 500, ok: false };
   if (polls > 1 && mode === "fetchthrow") throw new Error("network down");
   return { status: 200, ok: true, json: async () => view }; };
@@ -201,6 +238,13 @@ const tick = () => new Promise(r => setImmediate(r));
   if (liveTab) {
     runTicks();
     if (mode === "livebusy") { await Promise.all([refreshLive(), refreshLive()]); await tick(); }
+    else if (mode === "livelocal" || mode === "livelocalfail" || mode === "livelocal401") {
+      const find = (n) => n.tag === "button" && n.on.click && n.textContent.indexOf("Turn ") === 0 ? n : n.kids.map(find).find(Boolean);
+      const b = find(ids.live); if (!b) throw new Error("no local toggle button");
+      out("BUTTON: " + b.textContent);
+      b.on.click(); for (let i = 0; i < 6; i++) await tick();
+    }
+    else if (mode === "livelogout") { ids.logout.on.click(); await tick(); await tick(); }
     else if (mode !== "live") { await refreshLive(); await tick(); }
   } else {
     if (mode === "storagelater") broken = true;
@@ -218,6 +262,8 @@ const tick = () => new Promise(r => setImmediate(r));
   out("LOGIN: " + (ids.login.hidden ? "hidden" : "shown") + " AUTH: " + auth + " POLLS: " + polls);
   out("TASKS: AUTH: " + tasksAuth + " POLLS: " + tasksPolls);
   out("LIVE: AUTH: " + liveAuth + " POLLS: " + livePolls + " TAB: " + (ids.live.hidden ? "hidden" : "shown"));
+  out("LOCAL: AUTH: " + localAuth + " POLLS: " + localPolls + " SWITCH: " + JSON.stringify(switches) + " CONFIRMS: " + confirms.length);
+  out("SESSION: creds=" + creds + " replaced=" + replaced + " logout=" + logoutCall + " button=" + ids.logout.textContent);
 })().catch(fail);
 """
 _NODE_PRELUDE = ("const fs = require('fs'); global.HARNESS_IN = JSON.parse(fs.readFileSync(0, 'utf8'));"
@@ -278,9 +324,10 @@ class DashboardRenderTest(unittest.TestCase):
         args.update(kw)
         return usage.collect(**args)
 
-    def run_page(self, view, mode="render", tasks_view=None, live_view=None):
+    def run_page(self, view, mode="render", tasks_view=None, live_view=None, local_view=None, confirm=True, session=None):
         r = run_harness(_HARNESS, {"page": server._DASHBOARD_PATH.read_text(), "mode": mode, "view": view,
-                                   "tasks": tasks_view, "live": live_view})
+                                   "tasks": tasks_view, "live": live_view, "local": local_view, "confirm": confirm,
+                                   "session": session})
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
 
@@ -483,6 +530,54 @@ class DashboardRenderTest(unittest.TestCase):
         self.assertIn("provider host: not a known host name", out)
         self.assertNotIn("johns", out)
 
+    # ---------------------------------------------------------------- the Local models card (provider/local_switch.py)
+    PRO = {"node": "pro", "label": "Pro", "reachable": True, "error": None, "switch": "on", "allowed": True,
+           "reason": "local enabled: AC power + manual switch on", "power": "ac", "training": False, "ollama": "up",
+           "models_loaded": ["Qwen27b_heretic:latest"], "auto_route": {"model": "qwen-27b", "bands": ["R0"]},
+           "models": ["qwen-27b"]}
+
+    def test_local_card_renders_each_node(self):
+        battery = {**self.PRO, "switch": "on", "allowed": False, "reason": "local disabled: on battery",
+                   "power": "battery", "models_loaded": [], "auto_route": None}
+        out = self.run_page(None, "live", live_view=self.live(), local_view={"nodes": [battery]})
+        for want in ("Local models", "Pro", "refused", "switch on · on battery", "local disabled: on battery",
+                     "no model loaded", "auto_route: off (pin-only)", "Turn off"):
+            self.assertIn(want, out, want)
+        self.assertIn("LOCAL: AUTH: Bearer tok POLLS: 1 SWITCH: [] CONFIRMS: 0", out)
+        down = {"node": "pro", "label": "Pro", "reachable": False, "switch": "unknown", "auto_route": None,
+                "error": "local node pro unreachable (ConnectionRefusedError): it may be asleep or offline"}
+        out = self.run_page(None, "live", live_view=self.live(), local_view={"nodes": [down]})
+        self.assertIn("unreachable", out)
+        self.assertIn("[ERR] local node pro unreachable (ConnectionRefusedError)", out)
+        self.assertNotIn("Turn ", out)                                         # no toggle for an unknown state
+        for bad in ("[object Object]", "undefined", "NaN"):
+            self.assertNotIn(bad, out, bad)
+
+    def test_local_toggle_off_confirms_only_with_a_model_loaded(self):
+        out = self.run_page(None, "livelocal", live_view=self.live(), local_view={"nodes": [self.PRO]})
+        self.assertIn("BUTTON: Turn off", out)
+        self.assertIn('SWITCH: ["POST {\\"node\\":\\"pro\\",\\"on\\":false} Bearer tok csrf=- creds=omit ref=-"] CONFIRMS: 1', out)
+        self.assertIn("LOCAL: AUTH: Bearer tok POLLS: 2", out)                 # refreshed after the switch
+        self.assertIn("Pro switched off at", out)
+        self.assertIn("Turn on", out)
+        out = self.run_page(None, "livelocal", live_view=self.live(), local_view={"nodes": [self.PRO]}, confirm=False)
+        self.assertIn("SWITCH: [] CONFIRMS: 1", out)                           # declined: nothing sent
+        idle = {**self.PRO, "models_loaded": []}
+        out = self.run_page(None, "livelocal", live_view=self.live(), local_view={"nodes": [idle]})
+        self.assertIn("CONFIRMS: 0", out)                                      # nothing loaded: no question
+        self.assertIn('\\"on\\":false', out)
+        off = {**self.PRO, "switch": "off", "allowed": False, "models_loaded": []}
+        out = self.run_page(None, "livelocal", live_view=self.live(), local_view={"nodes": [off]})
+        self.assertIn("BUTTON: Turn on", out)
+        self.assertIn('\\"on\\":true', out)
+        self.assertIn("CONFIRMS: 0", out)
+
+    def test_local_switch_failure_is_said_on_the_card(self):
+        idle = {**self.PRO, "models_loaded": []}
+        out = self.run_page(None, "livelocalfail", live_view=self.live(), local_view={"nodes": [idle]})
+        self.assertIn("[ERR] switch failed: cortados: local node pro unreachable (TimeoutError)", out)
+        self.assertRegex(out, r"STATUS:  live · updated ")                     # the live view itself stays good
+
     def test_live_polls_never_overlap(self):
         out = self.run_page(None, "livebusy", live_view=self.live())
         self.assertIn("LIVE: AUTH: Bearer tok POLLS: 2 TAB: shown", out)       # startup + one of the two
@@ -499,6 +594,50 @@ class DashboardRenderTest(unittest.TestCase):
         out = self.run_page(None, "live401", live_view=v)
         self.assertIn("STATUS:  Token refused; enter it again.", out)
         self.assertIn("LOGIN: shown", out)
+
+
+    # ---------------------------------------------------------------- session mode (a dashboard password is set)
+    def test_token_mode_unchanged(self):
+        out = self.run_page(self.view(), "refresh")
+        self.assertIn("AUTH: Bearer tok", out)
+        self.assertIn("SESSION: creds=omit", out)
+        self.assertIn("button=Forget token", out)
+
+    def test_session_mode_fetches_with_the_cookie_only(self):
+        out = self.run_page(self.view(), "refresh", session="csrf-token-123")
+        self.assertIn("LOGIN: hidden AUTH:  POLLS: ", out)          # no Authorization header at all
+        self.assertIn("TASKS: AUTH:  POLLS: 2", out)                # the tab's first poll and the refresh
+        self.assertIn("SESSION: creds=same-origin", out)
+        self.assertIn("button=Log out", out)
+        out = self.run_page(None, "live", live_view={"generated_at": 1}, session="csrf-token-123")
+        self.assertIn("LIVE: AUTH:  POLLS: 1", out)
+        self.assertIn("LOGIN: hidden", out)
+
+    def test_session_401_goes_back_to_the_login_page(self):
+        out = self.run_page(None, "live401", live_view={"generated_at": 1}, session="csrf-token-123")
+        self.assertIn("replaced=/dashboard", out)
+        self.assertIn("LOGIN: hidden", out)                          # never the token form in session mode
+
+    def test_session_logout_posts_the_csrf_token(self):
+        out = self.run_page(None, "livelogout", live_view={"generated_at": 1}, session="csrf-token-123")
+        # referrerPolicy same-origin: under the page's no-referrer policy the POST would carry `Origin: null`
+        self.assertIn("logout=POST csrf-token-123 same-origin", out)
+        self.assertIn("replaced=/dashboard", out)
+
+    def test_session_mode_switch_sends_cookie_and_csrf(self):
+        out = self.run_page(None, "livelocal", live_view=self.live(), local_view={"nodes": [self.PRO]},
+                            session="csrf-token-123")
+        # the cookie (credentials same-origin), the session's CSRF token, the real Origin, and no Bearer header
+        self.assertIn('SWITCH: ["POST {\\"node\\":\\"pro\\",\\"on\\":false} - csrf=csrf-token-123 creds=same-origin '
+                      'ref=same-origin"] CONFIRMS: 1', out)
+        self.assertIn("LOCAL: AUTH:  POLLS: 2", out)
+        self.assertIn("Pro switched off at", out)
+
+    def test_session_mode_switch_401_goes_back_to_the_login_page(self):
+        idle = {**self.PRO, "models_loaded": []}
+        out = self.run_page(None, "livelocal401", live_view=self.live(), local_view={"nodes": [idle]},
+                            session="csrf-token-123")
+        self.assertIn("replaced=/dashboard", out)
 
 
 if __name__ == "__main__":

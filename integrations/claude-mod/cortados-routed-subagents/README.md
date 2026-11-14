@@ -54,6 +54,7 @@ Then set the provider URL (and, if you keep the token inline rather than in a fi
 | `permissionMode` | `bypassPermissions` | Headless permission mode for each routed subagent (see **Blast radius**). |
 | `allowedTools` | `Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit` | The built-in tools a routed subagent has **on this machine**. Passed as both `--tools` (availability — the real boundary, so a tool left out is genuinely absent even under `bypassPermissions`) and `--allowedTools` (permission). Covers built-in tools only; MCP tools are controlled separately. |
 | `claudeBin` | `claude` | The `claude` executable used to run each routed subagent. |
+| `hookPython` | `/usr/bin/python3` | Absolute path of the `python3` (3.9 or later) that runs the boundary hook in each routed subagent. Never looked up on `PATH`; a relative path or one inside the session's project folder denies the routed launch (see **Boundary hook**). |
 | `routeBackground` | `true` | Route background (`run_in_background`) subagents too (owner decision 2026-11-04: every subagent goes through S1). They run detached under `backgroundTimeoutMs`, not the foreground cap; see **Background subagents**. `false` hands them back to the native runner. |
 | `subagentTimeoutMs` | `600000` (10 min) | How long a routed subagent subprocess may run before it is aborted. The max is `600000` (10 min): that is the host's own cap (Claude Code validates `$.process.run`'s `timeoutMs` as an integer from 1 to 600000), so a larger value is clamped to it and a fractional one is rounded down. Lower it to fail fast; a non-positive/invalid value falls back to the default. |
 | `backgroundTimeoutMs` | `7200000` (2 h) | How long a routed **background** subagent may run before its watchdog stops it (TERM, then KILL 10 s later). Real background builders run 30-60+ minutes, so the foreground 10-minute cap would kill them. The max is `10800000` (3 h, the same as a CortadOS child task's limit): an unattended child that never ends burns quota. Larger values are clamped, fractions rounded down, invalid or non-positive values use the default. Foreground subagents keep `subagentTimeoutMs`. |
@@ -154,7 +155,7 @@ The allow path (reading, inspection, connectors) never makes that check. A bug i
 is noted once in the transcript).
 
 **Never gated:** subagents, teammates and engine forks (any call with an `agentId`), CortadOS child tasks
-(`CORTADOS_CHILD_TASK` set; they also run with this plugin disabled), routed subagents (their hooks are disabled), and
+(`CORTADOS_CHILD_TASK` set; they also run with this plugin disabled), routed subagents (this mod is disabled and inert in them: `CORTADOS_ROUTED_SUBAGENT`), and
 every session with `orchestratorMode` off.
 
 **Status line.** `gate balanced; 2 denied`, joined with the warn guard's counter when it has one
@@ -171,6 +172,18 @@ argument reports the level, where it comes from and the denied count. To change 
 connector tools, `Monitor`, future tools — an allowlist precisely because a denylist would miss new mutating tools. It
 does **not** fail open (a cage by choice); its refusal says how to lower it (`/cortados-gate balanced` or `off`).
 
+
+## Local models switch (`/cortados-local`)
+
+`/cortados-local on|off|status [node]` (no argument: status; node defaults to `pro`) sees or flips the Pro's manual
+local-models switch from this session, through the provider: `GET /v1/cortados/local` for status, `POST
+/v1/cortados/local/switch {"node", "on"}` for on/off (owner token; the provider asks the node's local gate, which writes
+the switch file there). Same provider URL and token discovery as routed subagents (`providerUrl`, else
+`CORTADOS_PROVIDER_URL` / the provider-url file; `providerToken`, else `providerTokenFile`). One line per node: switch,
+allowed or refused (with the reason), AC or battery, the loaded model, `auto_route`. Errors (provider unreachable,
+unknown node, node asleep, 10 s without an answer) come back as text with the token scrubbed. Works whatever
+`orchestratorMode` says; the same switch is on the dashboard and in the `local_switch` MCP tool (repo README, "Flipping
+the switch from anywhere").
 
 ## Main-session guard (warn only)
 
@@ -258,6 +271,38 @@ and `permissionMode: bypassPermissions`), a routed — and possibly cheap — mo
 unattended. That is the full-agentic setting. To narrow it, drop tools from `allowedTools` (e.g. remove `Bash`,
 `Write`, `Edit` for a read-only researcher) or set `permissionMode` to `acceptEdits` (auto-approve edits, no
 unattended Bash) or `default`.
+
+## Boundary hook (local-routed turns)
+
+Since 0.4.0 every routed subagent runs the CortadOS **boundary hook** (`docs/BOUNDARY-HOOK.md`). When S1 routes a
+child's turn automatically to a **local** model, the provider's effect boundary limits its tools (sensitive routes: no
+shell, edits only inside the project; cost routes: Bash checked against the outward patterns). The tools run here, so
+a symlink that exists only on this machine (`/repo/escape -> /outside`) is invisible to the provider. The hook closes
+that: a PreToolUse command hook in the child's `--settings` (`routedChildSettings`, matcher
+`Write|Edit|MultiEdit|NotebookEdit|Bash`) asks the provider (`POST /v1/cortados/boundary/check`, the provider token,
+the tool_use id only) about each call, resolves the target with `realpath` **on this machine**, and denies a write
+outside the real project folder or onto a protected path, and Bash on a sensitive route. Calls the provider does not
+know (cloud-routed turns) pass unchanged; a provider-marked call (`toolu_cxb_…`) is denied on any error, the provider
+unreachable included. The child announces the hook with `x-cortados-boundary-hook: 1`; a client without it gets
+sensitive local turns read-only.
+
+The hook is `cortados_router/boundary_hook.py`, embedded verbatim as `BOUNDARY_HOOK_PY` and run as
+`<hookPython> -I -S -B -c <source>` from `/` inside a shell guard: on an absolute interpreter (default
+`/usr/bin/python3`, never a `PATH` lookup), in isolated mode without the site import, so nothing the model writes into
+the project (a `json.py`, a `bin/python3`, a `sitecustomize.py` reached through a site-packages `.pth`) can replace its
+code. If the interpreter cannot start (a missing `hookPython`, a broken `/usr/bin/python3` shim) the guard denies a
+provider-marked call (exit 2) and lets any other through; a `hookPython` that does not exist is refused up front when
+the host can stat it (docs/BOUNDARY-HOOK.md, "Isolation"). Updating from 0.3.x: see **Updating**.
+
+## Updating
+
+```
+/plugin marketplace update cortados-router
+/plugin update cortados-routed-subagents@cortados-router
+```
+
+then restart Claude Code (a running session keeps the old module). Nothing to configure: the hook ships inside the
+mod. Check with `/plugin` that `cortados-routed-subagents` shows 0.4.1 or later.
 
 ## What is not routed
 
@@ -365,5 +410,6 @@ Run from the repository root. This covers `hooks/register.test.ts`, `hooks/guard
 
 - Claude Code logs `unrecognized_model: cortados` and assumes a 200k context window for the routed subprocess.
   Cosmetic; the route still works.
-- Recursion is prevented: each routed subprocess runs with hooks disabled, so it will not re-intercept and route
-  its own subagents.
+- Recursion is prevented: each routed subprocess runs with this mod disabled in its `--settings` and
+  `CORTADOS_ROUTED_SUBAGENT=1` in its env (every handler then passes through), so it will not re-intercept and route
+  its own subagents. Its only hook is the boundary hook (since 0.4.0; it was `disableAllHooks` before).

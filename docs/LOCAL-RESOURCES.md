@@ -197,10 +197,39 @@ Pin names (aliases and tags, case-insensitive) must be unique across nodes. Beha
    `com.cortados.ollama` were booted out and disabled on the Studio.
 3. On the Pro: nothing is downloaded (owner decision 2026-11-13: the lane uses the models already on the Pro, renamed
    with `ollama cp` to `Qwen27b_heretic`, `Huihui_Qwen_9b`, `Huihui_Qwen3.8` and `Phi_4`; the Pro block's `models` must
-   list these tags). Set Ollama's context to at least the configured `context_length` (131072, 128k, owner decision):
+   list these tags as `ollama list` prints them, e.g. `Qwen27b_heretic:latest`). Set Ollama's context to at least the
+   configured `context_length` (131072, 128k, owner decision):
    `OLLAMA_CONTEXT_LENGTH=131072` for `ollama serve`, or Ollama.app's context setting, then restart Ollama (see "Context
    length must match the node" below). Only then set the Pro block's `auto_route` in the Air's `tables/resources.json`
    (Local auto-route, below); before that the Pro is pin-only.
+
+### The manual switch: three ways to flip it
+
+The Pro admits local models only on AC power with its switch file (`$CORTADOS_HOME/local-enabled` on the Pro) present.
+It can be flipped:
+
+- on the Pro: `python3 -B -m cortados_router.local_resources toggle on|off|status`;
+- from the dashboard's Live tab (**Local models** card, On/Off button; turning off with a model loaded asks first);
+- from any Claude Code session: the `local_switch` MCP tool (`cortados-route`) or `/cortados-local on|off|status` (the
+  `cortados-routed-subagents` mod).
+
+The last two go provider → gate: `GET /v1/cortados/local` and `POST /v1/cortados/local/switch {"node", "on"}` on the
+provider (owner token; `provider/local_switch.py`), which call the node's gate at `GET`/`POST /cortados/local-switch`
+with the node's gate token (`token_file_env` above; a node without one is refused with a 409). On the node the gate
+writes or removes the switch file through `local_resources.set_local_switch` (atomic: a private temp file renamed into
+place; off is one unlink), the same function the CLI uses. The status endpoint answers whatever the switch and power
+say (it is how the state is seen); `/api/tags` and `/v1/messages` keep their 503 while off or on battery. The status
+carries the switch, `allowed` + reason, `power` (`ac`/`battery`/`unknown`), whether an S1 training hold is live, and the
+names (only) of the models Ollama has loaded (`/api/ps` on loopback, 2 s bound). `/api/ps` itself is not forwarded.
+
+Installing the new gate needs it restarted on the Pro (`launchctl kickstart -k gui/$(id -u)/com.cortados.local-gate`)
+and the provider restarted on the Air; the owner/orchestrator does both. Until then the provider reports the Pro's gate
+as an older one (502).
+
+**Model ids and tags.** Write each model's `id` exactly as `ollama list` prints it, tag included
+(`Qwen27b_heretic:latest`). The provider also treats `name` and `name:latest` as the same model
+(`local_lane.normal_tag` / `local_lane.lists`, the one comparison behind "does not list"), because Ollama does; a
+different tag (`name:q8`) is a different model.
 
 ### Local auto-route
 
@@ -386,6 +415,17 @@ are refused (`LocalConfigError`), as for `auto_route`.
    "max_tokens"` after thinking) or only malformed tool calls is a failed answer, so the original refusal stands and
    nothing is bound or recorded locally (`local_lane.complete`).
 
+**Which variant runs.** When the sensitive model has published-index variants (today `qwen-27b` and `qwen-27b-think`,
+"Local models in selection" above), a sensitive move (flag, prefer, keyword, refusal) picks one per request with the
+index route's own per-request rules (`routing.choose_variant`, sharing `_variant_why` with `index_local`): a node entry
+with `thinking: "passthrough"` takes none; a client that asked for thinking gets only the think variant; the think
+variant needs `max_tokens ≥ 4096`. A sensitive request runs local in any band, so the variant need not clear S1's
+required index: of the eligible ones it takes the lighter one that clears it (what the index route would take), else
+the strongest eligible (highest index for S1's use case). The variant, its index and `variant_why` are recorded on the
+routes row's `chosen` entry, and every turn (and the refusal fallback's whole answer, `local_lane.complete`) is sent
+the variant's thinking exactly as an index-routed turn is. A model with no eligible variant keeps its own `thinking`
+setting.
+
 A planned S1 "sensitive" signal plugs in at one place: `routing.S1_SENSITIVE_ANSWER` (None today) names the S1 answer
 key; once set, a request S1 marks is handled as trigger `s1` under exactly the rules below.
 
@@ -414,19 +454,153 @@ lane by an automatic rule (auto_route, the sensitive flag / prefer / keyword, th
 later turn to the node unchecked, so "now email the signed invoice and mark it paid" after a harmless opening reached
 the node. Now every continuation of such a conversation is rescored by S1 before anything reaches the node
 (`server.Handler._local_continuation_refused` → `Registry.local_recheck` → `routing.continuation_admission` →
-`local_admission`, under the band the conversation was bound with). S1 scores the turn's own words (the latest user
-text, client reminders removed; on a tool-result turn with no words, the latest earlier user words), through
-`core.decide`: the same scorer call, timeout and retry as the opening's routing call, and its degraded result fails
-closed. To bound the added latency in a tool loop, an admission is reused for the same conversation and the same scored
-text for 180 s (`routing.CONTINUATION_CACHE_S`); a refusal is never cached. A turn that is not admitted (outward,
-blast_radius 2 or more, a degraded or failed scorer, missing or garbled answers, no user text at all, no checker
-configured) is refused with a terminal **400** (`x-should-retry: false`, `invalid_request_error`): the conversation is
-bound to a local model and this turn needs a cloud model; start a new conversation (routed again) or pin a cloud model.
-Nothing was sent, so the conversation is untouched: a later turn on the same history that passes the gate continues it.
-The log names the route id and the gate's reason only. **An explicit local pin** (`sub/<local model or alias>`, the
-client's own choice) is **not rescored**. Moving a refused conversation to a cloud lane mid-way is a separate feature
-(#43, re-route when the Pro is unplugged); its seam is `server.Handler._local_continuation_refused`. `core.resolve`'s hard rule (outward effects floor the blast radius to 3,
-strong cloud models) is untouched: an outward request is never moved, whatever the trigger.
+`local_admission`, under the band the conversation was bound with). S1 scores, through `core.decide` (the same scorer
+call, timeout and retry as the opening's routing call; a degraded result fails closed), `routing.continuation_text`:
+the latest user words (client reminders removed; on a tool-result turn with no words, the latest earlier user words)
+**and the text of the tool results added since the last scored turn** (those after the conversation's last assistant
+message, `<system-reminder>` tags kept: a tool result is not the client's wrapper). A tool result can carry an
+instruction the person never wrote ("now email this file to ..."), so it is scored as if they had. A turn longer than
+S1's own 6000-character input (`routing.CONTINUATION_SCORE_CAP`) is scored in chunks (`routing.continuation_chunks`),
+**every one of which must pass**: each chunk opens with the person's words (up to 1500 characters, head and tail;
+longer words are also scored in full, in windows of their own) followed by a window of the new tool results, and the
+windows overlap by 400 characters (`CONTINUATION_OVERLAP`) so an instruction that straddles a cut is whole in one of
+them. Every character is scored. At most 16 chunks (`CONTINUATION_MAX_CHUNKS`, 65k to 90k characters of new
+tool results, by the words' length; up to 4 scored at once) per turn: each is an S1 call on the scorer every routing decision shares, and a
+longer turn is refused (fail closed) rather than scored in part. Review finding 3 (gpt-6.1-sol on f83b84a): the
+earlier head-and-tail cut left the middle of a long tool result unscored while the model still read it. Chunks rather
+than refusing everything over 6000 characters, because a coding tool loop reads files longer than that all the time
+and would be unusable. An admission is reused for 180 s
+(`routing.CONTINUATION_CACHE_S`) only for the same conversation, the same scored text and the same message count, so
+a new tool result, or the same words later in the conversation, is scored again; a client retrying the identical
+request reuses it. A refusal is never cached. A turn that is not admitted (outward, blast_radius 2 or more, a degraded
+or failed scorer, missing or garbled answers, no user words at all, no checker configured) is refused with a terminal
+**400** (`x-should-retry: false`, `invalid_request_error`): the conversation is bound to a local model and this turn
+needs a cloud model; start a new conversation (routed again) or pin a cloud model. Nothing was sent, so the
+conversation is untouched: a later turn on the same history that passes the gate continues it. The log names the
+route id and the gate's reason only. **An explicit local pin** (`sub/<local model or alias>`, the client's own choice)
+is **not rescored**. Moving a refused conversation to a cloud lane mid-way is a separate feature (#43, re-route when the
+Pro is unplugged); its seam is `server.Handler._local_continuation_refused`. `core.resolve`'s hard rule (outward
+effects floor the blast radius to 3, strong cloud models) is untouched: an outward request is never moved, whatever
+the trigger.
+
+**Effect boundary.** Scoring judges what the person (and the tools) said, not what the local model then does: asked to
+"draft a message locally; do not send", a model may still answer with a `send_email` call. So every turn an automatic
+rule sends to a local model (auto_route, flag, prefer, keyword, the refusal fallback, and the published index route:
+all relay through `local_lane.serve(auto_routed=True, bind_reason=...)` or, for the refusal fallback,
+`local_lane.complete(..., boundary=True, bind_reason="refusal")`) passes `cortados_router/provider/effect_boundary.py`.
+
+*Profiles, split by reason* (owner decision, Forest 2026-11-14). The route records WHICH rule bound the conversation
+local (`routing._moved(..., reason=...)` → the route's `bind_reason`); the route is the conversation's, so every
+continuation (and a rebuilt session) carries the same reason and gets the same profile. `effect_boundary.BIND_PROFILES`
+maps it; a missing or unknown reason gets the strictest profile. The published-score index route
+(`routing._move_to_local`) passes `reason="index"` to `_moved` (`"index": COST`). `prefer` is a cost
+route (review of 0961c80): `x-cortados-local: prefer` asks for local because it is cheaper, not because the work is
+sensitive.
+
+| Bind reason | Profile | Tools offered and allowed | File writes (Write, Edit, MultiEdit, NotebookEdit) |
+|---|---|---|---|
+| `sensitive_flag`, `keyword`, `refusal` | sensitive | Read, Glob, Grep, LS, NotebookRead, Edit, MultiEdit, Write, NotebookEdit, TodoWrite, ExitPlanMode. **No Bash family** (Bash, BashOutput, KillShell, KillBash are not offered, and an emitted one is blocked). **Without `x-cortados-boundary-hook: 1`: read-only** (Edit, MultiEdit, Write, NotebookEdit not offered; an emitted one is blocked, rule `write-no-hook`) | inside the project folder; every `PROTECTED_PATHS` entry refused, `package.json` / `pyproject.toml` / `Makefile` included; checked again on the client by the boundary hook |
+| `prefer`, `auto_route`, `index` | cost | the same, plus Bash, BashOutput, KillShell, KillBash; every Bash command checked against `OUTWARD_BASH_RULES` and `OUTWARD_BASH_TEXT_RULES` (**best-effort**, below) | inside the project folder; `PROTECTED_PATHS` refused except `package.json`, `pyproject.toml`, `Makefile` (normal coding targets) |
+| unknown / missing | sensitive | as sensitive | as sensitive |
+| explicit `sub/` pin | none | untouched: every tool, no inspection | untouched |
+
+*The project folder* (`effect_boundary.project_dir`) is the working directory Claude Code names in the request's
+`system` prompt: `Primary working directory: <path>` (2.x environment block) or `Working directory: <path>` (the older
+`<env>` block). Only `system` is read, never the messages or tool results, so neither the model nor a fetched page can
+move it. It is unknown, and **every write of the turn is blocked** (fail closed), when no such line is there, two
+different ones are, or the path is relative, holds `..`, or is `/`, `/tmp`, `/Users`, `/home` or a home directory
+itself.
+
+*Path rules* (`effect_boundary.blocked_write`). The target is normalised (`.` and `//` removed; a relative path is
+taken from the project folder) and must lie strictly inside the folder (compared case-sensitively, so a differently
+cased folder on a case-sensitive disk is outside). Refused: any `..` component, a path starting with `~` or holding
+`$` (not resolved here, so not provably inside), and a symlink the provider's own filesystem shows leading out of the
+folder or onto a protected name (`os.path.realpath`; a symlink that only exists on the client's machine cannot be seen
+here: the client-side boundary hook, docs/BOUNDARY-HOOK.md, resolves the path there; see
+the honest limits). `PROTECTED_PATHS`, matched case-insensitively on the path below the folder, each read and acted on
+later by something other than the turn:
+
+| Kind | Entries |
+|---|---|
+| any component | `.git` (hooks, config; a submodule's too), `.husky`, `.claude`, `.ssh` |
+| any component pair | `.github/workflows`, `Library/LaunchAgents`, `Library/LaunchDaemons` |
+| any file name | `.gitlab-ci.yml`, `.pre-commit-config.yaml`, `.envrc`, `.mcp.json`, `setup.py`, `setup.cfg`, shell startup files (`.zshrc`, `.zshenv`, `.zprofile`, `.zlogin`, `.bashrc`, `.bash_profile`, `.profile`, ...), `crontab` |
+| build files | `package.json`, `pyproject.toml`, `Makefile` / `GNUmakefile`: refused on sensitive routes, allowed on cost routes |
+| the project root | any dotfile or dot-directory directly in the folder |
+
+Outside the folder every write is refused anyway (`~/Library/LaunchAgents`, `~/.ssh`, `~/.zshrc`, the system crontab).
+A blocked write takes the same terminal 400 / stream `error` path as a blocked Bash call; the log names the rule id
+(`write-outside-project`, `write-dotdot`, `write-protected`, `write-symlink`, `write-no-project`, `write-malformed`) and
+the tool name, never the path.
+
+Two layers apply on every automatic-local turn:
+
+1. *Tool list.* Before the request reaches the node, its declared `tools` are cut to the profile's tools (an
+   allowlist: a name it does not know is dropped), and a `tool_choice` naming a dropped tool is removed. The model
+   cannot name what it is not offered. Always dropped:
+
+   | Dropped (everything not in the profile, including) |
+   |---|
+   | `WebFetch`, `WebSearch` (network) |
+   | every `mcp__*` tool (connectors: mail, chat, drive, payments, ...) |
+   | `Task` / `Agent` (a subagent is routed afresh, possibly to a cloud model with every tool) |
+   | `Skill`, `SlashCommand`, any typed server tool (`web_search_*`, `bash_*`), any unknown name |
+   | on a sensitive route: `Bash`, `BashOutput`, `KillShell`, `KillBash` |
+
+2. *Emitted calls.* Every tool call in the local reply is inspected before the client sees it: a call to a tool off
+   the profile (defence in depth), a file write the path rules refuse, a malformed `Bash` input, or (cost routes) a
+   `Bash` command one of whose simple commands (the line is cut at `; & | && || ( $( \` ` newlines and quotes,
+   wrappers such as `sudo`, `env`, `xargs`, `timeout 30` skipped) matches `OUTWARD_BASH_RULES`, or whose whole text
+   matches `OUTWARD_BASH_TEXT_RULES` or the interpreter check:
+
+   | Rule | Matches |
+   |---|---|
+   | `curl-upload` | `curl` with `-X`/`--request`, `-d`/`--data*`, `-F`/`--form*`, `-T`/`--upload-file`, `--json` (combined short flags too) |
+   | `wget-upload` | `wget --post-data/--post-file/--body-data/--body-file/--method` |
+   | `ssh` | `ssh`, `scp`, `sftp`, `mosh`, `autossh` |
+   | `netcat` | `nc`, `ncat`, `netcat`, `socat`, `telnet`, `ftp`, `lftp` |
+   | `rsync-remote` | `rsync` with a `host:` / `host::` / `rsync://` argument |
+   | `git-push` | `git ... push`, `send-email`, `request-pull` |
+   | `gh-write` | `gh` with create, edit, merge, comment, close, delete, release, reopen, review, ready, transfer, lock, unlock, fork, rename, (un)archive, run, rerun, cancel, set, upload, sync, enable, disable, (un)pin, develop, add, remove, login, logout |
+   | `gh-api-write` | `gh api` with `-X`, `--method`, `-f`, `-F`, `--field`, `--raw-field`, `--input` |
+   | `publish` | `npm`/`pnpm`/`yarn`/`bun`/`cargo`/`poetry`/`flit`/`hatch`/`uv`/`pip` publish, unpublish or upload; `twine upload` (also `python -m twine upload`); `gem`/`docker`/`podman`/`helm push` |
+   | `osascript` | any `osascript` (AppleScript drives Mail, Messages and every scriptable app) |
+   | `open-url-scheme` | `open` / `xdg-open` on `mailto:`, `sms:`, `imessage:`, `facetime:`, `tel:`, `message:` |
+   | `mail` | `sendmail`, `mail`, `mailx`, `mutt`, `msmtp`, `ssmtp` (also at the end of a pipe) |
+   | `git-config` | `git config` (any write: aliases, `core.hooksPath`; `--get`/`--list` pass) and `git -c` |
+   | `persistence` | `launchctl`, `crontab`, `at`, `batch` |
+   | `symlink` | `ln -s` / `--symbolic` (a link turns a project write into an outside one) |
+   | `pipe-to-shell` | a pipe into `sh`, `bash`, `zsh`, `python`, `node`, `perl`, `ruby`, `php`, `osascript`, `source` (`... \| base64 -d \| sh`, `curl ... \| bash`) |
+   | `protected-path` (text) | the command mentions `.git/hooks`, `.git/config`, LaunchAgents/LaunchDaemons, `.ssh`, a shell startup file or `crontab` |
+   | `computed-command` (text) | `eval` of a `$(...)` or backtick substitution, `source <(...)` / `. <(...)` |
+   | `interpreter-network` | a `python*`/`node`/`deno`/`bun`/`perl`/`ruby`/`php` command whose command line names a network or mail module (`socket`, `urllib`, `requests`, `http`, `https`, `smtplib`, `fetch`, `net`, `child_process`, ...), including a script written by a heredoc and run in the same command |
+
+   A match blocks the whole reply; nothing of it reaches the client's tools. **Non-streaming:** the same terminal
+   **400** as the continuation gate (`x-should-retry: false`, `invalid_request_error`, "the local model proposed an
+   action with an outward effect; run this turn on a cloud model ..."). **Streaming:** the relay holds every tool-call
+   block until its `content_block_stop` and judges the whole input (`input_json_delta` fragments included), and holds
+   `message_start` until the first content it may show. A block found before anything was written is answered with that
+   same JSON 400 (no stream starts). A block found after text was already streamed ends the stream with one
+   `event: error` (`invalid_request_error`, the same message): the client keeps the text it was shown and gets no
+   `tool_use`, no `message_delta` and no `message_stop`, so Claude Code shows an API error for the turn and runs no
+   tool. Either way the conversation is not advanced (a blocked opener is not bound; a blocked continuation leaves the
+   history as it was). The refusal fallback's local answer is judged the same way, and a blocked one leaves the cloud
+   refusal standing. The log names the rule id and the tool name only, never the arguments.
+
+   **An explicit `sub/` local pin** is the client's own choice: its tools are relayed untouched and its calls are not
+   inspected.
+
+**Honest limits.** On cost routes the Bash pattern lists are **best-effort**: they cannot recognise every outward
+shell command. A script written in one turn and run in a later one, a Makefile target or npm script that sends (cost
+routes may write `Makefile` and `package.json`), an alias or shell function the person already has (`git p` defined in
+their own gitconfig), a command name in a variable, obfuscation the lists do not know, or a plain `curl` GET whose URL
+carries data all pass. **Claude Code's own permission prompts are the last guard for what Bash runs**; sensitive
+routes have no shell for exactly this reason. A false positive (a quoted message that reads like a command,
+`git commit -m 'ssh fix'`, `cat ~/.zshrc`) refuses one turn, which the person reruns on a cloud model. The path rules
+read the path's text: a symlink is seen only when it exists on the provider's own machine, and on a cost route Bash
+could create one the same turn (`ln -s` is blocked, other ways are not). A write inside the project to a file that
+some tool later executes and that is not in `PROTECTED_PATHS` (a test file, a script the person runs) can still stage
+an effect; permission prompts remain the guard there too.
 
 **Every local guard still applies.** A degraded scorer never routes local; the request must arrive on `/v1/messages`
 (the relay speaks Messages only; a `/v1/responses` request is logged and stays on S1's route); the client's

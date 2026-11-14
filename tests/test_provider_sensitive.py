@@ -375,7 +375,7 @@ class RefusalFallbackEndToEndTests(LocalHarness):
                                             "content": "ok"}]}
         self.post({**first, "messages": first["messages"] + [{"role": "assistant", "content": got["content"]}, nxt]})
         self.assertEqual(len(self.posts()), 2)                          # the continuation went to the node too
-        self.assertEqual(self.scored, ["please refuse"])   # rescored first: a tool-result turn scores the latest words
+        self.assertEqual(self.scored, [scored("please refuse", "ok")])   # rescored: the latest words + the new result
 
     def test_refusal_after_tool_use_is_not_rerun(self):
         first = {**body("refuse after tool"), "tools": [READ_TOOL]}
@@ -473,6 +473,11 @@ class McpLocalOptionTests(unittest.TestCase):
 # ------------------------------------------------------------------------------------- review fixes (gpt-6.1-sol)
 SAFE = dict(CLEAN)
 OUTWARD_TEXT = "email the signed invoice to the client and mark it paid"
+
+
+def scored(words, *results):
+    """The text S1 scores for a continuation: the latest user words, then the new tool results (continuation_text)."""
+    return words + (routing.TOOL_RESULTS_LABEL + "\n---\n".join(results) if results else "")
 
 
 class LocalAdmissionTests(unittest.TestCase):
@@ -654,7 +659,7 @@ class ContinuationRecheckBase(LocalHarness):
         with self.assertLogs(server.logger, level="INFO") as cm:
             msg = self.refused(self.follow(first, got, OUTWARD_TEXT, stream=stream))
         self.assertEqual(len(self.node_posts()), 1)          # the turn never reached the node
-        self.assertEqual(self.scored, [OUTWARD_TEXT])
+        self.assertEqual(self.scored, [scored(OUTWARD_TEXT, "ok")])
         said = "\n".join(rec.getMessage() for rec in cm.records)
         self.assertIn("local continuation refused", said)
         for leak in ("invoice", "email", "paid"):            # metadata only, in the log and the message
@@ -676,23 +681,47 @@ class FlagBoundContinuationTests(ContinuationRecheckBase):
         got2 = self.post(self.follow(first, got, "now list the headings"))
         self.assertEqual(got2["content"][0]["type"], "tool_use")
         self.assertEqual(len(self.node_posts()), 2)
-        self.assertEqual(self.scored, ["now list the headings"])   # this turn's own words, not the opening's
+        self.assertEqual(self.scored, [scored("now list the headings", "ok")])   # this turn's words, not the opening's
 
     def test_safe_continuation_is_rescored_streaming(self):
         first, got = self.open()
         raw = self.post(self.follow(first, got, "now list the headings", stream=True))
         self.assertIn("tool_use", raw)
-        self.assertEqual(self.scored, ["now list the headings"])
+        self.assertEqual(self.scored, [scored("now list the headings", "ok")])
 
-    def test_tool_result_turns_reuse_an_admission_and_bound_latency(self):
+    def test_a_new_tool_result_is_rescored_not_served_from_the_cache(self):
         first, got = self.open()
         req = self.follow(first, got, "now list the headings")
         got2 = self.post(req)
         nxt = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": got2["content"][0]["id"],
                                             "content": "ok"}]}
-        self.post({**req, "messages": req["messages"] + [{"role": "assistant", "content": got2["content"]}, nxt]})
+        later = {**req, "messages": req["messages"] + [{"role": "assistant", "content": got2["content"]}, nxt]}
+        self.post(later)
         self.assertEqual(len(self.node_posts()), 3)
-        self.assertEqual(self.scored, ["now list the headings"])  # scored once; the tool-result turn reused it
+        # Same words and the same result text, but a later turn (more messages): scored again, the cache missed.
+        self.assertEqual(self.scored, [scored("now list the headings", "ok")] * 2)
+
+    def test_an_identical_retry_reuses_the_admission_and_a_new_result_does_not(self):
+        route = {"band": "R3", "route_id": "r-cache"}
+        msgs = [{"role": "user", "content": "list the headings"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "# One"}]}]
+        req = {"model": "cortados", "messages": msgs}
+        self.assertTrue(routing.continuation_admission(core, req, route)[0])
+        ok, why = routing.continuation_admission(core, json.loads(json.dumps(req)), route)   # the same request again
+        self.assertTrue(ok)
+        self.assertIn("admitted earlier", why)
+        self.assertEqual(len(self.scored), 1)
+        more = {"model": "cortados", "messages": msgs + [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t2", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "# Two"}]}]}
+        self.assertTrue(routing.continuation_admission(core, more, route)[0])
+        self.assertEqual(self.scored, [scored("list the headings", "# One"), scored("list the headings", "# Two")])
+        same_text = {"model": "cortados", "messages": msgs + [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t3", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t3", "content": "# One"}]}]}
+        self.assertTrue(routing.continuation_admission(core, same_text, route)[0])   # same text, more messages
+        self.assertEqual(len(self.scored), 3)
 
     def test_refused_continuation_leaves_the_session_usable(self):
         first, got = self.open()
@@ -738,7 +767,7 @@ class FlagBoundContinuationTests(ContinuationRecheckBase):
         self.assertEqual(self.scored, [])
         req["messages"][0]["content"].append({"type": "text", "text": "list them"})   # earlier words are used
         self.assertTrue(routing.continuation_admission(core, req, {"band": "R3", "route_id": "r"})[0])
-        self.assertEqual(self.scored, ["list them"])
+        self.assertEqual(self.scored, [scored("list them", "ok")])
 
     def test_no_checker_configured_fails_closed(self):
         first, got = self.open()
@@ -773,7 +802,7 @@ class AutoRouteBoundContinuationTests(ContinuationRecheckBase):
         first, got = self.open()
         self.post(self.follow(first, got, "and the next file"))
         self.assertEqual(len(self.node_posts()), 2)
-        self.assertEqual(self.scored, ["and the next file"])
+        self.assertEqual(self.scored, [scored("and the next file", "ok")])
 
 
 class RefusalBoundContinuationTests(ContinuationRecheckBase):

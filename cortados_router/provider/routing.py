@@ -14,6 +14,8 @@ Owner of two rules:
                     index_local, sensitive_local, refusal_route, the continuation re-check server.py runs on every later turn of a
                     conversation an automatic rule bound to a local lane): S1 not degraded, a band, `outward` exactly
                     False and `blast_radius` exactly the int 0 or 1. A missing or garbled answer is not admitted.
+                    What an admitted turn's local model then proposes is effect_boundary.py's (tool allowlist and
+                    outward-call inspection on every automatic-local relay, local_lane.serve / complete).
   local auto-route  after S1 has chosen a route (not degraded), auto_local may hand the conversation to a node's
                     auto_route model instead, only when local_admission admits it, S1's band is one the node's config
                     lists, the node answers its probe (on the Pro: AC power + manual switch + gate up) and lists the
@@ -44,6 +46,7 @@ import json
 import re
 import threading
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
 import logging
 import time
@@ -534,7 +537,7 @@ def _choose_local(core, body: dict[str, Any], node: dict[str, Any], entry: dict[
         tags = local_lane.probe(node)
     except local_lane.LocalUnavailable as exc:
         return {"router": execution_routing.ROUTER, "error": f"sub/{pin}: {exc}; no other model was tried"}
-    if entry["id"] not in tags:
+    if not local_lane.lists(tags, entry["id"]):
         return {"router": execution_routing.ROUTER,
                 "error": f"sub/{pin}: node {node['node']} does not list {entry['id']} (ollama pull it there); "
                          "no other model was tried"}
@@ -757,7 +760,7 @@ def _node_why(node: dict[str, Any], entry: dict[str, Any], body: dict[str, Any],
         # owner's attention, so it is a warning, where battery or a switched-off node is routine.
         return f"unavailable ({exc})", str(exc) == local_lane.GATE_REFUSED.format(node=node["node"])
     _auto_down.pop(node["node"], None)
-    if entry["id"] not in tags:
+    if not local_lane.lists(tags, entry["id"]):
         return f"does not list {entry['id']}", False
     if not need:
         need.append(int(request_fit(body)["input_tokens"]))
@@ -766,10 +769,16 @@ def _node_why(node: dict[str, Any], entry: dict[str, Any], body: dict[str, Any],
     return None, False
 
 
-def _moved(r: dict[str, Any], node: dict[str, Any], entry: dict[str, Any], rule: str) -> dict[str, Any]:
+def _moved(r: dict[str, Any], node: dict[str, Any], entry: dict[str, Any], rule: str, *,
+           reason: str) -> dict[str, Any]:
     """S1's route `r` moved to `entry` on `node`: the routes record names the local lane, S1's choice becomes runner_up,
     S1's own runner_up is kept as s1_runner_up and as a skipped entry, and `rule` joins the hard rules. Nothing is
-    written here (_log_moved writes it), so a move that does not happen leaves no trace in the routes table."""
+    written here (_log_moved writes it), so a move that does not happen leaves no trace in the routes table.
+
+    `reason` is WHICH automatic rule bound the conversation (an effect_boundary.BIND_PROFILES key: sensitive_flag,
+    prefer, keyword, refusal, auto_route; the published index adds "index"), kept as the route's `bind_reason`. The
+    route is the conversation's (server.LocalSession.route, kept across rebuilds), so every continuation carries it
+    and the effect boundary picks the same profile on every turn. Required: a new caller must say why it binds."""
     old = r.get("route") or {}
     chosen = {"lane": node["lane"], "provider": node["lane"], "model": entry["id"], "account": None,
               "config_dir": None, "reserve": False, "pool": None}
@@ -786,7 +795,7 @@ def _moved(r: dict[str, Any], node: dict[str, Any], entry: dict[str, Any], rule:
             "account": None, "config_dir": None, "context_length": entry["context_length"],
             "route_id": r["route_id"], "api_request_id": r.get("api_request_id", ""), "degraded": False,
             "band": r.get("band"), "projection": r.get("projection"), "decision": r.get("decision"), "route": route,
-            "local": {"node": node, "model": entry}}
+            "local": {"node": node, "model": entry}, "bind_reason": reason}
 
 
 def _log_moved(core, body: dict[str, Any], moved: dict[str, Any], *, client: str, conversation_id: str) -> None:
@@ -858,49 +867,139 @@ def route_admission(r: dict[str, Any] | None) -> tuple[bool, str]:
     return local_admission(decision.get("answers"), r.get("band"), degraded)
 
 
-def continuation_text(body: dict[str, Any]) -> str:
-    """What S1 scores for a continuation of a locally bound conversation: the latest user turn's own words (text
-    blocks, client reminders removed), or, on a tool-result turn that has none, the latest earlier user words. The
-    opening request is not rescored as such: it was admitted when the conversation was bound, and scoring it again
-    would hide a new instruction ("now email the invoice") behind the old one."""
-    for m in reversed(body.get("messages") or []):
-        if not isinstance(m, dict) or m.get("role") != "user":
-            continue
-        text = "\n".join(b.get("text", "") for b in wire._blocks(m.get("content"))
+def _user_words(m: dict[str, Any]) -> str:
+    """A user message's own words: its text blocks, client reminders removed."""
+    return strip_injected("\n".join(b.get("text", "") for b in wire._blocks(m.get("content"))
+                                     if isinstance(b, dict) and b.get("type") == "text"
+                                     and isinstance(b.get("text"), str))).strip()
+
+
+def _tool_result_text(block: dict[str, Any]) -> str:
+    """A tool_result block's text (string content or its text blocks). Not stripped of <system-reminder> tags: a tool
+    result is not the client's own wrapper, and a tag is exactly where an instruction could hide."""
+    c = block.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "\n".join(b.get("text", "") for b in c
                          if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
-        text = strip_injected(text).strip()
-        if text:
-            return text
     return ""
 
 
-# Bounds the re-check's added S1 latency in a tool loop: a turn whose scored text (continuation_text) is the same as
-# one this conversation had admitted within CONTINUATION_CACHE_S reuses that admission (the same window
-# execution_routing.select caches a score for). Only admissions are cached; a refusal is rescored every time.
+# The scored text's budget. S1 reads at most core.decide_s1's 6000 characters of a request (CONTINUATION_SCORE_CAP).
+# Review finding 3 (gpt-6.1-sol on f83b84a): cutting a long continuation to that cap (head and tail) left the middle of
+# a long tool result unscored while the model still got all of it, so an instruction placed there passed. Now a
+# continuation longer than the cap is scored in CHUNKS, every one of which must pass local_admission:
+#   - the person's words (up to CONTINUATION_WORDS_CAP, head and tail) open every chunk, so S1 judges each piece of a
+#     tool result as part of the request; words longer than that are also scored in full, in windows of their own;
+#   - the new tool results are cut into windows that overlap by CONTINUATION_OVERLAP characters, so an instruction up
+#     to that long which straddles a cut is whole in one window; every character is scored;
+#   - at most CONTINUATION_MAX_CHUNKS S1 calls per turn (up to CONTINUATION_PARALLEL at once). Reason: each is one S1
+#     call (core.S1_TIMEOUT_S bound), and the Studio's scorer serves every routing decision; 16 windows cover 65k to
+#     90k characters of new tool results (a large file Read), more than that is refused (fail closed) rather than
+#     scored in part. Chunking rather than failing closed at 6000: a tool loop routinely reads a file longer than
+#     6000 characters, and refusing every such turn would make a local-bound coding conversation unusable.
+CONTINUATION_SCORE_CAP = 6000
+CONTINUATION_WORDS_CAP = 1500
+CONTINUATION_OVERLAP = 400
+CONTINUATION_MAX_CHUNKS = 16
+CONTINUATION_PARALLEL = 4
+TOOL_RESULTS_LABEL = "\n\n[tool results since the last turn]\n"
+_CUT = "\n[...]\n"
+
+
+def _head_tail(text: str, cap: int) -> str:
+    if len(text) <= cap:
+        return text
+    if cap <= len(_CUT) + 2:
+        return text[:max(cap, 0)]
+    half = (cap - len(_CUT)) // 2
+    return text[:half] + _CUT + text[len(text) - (cap - len(_CUT) - half):]
+
+
+def _window_count(n: int, size: int) -> int:
+    """How many windows of `size` overlapping by CONTINUATION_OVERLAP cover `n` characters."""
+    if n <= size:
+        return 1
+    step = size - CONTINUATION_OVERLAP
+    return -(-(n - CONTINUATION_OVERLAP) // step)
+
+
+def _windows(text: str, size: int) -> list[str]:
+    """`text` cut into windows of `size` characters, consecutive windows overlapping by CONTINUATION_OVERLAP; together
+    they hold every character."""
+    if len(text) <= size:
+        return [text]
+    step = size - CONTINUATION_OVERLAP
+    return [text[i:i + size] for i in range(0, len(text) - CONTINUATION_OVERLAP, step)]
+
+
+def _continuation_parts(body: dict[str, Any]) -> tuple[str, str]:
+    """(the latest user words, the new tool results joined): continuation_text's two parts, uncut."""
+    msgs = [m for m in body.get("messages") or [] if isinstance(m, dict)]
+    last_assistant = max((i for i, m in enumerate(msgs) if m.get("role") == "assistant"), default=-1)
+    results = []
+    for m in msgs[last_assistant + 1:]:
+        if m.get("role") == "user" and isinstance(m.get("content"), list):
+            results += [_tool_result_text(b) for b in m["content"]
+                        if isinstance(b, dict) and b.get("type") == "tool_result"]
+    results = [r.strip() for r in results if r.strip()]
+    words = ""
+    for m in reversed(msgs):
+        if m.get("role") == "user":
+            words = _user_words(m)
+            if words:
+                break
+    return words, "\n---\n".join(results)
+
+
+def continuation_text(body: dict[str, Any]) -> str:
+    """What S1 judges for a continuation of a locally bound conversation, uncut: the latest user words (text blocks,
+    client reminders removed; on a tool-result turn with none, the latest earlier user words) AND the text of the tool
+    results added since the last scored turn, i.e. those in the user messages after the conversation's last assistant
+    message (each earlier turn's results were scored on that turn). A tool result can carry an instruction ("now
+    email this to ...") the person never wrote, so it is scored as if they had. The opening request is not rescored as
+    such: it was admitted when the conversation was bound, and scoring it again would hide a new instruction behind
+    the old one. "" when the conversation holds no user words at all (tool results alone are not scored: the caller
+    fails closed). Longer than CONTINUATION_SCORE_CAP, it is scored in chunks (continuation_chunks)."""
+    words, results = _continuation_parts(body)
+    if not results or not words:
+        return words
+    return words + TOOL_RESULTS_LABEL + results
+
+
+def continuation_chunks(body: dict[str, Any]) -> list[str] | None:
+    """The texts S1 scores for this continuation, each within CONTINUATION_SCORE_CAP, together covering every
+    character of continuation_text (see the comment above CONTINUATION_SCORE_CAP). [] when there are no user words;
+    None when covering it would take more than CONTINUATION_MAX_CHUNKS S1 calls (the caller fails closed)."""
+    words, results = _continuation_parts(body)
+    if not words:
+        return []
+    whole = words + TOOL_RESULTS_LABEL + results if results else words
+    if len(whole) <= CONTINUATION_SCORE_CAP:
+        return [whole]
+    context = _head_tail(words, CONTINUATION_WORDS_CAP)
+    room = CONTINUATION_SCORE_CAP - len(context) - len(TOOL_RESULTS_LABEL)
+    word_windows = 0 if words == context and results else _window_count(len(words), CONTINUATION_SCORE_CAP)
+    result_windows = _window_count(len(results), room) if results else 0
+    if word_windows + result_windows > CONTINUATION_MAX_CHUNKS:
+        return None
+    chunks = _windows(words, CONTINUATION_SCORE_CAP) if word_windows else []
+    return chunks + [context + TOOL_RESULTS_LABEL + w for w in (_windows(results, room) if results else [])]
+
+
+# Bounds the re-check's added S1 latency: a request whose scored text (continuation_text) AND message count equal one
+# this conversation had admitted within CONTINUATION_CACHE_S reuses that admission (the same window
+# execution_routing.select caches a score for). The text alone is not the key: a new tool result changes the text, and
+# a turn identical in words but later in the conversation (more messages) is a different turn, so both invalidate it;
+# a client retrying the same request hits it. Only admissions are cached; a refusal is rescored every time.
 CONTINUATION_CACHE_S = 180.0
-_admitted: "OrderedDict[tuple[str, str], tuple[float, str]]" = OrderedDict()
+_admitted: "OrderedDict[tuple[str, str, int], tuple[float, str]]" = OrderedDict()
 _admitted_lock = threading.Lock()
 
 
-def continuation_admission(core, body: dict[str, Any], route: dict[str, Any] | None) -> tuple[bool, str]:
-    """A continuation of a conversation an AUTOMATIC rule bound to a local lane (auto_local, sensitive_local,
-    refusal_route): S1 scores this turn (continuation_text) through core.decide, the same scorer call and the same
-    bounded timeout and retry as the opening's routing call (core.S1_TIMEOUT_S, S1_RETRIES), and local_admission
-    judges the answers under the band the conversation was bound with. (admitted, metadata reason). Fails closed: no
-    text to score, a degraded or failed scorer, or any exception is not admitted. server.Handler runs it before every
-    local dispatch of such a conversation; an explicit local pin (route["pinned"]) is never rescored.
-
-    Not admitted, the turn is refused and the conversation stays bound (server.py). Moving the conversation to a cloud
-    lane instead is #43's re-route seam (server.Handler._local_continuation_refused), not built here."""
-    route = route if isinstance(route, dict) else {}
-    text = continuation_text(body)
-    if not text:
-        return False, "no user text to score on this turn"
-    key = (str(route.get("route_id") or ""), hashlib.sha256(text.encode()).hexdigest())
-    with _admitted_lock:
-        hit = _admitted.get(key) if key[0] else None
-        if hit and _now() - hit[0] < CONTINUATION_CACHE_S:
-            return True, hit[1] + " (admitted earlier in this conversation)"
+def _score_chunk(core, text: str, band: Any) -> tuple[bool, str]:
+    """One chunk through core.decide and local_admission: (admitted, metadata reason). Fails closed."""
     try:
         decision = core.decide(text, {"platform": PLATFORM, "unit_kind": "interactive"})
     except Exception as exc:                         # the scorer call failed: the same as a degraded scorer
@@ -908,8 +1007,61 @@ def continuation_admission(core, body: dict[str, Any], route: dict[str, Any] | N
     if not isinstance(decision, dict):
         return False, "S1 gave no decision"
     deg = decision.get("degraded")
-    ok, why = local_admission(decision.get("answers"), route.get("band"),
-                              True if deg is True else False if deg is False else None)
+    return local_admission(decision.get("answers"), band, True if deg is True else False if deg is False else None)
+
+
+def _score_chunks(core, chunks: list[str], band: Any) -> tuple[bool, str]:
+    """Every chunk must pass; the first refusal found decides (the rest are cancelled where not started)."""
+    if len(chunks) == 1:
+        return _score_chunk(core, chunks[0], band)
+    pool = ThreadPoolExecutor(max_workers=min(CONTINUATION_PARALLEL, len(chunks)),
+                              thread_name_prefix="cortados-continuation")
+    try:
+        futures = {pool.submit(_score_chunk, core, c, band): i for i, c in enumerate(chunks)}
+        why_ok = ""
+        for fut in as_completed(futures):
+            try:
+                ok, why = fut.result()
+            except Exception as exc:                 # fail closed, as _score_chunk does
+                ok, why = False, f"S1 scoring failed ({type(exc).__name__})"
+            if not ok:
+                return False, f"{why} (part {futures[fut] + 1} of {len(chunks)})"
+            why_ok = why
+        return True, f"{why_ok} (all {len(chunks)} parts)"
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def continuation_admission(core, body: dict[str, Any], route: dict[str, Any] | None) -> tuple[bool, str]:
+    """A continuation of a conversation an AUTOMATIC rule bound to a local lane (auto_local, sensitive_local,
+    refusal_route): S1 scores this turn (continuation_text: the latest user words and the new tool results; longer
+    than S1's input cap, every chunk of continuation_chunks, all of which must pass) through core.decide, the same
+    scorer call and the same bounded timeout and retry as the opening's routing call (core.S1_TIMEOUT_S,
+    S1_RETRIES), and local_admission judges the answers under the band the conversation was bound with. (admitted,
+    metadata reason). Fails closed: no text to score, more than CONTINUATION_MAX_CHUNKS chunks, a degraded or failed
+    scorer on any chunk, or any exception is not admitted. server.Handler runs it before every local dispatch of such
+    a conversation; an explicit local pin (route["pinned"]) is never rescored. What the admitted turn's model then
+    proposes is the effect boundary's (effect_boundary.py, applied by local_lane.serve).
+
+    Not admitted, the turn is refused and the conversation stays bound (server.py). Moving the conversation to a cloud
+    lane instead is #43's re-route seam (server.Handler._local_continuation_refused), not built here."""
+    route = route if isinstance(route, dict) else {}
+    text = continuation_text(body)
+    if not text.strip():
+        return False, "no user text to score on this turn"
+    chunks = continuation_chunks(body)
+    if chunks is None:
+        return False, (f"this turn's new text is too long to score (more than {CONTINUATION_MAX_CHUNKS} "
+                       f"S1 calls of {CONTINUATION_SCORE_CAP} characters)")
+    if not chunks:
+        return False, "no user text to score on this turn"
+    key = (str(route.get("route_id") or ""), hashlib.sha256(text.encode()).hexdigest(),
+           len(body.get("messages") or []))
+    with _admitted_lock:
+        hit = _admitted.get(key) if key[0] else None
+        if hit and _now() - hit[0] < CONTINUATION_CACHE_S:
+            return True, hit[1] + " (admitted earlier in this conversation)"
+    ok, why = _score_chunks(core, chunks, route.get("band"))
     if ok and key[0]:
         with _admitted_lock:
             _admitted[key] = (_now(), why)
@@ -954,7 +1106,7 @@ def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, co
             continue
         moved = _moved(r, node, entry,
                        f"local auto-route: band {band} is in {node['lane']}'s auto_route bands and the node is "
-                       f"available; {pin} instead of {r.get('provider')}/{r.get('model')}")
+                       f"available; {pin} instead of {r.get('provider')}/{r.get('model')}", reason="auto_route")
         _log_moved(core, body, moved, client=client, conversation_id=conversation_id)
         logger.info("local auto-route: %s -> %s/%s (band %s)", r["route_id"], node["lane"], pin, band)
         return moved
@@ -976,7 +1128,7 @@ def _move_to_local(core, body: dict[str, Any], r: dict[str, Any], node: dict[str
         logger.info("local index route: %s/%s not taken for %s: %s", node["lane"], local_lane.pin_id(entry),
                     r.get("route_id"), why)
         return r
-    moved = _moved(r, node, entry, rule)
+    moved = _moved(r, node, entry, rule, reason="index")
     if chosen_extra:
         moved["route"]["chosen"] = {**moved["route"]["chosen"], **chosen_extra}
     _log_moved(core, body, moved, client=client, conversation_id=conversation_id)
@@ -989,6 +1141,70 @@ def _tag_key(tag: str | None) -> str:
     """An Ollama tag as the proxy table names it: case-insensitive, `:latest` optional (Ollama's implicit tag)."""
     t = str(tag or "").strip().casefold()
     return t[:-len(":latest")] if t.endswith(":latest") else t
+
+
+def _variant_why(body: dict[str, Any], entry: dict[str, Any], v: dict[str, Any], *, asked: bool, room: bool
+                 ) -> str | None:
+    """Why the published-index variant `v` of node model `entry` cannot run this request, or None: the per-request
+    part of the choice, shared by the index route (index_local) and the sensitive routes (choose_variant). Not the
+    index itself: the index route requires it to clear, a sensitive route runs local in any band."""
+    thinking = v.get("thinking")
+    if thinking not in local_lane.VARIANT_THINKING:
+        return f"unknown thinking {thinking!r}"
+    if entry.get("thinking") == "passthrough":
+        return "its node entry is thinking: passthrough, so the variant's thinking cannot be set"
+    if asked and thinking != "on":
+        return "the client asked for thinking: only a thinking variant matches what will run"
+    if thinking == "on" and not room:
+        return f"max_tokens {body.get('max_tokens')!r} < {local_lane.THINK_MIN_MAX_TOKENS}: no room to think and answer"
+    return None
+
+
+def _variant_index(v: dict[str, Any], use_case: str | None) -> Any:
+    idx = v.get("index") or {}
+    return idx.get(use_case, idx.get("general")) if use_case else idx.get("general")
+
+
+def choose_variant(core, body: dict[str, Any], r: dict[str, Any], entry: dict[str, Any]
+                   ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """The node model `entry` for a SENSITIVE route (sensitive_local, refusal_route), with its published-index variant
+    chosen per request by the index route's rules (_variant_why: passthrough, a client that asked for thinking, room in
+    max_tokens), and the chosen-entry extras to record, or (entry, None) when the model has no eligible variant (its
+    own `thinking` setting then applies, as before the index). A sensitive route runs local in any band, so the
+    variant need not clear S1's required index; of the eligible ones it takes what the index route would (the lighter
+    one whose index for S1's use case clears the required index), else the strongest (highest index: the request
+    runs here whatever its band, so it gets the best this model has)."""
+    try:
+        variants = (core.model_scores() or {}).get("local_models") or []
+    except Exception as exc:                       # the generated scores unreadable: the model's own setting applies
+        logger.warning("local variant: scores unreadable (%s); %s runs on its own thinking setting",
+                       type(exc).__name__, local_lane.pin_id(entry))
+        return entry, None
+    route = r.get("route") or {}
+    req = route.get("required_index")
+    use_case = (route.get("chosen") or {}).get("use_case")
+    asked = local_lane.client_asked_thinking(body)
+    room = local_lane.think_budget(body.get("max_tokens")) is not None
+    ok = []
+    for v in variants:
+        if _tag_key(v.get("local_id")) != _tag_key(entry["id"]):
+            continue
+        why = _variant_why(body, entry, v, asked=asked, room=room)
+        if why:
+            logger.info("local variant: %s not chosen for %s: %s", v.get("family"), r.get("route_id"), why)
+            continue
+        idx = _variant_index(v, use_case)
+        ok.append((float((v.get("index") or {}).get("general") or 0.0), v,
+                   idx if isinstance(idx, (int, float)) else None))
+    if not ok:
+        return entry, None
+    clears = sorted((o for o in ok if o[2] is not None and isinstance(req, (int, float)) and o[2] >= req),
+                    key=lambda o: o[0])
+    _, v, idx = clears[0] if clears else max(ok, key=lambda o: (o[2] if o[2] is not None else -1.0, o[0]))
+    extra = {"variant": v["family"], "index": idx, "use_case": use_case, "proxy": True,
+             "provenance": v.get("provenance"),
+             "variant_why": "clears the required index" if clears else "the strongest eligible variant"}
+    return {**entry, "variant": v["family"], "variant_thinking": v["thinking"]}, extra
 
 
 def index_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, conversation_id: str,
@@ -1038,19 +1254,10 @@ def index_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, c
             for v in variants:
                 if _tag_key(v.get("local_id")) != _tag_key(entry["id"]):
                     continue
-                name, thinking = v.get("family"), v.get("thinking")
-                idx = (v.get("index") or {}).get(use_case, (v.get("index") or {}).get("general"))
-                why = None
-                if thinking not in local_lane.VARIANT_THINKING:
-                    why = f"unknown thinking {thinking!r}"
-                elif entry.get("thinking") == "passthrough":
-                    why = "its node entry is thinking: passthrough, so the variant's thinking cannot be set"
-                elif asked and thinking != "on":
-                    why = "the client asked for thinking: only a thinking variant matches what will run"
-                elif thinking == "on" and not room:
-                    why = (f"max_tokens {body.get('max_tokens')!r} < {local_lane.THINK_MIN_MAX_TOKENS}: no room to "
-                           "think and answer")
-                elif not isinstance(idx, (int, float)) or idx < req:
+                name = v.get("family")
+                idx = _variant_index(v, use_case)
+                why = _variant_why(body, entry, v, asked=asked, room=room)
+                if why is None and (not isinstance(idx, (int, float)) or idx < req):
                     why = f"{use_case} index {idx} < required {req}"
                 if why:
                     skip(f"{node['lane']}/{name}", why)
@@ -1150,6 +1357,11 @@ def sensitive_trigger(body: dict[str, Any], r: dict[str, Any], section: dict[str
     return None
 
 
+# sensitive_trigger's rule -> the route's bind_reason (effect_boundary.BIND_PROFILES). "s1" (the planned S1 signal, not
+# wired) is not a known reason yet, so it gets the strictest profile until it is added there.
+TRIGGER_REASONS = {"flag": "sensitive_flag", "prefer": "prefer", "keyword": "keyword"}
+
+
 def _not_admitted(r: dict[str, Any]) -> str | None:
     """route_admission as sensitive_local reads it: None when admitted, else why not."""
     ok, why = route_admission(r)
@@ -1199,9 +1411,14 @@ def sensitive_local(core, body: dict[str, Any], r: dict[str, Any], *, client: st
                        _rule_label(rule), node["lane"], local_lane.pin_id(entry), rid, why)
             continue
         pin = local_lane.pin_id(entry)
-        moved = _moved(r, node, entry,
-                       f"{_rule_label(rule)}: no outward effect and {node['lane']} is available; {pin} instead of "
-                       f"{r.get('provider')}/{r.get('model')} (band {r.get('band')})")
+        run_entry, extra = choose_variant(core, body, r, entry)
+        moved = _moved(r, node, run_entry,
+                       f"{_rule_label(rule)}: no outward effect and {node['lane']} is available; {pin}"
+                       f"{' (' + extra['variant'] + ')' if extra else ''} instead of "
+                       f"{r.get('provider')}/{r.get('model')} (band {r.get('band')})",
+                       reason=TRIGGER_REASONS.get(rule, rule))
+        if extra:
+            moved["route"]["chosen"] = {**moved["route"]["chosen"], **extra}
         _log_moved(core, body, moved, client=client, conversation_id=conversation_id)
         logger.info("%s: %s -> %s/%s (band %s)", _rule_label(rule), rid, node["lane"], pin, r.get("band"))
         return moved
@@ -1245,10 +1462,14 @@ def refusal_route(core, body: dict[str, Any], route: dict[str, Any] | None,
         pin = local_lane.pin_id(entry)
         why, gate_refused = _node_why(node, entry, body, lambda name: False, need)   # exclusions applied when routed
         if why is None:
-            moved = _moved(route, node, entry,
+            run_entry, extra = choose_variant(core, body, route, entry)
+            moved = _moved(route, node, run_entry,
                            f"sensitive: refusal: {route.get('provider')}/{route.get('model')} refused the opening "
-                           f"turn; no outward effect and {node['lane']} is available; {pin} instead "
-                           f"(band {route.get('band')})")
+                           f"turn; no outward effect and {node['lane']} is available; {pin}"
+                           f"{' (' + extra['variant'] + ')' if extra else ''} instead "
+                           f"(band {route.get('band')})", reason="refusal")
+            if extra:
+                moved["route"]["chosen"] = {**moved["route"]["chosen"], **extra}
             moved.pop("refusal_fallback", None)
             if run(moved):
                 _log_moved(core, body, moved, client=marker.get("client") or "",

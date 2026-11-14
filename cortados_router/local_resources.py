@@ -84,6 +84,49 @@ def pro_local_allowed():
     return True, "local enabled: AC power + manual switch on"
 
 
+# The manual switch, set and read in ONE place: the `toggle` CLI and the local gate's authenticated switch endpoint
+# (local_gate.py, POST /cortados/local-switch) both call these, so the two doors cannot drift apart.
+POWER_WORDS = {"AC power": "ac", "local disabled: on battery": "battery"}
+
+
+def power_source():
+    """'ac', 'battery' or 'unknown' (pmset unreadable or a source it does not name), from the same cached probe that
+    pro_local_allowed uses: the status shown is the one admission decides on."""
+    return POWER_WORDS.get(_ac_power()[1], "unknown")
+
+
+def set_local_switch(on):
+    """Turn the manual switch on (create the flag file) or off (remove it). Atomic either way: on writes a private
+    temporary file and renames it into place, so a reader never sees a half-made flag; off is a single unlink. Neither
+    starts or stops Ollama. OSError propagates: the caller says the switch could not be changed."""
+    flag = local_switch_path()
+    if not on:
+        flag.unlink(missing_ok=True)
+        return
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    if flag.is_file():
+        return
+    tmp = flag.with_name(".local-enabled.%d.%d.tmp" % (os.getpid(), threading.get_ident()))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    try:
+        os.replace(tmp, flag)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def local_switch_status():
+    """{"switch", "allowed", "reason", "power"}: what the toggle CLI prints and the gate's status endpoint answers.
+    Read-only; answers whatever the switch and power say (it is how the owner sees the state)."""
+    allowed, reason = pro_local_allowed()
+    try:
+        switch = "on" if local_switch_path().is_file() else "off"
+    except OSError:
+        switch = "unknown"
+    return {"switch": switch, "allowed": allowed, "reason": reason, "power": power_source()}
+
+
 def mac_memory(text):
     page = re.search(r"page size of (\d+) bytes", text)
     if not page:
@@ -282,18 +325,12 @@ def main(argv=None):
     parser.add_argument("--config", type=Path)
     args = parser.parse_args(argv)
     if args.action == "toggle":
-        flag = local_switch_path()
         try:
-            if args.state == "on":
-                flag.parent.mkdir(parents=True, exist_ok=True)
-                flag.touch(exist_ok=True)
-            elif args.state == "off":
-                flag.unlink(missing_ok=True)
+            if args.state != "status":
+                set_local_switch(args.state == "on")
         except OSError as exc:
             parser.error("cannot change local switch: " + str(exc))
-        allowed, reason = pro_local_allowed()
-        print(json.dumps({"switch": "on" if flag.is_file() else "off",
-                          "allowed": allowed, "reason": reason}))
+        print(json.dumps(local_switch_status()))
         return
     if args.collect:
         result = collect_node(args.metal_probe)

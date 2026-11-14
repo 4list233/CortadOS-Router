@@ -1,10 +1,17 @@
 """The CortadOS endpoint: an Anthropic Messages server whose one model, `cortados`, is served by bridged headless CLIs.
 
 Owner of the conversation registry: which bridge session a request belongs to. A request with no assistant messages
-starts a new session; any other goes to the one live session whose replies are exactly its assistant history, and
-fails with 409 when there is none or more than one, or with a terminal 400 naming the failure's category when the
-request belongs to a conversation closed because its backend failed (a bounded, time-limited tombstone keyed by the
-conversation itself; both wires share the lookup).
+starts a new session; any other goes to the one live session whose replies are exactly its assistant history. A
+request whose client compacted or edited that history is served on a REBUILT backend (Registry.rebuild, issue #43:
+a fresh session on the same route, seeded with the client's current history as a transcript; identical concurrent
+rebuilds share one). When no rebuild is possible it fails with a terminal 400 (x-should-retry: false), because the
+retry carries the same history: no conversation identity, no live conversation of the same client wrote its last
+reply, more than one did, the conversation reached REBUILD_MAX, its replayed history does not fit its model, it asks
+for another model, or it was closed because its backend failed (a bounded, time-limited tombstone keyed by the
+conversation itself; both wires share the lookup). A state a moment can change (a rebuild in flight, a turn running)
+is a retryable 529; docs/PROVIDER-PLAN.md has the table. An exact match is looked up only among the request's own
+scope (wire, client, conversation identity): two clients never share one, and a request without an identity is
+continued only on proof that it is the session's caller (a tool_use id of that session in its history).
 A request without tools always gets its own throwaway CLI.
 
 Run:  python3 -B -m cortados_router.provider.server [--port 8432]
@@ -26,6 +33,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import html as html_escape
 import json
 import logging
 import os
@@ -45,9 +53,11 @@ from typing import Any, Callable
 if __package__ in (None, ""):                           # run as a file: make the package importable
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from cortados_router import http_body
 from cortados_router.compat import getenv
 from cortados_router.compaction import prune as compaction_prune, store as compaction_store
-from cortados_router.provider import anthropic_wire, clients, live, local_lane, office, responses_wire, routing, search_lane
+from cortados_router.provider import (anthropic_wire, clients, dashboard_auth, effect_boundary, live, local_lane,
+                                      local_switch, office, responses_wire, routing, search_lane)
 from cortados_router.provider.bridge import BridgeError, BridgeSession, ToolWaitExpired, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
 from cortados_router.provider.timeouts import IDLE_S, TOOL_WAIT_S, TURN_TIMEOUT_S, effective_tool_wait
@@ -75,6 +85,18 @@ if MAX_SESSIONS < 1:
 # goes first.
 TOMBSTONE_TTL_S = 900.0
 TOMBSTONE_MAX = 256
+# Rebuilds per conversation (Registry.rebuild): each one replays the client's whole history, uncached, into a fresh
+# backend, so a client whose history diverges on every request (a client bug, two clients fighting over one identity)
+# must not pay that on every turn. 5 covers several client compactions in one long run (the 409 bursts of #43 were in
+# 70-80 minute builder runs) and is counted along the conversation's lineage: every session rebuilt from it, by
+# compaction or by a branch, shares ONE budget (RebuildBudget), so branching cannot reset it. Reaching it is terminal
+# (TERMINAL_STATUS, never the retried 409): a retry carries the same rewritten history and would be refused again.
+# 0 switches rebuilding off (the pre-#43 409 for every rewritten history).
+REBUILD_MAX = 5
+# How long a rebuild waits for another rebuild of the same conversation point (same scope, wire and anchor reply) to
+# finish starting its backend before it answers a retryable busy (Registry.rebuild, review P1-a). A backend start is a
+# few seconds; a minute covers a slow Codex app-server start without holding a handler thread for a whole turn.
+REBUILD_WAIT_S = 60.0
 # Recently closed conversations kept for the 409 diagnostic (Registry.closed): enough to cover the live conversations
 # of a busy endpoint, and an hour, past which a reap no longer explains a 409.
 CLOSED_RECORD_MAX = 128
@@ -152,10 +174,13 @@ _DASHBOARD_PATH = Path(__file__).with_name("dashboard.html")
 _dashboard_cache: dict = {}
 
 
-# The page holds no data or secret, so it needs no token; these headers keep it from being cached, framed, sniffed as
-# another type, or sending its Referer. Its Content-Security-Policy is _dashboard_csp(): it pins the one inline script.
+# The token page holds no data or secret, so it needs no token; in session mode the page carries the session's CSRF
+# token. These headers keep it from being stored by the browser or any cache (private, no-store; Vary names the
+# credentials it depends on), framed, sniffed as another type, or sending its Referer. Its Content-Security-Policy is
+# _dashboard_csp(): it pins the one inline script.
 DASHBOARD_HEADERS = {
-    "Cache-Control": "no-store",
+    "Cache-Control": "private, no-store",
+    "Vary": "Cookie, Authorization",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
@@ -236,6 +261,66 @@ def _dashboard_csp() -> str:
     """The Content-Security-Policy for the page _dashboard_html() returned."""
     _dashboard_html()
     return _dashboard_cache["csp"]
+
+
+# The page's auth mode and CSRF token travel in two <meta> tags (outside the script, so the CSP's script hash is the same
+# for every mode). "token": no password is set, the page asks for the provider token as before. "session": a dashboard
+# session (provider/dashboard_auth.py) is open, the page fetches with its cookie and sends the CSRF token on a POST.
+_AUTH_META = b'<meta id="cortados-auth" name="cortados-auth" content="token">'
+_CSRF_META = b'<meta id="cortados-csrf" name="cortados-csrf" content="">'
+
+
+def _dashboard_page(session: "dashboard_auth.Session | None") -> bytes:
+    """The dashboard page for this request: token mode, or session mode carrying that session's CSRF token."""
+    page = _dashboard_html()
+    if session is None:
+        return page
+    if page.count(_AUTH_META) != 1 or page.count(_CSRF_META) != 1:
+        raise ValueError("dashboard page: the auth meta tags are missing")
+    csrf = html_escape.escape(session.csrf, quote=True).encode()   # urlsafe base64 already; escaped all the same
+    return (page.replace(_AUTH_META, _AUTH_META.replace(b'content="token"', b'content="session"'))
+            .replace(_CSRF_META, _CSRF_META.replace(b'content=""', b'content="' + csrf + b'"')))
+
+
+# The login page (a password is set and the request has no valid session): a plain form and no script at all, so its
+# policy allows no script; form-action 'self' is what lets it post to /dashboard/login.
+LOGIN_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+# The login page's referrer policy is same-origin, not the dashboard's no-referrer: under no-referrer a browser sends
+# `Origin: null` on a form POST, and the login's same-origin check (dashboard_auth.same_origin) would refuse the owner.
+# same-origin still sends nothing to another site. (The page's own logout fetch sets referrerPolicy per request.)
+LOGIN_HEADERS = {"Referrer-Policy": "same-origin"}
+LOGIN_PATH, LOGOUT_PATH = "/dashboard/login", "/dashboard/logout"
+# A login body is one short form field; anything bigger is refused before it is read.
+LOGIN_MAX_BYTES = 4096
+# The whole login body must arrive within this many seconds of the headers (http_body.read_within). The socket timeout
+# (SOCKET_TIMEOUT_S) bounds inactivity only, so without it an unauthenticated client trickling one byte per 100 s holds
+# a handler thread for days. 4 KiB in 5 s is ~6.5 kbit/s: a browser posts it in one write.
+LOGIN_BODY_DEADLINE_S = 5.0
+# Login requests handled at once, from headers to the reply; one more is refused with 503 before anything is read. The
+# route is unauthenticated, so this caps the threads (and scrypt/PBKDF2 queue) strangers can occupy. Logins are
+# serialised in dashboard_auth anyway, so 4 is plenty for the one owner.
+LOGIN_MAX_CONCURRENT = 4
+# Every authenticated view (owner token, scoped token or dashboard session): never stored by the browser or any cache,
+# and a response depends on the credential it was asked with.
+VIEW_HEADERS = {"Cache-Control": "private, no-store", "Vary": "Cookie, Authorization"}
+_LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark"><title>CortadOS · log in</title>
+<style>body{{font:15px system-ui,sans-serif;max-width:22rem;margin:12vh auto;padding:0 1rem}}
+input,button{{font:inherit;width:100%;box-sizing:border-box;padding:.5rem;margin:.4rem 0}}.msg{{color:#c0392b;min-height:1.2em}}</style>
+</head><body><h1>CortadOS</h1>
+<form method="post" action="/dashboard/login">
+<label for="password">Dashboard password</label>
+<input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+<button type="submit">Log in</button></form>
+<p class="msg">{message}</p>
+</body></html>
+"""
+
+
+def _login_page(message: str = "") -> bytes:
+    """The login page; `message` is one of this module's fixed strings, escaped all the same."""
+    return _LOGIN_PAGE.format(message=html_escape.escape(message, quote=True)).encode()
 # SSE pings while a turn runs, so the client's read timeout does not fire during a long think.
 PING_S = 10.0
 # Seconds a socket read or write may block (http.server applies it to the connection). A client that stops reading
@@ -253,12 +338,16 @@ class Wire:
     Anthropic-shaped body `routing.choose` scores; `stream_body(msg_id, model, blocks, stop, usage)` and
     `stream_error(msg_id, model, message[, terminal=])` also receive the id `stream_start` announced and the requested model,
     because the Responses wire must echo both in its final event (Codex compares the model) while the Anthropic
-    wire needs neither. `terminal=True` marks an error no retry can fix with each wire's non-retried kind."""
+    wire needs neither. `terminal=True` marks an error no retry can fix with each wire's non-retried kind.
+    `history_messages(body)` is the request's history before its new turn, Anthropic-shaped, for a rebuilt backend's
+    seed (anthropic_wire.rebuild_transcript)."""
 
     def __init__(self, *, model_id: str, error_type: type, parse_request: Callable, one_shot_content: Callable,
                  routing_body: Callable, new_message_id: Callable, stream_start: Callable, stream_ping: Callable,
-                 stream_body: Callable, stream_error: Callable, message_json: Callable, error_json: Callable):
+                 stream_body: Callable, stream_error: Callable, message_json: Callable, error_json: Callable,
+                 history_messages: Callable):
         self.MODEL_ID, self.WireError = model_id, error_type
+        self.history_messages = history_messages        # body -> Anthropic-shaped messages before the new turn (rebuild)
         self.parse_request, self.one_shot_content, self.routing_body = parse_request, one_shot_content, routing_body
         self.new_message_id, self.stream_start, self.stream_ping = new_message_id, stream_start, stream_ping
         self.stream_body, self.stream_error, self.message_json, self.error_json = stream_body, stream_error, message_json, error_json
@@ -271,7 +360,8 @@ ANTHROPIC = Wire(
     stream_body=lambda msg_id, model, blocks, stop, usage: anthropic_wire.sse_body(blocks, stop, usage),
     stream_error=lambda msg_id, model, message, terminal=False: anthropic_wire.sse(
         "error", anthropic_wire.error_json(TERMINAL_ERROR if terminal else "api_error", message)),
-    message_json=anthropic_wire.message_json, error_json=anthropic_wire.error_json)
+    message_json=anthropic_wire.message_json, error_json=anthropic_wire.error_json,
+    history_messages=lambda body: anthropic_wire.history_messages(body["messages"]))
 # The Responses wire scores what its user and assistant messages say, in Anthropic shape, with the rest of the body
 # kept (routing.choose sizes the request from the whole body and reads `tools` to tell a one-shot from a session).
 # Only the function tools are handed over: parse_request drops the hosted ones (web_search), so a request whose
@@ -286,7 +376,8 @@ RESPONSES = Wire(
     stream_body=lambda msg_id, model, blocks, stop, usage: responses_wire.sse_body(blocks, stop, usage, msg_id=msg_id, model=model),
     stream_error=lambda msg_id, model, message, terminal=False: responses_wire.sse_error(message, msg_id=msg_id, model=model,
                                                                                          terminal=terminal),
-    message_json=responses_wire.message_json, error_json=responses_wire.error_json)
+    message_json=responses_wire.message_json, error_json=responses_wire.error_json,
+    history_messages=responses_wire.history_messages)
 WIRES: dict[str, Wire] = {"/v1/messages": ANTHROPIC, "/v1/responses": RESPONSES}
 wire = ANTHROPIC                                        # the endpoint's own errors (GET 401, 404) speak the Anthropic wire
 
@@ -366,6 +457,9 @@ RUNS_PATH = "/v1/cortados/runs/"
 # The Office view (provider/office.py): GET is open to the owner token and to a client token with the office:read scope
 # (provider/clients.py); the heartbeat POST, which writes, needs the owner token (the mod already holds it to route).
 OFFICE_HEARTBEAT_PATH = "/v1/cortados/office/heartbeat"
+# The client-side boundary hook's question (docs/BOUNDARY-HOOK.md, effect_boundary.check_answer): owner token only.
+BOUNDARY_CHECK_PATH = "/v1/cortados/boundary/check"
+_TOOL_USE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _SCOPE_DENIED = "cortados: this token's scopes do not cover this endpoint"
 
 # What a refusal record (RunRecords.refuse) and the refusal log line hold: the status, the error type, an endpoint id
@@ -408,12 +502,22 @@ def endpoint_id(path: str | None) -> str:
         return "live"
     if p == live.HEARTBEAT_PATH:
         return "live_heartbeat"
+    if p == local_switch.VIEW_PATH:
+        return "local"
+    if p == local_switch.SWITCH_PATH:
+        return "local_switch"
+    if p == BOUNDARY_CHECK_PATH:
+        return "boundary_check"
     if p.startswith("/v1/models"):
         return "models"
     if p in ("/health", "/resources", "/bridge/call"):
         return p[1:].replace("/", "_")
     if p in ("/", "/dashboard"):
         return "dashboard"
+    if p == LOGIN_PATH:
+        return "dashboard_login"
+    if p == LOGOUT_PATH:
+        return "dashboard_logout"
     return "other"
 
 
@@ -425,9 +529,14 @@ def endpoint_id(path: str | None) -> str:
 #                              share it; their histories differ, so identity + digest still names one conversation.
 #   session-id                 Codex 0.166.0 sends its thread id as `session-id` (and `thread-id`, x-client-request-id,
 #                              prompt_cache_key) on /v1/responses; the 0.163.0 binary carries the same header names.
-# Every one present is part of the identity; with none, the request has no identity and gets no tombstone.
+# Every one present is part of the identity; with none, the request has no identity and gets no tombstone. The identity
+# also scopes every lookup (Registry.find: exact match, replay, rebuild), and a continuation without one is continued
+# only on a tool_use-id proof of caller, never rebuilt or replayed (#43 second review, P1-b). Every real client sends
+# one: Claude Code its session id, CortadOS child tasks and routed subagents also x-cortados-run-id, Codex session-id.
+# x-cortados-session (the Office's salted main-session tag) is not one: it only ever comes beside the run id or Claude
+# Code's own id, and every subagent of a session shares it.
 # These headers are client-asserted, not authenticated: a client holding the endpoint token could send another's. They
-# scope failure diagnostics to a conversation; they do not isolate one client from another.
+# keep honest clients' conversations apart; they are no defence against a token holder.
 CONVERSATION_ID_HEADERS = (RUN_ID_HEADER, "x-claude-code-session-id", "session-id")
 
 
@@ -623,7 +732,8 @@ def api_reveal_suffix() -> str | None:
 
 
 def _claude_session(reg: "Registry", *, account: str | None = None, config_dir: str | None = None, **kw) -> BridgeSession:
-    return BridgeSession(gateway_url=reg.gateway_url, token=reg.token, claude_bin=reg.claude_bin,
+    # No owner token: the session mints its own bridge-only credential for its MCP shim (BridgeSession.bridge_token).
+    return BridgeSession(gateway_url=reg.gateway_url, claude_bin=reg.claude_bin,
                          config_dir=config_dir, **kw)
 
 
@@ -709,6 +819,10 @@ class Registry:
         self._office_exit_lock = threading.Lock()
         self.sessions: dict[str, Any] = {}
         self._opening = 0                              # admission reservations: concurrent starts count toward cap
+        # Rebuilds in flight, (scope, wire_path, anchor reply) -> [gate lock, holders] (Registry.rebuild, review P1-a):
+        # identical concurrent rebuild requests take turns on the gate, and the later ones join the session the first
+        # published instead of starting their own. Read and changed under self._lock; an entry lives while held.
+        self._rebuilding: dict[tuple, list] = {}
         # failure_key of a failed conversation -> (diagnostic, failed_at, short id); under self._lock, oldest first.
         self.tombstones: "OrderedDict[str, tuple[str, float, str]]" = OrderedDict()
         self.runs = RunRecords()                    # x-cortados-run-id -> what its routed requests ran on
@@ -718,6 +832,9 @@ class Registry:
         # Scoped client tokens (clients.json). Consulted only when the owner token does not match, so the owner's
         # behaviour is unchanged; a client token opens only its scopes' endpoints and gets 403 everywhere else.
         self.clients = clients.ClientTokens(owner_token=token)
+        # Dashboard password and sessions ($CORTADOS_HOME/dashboard-*.json, provider/dashboard_auth.py). A session opens
+        # only the dashboard's views (and local:switch), through Handler._owner_or_session; the owner token is unchanged.
+        self.dashboard = dashboard_auth.DashboardAuth()
         # Recently closed conversations, for the 409 diagnostic only (find -> _lost_diagnostic): (closed_at, reason,
         # first reply fingerprint, history length). A 409 whose first fingerprint is here was a conversation this
         # endpoint closed itself (reaped, dropped, failed), which tells a reap from a lost response or an edited
@@ -739,23 +856,29 @@ class Registry:
         return None
 
     def new(self, turn: anthropic_wire.ClientTurn, *, keep: bool, route: dict | None = None,
-            scope: str | None = None, wire_path: str | None = None, admitted: bool = False):
+            scope: str | None = None, wire_path: str | None = None, admitted: bool = False,
+            client: str | None = None):
         if keep and not admitted:
             self.reserve_opening()
         try:
-            s = self._new(turn, keep=keep, route=route, scope=scope, wire_path=wire_path)
+            s = self._new(turn, keep=keep, route=route, scope=scope, wire_path=wire_path, client=client)
         except BaseException:
             if keep:
                 self.release_opening()
             raise
         if keep:
-            # Convert the admission reservation into a live session in one critical section.
-            with self._lock:
-                self.sessions[s.id] = s
-                self._opening -= 1
-            if hasattr(s, "set_exit_handler"):
-                s.set_exit_handler(self._backend_exited)
+            self._publish(s)
         return s
+
+    def _publish(self, s) -> None:
+        """Make a fully initialised session findable: convert its admission reservation into a live session in one
+        critical section. Everything find() and a turn read (history, rebuild_seed, the rebuild budget) must be set
+        before this call: from here on any request can find it and take its turn lock."""
+        with self._lock:
+            self.sessions[s.id] = s
+            self._opening -= 1
+        if hasattr(s, "set_exit_handler"):
+            s.set_exit_handler(self._backend_exited)
 
     def _backend_exited(self, s) -> None:
         """The backend process died on its own (e.g. the shim killed its CLI on a tool deadline): remove the
@@ -802,9 +925,12 @@ class Registry:
         a LocalSession (continued by the same reply fingerprints, so the client's next turn finds it) takes the old
         session's place, and the old backend is closed. Its exit is not an unexpected exit: the session is already out
         of the registry when it ends, so _backend_exited ignores it."""
+        # client: find's scope without an identity (#43, merged from main): the moved conversation keeps its opener's
+        # client, or an identity-less continuation would not find it.
         new = self._new(turn, keep=True, route=route, scope=getattr(old, "scope", None),
-                        wire_path=getattr(old, "wire_path", None))
+                        wire_path=getattr(old, "wire_path", None), client=getattr(old, "client", None))
         new.history = list(old.history)
+        new.rebuild_budget = getattr(old, "rebuild_budget", new.rebuild_budget)   # the same lineage
         if getattr(old, "office_worker", None):
             new.office_worker = old.office_worker
         with self._lock:
@@ -830,7 +956,7 @@ class Registry:
         return route
 
     def _new(self, turn: anthropic_wire.ClientTurn, *, keep: bool, route: dict | None,
-             scope: str | None, wire_path: str | None):
+             scope: str | None, wire_path: str | None, client: str | None = None):
         provider = route["provider"] if route else "claude-cli"
         factory = self._factories.get(provider) or self._factories.get(_base_provider(provider))
         if factory is None and route and route.get("local") and provider.startswith(local_lane.LANE_PREFIX):
@@ -859,6 +985,8 @@ class Registry:
         s.route, s.route_logged, s.system = route, False, turn.system
         s.scope = scope                             # conversation_scope of the request that opened it (failure())
         s.wire_path = wire_path                     # the wire it was opened on (/v1/messages, /v1/responses): _replays
+        s.client = client                           # the opener's User-Agent name: find's scope without an identity
+        s.rebuild_budget = RebuildBudget()          # its lineage's rebuilds (REBUILD_MAX), shared on rebuild
         s.tool_names, s.tools_warned = {t["name"] for t in turn.tools}, False   # what the backend was started with
         s.awaiting_tool_result = False
         s.opened_at = time.time()                   # the live view's elapsed (live_conversations)
@@ -887,25 +1015,51 @@ class Registry:
         return anthropic_wire.history_digest(wire_path, client, identity) if identity else None
 
     def find(self, turn: anthropic_wire.ClientTurn, failure_key: str | None = None, scope: str | None = None,
-             wire_path: str | None = None):
+             wire_path: str | None = None, client: str | None = None):
         """The live session whose replies are exactly this request's assistant history; None for a new conversation.
-        No match, or more than one, is a LostSession: never continue a conversation on a guess. With no match, a
-        tombstone under `failure_key` makes it a FailedSession instead; a retry of the session's last answered turn
-        (see Replay) raises Replay with the stored response. More than one such retry candidate is not replayed (it
-        falls through to the ordinary 409, whose diagnostic counts the candidates)."""
+        Never continue a conversation on a guess. With no match, a tombstone under `failure_key` makes it a
+        FailedSession; a retry of the session's last answered turn (see Replay) raises Replay with the stored
+        response; a continuation whose client rewrote the history raises Rebuild (_rebuild_or_refuse, which also
+        raises the refusal when no rebuild is possible). More than one such retry candidate is not replayed (it falls
+        through to that check). More than one exact match is a Refused (terminal) when it is stable, ConversationBusy
+        while a rebuild in the same scope is in flight (the duplicate is that rebuild's own, about to be resolved).
+        A request without a conversation identity (scope None, see CONVERSATION_ID_HEADERS; review P1-b) is matched
+        only on proof that it is the caller of that session: an exact match whose history carries a tool_use id
+        (ClientTurn.history_tool_ids: the backend's own random ids, which only a client that received that
+        session's output holds). The User-Agent name is no such proof (every Claude Code sends `claude-cli`), so
+        without it the request is refused, terminally (no_identity); it is never rebuilt and never replayed."""
         if not turn.history:
             return None
         with self._lock:
-            matches = [s for s in self.sessions.values() if s.history == turn.history]
-            replays = [] if matches else self._replays(turn, scope, wire_path)
+            # Only sessions opened in the request's own scope (wire, client, conversation identity) and on its wire:
+            # two clients, or two wires, whose reply histories happen to match must never continue each other's
+            # backend (the same rule _replays and _rebuild_or_refuse apply). Identity-less sessions additionally
+            # match by the opener's client name (`client`, kept by _new), then need the tool-id proof below.
+            matches = self._exact(turn.history, scope, wire_path, client)
+            replays = [] if matches or scope is None else self._replays(turn, scope, wire_path)
             if len(replays) == 1:
                 # A client in a retry loop touches nothing else, so the replay itself must count as use: otherwise the
                 # idle reaper closes the conversation the client is still trying to recover.
                 replays[0][0].last_used = time.time()
+            inflight = self._rebuild_in_flight(scope, wire_path)
+        if scope is None:
+            if len(matches) == 1 and turn.history_tool_ids:
+                return matches[0]
+            # The class: `ambiguous` (several identity-less sessions with this exact history: P1-b's shape),
+            # `unproven` (one, but no tool_use id in the history to prove the caller), else _lost_diagnostic's.
+            diag = (f"class=ambiguous candidates={len(matches)} request_len={len(turn.history)}" if len(matches) > 1
+                    else f"class=unproven candidates=1 request_len={len(turn.history)}" if matches
+                    else self._lost_diagnostic(turn))
+            logger.warning("refused lost conversation: %s rebuild=refused:no_identity; terminal", diag)
+            raise Refused(_NO_IDENTITY_MESSAGE, code="no_identity")
         if len(matches) > 1:
-            logger.warning("409 lost conversation: class=ambiguous candidates=%d request_len=%d",
+            if inflight:
+                raise ConversationBusy("cortados: conversation busy: a rebuild of this conversation is starting; retry")
+            logger.warning("refused lost conversation: class=ambiguous candidates=%d request_len=%d; terminal",
                            len(matches), len(turn.history))
-            raise LostSession(f"{len(matches)} live conversations have this exact history; refusing to pick one")
+            raise Refused(f"cortados: {len(matches)} live conversations of this client have this exact history; "
+                          "refusing to pick one, and retrying cannot change that: start a new conversation",
+                          code="ambiguous")
         if not matches:
             if len(replays) == 1:
                 s, last = replays[0]
@@ -915,9 +1069,250 @@ class Registry:
             dead = self.failure(failure_key, turn.history, scope)
             if dead:
                 raise dead
-            logger.warning("409 lost conversation: %s", self._lost_diagnostic(turn))
-            raise LostSession("a conversation this endpoint no longer holds (restarted, expired, or history edited)")
+            self._rebuild_or_refuse(turn, scope, wire_path)    # raises Rebuild, or the refusal saying why not
         return matches[0]
+
+    def _exact(self, history: list, scope: str | None, wire_path: str | None, client: str | None = None) -> list:
+        """Live sessions of the request's scope and wire whose replies are exactly `history` (under self._lock).
+        Identity-less (scope None): only identity-less sessions opened by the same client name."""
+        return [s for s in self.sessions.values() if s.history == history
+                and getattr(s, "scope", None) == scope and getattr(s, "wire_path", None) == wire_path
+                and (scope is not None or getattr(s, "client", None) == client)]
+
+    def _rebuild_in_flight(self, scope: str | None, wire_path: str | None) -> bool:
+        """Whether a rebuild in this scope and wire is starting right now (under self._lock): while it is, an old and
+        a new session can both hold the same replies for a moment, which is no lasting ambiguity."""
+        return scope is not None and any(k[0] == scope and k[1] == wire_path for k in self._rebuilding)
+
+    def _rebuild_or_refuse(self, turn: anthropic_wire.ClientTurn, scope: str | None, wire_path: str | None):
+        """A continuation no live session matches exactly: raise Rebuild for the one live conversation it continues
+        with a rewritten history, else a refusal naming why no rebuild is possible (issue #43).
+        The conversation it continues is the live session that wrote the request's LAST reply (its fingerprint is in
+        that session's history), in the request's scope (same wire, client and conversation identity: a stranger's
+        session is never rebuilt from, as in _replays) and opened on the request's wire. Two shapes:
+        - compacted: that reply is the session's last one too. The client rewrote what came before it (a partial
+          compaction, an edited or removed earlier message) and continues from where the session is, so the old
+          session is superseded and closed once the rebuilt one is running.
+        - branched: that reply is an earlier one of the session (a rewind, an edited message resent, a retry of an
+          older turn). Such a request cannot be told from a fork the client sends beside its live loop (Claude Code's
+          side requests share the loop's history), so the old session is KEPT: closing it could kill the loop that is
+          still running on it. It ends as any idle conversation does (reap).
+        The history before the anchor is not compared: rewriting it is what the client did.
+        Refusals (the table in docs/PROVIDER-PLAN.md): no identity, no writer, and more than one writer are terminal
+        (Refused: the retry carries the same history and meets the same live sessions), except more than one writer
+        while a rebuild in the scope is in flight (ConversationBusy: its old and new sessions overlap for a moment);
+        REBUILD_MAX 0 keeps the pre-#43 409."""
+        if not turn.history:
+            return
+        anchor = turn.history[-1]
+        with self._lock:
+            cands = [] if scope is None or wire_path is None else [
+                s for s in self.sessions.values()
+                if getattr(s, "scope", None) == scope and getattr(s, "wire_path", None) == wire_path
+                and anchor in s.history]
+            inflight = self._rebuild_in_flight(scope, wire_path)
+        if REBUILD_MAX <= 0:
+            # Rebuilds switched off: the pre-#43 409 (tests use it to pin what find and the replay guard decide alone).
+            logger.warning("409 lost conversation: %s rebuild=refused:disabled", self._lost_diagnostic(turn))
+            raise LostSession("cortados: a conversation this endpoint no longer holds as sent (its history does not "
+                              "match a live session's), and rebuilding a conversation from a rewritten history is "
+                              "switched off (REBUILD_MAX 0)")
+        code = why = None
+        if scope is None:
+            code, why = "no_identity", _NO_IDENTITY_MESSAGE
+        elif not cands:
+            code, why = "no_writer", (
+                "cortados: a conversation this endpoint no longer holds as sent (its history does not match a live "
+                "session's), and no live conversation of this client wrote its last reply (the endpoint restarted, "
+                "the conversation expired, or the reply itself was edited), so there is no route or backend to "
+                "rebuild from; retrying cannot help: start a new conversation")
+        elif len(cands) > 1:
+            if inflight:
+                raise ConversationBusy("cortados: conversation busy: a rebuild of this conversation is starting; retry")
+            code, why = "ambiguous_writer", (
+                f"cortados: a conversation this endpoint no longer holds as sent, and {len(cands)} live conversations "
+                "of this client wrote its last reply; refusing to pick one to rebuild from, and retrying cannot change "
+                "that: start a new conversation")
+        if code is None:
+            s = cands[0]
+            if self._budget(s).used >= REBUILD_MAX:
+                # A cheap early refusal on COMMITTED rebuilds only; rebuild() reserves atomically and is the one that
+                # counts (a pending reservation there is a retryable busy, never this terminal).
+                logger.warning("rebuild refused: conversation %s reached REBUILD_MAX (%d); terminal",
+                               str(s.id)[:8], REBUILD_MAX)
+                raise RebuildLimit(rebuild_limit_message())
+            raise Rebuild(s, superseded=s.history[-1] == anchor)
+        logger.warning("refused lost conversation: %s rebuild=refused:%s; terminal", self._lost_diagnostic(turn), code)
+        raise Refused(why, code=code)
+
+    def _budget(self, s) -> "RebuildBudget":
+        """The rebuild budget of `s`'s lineage, created on first use for a session _new did not give one (a test's
+        fake); under the registry lock so two concurrent rebuilds of one parent can never get two budgets."""
+        with self._lock:
+            b = getattr(s, "rebuild_budget", None)
+            if b is None:
+                b = s.rebuild_budget = RebuildBudget()
+            return b
+
+    def rebuild(self, old, turn: anthropic_wire.ClientTurn, *, superseded: bool, transcript: list,
+                scope: str | None, wire_path: str | None, client: str | None = None):
+        """A fresh backend for `old`'s conversation, seeded with the client's current history (issue #43): the same
+        route (provider, model, account, the frozen Codex home), so the routing decision and its quota reservation
+        stand; the request's own system prompt and tools, so the rebuilt backend serves what the client sends now.
+        Its history is the request's, so this request and its successors match it exactly (find), and the seed
+        (`rebuild_seed`, the history transcript as content blocks) is sent with the first turn it runs (Handler
+        work(), which re-checks that seed + turn fit the route under the turn lock), together with that turn's tool
+        results as text: the fresh backend never issued those calls. A rebuilt backend is created by the same factory
+        as any other, so every isolation rule (no built-in tools, Codex's policy checks) holds.
+        In flight (review P1-a): one rebuild at a time per (scope, wire, anchor reply), on a gate taken before the
+        budget or the old session is touched. After taking it the exact lookup runs again: a session an identical
+        request published meanwhile is JOINED (returned as is: both requests then meet on its turn lock, and the
+        loser is a stale continuation whose retry is replayed), never duplicated, so identical concurrent requests
+        cannot leave two sessions with one history. A session an identical request rebuilt (same gate key and new
+        turn, `rebuilt_for`) that has already answered that turn (review round 3, P1) is not rebuilt again either:
+        its stored reply is replayed (Replay), or, if none was kept, the request is a stale continuation
+        (LostSession, the 409 work() gives one). A gate held past REBUILD_WAIT_S is ConversationBusy (retryable).
+        Budget (review P2-4, P2-d): one RebuildBudget per lineage, shared by every session rebuilt from it (compacted
+        or branched), with committed rebuilds (`used`) apart from starts still pending (`pending`). Committed usage
+        at REBUILD_MAX is RebuildLimit (terminal); a limit reached only with pending starts is ConversationBusy
+        (retryable: a pending start that fails gives its slot back). A slot moves from pending to used in the same
+        step that publishes the new session, so neither branching nor concurrent rebuilds of one parent can exceed
+        REBUILD_MAX.
+        `superseded` (see _rebuild_or_refuse): the old session is closed once the new one runs, under the old one's
+        turn lock, so no turn is cut off; a turn running on it raises ConversationBusy (retryable), and so does an old
+        session that vanished meanwhile (another request rebuilt it first: the retry finds the new one). Under that
+        lock the decision is re-checked (review P1-3): find classified the request before the lock was taken, and a
+        normal turn may have advanced the old session since. Its last reply is then no longer the request's anchor,
+        so the request now continues from an EARLIER reply of that session, which is exactly the branch shape: it is
+        served as a branch and the advanced session is kept.
+        A branch keeps the old session and counts toward MAX_SESSIONS like any new conversation.
+        Publication (review P1-2): the session is registered only after its history, seed, budget and route state are
+        all set (_publish), so a concurrent find() can never return a half-built session. Raises UnservedProvider /
+        BridgeError when the new backend cannot start; the old session is then untouched and the slot returned."""
+        anchor = turn.history[-1] if turn.history else None
+        key = (scope, wire_path, anchor)
+        with self._lock:
+            gate = self._rebuilding.setdefault(key, [threading.Lock(), 0])
+            gate[1] += 1
+        try:
+            if not gate[0].acquire(timeout=REBUILD_WAIT_S):
+                raise ConversationBusy("cortados: conversation busy: another request is rebuilding this conversation; "
+                                       "retry once it has finished")
+            try:
+                fp = anthropic_wire.turn_fingerprint(turn)
+                n = len(turn.history)
+                with self._lock:
+                    joined = self._exact(turn.history, scope, wire_path, client)
+                    # Review round 3, P1: an identical request may have rebuilt AND finished its first turn while this
+                    # one waited (before the gate, or on it). That session no longer matches exactly (it holds the
+                    # reply), but it is this very request's rebuild: by the gate key and the new turn's fingerprint.
+                    advanced = [] if joined else [
+                        s for s in self.sessions.values()
+                        if getattr(s, "rebuilt_for", None) == (key, fp)
+                        and len(s.history) == n + 1 and s.history[:n] == turn.history]
+                    last = getattr(advanced[0], "last_reply", None) if len(advanced) == 1 else None
+                    if last and last[0] == n + 1 and last[1] == fp:
+                        advanced[0].last_used = time.time()     # a retry loop's use, as in find()
+                if len(joined) == 1:
+                    logger.info("conversation %s: an identical request rebuilt it first; joined, not rebuilt again",
+                                str(joined[0].id)[:8])
+                    return joined[0]
+                if advanced:
+                    if last and last[0] == n + 1 and last[1] == fp:
+                        logger.info("conversation %s: an identical request rebuilt it and was answered first; "
+                                    "replaying that answer, not rebuilding again", str(advanced[0].id)[:8])
+                        raise Replay(advanced[0], last)
+                    # Its reply was not kept for a replay (REPLAY_MAX_BYTES): this request is the stale twin of a
+                    # served one, answered as work() answers a stale continuation; a second backend would leave two
+                    # sessions with one history.
+                    logger.info("conversation %s: an identical request rebuilt it and was answered first, with no "
+                                "reply kept to replay; stale continuation (409)", str(advanced[0].id)[:8])
+                    raise LostSession("the conversation moved on while this request waited for it: another request "
+                                      "with the same history was served first; send the current history")
+                return self._rebuild_gated(old, turn, superseded=superseded, transcript=transcript, scope=scope,
+                                           wire_path=wire_path, client=client, anchor=anchor, rebuilt_for=(key, fp))
+            finally:
+                gate[0].release()
+        finally:
+            with self._lock:
+                gate[1] -= 1
+                if gate[1] == 0 and self._rebuilding.get(key) is gate:
+                    del self._rebuilding[key]
+
+    def _rebuild_gated(self, old, turn, *, superseded: bool, transcript: list, scope: str | None,
+                       wire_path: str | None, client: str | None, anchor, rebuilt_for=None):
+        """rebuild()'s work once its in-flight gate is held: reserve, start, publish, retire the old session."""
+        budget = self._budget(old)
+        with self._lock:
+            if budget.used >= REBUILD_MAX:
+                raise RebuildLimit(rebuild_limit_message())
+            if budget.used + budget.pending >= REBUILD_MAX:
+                raise ConversationBusy("cortados: conversation busy: another rebuild of this conversation is starting "
+                                       "and holds its last rebuild; retry once it has finished")
+            budget.pending += 1                         # pending; committed below with publication, else given back
+        committed = held = False
+        try:
+            if superseded:
+                held = old.lock.acquire(blocking=False)
+                if not held:
+                    raise ConversationBusy("cortados: conversation busy: a turn is running on the session this "
+                                           "request would replace; retry once it has finished")
+                if self.get(old.id) is not old:
+                    raise ConversationBusy("cortados: the conversation was rebuilt or closed while this request was "
+                                           "looked up; retry")
+                if not old.history or old.history[-1] != anchor:
+                    logger.info("conversation %s advanced after the rebuild lookup; served as a branch, kept",
+                                str(old.id)[:8])
+                    old.lock.release()
+                    superseded = held = False
+            route = getattr(old, "route", None)
+            if route and getattr(old, "codex_login", None):
+                route = {**route, "codex_home": old.codex_login}   # the login the conversation already runs on
+            if superseded:
+                with self._lock:
+                    self._opening += 1          # one-for-one replacement: the cap is not re-checked for it
+            else:
+                self.reserve_opening()          # a branch is one more conversation: UnservedProvider at the cap
+            try:
+                new = self._new(turn, keep=True, route=route, scope=scope, wire_path=wire_path, client=client)
+            except BaseException:
+                self.release_opening()
+                raise
+            new.history = list(turn.history)
+            new.rebuild_seed = None if isinstance(new, LocalSession) else transcript   # local: the relay is stateless
+            new.rebuild_budget = budget
+            new.rebuilt_for = rebuilt_for       # (gate key, new turn's fingerprint): rebuild()'s twin check
+            new.route_logged = getattr(old, "route_logged", False)    # the route already ran and was recorded
+            if getattr(old, "min_left_pct", None) is not None:
+                new.min_left_pct = old.min_left_pct                   # the tightest client floor carries over
+            with self._lock:
+                budget.pending -= 1
+                budget.used += 1
+                new.rebuilds = number = budget.used
+                committed = True
+            self._publish(new)                  # only now findable: every field above is set
+            logger.warning("conversation %s rebuilt as %s from the client's rewritten history (%s; rebuild %d of %d; "
+                           "request_len=%d candidate_len=%d)", str(old.id)[:8], str(new.id)[:8],
+                           "compacted: old session closed" if superseded else "branched: old session kept",
+                           number, REBUILD_MAX, len(turn.history), len(old.history))
+            if superseded:
+                with self._lock:
+                    if self.sessions.get(old.id) is old:
+                        del self.sessions[old.id]
+                self.note_closed(old, "rebuilt")
+                if hasattr(old, "expire_transport"):
+                    # Its CLI may be blocked in a bridged tool call the client will now never answer (the request
+                    # carried that result to the rebuilt backend instead): end the wait at once, so close() need not
+                    # sit out its kill timeout.
+                    old.expire_transport()
+                old.close()
+            return new
+        finally:
+            if held:
+                old.lock.release()
+            if not committed:
+                with self._lock:
+                    budget.pending -= 1         # the backend never ran: the slot is the lineage's again
 
     def _replays(self, turn: anthropic_wire.ClientTurn, scope: str | None = None,
                  wire_path: str | None = None) -> list:
@@ -1053,6 +1448,21 @@ class Registry:
         with self._lock:
             return self.sessions.get(session_id)
 
+    def bridge_session(self, credential: str):
+        """The live conversation whose bridge-only credential (BridgeSession.bridge_token, held by its MCP shim) is
+        `credential`, or None. Only sessions in the registry match, so a dropped, retired, exited or closed session's
+        credential is refused from the moment it leaves. Every candidate is compared in constant time."""
+        if not credential:
+            return None
+        given, found = credential.encode(), None
+        with self._lock:
+            candidates = list(self.sessions.values())
+        for s in candidates:
+            t = getattr(s, "bridge_token", None)
+            if isinstance(t, str) and t and hmac.compare_digest(given, t.encode()):
+                found = s
+        return found
+
     def live_conversations(self) -> list[dict[str, Any]]:
         """Every conversation this endpoint holds open, as metadata for the live view (provider/live.py): its Office key
         (the board's join key), a digest of its id (the id itself is never published), the route's provider, lane and
@@ -1156,11 +1566,105 @@ class Replay(Exception):
         self.session, self.last = session, last
 
 
+class Rebuild(Exception):
+    """The request continues a live conversation whose history the client rewrote (Registry._rebuild_or_refuse):
+    `session` is that conversation's backend, `superseded` whether the request continues from its last reply (the old
+    session is then replaced) or branches from an earlier one (kept)."""
+
+    def __init__(self, session, *, superseded: bool):
+        super().__init__("rebuild")
+        self.session, self.superseded = session, superseded
+
+
+class RebuildBudget:
+    """How many rebuilds one conversation lineage has used (REBUILD_MAX). One object is shared by a session and every
+    session rebuilt from it, compacted or branched. `used` counts committed rebuilds (a backend that started and was
+    published), `pending` the starts still in progress (given back if they fail); both are read and changed only under
+    Registry._lock. Only `used` makes the limit terminal (review P2-d)."""
+
+    def __init__(self):
+        self.used = 0
+        self.pending = 0
+
+
+def rebuild_limit_message() -> str:
+    """RebuildLimit's text, read at call time (REBUILD_MAX is a module setting tests rebind)."""
+    return (f"cortados: this conversation reached the rebuild limit ({REBUILD_MAX} rebuilds) after its client rewrote "
+            "the history again and again; retrying cannot help: start a new conversation")
+
+
+class Refused(LostSession):
+    """A continuation no retry can serve (Registry.find / _rebuild_or_refuse): answered TERMINAL_STATUS with
+    x-should-retry: false, never the 409 Claude Code retries, because the retry carries the same history and meets the
+    same live sessions. `code` names the category for the log and the request record (no_identity, no_writer,
+    ambiguous, ambiguous_writer, limit); the message is this endpoint's own text."""
+
+    def __init__(self, message: str, *, code: str):
+        super().__init__(message)
+        self.code = code
+
+
+class RebuildLimit(Refused):
+    """The conversation's lineage committed all REBUILD_MAX rebuilds: terminal, because its retry carries the same
+    rewritten history."""
+
+    def __init__(self, message: str):
+        super().__init__(message, code="limit")
+
+
+# Refused(no_identity): the request continues a conversation but names none (review P1-b).
+_NO_IDENTITY_MESSAGE = (
+    "cortados: this request continues a conversation but carries no conversation identity (one of "
+    + ", ".join(CONVERSATION_ID_HEADERS) + ") and no tool call id of that conversation, so it cannot be told from "
+    "another client's conversation with the same replies; it is not continued, replayed or rebuilt. Retrying cannot "
+    "help: send a conversation identity header (Claude Code and Codex send one by themselves), or start a new "
+    "conversation")
+
+
+class ConversationBusy(Exception):
+    """A rebuild could not take over its old session right now (a turn runs on it, or it was just replaced): the
+    answer is the retryable BUSY_STATUS, and the retry finds the conversation's current state."""
+
+
 class FailedSession(LostSession):
     """The request belongs to a conversation that was closed because its backend failed (a tombstone): answered with
     a terminal error (TERMINAL_STATUS / TERMINAL_ERROR) naming the failure's category, not the 409 of a conversation
     this endpoint never held or has forgotten."""
     diagnostic: str | None = None
+
+
+REBUILD_LIMIT_REASON = "the conversation reached its rebuild limit (terminal)"
+REBUILD_TOO_LARGE_REASON = "the rebuilt history does not fit the conversation's model (terminal)"
+MODEL_CHANGE_REASON = "the continuation asks for another model than its conversation runs (terminal)"
+# Refused.code -> the fixed record reason (_note_refusal); never request-derived text.
+REFUSED_REASONS = {
+    "no_identity": "the continuation carries no conversation identity (terminal)",
+    "no_writer": "no live conversation of this client wrote the request's last reply (terminal)",
+    "ambiguous": "more than one live conversation has the request's exact history (terminal)",
+    "ambiguous_writer": "more than one live conversation wrote the request's last reply (terminal)",
+    "limit": REBUILD_LIMIT_REASON,
+}
+
+
+def replay_overflow(session, transcript: list, turn) -> tuple[int, int] | None:
+    """(need, cap) in tokens when a rebuilt backend's first turn (the seed transcript, the new turn, the system prompt
+    and the tools) does not fit `session`'s frozen route, else None (review P2-5). Measured with the estimator the
+    opening route was fitted with (routing.request_fit, chars / 4 of the JSON body). A local pin is never checked: its
+    seed is never sent (the relay re-sends the whole body under its own per-turn fit gate); neither is a route without
+    context_length (a fixed-model endpoint: the backend reports an overflow itself)."""
+    cap = (getattr(session, "route", None) or {}).get("context_length")
+    if not cap or isinstance(session, LocalSession):
+        return None
+    seed_body = {"system": turn.system, "tools": turn.tools,
+                 "messages": [{"role": "user", "content": anthropic_wire.rebuild_content(transcript, turn)}]}
+    need = int(routing.request_fit(seed_body)["input_tokens"])
+    return (need, int(cap)) if need > int(cap) else None
+
+
+def replay_overflow_message(need: int, cap: int) -> str:
+    return (f"cortados: the client rewrote this conversation's history, and replaying it on a fresh backend "
+            f"(≈{need // 1000}k tokens) does not fit the conversation's model context ({cap // 1000}k tokens); "
+            "retrying cannot help: start a new conversation or compact it further")
 
 
 def _failed_reason(exc: object) -> str:
@@ -1192,6 +1696,154 @@ class Handler(BaseHTTPRequestHandler):
         self._authed = ok                               # per request: do_GET/do_POST reset it first (keep-alive reuse)
         return ok
 
+    def _peer(self) -> str:
+        return self.client_address[0] if self.client_address else ""
+
+    def _dash_session(self) -> "dashboard_auth.Session | None":
+        """The dashboard session this request's cookie names, or None. Only a request that carries no token at all is
+        looked up: a client that sends a token is judged on that token alone, never on a cookie beside it."""
+        if self._credential():
+            return None
+        try:
+            return self.server.registry.dashboard.session(self.headers.get("cookie"))
+        except Exception as exc:                        # fail closed for the cookie; the owner token is unaffected
+            logger.error("dashboard session check failed: %s", type(exc).__name__)
+            return None
+
+    def _owner_or_session(self, method: str) -> bool:
+        """THE auth check of the dashboard's views (live, usage, tasks, office) and of the local switch
+        (/v1/cortados/local and /local/switch): True for a scoped client token _scope_gate already admitted (no
+        clients.json scope covers the local switch, so none reaches it), for the owner token, or, when the request
+        carries no token, for a dashboard session whose scopes cover (method, path) (dashboard_auth.SESSION_SCOPES). A
+        state-changing method on a session must also pass the same-origin and CSRF-token check (the page's fetch must
+        set referrerPolicy "same-origin", else the browser sends `Origin: null` under the page's no-referrer policy).
+        Everything else (/v1/messages, /v1/responses, heartbeats, runs, models, resources) calls _authorized(), which
+        never reads the cookie. On False, _refuse_auth() answers."""
+        self._auth_refusal = None
+        if self._scoped is not None or self._authorized():
+            return True
+        s = self._dash_session()
+        if s is None or not s.allows(method, self.path.split("?")[0]):
+            return False
+        if method not in dashboard_auth.SAFE_METHODS and not self.server.registry.dashboard.csrf_ok(
+                s, self.headers, self._peer()):
+            self._auth_refusal = (403, "permission_error", "cortados: cross-site or CSRF-less dashboard request refused")
+            return False
+        return True
+
+    def _refuse_auth(self):
+        code, kind, msg = getattr(self, "_auth_refusal", None) or (401, "authentication_error", "bad or missing token")
+        return self._error(code, kind, msg)
+
+    def _html_page(self, code: int, page: bytes, csp: str, headers: dict[str, str] | None = None) -> None:
+        """An HTML page with the dashboard's headers; `headers` replaces a header of the same name, never doubles it."""
+        self.send_response(code)
+        self.send_header("content-type", "text/html; charset=utf-8")
+        self.send_header("content-length", str(len(page)))
+        for k, v in {**DASHBOARD_HEADERS, "Content-Security-Policy": csp, **(headers or {})}.items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(page)
+
+    def _dashboard_get(self) -> None:
+        """GET /dashboard: no password set, the token-paste page (as before); a password set, the dashboard in session
+        mode for a valid session cookie, else the login page. An unusable auth file is a 500, never the token page."""
+        auth = self.server.registry.dashboard
+        try:
+            rec = auth.record()
+        except dashboard_auth.AuthFileError:
+            return self._html_page(500, _login_page("dashboard login unavailable: dashboard-auth.json is unusable "
+                                                    "(see the provider log)"), LOGIN_CSP, LOGIN_HEADERS)
+        session = None
+        if rec is not None:
+            session = self._dash_session()
+            if session is None:
+                return self._html_page(200, _login_page(), LOGIN_CSP, LOGIN_HEADERS)
+        try:
+            page = _dashboard_page(session)
+            csp = _dashboard_csp()
+        except (OSError, ValueError) as exc:
+            logger.warning("dashboard page unavailable: %s", type(exc).__name__)
+            return self._error(500, "api_error", "dashboard page unavailable")
+        return self._html_page(200, page, csp)
+
+    def _dashboard_login(self) -> None:
+        """POST /dashboard/login (form field `password`). Unauthenticated, so everything that can be refused is refused
+        before the body is read: a free login slot (503), size, type, origin, and the lockout (429). The body is then
+        read under LOGIN_BODY_DEADLINE_S. Every refusal closes the connection. The password is never logged."""
+        self.close_connection = True                    # one login per connection: nothing unread is parsed later
+        slots = self.server.login_slots
+        if not slots.acquire(blocking=False):
+            logger.warning("dashboard login refused: %d logins already in progress", LOGIN_MAX_CONCURRENT)
+            return self._html_page(503, _login_page("too many logins in progress; try again shortly"), LOGIN_CSP,
+                                   dict(LOGIN_HEADERS, **{"Retry-After": "5"}))
+        try:
+            return self._dashboard_login_slot()
+        finally:
+            slots.release()
+
+    def _dashboard_login_slot(self) -> None:
+        try:
+            n = int(self.headers.get("content-length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0 or n > LOGIN_MAX_BYTES:
+            return self._html_page(413, _login_page("the login request is too large"), LOGIN_CSP, LOGIN_HEADERS)
+        ctype = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if ctype != "application/x-www-form-urlencoded":
+            return self._html_page(415, _login_page("the login form must be posted as a form"), LOGIN_CSP, LOGIN_HEADERS)
+        if not dashboard_auth.same_origin(self.headers, self._peer()):
+            logger.warning("dashboard login refused: not same-origin (origin %r, host %r, forwarded proto %r)",
+                           (self.headers.get("origin") or "")[:100], (self.headers.get("host") or "")[:100],
+                           (self.headers.get("x-forwarded-proto") or "")[:20])
+            return self._html_page(403, _login_page("cross-site login refused"), LOGIN_CSP, LOGIN_HEADERS)
+        addr = dashboard_auth.client_address(self._peer(), self.headers.get("x-forwarded-for") or "")
+        auth = self.server.registry.dashboard
+        r = auth.locked_out(addr)                       # before the read: a locked-out client gets no thread on its body
+        if r is None:
+            raw = http_body.read_within(self.connection, self.rfile, n, LOGIN_BODY_DEADLINE_S, self.timeout)
+            if raw is None:                             # too slow or gone: no reply worth writing, the socket is closed
+                logger.warning("dashboard login from %s dropped: body not received within %.1f s", addr,
+                               LOGIN_BODY_DEADLINE_S)
+                return
+            from urllib.parse import parse_qs
+            try:
+                form = parse_qs(raw.decode("utf-8"), keep_blank_values=True, max_num_fields=4)
+            except ValueError:                          # undecodable bytes or too many fields
+                return self._html_page(400, _login_page("the login form is malformed"), LOGIN_CSP, LOGIN_HEADERS)
+            password = (form.get("password") or [""])[0]
+            r = auth.login(password, addr)
+            del password, form, raw
+        if r["ok"]:
+            self.send_response(303)
+            self.send_header("Location", "/dashboard")
+            self.send_header("Set-Cookie", dashboard_auth.session_cookie(r["cookie"]))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+        headers = dict(LOGIN_HEADERS, **({"Retry-After": str(r["retry_after"])} if r.get("retry_after") else {}))
+        msg = r["why"] + (f"; try again in {max(1, round(r['retry_after'] / 60))} min" if r.get("retry_after") else "")
+        return self._html_page(r["status"], _login_page(msg), LOGIN_CSP, headers)
+
+    def _dashboard_logout(self) -> None:
+        """POST /dashboard/logout: ends the cookie's session. Needs the session, same origin and its CSRF token."""
+        self.close_connection = True                    # the body (if any) is never read
+        s = self._dash_session()
+        if s is None:
+            return self._error(401, "authentication_error", "no dashboard session")
+        auth = self.server.registry.dashboard
+        if not auth.csrf_ok(s, self.headers, self._peer()):
+            return self._error(403, "permission_error", "cortados: cross-site or CSRF-less dashboard request refused")
+        try:
+            auth.logout(s)
+        except OSError as exc:
+            logger.error("dashboard logout: cannot update the sessions file: %s", type(exc).__name__)
+            return self._error(500, "api_error", "cortados: logout failed (see provider log)")
+        return self._json(200, {"ok": True}, headers={"Set-Cookie": dashboard_auth.clear_cookie(),
+                                                      "Cache-Control": "no-store"})
+
     def _scoped_client(self) -> "clients.Client | None":
         """The scoped client whose token this request carries, or None (no token, the owner token, or an unknown one).
         The owner token is checked first and never reaches the client table."""
@@ -1218,6 +1870,44 @@ class Handler(BaseHTTPRequestHandler):
         self._scoped = c
         self._error(403, "permission_error", _SCOPE_DENIED)
         return True
+
+    def _control_body(self, max_bytes: int, deadline_s: float) -> dict[str, Any] | None:
+        """The JSON object body of a small control POST (POST /v1/cortados/local/switch), or None after an error was
+        sent. Unlike _body (the wires, count_tokens, the office heartbeat and /bridge/call), it does not trust
+        content-length: missing is a 411, negative or not a number a 400, over `max_bytes` a 413, all refused before a
+        byte is read; and the read has an absolute deadline (http_body.read_within, the reader the login and the
+        local gate share: each wait given only the time left, so a trickle cannot stretch it) past which it is a 408. Every refusal before the body is fully read closes the connection: the
+        unread rest must not be parsed as the next request."""
+        cl = self.headers.get("content-length")
+        if cl is None:
+            self.close_connection = True
+            return self._error(411, "invalid_request_error", "cortados: content-length is required",
+                               reason="the request was refused as invalid")
+        try:
+            n = int(cl.strip()) if cl.strip().isdigit() else -1
+        except ValueError:
+            n = -1
+        if n < 0:
+            self.close_connection = True
+            return self._error(400, "invalid_request_error", "cortados: content-length is not a byte count",
+                               reason="the request was refused as invalid")
+        if n > max_bytes:
+            self.close_connection = True
+            return self._error(413, "invalid_request_error", f"cortados: this body is at most {max_bytes} bytes",
+                               reason="the control request body is too large")
+        raw = http_body.read_within(self.connection, self.rfile, n, deadline_s, self.timeout)
+        if raw is None:                                 # past the deadline, stalled or gone
+            self.close_connection = True
+            return self._error(408, "invalid_request_error",
+                               f"cortados: the body did not arrive within {deadline_s:g}s",
+                               reason="the control request body did not arrive in time")
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:                              # JSONDecodeError and undecodable bytes alike
+            return self._error(400, "invalid_request_error", "body is not JSON", reason="body is not JSON")
+        if not isinstance(body, dict):
+            return self._error(400, "invalid_request_error", "body must be a JSON object")
+        return body
 
     def _body(self) -> dict[str, Any]:
         n = int(self.headers.get("content-length") or 0)
@@ -1254,6 +1944,11 @@ class Handler(BaseHTTPRequestHandler):
         _REFUSAL_REASONS). Bookkeeping only: it never raises into the response."""
         try:
             where = endpoint_id(self.path)
+            bridged = getattr(self, "_bridge", None)
+            if bridged is not None:
+                # A session's MCP shim (bridge-only credential): logged by its conversation, never recorded.
+                logger.warning("bridge %s: %s %s refused with %s %s", str(bridged.id)[:8], self.command, where, code, kind)
+                return
             client = getattr(self, "_scoped", None)
             if client is not None:
                 # A scoped client: named in the log, never recorded (its token cannot write run records).
@@ -1280,7 +1975,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------ routes
     def _unsupported_method(self):
-        self._authed = False
+        self._authed, self._bridge = False, None
         if not self._scope_gate(self.command):
             # Preserve BaseHTTPRequestHandler's unsupported-method response for owner/unknown credentials.
             self.send_error(501, "Unsupported method (%r)" % self.command)
@@ -1293,24 +1988,24 @@ class Handler(BaseHTTPRequestHandler):
         raise AttributeError(name)
 
     def do_GET(self):
-        self._authed = False
+        self._authed, self._bridge = False, None
         if self._scope_gate("GET"):
             return
         if self.path.split("?")[0] == clients.OFFICE_PATH:
-            # The one endpoint a scoped token may open (office:read), and the owner's too. Read-only, metadata only.
-            if self._scoped is None and not self._authorized():
-                return self._error(401, "authentication_error", "bad or missing token")
+            # The owner token, a scoped token with office:read, or a dashboard session. Read-only, metadata only.
+            if not self._owner_or_session("GET"):
+                return self._refuse_auth()
             try:
                 view = self.server.office_view(self.server.registry)
                 body = json.dumps(view, allow_nan=False).encode()
             except Exception as exc:
                 logger.warning("office: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: office view unavailable (see provider log)")
-            return self._json(200, body)
+            return self._json(200, body, headers=VIEW_HEADERS)
         if self.path.split("?")[0] == live.LIVE_PATH:
-            # Owner token, or a scoped token with live:read. Metadata only (provider/live.py), never request text.
-            if self._scoped is None and not self._authorized():
-                return self._error(401, "authentication_error", "bad or missing token")
+            # Owner token, a scoped token with live:read, or a dashboard session. Metadata only (provider/live.py).
+            if not self._owner_or_session("GET"):
+                return self._refuse_auth()
             # ?session=<tag>: one orchestrating session's tasks and conversations (live.for_session); a bad tag is a 400
             sess = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("session")
             if sess is not None and (len(sess) != 1 or live.valid_session(sess[0]) is None):
@@ -1321,25 +2016,11 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 logger.warning("live: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: live view unavailable (see provider log)")
-            return self._json(200, body, headers={"cache-control": "no-store"})
+            return self._json(200, body, headers=VIEW_HEADERS)
         if self.path == "/health":
             return self._json(200, {"ok": True, "conversations": len(self.server.registry.sessions)})
         if self.path in ("/", "/dashboard"):
-            try:
-                html = _dashboard_html()                # static page; the data it shows (/v1/cortados/usage) still needs the token
-                csp = _dashboard_csp()
-            except (OSError, ValueError) as exc:
-                logger.warning("dashboard page unavailable: %s", type(exc).__name__)
-                return self._error(500, "api_error", "dashboard page unavailable")
-            self.send_response(200)
-            self.send_header("content-type", "text/html; charset=utf-8")
-            self.send_header("content-length", str(len(html)))
-            for k, v in DASHBOARD_HEADERS.items():
-                self.send_header(k, v)
-            self.send_header("Content-Security-Policy", csp)
-            self.end_headers()
-            self.wfile.write(html)
-            return
+            return self._dashboard_get()
         if self.path.startswith("/v1/models"):
             if not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
@@ -1372,18 +2053,33 @@ class Handler(BaseHTTPRequestHandler):
             from cortados_router import core, resources     # the resource-pool snapshot: cached usage + scarcity + local devices + model-fit
             snap = resources.snapshot(core, local_config=getenv("CORTADOS_LOCAL_RESOURCES_CONFIG"))
             return self._json(200, snap)
+        if self.path.split("?")[0] == local_switch.VIEW_PATH:
+            # The owner token or a dashboard session (scope local:switch). A scoped client token was already refused
+            # by _scope_gate: no clients.json scope names this path, by design.
+            if not self._owner_or_session("GET"):
+                return self._refuse_auth()
+            try:
+                view = self.server.local_view()
+            except local_lane.LocalConfigError as exc:   # as /v1/models: the node is named, the file path is not
+                logger.warning("local: %s", exc)
+                return self._error(500, "api_error", "cortados: local node "
+                                   f"{getattr(exc, 'node', None) or '?'} is misconfigured on the provider (see provider log)")
+            except Exception as exc:
+                logger.warning("local: view failed: %s", type(exc).__name__)
+                return self._error(500, "api_error", "cortados: local view unavailable (see provider log)")
+            return self._json(200, view, headers=VIEW_HEADERS)
         if self.path.split("?")[0] == "/v1/cortados/tasks":
-            if not self._authorized():
-                return self._error(401, "authentication_error", "bad or missing token")
+            if not self._owner_or_session("GET"):        # the owner token or a dashboard session
+                return self._refuse_auth()
             try:
                 body = json.dumps(self.server.tasks_view(self.server.registry), allow_nan=False).encode()
             except Exception as exc:
                 logger.warning("tasks: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: tasks view unavailable (see provider log)")
-            return self._json(200, body)
+            return self._json(200, body, headers=VIEW_HEADERS)
         if self.path.split("?")[0] == "/v1/cortados/usage":
-            if not self._authorized():
-                return self._error(401, "authentication_error", "bad or missing token")
+            if not self._owner_or_session("GET"):        # the owner token or a dashboard session
+                return self._refuse_auth()
             try:   # a bug in a source must not drop the connection: a clean 500, detail (type only) in the log
                 view = self.server.usage_view(self.server.registry)
                 # the live view arrives encoded (usage.collect memoises the bytes); a dict is encoded strictly here,
@@ -1392,7 +2088,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 logger.warning("usage: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: usage view unavailable (see provider log)")
-            return self._json(200, body)
+            return self._json(200, body, headers=VIEW_HEADERS)
         if self.path.split("?")[0].startswith(RUNS_PATH):
             if not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
@@ -1406,15 +2102,31 @@ class Handler(BaseHTTPRequestHandler):
         self._error(404, "not_found_error", self.path)
 
     def do_POST(self):
-        self._authed = False
+        self._authed, self._bridge = False, None
         self._office_tags = {}
         path = self.path.split("?")[0]
         if self._scope_gate("POST"):
             return
         if path == live.HEARTBEAT_PATH:
             return self._live_heartbeat()
+        if path == LOGIN_PATH:
+            return self._dashboard_login()
+        if path == LOGOUT_PATH:
+            return self._dashboard_logout()
+        if path == "/bridge/call":
+            return self._bridge_post()
         # Every error on a wire's path is in that wire's shape, the 401 and the unreadable body included: Codex prints
         # the Responses error body verbatim and would show an Anthropic envelope as noise.
+        if path == local_switch.SWITCH_PATH:
+            # The owner token, or a dashboard session (scope local:switch) that also passes the same-origin + CSRF-token
+            # check (_owner_or_session -> DashboardAuth.csrf_ok): a browser attaches the cookie to a cross-site POST,
+            # never the x-cortados-csrf header. A scoped client token never reaches here: no clients.json scope covers
+            # this path, so _scope_gate answered 403 above. All refused from the headers alone, before a byte is read.
+            if not self._owner_or_session("POST"):
+                self.close_connection = True            # its body stays unread: never parse it as the next request
+                return self._refuse_auth()
+            body = self._control_body(local_switch.SWITCH_MAX_BODY, local_switch.SWITCH_BODY_DEADLINE_S)
+            return None if body is None else self._local_switch(body)
         w = WIRES.get(path, wire)
         if not self._authorized():
             return self._error(401, "authentication_error", "bad or missing token", w)
@@ -1438,12 +2150,31 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, "invalid_request_error", f"cortados: heartbeat field {bad} is invalid",
                                    reason="the heartbeat is malformed")
             return self._json(200, self.server.registry.office.heartbeat(hb))
+        if path == BOUNDARY_CHECK_PATH:
+            return self._boundary_check(body)
         if path == "/v1/messages/count_tokens":
             # Estimate only (chars / 4): the CLI behind cortados counts its own tokens and exposes no counter.
             return self._json(200, {"input_tokens": len(json.dumps(body)) // 4})
-        if path == "/bridge/call":
-            return self._bridge_call(body)
         self._error(404, "not_found_error", path)
+
+    def _boundary_hook(self) -> bool:
+        """Whether this request's client runs the boundary hook (effect_boundary.HOOK_HEADER: exactly "1")."""
+        return (self.headers.get(effect_boundary.HOOK_HEADER) or "").strip() == "1"
+
+    def _boundary_check(self, body: dict[str, Any]) -> None:
+        """POST /v1/cortados/boundary/check (docs/BOUNDARY-HOOK.md): the client's PreToolUse hook asks about one
+        tool_use id; the answer is the provider's record of it (effect_boundary.check_answer) or {"known": false}.
+        Owner token only (checked by do_POST before the body is read). Metadata only: the id, never a tool input."""
+        tid = body.get("tool_use_id")
+        if not isinstance(tid, str) or not _TOOL_USE_ID_RE.fullmatch(tid):
+            return self._error(400, "invalid_request_error", "cortados: tool_use_id must be 1-128 of [A-Za-z0-9_-]",
+                               reason="the boundary check is malformed")
+        try:
+            answer = effect_boundary.check_answer(tid)
+        except Exception as exc:                        # the hook fails closed on a 500 for a marked id
+            logger.error("boundary check failed: %s", type(exc).__name__)
+            return self._error(500, "api_error", "cortados: boundary check failed (see provider log)")
+        return self._json(200, answer, headers={"cache-control": "no-store"})
 
     def _live_heartbeat(self) -> None:
         """POST /v1/cortados/live/heartbeat (provider/live.py): a host's job states. The owner token or a live:heartbeat
@@ -1482,6 +2213,49 @@ class Handler(BaseHTTPRequestHandler):
                                f"cortados: this token posts heartbeats for host {c.host or '(none)'} only",
                                reason="the heartbeat names another host")
         return self._json(200, self.server.registry.live.post(hb, now))
+
+    def _local_switch(self, body: dict[str, Any]) -> None:
+        """POST /v1/cortados/local/switch {"node", "on"} (owner token or CSRF-checked dashboard session, checked by
+        do_POST): flip a local node's manual
+        switch through its gate (provider/local_switch.py). The answer is the node's new status row."""
+        try:
+            row = self.server.local_switch(body.get("node"), body.get("on"))
+        except local_switch.SwitchError as exc:
+            kind = {400: "invalid_request_error", 404: "not_found_error", 409: "invalid_request_error"}.get(
+                exc.status, "api_error")
+            return self._error(exc.status, kind, f"cortados: {exc}",
+                               reason={400: "the switch request is malformed", 404: "unknown local node",
+                                       409: "the local node has no gate configured",
+                                       503: "the local node is unreachable"}.get(exc.status, "the local gate failed"))
+        except local_lane.LocalConfigError as exc:
+            logger.warning("local switch: %s", exc)
+            return self._error(500, "api_error", "cortados: local node "
+                               f"{getattr(exc, 'node', None) or '?'} is misconfigured on the provider (see provider log)")
+        except Exception as exc:
+            logger.warning("local switch failed: %s", type(exc).__name__)
+            return self._error(500, "api_error", "cortados: local switch failed (see provider log)")
+        return self._json(200, row, headers=VIEW_HEADERS)
+
+    def _bridge_post(self) -> None:
+        """POST /bridge/call: the owner token, or a session's bridge-only credential (BridgeSession.bridge_token, the
+        one its MCP shim holds), which opens this endpoint for that session only. That credential is refused on every
+        other endpoint (_authorized checks the owner token alone) and once its session has left the registry."""
+        bound = None
+        if not self._authorized():
+            bound = self.server.registry.bridge_session(self._credential())
+            if bound is None:
+                return self._error(401, "authentication_error", "bad or missing token")
+            self._bridge = bound
+        try:
+            body = self._body()
+        except json.JSONDecodeError:
+            return self._error(400, "invalid_request_error", "body is not JSON", reason="body is not JSON")
+        except ValueError as exc:                       # JSON, but not an object
+            return self._error(400, "invalid_request_error", str(exc))
+        if bound is not None and body.get("session") != bound.id:
+            # Another session's credential: the same answer as a bad token, so it reveals nothing about that session.
+            return self._error(401, "authentication_error", "bad or missing token")
+        return self._bridge_call(body)
 
     def _bridge_call(self, body: dict[str, Any]) -> None:
         s = self.server.registry.get(body.get("session", ""))
@@ -1610,6 +2384,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(BUSY_STATUS, "overloaded_error", "cortados: conversation busy; retry once the other "
                                "request on it has finished", wire)
         try:
+            if not created and reg.get(session.id) is not session:
+                # Review round 3, P2: the lookup ran before the lock, and the conversation's session was replaced
+                # (a compaction rebuilt it) or closed meanwhile. Relaying on the retired session would answer from a
+                # conversation no later request can find; the retry is looked up afresh. Nothing reaches the node.
+                logger.info("local conversation %s was replaced or closed while this request waited; 529",
+                            str(session.id)[:8])
+                return self._error(BUSY_STATUS, "overloaded_error", "cortados: conversation busy: it was rebuilt or "
+                                   "closed while this request waited for it; retry", wire)
             if not created and session.history != turn.history:
                 return self._error(409, "invalid_request_error", "the conversation moved on while this request waited "
                                    "for it: another request with the same history was served first; send the current "
@@ -1634,7 +2416,9 @@ class Handler(BaseHTTPRequestHandler):
             outcome = "incomplete"
             try:
                 outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model,
-                                           reply=reply, auto_routed=not route.get("pinned"))
+                                           reply=reply, auto_routed=not route.get("pinned"),
+                                           bind_reason=route.get("bind_reason"), hook=self._boundary_hook(),
+                                           conversation=str(session.id))
             except Exception as exc:             # serve handles its own I/O; anything else must still clean up
                 logger.exception("local lane: relay failed")
                 outcome = "incomplete"
@@ -1754,7 +2538,11 @@ class Handler(BaseHTTPRequestHandler):
 
         def run(moved: dict) -> bool:
             try:
-                got["turn"] = local_lane.complete(body, moved["local"]["node"], moved["local"]["model"])
+                # boundary: an automatic move, so the effect boundary applies (effect_boundary.py); a blocked call is
+                # LocalUnavailable here and the cloud refusal stands
+                got["turn"] = local_lane.complete(body, moved["local"]["node"], moved["local"]["model"],
+                                                  boundary=True, bind_reason=moved.get("bind_reason"),
+                                                  hook=self._boundary_hook(), conversation=str(session.id))
             except local_lane.LocalUnavailable as exc:
                 logger.info("sensitive: refusal: local answer failed for %s: %s", rid, exc)
                 return False
@@ -1958,7 +2746,12 @@ class Handler(BaseHTTPRequestHandler):
             unkeyed = (None if identity or not turn.history else
                        "the client sent no conversation identity: none of " + ", ".join(CONVERSATION_ID_HEADERS))
             scope = reg.conversation_scope(wire_path=self.path.split("?")[0], client=self._client(), identity=identity)
-            session = None if one_shot else reg.find(turn, fail_key, scope, self.path.split("?")[0])
+            rebuild = None
+            try:
+                session = None if one_shot else reg.find(turn, fail_key, scope, self.path.split("?")[0],
+                                                         client=self._client())
+            except Rebuild as rb:                       # served below, once the request is known to be well-formed
+                session, rebuild = None, rb
             if session is not None and getattr(session, "system", turn.system) != turn.system:
                 # A running CLI keeps the system prompt it started with; a continuation that sends a different one
                 # (changed `instructions`, a rewritten developer item) is served under the original, and says so here
@@ -1983,55 +2776,22 @@ class Handler(BaseHTTPRequestHandler):
                                reason="the request does not parse on this wire")
         except FailedSession as exc:
             logger.info("request on a failed conversation refused: %s", exc)
-            self._note_refusal(TERMINAL_STATUS, TERMINAL_ERROR, reason=_failed_reason(exc))
-            if turn.stream:                             # an SSE error, as a streaming client gets any turn's failure
-                try:
-                    self.send_response(200)
-                    self.send_header("content-type", "text/event-stream")
-                    self.send_header("cache-control", "no-cache")
-                    self.send_header("connection", "close")
-                    self.send_header("x-should-retry", "false")
-                    self.end_headers()
-                    self.close_connection = True
-                    msg_id = wire.new_message_id()
-                    self.wfile.write(wire.stream_start(msg_id, turn.model))
-                    self.wfile.write(wire.stream_error(msg_id, turn.model, str(exc), terminal=True))
-                    self.wfile.flush()
-                except OSError as gone:
-                    logger.info("client gone before the failed-conversation error was sent (%s)", gone)
-                return
-            # Terminal, not retryable: see TERMINAL_ERROR.
-            return self._json(TERMINAL_STATUS, wire.error_json(TERMINAL_ERROR, str(exc)),
-                              headers={"x-should-retry": "false"})
+            return self._terminal(turn, wire, str(exc), reason=_failed_reason(exc))
+        except Refused as exc:                          # terminal: the retry would carry the same history
+            return self._terminal(turn, wire, str(exc), reason=REFUSED_REASONS.get(exc.code, "refused (terminal)"))
+        except ConversationBusy as exc:                 # a rebuild in this scope is starting: the retry sees it done
+            return self._error(BUSY_STATUS, "overloaded_error", str(exc), wire)
         except Replay as rp:
-            # A retry that also changes the sub/ pin gets the same refusal as any continuation that does: the stored
-            # answer came from the conversation's own model, which the request no longer asks for.
-            changed = self._model_change(rp.session, body)
-            if changed:
-                return self._error(409, "invalid_request_error", changed, wire)
-            _, _, msg_id, model, blocks, stop, usage = rp.last
-            if turn.stream:
-                try:
-                    self.send_response(200)
-                    self._route_header(rp.session)
-                    self.send_header("content-type", "text/event-stream")
-                    self.send_header("cache-control", "no-cache")
-                    self.send_header("connection", "close")
-                    self.end_headers()
-                    self.close_connection = True
-                    self.wfile.write(wire.stream_start(msg_id, model))
-                    for chunk in wire.stream_body(msg_id, model, blocks, stop, usage):
-                        self.wfile.write(chunk)
-                    self.wfile.flush()
-                except OSError as gone:
-                    logger.info("client gone while the replayed reply was written (%s)", gone)
-                return
-            return self._json(200, wire.message_json(msg_id, model, blocks, stop, usage), session=rp.session)
+            return self._serve_replay(rp, turn, body, wire)
         except LostSession as exc:
             return self._error(409, "invalid_request_error", str(exc), wire)
+        if rebuild is not None:
+            session = self._rebuild(rebuild, turn, body, wire, scope)
+            if session is None:
+                return                                  # refused; the answer is sent
         changed = self._model_change(session, body) if session is not None else None
         if changed:
-            return self._error(409, "invalid_request_error", changed, wire)
+            return self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
         created = session is None                       # this request opens the conversation (or is a one-shot)
         if session is None:
             route = None
@@ -2077,7 +2837,8 @@ class Handler(BaseHTTPRequestHandler):
                             route["band"], " (S1 degraded)" if route.get("degraded") else "")
             try:
                 session = reg.new(turn, keep=not one_shot, route=route, scope=scope,
-                                  wire_path=self.path.split("?")[0], admitted=bool(reg.router and not one_shot))
+                                  wire_path=self.path.split("?")[0], admitted=bool(reg.router and not one_shot),
+                                  client=self._client())
             except UnservedProvider as exc:
                 return self._error(503, "overloaded_error", f"cortados: {exc}", wire)
             except BridgeError as exc:                  # the backend refused to start (version pin, isolation, login)
@@ -2171,7 +2932,22 @@ class Handler(BaseHTTPRequestHandler):
                     outcome["stale_class"] = "moved_on_while_waiting"
                     outcome["stale_lens"] = (len(turn.history), len(session.history))
                     return
-                if turn.tool_results:
+                seed = getattr(session, "rebuild_seed", None)
+                over = replay_overflow(session, seed, turn) if seed is not None else None
+                if over:
+                    # Review P2-c: the request that passed the rebuild's fit check is not necessarily the one that
+                    # takes this first turn (any request with this exact history can), so the seed + THIS turn is
+                    # checked again here, under the turn lock. Refused terminally; the seed stays for a turn that fits.
+                    outcome["terminal"] = replay_overflow_message(*over)
+                    logger.warning("conversation %s: first turn after a rebuild ≈%dk tokens exceeds its route's "
+                                   "context %dk; terminal", session.id[:8], over[0] // 1000, over[1] // 1000)
+                    return
+                if seed is not None:
+                    # A rebuilt backend's first turn (Registry.rebuild): the client's history as a transcript, then
+                    # this turn, tool results as text. Cleared once sent: the backend holds the history from now on.
+                    session.send_user(anthropic_wire.rebuild_content(seed, turn), timeout=deadline - time.time())
+                    session.rebuild_seed = None
+                elif turn.tool_results:
                     session.deliver(turn.tool_results, timeout=deadline - time.time())
                 else:
                     session.send_user(turn.content, timeout=deadline - time.time())
@@ -2292,6 +3068,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(TERMINAL_STATUS, wire.error_json(TERMINAL_ERROR, str(stale)),
                                       headers={"x-should-retry": "false"})
                 return self._json(409, wire.error_json("invalid_request_error", str(stale)))
+            if "terminal" in outcome:
+                self._note_refusal(TERMINAL_STATUS, TERMINAL_ERROR, reason=REBUILD_TOO_LARGE_REASON)
+                if client_gone:
+                    return
+                if turn.stream:                         # the 200 is sent: the error event carries the terminal kind
+                    self.wfile.write(wire.stream_error(msg_id, model, outcome["terminal"], terminal=True))
+                    return
+                return self._json(TERMINAL_STATUS, wire.error_json(TERMINAL_ERROR, outcome["terminal"]),
+                                  headers={"x-should-retry": "false"})
             if "busy" in outcome:
                 logger.warning("conversation %s: %s", session.id[:8], outcome["busy"])
                 self._note_refusal(BUSY_STATUS, "overloaded_error")
@@ -2337,6 +3122,98 @@ class Handler(BaseHTTPRequestHandler):
             self._office_turn_end(session, office_key, outcome)
             if one_shot and not outcome.get("closed"):
                 session.close()                         # the worker never got to it (it did not run): close it here
+
+    def _terminal(self, turn, wire: Wire, message: str, *, reason: str) -> None:
+        """A refusal no retry can fix, in each wire's non-retried shape (see TERMINAL_ERROR): HTTP 400
+        invalid_request_error with `x-should-retry: false`, or for a streaming request an SSE error marked terminal
+        (the Responses wire's TERMINAL_CODE). `message` is this endpoint's own text; `reason` the fixed record."""
+        self._note_refusal(TERMINAL_STATUS, TERMINAL_ERROR, reason=reason)
+        if turn.stream:                                 # an SSE error, as a streaming client gets any turn's failure
+            try:
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.send_header("cache-control", "no-cache")
+                self.send_header("connection", "close")
+                self.send_header("x-should-retry", "false")
+                self.end_headers()
+                self.close_connection = True
+                msg_id = wire.new_message_id()
+                self.wfile.write(wire.stream_start(msg_id, turn.model))
+                self.wfile.write(wire.stream_error(msg_id, turn.model, message, terminal=True))
+                self.wfile.flush()
+            except OSError as gone:
+                logger.info("client gone before the terminal error was sent (%s)", gone)
+            return
+        self._json(TERMINAL_STATUS, wire.error_json(TERMINAL_ERROR, message), headers={"x-should-retry": "false"})
+
+    def _serve_replay(self, rp: "Replay", turn, body: dict[str, Any], wire: Wire) -> None:
+        """Answer a retry of an answered turn with the stored reply (Registry.find, or rebuild()'s identical twin).
+        A retry that also changes the sub/ pin gets the same refusal as any continuation that does: the stored
+        answer came from the conversation's own model, which the request no longer asks for."""
+        changed = self._model_change(rp.session, body)
+        if changed:
+            return self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
+        _, _, msg_id, model, blocks, stop, usage = rp.last
+        if turn.stream:
+            try:
+                self.send_response(200)
+                self._route_header(rp.session)
+                self.send_header("content-type", "text/event-stream")
+                self.send_header("cache-control", "no-cache")
+                self.send_header("connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                self.wfile.write(wire.stream_start(msg_id, model))
+                for chunk in wire.stream_body(msg_id, model, blocks, stop, usage):
+                    self.wfile.write(chunk)
+                self.wfile.flush()
+            except OSError as gone:
+                logger.info("client gone while the replayed reply was written (%s)", gone)
+            return
+        return self._json(200, wire.message_json(msg_id, model, blocks, stop, usage), session=rp.session)
+
+    def _rebuild(self, rb: "Rebuild", turn, body: dict[str, Any], wire: Wire, scope: str | None):
+        """Serve a continuation whose client rewrote the history on a rebuilt backend (Registry.rebuild); the new
+        session, or None once a refusal has been answered. The conversation's model is fixed (a changed sub/ pin is
+        refused exactly as on any continuation); a refusal to rebuild names its reason."""
+        reg = self.server.registry
+        changed = self._model_change(rb.session, body)
+        if changed:
+            self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
+            return None
+        try:
+            transcript = anthropic_wire.rebuild_transcript(wire.history_messages(body))
+        except (wire.WireError, RecursionError) as exc:
+            self._error(400, "invalid_request_error", f"cortados: the history cannot be replayed: {exc}", wire,
+                        reason="the request does not parse on this wire")
+            return None
+        # Review P2-5: the per-block cut does not bound the whole replay. The rebuilt backend's first turn must fit the
+        # conversation's frozen route (replay_overflow), refused BEFORE the old session is closed or replaced.
+        # Terminal: a retry replays the same history. Checked again under the new session's turn lock (work()), for
+        # whichever request actually sends the seed (review P2-c).
+        over = replay_overflow(rb.session, transcript, turn)
+        if over:
+            logger.warning("rebuild refused: conversation %s replay ≈%dk tokens exceeds its route's context %dk; "
+                           "terminal", str(rb.session.id)[:8], over[0] // 1000, over[1] // 1000)
+            self._terminal(turn, wire, replay_overflow_message(*over), reason=REBUILD_TOO_LARGE_REASON)
+            return None
+        try:
+            return reg.rebuild(rb.session, turn, superseded=rb.superseded, transcript=transcript, scope=scope,
+                               wire_path=self.path.split("?")[0], client=self._client())
+        except Refused as exc:                          # the limit, committed by a concurrent rebuild
+            self._terminal(turn, wire, str(exc), reason=REFUSED_REASONS.get(exc.code, REBUILD_LIMIT_REASON))
+        except Replay as rp:                            # an identical request rebuilt it and was answered first
+            self._serve_replay(rp, turn, body, wire)
+        except LostSession as exc:                      # ...and its answer was not kept: a stale continuation
+            self._error(409, "invalid_request_error", str(exc), wire)
+        except ConversationBusy as exc:
+            self._error(BUSY_STATUS, "overloaded_error", str(exc), wire)
+        except UnservedProvider as exc:
+            self._error(503, "overloaded_error", f"cortados: {exc}", wire)
+        except BridgeError as exc:                      # the rebuilt backend refused to start; the old one is untouched
+            logger.warning("rebuilt backend start failed: %s", exc)
+            self._error(502, "api_error", str(exc), wire, reason=failure_diagnostic(exc))
+        return None
 
     # ------------------------------------------------------------------ office bookkeeping (provider/office.py)
     def _office_turn_start(self, session, *, one_shot: bool) -> str | None:
@@ -2517,6 +3394,7 @@ class ProviderServer(ThreadingHTTPServer):
         super().__init__(addr, Handler)
         try:
             self.registry = registry
+            self.login_slots = threading.BoundedSemaphore(LOGIN_MAX_CONCURRENT)   # POST /dashboard/login (_dashboard_login)
             self._live_memo = live.Memo()                # GET /v1/cortados/live (live_body)
             # The usage ledger's writer starts with the endpoint, never from a request (record_async only queues).
             from cortados_router import usage_ledger
@@ -2539,6 +3417,15 @@ class ProviderServer(ThreadingHTTPServer):
             errors.append({"source": "child_tasks", "error": type(exc).__name__})
             events = []
         return registry.office.view(events, now=now, errors=errors)
+
+    def local_view(self) -> dict[str, Any]:
+        """GET /v1/cortados/local (provider/local_switch.py): each local node's switch, asked through its gate. Tests
+        replace it, or point CORTADOS_LOCAL_RESOURCES_CONFIG at a fake gate."""
+        return local_switch.view()
+
+    def local_switch(self, node: Any, on: Any) -> dict[str, Any]:
+        """POST /v1/cortados/local/switch: set a node's switch through its gate (local_switch.switch). Tests replace it."""
+        return local_switch.switch(node, on)
 
     def live_body(self, registry: Registry, session: str | None = None) -> bytes:
         """The encoded live view, memoised live.MEMO_S with single flight (live.Memo): every dashboard tab and pulse

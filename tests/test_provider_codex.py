@@ -22,6 +22,7 @@ from cortados_router.provider import codex_bridge, codex_isolation, routing
 from cortados_router.provider import server as provider_server
 from cortados_router.provider.bridge import BridgeError
 from cortados_router.provider.server import ProviderServer, Registry
+from tests.provider_fakes import setUpModule, tearDownModule  # noqa: F401  (FAKE_* reach the fake CLIs, #106)
 
 FAKE_CODEX = Path(__file__).with_name("fixtures") / "fake_codex_app_server.py"
 FAKE_CLAUDE = Path(__file__).with_name("fixtures") / "fake_claude_cli.py"
@@ -141,9 +142,10 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertEqual(seen, {})                           # refused before any routing or spend
 
     def send_with(self, body, headers):
+        # The same User-Agent as request(): an identity-less continuation is matched within its client (Registry.find).
         req = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(body).encode(), method="POST",
                                      headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
-                                              **headers})
+                                              "user-agent": "claude-cli/2.1.304 (external, cli)", **headers})
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return r.status, json.loads(r.read())
@@ -304,7 +306,7 @@ class CodexEndpointTests(unittest.TestCase):
     def test_switching_the_pinned_model_mid_conversation_is_refused(self):
         self.pin_router()
         code, msg = self.error_of(self.continuation("sub/opus", "sub/sonnet"))
-        self.assertEqual(code, 409)
+        self.assertEqual(code, provider_server.TERMINAL_STATUS)                  # terminal: the retry names the same model
         self.assertIn("fixed per conversation", msg)
         self.assertIn("sub/claude-opus-5-5", msg)
         self.assertIn("sub/claude-sonnet-5", msg)
@@ -314,7 +316,7 @@ class CodexEndpointTests(unittest.TestCase):
     def test_pinning_an_s1_routed_conversation_is_refused(self):
         self.pin_router()
         code, msg = self.error_of(self.continuation("cortados", "sub/opus"))
-        self.assertEqual(code, 409)
+        self.assertEqual(code, provider_server.TERMINAL_STATUS)
         self.assertIn("routed by S1 to gpt-test", msg)
         self.assertIn("new conversation", msg)
 
@@ -478,7 +480,7 @@ class CodexEndpointTests(unittest.TestCase):
 
     def test_vendor_variables_are_stripped_by_prefix_and_codex_home_reaches_the_child(self):
         # #84: a variable no exact list names (a later CLI release's) never reaches the child; CODEX_HOME, which the
-        # bridge sets on purpose, does. Unrelated variables pass through.
+        # bridge sets on purpose, does. Since #106 unlisted unrelated variables (KEEP_ME) are dropped too.
         extra = {"OPENAI_FOO": "1", "OPENAI_ORG_ID": "org", "CODEX_FOO": "1", "CODEX_SANDBOX": "seatbelt",
                  "ANTHROPIC_CUSTOM_HEADERS": "x-cortados-run-id: r", "CLAUDE_CODE_OAUTH_TOKEN": "tok",
                  "CLAUDE_CONFIG_DIR": "/cfg", "CODEX_HOME": "/somewhere/else", "KEEP_ME": "1"}
@@ -486,9 +488,9 @@ class CodexEndpointTests(unittest.TestCase):
             env = codex_isolation.child_env("/abs/home")
             self.post({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
         for name in extra:
-            if name not in ("CODEX_HOME", "KEEP_ME"):
+            if name != "CODEX_HOME":
                 self.assertNotIn(name, env)
-        self.assertEqual((env["CODEX_HOME"], env["KEEP_ME"]), ("/abs/home", "1"))
+        self.assertEqual(env["CODEX_HOME"], "/abs/home")
         seen = json.loads(Path(self.argv_file).read_text())
         # an allowlisted variable the host itself sets (the Air's CODEX_CA_CERTIFICATE, #103) may reach it too
         allowed_here = sorted({"CODEX_HOME"} | {k for k in codex_isolation.ALLOWED_ENV if k in os.environ})
@@ -901,9 +903,10 @@ class CodexEndpointTests(unittest.TestCase):
         methods = [m.get("method") for m in inbound if m.get("method") in ("turn/start", "turn/interrupt")]
         self.assertEqual(methods, ["turn/start", "turn/interrupt", "turn/start"])
         self.assertEqual(len(self.reg.sessions), 1)
-        # a late result for the abandoned call belongs to a history the endpoint no longer holds: 409, never replayed
+        # a late result for the abandoned call belongs to a history the endpoint no longer holds: refused (this client
+        # sends no conversation identity, so terminally: no_identity), never replayed
         stale = history[:2] + [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": r1["content"][-1]["id"], "content": "late"}]}]
-        self.assertEqual(self.error_of({"tools": [READ_TOOL], "messages": stale})[0], 409)
+        self.assertEqual(self.error_of({"tools": [READ_TOOL], "messages": stale})[0], provider_server.TERMINAL_STATUS)
 
     def test_a_user_input_request_is_answered_empty_and_the_turn_continues(self):
         r = self.post({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "ask user"}]})

@@ -51,8 +51,8 @@ from cortados_router.provider.codex_isolation import (BENIGN_MCP_TOOLS, DEFAULT_
 # The dynamic-tools API is experimental: each release is verified by hand before it joins this tuple (the /status
 # parser in scarcity_codex.py pins the same way).
 SUPPORTED_CLI_VERSIONS = ("0.163.0",)
-# Dropped from the child's environment: an OpenAI/Codex API key or access token would bill an API account instead of
-# the subscription login. The Anthropic trio is harmless to a Codex child and stripped for consistency with bridge.py.
+# The app-server's environment is codex_isolation.child_env: an allowlist (child_env.py, #106), so an OpenAI/Codex API
+# key or access token, which would bill an API account instead of the subscription login, never reaches it.
 # Settle window (seconds) after the first unanswered tool call of a turn. Codex dispatches each item/tool/call as its
 # function_call item finishes streaming, so sibling calls of one model message arrive seconds apart when their
 # arguments are long (a Write payload), not in one stdout burst as the Claude CLI's do (bridge.SETTLE_S = 0.3).

@@ -19,7 +19,7 @@ from cortados_router import core
 from cortados_router.provider import local_lane, routing
 from tests.test_provider_local import FakeOllama, LocalHarness, TAG, write_config
 from tests.test_provider_local_auto import AutoLocalBase, S1_ROUTE, body
-from tests.test_provider_sensitive import OUTWARD_TEXT, ContinuationRecheckBase
+from tests.test_provider_sensitive import OUTWARD_TEXT, SECRET_TERM, ContinuationRecheckBase, SensitiveBase, scored
 from tests.test_provider_sensitive import write_config as write_sensitive_config
 from cortados_router.provider import server
 
@@ -289,6 +289,91 @@ class ManualRuleStillWorksTests(IndexBase):
         self.assertEqual(self.choose()["provider"], "local-pro")
 
 
+class SensitiveVariantTests(SensitiveBase):
+    """main's sensitive routes (#109) that pick the local lane run a variant chosen per request by this branch's
+    published-index rules (routing.choose_variant): any band, so the index need not clear, but the lighter variant
+    that clears it is preferred, else the strongest eligible; the think variant needs room in max_tokens; a client that
+    asked for thinking gets only the think variant. The choice reaches the node (local_lane._node_body)."""
+
+    def setUp(self):
+        super().setUp()
+        self._scores = core.model_scores
+        core.model_scores = lambda: json.loads(json.dumps(SCORES))
+
+    def tearDown(self):
+        core.model_scores = self._scores
+        super().tearDown()
+
+    def scored(self, req, use_case="code"):
+        self.selected["route"]["required_index"] = req
+        self.selected["route"]["chosen"] = {**self.selected["route"]["chosen"], "use_case": use_case}
+
+    def variant(self, r):
+        (_, _, _, route), = self.logged
+        self.assertEqual(route["chosen"]["variant"], r["local"]["model"]["variant"])     # recorded as it runs
+        self.assertTrue(route["chosen"]["proxy"])
+        return r["local"]["model"]["variant"], r["local"]["model"]["variant_thinking"]
+
+    def test_flag_takes_the_lighter_variant_that_clears(self):
+        self.scored(10.0)
+        r = self.choose(body("hello", max_tokens=32000), local="sensitive")
+        self.assertLocal(r, "sensitive: flag")
+        self.assertEqual(self.variant(r), ("qwen-27b", "off"))
+        self.assertEqual(local_lane._node_body(body("hello", max_tokens=32000), r["local"]["model"])["thinking"],
+                         {"type": "disabled"})
+
+    def test_flag_takes_the_think_variant_when_only_it_clears_with_room(self):
+        self.scored(30.0)
+        r = self.choose(body("hello", max_tokens=8192), local="sensitive")
+        self.assertLocal(r, "sensitive: flag")
+        self.assertEqual(self.variant(r), ("qwen-27b-think", "on"))
+        self.assertEqual(local_lane._node_body(body("hello", max_tokens=8192), r["local"]["model"])["thinking"],
+                         {"type": "enabled", "budget_tokens": 4096})
+
+    def test_any_band_runs_local_on_the_strongest_eligible_when_none_clears(self):
+        self.scored(60.0)                                                  # R3-level: above both variants
+        r = self.choose(body("hello", max_tokens=8192), local="sensitive")
+        self.assertLocal(r, "sensitive: flag")
+        self.assertEqual(self.variant(r), ("qwen-27b-think", "on"))
+        self.logged.clear()
+        r = self.choose(body("hello", max_tokens=1024), local="sensitive")  # no room to think: the non-thinking one
+        self.assertEqual(self.variant(r), ("qwen-27b", "off"))
+
+    def test_client_that_asked_for_thinking_gets_the_think_variant(self):
+        self.scored(10.0)
+        asked = body("hello", max_tokens=8192, thinking={"type": "enabled", "budget_tokens": 2000})
+        r = self.choose(asked, local="sensitive")
+        self.assertEqual(self.variant(r), ("qwen-27b-think", "on"))
+        self.assertEqual(local_lane._node_body(asked, r["local"]["model"])["thinking"],
+                         {"type": "enabled", "budget_tokens": 2000})         # the client's own thinking passes
+
+    def test_keyword_route_chooses_too(self):
+        self.scored(30.0)
+        r = self.choose(body(f"about the {SECRET_TERM}", max_tokens=8192))
+        self.assertLocal(r, "sensitive: keyword")
+        self.assertEqual(self.variant(r), ("qwen-27b-think", "on"))
+
+    def test_refusal_fallback_chooses_and_its_whole_answer_gets_the_variant_thinking(self):
+        self.scored(30.0)
+        b = body("hello", max_tokens=8192)
+        r = self.choose(b)
+        sent = []
+        moved = routing.refusal_route(core, b, r, lambda m: sent.append(local_lane._node_body(b, m["local"]["model"]))
+                                      or True)
+        self.assertEqual(moved["bind_reason"], "refusal")
+        self.assertEqual(self.variant(moved), ("qwen-27b-think", "on"))
+        self.assertEqual(sent[0]["thinking"], {"type": "enabled", "budget_tokens": 4096})
+
+    def test_passthrough_entry_or_no_variants_keeps_the_model_unvaried(self):
+        self.scored(10.0)
+        core.model_scores = lambda: {"models": [], "local_models": []}
+        r = self.choose(body("hello"), local="sensitive")
+        self.assertLocal(r, "sensitive: flag")
+        self.assertNotIn("variant", r["local"]["model"])
+        (_, _, _, route), = self.logged
+        self.assertNotIn("variant", route["chosen"])
+
+
 class NodeBodyTests(unittest.TestCase):
     MODEL = {"id": TAG, "alias": "qwen-27b", "thinking": "off-unless-asked"}
 
@@ -400,7 +485,7 @@ class IndexBoundContinuationTests(ContinuationRecheckBase):
         got2 = self.post(self.follow(first, got, "now list the headings"))
         self.assertEqual(got2["content"][0]["type"], "tool_use")
         self.assertEqual(len(self.node_posts()), 2)
-        self.assertEqual(self.scored, ["now list the headings"])
+        self.assertEqual(self.scored, [scored("now list the headings", "ok")])   # main: the words + new tool results
 
 
 class BuilderTests(unittest.TestCase):

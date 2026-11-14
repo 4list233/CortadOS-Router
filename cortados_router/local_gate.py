@@ -8,6 +8,11 @@ Ollama has no authentication, so it listens on 127.0.0.1 only and this gate is t
     (hmac.compare_digest) against a token read from a file that only its owner can read. The check runs before the
     body is read, and a refusal is a fixed 401 that echoes nothing back.
   * The token and request bodies are never logged; a log line is method, path and status.
+  * One more path is the gate's own, never forwarded: GET / POST /cortados/local-switch (SWITCH_PATH), the node's
+    manual local-models switch, behind the same token. GET answers the switch, AC/battery, whether local models are
+    allowed and why, and the models Ollama has loaded (names from /api/ps only); POST {"on": true|false} sets the switch
+    through local_resources.set_local_switch, the toggle CLI's own code. It answers while the switch is off or on
+    battery (it is how the owner sees and changes the state); inference keeps its refusal.
 
 Run:   python3 -m cortados_router.local_gate --listen <tailscale-ip>
 Check: python3 -m cortados_router.local_gate --listen <tailscale-ip> --print-config
@@ -23,6 +28,7 @@ import fcntl
 import hmac
 import ipaddress
 import http.client
+import io
 import json
 import logging
 import math
@@ -36,6 +42,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from cortados_router import http_body, local_resources
 from cortados_router.local_resources import pro_local_allowed
 from cortados_router.studio_capacity import (gate_dir as default_studio_gate_dir, live_intents,
                                              open_node_lock, verify_node_lock)
@@ -78,6 +85,188 @@ BODY_DEADLINE_S = 120.0
 DRAIN_DEADLINE_S = 5.0
 # The only routes the provider's local lane uses (local_lane.probe and local_lane.serve).
 ROUTES = {("GET", "/api/tags"), ("POST", "/v1/messages")}
+# The gate's own switch endpoint (module docstring). Not in ROUTES: it never reaches Ollama as a forwarded request.
+SWITCH_PATH = "/cortados/local-switch"
+# A switch request body is {"on": true} or {"on": false}; 1 KiB is ample, and a larger one is refused unread.
+SWITCH_MAX_BODY = 1024
+# The status asks Ollama which models are loaded (GET /api/ps on loopback). A loopback connect takes microseconds (1 s
+# says "Ollama is not running") and the answer milliseconds; 2 s bounds a hung Ollama, so the whole status (pmset's own
+# 2 s cap included) stays under the provider's 6 s wait (provider/local_switch.GATE_TIMEOUT_S) and still answers, with
+# the models unknown. At most PS_MAX_MODELS names are reported. PS_TIMEOUT_S is end to end (connect, headers and body,
+# deadline_call): a trickling Ollama cannot stretch it by sending a byte now and then.
+PS_CONNECT_S = 1.0
+PS_TIMEOUT_S = 2.0
+PS_MAX_MODELS = 32
+PS_MAX_BYTES = 1024 * 1024
+
+class _DeadlineSocket:
+    """A connected socket under an absolute monotonic deadline: every send and every receive waits at most the time
+    left before `end`, so bytes arriving now and then cannot extend the call (a plain socket timeout is an inactivity
+    timeout and resets on each byte). Past the deadline it raises TimeoutError (an OSError) before waiting at all.
+    Stands in for HTTPConnection.sock: http.client only sends with sendall and reads through makefile("rb")."""
+
+    def __init__(self, sock: socket.socket, end: float):
+        self._sock, self._end = sock, end
+        self._readers, self._closed = 0, False
+
+    def _arm(self) -> None:
+        left = self._end - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("deadline passed")
+        self._sock.settimeout(left)
+
+    def sendall(self, data, *args):
+        self._arm()
+        return self._sock.sendall(data, *args)
+
+    def recv_into(self, buf, *args):
+        self._arm()
+        return self._sock.recv_into(buf, *args)
+
+    def makefile(self, mode: str = "rb", *args, **kwargs):
+        if "w" in mode:
+            raise ValueError("a deadline socket is read through makefile('rb') only")
+        self._readers += 1
+        return io.BufferedReader(_DeadlineReader(self))
+
+    def close(self) -> None:
+        # Like socket.socket: http.client closes the connection while a "Connection: close" response is still being
+        # read, so the real socket closes only once no reader is open.
+        self._closed = True
+        if self._readers <= 0:
+            self._sock.close()
+
+    def _reader_closed(self) -> None:
+        self._readers -= 1
+        if self._closed and self._readers <= 0:
+            self._sock.close()
+
+
+class _DeadlineReader(io.RawIOBase):
+    def __init__(self, sock: _DeadlineSocket):
+        super().__init__()
+        self._s = sock
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buf) -> int:
+        return self._s.recv_into(buf)
+
+    def close(self) -> None:
+        if not self.closed:
+            self._s._reader_closed()
+        super().close()
+
+
+_new_socket = socket.socket                      # the one seam the multi-address test replaces
+
+
+def _resolve_by(host: str, port: int, end: float) -> list:
+    """getaddrinfo results for (host, port) as stream sockets, given up at the monotonic `end` (TimeoutError).
+    A numeric IP is never resolved. getaddrinfo itself takes no timeout, so a name is resolved in a daemon thread that
+    is left to finish on its own when the deadline passes (it holds nothing but its own result)."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None:                      # "fe80::1%en0" (a scope id) is not parsed here on 3.9 and is resolved below
+        if ip.version == 4:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (host, port))]
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 0, "", (host, port, 0, 0))]
+    box: dict = {}
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            box["infos"] = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        except BaseException as exc:            # handed to the caller; nothing escapes the thread
+            box["exc"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=run, name="deadline-resolve", daemon=True).start()
+    if not done.wait(max(0.0, end - time.monotonic())):
+        raise TimeoutError("name resolution did not finish before the deadline")
+    if "exc" in box:
+        raise box["exc"]
+    return box["infos"]
+
+
+def _connect_by(address: tuple, connect_end: float, end: float, source_address=None) -> socket.socket:
+    """socket.create_connection with one absolute deadline: name resolution and every connection attempt share the
+    time left before `connect_end`, and no attempt starts once it has passed. The connected socket's timeout is the
+    time left before `end` (a TLS handshake that follows waits no longer than the call has left)."""
+    host, port = address[0], address[1]
+    last: OSError | None = None
+    for family, type_, proto, _, sockaddr in _resolve_by(host, port, connect_end):
+        left = connect_end - time.monotonic()
+        if left <= 0:
+            break
+        sock = _new_socket(family, type_, proto)
+        try:
+            sock.settimeout(left)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+        except OSError as exc:
+            sock.close()
+            last = exc
+            continue
+        left = end - time.monotonic()
+        if left <= 0:
+            sock.close()
+            break
+        sock.settimeout(left)
+        return sock
+    if last is not None and time.monotonic() < connect_end:
+        raise last
+    raise TimeoutError("connect did not finish before the deadline")
+
+
+def deadline_call(conn: http.client.HTTPConnection, deadline_s: float, method: str, path: str, *,
+                  body: bytes | None = None, headers: dict[str, str] | None = None, max_bytes: int,
+                  connect_s: float | None = None, on_connect_error=None) -> tuple[int, bytes]:
+    """One HTTP request on an unconnected `conn` within `deadline_s` seconds END TO END: the connect (name resolution
+    and every address tried, together also capped at `connect_s`; a numeric IP is not resolved), the request, the status line and headers and the body all share one monotonic deadline, each wait
+    given only the time left. The body is read incrementally, at most `max_bytes` (the rest is left unread).
+    (status, body bytes); OSError (TimeoutError past the deadline) or http.client.HTTPException otherwise. A connect
+    failure is passed to `on_connect_error(exc)` first when given, so a caller can tell "not reachable" from "did not
+    answer". Stdlib only: the provider's switch view (provider/local_switch.py) uses it too.
+    Not http_body.read_within: that is the SERVER side (a body a client sends us, on a socket http.server already
+    accepted, after the request line and headers were read). This is the CLIENT side: the connect, our request, the
+    status line and headers and then the body all share the one deadline, through _DeadlineSocket under http.client's
+    own reader, which a body-only reader on a raw rfile cannot cover."""
+    start = time.monotonic()
+    end = start + deadline_s
+    connect_end = start + min(deadline_s, connect_s if connect_s is not None else deadline_s)
+    conn.timeout = max(0.001, connect_end - start)
+    # http.client's connect (and HTTPSConnection's, which wraps the result in TLS) opens the socket through this
+    # per-instance hook; socket.create_connection would resolve without any timeout and give EVERY resolved address a
+    # full timeout, so a stalled resolver or a dead multi-address name could hold the call far past the deadline.
+    conn._create_connection = lambda address, timeout=None, source_address=None: _connect_by(
+        address, connect_end, end, source_address)
+    try:
+        conn.connect()
+    except (OSError, http.client.HTTPException) as exc:
+        if on_connect_error is not None:
+            on_connect_error(exc)
+        raise
+    conn.sock = _DeadlineSocket(conn.sock, end)
+    conn.request(method, path, body=body, headers=headers or {})
+    resp = conn.getresponse()
+    parts, left = [], max_bytes
+    try:
+        while left > 0:
+            chunk = resp.read1(min(left, 65536))
+            if not chunk:
+                break
+            parts.append(chunk)
+            left -= len(chunk)
+    finally:
+        resp.close()                                    # an unread rest is dropped with the connection, never waited for
+    return resp.status, b"".join(parts)
+
 
 _UNAUTHORIZED = json.dumps({"type": "error", "error": {"type": "authentication_error",
                                                         "message": "local gate: bad or missing token"}}).encode()
@@ -270,28 +459,8 @@ class GateHandler(BaseHTTPRequestHandler):
 
     def _read_body(self, n: int, deadline_s: float) -> bytes | None:
         """n bytes of body within an absolute deadline (BODY_DEADLINE_S / DRAIN_DEADLINE_S), or None when the
-        deadline passes or the client goes away. Each wait is bounded by the time left, so a trickle cannot extend it."""
-        end = time.monotonic() + deadline_s
-        parts, left = [], n
-        try:
-            while left > 0:
-                remaining = end - time.monotonic()
-                if remaining <= 0:
-                    return None
-                self.connection.settimeout(min(self.server.idle_timeout, remaining))
-                chunk = self.rfile.read1(min(left, 65536))
-                if not chunk:
-                    return None
-                parts.append(chunk)
-                left -= len(chunk)
-        except OSError:
-            return None
-        finally:
-            try:
-                self.connection.settimeout(self.server.idle_timeout)
-            except OSError:
-                pass
-        return b"".join(parts)
+        deadline passes or the client goes away (http_body.read_within: a trickle cannot extend it)."""
+        return http_body.read_within(self.connection, self.rfile, n, deadline_s, self.server.idle_timeout)
 
     def log_message(self, fmt, *args):          # http.server's line has the request line only: no token, no body
         logger.info("%s %s", self.address_string(), fmt % args)
@@ -363,6 +532,8 @@ class GateHandler(BaseHTTPRequestHandler):
                 self._send(401, _UNAUTHORIZED)
             return
         path = self.path.split("?", 1)[0]
+        if path == SWITCH_PATH:                  # the gate's own endpoint: no admission check (see docstring)
+            return self._switch(method)
         if (method, path) not in ROUTES:
             return self._error(404, "not_found_error", "not a forwarded path")
         allowed, reason = self._node_free()
@@ -415,6 +586,68 @@ class GateHandler(BaseHTTPRequestHandler):
         finally:
             if lock_fd is not None:
                 os.close(lock_fd)            # releases LOCK_SH
+
+    def _switch(self, method: str) -> None:
+        """GET / POST SWITCH_PATH (authorized by the caller). One implementation of the switch: local_resources."""
+        if method == "POST":
+            try:
+                n = int(self.headers.get("content-length") or "-1")
+            except ValueError:
+                n = -1
+            if n < 0:
+                return self._error(411, "invalid_request_error", "content-length required")
+            if n > SWITCH_MAX_BODY:
+                return self._error(413, "request_too_large", f"a switch body is at most {SWITCH_MAX_BODY} bytes")
+            raw = self._read_body(n, self.server.body_deadline)
+            if raw is None:
+                return
+            try:
+                body = json.loads(raw or b"null")
+            except ValueError:
+                body = None
+            on = body.get("on") if isinstance(body, dict) else None
+            if not isinstance(on, bool):
+                return self._error(400, "invalid_request_error", 'body must be {"on": true} or {"on": false}')
+            try:
+                local_resources.set_local_switch(on)
+            except OSError as exc:
+                logger.warning("local switch change failed: %s", type(exc).__name__)
+                return self._error(500, "api_error", f"cannot change the local switch ({type(exc).__name__})")
+            logger.info("local switch set %s", "on" if on else "off")
+        elif method != "GET":
+            return self._error(405, "invalid_request_error", "the switch takes GET or POST")
+        self._send(200, json.dumps(self.switch_status()).encode())
+
+    def switch_status(self) -> dict:
+        """The switch status: local_resources.local_switch_status, the S1 training hold (a yes/no, no detail), and the
+        models Ollama has loaded."""
+        out = local_resources.local_switch_status()
+        out["training"] = training_hold(self.server.studio_gate_dir) is not None
+        out["models_loaded"], out["ollama"] = self._loaded_models()
+        return out
+
+    def _loaded_models(self) -> tuple[list[str] | None, str]:
+        """(names, "up") from Ollama's GET /api/ps on loopback, or (None, "unreachable" | "unreadable"). Names only:
+        sizes, digests and expiry times stay on the node."""
+        conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port)
+        try:
+            try:
+                status, raw = deadline_call(conn, PS_TIMEOUT_S, "GET", "/api/ps", max_bytes=PS_MAX_BYTES,
+                                            connect_s=min(self.server.connect_timeout, PS_CONNECT_S))
+            except (OSError, http.client.HTTPException):
+                return None, "unreachable"
+            try:
+                data = json.loads(raw) if status == 200 else None
+            except ValueError:
+                data = None
+            models = data.get("models") if isinstance(data, dict) else None
+            if not isinstance(models, list):
+                return None, "unreadable"
+            names = [m.get("name") or m.get("model") for m in models if isinstance(m, dict)]
+            names = [n for n in names if isinstance(n, str) and 0 < len(n) <= 200 and n.isprintable()]
+            return names[:PS_MAX_MODELS], "up"
+        finally:
+            conn.close()
 
     def _forward(self, method: str, path: str, body: bytes | None) -> None:
         conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port,
@@ -492,6 +725,7 @@ def main(argv=None) -> int:
     if a.print_config:
         print(json.dumps({"listen": f"{listen}:{a.port}", "upstream": a.upstream, "token_file": a.token_file,
                           "token": f"ok ({len(token)} chars, mode 0600)", "routes": sorted(f"{m} {p}" for m, p in ROUTES),
+                          "switch_endpoint": f"GET/POST {SWITCH_PATH}",
                           "max_body_bytes": a.max_body_bytes, "max_connections": a.max_connections or "unlimited",
                           "connect_timeout_s": a.connect_timeout, "read_timeout_s": a.read_timeout,
                           "studio_gate_dir": a.studio_gate_dir}, indent=1))

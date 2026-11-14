@@ -69,7 +69,7 @@ def executing_login(cand: dict[str, Any]) -> str | None:
     Claude: the effective login of bridge.claude_env, so an inherited CLAUDE_CONFIG_DIR or OAuth token is never mistaken
     for the sampler's login (the same expression as server._route_pct_left, the reveal).
     Codex: the home codex_bridge resolves (the provider's --codex-home, else CODEX_HOME, else ~/.codex) under
-    codex_isolation.child_env, which strips every key/token override, so the login is that home's auth.json."""
+    codex_isolation.child_env, an allowlist holding no key/token override (#106), so the login is that home's auth.json."""
     from cortados_router import core
     if str(cand.get("provider") or "").split("#", 1)[0] == "codex-cli":
         if cand.get("codex_login"):
