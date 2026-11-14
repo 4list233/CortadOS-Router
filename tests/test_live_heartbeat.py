@@ -379,6 +379,15 @@ class InstallTest(unittest.TestCase):
         self.assertEqual((cfg["jobs"], "s1" in cfg, "provider_url" in cfg),
                          (["com.cortados.provider", "com.cortados.bot-gateway"], False, False))
 
+    def test_orchestrator_block_is_opt_in(self):
+        self.mint()
+        r = self.install("air", "--labels", "com.cortados.provider", "--orchestrator")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        cfg = json.loads((self.home / ".config" / "cortados" / "heartbeat.json").read_text())
+        self.assertEqual(cfg["orchestrator"], {"task_roots": ["~/CortadOS"]})
+        self.assertEqual(hbs.load_config(self.home / ".config" / "cortados" / "heartbeat.json")["orchestrator"]["every_s"],
+                         hbs.ORCH_EVERY_S)
+
     def test_refusals_load_nothing(self):
         r = self.install("studio")
         self.assertEqual(r.returncode, 2)

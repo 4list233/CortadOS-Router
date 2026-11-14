@@ -380,6 +380,18 @@ class ResponsesOnCodexTests(ResponsesEndpointTests):
         self.assertEqual(argv[0], "app-server")
         self.assertFalse(Path(self.claude_argv_file).exists())
 
+    def test_codex_turn_tokens_reach_the_route_with_the_session_tag(self):
+        # work split: the app-server's tokenUsage delta for the turn (the fake reports 100 in / 10 out per model
+        # request), in the Messages shape, onto the route's row with the client's x-cortados-session tag
+        logged, done = [], threading.Event()
+        self.reg.log_tokens = lambda rid, usage, tag: (logged.append((rid, usage, tag)), done.set())
+        with self.send(request(user("hi")), headers=dict(CODEX_HEADERS, **{"x-cortados-session": "ab" * 8})) as r:
+            r.read()
+        self.assertTrue(done.wait(10), "the turn's tokens were never logged")
+        [(rid, usage, tag)] = logged
+        self.assertEqual((rid, tag), (self.route["route_id"], "ab" * 8))
+        self.assertEqual((usage["input_tokens"], usage["output_tokens"]), (100, 10))
+
     def test_a_failed_codex_turn_is_response_failed_or_a_502(self):
         _, events, _ = self.stream(request(user("fail")))
         self.assertEqual([k for k, _ in events], ["response.created", "response.failed"])

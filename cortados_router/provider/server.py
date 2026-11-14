@@ -754,6 +754,9 @@ class Registry:
         # floor_release(rid) -> bool: refunds a floor_search reservation whose search CLI failed to start (a reservation
         # only counts once the run started). None: nothing to refund with; the row ages out as before, logged.
         self.floor_release: Callable[[str], bool] | None = None
+        # log_tokens(route_id, usage, office session tag or None): one backend turn's tokens onto its route's row
+        # (core.log_tokens). None: tokens are not recorded (fixed-model endpoint, tests).
+        self.log_tokens: Callable[[str, dict, str | None], Any] | None = None
         self._factories = SESSION_FACTORIES if session_factories is None else session_factories
         self._lock = threading.Lock()
         # Orders a conversation's backend-exit Office transition against its requests' turn-end writes, so the exit's
@@ -2335,6 +2338,7 @@ class Handler(BaseHTTPRequestHandler):
                     # The ledger only feeds unit-cost learning: it must never break a turn. Without this guard the reply
                     # would go out while history fell behind the client, killing the conversation on its next continuation.
                     _log_ledger_hook_failure(exc)
+                self._log_turn_tokens(session, outcome["turn"][2])
                 session.history.append(anthropic_wire.reply_fingerprint(outcome["turn"][0]))
                 if session.route and not session.route_logged and reg.executed:
                     try:
@@ -2540,6 +2544,23 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:   # never interrupts the turn; counted like any store scheduling failure
             compaction_store.STORE._count("schedule_failures",
                                           f"turn not handed to the store: {type(exc).__name__}: {exc}")
+
+    def _log_turn_tokens(self, session, usage) -> None:
+        """Add this backend turn's tokens to its route's router.db row with the orchestrator's session tag (work split:
+        provider/work_split.py). Off the critical path like the outcome log: a slow SQLite write must not hold the
+        session lock or delay the reply. Never raises; core.log_tokens counts a lost write in router_db."""
+        reg = self.server.registry
+        route = getattr(session, "route", None)
+        if not reg.log_tokens or not isinstance(route, dict) or not route.get("route_id") or not isinstance(usage, dict):
+            return
+        tag = office.clean(self.headers.get(office.SESSION_HEADER), office._HEADER_RULES[office.SESSION_HEADER])
+
+        def _write(route_id=route["route_id"], usage=dict(usage), tag=tag):
+            try:
+                reg.log_tokens(route_id, usage, tag)
+            except Exception:
+                logger.exception("token log for route %s failed", route_id)
+        threading.Thread(target=_write, name="cortados-token-log", daemon=True).start()
 
     def _run_id(self) -> tuple[str | None, bool]:
         """The x-cortados-run-id header: (id or None when absent/empty, valid)."""
@@ -2752,6 +2773,7 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
         registry.floor_turn = lambda route, floor: routing.floor_turn(core, route, floor, codex_home)
         registry.floor_search = lambda cand, floor, rid: _floor_search(core, cand, floor, rid)
         registry.floor_release = lambda rid: _floor_release(core, rid)
+        registry.log_tokens = core.log_tokens
     httpd = ProviderServer((host, port), registry)
 
     def reaper():

@@ -21,6 +21,9 @@ It composes views that already exist rather than re-deriving them:
   - s1             the scorer's /health probe usage already memoises (reachable, HTTP status, latency).
   - hosts          the fleet (default air, studio, pro: CORTADOS_LIVE_HOSTS), each with its hardware sample (usage's
                    hardware cards) and its job heartbeat (POST /v1/cortados/live/heartbeat, below), or "none" said so.
+  - work_split     orchestrator tokens (the main sessions' own, from the heartbeats' `orchestrator` blocks) against
+                   routed tokens (router.db, via tasks.collect's token_totals), overall and per main session
+                   (provider/work_split.py has the definitions).
 
 Every section carries its own `as_of`, a `status` (ok / partial / error, s1: up / down / unknown) and `errors`
 [{source, error}] naming what failed: a failed or absent source is never shown as an empty success. Metadata only:
@@ -36,7 +39,8 @@ loop) POSTs its job states:
               {"name": "s1-continuous", "state": "running", "summary": "sweep 3/8", "progress_pct": 37.5,
                "started_at": 1762850000}]}
 
-A heartbeat may also carry the host's `hardware` (cpu/gpu busy %, memory, load, disk free %: numbers and the chip
+A heartbeat may also carry an `orchestrator` block (cortados_router/orchestrator_usage.py: the host's main Claude Code
+sessions' tokens per window, by Office session tag; validated by work_split.validate_block), the host's `hardware` (cpu/gpu busy %, memory, load, disk free %: numbers and the chip
 name only) and, on the S1 host, an `s1` block (health, the served model's name, the pipeline's hold flags by fixed
 name, a pending candidate's reason slug); cortados_router/live_heartbeat.py is the sender (one per host, every 60 s).
 A post replaces that host's previous one. It is shown fresh for ttl_s (default 900, 60..86400), then stale, and is
@@ -56,7 +60,7 @@ from collections import OrderedDict
 from typing import Any, Callable
 
 from cortados_router import child_tasks, router_db
-from cortados_router.provider import office
+from cortados_router.provider import office, work_split
 
 VERSION = 1
 LIVE_PATH = "/v1/cortados/live"
@@ -73,7 +77,9 @@ PEEK_MAX = 64               # task-dir peeks per snapshot (a few stats each): bo
 CONVERSATIONS_MAX = 64      # in-flight conversations listed; the rest are counted in `hidden`
 ROUTED_MAX = 25             # latest routing decisions shown; tasks.collect reads at most its own ROW_LIMIT (200)
 # ---- heartbeat rules ----
-HEARTBEAT_MAX_BYTES = 8192  # 16 jobs x ~300 bytes is under 5 KiB; a larger body is not a heartbeat
+# 16 jobs x ~300 bytes is under 5 KiB; the orchestrator block adds at most 30 sessions x ~350 bytes (~10 KiB). Larger
+# is not a heartbeat.
+HEARTBEAT_MAX_BYTES = 24576
 HEARTBEAT_HOSTS_MAX = 16    # the fleet is three machines; LRU past this, configured hosts exempt (HeartbeatBoard)
 HEARTBEAT_KEEP_S = 24 * 3600.0
 TTL_DEFAULT_S = 900         # a job loop posting every 5 min misses two posts before it is shown stale
@@ -101,7 +107,7 @@ SESSION_FILTER_RULE = "one Office session tag (16-64 lowercase hex) or " + " or 
 MEMO_KEYS = 16              # live.Memo: the fleet view plus this many-1 session views memoised side by side
 ORIGINS_MAX = 32            # origin groups listed (sessions with a task in the window); the rest flagged truncated
 ORIGIN_IDS_MAX = 20         # task ids per origin group and per orchestrator item, newest first
-_HB_KEYS = {"host", "jobs", "ttl_s", "hardware", "s1"}
+_HB_KEYS = {"host", "jobs", "ttl_s", "hardware", "s1", "orchestrator"}
 # heartbeat `hardware`: percentages, byte counts, the 1-min load, the chip name and when it was sampled; nothing else
 _HB_PCT = ("cpu_busy_pct", "gpu_busy_pct", "disk_free_pct")
 _HB_BYTES = ("mem_available_bytes", "mem_total_bytes")
@@ -182,6 +188,11 @@ def validate_heartbeat(body: Any, now: float) -> tuple[dict[str, Any] | None, st
         if bad is not None:
             return None, "s1" + bad
         out["s1"] = s1
+    if body.get("orchestrator") is not None:
+        orch, bad = work_split.validate_block(body["orchestrator"], now, TIME_SKEW_S)
+        if bad is not None:
+            return None, "orchestrator" + bad
+        out["orchestrator"] = orch
     return out, None
 
 
@@ -575,7 +586,7 @@ _CALL_KEYS = ("ts", "task_id", "session_id", "routing_kind", "band", "lane", "mo
               "degraded", "s1_reason", "request_chars", "response_chars")
 
 
-_LOG_OPS = ("log_route", "log_execution", "log_outcome")
+_LOG_OPS = ("log_route", "log_execution", "log_outcome", "log_tokens")
 _TYPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,63}")
 
 
@@ -594,7 +605,10 @@ def route_log_errors(stats: Any) -> dict[str, Any] | None:
 def routed_section(view: dict[str, Any], now: float, log_errors: dict[str, Any] | None = None) -> dict[str, Any]:
     calls = [{k: t.get(k) for k in _CALL_KEYS} for t in (view.get("tasks") or [])[:ROUTED_MAX]]
     errors = [e for e in view.get("errors") or [] if isinstance(e, dict)]
-    return _section(now, _status(errors, bool(calls)), errors, calls=calls, totals=view.get("totals") or {},
+    totals = dict(view.get("totals") or {})
+    if view.get("token_totals") is not None:
+        totals["tokens"] = view["token_totals"]     # per window: overall, by orchestrator session tag, by lane/model
+    return _section(now, _status(errors, bool(calls)), errors, calls=calls, totals=totals,
                     row_limit=view.get("row_limit"), more=len(view.get("tasks") or []) > ROUTED_MAX,
                     route_log_errors=log_errors)
 
@@ -860,6 +874,8 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
                           exec_hosts=ex_hosts, exec_default=ex_default, self_host=self_host, now=now,
                           errors=hb_errs + ex_errs + (u_errs if u is None else []),
                           self_name=self_name if self_name is not None else _slug(os.environ.get(SELF_ENV)))
+    ws = work_split.section(tv.get("token_totals") if isinstance(tv, dict) else None, beats, now,
+                            tv_errs if tv is None else None)
     counts = tasks.get("counts") or {}
     overview = {
         "running_tasks": counts.get("running") if tasks["status"] != "error" else None,
@@ -870,9 +886,11 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
         "route_log_errors": (rl or {}).get("count"),
         "hosts_with_heartbeat": sum(1 for h in hosts["items"] if h["heartbeat_state"] == "fresh"),
         "errors": sum(len(s["errors"]) for s in (tasks, conv, routed, subs, s1, hosts)),
+        "routed_token_pct_24h": ((ws.get("overall") or {}).get("24h") or {}).get("routed_pct"),
     }
     snap = {"version": VERSION, "generated_at": round(now, 3), "overview": overview, "tasks": tasks,
-            "conversations": conv, "routed": routed, "subscriptions": subs, "s1": s1, "hosts": hosts}
+            "conversations": conv, "routed": routed, "subscriptions": subs, "s1": s1, "hosts": hosts,
+            "work_split": ws}
     return for_session(snap, session) if session is not None else snap
 
 
