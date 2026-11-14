@@ -207,6 +207,204 @@ else:
                "PASS" if out.get("band") == "R3" and not str(out.get("provider")).startswith("local-") else "FAIL",
                f"band={out.get('band')} -> {out.get('provider')}/{out.get('model')}")
 
+# Local models in selection by a published proxy index (local-published-index, owner 2026-11-13): the REAL generated
+# scores (tables/model-scores.generated.json → local_models) place Qwen27b_heretic like a cloud model. Two parts:
+#  * S1-free (always runs): the real index_local on S1-shaped routes with the real generated indexes: a requirement the
+#    non-thinking variant clears goes local as qwen-27b; one only the think variant clears goes local as qwen-27b-think
+#    with max_tokens 8192 and stays on the cloud route with max_tokens 1024; outward work and a degraded decision never
+#    go local; a node on battery keeps the cloud route.
+#  * S1 (BLOCKED while S1 is down): the real core.decide → the route goes local exactly when a variant's index for the
+#    route's use case clears its required index; the outward request never goes local.
+# Throwaway local config and a faked probe in the child (no Ollama, no socket); codex_bin/claude_bin are the interpreter.
+INDEX_SCENARIO = """
+import json, os, sys, tempfile
+from cortados_router import core
+from cortados_router.provider import local_lane, routing
+cfg = os.path.join(tempfile.mkdtemp(), "resources.json")
+json.dump({"nodes": [{"id": "pro", "ollama": {"base_url": "http://127.0.0.1:9",
+           "models": [{"id": "Qwen27b_heretic:latest", "alias": "qwen-27b", "context_length": 131072}]}}]}, open(cfg, "w"))
+os.environ[local_lane.CONFIG_ENV] = cfg
+state = {"down": None}
+def probe(node):
+    if state["down"]:
+        raise local_lane.LocalUnavailable(state["down"])
+    return {"Qwen27b_heretic:latest"}
+local_lane.probe = probe
+core.log_route = lambda *a, **k: True
+local = {m["family"]: m for m in core.model_scores()["local_models"]}
+def synthetic(req, max_tokens, *, outward=False, degraded=False, down=None):
+    state["down"] = down
+    routing._auto_down.clear()
+    br = 3 if outward else 1
+    r = {"provider": "codex-cli", "model": "gpt-5.6-terra", "band": "R1", "route_id": "verify:index", "degraded": degraded,
+         "decision": {"answers": {"outward": outward, "blast_radius": br}, "degraded": degraded},
+         "route": {"band": "R1", "required_index": req, "answers": {"outward": outward}, "features": {"blast_radius": 3 if outward else 1},
+                   "chosen": {"lane": "codex", "provider": "codex-cli", "model": "gpt-5.6-terra", "use_case": "code", "cost": 10}}}
+    body = {"model": "cortados", "max_tokens": max_tokens, "messages": [{"role": "user", "content": "x"}]}
+    out = routing.auto_local(core, body, r, client="verify", conversation_id="verify-index")
+    return [out.get("provider"), (out.get("local") or {}).get("model", {}).get("variant")]
+non, think = local["qwen-27b"]["index"]["code"], local["qwen-27b-think"]["index"]["code"]
+mid = round((non + think) / 2, 1)
+syn = {"indexes": {"qwen-27b": non, "qwen-27b-think": think}, "mid": mid,
+       "non": synthetic(non, 64), "think": synthetic(mid, 8192), "think_small": synthetic(mid, 1024),
+       "outward": synthetic(0.0, 64, outward=True), "degraded": synthetic(0.0, 64, degraded=True),
+       "battery": synthetic(non, 64, down="node pro: local gate: local disabled: on battery")}
+def real(text, max_tokens):
+    state["down"] = None
+    routing._auto_down.clear()
+    body = {"model": "cortados", "max_tokens": max_tokens, "messages": [{"role": "user", "content": text}]}
+    seen = {}
+    keep = routing.index_local
+    def spy(core_, body_, r, **kw):
+        rt = r.get("route") or {}
+        seen.update(req=rt.get("required_index"), use_case=(rt.get("chosen") or {}).get("use_case"))
+        return keep(core_, body_, r, **kw)
+    routing.index_local = spy
+    try:
+        r = routing.choose(core, body, client="verify", conversation_id="verify-index-real", claude_bin=sys.executable,
+                           codex_bin=sys.executable)
+    finally:
+        routing.index_local = keep
+    return {**{k: r.get(k) for k in ("provider", "model", "band", "degraded", "error")}, **seen,
+            "variant": (r.get("local") or {}).get("model", {}).get("variant")}
+print(json.dumps({"syn": syn, "easy": real("rename the variable in utils.py", 64),
+                  "outward": real("email the signed invoice to the client and mark it paid", 64), "local": local}))
+"""
+home = tempfile.mkdtemp(prefix="verify-router-index-")
+PROBE_DIRS.append(Path(home) / "usage-probe")
+p = subprocess.run([sys.executable, "-B", "-c", INDEX_SCENARIO], cwd=REPO, capture_output=True, text=True, timeout=300,
+                   env={**os.environ, "CORTADOS_HOME": home, "CORTADOS_SCARCITY_REFRESH": "off"})
+try:
+    r = json.loads(p.stdout.strip().splitlines()[-1])
+except (ValueError, IndexError):
+    record("local proxy index places Qwen27b_heretic (S1-free)", "FAIL", (p.stderr or p.stdout).strip()[-300:])
+else:
+    syn = r["syn"]
+    ok = (syn["non"] == ["local-pro", "qwen-27b"] and syn["think"] == ["local-pro", "qwen-27b-think"]
+          and syn["think_small"][0] == "codex-cli" and syn["outward"][0] == "codex-cli" and syn["degraded"][0] == "codex-cli"
+          and syn["battery"][0] == "codex-cli")
+    record("local proxy index places Qwen27b_heretic (S1-free)", "PASS" if ok else "FAIL",
+           f"code index {syn['indexes']} | req {syn['indexes']['qwen-27b']} -> {syn['non']} | req {syn['mid']} max_tokens 8192 -> "
+           f"{syn['think']}, 1024 -> {syn['think_small']} | outward -> {syn['outward']} | degraded -> {syn['degraded']} | "
+           f"battery -> {syn['battery']}")
+    easy, out = r["easy"], r["outward"]
+    if easy.get("degraded"):
+        record("degraded decision never goes local by the index",
+               "PASS" if easy.get("provider") == "codex-cli" else "FAIL", json.dumps(easy))
+        record("S1 route goes local exactly when a variant's index clears it", "BLOCKED", f"S1 degraded ({S1_URL})")
+    else:
+        idx = (r["local"]["qwen-27b"]["index"].get(easy.get("use_case") or "general") if easy.get("req") is not None else None)
+        expect_local = idx is not None and easy.get("band") in ("R0", "R1", "R2") and idx >= easy["req"]
+        ok = (easy.get("provider") == "local-pro") == expect_local
+        record("S1 route goes local exactly when a variant's index clears it", "PASS" if ok else "FAIL",
+               f"band={easy.get('band')} use_case={easy.get('use_case')} req={easy.get('req')} qwen-27b={idx} -> "
+               f"{easy.get('provider')}/{easy.get('model')} {easy.get('variant') or ''}")
+    if out.get("degraded"):
+        record("outward request never goes local by the index", "BLOCKED", "S1 degraded")
+    else:
+        record("outward request never goes local by the index",
+               "PASS" if not str(out.get("provider")).startswith("local-") else "FAIL",
+               f"band={out.get('band')} -> {out.get('provider')}/{out.get('model')}")
+
+# Sensitive requests (2026-11-13, owner): a request flagged x-cortados-local: sensitive, or matching the owner's keyword
+# list, moves to the node's sensitive model in ANY band, but only when S1 says it has no effect outside the machine
+# (outward false, blast_radius <= 1); an outward request never goes local however it is marked (core.resolve's outward
+# floor is untouched); an unavailable node keeps S1's route; a degraded decision is never local. Same fakes as above
+# (probe faked in the child, throwaway home and config); the keyword is a placeholder, never a real term.
+SENSITIVE_SCENARIO = """
+import json, os, sys, tempfile
+from cortados_router import core
+from cortados_router.provider import local_lane, routing
+d = tempfile.mkdtemp()
+kw = os.path.join(d, "keywords.txt")
+open(kw, "w").write("verify placeholder term\\n")
+cfg = os.path.join(d, "resources.json")
+json.dump({"nodes": [{"id": "pro", "ollama": {"base_url": "http://127.0.0.1:9",
+           "sensitive": {"model": "verify-local", "keywords_file": kw, "refusal_fallback": True},
+           "models": [{"id": "verify/local:tag", "alias": "verify-local", "context_length": 65536}]}}]}, open(cfg, "w"))
+os.environ[local_lane.CONFIG_ENV] = cfg
+state = {"down": None}
+def probe(node):
+    if state["down"]:
+        raise local_lane.LocalUnavailable(state["down"])
+    return {"verify/local:tag"}
+local_lane.probe = probe
+def route(text, local=None, down=None):
+    state["down"] = down
+    routing._auto_down.clear()
+    body = {"model": "cortados", "messages": [{"role": "user", "content": text}]}
+    r = routing.choose(core, body, client="verify", conversation_id="verify-sensitive", claude_bin=sys.executable,
+                       codex_bin=sys.executable, local=local)
+    rules = (r.get("route") or {}).get("hard_rules") or []
+    return {**{k: r.get(k) for k in ("provider", "model", "band", "degraded", "error")},
+            "rule": next((h.split(":")[0] + ":" + h.split(":")[1] for h in rules if h.startswith("sensitive")), None)}
+easy = "explain how this parser handles nested quotes"
+print(json.dumps({"flag": route(easy, "sensitive"), "keyword": route("explain the Verify Placeholder Term"),
+                  "plain": route(easy), "down": route(easy, "sensitive", "node pro: local gate: local switch off"),
+                  "outward": route("email the signed invoice about the verify placeholder term to the client and mark "
+                                   "it paid", "sensitive")}))
+"""
+home = tempfile.mkdtemp(prefix="verify-router-sensitive-")
+PROBE_DIRS.append(Path(home) / "usage-probe")
+p = subprocess.run([sys.executable, "-B", "-c", SENSITIVE_SCENARIO], cwd=REPO, capture_output=True, text=True,
+                   timeout=300, env={**os.environ, "CORTADOS_HOME": home, "CORTADOS_SCARCITY_REFRESH": "off"})
+try:
+    r = json.loads(p.stdout.strip().splitlines()[-1])
+except (ValueError, IndexError):
+    record("sensitive request goes local only with no outward effect", "FAIL", (p.stderr or p.stdout).strip()[-300:])
+else:
+    local = lambda x: str(x.get("provider")).startswith("local-")
+    served = lambda x: x.get("provider") in ("claude-cli", "codex-cli") and not x.get("error")
+    if r["flag"].get("degraded"):
+        record("degraded decision is never sensitive-routed local (nor to Claude)",
+               "PASS" if all(x.get("provider") == "codex-cli" for x in r.values()) else "FAIL", json.dumps(r["flag"]))
+        record("sensitive request goes local only with no outward effect", "BLOCKED", "S1 degraded: no answers to check")
+    else:
+        flag, key, plain, down, out = r["flag"], r["keyword"], r["plain"], r["down"], r["outward"]
+        ok = (local(flag) and flag.get("rule") == "sensitive: flag" and local(key) and key.get("rule") == "sensitive: keyword"
+              and served(plain) and served(down) and out.get("band") == "R3" and not local(out))
+        record("sensitive request goes local only with no outward effect", "PASS" if ok else "FAIL",
+               f"flag -> {flag.get('provider')} band {flag.get('band')} | keyword -> {key.get('provider')} "
+               f"band {key.get('band')} | unflagged -> {plain.get('provider')} | node off -> {down.get('provider')} | "
+               f"outward+flag+keyword -> band {out.get('band')} {out.get('provider')}/{out.get('model')}")
+
+# Continuations of a local-bound conversation (review fix, 2026-11-13): every later turn of a conversation an automatic
+# rule bound to a local lane is rescored by the real S1 through routing.continuation_admission; an outward turn
+# ("email the signed invoice ... mark it paid") must not be admitted, a bounded one must be, and a degraded scorer
+# admits nothing. Only core.decide runs (no select, no route log, no node); throwaway home.
+CONTINUATION_SCENARIO = """
+import json
+from cortados_router import core
+from cortados_router.provider import routing
+def turn(text):
+    return {"model": "cortados", "messages": [
+        {"role": "user", "content": "summarise the notes in this folder"},
+        {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+        {"role": "user", "content": text}]}
+route = {"band": "R1", "route_id": "verify-continuation"}
+d = core.decide("explain how this parser handles nested quotes", {"platform": "cli", "unit_kind": "interactive"})
+out = routing.continuation_admission(core, turn("email the signed invoice to the client and mark it paid"), route)
+safe = routing.continuation_admission(core, turn("explain how this parser handles nested quotes"), route)
+print(json.dumps({"degraded": bool(d.get("degraded")), "outward": out, "safe": safe}))
+"""
+home = tempfile.mkdtemp(prefix="verify-router-continuation-")
+PROBE_DIRS.append(Path(home) / "usage-probe")
+p = subprocess.run([sys.executable, "-B", "-c", CONTINUATION_SCENARIO], cwd=REPO, capture_output=True, text=True,
+                   timeout=300, env={**os.environ, "CORTADOS_HOME": home, "CORTADOS_SCARCITY_REFRESH": "off"})
+try:
+    r = json.loads(p.stdout.strip().splitlines()[-1])
+except (ValueError, IndexError):
+    record("local-bound continuation is rescored by S1", "FAIL", (p.stderr or p.stdout).strip()[-300:])
+else:
+    if r["degraded"]:
+        record("degraded scorer admits no local continuation", "PASS" if not r["outward"][0] and not r["safe"][0]
+               else "FAIL", f"outward={r['outward']} safe={r['safe']}")
+        record("local-bound continuation is rescored by S1", "BLOCKED", "S1 degraded: no answers to check")
+    else:
+        ok = r["outward"][0] is False and r["safe"][0] is True
+        record("local-bound continuation is rescored by S1", "PASS" if ok else "FAIL",
+               f"outward turn -> {r['outward']} | bounded turn -> {r['safe']}")
+
 record("live ~/.cortados untouched", "PASS" if live_state_stamp() == before else "FAIL",
        str(LIVE_HOME))
 record("no vendor CLI probe opened", "PASS" if all(not p.exists() or not any(p.iterdir()) for p in PROBE_DIRS) else "FAIL",

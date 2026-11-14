@@ -20,7 +20,9 @@ from tests.test_provider_local import FakeOllama, LocalHarness, TAG, write_confi
 S1_ROUTE = {"router": "cortados", "provider": "codex-cli", "model": "gpt-5.6-terra", "account": None,
             "config_dir": None, "context_length": 200000, "route_id": "execution:provider:call:abc", "api_request_id": "",
             "degraded": False, "band": "R0", "projection": None,
-            "decision": {"answers": {"D": 1}, "degraded": False, "engine": "s1", "engine_ms": 5},
+            # outward false and blast_radius 0: what routing.local_admission needs before any automatic local move
+            "decision": {"answers": {"D": 1, "outward": False, "blast_radius": 0}, "degraded": False, "engine": "s1",
+                         "engine_ms": 5},
             "route": {"band": "R0", "chosen": {"lane": "codex", "provider": "codex-cli", "model": "gpt-5.6-terra"},
                       "answers": {"D": 1}, "subagents": 0, "verifier": False, "hard_rules": ["s1 rule"]}}
 AUTO = {"model": "qwen-27b", "bands": ["R0", "R1"]}
@@ -323,11 +325,18 @@ class AutoLocalEndToEndTests(LocalHarness):
         self._select = routing.execution_routing.select
         routing.execution_routing.select = lambda core_, **kw: json.loads(json.dumps(
             {**S1_ROUTE, "route_id": "execution:provider:call:" + uuid.uuid4().hex[:8]}))
+        # Continuations of an auto-routed conversation are rescored by S1 (routing.continuation_admission): a stand-in
+        # scorer that finds every turn safe; test_provider_sensitive's ContinuationRecheck tests cover the refusals.
+        self.reg.local_recheck = lambda b, route: routing.continuation_admission(core, b, route)
+        core.decide = lambda text, ctx=None: {"answers": {"outward": False, "blast_radius": 0}, "degraded": False,
+                                              "engine": "s1", "engine_ms": 1}
         routing._auto_down.clear()
+        routing._admitted.clear()
 
     def tearDown(self):
         routing.execution_routing.select = self._select
         routing._auto_down.clear()
+        routing._admitted.clear()
         super().tearDown()
 
     def test_routed_conversation_runs_on_the_pro(self):

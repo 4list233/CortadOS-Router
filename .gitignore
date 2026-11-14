@@ -24,3 +24,5 @@ tables/benchmarks/raw/
 .claude/worktrees/
 # Provider credential; must never be committed
 cortados_router/provider-token
+# the real sensitive-request keyword list lives on the provider host only (ship the .example format file)
+tables/sensitive-keywords.txt

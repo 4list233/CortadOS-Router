@@ -6,5 +6,20 @@
     {"id": "qwen3-14b-4bit", "params_b": 14, "quant": "4bit", "approx_gib": 8.5},
     {"id": "qwen3-32b-4bit", "params_b": 32, "quant": "4bit", "approx_gib": 19.0},
     {"id": "llama-3.3-70b-4bit", "params_b": 70, "quant": "4bit", "approx_gib": 40.0}
-  ]
+  ],
+  "index_proxies": {
+    "_doc": "Local models in selection (owner 2026-11-13; docs/LOCAL-RESOURCES.md, 'Local models in selection (published proxy index)'). A model on the owner's Ollama node has no published scores of its own, so each VARIANT borrows the index of its PUBLISHED base model (a name exactly as in tables/benchmarks/scores.csv) minus `deduct` (the owner's copy is quantized and abliterated). tables/benchmarks/build_tiers.py writes them to model-scores.generated.json → local_models with proxy: true and the provenance; provider/routing.py offers a variant wherever its index clears the request's required index, like a cloud model. `id` is the Ollama tag on the node (matched case-insensitively, `:latest` optional). `thinking`: off = the request is sent with thinking disabled; on = thinking enabled with a budget that fits the request, offered only when the request's max_tokens leaves room (local_lane.THINK_MIN_MAX_TOKENS). A measured index (plugged-in benchmarking, a separate plan) replaces the proxy later.",
+    "variants": [
+      {"variant": "qwen-27b", "id": "Qwen27b_heretic", "thinking": "off", "published": "qwen3-8-27b-non-reasoning", "deduct": 0.1,
+       "note": "Qwen3.8 27B Heretic, Q4_K_M + abliterated: Artificial Analysis 'Qwen3.8 27B (Non-reasoning)', 20.2 intelligence / 44.6 coding, -10%"},
+      {"variant": "qwen-27b-think", "id": "Qwen27b_heretic", "thinking": "on", "published": "qwen3-8-27b", "deduct": 0.1,
+       "note": "the same weights with thinking on: Artificial Analysis 'Qwen3.8 27B (Reasoning)', 33.7 intelligence / 68.1 coding, -10%"}
+    ],
+    "not_mapped": {
+      "_doc": "Pin-only until their published base model is identified with certainty in scores.csv (do not guess: a wrong base model would route real work on a borrowed score).",
+      "Huihui_Qwen_9b": "'Huihui Qwythos 9B': a community fine-tune whose base is not stated in its name; scores.csv has qwen3-5-9b, qwen3.5-9B and qwen3-8b, but no Qwen3.8 9B, and which (if any) it derives from is not known",
+      "Huihui_Qwen3.8": "'Huihui Qwen3.8 Abliterated (17 GB)': the size suggests the 27B, but the parameter count and whether it is the reasoning or instruct build are not stated",
+      "Phi_4": "'Phi-4 Heretic (Q4_K_M, 9.1 GB)': 9.1 GB fits a 14B at Q4_K_M, which is phi-4 but also phi-4-reasoning (not in scores.csv); scores.csv's phi-4 is a candidate, not a certainty"
+    }
+  }
 }

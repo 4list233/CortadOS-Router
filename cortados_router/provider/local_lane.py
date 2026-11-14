@@ -1,7 +1,7 @@
 """Local model lanes: an Ollama node on the owner's machines (the Pro, #75), served as `sub/<local model id or alias>`
 pins and, when its config opts in, as an auto-route target after S1 has chosen a band.
 
-Owner of three rules:
+Owner of four rules:
   config        the nodes and the models they offer live in the local-resources config (CORTADOS_LOCAL_RESOURCES_CONFIG,
                 the same file local_resources.py samples; schema in docs/LOCAL-RESOURCES.md), under each node's `ollama`
                 block. Addresses are config or env only, never tables or code: the real file is git-ignored.
@@ -11,12 +11,26 @@ Owner of three rules:
                 R3 is where core.resolve's hard rules put outward and blast-radius-3 work (Opus-class floor) and R4 is
                 escalation only, so a local model never takes either. `true` and anything malformed are refused
                 (LocalConfigError): a switch that silently did nothing, or did more than it says, would mislead.
-                routing.auto_local applies it; S1 and core.resolve never see a local lane.
+                routing.auto_local applies it; S1 and core.resolve never see a local lane. Superseded by index_route for any
+                model with a published proxy index; kept working for configs that set it (it is checked first).
+  index_route   on by default (`"index_route": false` turns it off per node): a node model with a proxy index in the
+                generated scores (tables/local-models.json → index_proxies, built into model-scores.generated.json →
+                local_models) is offered wherever its index clears S1's required index (routing.auto_local). A variant
+                with thinking on is sent thinking enabled with a budget that fits max_tokens (think_budget); one with
+                thinking off is sent thinking disabled. `max_inflight` (default 1) is how many relayed turns make the
+                node busy: a busy node is not offered by index_route.
   availability  a lane is available when its node answers GET /api/tags within a short timeout and lists the model.
                 On the Pro the gate (local_gate.py) answers that probe with a 503 while on battery or with the manual
                 switch off, so one probe covers AC power, the switch and gate health. A pin to an unavailable node fails
                 with a clear 503 and nothing falls back to another model (the person chose this one); an auto-route to
                 one is simply not taken, and the conversation keeps the route S1 chose.
+
+  sensitive     off (absent) by default. On, an object naming ONE of the node's models for sensitive requests
+                (`{"model": "<alias or tag>", "keywords_file"|"keywords_file_env": ..., "refusal_fallback": bool}`):
+                requests flagged `x-cortados-local: sensitive|prefer`, matching the owner's keyword list, or refused by a
+                cloud model on their first turn may run there in any band, but only with no effect outside the
+                machine (routing.sensitive_local; docs/LOCAL-RESOURCES.md "Sensitive requests"). The keyword list is
+                a file on the provider host, never in this repository; `keywords` reads and matches it.
 
 Ollama implements the Anthropic Messages API at POST /v1/messages, so a turn is relayed as-is (stateless: the client
 sends the whole conversation every turn) with `model` rewritten to the node's tag and, unless the model entry says
@@ -27,6 +41,8 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
+import threading
 import urllib.parse
 from typing import Any
 
@@ -118,9 +134,17 @@ def nodes(path: str | None = None) -> list[dict[str, Any]]:
                 timeouts[key] = -1.0
             if not timeouts[key] > 0:            # 0 would make the socket non-blocking; negative raises mid-turn
                 raise LocalConfigError(f"node {nid}: {key} must be a positive number of seconds", nid)
+        index_route = block.get("index_route", True)
+        if not isinstance(index_route, bool):
+            raise LocalConfigError(f"node {nid}: index_route must be true or false, got {index_route!r}", nid)
+        max_inflight = block.get("max_inflight", MAX_INFLIGHT_DEFAULT)
+        if isinstance(max_inflight, bool) or not isinstance(max_inflight, int) or max_inflight < 1:
+            raise LocalConfigError(f"node {nid}: max_inflight must be a positive integer, got {max_inflight!r}", nid)
         out.append({"node": nid, "lane": LANE_PREFIX + nid, "label": block.get("label") or nid.capitalize(),
                     "base_url": base, "models": models, "token": token,
                     "auto_route": _auto_route(block.get("auto_route", False), models, nid),
+                    "index_route": index_route, "max_inflight": max_inflight,
+                    "sensitive": _sensitive(block.get("sensitive"), models, nid),
                     **timeouts})
     return out
 
@@ -160,6 +184,165 @@ def _auto_route(value: Any, models: list[dict[str, Any]], nid: str) -> dict[str,
 def auto_routes(path: str | None = None) -> list[tuple[dict[str, Any], dict[str, Any], list[str]]]:
     """(node, model, bands) for every node whose auto_route is on, in config order."""
     return [(n, n["auto_route"]["model"], n["auto_route"]["bands"]) for n in nodes(path) if n.get("auto_route")]
+
+
+_SENSITIVE_KEYS = {"model", "keywords_file", "keywords_file_env", "refusal_fallback", "_comment"}
+
+
+def _sensitive(value: Any, models: list[dict[str, Any]], nid: str) -> dict[str, Any] | None:
+    """A node's validated `sensitive` section: None (absent: the feature is off on this node) or {"model": <one of its
+    model entries>, "keywords_file": <path or None>, "keywords_file_env": <env name or None>, "refusal_fallback": bool}.
+    Malformed is refused (LocalConfigError), as for auto_route: a switch that silently did nothing would mislead. The
+    keyword FILE is not read here (routing reads it per request through `keyword_match`), so a missing list never
+    takes the node's pins down with it."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise LocalConfigError(f"node {nid}: sensitive must be an object "
+                               '{"model": "<alias or tag>", "keywords_file": ..., "refusal_fallback": true} (or absent)',
+                               nid)
+    unknown = set(value) - _SENSITIVE_KEYS
+    if unknown:
+        raise LocalConfigError(f"node {nid}: sensitive has unknown keys {sorted(unknown)}", nid)
+    name = str(value.get("model") or "").strip().casefold()
+    entry = next((m for m in models if name and name in (m["id"].casefold(), (m["alias"] or "").casefold())), None)
+    if entry is None:
+        raise LocalConfigError(f"node {nid}: sensitive.model must name one of this node's models (alias or tag)", nid)
+    out: dict[str, Any] = {"model": entry, "keywords_file": None, "keywords_file_env": None, "refusal_fallback": False}
+    for key in ("keywords_file", "keywords_file_env"):
+        v = value.get(key)
+        if v is not None and (not isinstance(v, str) or not v.strip()):
+            raise LocalConfigError(f"node {nid}: sensitive.{key} must be a non-empty string", nid)
+        out[key] = v.strip() if v else None
+    fb = value.get("refusal_fallback", False)
+    if not isinstance(fb, bool):
+        raise LocalConfigError(f"node {nid}: sensitive.refusal_fallback must be true or false", nid)
+    out["refusal_fallback"] = fb
+    return out
+
+
+def sensitive_routes(path: str | None = None) -> list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
+    """(node, model, sensitive section) for every node whose `sensitive` section is on, in config order."""
+    return [(n, n["sensitive"]["model"], n["sensitive"]) for n in nodes(path) if n.get("sensitive")]
+
+
+class KeywordListError(RuntimeError):
+    """The node's keyword list is configured but cannot be read. The message names the file or variable, never a term."""
+
+
+# path -> ((mtime_ns, size), compiled pattern or None). The list is re-read when the file changes, so the owner edits it
+# on the provider host without a restart. Guarded: the provider serves requests on many threads.
+_keyword_cache: dict[str, tuple[tuple[int, int], Any]] = {}
+_keyword_lock = threading.Lock()
+
+
+def keyword_file(section: dict[str, Any]) -> str | None:
+    """The keyword list's path: $keywords_file_env when that names a set variable, else keywords_file, else None (the
+    keyword trigger is off). KeywordListError when keywords_file_env names a variable that is not set and there is no
+    keywords_file to use instead: a list the owner configured must not silently match nothing."""
+    env_name = section.get("keywords_file_env")
+    path = (os.environ.get(env_name) if env_name else None) or section.get("keywords_file")
+    if env_name and not path:
+        raise KeywordListError(f"sensitive.keywords_file_env names ${env_name}, which is not set")
+    return os.path.expanduser(path) if path else None
+
+
+def compile_keywords(lines: list[str]):
+    """One pattern for a keyword list (one term or phrase per line; blank lines and `#` comments skipped), matched
+    case-insensitively (casefold) as whole words or phrases: a term never matches inside a longer word, and the words
+    of a phrase may be separated by any whitespace. None for an empty list."""
+    terms = []
+    for line in lines:
+        t = line.strip()
+        if not t or t.startswith("#"):
+            continue
+        words = t.casefold().split()
+        terms.append(r"\s+".join(re.escape(w) for w in words))
+    if not terms:
+        return None
+    # Longest first, so a phrase is preferred over a word it starts with (only a yes/no is reported either way).
+    terms.sort(key=len, reverse=True)
+    return re.compile(r"(?<!\w)(?:" + "|".join(terms) + r")(?!\w)")
+
+
+def keywords(section: dict[str, Any]):
+    """The compiled keyword pattern of a `sensitive` section (cached by file mtime and size), or None when no list is
+    configured or it is empty. KeywordListError when a configured list cannot be read."""
+    path = keyword_file(section)
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+        stamp = (st.st_mtime_ns, st.st_size)
+        with _keyword_lock:
+            hit = _keyword_cache.get(path)
+            if hit and hit[0] == stamp:
+                return hit[1]
+        with open(path, encoding="utf-8") as f:
+            pattern = compile_keywords(f.read().splitlines())
+    except (OSError, UnicodeDecodeError) as exc:
+        raise KeywordListError(f"sensitive keyword list {path} unreadable: {type(exc).__name__}") from None
+    with _keyword_lock:
+        _keyword_cache[path] = (stamp, pattern)
+    return pattern
+
+
+def keyword_match(section: dict[str, Any], text: str) -> bool:
+    """Whether `text` contains a term of the section's keyword list. Only the yes/no leaves this function: callers
+    must never log which term matched (there is no way to ask)."""
+    pattern = keywords(section)
+    return bool(pattern and text and pattern.search(text.casefold()))
+
+
+def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any]) -> tuple[list, str, dict]:
+    """One whole (non-streaming) answer from the node for `body`, as (blocks, stop_reason, usage) in the shape the
+    bridges return: text and tool_use blocks only (thinking is dropped, as the CLI lanes never send it). Used where
+    the answer must be written by the server itself: the refusal fallback (server.py), whose stream has already
+    started. LocalUnavailable on any failure (no answer, an HTTP error, an unreadable or non-message answer, or a
+    message holding no usable answer: at least one non-blank text block or a valid tool call, _answered); the
+    node's own error text is never repeated, only its status or the gate's fixed policy reason."""
+    out = dict(body)
+    out["model"] = model["id"]
+    out["stream"] = False
+    data = json.dumps(out).encode()
+    conn = _connection(node["base_url"], node["connect_timeout_s"])
+    try:
+        try:
+            conn.connect()
+            conn.sock.settimeout(node["read_timeout_s"])
+            conn.request("POST", _prefix(node["base_url"]) + "/v1/messages", body=data,
+                         headers={"content-type": "application/json", "anthropic-version": "2023-06-01",
+                                  **_auth(node)})
+            resp = conn.getresponse()
+            if resp.status != 200:
+                raw = _bounded_read(resp)
+                policy = _policy_refusal(raw) if resp.status == 503 else None
+                if resp.status == 401:
+                    raise LocalUnavailable(GATE_REFUSED.format(node=node["node"]))
+                raise LocalUnavailable(f"node {node['node']}: {policy}" if policy else
+                                       f"node {node['node']} answered /v1/messages with HTTP {resp.status}")
+            msg = json.loads(resp.read())
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            raise LocalUnavailable(f"node {node['node']} gave no usable answer ({type(exc).__name__})") from None
+    finally:
+        conn.close()
+    if not isinstance(msg, dict) or msg.get("type") != "message" or not isinstance(msg.get("content"), list):
+        raise LocalUnavailable(f"node {node['node']} answered something that is not a message")
+    declared = {t.get("name") for t in body.get("tools") or [] if isinstance(t, dict)}
+    blocks = []
+    for b in msg["content"]:
+        if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
+            blocks.append({"type": "text", "text": b["text"]})
+        elif (isinstance(b, dict) and b.get("type") == "tool_use" and isinstance(b.get("id"), str) and b["id"]
+              and isinstance(b.get("name"), str) and b["name"] in declared and isinstance(b.get("input"), dict)):
+            # A valid tool call only: a tool the client declared, with an object input. Anything else is dropped.
+            blocks.append({"type": "tool_use", "id": b["id"], "name": b["name"], "input": b["input"]})
+    if not _answered(blocks):
+        # Thinking only, blank text, an empty content list or only malformed tool calls (e.g. stop "max_tokens"
+        # after thinking): not an answer. The caller keeps what it had (the refusal fallback: the original refusal).
+        raise LocalUnavailable(f"node {node['node']} gave no usable answer (no text or valid tool call)")
+    usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+    return blocks, str(msg.get("stop_reason") or "end_turn"), usage
 
 
 DEFAULT_CONTEXT = 32768
@@ -204,6 +387,43 @@ def _thinking_mode(m: dict[str, Any], nid: str, mid: str) -> str:
     return v
 
 
+# Thinking variants (index_route, tables/local-models.json → index_proxies). Reason for the threshold (#108): Qwen3.8 27B
+# with thinking on spent all of max_tokens=20 thinking and wrote no answer, and the thinking counts against max_tokens.
+# Anthropic's extended thinking needs budget_tokens >= 1024 and < max_tokens, and the answer needs room after it; the
+# think variant's index comes from published reasoning runs with large budgets, which a 1k budget would not reproduce.
+# So the think variant is offered only from 4096 max_tokens, with half for thinking (>= 2048) and half for the answer
+# (>= 2048). Below it the request goes to the non-thinking variant or the cloud route, never to the think variant.
+THINK_MIN_MAX_TOKENS = 4096
+VARIANT_THINKING = ("off", "on")
+
+
+def think_budget(max_tokens: Any) -> int | None:
+    """The thinking budget a think-variant turn is sent with: half of max_tokens, or None when max_tokens (absent, not
+    an integer, or below THINK_MIN_MAX_TOKENS) leaves no room for thinking and an answer."""
+    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < THINK_MIN_MAX_TOKENS:
+        return None
+    return max_tokens // 2
+
+
+# Busy (index_route). Reason: Ollama runs one request per loaded model at a time unless OLLAMA_NUM_PARALLEL says
+# otherwise (a 27B at long context on the 48 GB Pro runs one), so a second turn queues behind the first for minutes
+# while a cloud lane would answer now. Counted per node in this process: every relayed turn, pinned or routed.
+MAX_INFLIGHT_DEFAULT = 1
+_inflight: dict[str, int] = {}
+_inflight_lock = threading.Lock()
+
+
+def inflight(node: dict[str, Any]) -> int:
+    """How many turns this process is relaying to the node right now."""
+    with _inflight_lock:
+        return _inflight.get(node["node"], 0)
+
+
+def busy(node: dict[str, Any]) -> bool:
+    """The node already relays its max_inflight turns: index_route does not add one more."""
+    return inflight(node) >= int(node.get("max_inflight") or MAX_INFLIGHT_DEFAULT)
+
+
 def client_asked_thinking(body: dict[str, Any]) -> bool:
     """The client asked for extended thinking: a `thinking` object whose type is anything but "disabled"."""
     t = body.get("thinking")
@@ -212,10 +432,17 @@ def client_asked_thinking(body: dict[str, Any]) -> bool:
 
 def _node_body(body: dict[str, Any], model: dict[str, Any]) -> dict[str, Any]:
     """The request as the node gets it: `model` rewritten to the node's tag and, under off-unless-asked, thinking
-    turned off when the client did not ask for it (a missing field, or one of another shape)."""
+    turned off when the client did not ask for it (a missing field, or one of another shape). An index-routed think
+    variant (`variant_thinking` "on") the client did not ask to think is sent thinking enabled with think_budget, or
+    disabled when this turn's max_tokens leaves no room for it; a client's own `thinking` always passes through."""
     out = dict(body)
     out["model"] = model["id"]
-    if model.get("thinking", THINKING_DEFAULT) == "off-unless-asked" and not client_asked_thinking(body):
+    if client_asked_thinking(body):
+        return out
+    if model.get("variant_thinking") == "on":
+        budget = think_budget(body.get("max_tokens"))
+        out["thinking"] = {"type": "enabled", "budget_tokens": budget} if budget else {"type": "disabled"}
+    elif model.get("variant_thinking") == "off" or model.get("thinking", THINKING_DEFAULT) == "off-unless-asked":
         out["thinking"] = {"type": "disabled"}
     return out
 
@@ -429,6 +656,22 @@ def auto_routed_unavailable(node: dict[str, Any], model: dict[str, Any], reason:
 
 def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
           echo_model: str, reply: list | None = None, auto_routed: bool = False) -> str:
+    """_serve, counted in the node's in-flight turns (busy) while it runs."""
+    with _inflight_lock:
+        _inflight[node["node"]] = _inflight.get(node["node"], 0) + 1
+    try:
+        return _serve(handler, body, node, model, echo_model=echo_model, reply=reply, auto_routed=auto_routed)
+    finally:
+        with _inflight_lock:
+            left = _inflight.get(node["node"], 1) - 1
+            if left > 0:
+                _inflight[node["node"]] = left
+            else:
+                _inflight.pop(node["node"], None)
+
+
+def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
+           echo_model: str, reply: list | None = None, auto_routed: bool = False) -> str:
     """Relay one turn to the node's /v1/messages and the answer back to the client. Returns the outcome: "completed"
     (a whole message or a parsed message_stop), "rejected" (the node answered an HTTP error, relayed as-is),
     "unreachable" (503 sent), or "incomplete" (the stream broke). The response names `echo_model` (what the client

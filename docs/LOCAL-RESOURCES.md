@@ -151,7 +151,8 @@ Owner decision 2026-11-08, confirmed 2026-11-13 (#75): local chat models run on 
 with the manual switch on. The Studio runs S1 (scoring, compaction) and **no chat models**: its config has no
 `ollama` block, its Ollama service and gate may stay installed but idle. A node with an `ollama` block offers its
 Ollama models to the provider as `sub/<alias or tag>` pins (`cortados_router/provider/local_lane.py`) and, when its
-`auto_route` is set, as an auto-route target (below). The provider reads the same file as the sampler,
+`auto_route` is set, as an auto-route target (below), and, for a model with a published proxy index, as a candidate
+in selection (Local models in selection, below). The provider reads the same file as the sampler,
 `CORTADOS_LOCAL_RESOURCES_CONFIG`; `tables/resources.example.json` shows the Pro's block (placeholders).
 
 | key | meaning |
@@ -161,8 +162,10 @@ Ollama models to the provider as `sub/<alias or tag>` pins (`cortados_router/pro
 | `base_url` | the URL itself, for the git-ignored `tables/resources.json` only; never commit a real address |
 | `label` | the suffix `/v1/models` shows: `<name> · CortadOS (<label>)` (default: the node id, capitalised) |
 | `auto_route` | `false` (default): pin-only. Or `{"model": "<alias or tag of one of this node's models>", "bands": ["R0", …]}`: the S1 bands in which that model may take a new conversation (Local auto-route, below). There is no default band; `true`, an unknown model, an empty list, unknown keys and the bands `R3`/`R4` are refused with a config error |
+| `index_route` | `true` (default) or `false`: whether this node's models with a published proxy index are offered in selection (Local models in selection, below); anything else is refused |
+| `max_inflight` | positive integer, default 1: how many turns this provider is relaying to the node at once make it busy; a busy node is not offered by the index route (pins and the manual `auto_route` are unaffected) |
 | `probe_timeout_s` / `connect_timeout_s` / `read_timeout_s` | `/api/tags` probe (2), connect (3), wait per response chunk (300; a first model load can take a minute); each must be positive |
-| `models[]` | `id` (the Ollama tag, required), `alias` (the short pin name), `name` (display name), `context_length` (a positive integer of tokens; default 32768 when absent, the input-fit gate; set it to the node's Ollama context, 65536 for Ollama.app's setting on the Pro); `thinking` (`"off-unless-asked"`, the default, or `"passthrough"`; anything else is refused: Thinking models, below) |
+| `models[]` | `id` (the Ollama tag, required), `alias` (the short pin name), `name` (display name), `context_length` (a positive integer of tokens; default 32768 when absent, the input-fit gate; set it to the node's Ollama context; the owner's decision is 128k, 131072, on the Pro); `thinking` (`"off-unless-asked"`, the default, or `"passthrough"`; anything else is refused: Thinking models, below) |
 
 Pin names (aliases and tags, case-insensitive) must be unique across nodes. Behaviour:
 
@@ -194,8 +197,8 @@ Pin names (aliases and tags, case-insensitive) must be unique across nodes. Beha
    `com.cortados.ollama` were booted out and disabled on the Studio.
 3. On the Pro: nothing is downloaded (owner decision 2026-11-13: the lane uses the models already on the Pro, renamed
    with `ollama cp` to `Qwen27b_heretic`, `Huihui_Qwen_9b`, `Huihui_Qwen3.8` and `Phi_4`; the Pro block's `models` must
-   list these tags as `ollama list` prints them, e.g. `Qwen27b_heretic:latest`). Set Ollama's context to at least the configured `context_length` (65536):
-   `OLLAMA_CONTEXT_LENGTH=65536` for `ollama serve`, or Ollama.app's context setting, then restart Ollama (see "Context
+   list these tags as `ollama list` prints them, e.g. `Qwen27b_heretic:latest`). Set Ollama's context to at least the configured `context_length` (131072, 128k, owner decision):
+   `OLLAMA_CONTEXT_LENGTH=131072` for `ollama serve`, or Ollama.app's context setting, then restart Ollama (see "Context
    length must match the node" below). Only then set the Pro block's `auto_route` in the Air's `tables/resources.json`
    (Local auto-route, below); before that the Pro is pin-only.
 
@@ -229,12 +232,14 @@ different tag (`name:q8`) is a different model.
 
 ### Local auto-route
 
-With `auto_route` set, `routing.auto_local` runs after S1 has routed a new `cortados` conversation (the routed path
+Superseded by the published proxy index (Local models in selection, below) for any model that has one; it keeps
+working for a config that sets it, and is checked first. With `auto_route` set, `routing.auto_local` runs after S1 has routed a new `cortados` conversation (the routed path
 only; pins are unaffected). It moves the conversation to the node's `auto_route.model` when **all** of these hold, and
 otherwise leaves S1's route exactly as it was:
 
-1. S1 was not degraded (a degraded decision has no band of its own; the "degraded scorer never defaults to Claude" rule
-   is untouched because nothing here ever adds a Claude route);
+1. the shared gate `routing.local_admission` admits S1's decision (Sensitive requests, below): not degraded (a degraded
+   decision has no band of its own; the "degraded scorer never defaults to Claude" rule is untouched because nothing
+   here ever adds a Claude route), `outward` exactly false and `blast_radius` exactly 0 or 1;
 2. S1's band is in `auto_route.bands` (`R0`/`R1`/`R2` only: `R3` is where the hard rules put outward and
    blast-radius-3 work, `R4` is escalation only);
 3. the request came in on `/v1/messages` (the relay speaks the Messages API; `/v1/responses` bodies carry
@@ -250,7 +255,8 @@ The first node in config order that passes wins. The routes row S1's select wrot
 (`INSERT OR REPLACE`: lane/provider `local-<node>`, the model's tag, S1's own choice as `runner_up`, S1's runner_up kept
 as an entry in `skipped`, a `local auto-route: …` hard-rules entry), and the conversation then runs exactly like a local
 pin (same relay, same per-turn context gate, the model is fixed for the conversation, the client's quota floor does not
-apply). Each skipped condition is logged at INFO (`local auto-route: … not taken …`), except a gate 401 (the provider's
+apply), except that every later turn is rescored by S1 first and refused when it is not admitted (Continuations of a
+local-bound conversation, under Sensitive requests). Each skipped condition is logged at INFO (`local auto-route: … not taken …`), except a gate 401 (the provider's
 token file does not match the gate's), which is a WARNING: it is a misconfiguration for the owner, not the node's state.
 
 **An auto-routed conversation stays on the Pro until it returns.** The decision is made once, on the opening turn. If
@@ -273,8 +279,8 @@ tags below are the names given with `ollama cp`):
 
 | model | Ollama tag | alias (example config) | size | use |
 | --- | --- | --- | --- | --- |
-| Qwen3.8 27B Heretic, Q4_K_M | `Qwen27b_heretic` | `qwen-27b` | 16 GB | default auto-route model |
-| Huihui Qwythos 9B, Q6_K | `Huihui_Qwen_9b` | `qwythos-9b` | 7.6 GB | fast/small option (auto-route model if the 27B is too slow) |
+| Qwen3.8 27B Heretic, Q4_K_M | `Qwen27b_heretic` | `qwen-27b` | 16 GB | in selection by its published proxy index (`qwen-27b`, `qwen-27b-think`) |
+| Huihui Qwythos 9B, Q6_K | `Huihui_Qwen_9b` | `qwythos-9b` | 7.6 GB | pin-only (base model not identified; could be a manual `auto_route` model) |
 | Huihui Qwen3.8 Abliterated | `Huihui_Qwen3.8` | `qwen-abliterated` | 17 GB | pin-only |
 | Phi-4 Heretic, Q4_K_M | `Phi_4` | `phi-4` | 9.1 GB | pin-only |
 
@@ -282,7 +288,193 @@ All four are community fine-tunes without a published evaluation, which is one m
 reflex work only. Recommended first setting:
 `"auto_route": {"model": "qwen-27b", "bands": ["R0"]}` (reflex work only: D ≤ 2, blast radius 0, small context);
 widen to `R1` only after reviewing the `local auto-route` rows in router.db. Which bands go local is the owner's call,
-so the shipped example keeps `auto_route: false`.
+so the shipped example keeps `auto_route: false`. (Owner decision 2026-11-13: the published proxy index below replaces
+this manual rule for `Qwen27b_heretic`.)
+
+### Local models in selection (published proxy index)
+
+Owner decision 2026-11-13 (branch `local-published-index`): a local model is placed by the same rule as a cloud model,
+an index per use case that must clear the request's required index, instead of a hand-picked band list. A local
+model has no published scores of its own, so it borrows its **published base model's** index, minus a deduction:
+
+- **Declared** in `tables/local-models.json` → `index_proxies.variants`: per variant the Ollama tag (`id`, matched
+  case-insensitively, `:latest` optional), `thinking` (`off` / `on`), `published` (the base model's name exactly as in
+  `tables/benchmarks/scores.csv`) and `deduct` (a fraction). `not_mapped` records why the other models have none.
+- **Built** by `tables/benchmarks/build_tiers.py` (nightly, or by hand; never hand-edit the generated file) into
+  `tables/model-scores.generated.json` → `local_models`: per use case `index = base family index × (1 − deduct)`, with
+  `base_index`, `published`, `published_family`, `proxy: true` and `provenance` ("proxy: published base model, −10%").
+  A base the data does not know (or with fewer than `tiering.min_benchmarks` benchmarks), or a malformed entry, is never
+  given an index: it is listed in `local_unranked` with the reason and printed, and the cloud build goes on. Local
+  variants are kept out of `models`, so no cloud consumer (the band references, `served_routes`, reviews) sees them.
+  `--keep-sentiment` rebuilds from the committed `community-sentiment.json` (the claims fold keeps a 30-day window by
+  the clock, so a rebuild on a later day would otherwise also move cloud indexes).
+- **Measured results replace the proxy later** (plugged-in benchmarking, a separate plan).
+
+Today only `Qwen27b_heretic` has one (owner: its copy is Q4_K_M and abliterated, so −10 %), as two variants of the
+same weights chosen per request. Artificial Analysis publishes both modes of the base model; the index is the
+builder's fit over every source in `scores.csv` for that family (Qwen3.8 27B reasoning has 32 benchmarks across
+Artificial Analysis, LiveBench, LMArena and Epoch; the non-reasoning entry has Artificial Analysis's 3 only, so the
+fit's ridge shrinks it toward the average model):
+
+| variant | thinking | published base | AA intelligence / coding | general | code | ops | research | planning | writing | conversation | capture/log |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `qwen-27b` | off | `qwen3-8-27b-non-reasoning` | 20.2 / 44.6 | 16.7 | 15.1 | 15.0 | 19.6 | 16.3 | 17.6 | 20.5 | 19.1 |
+| `qwen-27b-think` | on | `qwen3-8-27b` | 33.7 / 68.1 | 38.8 | 39.6 | 31.7 | 43.3 | 35.8 | 46.3 | 33.9 | 44.6 |
+| (cloud) `gpt-5-6-luna` | | | 37.3 / 71.4 | 50.2 | 49.9 | 51.3 | 47.5 | 44.8 | 34.3 | 44.4 | 48.3 |
+| (cloud) `gpt-6-luna` | | | | 47.4 | 44.9 | 50.8 | 45.0 | 43.9 | 21.9 | 40.5 | 38.4 |
+| (cloud) `claude-haiku-4-5` (R1 reference) | | | | 13.3 | 14.2 | 13.8 | 11.0 | 6.1 | 18.2 | 19.0 | 11.5 |
+
+(Luna's family index takes its best published configuration, so its −low/−high entries do not appear separately.)
+With the knots of `routing-table.json` (version as committed), that places them at:
+
+| use case | `qwen-27b` | `qwen-27b-think` (max_tokens ≥ 4096) |
+| --- | --- | --- |
+| code, ops, research, planning, conversation, capture/log | R0; R1 at D ≤ 3 | R0; R1 at D ≤ 5 (ops, planning, conversation: D ≤ 4) |
+| writing | R0 | R0; R1 at D ≤ 5; R2 at D ≤ 6 (R2's floor, 42.3, is below its 46.3) |
+
+Nothing else: every other R2 floor (the Sonnet 5 / GPT-5.6 Terra reference, 46.6–50.8) is above both, and R3/R4 are
+never local.
+
+**How a request is placed** (`routing.index_local`, run by `auto_local` after S1 has routed a new `cortados`
+conversation and the manual `auto_route` did not take it). S1 and `core.resolve` still never see a local lane; the
+provider compares the variants against the route S1 chose:
+
+1. Hard rules first: never when S1 was degraded, never outward work, never blast radius 3, never R3/R4; never on
+   `/v1/responses`; a route without a required index (the table-fallback path) has nothing to clear.
+2. A variant qualifies when its index for S1's use case is at least S1's `required_index`. The think variant also needs
+   `max_tokens ≥ local_lane.THINK_MIN_MAX_TOKENS` (4096). Reason (#108): Qwen3.8 27B thinking spent all of
+   `max_tokens=20` and wrote no answer, thinking counts against `max_tokens`, Anthropic's extended thinking needs a
+   budget ≥ 1024 and below `max_tokens`, and the think index comes from published reasoning runs with large budgets.
+   4096 splits into ≥ 2048 for thinking and ≥ 2048 for the answer. A client that asked for thinking itself gets only
+   the think variant (its turn thinks either way). A node entry with `thinking: "passthrough"` takes no variant (its
+   thinking cannot be set).
+3. Cost: a local lane spends no subscription quota (`core.resolve` already weighs local at 0, and its face floor
+   exempts local), so a qualifying variant wins over S1's cloud choice; the lighter one first (lower general index,
+   the selection's "pay by general index": the non-thinking variant, which also answers sooner). This is the owner's
+   rule ("the local lane wins where it qualifies unless the node is busy"); it also takes precedence over a cloud
+   window whose credit is about to expire unused.
+4. It is not taken when its node has `index_route: false`, is **busy** (this provider already relays `max_inflight`
+   turns to it; Ollama runs one request per loaded model on the Pro, so another would queue for minutes while a cloud
+   lane answers now), failed a probe within `AUTO_DOWN_S`, does not answer `/api/tags` (asleep, battery, switch off,
+   gate down), does not list the model, the request outgrows `context_length`, or the client excluded the model
+   (`x-cortados-exclude-model` by alias or tag; both variants are one model). S1's route then stands; the skip is
+   logged at INFO (`local index route: … not taken …`, node, variant and reason only, never the request).
+
+When taken, the routes row is rewritten under the same id as for the manual rule, with the variant, its index,
+use case and provenance on `chosen` and a `local index route: …` hard-rules entry. Each turn of a think-variant
+conversation is sent `"thinking": {"type": "enabled", "budget_tokens": max_tokens // 2}`, or disabled when that turn's
+`max_tokens` is below 4096; the non-thinking variant is sent thinking disabled; a client's own `thinking` passes
+through. The #108 safety net (a thinking-only reply is an error, not an empty answer) still applies to both.
+
+### Sensitive requests
+
+The Pro's local models are uncensored ("abliterated") fine-tunes the owner runs himself, so work that cloud models
+refuse, red-teaming and sensitive topics may run there (owner decision 2026-11-13). A node opts in with a `sensitive`
+section in its `ollama` block; absent, the feature is off on that node:
+
+```json
+"sensitive": {"model": "qwen-27b",
+              "keywords_file": "~/.config/cortados/sensitive-keywords.txt",
+              "refusal_fallback": true}
+```
+
+`model` names one of the node's models (alias or tag). `keywords_file` is the keyword list's path on the provider host;
+`keywords_file_env` instead names an environment variable holding the path (it wins when set; named but unset, the
+keyword trigger logs a warning and matches nothing). `refusal_fallback` defaults to false. Unknown keys and wrong types
+are refused (`LocalConfigError`), as for `auto_route`.
+
+**Three triggers** (`routing.sensitive_local`, `routing.refusal_route`):
+
+1. **Explicit flag.** The request header `x-cortados-local: sensitive` (or `prefer`, "local if eligible": the same
+   rules, recorded as `local: prefer`), honoured on `/v1/messages` and `/v1/responses` and read for a new conversation
+   only. Any other value is a 400. The MCP tools send it: `route_task(…, local="sensitive")`, and
+   `start_task(…, local="sensitive")` makes every request of the child carry it (not with `chrome: true`: login mode is
+   not routed). A `sub/` pin ignores it (the person chose the model). A Claude Code session-wide toggle
+   (`/cortados-local prefer`) is a follow-up after branch `local-switch-remote`.
+2. **Keyword list.** One term or phrase per line, `#` comments and blank lines skipped (format:
+   `tables/sensitive-keywords.example.txt`). Matched case-insensitively (casefold) as whole words or phrases: a term
+   never matches inside a longer word, and a phrase's words may be separated by any whitespace. Only the **latest user
+   turn's text** is matched: client reminders (`<system-reminder>`) are removed first, tool results are not the person's
+   words, and the **system prompt is not matched**, because it is the client's fixed instructions plus project files
+   (CLAUDE.md), the same for every conversation of a project: one word there would send every conversation local.
+3. **Refusal fallback** (`refusal_fallback: true`). When the cloud model refuses the **opening turn** of an S1-routed
+   conversation on `/v1/messages`, the provider asks the node for a whole answer to the same request, sends the client
+   only that answer, and binds the conversation to the local model (later turns relay there after the continuation
+   re-check below). The
+   Claude bridge recognises a refusal from the Claude CLI's own markers: an assistant frame with `stop_reason:
+   "refusal"` or the `model_refusal_no_fallback` system event (the bridge passes no `--fallback-model`). The Codex
+   app-server has no refusal signal (a refused Codex turn completes like any other, with text), and guessing from the
+   text is not reliable, so Codex lanes have no refusal fallback. Not re-run, ever: a turn after client tools ran or
+   were requested (the request carries an assistant message or a tool result, or the refused reply holds a
+   `tool_use`), so a tool's effect never repeats. A refusal later in a conversation does not move it (hook
+   `HOOK(rebuild-on-409)` in `server.Handler._refusal_fallback`; follow-up once branch `rebuild-on-409`, which seeds a new
+   backend from the client's transcript, merges). If the node is unavailable or its answer fails, the refusal stands
+   and reaches the client unchanged. An answer counts only when it holds a non-blank text block or a valid tool call (a
+   tool the request declared, with an object input): a thinking-only reply, an empty `content` (e.g. `stop_reason:
+   "max_tokens"` after thinking) or only malformed tool calls is a failed answer, so the original refusal stands and
+   nothing is bound or recorded locally (`local_lane.complete`).
+
+A planned S1 "sensitive" signal plugs in at one place: `routing.S1_SENSITIVE_ANSWER` (None today) names the S1 answer
+key; once set, a request S1 marks is handled as trigger `s1` under exactly the rules below.
+
+**The outward-effect limit.** A sensitive request may go local in **any band**, but **only with no effect outside the
+machine**: S1 answered `outward: false` and `blast_radius` 0 ("words only, nothing changes") or 1 ("a bounded
+reversible workspace change") (`routing.LOCAL_BLAST_OK`). Level 2 ("a broad or difficult-to-reverse system change") is
+not bounded to the workspace and level 3 is where `core.resolve` floors every outward request, so neither goes local.
+A decision without these answers fails closed.
+
+**One shared gate: `routing.local_admission`.** Every AUTOMATIC move to a local lane passes the same function:
+
+    routing.local_admission(answers, band, degraded) -> (admitted: bool, reason: str)
+    routing.route_admission(route) -> (admitted, reason)   # the same, reading a route's decision/band/degraded
+
+Callers: `auto_local` (auto_route bands), `sensitive_local` (flag, prefer, keyword, the planned S1 signal),
+`refusal_route` (the refusal fallback, rechecked on the route's own decision even when the marker is there) and
+`continuation_admission` (below); branch `local-published-index`'s `_move_to_local` must call it too. It admits only
+when `degraded` is exactly `False`, `band` is a non-empty string, `answers["outward"]` is exactly `False` and
+`answers["blast_radius"]` is exactly an `int` (not a bool) equal to 0 or 1. Anything else is malformed and not admitted:
+`-1`, `False`, `True`, `1.9`, `1.0`, `"1"`, a missing key, `outward: null`. The reason is metadata only (it is what the
+log and the routes row say). Per-node checks stay with the caller: the node's auto_route band list, the wire, and
+`_node_why` (exclusion, availability, the model listed, the context fit).
+
+**Continuations of a local-bound conversation.** A conversation is routed once, and a conversation bound to a local
+lane by an automatic rule (auto_route, the sensitive flag / prefer / keyword, the refusal fallback) used to relay every
+later turn to the node unchecked, so "now email the signed invoice and mark it paid" after a harmless opening reached
+the node. Now every continuation of such a conversation is rescored by S1 before anything reaches the node
+(`server.Handler._local_continuation_refused` → `Registry.local_recheck` → `routing.continuation_admission` →
+`local_admission`, under the band the conversation was bound with). S1 scores the turn's own words (the latest user
+text, client reminders removed; on a tool-result turn with no words, the latest earlier user words), through
+`core.decide`: the same scorer call, timeout and retry as the opening's routing call, and its degraded result fails
+closed. To bound the added latency in a tool loop, an admission is reused for the same conversation and the same scored
+text for 180 s (`routing.CONTINUATION_CACHE_S`); a refusal is never cached. A turn that is not admitted (outward,
+blast_radius 2 or more, a degraded or failed scorer, missing or garbled answers, no user text at all, no checker
+configured) is refused with a terminal **400** (`x-should-retry: false`, `invalid_request_error`): the conversation is
+bound to a local model and this turn needs a cloud model; start a new conversation (routed again) or pin a cloud model.
+Nothing was sent, so the conversation is untouched: a later turn on the same history that passes the gate continues it.
+The log names the route id and the gate's reason only. **An explicit local pin** (`sub/<local model or alias>`, the
+client's own choice) is **not rescored**. Moving a refused conversation to a cloud lane mid-way is a separate feature
+(#43, re-route when the Pro is unplugged); its seam is `server.Handler._local_continuation_refused`. `core.resolve`'s hard rule (outward effects floor the blast radius to 3,
+strong cloud models) is untouched: an outward request is never moved, whatever the trigger.
+
+**Every local guard still applies.** A degraded scorer never routes local; the request must arrive on `/v1/messages`
+(the relay speaks Messages only; a `/v1/responses` request is logged and stays on S1's route); the client's
+`x-cortados-exclude-model` is honoured (an excluded sensitive model also turns the refusal fallback off); the node must
+answer its probe (on the Pro: AC power + manual switch + gate up) and list the model; the request must fit the model's
+`context_length`. A request that fails any check keeps S1's route, and the reason is logged. When a request moves, the
+routes row is rewritten under the same route_id as for auto-route, with a `sensitive: flag|keyword|refusal|s1` or
+`local: prefer` hard-rules entry. The sensitive check runs before auto-route; a request it does not move still goes
+through auto-route as before.
+
+**Privacy of the logs.** The provider log names only the rule (`sensitive: keyword`, `sensitive: flag`,
+`sensitive: refusal`, `local: prefer`), the route id, the node/model and a metadata reason. It never logs which keyword
+matched, the keyword list's contents or any request or reply text; an unreadable list is a warning naming the file only.
+(The routes row keeps the request text exactly as for every routed request: that is S1's training record, unchanged.)
+
+**Editing the keyword list on the Air.** The list lives on the provider host only (the repository is public;
+`tables/sensitive-keywords.txt` is git-ignored in case one is placed there by mistake). Edit the file the config names,
+e.g. `~/.config/cortados/sensitive-keywords.txt`, one term per line; keep it `chmod 600`. It is re-read when its
+modification time or size changes, so no provider restart is needed. Check a change by sending a test request and
+looking for `sensitive: keyword` in the provider log, or the hard-rules entry in router.db's routes table.
 
 **Exposure and the local gate.** Ollama has no authentication: anyone who reaches its port can run, pull or delete
 models. So Ollama listens on `127.0.0.1:11434` only (its default; leave `OLLAMA_HOST` unset), and the one door from the

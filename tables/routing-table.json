@@ -599,6 +599,7 @@
   "expiring_credit_points": 80,
   "_cost": "cost = weight + scarcity_points × max(scarcity,0) − expiring_credit_points × max(−scarcity,0) − capacity credit. weight = BURN: model $/1M ÷ learned pool size (tokens per % of the pool's window), normalised to 100 for the heaviest candidate (Forest 2026-09-29: pools differ ~10× in size, so price alone under-charged Claude). Falls back to price-only for pools without a learned size.",
   "r0": "R0 is scored too: requirement 0, so the cheapest route wins; that is local unless a subscription window is about to expire unused.",
+  "_local": "Owner 2026-11-13: local models are placed by a published proxy index (tables/local-models.json → model-scores.generated.json local_models), by the provider after this selection (provider/routing.py index_local): a variant whose use-case index clears required_index takes the request unless its node is busy or unavailable, because a local lane spends no quota; never outward, blast-radius-3, R3/R4 or degraded work. This holds also against a window about to expire unused (the r0 note above describes core's own ranking, where no local route is offered).",
   "same_price_band": 20,
   "_same_price_band": "within one lane+pool, models whose general index is within this many points are the same price class: only the strongest of them is a candidate (Gemini 3.8 Flash over 3.6 Flash; Opus and Sonnet stay separate)",
   "_lane_tiebreak": "equal cost → this order: local first (a tie at R0 is the reflex case), then the lane whose pool is least fought over",
