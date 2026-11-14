@@ -621,6 +621,84 @@ class DeadlineCallTests(unittest.TestCase):
         self.assertEqual(len(seen), 1)
 
 
+class DeadlineConnectTests(unittest.TestCase):
+    """deadline_call bounds name resolution and every connection attempt by the same absolute deadline (review fix:
+    socket timeouts bound neither getaddrinfo nor the sum of attempts over several resolved addresses)."""
+
+    BUDGET, SLACK = 0.2, 0.15
+
+    def call(self, host, **kw):
+        import http.client
+        seen = []
+        start = time.monotonic()
+        with self.assertRaises(OSError):
+            local_gate.deadline_call(http.client.HTTPConnection(host, 9), self.BUDGET, "GET", "/", max_bytes=10,
+                                     on_connect_error=seen.append, **kw)
+        self.assertEqual(len(seen), 1)
+        return time.monotonic() - start
+
+    def test_stalled_resolver_gives_up_at_the_deadline(self):
+        real = socket.getaddrinfo
+
+        def slow(*a, **k):
+            time.sleep(1.0)
+            return real("127.0.0.1", 9, 0, socket.SOCK_STREAM)
+
+        with patch.object(socket, "getaddrinfo", slow):
+            took = self.call("gate.example.invalid")
+        self.assertLess(took, self.BUDGET + self.SLACK)
+
+    def test_connect_s_caps_resolution_too(self):
+        with patch.object(socket, "getaddrinfo", lambda *a, **k: time.sleep(1.0) or []):
+            took = self.call("gate.example.invalid", connect_s=0.05)
+        self.assertLess(took, 0.05 + self.SLACK)
+
+    def test_several_addresses_share_one_budget(self):
+        attempts = []
+
+        class Blackhole:
+            def __init__(self, *a):
+                self.t = None
+
+            def settimeout(self, t):
+                self.t = t
+
+            def connect(self, sa):
+                attempts.append(self.t)
+                time.sleep(self.t)
+                raise TimeoutError("timed out")
+
+            def close(self):
+                pass
+
+        infos = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (f"100.64.0.{i}", 9)) for i in range(1, 6)]
+        with patch.object(socket, "getaddrinfo", lambda *a, **k: infos), \
+                patch.object(local_gate, "_new_socket", Blackhole):
+            took = self.call("gate.example.invalid")
+        self.assertLess(took, self.BUDGET + self.SLACK)
+        self.assertGreaterEqual(len(attempts), 1)
+        self.assertLess(len(attempts), len(infos))                  # the later addresses were never tried
+        self.assertLessEqual(sum(attempts), self.BUDGET + 0.01)      # each attempt got only the time left
+
+    def test_numeric_host_is_not_resolved(self):
+        import http.client
+        ollama = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllamaPs)
+        threading.Thread(target=ollama.serve_forever, daemon=True).start()
+        self.addCleanup(ollama.server_close)
+        self.addCleanup(ollama.shutdown)
+        FakeOllamaPs.loaded, FakeOllamaPs.ps_status = [TAG], 200
+
+        def refuse(*a, **k):
+            raise AssertionError("getaddrinfo called for a numeric host")
+
+        with patch.object(socket, "getaddrinfo", refuse):
+            status, _ = local_gate.deadline_call(http.client.HTTPConnection("127.0.0.1", ollama.server_port), 5,
+                                                 "GET", "/api/ps", max_bytes=1 << 20)
+            self.assertEqual(status, 200)
+            for host in ("100.64.0.1", "::1"):
+                self.assertEqual(local_gate._resolve_by(host, 9, time.monotonic() + 1)[0][4][:2], (host, 9))
+
+
 class TrickleTimeoutTests(Home):
     """The gate's /api/ps read and the provider's gate call keep their whole-call bounds against a trickling peer."""
 

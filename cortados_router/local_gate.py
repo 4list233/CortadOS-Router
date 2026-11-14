@@ -159,11 +159,76 @@ class _DeadlineReader(io.RawIOBase):
         super().close()
 
 
+_new_socket = socket.socket                      # the one seam the multi-address test replaces
+
+
+def _resolve_by(host: str, port: int, end: float) -> list:
+    """getaddrinfo results for (host, port) as stream sockets, given up at the monotonic `end` (TimeoutError).
+    A numeric IP is never resolved. getaddrinfo itself takes no timeout, so a name is resolved in a daemon thread that
+    is left to finish on its own when the deadline passes (it holds nothing but its own result)."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None:                      # "fe80::1%en0" (a scope id) is not parsed here on 3.9 and is resolved below
+        if ip.version == 4:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (host, port))]
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 0, "", (host, port, 0, 0))]
+    box: dict = {}
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            box["infos"] = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        except BaseException as exc:            # handed to the caller; nothing escapes the thread
+            box["exc"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=run, name="deadline-resolve", daemon=True).start()
+    if not done.wait(max(0.0, end - time.monotonic())):
+        raise TimeoutError("name resolution did not finish before the deadline")
+    if "exc" in box:
+        raise box["exc"]
+    return box["infos"]
+
+
+def _connect_by(address: tuple, connect_end: float, end: float, source_address=None) -> socket.socket:
+    """socket.create_connection with one absolute deadline: name resolution and every connection attempt share the
+    time left before `connect_end`, and no attempt starts once it has passed. The connected socket's timeout is the
+    time left before `end` (a TLS handshake that follows waits no longer than the call has left)."""
+    host, port = address[0], address[1]
+    last: OSError | None = None
+    for family, type_, proto, _, sockaddr in _resolve_by(host, port, connect_end):
+        left = connect_end - time.monotonic()
+        if left <= 0:
+            break
+        sock = _new_socket(family, type_, proto)
+        try:
+            sock.settimeout(left)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+        except OSError as exc:
+            sock.close()
+            last = exc
+            continue
+        left = end - time.monotonic()
+        if left <= 0:
+            sock.close()
+            break
+        sock.settimeout(left)
+        return sock
+    if last is not None and time.monotonic() < connect_end:
+        raise last
+    raise TimeoutError("connect did not finish before the deadline")
+
+
 def deadline_call(conn: http.client.HTTPConnection, deadline_s: float, method: str, path: str, *,
                   body: bytes | None = None, headers: dict[str, str] | None = None, max_bytes: int,
                   connect_s: float | None = None, on_connect_error=None) -> tuple[int, bytes]:
-    """One HTTP request on an unconnected `conn` within `deadline_s` seconds END TO END: the connect (also capped at
-    `connect_s`), the request, the status line and headers and the body all share one monotonic deadline, each wait
+    """One HTTP request on an unconnected `conn` within `deadline_s` seconds END TO END: the connect (name resolution
+    and every address tried, together also capped at `connect_s`; a numeric IP is not resolved), the request, the status line and headers and the body all share one monotonic deadline, each wait
     given only the time left. The body is read incrementally, at most `max_bytes` (the rest is left unread).
     (status, body bytes); OSError (TimeoutError past the deadline) or http.client.HTTPException otherwise. A connect
     failure is passed to `on_connect_error(exc)` first when given, so a caller can tell "not reachable" from "did not
@@ -172,8 +237,15 @@ def deadline_call(conn: http.client.HTTPConnection, deadline_s: float, method: s
     accepted, after the request line and headers were read). This is the CLIENT side: the connect, our request, the
     status line and headers and then the body all share the one deadline, through _DeadlineSocket under http.client's
     own reader, which a body-only reader on a raw rfile cannot cover."""
-    end = time.monotonic() + deadline_s
-    conn.timeout = max(0.001, min(deadline_s, connect_s if connect_s is not None else deadline_s))
+    start = time.monotonic()
+    end = start + deadline_s
+    connect_end = start + min(deadline_s, connect_s if connect_s is not None else deadline_s)
+    conn.timeout = max(0.001, connect_end - start)
+    # http.client's connect (and HTTPSConnection's, which wraps the result in TLS) opens the socket through this
+    # per-instance hook; socket.create_connection would resolve without any timeout and give EVERY resolved address a
+    # full timeout, so a stalled resolver or a dead multi-address name could hold the call far past the deadline.
+    conn._create_connection = lambda address, timeout=None, source_address=None: _connect_by(
+        address, connect_end, end, source_address)
     try:
         conn.connect()
     except (OSError, http.client.HTTPException) as exc:
