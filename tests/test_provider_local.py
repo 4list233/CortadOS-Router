@@ -45,6 +45,7 @@ class FakeOllama(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    reply = None                # (content, stop_reason): answered as is, before every other rule
     thinker = None              # "ollama" / "ignores-disabled": answer as a thinking model does (#108)
     mode = "ok"                 # "truncated" / "stalled": a broken error body (review round 2, item 4)
     error_body = None           # bytes: answer every POST with this 400 body
@@ -79,7 +80,9 @@ class FakeOllama(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(raw)
             return
-        if body.get("tools"):
+        if FakeOllama.reply is not None:                # a test-set (content, stop_reason), e.g. an empty answer
+            content, stop = FakeOllama.reply
+        elif body.get("tools"):
             content = [{"type": "tool_use", "id": f"toolu_{uuid.uuid4().hex[:8]}", "name": body["tools"][0]["name"],
                         "input": {"path": "x"}}]
             stop = "tool_use"
@@ -155,6 +158,7 @@ class LocalHarness(EndpointHarness):
         threading.Thread(target=self.ollama.serve_forever, daemon=True).start()
         FakeOllama.seen = []
         FakeOllama.thinker = None
+        FakeOllama.reply = None
         self._env = os.environ.get(local_lane.CONFIG_ENV)
         os.environ[local_lane.CONFIG_ENV] = write_config(self.scratch, f"http://127.0.0.1:{self.ollama.server_port}")
         self._keep = (core.STATE, core.lane_health, core.decide)

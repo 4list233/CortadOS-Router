@@ -17,12 +17,13 @@
      "ollama": {"_comment": "Local models live on the Pro only (#75; owner 2026-11-13: the Studio runs S1, no chat models). The URL is the Pro's local gate (http://<pro tailscale-ip>:11435), from the env var named here (or base_url); the token file path likewise. Never commit a real address or token. The gate refuses on battery or with the manual switch off (local_resources toggle), and the lane is skipped then. The models are the ones already on the Pro (owner 2026-11-13: nothing is downloaded for the router). auto_route (the manual band rule) stays false: superseded by the published proxy index (owner 2026-11-13), which offers Qwen27b_heretic wherever its index qualifies (index_route, default true; max_inflight, default 1, makes the node busy; docs/LOCAL-RESOURCES.md, Local models in selection). A config that still sets auto_route keeps working; it is checked first. context_length must not exceed the Pro's OLLAMA_CONTEXT_LENGTH. Each model may set thinking: \"off-unless-asked\" (the default: a request that did not ask for thinking is sent with thinking disabled, #108) or \"passthrough\".",
                 "base_url_env": "CORTADOS_LOCAL_PRO_OLLAMA_URL", "token_file_env": "CORTADOS_LOCAL_PRO_GATE_TOKEN_FILE",
                 "label": "Pro", "auto_route": false,
+                "sensitive": {"_comment": "Sensitive requests (docs/LOCAL-RESOURCES.md, Sensitive requests): x-cortados-local: sensitive|prefer, a match in the keyword list, or (refusal_fallback) a cloud refusal of an opening turn may run on this model in any band, only with no effect outside the machine. Absent = off. The keyword list lives on the provider host only (format: tables/sensitive-keywords.example.txt); never commit real terms. keywords_file_env, when set, names an env var holding the path instead.", "model": "qwen-27b", "keywords_file": "~/.config/cortados/sensitive-keywords.txt", "refusal_fallback": true},
                 "probe_timeout_s": 2, "connect_timeout_s": 3, "read_timeout_s": 300,
                 "models": [
-                  {"id": "Qwen27b_heretic", "alias": "qwen-27b", "name": "Qwen3.8 27B Heretic (Q4_K_M, 16 GB)", "context_length": 65536, "thinking": "off-unless-asked"},
-                  {"id": "Huihui_Qwen_9b", "alias": "qwythos-9b", "name": "Huihui Qwythos 9B (Q6_K, 7.6 GB)", "context_length": 65536},
-                  {"id": "Huihui_Qwen3.8", "alias": "qwen-abliterated", "name": "Huihui Qwen3.8 Abliterated (17 GB)", "context_length": 65536},
-                  {"id": "Phi_4", "alias": "phi-4", "name": "Phi-4 Heretic (Q4_K_M, 9.1 GB)", "context_length": 65536}
+                  {"id": "Qwen27b_heretic", "alias": "qwen-27b", "name": "Qwen3.8 27B Heretic (Q4_K_M, 16 GB)", "context_length": 131072, "thinking": "off-unless-asked"},
+                  {"id": "Huihui_Qwen_9b", "alias": "qwythos-9b", "name": "Huihui Qwythos 9B (Q6_K, 7.6 GB)", "context_length": 131072},
+                  {"id": "Huihui_Qwen3.8", "alias": "qwen-abliterated", "name": "Huihui Qwen3.8 Abliterated (17 GB)", "context_length": 131072},
+                  {"id": "Phi_4", "alias": "phi-4", "name": "Phi-4 Heretic (Q4_K_M, 9.1 GB)", "context_length": 131072}
                 ]}}
   ],
   "deployments": []

@@ -924,7 +924,7 @@ def _start_where() -> str:
 
 def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=None, allowed_tools=None,
            provider_url="", token_file=None, chrome=False, red=None, connectors=None, client=None,
-           title=None, session_tag=None, repo=None, branch=None, host=None, parent_task_id=None,
+           title=None, session_tag=None, repo=None, branch=None, host=None, parent_task_id=None, local=None,
            origin=None) -> dict:
     """`client` (optional, e.g. "grokbot" from the bot gateway) is recorded in meta.json and every event line, so usage
     can be attributed to the caller. `red` carries the launch credentials (env token and token file's token as they are now). `permission_mode`
@@ -933,8 +933,10 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
     requests. `host` names the execution host (default: the configured default); `cwd` an existing directory THERE,
     or `repo` [+ `branch`] a workspace the host prepares (neither: a plain folder under the host's active/).
     `parent_task_id` (else CORTADOS_PARENT_TASK_ID) names the task that started this one, for the run export (#91);
-    none known is recorded as an explicit missing parent. `origin` ({session, project, device}, subagent_mcp.task_origin)
-    names the main session that started it: meta.json's `origin` and every event's origin_* fields (clean_origin)."""
+    none known is recorded as an explicit missing parent. `local` (session.LOCAL_MODES) makes every request of the
+    child carry x-cortados-local (the provider's sensitive-request routing); login mode (chrome) is not routed, so the
+    two are refused together. `origin` ({session, project, device}, subagent_mcp.task_origin) names the main session
+    that started it: meta.json's `origin` and every event's origin_* fields (clean_origin)."""
     if os.environ.get(NESTED_ENV):
         raise TaskError("start_task is not available inside a child task: children may not start children "
                         "(unbounded fan-out would spend subscription quota unattended)")
@@ -942,6 +944,13 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
     parent_id, parent_note = resolve_parent(parent_task_id)
     if not isinstance(chrome, bool):
         raise TaskError("chrome must be true or false")
+    if local in ("", None):
+        local = None
+    elif local not in session.LOCAL_MODES:
+        raise TaskError(f"local must be one of {', '.join(session.LOCAL_MODES)}")
+    elif chrome:
+        raise TaskError("local is not used with chrome: true (login mode is not routed, so no request could go local); "
+                        "omit one of them")
     if host is not None and not isinstance(host, str):
         raise TaskError("host must be the name of a configured execution host, or 'here' for this machine")
     target = _resolve_host(host)
@@ -970,7 +979,7 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
                 "title": start_red.text(title) if isinstance(title, str) else title,
                 "session_tag": session_tag, "repo": repo, "branch": branch,
                 "parent_task_id": parent_id,   # resolved here: the host's own env does not know this session
-                "origin": origin}
+                "origin": origin, **({"local": local} if local else {})}
         progress["launched"] = "maybe"         # from here the request may reach the host and launch a child
         try:
             out = _remote(target.name, "start", args)
@@ -1006,6 +1015,11 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
                             "the remote task was cancelled") from None
         out["host"] = target.name
         out["watch_command"] = watch_command(tid)   # THIS machine's command (the host's own, if any, is not ours)
+        if local and out.get("local") != local:
+            # An execution host on an older checkout ignores the option it does not know: say so, never imply it held.
+            out.setdefault("warnings", []).append(
+                f"execution host {target.describe()} did not confirm local: {local} (an older cortados-router checkout "
+                "there?); the child's requests may not carry x-cortados-local. Update the checkout on that host.")
         return out
     task_id = _new_id()
     ws_spec = _workspace_request(task_id, cwd, repo, branch, target)   # validated before anything is created
@@ -1071,7 +1085,8 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
         meta, env, cmd = _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file,
                                   start_red,
                                   chrome, max_s, exe, selected, login, office,
-                                  workspace=ws_spec, ws_root=target.root, host_name=target.name, launchd=launchd)
+                                  workspace=ws_spec, ws_root=target.root, host_name=target.name, launchd=launchd,
+                                  local=local)
         # Again with the child's launch env known: its credentials are the ones the export is checked against.
         launch_red = _start_redactor(red, env)
         _refuse_credentials(launch_red, caller_fields)
@@ -1096,6 +1111,8 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
             meta["launch_warning"] = launch_warning
         # For the run export (#91): the task that started this one (or why none is known), and the Office title.
         meta["parent_task_id"] = parent_id
+        if local:
+            meta["local"] = local
         if parent_note:
             meta["parent_note"] = parent_note
         if office.get("title"):
@@ -1171,6 +1188,8 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
     if login:
         out.update(lane=LOGIN_LANE, model=login, chrome_queue="chrome tasks run one at a time on this host; this one "
                    "waits for the Chrome lock while another browser task runs (task_status shows phase 'queued')")
+    if local:
+        out["local"] = local
     if mode_note:
         out["permission_mode_note"] = mode_note
     if launch_warning:
@@ -1282,7 +1301,8 @@ def _run_spec(cwd, max_s, meta, workspace=None, ws_root=None, launchd=False, chr
 
 
 def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file, red, chrome, max_s,
-             exe, selected=None, login=None, office=None, workspace=None, ws_root=None, host_name=None, launchd=False):
+             exe, selected=None, login=None, office=None, workspace=None, ws_root=None, host_name=None, launchd=False,
+             local=None):
     """Everything before the spawn: settings, prompt, cmd.json, meta.json. Returns (meta, env, cmd)."""
     os.chmod(d, 0o700)                          # mkdir's mode is masked by umask; the launcher verifies exactly 0700
     if login:
@@ -1294,6 +1314,8 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
         launch += ["--token-file", token_file]
     for k, v in (office or {}).items():         # validated by office_tags; session.py checks them again
         launch += ["--office-header", f"{_OFFICE_HEADER_OF[k]}: {v}"]
+    if local:                                   # validated by _start; session.py checks it again
+        launch += ["--local", local]
     # Never the whole-session ORCHESTRATOR directive or its delegation gate, whatever the orchestrator: a child is the
     # delegate and does the work itself (CHILD_DIRECTIVE). A pinned orchestrator only pins the child's main model; its
     # native subagents are still routed by S1 (CLAUDE_CODE_SUBAGENT_MODEL).
@@ -3674,7 +3696,7 @@ def serve_remote(stdin=None, stdout=None) -> int:
                         args.get("chrome", False), red, args.get("connectors"), client=args.get("client"),
                         title=args.get("title"), session_tag=args.get("session_tag"), repo=args.get("repo"),
                         branch=args.get("branch"), host=host.name, parent_task_id=args.get("parent_task_id"),
-                        origin=args.get("origin"))
+                        local=args.get("local"), origin=args.get("origin"))
         elif op == "status":
             out = status(args.get("task_id"), red, url, token)
         elif op == "wait":

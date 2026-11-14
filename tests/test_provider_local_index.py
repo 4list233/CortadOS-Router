@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 import uuid
 from pathlib import Path
@@ -18,6 +19,9 @@ from cortados_router import core
 from cortados_router.provider import local_lane, routing
 from tests.test_provider_local import FakeOllama, LocalHarness, TAG, write_config
 from tests.test_provider_local_auto import AutoLocalBase, S1_ROUTE, body
+from tests.test_provider_sensitive import OUTWARD_TEXT, ContinuationRecheckBase
+from tests.test_provider_sensitive import write_config as write_sensitive_config
+from cortados_router.provider import server
 
 ROOT = Path(__file__).resolve().parent.parent
 PROV = "proxy: published base model, −10%"
@@ -29,10 +33,13 @@ SCORES = {"models": [], "local_models": [NON, THINK]}
 
 
 def scored_route(req, *, band="R1", use_case="code", outward=False, blast=1, cost=12.5):
-    """S1's execution route as select returns it: core.resolve's output under `route`, with the required index."""
+    """S1's execution route as select returns it: core.resolve's output under `route`, with the required index, and
+    S1's raw answers under `decision` (what the shared gate, routing.route_admission, reads)."""
     answers = {"outward": outward, "work_kind": use_case}
     chosen = {"lane": "codex", "provider": "codex-cli", "model": "gpt-5.6-terra", "use_case": use_case, "cost": cost}
-    return {**S1_ROUTE, "band": band,
+    decision = {**S1_ROUTE["decision"], "answers": {**S1_ROUTE["decision"]["answers"], "outward": outward,
+                                                    "blast_radius": blast, "work_kind": use_case}}
+    return {**S1_ROUTE, "band": band, "decision": decision,
             "route": {**S1_ROUTE["route"], "band": band, "chosen": chosen, "required_index": req, "answers": answers,
                       "features": {"blast_radius": blast}}}
 
@@ -139,6 +146,24 @@ class HardRuleTests(IndexBase):
         self.assertS1Route(self.choose())
         self.assertEqual(self.probes, [])
 
+    def test_garbled_or_blast_two_answers_never_run_local(self):
+        # The shared gate (routing.local_admission) takes only outward exactly False and blast_radius exactly 0 or 1.
+        for outward, blast in ((None, 1), ("false", 1), (False, 2), (False, True), (False, "1"), (False, 1.0)):
+            self.assertS1Route(self.route(0.0, outward=outward, blast=blast))
+        self.assertEqual(self.probes, [])
+
+    def test_gate_is_applied_at_the_move_itself(self):
+        # _move_to_local runs route_admission again: a caller that skipped index_local's early check still cannot move
+        # an outward decision.
+        node = local_lane.nodes()[0]
+        entry = node["models"][0]
+        r = scored_route(0.0, outward=True)
+        got = routing._move_to_local(core, body(), r, node, entry, client="test", conversation_id="c", rule="test")
+        self.assertIs(got, r)
+        ok = scored_route(0.0)
+        self.assertEqual(routing._move_to_local(core, body(), ok, node, entry, client="test", conversation_id="c",
+                                                rule="test")["provider"], "local-pro")
+
     def test_responses_wire_and_exclusion_keep_s1_route(self):
         self.selected = scored_route(0.0)
         self.assertS1Route(self.choose(body(**{routing.NO_LOCAL_KEY: True})))
@@ -167,6 +192,46 @@ class AvailabilityTests(IndexBase):
         cfg["nodes"][0]["ollama"]["max_inflight"] = 2
         Path(os.environ[local_lane.CONFIG_ENV]).write_text(json.dumps(cfg))
         local_lane._inflight["pro"] = 1
+        self.assertEqual(self.route(14.0)["provider"], "local-pro")
+
+    def test_max_inflight_three_allows_three_concurrent_relays_and_the_fourth_goes_cloud(self):
+        # max_inflight is the node's config value (default 1; a benchmark measures the real limit): with 3, the node
+        # takes a new conversation while 0, 1 or 2 turns are relayed through local_lane.serve, and not with 3.
+        cfg = json.loads(Path(os.environ[local_lane.CONFIG_ENV]).read_text())
+        cfg["nodes"][0]["ollama"]["max_inflight"] = 3
+        Path(os.environ[local_lane.CONFIG_ENV]).write_text(json.dumps(cfg))
+        node = local_lane.nodes()[0]
+        self.assertEqual(node["max_inflight"], 3)
+        release, entered = threading.Event(), threading.Semaphore(0)
+        real_serve = local_lane._serve
+
+        def held(*a, **k):                                  # a relayed turn that stays in flight until released
+            entered.release()
+            release.wait(10)
+            return "completed"
+
+        local_lane._serve = held
+        threads = []
+        try:
+            for n in range(3):
+                self.assertEqual(local_lane.inflight(node), n)
+                self.assertEqual(self.route(14.0)["provider"], "local-pro", f"{n} in flight of 3")
+                t = threading.Thread(target=local_lane.serve, args=(None, body(), node, node["models"][0]),
+                                     kwargs={"echo_model": "cortados"}, daemon=True)
+                t.start()
+                threads.append(t)
+                self.assertTrue(entered.acquire(timeout=5))
+            self.assertEqual(local_lane.inflight(node), 3)
+            self.logged.clear()                             # the three moves' rows; the fourth must write none
+            with self.assertLogs(routing.logger, level="INFO") as cm:
+                self.assertS1Route(self.route(14.0))        # the fourth: cloud
+            self.assertTrue(any("node busy (3 turn(s) in flight, max_inflight 3)" in m for m in cm.output))
+        finally:
+            release.set()
+            for t in threads:
+                t.join(5)
+            local_lane._serve = real_serve
+        self.assertEqual(local_lane.inflight(node), 0)
         self.assertEqual(self.route(14.0)["provider"], "local-pro")
 
     def test_model_not_listed_or_too_large_keeps_s1_route(self):
@@ -287,6 +352,55 @@ class IndexEndToEndTests(LocalHarness):
         self.assertEqual(sent["thinking"], {"type": "enabled", "budget_tokens": 4096})
         self.assertEqual(got["content"][-1], {"type": "text", "text": "42"})
         self.assertEqual(local_lane._inflight, {})
+
+
+class IndexBoundContinuationTests(ContinuationRecheckBase):
+    """A conversation the index route moved to the local lane is an AUTOMATIC bind (its route is not `pinned`), so every
+    later turn takes local-sensitive's re-check (server.Handler._local_continuation_refused → continuation_admission):
+    an outward continuation is refused with the terminal 400 before it reaches the node; a safe one is relayed."""
+
+    BAND = "R1"
+
+    def setUp(self):
+        super().setUp()
+        # No manual auto_route and no sensitive section: only the index route can bind the conversation locally.
+        write_sensitive_config(self.scratch, f"http://127.0.0.1:{self.ollama.server_port}", auto_route=False)
+        self._scores = core.model_scores
+        core.model_scores = lambda: json.loads(json.dumps(SCORES))
+        selected = scored_route(14.0)                     # qwen-27b's code index 15.1 clears it at max_tokens 64
+        routing.execution_routing.select = lambda core_, **kw: json.loads(json.dumps(
+            {**selected, "route_id": "execution:provider:call:" + uuid.uuid4().hex[:8]}))
+        local_lane._inflight.clear()
+
+    def tearDown(self):
+        core.model_scores = self._scores
+        local_lane._inflight.clear()
+        super().tearDown()
+
+    def assertIndexBound(self):
+        (s,) = self.reg.sessions.values()
+        self.assertIsInstance(s, server.LocalSession)
+        route = s.route
+        self.assertFalse(route.get("pinned"))
+        self.assertEqual(route["local"]["model"]["variant"], "qwen-27b")
+        self.assertTrue(route["route"]["chosen"]["proxy"])
+        self.assertTrue(any(h.startswith("local index route:") for h in route["route"]["hard_rules"]))
+
+    def test_outward_continuation_of_an_index_bound_conversation_is_refused_json(self):
+        self.assertRefusedOutward(stream=False)
+        self.assertIndexBound()
+
+    def test_outward_continuation_of_an_index_bound_conversation_is_refused_streaming(self):
+        self.assertRefusedOutward(stream=True)
+        self.assertIndexBound()
+
+    def test_safe_continuation_of_an_index_bound_conversation_reaches_the_node(self):
+        first, got = self.open()
+        self.assertIndexBound()
+        got2 = self.post(self.follow(first, got, "now list the headings"))
+        self.assertEqual(got2["content"][0]["type"], "tool_use")
+        self.assertEqual(len(self.node_posts()), 2)
+        self.assertEqual(self.scored, ["now list the headings"])
 
 
 class BuilderTests(unittest.TestCase):

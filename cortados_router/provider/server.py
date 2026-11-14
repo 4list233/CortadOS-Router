@@ -344,6 +344,18 @@ def _min_left_header(headers) -> tuple[float | None, bool]:
     return (v, True) if 0.0 <= v <= 100.0 else (None, False)
 
 
+_LOCAL_BAD = "cortados: x-cortados-local must be `sensitive` or `prefer`"
+
+
+def _local_header(headers) -> tuple[str | None, bool]:
+    """(mode, valid) of the x-cortados-local header (routing.LOCAL_MODES, case-insensitive); (None, True) when absent
+    or empty. Read for a new conversation only: the route is chosen once per conversation."""
+    raw = (headers.get(routing.LOCAL_HEADER) or "").strip().lower()
+    if not raw:
+        return None, True
+    return (raw, True) if raw in routing.LOCAL_MODES else (None, False)
+
+
 # Request header naming the client's run (the routed-subagents mod runs each subagent as a headless `claude -p`, whose
 # JSON output names only `cortados`): every routed request of the run is recorded under it, and
 # GET /v1/cortados/runs/<id> tells the client which model really ran (to label it, and to keep a later review off it).
@@ -680,6 +692,16 @@ class Registry:
         # floor_release(rid) -> bool: refunds a floor_search reservation whose search CLI failed to start (a reservation
         # only counts once the run started). None: nothing to refund with; the row ages out as before, logged.
         self.floor_release: Callable[[str], bool] | None = None
+        # refusal_route(body, route, run) -> moved route or None: the refusal fallback's re-route of a refused opening
+        # turn to a node's sensitive model (routing.refusal_route). None: no fallback (a fixed-model endpoint).
+        self.refusal_route: Callable[[dict, dict | None, Callable[[dict], bool]], dict | None] | None = None
+        # local_recheck(body, route) -> (admitted, metadata reason): S1 rescores a continuation of a conversation an
+        # AUTOMATIC rule bound to a local lane (routing.continuation_admission, which applies routing.local_admission).
+        # None: such a continuation cannot be checked and is refused (fails closed). Explicit local pins never use it.
+        self.local_recheck: Callable[[dict, dict], tuple[bool, str]] | None = None
+        # log_tokens(route_id, usage, office session tag or None): one backend turn's tokens onto its route's row
+        # (core.log_tokens). None: tokens are not recorded (fixed-model endpoint, tests).
+        self.log_tokens: Callable[[str, dict, str | None], Any] | None = None
         self._factories = SESSION_FACTORIES if session_factories is None else session_factories
         self._lock = threading.Lock()
         # Orders a conversation's backend-exit Office transition against its requests' turn-end writes, so the exit's
@@ -774,6 +796,26 @@ class Registry:
     def release_opening(self) -> None:
         with self._lock:
             self._opening -= 1
+
+    def rebind_local(self, old, turn: anthropic_wire.ClientTurn, route: dict):
+        """Bind a conversation whose opening turn a cloud model refused to the local route the refusal fallback chose:
+        a LocalSession (continued by the same reply fingerprints, so the client's next turn finds it) takes the old
+        session's place, and the old backend is closed. Its exit is not an unexpected exit: the session is already out
+        of the registry when it ends, so _backend_exited ignores it."""
+        new = self._new(turn, keep=True, route=route, scope=getattr(old, "scope", None),
+                        wire_path=getattr(old, "wire_path", None))
+        new.history = list(old.history)
+        if getattr(old, "office_worker", None):
+            new.office_worker = old.office_worker
+        with self._lock:
+            if self.sessions.get(old.id) is old:
+                del self.sessions[old.id]
+            self.sessions[new.id] = new
+        try:
+            old.close()
+        except Exception as exc:                        # the conversation has moved on; only the old backend leaked
+            logger.warning("refusal fallback: closing the refused backend failed: %s", type(exc).__name__)
+        return new
 
     def route_new(self, body: dict, client: str, **kwargs) -> dict:
         """Reserve a held-session slot before routing can reserve a quota-floor turn."""
@@ -1630,6 +1672,112 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             session.lock.release()
 
+    def _local_continuation_refused(self, session: "LocalSession", body: dict[str, Any], wire: Wire) -> bool:
+        """The continuation re-check (docs/LOCAL-RESOURCES.md "Continuations of a local-bound conversation"): a
+        conversation an AUTOMATIC rule bound to a local lane (auto_route, the published-index route, the sensitive flag /
+        prefer / keyword, the refusal fallback; route not `pinned`) is rescored by S1 on every later turn (Registry.local_recheck →
+        routing.continuation_admission → routing.local_admission) before anything reaches the node. An explicit local
+        pin (`sub/<local model or alias>`) is the client's own choice and is not rescored.
+
+        Not admitted (an outward effect, blast_radius 2 or more, a degraded scorer, missing or malformed answers, no
+        checker): the turn is refused with a terminal 400 (`x-should-retry: false`) telling the client the conversation
+        is local-bound and this turn needs a cloud model. Nothing was sent, so the conversation is untouched: its
+        history is what it was, and a later turn with that same history that passes the gate continues it. Logs the
+        route id and the gate's metadata reason only, never the request text. Returns True when it answered (refused).
+
+        SEAM(#43): moving the conversation to a cloud lane mid-way (re-route when the Pro is unplugged) would replace
+        this refusal with a rebind; not built here."""
+        route = getattr(session, "route", None) or {}
+        if route.get("pinned"):
+            return False
+        rid = route.get("route_id")
+        reg = self.server.registry
+        if reg.local_recheck is None:
+            ok, why = False, "this endpoint has no continuation re-check (fixed model)"
+        else:
+            try:
+                ok, why = reg.local_recheck(wire.routing_body(body), route)
+            except Exception as exc:                    # a checker bug fails closed, as a degraded scorer does
+                logger.exception("local continuation re-check failed for %s", rid)
+                ok, why = False, f"the re-check failed ({type(exc).__name__})"
+        if ok is True:
+            logger.info("local continuation admitted for %s: %s", rid, why)
+            return False
+        logger.warning("local continuation refused for %s: %s", rid, why)
+        self._note_refusal(400, "invalid_request_error",
+                           reason="a turn of a local-bound conversation failed the local admission gate")
+        self._json(400, wire.error_json(
+            "invalid_request_error",
+            "cortados: this conversation is bound to a local model on this machine, and this turn may have an effect "
+            "outside it (or could not be checked), so it needs a cloud model; it was not sent. Start a new "
+            "conversation (it is routed again) or pin a cloud model with sub/<model>."),
+            headers={"x-should-retry": "false"})
+        return True
+
+    def _refusal_fallback(self, session, turn, body: dict[str, Any], result, *, created: bool, one_shot: bool,
+                          wire: Wire):
+        """The refusal fallback (docs/LOCAL-RESOURCES.md "Sensitive requests"): when the cloud backend refused this
+        turn (stop "refusal"; only the Claude bridge reports one, the Codex app-server has no refusal signal), re-run it
+        on a node's sensitive model and bind the conversation there. Returns (session, local result) or None (the
+        refusal stands and goes to the client as it is). Only the OPENING turn of a conversation on /v1/messages, and
+        only when no client tool has run: a request carrying an assistant message or a tool result, or a refused reply
+        holding a tool_use, is never re-run, so a tool's effect can never repeat. Eligibility of the request itself (no
+        outward effect, scorer not degraded, exclusions) was settled when it was routed (routing.sensitive_local);
+        routing.refusal_route rechecks the node and rewrites the routes row only once the local answer exists. Logs the
+        rule and metadata reasons only, never the request or the reply."""
+        blocks, stop, _usage = result
+        if stop != "refusal":
+            return None
+        reg = self.server.registry
+        route = getattr(session, "route", None)
+        rid = (route or {}).get("route_id")
+        why = None
+        if wire is not ANTHROPIC:
+            why = "the conversation is on /v1/responses (the local relay speaks Messages only)"
+        elif not created:
+            # HOOK(rebuild-on-409): a refusal later in a conversation could move it too, by seeding the local lane from
+            # the client's transcript as branch rebuild-on-409 does for a lost backend. Not built: the conversation
+            # stays on its cloud model and the client sees the refusal.
+            why = "a refusal after the opening turn does not move the conversation (follow-up: rebuild-on-409)"
+        elif (turn.tool_results or any(isinstance(m, dict) and m.get("role") == "assistant"
+                                       for m in body.get("messages") or [])
+              or any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks)):
+            why = "client tools ran or were requested in this conversation; a turn with tool effects is never re-run"
+        elif not route or route.get("local") or route.get("pinned"):
+            why = "the conversation is not S1-routed to a cloud model"
+        elif reg.refusal_route is None:
+            why = "this endpoint has no refusal fallback (fixed model)"
+        if why:
+            logger.info("sensitive: refusal not taken for %s: %s", rid, why)
+            return None
+        got: dict[str, Any] = {}
+
+        def run(moved: dict) -> bool:
+            try:
+                got["turn"] = local_lane.complete(body, moved["local"]["node"], moved["local"]["model"])
+            except local_lane.LocalUnavailable as exc:
+                logger.info("sensitive: refusal: local answer failed for %s: %s", rid, exc)
+                return False
+            return True
+
+        try:
+            moved = reg.refusal_route(body, route, run)
+        except Exception as exc:                        # a fallback bug must never cost the client the cloud answer
+            logger.exception("sensitive: refusal fallback failed for %s (%s); the refusal stands", rid,
+                             type(exc).__name__)
+            return None
+        if not moved or "turn" not in got:
+            return None
+        if one_shot:
+            session.route = moved                       # a throwaway backend: nothing to rebind; the record is local
+            return session, got["turn"]
+        try:
+            return reg.rebind_local(session, turn, moved), got["turn"]
+        except Exception as exc:
+            logger.exception("sensitive: refusal: binding %s to the local lane failed (%s); the refusal stands", rid,
+                             type(exc).__name__)
+            return None
+
     def _exclusion_refusal(self, model: str, label: str, advice: str) -> str | None:
         """Why x-cortados-exclude-model refuses a request that can only run on `model` (a lane that never reaches the
         router, which applies the header otherwise: the api/ pin, the search lane), or None. The same rules as choose:
@@ -1899,10 +2047,14 @@ class Handler(BaseHTTPRequestHandler):
                 exclude, valid = _exclude_model_header(self.headers)   # read for a new conversation only
                 if not valid:
                     return self._error(400, "invalid_request_error", _EXCLUDE_MODEL_BAD, wire)
+                local, valid = _local_header(self.headers)
+                if not valid:
+                    return self._error(400, "invalid_request_error", _LOCAL_BAD, wire)
                 try:
                     route_fn = reg.router if one_shot else reg.route_new
                     route = route_fn(wire.routing_body(body), self._client(),
                                      **({"exclude_model": exclude} if exclude else {}),
+                                     **({"local": local} if local else {}),
                                      **({"min_left_pct": floor} if floor is not None else {}))
                 except Exception as exc:                # scorer, tables or route log failed: a dependency, not the client
                     logger.exception("routing failed")
@@ -1931,7 +2083,9 @@ class Handler(BaseHTTPRequestHandler):
             except BridgeError as exc:                  # the backend refused to start (version pin, isolation, login)
                 logger.warning("backend start failed: %s", exc)
                 return self._error(502, "api_error", str(exc), wire, reason=failure_diagnostic(exc))
-        if isinstance(session, LocalSession):           # a local pin: relayed to its node, never a CLI turn
+        if isinstance(session, LocalSession):           # a local lane: relayed to its node, never a CLI turn
+            if not created and self._local_continuation_refused(session, body, wire):
+                return
             return self._relay_local(session, turn, body, created=created, one_shot=one_shot, wire=wire)
         if not created:
             # A continuation's paid turn under the client's floor: the session keeps the tightest floor it was ever sent,
@@ -2022,27 +2176,42 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     session.send_user(turn.content, timeout=deadline - time.time())
                 _turn_t0 = time.time()
-                outcome["turn"] = session.run_turn(deadline - time.time())
+                result = session.run_turn(deadline - time.time())
+                cur = session                           # the session this turn's answer belongs to
+                moved = self._refusal_fallback(session, turn, body, result, created=created, one_shot=one_shot,
+                                               wire=wire)
+                if moved:
+                    try:
+                        _ledger_turn(session, result[2])   # the refused cloud turn was spent all the same
+                    except Exception as exc:
+                        _log_ledger_hook_failure(exc)
+                    self._log_turn_tokens(session, result[2])   # and its tokens are on the cloud route's row
+                    cur, result = moved
+                    outcome["moved"] = cur
+                outcome["turn"] = result
                 _turn_ms = int((time.time() - _turn_t0) * 1000)
-                _remember_reply(session, turn, msg_id, model, outcome["turn"])
+                _remember_reply(cur, turn, msg_id, model, outcome["turn"])
                 # Compaction content store (shadow, off unless CORTADOS_COMPACTION_STORE=1): the one point where the
                 # turn's new user content / tool results and the backend's reply are both known. It only reads them
                 # and enqueues for the store's background writer; it never raises or blocks (failures are counted).
-                self._compaction_record(session, turn, outcome["turn"][0], wire)
-                try:
-                    _ledger_turn(session, outcome["turn"][2])
-                except Exception as exc:
-                    # The ledger only feeds unit-cost learning: it must never break a turn. Without this guard the reply
-                    # would go out while history fell behind the client, killing the conversation on its next continuation.
-                    _log_ledger_hook_failure(exc)
-                session.history.append(anthropic_wire.reply_fingerprint(outcome["turn"][0]))
-                if session.route and not session.route_logged and reg.executed:
+                self._compaction_record(cur, turn, outcome["turn"][0], wire)
+                if not moved:                           # a local answer spends no subscription: nothing to learn
+                    self._log_turn_tokens(session, outcome["turn"][2])
                     try:
-                        reg.executed(session.route)
-                        session.route_logged = True     # only after the write succeeded; a failure retries next turn
+                        _ledger_turn(session, outcome["turn"][2])
+                    except Exception as exc:
+                        # The ledger only feeds unit-cost learning: it must never break a turn. Without this guard the
+                        # reply would go out while history fell behind the client, killing the conversation on its next
+                        # continuation.
+                        _log_ledger_hook_failure(exc)
+                cur.history.append(anthropic_wire.reply_fingerprint(outcome["turn"][0]))
+                if cur.route and not cur.route_logged and reg.executed:
+                    try:
+                        reg.executed(cur.route)
+                        cur.route_logged = True         # only after the write succeeded; a failure retries next turn
                     except Exception:
                         # The reply is good; only its training record failed. Answer the client and say so loudly.
-                        logger.exception("execution log for route %s failed%s", session.route.get("route_id"),
+                        logger.exception("execution log for route %s failed%s", cur.route.get("route_id"),
                                          " (one-shot: no later turn to retry)" if one_shot else "; retrying next turn")
                     else:
                         if reg.log_outcome:             # the turn's size and duration, for training; once per conversation, same row as the route
@@ -2050,7 +2219,7 @@ class Handler(BaseHTTPRequestHandler):
                             chars = sum(len(b.get("text", "")) for b in blocks if isinstance(b, dict) and b.get("type") == "text")
                             # off the critical path: a slow SQLite write must not hold the session lock or delay the reply.
                             # Best effort — a failed outcome log is logged, not retried (the request label is already saved).
-                            route = session.route
+                            route = cur.route
                             def _log_outcome(route=route, chars=chars, ms=_turn_ms):
                                 try:
                                     reg.log_outcome(route, chars, ms)
@@ -2078,6 +2247,17 @@ class Handler(BaseHTTPRequestHandler):
         try:
             while worker.is_alive():
                 worker.join(PING_S)
+                if not worker.is_alive() and outcome.get("moved") is not None:
+                    # The refusal fallback bound the conversation to a local session: the reply, the route header and
+                    # the bookkeeping below belong to it now.
+                    session = outcome["moved"]
+                    routed = session.route
+                    if revealed:
+                        # A revealing client (route_task's trailer) must be told the model that answered. A streamed
+                        # reply named the refused model in its message_start already; the JSON reply is corrected.
+                        model = self._reveal(session) or model
+                    self._record_run(provider=str(routed.get("provider") or ""), model=str(routed.get("model") or ""),
+                                     label=str(routed.get("model") or ""), tools=not one_shot)
                 if worker.is_alive() and turn.stream and not client_gone:
                     try:
                         self.wfile.write(wire.stream_ping())
@@ -2240,6 +2420,23 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:   # never interrupts the turn; counted like any store scheduling failure
             compaction_store.STORE._count("schedule_failures",
                                           f"turn not handed to the store: {type(exc).__name__}: {exc}")
+
+    def _log_turn_tokens(self, session, usage) -> None:
+        """Add this backend turn's tokens to its route's router.db row with the orchestrator's session tag (work split:
+        provider/work_split.py). Off the critical path like the outcome log: a slow SQLite write must not hold the
+        session lock or delay the reply. Never raises; core.log_tokens counts a lost write in router_db."""
+        reg = self.server.registry
+        route = getattr(session, "route", None)
+        if not reg.log_tokens or not isinstance(route, dict) or not route.get("route_id") or not isinstance(usage, dict):
+            return
+        tag = office.clean(self.headers.get(office.SESSION_HEADER), office._HEADER_RULES[office.SESSION_HEADER])
+
+        def _write(route_id=route["route_id"], usage=dict(usage), tag=tag):
+            try:
+                reg.log_tokens(route_id, usage, tag)
+            except Exception:
+                logger.exception("token log for route %s failed", route_id)
+        threading.Thread(target=_write, name="cortados-token-log", daemon=True).start()
 
     def _run_id(self) -> tuple[str | None, bool]:
         """The x-cortados-run-id header: (id or None when absent/empty, valid)."""
@@ -2424,10 +2621,10 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
         from cortados_router import core                  # loads the tables and the live scarcity reader
         from cortados_router.provider import routing
 
-        def router(body, client, exclude_model=None, min_left_pct=None):
+        def router(body, client, exclude_model=None, min_left_pct=None, local=None):
             return routing.choose(core, body, client=client, conversation_id=uuid.uuid4().hex, claude_bin=claude_bin,
                                   codex_bin=codex_bin, exclude_model=exclude_model, min_left_pct=min_left_pct,
-                                  codex_home=codex_home)
+                                  codex_home=codex_home, local=local)
 
         def executed(route):
             core.log_execution(route["route_id"], route["provider"], route["model"])
@@ -2442,6 +2639,9 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
         registry.floor_turn = lambda route, floor: routing.floor_turn(core, route, floor, codex_home)
         registry.floor_search = lambda cand, floor, rid: _floor_search(core, cand, floor, rid)
         registry.floor_release = lambda rid: _floor_release(core, rid)
+        registry.refusal_route = lambda body, route, run: routing.refusal_route(core, body, route, run)
+        registry.local_recheck = lambda body, route: routing.continuation_admission(core, body, route)
+        registry.log_tokens = core.log_tokens
     httpd = ProviderServer((host, port), registry)
 
     def reaper():
