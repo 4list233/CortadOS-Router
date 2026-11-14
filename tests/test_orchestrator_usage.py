@@ -133,12 +133,29 @@ class ScanTest(unittest.TestCase):
         self.assertIsNone(work_split.validate_block(s, NOW, live.TIME_SKEW_S)[1])
 
     def test_the_scratch_prefixes_are_the_bridges_own(self):
-        import tempfile as tf
         from cortados_router.provider import bridge, search_lane
         self.assertEqual(ou.PROVIDER_SCRATCH_PREFIXES, (bridge.SCRATCH_PREFIX, search_lane.SCRATCH_PREFIX))
-        d = Path(tf.mkdtemp(prefix=bridge.SCRATCH_PREFIX, dir=self.root)) / bridge.SCRATCH_WORK
-        self.assertTrue(ou.is_provider_path(str(d), ""))
-        self.assertTrue(ou.is_provider_path(None, ou._slug(str(d))))
+        tmp = "/private/var/folders/0w/x/T"
+        # tempfile's suffixes are [a-z0-9_]; one starting with '_' slugs to a doubled '-' (cortados-bridge--...)
+        for suffix in ("k3x9zq1a", "_a1b2c3d", "a1b2c3d_", "ab__cd_e", "-a1b2c3d"):
+            bwork = f"{tmp}/{bridge.SCRATCH_PREFIX}{suffix}/{bridge.SCRATCH_WORK}"
+            swork = f"{tmp}/{search_lane.SCRATCH_PREFIX}{suffix}"
+            for path in (bwork, swork):
+                with self.subTest(path=path):
+                    self.assertTrue(ou.is_provider_path(path, ""))
+                    self.assertTrue(ou.is_provider_path(None, ou._slug(path)))
+
+    def test_project_folders_named_like_a_scratch_prefix_are_kept(self):
+        from cortados_router.provider import bridge, search_lane
+        for path in ("/Users/me/cortados-bridge-v2", "/Users/me/cortados-bridge-v2/src",
+                     "/Users/me/cortados-search-v2/src", f"/Users/me/{bridge.SCRATCH_PREFIX}", "/Users/me/cortados-bridge"):
+            with self.subTest(path=path):
+                self.assertFalse(ou.is_provider_path(path, ""))
+                if "search" not in path:   # a slug cannot tell <search scratch>-src from a folder; the cwd can
+                    self.assertFalse(ou.is_provider_path(None, ou._slug(path)))
+        # the real bridge scratch path and the search lane's are still excluded
+        self.assertTrue(ou.is_provider_path(f"/private/var/folders/0w/x/T/{bridge.SCRATCH_PREFIX}co6jigea/work", ""))
+        self.assertTrue(ou.is_provider_path(f"/private/var/folders/0w/x/T/{search_lane.SCRATCH_PREFIX}p0q1r2s3", ""))
 
     def test_child_task_transcripts_are_excluded_by_cwd_or_slug(self):
         task = "t20261113153431-36062624"

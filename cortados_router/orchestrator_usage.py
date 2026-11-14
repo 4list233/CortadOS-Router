@@ -153,11 +153,21 @@ def is_child_path(cwd: str | None, slug: str, task_roots: Iterable[str] = ()) ->
 
 def is_provider_path(cwd: str | None, slug: str) -> bool:
     """True when the session ran in one of the provider's scratch dirs (<tmp>/<bridge prefix><random>/work,
-    <tmp>/<search prefix><random>). Without a cwd the project slug is tested the same way."""
+    <tmp>/<search prefix><random>): the scratch folder is the cwd's last part (the search lane) or the one before
+    bridge.SCRATCH_WORK (the bridge), so a real project folder named like a prefix (~/code/cortados-bridge-v2) is
+    kept. Without a cwd the project slug is tested the same way; tempfile's random suffix may hold '_', which the
+    slug turns into '-', so the suffix is matched as [A-Za-z0-9-]+."""
     if cwd:
-        return any(part.startswith(p) and len(part) > len(p) for part in Path(cwd).parts
-                   for p in PROVIDER_SCRATCH_PREFIXES)
-    return any(re.search(rf"(?:^|-){re.escape(_slug(p))}[A-Za-z0-9]", slug) for p in PROVIDER_SCRATCH_PREFIXES)
+        parts = Path(os.path.normpath(cwd)).parts
+        def scratch(part: str, prefix: str) -> bool:
+            return part.startswith(prefix) and len(part) > len(prefix)
+        if len(parts) >= 2 and parts[-1] == _bridge.SCRATCH_WORK and scratch(parts[-2], _bridge.SCRATCH_PREFIX):
+            return True
+        return bool(parts) and scratch(parts[-1], _search_lane.SCRATCH_PREFIX)
+    suffix = r"[A-Za-z0-9-]+"
+    return bool(re.search(rf"(?:^|-){re.escape(_slug(_bridge.SCRATCH_PREFIX))}{suffix}-"
+                          rf"{re.escape(_slug(_bridge.SCRATCH_WORK))}$", slug)
+                or re.search(rf"(?:^|-){re.escape(_slug(_search_lane.SCRATCH_PREFIX))}{suffix}$", slug))
 
 
 def _ts(value: Any) -> float | None:
