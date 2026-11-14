@@ -286,7 +286,8 @@ def keyword_match(section: dict[str, Any], text: str) -> bool:
 
 
 def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
-             boundary: bool = False, bind_reason: str | None = None) -> tuple[list, str, dict]:
+             boundary: bool = False, bind_reason: str | None = None, hook: bool = False,
+             conversation: str | None = None) -> tuple[list, str, dict]:
     """One whole (non-streaming) answer from the node for `body`, as (blocks, stop_reason, usage) in the shape the
     bridges return: text and tool_use blocks only (thinking is dropped, as the CLI lanes never send it). Used where
     the answer must be written by the server itself: the refusal fallback (server.py), whose stream has already
@@ -297,8 +298,11 @@ def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], 
     `boundary` (an automatic move: the refusal fallback): the effect boundary applies, under the profile of
     `bind_reason` (effect_boundary.BIND_PROFILES; unknown: the strictest). The node sees only the profile's tools, and
     an answer proposing a blocked call (Boundary.blocked_reply, read on the node's raw content) is LocalUnavailable
-    too, so the caller keeps what it had and nothing outward reaches the client."""
-    fence = effect_boundary.Boundary.for_turn(bind_reason, body) if boundary else None
+    too, so the caller keeps what it had and nothing outward reaches the client. `hook`: the client runs the boundary
+    hook (effect_boundary.HOOK_HEADER; without it a sensitive turn is read-only); every tool call returned gets a
+    minted id recorded under `conversation` (effect_boundary.Boundary.mark), which the client's hook checks."""
+    fence = (effect_boundary.Boundary.for_turn(bind_reason, body, hook=hook, conversation=conversation)
+             if boundary else None)
     if fence:
         body, dropped = fence.tools_for_node(body)
         effect_boundary.log_dropped(dropped)
@@ -347,6 +351,8 @@ def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], 
         # Thinking only, blank text, an empty content list or only malformed tool calls (e.g. stop "max_tokens"
         # after thinking): not an answer. The caller keeps what it had (the refusal fallback: the original refusal).
         raise LocalUnavailable(f"node {node['node']} gave no usable answer (no text or valid tool call)")
+    if fence:
+        fence.mark_blocks(blocks)
     usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
     return blocks, str(msg.get("stop_reason") or "end_turn"), usage
 
@@ -615,8 +621,9 @@ def _judge_event(ev: dict[str, Any], call: "effect_boundary.StreamedCall | None"
         if t == "content_block_start" and isinstance(block, dict) and \
                 block.get("type") not in effect_boundary.PLAIN_BLOCKS:
             name = block.get("name")
-            if not isinstance(name, str) or name not in fence.tools:
-                return "tool-not-allowed", name if isinstance(name, str) else "<unnamed>"
+            rule = fence.name_rule(name)
+            if rule:
+                return rule, name if isinstance(name, str) else "<unnamed>"
             return effect_boundary.StreamedCall(ev.get("index"), block)
         return None
     if t == "content_block_start":
@@ -654,7 +661,7 @@ def _blocked(handler, hit: tuple[str, str], *, stream_started: bool = False) -> 
 
 def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
           echo_model: str, reply: list | None = None, auto_routed: bool = False,
-          bind_reason: str | None = None) -> str:
+          bind_reason: str | None = None, hook: bool = False, conversation: str | None = None) -> str:
     """Relay one turn to the node's /v1/messages and the answer back to the client. Returns the outcome: "completed"
     (a whole message or a parsed message_stop), "rejected" (the node answered an HTTP error, relayed as-is),
     "unreachable" (503 sent), or "incomplete" (the stream broke). The response names `echo_model` (what the client
@@ -674,9 +681,15 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
     effect_boundary.BLOCKED_MESSAGE); a streaming turn holds every tool-call block until it is complete and judged (and
     holds message_start until the first content that may be shown), so a block found before anything was written is
     the same 400, and one found after text was written ends the stream with an `error` event (invalid_request_error,
-    the same message): no tool_use, no message_delta, no message_stop. A pin is relayed untouched."""
+    the same message): no tool_use, no message_delta, no message_stop. A pin is relayed untouched.
+
+    The client-side hook (effect_boundary "client-side boundary hook"): `hook` says the client runs it (HOOK_HEADER;
+    without it a sensitive turn is read-only). Every tool-call block the boundary lets through reaches the client with
+    an id minted by the provider and recorded under `conversation` (Boundary.mark), never the node's own id: the
+    client's hook asks about that id before the tool runs."""
     reply = [] if reply is None else reply
-    fence = effect_boundary.Boundary.for_turn(bind_reason, body) if auto_routed else None
+    fence = (effect_boundary.Boundary.for_turn(bind_reason, body, hook=hook, conversation=conversation)
+             if auto_routed else None)
     boundary = fence is not None
     if fence:
         body, dropped = fence.tools_for_node(body)
@@ -769,6 +782,8 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
             hit = fence.blocked_reply(msg.get("content")) if fence and isinstance(msg, dict) else None
             if hit:
                 return _blocked(handler, hit)
+            if fence and isinstance(msg, dict):
+                fence.mark_blocks(msg.get("content"))
             if isinstance(msg, dict) and msg.get("type") == "message":
                 msg["model"] = echo_model
             if isinstance(msg, dict) and isinstance(msg.get("content"), list):
@@ -823,17 +838,21 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                                 and ev["delta"].get("stop_reason") == "max_tokens" and not _answered(reply)):
                             starved = True                   # this event and the rest are replaced by an error
                             break
-                        _fold(reply, ev)
-                        done = done or ev.get("type") == "message_stop"
-                        ev_type = ev.get("type")
                         if boundary:
                             blocked = _judge_event(ev, call, fence)
                             if isinstance(blocked, effect_boundary.StreamedCall):
                                 call, blocked = blocked, None
+                                # the call reaches the client under a minted, recorded id (the client hook's key),
+                                # folded into the reply too: the client sends that id back with its tool result
+                                ev["content_block"]["id"] = fence.mark(call.name)
+                                line = b"data: " + json.dumps(ev).encode() + b"\n"
                             elif blocked == "closed":
                                 call_closed, blocked = True, None
-                            if blocked:
-                                break                        # nothing of this event or after it is written
+                        _fold(reply, ev)
+                        done = done or ev.get("type") == "message_stop"
+                        ev_type = ev.get("type")
+                        if blocked:
+                            break                            # nothing of this event or after it is written
                 pending.append(line)
                 if line in (b"\n", b"\r\n"):
                     if not boundary:

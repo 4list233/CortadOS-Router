@@ -41,9 +41,9 @@ class SessionTests(unittest.TestCase):
         return rc, out.getvalue(), err.getvalue()
 
     def test_custom_headers(self):
-        self.assertEqual(session.custom_headers(None), "x-cortados-reveal: 1")
+        self.assertEqual(session.custom_headers(None), "x-cortados-reveal: 1\nx-cortados-boundary-hook: 1")
         self.assertEqual(session.custom_headers("t20261102000000-0000abcd"),
-                         "x-cortados-reveal: 1\nx-cortados-run-id: t20261102000000-0000abcd")
+                         "x-cortados-reveal: 1\nx-cortados-boundary-hook: 1\nx-cortados-run-id: t20261102000000-0000abcd")
 
     def test_invalid_run_id_refused(self):
         for bad in ("short", "has space in it", "x" * 65, "bad\nnewline-id"):
@@ -75,9 +75,18 @@ class SessionTests(unittest.TestCase):
                     data = json.load(src)
                 self.assertEqual(data["env"]["CORTADOS_DELEGATE_BUDGET"], str(budget))
                 self.assertEqual(env["CORTADOS_DELEGATE_BUDGET"], str(budget))
-                self.assertEqual("hooks" in data, enabled)
+                # The boundary hook is always first, with or without the gate (docs/BOUNDARY-HOOK.md), and hooks
+                # cannot be switched off by a user settings file while the boundary header promises the hook.
+                self.assertIs(data["disableAllHooks"], False)
+                pre = data["hooks"]["PreToolUse"]
+                self.assertEqual(pre[0]["matcher"], "Write|Edit|MultiEdit|NotebookEdit|Bash")
+                bcmd = shlex.split(pre[0]["hooks"][0]["command"])
+                self.assertEqual(bcmd[:2], ["python3", "-B"])
+                self.assertEqual(Path(bcmd[2]), Path(session.__file__).resolve().with_name("boundary_hook.py"))
+                self.assertIn("x-cortados-boundary-hook: 1", data["env"]["ANTHROPIC_CUSTOM_HEADERS"].split("\n"))
+                self.assertEqual(len(pre), 2 if enabled else 1)
                 if enabled:
-                    hook = data["hooks"]["PreToolUse"][0]
+                    hook = pre[1]
                     self.assertEqual(hook["matcher"], "*")
                     self.assertEqual(hook["hooks"][0]["type"], "command")
                     command = shlex.split(hook["hooks"][0]["command"])
@@ -356,7 +365,8 @@ class OfficeHeaderTests(unittest.TestCase):
     def test_office_headers_are_allowlisted_and_cannot_inject_lines(self):
         from cortados_router import session as sess
         h = sess.custom_headers("run-12345678", ["x-cortados-task-title: fix it", "X-Cortados-Session: 3f9a1c2e9b7d4a10"])
-        self.assertEqual(h.split("\n"), ["x-cortados-reveal: 1", "x-cortados-run-id: run-12345678",
+        self.assertEqual(h.split("\n"), ["x-cortados-reveal: 1", "x-cortados-boundary-hook: 1",
+                                         "x-cortados-run-id: run-12345678",
                                          "x-cortados-task-title: fix it", "x-cortados-session: 3f9a1c2e9b7d4a10"])
         for bad in ("x-api-key: steal", "x-cortados-task-title: a\nx-api-key: steal", "x-cortados-project:",
                     "x-cortados-device", "x-cortados-task-title: " + "x" * 81):

@@ -54,7 +54,8 @@ if __package__ in (None, ""):                           # run as a file: make th
 
 from cortados_router.compat import getenv
 from cortados_router.compaction import prune as compaction_prune, store as compaction_store
-from cortados_router.provider import anthropic_wire, clients, live, local_lane, office, responses_wire, routing, search_lane
+from cortados_router.provider import (anthropic_wire, clients, effect_boundary, live, local_lane, office, responses_wire,
+                                      routing, search_lane)
 from cortados_router.provider.bridge import BridgeError, BridgeSession, ToolWaitExpired, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
 from cortados_router.provider.timeouts import IDLE_S, TOOL_WAIT_S, TURN_TIMEOUT_S, effective_tool_wait
@@ -391,6 +392,9 @@ RUNS_PATH = "/v1/cortados/runs/"
 # The Office view (provider/office.py): GET is open to the owner token and to a client token with the office:read scope
 # (provider/clients.py); the heartbeat POST, which writes, needs the owner token (the mod already holds it to route).
 OFFICE_HEARTBEAT_PATH = "/v1/cortados/office/heartbeat"
+# The client-side boundary hook's question (docs/BOUNDARY-HOOK.md, effect_boundary.check_answer): owner token only.
+BOUNDARY_CHECK_PATH = "/v1/cortados/boundary/check"
+_TOOL_USE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _SCOPE_DENIED = "cortados: this token's scopes do not cover this endpoint"
 
 # What a refusal record (RunRecords.refuse) and the refusal log line hold: the status, the error type, an endpoint id
@@ -433,6 +437,8 @@ def endpoint_id(path: str | None) -> str:
         return "live"
     if p == live.HEARTBEAT_PATH:
         return "live_heartbeat"
+    if p == BOUNDARY_CHECK_PATH:
+        return "boundary_check"
     if p.startswith("/v1/models"):
         return "models"
     if p in ("/health", "/resources", "/bridge/call"):
@@ -1844,12 +1850,33 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, "invalid_request_error", f"cortados: heartbeat field {bad} is invalid",
                                    reason="the heartbeat is malformed")
             return self._json(200, self.server.registry.office.heartbeat(hb))
+        if path == BOUNDARY_CHECK_PATH:
+            return self._boundary_check(body)
         if path == "/v1/messages/count_tokens":
             # Estimate only (chars / 4): the CLI behind cortados counts its own tokens and exposes no counter.
             return self._json(200, {"input_tokens": len(json.dumps(body)) // 4})
         if path == "/bridge/call":
             return self._bridge_call(body)
         self._error(404, "not_found_error", path)
+
+    def _boundary_hook(self) -> bool:
+        """Whether this request's client runs the boundary hook (effect_boundary.HOOK_HEADER: exactly "1")."""
+        return (self.headers.get(effect_boundary.HOOK_HEADER) or "").strip() == "1"
+
+    def _boundary_check(self, body: dict[str, Any]) -> None:
+        """POST /v1/cortados/boundary/check (docs/BOUNDARY-HOOK.md): the client's PreToolUse hook asks about one
+        tool_use id; the answer is the provider's record of it (effect_boundary.check_answer) or {"known": false}.
+        Owner token only (checked by do_POST before the body is read). Metadata only: the id, never a tool input."""
+        tid = body.get("tool_use_id")
+        if not isinstance(tid, str) or not _TOOL_USE_ID_RE.fullmatch(tid):
+            return self._error(400, "invalid_request_error", "cortados: tool_use_id must be 1-128 of [A-Za-z0-9_-]",
+                               reason="the boundary check is malformed")
+        try:
+            answer = effect_boundary.check_answer(tid)
+        except Exception as exc:                        # the hook fails closed on a 500 for a marked id
+            logger.error("boundary check failed: %s", type(exc).__name__)
+            return self._error(500, "api_error", "cortados: boundary check failed (see provider log)")
+        return self._json(200, answer, headers={"cache-control": "no-store"})
 
     def _live_heartbeat(self) -> None:
         """POST /v1/cortados/live/heartbeat (provider/live.py): a host's job states. The owner token or a live:heartbeat
@@ -2049,7 +2076,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model,
                                            reply=reply, auto_routed=not route.get("pinned"),
-                                           bind_reason=route.get("bind_reason"))
+                                           bind_reason=route.get("bind_reason"), hook=self._boundary_hook(),
+                                           conversation=str(session.id))
             except Exception as exc:             # serve handles its own I/O; anything else must still clean up
                 logger.exception("local lane: relay failed")
                 outcome = "incomplete"
@@ -2172,7 +2200,8 @@ class Handler(BaseHTTPRequestHandler):
                 # boundary: an automatic move, so the effect boundary applies (effect_boundary.py); a blocked call is
                 # LocalUnavailable here and the cloud refusal stands
                 got["turn"] = local_lane.complete(body, moved["local"]["node"], moved["local"]["model"],
-                                                  boundary=True, bind_reason=moved.get("bind_reason"))
+                                                  boundary=True, bind_reason=moved.get("bind_reason"),
+                                                  hook=self._boundary_hook(), conversation=str(session.id))
             except local_lane.LocalUnavailable as exc:
                 logger.info("sensitive: refusal: local answer failed for %s: %s", rid, exc)
                 return False

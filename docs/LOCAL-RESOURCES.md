@@ -373,12 +373,14 @@ lands: all relay through `local_lane.serve(auto_routed=True, bind_reason=...)` o
 local (`routing._moved(..., reason=...)` → the route's `bind_reason`); the route is the conversation's, so every
 continuation (and a rebuilt session) carries the same reason and gets the same profile. `effect_boundary.BIND_PROFILES`
 maps it; a missing or unknown reason gets the strictest profile. The published-score index route (branch
-`local-published-index`) adds one line there, `"index": COST`, and passes `reason="index"` to `_moved`.
+`local-published-index`) passes `reason="index"` to `_moved`; `"index": COST` is already in the map. `prefer` is a cost
+route (review of 0961c80): `x-cortados-local: prefer` asks for local because it is cheaper, not because the work is
+sensitive.
 
 | Bind reason | Profile | Tools offered and allowed | File writes (Write, Edit, MultiEdit, NotebookEdit) |
 |---|---|---|---|
-| `sensitive_flag`, `prefer`, `keyword`, `refusal` | sensitive | Read, Glob, Grep, LS, NotebookRead, Edit, MultiEdit, Write, NotebookEdit, TodoWrite, ExitPlanMode. **No Bash family** (Bash, BashOutput, KillShell, KillBash are not offered, and an emitted one is blocked) | inside the project folder; every `PROTECTED_PATHS` entry refused, `package.json` / `pyproject.toml` / `Makefile` included |
-| `auto_route` (and `index` when it merges) | cost | the same, plus Bash, BashOutput, KillShell, KillBash; every Bash command checked against `OUTWARD_BASH_RULES` and `OUTWARD_BASH_TEXT_RULES` (**best-effort**, below) | inside the project folder; `PROTECTED_PATHS` refused except `package.json`, `pyproject.toml`, `Makefile` (normal coding targets) |
+| `sensitive_flag`, `keyword`, `refusal` | sensitive | Read, Glob, Grep, LS, NotebookRead, Edit, MultiEdit, Write, NotebookEdit, TodoWrite, ExitPlanMode. **No Bash family** (Bash, BashOutput, KillShell, KillBash are not offered, and an emitted one is blocked). **Without `x-cortados-boundary-hook: 1`: read-only** (Edit, MultiEdit, Write, NotebookEdit not offered; an emitted one is blocked, rule `write-no-hook`) | inside the project folder; every `PROTECTED_PATHS` entry refused, `package.json` / `pyproject.toml` / `Makefile` included; checked again on the client by the boundary hook |
+| `prefer`, `auto_route`, `index` | cost | the same, plus Bash, BashOutput, KillShell, KillBash; every Bash command checked against `OUTWARD_BASH_RULES` and `OUTWARD_BASH_TEXT_RULES` (**best-effort**, below) | inside the project folder; `PROTECTED_PATHS` refused except `package.json`, `pyproject.toml`, `Makefile` (normal coding targets) |
 | unknown / missing | sensitive | as sensitive | as sensitive |
 | explicit `sub/` pin | none | untouched: every tool, no inspection | untouched |
 
@@ -393,7 +395,8 @@ itself.
 taken from the project folder) and must lie strictly inside the folder (compared case-sensitively, so a differently
 cased folder on a case-sensitive disk is outside). Refused: any `..` component, a path starting with `~` or holding
 `$` (not resolved here, so not provably inside), and a symlink the provider's own filesystem shows leading out of the
-folder or onto a protected name (`os.path.realpath`; a symlink that only exists on another machine cannot be seen, see
+folder or onto a protected name (`os.path.realpath`; a symlink that only exists on the client's machine cannot be seen
+here: the client-side boundary hook, docs/BOUNDARY-HOOK.md, resolves the path there; see
 the honest limits). `PROTECTED_PATHS`, matched case-insensitively on the path below the folder, each read and acted on
 later by something other than the turn:
 

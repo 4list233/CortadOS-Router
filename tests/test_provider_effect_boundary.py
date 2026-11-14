@@ -85,9 +85,12 @@ class AllowlistUnitTests(unittest.TestCase):
         self.assertIsNone(eb.blocked_call("Bash", {"command": "ls"}, eb.COST))
 
     def test_bind_reasons_map_to_profiles(self):
+        # Review of 0961c80 (gpt-6.1-sol, finding 1): `prefer` is a COST route (owner decision 2026-11-14), not SENSITIVE.
         self.assertEqual({r: eb.profile_for(r) for r in eb.BIND_PROFILES},
-                         {"sensitive_flag": eb.SENSITIVE, "prefer": eb.SENSITIVE, "keyword": eb.SENSITIVE,
-                          "refusal": eb.SENSITIVE, "auto_route": eb.COST})
+                         {"sensitive_flag": eb.SENSITIVE, "keyword": eb.SENSITIVE, "refusal": eb.SENSITIVE,
+                          "prefer": eb.COST, "auto_route": eb.COST, "index": eb.COST})
+        self.assertEqual(eb.profile_for("prefer"), eb.COST)
+        self.assertIn("Bash", eb.Boundary("prefer", PROJECT).tools)
         for unknown in (None, "", "index-typo", 3, "s1"):                  # fail closed: the strictest profile
             self.assertEqual(eb.profile_for(unknown), eb.SENSITIVE)
         self.assertEqual(routing.TRIGGER_REASONS, {"flag": "sensitive_flag", "prefer": "prefer", "keyword": "keyword"})
@@ -421,7 +424,9 @@ class EmittedCallTests(BoundaryBase):
 
 class WriteRuleTests(BoundaryBase):
     """Finding 2, end to end on a sensitive bind: a startup-file Write (relayed by f83b84a in JSON and streaming) and
-    every other write outside the project or onto a protected path is blocked; a project file passes."""
+    every other write outside the project or onto a protected path is blocked; a project file passes. The client says
+    it runs the boundary hook (without it a sensitive turn is read-only: SensitiveWithoutHookTests)."""
+    HEADERS_OPEN = {"x-cortados-local": "sensitive", eb.HOOK_HEADER: "1"}
     PROFILE_ALLOWS_BUILD_FILES = False
 
     def request(self, *a, **kw):
@@ -650,11 +655,11 @@ class RefusalFallbackBoundaryTests(RefusalFallbackEndToEndTests):
     """The refusal fallback is an automatic move too, a SENSITIVE one: its local answer passes the boundary (no
     shell), and a blocked one keeps the cloud refusal (nothing outward reaches the client)."""
 
-    def run_refused(self, reply, stream=False, system=SYSTEM):
+    def run_refused(self, reply, stream=False, system=SYSTEM, hook=True):
         FakeOllama.reply = reply
         got = self.post({"model": "cortados", "max_tokens": 64, "stream": stream, "tools": ALL_TOOLS + [WRITE_TOOL],
                          "messages": [{"role": "user", "content": "please refuse"}],
-                         **({"system": system} if system else {})})
+                         **({"system": system} if system else {})}, headers={eb.HOOK_HEADER: "1"} if hook else None)
         return got
 
     def test_blocked_local_answer_keeps_the_refusal(self):
@@ -672,13 +677,162 @@ class RefusalFallbackBoundaryTests(RefusalFallbackEndToEndTests):
                     self.assertEqual(got["stop_reason"], "refusal")
                 self.assertFalse(any(isinstance(s, server.LocalSession) for s in self.reg.sessions.values()))
         for _, b in FakeOllama.seen:
-            self.assertEqual([t["name"] for t in b["tools"]], ["Read", "Write"])
+            self.assertEqual([t["name"] for t in b["tools"]], ["Read", "Write"])   # the client runs the hook
 
     def test_allowed_local_answer_is_still_taken(self):
         got = self.run_refused(([call("Write", {"file_path": f"{PROJECT}/draft.md", "content": "x"})], "tool_use"))
         self.assertEqual(got["content"][0]["input"]["file_path"], f"{PROJECT}/draft.md")
+        # the call reaches the client under a minted id the provider recorded (the client hook's key)
+        tid = got["content"][0]["id"]
+        self.assertTrue(eb.is_marked(tid), tid)
+        rec = eb.LEDGER.lookup(tid)
+        self.assertEqual((rec["tool"], rec["profile"], rec["project"]), ("Write", eb.SENSITIVE, PROJECT))
         (s,) = self.reg.sessions.values()
         self.assertEqual(s.route["bind_reason"], "refusal")
+
+    def test_without_the_hook_header_the_refusal_fallback_is_read_only(self):
+        got = self.run_refused(([call("Write", {"file_path": f"{PROJECT}/draft.md", "content": "x"})], "tool_use"),
+                               hook=False)
+        self.assertEqual(got["stop_reason"], "refusal")              # the Write is blocked: the cloud refusal stands
+        self.assertFalse(any(isinstance(s, server.LocalSession) for s in self.reg.sessions.values()))
+        self.assertEqual([t["name"] for t in FakeOllama.seen[-1][1]["tools"]], ["Read"])
+
+
+class SensitiveWithoutHookTests(BoundaryBase):
+    """No hook, no edits: a sensitive turn from a client that does not send x-cortados-boundary-hook: 1 is read-only.
+    The file-writing tools are not offered, and one the node emits anyway is blocked (rule write-no-hook)."""
+    HEADERS_OPEN = {"x-cortados-local": "sensitive"}
+
+    def test_write_tools_are_not_offered(self):
+        self.post(self.request(tools=[READ_TOOL, WRITE_TOOL, BASH_TOOL]), headers=self.HEADERS_OPEN)
+        (sent,) = self.node_bodies()
+        self.assertEqual([t["name"] for t in sent["tools"]], ["Read"])
+
+    def test_an_emitted_write_is_blocked_both_ways(self):
+        reply = [call("Write", {"file_path": f"{PROJECT}/src/notes.py", "content": "x"})], "tool_use"
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.blocked(reply, stream, "write-no-hook", "Write", json_deltas=stream,
+                             req=self.request(stream=stream, tools=[READ_TOOL, WRITE_TOOL]))
+
+    def test_a_hook_value_other_than_1_is_no_hook(self):
+        self.assertTrue(eb.Boundary("sensitive_flag", PROJECT).read_only)
+        self.assertFalse(eb.Boundary("sensitive_flag", PROJECT, hook=True).read_only)
+        self.assertFalse(eb.Boundary("prefer", PROJECT).read_only)          # cost routes keep their edits
+        self.assertFalse(eb.Boundary("auto_route", PROJECT).read_only)
+        self.post(self.request(tools=[READ_TOOL, WRITE_TOOL]), headers={**self.HEADERS_OPEN, eb.HOOK_HEADER: "yes"})
+        self.assertEqual([t["name"] for t in self.node_bodies()[-1]["tools"]], ["Read"])
+
+
+class LedgerUnitTests(unittest.TestCase):
+    def test_ids_are_minted_recorded_bounded_and_expire(self):
+        now = [1000.0]
+        led = eb.BoundaryLedger(ttl_s=60, max_total=5, max_per_conversation=3, clock=lambda: now[0])
+        a = [led.record("conv-a", "Write", eb.SENSITIVE, PROJECT) for _ in range(4)]
+        self.assertTrue(all(eb.is_marked(t) for t in a))
+        self.assertEqual(len(set(a)), 4)
+        self.assertIsNone(led.lookup(a[0]))                       # the conversation's oldest went first (3 per conv)
+        self.assertEqual(led.lookup(a[3])["project"], PROJECT)
+        b = [led.record("conv-b", "Bash", eb.COST, PROJECT) for _ in range(3)]
+        self.assertEqual(len(led), 5)                             # the global bound: the oldest of all went
+        self.assertIsNone(led.lookup(a[1]))
+        self.assertIsNotNone(led.lookup(b[2]))
+        now[0] += 61
+        self.assertIsNone(led.lookup(b[2]))                       # expired
+        self.assertEqual(len(led), 0)
+        self.assertIsNone(led.lookup("toolu_01abc"))              # never a model's own id
+
+    def test_check_answer_is_metadata_and_follows_the_profile(self):
+        led = eb.BoundaryLedger()
+        tid = led.record("c", "Write", eb.COST, PROJECT)
+        ans = eb.check_answer(tid, led)
+        self.assertEqual((ans["known"], ans["tool"], ans["profile"], ans["project"], ans["bash"]),
+                         (True, "Write", eb.COST, PROJECT, True))
+        self.assertEqual(ans["protected"]["build_files"], [])     # cost routes may write package.json
+        sens = eb.check_answer(led.record("c", "Write", eb.SENSITIVE, PROJECT), led)
+        self.assertFalse(sens["bash"])
+        self.assertIn("package.json", sens["protected"]["build_files"])
+        self.assertEqual(eb.check_answer("toolu_01abc", led), {"known": False, "marked": False})
+        self.assertEqual(eb.check_answer(eb.MARK_PREFIX + "0" * 24, led), {"known": False, "marked": True})
+
+
+class BoundaryCheckEndpointTests(BoundaryBase):
+    """The provider stays the authority: every call a boundary turn lets through reaches the client under a minted id
+    (JSON and streaming), and POST /v1/cortados/boundary/check answers the hook about it (owner token only)."""
+    HEADERS_OPEN = {"x-cortados-local": "sensitive", eb.HOOK_HEADER: "1"}
+
+    def check(self, tid, token=TOKEN):
+        r = urllib.request.Request(self.url + "/v1/cortados/boundary/check", data=json.dumps({"tool_use_id": tid})
+                                   .encode(), method="POST", headers={"content-type": "application/json",
+                                                                      "authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            return e.code, None
+
+    def test_minted_ids_are_known_to_the_check(self):
+        target = f"{PROJECT}/src/notes.py"
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.clear()
+                FakeOllama.reply = [call("Write", {"file_path": target, "content": "x"}, cid="toolu_node_own")], \
+                    "tool_use"
+                FakeOllama.json_deltas = stream
+                status, _, raw = self.raw_post(self.request(stream=stream, tools=[READ_TOOL, WRITE_TOOL]))
+                self.assertEqual(status, 200, raw)
+                if stream:
+                    (blk,) = [e["content_block"] for e in sse_events(raw) if e["type"] == "content_block_start"]
+                else:
+                    (blk,) = json.loads(raw)["content"]
+                tid = blk["id"]
+                self.assertNotIn("toolu_node_own", raw)            # the node's own id never reaches the client
+                self.assertTrue(eb.is_marked(tid), tid)
+                code, ans = self.check(tid)
+                self.assertEqual(code, 200)
+                self.assertEqual((ans["known"], ans["tool"], ans["profile"], ans["project"], ans["bash"]),
+                                 (True, "Write", eb.SENSITIVE, PROJECT, False))
+                self.assertNotIn("content", json.dumps(ans))       # metadata only: never the tool input
+
+    def test_end_to_end_the_hook_denies_a_symlink_the_provider_never_saw(self):
+        """Provider and hook together: the provider judges {proj}/escape/x.py inside the project (no link exists when
+        it looks), then a link appears on the client side only; the hook, asking the provider, denies the write."""
+        import io
+        from unittest import mock
+        from cortados_router import boundary_hook
+        tmp = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        proj, outside = os.path.join(tmp, "proj"), os.path.join(tmp, "outside")
+        os.makedirs(proj)
+        os.makedirs(outside)
+        system = SYSTEM.replace(PROJECT, proj)
+        ids = {}
+        for name in ("escape", "inside"):
+            self.clear()
+            FakeOllama.reply = [call("Write", {"file_path": f"{proj}/{name}/x.py", "content": "x"})], "tool_use"
+            FakeOllama.json_deltas = False
+            status, _, raw = self.raw_post(self.request(tools=[READ_TOOL, WRITE_TOOL], system=system))
+            self.assertEqual(status, 200, raw)
+            ids[name] = json.loads(raw)["content"][0]["id"]
+        os.symlink(outside, os.path.join(proj, "escape"))           # the client-only link
+
+        def run(name, tid):
+            ev = {"tool_name": "Write", "tool_use_id": tid, "tool_input": {"file_path": f"{proj}/{name}/x.py"}}
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"CORTADOS_BOUNDARY_URL": self.url, "CORTADOS_BOUNDARY_TOKEN": TOKEN}):
+                return boundary_hook.main(stdin=io.StringIO(json.dumps(ev)), stderr=err), err.getvalue()
+        code, err = run("escape", ids["escape"])
+        self.assertEqual(code, 2, err)
+        self.assertIn("outside the project folder", err)
+        self.assertEqual(run("inside", ids["inside"]), (0, ""))
+        self.assertEqual(run("inside", eb.MARK_PREFIX + "0" * 24)[0], 2)   # a marked id the provider never minted
+
+    def test_unknown_bad_and_unauthorised(self):
+        self.assertEqual(self.check("toolu_01cloud"), (200, {"known": False, "marked": False}))
+        self.assertEqual(self.check(eb.MARK_PREFIX + "f" * 24), (200, {"known": False, "marked": True}))
+        self.assertEqual(self.check("bad id with spaces")[0], 400)
+        self.assertEqual(self.check("toolu_01cloud", token="wrong-token")[0], 401)
+
 
 
 if __name__ == "__main__":

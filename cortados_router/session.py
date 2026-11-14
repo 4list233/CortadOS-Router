@@ -116,11 +116,26 @@ def parse_office_header(item: str) -> tuple[str, str]:
 LOCAL_MODES = ("sensitive", "prefer")
 
 
+# The provider's effect_boundary.HOOK_HEADER (checked by a test): this session's PreToolUse boundary hook is installed,
+# so a sensitive local-routed turn may offer file writes (docs/BOUNDARY-HOOK.md). Without it such a turn is read-only.
+BOUNDARY_HOOK_HEADER = "x-cortados-boundary-hook"
+# The tools the boundary hook checks: the file writers (path containment on this machine) and Bash (profile).
+BOUNDARY_HOOK_MATCHER = "Write|Edit|MultiEdit|NotebookEdit|Bash"
+
+
+def boundary_hook_entry() -> dict:
+    """The PreToolUse entry running boundary_hook.py (absolute standalone script; shell-quoted). Timeout 30 s, well
+    past the script's own 5 s provider timeout, so the script always answers (and fails closed) itself."""
+    command = "python3 -B " + shlex.quote(str(Path(__file__).resolve().with_name("boundary_hook.py")))
+    return {"matcher": BOUNDARY_HOOK_MATCHER, "hooks": [{"type": "command", "command": command, "timeout": 30}]}
+
+
 def custom_headers(run_id: str | None = None, office_headers=None, local: str | None = None) -> str:
     """ANTHROPIC_CUSTOM_HEADERS (newline-separated `name: value` lines). With a run id, every request of the session is
     recorded by the provider under it (GET /v1/cortados/runs/<id>); office headers (`name: value` items, OFFICE_HEADERS
     only) tag it for the Office view; `local` (LOCAL_MODES only) adds x-cortados-local."""
-    lines = ["x-cortados-reveal: 1"]
+    # The boundary hook (BOUNDARY_HOOK_HEADER): settings_content always installs boundary_hook.py next to this header.
+    lines = ["x-cortados-reveal: 1", BOUNDARY_HOOK_HEADER + ": 1"]
     if run_id:
         if not RUN_ID_RE.fullmatch(run_id):
             raise SessionError(f"run id {run_id!r} does not match the provider's run-id pattern")
@@ -172,12 +187,15 @@ def build_env(base: dict, provider_url: str, token: str, delegate_budget: int = 
 
 def settings_content(provider_url: str, token: str, delegate_budget: int = 3, gate: bool = True,
                      run_id: str | None = None, office_headers=None, local: str | None = None) -> dict:
+    # disableAllHooks false: a user settings file cannot switch the boundary hook off while the header says it runs.
     content = {"env": launcher_env(provider_url, token, delegate_budget, run_id, office_headers, local),
-               "enabledPlugins": {PLUGIN_ID: False}}
+               "enabledPlugins": {PLUGIN_ID: False}, "disableAllHooks": False}
+    pre = [boundary_hook_entry()]                # always: the header in env promises it (no hook, no edits)
     if gate:
         # Absolute standalone script: hook cwd need not be this checkout; shell-quote paths with spaces.
         command = "python3 -B " + shlex.quote(str(Path(__file__).resolve().with_name("orchestrator_gate.py")))
-        content["hooks"] = {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": command}]}]}
+        pre.append({"matcher": "*", "hooks": [{"type": "command", "command": command}]})
+    content["hooks"] = {"PreToolUse": pre}
     return content
 
 

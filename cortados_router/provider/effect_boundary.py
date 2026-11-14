@@ -14,14 +14,16 @@ the Pro. local_admission scores the request; scoring alone cannot stop a model f
                      OUTWARD_BASH_TEXT_RULES, or a file write outside the conversation's project folder or onto a
                      PROTECTED_PATHS entry blocks the whole reply (local_lane.serve / complete; server.py answers it).
 
-Profiles by WHY the turn is local (owner decision, Forest 2026-11-14, "split by reason"): the route carries its
-bind reason (routing._moved's `bind_reason`, kept by every continuation of the conversation), BIND_PROFILES maps it:
-  sensitive  the sensitive flag, prefer, the keyword list, the refusal fallback: no shell at all (the Bash family is
-             not offered and an emitted Bash call is blocked), file writes inside the project only, and every
+Profiles by WHY the turn is local (owner decision, Forest 2026-11-14, "split by reason"; `prefer` moved to cost on the
+review of 0961c80): the route carries its bind reason (routing._moved's `bind_reason`, kept by every continuation of the
+conversation), BIND_PROFILES maps it:
+  sensitive  the sensitive flag, the keyword list, the refusal fallback: no shell at all (the Bash family is not
+             offered and an emitted Bash call is blocked), file writes inside the project only, and every
              PROTECTED_PATHS entry refused (package.json / pyproject.toml / Makefile included).
-  cost       R0 auto_route and (branch local-published-index) the published-score index route: Bash stays, inspected
-             against the pattern lists, which are BEST-EFFORT (see the honest limit below); the same path rules, with
-             package.json / pyproject.toml / Makefile allowed (normal coding targets).
+  cost       `prefer` (x-cortados-local: prefer asks for local because it is cheaper, not because the work is
+             sensitive), R0 auto_route and the published-score index route: Bash stays, inspected against the pattern
+             lists, which are BEST-EFFORT (see the honest limit below); the same path rules, with package.json /
+             pyproject.toml / Makefile allowed (normal coding targets).
 An unknown or missing reason gets the strictest profile (sensitive): fail closed.
 
 An explicit `sub/<local model>` pin is the client's own choice: it never passes here (local_lane.serve's auto_routed
@@ -33,10 +35,27 @@ read, never messages or tool results, so neither a fetched page nor the model ca
 different ones, a relative path, `..`, or a folder that is a filesystem root or a home directory: unknown, and every
 file write of the turn is blocked (fail closed).
 
+The client-side boundary hook (docs/BOUNDARY-HOOK.md). The tools run on the CLIENT's machine, which is often not the
+provider's, so the provider's realpath (blocked_write) cannot see a symlink that exists only there. Therefore:
+  1. every tool call a boundary turn lets through gets an id minted here (MARK_PREFIX + random, Boundary.mark) and a
+     LEDGER record: conversation, tool, profile and the project folder the provider assumed. The ledger is bounded
+     (LEDGER_MAX, LEDGER_MAX_PER_CONVERSATION) and every record expires (LEDGER_TTL_S).
+  2. the client's PreToolUse hook (cortados_router/boundary_hook.py) asks POST /v1/cortados/boundary/check about the
+     tool_use id (check_answer), resolves the target with realpath ON THE CLIENT, and denies a write whose real path
+     leaves the real project folder or lands on a protected path, and Bash on a sensitive profile. An id with
+     MARK_PREFIX fails closed on any error (provider unreachable, record expired or unknown); any other id is not the
+     boundary's and passes.
+  3. no hook, no edits: a client that runs the hook says so with HOOK_HEADER on every request. A SENSITIVE turn
+     without it is read-only: the file-writing tools are not offered and an emitted one is blocked ("write-no-hook").
+     A COST turn without it keeps its edits under the provider-side path rules alone (the symlink limit above).
+blocked_write's provider-side realpath check stays as defence in depth.
+
 Honest limit: a pattern list cannot recognise every outward shell command (a script that sends, an alias defined
 earlier, a variable holding the command name, obfuscation, a Makefile target). On cost routes the boundary removes the
 obvious and the declared routes out; Claude Code's own permission prompts remain the final guard for what Bash runs.
-The path rules read the path's text; a symlink is seen only when it exists on the provider's own machine (realpath).
+The provider's path rules read the path's text and what the provider's own filesystem shows (realpath); the client's
+hook is what sees the client's symlinks. A client that sends HOOK_HEADER but whose hook does not run (python3 missing,
+hooks disabled by a managed policy) is not detected: the header is the client's word.
 Stdlib only."""
 from __future__ import annotations
 
@@ -45,6 +64,10 @@ import logging
 import os
 import posixpath
 import re
+import secrets
+import threading
+import time
+from collections import OrderedDict
 from typing import Any
 
 logger = logging.getLogger("cortados.provider.effect_boundary")
@@ -52,14 +75,14 @@ logger = logging.getLogger("cortados.provider.effect_boundary")
 # Profiles. A profile names the tools a turn may declare and call, and how strict the path rules are.
 SENSITIVE = "sensitive"
 COST = "cost"
-# WHICH automatic rule bound the conversation to a local lane (routing._moved's `bind_reason`) -> its profile. The
-# published-score index route (branch local-published-index) adds one line here: "index": COST.
+# WHICH automatic rule bound the conversation to a local lane (routing._moved's `bind_reason`) -> its profile.
 BIND_PROFILES: dict[str, str] = {
     "sensitive_flag": SENSITIVE,     # x-cortados-local: sensitive
-    "prefer": SENSITIVE,             # x-cortados-local: prefer
     "keyword": SENSITIVE,            # the node's keyword list matched the person's words
     "refusal": SENSITIVE,            # a cloud model refused the opening turn
+    "prefer": COST,                  # x-cortados-local: prefer: local because it is cheaper (owner decision 2026-11-14)
     "auto_route": COST,              # R0 auto_route: local because it is cheaper, not because it is sensitive
+    "index": COST,                   # the published-score index route (branch local-published-index)
 }
 
 
@@ -382,31 +405,189 @@ def blocked_call(name: Any, tool_input: Any, profile: str = SENSITIVE, project: 
     return None
 
 
-class Boundary:
-    """The boundary of one automatic-local turn: its bind reason, the profile it maps to, and the project folder read
-    from the request (project_dir). local_lane.serve / complete build one per turn (for_turn)."""
+# ------------------------------------------------------------------------------------- the client-side hook
+# The header a client sends on every request when its PreToolUse boundary hook is installed (session.py's
+# custom_headers, the routed-subagents mod's child env). Exactly "1"; anything else is "no hook".
+HOOK_HEADER = "x-cortados-boundary-hook"
+# Every tool call a boundary turn lets through carries an id starting with this, minted by the provider (Boundary.mark),
+# never the model's own. The client hook fails closed on any error for such an id, even when it cannot reach the
+# provider; an id without it is not the boundary's and passes. Starts like Anthropic's own ids (toolu_).
+MARK_PREFIX = "toolu_cxb_"
+_MARK_RE = re.compile(re.escape(MARK_PREFIX) + r"[0-9a-f]{24}")
+# The ledger's bounds: a record lives LEDGER_TTL_S (a tool call runs seconds after its reply; an hour covers a permission
+# prompt left open), at most LEDGER_MAX_PER_CONVERSATION per conversation and LEDGER_MAX in all (oldest out first).
+LEDGER_TTL_S = 3600.0
+LEDGER_MAX = 4096
+LEDGER_MAX_PER_CONVERSATION = 256
+# The write tools the hook checks, and the input key naming the target (WRITE_TOOLS, sent in check_answer).
+HOOK_TOOLS = frozenset(WRITE_TOOLS) | SHELL_TOOLS
 
-    def __init__(self, reason: Any, project: str | None):
+
+def is_marked(tool_use_id: Any) -> bool:
+    """Whether `tool_use_id` has the shape of an id the boundary minted."""
+    return isinstance(tool_use_id, str) and bool(_MARK_RE.fullmatch(tool_use_id))
+
+
+class BoundaryLedger:
+    """The provider's record of every tool call a boundary turn let through: tool_use id -> (conversation, tool,
+    profile, project, expiry). Bounded (max_total, max_per_conversation; the oldest goes first) and expiring (ttl_s).
+    Thread-safe. Metadata only: never a tool input or a file content."""
+
+    def __init__(self, ttl_s: float = LEDGER_TTL_S, max_total: int = LEDGER_MAX,
+                 max_per_conversation: int = LEDGER_MAX_PER_CONVERSATION, clock=time.time):
+        self.ttl_s, self.max_total, self.max_per_conversation, self.clock = ttl_s, max_total, max_per_conversation, clock
+        self._lock = threading.Lock()
+        self._records: "OrderedDict[str, dict[str, Any]]" = OrderedDict()   # insertion order is expiry order
+        self._per_conversation: dict[str, list[str]] = {}
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._records)
+
+    def _drop(self, tid: str) -> None:
+        rec = self._records.pop(tid, None)
+        if rec is None:
+            return
+        ids = self._per_conversation.get(rec["conversation"])
+        if ids is not None:
+            try:
+                ids.remove(tid)
+            except ValueError:
+                pass
+            if not ids:
+                del self._per_conversation[rec["conversation"]]
+
+    def _expire(self, now: float) -> None:
+        while self._records:
+            tid, rec = next(iter(self._records.items()))
+            if rec["expires"] > now:
+                return
+            self._drop(tid)
+
+    def record(self, conversation: Any, tool: Any, profile: str, project: str | None) -> str:
+        """Mint a new marked id for one tool call and record it; returns the id."""
+        conv = conversation if isinstance(conversation, str) and conversation else "-"
+        tid = MARK_PREFIX + secrets.token_hex(12)
+        with self._lock:
+            now = self.clock()
+            self._expire(now)
+            ids = self._per_conversation.setdefault(conv, [])
+            while len(ids) >= self.max_per_conversation:
+                self._drop(ids[0])
+                ids = self._per_conversation.setdefault(conv, [])
+            while len(self._records) >= self.max_total:
+                self._drop(next(iter(self._records)))
+            self._records[tid] = {"conversation": conv, "tool": tool if isinstance(tool, str) else None,
+                                  "profile": profile, "project": project, "expires": now + self.ttl_s}
+            self._per_conversation.setdefault(conv, []).append(tid)
+        return tid
+
+    def lookup(self, tool_use_id: Any) -> dict[str, Any] | None:
+        """The live record of `tool_use_id` (a copy), or None: unknown, expired or not a marked id."""
+        if not is_marked(tool_use_id):
+            return None
+        with self._lock:
+            self._expire(self.clock())
+            rec = self._records.get(tool_use_id)
+            return dict(rec) if rec else None
+
+    def clear(self) -> None:
+        with self._lock:
+            self._records.clear()
+            self._per_conversation.clear()
+
+
+# The provider's one ledger (the check endpoint reads it; local_lane's boundary turns write it).
+LEDGER = BoundaryLedger()
+
+
+def protected_rules(profile: str) -> dict[str, Any]:
+    """PROTECTED_PATHS as the hook applies them under `profile` (the build files only on non-COST profiles)."""
+    return {"root_dotfiles": True,
+            "components": sorted(PROTECTED_PATHS["components"]),
+            "component_pairs": sorted([list(p) for p in PROTECTED_PATHS["component_pairs"]]),
+            "names": sorted(PROTECTED_PATHS["names"]),
+            "build_files": [] if profile == COST else sorted(PROTECTED_PATHS["build_files"])}
+
+
+def check_answer(tool_use_id: Any, ledger: BoundaryLedger | None = None) -> dict[str, Any]:
+    """POST /v1/cortados/boundary/check's answer for `tool_use_id`. {"known": False, "marked": bool} when there is no
+    live record; else the record (tool, profile, project, the file-writing tools and their input keys, the protected
+    path rules, bash: allowed or not, expires_in). Metadata only."""
+    rec = (ledger or LEDGER).lookup(tool_use_id)
+    if rec is None:
+        return {"known": False, "marked": is_marked(tool_use_id)}
+    profile = rec["profile"]
+    return {"known": True, "marked": True, "tool": rec["tool"], "profile": profile, "project": rec["project"],
+            "write_tools": dict(WRITE_TOOLS), "bash": profile == COST, "protected": protected_rules(profile),
+            "expires_in": max(0, int(rec["expires"] - (ledger or LEDGER).clock()))}
+
+
+class Boundary:
+    """The boundary of one automatic-local turn: its bind reason, the profile it maps to, the project folder read
+    from the request (project_dir), whether the client runs the boundary hook (HOOK_HEADER), and the conversation its
+    tool calls are recorded under. local_lane.serve / complete build one per turn (for_turn).
+
+    A SENSITIVE turn from a client without the hook is read-only: the file-writing tools are cut from `tools` and an
+    emitted one is blocked ("write-no-hook")."""
+
+    def __init__(self, reason: Any, project: str | None, *, hook: bool = False, conversation: Any = None,
+                 ledger: BoundaryLedger | None = None):
         self.reason = reason if isinstance(reason, str) else None
         self.profile = profile_for(reason)
         self.project = project
-        self.tools = PROFILE_TOOLS[self.profile]
+        self.hook = hook is True
+        self.read_only = self.profile == SENSITIVE and not self.hook
+        self.tools = PROFILE_TOOLS[self.profile] - (frozenset(WRITE_TOOLS) if self.read_only else frozenset())
+        self.conversation = conversation if isinstance(conversation, str) else None
+        self.ledger = ledger or LEDGER
 
     @classmethod
-    def for_turn(cls, reason: Any, body: dict[str, Any]) -> "Boundary":
-        b = cls(reason, project_dir(body))
+    def for_turn(cls, reason: Any, body: dict[str, Any], *, hook: bool = False, conversation: Any = None,
+                 ledger: BoundaryLedger | None = None) -> "Boundary":
+        b = cls(reason, project_dir(body), hook=hook, conversation=conversation, ledger=ledger)
         if b.reason not in BIND_PROFILES:
             logger.warning("effect boundary: bind reason %r unknown; the %s profile applies", b.reason, SENSITIVE)
+        if b.read_only:
+            logger.info("effect boundary: no %s on a %s turn: read-only", HOOK_HEADER, SENSITIVE)
         return b
 
     def tools_for_node(self, body: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-        return tools_for_node(body, self.profile)
+        out, dropped = tools_for_node(body, self.profile)
+        if self.read_only and isinstance(out.get("tools"), list):
+            kept = [t for t in out["tools"] if t.get("name") not in WRITE_TOOLS]
+            if len(kept) != len(out["tools"]):
+                dropped = dropped + [t["name"] for t in out["tools"] if t.get("name") in WRITE_TOOLS]
+                out = dict(out, tools=kept)
+                choice = out.get("tool_choice")
+                if isinstance(choice, dict) and (choice.get("type") == "tool" and choice.get("name") in WRITE_TOOLS
+                                                 or choice.get("type") == "any" and not kept):
+                    out.pop("tool_choice")
+        return out, dropped
+
+    def name_rule(self, name: Any) -> str | None:
+        """The rule refusing a tool by its name alone under this boundary, or None."""
+        if self.read_only and name in WRITE_TOOLS:
+            return "write-no-hook"
+        if not isinstance(name, str) or name not in self.tools:
+            return "tool-not-allowed"
+        return None
 
     def blocked_call(self, name: Any, tool_input: Any) -> str | None:
-        return blocked_call(name, tool_input, self.profile, self.project)
+        return self.name_rule(name) or blocked_call(name, tool_input, self.profile, self.project)
 
     def blocked_reply(self, blocks: Any) -> tuple[str, str] | None:
         return blocked_reply(blocks, self)
+
+    def mark(self, name: Any) -> str:
+        """A new id for a tool call this boundary let through, recorded in the ledger (the client hook's source)."""
+        return self.ledger.record(self.conversation, name, self.profile, self.project)
+
+    def mark_blocks(self, blocks: Any) -> None:
+        """Give every tool-call block of a judged, allowed reply a minted id (in place)."""
+        for b in blocks if isinstance(blocks, list) else []:
+            if isinstance(b, dict) and b.get("type") not in PLAIN_BLOCKS and "id" in b:
+                b["id"] = self.mark(b.get("name"))
 
 
 # Content block types a reply may carry without inspection; any other block (tool_use, server_tool_use, an unknown

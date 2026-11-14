@@ -154,7 +154,7 @@ The allow path (reading, inspection, connectors) never makes that check. A bug i
 is noted once in the transcript).
 
 **Never gated:** subagents, teammates and engine forks (any call with an `agentId`), CortadOS child tasks
-(`CORTADOS_CHILD_TASK` set; they also run with this plugin disabled), routed subagents (their hooks are disabled), and
+(`CORTADOS_CHILD_TASK` set; they also run with this plugin disabled), routed subagents (this mod is disabled and inert in them: `CORTADOS_ROUTED_SUBAGENT`), and
 every session with `orchestratorMode` off.
 
 **Status line.** `gate balanced; 2 denied`, joined with the warn guard's counter when it has one
@@ -258,6 +258,33 @@ and `permissionMode: bypassPermissions`), a routed — and possibly cheap — mo
 unattended. That is the full-agentic setting. To narrow it, drop tools from `allowedTools` (e.g. remove `Bash`,
 `Write`, `Edit` for a read-only researcher) or set `permissionMode` to `acceptEdits` (auto-approve edits, no
 unattended Bash) or `default`.
+
+## Boundary hook (local-routed turns)
+
+Since 0.4.0 every routed subagent runs the CortadOS **boundary hook** (`docs/BOUNDARY-HOOK.md`). When S1 routes a
+child's turn automatically to a **local** model, the provider's effect boundary limits its tools (sensitive routes: no
+shell, edits only inside the project; cost routes: Bash checked against the outward patterns). The tools run here, so
+a symlink that exists only on this machine (`/repo/escape -> /outside`) is invisible to the provider. The hook closes
+that: a PreToolUse command hook in the child's `--settings` (`routedChildSettings`, matcher
+`Write|Edit|MultiEdit|NotebookEdit|Bash`) asks the provider (`POST /v1/cortados/boundary/check`, the provider token,
+the tool_use id only) about each call, resolves the target with `realpath` **on this machine**, and denies a write
+outside the real project folder or onto a protected path, and Bash on a sensitive route. Calls the provider does not
+know (cloud-routed turns) pass unchanged; a provider-marked call (`toolu_cxb_…`) is denied on any error, the provider
+unreachable included. The child announces the hook with `x-cortados-boundary-hook: 1`; a client without it gets
+sensitive local turns read-only.
+
+The hook is `cortados_router/boundary_hook.py`, embedded verbatim as `BOUNDARY_HOOK_PY` and run as
+`python3 -B -c <source>`, so it needs `python3` (3.9 or later) on `PATH`. Updating from 0.3.x: see **Updating**.
+
+## Updating
+
+```
+/plugin marketplace update cortados-router
+/plugin update cortados-routed-subagents@cortados-router
+```
+
+then restart Claude Code (a running session keeps the old module). Nothing to configure: the hook ships inside the
+mod. Check with `/plugin` that `cortados-routed-subagents` shows 0.4.0.
 
 ## What is not routed
 
@@ -365,5 +392,6 @@ Run from the repository root. This covers `hooks/register.test.ts`, `hooks/guard
 
 - Claude Code logs `unrecognized_model: cortados` and assumes a 200k context window for the routed subprocess.
   Cosmetic; the route still works.
-- Recursion is prevented: each routed subprocess runs with hooks disabled, so it will not re-intercept and route
-  its own subagents.
+- Recursion is prevented: each routed subprocess runs with this mod disabled in its `--settings` and
+  `CORTADOS_ROUTED_SUBAGENT=1` in its env (every handler then passes through), so it will not re-intercept and route
+  its own subagents. Its only hook is the boundary hook (since 0.4.0; it was `disableAllHooks` before).

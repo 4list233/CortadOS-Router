@@ -3,6 +3,7 @@ import { SHARED_SALT_TRIES, SHARED_SALT_RETRY_MS } from './register'
 import officeVectors from './office-vectors.fixture'
 import { resolveProviderUrl, officeTitle, officeName, baseName, sessionTag, officeHeaderLines, OFFICE_SALT_KEY, OFFICE_BEAT_MIN_MS, OFFICE_BEAT_REFRESH_MS, OFFICE_BEAT_TIMEOUT_MS } from './register'
 import { BG_SWEEP_SH, BG_SWEEP_MS, sweepBackgroundRuns } from './register'
+import { routedChildSettings, BOUNDARY_HOOK_PY, ROUTED_CHILD_ENV } from './register'
 import { MODEL_DIRECTIVE_RE, modelDirective, directiveModelId } from './register'
 import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, refusesAgent, isDelegationTool, AGENT_REFUSAL, ORCHESTRATOR_DIRECTIVE, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL, resolveBackgroundTimeoutMs, BG_LAUNCH_SH, BG_CLEANUP_SH, BACKGROUND_DATA_BOUNDARY, backgroundData, isBgDir } from './register'
 
@@ -97,12 +98,17 @@ test('provider URL resolves HTTPS config, env and files without silent fallback'
 
 const RUN_ID = /^[A-Za-z0-9_-]{8,64}$/
 
-/** Split ANTHROPIC_CUSTOM_HEADERS into the lines before the trailing run-id line, and the run id (asserted well-formed). */
+/** Split ANTHROPIC_CUSTOM_HEADERS into the lines before the trailing run-id line, and the run id (asserted well-formed).
+ * Every routed child also carries the boundary-hook line (docs/BOUNDARY-HOOK.md): asserted present, left out of base. */
 function splitRunId(h: string | undefined): { base: string; runId: string } {
   const m = /^([\s\S]*)\nx-cortados-run-id: (\S+)$/.exec(String(h))
   expect(m).not.toBe(null)
   expect(RUN_ID.test(m![2])).toBe(true)
-  return { base: m![1], runId: m![2] }
+  const lines = m![1].split('\n')
+  const i = lines.indexOf('x-cortados-boundary-hook: 1')
+  expect(i).toBeGreaterThan(0)
+  lines.splice(i, 1)
+  return { base: lines.join('\n'), runId: m![2] }
 }
 
 test('validToolName accepts built-in and MCP names, rejects punctuation', async () => {
@@ -377,7 +383,8 @@ test('the routed child is started with the provider credentials and CLAUDE_CODE_
     ANTHROPIC_API_KEY: 'tok',
     ANTHROPIC_AUTH_TOKEN: 'tok',
     CLAUDE_CODE_ENTRYPOINT: 'cli',
-    ANTHROPIC_CUSTOM_HEADERS: 'x-cortados-reveal: 1\nx-cortados-run-id: ' + runId,
+    ANTHROPIC_CUSTOM_HEADERS: 'x-cortados-reveal: 1\nx-cortados-boundary-hook: 1\nx-cortados-run-id: ' + runId,
+    CORTADOS_ROUTED_SUBAGENT: '1',
     ANTHROPIC_UNIX_SOCKET: '',
     CLAUDE_CODE_USE_BEDROCK: '',
     CLAUDE_CODE_USE_VERTEX: '',
@@ -388,6 +395,15 @@ test('the routed child is started with the provider credentials and CLAUDE_CODE_
   })
   // The child loads no user/project settings, so a settings env block can't override the launch env above.
   expect(recordedArgv).toContain('--setting-sources')
+  // Its --settings install the boundary hook (docs/BOUNDARY-HOOK.md), keep hooks on and this mod off.
+  const settings = JSON.parse(recordedArgv[recordedArgv.indexOf('--settings') + 1])
+  expect(settings).toEqual(routedChildSettings())
+  expect(settings.disableAllHooks).toBe(false)
+  expect(settings.enabledPlugins['cortados-routed-subagents@cortados-router']).toBe(false)
+  const pre = settings.hooks.PreToolUse[0]
+  expect(pre.matcher).toBe('Write|Edit|MultiEdit|NotebookEdit|Bash')
+  expect(pre.hooks[0].command.startsWith("python3 -B -c '")).toBe(true)
+  expect(pre.hooks[0].command).toContain('toolu_cxb_')
   // The child starts with no MCP servers: built-in tools only, nothing of the parent's exposed to the provider.
   expect(recordedArgv).toContain('--strict-mcp-config')
   const mcpIdx = recordedArgv.indexOf('--mcp-config')
@@ -1946,4 +1962,22 @@ test('a background directive-pinned excluded review fails without retry', async 
   await agentHandlerFor({})($, { ...bgEvent, prompt: '[cortados: model=opus]\ncheck it', description: 'review' }, async () => 'native')
   expect(await done).toContain('did not complete cleanly')
   expect(seen.cleaned).toEqual([BG_DIR])
+})
+
+test('inside a routed child (CORTADOS_ROUTED_SUBAGENT set) every handler of this mod passes straight through', async () => {
+  const handlers: Record<string, any> = {}
+  const on = (event: string, a: any, b?: any) => {
+    handlers[b === undefined ? event : `${event}:${a.tool ?? a.type ?? a.command ?? ''}`] = b ?? a
+    return { catch() {} }
+  }
+  register(on as any, {} as any)
+  let launched = false
+  const $ = {
+    env: { get: async (k: string) => (k === ROUTED_CHILD_ENV ? '1' : undefined) },
+    process: { run: async () => { launched = true; return { exitCode: 0, stdout: '', stderr: '' } } },
+  }
+  const out = await handlers['tool.call:Agent']($, { prompt: 'p', description: 'd', subagent_type: 'general-purpose' }, async (e: any) => ({ native: e.prompt }))
+  expect(out).toEqual({ native: 'p' })
+  expect(launched).toBe(false)
+  expect(BOUNDARY_HOOK_PY).toContain('def decide(event')
 })

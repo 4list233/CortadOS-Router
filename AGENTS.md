@@ -23,6 +23,9 @@ is the long form.
   `orchestrator_usage.py` (the owner's main Claude Code sessions' own tokens from local transcripts, direct-model
   subagents included as a sub-total; child-task transcripts, the provider's bridge/search-lane scratch-dir transcripts
   and provider-served messages excluded; sent in the heartbeat's `orchestrator` block, README "Work split"),
+  `boundary_hook.py` (the client-side PreToolUse boundary hook of local-routed turns: asks the provider's
+  `/v1/cortados/boundary/check` about each write/Bash tool_use and resolves paths with realpath on the client; installed
+  by `session.py` in every child and embedded in the routed-subagents mod; docs/BOUNDARY-HOOK.md),
   `exec_hosts.py` (which machine a child runs on: `~/.config/cortados/exec-hosts.json`, ssh transport), `workspaces.py`
   (per-task repo worktrees / folders under `<root>/active`, archive-or-held settling, index.jsonl, archive-only cleanup).
 - `cortados_router/provider/` — the `cortados` model endpoint (design and status: `docs/PROVIDER-PLAN.md`).
