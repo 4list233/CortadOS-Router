@@ -988,14 +988,18 @@ idempotent migration in `core._db`; older rows stay NULL = not recorded), tagged
 `x-cortados-session`. `GET /v1/cortados/tasks` carries per-row `tokens` and `token_totals`; the live view's
 `routed.totals.tokens` has them per window (24 h, 7 d), overall, by session tag and by lane/model. Orchestrator side:
 `cortados_router/orchestrator_usage.py` sums the main sessions' own `message.usage` from `~/.claude/projects/*/*.jsonl`
-(top-level transcripts only; sidechain lines, subagent files, child-task folders and messages served by the provider —
-`cortados`, `sub/…`, `api/…` — excluded; deduplicated by message id) and the heartbeat sender posts it as an
-`orchestrator` block (metadata only: Office session tags, never a raw session id, path or text; rescanned every 5 min).
+and their subagents' `<session>/subagents/*.jsonl` (an Agent-tool subagent on a direct model is the main session's own
+spend: counted on its session and again in a per-window `subagent` sub-total; child-task folders, the provider's own
+headless CLIs — the Claude lane's `cortados-bridge-*/work` and the search lane's `cortados-search-*` scratch dirs,
+whose transcripts land in the same folder on the provider host and whose turns router.db already has
+(`provider_bridge_files`) — and messages served by the provider — `cortados`, `sub/…`, `api/…` — excluded;
+deduplicated by message id) and the heartbeat sender posts it as an `orchestrator` block (metadata only: Office session tags, never a raw session id, path or text; rescanned every 5 min).
 Turn it on where the main sessions run: `scripts/install_live_heartbeat.sh air --orchestrator --force` (or add
 `"orchestrator": {}` to heartbeat.json). Check by hand: `python3 -B -m cortados_router.orchestrator_usage`. The live
 view's `work_split` section joins the two by session tag; % routed = routed fresh ÷ (orchestrator fresh + routed
 fresh), fresh = input + output + cache writes (cache reads are shown beside it). The definition is published in the
-section and shown on the dashboard's Work split panel.
+section and shown on the dashboard's Work split panel. A heartbeat that would exceed the server's byte cap is sent
+without its `orchestrator` block (said on stderr) rather than not at all.
 
 The dashboard's **Live** tab reads it every 5 s while the tab is visible: an overview strip (running tasks, active
 conversations, S1 health, the lowest subscription, host heartbeats), the Tasks panel (running first, elapsed ticking each

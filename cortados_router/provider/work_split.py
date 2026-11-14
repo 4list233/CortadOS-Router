@@ -8,7 +8,9 @@ Two sides, one unit:
                   (child_tasks passes it on), so they land on their orchestrator's session.
   - orchestrator  tokens the main sessions spent directly with Anthropic, read from their transcripts on the machine
                   that ran them (cortados_router/orchestrator_usage.py) and posted in that host's live heartbeat
-                  (`orchestrator` block). Child-task and subagent transcripts are excluded there.
+                  (`orchestrator` block). Direct-model Agent-tool subagents count here (also as the `subagent`
+                  sub-total); child-task transcripts, the provider's own headless CLIs and provider-served messages
+                  are excluded there.
 The join key is the Office session tag (sha256 of the mod's salt and the session id, 16 hex): both sides compute the
 same one, and neither ever carries the raw session id.
 
@@ -45,8 +47,9 @@ SESSIONS_MAX = 40          # joined session rows in the live section
 ORCH_STALE_S = 15 * 60     # an orchestrator block older than this (sender scans every 5 min) is shown stale
 DEFINITION = (
     "Tokens, per window (24h, 7d). Orchestrator = what the owner's main Claude Code sessions spent directly with "
-    "Anthropic, read from their local transcripts (subagent and child-task transcripts excluded) and reported by each "
-    "host's heartbeat. Routed = what the CortadOS provider's backends reported for routed conversations (child tasks, "
+    "Anthropic, read from their local transcripts and reported by each host's heartbeat; it includes their Agent-tool "
+    "subagents that ran on a direct model (shown again as the 'subagent' sub-total) and excludes child-task transcripts, "
+    "the provider's own headless CLIs and any message served by the provider. Routed = what the CortadOS provider's backends reported for routed conversations (child tasks, "
     "routed subagents, route_task), joined to the main session by its Office session tag. Fresh tokens = input + output "
     "+ cache writes; 'all' adds cache reads. % routed = routed fresh ÷ (orchestrator fresh + routed fresh). A routed "
     "conversation counts in the window it was routed in; an orchestrator message by its own time. Local-lane and "
@@ -121,8 +124,10 @@ def routed_tokens(conn: sqlite3.Connection, now: float, windows: dict[str, int] 
 
 
 # ================================================================ the heartbeat block (provider side)
-_HB_KEYS = {"version", "sampled_at", "salt", "windows", "totals", "sessions", "sessions_hidden", "excluded"}
-_EXCL_KEYS = ("child_task_files", "sidechain_entries", "routed_model_entries", "unreadable_files", "bad_lines")
+_HB_KEYS = {"version", "sampled_at", "salt", "windows", "totals", "subagent", "sessions", "sessions_hidden", "excluded"}
+# sidechain_entries: sent by senders from before subagents were counted (they skipped sidechain lines); still accepted
+_EXCL_KEYS = ("child_task_files", "provider_bridge_files", "sidechain_entries", "routed_model_entries",
+              "unreadable_files", "bad_lines")
 _TAG_RE = office._HEADER_RULES[office.SESSION_HEADER]
 _PROJECT_RE = office._HEADER_RULES[office.PROJECT_HEADER]
 
@@ -158,6 +163,18 @@ def validate_block(b: Any, now: float, skew_s: float) -> tuple[dict[str, Any] | 
         if t is None or not _count(n):
             return None, f".totals.{w}"
         out_totals[w] = {**t, "sessions": n}
+    # the direct-model subagent sub-total of `totals`; None from a sender that predates it (not known, not zero)
+    sub = b.get("subagent")
+    out_sub = None
+    if sub is not None:
+        if not isinstance(sub, dict) or set(sub) != set(WINDOWS):
+            return None, ".subagent"
+        out_sub = {}
+        for w in WINDOWS:
+            t = _tokens(sub[w])
+            if t is None or isinstance(sub[w], dict) and "sessions" in sub[w]:
+                return None, f".subagent.{w}"
+            out_sub[w] = t
     sessions = b.get("sessions", [])
     if not isinstance(sessions, list) or len(sessions) > ou.SESSIONS_MAX:
         return None, ".sessions"
@@ -192,7 +209,7 @@ def validate_block(b: Any, now: float, skew_s: float) -> tuple[dict[str, Any] | 
         return None, ".excluded"
     if b.get("salt") is not None and type(b["salt"]) is not bool:
         return None, ".salt"
-    return {"sampled_at": round(float(at), 3), "salt": bool(b.get("salt")), "totals": out_totals,
+    return {"sampled_at": round(float(at), 3), "salt": bool(b.get("salt")), "totals": out_totals, "subagent": out_sub,
             "sessions": out_sessions, "sessions_hidden": hidden,
             "excluded": {k: ex.get(k, 0) for k in _EXCL_KEYS}}, None
 
@@ -205,6 +222,7 @@ def section(routed: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]]
     errors = list(errors or [])
     hosts, orch_rows = [], []
     orch_tot = {w: _zero() for w in WINDOWS}
+    sub_tot: dict[str, dict[str, int] | None] = {w: _zero() for w in WINDOWS}
     for host, hb in sorted((heartbeats or {}).items()):
         o = hb.get("orchestrator") if isinstance(hb, dict) else None
         if not isinstance(o, dict):
@@ -214,6 +232,10 @@ def section(routed: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]]
                       "salt": o["salt"], "sessions_hidden": o["sessions_hidden"], "excluded": o["excluded"]})
         for w in WINDOWS:
             _add(orch_tot[w], o["totals"][w])
+            if o.get("subagent") is None:
+                sub_tot[w] = None               # a host that does not split it out: the sum is not known
+            elif sub_tot[w] is not None:
+                _add(sub_tot[w], o["subagent"][w])
         for s in o["sessions"]:
             orch_rows.append({**s, "host": host})
     if not hosts:
@@ -230,6 +252,7 @@ def section(routed: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]]
         rt = {k: int((rw.get("totals") or {}).get(k) or 0) for k in TOKEN_FIELDS}
         o, r = _with_sums(orch_tot[w]), _with_sums(rt)
         overall[w] = {"orchestrator": o, "routed": r,
+                      "orchestrator_subagent": _with_sums(sub_tot[w]) if hosts and sub_tot[w] is not None else None,
                       "routed_pct": _pct(r["fresh"], o["fresh"] + r["fresh"]),
                       "routed_pct_all": _pct(r["all"], o["all"] + r["all"]),
                       "routed_by_model": list(rw.get("by_model") or []),

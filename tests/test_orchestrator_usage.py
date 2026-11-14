@@ -80,20 +80,65 @@ class ScanTest(unittest.TestCase):
         import hashlib
         self.assertEqual(ou.session_tag(SALT, MAIN), hashlib.sha256(f"{SALT}:{MAIN}".encode()).hexdigest()[:16])
 
-    def test_subagents_sidechains_and_routed_models_are_not_the_orchestrators(self):
+    def test_direct_model_subagents_count_as_orchestrator_routed_ones_do_not(self):
         self.write(f"-Users-o-code-X/{MAIN}.jsonl", [
             line(MAIN, "m1", NOW - 60, inp=1, out=2, cwd="/Users/o/code/X"),
-            line(MAIN, "m2", NOW - 60, inp=100, out=100, cwd="/Users/o/code/X", isSidechain=True),
+            line(MAIN, "m2", NOW - 60, inp=10, out=10, cwd="/Users/o/code/X", isSidechain=True),
             line(MAIN, "m3", NOW - 60, inp=100, out=100, cwd="/Users/o/code/X", model="cortados"),
             line(MAIN, "m4", NOW - 60, inp=100, out=100, cwd="/Users/o/code/X", model="sub/gpt-6.1-sol"),
             line(MAIN, "m6", NOW - 60, inp=100, out=100, cwd="/Users/o/code/X", model="api/claude-haiku-5"),
         ])
-        # a subagent's own transcript lives one level down: never opened
-        self.write(f"-Users-o-code-X/{MAIN}/subagents/agent-1.jsonl",
-                   [line(MAIN, "m5", NOW - 60, inp=500, out=500, cwd="/Users/o/code/X")])
+        # a subagent's own transcript, one level down: an Agent-tool subagent on a direct model is the main session's
+        # work (its session id is the parent's, also when a line has none); a routed one asks for `cortados`
+        self.write(f"-Users-o-code-X/{MAIN}/subagents/agent-1.jsonl", [
+            line(MAIN, "m5", NOW - 60, inp=500, out=500, cwd="/Users/o/code/X", isSidechain=True,
+                 model="claude-sonnet-5"),
+            line(None, "m7", NOW - 3 * 86400, inp=7, cwd="/Users/o/code/X", isSidechain=True, sessionId=None),
+            line(MAIN, "m8", NOW - 60, inp=900, out=900, cwd="/Users/o/code/X", isSidechain=True, model="cortados"),
+        ])
         s = self.scan()
-        self.assertEqual(s["totals"]["24h"], {"input": 1, "output": 2, "cache_read": 0, "cache_write": 0, "sessions": 1})
-        self.assertEqual((s["excluded"]["sidechain_entries"], s["excluded"]["routed_model_entries"]), (1, 3))
+        self.assertEqual(s["totals"]["24h"], {"input": 511, "output": 512, "cache_read": 0, "cache_write": 0, "sessions": 1})
+        self.assertEqual(s["totals"]["7d"]["input"], 518)
+        self.assertEqual(s["subagent"]["24h"], {"input": 510, "output": 510, "cache_read": 0, "cache_write": 0})
+        self.assertEqual(s["subagent"]["7d"]["input"], 517)
+        [row] = s["sessions"]                    # one session: the subagents' tokens are on their main session's row
+        self.assertEqual((row["session"], row["24h"]["input"]), (ou.session_tag(SALT, MAIN), 511))
+        self.assertEqual(s["excluded"]["routed_model_entries"], 4)
+        self.assertNotIn("sidechain_entries", s["excluded"])
+        self.assertIsNone(work_split.validate_block(s, NOW, live.TIME_SKEW_S)[1])
+
+    def test_provider_bridge_transcripts_are_not_the_orchestrators(self):
+        """The provider's Claude lane runs `claude -p` on the default login in <tmp>/cortados-bridge-<random>/work: its
+        transcript lands in the same projects dir on a real model, and the same turn is in router.db (log_tokens)."""
+        from cortados_router.provider import bridge, search_lane
+        bwork = f"/private/var/folders/x/T/{bridge.SCRATCH_PREFIX}k3_9zq1a/work"
+        swork = f"/private/var/folders/x/T/{search_lane.SCRATCH_PREFIX}p0q1r2s3"
+        # by cwd
+        self.write(f"{ou._slug(bwork)}/{CHILD}.jsonl",
+                   [line(CHILD, "b1", NOW - 60, inp=800, out=80, model="claude-opus-5-5", cwd=bwork)])
+        # by slug alone (no cwd), the search lane's one-shot CLI too
+        self.write(f"{ou._slug(swork)}/{OTHER}.jsonl",
+                   [line(OTHER, "b2", NOW - 60, inp=800, model="claude-haiku-4-5-20251001", cwd=None)])
+        # by cwd while the slug looks ordinary (a cwd is the stronger evidence)
+        self.write(f"-Users-o-elsewhere/{OTHER}z.jsonl",
+                   [line(OTHER + "z", "b3", NOW - 60, inp=800, model="claude-opus-5-5", cwd=bwork)])
+        # a main session whose project name merely mentions the bridge
+        self.write(f"-Users-o-code-cortados-bridge/{MAIN}.jsonl",
+                   [line(MAIN, "m1", NOW - 60, inp=3, cwd="/Users/o/code/cortados-bridge")])
+        s = self.scan()
+        self.assertEqual(s["totals"]["24h"]["input"], 3)
+        self.assertEqual(s["excluded"]["provider_bridge_files"], 3)
+        self.assertEqual(s["excluded"]["child_task_files"], 0)
+        self.assertEqual([r["project"] for r in s["sessions"]], ["cortados-bridge"])
+        self.assertIsNone(work_split.validate_block(s, NOW, live.TIME_SKEW_S)[1])
+
+    def test_the_scratch_prefixes_are_the_bridges_own(self):
+        import tempfile as tf
+        from cortados_router.provider import bridge, search_lane
+        self.assertEqual(ou.PROVIDER_SCRATCH_PREFIXES, (bridge.SCRATCH_PREFIX, search_lane.SCRATCH_PREFIX))
+        d = Path(tf.mkdtemp(prefix=bridge.SCRATCH_PREFIX, dir=self.root)) / bridge.SCRATCH_WORK
+        self.assertTrue(ou.is_provider_path(str(d), ""))
+        self.assertTrue(ou.is_provider_path(None, ou._slug(str(d))))
 
     def test_child_task_transcripts_are_excluded_by_cwd_or_slug(self):
         task = "t20261113153431-36062624"

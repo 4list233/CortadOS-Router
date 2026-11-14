@@ -8,9 +8,18 @@ returns a metadata-only summary; live_heartbeat.py sends it to the provider (POS
 `orchestrator` block) and the live view sets it against the routed tokens in router.db (provider/work_split.py).
 
 What counts, and why:
-  - Only top-level transcripts (<projects>/<slug>/*.jsonl). A session's subagents write their own files under
-    <slug>/<session id>/subagents/; those, and any line marked isSidechain, are delegated work, not the orchestrator's.
-    The Agent tool's subagents run on `cortados` (routed) and are counted on the routed side from router.db.
+  - Top-level transcripts (<projects>/<slug>/*.jsonl) and the session's subagent transcripts
+    (<slug>/<session id>/subagents/*.jsonl, lines marked isSidechain). A subagent the Agent tool ran on a direct
+    Anthropic model was paid for by the main session's login and served by nobody else, so it is orchestrator work:
+    counted in the totals and its session's row, and also in a separate `subagent` sub-total per window. A subagent
+    routed through the provider asks for `cortados` or a pin (below), so it is skipped here by its model and counted on
+    the routed side from router.db.
+  - The provider's own headless CLIs are not orchestrators: the Claude lane (provider/bridge.py) and the search lane
+    (provider/search_lane.py) run `claude -p` in a scratch dir named bridge.SCRATCH_PREFIX / search_lane.SCRATCH_PREFIX
+    + random, and on the default login (no routed account config dir) their transcripts land in this projects dir on
+    the provider host, on a real model. That work is routed (core.log_tokens records the bridge's turns), so a
+    transcript whose cwd (or, without a cwd, project slug) is in such a scratch dir is skipped (provider_bridge_files).
+    The Codex lane (provider/codex_bridge.py) writes only under its CODEX_HOME, never here.
   - CortadOS child tasks are not orchestrators: they run in <task root>/{active,archive,held}/<task id> (workspaces.py),
     so a transcript whose cwd (or, without a cwd, project slug) is under such a folder is skipped. Their tokens are
     routed tokens (the provider served them).
@@ -47,6 +56,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+if __package__ in (None, ""):                       # run as a file: make the package importable
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from cortados_router.provider import bridge as _bridge, search_lane as _search_lane  # noqa: E402
+
 VERSION = 1
 DEFAULT_PROJECTS = "~/.claude/projects"
 # The mod's $.store file (Claude Code keeps one JSON per plugin under plugins/store); key officeSalt, 32 hex.
@@ -69,6 +82,8 @@ _PROJECT_RE = re.compile(r"[A-Za-z0-9._ -]{1,64}")   # office _HEADER_RULES[x-co
 _MODEL_RE = re.compile(r"[A-Za-z0-9._/\[\]:-]{1,64}")  # office._MODEL_RE
 ROUTED_MODELS = ("cortados",)                   # the provider's model name
 ROUTED_PREFIXES = ("sub/", "api/")              # the provider's subscription and API pins
+# The provider's headless CLIs' scratch dir prefixes (module doc): one shared constant each, never a copy of the string.
+PROVIDER_SCRATCH_PREFIXES = (_bridge.SCRATCH_PREFIX, _search_lane.SCRATCH_PREFIX)
 MAX_LINE_BYTES = 4 * 1024 * 1024                # an assistant line with a huge tool input is still read; larger is not usage
 
 
@@ -136,6 +151,15 @@ def is_child_path(cwd: str | None, slug: str, task_roots: Iterable[str] = ()) ->
     return any(slug.startswith(_slug(os.path.join(r, d)) + "-") for r in roots for d in TASK_DIRS)
 
 
+def is_provider_path(cwd: str | None, slug: str) -> bool:
+    """True when the session ran in one of the provider's scratch dirs (<tmp>/<bridge prefix><random>/work,
+    <tmp>/<search prefix><random>). Without a cwd the project slug is tested the same way."""
+    if cwd:
+        return any(part.startswith(p) and len(part) > len(p) for part in Path(cwd).parts
+                   for p in PROVIDER_SCRATCH_PREFIXES)
+    return any(re.search(rf"(?:^|-){re.escape(_slug(p))}[A-Za-z0-9]", slug) for p in PROVIDER_SCRATCH_PREFIXES)
+
+
 def _ts(value: Any) -> float | None:
     """An ISO-8601 timestamp ("2026-11-13T15:34:31.123Z") as epoch seconds, or None."""
     if not isinstance(value, str) or not value:
@@ -170,12 +194,17 @@ def scan(projects_dir: str | os.PathLike = DEFAULT_PROJECTS, *, now: float | Non
     windows = dict(WINDOWS if windows is None else windows)
     widest = max(windows.values())
     root = Path(os.path.expanduser(str(projects_dir)))
-    excl = {"child_task_files": 0, "sidechain_entries": 0, "routed_model_entries": 0, "unreadable_files": 0,
+    excl = {"child_task_files": 0, "provider_bridge_files": 0, "routed_model_entries": 0, "unreadable_files": 0,
             "bad_lines": 0}
-    # message key -> (session id, ts, model, tokens, cwd); the last line of a message wins
-    msgs: dict[str, tuple[str, float, str, dict[str, int], str | None]] = {}
-    files = sorted(root.glob("*/*.jsonl")) if root.is_dir() else []
-    for f in files:
+    # message key -> (session id, ts, model, tokens, cwd, sidechain); the last line of a message wins
+    msgs: dict[str, tuple[str, float, str, dict[str, int], str | None, bool]] = {}
+    files = []
+    if root.is_dir():
+        files = [(f, f.parent.name, f.stem) for f in root.glob("*/*.jsonl")]
+        # a session's subagents: <slug>/<session id>/subagents/*.jsonl (their session id is the parent's)
+        files += [(f, f.parents[2].name, f.parents[1].name) for f in root.glob("*/*/subagents/*.jsonl")]
+        files.sort()
+    for f, slug, file_sid in files:
         try:
             st = f.stat()
         except OSError:
@@ -183,12 +212,14 @@ def scan(projects_dir: str | os.PathLike = DEFAULT_PROJECTS, *, now: float | Non
             continue
         if st.st_mtime < now - widest:
             continue
-        slug = f.parent.name
+        if is_provider_path(None, slug):
+            excl["provider_bridge_files"] += 1
+            continue
         if is_child_path(None, slug, task_roots):
             excl["child_task_files"] += 1
             continue
-        file_msgs: dict[str, tuple[str, float, str, dict[str, int], str | None]] = {}
-        child = False
+        file_msgs: dict[str, tuple[str, float, str, dict[str, int], str | None, bool]] = {}
+        child = provider = False
         try:
             with open(f, "rb") as fh:
                 for raw in fh:
@@ -202,12 +233,12 @@ def scan(projects_dir: str | os.PathLike = DEFAULT_PROJECTS, *, now: float | Non
                     if not isinstance(e, dict) or e.get("type") != "assistant":
                         continue
                     cwd = e.get("cwd") if isinstance(e.get("cwd"), str) else None
+                    if cwd and is_provider_path(cwd, slug):
+                        provider = True
+                        break
                     if cwd and is_child_path(cwd, slug, task_roots):
                         child = True
                         break
-                    if e.get("isSidechain") is True:
-                        excl["sidechain_entries"] += 1
-                        continue
                     m = e.get("message")
                     if not isinstance(m, dict) or not isinstance(m.get("usage"), dict):
                         continue
@@ -218,16 +249,20 @@ def scan(projects_dir: str | os.PathLike = DEFAULT_PROJECTS, *, now: float | Non
                         excl["routed_model_entries"] += 1
                         continue
                     ts = _ts(e.get("timestamp"))
-                    sid = e.get("sessionId") if isinstance(e.get("sessionId"), str) else f.stem
+                    sid = e.get("sessionId") if isinstance(e.get("sessionId"), str) else file_sid
                     if ts is None or ts < now - widest or ts > now + 300:
                         continue
                     key = m.get("id") or e.get("requestId") or e.get("uuid")
                     if not isinstance(key, str) or not key:
                         continue
                     u = m["usage"]
-                    file_msgs[key] = (sid, ts, model, {k: _count(u.get(src)) for k, src in _USAGE_KEYS.items()}, cwd)
+                    file_msgs[key] = (sid, ts, model, {k: _count(u.get(src)) for k, src in _USAGE_KEYS.items()}, cwd,
+                                      e.get("isSidechain") is True)
         except OSError:
             excl["unreadable_files"] += 1
+            continue
+        if provider:
+            excl["provider_bridge_files"] += 1
             continue
         if child:
             excl["child_task_files"] += 1
@@ -236,12 +271,16 @@ def scan(projects_dir: str | os.PathLike = DEFAULT_PROJECTS, *, now: float | Non
     return summarize(msgs.values(), now=now, windows=windows, salt=salt, sessions_max=sessions_max, excluded=excl)
 
 
-def summarize(messages: Iterable[tuple[str, float, str, dict[str, int], str | None]], *, now: float,
+def summarize(messages: Iterable[tuple], *, now: float,
               windows: dict[str, int], salt: str | None, sessions_max: int, excluded: dict[str, int]) -> dict[str, Any]:
+    """messages: (session id, ts, model, tokens, cwd[, sidechain]). Sidechain (subagent) tokens count in the totals and
+    their session's row like the main loop's, and again in `subagent` (a sub-total of `totals`, per window)."""
     widest_name = max(windows, key=windows.get)
     totals = {w: {**_zero(), "sessions": 0} for w in windows}
+    subagent = {w: _zero() for w in windows}
     sessions: dict[str, dict[str, Any]] = {}
-    for sid, ts, model, tok, cwd in messages:
+    for sid, ts, model, tok, cwd, *rest in messages:
+        side = bool(rest and rest[0])
         s = sessions.setdefault(sid, {"windows": {w: _zero() for w in windows}, "models": {}, "last_at": 0.0,
                                       "project": None})
         s["last_at"] = max(s["last_at"], ts)
@@ -252,6 +291,8 @@ def summarize(messages: Iterable[tuple[str, float, str, dict[str, int], str | No
                 for k in TOKEN_FIELDS:
                     s["windows"][w][k] += tok[k]
                     totals[w][k] += tok[k]
+                    if side:
+                        subagent[w][k] += tok[k]
         if model:
             s["models"][model] = s["models"].get(model, 0) + fresh_tokens(tok)
     rows = []
@@ -267,6 +308,7 @@ def summarize(messages: Iterable[tuple[str, float, str, dict[str, int], str | No
     rows.sort(key=lambda r: (fresh_tokens(r[widest_name]), r["last_at"]), reverse=True)
     return {"version": VERSION, "sampled_at": round(now, 3), "salt": bool(salt),
             "windows": {w: int(span) for w, span in windows.items()}, "totals": totals,
+            "subagent": subagent,
             "sessions": rows[:sessions_max], "sessions_hidden": max(0, len(rows) - sessions_max),
             "excluded": dict(excluded)}
 
@@ -285,6 +327,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    if __package__ in (None, ""):
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     sys.exit(main())

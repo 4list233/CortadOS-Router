@@ -363,6 +363,10 @@ def build(cfg: dict[str, Any], *, run: Callable[..., Any] = subprocess.run,
     return body
 
 
+class OversizeError(ConfigError):
+    """The encoded heartbeat is over the server's byte cap."""
+
+
 def check(body: dict[str, Any], now: float | None = None) -> bytes:
     """The encoded body, after the server's own validation and byte cap; ConfigError naming the bad field otherwise."""
     _, bad = live.validate_heartbeat(body, time.time() if now is None else now)
@@ -370,8 +374,21 @@ def check(body: dict[str, Any], now: float | None = None) -> bytes:
         raise ConfigError(f"the heartbeat would be refused: field {bad}")
     raw = json.dumps(body, separators=(",", ":"), allow_nan=False).encode()
     if len(raw) > live.HEARTBEAT_MAX_BYTES:
-        raise ConfigError(f"the heartbeat is {len(raw)} bytes, over {live.HEARTBEAT_MAX_BYTES}")
+        raise OversizeError(f"the heartbeat is {len(raw)} bytes, over {live.HEARTBEAT_MAX_BYTES}")
     return raw
+
+
+def check_fit(body: dict[str, Any], now: float | None = None) -> tuple[dict[str, Any], bytes]:
+    """check(), except that an oversize body with an `orchestrator` block is sent without that block (said on stderr):
+    the work split is the optional part; the jobs, hardware and S1 must still arrive. Returns the body actually sent."""
+    try:
+        return body, check(body, now)
+    except OversizeError as exc:
+        if "orchestrator" not in body:
+            raise
+        print(f"live_heartbeat: {exc}; posting without the orchestrator block", file=sys.stderr)
+        body = {k: v for k, v in body.items() if k != "orchestrator"}
+        return body, check(body, now)
 
 
 def legacy(body: dict[str, Any]) -> dict[str, Any]:
@@ -431,7 +448,7 @@ def main(argv: list[str] | None = None, *, run: Callable[..., Any] = subprocess.
             print(f"live_heartbeat: config ok for host {cfg['host']} ({len(cfg['jobs'])} jobs)")
             return 0
         body = build(cfg, run=run, sample=sample, fetch=fetch, disk_usage=disk_usage, scan=scan, salt=salt)
-        raw = check(body)
+        body, raw = check_fit(body)
         if a.dry_run:
             print(json.dumps(body, indent=1))
             return 0

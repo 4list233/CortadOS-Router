@@ -14,6 +14,7 @@ import unittest
 import urllib.error
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from cortados_router import core, live_heartbeat as hbs, orchestrator_usage as ou, router_db
 from cortados_router.provider import live, tasks, work_split
@@ -143,6 +144,17 @@ class LogTokensTest(StateBase):
         c.close()
         self.assertEqual(row, (13, 7, 1000, 200, 3, TAG))
 
+    def test_no_matching_row_is_a_lost_write_not_a_success(self):
+        self.insert("r1")
+        before = router_db.stats()
+        self.assertFalse(core.log_tokens("missing", {"input_tokens": 10}, TAG))
+        after = router_db.stats()
+        self.assertEqual((after["count"] - before["count"], after["lost"] - before["lost"]), (1, 1))
+        self.assertEqual(after["last_op"], "log_tokens")
+        c = sqlite3.connect(core.STATE / "router.db")
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM routes WHERE tok_turns IS NOT NULL").fetchone()[0], 0)
+        c.close()
+
     def test_a_failed_write_is_counted_never_raised(self):
         self.insert("r1")
         real = core._db
@@ -236,6 +248,16 @@ class ValidateBlockTest(unittest.TestCase):
         self.assertEqual(out["sessions"][0]["session"], TAG)
         self.assertNotIn("version", out)
 
+    def test_subagent_subtotal_and_bridge_counter_pass_an_older_block_has_none(self):
+        sub = {"24h": {"input": 100, "output": 200, "cache_read": 0, "cache_write": 50},
+               "7d": {"input": 100, "output": 200, "cache_read": 0, "cache_write": 50}}
+        ex = dict(block()["excluded"], provider_bridge_files=2)
+        del ex["sidechain_entries"]
+        out, bad = self.check(block(subagent=sub, excluded=ex))
+        self.assertIsNone(bad)
+        self.assertEqual((out["subagent"], out["excluded"]["provider_bridge_files"]), (sub, 2))
+        self.assertIsNone(self.check(block())[0]["subagent"])
+
     def test_bad_blocks_name_the_field_only(self):
         s0 = block()["sessions"][0]
         cases = {
@@ -258,6 +280,10 @@ class ValidateBlockTest(unittest.TestCase):
             self.assertIsNone(out, want)
             self.assertEqual(bad, want)
             self.assertNotIn(SECRET, bad)
+        z = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+        for want, sub in ((".subagent", {"24h": z}), (".subagent.7d", {"24h": z, "7d": dict(z, input=-1)}),
+                          (".subagent.24h", {"24h": dict(z, sessions=1), "7d": z})):
+            self.assertEqual(self.check(block(subagent=sub)), (None, want))
         hb, bad = live.validate_heartbeat({"host": "air", "jobs": [], "orchestrator": block(salt=3)}, NOW)
         self.assertEqual((hb, bad), (None, "orchestrator.salt"))
 
@@ -290,6 +316,18 @@ class SectionTest(unittest.TestCase):
                          ("aaaaaaaaaaaaaaaa", None, None, 500))
         self.assertEqual(s["hosts"][0]["host"], "air")
         self.assertFalse(s["hosts"][0]["stale"])
+
+    def test_subagent_subtotal_is_summed_and_unknown_when_a_host_omits_it(self):
+        sub = {w: {"input": 1000, "output": 1000, "cache_read": 7, "cache_write": 0} for w in ("24h", "7d")}
+        hb = {"air": {"orchestrator": self_valid(block(subagent=sub))},
+              "studio": {"orchestrator": self_valid(block(subagent=sub, sessions=[]))}}
+        s = work_split.section(self.routed(), hb, NOW)
+        self.assertEqual(s["overall"]["24h"]["orchestrator_subagent"],
+                         {"input": 2000, "output": 2000, "cache_read": 14, "cache_write": 0, "fresh": 4000, "all": 4014})
+        hb["studio"] = {"orchestrator": self_valid(block(sessions=[]))}     # an older sender: no split, so no sum
+        self.assertIsNone(work_split.section(self.routed(), hb, NOW)["overall"]["24h"]["orchestrator_subagent"])
+        self.assertIsNone(work_split.section(self.routed(), {}, NOW)["overall"]["24h"]["orchestrator_subagent"])
+        self.assertIn("subagent", work_split.DEFINITION)
 
     def test_each_missing_side_is_an_error_not_a_zero(self):
         s = work_split.section(None, {}, NOW)
@@ -395,6 +433,27 @@ class SenderTest(unittest.TestCase):
         self.assertIsNone(live.validate_heartbeat(seen[0], time.time())[1])
         self.assertNotIn("orchestrator", seen[1])
         self.assertIn("posting without it", err.getvalue())
+
+    def test_an_oversize_heartbeat_drops_the_orchestrator_block_not_the_post(self):
+        seen = []
+
+        def opener(req, timeout):
+            seen.append(json.loads(req.data))
+            return FakeResponse(b"{}")
+        cfg = str(self.config({"cache": str(self.cache)}))
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(live, "HEARTBEAT_MAX_BYTES", 400), redirect_stdout(out), redirect_stderr(err):
+            code = hbs.main(["--config", cfg], run=lambda *a, **k: None, opener=opener, scan=self.scan,
+                            salt=lambda: None)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn("orchestrator", seen[0])
+        self.assertEqual(seen[0]["host"], "air")
+        self.assertIn("over 400; posting without the orchestrator block", err.getvalue())
+        # without an orchestrator block there is nothing optional to drop: still refused, nothing sent
+        with mock.patch.object(live, "HEARTBEAT_MAX_BYTES", 10), redirect_stderr(io.StringIO()):
+            with self.assertRaises(hbs.OversizeError):
+                hbs.check_fit({"host": "air", "ttl_s": 600, "jobs": []})
 
     def test_dry_run_shows_the_block(self):
         out, err = io.StringIO(), io.StringIO()

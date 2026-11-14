@@ -429,7 +429,9 @@ function renderWorkSplit(box, s, now) {
   const line = el("div", "top");
   add(line, el("span", "title", "Routed through CortadOS"), el("span", "big", pct(w.routed_pct)));
   add(top, line, bar(w.routed_pct));
+  const sa = w.orchestrator_subagent;
   add(top, el("div", "sub", join(["orchestrator " + tok(o.fresh) + " fresh (" + tok(o.cache_read) + " cache reads)",
+    sa && sa.fresh ? "of which direct-model subagents " + tok(sa.fresh) + " fresh" : null,
     "routed " + tok(r.fresh) + " fresh (" + tok(r.cache_read) + " cache reads)",
     isNum(w.routed_pct_all) ? pct(w.routed_pct_all) + " routed counting cache reads" : null,
     isNum(w.routed_conversations) ? w.routed_conversations + " routed conversations" : null,

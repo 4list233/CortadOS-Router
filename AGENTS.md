@@ -20,8 +20,9 @@ is the long form.
   `child_tasks.py` (whole tasks as headless Claude Code children; `--run` runner, `--remote` host side, `--cleanup-archive`;
   the runner appends each finished run, redacted, to the append-only `$CORTADOS_HOME/exports/task-runs.jsonl` for
   Grounds (#91, README "Task run export"); a task dir whose export failed is never pruned),
-  `orchestrator_usage.py` (the owner's main Claude Code sessions' own tokens from local transcripts, child-task and
-  subagent transcripts excluded; sent in the heartbeat's `orchestrator` block, README "Work split"),
+  `orchestrator_usage.py` (the owner's main Claude Code sessions' own tokens from local transcripts, direct-model
+  subagents included as a sub-total; child-task transcripts, the provider's bridge/search-lane scratch-dir transcripts
+  and provider-served messages excluded; sent in the heartbeat's `orchestrator` block, README "Work split"),
   `exec_hosts.py` (which machine a child runs on: `~/.config/cortados/exec-hosts.json`, ssh transport), `workspaces.py`
   (per-task repo worktrees / folders under `<root>/active`, archive-or-held settling, index.jsonl, archive-only cleanup).
 - `cortados_router/provider/` — the `cortados` model endpoint (design and status: `docs/PROVIDER-PLAN.md`).

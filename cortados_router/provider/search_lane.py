@@ -25,6 +25,10 @@ from typing import Any
 
 from cortados_router.provider import bridge
 
+# The one-shot search CLI's scratch dir prefix (tempfile adds a random suffix). Its transcript, on the default login,
+# lands under ~/.claude/projects/<slug of that dir>/; orchestrator_usage skips it by this prefix (provider work).
+SCRATCH_PREFIX = "cortados-search-"
+
 logger = logging.getLogger(__name__)
 
 # The routing table's W-fast Claude route (tables/routing-table.json, lane `claude`): searching and summarising
@@ -288,7 +292,7 @@ def run(claude_bin: str | list[str], query: str, config_dir: str | None, *,
     timeout = SEARCH_TIMEOUT_S if timeout is None else timeout
     check_query(query)
     try:
-        work = tempfile.mkdtemp(prefix="cortados-search-")
+        work = tempfile.mkdtemp(prefix=SCRATCH_PREFIX)
     except OSError as exc:
         raise SearchFailed("start_failed", f"no scratch dir: {exc}") from None
     # The slot is taken only after the scratch dir exists, and released in the same finally that removes it, so no

@@ -1087,16 +1087,26 @@ def log_tokens(turn_id: str, usage: dict[str, Any], office_session: str | None =
     """Add one backend turn's tokens to its route's row (Messages-shaped usage: input_tokens excludes the cache reads
     and writes, which come as cache_read_input_tokens / cache_creation_input_tokens; both bridges report that shape)
     and remember the first orchestrator session tag seen. Never raises sqlite3.Error: accounting must not fail a reply;
-    a lost write is counted in router_db like a lost route (#99). Returns False when it was not written."""
+    a lost write is counted in router_db like a lost route (#99). Returns False when it was not written, including when
+    no routes row has this turn_id (the tokens have nowhere to go: counted in router_db as a lost write too)."""
     def n(k: str) -> int:
         v = usage.get(k) if isinstance(usage, dict) else None
         return int(v) if type(v) in (int, float) and v == v and 0 <= v < 1e12 else 0
     vals = (n("input_tokens"), n("output_tokens"), n("cache_read_input_tokens"), n("cache_creation_input_tokens"))
-    return _write_routes("log_tokens", lambda c: c.execute(
-        "UPDATE routes SET tok_input=COALESCE(tok_input,0)+?, tok_output=COALESCE(tok_output,0)+?, "
-        "tok_cache_read=COALESCE(tok_cache_read,0)+?, tok_cache_write=COALESCE(tok_cache_write,0)+?, "
-        "tok_turns=COALESCE(tok_turns,0)+1, office_session=COALESCE(office_session,?) WHERE turn_id=?",
-        (*vals, office_session, turn_id)), raise_final=False)
+    matched = [0]
+
+    def write(c: sqlite3.Connection) -> None:
+        matched[0] = c.execute(
+            "UPDATE routes SET tok_input=COALESCE(tok_input,0)+?, tok_output=COALESCE(tok_output,0)+?, "
+            "tok_cache_read=COALESCE(tok_cache_read,0)+?, tok_cache_write=COALESCE(tok_cache_write,0)+?, "
+            "tok_turns=COALESCE(tok_turns,0)+1, office_session=COALESCE(office_session,?) WHERE turn_id=?",
+            (*vals, office_session, turn_id)).rowcount
+    if not _write_routes("log_tokens", write, raise_final=False):
+        return False
+    if matched[0] == 0:                             # e.g. the route's own log_route was lost: no row to add to
+        router_db.note_error("log_tokens", LookupError("no routes row for this turn"), final=True)
+        return False
+    return True
 
 
 def log_call_context(turn_id, api_request_id, *, session_id, model, provider,

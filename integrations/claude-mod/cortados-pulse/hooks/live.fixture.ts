@@ -717,7 +717,7 @@ export default {
     "as_of": 1800000000.0,
     "status": "ok",
     "errors": [],
-    "definition": "Tokens, per window (24h, 7d). Orchestrator = what the owner's main Claude Code sessions spent directly with Anthropic, read from their local transcripts (subagent and child-task transcripts excluded) and reported by each host's heartbeat. Routed = what the CortadOS provider's backends reported for routed conversations (child tasks, routed subagents, route_task), joined to the main session by its Office session tag. Fresh tokens = input + output + cache writes; 'all' adds cache reads. % routed = routed fresh ÷ (orchestrator fresh + routed fresh). A routed conversation counts in the window it was routed in; an orchestrator message by its own time. Local-lane and search-lane work, and routed conversations from before token recording, are not recorded and not estimated.",
+    "definition": "Tokens, per window (24h, 7d). Orchestrator = what the owner's main Claude Code sessions spent directly with Anthropic, read from their local transcripts and reported by each host's heartbeat; it includes their Agent-tool subagents that ran on a direct model (shown again as the 'subagent' sub-total) and excludes child-task transcripts, the provider's own headless CLIs and any message served by the provider. Routed = what the CortadOS provider's backends reported for routed conversations (child tasks, routed subagents, route_task), joined to the main session by its Office session tag. Fresh tokens = input + output + cache writes; 'all' adds cache reads. % routed = routed fresh ÷ (orchestrator fresh + routed fresh). A routed conversation counts in the window it was routed in; an orchestrator message by its own time. Local-lane and search-lane work, and routed conversations from before token recording, are not recorded and not estimated.",
     "windows": {
       "24h": 86400,
       "7d": 604800
@@ -740,6 +740,7 @@ export default {
           "fresh": 4500,
           "all": 54500
         },
+        "orchestrator_subagent": null,
         "routed_pct": 10.1,
         "routed_pct_all": 5.5,
         "routed_by_model": [
@@ -785,6 +786,7 @@ export default {
           "fresh": 14500,
           "all": 64500
         },
+        "orchestrator_subagent": null,
         "routed_pct": 12.7,
         "routed_pct_all": 2.4,
         "routed_by_model": [
@@ -873,6 +875,7 @@ export default {
         "sessions_hidden": 0,
         "excluded": {
           "child_task_files": 4,
+          "provider_bridge_files": 0,
           "sidechain_entries": 12,
           "routed_model_entries": 0,
           "unreadable_files": 0,
