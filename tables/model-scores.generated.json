@@ -1,5 +1,5 @@
 {
- "generated": "2026-10-13 17:53",
+ "generated": "2026-11-13 21:09",
  "scale": "index 100 = best published model on that use case (any vendor, reachable or not); from public benchmarks only",
  "use_cases": {
   "code": "building and fixing software in a repo: product modules, scripts, migrations, tests",
@@ -1664,5 +1664,86 @@
     }
    ]
   }
- ]
+ ],
+ "local_models": [
+  {
+   "family": "qwen-27b",
+   "local_id": "Qwen27b_heretic",
+   "thinking": "off",
+   "proxy": true,
+   "provenance": "proxy: published base model, \u221210%",
+   "published": "qwen3-8-27b-non-reasoning",
+   "published_family": "qwen3-8-27b-non",
+   "deduct": 0.1,
+   "benchmarks": 3,
+   "ceiling": false,
+   "base_index": {
+    "general": 18.6,
+    "code": 16.8,
+    "ops": 16.7,
+    "research": 21.8,
+    "planning": 18.1,
+    "writing": 19.5,
+    "conversation": 22.8,
+    "capture/log": 21.2
+   },
+   "index": {
+    "general": 16.7,
+    "code": 15.1,
+    "ops": 15.0,
+    "research": 19.6,
+    "planning": 16.3,
+    "writing": 17.6,
+    "conversation": 20.5,
+    "capture/log": 19.1
+   },
+   "reach": [
+    {
+     "lane": "local",
+     "provider": "ollama",
+     "model": "Qwen27b_heretic"
+    }
+   ]
+  },
+  {
+   "family": "qwen-27b-think",
+   "local_id": "Qwen27b_heretic",
+   "thinking": "on",
+   "proxy": true,
+   "provenance": "proxy: published base model, \u221210%",
+   "published": "qwen3-8-27b",
+   "published_family": "qwen3-8-27b",
+   "deduct": 0.1,
+   "benchmarks": 32,
+   "ceiling": false,
+   "base_index": {
+    "general": 43.1,
+    "code": 44.0,
+    "ops": 35.2,
+    "research": 48.1,
+    "planning": 39.8,
+    "writing": 51.4,
+    "conversation": 37.7,
+    "capture/log": 49.6
+   },
+   "index": {
+    "general": 38.8,
+    "code": 39.6,
+    "ops": 31.7,
+    "research": 43.3,
+    "planning": 35.8,
+    "writing": 46.3,
+    "conversation": 33.9,
+    "capture/log": 44.6
+   },
+   "reach": [
+    {
+     "lane": "local",
+     "provider": "ollama",
+     "model": "Qwen27b_heretic"
+    }
+   ]
+  }
+ ],
+ "local_unranked": []
 }

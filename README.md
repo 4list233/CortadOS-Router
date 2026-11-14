@@ -181,6 +181,8 @@ The hard rules come first and cannot be out-voted (`core.resolve`):
 
 **Required index.** The router interpolates the required index over `D` through knots pinned to reference models (D = 3 / 6 / 9 / 11 / 12), and never below the reference of the band the hard rules chose. Each model has a per-use-case index in `tables/model-scores.generated.json`, built nightly by `tables/benchmarks/build_tiers.py` from public benchmarks (Epoch AI, LiveBench, Aider, SWE-bench, LMArena, Artificial Analysis) weighted by `tables/use-cases.json`, plus a bounded community-sentiment nudge.
 
+**Local models in the table.** A model on the owner's Ollama node has no published scores, so `tables/local-models.json` (`index_proxies`) names its published base model and a deduction, and the builder writes a proxy index (base family index × (1 − deduct), `proxy: true`, with its provenance) to the generated file's separate `local_models` list. Today: `Qwen27b_heretic` as `qwen-27b` (thinking off; Qwen3.8 27B non-reasoning −10 %) and `qwen-27b-think` (thinking on; Qwen3.8 27B reasoning −10 %, only when `max_tokens` ≥ 4096). The provider places a variant wherever it clears S1's required index (never outward, blast-radius-3, R3/R4 or degraded work; not while its node is busy or unavailable); a local lane spends no quota, so it wins where it qualifies. `docs/LOCAL-RESOURCES.md`, "Local models in selection (published proxy index)".
+
 **Cost.**
 
 ```
@@ -427,7 +429,10 @@ Local chat models run on the Pro only (#75; the Studio runs S1 and no chat model
 provider as pins: `claude --model sub/qwen-27b` relays each turn to the Pro's Ollama Messages API. With the node's
 `auto_route` set (`{"model": …, "bands": ["R0"]}`; off by default, no default band, never R3/R4), a new S1-routed
 conversation in a listed band moves to that model while the Pro is available (AC + switch on + gate up), and keeps
-S1's route otherwise (`routing.auto_local`; S1 and `core.resolve` never see a local lane). An asleep or busy node fails
+S1's route otherwise (`routing.auto_local`; S1 and `core.resolve` never see a local lane). That manual rule is
+superseded by the published proxy index: a model with one (today `Qwen27b_heretic`, as `qwen-27b` and
+`qwen-27b-think`) takes a new S1-routed conversation wherever its index clears the required index and the node is
+available and not busy (`routing.index_local`; the node's `index_route`, on by default). An asleep or busy node fails
 a pin with a clear 503, never a fallback. Ollama has no auth, so it stays on localhost and the node runs a token gate
 (`python3 -m cortados_router.local_gate`) on its Tailscale address. Config schema, gate and launchd template:
 `docs/LOCAL-RESOURCES.md` ("Local models").

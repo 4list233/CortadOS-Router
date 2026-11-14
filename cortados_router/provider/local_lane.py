@@ -11,7 +11,14 @@ Owner of three rules:
                 R3 is where core.resolve's hard rules put outward and blast-radius-3 work (Opus-class floor) and R4 is
                 escalation only, so a local model never takes either. `true` and anything malformed are refused
                 (LocalConfigError): a switch that silently did nothing, or did more than it says, would mislead.
-                routing.auto_local applies it; S1 and core.resolve never see a local lane.
+                routing.auto_local applies it; S1 and core.resolve never see a local lane. Superseded by index_route for any
+                model with a published proxy index; kept working for configs that set it (it is checked first).
+  index_route   on by default (`"index_route": false` turns it off per node): a node model with a proxy index in the
+                generated scores (tables/local-models.json → index_proxies, built into model-scores.generated.json →
+                local_models) is offered wherever its index clears S1's required index (routing.auto_local). A variant
+                with thinking on is sent thinking enabled with a budget that fits max_tokens (think_budget); one with
+                thinking off is sent thinking disabled. `max_inflight` (default 1) is how many relayed turns make the
+                node busy: a busy node is not offered by index_route.
   availability  a lane is available when its node answers GET /api/tags within a short timeout and lists the model.
                 On the Pro the gate (local_gate.py) answers that probe with a 503 while on battery or with the manual
                 switch off, so one probe covers AC power, the switch and gate health. A pin to an unavailable node fails
@@ -27,6 +34,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import threading
 import urllib.parse
 from typing import Any
 
@@ -118,9 +126,16 @@ def nodes(path: str | None = None) -> list[dict[str, Any]]:
                 timeouts[key] = -1.0
             if not timeouts[key] > 0:            # 0 would make the socket non-blocking; negative raises mid-turn
                 raise LocalConfigError(f"node {nid}: {key} must be a positive number of seconds", nid)
+        index_route = block.get("index_route", True)
+        if not isinstance(index_route, bool):
+            raise LocalConfigError(f"node {nid}: index_route must be true or false, got {index_route!r}", nid)
+        max_inflight = block.get("max_inflight", MAX_INFLIGHT_DEFAULT)
+        if isinstance(max_inflight, bool) or not isinstance(max_inflight, int) or max_inflight < 1:
+            raise LocalConfigError(f"node {nid}: max_inflight must be a positive integer, got {max_inflight!r}", nid)
         out.append({"node": nid, "lane": LANE_PREFIX + nid, "label": block.get("label") or nid.capitalize(),
                     "base_url": base, "models": models, "token": token,
                     "auto_route": _auto_route(block.get("auto_route", False), models, nid),
+                    "index_route": index_route, "max_inflight": max_inflight,
                     **timeouts})
     return out
 
@@ -204,6 +219,43 @@ def _thinking_mode(m: dict[str, Any], nid: str, mid: str) -> str:
     return v
 
 
+# Thinking variants (index_route, tables/local-models.json → index_proxies). Reason for the threshold (#108): Qwen3.8 27B
+# with thinking on spent all of max_tokens=20 thinking and wrote no answer, and the thinking counts against max_tokens.
+# Anthropic's extended thinking needs budget_tokens >= 1024 and < max_tokens, and the answer needs room after it; the
+# think variant's index comes from published reasoning runs with large budgets, which a 1k budget would not reproduce.
+# So the think variant is offered only from 4096 max_tokens, with half for thinking (>= 2048) and half for the answer
+# (>= 2048). Below it the request goes to the non-thinking variant or the cloud route, never to the think variant.
+THINK_MIN_MAX_TOKENS = 4096
+VARIANT_THINKING = ("off", "on")
+
+
+def think_budget(max_tokens: Any) -> int | None:
+    """The thinking budget a think-variant turn is sent with: half of max_tokens, or None when max_tokens (absent, not
+    an integer, or below THINK_MIN_MAX_TOKENS) leaves no room for thinking and an answer."""
+    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < THINK_MIN_MAX_TOKENS:
+        return None
+    return max_tokens // 2
+
+
+# Busy (index_route). Reason: Ollama runs one request per loaded model at a time unless OLLAMA_NUM_PARALLEL says
+# otherwise (a 27B at 64k context on the 48 GB Pro runs one), so a second turn queues behind the first for minutes
+# while a cloud lane would answer now. Counted per node in this process: every relayed turn, pinned or routed.
+MAX_INFLIGHT_DEFAULT = 1
+_inflight: dict[str, int] = {}
+_inflight_lock = threading.Lock()
+
+
+def inflight(node: dict[str, Any]) -> int:
+    """How many turns this process is relaying to the node right now."""
+    with _inflight_lock:
+        return _inflight.get(node["node"], 0)
+
+
+def busy(node: dict[str, Any]) -> bool:
+    """The node already relays its max_inflight turns: index_route does not add one more."""
+    return inflight(node) >= int(node.get("max_inflight") or MAX_INFLIGHT_DEFAULT)
+
+
 def client_asked_thinking(body: dict[str, Any]) -> bool:
     """The client asked for extended thinking: a `thinking` object whose type is anything but "disabled"."""
     t = body.get("thinking")
@@ -212,10 +264,17 @@ def client_asked_thinking(body: dict[str, Any]) -> bool:
 
 def _node_body(body: dict[str, Any], model: dict[str, Any]) -> dict[str, Any]:
     """The request as the node gets it: `model` rewritten to the node's tag and, under off-unless-asked, thinking
-    turned off when the client did not ask for it (a missing field, or one of another shape)."""
+    turned off when the client did not ask for it (a missing field, or one of another shape). An index-routed think
+    variant (`variant_thinking` "on") the client did not ask to think is sent thinking enabled with think_budget, or
+    disabled when this turn's max_tokens leaves no room for it; a client's own `thinking` always passes through."""
     out = dict(body)
     out["model"] = model["id"]
-    if model.get("thinking", THINKING_DEFAULT) == "off-unless-asked" and not client_asked_thinking(body):
+    if client_asked_thinking(body):
+        return out
+    if model.get("variant_thinking") == "on":
+        budget = think_budget(body.get("max_tokens"))
+        out["thinking"] = {"type": "enabled", "budget_tokens": budget} if budget else {"type": "disabled"}
+    elif model.get("variant_thinking") == "off" or model.get("thinking", THINKING_DEFAULT) == "off-unless-asked":
         out["thinking"] = {"type": "disabled"}
     return out
 
@@ -413,6 +472,22 @@ def auto_routed_unavailable(node: dict[str, Any], model: dict[str, Any], reason:
 
 def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
           echo_model: str, reply: list | None = None, auto_routed: bool = False) -> str:
+    """_serve, counted in the node's in-flight turns (busy) while it runs."""
+    with _inflight_lock:
+        _inflight[node["node"]] = _inflight.get(node["node"], 0) + 1
+    try:
+        return _serve(handler, body, node, model, echo_model=echo_model, reply=reply, auto_routed=auto_routed)
+    finally:
+        with _inflight_lock:
+            left = _inflight.get(node["node"], 1) - 1
+            if left > 0:
+                _inflight[node["node"]] = left
+            else:
+                _inflight.pop(node["node"], None)
+
+
+def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
+           echo_model: str, reply: list | None = None, auto_routed: bool = False) -> str:
     """Relay one turn to the node's /v1/messages and the answer back to the client. Returns the outcome: "completed"
     (a whole message or a parsed message_stop), "rejected" (the node answered an HTTP error, relayed as-is),
     "unreachable" (503 sent), or "incomplete" (the stream broke). The response names `echo_model` (what the client

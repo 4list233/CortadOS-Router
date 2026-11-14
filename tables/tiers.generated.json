@@ -1,5 +1,5 @@
 {
- "generated": "2026-10-13 17:53",
+ "generated": "2026-11-13 21:09",
  "method": "per-benchmark min-max \u2192 logit \u2192 additive ability/difficulty fit over all published models, ridge-shrunk; floors = midpoints between band reference abilities",
  "benchmarks_used": 93,
  "families_fitted": 937,

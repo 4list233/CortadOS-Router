@@ -14,7 +14,13 @@ Owner of two rules:
                     auto_route model instead, only when S1's band is one the node's config lists, the node answers its
                     probe (on the Pro: AC power + manual switch + gate up) and lists the model, the request fits the
                     model's context, the client did not exclude it, and the request is on /v1/messages. Otherwise S1's
-                    route stands unchanged: a local node is an extra, never a fallback (#75).
+                    route stands unchanged: a local node is an extra, never a fallback (#75). Kept for configs that
+                    set it; the index route below supersedes it.
+  local index route a node model with a published proxy index (model-scores.generated.json → local_models, from
+                    tables/local-models.json) takes the conversation wherever its index for S1's use case clears S1's
+                    required index, like a cloud model (index_local). A local lane spends no quota, so where it
+                    qualifies and its node is available and not busy it wins over S1's cloud choice. Never outward,
+                    blast-radius-3 or R3/R4 work, never with a degraded scorer; anything missing keeps S1's route.
   sub/ pin          a client that names `sub/<model>` (any model the tables serve on claude-cli or codex-cli) chose the
                     model itself: S1 and the band are skipped, but the served-model, account, capacity, fit and
                     route-log rules still apply (choose_pinned). pinnable_models is the list GET /v1/models offers.
@@ -719,7 +725,8 @@ def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, co
     reason logged; a broken local config skips too (logged as a warning), so a config error never blocks S1 routing.
     When moved, the routes row S1's select wrote is rewritten under the same route_id (lane, provider and model of the
     local node, S1's choice as runner_up, S1's own runner_up kept as s1_runner_up and a skipped entry), so the record
-    names what will run and loses nothing S1 decided."""
+    names what will run and loses nothing S1 decided. When no manual auto_route takes it, the published proxy index
+    gets its turn (index_local), behind the same early checks."""
     if body.get(NO_LOCAL_KEY) or r.get("degraded") or not r.get("band") or not r.get("route_id"):
         return r
     try:
@@ -759,33 +766,155 @@ def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, co
             logger.log(logging.WARNING if gate_refused else logging.INFO,
                        "local auto-route: %s/%s not taken for %s: %s", node["lane"], pin, r["route_id"], why)
             continue
-        old = r.get("route") or {}
-        chosen = {"lane": node["lane"], "provider": node["lane"], "model": entry["id"], "account": None,
-                  "config_dir": None, "reserve": False, "pool": None}
-        # runner_up is S1's choice (what runs when the node is not there); S1's own runner_up is not dropped: it is
-        # kept as s1_runner_up and, so the routes row still shows it, as a skipped entry naming why.
-        s1_runner_up = old.get("runner_up")
-        skipped = list(old.get("skipped") or [])
-        if isinstance(s1_runner_up, dict) and s1_runner_up.get("model"):
-            skipped.append({"lane": s1_runner_up.get("lane"), "model": s1_runner_up.get("model"),
-                            "why": "S1's runner_up (s1_runner_up), behind S1's choice the local auto-route replaced"})
-        route = {**old, "chosen": chosen, "runner_up": old.get("chosen"), "s1_runner_up": s1_runner_up,
-                 "skipped": skipped or None,
-                 "hard_rules": list(old.get("hard_rules") or []) + [
-                     f"local auto-route: band {band} is in {node['lane']}'s auto_route bands and the node is available; "
-                     f"{pin} instead of {r.get('provider')}/{r.get('model')}"]}
-        core.log_route(r["route_id"], {"session_id": conversation_id, "platform": f"provider:{client}",
-                                       "unit_kind": "interactive", "actual_model": None,
-                                       "request": request_text(body.get("messages") or [],
-                                                               standalone=not body.get("tools"))[:8000]},
-                       r.get("decision") or {"answers": None, "degraded": False, "engine": "s1", "engine_ms": None},
-                       route)
-        logger.info("local auto-route: %s -> %s/%s (band %s)", r["route_id"], node["lane"], pin, band)
-        return {"router": r.get("router", execution_routing.ROUTER), "provider": node["lane"], "model": entry["id"],
-                "account": None, "config_dir": None, "context_length": entry["context_length"],
-                "route_id": r["route_id"], "api_request_id": r.get("api_request_id", ""), "degraded": False,
-                "band": band, "projection": r.get("projection"), "decision": r.get("decision"), "route": route,
-                "local": {"node": node, "model": entry}}
+        return _move_to_local(core, body, r, node, entry, client=client, conversation_id=conversation_id,
+                              rule=f"local auto-route: band {band} is in {node['lane']}'s auto_route bands and the "
+                                   f"node is available; {pin} instead of {r.get('provider')}/{r.get('model')}")
+    return index_local(core, body, r, client=client, conversation_id=conversation_id, excluded=excluded)
+
+
+def _move_to_local(core, body: dict[str, Any], r: dict[str, Any], node: dict[str, Any], entry: dict[str, Any], *,
+                   client: str, conversation_id: str, rule: str, chosen_extra: dict[str, Any] | None = None
+                   ) -> dict[str, Any]:
+    """S1's route `r` moved to `entry` on `node`: the routes row S1's select wrote is rewritten under the same route_id
+    (lane, provider and model of the local node, S1's choice as runner_up, S1's own runner_up kept as s1_runner_up and
+    a skipped entry, `rule` appended to the hard rules), and the provider's result names the node and model."""
+    band = r["band"]
+    old = r.get("route") or {}
+    chosen = {"lane": node["lane"], "provider": node["lane"], "model": entry["id"], "account": None,
+              "config_dir": None, "reserve": False, "pool": None, **(chosen_extra or {})}
+    # runner_up is S1's choice (what runs when the node is not there); S1's own runner_up is not dropped: it is
+    # kept as s1_runner_up and, so the routes row still shows it, as a skipped entry naming why.
+    s1_runner_up = old.get("runner_up")
+    skipped = list(old.get("skipped") or [])
+    if isinstance(s1_runner_up, dict) and s1_runner_up.get("model"):
+        skipped.append({"lane": s1_runner_up.get("lane"), "model": s1_runner_up.get("model"),
+                        "why": "S1's runner_up (s1_runner_up), behind S1's choice the local auto-route replaced"})
+    route = {**old, "chosen": chosen, "runner_up": old.get("chosen"), "s1_runner_up": s1_runner_up,
+             "skipped": skipped or None, "hard_rules": list(old.get("hard_rules") or []) + [rule]}
+    core.log_route(r["route_id"], {"session_id": conversation_id, "platform": f"provider:{client}",
+                                   "unit_kind": "interactive", "actual_model": None,
+                                   "request": request_text(body.get("messages") or [],
+                                                           standalone=not body.get("tools"))[:8000]},
+                   r.get("decision") or {"answers": None, "degraded": False, "engine": "s1", "engine_ms": None},
+                   route)
+    logger.info("local auto-route: %s -> %s/%s (band %s)", r["route_id"], node["lane"], local_lane.pin_id(entry), band)
+    return {"router": r.get("router", execution_routing.ROUTER), "provider": node["lane"], "model": entry["id"],
+            "account": None, "config_dir": None, "context_length": entry["context_length"],
+            "route_id": r["route_id"], "api_request_id": r.get("api_request_id", ""), "degraded": False,
+            "band": band, "projection": r.get("projection"), "decision": r.get("decision"), "route": route,
+            "local": {"node": node, "model": entry}}
+
+
+def _tag_key(tag: str | None) -> str:
+    """An Ollama tag as the proxy table names it: case-insensitive, `:latest` optional (Ollama's implicit tag)."""
+    t = str(tag or "").strip().casefold()
+    return t[:-len(":latest")] if t.endswith(":latest") else t
+
+
+def index_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, conversation_id: str,
+                excluded: Callable[[str], bool] = lambda name: False) -> dict[str, Any]:
+    """S1's route `r`, or the same decision moved to a local model variant whose published proxy index clears it
+    (local_models in the generated scores). Called by auto_local after its early checks (wire, degraded scorer, band,
+    route id) and the manual auto_route rule.
+
+    Qualifying is the cloud rule: the variant's index for S1's use case >= S1's required index for this request.
+    Hard rules (core.resolve's, restated here because the local lane is placed after it): never outward work, never
+    blast radius 3, never R3/R4 (local_lane.AUTO_ROUTE_BANDS), and core's face floor does not apply to a local lane
+    (core.resolve exempts local the same way). The think variant needs max_tokens >= local_lane.THINK_MIN_MAX_TOKENS;
+    a client that asked for thinking gets only the think variant (its turn thinks either way).
+    Cost: a local lane spends no subscription quota (core.resolve's weight for local is 0), so a qualifying variant
+    wins over S1's cloud choice, the lighter variant first (lower general index: the selection's "pay by general
+    index" — the non-thinking variant also answers sooner). It is not taken when its node is busy
+    (local_lane.busy), down, does not list the model, the request outgrows the model's context, or the client excluded
+    the model; then S1's route stands, with the skip logged (metadata only)."""
+    route = r.get("route") or {}
+    rid = r.get("route_id")
+    skip = lambda what, why: logger.info("local index route: %s not taken for %s: %s", what, rid, why)
+    band = r.get("band")
+    req = route.get("required_index")
+    use_case = (route.get("chosen") or {}).get("use_case")
+    answers = route.get("answers") or {}
+    features = route.get("features") or {}
+    if band not in local_lane.AUTO_ROUTE_BANDS:
+        return r                                   # R3/R4: outward, blast-radius-3 or escalation work never runs local
+    if answers.get("outward") or int(features.get("blast_radius") or 0) >= 3:
+        skip("every local variant", "outward or blast-radius-3 work never runs local")
+        return r
+    if not isinstance(req, (int, float)) or not use_case:
+        return r                                   # an unscored (table-fallback) route has no index to clear
+    variants = (core.model_scores() or {}).get("local_models") or []
+    if not variants:
+        return r
+    try:
+        nodes = [n for n in local_lane.nodes() if n.get("index_route")]
+    except local_lane.LocalConfigError as exc:
+        logger.warning("local index route skipped: local config error on node %s: %s", exc.node, exc)
+        return r
+    asked = local_lane.client_asked_thinking(body)
+    room = local_lane.think_budget(body.get("max_tokens")) is not None
+    offers = []
+    for n_i, node in enumerate(nodes):
+        for e_i, entry in enumerate(node["models"]):
+            for v in variants:
+                if _tag_key(v.get("local_id")) != _tag_key(entry["id"]):
+                    continue
+                name, thinking = v.get("family"), v.get("thinking")
+                idx = (v.get("index") or {}).get(use_case, (v.get("index") or {}).get("general"))
+                why = None
+                if thinking not in local_lane.VARIANT_THINKING:
+                    why = f"unknown thinking {thinking!r}"
+                elif entry.get("thinking") == "passthrough":
+                    why = "its node entry is thinking: passthrough, so the variant's thinking cannot be set"
+                elif asked and thinking != "on":
+                    why = "the client asked for thinking: only a thinking variant matches what will run"
+                elif thinking == "on" and not room:
+                    why = (f"max_tokens {body.get('max_tokens')!r} < {local_lane.THINK_MIN_MAX_TOKENS}: no room to "
+                           "think and answer")
+                elif not isinstance(idx, (int, float)) or idx < req:
+                    why = f"{use_case} index {idx} < required {req}"
+                if why:
+                    skip(f"{node['lane']}/{name}", why)
+                    continue
+                offers.append((float((v.get("index") or {}).get("general") or 0.0), n_i, e_i, node, entry, v, idx))
+    offers.sort(key=lambda o: o[:3])
+    need = None
+    for _, _, _, node, entry, v, idx in offers:
+        name, pin = v["family"], local_lane.pin_id(entry)
+        what = f"{node['lane']}/{name}"
+        if excluded(entry["id"]) or excluded(pin) or excluded(name):
+            skip(what, "excluded by the client (x-cortados-exclude-model)")
+            continue
+        if _auto_down.get(node["node"], 0.0) > _now():
+            skip(what, "probe failed within the last %gs" % AUTO_DOWN_S)
+            continue
+        if local_lane.busy(node):
+            skip(what, f"node busy ({local_lane.inflight(node)} turn(s) in flight, max_inflight "
+                       f"{node.get('max_inflight')})")
+            continue
+        try:
+            tags = local_lane.probe(node)
+        except local_lane.LocalUnavailable as exc:
+            _auto_down[node["node"]] = _now() + AUTO_DOWN_S
+            gate = str(exc) == local_lane.GATE_REFUSED.format(node=node["node"])
+            logger.log(logging.WARNING if gate else logging.INFO,
+                       "local index route: %s not taken for %s: unavailable (%s)", what, rid, exc)
+            continue
+        _auto_down.pop(node["node"], None)
+        if entry["id"] not in tags:
+            skip(what, f"does not list {entry['id']}")
+            continue
+        need = int(request_fit(body)["input_tokens"]) if need is None else need
+        if need > entry["context_length"]:
+            skip(what, f"request ≈{need // 1000}k tokens exceeds its {entry['context_length'] // 1000}k context")
+            continue
+        chosen = route.get("chosen") or {}
+        rule = (f"local index route: {name} {use_case} index {idx} ({v.get('provenance')}, {v.get('published')}) "
+                f"clears the required {req}; a local lane spends no quota, so it is taken instead of "
+                f"{r.get('provider')}/{r.get('model')} (cost {chosen.get('cost')})")
+        return _move_to_local(core, body, r, node, {**entry, "variant": name, "variant_thinking": v["thinking"]},
+                              client=client, conversation_id=conversation_id, rule=rule,
+                              chosen_extra={"variant": name, "index": idx, "use_case": use_case, "proxy": True,
+                                            "provenance": v.get("provenance"), "weight": 0.0, "cost": 0.0})
     return r
 
 

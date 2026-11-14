@@ -151,7 +151,8 @@ Owner decision 2026-11-08, confirmed 2026-11-13 (#75): local chat models run on 
 with the manual switch on. The Studio runs S1 (scoring, compaction) and **no chat models**: its config has no
 `ollama` block, its Ollama service and gate may stay installed but idle. A node with an `ollama` block offers its
 Ollama models to the provider as `sub/<alias or tag>` pins (`cortados_router/provider/local_lane.py`) and, when its
-`auto_route` is set, as an auto-route target (below). The provider reads the same file as the sampler,
+`auto_route` is set, as an auto-route target (below), and, for a model with a published proxy index, as a candidate
+in selection (Local models in selection, below). The provider reads the same file as the sampler,
 `CORTADOS_LOCAL_RESOURCES_CONFIG`; `tables/resources.example.json` shows the Pro's block (placeholders).
 
 | key | meaning |
@@ -161,6 +162,8 @@ Ollama models to the provider as `sub/<alias or tag>` pins (`cortados_router/pro
 | `base_url` | the URL itself, for the git-ignored `tables/resources.json` only; never commit a real address |
 | `label` | the suffix `/v1/models` shows: `<name> · CortadOS (<label>)` (default: the node id, capitalised) |
 | `auto_route` | `false` (default): pin-only. Or `{"model": "<alias or tag of one of this node's models>", "bands": ["R0", …]}`: the S1 bands in which that model may take a new conversation (Local auto-route, below). There is no default band; `true`, an unknown model, an empty list, unknown keys and the bands `R3`/`R4` are refused with a config error |
+| `index_route` | `true` (default) or `false`: whether this node's models with a published proxy index are offered in selection (Local models in selection, below); anything else is refused |
+| `max_inflight` | positive integer, default 1: how many turns this provider is relaying to the node at once make it busy; a busy node is not offered by the index route (pins and the manual `auto_route` are unaffected) |
 | `probe_timeout_s` / `connect_timeout_s` / `read_timeout_s` | `/api/tags` probe (2), connect (3), wait per response chunk (300; a first model load can take a minute); each must be positive |
 | `models[]` | `id` (the Ollama tag, required), `alias` (the short pin name), `name` (display name), `context_length` (a positive integer of tokens; default 32768 when absent, the input-fit gate; set it to the node's Ollama context, 65536 for Ollama.app's setting on the Pro); `thinking` (`"off-unless-asked"`, the default, or `"passthrough"`; anything else is refused: Thinking models, below) |
 
@@ -201,7 +204,8 @@ Pin names (aliases and tags, case-insensitive) must be unique across nodes. Beha
 
 ### Local auto-route
 
-With `auto_route` set, `routing.auto_local` runs after S1 has routed a new `cortados` conversation (the routed path
+Superseded by the published proxy index (Local models in selection, below) for any model that has one; it keeps
+working for a config that sets it, and is checked first. With `auto_route` set, `routing.auto_local` runs after S1 has routed a new `cortados` conversation (the routed path
 only; pins are unaffected). It moves the conversation to the node's `auto_route.model` when **all** of these hold, and
 otherwise leaves S1's route exactly as it was:
 
@@ -245,8 +249,8 @@ tags below are the names given with `ollama cp`):
 
 | model | Ollama tag | alias (example config) | size | use |
 | --- | --- | --- | --- | --- |
-| Qwen3.8 27B Heretic, Q4_K_M | `Qwen27b_heretic` | `qwen-27b` | 16 GB | default auto-route model |
-| Huihui Qwythos 9B, Q6_K | `Huihui_Qwen_9b` | `qwythos-9b` | 7.6 GB | fast/small option (auto-route model if the 27B is too slow) |
+| Qwen3.8 27B Heretic, Q4_K_M | `Qwen27b_heretic` | `qwen-27b` | 16 GB | in selection by its published proxy index (`qwen-27b`, `qwen-27b-think`) |
+| Huihui Qwythos 9B, Q6_K | `Huihui_Qwen_9b` | `qwythos-9b` | 7.6 GB | pin-only (base model not identified; could be a manual `auto_route` model) |
 | Huihui Qwen3.8 Abliterated | `Huihui_Qwen3.8` | `qwen-abliterated` | 17 GB | pin-only |
 | Phi-4 Heretic, Q4_K_M | `Phi_4` | `phi-4` | 9.1 GB | pin-only |
 
@@ -254,7 +258,83 @@ All four are community fine-tunes without a published evaluation, which is one m
 reflex work only. Recommended first setting:
 `"auto_route": {"model": "qwen-27b", "bands": ["R0"]}` (reflex work only: D ≤ 2, blast radius 0, small context);
 widen to `R1` only after reviewing the `local auto-route` rows in router.db. Which bands go local is the owner's call,
-so the shipped example keeps `auto_route: false`.
+so the shipped example keeps `auto_route: false`. (Owner decision 2026-11-13: the published proxy index below replaces
+this manual rule for `Qwen27b_heretic`.)
+
+### Local models in selection (published proxy index)
+
+Owner decision 2026-11-13 (branch `local-published-index`): a local model is placed by the same rule as a cloud model,
+an index per use case that must clear the request's required index, instead of a hand-picked band list. A local
+model has no published scores of its own, so it borrows its **published base model's** index, minus a deduction:
+
+- **Declared** in `tables/local-models.json` → `index_proxies.variants`: per variant the Ollama tag (`id`, matched
+  case-insensitively, `:latest` optional), `thinking` (`off` / `on`), `published` (the base model's name exactly as in
+  `tables/benchmarks/scores.csv`) and `deduct` (a fraction). `not_mapped` records why the other models have none.
+- **Built** by `tables/benchmarks/build_tiers.py` (nightly, or by hand; never hand-edit the generated file) into
+  `tables/model-scores.generated.json` → `local_models`: per use case `index = base family index × (1 − deduct)`, with
+  `base_index`, `published`, `published_family`, `proxy: true` and `provenance` ("proxy: published base model, −10%").
+  A base the data does not know (or with fewer than `tiering.min_benchmarks` benchmarks), or a malformed entry, is never
+  given an index: it is listed in `local_unranked` with the reason and printed, and the cloud build goes on. Local
+  variants are kept out of `models`, so no cloud consumer (the band references, `served_routes`, reviews) sees them.
+  `--keep-sentiment` rebuilds from the committed `community-sentiment.json` (the claims fold keeps a 30-day window by
+  the clock, so a rebuild on a later day would otherwise also move cloud indexes).
+- **Measured results replace the proxy later** (plugged-in benchmarking, a separate plan).
+
+Today only `Qwen27b_heretic` has one (owner: its copy is Q4_K_M and abliterated, so −10 %), as two variants of the
+same weights chosen per request. Artificial Analysis publishes both modes of the base model; the index is the
+builder's fit over every source in `scores.csv` for that family (Qwen3.8 27B reasoning has 32 benchmarks across
+Artificial Analysis, LiveBench, LMArena and Epoch; the non-reasoning entry has Artificial Analysis's 3 only, so the
+fit's ridge shrinks it toward the average model):
+
+| variant | thinking | published base | AA intelligence / coding | general | code | ops | research | planning | writing | conversation | capture/log |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `qwen-27b` | off | `qwen3-8-27b-non-reasoning` | 20.2 / 44.6 | 16.7 | 15.1 | 15.0 | 19.6 | 16.3 | 17.6 | 20.5 | 19.1 |
+| `qwen-27b-think` | on | `qwen3-8-27b` | 33.7 / 68.1 | 38.8 | 39.6 | 31.7 | 43.3 | 35.8 | 46.3 | 33.9 | 44.6 |
+| (cloud) `gpt-5-6-luna` | | | 37.3 / 71.4 | 50.2 | 49.9 | 51.3 | 47.5 | 44.8 | 34.3 | 44.4 | 48.3 |
+| (cloud) `gpt-6-luna` | | | | 47.4 | 44.9 | 50.8 | 45.0 | 43.9 | 21.9 | 40.5 | 38.4 |
+| (cloud) `claude-haiku-4-5` (R1 reference) | | | | 13.3 | 14.2 | 13.8 | 11.0 | 6.1 | 18.2 | 19.0 | 11.5 |
+
+(Luna's family index takes its best published configuration, so its −low/−high entries do not appear separately.)
+With the knots of `routing-table.json` (version as committed), that places them at:
+
+| use case | `qwen-27b` | `qwen-27b-think` (max_tokens ≥ 4096) |
+| --- | --- | --- |
+| code, ops, research, planning, conversation, capture/log | R0; R1 at D ≤ 3 | R0; R1 at D ≤ 5 (ops, planning, conversation: D ≤ 4) |
+| writing | R0 | R0; R1 at D ≤ 5; R2 at D ≤ 6 (R2's floor, 42.3, is below its 46.3) |
+
+Nothing else: every other R2 floor (the Sonnet 5 / GPT-5.6 Terra reference, 46.6–50.8) is above both, and R3/R4 are
+never local.
+
+**How a request is placed** (`routing.index_local`, run by `auto_local` after S1 has routed a new `cortados`
+conversation and the manual `auto_route` did not take it). S1 and `core.resolve` still never see a local lane; the
+provider compares the variants against the route S1 chose:
+
+1. Hard rules first: never when S1 was degraded, never outward work, never blast radius 3, never R3/R4; never on
+   `/v1/responses`; a route without a required index (the table-fallback path) has nothing to clear.
+2. A variant qualifies when its index for S1's use case is at least S1's `required_index`. The think variant also needs
+   `max_tokens ≥ local_lane.THINK_MIN_MAX_TOKENS` (4096). Reason (#108): Qwen3.8 27B thinking spent all of
+   `max_tokens=20` and wrote no answer, thinking counts against `max_tokens`, Anthropic's extended thinking needs a
+   budget ≥ 1024 and below `max_tokens`, and the think index comes from published reasoning runs with large budgets.
+   4096 splits into ≥ 2048 for thinking and ≥ 2048 for the answer. A client that asked for thinking itself gets only
+   the think variant (its turn thinks either way). A node entry with `thinking: "passthrough"` takes no variant (its
+   thinking cannot be set).
+3. Cost: a local lane spends no subscription quota (`core.resolve` already weighs local at 0, and its face floor
+   exempts local), so a qualifying variant wins over S1's cloud choice; the lighter one first (lower general index,
+   the selection's "pay by general index": the non-thinking variant, which also answers sooner). This is the owner's
+   rule ("the local lane wins where it qualifies unless the node is busy"); it also takes precedence over a cloud
+   window whose credit is about to expire unused.
+4. It is not taken when its node has `index_route: false`, is **busy** (this provider already relays `max_inflight`
+   turns to it; Ollama runs one request per loaded model on the Pro, so another would queue for minutes while a cloud
+   lane answers now), failed a probe within `AUTO_DOWN_S`, does not answer `/api/tags` (asleep, battery, switch off,
+   gate down), does not list the model, the request outgrows `context_length`, or the client excluded the model
+   (`x-cortados-exclude-model` by alias or tag; both variants are one model). S1's route then stands; the skip is
+   logged at INFO (`local index route: … not taken …`, node, variant and reason only, never the request).
+
+When taken, the routes row is rewritten under the same id as for the manual rule, with the variant, its index,
+use case and provenance on `chosen` and a `local index route: …` hard-rules entry. Each turn of a think-variant
+conversation is sent `"thinking": {"type": "enabled", "budget_tokens": max_tokens // 2}`, or disabled when that turn's
+`max_tokens` is below 4096; the non-thinking variant is sent thinking disabled; a client's own `thinking` passes
+through. The #108 safety net (a thinking-only reply is an error, not an empty answer) still applies to both.
 
 **Exposure and the local gate.** Ollama has no authentication: anyone who reaches its port can run, pull or delete
 models. So Ollama listens on `127.0.0.1:11434` only (its default; leave `OLLAMA_HOST` unset), and the one door from the
