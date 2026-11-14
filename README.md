@@ -524,13 +524,17 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   (`__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `*.pyc`) and empty ignored directories; a nested
   `.git` always holds (any case: `.GIT` and `.Git` are `.git` on macOS; a directory or a file). Archiving needs writer
   quiescence: the child's process group gone (or the folder is held), and two clean assessments a pause apart (2 s,
-  then 5 s more if needed) bracketed by identical snapshots of the tree (paths, sizes, mtimes, outside the caches),
-  compared again under the cleanup lock before the move and before HEAD is detached; a change after the move sends it
-  on to `held/` undetached. The record names the paths that held it (`held_paths`, at most 20) and a path-free
+  then 5 s more if needed) bracketed by identical snapshots of the tree (paths, sizes, mtimes, outside the caches) and
+  of its git state (HEAD, local refs and tags, stash list, index file; branches other worktrees have checked out are
+  left out, so a sibling task's commits do not hold it), compared again under the cleanup lock before the move and
+  before HEAD is detached; a change after the move sends it on to `held/` undetached. Every snapshot counts every
+  entry it scans, caches included, against its cap (200 000); past it, it holds. The record names the paths that held it (`held_paths`, at most 20) and a path-free
   `reason_code`. A plain folder containing a `.git` entry at any depth is conservatively moved
   to `held/` too (symlinks are never followed). An archived worktree has its HEAD detached at the same commit so its
-  branch is free for the next task (`git update-ref --no-deref HEAD` with hooks disabled: no checkout, no file
-  written; a failed detach is recorded as `detach_error` and loses nothing); a held one keeps its branch. An archive
+  branch is free for the next task, at exactly the assessed commit (`detached_at`), re-checked on the remote just
+  before (`git update-ref --no-deref HEAD <sha> <sha>` with hooks disabled: no checkout, no file written, refused by
+  git if HEAD moved; a commit gone from the remote holds it; a failed detach is recorded as `detach_error` and loses
+  nothing); a held one keeps its branch. An archive
   entry from before this that still holds the branch is detached when a new task asks for it, under the archive
   cleanup's lock, only if its tree is clean and its HEAD is the `origin/<branch>` tip fetched just then with an
   explicit all-heads refspec (a failed fetch refuses), and only if `active/`, `archive/` and `held/` are real
@@ -547,7 +551,12 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   reassessment times out is left exactly as it is (reported under `timed_out`, counted as kept, retried by the next
   run), never deleted or moved. The cleanup rechecks plain folders for a nested `.git` immediately before deletion,
   and deletes a worktree only after two clean reassessments 2 s apart (`CLEANUP_QUIESCE_S`) bracketed by identical
-  snapshots, plus one more snapshot compared immediately before the first unlink; any change holds it.
+  snapshots (files and git state), plus one more snapshot; then it renames the entry to
+  `archive/.deleting-<task_id>-<nonce>` (a quarantine: a writer reaching it by its old path now fails), re-assesses
+  it there in full, and only then deletes it through the descriptor; any change holds it. A writer that recreates
+  `archive/<task_id>` meanwhile has its new folder moved to `held/`. A `.deleting-*` left by a crash is re-assessed
+  the same way, never deleted by its name. Limit: a process already holding a descriptor inside the tree can still
+  write; archiving required the task's process group gone three days earlier.
   Worktree metadata is never pruned globally (#93): `git worktree prune` is never run, every clone has
   `gc.worktreePruneExpire=never`, a deleted worktree's own admin dir is removed alone, every move is followed by
   `git worktree repair` (a failure is recorded as `repair_error`, never rolled back), and each cleanup (and each start

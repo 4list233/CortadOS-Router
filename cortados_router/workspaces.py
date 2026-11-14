@@ -10,7 +10,9 @@
   <root>/index.jsonl       one line per task (rewritten in place under index.lock, never appended twice for a task)
 
 Only archive/ is ever deleted from, only entries named like a task id, only regular directories directly inside it
-(never a symlink, never through one), only with an index record saying `archived` long enough ago. held/, repos/,
+(never a symlink, never through one), only with an index record saying `archived` long enough ago. A worktree is
+deleted from a quarantine: renamed first to archive/.deleting-<task_id>-<nonce>, re-assessed there in full, and only
+then deleted (_cleanup_entry; a leftover from a crash is re-assessed the same way, never deleted by its name alone). held/, repos/,
 services/ and everything else are never touched: cleanup_archive() refuses them by construction, not by convention.
 
 <root>/cleanup.lock serializes the cleanup's reassess-through-delete section with every move of a worktree between the
@@ -103,10 +105,11 @@ HELD_PATHS_MAX = 20                 # paths recorded as `held_paths` (names only
 SETTLE_RECHECK_DELAYS_S = (2.0, 5.0)
 # Writer quiescence (review of held-settle-fix, P1): a worktree is archived (settle) or deleted (cleanup) only when two
 # clean assessments, separated by a pause, are bracketed by identical snapshots of the tree (file set, sizes, mtimes,
-# ctimes and inodes of everything outside the regenerable caches). settle() pauses SETTLE_RECHECK_DELAYS_S; the
+# ctimes and inodes of everything outside the regenerable caches) and of its git state (HEAD, refs, stash, index:
+# _git_state). settle() detaches HEAD at exactly the assessed commit, re-checked on the remote first. settle() pauses SETTLE_RECHECK_DELAYS_S; the
 # cleanup pauses CLEANUP_QUIESCE_S per entry it would delete. Anything that cannot be snapshotted holds.
 CLEANUP_QUIESCE_S = 2.0
-SNAPSHOT_MAX = 200000               # entries per snapshot; past it quiescence cannot be established, so it holds
+SNAPSHOT_MAX = 200000               # entries scanned per snapshot (caches included); past it, it holds
 # Code points HFS+/APFS ignore when comparing names (git's is_hfs_dotgit list): ".g\u200cit" names .git there too.
 _HFS_IGNORABLE = frozenset(map(chr, (0x200C, 0x200D, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
                                      0x206A, 0x206B, 0x206C, 0x206D, 0x206E, 0x206F, 0xFEFF)))
@@ -426,9 +429,12 @@ def _git_nohooks(args, cwd):
 
 
 def _detach_head(path: str, expect=None):
-    """Detach the worktree's HEAD at the commit it is on, so its branch is free for another worktree. Plumbing only:
-    `update-ref --no-deref HEAD` rewrites the worktree's own HEAD and nothing else (no checkout, no file, no hook).
-    `expect`, when given, is the commit HEAD must still be on. Returns None on success, else why it did not happen."""
+    """Detach the worktree's HEAD so its branch is free for another worktree: at `expect` (the commit the assessment
+    proved published) when given, else at the commit it is on. Plumbing only: `update-ref --no-deref HEAD <sha> <sha>`
+    rewrites the worktree's own HEAD and nothing else (no checkout, no file, no index, no hook), and git itself refuses
+    it unless HEAD is still exactly <sha> at that moment (the old-value check), so it never detaches at a commit that
+    was not assessed. That is `git checkout --detach <sha>` without the checkout. Returns None on success, else why
+    it did not happen."""
     try:
         head = _git(["rev-parse", "--verify", "HEAD^{commit}"], cwd=path).strip()
         if expect is not None and head != expect:
@@ -445,6 +451,24 @@ def _detach_head(path: str, expect=None):
         return f"HEAD moved from {head} to {after} while detaching"
     if attached:
         return "HEAD is still on a branch after detaching"
+    return None
+
+
+def _published_at(path: str, sha: str, deadline=None):
+    """None when commit `sha` is on a remote-tracking ref fetched just now (every remote, explicit all-heads refspec,
+    no tags), else why not. The re-check settle() makes right before it detaches HEAD at `sha`."""
+    try:
+        remotes = _git(["remote"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S)).split()
+        if not remotes:
+            return "it has no remote"
+        for remote in remotes:
+            _git(["fetch", "--prune", "--no-tags", remote, f"+refs/heads/*:refs/remotes/{remote}/*"], cwd=path,
+                 timeout=_within(deadline, FETCH_TIMEOUT_S))
+        ahead = _git(["rev-list", sha, "--not", "--remotes"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
+    except WorkspaceError as exc:
+        return f"could not re-check that {sha[:12]} is on a remote: {exc}"
+    if ahead.strip():
+        return f"{sha[:12]} is no longer on any remote ({len(ahead.split())} commit(s) not published)"
     return None
 
 
@@ -504,10 +528,11 @@ def _is_cache_path(rel: str) -> bool:
     return any(p in CACHE_DIR_NAMES for p in parts) or parts[-1].endswith(CACHE_FILE_SUFFIXES)
 
 
-def _ignored_blocker(top: str, rel: str):
+def _ignored_blocker(top: str, rel: str, deadline=None):
     """None when the ignored entry `rel` (a file, or a directory as `git status` names it: "dir/") holds nothing but
     regenerable caches or empty directories; else the first path inside it that is owner data. A nested .git always
-    blocks (it may hold unpushed commits), and so does anything that cannot be walked."""
+    blocks (it may hold unpushed commits), and so does anything that cannot be walked. Every listed entry counts
+    against IGNORED_WALK_MAX before any filtering; `deadline` is checked per directory (GitTimeoutError)."""
     full = os.path.join(top, rel.rstrip("/"))
     try:
         info = os.lstat(full)
@@ -519,6 +544,10 @@ def _ignored_blocker(top: str, rel: str):
         return None if _is_cache_path(rel) else rel
     errors, seen = [], 0
     for directory, dirs, files in os.walk(full, followlinks=False, onerror=errors.append):
+        seen += len(dirs) + len(files)               # every entry listed, before any filtering
+        if seen > IGNORED_WALK_MAX:
+            return f"{rel} (more than {IGNORED_WALK_MAX} entries; not assessed)"
+        _check_deadline(deadline, "walk the ignored files")
         base = os.path.relpath(directory, top)
         meta = next((n for n in (*dirs, *files) if _is_git_meta(n)), None)
         if meta is not None:
@@ -527,9 +556,6 @@ def _ignored_blocker(top: str, rel: str):
         for name in dirs:                            # a symlink to a directory is listed here and never followed
             (files if os.path.islink(os.path.join(directory, name)) else real_dirs).append(name)
         dirs[:] = real_dirs
-        seen += len(dirs) + len(files)
-        if seen > IGNORED_WALK_MAX:
-            return f"{rel} (more than {IGNORED_WALK_MAX} entries; not assessed)"
         for name in files:
             if not _is_cache_path(os.path.join(base, name)):
                 return os.path.join(base, name)
@@ -542,8 +568,9 @@ def _leftovers(path: str, deadline=None) -> list:
     """Working-tree paths that keep `path` from being proven published: every tracked change and every untracked file
     git does not ignore (named by `git status`), and, for ignored content, whatever _ignored_blocker finds that is not
     a regenerable cache or an empty directory. Paths only, relative to the worktree, in git's order."""
-    out = _git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"], cwd=path,
-               timeout=_within(deadline, GIT_TIMEOUT_S))
+    # --no-optional-locks: status must not refresh (rewrite) the index, whose stat is part of the snapshot.
+    out = _git(["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all",
+                "--ignored=matching"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
     tokens = out.split("\0")
     blocking, i = [], 0
     while i < len(tokens):
@@ -555,7 +582,7 @@ def _leftovers(path: str, deadline=None) -> list:
         if xy[0] in "RC":
             i += 1                                   # -z: a rename's or copy's source path follows as its own token
         if xy == "!!":
-            why = _ignored_blocker(path, rel)
+            why = _ignored_blocker(path, rel, deadline)
             if why is not None:
                 blocking.append(why)
         else:
@@ -577,7 +604,8 @@ def assess(path: str, deadline=None):
             return False, _Reason("no_remote", "could not assess the worktree: it has no remote"), []
         for remote in remotes:
             # An explicit all-heads refspec also prunes stale refs excluded by a locally narrowed fetch refspec.
-            _git(["fetch", "--prune", remote,
+            # --no-tags: a tag the fetch auto-follows would change the snapshot's refs and hold a clean worktree.
+            _git(["fetch", "--prune", "--no-tags", remote,
                   f"+refs/heads/*:refs/remotes/{remote}/*"], cwd=path, timeout=_within(deadline, FETCH_TIMEOUT_S))
         submodules = _git(["ls-files", "--stage"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
         if any(line.startswith("160000 ") for line in submodules.splitlines()):
@@ -602,16 +630,99 @@ def assess(path: str, deadline=None):
     return True, _Reason("pushed", "pushed"), []
 
 
-def _snapshot(path: str, deadline=None) -> frozenset:
-    """What a late writer would change: (relative path, type, size, mtime_ns, ctime_ns, inode) for every entry outside
-    the regenerable caches (directories by name only, so a cache file's creation does not count), plus any git
-    metadata at any depth, caches included. The worktree's own top-level .git (rewritten by `git worktree repair`
-    after a move) is left out. Never follows a symlink. Raises GitTimeoutError when `deadline` passes and
-    WorkspaceError when the tree cannot be walked completely or has more than SNAPSHOT_MAX entries."""
-    out, errors = set(), []
+def _git_state(path: str, deadline=None) -> dict:
+    """The worktree's unpublished git state, compared like the file snapshot (review of held-settle-fix, P1 #2): an
+    empty commit, a new branch or tag, a stash or a staged change touch no working-tree file but change this. HEAD's
+    commit and what it is attached to; the worktree's own git dir and the clone's common dir (`git rev-parse --git-dir
+    --git-common-dir`); every ref (`git for-each-ref`) except remote-tracking refs (our own fetches move them; they are
+    the remote's state, not local work), with the branches other worktrees of the clone have checked out (`elsewhere`,
+    left out of the comparison: see _Snap); the stash list; and the size, mtime and inode of the worktree's index file.
+    Raises GitTimeoutError / WorkspaceError like _git()."""
+    def run(args):
+        return _git(["--no-optional-locks", *args], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
+    lines = run(["rev-parse", "--git-dir", "--git-common-dir", "HEAD", "--symbolic-full-name", "HEAD"]).splitlines()
+    if len(lines) != 4:
+        raise WorkspaceError(f"git rev-parse gave {len(lines)} lines, not 4")
+    gitdir, common = (os.path.normpath(d if os.path.isabs(d) else os.path.join(path, d)) for d in lines[:2])
+    head, attached = lines[2].strip(), lines[3].strip()
+    elsewhere = _branches_elsewhere(gitdir, common)
+    refs = {}
+    for line in run(["for-each-ref", "--format=%(refname) %(objectname)"]).splitlines():
+        ref, _, sha = line.rpartition(" ")
+        if ref and not ref.startswith("refs/remotes/"):
+            refs[ref] = sha
+    stash = run(["stash", "list", "--format=%H"])
+    try:
+        st = os.lstat(os.path.join(gitdir, "index"))
+        index = (stat.S_IFMT(st.st_mode), st.st_size, st.st_mtime_ns, st.st_ino)
+    except FileNotFoundError:
+        index = None
+    return {"head": head, "attached": attached, "git_dir": gitdir, "common_dir": common, "refs": refs,
+            "elsewhere": elsewhere, "stash": stash, "index": index}
+
+
+class _Snap(tuple):
+    """(files, git state) from _snapshot(). Equal when the files are equal and the git states are equal, except that a
+    branch another worktree has checked out in EITHER snapshot is left out of the ref comparison: another task that
+    commits on its branch, settles (detaching, so its branch is no longer "elsewhere") or starts while this one is
+    assessed has not changed this worktree (#102: tasks share a clone)."""
+    __hash__ = None
+
+    def __eq__(self, other):
+        if not isinstance(other, tuple) or len(other) != 2:
+            return NotImplemented
+        if self[0] != other[0]:
+            return False
+        a, b = self[1], other[1]
+        if a is None or b is None:
+            return a is None and b is None
+        if any(a[k] != b[k] for k in ("head", "attached", "git_dir", "common_dir", "stash", "index")):
+            return False
+        skip = a["elsewhere"] | b["elsewhere"]
+        return {r: v for r, v in a["refs"].items() if r not in skip} == \
+            {r: v for r, v in b["refs"].items() if r not in skip}
+
+    def __ne__(self, other):
+        eq = self.__eq__(other)
+        return eq if eq is NotImplemented else not eq
+
+
+def _branches_elsewhere(gitdir: str, common: str) -> frozenset:
+    """refs/heads/<b> for every branch checked out by the clone itself or by a worktree other than the one whose admin
+    dir is `gitdir`, from their HEAD files (no git call, no symlink followed)."""
+    heads = [_read_small(os.path.join(common, "HEAD"))] if not _same_path(gitdir, common) else []
+    admin_root = os.path.join(common, "worktrees")
+    try:
+        names = sorted(os.listdir(admin_root))
+    except OSError:
+        names = []
+    for name in names:
+        admin = os.path.join(admin_root, name)
+        if not _same_path(admin, gitdir):
+            heads.append(_read_small(os.path.join(admin, "HEAD")))
+    out = set()
+    for text in heads:
+        if text and text.startswith("ref: "):
+            out.add(text[len("ref: "):].strip())
+    return frozenset(out)
+
+
+def _snapshot(path: str, deadline=None, git: bool = True) -> "_Snap":
+    """What a late writer would change: (files, git state). `files` holds (relative path, type, size, mtime_ns,
+    ctime_ns, inode) for every entry outside the regenerable caches (directories by name only, so a cache file's
+    creation does not count), plus any git metadata at any depth, caches included; the worktree's own top-level .git
+    (rewritten by `git worktree repair` after a move) is left out. `git state` is _git_state() for a repository
+    worktree (`git`), None for a plain folder. Never follows a symlink.
+
+    Bounded: every entry listed counts against SNAPSHOT_MAX before any filtering (a huge cache tree counts too), and
+    `deadline` is checked inside the entry loops. Raises GitTimeoutError when `deadline` passes and WorkspaceError
+    when the tree cannot be walked completely or has more than SNAPSHOT_MAX entries: callers hold on either."""
+    out, errors, scanned = set(), [], 0
     for directory, dirs, files in os.walk(path, followlinks=False, onerror=errors.append):
-        if deadline is not None and time.monotonic() >= deadline:
-            raise GitTimeoutError("no time left to snapshot the worktree")
+        scanned += len(dirs) + len(files)
+        if scanned > SNAPSHOT_MAX:
+            raise WorkspaceError(f"more than {SNAPSHOT_MAX} entries")
+        _check_deadline(deadline, "snapshot the worktree")
         base = os.path.relpath(directory, path)
         if base == ".":
             dirs[:] = [n for n in dirs if n != ".git"]
@@ -625,6 +736,7 @@ def _snapshot(path: str, deadline=None) -> frozenset:
             if _is_git_meta(name) or not _is_cache_path(rel):
                 out.add((rel, "d"))
         for name in files:
+            _check_deadline(deadline, "snapshot the worktree")
             rel = os.path.normpath(os.path.join(base, name))
             if not _is_git_meta(name) and _is_cache_path(rel):
                 continue
@@ -635,11 +747,21 @@ def _snapshot(path: str, deadline=None) -> frozenset:
             except OSError as exc:
                 raise WorkspaceError(f"cannot stat {rel}: {type(exc).__name__}")
             out.add((rel, stat.S_IFMT(st.st_mode), st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino))
-        if len(out) > SNAPSHOT_MAX:
-            raise WorkspaceError(f"more than {SNAPSHOT_MAX} entries")
     if errors:
         raise WorkspaceError(f"cannot be walked: {type(errors[0]).__name__}")
-    return frozenset(out)
+    return _Snap((frozenset(out), _git_state(path, deadline) if git else None))
+
+
+def _snapshot_head(snap):
+    """The HEAD commit a repository snapshot recorded, or None."""
+    if not snap or snap[1] is None:
+        return None
+    return snap[1].get("head")
+
+
+def _check_deadline(deadline, what: str) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise GitTimeoutError(f"no time left to {what}")
 
 
 def _not_quiet(text: str):
@@ -810,40 +932,59 @@ def _move_settled(rec: dict, root: str, ok: bool, reason: str, snapshot=None) ->
     rec.update(state="archived" if ok else "held", path=dest, settled_at=time.time(), reason=str(reason),
                reason_code=reason_code(reason))
     _repair_settled(rec, dest)
-    if ok and rec.get("kind") == "repo" and not _same_snapshot(dest, snapshot):
-        # A late write after the move: not detached (the branch stays held by it), and on to held/, never deleted.
-        ok = False
-        late = _not_quiet("its files changed after the move to archive/; moved on to held/ without detaching HEAD")
-        held = os.path.join(root, "held", rec["task_id"])
-        try:
-            os.makedirs(os.path.dirname(held), exist_ok=True)
-            if os.path.lexists(held):
-                raise WorkspaceError(f"{held} already exists")
-            os.rename(dest, held)
-        except (OSError, WorkspaceError) as exc:
-            rec.update(detached=False, detach_error=f"HEAD not detached: {late}; and it could not be moved to held/ "
-                                                    f"({exc}), so the cleanup reassesses it before any deletion")
-            return rec
-        for key in _REPAIR_FIELDS + ("registry_conflict",):
-            rec.pop(key, None)
-        rec.update(state="held", path=held, reason=str(late), reason_code=late.code)
-        _repair_settled(rec, held)
+    if not (ok and rec.get("kind") == "repo"):
         return rec
-    if ok and rec.get("kind") == "repo" and (rec.get("registry_conflict") or rec.get("repair_error")):
+    sha = _snapshot_head(snapshot)
+    if not _same_snapshot(dest, snapshot):
+        # A late write after the move (a file, a commit, a ref, a stash, a staged change): not detached (the branch
+        # stays held by it), and on to held/, never deleted.
+        return _move_on_to_held(rec, root, dest, _not_quiet(
+            "its files or git state changed after the move to archive/; moved on to held/ without detaching HEAD"))
+    if rec.get("registry_conflict") or rec.get("repair_error"):
         # #93 round 4: no git operation through a .git that may name another worktree's admin dir: detaching "this"
         # HEAD would detach that worktree's, freeing its branch. The branch stays held here until the entry is fixed.
         rec["detached"] = False
         rec["detach_error"] = ("HEAD not detached: the registry entry was not repaired after the move, so its .git "
                                "may name another worktree's admin dir; nothing was run through it")
-    elif ok and rec.get("kind") == "repo":
-        # Pushed work: free the branch for the next task (the commit stays checked out, detached). Held work keeps
-        # its branch, so a new task cannot start on it while it is unpushed. A failed detach loses nothing: the
-        # worktree stays archived and attached, and the reason is recorded here and in index.jsonl.
-        why = _detach_head(dest)
-        if why:
-            rec["detach_error"] = why
-        else:
-            rec["detached"] = True
+        return rec
+    # The assessed commit, re-checked on the remote right before the detach, then the whole state once more: the
+    # detach goes to exactly that commit (update-ref's old-value check refuses any other).
+    code, why = "not_published", (_published_at(dest, sha) if sha else "the assessment recorded no HEAD commit")
+    if why is None and not _same_snapshot(dest, snapshot):
+        code, why = "not_quiescent", "its files or git state changed while the remote was re-checked"
+    if why is not None:
+        return _move_on_to_held(rec, root, dest, _Reason(
+            code, f"not detached: {why}; moved on to held/ without detaching HEAD"))
+    # Pushed work: free the branch for the next task (the commit stays checked out, detached). Held work keeps its
+    # branch, so a new task cannot start on it while it is unpushed. A failed detach loses nothing: the worktree
+    # stays archived and attached, the reason is recorded here and in index.jsonl, and the cleanup reassesses it in
+    # full (quarantined) before any deletion.
+    why = _detach_head(dest, expect=sha)
+    if why:
+        rec["detach_error"] = why
+    else:
+        rec.update(detached=True, detached_at=sha)
+    return rec
+
+
+def _move_on_to_held(rec: dict, root: str, dest: str, late) -> dict:
+    """settle()'s second move, archive/ -> held/, for a worktree that changed (or lost its remote proof) after its
+    move into archive/. HEAD is not detached. If the move fails it stays archived and attached; the cleanup reassesses
+    it before any deletion."""
+    held = os.path.join(root, "held", rec["task_id"])
+    try:
+        os.makedirs(os.path.dirname(held), exist_ok=True)
+        if os.path.lexists(held):
+            raise WorkspaceError(f"{held} already exists")
+        os.rename(dest, held)
+    except (OSError, WorkspaceError) as exc:
+        rec.update(detached=False, detach_error=f"HEAD not detached: {late}; and it could not be moved to held/ "
+                                                f"({exc}), so the cleanup reassesses it before any deletion")
+        return rec
+    for key in _REPAIR_FIELDS + ("registry_conflict",):
+        rec.pop(key, None)
+    rec.update(state="held", path=held, reason=str(late), reason_code=late.code)
+    _repair_settled(rec, held)
     return rec
 
 
@@ -956,24 +1097,31 @@ def _remove_tree_fd(directory_fd: int) -> None:
 
 def _contains_git_entry(path: str) -> bool:
     """Find a .git entry (any case, file or directory: _is_git_meta) at any depth without traversing symlinks. A tree
-    that cannot be walked counts as containing one (it holds)."""
-    errors = []
+    that cannot be walked, or has more than SNAPSHOT_MAX entries, counts as containing one (it holds)."""
+    errors, scanned = [], 0
     for directory, dirs, files in os.walk(path, followlinks=False, onerror=errors.append):
-        if any(_is_git_meta(n) for n in (*dirs, *files)):
+        scanned += len(dirs) + len(files)
+        if scanned > SNAPSHOT_MAX or any(_is_git_meta(n) for n in (*dirs, *files)):
             return True
         dirs[:] = [name for name in dirs if not os.path.islink(os.path.join(directory, name))]
     return bool(errors)
 
 
-def _fd_contains_git_entry(directory_fd: int) -> bool:
-    for name in os.listdir(directory_fd):
+def _fd_contains_git_entry(directory_fd: int, _scanned=None) -> bool:
+    """_contains_git_entry through descriptors: True (holds) on a .git entry or past SNAPSHOT_MAX entries."""
+    scanned = [0] if _scanned is None else _scanned
+    names = os.listdir(directory_fd)
+    scanned[0] += len(names)
+    if scanned[0] > SNAPSHOT_MAX:
+        return True
+    for name in names:
         if _is_git_meta(name):
             return True
         info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if stat.S_ISDIR(info.st_mode):
             child_fd = _open_dir(name, dir_fd=directory_fd)
             try:
-                if _fd_contains_git_entry(child_fd):
+                if _fd_contains_git_entry(child_fd, scanned):
                     return True
             finally:
                 os.close(child_fd)
@@ -1243,7 +1391,10 @@ class _AdminDir:
     archive/ or held/, or the clone's own top level). Raises WorkspaceError otherwise (the caller then deletes nothing):
     a backlink alone is not proof of ownership, since a wrong repair could have rewritten it (#93 round 3)."""
 
-    def __init__(self, entry_fd: int, path: str, repo_dir: str, root: str):
+    def __init__(self, entry_fd: int, path: str, repo_dir: str, root: str, named=None):
+        # `named`: the path the admin dir's backlink must name, when it is not `path` (a quarantined worktree is
+        # deleted from archive/.deleting-<id>-<nonce>, and its registry entry still names archive/<id>).
+        named = path if named is None else named
         self.fds = []
         try:
             text = _read_small(".git", dir_fd=entry_fd)
@@ -1265,8 +1416,8 @@ class _AdminDir:
             self.fds.append(self.fd)
             recorded = _read_small("gitdir", dir_fd=self.fd)
             recorded = None if recorded is None else _parse_gitfile(recorded, admin)
-            if recorded is None or not _same_path(recorded, os.path.join(path, ".git")):
-                raise WorkspaceError(f"the admin dir {admin} names {recorded}, not {path}; it is left alone")
+            if recorded is None or not _same_path(recorded, os.path.join(named, ".git")):
+                raise WorkspaceError(f"the admin dir {admin} names {recorded}, not {named}; it is left alone")
             other = _other_referrer(admin, path, repo_dir, root)
             if other is not None:
                 raise WorkspaceError(f"the admin dir {admin} is also named by the existing worktree {other}'s .git "
@@ -1285,12 +1436,14 @@ class _AdminDir:
         self.fds = []
 
 
-def _hold_changed_archive(root: str, archive_fd: int, name: str, rec: dict, reason: str, now: float) -> dict:
+def _hold_changed_archive(root: str, archive_fd: int, name: str, rec: dict, reason: str, now: float,
+                          src=None) -> dict:
     """Move a newly changed archived worktree to held/ using anchored source and destination descriptors, then repair
     the clone's registry so it names the new path (fixed cap, never the cleanup budget). There is no rollback: held/
     is never deleted from, so it is the safe place to be, and a failed repair only leaves a stale registry entry,
     which nothing prunes (module docstring). The failure is recorded in the index (`repair_error`) and raised for
-    the cleanup report; the next cleanup or start repairs the entry and clears it."""
+    the cleanup report; the next cleanup or start repairs the entry and clears it. `src` is the entry's name in
+    archive/ when it is not `name` (a quarantined worktree)."""
     held_path = os.path.join(root, "held", name)
     held_fd = _open_dir(os.path.join(root, "held"))
     try:
@@ -1300,7 +1453,7 @@ def _hold_changed_archive(root: str, archive_fd: int, name: str, rec: dict, reas
             pass
         else:
             raise WorkspaceError(f"held/{name} already exists; archived workspace was not deleted")
-        os.rename(name, name, src_dir_fd=archive_fd, dst_dir_fd=held_fd)
+        os.rename(src or name, name, src_dir_fd=archive_fd, dst_dir_fd=held_fd)
     finally:
         os.close(held_fd)
     updated = {**rec, "state": "held", "path": held_path, "settled_at": now, "reason": str(reason),
@@ -1319,6 +1472,179 @@ def _hold_changed_archive(root: str, archive_fd: int, name: str, rec: dict, reas
         raise WorkspaceError(f"held, but `git worktree repair` of {held_path} failed ({failure}); its registry entry "
                              "is stale (not destructive) until the next cleanup or start repairs it")
     return updated
+
+
+# A worktree being deleted is first renamed to archive/.deleting-<task_id>-<nonce> (review of held-settle-fix, P1 #1).
+_QUARANTINE_PREFIX = ".deleting-"
+_QUARANTINE_RE = re.compile(r"\.deleting-(t\d{14}-[0-9a-f]{8})-[0-9a-f]{8,32}")
+_after_quarantine = None    # test seam: called with the quarantine path right after the rename, before the re-check
+
+
+def _cleanup_entry(root: str, archive_fd: int, name: str, tid: str, rec: dict, now: float, deadline, out) -> bool:
+    """Assess one old archive entry and delete it only when everything is proven published and nothing changed.
+    Returns True when it was deleted, False when it was kept (held, timed out, or left alone); raises WorkspaceError /
+    OSError for the cleanup report (nothing deleted). `name` is the entry in archive/: <tid>, or a quarantine leftover
+    .deleting-<tid>-<nonce> from a run that crashed mid-deletion, which is never deleted by its name alone: it gets
+    the same full assessment as any archived worktree.
+
+    The steps, for an entry still at archive/<tid>:
+      1. assess: a repository worktree needs two clean assessments CLEANUP_QUIESCE_S apart bracketed by identical
+         snapshots of its files and its git state (_quiet_assess), then its admin dir resolved (_AdminDir) and one
+         more identical snapshot; a plain folder needs no .git entry, and its file snapshot is taken.
+      2. quarantine: an atomic rename, on the same file system, to archive/.deleting-<tid>-<nonce>. From here a
+         writer that reaches the tree by its path (archive/<tid>/...) fails: the path no longer exists.
+      3. re-assess the quarantined tree in full: a repository worktree must still be published (assess()) with its
+         snapshot (files and git state) identical before and after that assessment and to step 1's; a plain folder
+         must still have no .git entry and the same file snapshot. Any difference moves it to held/<tid>.
+      4. delete through the descriptor opened in step 1 (never through a path), then its admin dir alone. If
+         archive/<tid> exists again afterwards (a writer recreated it), that new entry is moved to held/.
+    The honest limit: a process that already holds a descriptor inside the tree (an open file, or its current
+    directory) can still write between step 3 and step 4, and that write is deleted. Archiving needed the task's
+    process group confirmed gone at settle, ARCHIVE_AGE_S (three days) earlier, so such a process would have to have
+    left the group and kept the descriptor open for those three days.
+
+    An assessment that runs out of the cleanup budget is an unknown: nothing is deleted or held on it, and a
+    quarantined entry is renamed back to archive/<tid> (or, if that fails, left for the next run to re-assess)."""
+    archive = os.path.join(root, "archive")
+    orig = os.path.join(archive, tid)
+    path = os.path.join(archive, name)
+    quarantined = name != tid
+    kind = rec.get("kind")
+    entry_fd = admin = None
+
+    def hold(reason, hold_rec=None):
+        _hold_changed_archive(root, archive_fd, tid, hold_rec or rec, reason, now, src=name)
+        return False
+
+    try:
+        entry_fd = _open_dir(name, dir_fd=archive_fd)
+        if not _same_entry(entry_fd, path):
+            raise WorkspaceError("archive path changed after it was opened; refusing deletion")
+        if kind == "repo":
+            ok, reason, paths, _, snap = _quiet_assess(path, (CLEANUP_QUIESCE_S,), deadline=deadline)
+            if not _same_entry(entry_fd, path):
+                raise WorkspaceError("archive path changed during reassessment; refusing deletion")
+            if ok is None:
+                # Timed out: nothing is known about the worktree, so it is neither deleted nor moved. Not an error
+                # either (the daily job exits non-zero on errors): a later run reassesses it.
+                out["timed_out"].append(f"{name}: {reason}")
+                return False
+            if not ok:
+                return hold(reason, {**rec, "held_paths": paths} if paths else rec)
+            if not isinstance(rec.get("repo_dir"), str):
+                raise WorkspaceError("its record names no clone; refusing deletion")
+            # Resolved and checked before anything is deleted: a worktree whose admin dir cannot be proven its own
+            # is not deleted at all. Its backlink names archive/<tid>, also for a quarantine leftover.
+            admin = _AdminDir(entry_fd, path, rec["repo_dir"], root, named=orig)
+        else:
+            if _fd_contains_git_entry(entry_fd):
+                return hold(_Reason("nested_git", "plain folder contains a nested .git entry"))
+            snap = None
+        try:
+            final = _snapshot(path, deadline, git=kind == "repo")
+        except GitTimeoutError as exc:
+            out["timed_out"].append(f"{name}: {exc}")
+            return False
+        except WorkspaceError as exc:
+            return hold(_not_quiet(f"{exc}; checked immediately before deletion"))
+        if not _same_entry(entry_fd, path):
+            raise WorkspaceError("archive path changed during the final check; refusing deletion")
+        if snap is not None and final != snap:
+            return hold(_not_quiet("its files or git state changed after the assessment; checked immediately before "
+                                   "deletion"))
+        snap = final
+        if not quarantined:
+            qname = f"{_QUARANTINE_PREFIX}{tid}-{os.urandom(8).hex()}"
+            os.rename(name, qname, src_dir_fd=archive_fd, dst_dir_fd=archive_fd)
+            name, path, quarantined = qname, os.path.join(archive, qname), True
+            if not _same_entry(entry_fd, path):
+                raise WorkspaceError(f"the quarantined entry {qname} is not the directory that was assessed; "
+                                     "refusing deletion")
+            if _after_quarantine is not None:
+                _after_quarantine(path)
+            changed = _requarantine_check(path, entry_fd, kind, snap, deadline)
+            if changed is None:
+                _unquarantine(archive_fd, name, tid, out)
+                return False
+            if changed:
+                return hold(_not_quiet(f"{changed}; checked in quarantine immediately before deletion"))
+        _remove_tree_fd(entry_fd)
+        os.close(entry_fd)
+        entry_fd = None
+        os.rmdir(name, dir_fd=archive_fd)
+        if admin is not None:
+            # After the files: a crash in between leaves only a stale entry (never pruned, harmless).
+            try:
+                admin.remove()
+            except OSError as exc:
+                out["errors"].append(f"{tid}: deleted, but its admin dir in {rec['repo_dir']}/.git/worktrees "
+                                     f"was not removed ({exc}); stale, harmless")
+    finally:
+        if entry_fd is not None:
+            os.close(entry_fd)
+        if admin is not None:
+            admin.close()
+    update_index(root, {**rec, "state": "deleted", "deleted_at": now})
+    _hold_reappeared(root, archive_fd, tid, rec, now, out)
+    return True
+
+
+def _requarantine_check(path: str, entry_fd: int, kind, snap, deadline):
+    """Step 3 of _cleanup_entry: what changed in the quarantined tree (a string), "" when nothing did, None when the
+    budget ran out (unknown)."""
+    try:
+        if kind == "repo":
+            pre = _snapshot(path, deadline)
+            ok, reason, _ = assess(path, deadline)
+            if ok is None:
+                return None
+            post = _snapshot(path, deadline)
+            if not ok:
+                return f"it is no longer proven published ({reason})"
+        else:
+            if _fd_contains_git_entry(entry_fd):
+                return "a .git entry appeared in the plain folder"
+            pre = post = _snapshot(path, deadline, git=False)
+    except GitTimeoutError:
+        return None
+    except WorkspaceError as exc:
+        return f"it could not be snapshotted ({exc})"
+    if not (pre == snap and post == snap):
+        return "its files or git state changed"
+    return ""
+
+
+def _unquarantine(archive_fd: int, qname: str, tid: str, out) -> None:
+    """An assessment in quarantine ran out of time: rename it back to archive/<tid>, unless that name is taken again
+    (then it stays a leftover, which the next run re-assesses before anything)."""
+    try:
+        os.stat(tid, dir_fd=archive_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        try:
+            os.rename(qname, tid, src_dir_fd=archive_fd, dst_dir_fd=archive_fd)
+            out["timed_out"].append(f"{tid}: no time left to re-assess it in quarantine; renamed back, untouched")
+            return
+        except OSError:
+            pass
+    out["timed_out"].append(f"{tid}: no time left to re-assess it in quarantine; left as {qname} for the next run")
+
+
+def _hold_reappeared(root: str, archive_fd: int, tid: str, rec: dict, now: float, out) -> None:
+    """After a deletion: a writer that recreated archive/<tid> by its path wrote something new. Never deleted: it goes
+    to held/<tid> as a plain folder, and the task's record says so."""
+    try:
+        info = os.stat(tid, dir_fd=archive_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(info.st_mode):
+        out["errors"].append(f"{tid}: deleted, but a new non-directory entry archive/{tid} appeared; left alone")
+        return
+    reason = _not_quiet("archive/<task id> was recreated while its archived worktree was deleted; the new entry is "
+                        "held")
+    try:
+        _hold_changed_archive(root, archive_fd, tid, {**rec, "kind": "folder", "deleted_at": now}, reason, now)
+    except (OSError, WorkspaceError) as exc:
+        out["errors"].append(f"{tid}: deleted, but a new archive/{tid} appeared and could not be held ({exc})")
 
 
 def cleanup_archive(root: str, now=None, max_deletions=CLEANUP_MAX_DELETIONS, max_seconds=CLEANUP_MAX_SECONDS) -> dict:
@@ -1436,7 +1762,9 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
             if max_seconds is not None and time.monotonic() - started >= max_seconds:
                 out["kept"] += len(names) - pos
                 break
-            if not TASK_ID_RE.fullmatch(name):
+            leftover = _QUARANTINE_RE.fullmatch(name)
+            tid = leftover.group(1) if leftover else name
+            if not leftover and not TASK_ID_RE.fullmatch(name):
                 out["refused"].append(f"{name}: not a task id")
                 continue
             try:
@@ -1450,9 +1778,10 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
             if not stat.S_ISDIR(info.st_mode):
                 out["refused"].append(f"{name}: not a directory")
                 continue
-            rec = index.get(name)
+            rec = index.get(tid)
             if not isinstance(rec, dict) or rec.get("state") != "archived" \
-                    or not isinstance(rec.get("settled_at"), (int, float)):
+                    or not isinstance(rec.get("settled_at"), (int, float)) \
+                    or (leftover and not _same_path(rec.get("path") or "", os.path.join(archive, tid))):
                 out["refused"].append(f"{name}: no archive record in index.jsonl")
                 continue
             if now - rec["settled_at"] < ARCHIVE_AGE_S:
@@ -1465,77 +1794,15 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
                     and os.path.normpath(rec["repo_dir"]) in unprotected:
                 out["kept"] += 1
                 continue
-            entry_fd = admin = None
             try:
-                entry_fd = _open_dir(name, dir_fd=archive_fd)
-                path = os.path.join(archive, name)
-                if not _same_entry(entry_fd, path):
-                    raise WorkspaceError("archive path changed after it was opened; refusing deletion")
-                if rec.get("kind") == "folder" and _fd_contains_git_entry(entry_fd):
-                    _hold_changed_archive(root, archive_fd, name, rec,
-                                          _Reason("nested_git", "plain folder contains a nested .git entry"), now)
-                    out["kept"] += 1
-                    continue
-                snap = None
-                if rec.get("kind") == "repo":
-                    # Two clean assessments CLEANUP_QUIESCE_S apart, bracketed by identical snapshots; compared once
-                    # more below, after the admin dir is resolved and immediately before the first unlink.
-                    ok, reason, paths, _, snap = _quiet_assess(path, (CLEANUP_QUIESCE_S,), deadline=deadline)
-                    if not _same_entry(entry_fd, path):
-                        raise WorkspaceError("archive path changed during reassessment; refusing deletion")
-                    if ok is None:
-                        # Timed out: nothing is known about the worktree, so it is neither deleted nor moved. Not an
-                        # error either (the daily job exits non-zero on errors): a later run reassesses it.
-                        out["timed_out"].append(f"{name}: {reason}")
-                        out["kept"] += 1
-                        continue
-                    if not ok:
-                        _hold_changed_archive(root, archive_fd, name, {**rec, "held_paths": paths} if paths else rec,
-                                              reason, now)
-                        out["kept"] += 1
-                        continue
-                    if not isinstance(rec.get("repo_dir"), str):
-                        raise WorkspaceError("its record names no clone; refusing deletion")
-                    # Resolved and checked before anything is deleted: a worktree whose admin dir cannot be proven
-                    # its own is not deleted at all.
-                    admin = _AdminDir(entry_fd, path, rec["repo_dir"], root)
-                    try:
-                        final = _snapshot(path, deadline)
-                    except GitTimeoutError as exc:
-                        out["timed_out"].append(f"{name}: {exc}")
-                        out["kept"] += 1
-                        continue
-                    except WorkspaceError as exc:
-                        final = exc
-                    if not _same_entry(entry_fd, path):
-                        raise WorkspaceError("archive path changed during the final check; refusing deletion")
-                    if final != snap:
-                        why = final if isinstance(final, WorkspaceError) else "its files changed after the assessment"
-                        _hold_changed_archive(root, archive_fd, name, rec,
-                                              _not_quiet(f"{why}; checked immediately before deletion"), now)
-                        out["kept"] += 1
-                        continue
-                _remove_tree_fd(entry_fd)
-                os.close(entry_fd)
-                entry_fd = None
-                os.rmdir(name, dir_fd=archive_fd)
-                if admin is not None:
-                    # After the files: a crash in between leaves only a stale entry (never pruned, harmless).
-                    try:
-                        admin.remove()
-                    except OSError as exc:
-                        out["errors"].append(f"{name}: deleted, but its admin dir in {rec['repo_dir']}/.git/worktrees "
-                                             f"was not removed ({exc}); stale, harmless")
+                done = _cleanup_entry(root, archive_fd, name, tid, rec, now, deadline, out)
             except (OSError, WorkspaceError) as exc:
                 out["errors"].append(f"{name}: {type(exc).__name__}: {exc}")
                 continue
-            finally:
-                if entry_fd is not None:
-                    os.close(entry_fd)
-                if admin is not None:
-                    admin.close()
-            update_index(root, {**rec, "state": "deleted", "deleted_at": now})
-            out["deleted"].append(name)
+            if done:
+                out["deleted"].append(tid)
+            else:
+                out["kept"] += 1
     finally:
         os.close(archive_fd)
     return out

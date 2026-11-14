@@ -933,7 +933,7 @@ class BranchReleaseTests(_Base):
 
         def swap_after_status(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
             out = real_git(args, cwd=cwd, timeout=timeout)
-            if args[0] == "status" and cwd == path and not os.path.exists(aside):
+            if "status" in args[:2] and cwd == path and not os.path.exists(aside):
                 os.rename(path, aside)
                 shutil.copytree(aside, path, symlinks=True)        # same name, same content, another directory
             return out
@@ -1151,7 +1151,11 @@ class CleanupTests(_Base):
                 mock.patch.object(ws.os, "stat", side_effect=stat_then_swap):
             report = ws.cleanup_archive(self.root)
         self.assertTrue(swapped)
-        self.assertEqual(report["deleted"], [TID])
+        # archive/ now points at held/, so the path-identity checks before the quarantine rename (and after it) no
+        # longer find the opened entry at its path: refused, nothing deleted anywhere.
+        self.assertEqual(report["deleted"], [])
+        self.assertIn("refusing deletion", " ".join(report["errors"]))
+        self.assertTrue(os.path.isdir(os.path.join(replacement, TID)))
         self.assertTrue(os.path.isdir(held))
         self.assertFalse(os.path.islink(held))
 
@@ -1739,6 +1743,384 @@ class RegistryOwnershipTests(_Base):
         self.assertEqual(ws._repair_backoff(1), ws.REPAIR_BACKOFF_BASE_S)
         self.assertEqual(ws._repair_backoff(2), 2 * ws.REPAIR_BACKOFF_BASE_S)
         self.assertEqual(ws._repair_backoff(50), ws.REPAIR_BACKOFF_MAX_S)
+
+
+class QuarantineAndGitStateTests(_Base):
+    """Re-review of held-settle-fix (gpt-6.1-sol, FAIL): (1) a write after the cleanup's final snapshot, at
+    _remove_tree_fd entry, was deleted, and so was a .GIT created there in a plain folder; (2) an empty commit after the
+    last assessment changed no file, so it was archived, detached and later deleted; (3) the snapshot's entry cap
+    counted retained entries, so a huge cache tree bypassed it. Every late action comes from an injected hook."""
+
+    def head(self, path):
+        return git("rev-parse", "HEAD", cwd=path).strip()
+
+    def attached(self, path):
+        return subprocess.run(["git", "symbolic-ref", "--quiet", "HEAD"], cwd=path, capture_output=True,
+                              env=GIT_ENV).returncode == 0
+
+    def write(self, path, rel, text="late\n"):
+        full = os.path.join(path, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(text)
+
+    def assess_then(self, after_call, action):
+        real, calls = ws.assess, []
+
+        def assess(path, deadline=None):
+            out = real(path, deadline)
+            calls.append(path)
+            if len(calls) == after_call:
+                action(path)
+            return out
+        return mock.patch.object(ws, "assess", assess)
+
+    def old_archive(self, tid=TID, kind="repo"):
+        rec = ws.settle(self.prepare(tid, repo=self.origin) if kind == "repo" else self.prepare(tid), self.root)
+        self.assertEqual(rec["state"], "archived", rec)
+        ws.update_index(self.root, {**rec, "settled_at": time.time() - ws.ARCHIVE_AGE_S - 60})
+        self.sleeps.clear()
+        return rec
+
+    def archive_names(self):
+        return sorted(os.listdir(os.path.join(self.root, "archive")))
+
+    def remove_tree_hook(self, action):
+        """Patch _remove_tree_fd so `action` runs at its first (top-level) entry, before anything is unlinked."""
+        real, calls = ws._remove_tree_fd, []
+
+        def remove(fd):
+            if not calls:
+                calls.append(fd)
+                action()
+            return real(fd)
+        return mock.patch.object(ws, "_remove_tree_fd", remove), calls
+
+    # --- P1 #1: quarantine ------------------------------------------------------------------------------------------
+
+    def test_a_path_writer_at_remove_tree_entry_cannot_write_into_the_tree_being_deleted(self):
+        rec = self.old_archive()
+        failed = []
+
+        def late_write():
+            try:
+                with open(os.path.join(rec["path"], "late.txt"), "w") as f:      # no makedirs: a plain path write
+                    f.write("late\n")
+            except FileNotFoundError as exc:      # archive/<tid> is already renamed to .deleting-*: nothing written
+                failed.append(exc)
+        patch, calls = self.remove_tree_hook(late_write)
+        with patch:
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(report["deleted"], [TID])
+        self.assertEqual(self.archive_names(), [])
+
+    def test_a_writer_that_recreates_the_path_at_remove_tree_entry_is_held_and_nothing_is_lost(self):
+        rec = self.old_archive()
+        patch, calls = self.remove_tree_hook(lambda: self.write(rec["path"], "notes/late.txt"))
+        with patch:
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(report["deleted"], [TID])               # the worktree, proven published, is gone
+        self.assertEqual(report["errors"], [])
+        held = os.path.join(self.root, "held", TID)
+        with open(os.path.join(held, "notes", "late.txt")) as f:  # the late write is kept in held/
+            self.assertEqual(f.read(), "late\n")
+        self.assertEqual(self.archive_names(), [])
+        idx = ws.read_index(self.root)[TID]
+        self.assertEqual((idx["state"], idx["path"], idx["kind"], idx["reason_code"]),
+                         ("held", held, "folder", "not_quiescent"))
+
+    def test_a_write_in_quarantine_before_deletion_holds_with_the_registry_repaired(self):
+        rec = self.old_archive()
+        with mock.patch.object(ws, "_after_quarantine", lambda q: self.write(q, "late.txt")):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertEqual(report["errors"], [])
+        held = os.path.join(self.root, "held", TID)
+        self.assertTrue(os.path.isfile(os.path.join(held, "late.txt")))
+        self.assertEqual(self.archive_names(), [])
+        idx = ws.read_index(self.root)[TID]
+        self.assertEqual((idx["state"], idx["reason_code"]), ("held", "not_quiescent"))
+        self.assertIn("in quarantine", idx["reason"])
+        self.assertIn(f"worktree {held}\n", git("worktree", "list", "--porcelain", cwd=rec["repo_dir"]))
+        git("status", "--porcelain", cwd=held)
+
+    def test_a_commit_in_quarantine_holds(self):
+        rec = self.old_archive()
+        with mock.patch.object(ws, "_after_quarantine",
+                               lambda q: git("commit", "-q", "--allow-empty", "-m", "late", cwd=q)):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual(git("log", "-1", "--format=%s", cwd=held).strip(), "late")
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "held")
+
+    def test_dot_GIT_in_a_plain_folder_at_remove_tree_entry_or_in_quarantine_is_caught(self):
+        for hook in ("remove_tree", "quarantine"):
+            with self.subTest(hook=hook):
+                self.tearDown_dirs()
+                rec = self.old_archive(kind="folder")
+                held = os.path.join(self.root, "held", TID)
+                if hook == "remove_tree":
+                    patch, _ = self.remove_tree_hook(lambda: os.makedirs(os.path.join(rec["path"], ".GIT")))
+                else:
+                    patch = mock.patch.object(ws, "_after_quarantine",
+                                              lambda q: os.makedirs(os.path.join(q, "sub", ".GIT")))
+                with patch:
+                    report = ws.cleanup_archive(self.root)
+                self.assertEqual(report["errors"], [])
+                self.assertEqual(self.archive_names(), [])
+                self.assertEqual(ws.read_index(self.root)[TID]["state"], "held")
+                if hook == "remove_tree":                  # recreated by path after the deletion: held, not deleted
+                    self.assertEqual(report["deleted"], [TID])
+                    self.assertTrue(os.path.isdir(os.path.join(held, ".GIT")))
+                else:                                      # inside the quarantined folder: the folder is held
+                    self.assertEqual(report["deleted"], [])
+                    self.assertTrue(os.path.isdir(os.path.join(held, "sub", ".GIT")))
+
+    def tearDown_dirs(self):
+        for sub in ("archive", "held", "active"):
+            shutil.rmtree(os.path.join(self.root, sub), ignore_errors=True)
+        try:
+            os.unlink(ws.index_path(self.root))
+        except FileNotFoundError:
+            pass
+
+    def test_a_crash_leftover_is_reassessed_and_deleted_only_when_clean(self):
+        rec = self.old_archive()
+        admin = git("rev-parse", "--absolute-git-dir", cwd=rec["path"]).strip()
+
+        def crash(fd):
+            raise OSError("simulated crash mid-deletion")
+        with mock.patch.object(ws, "_remove_tree_fd", crash):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertIn("simulated crash", " ".join(report["errors"]))
+        [left] = self.archive_names()
+        self.assertTrue(left.startswith(".deleting-" + TID + "-"), left)
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "archived")
+        # the next run re-assesses the leftover in full (two assessments, a pause) before deleting it
+        self.sleeps.clear()
+        assessed = []
+        real = ws.assess
+        with mock.patch.object(ws, "assess", lambda p, deadline=None: assessed.append(p) or real(p, deadline)):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [TID], report)
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(assessed, [os.path.join(self.root, "archive", left)] * 2)
+        self.assertEqual(self.sleeps, [ws.CLEANUP_QUIESCE_S])
+        self.assertEqual(self.archive_names(), [])
+        self.assertFalse(os.path.exists(admin))
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "deleted")
+
+    def leftover(self, tid=TID):
+        rec = self.old_archive(tid)
+        q = ".deleting-%s-%s" % (tid, "ab" * 8)
+        os.rename(rec["path"], os.path.join(self.root, "archive", q))
+        return rec, os.path.join(self.root, "archive", q)
+
+    def test_a_crash_leftover_with_unpublished_work_is_held_never_deleted(self):
+        for case in ("untracked", "partly_deleted", "commit"):
+            with self.subTest(case=case):
+                self.tearDown_dirs()
+                shutil.rmtree(os.path.join(self.root, "repos"), ignore_errors=True)
+                rec, q = self.leftover()
+                if case == "untracked":
+                    self.write(q, "notes.txt")
+                elif case == "partly_deleted":
+                    os.unlink(os.path.join(q, "README.md"))
+                else:
+                    git("commit", "-q", "--allow-empty", "-m", "unpublished", cwd=q)
+                report = ws.cleanup_archive(self.root)
+                self.assertEqual(report["deleted"], [])
+                held = os.path.join(self.root, "held", TID)
+                self.assertTrue(os.path.isdir(held))
+                self.assertEqual(self.archive_names(), [])
+                idx = ws.read_index(self.root)[TID]
+                self.assertEqual((idx["state"], idx["path"]), ("held", held))
+                self.assertIn(f"worktree {held}\n", git("worktree", "list", "--porcelain", cwd=rec["repo_dir"]))
+
+    def test_a_leftover_without_an_archive_record_is_refused_and_untouched(self):
+        rec, q = self.leftover()
+        ws.update_index(self.root, {**rec, "state": "held"})
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertIn("no archive record", " ".join(report["refused"]))
+        self.assertTrue(os.path.isfile(os.path.join(q, "README.md")))
+        os.rename(q, os.path.join(self.root, "archive", ".deleting-not-a-task"))
+        report = ws.cleanup_archive(self.root)
+        self.assertIn("not a task id", " ".join(report["refused"]))
+
+    def test_no_time_to_reassess_in_quarantine_renames_it_back_untouched(self):
+        rec = self.old_archive()
+        real_monotonic, offset = time.monotonic, [0.0]
+        with mock.patch.object(ws, "_after_quarantine", lambda q: offset.__setitem__(0, 10 ** 6)), \
+                mock.patch.object(ws.time, "monotonic", side_effect=lambda: real_monotonic() + offset[0]):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertIn("renamed back", " ".join(report["timed_out"]))
+        self.assertEqual(self.archive_names(), [TID])
+        self.assertTrue(os.path.isfile(os.path.join(rec["path"], "README.md")))
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "archived")
+
+    # --- P1 #2: git state -------------------------------------------------------------------------------------------
+
+    def test_an_empty_commit_after_the_second_assessment_is_held_never_archived(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        # One pause (two assessments): the snapshot's git state is the only thing that can catch the commit.
+        with self.assess_then(2, lambda p: git("commit", "-q", "--allow-empty", "-m", "late", cwd=p)):
+            settled = ws.settle(rec, self.root, recheck_delays=(2.0,))
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual((settled["state"], settled["path"], settled["reason_code"]), ("held", held, "not_quiescent"),
+                         settled)
+        self.assertTrue(self.attached(held))
+        self.assertEqual(git("log", "-1", "--format=%s", cwd=held).strip(), "late")
+        self.assertEqual(self.archive_names(), [])
+
+    def test_an_empty_commit_after_the_cleanups_second_assessment_is_held(self):
+        rec = self.old_archive()
+        with self.assess_then(2, lambda p: git("commit", "-q", "--allow-empty", "-m", "late", cwd=p)):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual(git("log", "-1", "--format=%s", cwd=held).strip(), "late")
+
+    def test_a_new_ref_or_stash_after_the_assessment_is_held(self):
+        actions = {
+            "branch": lambda p: git("branch", "late-branch", cwd=p),
+            "tag": lambda p: git("tag", "late-tag", cwd=p),
+            "stash": lambda p: (self.write(os.path.join(self.root, "repos", "demo"), "README.md", "changed\n"),
+                                git("stash", "push", "-q", cwd=os.path.join(self.root, "repos", "demo"))),
+            "staged": lambda p: git("update-index", "--chmod=+x", "README.md", cwd=p),
+        }
+        for i, (what, action) in enumerate(sorted(actions.items())):
+            tid = "t2026110812%02d00-000000%02x" % (i, 0xa0 + i)
+            with self.subTest(what=what):
+                rec = self.prepare(tid, repo=self.origin)
+                with self._after_nth_assess_of(rec["path"], 2, action):     # snapshot-only, as above
+                    settled = ws.settle(rec, self.root, recheck_delays=(2.0,))
+                self.assertEqual((settled["state"], settled["reason_code"]), ("held", "not_quiescent"), settled)
+                self.assertTrue(self.attached(settled["path"]))
+
+    def _after_nth_assess_of(self, path, n, action):
+        real, calls = ws.assess, []
+
+        def assess(p, deadline=None):
+            out = real(p, deadline)
+            if p == path:
+                calls.append(p)
+                if len(calls) == n:
+                    action(p)
+            return out
+        return mock.patch.object(ws, "assess", assess)
+
+    def test_another_worktrees_commits_do_not_hold_this_one(self):
+        """#102: tasks share a clone. Another task committing on its own branch during this settle is not a change
+        in this worktree; neither are our own fetches (remote-tracking refs) nor tags the remote gained."""
+        other = self.prepare(TID2, repo=self.origin)
+        seed = os.path.join(self.tmp, "tagger")
+        git("clone", "-q", self.origin, seed)
+        git("tag", "v-remote", cwd=seed)
+        git("push", "-q", "origin", "v-remote", cwd=seed)
+        rec = self.prepare(repo=self.origin, branch="feature")
+        with self._after_nth_assess_of(rec["path"], 1,
+                                       lambda p: git("commit", "-q", "--allow-empty", "-m", "other", cwd=other["path"])):
+            settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled.get("detached")), ("archived", True), settled)
+
+    def test_another_worktree_settling_during_the_assessment_does_not_hold_this_one(self):
+        """#102: the other task's detach frees its branch, so refs/heads/<its branch> stops being 'elsewhere'."""
+        other = self.prepare(TID2, repo=self.origin)
+        git("commit", "-q", "--allow-empty", "-m", "other's local work", cwd=other["path"])
+        rec = self.prepare(repo=self.origin, branch="feature")
+        with self._after_nth_assess_of(rec["path"], 1, lambda p: git("checkout", "-q", "--detach", cwd=other["path"])):
+            settled = ws.settle(rec, self.root, recheck_delays=(2.0,))
+        self.assertEqual((settled["state"], settled.get("detached")), ("archived", True), settled)
+
+    def test_detach_goes_to_the_assessed_sha(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        sha = self.head(rec["path"])
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["detached_at"]), ("archived", sha))
+        self.assertEqual(self.head(settled["path"]), sha)
+        self.assertFalse(self.attached(settled["path"]))
+        # _detach_head refuses any other commit than the one it is given, and leaves HEAD attached
+        rec2 = self.prepare(TID2, repo="demo")
+        self.assertIn("HEAD moved", ws._detach_head(rec2["path"], expect=sha if sha != self.head(rec2["path"])
+                                                    else "0" * 40))
+        self.assertTrue(self.attached(rec2["path"]))
+
+    def test_a_commit_during_the_remote_recheck_is_held_not_detached(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        sha = self.head(rec["path"])
+        real = ws._published_at
+
+        def published(path, s, deadline=None):
+            self.assertEqual(s, sha)
+            git("commit", "-q", "--allow-empty", "-m", "late", cwd=path)
+            return real(path, s, deadline)
+        with mock.patch.object(ws, "_published_at", published):
+            settled = ws.settle(rec, self.root)
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual((settled["state"], settled["path"], settled["reason_code"]), ("held", held, "not_quiescent"))
+        self.assertTrue(self.attached(held))
+        self.assertEqual(git("log", "-1", "--format=%s", cwd=held).strip(), "late")
+
+    def test_assessed_sha_gone_from_the_remote_at_detach_is_held(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        with mock.patch.object(ws, "_published_at", lambda p, s, deadline=None: f"{s[:12]} is no longer on any remote"):
+            settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "not_published"), settled)
+        self.assertTrue(self.attached(settled["path"]))
+        # and the real re-check: an unpublished sha is reported
+        git("commit", "-q", "--allow-empty", "-m", "local", cwd=settled["path"])
+        self.assertIn("no longer on any remote", ws._published_at(settled["path"], self.head(settled["path"])))
+
+    # --- P2 #3: scanned-entry cap -----------------------------------------------------------------------------------
+
+    def test_the_snapshot_cap_counts_every_scanned_entry_and_holds(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        git("config", "core.excludesFile", os.path.join(self.tmp, "excludes"), cwd=rec["path"])
+        with open(os.path.join(self.tmp, "excludes"), "w") as f:
+            f.write("__pycache__/\n")
+        for i in range(60):
+            self.write(rec["path"], f"__pycache__/m{i}.pyc", "")
+        self.assertEqual(ws.assess(rec["path"])[0], True)          # caches only: published
+        files, _ = ws._snapshot(rec["path"])
+        self.assertLess(len(files), 10)                            # the cache files are not retained ...
+        with mock.patch.object(ws, "SNAPSHOT_MAX", 50):
+            with self.assertRaises(ws.WorkspaceError):             # ... but they are counted
+                ws._snapshot(rec["path"])
+            self.assertTrue(ws._contains_git_entry(rec["path"]))   # a plain-folder scan past the cap holds too
+            settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "not_quiescent"), settled)
+        self.assertIn("more than 50 entries", settled["reason"])
+
+    def test_the_snapshot_checks_its_deadline_inside_the_walk(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        with self.assertRaises(ws.GitTimeoutError):
+            ws._snapshot(rec["path"], deadline=time.monotonic() - 1)
+        with self.assertRaises(ws.GitTimeoutError):
+            ws._ignored_blocker(rec["path"], "", deadline=time.monotonic() - 1)
+
+    # --- #102 must not return ---------------------------------------------------------------------------------------
+
+    def test_clean_and_pushed_still_archives_and_cleanup_deletes_it_leaving_nothing(self):
+        rec = self.old_archive()
+        admin_dirs = os.listdir(os.path.join(rec["repo_dir"], ".git", "worktrees"))
+        self.assertEqual(len(admin_dirs), 1)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual((report["deleted"], report["errors"], report["timed_out"]), ([TID], [], []))
+        self.assertEqual(self.archive_names(), [])                 # no .deleting-* left behind
+        self.assertEqual(os.listdir(os.path.join(self.root, "held")), [])
+        self.assertFalse(os.path.exists(os.path.join(rec["repo_dir"], ".git", "worktrees", admin_dirs[0])))
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "deleted")
+        folder = self.old_archive(TID2, kind="folder")
+        self.assertEqual(ws.cleanup_archive(self.root)["deleted"], [TID2])
+        self.assertFalse(os.path.exists(folder["path"]))
+
 
 if __name__ == "__main__":
     unittest.main()
