@@ -816,8 +816,22 @@ def office_tags(cwd, title=None, session_tag=None) -> dict:
     return out
 
 
-ORIGIN_NAMED = ("grokbot",)     # origins that are not a session: the bot gateway's tasks (subagent_mcp.BOT_ORIGIN)
+# The one place the bot gateway's name is written: its client (bot_gateway.CLIENT), its tasks' origin
+# (subagent_mcp.task_origin), the live view's ?session= rule and the server's 400 message all derive from it.
+BOT_ORIGIN = "grokbot"
+ORIGIN_NAMED = (BOT_ORIGIN,)    # origins that are not a session
+ORIGIN_SESSION_RE = re.compile("|".join([SESSION_TAG_RE.pattern] + [re.escape(n) for n in ORIGIN_NAMED]))
 ORIGIN_KEYS = ("origin_session", "origin_project", "origin_device")
+OFFICE_NAME_MAX = 64            # cortados-routed-subagents' OFFICE_NAME_MAX
+
+
+def office_name(s, device=False):
+    """A project or device name normalised as cortados-routed-subagents' officeName does it (every run of characters
+    outside [A-Za-z0-9._ -] becomes "-", device without spaces; trimmed; cut to 64), or None without a letter or digit.
+    The one Python copy: subagent_mcp.origin_identity uses it, and tests/test_child_tasks.OFFICE_NAME_VECTORS pins it
+    against the mod (hooks/office-vectors.fixture.ts)."""
+    t = re.sub(r"[^A-Za-z0-9._-]+" if device else r"[^A-Za-z0-9._ -]+", "-", str(s or "")).strip()[:OFFICE_NAME_MAX]
+    return t if re.search(r"[A-Za-z0-9]", t) else None
 
 
 def clean_origin(origin) -> dict:
@@ -827,7 +841,7 @@ def clean_origin(origin) -> dict:
     o = origin if isinstance(origin, dict) else {}
     sess, proj, dev = o.get("session"), o.get("project"), o.get("device")
     ok = lambda v, rule: v if isinstance(v, str) and rule.fullmatch(v) else None
-    return {"origin_session": sess if sess in ORIGIN_NAMED else ok(sess, SESSION_TAG_RE),
+    return {"origin_session": ok(sess, ORIGIN_SESSION_RE),
             "origin_project": ok(proj, _OFFICE_NAME_RE), "origin_device": ok(dev, _DEVICE_RE)}
 
 

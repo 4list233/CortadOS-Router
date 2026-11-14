@@ -299,6 +299,40 @@ class CollectTest(unittest.TestCase):
         for bad in ("", "ABCDEF0123456789", "short", "../x", None, 7):
             self.assertIsNone(live.valid_session(bad))
 
+    def test_session_view_filters_before_the_fleet_caps(self):
+        # Review 2026-11-13: tasks_section capped running[:50] / recent[:40] and only then was ?session= applied, so on a
+        # busy fleet a session's older tasks vanished from its view while origins[].task_ids still listed them.
+        other = "b" * 16
+        tid = lambda i: f"t20261111{i:06d}-aaaaaaaa"
+        ev = []
+        for i in range(live.RUNNING_MAX + 5):                          # newer running tasks of another session
+            ev.append({"ts": NOW - 100 - i, "event": "started", "task_id": tid(i), "origin_session": other})
+        for i in range(100, 100 + live.RECENT_MAX + 5):                # newer finished tasks of another session
+            ev += [{"ts": NOW - 2000 - i, "event": "started", "task_id": tid(i), "origin_session": other},
+                   {"ts": NOW - 1000 - i, "event": "finished", "task_id": tid(i), "status": "succeeded"}]
+        mine_run, mine_done = tid(900), tid(901)                      # the session's own: the oldest of each list
+        ev += [{"ts": NOW - 3000, "event": "started", "task_id": mine_run, **ORIGIN},
+               {"ts": NOW - 9000, "event": "started", "task_id": mine_done, **ORIGIN},
+               {"ts": NOW - 8000, "event": "finished", "task_id": mine_done, "status": "failed"}]
+        fleet = fixture_view(child_events=lambda: ev, peek=None)["tasks"]
+        self.assertTrue(fleet["truncated"])
+        listed = [x["task_id"] for x in fleet["running"] + fleet["recent"]]
+        self.assertNotIn(mine_run, listed)                             # capped out of the fleet lists
+        self.assertNotIn(mine_done, listed)
+        self.assertEqual(next(g for g in fleet["origins"] if g["session"] == SESSION)["task_ids"], [mine_run, mine_done])
+        for v in (fixture_view(child_events=lambda: ev, peek=None, session=SESSION),
+                  fixture_view(child_events=lambda: ev, peek=None, session=SESSION)):
+            t = v["tasks"]
+            self.assertEqual(v["session_filter"], SESSION)
+            self.assertEqual([x["task_id"] for x in t["running"]], [mine_run])
+            self.assertEqual([x["task_id"] for x in t["recent"]], [mine_done])
+            self.assertFalse(t["truncated"])
+            self.assertEqual(t["counts"], fleet["counts"])             # counts stay fleet-wide
+            self.assertEqual([g["session"] for g in t["origins"]], [SESSION])
+        # the same through the old path (filtering the capped snapshot) loses them: what the fix is for
+        stale = live.for_session(fixture_view(child_events=lambda: ev, peek=None), SESSION)["tasks"]
+        self.assertEqual(stale["running"] + stale["recent"], [])
+
     def test_a_failed_conversation_list_keeps_the_board(self):
         c = fixture_view(conversations=lambda: 1 / 0)["conversations"]
         self.assertEqual(c["status"], "partial")
@@ -611,6 +645,23 @@ class MemoTest(unittest.TestCase):
             t.join(5)
         self.assertEqual((len(n), out), (1, [b"slow"] * 4))
 
+    def test_several_views_are_memoised_side_by_side(self):
+        # the fleet view and each pane's ?session= view are polled together: they must not evict each other
+        clock = [0.0]
+        m = live.Memo(ttl_s=2.0, clock=lambda: clock[0])
+        calls = []
+        build = lambda k: (lambda: (calls.append(k), k.encode())[1])
+        for _ in range(3):
+            for k in ("fleet", "s1", "s2"):
+                self.assertEqual(m.get(k, build(k)), k.encode())
+        self.assertEqual(calls, ["fleet", "s1", "s2"])
+        for i in range(live.MEMO_KEYS + 4):
+            m.get(f"x{i}", build(f"x{i}"))
+        self.assertLessEqual(len(m._hits), live.MEMO_KEYS)
+        clock[0] = 3.0
+        m.get("late", build("late"))
+        self.assertEqual(list(m._hits), ["late"])                     # expired entries are dropped, not kept
+
 
 class ClientHostTest(unittest.TestCase):
     D = "a" * 64
@@ -904,9 +955,9 @@ class EndpointTest(EndpointHarness):
         n = []
         real = self.httpd.live_view
 
-        def counted(reg):
-            n.append(1)
-            return real(reg)
+        def counted(reg, session=None):
+            n.append(session)
+            return real(reg, session)
         self.httpd.live_view = counted
         for _ in range(3):
             self.assertEqual(self.request("GET", live.LIVE_PATH, TOKEN)[0], 200)
@@ -915,6 +966,10 @@ class EndpointTest(EndpointHarness):
         v = json.loads(self.request("GET", live.LIVE_PATH, LIVE_TOKEN)[1])
         self.assertEqual(len(n), 2)                                  # the post invalidated it
         self.assertEqual({x["name"]: x for x in v["hosts"]["items"]}["studio"]["heartbeat_state"], "fresh")
+        for _ in range(2):                                           # a session view: its own collect, memoised too
+            self.assertEqual(self.request("GET", live.LIVE_PATH + "?session=" + SESSION, TOKEN)[0], 200)
+            self.assertEqual(self.request("GET", live.LIVE_PATH, TOKEN)[0], 200)
+        self.assertEqual(n[2:], [SESSION])
 
     def test_remote_stubs_reach_the_view(self):
         tid = "t20261111120000-abcdef01"

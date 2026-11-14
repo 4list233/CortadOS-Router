@@ -55,7 +55,7 @@ import time
 from collections import OrderedDict
 from typing import Any, Callable
 
-from cortados_router import router_db
+from cortados_router import child_tasks, router_db
 from cortados_router.provider import office
 
 VERSION = 1
@@ -96,7 +96,9 @@ _CLIENT_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 _WS_STATE_RE = re.compile(r"[a-z_-]{1,24}")
 _TASK_STATES = ("succeeded", "failed", "cancelled")   # child_tasks.TERMINAL_STATES
 # The main session that started a task (child_tasks.clean_origin): its Office tag, or a named origin (the bot gateway)
-_ORIGIN_SESSION_RE = re.compile(r"[0-9a-f]{16,64}|grokbot")
+_ORIGIN_SESSION_RE = child_tasks.ORIGIN_SESSION_RE
+SESSION_FILTER_RULE = "one Office session tag (16-64 lowercase hex) or " + " or ".join(child_tasks.ORIGIN_NAMED)
+MEMO_KEYS = 16              # live.Memo: the fleet view plus this many-1 session views memoised side by side
 ORIGINS_MAX = 32            # origin groups listed (sessions with a task in the window); the rest flagged truncated
 ORIGIN_IDS_MAX = 20         # task ids per origin group and per orchestrator item, newest first
 _HB_KEYS = {"host", "jobs", "ttl_s", "hardware", "s1"}
@@ -366,7 +368,10 @@ def _elsewhere(stubs: list | None, known: set[str], now: float) -> list[dict[str
 
 def tasks_section(events: list[dict[str, Any]], office_view: dict[str, Any] | None,
                   peek: Callable[[str], dict[str, Any] | None] | None, now: float,
-                  errors: list | None = None, stubs: list | None = None) -> dict[str, Any]:
+                  errors: list | None = None, stubs: list | None = None, session: str | None = None) -> dict[str, Any]:
+    """The tasks section. With `session` (a valid ?session= value) running, queued and recent hold only that session's
+    tasks, filtered BEFORE the caps: filtering the capped fleet lists lost a busy fleet's older tasks from the session's
+    view while its origin group still listed them (review 2026-11-13). Counts and origins stay fleet-wide."""
     errors = list(errors or [])
     by_run = {w.get("run_id"): w for _, w in _office_workers(office_view or {}) if w.get("kind") == "child_task"}
     kids = _children(events, now)
@@ -417,9 +422,10 @@ def tasks_section(events: list[dict[str, Any]], office_view: dict[str, Any] | No
     counts = {k: 0 for k in ("running", "queued", "succeeded", "failed", "cancelled", "unknown")}
     for r in rows:
         counts[r["state"]] += 1
-    running = sorted([r for r in rows if r["state"] == "running"], key=lambda r: -(r["started_at"] or 0))
-    queued = sorted([r for r in rows if r["state"] == "queued"], key=lambda r: r["started_at"] or 0)
-    recent = sorted([r for r in rows if r["state"] not in ("running", "queued")],
+    listed = rows if session is None else [r for r in rows if r.get("origin_session") == session]
+    running = sorted([r for r in listed if r["state"] == "running"], key=lambda r: -(r["started_at"] or 0))
+    queued = sorted([r for r in listed if r["state"] == "queued"], key=lambda r: r["started_at"] or 0)
+    recent = sorted([r for r in listed if r["state"] not in ("running", "queued")],
                     key=lambda r: -(r["ended_at"] or r["started_at"] or 0))
     truncated = len(running) > RUNNING_MAX or len(queued) > RUNNING_MAX or len(recent) > RECENT_MAX
     away = _elsewhere(stubs, set(kids), now)
@@ -466,7 +472,8 @@ def link_origins(conv: dict[str, Any], tasks: dict[str, Any]) -> None:
 def for_session(snap: dict[str, Any], session: str) -> dict[str, Any]:
     """GET /v1/cortados/live?session=<tag>: the snapshot narrowed to one orchestrating session: its tasks (running,
     queued, recent, by origin_session), its origin group, and the conversations on its floor. Counts, overview and
-    the other sections stay fleet-wide. `session` must already be valid (valid_session)."""
+    the other sections stay fleet-wide. `session` must already be valid (valid_session). collect(session=) calls it
+    on a snapshot whose task lists were filtered before their caps; here the lists are only narrowed again."""
     t = dict(snap.get("tasks") or {})
     for k in ("running", "queued", "recent"):
         t[k] = [r for r in t.get(k) or [] if r.get("origin_session") == session]
@@ -798,9 +805,11 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
             remote_stubs: Callable[[], list] | None = None,
             lane_enabled: Callable[[Any], bool] | None = None,
             conversations: Callable[[], list] | None = None, self_name: str | None = None,
-            route_log: Callable[[], dict[str, Any]] = router_db.stats) -> dict[str, Any]:
+            route_log: Callable[[], dict[str, Any]] = router_db.stats,
+            session: str | None = None) -> dict[str, Any]:
     """The snapshot. Each input is a callable, run under its own guard: one that raises turns ITS section into
-    status "error" with the exception's type (never its text: an OSError carries a path), the rest stand."""
+    status "error" with the exception's type (never its text: an OSError carries a path), the rest stand.
+    `session` (already valid, valid_session): the ?session= view (for_session), its tasks filtered before the caps."""
     def guard(source: str, fn: Callable[[], Any], errs: list) -> Any:
         try:
             return fn()
@@ -814,7 +823,7 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     ov = guard("office", lambda: office_view(office.recent_child_events(events or [], now)), office_errs)
     stub_errs: list = []
     stubs = guard("task stubs", remote_stubs, stub_errs) if remote_stubs is not None else None
-    tasks = tasks_section(events or [], ov, peek, now, child_errs + office_errs + stub_errs, stubs) \
+    tasks = tasks_section(events or [], ov, peek, now, child_errs + office_errs + stub_errs, stubs, session) \
         if events is not None \
         else _section(now, "error", child_errs + office_errs + stub_errs, scope=SCOPE, window_s=int(CHILD_WINDOW_S),
                       counts=None, running=[], queued=[], recent=[], truncated=False,
@@ -862,25 +871,28 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
         "hosts_with_heartbeat": sum(1 for h in hosts["items"] if h["heartbeat_state"] == "fresh"),
         "errors": sum(len(s["errors"]) for s in (tasks, conv, routed, subs, s1, hosts)),
     }
-    return {"version": VERSION, "generated_at": round(now, 3), "overview": overview, "tasks": tasks,
+    snap = {"version": VERSION, "generated_at": round(now, 3), "overview": overview, "tasks": tasks,
             "conversations": conv, "routed": routed, "subscriptions": subs, "s1": s1, "hosts": hosts}
+    return for_session(snap, session) if session is not None else snap
 
 
 class Memo:
     """A MEMO_S memo with single flight for the encoded snapshot (as usage.collect has for its view): concurrent GETs
     wait for the one collect in progress and share its bytes. `key` names what must invalidate it early (the heartbeat
-    board's generation, so a post shows on the next GET). A collect that raises is not memoised."""
+    board's generation, so a post shows on the next GET). A collect that raises is not memoised. Up to MEMO_KEYS keys
+    are held at once: the fleet view and each pane's ?session= view are polled side by side, and one slot would make
+    them evict each other on every poll."""
 
     def __init__(self, ttl_s: float = MEMO_S, clock: Callable[[], float] = time.monotonic):
         self._ttl, self._clock = ttl_s, clock
-        self._lock = threading.Lock()               # guards _hit; never held across a collect
+        self._lock = threading.Lock()               # guards _hits; never held across a collect
         self._flight = threading.Lock()             # held across a miss
-        self._hit: tuple[float, Any, bytes] | None = None
+        self._hits: OrderedDict[Any, tuple[float, bytes]] = OrderedDict()
 
     def _fresh(self, key: Any) -> bytes | None:
         with self._lock:
-            h = self._hit
-            return h[2] if h and h[1] == key and self._clock() - h[0] < self._ttl else None
+            h = self._hits.get(key)
+            return h[1] if h and self._clock() - h[0] < self._ttl else None
 
     def get(self, key: Any, build: Callable[[], bytes]) -> bytes:
         body = self._fresh(key)
@@ -891,5 +903,11 @@ class Memo:
             if body is None:
                 body = build()
                 with self._lock:
-                    self._hit = (self._clock(), key, body)
+                    at = self._clock()
+                    self._hits.pop(key, None)
+                    self._hits[key] = (at, body)
+                    for k in [k for k, (t, _) in self._hits.items() if at - t >= self._ttl]:
+                        del self._hits[k]                   # expired: never served again (keys only move forward)
+                    while len(self._hits) > MEMO_KEYS:
+                        self._hits.popitem(last=False)
         return body

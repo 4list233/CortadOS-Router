@@ -28,6 +28,7 @@ import os
 import secrets
 import socket
 import sys
+import tempfile
 import threading
 import urllib.error
 import urllib.request
@@ -196,7 +197,6 @@ OFFICE_SALT_ENV = "CORTADOS_OFFICE_SALT_FILE"
 OFFICE_SALT_DEFAULT = "~/.config/cortados/office-salt"
 SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID"          # set by Claude Code for the MCP servers a session launches
 ORIGIN_TAG_HEX = 16                                # the mod's OFFICE_TAG_HEX
-BOT_ORIGIN = "grokbot"                             # a bot-gateway task's origin (bot_gateway.CLIENT)
 _SALT_RE = re.compile(r"[0-9a-f]{32}")
 _SESSION_ID_RE = re.compile(r"[0-9A-Za-z-]{8,128}")
 
@@ -220,33 +220,43 @@ def read_office_salt(env=None):
 
 
 def ensure_office_salt(env=None):
-    """The salt, created (0600, exclusive: a racing creator's value wins and is read back) when missing. None when it
-    cannot be read or made; never raises, since start_task must work without an origin."""
+    """The salt, created when missing; None when it cannot be read or made. Never raises: start_task must work without
+    an origin, and this runs at server start. The value is written whole to a 0600 temp file in the same directory and
+    published with os.link, which fails if the name exists: so the salt file is never seen partial or empty (a write
+    that failed half way, ENOSPC or EIO, once left a 0-byte file read_office_salt rejected forever; review 2026-11-13),
+    and a racing creator's value is never overwritten (rename would replace it after the other side read it)."""
     salt = read_office_salt(env)
     if salt is not None:
         return salt
     path = office_salt_path(env)
+    tmp = None
     try:
         os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return read_office_salt(env)
-    except OSError:
+        fd, tmp = tempfile.mkstemp(prefix=".office-salt.", dir=os.path.dirname(path) or ".")   # 0600
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(secrets.token_hex(16) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            pass                                        # another server made it first: its value is the one read back
+    except Exception as exc:                            # never raises (see above); said once on stderr, not swallowed
+        print(f"cortados-route: cannot create the Office salt {path}: {type(exc).__name__}; task origins stay unset",
+              file=sys.stderr)
         return None
-    with os.fdopen(fd, "w", encoding="ascii") as f:
-        f.write(secrets.token_hex(16) + "\n")
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass                                    # already gone; nothing else to undo
     return read_office_salt(env)
 
 
 def origin_tag(salt: str, session_id: str) -> str:
     """The session's opaque Office tag (cortados-routed-subagents' sessionTag)."""
     return hashlib.sha256(f"{salt}:{session_id}".encode()).hexdigest()[:ORIGIN_TAG_HEX]
-
-
-def _office_name(s, device=False):
-    """A project or device name as the mod's officeName makes it ([A-Za-z0-9._ -], device without spaces), or None."""
-    t = re.sub(r"[^A-Za-z0-9._-]+" if device else r"[^A-Za-z0-9._ -]+", "-", str(s or "")).strip()[:64]
-    return t if re.search(r"[A-Za-z0-9]", t) else None
 
 
 def origin_identity(env=None) -> dict:
@@ -256,15 +266,17 @@ def origin_identity(env=None) -> dict:
     sid = (env.get(SESSION_ID_ENV) or "").strip()
     salt = read_office_salt(env) if _SESSION_ID_RE.fullmatch(sid) else None
     root = env.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    name = _child_module().office_name                  # the one Python copy of the mod's officeName
     return {"session": origin_tag(salt, sid) if salt else None,
-            "project": _office_name(os.path.basename(os.path.normpath(root))),
-            "device": _office_name(socket.gethostname().split(".")[0], device=True)}
+            "project": name(os.path.basename(os.path.normpath(root))),
+            "device": name(socket.gethostname().split(".")[0], device=True)}
 
 
 def task_origin(cfg: dict) -> dict:
     """The origin recorded on a start_task: the bot gateway's tasks are the bot's; anything else is this session's."""
-    if cfg.get("client") == BOT_ORIGIN:
-        return {"session": BOT_ORIGIN, "project": None, "device": None}
+    bot = _child_module().BOT_ORIGIN                    # bot_gateway.CLIENT
+    if cfg.get("client") == bot:
+        return {"session": bot, "project": None, "device": None}
     return origin_identity()
 
 

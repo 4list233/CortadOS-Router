@@ -66,6 +66,10 @@ const liveHeld = atom({ plugin: 'cortados-pulse', key: 'live' } as const, null a
 const liveErr = atom({ plugin: 'cortados-pulse', key: 'liveErr' } as const, null as string | null)
 type Mine = { tag: string | null; why: string | null }
 const mine = atom({ plugin: 'cortados-pulse', key: 'mine' } as const, null as Mine | null)
+/** GET /v1/cortados/live?session=<tag>: this session's tasks filtered by the provider BEFORE its list caps (a busy fleet
+ * pushes them out of the fleet view's lists). null: not fetched, or a provider that ignored ?session= (filter the fleet). */
+type MineLive = { data: PulseLive; at: number; tag: string }
+const mineLive = atom({ plugin: 'cortados-pulse', key: 'mineLive' } as const, null as MineLive | null)
 
 /** The machine's shared Office salt (cortados_router/subagent_mcp.py OFFICE_SALT_DEFAULT). */
 export const OFFICE_SALT_FILE = '~/.config/cortados/office-salt'
@@ -224,8 +228,20 @@ async function pollLiveOnce($: LiveDollar, cfg: Cfg, me: boolean): Promise<void>
     if (me) {
       const m = await identify($ as Pick<EngineInterface, 'env' | 'fs' | 'session'>)
       await update($, mine, () => m)
+      await fetchMine($, cfg, m.tag)
     }
   }
+}
+
+/** This session's own view (?session=). Kept only when the provider says it filtered for this tag (session_filter):
+ * an older provider ignores the query and answers the fleet view, which sessionLines then filters itself and says so.
+ * A failed fetch drops the held view rather than showing an old one; the fleet poll reports the provider's problems. */
+async function fetchMine($: LiveDollar, cfg: Cfg, tag: string | null): Promise<void> {
+  if (!tag) return          // a held view of another tag is never drawn (the render matches it to `mine`)
+  const f = await fetchView($, cfg, LIVE_PATH + '?session=' + tag)
+  const data = f.ok ? f.data as PulseLive : null
+  const at = await $.clock.now()
+  await update($, mineLive, () => data && data.session_filter === tag ? { data, at, tag } : null)
 }
 
 async function fetchLive($: LiveDollar, cfg: Cfg): Promise<void> {
@@ -398,6 +414,8 @@ export function sessionLines(live: PulseLive, me: Mine | null, since: number): s
   if (!me.tag) return [me.why || 'session not identified']
   const t = live.tasks ?? {}
   if (t.status === 'error') return ['tasks unavailable: ' + errs(t)]
+  // a provider from before task origins sends no origins at all: nothing can be attributed, which is not "none started"
+  if (t.origins === undefined) return ['this provider records no task origins yet (update it to see this session\'s tasks)']
   const own = (x: PulseLiveTask) => x.origin_session === me.tag
   const active = [...(t.running ?? []), ...(t.queued ?? [])].filter(own)
   const done = (t.recent ?? []).filter(own)
@@ -410,8 +428,14 @@ export function sessionLines(live: PulseLive, me: Mine | null, since: number): s
   }
   if (done.length > MINE_RECENT_MAX) out.push(`  +${done.length - MINE_RECENT_MAX} more finished (dashboard)`)
   if (!active.length && !done.length) out.push('no task started from this session in the last 24 h')
+  // the fleet view filtered here: its lists were capped before, so on a busy fleet some of this session's tasks are cut
+  if (live.session_filter !== me.tag && t.truncated) out.push('  (fleet lists are capped: some of this session\'s tasks may be missing; update the provider)')
   return out
 }
+
+/** Shown under This session: /clear gives the pane a new session id, while a task keeps the session it was started
+ * for (and the cortados-route server keeps the id it started with: README "Which main session started which task"). */
+export const CLEAR_NOTE = 'after a /clear, earlier tasks stay under the previous session (dashboard)'
 
 const S1_FLAGS: Record<string, string> = { 'no-promote': 'promotion held', 'no-train-tonight': 'no training tonight',
   'nightly-stop': 'nightly loop stopping', 'sweep-requested': 'sweep requested' }
@@ -493,11 +517,15 @@ export const register: Register = (on, options) => {
     const lv = await read($, liveHeld)
     const lvProblem = await read($, liveErr)
     const me = await read($, mine)
+    const ml = await read($, mineLive)
     const nowMs = await $.clock.now()
+    // this session's own view when the provider filtered it (before its caps), else the fleet view filtered here
+    const own = ml && me?.tag === ml.tag ? ml : lv
     const running = [
       head('This session'),
-      ...(lv ? sessionLines(lv.data, me, (nowMs - lv.at) / 1000).map(line) : []),
+      ...(own ? sessionLines(own.data, me, (nowMs - own.at) / 1000).map(line) : []),
       ...(lv ? [] : [dim(me && !me.tag ? me.why || '' : 'waiting for the live view…')]),
+      ...(me?.tag ? [dim(CLEAR_NOTE)] : []),
       head('Running'),
       ...(lv ? runningLines(lv.data, (nowMs - lv.at) / 1000).map(line) : lvProblem ? [] : [dim('loading the live view…')]),
       ...(lvProblem ? [dim(lvProblem + (lv ? ' · showing ' + age((nowMs - lv.at) / 1000) + ' old data' : ''))] : []),
