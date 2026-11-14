@@ -245,17 +245,19 @@ def make_writable(adapter_dir: Path) -> tuple[list[str], list[str]]:
         if not stat.S_ISLNK(st.st_mode) and os.path.dirname(os.path.realpath(f)) != real_dir:
             problems.append(f"{f} resolves outside {adapter_dir}: not touching it")
             continue
-        if os.access(f, os.W_OK, follow_symlinks=False) and not stat.S_ISLNK(st.st_mode):
-            continue
         if stat.S_ISLNK(st.st_mode):
             if f.name == "adapter_config.json" or not os.access(f, os.W_OK):
                 problems.append(f"{f} is a symlink to {os.readlink(f)}: mlx_lm would write through it; replace it with a copy")
             continue
         if not stat.S_ISREG(st.st_mode):
             continue
+        # Re-review 2026-11-14: the link count is checked BEFORE the already-writable skip. A WRITABLE source hard-linked into
+        # the run (cp -l, rsync --link-dest) needs no chmod, but the trainer's write would still change the source's content.
         if st.st_nlink > 1:
-            problems.append(f"{f} is read-only and hard-linked ({st.st_nlink} links): making it writable would change the "
+            problems.append(f"{f} is hard-linked ({st.st_nlink} links): the trainer's writes, or a chmod, would change the "
                             "other copy too; replace it with a copy")
+            continue
+        if os.access(f, os.W_OK, follow_symlinks=False):
             continue
         try:
             fd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -263,6 +265,9 @@ def make_writable(adapter_dir: Path) -> tuple[list[str], list[str]]:
             problems.append(f"{f}: cannot open it without following links ({e})")
             continue
         try:
+            # Not closed: a process that adds a hard link between this fstat and the fchmod. Outside the threat model (owner,
+            # 2026-11-14): it would run as the trainer's user and could change the promoted adapter directly. These guards are
+            # against ACCIDENTAL aliasing (stale symlinks, cp -l / rsync --link-dest hard links), not a same-uid adversary.
             fst = os.fstat(fd)
             if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(fst.st_mode) or fst.st_nlink > 1:
                 problems.append(f"{f} changed while it was being checked: not touching it")

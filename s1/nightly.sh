@@ -912,6 +912,9 @@ fi
 # Review 2026-11-14: the temporary is a fresh regular file from mktemp in the destination directory (a predictable
 # "$2.tmp" planted as a symlink to the source made cp overwrite the source), it is removed on any failure, and a destination,
 # or destination directory, that is a symlink (run/adapter -> promoted/adapter) is refused rather than written through.
+# Not closed: a process that swaps the destination directory for a symlink between this check and mktemp. Outside the threat
+# model (owner, 2026-11-14): it would run as the trainer's user and could change the promoted adapter directly. These guards
+# are against ACCIDENTAL aliasing (stale symlinks, cp -l / rsync --link-dest hard links), not a same-uid adversary.
 run_copy() {
   local tmp
   if [ -L "$2" ] || { [ -e "$2" ] && [ ! -f "$2" ]; } || [ -L "$(dirname "$2")" ]; then

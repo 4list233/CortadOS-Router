@@ -183,6 +183,20 @@ class Writable(unittest.TestCase):
         self.assertEqual(self.mode(self.src / "adapter_config.json"), 0o444)
         self.assertEqual(self.mode(self.src / "adapters.safetensors"), 0o444)
 
+    def test_a_writable_hard_linked_source_is_refused_and_unchanged(self):
+        """Re-review 2026-11-14: a writable file was skipped before its link count was checked, so a hard link to a writable
+        source passed and the trainer's write changed the source."""
+        cfg = self.src / "adapter_config.json"
+        cfg.chmod(0o644)
+        os.link(cfg, self.run_adapter / "adapter_config.json")
+        before = (cfg.read_bytes(), self.mode(cfg))
+        changed, problems = lp.make_writable(self.run_adapter)
+        self.assertEqual(changed, [])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("hard-linked", problems[0])
+        self.assertEqual(lp.main(["writable", str(self.run_adapter)]), lp.EXIT_REFUSED)
+        self.assertEqual((cfg.read_bytes(), self.mode(cfg)), before)
+
     def test_a_symlinked_adapter_directory_is_refused_and_the_source_keeps_0444(self):
         """Review 2026-11-14: run/adapter -> promoted/adapter made the source's files look like the run's own regular files."""
         self.run_adapter.rmdir()
