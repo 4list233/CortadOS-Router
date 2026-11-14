@@ -67,12 +67,13 @@ class Overnight(unittest.TestCase):
     def test_resume_interrupted_before_first_save_does_not_double_count(self):
         source=(Path(__file__).resolve().parents[1]/'s1/nightly.sh').read_text()
         block=source[source.index('  resume=""'):source.index('  # LoRA shape (#74')]   # the step count only; LoRA planning: test_s1_lora_params / test_s1_nightly
+        copy_fn=next(l for l in source.splitlines() if l.startswith('run_copy() {'))   # the loop's writable resume copy (2026-11-14)
         with tempfile.TemporaryDirectory() as tmp:
             run=Path(tmp);(run/'adapter').mkdir()
             (run/'adapter/0002400_adapters.safetensors').write_bytes(b'checkpoint-2400')
             (run/'iters-base').write_text('0\n');(run/'segment-target').write_text('3600\n')
             def plan():
-                script='RUN="$1";iters=7200;MAX_ITERS=3600;while :; do\n'+block+'\nbreak;done\nprintf "PLAN %s %s\\n" "$done_iters" "$remaining"'
+                script=copy_fn+'\nRUN="$1";iters=7200;MAX_ITERS=3600;while :; do\n'+block+'\nbreak;done\nprintf "PLAN %s %s\\n" "$done_iters" "$remaining"'
                 return subprocess.check_output(['/bin/bash','-c',script,'test',str(run)],text=True)
             self.assertIn('PLAN 2400 1200',plan())
             self.assertIn('PLAN 2400 1200',plan())
