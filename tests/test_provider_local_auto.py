@@ -315,7 +315,7 @@ class AutoRouteConfigTests(unittest.TestCase):
 
 class AutoLocalEndToEndTests(LocalHarness):
     """An S1-routed `cortados` conversation that auto_local moves to the Pro is served by the local relay (the in-thread
-    fake Ollama) and keeps its model: a continuation pinning another model is the usual 409."""
+    fake Ollama) and keeps its model: a continuation pinning another model is the usual terminal refusal."""
 
     def setUp(self):
         super().setUp()

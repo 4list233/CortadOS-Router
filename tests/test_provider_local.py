@@ -459,8 +459,11 @@ class LocalThinkingTests(LocalHarness):
 
 class LocalConversationPinTests(LocalHarness):
     """A local-pinned conversation keeps its model, exactly as a Claude or Codex pin does: the binding is recorded in
-    the registry and every continuation is checked against it (the 409 "fixed per conversation")."""
+    the registry and every continuation is checked against it (the terminal 400 "fixed per conversation", #43 review)."""
     TOOLS = [{"name": "Read", "input_schema": {"type": "object"}}]
+    # As Claude Code sends it: a text-only continuation without a conversation identity is refused before any model
+    # check (#43 review P1-b), and these tests pin the model check.
+    HEADERS = {"X-Claude-Code-Session-Id": "6a1d0c3e-local-pin"}
 
     def opener(self, model, stream=False):
         return {"model": model, "max_tokens": 64, "tools": self.TOOLS, "stream": stream,
@@ -475,7 +478,7 @@ class LocalConversationPinTests(LocalHarness):
 
     def conflict(self, body):
         code, msg = self.error_of(body)
-        self.assertEqual(code, 409)
+        self.assertEqual(code, 400)                     # terminal: the retry names the same other model (#43 review)
         self.assertIn("fixed per conversation", msg)
         return msg
 
