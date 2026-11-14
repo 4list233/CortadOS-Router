@@ -120,6 +120,8 @@ class OfficeBoard:
         self.mains: dict[str, dict[str, Any]] = {}     # session -> the routed main loop (whole-session mode)
         self.heartbeats: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
         self.dropped: Counter = Counter()
+        # session -> when the MAX_WORKERS LRU last evicted one of its workers (bounded, MAX_HEARTBEATS sessions)
+        self.evicted: "OrderedDict[str, float]" = OrderedDict()
 
     # ---------------------------------------------------------------- inputs
     def read_tags(self, headers) -> dict[str, str]:
@@ -200,7 +202,12 @@ class OfficeBoard:
                 w["session"] = tags["session"]
             self.workers[key] = w
             while len(self.workers) > MAX_WORKERS:
-                self.workers.popitem(last=False)
+                _, gone = self.workers.popitem(last=False)
+                if gone.get("session"):         # said in the live tree: that session's one-shot list may be short
+                    self.evicted.pop(gone["session"], None)
+                    self.evicted[gone["session"]] = now
+                    while len(self.evicted) > MAX_HEARTBEATS:
+                        self.evicted.popitem(last=False)
 
     def turn_end(self, key: str | None, tags: dict[str, str], *, status: str, tool: str | None = None,
                  now: float | None = None) -> None:
@@ -240,7 +247,13 @@ class OfficeBoard:
 
     # ---------------------------------------------------------------- the view
     def view(self, child_events: list[dict[str, Any]], *, now: float | None = None,
-             errors: list[dict[str, str]] | None = None) -> dict[str, Any]:
+             errors: list[dict[str, str]] | None = None, uncapped: bool = False) -> dict[str, Any]:
+        """The board as the Office shows it: floors capped at MAX_FLOORS, workers at MAX_WORKERS overall and
+        MAX_WORKERS_PER_FLOOR / MAX_LOBBY per floor. `uncapped` (the live view's orchestrator tree only, never the Office
+        endpoint) adds `workers_all`: every eligible worker before the floor, overall and per-floor caps, each with its
+        own session tag and that floor's project/device, so one session's workers never depend on the others' volume.
+        Its size is bounded by the board's memory (MAX_WORKERS LRU) plus the child tasks of the log window; the
+        sessions that lost a worker to that LRU within WORKER_KEEP_S are named in `workers_evicted`."""
         now = time.time() if now is None else now
         children = _children(child_events, now)
         with self._lock:
@@ -251,6 +264,7 @@ class OfficeBoard:
             mains = {s: dict(m) for s, m in self.mains.items() if s in self.floors}
             beats = {s: dict(h) for s, h in self.heartbeats.items()}
             dropped = dict(self.dropped)
+            evicted = {s: t for s, t in self.evicted.items() if now - t <= WORKER_KEEP_S}
         # Child tasks: merged into the worker their own traffic made (same run id), else a worker of their own. A child
         # with a tag opens (or keeps) its floor, as a routed request does.
         for tid, c in children.items():
@@ -278,6 +292,7 @@ class OfficeBoard:
                 floors[s] = f
         # Global caps cover the merged log AND live state. Keep the most recently active floors/workers; the log
         # tail may hold thousands of unique keys even though live state was already bounded.
+        all_floors = floors
         recent_floors = sorted(floors, key=lambda s: (-floors[s]["last"], s))[:MAX_FLOORS]
         floors_hidden = len(floors) - len(recent_floors)
         hidden_sessions = set(floors) - set(recent_floors)
@@ -307,10 +322,19 @@ class OfficeBoard:
                                "orchestrator": _orchestrator(beats.get(s), mains.get(s)),
                                "workers": ws["items"], "workers_hidden": ws["hidden"]})
         lobby = _cap(by_floor.get(None, []), MAX_LOBBY)
-        return {"version": VERSION, "ts": _ts(now), "floors": out_floors,
-                "floors_hidden": floors_hidden, "workers_hidden": workers_hidden,
-                "lobby": {"workers": lobby["items"], "workers_hidden": lobby["hidden"]},
-                "dropped_headers": dropped, "errors": list(errors or [])}
+        out = {"version": VERSION, "ts": _ts(now), "floors": out_floors,
+               "floors_hidden": floors_hidden, "workers_hidden": workers_hidden,
+               "lobby": {"workers": lobby["items"], "workers_hidden": lobby["hidden"]},
+               "dropped_headers": dropped, "errors": list(errors or [])}
+        if uncapped:
+            out["workers_evicted"] = sorted(evicted)   # sessions that lost a worker to the LRU in the keep window
+            out["workers_all"] = []
+            for w in eligible:
+                s = w.get("session")            # the worker's own tag, kept even when its floor was hidden or evicted
+                f = all_floors.get(s) or {}
+                out["workers_all"].append({**_pub_worker(w), "session": s, "project": f.get("project"),
+                                           "device": f.get("device")})
+        return out
 
     def _expire_locked(self, now: float, keep: set[str] | frozenset = frozenset()) -> None:
         for s in [s for s, f in self.floors.items() if now - f.get("last", now) > FLOOR_TTL_S]:

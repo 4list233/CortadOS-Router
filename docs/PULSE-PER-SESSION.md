@@ -142,14 +142,25 @@ tool name, Office tag) or from fixed vocabularies (status, phase, role).
   that session or its machine's salt holder. Tags are cosmetic labels inside the owner's trust boundary (as
   `x-cortados-session` already is), so the provider cannot check that the caller "is" the session. What it can and does
   guarantee is that a session's view contains nothing about another session.
-- **Independent of other sessions' activity** (review 2026-11-14): the tree is built from the uncapped task rows,
+- **Independent of other sessions' activity** (reviews 2026-11-14): the tree is built from the uncapped task rows,
   conversation items and remote stubs, narrowed to the session's origin first, and only then capped. The fleet lists'
-  own caps (64 conversations, 50 stubs) never decide what a session sees. A hard ceiling (`TREE_INPUT_MAX`, 2000 per
-  input, after the filter) bounds the work on a runaway fleet; a cut is named in `inputs_truncated` (also when the
-  task-dir scan for stubs stopped at its 200), and the pane and the dashboard say it. The session endpoint never opens
-  another session's task directory (its own open tasks are peeked first, so others cannot use up the 64 peeks), and a
-  task-dir error is published only with the task it belongs to: another session's `PermissionError` never reaches this
-  view or changes its status.
+  own caps (64 conversations, 50 stubs, the Office's 32 workers per floor) never decide what a session sees, and every
+  flag in a session's `inputs_truncated` is about that session's own data. Where each input comes from, and its bound:
+
+  | Input | How the session's own part is found | Bound and cost per request | Said when cut |
+  | --- | --- | --- | --- |
+  | Child tasks (local) | The child-task log (24 h, read once per collect), filtered by origin through the parent chain. | The log tail the live view already reads (`usage.CHILD_TAIL` lines / `CHILD_TAIL_BYTES`). | — (unchanged by this review) |
+  | Remote stubs | The **origin index**: `start_task` writes the stub (`<tasks>/<id>/remote.json`) and an empty entry `<tasks>/by-origin/<origin>/<id>` (`child_tasks._write_stub`). The session endpoint reads only `by-origin/<its tag>/` and those tasks' `remote.json` (`child_tasks.remote_stubs_for`); it never lists the task dirs, so other sessions' stubs, however many or new, are neither read nor counted. | One `listdir` of this origin's own entries, O(its stubs since the last daily prune), then at most `REMOTE_STUBS_SCAN` (200) stub reads, newest first. | `task stubs`, only when THIS origin has more than 200 entries. |
+  | Conversations | Each open conversation's own Office tags, kept per conversation by the registry (`Registry._conversation_meta`: session, project, device, title), uncapped. The board only fills a conversation that carries none. | The registry's open conversations (all of them, as the fleet list), then `TREE_INPUT_MAX` (2000) after the filter. | `conversations` |
+  | One-shot routed workers (no open conversation) | The Office board's **uncapped** worker list (`OfficeBoard.view(uncapped=True)`, the live view only; the Office endpoint is unchanged), each worker with its own session tag, before the per-floor (32), lobby and floor caps. | The board's memory: `office.MAX_WORKERS` (1024, an LRU across the fleet). | `routed workers`, only for a session that lost a worker to that LRU in the last 10 min (`OfficeBoard.evicted`). |
+
+  The fleet view keeps its own scan of the newest 200 task dirs (O(task dirs) `listdir`, ≤ 200 stub reads) for its
+  tasks section and its tree, and says `task stubs` when that scan stopped; that flag never reaches a session view.
+  Stubs written before the index existed are indexed by the next daily prune (`child_tasks.prune`), which also drops
+  entries whose task dir is gone (O(index entries), never on a view). Until then such a stub shows only in the fleet
+  view. The session endpoint never opens another session's task directory (its own open tasks are peeked first, so
+  others cannot use up the 64 peeks), and a task-dir error is published only with the task it belongs to: another
+  session's `PermissionError` never reaches this view or changes its status.
 - Why not have the provider derive the session from the request? The provider never sees the session id, and must not:
   it is a `claude --resume` handle. Why not filter in the pane? The pane would then download every session's metadata,
   which was the old behaviour.
@@ -189,8 +200,11 @@ Caps: 32 orchestrators, 20 top-level tasks each (active first; counts cover all)
 parent chain is drawn flat, never lost), 8 sub-sessions per task, 8 routed subagents. The section has its own
 `as_of`, `status` and `errors`. Failures of the task log, the office board, the conversation list, the ended list or
 the run tokens make it `partial` or `error`, never an empty success. `attention` = failed + unknown tasks + the failed
-sub-sessions of every other task. `inputs_truncated` names an input (`conversations`, `task stubs`) that hit the hard
-ceiling; `truncated` is then true as well.
+sub-sessions of every other task. `inputs_truncated` names an input that was cut: `conversations` or `task stubs`
+past the hard ceiling (`TREE_INPUT_MAX`, after the filter), `task stubs` when the stub read stopped at its 200 (the
+fleet's task-dir scan in the fleet view, the session's own origin index in a session view), `routed workers` when the
+board's memory dropped a worker of this session (the fleet view: of any). `truncated` is then true as well. Bounds and
+costs per input: §5.
 
 ## 7. What the owner must do
 
@@ -214,9 +228,15 @@ ceiling; `truncated` is then true as well.
   checked by tag, task id, title and conversation ref; filtering happens before the caps, and 64+ foreign
   conversations or 50+ foreign remote stubs hide nothing of this session's; the hard ceiling applies after the filter
   and is said; an unknown tag gets no foreign task-dir error and opens no foreign directory; attention counts a failed
-  sub-session once. Metadata only. The endpoint:
+  sub-session once. Review 2026-11-14 (second round): 300 newer foreign remote stubs in a real tasks dir neither hide
+  a session's older stub nor give any flag to it or to an unknown tag, and the session endpoint never lists the task
+  dirs; the fleet scan's cut is said in the fleet view only; 40 routed agents of one session on one floor are all
+  counted (open conversations with or without their own tags, or one-shot workers), with no flag; a worker lost to
+  the board's LRU is said for its own session only; the owner's view is unchanged under the caps. Metadata only. The endpoint:
   required tag, `live:session` versus other scopes, a real routed run appearing as a sub-session and staying after it
   closes. Linkage helpers. The generated `hooks/session.fixture.ts` is checked against `live.session_view`.
+- `tests/test_live.py` (`StubScanTest`): the origin index reads one origin's stubs only, read-only, with its own
+  truncation; the daily prune drops entries of removed stubs and indexes older stubs.
 - `tests/test_child_tasks.py`: inheritance at start (no origin of its own → the parent's, `origin_via: parent`, in
   `meta.json` and both events). A nested task with its own origin keeps it. A remote stub names the orchestrator.
   All with the fake claude and the fake ssh transport: no real child runs.

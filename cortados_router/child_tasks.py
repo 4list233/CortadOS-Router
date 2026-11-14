@@ -175,6 +175,10 @@ RUN_FETCH_MIN_S = 1                 # a fetch with less than this left is not wo
 
 # --- execution host, workspaces, launchd (2026-11-08) -------------------------------------------------------------
 REMOTE_STUB = "remote.json"         # in a local task dir: {"host": <name>} — the task lives on that execution host
+# Under the tasks root: by-origin/<origin_session>/<task id> (empty files), one per remote stub that names its
+# orchestrator. Not a task dir (the name never matches TASK_ID_RE). Written by _write_stub, read by remote_stubs_for,
+# pruned with its stubs by prune().
+ORIGIN_INDEX = "by-origin"
 WORKSPACE_FILE = "workspace.json"   # in the task dir on the host: the workspaces.prepare()/settle() record
 LAUNCHD_FILE = "launchd.json"       # in the task dir: {"label", "domain", "plist", "booted_out"} for a launchd task
 QUEUED_MARKER = "queued"            # in the task dir while the runner waits for the host's Chrome lock
@@ -699,10 +703,40 @@ def prune(root: str, now: float | None = None, errors: list | None = None, red=N
                     _launchd_bootout(d)         # idempotent; a corrupt launchd.json already raised from _state() above
                 shutil.rmtree(d)
                 removed.append(name)
+            elif state == "remote":             # a kept stub from before the index: indexed now (idempotent)
+                _index_origin(root, name, clean_origin_meta(meta.get("origin")).get("origin_session"))
         except OSError as exc:
             if errors is not None:
                 errors.append(f"{name}: {type(exc).__name__}: {exc}")
+    _prune_origin_index(root, errors)
     return removed
+
+
+def _prune_origin_index(root: str, errors: list | None = None) -> None:
+    """Drop origin-index entries whose task dir is gone (pruned above, or removed by hand), then empty origin dirs.
+    O(index entries); runs with prune(), never on a view."""
+    idx = os.path.join(root, ORIGIN_INDEX)
+    try:
+        origins = os.listdir(idx)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        if errors is not None:
+            errors.append(f"{ORIGIN_INDEX}: {type(exc).__name__}")
+        return
+    for origin in origins:
+        od = os.path.join(idx, origin)
+        try:
+            if os.path.islink(od) or not os.path.isdir(od):
+                continue
+            for tid in os.listdir(od):
+                if not (TASK_ID_RE.fullmatch(tid) and os.path.isdir(os.path.join(root, tid))):
+                    os.unlink(os.path.join(od, tid))
+            if not os.listdir(od):
+                os.rmdir(od)
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"{ORIGIN_INDEX}/{origin}: {type(exc).__name__}")
 
 
 def _remove_settings(d: str) -> list:
@@ -899,6 +933,22 @@ def _write_stub(root: str, task_id: str, host_name: str, origin: dict | None = N
     if o:
         rec["origin"] = o
     _write_json(os.path.join(d, REMOTE_STUB), rec)
+    _index_origin(root, task_id, o.get("origin_session"))
+
+
+def _index_origin(root: str, task_id: str, origin_session) -> None:
+    """Record a remote stub under its orchestrator in the origin index (<root>/by-origin/<origin>/<task id>, an empty
+    file), so the live session view finds ONE session's stubs without listing every task dir (remote_stubs_for).
+    Best effort: the stub itself is the record (the fleet view and status still find it); a failure is logged, never
+    a failed start."""
+    if not isinstance(origin_session, str) or not ORIGIN_SESSION_RE.fullmatch(origin_session):
+        return
+    try:
+        d = os.path.join(root, ORIGIN_INDEX, origin_session)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.close(os.open(os.path.join(d, task_id), os.O_WRONLY | os.O_CREAT, 0o600))
+    except OSError as exc:
+        log_event("origin_index_failed", task_id=task_id, error=type(exc).__name__)
 
 
 def _stub(d: str):
@@ -2186,6 +2236,34 @@ def remote_stubs() -> list:
         if rec is not None:
             out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at"),
                         **clean_origin_meta(rec.get("origin"))})
+    return out
+
+
+def remote_stubs_for(origin) -> list:
+    """For GET /v1/cortados/live/session: the remote stubs ONE orchestrator started from here, found through the origin
+    index (by-origin/<origin>/), never by listing the task dirs: other sessions' stubs, however many and however new,
+    are neither read nor counted. Cost: one listdir of this origin's own index entries (O(its stubs since the last
+    daily prune)), then at most REMOTE_STUBS_SCAN stub reads, newest first. `truncated` (StubList) is True only when
+    THIS origin has more entries than that. An entry whose stub is gone, unreadable or names another origin is
+    skipped. Read-only; a missing index (or root) is no stubs."""
+    out = StubList()
+    if not isinstance(origin, str) or not ORIGIN_SESSION_RE.fullmatch(origin):
+        return out
+    root = tasks_dir()
+    try:
+        names = sorted((x for x in os.listdir(os.path.join(root, ORIGIN_INDEX, origin)) if TASK_ID_RE.fullmatch(x)),
+                       reverse=True)
+    except (FileNotFoundError, NotADirectoryError):
+        return out
+    out.truncated = len(names) > REMOTE_STUBS_SCAN
+    for tid in names[:REMOTE_STUBS_SCAN]:
+        try:
+            rec = _stub(os.path.join(root, tid))
+        except TaskError:
+            continue
+        o = clean_origin_meta(rec.get("origin")) if rec is not None else {}
+        if o.get("origin_session") == origin:
+            out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at"), **o})
     return out
 
 

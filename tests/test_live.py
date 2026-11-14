@@ -670,6 +670,52 @@ class StubScanTest(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.root)), before)
 
 
+    def test_the_origin_index_reads_one_origins_stubs_only(self):
+        mine, theirs = "aaaaaaaaaaaaaaa1", "bbbbbbbbbbbbbbb2"
+        os.makedirs(self.root)
+        own = "t20261111080000-00000001"
+        child_tasks._write_stub(self.root, own, "studio", {"origin_session": mine, "origin_project": "Router"})
+        for i in range(300):                                         # newer, and more than the fleet scan reads
+            child_tasks._write_stub(self.root, f"t20261111090000-{i:08x}", "studio", {"origin_session": theirs})
+        child_tasks._write_stub(self.root, "t20261111100000-00000002", "studio")      # no origin: not indexed
+        fleet = child_tasks.remote_stubs()
+        self.assertTrue(fleet.truncated)
+        self.assertNotIn(own, [x["task_id"] for x in fleet])
+        before = sorted(os.listdir(self.root))
+        got = child_tasks.remote_stubs_for(mine)
+        self.assertEqual([(x["task_id"], x["host"], x["origin_session"], x["origin_project"]) for x in got],
+                         [(own, "studio", mine, "Router")])
+        self.assertFalse(got.truncated)
+        for tag in ("cccccccccccccccc", "grokbot", "../x", None):
+            got = child_tasks.remote_stubs_for(tag)
+            self.assertEqual((list(got), got.truncated), ([], False), tag)
+        self.assertEqual(len(child_tasks.remote_stubs_for(theirs)), child_tasks.REMOTE_STUBS_SCAN)
+        self.assertTrue(child_tasks.remote_stubs_for(theirs).truncated)       # its OWN volume, said to it
+        self.assertEqual(sorted(os.listdir(self.root)), before)              # read-only
+        # an entry whose stub names another origin (a hand-made or stale entry) is skipped
+        Path(self.root, child_tasks.ORIGIN_INDEX, mine, "t20261111090000-00000000").touch()
+        self.assertEqual([x["task_id"] for x in child_tasks.remote_stubs_for(mine)], [own])
+
+    def test_prune_keeps_the_origin_index_in_step(self):
+        mine = "aaaaaaaaaaaaaaa1"
+        os.makedirs(self.root)
+        old, kept = "t20261111080000-00000001", "t20261111090000-00000002"
+        child_tasks._write_stub(self.root, old, "studio", {"origin_session": mine})
+        os.makedirs(os.path.join(self.root, kept))                   # a stub from before the index
+        Path(self.root, kept, child_tasks.REMOTE_STUB).write_text(json.dumps(
+            {"host": "studio", "created_at": time.time(), "origin": {"origin_session": mine}}))
+        rec = json.loads(Path(self.root, old, child_tasks.REMOTE_STUB).read_text())
+        rec["created_at"] = time.time() - child_tasks.PRUNE_AGE_S - 60
+        Path(self.root, old, child_tasks.REMOTE_STUB).write_text(json.dumps(rec))
+        errors = []
+        self.assertEqual(child_tasks.prune(self.root, errors=errors), [old])
+        self.assertEqual(errors, [])
+        self.assertEqual(os.listdir(os.path.join(self.root, child_tasks.ORIGIN_INDEX, mine)), [kept])
+        shutil.rmtree(os.path.join(self.root, kept))
+        child_tasks.prune(self.root)
+        self.assertEqual(os.listdir(os.path.join(self.root, child_tasks.ORIGIN_INDEX)), [])
+
+
 class MemoTest(unittest.TestCase):
     def test_ttl_key_and_single_flight(self):
         clock = [0.0]

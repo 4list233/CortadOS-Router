@@ -1461,8 +1461,13 @@ class Registry:
         lock = getattr(s, "lock", None)
         worker = getattr(s, "office_worker", None)
         tok = getattr(s, "live_tokens", None)
+        # The request's own Office tags (OfficeBoard.read_tags, already validated; live.py re-checks them): which
+        # session owns this conversation, without joining through the board's capped worker lists.
+        tags = worker[1] if isinstance(worker, tuple) and len(worker) > 1 and isinstance(worker[1], dict) else {}
         return {
             "key": worker[0] if isinstance(worker, tuple) and worker and isinstance(worker[0], str) else None,
+            "session": tags.get("session"), "project": tags.get("project"), "device": tags.get("device"),
+            "title": tags.get("title"),
             "ref": "c-" + hashlib.sha256(str(s.id).encode()).hexdigest()[:12],
             "provider": office.provider_of(rp, local_lane.LANE_PREFIX),
             "lane": rp if rp.startswith(local_lane.LANE_PREFIX) else (_route_lane(route) if route else None),
@@ -3276,7 +3281,7 @@ class ProviderServer(ThreadingHTTPServer):
         state = paths.state_dir()
 
         def office_of(events):
-            return registry.office.view(events, now=now, errors=[])
+            return registry.office.view(events, now=now, errors=[], uncapped=True)
 
         def hosts():
             if not os.path.exists(exec_hosts.config_path()):
@@ -3291,7 +3296,9 @@ class ProviderServer(ThreadingHTTPServer):
             usage_view=lambda: self.live_usage_view(registry, now),
             heartbeats=lambda: registry.live.snapshot(now), backend_sessions=len(registry.sessions),
             peek=child_tasks.peek_local, exec_hosts=hosts, self_host=exec_hosts.short_hostname(),
-            remote_stubs=child_tasks.remote_stubs, lane_enabled=live.lane_enabled,
+            # the session endpoint never lists the task dirs: its stubs come from the origin index (remote_stubs_for)
+            remote_stubs=None if session_view else child_tasks.remote_stubs,
+            session_stubs=child_tasks.remote_stubs_for, lane_enabled=live.lane_enabled,
             conversations=registry.live_conversations, ended_conversations=registry.ended_conversations,
             run_tokens=registry.runs.tokens_by_run, session=session, peek_foreign=not session_view)
 

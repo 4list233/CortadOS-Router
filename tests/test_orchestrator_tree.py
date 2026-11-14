@@ -85,6 +85,16 @@ def backend():
     ]
 
 
+_TAGS = {ROOT: {"session": MINE}, NESTED: {"session": MINE}, OTHER: {"session": OTHER, "project": "Grounds"},
+         "other-sub-0001": {"session": OTHER, "project": "Grounds", "title": "Their subagent title"},
+         "mine-sub-00001": {"session": MINE, "project": "CortadOS-Router", "title": "Check the docs"}}
+
+
+def tagged(convs):
+    """Conversations with their own Office tags, as Registry._conversation_meta reports them (the request's tags)."""
+    return [{**c, **_TAGS.get(c["key"].partition(":")[2], {})} for c in convs]
+
+
 def ended():
     return [{"key": "r:" + ROOT, "ref": "c-000000000010", "provider": "local", "lane": "local-studio",
              "model": "qwen3-30b", "opened_at": NOW - 200, "last_used": NOW - 120, "closed_at": NOW - 110,
@@ -111,11 +121,19 @@ def board():
     return b
 
 
+def own_stubs(stubs_fn):
+    """session_stubs for collect: the origin index's answer (child_tasks.remote_stubs_for) simulated from a stub list,
+    every stub of that origin, with no foreign stub and no fleet scan flag."""
+    def by_origin(tag):
+        return child_tasks.StubList(x for x in stubs_fn() if x.get("origin_session") == tag)
+    return by_origin
+
+
 def view(session=None, **over):
     b = board()
-    args = dict(now=NOW, child_events=events, office_view=lambda ev: b.view(ev, now=NOW),
+    args = dict(now=NOW, child_events=events, office_view=lambda ev: b.view(ev, now=NOW, uncapped=True),
                 tasks_view=lambda: tl.tasks_view(3), usage_view=tl.usage_live,
-                heartbeats=lambda: tl.heartbeats().snapshot(NOW), peek=None, conversations=backend,
+                heartbeats=lambda: tl.heartbeats().snapshot(NOW), peek=None, conversations=lambda: tagged(backend()),
                 ended_conversations=ended, run_tokens=lambda: {ROOT: {"input": 9000, "output": 2000,
                                                                       "cache_read": 50000, "cache_write": 3000}},
                 remote_stubs=lambda: [{"task_id": AWAY, "host": "studio", "created_at": NOW - 30,
@@ -123,6 +141,8 @@ def view(session=None, **over):
                 exec_hosts=lambda: ({"air": ["forests-macbook-air"]}, "air"), self_host="forests-macbook-air",
                 host_names=["air", "studio", "pro"], session=session)
     args.update(over)
+    if "session_stubs" not in over:                 # as the server: the session's own stubs from the origin index
+        args["session_stubs"] = own_stubs(args["remote_stubs"] or (lambda: []))
     return live.collect(**args)
 
 
@@ -337,7 +357,8 @@ class SessionFilterTest(unittest.TestCase):
     def test_foreign_conversations_do_not_hide_this_sessions_routed_subagent(self):
         n = live.CONVERSATIONS_MAX + 6
         b, extra = self.busy_board(n)
-        over = dict(office_view=lambda ev: b.view(ev, now=NOW), conversations=lambda: extra + backend())
+        over = dict(office_view=lambda ev: b.view(ev, now=NOW, uncapped=True),
+                    conversations=lambda: extra + tagged(backend()))
         fleet = view(**over)
         c = fleet["conversations"]                                  # the fleet list: capped as before
         self.assertEqual((len(c["items"]), c["hidden"]), (live.CONVERSATIONS_MAX, c["active"] - live.CONVERSATIONS_MAX))
@@ -348,9 +369,69 @@ class SessionFilterTest(unittest.TestCase):
             self.assertEqual([r["ref"] for r in g["routed"]], ["mine-sub-00001"])
             self.assertEqual(g["routed_hidden"], 0)
             self.assertEqual(v["orchestrators"]["inputs_truncated"], [])
-        theirs = groups(fleet)[OTHER]       # OTHER's own count is told too: all its floor's workers (the board lists 32)
-        self.assertEqual(len(theirs["routed"]) + theirs["routed_hidden"], tl.office.MAX_WORKERS_PER_FLOOR)
+        # OTHER's own count is complete too: every one of its n + 1 routed agents, not the board's 32 per floor
+        theirs = groups(fleet)[OTHER]
+        self.assertEqual(len(theirs["routed"]) + theirs["routed_hidden"], n + 1)
         self.assertEqual(len(theirs["routed"]), live.ORCH_ROUTED_MAX)
+
+    def own_agents(self, n, *, open_conversations, tags_on_conversations=True):
+        """board() plus `n` of MINE's routed agents on its one floor: open conversations (with or without their own
+        tags, as the registry may know them) or one-shot workers the board alone knows."""
+        b = board()
+        mine = {"session": MINE, "project": "CortadOS-Router", "device": "pro"}
+        convs = []
+        for i in range(n):
+            rid = f"mine-agent-{i:05d}"
+            b.turn_start("r:" + rid, mine, run_id=rid, provider="codex", lane="codex", model="gpt-6.1",
+                         now=NOW - 100 + i)
+            if open_conversations:
+                c = {"key": "r:" + rid, "ref": f"c-2{i:011x}", "provider": "codex", "lane": "codex",
+                     "model": "gpt-6.1", "opened_at": NOW - 100 + i, "last_used": NOW - 1, "busy": True,
+                     "awaiting_tool": False}
+                convs.append({**c, "session": MINE} if tags_on_conversations else c)
+        return dict(office_view=lambda ev: b.view(ev, now=NOW, uncapped=True),
+                    conversations=lambda: convs + tagged(backend()))
+
+    def test_forty_own_routed_agents_on_one_floor_are_all_reported(self):
+        n = tl.office.MAX_WORKERS_PER_FLOOR + 8                    # 40: more than the Office lists on one floor
+        for kw in (dict(open_conversations=True), dict(open_conversations=True, tags_on_conversations=False),
+                   dict(open_conversations=False)):
+            over = self.own_agents(n, **kw)
+            # the Office board itself still lists 32 on the floor: the cap the tree no longer joins through
+            floor = next(f for f in tl.office.OfficeBoard.view(board(), [], now=NOW)["floors"] if f["session"] == MINE)
+            self.assertLessEqual(len(floor["workers"]), tl.office.MAX_WORKERS_PER_FLOOR)
+            for v in (view(**over), view(MINE, **over), live.session_view(view(MINE, **over), MINE)):
+                g, o = groups(v)[MINE], v["orchestrators"]
+                self.assertEqual(len(g["routed"]) + g["routed_hidden"], n + 1, kw)     # + mine-sub-00001
+                self.assertEqual((o["inputs_truncated"], o["truncated"]), ([], False), kw)
+
+    def test_a_worker_lost_to_the_boards_memory_is_said_for_its_session_only(self):
+        b = tl.office.OfficeBoard()
+        b.turn_start("r:mine-old-00001", {"session": MINE}, run_id="mine-old-00001", provider="codex", lane="codex",
+                     model="gpt-6.1", now=NOW - 60)
+        with mock.patch.object(tl.office, "MAX_WORKERS", 4):
+            for i in range(4):                                      # OTHER's newer one-shots push MINE's out
+                rid = f"other-new-{i:05d}"
+                b.turn_start("r:" + rid, {"session": OTHER}, run_id=rid, provider="codex", lane="codex",
+                             model="gpt-6.1", now=NOW - 10)
+        over = dict(office_view=lambda ev: b.view(ev, now=NOW, uncapped=True))
+        for v in (view(MINE, **over), live.session_view(view(MINE, **over), MINE)):
+            self.assertEqual(v["orchestrators"]["inputs_truncated"], ["routed workers"])
+            self.assertTrue(v["orchestrators"]["truncated"])
+        for tag in ("cccccccccccccccc", OTHER):                     # not a flag for anyone else
+            self.assertEqual(view(tag, **over)["orchestrators"]["inputs_truncated"], [], tag)
+        self.assertEqual(view(**over)["orchestrators"]["inputs_truncated"], ["routed workers"])   # the fleet: said
+
+    def test_the_fleet_view_is_unchanged_by_the_uncapped_join(self):
+        # under the caps, the board's uncapped list changes nothing in the owner's view
+        self.assertEqual(view(), view(office_view=lambda ev: board().view(ev, now=NOW)))
+        # and a conversation's own tags only fill an owner the board did not know (NESTED's loop: no worker of its own)
+        old, new = view(conversations=backend), view()
+        for v in (old, new):
+            for it in v["conversations"]["items"]:
+                if it["run_id"] == NESTED:
+                    it["session"] = MINE
+        self.assertEqual(old, new)
 
     def test_foreign_remote_stubs_do_not_hide_this_sessions_remote_task(self):
         n = live.ELSEWHERE_MAX + 10
@@ -378,9 +459,26 @@ class SessionFilterTest(unittest.TestCase):
             o = view(remote_stubs=lambda: stubs)["orchestrators"]       # the fleet: 13 stubs, 5 kept, the cut said
             self.assertEqual((o["inputs_truncated"], o["truncated"]), (["conversations", "task stubs"], True))
         cut = child_tasks.StubList(stubs)
-        cut.truncated = True                                            # the task-dir scan itself stopped at its cap
-        o = view(MINE, remote_stubs=lambda: cut)["orchestrators"]
+        cut.truncated = True                                            # the fleet's task-dir scan stopped at its cap
+        self.assertEqual(view(remote_stubs=lambda: cut)["orchestrators"]["inputs_truncated"], ["task stubs"])
+        for tag in (MINE, OTHER, "cccccccccccccccc"):                   # ... which is no session's own cut
+            o = view(tag, remote_stubs=lambda: cut)["orchestrators"]
+            self.assertEqual((o["inputs_truncated"], o["truncated"]), ([], False), tag)
+        own = child_tasks.StubList([stubs[-1]])
+        own.truncated = True                                            # THIS origin's index has more than it read
+        o = view(MINE, remote_stubs=lambda: cut, session_stubs=lambda tag: own)["orchestrators"]
         self.assertEqual((o["inputs_truncated"], o["truncated"]), (["task stubs"], True))
+
+    def test_the_session_tree_never_takes_the_fleet_scan(self):
+        def fleet_scan():
+            raise AssertionError("the fleet stubs were read")
+        asked = []
+        v = view(MINE, remote_stubs=None, session_stubs=lambda tag: asked.append(tag) or child_tasks.StubList(
+            [{"task_id": AWAY, "host": "studio", "created_at": NOW - 30, "origin_session": MINE}]))
+        self.assertEqual(asked, [MINE])
+        self.assertIn(AWAY, ids(groups(v)[MINE]))
+        self.assertEqual(view(MINE, remote_stubs=fleet_scan, session_stubs=lambda tag: [])["orchestrators"]["errors"],
+                         [])                                            # the fleet scan's error is not the tree's
 
     def test_an_unknown_tag_gets_no_foreign_errors(self):
         seen = []
@@ -453,6 +551,37 @@ class SessionEndpointTest(tl.EndpointHarness):
     def test_paths_agree(self):
         self.assertEqual(clients.LIVE_SESSION_PATH, live.SESSION_PATH)
 
+    def test_newer_foreign_stubs_neither_hide_an_own_stub_nor_flag_another_tag(self):
+        """Review 2026-11-14 (P2): 300 newer remote stubs of another session in the real tasks dir, past the fleet
+        scan's REMOTE_STUBS_SCAN, and one older stub of MINE's, all written the way start_task writes them."""
+        mine = "t20261111080000-00000001"
+        child_tasks._write_stub(self.tasks, mine, "studio", {"origin_session": MINE})
+        for i in range(300):
+            child_tasks._write_stub(self.tasks, f"t20261111090000-{i:08x}", "studio", {"origin_session": OTHER})
+        self.assertGreater(300, child_tasks.REMOTE_STUBS_SCAN)
+        listed = []
+        real = os.listdir
+
+        def spy(path="."):
+            listed.append(os.path.normpath(str(path)))
+            return real(path)
+        with mock.patch.object(os, "listdir", spy):
+            code, raw, _ = self.request("GET", live.SESSION_PATH + "?session=" + MINE, SESSION_TOKEN)
+        self.assertEqual(code, 200, raw)
+        self.assertNotIn(os.path.normpath(self.tasks), listed)            # the task dirs were never listed
+        o = json.loads(raw)["orchestrators"]
+        self.assertEqual([t["task_id"] for t in o["items"][0]["tasks"]], [mine])
+        self.assertEqual((o["inputs_truncated"], o["truncated"]), ([], False))
+        self.assertNotIn(OTHER, raw)
+        self.httpd._live_memo = live.Memo()
+        code, raw, _ = self.request("GET", live.SESSION_PATH + "?session=cccccccccccccccc", SESSION_TOKEN)
+        o = json.loads(raw)["orchestrators"]
+        self.assertEqual((o["items"], o["inputs_truncated"], o["truncated"]), ([], [], False))   # no foreign volume
+        # the owner's fleet view: unchanged, its scan's cut said there
+        fleet = json.loads(self.request("GET", live.LIVE_PATH, tl.TOKEN)[1])
+        self.assertEqual(fleet["orchestrators"]["inputs_truncated"], ["task stubs"])
+        self.assertNotIn(mine, [x["task_id"] for x in fleet["tasks"]["elsewhere"]])
+
     def test_tag_required_and_scopes(self):
         P = live.SESSION_PATH
         for q in ("", "?session=", "?session=nothex", f"?session={MINE}&session={MINE}"):
@@ -494,6 +623,8 @@ class SessionEndpointTest(tl.EndpointHarness):
         self.assertEqual((task["task_id"], task["title"], task["status"]), (tid, "Routed child", "running"))
         self.assertEqual([(s["role"], s["status"], s["phase"]) for s in task["sub_sessions"]],
                          [("main", "running", "running a tool")])
+        # the registry knows its owner itself (the request's own tags), not through the board's capped floors
+        self.assertEqual([(c["key"], c["session"]) for c in self.reg.live_conversations()], [("r:" + tid, MINE)])
         # closing it moves it to the ended sub-sessions, still under its task
         for s in list(self.reg.sessions.values()):
             self.reg.drop(s)
