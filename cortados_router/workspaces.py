@@ -4,8 +4,9 @@
   <root>/active/<task_id>  the task's working folder while it runs: a git worktree, or a plain folder (no repo)
   <root>/archive/<task_id> finished and pushed (or no repository): HEAD detached at its commit so the branch is free
                            for the next task; deleted by cleanup_archive() after ARCHIVE_AGE_S
-  <root>/held/<task_id>    finished with unpushed work: keeps its branch checked out (a new task on that branch is
-                           refused); never deleted automatically, listed for the owner
+  <root>/held/<task_id>    finished with unpushed work (any file not proven published, regenerable caches aside; see
+                           CACHE_DIR_NAMES): keeps its branch checked out (a new task on that branch is refused);
+                           never deleted automatically, listed for the owner; `held_paths` names what held it
   <root>/index.jsonl       one line per task (rewritten in place under index.lock, never appended twice for a task)
 
 Only archive/ is ever deleted from, only entries named like a task id, only regular directories directly inside it
@@ -87,6 +88,19 @@ SUBDIRS = ("repos", "active", "archive", "held")
 # attempt per backoff period instead of the front of every run's budget.
 REPAIR_BACKOFF_BASE_S = 3600
 REPAIR_BACKOFF_MAX_S = 7 * 24 * 3600
+# Ignored content that may be archived (and so deleted with the archive after ARCHIVE_AGE_S) without being published.
+# Only regenerable tool caches: deleting them loses nothing a rerun does not rebuild. Every other ignored file is owner
+# data (this repo's own s1/data/ holds S1 training data and is git-ignored), so it still holds the workspace. Empty
+# ignored directories hold nothing and never block (2026-11-13: five pushed worktrees were held for an empty
+# s1/data/outcome/journals/ that a test left behind).
+CACHE_DIR_NAMES = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
+CACHE_FILE_SUFFIXES = (".pyc", ".pyo")
+IGNORED_WALK_MAX = 20000            # entries walked per assessment; past it the content is unknown, so it holds
+HELD_PATHS_MAX = 20                 # paths recorded as `held_paths` (names only); the reason names the first few
+# settle() reassesses a worktree held only for leftover files after these pauses (seconds): the child's process group
+# is already stopped, but a process that left the group (setsid, nohup) may still be removing its temp file. A
+# reassessment can only turn "held" into "archived" when it proves everything published again; ~7 s in total.
+SETTLE_RECHECK_DELAYS_S = (2.0, 5.0)
 
 
 class WorkspaceError(Exception):
@@ -100,7 +114,9 @@ class GitTimeoutError(WorkspaceError):
 
 # Every fetch runs with automatic gc and maintenance off, whatever the clone's config says (belt and braces next to
 # protect_clone): a fetch ends with `git maintenance run --auto`, whose gc prunes duplicate worktree entries (#93).
-_FETCH_NO_GC = ("-c", "gc.auto=0", "-c", "maintenance.auto=false")
+# And with hooks off: a fetch runs the reference-transaction hook, and a hook that writes a file into the worktree
+# being assessed (pushed() fetches from inside it) would make a clean, pushed worktree look dirty and hold it.
+_FETCH_NO_GC = ("-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "core.hooksPath=/dev/null")
 
 
 def _git(args, cwd=None, timeout=GIT_TIMEOUT_S) -> str:
@@ -440,8 +456,9 @@ def _free_archived_branch(path: str, branch: str, repo_dir: str, root: str):
             flagged = _git(["ls-files", "-v"], cwd=path)
             if any(line and (line[0].islower() or line[0] == "S") for line in flagged.splitlines()):
                 return "it has files hidden by assume-unchanged or skip-worktree"
-            if _git(["status", "--porcelain", "--untracked-files=all", "--ignored=matching"], cwd=path).strip():
-                return "it has uncommitted, untracked or ignored files"
+            left = _leftovers(path)
+            if left:
+                return f"it has {_held_reason(left)}"
         except WorkspaceError as exc:
             return f"could not assess it: {exc}"
         if not (_same_entry(layout_fd, layout) and _same_entry(entry_fd, path)):
@@ -453,8 +470,111 @@ def _free_archived_branch(path: str, branch: str, repo_dir: str, root: str):
         os.close(layout_fd)
 
 
+def _is_cache_path(rel: str) -> bool:
+    parts = rel.strip("/").split("/")
+    return any(p in CACHE_DIR_NAMES for p in parts) or parts[-1].endswith(CACHE_FILE_SUFFIXES)
+
+
+def _ignored_blocker(top: str, rel: str):
+    """None when the ignored entry `rel` (a file, or a directory as `git status` names it: "dir/") holds nothing but
+    regenerable caches or empty directories; else the first path inside it that is owner data. A nested .git always
+    blocks (it may hold unpushed commits), and so does anything that cannot be walked."""
+    full = os.path.join(top, rel.rstrip("/"))
+    try:
+        info = os.lstat(full)
+    except FileNotFoundError:
+        return None                                  # already gone: nothing left to lose
+    except OSError as exc:
+        return f"{rel} (cannot be read: {type(exc).__name__})"
+    if not stat.S_ISDIR(info.st_mode):
+        return None if _is_cache_path(rel) else rel
+    errors, seen = [], 0
+    for directory, dirs, files in os.walk(full, followlinks=False, onerror=errors.append):
+        base = os.path.relpath(directory, top)
+        if ".git" in dirs or ".git" in files:
+            return os.path.join(base, ".git")
+        real_dirs = []
+        for name in dirs:                            # a symlink to a directory is listed here and never followed
+            (files if os.path.islink(os.path.join(directory, name)) else real_dirs).append(name)
+        dirs[:] = real_dirs
+        seen += len(dirs) + len(files)
+        if seen > IGNORED_WALK_MAX:
+            return f"{rel} (more than {IGNORED_WALK_MAX} entries; not assessed)"
+        for name in files:
+            if not _is_cache_path(os.path.join(base, name)):
+                return os.path.join(base, name)
+    if errors:
+        return f"{rel} (cannot be walked: {type(errors[0]).__name__})"
+    return None
+
+
+def _leftovers(path: str, deadline=None) -> list:
+    """Working-tree paths that keep `path` from being proven published: every tracked change and every untracked file
+    git does not ignore (named by `git status`), and, for ignored content, whatever _ignored_blocker finds that is not
+    a regenerable cache or an empty directory. Paths only, relative to the worktree, in git's order."""
+    out = _git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"], cwd=path,
+               timeout=_within(deadline, GIT_TIMEOUT_S))
+    tokens = out.split("\0")
+    blocking, i = [], 0
+    while i < len(tokens):
+        entry = tokens[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        xy, rel = entry[:2], entry[3:]
+        if xy[0] in "RC":
+            i += 1                                   # -z: a rename's or copy's source path follows as its own token
+        if xy == "!!":
+            why = _ignored_blocker(path, rel)
+            if why is not None:
+                blocking.append(why)
+        else:
+            blocking.append(rel)
+    return blocking
+
+
+def _held_reason(paths: list) -> str:
+    shown = ", ".join(paths[:5]) + (f" (+{len(paths) - 5} more)" if len(paths) > 5 else "")
+    return f"{len(paths)} uncommitted or untracked file(s) (ignored ones included, regenerable caches not): {shown}"
+
+
+def assess(path: str, deadline=None):
+    """(ok, reason, paths): pushed()'s answer plus, when the worktree is held for files in it, the paths that held it
+    (at most HELD_PATHS_MAX; [] otherwise), so a hold can be diagnosed after the files are gone."""
+    try:
+        remotes = _git(["remote"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S)).split()
+        if not remotes:
+            return False, "could not assess the worktree: it has no remote", []
+        for remote in remotes:
+            # An explicit all-heads refspec also prunes stale refs excluded by a locally narrowed fetch refspec.
+            _git(["fetch", "--prune", remote,
+                  f"+refs/heads/*:refs/remotes/{remote}/*"], cwd=path, timeout=_within(deadline, FETCH_TIMEOUT_S))
+        submodules = _git(["ls-files", "--stage"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
+        if any(line.startswith("160000 ") for line in submodules.splitlines()):
+            return False, "submodule content cannot be proven published; holding the workspace", []
+        flagged = _git(["ls-files", "-v"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
+        hidden = [line for line in flagged.splitlines() if line and (line[0].islower() or line[0] == "S")]
+        if hidden:
+            return (False, f"{len(hidden)} tracked file(s) hidden by assume-unchanged or skip-worktree",
+                    [line[2:] for line in hidden[:HELD_PATHS_MAX]])
+        # Ignored content is owner data too, except regenerable caches and empty directories (CACHE_DIR_NAMES):
+        # everything archived is deleted after ARCHIVE_AGE_S, so only what a rerun rebuilds may go unpublished.
+        paths = _leftovers(path, deadline)
+        if paths:
+            return False, _held_reason(paths), paths[:HELD_PATHS_MAX]
+        ahead = _git(["rev-list", "HEAD", "--not", "--remotes"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
+        if ahead.strip():
+            return False, f"{len(ahead.split())} commit(s) not on any remote", []
+    except GitTimeoutError as exc:
+        return None, f"could not assess the worktree in time: {exc}", []
+    except WorkspaceError as exc:
+        return False, f"could not assess the worktree: {exc}", []
+    return True, "pushed", []
+
+
 def pushed(path: str, deadline=None):
-    """(True, "pushed") only after fresh remote refs prove every byte and commit is published.
+    """(True, "pushed") only after fresh remote refs prove every byte and commit is published (assess() without the
+    paths).
 
     (False, reason): not proven published; any git or fetch failure is uncertainty too, so the caller holds the
     workspace rather than risking owner data. (None, reason): the assessment did not finish (a git call timed out, or
@@ -462,46 +582,21 @@ def pushed(path: str, deadline=None):
     would otherwise move or delete must leave the workspace exactly as it is. `None` is falsy on purpose: a caller
     that only asks "proven pushed?" (settle) holds, which is the conservative answer.
     """
-    try:
-        remotes = _git(["remote"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S)).split()
-        if not remotes:
-            return False, "could not assess the worktree: it has no remote"
-        for remote in remotes:
-            # An explicit all-heads refspec also prunes stale refs excluded by a locally narrowed fetch refspec.
-            _git(["fetch", "--prune", remote,
-                  f"+refs/heads/*:refs/remotes/{remote}/*"], cwd=path, timeout=_within(deadline, FETCH_TIMEOUT_S))
-        submodules = _git(["ls-files", "--stage"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
-        if any(line.startswith("160000 ") for line in submodules.splitlines()):
-            return False, "submodule content cannot be proven published; holding the workspace"
-        # Ignored content is owner data too. No cache (including __pycache__ or node_modules) is exempt: generated and
-        # unpublished content cannot be distinguished safely here, and holding is the required conservative default.
-        flagged = _git(["ls-files", "-v"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
-        hidden = [line for line in flagged.splitlines() if line and (line[0].islower() or line[0] == "S")]
-        if hidden:
-            return False, f"{len(hidden)} tracked file(s) hidden by assume-unchanged or skip-worktree"
-        dirty = _git(["status", "--porcelain", "--untracked-files=all", "--ignored=matching"], cwd=path,
-                     timeout=_within(deadline, GIT_TIMEOUT_S))
-        if dirty.strip():
-            n = len(dirty.splitlines())
-            return False, f"{n} uncommitted or untracked file(s), including ignored content"
-        ahead = _git(["rev-list", "HEAD", "--not", "--remotes"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
-        if ahead.strip():
-            return False, f"{len(ahead.split())} commit(s) not on any remote"
-    except GitTimeoutError as exc:
-        return None, f"could not assess the worktree in time: {exc}"
-    except WorkspaceError as exc:
-        return False, f"could not assess the worktree: {exc}"
-    return True, "pushed"
+    ok, reason, _ = assess(path, deadline)
+    return ok, reason
 
 
-def settle(rec: dict, root: str, lock_wait=SETTLE_LOCK_WAIT_S) -> dict:
+def settle(rec: dict, root: str, lock_wait=SETTLE_LOCK_WAIT_S, recheck_delays=SETTLE_RECHECK_DELAYS_S) -> dict:
     """Move a finished task's folder out of active/: to archive/ when it is pushed or had no repository, else to
     held/. Returns the updated record (state archived|held, or still active with `error` if the move failed, in which
     case the folder stays where it is and nothing is deleted).
 
     The move runs under cleanup.lock (waited for at most `lock_wait` seconds; see the lock order in the module
     docstring), so a cleanup never acts on a registry it listed before the move. When the lock stays busy the folder
-    stays in active/ and the record says `settle_deferred`: the next cleanup run settles it (cleanup_archive)."""
+    stays in active/ and the record says `settle_deferred`: the next cleanup run settles it (cleanup_archive).
+
+    A worktree held only for files in it is reassessed after each of `recheck_delays` (a straggler's temp file must not
+    decide the outcome); the record keeps the paths that held it (`held_paths`) and how many reassessments ran."""
     rec = dict(rec)
     path = rec.get("path")
     if rec.get("state") != "active" or not path:
@@ -515,7 +610,19 @@ def settle(rec: dict, root: str, lock_wait=SETTLE_LOCK_WAIT_S) -> dict:
         except WorkspaceError as exc:
             rec.update(error=f"not settled: {exc}", settle_deferred=True)
             return rec
-        ok, reason = pushed(path)
+        ok, reason, paths = assess(path)
+        rechecks = 0
+        for delay in recheck_delays:
+            if ok or not paths:                      # only leftover files can go away; commits and errors do not
+                break
+            time.sleep(delay)
+            rechecks += 1
+            ok, reason, paths = assess(path)
+        rec.pop("held_paths", None)
+        if paths:
+            rec["held_paths"] = paths
+        if rechecks:
+            rec["settle_rechecks"] = rechecks
     else:
         ok = not _contains_git_entry(path)
         reason = "no repository" if ok else "plain folder contains a nested .git entry"
@@ -1197,7 +1304,7 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
                     out["kept"] += 1
                     continue
                 if rec.get("kind") == "repo":
-                    ok, reason = pushed(path, deadline=deadline)
+                    ok, reason, paths = assess(path, deadline=deadline)
                     if not _same_entry(entry_fd, path):
                         raise WorkspaceError("archive path changed during reassessment; refusing deletion")
                     if ok is None:
@@ -1207,7 +1314,8 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
                         out["kept"] += 1
                         continue
                     if not ok:
-                        _hold_changed_archive(root, archive_fd, name, rec, reason, now)
+                        _hold_changed_archive(root, archive_fd, name, {**rec, "held_paths": paths} if paths else rec,
+                                              reason, now)
                         out["kept"] += 1
                         continue
                     if not isinstance(rec.get("repo_dir"), str):

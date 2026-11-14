@@ -1686,7 +1686,7 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
         out.update(lane=meta["lane"], model=meta.get("model"))
     ws = _workspace_record(d, task_id)
     if isinstance(ws, dict):
-        out["workspace"] = {k: ws.get(k) for k in ("kind", "state", "path", "repo", "branch", "reason", "error") if ws.get(k) is not None}
+        out["workspace"] = {k: ws.get(k) for k in ("kind", "state", "path", "repo", "branch", "reason", "held_paths", "error") if ws.get(k) is not None}
     elif meta.get("workspace"):
         out["workspace"] = {**meta["workspace"], "state": "preparing" if state == "running" else "not created"}
     if state == "running" and os.path.exists(os.path.join(d, QUEUED_MARKER)):

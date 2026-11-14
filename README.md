@@ -520,7 +520,10 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   answers at once; a failed clone fails the task with the reason) and, when the child ends, moves the folder to
   `archive/` (every commit on a remote and nothing uncommitted or untracked, or no repository) or `held/` (anything
   else, or a worktree git cannot assess) with `git worktree move`, and records it in `<root>/index.jsonl` (one line per
-  task, rewritten under `index.lock`). A plain folder containing a `.git` entry at any depth is conservatively moved
+  task, rewritten under `index.lock`). Git-ignored files count as unpublished owner data, except regenerable caches
+  (`__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `*.pyc`) and empty ignored directories; a nested
+  `.git` always holds. A worktree held only for files is reassessed twice (after 2 s and 5 s) in case a straggling
+  process was still removing its temp file, and the record names the paths that held it (`held_paths`, at most 20). A plain folder containing a `.git` entry at any depth is conservatively moved
   to `held/` too (symlinks are never followed). An archived worktree has its HEAD detached at the same commit so its
   branch is free for the next task (`git update-ref --no-deref HEAD` with hooks disabled: no checkout, no file
   written; a failed detach is recorded as `detach_error` and loses nothing); a held one keeps its branch. An archive

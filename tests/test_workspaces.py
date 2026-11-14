@@ -30,6 +30,14 @@ class _Base(unittest.TestCase):
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        # The module's own git calls run with os.environ: no global or system git config may reach the fixture (a
+        # user's core.hooksPath or init.templateDir would run hooks that write files into the test worktrees). Hooks
+        # a test installs in the clone's .git/hooks still apply, which is what the no-hook tests rely on.
+        isolate = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        env = mock.patch.dict(os.environ, isolate)
+        env.start()
+        self.addCleanup(env.stop)
+        GIT_ENV.update(isolate)
         self.root = os.path.join(self.tmp, "CortadOS")
         os.mkdir(self.root)
         self.origin = os.path.join(self.tmp, "origin", "demo.git")
@@ -286,6 +294,152 @@ class SettleTests(_Base):
         self.assertEqual(ws.read_index(self.root)[TID]["state"], "archived")
         with self.assertRaises(ws.WorkspaceError):
             ws.update_index(self.root, {"state": "x"})
+
+
+class SettleLeftoverTests(_Base):
+    """2026-11-13: pushed worktrees were held for an empty ignored directory a test left behind, and the reason named no
+    path. Regenerable caches and empty ignored directories no longer hold; owner data still does, and the record says
+    which paths held it."""
+
+    def pushed_worktree(self, ignore=("__pycache__/", "*.pyc", ".pytest_cache/", "data/")):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        with open(os.path.join(rec["path"], ".gitignore"), "w") as f:
+            f.write("\n".join(ignore) + "\n")
+        git("add", ".gitignore", cwd=rec["path"])
+        git("commit", "-q", "-m", "ignore", cwd=rec["path"])
+        git("push", "-q", "origin", "feature", cwd=rec["path"])
+        return rec
+
+    def write(self, rec, rel, text="x"):
+        full = os.path.join(rec["path"], rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(text)
+        return full
+
+    def test_ignored_caches_and_empty_ignored_dirs_archive_and_detach(self):
+        rec = self.pushed_worktree()
+        self.write(rec, "pkg/__pycache__/m.cpython-39.pyc")
+        self.write(rec, ".pytest_cache/v/cache/lastfailed", "{}")
+        self.write(rec, "stray.pyc")
+        os.makedirs(os.path.join(rec["path"], "data", "outcome", "journals"))     # the 2026-11-13 leftover
+        self.assertEqual(ws.assess(rec["path"]), (True, "pushed", []))
+        settled = ws.settle(rec, self.root, recheck_delays=())
+        self.assertEqual((settled["state"], settled["reason"]), ("archived", "pushed"), settled)
+        self.assertTrue(settled.get("detached"), settled)
+        self.assertNotIn("held_paths", settled)
+        git("rev-parse", "--verify", "HEAD", cwd=settled["path"])
+        self.assertNotEqual(subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=settled["path"],
+                                           env=GIT_ENV).returncode, 0)                 # HEAD detached: branch free
+
+    def test_untracked_file_not_ignored_holds_and_names_the_path(self):
+        rec = self.pushed_worktree()
+        self.write(rec, "notes.txt")
+        settled = ws.settle(rec, self.root, recheck_delays=())
+        self.assertEqual(settled["state"], "held")
+        self.assertEqual(settled["held_paths"], ["notes.txt"])
+        self.assertIn("notes.txt", settled["reason"])
+        self.assertIn("uncommitted or untracked", settled["reason"])
+        self.assertEqual(ws.read_index(self.root).get(TID), None)          # settle() itself does not write the index
+        ws.update_index(self.root, settled)
+        self.assertEqual(ws.read_index(self.root)[TID]["held_paths"], ["notes.txt"])
+
+    def test_a_cache_name_that_git_does_not_ignore_still_holds(self):
+        rec = self.pushed_worktree(ignore=("data/",))
+        self.write(rec, "pkg/__pycache__/m.pyc")
+        settled = ws.settle(rec, self.root, recheck_delays=())
+        self.assertEqual(settled["state"], "held")
+        self.assertEqual(settled["held_paths"], ["pkg/__pycache__/m.pyc"])
+
+    def test_ignored_owner_data_holds(self):
+        rec = self.pushed_worktree()
+        self.write(rec, "data/outcome/train.jsonl", "{}\n")
+        self.write(rec, "data/__pycache__/x.pyc")
+        settled = ws.settle(rec, self.root, recheck_delays=())
+        self.assertEqual(settled["state"], "held")
+        self.assertEqual(settled["held_paths"], ["data/outcome/train.jsonl"])
+        self.assertTrue(os.path.exists(os.path.join(settled["path"], "data", "outcome", "train.jsonl")))
+
+    def test_nested_git_holds_inside_an_ignored_dir_and_inside_a_cache(self):
+        for nested in ("data/clone/.git/HEAD", "__pycache__/odd/.git"):
+            with self.subTest(nested=nested):
+                self.tearDown()
+                self.setUp()
+                rec = self.pushed_worktree()
+                self.write(rec, nested)
+                settled = ws.settle(rec, self.root, recheck_delays=())
+                self.assertEqual(settled["state"], "held")
+                self.assertEqual(len(settled["held_paths"]), 1)
+                self.assertTrue(settled["held_paths"][0].endswith(".git"), settled["held_paths"])
+
+    def test_untracked_nested_repository_holds(self):
+        rec = self.pushed_worktree()
+        sub = os.path.join(rec["path"], "sub")
+        git("init", "-q", sub)
+        self.write(rec, "sub/x.txt")
+        settled = ws.settle(rec, self.root, recheck_delays=())
+        self.assertEqual(settled["state"], "held")
+        self.assertEqual(settled["held_paths"], ["sub/"])
+
+    def test_unpushed_commit_holds_without_paths_and_without_rechecks(self):
+        rec = self.pushed_worktree()
+        self.write(rec, "local.txt")
+        git("add", ".", cwd=rec["path"])
+        git("commit", "-q", "-m", "local only", cwd=rec["path"])
+        with mock.patch.object(ws.time, "sleep") as sleep:
+            settled = ws.settle(rec, self.root)
+        sleep.assert_not_called()
+        self.assertEqual(settled["state"], "held")
+        self.assertIn("not on any remote", settled["reason"])
+        self.assertNotIn("held_paths", settled)
+
+    def test_a_stragglers_temp_file_does_not_decide_the_outcome(self):
+        rec = self.pushed_worktree()
+        tmp = self.write(rec, "suite.log")
+        sleeps = []
+
+        def sleep(s):                       # the straggler finishes and removes its file during the first pause
+            sleeps.append(s)
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        with mock.patch.object(ws.time, "sleep", sleep):
+            settled = ws.settle(rec, self.root, recheck_delays=(2.0, 5.0))
+        self.assertEqual(sleeps, [2.0])
+        self.assertEqual(settled["state"], "archived", settled)
+        self.assertEqual(settled["settle_rechecks"], 1)
+        self.assertNotIn("held_paths", settled)
+
+    def test_a_file_that_stays_holds_after_every_recheck(self):
+        rec = self.pushed_worktree()
+        self.write(rec, "keep.txt")
+        with mock.patch.object(ws.time, "sleep") as sleep:
+            settled = ws.settle(rec, self.root, recheck_delays=(2.0, 5.0))
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [2.0, 5.0])
+        self.assertEqual((settled["state"], settled["held_paths"], settled["settle_rechecks"]),
+                         ("held", ["keep.txt"], 2))
+
+    def test_held_paths_are_bounded(self):
+        rec = self.pushed_worktree()
+        for i in range(ws.HELD_PATHS_MAX + 7):
+            self.write(rec, f"many/f{i:03d}.txt")
+        ok, reason, paths = ws.assess(rec["path"])
+        self.assertFalse(ok)
+        self.assertEqual(len(paths), ws.HELD_PATHS_MAX)
+        self.assertTrue(reason.startswith(f"{ws.HELD_PATHS_MAX + 7} uncommitted or untracked"), reason)
+        self.assertIn("(+", reason)
+
+    def test_a_reference_transaction_hook_does_not_dirty_the_assessed_worktree(self):
+        rec = self.pushed_worktree()
+        hook = os.path.join(rec["repo_dir"], ".git", "hooks", "reference-transaction")
+        os.makedirs(os.path.dirname(hook), exist_ok=True)
+        with open(hook, "w") as f:
+            f.write('#!/bin/sh\necho ran > "$(git rev-parse --show-toplevel)/hook.txt"\n')
+        os.chmod(hook, 0o755)
+        git("push", "-q", "origin", "HEAD:refs/heads/other", cwd=rec["path"])    # so the fetch has a ref to update
+        git("update-ref", "-d", "refs/remotes/origin/other", cwd=rec["path"])    # (the push's own hook run wrote one)
+        os.remove(os.path.join(rec["path"], "hook.txt"))
+        self.assertEqual(ws.assess(rec["path"]), (True, "pushed", []))
+        self.assertFalse(os.path.exists(os.path.join(rec["path"], "hook.txt")))
 
 
 class BranchReleaseTests(_Base):
@@ -777,17 +931,17 @@ class CleanupTests(_Base):
         return path, git("rev-parse", "HEAD", cwd=path).strip()
 
     def exhaust_budget_after_reassessment(self, budget):
-        """Patches for one cleanup run: time.monotonic jumps past `budget` the moment pushed() returns, so the entry it
+        """Patches for one cleanup run: time.monotonic jumps past `budget` the moment assess() returns, so the entry it
         assessed is handled with no budget left (the reviewer's reproduction of the held-worktree data loss)."""
-        real_monotonic, real_pushed, offset = time.monotonic, ws.pushed, [0.0]
+        real_monotonic, real_assess, offset = time.monotonic, ws.assess, [0.0]
 
         def pushed_then_exhaust(path, deadline=None):
-            result = real_pushed(path, deadline=deadline)
+            result = real_assess(path, deadline=deadline)
             offset[0] = budget + 1
             return result
 
         return (mock.patch.object(ws.time, "monotonic", side_effect=lambda: real_monotonic() + offset[0]),
-                mock.patch.object(ws, "pushed", side_effect=pushed_then_exhaust))
+                mock.patch.object(ws, "assess", side_effect=pushed_then_exhaust))
 
     def assert_valid_held_worktree(self, held, sha, repo_dir):
         """held is a working worktree of repo_dir at sha, and sha survives an aggressive gc of the clone."""
@@ -1291,7 +1445,8 @@ class RegistryOwnershipTests(_Base):
             fetches = [line for line in f.read().splitlines() if " fetch " in f" {line} "]
         self.assertTrue(fetches)
         for line in fetches:
-            self.assertTrue(line.startswith("-c gc.auto=0 -c maintenance.auto=false fetch"), line)
+            self.assertTrue(line.startswith("-c gc.auto=0 -c maintenance.auto=false -c core.hooksPath=/dev/null fetch"),
+                            line)
         for key, value in (("gc.auto", "0"), ("gc.autoDetach", "false"), ("maintenance.auto", "false"),
                            ("gc.worktreePruneExpire", "never")):
             self.assertEqual(git("config", "--local", "--get", key, cwd=repo_dir).strip(), value)
