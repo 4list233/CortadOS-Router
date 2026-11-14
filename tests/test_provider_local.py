@@ -47,9 +47,11 @@ class FakeOllama(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    reply = None                # (content, stop_reason): answered as is, before every other rule
     thinker = None              # "ollama" / "ignores-disabled": answer as a thinking model does (#108)
     mode = "ok"                 # "truncated" / "stalled": a broken error body (review round 2, item 4)
     error_body = None           # bytes: answer every POST with this 400 body
+    json_deltas = False         # stream a tool_use's input as input_json_delta fragments (as Anthropic and Ollama may)
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
@@ -81,7 +83,9 @@ class FakeOllama(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(raw)
             return
-        if body.get("tools"):
+        if FakeOllama.reply is not None:                # a test-set (content, stop_reason), e.g. an empty answer
+            content, stop = FakeOllama.reply
+        elif body.get("tools"):
             content = [{"type": "tool_use", "id": f"toolu_{uuid.uuid4().hex[:8]}", "name": body["tools"][0]["name"],
                         "input": {"path": "x"}}]
             stop = "tool_use"
@@ -126,14 +130,23 @@ class FakeOllama(BaseHTTPRequestHandler):
                 events += [{"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}}]
                 events += [{"type": "content_block_delta", "index": i, "delta": {"type": "text_delta", "text": w}}
                            for w in ((b["text"],) if FakeOllama.thinker else ("hello ", "from ", "qwen"))]
+            elif b["type"] == "tool_use" and FakeOllama.json_deltas:
+                raw_input = json.dumps(b["input"])
+                events += [{"type": "content_block_start", "index": i, "content_block": {**b, "input": {}}}]
+                events += [{"type": "content_block_delta", "index": i,
+                            "delta": {"type": "input_json_delta", "partial_json": part}}
+                           for part in (raw_input[:len(raw_input) // 2], raw_input[len(raw_input) // 2:])]
             else:
                 events += [{"type": "content_block_start", "index": i, "content_block": b}]
             events += [{"type": "content_block_stop", "index": i}]
         events += [{"type": "message_delta", "delta": {"stop_reason": stop}, "usage": {"output_tokens": 3}},
                    {"type": "message_stop"}]
         for ev in events:
-            self.wfile.write(f"event: {ev['type']}\ndata: {json.dumps(ev)}\n\n".encode())
-            self.wfile.flush()
+            try:
+                self.wfile.write(f"event: {ev['type']}\ndata: {json.dumps(ev)}\n\n".encode())
+                self.wfile.flush()
+            except OSError:                             # the relay stopped reading (an effect-boundary block)
+                return
 
 
 def write_config(directory, base_url, auto_route=False, token_file=None, thinking=None):
@@ -157,6 +170,8 @@ class LocalHarness(EndpointHarness):
         threading.Thread(target=self.ollama.serve_forever, daemon=True).start()
         FakeOllama.seen = []
         FakeOllama.thinker = None
+        FakeOllama.reply = None
+        FakeOllama.json_deltas = False
         self._env = os.environ.get(local_lane.CONFIG_ENV)
         os.environ[local_lane.CONFIG_ENV] = write_config(self.scratch, f"http://127.0.0.1:{self.ollama.server_port}")
         self._keep = (core.STATE, core.lane_health, core.decide)

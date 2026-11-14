@@ -806,6 +806,17 @@ class BridgeCredentialTests(EndpointHarness):
         dash.assert_not_called()          # a request carrying a token is never judged on a cookie
         s.wait_result.assert_not_called()
 
+    def test_bridge_token_is_refused_on_the_boundary_check(self):
+        # Merged from local-sensitive (#109): POST /v1/cortados/boundary/check is owner token only; a session's
+        # bridge-only credential gets 401 before the body is read and the provider's record is never consulted.
+        from cortados_router.provider import effect_boundary
+        s, _ = self.session()
+        with mock.patch.object(effect_boundary, "check_answer", wraps=effect_boundary.check_answer) as check:
+            self.assertEqual(self.call(s.bridge_token, s.id, path=server.BOUNDARY_CHECK_PATH)[0], 401)
+            self.assertEqual(self.call(TOKEN, s.id, path=server.BOUNDARY_CHECK_PATH)[0], 200)   # the owner token is answered
+        self.assertEqual(check.call_count, 1)
+        s.wait_result.assert_not_called()
+
     def test_bridge_token_is_revoked_when_the_session_is_retired_or_closed(self):
         s, _ = self.session()
         token = s.bridge_token

@@ -41,9 +41,9 @@ class SessionTests(unittest.TestCase):
         return rc, out.getvalue(), err.getvalue()
 
     def test_custom_headers(self):
-        self.assertEqual(session.custom_headers(None), "x-cortados-reveal: 1")
+        self.assertEqual(session.custom_headers(None), "x-cortados-reveal: 1\nx-cortados-boundary-hook: 1")
         self.assertEqual(session.custom_headers("t20261102000000-0000abcd"),
-                         "x-cortados-reveal: 1\nx-cortados-run-id: t20261102000000-0000abcd")
+                         "x-cortados-reveal: 1\nx-cortados-boundary-hook: 1\nx-cortados-run-id: t20261102000000-0000abcd")
 
     def test_invalid_run_id_refused(self):
         for bad in ("short", "has space in it", "x" * 65, "bad\nnewline-id"):
@@ -75,9 +75,25 @@ class SessionTests(unittest.TestCase):
                     data = json.load(src)
                 self.assertEqual(data["env"]["CORTADOS_DELEGATE_BUDGET"], str(budget))
                 self.assertEqual(env["CORTADOS_DELEGATE_BUDGET"], str(budget))
-                self.assertEqual("hooks" in data, enabled)
+                # The boundary hook is always first, with or without the gate (docs/BOUNDARY-HOOK.md), and hooks
+                # cannot be switched off by a user settings file while the boundary header promises the hook.
+                self.assertIs(data["disableAllHooks"], False)
+                pre = data["hooks"]["PreToolUse"]
+                self.assertEqual(pre[0]["matcher"], "Write|Edit|MultiEdit|NotebookEdit|Bash")
+                # Isolated (docs/BOUNDARY-HOOK.md "Isolation"): inside the shell guard, from /, an absolute
+                # interpreter, python -I -S.
+                full = pre[0]["hooks"][0]["command"]
+                head, tail = session.BOUNDARY_HOOK_GUARD_HEAD, session.BOUNDARY_HOOK_GUARD_TAIL
+                self.assertTrue(full.startswith(head) and full.endswith(tail), full)
+                self.assertTrue(head.endswith("(cd / && exec "))
+                bcmd = shlex.split(full[len(head):-len(tail)])
+                self.assertTrue(os.path.isabs(bcmd[0]) and os.path.isfile(bcmd[0]), bcmd)
+                self.assertEqual(bcmd[1:4], ["-I", "-S", "-B"])
+                self.assertEqual(Path(bcmd[4]), Path(session.__file__).resolve().with_name("boundary_hook.py"))
+                self.assertIn("x-cortados-boundary-hook: 1", data["env"]["ANTHROPIC_CUSTOM_HEADERS"].split("\n"))
+                self.assertEqual(len(pre), 2 if enabled else 1)
                 if enabled:
-                    hook = data["hooks"]["PreToolUse"][0]
+                    hook = pre[1]
                     self.assertEqual(hook["matcher"], "*")
                     self.assertEqual(hook["hooks"][0]["type"], "command")
                     command = shlex.split(hook["hooks"][0]["command"])
@@ -85,6 +101,38 @@ class SessionTests(unittest.TestCase):
                     self.assertEqual(Path(command[2]), Path(session.__file__).resolve().with_name("orchestrator_gate.py"))
         with self.assertRaises(session.SessionError):
             self.prepare(["--delegate-budget", "-1"])
+
+    def test_boundary_hook_interpreter_is_absolute_and_outside_the_project(self):
+        import sys
+        real = os.path.realpath(sys.executable)
+        self.assertEqual(session.boundary_hook_python(), real)
+        self.assertEqual(session.boundary_hook_python(self.tmp.name), real)
+        # The launcher's interpreter inside the project: the next absolute candidate, never a PATH lookup.
+        proj = os.path.join(self.tmp.name, "proj")
+        os.makedirs(os.path.join(proj, "bin"))
+        planted = os.path.join(proj, "bin", "python3")
+        with open(planted, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(planted, 0o755)
+        self.assertEqual(session.boundary_hook_python(proj, [planted, real]), real)
+        link = os.path.join(self.tmp.name, "py-link")
+        os.symlink(planted, link)                                # a link outside to a binary inside: refused
+        self.assertEqual(session.boundary_hook_python(proj, [link, real]), real)
+        for bad in ([planted], [link], ["python3"], [os.path.join(self.tmp.name, "missing")], []):
+            with self.subTest(candidates=bad), self.assertRaises(session.SessionError):
+                session.boundary_hook_python(proj, bad)
+
+    def test_boundary_hook_inside_the_project_is_refused(self):
+        from pathlib import Path
+        checkout = str(Path(session.__file__).resolve().parents[1])
+        with self.assertRaises(session.SessionError):
+            session.boundary_hook_entry(checkout)
+        with self.assertRaises(session.SessionError):        # child tasks pass --project-dir
+            self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok, "--project-dir", checkout])
+        _, _, cmd = self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok,
+                                  "--project-dir", self.tmp.name])
+        with open(cmd[cmd.index("--settings") + 1]) as src:
+            self.assertIn(" -I -S -B ", json.load(src)["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
 
     def test_model_mapping(self):
         self.assertEqual(session.resolve_model("fable"), "sub/claude-fable-5-1")
@@ -356,7 +404,8 @@ class OfficeHeaderTests(unittest.TestCase):
     def test_office_headers_are_allowlisted_and_cannot_inject_lines(self):
         from cortados_router import session as sess
         h = sess.custom_headers("run-12345678", ["x-cortados-task-title: fix it", "X-Cortados-Session: 3f9a1c2e9b7d4a10"])
-        self.assertEqual(h.split("\n"), ["x-cortados-reveal: 1", "x-cortados-run-id: run-12345678",
+        self.assertEqual(h.split("\n"), ["x-cortados-reveal: 1", "x-cortados-boundary-hook: 1",
+                                         "x-cortados-run-id: run-12345678",
                                          "x-cortados-task-title: fix it", "x-cortados-session: 3f9a1c2e9b7d4a10"])
         for bad in ("x-api-key: steal", "x-cortados-task-title: a\nx-api-key: steal", "x-cortados-project:",
                     "x-cortados-device", "x-cortados-task-title: " + "x" * 81):

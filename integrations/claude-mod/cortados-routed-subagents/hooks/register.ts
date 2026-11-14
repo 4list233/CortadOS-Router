@@ -45,6 +45,7 @@ type Cfg = {
   permissionMode: string
   allowedTools: string
   claudeBin: string
+  hookPython: string
   routeBackground: boolean
   orchestratorMode: boolean
   orchestratorEnforce: boolean
@@ -67,6 +68,10 @@ const FALLBACK: Cfg = {
   permissionMode: 'bypassPermissions',
   allowedTools: 'Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit',
   claudeBin: 'claude',
+  // The interpreter the boundary hook runs on in each routed child (docs/BOUNDARY-HOOK.md "Isolation"): an ABSOLUTE
+  // path, never a PATH lookup (a project's bin/, venv or node_modules/.bin may come first on PATH and plant python3).
+  // One inside the session's project folder is refused.
+  hookPython: '/usr/bin/python3',
   // Owner decision 2026-11-04: every subagent goes through S1, background ones included. They run detached under
   // their own, longer limit (backgroundTimeoutMs), so the foreground 10-minute cap no longer argues for native.
   routeBackground: true,
@@ -767,6 +772,318 @@ export function resolveBackgroundTimeoutMs(v: unknown): number {
 // useful results. FIFO readers enforce it during execution, without imposing ulimit -f on the child's file tools.
 export const BG_CAPTURE_BYTES = 1024 * 1024
 const shQuote = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'"
+
+// ---------------------------------------------------------------------------------------- client boundary hook
+// docs/BOUNDARY-HOOK.md. When the provider routes a routed child's turn automatically to a LOCAL model, its effect
+// boundary limits the tool calls; they run HERE, so a symlink only this machine has is invisible to the provider. Every
+// routed child therefore runs the boundary hook (a PreToolUse command hook in its --settings) and says so with
+// BOUNDARY_HOOK_HEADER; without the header a sensitive local turn is read-only. The hook asks the provider about each
+// Write/Edit/MultiEdit/NotebookEdit/Bash call's tool_use id, resolves the target with realpath on THIS machine, denies
+// a write outside the real project folder (and Bash on a sensitive profile), passes calls the provider does not know,
+// and fails closed for a provider-marked call on any error.
+export const BOUNDARY_HOOK_HEADER = 'x-cortados-boundary-hook: 1'
+export const BOUNDARY_HOOK_MATCHER = 'Write|Edit|MultiEdit|NotebookEdit|Bash'
+/** Set in every routed child's env: this mod stays inert there (it never routes or gates from inside a routed child). */
+export const ROUTED_CHILD_ENV = 'CORTADOS_ROUTED_SUBAGENT'
+/** Whether this process is a routed child (ROUTED_CHILD_ENV set), where this mod stays inert. Never throws: a failed
+ * read is "not a routed child" (the parent session's behaviour). */
+export async function isRoutedChild($: any): Promise<boolean> {
+  try { return Boolean(String((await $.env.get('CORTADOS_ROUTED_SUBAGENT')) ?? '').trim()) } catch { return false }
+}
+/** This mod's and the pane's plugin ids: disabled in the child's flag settings (its user settings are not loaded). */
+export const CHILD_DISABLED_PLUGINS = ['cortados-routed-subagents@cortados-router', 'cortados-pulse@cortados-router']
+export const HOOK_PYTHON_DEFAULT = '/usr/bin/python3'
+/** The shell guard around the hook's interpreter: cortados_router/session.py BOUNDARY_HOOK_GUARD_HEAD/TAIL, verbatim
+ * (tests/test_boundary_hook.py keeps them equal). It buffers the event, runs the interpreter in a subshell from /,
+ * passes exits 0 and 2 through and, when the interpreter cannot start or fails otherwise (126, 127, a broken
+ * /usr/bin/python3 shim, a crash), denies a call whose tool_use_id starts with toolu_cxb_ and allows any other. Claude
+ * Code treats every hook exit but 2 as non-blocking, so without it a missing interpreter would fail open. */
+export const BOUNDARY_HOOK_GUARD_HEAD = String.raw`ev=$(/bin/cat) || { printf 'cortados boundary: denied: the hook could not read its input. Nothing was run.\n' >&2; exit 2; }; printf '%s\n' "$ev" | (cd / && exec `
+export const BOUNDARY_HOOK_GUARD_TAIL = String.raw`); rc=$?; [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 2 ] && exit 2; f=$(printf '%s' "$ev" | /usr/bin/tr '\n\r\t' '   '); id=; printf '%s\n' "$f" | /usr/bin/grep -q '"tool_use_id"[[:space:]]*:.*"tool_use_id"[[:space:]]*:'; if [ "$?" -eq 1 ]; then id=$(printf '%s\n' "$f" | /usr/bin/sed -n 's/^.*"tool_use_id"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9_-]\{1,\}\)".*$/\1/p'); fi; case $id in toolu_cxb_*) m=1;; ?*) m=0;; *) case $ev in *'"toolu_cxb_'*) m=1;; *) m=0;; esac;; esac; if [ "$m" = 1 ]; then printf 'cortados boundary: denied: the hook did not run (exit %s), and a provider-marked call fails closed. Nothing was run.\n' "$rc" >&2; exit 2; fi; exit 0`
+/** The boundary hook's command (docs/BOUNDARY-HOOK.md "Isolation"): from / (the hook runs with the project, which the
+ * model may write, as its working directory), on an absolute interpreter (no PATH lookup), in isolated mode (-I: neither
+ * the working directory nor a script folder on sys.path, no PYTHON* variables, no user site-packages), without the
+ * site import (-S: no site-packages .pth can run project code first), the source inline (-c: no hook file on disk the
+ * model could reach), inside the shell guard (fails closed for a marked call when the interpreter cannot run). */
+export function boundaryHookCommand(python: string = HOOK_PYTHON_DEFAULT): string {
+  return BOUNDARY_HOOK_GUARD_HEAD + shQuote(python) + ' -I -S -B -c ' + shQuote(BOUNDARY_HOOK_PY) + BOUNDARY_HOOK_GUARD_TAIL
+}
+/** path is folder itself or lies below it (both absolute). */
+function pathWithin(path: string, folder: string): boolean {
+  const f = folder.replace(/\/+$/, '')
+  return path === f || f === '' || path.startsWith(f + '/')
+}
+/** The real path of p, or undefined when the host cannot stat it. Never throws. */
+async function realPathOf($: any, p: string): Promise<string | undefined> {
+  try {
+    const st = await $.fs.stat(p, { resolve: true })
+    return typeof st?.realPath === 'string' ? st.realPath : undefined
+  } catch {
+    return undefined
+  }
+}
+/** The configured hookPython, checked: absolute, no `.`/`..` segment or control character, an existing file when the
+ * host can stat it, and neither it nor its real path inside the session's project folder (lexical or real). Throws the
+ * reason otherwise; the routed launch is then refused, never run with a PATH lookup. A host without fs.stat, or a stat
+ * that fails for another reason than a missing file, cannot check existence: the command's shell guard then denies the
+ * marked calls if the interpreter does not start (docs/BOUNDARY-HOOK.md "Isolation"). */
+export async function boundaryHookPython($: any, configured: unknown): Promise<string> {
+  const p = String(configured ?? '')
+  if (!p.startsWith('/') || /[\u0000-\u001f\u007f]/.test(p) || p.split('/').some(seg => seg === '.' || seg === '..')) {
+    throw new Error(`routed-subagents: hookPython must be an absolute path to python3 (got ${JSON.stringify(p)}); a PATH lookup could run a python3 the project planted`)
+  }
+  // A host without fs.stat throws a TypeError here, which is not a missing file: the shell guard covers that case.
+  let st: any = undefined
+  let missing = false
+  try { st = await $.fs.stat(p, { resolve: true }) } catch (err: any) {
+    missing = (err && err.code === 'ENOENT') || /ENOENT|no such file|not found|does not exist/i.test(String(err && err.message ? err.message : err))
+  }
+  if (missing || (st && typeof st.kind === 'string' && st.kind !== 'file')) {
+    throw new Error(`routed-subagents: hookPython ${p} does not exist or is not a file; set hookPython to an absolute python3`)
+  }
+  let root: unknown = null
+  try { root = await $.session.root() } catch { root = null }
+  if (typeof root === 'string' && root.startsWith('/')) {
+    const forms = [p, await realPathOf($, p)].filter((x): x is string => typeof x === 'string')
+    const roots = [root, await realPathOf($, root)].filter((x): x is string => typeof x === 'string')
+    if (forms.some(f => roots.some(r => pathWithin(f, r)))) {
+      throw new Error(`routed-subagents: hookPython ${p} lies inside the project folder, which the model may write`)
+    }
+  }
+  return p
+}
+/** The routed child's --settings: the boundary hook (boundaryHookCommand), hooks on (a stray disableAllHooks would
+ * switch the hook off while the header says it runs), and this mod off. Replaces { disableAllHooks: true }, which also
+ * switched the hook off. */
+export function routedChildSettings(python: string = HOOK_PYTHON_DEFAULT): Record<string, unknown> {
+  return {
+    disableAllHooks: false,
+    enabledPlugins: Object.fromEntries(CHILD_DISABLED_PLUGINS.map(id => [id, false])),
+    hooks: { PreToolUse: [{ matcher: BOUNDARY_HOOK_MATCHER, hooks: [{
+      type: 'command', command: boundaryHookCommand(python), timeout: 30 }] }] },
+  }
+}
+/** cortados_router/boundary_hook.py, verbatim (tests/test_boundary_hook.py keeps the two identical). */
+export const BOUNDARY_HOOK_PY = String.raw`#!/usr/bin/env python3
+"""CortadOS boundary hook: a Claude Code PreToolUse hook run on the CLIENT machine (docs/BOUNDARY-HOOK.md).
+
+When the CortadOS provider routes a turn automatically to a local model, its effect boundary limits what the model's
+tool calls may do (cortados_router/provider/effect_boundary.py). The tools run here, on the client, which is often not
+the provider's machine: a symlink that exists only here (/repo/escape -> /outside) is invisible to the provider. This
+hook closes that gap. For each Write, Edit, MultiEdit, NotebookEdit and Bash call it:
+
+  1. asks the provider about the call's tool_use id (POST <provider>/v1/cortados/boundary/check, the provider token,
+     metadata only: the id);
+  2. a call the provider does not know is not the boundary's: allowed unchanged (exit 0, no output);
+  3. a call the provider knows: Bash is denied on a profile without a shell (sensitive); a file write is resolved with
+     os.path.realpath HERE and denied unless it lies strictly inside the realpath of the project folder the provider
+     assumed, and off the protected paths the provider names;
+  4. fails CLOSED for a boundary call: an id starting with MARK_PREFIX (minted only by the provider's boundary) is
+     denied on any error (provider unreachable, a bad answer, an expired or unknown record, a crash of this script).
+
+A denial is exit 2 with the reason on stderr (Claude Code blocks the call and shows the reason to the model).
+
+Provider and token: CORTADOS_BOUNDARY_URL / CORTADOS_BOUNDARY_TOKEN when set, else the session's own ANTHROPIC_BASE_URL
+and ANTHROPIC_AUTH_TOKEN (or ANTHROPIC_API_KEY): the provider that served the turn. The token is never printed.
+
+Standalone and stdlib only: the routed-subagents mod embeds this file verbatim (hooks/register.ts BOUNDARY_HOOK_PY,
+kept identical by tests/test_boundary_hook.py), so it holds no backquote and no dollar-brace.
+
+Isolation (docs/BOUNDARY-HOOK.md "Isolation"): the model may write files into the project, and the hook runs with the
+project as its working directory. Every installer therefore runs it as "<absolute python3> -I -S -B ..." from /, inside
+a shell guard: an absolute interpreter (no PATH lookup), isolated mode (neither the working directory nor the script's
+folder on sys.path, no PYTHON* variables, no user site-packages), no site import (-S: no .pth file of the interpreter's
+site-packages, e.g. an editable install pointing at the project, can run a project sitecustomize first). The guard
+denies a provider-marked call when the interpreter cannot start or ends with anything but 0 or 2. Run as a program
+WITHOUT -I, it drops the first sys.path entry (the working directory or its own folder) before importing anything
+else and denies every provider-marked call; without -S it denies every provider-marked call too. And it denies a known
+call whose project folder holds its interpreter or its own file."""
+import sys
+
+if __name__ == "__main__" and not sys.flags.isolated:   # an install without -I: no project module may load below
+    del sys.path[0]                                      # '' (python -c) or this script's folder
+    sys.path[:] = [p for p in sys.path if p and p != "."]
+
+import json
+import os
+import urllib.error
+import urllib.request
+
+MARK_PREFIX = "toolu_cxb_"
+CHECK_PATH = "/v1/cortados/boundary/check"
+TIMEOUT_S = 5.0
+WRITE_KEYS = {"Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path"}
+HOOK_TOOLS = frozenset(WRITE_KEYS) | {"Bash"}
+MAX_ANSWER = 65536
+
+
+class Denied(Exception):
+    """The call must not run; the message is the reason (metadata only)."""
+
+
+def provider() -> tuple:
+    env = os.environ
+    url = (env.get("CORTADOS_BOUNDARY_URL") or env.get("ANTHROPIC_BASE_URL") or "").strip().rstrip("/")
+    token = (env.get("CORTADOS_BOUNDARY_TOKEN") or env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY")
+             or "").strip()
+    return url, token
+
+
+def ask(tool_use_id: str) -> dict:
+    """The provider's record of tool_use_id (check_answer's shape). Raises on any failure."""
+    url, token = provider()
+    if not url.startswith(("http://", "https://")) or not token:
+        raise RuntimeError("no provider URL or token in this session")
+    req = urllib.request.Request(url + CHECK_PATH, data=json.dumps({"tool_use_id": tool_use_id}).encode(),
+                                 method="POST", headers={"content-type": "application/json",
+                                                         "authorization": "Bearer " + token, "x-api-key": token})
+    with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
+        if resp.status != 200:
+            raise RuntimeError("the provider answered HTTP %d" % resp.status)
+        raw = resp.read(MAX_ANSWER + 1)
+    if len(raw) > MAX_ANSWER:
+        raise RuntimeError("the provider's answer is too large")
+    answer = json.loads(raw)
+    if not isinstance(answer, dict) or not isinstance(answer.get("known"), bool):
+        raise RuntimeError("the provider's answer is not a boundary record")
+    return answer
+
+
+def inside(path: str, folder: str):
+    """path's components strictly below folder (both absolute, normalised), or None."""
+    root = folder.rstrip("/") + "/"
+    return path[len(root):].split("/") if path.startswith(root) and len(path) > len(root) else None
+
+
+def protected(parts: list, rules: dict) -> bool:
+    """The provider's PROTECTED_PATHS rules (effect_boundary.protected_rules) on a path relative to the project."""
+    parts = [p.casefold() for p in parts]
+    if not parts or rules.get("root_dotfiles", True) and parts[0].startswith("."):
+        return True
+    if any(p in set(rules.get("components") or ()) for p in parts):
+        return True
+    pairs = {tuple(x) for x in rules.get("component_pairs") or () if isinstance(x, list) and len(x) == 2}
+    if any(pair in pairs for pair in zip(parts, parts[1:])):
+        return True
+    return parts[-1] in set(rules.get("names") or ()) or parts[-1] in set(rules.get("build_files") or ())
+
+
+def check_write(target, project, rules) -> None:
+    """Deny unless target, resolved on THIS machine, lies strictly inside the real project folder and off the
+    protected paths."""
+    if not isinstance(project, str) or not project.startswith("/"):
+        raise Denied("the provider names no project folder for this call")
+    if not isinstance(rules, dict):
+        raise Denied("the provider's answer has no path rules")
+    if not isinstance(target, str) or not target.strip() or "\x00" in target:
+        raise Denied("the call names no usable file path")
+    if target.startswith("~") or "$" in target:
+        raise Denied("a home or variable path is not resolved here")
+    full = target if target.startswith("/") else os.path.join(project, target)
+    real, real_project = os.path.realpath(full), os.path.realpath(project)
+    rel = inside(real, real_project)
+    if rel is None:
+        raise Denied("the file resolves outside the project folder on this machine (a symlink or ..)")
+    if protected(rel, rules):
+        raise Denied("the file resolves onto a protected path of the project on this machine")
+
+
+def within(path: str, folder: str) -> bool:
+    """path is folder itself or lies below it (both absolute, normalised)."""
+    return path == folder or inside(path, folder) is not None
+
+
+def own_paths() -> list:
+    """What this run loads code from: its interpreter and, run as a file, that file and its folder; each lexically and
+    with symlinks followed."""
+    found = []
+    for what, path in (("interpreter", sys.executable), ("hook file", globals().get("__file__"))):
+        if not path:
+            if what == "interpreter":
+                raise Denied("the hook cannot name its own interpreter")
+            continue
+        for p in {os.path.abspath(path), os.path.realpath(path)}:
+            found.append((what, p))
+            if what == "hook file":
+                found.append(("hook folder", os.path.dirname(p)))
+    return found
+
+
+def check_self(project) -> None:
+    """Deny when the project folder of this call holds the interpreter running this hook, this hook's file or its
+    folder: the model may write there, so the hook could be the model's own code."""
+    if not isinstance(project, str) or not project.startswith("/"):
+        return                                           # check_write denies a write without a project folder
+    roots = {os.path.normpath(project), os.path.realpath(project)}
+    for what, path in own_paths():
+        if any(within(path, root) for root in roots):
+            raise Denied("the boundary hook's %s lies inside the project folder, which the model may write" % what)
+
+
+def decide(event: dict) -> None:
+    """Raise Denied when the call must not run; return when it may."""
+    tool = event.get("tool_name")
+    if tool not in HOOK_TOOLS:
+        return
+    tid = event.get("tool_use_id")
+    marked = isinstance(tid, str) and tid.startswith(MARK_PREFIX)
+    if not isinstance(tid, str) or not tid:
+        if marked:
+            raise Denied("no tool_use id")
+        return                                           # nothing to ask about: not the boundary's
+    try:
+        answer = ask(tid)
+    except Exception as exc:
+        if marked:
+            raise Denied("the provider could not confirm this local-routed call (%s)" % type(exc).__name__)
+        return                                           # not a boundary id: the provider's silence changes nothing
+    if not answer["known"]:
+        if marked:
+            raise Denied("the provider has no live record of this local-routed call (expired or unknown)")
+        return
+    if answer.get("tool") != tool:
+        raise Denied("the call does not match the provider's record of it")
+    check_self(answer.get("project"))
+    if tool == "Bash":
+        if answer.get("bash") is not True:
+            raise Denied("no shell on a sensitive local-routed turn")
+        return
+    inp = event.get("tool_input")
+    key = (answer.get("write_tools") or {}).get(tool) or WRITE_KEYS[tool]
+    check_write(inp.get(key) if isinstance(inp, dict) else None, answer.get("project"), answer.get("protected"))
+
+
+def main(stdin=None, stderr=None, standalone=False) -> int:
+    """standalone: run as the hook program (not imported), where a run without -I denies every marked call."""
+    stdin = stdin or sys.stdin
+    stderr = stderr or sys.stderr
+    marked = False
+    try:
+        event = json.loads(stdin.read())
+        if not isinstance(event, dict):
+            raise ValueError("the hook input is not an object")
+        tid = event.get("tool_use_id")
+        marked = isinstance(tid, str) and tid.startswith(MARK_PREFIX)
+        if standalone and marked and not sys.flags.isolated:
+            raise Denied("the hook runs without python -I, so files in the project could have replaced its code")
+        if standalone and marked and not sys.flags.no_site:
+            raise Denied("the hook runs without python -S, so a site-packages .pth file could have run project code "
+                         "before it")
+        decide(event)
+        return 0
+    except Denied as exc:
+        stderr.write("cortados boundary: denied: %s. Nothing was run.\n" % exc)
+        return 2
+    except BaseException as exc:                         # a crash: fail closed for a boundary call only
+        if marked:
+            stderr.write("cortados boundary: denied: the check failed (%s). Nothing was run.\n" % type(exc).__name__)
+            return 2
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(standalone=True))
+`
 
 /** Only launcher-owned raw artifacts, never the sanitized output.md. Shared by normal processing and recovery. */
 export const BG_CLEANUP_SH = `
@@ -1679,7 +1996,9 @@ async function gateLevelOf($: any, c: GateCtx): Promise<GateLevel> {
 /** CORTADOS_CHILD_TASK, read once: set in every CortadOS child task, which does its work directly. */
 async function gateIsChildTask($: any, c: GateCtx): Promise<boolean> {
   if (c.gate.childTask === null) {
-    try { c.gate.childTask = Boolean(String((await $.env.get('CORTADOS_CHILD_TASK')) ?? '').trim()) }
+    try {
+      c.gate.childTask = Boolean(String((await $.env.get('CORTADOS_CHILD_TASK')) ?? '').trim()) || await isRoutedChild($)
+    }
     catch (err) { guardReport($, c.guard, 'gate env read', err); return false }
   }
   return c.gate.childTask
@@ -2101,6 +2420,9 @@ export const register: Register = (on, options) => {
   }
 
   on('tool.call', { tool: 'Agent' }, async ($: any, e: any, next: any) => {
+    // Inside a routed child this mod is off (routedChildSettings); should the host load it anyway, it never routes or
+    // refuses from there: the child's own subagents run natively, on the child's provider.
+    if (await isRoutedChild($)) return next(e)
     // The top-level session delegates through cortados-route, never the Agent tool (owner rule): refused before any
     // pass-through or launch, at every gate level — unless the owner said "fork" in this turn's prompt and the call is
     // a fork, which passes through to the native runner below. A subagent's own Agent call (agentId present) is
@@ -2136,6 +2458,9 @@ export const register: Register = (on, options) => {
     try { resolvedUrl = await resolveProviderUrl($, cfg.providerUrl) }
     catch (err) { return { deny: String(err) } }
     const runCfg = { ...cfg, providerUrl: resolvedUrl }
+    let hookPython: string
+    try { hookPython = await boundaryHookPython($, cfg.hookPython) }
+    catch (err) { return { deny: String(err) } }
     let token: string
     try {
       token = await resolveToken($, cfg)
@@ -2169,7 +2494,8 @@ export const register: Register = (on, options) => {
     }
 
     // --tools bounds the built-in tools the child actually has; --allowedTools grants them (needed under non-bypass
-    // modes). --settings disableAllHooks stops THIS mod from firing inside the child and routing recursively.
+    // modes). --settings (routedChildSettings) installs the boundary hook and disables THIS mod in the child, and
+    // ROUTED_CHILD_ENV keeps it inert there even so, so it never fires inside the child and routes recursively.
     // --strict-mcp-config + an empty --mcp-config start the child with NO MCP servers: otherwise it inherits the
     // user's MCP servers and advertises their tools to the provider, and a Codex lane refuses a thread whose dynamic
     // tools include a reserved name (seen 2026-10-28: "dynamic tool name is reserved: mcp__cortados-route__route_task",
@@ -2181,7 +2507,7 @@ export const register: Register = (on, options) => {
       '--permission-mode', String(cfg.permissionMode),
       '--tools', tools,
       '--allowedTools', tools,
-      '--settings', JSON.stringify({ disableAllHooks: true }),
+      '--settings', JSON.stringify(routedChildSettings(hookPython)),
       // Load NO user/project/local settings, as the provider's own bridge does: otherwise a settings `env` block
       // could restore a conflicting ANTHROPIC_API_KEY/ANTHROPIC_BASE_URL and override the launch env below, sending
       // the provider token to the wrong endpoint or a stale key to the provider (Codex review, 2026-10-28).
@@ -2232,7 +2558,10 @@ export const register: Register = (on, options) => {
       ANTHROPIC_API_KEY: token,
       ANTHROPIC_AUTH_TOKEN: token,
       CLAUDE_CODE_ENTRYPOINT: 'cli',
-      ANTHROPIC_CUSTOM_HEADERS: headers + officeLines + '\nx-cortados-run-id: ' + runId,
+      // The boundary header: this child runs the boundary hook (routedChildSettings), so a sensitive local turn may
+      // offer it file writes; the hook checks each one on this machine.
+      ANTHROPIC_CUSTOM_HEADERS: headers + '\n' + BOUNDARY_HOOK_HEADER + officeLines + '\nx-cortados-run-id: ' + runId,
+      [ROUTED_CHILD_ENV]: '1',
       ANTHROPIC_UNIX_SOCKET: '',
       CLAUDE_CODE_USE_BEDROCK: '',
       CLAUDE_CODE_USE_VERTEX: '',
@@ -2779,6 +3108,7 @@ export const register: Register = (on, options) => {
 
   // Security framing is independent of orchestratorMode: turning delegation guidance off must not remove it.
   on('prompt.compose', async ($: any, e: any, next: any) => {
+    if (await isRoutedChild($)) return next(e)        // no orchestrator directive inside a routed child
     const r = await next(e)
     const sections = [...r.sections, { id: 'cortados-routed-subagents:background-data', text: BACKGROUND_DATA_BOUNDARY, scope: 'session' }]
     if (cfg.orchestratorMode && !(Array.isArray(e?.traits) && e.traits.includes('teammate'))) {

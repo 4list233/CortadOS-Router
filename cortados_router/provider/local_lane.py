@@ -1,7 +1,7 @@
 """Local model lanes: an Ollama node on the owner's machines (the Pro, #75), served as `sub/<local model id or alias>`
 pins and, when its config opts in, as an auto-route target after S1 has chosen a band.
 
-Owner of three rules:
+Owner of four rules:
   config        the nodes and the models they offer live in the local-resources config (CORTADOS_LOCAL_RESOURCES_CONFIG,
                 the same file local_resources.py samples; schema in docs/LOCAL-RESOURCES.md), under each node's `ollama`
                 block. Addresses are config or env only, never tables or code: the real file is git-ignored.
@@ -18,19 +18,33 @@ Owner of three rules:
                 with a clear 503 and nothing falls back to another model (the person chose this one); an auto-route to
                 one is simply not taken, and the conversation keeps the route S1 chose.
 
+  sensitive     off (absent) by default. On, an object naming ONE of the node's models for sensitive requests
+                (`{"model": "<alias or tag>", "keywords_file"|"keywords_file_env": ..., "refusal_fallback": bool}`):
+                requests flagged `x-cortados-local: sensitive|prefer`, matching the owner's keyword list, or refused by a
+                cloud model on their first turn may run there in any band, but only with no effect outside the
+                machine (routing.sensitive_local; docs/LOCAL-RESOURCES.md "Sensitive requests"). The keyword list is
+                a file on the provider host, never in this repository; `keywords` reads and matches it.
+
 Ollama implements the Anthropic Messages API at POST /v1/messages, so a turn is relayed as-is (stateless: the client
 sends the whole conversation every turn) with `model` rewritten to the node's tag and, unless the model entry says
-`"thinking": "passthrough"`, thinking turned off when the client did not ask for it (#108, THINKING_MODES). Stdlib only.
+`"thinking": "passthrough"`, thinking turned off when the client did not ask for it (#108, THINKING_MODES). An
+AUTOMATIC local turn (serve's auto_routed, complete's boundary) also passes the effect boundary (effect_boundary.py):
+its tools are cut to the profile of its bind reason (sensitive: no shell; cost: Bash, inspected) before the node
+sees them, and a reply proposing an outward tool call or a file write outside the project folder is never relayed.
+An explicit `sub/` pin is relayed as the client sent it. Stdlib only.
 """
 from __future__ import annotations
 
 import http.client
 import json
 import os
+import re
+import threading
 import urllib.parse
 from typing import Any
 
 from cortados_router.compat import getenv
+from cortados_router.provider import effect_boundary
 
 CONFIG_ENV = "CORTADOS_LOCAL_RESOURCES_CONFIG"
 LANE_PREFIX = "local-"
@@ -121,6 +135,7 @@ def nodes(path: str | None = None) -> list[dict[str, Any]]:
         out.append({"node": nid, "lane": LANE_PREFIX + nid, "label": block.get("label") or nid.capitalize(),
                     "base_url": base, "models": models, "token": token,
                     "auto_route": _auto_route(block.get("auto_route", False), models, nid),
+                    "sensitive": _sensitive(block.get("sensitive"), models, nid),
                     **timeouts})
     return out
 
@@ -160,6 +175,186 @@ def _auto_route(value: Any, models: list[dict[str, Any]], nid: str) -> dict[str,
 def auto_routes(path: str | None = None) -> list[tuple[dict[str, Any], dict[str, Any], list[str]]]:
     """(node, model, bands) for every node whose auto_route is on, in config order."""
     return [(n, n["auto_route"]["model"], n["auto_route"]["bands"]) for n in nodes(path) if n.get("auto_route")]
+
+
+_SENSITIVE_KEYS = {"model", "keywords_file", "keywords_file_env", "refusal_fallback", "_comment"}
+
+
+def _sensitive(value: Any, models: list[dict[str, Any]], nid: str) -> dict[str, Any] | None:
+    """A node's validated `sensitive` section: None (absent: the feature is off on this node) or {"model": <one of its
+    model entries>, "keywords_file": <path or None>, "keywords_file_env": <env name or None>, "refusal_fallback": bool}.
+    Malformed is refused (LocalConfigError), as for auto_route: a switch that silently did nothing would mislead. The
+    keyword FILE is not read here (routing reads it per request through `keyword_match`), so a missing list never
+    takes the node's pins down with it."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise LocalConfigError(f"node {nid}: sensitive must be an object "
+                               '{"model": "<alias or tag>", "keywords_file": ..., "refusal_fallback": true} (or absent)',
+                               nid)
+    unknown = set(value) - _SENSITIVE_KEYS
+    if unknown:
+        raise LocalConfigError(f"node {nid}: sensitive has unknown keys {sorted(unknown)}", nid)
+    name = str(value.get("model") or "").strip().casefold()
+    entry = next((m for m in models if name and name in (m["id"].casefold(), (m["alias"] or "").casefold())), None)
+    if entry is None:
+        raise LocalConfigError(f"node {nid}: sensitive.model must name one of this node's models (alias or tag)", nid)
+    out: dict[str, Any] = {"model": entry, "keywords_file": None, "keywords_file_env": None, "refusal_fallback": False}
+    for key in ("keywords_file", "keywords_file_env"):
+        v = value.get(key)
+        if v is not None and (not isinstance(v, str) or not v.strip()):
+            raise LocalConfigError(f"node {nid}: sensitive.{key} must be a non-empty string", nid)
+        out[key] = v.strip() if v else None
+    fb = value.get("refusal_fallback", False)
+    if not isinstance(fb, bool):
+        raise LocalConfigError(f"node {nid}: sensitive.refusal_fallback must be true or false", nid)
+    out["refusal_fallback"] = fb
+    return out
+
+
+def sensitive_routes(path: str | None = None) -> list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
+    """(node, model, sensitive section) for every node whose `sensitive` section is on, in config order."""
+    return [(n, n["sensitive"]["model"], n["sensitive"]) for n in nodes(path) if n.get("sensitive")]
+
+
+class KeywordListError(RuntimeError):
+    """The node's keyword list is configured but cannot be read. The message names the file or variable, never a term."""
+
+
+# path -> ((mtime_ns, size), compiled pattern or None). The list is re-read when the file changes, so the owner edits it
+# on the provider host without a restart. Guarded: the provider serves requests on many threads.
+_keyword_cache: dict[str, tuple[tuple[int, int], Any]] = {}
+_keyword_lock = threading.Lock()
+
+
+def keyword_file(section: dict[str, Any]) -> str | None:
+    """The keyword list's path: $keywords_file_env when that names a set variable, else keywords_file, else None (the
+    keyword trigger is off). KeywordListError when keywords_file_env names a variable that is not set and there is no
+    keywords_file to use instead: a list the owner configured must not silently match nothing."""
+    env_name = section.get("keywords_file_env")
+    path = (os.environ.get(env_name) if env_name else None) or section.get("keywords_file")
+    if env_name and not path:
+        raise KeywordListError(f"sensitive.keywords_file_env names ${env_name}, which is not set")
+    return os.path.expanduser(path) if path else None
+
+
+def compile_keywords(lines: list[str]):
+    """One pattern for a keyword list (one term or phrase per line; blank lines and `#` comments skipped), matched
+    case-insensitively (casefold) as whole words or phrases: a term never matches inside a longer word, and the words
+    of a phrase may be separated by any whitespace. None for an empty list."""
+    terms = []
+    for line in lines:
+        t = line.strip()
+        if not t or t.startswith("#"):
+            continue
+        words = t.casefold().split()
+        terms.append(r"\s+".join(re.escape(w) for w in words))
+    if not terms:
+        return None
+    # Longest first, so a phrase is preferred over a word it starts with (only a yes/no is reported either way).
+    terms.sort(key=len, reverse=True)
+    return re.compile(r"(?<!\w)(?:" + "|".join(terms) + r")(?!\w)")
+
+
+def keywords(section: dict[str, Any]):
+    """The compiled keyword pattern of a `sensitive` section (cached by file mtime and size), or None when no list is
+    configured or it is empty. KeywordListError when a configured list cannot be read."""
+    path = keyword_file(section)
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+        stamp = (st.st_mtime_ns, st.st_size)
+        with _keyword_lock:
+            hit = _keyword_cache.get(path)
+            if hit and hit[0] == stamp:
+                return hit[1]
+        with open(path, encoding="utf-8") as f:
+            pattern = compile_keywords(f.read().splitlines())
+    except (OSError, UnicodeDecodeError) as exc:
+        raise KeywordListError(f"sensitive keyword list {path} unreadable: {type(exc).__name__}") from None
+    with _keyword_lock:
+        _keyword_cache[path] = (stamp, pattern)
+    return pattern
+
+
+def keyword_match(section: dict[str, Any], text: str) -> bool:
+    """Whether `text` contains a term of the section's keyword list. Only the yes/no leaves this function: callers
+    must never log which term matched (there is no way to ask)."""
+    pattern = keywords(section)
+    return bool(pattern and text and pattern.search(text.casefold()))
+
+
+def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
+             boundary: bool = False, bind_reason: str | None = None, hook: bool = False,
+             conversation: str | None = None) -> tuple[list, str, dict]:
+    """One whole (non-streaming) answer from the node for `body`, as (blocks, stop_reason, usage) in the shape the
+    bridges return: text and tool_use blocks only (thinking is dropped, as the CLI lanes never send it). Used where
+    the answer must be written by the server itself: the refusal fallback (server.py), whose stream has already
+    started. LocalUnavailable on any failure (no answer, an HTTP error, an unreadable or non-message answer, or a
+    message holding no usable answer: at least one non-blank text block or a valid tool call, _answered); the
+    node's own error text is never repeated, only its status or the gate's fixed policy reason.
+
+    `boundary` (an automatic move: the refusal fallback): the effect boundary applies, under the profile of
+    `bind_reason` (effect_boundary.BIND_PROFILES; unknown: the strictest). The node sees only the profile's tools, and
+    an answer proposing a blocked call (Boundary.blocked_reply, read on the node's raw content) is LocalUnavailable
+    too, so the caller keeps what it had and nothing outward reaches the client. `hook`: the client runs the boundary
+    hook (effect_boundary.HOOK_HEADER; without it a sensitive turn is read-only); every tool call returned gets a
+    minted id recorded under `conversation` (effect_boundary.Boundary.mark), which the client's hook checks."""
+    fence = (effect_boundary.Boundary.for_turn(bind_reason, body, hook=hook, conversation=conversation)
+             if boundary else None)
+    if fence:
+        body, dropped = fence.tools_for_node(body)
+        effect_boundary.log_dropped(dropped)
+    out = dict(body)
+    out["model"] = model["id"]
+    out["stream"] = False
+    data = json.dumps(out).encode()
+    conn = _connection(node["base_url"], node["connect_timeout_s"])
+    try:
+        try:
+            conn.connect()
+            conn.sock.settimeout(node["read_timeout_s"])
+            conn.request("POST", _prefix(node["base_url"]) + "/v1/messages", body=data,
+                         headers={"content-type": "application/json", "anthropic-version": "2023-06-01",
+                                  **_auth(node)})
+            resp = conn.getresponse()
+            if resp.status != 200:
+                raw = _bounded_read(resp)
+                policy = _policy_refusal(raw) if resp.status == 503 else None
+                if resp.status == 401:
+                    raise LocalUnavailable(GATE_REFUSED.format(node=node["node"]))
+                raise LocalUnavailable(f"node {node['node']}: {policy}" if policy else
+                                       f"node {node['node']} answered /v1/messages with HTTP {resp.status}")
+            msg = json.loads(resp.read())
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            raise LocalUnavailable(f"node {node['node']} gave no usable answer ({type(exc).__name__})") from None
+    finally:
+        conn.close()
+    if not isinstance(msg, dict) or msg.get("type") != "message" or not isinstance(msg.get("content"), list):
+        raise LocalUnavailable(f"node {node['node']} answered something that is not a message")
+    hit = fence.blocked_reply(msg["content"]) if fence else None
+    if hit:
+        effect_boundary.log_blocked(*hit, where="refusal fallback")
+        raise LocalUnavailable(f"node {node['node']}: the local model proposed an action with an outward effect "
+                               f"(rule {hit[0]})")
+    declared = {t.get("name") for t in body.get("tools") or [] if isinstance(t, dict)}
+    blocks = []
+    for b in msg["content"]:
+        if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
+            blocks.append({"type": "text", "text": b["text"]})
+        elif (isinstance(b, dict) and b.get("type") == "tool_use" and isinstance(b.get("id"), str) and b["id"]
+              and isinstance(b.get("name"), str) and b["name"] in declared and isinstance(b.get("input"), dict)):
+            # A valid tool call only: a tool the client declared, with an object input. Anything else is dropped.
+            blocks.append({"type": "tool_use", "id": b["id"], "name": b["name"], "input": b["input"]})
+    if not _answered(blocks):
+        # Thinking only, blank text, an empty content list or only malformed tool calls (e.g. stop "max_tokens"
+        # after thinking): not an answer. The caller keeps what it had (the refusal fallback: the original refusal).
+        raise LocalUnavailable(f"node {node['node']} gave no usable answer (no text or valid tool call)")
+    if fence:
+        fence.mark_blocks(blocks)
+    usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+    return blocks, str(msg.get("stop_reason") or "end_turn"), usage
 
 
 DEFAULT_CONTEXT = 32768
@@ -368,12 +563,14 @@ def _catalog_read(resp) -> bytes | None:
     return _read_capped(resp, CATALOG_MAX)
 
 
-def _send_json(handler, code: int, data: dict[str, Any]) -> None:
+def _send_json(handler, code: int, data: dict[str, Any], headers: dict[str, str] | None = None) -> None:
     raw = json.dumps(data).encode()
     try:
         handler.send_response(code)
         handler.send_header("content-type", "application/json")
         handler.send_header("content-length", str(len(raw)))
+        for k, v in (headers or {}).items():
+            handler.send_header(k, v)
         handler.end_headers()
         handler.wfile.write(raw)
     except OSError:
@@ -427,8 +624,60 @@ def auto_routed_unavailable(node: dict[str, Any], model: dict[str, Any], reason:
             f"{reason}; start a new conversation (it is routed again) or send x-cortados-exclude-model: {pin_id(model)}")
 
 
+def _judge_event(ev: dict[str, Any], call: "effect_boundary.StreamedCall | None",
+                 fence: "effect_boundary.Boundary | None" = None):
+    """One streamed event under the effect boundary `fence` (None: the strictest, effect_boundary.Boundary(None,
+    None)). Returns a new StreamedCall when a tool-call block starts (and is
+    not already blocked by its name), "closed" when the open call's block ended and its call is allowed, a
+    (rule id, tool name) when the call is blocked, else None."""
+    fence = fence or effect_boundary.Boundary(None, None)
+    t = ev.get("type")
+    if call is None:
+        block = ev.get("content_block")
+        if t == "content_block_start" and isinstance(block, dict) and \
+                block.get("type") not in effect_boundary.PLAIN_BLOCKS:
+            name = block.get("name")
+            rule = fence.name_rule(name)
+            if rule:
+                return rule, name if isinstance(name, str) else "<unnamed>"
+            return effect_boundary.StreamedCall(ev.get("index"), block)
+        return None
+    if t == "content_block_start":
+        # A block started inside the open call (Anthropic and Ollama stream blocks one after another): it would be held
+        # and released with the call unjudged, so the reply is blocked instead (fail closed).
+        block = ev.get("content_block") if isinstance(ev.get("content_block"), dict) else {}
+        return "interleaved-block", block.get("name") if isinstance(block.get("name"), str) else "<unnamed>"
+    if ev.get("index") != call.index:
+        return None
+    if t == "content_block_delta" and isinstance(ev.get("delta"), dict) and \
+            ev["delta"].get("type") == "input_json_delta":
+        call.fragments.append(str(ev["delta"].get("partial_json") or ""))
+    elif t == "content_block_stop":
+        rule = fence.blocked_call(call.name, call.complete_input())
+        return (rule, call.name) if rule else "closed"
+    return None
+
+
+def _blocked(handler, hit: tuple[str, str], *, stream_started: bool = False) -> str:
+    """Answer a reply the effect boundary blocked (serve's "blocked" outcome): logged as rule and tool name only;
+    a terminal 400 when nothing was written yet, else an `error` event ending the stream."""
+    effect_boundary.log_blocked(*hit, where="local relay")
+    _refused(handler, 400, "invalid_request_error", "the local model proposed an action with an outward effect")
+    err = _error("invalid_request_error", effect_boundary.BLOCKED_MESSAGE)
+    if not stream_started:
+        _send_json(handler, 400, err, headers={"x-should-retry": "false"})
+        return "blocked"
+    try:
+        handler.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+        handler.wfile.flush()
+    except OSError:
+        pass
+    return "blocked"
+
+
 def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
-          echo_model: str, reply: list | None = None, auto_routed: bool = False) -> str:
+          echo_model: str, reply: list | None = None, auto_routed: bool = False,
+          bind_reason: str | None = None, hook: bool = False, conversation: str | None = None) -> str:
     """Relay one turn to the node's /v1/messages and the answer back to the client. Returns the outcome: "completed"
     (a whole message or a parsed message_stop), "rejected" (the node answered an HTTP error, relayed as-is),
     "unreachable" (503 sent), or "incomplete" (the stream broke). The response names `echo_model` (what the client
@@ -437,8 +686,30 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
     fingerprint the reply and continue the conversation by its history, as for every other pin. `auto_routed`: the
     conversation was moved here by S1's auto-route (routing.auto_local), not pinned; an unavailable node (unreachable,
     dropping requests, refusing the token, or the gate's fixed policy refusal: battery, switch off) is then worded by
-    auto_routed_unavailable instead of naming a `sub/` pin the person never made."""
+    auto_routed_unavailable instead of naming a `sub/` pin the person never made.
+
+    An auto-routed turn (every automatic move: auto_route, sensitive flag / prefer / keyword, a refusal bind, an index
+    bind) also passes the effect boundary (effect_boundary.py) under the profile of `bind_reason` (the route's
+    `bind_reason`: which automatic rule bound the conversation; unknown or missing: the strictest profile): the node is
+    offered only the profile's tools, and a reply proposing a blocked tool call (a tool off the profile, an outward
+    Bash command, a file write outside the project folder or onto a protected path) is never relayed. Outcome
+    "blocked": a non-streaming turn is answered with a terminal 400 (`x-should-retry: false`,
+    effect_boundary.BLOCKED_MESSAGE); a streaming turn holds every tool-call block until it is complete and judged (and
+    holds message_start until the first content that may be shown), so a block found before anything was written is
+    the same 400, and one found after text was written ends the stream with an `error` event (invalid_request_error,
+    the same message): no tool_use, no message_delta, no message_stop. A pin is relayed untouched.
+
+    The client-side hook (effect_boundary "client-side boundary hook"): `hook` says the client runs it (HOOK_HEADER;
+    without it a sensitive turn is read-only). Every tool-call block the boundary lets through reaches the client with
+    an id minted by the provider and recorded under `conversation` (Boundary.mark), never the node's own id: the
+    client's hook asks about that id before the tool runs."""
     reply = [] if reply is None else reply
+    fence = (effect_boundary.Boundary.for_turn(bind_reason, body, hook=hook, conversation=conversation)
+             if auto_routed else None)
+    boundary = fence is not None
+    if fence:
+        body, dropped = fence.tools_for_node(body)
+        effect_boundary.log_dropped(dropped)
     data = json.dumps(_node_body(body, model)).encode()
     # Safety net (#108): an auto-routed turn the client did not ask to think on, which still ended on max_tokens with
     # no text or tool_use, is answered with an error naming the cause instead of a silent empty answer. Not retried:
@@ -524,23 +795,49 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                 _refused(handler, 502, "api_error", "the local model used the whole max_tokens without an answer")
                 _send_json(handler, 502, _error("api_error", thinking_starved(node, model, body.get("max_tokens"))))
                 return "incomplete"
+            hit = fence.blocked_reply(msg.get("content")) if fence and isinstance(msg, dict) else None
+            if hit:
+                return _blocked(handler, hit)
+            if fence and isinstance(msg, dict):
+                fence.mark_blocks(msg.get("content"))
             if isinstance(msg, dict) and msg.get("type") == "message":
                 msg["model"] = echo_model
             if isinstance(msg, dict) and isinstance(msg.get("content"), list):
                 reply.extend(b for b in msg["content"] if isinstance(b, dict))
             _send_json(handler, 200, msg)
             return "completed" if isinstance(msg, dict) and msg.get("type") == "message" else "incomplete"
-        try:
-            handler.send_response(200)
-            handler.send_header("content-type", "text/event-stream")
-            handler.send_header("cache-control", "no-cache")
-            handler.send_header("connection", "close")
-            handler.end_headers()
-        except OSError:
+        started = False
+
+        def write(chunks: list) -> bool:
+            """Send the stream's headers (once) and `chunks`; False when the client has left."""
+            nonlocal started
+            try:
+                if not started:
+                    handler.send_response(200)
+                    handler.send_header("content-type", "text/event-stream")
+                    handler.send_header("cache-control", "no-cache")
+                    handler.send_header("connection", "close")
+                    handler.end_headers()
+                    handler.close_connection = True
+                    started = True
+                if chunks:
+                    handler.wfile.write(b"".join(chunks))
+                    handler.wfile.flush()
+            except OSError:
+                return False
+            return True
+
+        if not boundary and not write([]):              # a pin streams as before: headers first
             return "incomplete"
-        handler.close_connection = True
         done = starved = False
         pending: list = []                               # one SSE event's lines, written when its blank line arrives
+        # The effect boundary (auto-routed turns only): `held` keeps events back while a tool-call block is open
+        # (`call`) and, before anything was written, while only message_start / ping have arrived.
+        held: list = []
+        call: effect_boundary.StreamedCall | None = None
+        call_closed = False
+        blocked: tuple[str, str] | None = None
+        ev_type = None
         try:
             while True:
                 line = resp.readline()
@@ -557,44 +854,62 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                                 and ev["delta"].get("stop_reason") == "max_tokens" and not _answered(reply)):
                             starved = True                   # this event and the rest are replaced by an error
                             break
+                        if boundary:
+                            blocked = _judge_event(ev, call, fence)
+                            if isinstance(blocked, effect_boundary.StreamedCall):
+                                call, blocked = blocked, None
+                                # the call reaches the client under a minted, recorded id (the client hook's key),
+                                # folded into the reply too: the client sends that id back with its tool result
+                                ev["content_block"]["id"] = fence.mark(call.name)
+                                line = b"data: " + json.dumps(ev).encode() + b"\n"
+                            elif blocked == "closed":
+                                call_closed, blocked = True, None
                         _fold(reply, ev)
                         done = done or ev.get("type") == "message_stop"
+                        ev_type = ev.get("type")
+                        if blocked:
+                            break                            # nothing of this event or after it is written
                 pending.append(line)
                 if line in (b"\n", b"\r\n"):
-                    try:
-                        handler.wfile.write(b"".join(pending))
-                        handler.wfile.flush()
-                    except OSError:
-                        return "incomplete"                      # the client left
+                    if not boundary:
+                        if not write(pending):
+                            return "incomplete"              # the client left
+                    else:
+                        held.extend(pending)
+                        if call is not None and call_closed:
+                            call, call_closed = None, False  # judged and allowed: release it with what it held
+                        if call is None and (started or ev_type not in ("message_start", "ping")):
+                            if not write(held):
+                                return "incomplete"
+                            held = []
                     pending = []
-            if pending and not starved:
-                try:
-                    handler.wfile.write(b"".join(pending))
-                except OSError:
-                    return "incomplete"
+            if pending and not starved and not blocked:
+                if not boundary:
+                    if not write(pending):
+                        return "incomplete"
+                else:
+                    held.extend(pending)
         except (OSError, http.client.HTTPException):
             pass                                                 # the node stalled past read_timeout_s or dropped
+        if blocked:
+            return _blocked(handler, blocked, stream_started=started)
+        if boundary:
+            if call is not None:                                 # a tool-call block the node never closed: not sent
+                done = False
+            elif held and not write(held):
+                return "incomplete"
         if starved:
             _refused(handler, 502, "api_error", "the local model used the whole max_tokens without an answer")
             ev = _error("api_error", thinking_starved(node, model, body.get("max_tokens")))
-            try:
-                handler.wfile.write(b"event: error\ndata: " + json.dumps(ev).encode() + b"\n\n")
-                handler.wfile.flush()
-            except OSError:
-                pass
+            write([b"event: error\ndata: " + json.dumps(ev).encode() + b"\n\n"])
             return "incomplete"
         if not done:                                             # say so in the stream, not by a silent truncation
             _refused(handler, 502, "api_error", "the local node stopped mid-answer (stalled or dropped)")
             ev = _error("api_error", f"cortados: local node {node['node']} stopped mid-answer (stalled past "
                         f"{node['read_timeout_s']:g}s or dropped the connection)")
-            try:
-                handler.wfile.write(b"event: error\ndata: " + json.dumps(ev).encode() + b"\n\n")
-            except OSError:
-                pass
-        try:
-            handler.wfile.flush()
-        except OSError:
-            pass
+            write([b"event: error\ndata: " + json.dumps(ev).encode() + b"\n\n"])
+        if not write([]):
+            return "incomplete"
         return "completed" if done else "incomplete"
     finally:
         conn.close()

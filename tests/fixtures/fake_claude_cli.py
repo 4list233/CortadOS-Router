@@ -8,6 +8,9 @@ Starts the `bridge` MCP server from --mcp-config like the real CLI, then for eac
   - "garbled" first emits a tool_use of a tool that does not exist and answers it with the CLI's own tool error,
     then carries on as above; "misnamed" does the same with a wrong tool under the bridge's prefix
     (mcp__bridge__Bsh); "ran locally" answers the garbled call with a NON-error result, as if the CLI ran it;
+  - "please refuse": the model refuses (as Claude Code 2.1.3xx reports it: an assistant frame with stop_reason
+    "refusal", a system model_refusal_no_fallback event, and a result marked is_error);
+  - "refuse after tool": the "use tool" flow, but the answer after the tool result is that refusal;
   - otherwise it answers "echo: <text>".
 Every turn ends with a result event. Writes its argv and relevant env to $FAKE_CLAUDE_ARGV when set, and its argv and
 the bridge's tools/list names to $FAKE_CLAUDE_TOOLS_DIR/<pid>.json when that is set (one file per backend process).
@@ -62,6 +65,15 @@ def assistant(blocks):
                                           "usage": {"input_tokens": 10, "output_tokens": 5}}})
 
 
+def refuse():
+    out({"type": "assistant", "message": {"role": "assistant", "stop_reason": "refusal",
+                                          "content": [{"type": "text", "text": "API Error: the model refused"}],
+                                          "usage": {"input_tokens": 10, "output_tokens": 1}}})
+    out({"type": "system", "subtype": "model_refusal_no_fallback", "original_model": "claude-test",
+         "request_id": None, "content": "refused"})
+    out({"type": "result", "subtype": "error_during_execution", "is_error": True, "result": "refused"})
+
+
 def check_cache(value):
     """Reject leaked client cache metadata, including serialized fallback blocks."""
     if '"cache_control"' in json.dumps(value).replace('\\\"', '"'):
@@ -76,7 +88,10 @@ for line in sys.stdin:
     if "backend failure" in text:
         out({"type": "result", "is_error": True, "result": "API Error: 400 cache TTL ordering"})
         continue
-    n = 2 if "use two tools" in text else 1 if "use tool" in text else 0
+    if "please refuse" in text:
+        refuse()
+        continue
+    n = 2 if "use two tools" in text else 1 if "use tool" in text or "refuse after tool" in text else 0
     if "garbled" in text or "misnamed" in text or "ran locally" in text:
         # A model calls a tool that does not exist; the real CLI answers it with a tool error and the model goes on.
         bad = "toolu_" + uuid.uuid4().hex[:12]
@@ -99,6 +114,9 @@ for line in sys.stdin:
             r = rpc("tools/call", {"name": tools[0], "arguments": u["input"], "_meta": {"claudecode/toolUseId": u["id"]}})
             check_cache(r)
             said.append(("ERR " if r.get("isError") else "") + " ".join(c.get("text", "") for c in r["content"]))
+        if "refuse after tool" in text:
+            refuse()
+            continue
         assistant([{"type": "text", "text": "tool said: " + " | ".join(said)}])
     else:
         assistant([{"type": "text", "text": "echo: " + text}])
