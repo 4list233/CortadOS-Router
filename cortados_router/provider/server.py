@@ -1181,6 +1181,61 @@ class Handler(BaseHTTPRequestHandler):
         self._error(403, "permission_error", _SCOPE_DENIED)
         return True
 
+    def _control_body(self, max_bytes: int, deadline_s: float) -> dict[str, Any] | None:
+        """The JSON object body of a small control POST (POST /v1/cortados/local/switch), or None after an error was
+        sent. Unlike _body (the wires, count_tokens, the office heartbeat and /bridge/call), it does not trust
+        content-length: missing is a 411, negative or not a number a 400, over `max_bytes` a 413, all refused before a
+        byte is read; and the read has an absolute deadline (each wait given only the time left, so a trickle cannot
+        stretch it) past which it is a 408. Every refusal before the body is fully read closes the connection: the
+        unread rest must not be parsed as the next request."""
+        cl = self.headers.get("content-length")
+        if cl is None:
+            self.close_connection = True
+            return self._error(411, "invalid_request_error", "cortados: content-length is required",
+                               reason="the request was refused as invalid")
+        try:
+            n = int(cl.strip()) if cl.strip().isdigit() else -1
+        except ValueError:
+            n = -1
+        if n < 0:
+            self.close_connection = True
+            return self._error(400, "invalid_request_error", "cortados: content-length is not a byte count",
+                               reason="the request was refused as invalid")
+        if n > max_bytes:
+            self.close_connection = True
+            return self._error(413, "invalid_request_error", f"cortados: this body is at most {max_bytes} bytes",
+                               reason="the control request body is too large")
+        end = time.monotonic() + deadline_s
+        parts, left = [], n
+        try:
+            while left > 0:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("deadline passed")
+                self.connection.settimeout(remaining)
+                chunk = self.rfile.read1(left)
+                if not chunk:
+                    raise ConnectionError("client closed the body early")
+                parts.append(chunk)
+                left -= len(chunk)
+        except OSError:
+            self.close_connection = True
+            return self._error(408, "invalid_request_error",
+                               f"cortados: the body did not arrive within {deadline_s:g}s",
+                               reason="the control request body did not arrive in time")
+        finally:
+            try:
+                self.connection.settimeout(self.timeout)
+            except OSError:
+                pass
+        try:
+            body = json.loads(b"".join(parts) or b"{}")
+        except ValueError:                              # JSONDecodeError and undecodable bytes alike
+            return self._error(400, "invalid_request_error", "body is not JSON", reason="body is not JSON")
+        if not isinstance(body, dict):
+            return self._error(400, "invalid_request_error", "body must be a JSON object")
+        return body
+
     def _body(self) -> dict[str, Any]:
         n = int(self.headers.get("content-length") or 0)
         body = json.loads(self.rfile.read(n) or b"{}")
@@ -1388,7 +1443,15 @@ class Handler(BaseHTTPRequestHandler):
         # the Responses error body verbatim and would show an Anthropic envelope as noise.
         w = WIRES.get(path, wire)
         if not self._authorized():
+            if path == local_switch.SWITCH_PATH:
+                self.close_connection = True            # its body stays unread: never parse it as the next request
             return self._error(401, "authentication_error", "bad or missing token", w)
+        if path == local_switch.SWITCH_PATH:
+            # Authorization header only (the owner token, checked above). NOTE for the password-cookie login: a
+            # request authenticated by a cookie must pass a CSRF check (an Origin match or a token the page echoes in
+            # a header) BEFORE it is accepted here; a browser attaches cookies to a cross-site POST, never this header.
+            body = self._control_body(local_switch.SWITCH_MAX_BODY, local_switch.SWITCH_BODY_DEADLINE_S)
+            return None if body is None else self._local_switch(body)
         try:
             body = self._body()
         except json.JSONDecodeError:
@@ -1409,8 +1472,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, "invalid_request_error", f"cortados: heartbeat field {bad} is invalid",
                                    reason="the heartbeat is malformed")
             return self._json(200, self.server.registry.office.heartbeat(hb))
-        if path == local_switch.SWITCH_PATH:
-            return self._local_switch(body)
         if path == "/v1/messages/count_tokens":
             # Estimate only (chars / 4): the CLI behind cortados counts its own tokens and exposes no counter.
             return self._json(200, {"input_tokens": len(json.dumps(body)) // 4})

@@ -28,6 +28,7 @@ import fcntl
 import hmac
 import ipaddress
 import http.client
+import io
 import json
 import logging
 import math
@@ -91,11 +92,105 @@ SWITCH_MAX_BODY = 1024
 # The status asks Ollama which models are loaded (GET /api/ps on loopback). A loopback connect takes microseconds (1 s
 # says "Ollama is not running") and the answer milliseconds; 2 s bounds a hung Ollama, so the whole status (pmset's own
 # 2 s cap included) stays under the provider's 6 s wait (provider/local_switch.GATE_TIMEOUT_S) and still answers, with
-# the models unknown. At most PS_MAX_MODELS names are reported.
+# the models unknown. At most PS_MAX_MODELS names are reported. PS_TIMEOUT_S is end to end (connect, headers and body,
+# deadline_call): a trickling Ollama cannot stretch it by sending a byte now and then.
 PS_CONNECT_S = 1.0
 PS_TIMEOUT_S = 2.0
 PS_MAX_MODELS = 32
 PS_MAX_BYTES = 1024 * 1024
+
+class _DeadlineSocket:
+    """A connected socket under an absolute monotonic deadline: every send and every receive waits at most the time
+    left before `end`, so bytes arriving now and then cannot extend the call (a plain socket timeout is an inactivity
+    timeout and resets on each byte). Past the deadline it raises TimeoutError (an OSError) before waiting at all.
+    Stands in for HTTPConnection.sock: http.client only sends with sendall and reads through makefile("rb")."""
+
+    def __init__(self, sock: socket.socket, end: float):
+        self._sock, self._end = sock, end
+        self._readers, self._closed = 0, False
+
+    def _arm(self) -> None:
+        left = self._end - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("deadline passed")
+        self._sock.settimeout(left)
+
+    def sendall(self, data, *args):
+        self._arm()
+        return self._sock.sendall(data, *args)
+
+    def recv_into(self, buf, *args):
+        self._arm()
+        return self._sock.recv_into(buf, *args)
+
+    def makefile(self, mode: str = "rb", *args, **kwargs):
+        if "w" in mode:
+            raise ValueError("a deadline socket is read through makefile('rb') only")
+        self._readers += 1
+        return io.BufferedReader(_DeadlineReader(self))
+
+    def close(self) -> None:
+        # Like socket.socket: http.client closes the connection while a "Connection: close" response is still being
+        # read, so the real socket closes only once no reader is open.
+        self._closed = True
+        if self._readers <= 0:
+            self._sock.close()
+
+    def _reader_closed(self) -> None:
+        self._readers -= 1
+        if self._closed and self._readers <= 0:
+            self._sock.close()
+
+
+class _DeadlineReader(io.RawIOBase):
+    def __init__(self, sock: _DeadlineSocket):
+        super().__init__()
+        self._s = sock
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buf) -> int:
+        return self._s.recv_into(buf)
+
+    def close(self) -> None:
+        if not self.closed:
+            self._s._reader_closed()
+        super().close()
+
+
+def deadline_call(conn: http.client.HTTPConnection, deadline_s: float, method: str, path: str, *,
+                  body: bytes | None = None, headers: dict[str, str] | None = None, max_bytes: int,
+                  connect_s: float | None = None, on_connect_error=None) -> tuple[int, bytes]:
+    """One HTTP request on an unconnected `conn` within `deadline_s` seconds END TO END: the connect (also capped at
+    `connect_s`), the request, the status line and headers and the body all share one monotonic deadline, each wait
+    given only the time left. The body is read incrementally, at most `max_bytes` (the rest is left unread).
+    (status, body bytes); OSError (TimeoutError past the deadline) or http.client.HTTPException otherwise. A connect
+    failure is passed to `on_connect_error(exc)` first when given, so a caller can tell "not reachable" from "did not
+    answer". Stdlib only: the provider's switch view (provider/local_switch.py) uses it too."""
+    end = time.monotonic() + deadline_s
+    conn.timeout = max(0.001, min(deadline_s, connect_s if connect_s is not None else deadline_s))
+    try:
+        conn.connect()
+    except (OSError, http.client.HTTPException) as exc:
+        if on_connect_error is not None:
+            on_connect_error(exc)
+        raise
+    conn.sock = _DeadlineSocket(conn.sock, end)
+    conn.request(method, path, body=body, headers=headers or {})
+    resp = conn.getresponse()
+    parts, left = [], max_bytes
+    try:
+        while left > 0:
+            chunk = resp.read1(min(left, 65536))
+            if not chunk:
+                break
+            parts.append(chunk)
+            left -= len(chunk)
+    finally:
+        resp.close()                                    # an unread rest is dropped with the connection, never waited for
+    return resp.status, b"".join(parts)
+
 
 _UNAUTHORIZED = json.dumps({"type": "error", "error": {"type": "authentication_error",
                                                         "message": "local gate: bad or missing token"}}).encode()
@@ -478,19 +573,15 @@ class GateHandler(BaseHTTPRequestHandler):
     def _loaded_models(self) -> tuple[list[str] | None, str]:
         """(names, "up") from Ollama's GET /api/ps on loopback, or (None, "unreachable" | "unreadable"). Names only:
         sizes, digests and expiry times stay on the node."""
-        conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port,
-                                          timeout=min(self.server.connect_timeout, PS_CONNECT_S))
+        conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port)
         try:
             try:
-                conn.connect()
-                conn.sock.settimeout(PS_TIMEOUT_S)
-                conn.request("GET", "/api/ps")
-                resp = conn.getresponse()
-                raw = resp.read(PS_MAX_BYTES)
+                status, raw = deadline_call(conn, PS_TIMEOUT_S, "GET", "/api/ps", max_bytes=PS_MAX_BYTES,
+                                            connect_s=min(self.server.connect_timeout, PS_CONNECT_S))
             except (OSError, http.client.HTTPException):
                 return None, "unreachable"
             try:
-                data = json.loads(raw) if resp.status == 200 else None
+                data = json.loads(raw) if status == 200 else None
             except ValueError:
                 data = None
             models = data.get("models") if isinstance(data, dict) else None

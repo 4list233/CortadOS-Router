@@ -21,10 +21,16 @@ logger = logging.getLogger("cortados.provider.local_switch")
 
 VIEW_PATH = "/v1/cortados/local"
 SWITCH_PATH = "/v1/cortados/local/switch"
-# One bound for a whole gate call. The gate's status reads pmset (its own 2 s cap) and Ollama's /api/ps (2 s cap), so a
-# healthy node answers in well under 6 s; an asleep node fails at the connect timeout (the node's connect_timeout_s).
+# One bound for a whole gate call, end to end (connect, headers and body share one monotonic deadline:
+# local_gate.deadline_call), so a gate trickling bytes cannot stretch it. The gate's status reads pmset (its own 2 s
+# cap) and Ollama's /api/ps (2 s end to end), so a healthy node answers in well under 6 s; an asleep node fails at the
+# connect timeout (the node's connect_timeout_s, never more than this bound).
 GATE_TIMEOUT_S = 6.0
 GATE_MAX_BYTES = 65536
+# POST SWITCH_PATH's body is {"node": "<id>", "on": true|false}: 1 KiB is ample (a larger one is refused unread), and
+# it must arrive whole within SWITCH_BODY_DEADLINE_S, end to end (server._control_body).
+SWITCH_MAX_BODY = 1024
+SWITCH_BODY_DEADLINE_S = 5.0
 POWER = {"ac", "battery", "unknown"}
 OLLAMA = {"up", "unreachable", "unreadable"}
 REASON_MAX = 200
@@ -71,35 +77,35 @@ def _gate_call(node: dict[str, Any], method: str, body: dict[str, Any] | None = 
                                "token_file_env in its ollama block); its switch can only be flipped on the node")
     conn = local_lane._connection(node["base_url"], node["connect_timeout_s"])
     raw = json.dumps(body).encode() if body is not None else None
-    from cortados_router.local_gate import SWITCH_PATH as gate_path   # the gate's own constant (local_lane imports it too)
+    # The gate's own constant (local_lane imports it too) and its end-to-end deadline reader.
+    from cortados_router.local_gate import SWITCH_PATH as gate_path, deadline_call
+
+    def unreachable(exc: BaseException) -> None:
+        logger.info("local switch: node %s unreachable: %s", nid, type(exc).__name__)
+        raise SwitchError(503, f"local node {nid} unreachable ({type(exc).__name__}): it may be asleep or "
+                               "offline, or its local gate is not running") from None
+
     try:
         try:
-            conn.connect()
-        except (OSError, http.client.HTTPException) as exc:
-            logger.info("local switch: node %s unreachable: %s", nid, type(exc).__name__)
-            raise SwitchError(503, f"local node {nid} unreachable ({type(exc).__name__}): it may be asleep or "
-                                   "offline, or its local gate is not running") from None
-        try:
-            conn.sock.settimeout(GATE_TIMEOUT_S)
-            conn.request(method, local_lane._prefix(node["base_url"]) + gate_path, body=raw,
-                         headers={"content-type": "application/json", **local_lane._auth(node)})
-            resp = conn.getresponse()
-            data = resp.read(GATE_MAX_BYTES)
+            status, data = deadline_call(conn, GATE_TIMEOUT_S, method, local_lane._prefix(node["base_url"]) + gate_path,
+                                         body=raw, headers={"content-type": "application/json", **local_lane._auth(node)},
+                                         max_bytes=GATE_MAX_BYTES, connect_s=node["connect_timeout_s"],
+                                         on_connect_error=unreachable)
         except (OSError, http.client.HTTPException) as exc:
             logger.info("local switch: node %s gate did not answer: %s", nid, type(exc).__name__)
             raise SwitchError(503, f"the local gate on node {nid} accepted the connection but did not answer within "
                                    f"{GATE_TIMEOUT_S:g}s ({type(exc).__name__})") from None
     finally:
         conn.close()
-    if resp.status == 401:
+    if status == 401:
         raise SwitchError(502, f"the local gate on node {nid} refused the provider's token (401): the provider's "
                                "token file does not match the gate's")
-    if resp.status == 404:
+    if status == 404:
         raise SwitchError(502, f"the local gate on node {nid} has no switch endpoint (404): it runs an older "
                                "local_gate.py; restart the gate's LaunchAgent on the node with the new code")
-    if resp.status != 200:
-        logger.warning("local switch: node %s gate answered HTTP %s", nid, resp.status)
-        raise SwitchError(502, f"the local gate on node {nid} answered HTTP {resp.status}")
+    if status != 200:
+        logger.warning("local switch: node %s gate answered HTTP %s", nid, status)
+        raise SwitchError(502, f"the local gate on node {nid} answered HTTP {status}")
     try:
         parsed = json.loads(data)
     except ValueError:

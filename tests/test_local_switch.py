@@ -9,6 +9,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -342,9 +343,202 @@ class ProviderSwitchTests(EndpointHarness):
                          {"switch": "unknown", "allowed": None, "reason": None, "power": "unknown", "training": None,
                           "ollama": "unknown", "models_loaded": ["ok:latest"]})
 
+    def raw_post(self, head: bytes, body: bytes = b"", trickle=None):
+        """POST SWITCH_PATH with hand-written headers on a raw socket: (status, json or None, seconds)."""
+        start = time.monotonic()
+        with socket.create_connection(("127.0.0.1", self.httpd.server_port), timeout=20) as s:
+            s.sendall(b"POST " + local_switch.SWITCH_PATH.encode() + b" HTTP/1.1\r\nhost: x\r\n"
+                      b"authorization: Bearer " + OWNER.encode() + b"\r\ncontent-type: application/json\r\n"
+                      + head + b"\r\n")
+            try:
+                if trickle is None:
+                    s.sendall(body)
+                else:
+                    for i in range(len(body)):
+                        s.sendall(body[i:i + 1])
+                        time.sleep(trickle)
+            except OSError:                             # the server answered and closed before the body was sent
+                pass
+            raw = b""
+            while True:
+                try:
+                    chunk = s.recv(65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                raw += chunk
+                if b"\r\n\r\n" in raw:
+                    hdr, _, rest = raw.partition(b"\r\n\r\n")
+                    n = next((int(l.split(b":")[1]) for l in hdr.split(b"\r\n") if l.lower().startswith(b"content-length")), 0)
+                    if len(rest) >= n:
+                        break
+        hdr, _, rest = raw.partition(b"\r\n\r\n")
+        return int(hdr.split(b" ")[1]), json.loads(rest) if rest else None, time.monotonic() - start
+
+    def test_switch_body_is_bounded(self):
+        ok = json.dumps({"node": "pro", "on": True}).encode()
+        code, data, _ = self.raw_post(b"", ok)                          # no content-length
+        self.assertEqual(code, 411)
+        for cl in (b"-5", b"abc", b"1e3", b""):
+            code, data, _ = self.raw_post(b"content-length: " + cl + b"\r\n", ok)
+            self.assertEqual(code, 400, cl)                              # present but not a byte count
+        big = b'{"node": "pro", "on": true, "pad": "' + b"a" * (1 << 20) + b'"}'
+        code, data, elapsed = self.raw_post(b"content-length: %d\r\n" % len(big), big)
+        self.assertEqual(code, 413)
+        self.assertIn("at most 1024 bytes", data["error"]["message"])
+        code, data, _ = self.raw_post(b"content-length: 1025\r\n", b"")   # refused before a byte is read
+        self.assertEqual(code, 413)
+        code, data, _ = self.raw_post(b"content-length: 9\r\n", b"not json!")
+        self.assertEqual(code, 400)
+        code, data, _ = self.raw_post(b"content-length: 2\r\n", b"[]")
+        self.assertEqual(code, 400)
+        self.assertFalse(self.home.flag.exists())
+        code, data, _ = self.raw_post(b"content-length: %d\r\n" % len(ok), ok)
+        self.assertEqual((code, data["switch"]), (200, "on"))
+
+    def test_switch_body_has_an_absolute_deadline(self):
+        ok = json.dumps({"node": "pro", "on": True}).encode()
+        with patch.object(local_switch, "SWITCH_BODY_DEADLINE_S", 0.3):
+            code, data, elapsed = self.raw_post(b"content-length: %d\r\n" % len(ok), ok, trickle=0.05)
+            self.assertEqual(code, 408)
+            self.assertLess(elapsed, 1.5)                                # trickled whole, it would take ~1.4 s
+            code, data, elapsed = self.raw_post(b"content-length: 500\r\n", b"{")   # stalls after one byte
+            self.assertEqual(code, 408)
+            self.assertLess(elapsed, 1.5)
+        self.assertFalse(self.home.flag.exists())
+
     def test_endpoint_ids(self):
         self.assertEqual(server.endpoint_id(local_switch.VIEW_PATH), "local")
         self.assertEqual(server.endpoint_id(local_switch.SWITCH_PATH + "?x"), "local_switch")
+
+
+class Trickle:
+    """A fake HTTP peer on loopback that reads the request, then answers one byte every `gap` seconds forever: a
+    status line and headers when `headers` is False starts it trickling there, else a 200 header with a long body.
+    Each byte resets a plain socket timeout, so only an end-to-end deadline stops a client."""
+
+    def __init__(self, gap=0.05, in_headers=False):
+        self.gap, self.in_headers = gap, in_headers
+        self.stop = threading.Event()
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(4)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while not self.stop.is_set():
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._one, args=(c,), daemon=True).start()
+
+    def _one(self, c):
+        with c:
+            try:
+                c.settimeout(5)
+                c.recv(65536)
+                if not self.in_headers:
+                    c.sendall(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100000\r\n\r\n")
+                    data = b"{" + b" " * 99999
+                else:
+                    data = b"HTTP/1.1 200 OK\r\n" + b"x-pad: " + b"a" * 100000
+                for i in range(len(data)):
+                    if self.stop.is_set():
+                        return
+                    c.sendall(data[i:i + 1])
+                    time.sleep(self.gap)
+            except OSError:
+                return
+
+    def close(self):
+        self.stop.set()
+        self.sock.close()
+
+
+class DeadlineCallTests(unittest.TestCase):
+    """local_gate.deadline_call: one monotonic deadline for connect, headers and body (review fix: the socket timeout
+    alone reset on every byte, so a trickling gate exceeded a 0.1 s budget)."""
+
+    def trickle(self, **kw):
+        t = Trickle(**kw)
+        self.addCleanup(t.close)
+        return t
+
+    def test_trickling_body_and_headers_stop_at_the_deadline(self):
+        import http.client
+        for in_headers in (False, True):
+            t = self.trickle(in_headers=in_headers)
+            conn = http.client.HTTPConnection("127.0.0.1", t.port)
+            start = time.monotonic()
+            with self.assertRaises((OSError, http.client.HTTPException)):
+                local_gate.deadline_call(conn, 0.3, "GET", "/x", max_bytes=1 << 20)
+            conn.close()
+            self.assertLess(time.monotonic() - start, 1.0, in_headers)
+
+    def test_answers_within_the_deadline_and_caps_the_body(self):
+        import http.client
+        ollama = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllamaPs)
+        threading.Thread(target=ollama.serve_forever, daemon=True).start()
+        self.addCleanup(ollama.server_close)
+        self.addCleanup(ollama.shutdown)
+        FakeOllamaPs.loaded, FakeOllamaPs.ps_status = [TAG], 200
+        conn = http.client.HTTPConnection("127.0.0.1", ollama.server_port)
+        status, raw = local_gate.deadline_call(conn, 5, "GET", "/api/ps", max_bytes=1 << 20)
+        self.assertEqual((status, json.loads(raw)["models"][0]["name"]), (200, TAG))
+        conn = http.client.HTTPConnection("127.0.0.1", ollama.server_port)
+        status, raw = local_gate.deadline_call(conn, 5, "GET", "/api/ps", max_bytes=10)
+        self.assertEqual((status, len(raw)), (200, 10))
+
+    def test_connect_failure_is_reported_apart(self):
+        import http.client
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        seen = []
+        with self.assertRaises(OSError):
+            local_gate.deadline_call(http.client.HTTPConnection("127.0.0.1", port), 1, "GET", "/", max_bytes=10,
+                                     on_connect_error=seen.append)
+        self.assertEqual(len(seen), 1)
+
+
+class TrickleTimeoutTests(Home):
+    """The gate's /api/ps read and the provider's gate call keep their whole-call bounds against a trickling peer."""
+
+    def test_gate_status_with_a_trickling_ollama(self):
+        t = Trickle()
+        self.addCleanup(t.close)
+        gate = local_gate.GateServer(("127.0.0.1", 0), token=TOKEN, upstream=f"http://127.0.0.1:{t.port}",
+                                     read_timeout=5)
+        threading.Thread(target=gate.serve_forever, daemon=True).start()
+        self.addCleanup(gate.server_close)
+        self.addCleanup(gate.shutdown)
+        req = urllib.request.Request(f"http://127.0.0.1:{gate.server_port}{local_gate.SWITCH_PATH}",
+                                     headers={"authorization": f"Bearer {TOKEN}"})
+        with patch.object(local_gate, "PS_TIMEOUT_S", 0.3):
+            start = time.monotonic()
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())
+            elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual((data["ollama"], data["models_loaded"]), ("unreachable", None))
+
+    def test_provider_gate_call_with_a_trickling_gate(self):
+        for in_headers in (False, True):
+            t = Trickle(in_headers=in_headers)
+            self.addCleanup(t.close)
+            node = {"node": "pro", "base_url": f"http://127.0.0.1:{t.port}", "connect_timeout_s": 2.0,
+                    "token": TOKEN}
+            with patch.object(local_switch, "GATE_TIMEOUT_S", 0.3):
+                start = time.monotonic()
+                with self.assertRaises(local_switch.SwitchError) as cm:
+                    local_switch._gate_call(node, "GET")
+                elapsed = time.monotonic() - start
+            self.assertLess(elapsed, 1.0, in_headers)
+            self.assertEqual(cm.exception.status, 503)
+            self.assertIn("did not answer within 0.3s", str(cm.exception))
 
 
 class McpLocalSwitchTests(unittest.TestCase):
