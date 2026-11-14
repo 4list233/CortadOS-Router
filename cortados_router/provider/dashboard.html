@@ -642,7 +642,11 @@ function renderLocal(d, failure) {
       n.training ? "S1 training holds the node" : null])));
     if (n.reason) add(c, el("div", "sub muted", n.reason));
     add(c, el("div", "sub", n.ollama === "up" ? (loaded.length ? "loaded: " + loaded.join(", ") : "no model loaded")
-      : n.reachable ? "Ollama " + (n.ollama || "unknown") : null));
+      : n.reachable ? (n.backend === "vllm-mlx" ? "vllm-mlx " : "Ollama ") + (n.ollama || "unknown") : null));
+    const cap = n.capacity;
+    if (cap && cap.limit !== null && cap.limit !== undefined)
+      add(c, el("div", "sub", (n.backend || "backend") + ": " + cap.inflight + " of " + cap.limit + " running" +
+        (cap.reason ? " (" + cap.reason + ")" : "")));
     const a = n.auto_route;
     add(c, el("div", "sub muted", a ? "auto_route: " + a.model + " for " + (a.bands || []).join(", ") : "auto_route: off (pin-only)"));
     if (n.reachable && (n.switch === "on" || n.switch === "off")) {

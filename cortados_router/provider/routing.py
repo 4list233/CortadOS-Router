@@ -759,6 +759,9 @@ def _node_why(node: dict[str, Any], entry: dict[str, Any], body: dict[str, Any],
     _auto_down.pop(node["node"], None)
     if not local_lane.lists(tags, entry["id"]):
         return f"does not list {entry['id']}", False
+    full = local_lane.gate_busy(node)              # the gate's own admission limit (an MLX node's governor)
+    if full:
+        return f"node busy ({full})", False
     if not need:
         need.append(int(request_fit(body)["input_tokens"]))
     if need[0] > entry["context_length"]:
@@ -1006,7 +1009,8 @@ def index_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, c
     Cost: a local lane spends no subscription quota (core.resolve's weight for local is 0), so a qualifying variant
     wins over S1's cloud choice, the lighter variant first (lower general index: the selection's "pay by general
     index" — the non-thinking variant also answers sooner). It is not taken when its node is busy
-    (local_lane.busy), down, does not list the model, the request outgrows the model's context, or the client excluded
+    (local_lane.busy, or its gate reports its admission limit reached: local_lane.gate_busy), down, does not list the
+    model, the request outgrows the model's context, or the client excluded
     the model; then S1's route stands, with the skip logged (metadata only)."""
     route = r.get("route") or {}
     rid = r.get("route_id")
@@ -1082,6 +1086,10 @@ def index_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, c
         _auto_down.pop(node["node"], None)
         if not local_lane.lists(tags, entry["id"]):
             skip(what, f"does not list {entry['id']}")
+            continue
+        full = local_lane.gate_busy(node)          # the probe just refreshed the gate's report
+        if full:
+            skip(what, f"node busy ({full})")
             continue
         need = int(request_fit(body)["input_tokens"]) if need is None else need
         if need > entry["context_length"]:

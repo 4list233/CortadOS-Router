@@ -546,6 +546,117 @@ only). Check a setup with `python3 -m cortados_router.local_gate --listen <tails
 token file and prints the settings, never the token). On the provider, a 401 from the gate is a 503 "local gate on
 node <id> refused the provider token", with no fallback.
 
+## MLX backend (vllm-mlx) and the activity governor
+
+Ollama does not batch decode on Apple Silicon: on the Pro its aggregate output stays at ~27 tok/s whatever the slot
+count. `vllm-mlx` (an MLX server with continuous batching) serves the same 27B several requests at once. Measured on
+the Pro (48 GB), `vllm-mlx 0.6.0`, `~/models/mlx/Qwen3.8-27B-heretic-ara-4bit-bench` (15 GB, 4-bit), ~8.5k-token
+prompts, 512 output tokens:
+
+| Requests at once | Aggregate tok/s | Per request | TTFT | Makespan |
+|---|---|---|---|---|
+| 1 | 27.1 | 27.1 | 9.5 s | 28 s |
+| 2 | 47.8 | 23.9 | 21 s | 42 s |
+| 4 | 74.6 | 18.7 | 43 s | 70 s |
+| 8 | 87.9 | 11.0 | 85 s | 131 s |
+| 16 | 64.8 | worse | | |
+
+Peak footprint 31 GB at 8; no swap growth.
+
+### How it fits
+
+Nothing changes for the provider's lane protocol. vllm-mlx 0.6.0 serves the Anthropic Messages API itself
+(`POST /v1/messages`: text, `tool_use`/`tool_result`, streaming SSE, stop reasons, usage; read from its source), so
+**no translator was built**: turns are relayed as they are today. The gate (`local_gate.py`) adapts the rest, per
+backend, from a config file on the Pro (`cortados_router/local_backend.py`; example
+`tables/local-backend.example.json`, real file `~/.config/cortados/local-backend.json`; no file = Ollama, no governor):
+
+| Client route (unchanged) | Ollama upstream | vllm-mlx upstream |
+|---|---|---|
+| `GET /api/tags` | `GET /api/tags` | `GET /v1/models`, answered in `/api/tags` shape |
+| `POST /v1/messages` | `POST /v1/messages` | `POST /v1/messages`, body adapted (below) |
+| switch status "models loaded" | `GET /api/ps` | `GET /v1/models` |
+
+Nothing else reaches either backend (`local_backend.UPSTREAM` is the whole table). The adaptation is in the gate, not
+the lane, because only the gate knows its node's backend: the lane stays one Anthropic relay for every node and the
+gate's client-facing routes do not grow. On `POST /v1/messages` to vllm-mlx the gate:
+
+- maps thinking: vllm-mlx ignores Anthropic's `thinking`; the gate sets `chat_template_kwargs.enable_thinking` from it
+  (`disabled` → false, any other type → true; absent → the server default, false in the example). The think variant
+  (`qwen-27b-think`, max_tokens ≥ 4096) therefore thinks; vllm-mlx has no per-request thinking budget on this endpoint,
+  so its `budget_tokens` is not enforced (max_tokens bounds thinking + answer; the lane's #108 guard still turns a
+  turn that thought its whole budget away into a clear error);
+- checks the model: vllm-mlx serves one model; the request must name it (`name` = `name:latest`) and is sent with the
+  exact served name. Any other model (e.g. a `sub/phi-4` conversation started on Ollama) is a 404 at the gate, never
+  silently answered by the MLX model;
+- rewraps FastAPI's `{"detail": …}` errors in Anthropic's error shape.
+
+### The governor (owner-approved policy)
+
+`cortados_router/local_governor.py`, run inside the gate on the Pro. Inputs, sampled at most every `sample_s` (5 s):
+keyboard/mouse idle seconds (`ioreg -r -c IOHIDSystem -d 1`, `HIDIdleTime`) and macOS memory pressure (`sysctl -n
+kern.memorystatus_vm_pressure_level`: 1 normal, 2 warn, 4 critical). The policy as implemented (`policy()`; defaults,
+each threshold with its reason in `tables/local-backend.example.json` → `governor._reasons`):
+
+| Owner | Memory pressure | Admission limit (requests running at once) | Default (4-bit) |
+|---|---|---|---|
+| active (idle < `active_idle_s` 600 s) | normal | min(`active_cap`, idle limit) | 2 |
+| idle (≥ 600 s) | normal | idle limit = min(model `idle_cap`, memory cap) | 8 |
+| any | warn | min(the row above, `warn_cap`) | 1 |
+| any | critical | min(the row above, `critical_cap`) | 0 (nothing new) |
+| unreadable idle | — | counted active | |
+| — | unreadable | counted `unknown_pressure` | warn |
+
+Memory cap = ⌊(`memory_budget_gib` 40 − model `weights_gib` 15) / model `per_request_gib` 2⌋ = 12, so the 4-bit idle
+limit is 8. The limit bounds **admission only**: when the owner comes back with 6 running, the limit drops to 2,
+nothing new is admitted until fewer than 2 run, and the 6 finish on their own (never killed).
+
+Enforcement is an admission count in the gate on `POST /v1/messages` (the probe is never counted). Over the limit the
+gate answers at once, nothing reaching the backend: `529 overloaded_error`, `Retry-After: retry_after_s` (5), message
+`local gate: busy (n of limit running: reason)`, and the capacity report. The gate reports `{"backend", "limit",
+"inflight", "owner", "pressure", "reason"}` read-only as `cortados_gate` in every `GET /api/tags` answer and as
+`capacity` in the switch status (provider `GET /v1/cortados/local`; the dashboard's Local models card shows
+"vllm-mlx: n of limit running (reason)").
+
+The provider (`local_lane.gate_busy`) keeps the latest report per node for 10 s. A full gate is a busy node: the index
+route, auto_route and the sensitive moves skip it after their probe and keep S1's route ("routes elsewhere"). A turn
+the gate refuses (a race between probe and turn, or a continuation of a local-bound conversation) is answered to the
+client as `529 overloaded_error` with the gate's `Retry-After`, the provider's existing busy shape (BUSY_STATUS), which
+Claude Code and the SDK retry; a refused opening turn leaves no conversation behind, so its retry is routed afresh
+(to the cloud while the node stays full). The refusal fallback treats a busy node as unavailable.
+
+### Switch the Pro to MLX
+
+Owner steps; nothing here was run by the build. The provider's lane config needs no protocol change.
+
+1. On the Pro: copy `tables/local-backend.example.json` to `~/.config/cortados/local-backend.json` and check it:
+   `venv` (`~/venvs/mlx-bench`), `vllm_mlx.model` and its entry's `path` (the model directory; a 6-bit copy is another
+   entry, selected here), `served_model_name` = the id the Air's config gives this model (`Qwen27b_heretic:latest`),
+   and `serve.tool_call_parser` (set it to the parser the bench verified tool calls with). Validate:
+   `python3 -B -m cortados_router.local_backend --print-config`.
+2. On the Pro: `scripts/install_mlx_backend.sh --dry-run`, then `scripts/install_mlx_backend.sh` (LaunchAgent
+   `com.cortados.vllm-mlx` on 127.0.0.1:8000, log `~/.cortados/vllm-mlx.log`). Wait for `curl -s
+   http://127.0.0.1:8000/health`.
+3. On the Pro: unload Ollama's 27B so both copies are not held in memory: `ollama stop Qwen27b_heretic:latest`.
+   Nothing reloads it: the gate no longer sends requests to Ollama. (Quit Ollama too if no other use needs it.)
+4. On the Pro: restart the gate so it reads the config: `launchctl kickstart -k gui/$(id -u)/com.cortados.local-gate`.
+   Check: `python3 -m cortados_router.local_gate --listen <tailscale-ip> --print-config` shows `"backend":
+   "vllm-mlx"` and the governor.
+5. On the provider host (the Air), in `tables/resources.json`'s Pro block: `max_inflight` to the idle cap (8), so the
+   provider's own ceiling does not stop at 1 (the gate's governor sets the real limit), and `read_timeout_s` to 900
+   (as the backend config's). Restart the provider when the owner chooses.
+
+With the gate on vllm-mlx the Pro serves only the MLX model: the Ollama-only pins (`qwythos-9b`, `qwen-abliterated`,
+`phi-4`) are "does not list" (a clear 503) until the rollback.
+
+### Roll back to Ollama
+
+1. On the Pro: set `"backend": "ollama"` in `~/.config/cortados/local-backend.json` (or remove the file) and restart
+   the gate (`launchctl kickstart -k gui/$(id -u)/com.cortados.local-gate`).
+2. On the Pro: `scripts/install_mlx_backend.sh --uninstall` (boots `com.cortados.vllm-mlx` out, frees its memory);
+   Ollama loads its 27B again on the next request.
+3. On the Air: `max_inflight` back to 1 (Ollama runs one 27B request at a time) and `read_timeout_s` as before.
+
 ## What this setup does not claim
 
 The home machines are not verified until their SSH targets are configured and
