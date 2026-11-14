@@ -20,7 +20,7 @@ class BridgeConfigDirTests(unittest.TestCase):
             seen["env"] = kw.get("env")
             raise OSError("stop before running")             # record env, then abort; __init__ maps this to BridgeError
         with self.assertRaises(BridgeError):
-            BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
+            BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9",
                           claude_bin="claude", config_dir="/tmp/acctB", popen=fake_popen)
         self.assertEqual(seen["env"].get("CLAUDE_CONFIG_DIR"), "/tmp/acctB")
 
@@ -30,7 +30,7 @@ class BridgeConfigDirTests(unittest.TestCase):
         def fake_popen(args, **kw):
             seen["env"] = kw.get("env"); raise OSError("stop")
         with self.assertRaises(BridgeError):
-            BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
+            BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9",
                           claude_bin="claude", popen=fake_popen)
         self.assertNotIn("CLAUDE_CONFIG_DIR", seen["env"])    # default login
 
@@ -113,7 +113,7 @@ class OAuthTokenStripTests(unittest.TestCase):
         os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "ambient-account-A-token"
         try:
             with self.assertRaises(BridgeError):
-                BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
+                BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9",
                               claude_bin="claude", config_dir="/tmp/acctB", popen=fake_popen)
             self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", seen["env"])
         finally:

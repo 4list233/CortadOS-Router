@@ -205,7 +205,7 @@ The pipeline is in `s1/`, run nightly by `s1/nightly.sh` (or back to back by `s1
 | collect | `dataset.py` | gathers routed requests from the local `router.db` and any in `CORTADOS_ROUTER_DB_EXTRA` (e.g. rsynced from the provider host); a request's train/holdout split is fixed by its id |
 | label | `label.py` | teacher labels via a stateless CLI, k = 3 soft samples; train split by Sonnet, holdout by a stronger Opus |
 | build | `build_sft.py` | builds the SFT set, oversampling rare bands |
-| train | `mlx_lm lora` | warm-starts from the promoted adapter |
+| train | `mlx_lm lora` | warm-starts from the promoted adapter, through a run-owned copy; a symlinked or hard-linked adapter file fails the night before the trainer writes (guards against accidental aliasing, not a same-user adversary, which could change the promoted adapter directly) |
 | grade | `evaluate.py` | grades on the held-out split: band accuracy, under/over-routing, outward recall, ECE, Brier |
 | promote | `nightly.sh` | promotes only with no regression where mistakes are expensive — under-routing and outward recall never regress, band accuracy holds within noise — measured against the incumbent re-graded on the same rows |
 
@@ -263,6 +263,8 @@ CORTADOS_S1_URL=http://<scorer-ip>:8431 CORTADOS_S1_TOKEN=<s1-token> \
     --host <private-ip> --port 8432 \
     --claude-bin /path/to/claude --codex-bin /path/to/codex
 ```
+
+The backend CLIs the provider starts (headless `claude`, `codex app-server`, the search lane's `claude -p`) do not inherit its environment: they get an explicit allowlist (`cortados_router/provider/child_env.py`, #106) of `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LC_*`, `TZ`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, both cases), the CA bundle variables and `__CF_USER_TEXT_ENCODING`, plus `CODEX_HOME` / `CODEX_CA_CERTIFICATE` for Codex and `CLAUDE_CONFIG_DIR` / `CLAUDE_CODE_OAUTH_TOKEN` for Claude. The provider token, `GITHUB_TOKEN`, `AWS_*`, `SSH_AUTH_SOCK` and every API key stay in the provider. The MCP shim that serves the client's tools to the headless Claude CLI does not get the provider token either: each bridged session mints its own random credential, written to its `mcp.json`, that opens only `POST /bridge/call` for that session (every other endpoint answers 401) and is revoked when the session ends or is retired. One accepted exception: a proxy URL with credentials (`http://user:pass@proxy:3128`) passes to the backends unchanged, since those are proxy credentials the owner configured for them. To pass another variable, add it with its reason to `BASE_ENV` or `BACKEND_ENV` in that file and restart the provider (`docs/PROVIDER-PLAN.md`, "Backend environment allowlist").
 
 `CORTADOS_S1_URL` names the scorer; without it (and without a configured endpoints file that selects a remote device) the provider looks for S1 on loopback and routes degraded. On one machine, drop both `CORTADOS_S1_*` and S1 is found on loopback.
 

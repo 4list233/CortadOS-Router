@@ -68,7 +68,7 @@ def codex_home() -> str:
 
 
 def _codex_env() -> dict:
-    env = codex_isolation.child_env(codex_home())
+    env = codex_isolation.prefix_stripped_env(codex_home())    # pre-#106 rule; the allowlist is the provider's
     env["PATH"] = f"{Path.home()}/.local/bin:/opt/homebrew/bin:" + env.get("PATH", "")
     return env
 

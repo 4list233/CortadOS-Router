@@ -16,6 +16,7 @@ os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp())
 from cortados_router import core
 from cortados_router.provider import local_lane, routing
 from tests.test_provider_local import FakeOllama, LocalHarness, TAG, write_config
+from tests.provider_fakes import setUpModule, tearDownModule  # noqa: F401  (FAKE_* reach the fake CLIs, #106)
 
 S1_ROUTE = {"router": "cortados", "provider": "codex-cli", "model": "gpt-5.6-terra", "account": None,
             "config_dir": None, "context_length": 200000, "route_id": "execution:provider:call:abc", "api_request_id": "",

@@ -19,6 +19,7 @@ from unittest import mock
 from cortados_router import child_tasks
 from cortados_router.provider import clients, office
 from tests.test_provider import READ_TOOL, TOKEN, EndpointHarness
+from tests.provider_fakes import setUpModule, tearDownModule  # noqa: F401  (FAKE_* reach the fake CLIs, #106)
 
 OFFICE_TOKEN = "office-token-for-tests-0001"
 SESSION = "3f9a1c2e9b7d4a10"

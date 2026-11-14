@@ -33,6 +33,7 @@ is the long form.
   `routing.py` picks the lane through the router's execution policy; `bridge.py` drives a headless Claude CLI with
   `mcp_shim.py` serving the client's tools; `codex_bridge.py` drives `codex app-server` with the client's tools as
   dynamic tools, under the isolation policy of `codex_isolation.py` (command line, config and login checks, aliases).
+  `child_env.py` is the environment allowlist every backend CLI the provider starts runs on (#106).
   `office.py` is the Office view (`GET /v1/cortados/office`, metadata-only floors per routing session, fed by the
   `x-cortados-session/-project/-device/-task-title` headers, child-tasks.jsonl and `POST /v1/cortados/office/heartbeat`);
   `clients.py` holds the scoped per-client tokens (`clients.json`, hashes + named scopes: `office:read`, `live:read`,
