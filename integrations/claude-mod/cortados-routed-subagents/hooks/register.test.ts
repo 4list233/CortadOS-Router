@@ -3,7 +3,7 @@ import { SHARED_SALT_TRIES, SHARED_SALT_RETRY_MS } from './register'
 import officeVectors from './office-vectors.fixture'
 import { resolveProviderUrl, officeTitle, officeName, baseName, sessionTag, officeHeaderLines, OFFICE_SALT_KEY, OFFICE_BEAT_MIN_MS, OFFICE_BEAT_REFRESH_MS, OFFICE_BEAT_TIMEOUT_MS } from './register'
 import { BG_SWEEP_SH, BG_SWEEP_MS, sweepBackgroundRuns } from './register'
-import { routedChildSettings, BOUNDARY_HOOK_PY, ROUTED_CHILD_ENV } from './register'
+import { routedChildSettings, BOUNDARY_HOOK_PY, ROUTED_CHILD_ENV, boundaryHookPython, boundaryHookCommand } from './register'
 import { MODEL_DIRECTIVE_RE, modelDirective, directiveModelId } from './register'
 import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, refusesAgent, isDelegationTool, AGENT_REFUSAL, ORCHESTRATOR_DIRECTIVE, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL, resolveBackgroundTimeoutMs, BG_LAUNCH_SH, BG_CLEANUP_SH, BACKGROUND_DATA_BOUNDARY, backgroundData, isBgDir } from './register'
 
@@ -402,7 +402,8 @@ test('the routed child is started with the provider credentials and CLAUDE_CODE_
   expect(settings.enabledPlugins['cortados-routed-subagents@cortados-router']).toBe(false)
   const pre = settings.hooks.PreToolUse[0]
   expect(pre.matcher).toBe('Write|Edit|MultiEdit|NotebookEdit|Bash')
-  expect(pre.hooks[0].command.startsWith("python3 -B -c '")).toBe(true)
+  // Isolated (docs/BOUNDARY-HOOK.md "Isolation"): from /, an absolute interpreter, python -I, the source inline.
+  expect(pre.hooks[0].command.startsWith("cd / && exec '/usr/bin/python3' -I -B -c '")).toBe(true)
   expect(pre.hooks[0].command).toContain('toolu_cxb_')
   // The child starts with no MCP servers: built-in tools only, nothing of the parent's exposed to the provider.
   expect(recordedArgv).toContain('--strict-mcp-config')
@@ -1980,4 +1981,26 @@ test('inside a routed child (CORTADOS_ROUTED_SUBAGENT set) every handler of this
   expect(out).toEqual({ native: 'p' })
   expect(launched).toBe(false)
   expect(BOUNDARY_HOOK_PY).toContain('def decide(event')
+})
+
+test('the boundary hook runs on an absolute interpreter outside the project, never a PATH lookup', async () => {
+  const files: Record<string, string> = { '/usr/bin/python3': '/usr/bin/python3', '/work/proj/bin/python3': '/work/proj/bin/python3',
+    '/opt/link/python3': '/work/proj/.venv/bin/python3', '/work/proj': '/work/proj' }
+  const $ = {
+    session: { root: async () => '/work/proj' },
+    fs: { stat: async (p: string) => {
+      if (!(p in files)) throw new Error('ENOENT')
+      return { kind: p === '/work/proj' ? 'dir' : 'file', realPath: files[p] }
+    } },
+  }
+  expect(await boundaryHookPython($, '/usr/bin/python3')).toBe('/usr/bin/python3')
+  for (const bad of ['python3', 'bin/python3', '', '/usr/bin/../bin/python3', '/work/proj/bin/python3', '/opt/link/python3']) {
+    await expect(boundaryHookPython($, bad)).rejects.toThrow('hookPython')
+  }
+  expect(await boundaryHookPython($, '/nope/python3')).toBe('/nope/python3')   // outside the project, not stat-able
+  // No session root or stat on this host: the lexical rule still holds.
+  expect(await boundaryHookPython({}, '/usr/bin/python3')).toBe('/usr/bin/python3')
+  await expect(boundaryHookPython({}, 'python3')).rejects.toThrow('absolute')
+  expect(boundaryHookCommand('/opt/py 3/python3')).toBe("cd / && exec '/opt/py 3/python3' -I -B -c '" + BOUNDARY_HOOK_PY.replace(/'/g, "'\\''") + "'")
+  expect(routedChildSettings('/x/python3')).toEqual({ ...routedChildSettings(), hooks: { PreToolUse: [{ matcher: 'Write|Edit|MultiEdit|NotebookEdit|Bash', hooks: [{ type: 'command', command: boundaryHookCommand('/x/python3'), timeout: 30 }] }] } })
 })

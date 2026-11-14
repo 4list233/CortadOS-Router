@@ -80,9 +80,12 @@ class SessionTests(unittest.TestCase):
                 self.assertIs(data["disableAllHooks"], False)
                 pre = data["hooks"]["PreToolUse"]
                 self.assertEqual(pre[0]["matcher"], "Write|Edit|MultiEdit|NotebookEdit|Bash")
+                # Isolated (docs/BOUNDARY-HOOK.md "Isolation"): from /, an absolute interpreter, python -I.
                 bcmd = shlex.split(pre[0]["hooks"][0]["command"])
-                self.assertEqual(bcmd[:2], ["python3", "-B"])
-                self.assertEqual(Path(bcmd[2]), Path(session.__file__).resolve().with_name("boundary_hook.py"))
+                self.assertEqual(bcmd[:4], ["cd", "/", "&&", "exec"])
+                self.assertTrue(os.path.isabs(bcmd[4]) and os.path.isfile(bcmd[4]), bcmd)
+                self.assertEqual(bcmd[5:7], ["-I", "-B"])
+                self.assertEqual(Path(bcmd[7]), Path(session.__file__).resolve().with_name("boundary_hook.py"))
                 self.assertIn("x-cortados-boundary-hook: 1", data["env"]["ANTHROPIC_CUSTOM_HEADERS"].split("\n"))
                 self.assertEqual(len(pre), 2 if enabled else 1)
                 if enabled:
@@ -94,6 +97,38 @@ class SessionTests(unittest.TestCase):
                     self.assertEqual(Path(command[2]), Path(session.__file__).resolve().with_name("orchestrator_gate.py"))
         with self.assertRaises(session.SessionError):
             self.prepare(["--delegate-budget", "-1"])
+
+    def test_boundary_hook_interpreter_is_absolute_and_outside_the_project(self):
+        import sys
+        real = os.path.realpath(sys.executable)
+        self.assertEqual(session.boundary_hook_python(), real)
+        self.assertEqual(session.boundary_hook_python(self.tmp.name), real)
+        # The launcher's interpreter inside the project: the next absolute candidate, never a PATH lookup.
+        proj = os.path.join(self.tmp.name, "proj")
+        os.makedirs(os.path.join(proj, "bin"))
+        planted = os.path.join(proj, "bin", "python3")
+        with open(planted, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(planted, 0o755)
+        self.assertEqual(session.boundary_hook_python(proj, [planted, real]), real)
+        link = os.path.join(self.tmp.name, "py-link")
+        os.symlink(planted, link)                                # a link outside to a binary inside: refused
+        self.assertEqual(session.boundary_hook_python(proj, [link, real]), real)
+        for bad in ([planted], [link], ["python3"], [os.path.join(self.tmp.name, "missing")], []):
+            with self.subTest(candidates=bad), self.assertRaises(session.SessionError):
+                session.boundary_hook_python(proj, bad)
+
+    def test_boundary_hook_inside_the_project_is_refused(self):
+        from pathlib import Path
+        checkout = str(Path(session.__file__).resolve().parents[1])
+        with self.assertRaises(session.SessionError):
+            session.boundary_hook_entry(checkout)
+        with self.assertRaises(session.SessionError):        # child tasks pass --project-dir
+            self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok, "--project-dir", checkout])
+        _, _, cmd = self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok,
+                                  "--project-dir", self.tmp.name])
+        with open(cmd[cmd.index("--settings") + 1]) as src:
+            self.assertIn(" -I -B ", json.load(src)["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
 
     def test_model_mapping(self):
         self.assertEqual(session.resolve_model("fable"), "sub/claude-fable-5-1")

@@ -21,10 +21,22 @@ Provider and token: CORTADOS_BOUNDARY_URL / CORTADOS_BOUNDARY_TOKEN when set, el
 and ANTHROPIC_AUTH_TOKEN (or ANTHROPIC_API_KEY): the provider that served the turn. The token is never printed.
 
 Standalone and stdlib only: the routed-subagents mod embeds this file verbatim (hooks/register.ts BOUNDARY_HOOK_PY,
-kept identical by tests/test_boundary_hook.py), so it holds no backquote and no dollar-brace."""
+kept identical by tests/test_boundary_hook.py), so it holds no backquote and no dollar-brace.
+
+Isolation (docs/BOUNDARY-HOOK.md "Isolation"): the model may write files into the project, and the hook runs with the
+project as its working directory. Every installer therefore runs it as "cd / && exec <absolute python3> -I -B ...": an
+absolute interpreter (no PATH lookup), isolated mode (neither the working directory nor the script's folder on
+sys.path, no PYTHON* variables, no user site-packages), from /. Run as a program WITHOUT -I, it drops the first
+sys.path entry (the working directory or its own folder) before importing anything else and denies every
+provider-marked call. And it denies a known call whose project folder holds its interpreter or its own file."""
+import sys
+
+if __name__ == "__main__" and not sys.flags.isolated:   # an install without -I: no project module may load below
+    del sys.path[0]                                      # '' (python -c) or this script's folder
+    sys.path[:] = [p for p in sys.path if p and p != "."]
+
 import json
 import os
-import sys
 import urllib.error
 import urllib.request
 
@@ -107,6 +119,38 @@ def check_write(target, project, rules) -> None:
         raise Denied("the file resolves onto a protected path of the project on this machine")
 
 
+def within(path: str, folder: str) -> bool:
+    """path is folder itself or lies below it (both absolute, normalised)."""
+    return path == folder or inside(path, folder) is not None
+
+
+def own_paths() -> list:
+    """What this run loads code from: its interpreter and, run as a file, that file and its folder; each lexically and
+    with symlinks followed."""
+    found = []
+    for what, path in (("interpreter", sys.executable), ("hook file", globals().get("__file__"))):
+        if not path:
+            if what == "interpreter":
+                raise Denied("the hook cannot name its own interpreter")
+            continue
+        for p in {os.path.abspath(path), os.path.realpath(path)}:
+            found.append((what, p))
+            if what == "hook file":
+                found.append(("hook folder", os.path.dirname(p)))
+    return found
+
+
+def check_self(project) -> None:
+    """Deny when the project folder of this call holds the interpreter running this hook, this hook's file or its
+    folder: the model may write there, so the hook could be the model's own code."""
+    if not isinstance(project, str) or not project.startswith("/"):
+        return                                           # check_write denies a write without a project folder
+    roots = {os.path.normpath(project), os.path.realpath(project)}
+    for what, path in own_paths():
+        if any(within(path, root) for root in roots):
+            raise Denied("the boundary hook's %s lies inside the project folder, which the model may write" % what)
+
+
 def decide(event: dict) -> None:
     """Raise Denied when the call must not run; return when it may."""
     tool = event.get("tool_name")
@@ -130,6 +174,7 @@ def decide(event: dict) -> None:
         return
     if answer.get("tool") != tool:
         raise Denied("the call does not match the provider's record of it")
+    check_self(answer.get("project"))
     if tool == "Bash":
         if answer.get("bash") is not True:
             raise Denied("no shell on a sensitive local-routed turn")
@@ -139,7 +184,8 @@ def decide(event: dict) -> None:
     check_write(inp.get(key) if isinstance(inp, dict) else None, answer.get("project"), answer.get("protected"))
 
 
-def main(stdin=None, stderr=None) -> int:
+def main(stdin=None, stderr=None, standalone=False) -> int:
+    """standalone: run as the hook program (not imported), where a run without -I denies every marked call."""
     stdin = stdin or sys.stdin
     stderr = stderr or sys.stderr
     marked = False
@@ -149,6 +195,8 @@ def main(stdin=None, stderr=None) -> int:
             raise ValueError("the hook input is not an object")
         tid = event.get("tool_use_id")
         marked = isinstance(tid, str) and tid.startswith(MARK_PREFIX)
+        if standalone and marked and not sys.flags.isolated:
+            raise Denied("the hook runs without python -I, so files in the project could have replaced its code")
         decide(event)
         return 0
     except Denied as exc:
@@ -162,4 +210,4 @@ def main(stdin=None, stderr=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(standalone=True))

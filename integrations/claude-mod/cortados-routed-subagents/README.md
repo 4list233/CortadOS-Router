@@ -54,6 +54,7 @@ Then set the provider URL (and, if you keep the token inline rather than in a fi
 | `permissionMode` | `bypassPermissions` | Headless permission mode for each routed subagent (see **Blast radius**). |
 | `allowedTools` | `Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit` | The built-in tools a routed subagent has **on this machine**. Passed as both `--tools` (availability — the real boundary, so a tool left out is genuinely absent even under `bypassPermissions`) and `--allowedTools` (permission). Covers built-in tools only; MCP tools are controlled separately. |
 | `claudeBin` | `claude` | The `claude` executable used to run each routed subagent. |
+| `hookPython` | `/usr/bin/python3` | Absolute path of the `python3` (3.9 or later) that runs the boundary hook in each routed subagent. Never looked up on `PATH`; a relative path or one inside the session's project folder denies the routed launch (see **Boundary hook**). |
 | `routeBackground` | `true` | Route background (`run_in_background`) subagents too (owner decision 2026-11-04: every subagent goes through S1). They run detached under `backgroundTimeoutMs`, not the foreground cap; see **Background subagents**. `false` hands them back to the native runner. |
 | `subagentTimeoutMs` | `600000` (10 min) | How long a routed subagent subprocess may run before it is aborted. The max is `600000` (10 min): that is the host's own cap (Claude Code validates `$.process.run`'s `timeoutMs` as an integer from 1 to 600000), so a larger value is clamped to it and a fractional one is rounded down. Lower it to fail fast; a non-positive/invalid value falls back to the default. |
 | `backgroundTimeoutMs` | `7200000` (2 h) | How long a routed **background** subagent may run before its watchdog stops it (TERM, then KILL 10 s later). Real background builders run 30-60+ minutes, so the foreground 10-minute cap would kill them. The max is `10800000` (3 h, the same as a CortadOS child task's limit): an unattended child that never ends burns quota. Larger values are clamped, fractions rounded down, invalid or non-positive values use the default. Foreground subagents keep `subagentTimeoutMs`. |
@@ -274,7 +275,9 @@ unreachable included. The child announces the hook with `x-cortados-boundary-hoo
 sensitive local turns read-only.
 
 The hook is `cortados_router/boundary_hook.py`, embedded verbatim as `BOUNDARY_HOOK_PY` and run as
-`python3 -B -c <source>`, so it needs `python3` (3.9 or later) on `PATH`. Updating from 0.3.x: see **Updating**.
+`cd / && exec <hookPython> -I -B -c <source>`: from `/`, on an absolute interpreter (default `/usr/bin/python3`, never a
+`PATH` lookup), in isolated mode, so nothing the model writes into the project (a `json.py`, a `bin/python3`) can
+replace its code (docs/BOUNDARY-HOOK.md, "Isolation"). Updating from 0.3.x: see **Updating**.
 
 ## Updating
 

@@ -7,7 +7,10 @@ import json
 import os
 import re
 import shutil
+import shlex
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -21,6 +24,7 @@ from cortados_router import boundary_hook as hook
 from cortados_router.provider import effect_boundary as eb
 
 REPO = Path(__file__).resolve().parents[1]
+PY = os.path.realpath(sys.executable)                    # an absolute interpreter, as the installers resolve one
 REGISTER_TS = REPO / "integrations" / "claude-mod" / "cortados-routed-subagents" / "hooks" / "register.ts"
 TOKEN = "test-boundary-token-0001"
 MARKED = eb.MARK_PREFIX + "a" * 24
@@ -65,6 +69,15 @@ def closed_port():
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+def sh_quote(text: str) -> str:
+    return "'" + text.replace("'", "'\\''") + "'"                     # register.ts shQuote
+
+
+def mod_command(python: str) -> str:
+    """register.ts boundaryHookCommand (test_the_mod_builds_its_command_as_mod_command keeps the two in step)."""
+    return "cd / && exec " + sh_quote(python) + " -I -B -c " + sh_quote(Path(hook.__file__).read_text(encoding="utf-8"))
 
 
 class HookBase(unittest.TestCase):
@@ -233,6 +246,152 @@ class UnknownAndFailClosedTests(HookBase):
         self.assertEqual(hook.main(stdin=io.StringIO("not json"), stderr=io.StringIO()), 0)
 
 
+class SelfLocationTests(HookBase):
+    """The hook denies a known call whose project folder holds its interpreter, its file or the file's folder."""
+
+    def test_a_hook_file_inside_the_project_fails_closed(self):
+        FakeCheck.answers[MARKED] = record(eb.COST, self.project)
+        target = {"file_path": os.path.join(self.project, "src", "a.py")}
+        with mock.patch.dict(hook.__dict__, {"__file__": os.path.join(self.project, "tools", "boundary_hook.py")}):
+            self.assertDenied(self.run_hook("Write", target), "hook file lies inside the project")
+        with mock.patch.dict(hook.__dict__, {"__file__": os.path.join(self.project, "boundary_hook.py")}):
+            self.assertDenied(self.run_hook("Write", target), "inside the project")
+        FakeCheck.answers[MARKED] = record(eb.COST, self.project, tool="Bash")
+        with mock.patch.dict(hook.__dict__, {"__file__": os.path.join(self.project, "boundary_hook.py")}):
+            self.assertDenied(self.run_hook("Bash", {"command": "ls"}), "inside the project")
+
+    def test_a_hook_file_linked_into_the_project_fails_closed(self):
+        os.makedirs(os.path.join(self.outside, "real"))
+        os.symlink(os.path.join(self.project, "src"), os.path.join(self.outside, "real", "lnk"))
+        FakeCheck.answers[MARKED] = record(eb.COST, self.project)
+        with mock.patch.dict(hook.__dict__, {"__file__": os.path.join(self.outside, "real", "lnk", "h.py")}):
+            self.assertDenied(self.run_hook("Write", {"file_path": os.path.join(self.project, "a.py")}),
+                              "inside the project")
+
+    def test_an_interpreter_inside_the_project_fails_closed(self):
+        FakeCheck.answers[MARKED] = record(eb.SENSITIVE, self.project)
+        target = {"file_path": os.path.join(self.project, "src", "a.py")}
+        with mock.patch.object(sys, "executable", os.path.join(self.project, ".venv", "bin", "python3")):
+            self.assertDenied(self.run_hook("Write", target), "interpreter lies inside the project")
+        with mock.patch.object(sys, "executable", ""):
+            self.assertDenied(self.run_hook("Write", target), "cannot name its own interpreter")
+        self.assertAllowed(self.run_hook("Write", target))                     # the real one is outside
+
+    def test_unmarked_unknown_calls_skip_the_check(self):
+        with mock.patch.dict(hook.__dict__, {"__file__": os.path.join(self.project, "boundary_hook.py")}):
+            self.assertAllowed(self.run_hook("Write", {"file_path": "/x"}, tid="toolu_01CloudModelOwnId"))
+
+
+PLANTS = {
+    "json.py": "json",
+    os.path.join("urllib", "__init__.py"): "urllib",
+    os.path.join("http", "__init__.py"): "http",
+    "sitecustomize.py": "sitecustomize",
+    "usercustomize.py": "usercustomize",
+}
+
+
+class IsolationTests(HookBase):
+    """The hook runs as the installers run it, with the project (model-writable) as cwd, holding planted modules that
+    would allow the call and record that they ran. Every planted module must stay unexecuted and the marked write
+    outside the project must still be denied (exit 2)."""
+
+    def setUp(self):
+        super().setUp()
+        self.pwned = os.path.join(self.tmp, "pwned")
+        os.makedirs(self.pwned)
+        FakeCheck.answers[MARKED] = record(eb.SENSITIVE, self.project)
+
+    def plant(self, folder):
+        for rel, name in PLANTS.items():
+            path = os.path.join(folder, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("import os\nopen(os.path.join(%r, %r), 'w').close()\nos._exit(0)\n" % (self.pwned, name))
+
+    def planted_python(self, folder):
+        """A python3 in folder/bin that records it ran and allows the call."""
+        os.makedirs(os.path.join(folder, "bin"), exist_ok=True)
+        fake = os.path.join(folder, "bin", "python3")
+        with open(fake, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n: > %s/python3\nexit 0\n" % shlex.quote(self.pwned))
+        os.chmod(fake, 0o755)
+        return os.path.join(folder, "bin")
+
+    def env(self):
+        planted_bin = self.planted_python(self.project)
+        return {"PATH": planted_bin + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"),
+                "PYTHONPATH": self.project, "PYTHONSTARTUP": os.path.join(self.project, "json.py"),
+                "PYTHONHOME": "", "HOME": self.tmp,
+                "CORTADOS_BOUNDARY_URL": self.url, "CORTADOS_BOUNDARY_TOKEN": TOKEN}
+
+    def run_command(self, argv, env=None, cwd=None):
+        ev = json.dumps({"session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Write",
+                         "tool_input": {"file_path": os.path.join(self.outside, "x.py")}, "tool_use_id": MARKED,
+                         "cwd": self.project})
+        env = {k: v for k, v in (env or self.env()).items() if v != ""}
+        return subprocess.run(argv, input=ev, capture_output=True, text=True, env=env, cwd=cwd or self.project,
+                              timeout=60)
+
+    def assertBlockedAndClean(self, r, why="outside the project folder"):
+        self.assertEqual(os.listdir(self.pwned), [], "a planted module or interpreter ran: " + r.stderr)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("cortados boundary: denied", r.stderr)
+        self.assertIn(why, r.stderr)
+        self.assertEqual(os.listdir(self.outside), [])
+
+    def test_the_child_task_command_ignores_planted_modules_and_python(self):
+        from cortados_router import session
+        self.plant(self.project)
+        command = session.boundary_hook_entry()["hooks"][0]["command"]
+        self.assertBlockedAndClean(self.run_command(["sh", "-c", command]))
+
+    def test_the_mod_command_ignores_planted_modules_and_python(self):
+        self.plant(self.project)
+        self.assertBlockedAndClean(self.run_command(["sh", "-c", mod_command(PY)]))
+
+    def test_the_installers_never_look_python3_up_on_path(self):
+        from cortados_router import session
+        argv = shlex.split(session.boundary_hook_entry()["hooks"][0]["command"])
+        self.assertEqual(argv[:3], ["cd", "/", "&&"])
+        self.assertEqual(argv[3], "exec")
+        self.assertTrue(os.path.isabs(argv[4]), argv)
+        self.assertEqual(argv[5:7], ["-I", "-B"])
+        self.assertEqual(argv[7], str(Path(hook.__file__).resolve()))
+
+    def test_a_copy_next_to_planted_modules_ignores_them(self):
+        # The script in a writable folder (here outside the project) with planted modules beside it.
+        side = os.path.join(self.tmp, "writable")
+        os.makedirs(side)
+        copy = os.path.join(side, "boundary_hook.py")
+        shutil.copy(hook.__file__, copy)
+        self.plant(side)
+        self.plant(self.project)
+        self.assertBlockedAndClean(self.run_command(["sh", "-c", "cd / && exec %s -I -B %s" % (
+            shlex.quote(PY), shlex.quote(copy))]))
+        # Even run WITHOUT -I (an older install), its own folder and the cwd are dropped before any import, and a
+        # marked call is denied.
+        self.assertBlockedAndClean(self.run_command([PY, "-B", copy], env={
+            "PATH": os.environ.get("PATH", ""), "CORTADOS_BOUNDARY_URL": self.url,
+            "CORTADOS_BOUNDARY_TOKEN": TOKEN}), "without python -I")
+        self.assertBlockedAndClean(self.run_command([PY, "-B", "-c", Path(hook.__file__).read_text()], env={
+            "PATH": os.environ.get("PATH", ""), "CORTADOS_BOUNDARY_URL": self.url,
+            "CORTADOS_BOUNDARY_TOKEN": TOKEN}), "without python -I")
+
+    def test_a_copy_inside_the_project_fails_closed_even_for_an_inside_write(self):
+        copy = os.path.join(self.project, "tools", "boundary_hook.py")
+        os.makedirs(os.path.dirname(copy))
+        shutil.copy(hook.__file__, copy)
+        self.plant(os.path.dirname(copy))
+        ev = json.dumps({"tool_name": "Write", "tool_input": {"file_path": os.path.join(self.project, "src", "a.py")},
+                         "tool_use_id": MARKED})
+        r = subprocess.run(["sh", "-c", "cd / && exec %s -I -B %s" % (shlex.quote(PY), shlex.quote(copy))],
+                           input=ev, capture_output=True, text=True, cwd=self.project, timeout=60,
+                           env={"PATH": "/usr/bin:/bin", "CORTADOS_BOUNDARY_URL": self.url,
+                                "CORTADOS_BOUNDARY_TOKEN": TOKEN})
+        self.assertBlockedAndClean(r, "hook file lies inside the project")
+
+
 class SharedSourceTests(unittest.TestCase):
     def test_the_mod_embeds_this_file_verbatim(self):
         """The routed-subagents mod runs the same hook in each routed child (python3 -c <this source>)."""
@@ -247,19 +406,22 @@ class SharedSourceTests(unittest.TestCase):
         self.assertNotIn("${", text)
 
     def test_the_mods_command_line_runs_the_hook(self):
-        """The mod's hook command, built as register.ts builds it ('python3 -B -c ' + shQuote(source)), run by sh."""
-        import subprocess
-        import sys
-        src = Path(hook.__file__).read_text(encoding="utf-8")
-        quoted = "'" + src.replace("'", "'\\''") + "'"                     # register.ts shQuote
-        command = "python3 -B -c " + quoted
-        env = {"PATH": os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", ""),
+        """The mod's hook command, built as register.ts builds it (mod_command), run by sh."""
+        env = {"PATH": os.environ.get("PATH", ""),
                "CORTADOS_BOUNDARY_URL": f"http://127.0.0.1:{closed_port()}", "CORTADOS_BOUNDARY_TOKEN": TOKEN}
         for tid, code in (("toolu_01CloudModelOwnId", 0), (MARKED, 2)):
             ev = json.dumps({"tool_name": "Write", "tool_use_id": tid, "tool_input": {"file_path": "/x/y"}})
-            r = subprocess.run(["sh", "-c", command], input=ev, capture_output=True, text=True, env=env, timeout=60)
+            r = subprocess.run(["sh", "-c", mod_command(PY)], input=ev, capture_output=True, text=True, env=env,
+                               timeout=60)
             self.assertEqual(r.returncode, code, r.stderr)
             self.assertNotIn(TOKEN, r.stderr + r.stdout)
+
+    def test_the_mod_builds_its_command_as_mod_command(self):
+        """mod_command mirrors register.ts boundaryHookCommand: from /, absolute interpreter, -I, the source inline."""
+        src = REGISTER_TS.read_text(encoding="utf-8")
+        self.assertIn("return 'cd / && exec ' + shQuote(python) + ' -I -B -c ' + shQuote(BOUNDARY_HOOK_PY)", src)
+        self.assertIn("hookPython: '/usr/bin/python3',", src)
+        self.assertIn("command: boundaryHookCommand(python)", src)
 
     def test_constants_match_the_provider(self):
         from cortados_router import session

@@ -50,6 +50,12 @@
       "default": "claude",
       "description": "The claude executable used to run each routed subagent. Must be on PATH or an absolute path."
     },
+    "hookPython": {
+      "type": "string",
+      "title": "Boundary hook interpreter",
+      "default": "/usr/bin/python3",
+      "description": "Absolute path of the python3 (3.9 or later) that runs the client-side boundary hook in each routed subagent, as python -I from /. Never looked up on PATH; a path inside the session's project folder is refused (docs/BOUNDARY-HOOK.md, Isolation)."
+    },
     "routeBackground": {
       "type": "boolean",
       "title": "Route background subagents too",

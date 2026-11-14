@@ -123,10 +123,49 @@ BOUNDARY_HOOK_HEADER = "x-cortados-boundary-hook"
 BOUNDARY_HOOK_MATCHER = "Write|Edit|MultiEdit|NotebookEdit|Bash"
 
 
-def boundary_hook_entry() -> dict:
-    """The PreToolUse entry running boundary_hook.py (absolute standalone script; shell-quoted). Timeout 30 s, well
-    past the script's own 5 s provider timeout, so the script always answers (and fails closed) itself."""
-    command = "python3 -B " + shlex.quote(str(Path(__file__).resolve().with_name("boundary_hook.py")))
+BOUNDARY_HOOK_FILE = Path(__file__).resolve().with_name("boundary_hook.py")
+# Where the hook's interpreter is looked for, in order, after the interpreter running this launcher: absolute paths
+# only, never a PATH lookup (a project's bin/, venv or node_modules/.bin may come first on PATH; docs/BOUNDARY-HOOK.md).
+SYSTEM_PYTHONS = ("/usr/bin/python3",)
+
+
+def _within(path: str, folder: str) -> bool:
+    folder = folder.rstrip("/") or "/"
+    return path == folder or path.startswith(folder.rstrip("/") + "/")
+
+
+def _inside_project(path: str, project: str | None) -> bool:
+    """path (lexically or with links followed) is the project folder or lies below it (lexically or real)."""
+    if not project:
+        return False
+    roots = {os.path.normpath(os.path.abspath(project)), os.path.realpath(project)}
+    forms = {os.path.normpath(os.path.abspath(path)), os.path.realpath(path)}
+    return any(_within(p, r) for p in forms for r in roots)
+
+
+def boundary_hook_python(project: str | None = None, candidates=None) -> str:
+    """The absolute interpreter for the boundary hook: the real path of the interpreter running this launcher, else
+    SYSTEM_PYTHONS; one inside the project folder is refused (the model may write there). SessionError when none."""
+    if candidates is None:
+        candidates = ([os.path.realpath(sys.executable)] if sys.executable else []) + list(SYSTEM_PYTHONS)
+    for c in candidates:
+        if (c and os.path.isabs(c) and os.path.isfile(c) and os.access(c, os.X_OK)
+                and not _inside_project(c, project)):
+            return c
+    raise SessionError("no python3 for the boundary hook outside the project folder (tried "
+                       + ", ".join(map(str, candidates)) + ")")
+
+
+def boundary_hook_entry(project: str | None = None, python: str | None = None) -> dict:
+    """The PreToolUse entry running boundary_hook.py: `cd / && exec <absolute python3> -I -B <absolute script>`
+    (shell-quoted). No PATH lookup, isolated mode, run from / (docs/BOUNDARY-HOOK.md "Isolation"). A hook script inside
+    the project folder is refused. Timeout 30 s, well past the script's own 5 s provider timeout, so the script always
+    answers (and fails closed) itself."""
+    if _inside_project(str(BOUNDARY_HOOK_FILE), project):
+        raise SessionError("the boundary hook script lies inside the project folder; run the launcher from a router "
+                           "checkout outside it")
+    python = python or boundary_hook_python(project)
+    command = "cd / && exec " + shlex.quote(python) + " -I -B " + shlex.quote(str(BOUNDARY_HOOK_FILE))
     return {"matcher": BOUNDARY_HOOK_MATCHER, "hooks": [{"type": "command", "command": command, "timeout": 30}]}
 
 
@@ -186,11 +225,14 @@ def build_env(base: dict, provider_url: str, token: str, delegate_budget: int = 
 
 
 def settings_content(provider_url: str, token: str, delegate_budget: int = 3, gate: bool = True,
-                     run_id: str | None = None, office_headers=None, local: str | None = None) -> dict:
+                     run_id: str | None = None, office_headers=None, local: str | None = None,
+                     project: str | None = None) -> dict:
+    """project: the session's project folder when known (child tasks: --project-dir); the boundary hook's interpreter
+    and script must lie outside it."""
     # disableAllHooks false: a user settings file cannot switch the boundary hook off while the header says it runs.
     content = {"env": launcher_env(provider_url, token, delegate_budget, run_id, office_headers, local),
                "enabledPlugins": {PLUGIN_ID: False}, "disableAllHooks": False}
-    pre = [boundary_hook_entry()]                # always: the header in env promises it (no hook, no edits)
+    pre = [boundary_hook_entry(project)]         # always: the header in env promises it (no hook, no edits)
     if gate:
         # Absolute standalone script: hook cwd need not be this checkout; shell-quote paths with spaces.
         command = "python3 -B " + shlex.quote(str(Path(__file__).resolve().with_name("orchestrator_gate.py")))
@@ -348,6 +390,8 @@ def parse(argv: list):
     ap.add_argument("--office-header", action="append", default=[], help=argparse.SUPPRESS)
     # child tasks: x-cortados-local on every request of the session (start_task's `local` option)
     ap.add_argument("--local", default=None, help=argparse.SUPPRESS)   # checked by custom_headers (SessionError)
+    # child tasks: the child's project folder; the boundary hook's interpreter and script must lie outside it
+    ap.add_argument("--project-dir", default=None, help=argparse.SUPPRESS)
     return ap.parse_args(argv), extra
 
 
@@ -371,7 +415,7 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home
     check_managed(set(launcher_env(url, token, args.delegate_budget, args.run_id, office, args.local)), managed_dirs)
     settings_path = write_settings(args.settings_dir or SETTINGS_DIR,
                                    settings_content(url, token, args.delegate_budget, not args.no_gate, args.run_id,
-                                                    office, args.local), home)
+                                                    office, args.local, args.project_dir), home)
     return (args, build_env(base_env, url, token, args.delegate_budget, args.run_id, office, args.local),
             build_argv(model, directive, extra, settings_path))
 

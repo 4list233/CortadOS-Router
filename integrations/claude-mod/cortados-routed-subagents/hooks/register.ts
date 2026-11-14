@@ -45,6 +45,7 @@ type Cfg = {
   permissionMode: string
   allowedTools: string
   claudeBin: string
+  hookPython: string
   routeBackground: boolean
   orchestratorMode: boolean
   orchestratorEnforce: boolean
@@ -67,6 +68,10 @@ const FALLBACK: Cfg = {
   permissionMode: 'bypassPermissions',
   allowedTools: 'Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit',
   claudeBin: 'claude',
+  // The interpreter the boundary hook runs on in each routed child (docs/BOUNDARY-HOOK.md "Isolation"): an ABSOLUTE
+  // path, never a PATH lookup (a project's bin/, venv or node_modules/.bin may come first on PATH and plant python3).
+  // One inside the session's project folder is refused.
+  hookPython: '/usr/bin/python3',
   // Owner decision 2026-11-04: every subagent goes through S1, background ones included. They run detached under
   // their own, longer limit (backgroundTimeoutMs), so the foreground 10-minute cap no longer argues for native.
   routeBackground: true,
@@ -787,14 +792,56 @@ export async function isRoutedChild($: any): Promise<boolean> {
 }
 /** This mod's and the pane's plugin ids: disabled in the child's flag settings (its user settings are not loaded). */
 export const CHILD_DISABLED_PLUGINS = ['cortados-routed-subagents@cortados-router', 'cortados-pulse@cortados-router']
-/** The routed child's --settings: the boundary hook, hooks on (a stray disableAllHooks would switch the hook off while
- * the header says it runs), and this mod off. Replaces { disableAllHooks: true }, which also switched the hook off. */
-export function routedChildSettings(): Record<string, unknown> {
+export const HOOK_PYTHON_DEFAULT = '/usr/bin/python3'
+/** The boundary hook's command (docs/BOUNDARY-HOOK.md "Isolation"): from / (the hook runs with the project, which the
+ * model may write, as its working directory), on an absolute interpreter (no PATH lookup), in isolated mode (-I: neither
+ * the working directory nor a script folder on sys.path, no PYTHON* variables, no user site-packages), the source
+ * inline (-c: no hook file on disk the model could reach). */
+export function boundaryHookCommand(python: string = HOOK_PYTHON_DEFAULT): string {
+  return 'cd / && exec ' + shQuote(python) + ' -I -B -c ' + shQuote(BOUNDARY_HOOK_PY)
+}
+/** path is folder itself or lies below it (both absolute). */
+function pathWithin(path: string, folder: string): boolean {
+  const f = folder.replace(/\/+$/, '')
+  return path === f || f === '' || path.startsWith(f + '/')
+}
+/** The real path of p, or undefined when the host cannot stat it. Never throws. */
+async function realPathOf($: any, p: string): Promise<string | undefined> {
+  try {
+    const st = await $.fs.stat(p, { resolve: true })
+    return typeof st?.realPath === 'string' ? st.realPath : undefined
+  } catch {
+    return undefined
+  }
+}
+/** The configured hookPython, checked: absolute, no `.`/`..` segment or control character, and neither it nor its real
+ * path inside the session's project folder (lexical or real). Throws the reason otherwise; the routed launch is then
+ * refused, never run with a PATH lookup. */
+export async function boundaryHookPython($: any, configured: unknown): Promise<string> {
+  const p = String(configured ?? '')
+  if (!p.startsWith('/') || /[\u0000-\u001f\u007f]/.test(p) || p.split('/').some(seg => seg === '.' || seg === '..')) {
+    throw new Error(`routed-subagents: hookPython must be an absolute path to python3 (got ${JSON.stringify(p)}); a PATH lookup could run a python3 the project planted`)
+  }
+  let root: unknown = null
+  try { root = await $.session.root() } catch { root = null }
+  if (typeof root === 'string' && root.startsWith('/')) {
+    const forms = [p, await realPathOf($, p)].filter((x): x is string => typeof x === 'string')
+    const roots = [root, await realPathOf($, root)].filter((x): x is string => typeof x === 'string')
+    if (forms.some(f => roots.some(r => pathWithin(f, r)))) {
+      throw new Error(`routed-subagents: hookPython ${p} lies inside the project folder, which the model may write`)
+    }
+  }
+  return p
+}
+/** The routed child's --settings: the boundary hook (boundaryHookCommand), hooks on (a stray disableAllHooks would
+ * switch the hook off while the header says it runs), and this mod off. Replaces { disableAllHooks: true }, which also
+ * switched the hook off. */
+export function routedChildSettings(python: string = HOOK_PYTHON_DEFAULT): Record<string, unknown> {
   return {
     disableAllHooks: false,
     enabledPlugins: Object.fromEntries(CHILD_DISABLED_PLUGINS.map(id => [id, false])),
     hooks: { PreToolUse: [{ matcher: BOUNDARY_HOOK_MATCHER, hooks: [{
-      type: 'command', command: 'python3 -B -c ' + shQuote(BOUNDARY_HOOK_PY), timeout: 30 }] }] },
+      type: 'command', command: boundaryHookCommand(python), timeout: 30 }] }] },
   }
 }
 /** cortados_router/boundary_hook.py, verbatim (tests/test_boundary_hook.py keeps the two identical). */
@@ -821,10 +868,22 @@ Provider and token: CORTADOS_BOUNDARY_URL / CORTADOS_BOUNDARY_TOKEN when set, el
 and ANTHROPIC_AUTH_TOKEN (or ANTHROPIC_API_KEY): the provider that served the turn. The token is never printed.
 
 Standalone and stdlib only: the routed-subagents mod embeds this file verbatim (hooks/register.ts BOUNDARY_HOOK_PY,
-kept identical by tests/test_boundary_hook.py), so it holds no backquote and no dollar-brace."""
+kept identical by tests/test_boundary_hook.py), so it holds no backquote and no dollar-brace.
+
+Isolation (docs/BOUNDARY-HOOK.md "Isolation"): the model may write files into the project, and the hook runs with the
+project as its working directory. Every installer therefore runs it as "cd / && exec <absolute python3> -I -B ...": an
+absolute interpreter (no PATH lookup), isolated mode (neither the working directory nor the script's folder on
+sys.path, no PYTHON* variables, no user site-packages), from /. Run as a program WITHOUT -I, it drops the first
+sys.path entry (the working directory or its own folder) before importing anything else and denies every
+provider-marked call. And it denies a known call whose project folder holds its interpreter or its own file."""
+import sys
+
+if __name__ == "__main__" and not sys.flags.isolated:   # an install without -I: no project module may load below
+    del sys.path[0]                                      # '' (python -c) or this script's folder
+    sys.path[:] = [p for p in sys.path if p and p != "."]
+
 import json
 import os
-import sys
 import urllib.error
 import urllib.request
 
@@ -907,6 +966,38 @@ def check_write(target, project, rules) -> None:
         raise Denied("the file resolves onto a protected path of the project on this machine")
 
 
+def within(path: str, folder: str) -> bool:
+    """path is folder itself or lies below it (both absolute, normalised)."""
+    return path == folder or inside(path, folder) is not None
+
+
+def own_paths() -> list:
+    """What this run loads code from: its interpreter and, run as a file, that file and its folder; each lexically and
+    with symlinks followed."""
+    found = []
+    for what, path in (("interpreter", sys.executable), ("hook file", globals().get("__file__"))):
+        if not path:
+            if what == "interpreter":
+                raise Denied("the hook cannot name its own interpreter")
+            continue
+        for p in {os.path.abspath(path), os.path.realpath(path)}:
+            found.append((what, p))
+            if what == "hook file":
+                found.append(("hook folder", os.path.dirname(p)))
+    return found
+
+
+def check_self(project) -> None:
+    """Deny when the project folder of this call holds the interpreter running this hook, this hook's file or its
+    folder: the model may write there, so the hook could be the model's own code."""
+    if not isinstance(project, str) or not project.startswith("/"):
+        return                                           # check_write denies a write without a project folder
+    roots = {os.path.normpath(project), os.path.realpath(project)}
+    for what, path in own_paths():
+        if any(within(path, root) for root in roots):
+            raise Denied("the boundary hook's %s lies inside the project folder, which the model may write" % what)
+
+
 def decide(event: dict) -> None:
     """Raise Denied when the call must not run; return when it may."""
     tool = event.get("tool_name")
@@ -930,6 +1021,7 @@ def decide(event: dict) -> None:
         return
     if answer.get("tool") != tool:
         raise Denied("the call does not match the provider's record of it")
+    check_self(answer.get("project"))
     if tool == "Bash":
         if answer.get("bash") is not True:
             raise Denied("no shell on a sensitive local-routed turn")
@@ -939,7 +1031,8 @@ def decide(event: dict) -> None:
     check_write(inp.get(key) if isinstance(inp, dict) else None, answer.get("project"), answer.get("protected"))
 
 
-def main(stdin=None, stderr=None) -> int:
+def main(stdin=None, stderr=None, standalone=False) -> int:
+    """standalone: run as the hook program (not imported), where a run without -I denies every marked call."""
     stdin = stdin or sys.stdin
     stderr = stderr or sys.stderr
     marked = False
@@ -949,6 +1042,8 @@ def main(stdin=None, stderr=None) -> int:
             raise ValueError("the hook input is not an object")
         tid = event.get("tool_use_id")
         marked = isinstance(tid, str) and tid.startswith(MARK_PREFIX)
+        if standalone and marked and not sys.flags.isolated:
+            raise Denied("the hook runs without python -I, so files in the project could have replaced its code")
         decide(event)
         return 0
     except Denied as exc:
@@ -962,7 +1057,7 @@ def main(stdin=None, stderr=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(standalone=True))
 `
 
 /** Only launcher-owned raw artifacts, never the sanitized output.md. Shared by normal processing and recovery. */
@@ -2260,6 +2355,9 @@ export const register: Register = (on, options) => {
     try { resolvedUrl = await resolveProviderUrl($, cfg.providerUrl) }
     catch (err) { return { deny: String(err) } }
     const runCfg = { ...cfg, providerUrl: resolvedUrl }
+    let hookPython: string
+    try { hookPython = await boundaryHookPython($, cfg.hookPython) }
+    catch (err) { return { deny: String(err) } }
     let token: string
     try {
       token = await resolveToken($, cfg)
@@ -2306,7 +2404,7 @@ export const register: Register = (on, options) => {
       '--permission-mode', String(cfg.permissionMode),
       '--tools', tools,
       '--allowedTools', tools,
-      '--settings', JSON.stringify(routedChildSettings()),
+      '--settings', JSON.stringify(routedChildSettings(hookPython)),
       // Load NO user/project/local settings, as the provider's own bridge does: otherwise a settings `env` block
       // could restore a conflicting ANTHROPIC_API_KEY/ANTHROPIC_BASE_URL and override the launch env below, sending
       // the provider token to the wrong endpoint or a stale key to the provider (Codex review, 2026-10-28).

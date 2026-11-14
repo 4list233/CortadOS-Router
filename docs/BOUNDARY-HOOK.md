@@ -49,15 +49,51 @@ An id **without** the prefix passes on every one of these errors. The provider m
 so its silence about any other id changes nothing. On the provider side, a sensitive turn from a client without the
 header fails closed to read-only. The provider's own realpath check (`blocked_write`) stays as defence in depth.
 
+## Isolation
+
+Review finding 2026-11-14 (gpt-6.1-sol, HIGH, reproduced on `f87bd99`): **the hook ran Python from the
+model-writable project.** Claude Code runs a command hook with the project as its working directory, and a sensitive
+turn may write files there. The mod's `python3 -B -c '<source>'` put the working directory on `sys.path`, so a
+`<project>/json.py` the model wrote ran on the hook's next `import json`, with the client's privileges, and could exit
+0. `python3` itself came from `PATH`, where a project `bin/`, an activated venv or `node_modules/.bin` can come first.
+The rules now:
+
+1. **Isolated mode.** Every installer runs the hook as `python3 -I -B`. `-I` keeps the working directory and the
+   script's folder off `sys.path` and ignores `PYTHON*` variables and user site-packages.
+2. **No PATH lookup.** The interpreter is an absolute path fixed when the settings are written. Child tasks
+   (`session.boundary_hook_python`): the real path of the interpreter running the launcher, else `/usr/bin/python3`.
+   The mod: its `hookPython` option, default `/usr/bin/python3`, which must be absolute with no `.`/`..` segment. One
+   inside the project folder (lexically or after following links) is refused: the child task is not prepared
+   (`SessionError`), the routed subagent is denied. Neither falls back to `PATH`.
+3. **From `/`.** The command is `cd / && exec <python> -I -B …`, so the hook never runs in the project folder.
+4. **Hook location.** The hook's code lives outside any model-writable path: the mod passes the source inline (`-c`, no
+   file on disk), child tasks run `boundary_hook.py` from the router checkout running the launcher. `session.py`
+   refuses a checkout inside the child's project folder (`--project-dir`, passed by `child_tasks` when the task has a
+   `cwd`). At run time the hook checks itself: a known call whose recorded project folder holds the hook's interpreter,
+   its file or the file's folder (lexically or real) is **denied**, Bash included.
+5. **Imports.** The hook is stdlib only and imports nothing from the project. Run as a program without `-I` (an older
+   settings file), it deletes the first `sys.path` entry (the working directory or its own folder) and empty entries
+   before importing anything beyond `sys`, and **denies** every marked call: a missing `-I` is a misconfiguration,
+   never a quiet pass.
+
+Tests (`tests/test_boundary_hook.py`, subprocess, fakes only): `IsolationTests` run the child-task command and the mod's
+command through `sh` with the project as cwd, a planted `json.py`, `urllib/`, `http/`, `sitecustomize.py` and
+`usercustomize.py` there and on `PYTHONPATH`, and a planted `python3` first on `PATH`; none runs, and the marked write
+outside the project is still denied. A copy of the script beside planted modules is not hijacked (with `-I`, and without
+it, where marked calls are denied). A copy inside the project denies even an in-project write. `SelfLocationTests`
+cover the interpreter and file checks in process; `test_the_mod_builds_its_command_as_mod_command` keeps the test's
+command and register.ts in step. `tests/test_session.py` checks the interpreter choice and the project refusals; the
+mod's `register.test.ts` checks `boundaryHookPython` and the command prefix.
+
 ## Where the hook is installed
 
 - **CortadOS child tasks, on any host:** `cortados_router/session.py` `settings_content`. The launcher's 0600
   settings file always carries the boundary hook as the first PreToolUse entry
-  (`python3 -B <checkout>/cortados_router/boundary_hook.py`, timeout 30 s), plus `disableAllHooks: false`, so a user
+  (`cd / && exec <absolute python3> -I -B <checkout>/cortados_router/boundary_hook.py`, timeout 30 s; "Isolation"), plus `disableAllHooks: false`, so a user
   settings file cannot switch it off. `custom_headers` adds the header to `ANTHROPIC_CUSTOM_HEADERS`. Both are written
   together, so the header never goes out without the hook.
 - **The owner's interactive sessions:** the `cortados-routed-subagents` mod (0.4.0). Each routed subagent child gets
-  `--settings` from `routedChildSettings()`: the hook as `python3 -B -c '<BOUNDARY_HOOK_PY>'` (the file embedded
+  `--settings` from `routedChildSettings()`: the hook as `cd / && exec '<hookPython>' -I -B -c '<BOUNDARY_HOOK_PY>'` (the file embedded
   verbatim, kept identical by `tests/test_boundary_hook.py`), `disableAllHooks: false`, and this mod and the pane
   disabled. These replace `disableAllHooks: true`, which would also have switched the hook off. The child env carries
   the header and `CORTADOS_ROUTED_SUBAGENT=1`, which keeps the mod's Agent router, gate and directive inert there. The
@@ -65,7 +101,8 @@ header fails closed to read-only. The provider's own realpath check (`blocked_wr
 
 ## Honest limits
 
-- The header is the client's word. If a client sends it and the hook then does not run (`python3` missing on `PATH`,
+- The header is the client's word. If a client sends it and the hook then does not run (the absolute interpreter
+  missing, e.g. no `/usr/bin/python3` or the macOS developer-tools stub not installed,
   hooks disabled by a managed policy, a Claude Code that ignores the hook), the provider cannot tell. Edits then pass
   under the provider-side rules alone.
 - A time-of-check/time-of-use race: a link created between the hook's check and the write is not seen.
