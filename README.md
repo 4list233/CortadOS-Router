@@ -944,6 +944,8 @@ Then open `https://air.tailb38028.ts.net:8444/dashboard` (the HTTPS address: the
 - A good login sets the cookie `cortados_dash` (32 random bytes; `HttpOnly; Secure; SameSite=Strict; Path=/`,
   30 days). The server keeps only its SHA-256, with its expiry and the password generation, in
   `$CORTADOS_HOME/dashboard-sessions.json` (0600), so a provider restart does not log the owner out.
+  `SameSite=Strict` means a browser does not send it when the dashboard is opened from a link on another site
+  (a chat app, a mail): that first load shows the login page; open the address directly or from a bookmark instead.
 - **What a session can do:** the dashboard's read views only (`GET /v1/cortados/live`, `/usage`, `/tasks`, `/office`,
   with their parameters), plus the `local:switch` scope (`GET /v1/cortados/local`, `POST /v1/cortados/local/switch`,
   once those endpoints merge). **What it cannot do:** `/v1/messages`, `/v1/responses`, count_tokens, `/v1/models`,
