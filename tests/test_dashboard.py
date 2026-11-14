@@ -463,6 +463,23 @@ class DashboardRenderTest(unittest.TestCase):
         for bad in ("[object Object]", "undefined", "NaN", ot.SECRET, "null"):
             self.assertNotIn(bad, tree, bad)
 
+    def test_live_tab_draws_a_pro_hosted_task_under_its_session(self):
+        # #118: a task run with host "here" on the Pro, known only from the Pro's heartbeat, under the session that
+        # started it, and the panel says which hosts' tasks it holds
+        from tests import test_orchestrator_tree as ot
+        out = self.run_page(None, "live", live_view=ot.view(heartbeats=ot.beats_with()))
+        tree = out[out.index("Orchestrators"):out.index("\nTasks\n")]
+        self.assertIn("tasks on air, pro", tree)
+        self.assertNotIn("tasks on air only", tree)
+        mine, theirs = tree.index("CortadOS-Router"), tree.index("Grounds")
+        self.assertLess(mine, tree.index("Pro side job"))
+        self.assertLess(tree.index("Pro side job"), theirs)                       # in MINE's group, not OTHER's
+        self.assertLess(theirs, tree.index("Their pro job"))
+        self.assertIn("on pro · claude-haiku-5 (claude#a)", tree)
+        self.assertNotIn("stale copy", tree)
+        for bad in ("[object Object]", "undefined", "NaN"):
+            self.assertNotIn(bad, tree, bad)
+
     def test_live_tab_flags_a_failed_sub_session(self):
         # a running task whose subagent failed: counted in attention, said on the task in words (review 2026-11-14)
         from tests import test_orchestrator_tree as ot

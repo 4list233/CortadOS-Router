@@ -66,7 +66,7 @@ in the fallback (§5).
 The dashboard's Live tab gets an **Orchestrators** panel above Tasks. Text mock (▾ open, ▸ folded):
 
 ```
-Orchestrators                                    2 main sessions · Grok Bot · tasks on air only
+Orchestrators                                    2 main sessions · Grok Bot · tasks on air, pro
 ▾ ● working  CortadOS-Router  on pro · session aaaaaaaa · claude-opus-5 · tool mcp__cortados-route__start_task
              ● 2 running · ✓ 1 done · ? 1 unknown   ! 1 needs attention
   │ ▾ ● running  Build the tree                                                         5m 00s
@@ -120,8 +120,9 @@ tool name, Office tag) or from fixed vocabularies (status, phase, role).
   sub-session's phase is the provider's own state.
 - **Tokens:** shown only when recorded (`null` otherwise). Local-lane turns and anything before a provider restart are
   not counted.
-- **Scope:** as before, the provider host's child-task log. A task on another execution host shows only through the
-  stub of a start made from this machine.
+- **Scope (#118):** the provider host's child-task log, plus the task entries each exec host's heartbeat carries from
+  its own log (§9). Without a heartbeat from that host, a task there shows only through the stub of a start made from
+  the provider host, or in the pane from the pane's own machine's log.
 
 ## 5. Privacy: how the pane proves its session
 
@@ -215,12 +216,27 @@ costs per input: §5.
    their checkout is updated (`git pull` on each exec host).
 3. **The pulse mod (each machine):** installed from the marketplace:
    `/plugin marketplace update cortados-router`, then `/plugin update cortados-pulse@cortados-router` (or `/plugin`
-   → cortados-pulse → Update), then `/reload-plugins`. The version reads 0.5.0. Loaded with `--plugin-dir`: pull the
+   → cortados-pulse → Update), then `/reload-plugins`. The version reads 0.5.1 (#118, §9). Loaded with `--plugin-dir`: pull the
    checkout and restart Claude Code (or `/reload-plugins`). Nothing to configure. The salt file
    `~/.config/cortados/office-salt` is made by the cortados-route MCP server on first start, as before.
 4. **Optional:** a narrow `live:session` token for panes (§5).
 
 ## 8. Tests
+
+- #118 (§9): `tests/test_orchestrator_tree.py` `HostTasksTest` and `SessionEndpointTest.
+  test_a_posted_pro_heartbeat_puts_its_task_in_its_sessions_view_only`: a Pro-hosted task with origin X appears in X's
+  session view and under X in the fleet tree, never in another session's view or an unknown tag's (checked by id and
+  title, over the real endpoint too); a task nested on the Pro under an Air task inherits its orchestrator; the provider
+  host's own copy wins and nothing doubles; a stale heartbeat's task is unknown; its routed conversations are its
+  sub-sessions; a host's report replaces a remote stub; a task started from the Pro onto the Air needs no stub on the
+  Air. `tests/test_live.py` `HeartbeatTest.test_tasks_block`: every field rule, another host's task refused, the 24 h
+  window. `tests/test_live_heartbeat.py` `TasksBlockTest`: the sender's block from a fake log (metadata only, running
+  first, capped and said, an unreadable log costs the block only, an oversize body sheds task entries first) and the
+  installer on the Pro (`com.cortados.task.*` skipped, `--no-tasks`). `tests/test_dashboard.py`: the Pro task under its
+  session in the Orchestrators panel, "tasks on air, pro". The mod: the local log's parse (own tasks only, metadata
+  only, bounded tail, 10 h rule), the merge (by id, once, counts and attention in step, a locally finished task or a
+  stale heartbeat's guess corrected), the fallback lines, and the poll (read every 30 s, standing when the provider is
+  unreachable).
 
 - `tests/test_orchestrator_tree.py`: the tree (groups, nesting and inheritance, a follow-up by another session, a
   parent cycle, sub-sessions with roles, statuses and tokens, routed subagents, Grok Bot, unattributed, attention,
@@ -247,3 +263,62 @@ costs per input: §5.
   Regenerate the fixtures after a deliberate shape change:
   `python3 -B -c "from tests import test_orchestrator_tree as t; t.write_session_fixture()"` and
   `python3 -B -c "from tests import test_pulse_fixture as t; t.write_live_fixture()"`.
+
+## 9. Tasks on every exec host (#118)
+
+**Problem.** A main session on the Pro that calls `start_task` with host "here" runs the child on the Pro, which logs
+it only in the Pro's own `~/.cortados/child-tasks.jsonl`. The provider (the Air) builds the tree from its own log, so
+neither the pane's "This session" nor the dashboard showed such a task. The round-2 origin index does not help either:
+`tasks/by-origin/<tag>/` is written on the machine that called `start_task`, and the Air's session endpoint reads the
+Air's. For a session on the Pro whose task ran **on the Air**, that path never applies, and it is not needed: the Pro's
+`start_task` sends the origin with the request, the Air's `--remote` start records it, and the task is in the Air's own
+log under that origin (`HostTasksTest.test_a_task_started_from_the_pro_onto_the_air_needs_no_stub_on_the_air`).
+
+**Fix, provider side.** Each host's heartbeat sender (`live_heartbeat.tasks_block`) reads its own log through the live
+view's own reader (`office.read_child_events`, the bounded tail; `live.tasks_section` for the state, peeking at its own
+task dirs) and posts up to 40 entries of the last 24 h: task id, origin tag (and project/device), title, state, phase
+(fixed phrases only), model and lane when logged, host, start and end times, parent task id, workspace state, browser
+flag. Never the prompt, cwd, command or output. `live.validate_tasks` re-checks every field by the rule the view
+applies to its own log, refuses an entry for another host (a host speaks for its own tasks; a `live:heartbeat` token is
+already bound to its host) and drops entries outside the window. `live.heartbeat_rows` turns them into tree rows: the
+provider host's own log wins on a shared id, the most recently received heartbeat wins between hosts, a heartbeat past
+its TTL shows its running tasks as `unknown`, and the run id joins the Office board and the routed conversations as
+for a local task. The rows join the tree's input before the session filter, so `/v1/cortados/live/session` and the
+Orchestrators panel hold every host's tasks, each attributed by its origin tag (and the parent chain), and a session's
+view still holds nothing of another session. The tree's `scope` is `provider host and heartbeats`, and `task_hosts`
+names the hosts that sent a block (host names only). The Tasks panel keeps its provider-host scope.
+
+Bounds: 40 entries per heartbeat, 16 (+ configured) hosts on the board, the heartbeat's byte cap raised to 48 KiB. The
+sender halves its entries (`truncated`) before it drops the orchestrator block, and never drops the jobs. An older
+provider's 400 makes the sender retry without the block. A host whose block was cut (more than 40 tasks in its window)
+is said in the fleet view as `inputs_truncated: ["host tasks"]`, never in a session's view: that cut is over every
+session's tasks on the host, and a session's flags are about its own data only (§5).
+
+**Fix, pane side (0.5.1).** The pane also reads its own machine's log (`$CORTADOS_HOME`, else
+`$CORTADOS_HERMES_HOME`, else `~/.cortados`, then `/child-tasks.jsonl`) at most every 30 s, keeps only its own session's
+tasks (its tag, or a parent's within the log), from the last 2 MiB / 5000 lines, and merges them by task id into the
+provider's subtree (`mergeLocal`). The provider's node wins (it has sub-sessions and tokens), except that a task the
+local log saw end is shown ended, and a task the view knows only second-hand (a stale heartbeat, an `elsewhere` stub)
+takes the local state. A task only the local log knows is drawn too, with a dim "from this machine's task log only"
+line. Without any provider answer (unreachable, or never reached), the fallback view draws the local tasks the
+provider's lists lack. So a host "here" task shows in its own session's pane at once, before any heartbeat exists.
+
+**Deploy (the orchestrator, after review; nothing is installed by this branch):**
+
+1. Merge, `git pull` on the Air, restart the provider (`com.cortados.provider`). Until then it refuses the block, and
+   the senders post without it.
+2. `git pull` on the Studio (its sender runs from the checkout). Its `heartbeat.json` needs no change: an absent
+   `tasks` key means on.
+3. The Pro, which runs no heartbeat yet. On the Air, mint its token:
+   `python3 -B -m cortados_router.provider.clients add pro-heartbeat --scope live:heartbeat --host pro --token-file ~/.config/cortados/heartbeat-tokens/pro`.
+   Copy it to the Pro as `~/.config/cortados/live-heartbeat-token`, mode 600. Then, on the Pro, from its checkout:
+
+   ```sh
+   scripts/install_live_heartbeat.sh pro --orchestrator --dry-run   # look first: no com.cortados.task.* label in jobs
+   scripts/install_live_heartbeat.sh pro --orchestrator
+   ```
+
+   The Pro's `~/.config/cortados/provider-url` (the pane's own pointer) is where it posts. `--orchestrator` adds the
+   main sessions' tokens to the Work split, as on the Air.
+4. Each machine's pulse mod: `/plugin marketplace update cortados-router`, then
+   `/plugin update cortados-pulse@cortados-router`, then `/reload-plugins` (0.5.1).

@@ -660,6 +660,174 @@ class SessionEndpointTest(tl.EndpointHarness):
             self.assertIn({"source": "task_dir", "error": "PermissionError"}, json.loads(raw)["orchestrators"]["errors"])
 
 
+    def test_a_posted_pro_heartbeat_puts_its_task_in_its_sessions_view_only(self):
+        """#118 over the real endpoint: the Pro posts its host "here" tasks in its heartbeat; the Air's session view
+        for MINE holds MINE's, OTHER's view holds OTHER's, and the owner's fleet tree holds both."""
+        import time
+        now = time.time()
+        body = {"host": "pro", "ttl_s": 180, "jobs": [], "tasks": {"items": [
+            {"task_id": PRO_RUN, "host": "pro", "state": "running", "title": "Pro side job", "started_at": now - 60,
+             "origin_session": MINE, "origin_project": "CortadOS-Router", "origin_device": "pro"},
+            {"task_id": PRO_THEIRS, "host": "pro", "state": "succeeded", "title": "Their pro job",
+             "started_at": now - 900, "ended_at": now - 300, "origin_session": OTHER}]}}
+        code, raw, _ = self.request("POST", live.HEARTBEAT_PATH, tl.TOKEN, body=body)
+        self.assertEqual(code, 200, raw)
+        code, raw, _ = self.request("GET", live.SESSION_PATH + "?session=" + MINE, SESSION_TOKEN)
+        self.assertEqual(code, 200, raw)
+        o = json.loads(raw)["orchestrators"]
+        self.assertEqual([(t["task_id"], t["host"], t["status"]) for t in o["items"][0]["tasks"]],
+                         [(PRO_RUN, "pro", "running")])
+        self.assertEqual((o["scope"], o["task_hosts"]), (live.TREE_SCOPE, ["pro"]))
+        for bad in (PRO_THEIRS, "Their pro job", OTHER):
+            self.assertNotIn(bad, raw, bad)
+        self.httpd._live_memo = live.Memo()
+        raw = self.request("GET", live.SESSION_PATH + "?session=" + OTHER, SESSION_TOKEN)[1]
+        self.assertEqual([t["task_id"] for t in json.loads(raw)["orchestrators"]["items"][0]["tasks"]], [PRO_THEIRS])
+        for bad in (PRO_RUN, "Pro side job", MINE):
+            self.assertNotIn(bad, raw, bad)
+        fleet = groups(json.loads(self.request("GET", live.LIVE_PATH, tl.TOKEN)[1]))
+        self.assertEqual((ids(fleet[MINE]), ids(fleet[OTHER])), ([PRO_RUN], [PRO_THEIRS]))
+        # a heartbeat cannot speak for another host's task
+        bad = {**body, "host": "studio"}
+        self.assertEqual(self.request("POST", live.HEARTBEAT_PATH, tl.TOKEN, body=bad)[0], 400)
+
+
+PRO_RUN = "t20261111094000-f0000001"        # MINE's, run with host "here" on the Pro: only in the Pro's heartbeat
+PRO_THEIRS = "t20261111094100-f0000002"     # OTHER's, also on the Pro
+PRO_NESTED = "t20261111094200-f0000003"     # on the Pro, parent ROOT (on the Air), no origin of its own
+
+
+def pro_items():
+    return [
+        {"task_id": PRO_RUN, "state": "running", "title": "Pro side job", "started_at": NOW - 400,
+         "model": "claude-haiku-5", "lane": "claude#a", "origin_session": MINE, "origin_project": "CortadOS-Router",
+         "origin_device": "pro"},
+        {"task_id": PRO_THEIRS, "state": "succeeded", "title": "Their pro job", "started_at": NOW - 2000,
+         "ended_at": NOW - 1000, "origin_session": OTHER, "origin_project": "Grounds"},
+        {"task_id": PRO_NESTED, "state": "running", "title": "Pro nested", "started_at": NOW - 100,
+         "parent_task_id": ROOT},
+        # the provider host's own log has ROOT: a heartbeat's copy of it never replaces or doubles it
+        {"task_id": ROOT, "state": "succeeded", "title": "stale copy", "started_at": NOW - 300, "ended_at": NOW - 1}]
+
+
+def beats_with(host="pro", items=None, at=NOW - 20, ttl=180):
+    """tl.heartbeats() (the Studio's and the Air's) plus one host's heartbeat carrying a tasks block."""
+    b = tl.heartbeats()
+    hb, bad = live.validate_heartbeat({"host": host, "ttl_s": ttl, "jobs": [],
+                                       "tasks": {"items": pro_items() if items is None else items}}, NOW)
+    assert bad is None, bad
+    b.post(hb, at)
+    return lambda: b.snapshot(NOW)
+
+
+class HostTasksTest(unittest.TestCase):
+    """#118: tasks that ran on another execution host (host "here" on the Pro), known only from that host's own
+    child-task log, reach the tree through its heartbeat's tasks block, attributed by their origin tag."""
+
+    def test_a_pro_task_shows_in_its_sessions_view_and_never_in_anothers(self):
+        v = live.session_view(view(MINE, heartbeats=beats_with()), MINE)
+        mine = v["orchestrators"]["items"][0]
+        self.assertIn(PRO_RUN, ids(mine))
+        pro = next(t for t in mine["tasks"] if t["task_id"] == PRO_RUN)
+        self.assertEqual((pro["host"], pro["status"], pro["title"], pro["model"], pro["lane"]),
+                         ("pro", "running", "Pro side job", "claude-haiku-5", "claude#a"))
+        self.assertEqual(pro["elapsed_s"], 400.0)
+        raw = json.dumps(v)
+        for bad in (PRO_THEIRS, "Their pro job", "stale copy") + SessionFilterTest.FOREIGN:
+            self.assertNotIn(bad, raw, bad)
+        theirs = json.dumps(live.session_view(view(OTHER, heartbeats=beats_with()), OTHER))
+        self.assertIn(PRO_THEIRS, theirs)
+        for bad in (PRO_RUN, "Pro side job", PRO_NESTED, "Pro nested", MINE):
+            self.assertNotIn(bad, theirs, bad)
+        nobody = json.dumps(live.session_view(view("cccccccccccccccc", heartbeats=beats_with()), "cccccccccccccccc"))
+        for bad in (PRO_RUN, PRO_THEIRS, PRO_NESTED):
+            self.assertNotIn(bad, nobody, bad)
+
+    def test_the_fleet_tree_has_every_hosts_tasks(self):
+        v = view(heartbeats=beats_with())
+        g = groups(v)
+        self.assertIn(PRO_RUN, ids(g[MINE]))
+        self.assertIn(PRO_THEIRS, ids(g[OTHER]))
+        self.assertEqual((v["orchestrators"]["scope"], v["orchestrators"]["task_hosts"]), (live.TREE_SCOPE, ["pro"]))
+        self.assertEqual(v["tasks"]["scope"], live.SCOPE)            # the tasks section is still the provider host's
+        self.assertNotIn(PRO_RUN, json.dumps(v["tasks"]))
+        for tid in (PRO_RUN, PRO_THEIRS, PRO_NESTED):              # the hosts section carries no task entry
+            self.assertNotIn(tid, json.dumps(v["hosts"]), tid)
+
+    def test_a_task_nested_across_hosts_inherits_its_parents_orchestrator(self):
+        root = groups(view(heartbeats=beats_with()))[MINE]["tasks"][0]
+        self.assertEqual(root["task_id"], ROOT)
+        nested = next(t for t in root["tasks"] if t["task_id"] == PRO_NESTED)
+        self.assertEqual((nested["host"], nested["origin_via"]), ("pro", "parent"))
+
+    def test_the_provider_hosts_own_log_wins_and_nothing_doubles(self):
+        v = view(heartbeats=beats_with())
+        everything = [t for g in v["orchestrators"]["items"] for t in ids(g)]
+        self.assertEqual(everything.count(ROOT), 1)
+        self.assertNotIn("stale copy", json.dumps(v))
+        self.assertEqual(groups(v)[MINE]["tasks"][0]["status"], "running")
+
+    def test_a_stale_heartbeat_never_shows_a_task_as_live(self):
+        g = groups(view(heartbeats=beats_with(at=NOW - 1000, ttl=180)))[MINE]
+        pro = next(t for t in g["tasks"] if t["task_id"] == PRO_RUN)
+        self.assertEqual((pro["state"], pro["status"], pro["phase"]), ("unknown", "unknown", live.STALE_HB_PHASE))
+        self.assertEqual(g["attention"], 3)                        # AWAY, PRO_RUN, and PRO_NESTED under ROOT
+
+    def test_a_pro_tasks_routed_conversations_are_its_sub_sessions(self):
+        conv = {"key": "r:" + PRO_RUN, "ref": "c-000000000030", "provider": "claude", "lane": "claude#a",
+                "model": "claude-haiku-5", "opened_at": NOW - 390, "last_used": NOW - 2, "busy": True,
+                "session": MINE}
+        mine = view(MINE, heartbeats=beats_with(), conversations=lambda: tagged(backend()) + [conv])
+        pro = next(t for t in mine["orchestrators"]["items"][0]["tasks"] if t["task_id"] == PRO_RUN)
+        self.assertEqual([(s["ref"], s["role"], s["status"]) for s in pro["sub_sessions"]],
+                         [("c-000000000030", "main", "running")])
+
+    def test_a_hosts_report_replaces_a_remote_stub(self):
+        # MINE started AWAY onto the Studio from this machine (a stub, state unknown here); the Studio's heartbeat
+        # now reports it running
+        items = [{"task_id": AWAY, "state": "running", "title": "On the studio", "started_at": NOW - 30,
+                  "origin_session": MINE}]
+        mine = groups(view(heartbeats=beats_with("studio", items)))[MINE]
+        away = [t for t in mine["tasks"] if t["task_id"] == AWAY]
+        self.assertEqual([(t["state"], t["host"], t["title"]) for t in away], [("running", "studio", "On the studio")])
+        self.assertEqual(mine["attention"], 0)
+
+    def test_a_task_started_from_the_pro_onto_the_air_needs_no_stub_on_the_air(self):
+        """Round 2's remote-stub path for a start_task run on the Pro with host air: the stub and the origin index are
+        written on the Pro, so the Air's session endpoint finds none. The task shows anyway: the Air's own log has it
+        with the origin the Pro sent (test_child_tasks: test_remote_task_records_its_origin_on_the_host)."""
+        tid = "t20261111095000-a000000a"
+        log = events() + [{"ts": NOW - 50, "event": "started", "task_id": tid, "host": "air", "title": "Sent from pro",
+                           "origin_session": MINE, "origin_device": "pro"}]
+        v = live.session_view(view(MINE, child_events=lambda: log, remote_stubs=None,
+                                   session_stubs=lambda tag: child_tasks.StubList()), MINE)
+        t = next(t for t in v["orchestrators"]["items"][0]["tasks"] if t["task_id"] == tid)
+        self.assertEqual((t["status"], t["host"], t["title"]), ("running", "air", "Sent from pro"))
+
+    def test_the_pane_knows_the_stale_heartbeat_phase(self):
+        # the pane lets this machine's own log correct a task the view knows only from a stale heartbeat
+        pane = (FIXTURE.parent / "register.ts").read_text()
+        self.assertIn(f"export const STALE_HB_PHASE = {json.dumps(live.STALE_HB_PHASE)}", pane)
+
+    def test_a_hosts_cut_list_is_said_in_the_fleet_view_only(self):
+        b = tl.heartbeats()
+        hb, bad = live.validate_heartbeat({"host": "pro", "jobs": [], "tasks": {"items": pro_items(), "truncated": True}},
+                                          NOW)
+        b.post(hb, NOW - 20)
+        o = view(heartbeats=lambda: b.snapshot(NOW))["orchestrators"]
+        self.assertEqual((o["inputs_truncated"], o["truncated"]), (["host tasks"], True))
+        o = view(MINE, heartbeats=lambda: b.snapshot(NOW))["orchestrators"]
+        self.assertEqual((o["inputs_truncated"], o["truncated"]), ([], False))
+        self.assertIn(PRO_RUN, ids(o["items"][0]))
+
+    def test_a_failed_heartbeat_read_marks_the_tree(self):
+        def boom():
+            raise RuntimeError("x")
+        o = view(heartbeats=boom)["orchestrators"]
+        self.assertEqual(o["status"], "partial")
+        self.assertIn({"source": "heartbeats", "error": "RuntimeError"}, o["errors"])
+
+
 class LinkageTest(unittest.TestCase):
     def test_event_fields_carry_parent_and_inheritance(self):
         f = child_tasks._event_fields({"task_id": ROOT, "parent_task_id": NESTED, "origin_via": "parent",

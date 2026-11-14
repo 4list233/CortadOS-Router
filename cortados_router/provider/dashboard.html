@@ -363,6 +363,12 @@ function taskRow(t, now) {
 // The tasks section sees the provider host's child-task log only (scope "provider host"): a task running on another
 // execution host is absent, so the panel says whose tasks these are, and lists the tasks started from here elsewhere.
 function scopeText(s, host) { return s.scope === "provider host" ? "tasks on " + (host || "the provider host") + " only" : null; }
+// The orchestrator tree also takes the task entries of the hosts' heartbeats (#118): it names the hosts it covers.
+function treeScopeText(s, host) {
+  if (s.scope !== "provider host and heartbeats") return scopeText(s, host);
+  const more = (s.task_hosts || []).filter(h => h !== host);
+  return "tasks on " + [host || "the provider host"].concat(more).join(", ") + (more.length ? "" : " only");
+}
 function renderTasksPanel(box, s, now, host, conv) {
   const P = panel("p-tasks", "Tasks", "span-8");
   const c = s.counts || {};
@@ -522,7 +528,7 @@ function renderOrchestrators(box, s, now, host) {
   const n = items.filter(g => g.kind === "session").length;
   P.meta.textContent = join([n + " main session" + (n === 1 ? "" : "s"), items.some(g => g.kind === "bot") ? "Grok Bot" : null,
     s.truncated ? "list capped" : null,
-    (s.inputs_truncated || []).length ? "inputs capped: " + s.inputs_truncated.join(", ") : null, scopeText(s, host)]);
+    (s.inputs_truncated || []).length ? "inputs capped: " + s.inputs_truncated.join(", ") : null, treeScopeText(s, host)]);
   secErrors(P.body, s);
   items.forEach(g => {
     const active = (g.counts && (g.counts.running || g.counts.waiting)) || g.status === "working";

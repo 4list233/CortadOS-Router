@@ -166,6 +166,7 @@ export interface PulseTreeTask {
   ended_at?: number | null
   elapsed_s?: number | null
   origin_via?: string | null
+  parent_task_id?: string | null
   parent_hidden?: boolean
   tokens?: PulseTokens | null
   sub_sessions?: PulseSubSession[]
@@ -194,8 +195,10 @@ export interface PulseSessionView {
   generated_at?: number
   session_filter?: string
   overview?: PulseLive['overview']
+  // scope "provider host and heartbeats": the tree also holds the tasks the hosts' heartbeats carry (#118),
+  // task_hosts names those hosts
   orchestrators?: PulseLiveSection & { items?: PulseOrchestrator[]; scope?: string; truncated?: boolean;
-    inputs_truncated?: string[]; session_filter?: string }
+    inputs_truncated?: string[]; session_filter?: string; task_hosts?: string[] }
   s1?: PulseLive['s1']
   hosts?: PulseLive['hosts']
 }
@@ -208,6 +211,7 @@ declare module 'claude-code' {
       mine: { tag: string | null; why: string | null } | null
       mineLive: { data: PulseLive; at: number; tag: string } | null
       tree: { data: PulseSessionView; at: number; tag: string; base: string } | null; treeErr: string | null
+      local: { tag: string; at: number; tasks: (PulseTreeTask & { parent_task_id?: string | null })[] } | null
     }
   }
 }

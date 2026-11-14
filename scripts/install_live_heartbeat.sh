@@ -3,23 +3,29 @@
 # every 60 s. Run it on the host itself, from this checkout:
 #
 #   scripts/install_live_heartbeat.sh <host> [--provider-url URL] [--labels a,b,...] [--s1-data DIR] [--no-s1]
-#                                     [--orchestrator] [--force] [--dry-run]
+#                                     [--orchestrator] [--no-tasks] [--force] [--dry-run]
 #
 #   <host>          the host's slug on the live view: air | studio | pro (the name its token is bound to)
 #   --provider-url  where the provider answers from this machine; default: ~/.config/cortados/provider-url if present,
 #                   else http://127.0.0.1:8432 (the provider host itself)
-#   --labels        launchd labels to report; default: every loaded com.cortados.* job here (the sender's own excluded)
+#   --labels        launchd labels to report; default: every loaded com.cortados.* job here, except the sender's own
+#                   and the per-task LaunchAgents a gui exec host loads for its child tasks (com.cortados.task.<id>:
+#                   they come and go with each task, so a snapshot of them is wrong a minute later)
 #   --s1-data       the S1 pipeline's data dir (default ~/cortados/train/data); the s1 block is on by default for studio
 #   --no-s1 / --s1  turn the s1 block off / on whatever the host
 #   --orchestrator  also report this machine's main Claude Code sessions' own tokens (the live view's Work split;
 #                   cortados_router/orchestrator_usage.py reads ~/.claude/projects, child-task folders under ~/CortadOS
 #                   excluded). Turn it on where the owner runs his orchestrating sessions; off by default.
+#   --no-tasks      do not report this machine's own start_task children (on by default: an exec host's tasks, e.g.
+#                   the Pro's host "here" tasks, reach the live view's orchestrator tree only this way, #118)
 #   --force         overwrite an existing ~/.config/cortados/heartbeat.json (else it is kept as it is)
 #   --dry-run       print what would be written and run; change nothing
 #
 # Needs, before it is run: the host-bound token in ~/.config/cortados/live-heartbeat-token (0600), minted on the PROVIDER
 # host with  python3 -B -m cortados_router.provider.clients add <host>-heartbeat --scope live:heartbeat --host <host> \
 #            --token-file <path>  and copied here (scp, then chmod 600). The plist holds no secret.
+# The Pro (the owner's main sessions, and a gui exec host for host "here" tasks):
+#   scripts/install_live_heartbeat.sh pro --orchestrator
 # Writes: ~/.config/cortados/heartbeat.json, ~/Library/LaunchAgents/com.cortados.live-heartbeat.plist; loads it with
 # launchctl bootstrap gui/<uid> (booting out a previous copy first). Logs to ~/.cortados/live-heartbeat.out.
 # Test seams: CORTADOS_LAUNCHCTL (the launchctl binary), HOME.
@@ -37,10 +43,10 @@ LOG="$HOME/.cortados/live-heartbeat.out"
 
 die() { echo "install_live_heartbeat: $*" >&2; exit 2; }
 
-[ $# -ge 1 ] || die "usage: $0 <host> [--provider-url URL] [--labels a,b] [--s1-data DIR] [--no-s1|--s1] [--orchestrator] [--force] [--dry-run]"
+[ $# -ge 1 ] || die "usage: $0 <host> [--provider-url URL] [--labels a,b] [--s1-data DIR] [--no-s1|--s1] [--orchestrator] [--no-tasks] [--force] [--dry-run]"
 HOST="$1"; shift
 [[ "$HOST" =~ ^[a-z][a-z0-9-]{0,31}$ ]] || die "host must be a slug like air, studio, pro"
-URL=""; LABELS=""; S1_DATA="~/cortados/train/data"; FORCE=0; DRY=0; ORCH=0
+URL=""; LABELS=""; S1_DATA="~/cortados/train/data"; FORCE=0; DRY=0; ORCH=0; TASKS=1
 S1=0; [ "$HOST" = "studio" ] && S1=1
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -50,6 +56,7 @@ while [ $# -gt 0 ]; do
     --no-s1) S1=0; shift ;;
     --s1) S1=1; shift ;;
     --orchestrator) ORCH=1; shift ;;
+    --no-tasks) TASKS=0; shift ;;
     --force) FORCE=1; shift ;;
     --dry-run) DRY=1; shift ;;
     *) die "unknown option $1" ;;
@@ -60,9 +67,10 @@ if [ -n "$URL" ]; then
 fi
 
 if [ -z "$LABELS" ]; then
-  # every loaded com.cortados.* job of this user (third column of launchctl list), the sender itself excluded
+  # every loaded com.cortados.* job of this user (third column of launchctl list), the sender itself and the
+  # per-task LaunchAgents of child tasks (child_tasks.LAUNCHD_LABEL_PREFIX) excluded
   LABELS="$("$LAUNCHCTL" list 2>/dev/null | awk '{print $3}' | grep -E '^com\.cortados\.' | grep -vx "$LABEL" \
-            | sort -u | head -n 14 | paste -sd, - || true)"
+            | grep -v '^com\.cortados\.task\.' | sort -u | head -n 14 | paste -sd, - || true)"
 fi
 
 # The token must already be here: never minted or printed by this script.
@@ -74,12 +82,13 @@ fi
 
 # One isolated Python builds both files: the config as JSON and the plist with plistlib, so a path holding &, |, < or
 # any other XML or sed special is written as it is (the old sed substitution of a template corrupted such a plist).
-GENERATED="$(HOST="$HOST" URL="$URL" LABELS="$LABELS" S1="$S1" S1_DATA="$S1_DATA" ORCH="$ORCH" LABEL="$LABEL" PY="$PYTHON" \
+GENERATED="$(HOST="$HOST" URL="$URL" LABELS="$LABELS" S1="$S1" S1_DATA="$S1_DATA" ORCH="$ORCH" TASKS="$TASKS" LABEL="$LABEL" PY="$PYTHON" \
              CONFIG="$CONFIG" REPO="$REPO" LOG="$LOG" "$PYTHON" -I -c '
 import json, os, plistlib
 e = os.environ
 cfg = {"version": 1, "host": e["HOST"], "token_file": "~/.config/cortados/live-heartbeat-token",
-       "ttl_s": 180, "jobs": [l for l in e["LABELS"].split(",") if l], "hardware": True, "disk": True}
+       "ttl_s": 180, "jobs": [l for l in e["LABELS"].split(",") if l], "hardware": True, "disk": True,
+       "tasks": e["TASKS"] == "1"}
 if e["URL"]:
     cfg["provider_url"] = e["URL"]
 if e["S1"] == "1":

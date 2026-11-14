@@ -364,7 +364,7 @@ export default {
     "as_of": 1800000000.0,
     "status": "ok",
     "errors": [],
-    "scope": "provider host",
+    "scope": "provider host and heartbeats",
     "window_s": 86400,
     "items": [
       {
@@ -656,7 +656,8 @@ export default {
       }
     ],
     "truncated": false,
-    "inputs_truncated": []
+    "inputs_truncated": [],
+    "task_hosts": []
   },
   "routed": {
     "as_of": 1800000000.0,
