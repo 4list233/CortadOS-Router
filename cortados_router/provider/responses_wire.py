@@ -284,9 +284,11 @@ def _parse_request(body: dict[str, Any]) -> ClientTurn:
         content = []
     if not content and not results:
         raise WireError("the new turn carries no user content and no tool outputs")
+    tool_ids = any(it.get("type") == "function_call" and it.get("call_id")
+                   for side, it in kept[:start] if side == "assistant")
     return ClientTurn(system="\n\n".join(system_parts), tools=_parse_tools(body.get("tools")), content=content,
                       tool_results=results, history=history, stream=stream, model=MODEL_ID,
-                      prefix_digest=anthropic_wire.history_digest(tokens))
+                      prefix_digest=anthropic_wire.history_digest(tokens), history_tool_ids=tool_ids)
 
 
 def _messages_of(body: dict[str, Any], *, with_tools: bool) -> list[dict[str, Any]]:

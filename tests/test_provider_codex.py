@@ -305,7 +305,7 @@ class CodexEndpointTests(unittest.TestCase):
     def test_switching_the_pinned_model_mid_conversation_is_refused(self):
         self.pin_router()
         code, msg = self.error_of(self.continuation("sub/opus", "sub/sonnet"))
-        self.assertEqual(code, 409)
+        self.assertEqual(code, provider_server.TERMINAL_STATUS)                  # terminal: the retry names the same model
         self.assertIn("fixed per conversation", msg)
         self.assertIn("sub/claude-opus-5-5", msg)
         self.assertIn("sub/claude-sonnet-5", msg)
@@ -315,7 +315,7 @@ class CodexEndpointTests(unittest.TestCase):
     def test_pinning_an_s1_routed_conversation_is_refused(self):
         self.pin_router()
         code, msg = self.error_of(self.continuation("cortados", "sub/opus"))
-        self.assertEqual(code, 409)
+        self.assertEqual(code, provider_server.TERMINAL_STATUS)
         self.assertIn("routed by S1 to gpt-test", msg)
         self.assertIn("new conversation", msg)
 
@@ -902,9 +902,10 @@ class CodexEndpointTests(unittest.TestCase):
         methods = [m.get("method") for m in inbound if m.get("method") in ("turn/start", "turn/interrupt")]
         self.assertEqual(methods, ["turn/start", "turn/interrupt", "turn/start"])
         self.assertEqual(len(self.reg.sessions), 1)
-        # a late result for the abandoned call belongs to a history the endpoint no longer holds: 409, never replayed
+        # a late result for the abandoned call belongs to a history the endpoint no longer holds: refused (this client
+        # sends no conversation identity, so terminally: no_identity), never replayed
         stale = history[:2] + [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": r1["content"][-1]["id"], "content": "late"}]}]
-        self.assertEqual(self.error_of({"tools": [READ_TOOL], "messages": stale})[0], 409)
+        self.assertEqual(self.error_of({"tools": [READ_TOOL], "messages": stale})[0], provider_server.TERMINAL_STATUS)
 
     def test_a_user_input_request_is_answered_empty_and_the_turn_continues(self):
         r = self.post({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "ask user"}]})

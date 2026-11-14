@@ -117,12 +117,31 @@ Not yet in P1, each needing a decision or another phase:
 
 - Routing: see P1 status above. `--fixed-model` restores the P0 behaviour (one Claude CLI model, no routing).
 - A conversation lives in one CLI process and is identified by the exact sequence of replies the endpoint wrote
-  (text and tool_use ids). If the endpoint restarts the next request fails with 409. If the client compacts or edits
-  its history, the session is REBUILT (issue #43, `Registry._rebuild_or_refuse` / `Registry.rebuild`, see (f) below).
-  The exact match is looked up only within the request's scope (wire + client + conversation identity; a request
-  without an identity only among identity-less sessions of its own wire and User-Agent name), so two clients or two
-  wires never share a session. Two live conversations in ONE scope with identical histories (same opening, same
-  text-only replies) are refused with 409 rather than guessed between.
+  (text and tool_use ids). If the endpoint restarts the next request is refused, terminally (`no_writer`, see the
+  refusal table below). If the client compacts or edits its history, the session is REBUILT (issue #43,
+  `Registry._rebuild_or_refuse` / `Registry.rebuild`, see (f) below).
+  The exact match is looked up only within the request's scope (wire + client + conversation identity), so two
+  clients or two wires never share a session. Two live conversations in ONE scope with identical histories (same
+  opening, same text-only replies) are refused rather than guessed between (terminal; a retryable 529 while a rebuild
+  in that scope is in flight, whose old and new sessions overlap for a moment).
+  Identity-less requests (#43 second review, P1-b): the User-Agent name does not tell two callers apart (every
+  Claude Code sends `claude-cli`), so a continuation without one of `CONVERSATION_ID_HEADERS` is continued only on
+  proof that it is that session's caller: an exact match within identity-less sessions of its own wire and client
+  name whose history carries a tool_use id (`ClientTurn.history_tool_ids`; on the Responses wire a `function_call`
+  call_id). Those ids are the backend's own random ids, so only a client that received that session's output holds
+  them. Anything else identity-less with history (a text-only continuation, no exact match, a rewritten history) is
+  refused terminally (`no_identity`): never continued, replayed or rebuilt. Real clients always send an identifier
+  (list below), so this only affects unknown or very old clients.
+  Identifiers each real client sends (2026-11-13; confirmed against captures 2026-11-02 and the code that sets them):
+  Claude Code (main sessions, subagents, `claude -p`) sends `X-Claude-Code-Session-Id` on every `/v1/messages`
+  request (2.1.316+; main loop and subagents share it); CortadOS child tasks (`session.py` `custom_headers` through
+  `ANTHROPIC_CUSTOM_HEADERS`) and routed subagents (cortados-routed-subagents mod) add `x-cortados-run-id` (a fresh id
+  per run) and the Office tags `x-cortados-session/-project/-device/-task-title`; Codex sends its thread id as
+  `session-id` (also `thread-id`, `x-client-request-id`, `prompt_cache_key`) on `/v1/responses`;
+  `previous_response_id` is refused (400: the endpoint keeps no response store) and the Responses wire has no
+  `conversation` id. `x-cortados-session` is NOT part of the identity: it is a salted tag of the main session sent only
+  alongside the run id or Claude Code's own id, and shared by every subagent of that session. `route_task`
+  (subagent_mcp) sends one tool-less message, a one-shot that never looks a session up.
   What the match compares (`Registry.find`: `session.history == turn.history`, the list of `reply_fingerprint`s,
   sha256 of each assistant message's trimmed text + tool_use ids) decides each history rewrite (2026-11-03, tests in
   `tests/test_provider.py`): (a) old tool_result content replaced by a placeholder (Claude Code microcompaction) is
@@ -138,10 +157,10 @@ Not yet in P1, each needing a decision or another phase:
   + tool results, `anthropic_wire.turn_fingerprint`) is the one that reply answered gets the stored last response
   again (same id, content, stop reason, usage), without the backend; logged as "replaying its last response". One
   response per session, at most `REPLAY_MAX_BYTES` (1 MiB; larger replies are not kept and their retry stays a 409).
-  A different user turn on that history is still a 409, and so is a retry that also changes the `sub/` pin (the
-  "model is fixed per conversation" refusal). Replay needs a conversation identity header (one of
-  `CONVERSATION_ID_HEADERS`): a request without one is never replayed and gets the ordinary 409, since identity-less
-  sessions all share the empty scope and a stored reply would go to a stranger. Only sessions in the request's
+  A different user turn on that history is not replayed (a rebuilt branch, see (f)), and a retry that also changes the
+  `sub/` pin gets the terminal "model is fixed per conversation" refusal. Replay needs a conversation identity header
+  (one of `CONVERSATION_ID_HEADERS`): a request without one is never replayed (terminal `no_identity`), since
+  identity-less sessions all share the empty scope and a stored reply would go to a stranger. Only sessions in the request's
   conversation scope (client + identity) opened on the same wire (`/v1/messages` or `/v1/responses`) are replayed, more than one candidate is a 409, and a replay refreshes the conversation's idle clock so the reaper
   does not close it mid-retry. (e) Every lost-conversation 409 logs one `409 lost conversation: class=<c> ...` line
   (counts and lengths only, no content or fingerprints). From `Registry.find`: `class=<c> candidates=<n>
@@ -173,20 +192,47 @@ Not yet in P1, each needing a decision or another phase:
   because such a request cannot be told from a side request the client forks from its live loop. A compaction whose
   old session advanced between the lookup and the rebuild taking its turn lock is re-checked under that lock and
   served as a branch (the advanced session is kept). The rebuilt session is published only once its history, seed and
-  budget are set; its first turn goes to whichever request takes its turn lock first. Bounded by `REBUILD_MAX` = 5
+  budget are set. Rebuilds are coordinated in flight (#43 second review, P1-a): one at a time per (scope, wire, anchor
+  reply), on a gate taken before the budget or the old session is touched; after taking it the exact lookup runs again,
+  and a session an identical request published meanwhile is JOINED, never duplicated, so identical concurrent requests
+  share one session and its turn lock (the one that loses the lock is a stale continuation, 409, whose retry is
+  replayed). Waiting on the gate past `REBUILD_WAIT_S` (60 s) is a retryable 529. Bounded by `REBUILD_MAX` = 5
   per conversation lineage (each rebuild replays the whole history uncached): one budget shared by every session
-  rebuilt from the lineage, compacted or branched, reserved before the backend starts and returned if it does not.
+  rebuilt from the lineage, compacted or branched, which keeps committed rebuilds (`used`, a backend that started and
+  was published) apart from starts still pending (`pending`, given back if the start fails; P2-d). Committed usage at
+  the limit is terminal; a limit reached only with pending starts is a retryable 529.
   Before anything is closed or started, the first turn (seed + new turn + system + tools) is measured against the
-  frozen route's `context_length` with the opening route's estimator (`routing.request_fit`, chars / 4). The log
+  frozen route's `context_length` with the opening route's estimator (`routing.request_fit`, chars / 4), and measured
+  again under the rebuilt session's turn lock for whichever request actually takes that first turn (P2-c: another
+  request with the same history and a larger turn can take it; it is refused terminally and the seed stays). The log
   line is `conversation <old> rebuilt as <new> ... (compacted: old session closed | branched: old session kept;
-  rebuild n of 5; ...)`. Terminal (HTTP 400 `invalid_request_error` + `x-should-retry: false`, or a terminal SSE
-  error; Codex's `invalid_prompt`), because a retry carries the same history: the lineage reached `REBUILD_MAX`, or
-  the replay does not fit the route. 409 remains, with the reason in the message and `rebuild=refused:<code>` on the
-  `409 lost conversation` line, for: `no_identity` (no conversation identity header), `no_writer` (no live session of
-  this client wrote the last reply: restart, reap, an edited last reply) and `ambiguous_writer` (more than one did);
-  each of these costs the client's retries only a registry lookup, never a backend. `REBUILD_MAX` 0 switches
-  rebuilding off (`disabled`). A full compaction with no assistant message left still opens a new, freshly routed
+  rebuild n of 5; ...)`; a refusal logs `refused lost conversation: class=<c> ... rebuild=refused:<code>; terminal`
+  (the pre-#43 `409 lost conversation` line only with rebuilding off). `REBUILD_MAX` 0 switches rebuilding off
+  (`disabled`: the pre-#43 409). A full compaction with no assistant message left still opens a new, freshly routed
   conversation, as in (b).
+
+  Refusals of a continuation (#43; terminal = HTTP 400 `invalid_request_error` + `x-should-retry: false`, or a
+  terminal SSE error / Codex's `invalid_prompt`, because the retry carries the same history and meets the same state;
+  retryable = what Claude Code and Codex retry by themselves):
+
+  | Refusal | When | Answer | Retryable |
+  |---|---|---|---|
+  | `no_identity` | a continuation with no conversation identity header and no tool_use id of an exactly matching session | 400 | no |
+  | `no_writer` | no live session of this scope wrote the request's last reply (restart, reap, an edited last reply) | 400 | no |
+  | `ambiguous` / `ambiguous_writer` | more than one live session of this scope has the exact history / wrote the last reply | 400 | no |
+  | the same, while a rebuild in that scope is in flight | its old and new sessions overlap for a moment | 529 | yes |
+  | `limit` | the lineage committed `REBUILD_MAX` rebuilds | 400 | no |
+  | limit held only by pending starts | another rebuild of the lineage is still starting | 529 | yes |
+  | replay too large | seed + new turn exceed the route's `context_length` (before the rebuild, or at its first turn) | 400 | no |
+  | model change | a `sub/` pin other than the conversation's model (continuation, replay or rebuild) | 400 | no |
+  | failed conversation | a tombstone: the conversation's backend failed | 400 | no |
+  | old session busy / replaced | a turn runs on the session a compaction replaces, or another request rebuilt it first | 529 | yes |
+  | rebuild gate wait | an identical rebuild still starting after `REBUILD_WAIT_S` | 529 | yes |
+  | session lock wait | another request holds the conversation past `TURN_TIMEOUT_S` | 529 | yes |
+  | stale continuation | `moved_on_while_waiting` / `closed_while_waiting` (the retry is replayed, or meets the table above) | 409 | yes |
+  | rebuilding off | `REBUILD_MAX` 0 (`disabled`) | 409 | yes |
+  | backend cannot start | the rebuilt backend's start failed; the old session is untouched | 502 | yes |
+  | at the session cap | a branch over `MAX_SESSIONS` | 503 | yes |
 - Requests without tools (titles, summaries) always get their own throwaway CLI with the conversation as text.
 - Only `tool_choice: auto` is accepted (400 otherwise). `max_tokens` is not enforced: the CLI has no output-cap flag.
 - Responses are sent as SSE after the turn completes (with pings while waiting), not token by token.
@@ -463,7 +509,7 @@ tool type; optional, later.
 - Images: a tool-less single-message request keeps its image blocks on both wires; the text transcript a longer
   tool-less conversation is folded into is text only (P0 behaviour, both wires; images are P4).
 - No resume with tools: `thread/resume` and `thread/fork` take no `dynamicTools`, so a restarted endpoint answers
-  409 for a tool-bearing Codex conversation, exactly as P0 does for Claude.
+  the terminal `no_writer` refusal for a tool-bearing Codex conversation, exactly as P0 does for Claude.
 - `request_user_input` cannot be switched off. The backend answers it empty and logs a warning, so a model that asks
   the user a question gets no answer and carries on.
 - A tool-less request (Codex's own summaries, Claude Code's titles) boots a whole app-server for one turn.
@@ -561,7 +607,7 @@ local-resources config (schema: `docs/LOCAL-RESOURCES.md`, "Local models"). It i
 `choose_pinned` hands a local name to `_choose_local` (node answers `/api/tags` and lists the tag, input fits the
 configured `context_length`, opener logged as a `routes` row on lane `local-<node>`). The registry holds the
 conversation as a `LocalSession` (no backend process: the model binding and reply fingerprints), so `find` and
-`_model_change` keep it on its model like any pin (409 on a switch, in either direction); the server relays each turn
+`_model_change` keep it on its model like any pin (a terminal 400 on a switch, in either direction); the server relays each turn
 statelessly (`local_lane.serve`: bounded connect and read timeouts, SSE passed line by line, `tool_use` untouched).
 An unreachable node or unlisted model is a 503 naming the cause; an unknown name is a 400 listing every pinnable id,
 local ones included. `GET /v1/models` lists each as `<name> · CortadOS (<node label>)`. S1 never routes to a local

@@ -202,11 +202,11 @@ class ResponsesEndpointTests(unittest.TestCase):
         self.assertEqual(r["output"][0]["content"][0]["text"], "echo: title this")
         self.assertEqual(self.reg.sessions, {})
 
-    def test_a_continuation_the_endpoint_no_longer_holds_is_a_409_in_the_responses_shape(self):
+    def test_a_continuation_the_endpoint_no_longer_holds_is_refused_in_the_responses_shape(self):
         code, body = self.error_of(request(
             user("x"), {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "from before a restart"}]},
             user("go on")))
-        self.assertEqual(code, 409)
+        self.assertEqual(code, 400)                                    # terminal (#43 review): no_writer
         self.assertEqual(sorted(body), ["error"])                      # {"error": {...}}, not Anthropic's {"type": "error", ...}
         self.assertEqual(body["error"]["type"], "invalid_request_error")
         self.assertIn("no longer holds", body["error"]["message"])
@@ -214,7 +214,7 @@ class ResponsesEndpointTests(unittest.TestCase):
         code, body = self.error_of(request(
             user("x"), {"type": "function_call", "call_id": "call_gone", "name": "Read", "arguments": "{}"},
             {"type": "function_call_output", "call_id": "call_gone", "output": "late"}))
-        self.assertEqual(code, 409)
+        self.assertEqual(code, 400)
         self.no_backend_started()
 
     def test_a_failing_router_is_a_503_in_the_responses_shape_and_starts_nothing(self):
@@ -377,12 +377,29 @@ class ResponsesEndpointTests(unittest.TestCase):
         self.assertEqual((self._text(a2), self._text(b2)), ("echo: on a", "echo: on b"))
         self.assertEqual((len(a.history), len(b.history)), (2, 2))
 
-    def test_an_edited_history_without_a_session_id_is_a_409_that_says_why(self):
+    def test_an_edited_history_without_a_session_id_is_a_terminal_refusal_that_says_why(self):
         _, r1 = self.post(request(user("hello")))
         _, r2 = self.post(request(user("hello"), *r1["output"], user("second")))
         headers = {k: v for k, v in CODEX_HEADERS.items() if k != "session-id"}
         code, body = self.error_of(request(user("Summary."), *r2["output"], user("third")), headers=headers)
-        self.assertEqual(code, 409)
+        self.assertEqual(code, 400)
+        self.assertIn("carries no conversation identity", body["error"]["message"])
+
+    def test_without_a_session_id_only_a_history_holding_a_call_id_continues(self):
+        # #43 review P1-b on this wire: an identity-less continuation is matched only on proof of caller, a
+        # function_call call_id of that session in its history; a text-only one is refused before any backend.
+        no_id = {k: v for k, v in CODEX_HEADERS.items() if k != "session-id"}
+        items = [user("please use tool")]
+        with self.send(request(*items), headers=no_id) as r:
+            r1 = json.loads(r.read())
+        call = next(i for i in r1["output"] if i["type"] == "function_call")
+        items += r1["output"] + [{"type": "function_call_output", "call_id": call["call_id"], "output": "hello"}]
+        with self.send(request(*items), headers=no_id) as r:
+            self.assertEqual(self._text(json.loads(r.read())), "tool said: hello")
+        with self.send(request(user("hi")), headers=no_id) as r:
+            t1 = json.loads(r.read())
+        code, body = self.error_of(request(user("hi"), *t1["output"], user("more")), headers=no_id)
+        self.assertEqual(code, 400)
         self.assertIn("carries no conversation identity", body["error"]["message"])
 
 
@@ -495,24 +512,34 @@ class ResponsesOnCodexTests(ResponsesEndpointTests):
         self.assertEqual(error["code"], responses_wire.TERMINAL_CODE)
         self.assertIn("usageLimitExceeded", error["message"])
         self.assertEqual(self.reg.sessions, {})
-        other = [user("another conversation")] + items[1:]             # same reply, another conversation: 409
-        self.assertEqual(self.error_of(request(*other))[0], 409)
+        other = [user("another conversation")] + items[1:]             # same reply, another conversation: no_writer
+        code, body = self.error_of(request(*other))
+        self.assertEqual(code, 400)
+        self.assertNotIn("usageLimitExceeded", body["error"]["message"])  # never the tombstone's failure
         self.assertEqual(len(self.reg.tombstones), 1)                  # keyed by Codex's session-id header
         no_id = {k: v for k, v in CODEX_HEADERS.items() if k != "session-id"}
-        self.assertEqual(self.error_of(request(*items), headers=no_id)[0], 409)   # same history, no identity: no match
+        code, body = self.error_of(request(*items), headers=no_id)     # same history, no identity: no match
+        self.assertEqual(code, 400)
+        self.assertIn("carries no conversation identity", body["error"]["message"])
 
     def test_a_failed_turn_without_a_session_id_leaves_no_tombstone(self):
         # Without a conversation identity the digest alone cannot tell two conversations with the same prefix apart,
-        # so the failure is not published and its retry gets the ordinary 409.
+        # so the failure is not published, and its retry is refused as identity-less (terminal), never the failure.
+        # The conversation reaches its failing turn on the identity-less proof of caller: a call id in its history.
         no_id = {k: v for k, v in CODEX_HEADERS.items() if k != "session-id"}
-        items = [user("hi")]
+        items = [user("please use tool")]
         with self.send(request(*items), headers=no_id) as r:
             r1 = json.loads(r.read())
-        items += r1["output"] + [user("fail")]
+        call = next(i for i in r1["output"] if i["type"] == "function_call")
+        items += r1["output"] + [{"type": "function_call_output", "call_id": call["call_id"], "output": "hello"}]
+        with self.send(request(*items), headers=no_id) as r:
+            r2 = json.loads(r.read())
+        items += r2["output"] + [user("fail")]
         self.assertEqual(self.error_of(request(*items), headers=no_id)[0], 502)
         self.assertEqual((self.reg.sessions, len(self.reg.tombstones)), ({}, 0))
         code, body = self.error_of(request(*items), headers=no_id)
-        self.assertEqual(code, 409)
+        self.assertEqual(code, 400)
+        self.assertIn("carries no conversation identity", body["error"]["message"])
         self.assertNotIn("usageLimitExceeded", body["error"]["message"])
 
 if __name__ == "__main__":

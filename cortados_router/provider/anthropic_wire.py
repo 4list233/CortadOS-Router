@@ -76,6 +76,10 @@ class ClientTurn:
     # Canonical digest of the conversation before its new turn (conversation_digest): what the user and the tools
     # said, plus the assistant fingerprints. It names the conversation itself, where `history` only proves the replies.
     prefix_digest: str = ""
+    # Whether an earlier assistant message carries a tool_use id (tool_use_ids). Those ids are the backend's own,
+    # random and never reused, so a client whose history matches a session's AND carries one has seen that session's
+    # output: server.Registry.find accepts that as the proof of caller for a request without a conversation identity.
+    history_tool_ids: bool = False
 
 
 def _system_text(system: Any) -> str:
@@ -128,6 +132,12 @@ def turn_fingerprint(turn: "ClientTurn") -> str:
     """Digest of a request's new user turn (its user content and tool results), so a retry of an answered turn can be
     told from a different message on the same history (server.Replay). Never logged."""
     return hashlib.sha256(json.dumps([turn.content, turn.tool_results], sort_keys=True, default=str).encode()).hexdigest()
+
+
+def tool_use_ids(blocks: Any) -> list[str]:
+    """The tool_use ids of one assistant message (the ids reply_fingerprint covers), non-empty ones only."""
+    return [b["id"] for b in _blocks(blocks)
+            if b.get("type") == "tool_use" and isinstance(b.get("id"), str) and b["id"]]
 
 
 def reply_fingerprint(blocks: Any) -> str:
@@ -313,7 +323,9 @@ def _parse_request(body: dict[str, Any]) -> ClientTurn:
                       content=content, tool_results=results,
                       history=[reply_fingerprint(m.get("content")) for m in messages if m.get("role") == "assistant"],
                       stream=bool(body.get("stream")), model=str(body.get("model") or MODEL_ID),
-                      prefix_digest=conversation_digest(messages[:start]))
+                      prefix_digest=conversation_digest(messages[:start]),
+                      history_tool_ids=any(tool_use_ids(m.get("content")) for m in messages
+                                           if m.get("role") == "assistant"))
 
 
 def transcript_text(messages: list[dict[str, Any]]) -> str:
