@@ -443,7 +443,8 @@ function originGroups(s, list, conv) {
 // Each orchestrating main session (Office tag), the bot gateway and the unattributed group, with the child tasks it
 // started (nested by parent_task_id) and each task's sub-sessions (its routed conversations). Collapse state survives
 // the 5 s re-render (orchOpen, keyed by origin / task id); groups and tasks with live work or something failed open by
-// default. What needs attention (failed, unknown) is marked in red with its word, never by colour alone.
+// default. What needs attention (failed, unknown, a task with a failed sub-session) is marked in red with its word,
+// never by colour alone.
 const orchOpen = new Map();
 function keepOpen(d, key, dflt) {
   d.open = orchOpen.has(key) ? orchOpen.get(key) : dflt;
@@ -485,7 +486,9 @@ function subRow(x, last, now) {
   return add(r, w, elapsedCell(x, now));
 }
 function taskNode(t, now) {
-  const attn = t.status === "failed" || t.status === "unknown";
+  const bad = t.status === "failed" || t.status === "unknown";
+  const subFailed = bad ? 0 : Math.max(0, t.sub_sessions_failed || 0);   // listed or not (live.orchestrators_section)
+  const attn = bad || subFailed > 0;
   const head = (box) => {
     add(box, pill(t.state === "elsewhere" ? "unknown" : t.state, t.status === "done" && t.state === "cancelled" ? "cancelled" : t.status));
     const w = el("div", null);
@@ -493,7 +496,8 @@ function taskNode(t, now) {
     add(w, title, el("div", "m", join([t.host ? "on " + t.host : null,
       t.model ? t.model + (t.lane ? " (" + t.lane + ")" : "") : t.lane, t.tool ? "tool " + t.tool : null, t.phase,
       t.origin_via === "parent" ? "orchestrator inherited from its parent" : null,
-      t.parent_hidden ? "continues another orchestrator's task" : null, tokText(t.tokens),
+      t.parent_hidden ? "continues another orchestrator's task" : null,
+      subFailed ? subFailed + " sub-session" + (subFailed === 1 ? "" : "s") + " FAILED" : null, tokText(t.tokens),
       (t.sub_sessions || []).length ? t.sub_sessions.length + " sub-session" + (t.sub_sessions.length === 1 ? "" : "s") : null,
       short(t.task_id)])));
     add(box, w, elapsedCell(t, now));
@@ -517,7 +521,8 @@ function renderOrchestrators(box, s, now, host) {
   const items = s.items || [];
   const n = items.filter(g => g.kind === "session").length;
   P.meta.textContent = join([n + " main session" + (n === 1 ? "" : "s"), items.some(g => g.kind === "bot") ? "Grok Bot" : null,
-    s.truncated ? "list capped" : null, scopeText(s, host)]);
+    s.truncated ? "list capped" : null,
+    (s.inputs_truncated || []).length ? "inputs capped: " + s.inputs_truncated.join(", ") : null, scopeText(s, host)]);
   secErrors(P.body, s);
   items.forEach(g => {
     const active = (g.counts && (g.counts.running || g.counts.waiting)) || g.status === "working";

@@ -463,6 +463,20 @@ class DashboardRenderTest(unittest.TestCase):
         for bad in ("[object Object]", "undefined", "NaN", ot.SECRET, "null"):
             self.assertNotIn(bad, tree, bad)
 
+    def test_live_tab_flags_a_failed_sub_session(self):
+        # a running task whose subagent failed: counted in attention, said on the task in words (review 2026-11-14)
+        from tests import test_orchestrator_tree as ot
+        failed = {"key": "r:" + ot.ROOT, "ref": "c-000000000020", "provider": "codex", "opened_at": ot.NOW - 70,
+                  "closed_at": ot.NOW - 20, "closed": "failed"}
+        v = ot.view(ended_conversations=lambda: ot.ended() + [failed])
+        v["orchestrators"]["inputs_truncated"] = ["conversations"]
+        out = self.run_page(None, "live", live_view=v)
+        tree = out[out.index("Orchestrators"):out.index("\nTasks\n")]
+        for want in ("! 2 need attention", "1 sub-session FAILED", "inputs capped: conversations", "FAILED"):
+            self.assertIn(want, tree, want)
+        for bad in ("[object Object]", "undefined", "NaN"):
+            self.assertNotIn(bad, tree, bad)
+
     def test_live_tab_renders_every_section(self):
         from tests import test_live as tl
         v = self.live()

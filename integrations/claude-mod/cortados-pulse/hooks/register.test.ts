@@ -565,6 +565,24 @@ test('tree glyphs, tokens and failures', () => {
   expect(treeLines(many as any, MINE_TAG, 0).slice(-1)).toEqual([{ text: '  └ +4 more sub-sessions' }])
 })
 
+test('a failed sub-session needs attention: on a running task, a folded finished task, and past the cap', () => {
+  const sub = (status: string) => ({ status, role: 'subagent' })
+  const v = { session_filter: MINE_TAG, orchestrators: { status: 'ok', inputs_truncated: ['conversations'], items: [{ origin: MINE_TAG,
+    counts: { running: 1, done: 1 }, attention: 3, tasks: [
+      { task_id: 't1', title: 'Runs on', state: 'running', status: 'running', elapsed_s: 10, sub_sessions_failed: 1,
+        sub_sessions: [sub('running'), sub('running'), sub('running'), sub('running'), sub('failed')] },
+      { task_id: 't2', title: 'Finished', state: 'succeeded', status: 'done', elapsed_s: 30, ended_at: 5, sub_sessions_failed: 2,
+        sub_sessions: [sub('failed'), sub('failed')] },
+      { task_id: 't3', title: 'Broke', state: 'failed', status: 'failed', elapsed_s: 30, ended_at: 5, sub_sessions_failed: 1 }] }] } }
+  const lines = treeLines(v as any, MINE_TAG, 0)
+  expect(lines.slice(0, 3)).toEqual([{ text: 'inputs capped (conversations): some items may be missing', attn: true },
+    { text: '1 running · 1 done' }, { text: '! 3 need attention', attn: true }])
+  expect(lines.filter(l => l.attn).map(l => l.text).slice(2)).toEqual([
+    '● Runs on · 1 sub-session failed · 10s',                // its failed subagent is past the pane's 4: said on the task
+    '✓ Finished · succeeded · 2 sub-sessions failed · took 30s',  // folded to one line, still said
+    '✕ Broke · failed · took 30s'])                           // a failed task once: no sub-session count on it
+})
+
 test('pollLive with a tag reads only the session view: nothing fleet-wide', async () => {
   const salt = '0123456789abcdef0123456789abcdef', sid = '792b087a-1983-4baf-b701-77792e4b77e4'
   const tag = await sessionTag(salt, sid)

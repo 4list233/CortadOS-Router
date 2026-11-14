@@ -473,7 +473,8 @@ export function sessionLines(live: PulseLive, me: Mine | null, since: number): s
 
 // ---- this session's tree (flightdeck-style; pure, tested) -----------------------------------------------------------
 
-/** A tree line: its text, and whether it needs attention (failed, unknown: drawn bold, the glyph says which). */
+/** A tree line: its text, and whether it needs attention (failed, unknown, or a task with a failed sub-session:
+ * drawn bold, the glyph or the words say which). */
 export type TreeLine = { text: string; attn?: boolean }
 
 const GLYPH: Record<string, string> = { running: '●', waiting: '◷', done: '✓', failed: '✕', unknown: '?' }
@@ -504,10 +505,16 @@ function subLine(x: PulseSubSession, last: boolean, indent: string, since: numbe
 function taskLines(t: PulseTreeTask, depth: number, since: number): TreeLine[] {
   const ind = '  '.repeat(depth)
   const live = t.status === 'running' || t.status === 'waiting'
-  const attn = t.status === 'failed' || t.status === 'unknown'
+  const bad = t.status === 'failed' || t.status === 'unknown'
+  // a task that is not itself failed but has failed sub-sessions (counted in the group's attention): said on its own
+  // line, which a finished task folds to, and also when the failed one is past the sub-session cap
+  const subFailed = bad ? 0 : Math.max(0, t.sub_sessions_failed ?? 0)
+  const attn = bad || subFailed > 0
   const name = t.title || ('task ' + (t.task_id ?? '?'))
   const out: TreeLine[] = [{ attn, text: ind + (depth ? '↳ ' : '') + glyph(t.status, t.state) + ' ' + join([name,
-    live ? null : t.state === 'elsewhere' ? 'on ' + t.host + ', state there' : t.state, live ? clockOf(t, since) : clockOf(t, 0)]) }]
+    live ? null : t.state === 'elsewhere' ? 'on ' + t.host + ', state there' : t.state,
+    subFailed ? subFailed + ' sub-session' + (subFailed === 1 ? '' : 's') + ' failed' : null,
+    live ? clockOf(t, since) : clockOf(t, 0)]) }]
   const pad = ind + (depth ? '  ' : '') + '  '
   if (live) {
     const meta = join([t.model, t.host ? 'on ' + t.host : null, t.tool ? 'tool ' + t.tool : t.phase, tokShort(t.tokens)])
@@ -530,6 +537,8 @@ export function treeLines(v: PulseSessionView, tag: string, since: number): Tree
   const g: PulseOrchestrator | undefined = (o.items ?? []).find(x => x.origin === tag)
   const out: TreeLine[] = []
   if (o.status === 'partial') out.push({ text: 'partial: ' + errs(o), attn: true })
+  // the provider bounds its inputs by a hard ceiling far above any real fleet; when it cuts one it says so
+  if (o.inputs_truncated?.length) out.push({ text: 'inputs capped (' + o.inputs_truncated.join(', ') + '): some items may be missing', attn: true })
   if (!g) return [...out, { text: 'no task started from this session in the last 24 h' }]
   const c = g.counts ?? {}
   const n = (k: string) => c[k] ?? 0

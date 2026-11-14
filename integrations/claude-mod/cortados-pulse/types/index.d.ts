@@ -170,6 +170,8 @@ export interface PulseTreeTask {
   tokens?: PulseTokens | null
   sub_sessions?: PulseSubSession[]
   sub_sessions_hidden?: number
+  /** every failed sub-session of the task, listed or not (counted in its group's attention) */
+  sub_sessions_failed?: number
   tasks?: PulseTreeTask[]
 }
 export interface PulseOrchestrator {
@@ -192,7 +194,8 @@ export interface PulseSessionView {
   generated_at?: number
   session_filter?: string
   overview?: PulseLive['overview']
-  orchestrators?: PulseLiveSection & { items?: PulseOrchestrator[]; scope?: string; truncated?: boolean; session_filter?: string }
+  orchestrators?: PulseLiveSection & { items?: PulseOrchestrator[]; scope?: string; truncated?: boolean;
+    inputs_truncated?: string[]; session_filter?: string }
   s1?: PulseLive['s1']
   hosts?: PulseLive['hosts']
 }

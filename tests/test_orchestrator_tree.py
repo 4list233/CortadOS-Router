@@ -223,6 +223,30 @@ class TreeTest(unittest.TestCase):
         away = next(t for t in g[MINE]["tasks"] if t["task_id"] == AWAY)
         self.assertEqual((away["state"], away["status"], away["host"]), ("elsewhere", "unknown", "studio"))
 
+    def test_attention_counts_a_failed_sub_session_once(self):
+        def failed(key, ref, at):
+            return {"key": key, "ref": ref, "provider": "codex", "opened_at": at - 50, "closed_at": at, "closed": "failed"}
+        more = [failed("r:" + ROOT, "c-000000000020", NOW - 20),           # ROOT runs on; one subagent failed
+                failed("r:" + NESTED2, "c-000000000021", NOW - 101),       # a succeeded nested task, one failed sub
+                failed("r:" + THEIRS, "c-000000000022", NOW - 3002)]       # THEIRS failed: a second failed sub
+        g = groups(view(ended_conversations=lambda: ended() + more))
+        self.assertEqual(g[MINE]["attention"], 3)                   # AWAY + ROOT's failed sub + NESTED2's failed sub
+        self.assertEqual(g[OTHER]["attention"], 1)                  # THEIRS once, not once per failed sub-session
+        root = g[MINE]["tasks"][0]
+        self.assertEqual((root["status"], root["sub_sessions_failed"]), ("running", 1))
+        self.assertIn(("c-000000000020", "failed"), [(s["ref"], s["status"]) for s in root["sub_sessions"]])
+        theirs = next(t for t in g[OTHER]["tasks"] if t["task_id"] == THEIRS)
+        self.assertEqual(theirs["sub_sessions_failed"], 2)
+        self.assertEqual(g[MINE]["counts"], {"running": 2, "waiting": 0, "done": 1, "failed": 0, "unknown": 1})
+        # the same in the session's own view, and a failed sub-session past the list cap still counts
+        busy = [{"key": "r:" + ROOT, "ref": f"c-0000000003{i:02x}", "opened_at": NOW - 10, "busy": True}
+                for i in range(live.SUBSESSIONS_MAX + 2)]
+        mine = view(MINE, conversations=lambda: backend() + busy,
+                    ended_conversations=lambda: ended() + more)["orchestrators"]["items"][0]
+        self.assertEqual(mine["attention"], 3)
+        self.assertNotIn("failed", [s["status"] for s in mine["tasks"][0]["sub_sessions"]])
+        self.assertEqual(mine["tasks"][0]["sub_sessions_failed"], 1)
+
     def test_caps_are_said(self):
         many = [{"ts": NOW - 10 - i, "event": "started", "task_id": f"t20261111100000-{i:08x}",
                  "origin_session": MINE} for i in range(live.ORCH_TASKS_MAX + 5)]
@@ -295,6 +319,104 @@ class SessionFilterTest(unittest.TestCase):
                   "origin_session": f"{i:016x}"} for i in range(live.ORCH_MAX + 4)]
         items = view(MINE, child_events=lambda: many + events())["orchestrators"]["items"]
         self.assertEqual(ids(items[0]), [ROOT, NESTED, NESTED2, AWAY])
+
+    # ---- review 2026-11-14 (gpt-6.1-sol): the tree is built from uncapped inputs, filtered, then capped ----
+    def busy_board(self, n):
+        """board() plus `n` newer, working conversations of OTHER's: more than the conversations section lists."""
+        b = board()
+        other = {"session": OTHER, "project": "Grounds", "device": "studio"}
+        extra = []
+        for i in range(n):
+            rid = f"other-busy-{i:05d}"
+            b.turn_start("r:" + rid, other, run_id=rid, provider="codex", lane="codex", model="gpt-6.1", now=NOW - 2)
+            extra.append({"key": "r:" + rid, "ref": f"c-1{i:011x}", "provider": "codex", "lane": "codex",
+                          "model": "gpt-6.1", "opened_at": NOW - 2, "last_used": NOW - 1, "busy": True,
+                          "awaiting_tool": False})
+        return b, extra
+
+    def test_foreign_conversations_do_not_hide_this_sessions_routed_subagent(self):
+        n = live.CONVERSATIONS_MAX + 6
+        b, extra = self.busy_board(n)
+        over = dict(office_view=lambda ev: b.view(ev, now=NOW), conversations=lambda: extra + backend())
+        fleet = view(**over)
+        c = fleet["conversations"]                                  # the fleet list: capped as before
+        self.assertEqual((len(c["items"]), c["hidden"]), (live.CONVERSATIONS_MAX, c["active"] - live.CONVERSATIONS_MAX))
+        self.assertGreater(c["hidden"], 0)
+        self.assertNotIn("mine-sub-00001", [it["run_id"] for it in fleet["conversations"]["items"]])
+        for v in (fleet, view(MINE, **over), live.session_view(view(MINE, **over), MINE)):
+            g = groups(v)[MINE]
+            self.assertEqual([r["ref"] for r in g["routed"]], ["mine-sub-00001"])
+            self.assertEqual(g["routed_hidden"], 0)
+            self.assertEqual(v["orchestrators"]["inputs_truncated"], [])
+        theirs = groups(fleet)[OTHER]       # OTHER's own count is told too: all its floor's workers (the board lists 32)
+        self.assertEqual(len(theirs["routed"]) + theirs["routed_hidden"], tl.office.MAX_WORKERS_PER_FLOOR)
+        self.assertEqual(len(theirs["routed"]), live.ORCH_ROUTED_MAX)
+
+    def test_foreign_remote_stubs_do_not_hide_this_sessions_remote_task(self):
+        n = live.ELSEWHERE_MAX + 10
+        stubs = [{"task_id": f"t20261111095000-f{i:07x}", "host": "studio", "created_at": NOW - 1 - i / 100,
+                  "origin_session": OTHER} for i in range(n)]
+        stubs.append({"task_id": AWAY, "host": "studio", "created_at": NOW - 30, "origin_session": MINE})
+        fleet = view(remote_stubs=lambda: stubs)
+        self.assertEqual(len(fleet["tasks"]["elsewhere"]), live.ELSEWHERE_MAX)      # the fleet list: capped as before
+        self.assertNotIn(AWAY, [x["task_id"] for x in fleet["tasks"]["elsewhere"]])
+        for v in (fleet, view(MINE, remote_stubs=lambda: stubs)):
+            self.assertIn(AWAY, ids(groups(v)[MINE]))
+        theirs = groups(fleet)[OTHER]
+        self.assertEqual(theirs["counts"]["unknown"], n)                                # every one counted
+        self.assertEqual(ids(view(MINE, remote_stubs=lambda: stubs)["orchestrators"]["items"][0]),
+                         [ROOT, NESTED, NESTED2, AWAY])
+
+    def test_the_hard_ceiling_is_said_and_applies_after_the_filter(self):
+        stubs = [{"task_id": f"t20261111095000-f{i:07x}", "host": "studio", "created_at": NOW - 1 - i / 100,
+                  "origin_session": OTHER} for i in range(12)]
+        stubs.append({"task_id": AWAY, "host": "studio", "created_at": NOW - 30, "origin_session": MINE})
+        with mock.patch.object(live, "TREE_INPUT_MAX", 5):
+            mine = view(MINE, remote_stubs=lambda: stubs)["orchestrators"]
+            self.assertIn(AWAY, ids(mine["items"][0]))                  # filtered first: OTHER's stubs never count
+            self.assertEqual((mine["inputs_truncated"], mine["truncated"]), ([], False))
+            o = view(remote_stubs=lambda: stubs)["orchestrators"]       # the fleet: 13 stubs, 5 kept, the cut said
+            self.assertEqual((o["inputs_truncated"], o["truncated"]), (["conversations", "task stubs"], True))
+        cut = child_tasks.StubList(stubs)
+        cut.truncated = True                                            # the task-dir scan itself stopped at its cap
+        o = view(MINE, remote_stubs=lambda: cut)["orchestrators"]
+        self.assertEqual((o["inputs_truncated"], o["truncated"]), (["task stubs"], True))
+
+    def test_an_unknown_tag_gets_no_foreign_errors(self):
+        seen = []
+
+        def peek(tid):
+            seen.append(tid)
+            raise PermissionError("/Users/someone/tasks/" + tid)
+        for tag in ("cccccccccccccccc", MINE):
+            seen.clear()
+            o = view(tag, peek=peek, peek_foreign=False)["orchestrators"]
+            mine_open = {ROOT, NESTED} if tag == MINE else set()
+            self.assertEqual(set(seen), mine_open)                       # no other session's dir is opened at all
+            self.assertEqual(o["errors"], [{"source": "task_dir", "error": "PermissionError"}] * len(mine_open))
+            self.assertEqual(o["status"], "partial" if mine_open else "ok")
+        # the ?session= fleet variant still peeks every open task, but its tree keeps only its own tasks' errors
+        seen.clear()
+        v = view("cccccccccccccccc", peek=peek)
+        self.assertEqual(set(seen), {ROOT, NESTED, FOLLOW})
+        self.assertEqual((v["orchestrators"]["errors"], v["orchestrators"]["status"]), ([], "ok"))
+        self.assertEqual(len(v["tasks"]["errors"]), 3)                  # the tasks section is fleet-wide, as before
+        self.assertNotIn("/Users/", json.dumps(v))
+
+    def test_this_sessions_tasks_are_peeked_first(self):
+        many = [{"ts": NOW - 5 - i / 100, "event": "started", "task_id": f"t20261111130000-{i:08x}",
+                 "origin_session": OTHER} for i in range(live.PEEK_MAX + 5)]
+        seen = []
+        view(MINE, child_events=lambda: many + events(), peek=lambda tid: seen.append(tid) or {"phase": "queued"})
+        self.assertEqual(len(seen), live.PEEK_MAX)
+        self.assertEqual(seen[:2], [ROOT, NESTED])                      # OTHER's tasks never use up the budget
+
+    def test_the_fleet_tree_keeps_every_task_dir_error(self):
+        def peek(tid):
+            raise PermissionError("/x")
+        o = view(peek=peek)["orchestrators"]
+        self.assertEqual(o["errors"], [{"source": "task_dir", "error": "PermissionError"}] * 3)
+        self.assertEqual(o["status"], "partial")
 
     def test_the_session_fixture_is_current(self):
         text = FIXTURE.read_text()
@@ -379,6 +501,32 @@ class SessionEndpointTest(tl.EndpointHarness):
         raw = self.request("GET", live.SESSION_PATH + "?session=" + MINE, SESSION_TOKEN)[1]
         task = json.loads(raw)["orchestrators"]["items"][0]["tasks"][0]
         self.assertEqual([(s["role"], s["status"]) for s in task["sub_sessions"]], [("main", "done")])
+
+
+    def test_the_session_endpoint_never_opens_another_sessions_task_dir(self):
+        import time
+        mine, theirs = "t20261111170000-0a0b0c0d", "t20261111170000-0f0f0f0f"
+        Path(self.home, "child-tasks.jsonl").write_text("".join(json.dumps(e) + "\n" for e in (
+            {"ts": time.time() - 30, "event": "started", "task_id": mine, "origin_session": MINE},
+            {"ts": time.time() - 20, "event": "started", "task_id": theirs, "origin_session": OTHER})))
+        seen = []
+
+        def peek(tid):
+            seen.append(tid)
+            if tid == theirs:
+                raise PermissionError("/private/tasks/" + tid)
+            return None
+        with mock.patch.object(child_tasks, "peek_local", peek):
+            code, raw, _ = self.request("GET", live.SESSION_PATH + "?session=" + MINE, SESSION_TOKEN)
+            self.assertEqual(code, 200, raw)
+            self.assertEqual(seen, [mine])
+            o = json.loads(raw)["orchestrators"]
+            self.assertEqual((o["status"], o["errors"]), ("ok", []))
+            seen.clear()
+            code, raw, _ = self.request("GET", live.LIVE_PATH, tl.TOKEN)     # the fleet view peeks both, as before
+            self.assertEqual(code, 200, raw)
+            self.assertEqual(sorted(seen), sorted([mine, theirs]))
+            self.assertIn({"source": "task_dir", "error": "PermissionError"}, json.loads(raw)["orchestrators"]["errors"])
 
 
 class LinkageTest(unittest.TestCase):

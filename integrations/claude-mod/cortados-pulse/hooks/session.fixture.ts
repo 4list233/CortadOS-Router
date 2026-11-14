@@ -122,6 +122,7 @@ export default {
               }
             ],
             "sub_sessions_hidden": 0,
+            "sub_sessions_failed": 0,
             "tasks": [
               {
                 "task_id": "t20261111090500-a0000002",
@@ -160,6 +161,7 @@ export default {
                   }
                 ],
                 "sub_sessions_hidden": 0,
+                "sub_sessions_failed": 0,
                 "tasks": [
                   {
                     "task_id": "t20261111090600-a0000003",
@@ -183,6 +185,7 @@ export default {
                     "tokens": null,
                     "sub_sessions": [],
                     "sub_sessions_hidden": 0,
+                    "sub_sessions_failed": 0,
                     "tasks": []
                   }
                 ]
@@ -211,6 +214,7 @@ export default {
             "tokens": null,
             "sub_sessions": [],
             "sub_sessions_hidden": 0,
+            "sub_sessions_failed": 0,
             "tasks": []
           }
         ],
@@ -235,6 +239,7 @@ export default {
       }
     ],
     "truncated": false,
+    "inputs_truncated": [],
     "session_filter": "aaaaaaaaaaaaaaa1"
   },
   "s1": {

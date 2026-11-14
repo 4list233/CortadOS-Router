@@ -3262,13 +3262,15 @@ class ProviderServer(ThreadingHTTPServer):
         key = (str(paths.state_dir()), id(registry), registry.live.generation, session, session_view)
         if session_view:                                # GET /v1/cortados/live/session: that session's subtree only
             return self._live_memo.get(key, lambda: json.dumps(
-                live.session_view(self.live_view(registry, session), session), allow_nan=False).encode())
+                live.session_view(self.live_view(registry, session, session_view=True), session),
+                allow_nan=False).encode())
         return self._live_memo.get(key, lambda: json.dumps(self.live_view(registry, session), allow_nan=False).encode())
 
-    def live_view(self, registry: Registry, session: str | None = None) -> dict[str, Any]:
+    def live_view(self, registry: Registry, session: str | None = None, session_view: bool = False) -> dict[str, Any]:
         """GET /v1/cortados/live (provider/live.py): composes the office board, the tasks and the live slice of the usage
         view, the child-task log (read once, 24 h) and the host heartbeats. Cache-only: no vendor CLI, no ssh. Tests
-        replace the inputs it calls (office_view's board, tasks_view, live_usage_view) or this method."""
+        replace the inputs it calls (office_view's board, tasks_view, live_usage_view) or this method. `session_view`
+        (GET /v1/cortados/live/session): no other session's task directory is peeked."""
         from cortados_router import child_tasks, exec_hosts, paths
         now = time.time()
         state = paths.state_dir()
@@ -3291,7 +3293,7 @@ class ProviderServer(ThreadingHTTPServer):
             peek=child_tasks.peek_local, exec_hosts=hosts, self_host=exec_hosts.short_hostname(),
             remote_stubs=child_tasks.remote_stubs, lane_enabled=live.lane_enabled,
             conversations=registry.live_conversations, ended_conversations=registry.ended_conversations,
-            run_tokens=registry.runs.tokens_by_run, session=session)
+            run_tokens=registry.runs.tokens_by_run, session=session, peek_foreign=not session_view)
 
     def live_usage_view(self, registry: Registry, now: float) -> dict[str, Any]:
         """Lanes, S1 and hardware for the live view (usage.collect_live): the same sources usage_view reads."""

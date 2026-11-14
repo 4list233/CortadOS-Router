@@ -454,6 +454,7 @@ export default {
               }
             ],
             "sub_sessions_hidden": 0,
+            "sub_sessions_failed": 0,
             "tasks": []
           },
           {
@@ -478,6 +479,7 @@ export default {
             "tokens": null,
             "sub_sessions": [],
             "sub_sessions_hidden": 0,
+            "sub_sessions_failed": 0,
             "tasks": []
           }
         ],
@@ -546,6 +548,7 @@ export default {
             "tokens": null,
             "sub_sessions": [],
             "sub_sessions_hidden": 0,
+            "sub_sessions_failed": 0,
             "tasks": []
           },
           {
@@ -570,6 +573,7 @@ export default {
             "tokens": null,
             "sub_sessions": [],
             "sub_sessions_hidden": 0,
+            "sub_sessions_failed": 0,
             "tasks": []
           },
           {
@@ -594,6 +598,7 @@ export default {
             "tokens": null,
             "sub_sessions": [],
             "sub_sessions_hidden": 0,
+            "sub_sessions_failed": 0,
             "tasks": []
           }
         ],
@@ -641,6 +646,7 @@ export default {
             "tokens": null,
             "sub_sessions": [],
             "sub_sessions_hidden": 0,
+            "sub_sessions_failed": 0,
             "tasks": []
           }
         ],
@@ -649,7 +655,8 @@ export default {
         "routed_hidden": 0
       }
     ],
-    "truncated": false
+    "truncated": false,
+    "inputs_truncated": []
   },
   "routed": {
     "as_of": 1800000000.0,

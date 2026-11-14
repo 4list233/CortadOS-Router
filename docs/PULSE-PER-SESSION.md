@@ -19,7 +19,7 @@ What fits, and where it went:
 | Subagents drawn as cards while they fit, then swimlanes on one time axis | A tree: session → task → sub-session. A side pane is 40–60 columns, so it gets indented lines, not cards. |
 | A running clock per agent that redraws between events (`elapsed.tsx`) | Every running or waiting node has an elapsed time that keeps counting between polls: the pane adds the time since the snapshot, the dashboard ticks once a second. |
 | Status shown as a glyph and a word, not colour alone | The same glyphs in both views: `●` running, `◷` waiting, `✓` done, `✕` failed, `?` unknown, `⊘` cancelled. The dashboard pairs each with its word in a pill. |
-| What needs attention is red (`max_tokens`, denials, errors) | Failed or unknown tasks and failed sub-sessions are counted in `attention`. The pane draws them bold under a `! N needs attention` line. The dashboard draws them red and opens their group. |
+| What needs attention is red (`max_tokens`, denials, errors) | Failed or unknown tasks are counted in `attention`, and so is each failed sub-session of a task that is neither (a failed task counts once, however many of its sub-sessions failed). The pane draws them bold under a `! N needs attention` line, and a task with failed sub-sessions says "N sub-sessions failed" on its own line, even folded or past the list cap. The dashboard draws them red and opens their group and task. |
 | Panels with nothing to show take no room; a finished card folds | A finished task is one line. A running task opens with its model line and its sub-sessions. An orchestrator with no tasks shows one line. |
 | Expand an agent on demand (keys `1`, `2`, …) | Dashboard: each group and each task with children is a native `<details>`. It opens by default when it has live work or a failure, and it stays as you left it across the 5 s re-render. The pane has no key handling, so it uses fixed folding rules and the dashboard holds the rest ("+N more (dashboard)"). |
 | Only real event data; inferences labelled | Tokens are only shown when a backend reported them, never estimated. The one inference, which sub-session is the "main loop", is described in §4. |
@@ -142,6 +142,14 @@ tool name, Office tag) or from fixed vocabularies (status, phase, role).
   that session or its machine's salt holder. Tags are cosmetic labels inside the owner's trust boundary (as
   `x-cortados-session` already is), so the provider cannot check that the caller "is" the session. What it can and does
   guarantee is that a session's view contains nothing about another session.
+- **Independent of other sessions' activity** (review 2026-11-14): the tree is built from the uncapped task rows,
+  conversation items and remote stubs, narrowed to the session's origin first, and only then capped. The fleet lists'
+  own caps (64 conversations, 50 stubs) never decide what a session sees. A hard ceiling (`TREE_INPUT_MAX`, 2000 per
+  input, after the filter) bounds the work on a runaway fleet; a cut is named in `inputs_truncated` (also when the
+  task-dir scan for stubs stopped at its 200), and the pane and the dashboard say it. The session endpoint never opens
+  another session's task directory (its own open tasks are peeked first, so others cannot use up the 64 peeks), and a
+  task-dir error is published only with the task it belongs to: another session's `PermissionError` never reaches this
+  view or changes its status.
 - Why not have the provider derive the session from the request? The provider never sees the session id, and must not:
   it is a `claude --resume` handle. Why not filter in the pane? The pane would then download every session's metadata,
   which was the old behaviour.
@@ -164,14 +172,14 @@ tool name, Office tag) or from fixed vocabularies (status, phase, role).
 `?session=<tag>` narrows it like the other sections. `GET /v1/cortados/live/session?session=<tag>` is the pane's view.
 
 ```
-orchestrators: {as_of, status, errors[], scope: "provider host", window_s, truncated, session_filter?,
+orchestrators: {as_of, status, errors[], scope: "provider host", window_s, truncated, inputs_truncated[], session_filter?,
   items: [{origin: <tag> | "grokbot" | null, kind: session | bot | unattributed, project, device,
            status (working / idle / not live; "n/a" for bot and unattributed), model, tool, last_activity,
            counts {running, waiting, done, failed, unknown}, attention,
            tasks: [task], tasks_hidden, routed: [sub-session], routed_hidden}]}
 task:        {task_id, title, state, status, phase, tool, host, provider, lane, model, started_at, ended_at, elapsed_s,
               workspace, browser, parent_task_id, parent_hidden, origin_via, tokens, sub_sessions: [sub-session],
-              sub_sessions_hidden, tasks: [task]}
+              sub_sessions_hidden, sub_sessions_failed (all of them, listed or not), tasks: [task]}
 sub-session: {ref (c-<12 hex digest> or a run id), role: main | subagent, title?, status, phase, tool?, provider, lane,
               model, started_at, ended_at, last_activity, elapsed_s, tokens}
 tokens:      {input, output, cache_read, cache_write, fresh} | null
@@ -180,7 +188,9 @@ tokens:      {input, output, cache_read, cache_write, fresh} | null
 Caps: 32 orchestrators, 20 top-level tasks each (active first; counts cover all), nesting depth 4 (a deeper or cyclic
 parent chain is drawn flat, never lost), 8 sub-sessions per task, 8 routed subagents. The section has its own
 `as_of`, `status` and `errors`. Failures of the task log, the office board, the conversation list, the ended list or
-the run tokens make it `partial` or `error`, never an empty success.
+the run tokens make it `partial` or `error`, never an empty success. `attention` = failed + unknown tasks + the failed
+sub-sessions of every other task. `inputs_truncated` names an input (`conversations`, `task stubs`) that hit the hard
+ceiling; `truncated` is then true as well.
 
 ## 7. What the owner must do
 
@@ -201,7 +211,10 @@ the run tokens make it `partial` or `error`, never an empty success.
 - `tests/test_orchestrator_tree.py`: the tree (groups, nesting and inheritance, a follow-up by another session, a
   parent cycle, sub-sessions with roles, statuses and tokens, routed subagents, Grok Bot, unattributed, attention,
   caps, source errors). The session filter: nothing of another origin, the bot or the unattributed group appears,
-  checked by tag, task id, title and conversation ref; filtering happens before the caps. Metadata only. The endpoint:
+  checked by tag, task id, title and conversation ref; filtering happens before the caps, and 64+ foreign
+  conversations or 50+ foreign remote stubs hide nothing of this session's; the hard ceiling applies after the filter
+  and is said; an unknown tag gets no foreign task-dir error and opens no foreign directory; attention counts a failed
+  sub-session once. Metadata only. The endpoint:
   required tag, `live:session` versus other scopes, a real routed run appearing as a sub-session and staying after it
   closes. Linkage helpers. The generated `hooks/session.fixture.ts` is checked against `live.session_view`.
 - `tests/test_child_tasks.py`: inheritance at start (no origin of its own → the parent's, `origin_via: parent`, in

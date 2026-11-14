@@ -2158,17 +2158,26 @@ def peek_local(task_id) -> dict | None:
 REMOTE_STUBS_SCAN = 200            # newest task dirs looked at per call: a day of tasks at the owner's pace, a few stats each
 
 
+class StubList(list):
+    """remote_stubs()'s answer: a list, plus `truncated` True when more task dirs exist than REMOTE_STUBS_SCAN (older
+    stubs were not looked at; the live view's tree says so in `inputs_truncated`)."""
+    truncated = False
+
+
 def remote_stubs() -> list:
     """For GET /v1/cortados/live: the remote stubs among the newest REMOTE_STUBS_SCAN task dirs on this machine, as
     [{task_id, host, created_at, origin_*}] — tasks started FROM here onto another execution host. Metadata only, read-only (no
     ssh, never creates the tasks root; a missing root is no stubs). A stub that cannot be read is skipped: it is a
-    pointer, and the view says the section's scope rather than guessing its task's state."""
+    pointer, and the view says the section's scope rather than guessing its task's state. The list's `truncated`
+    (StubList) says the scan stopped at its cap."""
     root = tasks_dir()
     try:
-        names = sorted((x for x in os.listdir(root) if TASK_ID_RE.fullmatch(x)), reverse=True)[:REMOTE_STUBS_SCAN]
+        names = sorted((x for x in os.listdir(root) if TASK_ID_RE.fullmatch(x)), reverse=True)
     except FileNotFoundError:
-        return []
-    out = []
+        return StubList()
+    out = StubList()
+    out.truncated = len(names) > REMOTE_STUBS_SCAN
+    names = names[:REMOTE_STUBS_SCAN]
     for tid in names:
         try:
             rec = _stub(os.path.join(root, tid))
