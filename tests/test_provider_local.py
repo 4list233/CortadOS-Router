@@ -12,6 +12,7 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp())
 
@@ -459,8 +460,11 @@ class LocalThinkingTests(LocalHarness):
 
 class LocalConversationPinTests(LocalHarness):
     """A local-pinned conversation keeps its model, exactly as a Claude or Codex pin does: the binding is recorded in
-    the registry and every continuation is checked against it (the 409 "fixed per conversation")."""
+    the registry and every continuation is checked against it (the terminal 400 "fixed per conversation", #43 review)."""
     TOOLS = [{"name": "Read", "input_schema": {"type": "object"}}]
+    # As Claude Code sends it: a text-only continuation without a conversation identity is refused before any model
+    # check (#43 review P1-b), and these tests pin the model check.
+    HEADERS = {"X-Claude-Code-Session-Id": "6a1d0c3e-local-pin"}
 
     def opener(self, model, stream=False):
         return {"model": model, "max_tokens": 64, "tools": self.TOOLS, "stream": stream,
@@ -475,7 +479,7 @@ class LocalConversationPinTests(LocalHarness):
 
     def conflict(self, body):
         code, msg = self.error_of(body)
-        self.assertEqual(code, 409)
+        self.assertEqual(code, 400)                     # terminal: the retry names the same other model (#43 review)
         self.assertIn("fixed per conversation", msg)
         return msg
 
@@ -568,6 +572,50 @@ class LocalConversationPinTests(LocalHarness):
         self.assertIs(next(iter(self.reg.sessions.values())), session)
         ok = self.follow(first, got["content"], "sub/qwen-27b")         # the conversation is still usable
         self.assertEqual(self.post(ok)["stop_reason"], "tool_use")
+
+    def test_a_continuation_whose_session_was_replaced_while_it_waited_is_a_529_and_never_relayed(self):
+        # Review round 3, P2: A is paused after its lookup, before the relay; a compaction (C) replaces the
+        # conversation's session meanwhile. A must not be served by the retired session (it used to get a 200 that no
+        # later request could continue: the next continuation was a terminal no_writer). It gets a retryable 529,
+        # nothing reaches the node for it, and the conversation goes on, on the rebuilt session.
+        first = self.opener("sub/qwen-27b")
+        r1 = self.post(first)
+        second = self.follow(first, r1["content"], "sub/qwen-27b")
+        r2 = self.post(second)
+        (old,) = self.reg.sessions.values()
+        a_body = self.follow(second, r2["content"], "sub/qwen-27b")
+        compacted = {**a_body, "messages": [{"role": "user", "content": "Summary."}] + a_body["messages"][-2:]}
+        real, paused, go, out = server.Handler._relay_local, threading.Event(), threading.Event(), {}
+
+        def held(handler, session, *a, **kw):
+            if session is old and not paused.is_set():               # A: looked up, held before the relay
+                paused.set()
+                go.wait(10)
+            return real(handler, session, *a, **kw)
+
+        with mock.patch.object(server.Handler, "_relay_local", held):
+            a = threading.Thread(target=lambda: out.update(a=self.status_and_body(a_body)))
+            a.start()
+            self.assertTrue(paused.wait(10))
+            rc = self.post(compacted)                                 # C rebuilds: the old session is retired
+            (new,) = self.reg.sessions.values()
+            self.assertIsNot(new, old)
+            seen = len(FakeOllama.seen)
+            go.set()
+            a.join(30)
+        code, err = out["a"]
+        self.assertEqual(code, server.BUSY_STATUS, out)
+        self.assertEqual(err["error"]["type"], "overloaded_error")
+        self.assertEqual(len(FakeOllama.seen), seen)                  # the retired session never reached the node
+        self.assertEqual(list(self.reg.sessions.values()), [new])
+        # The conversation continues on the rebuilt session (before the fix this was a terminal no_writer).
+        self.assertEqual(self.post(self.follow(compacted, rc["content"], "sub/qwen-27b"))["stop_reason"], "tool_use")
+
+    def status_and_body(self, body):
+        try:
+            return 200, self.post(body)
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
 
     def test_a_failed_opening_turn_leaves_no_conversation(self):
         self.ollama.shutdown()
