@@ -47,7 +47,7 @@ class DashboardTest(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/dashboard", timeout=10) as r:
             self.assertEqual(r.status, 200)
             self.assertIn("text/html", r.headers["content-type"])
-            self.assertEqual(r.headers["cache-control"], "no-store")
+            self.assertEqual(r.headers["cache-control"], "private, no-store")
             self.assertEqual(r.headers["x-frame-options"], "DENY")
             self.assertEqual(r.headers["referrer-policy"], "no-referrer")
             self.assertEqual(r.headers["x-content-type-options"], "nosniff")

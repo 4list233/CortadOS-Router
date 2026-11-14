@@ -791,7 +791,7 @@ class EndpointTest(EndpointHarness):
             self.assertEqual(self.request("POST", live.HEARTBEAT_PATH, tok, body={"host": "studio"})[0], 401)
         code, raw, headers = self.request("GET", live.LIVE_PATH, TOKEN)
         self.assertEqual(code, 200, raw)
-        self.assertEqual(headers["cache-control"], "no-store")
+        self.assertEqual(headers["cache-control"], "private, no-store")
         v = json.loads(raw)
         self.assertEqual(v["version"], 1)
         self.assertEqual(v["subscriptions"]["status"], "error")    # the missing scarcity cache is said, not hidden

@@ -305,9 +305,13 @@ def clear_cookie() -> str:
 
 
 def same_origin(headers, peer: str) -> bool:
-    """True when the request's Origin (else Referer) names this server: its host[:port] equals the Host header, or
-    X-Forwarded-Host when the peer is loopback (Tailscale Serve). A browser cannot forge Origin, Referer or Host for a
-    cross-site request, so a page on another site fails here even before the CSRF token. No Origin and no Referer: refused."""
+    """True when the request's Origin (else Referer) names this server, scheme and authority both. The authority must
+    equal the Host header, or X-Forwarded-Host when the peer is loopback (Tailscale Serve). The scheme must be the one
+    the request arrived on: this server speaks plain HTTP, so "http", unless a loopback peer (the Serve proxy) says
+    otherwise in X-Forwarded-Proto (Serve sends "https"). Comparing the scheme too means an http:// page on the same
+    host and port (another listener, or a downgraded connection) is not "same origin" for the https dashboard. A browser
+    cannot forge Origin, Referer or Host for a cross-site request, so a page on another site fails here even before the
+    CSRF token. No Origin and no Referer: refused."""
     src = headers.get("origin") or headers.get("referer") or ""
     if not src or src == "null":
         return False
@@ -318,9 +322,13 @@ def same_origin(headers, peer: str) -> bool:
     if u.scheme not in ("https", "http") or not u.netloc:
         return False
     want = {h.strip().lower() for h in [headers.get("host") or ""] if h.strip()}
+    scheme = "http"
     if peer in LOOPBACK:
         want |= {h.strip().lower() for h in (headers.get("x-forwarded-host") or "").split(",") if h.strip()}
-    return u.netloc.lower() in want
+        proto = (headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+        if proto:
+            scheme = proto
+    return u.scheme == scheme and u.netloc.lower() in want
 
 
 # ------------------------------------------------------------------ throttle
@@ -513,6 +521,17 @@ class DashboardAuth:
             with self._lock:
                 self._sess_cache = None
 
+    def locked_out(self, address: str) -> dict | None:
+        """The 429 refusal login() would give `address` now (its own lockout or the global cap), or None. The server
+        calls it before it reads a login body, so a locked-out client is refused without holding a thread on its body."""
+        blocked = self.throttle.blocked(address)
+        if blocked is None:
+            return None
+        secs, kind = blocked
+        logger.warning("dashboard login refused from %s: %s lockout, %d s left", address, kind, secs)
+        return {"ok": False, "status": 429, "retry_after": secs,
+                "why": "too many failed logins" + (" from everywhere" if kind == "global" else "")}
+
     def login(self, password: str, address: str) -> dict:
         """One login attempt. {"ok": True, "cookie": value, "csrf": token} or {"ok": False, "status": 401 | 404 | 429
         | 500, "retry_after": s, "why": text}. The password is never logged; failures log the address only."""
@@ -523,12 +542,9 @@ class DashboardAuth:
                 return {"ok": False, "status": 500, "why": "dashboard-auth.json is unusable (see provider log)"}
             if rec is None:
                 return {"ok": False, "status": 404, "why": "no dashboard password is set"}
-            blocked = self.throttle.blocked(address)
-            if blocked is not None:
-                secs, kind = blocked
-                logger.warning("dashboard login refused from %s: %s lockout, %d s left", address, kind, secs)
-                return {"ok": False, "status": 429, "retry_after": secs,
-                        "why": "too many failed logins" + (" from everywhere" if kind == "global" else "")}
+            refusal = self.locked_out(address)        # again under the lock: a failure may have landed since the precheck
+            if refusal is not None:
+                return refusal
             if not verify_password(password, rec):
                 left = self.throttle.failed(address)
                 logger.warning("dashboard login failed from %s (%s)", address,

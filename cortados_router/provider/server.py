@@ -45,6 +45,7 @@ from typing import Any, Callable
 if __package__ in (None, ""):                           # run as a file: make the package importable
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from cortados_router import http_body
 from cortados_router.compat import getenv
 from cortados_router.compaction import prune as compaction_prune, store as compaction_store
 from cortados_router.provider import anthropic_wire, clients, dashboard_auth, live, local_lane, office, responses_wire, routing, search_lane
@@ -152,10 +153,13 @@ _DASHBOARD_PATH = Path(__file__).with_name("dashboard.html")
 _dashboard_cache: dict = {}
 
 
-# The page holds no data or secret, so it needs no token; these headers keep it from being cached, framed, sniffed as
-# another type, or sending its Referer. Its Content-Security-Policy is _dashboard_csp(): it pins the one inline script.
+# The token page holds no data or secret, so it needs no token; in session mode the page carries the session's CSRF
+# token. These headers keep it from being stored by the browser or any cache (private, no-store; Vary names the
+# credentials it depends on), framed, sniffed as another type, or sending its Referer. Its Content-Security-Policy is
+# _dashboard_csp(): it pins the one inline script.
 DASHBOARD_HEADERS = {
-    "Cache-Control": "no-store",
+    "Cache-Control": "private, no-store",
+    "Vary": "Cookie, Authorization",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
@@ -267,6 +271,17 @@ LOGIN_HEADERS = {"Referrer-Policy": "same-origin"}
 LOGIN_PATH, LOGOUT_PATH = "/dashboard/login", "/dashboard/logout"
 # A login body is one short form field; anything bigger is refused before it is read.
 LOGIN_MAX_BYTES = 4096
+# The whole login body must arrive within this many seconds of the headers (http_body.read_within). The socket timeout
+# (SOCKET_TIMEOUT_S) bounds inactivity only, so without it an unauthenticated client trickling one byte per 100 s holds
+# a handler thread for days. 4 KiB in 5 s is ~6.5 kbit/s: a browser posts it in one write.
+LOGIN_BODY_DEADLINE_S = 5.0
+# Login requests handled at once, from headers to the reply; one more is refused with 503 before anything is read. The
+# route is unauthenticated, so this caps the threads (and scrypt/PBKDF2 queue) strangers can occupy. Logins are
+# serialised in dashboard_auth anyway, so 4 is plenty for the one owner.
+LOGIN_MAX_CONCURRENT = 4
+# Every authenticated view (owner token, scoped token or dashboard session): never stored by the browser or any cache,
+# and a response depends on the credential it was asked with.
+VIEW_HEADERS = {"Cache-Control": "private, no-store", "Vary": "Cookie, Authorization"}
 _LOGIN_PAGE = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark"><title>CortadOS · log in</title>
@@ -1282,9 +1297,21 @@ class Handler(BaseHTTPRequestHandler):
         return self._html_page(200, page, csp)
 
     def _dashboard_login(self) -> None:
-        """POST /dashboard/login (form field `password`). Size and origin are checked before the body is read; every
-        refusal before the read closes the connection. The password is never logged (dashboard_auth.login)."""
+        """POST /dashboard/login (form field `password`). Unauthenticated, so everything that can be refused is refused
+        before the body is read: a free login slot (503), size, type, origin, and the lockout (429). The body is then
+        read under LOGIN_BODY_DEADLINE_S. Every refusal closes the connection. The password is never logged."""
         self.close_connection = True                    # one login per connection: nothing unread is parsed later
+        slots = self.server.login_slots
+        if not slots.acquire(blocking=False):
+            logger.warning("dashboard login refused: %d logins already in progress", LOGIN_MAX_CONCURRENT)
+            return self._html_page(503, _login_page("too many logins in progress; try again shortly"), LOGIN_CSP,
+                                   dict(LOGIN_HEADERS, **{"Retry-After": "5"}))
+        try:
+            return self._dashboard_login_slot()
+        finally:
+            slots.release()
+
+    def _dashboard_login_slot(self) -> None:
         try:
             n = int(self.headers.get("content-length") or 0)
         except ValueError:
@@ -1295,18 +1322,27 @@ class Handler(BaseHTTPRequestHandler):
         if ctype != "application/x-www-form-urlencoded":
             return self._html_page(415, _login_page("the login form must be posted as a form"), LOGIN_CSP, LOGIN_HEADERS)
         if not dashboard_auth.same_origin(self.headers, self._peer()):
-            logger.warning("dashboard login refused: not same-origin (origin %r, host %r)",
-                           (self.headers.get("origin") or "")[:100], (self.headers.get("host") or "")[:100])
+            logger.warning("dashboard login refused: not same-origin (origin %r, host %r, forwarded proto %r)",
+                           (self.headers.get("origin") or "")[:100], (self.headers.get("host") or "")[:100],
+                           (self.headers.get("x-forwarded-proto") or "")[:20])
             return self._html_page(403, _login_page("cross-site login refused"), LOGIN_CSP, LOGIN_HEADERS)
-        from urllib.parse import parse_qs
-        try:
-            form = parse_qs(self.rfile.read(n).decode("utf-8"), keep_blank_values=True, max_num_fields=4)
-        except ValueError:                              # undecodable bytes or too many fields
-            return self._html_page(400, _login_page("the login form is malformed"), LOGIN_CSP, LOGIN_HEADERS)
-        password = (form.get("password") or [""])[0]
         addr = dashboard_auth.client_address(self._peer(), self.headers.get("x-forwarded-for") or "")
-        r = self.server.registry.dashboard.login(password, addr)
-        del password, form
+        auth = self.server.registry.dashboard
+        r = auth.locked_out(addr)                       # before the read: a locked-out client gets no thread on its body
+        if r is None:
+            raw = http_body.read_within(self.connection, self.rfile, n, LOGIN_BODY_DEADLINE_S, self.timeout)
+            if raw is None:                             # too slow or gone: no reply worth writing, the socket is closed
+                logger.warning("dashboard login from %s dropped: body not received within %.1f s", addr,
+                               LOGIN_BODY_DEADLINE_S)
+                return
+            from urllib.parse import parse_qs
+            try:
+                form = parse_qs(raw.decode("utf-8"), keep_blank_values=True, max_num_fields=4)
+            except ValueError:                          # undecodable bytes or too many fields
+                return self._html_page(400, _login_page("the login form is malformed"), LOGIN_CSP, LOGIN_HEADERS)
+            password = (form.get("password") or [""])[0]
+            r = auth.login(password, addr)
+            del password, form, raw
         if r["ok"]:
             self.send_response(303)
             self.send_header("Location", "/dashboard")
@@ -1450,7 +1486,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 logger.warning("office: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: office view unavailable (see provider log)")
-            return self._json(200, body)
+            return self._json(200, body, headers=VIEW_HEADERS)
         if self.path.split("?")[0] == live.LIVE_PATH:
             # Owner token, a scoped token with live:read, or a dashboard session. Metadata only (provider/live.py).
             if not self._owner_or_session("GET"):
@@ -1460,7 +1496,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 logger.warning("live: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: live view unavailable (see provider log)")
-            return self._json(200, body, headers={"cache-control": "no-store"})
+            return self._json(200, body, headers=VIEW_HEADERS)
         if self.path == "/health":
             return self._json(200, {"ok": True, "conversations": len(self.server.registry.sessions)})
         if self.path in ("/", "/dashboard"):
@@ -1505,7 +1541,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 logger.warning("tasks: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: tasks view unavailable (see provider log)")
-            return self._json(200, body)
+            return self._json(200, body, headers=VIEW_HEADERS)
         if self.path.split("?")[0] == "/v1/cortados/usage":
             if not self._owner_or_session("GET"):        # the owner token or a dashboard session
                 return self._refuse_auth()
@@ -1517,7 +1553,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 logger.warning("usage: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: usage view unavailable (see provider log)")
-            return self._json(200, body)
+            return self._json(200, body, headers=VIEW_HEADERS)
         if self.path.split("?")[0].startswith(RUNS_PATH):
             if not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
@@ -2491,6 +2527,7 @@ class ProviderServer(ThreadingHTTPServer):
         super().__init__(addr, Handler)
         try:
             self.registry = registry
+            self.login_slots = threading.BoundedSemaphore(LOGIN_MAX_CONCURRENT)   # POST /dashboard/login (_dashboard_login)
             self._live_memo = live.Memo()                # GET /v1/cortados/live (live_body)
             # The usage ledger's writer starts with the endpoint, never from a request (record_async only queues).
             from cortados_router import usage_ledger

@@ -48,7 +48,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from cortados_router import child_tasks, paths, subagent_mcp
+from cortados_router import child_tasks, http_body, paths, subagent_mcp
 
 CLIENT = "grokbot"                       # fixed: one shared token means one attributable client (owner decision)
 EXPOSED = ("start_task", "wait_task", "task_status", "list_tasks", "cancel_task", "route_task")
@@ -700,24 +700,8 @@ def make_handler(gw: Gateway, allowed_hosts=(), clock=time.monotonic):
             super().finish()
 
         def _read_body(self, n: int):
-            """n bytes within BODY_DEADLINE_S, or None. Each wait is bounded by the time left, so a trickle cannot
-            extend the deadline."""
-            end = time.monotonic() + BODY_DEADLINE_S
-            parts, left = [], n
-            try:
-                while left > 0:
-                    remaining = end - time.monotonic()
-                    if remaining <= 0:
-                        return None
-                    self.connection.settimeout(min(REQUEST_TIMEOUT_S, remaining))
-                    chunk = self.rfile.read1(min(left, 65536))
-                    if not chunk:
-                        return None
-                    parts.append(chunk)
-                    left -= len(chunk)
-            except OSError:
-                return None                   # the client stalled or left; the caller closes the connection
-            return b"".join(parts)
+            """n bytes within BODY_DEADLINE_S, or None (http_body.read_within: a trickle cannot extend the deadline)."""
+            return http_body.read_within(self.connection, self.rfile, n, BODY_DEADLINE_S, REQUEST_TIMEOUT_S)
 
         def _client_addr(self):
             # Funnel is trusted only on loopback and appends the real client as the last XFF hop; earlier hops are

@@ -13,9 +13,11 @@ import logging
 import os
 import re
 import shutil
+import socket
 import stat
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -197,16 +199,34 @@ class HelperTest(unittest.TestCase):
 
     def test_same_origin(self):
         h = self.headers
-        self.assertTrue(da.same_origin(h(host="air.example:8444", origin="https://air.example:8444"), "127.0.0.1"))
-        self.assertFalse(da.same_origin(h(host="air.example:8444", origin="https://evil.example"), "127.0.0.1"))
-        self.assertFalse(da.same_origin(h(host="air.example:8444"), "127.0.0.1"))            # neither header
-        self.assertFalse(da.same_origin(h(host="air.example:8444", origin="null"), "127.0.0.1"))
-        self.assertTrue(da.same_origin(h(host="air.example:8444", referer="https://air.example:8444/dashboard"),
+        tls = {"x_forwarded_proto": "https"}                  # Tailscale Serve: the browser's connection was https
+        self.assertTrue(da.same_origin(h(host="air.example:8444", origin="https://air.example:8444", **tls),
+                                       "127.0.0.1"))
+        self.assertFalse(da.same_origin(h(host="air.example:8444", origin="https://evil.example", **tls), "127.0.0.1"))
+        self.assertFalse(da.same_origin(h(host="air.example:8444", **tls), "127.0.0.1"))            # neither header
+        self.assertFalse(da.same_origin(h(host="air.example:8444", origin="null", **tls), "127.0.0.1"))
+        self.assertTrue(da.same_origin(h(host="air.example:8444", referer="https://air.example:8444/dashboard", **tls),
                                        "127.0.0.1"))
         # X-Forwarded-Host (Tailscale Serve) counts only from a loopback peer
-        fwd = h(host="127.0.0.1:8432", x_forwarded_host="air.example:8444", origin="https://air.example:8444")
+        fwd = h(host="127.0.0.1:8432", x_forwarded_host="air.example:8444", origin="https://air.example:8444", **tls)
         self.assertTrue(da.same_origin(fwd, "127.0.0.1"))
         self.assertFalse(da.same_origin(fwd, "100.64.0.9"))
+
+    def test_same_origin_compares_the_scheme(self):
+        h = self.headers
+        # a direct (non-proxied) request arrives over this server's plain HTTP: only an http:// origin matches
+        self.assertTrue(da.same_origin(h(host="127.0.0.1:8432", origin="http://127.0.0.1:8432"), "127.0.0.1"))
+        self.assertFalse(da.same_origin(h(host="127.0.0.1:8432", origin="https://127.0.0.1:8432"), "127.0.0.1"))
+        self.assertFalse(da.same_origin(h(host="air.example:8432", origin="https://air.example:8432"), "100.64.0.9"))
+        self.assertFalse(da.same_origin(h(host="air.example:8432", referer="ftp://air.example:8432/"), "100.64.0.9"))
+        # behind Tailscale Serve (loopback peer): the scheme is X-Forwarded-Proto's, the authority X-Forwarded-Host's
+        serve = dict(host="127.0.0.1:8432", x_forwarded_host="air.example:8444", x_forwarded_proto="https")
+        self.assertTrue(da.same_origin(h(**serve, origin="https://air.example:8444"), "127.0.0.1"))
+        self.assertTrue(da.same_origin(h(**serve, referer="HTTPS://air.example:8444/dashboard"), "127.0.0.1"))
+        self.assertFalse(da.same_origin(h(**serve, origin="http://air.example:8444"), "127.0.0.1"))   # downgraded
+        # X-Forwarded-Proto counts only from a loopback peer, like X-Forwarded-Host
+        self.assertFalse(da.same_origin(h(host="air.example:8432", x_forwarded_proto="https",
+                                          origin="https://air.example:8432"), "100.64.0.9"))
 
     def test_client_address_and_cookie_values(self):
         self.assertEqual(da.client_address("127.0.0.1", "1.1.1.1, 100.64.0.5"), "100.64.0.5")
@@ -372,6 +392,93 @@ class LoginTest(ServerCase):
                                 {"content-type": "application/x-www-form-urlencoded", "origin": self.origin()})
         self.assertEqual(status, 413)
 
+    # ---- the unauthenticated login route cannot hold a thread on its body (lockout first, deadline, slot cap)
+    def raw_login(self, n=30, xff=None):
+        """A raw socket that has sent a login's headers (promising n body bytes) and nothing of its body."""
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        self.addCleanup(s.close)
+        head = (f"POST /dashboard/login HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\nOrigin: {self.origin()}\r\n"
+                f"Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {n}\r\n"
+                + (f"X-Forwarded-For: {xff}\r\n" if xff else "") + "\r\n")
+        s.sendall(head.encode())
+        return s
+
+    @staticmethod
+    def read_all(s):
+        """Everything the server sends until it closes the connection (a reset counts as a close)."""
+        out = b""
+        try:
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    return out
+                out += chunk
+        except ConnectionResetError:
+            return out
+
+    def wait_slots_free(self, want):
+        end = time.monotonic() + 3
+        while self.httpd.login_slots._value != want and time.monotonic() < end:
+            time.sleep(0.01)
+        return self.httpd.login_slots._value
+
+    def test_locked_out_address_refused_before_the_body_is_read(self):
+        self.set_password()
+        for _ in range(da.IP_FAILURES):
+            self.assertEqual(self.login(WRONG, xff="100.64.0.7")[0], 401)
+        s = self.raw_login(xff="100.64.0.7")               # the body never comes
+        s.settimeout(2)                                    # far below SOCKET_TIMEOUT_S: the 429 must not wait for a body
+        t0 = time.monotonic()
+        reply = self.read_all(s)
+        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertTrue(reply.startswith(b"HTTP/1.0 429") or reply.startswith(b"HTTP/1.1 429"), reply[:40])
+        self.assertIn(b"Retry-After:", reply)
+        self.assertEqual(self.wait_slots_free(server.LOGIN_MAX_CONCURRENT), server.LOGIN_MAX_CONCURRENT)
+
+    def test_trickled_login_body_dropped_at_the_deadline(self):
+        # Each byte arrives well inside the socket timeout, so only the absolute body deadline (scaled to 0.3 s) ends it.
+        self.set_password()
+        body = b"password=" + PASSWORD.replace(" ", "+").encode()
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+        with mock.patch.object(server, "LOGIN_BODY_DEADLINE_S", 0.3):
+            s = self.raw_login(n=len(body))
+            s.settimeout(3)
+
+            def trickle():
+                for b in body:
+                    if stop.wait(0.05):
+                        return
+                    try:
+                        s.send(bytes([b]))
+                    except OSError:
+                        return
+            threading.Thread(target=trickle, daemon=True).start()
+            t0 = time.monotonic()
+            reply = self.read_all(s)
+            elapsed = time.monotonic() - t0
+        stop.set()
+        self.assertLess(elapsed, 1.0, "closed by the body deadline, not after the trickle's own ~1.1 s")
+        self.assertEqual(reply, b"", "no login was attempted, so no reply")
+        self.assertFalse(da.sessions_path().exists() and json.loads(da.sessions_path().read_text())["sessions"])
+        self.assertEqual(self.wait_slots_free(server.LOGIN_MAX_CONCURRENT), server.LOGIN_MAX_CONCURRENT)
+        self.assertEqual(self.login()[0], 303)                 # the slot came back
+
+    def test_concurrent_logins_capped_with_503(self):
+        self.set_password()
+        self.httpd.login_slots = threading.BoundedSemaphore(2)
+        with mock.patch.object(server, "LOGIN_BODY_DEADLINE_S", 0.6):
+            held = [self.raw_login(xff=f"100.64.3.{i}") for i in range(2)]   # two logins waiting on their bodies
+            self.assertEqual(self.wait_slots_free(0), 0)
+            status, h, body = self.login()
+            self.assertEqual(status, 503)
+            self.assertIn("retry-after", h)
+            self.assertIn(b"too many logins in progress", body)
+            for s in held:
+                s.close()
+            self.assertEqual(self.wait_slots_free(2), 2)
+        self.assertEqual(self.login()[0], 303)
+
     def test_corrupt_auth_file_is_500_not_token_page(self):
         da.auth_path().write_text("[]")
         status, _, body = self.req("GET", "/dashboard")
@@ -405,6 +512,18 @@ class SessionTest(ServerCase):
             self.assertEqual(self.req("POST", path, body.encode(), c)[0], 401, path)
         for path in ("/v1/models", "/resources", "/v1/cortados/runs/abcdefgh12"):
             self.assertEqual(self.req("GET", path, headers=c)[0], 401, path)
+
+    def test_authenticated_views_are_never_cached(self):
+        for creds in ({"cookie": self.ck}, {"authorization": f"Bearer {TOKEN}"}):
+            for path in ("/v1/cortados/live", "/v1/cortados/usage", "/v1/cortados/tasks", "/v1/cortados/office"):
+                status, h, _ = self.req("GET", path, headers=creds)
+                self.assertEqual(status, 200, path)
+                self.assertEqual(h.get("cache-control"), "private, no-store", path)
+                self.assertEqual(h.get("vary"), "Cookie, Authorization", path)
+        status, h, _ = self.req("GET", "/dashboard", headers={"cookie": self.ck})   # carries the CSRF token
+        self.assertEqual(status, 200)
+        self.assertEqual(h.get("cache-control"), "private, no-store")
+        self.assertEqual(h.get("vary"), "Cookie, Authorization")
 
     def test_token_header_is_judged_alone(self):
         self.assertEqual(self.req("GET", "/v1/cortados/live",
