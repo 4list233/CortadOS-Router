@@ -162,13 +162,14 @@ Ollama models to the provider as `sub/<alias or tag>` pins (`cortados_router/pro
 | `label` | the suffix `/v1/models` shows: `<name> · CortadOS (<label>)` (default: the node id, capitalised) |
 | `auto_route` | `false` (default): pin-only. Or `{"model": "<alias or tag of one of this node's models>", "bands": ["R0", …]}`: the S1 bands in which that model may take a new conversation (Local auto-route, below). There is no default band; `true`, an unknown model, an empty list, unknown keys and the bands `R3`/`R4` are refused with a config error |
 | `probe_timeout_s` / `connect_timeout_s` / `read_timeout_s` | `/api/tags` probe (2), connect (3), wait per response chunk (300; a first model load can take a minute); each must be positive |
-| `models[]` | `id` (the Ollama tag, required), `alias` (the short pin name), `name` (display name), `context_length` (a positive integer of tokens; default 32768 when absent, the input-fit gate; set it to the node's Ollama context, 65536 for Ollama.app's setting on the Pro) |
+| `models[]` | `id` (the Ollama tag, required), `alias` (the short pin name), `name` (display name), `context_length` (a positive integer of tokens; default 32768 when absent, the input-fit gate; set it to the node's Ollama context, 65536 for Ollama.app's setting on the Pro); `thinking` (`"off-unless-asked"`, the default, or `"passthrough"`; anything else is refused: Thinking models, below) |
 
 Pin names (aliases and tags, case-insensitive) must be unique across nodes. Behaviour:
 
 - Only on `/v1/messages` (Ollama implements the Anthropic Messages API there), only on a routing endpoint (not
-  `--fixed-model`). The turn is relayed as-is (streaming or not, tools and `tool_use` blocks untouched); only `model` is
-  rewritten to the tag, and the response names the pin the client asked for. The relay is stateless (every turn
+  `--fixed-model`). The turn is relayed as-is (streaming or not, tools and `tool_use` blocks untouched); `model` is
+  rewritten to the tag (and `thinking` set as in Thinking models, below), and the response names the pin the client
+  asked for. The relay is stateless (every turn
   carries the whole conversation), but the conversation's model binding is kept in the provider's registry
   (`server.LocalSession`: the reply fingerprints, as for every pin), so a conversation keeps its model: a local
   conversation whose next turn names `sub/opus`, a `sub/opus` or S1-routed one whose next turn names a local pin, gets
@@ -291,6 +292,30 @@ intent check is a read-only advisory fast path and never deletes an intent. Over
 `--studio-gate-dir` / `CORTADOS_LOCAL_GATE_STUDIO_GATE_DIR`. Inside the lock, after the daemon's ack or its timeout,
 `training_gate` unloads EVERY model `/api/ps` lists (`keep_alive=0` each) and refuses to start if any remains or the
 reply is malformed. Writer starvation is accepted: a steady stream of overlapping gate requests can keep LOCK_EX from ever being granted, in which case the trainer refuses after the 120 s cap and retries on its next run. The gate directory must be a real directory (not a symlink) owned by the running user and not group/world-writable (a created one is chmod'ed 0700 regardless of umask), and `node.lock` is opened with `O_NOFOLLOW` and must be a regular file the user owns; otherwise the gate answers 503 and the trainer refuses. `gate` passes its LOCK_EX fd to the training command and runs it in its own process group: the lock stays held until every holder exits (a SIGKILLed wrapper does not release it), and on SIGTERM/SIGINT or any exit the whole group gets SIGTERM, 30 s grace, then SIGKILL before the lock is released.
+
+**Thinking models (#108).** Ollama's `/v1/messages` lets a thinking model (the Pro's Qwen3.x models; `ollama show`
+lists `thinking` among the capabilities) think whenever the request has **no** `thinking` field, and the thinking counts
+against `max_tokens`. Observed on Ollama 0.40.16 with `Qwen27b_heretic`: "What is 6*7?" with `max_tokens: 20` and no
+`thinking` came back as `content: [{"type": "thinking", …}]`, `stop_reason: "max_tokens"`, no text (streamed: one
+thinking block, then `message_delta` with `stop_reason: "max_tokens"`); the same request with
+`"thinking": {"type": "disabled"}` answered `[{"type": "text", "text": "42"}]`, `end_turn`, 3 output tokens (so did
+`Huihui_Qwen_9b`), and `{"type": "enabled", "budget_tokens": 1024}` returned a thinking block then the text. Anthropic's
+own default is the opposite (no field, no thinking), and clients send small `max_tokens` on exactly the reflex (R0)
+requests auto-routed here, so each model entry's `thinking` says what the relay sends:
+
+- `"off-unless-asked"` (default): a request without `thinking` (or with one that is not an object) is sent with
+  `"thinking": {"type": "disabled"}`; a client's own `thinking` (enabled, adaptive or disabled) is passed through.
+- `"passthrough"`: the request goes as the client sent it. For a model or Ollama build that rejects the field.
+
+Safety net: when an **auto-routed** turn whose client did not ask for thinking still ends on `max_tokens` with no
+non-blank text and no `tool_use` (only thinking, or empty), the client gets an error instead of a silent empty answer: a
+502 `api_error` (streamed: the final `message_delta`/`message_stop` are replaced by an `event: error`) saying "this
+request was auto-routed by S1 to `<model>` on `<node>`, which used the whole max_tokens (`<n>`) without writing an
+answer (thinking only); retry with a larger max_tokens, or send `x-cortados-exclude-model: <alias>`". The turn counts as
+not completed (an opening turn leaves no conversation; a later one keeps the history). It is not retried: thinking was
+already asked off (or the model is set to `passthrough`), so the same request would fail the same way. A pinned model
+(the person's choice) and a client that asked for thinking get the reply exactly as the node sent it. No prompt or reply
+text is logged; the refusal record carries a fixed reason only.
 
 **Context length must match the node.** A model's `context_length` here is only the provider's input-fit gate; Ollama
 uses the node's own `OLLAMA_CONTEXT_LENGTH` (or Ollama.app's setting). Set the node to the same value, or requests the
