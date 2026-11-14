@@ -304,42 +304,46 @@ def real(text, max_tokens):
 print(json.dumps({"syn": syn, "easy": real("rename the variable in utils.py", 64),
                   "outward": real("email the signed invoice to the client and mark it paid", 64), "local": local}))
 """
-home = tempfile.mkdtemp(prefix="verify-router-index-")
-PROBE_DIRS.append(Path(home) / "usage-probe")
-p = subprocess.run([sys.executable, "-B", "-c", INDEX_SCENARIO], cwd=REPO, capture_output=True, text=True, timeout=300,
-                   env={**os.environ, "CORTADOS_HOME": home, "CORTADOS_SCARCITY_REFRESH": "off"})
-try:
-    r = json.loads(p.stdout.strip().splitlines()[-1])
-except (ValueError, IndexError):
-    record("local proxy index places Qwen27b_heretic (S1-free)", "FAIL", (p.stderr or p.stdout).strip()[-300:])
-else:
-    syn = r["syn"]
-    ok = (syn["non"] == ["local-pro", "qwen-27b"] and syn["think"] == ["local-pro", "qwen-27b-think"]
-          and syn["think_small"][0] == "codex-cli" and syn["outward"][0] == "codex-cli" and syn["degraded"][0] == "codex-cli"
-          and syn["battery"][0] == "codex-cli")
-    record("local proxy index places Qwen27b_heretic (S1-free)", "PASS" if ok else "FAIL",
-           f"code index {syn['indexes']} | req {syn['indexes']['qwen-27b']} -> {syn['non']} | req {syn['mid']} max_tokens 8192 -> "
-           f"{syn['think']}, 1024 -> {syn['think_small']} | outward -> {syn['outward']} | degraded -> {syn['degraded']} | "
-           f"battery -> {syn['battery']}")
-    easy, out = r["easy"], r["outward"]
-    if easy.get("degraded"):
-        record("degraded decision never goes local by the index",
-               "PASS" if easy.get("provider") == "codex-cli" else "FAIL", json.dumps(easy))
-        record("S1 route goes local exactly when a variant's index clears it", "BLOCKED", f"S1 degraded ({S1_URL})")
-    else:
-        idx = (r["local"]["qwen-27b"]["index"].get(easy.get("use_case") or "general") if easy.get("req") is not None else None)
-        expect_local = idx is not None and easy.get("band") in ("R0", "R1", "R2") and idx >= easy["req"]
-        ok = (easy.get("provider") == "local-pro") == expect_local
-        record("S1 route goes local exactly when a variant's index clears it", "PASS" if ok else "FAIL",
-               f"band={easy.get('band')} use_case={easy.get('use_case')} req={easy.get('req')} qwen-27b={idx} -> "
-               f"{easy.get('provider')}/{easy.get('model')} {easy.get('variant') or ''}")
-    if out.get("degraded"):
-        record("outward request never goes local by the index", "BLOCKED", "S1 degraded")
-    else:
-        record("outward request never goes local by the index",
-               "PASS" if not str(out.get("provider")).startswith("local-") else "FAIL",
-               f"band={out.get('band')} -> {out.get('provider')}/{out.get('model')}")
-
+# Sensitive routes pick the published-index variant (merge of main's #109 into local-published-index): the REAL
+# sensitive_local / refusal_route on the REAL generated scores. An R3 route (above both variants' index) flagged
+# sensitive runs local on the strongest eligible variant: qwen-27b-think with max_tokens 8192, qwen-27b with 1024 (no
+# room to think); one the non-thinking variant clears takes qwen-27b; the refusal fallback chooses the same way and its
+# node body carries the variant's thinking. S1-free (synthetic S1-shaped routes); faked probe, throwaway config.
+SENSITIVE_VARIANT_SCENARIO = """
+import json, os, tempfile
+from cortados_router import core
+from cortados_router.provider import local_lane, routing
+d = tempfile.mkdtemp()
+cfg = os.path.join(d, "resources.json")
+json.dump({"nodes": [{"id": "pro", "ollama": {"base_url": "http://127.0.0.1:9",
+           "sensitive": {"model": "qwen-27b", "refusal_fallback": True},
+           "models": [{"id": "Qwen27b_heretic:latest", "alias": "qwen-27b", "context_length": 131072}]}}]}, open(cfg, "w"))
+os.environ[local_lane.CONFIG_ENV] = cfg
+local_lane.probe = lambda node: {"Qwen27b_heretic:latest"}
+core.log_route = lambda *a, **k: True
+idx = {m["family"]: m["index"]["code"] for m in core.model_scores()["local_models"]}
+def r(req):
+    return {"provider": "claude-cli", "model": "claude-opus-test", "band": "R3", "route_id": "verify:sens-variant",
+            "degraded": False, "decision": {"answers": {"outward": False, "blast_radius": 1}, "degraded": False},
+            "route": {"band": "R3", "required_index": req, "answers": {"outward": False},
+                      "features": {"blast_radius": 1},
+                      "chosen": {"lane": "claude", "provider": "claude-cli", "model": "claude-opus-test", "use_case": "code"}}}
+def b(mt):
+    return {"model": "cortados", "max_tokens": mt, "messages": [{"role": "user", "content": "x"}]}
+def flag(req, mt):
+    routing._auto_down.clear()
+    m = routing.sensitive_local(core, b(mt), r(req), client="verify", conversation_id="verify-sv", local="sensitive")
+    lm = (m.get("local") or {}).get("model") or {}
+    return [m.get("provider"), lm.get("variant"), local_lane._node_body(b(mt), lm).get("thinking") if lm else None]
+routing._auto_down.clear()
+marked = routing.sensitive_local(core, b(8192), r(99.0), client="verify", conversation_id="verify-sv")
+sent = []
+mv = routing.refusal_route(core, b(8192), marked, lambda m: sent.append(local_lane._node_body(b(8192), m["local"]["model"])) or True)
+print(json.dumps({"idx": idx, "high_8192": flag(99.0, 8192), "high_1024": flag(99.0, 1024),
+                  "clears_non": flag(idx["qwen-27b"], 32000),
+                  "refusal": [(mv or {}).get("provider"), ((mv or {}).get("local") or {}).get("model", {}).get("variant"),
+                              sent[0].get("thinking") if sent else None]}))
+"""
 # Sensitive requests (2026-11-13, owner): a request flagged x-cortados-local: sensitive, or matching the owner's keyword
 # list, moves to the node's sensitive model in ANY band, but only when S1 says it has no effect outside the machine
 # (outward false, blast_radius <= 1); an outward request never goes local however it is marked (core.resolve's outward
@@ -540,6 +544,53 @@ def main():
                    f"flag -> {flag.get('provider')} band {flag.get('band')} | keyword -> {key.get('provider')} "
                    f"band {key.get('band')} | unflagged -> {plain.get('provider')} | node off -> {down.get('provider')} | "
                    f"outward+flag+keyword -> band {out.get('band')} {out.get('provider')}/{out.get('model')}")
+
+    p = runner.run(["-c", INDEX_SCENARIO], prefix="verify-router-index-", timeout=300)
+    try:
+        r = _last_json(p)
+    except (ValueError, IndexError):
+        record("local proxy index places Qwen27b_heretic (S1-free)", "FAIL", (p.stderr or p.stdout).strip()[-300:])
+    else:
+        syn = r["syn"]
+        ok = (syn["non"] == ["local-pro", "qwen-27b"] and syn["think"] == ["local-pro", "qwen-27b-think"]
+              and syn["think_small"][0] == "codex-cli" and syn["outward"][0] == "codex-cli" and syn["degraded"][0] == "codex-cli"
+              and syn["battery"][0] == "codex-cli")
+        record("local proxy index places Qwen27b_heretic (S1-free)", "PASS" if ok else "FAIL",
+               f"code index {syn['indexes']} | req {syn['indexes']['qwen-27b']} -> {syn['non']} | req {syn['mid']} max_tokens 8192 -> "
+               f"{syn['think']}, 1024 -> {syn['think_small']} | outward -> {syn['outward']} | degraded -> {syn['degraded']} | "
+               f"battery -> {syn['battery']}")
+        easy, out = r["easy"], r["outward"]
+        if easy.get("degraded"):
+            record("degraded decision never goes local by the index",
+                   "PASS" if easy.get("provider") == "codex-cli" else "FAIL", json.dumps(easy))
+            record("S1 route goes local exactly when a variant's index clears it", "BLOCKED", f"S1 degraded ({s1_where})")
+        else:
+            idx = (r["local"]["qwen-27b"]["index"].get(easy.get("use_case") or "general") if easy.get("req") is not None else None)
+            expect_local = idx is not None and easy.get("band") in ("R0", "R1", "R2") and idx >= easy["req"]
+            ok = (easy.get("provider") == "local-pro") == expect_local
+            record("S1 route goes local exactly when a variant's index clears it", "PASS" if ok else "FAIL",
+                   f"band={easy.get('band')} use_case={easy.get('use_case')} req={easy.get('req')} qwen-27b={idx} -> "
+                   f"{easy.get('provider')}/{easy.get('model')} {easy.get('variant') or ''}")
+        if out.get("degraded"):
+            record("outward request never goes local by the index", "BLOCKED", "S1 degraded")
+        else:
+            record("outward request never goes local by the index",
+                   "PASS" if not str(out.get("provider")).startswith("local-") else "FAIL",
+                   f"band={out.get('band')} -> {out.get('provider')}/{out.get('model')}")
+
+    p = runner.run(["-c", SENSITIVE_VARIANT_SCENARIO], prefix="verify-router-sens-variant-", timeout=300)
+    try:
+        r = _last_json(p)
+    except (ValueError, IndexError):
+        record("sensitive route picks the published-index variant (S1-free)", "FAIL", (p.stderr or p.stdout).strip()[-300:])
+    else:
+        on = {"type": "enabled", "budget_tokens": 4096}
+        off = {"type": "disabled"}
+        ok = (r["high_8192"] == ["local-pro", "qwen-27b-think", on] and r["high_1024"] == ["local-pro", "qwen-27b", off]
+              and r["clears_non"] == ["local-pro", "qwen-27b", off] and r["refusal"] == ["local-pro", "qwen-27b-think", on])
+        record("sensitive route picks the published-index variant (S1-free)", "PASS" if ok else "FAIL",
+               f"code index {r['idx']} | R3 flag 8192 -> {r['high_8192']} | 1024 -> {r['high_1024']} | "
+               f"req {r['idx'].get('qwen-27b')} -> {r['clears_non']} | refusal 8192 -> {r['refusal']}")
 
     p = runner.run(["-c", CONTINUATION_SCENARIO], prefix="verify-router-continuation-", timeout=300)
     try:
