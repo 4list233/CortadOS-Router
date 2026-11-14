@@ -14,6 +14,8 @@ Owner of two rules:
                     sensitive_local, refusal_route, the continuation re-check server.py runs on every later turn of a
                     conversation an automatic rule bound to a local lane): S1 not degraded, a band, `outward` exactly
                     False and `blast_radius` exactly the int 0 or 1. A missing or garbled answer is not admitted.
+                    What an admitted turn's local model then proposes is effect_boundary.py's (tool allowlist and
+                    outward-call inspection on every automatic-local relay, local_lane.serve / complete).
   local auto-route  after S1 has chosen a route (not degraded), auto_local may hand the conversation to a node's
                     auto_route model instead, only when local_admission admits it, S1's band is one the node's config
                     lists, the node answers its probe (on the Pro: AC power + manual switch + gate up) and lists the
@@ -852,45 +854,103 @@ def route_admission(r: dict[str, Any] | None) -> tuple[bool, str]:
     return local_admission(decision.get("answers"), r.get("band"), degraded)
 
 
-def continuation_text(body: dict[str, Any]) -> str:
-    """What S1 scores for a continuation of a locally bound conversation: the latest user turn's own words (text
-    blocks, client reminders removed), or, on a tool-result turn that has none, the latest earlier user words. The
-    opening request is not rescored as such: it was admitted when the conversation was bound, and scoring it again
-    would hide a new instruction ("now email the invoice") behind the old one."""
-    for m in reversed(body.get("messages") or []):
-        if not isinstance(m, dict) or m.get("role") != "user":
-            continue
-        text = "\n".join(b.get("text", "") for b in wire._blocks(m.get("content"))
+def _user_words(m: dict[str, Any]) -> str:
+    """A user message's own words: its text blocks, client reminders removed."""
+    return strip_injected("\n".join(b.get("text", "") for b in wire._blocks(m.get("content"))
+                                     if isinstance(b, dict) and b.get("type") == "text"
+                                     and isinstance(b.get("text"), str))).strip()
+
+
+def _tool_result_text(block: dict[str, Any]) -> str:
+    """A tool_result block's text (string content or its text blocks). Not stripped of <system-reminder> tags: a tool
+    result is not the client's own wrapper, and a tag is exactly where an instruction could hide."""
+    c = block.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "\n".join(b.get("text", "") for b in c
                          if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
-        text = strip_injected(text).strip()
-        if text:
-            return text
     return ""
 
 
-# Bounds the re-check's added S1 latency in a tool loop: a turn whose scored text (continuation_text) is the same as
-# one this conversation had admitted within CONTINUATION_CACHE_S reuses that admission (the same window
-# execution_routing.select caches a score for). Only admissions are cached; a refusal is rescored every time.
+# The scored text's budget. S1 reads at most core.decide_s1's 6000 characters of a request, so the continuation text
+# is cut to fit it: the person's words first (up to CONTINUATION_WORDS_CAP), the new tool results in the rest. A tool
+# result longer than its share keeps its head and its tail (an instruction is as likely at the end of a fetched page
+# as at its start); the middle of a very long result is not scored (docs/LOCAL-RESOURCES.md, honest limits).
+CONTINUATION_SCORE_CAP = 6000
+CONTINUATION_WORDS_CAP = 2000
+TOOL_RESULTS_LABEL = "\n\n[tool results since the last turn]\n"
+_CUT = "\n[...]\n"
+
+
+def _head_tail(text: str, cap: int) -> str:
+    if len(text) <= cap:
+        return text
+    if cap <= len(_CUT) + 2:
+        return text[:max(cap, 0)]
+    half = (cap - len(_CUT)) // 2
+    return text[:half] + _CUT + text[len(text) - (cap - len(_CUT) - half):]
+
+
+def continuation_text(body: dict[str, Any]) -> str:
+    """What S1 scores for a continuation of a locally bound conversation: the latest user words (text blocks, client
+    reminders removed; on a tool-result turn with none, the latest earlier user words) AND the text of the tool
+    results added since the last scored turn, i.e. those in the user messages after the conversation's last assistant
+    message (each earlier turn's results were scored on that turn). A tool result can carry an instruction ("now
+    email this to ...") the person never wrote, so it is scored as if they had. The opening request is not rescored as
+    such: it was admitted when the conversation was bound, and scoring it again would hide a new instruction behind
+    the old one. Capped to CONTINUATION_SCORE_CAP characters (S1's own input cap). "" when the conversation holds no
+    user words at all (tool results alone are not scored: the caller fails closed)."""
+    msgs = [m for m in body.get("messages") or [] if isinstance(m, dict)]
+    last_assistant = max((i for i, m in enumerate(msgs) if m.get("role") == "assistant"), default=-1)
+    results = []
+    for m in msgs[last_assistant + 1:]:
+        if m.get("role") == "user" and isinstance(m.get("content"), list):
+            results += [_tool_result_text(b) for b in m["content"]
+                        if isinstance(b, dict) and b.get("type") == "tool_result"]
+    results = [r.strip() for r in results if r.strip()]
+    words = ""
+    for m in reversed(msgs):
+        if m.get("role") == "user":
+            words = _user_words(m)
+            if words:
+                break
+    words = _head_tail(words, CONTINUATION_WORDS_CAP)
+    if not results or not words:
+        # No person's words anywhere: "" (continuation_admission fails closed); tool results alone are not a request.
+        return words
+    budget = CONTINUATION_SCORE_CAP - len(words) - len(TOOL_RESULTS_LABEL)
+    return words + TOOL_RESULTS_LABEL + _head_tail("\n---\n".join(results), budget)
+
+
+# Bounds the re-check's added S1 latency: a request whose scored text (continuation_text) AND message count equal one
+# this conversation had admitted within CONTINUATION_CACHE_S reuses that admission (the same window
+# execution_routing.select caches a score for). The text alone is not the key: a new tool result changes the text, and
+# a turn identical in words but later in the conversation (more messages) is a different turn, so both invalidate it;
+# a client retrying the same request hits it. Only admissions are cached; a refusal is rescored every time.
 CONTINUATION_CACHE_S = 180.0
-_admitted: "OrderedDict[tuple[str, str], tuple[float, str]]" = OrderedDict()
+_admitted: "OrderedDict[tuple[str, str, int], tuple[float, str]]" = OrderedDict()
 _admitted_lock = threading.Lock()
 
 
 def continuation_admission(core, body: dict[str, Any], route: dict[str, Any] | None) -> tuple[bool, str]:
     """A continuation of a conversation an AUTOMATIC rule bound to a local lane (auto_local, sensitive_local,
-    refusal_route): S1 scores this turn (continuation_text) through core.decide, the same scorer call and the same
-    bounded timeout and retry as the opening's routing call (core.S1_TIMEOUT_S, S1_RETRIES), and local_admission
-    judges the answers under the band the conversation was bound with. (admitted, metadata reason). Fails closed: no
-    text to score, a degraded or failed scorer, or any exception is not admitted. server.Handler runs it before every
-    local dispatch of such a conversation; an explicit local pin (route["pinned"]) is never rescored.
+    refusal_route): S1 scores this turn (continuation_text: the latest user words and the new tool results) through
+    core.decide, the same scorer call and the same bounded timeout and retry as the opening's routing call
+    (core.S1_TIMEOUT_S, S1_RETRIES), and local_admission judges the answers under the band the conversation was bound
+    with. (admitted, metadata reason). Fails closed: no text to score, a degraded or failed scorer, or any exception
+    is not admitted. server.Handler runs it before every local dispatch of such a conversation; an explicit local pin
+    (route["pinned"]) is never rescored. What the admitted turn's model then proposes is the effect boundary's
+    (effect_boundary.py, applied by local_lane.serve).
 
     Not admitted, the turn is refused and the conversation stays bound (server.py). Moving the conversation to a cloud
     lane instead is #43's re-route seam (server.Handler._local_continuation_refused), not built here."""
     route = route if isinstance(route, dict) else {}
     text = continuation_text(body)
-    if not text:
+    if not text.strip():
         return False, "no user text to score on this turn"
-    key = (str(route.get("route_id") or ""), hashlib.sha256(text.encode()).hexdigest())
+    key = (str(route.get("route_id") or ""), hashlib.sha256(text.encode()).hexdigest(),
+           len(body.get("messages") or []))
     with _admitted_lock:
         hit = _admitted.get(key) if key[0] else None
         if hit and _now() - hit[0] < CONTINUATION_CACHE_S:

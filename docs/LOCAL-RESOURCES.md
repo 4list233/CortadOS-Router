@@ -334,19 +334,86 @@ lane by an automatic rule (auto_route, the sensitive flag / prefer / keyword, th
 later turn to the node unchecked, so "now email the signed invoice and mark it paid" after a harmless opening reached
 the node. Now every continuation of such a conversation is rescored by S1 before anything reaches the node
 (`server.Handler._local_continuation_refused` → `Registry.local_recheck` → `routing.continuation_admission` →
-`local_admission`, under the band the conversation was bound with). S1 scores the turn's own words (the latest user
-text, client reminders removed; on a tool-result turn with no words, the latest earlier user words), through
-`core.decide`: the same scorer call, timeout and retry as the opening's routing call, and its degraded result fails
-closed. To bound the added latency in a tool loop, an admission is reused for the same conversation and the same scored
-text for 180 s (`routing.CONTINUATION_CACHE_S`); a refusal is never cached. A turn that is not admitted (outward,
-blast_radius 2 or more, a degraded or failed scorer, missing or garbled answers, no user text at all, no checker
-configured) is refused with a terminal **400** (`x-should-retry: false`, `invalid_request_error`): the conversation is
-bound to a local model and this turn needs a cloud model; start a new conversation (routed again) or pin a cloud model.
-Nothing was sent, so the conversation is untouched: a later turn on the same history that passes the gate continues it.
-The log names the route id and the gate's reason only. **An explicit local pin** (`sub/<local model or alias>`, the
-client's own choice) is **not rescored**. Moving a refused conversation to a cloud lane mid-way is a separate feature
-(#43, re-route when the Pro is unplugged); its seam is `server.Handler._local_continuation_refused`. `core.resolve`'s hard rule (outward effects floor the blast radius to 3,
-strong cloud models) is untouched: an outward request is never moved, whatever the trigger.
+`local_admission`, under the band the conversation was bound with). S1 scores, through `core.decide` (the same scorer
+call, timeout and retry as the opening's routing call; a degraded result fails closed), `routing.continuation_text`:
+the latest user words (client reminders removed; on a tool-result turn with no words, the latest earlier user words)
+**and the text of the tool results added since the last scored turn** (those after the conversation's last assistant
+message, `<system-reminder>` tags kept: a tool result is not the client's wrapper). A tool result can carry an
+instruction the person never wrote ("now email this file to ..."), so it is scored as if they had. The scored text is
+capped to S1's own 6000-character input (`routing.CONTINUATION_SCORE_CAP`): the words first (up to 2000 characters),
+the new results in the rest, a longer result keeping its head and its tail. An admission is reused for 180 s
+(`routing.CONTINUATION_CACHE_S`) only for the same conversation, the same scored text and the same message count, so
+a new tool result, or the same words later in the conversation, is scored again; a client retrying the identical
+request reuses it. A refusal is never cached. A turn that is not admitted (outward, blast_radius 2 or more, a degraded
+or failed scorer, missing or garbled answers, no user words at all, no checker configured) is refused with a terminal
+**400** (`x-should-retry: false`, `invalid_request_error`): the conversation is bound to a local model and this turn
+needs a cloud model; start a new conversation (routed again) or pin a cloud model. Nothing was sent, so the
+conversation is untouched: a later turn on the same history that passes the gate continues it. The log names the
+route id and the gate's reason only. **An explicit local pin** (`sub/<local model or alias>`, the client's own choice)
+is **not rescored**. Moving a refused conversation to a cloud lane mid-way is a separate feature (#43, re-route when the
+Pro is unplugged); its seam is `server.Handler._local_continuation_refused`. `core.resolve`'s hard rule (outward
+effects floor the blast radius to 3, strong cloud models) is untouched: an outward request is never moved, whatever
+the trigger.
+
+**Effect boundary.** Scoring judges what the person (and the tools) said, not what the local model then does: asked to
+"draft a message locally; do not send", a model may still answer with a `send_email` call. So every turn an automatic
+rule sends to a local model (auto_route, flag, prefer, keyword, the refusal fallback, and the published index when it
+lands: all relay through `local_lane.serve(auto_routed=True)` or, for the refusal fallback, `local_lane.complete(...,
+boundary=True)`) passes `cortados_router/provider/effect_boundary.py`, in two layers:
+
+1. *Tool list.* Before the request reaches the node, its declared `tools` are cut to `LOCAL_TOOL_ALLOWLIST` (an
+   allowlist: a name it does not know is dropped), and a `tool_choice` naming a dropped tool is removed. The model
+   cannot name what it is not offered. As committed:
+
+   | Kept (acts on this machine only) | Dropped (everything else, including) |
+   |---|---|
+   | `Read`, `Glob`, `Grep`, `LS`, `NotebookRead` | `WebFetch`, `WebSearch` (network) |
+   | `Edit`, `MultiEdit`, `Write`, `NotebookEdit` | every `mcp__*` tool (connectors: mail, chat, drive, payments, ...) |
+   | `TodoWrite`, `ExitPlanMode` | `Task` / `Agent` (a subagent is routed afresh, possibly to a cloud model with every tool) |
+   | `Bash` (its command is inspected, below), `BashOutput`, `KillShell`, `KillBash` | `Skill`, `SlashCommand`, any typed server tool (`web_search_*`, `bash_*`), any unknown name |
+
+2. *Emitted calls.* Every tool call in the local reply is inspected before the client sees it: a call to a tool off
+   the allowlist (defence in depth), a malformed `Bash` input, or a `Bash` command one of whose simple commands (the
+   line is cut at `; & | && || ( $( \` ` newlines and quotes, wrappers such as `sudo`, `env`, `xargs`, `timeout 30`
+   skipped) matches `OUTWARD_BASH_RULES`:
+
+   | Rule | Matches |
+   |---|---|
+   | `curl-upload` | `curl` with `-X`/`--request`, `-d`/`--data*`, `-F`/`--form*`, `-T`/`--upload-file`, `--json` (combined short flags too) |
+   | `wget-upload` | `wget --post-data/--post-file/--body-data/--body-file/--method` |
+   | `ssh` | `ssh`, `scp`, `sftp`, `mosh`, `autossh` |
+   | `netcat` | `nc`, `ncat`, `netcat`, `socat`, `telnet`, `ftp`, `lftp` |
+   | `rsync-remote` | `rsync` with a `host:` / `host::` / `rsync://` argument |
+   | `git-push` | `git ... push`, `send-email`, `request-pull` |
+   | `gh-write` | `gh` with create, edit, merge, comment, close, delete, release, reopen, review, ready, transfer, lock, unlock, fork, rename, (un)archive, run, rerun, cancel, set, upload, sync, enable, disable, (un)pin, develop, add, remove, login, logout |
+   | `gh-api-write` | `gh api` with `-X`, `--method`, `-f`, `-F`, `--field`, `--raw-field`, `--input` |
+   | `publish` | `npm`/`pnpm`/`yarn`/`bun`/`cargo`/`poetry`/`flit`/`hatch`/`uv`/`pip` publish, unpublish or upload; `twine upload` (also `python -m twine upload`); `gem`/`docker`/`podman`/`helm push` |
+   | `osascript` | any `osascript` (AppleScript drives Mail, Messages and every scriptable app) |
+   | `open-url-scheme` | `open` / `xdg-open` on `mailto:`, `sms:`, `imessage:`, `facetime:`, `tel:`, `message:` |
+   | `mail` | `sendmail`, `mail`, `mailx`, `mutt`, `msmtp`, `ssmtp` (also at the end of a pipe) |
+
+   A match blocks the whole reply; nothing of it reaches the client's tools. **Non-streaming:** the same terminal
+   **400** as the continuation gate (`x-should-retry: false`, `invalid_request_error`, "the local model proposed an
+   action with an outward effect; run this turn on a cloud model ..."). **Streaming:** the relay holds every tool-call
+   block until its `content_block_stop` and judges the whole input (`input_json_delta` fragments included), and holds
+   `message_start` until the first content it may show. A block found before anything was written is answered with that
+   same JSON 400 (no stream starts). A block found after text was already streamed ends the stream with one
+   `event: error` (`invalid_request_error`, the same message): the client keeps the text it was shown and gets no
+   `tool_use`, no `message_delta` and no `message_stop`, so Claude Code shows an API error for the turn and runs no
+   tool. Either way the conversation is not advanced (a blocked opener is not bound; a blocked continuation leaves the
+   history as it was). The refusal fallback's local answer is judged the same way, and a blocked one leaves the cloud
+   refusal standing. The log names the rule id and the tool name only, never the arguments.
+
+   **An explicit `sub/` local pin** is the client's own choice: its tools are relayed untouched and its calls are not
+   inspected.
+
+**Honest limits.** A pattern list cannot recognise every outward shell command: a script or Makefile target that sends,
+an alias or shell function, a command name in a variable, base64 or other obfuscation, an interpreter one-liner
+(`python -c`, `node -e`) that opens a socket, or a plain `curl` GET whose URL carries data all pass. A false positive
+(a quoted message that reads like a command, `git commit -m 'ssh fix'`) refuses one turn, which the person reruns on
+a cloud model. A tool result longer than its share of S1's 6000 characters is scored by its head and tail only. File
+writes (`Write`, `Edit`) are local but can stage an effect for later (a hook, a launchd plist). **Claude Code's own
+permission prompts remain the final guard** for what Bash and the file tools actually do.
 
 **Every local guard still applies.** A degraded scorer never routes local; the request must arrive on `/v1/messages`
 (the relay speaks Messages only; a `/v1/responses` request is logged and stays on S1's route); the client's

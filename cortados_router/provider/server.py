@@ -1754,7 +1754,10 @@ class Handler(BaseHTTPRequestHandler):
 
         def run(moved: dict) -> bool:
             try:
-                got["turn"] = local_lane.complete(body, moved["local"]["node"], moved["local"]["model"])
+                # boundary: an automatic move, so the effect boundary applies (effect_boundary.py); a blocked call is
+                # LocalUnavailable here and the cloud refusal stands
+                got["turn"] = local_lane.complete(body, moved["local"]["node"], moved["local"]["model"],
+                                                  boundary=True)
             except local_lane.LocalUnavailable as exc:
                 logger.info("sensitive: refusal: local answer failed for %s: %s", rid, exc)
                 return False

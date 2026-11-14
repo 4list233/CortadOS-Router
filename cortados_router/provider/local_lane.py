@@ -27,7 +27,10 @@ Owner of four rules:
 
 Ollama implements the Anthropic Messages API at POST /v1/messages, so a turn is relayed as-is (stateless: the client
 sends the whole conversation every turn) with `model` rewritten to the node's tag and, unless the model entry says
-`"thinking": "passthrough"`, thinking turned off when the client did not ask for it (#108, THINKING_MODES). Stdlib only.
+`"thinking": "passthrough"`, thinking turned off when the client did not ask for it (#108, THINKING_MODES). An
+AUTOMATIC local turn (serve's auto_routed, complete's boundary) also passes the effect boundary (effect_boundary.py):
+its tools are cut to the local allowlist before the node sees them, and a reply proposing an outward tool call is
+never relayed. An explicit `sub/` pin is relayed as the client sent it. Stdlib only.
 """
 from __future__ import annotations
 
@@ -40,6 +43,7 @@ import urllib.parse
 from typing import Any
 
 from cortados_router.compat import getenv
+from cortados_router.provider import effect_boundary
 
 CONFIG_ENV = "CORTADOS_LOCAL_RESOURCES_CONFIG"
 LANE_PREFIX = "local-"
@@ -280,13 +284,21 @@ def keyword_match(section: dict[str, Any], text: str) -> bool:
     return bool(pattern and text and pattern.search(text.casefold()))
 
 
-def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any]) -> tuple[list, str, dict]:
+def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
+             boundary: bool = False) -> tuple[list, str, dict]:
     """One whole (non-streaming) answer from the node for `body`, as (blocks, stop_reason, usage) in the shape the
     bridges return: text and tool_use blocks only (thinking is dropped, as the CLI lanes never send it). Used where
     the answer must be written by the server itself: the refusal fallback (server.py), whose stream has already
     started. LocalUnavailable on any failure (no answer, an HTTP error, an unreadable or non-message answer, or a
     message holding no usable answer: at least one non-blank text block or a valid tool call, _answered); the
-    node's own error text is never repeated, only its status or the gate's fixed policy reason."""
+    node's own error text is never repeated, only its status or the gate's fixed policy reason.
+
+    `boundary` (an automatic move: the refusal fallback): the effect boundary applies. The node sees only the
+    allowlisted tools, and an answer proposing a blocked call (effect_boundary.blocked_reply, read on the node's raw
+    content) is LocalUnavailable too, so the caller keeps what it had and nothing outward reaches the client."""
+    if boundary:
+        body, dropped = effect_boundary.tools_for_node(body)
+        effect_boundary.log_dropped(dropped)
     out = dict(body)
     out["model"] = model["id"]
     out["stream"] = False
@@ -314,6 +326,11 @@ def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any]) 
         conn.close()
     if not isinstance(msg, dict) or msg.get("type") != "message" or not isinstance(msg.get("content"), list):
         raise LocalUnavailable(f"node {node['node']} answered something that is not a message")
+    hit = effect_boundary.blocked_reply(msg["content"]) if boundary else None
+    if hit:
+        effect_boundary.log_blocked(*hit, where="refusal fallback")
+        raise LocalUnavailable(f"node {node['node']}: the local model proposed an action with an outward effect "
+                               f"(rule {hit[0]})")
     declared = {t.get("name") for t in body.get("tools") or [] if isinstance(t, dict)}
     blocks = []
     for b in msg["content"]:
@@ -521,12 +538,14 @@ def _catalog_read(resp) -> bytes | None:
     return _read_capped(resp, CATALOG_MAX)
 
 
-def _send_json(handler, code: int, data: dict[str, Any]) -> None:
+def _send_json(handler, code: int, data: dict[str, Any], headers: dict[str, str] | None = None) -> None:
     raw = json.dumps(data).encode()
     try:
         handler.send_response(code)
         handler.send_header("content-type", "application/json")
         handler.send_header("content-length", str(len(raw)))
+        for k, v in (headers or {}).items():
+            handler.send_header(k, v)
         handler.end_headers()
         handler.wfile.write(raw)
     except OSError:
@@ -580,6 +599,53 @@ def auto_routed_unavailable(node: dict[str, Any], model: dict[str, Any], reason:
             f"{reason}; start a new conversation (it is routed again) or send x-cortados-exclude-model: {pin_id(model)}")
 
 
+def _judge_event(ev: dict[str, Any], call: "effect_boundary.StreamedCall | None"):
+    """One streamed event under the effect boundary. Returns a new StreamedCall when a tool-call block starts (and is
+    not already blocked by its name), "closed" when the open call's block ended and its call is allowed, a
+    (rule id, tool name) when the call is blocked, else None."""
+    t = ev.get("type")
+    if call is None:
+        block = ev.get("content_block")
+        if t == "content_block_start" and isinstance(block, dict) and \
+                block.get("type") not in effect_boundary.PLAIN_BLOCKS:
+            name = block.get("name")
+            if not isinstance(name, str) or name not in effect_boundary.LOCAL_TOOL_ALLOWLIST:
+                return "tool-not-allowed", name if isinstance(name, str) else "<unnamed>"
+            return effect_boundary.StreamedCall(ev.get("index"), block)
+        return None
+    if t == "content_block_start":
+        # A block started inside the open call (Anthropic and Ollama stream blocks one after another): it would be held
+        # and released with the call unjudged, so the reply is blocked instead (fail closed).
+        block = ev.get("content_block") if isinstance(ev.get("content_block"), dict) else {}
+        return "interleaved-block", block.get("name") if isinstance(block.get("name"), str) else "<unnamed>"
+    if ev.get("index") != call.index:
+        return None
+    if t == "content_block_delta" and isinstance(ev.get("delta"), dict) and \
+            ev["delta"].get("type") == "input_json_delta":
+        call.fragments.append(str(ev["delta"].get("partial_json") or ""))
+    elif t == "content_block_stop":
+        rule = effect_boundary.blocked_call(call.name, call.complete_input())
+        return (rule, call.name) if rule else "closed"
+    return None
+
+
+def _blocked(handler, hit: tuple[str, str], *, stream_started: bool = False) -> str:
+    """Answer a reply the effect boundary blocked (serve's "blocked" outcome): logged as rule and tool name only;
+    a terminal 400 when nothing was written yet, else an `error` event ending the stream."""
+    effect_boundary.log_blocked(*hit, where="local relay")
+    _refused(handler, 400, "invalid_request_error", "the local model proposed an action with an outward effect")
+    err = _error("invalid_request_error", effect_boundary.BLOCKED_MESSAGE)
+    if not stream_started:
+        _send_json(handler, 400, err, headers={"x-should-retry": "false"})
+        return "blocked"
+    try:
+        handler.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+        handler.wfile.flush()
+    except OSError:
+        pass
+    return "blocked"
+
+
 def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
           echo_model: str, reply: list | None = None, auto_routed: bool = False) -> str:
     """Relay one turn to the node's /v1/messages and the answer back to the client. Returns the outcome: "completed"
@@ -590,8 +656,21 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
     fingerprint the reply and continue the conversation by its history, as for every other pin. `auto_routed`: the
     conversation was moved here by S1's auto-route (routing.auto_local), not pinned; an unavailable node (unreachable,
     dropping requests, refusing the token, or the gate's fixed policy refusal: battery, switch off) is then worded by
-    auto_routed_unavailable instead of naming a `sub/` pin the person never made."""
+    auto_routed_unavailable instead of naming a `sub/` pin the person never made.
+
+    An auto-routed turn (every automatic move: auto_route, sensitive flag / prefer / keyword, a refusal bind, an index
+    bind) also passes the effect boundary (effect_boundary.py): the node is offered only the allowlisted tools, and a
+    reply proposing a blocked tool call is never relayed. Outcome "blocked": a non-streaming turn is answered with a
+    terminal 400 (`x-should-retry: false`, effect_boundary.BLOCKED_MESSAGE); a streaming turn holds every tool-call
+    block until it is complete and judged (and holds message_start until the first content that may be shown), so a
+    block found before anything was written is the same 400, and one found after text was written ends the stream with
+    an `error` event (invalid_request_error, the same message): no tool_use, no message_delta, no message_stop. A pin
+    is relayed untouched."""
     reply = [] if reply is None else reply
+    boundary = auto_routed
+    if boundary:
+        body, dropped = effect_boundary.tools_for_node(body)
+        effect_boundary.log_dropped(dropped)
     data = json.dumps(_node_body(body, model)).encode()
     # Safety net (#108): an auto-routed turn the client did not ask to think on, which still ended on max_tokens with
     # no text or tool_use, is answered with an error naming the cause instead of a silent empty answer. Not retried:
@@ -677,23 +756,47 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                 _refused(handler, 502, "api_error", "the local model used the whole max_tokens without an answer")
                 _send_json(handler, 502, _error("api_error", thinking_starved(node, model, body.get("max_tokens"))))
                 return "incomplete"
+            hit = effect_boundary.blocked_reply(msg.get("content")) if boundary and isinstance(msg, dict) else None
+            if hit:
+                return _blocked(handler, hit)
             if isinstance(msg, dict) and msg.get("type") == "message":
                 msg["model"] = echo_model
             if isinstance(msg, dict) and isinstance(msg.get("content"), list):
                 reply.extend(b for b in msg["content"] if isinstance(b, dict))
             _send_json(handler, 200, msg)
             return "completed" if isinstance(msg, dict) and msg.get("type") == "message" else "incomplete"
-        try:
-            handler.send_response(200)
-            handler.send_header("content-type", "text/event-stream")
-            handler.send_header("cache-control", "no-cache")
-            handler.send_header("connection", "close")
-            handler.end_headers()
-        except OSError:
+        started = False
+
+        def write(chunks: list) -> bool:
+            """Send the stream's headers (once) and `chunks`; False when the client has left."""
+            nonlocal started
+            try:
+                if not started:
+                    handler.send_response(200)
+                    handler.send_header("content-type", "text/event-stream")
+                    handler.send_header("cache-control", "no-cache")
+                    handler.send_header("connection", "close")
+                    handler.end_headers()
+                    handler.close_connection = True
+                    started = True
+                if chunks:
+                    handler.wfile.write(b"".join(chunks))
+                    handler.wfile.flush()
+            except OSError:
+                return False
+            return True
+
+        if not boundary and not write([]):              # a pin streams as before: headers first
             return "incomplete"
-        handler.close_connection = True
         done = starved = False
         pending: list = []                               # one SSE event's lines, written when its blank line arrives
+        # The effect boundary (auto-routed turns only): `held` keeps events back while a tool-call block is open
+        # (`call`) and, before anything was written, while only message_start / ping have arrived.
+        held: list = []
+        call: effect_boundary.StreamedCall | None = None
+        call_closed = False
+        blocked: tuple[str, str] | None = None
+        ev_type = None
         try:
             while True:
                 line = resp.readline()
@@ -712,42 +815,56 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                             break
                         _fold(reply, ev)
                         done = done or ev.get("type") == "message_stop"
+                        ev_type = ev.get("type")
+                        if boundary:
+                            blocked = _judge_event(ev, call)
+                            if isinstance(blocked, effect_boundary.StreamedCall):
+                                call, blocked = blocked, None
+                            elif blocked == "closed":
+                                call_closed, blocked = True, None
+                            if blocked:
+                                break                        # nothing of this event or after it is written
                 pending.append(line)
                 if line in (b"\n", b"\r\n"):
-                    try:
-                        handler.wfile.write(b"".join(pending))
-                        handler.wfile.flush()
-                    except OSError:
-                        return "incomplete"                      # the client left
+                    if not boundary:
+                        if not write(pending):
+                            return "incomplete"              # the client left
+                    else:
+                        held.extend(pending)
+                        if call is not None and call_closed:
+                            call, call_closed = None, False  # judged and allowed: release it with what it held
+                        if call is None and (started or ev_type not in ("message_start", "ping")):
+                            if not write(held):
+                                return "incomplete"
+                            held = []
                     pending = []
-            if pending and not starved:
-                try:
-                    handler.wfile.write(b"".join(pending))
-                except OSError:
-                    return "incomplete"
+            if pending and not starved and not blocked:
+                if not boundary:
+                    if not write(pending):
+                        return "incomplete"
+                else:
+                    held.extend(pending)
         except (OSError, http.client.HTTPException):
             pass                                                 # the node stalled past read_timeout_s or dropped
+        if blocked:
+            return _blocked(handler, blocked, stream_started=started)
+        if boundary:
+            if call is not None:                                 # a tool-call block the node never closed: not sent
+                done = False
+            elif held and not write(held):
+                return "incomplete"
         if starved:
             _refused(handler, 502, "api_error", "the local model used the whole max_tokens without an answer")
             ev = _error("api_error", thinking_starved(node, model, body.get("max_tokens")))
-            try:
-                handler.wfile.write(b"event: error\ndata: " + json.dumps(ev).encode() + b"\n\n")
-                handler.wfile.flush()
-            except OSError:
-                pass
+            write([b"event: error\ndata: " + json.dumps(ev).encode() + b"\n\n"])
             return "incomplete"
         if not done:                                             # say so in the stream, not by a silent truncation
             _refused(handler, 502, "api_error", "the local node stopped mid-answer (stalled or dropped)")
             ev = _error("api_error", f"cortados: local node {node['node']} stopped mid-answer (stalled past "
                         f"{node['read_timeout_s']:g}s or dropped the connection)")
-            try:
-                handler.wfile.write(b"event: error\ndata: " + json.dumps(ev).encode() + b"\n\n")
-            except OSError:
-                pass
-        try:
-            handler.wfile.flush()
-        except OSError:
-            pass
+            write([b"event: error\ndata: " + json.dumps(ev).encode() + b"\n\n"])
+        if not write([]):
+            return "incomplete"
         return "completed" if done else "incomplete"
     finally:
         conn.close()

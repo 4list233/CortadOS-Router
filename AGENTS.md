@@ -28,7 +28,8 @@ is the long form.
 - `cortados_router/provider/` — the `cortados` model endpoint (design and status: `docs/PROVIDER-PLAN.md`).
   `server.py` HTTP endpoint, `Registry` of conversations and the `Wire` seam; `anthropic_wire.py` (Claude Code,
   `/v1/messages`) and `responses_wire.py` (Codex, `/v1/responses`) turn requests into one `ClientTurn`;
-  `routing.py` picks the lane through the router's execution policy; `bridge.py` drives a headless Claude CLI with
+  `routing.py` picks the lane through the router's execution policy; `effect_boundary.py` is the effect boundary of
+  automatically local-routed turns (tool allowlist + outward Bash patterns, applied by `local_lane.serve`/`complete`); `bridge.py` drives a headless Claude CLI with
   `mcp_shim.py` serving the client's tools; `codex_bridge.py` drives `codex app-server` with the client's tools as
   dynamic tools, under the isolation policy of `codex_isolation.py` (command line, config and login checks, aliases).
   `office.py` is the Office view (`GET /v1/cortados/office`, metadata-only floors per routing session, fed by the
