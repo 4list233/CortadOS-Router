@@ -146,6 +146,73 @@ mv $TR/data/no-promote $TR/data/no-promote.lifted-$(date +%F)
 After a promotion, check that `current.json` has `"lora": {"rank": 16, "scale": 20.0, "num_layers": 16}` and that
 `curl -s -m 10 http://<bind>:8431/health` answers (see `s1-promote-2026-11-11.md` Part G for the full health checks).
 
+## 2026-11-14: the first rank-16 night failed on a read-only adapter_config.json (branch `s1-readonly-adapter`)
+
+**What happened.** The rank-16 fix worked: `lora: LoRA rank 16, scale 20 from resume_0_adapters.safetensors (tensors) and its
+adapter_config.json`, no teacher calls. Then every trainer launch died before step 1. That was 20 launches (four attempts in
+each of five cycles that overnight.py relaunched, 01:08 to 06:53), and nothing trained. From `runs/2026-11-14/nightly.log`:
+
+```
+  File ".../site-packages/mlx_lm/lora.py", line 258, in train_model
+    save_config(vars(args), adapter_path / "adapter_config.json")
+  File ".../site-packages/mlx_lm/utils.py", line 921, in save_config
+    with open(config_path, "w") as fid:
+PermissionError: [Errno 13] Permission denied: 'runs/2026-11-14/adapter/adapter_config.json'
+...
+trainer died (attempt 4)
+```
+
+**Root cause.** The warm start in `s1/nightly.sh` (line 907 before the fix) copied the promoted adapter with a plain `cp`:
+`cp "$CORTADOS_S1_INIT" "$RUN/adapter/0000000_adapters.safetensors"; cp "$(dirname "$CORTADOS_S1_INIT")/adapter_config.json" "$RUN/adapter/"`.
+`cp` gives a new file the source's mode, no `-p` needed. The source is
+`runs/2026-11-08/promoted/2026-11-08-blend0.7/adapter/`, which `promote_sweep.py` (`os.chmod(..., 0o444)`) leaves read-only
+on purpose, so the run-local copies came out `-r--r--r--`. The resume copy (`cp "$last" "$saved.tmp" && mv`, which made
+`resume_0_adapters.safetensors`) kept 0444 too. mlx_lm rewrites `<adapter-path>/adapter_config.json` at the start of every
+run (`save_config`), so it failed every time. Earlier warm starts copied from nightly run adapters, which mlx_lm writes 0644.
+The 11-14 night was the first to start from a promoted-by-sweep adapter. The 4-attempt retry loop could not tell that a
+deterministic error would repeat.
+
+**Fix.**
+- `run_copy` in `nightly.sh` (warm-start weights and config, resume checkpoint): `cp` to `.tmp`, `chmod u+w`, `mv -f`.
+  The run owns a writable copy, and an existing read-only destination is replaced instead of failing the `cp`. The
+  source's mode is never touched.
+- Preflight before every `mlx_lm lora` launch: `lora_params.py writable $RUN/adapter`. It gives owner write permission to
+  the run's own regular, single-link files, which also heals a run dir left 0444 by the old code, such as
+  `runs/2026-11-14`. A symlink or hard link to another copy, or an unwritable directory, is not changed. Instead the night fails
+  once with `TRAINING PREFLIGHT FAILED: ...` and the trainer is not started.
+- After a trainer death, `lora_params.py trainer-error` reads that attempt's part of the log. If the last exception is
+  deterministic (`PermissionError`, `FileNotFoundError`, `IsADirectoryError`, `NotADirectoryError`, `ModuleNotFoundError`,
+  `ImportError`, `SyntaxError`), the night stops at once:
+  `TRAINING FAILED for <run>: deterministic trainer error (<error>); not retrying`. Other deaths (Metal/memory, kill) are
+  still retried up to 4 times, then `TRAINING FAILED for <run>: trainer died on 4 attempts`. Both write a
+  `train_failure` event to `data/status.json` (`last_train_failure`). `CORTADOS_S1_TRAIN_RETRY_S` (default 60) is the pause
+  between attempts.
+
+**Deploy (between cycles; no launchd restart, no flag change).**
+
+```bash
+R=~/cortados-router; TR=~/cortados/train; S1=$R/s1
+pgrep -fl 'cortados-router/s1/nightly\.sh' || echo "no cycle running"     # deploy only when none is
+git -C $R status --porcelain > /tmp/status-before.txt
+git -C $R fetch origin && git -C $R merge --ff-only origin/main       # after s1-readonly-adapter is merged
+git -C $R status --porcelain | diff - /tmp/status-before.txt && echo "local table changes intact"
+python3 -B $S1/lora_params.py trainer-error < $TR/runs/2026-11-14/nightly.log; echo "exit $?"   # the PermissionError line; exit 0
+# Optional: the preflight does this itself on the next launch. These are run-local single-link copies, never the source.
+ls -l $TR/runs/2026-11-14/adapter/                       # link count 1 on each file
+chmod u+w $TR/runs/2026-11-14/adapter/*
+ls -l $TR/runs/2026-11-08/promoted/2026-11-08-blend0.7/adapter/   # the source: still -r--r--r--
+```
+
+**Re-run.** Tonight needs nothing more. The next in-window cycle carries on `runs/2026-11-14` (cross-night resume) or warm-starts
+a new run. It now logs `resuming from resume_0_adapters.safetensors`, the rank-16 `lora:` line and mlx_lm's
+`Iter ...` lines, with no `trainer died`. `data/no-promote` stays in place as Part C intends. Training now, outside the window,
+is the owner's call (`CORTADOS_S1_TRAIN_ONLY_IN_WINDOW`, Forest 2026-11-08). It would mean changing the s1-continuous
+plist env and reloading the job, which this fix does not need. Next morning:
+`grep -n "lora:\|adapter:\|PREFLIGHT\|TRAINING FAILED\|trainer died\|Iter 100" $TR/runs/<night>/nightly.log`.
+
+**Rollback.** `git -C $R reset --keep cf6b657`. The old code fails on any read-only warm-start source in the same way, so
+also `touch $TR/data/no-train-tonight`.
+
 ## Limits and their reasons
 
 - **Rank cap 64 (`CORTADOS_S1_LORA_MAX_RANK`).** Every blend promotion doubles the rank: 16 now, then 32, then 64. Trainer

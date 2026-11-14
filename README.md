@@ -205,7 +205,7 @@ The pipeline is in `s1/`, run nightly by `s1/nightly.sh` (or back to back by `s1
 | collect | `dataset.py` | gathers routed requests from the local `router.db` and any in `CORTADOS_ROUTER_DB_EXTRA` (e.g. rsynced from the provider host); a request's train/holdout split is fixed by its id |
 | label | `label.py` | teacher labels via a stateless CLI, k = 3 soft samples; train split by Sonnet, holdout by a stronger Opus |
 | build | `build_sft.py` | builds the SFT set, oversampling rare bands |
-| train | `mlx_lm lora` | warm-starts from the promoted adapter |
+| train | `mlx_lm lora` | warm-starts from the promoted adapter, through a run-owned copy; a symlinked or hard-linked adapter file fails the night before the trainer writes (guards against accidental aliasing, not a same-user adversary, which could change the promoted adapter directly) |
 | grade | `evaluate.py` | grades on the held-out split: band accuracy, under/over-routing, outward recall, ECE, Brier |
 | promote | `nightly.sh` | promotes only with no regression where mistakes are expensive — under-routing and outward recall never regress, band accuracy holds within noise — measured against the incumbent re-graded on the same rows |
 

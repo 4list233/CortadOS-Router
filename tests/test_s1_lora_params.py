@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -116,6 +117,115 @@ class LoraParams(unittest.TestCase):
                       "--start", str(w), "--config", str(self.tmp / "a/adapter_config.json")])
         self.assertEqual(rc, lp.EXIT_REFUSED)
         self.assertEqual(json.loads((self.run_dir / "lora-params.json").read_text())["rank"], 8)
+
+
+# 2026-11-14 nightly.log, runs/2026-11-14 on the Studio: the trainer's traceback on every one of 20 launches.
+REAL_TRACEBACK = """Loading configuration file runs/2026-11-14/lora-train.yaml
+Traceback (most recent call last):
+  File "/Users/velox/cortados/.venv-mlx/lib/python3.12/site-packages/mlx_lm/lora.py", line 258, in train_model
+    save_config(vars(args), adapter_path / "adapter_config.json")
+  File "/Users/velox/cortados/.venv-mlx/lib/python3.12/site-packages/mlx_lm/utils.py", line 921, in save_config
+    with open(config_path, "w") as fid:
+         ^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: 'runs/2026-11-14/adapter/adapter_config.json'
+Loading pretrained model
+Trainable parameters: 0.365% (14.680M/4022.468M)
+"""
+
+
+class TrainerError(unittest.TestCase):
+    def test_the_real_permission_error_is_deterministic(self):
+        self.assertEqual(lp.trainer_error(REAL_TRACEBACK),
+                         "PermissionError: [Errno 13] Permission denied: 'runs/2026-11-14/adapter/adapter_config.json'")
+
+    def test_transient_or_unknown_failures_are_retried(self):
+        self.assertIsNone(lp.trainer_error("Traceback (most recent call last):\n  File x\nRuntimeError: [metal::malloc] boom\n"))
+        self.assertIsNone(lp.trainer_error("Training\nIter 100: Train loss 1.2\n"))       # killed without a traceback
+        self.assertIsNone(lp.trainer_error("UserWarning: PermissionError: not raised, only mentioned\n"))
+
+    def test_only_the_last_exception_counts(self):
+        text = REAL_TRACEBACK + "Traceback (most recent call last):\n  File y\nMemoryError: out of memory\n"
+        self.assertIsNone(lp.trainer_error(text))
+
+
+class Writable(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="s1-writable-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.src = self.tmp / "promoted"
+        fake_adapter(self.src, rank=16)
+        for f in self.src.iterdir():
+            f.chmod(0o444)
+        self.run_adapter = self.tmp / "run" / "adapter"
+        self.run_adapter.mkdir(parents=True)
+
+    def mode(self, p):
+        return stat.S_IMODE(os.lstat(p).st_mode)
+
+    def test_read_only_copies_get_owner_write_and_the_source_keeps_0444(self):
+        for name in ("adapters.safetensors", "adapter_config.json"):
+            shutil.copy(self.src / name, self.run_adapter / name)       # cp/copy keep the source's 0444 (the bug)
+            self.assertEqual(self.mode(self.run_adapter / name), 0o444)
+        changed, problems = lp.make_writable(self.run_adapter)
+        self.assertEqual((sorted(changed), problems), (["adapter_config.json", "adapters.safetensors"], []))
+        for name in changed:
+            self.assertTrue(self.mode(self.run_adapter / name) & stat.S_IWUSR)
+            self.assertEqual(self.mode(self.src / name), 0o444)
+        (self.run_adapter / "adapter_config.json").write_text("{}")        # what mlx_lm's save_config does
+        self.assertEqual(lp.make_writable(self.run_adapter), ([], []))
+
+    def test_links_to_the_source_are_refused_and_left_alone(self):
+        (self.run_adapter / "adapter_config.json").symlink_to(self.src / "adapter_config.json")
+        os.link(self.src / "adapters.safetensors", self.run_adapter / "adapters.safetensors")
+        changed, problems = lp.make_writable(self.run_adapter)
+        self.assertEqual(changed, [])
+        self.assertEqual(len(problems), 2, problems)
+        self.assertEqual(self.mode(self.src / "adapter_config.json"), 0o444)
+        self.assertEqual(self.mode(self.src / "adapters.safetensors"), 0o444)
+
+    def test_a_writable_hard_linked_source_is_refused_and_unchanged(self):
+        """Re-review 2026-11-14: a writable file was skipped before its link count was checked, so a hard link to a writable
+        source passed and the trainer's write changed the source."""
+        cfg = self.src / "adapter_config.json"
+        cfg.chmod(0o644)
+        os.link(cfg, self.run_adapter / "adapter_config.json")
+        before = (cfg.read_bytes(), self.mode(cfg))
+        changed, problems = lp.make_writable(self.run_adapter)
+        self.assertEqual(changed, [])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("hard-linked", problems[0])
+        self.assertEqual(lp.main(["writable", str(self.run_adapter)]), lp.EXIT_REFUSED)
+        self.assertEqual((cfg.read_bytes(), self.mode(cfg)), before)
+
+    def test_a_symlinked_adapter_directory_is_refused_and_the_source_keeps_0444(self):
+        """Review 2026-11-14: run/adapter -> promoted/adapter made the source's files look like the run's own regular files."""
+        self.run_adapter.rmdir()
+        self.run_adapter.symlink_to(self.src, target_is_directory=True)
+        before = {f.name: (f.read_bytes(), self.mode(f)) for f in self.src.iterdir()}
+        changed, problems = lp.make_writable(self.run_adapter)
+        self.assertEqual(changed, [])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("symlink", problems[0])
+        self.assertEqual({f.name: (f.read_bytes(), self.mode(f)) for f in self.src.iterdir()}, before)
+        self.assertEqual(lp.main(["writable", str(self.run_adapter)]), lp.EXIT_REFUSED)
+        self.assertEqual({f.name: self.mode(f) for f in self.src.iterdir()}, {n: 0o444 for n in before})
+
+    def test_a_run_dir_reached_through_a_symlinked_parent_is_still_healed(self):
+        """A symlinked runs/ or run directory is not an alias of the adapter: the copies inside it are the run's own."""
+        real = self.tmp / "elsewhere" / "run"
+        (real / "adapter").mkdir(parents=True)
+        shutil.copy(self.src / "adapter_config.json", real / "adapter" / "adapter_config.json")
+        link = self.tmp / "linked-run"
+        link.symlink_to(real, target_is_directory=True)
+        self.assertEqual(lp.make_writable(link / "adapter"), (["adapter_config.json"], []))
+        self.assertEqual(self.mode(self.src / "adapter_config.json"), 0o444)
+
+    def test_cli_exit_codes(self):
+        shutil.copy(self.src / "adapter_config.json", self.run_adapter / "adapter_config.json")
+        self.assertEqual(lp.main(["writable", str(self.run_adapter)]), 0)
+        (self.run_adapter / "x.safetensors").symlink_to(self.src / "adapters.safetensors")
+        self.assertEqual(lp.main(["writable", str(self.run_adapter)]), lp.EXIT_REFUSED)
+        self.assertEqual(lp.main(["writable", str(self.tmp / "missing")]), 0)     # mlx_lm creates it
 
 
 class Provenance(unittest.TestCase):
