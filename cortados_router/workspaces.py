@@ -15,6 +15,19 @@ deleted from a quarantine: renamed first to archive/.deleting-<task_id>-<nonce>,
 then deleted (_cleanup_entry; a leftover from a crash is re-assessed the same way, never deleted by its name alone). held/, repos/,
 services/ and everything else are never touched: cleanup_archive() refuses them by construction, not by convention.
 
+"Published" covers what deleting a worktree would lose and nothing else: its files, its HEAD, and its worktree-private
+refs (refs/worktree/*, refs/bisect/*, refs/rewritten/*, and a stopped operation's MERGE_HEAD etc. in its own git dir:
+PRIVATE_REF_PREFIXES, PRIVATE_PSEUDOREFS), each of which must be reachable from a remote-tracking ref, or it is held.
+Branches, tags and the stash belong to the clone, are shared by every task's worktree and survive the deletion: they
+neither hold a worktree nor count as a change in it (#102). Reflogs, ORIG_HEAD and FETCH_HEAD are recovery records,
+not work, and are not checked.
+
+Known limit, accepted by the owner (2026-11-14, review 3 P1 #1): the quarantine stops writers that reach the tree by
+its path, not one that already holds a descriptor inside it (an open file or directory, a current directory). Such a
+process can still write between the last re-assessment and the deletion, and that write is deleted. No file-system
+lock can exclude a descriptor opened before it, and the case needs a process that left the task's process group
+(confirmed gone at settle) and kept a descriptor into a clean, pushed archive for ARCHIVE_AGE_S (three days).
+
 <root>/cleanup.lock serializes the cleanup's reassess-through-delete section with every move of a worktree between the
 layout directories: settle()'s move out of active/ and a task start that frees a legacy archived worktree. The cleanup's
 run budget (CLEANUP_MAX_SECONDS) bounds how long it holds the lock, because every git call it makes gets the time left
@@ -105,9 +118,10 @@ HELD_PATHS_MAX = 20                 # paths recorded as `held_paths` (names only
 SETTLE_RECHECK_DELAYS_S = (2.0, 5.0)
 # Writer quiescence (review of held-settle-fix, P1): a worktree is archived (settle) or deleted (cleanup) only when two
 # clean assessments, separated by a pause, are bracketed by identical snapshots of the tree (file set, sizes, mtimes,
-# ctimes and inodes of everything outside the regenerable caches) and of its git state (HEAD, refs, stash, index:
-# _git_state). settle() detaches HEAD at exactly the assessed commit, re-checked on the remote first. settle() pauses SETTLE_RECHECK_DELAYS_S; the
-# cleanup pauses CLEANUP_QUIESCE_S per entry it would delete. Anything that cannot be snapshotted holds.
+# ctimes and inodes of everything outside the regenerable caches) and of its own git state (HEAD, worktree-private
+# refs, index: _git_state; the clone's shared refs and stash are not part of it, #102). settle() detaches HEAD at
+# exactly the assessed commit, re-checked on the remote first. settle() pauses SETTLE_RECHECK_DELAYS_S; the cleanup
+# pauses CLEANUP_QUIESCE_S per entry it would delete. Anything that cannot be snapshotted holds.
 CLEANUP_QUIESCE_S = 2.0
 SNAPSHOT_MAX = 200000               # entries scanned per snapshot (caches included); past it, it holds
 # Code points HFS+/APFS ignore when comparing names (git's is_hfs_dotgit list): ".g\u200cit" names .git there too.
@@ -623,6 +637,12 @@ def assess(path: str, deadline=None):
         ahead = _git(["rev-list", "HEAD", "--not", "--remotes"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
         if ahead.strip():
             return False, _Reason("unpushed_commits", f"{len(ahead.split())} commit(s) not on any remote"), []
+        gitdir = _git(["rev-parse", "--absolute-git-dir"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S)).strip()
+        unpublished = _unpublished_private_refs(path, _private_refs(path, gitdir, deadline), deadline)
+        if unpublished:
+            shown = ", ".join(unpublished[:5]) + (f" (+{len(unpublished) - 5} more)" if len(unpublished) > 5 else "")
+            return False, _Reason("unpushed_private_refs", f"{len(unpublished)} worktree-private ref(s) not proven on "
+                                  f"any remote (deleting the worktree would delete them): {shown}"), []
     except GitTimeoutError as exc:
         return None, _Reason("assess_timeout", f"could not assess the worktree in time: {exc}"), []
     except WorkspaceError as exc:
@@ -630,13 +650,87 @@ def assess(path: str, deadline=None):
     return True, _Reason("pushed", "pushed"), []
 
 
+# Refs that live in a worktree's own git dir and go with it when the worktree is deleted (gitglossary "per-worktree
+# ref"; review 3 of held-settle-fix, P1 #2): every other ref (branches, tags, notes, the stash, packed-refs) is the
+# clone's, shared by all its worktrees, and survives the deletion. Pseudo-refs a stopped merge, cherry-pick, revert,
+# rebase or bisect leaves behind are checked too. ORIG_HEAD and FETCH_HEAD are not: `git worktree add` and every reset,
+# rebase or pull write ORIG_HEAD (after a `pull --rebase` it names the pre-rebase commits, which are never on the
+# remote), so it is a recovery record like the reflog, not work; holding on it would hold clean, pushed work (#102).
+PRIVATE_REF_PREFIXES = ("refs/worktree", "refs/bisect", "refs/rewritten")
+PRIVATE_PSEUDOREFS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "BISECT_HEAD")
+_OID_RE = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
+
+
+def _private_refs(path: str, gitdir: str, deadline=None) -> dict:
+    """{ref name: text} for every worktree-private ref of the worktree at `path` whose own git dir is `gitdir`: what
+    `git for-each-ref` lists under PRIVATE_REF_PREFIXES (any ref backend), every file under <gitdir>/refs/ that it did
+    not list (a ref git cannot parse is kept as its raw text, which _unpublished_private_refs cannot prove published),
+    and the PRIVATE_PSEUDOREFS files in <gitdir>. Never follows a symlink. Raises GitTimeoutError / WorkspaceError
+    (a refs tree that cannot be walked): callers hold."""
+    out = {}
+    listed = _git(["--no-optional-locks", "for-each-ref", "--format=%(refname) %(objectname)", *PRIVATE_REF_PREFIXES],
+                  cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
+    for line in listed.splitlines():
+        ref, _, oid = line.rpartition(" ")
+        if ref:
+            out[ref] = oid
+    refs_dir, errors = os.path.join(gitdir, "refs"), []
+    for directory, dirs, files in os.walk(refs_dir, followlinks=False, onerror=errors.append):
+        _check_deadline(deadline, "list the worktree's private refs")
+        real_dirs = []
+        for name in dirs:                            # a symlink is listed as a ref (unreadable: it holds), never entered
+            (files if os.path.islink(os.path.join(directory, name)) else real_dirs).append(name)
+        dirs[:] = real_dirs
+        for name in files:
+            ref = "refs/" + os.path.relpath(os.path.join(directory, name), refs_dir).replace(os.sep, "/")
+            if ref not in out:
+                out[ref] = (_read_small(os.path.join(directory, name)) or "unreadable").strip()
+    errors = [e for e in errors if not (isinstance(e, FileNotFoundError) and _same_path(e.filename or "", refs_dir))]
+    if errors:
+        raise WorkspaceError(f"the worktree's refs cannot be walked: {type(errors[0]).__name__}")
+    for name in PRIVATE_PSEUDOREFS:
+        full = os.path.join(gitdir, name)
+        if os.path.lexists(full):
+            out[name] = (_read_small(full) or "unreadable").strip()
+    return out
+
+
+def _unpublished_private_refs(path: str, refs: dict, deadline=None) -> list:
+    """The names in `refs` (_private_refs) not proven published: a value that is not object ids (a pseudo-ref may hold
+    several, one per line), an object that is not a commit, or a commit not reachable from any remote-tracking ref."""
+    bad = []
+    for name in sorted(refs):
+        oids = refs[name].split()
+        if not oids or not all(_OID_RE.fullmatch(o) for o in oids):
+            bad.append(name)
+            continue
+        for oid in oids:
+            try:
+                commit = _git(["rev-parse", "--verify", "--quiet", oid + "^{commit}"], cwd=path,
+                              timeout=_within(deadline, GIT_TIMEOUT_S)).strip()
+            except GitTimeoutError:
+                raise
+            except WorkspaceError:                   # missing, or not a commit (a tree, a blob): not provable
+                commit = ""
+            if not commit:
+                bad.append(name)
+                break
+            ahead = _git(["rev-list", "--max-count=1", commit, "--not", "--remotes"], cwd=path,
+                         timeout=_within(deadline, GIT_TIMEOUT_S))
+            if ahead.strip():
+                bad.append(name)
+                break
+    return bad
+
+
 def _git_state(path: str, deadline=None) -> dict:
-    """The worktree's unpublished git state, compared like the file snapshot (review of held-settle-fix, P1 #2): an
-    empty commit, a new branch or tag, a stash or a staged change touch no working-tree file but change this. HEAD's
-    commit and what it is attached to; the worktree's own git dir and the clone's common dir (`git rev-parse --git-dir
-    --git-common-dir`); every ref (`git for-each-ref`) except remote-tracking refs (our own fetches move them; they are
-    the remote's state, not local work), with the branches other worktrees of the clone have checked out (`elsewhere`,
-    left out of the comparison: see _Snap); the stash list; and the size, mtime and inode of the worktree's index file.
+    """The git state a late writer in THIS worktree would change and the deletion would lose, compared like the file
+    snapshot: an empty commit, a staged change or a new worktree-private ref touches no working-tree file but changes
+    this. HEAD's commit and what it is attached to; the worktree's own git dir and the clone's common dir (`git
+    rev-parse --git-dir --git-common-dir`); its worktree-private refs (_private_refs); and the size, mtime and inode of
+    its index file. Shared state (branches, tags, the stash, packed-refs) is left out (review 3, P2 #3; #102): every
+    worktree of the clone writes it, and it survives this worktree's deletion, so a sibling task's stash, commit or
+    tag never holds this one. A late commit on this worktree's own branch still moves its HEAD.
     Raises GitTimeoutError / WorkspaceError like _git()."""
     def run(args):
         return _git(["--no-optional-locks", *args], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S))
@@ -645,66 +739,27 @@ def _git_state(path: str, deadline=None) -> dict:
         raise WorkspaceError(f"git rev-parse gave {len(lines)} lines, not 4")
     gitdir, common = (os.path.normpath(d if os.path.isabs(d) else os.path.join(path, d)) for d in lines[:2])
     head, attached = lines[2].strip(), lines[3].strip()
-    elsewhere = _branches_elsewhere(gitdir, common)
-    refs = {}
-    for line in run(["for-each-ref", "--format=%(refname) %(objectname)"]).splitlines():
-        ref, _, sha = line.rpartition(" ")
-        if ref and not ref.startswith("refs/remotes/"):
-            refs[ref] = sha
-    stash = run(["stash", "list", "--format=%H"])
     try:
         st = os.lstat(os.path.join(gitdir, "index"))
         index = (stat.S_IFMT(st.st_mode), st.st_size, st.st_mtime_ns, st.st_ino)
     except FileNotFoundError:
         index = None
-    return {"head": head, "attached": attached, "git_dir": gitdir, "common_dir": common, "refs": refs,
-            "elsewhere": elsewhere, "stash": stash, "index": index}
+    return {"head": head, "attached": attached, "git_dir": gitdir, "common_dir": common,
+            "private": _private_refs(path, gitdir, deadline), "index": index}
 
 
 class _Snap(tuple):
-    """(files, git state) from _snapshot(). Equal when the files are equal and the git states are equal, except that a
-    branch another worktree has checked out in EITHER snapshot is left out of the ref comparison: another task that
-    commits on its branch, settles (detaching, so its branch is no longer "elsewhere") or starts while this one is
-    assessed has not changed this worktree (#102: tasks share a clone)."""
+    """(files, git state) from _snapshot(): equal when both parts are equal (a plain folder's git state is None)."""
     __hash__ = None
 
     def __eq__(self, other):
         if not isinstance(other, tuple) or len(other) != 2:
             return NotImplemented
-        if self[0] != other[0]:
-            return False
-        a, b = self[1], other[1]
-        if a is None or b is None:
-            return a is None and b is None
-        if any(a[k] != b[k] for k in ("head", "attached", "git_dir", "common_dir", "stash", "index")):
-            return False
-        skip = a["elsewhere"] | b["elsewhere"]
-        return {r: v for r, v in a["refs"].items() if r not in skip} == \
-            {r: v for r, v in b["refs"].items() if r not in skip}
+        return self[0] == other[0] and self[1] == other[1]
 
     def __ne__(self, other):
         eq = self.__eq__(other)
         return eq if eq is NotImplemented else not eq
-
-
-def _branches_elsewhere(gitdir: str, common: str) -> frozenset:
-    """refs/heads/<b> for every branch checked out by the clone itself or by a worktree other than the one whose admin
-    dir is `gitdir`, from their HEAD files (no git call, no symlink followed)."""
-    heads = [_read_small(os.path.join(common, "HEAD"))] if not _same_path(gitdir, common) else []
-    admin_root = os.path.join(common, "worktrees")
-    try:
-        names = sorted(os.listdir(admin_root))
-    except OSError:
-        names = []
-    for name in names:
-        admin = os.path.join(admin_root, name)
-        if not _same_path(admin, gitdir):
-            heads.append(_read_small(os.path.join(admin, "HEAD")))
-    out = set()
-    for text in heads:
-        if text and text.startswith("ref: "):
-            out.add(text[len("ref: "):].strip())
-    return frozenset(out)
 
 
 def _snapshot(path: str, deadline=None, git: bool = True) -> "_Snap":
@@ -936,7 +991,7 @@ def _move_settled(rec: dict, root: str, ok: bool, reason: str, snapshot=None) ->
         return rec
     sha = _snapshot_head(snapshot)
     if not _same_snapshot(dest, snapshot):
-        # A late write after the move (a file, a commit, a ref, a stash, a staged change): not detached (the branch
+        # A late write after the move (a file, a commit, a private ref, a staged change): not detached (the branch
         # stays held by it), and on to held/, never deleted.
         return _move_on_to_held(rec, root, dest, _not_quiet(
             "its files or git state changed after the move to archive/; moved on to held/ without detaching HEAD"))
@@ -1498,10 +1553,12 @@ def _cleanup_entry(root: str, archive_fd: int, name: str, tid: str, rec: dict, n
          must still have no .git entry and the same file snapshot. Any difference moves it to held/<tid>.
       4. delete through the descriptor opened in step 1 (never through a path), then its admin dir alone. If
          archive/<tid> exists again afterwards (a writer recreated it), that new entry is moved to held/.
-    The honest limit: a process that already holds a descriptor inside the tree (an open file, or its current
-    directory) can still write between step 3 and step 4, and that write is deleted. Archiving needed the task's
-    process group confirmed gone at settle, ARCHIVE_AGE_S (three days) earlier, so such a process would have to have
-    left the group and kept the descriptor open for those three days.
+    Known limit, accepted by the owner (2026-11-14, review 3 P1 #1; module docstring): the quarantine excludes
+    writers that reach the tree by its path, not a process that already holds a descriptor inside it (an open file
+    or directory, its current directory). Such a process can still write between step 3 and step 4, and that write
+    is deleted: no lock can exclude a descriptor opened before it. Archiving needed the task's process group
+    confirmed gone at settle, ARCHIVE_AGE_S (three days) earlier, so such a process would have to have left the group
+    and kept a descriptor into a clean, pushed copy for those three days. No test claims otherwise.
 
     An assessment that runs out of the cleanup budget is an unknown: nothing is deleted or held on it, and a
     quarantined entry is renamed back to archive/<tid> (or, if that fails, left for the next run to re-assess)."""

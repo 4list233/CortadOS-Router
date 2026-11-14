@@ -518,15 +518,19 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   folder there. `cwd`: an existing directory ON THE HOST (not managed; a path that exists only on the requesting machine
   is refused saying so). The runner prepares the workspace before spawning (a clone can take minutes; start_task
   answers at once; a failed clone fails the task with the reason) and, when the child ends, moves the folder to
-  `archive/` (every commit on a remote and nothing uncommitted or untracked, or no repository) or `held/` (anything
+  `archive/` (every commit on a remote and nothing uncommitted or untracked, or no repository; "every commit" includes
+  the worktree-private refs a deletion would remove with it: `refs/worktree/*`, `refs/bisect/*`, `refs/rewritten/*` and
+  a stopped operation's `MERGE_HEAD`/`CHERRY_PICK_HEAD`/`REVERT_HEAD`/`REBASE_HEAD`/`BISECT_HEAD`, each reachable
+  from a remote-tracking ref; reflogs and `ORIG_HEAD` are not checked) or `held/` (anything
   else, or a worktree git cannot assess) with `git worktree move`, and records it in `<root>/index.jsonl` (one line per
   task, rewritten under `index.lock`). Git-ignored files count as unpublished owner data, except regenerable caches
   (`__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `*.pyc`) and empty ignored directories; a nested
   `.git` always holds (any case: `.GIT` and `.Git` are `.git` on macOS; a directory or a file). Archiving needs writer
   quiescence: the child's process group gone (or the folder is held), and two clean assessments a pause apart (2 s,
   then 5 s more if needed) bracketed by identical snapshots of the tree (paths, sizes, mtimes, outside the caches) and
-  of its git state (HEAD, local refs and tags, stash list, index file; branches other worktrees have checked out are
-  left out, so a sibling task's commits do not hold it), compared again under the cleanup lock before the move and
+  of its own git state (HEAD, worktree-private refs, index file; the clone's shared branches, tags and stash are left
+  out: every task's worktree writes them and they survive the deletion, so a sibling task's commit or stash does not
+  hold it, #102), compared again under the cleanup lock before the move and
   before HEAD is detached; a change after the move sends it on to `held/` undetached. Every snapshot counts every
   entry it scans, caches included, against its cap (200 000); past it, it holds. The record names the paths that held it (`held_paths`, at most 20) and a path-free
   `reason_code`. A plain folder containing a `.git` entry at any depth is conservatively moved
@@ -555,8 +559,11 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   `archive/.deleting-<task_id>-<nonce>` (a quarantine: a writer reaching it by its old path now fails), re-assesses
   it there in full, and only then deletes it through the descriptor; any change holds it. A writer that recreates
   `archive/<task_id>` meanwhile has its new folder moved to `held/`. A `.deleting-*` left by a crash is re-assessed
-  the same way, never deleted by its name. Limit: a process already holding a descriptor inside the tree can still
-  write; archiving required the task's process group gone three days earlier.
+  the same way, never deleted by its name. Known limit, accepted by the owner (2026-11-14): the quarantine does not
+  exclude a process that already holds a descriptor inside the tree (an open file or directory, a current directory);
+  it can still write between the last re-assessment and the deletion, and that write is deleted. No file-system lock
+  can exclude a descriptor opened before it; archiving required the task's process group gone three days earlier, and
+  an archive is a clean, pushed copy nobody works in.
   Worktree metadata is never pruned globally (#93): `git worktree prune` is never run, every clone has
   `gc.worktreePruneExpire=never`, a deleted worktree's own admin dir is removed alone, every move is followed by
   `git worktree repair` (a failure is recorded as `repair_error`, never rolled back), and each cleanup (and each start

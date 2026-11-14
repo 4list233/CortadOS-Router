@@ -1987,12 +1987,10 @@ class QuarantineAndGitStateTests(_Base):
         held = os.path.join(self.root, "held", TID)
         self.assertEqual(git("log", "-1", "--format=%s", cwd=held).strip(), "late")
 
-    def test_a_new_ref_or_stash_after_the_assessment_is_held(self):
+    def test_a_staged_change_or_private_ref_after_the_assessment_is_held(self):
+        """What a late writer in this worktree changes and the deletion would lose: its index, its private refs."""
         actions = {
-            "branch": lambda p: git("branch", "late-branch", cwd=p),
-            "tag": lambda p: git("tag", "late-tag", cwd=p),
-            "stash": lambda p: (self.write(os.path.join(self.root, "repos", "demo"), "README.md", "changed\n"),
-                                git("stash", "push", "-q", cwd=os.path.join(self.root, "repos", "demo"))),
+            "private_ref": lambda p: git("update-ref", "refs/worktree/late", "HEAD", cwd=p),
             "staged": lambda p: git("update-index", "--chmod=+x", "README.md", cwd=p),
         }
         for i, (what, action) in enumerate(sorted(actions.items())):
@@ -2003,6 +2001,120 @@ class QuarantineAndGitStateTests(_Base):
                     settled = ws.settle(rec, self.root, recheck_delays=(2.0,))
                 self.assertEqual((settled["state"], settled["reason_code"]), ("held", "not_quiescent"), settled)
                 self.assertTrue(self.attached(settled["path"]))
+
+    def test_shared_refs_and_the_stash_after_the_assessment_do_not_hold(self):
+        """Review 3, P2 #3 (#102): a branch, a tag or a stash is the clone's, shared by every worktree, and survives
+        this worktree's deletion: it is no change in this worktree, and the work is archived. The ref survives."""
+        clone = os.path.join(self.root, "repos", "demo")
+        actions = {
+            "branch": (lambda p: git("branch", "late-branch", cwd=p),
+                       lambda: git("rev-parse", "--verify", "refs/heads/late-branch", cwd=clone)),
+            "tag": (lambda p: git("tag", "late-tag", cwd=p), lambda: git("rev-parse", "--verify", "late-tag", cwd=clone)),
+            "stash": (lambda p: (self.write(clone, "README.md", "changed\n"),
+                                 git("stash", "push", "-q", "-m", "late-stash-tag", cwd=clone)),
+                      lambda: self.assertIn("late-stash-tag", git("stash", "list", cwd=clone))),
+        }
+        for i, (what, (action, survives)) in enumerate(sorted(actions.items())):
+            tid = "t2026110812%02d00-000000%02x" % (i, 0xb0 + i)
+            with self.subTest(what=what):
+                rec = self.prepare(tid, repo=self.origin)
+                with self._after_nth_assess_of(rec["path"], 2, action):
+                    settled = ws.settle(rec, self.root, recheck_delays=(2.0,))
+                self.assertEqual((settled["state"], settled.get("detached")), ("archived", True), settled)
+                survives()
+
+    def test_a_sibling_stash_during_the_assessment_does_not_hold_and_survives(self):
+        """Review 3, P2 #3: a stash created in a sibling worktree while this task is assessed held it as
+        not_quiescent. Settle archives it, the cleanup deletes it later, and the stash is still there."""
+        other = self.prepare(TID2, repo=self.origin)
+        rec = self.prepare(repo=self.origin, branch="feature")
+
+        def stash(_p):
+            self.write(other["path"], "README.md", "sibling's change\n")
+            git("stash", "push", "-q", "-m", "sibling-stash-tag", cwd=other["path"])
+        with self._after_nth_assess_of(rec["path"], 1, stash):
+            settled = ws.settle(rec, self.root, recheck_delays=(2.0,))
+        self.assertEqual((settled["state"], settled.get("detached")), ("archived", True), settled)
+        ws.update_index(self.root, {**settled, "settled_at": time.time() - ws.ARCHIVE_AGE_S - 60})
+        clone = os.path.join(self.root, "repos", "demo")
+        def stash_again(_p):
+            self.write(other["path"], "README.md", "again\n")
+            git("stash", "push", "-q", "-m", "second-stash-tag", cwd=other["path"])
+        with self._after_nth_assess_of(settled["path"], 1, stash_again):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [TID], report)
+        stashes = git("stash", "list", cwd=clone)
+        self.assertIn("sibling-stash-tag", stashes)
+        self.assertIn("second-stash-tag", stashes)
+
+    # --- Review 3, P1 #2: worktree-private refs ----------------------------------------------------------------------
+
+    def unpublished_private_ref(self, path, ref="refs/worktree/private"):
+        """The reviewer's reproduction: an unpublished commit referenced only by a per-worktree ref; HEAD published,
+        tree clean."""
+        sha = git("commit-tree", "-p", "HEAD", "-m", "private", "HEAD^{tree}", cwd=path).strip()
+        git("update-ref", ref, sha, cwd=path)
+        return sha
+
+    def test_an_unpublished_worktree_private_ref_is_held_at_settle(self):
+        for i, ref in enumerate(("refs/worktree/private", "refs/bisect/bad", "refs/rewritten/x")):
+            tid = "t2026110813%02d00-000000%02x" % (i, 0xc0 + i)
+            with self.subTest(ref=ref):
+                rec = self.prepare(tid, repo=self.origin, branch="feature" if not i else None)
+                sha = self.unpublished_private_ref(rec["path"], ref)
+                settled = ws.settle(rec, self.root)
+                held = os.path.join(self.root, "held", tid)
+                self.assertEqual((settled["state"], settled["path"], settled["reason_code"]),
+                                 ("held", held, "unpushed_private_refs"), settled)
+                self.assertIn(ref, settled["reason"])
+                self.assertEqual(git("rev-parse", ref, cwd=held).strip(), sha)
+                self.assertEqual(self.archive_names(), [])
+
+    def test_an_unpublished_pseudoref_or_unparseable_private_ref_is_held(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        sha = git("commit-tree", "-p", "HEAD", "-m", "merging", "HEAD^{tree}", cwd=rec["path"]).strip()
+        gitdir = git("rev-parse", "--absolute-git-dir", cwd=rec["path"]).strip()
+        with open(os.path.join(gitdir, "MERGE_HEAD"), "w") as f:
+            f.write(sha + "\n")
+        self.assertEqual(ws.assess(rec["path"])[1].code, "unpushed_private_refs")
+        os.remove(os.path.join(gitdir, "MERGE_HEAD"))
+        os.makedirs(os.path.join(gitdir, "refs", "worktree"), exist_ok=True)
+        with open(os.path.join(gitdir, "refs", "worktree", "broken"), "w") as f:
+            f.write("not an object id\n")
+        ok, reason, _ = ws.assess(rec["path"])         # git itself may refuse the broken ref first: held either way
+        self.assertEqual(ok, False)
+        self.assertIn(reason.code, ("unpushed_private_refs", "assess_failed"))
+        settled = ws.settle(rec, self.root)
+        self.assertEqual(settled["state"], "held", settled)
+        self.assertTrue(os.path.isfile(os.path.join(settled["path"], ".git")))
+
+    def test_published_private_refs_do_not_hold(self):
+        """#102: a private ref at a published commit (a bisect over pushed history) loses nothing."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        git("update-ref", "refs/bisect/good", "HEAD~1", cwd=rec["path"])
+        git("update-ref", "refs/worktree/mark", "HEAD", cwd=rec["path"])
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled.get("detached")), ("archived", True), settled)
+
+    def test_an_unpublished_worktree_private_ref_is_held_by_the_cleanup(self):
+        rec = self.old_archive()
+        sha = self.unpublished_private_ref(rec["path"])
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        held = os.path.join(self.root, "held", TID)
+        idx = ws.read_index(self.root)[TID]
+        self.assertEqual((idx["state"], idx["reason_code"]), ("held", "unpushed_private_refs"), idx)
+        self.assertEqual(git("rev-parse", "refs/worktree/private", cwd=held).strip(), sha)
+        clone = os.path.join(self.root, "repos", "demo")
+        self.assertEqual(git("cat-file", "-t", sha, cwd=clone).strip(), "commit")
+
+    def test_an_unpublished_private_ref_made_in_quarantine_is_held(self):
+        rec = self.old_archive()
+        with mock.patch.object(ws, "_after_quarantine", lambda p: self.unpublished_private_ref(p)):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        held = os.path.join(self.root, "held", TID)
+        self.assertTrue(git("rev-parse", "refs/worktree/private", cwd=held).strip())
 
     def _after_nth_assess_of(self, path, n, action):
         real, calls = ws.assess, []
@@ -2031,7 +2143,7 @@ class QuarantineAndGitStateTests(_Base):
         self.assertEqual((settled["state"], settled.get("detached")), ("archived", True), settled)
 
     def test_another_worktree_settling_during_the_assessment_does_not_hold_this_one(self):
-        """#102: the other task's detach frees its branch, so refs/heads/<its branch> stops being 'elsewhere'."""
+        """#102: the other task's detach changes only its own HEAD and the clone's shared refs, never this worktree's."""
         other = self.prepare(TID2, repo=self.origin)
         git("commit", "-q", "--allow-empty", "-m", "other's local work", cwd=other["path"])
         rec = self.prepare(repo=self.origin, branch="feature")
