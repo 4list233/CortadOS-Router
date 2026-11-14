@@ -53,6 +53,15 @@ UPSTREAM = {
 # The switch status's "models loaded" source.
 LOADED = {"ollama": "/api/ps", "vllm-mlx": "/v1/models"}
 LAUNCH_LABEL = "com.cortados.vllm-mlx"
+# The prompt guard: its source in this checkout, and its name in the venv's bin/ (install_mlx_backend.sh copies it).
+GUARD_SOURCE = Path(__file__).resolve().parent.parent / "integrations" / "vllm-mlx" / "cortados_vllm_mlx_guard.py"
+GUARD_NAME = "cortados-vllm-mlx-guard.py"
+# The prefix of the guard's refusal (cortados_vllm_mlx_guard.REFUSAL; a test keeps the two equal).
+GUARD_REFUSAL = "cortados guard: prompt too long for this node's context"
+# The chat_template_kwargs a request may carry to vllm-mlx, with the type each must have. Only what routing needs:
+# enable_thinking, which the gate also sets from Anthropic's `thinking`. Anything else could change what the template
+# renders (chat_template, tools, add_generation_prompt, ...) beyond what the input bound reads from the body.
+ALLOWED_TEMPLATE_KWARGS: dict[str, type] = {"enable_thinking": bool}
 # vllm-mlx serve settings the example sets, and why (each becomes a CLI flag in serve_argv):
 SERVE_DEFAULTS: dict[str, Any] = {
     "host": "127.0.0.1",            # loopback only: the gate is the one door from the tailnet (as for Ollama)
@@ -228,8 +237,12 @@ def _normal(name: str) -> str:
     return n if not n or ":" in n.rsplit("/", 1)[-1] else n + ":latest"
 
 
+TOO_DEEP = "body is nested too deeply"
+
+
 class Refusal(Exception):
-    """A request the gate answers itself: (status, Anthropic error type, message)."""
+    """A request the gate answers itself: (status, Anthropic error type, message). Never retryable: the same body
+    gets the same answer (the gate sends x-should-retry: false)."""
 
     def __init__(self, status: int, kind: str, message: str):
         super().__init__(message)
@@ -243,6 +256,8 @@ def adapt_messages_body(cfg: dict[str, Any], raw: bytes) -> bytes:
         return raw
     try:
         body = json.loads(raw)
+    except RecursionError:
+        raise Refusal(400, "invalid_request_error", TOO_DEEP) from None
     except ValueError:
         raise Refusal(400, "invalid_request_error", "body is not JSON") from None
     if not isinstance(body, dict):
@@ -253,12 +268,37 @@ def adapt_messages_body(cfg: dict[str, Any], raw: bytes) -> bytes:
     body["model"] = served
     thinking = body.get("thinking")
     kwargs = body.get("chat_template_kwargs")
-    kwargs = dict(kwargs) if isinstance(kwargs, dict) else {}
+    if kwargs is not None and not isinstance(kwargs, dict):
+        raise Refusal(400, "invalid_request_error", "chat_template_kwargs must be an object")
+    kwargs = dict(kwargs or {})
+    for key, value in kwargs.items():
+        kind = ALLOWED_TEMPLATE_KWARGS.get(key)
+        if kind is None:
+            shown = key if key.isidentifier() and len(key) <= 40 else "a key"
+            raise Refusal(400, "invalid_request_error", f"chat_template_kwargs: {shown} is not allowed (allowed: "
+                                                        f"{', '.join(sorted(ALLOWED_TEMPLATE_KWARGS))})")
+        if type(value) is not kind:
+            raise Refusal(400, "invalid_request_error", f"chat_template_kwargs: {key} must be a {kind.__name__}")
     if isinstance(thinking, dict) and "enable_thinking" not in kwargs:
         kwargs["enable_thinking"] = thinking.get("type") != "disabled"
     if kwargs:
         body["chat_template_kwargs"] = kwargs
-    return json.dumps(body).encode()
+    try:
+        return json.dumps(body).encode()
+    except RecursionError:
+        raise Refusal(400, "invalid_request_error", TOO_DEEP) from None
+
+
+def guard_refusal(status: int, raw: bytes) -> str | None:
+    """The backend prompt guard's refusal text (a 413 whose detail starts with GUARD_REFUSAL), or None."""
+    if status != 413:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    detail = data.get("detail") if isinstance(data, dict) else None
+    return detail[:300] if isinstance(detail, str) and detail.startswith(GUARD_REFUSAL) else None
 
 
 def models_to_tags(raw: bytes) -> dict[str, Any] | None:
@@ -292,8 +332,19 @@ def anthropic_error(status: int, raw: bytes, backend: str) -> bytes:
     return json.dumps({"type": "error", "error": {"type": kind, "message": f"{backend}: {text[:300]}"}}).encode()
 
 
+def install_paths(cfg: dict[str, Any]) -> dict[str, str]:
+    """Where the backend runs from: the venv's python, the guard's installed copy and its source, the model directory
+    (install_mlx_backend.sh reads them through --install-paths)."""
+    if cfg["backend"] != "vllm-mlx":
+        raise BackendConfigError("install paths need backend vllm-mlx")
+    bin_dir = Path(_expand(cfg["venv"])) / "bin"
+    return {"python": str(bin_dir / "python"), "guard": str(bin_dir / GUARD_NAME), "guard_source": str(GUARD_SOURCE),
+            "model": _expand(cfg["model"]["path"])}
+
+
 def serve_argv(cfg: dict[str, Any]) -> list[str]:
-    """The vllm-mlx command line for the configured model (the LaunchAgent's ProgramArguments)."""
+    """The vllm-mlx command line for the configured model (the LaunchAgent's ProgramArguments): vllm-mlx's own
+    `serve` arguments, run through the prompt guard with the governor's context_tokens as the prompt cap."""
     if cfg["backend"] != "vllm-mlx":
         raise BackendConfigError("serve_argv needs backend vllm-mlx")
     s, m = cfg["serve"], cfg["model"]
@@ -301,7 +352,9 @@ def serve_argv(cfg: dict[str, Any]) -> list[str]:
     # The backend's own bound: never more sequences than the governor could ever admit (the idle cap, bounded by how
     # many empty-context reservations fit the byte budget), so a request that slipped past the gate could not add more.
     seqs = local_governor.max_seqs(gov)
-    argv = [str(Path(_expand(cfg["venv"])) / "bin" / "vllm-mlx"), "serve", _expand(m["path"]),
+    paths = install_paths(cfg)
+    argv = [paths["python"], paths["guard"], "--context-tokens", str(gov["context_tokens"]), "--",
+            "serve", paths["model"],
             "--served-model-name", cfg["served_model"], "--host", s["host"], "--port", str(s["port"]),
             "--continuous-batching", "--max-num-seqs", str(seqs),
             "--max-tokens", str(s["max_tokens"]), "--max-request-tokens", str(s["max_request_tokens"]),
@@ -339,6 +392,8 @@ def main(argv=None) -> int:
     what.add_argument("--print-config", action="store_true", help="validate and print the resolved config")
     what.add_argument("--argv", action="store_true", help="print the vllm-mlx command line, one argument per line")
     what.add_argument("--plist", metavar="LOG_DIR", help="print the LaunchAgent plist (logs under LOG_DIR)")
+    what.add_argument("--install-paths", action="store_true",
+                      help="print the venv python, the guard (installed and source) and the model directory as JSON")
     a = ap.parse_args(argv)
     try:
         cfg = load(a.config, explicit=a.config is not None)
@@ -346,6 +401,8 @@ def main(argv=None) -> int:
             print(json.dumps(cfg, indent=1, default=str))
         elif a.argv:
             print("\n".join(serve_argv(cfg)))
+        elif a.install_paths:
+            print(json.dumps(install_paths(cfg)))
         else:
             sys.stdout.buffer.write(launch_agent_plist(cfg, a.plist))
     except BackendConfigError as exc:

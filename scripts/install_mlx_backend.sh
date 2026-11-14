@@ -12,8 +12,12 @@
 #   --uninstall  boot the LaunchAgent out and remove its plist (the rollback's last step; the config is kept)
 #   --dry-run    print the plist and the launchctl calls; change nothing
 #
-# Needs, before it is run: the venv the config names with vllm-mlx in it (vllm-mlx 0.6.0 was measured), and the model
-# directory. Writes ~/Library/LaunchAgents/com.cortados.vllm-mlx.plist and loads it with launchctl bootstrap gui/<uid>
+# Needs, before it is run: the venv the config names with vllm-mlx 0.6.0 in it, and the model directory. It copies the
+# prompt guard (integrations/vllm-mlx/cortados_vllm_mlx_guard.py) to <venv>/bin/cortados-vllm-mlx-guard.py and runs its
+# --check first: vllm-mlx must be the pinned 0.6.0 and the model must resolve to vllm-mlx's text route, or nothing is
+# installed (the LaunchAgent runs vllm-mlx through the guard, which refuses a prompt over the context;
+# docs/LOCAL-RESOURCES.md "The backend's prompt cap"). --dry-run runs the check but copies nothing.
+# Writes ~/Library/LaunchAgents/com.cortados.vllm-mlx.plist and loads it with launchctl bootstrap gui/<uid>
 # (booting out a previous copy first). Logs to ~/.cortados/vllm-mlx.log. It does NOT touch Ollama or the gate: the
 # switch (unload Ollama's 27B, set the gate's backend, restart the gate) is in docs/LOCAL-RESOURCES.md "MLX backend".
 # Test seams: CORTADOS_LAUNCHCTL (the launchctl binary), HOME.
@@ -58,16 +62,20 @@ RESOLVED="$("$PYTHON" -B -m cortados_router.local_backend --config "$CONFIG" --p
 BACKEND="$(printf '%s' "$RESOLVED" | "$PYTHON" -I -c 'import json,sys; print(json.load(sys.stdin)["backend"])')"
 [ "$BACKEND" = "vllm-mlx" ] || die "$CONFIG has backend \"$BACKEND\"; set it to \"vllm-mlx\" to install the MLX server"
 
-# The server binary and the model must be there before anything is scheduled (a LaunchAgent that cannot start would
-# restart every ThrottleInterval and fill the log).
-ARGV="$("$PYTHON" -B -m cortados_router.local_backend --config "$CONFIG" --argv)"
-BIN="$(printf '%s\n' "$ARGV" | sed -n 1p)"
-MODEL_DIR="$(printf '%s\n' "$ARGV" | sed -n 3p)"
-[ -x "$BIN" ] || die "no vllm-mlx at $BIN (pip install vllm-mlx into the venv the config names)"
+# The venv's python, the guard and the model must be there before anything is scheduled (a LaunchAgent that cannot
+# start would restart every ThrottleInterval and fill the log).
+PATHS="$("$PYTHON" -B -m cortados_router.local_backend --config "$CONFIG" --install-paths)"
+path_of() { printf '%s' "$PATHS" | "$PYTHON" -I -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
+VPY="$(path_of python)"; GUARD="$(path_of guard)"; GUARD_SRC="$(path_of guard_source)"; MODEL_DIR="$(path_of model)"
+[ -x "$VPY" ] || die "no python at $VPY (the venv the config names, with vllm-mlx 0.6.0 installed)"
+[ -f "$GUARD_SRC" ] || die "no guard source at $GUARD_SRC"
 [ -d "$MODEL_DIR" ] || die "no model directory at $MODEL_DIR (vllm_mlx.models.<model>.path in $CONFIG)"
+# The guard's own check, run from the source: vllm-mlx version and pinned files, and the model's route.
+"$VPY" -B "$GUARD_SRC" --check "$MODEL_DIR" || die "the prompt guard refused this venv or model; nothing was installed"
 PLIST_XML="$("$PYTHON" -B -m cortados_router.local_backend --config "$CONFIG" --plist "$LOG_DIR")"
 
 if [ "$DRY" = 1 ]; then
+  echo "# would copy $GUARD_SRC to $GUARD"
   echo "# $PLIST"
   printf '%s\n' "$PLIST_XML"
   echo "# then: $LAUNCHCTL bootout gui/$(id -u)/$LABEL; $LAUNCHCTL bootstrap gui/$(id -u) $PLIST"
@@ -75,6 +83,7 @@ if [ "$DRY" = 1 ]; then
 fi
 
 mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+install -m 0644 "$GUARD_SRC" "$GUARD.tmp" && mv "$GUARD.tmp" "$GUARD"
 printf '%s\n' "$PLIST_XML" > "$PLIST.tmp" && mv "$PLIST.tmp" "$PLIST"
 chmod 644 "$PLIST"
 "$LAUNCHCTL" bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true

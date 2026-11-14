@@ -18,7 +18,10 @@ Ollama has no authentication, so it listens on 127.0.0.1 only and this gate is t
     529 overloaded_error with Retry-After at once (never queued here); one that could not fit the budget even alone gets
     a non-retryable 413 request_too_large (TOO_LARGE_MESSAGE), which the provider routes elsewhere. On vllm-mlx a turn
     carrying non-text content (an image, a document) is refused non-retryably before admission (UNSUPPORTED_MESSAGE):
-    the node serves a text-only model. Running requests are never
+    the node serves a text-only model. A body the gate cannot accept (another model, a chat_template_kwargs key other
+    than enable_thinking, JSON nested too deeply) is a non-retryable 4xx (x-should-retry: false). The reservation is
+    capped at the context because vllm-mlx runs under a prompt guard that refuses longer prompts; its refusal becomes
+    the gate's never-fits 413 (local_backend.guard_refusal). Running requests are never
     stopped; a reservation is released however the request ends. The limit, in-flight count and reserved/free bytes
     are reported read-only as `cortados_gate` in GET /api/tags and in the switch status.
   * One more path is the gate's own, never forwarded: GET / POST /cortados/local-switch (SWITCH_PATH), the node's
@@ -522,6 +525,19 @@ class GateHandler(BaseHTTPRequestHandler):
     def _error(self, code: int, kind: str, message: str) -> None:
         self._send(code, json.dumps({"type": "error", "error": {"type": kind, "message": f"local gate: {message}"}}).encode())
 
+    def _refuse(self, code: int, kind: str, message: str) -> None:
+        """A refusal of the request itself (local_backend.Refusal: a bad body, another model, a disallowed template
+        kwarg, a body nested too deeply): the same body always gets the same answer, so x-should-retry: false."""
+        body = json.dumps({"type": "error", "error": {"type": kind, "message": f"local gate: {message}"}}).encode()
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("x-should-retry", "false")
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
     def _authorized(self) -> bool:
         auth = self.headers.get("authorization") or ""
         given = auth[7:].strip() if auth[:7].lower() == "bearer " else (self.headers.get("x-api-key") or "").strip()
@@ -601,12 +617,15 @@ class GateHandler(BaseHTTPRequestHandler):
                 return
             try:
                 body = local_backend.adapt_messages_body(self.server.backend, raw)
+                # a text-only model: refused before any admission (adapt_messages_body checked the body parses)
+                why = local_governor.non_text_content(json.loads(body)) \
+                    if self.server.backend["backend"] == "vllm-mlx" else None
             except local_backend.Refusal as exc:
-                return self._error(exc.status, exc.kind, str(exc))
-            if self.server.backend["backend"] == "vllm-mlx":     # a text-only model: refused before any admission
-                why = local_governor.non_text_content(json.loads(body))      # adapt_messages_body checked it parses
-                if why is not None:
-                    return self._unsupported(why)
+                return self._refuse(exc.status, exc.kind, str(exc))
+            except RecursionError:                 # the adapted body re-parsed deeper than the original
+                return self._refuse(400, "invalid_request_error", local_backend.TOO_DEEP)
+            if why is not None:
+                return self._unsupported(why)
         # Admission: hold LOCK_SH on the node lock from here until the response is fully relayed. A trainer holds
         # LOCK_EX for its whole run (studio_capacity.training_gate), so the kernel guarantees no request reaches
         # Ollama while training runs, and the trainer cannot start while this request is in flight.
@@ -668,14 +687,16 @@ class GateHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         self.close_connection = True
 
-    def _too_large(self, snap: dict) -> None:
+    def _too_large(self, snap: dict, guarded: str | None = None) -> None:
         """The never-fits answer: the request's reservation exceeds the whole budget beside the weights, so no retry
         can be admitted. 413 request_too_large, x-should-retry: false, no Retry-After, and the capacity report (its
-        fit_tokens says how much would fit). Nothing reached the backend."""
+        fit_tokens says how much would fit). Nothing reached the backend. `guarded`: the backend's prompt guard refused
+        the prompt instead (its exact token count + max_tokens is over the context); nothing was scheduled there."""
         cap = self.server.report(snap)
+        why = guarded if guarded is not None else \
+            f"{cap['reason']}; at most {cap['fit_tokens']} tokens of input + max_tokens fit"
         body = json.dumps({"type": "error", "error": {"type": "request_too_large", "message":
-                           f"{TOO_LARGE_MESSAGE} ({cap['reason']}; at most {cap['fit_tokens']} tokens of input + "
-                           "max_tokens fit)"}, GATE_KEY: cap}).encode()
+                           f"{TOO_LARGE_MESSAGE} ({why})"}, GATE_KEY: cap}).encode()
         self.send_response(413)
         self.send_header("content-type", "application/json")
         self.send_header("x-should-retry", "false")
@@ -793,6 +814,9 @@ class GateHandler(BaseHTTPRequestHandler):
                 if path == "/api/tags" and resp.status == 200:
                     return self._tags(data, backend, ctype)
                 if resp.status != 200 and backend != "ollama":
+                    guarded = local_backend.guard_refusal(resp.status, data)
+                    if guarded is not None:          # the backend's prompt guard: never fits, like the gate's own 413
+                        return self._too_large(self.server.admission.snapshot(), guarded)
                     return self._send(resp.status, local_backend.anthropic_error(resp.status, data, backend))
                 return self._send(resp.status, data, ctype)
             self.send_response(resp.status)
@@ -836,7 +860,7 @@ def _max_tokens(body: bytes | None):
     """The request's max_tokens for its reservation, or None (the governor then assumes default_max_tokens)."""
     try:
         data = json.loads(body) if body else None
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return data.get("max_tokens") if isinstance(data, dict) else None
 

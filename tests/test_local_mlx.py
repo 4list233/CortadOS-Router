@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import http.client
+import unicodedata
 import unittest
 import urllib.error
 import urllib.request
@@ -414,7 +415,7 @@ class ConfigTests(unittest.TestCase):
         self.example["vllm_mlx"]["models"]["qwen-27b-6bit"]["path"] = "/models/q6"
         c = local_backend.load(self.write(self.example))
         argv = local_backend.serve_argv(c)
-        self.assertEqual(argv[1:3], ["serve", "/models/q6"])
+        self.assertEqual(argv[5:7], ["serve", "/models/q6"])                 # after the guard's own arguments
         self.assertEqual(argv[argv.index("--max-num-seqs") + 1], "6")      # the 6-bit entry's own idle cap
         self.assertEqual(c["governor"]["weights_bytes"], int(22.4 * GIB))      # measured, no longer a placeholder
         self.assertEqual(c["governor"]["default_max_tokens"], 32768)          # vllm_mlx.serve.max_tokens
@@ -422,7 +423,8 @@ class ConfigTests(unittest.TestCase):
     def test_serve_argv_and_plist(self):
         c = local_backend.load(str(EXAMPLE))
         argv = local_backend.serve_argv(c)
-        self.assertTrue(argv[0].endswith("/venvs/mlx-bench/bin/vllm-mlx"))
+        self.assertTrue(argv[0].endswith("/venvs/mlx-bench/bin/python"))
+        self.assertTrue(argv[1].endswith("/venvs/mlx-bench/bin/cortados-vllm-mlx-guard.py"))    # the prompt guard
         for flag, value in (("--served-model-name", "Qwen27b_heretic:latest"), ("--host", "127.0.0.1"),
                             ("--port", "8000"), ("--max-num-seqs", "8"), ("--reasoning-parser", "qwen3")):
             self.assertEqual(argv[argv.index(flag) + 1], value, flag)
@@ -541,6 +543,36 @@ class AdaptTests(unittest.TestCase):
         self.assertEqual(cm.exception.status, 404)
         with self.assertRaises(local_backend.Refusal):
             local_backend.adapt_messages_body(MLX, b"not json")
+
+    def test_round4_template_kwargs_are_allowlisted(self):
+        # The review's repro: a replacement chat_template renders a 100k-token prompt from a 155-byte body.
+        evil = {**self.BODY, "chat_template_kwargs": {"chat_template": "{{ 'a!' * 50000 }}"}}
+        self.assertLess(len(json.dumps(evil)), 200)
+        for kwargs in ({"chat_template": "{{ 'a!' * 50000 }}"}, {"tools": [{"name": "x" * 99}]},
+                       {"enable_thinking": True, "add_generation_prompt": False}, {"enable_thinking": "yes"},
+                       {"enable_thinking": 1}, ["enable_thinking"], "x"):
+            with self.subTest(kwargs):
+                with self.assertRaises(local_backend.Refusal) as cm:
+                    adapt({**self.BODY, "chat_template_kwargs": kwargs})
+                self.assertEqual((cm.exception.status, cm.exception.kind), (400, "invalid_request_error"))
+        self.assertIn("chat_template is not allowed", str(self._refusal(evil)))
+        self.assertEqual(adapt({**self.BODY, "chat_template_kwargs": {"enable_thinking": False}})
+                         ["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual(adapt({**self.BODY, "chat_template_kwargs": {}})["chat_template_kwargs"], {})
+
+    def _refusal(self, body):
+        try:
+            adapt(body)
+        except local_backend.Refusal as exc:
+            return exc
+        self.fail("not refused")
+
+    def test_round4_deep_json_is_refused_not_raised(self):
+        deep = b'{"model": "' + TAG.encode() + b'", "max_tokens": 1, "messages": ' + b"[" * 100_000 \
+            + b"]" * 100_000 + b"}"
+        with self.assertRaises(local_backend.Refusal) as cm:
+            local_backend.adapt_messages_body(MLX, deep)
+        self.assertEqual((cm.exception.status, str(cm.exception)), (400, local_backend.TOO_DEEP))
 
     def test_ollama_bodies_pass_unchanged(self):
         raw = b'{"model": "x", "thinking": {"type": "disabled"}}'
@@ -1208,6 +1240,59 @@ class InputTokensTests(unittest.TestCase):
         self.assertEqual(local_governor._dumped_bytes(deep, 77), 78)
         self.assertLessEqual(local_governor._dumped_bytes(list(range(10 ** 6)), 100), 100 + 16)   # stopped early
 
+    def test_round4_nfc_widening_is_bounded_by_the_normalized_bytes(self):
+        # The review's case: U+FA6C (3 bytes) is U+242EE (4 bytes) after the Qwen tokenizer's NFC normalizer, so
+        # 20,000 of them are 60,000 UTF-8 bytes in the body and 80,000 bytes (up to 80,000 tokens) in the prompt.
+        text = "\ufa6c" * 20_000
+        self.assertEqual((utf8(text), utf8(unicodedata.normalize("NFC", text))), (60_000, 80_000))
+        for body in ({"model": TAG, "max_tokens": 1, "messages": [{"role": "user", "content": text}]},
+                     {"model": TAG, "max_tokens": 1, "system": text, "messages": []},
+                     {"model": TAG, "max_tokens": 1, "tools": [{"name": "T", "description": text}], "messages": []},
+                     {"model": TAG, "max_tokens": 1, "messages": [{"role": "assistant", "content": [
+                         {"type": "tool_use", "id": "t", "name": "E", "input": {text: text}}]}]}):
+            with self.subTest(next(k for k in ("messages", "system", "tools") if body.get(k))):
+                self.assertGreaterEqual(tokens_of(body), utf8(unicodedata.normalize("NFC", text)) * (
+                    2 if "input" in json.dumps(body) else 1))
+        # the widest single code point (U+1D160: 4 bytes, 12 after normalization), raw and \u-escaped in the body
+        notes = "\U0001d160" * 10_000
+        body = {"model": TAG, "max_tokens": 1, "messages": [{"role": "user", "content": notes}]}
+        self.assertGreaterEqual(tokens_of(body), utf8(unicodedata.normalize("NFC", notes)))
+        self.assertGreaterEqual(local_governor.input_tokens(json.dumps(body).encode()),
+                                utf8(unicodedata.normalize("NFC", notes)))
+        # a forced tool_choice writes the tool's name twice: both copies are counted
+        name = "\ufa6c" * 5_000
+        forced = {"model": TAG, "max_tokens": 1, "tools": [{"name": name}],
+                  "tool_choice": {"type": "tool", "name": name}, "messages": []}
+        self.assertGreaterEqual(local_governor.normalization_bytes(forced), 3 * 5_000)
+        self.assertEqual(local_governor.normalization_bytes({"messages": [{"content": "ascii, 中文, →"}]}), 0)
+        self.assertEqual(local_governor.normalization_bytes({"messages": [{"content": "é"}]}), 1)    # e + U+0301
+
+    def test_nfd_is_never_shorter_than_nfc_over_the_whole_unicode_table(self):
+        # The lemma the bound rests on: canonical composition replaces a starter and a combining character by one
+        # code point no longer in UTF-8 than the two, so NFC(x) has at most NFD(x)'s bytes, for any x.
+        checked = 0
+        for cp in range(0x110000):
+            d = unicodedata.decomposition(chr(cp))
+            if not d or d.startswith("<"):
+                continue
+            parts = "".join(chr(int(h, 16)) for h in d.split())
+            if len(parts) == 2:
+                self.assertLessEqual(utf8(chr(cp)), utf8(parts), hex(cp))
+                checked += 1
+        self.assertGreater(checked, 1000)
+        self.assertEqual(utf8("\uac01"), 3)              # Hangul LVT: 3 bytes from three 3-byte jamo
+        for s in ("\ufa6c", "\U0001d160", "\u1f82", "e\u0301", "\u0344\u0301", "\uac00\u11a8", "\u0390"):
+            self.assertLessEqual(utf8(unicodedata.normalize("NFC", s)), utf8(unicodedata.normalize("NFD", s)))
+            self.assertGreaterEqual(local_governor._normalized_excess(s),
+                                    utf8(unicodedata.normalize("NFC", s)) - utf8(s))
+
+    def test_code_points_this_python_does_not_know_count_their_widest_decomposition(self):
+        unknown = "\U000e0080"                            # unassigned in every Unicode version so far
+        self.assertEqual(unicodedata.category(unknown), "Cn")
+        self.assertEqual(local_governor._normalized_excess(unknown * 10), 10 * local_governor.UNASSIGNED_EXCESS)
+        big = "\u00e9x" * 5_000_000                        # 10M characters: measured in chunks, stopped near the cap
+        self.assertLessEqual(local_governor._normalized_excess(big, 1000), 1000 + 2 * local_governor.NORMALIZE_CHUNK)
+
     def test_a_body_that_is_not_an_object_is_bounded_by_its_length(self):
         fixed = local_governor.TEMPLATE_TOKENS_FIXED
         self.assertEqual(local_governor.input_tokens(b"not json"), 8 + fixed)
@@ -1387,6 +1472,48 @@ class MlxGateBoundTests(MlxGateHarness):
         self.assertEqual(FakeVllm.seen, [])                              # never sent
         self.assertEqual((self.gate.admission.inflight, self.gate.admission.reserved), (0, 0))
         self.assertEqual(local_lane.GATE_UNSUPPORTED, local_gate.UNSUPPORTED_MESSAGE)
+
+    def test_round4_a_prompt_over_the_context_reserves_the_whole_context_and_the_guard_refusal_never_fits(self):
+        # The review's repro: "a!" * 100000 with max_tokens 1 is a 200k-token prompt. The gate can reserve no more
+        # than the context (the backend holds no more), and the backend's prompt guard refuses the prompt before it is
+        # scheduled; the gate answers that as its own never-fits 413 so the provider routes the turn elsewhere.
+        body = {"model": TAG, "max_tokens": 1, "messages": [{"role": "user", "content": "a!" * 100000}]}
+        self.assertEqual(local_governor.input_tokens(json.dumps(body).encode(), CONTEXT), CONTEXT)
+        t, results = self.held(body)
+        self.assertEqual(self.gate.admission.reserved, local_governor.tokens_bytes(self.governor.cfg, CONTEXT))
+        FakeVllm.error = (413, {"detail": f"{local_backend.GUARD_REFUSAL} (prompt 200017 tokens + max_tokens 1 = "
+                                          "200018, over the 131072-token context)"})
+        FakeVllm.hold.set()
+        t.join(10)
+        code, raw, headers = results[0]
+        h = {k.lower(): v for k, v in headers.items()}
+        data = json.loads(raw)
+        self.assertEqual((code, h.get("x-should-retry"), data["error"]["type"]), (413, "false", "request_too_large"))
+        self.assertTrue(data["error"]["message"].startswith(local_lane.GATE_TOO_LARGE))
+        self.assertIn("prompt 200017 tokens", data["error"]["message"])
+        self.assertNotIn("retry-after", h)
+        self.assertTrue(self.free())
+
+    def test_round4_a_replacement_chat_template_is_refused_and_reaches_nothing(self):
+        body = {**MSG, "chat_template_kwargs": {"chat_template": "{{ 'a!' * 50000 }}"}}
+        code, raw, headers = self.call_raw(json.dumps(body).encode())
+        h = {k.lower(): v for k, v in headers.items()}
+        self.assertEqual((code, h.get("x-should-retry")), (400, "false"))
+        self.assertEqual(json.loads(raw)["error"]["type"], "invalid_request_error")
+        self.assertIn("chat_template is not allowed", json.loads(raw)["error"]["message"])
+        self.assertEqual(turns(), [])
+        self.assertEqual((self.gate.admission.inflight, self.gate.admission.reserved), (0, 0))
+
+    def test_round4_deep_json_is_a_structured_400_not_a_dropped_connection(self):
+        deep = b'{"model": "' + TAG.encode() + b'", "max_tokens": 1, "messages": ' + b"[" * 100_000 \
+            + b"]" * 100_000 + b"}"
+        code, raw, headers = self.call_raw(deep)
+        h = {k.lower(): v for k, v in headers.items()}
+        self.assertEqual((code, h.get("x-should-retry")), (400, "false"))
+        self.assertEqual(json.loads(raw)["error"], {"type": "invalid_request_error",
+                                                    "message": f"local gate: {local_backend.TOO_DEEP}"})
+        self.assertEqual(turns(), [])
+        self.assertEqual(self.call("/v1/messages", MSG)[0], 200)            # the gate still serves
 
     def test_an_ollama_node_does_not_refuse_images(self):
         self.gate.backend = {"backend": "ollama", "served_model": None, "governor": None}

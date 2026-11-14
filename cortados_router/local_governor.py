@@ -22,11 +22,14 @@ BYTES (token-aware, `request_bytes()`): each admitted request reserves the memor
   tokens   = min(input tokens + max_tokens, context_tokens)
   reserved = tokens * kv_bytes_per_token + per_seq_state_bytes + prefill_margin_bytes
 input tokens (`input_tokens()`) are an upper bound, never an estimate and never a backend count:
-  bytes of the request body exactly as received + template_tokens() + reserialized_bytes(), capped at context_tokens.
-  Every character the model sees from the body costs at least one byte there and a byte-level BPE token covers at
-  least one byte, so the bound holds whatever the text (token-dense `a!a!...` included); the template allowance and
-  reserialized_bytes cover the only text that is not a copy from the body (docs/LOCAL-RESOURCES.md "The input bound").
-  Code-heavy turns run 3.5-4.5 body bytes per token, so long turns reserve the whole context.
+  bytes of the request body exactly as received + template_tokens() + reserialized_bytes() + normalization_bytes(),
+  capped at context_tokens. Every character the model sees from the body costs at least one byte there and a
+  byte-level BPE token covers at least one byte of the NFC-normalized text, so the bound holds whatever the text
+  (token-dense `a!a!...` included); the template allowance and reserialized_bytes cover the only text that is not a
+  copy from the body, normalization_bytes what the tokenizer's NFC normalizer writes wider (docs/LOCAL-RESOURCES.md
+  "The input bound"). Code-heavy turns run 3.5-4.5 body bytes per token, so long turns reserve the whole context.
+  The cap is enforced by the backend itself: vllm-mlx runs under integrations/vllm-mlx/cortados_vllm_mlx_guard.py,
+  which refuses a prompt whose exact token count + max_tokens exceeds context_tokens before it is scheduled.
 and a request is admitted only while the reservations in flight plus its own fit in
   memory_budget_bytes - weights_bytes.
 The count slot and the bytes are taken together (Admission.try_acquire). A request a text-only model cannot read
@@ -51,6 +54,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from typing import Any, Callable
 
 GIB = 2 ** 30
@@ -131,6 +135,17 @@ TEMPLATE_TOKENS_PER_TOOL = 64
 # (api/tool_calling.build_json_system_prompt, ~480 bytes at its longest) and the forced tool_choice one (server, ~190
 # bytes besides the tool's name). Rounded up like the template allowance.
 INJECTED_TEXT_BYTES = 1024
+# Unicode normalization. The deployed tokenizer's family (the public Qwen/Qwen3.5-27B tokenizer.json, and Qwen3's)
+# normalizes with NFC before its byte-level BPE, and NFC can widen text: U+FA6C (3 bytes) becomes U+242EE (4 bytes),
+# U+1D160 (4 bytes) three code points (12 bytes). The bound measures each body string's NFD form instead, which is
+# never shorter than NFC in UTF-8 (a canonical composition replaces two code points by one no longer than the two:
+# checked over the whole Unicode table by the tests) and, unlike NFC, is per character, so strings measured apart add
+# up to the prompt they are rendered into. A code point this Python's Unicode table does not know (unassigned here,
+# perhaps assigned in the tokenizer's newer table) counts UNASSIGNED_EXCESS more bytes: at most 4 code points of 4
+# bytes after decomposition.
+UNASSIGNED_EXCESS = 16
+NORMALIZE_CHUNK = 65536                    # characters measured at a time, so a 32 MiB string stops near the cap
+_UNASSIGNED: re.Pattern | None = None
 PRESSURES = ("normal", "warn", "critical")
 PRESSURE_LEVELS = {1: "normal", 2: "warn", 4: "critical"}
 SIGNAL_TIMEOUT_S = 2.0                     # each signal command; ioreg and sysctl answer in milliseconds
@@ -310,13 +325,73 @@ def reserialized_bytes(body: dict[str, Any], left: int = sys.maxsize) -> int:
     return total
 
 
+def _unassigned() -> re.Pattern:
+    """A pattern matching the non-ASCII code points this Python's Unicode table leaves unassigned (built once)."""
+    global _UNASSIGNED
+    if _UNASSIGNED is None:
+        ranges, start = [], None
+        for cp in range(0x80, 0x110001):
+            gap = cp <= 0x10FFFF and unicodedata.category(chr(cp)) == "Cn"
+            if gap and start is None:
+                start = cp
+            elif not gap and start is not None:
+                ranges.append(f"{re.escape(chr(start))}-{re.escape(chr(cp - 1))}")
+                start = None
+        _UNASSIGNED = re.compile("[" + "".join(ranges) + "]")
+    return _UNASSIGNED
+
+
+def _utf8(s: str) -> int:
+    return len(s.encode("utf-8", "surrogatepass"))      # a lone surrogate (a JSON \ud800 escape) is 3 bytes
+
+
+def _normalized_excess(s: str, left: int = sys.maxsize) -> int:
+    """How many more UTF-8 bytes the tokenizer's normalizer can make of `s` than `s` has: NFD's bytes over the raw
+    bytes (never negative), plus UNASSIGNED_EXCESS per code point this Python cannot decompose. ASCII is 0. Measured
+    in chunks (NFD is per character, so chunks add up) and stopped once past `left`."""
+    if s.isascii():
+        return 0
+    n = 0
+    for i in range(0, len(s), NORMALIZE_CHUNK):
+        part = s[i:i + NORMALIZE_CHUNK]
+        if part.isascii():
+            continue
+        if not unicodedata.is_normalized("NFD", part):
+            n += max(0, _utf8(unicodedata.normalize("NFD", part)) - _utf8(part))
+        n += UNASSIGNED_EXCESS * len(_unassigned().findall(part))
+        if n > left:
+            break
+    return n
+
+
+def normalization_bytes(body: dict[str, Any], left: int = sys.maxsize) -> int:
+    """The bytes the tokenizer's Unicode normalization (NFC) can add to the prompt rendered from `body`, bounded from
+    above (docs/LOCAL-RESOURCES.md "The input bound"): every string in the body, keys included, counted once for each
+    time vllm-mlx 0.6.0 can write it raw into the prompt. That is once, except a forced tool_choice, whose tool name its
+    instruction line writes twice, so tool_choice is counted again. ASCII adds nothing, and so does text vllm-mlx
+    writes ASCII-escaped (json.dumps). Walked without recursion; stops once past `left`."""
+    total = 0
+    stack: list = [body, body.get("tool_choice")]
+    while stack and total <= left:
+        v = stack.pop()
+        if isinstance(v, str):
+            total += _normalized_excess(v, left - total)
+        elif isinstance(v, dict):
+            stack.extend(v.keys())
+            stack.extend(v.values())
+        elif isinstance(v, list):
+            stack.extend(v)
+    return total
+
+
 def input_tokens(raw: bytes, cap: int | None = None) -> int:
     """An upper bound on a turn's input tokens, never an estimate (docs/LOCAL-RESOURCES.md "The input bound"):
-        len(raw) + template_tokens(body) + reserialized_bytes(body)
+        len(raw) + template_tokens(body) + reserialized_bytes(body) + normalization_bytes(body)
     capped at `cap` (the model's context; None: uncapped). `raw` is the request body EXACTLY as the client sent it:
     every character the model sees from the body costs at least one byte there, a byte-level BPE token covers at least
-    one byte, the template allowance covers the template's own text and reserialized_bytes what vllm-mlx writes wider
-    than it came. A body that is not a JSON object is bounded by its length plus the fixed allowance."""
+    one byte of the normalized text, the template allowance covers the template's own text, reserialized_bytes what
+    vllm-mlx writes wider than it came and normalization_bytes what NFC writes wider. A body that is not a JSON object
+    is bounded by its length plus the fixed allowance (the gate refuses it before this is asked)."""
     limit = sys.maxsize if cap is None else max(0, int(cap))
     raw = bytes(raw)
     try:
@@ -328,6 +403,8 @@ def input_tokens(raw: bytes, cap: int | None = None) -> int:
     total = len(raw) + template_tokens(body)
     if total < limit:
         total += reserialized_bytes(body, limit - total)
+    if total < limit:
+        total += normalization_bytes(body, limit - total)
     return min(limit, total)
 
 
