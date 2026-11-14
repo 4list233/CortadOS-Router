@@ -24,6 +24,7 @@ from pathlib import Path
 
 from cortados_router.provider import codex_bridge, responses_wire, routing, server
 from cortados_router.provider.server import ProviderServer, Registry
+from tests.provider_fakes import setUpModule, tearDownModule  # noqa: F401  (FAKE_* reach the fake CLIs, #106)
 
 FIXTURES = Path(__file__).with_name("fixtures")
 FAKE_CODEX = FIXTURES / "fake_codex_app_server.py"

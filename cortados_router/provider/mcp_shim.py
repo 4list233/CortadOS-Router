@@ -4,7 +4,8 @@ Spawned by the CLI, one per bridge session. A `tools/call` is POSTed to the endp
 until the client has run the tool and sent the result back. Stdlib only, no package imports: the CLI runs this
 file directly.
 
-Usage: mcp_shim.py <gateway url> <session id> <tools.json>; the endpoint token comes in CORTADOS_PROVIDER_TOKEN.
+Usage: mcp_shim.py <gateway url> <session id> <tools.json>; the session's bridge-only credential comes in
+CORTADOS_PROVIDER_BRIDGE_TOKEN (minted per session by bridge.BridgeSession; never the endpoint's owner token).
 
 The invariant: the CLI must never generate its OWN synthetic tool error (its MCP tool timeout) and continue a paid turn
 unattended. A real tool result written by this shim is never a violation, even one written close to the deadline.
@@ -354,7 +355,7 @@ def _read_stdin(stream, inbox, dispatcher, clock=time.monotonic):
 
 def main(argv):
     gateway, session, tools_path = argv[1], argv[2], argv[3]
-    token = os.environ.get("CORTADOS_PROVIDER_TOKEN", "")
+    token = os.environ.get("CORTADOS_PROVIDER_BRIDGE_TOKEN", "")
     with open(tools_path) as f:
         tools = [{"name": t["name"], "description": t.get("description", ""),
                   "inputSchema": t.get("input_schema") or {"type": "object"}} for t in json.load(f)]

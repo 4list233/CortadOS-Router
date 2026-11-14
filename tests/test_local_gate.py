@@ -18,6 +18,7 @@ from unittest.mock import patch
 from cortados_router import local_gate, studio_capacity
 from cortados_router.provider import local_lane
 from tests.test_provider_local import FakeOllama, LocalHarness, TAG, write_config
+from tests.provider_fakes import setUpModule, tearDownModule  # noqa: F401  (FAKE_* reach the fake CLIs, #106)
 
 TOKEN = "a" * 40
 

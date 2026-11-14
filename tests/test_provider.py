@@ -26,8 +26,9 @@ from unittest import mock
 from cortados_router.provider import anthropic_wire as wire, bridge, mcp_shim
 from cortados_router.provider.bridge import BridgeError, BridgeSession
 from cortados_router import core, scarcity
-from cortados_router.provider import search_lane, server
+from cortados_router.provider import local_switch, search_lane, server
 from cortados_router.provider.server import Handler, ProviderServer, Registry
+from tests.provider_fakes import setUpModule, tearDownModule  # noqa: F401  (FAKE_* reach the fake CLIs, #106)
 
 FAKE = Path(__file__).with_name("fixtures") / "fake_claude_cli.py"
 TOKEN = "test-token"
@@ -238,7 +239,7 @@ from cortados_router.provider import bridge, timeouts
 with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
     with mock.patch("threading.Thread.start"):
         popen = mock.Mock()
-        s = bridge.BridgeSession(gateway_url="", token="t", system="", tools=[{"name":"Read"}],
+        s = bridge.BridgeSession(gateway_url="", system="", tools=[{"name":"Read"}],
                                  popen=popen)
         cfg = json.loads((s.dir / "mcp.json").read_text())["mcpServers"]["bridge"]["env"]
         cli_seconds = int(popen.call_args.kwargs["env"]["MCP_TOOL_TIMEOUT"]) / 1000
@@ -730,6 +731,100 @@ class EndpointHarness(unittest.TestCase):
             return e.code
 
 
+class BridgeCredentialTests(EndpointHarness):
+    """#106 review: the MCP shim holds a per-session bridge-only credential, never the owner token. It opens
+    POST /bridge/call for its own session only and is revoked when the session leaves the registry or closes."""
+
+    TOOLS = [{"name": "Read", "description": "read", "input_schema": {"type": "object"}}]
+
+    def session(self, publish=True):
+        popen = mock.Mock()
+        with mock.patch.object(BridgeSession, "_read_stdout"):
+            s = BridgeSession(system="", tools=self.TOOLS, gateway_url=self.url, claude_bin="claude",
+                              scratch_root=self.scratch, popen=popen)
+        s.wait_result = mock.Mock(return_value={"content": [{"type": "text", "text": "ok"}]})
+        if publish:
+            self.reg.sessions[s.id] = s
+        return s, popen
+
+    def call(self, token, session_id, method="POST", path="/bridge/call"):
+        data = json.dumps({"session": session_id, "tool_use_id": "t"}).encode() if method == "POST" else None
+        req = urllib.request.Request(self.url + path, data=data, method=method,
+                                     headers={"content-type": "application/json", "x-cortados-token": token})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return e.code, None
+
+    def test_mcp_json_argv_and_env_hold_no_owner_token(self):
+        s, popen = self.session()
+        raw = (s.dir / "mcp.json").read_text()
+        self.assertNotIn(TOKEN, raw)
+        env = json.loads(raw)["mcpServers"][bridge.BRIDGE_SERVER]["env"]
+        self.assertNotIn("CORTADOS_PROVIDER_TOKEN", env)
+        self.assertEqual(env["CORTADOS_PROVIDER_BRIDGE_TOKEN"], s.bridge_token)
+        self.assertGreaterEqual(len(s.bridge_token), 43)        # token_urlsafe(32)
+        self.assertNotIn(TOKEN, json.dumps(popen.call_args.args))
+        self.assertNotIn(TOKEN, json.dumps(popen.call_args.kwargs["env"]))
+        other, _ = self.session(publish=False)
+        self.assertNotEqual(other.bridge_token, s.bridge_token)  # minted per session
+        other.close()
+
+    def test_bridge_token_works_for_its_own_session_only(self):
+        s, _ = self.session()
+        t, _ = self.session()
+        with self.assertLogs(level="DEBUG") as logs:
+            code, body = self.call(s.bridge_token, s.id)
+            self.assertEqual(code, 200)
+            self.assertEqual(body["result"]["content"][0]["text"], "ok")
+            self.assertEqual(self.call(s.bridge_token, t.id)[0], 401)          # another session's id
+            self.assertEqual(self.call(s.bridge_token, "no-such-session")[0], 401)
+            self.assertEqual(self.call("not-a-bridge-token", s.id)[0], 401)
+            server.logger.debug("marker")
+        self.assertFalse(any(s.bridge_token in line for line in logs.output), "the credential is never logged")
+        t.wait_result.assert_not_called()
+
+    def test_bridge_token_is_refused_on_every_other_endpoint(self):
+        s, _ = self.session()
+        for path in ("/v1/cortados/usage", "/v1/cortados/tasks", "/v1/cortados/office", "/v1/cortados/live",
+                     "/v1/models", "/resources", "/v1/cortados/runs/abcdefgh12"):
+            self.assertEqual(self.call(s.bridge_token, s.id, method="GET", path=path)[0], 401, path)
+        for path in ("/v1/messages", "/v1/responses", "/v1/messages/count_tokens", "/v1/cortados/office/heartbeat",
+                     "/v1/cortados/live/heartbeat", "/nope"):
+            self.assertEqual(self.call(s.bridge_token, s.id, path=path)[0], 401, path)
+        s.wait_result.assert_not_called()
+
+    def test_bridge_token_is_refused_on_local_switch_and_dashboard_session_endpoints(self):
+        # Merged from main alongside #106: the local switch (owner token or dashboard session) and the dashboard
+        # logout (session cookie) never accept a session's bridge-only credential.
+        s, _ = self.session()
+        with mock.patch.object(self.reg.dashboard, "session", wraps=self.reg.dashboard.session) as dash:
+            self.assertEqual(self.call(s.bridge_token, s.id, method="GET", path=local_switch.VIEW_PATH)[0], 401)
+            self.assertEqual(self.call(s.bridge_token, s.id, path=local_switch.SWITCH_PATH)[0], 401)
+            self.assertEqual(self.call(s.bridge_token, s.id, path=server.LOGOUT_PATH)[0], 401)
+        dash.assert_not_called()          # a request carrying a token is never judged on a cookie
+        s.wait_result.assert_not_called()
+
+    def test_bridge_token_is_revoked_when_the_session_is_retired_or_closed(self):
+        s, _ = self.session()
+        token = s.bridge_token
+        self.assertEqual(self.call(token, s.id)[0], 200)
+        self.reg.drop(s, "retired")
+        self.assertIsNone(s.bridge_token)
+        self.assertEqual(self.call(token, s.id)[0], 401)
+        # Closed while still listed (a teardown in progress): refused too.
+        u, _ = self.session()
+        token = u.bridge_token
+        u.close()
+        self.assertEqual(self.call(token, u.id)[0], 401)
+        self.reg.sessions.pop(u.id, None)
+
+    def test_owner_token_still_opens_bridge_call(self):
+        s, _ = self.session()
+        self.assertEqual(self.call(TOKEN, s.id)[0], 200)
+
+
 class EndpointTests(EndpointHarness):
     def test_shim_kills_owner_when_call_and_abort_transports_both_fail(self):
         failures = [urllib.error.URLError("call failed"), urllib.error.URLError("abort failed")]
@@ -977,13 +1072,15 @@ class EndpointTests(EndpointHarness):
         self.assertFalse([k for k in server.claude_env(None) if k.startswith("ANTHROPIC_")])
 
     def test_claude_env_strips_every_anthropic_variable_by_prefix(self):
+        # #84, now by the #106 allowlist: no ANTHROPIC_* and no unlisted variable passes; the default login's token does
         from cortados_router.provider import bridge
         ambient = {k: "" for k in os.environ if k.startswith("ANTHROPIC_")}   # the developer's shell, cleared
         with mock.patch.dict(os.environ, {**ambient, "ANTHROPIC_CUSTOM_HEADERS": "x-cortados-run-id: r1",
                                           "ANTHROPIC_MODEL": "m", "CLAUDE_CODE_OAUTH_TOKEN": "tok", "KEEP_ME": "1"}):
             env = bridge.claude_env(None)
             self.assertFalse([k for k in env if k.startswith("ANTHROPIC_")])
-            self.assertEqual((env["KEEP_ME"], env["CLAUDE_CODE_OAUTH_TOKEN"]), ("1", "tok"))
+            self.assertNotIn("KEEP_ME", env)
+            self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "tok")
             env = bridge.claude_env("/cfg/b")
             self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/cfg/b")
             self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
@@ -3183,7 +3280,7 @@ class StartFailureTests(unittest.TestCase):
         # connection without a response and leave the scratch dir and the stderr handle behind.
         scratch = tempfile.mkdtemp()
         with self.assertRaisesRegex(BridgeError, "cannot start .*no-such-claude"):
-            BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
+            BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9",
                           claude_bin=os.path.join(scratch, "no-such-claude"), scratch_root=scratch)
         self.assertEqual(os.listdir(scratch), [])
 
@@ -3199,7 +3296,7 @@ class OwnerDeathTests(unittest.TestCase):
         # The CLI dies (as when the shim SIGKILLs it on expiry) and the shim's abort never arrives: the provider's
         # own exit handling must remove the conversation terminally and end its backend.
         reg = Registry(gateway_url="", token=TOKEN, claude_bin=[sys.executable, str(FAKE)])
-        s = BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
+        s = BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9",
                           claude_bin=[sys.executable, "-c", "import time; time.sleep(0.3)"])
         closed, done = [], threading.Event()
         real_close = s.close
@@ -3240,7 +3337,7 @@ class OwnerDeathTests(unittest.TestCase):
 
     def test_exit_after_close_is_not_treated_as_an_unexpected_exit(self):
         reg = Registry(gateway_url="", token=TOKEN, claude_bin=[sys.executable, str(FAKE)])
-        s = BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
+        s = BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9",
                           claude_bin=[sys.executable, str(FAKE)])
         calls = []
         s.set_exit_handler(lambda sess: calls.append(sess))
@@ -3350,7 +3447,7 @@ class StalledCliTests(unittest.TestCase):
     def test_a_cli_that_stops_reading_input_is_killed_at_the_deadline(self):
         os.environ["FAKE_CLAUDE_STALL"] = "1"
         try:
-            s = BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
+            s = BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9",
                               claude_bin=[sys.executable, str(FAKE)])
         finally:
             os.environ.pop("FAKE_CLAUDE_STALL")

@@ -715,7 +715,8 @@ def api_reveal_suffix() -> str | None:
 
 
 def _claude_session(reg: "Registry", *, account: str | None = None, config_dir: str | None = None, **kw) -> BridgeSession:
-    return BridgeSession(gateway_url=reg.gateway_url, token=reg.token, claude_bin=reg.claude_bin,
+    # No owner token: the session mints its own bridge-only credential for its MCP shim (BridgeSession.bridge_token).
+    return BridgeSession(gateway_url=reg.gateway_url, claude_bin=reg.claude_bin,
                          config_dir=config_dir, **kw)
 
 
@@ -1400,6 +1401,21 @@ class Registry:
         with self._lock:
             return self.sessions.get(session_id)
 
+    def bridge_session(self, credential: str):
+        """The live conversation whose bridge-only credential (BridgeSession.bridge_token, held by its MCP shim) is
+        `credential`, or None. Only sessions in the registry match, so a dropped, retired, exited or closed session's
+        credential is refused from the moment it leaves. Every candidate is compared in constant time."""
+        if not credential:
+            return None
+        given, found = credential.encode(), None
+        with self._lock:
+            candidates = list(self.sessions.values())
+        for s in candidates:
+            t = getattr(s, "bridge_token", None)
+            if isinstance(t, str) and t and hmac.compare_digest(given, t.encode()):
+                found = s
+        return found
+
     def live_conversations(self) -> list[dict[str, Any]]:
         """Every conversation this endpoint holds open, as metadata for the live view (provider/live.py): its Office key
         (the board's join key), a digest of its id (the id itself is never published), the route's provider, lane and
@@ -1881,6 +1897,11 @@ class Handler(BaseHTTPRequestHandler):
         _REFUSAL_REASONS). Bookkeeping only: it never raises into the response."""
         try:
             where = endpoint_id(self.path)
+            bridged = getattr(self, "_bridge", None)
+            if bridged is not None:
+                # A session's MCP shim (bridge-only credential): logged by its conversation, never recorded.
+                logger.warning("bridge %s: %s %s refused with %s %s", str(bridged.id)[:8], self.command, where, code, kind)
+                return
             client = getattr(self, "_scoped", None)
             if client is not None:
                 # A scoped client: named in the log, never recorded (its token cannot write run records).
@@ -1907,7 +1928,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------ routes
     def _unsupported_method(self):
-        self._authed = False
+        self._authed, self._bridge = False, None
         if not self._scope_gate(self.command):
             # Preserve BaseHTTPRequestHandler's unsupported-method response for owner/unknown credentials.
             self.send_error(501, "Unsupported method (%r)" % self.command)
@@ -1920,7 +1941,7 @@ class Handler(BaseHTTPRequestHandler):
         raise AttributeError(name)
 
     def do_GET(self):
-        self._authed = False
+        self._authed, self._bridge = False, None
         if self._scope_gate("GET"):
             return
         if self.path.split("?")[0] == clients.OFFICE_PATH:
@@ -2034,7 +2055,7 @@ class Handler(BaseHTTPRequestHandler):
         self._error(404, "not_found_error", self.path)
 
     def do_POST(self):
-        self._authed = False
+        self._authed, self._bridge = False, None
         self._office_tags = {}
         path = self.path.split("?")[0]
         if self._scope_gate("POST"):
@@ -2045,6 +2066,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._dashboard_login()
         if path == LOGOUT_PATH:
             return self._dashboard_logout()
+        if path == "/bridge/call":
+            return self._bridge_post()
         # Every error on a wire's path is in that wire's shape, the 401 and the unreadable body included: Codex prints
         # the Responses error body verbatim and would show an Anthropic envelope as noise.
         if path == local_switch.SWITCH_PATH:
@@ -2083,8 +2106,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/messages/count_tokens":
             # Estimate only (chars / 4): the CLI behind cortados counts its own tokens and exposes no counter.
             return self._json(200, {"input_tokens": len(json.dumps(body)) // 4})
-        if path == "/bridge/call":
-            return self._bridge_call(body)
         self._error(404, "not_found_error", path)
 
     def _live_heartbeat(self) -> None:
@@ -2146,6 +2167,27 @@ class Handler(BaseHTTPRequestHandler):
             logger.warning("local switch failed: %s", type(exc).__name__)
             return self._error(500, "api_error", "cortados: local switch failed (see provider log)")
         return self._json(200, row, headers=VIEW_HEADERS)
+
+    def _bridge_post(self) -> None:
+        """POST /bridge/call: the owner token, or a session's bridge-only credential (BridgeSession.bridge_token, the
+        one its MCP shim holds), which opens this endpoint for that session only. That credential is refused on every
+        other endpoint (_authorized checks the owner token alone) and once its session has left the registry."""
+        bound = None
+        if not self._authorized():
+            bound = self.server.registry.bridge_session(self._credential())
+            if bound is None:
+                return self._error(401, "authentication_error", "bad or missing token")
+            self._bridge = bound
+        try:
+            body = self._body()
+        except json.JSONDecodeError:
+            return self._error(400, "invalid_request_error", "body is not JSON", reason="body is not JSON")
+        except ValueError as exc:                       # JSON, but not an object
+            return self._error(400, "invalid_request_error", str(exc))
+        if bound is not None and body.get("session") != bound.id:
+            # Another session's credential: the same answer as a bad token, so it reveals nothing about that session.
+            return self._error(401, "authentication_error", "bad or missing token")
+        return self._bridge_call(body)
 
     def _bridge_call(self, body: dict[str, Any]) -> None:
         s = self.server.registry.get(body.get("session", ""))

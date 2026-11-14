@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from cortados_router import usage_ledger
+from tests.provider_fakes import setUpModule, tearDownModule  # noqa: F401  (FAKE_* reach the fake CLIs, #106)
 
 
 def _unitcost(home: str):
