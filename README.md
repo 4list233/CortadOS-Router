@@ -906,7 +906,7 @@ Benchmark scores in `tables/benchmarks/scores*.csv` are derived from public sour
 
 Open `http://<provider>:8432/dashboard` in a browser on the tailnet to see it (the page opens on its **Live** tab, described under "Live view" below; this view is its **Usage** tab): one self-contained page (no external assets, served with `Cache-Control: no-store`, `nosniff` and a CSP whose `script-src` is only the sha256 of its one inline script) that asks for the provider token once, keeps it in the tab's sessionStorage only (in page memory, with a notice, when storage is unavailable), and every 30 s fetches `/v1/cortados/usage` with a Bearer header. It shows the view's `errors` first (every failed or absent source, e.g. `scarcity: OSError` when scarcity.json is missing, counted in the header and repeated where the empty section would be, so a missing source never reads as "no usage"), then a card per lane with its % left (stale readings greyed with their age, per-pool headroom, shared pools named, the lane's `error`), routed calls per lane/model today and over 7 days, the top S1 bands, ledger turns and tokens per lane/model, refusals by reason, child tasks by client/status/event, bot-gateway calls by client/tool/outcome, S1 health, HTTP status and latency (or its reason when down), a card per machine (CPU/GPU busy, memory, load, headroom, resident Ollama models, unavailable fields and sampler errors, sample age) and the notes. Capped lists say so; a failed poll greys the last good view and names the failure in red. A 401 forgets the token and asks again.
 
-`GET /v1/cortados/tasks` (same token, 401 otherwise; built by `cortados_router/provider/tasks.py`) feeds the page's **Tasks** section: the latest 200 routing decisions from `router.db` (`ORDER BY ts DESC` over the `routes(ts)` index, one look-ahead row sets `truncated`; no `COUNT(*)`, no `core._db_lock`, the dashboard's read-only deadline-limited connection), each as metadata only — `task_id`, `ts`, `session_id` (the router's conversation id, not an Office tag), `lane`, `model`, `actual_model`, `band`, `degraded`, `elapsed_ms` (the recorded `turn_ms`), `request_chars`/`response_chars` (recorded sizes), `routing_kind` (`routed` / `pinned` / `unselected`) and `s1_reason`, a fixed-vocabulary summary of the recorded band, the typed S1 answers (`steps=…, work_kind=…, outward=…`) and the hard rules by category (`cheapest qualifying route`, `escalated difficulty floor`, …; a rule's text is never published, since escalation reasons and fit failures can embed user text). The `request`, `context`, `task_context`, `engine_error` and `features` columns are never read. Per-task **tokens are not recorded** (`usage.db` counts tokens per backend turn with no `turn_id` to join on): every task carries `tokens: null, tokens_status: "not recorded"`, no estimate. `sessions[]` gives, per recorded session within that window, `decisions`, `routed`, `pinned`, `unselected` and `routed_pct` = 100 × routed ÷ decisions (pins counted separately, degraded fallbacks counted as routed; the definition is in `percentage_definition` and printed on the page); `totals` is the same over the whole window and `unassigned_decisions` counts rows with no session id (never pooled into an invented session). Identifiers are validated with the Office view's rules (an id or model name holding an address or foreign characters is `null`). A missing or unreadable database is an `errors[]` entry (`router.db: absent` / the sqlite exception class), never an empty success; the page shows a failed tasks poll in red inside its section and leaves the usage view current.
+`GET /v1/cortados/tasks` (same token, 401 otherwise; built by `cortados_router/provider/tasks.py`) feeds the page's **Tasks** section: the latest 200 routing decisions from `router.db` (`ORDER BY ts DESC` over the `routes(ts)` index, one look-ahead row sets `truncated`; no `COUNT(*)`, no `core._db_lock`, the dashboard's read-only deadline-limited connection), each as metadata only — `task_id`, `ts`, `session_id` (the router's conversation id, not an Office tag), `lane`, `model`, `actual_model`, `band`, `degraded`, `elapsed_ms` (the recorded `turn_ms`), `request_chars`/`response_chars` (recorded sizes), `routing_kind` (`routed` / `pinned` / `unselected`) and `s1_reason`, a fixed-vocabulary summary of the recorded band, the typed S1 answers (`steps=…, work_kind=…, outward=…`) and the hard rules by category (`cheapest qualifying route`, `escalated difficulty floor`, …; a rule's text is never published, since escalation reasons and fit failures can embed user text). The `request`, `context`, `task_context`, `engine_error` and `features` columns are never read. Per-task **tokens** are the backends' reported usage summed over the routed conversation's turns (`tokens: {input, output, cache_read, cache_write}`, `tokens_status: "recorded"`); rows from before token recording, local-lane rows and conversations with no completed turn carry `tokens: null, tokens_status: "not recorded"`, never an estimate. `token_totals` sums them per window (see "Work split" under "Live view"). `sessions[]` gives, per recorded session within that window, `decisions`, `routed`, `pinned`, `unselected` and `routed_pct` = 100 × routed ÷ decisions (pins counted separately, degraded fallbacks counted as routed; the definition is in `percentage_definition` and printed on the page); `totals` is the same over the whole window and `unassigned_decisions` counts rows with no session id (never pooled into an invented session). Identifiers are validated with the Office view's rules (an id or model name holding an address or foreign characters is `null`). A missing or unreadable database is an `errors[]` entry (`router.db: absent` / the sqlite exception class), never an empty success; the page shows a failed tasks poll in red inside its section and leaves the usage view current.
 
 ### Live view (GET /v1/cortados/live)
 
@@ -964,12 +964,13 @@ A host whose jobs the provider cannot see (the Mac Studio's S1 scorer and contin
 entry's `"host"` in clients.json, else the client's name; a post for any other host is 403, the owner token is never
 bound; `clients add <name> --scope live:heartbeat [--host studio] --token-file <path>`):
 `{"host": "studio", "ttl_s": 900, "jobs": [{"name": "s1-scorer", "state": "running", "summary": "serving v12"}]}`.
-Fields are validated strictly (8 KiB body cap, 16 jobs, fixed states, an 80-character summary with no address) and a
+Fields are validated strictly (24 KiB body cap, 16 jobs, fixed states, an 80-character summary with no address) and a
 bad one is refused naming the field, never echoing its value. The board keeps 16 hosts (least recently posted out first),
 but never evicts a configured host (`CORTADOS_LIVE_HOSTS` or the defaults, and exec-hosts.json's names). A heartbeat may
 also carry `hardware` (cpu/gpu busy %, memory bytes, 1-min load, disk free %, chip name, sample time) and `s1` (health,
 the served model's name, the pipeline's hold flags `no-promote` / `no-train-tonight` / `nightly-stop` /
-`sweep-requested`, a pending candidate's reason slug); docs/PROVIDER-PLAN.md ("Live view") has the full schema.
+`sweep-requested`, a pending candidate's reason slug) and `orchestrator` (the host's main Claude Code sessions' own
+tokens, below); docs/PROVIDER-PLAN.md ("Live view") has the full schema.
 
 **The heartbeat sender** (`cortados_router/live_heartbeat.py`, stdlib) runs on each host every 60 s from a LaunchAgent.
 It reports the configured launchd jobs from `launchctl print gui/<uid>/<label>` (running / ok / idle / failed / stopped,
@@ -977,7 +978,7 @@ It reports the configured launchd jobs from `launchctl print gui/<uid>/<label>` 
 Studio the S1 pipeline: which of `data/no-promote`, `data/no-train-tonight`, `data/nightly.stop`,
 `data/sweep-request.json` exist (never their contents), the reason field of `data/pending-candidate`, and the scorer's
 `/health` (its model name). It never sends a token, environment, path or command line; the body is checked against the
-server's own validator and 8 KiB cap before it is sent (`--dry-run` prints it, `--check` checks the config and token
+server's own validator and byte cap before it is sent (`--dry-run` prints it, `--check` checks the config and token
 file only). On a provider that predates the `hardware`/`s1` blocks it falls back to the jobs-only body with both folded
 into job summaries. To install it on a host:
 
@@ -1005,6 +1006,27 @@ file is kept unless `--force`), checks it with the sender, writes `~/Library/Lau
 `--dry-run` prints both files and changes nothing. Its log is `~/.cortados/live-heartbeat.out` (one line per failed post;
 a 403 there means the token is bound to another host). Remove: `launchctl bootout gui/$(id -u)/com.cortados.live-heartbeat`
 and delete the plist; revoke the token with `clients remove <name>`.
+
+**Work split** (how much the owner's main sessions do themselves vs hand to CortadOS, in tokens). Routed side: the
+provider adds each backend turn's reported usage (Claude CLI `result.usage`, Codex app-server `tokenUsage` delta;
+input, output, cache read, cache write) onto the conversation's `routes` row in router.db (`core.log_tokens`; columns
+`tok_input`, `tok_output`, `tok_cache_read`, `tok_cache_write`, `tok_turns`, `office_session`, added by an additive,
+idempotent migration in `core._db`; older rows stay NULL = not recorded), tagged with the client's
+`x-cortados-session`. `GET /v1/cortados/tasks` carries per-row `tokens` and `token_totals`; the live view's
+`routed.totals.tokens` has them per window (24 h, 7 d), overall, by session tag and by lane/model. Orchestrator side:
+`cortados_router/orchestrator_usage.py` sums the main sessions' own `message.usage` from `~/.claude/projects/*/*.jsonl`
+and their subagents' `<session>/subagents/*.jsonl` (an Agent-tool subagent on a direct model is the main session's own
+spend: counted on its session and again in a per-window `subagent` sub-total; child-task folders, the provider's own
+headless CLIs — the Claude lane's `cortados-bridge-*/work` and the search lane's `cortados-search-*` scratch dirs,
+whose transcripts land in the same folder on the provider host and whose turns router.db already has
+(`provider_bridge_files`) — and messages served by the provider — `cortados`, `sub/…`, `api/…` — excluded;
+deduplicated by message id) and the heartbeat sender posts it as an `orchestrator` block (metadata only: Office session tags, never a raw session id, path or text; rescanned every 5 min).
+Turn it on where the main sessions run: `scripts/install_live_heartbeat.sh air --orchestrator --force` (or add
+`"orchestrator": {}` to heartbeat.json). Check by hand: `python3 -B -m cortados_router.orchestrator_usage`. The live
+view's `work_split` section joins the two by session tag; % routed = routed fresh ÷ (orchestrator fresh + routed
+fresh), fresh = input + output + cache writes (cache reads are shown beside it). The definition is published in the
+section and shown on the dashboard's Work split panel. A heartbeat that would exceed the server's byte cap is sent
+without its `orchestrator` block (said on stderr) rather than not at all.
 
 The dashboard's **Live** tab reads it every 5 s while the tab is visible: an overview strip (running tasks, active
 conversations, S1 health, the lowest subscription, host heartbeats), the Tasks panel (running first, elapsed ticking each

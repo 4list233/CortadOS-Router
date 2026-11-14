@@ -986,6 +986,12 @@ DDL = """CREATE TABLE IF NOT EXISTS routes (
 CREATE INDEX IF NOT EXISTS routes_ts ON routes(ts);"""
 
 
+# Tokens a routed conversation spent, summed over its backend turns (log_tokens), and the x-cortados-session tag of the
+# orchestrator whose work it was. provider/work_split.py and provider/tasks.py read them; NULL = not recorded.
+TOKEN_COLUMNS = (("tok_input", "INTEGER"), ("tok_output", "INTEGER"), ("tok_cache_read", "INTEGER"),
+                 ("tok_cache_write", "INTEGER"), ("tok_turns", "INTEGER"), ("office_session", "TEXT"))
+
+
 def _db() -> sqlite3.Connection:
     STATE.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(STATE / "router.db", timeout=10)
@@ -997,6 +1003,17 @@ def _db() -> sqlite3.Connection:
         c.execute("ALTER TABLE routes ADD COLUMN context TEXT")   # request from day one so labels accumulate with context before the retrain
     if 'task_context' not in cols:
         c.execute('ALTER TABLE routes ADD COLUMN task_context TEXT')
+    # Work split (tokens per routed conversation, joined to the orchestrator's Office session tag): additive, nullable
+    # columns only, so an old reader never sees a change and a NULL means "not recorded" (rows from before this). Two
+    # processes opening an old db at once can both try the same ALTER: the loser's "duplicate column" is the outcome
+    # it wanted, so only that error is passed over.
+    for col, kind in TOKEN_COLUMNS:
+        if col not in cols:
+            try:
+                c.execute(f"ALTER TABLE routes ADD COLUMN {col} {kind}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):
+                    raise
     try:
         os.chmod(STATE / "router.db", 0o600)
     except OSError:
@@ -1064,6 +1081,32 @@ def log_execution(route_id: str, provider: str, model: str) -> None:
 def log_outcome(turn_id: str, response_chars: int, turn_ms: int) -> None:
     _write_routes("log_outcome", lambda c: c.execute("UPDATE routes SET response_chars=?, turn_ms=? WHERE turn_id=?",
                                                      (response_chars, turn_ms, turn_id)), raise_final=True)
+
+
+def log_tokens(turn_id: str, usage: dict[str, Any], office_session: str | None = None) -> bool:
+    """Add one backend turn's tokens to its route's row (Messages-shaped usage: input_tokens excludes the cache reads
+    and writes, which come as cache_read_input_tokens / cache_creation_input_tokens; both bridges report that shape)
+    and remember the first orchestrator session tag seen. Never raises sqlite3.Error: accounting must not fail a reply;
+    a lost write is counted in router_db like a lost route (#99). Returns False when it was not written, including when
+    no routes row has this turn_id (the tokens have nowhere to go: counted in router_db as a lost write too)."""
+    def n(k: str) -> int:
+        v = usage.get(k) if isinstance(usage, dict) else None
+        return int(v) if type(v) in (int, float) and v == v and 0 <= v < 1e12 else 0
+    vals = (n("input_tokens"), n("output_tokens"), n("cache_read_input_tokens"), n("cache_creation_input_tokens"))
+    matched = [0]
+
+    def write(c: sqlite3.Connection) -> None:
+        matched[0] = c.execute(
+            "UPDATE routes SET tok_input=COALESCE(tok_input,0)+?, tok_output=COALESCE(tok_output,0)+?, "
+            "tok_cache_read=COALESCE(tok_cache_read,0)+?, tok_cache_write=COALESCE(tok_cache_write,0)+?, "
+            "tok_turns=COALESCE(tok_turns,0)+1, office_session=COALESCE(office_session,?) WHERE turn_id=?",
+            (*vals, office_session, turn_id)).rowcount
+    if not _write_routes("log_tokens", write, raise_final=False):
+        return False
+    if matched[0] == 0:                             # e.g. the route's own log_route was lost: no row to add to
+        router_db.note_error("log_tokens", LookupError("no routes row for this turn"), final=True)
+        return False
+    return True
 
 
 def log_call_context(turn_id, api_request_id, *, session_id, model, provider,
