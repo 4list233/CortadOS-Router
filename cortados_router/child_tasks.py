@@ -816,6 +816,35 @@ def office_tags(cwd, title=None, session_tag=None) -> dict:
     return out
 
 
+# The one place the bot gateway's name is written: its client (bot_gateway.CLIENT), its tasks' origin
+# (subagent_mcp.task_origin), the live view's ?session= rule and the server's 400 message all derive from it.
+BOT_ORIGIN = "grokbot"
+ORIGIN_NAMED = (BOT_ORIGIN,)    # origins that are not a session
+ORIGIN_SESSION_RE = re.compile("|".join([SESSION_TAG_RE.pattern] + [re.escape(n) for n in ORIGIN_NAMED]))
+ORIGIN_KEYS = ("origin_session", "origin_project", "origin_device")
+OFFICE_NAME_MAX = 64            # cortados-routed-subagents' OFFICE_NAME_MAX
+
+
+def office_name(s, device=False):
+    """A project or device name normalised as cortados-routed-subagents' officeName does it (every run of characters
+    outside [A-Za-z0-9._ -] becomes "-", device without spaces; trimmed; cut to 64), or None without a letter or digit.
+    The one Python copy: subagent_mcp.origin_identity uses it, and tests/test_child_tasks.OFFICE_NAME_VECTORS pins it
+    against the mod (hooks/office-vectors.fixture.ts)."""
+    t = re.sub(r"[^A-Za-z0-9._-]+" if device else r"[^A-Za-z0-9._ -]+", "-", str(s or "")).strip()[:OFFICE_NAME_MAX]
+    return t if re.search(r"[A-Za-z0-9]", t) else None
+
+
+def clean_origin(origin) -> dict:
+    """The main session that started a task, as {origin_session, origin_project, origin_device}: the session's opaque
+    Office tag (16-64 lowercase hex) or a named origin (ORIGIN_NAMED), its folder name and device. Metadata only; a
+    value that does not fit is None, never repaired or guessed, and never fails the start (subagent_mcp.task_origin)."""
+    o = origin if isinstance(origin, dict) else {}
+    sess, proj, dev = o.get("session"), o.get("project"), o.get("device")
+    ok = lambda v, rule: v if isinstance(v, str) and rule.fullmatch(v) else None
+    return {"origin_session": ok(sess, ORIGIN_SESSION_RE),
+            "origin_project": ok(proj, _OFFICE_NAME_RE), "origin_device": ok(dev, _DEVICE_RE)}
+
+
 _OFFICE_HEADER_OF = {"session": "x-cortados-session", "project": "x-cortados-project", "device": "x-cortados-device",
                      "title": "x-cortados-task-title"}
 
@@ -895,7 +924,8 @@ def _start_where() -> str:
 
 def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=None, allowed_tools=None,
            provider_url="", token_file=None, chrome=False, red=None, connectors=None, client=None,
-           title=None, session_tag=None, repo=None, branch=None, host=None, parent_task_id=None, local=None) -> dict:
+           title=None, session_tag=None, repo=None, branch=None, host=None, parent_task_id=None, local=None,
+           origin=None) -> dict:
     """`client` (optional, e.g. "grokbot" from the bot gateway) is recorded in meta.json and every event line, so usage
     can be attributed to the caller. `red` carries the launch credentials (env token and token file's token as they are now). `permission_mode`
     None picks auto where the model supports it (resolve_permission_mode). `title` (<= 80 chars) and `session_tag`
@@ -905,7 +935,8 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
     `parent_task_id` (else CORTADOS_PARENT_TASK_ID) names the task that started this one, for the run export (#91);
     none known is recorded as an explicit missing parent. `local` (session.LOCAL_MODES) makes every request of the
     child carry x-cortados-local (the provider's sensitive-request routing); login mode (chrome) is not routed, so the
-    two are refused together."""
+    two are refused together. `origin` ({session, project, device}, subagent_mcp.task_origin) names the main session
+    that started it: meta.json's `origin` and every event's origin_* fields (clean_origin)."""
     if os.environ.get(NESTED_ENV):
         raise TaskError("start_task is not available inside a child task: children may not start children "
                         "(unbounded fan-out would spend subscription quota unattended)")
@@ -948,7 +979,7 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
                 "title": start_red.text(title) if isinstance(title, str) else title,
                 "session_tag": session_tag, "repo": repo, "branch": branch,
                 "parent_task_id": parent_id,   # resolved here: the host's own env does not know this session
-                **({"local": local} if local else {})}
+                "origin": origin, **({"local": local} if local else {})}
         progress["launched"] = "maybe"         # from here the request may reach the host and launch a child
         try:
             out = _remote(target.name, "start", args)
@@ -1064,6 +1095,9 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
         if meta.get("office"):
             meta["office"] = {k: launch_red.text(v) for k, v in meta["office"].items()}
         meta["task_preview"] = launch_red.text(task.strip())[:200]
+        org = clean_origin(origin)
+        if any(org.values()):
+            meta["origin"] = {k: launch_red.text(v) if v else v for k, v in org.items()}
         # cmd.json's event fields were written by _prepare before the client was known; the runner logs the finished
         # event from them, so rewrite them or that event loses its attribution (review r2 P3-8).
         cmd_path = os.path.join(d, "cmd.json")
@@ -1443,7 +1477,18 @@ def _event_fields(meta: dict) -> dict:
     # Office fields (title, session tag, project, device): metadata the view shows, never the prompt.
     for k, v in (meta.get("office") or {}).items():
         out[k] = v
+    # The main session that started the task (clean_origin): which orchestrator's work this is, for the live view.
+    for k, v in clean_origin_meta(meta.get("origin")).items():
+        out[k] = v
     return out
+
+
+def clean_origin_meta(rec) -> dict:
+    """meta.json's `origin` re-checked (the record is a file): its valid origin_* fields, None ones dropped."""
+    r = rec if isinstance(rec, dict) else {}
+    o = clean_origin({"session": r.get("origin_session"), "project": r.get("origin_project"),
+                      "device": r.get("origin_device")})
+    return {k: v for k, v in o.items() if v}
 
 
 _REAP: dict = {}    # Popen handles of runners this server started: polled so an exited runner is reaped, not a zombie
@@ -2143,7 +2188,8 @@ def list_recent(n=20, ids=None) -> list:
             continue
         rows.append({"task_id": tid, "state": state, "cwd": meta.get("cwd"), "orchestrator": meta.get("orchestrator"),
                      "task_preview": meta.get("task_preview"), "host": meta.get("host"),
-                     **({"workspace": meta["workspace"]} if meta.get("workspace") else {})})
+                     **({"workspace": meta["workspace"]} if meta.get("workspace") else {}),
+                     **clean_origin_meta(meta.get("origin"))})
     for host, tids in by_host.items():         # one round trip per host, never one per task
         try:
             remote = _remote(host, "list", {"limit": len(tids), "ids": tids})
@@ -3650,7 +3696,7 @@ def serve_remote(stdin=None, stdout=None) -> int:
                         args.get("chrome", False), red, args.get("connectors"), client=args.get("client"),
                         title=args.get("title"), session_tag=args.get("session_tag"), repo=args.get("repo"),
                         branch=args.get("branch"), host=host.name, parent_task_id=args.get("parent_task_id"),
-                        local=args.get("local"))
+                        local=args.get("local"), origin=args.get("origin"))
         elif op == "status":
             out = status(args.get("task_id"), red, url, token)
         elif op == "wait":

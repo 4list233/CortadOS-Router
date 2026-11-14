@@ -81,6 +81,10 @@ export interface PulseLiveTask {
   tool?: string | null
   elapsed_s?: number | null
   ended_at?: number | null
+  // the main session that started it: its Office tag, "grokbot" for the bot gateway, or null (unattributed)
+  origin_session?: string | null
+  origin_project?: string | null
+  origin_device?: string | null
 }
 export interface PulseLiveConversation {
   kind?: string
@@ -106,6 +110,7 @@ export interface PulseLiveHost {
 export interface PulseLiveS1 { health?: string; model?: string | null; flags?: string[]; pending?: string | null }
 export interface PulseLive {
   version?: number
+  session_filter?: string     // set by ?session=<tag>: the task lists hold only that session's tasks
   generated_at?: number
   overview?: {
     running_tasks?: number | null
@@ -119,7 +124,9 @@ export interface PulseLive {
   // scope: always "provider host" (tasks on other execution hosts log there); elsewhere: tasks started from the provider
   // host onto another host in the last 10 h, their state unknown to the view
   tasks?: PulseLiveSection & { counts?: Record<string, number> | null; running?: PulseLiveTask[]; queued?: PulseLiveTask[]; recent?: PulseLiveTask[]
-    scope?: string; elsewhere?: { task_id?: string; host?: string; started_at?: number }[] }
+    scope?: string; elsewhere?: { task_id?: string; host?: string; started_at?: number }[]; truncated?: boolean
+    // the tasks grouped by the session that started them (absent from a provider before task origins)
+    origins?: { session?: string | null; running?: number; queued?: number; finished?: number; task_ids?: string[] }[] }
   conversations?: PulseLiveSection & { items?: PulseLiveConversation[]; hidden?: number; active?: number | null; working?: number | null }
   s1?: PulseLiveSection & { latency_ms?: number | null; reason?: string | null }
   hosts?: PulseLiveSection & { items?: PulseLiveHost[]; provider_host?: string | null }
@@ -130,6 +137,8 @@ declare module 'claude-code' {
     'cortados-pulse': {
       held: { data: Pulse; at: number } | null; err: string | null
       live: { data: PulseLive; at: number; base: string } | null; liveErr: string | null
+      mine: { tag: string | null; why: string | null } | null
+      mineLive: { data: PulseLive; at: number; tag: string } | null
     }
   }
 }

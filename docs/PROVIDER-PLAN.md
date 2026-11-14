@@ -681,7 +681,14 @@ token is not bound.
         "pending": "promotion_held",   # a pending candidate's reason, [a-z0-9][a-z0-9_.-]{0,47}
         "loaded_s": 41.2}}             # 0..86400
 
-A post replaces the host's previous one. Refusals: 401 without a token, 403 for a token without the scope, 413 over 8 KiB
+An optional `orchestrator` block (2026-11-13, work split) carries the host's main Claude Code sessions' own tokens:
+`orchestrator_usage.scan`'s summary — `sampled_at`, `salt` (bool), `windows` {24h, 7d}, `totals` per window
+(input/output/cache_read/cache_write/sessions), up to 30 `sessions` (16-64 hex Office tag or null, project name, model
+id, `last_at`, tokens per window), `sessions_hidden`, `excluded` counters. Validated by `work_split.validate_block`
+(unknown keys, raw ids, paths and text are refused naming the field); the live view's `work_split` section joins it
+with router.db's routed tokens (README "Work split").
+
+A post replaces the host's previous one. Refusals: 401 without a token, 403 for a token without the scope, 413 over 24 KiB (8 KiB before the `orchestrator` block)
 (checked from content-length before reading), 400 naming the bad field (`jobs[0].state`), never echoing its value. The
 board is in memory (16 hosts, LRU; a configured host, from `CORTADOS_LIVE_HOSTS` or the defaults and exec-hosts.json,
 is never evicted, so the board holds at most 16 + the configured hosts): after a provider restart each host shows "no

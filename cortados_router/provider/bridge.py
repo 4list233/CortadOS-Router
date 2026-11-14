@@ -41,6 +41,11 @@ STRIPPED_ENV_PREFIX = "ANTHROPIC_"
 # After the first unanswered tool call, the CLI's stdout may still be delivering other tool_use blocks of the same
 # assistant message (the shim's HTTP call and the CLI's stdout race). Wait this long for stdout to go quiet.
 SETTLE_S = 0.3
+# The scratch dir's name prefix (tempfile adds a random suffix); the CLI runs in <scratch>/SCRATCH_WORK. On the default
+# login (config_dir None) the CLI writes its transcript under ~/.claude/projects/<slug of that cwd>/, which
+# orchestrator_usage recognises by this prefix so a routed turn is not counted again as orchestrator work.
+SCRATCH_PREFIX = "cortados-bridge-"
+SCRATCH_WORK = "work"
 logger = logging.getLogger(__name__)
 
 # The headless backend runs in an empty scratch dir on the provider's machine, and its CLI tells the model so: Claude
@@ -155,15 +160,15 @@ class BridgeSession:
         self._exited = False
         self._closing = False
         self._exit_handler: Callable[[Any], None] | None = None
-        self.dir = Path(tempfile.mkdtemp(prefix="cortados-bridge-", dir=scratch_root))
+        self.dir = Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX, dir=scratch_root))
         self._stderr = None
         prefix = [claude_bin] if isinstance(claude_bin, str) else list(claude_bin)   # a list lets tests run a fake CLI
         try:
-            (self.dir / "work").mkdir()
+            (self.dir / SCRATCH_WORK).mkdir()
             args = prefix + ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                     "--tools", "", "--setting-sources", "", "--settings", json.dumps({"disableAllHooks": True}),
                     "--system-prompt", (system or "You are a helpful assistant.") + "\n\n"
-                    + SCRATCH_NOTE.format(work=self.dir / "work")]
+                    + SCRATCH_NOTE.format(work=self.dir / SCRATCH_WORK)]
             if tools:
                 (self.dir / "tools.json").write_text(json.dumps(tools))
                 (self.dir / "mcp.json").write_text(json.dumps({"mcpServers": {BRIDGE_SERVER: {
@@ -186,7 +191,7 @@ class BridgeSession:
             env = claude_env(config_dir)
             env["MCP_TOOL_TIMEOUT"] = str(int(CLI_TOOL_TIMEOUT_S * 1000))  # call + abort + startup slack
             self._stderr = open(self.dir / "stderr.log", "w")
-            self.proc = popen(args, cwd=self.dir / "work", env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            self.proc = popen(args, cwd=self.dir / SCRATCH_WORK, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=self._stderr, text=True, bufsize=1)
         except OSError as exc:
             # No process exists yet, so close() cannot run: release the stderr handle and the scratch dir by hand and

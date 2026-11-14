@@ -21,6 +21,9 @@ It composes views that already exist rather than re-deriving them:
   - s1             the scorer's /health probe usage already memoises (reachable, HTTP status, latency).
   - hosts          the fleet (default air, studio, pro: CORTADOS_LIVE_HOSTS), each with its hardware sample (usage's
                    hardware cards) and its job heartbeat (POST /v1/cortados/live/heartbeat, below), or "none" said so.
+  - work_split     orchestrator tokens (the main sessions' own, from the heartbeats' `orchestrator` blocks) against
+                   routed tokens (router.db, via tasks.collect's token_totals), overall and per main session
+                   (provider/work_split.py has the definitions).
 
 Every section carries its own `as_of`, a `status` (ok / partial / error, s1: up / down / unknown) and `errors`
 [{source, error}] naming what failed: a failed or absent source is never shown as an empty success. Metadata only:
@@ -36,7 +39,8 @@ loop) POSTs its job states:
               {"name": "s1-continuous", "state": "running", "summary": "sweep 3/8", "progress_pct": 37.5,
                "started_at": 1762850000}]}
 
-A heartbeat may also carry the host's `hardware` (cpu/gpu busy %, memory, load, disk free %: numbers and the chip
+A heartbeat may also carry an `orchestrator` block (cortados_router/orchestrator_usage.py: the host's main Claude Code
+sessions' tokens per window, by Office session tag; validated by work_split.validate_block), the host's `hardware` (cpu/gpu busy %, memory, load, disk free %: numbers and the chip
 name only) and, on the S1 host, an `s1` block (health, the served model's name, the pipeline's hold flags by fixed
 name, a pending candidate's reason slug); cortados_router/live_heartbeat.py is the sender (one per host, every 60 s).
 A post replaces that host's previous one. It is shown fresh for ttl_s (default 900, 60..86400), then stale, and is
@@ -55,8 +59,8 @@ import time
 from collections import OrderedDict
 from typing import Any, Callable
 
-from cortados_router import router_db
-from cortados_router.provider import office
+from cortados_router import child_tasks, router_db
+from cortados_router.provider import office, work_split
 
 VERSION = 1
 LIVE_PATH = "/v1/cortados/live"
@@ -73,7 +77,9 @@ PEEK_MAX = 64               # task-dir peeks per snapshot (a few stats each): bo
 CONVERSATIONS_MAX = 64      # in-flight conversations listed; the rest are counted in `hidden`
 ROUTED_MAX = 25             # latest routing decisions shown; tasks.collect reads at most its own ROW_LIMIT (200)
 # ---- heartbeat rules ----
-HEARTBEAT_MAX_BYTES = 8192  # 16 jobs x ~300 bytes is under 5 KiB; a larger body is not a heartbeat
+# 16 jobs x ~300 bytes is under 5 KiB; the orchestrator block adds at most 30 sessions x ~350 bytes (~10 KiB). Larger
+# is not a heartbeat.
+HEARTBEAT_MAX_BYTES = 24576
 HEARTBEAT_HOSTS_MAX = 16    # the fleet is three machines; LRU past this, configured hosts exempt (HeartbeatBoard)
 HEARTBEAT_KEEP_S = 24 * 3600.0
 TTL_DEFAULT_S = 900         # a job loop posting every 5 min misses two posts before it is shown stale
@@ -95,7 +101,13 @@ _SUMMARY_RE = re.compile(r"[\x20-\x7e]{1,80}")       # office's title rule: prin
 _CLIENT_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 _WS_STATE_RE = re.compile(r"[a-z_-]{1,24}")
 _TASK_STATES = ("succeeded", "failed", "cancelled")   # child_tasks.TERMINAL_STATES
-_HB_KEYS = {"host", "jobs", "ttl_s", "hardware", "s1"}
+# The main session that started a task (child_tasks.clean_origin): its Office tag, or a named origin (the bot gateway)
+_ORIGIN_SESSION_RE = child_tasks.ORIGIN_SESSION_RE
+SESSION_FILTER_RULE = "one Office session tag (16-64 lowercase hex) or " + " or ".join(child_tasks.ORIGIN_NAMED)
+MEMO_KEYS = 16              # live.Memo: the fleet view plus this many-1 session views memoised side by side
+ORIGINS_MAX = 32            # origin groups listed (sessions with a task in the window); the rest flagged truncated
+ORIGIN_IDS_MAX = 20         # task ids per origin group and per orchestrator item, newest first
+_HB_KEYS = {"host", "jobs", "ttl_s", "hardware", "s1", "orchestrator"}
 # heartbeat `hardware`: percentages, byte counts, the 1-min load, the chip name and when it was sampled; nothing else
 _HB_PCT = ("cpu_busy_pct", "gpu_busy_pct", "disk_free_pct")
 _HB_BYTES = ("mem_available_bytes", "mem_total_bytes")
@@ -176,6 +188,11 @@ def validate_heartbeat(body: Any, now: float) -> tuple[dict[str, Any] | None, st
         if bad is not None:
             return None, "s1" + bad
         out["s1"] = s1
+    if body.get("orchestrator") is not None:
+        orch, bad = work_split.validate_block(body["orchestrator"], now, TIME_SKEW_S)
+        if bad is not None:
+            return None, "orchestrator" + bad
+        out["orchestrator"] = orch
     return out, None
 
 
@@ -323,7 +340,10 @@ def _children(events: list[dict[str, Any]], now: float) -> dict[str, dict[str, A
                             ("lane", office._LANE_RE), ("model", office._MODEL_RE), ("client", _CLIENT_RE),
                             ("session", office._HEADER_RULES[office.SESSION_HEADER]),
                             ("project", office._HEADER_RULES[office.PROJECT_HEADER]),
-                            ("device", office._HEADER_RULES[office.DEVICE_HEADER])):
+                            ("device", office._HEADER_RULES[office.DEVICE_HEADER]),
+                            ("origin_session", _ORIGIN_SESSION_RE),
+                            ("origin_project", office._HEADER_RULES[office.PROJECT_HEADER]),
+                            ("origin_device", office._HEADER_RULES[office.DEVICE_HEADER])):
             v = office.clean(e.get(field), rule)
             if v is not None:
                 c[field] = v
@@ -359,7 +379,10 @@ def _elsewhere(stubs: list | None, known: set[str], now: float) -> list[dict[str
 
 def tasks_section(events: list[dict[str, Any]], office_view: dict[str, Any] | None,
                   peek: Callable[[str], dict[str, Any] | None] | None, now: float,
-                  errors: list | None = None, stubs: list | None = None) -> dict[str, Any]:
+                  errors: list | None = None, stubs: list | None = None, session: str | None = None) -> dict[str, Any]:
+    """The tasks section. With `session` (a valid ?session= value) running, queued and recent hold only that session's
+    tasks, filtered BEFORE the caps: filtering the capped fleet lists lost a busy fleet's older tasks from the session's
+    view while its origin group still listed them (review 2026-11-13). Counts and origins stay fleet-wide."""
     errors = list(errors or [])
     by_run = {w.get("run_id"): w for _, w in _office_workers(office_view or {}) if w.get("kind") == "child_task"}
     kids = _children(events, now)
@@ -403,19 +426,77 @@ def tasks_section(events: list[dict[str, Any]], office_view: dict[str, Any] | No
             "session": None if c["chrome"] else c.get("session"),
             "project": None if c["chrome"] else c.get("project"),
             "device": None if c["chrome"] else c.get("device"),
+            # who started it (any task, browser ones too): the orchestrating session's tag, "grokbot", or None
+            "origin_session": c.get("origin_session"), "origin_project": c.get("origin_project"),
+            "origin_device": c.get("origin_device"),
         })
     counts = {k: 0 for k in ("running", "queued", "succeeded", "failed", "cancelled", "unknown")}
     for r in rows:
         counts[r["state"]] += 1
-    running = sorted([r for r in rows if r["state"] == "running"], key=lambda r: -(r["started_at"] or 0))
-    queued = sorted([r for r in rows if r["state"] == "queued"], key=lambda r: r["started_at"] or 0)
-    recent = sorted([r for r in rows if r["state"] not in ("running", "queued")],
+    listed = rows if session is None else [r for r in rows if r.get("origin_session") == session]
+    running = sorted([r for r in listed if r["state"] == "running"], key=lambda r: -(r["started_at"] or 0))
+    queued = sorted([r for r in listed if r["state"] == "queued"], key=lambda r: r["started_at"] or 0)
+    recent = sorted([r for r in listed if r["state"] not in ("running", "queued")],
                     key=lambda r: -(r["ended_at"] or r["started_at"] or 0))
     truncated = len(running) > RUNNING_MAX or len(queued) > RUNNING_MAX or len(recent) > RECENT_MAX
     away = _elsewhere(stubs, set(kids), now)
     return _section(now, _status(errors, bool(rows) or bool(away)), errors, scope=SCOPE, window_s=int(CHILD_WINDOW_S),
                     counts=counts, running=running[:RUNNING_MAX], queued=queued[:RUNNING_MAX],
-                    recent=recent[:RECENT_MAX], truncated=truncated, elsewhere=away)
+                    recent=recent[:RECENT_MAX], truncated=truncated, elsewhere=away, **origins_of(rows))
+
+
+def origins_of(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The tasks grouped by the main session that started them, from every row in the window (not the capped lists):
+    {origins: [{session, project, device, running, queued, finished, task_ids}], origins_truncated}. `session` None is
+    the unattributed group (tasks from before origins were recorded, or a server that knows no session tag). Groups
+    with a running or queued task first, the unattributed one last among equals, then by their newest task."""
+    groups: dict[Any, dict[str, Any]] = {}
+    for r in sorted(rows, key=lambda r: -(r.get("started_at") or 0)):
+        g = groups.setdefault(r.get("origin_session"), {
+            "session": r.get("origin_session"), "project": None, "device": None, "running": 0, "queued": 0,
+            "finished": 0, "task_ids": [], "_newest": r.get("started_at") or 0})
+        g["project"] = g["project"] or r.get("origin_project")
+        g["device"] = g["device"] or r.get("origin_device")
+        st = r.get("state")
+        g["running" if st == "running" else "queued" if st == "queued" else "finished"] += 1
+        if len(g["task_ids"]) < ORIGIN_IDS_MAX:
+            g["task_ids"].append(r["task_id"])
+    out = sorted(groups.values(), key=lambda g: (not (g["running"] or g["queued"]), g["session"] is None, -g["_newest"]))
+    for g in out:
+        del g["_newest"]
+    return {"origins": out[:ORIGINS_MAX], "origins_truncated": len(out) > ORIGINS_MAX}
+
+
+def link_origins(conv: dict[str, Any], tasks: dict[str, Any]) -> None:
+    """Each orchestrator item gets `tasks`: {running, queued, finished, task_ids} of the tasks its session started in
+    the window (zeros when none; null when the tasks section could not be read)."""
+    by = {g.get("session"): g for g in tasks.get("origins") or [] if g.get("session")}
+    known = tasks.get("status") != "error"
+    for it in conv.get("items") or []:
+        if it.get("kind") != "orchestrator":
+            continue
+        g = (by.get(it.get("session")) if it.get("session") else None) or {}
+        it["tasks"] = {"running": g.get("running", 0), "queued": g.get("queued", 0),
+                       "finished": g.get("finished", 0), "task_ids": list(g.get("task_ids") or [])} if known else None
+
+
+def for_session(snap: dict[str, Any], session: str) -> dict[str, Any]:
+    """GET /v1/cortados/live?session=<tag>: the snapshot narrowed to one orchestrating session: its tasks (running,
+    queued, recent, by origin_session), its origin group, and the conversations on its floor. Counts, overview and
+    the other sections stay fleet-wide. `session` must already be valid (valid_session). collect(session=) calls it
+    on a snapshot whose task lists were filtered before their caps; here the lists are only narrowed again."""
+    t = dict(snap.get("tasks") or {})
+    for k in ("running", "queued", "recent"):
+        t[k] = [r for r in t.get(k) or [] if r.get("origin_session") == session]
+    t["origins"] = [g for g in t.get("origins") or [] if g.get("session") == session]
+    c = dict(snap.get("conversations") or {})
+    c["items"] = [it for it in c.get("items") or [] if it.get("session") == session]
+    return {**snap, "session_filter": session, "tasks": t, "conversations": c}
+
+
+def valid_session(v: Any) -> str | None:
+    """A ?session= value the filter accepts (an Office tag or a named origin), else None."""
+    return v if isinstance(v, str) and _ORIGIN_SESSION_RE.fullmatch(v) else None
 
 
 def _backend_items(backend: list, view: dict[str, Any], now: float) -> tuple[list[dict[str, Any]], set[str]]:
@@ -505,7 +586,7 @@ _CALL_KEYS = ("ts", "task_id", "session_id", "routing_kind", "band", "lane", "mo
               "degraded", "s1_reason", "request_chars", "response_chars")
 
 
-_LOG_OPS = ("log_route", "log_execution", "log_outcome")
+_LOG_OPS = ("log_route", "log_execution", "log_outcome", "log_tokens")
 _TYPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,63}")
 
 
@@ -524,7 +605,10 @@ def route_log_errors(stats: Any) -> dict[str, Any] | None:
 def routed_section(view: dict[str, Any], now: float, log_errors: dict[str, Any] | None = None) -> dict[str, Any]:
     calls = [{k: t.get(k) for k in _CALL_KEYS} for t in (view.get("tasks") or [])[:ROUTED_MAX]]
     errors = [e for e in view.get("errors") or [] if isinstance(e, dict)]
-    return _section(now, _status(errors, bool(calls)), errors, calls=calls, totals=view.get("totals") or {},
+    totals = dict(view.get("totals") or {})
+    if view.get("token_totals") is not None:
+        totals["tokens"] = view["token_totals"]     # per window: overall, by orchestrator session tag, by lane/model
+    return _section(now, _status(errors, bool(calls)), errors, calls=calls, totals=totals,
                     row_limit=view.get("row_limit"), more=len(view.get("tasks") or []) > ROUTED_MAX,
                     route_log_errors=log_errors)
 
@@ -735,9 +819,11 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
             remote_stubs: Callable[[], list] | None = None,
             lane_enabled: Callable[[Any], bool] | None = None,
             conversations: Callable[[], list] | None = None, self_name: str | None = None,
-            route_log: Callable[[], dict[str, Any]] = router_db.stats) -> dict[str, Any]:
+            route_log: Callable[[], dict[str, Any]] = router_db.stats,
+            session: str | None = None) -> dict[str, Any]:
     """The snapshot. Each input is a callable, run under its own guard: one that raises turns ITS section into
-    status "error" with the exception's type (never its text: an OSError carries a path), the rest stand."""
+    status "error" with the exception's type (never its text: an OSError carries a path), the rest stand.
+    `session` (already valid, valid_session): the ?session= view (for_session), its tasks filtered before the caps."""
     def guard(source: str, fn: Callable[[], Any], errs: list) -> Any:
         try:
             return fn()
@@ -751,11 +837,11 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     ov = guard("office", lambda: office_view(office.recent_child_events(events or [], now)), office_errs)
     stub_errs: list = []
     stubs = guard("task stubs", remote_stubs, stub_errs) if remote_stubs is not None else None
-    tasks = tasks_section(events or [], ov, peek, now, child_errs + office_errs + stub_errs, stubs) \
+    tasks = tasks_section(events or [], ov, peek, now, child_errs + office_errs + stub_errs, stubs, session) \
         if events is not None \
         else _section(now, "error", child_errs + office_errs + stub_errs, scope=SCOPE, window_s=int(CHILD_WINDOW_S),
                       counts=None, running=[], queued=[], recent=[], truncated=False,
-                      elsewhere=_elsewhere(stubs, set(), now))
+                      elsewhere=_elsewhere(stubs, set(), now), origins=[], origins_truncated=False)
     conv_errs: list = []
     backend = guard("conversations", conversations, conv_errs) if conversations is not None else None
     if isinstance(backend, list):
@@ -766,6 +852,7 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     else:
         conv = _section(now, "error", office_errs + conv_errs, backend_sessions=backend_sessions, active=None,
                         working=None, floors=None, items=[], hidden=0)
+    link_origins(conv, tasks)
     tv_errs: list = []
     tv = guard("router.db", tasks_view, tv_errs)
     # this process's failed router.db writes (#99): shown even when the read side failed, which is when they matter most
@@ -787,6 +874,8 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
                           exec_hosts=ex_hosts, exec_default=ex_default, self_host=self_host, now=now,
                           errors=hb_errs + ex_errs + (u_errs if u is None else []),
                           self_name=self_name if self_name is not None else _slug(os.environ.get(SELF_ENV)))
+    ws = work_split.section(tv.get("token_totals") if isinstance(tv, dict) else None, beats, now,
+                            tv_errs if tv is None else None)
     counts = tasks.get("counts") or {}
     overview = {
         "running_tasks": counts.get("running") if tasks["status"] != "error" else None,
@@ -797,26 +886,31 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
         "route_log_errors": (rl or {}).get("count"),
         "hosts_with_heartbeat": sum(1 for h in hosts["items"] if h["heartbeat_state"] == "fresh"),
         "errors": sum(len(s["errors"]) for s in (tasks, conv, routed, subs, s1, hosts)),
+        "routed_token_pct_24h": ((ws.get("overall") or {}).get("24h") or {}).get("routed_pct"),
     }
-    return {"version": VERSION, "generated_at": round(now, 3), "overview": overview, "tasks": tasks,
-            "conversations": conv, "routed": routed, "subscriptions": subs, "s1": s1, "hosts": hosts}
+    snap = {"version": VERSION, "generated_at": round(now, 3), "overview": overview, "tasks": tasks,
+            "conversations": conv, "routed": routed, "subscriptions": subs, "s1": s1, "hosts": hosts,
+            "work_split": ws}
+    return for_session(snap, session) if session is not None else snap
 
 
 class Memo:
     """A MEMO_S memo with single flight for the encoded snapshot (as usage.collect has for its view): concurrent GETs
     wait for the one collect in progress and share its bytes. `key` names what must invalidate it early (the heartbeat
-    board's generation, so a post shows on the next GET). A collect that raises is not memoised."""
+    board's generation, so a post shows on the next GET). A collect that raises is not memoised. Up to MEMO_KEYS keys
+    are held at once: the fleet view and each pane's ?session= view are polled side by side, and one slot would make
+    them evict each other on every poll."""
 
     def __init__(self, ttl_s: float = MEMO_S, clock: Callable[[], float] = time.monotonic):
         self._ttl, self._clock = ttl_s, clock
-        self._lock = threading.Lock()               # guards _hit; never held across a collect
+        self._lock = threading.Lock()               # guards _hits; never held across a collect
         self._flight = threading.Lock()             # held across a miss
-        self._hit: tuple[float, Any, bytes] | None = None
+        self._hits: OrderedDict[Any, tuple[float, bytes]] = OrderedDict()
 
     def _fresh(self, key: Any) -> bytes | None:
         with self._lock:
-            h = self._hit
-            return h[2] if h and h[1] == key and self._clock() - h[0] < self._ttl else None
+            h = self._hits.get(key)
+            return h[1] if h and self._clock() - h[0] < self._ttl else None
 
     def get(self, key: Any, build: Callable[[], bytes]) -> bytes:
         body = self._fresh(key)
@@ -827,5 +921,11 @@ class Memo:
             if body is None:
                 body = build()
                 with self._lock:
-                    self._hit = (self._clock(), key, body)
+                    at = self._clock()
+                    self._hits.pop(key, None)
+                    self._hits[key] = (at, body)
+                    for k in [k for k, (t, _) in self._hits.items() if at - t >= self._ttl]:
+                        del self._hits[k]                   # expired: never served again (keys only move forward)
+                    while len(self._hits) > MEMO_KEYS:
+                        self._hits.popitem(last=False)
         return body

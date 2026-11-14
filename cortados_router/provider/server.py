@@ -34,6 +34,7 @@ import secrets
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from collections import OrderedDict, deque
 from html.parser import HTMLParser
@@ -694,6 +695,9 @@ class Registry:
         # refusal_route(body, route, run) -> moved route or None: the refusal fallback's re-route of a refused opening
         # turn to a node's sensitive model (routing.refusal_route). None: no fallback (a fixed-model endpoint).
         self.refusal_route: Callable[[dict, dict | None, Callable[[dict], bool]], dict | None] | None = None
+        # log_tokens(route_id, usage, office session tag or None): one backend turn's tokens onto its route's row
+        # (core.log_tokens). None: tokens are not recorded (fixed-model endpoint, tests).
+        self.log_tokens: Callable[[str, dict, str | None], Any] | None = None
         self._factories = SESSION_FACTORIES if session_factories is None else session_factories
         self._lock = threading.Lock()
         # Orders a conversation's backend-exit Office transition against its requests' turn-end writes, so the exit's
@@ -1303,8 +1307,13 @@ class Handler(BaseHTTPRequestHandler):
             # Owner token, or a scoped token with live:read. Metadata only (provider/live.py), never request text.
             if self._scoped is None and not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
+            # ?session=<tag>: one orchestrating session's tasks and conversations (live.for_session); a bad tag is a 400
+            sess = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("session")
+            if sess is not None and (len(sess) != 1 or live.valid_session(sess[0]) is None):
+                return self._error(400, "invalid_request_error",
+                                   "cortados: session must be " + live.SESSION_FILTER_RULE)
             try:
-                body = self.server.live_body(self.server.registry)
+                body = self.server.live_body(self.server.registry, sess[0] if sess else None)
             except Exception as exc:
                 logger.warning("live: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: live view unavailable (see provider log)")
@@ -2128,6 +2137,7 @@ class Handler(BaseHTTPRequestHandler):
                         _ledger_turn(session, result[2])   # the refused cloud turn was spent all the same
                     except Exception as exc:
                         _log_ledger_hook_failure(exc)
+                    self._log_turn_tokens(session, result[2])   # and its tokens are on the cloud route's row
                     cur, result = moved
                     outcome["moved"] = cur
                 outcome["turn"] = result
@@ -2138,6 +2148,7 @@ class Handler(BaseHTTPRequestHandler):
                 # and enqueues for the store's background writer; it never raises or blocks (failures are counted).
                 self._compaction_record(cur, turn, outcome["turn"][0], wire)
                 if not moved:                           # a local answer spends no subscription: nothing to learn
+                    self._log_turn_tokens(session, outcome["turn"][2])
                     try:
                         _ledger_turn(session, outcome["turn"][2])
                     except Exception as exc:
@@ -2362,6 +2373,23 @@ class Handler(BaseHTTPRequestHandler):
             compaction_store.STORE._count("schedule_failures",
                                           f"turn not handed to the store: {type(exc).__name__}: {exc}")
 
+    def _log_turn_tokens(self, session, usage) -> None:
+        """Add this backend turn's tokens to its route's router.db row with the orchestrator's session tag (work split:
+        provider/work_split.py). Off the critical path like the outcome log: a slow SQLite write must not hold the
+        session lock or delay the reply. Never raises; core.log_tokens counts a lost write in router_db."""
+        reg = self.server.registry
+        route = getattr(session, "route", None)
+        if not reg.log_tokens or not isinstance(route, dict) or not route.get("route_id") or not isinstance(usage, dict):
+            return
+        tag = office.clean(self.headers.get(office.SESSION_HEADER), office._HEADER_RULES[office.SESSION_HEADER])
+
+        def _write(route_id=route["route_id"], usage=dict(usage), tag=tag):
+            try:
+                reg.log_tokens(route_id, usage, tag)
+            except Exception:
+                logger.exception("token log for route %s failed", route_id)
+        threading.Thread(target=_write, name="cortados-token-log", daemon=True).start()
+
     def _run_id(self) -> tuple[str | None, bool]:
         """The x-cortados-run-id header: (id or None when absent/empty, valid)."""
         v = (self.headers.get(RUN_ID_HEADER) or "").strip()
@@ -2464,14 +2492,15 @@ class ProviderServer(ThreadingHTTPServer):
             events = []
         return registry.office.view(events, now=now, errors=errors)
 
-    def live_body(self, registry: Registry) -> bytes:
+    def live_body(self, registry: Registry, session: str | None = None) -> bytes:
         """The encoded live view, memoised live.MEMO_S with single flight (live.Memo): every dashboard tab and pulse
-        pane polling at once costs one collect. A heartbeat post (the board's generation) invalidates it."""
+        pane polling at once costs one collect per view (the fleet, each ?session=). A heartbeat post (the board's
+        generation) invalidates it. `session` must already be valid (live.valid_session)."""
         from cortados_router import paths
-        key = (str(paths.state_dir()), id(registry), registry.live.generation)
-        return self._live_memo.get(key, lambda: json.dumps(self.live_view(registry), allow_nan=False).encode())
+        key = (str(paths.state_dir()), id(registry), registry.live.generation, session)
+        return self._live_memo.get(key, lambda: json.dumps(self.live_view(registry, session), allow_nan=False).encode())
 
-    def live_view(self, registry: Registry) -> dict[str, Any]:
+    def live_view(self, registry: Registry, session: str | None = None) -> dict[str, Any]:
         """GET /v1/cortados/live (provider/live.py): composes the office board, the tasks and the live slice of the usage
         view, the child-task log (read once, 24 h) and the host heartbeats. Cache-only: no vendor CLI, no ssh. Tests
         replace the inputs it calls (office_view's board, tasks_view, live_usage_view) or this method."""
@@ -2496,7 +2525,7 @@ class ProviderServer(ThreadingHTTPServer):
             heartbeats=lambda: registry.live.snapshot(now), backend_sessions=len(registry.sessions),
             peek=child_tasks.peek_local, exec_hosts=hosts, self_host=exec_hosts.short_hostname(),
             remote_stubs=child_tasks.remote_stubs, lane_enabled=live.lane_enabled,
-            conversations=registry.live_conversations)
+            conversations=registry.live_conversations, session=session)
 
     def live_usage_view(self, registry: Registry, now: float) -> dict[str, Any]:
         """Lanes, S1 and hardware for the live view (usage.collect_live): the same sources usage_view reads."""
@@ -2563,6 +2592,7 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
         registry.floor_search = lambda cand, floor, rid: _floor_search(core, cand, floor, rid)
         registry.floor_release = lambda rid: _floor_release(core, rid)
         registry.refusal_route = lambda body, route, run: routing.refusal_route(core, body, route, run)
+        registry.log_tokens = core.log_tokens
     httpd = ProviderServer((host, port), registry)
 
     def reaper():

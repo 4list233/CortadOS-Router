@@ -26,7 +26,8 @@ Owner of four rules:
                 a file on the provider host, never in this repository; `keywords` reads and matches it.
 
 Ollama implements the Anthropic Messages API at POST /v1/messages, so a turn is relayed as-is (stateless: the client
-sends the whole conversation every turn) with only `model` rewritten to the node's tag. Stdlib only.
+sends the whole conversation every turn) with `model` rewritten to the node's tag and, unless the model entry says
+`"thinking": "passthrough"`, thinking turned off when the client did not ask for it (#108, THINKING_MODES). Stdlib only.
 """
 from __future__ import annotations
 
@@ -110,7 +111,8 @@ def nodes(path: str | None = None) -> list[dict[str, Any]]:
             if not mid:
                 raise LocalConfigError(f"node {nid}: every model needs an `id` (the Ollama tag)", nid)
             entry = {"id": mid, "alias": (str(m["alias"]).strip() or None) if m.get("alias") else None,
-                     "name": m.get("name") or mid, "context_length": _context_length(m, nid, mid)}
+                     "name": m.get("name") or mid, "context_length": _context_length(m, nid, mid),
+                     "thinking": _thinking_mode(m, nid, mid)}
             for pin in {mid.casefold(), (entry["alias"] or mid).casefold()}:
                 if pin in seen:
                     raise LocalConfigError(f"pin name {pin!r} is offered twice (nodes {seen[pin]} and {nid})", nid)
@@ -343,6 +345,57 @@ def _context_length(m: dict[str, Any], nid: str, mid: str) -> int:
     return n
 
 
+# A model entry's `thinking` (#108). Ollama's /v1/messages lets a thinking model (Qwen3.x) think whenever the request
+# has no `thinking` field, and the thinking counts against max_tokens: a max_tokens=20 reflex request came back with
+# only a thinking block and stop_reason max_tokens. Anthropic's default is the opposite (no field, no thinking), so
+#   off-unless-asked  (default) a request without `thinking` is sent with {"type": "disabled"}, which Ollama honours
+#                     (observed on 0.40.16: text only, end_turn); a client's own `thinking` is passed through.
+#   passthrough       the request is relayed as the client sent it: for a model or node that rejects the field.
+THINKING_MODES = ("off-unless-asked", "passthrough")
+THINKING_DEFAULT = "off-unless-asked"
+
+
+def _thinking_mode(m: dict[str, Any], nid: str, mid: str) -> str:
+    """A model's validated `thinking` mode; absent means THINKING_DEFAULT, anything else unknown is refused."""
+    v = m.get("thinking")
+    if v is None:
+        return THINKING_DEFAULT
+    if v not in THINKING_MODES:
+        raise LocalConfigError(f"node {nid}: model {mid}: thinking must be one of {', '.join(THINKING_MODES)}, "
+                               f"got {v!r}", nid)
+    return v
+
+
+def client_asked_thinking(body: dict[str, Any]) -> bool:
+    """The client asked for extended thinking: a `thinking` object whose type is anything but "disabled"."""
+    t = body.get("thinking")
+    return isinstance(t, dict) and t.get("type") != "disabled"
+
+
+def _node_body(body: dict[str, Any], model: dict[str, Any]) -> dict[str, Any]:
+    """The request as the node gets it: `model` rewritten to the node's tag and, under off-unless-asked, thinking
+    turned off when the client did not ask for it (a missing field, or one of another shape)."""
+    out = dict(body)
+    out["model"] = model["id"]
+    if model.get("thinking", THINKING_DEFAULT) == "off-unless-asked" and not client_asked_thinking(body):
+        out["thinking"] = {"type": "disabled"}
+    return out
+
+
+def _answered(blocks: list) -> bool:
+    """The reply holds an answer: a non-blank text block or a tool_use (a thinking block alone is not one)."""
+    return any(isinstance(b, dict) and (b.get("type") == "tool_use" or
+                                        b.get("type") == "text" and str(b.get("text") or "").strip())
+               for b in blocks)
+
+
+def thinking_starved(node: dict[str, Any], model: dict[str, Any], max_tokens: Any) -> str:
+    """The client's message when an auto-routed turn spent its whole max_tokens without writing an answer (#108)."""
+    return (f"cortados: this request was auto-routed by S1 to {model['id']} on {node['node']}, which used the whole "
+            f"max_tokens ({max_tokens}) without writing an answer (thinking only); retry with a larger max_tokens, or "
+            f"send x-cortados-exclude-model: {pin_id(model)} to keep S1's route")
+
+
 def pin_id(model: dict[str, Any]) -> str:
     """The name a client pins: the alias when there is one, else the Ollama tag."""
     return model["alias"] or model["id"]
@@ -532,9 +585,12 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
     dropping requests, refusing the token, or the gate's fixed policy refusal: battery, switch off) is then worded by
     auto_routed_unavailable instead of naming a `sub/` pin the person never made."""
     reply = [] if reply is None else reply
-    out = dict(body)
-    out["model"] = model["id"]
-    data = json.dumps(out).encode()
+    data = json.dumps(_node_body(body, model)).encode()
+    # Safety net (#108): an auto-routed turn the client did not ask to think on, which still ended on max_tokens with
+    # no text or tool_use, is answered with an error naming the cause instead of a silent empty answer. Not retried:
+    # thinking was already asked off (or the model is set to passthrough), so the same request would fail the same
+    # way. A pinned model (the person's choice) and a client that asked for thinking get the reply as the node sent it.
+    guard = auto_routed and not client_asked_thinking(body)
     conn = _connection(node["base_url"], node["connect_timeout_s"])
     try:
         try:
@@ -609,6 +665,11 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                 _send_json(handler, 502, _error("api_error", f"cortados: local node {node['node']} sent an "
                                                 f"unreadable response ({type(exc).__name__})"))
                 return "incomplete"
+            if (guard and isinstance(msg, dict) and msg.get("type") == "message"
+                    and msg.get("stop_reason") == "max_tokens" and not _answered(msg.get("content") or [])):
+                _refused(handler, 502, "api_error", "the local model used the whole max_tokens without an answer")
+                _send_json(handler, 502, _error("api_error", thinking_starved(node, model, body.get("max_tokens"))))
+                return "incomplete"
             if isinstance(msg, dict) and msg.get("type") == "message":
                 msg["model"] = echo_model
             if isinstance(msg, dict) and isinstance(msg.get("content"), list):
@@ -624,7 +685,8 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
         except OSError:
             return "incomplete"
         handler.close_connection = True
-        done = False
+        done = starved = False
+        pending: list = []                               # one SSE event's lines, written when its blank line arrives
         try:
             while True:
                 line = resp.readline()
@@ -637,16 +699,36 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                     except ValueError:
                         ev = None
                     if isinstance(ev, dict):
+                        if (guard and ev.get("type") == "message_delta" and isinstance(ev.get("delta"), dict)
+                                and ev["delta"].get("stop_reason") == "max_tokens" and not _answered(reply)):
+                            starved = True                   # this event and the rest are replaced by an error
+                            break
                         _fold(reply, ev)
                         done = done or ev.get("type") == "message_stop"
-                try:
-                    handler.wfile.write(line)
-                    if line in (b"\n", b"\r\n"):
+                pending.append(line)
+                if line in (b"\n", b"\r\n"):
+                    try:
+                        handler.wfile.write(b"".join(pending))
                         handler.wfile.flush()
+                    except OSError:
+                        return "incomplete"                      # the client left
+                    pending = []
+            if pending and not starved:
+                try:
+                    handler.wfile.write(b"".join(pending))
                 except OSError:
-                    return "incomplete"                          # the client left
+                    return "incomplete"
         except (OSError, http.client.HTTPException):
             pass                                                 # the node stalled past read_timeout_s or dropped
+        if starved:
+            _refused(handler, 502, "api_error", "the local model used the whole max_tokens without an answer")
+            ev = _error("api_error", thinking_starved(node, model, body.get("max_tokens")))
+            try:
+                handler.wfile.write(b"event: error\ndata: " + json.dumps(ev).encode() + b"\n\n")
+                handler.wfile.flush()
+            except OSError:
+                pass
+            return "incomplete"
         if not done:                                             # say so in the stream, not by a silent truncation
             _refused(handler, 502, "api_error", "the local node stopped mid-answer (stalled or dropped)")
             ev = _error("api_error", f"cortados: local node {node['node']} stopped mid-answer (stalled past "
