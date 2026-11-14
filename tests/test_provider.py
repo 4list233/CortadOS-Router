@@ -1685,6 +1685,59 @@ class RebuildTests(RoutedHarness):
         follow = body["messages"] + [{"role": "assistant", "content": served["content"]}, {"role": "user", "content": "go"}]
         self.assertEqual(self.post({"tools": [READ_TOOL], "messages": follow})["content"][0]["text"], "echo: go")
 
+    def _race_identical_branch_past_a_finished_rebuild(self):
+        """Round-3 P1's schedule: two identical branch requests both reach Rebuild; B is paused before its gated lookup
+        while A rebuilds AND completes its first turn, then B resumes. Returns (old, out) once both answered."""
+        history = self.converse("hello", "second", "third")
+        (old,) = self.reg.sessions.values()
+        body = {"tools": [READ_TOOL], "messages": history[:2] + [{"role": "user", "content": "second, edited"}]}
+        real, paused, go, out, calls = self.reg.rebuild, threading.Event(), threading.Event(), {}, []
+
+        def gated(*a, **kw):
+            calls.append(1)
+            if len(calls) == 1:                                         # B: told Rebuild, held before the gate
+                paused.set()
+                go.wait(10)
+            return real(*a, **kw)
+
+        with mock.patch.object(self.reg, "rebuild", side_effect=gated):
+            b = threading.Thread(target=lambda: out.update(b=self.answer(body)))
+            b.start()
+            self.assertTrue(paused.wait(10))
+            out["a"] = self.answer(body)                                # A rebuilds and finishes its turn
+            go.set()
+            b.join(30)
+        return old, body, out
+
+    def test_an_identical_branch_resumed_after_the_rebuild_finished_is_replayed_not_rebuilt_again(self):
+        # Review round 3, P1: B no longer finds an exact history match (A's rebuilt session advanced by A's reply), so
+        # before the fix it started a second backend from the retained parent: three sessions, two slots spent, and
+        # the next continuation (identical echo replies) a terminal 400 for two matching sessions.
+        old, body, out = self._race_identical_branch_past_a_finished_rebuild()
+        self.assertEqual(out["a"][0], 200, out)
+        self.assertEqual(out["b"], out["a"])                            # B is A's reply, replayed
+        self.assertEqual(len(self.reg.sessions), 2)                     # the kept parent + one rebuilt session
+        self.assertEqual(old.rebuild_budget.used, 1)
+        self.assertEqual(self.reg._rebuilding, {})
+        follow = body["messages"] + [{"role": "assistant", "content": out["a"][1]["content"]},
+                                     {"role": "user", "content": "go"}]
+        self.assertEqual(self.answer({"tools": [READ_TOOL], "messages": follow})[1]["content"][0]["text"], "echo: go")
+
+    def test_an_identical_branch_resumed_after_an_unreplayable_rebuilt_turn_is_a_stale_409(self):
+        # The same schedule with A's reply too large to keep for a replay: B is a stale continuation of the session A
+        # rebuilt (409, as in work()), never a second backend.
+        real = server.REPLAY_MAX_BYTES
+        server.REPLAY_MAX_BYTES = 1
+        try:
+            old, body, out = self._race_identical_branch_past_a_finished_rebuild()
+        finally:
+            server.REPLAY_MAX_BYTES = real
+        self.assertEqual(out["a"][0], 200, out)
+        self.assertEqual(out["b"][0], 409, out)
+        self.assertIn("moved on", out["b"][1]["error"]["message"])
+        self.assertEqual(len(self.reg.sessions), 2)
+        self.assertEqual(old.rebuild_budget.used, 1)
+
     def test_identity_less_clients_sharing_a_user_agent_never_continue_each_other(self):
         # Review P1-b: two independent callers, both `claude-cli`, no identity, the same reply text. B's session
         # disappears; B's continuation exact-matches A's history. It must not enter A's backend.

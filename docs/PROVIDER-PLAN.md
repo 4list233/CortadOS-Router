@@ -196,7 +196,12 @@ Not yet in P1, each needing a decision or another phase:
   reply), on a gate taken before the budget or the old session is touched; after taking it the exact lookup runs again,
   and a session an identical request published meanwhile is JOINED, never duplicated, so identical concurrent requests
   share one session and its turn lock (the one that loses the lock is a stale continuation, 409, whose retry is
-  replayed). Waiting on the gate past `REBUILD_WAIT_S` (60 s) is a retryable 529. Bounded by `REBUILD_MAX` = 5
+  replayed). A twin that reaches the gate only after the first request's rebuilt session has already answered (#43
+  third review, P1) is recognised by the gate key and its new turn's fingerprint (`rebuilt_for`) and gets that stored
+  reply replayed (or, with none kept, the stale 409), never a second backend. A local-lane continuation re-checks under
+  its turn lock that its session is still the registered one (third review, P2); one replaced or closed while it
+  waited is a retryable 529 and nothing reaches the node. Waiting on the gate past `REBUILD_WAIT_S` (60 s) is a
+  retryable 529. Bounded by `REBUILD_MAX` = 5
   per conversation lineage (each rebuild replays the whole history uncached): one budget shared by every session
   rebuilt from the lineage, compacted or branched, which keeps committed rebuilds (`used`, a backend that started and
   was published) apart from starts still pending (`pending`, given back if the start fails; P2-d). Committed usage at

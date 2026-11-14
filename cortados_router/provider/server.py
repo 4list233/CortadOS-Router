@@ -1043,7 +1043,10 @@ class Registry:
         budget or the old session is touched. After taking it the exact lookup runs again: a session an identical
         request published meanwhile is JOINED (returned as is: both requests then meet on its turn lock, and the
         loser is a stale continuation whose retry is replayed), never duplicated, so identical concurrent requests
-        cannot leave two sessions with one history. A gate held past REBUILD_WAIT_S is ConversationBusy (retryable).
+        cannot leave two sessions with one history. A session an identical request rebuilt (same gate key and new
+        turn, `rebuilt_for`) that has already answered that turn (review round 3, P1) is not rebuilt again either:
+        its stored reply is replayed (Replay), or, if none was kept, the request is a stale continuation
+        (LostSession, the 409 work() gives one). A gate held past REBUILD_WAIT_S is ConversationBusy (retryable).
         Budget (review P2-4, P2-d): one RebuildBudget per lineage, shared by every session rebuilt from it (compacted
         or branched), with committed rebuilds (`used`) apart from starts still pending (`pending`). Committed usage
         at REBUILD_MAX is RebuildLimit (terminal); a limit reached only with pending starts is ConversationBusy
@@ -1071,14 +1074,38 @@ class Registry:
                 raise ConversationBusy("cortados: conversation busy: another request is rebuilding this conversation; "
                                        "retry once it has finished")
             try:
+                fp = anthropic_wire.turn_fingerprint(turn)
+                n = len(turn.history)
                 with self._lock:
                     joined = self._exact(turn.history, scope, wire_path, client)
+                    # Review round 3, P1: an identical request may have rebuilt AND finished its first turn while this
+                    # one waited (before the gate, or on it). That session no longer matches exactly (it holds the
+                    # reply), but it is this very request's rebuild: by the gate key and the new turn's fingerprint.
+                    advanced = [] if joined else [
+                        s for s in self.sessions.values()
+                        if getattr(s, "rebuilt_for", None) == (key, fp)
+                        and len(s.history) == n + 1 and s.history[:n] == turn.history]
+                    last = getattr(advanced[0], "last_reply", None) if len(advanced) == 1 else None
+                    if last and last[0] == n + 1 and last[1] == fp:
+                        advanced[0].last_used = time.time()     # a retry loop's use, as in find()
                 if len(joined) == 1:
                     logger.info("conversation %s: an identical request rebuilt it first; joined, not rebuilt again",
                                 str(joined[0].id)[:8])
                     return joined[0]
+                if advanced:
+                    if last and last[0] == n + 1 and last[1] == fp:
+                        logger.info("conversation %s: an identical request rebuilt it and was answered first; "
+                                    "replaying that answer, not rebuilding again", str(advanced[0].id)[:8])
+                        raise Replay(advanced[0], last)
+                    # Its reply was not kept for a replay (REPLAY_MAX_BYTES): this request is the stale twin of a
+                    # served one, answered as work() answers a stale continuation; a second backend would leave two
+                    # sessions with one history.
+                    logger.info("conversation %s: an identical request rebuilt it and was answered first, with no "
+                                "reply kept to replay; stale continuation (409)", str(advanced[0].id)[:8])
+                    raise LostSession("the conversation moved on while this request waited for it: another request "
+                                      "with the same history was served first; send the current history")
                 return self._rebuild_gated(old, turn, superseded=superseded, transcript=transcript, scope=scope,
-                                           wire_path=wire_path, client=client, anchor=anchor)
+                                           wire_path=wire_path, client=client, anchor=anchor, rebuilt_for=(key, fp))
             finally:
                 gate[0].release()
         finally:
@@ -1088,7 +1115,7 @@ class Registry:
                     del self._rebuilding[key]
 
     def _rebuild_gated(self, old, turn, *, superseded: bool, transcript: list, scope: str | None,
-                       wire_path: str | None, client: str | None, anchor):
+                       wire_path: str | None, client: str | None, anchor, rebuilt_for=None):
         """rebuild()'s work once its in-flight gate is held: reserve, start, publish, retire the old session."""
         budget = self._budget(old)
         with self._lock:
@@ -1129,6 +1156,7 @@ class Registry:
             new.history = list(turn.history)
             new.rebuild_seed = None if isinstance(new, LocalSession) else transcript   # local: the relay is stateless
             new.rebuild_budget = budget
+            new.rebuilt_for = rebuilt_for       # (gate key, new turn's fingerprint): rebuild()'s twin check
             new.route_logged = getattr(old, "route_logged", False)    # the route already ran and was recorded
             if getattr(old, "min_left_pct", None) is not None:
                 new.min_left_pct = old.min_left_pct                   # the tightest client floor carries over
@@ -1946,6 +1974,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(BUSY_STATUS, "overloaded_error", "cortados: conversation busy; retry once the other "
                                "request on it has finished", wire)
         try:
+            if not created and reg.get(session.id) is not session:
+                # Review round 3, P2: the lookup ran before the lock, and the conversation's session was replaced
+                # (a compaction rebuilt it) or closed meanwhile. Relaying on the retired session would answer from a
+                # conversation no later request can find; the retry is looked up afresh. Nothing reaches the node.
+                logger.info("local conversation %s was replaced or closed while this request waited; 529",
+                            str(session.id)[:8])
+                return self._error(BUSY_STATUS, "overloaded_error", "cortados: conversation busy: it was rebuilt or "
+                                   "closed while this request waited for it; retry", wire)
             if not created and session.history != turn.history:
                 return self._error(409, "invalid_request_error", "the conversation moved on while this request waited "
                                    "for it: another request with the same history was served first; send the current "
@@ -2224,29 +2260,7 @@ class Handler(BaseHTTPRequestHandler):
         except ConversationBusy as exc:                 # a rebuild in this scope is starting: the retry sees it done
             return self._error(BUSY_STATUS, "overloaded_error", str(exc), wire)
         except Replay as rp:
-            # A retry that also changes the sub/ pin gets the same refusal as any continuation that does: the stored
-            # answer came from the conversation's own model, which the request no longer asks for.
-            changed = self._model_change(rp.session, body)
-            if changed:
-                return self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
-            _, _, msg_id, model, blocks, stop, usage = rp.last
-            if turn.stream:
-                try:
-                    self.send_response(200)
-                    self._route_header(rp.session)
-                    self.send_header("content-type", "text/event-stream")
-                    self.send_header("cache-control", "no-cache")
-                    self.send_header("connection", "close")
-                    self.end_headers()
-                    self.close_connection = True
-                    self.wfile.write(wire.stream_start(msg_id, model))
-                    for chunk in wire.stream_body(msg_id, model, blocks, stop, usage):
-                        self.wfile.write(chunk)
-                    self.wfile.flush()
-                except OSError as gone:
-                    logger.info("client gone while the replayed reply was written (%s)", gone)
-                return
-            return self._json(200, wire.message_json(msg_id, model, blocks, stop, usage), session=rp.session)
+            return self._serve_replay(rp, turn, body, wire)
         except LostSession as exc:
             return self._error(409, "invalid_request_error", str(exc), wire)
         if rebuild is not None:
@@ -2579,6 +2593,32 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(TERMINAL_STATUS, wire.error_json(TERMINAL_ERROR, message), headers={"x-should-retry": "false"})
 
+    def _serve_replay(self, rp: "Replay", turn, body: dict[str, Any], wire: Wire) -> None:
+        """Answer a retry of an answered turn with the stored reply (Registry.find, or rebuild()'s identical twin).
+        A retry that also changes the sub/ pin gets the same refusal as any continuation that does: the stored
+        answer came from the conversation's own model, which the request no longer asks for."""
+        changed = self._model_change(rp.session, body)
+        if changed:
+            return self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
+        _, _, msg_id, model, blocks, stop, usage = rp.last
+        if turn.stream:
+            try:
+                self.send_response(200)
+                self._route_header(rp.session)
+                self.send_header("content-type", "text/event-stream")
+                self.send_header("cache-control", "no-cache")
+                self.send_header("connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                self.wfile.write(wire.stream_start(msg_id, model))
+                for chunk in wire.stream_body(msg_id, model, blocks, stop, usage):
+                    self.wfile.write(chunk)
+                self.wfile.flush()
+            except OSError as gone:
+                logger.info("client gone while the replayed reply was written (%s)", gone)
+            return
+        return self._json(200, wire.message_json(msg_id, model, blocks, stop, usage), session=rp.session)
+
     def _rebuild(self, rb: "Rebuild", turn, body: dict[str, Any], wire: Wire, scope: str | None):
         """Serve a continuation whose client rewrote the history on a rebuilt backend (Registry.rebuild); the new
         session, or None once a refusal has been answered. The conversation's model is fixed (a changed sub/ pin is
@@ -2609,6 +2649,10 @@ class Handler(BaseHTTPRequestHandler):
                                wire_path=self.path.split("?")[0], client=self._client())
         except Refused as exc:                          # the limit, committed by a concurrent rebuild
             self._terminal(turn, wire, str(exc), reason=REFUSED_REASONS.get(exc.code, REBUILD_LIMIT_REASON))
+        except Replay as rp:                            # an identical request rebuilt it and was answered first
+            self._serve_replay(rp, turn, body, wire)
+        except LostSession as exc:                      # ...and its answer was not kept: a stale continuation
+            self._error(409, "invalid_request_error", str(exc), wire)
         except ConversationBusy as exc:
             self._error(BUSY_STATUS, "overloaded_error", str(exc), wire)
         except UnservedProvider as exc:
