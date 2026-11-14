@@ -2584,8 +2584,11 @@ class Handler(BaseHTTPRequestHandler):
                 # opening request's tools (Codex declares them once, on thread/start), so a tool added or dropped
                 # mid-conversation is never re-declared. Said once per conversation, names only; routing is unchanged.
                 session.tools_warned = True
+                # The usual cause of an ADDED tool is a Claude Code client with tool search on (#117): calls to it fail
+                # on the backend as "No such tool available". session.launcher_env turns it off; the hint names it.
                 logger.warning("conversation %s: the tool set changed mid-conversation (added %s, dropped %s); the "
-                               "running backend keeps the tools it started with", session.id[:8],
+                               "running backend keeps the tools it started with (a Claude Code client adding tools "
+                               "has tool search on: run it with ENABLE_TOOL_SEARCH=false, #117)", session.id[:8],
                                sorted(names - session.tool_names), sorted(session.tool_names - names))
             if one_shot:
                 # The transcript re-reads the whole history, so a shape error in an older user item surfaces here,

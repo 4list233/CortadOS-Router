@@ -148,6 +148,13 @@ def launcher_env(provider_url: str, token: str, delegate_budget: int = 3, run_id
             "CLAUDE_CODE_ENTRYPOINT": "cli",
             "CORTADOS_WHOLE_SESSION": "1",
             "CORTADOS_DELEGATE_BUDGET": str(delegate_budget),
+            # Every tool declared in the opening request (#117). With tool search on, Claude Code (2.1.325, measured
+            # on a fake API 2026-11-14) opens with only ToolSearch + a DeferredToolPlaceholder and adds an MCP tool's
+            # schema to `tools` only after ToolSearch loads it. The provider starts the backend with the opening
+            # request's tools and never re-declares them (server.py "tool set changed mid-conversation"; Codex takes
+            # dynamic tools once, on thread/start), so the backend model saw a loaded connector tool's name and
+            # every call ended in the backend CLI's own "No such tool available" (task t20261114164728-86cbe366).
+            "ENABLE_TOOL_SEARCH": "false",
         }
     )
     for key in BLANKED:

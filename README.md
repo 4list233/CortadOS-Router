@@ -662,9 +662,13 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   `~/.claude/CLAUDE.md` does not make it delegate again. Children never get the whole-session ORCHESTRATOR directive
   or its delegation gate, whatever `orchestrator` is: a pin only pins the child's main model (its native subagents
   are still S1-routed).
-- `claude -p` and deferred tool loading: with tool search on, a headless session may not have an MCP tool's schema
-  loaded and report e.g. "start_task is not a function". Run such sessions with `ENABLE_TOOL_SEARCH=false` so every
-  MCP tool is loaded up front.
+- Deferred tool loading (#117): every session the launcher (`session.launcher_env`) puts on the provider, whole
+  sessions and child tasks alike, runs with `ENABLE_TOOL_SEARCH=false`. With tool search on, Claude Code (2.1.325)
+  opens a conversation with only `ToolSearch` and a `DeferredToolPlaceholder`, and adds an MCP tool's schema to
+  `tools` only after ToolSearch loads it. The provider starts its backend with the opening request's tools and never
+  re-declares them (Codex takes dynamic tools once, on `thread/start`), so a tool loaded later was listed to the model
+  but every call ended in the backend CLI's own "No such tool available" (a routed child with
+  `connectors: ["wispr-flow"]`, 2026-11-14). Any other client pointed at the provider by hand must set it too.
 - `chrome: true` (default false) runs the child in LOGIN MODE (decided 2026-11-03): `claude` directly on the user's
   claude.ai login. Its env is an ALLOWLIST (`LOGIN_ENV_ALLOW`: shell basics, the bookkeeping paths, proxy/CA vars
   with any `user:pass@` proxy URL dropped); `LOGIN_FORBIDDEN_ENV` / `_PREFIXES` can never pass (provider URL and

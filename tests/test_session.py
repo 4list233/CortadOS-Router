@@ -107,6 +107,8 @@ class SessionTests(unittest.TestCase):
         self.assertIn("x-cortados-reveal: 1", env["ANTHROPIC_CUSTOM_HEADERS"])
         self.assertEqual(env["CORTADOS_WHOLE_SESSION"], "1")
         self.assertEqual(env["CLAUDE_CODE_ENTRYPOINT"], "cli")
+        # #117: tool search off, so every MCP tool is in the opening request the provider starts its backend with
+        self.assertEqual(env["ENABLE_TOOL_SEARCH"], "false")
         for k in session.BLANKED:
             self.assertEqual(env[k], "")
         self.assertEqual(cmd[:3], ["claude", "--model", "sub/claude-fable-5-1"])

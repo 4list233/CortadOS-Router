@@ -65,7 +65,7 @@ FAKE = textwrap.dedent('''\
                    "env": {{k: os.environ.get(k) for k in ("CORTADOS_PROVIDER_TOKEN", "CORTADOS_PROVIDER_URL",
                            "CORTADOS_PROVIDER_TOKEN_FILE", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_MODEL",
                            "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL",
-                           "ANTHROPIC_AUTH_TOKEN", "HOME", "PATH")}}}}, f)
+                           "ANTHROPIC_AUTH_TOKEN", "HOME", "PATH", "ENABLE_TOOL_SEARCH")}}}}, f)
     if mode == "sleep":
         time.sleep(60)
     if mode == "stubborn":
@@ -630,7 +630,13 @@ class ChildTaskTests(ChildTaskBase):
         tid = self.start(connectors=["notion"])
         d = ct.task_path(tid)
         _, w = self.call("wait_task", task_id=tid, timeout_s=30)
-        a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
+        seen = _load(os.path.join(self.work, "fake-argv.json"))
+        a = seen["argv"]
+        # #117: a routed child runs with tool search off, in its env and in its flag-precedence settings, so the
+        # connector tools are in the opening request the provider starts its backend with. With tool search on they
+        # were added only after ToolSearch, the backend never had them, and every call was "No such tool available".
+        self.assertEqual(seen["env"]["ENABLE_TOOL_SEARCH"], "false")
+        self.assertEqual(seen["settings"]["body"]["env"]["ENABLE_TOOL_SEARCH"], "false")
         path = a[a.index("--mcp-config") + 1]
         self.assertEqual(os.path.dirname(path), d)                 # a private per-task file, not the full config
         self.assertFalse(os.path.exists(path), "the selection (it may carry credentials) is removed at exit")
@@ -1486,6 +1492,9 @@ class ChildTaskTests(ChildTaskBase):
         conn = _load(os.path.join(d, "meta.json"))
         self.assertEqual(conn["connectors"], ["velox", "wispr-flow"])
         self.assertIn("--mcp-config", a)
+        # #117, the failing shape exactly (routed, connectors, gui LaunchAgent): the runner's env file carries tool
+        # search off to the child, so the connector tools are declared up front and reach the provider's backend
+        self.assertEqual(seen["env"]["ENABLE_TOOL_SEARCH"], "false")
         # the env file and the settings file (both token-free / token-bearing 0600 session-*.json) are gone after
         self.assertFalse([n for n in os.listdir(d) if n.startswith("session-")])
         self.assertTrue(_load(os.path.join(d, ct.LAUNCHD_FILE))["booted_out"])
