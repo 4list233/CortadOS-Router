@@ -528,10 +528,10 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   remote, and a stopped `git am` holds outright, `unpushed_operation_state`. `ORIG_HEAD` and the worktree's reflogs do
   not hold, since every reset, amend or rebase writes them; instead, before the folder is archived (and again before
   the cleanup deletes it) every commit only they reach gets a recovery ref in the clone,
-  `refs/cortados-recovery/<task_id>/orig-head` or `.../reflog-<n>` (one per tip; the count is `recovery_refs` in the
-  settle record, `task_status` and the run export, never the names); a ref that cannot be written holds the folder,
-  `recovery_refs_failed`. No cleanup ever deletes a recovery ref. TODO(owner): decide when recovery refs expire; until
-  then they accumulate in each clone) or `held/` (anything
+  `refs/cortados-recovery/<YYYYMMDD>/<task_id>/orig-head` or `.../reflog-<n>`, dated with the UTC day it was created
+  (one per tip; the count is `recovery_refs` in the settle record, `task_status` and the run export, never the
+  names); a ref that cannot be written holds the folder, `recovery_refs_failed`. Recovery refs expire 30 days after
+  creation (owner, 2026-11-14): see Archive cleanup) or `held/` (anything
   else, or a worktree git cannot assess) with `git worktree move`, and records it in `<root>/index.jsonl` (one line per
   task, rewritten under `index.lock`). Git-ignored files count as unpublished owner data, except regenerable caches
   (`__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `*.pyc`) and empty ignored directories; a nested
@@ -585,7 +585,14 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   another entry. With the admin dir kept, commits reachable from a worktree's HEAD or index survive any gc; in a held
   worktree a commit reachable only from reflog entries (committed, then reset away) is lost once git's normal reflog
   expiry drops those entries, which is acceptable: held work's commits are on its HEAD. An archived worktree's such
-  commits are kept by its recovery refs (above) before it is ever deleted. `settle()`
+  commits are kept by its recovery refs (above) before it is ever deleted. Recovery refs expire 30 days after they
+  were created (owner, 2026-11-14; `RECOVERY_REF_RETENTION_S`): each cleanup deletes, in every clone, the refs under
+  `refs/cortados-recovery/` whose creation day (in the ref's own name, written in the same transaction as the ref, so
+  no separate index can disagree with it) ended 30 days ago or more, each with `git update-ref -d <ref> <old value>`
+  so a ref that moved since it was read is kept (reported as an error); nothing outside that namespace is touched.
+  An undated ref from the first layout (`refs/cortados-recovery/<task_id>/...`) is renamed to today's date the first
+  time a cleanup sees it, so it is kept 30 days from then, never deleted at once. The report carries counts only:
+  `recovery_refs_expired`, `recovery_refs_dated`. `settle()`
   moves under `cleanup.lock` (waits at most 60 s; past it the folder stays in `active/` marked `settle_deferred` and
   the next cleanup settles it; `task_status` then reports the index's settled record). Lock order: clone lock -> `cleanup.lock` -> `index.lock`. `integrations/launchd/com.cortados.archive-cleanup.plist` runs it daily on
   the Air; task startup never runs cleanup, so starting a task is not delayed by cleanup locks or remote fetches.

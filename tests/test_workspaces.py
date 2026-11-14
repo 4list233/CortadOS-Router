@@ -2278,8 +2278,9 @@ class OperationStateAndRecoveryTests(_Base):
 
     def recovery(self, tid=TID):
         clone = os.path.join(self.root, "repos", "demo")
-        out = git("for-each-ref", "--format=%(refname) %(objectname)", ws.RECOVERY_REF_PREFIX + tid + "/", cwd=clone)
-        return dict(line.split() for line in out.splitlines())
+        out = git("for-each-ref", "--format=%(refname) %(objectname)", ws.RECOVERY_REF_PREFIX, cwd=clone)
+        refs = dict(line.split() for line in out.splitlines())
+        return {r: o for r, o in refs.items() if (ws._recovery_ref_parts(r) or (None, None))[1] == tid}
 
     def reachable(self, sha, ref):
         clone = os.path.join(self.root, "repos", "demo")
@@ -2451,7 +2452,8 @@ class OperationStateAndRecoveryTests(_Base):
                 self.assertEqual((settled["state"], settled.get("detached"), settled["recovery_refs"]),
                                  ("archived", True, len(want)), settled)
                 refs = self.recovery(tid)
-                self.assertEqual(refs, {ws.RECOVERY_REF_PREFIX + tid + "/" + k: v for k, v in want.items()})
+                day = time.strftime("%Y%m%d", time.gmtime())
+                self.assertEqual(refs, {f"{ws.RECOVERY_REF_PREFIX}{day}/{tid}/{k}": v for k, v in want.items()})
                 self.age(settled)
         report = ws.cleanup_archive(self.root)
         self.assertEqual((sorted(report["deleted"]), report["errors"]), (sorted(cases), []), report)
@@ -2527,6 +2529,97 @@ class OperationStateAndRecoveryTests(_Base):
         self.assertEqual(list(self.recovery().values()), [lost])
         with self.assertRaises(ws.WorkspaceError):
             ws.preserve_recovery_refs(rec["path"], "../../heads/main")
+
+
+class RecoveryRefExpiryTests(_Base):
+    """Owner decision 2026-11-14: recovery refs expire 30 days after creation; the daily cleanup deletes them, only
+    under refs/cortados-recovery/, only at the value it read. Real git in a real clone; the clock is cleanup's `now`."""
+
+    NOW = 1794614400.0                                # 2026-11-14 00:00:00 UTC
+
+    def setUp(self):
+        super().setUp()
+        self.prepare(repo=self.origin, branch="feature")          # makes the clone repos/demo
+        self.clone = os.path.join(self.root, "repos", "demo")
+        self.main = git("rev-parse", "origin/main", cwd=self.clone).strip()
+        self.other = git("commit-tree", "-p", self.main, "-m", "lost", self.main + "^{tree}", cwd=self.clone).strip()
+
+    def refs(self, prefix="refs/"):
+        out = git("for-each-ref", "--format=%(refname) %(objectname)", prefix, cwd=self.clone)
+        return dict(line.split() for line in out.splitlines())
+
+    def day(self, days_before):
+        return time.strftime("%Y%m%d", time.gmtime(self.NOW - days_before * 86400))
+
+    def put(self, ref, sha=None):
+        git("update-ref", ref, sha or self.other, cwd=self.clone)
+        return ref
+
+    def test_the_retention_is_thirty_days_from_the_end_of_the_creation_day(self):
+        self.assertEqual(ws.RECOVERY_REF_RETENTION_S, 30 * 24 * 3600)
+        self.assertEqual(time.strftime("%Y-%m-%d %H:%M", time.gmtime(self.NOW)), "2026-11-14 00:00")
+        self.assertTrue(ws.recovery_ref_expired("20261014", self.NOW))       # ended 2026-10-15 00:00: 30 days
+        self.assertFalse(ws.recovery_ref_expired("20261014", self.NOW - 1))
+        self.assertFalse(ws.recovery_ref_expired("20261015", self.NOW))
+
+    def test_old_refs_are_deleted_new_and_undated_kept_and_nothing_else_touched(self):
+        P = ws.RECOVERY_REF_PREFIX
+        old = [self.put(f"{P}{self.day(31)}/{TID}/orig-head"), self.put(f"{P}{self.day(45)}/{TID2}/reflog-1")]
+        new = [self.put(f"{P}{self.day(29)}/{TID}/reflog-1"), self.put(f"{P}{self.day(0)}/{TID2}/orig-head")]
+        legacy = self.put(f"{P}{TID}/reflog-7")
+        # outside the namespace or not one of its two layouts, all named like old recovery refs: never touched
+        outside = [self.put(f"refs/cortados-recovery-old/{self.day(90)}/{TID}/orig-head"),
+                   self.put(f"refs/heads/{self.day(90)}/{TID}/x"), self.put(f"refs/tags/{self.day(90)}"),
+                   self.put(f"{P}notes/{self.day(90)}"), self.put(f"{P}{self.day(90)}/not-a-task/x")]
+        before = self.refs()
+        report = ws.cleanup_archive(self.root, now=self.NOW)
+        self.assertEqual((report["recovery_refs_expired"], report["recovery_refs_dated"], report["errors"]),
+                         (2, 1, []), report)
+        self.assertNotIn(TID, json.dumps(report["recovery_refs_expired"]))       # a number, never names
+        after = self.refs()
+        for ref in old:
+            self.assertNotIn(ref, after)
+        for ref in new + outside:
+            self.assertEqual(after.get(ref), before[ref], ref)
+        # the undated ref is renamed to today's date at the same commit, never deleted
+        self.assertNotIn(legacy, after)
+        dated = f"{P}{self.day(0)}/{TID}/reflog-7"
+        self.assertEqual(after.get(dated), self.other)
+        self.assertEqual(set(after), set(before) - set(old) - {legacy} | {dated})
+        # ...and kept until 30 days after that day, then deleted
+        report = ws.cleanup_archive(self.root, now=self.NOW + 30 * 86400)
+        self.assertEqual((report["recovery_refs_expired"], report["recovery_refs_dated"]), (1, 0), report)
+        self.assertIn(dated, self.refs())
+        report = ws.cleanup_archive(self.root, now=self.NOW + 31 * 86400)
+        self.assertEqual(report["recovery_refs_expired"], 2, report)          # the 29-day-old one went too
+        self.assertNotIn(dated, self.refs())
+        self.assertEqual({r: o for r, o in self.refs().items() if r in outside}, {r: before[r] for r in outside})
+
+    def test_an_expired_ref_that_moved_after_it_was_read_is_not_deleted(self):
+        ref = self.put(f"{ws.RECOVERY_REF_PREFIX}{self.day(40)}/{TID}/orig-head")
+        real = ws._git
+
+        def racing(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
+            if "update-ref" in args and "-d" in args:
+                self.assertEqual(args[-2:], [ref, self.other])               # the old value is always passed
+                git("update-ref", ref, self.main, cwd=self.clone)             # a writer moves it in between
+            return real(args, cwd=cwd, timeout=timeout, **kw)
+        with mock.patch.object(ws, "_git", side_effect=racing):
+            report = ws.cleanup_archive(self.root, now=self.NOW)
+        self.assertEqual(report["recovery_refs_expired"], 0, report)
+        self.assertEqual(len(report["errors"]), 1, report)
+        self.assertIn("changed since read", report["errors"][0])
+        self.assertEqual(self.refs(ws.RECOVERY_REF_PREFIX), {ref: self.main})
+
+    def test_a_new_recovery_ref_is_dated_with_its_creation_day(self):
+        path = os.path.join(self.root, "active", TID)
+        git("commit", "-q", "--allow-empty", "-m", "lost", cwd=path)
+        lost = git("rev-parse", "HEAD", cwd=path).strip()
+        git("reset", "-q", "--hard", "HEAD~1", cwd=path)
+        self.assertEqual(ws.preserve_recovery_refs(path, TID, now=self.NOW - 3 * 86400), 1)
+        want = f"{ws.RECOVERY_REF_PREFIX}{self.day(3)}/{TID}/orig-head"
+        self.assertEqual(self.refs(ws.RECOVERY_REF_PREFIX), {want: lost})
+        self.assertEqual(ws.preserve_recovery_refs(path, TID, now=self.NOW), 1)    # idempotent across days
 
 
 if __name__ == "__main__":

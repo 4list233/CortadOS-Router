@@ -25,10 +25,13 @@ notes merge holds outright (`unpushed_operation_state`). Branches, tags and the 
 by every task's worktree and survive the deletion: they neither hold a worktree nor count as a change in it (#102).
 ORIG_HEAD and the worktree's own reflogs do not hold (every reset, amend, rebase or pull writes them, #102), but
 before a worktree is archived, and again before the cleanup deletes it, every commit only they reach gets a recovery
-ref in the clone, refs/cortados-recovery/<task_id>/orig-head or .../reflog-<n> (preserve_recovery_refs); if one
-cannot be written the worktree is held (`recovery_refs_failed`). Nothing here ever deletes a recovery ref.
-TODO(owner): decide when recovery refs expire; until then they accumulate, one small ref per lost tip. FETCH_HEAD
-names fetched commits, not local work, and is not checked.
+ref in the clone, refs/cortados-recovery/<YYYYMMDD>/<task_id>/orig-head or .../reflog-<n>, <YYYYMMDD> the UTC day
+it was created (preserve_recovery_refs); if one cannot be written the worktree is held (`recovery_refs_failed`).
+Recovery refs expire 30 days after they were created (owner, 2026-11-14; RECOVERY_REF_RETENTION_S): the daily
+cleanup deletes them (expire_recovery_refs), counted from the end of the creation day, each with `git update-ref -d`
+at the value it was read with, so one that moved is kept; nothing outside refs/cortados-recovery/ is touched. An
+undated ref from the first layout (refs/cortados-recovery/<task_id>/...) is dated today on first sight and so kept
+30 days from then. FETCH_HEAD names fetched commits, not local work, and is not checked.
 
 Known limit, accepted by the owner (2026-11-14, review 3 P1 #1): the quarantine stops writers that reach the tree by
 its path, not one that already holds a descriptor inside it (an open file or directory, a current directory). Such a
@@ -71,6 +74,7 @@ Stdlib only. git runs as a subprocess with GIT_TERMINAL_PROMPT=0 (an unauthentic
 """
 from __future__ import annotations
 
+import calendar
 import fcntl
 import json
 import os
@@ -697,10 +701,18 @@ OP_STATE_MAX_TOKENS = 20000
 REFLOG_MAX_BYTES = 16 * 1024 * 1024         # across the worktree's own reflogs (recovery refs)
 _HEX_TOKEN_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{7,64}(?![0-9A-Za-z])")
 
-# Recovery refs (review 4, #2): `refs/cortados-recovery/<task_id>/orig-head` and `.../reflog-<n>` in the clone keep
-# the commits a worktree's ORIG_HEAD or own reflogs reach and no shared ref does, before the worktree is archived (and
-# again before the cleanup deletes it). Nothing in this module ever deletes them. TODO(owner): decide their expiry.
+# Recovery refs (review 4, #2): `refs/cortados-recovery/<YYYYMMDD>/<task_id>/orig-head` and `.../reflog-<n>` in the
+# clone keep the commits a worktree's ORIG_HEAD or own reflogs reach and no shared ref does, before the worktree is
+# archived (and again before the cleanup deletes it). <YYYYMMDD> is the UTC day the ref was created. The creation date
+# lives in the ref's own name rather than in an index file next to it: it is written in the same atomic update-ref
+# transaction as the ref, so the two can never disagree, a crash cannot leave one without the other, and no second
+# store needs a lock or a repair; `git for-each-ref` alone answers "how old". Refs from 99d0e9f's undated layout
+# (`<task_id>/<name>`) are renamed to today's date by the first cleanup that sees them (expire_recovery_refs), so they
+# get the full retention from then on. The daily cleanup deletes a ref RECOVERY_REF_RETENTION_S after the END of its
+# creation day (so 30 to 31 days after creation, never sooner).
 RECOVERY_REF_PREFIX = "refs/cortados-recovery/"
+RECOVERY_REF_RETENTION_S = 30 * 24 * 3600   # owner, 2026-11-14: 30 days (measured from creation, not the task's start)
+_RECOVERY_DATE_RE = re.compile(r"\d{8}")
 
 
 def _op_state_files(gitdir: str, deadline=None) -> list:
@@ -876,17 +888,46 @@ def _recovery_candidates(path: str, gitdir: str, deadline=None):
     return orig, logged
 
 
-def preserve_recovery_refs(path: str, task_id: str, deadline=None) -> int:
+def _recovery_day(now: float) -> str:
+    return time.strftime("%Y%m%d", time.gmtime(now))
+
+
+def _recovery_ref_parts(ref: str):
+    """(creation day "YYYYMMDD" or None for the undated 99d0e9f layout, task id) of a recovery ref, or None when the
+    name is neither layout (such a ref is never touched)."""
+    if not ref.startswith(RECOVERY_REF_PREFIX):
+        return None
+    parts = ref[len(RECOVERY_REF_PREFIX):].split("/")
+    if len(parts) == 3 and _RECOVERY_DATE_RE.fullmatch(parts[0]) and TASK_ID_RE.fullmatch(parts[1]) and parts[2]:
+        try:
+            time.strptime(parts[0], "%Y%m%d")
+        except ValueError:
+            return None
+        return parts[0], parts[1]
+    if len(parts) == 2 and TASK_ID_RE.fullmatch(parts[0]) and parts[1]:
+        return None, parts[0]
+    return None
+
+
+def recovery_ref_expired(day: str, now: float) -> bool:
+    """Whether a recovery ref created on UTC `day` ("YYYYMMDD") is past RECOVERY_REF_RETENTION_S at `now`, counted
+    from the end of that day (the ref may have been made at 23:59), so never early."""
+    end_of_day = calendar.timegm(time.strptime(day, "%Y%m%d")) + 24 * 3600
+    return now - end_of_day >= RECOVERY_REF_RETENTION_S
+
+
+def preserve_recovery_refs(path: str, task_id: str, deadline=None, now=None) -> int:
     """Keep what deleting the worktree at `path` would lose from its ORIG_HEAD and its own reflogs (HEAD's and its
     private refs'): every such commit no shared ref of the clone reaches (branches, tags, remote-tracking refs, earlier
     recovery refs; never this or another worktree's HEAD or private refs) gets a ref in the clone, one per tip that
-    no other kept commit has as a descendant: RECOVERY_REF_PREFIX<task_id>/orig-head for ORIG_HEAD, reflog-<n> for
-    the rest, all created in one `git update-ref --stdin` transaction (hooks off) and read back. Returns how many
-    recovery refs the task has. Idempotent: a second call finds everything kept. Raises WorkspaceError (GitTimeoutError
-    included) when anything cannot be read, written or verified: the caller holds (fail closed)."""
+    no other kept commit has as a descendant: RECOVERY_REF_PREFIX<YYYYMMDD>/<task_id>/orig-head for ORIG_HEAD,
+    reflog-<n> for the rest (<YYYYMMDD>: today, UTC, from `now`), all created in one `git update-ref --stdin`
+    transaction (hooks off) and read back. Returns how many recovery refs the task has, of any date or layout.
+    Idempotent: a second call finds everything kept. Raises WorkspaceError (GitTimeoutError included) when anything
+    cannot be read, written or verified: the caller holds (fail closed)."""
     if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
         raise WorkspaceError(f"not a task id: {task_id!r}")
-    prefix = f"{RECOVERY_REF_PREFIX}{task_id}/"
+    prefix = f"{RECOVERY_REF_PREFIX}{_recovery_day(time.time() if now is None else now)}/{task_id}/"
     gitdir = _git(["rev-parse", "--absolute-git-dir"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S)).strip()
     orig, logged = _recovery_candidates(path, gitdir, deadline)
     cands = list(dict.fromkeys(([orig] if orig else []) + logged))
@@ -918,7 +959,51 @@ def preserve_recovery_refs(path: str, task_id: str, deadline=None) -> int:
             if wrong:
                 raise WorkspaceError(f"recovery ref(s) not written as planned: {', '.join(wrong)}")
             refs.update(made)
-    return sum(1 for ref in refs if ref.startswith(prefix))
+    return sum(1 for ref in refs if (_recovery_ref_parts(ref) or (None, None))[1] == task_id)
+
+
+def expire_recovery_refs(clone: str, now: float, deadline=None) -> dict:
+    """The recovery-ref retention pass over one clone (run by the daily cleanup, under cleanup.lock, the lock every
+    writer of recovery refs holds). An undated ref (99d0e9f's `<task_id>/<name>`) is first seen here: it is renamed to
+    `<today>/<task_id>/<name>` in one update-ref transaction (create the new name, delete the old at its old value),
+    so it gets the full retention from now and is never deleted on this run. A dated ref whose day is
+    RECOVERY_REF_RETENTION_S past (recovery_ref_expired) is deleted with `git update-ref -d <ref> <old value>`, so a
+    ref that moved since it was read is not deleted. Only names under RECOVERY_REF_PREFIX in one of the two layouts
+    are ever touched; hooks are off. Returns {"expired": n deleted, "dated": n renamed, "errors": [text]}. Raises
+    GitTimeoutError past `deadline`, WorkspaceError when the refs cannot be listed."""
+    out = {"expired": 0, "dated": 0, "errors": []}
+    refs = _ref_oids(clone, (RECOVERY_REF_PREFIX,), deadline)
+    today, changed, failed = _recovery_day(now), 0, 0
+    for ref, oid in sorted(refs.items()):
+        parts = _recovery_ref_parts(ref)
+        if parts is None or not _OID_RE.fullmatch(oid):
+            continue
+        day, tid = parts
+        if day is None:
+            new = f"{RECOVERY_REF_PREFIX}{today}/{tid}/{ref[len(RECOVERY_REF_PREFIX) + len(tid) + 1:]}"
+            try:
+                _git(["-c", "core.hooksPath=/dev/null", "update-ref", "--stdin"], cwd=clone,
+                     timeout=_within(deadline, GIT_TIMEOUT_S), input=f"create {new} {oid}\ndelete {ref} {oid}\n")
+                out["dated"] += 1
+            except GitTimeoutError:
+                raise
+            except WorkspaceError:
+                failed += 1
+        elif recovery_ref_expired(day, now):
+            try:
+                _git(["-c", "core.hooksPath=/dev/null", "update-ref", "-d", ref, oid], cwd=clone,
+                     timeout=_within(deadline, GIT_TIMEOUT_S))
+                out["expired"] += 1
+            except GitTimeoutError:
+                raise
+            except WorkspaceError:
+                changed += 1
+    if changed:
+        out["errors"].append(f"{changed} expired recovery ref(s) could not be deleted (changed since read, or locked); "
+                             "kept")
+    if failed:
+        out["errors"].append(f"{failed} undated recovery ref(s) could not be dated; kept undated, retried next run")
+    return out
 
 
 def _private_refs(path: str, gitdir: str, deadline=None) -> dict:
@@ -2026,6 +2111,37 @@ def _protect_clones(root: str, out: dict) -> set:
     return unprotected
 
 
+def _expire_recovery_refs(root: str, out: dict, now: float, deadline, unprotected: set) -> None:
+    """expire_recovery_refs() for every protected clone under repos/; counts only in the report (numbers, never ref
+    names: `recovery_refs_expired`, `recovery_refs_dated`). Runs before any archive entry is assessed, so a deletion's
+    preserve_recovery_refs sees the refs that are left (and re-keeps, under today's date, anything a worktree still
+    in archive/ needs)."""
+    repos = os.path.join(root, "repos")
+    try:
+        names = sorted(os.listdir(repos))
+    except OSError:
+        return
+    for name in names:
+        clone = os.path.join(repos, name)
+        if name.startswith(".") or os.path.islink(clone) or not os.path.isdir(os.path.join(clone, ".git")) \
+                or os.path.normpath(clone) in unprotected:
+            continue
+        if deadline is not None and time.monotonic() >= deadline:
+            out["timed_out"].append(f"repos/{name}: no time left to expire recovery refs")
+            continue
+        try:
+            done = expire_recovery_refs(clone, now, deadline)
+        except GitTimeoutError as exc:
+            out["timed_out"].append(f"repos/{name}: recovery ref expiry: {exc}")
+            continue
+        except WorkspaceError as exc:
+            out["errors"].append(f"repos/{name}: recovery refs could not be listed ({exc})")
+            continue
+        out["recovery_refs_expired"] += done["expired"]
+        out["recovery_refs_dated"] += done["dated"]
+        out["errors"].extend(f"repos/{name}: {e}" for e in done["errors"])
+
+
 def _settle_deferred(root: str, out: dict, deadline, unprotected: set) -> None:
     """Settle the tasks whose own settle() could not get cleanup.lock (index state active, `settle_deferred`). Runs
     under cleanup.lock. An assessment that times out leaves the folder in active/ for the next run."""
@@ -2090,7 +2206,8 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
     deadline = None if max_seconds is None else started + max_seconds
     now = time.time() if now is None else now
     archive = os.path.join(root, "archive")
-    out = {"deleted": [], "kept": 0, "refused": [], "errors": [], "timed_out": [], "repaired": [], "settled": []}
+    out = {"deleted": [], "kept": 0, "refused": [], "errors": [], "timed_out": [], "repaired": [], "settled": [],
+           "recovery_refs_expired": 0, "recovery_refs_dated": 0}
     unprotected = _protect_clones(root, out)
     # Deferred settles first (#93 round 3): a run whose registry repairs are slow must not starve them. Each move
     # repairs its own entry; the prepass then repairs what is left, under the same deadline (each repair started
@@ -2100,6 +2217,7 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
     out["repaired"].extend(fixed["repaired"])
     out["errors"].extend(fixed["errors"])
     out["timed_out"].extend(fixed["skipped"])
+    _expire_recovery_refs(root, out, now, deadline, unprotected)
     try:
         archive_fd = _open_dir(archive)
     except OSError as exc:
