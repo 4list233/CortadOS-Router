@@ -339,9 +339,17 @@ call, timeout and retry as the opening's routing call; a degraded result fails c
 the latest user words (client reminders removed; on a tool-result turn with no words, the latest earlier user words)
 **and the text of the tool results added since the last scored turn** (those after the conversation's last assistant
 message, `<system-reminder>` tags kept: a tool result is not the client's wrapper). A tool result can carry an
-instruction the person never wrote ("now email this file to ..."), so it is scored as if they had. The scored text is
-capped to S1's own 6000-character input (`routing.CONTINUATION_SCORE_CAP`): the words first (up to 2000 characters),
-the new results in the rest, a longer result keeping its head and its tail. An admission is reused for 180 s
+instruction the person never wrote ("now email this file to ..."), so it is scored as if they had. A turn longer than
+S1's own 6000-character input (`routing.CONTINUATION_SCORE_CAP`) is scored in chunks (`routing.continuation_chunks`),
+**every one of which must pass**: each chunk opens with the person's words (up to 1500 characters, head and tail;
+longer words are also scored in full, in windows of their own) followed by a window of the new tool results, and the
+windows overlap by 400 characters (`CONTINUATION_OVERLAP`) so an instruction that straddles a cut is whole in one of
+them. Every character is scored. At most 16 chunks (`CONTINUATION_MAX_CHUNKS`, 65k to 90k characters of new
+tool results, by the words' length; up to 4 scored at once) per turn: each is an S1 call on the scorer every routing decision shares, and a
+longer turn is refused (fail closed) rather than scored in part. Review finding 3 (gpt-6.1-sol on f83b84a): the
+earlier head-and-tail cut left the middle of a long tool result unscored while the model still read it. Chunks rather
+than refusing everything over 6000 characters, because a coding tool loop reads files longer than that all the time
+and would be unusable. An admission is reused for 180 s
 (`routing.CONTINUATION_CACHE_S`) only for the same conversation, the same scored text and the same message count, so
 a new tool result, or the same words later in the conversation, is scored again; a client retrying the identical
 request reuses it. A refusal is never cached. A turn that is not admitted (outward, blast_radius 2 or more, a degraded
@@ -358,24 +366,69 @@ the trigger.
 **Effect boundary.** Scoring judges what the person (and the tools) said, not what the local model then does: asked to
 "draft a message locally; do not send", a model may still answer with a `send_email` call. So every turn an automatic
 rule sends to a local model (auto_route, flag, prefer, keyword, the refusal fallback, and the published index when it
-lands: all relay through `local_lane.serve(auto_routed=True)` or, for the refusal fallback, `local_lane.complete(...,
-boundary=True)`) passes `cortados_router/provider/effect_boundary.py`, in two layers:
+lands: all relay through `local_lane.serve(auto_routed=True, bind_reason=...)` or, for the refusal fallback,
+`local_lane.complete(..., boundary=True, bind_reason="refusal")`) passes `cortados_router/provider/effect_boundary.py`.
 
-1. *Tool list.* Before the request reaches the node, its declared `tools` are cut to `LOCAL_TOOL_ALLOWLIST` (an
+*Profiles, split by reason* (owner decision, Forest 2026-11-14). The route records WHICH rule bound the conversation
+local (`routing._moved(..., reason=...)` → the route's `bind_reason`); the route is the conversation's, so every
+continuation (and a rebuilt session) carries the same reason and gets the same profile. `effect_boundary.BIND_PROFILES`
+maps it; a missing or unknown reason gets the strictest profile. The published-score index route (branch
+`local-published-index`) adds one line there, `"index": COST`, and passes `reason="index"` to `_moved`.
+
+| Bind reason | Profile | Tools offered and allowed | File writes (Write, Edit, MultiEdit, NotebookEdit) |
+|---|---|---|---|
+| `sensitive_flag`, `prefer`, `keyword`, `refusal` | sensitive | Read, Glob, Grep, LS, NotebookRead, Edit, MultiEdit, Write, NotebookEdit, TodoWrite, ExitPlanMode. **No Bash family** (Bash, BashOutput, KillShell, KillBash are not offered, and an emitted one is blocked) | inside the project folder; every `PROTECTED_PATHS` entry refused, `package.json` / `pyproject.toml` / `Makefile` included |
+| `auto_route` (and `index` when it merges) | cost | the same, plus Bash, BashOutput, KillShell, KillBash; every Bash command checked against `OUTWARD_BASH_RULES` and `OUTWARD_BASH_TEXT_RULES` (**best-effort**, below) | inside the project folder; `PROTECTED_PATHS` refused except `package.json`, `pyproject.toml`, `Makefile` (normal coding targets) |
+| unknown / missing | sensitive | as sensitive | as sensitive |
+| explicit `sub/` pin | none | untouched: every tool, no inspection | untouched |
+
+*The project folder* (`effect_boundary.project_dir`) is the working directory Claude Code names in the request's
+`system` prompt: `Primary working directory: <path>` (2.x environment block) or `Working directory: <path>` (the older
+`<env>` block). Only `system` is read, never the messages or tool results, so neither the model nor a fetched page can
+move it. It is unknown, and **every write of the turn is blocked** (fail closed), when no such line is there, two
+different ones are, or the path is relative, holds `..`, or is `/`, `/tmp`, `/Users`, `/home` or a home directory
+itself.
+
+*Path rules* (`effect_boundary.blocked_write`). The target is normalised (`.` and `//` removed; a relative path is
+taken from the project folder) and must lie strictly inside the folder (compared case-sensitively, so a differently
+cased folder on a case-sensitive disk is outside). Refused: any `..` component, a path starting with `~` or holding
+`$` (not resolved here, so not provably inside), and a symlink the provider's own filesystem shows leading out of the
+folder or onto a protected name (`os.path.realpath`; a symlink that only exists on another machine cannot be seen, see
+the honest limits). `PROTECTED_PATHS`, matched case-insensitively on the path below the folder, each read and acted on
+later by something other than the turn:
+
+| Kind | Entries |
+|---|---|
+| any component | `.git` (hooks, config; a submodule's too), `.husky`, `.claude`, `.ssh` |
+| any component pair | `.github/workflows`, `Library/LaunchAgents`, `Library/LaunchDaemons` |
+| any file name | `.gitlab-ci.yml`, `.pre-commit-config.yaml`, `.envrc`, `.mcp.json`, `setup.py`, `setup.cfg`, shell startup files (`.zshrc`, `.zshenv`, `.zprofile`, `.zlogin`, `.bashrc`, `.bash_profile`, `.profile`, ...), `crontab` |
+| build files | `package.json`, `pyproject.toml`, `Makefile` / `GNUmakefile`: refused on sensitive routes, allowed on cost routes |
+| the project root | any dotfile or dot-directory directly in the folder |
+
+Outside the folder every write is refused anyway (`~/Library/LaunchAgents`, `~/.ssh`, `~/.zshrc`, the system crontab).
+A blocked write takes the same terminal 400 / stream `error` path as a blocked Bash call; the log names the rule id
+(`write-outside-project`, `write-dotdot`, `write-protected`, `write-symlink`, `write-no-project`, `write-malformed`) and
+the tool name, never the path.
+
+Two layers apply on every automatic-local turn:
+
+1. *Tool list.* Before the request reaches the node, its declared `tools` are cut to the profile's tools (an
    allowlist: a name it does not know is dropped), and a `tool_choice` naming a dropped tool is removed. The model
-   cannot name what it is not offered. As committed:
+   cannot name what it is not offered. Always dropped:
 
-   | Kept (acts on this machine only) | Dropped (everything else, including) |
-   |---|---|
-   | `Read`, `Glob`, `Grep`, `LS`, `NotebookRead` | `WebFetch`, `WebSearch` (network) |
-   | `Edit`, `MultiEdit`, `Write`, `NotebookEdit` | every `mcp__*` tool (connectors: mail, chat, drive, payments, ...) |
-   | `TodoWrite`, `ExitPlanMode` | `Task` / `Agent` (a subagent is routed afresh, possibly to a cloud model with every tool) |
-   | `Bash` (its command is inspected, below), `BashOutput`, `KillShell`, `KillBash` | `Skill`, `SlashCommand`, any typed server tool (`web_search_*`, `bash_*`), any unknown name |
+   | Dropped (everything not in the profile, including) |
+   |---|
+   | `WebFetch`, `WebSearch` (network) |
+   | every `mcp__*` tool (connectors: mail, chat, drive, payments, ...) |
+   | `Task` / `Agent` (a subagent is routed afresh, possibly to a cloud model with every tool) |
+   | `Skill`, `SlashCommand`, any typed server tool (`web_search_*`, `bash_*`), any unknown name |
+   | on a sensitive route: `Bash`, `BashOutput`, `KillShell`, `KillBash` |
 
 2. *Emitted calls.* Every tool call in the local reply is inspected before the client sees it: a call to a tool off
-   the allowlist (defence in depth), a malformed `Bash` input, or a `Bash` command one of whose simple commands (the
-   line is cut at `; & | && || ( $( \` ` newlines and quotes, wrappers such as `sudo`, `env`, `xargs`, `timeout 30`
-   skipped) matches `OUTWARD_BASH_RULES`:
+   the profile (defence in depth), a file write the path rules refuse, a malformed `Bash` input, or (cost routes) a
+   `Bash` command one of whose simple commands (the line is cut at `; & | && || ( $( \` ` newlines and quotes,
+   wrappers such as `sudo`, `env`, `xargs`, `timeout 30` skipped) matches `OUTWARD_BASH_RULES`, or whose whole text
+   matches `OUTWARD_BASH_TEXT_RULES` or the interpreter check:
 
    | Rule | Matches |
    |---|---|
@@ -391,6 +444,13 @@ boundary=True)`) passes `cortados_router/provider/effect_boundary.py`, in two la
    | `osascript` | any `osascript` (AppleScript drives Mail, Messages and every scriptable app) |
    | `open-url-scheme` | `open` / `xdg-open` on `mailto:`, `sms:`, `imessage:`, `facetime:`, `tel:`, `message:` |
    | `mail` | `sendmail`, `mail`, `mailx`, `mutt`, `msmtp`, `ssmtp` (also at the end of a pipe) |
+   | `git-config` | `git config` (any write: aliases, `core.hooksPath`; `--get`/`--list` pass) and `git -c` |
+   | `persistence` | `launchctl`, `crontab`, `at`, `batch` |
+   | `symlink` | `ln -s` / `--symbolic` (a link turns a project write into an outside one) |
+   | `pipe-to-shell` | a pipe into `sh`, `bash`, `zsh`, `python`, `node`, `perl`, `ruby`, `php`, `osascript`, `source` (`... \| base64 -d \| sh`, `curl ... \| bash`) |
+   | `protected-path` (text) | the command mentions `.git/hooks`, `.git/config`, LaunchAgents/LaunchDaemons, `.ssh`, a shell startup file or `crontab` |
+   | `computed-command` (text) | `eval` of a `$(...)` or backtick substitution, `source <(...)` / `. <(...)` |
+   | `interpreter-network` | a `python*`/`node`/`deno`/`bun`/`perl`/`ruby`/`php` command whose command line names a network or mail module (`socket`, `urllib`, `requests`, `http`, `https`, `smtplib`, `fetch`, `net`, `child_process`, ...), including a script written by a heredoc and run in the same command |
 
    A match blocks the whole reply; nothing of it reaches the client's tools. **Non-streaming:** the same terminal
    **400** as the continuation gate (`x-should-retry: false`, `invalid_request_error`, "the local model proposed an
@@ -407,13 +467,17 @@ boundary=True)`) passes `cortados_router/provider/effect_boundary.py`, in two la
    **An explicit `sub/` local pin** is the client's own choice: its tools are relayed untouched and its calls are not
    inspected.
 
-**Honest limits.** A pattern list cannot recognise every outward shell command: a script or Makefile target that sends,
-an alias or shell function, a command name in a variable, base64 or other obfuscation, an interpreter one-liner
-(`python -c`, `node -e`) that opens a socket, or a plain `curl` GET whose URL carries data all pass. A false positive
-(a quoted message that reads like a command, `git commit -m 'ssh fix'`) refuses one turn, which the person reruns on
-a cloud model. A tool result longer than its share of S1's 6000 characters is scored by its head and tail only. File
-writes (`Write`, `Edit`) are local but can stage an effect for later (a hook, a launchd plist). **Claude Code's own
-permission prompts remain the final guard** for what Bash and the file tools actually do.
+**Honest limits.** On cost routes the Bash pattern lists are **best-effort**: they cannot recognise every outward
+shell command. A script written in one turn and run in a later one, a Makefile target or npm script that sends (cost
+routes may write `Makefile` and `package.json`), an alias or shell function the person already has (`git p` defined in
+their own gitconfig), a command name in a variable, obfuscation the lists do not know, or a plain `curl` GET whose URL
+carries data all pass. **Claude Code's own permission prompts are the last guard for what Bash runs**; sensitive
+routes have no shell for exactly this reason. A false positive (a quoted message that reads like a command,
+`git commit -m 'ssh fix'`, `cat ~/.zshrc`) refuses one turn, which the person reruns on a cloud model. The path rules
+read the path's text: a symlink is seen only when it exists on the provider's own machine, and on a cost route Bash
+could create one the same turn (`ln -s` is blocked, other ways are not). A write inside the project to a file that
+some tool later executes and that is not in `PROTECTED_PATHS` (a test file, a script the person runs) can still stage
+an effect; permission prompts remain the guard there too.
 
 **Every local guard still applies.** A degraded scorer never routes local; the request must arrive on `/v1/messages`
 (the relay speaks Messages only; a `/v1/responses` request is logged and stays on S1's route); the client's

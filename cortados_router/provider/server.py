@@ -842,9 +842,12 @@ class Registry:
         a LocalSession (continued by the same reply fingerprints, so the client's next turn finds it) takes the old
         session's place, and the old backend is closed. Its exit is not an unexpected exit: the session is already out
         of the registry when it ends, so _backend_exited ignores it."""
+        # client: find's scope without an identity (#43, merged from main): the moved conversation keeps its opener's
+        # client, or an identity-less continuation would not find it.
         new = self._new(turn, keep=True, route=route, scope=getattr(old, "scope", None),
-                        wire_path=getattr(old, "wire_path", None))
+                        wire_path=getattr(old, "wire_path", None), client=getattr(old, "client", None))
         new.history = list(old.history)
+        new.rebuild_budget = getattr(old, "rebuild_budget", new.rebuild_budget)   # the same lineage
         if getattr(old, "office_worker", None):
             new.office_worker = old.office_worker
         with self._lock:
@@ -2045,7 +2048,8 @@ class Handler(BaseHTTPRequestHandler):
             outcome = "incomplete"
             try:
                 outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model,
-                                           reply=reply, auto_routed=not route.get("pinned"))
+                                           reply=reply, auto_routed=not route.get("pinned"),
+                                           bind_reason=route.get("bind_reason"))
             except Exception as exc:             # serve handles its own I/O; anything else must still clean up
                 logger.exception("local lane: relay failed")
                 outcome = "incomplete"
@@ -2168,7 +2172,7 @@ class Handler(BaseHTTPRequestHandler):
                 # boundary: an automatic move, so the effect boundary applies (effect_boundary.py); a blocked call is
                 # LocalUnavailable here and the cloud refusal stands
                 got["turn"] = local_lane.complete(body, moved["local"]["node"], moved["local"]["model"],
-                                                  boundary=True)
+                                                  boundary=True, bind_reason=moved.get("bind_reason"))
             except local_lane.LocalUnavailable as exc:
                 logger.info("sensitive: refusal: local answer failed for %s: %s", rid, exc)
                 return False

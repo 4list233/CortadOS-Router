@@ -29,8 +29,9 @@ Ollama implements the Anthropic Messages API at POST /v1/messages, so a turn is 
 sends the whole conversation every turn) with `model` rewritten to the node's tag and, unless the model entry says
 `"thinking": "passthrough"`, thinking turned off when the client did not ask for it (#108, THINKING_MODES). An
 AUTOMATIC local turn (serve's auto_routed, complete's boundary) also passes the effect boundary (effect_boundary.py):
-its tools are cut to the local allowlist before the node sees them, and a reply proposing an outward tool call is
-never relayed. An explicit `sub/` pin is relayed as the client sent it. Stdlib only.
+its tools are cut to the profile of its bind reason (sensitive: no shell; cost: Bash, inspected) before the node
+sees them, and a reply proposing an outward tool call or a file write outside the project folder is never relayed.
+An explicit `sub/` pin is relayed as the client sent it. Stdlib only.
 """
 from __future__ import annotations
 
@@ -285,7 +286,7 @@ def keyword_match(section: dict[str, Any], text: str) -> bool:
 
 
 def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
-             boundary: bool = False) -> tuple[list, str, dict]:
+             boundary: bool = False, bind_reason: str | None = None) -> tuple[list, str, dict]:
     """One whole (non-streaming) answer from the node for `body`, as (blocks, stop_reason, usage) in the shape the
     bridges return: text and tool_use blocks only (thinking is dropped, as the CLI lanes never send it). Used where
     the answer must be written by the server itself: the refusal fallback (server.py), whose stream has already
@@ -293,11 +294,13 @@ def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], 
     message holding no usable answer: at least one non-blank text block or a valid tool call, _answered); the
     node's own error text is never repeated, only its status or the gate's fixed policy reason.
 
-    `boundary` (an automatic move: the refusal fallback): the effect boundary applies. The node sees only the
-    allowlisted tools, and an answer proposing a blocked call (effect_boundary.blocked_reply, read on the node's raw
-    content) is LocalUnavailable too, so the caller keeps what it had and nothing outward reaches the client."""
-    if boundary:
-        body, dropped = effect_boundary.tools_for_node(body)
+    `boundary` (an automatic move: the refusal fallback): the effect boundary applies, under the profile of
+    `bind_reason` (effect_boundary.BIND_PROFILES; unknown: the strictest). The node sees only the profile's tools, and
+    an answer proposing a blocked call (Boundary.blocked_reply, read on the node's raw content) is LocalUnavailable
+    too, so the caller keeps what it had and nothing outward reaches the client."""
+    fence = effect_boundary.Boundary.for_turn(bind_reason, body) if boundary else None
+    if fence:
+        body, dropped = fence.tools_for_node(body)
         effect_boundary.log_dropped(dropped)
     out = dict(body)
     out["model"] = model["id"]
@@ -326,7 +329,7 @@ def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], 
         conn.close()
     if not isinstance(msg, dict) or msg.get("type") != "message" or not isinstance(msg.get("content"), list):
         raise LocalUnavailable(f"node {node['node']} answered something that is not a message")
-    hit = effect_boundary.blocked_reply(msg["content"]) if boundary else None
+    hit = fence.blocked_reply(msg["content"]) if fence else None
     if hit:
         effect_boundary.log_blocked(*hit, where="refusal fallback")
         raise LocalUnavailable(f"node {node['node']}: the local model proposed an action with an outward effect "
@@ -599,17 +602,20 @@ def auto_routed_unavailable(node: dict[str, Any], model: dict[str, Any], reason:
             f"{reason}; start a new conversation (it is routed again) or send x-cortados-exclude-model: {pin_id(model)}")
 
 
-def _judge_event(ev: dict[str, Any], call: "effect_boundary.StreamedCall | None"):
-    """One streamed event under the effect boundary. Returns a new StreamedCall when a tool-call block starts (and is
+def _judge_event(ev: dict[str, Any], call: "effect_boundary.StreamedCall | None",
+                 fence: "effect_boundary.Boundary | None" = None):
+    """One streamed event under the effect boundary `fence` (None: the strictest, effect_boundary.Boundary(None,
+    None)). Returns a new StreamedCall when a tool-call block starts (and is
     not already blocked by its name), "closed" when the open call's block ended and its call is allowed, a
     (rule id, tool name) when the call is blocked, else None."""
+    fence = fence or effect_boundary.Boundary(None, None)
     t = ev.get("type")
     if call is None:
         block = ev.get("content_block")
         if t == "content_block_start" and isinstance(block, dict) and \
                 block.get("type") not in effect_boundary.PLAIN_BLOCKS:
             name = block.get("name")
-            if not isinstance(name, str) or name not in effect_boundary.LOCAL_TOOL_ALLOWLIST:
+            if not isinstance(name, str) or name not in fence.tools:
                 return "tool-not-allowed", name if isinstance(name, str) else "<unnamed>"
             return effect_boundary.StreamedCall(ev.get("index"), block)
         return None
@@ -624,7 +630,7 @@ def _judge_event(ev: dict[str, Any], call: "effect_boundary.StreamedCall | None"
             ev["delta"].get("type") == "input_json_delta":
         call.fragments.append(str(ev["delta"].get("partial_json") or ""))
     elif t == "content_block_stop":
-        rule = effect_boundary.blocked_call(call.name, call.complete_input())
+        rule = fence.blocked_call(call.name, call.complete_input())
         return (rule, call.name) if rule else "closed"
     return None
 
@@ -647,7 +653,8 @@ def _blocked(handler, hit: tuple[str, str], *, stream_started: bool = False) -> 
 
 
 def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
-          echo_model: str, reply: list | None = None, auto_routed: bool = False) -> str:
+          echo_model: str, reply: list | None = None, auto_routed: bool = False,
+          bind_reason: str | None = None) -> str:
     """Relay one turn to the node's /v1/messages and the answer back to the client. Returns the outcome: "completed"
     (a whole message or a parsed message_stop), "rejected" (the node answered an HTTP error, relayed as-is),
     "unreachable" (503 sent), or "incomplete" (the stream broke). The response names `echo_model` (what the client
@@ -659,17 +666,20 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
     auto_routed_unavailable instead of naming a `sub/` pin the person never made.
 
     An auto-routed turn (every automatic move: auto_route, sensitive flag / prefer / keyword, a refusal bind, an index
-    bind) also passes the effect boundary (effect_boundary.py): the node is offered only the allowlisted tools, and a
-    reply proposing a blocked tool call is never relayed. Outcome "blocked": a non-streaming turn is answered with a
-    terminal 400 (`x-should-retry: false`, effect_boundary.BLOCKED_MESSAGE); a streaming turn holds every tool-call
-    block until it is complete and judged (and holds message_start until the first content that may be shown), so a
-    block found before anything was written is the same 400, and one found after text was written ends the stream with
-    an `error` event (invalid_request_error, the same message): no tool_use, no message_delta, no message_stop. A pin
-    is relayed untouched."""
+    bind) also passes the effect boundary (effect_boundary.py) under the profile of `bind_reason` (the route's
+    `bind_reason`: which automatic rule bound the conversation; unknown or missing: the strictest profile): the node is
+    offered only the profile's tools, and a reply proposing a blocked tool call (a tool off the profile, an outward
+    Bash command, a file write outside the project folder or onto a protected path) is never relayed. Outcome
+    "blocked": a non-streaming turn is answered with a terminal 400 (`x-should-retry: false`,
+    effect_boundary.BLOCKED_MESSAGE); a streaming turn holds every tool-call block until it is complete and judged (and
+    holds message_start until the first content that may be shown), so a block found before anything was written is
+    the same 400, and one found after text was written ends the stream with an `error` event (invalid_request_error,
+    the same message): no tool_use, no message_delta, no message_stop. A pin is relayed untouched."""
     reply = [] if reply is None else reply
-    boundary = auto_routed
-    if boundary:
-        body, dropped = effect_boundary.tools_for_node(body)
+    fence = effect_boundary.Boundary.for_turn(bind_reason, body) if auto_routed else None
+    boundary = fence is not None
+    if fence:
+        body, dropped = fence.tools_for_node(body)
         effect_boundary.log_dropped(dropped)
     data = json.dumps(_node_body(body, model)).encode()
     # Safety net (#108): an auto-routed turn the client did not ask to think on, which still ended on max_tokens with
@@ -756,7 +766,7 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                 _refused(handler, 502, "api_error", "the local model used the whole max_tokens without an answer")
                 _send_json(handler, 502, _error("api_error", thinking_starved(node, model, body.get("max_tokens"))))
                 return "incomplete"
-            hit = effect_boundary.blocked_reply(msg.get("content")) if boundary and isinstance(msg, dict) else None
+            hit = fence.blocked_reply(msg.get("content")) if fence and isinstance(msg, dict) else None
             if hit:
                 return _blocked(handler, hit)
             if isinstance(msg, dict) and msg.get("type") == "message":
@@ -817,7 +827,7 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                         done = done or ev.get("type") == "message_stop"
                         ev_type = ev.get("type")
                         if boundary:
-                            blocked = _judge_event(ev, call)
+                            blocked = _judge_event(ev, call, fence)
                             if isinstance(blocked, effect_boundary.StreamedCall):
                                 call, blocked = blocked, None
                             elif blocked == "closed":

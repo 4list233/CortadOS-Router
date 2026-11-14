@@ -433,15 +433,24 @@ opening turn move to the node's sensitive model in any band, only when S1 says t
 (`docs/LOCAL-RESOURCES.md`, "Sensitive requests"; one shared gate, `routing.local_admission`). Every later turn of a
 conversation an automatic rule bound to a local lane is rescored by S1 first and refused with a terminal 400 when it
 may have an outward effect (the latest user words and any new tool results are scored); an explicit `sub/` local pin is
-not rescored. Every automatic-local turn also passes the effect boundary (`provider/effect_boundary.py`): the node is
-offered only the local tools of `LOCAL_TOOL_ALLOWLIST` (Read, Glob, Grep, LS, NotebookRead, Edit, MultiEdit, Write,
-NotebookEdit, TodoWrite, ExitPlanMode, Bash, BashOutput, KillShell, KillBash; WebFetch, WebSearch, every `mcp__*` tool
-and any unknown tool are dropped), and a reply calling a tool off that list or a Bash command matching
-`OUTWARD_BASH_RULES` (git push, curl uploads, gh writes, ssh, publish, sendmail, ...) is refused with a terminal 400
-(mid-stream: an `error` event, no tool_use). Pins are relayed untouched. A pattern list is not complete: Claude Code's
-permission prompts remain the final guard (`docs/LOCAL-RESOURCES.md`, "Effect boundary"). An asleep or busy node fails
-a pin with a clear 503, never a fallback. Ollama has no auth, so it stays on localhost and the node runs a token gate
-(`python3 -m cortados_router.local_gate`) on its Tailscale address. Config schema, gate and launchd template:
+not rescored. Every automatic-local turn also passes the effect boundary (`provider/effect_boundary.py`), whose
+profile follows WHY the conversation is local (the route's `bind_reason`, kept on every continuation; owner decision
+2026-11-14). **Sensitive routes** (the sensitive flag, `prefer`, the keyword list, the refusal fallback) get no shell
+at all: the node is offered Read, Glob, Grep, LS, NotebookRead, Edit, MultiEdit, Write, NotebookEdit, TodoWrite and
+ExitPlanMode only. **Cost routes** (R0 `auto_route`, and the published-score index route when it lands) also keep
+Bash, BashOutput, KillShell and KillBash, and every Bash command is checked against a pattern list (git push and git
+config/aliases, curl uploads, gh writes, ssh, publish, sendmail, interpreter network one-liners, pipes into a shell,
+eval of a substitution, launchctl/crontab, symlinks, writes to hooks and startup files, ...). **That pattern list is
+best-effort: it cannot recognise every outward shell command, and Claude Code's own permission prompts are the last
+guard for what Bash runs.** On both, Write / Edit / MultiEdit / NotebookEdit must target a path inside the
+conversation's project folder (read from the working directory Claude Code names in its system prompt; unknown means
+every write is refused), with no `..`, and never `.git/`, CI files, hook managers, `.envrc`, `.claude/`, `.mcp.json`,
+`setup.py`/`setup.cfg`, a dotfile at the project root, shell startup files, LaunchAgents, `~/.ssh` or crontab;
+`package.json`, `pyproject.toml` and `Makefile` are allowed on cost routes and refused on sensitive ones. WebFetch,
+WebSearch, every `mcp__*` tool and any unknown tool are always dropped. A blocked call is refused with a terminal 400
+(mid-stream: an `error` event, no tool_use). Pins are relayed untouched (`docs/LOCAL-RESOURCES.md`, "Effect
+boundary"). An asleep or busy node fails a pin with a clear 503, never a fallback. Ollama has no auth, so it stays
+on localhost and the node runs a token gate (`python3 -m cortados_router.local_gate`) on its Tailscale address. Config schema, gate and launchd template:
 `docs/LOCAL-RESOURCES.md` ("Local models").
 
 ### Local models on the Pro
