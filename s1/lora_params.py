@@ -19,6 +19,19 @@ written a rank-8 adapter_config.json beside them: an adapter whose config lies a
       would train at other parameters is refused (a run never changes rank half-way).
       Exit 0 planned (one log line), 3 refused (one "LORA REFUSED: ..." line; nightly.sh skips training), 2 usage.
   python3 lora_params.py rank <weights>     prints the tensor rank of a safetensors adapter (exit 3 when unreadable/mixed)
+  python3 lora_params.py writable <run>/adapter
+      Before every `mlx_lm lora` launch: gives the owner write permission on the run-local adapter files (mlx_lm rewrites
+      adapter_config.json there at every start). Exit 0 ready (one "adapter: ..." line when something was changed), 3 a
+      file that cannot be made writable without touching another copy (a symlink or a hard link: its source keeps its mode)
+      or a directory that is not writable ("TRAINING PREFLIGHT FAILED: ..."; nightly.sh does not start the trainer).
+  python3 lora_params.py trainer-error < <log tail>
+      Reads what the trainer printed in a failed attempt; exit 0 and one line naming the error when it is deterministic
+      (retrying the same command fails the same way: PermissionError, FileNotFoundError, ...), exit 1 otherwise.
+
+Why writable (2026-11-14): the warm start copied the promoted adapter, which promote_sweep.py leaves 0444 on purpose, with a
+plain `cp`. cp gives a new file the SOURCE's mode, so the run-local adapter_config.json was 0444 and mlx_lm's
+save_config(adapter_path / "adapter_config.json") raised PermissionError on every attempt: 20 trainer launches over five
+cycles, nothing trained. The source's mode is never changed; only the run's own regular, single-link copies are.
 """
 from __future__ import annotations
 
@@ -27,6 +40,7 @@ import json
 import math
 import os
 import re
+import stat
 import struct
 import sys
 from pathlib import Path
@@ -200,6 +214,62 @@ def write_plan(run: Path, params: dict, out: Path) -> None:
         os.replace(tmp, path)
 
 
+def make_writable(adapter_dir: Path) -> tuple[list[str], list[str]]:
+    """(names given u+w, problems) for the files directly in a run's adapter directory. Only regular files with one link are
+    changed: chmod follows a symlink and a hard link shares its mode, so either would change the source adapter's mode,
+    which is read-only on purpose (promote_sweep.py, the served adapter). Those, and a directory mlx_lm cannot write in,
+    are problems: the trainer would fail on them every time."""
+    changed, problems = [], []
+    if not adapter_dir.is_dir():
+        return changed, problems                      # mlx_lm creates it
+    if not os.access(adapter_dir, os.W_OK | os.X_OK):
+        problems.append(f"{adapter_dir} is not writable by this user")
+    for f in sorted(adapter_dir.iterdir()):
+        st = os.lstat(f)
+        if os.access(f, os.W_OK, follow_symlinks=False) and not stat.S_ISLNK(st.st_mode):
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            if f.name == "adapter_config.json" or not os.access(f, os.W_OK):
+                problems.append(f"{f} is a symlink to {os.readlink(f)}: mlx_lm would write through it; replace it with a copy")
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        if st.st_nlink > 1:
+            problems.append(f"{f} is read-only and hard-linked ({st.st_nlink} links): making it writable would change the "
+                            "other copy too; replace it with a copy")
+            continue
+        try:
+            os.chmod(f, stat.S_IMODE(st.st_mode) | stat.S_IWUSR)
+            changed.append(f.name)
+        except OSError as e:
+            problems.append(f"{f}: cannot add owner write permission ({e})")
+    return changed, problems
+
+
+# Errors that a relaunch a minute later meets again unchanged: the file system or the install, not memory, Metal or a signal.
+DETERMINISTIC_ERRORS = ("PermissionError", "FileNotFoundError", "IsADirectoryError", "NotADirectoryError",
+                        "ModuleNotFoundError", "ImportError", "SyntaxError")
+EXC_LINE_RE = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception))(?::\s*(.*))?$")
+
+
+def trainer_error(text: str) -> str | None:
+    """'<Error>: <message>' when the LAST exception the trainer printed is deterministic, else None. Only lines that follow a
+    'Traceback (most recent call last):' count, so a warning that mentions an error name is not mistaken for one."""
+    last = None
+    seen_tb = False
+    for line in text.splitlines():
+        if line.startswith("Traceback (most recent call last):"):
+            seen_tb = True
+            continue
+        m = EXC_LINE_RE.match(line.rstrip()) if seen_tb else None
+        if m:
+            last = m
+            seen_tb = False
+    if last is None or last.group(1).rsplit(".", 1)[-1] not in DETERMINISTIC_ERRORS:
+        return None
+    return f"{last.group(1)}: {last.group(2) or ''}".strip().rstrip(":")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -212,7 +282,24 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", type=Path, default=None, help="default <run>/lora-train.yaml")
     r = sub.add_parser("rank")
     r.add_argument("weights", type=Path)
+    w = sub.add_parser("writable")
+    w.add_argument("adapter_dir", type=Path)
+    sub.add_parser("trainer-error")
     a = ap.parse_args(argv)
+    if a.cmd == "writable":
+        changed, problems = make_writable(a.adapter_dir)
+        if changed:
+            print(f"adapter: gave the run's own copies owner write permission (read-only from their source): {', '.join(changed)}")
+        if problems:
+            print(f"TRAINING PREFLIGHT FAILED: {'; '.join(problems)}")
+            return EXIT_REFUSED
+        return 0
+    if a.cmd == "trainer-error":
+        why = trainer_error(sys.stdin.read())
+        if why is None:
+            return 1
+        print(why[:300])
+        return 0
     try:
         if a.cmd == "rank":
             rank, layers = tensor_rank(a.weights)

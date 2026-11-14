@@ -28,6 +28,7 @@
 #                               own). A warm start or resume trains at its weights' own rank/scale; setting these to anything else
 #                               then refuses the night (lora_params.py), it never overrides the weights.
 #   CORTADOS_S1_LORA_MAX_RANK   warm starts above this rank are refused (default 64: each blend promotion adds the two ranks)
+#   CORTADOS_S1_TRAIN_RETRY_S   seconds before relaunching a trainer that died of a non-deterministic error (default 60; 0-9999)
 #   CORTADOS_ROUTER_REPO        repo root for unitcost.py / bin/refresh-tiers.sh  (default ..)
 #   CORTADOS_S1_EVAL_MINUTES    minutes an evaluation needs (default 110). Evaluation is not started with less time than this
 #                               before the deadline: past evaluations took 78-100 min, and overnight.py TERMs at 07:00, so a late
@@ -904,7 +905,17 @@ if [ -z "${CORTADOS_S1_INIT:-}" ] && [ "$pending" -eq 0 ] && [ -f "${SERVE_POINT
   CORTADOS_S1_INIT=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['adapter'] + '/adapters.safetensors')" "${SERVE_POINTER:-current.json}")
   MAX_ITERS="${CORTADOS_S1_NIGHT_ITERS:-1500}"; MAX_DEFAULT=1500; LR="${CORTADOS_S1_WARM_LR:-5e-5}"
 fi
-if [ -n "${CORTADOS_S1_INIT:-}" ] && [ -f "$CORTADOS_S1_INIT" ]; then mkdir -p "$RUN/adapter"; cp "$CORTADOS_S1_INIT" "$RUN/adapter/0000000_adapters.safetensors"; cp "$(dirname "$CORTADOS_S1_INIT")/adapter_config.json" "$RUN/adapter/" 2>/dev/null; echo "warm start from $CORTADOS_S1_INIT"; fi
+# run_copy <src> <dest>: a copy the run OWNS, writable by the owner whatever the source's mode. Reason (2026-11-14): plain cp
+# gives a new file the source's mode, and the promoted adapter is 0444 on purpose (promote_sweep.py), so the warm-start
+# adapter_config.json came out 0444 and mlx_lm's save_config raised PermissionError on all 20 launches. Via .tmp + mv, so an
+# existing read-only destination is replaced instead of failing the cp. The source's mode is never touched.
+run_copy() { cp "$1" "$2.tmp" && chmod u+w "$2.tmp" && mv -f "$2.tmp" "$2"; }
+if [ -n "${CORTADOS_S1_INIT:-}" ] && [ -f "$CORTADOS_S1_INIT" ]; then
+  mkdir -p "$RUN/adapter"; run_copy "$CORTADOS_S1_INIT" "$RUN/adapter/0000000_adapters.safetensors" || { echo "ERROR: warm-start copy of $CORTADOS_S1_INIT failed"; exit 1; }
+  init_cfg="$(dirname "$CORTADOS_S1_INIT")/adapter_config.json"
+  [ ! -f "$init_cfg" ] || run_copy "$init_cfg" "$RUN/adapter/adapter_config.json" || { echo "ERROR: warm-start copy of $init_cfg failed"; exit 1; }
+  echo "warm start from $CORTADOS_S1_INIT"
+fi
 setting MAX_ITERS "$MAX_DEFAULT" 1;   # the selected cap falls back to ITS default (warm night 1500, fresh run 3600)
  setting BATCH 2 1; setting EPOCHS 2 1   # MAX_ITERS bounds the segment below: never let a bad value pass
 [ -n "${SETTING_NOTES:-}" ] && echo "settings: $SETTING_NOTES" && SETTING_NOTES=""
@@ -954,7 +965,7 @@ while :; do
     # Preserve a cumulative resume checkpoint before resetting the segment counter.
     # A stop before the first new checkpoint must not count the previous checkpoint twice.
     saved="$RUN/adapter/resume_${done_iters}_adapters.safetensors"
-    [ "$last" = "$saved" ] || { cp "$last" "$saved.tmp" && mv "$saved.tmp" "$saved"; } || exit 1
+    [ "$last" = "$saved" ] || run_copy "$last" "$saved" || exit 1
     resume="--resume-adapter-file $saved"
     echo "resuming from $(basename "$saved")"
   fi
@@ -977,11 +988,32 @@ while :; do
     state event "$STATUS" lora_refused "$RUN: $(printf '%s' "$lora_plan" | tail -1 | cut -c1-300)"
     echo "TRAINING REFUSED for $RUN (lora_params.py rc $lrc): see the LORA line above; nothing trained, the scorer comes back"; exit 1
   fi
+  # Preflight (2026-11-14): mlx_lm rewrites $RUN/adapter/adapter_config.json at every start. Copies left read-only by an older
+  # nightly (today's run dir) get owner write here; a symlink or hard link to a source, or an unwritable directory, cannot be
+  # fixed without touching the source, so the night fails once, clearly, instead of launching a trainer that must fail.
+  wplan=$(python3 -B ./lora_params.py writable "$RUN/adapter"); wrc=$?
+  [ -z "$wplan" ] || echo "$wplan"
+  if [ "$wrc" -ne 0 ]; then
+    state event "$STATUS" train_failure "$RUN: $(printf '%s' "$wplan" | tail -1 | cut -c1-300)"
+    echo "TRAINING FAILED for $RUN before the trainer started (run-local adapter not writable); not retrying"; exit 1
+  fi
+  log_off=$(wc -c < "$RUN/nightly.log" | tr -d ' ')     # stdout is this log (exec above): the attempt's output starts here
   HF_HUB_OFFLINE=1 gated "$PY" -m mlx_lm lora --model "$BASE" --train --data data/sft --fine-tune-type lora --num-layers "$LORA_LAYERS" --batch-size "$BATCH" --iters "$remaining" \
     -c "$RUN/lora-train.yaml" --learning-rate "$LR" --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path "$RUN/adapter" $resume && break
   [ -f "$STOPFLAG" ] && { echo "stopped by request; not relaunching"; exit 130; }
-  attempt=$((attempt + 1)); echo "trainer died (attempt $attempt)"; [ "$attempt" -ge 4 ] && exit 1
-  sleep 60
+  attempt=$((attempt + 1)); echo "trainer died (attempt $attempt)"
+  # A deterministic error (2026-11-14: PermissionError on adapter_config.json) fails the same way a minute later: four identical
+  # attempts only cost an hour of model loads, and overnight.py relaunching the cycle repeated that five times. Stop at once.
+  if [[ "${log_off:-}" =~ ^[0-9]+$ ]] && why=$(tail -c +"$((log_off + 1))" "$RUN/nightly.log" | python3 -B ./lora_params.py trainer-error); then
+    state event "$STATUS" train_failure "$RUN: deterministic trainer error, not retried: $why"
+    echo "TRAINING FAILED for $RUN: deterministic trainer error ($why); not retrying, a relaunch would fail the same way"; exit 1
+  fi
+  if [ "$attempt" -ge 4 ]; then
+    state event "$STATUS" train_failure "$RUN: trainer died on $attempt attempts"
+    echo "TRAINING FAILED for $RUN: trainer died on $attempt attempts"; exit 1
+  fi
+  retry_s="${CORTADOS_S1_TRAIN_RETRY_S:-60}"; [[ "$retry_s" =~ ^[0-9]{1,4}$ ]] || retry_s=60   # 60 s: a crashed trainer's memory comes back
+  sleep "$retry_s"
   [ -f "$STOPFLAG" ] && { echo "stopped by request; not relaunching"; exit 130; }
 done
 # written BEFORE evaluation: a TERM (07:00 deadline, --stop) during evaluate_run must leave the trained run pending, or the next
