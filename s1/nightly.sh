@@ -24,6 +24,10 @@
 #   CORTADOS_S1_STATUS          status file for the dashboard (default data/status.json)
 #   CORTADOS_S1_STALL_NIGHTS    nights without label growth before the ALERT (default 2)
 #   CORTADOS_S1_LOG_KEEP        nightly logs kept (default 14)
+#   CORTADOS_S1_LORA_RANK, CORTADOS_S1_LORA_SCALE   LoRA rank/scale of a run trained FROM SCRATCH (defaults 8 / 20.0, mlx_lm's
+#                               own). A warm start or resume trains at its weights' own rank/scale; setting these to anything else
+#                               then refuses the night (lora_params.py), it never overrides the weights.
+#   CORTADOS_S1_LORA_MAX_RANK   warm starts above this rank are refused (default 64: each blend promotion adds the two ranks)
 #   CORTADOS_ROUTER_REPO        repo root for unitcost.py / bin/refresh-tiers.sh  (default ..)
 #   CORTADOS_S1_EVAL_MINUTES    minutes an evaluation needs (default 110). Evaluation is not started with less time than this
 #                               before the deadline: past evaluations took 78-100 min, and overnight.py TERMs at 07:00, so a late
@@ -905,6 +909,9 @@ setting MAX_ITERS "$MAX_DEFAULT" 1;   # the selected cap falls back to ITS defau
  setting BATCH 2 1; setting EPOCHS 2 1   # MAX_ITERS bounds the segment below: never let a bad value pass
 [ -n "${SETTING_NOTES:-}" ] && echo "settings: $SETTING_NOTES" && SETTING_NOTES=""
 iters=$(( n * EPOCHS / BATCH ))
+# 16: the transformer layers every promoted adapter was trained on (adapter_config.json num_layers); lora_params.py refuses a
+# warm start or resume whose config or tensors name another count, since LoRA tensors for other layers would be ignored.
+LORA_LAYERS=16
 echo "training on $n examples, $iters iterations at batch $BATCH"
 attempt=0
 while :; do
@@ -954,8 +961,24 @@ while :; do
   for f in "$RUN"/adapter/0*_adapters.safetensors; do [ ! -f "$f" ] || mv "$f" "$f.old"; done
   echo "$done_iters" > "$RUN/iters-base.tmp"; mv "$RUN/iters-base.tmp" "$RUN/iters-base"
   echo "segment target $target; $done_iters checkpointed; $remaining steps remain"
-  HF_HUB_OFFLINE=1 gated "$PY" -m mlx_lm lora --model "$BASE" --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size "$BATCH" --iters "$remaining" \
-    --learning-rate "$LR" --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path "$RUN/adapter" $resume && break
+  # LoRA shape (#74, 2026-11-13): the segment trains at the rank/scale of the weights it starts from (warm-start copy or
+  # resume checkpoint: rank read from the tensors, checked against the adapter_config.json beside them), or at the
+  # configured CORTADOS_S1_LORA_RANK / _SCALE (defaults 8 / 20.0) from scratch; lora_params.py writes them to
+  # $RUN/lora-train.yaml for `mlx_lm lora -c`. Before this, mlx_lm's built-in rank 8 applied to every run: a rank-16 warm
+  # start (the 2026-11-08 blend) would have trained rank-16 tensors (resume loads with strict=False, no shape check) under a
+  # rank-8 adapter_config.json. Any mismatch is refused: training is skipped and the night fails loudly (exit 1), never guessed.
+  if [ -n "$resume" ]; then
+    lora_plan=$(python3 -B ./lora_params.py plan --run "$RUN" --num-layers "$LORA_LAYERS" --base "$BASE" --start "$saved" --config "$RUN/adapter/adapter_config.json"); lrc=$?
+  else
+    lora_plan=$(python3 -B ./lora_params.py plan --run "$RUN" --num-layers "$LORA_LAYERS" --base "$BASE"); lrc=$?
+  fi
+  echo "$lora_plan"
+  if [ "$lrc" -ne 0 ] || [ ! -f "$RUN/lora-train.yaml" ]; then
+    state event "$STATUS" lora_refused "$RUN: $(printf '%s' "$lora_plan" | tail -1 | cut -c1-300)"
+    echo "TRAINING REFUSED for $RUN (lora_params.py rc $lrc): see the LORA line above; nothing trained, the scorer comes back"; exit 1
+  fi
+  HF_HUB_OFFLINE=1 gated "$PY" -m mlx_lm lora --model "$BASE" --train --data data/sft --fine-tune-type lora --num-layers "$LORA_LAYERS" --batch-size "$BATCH" --iters "$remaining" \
+    -c "$RUN/lora-train.yaml" --learning-rate "$LR" --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path "$RUN/adapter" $resume && break
   [ -f "$STOPFLAG" ] && { echo "stopped by request; not relaunching"; exit 130; }
   attempt=$((attempt + 1)); echo "trainer died (attempt $attempt)"; [ "$attempt" -ge 4 ] && exit 1
   sleep 60

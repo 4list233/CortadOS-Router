@@ -476,6 +476,46 @@ class CodexEndpointTests(unittest.TestCase):
                 self.assertIn(name.split(".")[0], text)
         self.assertNotIn("thread/start", [m.get("method") for m in self.inbound()])
 
+    def test_vendor_variables_are_stripped_by_prefix_and_codex_home_reaches_the_child(self):
+        # #84: a variable no exact list names (a later CLI release's) never reaches the child; CODEX_HOME, which the
+        # bridge sets on purpose, does. Unrelated variables pass through.
+        extra = {"OPENAI_FOO": "1", "OPENAI_ORG_ID": "org", "CODEX_FOO": "1", "CODEX_SANDBOX": "seatbelt",
+                 "ANTHROPIC_CUSTOM_HEADERS": "x-cortados-run-id: r", "CLAUDE_CODE_OAUTH_TOKEN": "tok",
+                 "CLAUDE_CONFIG_DIR": "/cfg", "CODEX_HOME": "/somewhere/else", "KEEP_ME": "1"}
+        with mock.patch.dict(os.environ, extra):
+            env = codex_isolation.child_env("/abs/home")
+            self.post({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
+        for name in extra:
+            if name not in ("CODEX_HOME", "KEEP_ME"):
+                self.assertNotIn(name, env)
+        self.assertEqual((env["CODEX_HOME"], env["KEEP_ME"]), ("/abs/home", "1"))
+        seen = json.loads(Path(self.argv_file).read_text())
+        # an allowlisted variable the host itself sets (the Air's CODEX_CA_CERTIFICATE, #103) may reach it too
+        allowed_here = sorted({"CODEX_HOME"} | {k for k in codex_isolation.ALLOWED_ENV if k in os.environ})
+        self.assertEqual(seen["vendor_env"], allowed_here, "only the bridge's own CODEX_HOME reaches the child")
+        self.assertEqual(seen["env"]["CODEX_HOME"], os.path.realpath(self.codex_home))
+
+    def test_codex_ca_certificate_reaches_the_child_and_secrets_do_not(self):
+        # #103: the provider sets CODEX_CA_CERTIFICATE to a PEM of the macOS system roots (Codex TLS failed with
+        # UnknownIssuer without it); the #84 prefix strip must keep it while still removing the CODEX_ secrets.
+        extra = {"CODEX_CA_CERTIFICATE": "/ca/macos-system-roots.pem", "CODEX_API_KEY": "sk-x",
+                 "CODEX_ACCESS_TOKEN": "tok"}
+        with mock.patch.dict(os.environ, extra):
+            env = codex_isolation.child_env("/abs/home")
+            self.post({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(env["CODEX_CA_CERTIFICATE"], "/ca/macos-system-roots.pem")
+        seen = json.loads(Path(self.argv_file).read_text())
+        self.assertEqual(seen["vendor_env"], ["CODEX_CA_CERTIFICATE", "CODEX_HOME"], "the real spawn keeps it too")
+        self.assertNotIn("CODEX_API_KEY", env)
+        self.assertNotIn("CODEX_ACCESS_TOKEN", env)
+        self.assertFalse(codex_isolation.stripped("CODEX_CA_CERTIFICATE"))
+
+    def test_stripped_names_the_rule(self):
+        for name in codex_isolation.STRIPPED_ENV + ("OPENAI_FOO", "CODEX_FOO", "ANTHROPIC_FOO", "CLAUDE_FOO"):
+            self.assertTrue(codex_isolation.stripped(name), name)
+        for name in ("CODEX_HOME", "PATH", "HOME", "openai_foo", "CLAUDECODE", "XCODEX_FOO"):
+            self.assertFalse(codex_isolation.stripped(name), name)
+
     def test_the_app_server_runs_isolated(self):
         os.environ["OPENAI_API_KEY"] = "sk-would-bill-an-api-account"
         os.environ["OPENAI_BASE_URL"] = "https://mirror.invalid/v1"

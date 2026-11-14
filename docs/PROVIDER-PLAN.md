@@ -298,6 +298,14 @@ codex app-server -c notify=[] -c web_search="disabled" -c include_environment_co
 - The child's environment drops `OPENAI_API_KEY`, `CODEX_API_KEY` and `CODEX_ACCESS_TOKEN` (an API key would bill an
   API account instead of the subscription), `OPENAI_BASE_URL` (it would repoint the openai provider) and the Anthropic
   trio of the Claude bridge.
+  Since #84 it drops every `OPENAI_*`, `CODEX_*`, `ANTHROPIC_*` and `CLAUDE_*` variable by prefix, except the
+  allowlist `codex_isolation.ALLOWED_ENV`: `CODEX_HOME` (set by the bridge) and `CODEX_CA_CERTIFICATE`.
+- `CODEX_CA_CERTIFICATE` (#103, 2026-11-13): the path of a PEM bundle Codex uses as its custom CA set for TLS. The Air
+  provider sets it, in the provider's own environment, to an export of the macOS system roots, because Codex
+  intermittently failed with `invalid peer certificate: UnknownIssuer` without it. It is a file path, not a secret, so
+  it passes the prefix strip. The PEM is a snapshot: re-export it after every macOS update (root certificates change
+  with OS releases), then restart the provider:
+  `security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain > ~/.cortados/certs/macos-system-roots.pem`
 - The command line is asked for, then checked (Codex review of PR #5): before `thread/start` the bridge calls
   `account/read {refreshToken:false}` and requires a `chatgpt` login (an API-key login or none is a 502: the lane bills
   the subscription), and `config/read`, the effective config with every layer merged (config.toml, the `-c`
@@ -520,10 +528,16 @@ conversation as a `LocalSession` (no backend process: the model binding and repl
 statelessly (`local_lane.serve`: bounded connect and read timeouts, SSE passed line by line, `tool_use` untouched).
 An unreachable node or unlisted model is a 503 naming the cause; an unknown name is a 400 listing every pinnable id,
 local ones included. `GET /v1/models` lists each as `<name> · CortadOS (<node label>)`. S1 never routes to a local
-lane: they are absent from `SERVED_PROVIDERS`, and the config's `auto_route` switch is refused unless `false` until
-local lanes are evaluated. Ollama has no auth, so it stays on `127.0.0.1` and the node runs the token gate
+lane: they are absent from `SERVED_PROVIDERS`. Ollama has no auth, so it stays on `127.0.0.1` and the node runs the token gate
 (`cortados_router/local_gate.py`) on its Tailscale address; the lane sends the gate's token (`token_file_env`) on every
 probe and turn, and a gate 401 is a 503 naming it. `/v1/responses` (Codex) does not take local pins.
+
+**Local auto-route (2026-11-13, #75).** The local node is the Pro; the Studio runs S1 only. A node's `auto_route`
+(`{"model", "bands"}`, off by default, R0–R2 only) lets `routing.auto_local` move a new S1-routed `/v1/messages`
+conversation onto that model after `execution_routing.select` has chosen, when S1 was not degraded, the band is
+listed, the model is not excluded, the node's probe answers (the Pro's gate refuses it on battery or with the switch
+off) and lists the model, and the request fits. Otherwise S1's route stands. The routes row is rewritten under the
+same id with the local lane and S1's choice as `runner_up`. Details: `docs/LOCAL-RESOURCES.md`, "Local auto-route".
 
 ## Web search lane (2026-11-03)
 

@@ -690,6 +690,31 @@ class MinLeftFloorTests(unittest.TestCase):
         self.assertEqual([row["lane"] for row in self.ledger()], [lane for _, lane in lanes])
         self.assertEqual(set(lanes), {("claude-cli", "claude")})
 
+    def test_release_takes_back_exactly_one_stamped_reservation(self):
+        # #79: a run whose CLI never started is refunded; the ledger is left as it was before that reservation.
+        from cortados_router.provider import floor
+        self.readings([self.win(40)], [self.win(10)])
+        cand = {"lane": "claude", "provider": "claude-cli", "account": "a", "config_dir": "/x/a"}
+        self.assertIsNone(floor.reserve(core, cand, "claude-opus-4-8", 5, now=self.now, rid="keep"))
+        before = self.ledger()
+        self.assertIsNone(floor.reserve(core, cand, "claude-opus-4-8", 5, now=self.now, rid="r1"))
+        self.assertEqual(len(self.ledger()), 2)
+        self.assertTrue(floor.release(core, "r1"))
+        self.assertEqual(self.ledger(), before, "the launch failure leaves the ledger as it was")
+        self.assertFalse(floor.release(core, "r1"), "a second release refunds nothing")
+        self.assertFalse(floor.release(core, ""), "no id never matches the unstamped rows")
+        self.assertEqual(self.ledger(), before)
+
+    def test_release_frees_room_under_the_floor(self):
+        from cortados_router.provider import floor
+        self.readings([self.win(93.5)], [self.win(10)])       # claude: room for exactly three 0.5% runs over 5%
+        cand = {"lane": "claude", "provider": "claude-cli", "account": "a", "config_dir": "/x/a"}
+        for i in range(3):
+            self.assertIsNone(floor.reserve(core, cand, "claude-opus-4-8", 5, now=self.now, rid=f"r{i}"))
+        self.assertIn("outstanding", floor.reserve(core, cand, "claude-opus-4-8", 5, now=self.now, rid="r3"))
+        self.assertTrue(floor.release(core, "r1"))
+        self.assertIsNone(floor.reserve(core, cand, "claude-opus-4-8", 5, now=self.now, rid="r4"))
+
     def test_low_account_excluded_before_ranking_and_reservations_count(self):
         # claude at 3% left is out; claude#b at 6.5% left takes three 0.5% runs, then refuses.
         self.readings([self.win(97)], [self.win(93.5)])

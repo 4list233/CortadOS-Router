@@ -53,7 +53,10 @@ export default {
         "browser": false,
         "session": "3f9a1c2e9b7d4a10",
         "project": "CortadOS-Router",
-        "device": "pro"
+        "device": "pro",
+        "origin_session": "3f9a1c2e9b7d4a10",
+        "origin_project": "CortadOS-Router",
+        "origin_device": "pro"
       }
     ],
     "queued": [
@@ -75,7 +78,10 @@ export default {
         "browser": true,
         "session": null,
         "project": null,
-        "device": null
+        "device": null,
+        "origin_session": null,
+        "origin_project": null,
+        "origin_device": null
       }
     ],
     "recent": [
@@ -97,7 +103,10 @@ export default {
         "browser": false,
         "session": null,
         "project": null,
-        "device": null
+        "device": null,
+        "origin_session": "3f9a1c2e9b7d4a10",
+        "origin_project": "CortadOS-Router",
+        "origin_device": "pro"
       },
       {
         "task_id": "t20261111060000-eeeeeeee",
@@ -117,7 +126,10 @@ export default {
         "browser": false,
         "session": null,
         "project": null,
-        "device": null
+        "device": null,
+        "origin_session": "grokbot",
+        "origin_project": null,
+        "origin_device": null
       },
       {
         "task_id": "t20261111070000-dddddddd",
@@ -137,7 +149,10 @@ export default {
         "browser": false,
         "session": null,
         "project": null,
-        "device": null
+        "device": null,
+        "origin_session": null,
+        "origin_project": null,
+        "origin_device": null
       },
       {
         "task_id": "t20261110060000-ffffffff",
@@ -157,11 +172,53 @@ export default {
         "browser": false,
         "session": null,
         "project": null,
-        "device": null
+        "device": null,
+        "origin_session": null,
+        "origin_project": null,
+        "origin_device": null
       }
     ],
     "truncated": false,
-    "elsewhere": []
+    "elsewhere": [],
+    "origins": [
+      {
+        "session": "3f9a1c2e9b7d4a10",
+        "project": "CortadOS-Router",
+        "device": "pro",
+        "running": 1,
+        "queued": 0,
+        "finished": 1,
+        "task_ids": [
+          "t20261111090000-aaaaaaaa",
+          "t20261111080000-cccccccc"
+        ]
+      },
+      {
+        "session": null,
+        "project": null,
+        "device": null,
+        "running": 0,
+        "queued": 1,
+        "finished": 2,
+        "task_ids": [
+          "t20261111085000-bbbbbbbb",
+          "t20261111070000-dddddddd",
+          "t20261110060000-ffffffff"
+        ]
+      },
+      {
+        "session": "grokbot",
+        "project": null,
+        "device": null,
+        "running": 0,
+        "queued": 0,
+        "finished": 1,
+        "task_ids": [
+          "t20261111060000-eeeeeeee"
+        ]
+      }
+    ],
+    "origins_truncated": false
   },
   "conversations": {
     "as_of": 1800000000.0,
@@ -224,7 +281,16 @@ export default {
         "title": null,
         "started_at": 1799999100.0,
         "last_activity": 1799999985.0,
-        "elapsed_s": 900.0
+        "elapsed_s": 900.0,
+        "tasks": {
+          "running": 1,
+          "queued": 0,
+          "finished": 1,
+          "task_ids": [
+            "t20261111090000-aaaaaaaa",
+            "t20261111080000-cccccccc"
+          ]
+        }
       },
       {
         "kind": "conversation",

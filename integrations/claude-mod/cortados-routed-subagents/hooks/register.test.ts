@@ -1,4 +1,6 @@
 import { test, expect } from 'claude-code/testing'
+import { SHARED_SALT_TRIES, SHARED_SALT_RETRY_MS } from './register'
+import officeVectors from './office-vectors.fixture'
 import { resolveProviderUrl, officeTitle, officeName, baseName, sessionTag, officeHeaderLines, OFFICE_SALT_KEY, OFFICE_BEAT_MIN_MS, OFFICE_BEAT_REFRESH_MS, OFFICE_BEAT_TIMEOUT_MS } from './register'
 import { BG_SWEEP_SH, BG_SWEEP_MS, sweepBackgroundRuns } from './register'
 import { MODEL_DIRECTIVE_RE, modelDirective, directiveModelId } from './register'
@@ -1359,8 +1361,17 @@ test('the session tag is a salted hash, never the raw id', async () => {
   expect(officeHeaderLines({ session: null, title: 'a title' })).toBe('')
 })
 
+test('officeName and sessionTag agree with the Python copies (tests/test_child_tasks.py vectors)', async () => {
+  // generated from OFFICE_NAME_VECTORS / HASH_VECTOR: child_tasks.office_name and subagent_mcp.origin_tag pass the same
+  for (const [raw, device, want] of (officeVectors as any).office_name) expect(officeName(raw, device)).toBe(want)
+  const v = (officeVectors as any).session_tag
+  expect(await sessionTag(v.salt, v.session_id)).toBe(v.tag)
+  // and pinned here as literals, so a regenerated fixture cannot move the hash unnoticed
+  expect(await sessionTag('0123456789abcdef0123456789abcdef', '792b087a-1983-4baf-b701-77792e4b77e4')).toBe('ea4383005613c21c')
+})
+
 /** The mod registered with a full host stand-in: the store, session id/root/model, hostname, clock and fetch. */
-function officeHarness(opts: { officeView?: boolean; providerUrl?: string; fileUrl?: string } = {}) {
+function officeHarness(opts: { officeView?: boolean; providerUrl?: string; fileUrl?: string; sharedSalt?: string | null } = {}) {
   const handlers: Record<string, any> = {}
   const on = (event: string, filterOrHandler: any, maybeHandler?: any) => {
     const key = maybeHandler ? `${event}:${filterOrHandler?.tool ?? filterOrHandler?.command ?? ''}` : event
@@ -1373,10 +1384,17 @@ function officeHarness(opts: { officeView?: boolean; providerUrl?: string; fileU
   const childHeaders: string[] = []
   const logs: string[] = []
   let now = 1_000_000
+  let shared = opts.sharedSalt                                  // the machine's salt file: mutable, like the real one
+  let sid = 'raw-session-id-123'
+  const sleeps: number[] = []
+  let onSleep: (() => void) | null = null
   const $ = {
     store: { get: async (k: string) => store[k], set: async (k: string, v: unknown) => { store[k] = v } },
-    session: { id: async () => 'raw-session-id-123', root: async () => '/Users/someone/Ai/CortadOS-Router', model: async () => 'claude-opus-5-5' },
-    clock: { now: async () => now },
+    session: { id: async () => sid, root: async () => '/Users/someone/Ai/CortadOS-Router', model: async () => 'claude-opus-5-5' },
+    // only the salt retry's sleep returns: the background sweep session.start begins sleeps for good (an instant
+    // sleep would spin its loop without ever yielding)
+    clock: { now: async () => now, sleep: (ms: number) => ms === SHARED_SALT_RETRY_MS
+      ? (sleeps.push(ms), now += ms, onSleep?.(), Promise.resolve()) : new Promise<void>(() => {}) },
     process: {
       run: async (argv: string[], o: any) => {
         if (argv[0] === 'hostname') return { exitCode: 0, stdout: 'pro\n', stderr: '' }
@@ -1391,11 +1409,20 @@ function officeHarness(opts: { officeView?: boolean; providerUrl?: string; fileU
         return { status: 404, ok: false, headers: {}, text: '{}' }
       },
     },
-    fs: { read: async (path: string) => opts.fileUrl && path === '/tmp/test-home/.config/cortados/provider-url' ? opts.fileUrl : 'unused' },
+    fs: { read: async (path: string) => {
+      if (opts.sharedSalt !== undefined && path === '/tmp/test-home/.config/cortados/office-salt') {
+        if (shared === null || shared === undefined) throw new Error('ENOENT')
+        return shared + '\n'
+      }
+      return opts.fileUrl && path === '/tmp/test-home/.config/cortados/provider-url' ? opts.fileUrl : 'unused'
+    } },
     ui: { status() {}, toast() {}, log(m: string) { logs.push(m) } },
+    ...(opts.sharedSalt !== undefined ? { env: { get: async (k: string) => k === 'HOME' ? '/tmp/test-home' : undefined } } : {}),
   }
   const settle = () => new Promise((r) => setTimeout(r, 0))
-  return { handlers, $, store, beats, childHeaders, logs, settle, advance(ms: number) { now += ms } }
+  return { handlers, $, store, beats, childHeaders, logs, settle, sleeps, advance(ms: number) { now += ms },
+    setShared(v: string | null) { shared = v }, setSessionId(v: string) { sid = v },
+    onSleep(f: (() => void) | null) { onSleep = f } }
 }
 
 test('routed requests carry the office tags before the run id, never the raw session id', async () => {
@@ -1412,6 +1439,63 @@ test('routed requests carry the office tags before the run id, never the raw ses
   // the salt is kept: a second session of this install reuses it
   await h.handlers['tool.call:Agent'](h.$, { prompt: 'p', description: 'Again', subagent_type: 'general-purpose' }, async () => 'native')
   expect(h.store[OFFICE_SALT_KEY]).toBe(salt)
+})
+
+test('the machine\'s shared salt file names the floor, so start_task origins and the pulse pane join it', async () => {
+  const SHARED = '0123456789abcdef0123456789abcdef'
+  const h = officeHarness({ sharedSalt: SHARED })
+  await h.handlers['tool.call'](h.$, { tool: 'Bash' }, async (e: any) => e)
+  await h.settle()
+  // the same derivation as cortados_router/subagent_mcp.py origin_tag (sha256("<salt>:<session id>")[:16])
+  expect(h.beats[0].body.session).toBe(await sessionTag(SHARED, 'raw-session-id-123'))
+  expect(h.store[OFFICE_SALT_KEY]).toBe(undefined)               // the install's own salt is never made
+  // no shared file: the install's salt, after SHARED_SALT_TRIES reads
+  const g = officeHarness({ sharedSalt: null })
+  await g.handlers['tool.call'](g.$, { tool: 'Bash' }, async (e: any) => e)
+  await g.settle()
+  expect(g.beats[0].body.session).toBe(await sessionTag(g.store[OFFICE_SALT_KEY] as string, 'raw-session-id-123'))
+  expect(g.sleeps).toEqual(Array(SHARED_SALT_TRIES - 1).fill(SHARED_SALT_RETRY_MS))
+  const bad = officeHarness({ sharedSalt: 'not-a-salt' })
+  await bad.handlers['tool.call'](bad.$, { tool: 'Bash' }, async (e: any) => e)
+  await bad.settle()
+  expect(bad.beats[0].body.session).toBe(await sessionTag(bad.store[OFFICE_SALT_KEY] as string, 'raw-session-id-123'))
+})
+
+test('one session keeps one floor tag: the salt is decided at its first heartbeat and pinned until its id changes', async () => {
+  // Review 2026-11-13: the session.start heartbeat raced the MCP server making the shared file, so the tag flipped
+  // from the install's salt to the shared one mid-session and the session showed as two floors for 900 s.
+  const SHARED = '0123456789abcdef0123456789abcdef'
+  const h = officeHarness({ sharedSalt: null })
+  h.onSleep(() => h.setShared(SHARED))                 // the file appears while the first heartbeat is retrying
+  await h.handlers['session.start'](h.$, {}, async (e: any) => e)
+  await h.settle()
+  await h.settle()
+  const tag = await sessionTag(SHARED, 'raw-session-id-123')
+  expect(h.beats[0].body.session).toBe(tag)
+  expect(h.sleeps.length).toBe(1)
+  expect(h.store[OFFICE_SALT_KEY]).toBe(undefined)
+  // the file appears only after every retry: the install's salt is pinned for the rest of the session
+  const g = officeHarness({ sharedSalt: null })
+  await g.handlers['session.start'](g.$, {}, async (e: any) => e)
+  await g.settle()
+  await g.settle()
+  const own = await sessionTag(g.store[OFFICE_SALT_KEY] as string, 'raw-session-id-123')
+  expect(g.beats[0].body.session).toBe(own)
+  g.setShared(SHARED)
+  g.advance(60_000)
+  await g.handlers['tool.call'](g.$, { tool: 'Bash' }, async (e: any) => e)
+  await g.handlers['tool.call:Agent'](g.$, { prompt: 'p', description: 'Build', subagent_type: 'general-purpose' }, async () => 'native')
+  await g.settle()
+  expect(g.beats.length).toBeGreaterThan(1)
+  for (const b of g.beats) expect(b.body.session).toBe(own)
+  expect(g.childHeaders[0]).toContain(`x-cortados-session: ${own}`)
+  expect(g.sleeps.length).toBe(SHARED_SALT_TRIES - 1)   // the shared file is not looked for again in this session
+  // a new session id (/clear): a new floor anyway, so its salt is decided again and the shared file now wins
+  g.setSessionId('raw-session-id-456')
+  g.advance(60_000)
+  await g.handlers['tool.call'](g.$, { tool: 'Read' }, async (e: any) => e)
+  await g.settle()
+  expect(g.beats[g.beats.length - 1].body.session).toBe(await sessionTag(SHARED, 'raw-session-id-456'))
 })
 
 test('officeView off sends no tags and no heartbeats (turn/session end hooks keep only the gate\'s turn bookkeeping)', async () => {

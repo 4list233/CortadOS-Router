@@ -111,7 +111,9 @@ def effective_config(argv):
     return cfg
 if os.environ.get("FAKE_CODEX_ARGV"):
     with open(os.environ["FAKE_CODEX_ARGV"], "w") as f:
-        json.dump({"argv": sys.argv[1:], "cwd": os.getcwd(), "env": {k: os.environ.get(k) for k in ENV_KEYS}}, f)
+        json.dump({"argv": sys.argv[1:], "cwd": os.getcwd(), "env": {k: os.environ.get(k) for k in ENV_KEYS},
+                   "vendor_env": sorted(k for k in os.environ
+                                        if k.startswith(("OPENAI_", "CODEX_", "ANTHROPIC_", "CLAUDE_")))}, f)
 
 stdin = os.fdopen(0, "rb", buffering=0)     # unbuffered, so select() sees exactly what readline() has not consumed
 server_ids = itertools.count()

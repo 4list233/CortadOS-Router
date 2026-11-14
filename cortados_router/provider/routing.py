@@ -8,8 +8,13 @@ Owner of two rules:
                     skips the table's non-Claude fallback routes, so this host enforces the rule itself: while S1 is
                     down a Claude route is not offered; the conversation runs on a Codex lane, and when no Codex
                     lane survives (binary missing, capacity spent) the request is refused.
-  local pins        `sub/<local model or alias>` names a model a local Ollama node offers (local_lane.py): pin-only,
-                    never in SERVED_PROVIDERS, so S1 auto-routing cannot pick it (its auto_route switch stays off).
+  local pins        `sub/<local model or alias>` names a model a local Ollama node offers (local_lane.py). Local lanes
+                    are never in SERVED_PROVIDERS: S1 and core.resolve never see one.
+  local auto-route  after S1 has chosen a route (not degraded), auto_local may hand the conversation to a node's
+                    auto_route model instead, only when S1's band is one the node's config lists, the node answers its
+                    probe (on the Pro: AC power + manual switch + gate up) and lists the model, the request fits the
+                    model's context, the client did not exclude it, and the request is on /v1/messages. Otherwise S1's
+                    route stands unchanged: a local node is an extra, never a fallback (#75).
   sub/ pin          a client that names `sub/<model>` (any model the tables serve on claude-cli or codex-cli) chose the
                     model itself: S1 and the band are skipped, but the served-model, account, capacity, fit and
                     route-log rules still apply (choose_pinned). pinnable_models is the list GET /v1/models offers.
@@ -20,6 +25,7 @@ import json
 import re
 import shutil
 import logging
+import time
 import uuid
 from typing import Any, Callable
 
@@ -631,7 +637,7 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
                 continue
             routes = [[p, r] for p, r in constraints["allowed_routes"] if model_key(r) == model_key(m)]
             if not routes and _is_local(m):
-                continue                           # only a local model: S1 never routes there, so it is avoided
+                continue                           # only a local model: S1 never routes there; auto_local checks it
             if not routes:
                 # Loud beats silent: routing normally could land the review on its builder's model (e.g. a typo'd id).
                 return {"router": execution_routing.ROUTER, "client_error": True,
@@ -669,6 +675,8 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
         return {"router": execution_routing.ROUTER,
                 "error": f"internal: routed to the excluded model {r.get('model')} ({r.get('provider')}); refused "
                          "(x-cortados-exclude-model)"}
+    if not r.get("error"):
+        r = auto_local(core, body, r, client=client, conversation_id=conversation_id, excluded=hit)
     if min_left_pct is not None and not r.get("error"):
         # The routed path's floor check runs on the account select chose (execution_routing ranks inside select); a
         # chosen account below the client's floor is refused like a spent one, never swapped for an unscored sibling.
@@ -687,6 +695,102 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
         if bound:
             r["codex_home"] = bound["codex_login"]  # the backend starts on exactly the home that was checked
     return r
+
+
+# A routing body carrying this key came from a wire the local relay cannot serve (/v1/responses: local_lane relays the
+# Anthropic Messages shape only), so auto_local leaves its route alone. Set by server.RESPONSES.routing_body.
+NO_LOCAL_KEY = "_cortados_no_local"
+# How long a node that failed its probe is not probed again for auto-routing. Reason: an asleep or off-tailnet Pro costs
+# a full probe_timeout_s per probe, and without this every new S1-routed conversation would wait for it. A node refusing
+# on battery or with the switch off answers at once, so this only bounds the slow case; turning the switch back on
+# takes effect within this window. Pins never use it (a person who pins a model is told the node's state now).
+AUTO_DOWN_S = 30.0
+_auto_down: dict[str, float] = {}
+
+
+def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, conversation_id: str,
+               excluded: Callable[[str], bool] = lambda name: False) -> dict[str, Any]:
+    """S1's route `r`, or the same decision moved to a local node's auto_route model (local_lane.auto_routes) when every
+    condition holds: S1 was not degraded (a degraded decision has no band of its own; it keeps core's no-Claude rule
+    and its route), the band is one the node lists, the request is on a wire the relay serves (no NO_LOCAL_KEY), the
+    client did not exclude the model (`excluded`), the node answered its probe within probe_timeout_s and lists the
+    model (on the Pro the gate refuses that probe on battery or with the manual switch off), and the request fits the
+    model's context. The first node in config order that passes wins. A skip leaves `r` exactly as it was, with the
+    reason logged; a broken local config skips too (logged as a warning), so a config error never blocks S1 routing.
+    When moved, the routes row S1's select wrote is rewritten under the same route_id (lane, provider and model of the
+    local node, S1's choice as runner_up, S1's own runner_up kept as s1_runner_up and a skipped entry), so the record
+    names what will run and loses nothing S1 decided."""
+    if body.get(NO_LOCAL_KEY) or r.get("degraded") or not r.get("band") or not r.get("route_id"):
+        return r
+    try:
+        targets = local_lane.auto_routes()
+    except local_lane.LocalConfigError as exc:
+        logger.warning("local auto-route skipped: local config error on node %s: %s", exc.node, exc)
+        return r
+    band = r["band"]
+    need = None
+    for node, entry, bands in targets:
+        pin = local_lane.pin_id(entry)
+        why, gate_refused = None, False
+        if band not in bands:
+            why = f"band {band} is not in its auto_route bands"
+        elif excluded(entry["id"]) or excluded(pin):
+            why = "excluded by the client (x-cortados-exclude-model)"
+        elif _auto_down.get(node["node"], 0.0) > _now():
+            why = "probe failed within the last %gs" % AUTO_DOWN_S
+        if why is None:
+            try:
+                tags = local_lane.probe(node)
+            except local_lane.LocalUnavailable as exc:
+                _auto_down[node["node"]] = _now() + AUTO_DOWN_S
+                why = f"unavailable ({exc})"
+                # A gate 401 is the provider's misconfiguration (token files out of step), not the node's state: it
+                # needs the owner's attention, so it is a warning, where battery or a switched-off node is routine.
+                gate_refused = str(exc) == local_lane.GATE_REFUSED.format(node=node["node"])
+            else:
+                _auto_down.pop(node["node"], None)
+                if entry["id"] not in tags:
+                    why = f"does not list {entry['id']}"
+        if why is None:
+            need = int(request_fit(body)["input_tokens"]) if need is None else need
+            if need > entry["context_length"]:
+                why = f"request ≈{need // 1000}k tokens exceeds its {entry['context_length'] // 1000}k context"
+        if why:
+            logger.log(logging.WARNING if gate_refused else logging.INFO,
+                       "local auto-route: %s/%s not taken for %s: %s", node["lane"], pin, r["route_id"], why)
+            continue
+        old = r.get("route") or {}
+        chosen = {"lane": node["lane"], "provider": node["lane"], "model": entry["id"], "account": None,
+                  "config_dir": None, "reserve": False, "pool": None}
+        # runner_up is S1's choice (what runs when the node is not there); S1's own runner_up is not dropped: it is
+        # kept as s1_runner_up and, so the routes row still shows it, as a skipped entry naming why.
+        s1_runner_up = old.get("runner_up")
+        skipped = list(old.get("skipped") or [])
+        if isinstance(s1_runner_up, dict) and s1_runner_up.get("model"):
+            skipped.append({"lane": s1_runner_up.get("lane"), "model": s1_runner_up.get("model"),
+                            "why": "S1's runner_up (s1_runner_up), behind S1's choice the local auto-route replaced"})
+        route = {**old, "chosen": chosen, "runner_up": old.get("chosen"), "s1_runner_up": s1_runner_up,
+                 "skipped": skipped or None,
+                 "hard_rules": list(old.get("hard_rules") or []) + [
+                     f"local auto-route: band {band} is in {node['lane']}'s auto_route bands and the node is available; "
+                     f"{pin} instead of {r.get('provider')}/{r.get('model')}"]}
+        core.log_route(r["route_id"], {"session_id": conversation_id, "platform": f"provider:{client}",
+                                       "unit_kind": "interactive", "actual_model": None,
+                                       "request": request_text(body.get("messages") or [],
+                                                               standalone=not body.get("tools"))[:8000]},
+                       r.get("decision") or {"answers": None, "degraded": False, "engine": "s1", "engine_ms": None},
+                       route)
+        logger.info("local auto-route: %s -> %s/%s (band %s)", r["route_id"], node["lane"], pin, band)
+        return {"router": r.get("router", execution_routing.ROUTER), "provider": node["lane"], "model": entry["id"],
+                "account": None, "config_dir": None, "context_length": entry["context_length"],
+                "route_id": r["route_id"], "api_request_id": r.get("api_request_id", ""), "degraded": False,
+                "band": band, "projection": r.get("projection"), "decision": r.get("decision"), "route": route,
+                "local": {"node": node, "model": entry}}
+    return r
+
+
+def _now() -> float:
+    return time.monotonic()
 
 
 def _floor_exempt(lane: str) -> bool:

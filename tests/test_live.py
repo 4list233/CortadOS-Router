@@ -31,6 +31,7 @@ CANCELLED = "t20261111060000-eeeeeeee"
 LOST = "t20261110060000-ffffffff"          # started 11 h ago, no end event: unknown, never "running"
 OLD = "t20261109060000-99999999"           # outside the 24 h window
 SESSION = "3f9a1c2e9b7d4a10"
+ORIGIN = {"origin_session": SESSION, "origin_project": "CortadOS-Router", "origin_device": "pro"}   # the main session
 
 
 def events():
@@ -42,16 +43,19 @@ def events():
         {"ts": NOW - 30 * 3600, "event": "started", "task_id": OLD, **base, "title": "too old to show"},
         {"ts": NOW - 125, "event": "started", "task_id": RUNNING, **base, "host": "air", "lane": "claude#b",
          "model": "claude-sonnet-5", "title": "Refactor the scarcity reader", "session": SESSION,
-         "project": "CortadOS-Router", "device": "pro"},
+         "project": "CortadOS-Router", "device": "pro", **ORIGIN},
         {"ts": NOW - 600, "event": "started", "task_id": QUEUED, **base, "chrome": True, "host": "air",
          "title": "Check the release page", "session": SESSION},
-        {"ts": NOW - 4000, "event": "started", "task_id": DONE, **base, "host": "air", "title": "Write the changelog"},
+        {"ts": NOW - 4000, "event": "started", "task_id": DONE, **base, "host": "air", "title": "Write the changelog",
+         **ORIGIN},
         {"ts": NOW - 3000, "event": "finished", "task_id": DONE, **base, "host": "air", "title": "Write the changelog",
          "status": "succeeded", "exit_code": 0, "duration_s": 1000.0, "workspace_state": "archived"},
-        {"ts": NOW - 7200, "event": "started", "task_id": FAILED, **base, "title": "Bisect flaky test 10.0.0.7"},
+        {"ts": NOW - 7200, "event": "started", "task_id": FAILED, **base, "title": "Bisect flaky test 10.0.0.7",
+         "origin_session": "/Users/someone", "origin_project": "<b>x</b>"},          # not an origin: unattributed
         {"ts": NOW - 6900, "event": "finished", "task_id": FAILED, **base, "status": "failed", "exit_code": 1,
          "duration_s": 300.0, "workspace_state": "held"},
-        {"ts": NOW - 5000, "event": "cancelled", "task_id": CANCELLED, **base, "client": "grokbot"},
+        {"ts": NOW - 5000, "event": "cancelled", "task_id": CANCELLED, **base, "client": "grokbot",
+         "origin_session": "grokbot"},
         {"ts": NOW - 11 * 3600, "event": "started", "task_id": LOST, **base, "host": "air"},
         {"ts": NOW - 10, "event": "task_exported", "task_id": DONE, "path_kind": "default"},
         {"ts": NOW - 5, "event": "started", "task_id": "../../etc/passwd", "title": SECRET},
@@ -279,6 +283,93 @@ class CollectTest(unittest.TestCase):
         c = fixture_view(backend_sessions=99, conversations=lambda: 1 / 0)["conversations"]
         self.assertEqual(c["backend_sessions"], 99)        # the list failed: the registry's own count stands
 
+    def test_tasks_carry_their_origin_and_are_grouped_by_it(self):
+        t = fixture_view()["tasks"]
+        r = t["running"][0]
+        self.assertEqual((r["origin_session"], r["origin_project"], r["origin_device"]),
+                         (SESSION, "CortadOS-Router", "pro"))
+        recent = {x["task_id"]: x for x in t["recent"]}
+        self.assertEqual(recent[CANCELLED]["origin_session"], "grokbot")
+        self.assertEqual((recent[FAILED]["origin_session"], recent[FAILED]["origin_project"]), (None, None))
+        self.assertIsNone(t["queued"][0]["origin_session"])                  # logged before origins: unattributed
+        groups = {g["session"]: g for g in t["origins"]}
+        self.assertEqual(set(groups), {SESSION, "grokbot", None})
+        mine = groups[SESSION]
+        self.assertEqual((mine["project"], mine["device"], mine["running"], mine["queued"], mine["finished"],
+                          mine["task_ids"]), ("CortadOS-Router", "pro", 1, 0, 1, [RUNNING, DONE]))
+        self.assertEqual((groups[None]["running"], groups[None]["queued"], groups[None]["finished"]), (0, 1, 2))
+        self.assertEqual((groups["grokbot"]["finished"], groups["grokbot"]["task_ids"]), (1, [CANCELLED]))
+        # a group with running or queued work first; the unattributed group after a named one
+        self.assertEqual([g["session"] for g in t["origins"]][:2], [SESSION, None])
+        self.assertFalse(t["origins_truncated"])
+
+    def test_orchestrator_items_count_their_sessions_tasks(self):
+        c = fixture_view()["conversations"]
+        main = next(x for x in c["items"] if x["kind"] == "orchestrator")
+        self.assertEqual(main["tasks"], {"running": 1, "queued": 0, "finished": 1, "task_ids": [RUNNING, DONE]})
+        self.assertNotIn("tasks", next(x for x in c["items"] if x["kind"] == "subagent"))
+        # a floor known only from its heartbeat (no routed main loop) gets the same counts
+        c = fixture_view(conversations=lambda: [])["conversations"]
+        main = next(x for x in c["items"] if x["kind"] == "orchestrator")
+        self.assertEqual((main["source"], main["tasks"]["running"]), ("heartbeat", 1))
+        # the tasks could not be read: the count is unknown, never zero
+        c = fixture_view(child_events=lambda: 1 / 0)["conversations"]
+        self.assertIsNone(next(x for x in c["items"] if x["kind"] == "orchestrator")["tasks"])
+
+    def test_origin_groups_are_capped(self):
+        rows = [{"task_id": f"t2026111109{i:04d}-aaaaaaaa", "state": "succeeded", "started_at": NOW - i,
+                 "origin_session": f"{i:016x}"} for i in range(live.ORIGINS_MAX + 3)]
+        o = live.origins_of(rows)
+        self.assertEqual((len(o["origins"]), o["origins_truncated"]), (live.ORIGINS_MAX, True))
+        self.assertEqual(o["origins"][0]["session"], f"{0:016x}")             # newest first
+
+    def test_for_session_narrows_tasks_and_conversations(self):
+        v = live.for_session(fixture_view(), SESSION)
+        self.assertEqual(v["session_filter"], SESSION)
+        self.assertEqual([x["task_id"] for x in v["tasks"]["running"] + v["tasks"]["queued"] + v["tasks"]["recent"]],
+                         [RUNNING, DONE])
+        self.assertEqual([g["session"] for g in v["tasks"]["origins"]], [SESSION])
+        self.assertTrue(v["conversations"]["items"])
+        self.assertTrue(all(x["session"] == SESSION for x in v["conversations"]["items"]))
+        self.assertEqual(v["tasks"]["counts"], fixture_view()["tasks"]["counts"])   # counts stay fleet-wide
+        self.assertEqual(live.valid_session("grokbot"), "grokbot")
+        for bad in ("", "ABCDEF0123456789", "short", "../x", None, 7):
+            self.assertIsNone(live.valid_session(bad))
+
+    def test_session_view_filters_before_the_fleet_caps(self):
+        # Review 2026-11-13: tasks_section capped running[:50] / recent[:40] and only then was ?session= applied, so on a
+        # busy fleet a session's older tasks vanished from its view while origins[].task_ids still listed them.
+        other = "b" * 16
+        tid = lambda i: f"t20261111{i:06d}-aaaaaaaa"
+        ev = []
+        for i in range(live.RUNNING_MAX + 5):                          # newer running tasks of another session
+            ev.append({"ts": NOW - 100 - i, "event": "started", "task_id": tid(i), "origin_session": other})
+        for i in range(100, 100 + live.RECENT_MAX + 5):                # newer finished tasks of another session
+            ev += [{"ts": NOW - 2000 - i, "event": "started", "task_id": tid(i), "origin_session": other},
+                   {"ts": NOW - 1000 - i, "event": "finished", "task_id": tid(i), "status": "succeeded"}]
+        mine_run, mine_done = tid(900), tid(901)                      # the session's own: the oldest of each list
+        ev += [{"ts": NOW - 3000, "event": "started", "task_id": mine_run, **ORIGIN},
+               {"ts": NOW - 9000, "event": "started", "task_id": mine_done, **ORIGIN},
+               {"ts": NOW - 8000, "event": "finished", "task_id": mine_done, "status": "failed"}]
+        fleet = fixture_view(child_events=lambda: ev, peek=None)["tasks"]
+        self.assertTrue(fleet["truncated"])
+        listed = [x["task_id"] for x in fleet["running"] + fleet["recent"]]
+        self.assertNotIn(mine_run, listed)                             # capped out of the fleet lists
+        self.assertNotIn(mine_done, listed)
+        self.assertEqual(next(g for g in fleet["origins"] if g["session"] == SESSION)["task_ids"], [mine_run, mine_done])
+        for v in (fixture_view(child_events=lambda: ev, peek=None, session=SESSION),
+                  fixture_view(child_events=lambda: ev, peek=None, session=SESSION)):
+            t = v["tasks"]
+            self.assertEqual(v["session_filter"], SESSION)
+            self.assertEqual([x["task_id"] for x in t["running"]], [mine_run])
+            self.assertEqual([x["task_id"] for x in t["recent"]], [mine_done])
+            self.assertFalse(t["truncated"])
+            self.assertEqual(t["counts"], fleet["counts"])             # counts stay fleet-wide
+            self.assertEqual([g["session"] for g in t["origins"]], [SESSION])
+        # the same through the old path (filtering the capped snapshot) loses them: what the fix is for
+        stale = live.for_session(fixture_view(child_events=lambda: ev, peek=None), SESSION)["tasks"]
+        self.assertEqual(stale["running"] + stale["recent"], [])
+
     def test_a_failed_conversation_list_keeps_the_board(self):
         c = fixture_view(conversations=lambda: 1 / 0)["conversations"]
         self.assertEqual(c["status"], "partial")
@@ -296,7 +387,8 @@ class CollectTest(unittest.TestCase):
         sub = c["items"][0]
         self.assertEqual((sub["tool"], sub["project"], sub["device"], sub["elapsed_s"], sub["title"]),
                          ("Read", "CortadOS-Router", "pro", 90.0, "Review the diff"))
-        self.assertNotIn(RUNNING, json.dumps(c))              # child tasks live in the tasks section
+        # child tasks live in the tasks section: no item of their own, only the ids its orchestrator started
+        self.assertNotIn(RUNNING, json.dumps([{k: v for k, v in x.items() if k != "tasks"} for x in c["items"]]))
 
     def test_routed_calls_capped(self):
         r = fixture_view()["routed"]
@@ -590,6 +682,23 @@ class MemoTest(unittest.TestCase):
             t.join(5)
         self.assertEqual((len(n), out), (1, [b"slow"] * 4))
 
+    def test_several_views_are_memoised_side_by_side(self):
+        # the fleet view and each pane's ?session= view are polled together: they must not evict each other
+        clock = [0.0]
+        m = live.Memo(ttl_s=2.0, clock=lambda: clock[0])
+        calls = []
+        build = lambda k: (lambda: (calls.append(k), k.encode())[1])
+        for _ in range(3):
+            for k in ("fleet", "s1", "s2"):
+                self.assertEqual(m.get(k, build(k)), k.encode())
+        self.assertEqual(calls, ["fleet", "s1", "s2"])
+        for i in range(live.MEMO_KEYS + 4):
+            m.get(f"x{i}", build(f"x{i}"))
+        self.assertLessEqual(len(m._hits), live.MEMO_KEYS)
+        clock[0] = 3.0
+        m.get("late", build("late"))
+        self.assertEqual(list(m._hits), ["late"])                     # expired entries are dropped, not kept
+
 
 class ClientHostTest(unittest.TestCase):
     D = "a" * 64
@@ -819,6 +928,17 @@ class EndpointTest(EndpointHarness):
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode(), e.headers
 
+    def test_session_filter(self):
+        code, raw, _ = self.request("GET", live.LIVE_PATH + "?session=" + SESSION, TOKEN)
+        self.assertEqual(code, 200, raw)
+        self.assertEqual(json.loads(raw)["session_filter"], SESSION)
+        for bad in ("?session=nothex", "?session=" + SESSION + "&session=" + SESSION, "?session="):
+            code, raw, _ = self.request("GET", live.LIVE_PATH + bad, TOKEN)
+            self.assertEqual(code, 400 if bad != "?session=" else 200, (bad, raw))
+            self.assertNotIn("nothex", raw)
+        self.assertEqual(self.request("GET", live.LIVE_PATH + "?session=" + SESSION, LIVE_TOKEN)[0], 200)
+        self.assertEqual(self.request("GET", live.LIVE_PATH + "?session=" + SESSION)[0], 401)
+
     def test_paths_agree(self):
         self.assertEqual((clients.LIVE_PATH, clients.LIVE_HEARTBEAT_PATH), (live.LIVE_PATH, live.HEARTBEAT_PATH))
 
@@ -872,9 +992,9 @@ class EndpointTest(EndpointHarness):
         n = []
         real = self.httpd.live_view
 
-        def counted(reg):
-            n.append(1)
-            return real(reg)
+        def counted(reg, session=None):
+            n.append(session)
+            return real(reg, session)
         self.httpd.live_view = counted
         for _ in range(3):
             self.assertEqual(self.request("GET", live.LIVE_PATH, TOKEN)[0], 200)
@@ -883,6 +1003,10 @@ class EndpointTest(EndpointHarness):
         v = json.loads(self.request("GET", live.LIVE_PATH, LIVE_TOKEN)[1])
         self.assertEqual(len(n), 2)                                  # the post invalidated it
         self.assertEqual({x["name"]: x for x in v["hosts"]["items"]}["studio"]["heartbeat_state"], "fresh")
+        for _ in range(2):                                           # a session view: its own collect, memoised too
+            self.assertEqual(self.request("GET", live.LIVE_PATH + "?session=" + SESSION, TOKEN)[0], 200)
+            self.assertEqual(self.request("GET", live.LIVE_PATH, TOKEN)[0], 200)
+        self.assertEqual(n[2:], [SESSION])
 
     def test_remote_stubs_reach_the_view(self):
         tid = "t20261111120000-abcdef01"
