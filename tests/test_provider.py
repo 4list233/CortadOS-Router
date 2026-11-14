@@ -67,7 +67,8 @@ class IdleLifetimeTests(unittest.TestCase):
         self.now += 1801
         self.reg.reap(1800)
         self.assertIs(self.reg.get(s.id), s)
-        continuation = wire.ClientTurn("", [], [], {"t": {}}, history=list(s.history))
+        continuation = wire.ClientTurn("", [], [], {"t": {}}, history=list(s.history),
+                                       history_tool_ids=True)      # the reply's tool id: an identity-less caller's proof
         self.assertIs(self.reg.find(continuation), s)
         self.now = finished + server.TOOL_WAIT_S
         self.reg.reap(1800)
@@ -894,13 +895,14 @@ class EndpointTests(EndpointHarness):
 
     def test_a_garbled_tool_name_is_skipped_not_fatal(self):
         history = [{"role": "user", "content": "garbled"}]
+        sid = {"x-claude-code-session-id": "garbled-1"}  # a text-only continuation needs an identity (#43 review P1-b)
         with self.assertLogs("cortados_router.provider.bridge", "WARNING") as logs:
-            r1 = self.post({"tools": [READ_TOOL], "messages": history})
+            r1 = self.post({"tools": [READ_TOOL], "messages": history}, headers=sid)
         self.assertIn("mcp__bashbridge__Bash", "\n".join(logs.output))
         self.assertEqual(r1["stop_reason"], "end_turn")
         self.assertEqual(r1["content"], [{"type": "text", "text": "echo: garbled"}])
         history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "thanks"}]
-        r2 = self.post({"tools": [READ_TOOL], "messages": history})     # the conversation lives on
+        r2 = self.post({"tools": [READ_TOOL], "messages": history}, headers=sid)     # the conversation lives on
         self.assertEqual(r2["content"], [{"type": "text", "text": "echo: thanks"}])
 
     def test_only_the_bridged_tool_use_after_a_garbled_one_is_forwarded(self):
@@ -1029,13 +1031,13 @@ class EndpointTests(EndpointHarness):
         history[1] = {"role": "assistant", "content": [dict(history[1]["content"][-1], id="toolu_someone_else")]}
         history[2]["content"][0]["tool_use_id"] = "toolu_someone_else"
         body = {"tools": [READ_TOOL], "messages": history + [{"role": "user", "content": "thanks"}]}
-        self.assertEqual(self.status_of(body), 409)
+        self.assertEqual(self.status_of(body), server.TERMINAL_STATUS)     # identity-less: refused, never continued
 
     def test_edited_earlier_assistant_text_is_refused_not_continued(self):
         history = self._two_tool_turns()
         history[3] = {"role": "assistant", "content": [{"type": "text", "text": "an answer this endpoint never wrote"}]}
         body = {"tools": [READ_TOOL], "messages": history + [{"role": "user", "content": "thanks"}]}
-        self.assertEqual(self.status_of(body), 409)
+        self.assertEqual(self.status_of(body), server.TERMINAL_STATUS)     # identity-less: refused, never continued
 
     def test_a_compacted_history_with_no_assistant_message_opens_a_new_conversation(self):
         self._two_tool_turns()
@@ -1063,19 +1065,26 @@ class EndpointTests(EndpointHarness):
                        headers=self.REPLAY_ID)
         self.assertEqual(r3["stop_reason"], "end_turn")
 
-    def test_a_retry_with_a_different_user_turn_still_409s_and_says_why(self):
+    def test_a_retry_with_a_different_user_turn_is_never_replayed(self):
         history = [{"role": "user", "content": "please use tool"}]
         r1 = self.post({"tools": [READ_TOOL], "messages": history}, headers=self.REPLAY_ID)
         history += [{"role": "assistant", "content": r1["content"]}]
         use = r1["content"][-1]["id"]
-        self.post({"tools": [READ_TOOL], "messages": history + [
+        r2 = self.post({"tools": [READ_TOOL], "messages": history + [
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use, "content": "hello"}]}]},
-                  headers=self.REPLAY_ID)
+                       headers=self.REPLAY_ID)
         other = {"tools": [READ_TOOL], "messages": history + [
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use, "content": "something else"}]}]}
-        with self.assertLogs("cortados.provider", "WARNING") as logs:
-            self.assertEqual(self.status_of(other, headers=self.REPLAY_ID), 409)
-        self.assertTrue(any("class=retry_of_answered_turn" in l for l in logs.output), logs.output)
+        # Rebuilds off: the ordinary 409, classified.
+        self.assertEqual(self._409_class(other, headers=self.REPLAY_ID), "retry_of_answered_turn")
+        # Rebuilds on (#43): an edit of the answered turn, served on a rebuilt branch, never the stored reply.
+        (old,) = self.reg.sessions.values()
+        r = self.post(other, headers=self.REPLAY_ID)
+        self.assertNotEqual(r["id"], r2["id"])
+        # The replayed transcript still holds "please use tool", so the fake model calls the tool again: a new call.
+        self.assertNotIn(use, [b.get("id") for b in r["content"]])
+        self.assertEqual(len(self.reg.sessions), 2)
+        self.assertIn(old, self.reg.sessions.values())                 # a branch: the old session is kept
 
     REPLAY_ID = {"x-claude-code-session-id": "conversation-replay"}   # replay needs a conversation identity
 
@@ -1122,20 +1131,23 @@ class EndpointTests(EndpointHarness):
     def test_a_retry_from_another_scope_is_not_replayed(self):
         body, r2 = self._answered_tool_turn(headers={"x-claude-code-session-id": "conversation-A"})
         with self.assertLogs("cortados.provider", "WARNING") as logs:
-            self.assertEqual(self.status_of(body, headers={"x-claude-code-session-id": "conversation-B"}), 409)
+            # Another conversation identity: no session of its own wrote the reply (no_writer, terminal).
+            self.assertEqual(self.status_of(body, headers={"x-claude-code-session-id": "conversation-B"}),
+                             server.TERMINAL_STATUS)
         self.assertTrue(any("class=retry_of_answered_turn" in l for l in logs.output), logs.output)
         self.assertEqual(self.post(body, headers={"x-claude-code-session-id": "conversation-A"}), r2)
 
-    def test_an_identity_less_retry_is_not_replayed_but_409s(self):
+    def test_an_identity_less_retry_is_not_replayed_but_refused(self):
         # P2-1: without a conversation identity both scopes are None; None == None must never replay a stored reply
-        # to whoever re-sends the same history (another User-Agent, another wire). It gets the ordinary 409.
+        # to whoever re-sends the same history (another User-Agent, another wire). It is refused (no_identity).
         body, r2 = self._answered_tool_turn(headers={})
         (session,) = self.reg.sessions.values()
         self.assertIsNone(session.scope)
         self.assertIsNotNone(session.last_reply)
         with self.assertLogs("cortados.provider", "WARNING") as logs:
-            self.assertEqual(self.status_of(body, headers={"user-agent": "someone-else/1.0"}), 409)
-        self.assertTrue(any("class=retry_of_answered_turn" in l for l in logs.output), logs.output)
+            self.assertEqual(self.status_of(body, headers={"user-agent": "someone-else/1.0"}), server.TERMINAL_STATUS)
+        self.assertTrue(any("class=retry_of_answered_turn" in l and "refused:no_identity" in l for l in logs.output),
+                        logs.output)
         self.assertEqual(self._409_class(body), "retry_of_answered_turn")   # the same client without an id too
 
     def test_a_retry_in_the_same_scope_on_another_wire_is_not_replayed(self):
@@ -1172,7 +1184,8 @@ class EndpointTests(EndpointHarness):
             self.post(dict(body, model="sub/opus"), headers=self.REPLAY_ID)
             self.fail("a retry naming another model was served")
         except urllib.error.HTTPError as exc:
-            self.assertEqual(exc.code, 409)
+            # Terminal (#43 review): the retry would name the same other model.
+            self.assertEqual((exc.code, exc.headers.get("x-should-retry")), (server.TERMINAL_STATUS, "false"))
             err = json.loads(exc.read())
         self.assertIn("the model is fixed per conversation", err["error"]["message"])
         self.assertNotIn(r2["id"], json.dumps(err))
@@ -1236,11 +1249,12 @@ class EndpointTests(EndpointHarness):
                 self.post(follow, headers=self.REPLAY_ID)
                 self.fail("an ambiguous retry was replayed")
             except urllib.error.HTTPError as exc:
-                self.assertEqual(exc.code, 409)
+                # A stable ambiguity (no rebuild in flight): terminal, the retry meets the same two sessions.
+                self.assertEqual((exc.code, exc.headers.get("x-should-retry")), (server.TERMINAL_STATUS, "false"))
                 raw = exc.read().decode()
         for r in replies:
             self.assertNotIn(r["id"], raw)
-        line = next(l for l in logs.output if "409 lost conversation" in l)
+        line = next(l for l in logs.output if "lost conversation" in l)
         self.assertIn("candidates=2", line)
 
     def test_a_stale_continuation_whose_conversation_closed_while_waiting_is_classified(self):
@@ -1251,7 +1265,7 @@ class EndpointTests(EndpointHarness):
         codes = []
 
         def continuation():
-            codes.append(self.status_of(follow))
+            codes.append(self.status_of(follow, headers=self.REPLAY_ID))   # the same scope as the conversation
         session.lock.acquire()
         try:
             with self.assertLogs("cortados.provider", "WARNING") as logs:
@@ -1271,9 +1285,13 @@ class EndpointTests(EndpointHarness):
                         logs.output)
 
     def _409_class(self, body, headers=None):
-        with self.assertLogs("cortados.provider", "WARNING") as logs:
-            self.assertEqual(self.status_of(body, headers=headers), 409)
-        line = next(l for l in logs.output if "409 lost conversation" in l)
+        """The class of the lost-conversation refusal this request gets, with rebuilds off (REBUILD_MAX 0): these tests
+        pin what find and the replay guard decide; a request with an identity that a rebuild would serve is covered by
+        RebuildTests. With an identity that is the pre-#43 409; without one, the terminal no_identity refusal (#43
+        review P1-b), whose log line carries the same class."""
+        with self.assertLogs("cortados.provider", "WARNING") as logs, mock.patch.object(server, "REBUILD_MAX", 0):
+            self.assertIn(self.status_of(body, headers=headers), (409, server.TERMINAL_STATUS))
+        line = next(l for l in logs.output if "lost conversation" in l)
         return line.split("class=")[1].split()[0]
 
     def test_the_409_log_classifies_client_ahead_diverged_no_candidate_and_reaped(self):
@@ -1312,19 +1330,23 @@ class EndpointTests(EndpointHarness):
             {"type": "tool_result", "tool_use_id": r1["content"][-1]["id"], "content": "ok"}]}]})
         self.assertEqual(r2["content"][0]["text"], "tool said: ok")
 
-    def test_a_continuation_of_an_unknown_conversation_is_a_409_not_a_fresh_start(self):
+    def test_a_continuation_of_an_unknown_conversation_is_refused_not_a_fresh_start(self):
         body = {"tools": [READ_TOOL], "messages": [{"role": "user", "content": "x"},
                                                    {"role": "assistant", "content": "an answer from before a restart"},
                                                    {"role": "user", "content": "go on"}]}
-        self.assertEqual(self.status_of(body), 409)
+        # Terminal (#43 review): the retry would carry the same history to the same empty registry.
+        self.assertEqual(self.status_of(body), server.TERMINAL_STATUS)
+        self.assertEqual(self.status_of(body, headers={"x-claude-code-session-id": "s"}), server.TERMINAL_STATUS)
         self.assertEqual(self.reg.sessions, {})
 
-    def test_results_for_an_unknown_conversation_are_a_409(self):
+    def test_results_for_an_unknown_conversation_are_refused(self):
         body = {"tools": [READ_TOOL], "messages": [
             {"role": "user", "content": "x"},
             {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_gone", "name": "Read", "input": {}}]},
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_gone", "content": "x"}]}]}
-        self.assertEqual(self.status_of(body), 409)
+        self.assertEqual(self.status_of(body), server.TERMINAL_STATUS)
+        with mock.patch.object(server, "REBUILD_MAX", 0):          # rebuilds off: the pre-#43 409, with an identity
+            self.assertEqual(self.status_of(body, headers={"x-claude-code-session-id": "s"}), 409)
 
     def test_a_wrong_token_is_refused(self):
         self.assertEqual(self.status_of({"messages": [{"role": "user", "content": "x"}]}, token="nope"), 401)
@@ -1381,6 +1403,814 @@ class RoutedHarness(EndpointHarness):
         body = {"model": "cortados", "tools": [{"name": "Re\ud800d", "input_schema": {"type": "object"}}],
                 "messages": [{"role": "user", "content": "x"}]}
         self.assertEqual(self.status_of(body), 400)
+
+
+class RebuildTests(RoutedHarness):
+    """Issue #43: a continuation whose client compacted or edited its history is served on a rebuilt backend (same
+    route, seeded with the client's current history as a transcript) instead of a 409; 409 stays only where no rebuild
+    is possible, and says why. Requests carry Claude Code's session id, the identity a rebuild needs."""
+
+    HEADERS = {"X-Claude-Code-Session-Id": "8c0f6a52-rebuild"}
+
+    def converse(self, *texts):
+        """A conversation of plain turns (the fake answers "echo: <text>"); returns the message list."""
+        history: list = []
+        for t in texts:
+            history.append({"role": "user", "content": t})
+            r = self.post({"tools": [READ_TOOL], "messages": history})
+            history.append({"role": "assistant", "content": r["content"]})
+        return history
+
+    def test_a_partial_compaction_rebuilds_the_session_and_closes_the_old_one(self):
+        history = self.converse("hello", "second")
+        (old,) = self.reg.sessions.values()
+        # The client summarised the first exchange and kept the last reply.
+        compacted = [{"role": "user", "content": "Summary: the user said hello."}] + history[3:]
+        body = {"tools": [READ_TOOL], "messages": compacted + [{"role": "user", "content": "third"}]}
+        with self.assertLogs("cortados.provider", "WARNING") as logs:
+            r = self.post(body)
+        self.assertTrue(any("compacted: old session closed" in l and "rebuild 1 of 5" in l for l in logs.output),
+                        logs.output)
+        seed = r["content"][0]["text"]
+        self.assertTrue(seed.startswith("echo: [cortados relay] The client rewrote"), seed)
+        self.assertIn("<user>\nSummary: the user said hello.\n</user>", seed)
+        self.assertIn("<assistant>\necho: second\n</assistant>", seed)
+        self.assertNotIn("echo: hello", seed)                         # the compacted-away reply is not replayed
+        self.assertTrue(seed.endswith("The client's new turn follows. third"), seed)
+        (new,) = self.reg.sessions.values()
+        self.assertIsNot(new, old)
+        self.assertTrue(old._closed)
+        self.assertEqual(new.route["route_id"], "r1")                 # the routing decision stands
+        self.assertEqual(len(self.calls), 1)                          # not re-routed
+        self.assertEqual([e["route_id"] for e in self.executed], ["r1"])   # nor logged again
+        self.assertIsNone(new.rebuild_seed)                           # the history is in the backend now
+        # The rebuilt conversation continues like any other, with no seed.
+        follow = body["messages"] + [{"role": "assistant", "content": r["content"]}, {"role": "user", "content": "fourth"}]
+        self.assertEqual(self.post({"tools": [READ_TOOL], "messages": follow})["content"],
+                         [{"type": "text", "text": "echo: fourth"}])
+        self.assertEqual(list(self.reg.sessions.values()), [new])
+
+    def test_a_compaction_over_a_pending_tool_call_replays_the_call_and_its_result_by_id(self):
+        history = self.converse("hello") + [{"role": "user", "content": "please use tool"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        use = r1["content"][-1]
+        (old,) = self.reg.sessions.values()
+        self.assertTrue(old.awaiting_tool_result)
+        # The client compacted the first exchange and the request, keeping the tool call and answering it.
+        body = {"tools": [READ_TOOL], "messages": [
+            {"role": "user", "content": "Summary: the user said hello, then asked to read a file."},
+            {"role": "assistant", "content": r1["content"]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"], "content": "hello"}]}]}
+        t0 = time.time()
+        r = self.post(body)
+        self.assertLess(time.time() - t0, 4.5)        # the old CLI's tool wait was ended, not sat out to the kill
+        seed = r["content"][0]["text"]
+        self.assertIn(f'[tool call {use["id"]}: Read] {{"file_path": "f0.md"}}', seed)
+        self.assertIn(f"[tool result for call {use['id']}]\nhello", seed)
+        self.assertLess(seed.index("[tool call"), seed.index("[tool result"))
+        (new,) = self.reg.sessions.values()
+        self.assertIsNot(new, old)
+        self.assertFalse(new.awaiting_tool_result)
+
+    def test_an_edited_earlier_message_rebuilds_from_the_edited_history(self):
+        history = self.converse("hello", "second")
+        edited = list(history)
+        edited[0] = {"role": "user", "content": "HELLO, edited"}
+        edited[1] = {"role": "assistant", "content": [{"type": "text", "text": "a reply the client rewrote"}]}
+        r = self.post({"tools": [READ_TOOL], "messages": edited + [{"role": "user", "content": "third"}]})
+        seed = r["content"][0]["text"]
+        self.assertIn("HELLO, edited", seed)
+        self.assertIn("a reply the client rewrote", seed)
+        self.assertEqual(len(self.reg.sessions), 1)                    # it continued from the last reply: superseded
+
+    def test_a_rewind_to_an_earlier_reply_branches_and_keeps_the_old_session(self):
+        history = self.converse("hello", "second", "third")
+        (old,) = self.reg.sessions.values()
+        rewind = history[:2] + [{"role": "user", "content": "second, edited"}]
+        with self.assertLogs("cortados.provider", "WARNING") as logs:
+            r = self.post({"tools": [READ_TOOL], "messages": rewind})
+        self.assertTrue(any("branched: old session kept" in l for l in logs.output), logs.output)
+        self.assertTrue(r["content"][0]["text"].endswith("second, edited"))
+        self.assertEqual(len(self.reg.sessions), 2)
+        self.assertIn(old, self.reg.sessions.values())
+        self.assertEqual(len(old.history), 3)
+        # Both go on: the branch by its own history, the old session by its own.
+        branch = rewind + [{"role": "assistant", "content": r["content"]}, {"role": "user", "content": "b"}]
+        self.assertEqual(self.post({"tools": [READ_TOOL], "messages": branch})["content"][0]["text"], "echo: b")
+        main = history + [{"role": "user", "content": "m"}]
+        self.assertEqual(self.post({"tools": [READ_TOOL], "messages": main})["content"][0]["text"], "echo: m")
+
+    def compacted(self, history, summary, text):
+        """A request whose client summarised everything before the last reply of `history`, then says `text`."""
+        return {"tools": [READ_TOOL], "messages": [{"role": "user", "content": summary}] + history[-1:]
+                + [{"role": "user", "content": text}]}
+
+    def terminal_error(self, body, stream=False, headers=None):
+        """(status, error type, message, x-should-retry) of a refused request."""
+        try:
+            self.post(dict(body, stream=True) if stream else body, headers=headers)
+        except urllib.error.HTTPError as exc:
+            return exc.code, *(lambda e: (e["type"], e["message"]))(json.loads(exc.read())["error"]), \
+                exc.headers.get("x-should-retry")
+        self.fail("expected an HTTP error")
+
+    def test_the_rebuild_limit_is_terminal_and_says_so(self):
+        # Review P1-1: Claude Code retries 409, and the retry carries the same rewritten history, so the limit is the
+        # endpoint's terminal 400 (x-should-retry: false), and the message names the limit and the way out.
+        history = self.converse("hello", "second")
+        with mock.patch.object(server, "REBUILD_MAX", 1):
+            r = self.post(self.compacted(history, "Summary 1.", "third"))
+            again = [{"role": "user", "content": "Summary 2."}, {"role": "assistant", "content": r["content"]},
+                     {"role": "user", "content": "fourth"}]
+            with self.assertLogs("cortados.provider", "WARNING") as logs:
+                code, kind, msg, retry = self.terminal_error({"tools": [READ_TOOL], "messages": again})
+        self.assertEqual((code, kind, retry), (server.TERMINAL_STATUS, server.TERMINAL_ERROR, "false"))
+        self.assertEqual((code, kind), (400, "invalid_request_error"))
+        self.assertIn("rebuild limit (1 rebuilds)", msg)
+        self.assertIn("start a new conversation", msg)
+        self.assertTrue(any("reached REBUILD_MAX" in l for l in logs.output), logs.output)
+        self.assertFalse(any("409" in l for l in logs.output), logs.output)
+        self.assertEqual(len(self.reg.sessions), 1)                    # the live session is untouched
+
+    def test_the_rebuild_limit_on_a_streaming_request_is_a_terminal_sse_error(self):
+        history = self.converse("hello", "second")
+        with mock.patch.object(server, "REBUILD_MAX", 1):
+            r = self.post(self.compacted(history, "Summary 1.", "third"))
+            again = {"tools": [READ_TOOL], "stream": True, "messages": [
+                {"role": "user", "content": "Summary 2."}, {"role": "assistant", "content": r["content"]},
+                {"role": "user", "content": "fourth"}]}
+            raw = self.post(again)
+        self.assertIn("event: error", raw)
+        self.assertIn('"type": "invalid_request_error"', raw)
+        self.assertIn("rebuild limit", raw)
+
+    def test_a_replay_that_does_not_fit_the_route_is_refused_before_the_old_session_is_touched(self):
+        # Review P2-5: each replayed block is under the per-block cut, but together they exceed the route's context
+        # (estimated as the opening route was: routing.request_fit, chars / 4). Refused, terminal, old session kept.
+        history = self.converse("hello", "second")
+        (old,) = self.reg.sessions.values()
+        old.route = dict(old.route, context_length=2000)
+        secret = "PROMPT-TEXT-MUST-NOT-BE-LOGGED "
+        blocks = [{"type": "text", "text": secret + "y" * 870} for _ in range(10)]   # 10 x 900 chars ≈ 2.2k tokens
+        body = {"tools": [READ_TOOL], "messages": [{"role": "user", "content": blocks}] + history[-1:]
+                + [{"role": "user", "content": "third"}]}
+        with mock.patch.object(wire, "REBUILD_BLOCK_CHARS", 1000):
+            with self.assertLogs("cortados.provider", "WARNING") as logs:
+                code, kind, msg, retry = self.terminal_error(body)
+        self.assertEqual((code, kind, retry), (400, "invalid_request_error", "false"))
+        self.assertIn("does not fit the conversation's model context (2k tokens)", msg)
+        self.assertIn("start a new conversation", msg)
+        self.assertTrue(any("rebuild refused" in l and "exceeds its route's context" in l for l in logs.output))
+        self.assertFalse(any(secret.strip() in l for l in logs.output), logs.output)
+        self.assertEqual(list(self.reg.sessions.values()), [old])     # untouched: not closed, not replaced
+        self.assertFalse(old._closed)
+        self.assertEqual(old.rebuild_budget.used, 0)                    # and no rebuild was spent
+        # The same request on a route that has the room is rebuilt.
+        old.route["context_length"] = 200_000
+        with mock.patch.object(wire, "REBUILD_BLOCK_CHARS", 1000):
+            self.assertEqual(self.status_of(body), 200)
+
+    def test_without_an_identity_no_rebuild_and_the_terminal_refusal_says_why(self):
+        # #43 review: no_identity and no_writer are terminal (400, x-should-retry: false): the retry carries the same
+        # history and meets the same registry, so the 409 Claude Code retries would only loop.
+        history = self.converse("hello", "second")
+        body = {"tools": [READ_TOOL], "messages": [{"role": "user", "content": "Summary."}] + history[3:]
+                + [{"role": "user", "content": "third"}]}
+        code, kind, msg, retry = self.terminal_error(dict(body), headers={"X-Claude-Code-Session-Id": ""})
+        self.assertEqual((code, kind, retry), (400, "invalid_request_error", "false"))
+        self.assertIn("carries no conversation identity", msg)
+        # Another identity is a stranger: no candidate, never another client's session.
+        code, kind, msg, retry = self.terminal_error(body, headers={"X-Claude-Code-Session-Id": "someone-else"})
+        self.assertEqual((code, retry), (400, "false"))
+        self.assertIn("no live conversation of this client wrote its last reply", msg)
+        self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_two_conversations_that_wrote_the_last_reply_are_refused_not_guessed(self):
+        a = self.converse("same", "x")
+        self.converse("same", "x")                                      # same reply texts: the same fingerprints
+        body = {"tools": [READ_TOOL], "messages": [{"role": "user", "content": "Summary."}] + a[3:]
+                + [{"role": "user", "content": "go"}]}
+        code, kind, msg, retry = self.terminal_error(body)     # stable: nothing is in flight to resolve it
+        self.assertEqual((code, retry), (400, "false"))
+        self.assertIn("2 live conversations of this client wrote its last reply", msg)
+
+    def test_a_rebuild_that_changes_the_pinned_model_is_refused(self):
+        history = self.converse("hello", "second")
+        body = {"model": "sub/opus", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "Summary."}]
+                + history[3:] + [{"role": "user", "content": "third"}]}
+        code, kind, msg, retry = self.terminal_error(body)     # terminal: the retry names the same other model
+        self.assertEqual((code, retry), (400, "false"))
+        self.assertIn("the model is fixed per conversation", msg)
+
+    def test_a_rebuilt_backend_starts_with_the_same_isolation_and_the_requests_tools(self):
+        history = self.converse("hello", "second")
+        first = json.loads(Path(self.argv_file).read_text())["argv"]
+        other = {"name": "Grep", "description": "Search", "input_schema": {"type": "object", "properties": {}}}
+        self.post({"tools": [READ_TOOL, other], "messages": [{"role": "user", "content": "Summary."}] + history[3:]
+                   + [{"role": "user", "content": "third"}]})
+        argv = json.loads(Path(self.argv_file).read_text())["argv"]
+        for flag in ("--tools", "--setting-sources", "--settings", "--model"):
+            self.assertEqual(argv[argv.index(flag) + 1], first[first.index(flag) + 1], flag)
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertEqual(argv[argv.index("--allowedTools") + 1], "mcp__bridge__Read,mcp__bridge__Grep")
+
+    def test_a_busy_old_session_answers_a_retryable_busy_not_a_409(self):
+        history = self.converse("hello", "second")
+        (old,) = self.reg.sessions.values()
+        body = {"tools": [READ_TOOL], "messages": [{"role": "user", "content": "Summary."}] + history[3:]
+                + [{"role": "user", "content": "third"}]}
+        old.lock.acquire()                                              # a turn is running on it
+        try:
+            self.assertEqual(self.status_of(body), server.BUSY_STATUS)
+        finally:
+            old.lock.release()
+        self.assertEqual(list(self.reg.sessions.values()), [old])
+        self.assertEqual(self.status_of(body), 200)                     # the retry is rebuilt
+
+    # ---- #43 second review, through the HTTP handlers
+    def answer(self, body, headers=None):
+        """(status, response or error body) of one request."""
+        try:
+            return 200, self.post(body, headers=headers)
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    @staticmethod
+    def wait_until(cond, what):
+        """Poll a condition the code under test sets (never a fixed sleep standing in for an ordering)."""
+        deadline = time.time() + 10
+        while not cond():
+            if time.time() > deadline:
+                raise AssertionError(f"timed out waiting for {what}")
+            time.sleep(0.01)
+
+    def test_identical_concurrent_branch_requests_share_one_rebuilt_session(self):
+        # Review P1-a: both requests finish find() before either publishes. The second waits on the first's in-flight
+        # gate, then finds the session the first published and joins it: one backend, no duplicate history, so the
+        # next continuation is never ambiguous.
+        history = self.converse("hello", "second", "third")
+        (old,) = self.reg.sessions.values()
+        body = {"tools": [READ_TOOL], "messages": history[:2] + [{"role": "user", "content": "second, edited"}]}
+        real_new, entered, release, starts, out = self.reg._new, threading.Event(), threading.Event(), [], {}
+
+        def slow_new(*a, **kw):                                         # the first rebuild's backend is starting
+            starts.append(kw.get("scope"))
+            entered.set()
+            release.wait(10)
+            return real_new(*a, **kw)
+
+        with mock.patch.object(self.reg, "_new", side_effect=slow_new):
+            a = threading.Thread(target=lambda: out.update(a=self.answer(body)))
+            a.start()
+            self.assertTrue(entered.wait(10))
+            b = threading.Thread(target=lambda: out.update(b=self.answer(body)))
+            b.start()
+            # B has looked up (nothing published yet: it too was told Rebuild) and now waits on A's gate.
+            self.wait_until(lambda: any(g[1] == 2 for g in self.reg._rebuilding.values()), "B on the rebuild gate")
+            release.set()
+            a.join(30)
+            b.join(30)
+        self.assertEqual(len(starts), 1)                                # one rebuilt backend, not two
+        self.assertEqual(self.reg._rebuilding, {})
+        self.assertEqual(len(self.reg.sessions), 2)                     # the old session (a branch keeps it) + one
+        (new,) = [s for s in self.reg.sessions.values() if s is not old]
+        self.assertEqual(new.rebuilds, 1)
+        self.assertEqual(old.rebuild_budget.used, 1)
+        # Both met on the shared session's turn lock: one was served, the other is a stale continuation (409)...
+        codes = sorted(code for code, _ in out.values())
+        self.assertEqual(codes, [200, 409], out)
+        served = next(r for code, r in out.values() if code == 200)
+        # ...whose retry is the replay of the reply it lost, and the branch continues unambiguously.
+        self.assertEqual(self.post(body), served)
+        follow = body["messages"] + [{"role": "assistant", "content": served["content"]}, {"role": "user", "content": "go"}]
+        self.assertEqual(self.post({"tools": [READ_TOOL], "messages": follow})["content"][0]["text"], "echo: go")
+
+    def _race_identical_branch_past_a_finished_rebuild(self):
+        """Round-3 P1's schedule: two identical branch requests both reach Rebuild; B is paused before its gated lookup
+        while A rebuilds AND completes its first turn, then B resumes. Returns (old, out) once both answered."""
+        history = self.converse("hello", "second", "third")
+        (old,) = self.reg.sessions.values()
+        body = {"tools": [READ_TOOL], "messages": history[:2] + [{"role": "user", "content": "second, edited"}]}
+        real, paused, go, out, calls = self.reg.rebuild, threading.Event(), threading.Event(), {}, []
+
+        def gated(*a, **kw):
+            calls.append(1)
+            if len(calls) == 1:                                         # B: told Rebuild, held before the gate
+                paused.set()
+                go.wait(10)
+            return real(*a, **kw)
+
+        with mock.patch.object(self.reg, "rebuild", side_effect=gated):
+            b = threading.Thread(target=lambda: out.update(b=self.answer(body)))
+            b.start()
+            self.assertTrue(paused.wait(10))
+            out["a"] = self.answer(body)                                # A rebuilds and finishes its turn
+            go.set()
+            b.join(30)
+        return old, body, out
+
+    def test_an_identical_branch_resumed_after_the_rebuild_finished_is_replayed_not_rebuilt_again(self):
+        # Review round 3, P1: B no longer finds an exact history match (A's rebuilt session advanced by A's reply), so
+        # before the fix it started a second backend from the retained parent: three sessions, two slots spent, and
+        # the next continuation (identical echo replies) a terminal 400 for two matching sessions.
+        old, body, out = self._race_identical_branch_past_a_finished_rebuild()
+        self.assertEqual(out["a"][0], 200, out)
+        self.assertEqual(out["b"], out["a"])                            # B is A's reply, replayed
+        self.assertEqual(len(self.reg.sessions), 2)                     # the kept parent + one rebuilt session
+        self.assertEqual(old.rebuild_budget.used, 1)
+        self.assertEqual(self.reg._rebuilding, {})
+        follow = body["messages"] + [{"role": "assistant", "content": out["a"][1]["content"]},
+                                     {"role": "user", "content": "go"}]
+        self.assertEqual(self.answer({"tools": [READ_TOOL], "messages": follow})[1]["content"][0]["text"], "echo: go")
+
+    def test_an_identical_branch_resumed_after_an_unreplayable_rebuilt_turn_is_a_stale_409(self):
+        # The same schedule with A's reply too large to keep for a replay: B is a stale continuation of the session A
+        # rebuilt (409, as in work()), never a second backend.
+        real = server.REPLAY_MAX_BYTES
+        server.REPLAY_MAX_BYTES = 1
+        try:
+            old, body, out = self._race_identical_branch_past_a_finished_rebuild()
+        finally:
+            server.REPLAY_MAX_BYTES = real
+        self.assertEqual(out["a"][0], 200, out)
+        self.assertEqual(out["b"][0], 409, out)
+        self.assertIn("moved on", out["b"][1]["error"]["message"])
+        self.assertEqual(len(self.reg.sessions), 2)
+        self.assertEqual(old.rebuild_budget.used, 1)
+
+    def test_identity_less_clients_sharing_a_user_agent_never_continue_each_other(self):
+        # Review P1-b: two independent callers, both `claude-cli`, no identity, the same reply text. B's session
+        # disappears; B's continuation exact-matches A's history. It must not enter A's backend.
+        ua = {"X-Claude-Code-Session-Id": "", "user-agent": "claude-cli/2.1.316 (external, cli)"}
+        opening = [{"role": "user", "content": "same"}]
+        ra = self.post({"system": "A's private system prompt", "tools": [READ_TOOL], "messages": opening}, headers=ua)
+        rb = self.post({"system": "B's system prompt", "tools": [READ_TOOL], "messages": opening}, headers=ua)
+        self.assertEqual(ra["content"], rb["content"])                 # identical fingerprints
+        (a,) = [s for s in self.reg.sessions.values() if s.system == "A's private system prompt"]
+        (b,) = [s for s in self.reg.sessions.values() if s is not a]
+        self.reg.drop(b)                                                # B's session goes away (reaped, failed)
+        follow = {"system": "B's system prompt", "tools": [READ_TOOL],
+                  "messages": opening + [{"role": "assistant", "content": rb["content"]},
+                                         {"role": "user", "content": "more"}]}
+        code, kind, msg, retry = self.terminal_error(follow, headers=ua)
+        self.assertEqual((code, kind, retry), (400, "invalid_request_error", "false"))
+        self.assertIn("carries no conversation identity", msg)
+        self.assertEqual(len(a.history), 1)                             # A's conversation did not advance
+        self.assertEqual(list(self.reg.sessions.values()), [a])
+        # A itself, also identity-less and text-only, is refused the same way: nothing proves it is A's caller.
+        self.assertEqual(self.terminal_error(dict(follow, system="A's private system prompt"), headers=ua)[0], 400)
+
+    # What the real clients send (README "Delegating", cortados_router/session.py custom_headers, the routed-subagents
+    # mod): Claude Code's own X-Claude-Code-Session-Id on every request; a CortadOS child task or routed subagent adds
+    # x-cortados-run-id and the Office's x-cortados-* tags through ANTHROPIC_CUSTOM_HEADERS.
+    CLAUDE_CODE = {"user-agent": "claude-cli/2.1.316 (external, cli)",
+                   "X-Claude-Code-Session-Id": "3f1c2b9a-7d4e-4c55-9a51-0d6c8e2f7b10"}
+    CHILD_TASK = dict(CLAUDE_CODE, **{"x-cortados-run-id": "t20261113202214-359735e4",
+                                      "x-cortados-session": "0123456789abcdef", "x-cortados-project": "CortadOS-Router",
+                                      "x-cortados-device": "air", "x-cortados-task-title": "rebuild review fixes"})
+
+    def test_claude_code_main_sessions_and_child_tasks_continue_and_rebuild(self):
+        for name, headers in (("main session", self.CLAUDE_CODE), ("child task", self.CHILD_TASK)):
+            with self.subTest(name):
+                for s in list(self.reg.sessions.values()):
+                    self.reg.drop(s)
+                history: list = []
+                for t in ("hello", "second"):                           # text-only turns: no tool id needed
+                    history.append({"role": "user", "content": t})
+                    r = self.post({"tools": [READ_TOOL], "messages": history}, headers=headers)
+                    history.append({"role": "assistant", "content": r["content"]})
+                (old,) = self.reg.sessions.values()
+                self.assertIsNotNone(old.scope)
+                r = self.post(self.compacted(history, "Summary.", "third"), headers=headers)
+                self.assertTrue(r["content"][0]["text"].endswith("third"))
+                (new,) = self.reg.sessions.values()
+                self.assertIsNot(new, old)                              # rebuilt, in the same scope
+                self.assertEqual(new.scope, old.scope)
+
+    def test_the_first_turn_after_a_rebuild_is_rechecked_under_the_turn_lock(self):
+        # Review P2-c: request A passed the fit check and published the rebuilt session; before A takes its first
+        # turn, B (the same history, a much larger new turn) takes it. B is refused terminally under the turn lock; the
+        # seed stays for A, which is then served.
+        history = self.converse("hello", "second")
+        (old,) = self.reg.sessions.values()
+        old.route = dict(old.route, context_length=2000)
+        small = self.compacted(history, "Summary.", "third")
+        turn = wire.parse_request(small)
+        transcript = wire.rebuild_transcript(wire.history_messages(small["messages"]))
+        new = self.reg.rebuild(old, turn, superseded=True, transcript=transcript, scope=old.scope,
+                               wire_path="/v1/messages", client=old.client)      # A, published, first turn not taken
+        big = dict(small, messages=small["messages"][:-1] + [{"role": "user", "content": "y" * 12000}])  # ≈3k tokens
+        with self.assertLogs("cortados.provider", "WARNING") as logs:
+            code, kind, msg, retry = self.terminal_error(big)
+        self.assertEqual((code, kind, retry), (400, "invalid_request_error", "false"))
+        self.assertIn("does not fit the conversation's model context (2k tokens)", msg)
+        self.assertTrue(any("first turn after a rebuild" in l for l in logs.output), logs.output)
+        self.assertIs(self.reg.get(new.id), new)
+        self.assertEqual(new.rebuild_seed, transcript)                 # not consumed by the refused turn
+        r = self.post(small)                                            # A's own turn fits and carries the seed
+        self.assertIn("Summary.", r["content"][0]["text"])
+        self.assertIsNone(new.rebuild_seed)
+
+    def test_a_backend_that_cannot_start_leaves_the_old_session_untouched(self):
+        history = self.converse("hello", "second")
+        (old,) = self.reg.sessions.values()
+        body = {"tools": [READ_TOOL], "messages": [{"role": "user", "content": "Summary."}] + history[3:]
+                + [{"role": "user", "content": "third"}]}
+        self.reg.claude_bin = "/nonexistent/claude"
+        with self.assertLogs("cortados.provider", "WARNING"):
+            self.assertEqual(self.status_of(body), 502)
+        self.assertEqual(list(self.reg.sessions.values()), [old])
+        self.assertFalse(old._closed)
+        self.assertEqual(self.reg._opening, 0)
+
+
+class RebuildRegistryTests(unittest.TestCase):
+    """Registry.find / rebuild under concurrency and isolation (#43 review), with a fake backend factory and hooks at
+    the exact points of each race, never sleeps."""
+
+    SCOPE, WIRE, CLIENT = "scope-a", "/v1/messages", "claude-cli"
+
+    def setUp(self):
+        from types import SimpleNamespace
+        self.on_create = None                       # hook: runs inside the factory (a backend starting)
+        self.fail_create = None                     # an exception the factory raises (a backend refusing to start)
+
+        def factory(reg, **kw):
+            if self.on_create:
+                self.on_create()
+            if self.fail_create:
+                raise self.fail_create
+            return SimpleNamespace(id=uuid.uuid4().hex, lock=threading.Lock(), last_used=time.time(), history=[],
+                                   close=mock.Mock(), _closed=False)
+        self.reg = Registry(gateway_url="", token=TOKEN, session_factories={"claude-cli": factory})
+
+    def opened(self, replies, scope=SCOPE, wire_path=WIRE, client=CLIENT):
+        s = self.reg.new(wire.ClientTurn("", [READ_TOOL], [], {}), keep=True, scope=scope, wire_path=wire_path,
+                         client=client)
+        s.history = list(replies)
+        return s
+
+    def turn(self, history):
+        return wire.ClientTurn("", [READ_TOOL], [{"type": "text", "text": "next"}], {}, history=list(history))
+
+    def rebuild(self, old, history, *, superseded, scope=SCOPE):
+        return self.reg.rebuild(old, self.turn(history), superseded=superseded,
+                                transcript=[{"type": "text", "text": "T"}], scope=scope, wire_path=self.WIRE,
+                                client=self.CLIENT)
+
+    def rebuild_of(self, history, scope=SCOPE):
+        """What find decides for `history`: the Rebuild it raises."""
+        with self.assertRaises(server.Rebuild) as cm:
+            self.reg.find(self.turn(history), None, scope, self.WIRE, client=self.CLIENT)
+        return cm.exception
+
+    # ---- review P1-2: publication only once initialised
+    def test_a_rebuilt_session_is_published_only_once_fully_initialised(self):
+        old = self.opened(["a", "b"])
+        history = ["x", "b"]                                    # the client rewrote the first reply, kept the last
+        seen = {}
+
+        def published(s, handler):
+            """Registry calls set_exit_handler right after a session becomes findable, outside the registry lock: a
+            concurrent request looks it up at exactly that instant and inspects what it would see (the review's race:
+            a find between publication and the seeding of history / rebuild_seed / budget)."""
+            try:
+                found = self.reg.find(self.turn(history), None, self.SCOPE, self.WIRE, client=self.CLIENT)
+            except Exception as exc:                        # the old code: not findable yet, or found half-built
+                seen["found"] = exc
+                return
+            seen.update(found=found, seed=getattr(found, "rebuild_seed", None),
+                        budget=getattr(found, "rebuild_budget", None))
+        create = self.reg._factories["claude-cli"]
+
+        def factory(reg, **kw):
+            s = create(reg, **kw)
+            s.set_exit_handler = lambda handler, s=s: published(s, handler)
+            return s
+        self.reg._factories["claude-cli"] = factory
+        new = self.rebuild(old, history, superseded=True)
+        self.assertIs(seen["found"], new)                       # findable with the request's history...
+        self.assertEqual(seen["seed"], [{"type": "text", "text": "T"}])   # ...and already holding its seed,
+        self.assertIs(seen["budget"], old.rebuild_budget)       # the lineage's budget,
+        self.assertEqual(new.history, history)
+        self.assertEqual(new.rebuilds, 1)
+
+    # ---- review P1-3: a stale superseded decision is revalidated under the old turn lock
+    def test_an_old_session_that_advanced_after_the_lookup_is_kept_and_served_as_a_branch(self):
+        old = self.opened(["a", "b"])
+        history = ["x", "b"]
+        rb = self.rebuild_of(history)
+        self.assertTrue(rb.superseded)                          # classified as a compaction at lookup time
+        # Between that lookup and the rebuild taking the old session's lock, a normal turn advanced it.
+        with old.lock:
+            old.history.append("c")
+        with self.assertLogs("cortados.provider", "INFO") as logs:
+            new = self.rebuild(old, history, superseded=rb.superseded)
+        self.assertTrue(any("advanced after the rebuild lookup; served as a branch" in l for l in logs.output))
+        self.assertTrue(any("branched: old session kept" in l for l in logs.output), logs.output)
+        self.assertIs(self.reg.get(old.id), old)                # the advanced session was NOT closed
+        old.close.assert_not_called()
+        self.assertIs(self.reg.get(new.id), new)
+        self.assertFalse(old.lock.locked())
+        self.assertEqual(self.reg._opening, 0)
+
+    def test_the_revalidation_happens_under_the_old_turn_lock(self):
+        # The advance lands while the rebuild is starting the new backend: by then the old lock is held, so the turn
+        # that would advance it cannot run until the old session has been closed (the compaction stands).
+        old = self.opened(["a", "b"])
+        history = ["x", "b"]
+        self.on_create = lambda: self.assertTrue(old.lock.locked())
+        new = self.rebuild(old, history, superseded=True)
+        self.assertIsNone(self.reg.get(old.id))
+        old.close.assert_called_once()
+        self.assertIs(self.reg.get(new.id), new)
+
+    # ---- review P2-4: one budget per lineage, reserved atomically
+    def test_sequential_branches_share_one_budget(self):
+        old = self.opened(["a", "b", "c", "d"])
+        with mock.patch.object(server, "REBUILD_MAX", 2):
+            b1 = self.rebuild(old, ["a"], superseded=False)
+            b2 = self.rebuild(old, ["a", "b"], superseded=False)
+            self.assertEqual((b1.rebuilds, b2.rebuilds), (1, 2))
+            self.assertIs(b1.rebuild_budget, old.rebuild_budget)
+            with self.assertRaises(server.RebuildLimit):
+                self.rebuild(old, ["a", "b", "c"], superseded=False)
+            with self.assertRaises(server.RebuildLimit):     # a branch of a branch is the same lineage
+                self.rebuild(b1, ["z", "a"], superseded=False)
+            # find refuses up front, terminally, once the lineage is spent
+            with self.assertRaises(server.RebuildLimit):
+                self.reg.find(self.turn(["z", "c"]), None, self.SCOPE, self.WIRE, client=self.CLIENT)
+        self.assertEqual(len(self.reg.sessions), 3)
+
+    def test_concurrent_branches_cannot_both_take_the_last_slot(self):
+        old = self.opened(["a", "b", "c"])
+        entered, release, out = threading.Event(), threading.Event(), {}
+
+        def slow_start():                                   # the first rebuild's backend is starting...
+            entered.set()
+            release.wait(10)
+        self.on_create = slow_start
+        with mock.patch.object(server, "REBUILD_MAX", 1):
+            t = threading.Thread(target=lambda: out.update(first=self.rebuild(old, ["a"], superseded=False)))
+            t.start()
+            self.assertTrue(entered.wait(10))
+            self.on_create = None
+            # ...and the second finds the last slot reserved by a start still pending: retryable busy (review P2-d),
+            # not the terminal limit, since that start may yet fail and give it back.
+            with self.assertRaises(server.ConversationBusy):
+                self.rebuild(old, ["a", "b"], superseded=False)
+            release.set()
+            t.join(10)
+            with self.assertRaises(server.RebuildLimit):    # once committed, the limit is terminal
+                self.rebuild(old, ["a", "b"], superseded=False)
+        self.assertEqual(out["first"].rebuilds, 1)
+        self.assertEqual((old.rebuild_budget.used, old.rebuild_budget.pending), (1, 0))
+
+    def test_a_backend_that_fails_to_start_returns_its_slot(self):
+        old = self.opened(["a", "b"])
+        self.fail_create = BridgeError("cannot start the headless CLI")
+        with mock.patch.object(server, "REBUILD_MAX", 1):
+            with self.assertRaises(BridgeError):
+                self.rebuild(old, ["x", "b"], superseded=True)
+            self.assertEqual(old.rebuild_budget.used, 0)
+            self.assertIs(self.reg.get(old.id), old)            # untouched
+            self.assertFalse(old.lock.locked())
+            self.fail_create = None
+            self.assertEqual(self.rebuild(old, ["x", "b"], superseded=True).rebuilds, 1)
+        self.assertEqual(self.reg._opening, 0)
+
+    def test_a_busy_or_vanished_old_session_returns_its_slot(self):
+        old = self.opened(["a", "b"])
+        with old.lock:
+            with self.assertRaises(server.ConversationBusy):
+                self.rebuild(old, ["x", "b"], superseded=True)
+        self.assertEqual(old.rebuild_budget.used, 0)
+        self.reg.drop(old)
+        with self.assertRaises(server.ConversationBusy):
+            self.rebuild(old, ["x", "b"], superseded=True)
+        self.assertEqual(old.rebuild_budget.used, 0)
+
+    # ---- scope: the exact-match lookup never crosses clients or wires
+    def test_identical_histories_in_two_scopes_never_share_a_session(self):
+        a = self.opened(["r1", "r2"], scope="scope-a")
+        b = self.opened(["r1", "r2"], scope="scope-b")
+        c = self.opened(["r1", "r2"], scope="scope-a", wire_path="/v1/responses")
+        find = lambda scope, wire_path=self.WIRE: self.reg.find(self.turn(["r1", "r2"]), None, scope, wire_path,
+                                                                 client=self.CLIENT)
+        self.assertIs(find("scope-a"), a)                   # used to be a 409: 3 live sessions had this history
+        self.assertIs(find("scope-b"), b)
+        self.assertIs(find("scope-a", "/v1/responses"), c)
+        with self.assertRaises(server.LostSession):         # a stranger finds nothing (and no rebuild either)
+            find("scope-c")
+
+    # ---- #43 second review
+    def test_a_pending_start_holding_the_last_slot_is_busy_and_its_failure_returns_the_slot(self):
+        # Review P2-d: committed usage and pending reservations are apart. While the only slot is held by a start that
+        # may still fail, another rebuild is a retryable busy, never the terminal limit; when that start fails, the
+        # slot is back and the retry is served.
+        old = self.opened(["a", "b", "c"])
+        entered, release, out = threading.Event(), threading.Event(), {}
+
+        def failing_start():
+            entered.set()
+            release.wait(10)
+            raise BridgeError("cannot start the headless CLI")
+
+        def first():
+            try:
+                out["first"] = self.rebuild(old, ["a"], superseded=False)
+            except BridgeError as exc:
+                out["first"] = exc
+        self.on_create = failing_start
+        with mock.patch.object(server, "REBUILD_MAX", 1):
+            t = threading.Thread(target=first)
+            t.start()
+            self.assertTrue(entered.wait(10))
+            self.on_create = None
+            self.assertEqual((old.rebuild_budget.used, old.rebuild_budget.pending), (0, 1))
+            with self.assertRaises(server.ConversationBusy):
+                self.rebuild(old, ["a", "b"], superseded=False)
+            with self.assertRaises(server.Rebuild):     # find's early check reads committed usage only: no terminal
+                self.reg.find(self.turn(["z", "b"]), None, self.SCOPE, self.WIRE, client=self.CLIENT)
+            release.set()
+            t.join(10)
+            self.assertIsInstance(out["first"], BridgeError)
+            self.assertEqual((old.rebuild_budget.used, old.rebuild_budget.pending), (0, 0))
+            self.assertEqual(self.rebuild(old, ["a", "b"], superseded=False).rebuilds, 1)   # the retry is served
+            with self.assertRaises(server.RebuildLimit):    # and now the limit is committed: terminal
+                self.rebuild(old, ["z", "c"], superseded=False)
+
+    def test_identical_concurrent_rebuilds_join_one_session(self):
+        # Review P1-a at the registry: the second rebuild of the same history, gated behind the first, joins it.
+        old = self.opened(["a", "b", "c"])
+        entered, release, out = threading.Event(), threading.Event(), {}
+
+        def slow_start():
+            entered.set()
+            release.wait(10)
+        self.on_create = slow_start
+        t = threading.Thread(target=lambda: out.update(first=self.rebuild(old, ["a"], superseded=False)))
+        t.start()
+        self.assertTrue(entered.wait(10))
+        self.on_create = None
+        t2 = threading.Thread(target=lambda: out.update(second=self.rebuild(old, ["a"], superseded=False)))
+        t2.start()
+        deadline = time.time() + 10
+        while not any(g[1] == 2 for g in self.reg._rebuilding.values()):
+            self.assertLess(time.time(), deadline, "the second rebuild never reached the gate")
+            time.sleep(0.01)
+        release.set()
+        t.join(10)
+        t2.join(10)
+        self.assertIs(out["second"], out["first"])
+        self.assertEqual(old.rebuild_budget.used, 1)                    # joined: no second slot spent
+        self.assertEqual(len(self.reg.sessions), 2)
+        self.assertEqual(self.reg._rebuilding, {})
+
+    def test_a_rebuild_waiting_too_long_on_the_gate_is_busy(self):
+        old = self.opened(["a", "b"])
+        gate = [threading.Lock(), 1]
+        gate[0].acquire()
+        with self.reg._lock:
+            self.reg._rebuilding[(self.SCOPE, self.WIRE, "b")] = gate
+        with mock.patch.object(server, "REBUILD_WAIT_S", 0.05):
+            with self.assertRaises(server.ConversationBusy):
+                self.rebuild(old, ["x", "b"], superseded=True)
+        self.assertEqual(gate[1], 1)                                    # its own hold released, the owner's kept
+        self.assertEqual((old.rebuild_budget.used, old.rebuild_budget.pending), (0, 0))
+
+    def test_ambiguity_is_busy_while_a_rebuild_is_in_flight_and_terminal_otherwise(self):
+        # The reviewer's 409 recommendation: a stable ambiguity is terminal; one a rebuild in flight may resolve (its
+        # old and new sessions overlap for a moment) is a retryable busy.
+        self.opened(["a", "b"])
+        self.opened(["x", "b"])
+        find = lambda h: self.reg.find(self.turn(h), None, self.SCOPE, self.WIRE, client=self.CLIENT)
+        with self.assertRaises(server.Refused) as cm:
+            find(["z", "b"])
+        self.assertEqual(cm.exception.code, "ambiguous_writer")
+        self.opened(["q"])
+        self.opened(["q"])
+        with self.assertRaises(server.Refused) as cm:
+            find(["q"])
+        self.assertEqual(cm.exception.code, "ambiguous")
+        with self.reg._lock:
+            self.reg._rebuilding[(self.SCOPE, self.WIRE, "b")] = [threading.Lock(), 1]
+        with self.assertRaises(server.ConversationBusy):
+            find(["z", "b"])
+        with self.assertRaises(server.ConversationBusy):
+            find(["q"])
+        with self.assertRaises(server.Refused):         # another scope is not affected by this one's rebuild
+            self.reg.find(self.turn(["z", "b"]), None, "scope-b", self.WIRE, client=self.CLIENT)
+
+    def test_identity_less_requests_need_a_tool_id_in_their_history(self):
+        # Review P1-b: the client name is no proof (every Claude Code is `claude-cli`); a tool_use id of the session in
+        # the request's history is, so only that continues. Nothing identity-less is ever rebuilt or replayed.
+        mine = self.opened(["r1"], scope=None, client="claude-cli")
+        with self.assertRaises(server.Refused) as cm:
+            self.reg.find(self.turn(["r1"]), None, None, self.WIRE, client="claude-cli")
+        self.assertEqual(cm.exception.code, "no_identity")
+        self.assertIs(self.reg.find(self.proven(["r1"]), None, None, self.WIRE, client="claude-cli"), mine)
+        with self.assertRaises(server.Refused) as cm:   # a rewritten history: never a rebuild without an identity
+            self.reg.find(self.proven(["x", "r1"]), None, None, self.WIRE, client="claude-cli")
+        self.assertEqual(cm.exception.code, "no_identity")
+
+    def proven(self, history):
+        """An identity-less request's turn whose history carries a tool_use id (Registry.find's proof of caller)."""
+        t = self.turn(history)
+        t.history_tool_ids = True
+        return t
+
+    def test_identity_less_requests_match_only_their_own_client_and_wire(self):
+        mine = self.opened(["r1"], scope=None, client="claude-cli")
+        self.opened(["r1"], scope=None, client="codex_exec")
+        self.opened(["r1"], scope="scope-a", client="claude-cli")
+        self.assertIs(self.reg.find(self.proven(["r1"]), None, None, self.WIRE, client="claude-cli"), mine)
+        with self.assertRaises(server.Refused):
+            self.reg.find(self.proven(["r1"]), None, None, self.WIRE, client="curl")
+        with self.assertRaises(server.Refused):
+            self.reg.find(self.proven(["r1"]), None, None, "/v1/responses", client="claude-cli")
+
+
+class TranscriptTests(unittest.TestCase):
+    """anthropic_wire's rebuild transcript: labelled roles, tool calls and results paired by id, thinking dropped,
+    oversized blocks cut with the cut stated."""
+
+    @staticmethod
+    def text_of(blocks):
+        return "".join(b["text"] for b in blocks if b["type"] == "text")
+
+    def test_roles_tools_and_thinking(self):
+        t = self.text_of(wire.rebuild_transcript([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "secret", "signature": "s"},
+                                              {"type": "text", "text": "ok"},
+                                              {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"p": 1}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "is_error": True,
+                                          "content": [{"type": "text", "text": "nope"}, {"type": "image", "source": {}}]}]},
+            {"role": "system", "content": "operator note"}]))
+        self.assertNotIn("secret", t)
+        self.assertIn('<assistant>\nok\n[tool call toolu_1: Read] {"p": 1}\n</assistant>', t)
+        # An image block without any image data has nothing to replay: the placeholder says so.
+        self.assertIn("[tool result for call toolu_1, error]\nnope\n[image: no image data", t)
+        self.assertIn("<operator>\noperator note\n</operator>", t)
+
+    def test_an_oversized_block_is_cut_and_says_so(self):
+        with mock.patch.object(wire, "REBUILD_BLOCK_CHARS", 10):
+            t = self.text_of(wire.rebuild_transcript([{"role": "user", "content": "x" * 25}]))
+        self.assertIn("x" * 10 + "\n[cut at 10 of 25 characters]", t)
+
+    def test_new_turn_results_are_text_and_images_stay_images(self):
+        turn = wire.parse_request({"messages": [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_9", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_9", "content": [
+                {"type": "text", "text": "res"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]}]}]})
+        out = wire.rebuild_content([{"type": "text", "text": "HIST"}], turn)
+        self.assertIn("<conversation-history>\nHIST\n</conversation-history>", out[0]["text"])
+        self.assertEqual(out[1]["text"], "[tool result for call toolu_9]\nres\n[image result: attached after this text]")
+        self.assertEqual(out[2], {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}})
+
+    def test_historical_images_are_kept_in_place_with_their_owner(self):
+        # Review P2-6: an image in an earlier user message and one in an earlier tool result stay image blocks, in
+        # place, each after a label that numbers it and names its turn or tool call.
+        png = {"type": "base64", "media_type": "image/png", "data": "UFVORw=="}
+        jpg = {"type": "base64", "media_type": "image/jpeg", "data": "SlBFRw=="}
+        blocks = wire.rebuild_transcript([
+            {"role": "user", "content": [{"type": "text", "text": "look at this"}, {"type": "image", "source": png}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_s", "name": "Shot", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_s", "content": [
+                {"type": "text", "text": "before"}, {"type": "image", "source": jpg},
+                {"type": "text", "text": "after"}]}]},
+            {"role": "assistant", "content": "seen"}])
+        kinds = [b["type"] for b in blocks]
+        self.assertEqual(kinds, ["text", "image", "text", "image", "text"])
+        self.assertEqual(blocks[1], {"type": "image", "source": png})
+        self.assertEqual(blocks[3], {"type": "image", "source": jpg})
+        self.assertTrue(blocks[0]["text"].endswith("look at this\n[image 1: in this user message, follows]\n"),
+                        blocks[0])
+        self.assertTrue(blocks[2]["text"].endswith(
+            "[tool result for call toolu_s]\nbefore\n[image 2: from the tool result for call toolu_s, follows]\n"),
+            blocks[2])
+        self.assertTrue(blocks[4]["text"].startswith("\nafter\n</user>"), blocks[4])
+        # The seed keeps them in the same place, between the note and the new turn.
+        turn = wire.parse_request({"messages": [{"role": "user", "content": "x"},
+                                                {"role": "assistant", "content": "seen"},
+                                                {"role": "user", "content": "next"}]})
+        out = wire.rebuild_content(blocks, turn)
+        self.assertEqual([b["type"] for b in out], ["text", "image", "text", "image", "text", "text"])
+        self.assertTrue(out[0]["text"].startswith(wire.REBUILD_NOTE))
+        self.assertTrue(out[4]["text"].endswith("</conversation-history>\n\nThe client's new turn follows."))
+
+    def test_a_url_image_is_kept_and_mcp_image_content_becomes_a_block(self):
+        blocks = wire.rebuild_transcript([
+            {"role": "user", "content": [{"type": "image", "source": {"type": "url", "url": "https://x.test/a.png"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": [
+                {"type": "image", "data": "QUJD", "mimeType": "image/gif"}]}]}])
+        images = [b for b in blocks if b["type"] == "image"]
+        self.assertEqual(images, [{"type": "image", "source": {"type": "url", "url": "https://x.test/a.png"}},
+                                  {"type": "image", "source": {"type": "base64", "media_type": "image/gif",
+                                                               "data": "QUJD"}}])
 
 
 class FixedModelFloorTests(EndpointHarness):
@@ -1772,10 +2602,14 @@ class RunRecordTests(RoutedHarness):
         self.assertEqual((code, r1["stop_reason"]), (200, "tool_use"))
         history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": r1["content"][-1]["id"], "content": "x"}]}]
-        code, r2 = self.send({"tools": [READ_TOOL], "messages": history}, "run-continuer")
+        # The run id is part of the conversation identity (CONVERSATION_ID_HEADERS), so another run id is another
+        # scope: it never continues this run's session (Registry.find), and records nothing either way.
+        code, _ = self.send({"tools": [READ_TOOL], "messages": history}, "run-continuer")
+        self.assertEqual(code, server.TERMINAL_STATUS)                 # no_writer in its scope: terminal
+        self.assertEqual(self.lookup("run-continuer")[1]["models"], [])   # its refusal only, nothing routed
+        code, r2 = self.send({"tools": [READ_TOOL], "messages": history}, "run-opener")
         self.assertEqual((code, r2["content"][0]["text"]), (200, "tool said: x"))
-        self.assertEqual(self.lookup("run-continuer")[0], 404)        # routed when it opened, not by this request
-        self.assertEqual(len(self.reg.runs._runs["run-opener"]), 1)
+        self.assertEqual(len(self.reg.runs._runs["run-opener"]), 1)   # routed when it opened, not by this request
 
     def test_a_backend_start_failure_leaves_no_record(self):
         self.reg.claude_bin = [os.path.join(self.scratch, "no-such-claude")]
@@ -1894,9 +2728,44 @@ class FailedSessionTombstoneTests(EndpointHarness):
                                               **self.HEADERS, **(headers or {})})
         return urllib.request.urlopen(req, timeout=30)
 
-    def lose_a_reply(self, headers):
+    def proven_failed_conversation(self, headers, first="please use tool"):
+        """failed_conversation for a client without a conversation identity: such a continuation reaches its backend
+        only when its history carries a tool_use id of that session (Registry.find's proof of caller, #43 review
+        P1-b), so the conversation opens with a tool call and its result before the failing turn."""
+        history = [{"role": "user", "content": first}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history}, headers=headers)
+        history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": r1["content"][-1]["id"], "content": "hello"}]}]
+        r2 = self.post({"tools": [READ_TOOL], "messages": history}, headers=headers)
+        history += [{"role": "assistant", "content": r2["content"]}, {"role": "user", "content": "backend failure"}]
+        body = {"tools": [READ_TOOL], "messages": history}
+        with self.assertLogs("cortados.provider", "WARNING"):
+            self.assertEqual(self.status_of(body, headers=headers), 502)
+        self.assertEqual(self.reg.sessions, {})
+        return body
+
+    def lost(self, body, headers=None, *, why="no longer holds"):
+        """A request that gets the terminal refusal of a conversation this endpoint does not hold (#43 review: 400 +
+        x-should-retry: false, never the 409 Claude Code retries), and never a tombstone's failure."""
+        code, err, hdrs = self.error_of(body, headers)
+        self.assertEqual((code, err["error"]["type"], hdrs.get("x-should-retry")),
+                         (400, "invalid_request_error", "false"))
+        self.assertIn(why, err["error"]["message"])
+        self.assertNotIn("failed at", err["error"]["message"])
+
+    def lose_a_reply(self, headers, proven=False):
         """Conversation B: opens with "hi" (A's prefix, A's reply), advances its live session one turn, then retries as
-        a client that lost that turn's response would: the history no longer matches B's live session."""
+        a client that lost that turn's response would: the history no longer matches B's live session. `proven`: an
+        identity-less B, which opens with a tool call instead (see proven_failed_conversation)."""
+        if proven:
+            history = [{"role": "user", "content": "please use tool"}]
+            r1 = self.post({"tools": [READ_TOOL], "messages": history}, headers=headers)
+            history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": r1["content"][-1]["id"], "content": "hello"}]}]
+            retry = {"tools": [READ_TOOL], "messages": history}
+            self.post(retry, headers=headers)
+            self.assertEqual(len(self.reg.sessions), 1)
+            return retry
         history = [{"role": "user", "content": "hi"}]
         r1 = self.post({"tools": [READ_TOOL], "messages": history}, headers=headers)
         history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "next step"}]
@@ -1906,26 +2775,27 @@ class FailedSessionTombstoneTests(EndpointHarness):
         return retry
 
     def test_without_an_identity_an_independent_conversation_never_gets_another_ones_failure(self):
-        # The round-3 reproduction: A fails after "hi -> OK"; independent B (same prefix, same UA, no identity)
-        # advances, loses a response and retries. B must get the ordinary 409, never A's terminal failure.
+        # The round-3 reproduction: A fails; independent B (same UA, no identity) advances, loses a response and
+        # retries. B must never get A's terminal failure. Since #43 review P1-b neither retry is served at all: an
+        # identity-less request that matches no session exactly is refused terminally (no_identity), never A's failure.
         none = {"X-Claude-Code-Session-Id": ""}
         server._unkeyed_logged = False
         with mock.patch.object(server.logger, "info") as info:
-            body = self.failed_conversation(headers=none)
+            body = self.proven_failed_conversation(none)
         lines = [c.args[0] % c.args[1:] for c in info.call_args_list]
         self.assertEqual(sum("no conversation identity" in line for line in lines), 1, lines)
         self.assertEqual(len(self.reg.tombstones), 0)                  # no identity: nothing published
-        self.assertEqual(self.error_of(body, none)[0], 409)            # A's own retry: the ordinary 409 too
+        self.lost(body, none, why="carries no conversation identity")  # A's own retry
         # B's retry of its answered turn: without an identity it is never replayed (another client could share the
-        # history), and never A's failure either: the ordinary 409.
-        self.assertEqual(self.error_of(self.lose_a_reply(none), none)[0], 409)
+        # history), and never A's failure either.
+        self.lost(self.lose_a_reply(none, proven=True), none, why="carries no conversation identity")
 
     def test_the_missing_identity_is_logged_once_per_process(self):
         none = {"X-Claude-Code-Session-Id": ""}
         server._unkeyed_logged = False
         with mock.patch.object(server.logger, "info") as info:
-            self.failed_conversation(headers=none)
-            self.failed_conversation("hello", headers=none)
+            self.proven_failed_conversation(none)
+            self.proven_failed_conversation(none, first="please use tool again")
         lines = [c.args[0] % c.args[1:] for c in info.call_args_list]
         self.assertEqual(sum("no conversation identity" in line for line in lines), 1, lines)
 
@@ -1952,7 +2822,16 @@ class FailedSessionTombstoneTests(EndpointHarness):
         # B's retry of its answered turn is now replayed from B's live session (Replay): never A's failure.
         self.assertIn("content", self.post(self.lose_a_reply(self.HEADERS), headers=self.HEADERS))
         self.assertEqual(len(self.reg.sessions), 1)                    # B is untouched and still live
-        self.assertEqual(self.error_of(body)[0], 409)                  # A's retry is indistinguishable from B's
+        (b,) = self.reg.sessions.values()
+        # A's retry is indistinguishable from B's: never A's terminal error. With rebuilds off it is the ordinary 409;
+        # with them on (#43) it is served on a branch rebuilt from B (it fails again only because its own turn is the
+        # fake's "backend failure" trigger), and B stays live either way.
+        with mock.patch.object(server, "REBUILD_MAX", 0):
+            self.assertEqual(self.error_of(body)[0], 409)
+        with self.assertLogs("cortados.provider", "WARNING") as logs:
+            self.assertEqual(self.error_of(body)[0], 502)
+        self.assertTrue(any("branched: old session kept" in l for l in logs.output), logs.output)
+        self.assertIn(b, self.reg.sessions.values())
 
     def test_a_live_extension_under_another_identity_never_hides_the_failure(self):
         # Control: the live session that extends the history belongs to another session id; A's retry keeps its
@@ -1969,7 +2848,7 @@ class FailedSessionTombstoneTests(EndpointHarness):
         code, err, _ = self.error_of(body)
         self.assertEqual((code, err["error"]["type"]), (400, "invalid_request_error"))
         self.assertIn("failed at", err["error"]["message"])
-        self.assertEqual(self.error_of(body, {"X-Claude-Code-Session-Id": ""})[0], 409)   # identity dropped: no match
+        self.lost(body, {"X-Claude-Code-Session-Id": ""}, why="carries no conversation identity")   # identity dropped
 
     def test_a_run_id_alone_is_an_identity(self):
         run = {"X-Claude-Code-Session-Id": "", server.RUN_ID_HEADER: "run-00077"}
@@ -2030,9 +2909,7 @@ class FailedSessionTombstoneTests(EndpointHarness):
         body = self.failed_conversation()
         # Same assistant reply (same fingerprints), different earlier user message: another conversation.
         other = dict(body, messages=[{"role": "user", "content": "a different question"}] + body["messages"][1:])
-        code, err, _ = self.error_of(other)
-        self.assertEqual(code, 409)
-        self.assertIn("no longer holds", err["error"]["message"])
+        self.lost(other)
 
     def test_client_churn_in_the_history_still_finds_the_tombstone(self):
         # What a client re-renders between a request and its retry is not the conversation's identity: the system
@@ -2085,9 +2962,7 @@ class FailedSessionTombstoneTests(EndpointHarness):
                                          {"type": "text", "text": "hi"}])
         other = json.loads(json.dumps(body))
         other["messages"][0]["content"][1]["text"] = "hi there"       # same reminder and reply, other user text
-        code, err, _ = self.error_of(other)
-        self.assertEqual(code, 409)
-        self.assertIn("no longer holds", err["error"]["message"])
+        self.lost(other)
 
     def test_a_busy_timeout_never_closes_or_tombstones_the_owners_session(self):
         # Deterministic overlap: request A owns the session lock; request B (same history) times out waiting for it.
@@ -2138,23 +3013,21 @@ class FailedSessionTombstoneTests(EndpointHarness):
     def test_another_client_or_run_with_the_same_history_never_gets_the_tombstone(self):
         body = self.failed_conversation()
         self.assertEqual(self.error_of(body)[0], 400)                  # the default client (Python-urllib)
-        self.assertEqual(self.error_of(body, {"user-agent": "claude-cli/2.1.0 (external, cli)"})[0], 409)
-        self.assertEqual(self.error_of(body, {server.RUN_ID_HEADER: "run-00042"})[0], 409)
+        self.lost(body, {"user-agent": "claude-cli/2.1.0 (external, cli)"})
+        self.lost(body, {server.RUN_ID_HEADER: "run-00042"})
 
     def test_a_genuinely_unknown_history_is_still_a_409(self):
         self.failed_conversation()
         body = {"tools": [READ_TOOL], "messages": [{"role": "user", "content": "x"},
                                                    {"role": "assistant", "content": "an answer from elsewhere"},
                                                    {"role": "user", "content": "go on"}]}
-        code, err, _ = self.error_of(body)
-        self.assertEqual(code, 409)
-        self.assertIn("no longer holds", err["error"]["message"])
+        self.lost(body)
 
     def test_the_tombstone_expires_after_its_ttl(self):
         body = self.failed_conversation()
         later = time.time() + server.TOMBSTONE_TTL_S + 1
         with mock.patch.object(server.time, "time", return_value=later):
-            self.assertEqual(self.error_of(body)[0], 409)
+            self.lost(body)
         self.assertEqual(self.reg.tombstones, {})                      # pruned, not only ignored
 
     def test_the_store_keeps_only_the_newest_entries(self):
@@ -2238,7 +3111,7 @@ class FailedSessionTombstoneTests(EndpointHarness):
         self.reg.reap(1)
         self.assertEqual((self.reg.sessions, dict(self.reg.tombstones)), ({}, {}))
         follow = history + [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "more"}]
-        self.assertEqual(self.status_of({"tools": [READ_TOOL], "messages": follow}), 409)
+        self.lost({"tools": [READ_TOOL], "messages": follow})
 
     def test_a_request_waiting_on_a_failing_turn_never_reaches_the_dead_backend(self):
         # Deterministic overlap: request A holds the session lock and its backend fails; request B (a retry with the

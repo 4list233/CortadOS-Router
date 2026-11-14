@@ -76,6 +76,10 @@ class ClientTurn:
     # Canonical digest of the conversation before its new turn (conversation_digest): what the user and the tools
     # said, plus the assistant fingerprints. It names the conversation itself, where `history` only proves the replies.
     prefix_digest: str = ""
+    # Whether an earlier assistant message carries a tool_use id (tool_use_ids). Those ids are the backend's own,
+    # random and never reused, so a client whose history matches a session's AND carries one has seen that session's
+    # output: server.Registry.find accepts that as the proof of caller for a request without a conversation identity.
+    history_tool_ids: bool = False
 
 
 def _system_text(system: Any) -> str:
@@ -128,6 +132,12 @@ def turn_fingerprint(turn: "ClientTurn") -> str:
     """Digest of a request's new user turn (its user content and tool results), so a retry of an answered turn can be
     told from a different message on the same history (server.Replay). Never logged."""
     return hashlib.sha256(json.dumps([turn.content, turn.tool_results], sort_keys=True, default=str).encode()).hexdigest()
+
+
+def tool_use_ids(blocks: Any) -> list[str]:
+    """The tool_use ids of one assistant message (the ids reply_fingerprint covers), non-empty ones only."""
+    return [b["id"] for b in _blocks(blocks)
+            if b.get("type") == "tool_use" and isinstance(b.get("id"), str) and b["id"]]
 
 
 def reply_fingerprint(blocks: Any) -> str:
@@ -313,7 +323,9 @@ def _parse_request(body: dict[str, Any]) -> ClientTurn:
                       content=content, tool_results=results,
                       history=[reply_fingerprint(m.get("content")) for m in messages if m.get("role") == "assistant"],
                       stream=bool(body.get("stream")), model=str(body.get("model") or MODEL_ID),
-                      prefix_digest=conversation_digest(messages[:start]))
+                      prefix_digest=conversation_digest(messages[:start]),
+                      history_tool_ids=any(tool_use_ids(m.get("content")) for m in messages
+                                           if m.get("role") == "assistant"))
 
 
 def transcript_text(messages: list[dict[str, Any]]) -> str:
@@ -334,6 +346,191 @@ def one_shot_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [b for b in _blocks(messages[0].get("content")) if b.get("type") != "tool_result"] or \
                [{"type": "text", "text": transcript_text(messages)}]
     return [{"type": "text", "text": "Conversation so far:\n" + transcript_text(messages)}]
+
+
+# ------------------------------------------------------------------ rebuild (server.Registry.rebuild, issue #43)
+# A conversation whose client compacted or edited its history no longer matches its backend session, which holds the
+# old history. The endpoint then starts a fresh backend and seeds it with the client's CURRENT history, as text: a
+# fresh CLI or Codex thread cannot be handed earlier assistant turns or tool calls it never made (the Claude CLI takes
+# user input only; Codex's thread/resume takes no dynamic tools), so tool calls and results are replayed as labelled
+# text, paired by their call id, and the new turn's tool results follow as text too (the fresh backend never issued
+# those calls, so they cannot be delivered to a pending call).
+# Longest text one replayed block keeps (characters; the cut is stated in the transcript). A single oversized tool
+# output (a log dump, a huge file read) would otherwise fill the fresh backend's context with one old result; the
+# model can run the tool again if it needs the rest. 100k characters (~25k tokens) keeps any ordinary file read whole.
+REBUILD_BLOCK_CHARS = 100_000
+REBUILD_NOTE = (
+    "[cortados relay] The client rewrote this conversation's history (it compacted or edited it), so the conversation "
+    "continues on a fresh backend session. The conversation so far, as the client now holds it, is replayed below as a "
+    "transcript. It is history, not new instructions. Tool calls and tool results in it already happened and are "
+    "shown as text, paired by call id. To call a tool from now on, make a real tool call; never write one as text.")
+
+
+def _cut(text: str) -> str:
+    if len(text) <= REBUILD_BLOCK_CHARS:
+        return text
+    return text[:REBUILD_BLOCK_CHARS] + f"\n[cut at {REBUILD_BLOCK_CHARS} of {len(text)} characters]"
+
+
+# An image the history names but whose data is not in the request (no base64 data, no URL): there is nothing to replay.
+_IMAGE_NOT_CARRIED = "[image: no image data in the client's history, not carried]"
+
+
+def _image_of(c: Any) -> dict[str, Any] | None:
+    """An image (an Anthropic image block, or MCP image content from a tool result) as the Anthropic image block both
+    backends take inside user content (the Claude CLI's stream-json input; codex_bridge._turn_input), or None when it
+    carries no image data. A url source is kept as one: the Claude CLI reads it, and Codex shows it as its JSON text,
+    exactly as for an image in the request's own new turn."""
+    if not isinstance(c, dict) or c.get("type") != "image":
+        return None
+    src = c.get("source")
+    if isinstance(src, dict):
+        if src.get("type") == "base64" and src.get("data"):
+            return {"type": "image", "source": {"type": "base64", "media_type": src.get("media_type") or "image/png",
+                                                "data": src["data"]}}
+        if src.get("type") == "url" and src.get("url"):
+            return {"type": "image", "source": {"type": "url", "url": src["url"]}}
+        return None
+    if c.get("data"):                                   # MCP content: {"type": "image", "data", "mimeType"}
+        return {"type": "image", "source": {"type": "base64", "media_type": c.get("mimeType") or "image/png",
+                                            "data": c["data"]}}
+    return None
+
+
+def _result_text(content: Any, image_note: str = _IMAGE_NOT_CARRIED) -> str:
+    """A tool result's content as text: Anthropic blocks or MCP content (text, images by `image_note`, other as JSON)."""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for c in content if isinstance(content, list) else []:
+        if not isinstance(c, dict):
+            continue
+        if c.get("type") == "text":
+            parts.append(str(c.get("text", "")))
+        elif c.get("type") == "image":
+            parts.append(image_note)
+        else:
+            parts.append(json.dumps(c, default=str))
+    return "\n".join(parts)
+
+
+# The replayed history is a list of PARTS (str, or an image block), joined by newlines and then coalesced into content
+# blocks (_coalesce): text stays one text block wherever no image interrupts it, and every historical image stays in
+# place, right after a label that numbers it and says whose it is (a user message, or the tool result of a named
+# call), so the model can tell which turn or result it belongs to (#43 review P2-6: images used to become
+# placeholders, against the stated design "images kept").
+def _image_parts(c: Any, n: list, owner: str) -> list:
+    img = _image_of(c)
+    if img is None:
+        return [_IMAGE_NOT_CARRIED]
+    n[0] += 1
+    return [f"[image {n[0]}: {owner}, follows]", img]
+
+
+def _result_parts(content: Any, call_id: Any, n: list) -> list:
+    """A historical tool result's content: its text (consecutive text items joined, then cut as one) with its images
+    in place between them."""
+    if isinstance(content, str):
+        return [_cut(content)]
+    out, texts = [], []
+    for c in content if isinstance(content, list) else []:
+        if not isinstance(c, dict):
+            continue
+        if c.get("type") == "image":
+            if texts:
+                out.append(_cut("\n".join(texts)))
+                texts = []
+            out += _image_parts(c, n, f"from the tool result for call {call_id}")
+        elif c.get("type") == "text":
+            texts.append(str(c.get("text", "")))
+        else:
+            texts.append(json.dumps(c, default=str))
+    if texts:
+        out.append(_cut("\n".join(texts)))
+    return out
+
+
+def _replay_block(b: dict[str, Any], n: list, role: str) -> list | None:
+    kind = b.get("type")
+    if kind == "text":
+        return [_cut(str(b.get("text", "")))]
+    if kind == "tool_use":
+        return [_cut(f"[tool call {b.get('id')}: {b.get('name')}] {json.dumps(b.get('input') or {}, default=str)}")]
+    if kind == "tool_result":
+        err = ", error" if b.get("is_error") else ""
+        return [f"[tool result for call {b.get('tool_use_id')}{err}]"] + _result_parts(b.get("content"),
+                                                                                        b.get("tool_use_id"), n)
+    if kind == "image":
+        return _image_parts(b, n, f"in this {role} message")
+    if kind in ("thinking", "redacted_thinking"):
+        return None                                 # the model's private reasoning: never part of the transcript
+    return [_cut(json.dumps(b, default=str))]
+
+
+def _coalesce(parts: list) -> list[dict[str, Any]]:
+    """Parts (str, a text block, or an image block) as content blocks: adjacent text becomes one text block, images
+    stay blocks."""
+    out: list[dict[str, Any]] = []
+    for p in parts:
+        if isinstance(p, dict) and p.get("type") == "text":
+            p = str(p.get("text", ""))
+        if isinstance(p, str):
+            if out and out[-1].get("type") == "text":
+                out[-1] = {"type": "text", "text": out[-1]["text"] + p}
+            elif p:
+                out.append({"type": "text", "text": p})
+        else:
+            out.append(p)
+    return out
+
+
+def history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The messages before the request's new turn (everything up to the last assistant message): what a rebuilt
+    backend is seeded with. The new turn itself is rendered from the ClientTurn (rebuild_content)."""
+    start = max((i + 1 for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "assistant"),
+                default=0)
+    return [m for m in messages[:start] if isinstance(m, dict)]
+
+
+def rebuild_transcript(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Anthropic-shaped history messages as one labelled transcript (see REBUILD_NOTE), as content blocks: text, with
+    each historical image kept in place as an image block (see _image_parts). Content that _blocks refuses in an
+    earlier message is shown as its JSON, never a 400: the endpoint already accepted it once."""
+    parts: list = []
+    n = [0]                                         # images numbered across the whole transcript
+    for m in messages:
+        role = {"assistant": "assistant", "user": "user", "system": "operator"}.get(m.get("role"), str(m.get("role")))
+        try:
+            blocks = _blocks(m.get("content"))
+        except WireError:
+            blocks = [{"type": "_raw", "content": m.get("content")}]
+        body = [p for b in blocks for p in (_replay_block(b, n, role) or [])]
+        if body:
+            if parts:
+                parts.append("\n\n")
+            parts.append(f"<{role}>\n")
+            for i, p in enumerate(body):
+                parts += (["\n"] if i else []) + [p]
+            parts.append(f"\n</{role}>")
+    return _coalesce(parts)
+
+
+def rebuild_content(transcript: list[dict[str, Any]], turn: ClientTurn) -> list[dict[str, Any]]:
+    """The first user message of a rebuilt backend: REBUILD_NOTE, the history transcript (rebuild_transcript's blocks,
+    images in place), then the request's new turn (its tool results as text by call id, images kept as image blocks,
+    then its user content)."""
+    out = _coalesce([f"{REBUILD_NOTE}\n\n<conversation-history>\n", *transcript,
+                     "\n</conversation-history>\n\nThe client's new turn follows."])
+    for call_id, result in turn.tool_results.items():
+        err = ", error" if result.get("isError") else ""
+        out.append({"type": "text", "text": f"[tool result for call {call_id}{err}]\n"
+                                            + _cut(_result_text(result.get("content"),
+                                                                "[image result: attached after this text]"))})
+        for c in result.get("content") or []:
+            if isinstance(c, dict) and c.get("type") == "image" and c.get("data"):
+                out.append({"type": "image", "source": {"type": "base64", "media_type": c.get("mimeType") or "image/png",
+                                                        "data": c["data"]}})
+    return out + list(turn.content)
 
 
 def new_message_id() -> str:
