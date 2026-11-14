@@ -18,9 +18,17 @@ services/ and everything else are never touched: cleanup_archive() refuses them 
 "Published" covers what deleting a worktree would lose and nothing else: its files, its HEAD, and its worktree-private
 refs (refs/worktree/*, refs/bisect/*, refs/rewritten/*, and a stopped operation's MERGE_HEAD etc. in its own git dir:
 PRIVATE_REF_PREFIXES, PRIVATE_PSEUDOREFS), each of which must be reachable from a remote-tracking ref, or it is held.
-Branches, tags and the stash belong to the clone, are shared by every task's worktree and survive the deletion: they
-neither hold a worktree nor count as a change in it (#102). Reflogs, ORIG_HEAD and FETCH_HEAD are recovery records,
-not work, and are not checked.
+A stopped merge's or rebase's autostash (MERGE_AUTOSTASH, rebase-merge/autostash, rebase-apply/autostash) is never on
+a remote, so it always holds (`unpushed_autostash`). Every commit a stopped operation's state names (rebase-merge/,
+rebase-apply/, sequencer/, BISECT_*, NOTES_MERGE_*: OP_STATE_DIRS) must be published too, and a stopped `git am` or
+notes merge holds outright (`unpushed_operation_state`). Branches, tags and the stash belong to the clone, are shared
+by every task's worktree and survive the deletion: they neither hold a worktree nor count as a change in it (#102).
+ORIG_HEAD and the worktree's own reflogs do not hold (every reset, amend, rebase or pull writes them, #102), but
+before a worktree is archived, and again before the cleanup deletes it, every commit only they reach gets a recovery
+ref in the clone, refs/cortados-recovery/<task_id>/orig-head or .../reflog-<n> (preserve_recovery_refs); if one
+cannot be written the worktree is held (`recovery_refs_failed`). Nothing here ever deletes a recovery ref.
+TODO(owner): decide when recovery refs expire; until then they accumulate, one small ref per lost tip. FETCH_HEAD
+names fetched commits, not local work, and is not checked.
 
 Known limit, accepted by the owner (2026-11-14, review 3 P1 #1): the quarantine stops writers that reach the tree by
 its path, not one that already holds a descriptor inside it (an open file or directory, a current directory). Such a
@@ -165,11 +173,12 @@ class GitTimeoutError(WorkspaceError):
 _FETCH_NO_GC = ("-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "core.hooksPath=/dev/null")
 
 
-def _git(args, cwd=None, timeout=GIT_TIMEOUT_S) -> str:
+def _git(args, cwd=None, timeout=GIT_TIMEOUT_S, input=None) -> str:
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     pre = _FETCH_NO_GC if args and args[0] == "fetch" else ()
     try:
-        p = subprocess.run([GIT, *pre, *args], cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
+        p = subprocess.run([GIT, *pre, *args], cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env,
+                           **({"input": input} if input is not None else {}))
     except FileNotFoundError:
         raise WorkspaceError("git is not installed or not on PATH on this execution host") from None
     except subprocess.TimeoutExpired:
@@ -639,10 +648,19 @@ def assess(path: str, deadline=None):
             return False, _Reason("unpushed_commits", f"{len(ahead.split())} commit(s) not on any remote"), []
         gitdir = _git(["rev-parse", "--absolute-git-dir"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S)).strip()
         unpublished = _unpublished_private_refs(path, _private_refs(path, gitdir, deadline), deadline)
+        stashes = [name for name in unpublished if name in AUTOSTASH_FILES]
+        if stashes:
+            return False, _Reason("unpushed_autostash", f"a stopped merge or rebase keeps local changes in an "
+                                  f"autostash that exists only in this worktree's git dir: {', '.join(stashes)}"), []
         if unpublished:
             shown = ", ".join(unpublished[:5]) + (f" (+{len(unpublished) - 5} more)" if len(unpublished) > 5 else "")
             return False, _Reason("unpushed_private_refs", f"{len(unpublished)} worktree-private ref(s) not proven on "
                                   f"any remote (deleting the worktree would delete them): {shown}"), []
+        state = _unpublished_operation_state(path, gitdir, deadline)
+        if state:
+            shown = ", ".join(state[:5]) + (f" (+{len(state) - 5} more)" if len(state) > 5 else "")
+            return False, _Reason("unpushed_operation_state", f"a stopped git operation's state in this worktree's git "
+                                  f"dir names work not proven on any remote, or cannot be assessed: {shown}"), []
     except GitTimeoutError as exc:
         return None, _Reason("assess_timeout", f"could not assess the worktree in time: {exc}"), []
     except WorkspaceError as exc:
@@ -653,12 +671,254 @@ def assess(path: str, deadline=None):
 # Refs that live in a worktree's own git dir and go with it when the worktree is deleted (gitglossary "per-worktree
 # ref"; review 3 of held-settle-fix, P1 #2): every other ref (branches, tags, notes, the stash, packed-refs) is the
 # clone's, shared by all its worktrees, and survives the deletion. Pseudo-refs a stopped merge, cherry-pick, revert,
-# rebase or bisect leaves behind are checked too. ORIG_HEAD and FETCH_HEAD are not: `git worktree add` and every reset,
-# rebase or pull write ORIG_HEAD (after a `pull --rebase` it names the pre-rebase commits, which are never on the
-# remote), so it is a recovery record like the reflog, not work; holding on it would hold clean, pushed work (#102).
+# rebase or bisect leaves behind are checked too, and so are the autostashes a stopped `merge --autostash` or
+# `rebase --autostash` (either backend) keeps in the worktree's own git dir (review 4, P1): a stash commit is never
+# on a remote, so a pending autostash always holds. ORIG_HEAD and the reflogs are not checked here: `git worktree
+# add` and every reset, rebase or pull write them (after a `pull --rebase` ORIG_HEAD names the pre-rebase commits,
+# which are never on the remote), so holding on them would hold clean, pushed work (#102). What only they reach is
+# kept by recovery refs in the clone instead (preserve_recovery_refs). FETCH_HEAD names fetched, not local, commits.
 PRIVATE_REF_PREFIXES = ("refs/worktree", "refs/bisect", "refs/rewritten")
-PRIVATE_PSEUDOREFS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "BISECT_HEAD")
+AUTOSTASH_FILES = ("MERGE_AUTOSTASH", "rebase-merge/autostash", "rebase-apply/autostash")
+PRIVATE_PSEUDOREFS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "BISECT_HEAD", *AUTOSTASH_FILES)
 _OID_RE = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
+
+# A stopped operation's state in the worktree's own git dir (review 4, P1): a rebase's todo, done list, orig-head,
+# amend and rewritten lists (rebase-merge/, rebase-apply/), a cherry-pick or revert sequence (sequencer/), a bisect's
+# start point and log (BISECT_*), a notes merge (NOTES_MERGE_*). Every commit any of their files names, by full or
+# abbreviated id, must be on a remote, or the worktree holds; a name that is no object here names nothing to lose. A
+# stopped `git am` (rebase-apply/applying) and a notes merge's worktree hold outright: their patches and note text
+# exist nowhere else. A file past the size caps, an ambiguous abbreviation or a tree that cannot be walked holds too.
+OP_STATE_DIRS = ("rebase-merge", "rebase-apply", "sequencer", "NOTES_MERGE_WORKTREE")
+OP_STATE_FILE_PREFIXES = ("BISECT_", "NOTES_MERGE_")
+OP_STATE_HOLD = ("rebase-apply/applying", "NOTES_MERGE_WORKTREE")
+OP_STATE_MAX_FILES = 10000
+OP_STATE_MAX_BYTES = 8 * 1024 * 1024       # read across every scanned state file of one worktree
+OP_STATE_MAX_TOKENS = 20000
+REFLOG_MAX_BYTES = 16 * 1024 * 1024         # across the worktree's own reflogs (recovery refs)
+_HEX_TOKEN_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{7,64}(?![0-9A-Za-z])")
+
+# Recovery refs (review 4, #2): `refs/cortados-recovery/<task_id>/orig-head` and `.../reflog-<n>` in the clone keep
+# the commits a worktree's ORIG_HEAD or own reflogs reach and no shared ref does, before the worktree is archived (and
+# again before the cleanup deletes it). Nothing in this module ever deletes them. TODO(owner): decide their expiry.
+RECOVERY_REF_PREFIX = "refs/cortados-recovery/"
+
+
+def _op_state_files(gitdir: str, deadline=None) -> list:
+    """[(name relative to `gitdir`, full path)] for the worktree's per-worktree operation and recovery state:
+    everything under OP_STATE_DIRS and logs/, and the top-level ORIG_HEAD, MERGE_AUTOSTASH and OP_STATE_FILE_PREFIXES
+    files. Directories are listed with a trailing "/"; a symlink is listed, never followed. Raises WorkspaceError when
+    a tree cannot be walked or has more than OP_STATE_MAX_FILES entries, GitTimeoutError past `deadline`."""
+    out, errors = [], []
+    try:
+        top = os.listdir(gitdir)
+    except OSError as exc:
+        raise WorkspaceError(f"the worktree's git dir cannot be listed: {type(exc).__name__}")
+    for name in sorted(top):
+        full = os.path.join(gitdir, name)
+        if name in ("ORIG_HEAD", "MERGE_AUTOSTASH") or name.startswith(OP_STATE_FILE_PREFIXES):
+            if not (os.path.isdir(full) and not os.path.islink(full)):
+                out.append((name, full))
+                continue
+        if name not in (*OP_STATE_DIRS, "logs"):
+            continue
+        if os.path.islink(full) or not os.path.isdir(full):
+            out.append((name, full))
+            continue
+        out.append((name + "/", full))
+        for directory, dirs, files in os.walk(full, followlinks=False, onerror=errors.append):
+            _check_deadline(deadline, "list the worktree's operation state")
+            real_dirs = []
+            for d in dirs:
+                (files if os.path.islink(os.path.join(directory, d)) else real_dirs).append(d)
+            dirs[:] = real_dirs
+            for d in real_dirs:
+                out.append((os.path.relpath(os.path.join(directory, d), gitdir).replace(os.sep, "/") + "/",
+                            os.path.join(directory, d)))
+            for f in files:
+                out.append((os.path.relpath(os.path.join(directory, f), gitdir).replace(os.sep, "/"),
+                            os.path.join(directory, f)))
+            if len(out) > OP_STATE_MAX_FILES:
+                raise WorkspaceError(f"more than {OP_STATE_MAX_FILES} operation state entries")
+    if errors:
+        raise WorkspaceError(f"the worktree's operation state cannot be walked: {type(errors[0]).__name__}")
+    return out
+
+
+def _is_op_scanned(rel: str) -> bool:
+    """Whether _unpublished_operation_state reads `rel` (a file of _op_state_files) for commit ids."""
+    if rel.endswith("/") or rel == "ORIG_HEAD" or rel.startswith("logs"):
+        return False
+    return rel.split("/")[0] in OP_STATE_DIRS or rel.startswith(OP_STATE_FILE_PREFIXES) or rel == "MERGE_AUTOSTASH"
+
+
+def _read_capped(full: str, cap: int) -> bytes:
+    """A regular file's bytes, never through a symlink; WorkspaceError when it is not one, cannot be read or is
+    longer than `cap` (the caller holds: unread state is not proven published)."""
+    try:
+        fd = os.open(full, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise WorkspaceError(f"cannot be read: {type(exc).__name__}")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise WorkspaceError("not a regular file")
+        chunks, size = [], 0
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                return b"".join(chunks)
+            size += len(chunk)
+            if size > cap:
+                raise WorkspaceError("too large to assess")
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+
+
+def _object_types(path: str, names, deadline=None) -> dict:
+    """{name: (oid, type)} for object names (full or abbreviated ids) via one `git cat-file --batch-check`; type is
+    "missing" or "ambiguous" (oid None) when git says so."""
+    names = list(names)
+    if not names:
+        return {}
+    out = _git(["--no-optional-locks", "cat-file", "--batch-check=%(objectname) %(objecttype)"], cwd=path,
+               timeout=_within(deadline, GIT_TIMEOUT_S), input="".join(n + "\n" for n in names)).splitlines()
+    if len(out) != len(names):
+        raise WorkspaceError(f"git cat-file answered {len(out)} lines for {len(names)} names")
+    types = {}
+    for name, line in zip(names, out):
+        oid, _, kind = line.strip().rpartition(" ")
+        types[name] = (None, kind) if kind in ("missing", "ambiguous") else (oid, kind)
+    return types
+
+
+def _not_reachable(path: str, commits, keep, deadline=None) -> set:
+    """The commits in `commits` that no object id in `keep` reaches (one `git rev-list --stdin`)."""
+    commits = list(commits)
+    if not commits:
+        return set()
+    lines = commits + ["^" + oid for oid in keep]
+    listed = _git(["--no-optional-locks", "rev-list", "--stdin"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S),
+                  input="".join(line + "\n" for line in lines)).split()
+    listed = set(listed)
+    return {c for c in commits if c in listed}
+
+
+def _ref_oids(path: str, patterns=(), deadline=None) -> dict:
+    """{ref name: object id} from `git for-each-ref` in the worktree at `path` (the clone's shared refs and this
+    worktree's own private refs; never another worktree's)."""
+    out = {}
+    listed = _git(["--no-optional-locks", "for-each-ref", "--format=%(refname) %(objectname)", *patterns], cwd=path,
+                  timeout=_within(deadline, GIT_TIMEOUT_S))
+    for line in listed.splitlines():
+        ref, _, oid = line.rpartition(" ")
+        if ref:
+            out[ref] = oid
+    return out
+
+
+def _unpublished_operation_state(path: str, gitdir: str, deadline=None) -> list:
+    """The operation state files (relative to `gitdir`) that keep the worktree from being proven published: see
+    OP_STATE_DIRS. Raises WorkspaceError / GitTimeoutError: callers hold."""
+    entries = _op_state_files(gitdir, deadline)
+    bad = [rel for rel, _ in entries if rel.rstrip("/") in OP_STATE_HOLD]
+    tokens, budget = {}, OP_STATE_MAX_BYTES
+    for rel, full in entries:
+        if not _is_op_scanned(rel):
+            continue
+        _check_deadline(deadline, "read the worktree's operation state")
+        try:
+            data = _read_capped(full, budget)
+        except WorkspaceError:
+            bad.append(rel)
+            continue
+        budget -= len(data)
+        for tok in _HEX_TOKEN_RE.findall(data.decode("utf-8", "replace")):
+            tokens.setdefault(tok, rel)
+        if len(tokens) > OP_STATE_MAX_TOKENS:
+            raise WorkspaceError(f"more than {OP_STATE_MAX_TOKENS} object names in the operation state")
+    commits = {}
+    for tok, (oid, kind) in _object_types(path, tokens, deadline).items():
+        if kind == "ambiguous":
+            bad.append(tokens[tok])
+        elif kind == "commit":
+            commits.setdefault(oid, tokens[tok])
+    if commits:
+        remotes = _ref_oids(path, ("refs/remotes",), deadline).values()
+        for oid in _not_reachable(path, commits, remotes, deadline):
+            bad.append(commits[oid])
+    return sorted(set(bad))
+
+
+def _recovery_candidates(path: str, gitdir: str, deadline=None):
+    """(ORIG_HEAD's commit id or None, [every commit id in the worktree's own reflogs, newest first]), read from the
+    files backend. A reftable clone keeps them where this cannot read them: WorkspaceError (the caller holds)."""
+    try:
+        fmt = _git(["config", "--get", "extensions.refstorage"], cwd=path,
+                   timeout=_within(deadline, GIT_TIMEOUT_S)).strip().lower()
+    except GitTimeoutError:
+        raise
+    except WorkspaceError:                           # unset: the files backend
+        fmt = ""
+    if fmt not in ("", "files"):
+        raise WorkspaceError(f"the clone's ref storage is {fmt!r}; its reflogs cannot be read")
+    orig = (_read_small(os.path.join(gitdir, "ORIG_HEAD")) or "").split()
+    orig = orig[0] if orig and _OID_RE.fullmatch(orig[0]) else None
+    logged, budget = [], REFLOG_MAX_BYTES
+    for rel, full in _op_state_files(gitdir, deadline):
+        if not rel.startswith("logs/") or rel.endswith("/"):
+            continue
+        data = _read_capped(full, budget)
+        budget -= len(data)
+        for line in reversed(data.decode("utf-8", "replace").splitlines()):
+            for oid in line.split(None, 2)[:2]:
+                if _OID_RE.fullmatch(oid) and oid.strip("0"):
+                    logged.append(oid)
+    return orig, logged
+
+
+def preserve_recovery_refs(path: str, task_id: str, deadline=None) -> int:
+    """Keep what deleting the worktree at `path` would lose from its ORIG_HEAD and its own reflogs (HEAD's and its
+    private refs'): every such commit no shared ref of the clone reaches (branches, tags, remote-tracking refs, earlier
+    recovery refs; never this or another worktree's HEAD or private refs) gets a ref in the clone, one per tip that
+    no other kept commit has as a descendant: RECOVERY_REF_PREFIX<task_id>/orig-head for ORIG_HEAD, reflog-<n> for
+    the rest, all created in one `git update-ref --stdin` transaction (hooks off) and read back. Returns how many
+    recovery refs the task has. Idempotent: a second call finds everything kept. Raises WorkspaceError (GitTimeoutError
+    included) when anything cannot be read, written or verified: the caller holds (fail closed)."""
+    if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
+        raise WorkspaceError(f"not a task id: {task_id!r}")
+    prefix = f"{RECOVERY_REF_PREFIX}{task_id}/"
+    gitdir = _git(["rev-parse", "--absolute-git-dir"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S)).strip()
+    orig, logged = _recovery_candidates(path, gitdir, deadline)
+    cands = list(dict.fromkeys(([orig] if orig else []) + logged))
+    refs = _ref_oids(path, (), deadline)
+    if cands:
+        types = _object_types(path, cands, deadline)
+        commits = [c for c in cands if types[c] == (c, "commit")]     # a missing object leaves nothing to keep
+        keep = {oid for ref, oid in refs.items() if not ref.startswith(tuple(p + "/" for p in PRIVATE_REF_PREFIXES))}
+        lost = _not_reachable(path, commits, keep, deadline)
+        lost = [c for c in commits if c in lost]
+        if lost:
+            tips = set(lost) if len(lost) == 1 else set(_git(
+                ["--no-optional-locks", "merge-base", "--independent", *lost], cwd=path,
+                timeout=_within(deadline, GIT_TIMEOUT_S)).split())
+            taken, n, plan = set(refs), 0, []
+            for c in lost:
+                if c not in tips:
+                    continue
+                name = prefix + "orig-head" if c == orig and prefix + "orig-head" not in taken else None
+                while name is None or name in taken:
+                    n += 1
+                    name = f"{prefix}reflog-{n}"
+                taken.add(name)
+                plan.append((name, c))
+            _git(["-c", "core.hooksPath=/dev/null", "update-ref", "--stdin"], cwd=path,
+                 timeout=_within(deadline, GIT_TIMEOUT_S), input="".join(f"create {r} {c}\n" for r, c in plan))
+            made = _ref_oids(path, (prefix,), deadline)
+            wrong = [r for r, c in plan if made.get(r) != c]
+            if wrong:
+                raise WorkspaceError(f"recovery ref(s) not written as planned: {', '.join(wrong)}")
+            refs.update(made)
+    return sum(1 for ref in refs if ref.startswith(prefix))
 
 
 def _private_refs(path: str, gitdir: str, deadline=None) -> dict:
@@ -727,8 +987,10 @@ def _git_state(path: str, deadline=None) -> dict:
     """The git state a late writer in THIS worktree would change and the deletion would lose, compared like the file
     snapshot: an empty commit, a staged change or a new worktree-private ref touches no working-tree file but changes
     this. HEAD's commit and what it is attached to; the worktree's own git dir and the clone's common dir (`git
-    rev-parse --git-dir --git-common-dir`); its worktree-private refs (_private_refs); and the size, mtime and inode of
-    its index file. Shared state (branches, tags, the stash, packed-refs) is left out (review 3, P2 #3; #102): every
+    rev-parse --git-dir --git-common-dir`); its worktree-private refs (_private_refs, autostashes included); the size,
+    mtime and inode of its index file; and those of its operation and recovery state (`ops`: _op_state_files, i.e.
+    rebase-merge/, rebase-apply/, sequencer/, BISECT_*, NOTES_MERGE_*, ORIG_HEAD and its own reflogs, so a late
+    reset-and-back that leaves HEAD where it was still counts). Shared state (branches, tags, the stash, packed-refs) is left out (review 3, P2 #3; #102): every
     worktree of the clone writes it, and it survives this worktree's deletion, so a sibling task's stash, commit or
     tag never holds this one. A late commit on this worktree's own branch still moves its HEAD.
     Raises GitTimeoutError / WorkspaceError like _git()."""
@@ -744,8 +1006,18 @@ def _git_state(path: str, deadline=None) -> dict:
         index = (stat.S_IFMT(st.st_mode), st.st_size, st.st_mtime_ns, st.st_ino)
     except FileNotFoundError:
         index = None
+    ops = []
+    for rel, full in _op_state_files(gitdir, deadline):
+        try:
+            st = os.lstat(full)
+        except FileNotFoundError:
+            continue                                  # gone between listing and stat: the next snapshot differs
+        except OSError as exc:
+            raise WorkspaceError(f"cannot stat {rel} in the worktree's git dir: {type(exc).__name__}")
+        ops.append((rel, stat.S_IFMT(st.st_mode), None if rel.endswith("/") else st.st_size,
+                    None if rel.endswith("/") else st.st_mtime_ns, st.st_ino))
     return {"head": head, "attached": attached, "git_dir": gitdir, "common_dir": common,
-            "private": _private_refs(path, gitdir, deadline), "index": index}
+            "private": _private_refs(path, gitdir, deadline), "index": index, "ops": frozenset(ops)}
 
 
 class _Snap(tuple):
@@ -972,6 +1244,15 @@ def _move_settled(rec: dict, root: str, ok: bool, reason: str, snapshot=None) ->
         return _already_settled(rec, root)
     if ok and rec.get("kind") == "repo" and (snapshot is None or not _same_snapshot(path, snapshot)):
         ok, reason = False, _not_quiet("its files changed after the last assessment, before the move")
+    if ok and rec.get("kind") == "repo":
+        # Review 4, #2: what only ORIG_HEAD or this worktree's reflogs reach gets a recovery ref in the clone before
+        # the worktree may be archived (and so, three days later, deleted). No ref, no archive: fail closed. The
+        # post-move snapshot comparison (reflogs and ORIG_HEAD included) catches a write after this point.
+        try:
+            rec["recovery_refs"] = preserve_recovery_refs(path, rec.get("task_id"))
+        except WorkspaceError as exc:
+            ok, reason = False, _Reason("recovery_refs_failed", "commits reachable only from ORIG_HEAD or the "
+                                        f"worktree's reflog could not be kept by a recovery ref ({exc})")
     dest_dir = os.path.join(root, "archive" if ok else "held")
     dest = os.path.join(dest_dir, rec["task_id"])
     try:
@@ -1610,6 +1891,18 @@ def _cleanup_entry(root: str, archive_fd: int, name: str, tid: str, rec: dict, n
             return hold(_not_quiet("its files or git state changed after the assessment; checked immediately before "
                                    "deletion"))
         snap = final
+        if kind == "repo":
+            # Review 4, #2: recovery refs for what only ORIG_HEAD or the worktree's reflogs reach, before anything is
+            # deleted (idempotent after settle's; covers worktrees archived before recovery refs existed). The
+            # quarantine re-check below compares the snapshot, reflogs included, once more.
+            try:
+                rec = {**rec, "recovery_refs": preserve_recovery_refs(path, tid, deadline)}
+            except GitTimeoutError as exc:
+                out["timed_out"].append(f"{name}: {exc}")
+                return False
+            except WorkspaceError as exc:
+                return hold(_Reason("recovery_refs_failed", "commits reachable only from ORIG_HEAD or the worktree's "
+                                    f"reflog could not be kept by a recovery ref ({exc})"))
         if not quarantined:
             qname = f"{_QUARANTINE_PREFIX}{tid}-{os.urandom(8).hex()}"
             os.rename(name, qname, src_dir_fd=archive_fd, dst_dir_fd=archive_fd)

@@ -578,6 +578,23 @@ class TaskExportTests(ChildTaskBase):
                     self.assertNotIn("withheld_fields", rec)
                 res = _load(os.path.join(d, "result.json"))
 
+    def test_the_recovery_ref_count_is_exported_as_a_number_only(self):
+        """Review 4 of held-settle-fix, #2: the settle's recovery-ref count reaches the run export; anything but an
+        int (a planted name or path) does not."""
+        tid, d, res = self.run_export_task(task="x")
+        for value, want in ((2, 2), (0, 0), ("refs/cortados-recovery/x", None), (True, None)):
+            with self.subTest(value=value):
+                res.update(workspace={"kind": "repo", "state": "archived", "repo": "demo", "branch": "b",
+                                      "reason_code": "pushed", "recovery_refs": value})
+                self._forget_export(d, res)
+                _, st = self.call("task_status", task_id=tid)
+                self.assertTrue(st["export"]["ok"], st["export"])
+                [rec] = self.records()
+                self.assertEqual(rec["workspace"].get("recovery_refs"), want, rec["workspace"])
+                with open(self.export_file()) as f:
+                    self.assertNotIn("cortados-recovery", f.read())
+                res = _load(os.path.join(d, "result.json"))
+
     # --- export file permissions -----------------------------------------------------------------------------------
     def test_loose_export_files_and_dir_are_tightened_and_recorded(self):
         path = self.export_file()

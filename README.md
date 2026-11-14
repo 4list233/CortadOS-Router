@@ -521,14 +521,25 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   `archive/` (every commit on a remote and nothing uncommitted or untracked, or no repository; "every commit" includes
   the worktree-private refs a deletion would remove with it: `refs/worktree/*`, `refs/bisect/*`, `refs/rewritten/*` and
   a stopped operation's `MERGE_HEAD`/`CHERRY_PICK_HEAD`/`REVERT_HEAD`/`REBASE_HEAD`/`BISECT_HEAD`, each reachable
-  from a remote-tracking ref; reflogs and `ORIG_HEAD` are not checked) or `held/` (anything
+  from a remote-tracking ref; a stopped `merge --autostash` or `rebase --autostash` (either backend) keeps the task's
+  changes in an autostash in the worktree's own git dir (`MERGE_AUTOSTASH`, `rebase-merge/autostash`,
+  `rebase-apply/autostash`) that is never on a remote, so it always holds, `reason_code` `unpushed_autostash`; every
+  commit a stopped rebase, cherry-pick/revert sequence, bisect or notes merge names in its state files must be on a
+  remote, and a stopped `git am` holds outright, `unpushed_operation_state`. `ORIG_HEAD` and the worktree's reflogs do
+  not hold, since every reset, amend or rebase writes them; instead, before the folder is archived (and again before
+  the cleanup deletes it) every commit only they reach gets a recovery ref in the clone,
+  `refs/cortados-recovery/<task_id>/orig-head` or `.../reflog-<n>` (one per tip; the count is `recovery_refs` in the
+  settle record, `task_status` and the run export, never the names); a ref that cannot be written holds the folder,
+  `recovery_refs_failed`. No cleanup ever deletes a recovery ref. TODO(owner): decide when recovery refs expire; until
+  then they accumulate in each clone) or `held/` (anything
   else, or a worktree git cannot assess) with `git worktree move`, and records it in `<root>/index.jsonl` (one line per
   task, rewritten under `index.lock`). Git-ignored files count as unpublished owner data, except regenerable caches
   (`__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `*.pyc`) and empty ignored directories; a nested
   `.git` always holds (any case: `.GIT` and `.Git` are `.git` on macOS; a directory or a file). Archiving needs writer
   quiescence: the child's process group gone (or the folder is held), and two clean assessments a pause apart (2 s,
   then 5 s more if needed) bracketed by identical snapshots of the tree (paths, sizes, mtimes, outside the caches) and
-  of its own git state (HEAD, worktree-private refs, index file; the clone's shared branches, tags and stash are left
+  of its own git state (HEAD, worktree-private refs and autostashes, index file, stopped-operation state, `ORIG_HEAD` and
+  its reflogs; the clone's shared branches, tags and stash are left
   out: every task's worktree writes them and they survive the deletion, so a sibling task's commit or stash does not
   hold it, #102), compared again under the cleanup lock before the move and
   before HEAD is detached; a change after the move sends it on to `held/` undetached. Every snapshot counts every
@@ -545,7 +556,7 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   directories and the entry is unchanged between assessment and detach; otherwise the start is refused. The start
   waits at most 60 s (`CLEANUP_LOCK_WAIT_S`) for that lock; past it the start is refused with "archive cleanup is
   running; retry in a minute" and never proceeds without the lock (#93).
-  `task_status` shows `workspace` (kind, state, path, reason, reason_code, held_paths).
+  `task_status` shows `workspace` (kind, state, path, reason, reason_code, held_paths, recovery_refs).
 - Archive cleanup: `python3 cortados_router/child_tasks.py --cleanup-archive [--root <dir>]` deletes `archive/<task_id>`
   entries whose index record says archived more than 3 days ago, and nothing else: not a name that is not a task id,
   not a symlink (never followed), not a non-directory, not an entry resolving outside `archive/`, not one without an
@@ -571,9 +582,10 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   run's deadline, after the deferred settles, with a per-entry backoff in `index.jsonl` (`repair_failures`,
   `repair_next_at`: 1 h doubling to a week). An admin dir whose backlink names another existing worktree that names it
   back belongs to that worktree: it is never repaired over (reported, `registry_conflict`) and never deleted with
-  another entry. With the admin dir kept, commits reachable from a worktree's HEAD or index survive any gc; a commit
-  reachable only from reflog entries (committed, then reset away) is lost once git's normal reflog expiry drops those
-  entries. That is acceptable: held work's commits are on its HEAD. `settle()`
+  another entry. With the admin dir kept, commits reachable from a worktree's HEAD or index survive any gc; in a held
+  worktree a commit reachable only from reflog entries (committed, then reset away) is lost once git's normal reflog
+  expiry drops those entries, which is acceptable: held work's commits are on its HEAD. An archived worktree's such
+  commits are kept by its recovery refs (above) before it is ever deleted. `settle()`
   moves under `cleanup.lock` (waits at most 60 s; past it the folder stays in `active/` marked `settle_deferred` and
   the next cleanup settles it; `task_status` then reports the index's settled record). Lock order: clone lock -> `cleanup.lock` -> `index.lock`. `integrations/launchd/com.cortados.archive-cleanup.plist` runs it daily on
   the Air; task startup never runs cleanup, so starting a task is not delayed by cleanup locks or remote fetches.

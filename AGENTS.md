@@ -124,7 +124,10 @@ silent fallback to the requesting machine)
 through the provider (every child spends subscription quota). Workspaces (`cortados_router/workspaces.py`): `repo`
 [+ `branch`] gives a git worktree under `<root>/active/<task_id>`, settled to `archive/` (pushed; HEAD detached so
 the branch is free for the next task) or `held/` (unpushed, or a plain folder containing a nested `.git`; keeps its
-branch, so a new task on it is refused naming the held path) when the task ends; only `archive/` is ever cleaned up (3 days),
+branch, so a new task on it is refused naming the held path; a pending autostash or stopped operation naming unpushed
+commits holds too) when the task ends; commits only `ORIG_HEAD` or the worktree's reflog reach get
+`refs/cortados-recovery/<task_id>/*` refs in the clone before archiving (a failed write holds; never deleted, expiry
+is an open owner TODO); only `archive/` is ever cleaned up (3 days),
 by the daily cleanup job rather than task startup. `chrome: true` on a `gui` host launches
 through `launchctl bootstrap gui/<uid>` and chrome children queue on one lock per host. A routed task with
 `connectors` on a `gui` host takes the same LaunchAgent path (MCP OAuth tokens live in the login Keychain) but stays

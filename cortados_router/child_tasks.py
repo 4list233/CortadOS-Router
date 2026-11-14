@@ -1686,7 +1686,7 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
         out.update(lane=meta["lane"], model=meta.get("model"))
     ws = _workspace_record(d, task_id)
     if isinstance(ws, dict):
-        out["workspace"] = {k: ws.get(k) for k in ("kind", "state", "path", "repo", "branch", "reason", "reason_code", "held_paths", "error") if ws.get(k) is not None}
+        out["workspace"] = {k: ws.get(k) for k in ("kind", "state", "path", "repo", "branch", "reason", "reason_code", "held_paths", "recovery_refs", "error") if ws.get(k) is not None}
     elif meta.get("workspace"):
         out["workspace"] = {**meta["workspace"], "state": "preparing" if state == "running" else "not created"}
     if state == "running" and os.path.exists(os.path.join(d, QUEUED_MARKER)):
@@ -2638,7 +2638,11 @@ def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_r
         "started_at": started, "ended_at": ended,
         "elapsed_s": round(ended - started, 1) if isinstance(started, (int, float)) and isinstance(ended, (int, float)) else None,
         "cwd": _home_relative(meta.get("cwd")),
-        "workspace": {k: ws.get(k) for k in ("kind", "state", "repo", "branch", "reason_code") if ws.get(k) is not None} if ws else None,
+        "workspace": ({**{k: ws.get(k) for k in ("kind", "state", "repo", "branch", "reason_code") if ws.get(k) is not None},
+                       # how many recovery refs the settle kept in the clone (workspaces.preserve_recovery_refs): a
+                       # number only, never their names
+                       **({"recovery_refs": ws["recovery_refs"]} if type(ws.get("recovery_refs")) is int else {})}
+                      if ws else None),
         "orchestrator": meta.get("orchestrator"), "permission_mode": meta.get("permission_mode"),
         "effective_permission_mode": act.get("effective_permission_mode"),
         "chrome": bool(meta.get("chrome")), "launch": meta.get("launch"),
