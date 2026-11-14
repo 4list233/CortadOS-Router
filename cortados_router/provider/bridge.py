@@ -63,6 +63,12 @@ SCRATCH_REFUSED = ("cortados: not run. This call names {name}, the relay backend
                    "Use the working directory from the user's own environment block and retry with that path.")
 
 
+# The Claude CLI's (2.1.3xx) stream-json event when the model ended its answer with stop_reason "refusal" and the CLI did
+# not retry it on a fallback model; the CLI's own detector also reads an assistant frame with stop_reason "refusal",
+# which run_turn checks as well. This bridge passes no --fallback-model, so a refusal always reaches it.
+REFUSAL_EVENT = "model_refusal_no_fallback"
+
+
 def names_scratch(args: Any, scratch: Path) -> bool:
     """Whether a tool call's input names the backend's scratch dir. Its basename (cortados-bridge-<random>) is unique,
     so it matches every spelling of the path (/var vs /private/var, relative forms) and nothing else."""
@@ -282,8 +288,11 @@ class BridgeSession:
 
     # ------------------------------------------------------------------ one turn
     def run_turn(self, timeout: float) -> tuple[list[dict[str, Any]], str, dict[str, int]]:
-        """Read the CLI until it finishes or blocks on a bridged tool. Returns (blocks, stop_reason, usage)."""
+        """Read the CLI until it finishes or blocks on a bridged tool. Returns (blocks, stop_reason, usage). The stop is
+        "refusal" when the CLI reports that the model refused (REFUSAL_EVENT, or an assistant frame whose stop_reason is
+        "refusal"), so the server can apply its refusal fallback; otherwise "end_turn" or "tool_use"."""
         blocks: list[dict[str, Any]] = []
+        refused = False
         usage: dict[str, int] = {}
         pending: set[str] = set()                        # tool_use ids of this turn, not yet answered
         blocked_on: str | None = None
@@ -310,9 +319,13 @@ class BridgeSession:
                     blocked_on = item
                 continue
             ev = item
+            if ev.get("type") == "system" and ev.get("subtype") == REFUSAL_EVENT:
+                refused = True
             if ev.get("type") == "assistant":
                 msg = ev.get("message") or {}
                 usage = msg.get("usage") or usage
+                if msg.get("stop_reason") == "refusal":
+                    refused = True
                 for b in msg.get("content") or []:
                     if b.get("type") == "text" and b.get("text"):
                         blocks.append({"type": "text", "text": b["text"]})
@@ -363,6 +376,10 @@ class BridgeSession:
                         raise BridgeError(f"the headless CLI ran a non-bridged tool itself (tool_use {b['tool_use_id']}); "
                                           "it must have no tools but the bridge's")
             elif ev.get("type") == "result":
+                if refused:
+                    # A refusal is the model's answer, not a backend failure, even when the CLI marks the result an
+                    # error: the conversation stays usable and the server decides what the client sees.
+                    return blocks, "refusal", usage or ev.get("usage") or {}
                 if ev.get("is_error"):
                     raise BridgeError(f"the headless CLI reported an error: {ev.get('result') or ev.get('subtype')}")
                 return blocks, "end_turn", usage or ev.get("usage") or {}

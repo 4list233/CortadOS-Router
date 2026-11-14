@@ -1,7 +1,7 @@
 """Local model lanes: an Ollama node on the owner's machines (the Pro, #75), served as `sub/<local model id or alias>`
 pins and, when its config opts in, as an auto-route target after S1 has chosen a band.
 
-Owner of three rules:
+Owner of four rules:
   config        the nodes and the models they offer live in the local-resources config (CORTADOS_LOCAL_RESOURCES_CONFIG,
                 the same file local_resources.py samples; schema in docs/LOCAL-RESOURCES.md), under each node's `ollama`
                 block. Addresses are config or env only, never tables or code: the real file is git-ignored.
@@ -18,6 +18,13 @@ Owner of three rules:
                 with a clear 503 and nothing falls back to another model (the person chose this one); an auto-route to
                 one is simply not taken, and the conversation keeps the route S1 chose.
 
+  sensitive     off (absent) by default. On, an object naming ONE of the node's models for sensitive requests
+                (`{"model": "<alias or tag>", "keywords_file"|"keywords_file_env": ..., "refusal_fallback": bool}`):
+                requests flagged `x-cortados-local: sensitive|prefer`, matching the owner's keyword list, or refused by a
+                cloud model on their first turn may run there in any band, but only with no effect outside the
+                machine (routing.sensitive_local; docs/LOCAL-RESOURCES.md "Sensitive requests"). The keyword list is
+                a file on the provider host, never in this repository; `keywords` reads and matches it.
+
 Ollama implements the Anthropic Messages API at POST /v1/messages, so a turn is relayed as-is (stateless: the client
 sends the whole conversation every turn) with only `model` rewritten to the node's tag. Stdlib only.
 """
@@ -26,6 +33,8 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
+import threading
 import urllib.parse
 from typing import Any
 
@@ -119,6 +128,7 @@ def nodes(path: str | None = None) -> list[dict[str, Any]]:
         out.append({"node": nid, "lane": LANE_PREFIX + nid, "label": block.get("label") or nid.capitalize(),
                     "base_url": base, "models": models, "token": token,
                     "auto_route": _auto_route(block.get("auto_route", False), models, nid),
+                    "sensitive": _sensitive(block.get("sensitive"), models, nid),
                     **timeouts})
     return out
 
@@ -158,6 +168,158 @@ def _auto_route(value: Any, models: list[dict[str, Any]], nid: str) -> dict[str,
 def auto_routes(path: str | None = None) -> list[tuple[dict[str, Any], dict[str, Any], list[str]]]:
     """(node, model, bands) for every node whose auto_route is on, in config order."""
     return [(n, n["auto_route"]["model"], n["auto_route"]["bands"]) for n in nodes(path) if n.get("auto_route")]
+
+
+_SENSITIVE_KEYS = {"model", "keywords_file", "keywords_file_env", "refusal_fallback", "_comment"}
+
+
+def _sensitive(value: Any, models: list[dict[str, Any]], nid: str) -> dict[str, Any] | None:
+    """A node's validated `sensitive` section: None (absent: the feature is off on this node) or {"model": <one of its
+    model entries>, "keywords_file": <path or None>, "keywords_file_env": <env name or None>, "refusal_fallback": bool}.
+    Malformed is refused (LocalConfigError), as for auto_route: a switch that silently did nothing would mislead. The
+    keyword FILE is not read here (routing reads it per request through `keyword_match`), so a missing list never
+    takes the node's pins down with it."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise LocalConfigError(f"node {nid}: sensitive must be an object "
+                               '{"model": "<alias or tag>", "keywords_file": ..., "refusal_fallback": true} (or absent)',
+                               nid)
+    unknown = set(value) - _SENSITIVE_KEYS
+    if unknown:
+        raise LocalConfigError(f"node {nid}: sensitive has unknown keys {sorted(unknown)}", nid)
+    name = str(value.get("model") or "").strip().casefold()
+    entry = next((m for m in models if name and name in (m["id"].casefold(), (m["alias"] or "").casefold())), None)
+    if entry is None:
+        raise LocalConfigError(f"node {nid}: sensitive.model must name one of this node's models (alias or tag)", nid)
+    out: dict[str, Any] = {"model": entry, "keywords_file": None, "keywords_file_env": None, "refusal_fallback": False}
+    for key in ("keywords_file", "keywords_file_env"):
+        v = value.get(key)
+        if v is not None and (not isinstance(v, str) or not v.strip()):
+            raise LocalConfigError(f"node {nid}: sensitive.{key} must be a non-empty string", nid)
+        out[key] = v.strip() if v else None
+    fb = value.get("refusal_fallback", False)
+    if not isinstance(fb, bool):
+        raise LocalConfigError(f"node {nid}: sensitive.refusal_fallback must be true or false", nid)
+    out["refusal_fallback"] = fb
+    return out
+
+
+def sensitive_routes(path: str | None = None) -> list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
+    """(node, model, sensitive section) for every node whose `sensitive` section is on, in config order."""
+    return [(n, n["sensitive"]["model"], n["sensitive"]) for n in nodes(path) if n.get("sensitive")]
+
+
+class KeywordListError(RuntimeError):
+    """The node's keyword list is configured but cannot be read. The message names the file or variable, never a term."""
+
+
+# path -> ((mtime_ns, size), compiled pattern or None). The list is re-read when the file changes, so the owner edits it
+# on the provider host without a restart. Guarded: the provider serves requests on many threads.
+_keyword_cache: dict[str, tuple[tuple[int, int], Any]] = {}
+_keyword_lock = threading.Lock()
+
+
+def keyword_file(section: dict[str, Any]) -> str | None:
+    """The keyword list's path: $keywords_file_env when that names a set variable, else keywords_file, else None (the
+    keyword trigger is off). KeywordListError when keywords_file_env names a variable that is not set and there is no
+    keywords_file to use instead: a list the owner configured must not silently match nothing."""
+    env_name = section.get("keywords_file_env")
+    path = (os.environ.get(env_name) if env_name else None) or section.get("keywords_file")
+    if env_name and not path:
+        raise KeywordListError(f"sensitive.keywords_file_env names ${env_name}, which is not set")
+    return os.path.expanduser(path) if path else None
+
+
+def compile_keywords(lines: list[str]):
+    """One pattern for a keyword list (one term or phrase per line; blank lines and `#` comments skipped), matched
+    case-insensitively (casefold) as whole words or phrases: a term never matches inside a longer word, and the words
+    of a phrase may be separated by any whitespace. None for an empty list."""
+    terms = []
+    for line in lines:
+        t = line.strip()
+        if not t or t.startswith("#"):
+            continue
+        words = t.casefold().split()
+        terms.append(r"\s+".join(re.escape(w) for w in words))
+    if not terms:
+        return None
+    # Longest first, so a phrase is preferred over a word it starts with (only a yes/no is reported either way).
+    terms.sort(key=len, reverse=True)
+    return re.compile(r"(?<!\w)(?:" + "|".join(terms) + r")(?!\w)")
+
+
+def keywords(section: dict[str, Any]):
+    """The compiled keyword pattern of a `sensitive` section (cached by file mtime and size), or None when no list is
+    configured or it is empty. KeywordListError when a configured list cannot be read."""
+    path = keyword_file(section)
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+        stamp = (st.st_mtime_ns, st.st_size)
+        with _keyword_lock:
+            hit = _keyword_cache.get(path)
+            if hit and hit[0] == stamp:
+                return hit[1]
+        with open(path, encoding="utf-8") as f:
+            pattern = compile_keywords(f.read().splitlines())
+    except (OSError, UnicodeDecodeError) as exc:
+        raise KeywordListError(f"sensitive keyword list {path} unreadable: {type(exc).__name__}") from None
+    with _keyword_lock:
+        _keyword_cache[path] = (stamp, pattern)
+    return pattern
+
+
+def keyword_match(section: dict[str, Any], text: str) -> bool:
+    """Whether `text` contains a term of the section's keyword list. Only the yes/no leaves this function: callers
+    must never log which term matched (there is no way to ask)."""
+    pattern = keywords(section)
+    return bool(pattern and text and pattern.search(text.casefold()))
+
+
+def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any]) -> tuple[list, str, dict]:
+    """One whole (non-streaming) answer from the node for `body`, as (blocks, stop_reason, usage) in the shape the
+    bridges return: text and tool_use blocks only (thinking is dropped, as the CLI lanes never send it). Used where
+    the answer must be written by the server itself: the refusal fallback (server.py), whose stream has already
+    started. LocalUnavailable on any failure (no answer, an HTTP error, an unreadable or non-message answer); the
+    node's own error text is never repeated, only its status or the gate's fixed policy reason."""
+    out = dict(body)
+    out["model"] = model["id"]
+    out["stream"] = False
+    data = json.dumps(out).encode()
+    conn = _connection(node["base_url"], node["connect_timeout_s"])
+    try:
+        try:
+            conn.connect()
+            conn.sock.settimeout(node["read_timeout_s"])
+            conn.request("POST", _prefix(node["base_url"]) + "/v1/messages", body=data,
+                         headers={"content-type": "application/json", "anthropic-version": "2023-06-01",
+                                  **_auth(node)})
+            resp = conn.getresponse()
+            if resp.status != 200:
+                raw = _bounded_read(resp)
+                policy = _policy_refusal(raw) if resp.status == 503 else None
+                if resp.status == 401:
+                    raise LocalUnavailable(GATE_REFUSED.format(node=node["node"]))
+                raise LocalUnavailable(f"node {node['node']}: {policy}" if policy else
+                                       f"node {node['node']} answered /v1/messages with HTTP {resp.status}")
+            msg = json.loads(resp.read())
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            raise LocalUnavailable(f"node {node['node']} gave no usable answer ({type(exc).__name__})") from None
+    finally:
+        conn.close()
+    if not isinstance(msg, dict) or msg.get("type") != "message" or not isinstance(msg.get("content"), list):
+        raise LocalUnavailable(f"node {node['node']} answered something that is not a message")
+    blocks = []
+    for b in msg["content"]:
+        if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
+            blocks.append({"type": "text", "text": b["text"]})
+        elif isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id") and b.get("name"):
+            blocks.append({"type": "tool_use", "id": str(b["id"]), "name": str(b["name"]),
+                           "input": b.get("input") if isinstance(b.get("input"), dict) else {}})
+    usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+    return blocks, str(msg.get("stop_reason") or "end_turn"), usage
 
 
 DEFAULT_CONTEXT = 32768

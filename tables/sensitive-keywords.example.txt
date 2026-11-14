@@ -1,0 +1,11 @@
+# CortadOS sensitive-request keyword list: FORMAT EXAMPLE ONLY. The real list lives on the provider host (the Air),
+# at the node's `sensitive.keywords_file` (e.g. ~/.config/cortados/sensitive-keywords.txt), and is never committed:
+# this repository is public.
+#
+# One term or phrase per line. Blank lines and lines starting with # are ignored.
+# Matching is case-insensitive and whole-word: "example term" matches "Example   TERM" but not "counterexample terms".
+# Only the latest user turn of a request is matched (not the system prompt, not tool results), and the provider never
+# logs which term matched: only the rule `sensitive: keyword`.
+# The file is re-read when it changes; no restart is needed.
+placeholder term one
+placeholder-phrase-two

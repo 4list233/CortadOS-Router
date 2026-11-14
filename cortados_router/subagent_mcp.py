@@ -37,6 +37,11 @@ DEFAULT_TIMEOUT_S = 300.0          # a routed subtask can take a while (cold lan
 DEFAULT_MAX_TOKENS = 8000
 MIN_TOKEN_LEN = 8                 # shorter is not a provider token (see route_task)
 
+# The x-cortados-local header's values (mirrors provider/routing.LOCAL_MODES; checked by a test). This file runs
+# standalone, so it does not import the provider package for them.
+LOCAL_MODES = ("sensitive", "prefer")
+LOCAL_HEADER = "x-cortados-local"
+
 TOOL = {
     "name": "route_task",
     "description": ("Delegate ONE self-contained subtask to the CortadOS router and get the answer back as text. S1 "
@@ -54,6 +59,11 @@ TOOL = {
                       "a pinnable model or alias (fable, opus, sonnet, claude-*, gpt-*) or a friendly name ('GPT 6.1', "
                       "'Sonnet 5', 'ollama 27b q3km': every word must belong to exactly one pool model; an ambiguous "
                       "name is refused with its candidates), sent as sub/<id> (no S1)."},
+            "local": {"type": "string", "enum": list(LOCAL_MODES),
+                      "description": "Optional: 'sensitive' marks the subtask as sensitive (red-teaming, a topic cloud "
+                      "models refuse) so it runs on the owner's local model when eligible: no effect outside the "
+                      "machine and the local node available; otherwise it stays on S1's route. 'prefer': local "
+                      "if eligible. Sent as the x-cortados-local header; ignored with a model pin."},
         },
         "required": ["task"],
     },
@@ -128,7 +138,12 @@ CHILD_TOOLS = [
                         "tool schemas are sent with every request; loading them all can exceed the model's context "
                         "(the provider then refuses with 413)."},
          "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional extra tool patterns "
-                           "pre-approved for the child, e.g. ['Bash(npm test:*)', 'Bash(git diff:*)']."}},
+                           "pre-approved for the child, e.g. ['Bash(npm test:*)', 'Bash(git diff:*)']."},
+         "local": {"type": "string", "enum": list(LOCAL_MODES), "description": "Optional: 'sensitive' marks the "
+                   "task as sensitive (red-teaming, a topic cloud models refuse): every request of the child carries "
+                   "x-cortados-local: sensitive, so each one runs on the owner's local model when eligible (no effect "
+                   "outside the machine, local node available) and stays on S1's route otherwise. 'prefer': local if "
+                   "eligible. Not with chrome: true (login mode is not routed)."}},
          "required": ["task"]}},
     {"name": "task_status",
      "description": "State of a child task (running/succeeded/failed/cancelled), elapsed time, models used, and the final "
@@ -213,7 +228,7 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
                            cfg.get("url", ""), cfg.get("token_file"), a.get("chrome", False), red,
                            a.get("connectors"), client=cfg.get("client"), title=a.get("title"),
                            session_tag=cfg.get("session_tag"), repo=a.get("repo"), branch=a.get("branch"),
-                           host=a.get("host"), parent_task_id=a.get("parent_task_id"))
+                           host=a.get("host"), parent_task_id=a.get("parent_task_id"), local=a.get("local"))
         elif name == "task_status":
             out = ct.status(a.get("task_id"), red, cfg.get("url", ""), token)
         elif name == "wait_task":
@@ -278,8 +293,9 @@ def _err(text: str) -> dict:
 
 
 def route_task(provider_url: str, token: str, task: str, context: str = "", max_tokens: int = DEFAULT_MAX_TOKENS,
-               urlopen=urllib.request.urlopen, model=None, client=None) -> dict:
-    """Post the subtask to the provider's /v1/messages and return the routed model's text as an MCP tool result."""
+               urlopen=urllib.request.urlopen, model=None, client=None, local=None) -> dict:
+    """Post the subtask to the provider's /v1/messages and return the routed model's text as an MCP tool result.
+    `local` (LOCAL_MODES) is sent as the x-cortados-local header; anything else is refused before any request."""
     provider_url, token = (provider_url or "").strip(), (token or "").strip()   # strip stray whitespace/newlines that break header validation
     # Never let the token reach model-visible text: every error below is scrubbed. A token too short to be a provider
     # token (a real one is a long random string) is refused instead of sent, so the scrub never has to choose between
@@ -300,6 +316,10 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
                     "an embedded newline, no non-ASCII); fix it")
     if not (task and str(task).strip()):
         return _err("route_task requires a non-empty 'task'")
+    if local in ("", None):
+        local = None
+    elif local not in LOCAL_MODES:
+        return _err(f"route_task: local must be one of {', '.join(LOCAL_MODES)}")
     requested = "cortados"
     if model not in (None, "", "cortados"):
         # A pin: validated by the same function start_task's orchestrator uses (child_tasks.pin_model), so both tools
@@ -325,7 +345,8 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
                                  headers={"content-type": "application/json", "x-api-key": token,
                                           "x-cortados-reveal": "1",
                                           # attribution: which front door asked (e.g. the bot gateway's "grokbot")
-                                          **({"x-cortados-client": str(client)} if client else {})})
+                                          **({"x-cortados-client": str(client)} if client else {}),
+                                          **({LOCAL_HEADER: local} if local else {})})
     try:
         # Parse this operation-specific setting only when route_task needs it. Importers use the URL resolver too;
         # unrelated ambient route settings must not break those imports.
@@ -405,7 +426,7 @@ def handle(msg: dict, cfg: dict) -> dict | None:
             return {**base, "result": _err(cfg["url_error"])}
         return {**base, "result": route_task(cfg.get("url", ""), cfg.get("token", ""), a.get("task", ""),
                                               a.get("context", ""), a.get("max_tokens", DEFAULT_MAX_TOKENS),
-                                              model=a.get("model"))}
+                                              model=a.get("model"), local=a.get("local"))}
     if method == "ping":
         return {**base, "result": {}}
     return {**base, "error": {"code": -32601, "message": f"method not found: {method}"}}

@@ -111,10 +111,15 @@ def parse_office_header(item: str) -> tuple[str, str]:
     return name, value
 
 
-def custom_headers(run_id: str | None = None, office_headers=None) -> str:
+# The provider's x-cortados-local values (provider/routing.LOCAL_MODES; checked by a test): a child task started with
+# start_task's `local` option sends it on every request, so the provider may run each one on the owner's local model.
+LOCAL_MODES = ("sensitive", "prefer")
+
+
+def custom_headers(run_id: str | None = None, office_headers=None, local: str | None = None) -> str:
     """ANTHROPIC_CUSTOM_HEADERS (newline-separated `name: value` lines). With a run id, every request of the session is
     recorded by the provider under it (GET /v1/cortados/runs/<id>); office headers (`name: value` items, OFFICE_HEADERS
-    only) tag it for the Office view."""
+    only) tag it for the Office view; `local` (LOCAL_MODES only) adds x-cortados-local."""
     lines = ["x-cortados-reveal: 1"]
     if run_id:
         if not RUN_ID_RE.fullmatch(run_id):
@@ -123,11 +128,15 @@ def custom_headers(run_id: str | None = None, office_headers=None) -> str:
     for item in office_headers or ():
         name, value = parse_office_header(item)
         lines.append(f"{name}: {value}")
+    if local is not None:
+        if local not in LOCAL_MODES:
+            raise SessionError(f"--local must be one of {', '.join(LOCAL_MODES)}")
+        lines.append("x-cortados-local: " + local)
     return "\n".join(lines)
 
 
 def launcher_env(provider_url: str, token: str, delegate_budget: int = 3, run_id: str | None = None,
-                 office_headers=None) -> dict:
+                 office_headers=None, local: str | None = None) -> dict:
     """Every variable the launcher sets (BLANKED ones as empty)."""
     env = dict(
         {
@@ -144,7 +153,7 @@ def launcher_env(provider_url: str, token: str, delegate_budget: int = 3, run_id
             "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
             "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": "cortados",
             "ANTHROPIC_SMALL_FAST_MODEL": SMALL_FAST_MODEL,
-            "ANTHROPIC_CUSTOM_HEADERS": custom_headers(run_id, office_headers),
+            "ANTHROPIC_CUSTOM_HEADERS": custom_headers(run_id, office_headers, local),
             "CLAUDE_CODE_ENTRYPOINT": "cli",
             "CORTADOS_WHOLE_SESSION": "1",
             "CORTADOS_DELEGATE_BUDGET": str(delegate_budget),
@@ -156,14 +165,14 @@ def launcher_env(provider_url: str, token: str, delegate_budget: int = 3, run_id
 
 
 def build_env(base: dict, provider_url: str, token: str, delegate_budget: int = 3, run_id: str | None = None,
-              office_headers=None) -> dict:
+              office_headers=None, local: str | None = None) -> dict:
     # Kept in the process env too, so anything that reads the environment before settings load sees the same values.
-    return {**base, **launcher_env(provider_url, token, delegate_budget, run_id, office_headers)}
+    return {**base, **launcher_env(provider_url, token, delegate_budget, run_id, office_headers, local)}
 
 
 def settings_content(provider_url: str, token: str, delegate_budget: int = 3, gate: bool = True,
-                     run_id: str | None = None, office_headers=None) -> dict:
-    content = {"env": launcher_env(provider_url, token, delegate_budget, run_id, office_headers),
+                     run_id: str | None = None, office_headers=None, local: str | None = None) -> dict:
+    content = {"env": launcher_env(provider_url, token, delegate_budget, run_id, office_headers, local),
                "enabledPlugins": {PLUGIN_ID: False}}
     if gate:
         # Absolute standalone script: hook cwd need not be this checkout; shell-quote paths with spaces.
@@ -319,6 +328,8 @@ def parse(argv: list):
     ap.add_argument("--run-id", default=None, help=argparse.SUPPRESS)   # child tasks: record the session under this id
     # child tasks: `name: value` Office tags (OFFICE_HEADERS) sent on every request of the session
     ap.add_argument("--office-header", action="append", default=[], help=argparse.SUPPRESS)
+    # child tasks: x-cortados-local on every request of the session (start_task's `local` option)
+    ap.add_argument("--local", default=None, help=argparse.SUPPRESS)   # checked by custom_headers (SessionError)
     return ap.parse_args(argv), extra
 
 
@@ -339,11 +350,11 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home
         if not args.no_gate:
             directive += f"\nThis session allows {args.delegate_budget} direct work calls per prompt before delegation is required."
     office = args.office_header
-    check_managed(set(launcher_env(url, token, args.delegate_budget, args.run_id, office)), managed_dirs)
+    check_managed(set(launcher_env(url, token, args.delegate_budget, args.run_id, office, args.local)), managed_dirs)
     settings_path = write_settings(args.settings_dir or SETTINGS_DIR,
                                    settings_content(url, token, args.delegate_budget, not args.no_gate, args.run_id,
-                                                    office), home)
-    return (args, build_env(base_env, url, token, args.delegate_budget, args.run_id, office),
+                                                    office, args.local), home)
+    return (args, build_env(base_env, url, token, args.delegate_budget, args.run_id, office, args.local),
             build_argv(model, directive, extra, settings_path))
 
 

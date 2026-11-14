@@ -255,6 +255,80 @@ reflex work only. Recommended first setting:
 widen to `R1` only after reviewing the `local auto-route` rows in router.db. Which bands go local is the owner's call,
 so the shipped example keeps `auto_route: false`.
 
+### Sensitive requests
+
+The Pro's local models are uncensored ("abliterated") fine-tunes the owner runs himself, so work that cloud models
+refuse, red-teaming and sensitive topics may run there (owner decision 2026-11-13). A node opts in with a `sensitive`
+section in its `ollama` block; absent, the feature is off on that node:
+
+```json
+"sensitive": {"model": "qwen-27b",
+              "keywords_file": "~/.config/cortados/sensitive-keywords.txt",
+              "refusal_fallback": true}
+```
+
+`model` names one of the node's models (alias or tag). `keywords_file` is the keyword list's path on the provider host;
+`keywords_file_env` instead names an environment variable holding the path (it wins when set; named but unset, the
+keyword trigger logs a warning and matches nothing). `refusal_fallback` defaults to false. Unknown keys and wrong types
+are refused (`LocalConfigError`), as for `auto_route`.
+
+**Three triggers** (`routing.sensitive_local`, `routing.refusal_route`):
+
+1. **Explicit flag.** The request header `x-cortados-local: sensitive` (or `prefer`, "local if eligible": the same
+   rules, recorded as `local: prefer`), honoured on `/v1/messages` and `/v1/responses` and read for a new conversation
+   only. Any other value is a 400. The MCP tools send it: `route_task(…, local="sensitive")`, and
+   `start_task(…, local="sensitive")` makes every request of the child carry it (not with `chrome: true`: login mode is
+   not routed). A `sub/` pin ignores it (the person chose the model). A Claude Code session-wide toggle
+   (`/cortados-local prefer`) is a follow-up after branch `local-switch-remote`.
+2. **Keyword list.** One term or phrase per line, `#` comments and blank lines skipped (format:
+   `tables/sensitive-keywords.example.txt`). Matched case-insensitively (casefold) as whole words or phrases: a term
+   never matches inside a longer word, and a phrase's words may be separated by any whitespace. Only the **latest user
+   turn's text** is matched: client reminders (`<system-reminder>`) are removed first, tool results are not the person's
+   words, and the **system prompt is not matched**, because it is the client's fixed instructions plus project files
+   (CLAUDE.md), the same for every conversation of a project: one word there would send every conversation local.
+3. **Refusal fallback** (`refusal_fallback: true`). When the cloud model refuses the **opening turn** of an S1-routed
+   conversation on `/v1/messages`, the provider asks the node for a whole answer to the same request, sends the client
+   only that answer, and binds the conversation to the local model (later turns relay there like any local route). The
+   Claude bridge recognises a refusal from the Claude CLI's own markers: an assistant frame with `stop_reason:
+   "refusal"` or the `model_refusal_no_fallback` system event (the bridge passes no `--fallback-model`). The Codex
+   app-server has no refusal signal (a refused Codex turn completes like any other, with text), and guessing from the
+   text is not reliable, so Codex lanes have no refusal fallback. Not re-run, ever: a turn after client tools ran or
+   were requested (the request carries an assistant message or a tool result, or the refused reply holds a
+   `tool_use`), so a tool's effect never repeats. A refusal later in a conversation does not move it (hook
+   `HOOK(rebuild-on-409)` in `server.Handler._refusal_fallback`; follow-up once branch `rebuild-on-409`, which seeds a new
+   backend from the client's transcript, merges). If the node is unavailable or its answer fails, the refusal stands
+   and reaches the client unchanged.
+
+A planned S1 "sensitive" signal plugs in at one place: `routing.S1_SENSITIVE_ANSWER` (None today) names the S1 answer
+key; once set, a request S1 marks is handled as trigger `s1` under exactly the rules below.
+
+**The outward-effect limit.** A sensitive request may go local in **any band**, but **only with no effect outside the
+machine**: S1 answered `outward: false` and `blast_radius` 0 ("words only, nothing changes") or 1 ("a bounded
+reversible workspace change") (`routing.LOCAL_BLAST_MAX`). Level 2 ("a broad or difficult-to-reverse system change") is
+not bounded to the workspace and level 3 is where `core.resolve` floors every outward request, so neither goes local.
+A decision without these answers fails closed. `core.resolve`'s hard rule (outward effects floor the blast radius to 3,
+strong cloud models) is untouched: an outward request is never moved, whatever the trigger.
+
+**Every local guard still applies.** A degraded scorer never routes local; the request must arrive on `/v1/messages`
+(the relay speaks Messages only; a `/v1/responses` request is logged and stays on S1's route); the client's
+`x-cortados-exclude-model` is honoured (an excluded sensitive model also turns the refusal fallback off); the node must
+answer its probe (on the Pro: AC power + manual switch + gate up) and list the model; the request must fit the model's
+`context_length`. A request that fails any check keeps S1's route, and the reason is logged. When a request moves, the
+routes row is rewritten under the same route_id as for auto-route, with a `sensitive: flag|keyword|refusal|s1` or
+`local: prefer` hard-rules entry. The sensitive check runs before auto-route; a request it does not move still goes
+through auto-route as before.
+
+**Privacy of the logs.** The provider log names only the rule (`sensitive: keyword`, `sensitive: flag`,
+`sensitive: refusal`, `local: prefer`), the route id, the node/model and a metadata reason. It never logs which keyword
+matched, the keyword list's contents or any request or reply text; an unreadable list is a warning naming the file only.
+(The routes row keeps the request text exactly as for every routed request: that is S1's training record, unchanged.)
+
+**Editing the keyword list on the Air.** The list lives on the provider host only (the repository is public;
+`tables/sensitive-keywords.txt` is git-ignored in case one is placed there by mistake). Edit the file the config names,
+e.g. `~/.config/cortados/sensitive-keywords.txt`, one term per line; keep it `chmod 600`. It is re-read when its
+modification time or size changes, so no provider restart is needed. Check a change by sending a test request and
+looking for `sensitive: keyword` in the provider log, or the hard-rules entry in router.db's routes table.
+
 **Exposure and the local gate.** Ollama has no authentication: anyone who reaches its port can run, pull or delete
 models. So Ollama listens on `127.0.0.1:11434` only (its default; leave `OLLAMA_HOST` unset), and the one door from the
 tailnet is the token gate `cortados_router/local_gate.py`, run on the node:

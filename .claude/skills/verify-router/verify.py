@@ -207,6 +207,68 @@ else:
                "PASS" if out.get("band") == "R3" and not str(out.get("provider")).startswith("local-") else "FAIL",
                f"band={out.get('band')} -> {out.get('provider')}/{out.get('model')}")
 
+# Sensitive requests (2026-11-13, owner): a request flagged x-cortados-local: sensitive, or matching the owner's keyword
+# list, moves to the node's sensitive model in ANY band, but only when S1 says it has no effect outside the machine
+# (outward false, blast_radius <= 1); an outward request never goes local however it is marked (core.resolve's outward
+# floor is untouched); an unavailable node keeps S1's route; a degraded decision is never local. Same fakes as above
+# (probe faked in the child, throwaway home and config); the keyword is a placeholder, never a real term.
+SENSITIVE_SCENARIO = """
+import json, os, sys, tempfile
+from cortados_router import core
+from cortados_router.provider import local_lane, routing
+d = tempfile.mkdtemp()
+kw = os.path.join(d, "keywords.txt")
+open(kw, "w").write("verify placeholder term\\n")
+cfg = os.path.join(d, "resources.json")
+json.dump({"nodes": [{"id": "pro", "ollama": {"base_url": "http://127.0.0.1:9",
+           "sensitive": {"model": "verify-local", "keywords_file": kw, "refusal_fallback": True},
+           "models": [{"id": "verify/local:tag", "alias": "verify-local", "context_length": 65536}]}}]}, open(cfg, "w"))
+os.environ[local_lane.CONFIG_ENV] = cfg
+state = {"down": None}
+def probe(node):
+    if state["down"]:
+        raise local_lane.LocalUnavailable(state["down"])
+    return {"verify/local:tag"}
+local_lane.probe = probe
+def route(text, local=None, down=None):
+    state["down"] = down
+    routing._auto_down.clear()
+    body = {"model": "cortados", "messages": [{"role": "user", "content": text}]}
+    r = routing.choose(core, body, client="verify", conversation_id="verify-sensitive", claude_bin=sys.executable,
+                       codex_bin=sys.executable, local=local)
+    rules = (r.get("route") or {}).get("hard_rules") or []
+    return {**{k: r.get(k) for k in ("provider", "model", "band", "degraded", "error")},
+            "rule": next((h.split(":")[0] + ":" + h.split(":")[1] for h in rules if h.startswith("sensitive")), None)}
+easy = "explain how this parser handles nested quotes"
+print(json.dumps({"flag": route(easy, "sensitive"), "keyword": route("explain the Verify Placeholder Term"),
+                  "plain": route(easy), "down": route(easy, "sensitive", "node pro: local gate: local switch off"),
+                  "outward": route("email the signed invoice about the verify placeholder term to the client and mark "
+                                   "it paid", "sensitive")}))
+"""
+home = tempfile.mkdtemp(prefix="verify-router-sensitive-")
+PROBE_DIRS.append(Path(home) / "usage-probe")
+p = subprocess.run([sys.executable, "-B", "-c", SENSITIVE_SCENARIO], cwd=REPO, capture_output=True, text=True,
+                   timeout=300, env={**os.environ, "CORTADOS_HOME": home, "CORTADOS_SCARCITY_REFRESH": "off"})
+try:
+    r = json.loads(p.stdout.strip().splitlines()[-1])
+except (ValueError, IndexError):
+    record("sensitive request goes local only with no outward effect", "FAIL", (p.stderr or p.stdout).strip()[-300:])
+else:
+    local = lambda x: str(x.get("provider")).startswith("local-")
+    served = lambda x: x.get("provider") in ("claude-cli", "codex-cli") and not x.get("error")
+    if r["flag"].get("degraded"):
+        record("degraded decision is never sensitive-routed local (nor to Claude)",
+               "PASS" if all(x.get("provider") == "codex-cli" for x in r.values()) else "FAIL", json.dumps(r["flag"]))
+        record("sensitive request goes local only with no outward effect", "BLOCKED", "S1 degraded: no answers to check")
+    else:
+        flag, key, plain, down, out = r["flag"], r["keyword"], r["plain"], r["down"], r["outward"]
+        ok = (local(flag) and flag.get("rule") == "sensitive: flag" and local(key) and key.get("rule") == "sensitive: keyword"
+              and served(plain) and served(down) and out.get("band") == "R3" and not local(out))
+        record("sensitive request goes local only with no outward effect", "PASS" if ok else "FAIL",
+               f"flag -> {flag.get('provider')} band {flag.get('band')} | keyword -> {key.get('provider')} "
+               f"band {key.get('band')} | unflagged -> {plain.get('provider')} | node off -> {down.get('provider')} | "
+               f"outward+flag+keyword -> band {out.get('band')} {out.get('provider')}/{out.get('model')}")
+
 record("live ~/.cortados untouched", "PASS" if live_state_stamp() == before else "FAIL",
        str(LIVE_HOME))
 record("no vendor CLI probe opened", "PASS" if all(not p.exists() or not any(p.iterdir()) for p in PROBE_DIRS) else "FAIL",

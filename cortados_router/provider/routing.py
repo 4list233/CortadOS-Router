@@ -15,6 +15,12 @@ Owner of two rules:
                     probe (on the Pro: AC power + manual switch + gate up) and lists the model, the request fits the
                     model's context, the client did not exclude it, and the request is on /v1/messages. Otherwise S1's
                     route stands unchanged: a local node is an extra, never a fallback (#75).
+  sensitive         after S1 has chosen a route, sensitive_local may move a request marked sensitive (the
+                    x-cortados-local header, the node's keyword list; a planned S1 signal plugs in at S1_SENSITIVE_ANSWER)
+                    to the node's `sensitive.model` in ANY band, but only when S1 says it has no effect outside this
+                    machine (no_outward_effect: outward false, blast_radius <= LOCAL_BLAST_MAX, not degraded) and the
+                    local guards pass. refusal_route does the same for an opening turn a cloud model refused (server.py).
+                    core.resolve's outward floor is untouched: an outward request never reaches a local model.
   sub/ pin          a client that names `sub/<model>` (any model the tables serve on claude-cli or codex-cli) chose the
                     model itself: S1 and the band are skipped, but the served-model, account, capacity, fit and
                     route-log rules still apply (choose_pinned). pinnable_models is the list GET /v1/models offers.
@@ -586,11 +592,16 @@ def _excluded_route_usable(core, routes, body: dict[str, Any], claude_bin: str, 
 
 def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, claude_bin: str = "claude",
            codex_bin: str = "codex", exclude_model: str | None = None,
-           min_left_pct: float | None = None, codex_home: str | None = None) -> dict[str, Any]:
+           min_left_pct: float | None = None, codex_home: str | None = None,
+           local: str | None = None) -> dict[str, Any]:
     """Route a new conversation. Returns execution_routing.select's result: provider, model, route_id, band, … or error.
     A `sub/`-pinned request skips S1 (choose_pinned). `exclude_model` (the x-cortados-exclude-model header, a comma
     list) keeps the conversation off each listed model on every lane, so a review never runs on a model that wrote the
-    code."""
+    code. `local` (the x-cortados-local header: LOCAL_MODES) marks the request for a node's sensitive model
+    (sensitive_local); a pin ignores it (the person chose the model)."""
+    if local is not None and local not in LOCAL_MODES:
+        return {"router": execution_routing.ROUTER, "client_error": True,
+                "error": f"{LOCAL_HEADER}: must be one of {', '.join(LOCAL_MODES)}"}
     items = [i.strip() for i in (exclude_model or "").split(",") if i.strip()]
     excluded_models: list[str] = []
     for item in items:
@@ -616,6 +627,8 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
             pinned = resolve_pin(core, pinned) or pinned
         except AmbiguousPin as exc:
             return {"router": execution_routing.ROUTER, "client_error": True, "error": str(exc)}
+        if local:
+            logger.info("%s: %s ignored: the request pins sub/%s", LOCAL_HEADER, local, pinned)
         if hit(pinned):
             return {"router": execution_routing.ROUTER, "client_error": True,
                     "error": f"sub/{pinned} is the excluded model (x-cortados-exclude-model); pin another model or use cortados"}
@@ -676,7 +689,9 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
                 "error": f"internal: routed to the excluded model {r.get('model')} ({r.get('provider')}); refused "
                          "(x-cortados-exclude-model)"}
     if not r.get("error"):
-        r = auto_local(core, body, r, client=client, conversation_id=conversation_id, excluded=hit)
+        r = sensitive_local(core, body, r, client=client, conversation_id=conversation_id, excluded=hit, local=local)
+        if not r.get("local"):
+            r = auto_local(core, body, r, client=client, conversation_id=conversation_id, excluded=hit)
     if min_left_pct is not None and not r.get("error"):
         # The routed path's floor check runs on the account select chose (execution_routing ranks inside select); a
         # chosen account below the client's floor is refused like a spent one, never swapped for an unscored sibling.
@@ -708,18 +723,77 @@ AUTO_DOWN_S = 30.0
 _auto_down: dict[str, float] = {}
 
 
+def _node_why(node: dict[str, Any], entry: dict[str, Any], body: dict[str, Any],
+              excluded: Callable[[str], bool], need: list) -> tuple[str | None, bool]:
+    """The local guards every move to a node passes (auto_local, sensitive_local, refusal_route): the client did not
+    exclude the model, the node is not inside its AUTO_DOWN_S window, it answers its probe (on the Pro the gate refuses
+    that probe on battery or with the manual switch off) and lists the model, and the request fits the model's context.
+    Returns (why not, or None; whether the reason is a gate 401). `need` caches the request's size across nodes."""
+    pin = local_lane.pin_id(entry)
+    if excluded(entry["id"]) or excluded(pin):
+        return "excluded by the client (x-cortados-exclude-model)", False
+    if _auto_down.get(node["node"], 0.0) > _now():
+        return "probe failed within the last %gs" % AUTO_DOWN_S, False
+    try:
+        tags = local_lane.probe(node)
+    except local_lane.LocalUnavailable as exc:
+        _auto_down[node["node"]] = _now() + AUTO_DOWN_S
+        # A gate 401 is the provider's misconfiguration (token files out of step), not the node's state: it needs the
+        # owner's attention, so it is a warning, where battery or a switched-off node is routine.
+        return f"unavailable ({exc})", str(exc) == local_lane.GATE_REFUSED.format(node=node["node"])
+    _auto_down.pop(node["node"], None)
+    if entry["id"] not in tags:
+        return f"does not list {entry['id']}", False
+    if not need:
+        need.append(int(request_fit(body)["input_tokens"]))
+    if need[0] > entry["context_length"]:
+        return f"request ≈{need[0] // 1000}k tokens exceeds its {entry['context_length'] // 1000}k context", False
+    return None, False
+
+
+def _moved(r: dict[str, Any], node: dict[str, Any], entry: dict[str, Any], rule: str) -> dict[str, Any]:
+    """S1's route `r` moved to `entry` on `node`: the routes record names the local lane, S1's choice becomes runner_up,
+    S1's own runner_up is kept as s1_runner_up and as a skipped entry, and `rule` joins the hard rules. Nothing is
+    written here (_log_moved writes it), so a move that does not happen leaves no trace in the routes table."""
+    old = r.get("route") or {}
+    chosen = {"lane": node["lane"], "provider": node["lane"], "model": entry["id"], "account": None,
+              "config_dir": None, "reserve": False, "pool": None}
+    # runner_up is S1's choice (what runs when the node is not there); S1's own runner_up is not dropped: it is
+    # kept as s1_runner_up and, so the routes row still shows it, as a skipped entry naming why.
+    s1_runner_up = old.get("runner_up")
+    skipped = list(old.get("skipped") or [])
+    if isinstance(s1_runner_up, dict) and s1_runner_up.get("model"):
+        skipped.append({"lane": s1_runner_up.get("lane"), "model": s1_runner_up.get("model"),
+                        "why": "S1's runner_up (s1_runner_up), behind S1's choice the local lane replaced"})
+    route = {**old, "chosen": chosen, "runner_up": old.get("chosen"), "s1_runner_up": s1_runner_up,
+             "skipped": skipped or None, "hard_rules": list(old.get("hard_rules") or []) + [rule]}
+    return {"router": r.get("router", execution_routing.ROUTER), "provider": node["lane"], "model": entry["id"],
+            "account": None, "config_dir": None, "context_length": entry["context_length"],
+            "route_id": r["route_id"], "api_request_id": r.get("api_request_id", ""), "degraded": False,
+            "band": r.get("band"), "projection": r.get("projection"), "decision": r.get("decision"), "route": route,
+            "local": {"node": node, "model": entry}}
+
+
+def _log_moved(core, body: dict[str, Any], moved: dict[str, Any], *, client: str, conversation_id: str) -> None:
+    """Rewrite the routes row S1's select wrote, under the same route_id, with what will run (_moved's record)."""
+    core.log_route(moved["route_id"], {"session_id": conversation_id, "platform": f"provider:{client}",
+                                       "unit_kind": "interactive", "actual_model": None,
+                                       "request": request_text(body.get("messages") or [],
+                                                               standalone=not body.get("tools"))[:8000]},
+                   moved.get("decision") or {"answers": None, "degraded": False, "engine": "s1", "engine_ms": None},
+                   moved["route"])
+
+
 def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, conversation_id: str,
                excluded: Callable[[str], bool] = lambda name: False) -> dict[str, Any]:
     """S1's route `r`, or the same decision moved to a local node's auto_route model (local_lane.auto_routes) when every
     condition holds: S1 was not degraded (a degraded decision has no band of its own; it keeps core's no-Claude rule
-    and its route), the band is one the node lists, the request is on a wire the relay serves (no NO_LOCAL_KEY), the
-    client did not exclude the model (`excluded`), the node answered its probe within probe_timeout_s and lists the
-    model (on the Pro the gate refuses that probe on battery or with the manual switch off), and the request fits the
-    model's context. The first node in config order that passes wins. A skip leaves `r` exactly as it was, with the
-    reason logged; a broken local config skips too (logged as a warning), so a config error never blocks S1 routing.
-    When moved, the routes row S1's select wrote is rewritten under the same route_id (lane, provider and model of the
-    local node, S1's choice as runner_up, S1's own runner_up kept as s1_runner_up and a skipped entry), so the record
-    names what will run and loses nothing S1 decided."""
+    and its route), the band is one the node lists, the request is on a wire the relay serves (no NO_LOCAL_KEY), and
+    the local guards pass (_node_why: not excluded, node available and listing the model, request fits). The first
+    node in config order that passes wins. A skip leaves `r` exactly as it was, with the reason logged; a broken local
+    config skips too (logged as a warning), so a config error never blocks S1 routing. When moved, the routes row S1's
+    select wrote is rewritten under the same route_id (_moved), so the record names what will run and loses nothing S1
+    decided."""
     if body.get(NO_LOCAL_KEY) or r.get("degraded") or not r.get("band") or not r.get("route_id"):
         return r
     try:
@@ -728,65 +802,201 @@ def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, co
         logger.warning("local auto-route skipped: local config error on node %s: %s", exc.node, exc)
         return r
     band = r["band"]
-    need = None
+    need: list = []
     for node, entry, bands in targets:
         pin = local_lane.pin_id(entry)
-        why, gate_refused = None, False
-        if band not in bands:
-            why = f"band {band} is not in its auto_route bands"
-        elif excluded(entry["id"]) or excluded(pin):
-            why = "excluded by the client (x-cortados-exclude-model)"
-        elif _auto_down.get(node["node"], 0.0) > _now():
-            why = "probe failed within the last %gs" % AUTO_DOWN_S
-        if why is None:
-            try:
-                tags = local_lane.probe(node)
-            except local_lane.LocalUnavailable as exc:
-                _auto_down[node["node"]] = _now() + AUTO_DOWN_S
-                why = f"unavailable ({exc})"
-                # A gate 401 is the provider's misconfiguration (token files out of step), not the node's state: it
-                # needs the owner's attention, so it is a warning, where battery or a switched-off node is routine.
-                gate_refused = str(exc) == local_lane.GATE_REFUSED.format(node=node["node"])
-            else:
-                _auto_down.pop(node["node"], None)
-                if entry["id"] not in tags:
-                    why = f"does not list {entry['id']}"
-        if why is None:
-            need = int(request_fit(body)["input_tokens"]) if need is None else need
-            if need > entry["context_length"]:
-                why = f"request ≈{need // 1000}k tokens exceeds its {entry['context_length'] // 1000}k context"
+        why, gate_refused = (f"band {band} is not in its auto_route bands", False) if band not in bands else \
+            _node_why(node, entry, body, excluded, need)
         if why:
             logger.log(logging.WARNING if gate_refused else logging.INFO,
                        "local auto-route: %s/%s not taken for %s: %s", node["lane"], pin, r["route_id"], why)
             continue
-        old = r.get("route") or {}
-        chosen = {"lane": node["lane"], "provider": node["lane"], "model": entry["id"], "account": None,
-                  "config_dir": None, "reserve": False, "pool": None}
-        # runner_up is S1's choice (what runs when the node is not there); S1's own runner_up is not dropped: it is
-        # kept as s1_runner_up and, so the routes row still shows it, as a skipped entry naming why.
-        s1_runner_up = old.get("runner_up")
-        skipped = list(old.get("skipped") or [])
-        if isinstance(s1_runner_up, dict) and s1_runner_up.get("model"):
-            skipped.append({"lane": s1_runner_up.get("lane"), "model": s1_runner_up.get("model"),
-                            "why": "S1's runner_up (s1_runner_up), behind S1's choice the local auto-route replaced"})
-        route = {**old, "chosen": chosen, "runner_up": old.get("chosen"), "s1_runner_up": s1_runner_up,
-                 "skipped": skipped or None,
-                 "hard_rules": list(old.get("hard_rules") or []) + [
-                     f"local auto-route: band {band} is in {node['lane']}'s auto_route bands and the node is available; "
-                     f"{pin} instead of {r.get('provider')}/{r.get('model')}"]}
-        core.log_route(r["route_id"], {"session_id": conversation_id, "platform": f"provider:{client}",
-                                       "unit_kind": "interactive", "actual_model": None,
-                                       "request": request_text(body.get("messages") or [],
-                                                               standalone=not body.get("tools"))[:8000]},
-                       r.get("decision") or {"answers": None, "degraded": False, "engine": "s1", "engine_ms": None},
-                       route)
+        moved = _moved(r, node, entry,
+                       f"local auto-route: band {band} is in {node['lane']}'s auto_route bands and the node is "
+                       f"available; {pin} instead of {r.get('provider')}/{r.get('model')}")
+        _log_moved(core, body, moved, client=client, conversation_id=conversation_id)
         logger.info("local auto-route: %s -> %s/%s (band %s)", r["route_id"], node["lane"], pin, band)
-        return {"router": r.get("router", execution_routing.ROUTER), "provider": node["lane"], "model": entry["id"],
-                "account": None, "config_dir": None, "context_length": entry["context_length"],
-                "route_id": r["route_id"], "api_request_id": r.get("api_request_id", ""), "degraded": False,
-                "band": band, "projection": r.get("projection"), "decision": r.get("decision"), "route": route,
-                "local": {"node": node, "model": entry}}
+        return moved
     return r
+
+
+# ---------------------------------------------------------------------------------------------- sensitive requests
+# The x-cortados-local request header (both wires; the MCP route_task/start_task `local` option sends it):
+#   sensitive  the request is sensitive: run it on the node's `sensitive.model` when it is eligible (below)
+#   prefer     "local if eligible": the same eligibility and model, recorded as a preference rather than a sensitivity
+LOCAL_HEADER = "x-cortados-local"
+LOCAL_MODES = ("sensitive", "prefer")
+# The S1 blast_radius levels that mean "no effect outside this machine" (core.ANCHORS["blast_radius"]): 0 "words only,
+# nothing changes" and 1 "a bounded reversible workspace change". 2 ("a broad or difficult-to-reverse system change")
+# is not bounded to the workspace and 3 is "law, money, production, or irreversible effects nearby", where core.resolve
+# floors every outward request. Owner rule (2026-11-13): a sensitive request may go local in any band, but only with no
+# effect outside the machine; the outward floor itself is core.resolve's and is not touched here.
+LOCAL_BLAST_MAX = 1
+# HOOK for the planned S1 "sensitive" signal (not built): the name of the S1 answer that marks a request sensitive.
+# None = not wired. When S1 learns the question, set this to its answers key; sensitive_trigger then reports rule "s1"
+# for a request S1 marks, and every eligibility rule below applies to it unchanged.
+S1_SENSITIVE_ANSWER: str | None = None
+
+
+def no_outward_effect(r: dict[str, Any]) -> str | None:
+    """None when S1's decision says the request has no effect outside this machine: not degraded, `outward` answered
+    false, and `blast_radius` answered at most LOCAL_BLAST_MAX (the raw answers, before core.resolve's outward floor).
+    Otherwise why not. Fails closed: a decision without those answers is not eligible."""
+    decision = r.get("decision") or {}
+    if r.get("degraded") or decision.get("degraded"):
+        return "S1 is degraded (a degraded scorer never routes local)"
+    ans = decision.get("answers") or {}
+    if "outward" not in ans or "blast_radius" not in ans:
+        return "S1 gave no outward / blast_radius answer"
+    if ans.get("outward") is not False:
+        return "outward effect (S1 outward=true): never local"
+    try:
+        br = int(ans["blast_radius"])
+    except (TypeError, ValueError):
+        return "S1's blast_radius answer is unreadable"
+    if br > LOCAL_BLAST_MAX:
+        return f"blast_radius {br} > {LOCAL_BLAST_MAX} (an effect outside the workspace)"
+    return None
+
+
+def latest_user_text(body: dict[str, Any]) -> str:
+    """The text of the request's latest user turn (text blocks only, client reminders removed): what the keyword list is
+    matched against. The system prompt is deliberately not matched: it is the client's fixed instructions plus project
+    files (CLAUDE.md), the same for every conversation of a project, so one word there would send every conversation
+    local; a tool result is not the person's words either."""
+    for m in reversed(body.get("messages") or []):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            return strip_injected(c)
+        if isinstance(c, list):
+            return strip_injected("\n".join(b.get("text", "") for b in c
+                                             if isinstance(b, dict) and b.get("type") == "text"
+                                             and isinstance(b.get("text"), str)))
+        return ""
+    return ""
+
+
+def sensitive_trigger(body: dict[str, Any], r: dict[str, Any], section: dict[str, Any], local: str | None,
+                      text: str | None = None) -> str | None:
+    """Which trigger marks this request for `section`'s node: "flag" (x-cortados-local: sensitive), "prefer"
+    (x-cortados-local: prefer), "keyword" (the latest user turn matches the node's keyword list), "s1" (the planned S1
+    signal, S1_SENSITIVE_ANSWER), or None. A keyword list that cannot be read is a warning naming the file, never a
+    term, and matches nothing."""
+    if local == "sensitive":
+        return "flag"
+    if local == "prefer":
+        return "prefer"
+    try:
+        if local_lane.keyword_match(section, latest_user_text(body) if text is None else text):
+            return "keyword"
+    except local_lane.KeywordListError as exc:
+        logger.warning("sensitive: keyword list skipped: %s", exc)
+    ans = (r.get("decision") or {}).get("answers") or {}
+    if S1_SENSITIVE_ANSWER and ans.get(S1_SENSITIVE_ANSWER) is True:
+        return "s1"
+    return None
+
+
+def _rule_label(rule: str) -> str:
+    return "local: prefer" if rule == "prefer" else f"sensitive: {rule}"
+
+
+def sensitive_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, conversation_id: str,
+                    excluded: Callable[[str], bool] = lambda name: False, local: str | None = None) -> dict[str, Any]:
+    """S1's route `r`, or the same decision moved to a node's `sensitive.model` when a trigger marks the request
+    (sensitive_trigger: flag, prefer, keyword) and it is eligible: on a wire the relay serves (no NO_LOCAL_KEY), with no
+    effect outside this machine (no_outward_effect; this also refuses a degraded scorer), and through the same local
+    guards as auto_local (_node_why). Any band. The first node in config order that passes wins; the routes row is
+    rewritten as auto_local does, with a `sensitive: <rule>` hard-rules entry. Every skip is logged as the rule and a
+    metadata reason only, never the request text or the matched term.
+
+    When the request is not moved but a node has `refusal_fallback` on and the request is eligible except for the
+    node's live state, the route carries `refusal_fallback` (the candidate nodes, the conversation id and the client),
+    which refusal_route reads if the cloud model refuses the opening turn."""
+    if r.get("error") or not r.get("route_id") or r.get("pinned"):
+        return r
+    try:
+        targets = local_lane.sensitive_routes()
+    except local_lane.LocalConfigError as exc:
+        logger.warning("sensitive: skipped: local config error on node %s: %s", exc.node, exc)
+        return r
+    rid = r["route_id"]
+    if not targets:
+        if local:
+            logger.info("%s not taken for %s: no local node has a sensitive section", _rule_label(
+                "flag" if local == "sensitive" else local), rid)
+        return r
+    static = "the request came in on /v1/responses (the local relay speaks Messages only)" \
+        if body.get(NO_LOCAL_KEY) else no_outward_effect(r)
+    text = latest_user_text(body)
+    need: list = []
+    for node, entry, section in targets:
+        rule = sensitive_trigger(body, r, section, local, text)
+        if rule is None:
+            continue
+        why, gate_refused = (static, False) if static else _node_why(node, entry, body, excluded, need)
+        if why:
+            logger.log(logging.WARNING if gate_refused else logging.INFO, "%s: %s/%s not taken for %s: %s",
+                       _rule_label(rule), node["lane"], local_lane.pin_id(entry), rid, why)
+            continue
+        pin = local_lane.pin_id(entry)
+        moved = _moved(r, node, entry,
+                       f"{_rule_label(rule)}: no outward effect and {node['lane']} is available; {pin} instead of "
+                       f"{r.get('provider')}/{r.get('model')} (band {r.get('band')})")
+        _log_moved(core, body, moved, client=client, conversation_id=conversation_id)
+        logger.info("%s: %s -> %s/%s (band %s)", _rule_label(rule), rid, node["lane"], pin, r.get("band"))
+        return moved
+    if not static:
+        cands = [{"node": n["node"], "model": e["id"]} for n, e, sec in targets
+                 if sec["refusal_fallback"] and not excluded(e["id"]) and not excluded(local_lane.pin_id(e))]
+        if cands:
+            r = {**r, "refusal_fallback": {"targets": cands, "conversation_id": conversation_id, "client": client}}
+    return r
+
+
+def refusal_route(core, body: dict[str, Any], route: dict[str, Any] | None,
+                  run: Callable[[dict[str, Any]], bool]) -> dict[str, Any] | None:
+    """The opening turn of an S1-routed conversation was refused by its cloud model (server.py checks that it was the
+    opening turn, on /v1/messages, with no tool run). Returns the route moved to a node's `sensitive.model`, or None.
+    Eligibility was settled when the route was chosen (sensitive_local's `refusal_fallback` marker: no outward effect,
+    not degraded, the client's exclusions); here the node's live state is checked again (_node_why) and `run(moved)`
+    must produce the local answer (True) before the routes row is rewritten, so a failed fallback leaves S1's record
+    as it was. Logs the rule (`sensitive: refusal`) and metadata reasons only."""
+    marker = (route or {}).get("refusal_fallback")
+    rid = (route or {}).get("route_id")
+    if not marker:
+        logger.info("sensitive: refusal not taken for %s: not eligible when routed (no refusal_fallback node, an "
+                    "outward effect, a degraded scorer, a pin, an exclusion or the /v1/responses wire)", rid)
+        return None
+    try:
+        targets = local_lane.sensitive_routes()
+    except local_lane.LocalConfigError as exc:
+        logger.warning("sensitive: refusal not taken for %s: local config error on node %s: %s", rid, exc.node, exc)
+        return None
+    wanted = {(t.get("node"), t.get("model")) for t in marker.get("targets") or []}
+    need: list = []
+    for node, entry, section in targets:
+        if not section["refusal_fallback"] or (node["node"], entry["id"]) not in wanted:
+            continue
+        pin = local_lane.pin_id(entry)
+        why, gate_refused = _node_why(node, entry, body, lambda name: False, need)   # exclusions applied when routed
+        if why is None:
+            moved = _moved(route, node, entry,
+                           f"sensitive: refusal: {route.get('provider')}/{route.get('model')} refused the opening "
+                           f"turn; no outward effect and {node['lane']} is available; {pin} instead "
+                           f"(band {route.get('band')})")
+            moved.pop("refusal_fallback", None)
+            if run(moved):
+                _log_moved(core, body, moved, client=marker.get("client") or "",
+                           conversation_id=marker.get("conversation_id") or "")
+                logger.info("sensitive: refusal: %s -> %s/%s", rid, node["lane"], pin)
+                return moved
+            why = "the local model gave no usable answer"
+        logger.log(logging.WARNING if gate_refused else logging.INFO, "sensitive: refusal: %s/%s not taken for %s: %s",
+                   node["lane"], pin, rid, why)
+    return None
 
 
 def _now() -> float:
