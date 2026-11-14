@@ -619,64 +619,99 @@ reserved = tokens × kv_bytes_per_token + per_seq_state_bytes + prefill_margin_b
 admit    iff  count < count limit  and  reserved in flight + reserved ≤ memory_budget_bytes − weights_bytes
 ```
 
-**Input tokens are counted, or bounded, never estimated** (`local_governor.input_tokens`). An average such as
-"characters / 3.5" is not a bound: 100,000 characters of `a!a!…` are 100,000 tokens on Qwen's tokenizer (1 byte a
-token), and the old estimate called them 28,572, so seven such turns were admitted at once while each really holds
-~7.9 GiB. Now, per turn, before admission:
+**The input bound** (`local_governor.input_tokens`). A turn's input tokens are bounded from above, never estimated and
+never asked of the backend:
 
-1. **Counted, never trusted alone.** The gate asks vllm-mlx for the count on loopback: `POST
-   /v1/messages/count_tokens`, sending the body it is about to relay, within `COUNT_DEADLINE_S` (5 s, end to end). That
-   count misses some of what vllm-mlx sends to the model. Read from vllm-mlx 0.6.0's source
-   (`server.count_anthropic_tokens` against `api/anthropic_adapter.anthropic_to_openai`), the counter encodes a system
-   string and each system block's `text`, a message string, each content block's `text`, a non-empty `input` (as JSON),
-   a tool_result's string content or its dict items' `text`, and each tool's name, description and `input_schema`. It
-   leaves out, though the adapter sends them:
+```
+input tokens ≤ bytes of the request body exactly as received
+             + template allowance   1024 + 16 per message + 32 per content block + 64 per tool   (TEMPLATE_TOKENS_*)
+             + re-serialized bytes  what vllm-mlx writes wider than it came (below)
+capped at context_tokens; then + max_tokens, capped at context_tokens again (request_tokens)
+```
 
-   | Left out by the 0.6.0 count | Sent to the model as |
-   |---|---|
-   | a `tool_use` block's `name` and `id` (and `input` when empty) | the assistant's tool call (`function.name`, `id`, `arguments: "{}"`) |
-   | a `tool_result` block's `tool_use_id` | the tool message's `tool_call_id` |
-   | plain **string** items of a `tool_result`'s content list | joined into the tool message |
-   | plain string entries of a `system` list | joined into the system message |
-   | a tool defined without `input_schema` | the default `{"type": "object", "properties": {}}` |
+An average such as "characters / 3.5" is not a bound: 100,000 characters of `a!a!…` are 100,000 tokens on Qwen's
+tokenizer (1 byte a token), and the old estimate called them 28,572, so seven such turns were admitted at once while
+each really holds ~7.9 GiB. An earlier version asked vllm-mlx's `POST /v1/messages/count_tokens` and added the bytes of
+what that count leaves out. Three review rounds each found another under-count (nested tool_result items joined with
+`\n`, tool descriptions through `tojson`, `response_format` schemas injected into the system prompt): modelling a
+counter's omissions does not converge. The count call, its 2-slot semaphore, its 5 s deadline and `uncounted_bytes()`
+are gone, and the gate makes no backend call before the turn itself.
 
-   The gate adds the UTF-8 bytes of all of these to the count (`local_governor.uncounted_bytes`; bytes ≥ tokens, so
-   this can only over-reserve), then the template allowance, which covers what the count never sees: the chat
-   template's markers and tool preamble, about twice what Qwen3's template adds: 1024 + 16 per message + 32 per content
-   block + 64 per tool (`TEMPLATE_TOKENS_*`). The result is never above the byte bound below, which holds by itself. The
-   re-review's case: a 100,000-byte token-dense tool_result as string items after a 4 KB tool name was counted 7 and
-   admitted as ~1k tokens. It now reserves ≥ 104k tokens.
-2. **Bound**, when there is no count (an Ollama node, the route missing, an error, a timeout, an unreadable answer, or
-   no count slot free within the deadline): the UTF-8 bytes of the text the model will see (system, message text and
-   thinking, tool_use names, ids and input JSON, tool_result ids and content, tool definitions as JSON) plus the same
-   allowance. A byte-level BPE token covers at least one byte, so the bytes are never fewer than the tokens, whatever
-   the text.
+**Why it cannot under-count.** The body is the JSON the client sent, before the gate adapts it. Tokens ≤ UTF-8 bytes
+of the rendered prompt, because Qwen's tokenizer is byte-level BPE and every token covers at least one byte. So it is
+enough that the rendered prompt has no more bytes than the bound:
 
-The trade-off: the bound is very conservative. Prose and code run ~4.3 bytes a token (measured with Qwen3's tokenizer
-on this repository's source), so a turn on the bound reserves about four times its real context, and fewer turns run
-at once. That costs concurrency only while the count fails; a working count reserves what the turn holds. The count
-is cheap: Qwen3's tokenizer encodes ~100 KB in ~25 ms and a full 128k-token context (~400 KB) in ~100 ms on an M-series CPU
-(measured on the Air with `tokenizers` 0.22 and Qwen3's `tokenizer.json`, not on the Pro). vllm-mlx runs it
-synchronously on its event loop, so the gate keeps counts few:
+- Text the model sees is a copy of a JSON string in the body, and a JSON string costs at least as many bytes as it
+  renders to. ASCII is one byte either way. Non-ASCII is raw UTF-8 (the same bytes) or a `\uXXXX` escape (6 bytes for
+  ≤ 3, 12 for a 4-byte character). An escape such as `\n` or `\"` is 2 bytes for 1.
+- Where text is escaped again on the way in (`tojson` writes a newline as `\n`), the result is never longer than the
+  body's own escape: `\n` is 2 bytes in the body and 2 characters after `tojson`.
+- Separators vllm-mlx adds between copied items are paid for by the items' own JSON. Joining tool_result or system
+  items with `\n` costs 1 byte per item, and each item costs at least 3 body bytes (`"",`). System messages are joined
+  with `\n\n`, but each message costs ~30 bytes.
+- `response_format` instruction text is in the body (name, description), apart from the fixed wording counted below.
+- The chat template's own text (role markers, `<tool_call>` wrappers, the tool-use preamble, about half the
+  allowance) is the only text from outside the body. The allowance covers it, and as a token count it is also at least
+  as many bytes as that text.
 
-- **Admission is two-phase.** A turn takes its COUNT slot (`Admission.acquire_slot`) before any count is asked, so no
-  more counts run than turns may run (2 with the owner active), and a turn the count limit refuses is answered 529
-  without being counted. After the count, `Ticket.reserve` adds the turn's bytes. If they do not fit now (529) or
-  never fit (413), the slot is given back right there, and the gate's `finally` release is then a no-op: each slot is
-  released exactly once, on every path.
-- **At most `COUNT_CONCURRENCY` (2) count calls are in flight at once**, whatever the count limit (8 with the owner
-  idle). A turn that cannot start its count within the deadline takes the byte bound.
+**What vllm-mlx 0.6.0 writes wider than it came, bounded explicitly** (`local_governor.reserialized_bytes`; read from
+its source). Re-serializing a JSON value is not a copy. The rendered text can outgrow the body bytes it came from, so
+each of these is added in full, as long as its widest rendering, on top of the body bytes:
 
-A long prefill step can still slow a count; the deadline caps that wait and the bound takes over. The count route is
-gate-internal (`local_backend.COUNT_TOKENS`): it is in neither the client routes (`local_gate.ROUTES`) nor
-`local_backend.UPSTREAM`, so a client asking the gate for it gets the gate's 404.
+| Re-serialized | How vllm-mlx renders it | Why it can outgrow the body | Added |
+|---|---|---|---|
+| each tool definition | the template's `tojson` of the OpenAI-shaped tool (`_convert_tool`) | compact `,` / `:` become `, ` / `: ` (`[0,0,…]` 2 bytes an item → 3); the `{"type": "function", …}` wrapper and the default schema of a tool without `input_schema` are not in the body | `json.dumps` of that OpenAI-shaped tool |
+| each `tool_use` input | `json.dumps(input)` (ASCII-escaped) as the call's `arguments`, or `tojson` of it | `é` is 2 bytes raw and 6 as `é` (3×); separators as above | `json.dumps(input)` |
+| `response_format` | `build_json_system_prompt`: fixed wording + name + description + `json.dumps(schema, indent=2)` | `indent=2` writes a line and its indentation per value: a 300-deep schema of ~3 KB becomes ~90 KB | `json.dumps(response_format, indent=2)` + `INJECTED_TEXT_BYTES` (1024) |
+| a forced `tool_choice` (`any` / `tool`) | an `[IMPORTANT INSTRUCTION] You MUST call …` line, naming the tool twice | ~190 bytes of fixed wording | the `tool_choice` JSON + 1024 |
+
+`json.dumps` with its defaults (ASCII-escaped, `, ` / `: `) is never shorter than any of these renderings: `tojson`
+uses `ensure_ascii=False` and the same separators. So each addition is at least as long as what vllm-mlx writes. The
+sizes are counted chunk by chunk (`JSONEncoder.iterencode`) and the count stops at the context cap, so a 32 MiB body
+or a deep schema is never built in memory. A value nested too deeply to encode counts as the whole context.
+
+The tests render each reviewer case as vllm-mlx 0.6.0 does and check that the bound covers it (`tests/test_local_mlx.py`
+`InputTokensTests` and `MlxGateBoundTests`): 1,000,000 empty tool_result items (999,999 newlines), a 100,000-newline
+tool description, a 100 KB `response_format` description, a 300-deep schema under `indent=2`, a non-ASCII `tool_use`
+input and a compact enum through `tojson`.
+
+**The cost.** Code-heavy Claude Code turns run about 3.5–4.5 body bytes per token, so the bound reserves roughly four
+times the real input. A turn whose real input passes ~22k–38k tokens (depending on max_tokens and density) reserves
+the whole context. Reservations, and how
+many of one size fit at once by bytes (25 GiB beside the 4-bit weights, 17.6 GiB beside the 6-bit), with an allowance
+for ~20 messages and 40 blocks:
+
+| Real input tokens | max_tokens | Reserved tokens (3.5–4.5 B/token) | GiB each | Fit by bytes, 4-bit | Fit by bytes, 6-bit |
+|---|---|---|---|---|---|
+| 2,000 | 512 | 10.1k–12.1k | 2.3–2.4 | 10–11 | 7 |
+| 2,000 | 32,000 | 41.6k–43.6k | 4.2–4.3 | 5 | 4 |
+| 8,500 | 512 | 32.9k–41.4k | 3.7–4.2 | 5–6 | 4 |
+| 8,500 | 32,000 | 64.4k–72.9k | 5.6–6.1 | 4 | 2–3 |
+| 16,000 | 4,096 | 62.7k–78.7k | 5.5–6.5 | 3–4 | 2–3 |
+| 38,000 and up | any | 131,072 (the cap) | 9.65 | 2 | 1 |
+
+The count limit applies on top: 2 with the owner active, 8 idle (6 for the 6-bit), 1 under warn pressure. So:
+
+- Two full 128k turns still run at once at 4-bit; a third waits (529). This is the same as before, since long turns
+  were already capped.
+- With the owner active, every row admits at least 2 by bytes, so short turns are limited by the count cap first.
+- With the owner idle, bytes limit before the count of 8 except for small turns with small max_tokens. A turn with
+  vllm-mlx's default max_tokens (32k, as Claude Code sends) reserves ≥ 4.2 GiB whatever its size.
+
+This is concurrency given up for a bound that holds by construction. The provider's own skip estimate
+(`local_lane.request_tokens`, characters / 3.5) is unchanged. It only decides whether to try the node, and the gate's
+refusal handles the rest.
+
+**Admission is one step.** With no count call to wait for, the count slot and the byte reservation are checked and
+taken together under one lock (`Admission.try_acquire`). A refused turn takes nothing, and an admitted turn's
+`Ticket` is released exactly once, in the gate's `finally`, however the turn ends.
 
 **Text only.** The Pro's vllm-mlx serves the 27B with its vision tower excluded at load. vllm-mlx 0.6.0's adapter
 turns a top-level image into image input, which the loaded model cannot use. It silently drops a document, any other
 non-text block, and an image inside a tool_result, so the model would answer as if it had seen them. On a vllm-mlx
 node the gate therefore refuses a turn carrying any of these (`local_governor.non_text_content`: message blocks other
 than text, thinking, redacted_thinking, tool_use and tool_result; tool_result content or system entries other than text
-blocks and strings). The refusal comes before admission and before any count: `400 invalid_request_error`,
+blocks and strings). The refusal comes before admission: `400 invalid_request_error`,
 `x-should-retry: false`, no Retry-After, message `local gate: content this node's model cannot read (image block in
 message 3; it serves a text-only model)` (`local_gate.UNSUPPORTED_MESSAGE`). An Ollama node relays images as before:
 its model decides. The provider treats the refusal like "never fits" (below).
@@ -694,7 +729,8 @@ recurrent; vllm-mlx keeps the KV cache unquantized, fp16):
 | `prefill_margin_bytes` | 1.5 GiB | prefill activations and allocator slack: the 6-bit copy used 2.3 GB over idle for one ~9k-token request, KV + state explain ~0.7 GiB |
 | `context_tokens` | 131072 | the Pro block's `context_length` on the provider host; tokens are capped here |
 
-What that admits (owner idle, pressure normal; 25 GiB beside the 4-bit weights, 17.6 GiB beside the 6-bit):
+What that admits, in RESERVED tokens (the bound's, not a turn's real size; "The cost" above maps one to the other;
+owner idle, pressure normal; 25 GiB beside the 4-bit weights, 17.6 GiB beside the 6-bit):
 
 | Mix | Reserved | 4-bit | 6-bit |
 |---|---|---|---|
@@ -734,8 +770,8 @@ Old configs: the count-only keys `per_request_gib`, `memory_budget_gib` and `wei
 key that replaced them (a gate given an old config does not start; update `~/.config/cortados/local-backend.json`
 from the example).
 
-Enforcement, in the gate on `POST /v1/messages` (the probe is never counted), no turn reaching the backend when refused
-(only its token count, which runs no model, and only once the turn holds a count slot):
+Enforcement, in the gate on `POST /v1/messages` (the probe is never counted); nothing reaches the backend when a
+turn is refused:
 
 - over either bound **now**: `529 overloaded_error`, `Retry-After: retry_after_s` (5), message `local gate: busy (n of
   limit running: reason)`; the reason names the memory budget when the bytes refused it (`memory budget: 5.7 GiB free,
@@ -743,7 +779,7 @@ Enforcement, in the gate on `POST /v1/messages` (the probe is never counted), no
 - **never fits**: `413 request_too_large`, `x-should-retry: false`, no Retry-After, message `local gate: too large for
   this node's memory (…; at most N tokens of input + max_tokens fit)`.
 - **content the model cannot read** (vllm-mlx, an image or document; above): `400 invalid_request_error`,
-  `x-should-retry: false`, before admission and count.
+  `x-should-retry: false`, before admission.
 
 Both carry the capacity report. The gate reports `{"backend", "limit", "inflight", "owner", "pressure", "reason",
 "reserved_bytes", "free_bytes", "fit_tokens", "free_tokens"}` read-only as `cortados_gate` in every `GET /api/tags`

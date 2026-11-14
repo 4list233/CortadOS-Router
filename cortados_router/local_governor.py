@@ -21,21 +21,16 @@ COUNT (owner-approved policy, as `policy()` computes it): how many requests may 
 BYTES (token-aware, `request_bytes()`): each admitted request reserves the memory its context will hold,
   tokens   = min(input tokens + max_tokens, context_tokens)
   reserved = tokens * kv_bytes_per_token + per_seq_state_bytes + prefill_margin_bytes
-input tokens (`input_tokens()`), never an average-case estimate, and never the backend's count alone:
-  counted  the backend's own count (vllm-mlx POST /v1/messages/count_tokens, the gate asks it on loopback) plus the
-           UTF-8 bytes of what vllm-mlx 0.6.0's count leaves out but its adapter sends (uncounted_bytes: tool_use names
-           and ids, tool_result ids and string items, system string entries) plus template_tokens() for the chat
-           template's markers and tool preamble; never more than the bound below;
-  bound    when there is no count (Ollama, no endpoint, an error, a timeout): the UTF-8
-           bytes of the text the model will see (input_bound_bytes) plus template_tokens(). A byte-level BPE token
-           covers at least one byte, so bytes >= tokens whatever the text: token-dense input (`a!a!...`, 1 byte per
-           token on Qwen's tokenizer) cannot be under-reserved. Prose and code run ~4 bytes per token, so the bound
-           reserves ~4x what the count does and lowers concurrency, but only while the count is failing.
+input tokens (`input_tokens()`) are an upper bound, never an estimate and never a backend count:
+  bytes of the request body exactly as received + template_tokens() + reserialized_bytes(), capped at context_tokens.
+  Every character the model sees from the body costs at least one byte there and a byte-level BPE token covers at
+  least one byte, so the bound holds whatever the text (token-dense `a!a!...` included); the template allowance and
+  reserialized_bytes cover the only text that is not a copy from the body (docs/LOCAL-RESOURCES.md "The input bound").
+  Code-heavy turns run 3.5-4.5 body bytes per token, so long turns reserve the whole context.
 and a request is admitted only while the reservations in flight plus its own fit in
   memory_budget_bytes - weights_bytes.
-Admission is two-phase (Admission.acquire_slot, then Ticket.reserve): a COUNT slot before the token count is asked,
-the bytes after it, the slot given back if they do not fit. A request a text-only model cannot read (non_text_content:
-an image, a document) is refused by the gate before either.
+The count slot and the bytes are taken together (Admission.try_acquire). A request a text-only model cannot read
+(non_text_content: an image, a document) is refused by the gate before admission.
 Defaults (Qwen3.8 27B, 4-bit): 64 KiB per token (16 full-attention layers x K/V x 4 KV heads x head_dim 256 x fp16),
 0.15 GiB recurrent state, 1.5 GiB prefill margin: a 128k-token request reserves 9.65 GiB, so two fit beside 15 GiB of
 weights in a 40 GiB budget and a third does not, while eight ~9k-token requests (2.2 GiB each) fit.
@@ -53,6 +48,7 @@ import json
 import math
 import re
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Callable
@@ -121,17 +117,20 @@ FLOAT_KEYS = ("sample_s",)
 # longer mean anything (the fixed per-request size could not see a 128k-token turn).
 REPLACED = {"per_request_gib": "token-aware admission (kv_bytes_per_token, per_seq_state_bytes, prefill_margin_bytes)",
             "memory_budget_gib": "memory_budget_bytes", "weights_gib": "weights_bytes"}
-# Template tokens no count or byte sum sees, added to the count and to the byte bound alike. vllm-mlx 0.6.0's
-# count_tokens encodes the text, tool inputs, tool results and tool definitions one by one, without the chat template
-# around them (server.count_anthropic_tokens). Qwen3's template adds <|im_start|>role / <|im_end|> per message (~5
-# tokens), <tool_call> / <tool_response> wrappers and the tool's name per block (~10-20), the OpenAI-shaped
-# {"type": "function", "function": ...} wrapper per tool definition (~20) and a fixed tool-use preamble (~300). Each
-# allowance is about double that: 1024 + 16 per message + 32 per block + 64 per tool. At 64 KiB per token the fixed
-# part reserves 64 MiB.
+# Template tokens: the only prompt text that does not come from the request body. Qwen3's chat template adds
+# <|im_start|>role / <|im_end|> per message (~5 tokens), <tool_call> / <tool_response> wrappers and the tool's name per
+# block (~10-20), the OpenAI-shaped {"type": "function", "function": ...} wrapper per tool definition (~20) and a fixed
+# tool-use preamble (~300). Each allowance is about double that: 1024 + 16 per message + 32 per block + 64 per tool. At
+# 64 KiB per token the fixed part reserves 64 MiB. Counted as tokens, the allowance is also at least as many BYTES as the
+# template text, so it stays an upper bound under "a token covers at least one byte".
 TEMPLATE_TOKENS_FIXED = 1024
 TEMPLATE_TOKENS_PER_MESSAGE = 16
 TEMPLATE_TOKENS_PER_BLOCK = 32
 TEMPLATE_TOKENS_PER_TOOL = 64
+# Instruction text vllm-mlx 0.6.0 writes into the system prompt from outside the body: the response_format instruction
+# (api/tool_calling.build_json_system_prompt, ~480 bytes at its longest) and the forced tool_choice one (server, ~190
+# bytes besides the tool's name). Rounded up like the template allowance.
+INJECTED_TEXT_BYTES = 1024
 PRESSURES = ("normal", "warn", "critical")
 PRESSURE_LEVELS = {1: "normal", 2: "warn", 4: "critical"}
 SIGNAL_TIMEOUT_S = 2.0                     # each signal command; ioreg and sysctl answer in milliseconds
@@ -195,50 +194,6 @@ def bytes_tokens(cfg: dict[str, Any], free: int) -> int:
     return 0 if room < 0 else min(cfg["context_tokens"], room // cfg["kv_bytes_per_token"])
 
 
-def _utf8(s: Any) -> int:
-    return len(s.encode("utf-8", "surrogatepass")) if isinstance(s, str) else 0
-
-
-def _json_bytes(v: Any) -> int:
-    """JSON as the backend renders a tool input or definition (json.dumps, ASCII-escaped: never shorter than the
-    UTF-8 text it stands for)."""
-    try:
-        return len(json.dumps(v))
-    except (TypeError, ValueError, RecursionError):
-        return len(repr(v).encode("utf-8", "surrogatepass"))
-
-
-def _content_bytes(content: Any) -> int:
-    """The bytes of a system prompt, message content or tool_result content the model will see. Text, thinking,
-    tool_use (name + input JSON) and tool_result (its text) by their text; an image by its source (base64 data or URL,
-    far more bytes than the image's tokens); any other block by its whole JSON, so nothing is ever left out."""
-    if content is None:
-        return 0
-    if isinstance(content, str):
-        return _utf8(content)
-    if not isinstance(content, list):
-        return _json_bytes(content)
-    total = 0
-    for block in content:
-        if isinstance(block, str):
-            total += _utf8(block)
-        elif not isinstance(block, dict):
-            total += _json_bytes(block)
-        elif block.get("type") == "text" and isinstance(block.get("text"), str):
-            total += _utf8(block["text"])
-        elif block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
-            total += _utf8(block["thinking"])        # vllm-mlx 0.6.0 drops past thinking; counted all the same
-        elif block.get("type") == "tool_use":
-            total += _utf8(block.get("name")) + _utf8(block.get("id")) + _json_bytes(block.get("input") or {})
-        elif block.get("type") == "tool_result":
-            total += _utf8(block.get("tool_use_id")) + _content_bytes(block.get("content"))
-        elif block.get("type") == "image":
-            total += _json_bytes(block.get("source"))
-        else:
-            total += _json_bytes(block)
-    return total
-
-
 def _messages(body: dict[str, Any]) -> list:
     m = body.get("messages")
     return m if isinstance(m, list) else []
@@ -257,15 +212,6 @@ def template_tokens(body: dict[str, Any]) -> int:
     blocks += len(system) if isinstance(system, list) else 0
     return (TEMPLATE_TOKENS_FIXED + TEMPLATE_TOKENS_PER_MESSAGE * len(msgs) + TEMPLATE_TOKENS_PER_BLOCK * blocks
             + TEMPLATE_TOKENS_PER_TOOL * len(_tools(body)))
-
-
-def input_bound_bytes(body: dict[str, Any]) -> int:
-    """The UTF-8 bytes of the text the model will see: system, every message's content (_content_bytes) and every tool
-    definition's JSON. A hard upper bound on its tokens (a BPE token covers at least one byte)."""
-    total = _content_bytes(body.get("system"))
-    for m in _messages(body):
-        total += _content_bytes(m.get("content")) if isinstance(m, dict) else _json_bytes(m)
-    return total + sum(_json_bytes(t) for t in _tools(body))
 
 
 # The content block types a text-only model can take (message content): text, past thinking (vllm-mlx 0.6.0 drops it)
@@ -301,95 +247,92 @@ def non_text_content(body: dict[str, Any]) -> str | None:
     return None
 
 
-# What vllm-mlx's adapter (api/anthropic_adapter.anthropic_to_openai) sends for a tool defined without input_schema.
-_DEFAULT_SCHEMA_BYTES = len(json.dumps({"type": "object", "properties": {}}))
+# What vllm-mlx's adapter (api/anthropic_adapter._convert_tool) sends for a tool defined without input_schema.
+_DEFAULT_SCHEMA = {"type": "object", "properties": {}}
 
 
-def uncounted_bytes(body: dict[str, Any]) -> int:
-    """The UTF-8 bytes of what the model will see that vllm-mlx 0.6.0's count leaves out. Read from its source
-    (server.count_anthropic_tokens against api/anthropic_adapter): the count encodes a system string, every system
-    block's "text", a message string, every content block's "text", a truthy "input" (as JSON), a tool_result's string
-    content or its dict items' "text", and each tool's name, description and input_schema. The adapter sends, besides:
+def _dumped_bytes(value: Any, left: int, indent: int | None = None) -> int:
+    """len(json.dumps(value, indent=indent)): ASCII-escaped, so its characters are its bytes, and never shorter than the
+    same value as vllm-mlx renders it (the adapter's json.dumps, the template's tojson with ensure_ascii=False, both with
+    the ", " / ": " separators). Counted chunk by chunk (iterencode) and stopped once past `left`, so a 32 MiB body or a
+    deep schema under indent is never built in memory. A value too deep to encode counts as `left + 1` (over the cap)."""
+    n = 0
+    try:
+        for chunk in json.JSONEncoder(indent=indent).iterencode(value):
+            n += len(chunk)
+            if n > left:
+                break
+    except (RecursionError, ValueError, TypeError):
+        return left + 1
+    return n
 
-      * a tool_use block's name and id (the assistant's tool call) and its input as "{}" when empty;
-      * a tool_result block's tool_use_id, and plain STRING items of its content list (joined into the tool message);
-      * plain string entries of a system list;
-      * the default {"type": "object", "properties": {}} of a tool without input_schema.
 
-    A tool_result whose content is neither a string nor a list (vllm-mlx's model refuses it, but it is counted all the
-    same) and any block the count does not know are added whole. Past thinking is neither counted nor sent (the adapter
-    drops it). Bytes >= tokens (input_bound_bytes), so adding these bytes to the count can only over-reserve."""
+def reserialized_bytes(body: dict[str, Any], left: int = sys.maxsize) -> int:
+    """The bytes of what vllm-mlx 0.6.0 RE-SERIALIZES instead of copying, each as long as its widest rendering, plus
+    the instruction text it adds from outside the body (INJECTED_TEXT_BYTES). Re-serialization can be longer than the
+    body bytes it came from (compact JSON gains ", " / ": " separators, non-ASCII text becomes \\uXXXX, indent=2 adds
+    a line and its indentation per value), so these are added IN FULL on top of the body bytes (docs/LOCAL-RESOURCES.md
+    "The input bound"):
+
+      * every tool definition, as the OpenAI-shaped tool the template renders with tojson (wrapper and the default
+        schema of a tool without input_schema included);
+      * every tool_use block's input (the adapter's json.dumps arguments; the template's tojson of them);
+      * response_format, as json.dumps(..., indent=2) (build_json_system_prompt dumps its schema that way), plus
+        its instruction text;
+      * a forced tool_choice ("any" or "tool"): its instruction text and the tool_choice itself (the name is written
+        twice).
+
+    Stops counting once past `left` (input_tokens' cap)."""
     total = 0
-    system = body.get("system")
-    if isinstance(system, list):
-        for s in system:
-            if isinstance(s, str):
-                total += _utf8(s)
-            elif not isinstance(s, dict) or not (isinstance(s.get("text"), str) and s["text"]):
-                total += _json_bytes(s)
-    for m in _messages(body):
-        if not isinstance(m, dict):
-            total += _json_bytes(m)
-            continue
-        content = m.get("content")
-        if isinstance(content, str) or content is None:
-            continue
-        if not isinstance(content, list):
-            total += _json_bytes(content)
-            continue
-        for b in content:
-            if not isinstance(b, dict):
-                total += _utf8(b) if isinstance(b, str) else _json_bytes(b)
-                continue
-            kind = b.get("type")
-            if kind == "text" or kind in ("thinking", "redacted_thinking"):
-                continue                     # text counted; thinking dropped by the adapter
-            if kind == "tool_use":
-                total += _utf8(b.get("name")) + _utf8(b.get("id")) + (0 if b.get("input") else 2)
-            elif kind == "tool_result":
-                total += _utf8(b.get("tool_use_id"))
-                sub = b.get("content")
-                if isinstance(sub, list):
-                    for item in sub:
-                        if isinstance(item, str):
-                            total += _utf8(item)
-                        elif not (isinstance(item, dict) and isinstance(item.get("text"), str)):
-                            total += _json_bytes(item)
-                elif sub is not None and not isinstance(sub, str):
-                    total += len(str(sub).encode("utf-8", "surrogatepass"))
-            else:
-                total += _json_bytes(b)      # an image, a document, anything unknown: the whole block
+
+    def add(value: Any, indent: int | None = None) -> None:
+        nonlocal total
+        if total <= left:
+            total += _dumped_bytes(value, left - total, indent)
+
     for t in _tools(body):
-        if isinstance(t, dict) and not t.get("input_schema"):
-            total += _DEFAULT_SCHEMA_BYTES
+        add({"type": "function", "function": {"name": t.get("name"), "description": t.get("description") or "",
+                                              "parameters": t.get("input_schema") or _DEFAULT_SCHEMA}}
+            if isinstance(t, dict) else t)
+    for m in _messages(body):
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    add(b.get("input") or {})
+    if body.get("response_format"):
+        total += INJECTED_TEXT_BYTES
+        add(body["response_format"], indent=2)       # a superset of its schema under the same indent
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict) and choice.get("type") in ("any", "tool"):
+        total += INJECTED_TEXT_BYTES
+        add(choice)
     return total
 
 
-def input_tokens(body: Any, counted: Any = None) -> tuple[int, str]:
-    """(input tokens, "counted" | "bound") for a request (module docstring). The backend's count is never trusted
-    alone: with `counted` a non-negative integer, the input is
-        counted + uncounted_bytes(body) + template_tokens(body)
-    (what the count saw, the bytes of what it left out, the template), never more than the byte bound (a hard upper
-    bound by itself); without one, the byte bound plus the allowance. `body` is the parsed request; anything else (bytes
-    that are not a JSON object) is bounded by its own length."""
-    if isinstance(body, (bytes, bytearray)):
-        try:
-            body = json.loads(body)
-        except (ValueError, RecursionError):
-            return len(body), "bound"
-        if not isinstance(body, dict):
-            return len(json.dumps(body)), "bound"
+def input_tokens(raw: bytes, cap: int | None = None) -> int:
+    """An upper bound on a turn's input tokens, never an estimate (docs/LOCAL-RESOURCES.md "The input bound"):
+        len(raw) + template_tokens(body) + reserialized_bytes(body)
+    capped at `cap` (the model's context; None: uncapped). `raw` is the request body EXACTLY as the client sent it:
+    every character the model sees from the body costs at least one byte there, a byte-level BPE token covers at least
+    one byte, the template allowance covers the template's own text and reserialized_bytes what vllm-mlx writes wider
+    than it came. A body that is not a JSON object is bounded by its length plus the fixed allowance."""
+    limit = sys.maxsize if cap is None else max(0, int(cap))
+    raw = bytes(raw)
+    try:
+        body = json.loads(raw)
+    except (ValueError, RecursionError):
+        body = None
     if not isinstance(body, dict):
-        return _json_bytes(body), "bound"
-    allowance = template_tokens(body)
-    bound = input_bound_bytes(body) + allowance
-    if isinstance(counted, int) and not isinstance(counted, bool) and counted >= 0:
-        return min(bound, counted + uncounted_bytes(body) + allowance), "counted"
-    return bound, "bound"
+        return min(limit, len(raw) + TEMPLATE_TOKENS_FIXED)
+    total = len(raw) + template_tokens(body)
+    if total < limit:
+        total += reserialized_bytes(body, limit - total)
+    return min(limit, total)
 
 
 def request_tokens(cfg: dict[str, Any], input_tokens: int, max_tokens: Any) -> int:
-    """The context a request will hold: its input tokens (input_tokens(): exact or a hard bound) plus the output it may
+    """The context a request will hold: its input tokens (input_tokens(): an upper bound) plus the output it may
     write (max_tokens; default_max_tokens when absent or not a positive integer), capped at context_tokens."""
     out = max_tokens if isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0 \
         else cfg["default_max_tokens"]
@@ -485,16 +428,11 @@ NO_GOVERNOR = {"limit": None, "owner": None, "pressure": None, "reason": "no gov
 
 
 class Ticket:
-    """One request's hold on the admission: a COUNT slot (acquire_slot) and the bytes it reserved (0 until reserve()).
-    release() gives both back, once (a second call, from a later finally or error path, does nothing)."""
+    """One admitted request's hold: a COUNT slot and the bytes it reserved. release() gives both back, once (a second
+    call, from a later finally or error path, does nothing)."""
 
     def __init__(self, admission: "Admission", reserved: int):
         self._admission, self.reserved, self._done = admission, reserved, False
-
-    def reserve(self, nbytes: int) -> tuple[bool, dict[str, Any]]:
-        """Add the request's byte reservation to its slot: (True, report) when it fits; otherwise (False, report with
-        "refused": "busy" | "too_large") and the slot is released here (Admission._reserve)."""
-        return self._admission._reserve(self, nbytes)
 
     def release(self) -> None:
         self._admission._release(self)
@@ -502,9 +440,10 @@ class Ticket:
 
 class Admission:
     """The gate's admission: try_acquire(reserve) admits a request while fewer than the governor's COUNT limit run AND
-    its reservation fits the BYTES left (module docstring). No governor (None) is unlimited, today's behaviour for an
-    Ollama node. A refused request is never queued here: the gate answers at once, a retryable 529 when the node is
-    full now, a non-retryable refusal when the request could never fit (`too_large`)."""
+    its reservation fits the BYTES left (module docstring), both checked and taken in one step under one lock. No
+    governor (None) is unlimited, today's behaviour for an Ollama node. A refused request is never queued here: the
+    gate answers at once, a retryable 529 when the node is full now, a non-retryable refusal when the request could
+    never fit (`too_large`)."""
 
     def __init__(self, governor: Governor | None):
         self.governor = governor
@@ -532,64 +471,40 @@ class Admission:
         with self._lock:
             return self._report(g)
 
+    @property
+    def context_tokens(self) -> int | None:
+        """The served model's context (input_tokens' cap), None without a governor."""
+        return self.governor.cfg["context_tokens"] if self.governor else None
+
     def request_bytes(self, input_tokens: int, max_tokens: Any) -> int:
         """The reservation a request asks for (0 without a governor: nothing is budgeted)."""
         return request_bytes(self.governor.cfg, input_tokens, max_tokens) if self.governor else 0
 
-    def acquire_slot(self) -> tuple[Ticket | None, dict[str, Any]]:
-        """Phase one: a COUNT slot holding no bytes yet, (ticket, report), or (None, report with "refused": "busy")
-        when the count limit is reached. The gate takes it BEFORE asking the backend for the token count, so no more
-        counts run than turns may (a count is synchronous tokenization on vllm-mlx's event loop), then calls
-        ticket.reserve(bytes) with the counted size. No governor: always a slot."""
+    def try_acquire(self, reserve: int = 0) -> tuple[Ticket | None, dict[str, Any]]:
+        """(ticket, report) when admitted; (None, report) when not, report["refused"] saying why: "too_large" (more
+        than the whole budget beside the weights: never, even when the count is full too) or "busy" (the count limit
+        or the bytes left now; retryable). The count slot and the bytes are taken together, atomically."""
         g = self.governor.current() if self.governor else NO_GOVERNOR
         with self._lock:
-            limit = g["limit"] if self.governor is not None else None
-            if limit is not None and self.inflight >= limit:
-                return None, {**self._report(g), "refused": "busy"}
-            self.inflight += 1
-            return Ticket(self, 0), self._report(g)
-
-    def _reserve(self, ticket: Ticket, nbytes: int) -> tuple[bool, dict[str, Any]]:
-        """Phase two (Ticket.reserve): the bytes beside the reservations in flight. Refused: "too_large" (more than
-        the whole budget beside the weights: never) or "busy" (not now); either way the slot is given back here."""
-        g = self.governor.current() if self.governor else NO_GOVERNOR
-        with self._lock:
-            if ticket._done:                 # released meanwhile (never in the gate): nothing to add to
-                return False, {**self._report(g), "refused": "busy"}
             if self.governor is None:
-                return True, self._report(g)
-            nbytes = max(0, int(nbytes))
+                self.inflight += 1
+                return Ticket(self, 0), self._report(g)
+            nbytes = max(0, int(reserve))
             avail = available_bytes(self.governor.cfg)
             refused = None
             if nbytes > avail:
                 refused = {"refused": "too_large", "reason": f"request needs {_gib(nbytes)} GiB, more than the "
                                                              f"{_gib(avail)} GiB budget beside the weights"}
+            elif g["limit"] is not None and self.inflight >= g["limit"]:
+                refused = {"refused": "busy"}                       # the sample's reason: owner / pressure
             elif self.reserved + nbytes > avail:
                 refused = {"refused": "busy", "reason": f"memory budget: {_gib(avail - self.reserved)} GiB free, "
                                                         f"request needs {_gib(nbytes)} GiB"}
             if refused is not None:
-                self._release_locked(ticket)
-                return False, {**self._report(g), **refused, "request_bytes": nbytes}
-            ticket.reserved += nbytes
+                return None, {**self._report(g), **refused, "request_bytes": nbytes}
+            self.inflight += 1
             self.reserved += nbytes
-            return True, self._report(g)
-
-    def try_acquire(self, reserve: int = 0) -> tuple[Ticket | None, dict[str, Any]]:
-        """Both phases at once: (ticket, report) when admitted; (None, report) when not, report["refused"] saying why:
-        "busy" (the count limit or the bytes left; retryable) or "too_large" (more than the whole budget beside the
-        weights: never). A request that could never fit is "too_large" even when the count is full."""
-        if self.governor is not None and max(0, int(reserve)) > available_bytes(self.governor.cfg):
-            g = self.governor.current()
-            nbytes, avail = max(0, int(reserve)), available_bytes(self.governor.cfg)
-            with self._lock:
-                return None, {**self._report(g), "refused": "too_large", "request_bytes": nbytes,
-                              "reason": f"request needs {_gib(nbytes)} GiB, more than the {_gib(avail)} GiB budget "
-                                        "beside the weights"}
-        ticket, report = self.acquire_slot()
-        if ticket is None:
-            return None, {**report, "request_bytes": max(0, int(reserve))}
-        ok, report = ticket.reserve(reserve)
-        return (ticket if ok else None), report
+            return Ticket(self, nbytes), self._report(g)
 
     def _release_locked(self, ticket: Ticket) -> None:
         if ticket._done:
