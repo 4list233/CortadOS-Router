@@ -88,8 +88,11 @@ ROUTES = {("GET", "/api/tags"), ("POST", "/v1/messages")}
 SWITCH_PATH = "/cortados/local-switch"
 # A switch request body is {"on": true} or {"on": false}; 1 KiB is ample, and a larger one is refused unread.
 SWITCH_MAX_BODY = 1024
-# The status asks Ollama which models are loaded (GET /api/ps on loopback). It answers in milliseconds; 2 s bounds a
-# hung Ollama so the status still answers (with the models unknown). At most this many names are reported.
+# The status asks Ollama which models are loaded (GET /api/ps on loopback). A loopback connect takes microseconds (1 s
+# says "Ollama is not running") and the answer milliseconds; 2 s bounds a hung Ollama, so the whole status (pmset's own
+# 2 s cap included) stays under the provider's 6 s wait (provider/local_switch.GATE_TIMEOUT_S) and still answers, with
+# the models unknown. At most PS_MAX_MODELS names are reported.
+PS_CONNECT_S = 1.0
 PS_TIMEOUT_S = 2.0
 PS_MAX_MODELS = 32
 PS_MAX_BYTES = 1024 * 1024
@@ -476,7 +479,7 @@ class GateHandler(BaseHTTPRequestHandler):
         """(names, "up") from Ollama's GET /api/ps on loopback, or (None, "unreachable" | "unreadable"). Names only:
         sizes, digests and expiry times stay on the node."""
         conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port,
-                                          timeout=min(self.server.connect_timeout, PS_TIMEOUT_S))
+                                          timeout=min(self.server.connect_timeout, PS_CONNECT_S))
         try:
             try:
                 conn.connect()
