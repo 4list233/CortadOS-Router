@@ -525,7 +525,11 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   changes in an autostash in the worktree's own git dir (`MERGE_AUTOSTASH`, `rebase-merge/autostash`,
   `rebase-apply/autostash`) that is never on a remote, so it always holds, `reason_code` `unpushed_autostash`; every
   commit a stopped rebase, cherry-pick/revert sequence, bisect or notes merge names in its state files must be on a
-  remote, and a stopped `git am` holds outright, `unpushed_operation_state`. `ORIG_HEAD` and the worktree's reflogs do
+  remote, and a stopped `git am` holds outright, `unpushed_operation_state` (only the commit-id fields of those files
+  are read, e.g. `pick <id>` in a todo, never subjects or messages; an id there may be as short as git's 4-digit
+  `core.abbrev` and must resolve as `<id>^{commit}` to one commit, or it holds). A state file that exists but cannot be
+  read, is not a regular file, is malformed (an `ORIG_HEAD` that is not one object id) or is past a size cap holds the
+  folder, `unreadable_git_state`; only a missing file counts as absent. `ORIG_HEAD` and the worktree's reflogs do
   not hold, since every reset, amend or rebase writes them; instead, before the folder is archived (and again before
   the cleanup deletes it) every commit only they reach gets a recovery ref in the clone,
   `refs/cortados-recovery/<YYYYMMDD>/<task_id>/orig-head` or `.../reflog-<n>`, dated with the UTC day it was created
@@ -588,8 +592,12 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   commits are kept by its recovery refs (above) before it is ever deleted. Recovery refs expire 30 days after they
   were created (owner, 2026-11-14; `RECOVERY_REF_RETENTION_S`): each cleanup deletes, in every clone, the refs under
   `refs/cortados-recovery/` whose creation day (in the ref's own name, written in the same transaction as the ref, so
-  no separate index can disagree with it) ended 30 days ago or more, each with `git update-ref -d <ref> <old value>`
-  so a ref that moved since it was read is kept (reported as an error); nothing outside that namespace is touched.
+  no separate index can disagree with it) ended 30 days ago or more, each with `git update-ref --no-deref -d <ref>
+  <old value>` so a ref that moved since it was read is kept (reported as an error); nothing outside that namespace is
+  touched. A symbolic ref in the namespace (never made by this module) is never followed, renamed or deleted; it is
+  reported as an error for the owner to remove by hand. Known limit: a clone with the reftable ref backend
+  (`extensions.refStorage=reftable`) keeps its reflogs where this module cannot read them, so every worktree of such a
+  clone is held (`unreadable_git_state`): safe, but noisy.
   An undated ref from the first layout (`refs/cortados-recovery/<task_id>/...`) is renamed to today's date the first
   time a cleanup sees it, so it is kept 30 days from then, never deleted at once. The report carries counts only:
   `recovery_refs_expired`, `recovery_refs_dated`. `settle()`

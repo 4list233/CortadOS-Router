@@ -2530,6 +2530,141 @@ class OperationStateAndRecoveryTests(_Base):
         with self.assertRaises(ws.WorkspaceError):
             ws.preserve_recovery_refs(rec["path"], "../../heads/main")
 
+    # --- review 5 (gpt-6.1-sol): unreadable state, short ids ---------------------------------------------------
+
+    def only_orig_head(self, path):
+        """An unpublished commit that ORIG_HEAD alone names (no reflog, no ref): the reviewer's reproduction."""
+        sha = git("commit-tree", "-p", "HEAD", "-m", "only in ORIG_HEAD", "HEAD^{tree}", cwd=path).strip()
+        orig = os.path.join(self.gitdir(path), "ORIG_HEAD")
+        with open(orig, "w") as f:
+            f.write(sha + "\n")
+        return sha, orig
+
+    def test_an_unreadable_or_malformed_orig_head_holds_and_is_never_taken_as_missing(self):
+        """Review 5, P1 #2: _read_small() returned None for an unreadable ORIG_HEAD, so its only commit got no
+        recovery ref (`recovery_refs=0`), the worktree was archived, and the cleanup deleted it."""
+        def unreadable(orig):
+            os.chmod(orig, 0)
+
+        def malformed(orig):
+            with open(orig, "w") as f:
+                f.write("not an object id\n")
+
+        def directory(orig):
+            os.remove(orig)
+            os.mkdir(orig)
+        cases = [malformed, directory] + ([unreadable] if os.geteuid() != 0 else [])
+        for i, spoil in enumerate(cases):
+            tid = "t2026111416%02d00-000000%02x" % (i, 0xa0 + i)
+            with self.subTest(spoil=spoil.__name__):
+                rec = self.prepare(tid, repo=self.origin, branch="feature" if not i else None)
+                sha, orig = self.only_orig_head(rec["path"])
+                spoil(orig)
+                ok, reason, _ = ws.assess(rec["path"])
+                self.assertEqual((ok, reason.code), (False, "unreadable_git_state"), reason)
+                with self.assertRaises(ws.StateUnreadableError):
+                    ws.preserve_recovery_refs(rec["path"], tid)
+                settled = ws.settle(rec, self.root)
+                held = os.path.join(self.root, "held", tid)
+                self.assertEqual((settled["state"], settled["path"], settled["reason_code"]),
+                                 ("held", held, "unreadable_git_state"), settled)
+                self.assertEqual(self.recovery(tid), {})
+                self.assertEqual(git("cat-file", "-t", sha, cwd=held).strip(), "commit")
+
+    def test_an_orig_head_made_unreadable_in_an_archived_worktree_holds_at_cleanup(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-0 file")
+        rec = ws.settle(self.prepare(repo=self.origin, branch="feature"), self.root)
+        self.assertEqual(rec["state"], "archived", rec)
+        self.age(rec)
+        sha, orig = self.only_orig_head(rec["path"])
+        os.chmod(orig, 0)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [], report)
+        idx = ws.read_index(self.root)[TID]
+        self.assertEqual((idx["state"], idx["reason_code"]), ("held", "unreadable_git_state"), idx)
+        self.assertEqual(git("cat-file", "-t", sha, cwd=idx["path"]).strip(), "commit")
+
+    def test_unreadable_operation_state_files_hold(self):
+        """Review 5, P1 #2, every state file: a directory or an unreadable file where a sequencer, rebase or bisect
+        file should be is not proven published."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        gitdir = self.gitdir(rec["path"])
+        for rel in ("BISECT_LOG", "sequencer/todo", "rebase-merge/done"):
+            with self.subTest(rel=rel):
+                full = os.path.join(gitdir, rel)
+                os.makedirs(full)
+                ok, reason, _ = ws.assess(rec["path"])
+                self.assertEqual((ok, reason.code), (False, "unreadable_git_state"), reason)
+                self.assertIn(rel, reason)
+                shutil.rmtree(os.path.join(gitdir, rel.split("/")[0]))
+        if os.geteuid() != 0:
+            os.makedirs(os.path.join(gitdir, "sequencer"))
+            todo = os.path.join(gitdir, "sequencer", "todo")
+            with open(todo, "w") as f:
+                f.write("pick " + self.head(rec["path"]) + " published\n")
+            self.assertEqual(ws.assess(rec["path"])[0], True)
+            os.chmod(todo, 0)
+            ok, reason, _ = ws.assess(rec["path"])
+            self.assertEqual((ok, reason.code), (False, "unreadable_git_state"), reason)
+            os.chmod(todo, 0o600)
+
+    def test_a_cherry_pick_sequence_with_four_char_ids_naming_an_unpublished_commit_holds(self):
+        """Review 5, P1 #3: with core.abbrev=4 sequencer/todo names commits by 4 hex digits; the 7+ digit scan
+        missed them, and the worktree was judged pushed and deleted."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        path = rec["path"]
+        git("config", "core.abbrev", "4", cwd=path)
+        local = self.commit(path, "local.txt")
+        git("reset", "-q", "--hard", "origin/feature", cwd=path)
+        stopped = self.run_git("cherry-pick", "origin/side", local, cwd=path)
+        self.assertNotEqual(stopped.returncode, 0)
+        git("reset", "-q", "--hard", cwd=path)
+        self.clean(path)
+        with open(os.path.join(self.gitdir(path), "sequencer", "todo")) as f:
+            todo = f.read()
+        self.assertRegex(todo, r"(?m)^pick %s " % local[:4], todo)
+        self.assertNotIn(local[:7], todo)                  # really abbreviated below the old 7-digit floor
+        ok, reason, _ = ws.assess(path)
+        self.assertEqual((ok, reason.code), (False, "unpushed_operation_state"), reason)
+        self.assertIn("sequencer/todo", reason)
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "unpushed_operation_state"), settled)
+
+    def test_short_hex_words_in_subjects_do_not_hold_and_unresolvable_ids_do(self):
+        """Only commit-id fields are read: a published sequence whose subjects are full of short hex words is
+        archived; an id in a commit position that resolves to no commit (or several) holds."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        path = rec["path"]
+        git("config", "core.abbrev", "4", cwd=path)
+        for name in ("a.txt", "b.txt"):
+            with open(os.path.join(path, name), "w") as f:
+                f.write(name)
+            git("add", name, cwd=path)
+            git("commit", "-q", "-m", "fix cafe beef dead 1234 abcdef0 feed " + name, cwd=path)
+        picks = git("rev-list", "--reverse", "origin/feature..HEAD", cwd=path).split()
+        git("push", "-q", "origin", "HEAD:refs/heads/published", cwd=path)
+        git("reset", "-q", "--hard", "origin/feature", cwd=path)
+        stopped = self.run_git("cherry-pick", "origin/side", *picks, cwd=path)
+        self.assertNotEqual(stopped.returncode, 0)
+        git("reset", "-q", "--hard", cwd=path)
+        todo = os.path.join(self.gitdir(path), "sequencer", "todo")
+        with open(todo) as f:
+            text = f.read()
+        self.assertIn("cafe beef dead 1234", text)
+        ok, reason, _ = ws.assess(path)
+        self.assertEqual(ok, True, reason)
+        for line in ("pick ffff0000 no such commit\n", "revert " + git("rev-parse", "HEAD^{tree}", cwd=path)[:12]
+                     + " a tree, not a commit\n", "merge -C fffe " + "label # x\n", "reset abcd\n"):
+            with self.subTest(line=line):
+                with open(todo, "w") as f:
+                    f.write(text + line)
+                ok, reason, _ = ws.assess(path)
+                self.assertEqual((ok, reason.code), (False, "unpushed_operation_state"), reason)
+        with open(todo, "w") as f:                          # a label defined in the todo is a label, not an id
+            f.write(text + "label beef\nreset beef\n# pick 0bad comment\nexec echo dead\n")
+        self.assertEqual(ws.assess(path)[0], True)
+
 
 class RecoveryRefExpiryTests(_Base):
     """Owner decision 2026-11-14: recovery refs expire 30 days after creation; the daily cleanup deletes them, only
@@ -2610,6 +2745,50 @@ class RecoveryRefExpiryTests(_Base):
         self.assertEqual(len(report["errors"]), 1, report)
         self.assertIn("changed since read", report["errors"][0])
         self.assertEqual(self.refs(ws.RECOVERY_REF_PREFIX), {ref: self.main})
+
+    def test_a_symbolic_recovery_ref_is_never_followed_and_is_reported(self):
+        """Review 5, P1 #1: `update-ref -d` through an expired symbolic recovery ref deleted the branch it named (and
+        the cleanup reported success); the undated-ref rename followed it the same way."""
+        P = ws.RECOVERY_REF_PREFIX
+        valuable, other = self.put("refs/heads/valuable"), self.put("refs/heads/valuable-2", self.main)
+        expired_sym = f"{P}{self.day(40)}/{TID}/orig-head"
+        legacy_sym = f"{P}{TID2}/reflog-1"
+        git("symbolic-ref", expired_sym, valuable, cwd=self.clone)
+        git("symbolic-ref", legacy_sym, other, cwd=self.clone)
+        plain = self.put(f"{P}{self.day(40)}/{TID2}/orig-head")             # an ordinary expired ref still goes
+        before = self.refs()
+        report = ws.cleanup_archive(self.root, now=self.NOW)
+        self.assertEqual((report["recovery_refs_expired"], report["recovery_refs_dated"]), (1, 0), report)
+        self.assertEqual(len(report["errors"]), 1, report)
+        self.assertIn("2 symbolic ref(s)", report["errors"][0])
+        after = self.refs()
+        self.assertEqual((after.get(valuable), after.get(other)), (before[valuable], before[other]))
+        self.assertNotIn(plain, after)
+        for sym, target in ((expired_sym, valuable), (legacy_sym, other)):
+            self.assertEqual(git("symbolic-ref", sym, cwd=self.clone).strip(), target)
+        done = ws.expire_recovery_refs(self.clone, self.NOW + 365 * 86400)
+        self.assertEqual((done["expired"], done["dated"], done["symbolic"]), (0, 0, 2), done)
+        self.assertEqual({r: self.refs().get(r) for r in (valuable, other)}, {valuable: before[valuable],
+                                                                              other: before[other]})
+
+    def test_expiry_writes_never_dereference(self):
+        """Every update-ref the expiry runs passes --no-deref: a ref turned symbolic after it was listed is
+        written as itself, never through to its target."""
+        P = ws.RECOVERY_REF_PREFIX
+        self.put(f"{P}{self.day(40)}/{TID}/orig-head")
+        self.put(f"{P}{TID2}/reflog-1")
+        seen, real = [], ws._git
+
+        def spy(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
+            if "update-ref" in args:
+                seen.append(list(args))
+            return real(args, cwd=cwd, timeout=timeout, **kw)
+        with mock.patch.object(ws, "_git", side_effect=spy):
+            done = ws.expire_recovery_refs(self.clone, self.NOW)
+        self.assertEqual((done["expired"], done["dated"]), (1, 1), done)
+        self.assertEqual(len(seen), 2)
+        for args in seen:
+            self.assertIn("--no-deref", args)
 
     def test_a_new_recovery_ref_is_dated_with_its_creation_day(self):
         path = os.path.join(self.root, "active", TID)
