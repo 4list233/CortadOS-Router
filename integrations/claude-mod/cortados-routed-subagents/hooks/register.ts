@@ -793,12 +793,20 @@ export async function isRoutedChild($: any): Promise<boolean> {
 /** This mod's and the pane's plugin ids: disabled in the child's flag settings (its user settings are not loaded). */
 export const CHILD_DISABLED_PLUGINS = ['cortados-routed-subagents@cortados-router', 'cortados-pulse@cortados-router']
 export const HOOK_PYTHON_DEFAULT = '/usr/bin/python3'
+/** The shell guard around the hook's interpreter: cortados_router/session.py BOUNDARY_HOOK_GUARD_HEAD/TAIL, verbatim
+ * (tests/test_boundary_hook.py keeps them equal). It buffers the event, runs the interpreter in a subshell from /,
+ * passes exits 0 and 2 through and, when the interpreter cannot start or fails otherwise (126, 127, a broken
+ * /usr/bin/python3 shim, a crash), denies a call whose tool_use_id starts with toolu_cxb_ and allows any other. Claude
+ * Code treats every hook exit but 2 as non-blocking, so without it a missing interpreter would fail open. */
+export const BOUNDARY_HOOK_GUARD_HEAD = String.raw`ev=$(/bin/cat) || { printf 'cortados boundary: denied: the hook could not read its input. Nothing was run.\n' >&2; exit 2; }; printf '%s\n' "$ev" | (cd / && exec `
+export const BOUNDARY_HOOK_GUARD_TAIL = String.raw`); rc=$?; [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 2 ] && exit 2; f=$(printf '%s' "$ev" | /usr/bin/tr '\n\r\t' '   '); id=; printf '%s\n' "$f" | /usr/bin/grep -q '"tool_use_id"[[:space:]]*:.*"tool_use_id"[[:space:]]*:'; if [ "$?" -eq 1 ]; then id=$(printf '%s\n' "$f" | /usr/bin/sed -n 's/^.*"tool_use_id"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9_-]\{1,\}\)".*$/\1/p'); fi; case $id in toolu_cxb_*) m=1;; ?*) m=0;; *) case $ev in *'"toolu_cxb_'*) m=1;; *) m=0;; esac;; esac; if [ "$m" = 1 ]; then printf 'cortados boundary: denied: the hook did not run (exit %s), and a provider-marked call fails closed. Nothing was run.\n' "$rc" >&2; exit 2; fi; exit 0`
 /** The boundary hook's command (docs/BOUNDARY-HOOK.md "Isolation"): from / (the hook runs with the project, which the
  * model may write, as its working directory), on an absolute interpreter (no PATH lookup), in isolated mode (-I: neither
- * the working directory nor a script folder on sys.path, no PYTHON* variables, no user site-packages), the source
- * inline (-c: no hook file on disk the model could reach). */
+ * the working directory nor a script folder on sys.path, no PYTHON* variables, no user site-packages), without the
+ * site import (-S: no site-packages .pth can run project code first), the source inline (-c: no hook file on disk the
+ * model could reach), inside the shell guard (fails closed for a marked call when the interpreter cannot run). */
 export function boundaryHookCommand(python: string = HOOK_PYTHON_DEFAULT): string {
-  return 'cd / && exec ' + shQuote(python) + ' -I -B -c ' + shQuote(BOUNDARY_HOOK_PY)
+  return BOUNDARY_HOOK_GUARD_HEAD + shQuote(python) + ' -I -S -B -c ' + shQuote(BOUNDARY_HOOK_PY) + BOUNDARY_HOOK_GUARD_TAIL
 }
 /** path is folder itself or lies below it (both absolute). */
 function pathWithin(path: string, folder: string): boolean {
@@ -814,13 +822,24 @@ async function realPathOf($: any, p: string): Promise<string | undefined> {
     return undefined
   }
 }
-/** The configured hookPython, checked: absolute, no `.`/`..` segment or control character, and neither it nor its real
- * path inside the session's project folder (lexical or real). Throws the reason otherwise; the routed launch is then
- * refused, never run with a PATH lookup. */
+/** The configured hookPython, checked: absolute, no `.`/`..` segment or control character, an existing file when the
+ * host can stat it, and neither it nor its real path inside the session's project folder (lexical or real). Throws the
+ * reason otherwise; the routed launch is then refused, never run with a PATH lookup. A host without fs.stat, or a stat
+ * that fails for another reason than a missing file, cannot check existence: the command's shell guard then denies the
+ * marked calls if the interpreter does not start (docs/BOUNDARY-HOOK.md "Isolation"). */
 export async function boundaryHookPython($: any, configured: unknown): Promise<string> {
   const p = String(configured ?? '')
   if (!p.startsWith('/') || /[\u0000-\u001f\u007f]/.test(p) || p.split('/').some(seg => seg === '.' || seg === '..')) {
     throw new Error(`routed-subagents: hookPython must be an absolute path to python3 (got ${JSON.stringify(p)}); a PATH lookup could run a python3 the project planted`)
+  }
+  // A host without fs.stat throws a TypeError here, which is not a missing file: the shell guard covers that case.
+  let st: any = undefined
+  let missing = false
+  try { st = await $.fs.stat(p, { resolve: true }) } catch (err: any) {
+    missing = (err && err.code === 'ENOENT') || /ENOENT|no such file|not found|does not exist/i.test(String(err && err.message ? err.message : err))
+  }
+  if (missing || (st && typeof st.kind === 'string' && st.kind !== 'file')) {
+    throw new Error(`routed-subagents: hookPython ${p} does not exist or is not a file; set hookPython to an absolute python3`)
   }
   let root: unknown = null
   try { root = await $.session.root() } catch { root = null }
@@ -871,11 +890,14 @@ Standalone and stdlib only: the routed-subagents mod embeds this file verbatim (
 kept identical by tests/test_boundary_hook.py), so it holds no backquote and no dollar-brace.
 
 Isolation (docs/BOUNDARY-HOOK.md "Isolation"): the model may write files into the project, and the hook runs with the
-project as its working directory. Every installer therefore runs it as "cd / && exec <absolute python3> -I -B ...": an
-absolute interpreter (no PATH lookup), isolated mode (neither the working directory nor the script's folder on
-sys.path, no PYTHON* variables, no user site-packages), from /. Run as a program WITHOUT -I, it drops the first
-sys.path entry (the working directory or its own folder) before importing anything else and denies every
-provider-marked call. And it denies a known call whose project folder holds its interpreter or its own file."""
+project as its working directory. Every installer therefore runs it as "<absolute python3> -I -S -B ..." from /, inside
+a shell guard: an absolute interpreter (no PATH lookup), isolated mode (neither the working directory nor the script's
+folder on sys.path, no PYTHON* variables, no user site-packages), no site import (-S: no .pth file of the interpreter's
+site-packages, e.g. an editable install pointing at the project, can run a project sitecustomize first). The guard
+denies a provider-marked call when the interpreter cannot start or ends with anything but 0 or 2. Run as a program
+WITHOUT -I, it drops the first sys.path entry (the working directory or its own folder) before importing anything
+else and denies every provider-marked call; without -S it denies every provider-marked call too. And it denies a known
+call whose project folder holds its interpreter or its own file."""
 import sys
 
 if __name__ == "__main__" and not sys.flags.isolated:   # an install without -I: no project module may load below
@@ -1044,6 +1066,9 @@ def main(stdin=None, stderr=None, standalone=False) -> int:
         marked = isinstance(tid, str) and tid.startswith(MARK_PREFIX)
         if standalone and marked and not sys.flags.isolated:
             raise Denied("the hook runs without python -I, so files in the project could have replaced its code")
+        if standalone and marked and not sys.flags.no_site:
+            raise Denied("the hook runs without python -S, so a site-packages .pth file could have run project code "
+                         "before it")
         decide(event)
         return 0
     except Denied as exc:

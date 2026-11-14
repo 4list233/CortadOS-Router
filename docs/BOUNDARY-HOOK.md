@@ -58,14 +58,40 @@ turn may write files there. The mod's `python3 -B -c '<source>'` put the working
 0. `python3` itself came from `PATH`, where a project `bin/`, an activated venv or `node_modules/.bin` can come first.
 The rules now:
 
-1. **Isolated mode.** Every installer runs the hook as `python3 -I -B`. `-I` keeps the working directory and the
-   script's folder off `sys.path` and ignores `PYTHON*` variables and user site-packages.
+1. **Isolated mode, no site.** Every installer runs the hook as `python3 -I -S -B`. `-I` keeps the working directory
+   and the script's folder off `sys.path` and ignores `PYTHON*` variables and user site-packages. `-S` skips the `site`
+   import altogether (review finding 2026-11-14, gpt-6.1-sol, HIGH, reproduced on `ad5ab4c`): `-I` still runs `site`
+   for the interpreter's own site-packages, so a `.pth` file there (an editable install pointing at the project root,
+   say) put the project on `sys.path`, and `site` then imported a project `sitecustomize.py` the model may write,
+   before the hook ran. The hook is stdlib only and needs nothing from site-packages.
 2. **No PATH lookup.** The interpreter is an absolute path fixed when the settings are written. Child tasks
    (`session.boundary_hook_python`): the real path of the interpreter running the launcher, else `/usr/bin/python3`.
    The mod: its `hookPython` option, default `/usr/bin/python3`, which must be absolute with no `.`/`..` segment. One
    inside the project folder (lexically or after following links) is refused: the child task is not prepared
-   (`SessionError`), the routed subagent is denied. Neither falls back to `PATH`.
-3. **From `/`.** The command is `cd / && exec <python> -I -B …`, so the hook never runs in the project folder.
+   (`SessionError`), the routed subagent is denied. Neither falls back to `PATH`. The mod also refuses a `hookPython`
+   that does not exist or is not a file when its host can stat it (`$.fs.stat` reports the file missing); where the host
+   has no stat, or the stat fails for another reason (permissions, a sandboxed host), it cannot check and relies on
+   the guard (rule 3).
+3. **From `/`, inside a shell guard.** Claude Code blocks a call only on hook exit 2; any other non-zero exit is a
+   non-blocking error and the call runs. So an interpreter that cannot start failed OPEN (same review, HIGH): a missing
+   `hookPython` exits 126/127, and a broken `/usr/bin/python3` shim (the macOS xcrun stub with an invalid inherited
+   `DEVELOPER_DIR`) fails before Python starts. The command is now
+   `<guard head><python> -I -S -B <script or -c source><guard tail>` (`session.BOUNDARY_HOOK_GUARD_HEAD`/`_TAIL`,
+   the same two strings in the mod's `register.ts`, kept equal by `tests/test_boundary_hook.py`). The guard:
+   - buffers the event first (`ev=$(/bin/cat)`; a failed read denies every call), then feeds it to
+     `(cd / && exec <python> …)` in a **subshell**, so a failed `exec` ends the subshell, not the guard;
+   - exit 0 allows, exit 2 (the hook's own denial) is kept;
+   - any other status (126, 127, a signal, a crash, a failed `cd /`) is decided from the event's `tool_use_id`
+     **field**, never from the prefix appearing elsewhere: the event is flattened (`tr`), and when it holds exactly one
+     `"tool_use_id":` key with a plain `[A-Za-z0-9_-]+` value (`grep`, `sed`), an id starting with `toolu_cxb_` is
+     denied (reason on stderr, exit 2) and any other allowed (exit 0). Inside a JSON string every quote is escaped, so
+     the key pattern only matches real keys, at any depth.
+   - when the id cannot be read that way (a second `tool_use_id` key, e.g. inside `tool_input`; a non-string value; a
+     missing `grep`/`sed`), it denies if the raw event holds `"toolu_cxb_` anywhere (a shell `case`, no tool needed)
+     and allows otherwise: a false block, never a false allow.
+   Every helper is named by absolute path (`/bin/cat`, `/usr/bin/tr`, `/usr/bin/grep`, `/usr/bin/sed`), never looked
+   up on `PATH`; a helper missing at that path only ever moves the decision to the raw check. The hook never runs in
+   the project folder.
 4. **Hook location.** The hook's code lives outside any model-writable path: the mod passes the source inline (`-c`, no
    file on disk), child tasks run `boundary_hook.py` from the router checkout running the launcher. `session.py`
    refuses a checkout inside the child's project folder (`--project-dir`, passed by `child_tasks` when the task has a
@@ -74,26 +100,36 @@ The rules now:
 5. **Imports.** The hook is stdlib only and imports nothing from the project. Run as a program without `-I` (an older
    settings file), it deletes the first `sys.path` entry (the working directory or its own folder) and empty entries
    before importing anything beyond `sys`, and **denies** every marked call: a missing `-I` is a misconfiguration,
-   never a quiet pass.
+   never a quiet pass. Without `-S` (an `ad5ab4c` settings file) it denies every marked call too: by the time it runs,
+   `site` may already have run project code.
 
 Tests (`tests/test_boundary_hook.py`, subprocess, fakes only): `IsolationTests` run the child-task command and the mod's
 command through `sh` with the project as cwd, a planted `json.py`, `urllib/`, `http/`, `sitecustomize.py` and
 `usercustomize.py` there and on `PYTHONPATH`, and a planted `python3` first on `PATH`; none runs, and the marked write
-outside the project is still denied. A copy of the script beside planted modules is not hijacked (with `-I`, and without
-it, where marked calls are denied). A copy inside the project denies even an in-project write. `SelfLocationTests`
-cover the interpreter and file checks in process; `test_the_mod_builds_its_command_as_mod_command` keeps the test's
-command and register.ts in step. `tests/test_session.py` checks the interpreter choice and the project refusals; the
-mod's `register.test.ts` checks `boundaryHookPython` and the command prefix.
+outside the project is still denied. A copy of the script beside planted modules is not hijacked (with `-I -S`; with
+`-I` alone and without `-I`, marked calls are denied). A copy inside the project denies even an in-project write.
+`SitePthTests` build a throwaway venv outside the project whose site-packages holds a `.pth` naming the project, plus a
+project `sitecustomize.py` payload: the `ad5ab4c` command (`-I -B`) runs it and allows the marked write; both current
+commands skip it and deny (exit 2). `GuardTests` run both builders through `sh`: a missing interpreter (and a folder,
+126) denies a marked call and allows an unmarked one; a marked id only inside `tool_input` with an unmarked
+`tool_use_id` is allowed; pretty-printed events with any key order; an unreadable id fails closed only when the prefix
+is present; a fake hook exiting 2 keeps 2, exiting 0 allows; a crash (exit 1/3, SIGSEGV, SIGKILL) denies marked and
+allows unmarked; a fake broken shim exiting 126 likewise; the real hook's own answers pass through unchanged.
+`SelfLocationTests` cover the interpreter and file checks in process; `test_the_mod_builds_its_command_as_mod_command`
+keeps the test's command, the guard strings and register.ts in step. `tests/test_session.py` checks the interpreter
+choice, the command shape and the project refusals; the mod's `register.test.ts` checks `boundaryHookPython` (including
+a missing file) and the command.
 
 ## Where the hook is installed
 
 - **CortadOS child tasks, on any host:** `cortados_router/session.py` `settings_content`. The launcher's 0600
   settings file always carries the boundary hook as the first PreToolUse entry
-  (`cd / && exec <absolute python3> -I -B <checkout>/cortados_router/boundary_hook.py`, timeout 30 s; "Isolation"), plus `disableAllHooks: false`, so a user
+  (`<absolute python3> -I -S -B <checkout>/cortados_router/boundary_hook.py` from `/` inside the shell guard, timeout 30 s;
+  "Isolation"), plus `disableAllHooks: false`, so a user
   settings file cannot switch it off. `custom_headers` adds the header to `ANTHROPIC_CUSTOM_HEADERS`. Both are written
   together, so the header never goes out without the hook.
 - **The owner's interactive sessions:** the `cortados-routed-subagents` mod (0.4.0). Each routed subagent child gets
-  `--settings` from `routedChildSettings()`: the hook as `cd / && exec '<hookPython>' -I -B -c '<BOUNDARY_HOOK_PY>'` (the file embedded
+  `--settings` from `routedChildSettings()`: the hook as `'<hookPython>' -I -S -B -c '<BOUNDARY_HOOK_PY>'` inside the guard (the file embedded
   verbatim, kept identical by `tests/test_boundary_hook.py`), `disableAllHooks: false`, and this mod and the pane
   disabled. These replace `disableAllHooks: true`, which would also have switched the hook off. The child env carries
   the header and `CORTADOS_ROUTED_SUBAGENT=1`, which keeps the mod's Agent router, gate and directive inert there. The
@@ -101,10 +137,12 @@ mod's `register.test.ts` checks `boundaryHookPython` and the command prefix.
 
 ## Honest limits
 
-- The header is the client's word. If a client sends it and the hook then does not run (the absolute interpreter
-  missing, e.g. no `/usr/bin/python3` or the macOS developer-tools stub not installed,
-  hooks disabled by a managed policy, a Claude Code that ignores the hook), the provider cannot tell. Edits then pass
-  under the provider-side rules alone.
+- The header is the client's word. If a client sends it and the hook then does not run at all (hooks disabled by a
+  managed policy, a Claude Code that ignores the hook, a missing `/bin/sh`), the provider cannot tell. Edits then pass
+  under the provider-side rules alone. An interpreter that is missing or cannot start (no `/usr/bin/python3`, the
+  macOS developer-tools stub not installed or a bad `DEVELOPER_DIR`) is no longer such a case: the shell guard denies
+  every provider-marked call then ("Isolation", rule 3), so sensitive and cost turns lose their edits and Bash until
+  the interpreter is fixed.
 - A time-of-check/time-of-use race: a link created between the hook's check and the write is not seen.
 - A **cost** turn from a client without the hook (e.g. Codex on `/v1/responses`, or an older mod) keeps its edits and
   Bash under the provider-side checks only, as before this change.

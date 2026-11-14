@@ -127,6 +127,21 @@ BOUNDARY_HOOK_FILE = Path(__file__).resolve().with_name("boundary_hook.py")
 # Where the hook's interpreter is looked for, in order, after the interpreter running this launcher: absolute paths
 # only, never a PATH lookup (a project's bin/, venv or node_modules/.bin may come first on PATH; docs/BOUNDARY-HOOK.md).
 SYSTEM_PYTHONS = ("/usr/bin/python3",)
+# The shell guard around the hook's interpreter (docs/BOUNDARY-HOOK.md "Isolation"). Claude Code treats any hook exit
+# but 2 as a non-blocking error and runs the call, so an interpreter that cannot start (a missing path: 126/127; a
+# broken /usr/bin/python3 shim) would let a provider-marked call through. The guard buffers the event, runs the
+# interpreter in a subshell from /, passes 0 and 2 through, and on any other status decides from the event's
+# tool_use_id FIELD alone: an id starting with toolu_cxb_ (effect_boundary.MARK_PREFIX) is denied (exit 2), any other
+# id allowed (exit 0). An id it cannot read (no single "tool_use_id" key with a plain value; a missing grep or sed)
+# denies when the raw event holds "toolu_cxb_ anywhere: a false block, never a false allow. Helpers by absolute path,
+# never PATH. The mod's hooks/register.ts carries the same two strings (tests/test_boundary_hook.py keeps them equal).
+BOUNDARY_HOOK_GUARD_HEAD = r"""ev=$(/bin/cat) || { printf 'cortados boundary: denied: the hook could not read its input. Nothing was run.\n' >&2; exit 2; }; printf '%s\n' "$ev" | (cd / && exec """
+BOUNDARY_HOOK_GUARD_TAIL = r"""); rc=$?; [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 2 ] && exit 2; f=$(printf '%s' "$ev" | /usr/bin/tr '\n\r\t' '   '); id=; printf '%s\n' "$f" | /usr/bin/grep -q '"tool_use_id"[[:space:]]*:.*"tool_use_id"[[:space:]]*:'; if [ "$?" -eq 1 ]; then id=$(printf '%s\n' "$f" | /usr/bin/sed -n 's/^.*"tool_use_id"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9_-]\{1,\}\)".*$/\1/p'); fi; case $id in toolu_cxb_*) m=1;; ?*) m=0;; *) case $ev in *'"toolu_cxb_'*) m=1;; *) m=0;; esac;; esac; if [ "$m" = 1 ]; then printf 'cortados boundary: denied: the hook did not run (exit %s), and a provider-marked call fails closed. Nothing was run.\n' "$rc" >&2; exit 2; fi; exit 0"""
+
+
+def guarded_hook_command(python: str, args: str) -> str:
+    """The boundary hook's shell command: `<python> -I -S -B <args>` (args already shell-quoted) inside the guard."""
+    return BOUNDARY_HOOK_GUARD_HEAD + shlex.quote(python) + " -I -S -B " + args + BOUNDARY_HOOK_GUARD_TAIL
 
 
 def _within(path: str, folder: str) -> bool:
@@ -157,15 +172,16 @@ def boundary_hook_python(project: str | None = None, candidates=None) -> str:
 
 
 def boundary_hook_entry(project: str | None = None, python: str | None = None) -> dict:
-    """The PreToolUse entry running boundary_hook.py: `cd / && exec <absolute python3> -I -B <absolute script>`
-    (shell-quoted). No PATH lookup, isolated mode, run from / (docs/BOUNDARY-HOOK.md "Isolation"). A hook script inside
+    """The PreToolUse entry running boundary_hook.py: `<absolute python3> -I -S -B <absolute script>` (shell-quoted),
+    from / inside the shell guard (guarded_hook_command). No PATH lookup, isolated mode, no site import, fail closed for
+    a marked call when the interpreter cannot start (docs/BOUNDARY-HOOK.md "Isolation"). A hook script inside
     the project folder is refused. Timeout 30 s, well past the script's own 5 s provider timeout, so the script always
     answers (and fails closed) itself."""
     if _inside_project(str(BOUNDARY_HOOK_FILE), project):
         raise SessionError("the boundary hook script lies inside the project folder; run the launcher from a router "
                            "checkout outside it")
     python = python or boundary_hook_python(project)
-    command = "cd / && exec " + shlex.quote(python) + " -I -B " + shlex.quote(str(BOUNDARY_HOOK_FILE))
+    command = guarded_hook_command(python, shlex.quote(str(BOUNDARY_HOOK_FILE)))
     return {"matcher": BOUNDARY_HOOK_MATCHER, "hooks": [{"type": "command", "command": command, "timeout": 30}]}
 
 

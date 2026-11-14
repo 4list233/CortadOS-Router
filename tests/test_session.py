@@ -80,12 +80,16 @@ class SessionTests(unittest.TestCase):
                 self.assertIs(data["disableAllHooks"], False)
                 pre = data["hooks"]["PreToolUse"]
                 self.assertEqual(pre[0]["matcher"], "Write|Edit|MultiEdit|NotebookEdit|Bash")
-                # Isolated (docs/BOUNDARY-HOOK.md "Isolation"): from /, an absolute interpreter, python -I.
-                bcmd = shlex.split(pre[0]["hooks"][0]["command"])
-                self.assertEqual(bcmd[:4], ["cd", "/", "&&", "exec"])
-                self.assertTrue(os.path.isabs(bcmd[4]) and os.path.isfile(bcmd[4]), bcmd)
-                self.assertEqual(bcmd[5:7], ["-I", "-B"])
-                self.assertEqual(Path(bcmd[7]), Path(session.__file__).resolve().with_name("boundary_hook.py"))
+                # Isolated (docs/BOUNDARY-HOOK.md "Isolation"): inside the shell guard, from /, an absolute
+                # interpreter, python -I -S.
+                full = pre[0]["hooks"][0]["command"]
+                head, tail = session.BOUNDARY_HOOK_GUARD_HEAD, session.BOUNDARY_HOOK_GUARD_TAIL
+                self.assertTrue(full.startswith(head) and full.endswith(tail), full)
+                self.assertTrue(head.endswith("(cd / && exec "))
+                bcmd = shlex.split(full[len(head):-len(tail)])
+                self.assertTrue(os.path.isabs(bcmd[0]) and os.path.isfile(bcmd[0]), bcmd)
+                self.assertEqual(bcmd[1:4], ["-I", "-S", "-B"])
+                self.assertEqual(Path(bcmd[4]), Path(session.__file__).resolve().with_name("boundary_hook.py"))
                 self.assertIn("x-cortados-boundary-hook: 1", data["env"]["ANTHROPIC_CUSTOM_HEADERS"].split("\n"))
                 self.assertEqual(len(pre), 2 if enabled else 1)
                 if enabled:
@@ -128,7 +132,7 @@ class SessionTests(unittest.TestCase):
         _, _, cmd = self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok,
                                   "--project-dir", self.tmp.name])
         with open(cmd[cmd.index("--settings") + 1]) as src:
-            self.assertIn(" -I -B ", json.load(src)["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
+            self.assertIn(" -I -S -B ", json.load(src)["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
 
     def test_model_mapping(self):
         self.assertEqual(session.resolve_model("fable"), "sub/claude-fable-5-1")

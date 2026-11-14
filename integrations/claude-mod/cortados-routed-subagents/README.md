@@ -275,9 +275,12 @@ unreachable included. The child announces the hook with `x-cortados-boundary-hoo
 sensitive local turns read-only.
 
 The hook is `cortados_router/boundary_hook.py`, embedded verbatim as `BOUNDARY_HOOK_PY` and run as
-`cd / && exec <hookPython> -I -B -c <source>`: from `/`, on an absolute interpreter (default `/usr/bin/python3`, never a
-`PATH` lookup), in isolated mode, so nothing the model writes into the project (a `json.py`, a `bin/python3`) can
-replace its code (docs/BOUNDARY-HOOK.md, "Isolation"). Updating from 0.3.x: see **Updating**.
+`<hookPython> -I -S -B -c <source>` from `/` inside a shell guard: on an absolute interpreter (default
+`/usr/bin/python3`, never a `PATH` lookup), in isolated mode without the site import, so nothing the model writes into
+the project (a `json.py`, a `bin/python3`, a `sitecustomize.py` reached through a site-packages `.pth`) can replace its
+code. If the interpreter cannot start (a missing `hookPython`, a broken `/usr/bin/python3` shim) the guard denies a
+provider-marked call (exit 2) and lets any other through; a `hookPython` that does not exist is refused up front when
+the host can stat it (docs/BOUNDARY-HOOK.md, "Isolation"). Updating from 0.3.x: see **Updating**.
 
 ## Updating
 

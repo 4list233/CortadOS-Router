@@ -3,7 +3,7 @@ import { SHARED_SALT_TRIES, SHARED_SALT_RETRY_MS } from './register'
 import officeVectors from './office-vectors.fixture'
 import { resolveProviderUrl, officeTitle, officeName, baseName, sessionTag, officeHeaderLines, OFFICE_SALT_KEY, OFFICE_BEAT_MIN_MS, OFFICE_BEAT_REFRESH_MS, OFFICE_BEAT_TIMEOUT_MS } from './register'
 import { BG_SWEEP_SH, BG_SWEEP_MS, sweepBackgroundRuns } from './register'
-import { routedChildSettings, BOUNDARY_HOOK_PY, ROUTED_CHILD_ENV, boundaryHookPython, boundaryHookCommand } from './register'
+import { routedChildSettings, BOUNDARY_HOOK_PY, BOUNDARY_HOOK_GUARD_HEAD, BOUNDARY_HOOK_GUARD_TAIL, ROUTED_CHILD_ENV, boundaryHookPython, boundaryHookCommand } from './register'
 import { MODEL_DIRECTIVE_RE, modelDirective, directiveModelId } from './register'
 import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, refusesAgent, isDelegationTool, AGENT_REFUSAL, ORCHESTRATOR_DIRECTIVE, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL, resolveBackgroundTimeoutMs, BG_LAUNCH_SH, BG_CLEANUP_SH, BACKGROUND_DATA_BOUNDARY, backgroundData, isBgDir } from './register'
 
@@ -403,7 +403,8 @@ test('the routed child is started with the provider credentials and CLAUDE_CODE_
   const pre = settings.hooks.PreToolUse[0]
   expect(pre.matcher).toBe('Write|Edit|MultiEdit|NotebookEdit|Bash')
   // Isolated (docs/BOUNDARY-HOOK.md "Isolation"): from /, an absolute interpreter, python -I, the source inline.
-  expect(pre.hooks[0].command.startsWith("cd / && exec '/usr/bin/python3' -I -B -c '")).toBe(true)
+  expect(pre.hooks[0].command.startsWith(BOUNDARY_HOOK_GUARD_HEAD + "'/usr/bin/python3' -I -S -B -c '")).toBe(true)
+  expect(pre.hooks[0].command.endsWith(BOUNDARY_HOOK_GUARD_TAIL)).toBe(true)
   expect(pre.hooks[0].command).toContain('toolu_cxb_')
   // The child starts with no MCP servers: built-in tools only, nothing of the parent's exposed to the provider.
   expect(recordedArgv).toContain('--strict-mcp-config')
@@ -1997,10 +1998,19 @@ test('the boundary hook runs on an absolute interpreter outside the project, nev
   for (const bad of ['python3', 'bin/python3', '', '/usr/bin/../bin/python3', '/work/proj/bin/python3', '/opt/link/python3']) {
     await expect(boundaryHookPython($, bad)).rejects.toThrow('hookPython')
   }
-  expect(await boundaryHookPython($, '/nope/python3')).toBe('/nope/python3')   // outside the project, not stat-able
+  // A hookPython that does not exist, or is no file, is refused when the host can stat it.
+  await expect(boundaryHookPython($, '/nope/python3')).rejects.toThrow('does not exist')
+  await expect(boundaryHookPython($, '/work/proj')).rejects.toThrow('hookPython')
+  const enoent = { fs: { stat: async () => { throw Object.assign(new Error('stat failed'), { code: 'ENOENT' }) } } }
+  await expect(boundaryHookPython(enoent, '/usr/bin/python3')).rejects.toThrow('does not exist')
+  // A stat that fails otherwise (e.g. outside the host's readable roots) cannot tell: the shell guard covers it.
+  const denied = { fs: { stat: async () => { throw new Error('EACCES: permission denied') } } }
+  expect(await boundaryHookPython(denied, '/usr/bin/python3')).toBe('/usr/bin/python3')
   // No session root or stat on this host: the lexical rule still holds.
   expect(await boundaryHookPython({}, '/usr/bin/python3')).toBe('/usr/bin/python3')
   await expect(boundaryHookPython({}, 'python3')).rejects.toThrow('absolute')
-  expect(boundaryHookCommand('/opt/py 3/python3')).toBe("cd / && exec '/opt/py 3/python3' -I -B -c '" + BOUNDARY_HOOK_PY.replace(/'/g, "'\\''") + "'")
+  expect(boundaryHookCommand('/opt/py 3/python3')).toBe(BOUNDARY_HOOK_GUARD_HEAD + "'/opt/py 3/python3' -I -S -B -c '" + BOUNDARY_HOOK_PY.replace(/'/g, "'\\''") + "'" + BOUNDARY_HOOK_GUARD_TAIL)
+  expect(BOUNDARY_HOOK_GUARD_HEAD).toContain('(cd / && exec ')
+  expect(BOUNDARY_HOOK_GUARD_TAIL).toContain('toolu_cxb_')
   expect(routedChildSettings('/x/python3')).toEqual({ ...routedChildSettings(), hooks: { PreToolUse: [{ matcher: 'Write|Edit|MultiEdit|NotebookEdit|Bash', hooks: [{ type: 'command', command: boundaryHookCommand('/x/python3'), timeout: 30 }] }] } })
 })

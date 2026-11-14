@@ -24,11 +24,14 @@ Standalone and stdlib only: the routed-subagents mod embeds this file verbatim (
 kept identical by tests/test_boundary_hook.py), so it holds no backquote and no dollar-brace.
 
 Isolation (docs/BOUNDARY-HOOK.md "Isolation"): the model may write files into the project, and the hook runs with the
-project as its working directory. Every installer therefore runs it as "cd / && exec <absolute python3> -I -B ...": an
-absolute interpreter (no PATH lookup), isolated mode (neither the working directory nor the script's folder on
-sys.path, no PYTHON* variables, no user site-packages), from /. Run as a program WITHOUT -I, it drops the first
-sys.path entry (the working directory or its own folder) before importing anything else and denies every
-provider-marked call. And it denies a known call whose project folder holds its interpreter or its own file."""
+project as its working directory. Every installer therefore runs it as "<absolute python3> -I -S -B ..." from /, inside
+a shell guard: an absolute interpreter (no PATH lookup), isolated mode (neither the working directory nor the script's
+folder on sys.path, no PYTHON* variables, no user site-packages), no site import (-S: no .pth file of the interpreter's
+site-packages, e.g. an editable install pointing at the project, can run a project sitecustomize first). The guard
+denies a provider-marked call when the interpreter cannot start or ends with anything but 0 or 2. Run as a program
+WITHOUT -I, it drops the first sys.path entry (the working directory or its own folder) before importing anything
+else and denies every provider-marked call; without -S it denies every provider-marked call too. And it denies a known
+call whose project folder holds its interpreter or its own file."""
 import sys
 
 if __name__ == "__main__" and not sys.flags.isolated:   # an install without -I: no project module may load below
@@ -197,6 +200,9 @@ def main(stdin=None, stderr=None, standalone=False) -> int:
         marked = isinstance(tid, str) and tid.startswith(MARK_PREFIX)
         if standalone and marked and not sys.flags.isolated:
             raise Denied("the hook runs without python -I, so files in the project could have replaced its code")
+        if standalone and marked and not sys.flags.no_site:
+            raise Denied("the hook runs without python -S, so a site-packages .pth file could have run project code "
+                         "before it")
         decide(event)
         return 0
     except Denied as exc:

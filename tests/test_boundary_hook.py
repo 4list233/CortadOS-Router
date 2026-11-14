@@ -77,7 +77,20 @@ def sh_quote(text: str) -> str:
 
 def mod_command(python: str) -> str:
     """register.ts boundaryHookCommand (test_the_mod_builds_its_command_as_mod_command keeps the two in step)."""
+    from cortados_router import session
+    return (session.BOUNDARY_HOOK_GUARD_HEAD + sh_quote(python) + " -I -S -B -c "
+            + sh_quote(Path(hook.__file__).read_text(encoding="utf-8")) + session.BOUNDARY_HOOK_GUARD_TAIL)
+
+
+def ad5ab4c_mod_command(python: str) -> str:
+    """The mod's command before the -S and guard fix (ad5ab4c): the regression tests show it fails."""
     return "cd / && exec " + sh_quote(python) + " -I -B -c " + sh_quote(Path(hook.__file__).read_text(encoding="utf-8"))
+
+
+def child_command(python: str) -> str:
+    """session.py's child-task hook command on the given interpreter."""
+    from cortados_router import session
+    return session.boundary_hook_entry(python=python)["hooks"][0]["command"]
 
 
 class HookBase(unittest.TestCase):
@@ -291,7 +304,7 @@ PLANTS = {
 }
 
 
-class IsolationTests(HookBase):
+class IsolationBase(HookBase):
     """The hook runs as the installers run it, with the project (model-writable) as cwd, holding planted modules that
     would allow the call and record that they ran. Every planted module must stay unexecuted and the marked write
     outside the project must still be denied (exit 2)."""
@@ -340,6 +353,8 @@ class IsolationTests(HookBase):
         self.assertIn(why, r.stderr)
         self.assertEqual(os.listdir(self.outside), [])
 
+
+class IsolationTests(IsolationBase):
     def test_the_child_task_command_ignores_planted_modules_and_python(self):
         from cortados_router import session
         self.plant(self.project)
@@ -352,12 +367,17 @@ class IsolationTests(HookBase):
 
     def test_the_installers_never_look_python3_up_on_path(self):
         from cortados_router import session
-        argv = shlex.split(session.boundary_hook_entry()["hooks"][0]["command"])
-        self.assertEqual(argv[:3], ["cd", "/", "&&"])
-        self.assertEqual(argv[3], "exec")
-        self.assertTrue(os.path.isabs(argv[4]), argv)
-        self.assertEqual(argv[5:7], ["-I", "-B"])
-        self.assertEqual(argv[7], str(Path(hook.__file__).resolve()))
+        command = session.boundary_hook_entry()["hooks"][0]["command"]
+        head, tail = session.BOUNDARY_HOOK_GUARD_HEAD, session.BOUNDARY_HOOK_GUARD_TAIL
+        self.assertTrue(command.startswith(head) and command.endswith(tail), command)
+        self.assertTrue(head.endswith("(cd / && exec "))
+        argv = shlex.split(command[len(head):-len(tail)])
+        self.assertTrue(os.path.isabs(argv[0]), argv)
+        self.assertEqual(argv[1:4], ["-I", "-S", "-B"])
+        self.assertEqual(argv[4:], [str(Path(hook.__file__).resolve())])
+        # Every helper of the guard is named by absolute path: no PATH lookup there either.
+        for tool in ("cat", "tr", "grep", "sed"):
+            self.assertNotRegex(head + tail, r"(?<![/\w])" + tool + r" ")
 
     def test_a_copy_next_to_planted_modules_ignores_them(self):
         # The script in a writable folder (here outside the project) with planted modules beside it.
@@ -367,8 +387,11 @@ class IsolationTests(HookBase):
         shutil.copy(hook.__file__, copy)
         self.plant(side)
         self.plant(self.project)
-        self.assertBlockedAndClean(self.run_command(["sh", "-c", "cd / && exec %s -I -B %s" % (
+        self.assertBlockedAndClean(self.run_command(["sh", "-c", "cd / && exec %s -I -S -B %s" % (
             shlex.quote(PY), shlex.quote(copy))]))
+        # With -I but without -S (an ad5ab4c install) a marked call is denied: site may have run project code.
+        self.assertBlockedAndClean(self.run_command(["sh", "-c", "cd / && exec %s -I -B %s" % (
+            shlex.quote(PY), shlex.quote(copy))]), "without python -S")
         # Even run WITHOUT -I (an older install), its own folder and the cwd are dropped before any import, and a
         # marked call is denied.
         self.assertBlockedAndClean(self.run_command([PY, "-B", copy], env={
@@ -385,11 +408,144 @@ class IsolationTests(HookBase):
         self.plant(os.path.dirname(copy))
         ev = json.dumps({"tool_name": "Write", "tool_input": {"file_path": os.path.join(self.project, "src", "a.py")},
                          "tool_use_id": MARKED})
-        r = subprocess.run(["sh", "-c", "cd / && exec %s -I -B %s" % (shlex.quote(PY), shlex.quote(copy))],
+        r = subprocess.run(["sh", "-c", "cd / && exec %s -I -S -B %s" % (shlex.quote(PY), shlex.quote(copy))],
                            input=ev, capture_output=True, text=True, cwd=self.project, timeout=60,
                            env={"PATH": "/usr/bin:/bin", "CORTADOS_BOUNDARY_URL": self.url,
                                 "CORTADOS_BOUNDARY_TOKEN": TOKEN})
         self.assertBlockedAndClean(r, "hook file lies inside the project")
+
+
+class SitePthTests(IsolationBase):
+    """Review finding 2026-11-14 (HIGH): -I does not disable `site`. A .pth file in the interpreter's site-packages (an
+    editable install pointing at the project root) puts the project on sys.path, and site then imports a project
+    sitecustomize.py the model may write, before the hook runs. -S (no site import) closes it."""
+
+    def setUp(self):
+        super().setUp()
+        venv = os.path.join(self.tmp, "venv")                  # outside the project, as an owner's venv would be
+        subprocess.run([PY, "-I", "-m", "venv", "--without-pip", venv], check=True, capture_output=True, timeout=120)
+        self.venv_py = os.path.join(venv, "bin", "python3")
+        site = subprocess.run([self.venv_py, "-I", "-c", "import site; print(site.getsitepackages()[0])"],
+                              capture_output=True, text=True, check=True, cwd="/").stdout.strip()
+        with open(os.path.join(site, "editable_project.pth"), "w", encoding="utf-8") as f:
+            f.write(self.project + "\n")
+        with open(os.path.join(self.project, "sitecustomize.py"), "w", encoding="utf-8") as f:
+            f.write("import os\nopen(os.path.join(%r, 'sitecustomize'), 'w').close()\nos._exit(0)\n" % self.pwned)
+
+    def clean_env(self):
+        return {"PATH": "/usr/bin:/bin", "CORTADOS_BOUNDARY_URL": self.url, "CORTADOS_BOUNDARY_TOKEN": TOKEN}
+
+    def test_the_old_commands_ran_the_project_sitecustomize(self):
+        # The control: ad5ab4c's -I -B command runs the payload, which allows the marked write (exit 0).
+        r = self.run_command(["sh", "-c", ad5ab4c_mod_command(self.venv_py)], env=self.clean_env())
+        self.assertEqual(os.listdir(self.pwned), ["sitecustomize"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_the_child_task_command_skips_site(self):
+        self.assertBlockedAndClean(self.run_command(["sh", "-c", child_command(self.venv_py)], env=self.clean_env()))
+
+    def test_the_mod_command_skips_site(self):
+        self.assertBlockedAndClean(self.run_command(["sh", "-c", mod_command(self.venv_py)], env=self.clean_env()))
+
+
+class GuardTests(unittest.TestCase):
+    """Review finding 2026-11-14 (HIGH): an interpreter that cannot start failed OPEN. Claude Code blocks only on exit 2;
+    a missing hookPython (126/127) or a broken /usr/bin/python3 shim (bad DEVELOPER_DIR) is a non-blocking error and
+    the call ran. The shell guard decides those from the event's tool_use_id field. Both builders, through sh."""
+
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.env = {"PATH": "/usr/bin:/bin",                  # no provider: the real hook fails closed on its own
+                    "CORTADOS_BOUNDARY_URL": f"http://127.0.0.1:{closed_port()}", "CORTADOS_BOUNDARY_TOKEN": TOKEN}
+
+    def fake(self, name, body):
+        """A fake interpreter: a shell script standing in for python3."""
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n" + body + "\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def run_guarded(self, python, event):
+        raw = event if isinstance(event, str) else json.dumps(event)
+        out = []
+        for build in (child_command, mod_command):
+            r = subprocess.run(["sh", "-c", build(python)], input=raw, capture_output=True, text=True, env=self.env,
+                               cwd=self.tmp, timeout=60)
+            self.assertNotIn(TOKEN, r.stdout + r.stderr)
+            out.append((r.returncode, r.stderr))
+        self.assertEqual(out[0][0], out[1][0], out)
+        return out[0]
+
+    def ev(self, tid, tool_input=None):
+        return {"session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Write",
+                "tool_input": tool_input or {"file_path": "/x/y"}, "tool_use_id": tid}
+
+    def assertGuardDenied(self, result):
+        self.assertEqual(result[0], 2, result[1])
+        self.assertIn("cortados boundary: denied", result[1])
+
+    def test_a_missing_interpreter_denies_a_marked_call(self):
+        missing = os.path.join(self.tmp, "no-such", "python3")
+        self.assertGuardDenied(self.run_guarded(missing, self.ev(MARKED)))
+        self.assertGuardDenied(self.run_guarded(self.tmp, self.ev(MARKED)))     # a folder: 126
+
+    def test_a_missing_interpreter_allows_an_unmarked_call(self):
+        missing = os.path.join(self.tmp, "no-such", "python3")
+        self.assertEqual(self.run_guarded(missing, self.ev("toolu_01CloudModelOwnId"))[0], 0)
+        self.assertEqual(self.run_guarded(missing, {"tool_name": "Write", "tool_input": {}})[0], 0)   # no id
+
+    def test_the_id_field_decides_not_a_marked_id_inside_tool_input(self):
+        missing = os.path.join(self.tmp, "no-such", "python3")
+        ev = self.ev("toolu_01CloudModelOwnId", {"file_path": "/x/" + MARKED, "content": '"%s" %s' % (MARKED, MARKED)})
+        self.assertIn('"' + MARKED, json.dumps(ev).replace('\\"', '"'))
+        self.assertEqual(self.run_guarded(missing, ev)[0], 0)
+        self.assertEqual(self.run_guarded(missing, json.dumps(ev, indent=2))[0], 0)
+
+    def test_whitespace_and_key_order(self):
+        missing = os.path.join(self.tmp, "no-such", "python3")
+        pretty = '{\n  "tool_use_id"  :\n\t"%s",\r\n  "tool_name": "Bash",\n  "tool_input": {"command": "ls"}\n}' % MARKED
+        self.assertGuardDenied(self.run_guarded(missing, pretty))
+        self.assertEqual(self.run_guarded(missing, pretty.replace(MARKED, "toolu_01Own"))[0], 0)
+
+    def test_an_id_it_cannot_read_fails_closed_only_with_the_prefix_present(self):
+        missing = os.path.join(self.tmp, "no-such", "python3")
+        # A second tool_use_id key (inside tool_input): which one is the event's is not read; the prefix is present.
+        nested = self.ev("toolu_01CloudModelOwnId", {"file_path": "/x", "tool_use_id": MARKED})
+        self.assertGuardDenied(self.run_guarded(missing, nested))
+        self.assertGuardDenied(self.run_guarded(missing, 'not json "%s' % MARKED))
+        self.assertEqual(self.run_guarded(missing, "not json")[0], 0)
+        self.assertEqual(self.run_guarded(missing, self.ev(None))[0], 0)
+
+    def test_a_genuine_exit_2_is_kept(self):
+        two = self.fake("exits2", "cat >/dev/null; echo 'cortados boundary: denied: test' >&2; exit 2")
+        self.assertGuardDenied(self.run_guarded(two, self.ev("toolu_01CloudModelOwnId")))
+        self.assertGuardDenied(self.run_guarded(two, self.ev(MARKED)))
+
+    def test_exit_0_allows(self):
+        zero = self.fake("exits0", "cat >/dev/null; exit 0")
+        self.assertEqual(self.run_guarded(zero, self.ev(MARKED)), (0, ""))
+
+    def test_a_crashing_hook_denies_marked_and_allows_unmarked(self):
+        for body in ("cat >/dev/null; exit 1", "cat >/dev/null; kill -SEGV $$", "kill -KILL $$", "exit 3"):
+            crash = self.fake("crash", body)
+            self.assertGuardDenied(self.run_guarded(crash, self.ev(MARKED)))
+            self.assertEqual(self.run_guarded(crash, self.ev("toolu_01CloudModelOwnId"))[0], 0, body)
+
+    def test_a_broken_shim_that_exits_126(self):
+        # /usr/bin/python3 on macOS is an xcrun shim; with an invalid DEVELOPER_DIR it fails before Python starts.
+        shim = self.fake("python3", "echo 'xcrun: error: invalid DEVELOPER_DIR path' >&2; exit 126")
+        self.assertGuardDenied(self.run_guarded(shim, self.ev(MARKED)))
+        self.assertEqual(self.run_guarded(shim, self.ev("toolu_01CloudModelOwnId"))[0], 0)
+
+    def test_the_real_hook_still_decides(self):
+        # The guard leaves the hook's own answers alone: unmarked unknown 0, marked with no provider 2 (its reason).
+        self.assertEqual(self.run_guarded(PY, self.ev("toolu_01CloudModelOwnId")), (0, ""))
+        code, err = self.run_guarded(PY, self.ev(MARKED))
+        self.assertEqual(code, 2, err)
+        self.assertIn("cortados boundary: denied", err)
+        self.assertNotIn("the hook did not run", err)
 
 
 class SharedSourceTests(unittest.TestCase):
@@ -417,15 +573,24 @@ class SharedSourceTests(unittest.TestCase):
             self.assertNotIn(TOKEN, r.stderr + r.stdout)
 
     def test_the_mod_builds_its_command_as_mod_command(self):
-        """mod_command mirrors register.ts boundaryHookCommand: from /, absolute interpreter, -I, the source inline."""
+        """mod_command mirrors register.ts boundaryHookCommand: the shell guard (the same two strings as session.py),
+        from /, absolute interpreter, -I -S, the source inline."""
+        from cortados_router import session
         src = REGISTER_TS.read_text(encoding="utf-8")
-        self.assertIn("return 'cd / && exec ' + shQuote(python) + ' -I -B -c ' + shQuote(BOUNDARY_HOOK_PY)", src)
+        for name in ("BOUNDARY_HOOK_GUARD_HEAD", "BOUNDARY_HOOK_GUARD_TAIL"):
+            m = re.search(r"export const %s = String\.raw`([^`]*)`" % name, src)
+            self.assertIsNotNone(m, "register.ts must export " + name)
+            self.assertEqual(m.group(1), getattr(session, name))
+        self.assertIn("return BOUNDARY_HOOK_GUARD_HEAD + shQuote(python) + ' -I -S -B -c ' + shQuote(BOUNDARY_HOOK_PY)"
+                      " + BOUNDARY_HOOK_GUARD_TAIL", src)
         self.assertIn("hookPython: '/usr/bin/python3',", src)
         self.assertIn("command: boundaryHookCommand(python)", src)
 
     def test_constants_match_the_provider(self):
         from cortados_router import session
         self.assertEqual(hook.MARK_PREFIX, eb.MARK_PREFIX)
+        self.assertIn("toolu_cxb_*)", session.BOUNDARY_HOOK_GUARD_TAIL)
+        self.assertEqual(session.BOUNDARY_HOOK_GUARD_TAIL.count(eb.MARK_PREFIX), 2)   # the id case, the raw check
         self.assertEqual(hook.WRITE_KEYS, eb.WRITE_TOOLS)
         self.assertEqual(hook.HOOK_TOOLS, eb.HOOK_TOOLS)
         self.assertEqual(session.BOUNDARY_HOOK_HEADER, eb.HOOK_HEADER)
