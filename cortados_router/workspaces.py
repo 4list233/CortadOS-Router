@@ -22,7 +22,8 @@ A stopped merge's or rebase's autostash (MERGE_AUTOSTASH, rebase-merge/autostash
 a remote, so it always holds (`unpushed_autostash`). Any in-progress git operation holds outright, whatever it names
 (`unpushed_operation_state`, review 8): rebase-merge/, rebase-apply/, MERGE_HEAD, CHERRY_PICK_HEAD, REVERT_HEAD,
 REBASE_HEAD, sequencer/, BISECT_* (BISECT_LOG...), NOTES_MERGE_* in the worktree's own git dir (OPERATION_STATE_*;
-AUTO_MERGE is reported with them). Its files are not parsed: seven review rounds each found a todo, label, short-id or
+AUTO_MERGE is reported with them), matched in any letter case (review 9: macOS's usual case-insensitive filesystem lets git
+read Rebase-Apply/ as rebase-apply/). Its files are not parsed: seven review rounds each found a todo, label, short-id or
 reset/merge form the parser missed, and round 7 lost an unpublished commit to one (`reset <id>` before `label <id>`).
 A task ending mid-operation is rare, a false hold costs only a kept folder, a false archive loses work. Branches,
 tags and the stash belong to the clone, are shared by every task's worktree and survive the deletion: they neither
@@ -725,16 +726,35 @@ _OID_RE = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
 # merge (NOTES_MERGE_*). Only the names' presence is checked; nothing in them is parsed, so no todo form, label, short
 # id or reset/merge argument can be misread (round 7 archived an unpublished commit named by `reset <id>` before a
 # later `label <id>`). AUTO_MERGE (a tree merge-ort keeps while conflicts are open) is reported with them but does not
-# hold alone. A task rarely ends mid-operation; a false hold keeps a folder, a false archive deletes work.
+# hold alone: git 2.50 leaves a stale one after every rebase that completes without a conflict (`pull --rebase`
+# included), so it would hold clean, pushed work, and it names only a tree in the clone's shared object store, which
+# the deletion keeps. A task rarely ends mid-operation; a false hold keeps a folder, a false archive deletes work.
+# Names match in any letter case (review 9, P1): on a case-insensitive filesystem (macOS's usual one) git opens
+# Rebase-Apply/ as rebase-apply/, so a case-sensitive check archived a stopped `git am` and cleanup deleted its patch.
+# _operation_state checks both ways: os.path.lexists() of each canonical name (the filesystem applies its own case
+# rules) and a casefold scan of the listing (any variant, whatever the filesystem). On a case-sensitive filesystem a
+# variant git would not read still holds: a false hold costs a folder.
 OPERATION_STATE_DIRS = ("rebase-merge", "rebase-apply", "sequencer", "NOTES_MERGE_WORKTREE")
 OPERATION_STATE_FILES = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "BISECT_LOG")
 OPERATION_STATE_PREFIXES = ("BISECT_", "NOTES_MERGE_")
 OPERATION_STATE_COMPANIONS = ("AUTO_MERGE",)
+_OPERATION_STATE_NAMES = (*OPERATION_STATE_DIRS, *OPERATION_STATE_FILES)
+_OPERATION_STATE_FOLDED = frozenset(n.casefold() for n in _OPERATION_STATE_NAMES)
+_OPERATION_STATE_PREFIXES_FOLDED = tuple(p.casefold() for p in OPERATION_STATE_PREFIXES)
 # _op_state_files (the late-writer snapshot and the reflog reader) lists these trees and top-level files.
 OP_STATE_DIRS = OPERATION_STATE_DIRS
 OP_STATE_FILE_PREFIXES = OPERATION_STATE_PREFIXES
 OP_STATE_MAX_FILES = 10000
 REFLOG_MAX_BYTES = 16 * 1024 * 1024         # across the worktree's own reflogs (recovery refs)
+_OP_STATE_DIRS_FOLDED = frozenset(n.casefold() for n in (*OP_STATE_DIRS, "logs"))
+_OP_STATE_TOP_FILES_FOLDED = frozenset(n.casefold() for n in ("ORIG_HEAD", "MERGE_AUTOSTASH", *OPERATION_STATE_FILES,
+                                                                *OPERATION_STATE_COMPANIONS))
+
+
+def _is_operation_state_name(name: str) -> bool:
+    """True when the git-dir entry `name` is operation state (OPERATION_STATE_*) in any letter case."""
+    folded = name.casefold()
+    return folded in _OPERATION_STATE_FOLDED or folded.startswith(_OPERATION_STATE_PREFIXES_FOLDED)
 
 # Recovery refs (review 4, #2): `refs/cortados-recovery/<YYYYMMDD>/<task_id>/orig-head` and `.../reflog-<n>` in the
 # clone keep the commits a worktree's ORIG_HEAD or own reflogs reach and no shared ref does, before the worktree is
@@ -752,8 +772,8 @@ _RECOVERY_DATE_RE = re.compile(r"\d{8}")
 
 def _op_state_files(gitdir: str, deadline=None) -> list:
     """[(name relative to `gitdir`, full path)] for the worktree's per-worktree operation and recovery state:
-    everything under OP_STATE_DIRS and logs/, and the top-level ORIG_HEAD, MERGE_AUTOSTASH, OPERATION_STATE_FILES,
-    AUTO_MERGE and OP_STATE_FILE_PREFIXES files. Directories are listed with a trailing "/"; a symlink is listed, never
+    everything under OP_STATE_DIRS and logs/, and the top-level ORIG_HEAD, MERGE_AUTOSTASH, OPERATION_STATE_FILES
+    AUTO_MERGE and OP_STATE_FILE_PREFIXES files, each name matched in any letter case (review 9). Directories are listed with a trailing "/"; a symlink is listed, never
     followed. Raises WorkspaceError when a tree cannot be walked or has more than OP_STATE_MAX_FILES entries,
     GitTimeoutError past `deadline`."""
     out, errors = [], []
@@ -763,14 +783,15 @@ def _op_state_files(gitdir: str, deadline=None) -> list:
         raise WorkspaceError(f"the worktree's git dir cannot be listed: {type(exc).__name__}")
     for name in sorted(top):
         full = os.path.join(gitdir, name)
-        if name in ("ORIG_HEAD", "MERGE_AUTOSTASH", *OPERATION_STATE_FILES, *OPERATION_STATE_COMPANIONS) \
-                or name.startswith(OP_STATE_FILE_PREFIXES):
+        folded = name.casefold()
+        is_dir_name = folded in _OP_STATE_DIRS_FOLDED
+        if folded in _OP_STATE_TOP_FILES_FOLDED or folded.startswith(_OPERATION_STATE_PREFIXES_FOLDED):
             # A file name (a directory in its place is listed as the file), except NOTES_MERGE_WORKTREE, a directory
             # that is walked.
-            if name not in OP_STATE_DIRS or not (os.path.isdir(full) and not os.path.islink(full)):
+            if not is_dir_name or not (os.path.isdir(full) and not os.path.islink(full)):
                 out.append((name, full))
                 continue
-        if name not in (*OP_STATE_DIRS, "logs"):
+        if not is_dir_name:
             continue
         if os.path.islink(full) or not os.path.isdir(full):
             out.append((name, full))
@@ -903,19 +924,29 @@ def _ref_entries(path: str, patterns=(), deadline=None) -> dict:
 
 
 def _operation_state(gitdir: str) -> list:
-    """The in-progress operation state names in the worktree's own git dir `gitdir` (OPERATION_STATE_*), sorted, with
-    AUTO_MERGE added when it is there beside one of them; [] when no operation is in progress. Presence alone counts:
-    a name is not opened, so an unreadable file or a directory in a file's place holds like any other. Raises
-    StateUnreadableError when the git dir cannot be listed (no operation can be ruled out)."""
+    """The in-progress operation state names in the worktree's own git dir `gitdir` (OPERATION_STATE_*), as they are
+    on disk, sorted, with AUTO_MERGE added when it is there beside one of them; [] when no operation is in progress.
+    Any letter case counts (review 9):
+    a casefold scan of the listing, plus os.path.lexists() of each canonical name, which the filesystem resolves
+    with its own case rules (a canonical name found only that way is reported as such). Presence alone counts: a
+    name is not opened, so an unreadable file, a dangling symlink or a directory in a file's place holds like any
+    other. Raises StateUnreadableError when the git dir cannot be listed (no operation can be ruled out)."""
     try:
-        names = set(os.listdir(gitdir))
+        names = os.listdir(gitdir)
     except OSError as exc:
         raise StateUnreadableError(f"the worktree's git dir cannot be listed: {type(exc).__name__}")
-    found = sorted(n for n in names if n in OPERATION_STATE_DIRS or n in OPERATION_STATE_FILES
-                   or n.startswith(OPERATION_STATE_PREFIXES))
-    if found:
-        found += [n for n in OPERATION_STATE_COMPANIONS if n in names]
-    return found
+    found = {n.casefold(): n for n in names if _is_operation_state_name(n)}
+    for canonical in _OPERATION_STATE_NAMES:
+        if canonical.casefold() not in found and os.path.lexists(os.path.join(gitdir, canonical)):
+            found[canonical.casefold()] = canonical
+    if not found:
+        return []
+    for companion in OPERATION_STATE_COMPANIONS:
+        variants = [n for n in names if n.casefold() == companion.casefold()]
+        if not variants and os.path.lexists(os.path.join(gitdir, companion)):
+            variants = [companion]
+        found.update((v.casefold(), v) for v in variants[:1])
+    return sorted(found.values())
 
 
 def _recovery_candidates(path: str, gitdir: str, deadline=None):
@@ -1156,7 +1187,7 @@ def _git_state(path: str, deadline=None) -> dict:
     rev-parse --git-dir --git-common-dir`); its worktree-private refs (_private_refs, autostashes included); the size,
     mtime and inode of its index file; and those of its operation and recovery state (`ops`: _op_state_files, i.e.
     rebase-merge/, rebase-apply/, sequencer/, MERGE_HEAD etc., BISECT_*, NOTES_MERGE_*, AUTO_MERGE, ORIG_HEAD and
-    its own reflogs, so a late
+    its own reflogs, in any letter case, so a late
     reset-and-back that leaves HEAD where it was still counts). Shared state (branches, tags, the stash, packed-refs) is left out (review 3, P2 #3; #102): every
     worktree of the clone writes it, and it survives this worktree's deletion, so a sibling task's stash, commit or
     tag never holds this one. A late commit on this worktree's own branch still moves its HEAD.

@@ -526,7 +526,8 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   `rebase-apply/autostash`) that is never on a remote, so it always holds, `reason_code` `unpushed_autostash`; ANY
   in-progress git operation holds outright, `unpushed_operation_state`: `rebase-merge/`, `rebase-apply/` (also a
   stopped `git am`), `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `REBASE_HEAD`, `sequencer/`, `BISECT_LOG` (any
-  `BISECT_*`) or `NOTES_MERGE_*` in the worktree's own git dir, `AUTO_MERGE` reported with them. Their files are never
+  `BISECT_*`) or `NOTES_MERGE_*` in the worktree's own git dir (`AUTO_MERGE` reported with them), in any letter case
+  (on macOS's usual case-insensitive filesystem git reads `Rebase-Apply/` as `rebase-apply/`). Their files are never
   parsed and the commits they name are not checked: seven review rounds each found a todo, label, short-id or
   reset/merge form a parser missed, and one (`reset <id>` before a later `label <id>`) archived and then deleted an
   unpublished commit. A task rarely ends mid-operation, a false hold only keeps a folder, a false archive loses work.

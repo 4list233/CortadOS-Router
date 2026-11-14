@@ -2399,11 +2399,13 @@ class OperationStateAndRecoveryTests(_Base):
         self.assert_operation_holds(rec, "MERGE_HEAD", *(["AUTO_MERGE"] if auto else []))
 
     def test_auto_merge_alone_does_not_hold(self):
+        """AUTO_MERGE without an operation does not hold (review 9 kept this): git 2.50 leaves a stale one after a
+        rebase that completed without a conflict, and it names only a tree in the clone's shared object store."""
         rec = self.prepare(repo=self.origin, branch="feature")
         tree = git("rev-parse", "HEAD^{tree}", cwd=rec["path"]).strip()
-        with open(os.path.join(self.gitdir(rec["path"]), "AUTO_MERGE"), "w") as f:
+        with open(os.path.join(self.gitdir(rec["path"]), "auto_merge"), "w") as f:      # any case
             f.write(tree + "\n")
-        self.assertEqual(ws.assess(rec["path"])[0], True)
+        self.assertEqual(ws.assess(rec["path"])[:2], (True, "pushed"))
 
     def test_a_stopped_cherry_pick_holds(self):
         """A single pick (CHERRY_PICK_HEAD) and a sequence (sequencer/), published commits or not."""
@@ -2441,15 +2443,57 @@ class OperationStateAndRecoveryTests(_Base):
         self.clean(rec["path"])
         self.assert_operation_holds(rec, "rebase-merge")
 
+    def stopped_am(self, path):
+        """A real `git am` of a mailed patch that fails to apply and leaves its state in rebase-apply/; the patch's
+        content (UNPUBLISHED-MAIL-CONTENT) exists nowhere but that state. The tree is reset clean, HEAD is published."""
+        patch = git("format-patch", "-1", "--stdout", "origin/side", cwd=path)
+        patch = patch.replace("+side\n", "+UNPUBLISHED-MAIL-CONTENT\n")
+        self.assertIn("UNPUBLISHED-MAIL-CONTENT", patch)
+        stopped = subprocess.run(["git", "am"], cwd=path, input=patch, capture_output=True, text=True, env=GIT_ENV)
+        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)  # f.txt exists on feature
+        git("reset", "-q", "--hard", "HEAD", cwd=path)
+        self.clean(path)
+        state = os.path.join(self.gitdir(path), "rebase-apply")
+        self.assertTrue(os.path.isdir(state))
+        return state
+
+    def assert_patch_kept(self, settled):
+        held = settled["path"]
+        found = []
+        for directory, _, files in os.walk(self.gitdir(held)):
+            for name in files:
+                with open(os.path.join(directory, name), "rb") as f:
+                    if b"UNPUBLISHED-MAIL-CONTENT" in f.read():
+                        found.append(name)
+        self.assertTrue(found, "the stopped am's patch is gone")
+
     def test_a_stopped_am_holds_outright(self):
+        """A real stopped `git am` (review 8's reviewer: the old test synthesized rebase-apply/)."""
         rec = self.prepare(repo=self.origin, branch="feature")
-        state = os.path.join(self.gitdir(rec["path"]), "rebase-apply")
-        os.makedirs(state)
-        for name in ("applying", "0001"):
-            with open(os.path.join(state, name), "w") as f:
-                f.write("a mailed patch that exists nowhere else\n")
-        ok, reason, _ = ws.assess(rec["path"])
-        self.assertEqual((ok, reason.code), (False, "unpushed_operation_state"), reason)
+        self.stopped_am(rec["path"])
+        settled = self.assert_operation_holds(rec, "rebase-apply")
+        self.assert_patch_kept(settled)
+
+    def test_a_stopped_am_state_dir_in_another_case_holds_on_a_case_insensitive_filesystem(self):
+        """Review 8 of held-settle-fix (gpt-6.1-sol), P1: on macOS's usual case-insensitive filesystem git reads
+        Rebase-Apply/ as rebase-apply/; the case-sensitive name check archived the worktree and cleanup deleted the
+        unpublished patch. Real git; the reviewer's reproduction."""
+        probe = os.path.join(self.tmp, "CaseProbe")
+        os.makedirs(probe)
+        if not os.path.exists(os.path.join(self.tmp, "caseprobe")):
+            self.skipTest("the temp filesystem is case-sensitive: git would not read Rebase-Apply/ as an am in "
+                          "progress here (the casefold scan is covered by test_operation_state_names_match_any_case)")
+        rec = self.prepare(repo=self.origin, branch="feature")
+        state = self.stopped_am(rec["path"])
+        os.rename(state, os.path.join(os.path.dirname(state), "Rebase-Apply"))
+        self.assertIn("Rebase-Apply", os.listdir(os.path.dirname(state)))
+        self.assertNotIn("rebase-apply", os.listdir(os.path.dirname(state)))
+        status = git("status", cwd=rec["path"])
+        self.assertIn("am session", status)             # git itself still sees the stopped am
+        settled = self.assert_operation_holds(rec, "Rebase-Apply")
+        self.assert_patch_kept(settled)
+        listed = [name for name, _ in ws._op_state_files(self.gitdir(settled["path"]))]
+        self.assertIn("Rebase-Apply/", listed)          # the late-writer snapshot walks it too
 
     def test_a_finished_or_aborted_operation_leaves_a_clean_pushed_worktree_that_archives(self):
         rec = self.prepare(repo=self.origin, branch="feature")
@@ -2460,6 +2504,31 @@ class OperationStateAndRecoveryTests(_Base):
         git("bisect", "reset", cwd=rec["path"])
         settled = ws.settle(rec, self.root)
         self.assertEqual((settled["state"], settled["reason_code"]), ("archived", "pushed"), settled)
+
+    def test_operation_state_names_match_any_case(self):
+        """Review 9: the git-dir scan and the snapshot walker match operation state names case-insensitively (a
+        case-insensitive filesystem resolves any case to git's own name). Runs on any filesystem: a plain directory."""
+        gitdir = os.path.join(self.tmp, "fake-gitdir")
+        os.makedirs(os.path.join(gitdir, "Rebase-Apply"))
+        with open(os.path.join(gitdir, "Rebase-Apply", "patch"), "w") as f:
+            f.write("unpublished\n")
+        for name in ("Merge_Head", "bisect_log", "auto_merge", "Notes_Merge_Partial", "orig_head", "HEAD", "config"):
+            with open(os.path.join(gitdir, name), "w") as f:
+                f.write("x\n")
+        os.makedirs(os.path.join(gitdir, "SEQUENCER"))
+        self.assertEqual(sorted(ws._operation_state(gitdir), key=str.casefold),
+                         sorted(["Rebase-Apply", "Merge_Head", "bisect_log", "auto_merge", "Notes_Merge_Partial",
+                                 "SEQUENCER"], key=str.casefold))
+        listed = {name for name, _ in ws._op_state_files(gitdir)}
+        for name in ("Rebase-Apply/", "Rebase-Apply/patch", "Merge_Head", "bisect_log", "auto_merge",
+                     "Notes_Merge_Partial", "orig_head", "SEQUENCER/"):
+            self.assertIn(name, listed)
+        self.assertNotIn("HEAD", listed)
+        self.assertNotIn("config", listed)
+        for name in os.listdir(gitdir):
+            path = os.path.join(gitdir, name)
+            shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+        self.assertEqual(ws._operation_state(gitdir), [])
 
     def test_operation_state_that_cannot_be_read_still_holds(self):
         """Presence alone counts: a directory or a mode-0 file in a state file's place holds as an operation, and a
