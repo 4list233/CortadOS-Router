@@ -27,6 +27,8 @@ PASSED = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.ge
           "HTTP_PROXY": "http://proxy:3128", "http_proxy": "http://proxy:3128",
           "HTTPS_PROXY": "http://proxy:3128", "https_proxy": "http://proxy:3128",
           "NO_PROXY": "localhost,127.0.0.1", "no_proxy": "localhost,127.0.0.1",
+          # an authenticated proxy URL passes unchanged: proxy credentials the owner configured (accepted exception)
+          "ALL_PROXY": "socks5://owner:pw@proxy:1080", "all_proxy": "socks5://owner:pw@proxy:1080",
           "SSL_CERT_FILE": "/ca/bundle.pem", "SSL_CERT_DIR": "/ca", "REQUESTS_CA_BUNDLE": "/ca/bundle.pem",
           "NODE_EXTRA_CA_CERTS": "/ca/bundle.pem", "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8", "TZ": "UTC"}
 CODEX_CA = {"CODEX_CA_CERTIFICATE": "/ca/macos-system-roots.pem"}
@@ -49,6 +51,11 @@ class BackendEnvTests(unittest.TestCase):
             self.assertNotIn("KEEP_ME", env, "an unlisted variable never passes, whatever its name")
             for name, value in PASSED.items():
                 self.assertEqual(env.get(name), value, (backend, name))
+
+    def test_all_proxy_passes_in_both_cases_credentials_unchanged(self):
+        environ = {"ALL_PROXY": "http://u:p@proxy:3128", "all_proxy": "socks5h://u:p@proxy:1080"}
+        for backend in ("codex", "claude"):
+            self.assertEqual(child_env.backend_env(backend, environ=environ), environ, backend)
 
     def test_each_backend_gets_only_its_own_variables(self):
         environ = {"CODEX_HOME": "/h", **CODEX_CA, "CLAUDE_CONFIG_DIR": "/cfg", "CLAUDE_CODE_OAUTH_TOKEN": "tok"}
@@ -129,7 +136,7 @@ class SpawnSiteTests(unittest.TestCase):
         self.assertEqual(seen["CODEX_CA_CERTIFICATE"], CODEX_CA["CODEX_CA_CERTIFICATE"])
 
     def test_claude_bridge(self):
-        s = bridge.BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
+        s = bridge.BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9",
                                  claude_bin=self.bin, scratch_root=self.tmp)
         try:
             seen = self.child_env_seen()
@@ -141,7 +148,7 @@ class SpawnSiteTests(unittest.TestCase):
 
     def test_claude_bridge_on_a_routed_account(self):
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "ambient"}):
-            s = bridge.BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
+            s = bridge.BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9",
                                      claude_bin=self.bin, scratch_root=self.tmp, config_dir="/cfg/b")
             try:
                 seen = self.child_env_seen()

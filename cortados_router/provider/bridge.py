@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import secrets
 import shutil
 import subprocess
 import sys
@@ -130,11 +131,15 @@ def write_line(proc: subprocess.Popen, line: str, timeout: float, who: str) -> N
 
 
 class BridgeSession:
-    def __init__(self, *, system: str, tools: list[dict[str, Any]], gateway_url: str, token: str,
+    def __init__(self, *, system: str, tools: list[dict[str, Any]], gateway_url: str,
                  claude_bin: str | list[str] = "claude", model: str | None = None, scratch_root: str | None = None,
                  config_dir: str | None = None, popen: Callable[..., subprocess.Popen] = subprocess.Popen):
         self.config_dir = config_dir            # CLAUDE_CONFIG_DIR of the routed account; None = the default login
         self.id = uuid.uuid4().hex
+        # The shim's credential (#106 review): random, minted per session, good for POST /bridge/call on THIS session
+        # only (server.Registry.bridge_session) and revoked when the session leaves the registry or closes. The
+        # owner token never reaches the CLI, its mcp.json or the shim. Never logged.
+        self.bridge_token: str | None = secrets.token_urlsafe(32)
         self.lock = threading.Lock()                    # one client request at a time per conversation
         self.last_used = time.time()
         self.emitted: set[str] = set()                  # tool_use ids handed to the client
@@ -169,7 +174,7 @@ class BridgeSession:
                 (self.dir / "mcp.json").write_text(json.dumps({"mcpServers": {BRIDGE_SERVER: {
                     "command": sys.executable,
                     "args": ["-I", str(SHIM), gateway_url, self.id, str(self.dir / "tools.json")],
-                    "env": {"CORTADOS_PROVIDER_TOKEN": token,
+                    "env": {"CORTADOS_PROVIDER_BRIDGE_TOKEN": self.bridge_token,
                             "CORTADOS_PROVIDER_TOOL_WAIT_S": str(effective_tool_wait(IDLE_S, TOOL_WAIT_S)),
                             "CORTADOS_PROVIDER_TURN_TIMEOUT_S": str(TURN_TIMEOUT_S),
                             "CORTADOS_PROVIDER_CALL_SLACK_S": str(CALL_SLACK_S),
@@ -374,6 +379,7 @@ class BridgeSession:
 
     # ------------------------------------------------------------------ lifecycle
     def close(self) -> None:
+        self.bridge_token = None                        # revoked: the shim's calls are refused from here on
         with self._cv:
             self._closing = True                        # an exit we caused is not an unexpected exit
         try:

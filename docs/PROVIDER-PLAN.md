@@ -649,8 +649,10 @@ of those passed unless someone had named its family.
 Spawn sites: `bridge.BridgeSession` and `search_lane.run` (both through `bridge.claude_env`), and
 `codex_bridge.CodexSession` (through `codex_isolation.child_env`). The login readers (`floor.executing_login`, the
 server's reveal) call the same builders, so the login they report is the one the child runs on. The MCP shim the
-Claude CLI starts gets its own variables (`CORTADOS_PROVIDER_TOKEN` and the timeouts) from the session's `mcp.json`,
-not from the inherited environment. No Cursor or Antigravity CLI is started by the provider.
+Claude CLI starts gets its own variables (`CORTADOS_PROVIDER_BRIDGE_TOKEN` and the timeouts) from the session's
+`mcp.json`, not from the inherited environment. That credential is minted per session (`secrets.token_urlsafe(32)`),
+opens only `POST /bridge/call` for that session and is revoked when the session leaves the registry or closes; the
+owner token is in no backend's `mcp.json`, argv or environment. No Cursor or Antigravity CLI is started by the provider.
 
 Not covered, on purpose: `child_tasks.py` (whole Claude Code tasks with the owner's tools and connectors, another
 trust level, which has its own login-mode allowlist) and the scarcity / S1 probes; the S1 outcome loop keeps the

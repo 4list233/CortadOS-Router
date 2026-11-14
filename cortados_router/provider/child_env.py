@@ -35,6 +35,8 @@ BASE_ENV = frozenset({
     "HTTP_PROXY", "http_proxy",     # a host that reaches the vendor only through a proxy (both cases are read)
     "HTTPS_PROXY", "https_proxy",
     "NO_PROXY", "no_proxy",
+    "ALL_PROXY", "all_proxy",       # the catch-all proxy (curl, Node agents); an authenticated URL (user:pass@)
+                                    # passes unchanged: proxy credentials the owner configured, an accepted exception
     "SSL_CERT_FILE",                # a custom CA bundle (TLS interception, or the system roots exported, #103)
     "SSL_CERT_DIR",
     "REQUESTS_CA_BUNDLE",
