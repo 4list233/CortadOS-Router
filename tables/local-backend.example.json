@@ -4,7 +4,7 @@
  "read_timeout_s": 900,
  "_read_timeout_s": "The gate's wait for each upstream read (default 300 s). A non-streaming vllm-mlx answer sends nothing until it is whole; at 8 at once a long one takes minutes. 900 matches vllm_mlx.serve.timeout_s. Set the Pro block's read_timeout_s on the provider host to the same.",
  "vllm_mlx": {
-  "_comment": "venv: the Python venv holding vllm-mlx (0.6.0 measured). served_model_name must be the id the provider's config gives this model on the Air (tables/resources.json, the Pro block's models[].id), so nothing changes there but max_inflight; name and name:latest are the same model. idle_cap / weights_gib / per_request_gib size the governor per model. serve: vllm-mlx flags (local_backend.SERVE_DEFAULTS has each one's reason); host must be loopback.",
+  "_comment": "venv: the Python venv holding vllm-mlx (0.6.0 measured). served_model_name must be the id the provider's config gives this model on the Air (tables/resources.json, the Pro block's models[].id), so nothing changes there but max_inflight; name and name:latest are the same model. idle_cap, weights_bytes, kv_bytes_per_token, per_seq_state_bytes, prefill_margin_bytes and context_tokens size the governor per model (governor._reasons has each one's reason). serve: vllm-mlx flags (local_backend.SERVE_DEFAULTS has each one's reason); host must be loopback.",
   "venv": "~/venvs/mlx-bench",
   "model": "qwen-27b-4bit",
   "models": {
@@ -12,17 +12,23 @@
     "path": "~/models/mlx/Qwen3.8-27B-heretic-ara-4bit-bench",
     "served_model_name": "Qwen27b_heretic:latest",
     "idle_cap": 8,
-    "weights_gib": 15,
-    "per_request_gib": 2.0,
-    "_comment": "Measured 2026-11-14 on the Pro: peak aggregate 87.9 tok/s at 8, 31 GB peak footprint."
+    "weights_bytes": 16106127360,
+    "kv_bytes_per_token": 65536,
+    "per_seq_state_bytes": 161061273,
+    "prefill_margin_bytes": 1610612736,
+    "context_tokens": 131072,
+    "_comment": "Measured 2026-11-14 on the Pro: peak aggregate 87.9 tok/s at 8, 31 GB peak footprint (~8.5k-token prompts). weights_bytes 15 GiB. KV: 16 full-attention layers x K/V x 4 KV heads x head_dim 256 x fp16 = 65,536 bytes/token (a 128k context holds 8 GiB), plus ~0.15 GiB recurrent state per sequence; vllm-mlx keeps the KV cache unquantized."
    },
    "qwen-27b-6bit": {
     "path": "~/models/mlx/<6-bit copy>",
     "served_model_name": "Qwen27b_heretic:latest",
     "idle_cap": 6,
-    "weights_gib": 22,
-    "per_request_gib": 2.2,
-    "_comment": "NOT measured: a placeholder for the planned 6-bit copy. Heavier weights leave less room for KV cache, so the cap starts lower; bench it (as for the 4-bit) before raising idle_cap."
+    "weights_bytes": 24051816857,
+    "kv_bytes_per_token": 65536,
+    "per_seq_state_bytes": 161061273,
+    "prefill_margin_bytes": 1610612736,
+    "context_tokens": 131072,
+    "_comment": "Memory measured on the Pro: 22.4 GB idle (weights_bytes), peaks 24.7 / 25.9 / 27.9 / 31.5 GB at 1 / 2 / 4 / 8 requests of ~8.5k tokens. Same architecture as the 4-bit, so the same KV and state sizes; 17.6 GiB beside the weights holds one 128k-token request (9.65 GiB reserved), not two. Throughput not benched: idle_cap stays 6 until it is. Set path to the copy's directory."
    }
   },
   "serve": {
@@ -39,27 +45,35 @@
   "extra_args": []
  },
  "governor": {
-  "_comment": "Activity governor (cortados_router/local_governor.py, owner-approved policy; docs/LOCAL-RESOURCES.md \"MLX backend\"). Enforced in the local gate as an admission count on POST /v1/messages; a request over the limit gets a retryable 529 with Retry-After and is never queued at the gate. Running requests are never stopped. Remove the section to run without a governor (unlimited, as with Ollama).",
+  "_comment": "Activity governor (cortados_router/local_governor.py, owner-approved policy; docs/LOCAL-RESOURCES.md \"MLX backend\"). Enforced in the local gate on POST /v1/messages by two bounds: a COUNT from the owner's activity and memory pressure, and a BYTE budget: each request reserves (input tokens ~ body chars / 3.5 + max_tokens, capped at context_tokens) x kv_bytes_per_token + per_seq_state_bytes + prefill_margin_bytes, and is admitted only while the reservations in flight fit in memory_budget_bytes - weights_bytes. A request over either bound now gets a retryable 529 with Retry-After; one that could not fit even alone gets a non-retryable 413 (the provider routes it elsewhere). Nothing is queued at the gate, running requests are never stopped. Remove the section to run without a governor (unlimited, as with Ollama).",
   "_reasons": {
    "active_idle_s": "10 minutes without keyboard or mouse: the owner has stepped away (a pause to read or think is shorter); below it the owner is active and the laptop must stay responsive.",
    "active_cap": "Owner active: measured on the Pro (4-bit, ~8.5k-token prompts) 2 requests give 47.8 tok/s aggregate at 23.9 tok/s each, near single-request speed; 4 already drops each to 18.7 tok/s and TTFT to 43 s.",
    "idle_cap": "Owner idle and pressure normal: the per-model cap (each vllm_mlx.models entry sets its own). Default 8, the measured aggregate peak for the 4-bit model (87.9 tok/s at a 31 GB peak, no swap growth; 16 fell to 64.8).",
    "warn_cap": "Memory pressure warn: macOS is compressing and close to swapping; hold at 1 running so the node drains instead of adding KV cache.",
    "critical_cap": "Memory pressure critical: admit nothing new; running requests finish (stopping them would waste their work and free memory no sooner).",
-   "memory_budget_gib": "40 GB of the Pro's 48 GB unified memory for the backend, leaving ~8 GB for macOS and the owner's apps; the idle cap is also bounded by (budget - weights_gib) / per_request_gib.",
-   "weights_gib": "Default resident weights when a model entry names none (the 4-bit 27B is 15 GB).",
-   "per_request_gib": "Default memory per running request when a model entry names none: (31 GB peak - 15 GB weights) / 8 requests = 2 GB at ~8.5k-token prompts; longer prompts take more, which the pressure signal covers.",
    "sample_s": "Signals are re-read at most every 5 s: idle changes on a scale of minutes, pressure of seconds; never one subprocess per request.",
    "retry_after_s": "Retry-After on an over-limit 529: the next sample is at most sample_s away and a slot frees when a request ends; 5 s lets a client retry soon without hammering the gate.",
-   "unknown_pressure": "An unreadable pressure level counts as warn: keep serving one at a time rather than stopping (critical) or trusting an unknown memory state (normal)."
+   "unknown_pressure": "An unreadable pressure level counts as warn: keep serving one at a time rather than stopping (critical) or trusting an unknown memory state (normal).",
+   "memory_budget_bytes": "40 GiB (42949672960) of the Pro's 48 GB unified memory for the backend, leaving ~8 GB for macOS and the owner's apps. Requests are admitted only while the bytes they reserve, in flight together, fit in memory_budget_bytes - weights_bytes.",
+   "weights_bytes": "Default resident weights when a model entry names none: the 4-bit 27B is 15 GiB (16106127360); the 6-bit entry sets its measured 22.4 GB.",
+   "kv_bytes_per_token": "KV cache per token of context, unquantized fp16 in vllm-mlx: Qwen3.8 27B keeps KV only in its 16 full-attention layers: 16 x 2 (K, V) x 4 KV heads x head_dim 256 x 2 bytes = 65,536, so a 128k-token request holds 8 GiB.",
+   "per_seq_state_bytes": "Per running request whatever its length: the hybrid model's recurrent-layer state, about 0.15 GiB (161061273) per sequence.",
+   "prefill_margin_bytes": "Per running request: prefill activations and allocator slack beyond KV and state. The 6-bit copy used 2.3 GB over idle for one ~9k-token request, of which KV + state explain ~0.7 GiB; 1.5 GiB (1610612736) covers the rest. A 128k request then reserves 9.65 GiB: two fit in 25 GiB, a third does not; eight ~9k-token requests (2.2 GiB each) do.",
+   "context_tokens": "The longest context the model is served with, the Pro block's context_length on the provider host (131072). A request's tokens (input + max_tokens) are capped here.",
+   "default_max_tokens": "max_tokens reserved for a request that names none: vllm-mlx's own default (vllm_mlx.serve.max_tokens, 32768; the gate takes the serve value when this key is absent)."
   },
   "active_idle_s": 600,
   "active_cap": 2,
   "warn_cap": 1,
   "critical_cap": 0,
-  "memory_budget_gib": 40.0,
-  "weights_gib": 15.0,
-  "per_request_gib": 2.0,
+  "memory_budget_bytes": 42949672960,
+  "weights_bytes": 16106127360,
+  "kv_bytes_per_token": 65536,
+  "per_seq_state_bytes": 161061273,
+  "prefill_margin_bytes": 1610612736,
+  "context_tokens": 131072,
+  "default_max_tokens": 32768,
   "sample_s": 5.0,
   "retry_after_s": 5,
   "unknown_pressure": "warn"

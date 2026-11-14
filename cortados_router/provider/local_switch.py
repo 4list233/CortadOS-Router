@@ -73,15 +73,17 @@ def _clean(data: Any) -> dict[str, Any]:
 
 def _capacity(c: Any) -> dict[str, Any] | None:
     """The gate's admission report (local_gate.GateServer.capacity), field by field: the limit (None: no governor) and
-    in-flight count as small integers, the owner/pressure state as known words, the reason as bounded text."""
+    in-flight count as small integers, the owner/pressure state as known words, the reason as bounded text, and the
+    byte budget (reserved and free bytes, the token room alone and now) as non-negative integers (None: no governor)."""
     if not isinstance(c, dict):
         return None
-    def count(v):
-        return v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 10000 else None
+    def count(v, top=10000):
+        return v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= top else None
     return {"limit": count(c.get("limit")), "inflight": count(c.get("inflight")),
             "owner": c.get("owner") if c.get("owner") in ("active", "idle") else None,
             "pressure": c.get("pressure") if c.get("pressure") in ("normal", "warn", "critical", "unknown") else None,
-            "reason": _text(c.get("reason"), REASON_MAX)}
+            "reason": _text(c.get("reason"), REASON_MAX),
+            **{k: count(c.get(k), 2 ** 53) for k in ("reserved_bytes", "free_bytes", "fit_tokens", "free_tokens")}}
 
 
 def _gate_call(node: dict[str, Any], method: str, body: dict[str, Any] | None = None) -> dict[str, Any]:

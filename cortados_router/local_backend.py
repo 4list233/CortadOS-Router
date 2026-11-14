@@ -154,6 +154,9 @@ def check(raw: Any, path: str | None = None) -> dict[str, Any]:
     gov = raw.get("governor")
     if gov is not None and not isinstance(gov, dict):
         raise BackendConfigError("governor must be an object or absent")
+    if gov is not None and out["serve"] and "default_max_tokens" not in gov:
+        # A request naming no max_tokens gets vllm-mlx's own default, so the governor reserves for that.
+        gov = {**gov, "default_max_tokens": out["serve"]["max_tokens"]}
     try:
         out["governor"] = local_governor.check_config(gov, model) if gov is not None else None
     except local_governor.GovernorConfigError as exc:
@@ -240,9 +243,9 @@ def serve_argv(cfg: dict[str, Any]) -> list[str]:
         raise BackendConfigError("serve_argv needs backend vllm-mlx")
     s, m = cfg["serve"], cfg["model"]
     gov = cfg["governor"] or local_governor.check_config({}, m)
-    # The backend's own bound: never more sequences than the governor could ever admit (the idle cap, itself bounded
-    # by the memory budget), so a request that slipped past the gate still could not overrun memory.
-    seqs = max(1, min(gov["idle_cap"], local_governor.memory_cap(gov)))
+    # The backend's own bound: never more sequences than the governor could ever admit (the idle cap, bounded by how
+    # many empty-context reservations fit the byte budget), so a request that slipped past the gate could not add more.
+    seqs = local_governor.max_seqs(gov)
     argv = [str(Path(_expand(cfg["venv"])) / "bin" / "vllm-mlx"), "serve", _expand(m["path"]),
             "--served-model-name", cfg["served_model"], "--host", s["host"], "--port", str(s["port"]),
             "--continuous-batching", "--max-num-seqs", str(seqs),

@@ -591,39 +591,110 @@ gate's client-facing routes do not grow. On `POST /v1/messages` to vllm-mlx the 
   silently answered by the MLX model;
 - rewraps FastAPI's `{"detail": …}` errors in Anthropic's error shape.
 
-### The governor (owner-approved policy)
+### The governor (owner-approved policy) and token-aware memory admission
 
 `cortados_router/local_governor.py`, run inside the gate on the Pro. Inputs, sampled at most every `sample_s` (5 s):
 keyboard/mouse idle seconds (`ioreg -r -c IOHIDSystem -d 1`, `HIDIdleTime`) and macOS memory pressure (`sysctl -n
-kern.memorystatus_vm_pressure_level`: 1 normal, 2 warn, 4 critical). The policy as implemented (`policy()`; defaults,
-each threshold with its reason in `tables/local-backend.example.json` → `governor._reasons`):
+kern.memorystatus_vm_pressure_level`: 1 normal, 2 warn, 4 critical). A turn is admitted only when it passes **both**
+bounds below; defaults, each with its reason, in `tables/local-backend.example.json` → `governor._reasons`.
 
-| Owner | Memory pressure | Admission limit (requests running at once) | Default (4-bit) |
+**Count** (`policy()`): an upper bound on how many requests run at once, whatever their size.
+
+| Owner | Memory pressure | Count limit (requests running at once) | Default (4-bit) |
 |---|---|---|---|
-| active (idle < `active_idle_s` 600 s) | normal | min(`active_cap`, idle limit) | 2 |
-| idle (≥ 600 s) | normal | idle limit = min(model `idle_cap`, memory cap) | 8 |
+| active (idle < `active_idle_s` 600 s) | normal | min(`active_cap`, model `idle_cap`) | 2 |
+| idle (≥ 600 s) | normal | model `idle_cap` | 8 |
 | any | warn | min(the row above, `warn_cap`) | 1 |
 | any | critical | min(the row above, `critical_cap`) | 0 (nothing new) |
 | unreadable idle | — | counted active | |
 | — | unreadable | counted `unknown_pressure` | warn |
 
-Memory cap = ⌊(`memory_budget_gib` 40 − model `weights_gib` 15) / model `per_request_gib` 2⌋ = 12, so the 4-bit idle
-limit is 8. The limit bounds **admission only**: when the owner comes back with 6 running, the limit drops to 2,
-nothing new is admitted until fewer than 2 run, and the 6 finish on their own (never killed).
+**Bytes** (`request_bytes()`): each turn reserves the memory its context will hold, and turns are admitted while the
+reservations in flight fit beside the weights. The fixed "2 GB per request" cap is gone: it came from ~8.5k-token
+benchmark prompts, and real Claude Code turns of 30k–130k tokens hold four to sixteen times that.
 
-Enforcement is an admission count in the gate on `POST /v1/messages` (the probe is never counted). Over the limit the
-gate answers at once, nothing reaching the backend: `529 overloaded_error`, `Retry-After: retry_after_s` (5), message
-`local gate: busy (n of limit running: reason)`, and the capacity report. The gate reports `{"backend", "limit",
-"inflight", "owner", "pressure", "reason"}` read-only as `cortados_gate` in every `GET /api/tags` answer and as
-`capacity` in the switch status (provider `GET /v1/cortados/local`; the dashboard's Local models card shows
-"vllm-mlx: n of limit running (reason)").
+```
+tokens   = min(input tokens + max_tokens, context_tokens)      input tokens ≈ request body characters / 3.5
+reserved = tokens × kv_bytes_per_token + per_seq_state_bytes + prefill_margin_bytes
+admit    iff  count < count limit  and  reserved in flight + reserved ≤ memory_budget_bytes − weights_bytes
+```
 
-The provider (`local_lane.gate_busy`) keeps the latest report per node for 10 s. A full gate is a busy node: the index
-route, auto_route and the sensitive moves skip it after their probe and keep S1's route ("routes elsewhere"). A turn
-the gate refuses (a race between probe and turn, or a continuation of a local-bound conversation) is answered to the
-client as `529 overloaded_error` with the gate's `Retry-After`, the provider's existing busy shape (BUSY_STATUS), which
-Claude Code and the SDK retry; a refused opening turn leaves no conversation behind, so its retry is routed afresh
-(to the cloud while the node stays full). The refusal fallback treats a busy node as unavailable.
+A request without `max_tokens` reserves vllm-mlx's default (`vllm_mlx.serve.max_tokens`, 32768). Per model (a
+`vllm_mlx.models` entry overrides the `governor` default), measured and derived for Qwen3.8 27B (hybrid attention /
+recurrent; vllm-mlx keeps the KV cache unquantized, fp16):
+
+| Setting | Default | Why |
+|---|---|---|
+| `memory_budget_bytes` | 40 GiB | of the Pro's 48 GB, leaving ~8 GB for macOS and the owner's apps |
+| `weights_bytes` | 15 GiB (4-bit); 22.4 GB (6-bit, measured idle) | resident weights |
+| `kv_bytes_per_token` | 65,536 | 16 full-attention layers × K/V × 4 KV heads × head_dim 256 × 2 bytes; 128k tokens = 8 GiB |
+| `per_seq_state_bytes` | 0.15 GiB | the recurrent layers' state per sequence |
+| `prefill_margin_bytes` | 1.5 GiB | prefill activations and allocator slack: the 6-bit copy used 2.3 GB over idle for one ~9k-token request, KV + state explain ~0.7 GiB |
+| `context_tokens` | 131072 | the Pro block's `context_length` on the provider host; tokens are capped here |
+
+What that admits (owner idle, pressure normal; 25 GiB beside the 4-bit weights, 17.6 GiB beside the 6-bit):
+
+| Mix | Reserved | 4-bit | 6-bit |
+|---|---|---|---|
+| one 128k-token turn | 9.65 GiB | yes | yes |
+| two 128k-token turns | 19.3 GiB | yes | no (the second waits) |
+| three 128k-token turns | 29.0 GiB | no (the third waits) | no |
+| eight ~8.5k-token turns (512 out) | 8 × 2.17 GiB | yes (the count's 8) | count-capped at 6 |
+| two 128k + short turns | 19.3 + 2.17 each | two short fit, a third waits | — |
+
+Measured footprints the defaults were checked against: 4-bit ~31 GB at 8 × ~8.5k tokens; 6-bit 24.7 / 25.9 / 27.9 /
+31.5 GB at 1 / 2 / 4 / 8. The reservations are on the safe side of both (8 short 4-bit turns reserve 17.4 GiB against 16
+GB measured above the weights).
+
+Rules on top:
+
+- **A single turn is always admitted when nothing runs and it fits alone** (and the count allows one: under critical
+  pressure nothing is admitted).
+- **A turn that could never fit** (its reservation exceeds `memory_budget_bytes − weights_bytes` even with nothing
+  else running) is refused for good, not left to an endless 529 loop: see Enforcement.
+- **Pressure stays the safety net**: on warn or critical the count caps apply even when the bytes fit.
+- Both bounds gate **admission only**: when the owner comes back with 6 running, the limit drops to 2, nothing new is
+  admitted until fewer than 2 run, and the 6 finish on their own (never killed). A reservation is released however
+  its turn ends: answered, backend error, upstream timeout, backend unreachable, client gone mid-stream, or an
+  exception in the relay (a `Ticket`, released once in the gate's `finally`).
+- vllm-mlx's own `--max-num-seqs` is `max_seqs()`: the idle cap, bounded by how many empty-context reservations fit.
+
+Old configs: the count-only keys `per_request_gib`, `memory_budget_gib` and `weights_gib` are refused by name, with the
+key that replaced them (a gate given an old config does not start; update `~/.config/cortados/local-backend.json`
+from the example).
+
+Enforcement, in the gate on `POST /v1/messages` (the probe is never counted), nothing reaching the backend when refused:
+
+- over either bound **now**: `529 overloaded_error`, `Retry-After: retry_after_s` (5), message `local gate: busy (n of
+  limit running: reason)`; the reason names the memory budget when the bytes refused it (`memory budget: 5.7 GiB free,
+  request needs 9.6 GiB`);
+- **never fits**: `413 request_too_large`, `x-should-retry: false`, no Retry-After, message `local gate: too large for
+  this node's memory (…; at most N tokens of input + max_tokens fit)`.
+
+Both carry the capacity report. The gate reports `{"backend", "limit", "inflight", "owner", "pressure", "reason",
+"reserved_bytes", "free_bytes", "fit_tokens", "free_tokens"}` read-only as `cortados_gate` in every `GET /api/tags`
+answer and as `capacity` in the switch status (provider `GET /v1/cortados/local`; the dashboard's Local models card
+shows "vllm-mlx: n of limit running, R of B GiB reserved (reason)"). `free_bytes` is the budget beside the weights
+minus the reservations; `fit_tokens` is the most context one turn may hold alone, `free_tokens` beside what runs now
+(0 when the count is full). Bytes and tokens are null without a governor.
+
+The provider (`local_lane.gate_busy`, `local_lane.gate_fit`) keeps the latest report per node for 10 s and estimates a
+turn's tokens the way the gate does (`local_lane.request_tokens`). A full gate, a turn over `free_tokens` (busy) or
+over `fit_tokens` (too large) is skipped by the index route, auto_route and the sensitive moves after their probe, and
+S1's route stands ("routes elsewhere"). A turn the gate still refuses:
+
+- busy (a race between probe and turn, or a continuation of a local-bound conversation): answered to the client as
+  `529 overloaded_error` with the gate's `Retry-After`, the provider's existing busy shape (BUSY_STATUS), which Claude
+  Code and the SDK retry; a refused opening turn leaves no conversation behind, so its retry is routed afresh (to the
+  cloud while the node stays full);
+- too large, on the **opening turn of a conversation a rule moved to the node**: nothing is sent to the client; the
+  provider drops the conversation and routes it again once with that local model excluded (S1's route, or another
+  node), and the client gets that route's answer;
+- too large on a **pinned** turn (`sub/<local model>`) or a **continuation**: a terminal `413 request_too_large` with
+  `x-should-retry: false`, saying the turn is too large for the node's memory (compact, lower max_tokens, start a new
+  conversation, or pin a cloud model); the conversation is unchanged.
+
+The refusal fallback (`local_lane.complete`) treats a busy or too-large node as unavailable.
 
 ### Switch the Pro to MLX
 
@@ -643,7 +714,7 @@ Owner steps; nothing here was run by the build. The provider's lane config needs
    Check: `python3 -m cortados_router.local_gate --listen <tailscale-ip> --print-config` shows `"backend":
    "vllm-mlx"` and the governor.
 5. On the provider host (the Air), in `tables/resources.json`'s Pro block: `max_inflight` to the idle cap (8), so the
-   provider's own ceiling does not stop at 1 (the gate's governor sets the real limit), and `read_timeout_s` to 900
+   provider's own ceiling does not stop at 1 (the gate's governor sets the real limit, by count and by bytes), and `read_timeout_s` to 900
    (as the backend config's). Restart the provider when the owner chooses.
 
 With the gate on vllm-mlx the Pro serves only the MLX model: the Ollama-only pins (`qwythos-9b`, `qwen-abliterated`,

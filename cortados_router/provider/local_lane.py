@@ -21,6 +21,8 @@ Owner of four rules:
                 node busy: a busy node is not offered by index_route. A node whose gate runs a governor (an MLX
                 backend, docs/LOCAL-RESOURCES.md "MLX backend") also reports its own admission limit and in-flight
                 count (gate_busy); a full gate is busy too, and max_inflight is then only the provider's ceiling.
+                Its report also carries the most tokens one request may hold there, alone and beside what runs now
+                (gate_fit): a request the node's memory could never hold, or cannot hold now, is routed elsewhere.
   availability  a lane is available when its node answers GET /api/tags within a short timeout and lists the model.
                 On the Pro the gate (local_gate.py) answers that probe with a 503 while on battery or with the manual
                 switch off, so one probe covers AC power, the switch and gate health. A pin to an unavailable node fails
@@ -49,6 +51,7 @@ import time
 import urllib.parse
 from typing import Any
 
+from cortados_router import local_governor
 from cortados_router.compat import getenv
 
 CONFIG_ENV = "CORTADOS_LOCAL_RESOURCES_CONFIG"
@@ -325,7 +328,11 @@ def complete(body: dict[str, Any], node: dict[str, Any], model: dict[str, Any]) 
                 busy_answer = _gate_busy_answer(raw) if resp.status == 529 else None
                 if busy_answer is not None:
                     _note_gate(node, busy_answer.get(GATE_KEY))
-                    raise LocalUnavailable(f"node {node['node']} busy ({gate_busy(node) or 'gate full'})")
+                    raise LocalUnavailable(f"node {node['node']} busy ({_busy_why(node)})")
+                big = _gate_too_large_answer(raw) if resp.status == 413 else None
+                if big is not None:
+                    _note_gate(node, big.get(GATE_KEY))
+                    raise LocalUnavailable(f"node {node['node']}: request too large for its memory budget")
                 raise LocalUnavailable(f"node {node['node']}: {policy}" if policy else
                                        f"node {node['node']} answered /v1/messages with HTTP {resp.status}")
             msg = json.loads(resp.read())
@@ -418,6 +425,10 @@ def think_budget(max_tokens: Any) -> int | None:
 # answer (serve, complete).
 GATE_KEY = "cortados_gate"
 GATE_BUSY = "local gate: busy"
+GATE_TOO_LARGE = "local gate: too large for this node's memory"   # local_gate.TOO_LARGE_MESSAGE: never retried
+# serve's outcome for a turn the gate refused as too large when the caller asked to route it elsewhere (reroute=True):
+# nothing was sent to the client, so the server can open the conversation on another route.
+TOO_LARGE = "too_large"
 GATE_REPORT_TTL_S = 10.0
 BUSY_RETRY_AFTER_S = 5                     # when a 529 from the gate carries no usable Retry-After
 _gate_reports: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -433,9 +444,12 @@ def _note_gate(node: dict[str, Any], report: Any) -> None:
     if isinstance(inflight, bool) or not isinstance(inflight, int) or inflight < 0:
         return
     words = {k: report.get(k) for k in ("backend", "owner", "pressure", "reason")}
-    words = {k: v for k, v in words.items() if isinstance(v, str) and 0 < len(v) <= 80 and v.isprintable()}
+    words = {k: v for k, v in words.items() if isinstance(v, str) and 0 < len(v) <= 120 and v.isprintable()}
+    # The byte budget (a governed gate): reserved/free bytes and the token room, each a non-negative integer or dropped.
+    room = {k: report.get(k) for k in ("reserved_bytes", "free_bytes", "fit_tokens", "free_tokens")}
+    room = {k: v for k, v in room.items() if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 2 ** 53}
     with _inflight_lock:
-        _gate_reports[node["node"]] = (time.monotonic(), {"limit": limit, "inflight": inflight, **words})
+        _gate_reports[node["node"]] = (time.monotonic(), {"limit": limit, "inflight": inflight, **words, **room})
 
 
 def gate_report(node: dict[str, Any]) -> dict[str, Any] | None:
@@ -456,15 +470,55 @@ def gate_busy(node: dict[str, Any]) -> str | None:
     return f"{r['inflight']} of {r['limit']} running at the gate: {r.get('reason') or 'governor'}"
 
 
-def _gate_busy_answer(raw: bytes | None) -> dict[str, Any] | None:
-    """The gate's over-limit answer (a 529 whose message starts with GATE_BUSY), parsed, or None."""
+def _busy_why(node: dict[str, Any]) -> str:
+    """Why the gate just refused a turn as busy: the count (gate_busy), else the gate's own reason (its memory budget:
+    "memory budget: 5.7 GiB free, request needs 9.6 GiB"), else "gate full"."""
+    return gate_busy(node) or (gate_report(node) or {}).get("reason") or "gate full"
+
+
+def request_tokens(body: dict[str, Any], model: dict[str, Any]) -> int:
+    """The context a turn will hold on the node, estimated as the gate's governor does (local_governor.request_tokens:
+    body characters / 3.5 + max_tokens, the backend default when absent), capped at the model's context_length."""
+    cfg = {**local_governor.DEFAULTS, "context_tokens": int(model.get("context_length") or DEFAULT_CONTEXT)}
+    return local_governor.request_tokens(cfg, len(json.dumps(body)), body.get("max_tokens"))
+
+
+def gate_fit(node: dict[str, Any], tokens: int) -> tuple[str, str] | None:
+    """Whether a turn holding `tokens` of context fits the node's memory by its gate's latest report: None (fits, or
+    no fresh report / no byte budget), ("too_large", why) when it could not fit even alone, or ("busy", why) when it
+    does not fit beside what runs now. Routing reads it after its probe; either way the turn is routed elsewhere."""
+    r = gate_report(node)
+    if not r:
+        return None
+    fit, free = r.get("fit_tokens"), r.get("free_tokens")
+    if fit is not None and tokens > fit:
+        return "too_large", (f"request ≈{tokens // 1000}k tokens (input + max_tokens) is more than its memory budget "
+                             f"holds ({fit // 1000}k at most)")
+    if free is not None and tokens > free and (r.get("limit") is None or r["inflight"] < r["limit"]):
+        return "busy", (f"memory: ≈{free // 1000}k tokens free beside {r['inflight']} running, request ≈"
+                        f"{tokens // 1000}k")
+    return None
+
+
+def _gate_answer(raw: bytes | None, prefix: str) -> dict[str, Any] | None:
+    """The gate's own refusal (an error whose message starts with `prefix`), parsed, or None."""
     try:
         data = json.loads(raw) if raw else None
     except ValueError:
         return None
     error = data.get("error") if isinstance(data, dict) else None
     message = error.get("message") if isinstance(error, dict) else None
-    return data if isinstance(message, str) and message.startswith(GATE_BUSY) else None
+    return data if isinstance(message, str) and message.startswith(prefix) else None
+
+
+def _gate_busy_answer(raw: bytes | None) -> dict[str, Any] | None:
+    """The gate's over-limit answer (a 529 whose message starts with GATE_BUSY), parsed, or None."""
+    return _gate_answer(raw, GATE_BUSY)
+
+
+def _gate_too_large_answer(raw: bytes | None) -> dict[str, Any] | None:
+    """The gate's never-fits answer (a 413 whose message starts with GATE_TOO_LARGE), parsed, or None."""
+    return _gate_answer(raw, GATE_TOO_LARGE)
 
 
 def _retry_after(resp) -> int:
@@ -702,6 +756,20 @@ def _send_busy(handler, retry_after: int, data: dict[str, Any]) -> None:
         pass
 
 
+def _send_terminal(handler, code: int, data: dict[str, Any]) -> None:
+    """A refusal no retry can change: `x-should-retry: false` tells Claude Code and the Anthropic SDK not to retry."""
+    raw = json.dumps(data).encode()
+    try:
+        handler.send_response(code)
+        handler.send_header("content-type", "application/json")
+        handler.send_header("x-should-retry", "false")
+        handler.send_header("content-length", str(len(raw)))
+        handler.end_headers()
+        handler.wfile.write(raw)
+    except OSError:
+        pass
+
+
 def _error(kind: str, message: str) -> dict[str, Any]:
     return {"type": "error", "error": {"type": kind, "message": message}}
 
@@ -741,12 +809,13 @@ def auto_routed_unavailable(node: dict[str, Any], model: dict[str, Any], reason:
 
 
 def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
-          echo_model: str, reply: list | None = None, auto_routed: bool = False) -> str:
+          echo_model: str, reply: list | None = None, auto_routed: bool = False, reroute: bool = False) -> str:
     """_serve, counted in the node's in-flight turns (busy) while it runs."""
     with _inflight_lock:
         _inflight[node["node"]] = _inflight.get(node["node"], 0) + 1
     try:
-        return _serve(handler, body, node, model, echo_model=echo_model, reply=reply, auto_routed=auto_routed)
+        return _serve(handler, body, node, model, echo_model=echo_model, reply=reply, auto_routed=auto_routed,
+                      reroute=reroute)
     finally:
         with _inflight_lock:
             left = _inflight.get(node["node"], 1) - 1
@@ -757,7 +826,7 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
 
 
 def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
-           echo_model: str, reply: list | None = None, auto_routed: bool = False) -> str:
+           echo_model: str, reply: list | None = None, auto_routed: bool = False, reroute: bool = False) -> str:
     """Relay one turn to the node's /v1/messages and the answer back to the client. Returns the outcome: "completed"
     (a whole message or a parsed message_stop), "rejected" (the node answered an HTTP error, relayed as-is),
     "unreachable" (503 sent), or "incomplete" (the stream broke). The response names `echo_model` (what the client
@@ -766,7 +835,12 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
     fingerprint the reply and continue the conversation by its history, as for every other pin. `auto_routed`: the
     conversation was moved here by S1's auto-route (routing.auto_local), not pinned; an unavailable node (unreachable,
     dropping requests, refusing the token, or the gate's fixed policy refusal: battery, switch off) is then worded by
-    auto_routed_unavailable instead of naming a `sub/` pin the person never made."""
+    auto_routed_unavailable instead of naming a `sub/` pin the person never made.
+
+    The gate's never-fits refusal (GATE_TOO_LARGE: the turn needs more memory than the node's whole budget) is not
+    retryable. With `reroute` (the opening turn of a conversation a rule moved here) nothing is sent and TOO_LARGE is
+    returned, so the server opens the conversation on another route; otherwise the client gets a terminal 413
+    (x-should-retry: false) saying so, never a 529 it would retry forever."""
     reply = [] if reply is None else reply
     data = json.dumps(_node_body(body, model)).encode()
     # Safety net (#108): an auto-routed turn the client did not ask to think on, which still ended on max_tokens with
@@ -814,7 +888,7 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
             busy_answer = _gate_busy_answer(raw) if resp.status == 529 else None
             if busy_answer is not None:                          # the gate's admission limit: retryable, nothing ran
                 _note_gate(node, busy_answer.get(GATE_KEY))
-                why = gate_busy(node) or "gate full"
+                why = _busy_why(node)
                 _refused(handler, 529, "overloaded_error", "the local node is busy (gate admission limit)")
                 _send_busy(handler, _retry_after(resp), _error("overloaded_error",
                            f"cortados: this conversation was auto-routed by S1 to {model['id']} on {node['node']}; the "
@@ -822,6 +896,23 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
                            f"busy), or send x-cortados-exclude-model: {pin_id(model)}" if auto_routed else
                            f"cortados: local node {node['node']} is busy for sub/{pin_id(model)} ({why}); retry "
                            "shortly. No other model was tried."))
+                return "rejected"
+            big = _gate_too_large_answer(raw) if resp.status == 413 else None
+            if big is not None:                                  # never fits this node: retrying cannot help
+                _note_gate(node, big.get(GATE_KEY))
+                if reroute:
+                    return TOO_LARGE                             # the server routes the conversation elsewhere
+                _refused(handler, 413, "request_too_large", "the request is too large for the local node's memory")
+                fit = (gate_report(node) or {}).get("fit_tokens")
+                room = f" (at most ≈{fit // 1000}k tokens of input + max_tokens fit there)" if fit is not None else ""
+                _send_terminal(handler, 413, _error("request_too_large",
+                               f"cortados: this conversation was auto-routed by S1 to {model['id']} on {node['node']}, "
+                               f"and this turn is too large for the node's memory budget{room}; start a new "
+                               "conversation (it is routed again), compact this one, or send x-cortados-exclude-model: "
+                               f"{pin_id(model)}" if auto_routed else
+                               f"cortados: local node {node['node']} cannot hold this request for sub/{pin_id(model)}: "
+                               f"too large for its memory budget{room}. Compact the conversation, lower max_tokens or "
+                               "pin a cloud model. No other model was tried."))
                 return "rejected"
             policy = _policy_refusal(raw) if auto_routed and resp.status == 503 else None
             if policy:                                           # the gate's fixed reason: battery, switch off, ...

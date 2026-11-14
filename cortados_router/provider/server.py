@@ -2300,13 +2300,75 @@ class Handler(BaseHTTPRequestHandler):
                 logger.error("anthropic-api settle gave up for %s: reservation $%.4f retained, charge was $%.4f; "
                              "the API overage-off cap remains the hard backstop", res_id, max_cost, charge)
 
+    def _open_conversation(self, turn, body: dict[str, Any], wire: Wire, *, one_shot: bool, floor: float | None,
+                           scope: str | None, also_exclude: str | None = None):
+        """Route and open a new conversation (or a one-shot) for `turn`: the session, or None when the request was
+        refused (the answer is sent). `also_exclude`: a model to keep the route off on top of the client's
+        x-cortados-exclude-model (a local model whose node cannot hold the request: the caller's re-route)."""
+        reg = self.server.registry
+        route = None
+        if floor is not None and not reg.router:
+            # A fixed-model endpoint has no router to choose and reserve an account: a floor cannot be honoured, so
+            # the opening turn fails closed, as its continuations do.
+            return self._error(429, "rate_limit_error",
+                               "cortados: this endpoint runs a fixed model and cannot check x-cortados-min-left-pct",
+                               wire, reason="the client's quota floor cannot be checked here")
+        if reg.router:
+            # The route is chosen once, for the whole conversation: switching models mid-conversation would lose
+            # the CLI session and its prompt cache.
+            exclude, valid = _exclude_model_header(self.headers)   # read for a new conversation only
+            if not valid:
+                return self._error(400, "invalid_request_error", _EXCLUDE_MODEL_BAD, wire)
+            if also_exclude:                            # a re-route: the model whose node could not hold the request
+                exclude = ",".join(x for x in (exclude, also_exclude) if x)
+            local, valid = _local_header(self.headers)
+            if not valid:
+                return self._error(400, "invalid_request_error", _LOCAL_BAD, wire)
+            try:
+                route_fn = reg.router if one_shot else reg.route_new
+                route = route_fn(wire.routing_body(body), self._client(),
+                                 **({"exclude_model": exclude} if exclude else {}),
+                                 **({"local": local} if local else {}),
+                                 **({"min_left_pct": floor} if floor is not None else {}))
+            except Exception as exc:                # scorer, tables or route log failed: a dependency, not the client
+                logger.exception("routing failed")
+                return self._error(503, "overloaded_error", f"cortados: routing failed: {type(exc).__name__}: {exc}", wire,
+                                   reason="routing failed")
+            if route.get("error"):
+                if route.get("client_error"):       # a bad pin or exclusion (unserved model, emptied pool): the client's to fix
+                    # It names the client's own pin or exclusion, request-derived: the record keeps the fixed reason.
+                    return self._error(400, "invalid_request_error", f"cortados: {route['error']}", wire,
+                                       reason="the pin or exclusion names no model this endpoint can serve")
+                if route.get("quota_blocked"):      # the client's x-cortados-min-left-pct floor excluded every account
+                    return self._error(429, "rate_limit_error", f"cortados: {route['error']}", wire,
+                                       reason="no account is above the client's quota floor")
+                if route.get("fit_blocked"):        # too large for every account: retrying unchanged cannot succeed
+                    return self._error(413, "request_too_large", f"cortados: {route['error']}", wire,
+                                       reason="the request is larger than every eligible model's context")
+                return self._error(503, "overloaded_error", f"cortados: {route['error']}", wire,
+                                   reason="no route is available")
+            logger.info("route %s: %s/%s band %s%s", route["route_id"], route["provider"], route["model"],
+                        route["band"], " (S1 degraded)" if route.get("degraded") else "")
+        try:
+            return reg.new(turn, keep=not one_shot, route=route, scope=scope,
+                           wire_path=self.path.split("?")[0], admitted=bool(reg.router and not one_shot),
+                           client=self._client())
+        except UnservedProvider as exc:
+            return self._error(503, "overloaded_error", f"cortados: {exc}", wire)
+        except BridgeError as exc:                  # the backend refused to start (version pin, isolation, login)
+            logger.warning("backend start failed: %s", exc)
+            return self._error(502, "api_error", str(exc), wire, reason=failure_diagnostic(exc))
+
     def _relay_local(self, session: "LocalSession", turn, body: dict[str, Any], *, created: bool, one_shot: bool,
-                     wire: Wire) -> None:
+                     wire: Wire, reroute: bool | None = None) -> str | None:
         """One turn of a local-pinned conversation: relayed statelessly to its Ollama node (local_lane.serve), under
         the conversation's lock and the same stale-history rule as a CLI turn. The reply's fingerprint is appended to
         the session's history, so the next turn finds this conversation and keeps its model (_model_change). A node
         that fails a turn leaves the conversation as it was: the laptop may wake, and the same history retried
-        continues it. A conversation whose opening turn failed is dropped (no reply exists to continue from)."""
+        continues it. A conversation whose opening turn failed is dropped (no reply exists to continue from).
+        Returns the lane's outcome (None when refused before the relay). `reroute` (default: an opening turn a rule
+        moved here, not a pin) lets the lane hand back local_lane.TOO_LARGE, unanswered, when the node's gate can never
+        hold the turn; the caller then routes the conversation elsewhere."""
         reg = self.server.registry
         route = session.route or {}
         if not session.lock.acquire(timeout=TURN_TIMEOUT_S):
@@ -2343,9 +2405,11 @@ class Handler(BaseHTTPRequestHandler):
             t0 = time.time()
             office_key = self._office_turn_start(session, one_shot=one_shot)
             outcome = "incomplete"
+            if reroute is None:              # an opening turn a rule moved here may be routed elsewhere (TOO_LARGE)
+                reroute = created and not route.get("pinned")
             try:
                 outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model,
-                                           reply=reply, auto_routed=not route.get("pinned"))
+                                           reply=reply, auto_routed=not route.get("pinned"), reroute=reroute)
             except Exception as exc:             # serve handles its own I/O; anything else must still clean up
                 logger.exception("local lane: relay failed")
                 outcome = "incomplete"
@@ -2382,6 +2446,7 @@ class Handler(BaseHTTPRequestHandler):
                 reg.drop(session)
         finally:
             session.lock.release()
+        return outcome
 
     def _local_continuation_refused(self, session: "LocalSession", body: dict[str, Any], wire: Wire) -> bool:
         """The continuation re-check (docs/LOCAL-RESOURCES.md "Continuations of a local-bound conversation"): a
@@ -2717,60 +2782,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
         created = session is None                       # this request opens the conversation (or is a one-shot)
         if session is None:
-            route = None
-            if floor is not None and not reg.router:
-                # A fixed-model endpoint has no router to choose and reserve an account: a floor cannot be honoured, so
-                # the opening turn fails closed, as its continuations do.
-                return self._error(429, "rate_limit_error",
-                                   "cortados: this endpoint runs a fixed model and cannot check x-cortados-min-left-pct",
-                                   wire, reason="the client's quota floor cannot be checked here")
-            if reg.router:
-                # The route is chosen once, for the whole conversation: switching models mid-conversation would lose
-                # the CLI session and its prompt cache.
-                exclude, valid = _exclude_model_header(self.headers)   # read for a new conversation only
-                if not valid:
-                    return self._error(400, "invalid_request_error", _EXCLUDE_MODEL_BAD, wire)
-                local, valid = _local_header(self.headers)
-                if not valid:
-                    return self._error(400, "invalid_request_error", _LOCAL_BAD, wire)
-                try:
-                    route_fn = reg.router if one_shot else reg.route_new
-                    route = route_fn(wire.routing_body(body), self._client(),
-                                     **({"exclude_model": exclude} if exclude else {}),
-                                     **({"local": local} if local else {}),
-                                     **({"min_left_pct": floor} if floor is not None else {}))
-                except Exception as exc:                # scorer, tables or route log failed: a dependency, not the client
-                    logger.exception("routing failed")
-                    return self._error(503, "overloaded_error", f"cortados: routing failed: {type(exc).__name__}: {exc}", wire,
-                                       reason="routing failed")
-                if route.get("error"):
-                    if route.get("client_error"):       # a bad pin or exclusion (unserved model, emptied pool): the client's to fix
-                        # It names the client's own pin or exclusion, request-derived: the record keeps the fixed reason.
-                        return self._error(400, "invalid_request_error", f"cortados: {route['error']}", wire,
-                                           reason="the pin or exclusion names no model this endpoint can serve")
-                    if route.get("quota_blocked"):      # the client's x-cortados-min-left-pct floor excluded every account
-                        return self._error(429, "rate_limit_error", f"cortados: {route['error']}", wire,
-                                           reason="no account is above the client's quota floor")
-                    if route.get("fit_blocked"):        # too large for every account: retrying unchanged cannot succeed
-                        return self._error(413, "request_too_large", f"cortados: {route['error']}", wire,
-                                           reason="the request is larger than every eligible model's context")
-                    return self._error(503, "overloaded_error", f"cortados: {route['error']}", wire,
-                                       reason="no route is available")
-                logger.info("route %s: %s/%s band %s%s", route["route_id"], route["provider"], route["model"],
-                            route["band"], " (S1 degraded)" if route.get("degraded") else "")
-            try:
-                session = reg.new(turn, keep=not one_shot, route=route, scope=scope,
-                                  wire_path=self.path.split("?")[0], admitted=bool(reg.router and not one_shot),
-                                  client=self._client())
-            except UnservedProvider as exc:
-                return self._error(503, "overloaded_error", f"cortados: {exc}", wire)
-            except BridgeError as exc:                  # the backend refused to start (version pin, isolation, login)
-                logger.warning("backend start failed: %s", exc)
-                return self._error(502, "api_error", str(exc), wire, reason=failure_diagnostic(exc))
+            session = self._open_conversation(turn, body, wire, one_shot=one_shot, floor=floor, scope=scope)
+            if session is None:
+                return                                  # refused; the answer is sent
         if isinstance(session, LocalSession):           # a local lane: relayed to its node, never a CLI turn
             if not created and self._local_continuation_refused(session, body, wire):
                 return
-            return self._relay_local(session, turn, body, created=created, one_shot=one_shot, wire=wire)
+            outcome = self._relay_local(session, turn, body, created=created, one_shot=one_shot, wire=wire)
+            if outcome != local_lane.TOO_LARGE:
+                return
+            # The node's gate can never hold this opening turn (more memory than its whole budget): nothing was sent
+            # and the conversation was dropped, so it is routed again with that local model excluded (S1's route, or
+            # another node), once. A second refusal is answered by the lane itself (reroute off).
+            moved = (session.route or {}).get("local") or {}
+            logger.info("route %s: local node %s cannot hold the opening turn; routing it elsewhere",
+                        (session.route or {}).get("route_id"), (moved.get("node") or {}).get("node"))
+            session = self._open_conversation(turn, body, wire, one_shot=one_shot, floor=floor, scope=scope,
+                                              also_exclude=str((moved.get("model") or {}).get("id") or ""))
+            if session is None:
+                return
+            if isinstance(session, LocalSession):
+                self._relay_local(session, turn, body, created=True, one_shot=one_shot, wire=wire, reroute=False)
+                return
         if not created:
             # A continuation's paid turn under the client's floor: the session keeps the tightest floor it was ever sent,
             # and its executing account is rechecked and reserved before this turn (an opening turn was reserved when

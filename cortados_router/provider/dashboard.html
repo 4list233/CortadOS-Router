@@ -222,6 +222,7 @@ function getTok() { if (!storageOk) return memTok;
 function setTok(t) { memTok = t || ""; if (!storageOk) return;
   try { if (t) sessionStorage.setItem(KEY, t); else sessionStorage.removeItem(KEY); } catch (e) { storageFailed(); } }
 // Every string from the endpoint goes in through textContent: lane names, titles and errors are data, never markup.
+function gib(n) { return (n / 1073741824).toFixed(1); }
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined && text !== null) e.textContent = String(text); return e; }
 function add(parent, ...kids) { for (const k of kids) if (k) parent.appendChild(k); return parent; }
 function age(s) { if (s === null || s === undefined || isNaN(s)) return "?"; s = Math.round(s); if (s < 90) return s + " s"; if (s < 5400) return Math.round(s / 60) + " min"; if (s < 172800) return Math.round(s / 3600) + " h"; return Math.round(s / 86400) + " d"; }
@@ -646,6 +647,8 @@ function renderLocal(d, failure) {
     const cap = n.capacity;
     if (cap && cap.limit !== null && cap.limit !== undefined)
       add(c, el("div", "sub", (n.backend || "backend") + ": " + cap.inflight + " of " + cap.limit + " running" +
+        (Number.isInteger(cap.reserved_bytes) && Number.isInteger(cap.free_bytes)
+          ? ", " + gib(cap.reserved_bytes) + " of " + gib(cap.reserved_bytes + cap.free_bytes) + " GiB reserved" : "") +
         (cap.reason ? " (" + cap.reason + ")" : "")));
     const a = n.auto_route;
     add(c, el("div", "sub muted", a ? "auto_route: " + a.model + " for " + (a.bands || []).join(", ") : "auto_route: off (pin-only)"));

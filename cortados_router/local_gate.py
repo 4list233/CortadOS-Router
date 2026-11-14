@@ -10,10 +10,13 @@ Ollama has no authentication, so it listens on 127.0.0.1 only and this gate is t
   * The token and request bodies are never logged; a log line is method, path and status.
   * The backend behind the gate is Ollama (default) or vllm-mlx (local_backend.py: a per-node config file); the client
     routes above stay the same and each backend receives only its fixed upstream routes (local_backend.UPSTREAM).
-  * An admission count (local_governor.py) bounds how many POST /v1/messages run at once when the backend config has a
-    `governor`: the limit follows the owner's activity and memory pressure; a request over it gets a retryable 529
-    overloaded_error with Retry-After at once (never queued here), and running requests are never stopped. The current
-    limit and in-flight count are reported read-only as `cortados_gate` in GET /api/tags and in the switch status.
+  * Admission (local_governor.py) bounds the POST /v1/messages running at once when the backend config has a
+    `governor`: a COUNT that follows the owner's activity and memory pressure, and a BYTE budget each request reserves
+    its KV cache from (input tokens + max_tokens). A request over either, now, gets a retryable 529 overloaded_error
+    with Retry-After at once (never queued here); one that could not fit the budget even alone gets a non-retryable
+    413 request_too_large (TOO_LARGE_MESSAGE), which the provider routes elsewhere. Running requests are never
+    stopped; a reservation is released however the request ends. The limit, in-flight count and reserved/free bytes
+    are reported read-only as `cortados_gate` in GET /api/tags and in the switch status.
   * One more path is the gate's own, never forwarded: GET / POST /cortados/local-switch (SWITCH_PATH), the node's
     manual local-models switch, behind the same token. GET answers the switch, AC/battery, whether local models are
     allowed and why, and the models Ollama has loaded (names from /api/ps only); POST {"on": true|false} sets the switch
@@ -96,6 +99,14 @@ ROUTES = {("GET", "/api/tags"), ("POST", "/v1/messages")}
 # (local_lane.GATE_KEY).
 GATE_KEY = "cortados_gate"
 BUSY_MESSAGE = "local gate: busy"           # the fixed prefix of an over-limit refusal (local_lane.GATE_BUSY)
+# The fixed prefix of a refusal that no retry can change: the request's reservation exceeds the node's whole byte
+# budget (local_lane.GATE_TOO_LARGE). Answered 413 request_too_large with x-should-retry: false.
+TOO_LARGE_MESSAGE = "local gate: too large for this node's memory"
+# The capacity report's fields (GateServer.capacity, the 529 and 413 answers). Bytes and tokens are None without a
+# governor: reserved/free bytes of the budget beside the weights, and the most tokens one request may hold alone
+# (fit_tokens) and beside what runs now (free_tokens), which the provider's routing reads.
+CAPACITY_KEYS = ("limit", "inflight", "owner", "pressure", "reason", "reserved_bytes", "free_bytes", "fit_tokens",
+                 "free_tokens")
 # The gate's own switch endpoint (module docstring). Not in ROUTES: it never reaches Ollama as a forwarded request.
 SWITCH_PATH = "/cortados/local-switch"
 # A switch request body is {"on": true} or {"on": false}; 1 KiB is ample, and a larger one is refused unread.
@@ -420,9 +431,10 @@ class GateServer(ThreadingHTTPServer):
     def capacity(self) -> dict:
         """The read-only capacity report: backend, the admission limit (None: unlimited) and how many run now, and
         the governor's owner/pressure state and reason (coarse words only, no idle seconds)."""
-        snap = self.admission.snapshot()
-        return {"backend": self.backend["backend"], **{k: snap.get(k) for k in
-                                                       ("limit", "inflight", "owner", "pressure", "reason")}}
+        return self.report(self.admission.snapshot())
+
+    def report(self, snap: dict) -> dict:
+        return {"backend": self.backend["backend"], **{k: snap.get(k) for k in CAPACITY_KEYS}}
 
     def process_request(self, request, client_address):
         if self.slots is None:                      # unlimited: no slot to take or give back
@@ -585,7 +597,7 @@ class GateHandler(BaseHTTPRequestHandler):
         # Admission: hold LOCK_SH on the node lock from here until the response is fully relayed. A trainer holds
         # LOCK_EX for its whole run (studio_capacity.training_gate), so the kernel guarantees no request reaches
         # Ollama while training runs, and the trainer cannot start while this request is in flight.
-        lock_fd, admitted = None, False
+        lock_fd, ticket = None, None
         if self.server.studio_gate_dir is not None:
             try:
                 # create=False: a request never recreates a missing/renamed-away gate dir (studio_capacity.open_node_lock);
@@ -611,27 +623,46 @@ class GateHandler(BaseHTTPRequestHandler):
             if not allowed:
                 return self._error(503, "overloaded_error", reason)
             if method == "POST":             # admission: only a model turn takes a slot, never the probe
-                admitted, snap = self.server.admission.try_acquire()
-                if not admitted:
-                    return self._busy(snap)
+                adm = self.server.admission
+                ticket, snap = adm.try_acquire(adm.request_bytes(n, _max_tokens(body)) if adm.governor else 0)
+                if ticket is None:
+                    return self._too_large(snap) if snap.get("refused") == "too_large" else self._busy(snap)
             self._forward(method, path, body)
         finally:
-            if admitted:
-                self.server.admission.release()      # the turn is fully relayed (or failed): its slot is free
+            if ticket is not None:
+                # However the turn ended (relayed, an upstream error or timeout, the client gone, an exception on the
+                # way out): its slot and bytes are free. Ticket.release is idempotent.
+                ticket.release()
             if lock_fd is not None:
                 os.close(lock_fd)            # releases LOCK_SH
 
     def _busy(self, snap: dict) -> None:
         """The over-limit answer: 529 overloaded_error (Anthropic's "busy, retry"), Retry-After, and the capacity report
         so the provider marks the node busy without another probe. Nothing reached the backend."""
-        cap = {"backend": self.server.backend["backend"],
-               **{k: snap.get(k) for k in ("limit", "inflight", "owner", "pressure", "reason")}}
+        cap = self.server.report(snap)
         body = json.dumps({"type": "error", "error": {"type": "overloaded_error", "message":
                            f"{BUSY_MESSAGE} ({cap['inflight']} of {cap['limit']} running: {cap['reason']})"},
                            GATE_KEY: cap}).encode()
         self.send_response(529, "Overloaded")
         self.send_header("content-type", "application/json")
         self.send_header("retry-after", str(self.server.admission.retry_after_s))
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    def _too_large(self, snap: dict) -> None:
+        """The never-fits answer: the request's reservation exceeds the whole budget beside the weights, so no retry
+        can be admitted. 413 request_too_large, x-should-retry: false, no Retry-After, and the capacity report (its
+        fit_tokens says how much would fit). Nothing reached the backend."""
+        cap = self.server.report(snap)
+        body = json.dumps({"type": "error", "error": {"type": "request_too_large", "message":
+                           f"{TOO_LARGE_MESSAGE} ({cap['reason']}; at most {cap['fit_tokens']} tokens of input + "
+                           "max_tokens fit)"}, GATE_KEY: cap}).encode()
+        self.send_response(413)
+        self.send_header("content-type", "application/json")
+        self.send_header("x-should-retry", "false")
         self.send_header("content-length", str(len(body)))
         self.send_header("connection", "close")
         self.end_headers()
@@ -769,6 +800,15 @@ class GateHandler(BaseHTTPRequestHandler):
                 return self._send(200, data, ctype)
         tags[GATE_KEY] = self.server.capacity()
         return self._send(200, json.dumps(tags).encode())
+
+
+def _max_tokens(body: bytes | None):
+    """The request's max_tokens for its reservation, or None (the governor then assumes default_max_tokens)."""
+    try:
+        data = json.loads(body) if body else None
+    except ValueError:
+        return None
+    return data.get("max_tokens") if isinstance(data, dict) else None
 
 
 def _settings(argv=None) -> argparse.Namespace:

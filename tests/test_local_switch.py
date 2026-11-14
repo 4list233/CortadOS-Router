@@ -144,7 +144,8 @@ class GateSwitchTests(Home):
         self.assertEqual(data, {"switch": "off", "allowed": False, "reason": "local switch off", "power": "battery",
                                 "training": False, "models_loaded": [TAG], "ollama": "up", "backend": "ollama",
                                 "capacity": {"backend": "ollama", "limit": None, "inflight": 0, "owner": None,
-                                             "pressure": None, "reason": "no governor"}})
+                                             "pressure": None, "reason": "no governor", "reserved_bytes": None,
+                                             "free_bytes": None, "fit_tokens": None, "free_tokens": None}})
         self.flag.touch()
         code, data = self.call("GET")
         self.assertEqual((data["switch"], data["allowed"], data["reason"]), ("on", False, "local disabled: on battery"))
@@ -270,7 +271,9 @@ class ProviderSwitchTests(EndpointHarness):
                                           "power": "battery", "training": False, "ollama": "up",
                                           "models_loaded": [TAG], "backend": "ollama",
                                           "capacity": {"limit": None, "inflight": 0, "owner": None, "pressure": None,
-                                                       "reason": "no governor"}}])
+                                                       "reason": "no governor", "reserved_bytes": None,
+                                                       "free_bytes": None, "fit_tokens": None,
+                                                       "free_tokens": None}}])
         raw = json.dumps(data)
         self.assertNotIn(TOKEN, raw)
         self.assertNotIn("127.0.0.1", raw)                      # never the node's address
@@ -346,12 +349,14 @@ class ProviderSwitchTests(EndpointHarness):
         evil = {"switch": "maybe", "allowed": "yes", "reason": "x" * 500, "power": "nuclear", "training": 1,
                 "ollama": "<b>", "models_loaded": ["ok:latest", "bad\nname", 7], "token": TOKEN,
                 "backend": "<script>", "capacity": {"limit": True, "inflight": -1, "owner": "away", "pressure": "high",
-                                                   "reason": "y" * 500, "extra": TOKEN}}
+                                                   "reason": "y" * 500, "extra": TOKEN, "reserved_bytes": -5,
+                                                   "free_bytes": "lots", "fit_tokens": 2 ** 60, "free_tokens": 1.5}}
         self.assertEqual(local_switch._clean(evil),
                          {"switch": "unknown", "allowed": None, "reason": None, "power": "unknown", "training": None,
                           "ollama": "unknown", "models_loaded": ["ok:latest"], "backend": "unknown",
                           "capacity": {"limit": None, "inflight": None, "owner": None, "pressure": None,
-                                       "reason": None}})
+                                       "reason": None, "reserved_bytes": None, "free_bytes": None, "fit_tokens": None,
+                                       "free_tokens": None}})
         self.assertIsNone(local_switch._clean({"capacity": "full"})["capacity"])
 
     def raw_post(self, head: bytes, body: bytes = b"", trickle=None):
