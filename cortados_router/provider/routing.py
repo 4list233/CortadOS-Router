@@ -513,7 +513,7 @@ def _choose_local(core, body: dict[str, Any], node: dict[str, Any], entry: dict[
         tags = local_lane.probe(node)
     except local_lane.LocalUnavailable as exc:
         return {"router": execution_routing.ROUTER, "error": f"sub/{pin}: {exc}; no other model was tried"}
-    if entry["id"] not in tags:
+    if not local_lane.lists(tags, entry["id"]):
         return {"router": execution_routing.ROUTER,
                 "error": f"sub/{pin}: node {node['node']} does not list {entry['id']} (ollama pull it there); "
                          "no other model was tried"}
@@ -749,7 +749,7 @@ def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, co
                 gate_refused = str(exc) == local_lane.GATE_REFUSED.format(node=node["node"])
             else:
                 _auto_down.pop(node["node"], None)
-                if entry["id"] not in tags:
+                if not local_lane.lists(tags, entry["id"]):
                     why = f"does not list {entry['id']}"
         if why is None:
             need = int(request_fit(body)["input_tokens"]) if need is None else need

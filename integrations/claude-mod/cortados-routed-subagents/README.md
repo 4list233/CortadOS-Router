@@ -172,6 +172,18 @@ connector tools, `Monitor`, future tools — an allowlist precisely because a de
 does **not** fail open (a cage by choice); its refusal says how to lower it (`/cortados-gate balanced` or `off`).
 
 
+## Local models switch (`/cortados-local`)
+
+`/cortados-local on|off|status [node]` (no argument: status; node defaults to `pro`) sees or flips the Pro's manual
+local-models switch from this session, through the provider: `GET /v1/cortados/local` for status, `POST
+/v1/cortados/local/switch {"node", "on"}` for on/off (owner token; the provider asks the node's local gate, which writes
+the switch file there). Same provider URL and token discovery as routed subagents (`providerUrl`, else
+`CORTADOS_PROVIDER_URL` / the provider-url file; `providerToken`, else `providerTokenFile`). One line per node: switch,
+allowed or refused (with the reason), AC or battery, the loaded model, `auto_route`. Errors (provider unreachable,
+unknown node, node asleep, 10 s without an answer) come back as text with the token scrubbed. Works whatever
+`orchestratorMode` says; the same switch is on the dashboard and in the `local_switch` MCP tool (repo README, "Flipping
+the switch from anywhere").
+
 ## Main-session guard (warn only)
 
 With `mainSessionGuard` on (the default), the mod watches the **main session's** `Edit`, `Write`, `NotebookEdit`
