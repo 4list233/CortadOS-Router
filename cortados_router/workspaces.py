@@ -19,20 +19,22 @@ services/ and everything else are never touched: cleanup_archive() refuses them 
 refs (refs/worktree/*, refs/bisect/*, refs/rewritten/*, and a stopped operation's MERGE_HEAD etc. in its own git dir:
 PRIVATE_REF_PREFIXES, PRIVATE_PSEUDOREFS), each of which must be reachable from a remote-tracking ref, or it is held.
 A stopped merge's or rebase's autostash (MERGE_AUTOSTASH, rebase-merge/autostash, rebase-apply/autostash) is never on
-a remote, so it always holds (`unpushed_autostash`). Every commit a stopped operation's state names (rebase-merge/,
-rebase-apply/, sequencer/, BISECT_*, NOTES_MERGE_*: OP_STATE_DIRS) must be published too, and a stopped `git am` or
-notes merge holds outright (`unpushed_operation_state`). Branches, tags and the stash belong to the clone, are shared
-by every task's worktree and survive the deletion: they neither hold a worktree nor count as a change in it (#102).
+a remote, so it always holds (`unpushed_autostash`). Any in-progress git operation holds outright, whatever it names
+(`unpushed_operation_state`, review 8): rebase-merge/, rebase-apply/, MERGE_HEAD, CHERRY_PICK_HEAD, REVERT_HEAD,
+REBASE_HEAD, sequencer/, BISECT_* (BISECT_LOG...), NOTES_MERGE_* in the worktree's own git dir (OPERATION_STATE_*;
+AUTO_MERGE is reported with them). Its files are not parsed: seven review rounds each found a todo, label, short-id or
+reset/merge form the parser missed, and round 7 lost an unpublished commit to one (`reset <id>` before `label <id>`).
+A task ending mid-operation is rare, a false hold costs only a kept folder, a false archive loses work. Branches,
+tags and the stash belong to the clone, are shared by every task's worktree and survive the deletion: they neither
+hold a worktree nor count as a change in it (#102).
 ORIG_HEAD and the worktree's own reflogs do not hold (every reset, amend, rebase or pull writes them, #102), but
 before a worktree is archived, and again before the cleanup deletes it, every commit only they reach gets a recovery
 ref in the clone, refs/cortados-recovery/<YYYYMMDD>/<task_id>/orig-head or .../reflog-<n>, <YYYYMMDD> the UTC day
 it was created (preserve_recovery_refs); if one cannot be written the worktree is held (`recovery_refs_failed`).
-Only a MISSING state file is absent (review 5, P1 #2): ORIG_HEAD, a reflog, an autostash or any stopped operation's
-file that exists but cannot be read, is not a regular file, is malformed (an ORIG_HEAD that is not one object id) or
-is past a size cap holds the worktree (`unreadable_git_state`, StateUnreadableError). A stopped operation's files are
-read by format (review 5, P1 #3): only their commit-id fields (`pick <id> <subject>`, `merge -C <id>`, a bisect log's
-revisions, files that are only ids), never subjects or messages; an id there is 4 to 64 hex digits (git abbreviates
-to 4 with core.abbrev=4) and must resolve as `<id>^{commit}` to exactly one commit, or it holds.
+Only a MISSING state file is absent (review 5, P1 #2): ORIG_HEAD, a reflog or an autostash that exists but cannot be
+read, is not a regular file, is malformed (an ORIG_HEAD that is not one object id) or is past a size cap, and a git
+dir that cannot be listed (so no operation state can be ruled out), hold the worktree (`unreadable_git_state`,
+StateUnreadableError).
 Recovery refs expire 30 days after they were created (owner, 2026-11-14; RECOVERY_REF_RETENTION_S): the daily
 cleanup deletes them (expire_recovery_refs), counted from the end of the creation day, each with `git update-ref -d`
 at the value it was read with, so one that moved is kept; nothing outside refs/cortados-recovery/ is touched. Refs
@@ -679,24 +681,21 @@ def assess(path: str, deadline=None):
         if ahead.strip():
             return False, _Reason("unpushed_commits", f"{len(ahead.split())} commit(s) not on any remote"), []
         gitdir = _git(["rev-parse", "--absolute-git-dir"], cwd=path, timeout=_within(deadline, GIT_TIMEOUT_S)).strip()
+        operation = _operation_state(gitdir)         # raises StateUnreadableError: an unlistable git dir holds
         unpublished = _unpublished_private_refs(path, _private_refs(path, gitdir, deadline), deadline)
         stashes = [name for name in unpublished if name in AUTOSTASH_FILES]
         if stashes:
             return False, _Reason("unpushed_autostash", f"a stopped merge or rebase keeps local changes in an "
                                   f"autostash that exists only in this worktree's git dir: {', '.join(stashes)}"), []
+        if operation:
+            return False, _Reason("unpushed_operation_state", f"a git operation is in progress in this worktree "
+                                  f"(its state is never parsed; any in-progress operation holds): "
+                                  f"{', '.join(operation)}"), []
         if unpublished:
             shown = ", ".join(unpublished[:5]) + (f" (+{len(unpublished) - 5} more)" if len(unpublished) > 5 else "")
             return False, _Reason("unpushed_private_refs", f"{len(unpublished)} worktree-private ref(s) not proven on "
                                   f"any remote (deleting the worktree would delete them): {shown}"), []
-        state, unreadable = _unpublished_operation_state(path, gitdir, deadline)
         _read_orig_head(gitdir)                      # raises StateUnreadableError: an unreadable ORIG_HEAD holds
-        if unreadable:
-            raise StateUnreadableError(f"{', '.join(unreadable[:5])}" + (f" (+{len(unreadable) - 5} more)"
-                                       if len(unreadable) > 5 else "") + " cannot be read in full")
-        if state:
-            shown = ", ".join(state[:5]) + (f" (+{len(state) - 5} more)" if len(state) > 5 else "")
-            return False, _Reason("unpushed_operation_state", f"a stopped git operation's state in this worktree's git "
-                                  f"dir names work not proven on any remote, or cannot be assessed: {shown}"), []
     except GitTimeoutError as exc:
         return None, _Reason("assess_timeout", f"could not assess the worktree in time: {exc}"), []
     except StateUnreadableError as exc:
@@ -720,49 +719,22 @@ AUTOSTASH_FILES = ("MERGE_AUTOSTASH", "rebase-merge/autostash", "rebase-apply/au
 PRIVATE_PSEUDOREFS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "BISECT_HEAD", *AUTOSTASH_FILES)
 _OID_RE = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
 
-# A stopped operation's state in the worktree's own git dir (review 4, P1): a rebase's todo, done list, orig-head,
-# amend and rewritten lists (rebase-merge/, rebase-apply/), a cherry-pick or revert sequence (sequencer/), a bisect's
-# start point and log (BISECT_*), a notes merge (NOTES_MERGE_*). Every commit any of their files names, by full or
-# abbreviated id, must be on a remote, or the worktree holds; a name that is no object here names nothing to lose. A
-# stopped `git am` (rebase-apply/applying) and a notes merge's worktree hold outright: their patches and note text
-# exist nowhere else. A file past the size caps, an ambiguous abbreviation or a tree that cannot be walked holds too.
-OP_STATE_DIRS = ("rebase-merge", "rebase-apply", "sequencer", "NOTES_MERGE_WORKTREE")
-OP_STATE_FILE_PREFIXES = ("BISECT_", "NOTES_MERGE_")
-OP_STATE_HOLD = ("rebase-apply/applying", "NOTES_MERGE_WORKTREE")
+# An in-progress git operation in the worktree's own git dir holds the worktree outright (review 8, owner's decision):
+# a rebase (rebase-merge/, rebase-apply/, also a stopped `git am`), a merge, cherry-pick or revert (MERGE_HEAD,
+# CHERRY_PICK_HEAD, REVERT_HEAD, REBASE_HEAD, sequencer/), a bisect (BISECT_LOG and the other BISECT_* files), a notes
+# merge (NOTES_MERGE_*). Only the names' presence is checked; nothing in them is parsed, so no todo form, label, short
+# id or reset/merge argument can be misread (round 7 archived an unpublished commit named by `reset <id>` before a
+# later `label <id>`). AUTO_MERGE (a tree merge-ort keeps while conflicts are open) is reported with them but does not
+# hold alone. A task rarely ends mid-operation; a false hold keeps a folder, a false archive deletes work.
+OPERATION_STATE_DIRS = ("rebase-merge", "rebase-apply", "sequencer", "NOTES_MERGE_WORKTREE")
+OPERATION_STATE_FILES = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "BISECT_LOG")
+OPERATION_STATE_PREFIXES = ("BISECT_", "NOTES_MERGE_")
+OPERATION_STATE_COMPANIONS = ("AUTO_MERGE",)
+# _op_state_files (the late-writer snapshot and the reflog reader) lists these trees and top-level files.
+OP_STATE_DIRS = OPERATION_STATE_DIRS
+OP_STATE_FILE_PREFIXES = OPERATION_STATE_PREFIXES
 OP_STATE_MAX_FILES = 10000
-OP_STATE_MAX_BYTES = 8 * 1024 * 1024       # read across every scanned state file of one worktree
-OP_STATE_MAX_TOKENS = 20000
 REFLOG_MAX_BYTES = 16 * 1024 * 1024         # across the worktree's own reflogs (recovery refs)
-_HEX_TOKEN_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{7,64}(?![0-9A-Za-z])")   # unknown files only (see below)
-# Review 5, P1 #3: git abbreviates as short as 4 hex digits (core.abbrev=4), so an id in a COMMIT POSITION of a state
-# file is any 4..64 hex token there. Only those positions are read (_op_state_ids), never subjects or messages, so a
-# short hex word in a subject cannot hold. Each is resolved as `<id>^{commit}` (what `git rev-parse --verify <id>^
-# {commit}` resolves, in one `git cat-file --batch-check`); one that does not resolve to exactly one commit holds.
-_SHORT_OID_RE = re.compile(r"[0-9a-f]{4,64}")
-# Todo lines (rebase-merge/git-rebase-todo, its .backup, done, current-fixups; sequencer/todo): `<cmd> <commit> ...`
-_TODO_COMMIT_CMDS = frozenset({"pick", "p", "reword", "r", "edit", "e", "drop", "d", "revert",
-                               "squash", "s", "fixup", "f"})
-_TODO_OTHER_CMDS = frozenset({"exec", "x", "break", "b", "label", "l", "update-ref", "u", "noop"})
-_TODO_FILES = frozenset({"git-rebase-todo", "git-rebase-todo.backup", "done", "todo", "current-fixups"})
-# Files whose every hex token is a commit id (one per line, or "old new" pairs); other words in them (update-refs'
-# ref names, BISECT_START's branch name) name no commit by id and are skipped.
-_ID_FILES = frozenset({"orig-head", "onto", "head", "amend", "stopped-sha", "squash-onto", "rewritten-pending",
-                       "rewritten-list", "rewritten", "dropped", "abort-safety", "original-commit", "update-refs",
-                       "autostash"})
-_ID_TOP_FILES = frozenset({"BISECT_EXPECTED_REV", "BISECT_HEAD", "BISECT_START", "NOTES_MERGE_PARTIAL",
-                           "MERGE_AUTOSTASH"})
-# State files that hold text, flags or numbers, never a commit id git reads back (a message, a diff, msgnum's "1234"):
-# not read at all. Anything in OP_STATE_DIRS not listed anywhere here is scanned as before review 5 (_HEX_TOKEN_RE).
-_TEXT_FILES = frozenset({
-    "message", "message-squash", "message-fixup", "author-script", "patch", "msg", "msg-clean", "final-commit", "info",
-    "head-name", "strategy", "strategy_opts", "opts", "gpg_sign_opt", "msgnum", "end", "next", "last", "interactive",
-    "quiet", "verbose", "signoff", "keep", "utf8", "threeway", "scissors", "messageid", "apply-opt", "rebasing",
-    "applying", "sign", "drop_redundant_commits", "keep_redundant_commits", "reschedule-failed-exec",
-    "no-reschedule-failed-exec", "allow_rerere_autoupdate", "autosquash", "cdate_is_adate", "ignore_date",
-    "keep-cr", "no-keep-cr", "quoted-cr", "allow_empty_message", "empty"})
-_TEXT_TOP_FILES = frozenset({"BISECT_NAMES", "BISECT_TERMS", "BISECT_RUN", "BISECT_ANCESTORS_OK",
-                             "BISECT_FIRST_PARENT", "NOTES_MERGE_REF"})
-_PATCH_FILE_RE = re.compile(r"\d{4,}")                     # rebase-apply/0001...: `From <commit> Mon Sep 17 ...`
 
 # Recovery refs (review 4, #2): `refs/cortados-recovery/<YYYYMMDD>/<task_id>/orig-head` and `.../reflog-<n>` in the
 # clone keep the commits a worktree's ORIG_HEAD or own reflogs reach and no shared ref does, before the worktree is
@@ -780,9 +752,10 @@ _RECOVERY_DATE_RE = re.compile(r"\d{8}")
 
 def _op_state_files(gitdir: str, deadline=None) -> list:
     """[(name relative to `gitdir`, full path)] for the worktree's per-worktree operation and recovery state:
-    everything under OP_STATE_DIRS and logs/, and the top-level ORIG_HEAD, MERGE_AUTOSTASH and OP_STATE_FILE_PREFIXES
-    files. Directories are listed with a trailing "/"; a symlink is listed, never followed. Raises WorkspaceError when
-    a tree cannot be walked or has more than OP_STATE_MAX_FILES entries, GitTimeoutError past `deadline`."""
+    everything under OP_STATE_DIRS and logs/, and the top-level ORIG_HEAD, MERGE_AUTOSTASH, OPERATION_STATE_FILES,
+    AUTO_MERGE and OP_STATE_FILE_PREFIXES files. Directories are listed with a trailing "/"; a symlink is listed, never
+    followed. Raises WorkspaceError when a tree cannot be walked or has more than OP_STATE_MAX_FILES entries,
+    GitTimeoutError past `deadline`."""
     out, errors = [], []
     try:
         top = os.listdir(gitdir)
@@ -790,9 +763,10 @@ def _op_state_files(gitdir: str, deadline=None) -> list:
         raise WorkspaceError(f"the worktree's git dir cannot be listed: {type(exc).__name__}")
     for name in sorted(top):
         full = os.path.join(gitdir, name)
-        if name in ("ORIG_HEAD", "MERGE_AUTOSTASH") or name.startswith(OP_STATE_FILE_PREFIXES):
-            # A file name (a directory in its place is listed as the file, so reading it fails and holds, review 5
-            # P1 #2), except NOTES_MERGE_WORKTREE, a directory that is walked (and holds outright anyway).
+        if name in ("ORIG_HEAD", "MERGE_AUTOSTASH", *OPERATION_STATE_FILES, *OPERATION_STATE_COMPANIONS) \
+                or name.startswith(OP_STATE_FILE_PREFIXES):
+            # A file name (a directory in its place is listed as the file), except NOTES_MERGE_WORKTREE, a directory
+            # that is walked.
             if name not in OP_STATE_DIRS or not (os.path.isdir(full) and not os.path.islink(full)):
                 out.append((name, full))
                 continue
@@ -819,13 +793,6 @@ def _op_state_files(gitdir: str, deadline=None) -> list:
     if errors:
         raise StateUnreadableError(f"the worktree's operation state cannot be walked: {type(errors[0]).__name__}")
     return out
-
-
-def _is_op_scanned(rel: str) -> bool:
-    """Whether _unpublished_operation_state reads `rel` (a file of _op_state_files) for commit ids."""
-    if rel.endswith("/") or rel == "ORIG_HEAD" or rel.startswith("logs"):
-        return False
-    return rel.split("/")[0] in OP_STATE_DIRS or rel.startswith(OP_STATE_FILE_PREFIXES) or rel == "MERGE_AUTOSTASH"
 
 
 def _read_capped(full: str, cap: int) -> bytes:
@@ -935,144 +902,20 @@ def _ref_entries(path: str, patterns=(), deadline=None) -> dict:
     return out
 
 
-def _todo_ids(text: str):
-    """(commit-position words, label-position words, labels defined) of a todo file's lines (git-rebase-todo,
-    sequencer/todo...): `<cmd> <commit> <subject>` for pick and the like, `fixup|squash [-C|-c] <commit>`, `merge
-    [-C|-c <commit>] <label|commit>... [# subject]`, `reset <label|commit>`, `label <name>`. Comments, exec lines and
-    subjects are never read. A line with an unknown command (a different comment char, a newer git) counts its second
-    word as a commit position: conservative, and no template comment of git's has a hex word there."""
-    commits, labels, defined = [], [], set()
-    for line in text.splitlines():
-        words = line.split()
-        if not words or words[0].startswith("#"):
-            continue
-        cmd, args = words[0], words[1:]
-        if cmd in _TODO_COMMIT_CMDS:
-            while args and args[0].startswith("-"):
-                args = args[1:]
-            commits.extend(args[:1])
-        elif cmd in ("merge", "m"):
-            if len(args) >= 2 and args[0] in ("-C", "-c"):
-                commits.append(args[1])
-                args = args[2:]
-            for word in args:
-                if word.startswith("#"):
-                    break
-                labels.append(word)
-        elif cmd in ("reset", "t"):
-            labels.extend(args[:1])
-        elif cmd in ("label", "l"):
-            defined.update(args[:1])
-        elif cmd not in _TODO_OTHER_CMDS:
-            commits.extend(args[:1])
-    return commits, labels, defined
-
-
-def _bisect_log_ids(text: str) -> list:
-    """Commit-position words of BISECT_LOG: the revisions of its `git bisect start|good|bad|skip|<term> ...` lines
-    (before any `--`, quotes stripped) and the `[<commit>]` of its `# bad: [<commit>] subject` comments."""
-    ids = []
-    for line in text.splitlines():
-        words = line.split()
-        if line.startswith("#"):
-            m = re.search(r"\[([0-9a-f]{4,64})\]", line)
-            if m:
-                ids.append(m.group(1))
-        elif words[:2] == ["git", "bisect"]:
-            for word in words[3:]:
-                if word == "--" or word == "'--'":
-                    break
-                ids.append(word.strip("'\""))
-    return ids
-
-
-def _op_state_ids(rel: str, text: str):
-    """(commit-position words, label-position words, labels defined, generic) for one scanned state file `rel`:
-    format-aware where the format is known (review 5, P1 #3); `generic` is True for an unknown file, whose words are
-    _HEX_TOKEN_RE matches anywhere (the pre-review-5 scan: no false holds from short words, no 4-char ids either)."""
-    base = rel.rsplit("/", 1)[-1]
-    top = "/" not in rel
-    if top:
-        if base in _TEXT_TOP_FILES:
-            return [], [], set(), False
-        if base == "BISECT_LOG":
-            return _bisect_log_ids(text), [], set(), False
-        if base in _ID_TOP_FILES:
-            return text.split(), [], set(), False
-        return _HEX_TOKEN_RE.findall(text), [], set(), True
-    if base in _TODO_FILES:
-        return (*_todo_ids(text), False)
-    if base in _ID_FILES:
-        return text.split(), [], set(), False
-    if base in _TEXT_FILES:
-        return [], [], set(), False
-    if rel.startswith("rebase-apply/") and _PATCH_FILE_RE.fullmatch(base):
-        first = text.split("\n", 1)[0].split()
-        return (first[1:2] if first[:1] == ["From"] else []), [], set(), False
-    return _HEX_TOKEN_RE.findall(text), [], set(), True
-
-
-def _unpublished_operation_state(path: str, gitdir: str, deadline=None):
-    """(names, unreadable): the operation state files (relative to `gitdir`) that keep the worktree from being proven
-    published (see OP_STATE_DIRS), and those that exist but could not be read in full (review 5, P1 #2: never treated
-    as missing). A commit id in a commit position (_op_state_ids) must resolve as `<id>^{commit}` to one commit that a
-    remote-tracking ref reaches; an all-zero id (update-refs' "not yet") names nothing. A hex label of a `reset` or
-    `merge` line that is neither defined by a `label` line nor a refs/rewritten/ ref is taken as a commit id. Raises
-    WorkspaceError / GitTimeoutError: callers hold."""
-    entries = _op_state_files(gitdir, deadline)
-    bad = [rel for rel, _ in entries if rel.rstrip("/") in OP_STATE_HOLD]
-    unreadable = []
-    exact, loose, labels, defined, budget, count = {}, {}, {}, set(), OP_STATE_MAX_BYTES, 0
-    for rel, full in entries:
-        if rel.endswith("/") and rel.count("/") > 1 and rel.split("/")[0] in OP_STATE_DIRS \
-                and rel.split("/")[0] not in OP_STATE_HOLD:      # a notes merge's tree fans out (and holds anyway)
-            unreadable.append(rel.rstrip("/"))       # git keeps only files there: a directory may be a file's place
-            continue
-        if not _is_op_scanned(rel):
-            continue
-        _check_deadline(deadline, "read the worktree's operation state")
-        try:
-            data = _read_capped(full, budget)
-        except _StateMissing:
-            continue                                 # removed since listed: the closing snapshot differs
-        except StateUnreadableError:
-            unreadable.append(rel)
-            continue
-        budget -= len(data)
-        ids, lab, dfn, generic = _op_state_ids(rel, data.decode("utf-8", "replace"))
-        for word in ids:
-            if _SHORT_OID_RE.fullmatch(word) and word.strip("0"):
-                (loose if generic else exact).setdefault(word, rel)
-                count += 1
-        for word in lab:
-            if _SHORT_OID_RE.fullmatch(word) and word.strip("0"):
-                labels.setdefault(word, rel)
-        defined |= dfn
-        if count > OP_STATE_MAX_TOKENS:
-            raise StateUnreadableError(f"more than {OP_STATE_MAX_TOKENS} object names in the operation state")
-    if labels:
-        rewritten = {ref[len("refs/rewritten/"):] for ref in _ref_oids(path, ("refs/rewritten",), deadline)}
-        for word, rel in labels.items():
-            if word not in defined and word not in rewritten:
-                exact.setdefault(word, rel)
-    commits = {}
-    resolved = _object_types(path, [w + "^{commit}" for w in exact], deadline)
-    for word, rel in exact.items():
-        oid, kind = resolved[word + "^{commit}"]
-        if kind == "commit" and oid:
-            commits.setdefault(oid, rel)
-        else:                                        # missing, ambiguous, or not a commit: not provable
-            bad.append(rel)
-    for word, (oid, kind) in _object_types(path, loose, deadline).items():
-        if kind == "ambiguous":
-            bad.append(loose[word])
-        elif kind == "commit":
-            commits.setdefault(oid, loose[word])
-    if commits:
-        remotes = _ref_oids(path, ("refs/remotes",), deadline).values()
-        for oid in _not_reachable(path, commits, remotes, deadline):
-            bad.append(commits[oid])
-    return sorted(set(bad)), sorted(set(unreadable))
+def _operation_state(gitdir: str) -> list:
+    """The in-progress operation state names in the worktree's own git dir `gitdir` (OPERATION_STATE_*), sorted, with
+    AUTO_MERGE added when it is there beside one of them; [] when no operation is in progress. Presence alone counts:
+    a name is not opened, so an unreadable file or a directory in a file's place holds like any other. Raises
+    StateUnreadableError when the git dir cannot be listed (no operation can be ruled out)."""
+    try:
+        names = set(os.listdir(gitdir))
+    except OSError as exc:
+        raise StateUnreadableError(f"the worktree's git dir cannot be listed: {type(exc).__name__}")
+    found = sorted(n for n in names if n in OPERATION_STATE_DIRS or n in OPERATION_STATE_FILES
+                   or n.startswith(OPERATION_STATE_PREFIXES))
+    if found:
+        found += [n for n in OPERATION_STATE_COMPANIONS if n in names]
+    return found
 
 
 def _recovery_candidates(path: str, gitdir: str, deadline=None):
@@ -1312,7 +1155,8 @@ def _git_state(path: str, deadline=None) -> dict:
     this. HEAD's commit and what it is attached to; the worktree's own git dir and the clone's common dir (`git
     rev-parse --git-dir --git-common-dir`); its worktree-private refs (_private_refs, autostashes included); the size,
     mtime and inode of its index file; and those of its operation and recovery state (`ops`: _op_state_files, i.e.
-    rebase-merge/, rebase-apply/, sequencer/, BISECT_*, NOTES_MERGE_*, ORIG_HEAD and its own reflogs, so a late
+    rebase-merge/, rebase-apply/, sequencer/, MERGE_HEAD etc., BISECT_*, NOTES_MERGE_*, AUTO_MERGE, ORIG_HEAD and
+    its own reflogs, so a late
     reset-and-back that leaves HEAD where it was still counts). Shared state (branches, tags, the stash, packed-refs) is left out (review 3, P2 #3; #102): every
     worktree of the clone writes it, and it survives this worktree's deletion, so a sibling task's stash, commit or
     tag never holds this one. A late commit on this worktree's own branch still moves its HEAD.

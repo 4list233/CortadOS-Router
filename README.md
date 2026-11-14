@@ -523,13 +523,16 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   a stopped operation's `MERGE_HEAD`/`CHERRY_PICK_HEAD`/`REVERT_HEAD`/`REBASE_HEAD`/`BISECT_HEAD`, each reachable
   from a remote-tracking ref; a stopped `merge --autostash` or `rebase --autostash` (either backend) keeps the task's
   changes in an autostash in the worktree's own git dir (`MERGE_AUTOSTASH`, `rebase-merge/autostash`,
-  `rebase-apply/autostash`) that is never on a remote, so it always holds, `reason_code` `unpushed_autostash`; every
-  commit a stopped rebase, cherry-pick/revert sequence, bisect or notes merge names in its state files must be on a
-  remote, and a stopped `git am` holds outright, `unpushed_operation_state` (only the commit-id fields of those files
-  are read, e.g. `pick <id>` in a todo, never subjects or messages; an id there may be as short as git's 4-digit
-  `core.abbrev` and must resolve as `<id>^{commit}` to one commit, or it holds). A state file that exists but cannot be
-  read, is not a regular file, is malformed (an `ORIG_HEAD` that is not one object id) or is past a size cap holds the
-  folder, `unreadable_git_state`; only a missing file counts as absent. `ORIG_HEAD` and the worktree's reflogs do
+  `rebase-apply/autostash`) that is never on a remote, so it always holds, `reason_code` `unpushed_autostash`; ANY
+  in-progress git operation holds outright, `unpushed_operation_state`: `rebase-merge/`, `rebase-apply/` (also a
+  stopped `git am`), `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `REBASE_HEAD`, `sequencer/`, `BISECT_LOG` (any
+  `BISECT_*`) or `NOTES_MERGE_*` in the worktree's own git dir, `AUTO_MERGE` reported with them. Their files are never
+  parsed and the commits they name are not checked: seven review rounds each found a todo, label, short-id or
+  reset/merge form a parser missed, and one (`reset <id>` before a later `label <id>`) archived and then deleted an
+  unpublished commit. A task rarely ends mid-operation, a false hold only keeps a folder, a false archive loses work.
+  A git dir that cannot be listed, or an `ORIG_HEAD`, reflog or autostash that exists but cannot be read, is not a
+  regular file, is malformed (an `ORIG_HEAD` that is not one object id) or is past a size cap holds the folder,
+  `unreadable_git_state`; only a missing file counts as absent. `ORIG_HEAD` and the worktree's reflogs do
   not hold, since every reset, amend or rebase writes them; instead, before the folder is archived (and again before
   the cleanup deletes it) every commit only they reach gets a recovery ref in the clone,
   `refs/cortados-recovery/<YYYYMMDD>/<task_id>/orig-head` or `.../reflog-<n>`, dated with the UTC day it was created

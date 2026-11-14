@@ -2076,7 +2076,7 @@ class QuarantineAndGitStateTests(_Base):
         gitdir = git("rev-parse", "--absolute-git-dir", cwd=rec["path"]).strip()
         with open(os.path.join(gitdir, "MERGE_HEAD"), "w") as f:
             f.write(sha + "\n")
-        self.assertEqual(ws.assess(rec["path"])[1].code, "unpushed_private_refs")
+        self.assertEqual(ws.assess(rec["path"])[1].code, "unpushed_operation_state")   # review 8: a merge in progress
         os.remove(os.path.join(gitdir, "MERGE_HEAD"))
         os.makedirs(os.path.join(gitdir, "refs", "worktree"), exist_ok=True)
         with open(os.path.join(gitdir, "refs", "worktree", "broken"), "w") as f:
@@ -2347,9 +2347,74 @@ class OperationStateAndRecoveryTests(_Base):
                 self.assertEqual((settled["state"], settled["reason_code"]), ("held", "unpushed_autostash"), settled)
                 self.assertTrue(os.path.isfile(os.path.join(self.gitdir(settled["path"]), state, "autostash")))
 
-    def test_a_stopped_cherry_pick_sequence_naming_an_unpublished_commit_holds(self):
-        """sequencer/todo names commits by abbreviated id; one exists nowhere but there (and the reflog)."""
+    # --- review 8: any in-progress operation holds; its state is never parsed -----------------------------------
+
+    def assert_operation_holds(self, rec, *names):
+        ok, reason, _ = ws.assess(rec["path"])
+        self.assertEqual((ok, reason.code), (False, "unpushed_operation_state"), reason)
+        for name in names:
+            self.assertIn(name, reason)
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "unpushed_operation_state"), settled)
+        self.assertEqual(os.listdir(os.path.join(self.root, "archive")), [])
+        return settled
+
+    def test_round_7_pending_reset_before_label_mid_rebase_holds(self):
+        """Round 7's reproduction under real git: an unpublished commit L named only by a pending `reset <L>` before a
+        later `label <L>` in a stopped rebase's todo. The parser took <L> for a label and archived; now any rebase holds."""
         rec = self.prepare(repo=self.origin, branch="feature")
+        path = rec["path"]
+        local = self.commit(path, "local.txt")
+        git("reset", "-q", "--hard", "origin/feature", cwd=path)
+        short = local[:7]
+        todo = os.path.join(self.tmp, "round7-todo")
+        with open(todo, "w") as f:
+            f.write(f"break\nreset {short}\nlabel {short}\nreset onto\n")
+        stopped = subprocess.run(["git", "rebase", "-i", "origin/feature"], cwd=path, capture_output=True, text=True,
+                                 env={**GIT_ENV, "GIT_SEQUENCE_EDITOR": f"cp {todo}"})
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)     # stopped at `break`
+        self.clean(path)
+        self.assertEqual(self.head(path), git("rev-parse", "origin/feature", cwd=path).strip())
+        with open(os.path.join(self.gitdir(path), "rebase-merge", "git-rebase-todo")) as f:
+            pending = f.read()
+        self.assertRegex(pending, r"(?m)^reset %s" % short, pending)
+        self.assertRegex(pending, r"(?m)^label %s" % short, pending)
+        self.assertEqual(self.run_git("merge-base", "--is-ancestor", local, "origin/feature", cwd=path).returncode, 1)
+        settled = self.assert_operation_holds(rec, "rebase-merge")
+        self.assertEqual(git("cat-file", "-t", local, cwd=settled["path"]).strip(), "commit")
+
+    def test_a_merge_in_progress_holds_even_when_everything_it_names_is_published(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        git("merge", "--no-commit", "--no-ff", "-s", "ours", "origin/side", cwd=rec["path"])
+        self.clean(rec["path"])
+        self.assert_operation_holds(rec, "MERGE_HEAD")
+
+    def test_a_conflicted_merge_resolved_but_not_committed_holds_and_names_auto_merge(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        stopped = self.run_git("merge", "origin/side", cwd=rec["path"])
+        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)    # f.txt conflicts
+        git("checkout", "HEAD", "--", "f.txt", cwd=rec["path"])                      # resolved as ours, not committed
+        self.clean(rec["path"])
+        auto = os.path.exists(os.path.join(self.gitdir(rec["path"]), "AUTO_MERGE"))
+        self.assert_operation_holds(rec, "MERGE_HEAD", *(["AUTO_MERGE"] if auto else []))
+
+    def test_auto_merge_alone_does_not_hold(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        tree = git("rev-parse", "HEAD^{tree}", cwd=rec["path"]).strip()
+        with open(os.path.join(self.gitdir(rec["path"]), "AUTO_MERGE"), "w") as f:
+            f.write(tree + "\n")
+        self.assertEqual(ws.assess(rec["path"])[0], True)
+
+    def test_a_stopped_cherry_pick_holds(self):
+        """A single pick (CHERRY_PICK_HEAD) and a sequence (sequencer/), published commits or not."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        stopped = self.run_git("cherry-pick", "origin/side", cwd=rec["path"])
+        self.assertNotEqual(stopped.returncode, 0)
+        git("checkout", "HEAD", "--", "f.txt", cwd=rec["path"])
+        self.clean(rec["path"])
+        self.assert_operation_holds(rec, "CHERRY_PICK_HEAD")
+        tid = "t20261114170000-000000b1"
+        rec = self.prepare(tid, repo=self.origin)
         path = rec["path"]
         local = self.commit(path, "local.txt")
         git("reset", "-q", "--hard", "origin/feature", cwd=path)
@@ -2357,26 +2422,24 @@ class OperationStateAndRecoveryTests(_Base):
         self.assertNotEqual(stopped.returncode, 0)
         git("reset", "-q", "--hard", cwd=path)
         self.clean(path)
-        with open(os.path.join(self.gitdir(path), "sequencer", "todo")) as f:
-            self.assertIn(local[:7], f.read())
+        self.assertTrue(os.path.isdir(os.path.join(self.gitdir(path), "sequencer")))
         ok, reason, _ = ws.assess(path)
         self.assertEqual((ok, reason.code), (False, "unpushed_operation_state"), reason)
-        self.assertIn("sequencer/todo", reason)
-        self.assertEqual(ws.settle(rec, self.root)["state"], "held")
+        self.assertIn("sequencer", reason)
 
-    def test_operation_state_naming_only_published_commits_does_not_hold(self):
-        """#102: a bisect over pushed history, or a stopped rebase of pushed commits without an autostash, loses
-        nothing; and an unknown or abbreviated name that is no object here names nothing to lose."""
+    def test_a_bisect_in_progress_holds(self):
         rec = self.prepare(repo=self.origin, branch="feature")
-        gitdir = self.gitdir(rec["path"])
-        with open(os.path.join(gitdir, "BISECT_LOG"), "w") as f:
-            f.write(f"git bisect start\n# bad: [{self.head(rec['path'])}] feature\nversion 20261114 deadbeefcafe\n")
-        self.assertEqual(ws.assess(rec["path"])[0], True)
-        os.remove(os.path.join(gitdir, "BISECT_LOG"))
+        git("bisect", "start", "HEAD", "HEAD~1", cwd=rec["path"])
+        self.clean(rec["path"])
+        self.assert_operation_holds(rec, "BISECT_LOG")
+
+    def test_a_stopped_rebase_of_published_commits_holds(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
         stopped = self.run_git("rebase", "origin/side", cwd=rec["path"])
         self.assertNotEqual(stopped.returncode, 0)
         git("reset", "-q", "--hard", cwd=rec["path"])
-        self.assertEqual(ws.assess(rec["path"])[0], True)
+        self.clean(rec["path"])
+        self.assert_operation_holds(rec, "rebase-merge")
 
     def test_a_stopped_am_holds_outright(self):
         rec = self.prepare(repo=self.origin, branch="feature")
@@ -2387,6 +2450,50 @@ class OperationStateAndRecoveryTests(_Base):
                 f.write("a mailed patch that exists nowhere else\n")
         ok, reason, _ = ws.assess(rec["path"])
         self.assertEqual((ok, reason.code), (False, "unpushed_operation_state"), reason)
+
+    def test_a_finished_or_aborted_operation_leaves_a_clean_pushed_worktree_that_archives(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        self.assertEqual(ws.assess(rec["path"])[:2], (True, "pushed"))
+        git("merge", "--no-commit", "--no-ff", "-s", "ours", "origin/side", cwd=rec["path"])
+        git("merge", "--abort", cwd=rec["path"])
+        git("bisect", "start", "HEAD", "HEAD~1", cwd=rec["path"])
+        git("bisect", "reset", cwd=rec["path"])
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["reason_code"]), ("archived", "pushed"), settled)
+
+    def test_operation_state_that_cannot_be_read_still_holds(self):
+        """Presence alone counts: a directory or a mode-0 file in a state file's place holds as an operation, and a
+        git dir that cannot be listed holds as unreadable (no operation can be ruled out)."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        gitdir = self.gitdir(rec["path"])
+        for rel in ("BISECT_LOG", "sequencer/todo", "rebase-merge/done", "MERGE_HEAD"):
+            with self.subTest(rel=rel):
+                os.makedirs(os.path.join(gitdir, rel))
+                ok, reason, _ = ws.assess(rec["path"])
+                self.assertEqual((ok, reason.code), (False, "unpushed_operation_state"), reason)
+                self.assertIn(rel.split("/")[0], reason)
+                shutil.rmtree(os.path.join(gitdir, rel.split("/")[0]))
+        if os.geteuid() != 0:
+            os.makedirs(os.path.join(gitdir, "sequencer"))
+            todo = os.path.join(gitdir, "sequencer", "todo")
+            with open(todo, "w") as f:
+                f.write("pick " + self.head(rec["path"]) + " published\n")
+            os.chmod(todo, 0)                               # unlinkable at cleanup: the dir is writable
+            ok, reason, _ = ws.assess(rec["path"])
+            self.assertEqual((ok, reason.code), (False, "unpushed_operation_state"), reason)
+            os.chmod(todo, 0o600)
+            shutil.rmtree(os.path.join(gitdir, "sequencer"))
+        self.assertEqual(ws.assess(rec["path"])[0], True)
+        real = os.listdir
+
+        def listdir(p="."):
+            if isinstance(p, str) and os.path.realpath(p) == os.path.realpath(gitdir):
+                raise PermissionError(13, "Permission denied", p)
+            return real(p)
+        with mock.patch.object(ws.os, "listdir", listdir):
+            ok, reason, _ = ws.assess(rec["path"])
+        self.assertEqual((ok, reason.code), (False, "unreadable_git_state"), reason)
+        self.assertIn("cannot be listed", reason)
 
     def test_autostash_and_reflog_written_after_the_assessment_are_in_the_snapshot(self):
         """Neither changes a working-tree file, HEAD or the index; the snapshot sees them anyway."""
@@ -2584,86 +2691,6 @@ class OperationStateAndRecoveryTests(_Base):
         idx = ws.read_index(self.root)[TID]
         self.assertEqual((idx["state"], idx["reason_code"]), ("held", "unreadable_git_state"), idx)
         self.assertEqual(git("cat-file", "-t", sha, cwd=idx["path"]).strip(), "commit")
-
-    def test_unreadable_operation_state_files_hold(self):
-        """Review 5, P1 #2, every state file: a directory or an unreadable file where a sequencer, rebase or bisect
-        file should be is not proven published."""
-        rec = self.prepare(repo=self.origin, branch="feature")
-        gitdir = self.gitdir(rec["path"])
-        for rel in ("BISECT_LOG", "sequencer/todo", "rebase-merge/done"):
-            with self.subTest(rel=rel):
-                full = os.path.join(gitdir, rel)
-                os.makedirs(full)
-                ok, reason, _ = ws.assess(rec["path"])
-                self.assertEqual((ok, reason.code), (False, "unreadable_git_state"), reason)
-                self.assertIn(rel, reason)
-                shutil.rmtree(os.path.join(gitdir, rel.split("/")[0]))
-        if os.geteuid() != 0:
-            os.makedirs(os.path.join(gitdir, "sequencer"))
-            todo = os.path.join(gitdir, "sequencer", "todo")
-            with open(todo, "w") as f:
-                f.write("pick " + self.head(rec["path"]) + " published\n")
-            self.assertEqual(ws.assess(rec["path"])[0], True)
-            os.chmod(todo, 0)
-            ok, reason, _ = ws.assess(rec["path"])
-            self.assertEqual((ok, reason.code), (False, "unreadable_git_state"), reason)
-            os.chmod(todo, 0o600)
-
-    def test_a_cherry_pick_sequence_with_four_char_ids_naming_an_unpublished_commit_holds(self):
-        """Review 5, P1 #3: with core.abbrev=4 sequencer/todo names commits by 4 hex digits; the 7+ digit scan
-        missed them, and the worktree was judged pushed and deleted."""
-        rec = self.prepare(repo=self.origin, branch="feature")
-        path = rec["path"]
-        git("config", "core.abbrev", "4", cwd=path)
-        local = self.commit(path, "local.txt")
-        git("reset", "-q", "--hard", "origin/feature", cwd=path)
-        stopped = self.run_git("cherry-pick", "origin/side", local, cwd=path)
-        self.assertNotEqual(stopped.returncode, 0)
-        git("reset", "-q", "--hard", cwd=path)
-        self.clean(path)
-        with open(os.path.join(self.gitdir(path), "sequencer", "todo")) as f:
-            todo = f.read()
-        self.assertRegex(todo, r"(?m)^pick %s " % local[:4], todo)
-        self.assertNotIn(local[:7], todo)                  # really abbreviated below the old 7-digit floor
-        ok, reason, _ = ws.assess(path)
-        self.assertEqual((ok, reason.code), (False, "unpushed_operation_state"), reason)
-        self.assertIn("sequencer/todo", reason)
-        settled = ws.settle(rec, self.root)
-        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "unpushed_operation_state"), settled)
-
-    def test_short_hex_words_in_subjects_do_not_hold_and_unresolvable_ids_do(self):
-        """Only commit-id fields are read: a published sequence whose subjects are full of short hex words is
-        archived; an id in a commit position that resolves to no commit (or several) holds."""
-        rec = self.prepare(repo=self.origin, branch="feature")
-        path = rec["path"]
-        git("config", "core.abbrev", "4", cwd=path)
-        for name in ("a.txt", "b.txt"):
-            with open(os.path.join(path, name), "w") as f:
-                f.write(name)
-            git("add", name, cwd=path)
-            git("commit", "-q", "-m", "fix cafe beef dead 1234 abcdef0 feed " + name, cwd=path)
-        picks = git("rev-list", "--reverse", "origin/feature..HEAD", cwd=path).split()
-        git("push", "-q", "origin", "HEAD:refs/heads/published", cwd=path)
-        git("reset", "-q", "--hard", "origin/feature", cwd=path)
-        stopped = self.run_git("cherry-pick", "origin/side", *picks, cwd=path)
-        self.assertNotEqual(stopped.returncode, 0)
-        git("reset", "-q", "--hard", cwd=path)
-        todo = os.path.join(self.gitdir(path), "sequencer", "todo")
-        with open(todo) as f:
-            text = f.read()
-        self.assertIn("cafe beef dead 1234", text)
-        ok, reason, _ = ws.assess(path)
-        self.assertEqual(ok, True, reason)
-        for line in ("pick ffff0000 no such commit\n", "revert " + git("rev-parse", "HEAD^{tree}", cwd=path)[:12]
-                     + " a tree, not a commit\n", "merge -C fffe " + "label # x\n", "reset abcd\n"):
-            with self.subTest(line=line):
-                with open(todo, "w") as f:
-                    f.write(text + line)
-                ok, reason, _ = ws.assess(path)
-                self.assertEqual((ok, reason.code), (False, "unpushed_operation_state"), reason)
-        with open(todo, "w") as f:                          # a label defined in the todo is a label, not an id
-            f.write(text + "label beef\nreset beef\n# pick 0bad comment\nexec echo dead\n")
-        self.assertEqual(ws.assess(path)[0], True)
 
 
 class RecoveryRefExpiryTests(_Base):
