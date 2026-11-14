@@ -132,6 +132,71 @@ export interface PulseLive {
   hosts?: PulseLiveSection & { items?: PulseLiveHost[]; provider_host?: string | null }
 }
 
+// GET /v1/cortados/live/session?session=<tag> (provider/live.py `session_view`): this session's orchestrator subtree
+// and session-free fleet health. Statuses in the owner's words: running, waiting, done, failed, unknown.
+export type PulseTreeStatus = 'running' | 'waiting' | 'done' | 'failed' | 'unknown' | string
+export interface PulseTokens { input?: number; output?: number; cache_read?: number; cache_write?: number; fresh?: number }
+/** A sub-session: one of a child task's routed conversations (role main = its main loop), or one of the session's own
+ * routed subagents (orchestrator `routed`). */
+export interface PulseSubSession {
+  ref?: string | null
+  role?: 'main' | 'subagent' | string
+  title?: string | null
+  status?: PulseTreeStatus
+  phase?: string | null
+  tool?: string | null
+  model?: string | null
+  lane?: string | null
+  started_at?: number | null
+  ended_at?: number | null
+  elapsed_s?: number | null
+  tokens?: PulseTokens | null
+}
+export interface PulseTreeTask {
+  task_id?: string
+  title?: string | null
+  state?: string
+  status?: PulseTreeStatus
+  phase?: string | null
+  tool?: string | null
+  host?: string | null
+  model?: string | null
+  lane?: string | null
+  started_at?: number | null
+  ended_at?: number | null
+  elapsed_s?: number | null
+  origin_via?: string | null
+  parent_hidden?: boolean
+  tokens?: PulseTokens | null
+  sub_sessions?: PulseSubSession[]
+  sub_sessions_hidden?: number
+  tasks?: PulseTreeTask[]
+}
+export interface PulseOrchestrator {
+  origin?: string | null
+  kind?: 'session' | 'bot' | 'unattributed' | string
+  project?: string | null
+  device?: string | null
+  status?: string
+  model?: string | null
+  tool?: string | null
+  counts?: Record<string, number>
+  attention?: number
+  tasks?: PulseTreeTask[]
+  tasks_hidden?: number
+  routed?: PulseSubSession[]
+  routed_hidden?: number
+}
+export interface PulseSessionView {
+  version?: number
+  generated_at?: number
+  session_filter?: string
+  overview?: PulseLive['overview']
+  orchestrators?: PulseLiveSection & { items?: PulseOrchestrator[]; scope?: string; truncated?: boolean; session_filter?: string }
+  s1?: PulseLive['s1']
+  hosts?: PulseLive['hosts']
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'cortados-pulse': {
@@ -139,6 +204,7 @@ declare module 'claude-code' {
       live: { data: PulseLive; at: number; base: string } | null; liveErr: string | null
       mine: { tag: string | null; why: string | null } | null
       mineLive: { data: PulseLive; at: number; tag: string } | null
+      tree: { data: PulseSessionView; at: number; tag: string; base: string } | null; treeErr: string | null
     }
   }
 }

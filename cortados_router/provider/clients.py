@@ -48,12 +48,16 @@ CLIENTS_ENV = "CORTADOS_PROVIDER_CLIENTS"
 OFFICE_PATH = "/v1/cortados/office"
 LIVE_PATH = "/v1/cortados/live"                       # provider/live.py LIVE_PATH (a test keeps the two equal)
 LIVE_HEARTBEAT_PATH = "/v1/cortados/live/heartbeat"   # provider/live.py HEARTBEAT_PATH
+LIVE_SESSION_PATH = "/v1/cortados/live/session"       # provider/live.py SESSION_PATH
 # Scope -> the (method, path) pairs it opens. Exact paths only (no prefixes): a prefix would open whatever is added
 # under it later. A new reader gets a new scope here, reviewed, never a wildcard.
 SCOPES: dict[str, frozenset[tuple[str, str]]] = {
     "office:read": frozenset({("GET", OFFICE_PATH)}),
     # the live snapshot (dashboard, pulse pane): read-only metadata, like the office view
-    "live:read": frozenset({("GET", LIVE_PATH)}),
+    "live:read": frozenset({("GET", LIVE_PATH), ("GET", LIVE_SESSION_PATH)}),
+    # one session's own tree only (the pulse pane): the endpoint always needs ?session=<tag> and lists no other session,
+    # so this token can read a subtree only for a tag it already knows (docs/PULSE-PER-SESSION.md)
+    "live:session": frozenset({("GET", LIVE_SESSION_PATH)}),
     # write-only: a host posting its job states (the Studio's S1 jobs) without holding the owner token, which routes
     "live:heartbeat": frozenset({("POST", LIVE_HEARTBEAT_PATH)}),
 }

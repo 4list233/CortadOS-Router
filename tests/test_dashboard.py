@@ -378,12 +378,13 @@ class DashboardRenderTest(unittest.TestCase):
             self.assertIn(key, html)
         self.assertNotIn("error_kind", html)        # the merged lane publishes `error` only
         # the Live tab reads every section live.collect publishes
-        for key in ("d.overview", "d.tasks", "d.conversations", "d.routed", "d.subscriptions", "d.s1", "d.hosts",
+        for key in ("d.overview", "d.tasks", "d.conversations", "d.orchestrators", "d.routed", "d.subscriptions", "d.s1", "d.hosts",
                     "o.lowest_subscription", "s.heartbeat_path", "h.heartbeat_state"):
             self.assertIn(key, html)
         from tests import test_live
         self.assertEqual(set(test_live.fixture_view()) - {"version", "generated_at"},
-                         {"overview", "tasks", "conversations", "routed", "subscriptions", "s1", "hosts", "work_split"})
+                         {"overview", "tasks", "conversations", "orchestrators", "routed", "subscriptions", "s1", "hosts",
+                          "work_split"})
         self.assertIn("d.work_split", html)
         self.assertEqual(set(usage._VIEW.fields) - {"generated_at"},
                          {"lanes", "routed", "refusals", "child_tasks", "ledger", "bots", "s1", "hardware", "notes"})
@@ -439,6 +440,29 @@ class DashboardRenderTest(unittest.TestCase):
         from tests import test_live
         return test_live.fixture_view(**kw)
 
+    def test_live_tab_draws_the_orchestrator_tree(self):
+        from tests import test_orchestrator_tree as ot
+        out = self.run_page(None, "live", live_view=ot.view())
+        tree = out[out.index("Orchestrators"):out.index("\nTasks\n")]
+        for want in ("2 main sessions · Grok Bot · tasks on air only",
+                     "CortadOS-Router", "on pro · session aaaaaaaa · claude-opus-5 · tool mcp__cortados-route__start_task",
+                     "● 2 running · ✓ 1 done · ? 1 unknown", "! 1 needs attention",
+                     "Build the tree", "on air · claude-sonnet-5 (claude#b) · tool Edit · 14.0k tok (+50.0k cached) · "
+                     "3 sub-sessions",
+                     "├ ●", "main loop · claude-sonnet-5 (claude#b) · model turn · 4.9k tok (+40.0k cached)",
+                     "subagent · gpt-6.1 (codex) · running a tool", "└ ✓", "subagent · qwen3-30b (local-studio) · closed idle",
+                     "Nested step", "orchestrator inherited from its parent", "Deeper step",
+                     "runs on studio; its state is on that host",
+                     "Routed directly by this session", "Check the docs · gpt-6.1-mini (codex) · model turn",
+                     "Grounds", "Their secret plan", "✕ 1 failed", "Follow-up by Grounds",
+                     "Grok Bot", "bot gateway", "Bot errand",
+                     "Unattributed", "tasks with no orchestrator recorded", "Legacy task"):
+            self.assertIn(want, tree, want)
+        self.assertLess(tree.index("CortadOS-Router"), tree.index("Unattributed"))      # the unattributed group last
+        self.assertLess(tree.index("Build the tree"), tree.index("Nested step"))        # nested under its parent
+        for bad in ("[object Object]", "undefined", "NaN", ot.SECRET, "null"):
+            self.assertNotIn(bad, tree, bad)
+
     def test_live_tab_renders_every_section(self):
         from tests import test_live as tl
         v = self.live()
@@ -488,6 +512,7 @@ class DashboardRenderTest(unittest.TestCase):
     def test_live_tasks_grouped_under_their_main_session(self):
         from tests import test_live as tl
         out = self.run_page(None, "live", live_view=self.live())
+        out = out[out.index("\nTasks\n"):]                                     # the Tasks panel (the tree is above it)
         mine = "CortadOS-Router · on pro · session " + tl.SESSION[:8] + " · main session working · tool Edit"
         self.assertIn(mine, out)
         self.assertIn("Unattributed · no main session recorded", out)

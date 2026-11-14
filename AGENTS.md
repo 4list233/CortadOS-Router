@@ -40,7 +40,9 @@ is the long form.
   metadata-only snapshot of running child tasks, routed conversations, routed calls, subscriptions, S1 and hosts, each
   section with its own `as_of`/`status`/`errors`, composed from the office, tasks and usage views) and validates
   `POST /v1/cortados/live/heartbeat` (host job states, e.g. the Studio's S1 jobs); the dashboard's Live tab and the
-  cortados-pulse pane read it. Its host-side sender is `cortados_router/live_heartbeat.py` (launchd jobs, hardware, the Studio's S1
+  cortados-pulse pane read it. Its `orchestrators` section is the tree session → child tasks (nested by parent_task_id)
+  → sub-sessions (the run's conversations); `GET /v1/cortados/live/session?session=<tag>` is one session's subtree only,
+  the pane's view (scope `live:session`; design and privacy in `docs/PULSE-PER-SESSION.md`). Its host-side sender is `cortados_router/live_heartbeat.py` (launchd jobs, hardware, the Studio's S1
   flags and /health; installed per host by `scripts/install_live_heartbeat.sh`, README "Live view"). `work_split.py` joins routed tokens (router.db `tok_*` columns, written per backend turn by `core.log_tokens`) with the
   heartbeats' orchestrator tokens into the live view's `work_split` section and the dashboard's Work split panel.
   `usage.py` builds `GET /v1/cortados/usage` and `tasks.py` builds

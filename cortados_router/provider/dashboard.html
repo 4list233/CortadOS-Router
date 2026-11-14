@@ -101,6 +101,31 @@ h2 { font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.
 .group.origin { text-transform:none; letter-spacing:0; font-size:12.5px; color:var(--fg2); border-top:1px solid var(--line); padding-top:8px; }
 .sub.origin { margin-top:8px; font-weight:600; }
 
+/* orchestrator tree (live.orchestrators_section): session -> tasks -> sub-sessions, collapsible, state kept per poll */
+.og { border-top:1px solid var(--line); padding:4px 0; }
+.og:first-child { border-top:0; }
+.og > summary, .tn > summary { list-style:none; cursor:pointer; }
+.og > summary::-webkit-details-marker, .tn > summary::-webkit-details-marker { display:none; }
+.og > summary { display:flex; flex-wrap:wrap; align-items:center; gap:4px 10px; padding:8px 0; }
+.og > summary::before, .tn > summary::before { content:"▸"; color:var(--muted); font-size:11px; width:10px; }
+.og[open] > summary::before, .tn[open] > summary::before { content:"▾"; }
+.og .on { font-weight:650; }
+.og .om { font-size:12px; color:var(--fg2); }
+.og .oc { margin-left:auto; font-size:12px; color:var(--fg2); font-variant-numeric:tabular-nums; white-space:nowrap; }
+.attn { color:var(--crit-ink); font-weight:600; }
+.tree { margin:0 0 6px 4px; border-left:1px solid var(--line); padding-left:12px; }
+.tn > summary, .tl { display:grid; grid-template-columns:10px auto minmax(0, 1fr) auto; gap:2px 10px; align-items:center; padding:6px 0; }
+.tl::before { content:""; }
+.tn .t, .tl .t { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.tn .m, .tl .m, .sn .m { font-size:12px; color:var(--fg2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.tn .el, .tl .el, .sn .el { text-align:right; font-variant-numeric:tabular-nums; font-weight:600; white-space:nowrap; }
+.el .u { display:block; font-size:11px; font-weight:400; color:var(--muted); }
+.tn.attn > summary .t, .tl.attn .t { color:var(--crit-ink); }
+.sn { display:grid; grid-template-columns:auto minmax(0, 1fr) auto; gap:2px 10px; align-items:center; padding:3px 0 3px 22px; font-size:12.5px; }
+.sn .g { color:var(--muted); font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
+.kids { margin-left:14px; border-left:1px dashed var(--line); padding-left:10px; }
+.tree .lbl { font-size:11.5px; color:var(--muted); margin-top:6px; }
+
 /* tables */
 .wide { overflow-x:auto; -webkit-overflow-scrolling:touch; }
 table { width:100%; border-collapse:collapse; }
@@ -265,6 +290,7 @@ const STATES = {
   cancelled: ["⊘", "", "cancelled"], stopped: ["■", "", "stopped"], scheduled: ["◷", "", "scheduled"],
   unknown: ["?", "warn", "unknown"], stale: ["!", "warn", "stale heartbeat"], none: ["–", "", "no heartbeat yet"],
   partial: ["!", "warn", "partial"],
+  waiting: ["◷", "", "waiting"], done: ["✓", "ok", "done"], "not live": ["–", "", "not live"], "n/a": ["•", "", "—"],
 };
 function pill(state, word) {
   const s = STATES[state] || ["•", "", String(state || "unknown")];
@@ -412,6 +438,110 @@ function originGroups(s, list, conv) {
   });
   return keys.map(k => ({label: originLabel(s.origins.find(g => (g.session || "") === k) || {session: k || null}, conv),
     tasks: groups.get(k)}));
+}
+// ---------------------------------------------------------------- the orchestrator tree (live.orchestrators_section)
+// Each orchestrating main session (Office tag), the bot gateway and the unattributed group, with the child tasks it
+// started (nested by parent_task_id) and each task's sub-sessions (its routed conversations). Collapse state survives
+// the 5 s re-render (orchOpen, keyed by origin / task id); groups and tasks with live work or something failed open by
+// default. What needs attention (failed, unknown) is marked in red with its word, never by colour alone.
+const orchOpen = new Map();
+function keepOpen(d, key, dflt) {
+  d.open = orchOpen.has(key) ? orchOpen.get(key) : dflt;
+  d.addEventListener("toggle", () => orchOpen.set(key, d.open));
+  return d;
+}
+function orchLabel(g) {
+  if (g.kind === "bot") return "Grok Bot";
+  if (g.kind === "unattributed") return "Unattributed";
+  return g.project || "main session";
+}
+function orchMeta(g) {
+  if (g.kind === "unattributed") return "tasks with no orchestrator recorded (from before task origins, or no session tag)";
+  if (g.kind === "bot") return "bot gateway";
+  return join([g.device ? "on " + g.device : null, "session " + String(g.origin || "").slice(0, 8),
+    g.model, g.tool ? "tool " + g.tool : null]);
+}
+function counts(c) {
+  c = c || {};
+  return join([c.running ? "● " + c.running + " running" : null, c.waiting ? "◷ " + c.waiting + " waiting" : null,
+    c.done ? "✓ " + c.done + " done" : null, c.failed ? "✕ " + c.failed + " failed" : null,
+    c.unknown ? "? " + c.unknown + " unknown" : null]) || "no tasks in 24 h";
+}
+function tokText(t) { return t && isNum(t.fresh) ? tok(t.fresh) + " tok" + (t.cache_read ? " (+" + tok(t.cache_read) + " cached)" : "") : null; }
+function elapsedCell(x, now) {
+  const e = el("div", "el"), v = el("span", "tick");
+  const live = x.status === "running" || x.status === "waiting";
+  if (live && x.ended_at == null) tick(v, x.elapsed_s); else v.textContent = dur(x.elapsed_s);
+  add(e, v, el("span", "u", live ? (x.status === "waiting" ? "waiting" : "elapsed") : (x.ended_at ? ago(x.ended_at, now) : "")));
+  return e;
+}
+function subRow(x, last, now) {
+  const r = el("div", "sn");
+  add(r, el("span", "g", (last ? "└ " : "├ ") + ((STATES[x.status] || ["•"])[0])));
+  const w = el("div", "m", join([x.title || (x.role === "main" ? "main loop" : "subagent"),
+    x.model ? x.model + (x.lane ? " (" + x.lane + ")" : "") : x.lane, x.tool ? "tool " + x.tool : x.phase,
+    x.status === "failed" ? "FAILED" : null, tokText(x.tokens)]));
+  w.title = x.ref || "";
+  return add(r, w, elapsedCell(x, now));
+}
+function taskNode(t, now) {
+  const attn = t.status === "failed" || t.status === "unknown";
+  const head = (box) => {
+    add(box, pill(t.state === "elsewhere" ? "unknown" : t.state, t.status === "done" && t.state === "cancelled" ? "cancelled" : t.status));
+    const w = el("div", null);
+    const title = el("div", "t", t.title || ("task " + short(t.task_id))); title.title = t.task_id || "";
+    add(w, title, el("div", "m", join([t.host ? "on " + t.host : null,
+      t.model ? t.model + (t.lane ? " (" + t.lane + ")" : "") : t.lane, t.tool ? "tool " + t.tool : null, t.phase,
+      t.origin_via === "parent" ? "orchestrator inherited from its parent" : null,
+      t.parent_hidden ? "continues another orchestrator's task" : null, tokText(t.tokens),
+      (t.sub_sessions || []).length ? t.sub_sessions.length + " sub-session" + (t.sub_sessions.length === 1 ? "" : "s") : null,
+      short(t.task_id)])));
+    add(box, w, elapsedCell(t, now));
+  };
+  const subs = t.sub_sessions || [], kids = t.tasks || [];
+  if (!subs.length && !kids.length) {
+    const r = el("div", "tl" + (attn ? " attn" : ""));
+    add(r, el("span", null)); head(r);
+    return r;
+  }
+  const d = keepOpen(el("details", "tn" + (attn ? " attn" : "")), "t:" + t.task_id,
+    t.status === "running" || t.status === "waiting" || attn);
+  const sm = el("summary"); head(sm); add(d, sm);
+  subs.forEach((x, i) => add(d, subRow(x, i === subs.length - 1 && !t.sub_sessions_hidden, now)));
+  if (t.sub_sessions_hidden) add(d, el("div", "sn", "└ +" + t.sub_sessions_hidden + " more sub-sessions"));
+  if (kids.length) { const k = el("div", "kids"); kids.forEach(c => add(k, taskNode(c, now))); add(d, k); }
+  return d;
+}
+function renderOrchestrators(box, s, now, host) {
+  const P = panel("p-orch", "Orchestrators", "span-12");
+  const items = s.items || [];
+  const n = items.filter(g => g.kind === "session").length;
+  P.meta.textContent = join([n + " main session" + (n === 1 ? "" : "s"), items.some(g => g.kind === "bot") ? "Grok Bot" : null,
+    s.truncated ? "list capped" : null, scopeText(s, host)]);
+  secErrors(P.body, s);
+  items.forEach(g => {
+    const active = (g.counts && (g.counts.running || g.counts.waiting)) || g.status === "working";
+    const d = keepOpen(el("details", "og"), "o:" + (g.origin || ""), !!(active || g.attention));
+    const sm = el("summary");
+    add(sm, pill(g.status === "working" ? "working" : g.status === "idle" ? "idle" : g.status), el("span", "on", orchLabel(g)),
+      el("span", "om", orchMeta(g)), el("span", "oc", counts(g.counts)));
+    if (g.attention) add(sm, el("span", "attn", "! " + g.attention + " need" + (g.attention === 1 ? "s" : "") + " attention"));
+    add(d, sm);
+    const tree = el("div", "tree");
+    (g.tasks || []).forEach(t => add(tree, taskNode(t, now)));
+    if (g.tasks_hidden) add(tree, el("div", "sub", "+" + g.tasks_hidden + " more tasks (list capped)"));
+    if (!(g.tasks || []).length) add(tree, el("div", "sub", "no child task in the last 24 hours"));
+    const rs = g.routed || [];
+    if (rs.length) {
+      add(tree, el("div", "lbl", "Routed directly by this session"));
+      rs.forEach((x, i) => add(tree, subRow(x, i === rs.length - 1 && !g.routed_hidden, now)));
+      if (g.routed_hidden) add(tree, el("div", "sn", "└ +" + g.routed_hidden + " more"));
+    }
+    add(d, tree);
+    add(P.body, d);
+  });
+  if (!items.length) add(P.body, el("div", "empty", s.status === "error" ? "orchestrators unknown" : "No orchestrating session and no child task in the last 24 hours."));
+  add(box, P.p);
 }
 // Conversation kinds (live.conversations_section): open provider conversations, joined with the Office board.
 const KINDS = {orchestrator: "main session", child_task: "child task", subagent: "subagent", conversation: "conversation"};
@@ -717,6 +847,7 @@ function renderLive(d) {
     hosts.filter(h => h.heartbeat_state === "none").map(h => h.name).join(", ") ? "none yet: " + hosts.filter(h => h.heartbeat_state === "none").map(h => h.name).join(", ") : "all reporting"));
   add(box, ov);
   const panels = el("div", "panels");
+  if (d.orchestrators) renderOrchestrators(panels, d.orchestrators, now, host);
   renderTasksPanel(panels, ts, now, host, d.conversations);
   renderConversations(panels, d.conversations || {});
   renderSubs(panels, d.subscriptions || {});

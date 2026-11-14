@@ -1060,6 +1060,16 @@ tag and whether its main loop is live), Grok Bot and an "Unattributed" group; ea
 tasks first. One limit: the MCP server reads the session id once, at its start, so tasks started after `/clear` in the
 same process keep the session it was started for.
 
+**The orchestrator tree** (`docs/PULSE-PER-SESSION.md`). The live view's `orchestrators` section is each orchestrating
+main session (its Office tag), Grok Bot and an "Unattributed" group, each with its child tasks (nested by
+`parent_task_id`, now on every task event; a task with no origin of its own takes its parent's, `origin_via: "parent"`;
+tasks started onto another host are listed from their stub, which now records the origin) and under each task its
+sub-sessions: the run's provider conversations (`x-cortados-run-id`), open or recently closed, with status (running /
+waiting / done / failed / unknown), phase, model, elapsed and in-memory token totals. The dashboard's Live tab draws it
+as a collapsible tree. `GET /v1/cortados/live/session?session=<tag>` (owner token, `live:read`, or the narrow
+`live:session` scope that opens nothing else) returns ONLY that session's subtree plus S1 and host health, built
+filtered before any cap; the cortados-pulse pane (0.5.0) reads only that view once its session is identified.
+
 A host whose jobs the provider cannot see (the Mac Studio's S1 scorer and continuous training) reports them with
 `POST /v1/cortados/live/heartbeat` (owner token, or a write-only `live:heartbeat` client token bound to ONE host: the
 entry's `"host"` in clients.json, else the client's name; a post for any other host is 403, the owner token is never

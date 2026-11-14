@@ -1,8 +1,10 @@
 import { test, expect } from 'claude-code/testing'
 import { FALLBACK, POLL_MS, LIVE_POLL_MS, STALE_AFTER_S, expandHome, resolveProviderUrl, resolveToken, scrub, readConfig, poll,
   pollLive, age, pct, gib, dur, leftPct, laneLabel, laneLines, usageLines, deviceLines, laneOrder, taskLine, conversationLine,
-  runningLines, fleetLines, hwText, identify, sessionLines, sessionTag, OFFICE_SALT_FILE, MINE_RECENT_MAX, CLEAR_NOTE } from './register'
+  runningLines, fleetLines, hwText, identify, sessionLines, sessionTag, OFFICE_SALT_FILE, MINE_RECENT_MAX, CLEAR_NOTE,
+  SESSION_PATH, treeLines, tokShort, glyph, fetchTree } from './register'
 import liveFixture from './live.fixture'
+import sessionFixture from './session.fixture'
 
 const TOKEN = 'sekrit-token-123'
 
@@ -253,11 +255,12 @@ test('session.start registers the command, opens the pane, polls once and keeps 
     clock: { ...base.clock, every: (ms: number, _fn: () => void) => { const t = { ms, cancelled: false }; every.push(t); return { cancel: () => { t.cancelled = true } } } },
   }
   expect(await hooks['session.start']($, { kind: 'start' }, async (e: any) => e)).toEqual({ kind: 'start' })
-  await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+  for (let i = 0; i < 30; i++) await Promise.resolve()       // the live poll identifies the session before it fetches
   expect(registered).toEqual([{ name: 'cortados-pulse', description: 'Open the CortadOS router pulse pane' }])
   expect(opened).toEqual([{ id: 'cortados-pulse', title: 'CortadOS pulse' }])
   expect(every.map(t => t.ms)).toEqual([LIVE_POLL_MS])
-  expect($.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live', 'http://air.example:8432/resources'])
+  // no salt file here: the session has no tag, so the fleet view is read (the fallback), never the per-session one
+  expect([...$.calls.urls].sort()).toEqual(['http://air.example:8432/resources', 'http://air.example:8432/v1/cortados/live'])
   expect($.held().data.usage.total_routes).toBe(1)
   await hooks['session.start']($, {}, async (e: any) => e)
   expect(every.length).toBe(2)
@@ -265,6 +268,7 @@ test('session.start registers the command, opens the pane, polls once and keeps 
   expect(every[1]!.cancelled).toBe(false)
   expect(await hooks['command.run']($, {})).toEqual({ text: 'CortadOS pulse pane opened.' })
   expect(opened.length).toBe(3)
+  for (let i = 0; i < 60; i++) await Promise.resolve()       // let the last poll settle: one live poll runs at a time
 })
 
 test('pollLive reads /v1/cortados/live with the Bearer token and keeps the provider base for the dashboard link', async () => {
@@ -476,7 +480,9 @@ test('pollLive asks the provider for this session\'s own view, and keeps it only
         // an older provider ignores ?session= and answers the fleet view
         text: JSON.stringify(url.includes('?session=') && filtered ? own : fleet) }) }), session: { id: async () => SID } }
     await pollLive($ as any, FALLBACK, true)
-    expect($.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live', 'http://air.example:8432/v1/cortados/live?session=' + tag])
+    // the per-session view is asked first; these answers are not a subtree (an older provider): the fleet fallback
+    expect($.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live/session?session=' + tag,
+      'http://air.example:8432/v1/cortados/live', 'http://air.example:8432/v1/cortados/live?session=' + tag])
     const held = (await ($ as any).state.get({ plugin: 'cortados-pulse', key: 'mineLive' })).value
     if (filtered) {
       expect(held.tag).toBe(tag)
@@ -502,4 +508,83 @@ test('the provider-generated fixture carries origins: its main session sees its 
     '● Refactor the scarcity reader · on air · claude-sonnet-5 (claude#b) · tool Bash · 2m 05s',
     '✓ Write the changelog · on air · succeeded · took 16m 40s',
   ])
+})
+
+// ---- this session's tree (GET /v1/cortados/live/session; tests/test_orchestrator_tree.py generates the fixture) ----
+
+const MINE_TAG = 'aaaaaaaaaaaaaaa1'                  // the fixture's session (tests/test_orchestrator_tree.MINE)
+
+test('the session view holds this session only, and the pane draws it as a tree', () => {
+  const raw = JSON.stringify(sessionFixture)
+  for (const other of ['bbbbbbbbbbbbbbb2', 'Grounds', 'Their secret plan', 'grokbot', 'Legacy task', 'SECRET']) {
+    expect(raw.includes(other)).toBe(false)
+  }
+  expect(SESSION_PATH).toBe('/v1/cortados/live/session')
+  const lines = treeLines(sessionFixture as any, MINE_TAG, 0)
+  expect(lines.map(l => l.text)).toEqual([
+    '2 running · 1 done · 1 unknown',
+    '! 1 needs attention',
+    '● Build the tree · 5m 00s',
+    '  claude-sonnet-5 · on air · tool Edit · 14k tok',
+    '  ├ ● main loop · claude-sonnet-5 · model turn · 4.9k tok · 4m 50s',
+    '  ├ ● subagent · gpt-6.1 · running a tool · 1m 00s',
+    '  └ ✓ subagent · qwen3-30b · closed idle · 1.0k tok · took 1m 30s',
+    '  ↳ ● Nested step · 3m 20s',
+    '      claude-haiku-5 · on air',
+    '      └ ◷ main loop · claude-haiku-5 · idle between turns · 3m 10s',
+    '    ↳ ✓ Deeper step · succeeded · took 50s',
+    '? task t20261111093000-a0000009 · on studio, state there',
+    'routed directly',
+    '└ ● Check the docs · gpt-6.1-mini · model turn · 40s',
+  ])
+  expect(lines.filter(l => l.attn).map(l => l.text)).toEqual(['! 1 needs attention',
+    '? task t20261111093000-a0000009 · on studio, state there'])
+  // clocks of live nodes keep counting between polls; finished ones do not
+  const later = treeLines(sessionFixture as any, MINE_TAG, 10).map(l => l.text)
+  expect(later[2]).toBe('● Build the tree · 5m 10s')
+  expect(later[10]).toBe('    ↳ ✓ Deeper step · succeeded · took 50s')
+  // another tag's pane draws nothing from this view (the provider would not have sent it, and the pane checks too)
+  expect(treeLines(sessionFixture as any, 'cccccccccccccccc', 0).map(l => l.text))
+    .toEqual(['no task started from this session in the last 24 h'])
+})
+
+test('tree glyphs, tokens and failures', () => {
+  expect([glyph('running'), glyph('waiting'), glyph('done'), glyph('failed'), glyph('unknown'), glyph('done', 'cancelled')])
+    .toEqual(['●', '◷', '✓', '✕', '?', '⊘'])
+  expect([tokShort({ fresh: 950 }), tokShort({ fresh: 4900 }), tokShort({ fresh: 14000 }), tokShort({ fresh: 2_500_000 }),
+    tokShort(null), tokShort({ fresh: 0 })]).toEqual(['950 tok', '4.9k tok', '14k tok', '2.5M tok', null, null])
+  const v = { session_filter: MINE_TAG, orchestrators: { status: 'ok', items: [{ origin: MINE_TAG, counts: { failed: 1 }, attention: 1,
+    tasks: [{ task_id: 't1', title: 'Broke', state: 'failed', status: 'failed', elapsed_s: 30, ended_at: 5 }] }] } }
+  expect(treeLines(v as any, MINE_TAG, 0)).toEqual([{ text: '1 failed' }, { text: '! 1 needs attention', attn: true },
+    { text: '✕ Broke · failed · took 30s', attn: true }])
+  expect(treeLines({ orchestrators: { status: 'error', errors: [{ source: 'child-tasks.jsonl', error: 'OSError' }] } } as any, MINE_TAG, 0))
+    .toEqual([{ text: 'tasks unavailable: child-tasks.jsonl: OSError', attn: true }])
+  const many = { orchestrators: { status: 'ok', items: [{ origin: MINE_TAG, counts: { running: 1 }, tasks: [{ task_id: 't', title: 'Fan',
+    status: 'running', state: 'running', elapsed_s: 1, sub_sessions: Array.from({ length: 6 }, () => ({ status: 'running', role: 'subagent' })),
+    sub_sessions_hidden: 2 }] }] } }
+  expect(treeLines(many as any, MINE_TAG, 0).slice(-1)).toEqual([{ text: '  └ +4 more sub-sessions' }])
+})
+
+test('pollLive with a tag reads only the session view: nothing fleet-wide', async () => {
+  const salt = '0123456789abcdef0123456789abcdef', sid = '792b087a-1983-4baf-b701-77792e4b77e4'
+  const tag = await sessionTag(salt, sid)
+  const view = { ...sessionFixture, session_filter: tag, orchestrators: { ...(sessionFixture as any).orchestrators, session_filter: tag } }
+  const $ = { ...fakeDollar({ env: { HOME: '/tmp/home', CORTADOS_PROVIDER_URL: 'http://air.example:8432' },
+    files: { '/tmp/home/.config/cortados/provider-token': TOKEN, '/tmp/home/.config/cortados/office-salt': salt },
+    http: () => ({ status: 200, ok: true, headers: {}, text: JSON.stringify(view) }) }), session: { id: async () => sid } }
+  await pollLive($ as any, FALLBACK, true)
+  expect($.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live/session?session=' + tag])
+  expect($.calls.inits[0].headers.authorization).toBe('Bearer ' + TOKEN)
+  const held = (await ($ as any).state.get({ plugin: 'cortados-pulse', key: 'tree' })).value
+  expect([held.tag, held.base]).toEqual([tag, 'http://air.example:8432'])
+  // a provider failure settles the poll (said, the held tree kept); a 404 falls back to the fleet view
+  for (const [status, fallback] of [[503, false], [401, false], [404, true]] as const) {
+    const f = { ...fakeDollar({ env: { HOME: '/tmp/home', CORTADOS_PROVIDER_URL: 'http://air.example:8432' },
+      files: { '/tmp/home/.config/cortados/provider-token': TOKEN },
+      http: () => ({ status, ok: false, headers: {}, text: 'secret ' + TOKEN }) }) }
+    expect(await fetchTree(f as any, FALLBACK, tag)).toBe(!fallback)
+    const e = (await (f as any).state.get({ plugin: 'cortados-pulse', key: 'treeErr' })).value
+    if (fallback) expect(e).toBe(null)
+    else { expect(e).toMatch(status === 401 ? /rejected the token/ : /HTTP 503/); expect(String(e).includes(TOKEN)).toBe(false) }
+  }
 })

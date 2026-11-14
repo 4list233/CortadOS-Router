@@ -175,12 +175,32 @@ def backend_conversations():
          "model": "claude-opus-5", "opened_at": NOW - 900, "last_used": NOW - 15, "busy": False, "awaiting_tool": True},
         {"key": "r:" + RUNNING, "ref": "c-000000000002", "provider": "claude", "lane": "claude#b",
          "model": "claude-sonnet-5", "opened_at": NOW - 100, "last_used": NOW - 20, "busy": True,
-         "awaiting_tool": False},
+         "awaiting_tool": False, "tokens": {"input": 4000, "output": 1500, "cache_read": 90000, "cache_write": 6000}},
         {"key": "r:sub-run-0001", "ref": "c-000000000003", "provider": "codex", "lane": "codex", "model": "gpt-6.1",
-         "opened_at": NOW - 90, "last_used": NOW - 80, "busy": False, "awaiting_tool": True},
+         "opened_at": NOW - 90, "last_used": NOW - 80, "busy": False, "awaiting_tool": True,
+         "tokens": {"input": 700, "output": 300, "cache_read": 0, "cache_write": 0}},
         {"key": None, "ref": "c-000000000004", "provider": "codex", "lane": "codex", "model": "gpt-6.1-mini",
          "opened_at": NOW - 400, "last_used": NOW - 300, "busy": False, "awaiting_tool": False},
     ]
+
+
+def ended_conversations():
+    """Registry.ended_conversations: a subagent of the running child that finished 35 s ago (with its tokens), one of
+    a run outside the window (dropped) and one with no run key (not a sub-session: dropped)."""
+    return [
+        {"key": "r:" + RUNNING, "ref": "c-000000000005", "provider": "codex", "lane": "codex", "model": "gpt-6.1",
+         "opened_at": NOW - 80, "last_used": NOW - 40, "busy": False, "awaiting_tool": False, "closed_at": NOW - 35,
+         "closed": "reaped", "tokens": {"input": 1000, "output": 500, "cache_read": 30000, "cache_write": 2000}},
+        {"key": "r:" + OLD, "ref": "c-000000000006", "provider": "claude", "opened_at": NOW - 30 * 3600,
+         "closed_at": NOW - 29 * 3600, "closed": "reaped"},
+        {"key": None, "ref": "c-000000000007", "provider": "claude", "opened_at": NOW - 50, "closed_at": NOW - 10,
+         "closed": "exited"},
+    ]
+
+
+def run_tokens():
+    """RunRecords.tokens_by_run: the running child's total over every turn of its conversations."""
+    return {RUNNING: {"input": 5000, "output": 2000, "cache_read": 120000, "cache_write": 8000}}
 
 
 def _n(x):
@@ -201,6 +221,7 @@ def fixture_view(**over):
     args = dict(now=NOW, child_events=events, office_view=lambda ev: board.view(ev, now=NOW),
                 tasks_view=lambda: tv, usage_view=lambda: u, heartbeats=lambda: beats.snapshot(NOW),
                 backend_sessions=4, peek=peek, conversations=backend_conversations,
+                ended_conversations=ended_conversations, run_tokens=run_tokens,
                 exec_hosts=lambda: ({"air": ["forests-macbook-air"], "studio": ["forests-mac-studio"]}, "air"),
                 self_host="forests-macbook-air", host_names=["air", "studio", "pro"])
     args.update(over)

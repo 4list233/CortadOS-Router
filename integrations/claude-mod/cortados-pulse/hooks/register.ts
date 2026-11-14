@@ -6,12 +6,18 @@
  * cached scarcity with its per-window "% left" (one row per lane and per Claude account), and the online local devices.
  * The last line links the browser dashboard (<provider>/dashboard), which shows the same live view in full.
  *
- * THIS SESSION, at the top: the start_task children this very session started (running and queued, then the last few
- * finished), picked out of the live view by their origin_session. The pane names its session the way
+ * THIS SESSION, at the top: a live tree of this session's own work, flightdeck-style (docs/PULSE-PER-SESSION.md): the
+ * start_task children it started, each child's sub-sessions (its routed conversations) under it, nested tasks under
+ * their parent, and the subagents this session routed directly; each node with its state glyph, model, phase or tool,
+ * tokens and an elapsed clock that keeps counting between polls. The pane names its session the way
  * cortados-routed-subagents names its Office floor and the cortados-route MCP server names a task's origin:
  * sha256("<salt>:<session id>") cut to 16 hex, the salt read from the machine's shared file
  * (~/.config/cortados/office-salt, made by the MCP server; CORTADOS_OFFICE_SALT_FILE overrides). The raw session id
  * never leaves the pane; without the salt file the section says the session cannot be identified.
+ *
+ * With its tag the pane reads ONLY GET /v1/cortados/live/session?session=<tag>, which the provider builds filtered: that
+ * one subtree plus fleet health that names no session (S1, hosts). The fleet view (/v1/cortados/live, every session's
+ * tasks and conversations) is read only as a fallback: no tag, or a provider from before the per-session view.
  *
  * Where the provider is comes from the plugin config, else CORTADOS_PROVIDER_URL, else the per-machine URL file
  * (CORTADOS_PROVIDER_URL_FILE or ~/.config/cortados/provider-url): the same chain as cortados-routed-subagents, and
@@ -23,7 +29,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Pulse, PulseDevices, PulseLaneHealth, PulseLive, PulseLiveConversation, PulseLiveHost, PulseLiveTask,
-  PulseReading, PulseUsage } from '../types'
+  PulseOrchestrator, PulseReading, PulseSessionView, PulseSubSession, PulseTokens, PulseTreeTask, PulseUsage } from '../types'
 
 type Cfg = {
   providerUrl: string
@@ -49,6 +55,12 @@ export const POLL_MS = 20_000
  * (no vendor CLI, no ssh), and the pane's one timer ticks at this rate, reading /resources every other tick. */
 export const LIVE_POLL_MS = 10_000
 export const LIVE_PATH = '/v1/cortados/live'
+/** This session's own subtree (provider/live.py SESSION_PATH, session_view). */
+export const SESSION_PATH = '/v1/cortados/live/session'
+/** Sub-sessions drawn under a running task before "+N more": a side pane, not the dashboard (which lists 8). */
+export const SUBS_MAX = 4
+/** Subagents this session routed directly, drawn after its tasks. */
+export const ROUTED_SHOWN = 3
 /** Lines the Running section draws per list before it says "+N more": the pane is a side column, not the dashboard. */
 export const RUNNING_MAX = 6
 export const CONVERSATIONS_MAX = 4
@@ -70,6 +82,10 @@ const mine = atom({ plugin: 'cortados-pulse', key: 'mine' } as const, null as Mi
  * pushes them out of the fleet view's lists). null: not fetched, or a provider that ignored ?session= (filter the fleet). */
 type MineLive = { data: PulseLive; at: number; tag: string }
 const mineLive = atom({ plugin: 'cortados-pulse', key: 'mineLive' } as const, null as MineLive | null)
+/** GET /v1/cortados/live/session?session=<tag>: this session's subtree. Drawn only for the tag it was fetched for. */
+type TreeHeld = { data: PulseSessionView; at: number; tag: string; base: string }
+const tree = atom({ plugin: 'cortados-pulse', key: 'tree' } as const, null as TreeHeld | null)
+const treeErr = atom({ plugin: 'cortados-pulse', key: 'treeErr' } as const, null as string | null)
 
 /** The machine's shared Office salt (cortados_router/subagent_mcp.py OFFICE_SALT_DEFAULT). */
 export const OFFICE_SALT_FILE = '~/.config/cortados/office-salt'
@@ -221,16 +237,38 @@ export async function pollLive($: LiveDollar, cfg: Cfg, me = false): Promise<voi
 }
 
 async function pollLiveOnce($: LiveDollar, cfg: Cfg, me: boolean): Promise<void> {
+  // every poll: /clear and resume move the pane to another session id
+  const m = me ? await identify($ as Pick<EngineInterface, 'env' | 'fs' | 'session'>) : null
+  if (m) await update($, mine, () => m)
+  // the per-session view answered (or failed in a way the fleet view would too): nothing fleet-wide is read
+  if (m?.tag && await fetchTree($, cfg, m.tag)) return
   try {
     await fetchLive($, cfg)
   } finally {
-    // after the fetch, every poll: /clear and resume move the pane to another session id
-    if (me) {
-      const m = await identify($ as Pick<EngineInterface, 'env' | 'fs' | 'session'>)
-      await update($, mine, () => m)
-      await fetchMine($, cfg, m.tag)
-    }
+    if (m) await fetchMine($, cfg, m.tag)
   }
+}
+
+/** GET /v1/cortados/live/session?session=<tag>. True when it settled the poll: the subtree is held, or the provider
+ * failed (401/403/5xx/network: said, the held subtree stays with its age). False only for a provider without the view
+ * (404, or an answer that is not this session's subtree): the pane then falls back to the fleet view. */
+export async function fetchTree($: LiveDollar, cfg: Cfg, tag: string): Promise<boolean> {
+  const f = await fetchView($, cfg, SESSION_PATH + '?session=' + tag)
+  if (f.ok) {
+    const data = f.data as PulseSessionView
+    if (data.session_filter === tag && data.orchestrators && typeof data.orchestrators === 'object') {
+      const at = await $.clock.now()
+      await update($, tree, () => ({ data, at, tag, base: f.url }))
+      await update($, treeErr, () => null)
+      return true
+    }
+  } else if (f.status !== 404) {
+    await update($, treeErr, () => 'live: ' + f.problem)
+    return true
+  }
+  await update($, tree, () => null)
+  await update($, treeErr, () => null)
+  return false
 }
 
 /** This session's own view (?session=). Kept only when the provider says it filtered for this tag (session_filter):
@@ -433,6 +471,91 @@ export function sessionLines(live: PulseLive, me: Mine | null, since: number): s
   return out
 }
 
+// ---- this session's tree (flightdeck-style; pure, tested) -----------------------------------------------------------
+
+/** A tree line: its text, and whether it needs attention (failed, unknown: drawn bold, the glyph says which). */
+export type TreeLine = { text: string; attn?: boolean }
+
+const GLYPH: Record<string, string> = { running: '●', waiting: '◷', done: '✓', failed: '✕', unknown: '?' }
+export const glyph = (status?: string | null, state?: string | null): string =>
+  state === 'cancelled' ? '⊘' : GLYPH[status ?? ''] ?? '•'
+
+/** Fresh tokens (input + output + cache writes) in a few characters: 950 tok, 14k tok, 1.2M tok. */
+export function tokShort(t?: PulseTokens | null): string | null {
+  const n = t?.fresh
+  if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) return null
+  return (n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? Math.round(n / 1e3) + 'k' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n)) + ' tok'
+}
+
+/** Elapsed as it should read now: a node still running or waiting keeps counting from the snapshot (`since` s ago). */
+const clockOf = (x: { status?: string; ended_at?: number | null; elapsed_s?: number | null }, since: number): string | null =>
+  typeof x.elapsed_s !== 'number' ? null
+    : (x.status === 'running' || x.status === 'waiting') && x.ended_at == null ? dur(x.elapsed_s + since)
+    : 'took ' + dur(x.elapsed_s)
+
+function subLine(x: PulseSubSession, last: boolean, indent: string, since: number): TreeLine {
+  const who = x.title || (x.role === 'main' ? 'main loop' : 'subagent')
+  return { text: indent + (last ? '└ ' : '├ ') + glyph(x.status) + ' ' + join([who, x.model, x.tool ? 'tool ' + x.tool : x.phase,
+    tokShort(x.tokens), clockOf(x, since)]), attn: x.status === 'failed' }
+}
+
+/** One task and what hangs under it. A live task (running, waiting) opens: its model line and its sub-sessions; a
+ * finished one is one line, as flightdeck folds a finished card. Nested tasks follow, indented under their parent. */
+function taskLines(t: PulseTreeTask, depth: number, since: number): TreeLine[] {
+  const ind = '  '.repeat(depth)
+  const live = t.status === 'running' || t.status === 'waiting'
+  const attn = t.status === 'failed' || t.status === 'unknown'
+  const name = t.title || ('task ' + (t.task_id ?? '?'))
+  const out: TreeLine[] = [{ attn, text: ind + (depth ? '↳ ' : '') + glyph(t.status, t.state) + ' ' + join([name,
+    live ? null : t.state === 'elsewhere' ? 'on ' + t.host + ', state there' : t.state, live ? clockOf(t, since) : clockOf(t, 0)]) }]
+  const pad = ind + (depth ? '  ' : '') + '  '
+  if (live) {
+    const meta = join([t.model, t.host ? 'on ' + t.host : null, t.tool ? 'tool ' + t.tool : t.phase, tokShort(t.tokens)])
+    if (meta) out.push({ text: pad + meta })
+    const subs = t.sub_sessions ?? []
+    const shown = subs.slice(0, SUBS_MAX)
+    const more = subs.length - shown.length + (t.sub_sessions_hidden ?? 0)
+    shown.forEach((x, i) => out.push(subLine(x, i === shown.length - 1 && more <= 0, pad, since)))
+    if (more > 0) out.push({ text: pad + '└ +' + more + ' more sub-sessions' })
+  }
+  for (const k of t.tasks ?? []) out.push(...taskLines(k, depth + 1, since))
+  return out
+}
+
+/** This session's tree from its session view: a count line, then its live tasks (opened), the last few finished
+ * (folded), and the subagents it routed directly. Only `items` whose origin is the session's own tag are drawn. */
+export function treeLines(v: PulseSessionView, tag: string, since: number): TreeLine[] {
+  const o = v.orchestrators ?? {}
+  if (o.status === 'error') return [{ text: 'tasks unavailable: ' + errs(o), attn: true }]
+  const g: PulseOrchestrator | undefined = (o.items ?? []).find(x => x.origin === tag)
+  const out: TreeLine[] = []
+  if (o.status === 'partial') out.push({ text: 'partial: ' + errs(o), attn: true })
+  if (!g) return [...out, { text: 'no task started from this session in the last 24 h' }]
+  const c = g.counts ?? {}
+  const n = (k: string) => c[k] ?? 0
+  out.push({ text: join([n('running') ? n('running') + ' running' : null, n('waiting') ? n('waiting') + ' waiting' : null,
+    n('done') ? n('done') + ' done' : null, n('failed') ? n('failed') + ' failed' : null,
+    n('unknown') ? n('unknown') + ' unknown' : null]) || 'no task started from this session in the last 24 h' })
+  if (g.attention) out.push({ text: '! ' + g.attention + (g.attention === 1 ? ' needs' : ' need') + ' attention', attn: true })
+  const tasks = g.tasks ?? []
+  const live = tasks.filter(t => t.status === 'running' || t.status === 'waiting')
+  const rest = tasks.filter(t => !(t.status === 'running' || t.status === 'waiting'))
+  for (const t of live.slice(0, RUNNING_MAX)) out.push(...taskLines(t, 0, since))
+  if (live.length > RUNNING_MAX) out.push({ text: `  +${live.length - RUNNING_MAX} more running (dashboard)` })
+  for (const t of rest.slice(0, MINE_RECENT_MAX)) out.push(...taskLines(t, 0, since))
+  const hidden = Math.max(0, rest.length - MINE_RECENT_MAX) + (g.tasks_hidden ?? 0)
+  if (hidden) out.push({ text: `  +${hidden} more finished (dashboard)` })
+  const routed = g.routed ?? []
+  if (routed.length) {
+    out.push({ text: 'routed directly' })
+    const shown = routed.slice(0, ROUTED_SHOWN)
+    const more = routed.length - shown.length + (g.routed_hidden ?? 0)
+    shown.forEach((x, i) => out.push(subLine(x, i === shown.length - 1 && more <= 0, '', since)))
+    if (more > 0) out.push({ text: '└ +' + more + ' more' })
+  }
+  return out
+}
+
 /** Shown under This session: /clear gives the pane a new session id, while a task keeps the session it was started
  * for (and the cortados-route server keeps the id it started with: README "Which main session started which task"). */
 export const CLEAR_NOTE = 'after a /clear, earlier tasks stay under the previous session (dashboard)'
@@ -518,20 +641,37 @@ export const register: Register = (on, options) => {
     const lvProblem = await read($, liveErr)
     const me = await read($, mine)
     const ml = await read($, mineLive)
+    const tr = await read($, tree)
+    const trProblem = await read($, treeErr)
     const nowMs = await $.clock.now()
-    // this session's own view when the provider filtered it (before its caps), else the fleet view filtered here
-    const own = ml && me?.tag === ml.tag ? ml : lv
-    const running = [
-      head('This session'),
-      ...(own ? sessionLines(own.data, me, (nowMs - own.at) / 1000).map(line) : []),
-      ...(lv ? [] : [dim(me && !me.tag ? me.why || '' : 'waiting for the live view…')]),
-      ...(me?.tag ? [dim(CLEAR_NOTE)] : []),
-      head('Running'),
-      ...(lv ? runningLines(lv.data, (nowMs - lv.at) / 1000).map(line) : lvProblem ? [] : [dim('loading the live view…')]),
-      ...(lvProblem ? [dim(lvProblem + (lv ? ' · showing ' + age((nowMs - lv.at) / 1000) + ' old data' : ''))] : []),
-    ]
-    const fleet = lv ? [head('Fleet'), ...fleetLines(lv.data).map(line)] : []
-    const link = lv ? [dim('dashboard ' + lv.base + '/dashboard')] : []
+    let running: ReturnType<typeof line>[], fleet: ReturnType<typeof line>[], link: ReturnType<typeof line>[]
+    if (tr && me?.tag === tr.tag) {
+      // the per-session view: this session's tree and session-free fleet health, nothing of another session
+      const since = (nowMs - tr.at) / 1000
+      running = [
+        head('This session'),
+        ...treeLines(tr.data, tr.tag, since).map(l => l.attn ? Text({ bold: true, children: l.text }) : line(l.text)),
+        ...(trProblem ? [dim(trProblem + ' · showing ' + age(since) + ' old data')] : []),
+        dim(CLEAR_NOTE),
+      ]
+      fleet = [head('Fleet'), ...fleetLines(tr.data as PulseLive).map(line)]
+      link = [dim('dashboard ' + tr.base + '/dashboard')]
+    } else {
+      // no tag, or a provider from before the per-session view: the fleet view, this session's tasks picked out of it
+      const own = ml && me?.tag === ml.tag ? ml : lv
+      running = [
+        head('This session'),
+        ...(trProblem ? [dim(trProblem)] : []),
+        ...(own ? sessionLines(own.data, me, (nowMs - own.at) / 1000).map(line) : []),
+        ...(lv ? [] : [dim(me && !me.tag ? me.why || '' : 'waiting for the live view…')]),
+        ...(me?.tag ? [dim(CLEAR_NOTE)] : []),
+        head('Running'),
+        ...(lv ? runningLines(lv.data, (nowMs - lv.at) / 1000).map(line) : lvProblem ? [] : [dim('loading the live view…')]),
+        ...(lvProblem ? [dim(lvProblem + (lv ? ' · showing ' + age((nowMs - lv.at) / 1000) + ' old data' : ''))] : []),
+      ]
+      fleet = lv ? [head('Fleet'), ...fleetLines(lv.data).map(line)] : []
+      link = lv ? [dim('dashboard ' + lv.base + '/dashboard')] : []
+    }
     if (!h) return Box({ flexDirection: 'column', children: [...running, ...fleet, dim(problem || 'loading the resource pool…'), ...link] })
     const s = h.data
     const nowS = typeof s.generated_at === 'number' ? s.generated_at + (nowMs - h.at) / 1000 : nowMs / 1000
