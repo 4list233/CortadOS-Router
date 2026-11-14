@@ -662,13 +662,21 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   `~/.claude/CLAUDE.md` does not make it delegate again. Children never get the whole-session ORCHESTRATOR directive
   or its delegation gate, whatever `orchestrator` is: a pin only pins the child's main model (its native subagents
   are still S1-routed).
-- Deferred tool loading (#117): every session the launcher (`session.launcher_env`) puts on the provider, whole
-  sessions and child tasks alike, runs with `ENABLE_TOOL_SEARCH=false`. With tool search on, Claude Code (2.1.325)
-  opens a conversation with only `ToolSearch` and a `DeferredToolPlaceholder`, and adds an MCP tool's schema to
-  `tools` only after ToolSearch loads it. The provider starts its backend with the opening request's tools and never
-  re-declares them (Codex takes dynamic tools once, on `thread/start`), so a tool loaded later was listed to the model
-  but every call ended in the backend CLI's own "No such tool available" (a routed child with
-  `connectors: ["wispr-flow"]`, 2026-11-14). Any other client pointed at the provider by hand must set it too.
+- Deferred tool loading (#117): with tool search on, Claude Code (2.1.325) opens a conversation with only
+  `ToolSearch` and a `DeferredToolPlaceholder`, and adds an MCP tool's schema to `tools` only after ToolSearch loads
+  it. The provider starts its backend with the opening request's tools and never adds any (Codex takes dynamic tools
+  once, on `thread/start`), so a tool loaded later was listed to the model but every call ended in the backend CLI's
+  own "No such tool available" (a routed child with `connectors: ["wispr-flow"]`, 2026-11-14). The launcher
+  (`session.launcher_env`) therefore sets `ENABLE_TOOL_SEARCH=false`, which puts every MCP tool in the opening
+  request, but only where the catalog is bounded: every `start_task` child (hidden `--eager-tools`; its connectors
+  are opt-in, filtered and within the budget below), and a whole session started with `--strict-mcp-config` among
+  its claude args (only the `--mcp-config` servers given load). Any other whole session keeps deferred loading: the
+  full catalog (~290k tokens) is over the 200k routes and the 128k local lane, and `routing.request_fit` counts the
+  whole request. In such a session, a tool loaded after the first request cannot be called. The provider logs that
+  ("the tool set changed mid-conversation … an added tool CANNOT be called") and tells the backend model once, with
+  the next turn, so it can say so instead of retrying. Provider-side tool-set growth is #121. A child also loads the
+  user's own Claude Code MCP servers on its execution host, which the connector budget does not see; keep that list
+  short on the exec hosts.
 - `chrome: true` (default false) runs the child in LOGIN MODE (decided 2026-11-03): `claude` directly on the user's
   claude.ai login. Its env is an ALLOWLIST (`LOGIN_ENV_ALLOW`: shell basics, the bookkeeping paths, proxy/CA vars
   with any `user:pass@` proxy URL dropped); `LOGIN_FORBIDDEN_ENV` / `_PREFIXES` can never pass (provider URL and
@@ -695,6 +703,14 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   gets no client-side tool search). The full set measured ~1.1 MB, about 290k estimated tokens across 495 MCP tools
   (Vercel alone 241), on 2026-11-02. That is over a 200k model's input ceiling, so the provider refused every such
   child with 413, and Claude Code shows a 413 as "Request too large (max 32MB) … images".
+  Budget (#117): a child loads every connector schema up front, so a selection is limited to
+  `child_tasks.EAGER_SCHEMA_BUDGET_TOKENS` (40k tokens, leaving room on the 128k local lane). `start_task` cannot
+  list a connector's tools at launch: they sit behind OAuth tokens in the execution host's login Keychain, and
+  listing them would open the connector before the task is accepted. So each entry in `connectors.mcp.json`
+  declares its tool count as `"cortadosTools": <n>` (removed from the child's own `--mcp-config`). The size is
+  estimated at 600 tokens a tool (the measured ~290k / 495). A selection over 66 tools, or one naming an entry
+  without a count, is refused with the connectors and the size named; it is never cut down silently. To find a
+  server's count, start `claude --strict-mcp-config --mcp-config <file with that entry>` and look in `/mcp`.
 - Refusals: the provider logs every refusal it answers (JSON errors, SSE error events, the local relay's errors) and,
   for an authenticated request, records it under its `x-cortados-run-id`; an unauthenticated one is logged apart and
   never recorded. Only status, error type and a fixed reason of the provider's own (for a backend failure, its

@@ -977,6 +977,42 @@ class EndpointTests(EndpointHarness):
         self.assertEqual(r3["content"], [{"type": "text", "text": "echo: thanks"}])
         self.assertEqual(len(self.reg.sessions), 1)
 
+    def test_a_tool_added_mid_conversation_is_logged_as_uncallable_and_the_model_is_told_once(self):
+        # #117: a Claude Code client with tool search on declares an MCP tool only after ToolSearch loads it. The
+        # running CLI keeps its opening tools (#121), so the log says the added tool cannot be called, and the
+        # model gets one note with the next delivery (here the tool result) instead of failing on it unexplained.
+        late = {"name": "mcp__wispr-flow__dictate", "description": "d", "input_schema": {"type": "object"}}
+        history = [{"role": "user", "content": "please use tool"}]
+        r1 = self.post({"model": "cortados", "tools": [READ_TOOL], "messages": history})
+        use = r1["content"][-1]
+        history += [{"role": "assistant", "content": r1["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"], "content": "hello"}]}]
+        with self.assertLogs("cortados.provider", level="WARNING") as logs:
+            r2 = self.post({"model": "cortados", "tools": [READ_TOOL, late], "messages": history})
+        [line] = [l for l in logs.output if "tool set changed mid-conversation" in l]
+        self.assertIn("added ['mcp__wispr-flow__dictate'], dropped []", line)
+        self.assertIn("CANNOT be called", line)
+        self.assertIn("ENABLE_TOOL_SEARCH=false", line)
+        [text] = [b["text"] for b in r2["content"]]
+        self.assertTrue(text.startswith("tool said: hello [cortados provider] These tools were added after this "
+                                        "conversation started and cannot be called in it: mcp__wispr-flow__dictate."),
+                        text)
+        history += [{"role": "assistant", "content": r2["content"]}, {"role": "user", "content": "thanks"}]
+        r3 = self.post({"model": "cortados", "tools": [READ_TOOL, late], "messages": history})
+        self.assertEqual(r3["content"], [{"type": "text", "text": "echo: thanks"}])   # said once
+        self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_the_added_tools_note_names_at_most_twenty_and_leaves_the_results_unchanged(self):
+        note = server.tools_added_note([f"t{i:02d}" for i in range(25)])
+        self.assertIn("t19 and 5 more.", note)
+        self.assertNotIn("t20", note)
+        results = {"a": {"content": [{"type": "text", "text": "x"}], "isError": False}, "b": {"content": []}}
+        out = server.with_tools_note(results, "N")
+        self.assertEqual(out["a"]["content"], [{"type": "text", "text": "x"}, {"type": "text", "text": "N"}])
+        self.assertEqual(out["b"], {"content": []})
+        self.assertEqual(results["a"]["content"], [{"type": "text", "text": "x"}])   # a copy: the turn is unchanged
+        self.assertIs(server.with_tools_note(results, None), results)
+
     def test_parallel_tool_uses_are_returned_together_and_answered_in_one_request(self):
         history = [{"role": "user", "content": "use two tools"}]
         r1 = self.post({"tools": [READ_TOOL], "messages": history})

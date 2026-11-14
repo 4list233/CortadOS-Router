@@ -941,6 +941,7 @@ class Registry:
         s.client = client                           # the opener's User-Agent name: find's scope without an identity
         s.rebuild_budget = RebuildBudget()          # its lineage's rebuilds (REBUILD_MAX), shared on rebuild
         s.tool_names, s.tools_warned = {t["name"] for t in turn.tools}, False   # what the backend was started with
+        s.tools_note = None                         # tools_added_note, sent with the next turn once
         s.awaiting_tool_result = False
         s.opened_at = time.time()                   # the live view's elapsed (live_conversations)
         return s
@@ -1625,6 +1626,31 @@ def _failed_reason(exc: object) -> str:
     failure_diagnostic (never the backend's own text)."""
     diag = getattr(exc, "diagnostic", None)
     return "the conversation already failed (terminal)" + (f": {diag}" if diag else "")
+
+
+TOOLS_NOTE_NAMES = 20                          # names listed in the note; the log has them all
+
+
+def tools_added_note(added: list) -> str:
+    """What the backend model is told, once, when the client added tools after the backend started (#117, #121): it
+    must not call them, and should say so if the task needs them. Only the provider can say it: the client lists the
+    tools, and the backend's own error ("No such tool available") does not say why."""
+    shown = ", ".join(added[:TOOLS_NOTE_NAMES]) + (f" and {len(added) - TOOLS_NOTE_NAMES} more"
+                                                    if len(added) > TOOLS_NOTE_NAMES else "")
+    return ("[cortados provider] These tools were added after this conversation started and cannot be called in it: "
+            f"{shown}. Do not call them; if the task needs them, say so in your answer (they work in a new "
+            "conversation that has them from its first request).")
+
+
+def with_tools_note(results: dict, note: str | None) -> dict:
+    """The client's tool results with the note appended as a text item to the first one (a copy; the turn and its
+    fingerprint are unchanged)."""
+    if not note or not results:
+        return results
+    out = dict(results)
+    first = next(iter(out))
+    out[first] = {**out[first], "content": list(out[first].get("content") or []) + [{"type": "text", "text": note}]}
+    return out
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2584,12 +2610,20 @@ class Handler(BaseHTTPRequestHandler):
                 # opening request's tools (Codex declares them once, on thread/start), so a tool added or dropped
                 # mid-conversation is never re-declared. Said once per conversation, names only; routing is unchanged.
                 session.tools_warned = True
-                # The usual cause of an ADDED tool is a Claude Code client with tool search on (#117): calls to it fail
-                # on the backend as "No such tool available". session.launcher_env turns it off; the hint names it.
+                added, dropped = sorted(names - session.tool_names), sorted(session.tool_names - names)
+                # The usual cause of an ADDED tool is a Claude Code client with tool search on (#117): it declares an
+                # MCP tool only once ToolSearch has loaded it. The backend cannot call it ("No such tool available"),
+                # so this says so plainly, and the model is told once (tools_added_note) so it can tell the user
+                # instead of retrying. Growing the backend's tool set is #121; launch bounded clients with tool search
+                # off (session.TOOL_SEARCH_OFF).
                 logger.warning("conversation %s: the tool set changed mid-conversation (added %s, dropped %s); the "
-                               "running backend keeps the tools it started with (a Claude Code client adding tools "
-                               "has tool search on: run it with ENABLE_TOOL_SEARCH=false, #117)", session.id[:8],
-                               sorted(names - session.tool_names), sorted(session.tool_names - names))
+                               "running backend keeps the tools it started with, so an added tool CANNOT be called in "
+                               "this conversation (calls fail as \"No such tool available\"; the model is told). "
+                               "Usual cause: a Claude Code client with tool search on; start it with "
+                               "ENABLE_TOOL_SEARCH=false or a new conversation (#117, #121)", session.id[:8],
+                               added, dropped)
+                if added:
+                    session.tools_note = tools_added_note(added)
             if one_shot:
                 # The transcript re-reads the whole history, so a shape error in an older user item surfaces here,
                 # not in parse_request: it is a request-shape error all the same and answers 400.
@@ -2765,9 +2799,13 @@ class Handler(BaseHTTPRequestHandler):
                     session.send_user(anthropic_wire.rebuild_content(seed, turn), timeout=deadline - time.time())
                     session.rebuild_seed = None
                 elif turn.tool_results:
-                    session.deliver(turn.tool_results, timeout=deadline - time.time())
+                    session.deliver(with_tools_note(turn.tool_results, getattr(session, "tools_note", None)),
+                                    timeout=deadline - time.time())
                 else:
-                    session.send_user(turn.content, timeout=deadline - time.time())
+                    note = getattr(session, "tools_note", None)
+                    session.send_user(turn.content + ([{"type": "text", "text": note}] if note else []),
+                                      timeout=deadline - time.time())
+                session.tools_note = None               # said once; a rebuilt backend starts with the current tools
                 _turn_t0 = time.time()
                 outcome["turn"] = session.run_turn(deadline - time.time())
                 _turn_ms = int((time.time() - _turn_t0) * 1000)
