@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from cortados_router import child_tasks, paths, subagent_mcp
 
-CLIENT = "grokbot"                       # fixed: one shared token means one attributable client (owner decision)
+CLIENT = child_tasks.BOT_ORIGIN          # "grokbot", fixed: one shared token means one attributable client (owner decision)
 EXPOSED = ("start_task", "wait_task", "task_status", "list_tasks", "cancel_task", "route_task")
 # start_task arguments forwarded to child_tasks as the bot sent them (#86: the owner's agent gets the owner's surface).
 # `task` is not in this list: the gateway builds the child's prompt (APPROVAL_DIRECTIVE + task). Anything else a bot
