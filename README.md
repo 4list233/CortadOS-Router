@@ -522,8 +522,12 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   else, or a worktree git cannot assess) with `git worktree move`, and records it in `<root>/index.jsonl` (one line per
   task, rewritten under `index.lock`). Git-ignored files count as unpublished owner data, except regenerable caches
   (`__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `*.pyc`) and empty ignored directories; a nested
-  `.git` always holds. A worktree held only for files is reassessed twice (after 2 s and 5 s) in case a straggling
-  process was still removing its temp file, and the record names the paths that held it (`held_paths`, at most 20). A plain folder containing a `.git` entry at any depth is conservatively moved
+  `.git` always holds (any case: `.GIT` and `.Git` are `.git` on macOS; a directory or a file). Archiving needs writer
+  quiescence: the child's process group gone (or the folder is held), and two clean assessments a pause apart (2 s,
+  then 5 s more if needed) bracketed by identical snapshots of the tree (paths, sizes, mtimes, outside the caches),
+  compared again under the cleanup lock before the move and before HEAD is detached; a change after the move sends it
+  on to `held/` undetached. The record names the paths that held it (`held_paths`, at most 20) and a path-free
+  `reason_code`. A plain folder containing a `.git` entry at any depth is conservatively moved
   to `held/` too (symlinks are never followed). An archived worktree has its HEAD detached at the same commit so its
   branch is free for the next task (`git update-ref --no-deref HEAD` with hooks disabled: no checkout, no file
   written; a failed detach is recorded as `detach_error` and loses nothing); a held one keeps its branch. An archive
@@ -533,7 +537,7 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   directories and the entry is unchanged between assessment and detach; otherwise the start is refused. The start
   waits at most 60 s (`CLEANUP_LOCK_WAIT_S`) for that lock; past it the start is refused with "archive cleanup is
   running; retry in a minute" and never proceeds without the lock (#93).
-  `task_status` shows `workspace` (kind, state, path, reason).
+  `task_status` shows `workspace` (kind, state, path, reason, reason_code, held_paths).
 - Archive cleanup: `python3 cortados_router/child_tasks.py --cleanup-archive [--root <dir>]` deletes `archive/<task_id>`
   entries whose index record says archived more than 3 days ago, and nothing else: not a name that is not a task id,
   not a symlink (never followed), not a non-directory, not an entry resolving outside `archive/`, not one without an
@@ -541,7 +545,9 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   reassessed work moved to `held/` and errors consume the same time budget, and the time left in the budget is every
   git call's subprocess timeout, so one hung fetch cannot hold `cleanup.lock` past it (#93). An entry whose
   reassessment times out is left exactly as it is (reported under `timed_out`, counted as kept, retried by the next
-  run), never deleted or moved. The cleanup rechecks plain folders for a nested `.git` immediately before deletion.
+  run), never deleted or moved. The cleanup rechecks plain folders for a nested `.git` immediately before deletion,
+  and deletes a worktree only after two clean reassessments 2 s apart (`CLEANUP_QUIESCE_S`) bracketed by identical
+  snapshots, plus one more snapshot compared immediately before the first unlink; any change holds it.
   Worktree metadata is never pruned globally (#93): `git worktree prune` is never run, every clone has
   `gc.worktreePruneExpire=never`, a deleted worktree's own admin dir is removed alone, every move is followed by
   `git worktree repair` (a failure is recorded as `repair_error`, never rolled back), and each cleanup (and each start
@@ -712,7 +718,7 @@ Each finished child task (any terminal state) is exported as one JSON line for a
   explicit marker `missing` when no parent is known; the parent comes from `start_task`'s optional `parent_task_id`, else
   `CORTADOS_PARENT_TASK_ID` in the launching session, validated as a task id), `title`, `host`, `client`, `state`,
   `exit_code`, `cancelled`, `timed_out`, `started_at` / `ended_at` / `elapsed_s`, `cwd` (home shown as `~`),
-  `workspace` (kind, state, repo, branch, reason; no path), `orchestrator`, `permission_mode`,
+  `workspace` (kind, state, repo, branch, reason_code; no path, so neither the reason text nor `held_paths`), `orchestrator`, `permission_mode`,
   `effective_permission_mode`, `chrome`, `launch`, `lane` / `model` (login mode), `router_run` (model, label, provider
   with account alias such as `claude-cli#b`, models, builder_models, refusals; fetched by the runner while the
   provider still holds it, else a note or an error field), `tool_uses`, `tool_errors`, `error`, `prompt`, `events` in

@@ -38,6 +38,12 @@ class _Base(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         GIT_ENV.update(isolate)
+        # The pauses between quiescence assessments are the module's own seam (ws._sleep), never the shared
+        # time.sleep that subprocess polling also uses; no test waits for them in real time.
+        self.sleeps = []
+        quiet = mock.patch.object(ws, "_sleep", self.sleeps.append)
+        quiet.start()
+        self.addCleanup(quiet.stop)
         self.root = os.path.join(self.tmp, "CortadOS")
         os.mkdir(self.root)
         self.origin = os.path.join(self.tmp, "origin", "demo.git")
@@ -324,8 +330,10 @@ class SettleLeftoverTests(_Base):
         self.write(rec, "stray.pyc")
         os.makedirs(os.path.join(rec["path"], "data", "outcome", "journals"))     # the 2026-11-13 leftover
         self.assertEqual(ws.assess(rec["path"]), (True, "pushed", []))
-        settled = ws.settle(rec, self.root, recheck_delays=())
-        self.assertEqual((settled["state"], settled["reason"]), ("archived", "pushed"), settled)
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["reason"], settled["reason_code"]), ("archived", "pushed", "pushed"),
+                         settled)
+        self.assertEqual(self.sleeps, [2.0])               # one pause: two clean assessments, identical snapshots
         self.assertTrue(settled.get("detached"), settled)
         self.assertNotIn("held_paths", settled)
         git("rev-parse", "--verify", "HEAD", cwd=settled["path"])
@@ -335,7 +343,7 @@ class SettleLeftoverTests(_Base):
     def test_untracked_file_not_ignored_holds_and_names_the_path(self):
         rec = self.pushed_worktree()
         self.write(rec, "notes.txt")
-        settled = ws.settle(rec, self.root, recheck_delays=())
+        settled = ws.settle(rec, self.root)
         self.assertEqual(settled["state"], "held")
         self.assertEqual(settled["held_paths"], ["notes.txt"])
         self.assertIn("notes.txt", settled["reason"])
@@ -347,7 +355,7 @@ class SettleLeftoverTests(_Base):
     def test_a_cache_name_that_git_does_not_ignore_still_holds(self):
         rec = self.pushed_worktree(ignore=("data/",))
         self.write(rec, "pkg/__pycache__/m.pyc")
-        settled = ws.settle(rec, self.root, recheck_delays=())
+        settled = ws.settle(rec, self.root)
         self.assertEqual(settled["state"], "held")
         self.assertEqual(settled["held_paths"], ["pkg/__pycache__/m.pyc"])
 
@@ -355,7 +363,7 @@ class SettleLeftoverTests(_Base):
         rec = self.pushed_worktree()
         self.write(rec, "data/outcome/train.jsonl", "{}\n")
         self.write(rec, "data/__pycache__/x.pyc")
-        settled = ws.settle(rec, self.root, recheck_delays=())
+        settled = ws.settle(rec, self.root)
         self.assertEqual(settled["state"], "held")
         self.assertEqual(settled["held_paths"], ["data/outcome/train.jsonl"])
         self.assertTrue(os.path.exists(os.path.join(settled["path"], "data", "outcome", "train.jsonl")))
@@ -367,7 +375,7 @@ class SettleLeftoverTests(_Base):
                 self.setUp()
                 rec = self.pushed_worktree()
                 self.write(rec, nested)
-                settled = ws.settle(rec, self.root, recheck_delays=())
+                settled = ws.settle(rec, self.root)
                 self.assertEqual(settled["state"], "held")
                 self.assertEqual(len(settled["held_paths"]), 1)
                 self.assertTrue(settled["held_paths"][0].endswith(".git"), settled["held_paths"])
@@ -377,7 +385,7 @@ class SettleLeftoverTests(_Base):
         sub = os.path.join(rec["path"], "sub")
         git("init", "-q", sub)
         self.write(rec, "sub/x.txt")
-        settled = ws.settle(rec, self.root, recheck_delays=())
+        settled = ws.settle(rec, self.root)
         self.assertEqual(settled["state"], "held")
         self.assertEqual(settled["held_paths"], ["sub/"])
 
@@ -386,10 +394,9 @@ class SettleLeftoverTests(_Base):
         self.write(rec, "local.txt")
         git("add", ".", cwd=rec["path"])
         git("commit", "-q", "-m", "local only", cwd=rec["path"])
-        with mock.patch.object(ws.time, "sleep") as sleep:
-            settled = ws.settle(rec, self.root)
-        sleep.assert_not_called()
-        self.assertEqual(settled["state"], "held")
+        settled = ws.settle(rec, self.root)
+        self.assertEqual(self.sleeps, [])
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "unpushed_commits"))
         self.assertIn("not on any remote", settled["reason"])
         self.assertNotIn("held_paths", settled)
 
@@ -402,19 +409,18 @@ class SettleLeftoverTests(_Base):
             sleeps.append(s)
             if os.path.exists(tmp):
                 os.remove(tmp)
-        with mock.patch.object(ws.time, "sleep", sleep):
+        with mock.patch.object(ws, "_sleep", sleep):
             settled = ws.settle(rec, self.root, recheck_delays=(2.0, 5.0))
-        self.assertEqual(sleeps, [2.0])
+        self.assertEqual(sleeps, [2.0, 5.0])              # clean after the first pause, proven quiet after the second
         self.assertEqual(settled["state"], "archived", settled)
-        self.assertEqual(settled["settle_rechecks"], 1)
+        self.assertEqual(settled["settle_rechecks"], 2)
         self.assertNotIn("held_paths", settled)
 
     def test_a_file_that_stays_holds_after_every_recheck(self):
         rec = self.pushed_worktree()
         self.write(rec, "keep.txt")
-        with mock.patch.object(ws.time, "sleep") as sleep:
-            settled = ws.settle(rec, self.root, recheck_delays=(2.0, 5.0))
-        self.assertEqual([c.args[0] for c in sleep.call_args_list], [2.0, 5.0])
+        settled = ws.settle(rec, self.root, recheck_delays=(2.0, 5.0))
+        self.assertEqual(self.sleeps, [2.0, 5.0])
         self.assertEqual((settled["state"], settled["held_paths"], settled["settle_rechecks"]),
                          ("held", ["keep.txt"], 2))
 
@@ -440,6 +446,235 @@ class SettleLeftoverTests(_Base):
         os.remove(os.path.join(rec["path"], "hook.txt"))
         self.assertEqual(ws.assess(rec["path"]), (True, "pushed", []))
         self.assertFalse(os.path.exists(os.path.join(rec["path"], "hook.txt")))
+
+
+class GitMetadataCaseTests(_Base):
+    """Review P1: macOS is case-insensitive, so .GIT (or .Git, or a name with HFS-ignorable code points) is git
+    metadata there. An unpushed nested repository under an ignored cache with its .git spelled .GIT was archived and
+    then deleted with its commit."""
+
+    def pushed_worktree(self):
+        return SettleLeftoverTests.pushed_worktree(self)
+
+    def test_is_git_meta(self):
+        for name in (".git", ".GIT", ".Git", ".g\u200cit", "\ufeff.GiT"):
+            self.assertTrue(ws._is_git_meta(name), repr(name))
+        for name in ("git", ".gitignore", "x.git", ".git2", ".gi"):
+            self.assertFalse(ws._is_git_meta(name), repr(name))
+
+    def nested_upper_repo(self, top):
+        nested = os.path.join(top, "__pycache__", "nested")
+        os.makedirs(nested)
+        git("init", "-q", nested)
+        with open(os.path.join(nested, "work.txt"), "w") as f:
+            f.write("unpushed\n")
+        git("add", ".", cwd=nested)
+        git("commit", "-q", "-m", "only here", cwd=nested)
+        os.rename(os.path.join(nested, ".git"), os.path.join(nested, ".tmp-git"))
+        os.rename(os.path.join(nested, ".tmp-git"), os.path.join(nested, ".GIT"))
+        return nested
+
+    def test_settle_holds_a_nested_repo_spelled_dot_GIT_inside_an_ignored_cache(self):
+        rec = self.pushed_worktree()
+        self.nested_upper_repo(rec["path"])
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "unpushed_files"), settled)
+        self.assertEqual(settled["held_paths"], ["__pycache__/nested/.GIT"])
+
+    def test_a_dot_Git_file_in_an_ignored_cache_holds(self):
+        rec = self.pushed_worktree()
+        os.makedirs(os.path.join(rec["path"], "__pycache__", "sub"))
+        with open(os.path.join(rec["path"], "__pycache__", "sub", ".Git"), "w") as f:
+            f.write("gitdir: /elsewhere\n")                 # a worktree's or submodule's .git FILE
+        self.assertEqual(ws.settle(rec, self.root)["state"], "held")
+
+    def test_cleanup_holds_an_archive_that_gained_a_dot_GIT_repo_and_deletes_nothing(self):
+        rec = ws.settle(self.prepare(TID, repo=self.origin), self.root)
+        self.assertEqual(rec["state"], "archived")
+        ws.update_index(self.root, {**rec, "settled_at": time.time() - ws.ARCHIVE_AGE_S - 60})
+        self.nested_upper_repo(rec["path"])
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        held = os.path.join(self.root, "held", TID)
+        self.assertTrue(os.path.isdir(os.path.join(held, "__pycache__", "nested", ".GIT")))
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "held")
+
+    def test_plain_folder_guards_are_case_insensitive_at_settle_and_cleanup(self):
+        rec = self.prepare()
+        os.makedirs(os.path.join(rec["path"], "x", ".GIT"))
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "nested_git"))
+        rec2 = ws.settle(self.prepare(TID2), self.root)
+        self.assertEqual(rec2["state"], "archived")
+        ws.update_index(self.root, {**rec2, "settled_at": time.time() - ws.ARCHIVE_AGE_S - 60})
+        os.makedirs(os.path.join(rec2["path"], "y", ".Git"))
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertTrue(os.path.isdir(os.path.join(self.root, "held", TID2, "y", ".Git")))
+
+
+class LateWriterTests(_Base):
+    """Review P1: a file written after the last assessment was archived (settle) or deleted (cleanup). Archiving and
+    deleting now need writer quiescence: the task's process group gone, two clean assessments a pause apart bracketed
+    by identical snapshots, compared again under the lock right before the move, the detach and the deletion. The
+    late writes come from injected hooks, never from real sleeps."""
+
+    def pushed_worktree(self, tid=TID):
+        return self.prepare(tid, repo=self.origin, branch="feature")
+
+    def write(self, path, rel, text="late\n"):
+        with open(os.path.join(path, rel), "w") as f:
+            f.write(text)
+
+    def assess_then(self, after_call, action):
+        """Patch ws.assess so `action` runs right after its `after_call`-th call returns (a write after it looked)."""
+        real, calls = ws.assess, []
+
+        def assess(path, deadline=None):
+            out = real(path, deadline)
+            calls.append(path)
+            if len(calls) == after_call:
+                action(path)
+            return out
+        return mock.patch.object(ws, "assess", assess)
+
+    def test_writers_still_running_hold_without_assessing(self):
+        probes = (lambda: True, lambda: None, mock.Mock(side_effect=RuntimeError("ps failed")))
+        for tid, probe in zip((TID, TID2, "t20261108120200-0000000c"), probes):
+            with self.subTest(tid=tid):
+                rec = self.prepare(tid, repo=self.origin)
+                with mock.patch.object(ws, "assess") as assess:
+                    settled = ws.settle(rec, self.root, writers_alive=probe)
+                assess.assert_not_called()
+                self.assertEqual((settled["state"], settled["reason_code"]), ("held", "writers_running"))
+
+    def test_writers_gone_archives(self):
+        settled = ws.settle(self.pushed_worktree(), self.root, writers_alive=lambda: False)
+        self.assertEqual((settled["state"], settled["detached"]), ("archived", True))
+
+    def test_a_file_written_during_the_pause_holds(self):
+        rec = self.pushed_worktree()
+        with mock.patch.object(ws, "_sleep", lambda s: self.write(rec["path"], "late.txt")):
+            settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["held_paths"]), ("held", ["late.txt"]))
+        self.assertTrue(os.path.exists(os.path.join(settled["path"], "late.txt")))
+
+    def test_a_tree_that_keeps_changing_is_never_archived(self):
+        rec = self.pushed_worktree()
+        readme = os.path.join(rec["path"], "README.md")
+        real, n = ws.assess, [0]
+
+        def assess(path, deadline=None):         # a tracked file's mtime moves on every look: content clean, never quiet
+            out = real(path, deadline)
+            n[0] += 1
+            os.utime(readme, ns=(n[0] * 10 ** 9, n[0] * 10 ** 9))
+            return out
+        with mock.patch.object(ws, "assess", assess):
+            settled = ws.settle(rec, self.root, recheck_delays=(2.0, 5.0))
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "not_quiescent"), settled)
+        self.assertEqual(n[0], 3)
+        self.assertTrue(self.attached(settled["path"]))
+
+    def test_a_write_after_the_second_assessment_holds(self):
+        rec = self.pushed_worktree()
+        with self.assess_then(2, lambda p: self.write(p, "late.txt")):
+            settled = ws.settle(rec, self.root, recheck_delays=(2.0, 5.0))
+        self.assertEqual((settled["state"], settled["held_paths"]), ("held", ["late.txt"]))
+
+    def test_a_write_under_the_lock_before_the_move_holds(self):
+        rec = self.pushed_worktree()
+        probes = []
+
+        def probe():                              # the second probe runs under cleanup.lock, just before the move
+            probes.append(1)
+            if len(probes) == 2:
+                self.write(rec["path"], "late.txt")
+            return False
+        settled = ws.settle(rec, self.root, writers_alive=probe)
+        self.assertEqual(len(probes), 2)
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "not_quiescent"), settled)
+        self.assertTrue(os.path.exists(os.path.join(self.root, "held", TID, "late.txt")))
+        self.assertTrue(self.attached(settled["path"]))
+
+    def test_a_write_after_the_move_before_the_detach_moves_on_to_held(self):
+        rec = self.pushed_worktree()
+        real = ws._repair_worktree
+
+        def repair(path, repo_dir):              # runs after the rename into archive/, before HEAD is detached
+            real(path, repo_dir)
+            if "/archive/" in path:
+                self.write(path, "late.txt")
+        with mock.patch.object(ws, "_repair_worktree", repair):
+            settled = ws.settle(rec, self.root)
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual((settled["state"], settled["path"], settled["reason_code"]), ("held", held, "not_quiescent"))
+        self.assertFalse(settled.get("detached"))
+        self.assertTrue(self.attached(held))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "archive", TID)))
+        self.assertTrue(os.path.exists(os.path.join(held, "late.txt")))
+        self.assertIn(held, git("worktree", "list", "--porcelain", cwd=rec["repo_dir"]))
+
+    def attached(self, path):
+        return subprocess.run(["git", "symbolic-ref", "--quiet", "HEAD"], cwd=path, capture_output=True,
+                              env=GIT_ENV).returncode == 0
+
+    def old_archive(self):
+        rec = ws.settle(self.prepare(TID, repo=self.origin), self.root)
+        self.assertEqual(rec["state"], "archived")
+        ws.update_index(self.root, {**rec, "settled_at": time.time() - ws.ARCHIVE_AGE_S - 60})
+        self.sleeps.clear()
+        return rec["path"]
+
+    def test_cleanup_pauses_between_two_assessments_before_deleting(self):
+        path = self.old_archive()
+        self.assertEqual(ws.cleanup_archive(self.root)["deleted"], [TID])
+        self.assertEqual(self.sleeps, [ws.CLEANUP_QUIESCE_S])
+        self.assertFalse(os.path.exists(path))
+
+    def test_cleanup_holds_a_file_written_after_its_last_assessment(self):
+        self.old_archive()
+        with self.assess_then(2, lambda p: self.write(p, "late.txt")):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertTrue(os.path.exists(os.path.join(self.root, "held", TID, "late.txt")))
+        self.assertEqual(ws.read_index(self.root)[TID]["reason_code"], "not_quiescent")
+
+    def test_cleanup_holds_a_file_written_during_its_pause(self):
+        path = self.old_archive()
+        with mock.patch.object(ws, "_sleep", lambda s: self.write(path, "late.txt")):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertEqual(ws.read_index(self.root)[TID]["held_paths"], ["late.txt"])
+
+    def test_cleanup_holds_a_file_written_after_the_final_assessment_immediately_before_deletion(self):
+        path = self.old_archive()
+        real = ws._AdminDir
+
+        def admin(*a, **kw):                     # resolved after the assessments, before the final snapshot
+            out = real(*a, **kw)
+            self.write(path, "late.txt")
+            return out
+        with mock.patch.object(ws, "_AdminDir", admin):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertEqual(report["errors"], [])
+        self.assertTrue(os.path.exists(os.path.join(self.root, "held", TID, "late.txt")))
+        rec = ws.read_index(self.root)[TID]
+        self.assertEqual((rec["state"], rec["reason_code"]), ("held", "not_quiescent"))
+        self.assertIn("immediately before deletion", rec["reason"])
+
+    def test_cleanup_with_no_time_for_the_pause_keeps_the_entry_untouched(self):
+        path = self.old_archive()
+        with mock.patch.object(ws, "CLEANUP_QUIESCE_S", 10 ** 6):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "archived")
+        self.assertTrue(report["timed_out"])
+
+    def test_sleep_seam_is_the_modules_own(self):
+        self.assertEqual(ws._sleep, self.sleeps.append)     # patched here; time.sleep (subprocess polling) is not
+        self.assertNotEqual(time.sleep, self.sleeps.append)
 
 
 class BranchReleaseTests(_Base):

@@ -1686,7 +1686,7 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
         out.update(lane=meta["lane"], model=meta.get("model"))
     ws = _workspace_record(d, task_id)
     if isinstance(ws, dict):
-        out["workspace"] = {k: ws.get(k) for k in ("kind", "state", "path", "repo", "branch", "reason", "held_paths", "error") if ws.get(k) is not None}
+        out["workspace"] = {k: ws.get(k) for k in ("kind", "state", "path", "repo", "branch", "reason", "reason_code", "held_paths", "error") if ws.get(k) is not None}
     elif meta.get("workspace"):
         out["workspace"] = {**meta["workspace"], "state": "preparing" if state == "running" else "not created"}
     if state == "running" and os.path.exists(os.path.join(d, QUEUED_MARKER)):
@@ -2240,6 +2240,19 @@ def _workspace_record(d: str, task_id: str):
     return ws
 
 
+def _child_group_alive(d: str):
+    """For workspaces.settle's writer-quiescence check: False once the child's recorded process group is gone (or no
+    child was ever recorded: nothing ran in the folder), True while it is alive, None when child.json cannot be read.
+    A pgid reused by another user's process ('foreign') is not ours: gone. One reused by ours reads as alive: held."""
+    path = os.path.join(d, "child.json")
+    if not os.path.lexists(path):
+        return False
+    rec = _read_json(path)
+    if not isinstance(rec, dict) or not isinstance(rec.get("pgid"), int) or rec["pgid"] <= 1:
+        return None
+    return _probe_group(rec["pgid"]) == "alive"
+
+
 def _settle_workspace(d: str):
     """Move the task's workspace out of active/ (workspaces.settle) once the child is over, and record it in the
     host's index.jsonl. Idempotent: a folder already settled (or a task with none) is left alone. Returns the
@@ -2252,7 +2265,7 @@ def _settle_workspace(d: str):
     if ws.get("state") != "active":
         return ws
     try:
-        ws = workspaces.settle(ws, root)
+        ws = workspaces.settle(ws, root, writers_alive=lambda: _child_group_alive(d))
         _write_json(os.path.join(d, WORKSPACE_FILE), ws)
         workspaces.update_index(root, {**ws, "settled_from": "runner" if ws.get("state") != "active" else None})
     except (OSError, workspaces.WorkspaceError) as exc:
@@ -2298,7 +2311,8 @@ META_TEXT_MARK = "caller_text_redacted"      # meta.json: every caller-supplied 
 # task's meta is marked (start_task redacted or refused every credential in them with the launch credentials) or the
 # current credentials provably cover the launch ones; otherwise they are null and named in withheld_fields.
 EXPORT_CALLER_TEXT = ("title", "client", "cwd", "orchestrator", "model", "error", "parent_note")
-EXPORT_CALLER_WORKSPACE = ("repo", "branch", "reason")
+# The workspace's `reason` is not exported at all: it names paths (held_paths); its path-free `reason_code` is.
+EXPORT_CALLER_WORKSPACE = ("repo", "branch")
 
 # Best-effort scrub of well-known secret shapes, applied to export text only, AFTER the known-value redaction and
 # BEFORE the cap. Not a guarantee: a secret of any other shape passes. Each match becomes [scrubbed:<type>], counted.
@@ -2624,7 +2638,7 @@ def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_r
         "started_at": started, "ended_at": ended,
         "elapsed_s": round(ended - started, 1) if isinstance(started, (int, float)) and isinstance(ended, (int, float)) else None,
         "cwd": _home_relative(meta.get("cwd")),
-        "workspace": {k: ws.get(k) for k in ("kind", "state", "repo", "branch", "reason") if ws.get(k) is not None} if ws else None,
+        "workspace": {k: ws.get(k) for k in ("kind", "state", "repo", "branch", "reason_code") if ws.get(k) is not None} if ws else None,
         "orchestrator": meta.get("orchestrator"), "permission_mode": meta.get("permission_mode"),
         "effective_permission_mode": act.get("effective_permission_mode"),
         "chrome": bool(meta.get("chrome")), "launch": meta.get("launch"),

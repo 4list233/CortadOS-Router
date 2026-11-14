@@ -906,7 +906,21 @@ class ChildTaskTests(ChildTaskBase):
         held = os.path.join(self.ws_root, "held", tid)
         self.assertEqual(w["workspace"]["path"], held)
         self.assertIn("untracked", w["workspace"]["reason"])
+        self.assertEqual(w["workspace"]["reason_code"], "unpushed_files")
+        self.assertIn("fake-argv.json", w["workspace"]["held_paths"])
         self.assertTrue(os.path.exists(os.path.join(held, "fake-argv.json")))
+        # the run export (#91) carries the path-free reason code, never the reason or held_paths (they name paths)
+        export = os.path.join(os.environ["CORTADOS_HOME"], "exports", "task-runs.jsonl")
+        end = time.time() + 30
+        while not os.path.exists(export) and time.time() < end:
+            time.sleep(0.2)
+        with open(export) as f:
+            text = f.read()
+        row = [json.loads(x) for x in text.splitlines() if json.loads(x)["task_id"] == tid][0]
+        self.assertEqual(row["workspace"]["reason_code"], "unpushed_files")
+        self.assertNotIn("reason", row["workspace"])
+        self.assertNotIn("held_paths", row["workspace"])
+        self.assertNotIn("fake-argv.json", text)
         self.assertTrue(os.path.exists(os.path.join(held, "README.md")))
         listed = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=os.path.join(self.ws_root, "repos", "demo"),
                                 capture_output=True, text=True).stdout
@@ -915,6 +929,24 @@ class ChildTaskTests(ChildTaskBase):
         rec = ct.workspaces.read_index(self.ws_root)[tid]
         self.assertEqual((rec["state"], rec["branch"]), ("held", "task/" + tid))
         self.assertEqual(ct.workspaces.cleanup_archive(self.ws_root, now=time.time() + 10 ** 7)["deleted"], [])   # held: never
+
+    def test_settle_probe_reports_the_child_group(self):
+        d = os.path.join(self.tmp, "probe-task")
+        os.mkdir(d)
+        self.assertIs(ct._child_group_alive(d), False)                   # no child ever recorded
+        g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        self.addCleanup(lambda: (g.poll() is None and g.kill(), g.wait()))
+        ct._write_json(os.path.join(d, "child.json"), {"pgid": g.pid, "start": None})
+        self.assertIs(ct._child_group_alive(d), True)
+        g.kill()
+        g.wait()
+        self.assertIs(ct._child_group_alive(d), False)
+        with open(os.path.join(d, "child.json"), "w") as f:
+            f.write("{not json")
+        with self.assertRaises(ct.TaskError):                            # settle reads a raise as "unknown": holds
+            ct._child_group_alive(d)
+        ct._write_json(os.path.join(d, "child.json"), {"pgid": "x"})
+        self.assertIsNone(ct._child_group_alive(d))
 
     def test_bad_repo_or_branch_and_cwd_plus_repo_are_refused_before_anything_runs(self):
         for kw, needle in (({"repo": "-rf"}, "not a clone URL"), ({"branch": "main"}, "branch needs repo"),
