@@ -39,6 +39,39 @@ import urllib.error
 import urllib.request
 import urllib.parse
 
+
+# ---- Error text sink (#117 round 5): a COPY of cortados_router.safe_text.escape_controls, since this file runs standalone
+# (no package import); tests/test_safe_text.py pins the copy to the original. Every error text this server returns passes
+# _safe_error, so the decoded text a model reads has no raw newline or other control character from client input.
+SAFE_ERROR_CAP = 2000
+
+
+def _escape_char(c):
+    if c in "\n\r\t":
+        return {"\n": "\\n", "\r": "\\r", "\t": "\\t"}[c]
+    o = ord(c)
+    return f"\\x{o:02x}" if o < 0x100 else f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}"
+
+
+def escape_controls(value, cap):
+    if not isinstance(value, str):
+        try:
+            value = str(value)
+        except Exception:
+            value = f"<{type(value).__name__}>"
+    head = value[:cap]
+    out = head if head.isprintable() else "".join(c if c == " " or c.isprintable() else _escape_char(c) for c in head)
+    if len(out) > cap:
+        out = out[:cap]
+        if out.endswith("\\"):
+            out = out[:-1]
+    return out + (f"...(+{len(value) - len(head)} chars)" if len(value) > cap else "")
+
+
+def _safe_error(text):
+    return escape_controls(text, SAFE_ERROR_CAP)
+
+
 PROTOCOL = "2025-06-18"
 SUPPORTED_PROTOCOLS = {"2025-06-18"}   # only versions whose required behaviour (no mandatory JSON-RPC batching) we implement
 DEFAULT_TIMEOUT_S = 300.0          # a routed subtask can take a while (cold lane, large output)
@@ -393,7 +426,14 @@ def _short_host() -> str:
 
 
 def _err(text: str) -> dict:
-    return {"content": [{"type": "text", "text": text}], "isError": True}
+    """An isError tool result: THE sink of every error text this server's tools return (start_task's unknown connector,
+    route_task's routing error, ...), through _safe_error."""
+    return {"content": [{"type": "text", "text": _safe_error(text)}], "isError": True}
+
+
+def _rpc_error(base: dict, code: int, message: str) -> dict:
+    """A JSON-RPC error reply; its message through _safe_error (a method name is client text)."""
+    return {**base, "error": {"code": code, "message": _safe_error(message)}}
 
 
 def route_task(provider_url: str, token: str, task: str, context: str = "", max_tokens: int = DEFAULT_MAX_TOKENS,
@@ -551,7 +591,7 @@ def handle(msg: dict, cfg: dict) -> dict | None:
         return None                                     # notifications need no answer
     base = {"jsonrpc": "2.0", "id": mid}
     if not isinstance(method, str):
-        return {**base, "error": {"code": -32600, "message": "invalid request: 'method' must be a string"}}
+        return _rpc_error(base, -32600, "invalid request: 'method' must be a string")
     if method == "initialize":
         req = params.get("protocolVersion")
         version = req if req in SUPPORTED_PROTOCOLS else PROTOCOL   # only echo versions we actually implement
@@ -579,7 +619,7 @@ def handle(msg: dict, cfg: dict) -> dict | None:
                                               model=a.get("model"))}
     if method == "ping":
         return {**base, "result": {}}
-    return {**base, "error": {"code": -32601, "message": f"method not found: {method}"}}
+    return _rpc_error(base, -32601, f"method not found: {method}")
 
 
 _out_lock = threading.Lock()
@@ -600,7 +640,8 @@ def _dispatch(msg, cfg, write=_write) -> None:
         except Exception as exc:                        # never let one bad request kill the session; the reply names only
                                                         # the exception type, as its text is unscrubbed and may echo config
             mid = msg.get("id") if isinstance(msg, dict) else None
-            reply = {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": f"internal error ({type(exc).__name__})"}} if mid is not None else None
+            reply = (_rpc_error({"jsonrpc": "2.0", "id": mid}, -32603, f"internal error ({type(exc).__name__})")
+                     if mid is not None else None)
         if reply is not None:
             write(reply)
     threading.Thread(target=run, daemon=True).start()

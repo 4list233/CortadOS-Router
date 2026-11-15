@@ -55,6 +55,7 @@ if __package__ in (None, ""):                           # run as a file: make th
 
 from cortados_router import http_body
 from cortados_router.compat import getenv
+from cortados_router.safe_text import install_log_sanitizer
 from cortados_router.compaction import prune as compaction_prune, store as compaction_store
 from cortados_router.provider import (anthropic_wire, clients, dashboard_auth, live, local_lane, local_switch, office,
                                       responses_wire, routing, search_lane)
@@ -1733,7 +1734,9 @@ class Handler(BaseHTTPRequestHandler):
     timeout = SOCKET_TIMEOUT_S
 
     def log_message(self, fmt, *args):                  # route http.server's stderr lines into logging
-        logger.debug("%s " + fmt, self.address_string(), *args)
+        # fmt is http.server's own constant; its args (the request line, a path) are client text: each rendered by
+        # log_text, and the record escaped again by the installed SafeFormatter (serve()).
+        logger.debug("%s " + fmt, self.address_string(), *(anthropic_wire.log_text(a, 300) if isinstance(a, str) else a for a in args))
 
     # ------------------------------------------------------------------ plumbing
     def _credential(self) -> str:
@@ -2546,7 +2549,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = search_lane.run(getattr(reg, "search_bin", None) or reg.claude_bin,
                                          query, who.config_dir, allowed=allowed, blocked=blocked, slot_held=True)
         except search_lane.SearchFailed as exc:
-            logger.warning("web search lane failed (%s): %s", exc.kind, exc.detail[:200])
+            logger.warning("web search lane failed (%s): %s", exc.kind, anthropic_wire.log_text(exc.detail, 200))
             if exc.kind == "start_failed" and reserved:
                 # The CLI never started, so nothing was spent: refund the reservation, once (#79). Every other failure
                 # ran the CLI (it may have spent quota) and keeps its reservation. Only an OSError from launching the
@@ -3414,6 +3417,9 @@ class ProviderServer(ThreadingHTTPServer):
 
 def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, codex_home: str | None,
           fixed_model: str | None) -> None:
+    # #117 round 5: every handler formats through safe_text.SafeFormatter, so no log record (http.server's request
+    # lines via log_message included) can carry a raw newline or control character, whatever a call site passes.
+    install_log_sanitizer()
     router = executed = log_turn_outcome = None
     if not fixed_model:
         from cortados_router import core                  # loads the tables and the live scarcity reader

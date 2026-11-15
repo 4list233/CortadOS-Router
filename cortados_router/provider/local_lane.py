@@ -31,6 +31,7 @@ import urllib.parse
 from typing import Any
 
 from cortados_router.compat import getenv
+from cortados_router.safe_text import safe_error_text
 
 CONFIG_ENV = "CORTADOS_LOCAL_RESOURCES_CONFIG"
 LANE_PREFIX = "local-"
@@ -390,7 +391,7 @@ def _refused(handler, code: int, kind: str, reason: str) -> None:
 
 
 def _error(kind: str, message: str) -> dict[str, Any]:
-    return {"type": "error", "error": {"type": kind, "message": message}}
+    return {"type": "error", "error": {"type": kind, "message": safe_error_text(message)}}
 
 
 def _rename(event_line: bytes, name: str) -> bytes:

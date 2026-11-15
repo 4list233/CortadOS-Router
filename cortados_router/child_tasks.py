@@ -70,6 +70,7 @@ if __name__ == "__main__" and not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cortados_router import exec_hosts, paths, redact, session, workspaces  # noqa: E402
+from cortados_router.safe_text import escape_controls, quoted  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TASKS_DIR = "~/.config/cortados/tasks"
@@ -400,7 +401,7 @@ def login_model(name) -> str:
     model = pin_model(name)
     model = model.split("/", 1)[1] if model.startswith("sub/") else model
     if not model.startswith("claude-"):
-        raise TaskError(f"chrome tasks run on the user's claude.ai login, which can only run Claude models; {name!r} "
+        raise TaskError(f"chrome tasks run on the user's claude.ai login, which can only run Claude models; {quoted(name)} "
                         f"({model}) is not one. Use cortados (= {LOGIN_DEFAULT_MODEL}) or a claude-* model.")
     return model
 
@@ -467,7 +468,7 @@ def _private_root() -> str:
 
 def task_path(task_id) -> str:
     if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
-        raise TaskError(f"invalid task_id {task_id!r}: expected the id start_task returned (t<14 digits>-<8 hex>)")
+        raise TaskError(f"invalid task_id {quoted(task_id)}: expected the id start_task returned (t<14 digits>-<8 hex>)")
     p = os.path.join(_private_root(), task_id)
     if not os.path.isdir(p):
         raise TaskError(f"no such task {task_id}")
@@ -520,12 +521,12 @@ def pin_model(name) -> str:
     (S1 routes) or a pinnable model or alias (fable, opus, sonnet, claude-*, gpt-*, ...). Returns the provider model id:
     'cortados' or 'sub/<id>' (session.resolve_model, which uses the provider's own alias table)."""
     if not isinstance(name, str):
-        raise TaskError(f"invalid model {name!r}: use 'cortados' or a pinnable model name (e.g. fable, opus, gpt-6.1-sol)")
+        raise TaskError(f"invalid model {quoted(name)}: use 'cortados' or a pinnable model name (e.g. fable, opus, gpt-6.1-sol)")
     # A friendly name's spaces become dashes (`GPT 6.1` -> `gpt-6.1`): the provider's resolver (routing.resolve_pin)
     # reads the two alike, and the id then stays one argv token for the child's --model.
     name = re.sub(r"\s+", "-", name.strip()).lower()
     if not ORCHESTRATOR_RE.fullmatch(name):
-        raise TaskError(f"invalid model {name!r}: use 'cortados' or a pinnable model name (e.g. fable, opus, gpt-6.1-sol, "
+        raise TaskError(f"invalid model {quoted(name)}: use 'cortados' or a pinnable model name (e.g. fable, opus, gpt-6.1-sol, "
                         "'GPT 6.1', 'ollama 27b q3km')")
     try:
         return session.resolve_model(name)
@@ -582,7 +583,7 @@ def _validate(task, cwd, orchestrator, permission_mode, allowed_tools):
         raise TaskError("cwd, when given, must be an absolute directory path on the execution host")
     pin_model(orchestrator)
     if permission_mode is not None and permission_mode not in PERMISSION_MODES:   # None: resolve_permission_mode picks
-        raise TaskError(f"permission_mode {permission_mode!r} is not allowed; choose one of {', '.join(PERMISSION_MODES)} "
+        raise TaskError(f"permission_mode {quoted(permission_mode)} is not allowed; choose one of {', '.join(PERMISSION_MODES)} "
                         "(bypassPermissions is deliberately unavailable for unattended children)")
     tools = []
     if allowed_tools is not None:
@@ -591,7 +592,7 @@ def _validate(task, cwd, orchestrator, permission_mode, allowed_tools):
         for t in allowed_tools:
             if (not isinstance(t, str) or not t.strip() or len(t) > MAX_TOOL_PATTERN or "," in t
                     or not t.isprintable()):
-                raise TaskError(f"invalid allowed_tools entry {t!r}: a printable pattern such as 'Bash(git diff:*)', "
+                raise TaskError(f"invalid allowed_tools entry {quoted(t)}: a printable pattern such as 'Bash(git diff:*)', "
                                 f"no commas, at most {MAX_TOOL_PATTERN} characters")
             tools.append(t.strip())
     return tools
@@ -605,7 +606,7 @@ def _check_cwd_here(cwd: str, host: "exec_hosts.Host") -> None:
     """cwd must exist on THIS host (the execution host). The message names the host so a path that exists only on the
     requesting machine is understood as such (start() adds that it exists there when it does)."""
     if not os.path.isdir(cwd):
-        raise TaskError(f"cwd {cwd!r} does not exist on execution host {host.describe()}; name a `repo` (and `branch`) "
+        raise TaskError(f"cwd {quoted(cwd)} does not exist on execution host {host.describe()}; name a `repo` (and `branch`) "
                         f"for a workspace under {host.root or '<root>'}/active/<task_id>, or a cwd that exists there")
 
 
@@ -818,7 +819,9 @@ def select_connectors(names) -> dict | None:
         raise TaskError(f"cannot read the connectors MCP config {path}: {type(exc).__name__}") from None
     unknown = [n for n in names if n not in servers]
     if unknown:
-        raise TaskError(f"unknown connector(s) {', '.join(unknown)}; available: {', '.join(sorted(servers)) or 'none'}")
+        # Client names quoted and capped (#117 round 5); the MCP sink (subagent_mcp._err) escapes the whole text again.
+        raise TaskError(f"unknown connector(s) {', '.join(quoted(n) for n in unknown[:MAX_CONNECTORS])}; available: "
+                        f"{', '.join(sorted(servers)) or 'none'}")
     chosen = list(dict.fromkeys(names))
     return {n: ({k: v for k, v in servers[n].items() if k != LEGACY_COUNT_KEY} if isinstance(servers[n], dict)
                 else servers[n]) for n in chosen}
@@ -931,6 +934,21 @@ def _stub(d: str):
     return rec if isinstance(rec, dict) and isinstance(rec.get("host"), str) else None
 
 
+STDERR_CAP = 16000
+
+
+def _stderr(text: str) -> None:
+    """One diagnostic line on stderr (a child's stderr.log, the --watch / --remote caller's terminal): control
+    characters escaped and capped (safe_text, #117 round 5), so client text in it (an id, a path) cannot forge a line."""
+    print(escape_controls(text, STDERR_CAP), file=sys.stderr, flush=True)
+
+
+def _stderr_traceback() -> None:
+    """The current exception's traceback through _stderr: one line, its newlines shown as `\\n`."""
+    import traceback
+    _stderr(traceback.format_exc())
+
+
 def start(*args, **kwargs) -> dict:
     """Start a child task (_start has the arguments). A TaskError passes through; any other exception becomes a
     StartFailed classified by how far the launch got (`progress`, advanced by _start at the launch boundary), so the
@@ -941,8 +959,7 @@ def start(*args, **kwargs) -> dict:
     except TaskError:
         raise
     except Exception as exc:
-        import traceback
-        traceback.print_exc(file=sys.stderr)    # the full exception for the operator's log, not for the caller
+        _stderr_traceback()                     # the full exception for the operator's log, not for the caller
         raise StartFailed(type(exc).__name__, _start_where(), progress["launched"], progress["task_id"]) from None
 
 
@@ -2108,7 +2125,7 @@ def watch_main(argv: list) -> int:
             try:
                 opts[a[2:]] = float(argv[i + 1])
             except ValueError:
-                print(f"--watch: {a} needs a number of seconds, got {argv[i + 1]!r}", file=sys.stderr)
+                _stderr(f"--watch: {a} needs a number of seconds, got {quoted(argv[i + 1])}")
                 return 2
             i += 2
             continue
@@ -2123,7 +2140,7 @@ def watch_main(argv: list) -> int:
     try:
         return watch(ids, opts["timeout"], opts["interval"], opts["stall"])
     except TaskError as exc:
-        print(f"--watch: {exc}", file=sys.stderr)     # task_path / option errors: ids and settings, never credentials
+        _stderr(f"--watch: {exc}")     # task_path / option errors: ids and settings, never credentials
         return 2
     except KeyboardInterrupt:
         return 130
@@ -3725,7 +3742,7 @@ def serve_remote(stdin=None, stdout=None) -> int:
         elif op == "cancel":
             out = cancel(args.get("task_id"))
         else:
-            return reply(False, f"unknown remote operation {op!r}")
+            return reply(False, f"unknown remote operation {quoted(op)}")
     except StartFailed as exc:                  # classified by start() itself: carry it so the caller can say what to do
         return reply(False, str(exc), exc.failure())
     except TaskError as exc:
@@ -3733,8 +3750,7 @@ def serve_remote(stdin=None, stdout=None) -> int:
                                     "message (a cortados-router bug: please report it)")
         return reply(False, Redactor(tokens).text(text) if tokens else text)
     except Exception as exc:                    # the type only: the text is unscrubbed and could echo configuration
-        import traceback
-        traceback.print_exc(file=sys.stderr)
+        _stderr_traceback()
         # Outside start() (start classifies its own): for a start request nothing was launched yet.
         return reply(False, f"internal error on execution host {host.name} ({type(exc).__name__})",
                      {"type": type(exc).__name__, "launched": "none", "task_id": None})
@@ -3754,7 +3770,7 @@ def cleanup_main(argv: list) -> int:
         try:
             me = exec_hosts.load().local_entry()
         except exec_hosts.HostError as exc:
-            print(str(exc), file=sys.stderr)
+            _stderr(str(exc))
             return 2
         if me is None or not me.root:
             print(f"no entry in {exec_hosts.config_path()} names this machine with a workspace root; pass --root", file=sys.stderr)

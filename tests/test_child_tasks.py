@@ -664,7 +664,7 @@ class ChildTaskTests(ChildTaskBase):
         self.assertFalse(os.path.exists(path), "the selection (it may carry credentials) is removed at exit")
         self.assertEqual(_load(os.path.join(d, "meta.json"))["connectors"], ["notion"])
         r, _ = self.call("start_task", task="x", cwd=self.work, connectors=["nope"])
-        self.assertIn("unknown connector(s) nope; available: notion, slack, vercel", r["content"][0]["text"])
+        self.assertIn("unknown connector(s) 'nope'; available: notion, slack, vercel", r["content"][0]["text"])
 
     def test_selected_connectors_file_content(self):
         conn = os.path.join(self.tmp, "connectors.mcp.json")

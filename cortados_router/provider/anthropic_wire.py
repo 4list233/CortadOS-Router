@@ -12,6 +12,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
+from cortados_router.safe_text import safe_error_text
+
 MODEL_ID = "cortados"
 
 # How the provider shows a client-supplied tool name in text of its OWN (an error, a log line, a note to the backend
@@ -653,4 +655,6 @@ def sse_body(blocks: list[dict[str, Any]], stop_reason: str, usage: dict[str, in
 
 
 def error_json(kind: str, message: str) -> dict[str, Any]:
-    return {"type": "error", "error": {"type": kind, "message": message}}
+    """The Anthropic error body (HTTP and SSE `error` event). The message passes safe_error_text: the SINK that keeps
+    client text from showing a raw newline or other control character to a model or user, whatever the caller built."""
+    return {"type": "error", "error": {"type": kind, "message": safe_error_text(message)}}

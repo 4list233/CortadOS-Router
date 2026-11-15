@@ -16,6 +16,7 @@ import uuid
 from typing import Any, Iterator
 
 from cortados_router.provider import anthropic_wire
+from cortados_router.safe_text import safe_error_text
 from cortados_router.provider.anthropic_wire import (ClientTurn, WireError, check_tool_name, log_safe, mcp_content,
                                                     reply_fingerprint, sse)
 
@@ -469,9 +470,11 @@ def sse_error(message: str, *, msg_id: str | None = None, model: str = MODEL_ID,
     """response.failed; Codex shows response.error.message. `terminal`: the non-retried code (TERMINAL_CODE)."""
     return _event("response.failed", sequence,
                   response=_response(msg_id or new_message_id(), model, "failed", [], None,
-                                     error={"code": TERMINAL_CODE if terminal else "server_error", "message": message}))
+                                     error={"code": TERMINAL_CODE if terminal else "server_error",
+                                            "message": safe_error_text(message)}))
 
 
 def error_json(kind: str, message: str) -> dict[str, Any]:
-    """The HTTP error body; Codex prints it verbatim."""
-    return {"error": {"type": kind, "message": message}}
+    """The HTTP error body; Codex prints it verbatim, so the message passes safe_error_text (the sink, see error_json in
+    anthropic_wire)."""
+    return {"error": {"type": kind, "message": safe_error_text(message)}}

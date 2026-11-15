@@ -410,7 +410,8 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
             return {"router": execution_routing.ROUTER, "error": misconfigured(model, local_error)}
         names = [m for _, m in pinnable] + [local_lane.pin_id(m) for _, m in local_lane.pins()]
         return {"router": execution_routing.ROUTER, "client_error": True,
-                "error": f"sub/{model} is not a model this endpoint serves; pin one of: {', '.join(names)}"}
+                "error": f"sub/{shown_pin(model)} is not a model this endpoint serves; pin one of: "
+                         f"{', '.join(shown_pin(n) for n in names)}"}
     vendor = PIN_VENDORS[provider]
     family = vendor["family"]
     if provider == "claude-cli":
@@ -615,7 +616,7 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
             # `api`, `sub/`, `api/`: a lane named without a model. Ignoring it would route the review freely, possibly onto
             # its builder's model, so it is refused like any other header that names no served model.
             return {"router": execution_routing.ROUTER, "client_error": True,
-                    "error": f"x-cortados-exclude-model: {item} names no model this endpoint serves; "
+                    "error": f"x-cortados-exclude-model: {shown_pin(item)} names no model this endpoint serves; "
                              "the review could not be kept off it"}
         if m and m not in excluded_models:
             excluded_models.append(m)
@@ -623,7 +624,7 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
     # key (what the name means on the served lanes), so neither recheck below can miss a model by spelling.
     excluded_keys = {canonical_model(m) for m in excluded_models} | {model_key(m) for m in excluded_models}
     hit = lambda name: bool({canonical_model(name), model_key(name)} & excluded_keys)
-    names = ", ".join(excluded_models)            # one model: exactly the single-model wording
+    names = ", ".join(shown_pin(m) for m in excluded_models)   # one model: exactly the single-model wording
     pinned = sub_pin(body)
     if pinned and not pin_name_ok(pinned):
         # #117 round 3: the body's model is client text; a pin with a control character (or too long) is refused
@@ -639,14 +640,14 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
             return {"router": execution_routing.ROUTER, "client_error": True, "error": str(exc)}
         if hit(pinned):
             return {"router": execution_routing.ROUTER, "client_error": True,
-                    "error": f"sub/{pinned} is the excluded model (x-cortados-exclude-model); pin another model or use cortados"}
+                    "error": f"sub/{shown_pin(pinned)} is the excluded model (x-cortados-exclude-model); pin another model or use cortados"}
         r = choose_pinned(core, body, pinned, client=client, conversation_id=conversation_id, claude_bin=claude_bin,
                           codex_bin=codex_bin, min_left_pct=min_left_pct, codex_home=codex_home)
         if not r.get("error") and hit(r.get("model")):
             # Defence in depth, as on the S1 path: the review guarantee must hold on what was selected, not only on
             # how the client spelled the pin.
             return {"router": execution_routing.ROUTER,
-                    "error": f"internal: sub/{pinned} resolved to the excluded model {r.get('model')}; refused "
+                    "error": f"internal: sub/{shown_pin(pinned)} resolved to the excluded model {shown_pin(r.get('model'))}; refused "
                              "(x-cortados-exclude-model)"}
         return r
     constraints: dict[str, Any] = {"allowed_routes": list(served_routes(core))}
@@ -662,7 +663,7 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
             if not routes:
                 # Loud beats silent: routing normally could land the review on its builder's model (e.g. a typo'd id).
                 return {"router": execution_routing.ROUTER, "client_error": True,
-                        "error": f"x-cortados-exclude-model: {item} names no model this endpoint serves; "
+                        "error": f"x-cortados-exclude-model: {shown_pin(item)} names no model this endpoint serves; "
                                  "the review could not be kept off it"}
             constraints["excluded_routes"] += [r for r in routes if r not in constraints["excluded_routes"]]
         constraints["notes"] = [f"excluded by client: {names}"]   # select logs it with the route

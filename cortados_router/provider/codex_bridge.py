@@ -404,7 +404,7 @@ class CodexSession:
             raise BridgeError(f"codex app-server did not answer {method} within {timeout:.0f}s")
         if "error" in reply:
             err = reply.get("error") or {}
-            refused = BridgeError(f"codex app-server refused {method}: {log_text(err.get('message'))} "
+            refused = BridgeError(f"codex app-server refused {method}: {log_safe(err.get('message'), 300)} "
                                   f"(code {log_safe(err.get('code'))})")
             # The raw text, for _tool_refusal's parser only (it never goes into a message or log line as it is).
             refused.codex_message = err.get("message") if isinstance(err.get("message"), str) else ""
