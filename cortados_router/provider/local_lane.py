@@ -369,16 +369,20 @@ def _catalog_read(resp) -> bytes | None:
     return _read_capped(resp, CATALOG_MAX)
 
 
-def _send_json(handler, code: int, data: dict[str, Any]) -> None:
+def _send_json(handler, code: int, data: dict[str, Any]) -> bool:
+    """Write one JSON response. True when every byte was handed to the client's socket, False when the client's
+    connection failed on the way (BrokenPipeError, ConnectionResetError, any OSError): a caller that recorded state
+    before this write must treat False as an undelivered answer (#117 review round 7)."""
     raw = json.dumps(data).encode()
     try:
         handler.send_response(code)
         handler.send_header("content-type", "application/json")
         handler.send_header("content-length", str(len(raw)))
         handler.end_headers()
-        handler.wfile.write(raw)
+        handler.wfile.write(raw)                         # unbuffered (socket sendall): a failed send raises here
     except OSError:
-        pass
+        return False
+    return True
 
 
 def _refused(handler, code: int, kind: str, reason: str) -> None:
@@ -443,7 +447,8 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
     the whole reply once, BEFORE the bytes that complete the answer reach the client (the non-streaming body, or the
     SSE event carrying message_stop): the server records the conversation's history there, so a client that
     continues the instant it has the answer always finds it (#117 review round 5). It is called only on a turn that
-    returns "completed" unless a later client write fails; the server then undoes it (the outcome is "incomplete").
+    returns "completed" unless a later client write or flush fails (any OSError, never swallowed after a commit); the
+    server then undoes it (the outcome is "incomplete").
     An error body from the node is relayed with its message escaped and capped (safe_error_body); a successful
     answer's bytes are never altered beyond the model name."""
     reply = [] if reply is None else reply
@@ -540,7 +545,8 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
             complete = isinstance(msg, dict) and msg.get("type") == "message"
             if complete and commit is not None:
                 commit(reply)                                    # recorded before the client can continue from it
-            _send_json(handler, 200, msg)
+            if not _send_json(handler, 200, msg):
+                return "incomplete"                              # the client left: the server undoes the commit
             return "completed" if complete else "incomplete"
         try:
             handler.send_response(200)
@@ -612,7 +618,7 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
         try:
             handler.wfile.flush()
         except OSError:
-            pass
+            return "incomplete"                                  # the end of the answer never reached the client
         return "completed" if done else "incomplete"
     finally:
         conn.close()

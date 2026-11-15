@@ -805,6 +805,63 @@ class LocalConversationPinTests(LocalHarness):
         self.assertIs(real_send, local_lane._send_json)
         self.assertEqual(self.post(self.follow(first, got["content"], "sub/qwen-27b"))["stop_reason"], "tool_use")
 
+    def _client_leaves_on_final_write(self, exc_type, stream):
+        """#117 review round 7: the client's socket fails (an OSError, as a real disconnect raises) on the write that
+        completes the answer: the whole non-streaming body, or the SSE event carrying message_stop. The turn must be
+        undone (history length and awaiting-tool flag as before it), so the client's retry of the same turn continues
+        the same session by exact match: no rebuild, no rebuild budget spent."""
+        first = self.opener("sub/qwen-27b")
+        got = self.post(first)
+        (session,) = self.reg.sessions.values()
+        before = (list(session.history), session.awaiting_tool_result)
+        budget = (session.rebuild_budget.used, session.rebuild_budget.pending)
+        seen = len(FakeOllama.seen)
+
+        class Leaving:                                   # the handler's wfile once the headers are out
+            def __init__(self, real):
+                self._real = real
+
+            def write(self, data):
+                if not stream or b"message_stop" in data:
+                    raise exc_type("the client left")
+                return self._real.write(data)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        real_end = server.Handler.end_headers
+
+        def end_headers(handler):
+            real_end(handler)
+            if not isinstance(handler.wfile, Leaving):
+                handler.wfile = Leaving(handler.wfile)
+        retry = self.follow(first, got["content"], "sub/qwen-27b")
+        with mock.patch.object(server.Handler, "end_headers", end_headers):
+            try:
+                self.post({**retry, "stream": stream})
+            except (OSError, http.client.HTTPException, ValueError):
+                pass                                     # the client saw a cut answer, as after a real disconnect
+        self.assertEqual(len(FakeOllama.seen), seen + 1)                 # the turn did reach the node
+        self.assertEqual(list(self.reg.sessions.values()), [session])
+        self.assertEqual((session.history, session.awaiting_tool_result), before)
+        # The same turn retried: served on the same session by its unchanged history, not rebuilt.
+        self.assertEqual(self.post(retry)["stop_reason"], "tool_use")
+        self.assertEqual(list(self.reg.sessions.values()), [session])
+        self.assertEqual((session.rebuild_budget.used, session.rebuild_budget.pending), budget)
+        self.assertEqual(len(session.history), len(before[0]) + 1)
+
+    def test_a_broken_pipe_on_the_final_body_leaves_the_history_as_it_was(self):
+        self._client_leaves_on_final_write(BrokenPipeError, stream=False)
+
+    def test_a_connection_reset_on_the_final_body_leaves_the_history_as_it_was(self):
+        self._client_leaves_on_final_write(ConnectionResetError, stream=False)
+
+    def test_a_broken_pipe_on_the_streamed_message_stop_leaves_the_history_as_it_was(self):
+        self._client_leaves_on_final_write(BrokenPipeError, stream=True)
+
+    def test_a_connection_reset_on_the_streamed_message_stop_leaves_the_history_as_it_was(self):
+        self._client_leaves_on_final_write(ConnectionResetError, stream=True)
+
     def status_and_body(self, body):
         try:
             return 200, self.post(body)
