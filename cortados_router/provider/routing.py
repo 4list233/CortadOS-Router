@@ -11,7 +11,7 @@ Owner of two rules:
   local pins        `sub/<local model or alias>` names a model a local Ollama node offers (local_lane.py). Local lanes
                     are never in SERVED_PROVIDERS: S1 and core.resolve never see one.
   local admission   local_admission is THE one gate every automatic move to a local lane passes (auto_local,
-                    sensitive_local, refusal_route, the continuation re-check server.py runs on every later turn of a
+                    index_local, sensitive_local, refusal_route, the continuation re-check server.py runs on every later turn of a
                     conversation an automatic rule bound to a local lane): S1 not degraded, a band, `outward` exactly
                     False and `blast_radius` exactly the int 0 or 1. A missing or garbled answer is not admitted.
                     What an admitted turn's local model then proposes is effect_boundary.py's (tool allowlist and
@@ -21,7 +21,14 @@ Owner of two rules:
                     lists, the node answers its probe (on the Pro: AC power + manual switch + gate up) and lists the
                     model, the request fits the model's context, the client did not exclude it, and the request is on
                     /v1/messages. Otherwise S1's
-                    route stands unchanged: a local node is an extra, never a fallback (#75).
+                    route stands unchanged: a local node is an extra, never a fallback (#75). Kept for configs that
+                    set it; the index route below supersedes it.
+  local index route a node model with a published proxy index (model-scores.generated.json → local_models, from
+                    tables/local-models.json) takes the conversation wherever its index for S1's use case clears S1's
+                    required index, like a cloud model (index_local). A local lane spends no quota, so where it
+                    qualifies and its node is available and not busy it wins over S1's cloud choice. Only what
+                    local_admission admits (no outward effect, blast_radius 0 or 1, not degraded, a band), never R3/R4;
+                    an index-bound conversation is an automatic bind, so every continuation is re-checked too.
   sensitive         after S1 has chosen a route, sensitive_local may move a request marked sensitive (the
                     x-cortados-local header, the node's keyword list; a planned S1 signal plugs in at S1_SENSITIVE_ANSWER)
                     to the node's `sensitive.model` in ANY band, but only when S1 says it has no effect outside this
@@ -816,8 +823,7 @@ def local_admission(answers: Any, band: Any, degraded: Any) -> tuple[bool, str]:
 
     Callers: auto_local (a node's auto_route bands), sensitive_local (flag, prefer, keyword, the planned S1 signal),
     refusal_route (a refused opening turn), continuation_admission (every later turn of a conversation an automatic
-    rule bound to a local lane; server.py) and, to come, branch local-published-index's _move_to_local (index-based
-    local candidates). An explicit local pin (`sub/<local model or alias>`) is the client's choice and does not pass
+    rule bound to a local lane; server.py), and index_local / _move_to_local (index-based local candidates). An explicit local pin (`sub/<local model or alias>`) is the client's choice and does not pass
     here. What the gate does not cover is per node and stays with the caller: the node's band list (auto_local), the
     wire (NO_LOCAL_KEY), and _node_why (exclusion, availability, the model listed, the context fit).
 
@@ -1075,15 +1081,14 @@ def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, co
     node in config order that passes wins. A skip leaves `r` exactly as it was, with the reason logged; a broken local
     config skips too (logged as a warning), so a config error never blocks S1 routing. When moved, the routes row S1's
     select wrote is rewritten under the same route_id (_moved), so the record names what will run and loses nothing S1
-    decided."""
+    decided. When no manual auto_route takes it, the published proxy index gets its turn (index_local), behind the
+    same early checks and the same admission."""
     if body.get(NO_LOCAL_KEY) or r.get("degraded") or not r.get("band") or not r.get("route_id"):
         return r
     try:
         targets = local_lane.auto_routes()
     except local_lane.LocalConfigError as exc:
         logger.warning("local auto-route skipped: local config error on node %s: %s", exc.node, exc)
-        return r
-    if not targets:
         return r
     ok, why = route_admission(r)
     if not ok:
@@ -1105,6 +1110,241 @@ def auto_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, co
         _log_moved(core, body, moved, client=client, conversation_id=conversation_id)
         logger.info("local auto-route: %s -> %s/%s (band %s)", r["route_id"], node["lane"], pin, band)
         return moved
+    return index_local(core, body, r, client=client, conversation_id=conversation_id, excluded=excluded)
+    return r
+
+
+def _move_to_local(core, body: dict[str, Any], r: dict[str, Any], node: dict[str, Any], entry: dict[str, Any], *,
+                   client: str, conversation_id: str, rule: str, chosen_extra: dict[str, Any] | None = None
+                   ) -> dict[str, Any]:
+    """S1's route `r` moved to `entry` on `node` for the index route (index_local), or `r` unchanged when the shared
+    local admission gate (route_admission → local_admission) does not admit S1's decision. The gate is applied here,
+    at the move itself, so no index-based path can reach a local lane around it. The move is _moved's record with
+    `chosen_extra` (variant, index, provenance) on the chosen entry, written by _log_moved under the same route_id.
+    The result is not `pinned`: an index-bound conversation is an automatic bind, so server.Handler re-checks every
+    later turn (_local_continuation_refused → continuation_admission)."""
+    ok, why = route_admission(r)
+    if not ok:
+        logger.info("local index route: %s/%s not taken for %s: %s", node["lane"], local_lane.pin_id(entry),
+                    r.get("route_id"), why)
+        return r
+    moved = _moved(r, node, entry, rule, reason="index")
+    if chosen_extra:
+        moved["route"]["chosen"] = {**moved["route"]["chosen"], **chosen_extra}
+    _log_moved(core, body, moved, client=client, conversation_id=conversation_id)
+    logger.info("local index route: %s -> %s/%s (band %s)", r["route_id"], node["lane"], local_lane.pin_id(entry),
+                r.get("band"))
+    return moved
+
+
+def _tag_key(tag: str | None) -> str:
+    """An Ollama tag as the proxy table names it: case-insensitive, `:latest` optional (Ollama's implicit tag)."""
+    t = str(tag or "").strip().casefold()
+    return t[:-len(":latest")] if t.endswith(":latest") else t
+
+
+def _variant_why(body: dict[str, Any], entry: dict[str, Any], v: dict[str, Any], *, asked: bool, room: bool
+                 ) -> str | None:
+    """Why the published-index variant `v` of node model `entry` cannot run this request, or None: the per-request
+    part of the choice, shared by the index route (index_local) and the sensitive routes (choose_variant). Not the
+    index itself: the index route requires it to clear, a sensitive route runs local in any band."""
+    thinking = v.get("thinking")
+    if thinking not in local_lane.VARIANT_THINKING:
+        return f"unknown thinking {thinking!r}"
+    if entry.get("thinking") == "passthrough":
+        return "its node entry is thinking: passthrough, so the variant's thinking cannot be set"
+    if asked and thinking != "on":
+        return "the client asked for thinking: only a thinking variant matches what will run"
+    if thinking == "on" and not room:
+        return f"max_tokens {body.get('max_tokens')!r} < {local_lane.THINK_MIN_MAX_TOKENS}: no room to think and answer"
+    return None
+
+
+def _variant_index(v: dict[str, Any], use_case: str | None) -> Any:
+    idx = v.get("index") or {}
+    return idx.get(use_case, idx.get("general")) if use_case else idx.get("general")
+
+
+def choose_variant(core, body: dict[str, Any], r: dict[str, Any], entry: dict[str, Any]
+                   ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """The node model `entry` for a SENSITIVE route (sensitive_local, refusal_route), with its published-index variant
+    chosen per request by the index route's rules (_variant_why: passthrough, a client that asked for thinking, room in
+    max_tokens), and the chosen-entry extras to record, or (entry, None) when the model has no eligible variant (its
+    own `thinking` setting then applies, as before the index). A sensitive route runs local in any band, so the
+    variant need not clear S1's required index; of the eligible ones it takes what the index route would (the lighter
+    one whose index for S1's use case clears the required index), else the strongest (highest index: the request
+    runs here whatever its band, so it gets the best this model has).
+
+    Budget safeguard, independent of the published scores (review P2, round 2): a client that asked for thinking
+    with max_tokens below local_lane.THINK_MIN_MAX_TOKENS has no variant that qualifies, and its thinking passed
+    through unchanged would leave almost nothing for the answer (a 1900 budget of 2048). Such a request always runs
+    with thinking forced off (`thinking_forced_off`: local_lane._node_body sends {"type": "disabled"}, and the #108
+    empty-answer guard covers the turn) on the non-thinking variant when one is published, and its `variant_why` says
+    which case applied: scores unreadable, a `thinking: passthrough` entry (overridden in this starving case only: a
+    sensitive answer is never starved), no published variant, or no non-thinking variant."""
+    asked = local_lane.client_asked_thinking(body)
+    room = local_lane.think_budget(body.get("max_tokens")) is not None
+    starving = asked and not room
+    route = r.get("route") or {}
+    use_case = (route.get("chosen") or {}).get("use_case")
+    try:
+        variants = (core.model_scores() or {}).get("local_models") or []
+    except Exception as exc:                       # the generated scores unreadable: the model's own setting applies
+        logger.warning("local variant: scores unreadable (%s); %s runs on its own thinking setting",
+                       type(exc).__name__, local_lane.pin_id(entry))
+        if starving:
+            return _forced_off(r, entry, None, use_case, "the published scores are unreadable")
+        return entry, None
+    req = route.get("required_index")
+    ok, matched = [], []
+    for v in variants:
+        if _tag_key(v.get("local_id")) != _tag_key(entry["id"]):
+            continue
+        matched.append(v)
+        why = _variant_why(body, entry, v, asked=asked, room=room)
+        if why:
+            logger.info("local variant: %s not chosen for %s: %s", v.get("family"), r.get("route_id"), why)
+            continue
+        idx = _variant_index(v, use_case)
+        ok.append((float((v.get("index") or {}).get("general") or 0.0), v,
+                   idx if isinstance(idx, (int, float)) else None))
+    if starving:                                   # ok is empty here: every variant wants thinking off or room for it
+        if entry.get("thinking") == "passthrough":
+            return _forced_off(r, entry, None, use_case,
+                               "its node entry is thinking: passthrough, overridden so the answer is not starved")
+        if not matched:
+            return _forced_off(r, entry, None, use_case, "no published variant for this model")
+        off = [v for v in matched if v.get("thinking") == "off"]
+        if not off:
+            return _forced_off(r, entry, None, use_case, "no published non-thinking variant for this model")
+        return _forced_off(r, entry, max(off, key=lambda v: float((v.get("index") or {}).get("general") or 0.0)),
+                           use_case, None)
+    if not ok:
+        return entry, None
+    clears = sorted((o for o in ok if o[2] is not None and isinstance(req, (int, float)) and o[2] >= req),
+                    key=lambda o: o[0])
+    _, v, idx = clears[0] if clears else max(ok, key=lambda o: (o[2] if o[2] is not None else -1.0, o[0]))
+    extra = {"variant": v["family"], "index": idx, "use_case": use_case, "proxy": True,
+             "provenance": v.get("provenance"),
+             "variant_why": "clears the required index" if clears else "the strongest eligible variant"}
+    return {**entry, "variant": v["family"], "variant_thinking": v["thinking"]}, extra
+
+
+FORCED_OFF_WHY = f"thinking requested but max_tokens < {local_lane.THINK_MIN_MAX_TOKENS}: served without thinking"
+
+
+def _forced_off(r: dict[str, Any], entry: dict[str, Any], v: dict[str, Any] | None, use_case: str | None,
+                case: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """choose_variant's budget safeguard: `entry` run with thinking forced off, on the non-thinking variant `v` when
+    there is one, with the chosen-entry extras; `case` (why no variant is named) is appended to the reason."""
+    why = FORCED_OFF_WHY + (f" ({case})" if case else "")
+    logger.info("local variant: %s for %s: %s", v.get("family") if v else local_lane.pin_id(entry), r.get("route_id"),
+                why)
+    run = {**entry, "thinking_forced_off": True}
+    extra: dict[str, Any] = {"thinking_forced_off": True, "variant_why": why}
+    if v:
+        idx = _variant_index(v, use_case)
+        run.update(variant=v["family"], variant_thinking="off")
+        extra.update(variant=v["family"], index=idx if isinstance(idx, (int, float)) else None,
+                     use_case=use_case, proxy=True, provenance=v.get("provenance"))
+    return run, extra
+
+
+def index_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, conversation_id: str,
+                excluded: Callable[[str], bool] = lambda name: False) -> dict[str, Any]:
+    """S1's route `r`, or the same decision moved to a local model variant whose published proxy index clears it
+    (local_models in the generated scores). Called by auto_local after its early checks (wire, degraded scorer, band,
+    route id) and the manual auto_route rule.
+
+    Qualifying is the cloud rule: the variant's index for S1's use case >= S1's required index for this request.
+    Hard rules: the shared local admission gate (route_admission → local_admission: not degraded, a band, outward
+    exactly False, blast_radius exactly 0 or 1), applied before any probe and again in _move_to_local; never R3/R4
+    (local_lane.AUTO_ROUTE_BANDS); and core's face floor does not apply to a local lane
+    (core.resolve exempts local the same way). The think variant needs max_tokens >= local_lane.THINK_MIN_MAX_TOKENS;
+    a client that asked for thinking gets only the think variant (its turn thinks either way).
+    Cost: a local lane spends no subscription quota (core.resolve's weight for local is 0), so a qualifying variant
+    wins over S1's cloud choice, the lighter variant first (lower general index: the selection's "pay by general
+    index" — the non-thinking variant also answers sooner). It is not taken when its node is busy
+    (local_lane.busy), down, does not list the model, the request outgrows the model's context, or the client excluded
+    the model; then S1's route stands, with the skip logged (metadata only)."""
+    route = r.get("route") or {}
+    rid = r.get("route_id")
+    skip = lambda what, why: logger.info("local index route: %s not taken for %s: %s", what, rid, why)
+    band = r.get("band")
+    req = route.get("required_index")
+    use_case = (route.get("chosen") or {}).get("use_case")
+    if band not in local_lane.AUTO_ROUTE_BANDS:
+        return r                                   # R3/R4: outward, blast-radius-3 or escalation work never runs local
+    ok, why = route_admission(r)                   # the shared gate, before any probe (_move_to_local applies it again)
+    if not ok:
+        skip("every local variant", why)
+        return r
+    if not isinstance(req, (int, float)) or not use_case:
+        return r                                   # an unscored (table-fallback) route has no index to clear
+    variants = (core.model_scores() or {}).get("local_models") or []
+    if not variants:
+        return r
+    try:
+        nodes = [n for n in local_lane.nodes() if n.get("index_route")]
+    except local_lane.LocalConfigError as exc:
+        logger.warning("local index route skipped: local config error on node %s: %s", exc.node, exc)
+        return r
+    asked = local_lane.client_asked_thinking(body)
+    room = local_lane.think_budget(body.get("max_tokens")) is not None
+    offers = []
+    for n_i, node in enumerate(nodes):
+        for e_i, entry in enumerate(node["models"]):
+            for v in variants:
+                if _tag_key(v.get("local_id")) != _tag_key(entry["id"]):
+                    continue
+                name = v.get("family")
+                idx = _variant_index(v, use_case)
+                why = _variant_why(body, entry, v, asked=asked, room=room)
+                if why is None and (not isinstance(idx, (int, float)) or idx < req):
+                    why = f"{use_case} index {idx} < required {req}"
+                if why:
+                    skip(f"{node['lane']}/{name}", why)
+                    continue
+                offers.append((float((v.get("index") or {}).get("general") or 0.0), n_i, e_i, node, entry, v, idx))
+    offers.sort(key=lambda o: o[:3])
+    need = None
+    for _, _, _, node, entry, v, idx in offers:
+        name, pin = v["family"], local_lane.pin_id(entry)
+        what = f"{node['lane']}/{name}"
+        if excluded(entry["id"]) or excluded(pin) or excluded(name):
+            skip(what, "excluded by the client (x-cortados-exclude-model)")
+            continue
+        if _auto_down.get(node["node"], 0.0) > _now():
+            skip(what, "probe failed within the last %gs" % AUTO_DOWN_S)
+            continue
+        if local_lane.busy(node):
+            skip(what, f"node busy ({local_lane.inflight(node)} turn(s) in flight, max_inflight "
+                       f"{node.get('max_inflight')})")
+            continue
+        try:
+            tags = local_lane.probe(node)
+        except local_lane.LocalUnavailable as exc:
+            _auto_down[node["node"]] = _now() + AUTO_DOWN_S
+            gate = str(exc) == local_lane.GATE_REFUSED.format(node=node["node"])
+            logger.log(logging.WARNING if gate else logging.INFO,
+                       "local index route: %s not taken for %s: unavailable (%s)", what, rid, exc)
+            continue
+        _auto_down.pop(node["node"], None)
+        if entry["id"] not in tags:
+            skip(what, f"does not list {entry['id']}")
+            continue
+        need = int(request_fit(body)["input_tokens"]) if need is None else need
+        if need > entry["context_length"]:
+            skip(what, f"request ≈{need // 1000}k tokens exceeds its {entry['context_length'] // 1000}k context")
+            continue
+        chosen = route.get("chosen") or {}
+        rule = (f"local index route: {name} {use_case} index {idx} ({v.get('provenance')}, {v.get('published')}) "
+                f"clears the required {req}; a local lane spends no quota, so it is taken instead of "
+                f"{r.get('provider')}/{r.get('model')} (cost {chosen.get('cost')})")
+        return _move_to_local(core, body, r, node, {**entry, "variant": name, "variant_thinking": v["thinking"]},
+                              client=client, conversation_id=conversation_id, rule=rule,
+                              chosen_extra={"variant": name, "index": idx, "use_case": use_case, "proxy": True,
+                                            "provenance": v.get("provenance"), "weight": 0.0, "cost": 0.0})
     return r
 
 
@@ -1214,10 +1454,14 @@ def sensitive_local(core, body: dict[str, Any], r: dict[str, Any], *, client: st
                        _rule_label(rule), node["lane"], local_lane.pin_id(entry), rid, why)
             continue
         pin = local_lane.pin_id(entry)
-        moved = _moved(r, node, entry,
-                       f"{_rule_label(rule)}: no outward effect and {node['lane']} is available; {pin} instead of "
+        run_entry, extra = choose_variant(core, body, r, entry)
+        moved = _moved(r, node, run_entry,
+                       f"{_rule_label(rule)}: no outward effect and {node['lane']} is available; {pin}"
+                       f"{' (' + extra['variant'] + ')' if extra and extra.get('variant') else ''} instead of "
                        f"{r.get('provider')}/{r.get('model')} (band {r.get('band')})",
                        reason=TRIGGER_REASONS.get(rule, rule))
+        if extra:
+            moved["route"]["chosen"] = {**moved["route"]["chosen"], **extra}
         _log_moved(core, body, moved, client=client, conversation_id=conversation_id)
         logger.info("%s: %s -> %s/%s (band %s)", _rule_label(rule), rid, node["lane"], pin, r.get("band"))
         return moved
@@ -1261,10 +1505,14 @@ def refusal_route(core, body: dict[str, Any], route: dict[str, Any] | None,
         pin = local_lane.pin_id(entry)
         why, gate_refused = _node_why(node, entry, body, lambda name: False, need)   # exclusions applied when routed
         if why is None:
-            moved = _moved(route, node, entry,
+            run_entry, extra = choose_variant(core, body, route, entry)
+            moved = _moved(route, node, run_entry,
                            f"sensitive: refusal: {route.get('provider')}/{route.get('model')} refused the opening "
-                           f"turn; no outward effect and {node['lane']} is available; {pin} instead "
+                           f"turn; no outward effect and {node['lane']} is available; {pin}"
+                           f"{' (' + extra['variant'] + ')' if extra and extra.get('variant') else ''} instead "
                            f"(band {route.get('band')})", reason="refusal")
+            if extra:
+                moved["route"]["chosen"] = {**moved["route"]["chosen"], **extra}
             moved.pop("refusal_fallback", None)
             if run(moved):
                 _log_moved(core, body, moved, client=marker.get("client") or "",

@@ -181,6 +181,8 @@ The hard rules come first and cannot be out-voted (`core.resolve`):
 
 **Required index.** The router interpolates the required index over `D` through knots pinned to reference models (D = 3 / 6 / 9 / 11 / 12), and never below the reference of the band the hard rules chose. Each model has a per-use-case index in `tables/model-scores.generated.json`, built nightly by `tables/benchmarks/build_tiers.py` from public benchmarks (Epoch AI, LiveBench, Aider, SWE-bench, LMArena, Artificial Analysis) weighted by `tables/use-cases.json`, plus a bounded community-sentiment nudge.
 
+**Local models in the table.** A model on the owner's Ollama node has no published scores, so `tables/local-models.json` (`index_proxies`) names its published base model and a deduction, and the builder writes a proxy index (base family index × (1 − deduct), `proxy: true`, with its provenance) to the generated file's separate `local_models` list. Today: `Qwen27b_heretic` as `qwen-27b` (thinking off; Qwen3.8 27B non-reasoning −10 %) and `qwen-27b-think` (thinking on; Qwen3.8 27B reasoning −10 %, only when `max_tokens` ≥ 4096). The provider places a variant wherever it clears S1's required index (never outward, blast-radius-3, R3/R4 or degraded work; not while its node is busy or unavailable); a local lane spends no quota, so it wins where it qualifies. `docs/LOCAL-RESOURCES.md`, "Local models in selection (published proxy index)".
+
 **Cost.**
 
 ```
@@ -431,17 +433,23 @@ Local chat models run on the Pro only (#75; the Studio runs S1 and no chat model
 provider as pins: `claude --model sub/qwen-27b` relays each turn to the Pro's Ollama Messages API. With the node's
 `auto_route` set (`{"model": …, "bands": ["R0"]}`; off by default, no default band, never R3/R4), a new S1-routed
 conversation in a listed band moves to that model while the Pro is available (AC + switch on + gate up), and keeps
-S1's route otherwise (`routing.auto_local`; S1 and `core.resolve` never see a local lane). With a `sensitive` section,
+S1's route otherwise (`routing.auto_local`; S1 and `core.resolve` never see a local lane). That manual rule is
+superseded by the published proxy index: a model with one (today `Qwen27b_heretic`, as `qwen-27b` and
+`qwen-27b-think`) takes a new S1-routed conversation wherever its index clears the required index and the node is
+available and not busy (`routing.index_local`; the node's `index_route`, on by default; `max_inflight` turns at once).
+With a `sensitive` section,
 requests flagged `x-cortados-local: sensitive`, matching the owner's keyword list, or refused by a Claude lane on their
 opening turn move to the node's sensitive model in any band, only when S1 says they have no effect outside the machine
-(`docs/LOCAL-RESOURCES.md`, "Sensitive requests"; one shared gate, `routing.local_admission`). Every later turn of a
-conversation an automatic rule bound to a local lane is rescored by S1 first and refused with a terminal 400 when it
+(`docs/LOCAL-RESOURCES.md`, "Sensitive requests"), on the published-index variant chosen per request as the index route
+chooses it (`routing.choose_variant`: the lighter variant that clears the required index, else the strongest eligible).
+Every automatic move (auto route, index route, sensitive) passes one shared gate, `routing.local_admission`. Every
+later turn of a conversation an automatic rule bound to a local lane (the index route included) is rescored by S1 first and refused with a terminal 400 when it
 may have an outward effect (the latest user words and any new tool results are scored); an explicit `sub/` local pin is
 not rescored. Every automatic-local turn also passes the effect boundary (`provider/effect_boundary.py`), whose
 profile follows WHY the conversation is local (the route's `bind_reason`, kept on every continuation; owner decision
 2026-11-14). **Sensitive routes** (the sensitive flag, `prefer`, the keyword list, the refusal fallback) get no shell
 at all: the node is offered Read, Glob, Grep, LS, NotebookRead, Edit, MultiEdit, Write, NotebookEdit, TodoWrite and
-ExitPlanMode only. **Cost routes** (R0 `auto_route`, and the published-score index route when it lands) also keep
+ExitPlanMode only. **Cost routes** (R0 `auto_route` and the published-score index route) also keep
 Bash, BashOutput, KillShell and KillBash, and every Bash command is checked against a pattern list (git push and git
 config/aliases, curl uploads, gh writes, ssh, publish, sendmail, interpreter network one-liners, pipes into a shell,
 eval of a substitution, launchctl/crontab, symlinks, writes to hooks and startup files, ...). **That pattern list is

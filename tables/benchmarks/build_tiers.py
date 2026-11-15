@@ -11,7 +11,14 @@ Method (all knobs live in routing-table.json → "tiering"):
     are the models the 2.0 table already ruled into each band (haiku / sonnet / opus / fable class), so "R3" keeps meaning "Opus-class or better"
     while WHICH models are Opus-class is decided by the numbers, and changes when the numbers change.
  4. Reach: a ranked family becomes candidates only through subscriptions that can actually run it (tables/inventory/*).
- Families with no public score stay unranked (never routed by this file); Cursor-branded Grok borrows plain Grok's score, flagged proxy."""
+ Families with no public score stay unranked (never routed by this file); Cursor-branded Grok borrows plain Grok's score, flagged proxy.
+ 5. Local models (tables/local-models.json → index_proxies): a model on the owner's Ollama node has no published scores of its own, so each
+    variant borrows the index of its PUBLISHED base model's family, minus a stated deduction (quantisation, abliteration), flagged proxy with
+    its provenance. They go to "local_models" (never "models": no cloud consumer sees them); provider/routing.py places them.
+
+ --keep-sentiment: rebuild from the committed community-sentiment.json instead of re-folding claims.jsonl. Reason: the fold keeps only
+ the last 30 days of claims by the CLOCK, so a rebuild on a later day changes cloud indexes although no input changed; a change that
+ only adds local entries must not carry that drift (local-published-index, 2026-11-13)."""
 from __future__ import annotations
 
 import csv
@@ -131,7 +138,53 @@ def reach() -> dict[str, list[dict]]:
     return out
 
 
-def main() -> int:
+LOCAL_THINKING = ("off", "on")
+
+
+def local_proxies(overall: dict, n_obs: dict, index, use_cases: list[str], min_benchmarks: int) -> tuple[list[dict], list[dict]]:
+    """(ranked, unranked) local model variants from tables/local-models.json's index_proxies. A variant's index on every use case is its
+    published base family's index × (1 − deduct). A variant whose base is not in the fit (or has too few benchmarks), or whose entry is
+    malformed, is never given a made-up index: it is listed in `unranked` with the reason and printed, and the cloud build goes on."""
+    try:
+        cfg = (json.loads((ROUTER / "local-models.json").read_text()).get("index_proxies") or {})
+    except (OSError, ValueError) as exc:
+        print("local index proxies unavailable:", exc, file=sys.stderr)
+        return [], [{"family": None, "why": f"tables/local-models.json unreadable: {exc}"}]
+    ranked, unranked, seen = [], [], set()
+    for v in cfg.get("variants") or []:
+        name, mid = str(v.get("variant") or "").strip(), str(v.get("id") or "").strip()
+        pub, thinking, deduct = str(v.get("published") or "").strip(), v.get("thinking"), v.get("deduct")
+        why = None
+        if not name or not mid or not pub:
+            why = "a variant needs `variant`, `id` (the Ollama tag) and `published` (the base model's name in scores.csv)"
+        elif name in seen:
+            why = f"variant {name!r} is listed twice"
+        elif thinking not in LOCAL_THINKING:
+            why = f"thinking must be one of {LOCAL_THINKING}, got {thinking!r}"
+        elif isinstance(deduct, bool) or not isinstance(deduct, (int, float)) or not 0 <= deduct < 1:
+            why = f"deduct must be a fraction in [0, 1), got {deduct!r}"
+        elif family(pub) not in overall:
+            why = f"published base model {pub!r} (family {family(pub)!r}) has no benchmark scores in scores.csv"
+        elif n_obs[family(pub)] < min_benchmarks:
+            why = f"published base model {pub!r} has {n_obs[family(pub)]} benchmarks (< {min_benchmarks})"
+        if why:
+            print(f"local variant {name or mid or '?'} unranked: {why}", file=sys.stderr)
+            unranked.append({"family": name or None, "local_id": mid or None, "why": why})
+            continue
+        seen.add(name)
+        fam = family(pub)
+        base = {u: index(u, fam) for u in use_cases}
+        ranked.append({"family": name, "local_id": mid, "thinking": thinking, "proxy": True,
+                       "provenance": f"proxy: published base model, \u2212{round(100 * deduct, 1):g}%",
+                       "published": pub, "published_family": fam, "deduct": deduct, "benchmarks": n_obs[fam], "ceiling": False,
+                       "base_index": base, "index": {u: round(x * (1 - deduct), 1) for u, x in base.items()},
+                       "reach": [{"lane": "local", "provider": "ollama", "model": mid}]})
+    return ranked, unranked
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    keep_sentiment = "--keep-sentiment" in argv
     table = json.loads((ROUTER / "routing-table.json").read_text())
     cfg = table.get("tiering") or {}
     refs = cfg.get("band_references") or {}
@@ -155,12 +208,19 @@ def main() -> int:
             evidence[u][f] = n
     top = {u: max(v.values()) for u, v in ability.items()}
     # community sentiment (tables/community/SPEC.md): a bounded nudge per (family, use case), applied to the use-case index only
-    try:
-        import importlib.util as _ilu
-        _sp = _ilu.spec_from_file_location("fold_sentiment", str(ROUTER / "community/fold_sentiment.py")); _fs = _ilu.module_from_spec(_sp); _sp.loader.exec_module(_fs)
-        sentiment = _fs.fold().get("adjustments") or {}
-    except Exception as exc:
-        print("community sentiment unavailable:", exc, file=sys.stderr); sentiment = {}
+    if keep_sentiment:
+        try:
+            sentiment = json.loads((ROUTER / "community-sentiment.json").read_text()).get("adjustments") or {}
+        except (OSError, ValueError) as exc:
+            print("--keep-sentiment: community-sentiment.json unreadable:", exc, file=sys.stderr)
+            return 1
+    else:
+        try:
+            import importlib.util as _ilu
+            _sp = _ilu.spec_from_file_location("fold_sentiment", str(ROUTER / "community/fold_sentiment.py")); _fs = _ilu.module_from_spec(_sp); _sp.loader.exec_module(_fs)
+            sentiment = _fs.fold().get("adjustments") or {}
+        except Exception as exc:
+            print("community sentiment unavailable:", exc, file=sys.stderr); sentiment = {}
     def index(u, f):
         raw = 100.0 * ability[u][f] / top[u]
         nudge = ((sentiment.get(f) or {}).get(u) or {}).get("points", 0.0) if u != "general" else 0.0
@@ -223,15 +283,20 @@ def main() -> int:
                        "index": {u: index(u, f) for u in ability}, "use_case_benchmarks": {u: evidence[u][f] for u in evidence}, "reach": x["reach"]})
     scored.sort(key=lambda m: -m["index"]["general"])
     refs_index = {b: {u: min(index(u, family(m)) for m in ms) for u in ability} for b, ms in refs.items()}
+    local_ranked, local_unranked = local_proxies(overall, n_obs, index, list(ability), cfg.get("min_benchmarks", 3))
     (ROUTER / "model-scores.generated.json").write_text(json.dumps({
         "generated": time.strftime("%Y-%m-%d %H:%M"), "scale": "index 100 = best published model on that use case (any vendor, reachable or not); from public benchmarks only",
         "use_cases": {u: v["what"] for u, v in uc["use_cases"].items()}, "use_case_benchmarks_missing_from_data": unknown,
-        "reference_index": refs_index, "models": scored, "unranked": [{"family": x["family"], "reach": x["reach"]} for x in fams if x.get("band") is None]}, indent=1))
+        "reference_index": refs_index, "models": scored, "unranked": [{"family": x["family"], "reach": x["reach"]} for x in fams if x.get("band") is None],
+        "local_models": local_ranked, "local_unranked": local_unranked}, indent=1))
     cols = ["general", *uc["use_cases"]]
     print("index per use case (100 = best published model) · price $/1M blended · tok/s:\n  " + "family".ljust(24) + "".join(c[:8].rjust(9) for c in cols) + "    $/1M   tok/s   lanes")
     for m in scored:
         print("  " + m["family"].ljust(24) + "".join(str(m["index"][c]).rjust(9) for c in cols) + f"  {m['price_1m_blended_usd'] if m['price_1m_blended_usd'] is not None else '?':>6} {m['tokens_per_s'] if m['tokens_per_s'] is not None else '?':>6}   "
               + ",".join(sorted({r["lane"] for r in m["reach"]})) + ("  ceiling" if m["ceiling"] else "") + ("  proxy" if m["proxy"] else ""))
+    for m in local_ranked:
+        print("  " + m["family"].ljust(24) + "".join(str(m["index"][c]).rjust(9) for c in cols) + f"  {'0':>6} {'?':>6}   local  proxy "
+              + f"({m['published']} {m['provenance'].split(', ')[-1]})")
     if unknown:
         print("use-case benchmarks not in the data:", unknown)
     out = {"generated": time.strftime("%Y-%m-%d %H:%M"), "method": "per-benchmark min-max → logit → additive ability/difficulty fit over all published models, ridge-shrunk; floors = midpoints between band reference abilities",

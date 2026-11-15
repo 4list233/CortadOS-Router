@@ -348,7 +348,9 @@ class InstallTest(unittest.TestCase):
         self.assertEqual((pl["WorkingDirectory"], pl["StartInterval"]), (str(REPO), 60))
         self.assertEqual(set(pl["EnvironmentVariables"]), {"PATH"})
         self.assertNotIn(TOKEN, raw)
-        self.assertNotIn("__", raw)
+        # No template placeholder (__NAME__) is left. The random temp HOME may itself contain "__" (mkdtemp's suffix
+        # draws from [a-z0-9_], e.g. tmp__4xkc36), so it is taken out before the check.
+        self.assertNotIn("__", raw.replace(str(self.home), "<HOME>"))
         uid = os.getuid()
         self.assertEqual(self.calls(), ["list", f"bootout gui/{uid}/com.cortados.live-heartbeat",
                                         f"bootstrap gui/{uid} {plist_path}"])

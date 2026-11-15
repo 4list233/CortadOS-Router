@@ -30,8 +30,9 @@ R3_ROUTE = {**S1_ROUTE, "band": "R3", "provider": "claude-cli", "model": "claude
                       "chosen": {"lane": "claude", "provider": "claude-cli", "model": "claude-opus-test"}}}
 
 
-def write_config(directory, base_url, sensitive=None, auto_route=False, keywords=None):
-    """test_provider_local's config (node `pro`, qwen-27b + phi), plus a `sensitive` section and a keyword file."""
+def write_config(directory, base_url, sensitive=None, auto_route=False, keywords=None, thinking=None):
+    """test_provider_local's config (node `pro`, qwen-27b + phi), plus a `sensitive` section and a keyword file;
+    `thinking` sets qwen-27b's entry `thinking` (e.g. "passthrough")."""
     kw_file = Path(directory) / "keywords.txt"
     if keywords is not None:
         kw_file.write_text(keywords)
@@ -40,7 +41,8 @@ def write_config(directory, base_url, sensitive=None, auto_route=False, keywords
     cfg = {"nodes": [{"id": "pro", "ollama": {
         "base_url_env": "TEST_LOCAL_PRO_URL", "auto_route": auto_route, "probe_timeout_s": 1, "connect_timeout_s": 1,
         "read_timeout_s": 5, **({"sensitive": sensitive} if sensitive is not None else {}),
-        "models": [{"id": TAG, "alias": "qwen-27b", "name": "Qwen 27B", "context_length": 32768},
+        "models": [{"id": TAG, "alias": "qwen-27b", "name": "Qwen 27B", "context_length": 32768,
+                    **({"thinking": thinking} if thinking else {})},
                    {"id": "phi:latest"}]}}]}
     p = Path(directory) / "resources.json"
     p.write_text(json.dumps(cfg))

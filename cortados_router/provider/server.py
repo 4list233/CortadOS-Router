@@ -2458,8 +2458,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _local_continuation_refused(self, session: "LocalSession", body: dict[str, Any], wire: Wire) -> bool:
         """The continuation re-check (docs/LOCAL-RESOURCES.md "Continuations of a local-bound conversation"): a
-        conversation an AUTOMATIC rule bound to a local lane (auto_route, the sensitive flag / prefer / keyword, the
-        refusal fallback; route not `pinned`) is rescored by S1 on every later turn (Registry.local_recheck →
+        conversation an AUTOMATIC rule bound to a local lane (auto_route, the published-index route, the sensitive flag /
+        prefer / keyword, the refusal fallback; route not `pinned`) is rescored by S1 on every later turn (Registry.local_recheck →
         routing.continuation_admission → routing.local_admission) before anything reaches the node. An explicit local
         pin (`sub/<local model or alias>`) is the client's own choice and is not rescored.
 

@@ -1,7 +1,7 @@
 """The effect boundary of AUTOMATICALLY local-routed turns (docs/LOCAL-RESOURCES.md "Effect boundary").
 
 Owner policy (Forest): a request may reach a local uncensored model automatically (R0 auto_route, the sensitive flag,
-prefer, keyword, the refusal fallback, and the published index when it lands) only when the work has no effect outside
+prefer, keyword, the refusal fallback, and the published index route) only when the work has no effect outside
 the Pro. local_admission scores the request; scoring alone cannot stop a model from escalating beyond what was asked
 ("draft it, do not send" answered with a send_email call). So every automatic-local turn also passes this boundary:
 
@@ -82,7 +82,7 @@ BIND_PROFILES: dict[str, str] = {
     "refusal": SENSITIVE,            # a cloud model refused the opening turn
     "prefer": COST,                  # x-cortados-local: prefer: local because it is cheaper (owner decision 2026-11-14)
     "auto_route": COST,              # R0 auto_route: local because it is cheaper, not because it is sensitive
-    "index": COST,                   # the published-score index route (branch local-published-index)
+    "index": COST,                   # the published-score index route (routing._move_to_local)
 }
 
 
