@@ -734,6 +734,10 @@ _OID_RE = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
 # _operation_state checks both ways: os.path.lexists() of each canonical name (the filesystem applies its own case
 # rules) and a casefold scan of the listing (any variant, whatever the filesystem). On a case-sensitive filesystem a
 # variant git would not read still holds: a false hold costs a folder.
+# Round 10 audit: every other comparison of an on-disk name with a git-defined one does the same: the reflog reader's
+# logs/ (casefold, review of round 9, P1), the snapshot's own top-level .git (the same entry, _is_own_dotgit), and the
+# admin dir's .git/worktrees in _clone_of_admin and _AdminDir (_same_dir). Names opened by their canonical path
+# (ORIG_HEAD, PRIVATE_PSEUDOREFS, refs/, index) are resolved by the filesystem itself; ref names git reports are exact.
 OPERATION_STATE_DIRS = ("rebase-merge", "rebase-apply", "sequencer", "NOTES_MERGE_WORKTREE")
 OPERATION_STATE_FILES = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "BISECT_LOG")
 OPERATION_STATE_PREFIXES = ("BISECT_", "NOTES_MERGE_")
@@ -964,9 +968,15 @@ def _recovery_candidates(path: str, gitdir: str, deadline=None):
     orig = _read_orig_head(gitdir)                   # None only when missing; unreadable or malformed raises
     logged, budget = [], REFLOG_MAX_BYTES
     for rel, full in _op_state_files(gitdir, deadline):
-        if rel == "logs":                            # not a directory (a file, a symlink): its reflogs are unknown
-            raise StateUnreadableError("the worktree's logs/ is not a directory")
-        if not rel.startswith("logs/") or rel.endswith("/"):
+        # Review 9 of the round-9 fix, P1: _op_state_files lists logs/ as it is on disk, and git on a case-insensitive
+        # filesystem writes HEAD's reflog into Logs/HEAD; a case-sensitive "logs/" check read no reflog there and the
+        # cleanup deleted a commit only that reflog reached. The first component matches in any letter case.
+        top, sep, _ = rel.partition("/")
+        if top.casefold() != "logs":
+            continue
+        if not sep:                                  # not a directory (a file, a symlink): its reflogs are unknown
+            raise StateUnreadableError(f"the worktree's {top}/ is not a directory")
+        if rel.endswith("/"):
             continue
         data = _read_capped(full, budget)
         budget -= len(data)
@@ -1232,6 +1242,33 @@ class _Snap(tuple):
         return eq if eq is NotImplemented else not eq
 
 
+def _is_own_dotgit(path: str, name: str) -> bool:
+    """Whether the top-level entry `name` of the worktree `path` is its own .git, as the filesystem resolves the name:
+    ".git" itself, or a case variant (.GIT on a case-insensitive filesystem, where `git worktree repair` rewrites it
+    in place) that is the very entry path/.git opens. A variant beside a distinct .git (a case-sensitive filesystem)
+    is not, and stays in the snapshot."""
+    if name == ".git":
+        return True
+    if not _is_git_meta(name):
+        return False
+    try:
+        return os.path.samestat(os.lstat(os.path.join(path, name)), os.lstat(os.path.join(path, ".git")))
+    except OSError:
+        return False
+
+
+def _same_dir(a: str, b: str) -> bool:
+    """_same_path, or both name one existing directory as the filesystem resolves them (a case variant of a git
+    directory name on a case-insensitive filesystem)."""
+    if _same_path(a, b):
+        return True
+    try:
+        sa, sb = os.stat(a), os.stat(b)
+    except OSError:
+        return False
+    return stat.S_ISDIR(sa.st_mode) and os.path.samestat(sa, sb)
+
+
 def _snapshot(path: str, deadline=None, git: bool = True) -> "_Snap":
     """What a late writer would change: (files, git state). `files` holds (relative path, type, size, mtime_ns,
     ctime_ns, inode) for every entry outside the regenerable caches (directories by name only, so a cache file's
@@ -1250,8 +1287,8 @@ def _snapshot(path: str, deadline=None, git: bool = True) -> "_Snap":
         _check_deadline(deadline, "snapshot the worktree")
         base = os.path.relpath(directory, path)
         if base == ".":
-            dirs[:] = [n for n in dirs if n != ".git"]
-            files = [n for n in files if n != ".git"]
+            dirs[:] = [n for n in dirs if not _is_own_dotgit(path, n)]
+            files = [n for n in files if not _is_own_dotgit(path, n)]
         real_dirs = []
         for name in dirs:
             (files if os.path.islink(os.path.join(directory, name)) else real_dirs).append(name)
@@ -1729,7 +1766,11 @@ def _clone_of_admin(admin: str, root: str):
     worktrees = os.path.dirname(admin)
     dot_git = os.path.dirname(worktrees)
     clone = os.path.dirname(dot_git)
-    if os.path.basename(worktrees) != "worktrees" or os.path.basename(dot_git) != ".git":
+    # Any letter case, when it is the clone's own .git/worktrees as the filesystem resolves it (round 10 audit).
+    if os.path.basename(worktrees).casefold() != "worktrees" or os.path.basename(dot_git).casefold() != ".git":
+        return None
+    if (os.path.basename(worktrees), os.path.basename(dot_git)) != ("worktrees", ".git") \
+            and not _same_dir(worktrees, os.path.join(clone, ".git", "worktrees")):
         return None
     if not _same_path(os.path.dirname(clone), os.path.join(root, "repos")):
         return None
@@ -1937,7 +1978,7 @@ class _AdminDir:
             admin = None if text is None else _parse_gitfile(text, path)
             if admin is None:
                 raise WorkspaceError(f"{path} has no readable .git file naming its admin dir")
-            if not _same_path(os.path.dirname(admin), os.path.join(repo_dir, ".git", "worktrees")):
+            if not _same_dir(os.path.dirname(admin), os.path.join(repo_dir, ".git", "worktrees")):
                 raise WorkspaceError(f"{path}'s admin dir {admin} is not inside {repo_dir}/.git/worktrees")
             self.name = os.path.basename(admin)
             if self.name in ("", ".", "..") or "/" in self.name:

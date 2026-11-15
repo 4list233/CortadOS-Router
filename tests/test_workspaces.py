@@ -2647,6 +2647,112 @@ class OperationStateAndRecoveryTests(_Base):
         self.assertEqual((rec["state"], rec["recovery_refs"]), ("archived", 0), rec)
         self.assertEqual(self.recovery(), {})
 
+    # --- round 10 audit: every git-defined name matches the way the filesystem resolves it ------------------------
+
+    def case_insensitive(self):
+        probe = os.path.join(self.tmp, "CaseProbe10")
+        os.makedirs(probe, exist_ok=True)
+        return os.path.exists(os.path.join(self.tmp, "caseprobe10"))
+
+    def test_a_reflog_dir_in_another_case_keeps_its_recovery_ref_through_the_cleanup(self):
+        """Review of round 9 (gpt-6.1-sol), P1, the reviewer's reproduction in real git: _op_state_files listed
+        Logs/HEAD, the reflog reader kept only "logs/", so a commit only HEAD's reflog reached got no recovery ref and
+        the cleanup deleted it."""
+        if not self.case_insensitive():
+            self.skipTest("the temp filesystem is case-sensitive: git would not write HEAD's reflog into Logs/ here "
+                          "(the casefold reader is covered by test_the_reflog_reader_matches_logs_in_any_case)")
+        rec = self.prepare(repo=self.origin, branch="feature")
+        path = rec["path"]
+        published = self.head(path)
+        git("checkout", "-q", "--detach", cwd=path)
+        secret = self.commit(path, "secret.txt", "only the reflog has me\n")
+        git("reset", "-q", "--hard", published, cwd=path)
+        git("reset", "-q", "--hard", published, cwd=path)        # ORIG_HEAD is the published commit now
+        gitdir = self.gitdir(path)
+        with open(os.path.join(gitdir, "ORIG_HEAD")) as f:
+            self.assertEqual(f.read().strip(), published)
+        os.rename(os.path.join(gitdir, "logs"), os.path.join(gitdir, "Logs"))
+        self.assertIn("Logs", os.listdir(gitdir))
+        self.assertIn(secret, git("reflog", "--format=%H", "HEAD", cwd=path))   # git still reads it
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["recovery_refs"]), ("archived", 1), settled)
+        day = time.strftime("%Y%m%d", time.gmtime())
+        self.assertEqual(self.recovery(), {f"{ws.RECOVERY_REF_PREFIX}{day}/{TID}/reflog-1": secret})
+        self.age(settled)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual((report["deleted"], report["errors"]), ([TID], []), report)
+        clone = os.path.join(self.root, "repos", "demo")
+        git("-c", "gc.pruneExpire=now", "gc", "-q", "--prune=now", cwd=clone)
+        self.assertEqual(git("cat-file", "-t", secret, cwd=clone).strip(), "commit")
+        self.assertTrue(any(self.reachable(secret, ref) for ref in self.recovery()))
+
+    def test_the_reflog_reader_matches_logs_in_any_case(self):
+        """Any filesystem: a plain directory standing in for the git dir. A case variant of logs/ is read, and a
+        non-directory in its place, in any case, holds (its reflogs are unknown)."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        sha = self.head(rec["path"])
+        gitdir = os.path.join(self.tmp, "fake-gitdir")
+        os.makedirs(os.path.join(gitdir, "LoGs", "refs", "heads"))
+        line = f"{'0' * 40} {sha} t <t@x> 1 +0000\tcommit\n"
+        for rel in (("LoGs", "HEAD"), ("LoGs", "refs", "heads", "x")):
+            with open(os.path.join(gitdir, *rel), "w") as f:
+                f.write(line)
+        orig, logged = ws._recovery_candidates(rec["path"], gitdir)
+        self.assertEqual((orig, logged), (None, [sha, sha]))
+        shutil.rmtree(os.path.join(gitdir, "LoGs"))
+        with open(os.path.join(gitdir, "LOGS"), "w") as f:
+            f.write("not a directory\n")
+        with self.assertRaises(ws.StateUnreadableError) as cm:
+            ws._recovery_candidates(rec["path"], gitdir)
+        self.assertIn("LOGS/ is not a directory", str(cm.exception))
+
+    def test_the_snapshot_leaves_out_the_worktrees_own_dot_git_in_any_case_and_nothing_else(self):
+        """_snapshot leaves out the worktree's own top-level .git (`git worktree repair` rewrites it after a move). A
+        case variant that IS that entry (case-insensitive filesystem) is left out too; one beside a distinct .git
+        (case-sensitive filesystem) is a separate entry and stays in."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        path = rec["path"]
+        if self.case_insensitive():
+            os.rename(os.path.join(path, ".git"), os.path.join(path, ".GIT"))
+            self.assertIn(".GIT", os.listdir(path))
+            self.assertTrue(ws._is_own_dotgit(path, ".GIT"))
+            files = {e[0] for e in ws._snapshot(path, git=False)[0]}
+            self.assertNotIn(".GIT", files)
+            self.assertEqual(ws._snapshot(path)[1]["head"], self.head(path))   # git still opens it
+        else:
+            os.makedirs(os.path.join(path, ".GIT"))
+            self.assertFalse(ws._is_own_dotgit(path, ".GIT"))
+            files = {e[0] for e in ws._snapshot(path, git=False)[0]}
+            self.assertIn(".GIT", files)
+        self.assertNotIn(".git", files)
+
+    def test_an_admin_dir_named_through_a_case_variant_of_dot_git_worktrees_is_found_and_deleted(self):
+        """_clone_of_admin (registry repair) and _AdminDir (cleanup) compared .git/worktrees exactly; a worktree whose
+        .git file names <clone>/.GIT/Worktrees/<id>, which git opens on a case-insensitive filesystem, was skipped by
+        the repair and its archive was never deleted. Now matched when the filesystem resolves it to the clone's own
+        .git/worktrees, and only then."""
+        clone = os.path.join(self.root, "repos", "demo")
+        foreign = os.path.join(self.tmp, "repos", "demo", ".GIT", "Worktrees", "x")
+        self.assertIsNone(ws._clone_of_admin(foreign, self.root))           # not under <root>/repos: never
+        if not self.case_insensitive():
+            self.skipTest("the temp filesystem is case-sensitive: git would not open .GIT/Worktrees/ as .git/worktrees/")
+        settled = ws.settle(self.prepare(repo=self.origin, branch="feature"), self.root)
+        self.assertEqual(settled["state"], "archived", settled)
+        path = settled["path"]
+        with open(os.path.join(path, ".git")) as f:
+            admin = ws._parse_gitfile(f.read(), path)
+        variant = os.path.join(clone, ".GIT", "Worktrees", os.path.basename(admin))
+        with open(os.path.join(path, ".git"), "w") as f:
+            f.write(f"gitdir: {variant}\n")
+        self.assertEqual(git("rev-parse", "HEAD", cwd=path).strip(), self.head(path))     # git opens it
+        self.assertEqual(ws._clone_of_admin(variant, self.root), clone)
+        self.assertIsNone(ws._clone_of_admin(os.path.join(clone, ".GIT", "Elsewhere", "x"), self.root))
+        self.age(settled)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual((report["deleted"], report["errors"]), ([TID], []), report)
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.exists(admin))
+
     def reset_away(self, path):
         lost = self.commit(path, "lost.txt")
         git("reset", "-q", "--hard", "HEAD~1", cwd=path)
