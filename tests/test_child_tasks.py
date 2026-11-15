@@ -648,7 +648,19 @@ class ChildTaskTests(ChildTaskBase):
         # #117 round 3: only the selection loads, not also the execution host's own MCP servers.
         self.assertEqual(a[a.index("--mcp-config") - 1], "--strict-mcp-config")
         self.assertEqual(a.count("--strict-mcp-config"), 1)
-        self.assertEqual(seen["mcp"], {"mcpServers": {"notion": {"type": "http", "url": "https://notion.example/mcp"}}})
+        # Round 4: exactly the selection plus cortados-route (its local_switch is allowed in a child), nothing else.
+        self.assertEqual(sorted(seen["mcp"]["mcpServers"]), ["cortados-route", "notion"])
+        self.assertEqual(seen["mcp"]["mcpServers"]["notion"], {"type": "http", "url": "https://notion.example/mcp"})
+        route = seen["mcp"]["mcpServers"]["cortados-route"]
+        self.assertTrue(os.path.isabs(route["command"]), route)
+        self.assertEqual(len(route["args"]), 1)
+        self.assertTrue(os.path.isabs(route["args"][0]), route)
+        self.assertEqual(os.path.realpath(route["args"][0]),
+                         os.path.realpath(os.path.join(os.path.dirname(ct.__file__), "subagent_mcp.py")))
+        self.assertTrue(os.path.isfile(route["args"][0]))
+        self.assertEqual(route["env"]["CORTADOS_CHILD_TASK"], "1")   # start_task / route_task stay refused
+        self.assertEqual(route["env"]["CORTADOS_PROVIDER_URL"], self.cfg["url"])
+        self.assertFalse([k for k in route["env"] if k == "CORTADOS_PROVIDER_TOKEN"], "never the token itself")
         self.assertFalse(os.path.exists(path), "the selection (it may carry credentials) is removed at exit")
         self.assertEqual(_load(os.path.join(d, "meta.json"))["connectors"], ["notion"])
         r, _ = self.call("start_task", task="x", cwd=self.work, connectors=["nope"])
@@ -682,8 +694,10 @@ class ChildTaskTests(ChildTaskBase):
         seen = _load(os.path.join(self.work, "fake-argv.json"))
         a = seen["argv"]
         self.assertIn("--strict-mcp-config", a)
-        self.assertEqual(seen["mcp"], {"mcpServers": {"vercel": {"type": "http", "url": "https://v.example"},
-                                                      "apollo": {"type": "http", "url": "https://a.example"}}})
+        servers = dict(seen["mcp"]["mcpServers"])
+        self.assertEqual(servers.pop("cortados-route")["args"][0].rsplit("/", 1)[-1], "subagent_mcp.py")
+        self.assertEqual(servers, {"vercel": {"type": "http", "url": "https://v.example"},
+                                   "apollo": {"type": "http", "url": "https://a.example"}})
         self.assertEqual(seen["env"]["ENABLE_TOOL_SEARCH"], "false")
         self.assertEqual(sorted(_load(os.path.join(ct.task_path(tid), "meta.json"))["connectors"]), ["apollo", "vercel"])
 

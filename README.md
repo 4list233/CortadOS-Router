@@ -710,10 +710,12 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   gets no client-side tool search). The full set measured ~1.1 MB, about 290k estimated tokens across 495 MCP tools
   (Vercel alone 241), on 2026-11-02. That is over a 200k model's input ceiling, so the provider refused every such
   child with 413, and Claude Code shows a 413 as "Request too large (max 32MB) … images".
-  A child with `connectors` also gets `--strict-mcp-config` (#117): only the selected servers load, so the execution
-  host's own Claude Code MCP servers (user, project, plugin) are NOT available to that child. Nothing the child needs
-  is lost: `cortados-route`'s tools are refused inside a child anyway. A child without `connectors` keeps the host's
-  servers. Either way the selection's size is checked by the provider's tool-schema budget above on the child's
+  A child with `connectors` also gets `--strict-mcp-config` (#117): only the selected servers load, plus
+  `cortados-route` (the execution host's own `subagent_mcp.py` by absolute path, with `CORTADOS_PROVIDER_URL`, the
+  token file when one was given, `CORTADOS_CHILD_CLAUDE_BIN` when set and `CORTADOS_CHILD_TASK=1`), so its
+  `local_switch` stays available while `start_task` and `route_task` stay refused, as in every child. The execution
+  host's other Claude Code MCP servers (user, project, plugin) are NOT available to that child. A child without
+  `connectors` keeps the host's servers. Either way the selection's size is checked by the provider's tool-schema budget above on the child's
   first request (a connector's tools cannot be listed at launch: they sit behind OAuth in the execution host's
   Keychain), so `start_task` needs no tool counts; a leftover `"cortadosTools"` key in an entry is ignored and not
   passed to the child.

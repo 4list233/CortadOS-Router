@@ -1846,9 +1846,10 @@ class Handler(BaseHTTPRequestHandler):
         if ctype != "application/x-www-form-urlencoded":
             return self._html_page(415, _login_page("the login form must be posted as a form"), LOGIN_CSP, LOGIN_HEADERS)
         if not dashboard_auth.same_origin(self.headers, self._peer()):
-            logger.warning("dashboard login refused: not same-origin (origin %r, host %r, forwarded proto %r)",
-                           (self.headers.get("origin") or "")[:100], (self.headers.get("host") or "")[:100],
-                           (self.headers.get("x-forwarded-proto") or "")[:20])
+            logger.warning("dashboard login refused: not same-origin (origin %s, host %s, forwarded proto %s)",
+                           anthropic_wire.log_safe(self.headers.get("origin") or "", 100),
+                           anthropic_wire.log_safe(self.headers.get("host") or "", 100),
+                           anthropic_wire.log_safe(self.headers.get("x-forwarded-proto") or "", 20))
             return self._html_page(403, _login_page("cross-site login refused"), LOGIN_CSP, LOGIN_HEADERS)
         addr = dashboard_auth.client_address(self._peer(), self.headers.get("x-forwarded-for") or "")
         auth = self.server.registry.dashboard
@@ -2336,7 +2337,7 @@ class Handler(BaseHTTPRequestHandler):
         if bad:                                   # a server tool whose cost we cannot bound/reconcile -> never dispatch
             return self._error(400, "invalid_request_error",
                                f"cortados: the anthropic-api credit lane cannot bound the cost of server tool(s) "
-                               f"{', '.join(sorted(set(bad)))} (billed by server-side time); not permitted on this lane", wire)
+                               f"{', '.join(sorted({anthropic_wire.shown_name(b) for b in bad}))} (billed by server-side time); not permitted on this lane", wire)
         body = api_credits.enforce_server_tool_caps(body)   # cap metered tools to what we reserve, so admission is a real bound
         # A revealing client (the routed-subagents mod) also sees the credit window's % left after the real model the
         # upstream response names; read BEFORE this turn reserves. Without the header nothing about the relay changes.
@@ -2361,7 +2362,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(503, "overloaded_error",
                                "cortados: the anthropic-api lane's reserved org is no longer configured", wire)
         logger.info("anthropic-api lane: reserved $%.2f for %s (committed $%.2f of $%.0f)",
-                    max_cost, model, api_credits.committed(now), api_credits.total_budget_usd())
+                    max_cost, routing.shown_pin(model), api_credits.committed(now), api_credits.total_budget_usd())
         # Recorded once admitted (it is about to run). The label is the reveal the response carries when one was asked
         # for; otherwise the model (the meter is not read just for the record).
         self._record_run(provider="anthropic-api", model=model, label=model + reveal if reveal else model,
@@ -2638,7 +2639,8 @@ class Handler(BaseHTTPRequestHandler):
             if api_model:
                 # api/ requests are stateless, so each is a new conversation: honour x-cortados-exclude-model here
                 # (the router, which applies it otherwise, is never called for this lane).
-                refused = self._exclusion_refusal(api_model, f"api/{api_model}", "pin another model or use cortados")
+                refused = self._exclusion_refusal(api_model, f"api/{routing.shown_pin(api_model)}",
+                                                "pin another model or use cortados")
                 if refused:
                     return self._error(400, "invalid_request_error", refused, wire)
                 # Pinned to the anthropic-api credit lane: proxy it directly, bypassing S1 and the session machinery.
@@ -3271,7 +3273,7 @@ class Handler(BaseHTTPRequestHandler):
             shown = r.get("model")
         now = f"pinned to sub/{shown}" if r.get("pinned") else f"routed by S1 to {r.get('model') or 'its model'}"
         return (f"cortados: the model is fixed per conversation: this one is {now}, and this request asks for "
-                f"sub/{pinned}; start a new conversation to change models")
+                f"sub/{routing.shown_pin(pinned)}; start a new conversation to change models")
 
     @staticmethod
     def _resolved_pin(pinned: str) -> str:

@@ -767,6 +767,26 @@ def _max_s() -> int:
     return v
 
 
+ROUTE_SERVER = "cortados-route"     # the router's own MCP server (subagent_mcp.py)
+
+
+def route_server_entry(provider_url: str, token_file=None) -> dict:
+    """cortados-route as a connector child's strict MCP config carries it: the absolute path of subagent_mcp.py and the
+    interpreter on THIS host (the execution host: _prepare runs there), with the env the README's registration gives it
+    (CORTADOS_PROVIDER_URL, CORTADOS_CHILD_CLAUDE_BIN when set) plus the token FILE when one was given (never a token)
+    and NESTED_ENV, so start_task and route_task are refused even if the child's own env were not inherited."""
+    env = {NESTED_ENV: "1"}
+    if provider_url:
+        env["CORTADOS_PROVIDER_URL"] = provider_url
+    if token_file:
+        env["CORTADOS_PROVIDER_TOKEN_FILE"] = os.path.abspath(os.path.expanduser(token_file))
+    if os.environ.get("CORTADOS_CHILD_CLAUDE_BIN"):
+        env["CORTADOS_CHILD_CLAUDE_BIN"] = os.environ["CORTADOS_CHILD_CLAUDE_BIN"]
+    py = sys.executable if sys.executable and os.path.isabs(sys.executable) else "python3"
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subagent_mcp.py")
+    return {"type": "stdio", "command": py, "args": [script], "env": env}
+
+
 MAX_CONNECTORS = 32                 # a selection longer than this is not a selection
 # Round 2 of #117 asked each connectors.mcp.json entry for a "cortadosTools" count. Round 3 dropped it: a count bounds
 # nothing (descriptions vary without limit) and the host's own MCP servers were outside it. The provider now enforces
@@ -1328,12 +1348,13 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
         # Only the named servers, in a private file (session-*.json: removed with the settings when the child exits,
         # since server entries may carry their own credentials).
         conn = os.path.join(d, "session-connectors.json")
+        servers = {**selected, ROUTE_SERVER: route_server_entry(provider_url, token_file)}
         with open(os.open(conn, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as f:
-            json.dump({"mcpServers": selected}, f)
+            json.dump({"mcpServers": servers}, f)
         # --strict-mcp-config (#117): only the selected connectors load, not also the execution host's own Claude Code
-        # MCP servers (user, project and plugin ones), which would add schemas the selection never chose. So a child
-        # with connectors has no host MCP server. Nothing it needs is lost: cortados-route is the one server the
-        # router itself registers, and its tools are refused inside a child (CHILD_DIRECTIVE), so it is not added.
+        # MCP servers (user, project and plugin ones), which would add schemas the selection never chose. The one
+        # exception is cortados-route, added back explicitly (round 4): its local_switch tool IS allowed inside a child
+        # (subagent_mcp.py docstring); its start_task and route_task stay refused there (NESTED_ENV), as in any child.
         extra += ["--strict-mcp-config", "--mcp-config", conn]
     else:
         conn_note = ("no connectors selected; the child has the user's Claude Code MCP servers only (bounded by the "

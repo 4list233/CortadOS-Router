@@ -136,6 +136,22 @@ SUB_ALIASES = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5", "haiku": 
                "fable": "claude-fable-5-1"}
 
 
+# A pinned model name the provider may echo in its own text: printable (str.isprintable rejects newline, CR, ESC, NUL
+# and the Unicode line/paragraph separators, so none can start a forged log line) and at most PIN_NAME_MAX characters.
+# Friendly pins keep their spaces (`sub/GPT 6.1`, `sub/ollama 27b q3km`: resolve_pin's input), so this is not an
+# identifier grammar; anything else is refused before routing (#117 round 3).
+PIN_NAME_MAX = 128
+
+
+def pin_name_ok(name: Any) -> bool:
+    return isinstance(name, str) and 0 < len(name) <= PIN_NAME_MAX and name.isprintable()
+
+
+def shown_pin(name: Any) -> str:
+    """A client's pin name as provider-authored text shows it: itself when pin_name_ok, else wire.log_safe."""
+    return name if pin_name_ok(name) else wire.log_safe(name)
+
+
 def sub_pin(body: dict[str, Any]) -> str | None:
     """A request pinned to a subscription model: model `sub/<model id or Claude alias>` (bare `sub` for the
     default), a Claude model (claude-cli) or a Codex one (codex-cli). Returns the requested model name (unvalidated), or None for a normal S1-routed request."""
@@ -609,6 +625,11 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
     hit = lambda name: bool({canonical_model(name), model_key(name)} & excluded_keys)
     names = ", ".join(excluded_models)            # one model: exactly the single-model wording
     pinned = sub_pin(body)
+    if pinned and not pin_name_ok(pinned):
+        # #117 round 3: the body's model is client text; a pin with a control character (or too long) is refused
+        # here, shown only through log_safe, so it never reaches a provider log line or error raw.
+        return {"router": execution_routing.ROUTER, "client_error": True,
+                "error": f"sub/{shown_pin(pinned)} is not a model name this endpoint could serve"}
     if pinned:
         # A friendly or undated name becomes its one pin name here, before the exclusion check, so that check sees the
         # model the pin means. A name that means nothing stays as typed: choose_pinned refuses it with the pinnable list.
