@@ -43,7 +43,8 @@ class GateHarness(unittest.TestCase):
         self.addCleanup(allowed.stop)
         self.ollama = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllama)
         threading.Thread(target=self.ollama.serve_forever, daemon=True).start()
-        FakeOllama.seen = []
+        FakeOllama.reset()                    # whatever a test elsewhere left on the shared fake (reply, thinker, ...)
+        self.addCleanup(FakeOllama.reset)
         self.gate = local_gate.GateServer(("127.0.0.1", 0), token=TOKEN,
                                           upstream=f"http://127.0.0.1:{self.ollama.server_port}", read_timeout=5,
                                           max_connections=self.MAX_CONNECTIONS)

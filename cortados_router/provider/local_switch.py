@@ -32,7 +32,8 @@ GATE_MAX_BYTES = 65536
 SWITCH_MAX_BODY = 1024
 SWITCH_BODY_DEADLINE_S = 5.0
 POWER = {"ac", "battery", "unknown"}
-OLLAMA = {"up", "unreachable", "unreadable"}
+OLLAMA = {"up", "unreachable", "unreadable"}       # the backend's reachability (the key predates vllm-mlx)
+BACKENDS = {"ollama", "vllm-mlx"}
 REASON_MAX = 200
 MODEL_MAX = 200
 MODELS_MAX = 32
@@ -65,7 +66,24 @@ def _clean(data: Any) -> dict[str, Any]:
             "power": d.get("power") if d.get("power") in POWER else "unknown",
             "training": d.get("training") if isinstance(d.get("training"), bool) else None,
             "ollama": d.get("ollama") if d.get("ollama") in OLLAMA else "unknown",
-            "models_loaded": models}
+            "models_loaded": models,
+            "backend": d.get("backend") if d.get("backend") in BACKENDS else "unknown",
+            "capacity": _capacity(d.get("capacity"))}
+
+
+def _capacity(c: Any) -> dict[str, Any] | None:
+    """The gate's admission report (local_gate.GateServer.capacity), field by field: the limit (None: no governor) and
+    in-flight count as small integers, the owner/pressure state as known words, the reason as bounded text, and the
+    byte budget (reserved and free bytes, the token room alone and now) as non-negative integers (None: no governor)."""
+    if not isinstance(c, dict):
+        return None
+    def count(v, top=10000):
+        return v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= top else None
+    return {"limit": count(c.get("limit")), "inflight": count(c.get("inflight")),
+            "owner": c.get("owner") if c.get("owner") in ("active", "idle") else None,
+            "pressure": c.get("pressure") if c.get("pressure") in ("normal", "warn", "critical", "unknown") else None,
+            "reason": _text(c.get("reason"), REASON_MAX),
+            **{k: count(c.get(k), 2 ** 53) for k in ("reserved_bytes", "free_bytes", "fit_tokens", "free_tokens")}}
 
 
 def _gate_call(node: dict[str, Any], method: str, body: dict[str, Any] | None = None) -> dict[str, Any]:

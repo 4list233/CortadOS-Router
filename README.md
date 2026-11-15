@@ -465,6 +465,16 @@ boundary"). An asleep or busy node fails a pin with a clear 503, never a fallbac
 on localhost and the node runs a token gate (`python3 -m cortados_router.local_gate`) on its Tailscale address. Config schema, gate and launchd template:
 `docs/LOCAL-RESOURCES.md` ("Local models").
 
+**MLX backend.** The Pro's gate can front `vllm-mlx` (continuous batching: 87.9 tok/s aggregate at 8 requests against
+Ollama's ~27) instead of Ollama, chosen by a config file on the Pro (`~/.config/cortados/local-backend.json`, example
+`tables/local-backend.example.json`; no file = Ollama). vllm-mlx speaks the Anthropic Messages API, so the lane relays
+as before; the gate maps thinking to `chat_template_kwargs.enable_thinking` and answers `/api/tags` from `/v1/models`.
+An activity governor in the gate sets how many requests run at once (owner active 2, idle 8, memory pressure warn 1,
+critical 0; never stopping running ones) and reserves each request's KV cache from its tokens (input + max_tokens) in
+a byte budget beside the weights; over either is a retryable 529 with Retry-After, a request that could never fit is a
+non-retryable 413, and the provider routes new conversations elsewhere while the gate reports no room. Install script: `scripts/install_mlx_backend.sh`.
+Switch and rollback: `docs/LOCAL-RESOURCES.md`, "MLX backend (vllm-mlx) and the activity governor".
+
 ### Local models on the Pro
 
 The Pro gate admits probes and inference only on **AC power AND with the manual switch ON**.

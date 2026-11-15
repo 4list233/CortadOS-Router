@@ -310,6 +310,9 @@ class HeaderTests(LocalHarness):
 
 
 class RefusalFallbackEndToEndTests(LocalHarness):
+    # A continuation must carry a conversation identity (main, cf6b657): the refusal fallback's answer has no tool call
+    # id to find the conversation by, so the Claude Code session header is sent, as Claude Code itself does.
+    HEADERS = {"X-Claude-Code-Session-Id": "6a1d0c3e-refusal-e2e"}
     """The Claude bridge reports the fake CLI's refusal; the server re-runs an eligible opening turn on the fake Ollama
     and binds the conversation there. A refusal after a tool ran, or of an ineligible request, reaches the client."""
 
@@ -597,6 +600,7 @@ class ContinuationRecheckBase(LocalHarness):
 
     BAND = "R3"
     HEADERS_OPEN: dict = {}
+    HEADERS = {"X-Claude-Code-Session-Id": "6a1d0c3e-recheck"}     # a conversation identity, as Claude Code sends
 
     def setUp(self):
         super().setUp()
@@ -644,7 +648,8 @@ class ContinuationRecheckBase(LocalHarness):
 
     def refused(self, req):
         req_ = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(req).encode(), method="POST",
-                                      headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}"})
+                                      headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
+                                               **self.HEADERS})
         with self.assertRaises(urllib.error.HTTPError) as cm:
             urllib.request.urlopen(req_, timeout=30)
         e = cm.exception

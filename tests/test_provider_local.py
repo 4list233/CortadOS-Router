@@ -53,6 +53,21 @@ class FakeOllama(BaseHTTPRequestHandler):
     error_body = None           # bytes: answer every POST with this 400 body
     json_deltas = False         # stream a tool_use's input as input_json_delta fragments (as Anthropic and Ollama may)
 
+    @classmethod
+    def reset(cls):
+        """Every class-level knob back to its default. The fake's state lives on the class, shared by every test
+        module that imports it: a test that sets `reply` or `thinker` and ends without clearing it would otherwise
+        change the answers seen by the next harness (a gate test once got `tool_use` / `max_tokens` for `end_turn`)."""
+        cls.tags = [TAG, "phi:latest"]
+        cls.seen = []
+        cls.gets = 0
+        cls.tags_body = None
+        cls.reply = None
+        cls.thinker = None
+        cls.mode = "ok"
+        cls.error_body = None
+        cls.json_deltas = False
+
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         FakeOllama.seen.append((self.path, body))
@@ -168,10 +183,8 @@ class LocalHarness(EndpointHarness):
         super().setUp()
         self.ollama = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllama)
         threading.Thread(target=self.ollama.serve_forever, daemon=True).start()
-        FakeOllama.seen = []
-        FakeOllama.thinker = None
-        FakeOllama.reply = None
-        FakeOllama.json_deltas = False
+        FakeOllama.reset()
+        self.addCleanup(FakeOllama.reset)
         self._env = os.environ.get(local_lane.CONFIG_ENV)
         os.environ[local_lane.CONFIG_ENV] = write_config(self.scratch, f"http://127.0.0.1:{self.ollama.server_port}")
         self._keep = (core.STATE, core.lane_health, core.decide)

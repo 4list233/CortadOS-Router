@@ -692,6 +692,409 @@ only). Check a setup with `python3 -m cortados_router.local_gate --listen <tails
 token file and prints the settings, never the token). On the provider, a 401 from the gate is a 503 "local gate on
 node <id> refused the provider token", with no fallback.
 
+## MLX backend (vllm-mlx) and the activity governor
+
+Ollama does not batch decode on Apple Silicon: on the Pro its aggregate output stays at ~27 tok/s whatever the slot
+count. `vllm-mlx` (an MLX server with continuous batching) serves the same 27B several requests at once. Measured on
+the Pro (48 GB), `vllm-mlx 0.6.0`, `~/models/mlx/Qwen3.8-27B-heretic-ara-4bit-bench` (15 GB, 4-bit), ~8.5k-token
+prompts, 512 output tokens:
+
+| Requests at once | Aggregate tok/s | Per request | TTFT | Makespan |
+|---|---|---|---|---|
+| 1 | 27.1 | 27.1 | 9.5 s | 28 s |
+| 2 | 47.8 | 23.9 | 21 s | 42 s |
+| 4 | 74.6 | 18.7 | 43 s | 70 s |
+| 8 | 87.9 | 11.0 | 85 s | 131 s |
+| 16 | 64.8 | worse | | |
+
+Peak footprint 31 GB at 8; no swap growth.
+
+### How it fits
+
+Nothing changes for the provider's lane protocol. vllm-mlx 0.6.0 serves the Anthropic Messages API itself
+(`POST /v1/messages`: text, `tool_use`/`tool_result`, streaming SSE, stop reasons, usage; read from its source), so
+**no translator was built**: turns are relayed as they are today. The gate (`local_gate.py`) adapts the rest, per
+backend, from a config file on the Pro (`cortados_router/local_backend.py`; example
+`tables/local-backend.example.json`, real file `~/.config/cortados/local-backend.json`; no file = Ollama, no governor):
+
+| Client route (unchanged) | Ollama upstream | vllm-mlx upstream |
+|---|---|---|
+| `GET /api/tags` | `GET /api/tags` | `GET /v1/models`, answered in `/api/tags` shape |
+| `POST /v1/messages` | `POST /v1/messages` | `POST /v1/messages`, body adapted (below) |
+| switch status "models loaded" | `GET /api/ps` | `GET /v1/models` |
+
+Nothing else reaches either backend (`local_backend.UPSTREAM` is the whole table). The adaptation is in the gate, not
+the lane, because only the gate knows its node's backend: the lane stays one Anthropic relay for every node and the
+gate's client-facing routes do not grow. On `POST /v1/messages` to vllm-mlx the gate:
+
+- maps thinking: vllm-mlx ignores Anthropic's `thinking`; the gate sets `chat_template_kwargs.enable_thinking` from it
+  (`disabled` → false, any other type → true; absent → the server default, false in the example). The think variant
+  (`qwen-27b-think`, max_tokens ≥ 4096) therefore thinks; vllm-mlx has no per-request thinking budget on this endpoint,
+  so its `budget_tokens` is not enforced (max_tokens bounds thinking + answer; the lane's #108 guard still turns a
+  turn that thought its whole budget away into a clear error);
+- checks the model: vllm-mlx serves one model; the request must name it (`name` = `name:latest`) and is sent with the
+  exact served name. Any other model (e.g. a `sub/phi-4` conversation started on Ollama) is a 404 at the gate, never
+  silently answered by the MLX model;
+- allowlists `chat_template_kwargs`: only `enable_thinking` (a boolean) passes; any other key, or a non-boolean
+  value, is a `400 invalid_request_error` with `x-should-retry: false`. vllm-mlx 0.6.0 merges these kwargs into the
+  template call (`engine/batched.py` `_apply_chat_template`: `template_kwargs.update(chat_template_kwargs)`), so a
+  client could replace the template itself: `{"chat_template": "{{ 'a!' * 50000 }}"}` is a 155-byte body that renders
+  a 100k-token prompt, which no bound read from the body can see. The server's own default
+  (`vllm_mlx.serve.default_chat_template_kwargs`, emitted as `--default-chat-template-kwargs`) reaches the same
+  template call, so it is held to the same allowlist: `local_backend.check()` refuses the config and `serve_argv()`
+  re-checks before it emits the flag (round 6);
+- refuses a body nested too deeply to parse or re-encode (Python's recursion limit, ~1,000 levels) with the same
+  structured 400, instead of an uncaught `RecursionError` that dropped the connection;
+- rewraps FastAPI's `{"detail": …}` errors in Anthropic's error shape. The backend prompt guard's refusal (below)
+  becomes the gate's own never-fits 413.
+
+### The governor (owner-approved policy) and token-aware memory admission
+
+`cortados_router/local_governor.py`, run inside the gate on the Pro. Inputs, sampled at most every `sample_s` (5 s):
+keyboard/mouse idle seconds (`ioreg -r -c IOHIDSystem -d 1`, `HIDIdleTime`) and macOS memory pressure (`sysctl -n
+kern.memorystatus_vm_pressure_level`: 1 normal, 2 warn, 4 critical). A turn is admitted only when it passes **both**
+bounds below; defaults, each with its reason, in `tables/local-backend.example.json` → `governor._reasons`.
+
+**Count** (`policy()`): an upper bound on how many requests run at once, whatever their size.
+
+| Owner | Memory pressure | Count limit (requests running at once) | Default (4-bit) |
+|---|---|---|---|
+| active (idle < `active_idle_s` 600 s) | normal | min(`active_cap`, model `idle_cap`) | 2 |
+| idle (≥ 600 s) | normal | model `idle_cap` | 8 |
+| any | warn | min(the row above, `warn_cap`) | 1 |
+| any | critical | min(the row above, `critical_cap`) | 0 (nothing new) |
+| unreadable idle | — | counted active | |
+| — | unreadable | counted `unknown_pressure` | warn |
+
+**Bytes** (`request_bytes()`): each turn reserves the memory its context will hold, and turns are admitted while the
+reservations in flight fit beside the weights. The fixed "2 GB per request" cap is gone: it came from ~8.5k-token
+benchmark prompts, and real Claude Code turns of 30k–130k tokens hold four to sixteen times that.
+
+```
+tokens   = min(input tokens + max_tokens, context_tokens)
+reserved = tokens × kv_bytes_per_token + per_seq_state_bytes + prefill_margin_bytes
+admit    iff  count < count limit  and  reserved in flight + reserved ≤ memory_budget_bytes − weights_bytes
+```
+
+**The input bound** (`local_governor.input_tokens`). A turn's input tokens are bounded from above, never estimated and
+never asked of the backend:
+
+```
+input tokens ≤ bytes of the request body exactly as received
+             + template allowance   1024 + 16 per message + 32 per content block + 64 per tool   (TEMPLATE_TOKENS_*)
+             + re-serialized bytes  what vllm-mlx writes wider than it came (below)
+             + normalization bytes  what the tokenizer's NFC normalizer writes wider (below)
+capped at context_tokens; then + max_tokens, capped at context_tokens again (request_tokens)
+the cap holds because the backend refuses a longer prompt itself ("The backend's prompt cap", below)
+```
+
+An average such as "characters / 3.5" is not a bound: 100,000 characters of `a!a!…` are 100,000 tokens on Qwen's
+tokenizer (1 byte a token), and the old estimate called them 28,572, so seven such turns were admitted at once while
+each really holds ~7.9 GiB. An earlier version asked vllm-mlx's `POST /v1/messages/count_tokens` and added the bytes of
+what that count leaves out. Three review rounds each found another under-count (nested tool_result items joined with
+`\n`, tool descriptions through `tojson`, `response_format` schemas injected into the system prompt): modelling a
+counter's omissions does not converge. The count call, its 2-slot semaphore, its 5 s deadline and `uncounted_bytes()`
+are gone, and the gate makes no backend call before the turn itself.
+
+**Why it cannot under-count.** The body is the JSON the client sent, before the gate adapts it. Tokens ≤ UTF-8 bytes
+of the rendered prompt after the tokenizer's normalization, because Qwen's tokenizer normalizes with NFC and then runs
+a byte-level BPE in which every token covers at least one byte. Checked on the public `Qwen/Qwen3.5-27B` tokenizer.json
+(the closest public family to the Pro's Qwen3.8 27B; sha256 `5f9e4d49…`, read with the stdlib, never loaded as a
+model): `normalizer` `{"type": "NFC"}`, pre-tokenizer `Split` + `ByteLevel`, BPE without byte fallback, all 248,044
+vocabulary entries in the byte-level alphabet and at least one byte long; special tokens are matched before
+normalization and cover several bytes each. `Qwen/Qwen3-8B`'s tokenizer.json is also NFC. The Pro's own
+`~/models/mlx/Qwen3.8-27B-heretic-ara-4bit-bench/tokenizer.json` was not read (this was built on the Air); its
+`normalizer` should be checked to be NFC or none before relying on this. So it is enough that the normalized prompt
+has no more bytes than the bound:
+
+- Text the model sees is a copy of a JSON string in the body, and a JSON string costs at least as many bytes as it
+  renders to. ASCII is one byte either way. Non-ASCII is raw UTF-8 (the same bytes) or a `\uXXXX` escape (6 bytes for
+  ≤ 3, 12 for a 4-byte character). An escape such as `\n` or `\"` is 2 bytes for 1.
+- Where text is escaped again on the way in (`tojson` writes a newline as `\n`), the result is never longer than the
+  body's own escape: `\n` is 2 bytes in the body and 2 characters after `tojson`.
+- Separators vllm-mlx adds between copied items are paid for by the items' own JSON. Joining tool_result or system
+  items with `\n` costs 1 byte per item, and each item costs at least 3 body bytes (`"",`). System messages are joined
+  with `\n\n`, but each message costs ~30 bytes.
+- `response_format` instruction text is in the body (name, description), apart from the fixed wording counted below.
+- The chat template's own text (role markers, `<tool_call>` wrappers, the tool-use preamble, about half the
+  allowance) is the only text from outside the body. The allowance covers it, and as a token count it is also at least
+  as many bytes as that text. The Qwen3.5 template is pure ASCII, so normalization does not change it.
+- **Normalization** (`local_governor.normalization_bytes`). NFC can widen text: U+FA6C (3 bytes) becomes U+242EE (4
+  bytes), so `"\ufa6c" * 20000` is 60,000 body bytes and 80,000 prompt bytes (up to 80,000 tokens); U+1D160 (4 bytes)
+  becomes three code points (12 bytes). A ratio cannot bound this, so the bound measures each string in the body, keys
+  included: it adds `len(NFD(s)) − len(s)` UTF-8 bytes (when positive) for every time vllm-mlx can write `s` raw into
+  the prompt. That is once per string, and twice for a forced tool_choice's tool name. NFD, not NFC, is measured for
+  two reasons. NFD is per character, so strings measured apart add up to the prompt they are concatenated into, while
+  NFC can compose across a string boundary. And NFC never has more bytes than NFD: canonical composition replaces a
+  starter and a combining character by one code point that is no longer in UTF-8 than the two. A test checks this over
+  every composition in the Unicode table. A code point this Python's Unicode table leaves unassigned (the tokenizer's
+  table may be newer) counts 16 more bytes, its widest possible decomposition. Text vllm-mlx writes ASCII-escaped
+  (`json.dumps`) is ASCII and normalizes to itself. The cost: text with combining forms counts more than its raw
+  bytes (`é` is 2 bytes and counts 3; a Hangul syllable is 3 and counts 9), and ASCII counts nothing extra. Strings are
+  measured in 64K-character chunks, and measuring stops once the bound passes the cap.
+
+**What vllm-mlx 0.6.0 writes wider than it came, bounded explicitly** (`local_governor.reserialized_bytes`; read from
+its source). Re-serializing a JSON value is not a copy. The rendered text can outgrow the body bytes it came from, so
+each of these is added in full, as long as its widest rendering, on top of the body bytes:
+
+| Re-serialized | How vllm-mlx renders it | Why it can outgrow the body | Added |
+|---|---|---|---|
+| each tool definition | the template's `tojson` of the OpenAI-shaped tool (`_convert_tool`) | compact `,` / `:` become `, ` / `: ` (`[0,0,…]` 2 bytes an item → 3); the `{"type": "function", …}` wrapper and the default schema of a tool without `input_schema` are not in the body | `json.dumps` of that OpenAI-shaped tool |
+| each `tool_use` input | `json.dumps(input)` (ASCII-escaped) as the call's `arguments`, or `tojson` of it | `é` is 2 bytes raw and 6 as `é` (3×); separators as above | `json.dumps(input)` |
+| `response_format` | `build_json_system_prompt`: fixed wording + name + description + `json.dumps(schema, indent=2)` | `indent=2` writes a line and its indentation per value: a 300-deep schema of ~3 KB becomes ~90 KB | `json.dumps(response_format, indent=2)` + `INJECTED_TEXT_BYTES` (1024) |
+| a forced `tool_choice` (`any` / `tool`) | an `[IMPORTANT INSTRUCTION] You MUST call …` line, naming the tool twice | ~190 bytes of fixed wording | the `tool_choice` JSON + 1024 |
+
+`json.dumps` with its defaults (ASCII-escaped, `, ` / `: `) is never shorter than any of these renderings: `tojson`
+uses `ensure_ascii=False` and the same separators. So each addition is at least as long as what vllm-mlx writes. The
+sizes are counted chunk by chunk (`JSONEncoder.iterencode`) and the count stops at the context cap, so a 32 MiB body
+or a deep schema is never built in memory. A value nested too deeply to encode counts as the whole context.
+
+The tests render each reviewer case as vllm-mlx 0.6.0 does and check that the bound covers it (`tests/test_local_mlx.py`
+`InputTokensTests` and `MlxGateBoundTests`): 1,000,000 empty tool_result items (999,999 newlines), a 100,000-newline
+tool description, a 100 KB `response_format` description, a 300-deep schema under `indent=2`, a non-ASCII `tool_use`
+input and a compact enum through `tojson`.
+
+**The cost.** Code-heavy Claude Code turns run about 3.5–4.5 body bytes per token, so the bound reserves roughly four
+times the real input. A turn whose real input passes ~22k–38k tokens (depending on max_tokens and density) reserves
+the whole context. Reservations, and how
+many of one size fit at once by bytes (25 GiB beside the 4-bit weights, 17.6 GiB beside the 6-bit), with an allowance
+for ~20 messages and 40 blocks:
+
+| Real input tokens | max_tokens | Reserved tokens (3.5–4.5 B/token) | GiB each | Fit by bytes, 4-bit | Fit by bytes, 6-bit |
+|---|---|---|---|---|---|
+| 2,000 | 512 | 10.1k–12.1k | 2.3–2.4 | 10–11 | 7 |
+| 2,000 | 32,000 | 41.6k–43.6k | 4.2–4.3 | 5 | 4 |
+| 8,500 | 512 | 32.9k–41.4k | 3.7–4.2 | 5–6 | 4 |
+| 8,500 | 32,000 | 64.4k–72.9k | 5.6–6.1 | 4 | 2–3 |
+| 16,000 | 4,096 | 62.7k–78.7k | 5.5–6.5 | 3–4 | 2–3 |
+| 38,000 and up | any | 131,072 (the cap) | 9.65 | 2 | 1 |
+
+The count limit applies on top: 2 with the owner active, 8 idle (6 for the 6-bit), 1 under warn pressure. So:
+
+- Two full 128k turns still run at once at 4-bit; a third waits (529). This is the same as before, since long turns
+  were already capped.
+- With the owner active, every row admits at least 2 by bytes, so short turns are limited by the count cap first.
+- With the owner idle, bytes limit before the count of 8 except for small turns with small max_tokens. A turn with
+  vllm-mlx's default max_tokens (32k, as Claude Code sends) reserves ≥ 4.2 GiB whatever its size.
+
+This is concurrency given up for a bound that holds by construction. The provider's own skip estimate
+(`local_lane.request_tokens`, characters / 3.5) is unchanged. It only decides whether to try the node, and the gate's
+refusal handles the rest.
+
+### The backend's prompt cap (vllm-mlx runs under a guard)
+
+The reservation is capped at `context_tokens` (131,072): the KV cache of a sequence no longer than that is all the
+backend can hold, **provided the backend refuses longer prompts**. vllm-mlx 0.6.0 does not. It neither truncates nor
+refuses a prompt over the model's context, and `--max-request-tokens` bounds only `max_tokens`. So user content
+`"a!" * 100000` with `max_tokens: 1` (200 KB, a 200k-token prompt) reserved the 131k cap at the gate, ran at 200k
+tokens, and two of them passed admission. The fix is the second of three options, for the reasons below.
+
+1. **An exact count on the generation path (not available).** vllm-mlx 0.6.0's HTTP routes (`server.py`) are
+   `/v1/messages`, `/v1/messages/count_tokens`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
+   `/v1/embeddings`, `/v1/rerank`, `/v1/audio/*`, `/v1/mcp/*`, `/v1/models`, `/v1/status`, `/v1/cache/stats`,
+   `/v1/requests/{id}/cancel`, `/health` and `/metrics`. None of them tokenizes a request through the template and
+   tokenizer generation uses. `count_tokens` is the path an earlier round dropped because it is not that path.
+2. **The backend refuses itself (taken).** On the text (LLM) route, vllm-mlx tokenizes a prompt for generation in one
+   place: `Scheduler.add_request` (`vllm_mlx/scheduler.py`, lines 2096–2125:
+   `request.prompt_token_ids = self.tokenizer.encode(request.prompt)` when unset). It runs before the request is
+   queued: `self.waiting.append(request)` at line 2221 is the only place a request enters the queue, and
+   `EngineCore.add_request` / `generate_batch_sync` (`engine_core.py` 493, 496, 719) are its only callers.
+   `integrations/vllm-mlx/cortados_vllm_mlx_guard.py` replaces that method with one that tokenizes the same way, sets
+   the ids and refuses when `prompt tokens + max_tokens > context_tokens`, before calling the original. Because it
+   sets the ids, the original prefills exactly what was counted: the count is the prompt, not a second opinion of it.
+   The refusal is fastapi's `HTTPException(413, "cortados guard: prompt too long for this node's context (prompt N
+   tokens + max_tokens M = T, over the C-token context)")`. Nothing is queued or prefilled, and
+   `engine_core.add_request` aborts and cleans up a request whose `add_request` raised (line 503,
+   `except BaseException`). Prompt + max_tokens is capped, not only the prompt, so a running sequence never outgrows
+   its reservation either.
+3. **Refuse in the gate (not taken).** Refusing every turn whose byte bound + max_tokens exceeds the context would
+   cap the local lane at about 22k–28k real input tokens with Claude Code's 32k max_tokens (131,072 − 32,768 −
+   ~1–2k of allowances ≈ 97k body bytes, at 3.5–4.5 bytes a token), and ~28k–36k even at max_tokens 4,096: a
+   quarter of the context. With the guard, the lane serves turns up to the real 131k (their reservation is the whole
+   context, as before).
+
+How the guard runs. `scripts/install_mlx_backend.sh` copies it to `<venv>/bin/cortados-vllm-mlx-guard.py`. The
+LaunchAgent runs `<venv>/bin/python <venv>/bin/cortados-vllm-mlx-guard.py --context-tokens <governor context_tokens>
+-- serve <model> …` (`local_backend.serve_argv`). The guard installs itself and hands over to vllm-mlx's own CLI
+(`vllm_mlx.cli.main`); it loads no model itself. It runs in the MLX venv, so the router package's stdlib-only rule
+does not apply to it (it imports `vllm_mlx` and `fastapi` from there). It is pinned: `vllm_mlx.__version__` must be
+`0.6.0` and `scheduler.py`, `engine_core.py`, `engine/batched.py` and the engine dispatch (`cli.py`, `server.py`,
+`model_registry.py`, `engine/__init__.py`, `engine/base.py`) must match the sha256 of the PyPI wheel
+`vllm_mlx-0.6.0-py3-none-any.whl` (`a5e5a52a…f062`). Anything else stops startup, so a new vllm-mlx gets this argument
+re-read before it serves. The multimodal route (`MLLMScheduler`) tokenizes for generation inside mlx_vlm's
+`prepare_inputs`, which the guard cannot count the same way, so it is refused: the guard stops startup if vllm-mlx
+resolves the model to the MLLM route, and `MLLMScheduler.add_request` refuses every request. The install script runs
+`--check <model dir>` (pins and route; serves nothing) before it writes the plist, so a model that would take the MLLM
+route is reported at install time and nothing is installed.
+
+Only the batched engine is guarded, so only it may serve (round 6). vllm-mlx 0.6.0 picks `BatchedEngine` (its text
+route is `AsyncEngineCore` → `Scheduler.add_request`) when served with `--continuous-batching`, and `SimpleEngine`
+(mlx-lm directly, no scheduler, no cap) otherwise. Pins on the files that choose do not prove the choice, so the guard
+enforces it at runtime: `serve` without the exact `--continuous-batching` flag is refused before vllm-mlx starts;
+`BaseEngine.__new__` admits only `BatchedEngine` itself, so building `SimpleEngine` (or any other engine) raises and
+the server exits at startup; every other engine's `start`/`generate`/`stream_generate`/`chat`/`stream_chat` raises; and
+a `BaseEngine` subclass defined after install is refused at class creation. Tests use a fake `vllm_mlx` package
+(`tests/test_vllm_mlx_guard.py`).
+
+What the client sees. A non-streamed turn gets vllm-mlx's 413 `{"detail": …}`, which the gate answers as its own
+never-fits refusal (`413 request_too_large`, `x-should-retry: false`, message `local gate: too large for this node's
+memory (cortados guard: …)`), so the provider routes the turn elsewhere as for any never-fits turn. A streamed turn
+has already received `message_start` from vllm-mlx before the scheduler is reached. It ends with an Anthropic `error`
+event carrying the guard's text, then `message_stop`, and is not rerouted. Either way nothing ran on the node. Only a
+turn whose real prompt + max_tokens exceeds 131k tokens gets this. A pre-stream refusal (a clean 413 for streamed
+turns too) was considered in round 6 and not taken: vllm-mlx renders the template inside `BatchedEngine.stream_chat`,
+which `server._stream_anthropic_messages` calls lazily inside the `StreamingResponse`, so a check before the response
+would render and tokenize the whole prompt a second time on the event loop, and its ids could not be reused without
+also patching `stream_chat`, `stream_generate` and `AsyncEngineCore`.
+
+Keep the two numbers in step. The gate's cap and the guard's come from the same config value (`context_tokens`). After
+lowering it, reinstall the backend (`install_mlx_backend.sh`) **before** restarting the gate; after raising it,
+restart the gate first. A gate capped below the guard reserves less than a prompt the guard admits.
+
+**Admission is one step.** With no count call to wait for, the count slot and the byte reservation are checked and
+taken together under one lock (`Admission.try_acquire`). A refused turn takes nothing, and an admitted turn's
+`Ticket` is released exactly once, in the gate's `finally`, however the turn ends.
+
+**Text only.** The Pro's vllm-mlx serves the 27B with its vision tower excluded at load. vllm-mlx 0.6.0's adapter
+turns a top-level image into image input, which the loaded model cannot use. It silently drops a document, any other
+non-text block, and an image inside a tool_result, so the model would answer as if it had seen them. On a vllm-mlx
+node the gate therefore refuses a turn carrying any of these (`local_governor.non_text_content`: message blocks other
+than text, thinking, redacted_thinking, tool_use and tool_result; tool_result content or system entries other than text
+blocks and strings). The refusal comes before admission: `400 invalid_request_error`,
+`x-should-retry: false`, no Retry-After, message `local gate: content this node's model cannot read (image block in
+message 3; it serves a text-only model)` (`local_gate.UNSUPPORTED_MESSAGE`). An Ollama node relays images as before:
+its model decides. The provider treats the refusal like "never fits" (below).
+
+A request without `max_tokens` reserves vllm-mlx's default (`vllm_mlx.serve.max_tokens`, 32768). Per model (a
+`vllm_mlx.models` entry overrides the `governor` default), measured and derived for Qwen3.8 27B (hybrid attention /
+recurrent; vllm-mlx keeps the KV cache unquantized, fp16):
+
+| Setting | Default | Why |
+|---|---|---|
+| `memory_budget_bytes` | 40 GiB | of the Pro's 48 GB, leaving ~8 GB for macOS and the owner's apps |
+| `weights_bytes` | 15 GiB (4-bit); 22.4 GB (6-bit, measured idle) | resident weights |
+| `kv_bytes_per_token` | 65,536 | 16 full-attention layers × K/V × 4 KV heads × head_dim 256 × 2 bytes; 128k tokens = 8 GiB |
+| `per_seq_state_bytes` | 0.15 GiB | the recurrent layers' state per sequence |
+| `prefill_margin_bytes` | 1.5 GiB | prefill activations and allocator slack: the 6-bit copy used 2.3 GB over idle for one ~9k-token request, KV + state explain ~0.7 GiB |
+| `context_tokens` | 131072 | the Pro block's `context_length` on the provider host; tokens are capped here |
+
+What that admits, in RESERVED tokens (the bound's, not a turn's real size; "The cost" above maps one to the other;
+owner idle, pressure normal; 25 GiB beside the 4-bit weights, 17.6 GiB beside the 6-bit):
+
+| Mix | Reserved | 4-bit | 6-bit |
+|---|---|---|---|
+| one 128k-token turn | 9.65 GiB | yes | yes |
+| two 128k-token turns | 19.3 GiB | yes | no (the second waits) |
+| three 128k-token turns | 29.0 GiB | no (the third waits) | no |
+| eight ~8.5k-token turns (512 out) | 8 × 2.17 GiB | yes (the count's 8) | count-capped at 6 |
+| two 128k + short turns | 19.3 + 2.17 each | two short fit, a third waits | — |
+
+Measured footprints the defaults were checked against: 4-bit ~31 GB at 8 × ~8.5k tokens; 6-bit 24.7 / 25.9 / 27.9 /
+31.5 GB at 1 / 2 / 4 / 8. The reservations are on the safe side of both (8 short 4-bit turns reserve 17.4 GiB against 16
+GB measured above the weights).
+
+Rules on top:
+
+- **A single turn is always admitted when nothing runs and it fits alone** (and the count allows one: under critical
+  pressure nothing is admitted).
+- **A turn that could never fit** (its reservation exceeds `memory_budget_bytes − weights_bytes` even with nothing
+  else running) is refused for good, not left to an endless 529 loop: see Enforcement.
+- **Pressure stays the safety net**: on warn or critical the count caps apply even when the bytes fit.
+- Both bounds gate **admission only**: when the owner comes back with 6 running, the limit drops to 2, nothing new is
+  admitted until fewer than 2 run, and the 6 finish on their own (never killed). A reservation is released however
+  its turn ends: answered, backend error, upstream timeout, backend unreachable, client gone mid-stream, or an
+  exception in the relay (a `Ticket`, released once in the gate's `finally`).
+- vllm-mlx's own `--max-num-seqs` is `max_seqs()`: the idle cap, bounded by how many empty-context reservations fit.
+- **`vllm_mlx.extra_args` cannot override what the generator sets.** argparse keeps the last value of a repeated flag
+  and expands abbreviations (`--ho` is `--host`), so `["--host", "0.0.0.0", "--max-num-seqs", "64"]` would expose the
+  unauthenticated backend and lift its bound under the gate. `extra_args` is checked against an allowlist
+  (`local_backend.EXTRA_ARGS_ALLOWED`; exact flag names, `--flag value` or `--flag=value`): `--default-temperature`,
+  `--default-top-p`, `--default-top-k`, `--default-min-p`, `--default-presence-penalty`, `--default-repetition-penalty`,
+  `--stream-interval`, `--chunked-prefill-tokens` and `--disable-prefix-cache`: sampling defaults, output pacing or
+  less memory, never exposure, admission or memory per request. Any other flag (`--host`, `--port`, `--max-num-seqs`,
+  `--max-tokens`, `--api-key`, `--mcp-config`, …) or a bare argument fails config validation (`--print-config`, the
+  gate's start, the install script) with a message naming it and the allowed list; `serve_argv` checks again.
+
+Old configs: the count-only keys `per_request_gib`, `memory_budget_gib` and `weights_gib` are refused by name, with the
+key that replaced them (a gate given an old config does not start; update `~/.config/cortados/local-backend.json`
+from the example).
+
+Enforcement, in the gate on `POST /v1/messages` (the probe is never counted); nothing reaches the backend when a
+turn is refused:
+
+- over either bound **now**: `529 overloaded_error`, `Retry-After: retry_after_s` (5), message `local gate: busy (n of
+  limit running: reason)`; the reason names the memory budget when the bytes refused it (`memory budget: 5.7 GiB free,
+  request needs 9.6 GiB`);
+- **never fits**: `413 request_too_large`, `x-should-retry: false`, no Retry-After, message `local gate: too large for
+  this node's memory (…; at most N tokens of input + max_tokens fit)`.
+- **content the model cannot read** (vllm-mlx, an image or document; above): `400 invalid_request_error`,
+  `x-should-retry: false`, before admission.
+
+Both carry the capacity report. The gate reports `{"backend", "limit", "inflight", "owner", "pressure", "reason",
+"reserved_bytes", "free_bytes", "fit_tokens", "free_tokens"}` read-only as `cortados_gate` in every `GET /api/tags`
+answer and as `capacity` in the switch status (provider `GET /v1/cortados/local`; the dashboard's Local models card
+shows "vllm-mlx: n of limit running, R of B GiB reserved (reason)"). `free_bytes` is the budget beside the weights
+minus the reservations; `fit_tokens` is the most context one turn may hold alone, `free_tokens` beside what runs now
+(0 when the count is full). Bytes and tokens are null without a governor.
+
+The provider (`local_lane.gate_busy`, `local_lane.gate_fit`) keeps the latest report per node for 10 s and ESTIMATES a
+turn's tokens (`local_lane.request_tokens`: body characters / 3.5 + max_tokens; it cannot count, and the estimate only
+decides whether to skip the node, so a turn it lets through may still be refused by the gate, below). A full gate, a turn over `free_tokens` (busy) or
+over `fit_tokens` (too large) is skipped by the index route, auto_route and the sensitive moves after their probe, and
+S1's route stands ("routes elsewhere"). A turn the gate still refuses:
+
+- busy (a race between probe and turn, or a continuation of a local-bound conversation): answered to the client as
+  `529 overloaded_error` with the gate's `Retry-After`, the provider's existing busy shape (BUSY_STATUS), which Claude
+  Code and the SDK retry; a refused opening turn leaves no conversation behind, so its retry is routed afresh (to the
+  cloud while the node stays full);
+- too large, on the **opening turn of a conversation a rule moved to the node**: nothing is sent to the client; the
+  provider drops the conversation and routes it again once with that local model excluded (S1's route, or another
+  node), and the client gets that route's answer;
+- too large on a **pinned** turn (`sub/<local model>`) or a **continuation**: a terminal `413 request_too_large` with
+  `x-should-retry: false`, saying the turn is too large for the node's memory (compact, lower max_tokens, start a new
+  conversation, or pin a cloud model); the conversation is unchanged;
+- content the text-only model cannot read (`local_lane.GATE_UNSUPPORTED`), handled the same way: on the opening turn of
+  a conversation a rule moved to the node it is routed again with that local model excluded (`local_lane.UNSUPPORTED`,
+  one of `local_lane.REROUTE`); on a pinned turn or a continuation, a terminal `400 invalid_request_error` with
+  `x-should-retry: false`, saying the node serves a text-only model (pin a model that reads images, or send text only).
+
+The refusal fallback (`local_lane.complete`) treats a busy, too-large or text-only refusal as an unavailable node.
+
+### Switch the Pro to MLX
+
+Owner steps; nothing here was run by the build. The provider's lane config needs no protocol change.
+
+1. On the Pro: copy `tables/local-backend.example.json` to `~/.config/cortados/local-backend.json` and check it:
+   `venv` (`~/venvs/mlx-bench`), `vllm_mlx.model` and its entry's `path` (the model directory; a 6-bit copy is another
+   entry, selected here), `served_model_name` = the id the Air's config gives this model (`Qwen27b_heretic:latest`),
+   and `serve.tool_call_parser` (set it to the parser the bench verified tool calls with). Validate:
+   `python3 -B -m cortados_router.local_backend --print-config`.
+2. On the Pro: `scripts/install_mlx_backend.sh --dry-run`, then `scripts/install_mlx_backend.sh` (LaunchAgent
+   `com.cortados.vllm-mlx` on 127.0.0.1:8000 under the prompt guard, log `~/.cortados/vllm-mlx.log`). Both run the
+   guard's `--check`: it must print `ok (vllm-mlx 0.6.0, pinned files match, text route)`. Wait for `curl -s
+   http://127.0.0.1:8000/health`; the log's first line names the cap (`prompt + max_tokens capped at 131072 tokens`).
+   An already-installed LaunchAgent from before the guard runs vllm-mlx without it: reinstall it before the gate runs
+   with this version.
+3. On the Pro: unload Ollama's 27B so both copies are not held in memory: `ollama stop Qwen27b_heretic:latest`.
+   Nothing reloads it: the gate no longer sends requests to Ollama. (Quit Ollama too if no other use needs it.)
+4. On the Pro: restart the gate so it reads the config: `launchctl kickstart -k gui/$(id -u)/com.cortados.local-gate`.
+   Check: `python3 -m cortados_router.local_gate --listen <tailscale-ip> --print-config` shows `"backend":
+   "vllm-mlx"` and the governor.
+5. On the provider host (the Air), in `tables/resources.json`'s Pro block: `max_inflight` to the idle cap (8), so the
+   provider's own ceiling does not stop at 1 (the gate's governor sets the real limit, by count and by bytes), and `read_timeout_s` to 900
+   (as the backend config's). Restart the provider when the owner chooses.
+
+With the gate on vllm-mlx the Pro serves only the MLX model: the Ollama-only pins (`qwythos-9b`, `qwen-abliterated`,
+`phi-4`) are "does not list" (a clear 503) until the rollback.
+
+### Roll back to Ollama
+
+1. On the Pro: set `"backend": "ollama"` in `~/.config/cortados/local-backend.json` (or remove the file) and restart
+   the gate (`launchctl kickstart -k gui/$(id -u)/com.cortados.local-gate`).
+2. On the Pro: `scripts/install_mlx_backend.sh --uninstall` (boots `com.cortados.vllm-mlx` out, frees its memory);
+   Ollama loads its 27B again on the next request.
+3. On the Air: `max_inflight` back to 1 (Ollama runs one 27B request at a time) and `read_timeout_s` as before.
+
 ## What this setup does not claim
 
 The home machines are not verified until their SSH targets are configured and

@@ -8,6 +8,22 @@ Ollama has no authentication, so it listens on 127.0.0.1 only and this gate is t
     (hmac.compare_digest) against a token read from a file that only its owner can read. The check runs before the
     body is read, and a refusal is a fixed 401 that echoes nothing back.
   * The token and request bodies are never logged; a log line is method, path and status.
+  * The backend behind the gate is Ollama (default) or vllm-mlx (local_backend.py: a per-node config file); the client
+    routes above stay the same and each backend receives only its fixed upstream routes (local_backend.UPSTREAM).
+  * Admission (local_governor.py) bounds the POST /v1/messages running at once when the backend config has a
+    `governor`: a COUNT that follows the owner's activity and memory pressure, and a BYTE budget each request reserves
+    its KV cache from (input tokens + max_tokens; input tokens bounded from above by the request body's bytes as
+    received plus a template allowance and what the backend re-serializes wider, local_governor.input_tokens; no
+    backend call). The count slot and the bytes are taken in one step. A request over either, now, gets a retryable
+    529 overloaded_error with Retry-After at once (never queued here); one that could not fit the budget even alone gets
+    a non-retryable 413 request_too_large (TOO_LARGE_MESSAGE), which the provider routes elsewhere. On vllm-mlx a turn
+    carrying non-text content (an image, a document) is refused non-retryably before admission (UNSUPPORTED_MESSAGE):
+    the node serves a text-only model. A body the gate cannot accept (another model, a chat_template_kwargs key other
+    than enable_thinking, JSON nested too deeply) is a non-retryable 4xx (x-should-retry: false). The reservation is
+    capped at the context because vllm-mlx runs under a prompt guard that refuses longer prompts; its refusal becomes
+    the gate's never-fits 413 (local_backend.guard_refusal). Running requests are never
+    stopped; a reservation is released however the request ends. The limit, in-flight count and reserved/free bytes
+    are reported read-only as `cortados_gate` in GET /api/tags and in the switch status.
   * One more path is the gate's own, never forwarded: GET / POST /cortados/local-switch (SWITCH_PATH), the node's
     manual local-models switch, behind the same token. GET answers the switch, AC/battery, whether local models are
     allowed and why, and the models Ollama has loaded (names from /api/ps only); POST {"on": true|false} sets the switch
@@ -17,7 +33,7 @@ Ollama has no authentication, so it listens on 127.0.0.1 only and this gate is t
 Run:   python3 -m cortados_router.local_gate --listen <tailscale-ip>
 Check: python3 -m cortados_router.local_gate --listen <tailscale-ip> --print-config
 Env equivalents: CORTADOS_LOCAL_GATE_LISTEN, CORTADOS_LOCAL_GATE_PORT, CORTADOS_LOCAL_GATE_UPSTREAM,
-CORTADOS_LOCAL_GATE_TOKEN_FILE, CORTADOS_LOCAL_GATE_STUDIO_GATE_DIR. Stdlib only.
+CORTADOS_LOCAL_GATE_TOKEN_FILE, CORTADOS_LOCAL_GATE_STUDIO_GATE_DIR, CORTADOS_LOCAL_BACKEND_CONFIG. Stdlib only.
 While S1 training holds the node (LOCK_EX on <studio-gate dir>/node.lock), every forwarded request is a 503: each
 request holds LOCK_SH on that file from before it reaches Ollama until its response is fully relayed.
 """
@@ -42,7 +58,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from cortados_router import http_body, local_resources
+from cortados_router import http_body, local_backend, local_governor, local_resources
 from cortados_router.local_resources import pro_local_allowed
 from cortados_router.studio_capacity import (gate_dir as default_studio_gate_dir, live_intents,
                                              open_node_lock, verify_node_lock)
@@ -83,8 +99,26 @@ BODY_DEADLINE_S = 120.0
 #   drain of a refused request: only a courtesy so the 401 arrives (see _drain); a client that cannot send its
 #   body within 5 s is closed without the 401, since a well-behaved provider is never refused in the first place.
 DRAIN_DEADLINE_S = 5.0
-# The only routes the provider's local lane uses (local_lane.probe and local_lane.serve).
+# The only routes the provider's local lane uses (local_lane.probe and local_lane.serve), whatever the backend; what
+# each becomes upstream is local_backend.UPSTREAM's fixed table.
 ROUTES = {("GET", "/api/tags"), ("POST", "/v1/messages")}
+# The key of the gate's capacity report in a GET /api/tags answer and a busy (529) answer; the provider reads it
+# (local_lane.GATE_KEY).
+GATE_KEY = "cortados_gate"
+BUSY_MESSAGE = "local gate: busy"           # the fixed prefix of an over-limit refusal (local_lane.GATE_BUSY)
+# The fixed prefix of a refusal that no retry can change: the request's reservation exceeds the node's whole byte
+# budget (local_lane.GATE_TOO_LARGE). Answered 413 request_too_large with x-should-retry: false.
+TOO_LARGE_MESSAGE = "local gate: too large for this node's memory"
+# The fixed prefix of the other refusal no retry can change: the turn carries content the node's TEXT-ONLY model cannot
+# see (an image, a document, any non-text block; local_governor.non_text_content), on a vllm-mlx node (its 27B is
+# served with the vision tower excluded). Answered 400 invalid_request_error with x-should-retry: false, before any
+# admission; the provider routes the turn elsewhere (local_lane.GATE_UNSUPPORTED).
+UNSUPPORTED_MESSAGE = "local gate: content this node's model cannot read"
+# The capacity report's fields (GateServer.capacity, the 529 and 413 answers). Bytes and tokens are None without a
+# governor: reserved/free bytes of the budget beside the weights, and the most tokens one request may hold alone
+# (fit_tokens) and beside what runs now (free_tokens), which the provider's routing reads.
+CAPACITY_KEYS = ("limit", "inflight", "owner", "pressure", "reason", "reserved_bytes", "free_bytes", "fit_tokens",
+                 "free_tokens")
 # The gate's own switch endpoint (module docstring). Not in ROUTES: it never reaches Ollama as a forwarded request.
 SWITCH_PATH = "/cortados/local-switch"
 # A switch request body is {"on": true} or {"on": false}; 1 KiB is ample, and a larger one is refused unread.
@@ -379,7 +413,8 @@ class GateServer(ThreadingHTTPServer):
                  max_connections: int = MAX_CONNECTIONS, connect_timeout: float = CONNECT_TIMEOUT_S,
                  read_timeout: float = READ_TIMEOUT_S, idle_timeout: float = IDLE_TIMEOUT_S,
                  header_deadline: float = HEADER_DEADLINE_S, body_deadline: float = BODY_DEADLINE_S,
-                 drain_deadline: float = DRAIN_DEADLINE_S, studio_gate_dir: str | os.PathLike | None = None):
+                 drain_deadline: float = DRAIN_DEADLINE_S, studio_gate_dir: str | os.PathLike | None = None,
+                 backend: dict | None = None, admission: local_governor.Admission | None = None):
         check_max_connections(max_connections)
         check_limits(max_body=max_body, connect_timeout=connect_timeout,
                      read_timeout=read_timeout, idle_timeout=idle_timeout, header_deadline=header_deadline,
@@ -398,7 +433,20 @@ class GateServer(ThreadingHTTPServer):
         self.slots = threading.BoundedSemaphore(max_connections) if max_connections > 0 else None
         # The S1 training handshake dir (None: no training check, e.g. a node that never trains).
         self.studio_gate_dir = studio_gate_dir
+        # The backend (local_backend.load) and the admission count; absent: Ollama, unlimited (the gate as before).
+        self.backend = backend or {"backend": "ollama", "served_model": None, "governor": None}
+        if self.backend["backend"] not in local_backend.BACKENDS:
+            raise GateConfigError(f"unknown backend {self.backend['backend']!r}")
+        self.admission = admission if admission is not None else local_governor.Admission(None)
         super().__init__(addr, GateHandler)
+
+    def capacity(self) -> dict:
+        """The read-only capacity report: backend, the admission limit (None: unlimited) and how many run now, and
+        the governor's owner/pressure state and reason (coarse words only, no idle seconds)."""
+        return self.report(self.admission.snapshot())
+
+    def report(self, snap: dict) -> dict:
+        return {"backend": self.backend["backend"], **{k: snap.get(k) for k in CAPACITY_KEYS}}
 
     def process_request(self, request, client_address):
         if self.slots is None:                      # unlimited: no slot to take or give back
@@ -477,6 +525,19 @@ class GateHandler(BaseHTTPRequestHandler):
     def _error(self, code: int, kind: str, message: str) -> None:
         self._send(code, json.dumps({"type": "error", "error": {"type": kind, "message": f"local gate: {message}"}}).encode())
 
+    def _refuse(self, code: int, kind: str, message: str) -> None:
+        """A refusal of the request itself (local_backend.Refusal: a bad body, another model, a disallowed template
+        kwarg, a body nested too deeply): the same body always gets the same answer, so x-should-retry: false."""
+        body = json.dumps({"type": "error", "error": {"type": kind, "message": f"local gate: {message}"}}).encode()
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("x-should-retry", "false")
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
     def _authorized(self) -> bool:
         auth = self.headers.get("authorization") or ""
         given = auth[7:].strip() if auth[:7].lower() == "bearer " else (self.headers.get("x-api-key") or "").strip()
@@ -541,7 +602,7 @@ class GateHandler(BaseHTTPRequestHandler):
             if self._drain():
                 self._error(503, "overloaded_error", reason)
             return
-        body = None
+        body = raw = None
         if method == "POST":
             try:
                 n = int(self.headers.get("content-length") or "-1")
@@ -551,13 +612,24 @@ class GateHandler(BaseHTTPRequestHandler):
                 return self._error(411, "invalid_request_error", "content-length required")
             if n > self.server.max_body:
                 return self._error(413, "request_too_large", f"body over {self.server.max_body} bytes")
-            body = self._read_body(n, self.server.body_deadline)
-            if body is None:                     # too slow or gone: close, freeing the slot
+            raw = self._read_body(n, self.server.body_deadline)
+            if raw is None:                      # too slow or gone: close, freeing the slot
                 return
+            try:
+                body = local_backend.adapt_messages_body(self.server.backend, raw)
+                # a text-only model: refused before any admission (adapt_messages_body checked the body parses)
+                why = local_governor.non_text_content(json.loads(body)) \
+                    if self.server.backend["backend"] == "vllm-mlx" else None
+            except local_backend.Refusal as exc:
+                return self._refuse(exc.status, exc.kind, str(exc))
+            except RecursionError:                 # the adapted body re-parsed deeper than the original
+                return self._refuse(400, "invalid_request_error", local_backend.TOO_DEEP)
+            if why is not None:
+                return self._unsupported(why)
         # Admission: hold LOCK_SH on the node lock from here until the response is fully relayed. A trainer holds
         # LOCK_EX for its whole run (studio_capacity.training_gate), so the kernel guarantees no request reaches
         # Ollama while training runs, and the trainer cannot start while this request is in flight.
-        lock_fd = None
+        lock_fd, ticket = None, None
         if self.server.studio_gate_dir is not None:
             try:
                 # create=False: a request never recreates a missing/renamed-away gate dir (studio_capacity.open_node_lock);
@@ -582,10 +654,71 @@ class GateHandler(BaseHTTPRequestHandler):
             allowed, reason = self._node_free()
             if not allowed:
                 return self._error(503, "overloaded_error", reason)
+            if method == "POST":             # admission: only a model turn takes a slot, never the probe
+                adm = self.server.admission
+                # The bound comes from the body as the client sent it (raw), before the gate's own adaptation.
+                need = adm.request_bytes(local_governor.input_tokens(raw, adm.context_tokens), _max_tokens(body)) \
+                    if adm.governor is not None else 0
+                ticket, snap = adm.try_acquire(need)       # count slot and bytes together, or neither
+                if ticket is None:
+                    return self._too_large(snap) if snap.get("refused") == "too_large" else self._busy(snap)
             self._forward(method, path, body)
         finally:
+            if ticket is not None:
+                # However the turn ended (relayed, an upstream error or timeout, the client gone, an exception on the
+                # way out): its slot and bytes are free. Ticket.release is idempotent.
+                ticket.release()
             if lock_fd is not None:
                 os.close(lock_fd)            # releases LOCK_SH
+
+    def _busy(self, snap: dict) -> None:
+        """The over-limit answer: 529 overloaded_error (Anthropic's "busy, retry"), Retry-After, and the capacity report
+        so the provider marks the node busy without another probe. Nothing reached the backend."""
+        cap = self.server.report(snap)
+        body = json.dumps({"type": "error", "error": {"type": "overloaded_error", "message":
+                           f"{BUSY_MESSAGE} ({cap['inflight']} of {cap['limit']} running: {cap['reason']})"},
+                           GATE_KEY: cap}).encode()
+        self.send_response(529, "Overloaded")
+        self.send_header("content-type", "application/json")
+        self.send_header("retry-after", str(self.server.admission.retry_after_s))
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    def _too_large(self, snap: dict, guarded: str | None = None) -> None:
+        """The never-fits answer: the request's reservation exceeds the whole budget beside the weights, so no retry
+        can be admitted. 413 request_too_large, x-should-retry: false, no Retry-After, and the capacity report (its
+        fit_tokens says how much would fit). Nothing reached the backend. `guarded`: the backend's prompt guard refused
+        the prompt instead (its exact token count + max_tokens is over the context); nothing was scheduled there."""
+        cap = self.server.report(snap)
+        why = guarded if guarded is not None else \
+            f"{cap['reason']}; at most {cap['fit_tokens']} tokens of input + max_tokens fit"
+        body = json.dumps({"type": "error", "error": {"type": "request_too_large", "message":
+                           f"{TOO_LARGE_MESSAGE} ({why})"}, GATE_KEY: cap}).encode()
+        self.send_response(413)
+        self.send_header("content-type", "application/json")
+        self.send_header("x-should-retry", "false")
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    def _unsupported(self, why: str) -> None:
+        """The text-only refusal (UNSUPPORTED_MESSAGE): 400 invalid_request_error, x-should-retry: false, no
+        Retry-After. Nothing was admitted or sent to the backend; the provider routes the turn elsewhere."""
+        body = json.dumps({"type": "error", "error": {"type": "invalid_request_error", "message":
+                           f"{UNSUPPORTED_MESSAGE} ({why}; it serves a text-only model)"}}).encode()
+        self.send_response(400)
+        self.send_header("content-type", "application/json")
+        self.send_header("x-should-retry", "false")
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
 
     def _switch(self, method: str) -> None:
         """GET / POST SWITCH_PATH (authorized by the caller). One implementation of the switch: local_resources."""
@@ -623,23 +756,31 @@ class GateHandler(BaseHTTPRequestHandler):
         models Ollama has loaded."""
         out = local_resources.local_switch_status()
         out["training"] = training_hold(self.server.studio_gate_dir) is not None
+        # "ollama" is the backend's reachability (the key predates the vllm-mlx backend; `backend` names which).
         out["models_loaded"], out["ollama"] = self._loaded_models()
+        out["backend"] = self.server.backend["backend"]
+        out["capacity"] = self.server.capacity()
         return out
 
     def _loaded_models(self) -> tuple[list[str] | None, str]:
-        """(names, "up") from Ollama's GET /api/ps on loopback, or (None, "unreachable" | "unreadable"). Names only:
-        sizes, digests and expiry times stay on the node."""
+        """(names, "up") from the backend on loopback (Ollama's GET /api/ps; vllm-mlx's GET /v1/models, its one
+        resident model), or (None, "unreachable" | "unreadable"). Names only: sizes, digests and expiry times stay on
+        the node."""
+        backend = self.server.backend["backend"]
         conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port)
         try:
             try:
-                status, raw = deadline_call(conn, PS_TIMEOUT_S, "GET", "/api/ps", max_bytes=PS_MAX_BYTES,
+                status, raw = deadline_call(conn, PS_TIMEOUT_S, "GET", local_backend.LOADED[backend],
+                                            max_bytes=PS_MAX_BYTES,
                                             connect_s=min(self.server.connect_timeout, PS_CONNECT_S))
             except (OSError, http.client.HTTPException):
                 return None, "unreachable"
-            try:
-                data = json.loads(raw) if status == 200 else None
-            except ValueError:
-                data = None
+            data = (local_backend.models_to_tags(raw) if backend == "vllm-mlx" else None) if status == 200 else None
+            if data is None and status == 200 and backend == "ollama":
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    data = None
             models = data.get("models") if isinstance(data, dict) else None
             if not isinstance(models, list):
                 return None, "unreadable"
@@ -650,23 +791,33 @@ class GateHandler(BaseHTTPRequestHandler):
             conn.close()
 
     def _forward(self, method: str, path: str, body: bytes | None) -> None:
+        backend = self.server.backend["backend"]
+        name = "Ollama" if backend == "ollama" else backend
+        up_method, up_path = local_backend.UPSTREAM[backend][(method, path)]
         conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port,
                                           timeout=self.server.connect_timeout)
         try:
             try:
                 conn.connect()
                 conn.sock.settimeout(self.server.read_timeout)
-                conn.request(method, path, body=body,
+                conn.request(up_method, up_path, body=body,
                              headers={"content-type": self.headers.get("content-type") or "application/json"})
                 resp = conn.getresponse()
             except (OSError, http.client.HTTPException) as exc:
-                return self._error(502, "api_error", f"Ollama unreachable on loopback ({type(exc).__name__})")
+                return self._error(502, "api_error", f"{name} unreachable on loopback ({type(exc).__name__})")
             ctype = resp.getheader("content-type") or "application/json"
             if "text/event-stream" not in ctype:
                 try:
                     data = resp.read()
                 except (OSError, http.client.HTTPException) as exc:
-                    return self._error(502, "api_error", f"Ollama response unreadable ({type(exc).__name__})")
+                    return self._error(502, "api_error", f"{name} response unreadable ({type(exc).__name__})")
+                if path == "/api/tags" and resp.status == 200:
+                    return self._tags(data, backend, ctype)
+                if resp.status != 200 and backend != "ollama":
+                    guarded = local_backend.guard_refusal(resp.status, data)
+                    if guarded is not None:          # the backend's prompt guard: never fits, like the gate's own 413
+                        return self._too_large(self.server.admission.snapshot(), guarded)
+                    return self._send(resp.status, local_backend.anthropic_error(resp.status, data, backend))
                 return self._send(resp.status, data, ctype)
             self.send_response(resp.status)
             self.send_header("content-type", ctype)
@@ -687,6 +838,33 @@ class GateHandler(BaseHTTPRequestHandler):
             conn.close()
 
 
+    def _tags(self, data: bytes, backend: str, ctype: str) -> None:
+        """A successful GET /api/tags: the backend's model list in Ollama's shape, with the capacity report added under
+        GATE_KEY (Ollama clients ignore unknown keys). An answer that is not a JSON object is relayed unchanged."""
+        if backend == "vllm-mlx":
+            tags = local_backend.models_to_tags(data)
+            if tags is None:
+                return self._error(502, "api_error", f"{backend} answered /v1/models with an unreadable list")
+        else:
+            try:
+                tags = json.loads(data)
+            except ValueError:
+                tags = None
+            if not isinstance(tags, dict):
+                return self._send(200, data, ctype)
+        tags[GATE_KEY] = self.server.capacity()
+        return self._send(200, json.dumps(tags).encode())
+
+
+def _max_tokens(body: bytes | None):
+    """The request's max_tokens for its reservation, or None (the governor then assumes default_max_tokens)."""
+    try:
+        data = json.loads(body) if body else None
+    except (ValueError, RecursionError):
+        return None
+    return data.get("max_tokens") if isinstance(data, dict) else None
+
+
 def _settings(argv=None) -> argparse.Namespace:
     env = os.environ.get
     ap = argparse.ArgumentParser(prog="python3 -m cortados_router.local_gate", description=__doc__.split("\n")[0])
@@ -698,6 +876,9 @@ def _settings(argv=None) -> argparse.Namespace:
     ap.add_argument("--studio-gate-dir", default=env("CORTADOS_LOCAL_GATE_STUDIO_GATE_DIR") or str(default_studio_gate_dir()),
                     help="S1 training handshake dir; a live intent there refuses requests with 503 "
                          "(default $CORTADOS_HOME/studio-gate)")
+    ap.add_argument("--backend-config", default=env(local_backend.CONFIG_ENV) or None,
+                    help="the node's backend config (ollama | vllm-mlx, governor); default "
+                         f"{local_backend.DEFAULT_CONFIG} when it exists, else Ollama with no governor")
     ap.add_argument("--allow-any", action="store_true", help="permit 0.0.0.0 / :: (only on a trusted-only machine)")
     ap.add_argument("--max-body-bytes", type=int, default=MAX_BODY_BYTES)
     ap.add_argument("--max-connections", type=int,
@@ -719,21 +900,31 @@ def main(argv=None) -> int:
         check_limits(max_body_bytes=a.max_body_bytes,
                      connect_timeout=a.connect_timeout, read_timeout=a.read_timeout)
         token = read_token(a.token_file)
+        try:
+            backend = local_backend.load(a.backend_config, explicit=a.backend_config is not None)
+        except local_backend.BackendConfigError as exc:
+            raise GateConfigError(str(exc)) from None
     except GateConfigError as exc:
         print(f"local_gate: {exc}", file=sys.stderr)
         return 2
+    upstream = backend["upstream"] or a.upstream
+    read_timeout = backend["read_timeout_s"] or a.read_timeout       # the backend config's, when it sets one
+    governor = local_governor.Governor(backend["governor"]) if backend["governor"] else None
     if a.print_config:
-        print(json.dumps({"listen": f"{listen}:{a.port}", "upstream": a.upstream, "token_file": a.token_file,
+        print(json.dumps({"listen": f"{listen}:{a.port}", "upstream": upstream, "token_file": a.token_file,
+                          "backend": backend["backend"], "backend_config": backend["path"],
+                          "served_model": backend["served_model"], "governor": backend["governor"],
                           "token": f"ok ({len(token)} chars, mode 0600)", "routes": sorted(f"{m} {p}" for m, p in ROUTES),
                           "switch_endpoint": f"GET/POST {SWITCH_PATH}",
                           "max_body_bytes": a.max_body_bytes, "max_connections": a.max_connections or "unlimited",
-                          "connect_timeout_s": a.connect_timeout, "read_timeout_s": a.read_timeout,
+                          "connect_timeout_s": a.connect_timeout, "read_timeout_s": read_timeout,
                           "studio_gate_dir": a.studio_gate_dir}, indent=1))
         return 0
     try:
-        srv = GateServer((listen, a.port), token=token, upstream=a.upstream, max_body=a.max_body_bytes,
+        srv = GateServer((listen, a.port), token=token, upstream=upstream, max_body=a.max_body_bytes,
                          max_connections=a.max_connections, connect_timeout=a.connect_timeout,
-                         read_timeout=a.read_timeout, studio_gate_dir=a.studio_gate_dir)
+                         read_timeout=read_timeout, studio_gate_dir=a.studio_gate_dir, backend=backend,
+                         admission=local_governor.Admission(governor))
     except (GateConfigError, OSError) as exc:
         print(f"local_gate: cannot start: {exc}", file=sys.stderr)
         return 2
@@ -745,7 +936,8 @@ def main(argv=None) -> int:
             srv.server_close()
             print(f"local_gate: studio-gate node lock unusable: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
-    logger.info("local gate on %s:%s -> %s (%d forwarded routes)", listen, a.port, a.upstream, len(ROUTES))
+    logger.info("local gate on %s:%s -> %s %s (%d forwarded routes, governor %s)", listen, a.port, backend["backend"],
+                upstream, len(ROUTES), "on" if governor else "off")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

@@ -106,7 +106,9 @@ class GateSwitchTests(Home):
         super().setUp()
         self.ollama = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllamaPs)
         threading.Thread(target=self.ollama.serve_forever, daemon=True).start()
-        FakeOllama.seen, FakeOllamaPs.loaded, FakeOllamaPs.ps_status, FakeOllamaPs.ps_gets = [], [TAG], 200, 0
+        FakeOllama.reset()                    # the shared fake's knobs, whatever an earlier module left set
+        self.addCleanup(FakeOllama.reset)
+        FakeOllamaPs.loaded, FakeOllamaPs.ps_status, FakeOllamaPs.ps_gets = [TAG], 200, 0
         self.gate = local_gate.GateServer(("127.0.0.1", 0), token=TOKEN,
                                           upstream=f"http://127.0.0.1:{self.ollama.server_port}", read_timeout=5)
         threading.Thread(target=self.gate.serve_forever, daemon=True).start()
@@ -142,7 +144,10 @@ class GateSwitchTests(Home):
         code, data = self.call("GET")
         self.assertEqual(code, 200)
         self.assertEqual(data, {"switch": "off", "allowed": False, "reason": "local switch off", "power": "battery",
-                                "training": False, "models_loaded": [TAG], "ollama": "up"})
+                                "training": False, "models_loaded": [TAG], "ollama": "up", "backend": "ollama",
+                                "capacity": {"backend": "ollama", "limit": None, "inflight": 0, "owner": None,
+                                             "pressure": None, "reason": "no governor", "reserved_bytes": None,
+                                             "free_bytes": None, "fit_tokens": None, "free_tokens": None}})
         self.flag.touch()
         code, data = self.call("GET")
         self.assertEqual((data["switch"], data["allowed"], data["reason"]), ("on", False, "local disabled: on battery"))
@@ -211,6 +216,8 @@ class ProviderSwitchTests(EndpointHarness):
         self.addCleanup(self.home.doCleanups)
         self.ollama = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllamaPs)
         threading.Thread(target=self.ollama.serve_forever, daemon=True).start()
+        FakeOllama.reset()
+        self.addCleanup(FakeOllama.reset)
         FakeOllamaPs.loaded, FakeOllamaPs.ps_status = [TAG], 200
         self.gate = local_gate.GateServer(("127.0.0.1", 0), token=TOKEN,
                                           upstream=f"http://127.0.0.1:{self.ollama.server_port}", read_timeout=5)
@@ -266,7 +273,11 @@ class ProviderSwitchTests(EndpointHarness):
                                           "models": ["qwen-27b", "phi:latest"], "reachable": True, "error": None,
                                           "switch": "off", "allowed": False, "reason": "local switch off",
                                           "power": "battery", "training": False, "ollama": "up",
-                                          "models_loaded": [TAG]}])
+                                          "models_loaded": [TAG], "backend": "ollama",
+                                          "capacity": {"limit": None, "inflight": 0, "owner": None, "pressure": None,
+                                                       "reason": "no governor", "reserved_bytes": None,
+                                                       "free_bytes": None, "fit_tokens": None,
+                                                       "free_tokens": None}}])
         raw = json.dumps(data)
         self.assertNotIn(TOKEN, raw)
         self.assertNotIn("127.0.0.1", raw)                      # never the node's address
@@ -340,10 +351,17 @@ class ProviderSwitchTests(EndpointHarness):
 
     def test_gate_answer_is_cleaned_field_by_field(self):
         evil = {"switch": "maybe", "allowed": "yes", "reason": "x" * 500, "power": "nuclear", "training": 1,
-                "ollama": "<b>", "models_loaded": ["ok:latest", "bad\nname", 7], "token": TOKEN}
+                "ollama": "<b>", "models_loaded": ["ok:latest", "bad\nname", 7], "token": TOKEN,
+                "backend": "<script>", "capacity": {"limit": True, "inflight": -1, "owner": "away", "pressure": "high",
+                                                   "reason": "y" * 500, "extra": TOKEN, "reserved_bytes": -5,
+                                                   "free_bytes": "lots", "fit_tokens": 2 ** 60, "free_tokens": 1.5}}
         self.assertEqual(local_switch._clean(evil),
                          {"switch": "unknown", "allowed": None, "reason": None, "power": "unknown", "training": None,
-                          "ollama": "unknown", "models_loaded": ["ok:latest"]})
+                          "ollama": "unknown", "models_loaded": ["ok:latest"], "backend": "unknown",
+                          "capacity": {"limit": None, "inflight": None, "owner": None, "pressure": None,
+                                       "reason": None, "reserved_bytes": None, "free_bytes": None, "fit_tokens": None,
+                                       "free_tokens": None}})
+        self.assertIsNone(local_switch._clean({"capacity": "full"})["capacity"])
 
     def raw_post(self, head: bytes, body: bytes = b"", trickle=None):
         """POST SWITCH_PATH with hand-written headers on a raw socket: (status, json or None, seconds)."""
