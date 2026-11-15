@@ -738,6 +738,12 @@ _OID_RE = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
 # logs/ (casefold, review of round 9, P1), the snapshot's own top-level .git (the same entry, _is_own_dotgit), and the
 # admin dir's .git/worktrees in _clone_of_admin and _AdminDir (_same_dir). Names opened by their canonical path
 # (ORIG_HEAD, PRIVATE_PSEUDOREFS, refs/, index) are resolved by the filesystem itself; ref names git reports are exact.
+# Round 11 (review of round 10, P2): every ownership, duplication and may-delete decision compares two paths by
+# filesystem identity, never by spelling: _same_dir for directories (_other_referrer, _valid_owner's back-pointer,
+# _clone_of_admin's repos/, the registry prepass's clone, the deferred-settle and archive-record paths, the unprotected
+# clone set via _in_dirs) and _same_file for a backlink naming a .git file (_registry_names, _valid_owner, _AdminDir).
+# Left by spelling on purpose: _settled_under (lexical by design; an alias refuses), the index-record bookkeeping
+# match in repair_registry/_note_repair (an alias only loses backoff bookkeeping) and the refs walk's own error filter.
 OPERATION_STATE_DIRS = ("rebase-merge", "rebase-apply", "sequencer", "NOTES_MERGE_WORKTREE")
 OPERATION_STATE_FILES = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "BISECT_LOG")
 OPERATION_STATE_PREFIXES = ("BISECT_", "NOTES_MERGE_")
@@ -1269,6 +1275,26 @@ def _same_dir(a: str, b: str) -> bool:
     return stat.S_ISDIR(sa.st_mode) and os.path.samestat(sa, sb)
 
 
+def _same_file(a: str, b: str) -> bool:
+    """_same_path, or both name one existing directory entry as the filesystem resolves them: the parents are
+    _same_dir, the names match in any letter case and lstat() gives one file (a .git file, say, named through a case
+    variant of its worktree's path). A hard link elsewhere never matches: the parents must be the same directory."""
+    if _same_path(a, b):
+        return True
+    if os.path.basename(a).casefold() != os.path.basename(b).casefold() \
+            or not _same_dir(os.path.dirname(a), os.path.dirname(b)):
+        return False
+    try:
+        return os.path.samestat(os.lstat(a), os.lstat(b))
+    except OSError:
+        return False
+
+
+def _in_dirs(path: str, dirs) -> bool:
+    """Whether `path` is, as the filesystem resolves it, one of `dirs`."""
+    return any(_same_dir(path, d) for d in dirs)
+
+
 def _snapshot(path: str, deadline=None, git: bool = True) -> "_Snap":
     """What a late writer would change: (files, git state). `files` holds (relative path, type, size, mtime_ns,
     ctime_ns, inode) for every entry outside the regenerable caches (directories by name only, so a cache file's
@@ -1772,7 +1798,7 @@ def _clone_of_admin(admin: str, root: str):
     if (os.path.basename(worktrees), os.path.basename(dot_git)) != ("worktrees", ".git") \
             and not _same_dir(worktrees, os.path.join(clone, ".git", "worktrees")):
         return None
-    if not _same_path(os.path.dirname(clone), os.path.join(root, "repos")):
+    if not _same_dir(os.path.dirname(clone), os.path.join(root, "repos")):
         return None
     return clone
 
@@ -1781,7 +1807,7 @@ def _registry_names(path: str, admin: str) -> bool:
     """Whether the admin dir's `gitdir` file names path/.git."""
     text = _read_small(os.path.join(admin, "gitdir"))
     recorded = None if text is None else _parse_gitfile(text, admin)
-    return recorded is not None and _same_path(recorded, os.path.join(path, ".git"))
+    return recorded is not None and _same_file(recorded, os.path.join(path, ".git"))
 
 
 class RegistryConflictError(WorkspaceError):
@@ -1801,11 +1827,11 @@ def _valid_owner(admin: str, path: str):
     file names the admin dir back. None when the backlink names `path`, is missing, or no longer points back."""
     text = _read_small(os.path.join(admin, "gitdir"))
     recorded = None if text is None else _parse_gitfile(text, admin)
-    if recorded is None or _same_path(recorded, os.path.join(path, ".git")):
+    if recorded is None or _same_file(recorded, os.path.join(path, ".git")):
         return None
     owner = os.path.dirname(recorded)
     back = _gitfile_admin(owner)
-    if back is not None and _same_path(back, admin):
+    if back is not None and _same_dir(back, admin):
         return owner
     return None
 
@@ -1874,7 +1900,7 @@ def repair_registry(root: str, repo_dir=None, deadline=None, now=None) -> dict:
                 continue
             admin = _gitfile_admin(path)
             clone = None if admin is None else _clone_of_admin(admin, root)
-            if clone is None or (repo_dir is not None and not _same_path(clone, repo_dir)):
+            if clone is None or (repo_dir is not None and not _same_dir(clone, repo_dir)):
                 continue                         # a plain folder, a nested repo, or another clone's worktree
             rec = index.get(name)
             rec = rec if isinstance(rec, dict) and rec.get("path") == path else None
@@ -1953,10 +1979,10 @@ def _other_referrer(admin: str, path: str, repo_dir: str, root: str):
         except OSError:
             continue
     for cand in candidates:
-        if _same_path(cand, path):
+        if _same_dir(cand, path):
             continue
         named = _gitfile_admin(cand)
-        if named is not None and _same_path(named, admin):
+        if named is not None and _same_dir(named, admin):
             return cand
     return None
 
@@ -1993,7 +2019,7 @@ class _AdminDir:
             self.fds.append(self.fd)
             recorded = _read_small("gitdir", dir_fd=self.fd)
             recorded = None if recorded is None else _parse_gitfile(recorded, admin)
-            if recorded is None or not _same_path(recorded, os.path.join(named, ".git")):
+            if recorded is None or not _same_file(recorded, os.path.join(named, ".git")):
                 raise WorkspaceError(f"the admin dir {admin} names {recorded}, not {named}; it is left alone")
             other = _other_referrer(admin, path, repo_dir, root)
             if other is not None:
@@ -2282,7 +2308,7 @@ def _expire_recovery_refs(root: str, out: dict, now: float, deadline, unprotecte
     for name in names:
         clone = os.path.join(repos, name)
         if name.startswith(".") or os.path.islink(clone) or not os.path.isdir(os.path.join(clone, ".git")) \
-                or os.path.normpath(clone) in unprotected:
+                or _in_dirs(clone, unprotected):
             continue
         if deadline is not None and time.monotonic() >= deadline:
             out["timed_out"].append(f"repos/{name}: no time left to expire recovery refs")
@@ -2309,7 +2335,7 @@ def _settle_deferred(root: str, out: dict, deadline, unprotected: set) -> None:
         if deadline is not None and time.monotonic() >= deadline:
             return
         path = rec.get("path")
-        if not isinstance(path, str) or not _same_path(path, os.path.join(root, "active", tid)):
+        if not isinstance(path, str) or not _same_dir(path, os.path.join(root, "active", tid)):
             out["errors"].append(f"{tid}: deferred settle record does not name active/{tid}; left alone")
             continue
         if not os.path.isdir(path):
@@ -2318,7 +2344,7 @@ def _settle_deferred(root: str, out: dict, deadline, unprotected: set) -> None:
             continue
         repo_dir = rec.get("repo_dir")
         if rec.get("kind") == "repo":
-            if isinstance(repo_dir, str) and os.path.normpath(repo_dir) in unprotected:
+            if isinstance(repo_dir, str) and _in_dirs(repo_dir, unprotected):
                 continue
             ok, reason, paths, _, snap = _quiet_assess(path, (CLEANUP_QUIESCE_S,), deadline=deadline)
             if ok is None:
@@ -2407,7 +2433,7 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
             rec = index.get(tid)
             if not isinstance(rec, dict) or rec.get("state") != "archived" \
                     or not isinstance(rec.get("settled_at"), (int, float)) \
-                    or (leftover and not _same_path(rec.get("path") or "", os.path.join(archive, tid))):
+                    or (leftover and not _same_dir(rec.get("path") or "", os.path.join(archive, tid))):
                 out["refused"].append(f"{name}: no archive record in index.jsonl")
                 continue
             if now - rec["settled_at"] < ARCHIVE_AGE_S:
@@ -2417,7 +2443,7 @@ def _cleanup_archive_locked(root: str, now=None, max_deletions=CLEANUP_MAX_DELET
                 out["kept"] += 1
                 continue
             if rec.get("kind") == "repo" and isinstance(rec.get("repo_dir"), str) \
-                    and os.path.normpath(rec["repo_dir"]) in unprotected:
+                    and _in_dirs(rec["repo_dir"], unprotected):
                 out["kept"] += 1
                 continue
             try:

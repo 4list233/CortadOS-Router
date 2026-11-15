@@ -68,6 +68,11 @@ class _Base(unittest.TestCase):
     def prepare(self, tid=TID, repo=None, branch=None):
         return ws.prepare(ws.workspace_spec(tid, repo, branch), self.root)
 
+    def case_insensitive(self):
+        probe = os.path.join(self.tmp, "CaseProbe10")
+        os.makedirs(probe, exist_ok=True)
+        return os.path.exists(os.path.join(self.tmp, "caseprobe10"))
+
 
 class ParseTests(unittest.TestCase):
     def test_parse_repo(self):
@@ -1577,6 +1582,77 @@ class RegistryOwnershipTests(_Base):
             f.write(os.path.join(b, ".git") + "\n")
         self.assert_b_intact(b, b_admin, b_head, repo_dir)
 
+    # --- round 11: ownership and identity checks compare paths as the filesystem resolves them ---------------------
+
+    def alias_of(self, admin):
+        """`admin` named through .GIT/Worktrees/, which git opens as .git/worktrees/ on a case-insensitive filesystem."""
+        if not self.case_insensitive():
+            self.skipTest("the temp filesystem is case-sensitive: git would not open .GIT/Worktrees/ as .git/worktrees/")
+        variant = admin.replace(os.sep + os.path.join(".git", "worktrees") + os.sep,
+                                os.sep + os.path.join(".GIT", "Worktrees") + os.sep)
+        self.assertNotEqual(variant, admin)
+        self.assertTrue(ws._same_dir(variant, admin))
+        return variant
+
+    def test_deletion_refuses_an_admin_dir_another_worktree_names_through_a_case_variant(self):
+        """Review of round 10 (gpt-6.1-sol), P2, the reviewer's reproduction in real git: archived A names active B's
+        admin dir through .GIT/Worktrees/, the stolen backlink names A, B has dirty work and its registry repair is
+        backing off. _other_referrer compared the alias with B's canonical .git/worktrees/<id> by spelling, found no
+        other referrer, and the cleanup deleted A and B's admin dir (`git status` in B then exits 128)."""
+        a, b, b_admin, b_head, repo_dir = self.impostor(b_commit=False)
+        variant = self.alias_of(b_admin)
+        with open(os.path.join(a, ".git"), "w") as f:
+            f.write(f"gitdir: {variant}\n")
+        with open(os.path.join(b_admin, "gitdir"), "w") as f:
+            f.write(os.path.join(a, ".git") + "\n")
+        ws.update_index(self.root, {"task_id": TID2, "path": b, "state": "active", "kind": "repo", "repo_dir": repo_dir,
+                                    "repair_failures": 1, "repair_next_at": time.time() + 3600})
+        with open(os.path.join(b, "README.md"), "a") as f:
+            f.write("unpublished work in B\n")
+        self.assertEqual(ws._other_referrer(variant, a, repo_dir, self.root), b)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertTrue(any("also named by" in e and b in e for e in report["errors"]), report["errors"])
+        self.assertTrue(os.path.isdir(a))
+        self.assertTrue(os.path.isdir(b_admin))
+        self.assertIn("unpublished work in B", git("diff", cwd=b))                  # B is still a working repo
+        with open(os.path.join(b_admin, "gitdir"), "w") as f:                      # the owner fixes the backlink
+            f.write(os.path.join(b, ".git") + "\n")
+        git("checkout", "-q", "--", "README.md", cwd=b)
+        self.assert_b_intact(b, b_admin, b_head, repo_dir)
+
+    def test_impostor_naming_the_owners_admin_dir_through_a_case_variant_is_not_repaired_over_it(self):
+        """The duplicate-owner check (_valid_owner) compared the impostor's alias with the owner's canonical admin path
+        by spelling: B did not count as the owner, so A's repair rewrote B's backlink to A."""
+        a, b, b_admin, b_head, repo_dir = self.impostor(b_commit=True)
+        variant = self.alias_of(b_admin)
+        with open(os.path.join(a, ".git"), "w") as f:
+            f.write(f"gitdir: {variant}\n")
+        self.assertEqual(ws._valid_owner(variant, a), b)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual((report["deleted"], report["repaired"]), ([], []))
+        self.assertTrue(any("belongs to" in e and b in e for e in report["errors"]), report["errors"])
+        rec = ws.read_index(self.root)[TID]
+        self.assertIn(rec["state"], ("archived", "held"))
+        self.assertTrue(os.path.isdir(rec["path"]))            # A's files are kept, wherever they are
+        self.assert_b_intact(b, b_admin, b_head, repo_dir)
+
+    def test_a_backlink_naming_the_worktree_through_a_case_variant_is_its_own(self):
+        """The other direction: a backlink naming B through a case variant of its path names B itself, not another
+        owner, and a deletion's backlink check accepts it the same way."""
+        b = self.prepare(TID2, repo=self.origin)["path"]
+        b_admin = self.admin_dir(b)
+        if not self.case_insensitive():
+            self.skipTest("the temp filesystem is case-sensitive")
+        alias = os.path.join(self.root, "ACTIVE", TID2, ".GIT")
+        self.assertTrue(ws._same_file(alias, os.path.join(b, ".git")))
+        with open(os.path.join(b_admin, "gitdir"), "w") as f:
+            f.write(alias + "\n")
+        self.assertIsNone(ws._valid_owner(b_admin, b))
+        self.assertTrue(ws._registry_names(b, b_admin))
+        self.assertFalse(ws._same_file(os.path.join(self.root, "active", TID2, "README.md"),
+                                        os.path.join(b, ".git")))
+
     def test_repair_whose_backlink_target_is_gone_still_repairs(self):
         """Only a valid owner blocks a repair: a backlink naming a missing path (an ordinary unrepaired move) is fixed."""
         rec = self.prepare(TID, repo=self.origin)
@@ -2648,11 +2724,6 @@ class OperationStateAndRecoveryTests(_Base):
         self.assertEqual(self.recovery(), {})
 
     # --- round 10 audit: every git-defined name matches the way the filesystem resolves it ------------------------
-
-    def case_insensitive(self):
-        probe = os.path.join(self.tmp, "CaseProbe10")
-        os.makedirs(probe, exist_ok=True)
-        return os.path.exists(os.path.join(self.tmp, "caseprobe10"))
 
     def test_a_reflog_dir_in_another_case_keeps_its_recovery_ref_through_the_cleanup(self):
         """Review of round 9 (gpt-6.1-sol), P1, the reviewer's reproduction in real git: _op_state_files listed
