@@ -10,6 +10,8 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -22,6 +24,7 @@ from tests.test_provider_local_auto import AutoLocalBase, S1_ROUTE, body
 from tests.test_provider_sensitive import OUTWARD_TEXT, SECRET_TERM, ContinuationRecheckBase, SensitiveBase, scored
 from tests.test_provider_sensitive import write_config as write_sensitive_config
 from cortados_router.provider import server
+from tests.test_provider import TOKEN
 
 ROOT = Path(__file__).resolve().parent.parent
 PROV = "proxy: published base model, −10%"
@@ -404,16 +407,83 @@ class SensitiveVariantTests(SensitiveBase):
         self.assertEqual(moved["bind_reason"], "refusal")
         self.assertForcedOff(moved, b, sent[0])
 
+    # Review P2, round 2: the safeguard must not depend on the published scores. Each case below used to send the
+    # node {"max_tokens": 2048, "thinking": {"type": "enabled", "budget_tokens": 1900}} with the #108 guard off.
+    def unvaried_forced_off(self, case, refusal):
+        """The REPRO request on a sensitive flag (or a refusal fallback) runs with thinking forced off, no variant
+        named, the reason naming `case`; returns the node body."""
+        b = body("hello", **self.REPRO)
+        if refusal:
+            sent = []
+            r = routing.refusal_route(core, b, self.choose(b),
+                                      lambda m: sent.append(local_lane._node_body(b, m["local"]["model"])) or True)
+            self.assertEqual(r["bind_reason"], "refusal")
+        else:
+            r = self.choose(b, local="sensitive")
+            self.assertLocal(r, "sensitive: flag")
+        self.assertNotIn("variant", r["local"]["model"])
+        self.assertTrue(r["local"]["model"]["thinking_forced_off"])
+        (_, _, _, route), = self.logged
+        self.assertEqual(route["chosen"]["variant_why"], f"{self.FORCED} ({case})")
+        self.assertTrue(route["chosen"]["thinking_forced_off"])
+        self.assertNotIn("variant", route["chosen"])
+        out = sent[0] if refusal else local_lane._node_body(b, r["local"]["model"])
+        self.assertEqual((out["thinking"], out["max_tokens"]), ({"type": "disabled"}, 2048))
+        return out
+
+    def passthrough(self):
+        write_sensitive_config(self.dir, "http://127.0.0.1:9", sensitive=True, thinking="passthrough")
+
+    def no_variants(self):
+        core.model_scores = lambda: {"models": [], "local_models": []}
+
+    def unreadable(self):
+        # Unreadable for choose_variant's own read only: routing.choose's earlier reads (served_routes) are another
+        # path, and this case is about the safeguard once the move to the local lane is under way.
+        def broken():
+            if sys._getframe(1).f_code.co_name == "choose_variant":
+                raise json.JSONDecodeError("bad", "", 0)
+            return json.loads(json.dumps(SCORES))
+        core.model_scores = broken
+
+    CASES = {"passthrough": (passthrough, "its node entry is thinking: passthrough, overridden so the answer is not "
+                                          "starved"),
+             "no variants": (no_variants, "no published variant for this model"),
+             "unreadable": (unreadable, "the published scores are unreadable")}
+
+    def test_each_case_on_the_flag_route_goes_out_without_thinking(self):
+        for name, (setup, case) in self.CASES.items():
+            with self.subTest(name):
+                self.scored(10.0)
+                self.logged.clear()
+                core.model_scores = lambda: json.loads(json.dumps(SCORES))
+                setup(self)
+                self.unvaried_forced_off(case, refusal=False)
+                write_sensitive_config(self.dir, "http://127.0.0.1:9", sensitive=True)
+
+    def test_each_case_on_the_refusal_route_goes_out_without_thinking(self):
+        for name, (setup, case) in self.CASES.items():
+            with self.subTest(name):
+                self.scored(10.0)
+                self.logged.clear()
+                core.model_scores = lambda: json.loads(json.dumps(SCORES))
+                setup(self)
+                self.unvaried_forced_off(case, refusal=True)
+                write_sensitive_config(self.dir, "http://127.0.0.1:9", sensitive=True)
+
+    def test_passthrough_is_kept_when_there_is_room_or_no_thinking_was_asked(self):
+        self.passthrough()
+        for b in (body("hello", max_tokens=8192, thinking={"type": "enabled", "budget_tokens": 2000}),
+                  body("hello", max_tokens=2048)):
+            self.logged.clear()
+            r = self.choose(b, local="sensitive")
+            self.assertNotIn("thinking_forced_off", r["local"]["model"])
+            self.assertEqual(local_lane._node_body(b, r["local"]["model"]).get("thinking"), b.get("thinking"))
+
     def test_thinking_asked_and_no_room_with_only_a_think_variant_still_goes_out_without_thinking(self):
         self.scored(10.0)
         core.model_scores = lambda: {"models": [], "local_models": [THINK]}
-        b = body("hello", **self.REPRO)
-        r = self.choose(b, local="sensitive")
-        self.assertLocal(r, "sensitive: flag")
-        self.assertNotIn("variant", r["local"]["model"])
-        (_, _, _, route), = self.logged
-        self.assertEqual(route["chosen"]["variant_why"], self.FORCED)
-        self.assertEqual(local_lane._node_body(b, r["local"]["model"])["thinking"], {"type": "disabled"})
+        self.unvaried_forced_off("no published non-thinking variant for this model", refusal=False)
 
     def test_passthrough_entry_or_no_variants_keeps_the_model_unvaried(self):
         self.scored(10.0)
@@ -488,6 +558,58 @@ class IndexEndToEndTests(LocalHarness):
         self.assertEqual(sent["thinking"], {"type": "enabled", "budget_tokens": 4096})
         self.assertEqual(got["content"][-1], {"type": "text", "text": "42"})
         self.assertEqual(local_lane._inflight, {})
+
+
+class ForcedOffEndToEndTests(ContinuationRecheckBase):
+    """Review P2, round 2, end to end: a sensitive turn that asked for thinking with max_tokens < 4096 reaches the fake
+    Ollama with thinking disabled whatever the published scores say, and when the node still spends the whole
+    max_tokens without an answer, the client gets #108's error (local_lane.thinking_starved), not an empty reply."""
+
+    HEADERS_OPEN = {"x-cortados-local": "sensitive"}
+    REPRO = {"max_tokens": 2048, "thinking": {"type": "enabled", "budget_tokens": 1900}}
+
+    def setUp(self):
+        super().setUp()
+        self._scores = core.model_scores
+        core.model_scores = lambda: json.loads(json.dumps(SCORES))
+
+    def tearDown(self):
+        core.model_scores = self._scores
+        super().tearDown()
+
+    def starved(self, stream=False):
+        FakeOllama.reply = ([{"type": "thinking", "thinking": "The user asks"}], "max_tokens")
+        req = urllib.request.Request(self.url + "/v1/messages", method="POST",
+                                     data=json.dumps({**body("hello", stream=stream), **self.REPRO}).encode(),
+                                     headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
+                                              **self.HEADERS_OPEN})
+        path, sent = None, None
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode()
+            self.assertTrue(stream, raw)
+            events = [json.loads(l[5:]) for l in raw.splitlines() if l.startswith("data:")]
+            self.assertEqual(events[-1]["type"], "error")
+            msg = events[-1]["error"]["message"]
+        except urllib.error.HTTPError as e:
+            self.assertFalse(stream)
+            self.assertEqual(e.code, 502)
+            msg = json.loads(e.read())["error"]["message"]
+        path, sent = FakeOllama.seen[-1]
+        self.assertEqual(path, "/v1/messages")
+        self.assertEqual((sent["thinking"], sent["max_tokens"]), ({"type": "disabled"}, 2048))
+        self.assertIn("used the whole max_tokens (2048) without writing an answer (thinking only)", msg)
+        self.assertNotIn("The user asks", msg)
+        self.assertEqual(self.reg.sessions, {})
+
+    def test_forced_off_turn_with_no_answer_is_the_108_error(self):
+        self.starved()
+        self.starved(stream=True)
+
+    def test_passthrough_entry_forced_off_turn_with_no_answer_is_the_108_error(self):
+        write_sensitive_config(self.scratch, f"http://127.0.0.1:{self.ollama.server_port}", sensitive=True,
+                               keywords="", thinking="passthrough")
+        self.starved()
 
 
 class IndexBoundContinuationTests(ContinuationRecheckBase):

@@ -310,7 +310,8 @@ print(json.dumps({"syn": syn, "easy": real("rename the variable in utils.py", 64
 # room to think); one the non-thinking variant clears takes qwen-27b; the refusal fallback chooses the same way and its
 # node body carries the variant's thinking. Review P2: the reviewer's repro (thinking asked, budget 1900, max_tokens 2048)
 # qualifies for neither variant, yet a sensitive route must stay local: flag and refusal both serve qwen-27b with
-# thinking disabled and record why, never the client's thinking unchanged. S1-free (synthetic S1-shaped routes); faked probe, throwaway config.
+# thinking disabled and record why, never the client's thinking unchanged; round 2: a `thinking: passthrough` entry
+# (no variant can be set) is still sent thinking disabled, the reason naming the override. S1-free (synthetic S1-shaped routes); faked probe, throwaway config.
 SENSITIVE_VARIANT_SCENARIO = """
 import json, os, tempfile
 from cortados_router import core
@@ -355,8 +356,14 @@ marked2 = routing.sensitive_local(core, ask, r(10.0), client="verify", conversat
 sent2 = []
 mv2 = routing.refusal_route(core, ask, marked2, lambda m: sent2.append(local_lane._node_body(ask, m["local"]["model"])) or True)
 asked_refusal = forced(mv2, sent2[0] if sent2 else None)
-print(json.dumps({"asked_flag": asked_flag, "asked_refusal": asked_refusal, "idx": idx, "high_8192": flag(99.0, 8192), "high_1024": flag(99.0, 1024),
-                  "clears_non": flag(idx["qwen-27b"], 32000),
+flags = {"high_8192": flag(99.0, 8192), "high_1024": flag(99.0, 1024), "clears_non": flag(idx["qwen-27b"], 32000)}
+pcfg = json.load(open(cfg))                        # from here on the model entry is thinking: passthrough
+pcfg["nodes"][0]["ollama"]["models"][0]["thinking"] = "passthrough"
+json.dump(pcfg, open(cfg, "w"))
+routing._auto_down.clear()
+pm = routing.sensitive_local(core, ask, r(10.0), client="verify", conversation_id="verify-sv", local="sensitive")
+asked_passthrough = forced(pm, local_lane._node_body(ask, pm["local"]["model"]) if pm.get("local") else None)
+print(json.dumps({"asked_flag": asked_flag, "asked_refusal": asked_refusal, "asked_passthrough": asked_passthrough, "idx": idx, **flags,
                   "refusal": [(mv or {}).get("provider"), ((mv or {}).get("local") or {}).get("model", {}).get("variant"),
                               sent[0].get("thinking") if sent else None]}))
 """
@@ -606,10 +613,13 @@ def main():
               and r["clears_non"] == ["local-pro", "qwen-27b", off] and r["refusal"] == ["local-pro", "qwen-27b-think", on])
         why = "thinking requested but max_tokens < 4096: served without thinking"
         ok = ok and r["asked_flag"] == r["asked_refusal"] == ["local-pro", "qwen-27b", off, why]
+        ok = ok and r["asked_passthrough"] == ["local-pro", None, off, why + " (its node entry is thinking: "
+                                               "passthrough, overridden so the answer is not starved)"]
         record("sensitive route picks the published-index variant (S1-free)", "PASS" if ok else "FAIL",
                f"code index {r['idx']} | R3 flag 8192 -> {r['high_8192']} | 1024 -> {r['high_1024']} | "
                f"req {r['idx'].get('qwen-27b')} -> {r['clears_non']} | refusal 8192 -> {r['refusal']} | "
-               f"thinking asked 2048: flag -> {r['asked_flag'][:3]}, refusal -> {r['asked_refusal'][:3]}")
+               f"thinking asked 2048: flag -> {r['asked_flag'][:3]}, refusal -> {r['asked_refusal'][:3]}, "
+               f"passthrough entry -> {r['asked_passthrough'][:3]}")
 
     p = runner.run(["-c", CONTINUATION_SCENARIO], prefix="verify-router-continuation-", timeout=300)
     try:

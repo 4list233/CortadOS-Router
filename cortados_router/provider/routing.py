@@ -1170,23 +1170,32 @@ def choose_variant(core, body: dict[str, Any], r: dict[str, Any], entry: dict[st
     """The node model `entry` for a SENSITIVE route (sensitive_local, refusal_route), with its published-index variant
     chosen per request by the index route's rules (_variant_why: passthrough, a client that asked for thinking, room in
     max_tokens), and the chosen-entry extras to record, or (entry, None) when the model has no eligible variant (its
-    own `thinking` setting then applies, as before the index) — except a client that asked for thinking with
-    max_tokens below local_lane.THINK_MIN_MAX_TOKENS: that request runs on the non-thinking variant with thinking
-    forced off (`thinking_forced_off`), never with the client's thinking passed through. A sensitive route runs local in any band, so the
+    own `thinking` setting then applies, as before the index). A sensitive route runs local in any band, so the
     variant need not clear S1's required index; of the eligible ones it takes what the index route would (the lighter
     one whose index for S1's use case clears the required index), else the strongest (highest index: the request
-    runs here whatever its band, so it gets the best this model has)."""
+    runs here whatever its band, so it gets the best this model has).
+
+    Budget safeguard, independent of the published scores (review P2, round 2): a client that asked for thinking
+    with max_tokens below local_lane.THINK_MIN_MAX_TOKENS has no variant that qualifies, and its thinking passed
+    through unchanged would leave almost nothing for the answer (a 1900 budget of 2048). Such a request always runs
+    with thinking forced off (`thinking_forced_off`: local_lane._node_body sends {"type": "disabled"}, and the #108
+    empty-answer guard covers the turn) on the non-thinking variant when one is published, and its `variant_why` says
+    which case applied: scores unreadable, a `thinking: passthrough` entry (overridden in this starving case only: a
+    sensitive answer is never starved), no published variant, or no non-thinking variant."""
+    asked = local_lane.client_asked_thinking(body)
+    room = local_lane.think_budget(body.get("max_tokens")) is not None
+    starving = asked and not room
+    route = r.get("route") or {}
+    use_case = (route.get("chosen") or {}).get("use_case")
     try:
         variants = (core.model_scores() or {}).get("local_models") or []
     except Exception as exc:                       # the generated scores unreadable: the model's own setting applies
         logger.warning("local variant: scores unreadable (%s); %s runs on its own thinking setting",
                        type(exc).__name__, local_lane.pin_id(entry))
+        if starving:
+            return _forced_off(r, entry, None, use_case, "the published scores are unreadable")
         return entry, None
-    route = r.get("route") or {}
     req = route.get("required_index")
-    use_case = (route.get("chosen") or {}).get("use_case")
-    asked = local_lane.client_asked_thinking(body)
-    room = local_lane.think_budget(body.get("max_tokens")) is not None
     ok, matched = [], []
     for v in variants:
         if _tag_key(v.get("local_id")) != _tag_key(entry["id"]):
@@ -1199,24 +1208,17 @@ def choose_variant(core, body: dict[str, Any], r: dict[str, Any], entry: dict[st
         idx = _variant_index(v, use_case)
         ok.append((float((v.get("index") or {}).get("general") or 0.0), v,
                    idx if isinstance(idx, (int, float)) else None))
-    if not ok and asked and not room and matched and entry.get("thinking") != "passthrough":
-        # The client asked for thinking but max_tokens leaves no room for it: no variant qualifies, yet a sensitive
-        # route must still run local, and the client's thinking passed through unchanged would leave almost nothing
-        # for the answer (a 1900 budget of 2048). Served on the non-thinking variant with thinking forced off
-        # (local_lane._node_body: `thinking_forced_off`), the reason recorded on the chosen entry.
-        why = f"thinking requested but max_tokens < {local_lane.THINK_MIN_MAX_TOKENS}: served without thinking"
+    if starving:                                   # ok is empty here: every variant wants thinking off or room for it
+        if entry.get("thinking") == "passthrough":
+            return _forced_off(r, entry, None, use_case,
+                               "its node entry is thinking: passthrough, overridden so the answer is not starved")
+        if not matched:
+            return _forced_off(r, entry, None, use_case, "no published variant for this model")
         off = [v for v in matched if v.get("thinking") == "off"]
-        v = max(off, key=lambda v: float((v.get("index") or {}).get("general") or 0.0)) if off else None
-        logger.info("local variant: %s for %s: %s", v.get("family") if v else local_lane.pin_id(entry),
-                    r.get("route_id"), why)
-        run = {**entry, "thinking_forced_off": True}
-        extra = {"thinking_forced_off": True, "variant_why": why}
-        if v:
-            idx = _variant_index(v, use_case)
-            run.update(variant=v["family"], variant_thinking="off")
-            extra.update(variant=v["family"], index=idx if isinstance(idx, (int, float)) else None,
-                         use_case=use_case, proxy=True, provenance=v.get("provenance"))
-        return run, extra
+        if not off:
+            return _forced_off(r, entry, None, use_case, "no published non-thinking variant for this model")
+        return _forced_off(r, entry, max(off, key=lambda v: float((v.get("index") or {}).get("general") or 0.0)),
+                           use_case, None)
     if not ok:
         return entry, None
     clears = sorted((o for o in ok if o[2] is not None and isinstance(req, (int, float)) and o[2] >= req),
@@ -1226,6 +1228,26 @@ def choose_variant(core, body: dict[str, Any], r: dict[str, Any], entry: dict[st
              "provenance": v.get("provenance"),
              "variant_why": "clears the required index" if clears else "the strongest eligible variant"}
     return {**entry, "variant": v["family"], "variant_thinking": v["thinking"]}, extra
+
+
+FORCED_OFF_WHY = f"thinking requested but max_tokens < {local_lane.THINK_MIN_MAX_TOKENS}: served without thinking"
+
+
+def _forced_off(r: dict[str, Any], entry: dict[str, Any], v: dict[str, Any] | None, use_case: str | None,
+                case: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """choose_variant's budget safeguard: `entry` run with thinking forced off, on the non-thinking variant `v` when
+    there is one, with the chosen-entry extras; `case` (why no variant is named) is appended to the reason."""
+    why = FORCED_OFF_WHY + (f" ({case})" if case else "")
+    logger.info("local variant: %s for %s: %s", v.get("family") if v else local_lane.pin_id(entry), r.get("route_id"),
+                why)
+    run = {**entry, "thinking_forced_off": True}
+    extra: dict[str, Any] = {"thinking_forced_off": True, "variant_why": why}
+    if v:
+        idx = _variant_index(v, use_case)
+        run.update(variant=v["family"], variant_thinking="off")
+        extra.update(variant=v["family"], index=idx if isinstance(idx, (int, float)) else None,
+                     use_case=use_case, proxy=True, provenance=v.get("provenance"))
+    return run, extra
 
 
 def index_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, conversation_id: str,
