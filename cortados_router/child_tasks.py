@@ -175,6 +175,10 @@ RUN_FETCH_MIN_S = 1                 # a fetch with less than this left is not wo
 
 # --- execution host, workspaces, launchd (2026-11-08) -------------------------------------------------------------
 REMOTE_STUB = "remote.json"         # in a local task dir: {"host": <name>} — the task lives on that execution host
+# The most of a remote stub that is ever read. A stub is a host name, a time and four origin tags (well under 1 KiB);
+# the live view reads the stub of every task id another host's heartbeat names (remote_stubs_by_id), so a corrupt or
+# planted remote.json must cost a bounded read, never an unbounded parse (review round 5, P2).
+REMOTE_STUB_MAX_BYTES = 16 * 1024
 # Under the tasks root: by-origin/<origin_session>/<task id> (empty files), one per remote stub that names its
 # orchestrator. Not a task dir (the name never matches TASK_ID_RE). Written by _write_stub, read by remote_stubs_for,
 # pruned with its stubs by prune().
@@ -478,12 +482,22 @@ def task_path(task_id) -> str:
     return p
 
 
-def _read_json(path: str):
+class RecordTooLarge(ValueError):
+    """A record over its read cap (_read_json's max_bytes): not parsed. Its type name is what a RecordError names."""
+
+
+def _read_json(path: str, max_bytes: int | None = None):
     """A task-dir record: None when the file does not exist, RecordError (a TaskError) when it exists but cannot be
-    read or parsed. Never a raw JSONDecodeError: its text quotes the file."""
+    read or parsed, or is over `max_bytes` (RecordTooLarge; None reads it whole). Never a raw JSONDecodeError: its
+    text quotes the file."""
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            if max_bytes is None:
+                return json.load(f)
+            data = f.read(max_bytes + 1)
+        if len(data) > max_bytes:               # characters, not bytes: a bound all the same (at most 4x)
+            raise RecordTooLarge()
+        return json.loads(data)
     except FileNotFoundError:
         return None
     except (OSError, ValueError, RecursionError) as exc:
@@ -953,8 +967,9 @@ def _index_origin(root: str, task_id: str, origin_session) -> None:
 
 
 def _stub(d: str):
-    """The remote stub of a local task dir ({"host": ...}), or None for a task that runs on this machine."""
-    rec = _read_json(os.path.join(d, REMOTE_STUB))
+    """The remote stub of a local task dir ({"host": ...}), or None for a task that runs on this machine. Read bounded
+    (REMOTE_STUB_MAX_BYTES); an oversized or unparsable stub is a RecordError (a TaskError), as before."""
+    rec = _read_json(os.path.join(d, REMOTE_STUB), REMOTE_STUB_MAX_BYTES)
     return rec if isinstance(rec, dict) and isinstance(rec.get("host"), str) else None
 
 
@@ -2242,7 +2257,7 @@ def remote_stubs() -> list:
     for tid in names:
         try:
             rec = _stub(os.path.join(root, tid))
-        except TaskError:
+        except Exception:                       # a RecordError, or anything a planted stub makes the read raise
             continue
         if rec is not None:
             out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at"),
@@ -2263,7 +2278,7 @@ def remote_stubs_by_id(task_ids) -> list:
             continue
         try:
             rec = _stub(os.path.join(root, tid))
-        except TaskError:
+        except Exception:                       # a RecordError, or anything a planted stub makes the read raise
             out.append({"task_id": tid, "unreadable": True})
             continue
         if rec is not None:
@@ -2292,7 +2307,7 @@ def remote_stubs_for(origin) -> list:
     for tid in names[:REMOTE_STUBS_SCAN]:
         try:
             rec = _stub(os.path.join(root, tid))
-        except TaskError:
+        except Exception:                       # a RecordError, or anything a planted stub makes the read raise
             continue
         o = clean_origin_meta(rec.get("origin")) if rec is not None else {}
         if o.get("origin_session") == origin:

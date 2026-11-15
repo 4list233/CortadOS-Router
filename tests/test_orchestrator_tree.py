@@ -1004,12 +1004,19 @@ class HostBindingTest(unittest.TestCase):
         claim(hbs, "pro", OTHER, NOW - 10, session=VICTIM_CHILD)
         stray = {**VICTIM_CONV, "ref": "c-0000000000cc", "origin": MINE}
         bare = {**VICTIM_CONV, "ref": "c-0000000000dd", "origin": None}
+        # a conversation with no x-cortados-origin is no observation: not joined, and it vetoes nothing
         v = victim_view(OTHER, lambda: hbs.snapshot(NOW),
-                        conversations=lambda: tagged(backend()) + [VICTIM_CONV, stray, bare])
+                        conversations=lambda: tagged(backend()) + [VICTIM_CONV, bare])
         t = next(t for t in v["orchestrators"]["items"][0]["tasks"] if t["task_id"] == VICTIM)
         self.assertEqual([s["ref"] for s in t["sub_sessions"]], ["c-0000000000bb"])
         for bad in ('"_origin"', '"_session"', '"bind_origin"', VICTIM_CHILD):
             self.assertNotIn(bad, json.dumps(v), bad)            # compared, never published
+        # one conversation of the run seen with another origin: the run was seen with two, and joins nothing at all
+        # (round 5: the veto is run-wide, not per conversation)
+        v = victim_view(OTHER, lambda: hbs.snapshot(NOW),
+                        conversations=lambda: tagged(backend()) + [VICTIM_CONV, stray, bare])
+        t = next(t for t in v["orchestrators"]["items"][0]["tasks"] if t["task_id"] == VICTIM)
+        self.assertEqual((t["sub_sessions"], t["tokens"], t["model"], t["tool"]), ([], None, None, None))
 
     def test_the_child_tag_is_no_part_of_the_claim(self):
         # round 4: a heartbeat's child tag is the reporting host's word: neither a key nor part of the binding
@@ -1094,6 +1101,47 @@ class ProviderObservedJoinTest(unittest.TestCase):
                             run_origins=lambda: {VICTIM: ""})
             for bad in VICTIM_SECRETS + ("777",):
                 self.assertNotIn(bad, json.dumps(v), (who, bad))
+
+    def test_the_round5_repro_two_differently_tagged_conversations_join_nothing(self):
+        """Review round 5, P2: one run, two conversations, one observed with OTHER and one with MINE; the worker's and
+        the run tokens' origin are ORIGIN_CONFLICT; the task is reported under OTHER. Round 4 still gave OTHER's task
+        the OTHER-tagged conversation's ref, model, phase and tokens."""
+        b = victim_board()
+        b.turn_start("r:" + VICTIM, {}, run_id=VICTIM, provider="claude", lane=None, model=None, now=NOW - 4,
+                     origin=MINE)                       # the worker: OTHER, then MINE -> ORIGIN_CONFLICT
+        self.assertEqual([w["origin"] for w in b.view([], now=NOW, uncapped=True)["workers_all"]
+                          if w.get("run_id") == VICTIM], [live.office.ORIGIN_CONFLICT])
+        theirs = {**VICTIM_CONV, "origin": OTHER,
+                  "tokens": {"input": 4242, "output": 4243, "cache_read": 0, "cache_write": 0}}
+        mine = {**VICTIM_CONV, "ref": "c-0000000000cc", "model": "gpt-6.1-secret", "origin": MINE,
+                "tokens": {"input": 5151, "output": 5152, "cache_read": 0, "cache_write": 0}}
+        hbs = live.HeartbeatBoard()
+        claim(hbs, "pro", OTHER, NOW - 20)
+        for who in (OTHER, MINE, None):
+            v = victim_view(who, lambda: hbs.snapshot(NOW), office_view=lambda ev: b.view(ev, now=NOW, uncapped=True),
+                            conversations=lambda: tagged(backend()) + [theirs, mine],
+                            run_origins=lambda: {VICTIM: live.office.ORIGIN_CONFLICT})
+            raw = json.dumps(v["orchestrators"])
+            for bad in VICTIM_SECRETS + ("777", "c-0000000000cc", "gpt-6.1-secret", "4242", "5151"):
+                self.assertNotIn(bad, raw, (who, bad))
+            if who != MINE:
+                t = next(t for g in v["orchestrators"]["items"] for t in g["tasks"] if t["task_id"] == VICTIM)
+                self.assertEqual((t["sub_sessions"], t["tokens"], t["model"], t["tool"], t["provider"], t["title"]),
+                                 ([], None, None, None, None, None))
+        # the same with the worker and the run tokens agreeing on OTHER: the MINE conversation alone vetoes the run
+        v = victim_view(OTHER, lambda: hbs.snapshot(NOW), conversations=lambda: tagged(backend()) + [theirs, mine])
+        t = next(t for t in v["orchestrators"]["items"][0]["tasks"] if t["task_id"] == VICTIM)
+        self.assertEqual((t["sub_sessions"], t["tokens"], t["model"], t["tool"]), ([], None, None, None))
+        # and an unreadable source of origin observations vetoes every heartbeat join
+        def boom():
+            raise RuntimeError("x")
+        v = victim_view(OTHER, lambda: hbs.snapshot(NOW), ended_conversations=boom)
+        t = next(t for t in v["orchestrators"]["items"][0]["tasks"] if t["task_id"] == VICTIM)
+        self.assertEqual((t["sub_sessions"], t["tokens"], t["model"], t["tool"]), ([], None, None, None))
+        # control: one origin everywhere still joins
+        t = next(t for t in victim_view(OTHER, lambda: hbs.snapshot(NOW))["orchestrators"]["items"][0]["tasks"]
+                 if t["task_id"] == VICTIM)
+        self.assertEqual([s["ref"] for s in t["sub_sessions"]], ["c-0000000000bb"])
 
     def test_the_reviewers_p2_repro_another_sessions_stub_rejects_a_forgery_in_every_view(self):
         """AWAY is MINE's start onto the Studio (a stub on this machine). The Pro forges it under OTHER. The session
@@ -1201,6 +1249,86 @@ class ProviderObservedJoinTest(unittest.TestCase):
         post_ids(ro, "pro", [live_], NOW - 5, origin=MINE)
         self.assertIn(live_, ro._bindings)
         self.assertEqual([e["source"] for e in ro.errors()], ["task bindings"])
+
+    def test_a_corrupt_bindings_file_never_stops_the_start(self):
+        """Review round 5, P2: `seen` = 10**400 made _num's math.isfinite raise OverflowError outside the loader's
+        handler, and the Registry builds the board at provider start. Every bad entry is skipped and said; a garbage,
+        oversized or malformed file is an empty table and said; nothing is raised."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = Path(d, live.BINDINGS_FILE)
+        good, bad_id = "t20261111094500-f0000201", "t20261111094500-f0000202"
+        ok_row = json.dumps([good, "pro", OTHER, None, NOW - 10])
+
+        def load(text):
+            path.write_bytes(text if isinstance(text, bytes) else text.encode())
+            with mock.patch.object(live.time, "time", return_value=NOW):
+                b = live.HeartbeatBoard(path=path)
+            return set(b._bindings), [e["error"] for e in b.errors()]
+        self.assertFalse(live._num(10 ** 400))
+        self.assertEqual(live.validate_heartbeat({"host": "pro", "jobs": [], "ttl_s": 10 ** 400}, NOW), (None, "ttl_s"))
+        # the reviewer's repro, written as the JSON a corrupt file would hold, beside a good entry
+        for seen in ("1" + "0" * 400, "-1" + "0" * 400, "NaN", "Infinity", "-Infinity", "1e400", '"1800000000"',
+                     "true", "null", "[1]", "{}"):
+            row = f'["{bad_id}","pro",null,null,{seen}]'
+            self.assertEqual(load(f'{{"version":1,"bindings":[{row},{ok_row}]}}'), ({good}, ["InvalidEntry"]), seen)
+        # wrong types and shapes, entry by entry: skipped and said, the good one kept
+        for row in ([bad_id, 5, None, None, NOW], [5, "pro", None, None, NOW], [bad_id, "pro", 5, None, NOW],
+                    [bad_id, "pro", None, ["x"], NOW], [bad_id, "pro", None, None], {"task_id": bad_id}, "x", None,
+                    [[bad_id], "pro", None, None, NOW]):
+            self.assertEqual(load(json.dumps({"version": 1, "bindings": [row, json.loads(ok_row)]})),
+                             ({good}, ["InvalidEntry"]), row)
+        # an expired entry is no error
+        self.assertEqual(load(json.dumps({"version": 1, "bindings": [
+            [bad_id, "pro", None, None, NOW - live.HEARTBEAT_KEEP_S - 5], json.loads(ok_row)]})), ({good}, []))
+        # whole files that cannot be used: an empty table, the type said, never raised
+        for text, err in ((b"\xff\xfe\x00garbage", "UnicodeDecodeError"), ("garbage", "JSONDecodeError"),
+                          ("[" * 100000 + "]" * 100000, "RecursionError"), ("[]", "ValueError"),
+                          ('{"version":"1","bindings":[]}', "ValueError"), ('{"version":1,"bindings":{}}', "ValueError"),
+                          ('{"version":1}', "ValueError"), ("1" + "0" * 400, "ValueError")):
+            self.assertEqual(load(text), (set(), [err]), text[:20])
+        # an oversized file is not read at all (a bounded read: never a parse of BINDINGS_MAX_BYTES + more)
+        big = json.dumps({"version": 1, "bindings": [json.loads(ok_row)] * 20})
+        with mock.patch.object(live, "BINDINGS_MAX_BYTES", len(big) - 1):
+            self.assertEqual(load(big), (set(), ["BindingsTooLarge"]))
+        with mock.patch.object(live, "BINDINGS_MAX_BYTES", len(big)):
+            self.assertEqual(load(big), ({good}, []))
+        self.assertEqual(live.BINDINGS_MAX_BYTES, 2 * 1024 * 1024)
+        self.assertLess(len(json.dumps([bad_id, "abcdefghijklmnopqrstuvwxyz012345", "f" * 64, bad_id, NOW + 0.125]))
+                        * live.TASK_BINDINGS_MAX, live.BINDINGS_MAX_BYTES)   # a full table fits under the cap
+        # and the provider's own start, on a home holding the reviewer's file: the Registry builds; the board is empty
+        from cortados_router.provider.server import Registry
+        path.write_text(f'{{"version":1,"bindings":[["{bad_id}","pro",null,null,1{"0" * 400}]]}}')
+        with mock.patch.dict(os.environ, {"CORTADOS_HOME": d}):
+            reg = Registry(gateway_url="", token="t", claude_bin=["true"])
+        self.assertEqual((reg.live._bindings, [e["error"] for e in reg.live.errors()]), ({}, ["InvalidEntry"]))
+
+    def test_a_corrupt_or_oversized_remote_stub_is_skipped_never_raised(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        ids_ = [f"t20261111094500-f00003{i:02d}" for i in range(6)]
+        child_tasks._write_stub(d, ids_[0], "studio", {"origin_session": MINE})
+        for tid in ids_[1:]:
+            os.mkdir(os.path.join(d, tid), 0o700)
+        stub = lambda tid: Path(d, tid, child_tasks.REMOTE_STUB)
+        stub(ids_[1]).write_text(json.dumps({"host": "studio", "pad": "x" * child_tasks.REMOTE_STUB_MAX_BYTES}))
+        stub(ids_[2]).write_bytes(b"\xff\xfe garbage")
+        stub(ids_[3]).write_text('{"host":"studio","created_at":1' + "0" * 400 + "}")
+        stub(ids_[4]).write_text('{"host":"studio","created_at":NaN}')
+        stub(ids_[5]).write_text('{"host":["studio"],"created_at":"x","origin":7}')
+        with mock.patch.object(child_tasks, "tasks_dir", lambda: d):
+            got = {x["task_id"]: x for x in child_tasks.remote_stubs_by_id(ids_)}
+            self.assertEqual((got[ids_[1]], got[ids_[2]]), ({"task_id": ids_[1], "unreadable": True},
+                                                             {"task_id": ids_[2], "unreadable": True}))
+            self.assertEqual(got[ids_[0]]["host"], "studio")
+            self.assertNotIn(ids_[5], got)                        # a host that is no string: no stub
+            fleet = child_tasks.remote_stubs()
+            self.assertEqual(sorted(x["task_id"] for x in fleet), sorted([ids_[0], ids_[3], ids_[4]]))
+            # the live view re-validates them: the huge and NaN times are no times; nothing raises
+            self.assertEqual([x["task_id"] for x in live._elsewhere(fleet, set(), NOW + 1e9)], [])
+            with self.assertRaises(child_tasks.RecordError) as cm:
+                child_tasks._stub(os.path.join(d, ids_[1]))
+            self.assertEqual(cm.exception.kind, "RecordTooLarge")
 
     def test_a_full_table_refuses_new_ids_and_keeps_live_ones(self):
         ids_ = [f"t20261111094500-f00000{i:02d}" for i in range(5)]

@@ -316,8 +316,12 @@ id to (host, origin, parent) (`HeartbeatBoard._bind_locked`), and a later report
 The bindings persist in `$CORTADOS_HOME/live-task-bindings.json` (0600, written atomically when they change; a
 re-reported id's time reaches the file at most hourly), loaded at start, so a restarted provider still refuses a
 newcomer's claim. Each lasts 24 h after its last report (the heartbeat window); only expired bindings are removed. At
-4096 live bindings a NEW id is refused and counted, never bound by evicting a live one. An unreadable file starts an
-empty table and says `task bindings` in the tree's errors. The count is the fleet view's `orchestrators.conflicts` and
+4096 live bindings a NEW id is refused and counted, never bound by evicting a live one. An unreadable, oversized
+(over 2 MiB, `live.BINDINGS_MAX_BYTES`: a full table is under 1 MiB) or malformed file starts an empty table, and an
+invalid entry (a wrong type, a time that is NaN, infinite or past a float's range) is skipped; either says
+`task bindings` in the tree's errors, and nothing raised while loading ever stops the provider's start (round 5). Each
+`remote.json` read by id is bounded the same way (`child_tasks.REMOTE_STUB_MAX_BYTES`, 16 KiB); an oversized or
+unparsable stub is unreadable, so no report of that id is trusted. The count is the fleet view's `orchestrators.conflicts` and
 the poster's `task_conflicts`; it is never in a session's view, and never names an id. `live.heartbeat_rows` turns the
 entries into tree rows: a heartbeat past its TTL shows its running tasks as `unknown`.
 
@@ -326,14 +330,23 @@ child runner sends `x-cortados-origin: <the task's origin tag>` (from the task's
 nested task) on every routed request of the run, next to `x-cortados-run-id` (`child_tasks._prepare`, allowed by
 `session.OFFICE_HEADERS`). The provider records it per Office worker, per conversation (`Registry._conversation_meta`)
 and per run's tokens (`RunRecords.run_origins`), the first one seen; a run that ever carries two different origins
-matches nothing (`office.note_origin`). A heartbeat's task gets the run's Office worker (title, model, lane, provider,
+matches nothing (`office.note_origin`). The veto is run-wide (round 5): `live.conflicted_runs` takes every origin the
+provider observed for the run on ANY record (each Office worker, each open or recently closed conversation, the run's
+tokens), and a run with two different ones, or a conflict marker on any, joins nothing at all: no worker field, no
+sub-session (not even one whose own conversation carried the bound origin) and no token figure. A source of those
+observations that could not be read this time vetoes every heartbeat join. A heartbeat's task gets the run's Office worker (title, model, lane, provider,
 current tool), its sub-sessions and its run tokens only when the provider observed the run's own requests carry the
 task's bound origin. A heartbeat-reported task with no such observation (a run never routed here, a runner from before
 round 4, a task without an origin) shows only its heartbeat's own fields. The child tag a sender still reports is
 checked and dropped: no key, and no part of the binding. The observed origin is never published.
 
-**Threat note.** Heartbeat clients are the owner's own machines (one `live:heartbeat` token per host, bound to its host
-name). Such a token cannot reach the model endpoints, so it cannot create the provider observations the joins need;
+**Threat note.** The threat this covers is the compromise of a heartbeat credential ALONE: an attacker holding one
+host's `live:heartbeat` token and nothing else. An execution host that also holds the owner token (a host that starts
+or routes children through the provider does) is out of scope: the owner token already reads the whole fleet (the
+fleet live view, every task, every conversation), so forging headers or heartbeat entries gains it nothing it could not
+read directly. Heartbeat clients are the owner's own machines (one `live:heartbeat` token per host, bound to its host
+name). A scoped heartbeat token cannot reach the model endpoints (`clients.py`: a client token opens only its scopes'
+endpoints, 403 everywhere else), so it cannot create the provider observations the joins need;
 `x-cortados-origin` is sent only by holders of the owner token, inside its existing trust boundary (like
 `x-cortados-run-id`). The residual risk after this round is integrity only: a compromised host can show fabricated
 entries for ids nobody has reported (under any origin, with its own titles), or report a real id first so the real
