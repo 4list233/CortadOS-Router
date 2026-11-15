@@ -30,6 +30,20 @@ class _Base(unittest.TestCase):
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        # The module's own git calls run with os.environ: no global or system git config may reach the fixture (a
+        # user's core.hooksPath or init.templateDir would run hooks that write files into the test worktrees). Hooks
+        # a test installs in the clone's .git/hooks still apply, which is what the no-hook tests rely on.
+        isolate = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        env = mock.patch.dict(os.environ, isolate)
+        env.start()
+        self.addCleanup(env.stop)
+        GIT_ENV.update(isolate)
+        # The pauses between quiescence assessments are the module's own seam (ws._sleep), never the shared
+        # time.sleep that subprocess polling also uses; no test waits for them in real time.
+        self.sleeps = []
+        quiet = mock.patch.object(ws, "_sleep", self.sleeps.append)
+        quiet.start()
+        self.addCleanup(quiet.stop)
         self.root = os.path.join(self.tmp, "CortadOS")
         os.mkdir(self.root)
         self.origin = os.path.join(self.tmp, "origin", "demo.git")
@@ -53,6 +67,11 @@ class _Base(unittest.TestCase):
 
     def prepare(self, tid=TID, repo=None, branch=None):
         return ws.prepare(ws.workspace_spec(tid, repo, branch), self.root)
+
+    def case_insensitive(self):
+        probe = os.path.join(self.tmp, "CaseProbe10")
+        os.makedirs(probe, exist_ok=True)
+        return os.path.exists(os.path.join(self.tmp, "caseprobe10"))
 
 
 class ParseTests(unittest.TestCase):
@@ -288,6 +307,381 @@ class SettleTests(_Base):
             ws.update_index(self.root, {"state": "x"})
 
 
+class SettleLeftoverTests(_Base):
+    """2026-11-13: pushed worktrees were held for an empty ignored directory a test left behind, and the reason named no
+    path. Regenerable caches and empty ignored directories no longer hold; owner data still does, and the record says
+    which paths held it."""
+
+    def pushed_worktree(self, ignore=("__pycache__/", "*.pyc", ".pytest_cache/", "data/")):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        with open(os.path.join(rec["path"], ".gitignore"), "w") as f:
+            f.write("\n".join(ignore) + "\n")
+        git("add", ".gitignore", cwd=rec["path"])
+        git("commit", "-q", "-m", "ignore", cwd=rec["path"])
+        git("push", "-q", "origin", "feature", cwd=rec["path"])
+        return rec
+
+    def write(self, rec, rel, text="x"):
+        full = os.path.join(rec["path"], rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(text)
+        return full
+
+    def test_ignored_caches_and_empty_ignored_dirs_archive_and_detach(self):
+        rec = self.pushed_worktree()
+        self.write(rec, "pkg/__pycache__/m.cpython-39.pyc")
+        self.write(rec, ".pytest_cache/v/cache/lastfailed", "{}")
+        self.write(rec, "stray.pyc")
+        os.makedirs(os.path.join(rec["path"], "data", "outcome", "journals"))     # the 2026-11-13 leftover
+        self.assertEqual(ws.assess(rec["path"]), (True, "pushed", []))
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["reason"], settled["reason_code"]), ("archived", "pushed", "pushed"),
+                         settled)
+        self.assertEqual(self.sleeps, [2.0])               # one pause: two clean assessments, identical snapshots
+        self.assertTrue(settled.get("detached"), settled)
+        self.assertNotIn("held_paths", settled)
+        git("rev-parse", "--verify", "HEAD", cwd=settled["path"])
+        self.assertNotEqual(subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=settled["path"],
+                                           env=GIT_ENV).returncode, 0)                 # HEAD detached: branch free
+
+    def test_untracked_file_not_ignored_holds_and_names_the_path(self):
+        rec = self.pushed_worktree()
+        self.write(rec, "notes.txt")
+        settled = ws.settle(rec, self.root)
+        self.assertEqual(settled["state"], "held")
+        self.assertEqual(settled["held_paths"], ["notes.txt"])
+        self.assertIn("notes.txt", settled["reason"])
+        self.assertIn("uncommitted or untracked", settled["reason"])
+        self.assertEqual(ws.read_index(self.root).get(TID), None)          # settle() itself does not write the index
+        ws.update_index(self.root, settled)
+        self.assertEqual(ws.read_index(self.root)[TID]["held_paths"], ["notes.txt"])
+
+    def test_a_cache_name_that_git_does_not_ignore_still_holds(self):
+        rec = self.pushed_worktree(ignore=("data/",))
+        self.write(rec, "pkg/__pycache__/m.pyc")
+        settled = ws.settle(rec, self.root)
+        self.assertEqual(settled["state"], "held")
+        self.assertEqual(settled["held_paths"], ["pkg/__pycache__/m.pyc"])
+
+    def test_ignored_owner_data_holds(self):
+        rec = self.pushed_worktree()
+        self.write(rec, "data/outcome/train.jsonl", "{}\n")
+        self.write(rec, "data/__pycache__/x.pyc")
+        settled = ws.settle(rec, self.root)
+        self.assertEqual(settled["state"], "held")
+        self.assertEqual(settled["held_paths"], ["data/outcome/train.jsonl"])
+        self.assertTrue(os.path.exists(os.path.join(settled["path"], "data", "outcome", "train.jsonl")))
+
+    def test_nested_git_holds_inside_an_ignored_dir_and_inside_a_cache(self):
+        for nested in ("data/clone/.git/HEAD", "__pycache__/odd/.git"):
+            with self.subTest(nested=nested):
+                self.tearDown()
+                self.setUp()
+                rec = self.pushed_worktree()
+                self.write(rec, nested)
+                settled = ws.settle(rec, self.root)
+                self.assertEqual(settled["state"], "held")
+                self.assertEqual(len(settled["held_paths"]), 1)
+                self.assertTrue(settled["held_paths"][0].endswith(".git"), settled["held_paths"])
+
+    def test_untracked_nested_repository_holds(self):
+        rec = self.pushed_worktree()
+        sub = os.path.join(rec["path"], "sub")
+        git("init", "-q", sub)
+        self.write(rec, "sub/x.txt")
+        settled = ws.settle(rec, self.root)
+        self.assertEqual(settled["state"], "held")
+        self.assertEqual(settled["held_paths"], ["sub/"])
+
+    def test_unpushed_commit_holds_without_paths_and_without_rechecks(self):
+        rec = self.pushed_worktree()
+        self.write(rec, "local.txt")
+        git("add", ".", cwd=rec["path"])
+        git("commit", "-q", "-m", "local only", cwd=rec["path"])
+        settled = ws.settle(rec, self.root)
+        self.assertEqual(self.sleeps, [])
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "unpushed_commits"))
+        self.assertIn("not on any remote", settled["reason"])
+        self.assertNotIn("held_paths", settled)
+
+    def test_a_stragglers_temp_file_does_not_decide_the_outcome(self):
+        rec = self.pushed_worktree()
+        tmp = self.write(rec, "suite.log")
+        sleeps = []
+
+        def sleep(s):                       # the straggler finishes and removes its file during the first pause
+            sleeps.append(s)
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        with mock.patch.object(ws, "_sleep", sleep):
+            settled = ws.settle(rec, self.root, recheck_delays=(2.0, 5.0))
+        self.assertEqual(sleeps, [2.0, 5.0])              # clean after the first pause, proven quiet after the second
+        self.assertEqual(settled["state"], "archived", settled)
+        self.assertEqual(settled["settle_rechecks"], 2)
+        self.assertNotIn("held_paths", settled)
+
+    def test_a_file_that_stays_holds_after_every_recheck(self):
+        rec = self.pushed_worktree()
+        self.write(rec, "keep.txt")
+        settled = ws.settle(rec, self.root, recheck_delays=(2.0, 5.0))
+        self.assertEqual(self.sleeps, [2.0, 5.0])
+        self.assertEqual((settled["state"], settled["held_paths"], settled["settle_rechecks"]),
+                         ("held", ["keep.txt"], 2))
+
+    def test_held_paths_are_bounded(self):
+        rec = self.pushed_worktree()
+        for i in range(ws.HELD_PATHS_MAX + 7):
+            self.write(rec, f"many/f{i:03d}.txt")
+        ok, reason, paths = ws.assess(rec["path"])
+        self.assertFalse(ok)
+        self.assertEqual(len(paths), ws.HELD_PATHS_MAX)
+        self.assertTrue(reason.startswith(f"{ws.HELD_PATHS_MAX + 7} uncommitted or untracked"), reason)
+        self.assertIn("(+", reason)
+
+    def test_a_reference_transaction_hook_does_not_dirty_the_assessed_worktree(self):
+        rec = self.pushed_worktree()
+        hook = os.path.join(rec["repo_dir"], ".git", "hooks", "reference-transaction")
+        os.makedirs(os.path.dirname(hook), exist_ok=True)
+        with open(hook, "w") as f:
+            f.write('#!/bin/sh\necho ran > "$(git rev-parse --show-toplevel)/hook.txt"\n')
+        os.chmod(hook, 0o755)
+        git("push", "-q", "origin", "HEAD:refs/heads/other", cwd=rec["path"])    # so the fetch has a ref to update
+        git("update-ref", "-d", "refs/remotes/origin/other", cwd=rec["path"])    # (the push's own hook run wrote one)
+        os.remove(os.path.join(rec["path"], "hook.txt"))
+        self.assertEqual(ws.assess(rec["path"]), (True, "pushed", []))
+        self.assertFalse(os.path.exists(os.path.join(rec["path"], "hook.txt")))
+
+
+class GitMetadataCaseTests(_Base):
+    """Review P1: macOS is case-insensitive, so .GIT (or .Git, or a name with HFS-ignorable code points) is git
+    metadata there. An unpushed nested repository under an ignored cache with its .git spelled .GIT was archived and
+    then deleted with its commit."""
+
+    def pushed_worktree(self):
+        return SettleLeftoverTests.pushed_worktree(self)
+
+    def test_is_git_meta(self):
+        for name in (".git", ".GIT", ".Git", ".g\u200cit", "\ufeff.GiT"):
+            self.assertTrue(ws._is_git_meta(name), repr(name))
+        for name in ("git", ".gitignore", "x.git", ".git2", ".gi"):
+            self.assertFalse(ws._is_git_meta(name), repr(name))
+
+    def nested_upper_repo(self, top):
+        nested = os.path.join(top, "__pycache__", "nested")
+        os.makedirs(nested)
+        git("init", "-q", nested)
+        with open(os.path.join(nested, "work.txt"), "w") as f:
+            f.write("unpushed\n")
+        git("add", ".", cwd=nested)
+        git("commit", "-q", "-m", "only here", cwd=nested)
+        os.rename(os.path.join(nested, ".git"), os.path.join(nested, ".tmp-git"))
+        os.rename(os.path.join(nested, ".tmp-git"), os.path.join(nested, ".GIT"))
+        return nested
+
+    def test_settle_holds_a_nested_repo_spelled_dot_GIT_inside_an_ignored_cache(self):
+        rec = self.pushed_worktree()
+        self.nested_upper_repo(rec["path"])
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "unpushed_files"), settled)
+        self.assertEqual(settled["held_paths"], ["__pycache__/nested/.GIT"])
+
+    def test_a_dot_Git_file_in_an_ignored_cache_holds(self):
+        rec = self.pushed_worktree()
+        os.makedirs(os.path.join(rec["path"], "__pycache__", "sub"))
+        with open(os.path.join(rec["path"], "__pycache__", "sub", ".Git"), "w") as f:
+            f.write("gitdir: /elsewhere\n")                 # a worktree's or submodule's .git FILE
+        self.assertEqual(ws.settle(rec, self.root)["state"], "held")
+
+    def test_cleanup_holds_an_archive_that_gained_a_dot_GIT_repo_and_deletes_nothing(self):
+        rec = ws.settle(self.prepare(TID, repo=self.origin), self.root)
+        self.assertEqual(rec["state"], "archived")
+        ws.update_index(self.root, {**rec, "settled_at": time.time() - ws.ARCHIVE_AGE_S - 60})
+        self.nested_upper_repo(rec["path"])
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        held = os.path.join(self.root, "held", TID)
+        self.assertTrue(os.path.isdir(os.path.join(held, "__pycache__", "nested", ".GIT")))
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "held")
+
+    def test_plain_folder_guards_are_case_insensitive_at_settle_and_cleanup(self):
+        rec = self.prepare()
+        os.makedirs(os.path.join(rec["path"], "x", ".GIT"))
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "nested_git"))
+        rec2 = ws.settle(self.prepare(TID2), self.root)
+        self.assertEqual(rec2["state"], "archived")
+        ws.update_index(self.root, {**rec2, "settled_at": time.time() - ws.ARCHIVE_AGE_S - 60})
+        os.makedirs(os.path.join(rec2["path"], "y", ".Git"))
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertTrue(os.path.isdir(os.path.join(self.root, "held", TID2, "y", ".Git")))
+
+
+class LateWriterTests(_Base):
+    """Review P1: a file written after the last assessment was archived (settle) or deleted (cleanup). Archiving and
+    deleting now need writer quiescence: the task's process group gone, two clean assessments a pause apart bracketed
+    by identical snapshots, compared again under the lock right before the move, the detach and the deletion. The
+    late writes come from injected hooks, never from real sleeps."""
+
+    def pushed_worktree(self, tid=TID):
+        return self.prepare(tid, repo=self.origin, branch="feature")
+
+    def write(self, path, rel, text="late\n"):
+        with open(os.path.join(path, rel), "w") as f:
+            f.write(text)
+
+    def assess_then(self, after_call, action):
+        """Patch ws.assess so `action` runs right after its `after_call`-th call returns (a write after it looked)."""
+        real, calls = ws.assess, []
+
+        def assess(path, deadline=None):
+            out = real(path, deadline)
+            calls.append(path)
+            if len(calls) == after_call:
+                action(path)
+            return out
+        return mock.patch.object(ws, "assess", assess)
+
+    def test_writers_still_running_hold_without_assessing(self):
+        probes = (lambda: True, lambda: None, mock.Mock(side_effect=RuntimeError("ps failed")))
+        for tid, probe in zip((TID, TID2, "t20261108120200-0000000c"), probes):
+            with self.subTest(tid=tid):
+                rec = self.prepare(tid, repo=self.origin)
+                with mock.patch.object(ws, "assess") as assess:
+                    settled = ws.settle(rec, self.root, writers_alive=probe)
+                assess.assert_not_called()
+                self.assertEqual((settled["state"], settled["reason_code"]), ("held", "writers_running"))
+
+    def test_writers_gone_archives(self):
+        settled = ws.settle(self.pushed_worktree(), self.root, writers_alive=lambda: False)
+        self.assertEqual((settled["state"], settled["detached"]), ("archived", True))
+
+    def test_a_file_written_during_the_pause_holds(self):
+        rec = self.pushed_worktree()
+        with mock.patch.object(ws, "_sleep", lambda s: self.write(rec["path"], "late.txt")):
+            settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["held_paths"]), ("held", ["late.txt"]))
+        self.assertTrue(os.path.exists(os.path.join(settled["path"], "late.txt")))
+
+    def test_a_tree_that_keeps_changing_is_never_archived(self):
+        rec = self.pushed_worktree()
+        readme = os.path.join(rec["path"], "README.md")
+        real, n = ws.assess, [0]
+
+        def assess(path, deadline=None):         # a tracked file's mtime moves on every look: content clean, never quiet
+            out = real(path, deadline)
+            n[0] += 1
+            os.utime(readme, ns=(n[0] * 10 ** 9, n[0] * 10 ** 9))
+            return out
+        with mock.patch.object(ws, "assess", assess):
+            settled = ws.settle(rec, self.root, recheck_delays=(2.0, 5.0))
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "not_quiescent"), settled)
+        self.assertEqual(n[0], 3)
+        self.assertTrue(self.attached(settled["path"]))
+
+    def test_a_write_after_the_second_assessment_holds(self):
+        rec = self.pushed_worktree()
+        with self.assess_then(2, lambda p: self.write(p, "late.txt")):
+            settled = ws.settle(rec, self.root, recheck_delays=(2.0, 5.0))
+        self.assertEqual((settled["state"], settled["held_paths"]), ("held", ["late.txt"]))
+
+    def test_a_write_under_the_lock_before_the_move_holds(self):
+        rec = self.pushed_worktree()
+        probes = []
+
+        def probe():                              # the second probe runs under cleanup.lock, just before the move
+            probes.append(1)
+            if len(probes) == 2:
+                self.write(rec["path"], "late.txt")
+            return False
+        settled = ws.settle(rec, self.root, writers_alive=probe)
+        self.assertEqual(len(probes), 2)
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "not_quiescent"), settled)
+        self.assertTrue(os.path.exists(os.path.join(self.root, "held", TID, "late.txt")))
+        self.assertTrue(self.attached(settled["path"]))
+
+    def test_a_write_after_the_move_before_the_detach_moves_on_to_held(self):
+        rec = self.pushed_worktree()
+        real = ws._repair_worktree
+
+        def repair(path, repo_dir):              # runs after the rename into archive/, before HEAD is detached
+            real(path, repo_dir)
+            if "/archive/" in path:
+                self.write(path, "late.txt")
+        with mock.patch.object(ws, "_repair_worktree", repair):
+            settled = ws.settle(rec, self.root)
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual((settled["state"], settled["path"], settled["reason_code"]), ("held", held, "not_quiescent"))
+        self.assertFalse(settled.get("detached"))
+        self.assertTrue(self.attached(held))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "archive", TID)))
+        self.assertTrue(os.path.exists(os.path.join(held, "late.txt")))
+        self.assertIn(held, git("worktree", "list", "--porcelain", cwd=rec["repo_dir"]))
+
+    def attached(self, path):
+        return subprocess.run(["git", "symbolic-ref", "--quiet", "HEAD"], cwd=path, capture_output=True,
+                              env=GIT_ENV).returncode == 0
+
+    def old_archive(self):
+        rec = ws.settle(self.prepare(TID, repo=self.origin), self.root)
+        self.assertEqual(rec["state"], "archived")
+        ws.update_index(self.root, {**rec, "settled_at": time.time() - ws.ARCHIVE_AGE_S - 60})
+        self.sleeps.clear()
+        return rec["path"]
+
+    def test_cleanup_pauses_between_two_assessments_before_deleting(self):
+        path = self.old_archive()
+        self.assertEqual(ws.cleanup_archive(self.root)["deleted"], [TID])
+        self.assertEqual(self.sleeps, [ws.CLEANUP_QUIESCE_S])
+        self.assertFalse(os.path.exists(path))
+
+    def test_cleanup_holds_a_file_written_after_its_last_assessment(self):
+        self.old_archive()
+        with self.assess_then(2, lambda p: self.write(p, "late.txt")):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertTrue(os.path.exists(os.path.join(self.root, "held", TID, "late.txt")))
+        self.assertEqual(ws.read_index(self.root)[TID]["reason_code"], "not_quiescent")
+
+    def test_cleanup_holds_a_file_written_during_its_pause(self):
+        path = self.old_archive()
+        with mock.patch.object(ws, "_sleep", lambda s: self.write(path, "late.txt")):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertEqual(ws.read_index(self.root)[TID]["held_paths"], ["late.txt"])
+
+    def test_cleanup_holds_a_file_written_after_the_final_assessment_immediately_before_deletion(self):
+        path = self.old_archive()
+        real = ws._AdminDir
+
+        def admin(*a, **kw):                     # resolved after the assessments, before the final snapshot
+            out = real(*a, **kw)
+            self.write(path, "late.txt")
+            return out
+        with mock.patch.object(ws, "_AdminDir", admin):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertEqual(report["errors"], [])
+        self.assertTrue(os.path.exists(os.path.join(self.root, "held", TID, "late.txt")))
+        rec = ws.read_index(self.root)[TID]
+        self.assertEqual((rec["state"], rec["reason_code"]), ("held", "not_quiescent"))
+        self.assertIn("immediately before deletion", rec["reason"])
+
+    def test_cleanup_with_no_time_for_the_pause_keeps_the_entry_untouched(self):
+        path = self.old_archive()
+        with mock.patch.object(ws, "CLEANUP_QUIESCE_S", 10 ** 6):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "archived")
+        self.assertTrue(report["timed_out"])
+
+    def test_sleep_seam_is_the_modules_own(self):
+        self.assertEqual(ws._sleep, self.sleeps.append)     # patched here; time.sleep (subprocess polling) is not
+        self.assertNotEqual(time.sleep, self.sleeps.append)
+
+
 class BranchReleaseTests(_Base):
     """Issue #92: an archived worktree frees its branch; a held one keeps it; a legacy attached archive is freed only
     when that provably loses nothing."""
@@ -515,10 +909,10 @@ class BranchReleaseTests(_Base):
         path, _ = self.legacy()
         real_git = ws._git
 
-        def failing_fetch(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+        def failing_fetch(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
             if args[:2] == ["fetch", "--prune"] and "+refs/heads/*:refs/remotes/origin/*" in args:
                 raise ws.WorkspaceError("simulated network failure")
-            return real_git(args, cwd=cwd, timeout=timeout)
+            return real_git(args, cwd=cwd, timeout=timeout, **kw)
 
         with mock.patch.object(ws, "_git", side_effect=failing_fetch):
             with self.assertRaises(ws.WorkspaceError) as cm:
@@ -542,9 +936,9 @@ class BranchReleaseTests(_Base):
         aside = os.path.join(self.tmp, "aside")
         real_git = ws._git
 
-        def swap_after_status(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
-            out = real_git(args, cwd=cwd, timeout=timeout)
-            if args[0] == "status" and cwd == path and not os.path.exists(aside):
+        def swap_after_status(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
+            out = real_git(args, cwd=cwd, timeout=timeout, **kw)
+            if "status" in args[:2] and cwd == path and not os.path.exists(aside):
                 os.rename(path, aside)
                 shutil.copytree(aside, path, symlinks=True)        # same name, same content, another directory
             return out
@@ -655,10 +1049,10 @@ class CleanupTests(_Base):
         before = {tid: ws.read_index(self.root)[tid] for tid in (TID, TID2)}
         timeouts, real_git = [], ws._git
 
-        def recording_git(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+        def recording_git(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
             if args[0] == "fetch":
                 timeouts.append(timeout)
-            return real_git(args, cwd=cwd, timeout=timeout)
+            return real_git(args, cwd=cwd, timeout=timeout, **kw)
 
         budget = 2
         with mock.patch.object(ws, "GIT", self.hanging_fetch_git()), \
@@ -695,10 +1089,10 @@ class CleanupTests(_Base):
         rec = self.prepare(TID, repo=self.origin)
         real_git = ws._git
 
-        def timing_out_fetch(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+        def timing_out_fetch(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
             if args[0] == "fetch":
                 raise ws.GitTimeoutError("git fetch did not finish within 300 s")
-            return real_git(args, cwd=cwd, timeout=timeout)
+            return real_git(args, cwd=cwd, timeout=timeout, **kw)
 
         with mock.patch.object(ws, "_git", side_effect=timing_out_fetch):
             self.assertEqual(ws.pushed(rec["path"])[0], None)
@@ -762,7 +1156,11 @@ class CleanupTests(_Base):
                 mock.patch.object(ws.os, "stat", side_effect=stat_then_swap):
             report = ws.cleanup_archive(self.root)
         self.assertTrue(swapped)
-        self.assertEqual(report["deleted"], [TID])
+        # archive/ now points at held/, so the path-identity checks before the quarantine rename (and after it) no
+        # longer find the opened entry at its path: refused, nothing deleted anywhere.
+        self.assertEqual(report["deleted"], [])
+        self.assertIn("refusing deletion", " ".join(report["errors"]))
+        self.assertTrue(os.path.isdir(os.path.join(replacement, TID)))
         self.assertTrue(os.path.isdir(held))
         self.assertFalse(os.path.islink(held))
 
@@ -777,17 +1175,17 @@ class CleanupTests(_Base):
         return path, git("rev-parse", "HEAD", cwd=path).strip()
 
     def exhaust_budget_after_reassessment(self, budget):
-        """Patches for one cleanup run: time.monotonic jumps past `budget` the moment pushed() returns, so the entry it
+        """Patches for one cleanup run: time.monotonic jumps past `budget` the moment assess() returns, so the entry it
         assessed is handled with no budget left (the reviewer's reproduction of the held-worktree data loss)."""
-        real_monotonic, real_pushed, offset = time.monotonic, ws.pushed, [0.0]
+        real_monotonic, real_assess, offset = time.monotonic, ws.assess, [0.0]
 
         def pushed_then_exhaust(path, deadline=None):
-            result = real_pushed(path, deadline=deadline)
+            result = real_assess(path, deadline=deadline)
             offset[0] = budget + 1
             return result
 
         return (mock.patch.object(ws.time, "monotonic", side_effect=lambda: real_monotonic() + offset[0]),
-                mock.patch.object(ws, "pushed", side_effect=pushed_then_exhaust))
+                mock.patch.object(ws, "assess", side_effect=pushed_then_exhaust))
 
     def assert_valid_held_worktree(self, held, sha, repo_dir):
         """held is a working worktree of repo_dir at sha, and sha survives an aggressive gc of the clone."""
@@ -853,8 +1251,8 @@ class CleanupTests(_Base):
         repo_dir = ws.read_index(self.root)[TID]["repo_dir"]
         real_git = ws._git
 
-        def repair_then_timeout(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
-            out = real_git(args, cwd=cwd, timeout=timeout)
+        def repair_then_timeout(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
+            out = real_git(args, cwd=cwd, timeout=timeout, **kw)
             if args[:2] == ["worktree", "repair"]:
                 raise ws.GitTimeoutError("git worktree did not finish within 60 s")
             return out
@@ -887,10 +1285,10 @@ class CleanupTests(_Base):
         repo_dir = ws.read_index(self.root)[TID]["repo_dir"]
         real_git = ws._git
 
-        def failing_repair(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+        def failing_repair(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
             if args[:2] == ["worktree", "repair"]:
                 raise ws.WorkspaceError("git worktree failed (exit 1): simulated")
-            return real_git(args, cwd=cwd, timeout=timeout)
+            return real_git(args, cwd=cwd, timeout=timeout, **kw)
 
         with mock.patch.object(ws, "_git", side_effect=failing_repair):
             report = ws.cleanup_archive(self.root)
@@ -919,9 +1317,9 @@ class CleanupTests(_Base):
         git("config", "--local", "--unset", "gc.worktreePruneExpire", cwd=repo_dir)
         calls, real_git = [], ws._git
 
-        def recording_git(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+        def recording_git(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
             calls.append(list(args))
-            return real_git(args, cwd=cwd, timeout=timeout)
+            return real_git(args, cwd=cwd, timeout=timeout, **kw)
 
         with mock.patch.object(ws, "_git", side_effect=recording_git):
             self.prepare(TID2, repo="demo")
@@ -1027,10 +1425,10 @@ class CleanupTests(_Base):
                 os.rename(rec["path"], held)
                 moved.append(held)
 
-        def move_before_prune(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+        def move_before_prune(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
             if args[:2] == ["worktree", "prune"]:
                 settle_move()        # the reviewer's interleave: after the cleanup listed the registry
-            return real_git(args, cwd=cwd, timeout=timeout)
+            return real_git(args, cwd=cwd, timeout=timeout, **kw)
 
         with mock.patch.object(ws, "_git", side_effect=move_before_prune):
             report = ws.cleanup_archive(self.root)
@@ -1077,10 +1475,10 @@ class CleanupTests(_Base):
         rec = self.prepare(TID, repo=self.origin)
         real_git = ws._git
 
-        def failing_repair(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+        def failing_repair(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
             if args[:2] == ["worktree", "repair"]:
                 raise ws.GitTimeoutError("git worktree did not finish within 60 s")
-            return real_git(args, cwd=cwd, timeout=timeout)
+            return real_git(args, cwd=cwd, timeout=timeout, **kw)
 
         with mock.patch.object(ws, "_git", side_effect=failing_repair):
             out = ws.settle(rec, self.root)
@@ -1184,6 +1582,77 @@ class RegistryOwnershipTests(_Base):
             f.write(os.path.join(b, ".git") + "\n")
         self.assert_b_intact(b, b_admin, b_head, repo_dir)
 
+    # --- round 11: ownership and identity checks compare paths as the filesystem resolves them ---------------------
+
+    def alias_of(self, admin):
+        """`admin` named through .GIT/Worktrees/, which git opens as .git/worktrees/ on a case-insensitive filesystem."""
+        if not self.case_insensitive():
+            self.skipTest("the temp filesystem is case-sensitive: git would not open .GIT/Worktrees/ as .git/worktrees/")
+        variant = admin.replace(os.sep + os.path.join(".git", "worktrees") + os.sep,
+                                os.sep + os.path.join(".GIT", "Worktrees") + os.sep)
+        self.assertNotEqual(variant, admin)
+        self.assertTrue(ws._same_dir(variant, admin))
+        return variant
+
+    def test_deletion_refuses_an_admin_dir_another_worktree_names_through_a_case_variant(self):
+        """Review of round 10 (gpt-6.1-sol), P2, the reviewer's reproduction in real git: archived A names active B's
+        admin dir through .GIT/Worktrees/, the stolen backlink names A, B has dirty work and its registry repair is
+        backing off. _other_referrer compared the alias with B's canonical .git/worktrees/<id> by spelling, found no
+        other referrer, and the cleanup deleted A and B's admin dir (`git status` in B then exits 128)."""
+        a, b, b_admin, b_head, repo_dir = self.impostor(b_commit=False)
+        variant = self.alias_of(b_admin)
+        with open(os.path.join(a, ".git"), "w") as f:
+            f.write(f"gitdir: {variant}\n")
+        with open(os.path.join(b_admin, "gitdir"), "w") as f:
+            f.write(os.path.join(a, ".git") + "\n")
+        ws.update_index(self.root, {"task_id": TID2, "path": b, "state": "active", "kind": "repo", "repo_dir": repo_dir,
+                                    "repair_failures": 1, "repair_next_at": time.time() + 3600})
+        with open(os.path.join(b, "README.md"), "a") as f:
+            f.write("unpublished work in B\n")
+        self.assertEqual(ws._other_referrer(variant, a, repo_dir, self.root), b)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertTrue(any("also named by" in e and b in e for e in report["errors"]), report["errors"])
+        self.assertTrue(os.path.isdir(a))
+        self.assertTrue(os.path.isdir(b_admin))
+        self.assertIn("unpublished work in B", git("diff", cwd=b))                  # B is still a working repo
+        with open(os.path.join(b_admin, "gitdir"), "w") as f:                      # the owner fixes the backlink
+            f.write(os.path.join(b, ".git") + "\n")
+        git("checkout", "-q", "--", "README.md", cwd=b)
+        self.assert_b_intact(b, b_admin, b_head, repo_dir)
+
+    def test_impostor_naming_the_owners_admin_dir_through_a_case_variant_is_not_repaired_over_it(self):
+        """The duplicate-owner check (_valid_owner) compared the impostor's alias with the owner's canonical admin path
+        by spelling: B did not count as the owner, so A's repair rewrote B's backlink to A."""
+        a, b, b_admin, b_head, repo_dir = self.impostor(b_commit=True)
+        variant = self.alias_of(b_admin)
+        with open(os.path.join(a, ".git"), "w") as f:
+            f.write(f"gitdir: {variant}\n")
+        self.assertEqual(ws._valid_owner(variant, a), b)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual((report["deleted"], report["repaired"]), ([], []))
+        self.assertTrue(any("belongs to" in e and b in e for e in report["errors"]), report["errors"])
+        rec = ws.read_index(self.root)[TID]
+        self.assertIn(rec["state"], ("archived", "held"))
+        self.assertTrue(os.path.isdir(rec["path"]))            # A's files are kept, wherever they are
+        self.assert_b_intact(b, b_admin, b_head, repo_dir)
+
+    def test_a_backlink_naming_the_worktree_through_a_case_variant_is_its_own(self):
+        """The other direction: a backlink naming B through a case variant of its path names B itself, not another
+        owner, and a deletion's backlink check accepts it the same way."""
+        b = self.prepare(TID2, repo=self.origin)["path"]
+        b_admin = self.admin_dir(b)
+        if not self.case_insensitive():
+            self.skipTest("the temp filesystem is case-sensitive")
+        alias = os.path.join(self.root, "ACTIVE", TID2, ".GIT")
+        self.assertTrue(ws._same_file(alias, os.path.join(b, ".git")))
+        with open(os.path.join(b_admin, "gitdir"), "w") as f:
+            f.write(alias + "\n")
+        self.assertIsNone(ws._valid_owner(b_admin, b))
+        self.assertTrue(ws._registry_names(b, b_admin))
+        self.assertFalse(ws._same_file(os.path.join(self.root, "active", TID2, "README.md"),
+                                        os.path.join(b, ".git")))
+
     def test_repair_whose_backlink_target_is_gone_still_repairs(self):
         """Only a valid owner blocks a repair: a backlink naming a missing path (an ordinary unrepaired move) is fixed."""
         rec = self.prepare(TID, repo=self.origin)
@@ -1211,13 +1680,13 @@ class RegistryOwnershipTests(_Base):
         budget = 30
         real_git, real_monotonic, offset, repairs = ws._git, time.monotonic, [0.0], []
 
-        def slow_git(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+        def slow_git(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
             if args[:2] == ["worktree", "repair"]:
                 repairs.append(args[-1])
                 if args[-1] == slow:                # hangs for its whole fixed cap, which eats the run's budget
                     offset[0] += budget + 1
                     raise ws.GitTimeoutError("git worktree did not finish within 60 s")
-            return real_git(args, cwd=cwd, timeout=timeout)
+            return real_git(args, cwd=cwd, timeout=timeout, **kw)
 
         with mock.patch.object(ws, "_git", side_effect=slow_git), \
                 mock.patch.object(ws.time, "monotonic", side_effect=lambda: real_monotonic() + offset[0]):
@@ -1275,9 +1744,9 @@ class RegistryOwnershipTests(_Base):
         git("push", "-q", "origin", "HEAD:main", cwd=seed)
         calls, real_git = [], ws._git
 
-        def recording_git(args, cwd=None, timeout=ws.GIT_TIMEOUT_S):
+        def recording_git(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
             calls.append(list(args))
-            return real_git(args, cwd=cwd, timeout=timeout)
+            return real_git(args, cwd=cwd, timeout=timeout, **kw)
 
         log = os.path.join(self.tmp, "git.log")
         wrapper = os.path.join(self.tmp, "git-logging")
@@ -1291,7 +1760,8 @@ class RegistryOwnershipTests(_Base):
             fetches = [line for line in f.read().splitlines() if " fetch " in f" {line} "]
         self.assertTrue(fetches)
         for line in fetches:
-            self.assertTrue(line.startswith("-c gc.auto=0 -c maintenance.auto=false fetch"), line)
+            self.assertTrue(line.startswith("-c gc.auto=0 -c maintenance.auto=false -c core.hooksPath=/dev/null fetch"),
+                            line)
         for key, value in (("gc.auto", "0"), ("gc.autoDetach", "false"), ("maintenance.auto", "false"),
                            ("gc.worktreePruneExpire", "never")):
             self.assertEqual(git("config", "--local", "--get", key, cwd=repo_dir).strip(), value)
@@ -1349,6 +1819,1260 @@ class RegistryOwnershipTests(_Base):
         self.assertEqual(ws._repair_backoff(1), ws.REPAIR_BACKOFF_BASE_S)
         self.assertEqual(ws._repair_backoff(2), 2 * ws.REPAIR_BACKOFF_BASE_S)
         self.assertEqual(ws._repair_backoff(50), ws.REPAIR_BACKOFF_MAX_S)
+
+
+class QuarantineAndGitStateTests(_Base):
+    """Re-review of held-settle-fix (gpt-6.1-sol, FAIL): (1) a write after the cleanup's final snapshot, at
+    _remove_tree_fd entry, was deleted, and so was a .GIT created there in a plain folder; (2) an empty commit after the
+    last assessment changed no file, so it was archived, detached and later deleted; (3) the snapshot's entry cap
+    counted retained entries, so a huge cache tree bypassed it. Every late action comes from an injected hook."""
+
+    def head(self, path):
+        return git("rev-parse", "HEAD", cwd=path).strip()
+
+    def attached(self, path):
+        return subprocess.run(["git", "symbolic-ref", "--quiet", "HEAD"], cwd=path, capture_output=True,
+                              env=GIT_ENV).returncode == 0
+
+    def write(self, path, rel, text="late\n"):
+        full = os.path.join(path, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(text)
+
+    def assess_then(self, after_call, action):
+        real, calls = ws.assess, []
+
+        def assess(path, deadline=None):
+            out = real(path, deadline)
+            calls.append(path)
+            if len(calls) == after_call:
+                action(path)
+            return out
+        return mock.patch.object(ws, "assess", assess)
+
+    def old_archive(self, tid=TID, kind="repo"):
+        rec = ws.settle(self.prepare(tid, repo=self.origin) if kind == "repo" else self.prepare(tid), self.root)
+        self.assertEqual(rec["state"], "archived", rec)
+        ws.update_index(self.root, {**rec, "settled_at": time.time() - ws.ARCHIVE_AGE_S - 60})
+        self.sleeps.clear()
+        return rec
+
+    def archive_names(self):
+        return sorted(os.listdir(os.path.join(self.root, "archive")))
+
+    def remove_tree_hook(self, action):
+        """Patch _remove_tree_fd so `action` runs at its first (top-level) entry, before anything is unlinked."""
+        real, calls = ws._remove_tree_fd, []
+
+        def remove(fd):
+            if not calls:
+                calls.append(fd)
+                action()
+            return real(fd)
+        return mock.patch.object(ws, "_remove_tree_fd", remove), calls
+
+    # --- P1 #1: quarantine ------------------------------------------------------------------------------------------
+
+    def test_a_path_writer_at_remove_tree_entry_cannot_write_into_the_tree_being_deleted(self):
+        rec = self.old_archive()
+        failed = []
+
+        def late_write():
+            try:
+                with open(os.path.join(rec["path"], "late.txt"), "w") as f:      # no makedirs: a plain path write
+                    f.write("late\n")
+            except FileNotFoundError as exc:      # archive/<tid> is already renamed to .deleting-*: nothing written
+                failed.append(exc)
+        patch, calls = self.remove_tree_hook(late_write)
+        with patch:
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(report["deleted"], [TID])
+        self.assertEqual(self.archive_names(), [])
+
+    def test_a_writer_that_recreates_the_path_at_remove_tree_entry_is_held_and_nothing_is_lost(self):
+        rec = self.old_archive()
+        patch, calls = self.remove_tree_hook(lambda: self.write(rec["path"], "notes/late.txt"))
+        with patch:
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(report["deleted"], [TID])               # the worktree, proven published, is gone
+        self.assertEqual(report["errors"], [])
+        held = os.path.join(self.root, "held", TID)
+        with open(os.path.join(held, "notes", "late.txt")) as f:  # the late write is kept in held/
+            self.assertEqual(f.read(), "late\n")
+        self.assertEqual(self.archive_names(), [])
+        idx = ws.read_index(self.root)[TID]
+        self.assertEqual((idx["state"], idx["path"], idx["kind"], idx["reason_code"]),
+                         ("held", held, "folder", "not_quiescent"))
+
+    def test_a_write_in_quarantine_before_deletion_holds_with_the_registry_repaired(self):
+        rec = self.old_archive()
+        with mock.patch.object(ws, "_after_quarantine", lambda q: self.write(q, "late.txt")):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertEqual(report["errors"], [])
+        held = os.path.join(self.root, "held", TID)
+        self.assertTrue(os.path.isfile(os.path.join(held, "late.txt")))
+        self.assertEqual(self.archive_names(), [])
+        idx = ws.read_index(self.root)[TID]
+        self.assertEqual((idx["state"], idx["reason_code"]), ("held", "not_quiescent"))
+        self.assertIn("in quarantine", idx["reason"])
+        self.assertIn(f"worktree {held}\n", git("worktree", "list", "--porcelain", cwd=rec["repo_dir"]))
+        git("status", "--porcelain", cwd=held)
+
+    def test_a_commit_in_quarantine_holds(self):
+        rec = self.old_archive()
+        with mock.patch.object(ws, "_after_quarantine",
+                               lambda q: git("commit", "-q", "--allow-empty", "-m", "late", cwd=q)):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual(git("log", "-1", "--format=%s", cwd=held).strip(), "late")
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "held")
+
+    def test_dot_GIT_in_a_plain_folder_at_remove_tree_entry_or_in_quarantine_is_caught(self):
+        for hook in ("remove_tree", "quarantine"):
+            with self.subTest(hook=hook):
+                self.tearDown_dirs()
+                rec = self.old_archive(kind="folder")
+                held = os.path.join(self.root, "held", TID)
+                if hook == "remove_tree":
+                    patch, _ = self.remove_tree_hook(lambda: os.makedirs(os.path.join(rec["path"], ".GIT")))
+                else:
+                    patch = mock.patch.object(ws, "_after_quarantine",
+                                              lambda q: os.makedirs(os.path.join(q, "sub", ".GIT")))
+                with patch:
+                    report = ws.cleanup_archive(self.root)
+                self.assertEqual(report["errors"], [])
+                self.assertEqual(self.archive_names(), [])
+                self.assertEqual(ws.read_index(self.root)[TID]["state"], "held")
+                if hook == "remove_tree":                  # recreated by path after the deletion: held, not deleted
+                    self.assertEqual(report["deleted"], [TID])
+                    self.assertTrue(os.path.isdir(os.path.join(held, ".GIT")))
+                else:                                      # inside the quarantined folder: the folder is held
+                    self.assertEqual(report["deleted"], [])
+                    self.assertTrue(os.path.isdir(os.path.join(held, "sub", ".GIT")))
+
+    def tearDown_dirs(self):
+        for sub in ("archive", "held", "active"):
+            shutil.rmtree(os.path.join(self.root, sub), ignore_errors=True)
+        try:
+            os.unlink(ws.index_path(self.root))
+        except FileNotFoundError:
+            pass
+
+    def test_a_crash_leftover_is_reassessed_and_deleted_only_when_clean(self):
+        rec = self.old_archive()
+        admin = git("rev-parse", "--absolute-git-dir", cwd=rec["path"]).strip()
+
+        def crash(fd):
+            raise OSError("simulated crash mid-deletion")
+        with mock.patch.object(ws, "_remove_tree_fd", crash):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertIn("simulated crash", " ".join(report["errors"]))
+        [left] = self.archive_names()
+        self.assertTrue(left.startswith(".deleting-" + TID + "-"), left)
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "archived")
+        # the next run re-assesses the leftover in full (two assessments, a pause) before deleting it
+        self.sleeps.clear()
+        assessed = []
+        real = ws.assess
+        with mock.patch.object(ws, "assess", lambda p, deadline=None: assessed.append(p) or real(p, deadline)):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [TID], report)
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(assessed, [os.path.join(self.root, "archive", left)] * 2)
+        self.assertEqual(self.sleeps, [ws.CLEANUP_QUIESCE_S])
+        self.assertEqual(self.archive_names(), [])
+        self.assertFalse(os.path.exists(admin))
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "deleted")
+
+    def leftover(self, tid=TID):
+        rec = self.old_archive(tid)
+        q = ".deleting-%s-%s" % (tid, "ab" * 8)
+        os.rename(rec["path"], os.path.join(self.root, "archive", q))
+        return rec, os.path.join(self.root, "archive", q)
+
+    def test_a_crash_leftover_with_unpublished_work_is_held_never_deleted(self):
+        for case in ("untracked", "partly_deleted", "commit"):
+            with self.subTest(case=case):
+                self.tearDown_dirs()
+                shutil.rmtree(os.path.join(self.root, "repos"), ignore_errors=True)
+                rec, q = self.leftover()
+                if case == "untracked":
+                    self.write(q, "notes.txt")
+                elif case == "partly_deleted":
+                    os.unlink(os.path.join(q, "README.md"))
+                else:
+                    git("commit", "-q", "--allow-empty", "-m", "unpublished", cwd=q)
+                report = ws.cleanup_archive(self.root)
+                self.assertEqual(report["deleted"], [])
+                held = os.path.join(self.root, "held", TID)
+                self.assertTrue(os.path.isdir(held))
+                self.assertEqual(self.archive_names(), [])
+                idx = ws.read_index(self.root)[TID]
+                self.assertEqual((idx["state"], idx["path"]), ("held", held))
+                self.assertIn(f"worktree {held}\n", git("worktree", "list", "--porcelain", cwd=rec["repo_dir"]))
+
+    def test_a_leftover_without_an_archive_record_is_refused_and_untouched(self):
+        rec, q = self.leftover()
+        ws.update_index(self.root, {**rec, "state": "held"})
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertIn("no archive record", " ".join(report["refused"]))
+        self.assertTrue(os.path.isfile(os.path.join(q, "README.md")))
+        os.rename(q, os.path.join(self.root, "archive", ".deleting-not-a-task"))
+        report = ws.cleanup_archive(self.root)
+        self.assertIn("not a task id", " ".join(report["refused"]))
+
+    def test_no_time_to_reassess_in_quarantine_renames_it_back_untouched(self):
+        rec = self.old_archive()
+        real_monotonic, offset = time.monotonic, [0.0]
+        with mock.patch.object(ws, "_after_quarantine", lambda q: offset.__setitem__(0, 10 ** 6)), \
+                mock.patch.object(ws.time, "monotonic", side_effect=lambda: real_monotonic() + offset[0]):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        self.assertIn("renamed back", " ".join(report["timed_out"]))
+        self.assertEqual(self.archive_names(), [TID])
+        self.assertTrue(os.path.isfile(os.path.join(rec["path"], "README.md")))
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "archived")
+
+    # --- P1 #2: git state -------------------------------------------------------------------------------------------
+
+    def test_an_empty_commit_after_the_second_assessment_is_held_never_archived(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        # One pause (two assessments): the snapshot's git state is the only thing that can catch the commit.
+        with self.assess_then(2, lambda p: git("commit", "-q", "--allow-empty", "-m", "late", cwd=p)):
+            settled = ws.settle(rec, self.root, recheck_delays=(2.0,))
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual((settled["state"], settled["path"], settled["reason_code"]), ("held", held, "not_quiescent"),
+                         settled)
+        self.assertTrue(self.attached(held))
+        self.assertEqual(git("log", "-1", "--format=%s", cwd=held).strip(), "late")
+        self.assertEqual(self.archive_names(), [])
+
+    def test_an_empty_commit_after_the_cleanups_second_assessment_is_held(self):
+        rec = self.old_archive()
+        with self.assess_then(2, lambda p: git("commit", "-q", "--allow-empty", "-m", "late", cwd=p)):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual(git("log", "-1", "--format=%s", cwd=held).strip(), "late")
+
+    def test_a_staged_change_or_private_ref_after_the_assessment_is_held(self):
+        """What a late writer in this worktree changes and the deletion would lose: its index, its private refs."""
+        actions = {
+            "private_ref": lambda p: git("update-ref", "refs/worktree/late", "HEAD", cwd=p),
+            "staged": lambda p: git("update-index", "--chmod=+x", "README.md", cwd=p),
+        }
+        for i, (what, action) in enumerate(sorted(actions.items())):
+            tid = "t2026110812%02d00-000000%02x" % (i, 0xa0 + i)
+            with self.subTest(what=what):
+                rec = self.prepare(tid, repo=self.origin)
+                with self._after_nth_assess_of(rec["path"], 2, action):     # snapshot-only, as above
+                    settled = ws.settle(rec, self.root, recheck_delays=(2.0,))
+                self.assertEqual((settled["state"], settled["reason_code"]), ("held", "not_quiescent"), settled)
+                self.assertTrue(self.attached(settled["path"]))
+
+    def test_shared_refs_and_the_stash_after_the_assessment_do_not_hold(self):
+        """Review 3, P2 #3 (#102): a branch, a tag or a stash is the clone's, shared by every worktree, and survives
+        this worktree's deletion: it is no change in this worktree, and the work is archived. The ref survives."""
+        clone = os.path.join(self.root, "repos", "demo")
+        actions = {
+            "branch": (lambda p: git("branch", "late-branch", cwd=p),
+                       lambda: git("rev-parse", "--verify", "refs/heads/late-branch", cwd=clone)),
+            "tag": (lambda p: git("tag", "late-tag", cwd=p), lambda: git("rev-parse", "--verify", "late-tag", cwd=clone)),
+            "stash": (lambda p: (self.write(clone, "README.md", "changed\n"),
+                                 git("stash", "push", "-q", "-m", "late-stash-tag", cwd=clone)),
+                      lambda: self.assertIn("late-stash-tag", git("stash", "list", cwd=clone))),
+        }
+        for i, (what, (action, survives)) in enumerate(sorted(actions.items())):
+            tid = "t2026110812%02d00-000000%02x" % (i, 0xb0 + i)
+            with self.subTest(what=what):
+                rec = self.prepare(tid, repo=self.origin)
+                with self._after_nth_assess_of(rec["path"], 2, action):
+                    settled = ws.settle(rec, self.root, recheck_delays=(2.0,))
+                self.assertEqual((settled["state"], settled.get("detached")), ("archived", True), settled)
+                survives()
+
+    def test_a_sibling_stash_during_the_assessment_does_not_hold_and_survives(self):
+        """Review 3, P2 #3: a stash created in a sibling worktree while this task is assessed held it as
+        not_quiescent. Settle archives it, the cleanup deletes it later, and the stash is still there."""
+        other = self.prepare(TID2, repo=self.origin)
+        rec = self.prepare(repo=self.origin, branch="feature")
+
+        def stash(_p):
+            self.write(other["path"], "README.md", "sibling's change\n")
+            git("stash", "push", "-q", "-m", "sibling-stash-tag", cwd=other["path"])
+        with self._after_nth_assess_of(rec["path"], 1, stash):
+            settled = ws.settle(rec, self.root, recheck_delays=(2.0,))
+        self.assertEqual((settled["state"], settled.get("detached")), ("archived", True), settled)
+        ws.update_index(self.root, {**settled, "settled_at": time.time() - ws.ARCHIVE_AGE_S - 60})
+        clone = os.path.join(self.root, "repos", "demo")
+        def stash_again(_p):
+            self.write(other["path"], "README.md", "again\n")
+            git("stash", "push", "-q", "-m", "second-stash-tag", cwd=other["path"])
+        with self._after_nth_assess_of(settled["path"], 1, stash_again):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [TID], report)
+        stashes = git("stash", "list", cwd=clone)
+        self.assertIn("sibling-stash-tag", stashes)
+        self.assertIn("second-stash-tag", stashes)
+
+    # --- Review 3, P1 #2: worktree-private refs ----------------------------------------------------------------------
+
+    def unpublished_private_ref(self, path, ref="refs/worktree/private"):
+        """The reviewer's reproduction: an unpublished commit referenced only by a per-worktree ref; HEAD published,
+        tree clean."""
+        sha = git("commit-tree", "-p", "HEAD", "-m", "private", "HEAD^{tree}", cwd=path).strip()
+        git("update-ref", ref, sha, cwd=path)
+        return sha
+
+    def test_an_unpublished_worktree_private_ref_is_held_at_settle(self):
+        for i, ref in enumerate(("refs/worktree/private", "refs/bisect/bad", "refs/rewritten/x")):
+            tid = "t2026110813%02d00-000000%02x" % (i, 0xc0 + i)
+            with self.subTest(ref=ref):
+                rec = self.prepare(tid, repo=self.origin, branch="feature" if not i else None)
+                sha = self.unpublished_private_ref(rec["path"], ref)
+                settled = ws.settle(rec, self.root)
+                held = os.path.join(self.root, "held", tid)
+                self.assertEqual((settled["state"], settled["path"], settled["reason_code"]),
+                                 ("held", held, "unpushed_private_refs"), settled)
+                self.assertIn(ref, settled["reason"])
+                self.assertEqual(git("rev-parse", ref, cwd=held).strip(), sha)
+                self.assertEqual(self.archive_names(), [])
+
+    def test_an_unpublished_pseudoref_or_unparseable_private_ref_is_held(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        sha = git("commit-tree", "-p", "HEAD", "-m", "merging", "HEAD^{tree}", cwd=rec["path"]).strip()
+        gitdir = git("rev-parse", "--absolute-git-dir", cwd=rec["path"]).strip()
+        with open(os.path.join(gitdir, "MERGE_HEAD"), "w") as f:
+            f.write(sha + "\n")
+        self.assertEqual(ws.assess(rec["path"])[1].code, "unpushed_operation_state")   # review 8: a merge in progress
+        os.remove(os.path.join(gitdir, "MERGE_HEAD"))
+        os.makedirs(os.path.join(gitdir, "refs", "worktree"), exist_ok=True)
+        with open(os.path.join(gitdir, "refs", "worktree", "broken"), "w") as f:
+            f.write("not an object id\n")
+        ok, reason, _ = ws.assess(rec["path"])         # git itself may refuse the broken ref first: held either way
+        self.assertEqual(ok, False)
+        self.assertIn(reason.code, ("unpushed_private_refs", "assess_failed"))
+        settled = ws.settle(rec, self.root)
+        self.assertEqual(settled["state"], "held", settled)
+        self.assertTrue(os.path.isfile(os.path.join(settled["path"], ".git")))
+
+    def test_published_private_refs_do_not_hold(self):
+        """#102: a private ref at a published commit (a bisect over pushed history) loses nothing."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        git("update-ref", "refs/bisect/good", "HEAD~1", cwd=rec["path"])
+        git("update-ref", "refs/worktree/mark", "HEAD", cwd=rec["path"])
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled.get("detached")), ("archived", True), settled)
+
+    def test_an_unpublished_worktree_private_ref_is_held_by_the_cleanup(self):
+        rec = self.old_archive()
+        sha = self.unpublished_private_ref(rec["path"])
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        held = os.path.join(self.root, "held", TID)
+        idx = ws.read_index(self.root)[TID]
+        self.assertEqual((idx["state"], idx["reason_code"]), ("held", "unpushed_private_refs"), idx)
+        self.assertEqual(git("rev-parse", "refs/worktree/private", cwd=held).strip(), sha)
+        clone = os.path.join(self.root, "repos", "demo")
+        self.assertEqual(git("cat-file", "-t", sha, cwd=clone).strip(), "commit")
+
+    def test_an_unpublished_private_ref_made_in_quarantine_is_held(self):
+        rec = self.old_archive()
+        with mock.patch.object(ws, "_after_quarantine", lambda p: self.unpublished_private_ref(p)):
+            report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [])
+        held = os.path.join(self.root, "held", TID)
+        self.assertTrue(git("rev-parse", "refs/worktree/private", cwd=held).strip())
+
+    def _after_nth_assess_of(self, path, n, action):
+        real, calls = ws.assess, []
+
+        def assess(p, deadline=None):
+            out = real(p, deadline)
+            if p == path:
+                calls.append(p)
+                if len(calls) == n:
+                    action(p)
+            return out
+        return mock.patch.object(ws, "assess", assess)
+
+    def test_another_worktrees_commits_do_not_hold_this_one(self):
+        """#102: tasks share a clone. Another task committing on its own branch during this settle is not a change
+        in this worktree; neither are our own fetches (remote-tracking refs) nor tags the remote gained."""
+        other = self.prepare(TID2, repo=self.origin)
+        seed = os.path.join(self.tmp, "tagger")
+        git("clone", "-q", self.origin, seed)
+        git("tag", "v-remote", cwd=seed)
+        git("push", "-q", "origin", "v-remote", cwd=seed)
+        rec = self.prepare(repo=self.origin, branch="feature")
+        with self._after_nth_assess_of(rec["path"], 1,
+                                       lambda p: git("commit", "-q", "--allow-empty", "-m", "other", cwd=other["path"])):
+            settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled.get("detached")), ("archived", True), settled)
+
+    def test_another_worktree_settling_during_the_assessment_does_not_hold_this_one(self):
+        """#102: the other task's detach changes only its own HEAD and the clone's shared refs, never this worktree's."""
+        other = self.prepare(TID2, repo=self.origin)
+        git("commit", "-q", "--allow-empty", "-m", "other's local work", cwd=other["path"])
+        rec = self.prepare(repo=self.origin, branch="feature")
+        with self._after_nth_assess_of(rec["path"], 1, lambda p: git("checkout", "-q", "--detach", cwd=other["path"])):
+            settled = ws.settle(rec, self.root, recheck_delays=(2.0,))
+        self.assertEqual((settled["state"], settled.get("detached")), ("archived", True), settled)
+
+    def test_detach_goes_to_the_assessed_sha(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        sha = self.head(rec["path"])
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["detached_at"]), ("archived", sha))
+        self.assertEqual(self.head(settled["path"]), sha)
+        self.assertFalse(self.attached(settled["path"]))
+        # _detach_head refuses any other commit than the one it is given, and leaves HEAD attached
+        rec2 = self.prepare(TID2, repo="demo")
+        self.assertIn("HEAD moved", ws._detach_head(rec2["path"], expect=sha if sha != self.head(rec2["path"])
+                                                    else "0" * 40))
+        self.assertTrue(self.attached(rec2["path"]))
+
+    def test_a_commit_during_the_remote_recheck_is_held_not_detached(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        sha = self.head(rec["path"])
+        real = ws._published_at
+
+        def published(path, s, deadline=None):
+            self.assertEqual(s, sha)
+            git("commit", "-q", "--allow-empty", "-m", "late", cwd=path)
+            return real(path, s, deadline)
+        with mock.patch.object(ws, "_published_at", published):
+            settled = ws.settle(rec, self.root)
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual((settled["state"], settled["path"], settled["reason_code"]), ("held", held, "not_quiescent"))
+        self.assertTrue(self.attached(held))
+        self.assertEqual(git("log", "-1", "--format=%s", cwd=held).strip(), "late")
+
+    def test_assessed_sha_gone_from_the_remote_at_detach_is_held(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        with mock.patch.object(ws, "_published_at", lambda p, s, deadline=None: f"{s[:12]} is no longer on any remote"):
+            settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "not_published"), settled)
+        self.assertTrue(self.attached(settled["path"]))
+        # and the real re-check: an unpublished sha is reported
+        git("commit", "-q", "--allow-empty", "-m", "local", cwd=settled["path"])
+        self.assertIn("no longer on any remote", ws._published_at(settled["path"], self.head(settled["path"])))
+
+    # --- P2 #3: scanned-entry cap -----------------------------------------------------------------------------------
+
+    def test_the_snapshot_cap_counts_every_scanned_entry_and_holds(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        git("config", "core.excludesFile", os.path.join(self.tmp, "excludes"), cwd=rec["path"])
+        with open(os.path.join(self.tmp, "excludes"), "w") as f:
+            f.write("__pycache__/\n")
+        for i in range(60):
+            self.write(rec["path"], f"__pycache__/m{i}.pyc", "")
+        self.assertEqual(ws.assess(rec["path"])[0], True)          # caches only: published
+        files, _ = ws._snapshot(rec["path"])
+        self.assertLess(len(files), 10)                            # the cache files are not retained ...
+        with mock.patch.object(ws, "SNAPSHOT_MAX", 50):
+            with self.assertRaises(ws.WorkspaceError):             # ... but they are counted
+                ws._snapshot(rec["path"])
+            self.assertTrue(ws._contains_git_entry(rec["path"]))   # a plain-folder scan past the cap holds too
+            settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "not_quiescent"), settled)
+        self.assertIn("more than 50 entries", settled["reason"])
+
+    def test_the_snapshot_checks_its_deadline_inside_the_walk(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        with self.assertRaises(ws.GitTimeoutError):
+            ws._snapshot(rec["path"], deadline=time.monotonic() - 1)
+        with self.assertRaises(ws.GitTimeoutError):
+            ws._ignored_blocker(rec["path"], "", deadline=time.monotonic() - 1)
+
+    # --- #102 must not return ---------------------------------------------------------------------------------------
+
+    def test_clean_and_pushed_still_archives_and_cleanup_deletes_it_leaving_nothing(self):
+        rec = self.old_archive()
+        admin_dirs = os.listdir(os.path.join(rec["repo_dir"], ".git", "worktrees"))
+        self.assertEqual(len(admin_dirs), 1)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual((report["deleted"], report["errors"], report["timed_out"]), ([TID], [], []))
+        self.assertEqual(self.archive_names(), [])                 # no .deleting-* left behind
+        self.assertEqual(os.listdir(os.path.join(self.root, "held")), [])
+        self.assertFalse(os.path.exists(os.path.join(rec["repo_dir"], ".git", "worktrees", admin_dirs[0])))
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "deleted")
+        folder = self.old_archive(TID2, kind="folder")
+        self.assertEqual(ws.cleanup_archive(self.root)["deleted"], [TID2])
+        self.assertFalse(os.path.exists(folder["path"]))
+
+
+class OperationStateAndRecoveryTests(_Base):
+    """Review 4 of held-settle-fix (gpt-6.1-sol): (1) a stopped merge or rebase --autostash keeps the only copy of the
+    task's tracked changes in its own git dir with a clean tree and a published HEAD; it was archived and deleted. (2)
+    Commits only ORIG_HEAD or the worktree's reflog reached (after a reset, an amend, a rebase) were lost with the
+    worktree; they now get recovery refs in the clone, and a failure to write one holds. Real git throughout."""
+
+    def setUp(self):
+        super().setUp()
+        # A published branch `side` from main whose f.txt conflicts with feature's (both add it).
+        seed = os.path.join(self.tmp, "side-seed")
+        git("clone", "-q", self.origin, seed)
+        git("checkout", "-q", "-b", "side", "origin/main", cwd=seed)
+        with open(os.path.join(seed, "f.txt"), "w") as f:
+            f.write("side\n")
+        git("add", ".", cwd=seed)
+        git("commit", "-q", "-m", "side", cwd=seed)
+        git("push", "-q", "origin", "side", cwd=seed)
+        shutil.rmtree(seed)
+
+    def run_git(self, *args, cwd):
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, env=GIT_ENV)
+
+    def gitdir(self, path):
+        return git("rev-parse", "--absolute-git-dir", cwd=path).strip()
+
+    def head(self, path):
+        return git("rev-parse", "HEAD", cwd=path).strip()
+
+    def commit(self, path, name, text="x\n"):
+        with open(os.path.join(path, name), "w") as f:
+            f.write(text)
+        git("add", name, cwd=path)
+        git("commit", "-q", "-m", name, cwd=path)
+        return self.head(path)
+
+    def dirty(self, path):
+        with open(os.path.join(path, "README.md"), "a") as f:
+            f.write("task's tracked change\n")
+
+    def clean(self, path):
+        self.assertEqual(git("status", "--porcelain", "--untracked-files=all", cwd=path), "")
+
+    def recovery(self, tid=TID):
+        clone = os.path.join(self.root, "repos", "demo")
+        out = git("for-each-ref", "--format=%(refname) %(objectname)", ws.RECOVERY_REF_PREFIX, cwd=clone)
+        refs = dict(line.split() for line in out.splitlines())
+        return {r: o for r, o in refs.items() if (ws._recovery_ref_parts(r) or (None, None))[1] == tid}
+
+    def reachable(self, sha, ref):
+        clone = os.path.join(self.root, "repos", "demo")
+        return self.run_git("merge-base", "--is-ancestor", sha, ref, cwd=clone).returncode == 0
+
+    def age(self, rec):
+        ws.update_index(self.root, {**rec, "settled_at": time.time() - ws.ARCHIVE_AGE_S - 60})
+
+    # --- (1) autostash and stopped operations hold -----------------------------------------------------------------
+
+    def merge_autostash(self, path):
+        """The reviewer's reproduction: unpublished tracked changes, then a merge with --autostash stopped by
+        --no-commit (-s ours: the tree stays clean). HEAD and MERGE_HEAD are published; the change is only in the
+        autostash."""
+        self.dirty(path)
+        git("merge", "--no-commit", "--no-ff", "--autostash", "-s", "ours", "origin/side", cwd=path)
+        self.clean(path)
+        self.assertTrue(os.path.isfile(os.path.join(self.gitdir(path), "MERGE_AUTOSTASH")))
+
+    def test_a_merge_autostash_stopped_with_no_commit_holds_at_settle(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        self.merge_autostash(rec["path"])
+        ok, reason, _ = ws.assess(rec["path"])
+        self.assertEqual((ok, reason.code), (False, "unpushed_autostash"), reason)
+        settled = ws.settle(rec, self.root)
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual((settled["state"], settled["path"], settled["reason_code"]),
+                         ("held", held, "unpushed_autostash"), settled)
+        with open(os.path.join(self.gitdir(held), "MERGE_AUTOSTASH")) as f:
+            stash = f.read().strip()
+        self.assertIn("task's tracked change", git("show", stash + ":README.md", cwd=held))
+
+    def test_a_merge_autostash_made_in_an_archived_worktree_holds_at_cleanup(self):
+        rec = ws.settle(self.prepare(repo=self.origin, branch="feature"), self.root)
+        self.assertEqual(rec["state"], "archived", rec)
+        self.age(rec)
+        self.merge_autostash(rec["path"])
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [], report)
+        idx = ws.read_index(self.root)[TID]
+        self.assertEqual((idx["state"], idx["reason_code"]), ("held", "unpushed_autostash"), idx)
+        self.assertTrue(os.path.isfile(os.path.join(self.gitdir(idx["path"]), "MERGE_AUTOSTASH")))
+
+    def test_a_rebase_autostash_stopped_on_a_conflict_holds_with_either_backend(self):
+        for i, backend in enumerate(("--merge", "--apply")):
+            tid = "t2026110814%02d00-000000%02x" % (i, 0xd0 + i)
+            with self.subTest(backend=backend):
+                rec = self.prepare(tid, repo=self.origin, branch="feature" if not i else None)
+                if i:                                          # task/<tid> from main, with feature's commit on it
+                    git("merge", "-q", "--ff-only", "origin/feature", cwd=rec["path"])
+                    git("push", "-q", "origin", "HEAD:refs/heads/task/" + tid, cwd=rec["path"])
+                self.dirty(rec["path"])
+                stopped = self.run_git("rebase", backend, "--autostash", "origin/side", cwd=rec["path"])
+                self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)    # f.txt conflicts
+                git("reset", "-q", "--hard", cwd=rec["path"])  # conflict gone, the rebase still stopped
+                self.clean(rec["path"])
+                state = "rebase-merge" if backend == "--merge" else "rebase-apply"
+                autostash = os.path.join(self.gitdir(rec["path"]), state, "autostash")
+                self.assertTrue(os.path.isfile(autostash))
+                ok, reason, _ = ws.assess(rec["path"])
+                self.assertEqual((ok, reason.code), (False, "unpushed_autostash"), reason)
+                self.assertIn(state + "/autostash", reason)
+                settled = ws.settle(rec, self.root)
+                self.assertEqual((settled["state"], settled["reason_code"]), ("held", "unpushed_autostash"), settled)
+                self.assertTrue(os.path.isfile(os.path.join(self.gitdir(settled["path"]), state, "autostash")))
+
+    # --- review 8: any in-progress operation holds; its state is never parsed -----------------------------------
+
+    def assert_operation_holds(self, rec, *names):
+        ok, reason, _ = ws.assess(rec["path"])
+        self.assertEqual((ok, reason.code), (False, "unpushed_operation_state"), reason)
+        for name in names:
+            self.assertIn(name, reason)
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["reason_code"]), ("held", "unpushed_operation_state"), settled)
+        self.assertEqual(os.listdir(os.path.join(self.root, "archive")), [])
+        return settled
+
+    def test_round_7_pending_reset_before_label_mid_rebase_holds(self):
+        """Round 7's reproduction under real git: an unpublished commit L named only by a pending `reset <L>` before a
+        later `label <L>` in a stopped rebase's todo. The parser took <L> for a label and archived; now any rebase holds."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        path = rec["path"]
+        local = self.commit(path, "local.txt")
+        git("reset", "-q", "--hard", "origin/feature", cwd=path)
+        short = local[:7]
+        todo = os.path.join(self.tmp, "round7-todo")
+        with open(todo, "w") as f:
+            f.write(f"break\nreset {short}\nlabel {short}\nreset onto\n")
+        stopped = subprocess.run(["git", "rebase", "-i", "origin/feature"], cwd=path, capture_output=True, text=True,
+                                 env={**GIT_ENV, "GIT_SEQUENCE_EDITOR": f"cp {todo}"})
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)     # stopped at `break`
+        self.clean(path)
+        self.assertEqual(self.head(path), git("rev-parse", "origin/feature", cwd=path).strip())
+        with open(os.path.join(self.gitdir(path), "rebase-merge", "git-rebase-todo")) as f:
+            pending = f.read()
+        self.assertRegex(pending, r"(?m)^reset %s" % short, pending)
+        self.assertRegex(pending, r"(?m)^label %s" % short, pending)
+        self.assertEqual(self.run_git("merge-base", "--is-ancestor", local, "origin/feature", cwd=path).returncode, 1)
+        settled = self.assert_operation_holds(rec, "rebase-merge")
+        self.assertEqual(git("cat-file", "-t", local, cwd=settled["path"]).strip(), "commit")
+
+    def test_a_merge_in_progress_holds_even_when_everything_it_names_is_published(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        git("merge", "--no-commit", "--no-ff", "-s", "ours", "origin/side", cwd=rec["path"])
+        self.clean(rec["path"])
+        self.assert_operation_holds(rec, "MERGE_HEAD")
+
+    def test_a_conflicted_merge_resolved_but_not_committed_holds_and_names_auto_merge(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        stopped = self.run_git("merge", "origin/side", cwd=rec["path"])
+        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)    # f.txt conflicts
+        git("checkout", "HEAD", "--", "f.txt", cwd=rec["path"])                      # resolved as ours, not committed
+        self.clean(rec["path"])
+        auto = os.path.exists(os.path.join(self.gitdir(rec["path"]), "AUTO_MERGE"))
+        self.assert_operation_holds(rec, "MERGE_HEAD", *(["AUTO_MERGE"] if auto else []))
+
+    def test_auto_merge_alone_does_not_hold(self):
+        """AUTO_MERGE without an operation does not hold (review 9 kept this): git 2.50 leaves a stale one after a
+        rebase that completed without a conflict, and it names only a tree in the clone's shared object store."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        tree = git("rev-parse", "HEAD^{tree}", cwd=rec["path"]).strip()
+        with open(os.path.join(self.gitdir(rec["path"]), "auto_merge"), "w") as f:      # any case
+            f.write(tree + "\n")
+        self.assertEqual(ws.assess(rec["path"])[:2], (True, "pushed"))
+
+    def test_a_stopped_cherry_pick_holds(self):
+        """A single pick (CHERRY_PICK_HEAD) and a sequence (sequencer/), published commits or not."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        stopped = self.run_git("cherry-pick", "origin/side", cwd=rec["path"])
+        self.assertNotEqual(stopped.returncode, 0)
+        git("checkout", "HEAD", "--", "f.txt", cwd=rec["path"])
+        self.clean(rec["path"])
+        self.assert_operation_holds(rec, "CHERRY_PICK_HEAD")
+        tid = "t20261114170000-000000b1"
+        rec = self.prepare(tid, repo=self.origin)
+        path = rec["path"]
+        local = self.commit(path, "local.txt")
+        git("reset", "-q", "--hard", "origin/feature", cwd=path)
+        stopped = self.run_git("cherry-pick", "origin/side", local, cwd=path)
+        self.assertNotEqual(stopped.returncode, 0)
+        git("reset", "-q", "--hard", cwd=path)
+        self.clean(path)
+        self.assertTrue(os.path.isdir(os.path.join(self.gitdir(path), "sequencer")))
+        ok, reason, _ = ws.assess(path)
+        self.assertEqual((ok, reason.code), (False, "unpushed_operation_state"), reason)
+        self.assertIn("sequencer", reason)
+
+    def test_a_bisect_in_progress_holds(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        git("bisect", "start", "HEAD", "HEAD~1", cwd=rec["path"])
+        self.clean(rec["path"])
+        self.assert_operation_holds(rec, "BISECT_LOG")
+
+    def test_a_stopped_rebase_of_published_commits_holds(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        stopped = self.run_git("rebase", "origin/side", cwd=rec["path"])
+        self.assertNotEqual(stopped.returncode, 0)
+        git("reset", "-q", "--hard", cwd=rec["path"])
+        self.clean(rec["path"])
+        self.assert_operation_holds(rec, "rebase-merge")
+
+    def stopped_am(self, path):
+        """A real `git am` of a mailed patch that fails to apply and leaves its state in rebase-apply/; the patch's
+        content (UNPUBLISHED-MAIL-CONTENT) exists nowhere but that state. The tree is reset clean, HEAD is published."""
+        patch = git("format-patch", "-1", "--stdout", "origin/side", cwd=path)
+        patch = patch.replace("+side\n", "+UNPUBLISHED-MAIL-CONTENT\n")
+        self.assertIn("UNPUBLISHED-MAIL-CONTENT", patch)
+        stopped = subprocess.run(["git", "am"], cwd=path, input=patch, capture_output=True, text=True, env=GIT_ENV)
+        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)  # f.txt exists on feature
+        git("reset", "-q", "--hard", "HEAD", cwd=path)
+        self.clean(path)
+        state = os.path.join(self.gitdir(path), "rebase-apply")
+        self.assertTrue(os.path.isdir(state))
+        return state
+
+    def assert_patch_kept(self, settled):
+        held = settled["path"]
+        found = []
+        for directory, _, files in os.walk(self.gitdir(held)):
+            for name in files:
+                with open(os.path.join(directory, name), "rb") as f:
+                    if b"UNPUBLISHED-MAIL-CONTENT" in f.read():
+                        found.append(name)
+        self.assertTrue(found, "the stopped am's patch is gone")
+
+    def test_a_stopped_am_holds_outright(self):
+        """A real stopped `git am` (review 8's reviewer: the old test synthesized rebase-apply/)."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        self.stopped_am(rec["path"])
+        settled = self.assert_operation_holds(rec, "rebase-apply")
+        self.assert_patch_kept(settled)
+
+    def test_a_stopped_am_state_dir_in_another_case_holds_on_a_case_insensitive_filesystem(self):
+        """Review 8 of held-settle-fix (gpt-6.1-sol), P1: on macOS's usual case-insensitive filesystem git reads
+        Rebase-Apply/ as rebase-apply/; the case-sensitive name check archived the worktree and cleanup deleted the
+        unpublished patch. Real git; the reviewer's reproduction."""
+        probe = os.path.join(self.tmp, "CaseProbe")
+        os.makedirs(probe)
+        if not os.path.exists(os.path.join(self.tmp, "caseprobe")):
+            self.skipTest("the temp filesystem is case-sensitive: git would not read Rebase-Apply/ as an am in "
+                          "progress here (the casefold scan is covered by test_operation_state_names_match_any_case)")
+        rec = self.prepare(repo=self.origin, branch="feature")
+        state = self.stopped_am(rec["path"])
+        os.rename(state, os.path.join(os.path.dirname(state), "Rebase-Apply"))
+        self.assertIn("Rebase-Apply", os.listdir(os.path.dirname(state)))
+        self.assertNotIn("rebase-apply", os.listdir(os.path.dirname(state)))
+        status = git("status", cwd=rec["path"])
+        self.assertIn("am session", status)             # git itself still sees the stopped am
+        settled = self.assert_operation_holds(rec, "Rebase-Apply")
+        self.assert_patch_kept(settled)
+        listed = [name for name, _ in ws._op_state_files(self.gitdir(settled["path"]))]
+        self.assertIn("Rebase-Apply/", listed)          # the late-writer snapshot walks it too
+
+    def test_a_finished_or_aborted_operation_leaves_a_clean_pushed_worktree_that_archives(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        self.assertEqual(ws.assess(rec["path"])[:2], (True, "pushed"))
+        git("merge", "--no-commit", "--no-ff", "-s", "ours", "origin/side", cwd=rec["path"])
+        git("merge", "--abort", cwd=rec["path"])
+        git("bisect", "start", "HEAD", "HEAD~1", cwd=rec["path"])
+        git("bisect", "reset", cwd=rec["path"])
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["reason_code"]), ("archived", "pushed"), settled)
+
+    def test_operation_state_names_match_any_case(self):
+        """Review 9: the git-dir scan and the snapshot walker match operation state names case-insensitively (a
+        case-insensitive filesystem resolves any case to git's own name). Runs on any filesystem: a plain directory."""
+        gitdir = os.path.join(self.tmp, "fake-gitdir")
+        os.makedirs(os.path.join(gitdir, "Rebase-Apply"))
+        with open(os.path.join(gitdir, "Rebase-Apply", "patch"), "w") as f:
+            f.write("unpublished\n")
+        for name in ("Merge_Head", "bisect_log", "auto_merge", "Notes_Merge_Partial", "orig_head", "HEAD", "config"):
+            with open(os.path.join(gitdir, name), "w") as f:
+                f.write("x\n")
+        os.makedirs(os.path.join(gitdir, "SEQUENCER"))
+        self.assertEqual(sorted(ws._operation_state(gitdir), key=str.casefold),
+                         sorted(["Rebase-Apply", "Merge_Head", "bisect_log", "auto_merge", "Notes_Merge_Partial",
+                                 "SEQUENCER"], key=str.casefold))
+        listed = {name for name, _ in ws._op_state_files(gitdir)}
+        for name in ("Rebase-Apply/", "Rebase-Apply/patch", "Merge_Head", "bisect_log", "auto_merge",
+                     "Notes_Merge_Partial", "orig_head", "SEQUENCER/"):
+            self.assertIn(name, listed)
+        self.assertNotIn("HEAD", listed)
+        self.assertNotIn("config", listed)
+        for name in os.listdir(gitdir):
+            path = os.path.join(gitdir, name)
+            shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+        self.assertEqual(ws._operation_state(gitdir), [])
+
+    def test_operation_state_that_cannot_be_read_still_holds(self):
+        """Presence alone counts: a directory or a mode-0 file in a state file's place holds as an operation, and a
+        git dir that cannot be listed holds as unreadable (no operation can be ruled out)."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        gitdir = self.gitdir(rec["path"])
+        for rel in ("BISECT_LOG", "sequencer/todo", "rebase-merge/done", "MERGE_HEAD"):
+            with self.subTest(rel=rel):
+                os.makedirs(os.path.join(gitdir, rel))
+                ok, reason, _ = ws.assess(rec["path"])
+                self.assertEqual((ok, reason.code), (False, "unpushed_operation_state"), reason)
+                self.assertIn(rel.split("/")[0], reason)
+                shutil.rmtree(os.path.join(gitdir, rel.split("/")[0]))
+        if os.geteuid() != 0:
+            os.makedirs(os.path.join(gitdir, "sequencer"))
+            todo = os.path.join(gitdir, "sequencer", "todo")
+            with open(todo, "w") as f:
+                f.write("pick " + self.head(rec["path"]) + " published\n")
+            os.chmod(todo, 0)                               # unlinkable at cleanup: the dir is writable
+            ok, reason, _ = ws.assess(rec["path"])
+            self.assertEqual((ok, reason.code), (False, "unpushed_operation_state"), reason)
+            os.chmod(todo, 0o600)
+            shutil.rmtree(os.path.join(gitdir, "sequencer"))
+        self.assertEqual(ws.assess(rec["path"])[0], True)
+        real = os.listdir
+
+        def listdir(p="."):
+            if isinstance(p, str) and os.path.realpath(p) == os.path.realpath(gitdir):
+                raise PermissionError(13, "Permission denied", p)
+            return real(p)
+        with mock.patch.object(ws.os, "listdir", listdir):
+            ok, reason, _ = ws.assess(rec["path"])
+        self.assertEqual((ok, reason.code), (False, "unreadable_git_state"), reason)
+        self.assertIn("cannot be listed", reason)
+
+    def test_autostash_and_reflog_written_after_the_assessment_are_in_the_snapshot(self):
+        """Neither changes a working-tree file, HEAD or the index; the snapshot sees them anyway."""
+        def autostash(path):
+            sha = git("commit-tree", "-p", "HEAD", "-m", "stash", "HEAD^{tree}", cwd=path).strip()
+            with open(os.path.join(self.gitdir(path), "MERGE_AUTOSTASH"), "w") as f:
+                f.write(sha + "\n")
+
+        def reflog(path):
+            sha = git("commit-tree", "-p", "HEAD", "-m", "gone", "HEAD^{tree}", cwd=path).strip()
+            head = self.head(path)
+            with open(os.path.join(self.gitdir(path), "logs", "HEAD"), "a") as f:
+                f.write(f"{head} {sha} t <t@x> 1 +0000\treset: moving to x\n{sha} {head} t <t@x> 1 +0000\tback\n")
+        for i, late in enumerate((autostash, reflog)):
+            tid = "t2026110815%02d00-000000%02x" % (i, 0xe0 + i)
+            with self.subTest(late=late.__name__):
+                rec = self.prepare(tid, repo=self.origin, branch="feature" if not i else None)
+                real = ws._published_at
+
+                def published(path, s, deadline=None, late=late):
+                    late(path)
+                    return real(path, s, deadline)
+                with mock.patch.object(ws, "_published_at", published):
+                    settled = ws.settle(rec, self.root)
+                self.assertEqual((settled["state"], settled["reason_code"]), ("held", "not_quiescent"), settled)
+
+    # --- (2) recovery refs for ORIG_HEAD and the worktree's reflog -------------------------------------------------
+
+    def test_reset_amend_and_rebase_leave_recovery_refs_that_outlive_the_cleanup(self):
+        cases = {}
+        # reset: two local commits reset away; ORIG_HEAD names the newer, which keeps both
+        tid = "t20261108160000-000000f0"
+        rec = self.prepare(tid, repo=self.origin, branch="feature")
+        older = self.commit(rec["path"], "l1.txt")
+        newer = self.commit(rec["path"], "l2.txt")
+        git("reset", "-q", "--hard", "origin/feature", cwd=rec["path"])
+        cases[tid] = (rec, [older, newer], {"orig-head": newer})
+        # amend: the pre-amend commit is only in the reflog (amend writes no ORIG_HEAD); the amended one is pushed
+        tid = "t20261108160100-000000f1"
+        rec = self.prepare(tid, repo=self.origin)
+        before = self.commit(rec["path"], "a.txt", "first\n")
+        with open(os.path.join(rec["path"], "a.txt"), "w") as f:
+            f.write("amended\n")
+        git("commit", "-q", "-a", "--amend", "-m", "amended", cwd=rec["path"])
+        git("push", "-q", "origin", "HEAD:refs/heads/task/" + tid, cwd=rec["path"])
+        cases[tid] = (rec, [before], {"reflog-1": before})
+        # rebase: a local commit rebased onto a new main and pushed; ORIG_HEAD names the pre-rebase one
+        tid = "t20261108160200-000000f2"
+        rec = self.prepare(tid, repo=self.origin)
+        pre = self.commit(rec["path"], "r.txt")
+        seed = os.path.join(self.tmp, "main-seed")
+        git("clone", "-q", self.origin, seed)
+        self.commit(seed, "upstream.txt")
+        git("push", "-q", "origin", "HEAD:main", cwd=seed)
+        git("fetch", "-q", "origin", cwd=rec["path"])
+        git("rebase", "-q", "origin/main", cwd=rec["path"])
+        git("push", "-q", "origin", "HEAD:refs/heads/task/" + tid, cwd=rec["path"])
+        cases[tid] = (rec, [pre], {"orig-head": pre})
+
+        for tid, (rec, lost, want) in sorted(cases.items()):
+            with self.subTest(tid=tid):
+                settled = ws.settle(rec, self.root)
+                self.assertEqual((settled["state"], settled.get("detached"), settled["recovery_refs"]),
+                                 ("archived", True, len(want)), settled)
+                refs = self.recovery(tid)
+                day = time.strftime("%Y%m%d", time.gmtime())
+                self.assertEqual(refs, {f"{ws.RECOVERY_REF_PREFIX}{day}/{tid}/{k}": v for k, v in want.items()})
+                self.age(settled)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual((sorted(report["deleted"]), report["errors"]), (sorted(cases), []), report)
+        clone = os.path.join(self.root, "repos", "demo")
+        git("-c", "gc.pruneExpire=now", "gc", "-q", "--prune=now", cwd=clone)   # only refs keep objects now
+        for tid, (rec, lost, want) in cases.items():
+            idx = ws.read_index(self.root)[tid]
+            self.assertEqual((idx["state"], idx["recovery_refs"]), ("deleted", len(want)), idx)
+            self.assertFalse(os.path.exists(rec["path"]))
+            for sha in lost:
+                self.assertTrue(any(self.reachable(sha, ref) for ref in self.recovery(tid)), (tid, sha))
+
+    def test_clean_pushed_work_needs_no_recovery_ref(self):
+        rec = ws.settle(self.prepare(repo=self.origin, branch="feature"), self.root)
+        self.assertEqual((rec["state"], rec["recovery_refs"]), ("archived", 0), rec)
+        self.assertEqual(self.recovery(), {})
+
+    # --- round 10 audit: every git-defined name matches the way the filesystem resolves it ------------------------
+
+    def test_a_reflog_dir_in_another_case_keeps_its_recovery_ref_through_the_cleanup(self):
+        """Review of round 9 (gpt-6.1-sol), P1, the reviewer's reproduction in real git: _op_state_files listed
+        Logs/HEAD, the reflog reader kept only "logs/", so a commit only HEAD's reflog reached got no recovery ref and
+        the cleanup deleted it."""
+        if not self.case_insensitive():
+            self.skipTest("the temp filesystem is case-sensitive: git would not write HEAD's reflog into Logs/ here "
+                          "(the casefold reader is covered by test_the_reflog_reader_matches_logs_in_any_case)")
+        rec = self.prepare(repo=self.origin, branch="feature")
+        path = rec["path"]
+        published = self.head(path)
+        git("checkout", "-q", "--detach", cwd=path)
+        secret = self.commit(path, "secret.txt", "only the reflog has me\n")
+        git("reset", "-q", "--hard", published, cwd=path)
+        git("reset", "-q", "--hard", published, cwd=path)        # ORIG_HEAD is the published commit now
+        gitdir = self.gitdir(path)
+        with open(os.path.join(gitdir, "ORIG_HEAD")) as f:
+            self.assertEqual(f.read().strip(), published)
+        os.rename(os.path.join(gitdir, "logs"), os.path.join(gitdir, "Logs"))
+        self.assertIn("Logs", os.listdir(gitdir))
+        self.assertIn(secret, git("reflog", "--format=%H", "HEAD", cwd=path))   # git still reads it
+        settled = ws.settle(rec, self.root)
+        self.assertEqual((settled["state"], settled["recovery_refs"]), ("archived", 1), settled)
+        day = time.strftime("%Y%m%d", time.gmtime())
+        self.assertEqual(self.recovery(), {f"{ws.RECOVERY_REF_PREFIX}{day}/{TID}/reflog-1": secret})
+        self.age(settled)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual((report["deleted"], report["errors"]), ([TID], []), report)
+        clone = os.path.join(self.root, "repos", "demo")
+        git("-c", "gc.pruneExpire=now", "gc", "-q", "--prune=now", cwd=clone)
+        self.assertEqual(git("cat-file", "-t", secret, cwd=clone).strip(), "commit")
+        self.assertTrue(any(self.reachable(secret, ref) for ref in self.recovery()))
+
+    def test_the_reflog_reader_matches_logs_in_any_case(self):
+        """Any filesystem: a plain directory standing in for the git dir. A case variant of logs/ is read, and a
+        non-directory in its place, in any case, holds (its reflogs are unknown)."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        sha = self.head(rec["path"])
+        gitdir = os.path.join(self.tmp, "fake-gitdir")
+        os.makedirs(os.path.join(gitdir, "LoGs", "refs", "heads"))
+        line = f"{'0' * 40} {sha} t <t@x> 1 +0000\tcommit\n"
+        for rel in (("LoGs", "HEAD"), ("LoGs", "refs", "heads", "x")):
+            with open(os.path.join(gitdir, *rel), "w") as f:
+                f.write(line)
+        orig, logged = ws._recovery_candidates(rec["path"], gitdir)
+        self.assertEqual((orig, logged), (None, [sha, sha]))
+        shutil.rmtree(os.path.join(gitdir, "LoGs"))
+        with open(os.path.join(gitdir, "LOGS"), "w") as f:
+            f.write("not a directory\n")
+        with self.assertRaises(ws.StateUnreadableError) as cm:
+            ws._recovery_candidates(rec["path"], gitdir)
+        self.assertIn("LOGS/ is not a directory", str(cm.exception))
+
+    def test_the_snapshot_leaves_out_the_worktrees_own_dot_git_in_any_case_and_nothing_else(self):
+        """_snapshot leaves out the worktree's own top-level .git (`git worktree repair` rewrites it after a move). A
+        case variant that IS that entry (case-insensitive filesystem) is left out too; one beside a distinct .git
+        (case-sensitive filesystem) is a separate entry and stays in."""
+        rec = self.prepare(repo=self.origin, branch="feature")
+        path = rec["path"]
+        if self.case_insensitive():
+            os.rename(os.path.join(path, ".git"), os.path.join(path, ".GIT"))
+            self.assertIn(".GIT", os.listdir(path))
+            self.assertTrue(ws._is_own_dotgit(path, ".GIT"))
+            files = {e[0] for e in ws._snapshot(path, git=False)[0]}
+            self.assertNotIn(".GIT", files)
+            self.assertEqual(ws._snapshot(path)[1]["head"], self.head(path))   # git still opens it
+        else:
+            os.makedirs(os.path.join(path, ".GIT"))
+            self.assertFalse(ws._is_own_dotgit(path, ".GIT"))
+            files = {e[0] for e in ws._snapshot(path, git=False)[0]}
+            self.assertIn(".GIT", files)
+        self.assertNotIn(".git", files)
+
+    def test_an_admin_dir_named_through_a_case_variant_of_dot_git_worktrees_is_found_and_deleted(self):
+        """_clone_of_admin (registry repair) and _AdminDir (cleanup) compared .git/worktrees exactly; a worktree whose
+        .git file names <clone>/.GIT/Worktrees/<id>, which git opens on a case-insensitive filesystem, was skipped by
+        the repair and its archive was never deleted. Now matched when the filesystem resolves it to the clone's own
+        .git/worktrees, and only then."""
+        clone = os.path.join(self.root, "repos", "demo")
+        foreign = os.path.join(self.tmp, "repos", "demo", ".GIT", "Worktrees", "x")
+        self.assertIsNone(ws._clone_of_admin(foreign, self.root))           # not under <root>/repos: never
+        if not self.case_insensitive():
+            self.skipTest("the temp filesystem is case-sensitive: git would not open .GIT/Worktrees/ as .git/worktrees/")
+        settled = ws.settle(self.prepare(repo=self.origin, branch="feature"), self.root)
+        self.assertEqual(settled["state"], "archived", settled)
+        path = settled["path"]
+        with open(os.path.join(path, ".git")) as f:
+            admin = ws._parse_gitfile(f.read(), path)
+        variant = os.path.join(clone, ".GIT", "Worktrees", os.path.basename(admin))
+        with open(os.path.join(path, ".git"), "w") as f:
+            f.write(f"gitdir: {variant}\n")
+        self.assertEqual(git("rev-parse", "HEAD", cwd=path).strip(), self.head(path))     # git opens it
+        self.assertEqual(ws._clone_of_admin(variant, self.root), clone)
+        self.assertIsNone(ws._clone_of_admin(os.path.join(clone, ".GIT", "Elsewhere", "x"), self.root))
+        self.age(settled)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual((report["deleted"], report["errors"]), ([TID], []), report)
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.exists(admin))
+
+    def reset_away(self, path):
+        lost = self.commit(path, "lost.txt")
+        git("reset", "-q", "--hard", "HEAD~1", cwd=path)
+        return lost
+
+    def failing_update_ref(self):
+        real = ws._git
+
+        def fake(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
+            if "update-ref" in args and "--stdin" in args:
+                raise ws.WorkspaceError("git update-ref failed (exit 128): cannot lock ref")
+            return real(args, cwd=cwd, timeout=timeout, **kw)
+        return mock.patch.object(ws, "_git", side_effect=fake)
+
+    def test_a_recovery_ref_that_cannot_be_written_holds_at_settle(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        lost = self.reset_away(rec["path"])
+        with self.failing_update_ref():
+            settled = ws.settle(rec, self.root)
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual((settled["state"], settled["path"], settled["reason_code"]),
+                         ("held", held, "recovery_refs_failed"), settled)
+        self.assertNotIn("recovery_refs", settled)
+        self.assertEqual(os.listdir(os.path.join(self.root, "archive")), [])
+        self.assertIn(lost, git("reflog", "--format=%H", cwd=held))
+
+    def test_an_archive_from_before_recovery_refs_gets_them_at_cleanup_or_is_held(self):
+        """A worktree archived before this change (or written to since) gets its recovery refs before deletion; when
+        they cannot be written it is held, never deleted."""
+        for fail in (True, False):
+            with self.subTest(fail=fail):
+                tid = TID if fail else TID2
+                rec = ws.settle(self.prepare(tid, repo=self.origin, branch="feature" if fail else None), self.root)
+                self.assertEqual((rec["state"], rec["recovery_refs"]), ("archived", 0), rec)
+                lost = self.reset_away(rec["path"])        # detached at a pushed commit: commit, reset back
+                self.age(rec)
+                if fail:
+                    with self.failing_update_ref():
+                        report = ws.cleanup_archive(self.root)
+                    self.assertEqual(report["deleted"], [], report)
+                    idx = ws.read_index(self.root)[tid]
+                    self.assertEqual((idx["state"], idx["reason_code"]), ("held", "recovery_refs_failed"), idx)
+                    self.assertIn(lost, git("reflog", "--format=%H", cwd=idx["path"]))
+                    self.assertEqual(self.recovery(tid), {})
+                else:
+                    report = ws.cleanup_archive(self.root)
+                    self.assertEqual(report["deleted"], [tid], report)
+                    self.assertEqual(ws.read_index(self.root)[tid]["recovery_refs"], 1)
+                    self.assertEqual(list(self.recovery(tid).values()), [lost])
+
+    def test_preserving_twice_adds_nothing_and_a_bad_task_id_is_refused(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        lost = self.reset_away(rec["path"])
+        self.assertEqual(ws.preserve_recovery_refs(rec["path"], TID), 1)
+        self.assertEqual(ws.preserve_recovery_refs(rec["path"], TID), 1)
+        self.assertEqual(list(self.recovery().values()), [lost])
+        with self.assertRaises(ws.WorkspaceError):
+            ws.preserve_recovery_refs(rec["path"], "../../heads/main")
+
+    # --- review 5 (gpt-6.1-sol): unreadable state, short ids ---------------------------------------------------
+
+    def only_orig_head(self, path):
+        """An unpublished commit that ORIG_HEAD alone names (no reflog, no ref): the reviewer's reproduction."""
+        sha = git("commit-tree", "-p", "HEAD", "-m", "only in ORIG_HEAD", "HEAD^{tree}", cwd=path).strip()
+        orig = os.path.join(self.gitdir(path), "ORIG_HEAD")
+        with open(orig, "w") as f:
+            f.write(sha + "\n")
+        return sha, orig
+
+    def test_an_unreadable_or_malformed_orig_head_holds_and_is_never_taken_as_missing(self):
+        """Review 5, P1 #2: _read_small() returned None for an unreadable ORIG_HEAD, so its only commit got no
+        recovery ref (`recovery_refs=0`), the worktree was archived, and the cleanup deleted it."""
+        def unreadable(orig):
+            os.chmod(orig, 0)
+
+        def malformed(orig):
+            with open(orig, "w") as f:
+                f.write("not an object id\n")
+
+        def directory(orig):
+            os.remove(orig)
+            os.mkdir(orig)
+        cases = [malformed, directory] + ([unreadable] if os.geteuid() != 0 else [])
+        for i, spoil in enumerate(cases):
+            tid = "t2026111416%02d00-000000%02x" % (i, 0xa0 + i)
+            with self.subTest(spoil=spoil.__name__):
+                rec = self.prepare(tid, repo=self.origin, branch="feature" if not i else None)
+                sha, orig = self.only_orig_head(rec["path"])
+                spoil(orig)
+                ok, reason, _ = ws.assess(rec["path"])
+                self.assertEqual((ok, reason.code), (False, "unreadable_git_state"), reason)
+                with self.assertRaises(ws.StateUnreadableError):
+                    ws.preserve_recovery_refs(rec["path"], tid)
+                settled = ws.settle(rec, self.root)
+                held = os.path.join(self.root, "held", tid)
+                self.assertEqual((settled["state"], settled["path"], settled["reason_code"]),
+                                 ("held", held, "unreadable_git_state"), settled)
+                self.assertEqual(self.recovery(tid), {})
+                self.assertEqual(git("cat-file", "-t", sha, cwd=held).strip(), "commit")
+
+    def test_an_orig_head_made_unreadable_in_an_archived_worktree_holds_at_cleanup(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-0 file")
+        rec = ws.settle(self.prepare(repo=self.origin, branch="feature"), self.root)
+        self.assertEqual(rec["state"], "archived", rec)
+        self.age(rec)
+        sha, orig = self.only_orig_head(rec["path"])
+        os.chmod(orig, 0)
+        report = ws.cleanup_archive(self.root)
+        self.assertEqual(report["deleted"], [], report)
+        idx = ws.read_index(self.root)[TID]
+        self.assertEqual((idx["state"], idx["reason_code"]), ("held", "unreadable_git_state"), idx)
+        self.assertEqual(git("cat-file", "-t", sha, cwd=idx["path"]).strip(), "commit")
+
+
+class RecoveryRefExpiryTests(_Base):
+    """Owner decision 2026-11-14: recovery refs expire 30 days after creation; the daily cleanup deletes them, only
+    under refs/cortados-recovery/, only at the value it read. Real git in a real clone; the clock is cleanup's `now`."""
+
+    NOW = 1794614400.0                                # 2026-11-14 00:00:00 UTC
+
+    def setUp(self):
+        super().setUp()
+        self.prepare(repo=self.origin, branch="feature")          # makes the clone repos/demo
+        self.clone = os.path.join(self.root, "repos", "demo")
+        self.main = git("rev-parse", "origin/main", cwd=self.clone).strip()
+        self.other = git("commit-tree", "-p", self.main, "-m", "lost", self.main + "^{tree}", cwd=self.clone).strip()
+
+    def refs(self, prefix="refs/"):
+        out = git("for-each-ref", "--format=%(refname) %(objectname)", prefix, cwd=self.clone)
+        return dict(line.split() for line in out.splitlines())
+
+    def day(self, days_before):
+        return time.strftime("%Y%m%d", time.gmtime(self.NOW - days_before * 86400))
+
+    def put(self, ref, sha=None):
+        git("update-ref", ref, sha or self.other, cwd=self.clone)
+        return ref
+
+    def test_the_retention_is_thirty_days_from_the_end_of_the_creation_day(self):
+        self.assertEqual(ws.RECOVERY_REF_RETENTION_S, 30 * 24 * 3600)
+        self.assertEqual(time.strftime("%Y-%m-%d %H:%M", time.gmtime(self.NOW)), "2026-11-14 00:00")
+        self.assertTrue(ws.recovery_ref_expired("20261014", self.NOW))       # ended 2026-10-15 00:00: 30 days
+        self.assertFalse(ws.recovery_ref_expired("20261014", self.NOW - 1))
+        self.assertFalse(ws.recovery_ref_expired("20261015", self.NOW))
+
+    def test_old_refs_are_deleted_new_and_undated_kept_and_nothing_else_touched(self):
+        P = ws.RECOVERY_REF_PREFIX
+        old = [self.put(f"{P}{self.day(31)}/{TID}/orig-head"), self.put(f"{P}{self.day(45)}/{TID2}/reflog-1")]
+        new = [self.put(f"{P}{self.day(29)}/{TID}/reflog-1"), self.put(f"{P}{self.day(0)}/{TID2}/orig-head")]
+        legacy = self.put(f"{P}{TID}/reflog-7")
+        # outside the namespace or not one of its two layouts, all named like old recovery refs: never touched
+        outside = [self.put(f"refs/cortados-recovery-old/{self.day(90)}/{TID}/orig-head"),
+                   self.put(f"refs/heads/{self.day(90)}/{TID}/x"), self.put(f"refs/tags/{self.day(90)}"),
+                   self.put(f"{P}notes/{self.day(90)}"), self.put(f"{P}{self.day(90)}/not-a-task/x")]
+        before = self.refs()
+        report = ws.cleanup_archive(self.root, now=self.NOW)
+        self.assertEqual((report["recovery_refs_expired"], report["recovery_refs_dated"], report["errors"]),
+                         (2, 1, []), report)
+        self.assertNotIn(TID, json.dumps(report["recovery_refs_expired"]))       # a number, never names
+        after = self.refs()
+        for ref in old:
+            self.assertNotIn(ref, after)
+        for ref in new + outside:
+            self.assertEqual(after.get(ref), before[ref], ref)
+        # the undated ref is renamed to today's date at the same commit, never deleted
+        self.assertNotIn(legacy, after)
+        dated = f"{P}{self.day(0)}/{TID}/reflog-7"
+        self.assertEqual(after.get(dated), self.other)
+        self.assertEqual(set(after), set(before) - set(old) - {legacy} | {dated})
+        # ...and kept until 30 days after that day, then deleted
+        report = ws.cleanup_archive(self.root, now=self.NOW + 30 * 86400)
+        self.assertEqual((report["recovery_refs_expired"], report["recovery_refs_dated"]), (1, 0), report)
+        self.assertIn(dated, self.refs())
+        report = ws.cleanup_archive(self.root, now=self.NOW + 31 * 86400)
+        self.assertEqual(report["recovery_refs_expired"], 2, report)          # the 29-day-old one went too
+        self.assertNotIn(dated, self.refs())
+        self.assertEqual({r: o for r, o in self.refs().items() if r in outside}, {r: before[r] for r in outside})
+
+    def test_an_expired_ref_that_moved_after_it_was_read_is_not_deleted(self):
+        ref = self.put(f"{ws.RECOVERY_REF_PREFIX}{self.day(40)}/{TID}/orig-head")
+        real = ws._git
+
+        def racing(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
+            if "update-ref" in args and "-d" in args:
+                self.assertEqual(args[-2:], [ref, self.other])               # the old value is always passed
+                git("update-ref", ref, self.main, cwd=self.clone)             # a writer moves it in between
+            return real(args, cwd=cwd, timeout=timeout, **kw)
+        with mock.patch.object(ws, "_git", side_effect=racing):
+            report = ws.cleanup_archive(self.root, now=self.NOW)
+        self.assertEqual(report["recovery_refs_expired"], 0, report)
+        self.assertEqual(len(report["errors"]), 1, report)
+        self.assertIn("changed since read", report["errors"][0])
+        self.assertEqual(self.refs(ws.RECOVERY_REF_PREFIX), {ref: self.main})
+
+    def test_a_symbolic_recovery_ref_is_never_followed_and_is_reported(self):
+        """Review 5, P1 #1: `update-ref -d` through an expired symbolic recovery ref deleted the branch it named (and
+        the cleanup reported success); the undated-ref rename followed it the same way."""
+        P = ws.RECOVERY_REF_PREFIX
+        valuable, other = self.put("refs/heads/valuable"), self.put("refs/heads/valuable-2", self.main)
+        expired_sym = f"{P}{self.day(40)}/{TID}/orig-head"
+        legacy_sym = f"{P}{TID2}/reflog-1"
+        git("symbolic-ref", expired_sym, valuable, cwd=self.clone)
+        git("symbolic-ref", legacy_sym, other, cwd=self.clone)
+        plain = self.put(f"{P}{self.day(40)}/{TID2}/orig-head")             # an ordinary expired ref still goes
+        before = self.refs()
+        report = ws.cleanup_archive(self.root, now=self.NOW)
+        self.assertEqual((report["recovery_refs_expired"], report["recovery_refs_dated"]), (1, 0), report)
+        self.assertEqual(len(report["errors"]), 1, report)
+        self.assertIn("2 symbolic ref(s)", report["errors"][0])
+        after = self.refs()
+        self.assertEqual((after.get(valuable), after.get(other)), (before[valuable], before[other]))
+        self.assertNotIn(plain, after)
+        for sym, target in ((expired_sym, valuable), (legacy_sym, other)):
+            self.assertEqual(git("symbolic-ref", sym, cwd=self.clone).strip(), target)
+        done = ws.expire_recovery_refs(self.clone, self.NOW + 365 * 86400)
+        self.assertEqual((done["expired"], done["dated"], done["symbolic"]), (0, 0, 2), done)
+        self.assertEqual({r: self.refs().get(r) for r in (valuable, other)}, {valuable: before[valuable],
+                                                                              other: before[other]})
+
+    def test_expiry_writes_never_dereference(self):
+        """Every update-ref the expiry runs passes --no-deref: a ref turned symbolic after it was listed is
+        written as itself, never through to its target."""
+        P = ws.RECOVERY_REF_PREFIX
+        self.put(f"{P}{self.day(40)}/{TID}/orig-head")
+        self.put(f"{P}{TID2}/reflog-1")
+        seen, real = [], ws._git
+
+        def spy(args, cwd=None, timeout=ws.GIT_TIMEOUT_S, **kw):
+            if "update-ref" in args:
+                seen.append(list(args))
+            return real(args, cwd=cwd, timeout=timeout, **kw)
+        with mock.patch.object(ws, "_git", side_effect=spy):
+            done = ws.expire_recovery_refs(self.clone, self.NOW)
+        self.assertEqual((done["expired"], done["dated"]), (1, 1), done)
+        self.assertEqual(len(seen), 2)
+        for args in seen:
+            self.assertIn("--no-deref", args)
+
+    def test_a_new_recovery_ref_is_dated_with_its_creation_day(self):
+        path = os.path.join(self.root, "active", TID)
+        git("commit", "-q", "--allow-empty", "-m", "lost", cwd=path)
+        lost = git("rev-parse", "HEAD", cwd=path).strip()
+        git("reset", "-q", "--hard", "HEAD~1", cwd=path)
+        self.assertEqual(ws.preserve_recovery_refs(path, TID, now=self.NOW - 3 * 86400), 1)
+        want = f"{ws.RECOVERY_REF_PREFIX}{self.day(3)}/{TID}/orig-head"
+        self.assertEqual(self.refs(ws.RECOVERY_REF_PREFIX), {want: lost})
+        self.assertEqual(ws.preserve_recovery_refs(path, TID, now=self.NOW), 1)    # idempotent across days
+
 
 if __name__ == "__main__":
     unittest.main()

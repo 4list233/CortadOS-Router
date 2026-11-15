@@ -451,9 +451,10 @@ class TaskExportTests(ChildTaskBase):
         with open(os.path.join(d, "prompt.txt"), "w") as f:
             f.write(planted)
         res.update(error=planted, workspace={"kind": "repo", "state": "held", "repo": planted, "branch": planted,
-                                             "reason": planted, "path": planted})
+                                             "reason": planted, "reason_code": "unpushed_files", "path": planted})
+        # the workspace reason (free text naming paths) is never exported, so it is not "withheld" either
         want = {"title", "client", "cwd", "orchestrator", "model", "error", "parent_note", "workspace.repo",
-                "workspace.branch", "workspace.reason"}
+                "workspace.branch"}
         for via in ("status", "prune"):
             with self.subTest(via=via):
                 self._forget_export(d, res, prompt_redacted=True)
@@ -472,7 +473,7 @@ class TaskExportTests(ChildTaskBase):
                     self.assertIsNone(rec[k], k)
                 self.assertEqual(rec["withheld_reason"], ct.EXPORT_PROMPT_WITHHELD)
                 self.assertEqual(rec["workspace"], {"kind": "repo", "state": "held", "repo": None, "branch": None,
-                                                    "reason": None})
+                                                    "reason_code": "unpushed_files"})
                 if via == "status":                           # the next round starts from what status left
                     res = _load(os.path.join(d, "result.json"))
 
@@ -553,7 +554,8 @@ class TaskExportTests(ChildTaskBase):
         res.pop("workspace", None)
         res.pop("error", None)
         ct._write_json(os.path.join(d, ct.WORKSPACE_FILE), {"kind": "repo", "state": "held", "repo": f"r{TOKEN}",
-                                                            "branch": "b", "reason": f"unpushed {TOKEN}"})
+                                                            "branch": "b", "reason": f"unpushed {TOKEN}",
+                                                            "reason_code": "unpushed_files"})
         for rotated in (False, True):
             with self.subTest(rotated=rotated):
                 self._forget_export(d, res)
@@ -568,12 +570,29 @@ class TaskExportTests(ChildTaskBase):
                 self.assertIsNone(rec["error"])
                 if rotated:
                     self.assertEqual(rec["workspace"], {"kind": "repo", "state": "held", "repo": None, "branch": None,
-                                                        "reason": None})
-                    self.assertEqual(rec["withheld_fields"], ["workspace.repo", "workspace.branch", "workspace.reason"])
+                                                        "reason_code": "unpushed_files"})
+                    self.assertEqual(rec["withheld_fields"], ["workspace.repo", "workspace.branch"])
                 else:
                     self.assertEqual(rec["workspace"], {"kind": "repo", "state": "held", "repo": "r***", "branch": "b",
-                                                        "reason": "unpushed ***"})
+                                                        "reason_code": "unpushed_files"})
                     self.assertNotIn("withheld_fields", rec)
+                res = _load(os.path.join(d, "result.json"))
+
+    def test_the_recovery_ref_count_is_exported_as_a_number_only(self):
+        """Review 4 of held-settle-fix, #2: the settle's recovery-ref count reaches the run export; anything but an
+        int (a planted name or path) does not."""
+        tid, d, res = self.run_export_task(task="x")
+        for value, want in ((2, 2), (0, 0), ("refs/cortados-recovery/x", None), (True, None)):
+            with self.subTest(value=value):
+                res.update(workspace={"kind": "repo", "state": "archived", "repo": "demo", "branch": "b",
+                                      "reason_code": "pushed", "recovery_refs": value})
+                self._forget_export(d, res)
+                _, st = self.call("task_status", task_id=tid)
+                self.assertTrue(st["export"]["ok"], st["export"])
+                [rec] = self.records()
+                self.assertEqual(rec["workspace"].get("recovery_refs"), want, rec["workspace"])
+                with open(self.export_file()) as f:
+                    self.assertNotIn("cortados-recovery", f.read())
                 res = _load(os.path.join(d, "result.json"))
 
     # --- export file permissions -----------------------------------------------------------------------------------

@@ -1246,7 +1246,10 @@ class CodexIsolationTests(unittest.TestCase):
         ws = tempfile.mkdtemp()
         # Local backend, and no provider URL from env or this machine's ~/.config/cortados/provider-url: the test checks
         # the direct Codex argv, which provider mode replaces with the Claude CLI.
-        local = {"CORTADOS_OUTCOME_BACKEND": "local", "CORTADOS_PROVIDER_URL": "", "CORTADOS_PROVIDER_URL_FILE": ""}
+        # Its own data home too: run_task's journal dir otherwise lands in the checkout's git-ignored s1/data/, and
+        # that leftover held every pushed task worktree that ran the full suite (2026-11-13).
+        local = {"CORTADOS_OUTCOME_BACKEND": "local", "CORTADOS_PROVIDER_URL": "", "CORTADOS_PROVIDER_URL_FILE": "",
+                 "CORTADOS_OUTCOME_HOME": tempfile.mkdtemp()}
         with mock.patch.object(agents, "_run", fake_run), mock.patch.object(codex_preflight, "preflight"), \
                 mock.patch.dict(os.environ, local):
             agents.ask_codex("gpt-6-astra", "hi")

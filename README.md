@@ -582,19 +582,53 @@ older checkout that does not confirm it adds a warning to the result; `docs/LOCA
   folder there. `cwd`: an existing directory ON THE HOST (not managed; a path that exists only on the requesting machine
   is refused saying so). The runner prepares the workspace before spawning (a clone can take minutes; start_task
   answers at once; a failed clone fails the task with the reason) and, when the child ends, moves the folder to
-  `archive/` (every commit on a remote and nothing uncommitted or untracked, or no repository) or `held/` (anything
+  `archive/` (every commit on a remote and nothing uncommitted or untracked, or no repository; "every commit" includes
+  the worktree-private refs a deletion would remove with it: `refs/worktree/*`, `refs/bisect/*`, `refs/rewritten/*` and
+  a stopped operation's `MERGE_HEAD`/`CHERRY_PICK_HEAD`/`REVERT_HEAD`/`REBASE_HEAD`/`BISECT_HEAD`, each reachable
+  from a remote-tracking ref; a stopped `merge --autostash` or `rebase --autostash` (either backend) keeps the task's
+  changes in an autostash in the worktree's own git dir (`MERGE_AUTOSTASH`, `rebase-merge/autostash`,
+  `rebase-apply/autostash`) that is never on a remote, so it always holds, `reason_code` `unpushed_autostash`; ANY
+  in-progress git operation holds outright, `unpushed_operation_state`: `rebase-merge/`, `rebase-apply/` (also a
+  stopped `git am`), `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `REBASE_HEAD`, `sequencer/`, `BISECT_LOG` (any
+  `BISECT_*`) or `NOTES_MERGE_*` in the worktree's own git dir (`AUTO_MERGE` reported with them), in any letter case
+  (on macOS's usual case-insensitive filesystem git reads `Rebase-Apply/` as `rebase-apply/`). Their files are never
+  parsed and the commits they name are not checked: seven review rounds each found a todo, label, short-id or
+  reset/merge form a parser missed, and one (`reset <id>` before a later `label <id>`) archived and then deleted an
+  unpublished commit. A task rarely ends mid-operation, a false hold only keeps a folder, a false archive loses work.
+  A git dir that cannot be listed, or an `ORIG_HEAD`, reflog or autostash that exists but cannot be read, is not a
+  regular file, is malformed (an `ORIG_HEAD` that is not one object id) or is past a size cap holds the folder,
+  `unreadable_git_state`; only a missing file counts as absent. `ORIG_HEAD` and the worktree's reflogs do
+  not hold, since every reset, amend or rebase writes them; instead, before the folder is archived (and again before
+  the cleanup deletes it) every commit only they reach gets a recovery ref in the clone,
+  `refs/cortados-recovery/<YYYYMMDD>/<task_id>/orig-head` or `.../reflog-<n>`, dated with the UTC day it was created
+  (one per tip; the count is `recovery_refs` in the settle record, `task_status` and the run export, never the
+  names); a ref that cannot be written holds the folder, `recovery_refs_failed`. Recovery refs expire 30 days after
+  creation (owner, 2026-11-14): see Archive cleanup) or `held/` (anything
   else, or a worktree git cannot assess) with `git worktree move`, and records it in `<root>/index.jsonl` (one line per
-  task, rewritten under `index.lock`). A plain folder containing a `.git` entry at any depth is conservatively moved
+  task, rewritten under `index.lock`). Git-ignored files count as unpublished owner data, except regenerable caches
+  (`__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `*.pyc`) and empty ignored directories; a nested
+  `.git` always holds (any case: `.GIT` and `.Git` are `.git` on macOS; a directory or a file). Archiving needs writer
+  quiescence: the child's process group gone (or the folder is held), and two clean assessments a pause apart (2 s,
+  then 5 s more if needed) bracketed by identical snapshots of the tree (paths, sizes, mtimes, outside the caches) and
+  of its own git state (HEAD, worktree-private refs and autostashes, index file, stopped-operation state, `ORIG_HEAD` and
+  its reflogs; the clone's shared branches, tags and stash are left
+  out: every task's worktree writes them and they survive the deletion, so a sibling task's commit or stash does not
+  hold it, #102), compared again under the cleanup lock before the move and
+  before HEAD is detached; a change after the move sends it on to `held/` undetached. Every snapshot counts every
+  entry it scans, caches included, against its cap (200 000); past it, it holds. The record names the paths that held it (`held_paths`, at most 20) and a path-free
+  `reason_code`. A plain folder containing a `.git` entry at any depth is conservatively moved
   to `held/` too (symlinks are never followed). An archived worktree has its HEAD detached at the same commit so its
-  branch is free for the next task (`git update-ref --no-deref HEAD` with hooks disabled: no checkout, no file
-  written; a failed detach is recorded as `detach_error` and loses nothing); a held one keeps its branch. An archive
+  branch is free for the next task, at exactly the assessed commit (`detached_at`), re-checked on the remote just
+  before (`git update-ref --no-deref HEAD <sha> <sha>` with hooks disabled: no checkout, no file written, refused by
+  git if HEAD moved; a commit gone from the remote holds it; a failed detach is recorded as `detach_error` and loses
+  nothing); a held one keeps its branch. An archive
   entry from before this that still holds the branch is detached when a new task asks for it, under the archive
   cleanup's lock, only if its tree is clean and its HEAD is the `origin/<branch>` tip fetched just then with an
   explicit all-heads refspec (a failed fetch refuses), and only if `active/`, `archive/` and `held/` are real
   directories and the entry is unchanged between assessment and detach; otherwise the start is refused. The start
   waits at most 60 s (`CLEANUP_LOCK_WAIT_S`) for that lock; past it the start is refused with "archive cleanup is
   running; retry in a minute" and never proceeds without the lock (#93).
-  `task_status` shows `workspace` (kind, state, path, reason).
+  `task_status` shows `workspace` (kind, state, path, reason, reason_code, held_paths, recovery_refs).
 - Archive cleanup: `python3 cortados_router/child_tasks.py --cleanup-archive [--root <dir>]` deletes `archive/<task_id>`
   entries whose index record says archived more than 3 days ago, and nothing else: not a name that is not a task id,
   not a symlink (never followed), not a non-directory, not an entry resolving outside `archive/`, not one without an
@@ -602,7 +636,17 @@ older checkout that does not confirm it adds a warning to the result; `docs/LOCA
   reassessed work moved to `held/` and errors consume the same time budget, and the time left in the budget is every
   git call's subprocess timeout, so one hung fetch cannot hold `cleanup.lock` past it (#93). An entry whose
   reassessment times out is left exactly as it is (reported under `timed_out`, counted as kept, retried by the next
-  run), never deleted or moved. The cleanup rechecks plain folders for a nested `.git` immediately before deletion.
+  run), never deleted or moved. The cleanup rechecks plain folders for a nested `.git` immediately before deletion,
+  and deletes a worktree only after two clean reassessments 2 s apart (`CLEANUP_QUIESCE_S`) bracketed by identical
+  snapshots (files and git state), plus one more snapshot; then it renames the entry to
+  `archive/.deleting-<task_id>-<nonce>` (a quarantine: a writer reaching it by its old path now fails), re-assesses
+  it there in full, and only then deletes it through the descriptor; any change holds it. A writer that recreates
+  `archive/<task_id>` meanwhile has its new folder moved to `held/`. A `.deleting-*` left by a crash is re-assessed
+  the same way, never deleted by its name. Known limit, accepted by the owner (2026-11-14): the quarantine does not
+  exclude a process that already holds a descriptor inside the tree (an open file or directory, a current directory);
+  it can still write between the last re-assessment and the deletion, and that write is deleted. No file-system lock
+  can exclude a descriptor opened before it; archiving required the task's process group gone three days earlier, and
+  an archive is a clean, pushed copy nobody works in.
   Worktree metadata is never pruned globally (#93): `git worktree prune` is never run, every clone has
   `gc.worktreePruneExpire=never`, a deleted worktree's own admin dir is removed alone, every move is followed by
   `git worktree repair` (a failure is recorded as `repair_error`, never rolled back), and each cleanup (and each start
@@ -610,9 +654,21 @@ older checkout that does not confirm it adds a warning to the result; `docs/LOCA
   run's deadline, after the deferred settles, with a per-entry backoff in `index.jsonl` (`repair_failures`,
   `repair_next_at`: 1 h doubling to a week). An admin dir whose backlink names another existing worktree that names it
   back belongs to that worktree: it is never repaired over (reported, `registry_conflict`) and never deleted with
-  another entry. With the admin dir kept, commits reachable from a worktree's HEAD or index survive any gc; a commit
-  reachable only from reflog entries (committed, then reset away) is lost once git's normal reflog expiry drops those
-  entries. That is acceptable: held work's commits are on its HEAD. `settle()`
+  another entry. With the admin dir kept, commits reachable from a worktree's HEAD or index survive any gc; in a held
+  worktree a commit reachable only from reflog entries (committed, then reset away) is lost once git's normal reflog
+  expiry drops those entries, which is acceptable: held work's commits are on its HEAD. An archived worktree's such
+  commits are kept by its recovery refs (above) before it is ever deleted. Recovery refs expire 30 days after they
+  were created (owner, 2026-11-14; `RECOVERY_REF_RETENTION_S`): each cleanup deletes, in every clone, the refs under
+  `refs/cortados-recovery/` whose creation day (in the ref's own name, written in the same transaction as the ref, so
+  no separate index can disagree with it) ended 30 days ago or more, each with `git update-ref --no-deref -d <ref>
+  <old value>` so a ref that moved since it was read is kept (reported as an error); nothing outside that namespace is
+  touched. A symbolic ref in the namespace (never made by this module) is never followed, renamed or deleted; it is
+  reported as an error for the owner to remove by hand. Known limit: a clone with the reftable ref backend
+  (`extensions.refStorage=reftable`) keeps its reflogs where this module cannot read them, so every worktree of such a
+  clone is held (`unreadable_git_state`): safe, but noisy.
+  An undated ref from the first layout (`refs/cortados-recovery/<task_id>/...`) is renamed to today's date the first
+  time a cleanup sees it, so it is kept 30 days from then, never deleted at once. The report carries counts only:
+  `recovery_refs_expired`, `recovery_refs_dated`. `settle()`
   moves under `cleanup.lock` (waits at most 60 s; past it the folder stays in `active/` marked `settle_deferred` and
   the next cleanup settles it; `task_status` then reports the index's settled record). Lock order: clone lock -> `cleanup.lock` -> `index.lock`. `integrations/launchd/com.cortados.archive-cleanup.plist` runs it daily on
   the Air; task startup never runs cleanup, so starting a task is not delayed by cleanup locks or remote fetches.
@@ -773,7 +829,7 @@ Each finished child task (any terminal state) is exported as one JSON line for a
   explicit marker `missing` when no parent is known; the parent comes from `start_task`'s optional `parent_task_id`, else
   `CORTADOS_PARENT_TASK_ID` in the launching session, validated as a task id), `title`, `host`, `client`, `state`,
   `exit_code`, `cancelled`, `timed_out`, `started_at` / `ended_at` / `elapsed_s`, `cwd` (home shown as `~`),
-  `workspace` (kind, state, repo, branch, reason; no path), `orchestrator`, `permission_mode`,
+  `workspace` (kind, state, repo, branch, reason_code; no path, so neither the reason text nor `held_paths`), `orchestrator`, `permission_mode`,
   `effective_permission_mode`, `chrome`, `launch`, `lane` / `model` (login mode), `router_run` (model, label, provider
   with account alias such as `claude-cli#b`, models, builder_models, refusals; fetched by the runner while the
   provider still holds it, else a note or an error field), `tool_uses`, `tool_errors`, `error`, `prompt`, `events` in
