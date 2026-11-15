@@ -760,9 +760,28 @@ older checkout that does not confirm it adds a warning to the result; `docs/LOCA
   `~/.claude/CLAUDE.md` does not make it delegate again. Children never get the whole-session ORCHESTRATOR directive
   or its delegation gate, whatever `orchestrator` is: a pin only pins the child's main model (its native subagents
   are still S1-routed).
-- `claude -p` and deferred tool loading: with tool search on, a headless session may not have an MCP tool's schema
-  loaded and report e.g. "start_task is not a function". Run such sessions with `ENABLE_TOOL_SEARCH=false` so every
-  MCP tool is loaded up front.
+- Deferred tool loading (#117): with tool search on, Claude Code (2.1.325) opens a conversation with only
+  `ToolSearch` and a `DeferredToolPlaceholder`, and adds an MCP tool's schema to `tools` only after ToolSearch loads
+  it. The provider starts its backend with the opening request's tools and never adds any (Codex takes dynamic tools
+  once, on `thread/start`), so a tool loaded later was listed to the model but every call ended in the backend CLI's
+  own "No such tool available" (a routed child with `connectors: ["wispr-flow"]`, 2026-11-14). The launcher
+  (`session.launcher_env`) therefore sets `ENABLE_TOOL_SEARCH=false`, which puts every MCP tool in the opening
+  request, but only where the catalog is bounded: every `start_task` child (hidden `--eager-tools`), and a whole
+  session started with `--strict-mcp-config` among its claude args (only the `--mcp-config` servers given load). Any
+  other whole session keeps deferred loading: the full catalog (~290k tokens) is over the 200k routes and the 128k
+  local lane, and `routing.request_fit` counts the whole request. In such a session, a tool loaded after the first
+  request cannot be called. The provider logs that ("the tool set changed mid-conversation … an added tool CANNOT be
+  called", tool names shown only as plain identifiers) and tells the backend model once, with the next turn, in a
+  fixed note that names no tool, so it can say so instead of retrying. Provider-side tool-set growth is #121.
+- Tool-schema budget (#117): the provider refuses any request whose `tools` serialize to more than
+  `server.TOOL_SCHEMA_BUDGET_BYTES` (200 KB: 80 KB for the client's built-in tools, measured 70 KB for Claude Code
+  2.1.325's 23, plus ≈40k tokens of MCP tools at a conservative 3 bytes a token). The check reads the real request on
+  both wires, before any routing or backend start, so it covers a child's connectors, the host MCP servers a child
+  without connectors inherits, and whole sessions alike. It applies to every request: a deferred-loading request is
+  far below it. The refusal is a 400 (retrying unchanged cannot succeed) naming the largest tool namespaces
+  (`mcp__<server>`, sizes in KB) and how to shrink the set: fewer connectors, or `--strict-mcp-config` with an
+  `--mcp-config` naming only the servers needed. Any tool name the provider puts in its own text (errors, log lines)
+  is shown only if it matches `^[A-Za-z0-9_.:-]{1,128}$`, else as `<invalid name>`.
 - `chrome: true` (default false) runs the child in LOGIN MODE (decided 2026-11-03): `claude` directly on the user's
   claude.ai login. Its env is an ALLOWLIST (`LOGIN_ENV_ALLOW`: shell basics, the bookkeeping paths, proxy/CA vars
   with any `user:pass@` proxy URL dropped); `LOGIN_FORBIDDEN_ENV` / `_PREFIXES` can never pass (provider URL and
@@ -789,6 +808,15 @@ older checkout that does not confirm it adds a warning to the result; `docs/LOCA
   gets no client-side tool search). The full set measured ~1.1 MB, about 290k estimated tokens across 495 MCP tools
   (Vercel alone 241), on 2026-11-02. That is over a 200k model's input ceiling, so the provider refused every such
   child with 413, and Claude Code shows a 413 as "Request too large (max 32MB) … images".
+  A child with `connectors` also gets `--strict-mcp-config` (#117): only the selected servers load, plus
+  `cortados-route` (the execution host's own `subagent_mcp.py` by absolute path, with `CORTADOS_PROVIDER_URL`, the
+  token file when one was given, `CORTADOS_CHILD_CLAUDE_BIN` when set and `CORTADOS_CHILD_TASK=1`), so its
+  `local_switch` stays available while `start_task` and `route_task` stay refused, as in every child. The execution
+  host's other Claude Code MCP servers (user, project, plugin) are NOT available to that child. A child without
+  `connectors` keeps the host's servers. Either way the selection's size is checked by the provider's tool-schema budget above on the child's
+  first request (a connector's tools cannot be listed at launch: they sit behind OAuth in the execution host's
+  Keychain), so `start_task` needs no tool counts; a leftover `"cortadosTools"` key in an entry is ignored and not
+  passed to the child.
 - Refusals: the provider logs every refusal it answers (JSON errors, SSE error events, the local relay's errors) and,
   for an authenticated request, records it under its `x-cortados-run-id`; an unauthenticated one is logged apart and
   never recorded. Only status, error type and a fixed reason of the provider's own (for a backend failure, its

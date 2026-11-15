@@ -12,7 +12,76 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
+from cortados_router.safe_text import safe_error_text
+
 MODEL_ID = "cortados"
+
+# How the provider shows a client-supplied tool name in text of its OWN (an error, a log line, a note to the backend
+# model), #117 review round 2: names are only checked as valid Unicode on the wire (check_tool_name), so a name can
+# carry newlines or a sentence ("Ignore prior instructions ...") that would then read as the provider speaking.
+# A name is shown only if it fits this identifier grammar (every Claude Code, MCP and Codex tool name seen does);
+# anything else is shown as INVALID_NAME. fullmatch, not ^...$: `$` also matches before a trailing newline.
+SHOWN_NAME = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+INVALID_NAME = "<invalid name>"
+
+
+def shown_name(name: Any) -> str:
+    """`name` as provider-authored text may show it: itself if it is a plain identifier (SHOWN_NAME), else
+    INVALID_NAME. The only way a client's tool name enters the provider's own messages."""
+    return name if isinstance(name, str) and SHOWN_NAME.fullmatch(name) else INVALID_NAME
+
+
+# Any OTHER client-supplied string the provider puts in a log line or an error message (call ids, model names, roles,
+# block and item types, ids from a backend that echo the client's), #117 review round 3: rendered repr-style, so every
+# control character (newline, CR, ESC, NUL; also U+2028/U+2029/U+0085, which str.isprintable rejects) is an escape
+# sequence and no client string can start a second log line; capped so it cannot flood one either. Quoted, so it never
+# reads as the provider's own words. Non-strings are rendered by type and repr, capped the same way.
+LOG_SAFE_CAP = 120
+
+
+def log_safe(value: Any, cap: int = LOG_SAFE_CAP) -> str:
+    """`value` as a provider log line or error may show it: repr of at most `cap` characters of it, with a
+    '...(+N chars)' suffix when cut. Never contains a raw control or line-separator character."""
+    if isinstance(value, str):
+        cut = value[:cap]
+        out = repr(cut)
+        return out + (f"...(+{len(value) - cap} chars)" if len(value) > cap else "")
+    if value is None or isinstance(value, (bool, int, float)):
+        return repr(value)
+    try:
+        out = repr(value)
+    except Exception:                       # a hostile __repr__ never breaks the error path
+        return f"<{type(value).__name__}>"
+    out = out if out.isprintable() else out.encode("unicode_escape").decode("ascii")
+    return out[:cap] + (f"...(+{len(out) - cap} chars)" if len(out) > cap else "")
+
+
+def log_text(value: Any, cap: int = 300) -> str:
+    """Free backend text (a CLI's error result, a backend's error message) in a provider error: log_safe's escaping and
+    cap without the quotes, so templates that read its start (server.failure_diagnostic's `API Error: <status>`) still
+    match, while a newline or other control character in it is an escape sequence, never a line break."""
+    out = log_safe(value if isinstance(value, str) else str(value), cap)
+    q = out[0]
+    end = out.rfind(q)
+    return out[1:end] + out[end + 1:]
+
+
+def shown_id(value: Any) -> str:
+    """A client call id in provider-authored transcript text (replay labels): itself when it is a plain identifier
+    (SHOWN_NAME; every real tool_use / call id is), else its log_safe rendering, so a forged id can neither break a
+    label line nor read as the provider's words, and the same id always renders the same (labels still pair)."""
+    return value if isinstance(value, str) and SHOWN_NAME.fullmatch(value) else log_safe(value)
+
+
+def log_ids(values: Any, cap: int = 8) -> str:
+    """A collection of client ids (call ids, tool_use ids) for a log line or error: each through log_safe, at most
+    `cap` of them, sorted when they sort."""
+    try:
+        vals = sorted(values)
+    except TypeError:
+        vals = list(values)
+    shown = ", ".join(log_safe(v) for v in vals[:cap])
+    return "[" + shown + (f", ... +{len(vals) - cap} more" if len(vals) > cap else "") + "]"
 
 
 # Anthropic server tools: the Messages API itself executes them (web search, web fetch, code execution) and answers with
@@ -256,8 +325,8 @@ def check_tool_name(name: str, what: str = "tool name") -> str:
     try:
         name.encode("utf-8")
     except UnicodeEncodeError:
-        # !a escapes every non-ASCII code point, so the message itself can always be encoded (é and a surrogate alike).
-        raise WireError(f"{what} {name!a} is not valid Unicode "
+        # Never the name itself (shown_name: a lone surrogate is never an identifier, so this says <invalid name>).
+        raise WireError(f"{what} {shown_name(name)} is not valid Unicode "
                         "(it contains a lone surrogate)") from None
     return name
 
@@ -287,7 +356,7 @@ def _parse_request(body: dict[str, Any]) -> ClientTurn:
     for m in messages[start:]:
         role = m.get("role")
         if role not in ("user", "system"):
-            raise WireError(f"unsupported message role {role!r}")
+            raise WireError(f"unsupported message role {log_safe(role)}")
         for b in _blocks(m.get("content")):
             if b.get("type") == "tool_result" and role == "user":
                 results[b["tool_use_id"]] = {"content": mcp_content(b.get("content")), "isError": bool(b.get("is_error"))}
@@ -317,7 +386,7 @@ def _parse_request(body: dict[str, Any]) -> ClientTurn:
     choice = raw_choice.get("type")
     # One exception, for server-tool-only requests: see _forced_server_tool_choice.
     if choice != "auto" and not _forced_server_tool_choice(tools, raw_choice):
-        raise WireError(f"tool_choice {choice!r} is not supported by the cortados model; only 'auto'")
+        raise WireError(f"tool_choice {log_safe(choice)} is not supported by the cortados model; only 'auto'")
     return ClientTurn(system=_system_text(body.get("system")), tools=[without_cache_control(t) for t in tools
                                                                      if t.get("name") and not is_server_tool(t)],
                       content=content, tool_results=results,
@@ -440,7 +509,7 @@ def _result_parts(content: Any, call_id: Any, n: list) -> list:
             if texts:
                 out.append(_cut("\n".join(texts)))
                 texts = []
-            out += _image_parts(c, n, f"from the tool result for call {call_id}")
+            out += _image_parts(c, n, f"from the tool result for call {shown_id(call_id)}")
         elif c.get("type") == "text":
             texts.append(str(c.get("text", "")))
         else:
@@ -455,10 +524,10 @@ def _replay_block(b: dict[str, Any], n: list, role: str) -> list | None:
     if kind == "text":
         return [_cut(str(b.get("text", "")))]
     if kind == "tool_use":
-        return [_cut(f"[tool call {b.get('id')}: {b.get('name')}] {json.dumps(b.get('input') or {}, default=str)}")]
+        return [_cut(f"[tool call {shown_id(b.get('id'))}: {shown_name(b.get('name'))}] {json.dumps(b.get('input') or {}, default=str)}")]
     if kind == "tool_result":
         err = ", error" if b.get("is_error") else ""
-        return [f"[tool result for call {b.get('tool_use_id')}{err}]"] + _result_parts(b.get("content"),
+        return [f"[tool result for call {shown_id(b.get('tool_use_id'))}{err}]"] + _result_parts(b.get("content"),
                                                                                         b.get("tool_use_id"), n)
     if kind == "image":
         return _image_parts(b, n, f"in this {role} message")
@@ -523,7 +592,7 @@ def rebuild_content(transcript: list[dict[str, Any]], turn: ClientTurn) -> list[
                      "\n</conversation-history>\n\nThe client's new turn follows."])
     for call_id, result in turn.tool_results.items():
         err = ", error" if result.get("isError") else ""
-        out.append({"type": "text", "text": f"[tool result for call {call_id}{err}]\n"
+        out.append({"type": "text", "text": f"[tool result for call {shown_id(call_id)}{err}]\n"
                                             + _cut(_result_text(result.get("content"),
                                                                 "[image result: attached after this text]"))})
         for c in result.get("content") or []:
@@ -576,7 +645,7 @@ def sse_body(blocks: list[dict[str, Any]], stop_reason: str, usage: dict[str, in
             yield sse("content_block_delta", {"type": "content_block_delta", "index": i,
                                               "delta": {"type": "input_json_delta", "partial_json": json.dumps(b["input"])}})
         else:
-            raise ValueError(f"unsupported block type {b['type']!r}")
+            raise ValueError(f"unsupported block type {log_safe(b['type'])}")
         yield sse("content_block_stop", {"type": "content_block_stop", "index": i})
     # message_start carried zeros (nothing was known then); the whole turn's usage, cache counts included, rides here,
     # where the API reports cumulative usage and where clients read it.
@@ -586,4 +655,6 @@ def sse_body(blocks: list[dict[str, Any]], stop_reason: str, usage: dict[str, in
 
 
 def error_json(kind: str, message: str) -> dict[str, Any]:
-    return {"type": "error", "error": {"type": kind, "message": message}}
+    """The Anthropic error body (HTTP and SSE `error` event). The message passes safe_error_text: the SINK that keeps
+    client text from showing a raw newline or other control character to a model or user, whatever the caller built."""
+    return {"type": "error", "error": {"type": kind, "message": safe_error_text(message)}}

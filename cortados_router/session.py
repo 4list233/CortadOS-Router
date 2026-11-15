@@ -207,9 +207,36 @@ def custom_headers(run_id: str | None = None, office_headers=None, local: str | 
     return "\n".join(lines)
 
 
+# Deferred tool loading (#117). With tool search on, Claude Code (2.1.325, measured on a fake API 2026-11-14) opens a
+# conversation with only ToolSearch + a DeferredToolPlaceholder and adds an MCP tool's schema to `tools` only after
+# ToolSearch loads it. The provider starts its backend with the opening request's tools and never re-declares them
+# (server.py "tool set changed mid-conversation"; Codex takes dynamic tools once, on thread/start), so the backend
+# model saw a loaded connector tool's name and every call ended in the backend CLI's own "No such tool available"
+# (task t20261114164728-86cbe366). ENABLE_TOOL_SEARCH=false puts every MCP tool in the opening request instead, which
+# is only safe when the MCP catalog is BOUNDED: the full connector catalog measured ~290k tokens across 495 tools
+# (README "Connectors"), over the 200k routes and the 128k local lane, and routing.request_fit counts the whole request,
+# so eager schemas there would exclude routes or refuse the session outright. So the flag is set only for
+#   - child tasks (`--eager-tools`, passed by child_tasks.start only): with connectors only those load (plus
+#     `--strict-mcp-config`, so not the host's own MCP servers); without, the host's own servers load;
+#   - whole sessions whose MCP set is explicitly filtered: `--strict-mcp-config` among the claude args (only the
+#     `--mcp-config` servers given load, so the user chose and can see the catalog).
+# Either way the provider bounds what arrives: every request's tools are checked against its tool-schema budget on
+# their real serialized size (provider/server.py TOOL_SCHEMA_BUDGET_BYTES), and an oversized set is refused naming its
+# largest namespaces. Any other whole session keeps Claude Code's deferred loading; a tool it loads later still cannot
+# be called through the provider (the provider's warning says so) until provider-side tool-set growth lands (#121).
+TOOL_SEARCH_OFF = {"ENABLE_TOOL_SEARCH": "false"}
+STRICT_MCP_FLAG = "--strict-mcp-config"
+
+
+def mcp_filtered(extra) -> bool:
+    """Whether the claude args restrict the session to an explicit MCP set (STRICT_MCP_FLAG)."""
+    return STRICT_MCP_FLAG in (extra or ())
+
+
 def launcher_env(provider_url: str, token: str, delegate_budget: int = 3, run_id: str | None = None,
-                 office_headers=None, local: str | None = None) -> dict:
-    """Every variable the launcher sets (BLANKED ones as empty)."""
+                 office_headers=None, local: str | None = None, eager_tools: bool = False) -> dict:
+    """Every variable the launcher sets (BLANKED ones as empty). `eager_tools` turns tool search off (TOOL_SEARCH_OFF):
+    only for a bounded MCP catalog."""
     env = dict(
         {
             "ANTHROPIC_BASE_URL": provider_url,
@@ -229,7 +256,8 @@ def launcher_env(provider_url: str, token: str, delegate_budget: int = 3, run_id
             "CLAUDE_CODE_ENTRYPOINT": "cli",
             "CORTADOS_WHOLE_SESSION": "1",
             "CORTADOS_DELEGATE_BUDGET": str(delegate_budget),
-        }
+        },
+        **(TOOL_SEARCH_OFF if eager_tools else {}),
     )
     for key in BLANKED:
         env[key] = ""
@@ -237,18 +265,20 @@ def launcher_env(provider_url: str, token: str, delegate_budget: int = 3, run_id
 
 
 def build_env(base: dict, provider_url: str, token: str, delegate_budget: int = 3, run_id: str | None = None,
-              office_headers=None, local: str | None = None) -> dict:
+              office_headers=None, local: str | None = None, eager_tools: bool = False) -> dict:
     # Kept in the process env too, so anything that reads the environment before settings load sees the same values.
-    return {**base, **launcher_env(provider_url, token, delegate_budget, run_id, office_headers, local)}
+    return {**base, **launcher_env(provider_url, token, delegate_budget, run_id, office_headers, local,
+                                   eager_tools=eager_tools)}
 
 
 def settings_content(provider_url: str, token: str, delegate_budget: int = 3, gate: bool = True,
                      run_id: str | None = None, office_headers=None, local: str | None = None,
-                     project: str | None = None) -> dict:
+                     project: str | None = None, eager_tools: bool = False) -> dict:
     """project: the session's project folder when known (child tasks: --project-dir); the boundary hook's interpreter
     and script must lie outside it."""
     # disableAllHooks false: a user settings file cannot switch the boundary hook off while the header says it runs.
-    content = {"env": launcher_env(provider_url, token, delegate_budget, run_id, office_headers, local),
+    content = {"env": launcher_env(provider_url, token, delegate_budget, run_id, office_headers, local,
+                                   eager_tools=eager_tools),
                "enabledPlugins": {PLUGIN_ID: False}, "disableAllHooks": False}
     pre = [boundary_hook_entry(project)]         # always: the header in env promises it (no hook, no edits)
     if gate:
@@ -410,6 +440,8 @@ def parse(argv: list):
     ap.add_argument("--local", default=None, help=argparse.SUPPRESS)   # checked by custom_headers (SessionError)
     # child tasks: the child's project folder; the boundary hook's interpreter and script must lie outside it
     ap.add_argument("--project-dir", default=None, help=argparse.SUPPRESS)
+    # child tasks only (child_tasks.start, after its connector budget check): tool search off, TOOL_SEARCH_OFF
+    ap.add_argument("--eager-tools", action="store_true", help=argparse.SUPPRESS)
     return ap.parse_args(argv), extra
 
 
@@ -430,11 +462,15 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home
         if not args.no_gate:
             directive += f"\nThis session allows {args.delegate_budget} direct work calls per prompt before delegation is required."
     office = args.office_header
-    check_managed(set(launcher_env(url, token, args.delegate_budget, args.run_id, office, args.local)), managed_dirs)
+    eager = bool(args.eager_tools or mcp_filtered(extra))      # a bounded MCP catalog only (TOOL_SEARCH_OFF)
+    check_managed(set(launcher_env(url, token, args.delegate_budget, args.run_id, office, args.local,
+                                   eager_tools=eager)), managed_dirs)
     settings_path = write_settings(args.settings_dir or SETTINGS_DIR,
                                    settings_content(url, token, args.delegate_budget, not args.no_gate, args.run_id,
-                                                    office, args.local, args.project_dir), home)
-    return (args, build_env(base_env, url, token, args.delegate_budget, args.run_id, office, args.local),
+                                                    office, args.local, args.project_dir, eager_tools=eager),
+                                   home)
+    return (args, build_env(base_env, url, token, args.delegate_budget, args.run_id, office, args.local,
+                            eager_tools=eager),
             build_argv(model, directive, extra, settings_path))
 
 

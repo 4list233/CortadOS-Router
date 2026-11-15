@@ -62,10 +62,12 @@ FAKE = textwrap.dedent('''\
                    "pythonpath": os.environ.get("PYTHONPATH"), "pid": os.getpid(),
                    "settings": (lambda p: p and {{"mode": os.stat(p).st_mode & 0o777, "body": json.load(open(p))}})(
                        sys.argv[sys.argv.index("--settings") + 1] if "--settings" in sys.argv else None),
+                   "mcp": (lambda p: p and json.load(open(p)))(
+                       sys.argv[sys.argv.index("--mcp-config") + 1] if "--mcp-config" in sys.argv else None),
                    "env": {{k: os.environ.get(k) for k in ("CORTADOS_PROVIDER_TOKEN", "CORTADOS_PROVIDER_URL",
                            "CORTADOS_PROVIDER_TOKEN_FILE", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_MODEL",
                            "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL",
-                           "ANTHROPIC_AUTH_TOKEN", "HOME", "PATH")}}}}, f)
+                           "ANTHROPIC_AUTH_TOKEN", "HOME", "PATH", "ENABLE_TOOL_SEARCH")}}}}, f)
     if mode == "sleep":
         time.sleep(60)
     if mode == "stubborn":
@@ -626,29 +628,78 @@ class ChildTaskTests(ChildTaskBase):
         os.environ["CORTADOS_CONNECTORS_MCP_CONFIG"] = conn
         tid = self.start(permission_mode="dontAsk")                 # default: none, even though the file exists
         self.call("wait_task", task_id=tid, timeout_s=30)
-        self.assertNotIn("--mcp-config", _load(os.path.join(self.work, "fake-argv.json"))["argv"])
+        seen = _load(os.path.join(self.work, "fake-argv.json"))
+        self.assertNotIn("--mcp-config", seen["argv"])
+        # Without connectors the child keeps the host's own MCP servers (bounded at the provider, #117).
+        self.assertNotIn("--strict-mcp-config", seen["argv"])
+        self.assertEqual(seen["env"]["ENABLE_TOOL_SEARCH"], "false")  # #117: every child, connectors or not
         tid = self.start(connectors=["notion"])
         d = ct.task_path(tid)
         _, w = self.call("wait_task", task_id=tid, timeout_s=30)
-        a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
+        seen = _load(os.path.join(self.work, "fake-argv.json"))
+        a = seen["argv"]
+        # #117: a routed child runs with tool search off, in its env and in its flag-precedence settings, so the
+        # connector tools are in the opening request the provider starts its backend with. With tool search on they
+        # were added only after ToolSearch, the backend never had them, and every call was "No such tool available".
+        self.assertEqual(seen["env"]["ENABLE_TOOL_SEARCH"], "false")
+        self.assertEqual(seen["settings"]["body"]["env"]["ENABLE_TOOL_SEARCH"], "false")
         path = a[a.index("--mcp-config") + 1]
         self.assertEqual(os.path.dirname(path), d)                 # a private per-task file, not the full config
+        # #117 round 3: only the selection loads, not also the execution host's own MCP servers.
+        self.assertEqual(a[a.index("--mcp-config") - 1], "--strict-mcp-config")
+        self.assertEqual(a.count("--strict-mcp-config"), 1)
+        # Round 4: exactly the selection plus cortados-route (its local_switch is allowed in a child), nothing else.
+        self.assertEqual(sorted(seen["mcp"]["mcpServers"]), ["cortados-route", "notion"])
+        self.assertEqual(seen["mcp"]["mcpServers"]["notion"], {"type": "http", "url": "https://notion.example/mcp"})
+        route = seen["mcp"]["mcpServers"]["cortados-route"]
+        self.assertTrue(os.path.isabs(route["command"]), route)
+        self.assertEqual(len(route["args"]), 1)
+        self.assertTrue(os.path.isabs(route["args"][0]), route)
+        self.assertEqual(os.path.realpath(route["args"][0]),
+                         os.path.realpath(os.path.join(os.path.dirname(ct.__file__), "subagent_mcp.py")))
+        self.assertTrue(os.path.isfile(route["args"][0]))
+        self.assertEqual(route["env"]["CORTADOS_CHILD_TASK"], "1")   # start_task / route_task stay refused
+        self.assertEqual(route["env"]["CORTADOS_PROVIDER_URL"], self.cfg["url"])
+        self.assertFalse([k for k in route["env"] if k == "CORTADOS_PROVIDER_TOKEN"], "never the token itself")
         self.assertFalse(os.path.exists(path), "the selection (it may carry credentials) is removed at exit")
         self.assertEqual(_load(os.path.join(d, "meta.json"))["connectors"], ["notion"])
         r, _ = self.call("start_task", task="x", cwd=self.work, connectors=["nope"])
-        self.assertIn("unknown connector(s) nope; available: notion, slack, vercel", r["content"][0]["text"])
+        self.assertIn("unknown connector(s) 'nope'; available: notion, slack, vercel", r["content"][0]["text"])
 
     def test_selected_connectors_file_content(self):
         conn = os.path.join(self.tmp, "connectors.mcp.json")
         with open(conn, "w") as f:
-            json.dump({"mcpServers": {"a": {"command": "x"}, "b": {"command": "y"}}}, f)
+            json.dump({"mcpServers": {"a": {"command": "x"}, "b": {"command": "y", "cortadosTools": 3}}}, f)
         os.environ["CORTADOS_CONNECTORS_MCP_CONFIG"] = conn
         self.assertIsNone(ct.select_connectors(None))
         self.assertIsNone(ct.select_connectors([]))
-        self.assertEqual(ct.select_connectors(["b"]), {"b": {"command": "y"}})
+        self.assertEqual(ct.select_connectors(["a"]), {"a": {"command": "x"}})
+        self.assertEqual(ct.select_connectors(["b"]), {"b": {"command": "y"}})   # a round-2 count key is not passed on
         for bad in ("a", [1], ["a"] * 40):
             with self.assertRaises(ct.TaskError):
                 ct.select_connectors(bad)
+
+    def test_connectors_with_no_tool_count_launch_strict_and_eager(self):
+        # #117 round 3: start_task needs no "cortadosTools" (a count bounded nothing); the provider's byte budget
+        # bounds the catalog. A large selection launches; it would be refused at the provider, not here.
+        self.assertFalse(hasattr(ct, "MAX_EAGER_TOOLS"))
+        conn = os.path.join(self.tmp, "connectors.mcp.json")
+        with open(conn, "w") as f:
+            json.dump({"mcpServers": {"vercel": {"type": "http", "url": "https://v.example"},
+                                      "apollo": {"type": "http", "url": "https://a.example"}}}, f)
+        os.environ["CORTADOS_CONNECTORS_MCP_CONFIG"] = conn
+        tid = self.start(connectors=["vercel", "apollo"])
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        seen = _load(os.path.join(self.work, "fake-argv.json"))
+        a = seen["argv"]
+        self.assertIn("--strict-mcp-config", a)
+        servers = dict(seen["mcp"]["mcpServers"])
+        self.assertEqual(servers.pop("cortados-route")["args"][0].rsplit("/", 1)[-1], "subagent_mcp.py")
+        self.assertEqual(servers, {"vercel": {"type": "http", "url": "https://v.example"},
+                                   "apollo": {"type": "http", "url": "https://a.example"}})
+        self.assertEqual(seen["env"]["ENABLE_TOOL_SEARCH"], "false")
+        self.assertEqual(sorted(_load(os.path.join(ct.task_path(tid), "meta.json"))["connectors"]), ["apollo", "vercel"])
 
     def test_settings_file_exists_while_running(self):
         os.environ["FAKE_CLAUDE_MODE"] = "sleep"
@@ -1518,6 +1569,9 @@ class ChildTaskTests(ChildTaskBase):
         conn = _load(os.path.join(d, "meta.json"))
         self.assertEqual(conn["connectors"], ["velox", "wispr-flow"])
         self.assertIn("--mcp-config", a)
+        # #117, the failing shape exactly (routed, connectors, gui LaunchAgent): the runner's env file carries tool
+        # search off to the child, so the connector tools are declared up front and reach the provider's backend
+        self.assertEqual(seen["env"]["ENABLE_TOOL_SEARCH"], "false")
         # the env file and the settings file (both token-free / token-bearing 0600 session-*.json) are gone after
         self.assertFalse([n for n in os.listdir(d) if n.startswith("session-")])
         self.assertTrue(_load(os.path.join(d, ct.LAUNCHD_FILE))["booted_out"])

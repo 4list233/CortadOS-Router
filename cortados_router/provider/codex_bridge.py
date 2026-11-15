@@ -42,6 +42,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from cortados_router.provider.anthropic_wire import log_ids, log_safe, log_text, shown_id, shown_name
 from cortados_router.provider.bridge import SCRATCH_NOTE, SCRATCH_REFUSED, BridgeError, names_scratch, write_line
 from cortados_router.provider.codex_isolation import (BENIGN_MCP_TOOLS, DEFAULT_EXEC_YIELD_MS, LEAKED_ITEMS,
                                                        REFUSED_EFFORTS, V1_APPROVALS, V2_APPROVALS, check_account,
@@ -251,7 +252,7 @@ class CodexSession:
         declared = {v: k for k, v in self._aliases.items()}
         if self._aliases:
             logger.info("codex conversation %s: client tools Codex would refuse or swallow are declared as %s", self.id[:8],
-                        ", ".join(f"{wire} -> {client!a}" for wire, client in sorted(self._aliases.items())))
+                        ", ".join(f"{shown_name(wire)} -> {shown_name(client)}" for wire, client in sorted(self._aliases.items())))
         params: dict[str, Any] = {
             "cwd": str(self.dir / "work"), "ephemeral": True, "sandbox": "read-only", "approvalPolicy": "never",
             # Codex tells the model its cwd too (the scratch work dir): the same note and guard as bridge.SCRATCH_NOTE.
@@ -269,24 +270,25 @@ class CodexSession:
         thread = started.get("thread") or {}
         version = thread.get("cliVersion")
         if version not in SUPPORTED_CLI_VERSIONS:
-            raise BridgeError(f"codex app-server reports cliVersion {version!r}; this bridge is verified for "
+            raise BridgeError(f"codex app-server reports cliVersion {log_safe(version)}; this bridge is verified for "
                               f"{', '.join(SUPPORTED_CLI_VERSIONS)} only (the dynamic-tools API is experimental)")
         if not thread.get("id"):
             raise BridgeError("codex app-server answered thread/start without a thread id")
         if model and started.get("model") != model:
             # The route log and the x-cortados-route header name the routed model as the one that ran; a thread
             # Codex started on another slug (one the account's model/list lacks) must be refused, never run quietly.
-            raise BridgeError(f"codex app-server started the thread on {started.get('model')!r}, not the routed "
-                              f"{model!r}; the route log must name the model that ran")
+            raise BridgeError(f"codex app-server started the thread on {log_safe(started.get('model'))}, not the routed "
+                              f"{log_safe(model)}; the route log must name the model that ran")
         sandbox = (started.get("sandbox") or {}).get("type")
         if sandbox != "readOnly" or started.get("approvalPolicy") != "never":
             # Both were asked for on thread/start; a managed requirements.toml can override either, and a thread that
             # could write or ask for approvals is not the isolated one this bridge promises.
-            raise BridgeError(f"codex app-server started the thread with sandbox {sandbox!r} and approvalPolicy "
-                              f"{started.get('approvalPolicy')!r}, not the read-only / never that was requested")
+            raise BridgeError(f"codex app-server started the thread with sandbox {log_safe(sandbox)} and approvalPolicy "
+                              f"{log_safe(started.get('approvalPolicy'))}, not the read-only / never that was requested")
         self.thread_id = thread["id"]
         logger.info("codex conversation %s: thread %s, model %s, codexHome %s, instructionSources %s", self.id[:8],
-                    self.thread_id, started.get("model"), info.get("codexHome"), started.get("instructionSources"))
+                    log_safe(self.thread_id), log_safe(started.get("model")), log_safe(info.get("codexHome"), 200),
+                    log_safe(started.get("instructionSources"), 300))
         self._check_fatal()
 
     def _tool_refusal(self, exc: BridgeError, declared: list[dict[str, Any]]) -> BridgeError:
@@ -294,16 +296,19 @@ class CodexSession:
         client must learn which of its tools Codex refused, never get a silently shortened tool set. Only the name
         Codex spelled out in one of its known refusal formats is looked up; the rest of the message is never scanned,
         so a client tool named like a word of the boilerplate ("tool", "reserved", ...) is never blamed."""
-        msg = str(exc)
+        # Parsed on Codex's raw text; shown only as str(exc), whose Codex text _call rendered with log_safe.
+        raw = getattr(exc, "codex_message", None)
+        msg = raw if isinstance(raw, str) else str(exc)
         if "dynamic tool" not in msg:
             return exc
         wire = refused_tool_name(msg)
         if wire is None or wire not in {d["name"] for d in declared}:
             return BridgeError(f"codex app-server refused a dynamic tool name this bridge cannot match to any of the "
-                               f"client's declared tools (none of them is known to be wrong): {msg}")
+                               f"client's declared tools (none of them is known to be wrong): {exc}")
         client = self._aliases.get(wire, wire)
-        shown = f"{client!r}" + (f" (declared to Codex as {wire!r})" if client != wire else "")
-        return BridgeError(f"codex app-server refused client tool {shown}: {msg}")
+        # The names as shown_name renders them (#117): a client's tool name never enters this message raw.
+        shown = f"'{shown_name(client)}'" + (f" (declared to Codex as '{shown_name(wire)}')" if client != wire else "")
+        return BridgeError(f"codex app-server refused client tool {shown}: {exc}")
 
     def _read_stdout(self) -> None:
         try:
@@ -314,10 +319,10 @@ class CodexSession:
                 try:
                     msg = json.loads(line)
                 except ValueError:
-                    logger.warning("cortados codex %s: non-JSON stdout line: %.200s", self.id[:8], line)
+                    logger.warning("cortados codex %s: non-JSON stdout line: %s", self.id[:8], log_safe(line, 200))
                     continue
                 if not isinstance(msg, dict):
-                    logger.warning("cortados codex %s: non-object stdout line: %.200s", self.id[:8], line)
+                    logger.warning("cortados codex %s: non-object stdout line: %s", self.id[:8], log_safe(line, 200))
                     continue
                 if "method" in msg:                     # server request (with id) or notification (without)
                     if msg["method"] == "mcpServer/startupStatus/updated":
@@ -399,7 +404,11 @@ class CodexSession:
             raise BridgeError(f"codex app-server did not answer {method} within {timeout:.0f}s")
         if "error" in reply:
             err = reply.get("error") or {}
-            raise BridgeError(f"codex app-server refused {method}: {err.get('message')} (code {err.get('code')})")
+            refused = BridgeError(f"codex app-server refused {method}: {log_safe(err.get('message'), 300)} "
+                                  f"(code {log_safe(err.get('code'))})")
+            # The raw text, for _tool_refusal's parser only (it never goes into a message or log line as it is).
+            refused.codex_message = err.get("message") if isinstance(err.get("message"), str) else ""
+            raise refused
         return reply.get("result") or {}
 
     def _drain_snapshot(self, deadline: float | None) -> bool:
@@ -460,11 +469,11 @@ class CodexSession:
             # Calls of a turn that already ended: Codex was answered when the turn ended (ENDED_AROUND), and the
             # client moved on instead of sending their results. No follow-up turn: the new message supersedes them.
             logger.warning("codex conversation %s: new user message while the ended turn %s still had calls %s "
-                           "outstanding; they stay failed and no follow-up turn starts", self.id[:8], self._turn_id,
-                           sorted(list(self._orphaned) + [e["call_id"] for e in self._late]))
+                           "outstanding; they stay failed and no follow-up turn starts", self.id[:8], log_safe(self._turn_id),
+                           log_ids(list(self._orphaned) + [e["call_id"] for e in self._late]))
         if self._carried:
             logger.warning("codex conversation %s: new user message before %d block(s) of the ended turn %s reached "
-                           "the client; they are dropped", self.id[:8], len(self._carried), self._turn_id)
+                           "the client; they are dropped", self.id[:8], len(self._carried), log_safe(self._turn_id))
         self._orphaned, self._late, self._delivered, self._carried = {}, [], {}, []
         self._start_turn(_turn_input(content), deadline)
 
@@ -475,7 +484,7 @@ class CodexSession:
         effort = (self.route or {}).get("effort")       # only a route that carries one; otherwise the model default
         if effort:
             if str(effort).lower() in REFUSED_EFFORTS:
-                raise BridgeError(f"reasoning effort {effort!r} is refused on the Codex backend: it turns on Codex's "
+                raise BridgeError(f"reasoning effort {log_safe(effort)} is refused on the Codex backend: it turns on Codex's "
                                   f"automatic task delegation (its own sub-agents), which this bridge must never run")
             params["effort"] = effort
         # While turn/start waits, a cell of an ended turn may still call a tool; it is refused there and then, so a
@@ -485,7 +494,7 @@ class CodexSession:
         if not isinstance(turn_id, str) or not turn_id:
             raise BridgeError("codex app-server answered turn/start without a turn id")
         if turn_id in self._turns:
-            raise BridgeError(f"codex app-server answered turn/start with the id of an earlier turn ({turn_id})")
+            raise BridgeError(f"codex app-server answered turn/start with the id of an earlier turn ({log_safe(turn_id)})")
         self._turn_id = turn_id
         self._turns.add(turn_id)
 
@@ -494,10 +503,10 @@ class CodexSession:
         late, ids = self._late, [e["call_id"] for e in self._late]
         if self._followups >= MAX_FOLLOWUPS:
             raise BridgeError(f"the Codex turn ended around outstanding tool calls {MAX_FOLLOWUPS} times for one user "
-                              f"message; refusing another follow-up turn (late results for {ids})")
+                              f"message; refusing another follow-up turn (late results for {log_ids(ids)})")
         self._followups += 1
         logger.warning("codex conversation %s: turn %s ended before the results for %s were consumed; follow-up turn "
-                       "%d/%d carries them", self.id[:8], self._turn_id, ids, self._followups, MAX_FOLLOWUPS)
+                       "%d/%d carries them", self.id[:8], log_safe(self._turn_id), log_ids(ids), self._followups, MAX_FOLLOWUPS)
         self._start_turn(_late_input(late), deadline)
         self._late = []
 
@@ -542,8 +551,8 @@ class CodexSession:
                 continue
             self._note_notification(msg)
             if msg.get("method") == "turn/completed" and (msg.get("params") or {}).get("turn", {}).get("id") == turn_id:
-                logger.info("codex conversation %s: abandoned turn %s ended %s", self.id[:8], turn_id,
-                            msg["params"]["turn"].get("status"))
+                logger.info("codex conversation %s: abandoned turn %s ended %s", self.id[:8], log_safe(turn_id),
+                            log_safe(msg["params"]["turn"].get("status")))
                 if turn_id:
                     self._ended.add(turn_id)
                 return
@@ -554,21 +563,21 @@ class CodexSession:
         deadline = time.time() + timeout if timeout is not None else None
         unknown = [i for i in results if i not in self.emitted]
         if unknown:
-            raise BridgeError(f"tool results for ids this session never issued: {unknown}")
+            raise BridgeError(f"tool results for ids this session never issued: {log_ids(unknown)}")
         if self._pending and self._orphaned:
-            raise BridgeError(f"calls of a live turn {sorted(self._pending)} and of an ended one {sorted(self._orphaned)} "
+            raise BridgeError(f"calls of a live turn {log_ids(self._pending)} and of an ended one {log_ids(self._orphaned)} "
                               f"are outstanding at once; this bridge cannot tell which turn the results belong to")
         waiting = list(self._pending) + list(self._orphaned)
         stale = [i for i in results if i not in waiting]
         if stale:
             raise BridgeError(f"tool results for calls no longer waiting (answered earlier, or abandoned when the "
-                              f"client moved on): {stale}")
+                              f"client moved on): {log_ids(stale)}")
         missing = [i for i in waiting if i not in results]
         if missing:
             # Codex continues only once every call of the model's message is answered; a partial answer would hang
             # the turn until the deadline. Refuse it instead.
             raise BridgeError(f"results for {len(results)} of {len(waiting)} pending tool calls; every call of "
-                              f"one assistant message must be answered in one request (missing {missing})")
+                              f"one assistant message must be answered in one request (missing {log_ids(missing)})")
         self.last_used = time.time()
         # A completion the reader already queued decides where these results go: a turn that ended is never written
         # to. Whatever the turn sent before that completion is still the live turn's (FIFO): _absorb_backlog keeps it.
@@ -618,7 +627,7 @@ class CodexSession:
             return
         logger.warning("codex conversation %s: turn %s completed before the client's results arrived; they go to a "
                        "follow-up turn, not to the turn's cell (%d earlier event(s) of the turn kept in order)",
-                       self.id[:8], self._turn_id, boundary)
+                       self.id[:8], log_safe(self._turn_id), boundary)
         self._backlog = collections.deque(events[boundary + 1:])
         for i, (kind, msg) in enumerate(events[:boundary + 1]):
             if deadline is not None and time.time() >= deadline:
@@ -634,14 +643,14 @@ class CodexSession:
         self._ended.add(turn_id)
         unread = sorted(self._delivered)
         if unread:
-            raise BridgeError(f"the Codex turn {turn_id} completed without consuming the delivered tool results for "
-                              f"{unread}; whether the model saw them is unknown, so they are neither dropped nor replayed")
+            raise BridgeError(f"the Codex turn {log_safe(turn_id)} completed without consuming the delivered tool results for "
+                              f"{log_ids(unread)}; whether the model saw them is unknown, so they are neither dropped nor replayed")
         for call_id in [c for c in self._pending if self._call_turn.get(c) == turn_id]:
             self._reply(self._pending.pop(call_id), {"success": False, "contentItems": [
                 {"type": "inputText", "text": ENDED_AROUND}]}, timeout=self._left(deadline, "while closing the ended turn's calls"))
             self._orphaned[call_id] = self._call_tools.get(call_id, "?")
         if self._pending:
-            raise BridgeError(f"calls {sorted(self._pending)} are pending but belong to no live turn")
+            raise BridgeError(f"calls {log_ids(self._pending)} are pending but belong to no live turn")
 
     def _next_event(self, timeout: float) -> tuple[str, Any]:
         """The next event: the backlog first, then the reader's queue. Raises queue.Empty after `timeout`."""
@@ -653,7 +662,8 @@ class CodexSession:
         """Answer an item/tool/call of an ended turn with TURN_ENDED; it never reaches the client."""
         params = msg.get("params") or {}
         logger.warning("codex conversation %s: item/tool/call %s (tool %s) from ended turn %s refused, not forwarded",
-                       self.id[:8], params.get("callId"), params.get("tool"), params.get("turnId"))
+                       self.id[:8], log_safe(params.get("callId")), shown_name(params.get("tool")),
+                       log_safe(params.get("turnId")))
         self._reply(msg["id"], {"success": False, "contentItems": [{"type": "inputText", "text": TURN_ENDED}]},
                     timeout=timeout)
 
@@ -661,8 +671,8 @@ class CodexSession:
         """The turn a call or item names; a turn this session never started is a BridgeError (never guessed)."""
         turn_id = params.get("turnId")
         if turn_id not in self._turns and turn_id not in self._ended:
-            raise BridgeError(f"codex app-server sent {what} for turn {turn_id!r}, which this session never started "
-                              f"(current {self._turn_id!r})")
+            raise BridgeError(f"codex app-server sent {what} for turn {log_safe(turn_id)}, which this session never "
+                              f"started (current {log_safe(self._turn_id)})")
         return turn_id
 
     # ------------------------------------------------------------------ one turn
@@ -677,13 +687,13 @@ class CodexSession:
                 # Sibling calls the ended turn issued before its completion: the client sees them now, and their
                 # results join the late ones in the follow-up turn.
                 logger.warning("codex conversation %s: turn %s ended with sibling calls %s the client has not seen; "
-                               "returning them as tool_use", self.id[:8], self._turn_id, sorted(self._orphaned))
+                               "returning them as tool_use", self.id[:8], log_safe(self._turn_id), log_ids(self._orphaned))
                 return self._finish(blocks, "tool_use")
             if self._pending or self._orphaned:
-                raise BridgeError(f"run_turn on the ended Codex turn {self._turn_id} with calls "
-                                  f"{sorted(list(self._pending) + list(self._orphaned))} still unanswered")
+                raise BridgeError(f"run_turn on the ended Codex turn {log_safe(self._turn_id)} with calls "
+                                  f"{log_ids(list(self._pending) + list(self._orphaned))} still unanswered")
             if not self._late:
-                raise BridgeError(f"run_turn on the ended Codex turn {self._turn_id} with no late results to continue from")
+                raise BridgeError(f"run_turn on the ended Codex turn {log_safe(self._turn_id)} with no late results to continue from")
             self._start_followup(deadline)
         while True:
             self._check_fatal()
@@ -707,7 +717,7 @@ class CodexSession:
                     # The model ended the turn around calls it had issued (code mode yielded): they still go to the
                     # client, and their results come back through deliver() for a follow-up turn.
                     logger.warning("codex conversation %s: turn %s completed with calls %s outstanding; returning them "
-                                   "as tool_use", self.id[:8], self._turn_id, sorted(self._orphaned))
+                                   "as tool_use", self.id[:8], log_safe(self._turn_id), log_ids(self._orphaned))
                     return self._finish(blocks, "tool_use")
                 return self._finish(blocks, "end_turn")
             if self._pending:
@@ -728,21 +738,22 @@ class CodexSession:
                     args = {}
                 if not isinstance(call_id, str) or not call_id or not isinstance(args, dict):
                     raise BridgeError(f"codex app-server sent a malformed item/tool/call: {json.dumps(params)[:300]}")
-                owner = self._owning_turn(params, f"item/tool/call {call_id}")
+                owner = self._owning_turn(params, f"item/tool/call {log_safe(call_id)}")
                 if owner in self._ended:
                     self._refuse_stale_call(msg, self._left(deadline, "while refusing a stale tool call"))
                     return None
                 if owner != self._turn_id:
-                    raise BridgeError(f"codex app-server sent item/tool/call {call_id} for turn {owner}, which is "
-                                      f"neither current ({self._turn_id}) nor ended")
+                    raise BridgeError(f"codex app-server sent item/tool/call {log_safe(call_id)} for turn {log_safe(owner)}, "
+                                      f"which is neither current ({log_safe(self._turn_id)}) nor ended")
                 if call_id in self.emitted:
-                    raise BridgeError(f"codex app-server reused tool call id {call_id}")
+                    raise BridgeError(f"codex app-server reused tool call id {log_safe(call_id)}")
                 name = params.get("tool") or ""
                 scratch = self.dir
                 if names_scratch(args, scratch):
                     # Never forwarded (bridge.SCRATCH_NOTE): answered here with the refusal, and the turn goes on.
                     logger.warning("codex conversation %s: item/tool/call %s (tool %s) names the backend's scratch "
-                                   "dir; answered with an error, not forwarded", self.id[:8], call_id, name)
+                                   "dir; answered with an error, not forwarded", self.id[:8], log_safe(call_id),
+                                   shown_name(self._aliases.get(name, name)))
                     self._reply(msg["id"], {"success": False, "contentItems": [
                         {"type": "inputText", "text": SCRATCH_REFUSED.format(name=scratch.name)}]},
                         timeout=self._left(deadline, "while refusing a scratch-dir tool call"))
@@ -766,29 +777,29 @@ class CodexSession:
                     owner = self._owning_turn(params, "an agentMessage")
                     if owner in self._ended:
                         logger.warning("codex conversation %s: agentMessage from ended turn %s dropped (%d chars), "
-                                       "not shown to the client", self.id[:8], owner, len(item["text"]))
+                                       "not shown to the client", self.id[:8], log_safe(owner), len(item["text"]))
                     elif owner != self._turn_id:
-                        raise BridgeError(f"codex app-server sent an agentMessage for turn {owner}, which is neither "
-                                          f"current ({self._turn_id}) nor ended")
+                        raise BridgeError(f"codex app-server sent an agentMessage for turn {log_safe(owner)}, which is "
+                                          f"neither current ({log_safe(self._turn_id)}) nor ended")
                     else:
                         blocks.append({"type": "text", "text": item["text"]})
             elif method == "turn/completed":
                 turn = params.get("turn") or {}
                 if turn.get("id") in self._ended:
                     logger.info("codex conversation %s: turn/completed again for ended turn %s; ignored", self.id[:8],
-                                turn.get("id"))
+                                log_safe(turn.get("id")))
                     return None
                 if turn.get("id") != self._turn_id:
-                    raise BridgeError(f"codex app-server completed turn {turn.get('id')!r}, which is not the current "
-                                      f"turn {self._turn_id!r}")
+                    raise BridgeError(f"codex app-server completed turn {log_safe(turn.get('id'))}, which is not the "
+                                      f"current turn {log_safe(self._turn_id)}")
                 if turn.get("status") == "completed":
                     self._end_turn(self._turn_id, deadline)
                     return "completed"
                 self._ended.add(self._turn_id)
                 err = turn.get("error") or {}
                 info = err.get("codexErrorInfo")
-                raise BridgeError(f"the Codex turn {turn.get('status')}: {err.get('message') or 'no message'} "
-                                  f"({info if isinstance(info, str) else json.dumps(info)})")
+                raise BridgeError(f"the Codex turn {log_text(turn.get('status'), 60)}: {log_text(err.get('message') or 'no message')} "
+                                  f"({shown_id(info) if isinstance(info, str) else json.dumps(info)[:300]})")
         return None
 
     def _note_notification(self, msg: dict[str, Any]) -> None:
@@ -801,20 +812,20 @@ class CodexSession:
             itype = item.get("type")
             if itype == "mcpToolCall" and item.get("server") == BENIGN_MCP_TOOLS[0] and item.get("tool") in BENIGN_MCP_TOOLS[1]:
                 if method == "item/started":
-                    logger.info("codex conversation %s: the model listed MCP resources (%s); none are served", self.id[:8], item.get("tool"))
+                    logger.info("codex conversation %s: the model listed MCP resources (%s); none are served", self.id[:8], shown_name(item.get("tool")))
             elif itype in LEAKED_ITEMS:
-                raise BridgeError(f"codex app-server ran a built-in tool ({itype} item) despite isolation; "
+                raise BridgeError(f"codex app-server ran a built-in tool ({log_safe(itype)} item) despite isolation; "
                                   f"the headless Codex must never run a tool itself: {json.dumps(params.get('item'))[:400]}")
         elif method == "model/rerouted":
             # Codex moved the turn to another model (one it could not serve under the routed slug); the route log
             # would then name a model that did not answer. The routed model is the one that must run.
-            raise BridgeError(f"codex rerouted the turn from {params.get('fromModel')!r} to {params.get('toModel')!r} "
-                              f"({params.get('reason')!r}): the routed model is the one that must run")
+            raise BridgeError(f"codex rerouted the turn from {log_safe(params.get('fromModel'))} to "
+                              f"{log_safe(params.get('toModel'))} ({log_safe(params.get('reason'))}): the routed model is the one that must run")
         elif method == "thread/tokenUsage/updated":
             self._usage_total = (params.get("tokenUsage") or {}).get("total") or self._usage_total
         elif method == "error":
             logger.warning("codex conversation %s: mid-turn error %s (willRetry=%s)", self.id[:8],
-                           json.dumps(params.get("error"))[:300], params.get("willRetry"))
+                           json.dumps(params.get("error"))[:300], log_safe(params.get("willRetry")))
 
     def _answer(self, msg: dict[str, Any], timeout: float = REPLY_WRITE_S) -> None:
         """Defensive answers to the server requests that are not tool calls (§A.10): the turn hangs otherwise."""
@@ -836,8 +847,8 @@ class CodexSession:
             self._reply(rid, {"action": "decline"}, timeout=timeout)
             logger.warning("codex conversation %s: MCP elicitation declined", self.id[:8])
         else:
-            self._reply(rid, error={"code": -32601, "message": f"cortados: unsupported server request {method}"}, timeout=timeout)
-            logger.warning("codex conversation %s: unsupported server request %s refused", self.id[:8], method)
+            self._reply(rid, error={"code": -32601, "message": f"cortados: unsupported server request {log_safe(method)}"}, timeout=timeout)
+            logger.warning("codex conversation %s: unsupported server request %s refused", self.id[:8], log_safe(method))
 
     def _finish(self, blocks: list[dict[str, Any]], stop: str) -> tuple[list[dict[str, Any]], str, dict[str, int]]:
         # One client request may span several model requests; tokenUsage.total is cumulative per thread, so the

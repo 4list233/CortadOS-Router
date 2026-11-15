@@ -395,5 +395,72 @@ class TestModelSuffix(unittest.TestCase):
         self.assertEqual(self.run_serve(True)[0], b"".join(self.CHUNKS))
 
 
+class TestErrorSanitizing(unittest.TestCase):
+    """#117 review round 5: what the proxy shows a client as an error has no raw control character and is capped,
+    whether the proxy built it or the API sent it; a successful answer is relayed byte for byte."""
+
+    def message_of(self, h):
+        body = json.loads(h.wfile.buf.getvalue())
+        msg = body["error"]["message"]
+        self.assertNotIn("\n", msg)
+        self.assertLessEqual(len(msg), 2100)
+        return body, msg
+
+    def test_a_generated_error_goes_through_the_builder(self):
+        h = FakeHandler()
+        err = urllib.error.URLError("nope\nFORGED" + "y" * 3000)        # the reviewer's case
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=mock.Mock(side_effect=err))
+        self.assertEqual((h.status, outcome), (502, "unknown"))
+        body, msg = self.message_of(h)
+        self.assertEqual(body["error"]["type"], "api_error")
+        self.assertIn("nope\\nFORGED", msg)
+        self.assertIn("chars)", msg)                                    # capped, and says by how much
+
+    def test_an_upstream_error_body_keeps_its_fields_with_its_message_escaped(self):
+        sent = {"type": "error", "error": {"type": "overloaded_error", "message": "busy\r\nFORGED: 1" + "z" * 3000,
+                                           "details": {"retry": 3}}, "request_id": "req_1"}
+        err = urllib.error.HTTPError("u", 529, "Busy", {"content-type": "application/json"},
+                                     io.BytesIO(json.dumps(sent).encode()))
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=mock.Mock(side_effect=err))
+        self.assertEqual((h.status, outcome), (529, "rejected"))
+        body, msg = self.message_of(h)
+        self.assertTrue(msg.startswith("busy\\r\\nFORGED: 1"))
+        self.assertEqual({k: v for k, v in body.items() if k != "error"}, {"type": "error", "request_id": "req_1"})
+        self.assertEqual((body["error"]["type"], body["error"]["details"]), ("overloaded_error", {"retry": 3}))
+
+    def test_a_non_json_upstream_error_becomes_a_cortados_error(self):
+        err = urllib.error.HTTPError("u", 502, "Bad", {"content-type": "text/html"},
+                                     io.BytesIO(b"<html>\nbad gateway\n</html>"))
+        h = FakeHandler()
+        ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk", urlopen=mock.Mock(side_effect=err))
+        self.assertEqual((h.status, h.headers["content-type"]), (502, "application/json"))
+        body, msg = self.message_of(h)
+        self.assertIn("HTTP 502", msg)
+        self.assertIn("\\nbad gateway", msg)
+
+    def test_successful_output_is_byte_identical(self):
+        text = "line one\nline two\r\n\x1b[31m" + "w" * 5000             # model output may hold anything
+        msg = {"id": "m1", "type": "message", "content": [{"type": "text", "text": text}],
+               "usage": {"input_tokens": 1, "output_tokens": 2}}
+        raw = json.dumps(msg).encode()
+        h = FakeHandler()
+        ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                 urlopen=lambda req, timeout=0: FakeResp(body=raw))
+        self.assertEqual(h.wfile.buf.getvalue(), raw)
+        chunks = [b'data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}\n\n',
+                  b'data: ' + json.dumps({"type": "content_block_delta", "delta": {"type": "text_delta",
+                                          "text": text}}).encode() + b'\n\n',
+                  b'event: error\ndata: {"type":"error","error":{"message":"a\\nb"}}\n\n',
+                  b'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
+                  b'event: message_stop\ndata: {"type":"message_stop"}\n\n']
+        h = FakeHandler()
+        ap.serve(h, {"model": "cortados", "stream": True}, "claude-opus-5-5", 0.0, key="sk",
+                 urlopen=lambda req, timeout=0: FakeResp(chunks=chunks))
+        self.assertEqual(h.wfile.buf.getvalue(), b"".join(chunks))
+
+
 if __name__ == "__main__":
     unittest.main()

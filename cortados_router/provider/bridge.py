@@ -23,6 +23,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from cortados_router.provider.anthropic_wire import log_ids, log_safe, log_text, shown_name
 from cortados_router.provider.child_env import backend_env
 from cortados_router.provider.timeouts import (
     ABORT_TIMEOUT_S, CALL_SLACK_S, CALL_TIMEOUT_S, CLI_TOOL_TIMEOUT_S, IDLE_S, TOOL_WAIT_S, TURN_TIMEOUT_S,
@@ -218,7 +219,7 @@ class BridgeSession:
                 try:
                     self._events.put(("cli", json.loads(line)))
                 except ValueError:
-                    logger.warning("cortados bridge %s: non-JSON stdout line: %.200s", self.id[:8], line)
+                    logger.warning("cortados bridge %s: non-JSON stdout line: %s", self.id[:8], log_safe(line, 200))
         except ValueError:
             pass                                        # close() shut stdout under us: the session is ending anyway
         self._events.put(("exit", self.proc.wait()))
@@ -263,7 +264,7 @@ class BridgeSession:
                             self._waiting.discard(tool_use_id)
                             # This transition shares _cv with deliver(): exactly one of expiry or delivery wins.
                             self._tool_result_expired = True
-                            raise ToolWaitExpired(f"no result for {tool_use_id} before the tool-result deadline")
+                            raise ToolWaitExpired(f"no result for {log_safe(tool_use_id)} before the tool-result deadline")
                 if self._closed and tool_use_id not in self._results:
                     raise BridgeError("the session was closed")
             self._waiting.discard(tool_use_id)
@@ -280,7 +281,7 @@ class BridgeSession:
         budget, part of the session contract the Codex bridge needs for its pipe writes) has nothing to bound here."""
         unknown = [i for i in results if i not in self.emitted]
         if unknown:
-            raise BridgeError(f"tool results for ids this session never issued: {unknown}")
+            raise BridgeError(f"tool results for ids this session never issued: {log_ids(unknown)}")
         self.last_used = time.time()
         with self._cv:
             if getattr(self, "_tool_result_expired", False) or self._closed:
@@ -323,7 +324,7 @@ class BridgeSession:
                     blocked_on = item
                     settle_until = time.time() + SETTLE_S
                 elif item in self.emitted:
-                    raise BridgeError(f"the client answered an earlier turn without a result for {item}")
+                    raise BridgeError(f"the client answered an earlier turn without a result for {log_safe(item)}")
                 else:
                     # The call came before its tool_use reached stdout; it is put back once the block arrives.
                     blocked_on = item
@@ -350,8 +351,8 @@ class BridgeSession:
                             # killing the conversation: forwarding it would let the client answer a call the CLI has
                             # already answered. This tolerance relies on both flags: revisit it if either changes; the
                             # tool_result check on "user" events below enforces it at runtime.
-                            logger.warning("cortados bridge %s: skipped a tool_use of non-bridged tool %r",
-                                           self.id[:8], name)
+                            logger.warning("cortados bridge %s: skipped a tool_use of non-bridged tool %s",
+                                           self.id[:8], shown_name(name))
                             if b.get("id"):
                                 self._skipped.add(b["id"])
                             continue
@@ -359,7 +360,8 @@ class BridgeSession:
                             # Never forwarded (SCRATCH_NOTE): the shim's call gets the refusal as its result, at once
                             # or when it arrives, and the CLI goes on with the turn.
                             logger.warning("cortados bridge %s: tool_use %s of %s names the backend's scratch dir; "
-                                           "answered with an error, not forwarded", self.id[:8], b.get("id"), name)
+                                           "answered with an error, not forwarded", self.id[:8], log_safe(b.get("id")),
+                                           shown_name(name))
                             with self._cv:
                                 self._results[b["id"]] = {"content": [{"type": "text", "text": SCRATCH_REFUSED.format(
                                     name=self.dir.name)}], "isError": True}
@@ -383,7 +385,7 @@ class BridgeSession:
                         continue
                     self._skipped.discard(b["tool_use_id"])
                     if not (b.get("is_error") or "No such tool available" in _result_text(b.get("content"))):
-                        raise BridgeError(f"the headless CLI ran a non-bridged tool itself (tool_use {b['tool_use_id']}); "
+                        raise BridgeError(f"the headless CLI ran a non-bridged tool itself (tool_use {log_safe(b['tool_use_id'])}); "
                                           "it must have no tools but the bridge's")
             elif ev.get("type") == "result":
                 if refused:
@@ -391,7 +393,8 @@ class BridgeSession:
                     # error: the conversation stays usable and the server decides what the client sees.
                     return blocks, "refusal", usage or ev.get("usage") or {}
                 if ev.get("is_error"):
-                    raise BridgeError(f"the headless CLI reported an error: {ev.get('result') or ev.get('subtype')}")
+                    raise BridgeError("the headless CLI reported an error: "
+                                      f"{log_text(ev.get('result') or ev.get('subtype'))}")
                 return blocks, "end_turn", usage or ev.get("usage") or {}
 
     # ------------------------------------------------------------------ lifecycle

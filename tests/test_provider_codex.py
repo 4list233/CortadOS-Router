@@ -734,12 +734,17 @@ class CodexEndpointTests(unittest.TestCase):
                     {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"], "content": "hello"}]}]
         with self.assertLogs("cortados.provider", level="WARNING") as logs:
             r2 = self.post({"system": "A", "tools": [READ_TOOL, edit_tool], "messages": history})
-        self.assertEqual(r2["content"], [{"type": "text", "text": "tool said: hello"}])
+        # #117: the model is told once, with the tool result, that the added tool cannot be called here
+        [text] = [b["text"] for b in r2["content"]]
+        self.assertTrue(text.startswith("tool said: hello"), text)
+        self.assertTrue(text.endswith(provider_server.TOOLS_ADDED_NOTE), text)
         lines = [l for l in logs.output if "tool set changed mid-conversation" in l]
         self.assertEqual(len(lines), 1)
         self.assertIn("added ['Edit'], dropped []", lines[0])
+        self.assertIn("CANNOT be called", lines[0])
         [session] = self.reg.sessions.values()
         self.assertTrue(session.tools_warned)
+        self.assertIsNone(session.tools_note)                       # said once
         start = [m for m in self.inbound() if m.get("method") == "thread/start"]
         self.assertEqual([[t["name"] for t in m["params"]["dynamicTools"]] for m in start], [["Read"]])   # one thread
 

@@ -55,6 +55,7 @@ if __package__ in (None, ""):                           # run as a file: make th
 
 from cortados_router import http_body
 from cortados_router.compat import getenv
+from cortados_router.safe_text import install_log_sanitizer
 from cortados_router.compaction import prune as compaction_prune, store as compaction_store
 from cortados_router.provider import (anthropic_wire, clients, dashboard_auth, effect_boundary, live, local_lane,
                                       local_switch, office, responses_wire, routing, search_lane, work_split)
@@ -1031,6 +1032,7 @@ class Registry:
         s.client = client                           # the opener's User-Agent name: find's scope without an identity
         s.rebuild_budget = RebuildBudget()          # its lineage's rebuilds (REBUILD_MAX), shared on rebuild
         s.tool_names, s.tools_warned = {t["name"] for t in turn.tools}, False   # what the backend was started with
+        s.tools_note = None                         # TOOLS_ADDED_NOTE, sent with the next turn once
         s.awaiting_tool_result = False
         s.opened_at = time.time()                   # the live view's elapsed (live_conversations)
         return s
@@ -1749,6 +1751,104 @@ def _failed_reason(exc: object) -> str:
     return "the conversation already failed (terminal)" + (f": {diag}" if diag else "")
 
 
+# What the backend model is told, once, when the client added tools after the backend started (#117, #121): it must not
+# call them, and should say so if the task needs them. Only the provider can say it: the client lists the tools, and
+# the backend's own error ("No such tool available") does not say why. A FIXED text (#117 review round 2): a client's
+# tool name is not text the provider may put in its own voice (anthropic_wire.shown_name), and the model needs no list:
+# whatever it was shown but cannot call fails at once. The provider log names the tools (as shown_name renders them).
+TOOLS_ADDED_NOTE = ("[cortados provider] Tools were added to this conversation after it started. They cannot be called "
+                    "in it: only the tools available when the conversation started can be called. Do not call the "
+                    "added tools; if the task needs one, say so in your answer (it works in a new conversation that "
+                    "has it from its first request).")
+
+
+# The tool-schema budget (#117 review round 2). With tool search off (child tasks, --strict-mcp-config sessions) every
+# MCP tool schema is in every request, and a host's own MCP servers load too, outside any launch-time selection. A tool
+# COUNT bounds nothing (66 tools with 8,000-character descriptions came to ~133k tokens), and the launcher cannot list
+# a connector's tools (OAuth in the exec host's Keychain). So the provider enforces the real serialized size of each
+# request's `tools`, the one place every client's catalog arrives in full, before anything is routed or started.
+#   - BYTES_PER_TOKEN: the measured 290k tokens / ~1.1 MB of the full connector catalog (README "Connectors") is
+#     request_fit's own chars / 4 estimate (~3.8 bytes a token), not a tokenizer count, so it cannot set the factor.
+#     JSON schemas (quotes, braces, short identifiers, camelCase) tokenize denser than prose; 3 bytes a token is
+#     taken as the conservative factor (api_credits' cost bound uses 2 for a ceiling on a bill, not a budget).
+#   - CLIENT_BUILTIN_TOOLS_BYTES: Claude Code's own tools are in `tools` too and are not the catalog: 2.1.325 with tool
+#     search off and no MCP server sent 23 built-in tools = 70,034 bytes (local sink, 2026-11-14); 80 KB leaves room for
+#     a release's growth.
+#   - TOOL_CATALOG_BUDGET_TOKENS: 40k tokens of MCP schemas leaves a child on the 128k local lane room for its system
+#     prompt, the built-ins and the work itself.
+# Applied to EVERY request, not only eager ones: the provider cannot tell tool search on from off except by a client
+# detail (a ToolSearch tool), a deferred request (~70 KB of built-ins + ToolSearch) is far below the budget, and one
+# rule bounds every client alike (Codex declares its tools up front, always). A deferred session would trip it only
+# after loading >120 KB of MCP schemas, which then cost the same context on every turn anyway.
+# Refused with a 400, not a 413: retrying unchanged cannot succeed, and Claude Code shows a 413 as "Request too large
+# (max 32MB) ... images" (README "Connectors"). routing.request_fit still gates the whole request against each route.
+BYTES_PER_TOKEN = 3
+CLIENT_BUILTIN_TOOLS_BYTES = 80_000
+TOOL_CATALOG_BUDGET_TOKENS = 40_000
+TOOL_SCHEMA_BUDGET_BYTES = CLIENT_BUILTIN_TOOLS_BYTES + TOOL_CATALOG_BUDGET_TOKENS * BYTES_PER_TOKEN    # 200,000
+TOOL_BUDGET_NAMESPACES_SHOWN = 6
+TOOL_BUDGET_REASON = "the request's tool schemas are over the tool-schema budget"
+UNPREFIXED_TOOLS = "(tools without a server prefix)"
+
+
+def tool_namespace(name: Any) -> str:
+    """The namespace a tool's size is reported under: `mcp__<server>` for an MCP tool (Claude Code and Codex both name
+    them mcp__<server>__<tool>), UNPREFIXED_TOOLS for any other valid name (built-ins, Codex functions), and
+    anthropic_wire.INVALID_NAME for a name shown_name would not show."""
+    shown = anthropic_wire.shown_name(name)
+    if shown == anthropic_wire.INVALID_NAME:
+        return shown
+    if shown.startswith("mcp__"):
+        server = shown[len("mcp__"):].split("__", 1)[0]
+        return f"mcp__{server}" if server else UNPREFIXED_TOOLS
+    return UNPREFIXED_TOOLS
+
+
+def tool_schema_overrun(body: Any) -> str | None:
+    """None when the request's `tools` serialize within TOOL_SCHEMA_BUDGET_BYTES (or are absent or malformed:
+    parse_request reports that), else the client's error message: the size, the budget, the largest namespaces (only
+    as tool_namespace renders them: never a raw client string) and how to shrink the set. Measured as request_fit
+    measures the body (json.dumps, UTF-8 bytes)."""
+    tools = body.get("tools") if isinstance(body, dict) else None
+    if not isinstance(tools, list) or not tools:
+        return None
+    try:
+        total = len(json.dumps(tools).encode())
+        if total <= TOOL_SCHEMA_BUDGET_BYTES:
+            return None
+        sizes: dict[str, list[int]] = {}
+        for t in tools:
+            entry = sizes.setdefault(tool_namespace(t.get("name") if isinstance(t, dict) else None), [0, 0])
+            entry[0] += 1
+            entry[1] += len(json.dumps(t).encode())
+    except RecursionError:                  # nested past json's limit: parse_request answers it as a shape error
+        return None
+    ranked = sorted(sizes.items(), key=lambda kv: (-kv[1][1], kv[0]))
+    shown = "; ".join(f"{ns} ({n} tool{'s' if n != 1 else ''}, {b // 1000} KB)"
+                      for ns, (n, b) in ranked[:TOOL_BUDGET_NAMESPACES_SHOWN])
+    more = len(ranked) - TOOL_BUDGET_NAMESPACES_SHOWN
+    return (f"cortados: the request's tool definitions are {total // 1000} KB (≈{total // BYTES_PER_TOKEN // 1000}k "
+            f"tokens), over this endpoint's tool-schema budget of {TOOL_SCHEMA_BUDGET_BYTES // 1000} KB "
+            f"(≈{TOOL_SCHEMA_BUDGET_BYTES // BYTES_PER_TOKEN // 1000}k tokens: the client's built-in tools plus "
+            f"≈{TOOL_CATALOG_BUDGET_TOKENS // 1000}k tokens of MCP tools). Every tool schema is sent with every request "
+            f"(tool search is off), so the conversation would have no room. Largest tool namespaces: {shown}"
+            + (f"; and {more} more" if more > 0 else "") +
+            ". Shrink the tool set: fewer connectors (start_task `connectors`), or start Claude Code with "
+            "--strict-mcp-config and an --mcp-config naming only the servers this work needs (the host's own MCP "
+            "servers count too). Retrying unchanged cannot succeed.")
+
+
+def with_tools_note(results: dict, note: str | None) -> dict:
+    """The client's tool results with the note appended as a text item to the first one (a copy; the turn and its
+    fingerprint are unchanged)."""
+    if not note or not results:
+        return results
+    out = dict(results)
+    first = next(iter(out))
+    out[first] = {**out[first], "content": list(out[first].get("content") or []) + [{"type": "text", "text": note}]}
+    return out
+
+
 class Handler(BaseHTTPRequestHandler):
     server: "ProviderServer"
     _scoped: "clients.Client | None" = None             # the scoped client of the current request (_scope_gate)
@@ -1756,7 +1856,9 @@ class Handler(BaseHTTPRequestHandler):
     timeout = SOCKET_TIMEOUT_S
 
     def log_message(self, fmt, *args):                  # route http.server's stderr lines into logging
-        logger.debug("%s " + fmt, self.address_string(), *args)
+        # fmt is http.server's own constant; its args (the request line, a path) are client text: each rendered by
+        # log_text, and the record escaped again by the installed SafeFormatter (serve()).
+        logger.debug("%s " + fmt, self.address_string(), *(anthropic_wire.log_text(a, 300) if isinstance(a, str) else a for a in args))
 
     # ------------------------------------------------------------------ plumbing
     def _credential(self) -> str:
@@ -1869,9 +1971,10 @@ class Handler(BaseHTTPRequestHandler):
         if ctype != "application/x-www-form-urlencoded":
             return self._html_page(415, _login_page("the login form must be posted as a form"), LOGIN_CSP, LOGIN_HEADERS)
         if not dashboard_auth.same_origin(self.headers, self._peer()):
-            logger.warning("dashboard login refused: not same-origin (origin %r, host %r, forwarded proto %r)",
-                           (self.headers.get("origin") or "")[:100], (self.headers.get("host") or "")[:100],
-                           (self.headers.get("x-forwarded-proto") or "")[:20])
+            logger.warning("dashboard login refused: not same-origin (origin %s, host %s, forwarded proto %s)",
+                           anthropic_wire.log_safe(self.headers.get("origin") or "", 100),
+                           anthropic_wire.log_safe(self.headers.get("host") or "", 100),
+                           anthropic_wire.log_safe(self.headers.get("x-forwarded-proto") or "", 20))
             return self._html_page(403, _login_page("cross-site login refused"), LOGIN_CSP, LOGIN_HEADERS)
         addr = dashboard_auth.client_address(self._peer(), self.headers.get("x-forwarded-for") or "")
         auth = self.server.registry.dashboard
@@ -2398,7 +2501,7 @@ class Handler(BaseHTTPRequestHandler):
         if bad:                                   # a server tool whose cost we cannot bound/reconcile -> never dispatch
             return self._error(400, "invalid_request_error",
                                f"cortados: the anthropic-api credit lane cannot bound the cost of server tool(s) "
-                               f"{', '.join(sorted(set(bad)))} (billed by server-side time); not permitted on this lane", wire)
+                               f"{', '.join(sorted({anthropic_wire.shown_name(b) for b in bad}))} (billed by server-side time); not permitted on this lane", wire)
         body = api_credits.enforce_server_tool_caps(body)   # cap metered tools to what we reserve, so admission is a real bound
         # A revealing client (the routed-subagents mod) also sees the credit window's % left after the real model the
         # upstream response names; read BEFORE this turn reserves. Without the header nothing about the relay changes.
@@ -2423,7 +2526,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(503, "overloaded_error",
                                "cortados: the anthropic-api lane's reserved org is no longer configured", wire)
         logger.info("anthropic-api lane: reserved $%.2f for %s (committed $%.2f of $%.0f)",
-                    max_cost, model, api_credits.committed(now), api_credits.total_budget_usd())
+                    max_cost, routing.shown_pin(model), api_credits.committed(now), api_credits.total_budget_usd())
         # Recorded once admitted (it is about to run). The label is the reveal the response carries when one was asked
         # for; otherwise the model (the meter is not read just for the record).
         self._record_run(provider="anthropic-api", model=model, label=model + reveal if reveal else model,
@@ -2571,11 +2674,23 @@ class Handler(BaseHTTPRequestHandler):
             outcome = "incomplete"
             if reroute is None:              # an opening turn a rule moved here may be routed elsewhere (REROUTE)
                 reroute = created and not route.get("pinned")
+            # #117 review round 5: the reply's fingerprint is recorded BEFORE the client can see the answer complete
+            # (local_lane.serve calls this just before the final body / message_stop event is written). Recorded after
+            # delivery, a client continuing at once was looked up (Registry.find, before this lock) against the old
+            # history and refused terminally (no_writer). Undone below if the delivery then failed.
+            undo: list = []
+
+            def commit(blocks: list) -> None:
+                undo.append((len(session.history), session.awaiting_tool_result))
+                session.awaiting_tool_result = any(b.get("type") == "tool_use" for b in blocks)
+                session.history.append(anthropic_wire.reply_fingerprint(blocks))
+
             try:
                 outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model,
                                            reply=reply, auto_routed=not route.get("pinned"),
                                            bind_reason=route.get("bind_reason"), hook=self._boundary_hook(),
-                                           conversation=str(session.id), reroute=reroute)
+                                           conversation=str(session.id), reroute=reroute,
+                                           commit=commit)
             except Exception as exc:             # serve handles its own I/O; anything else must still clean up
                 logger.exception("local lane: relay failed")
                 outcome = "incomplete"
@@ -2584,13 +2699,19 @@ class Handler(BaseHTTPRequestHandler):
                                 reason="the local relay failed")
                 except Exception:
                     pass                         # headers may already be out; the client sees a broken response
+            if outcome == "completed" and not undo:
+                commit(reply)                    # a serve that completed without calling it (defensive)
+            elif outcome != "completed" and undo:
+                # The client never received the whole answer (its connection broke on the final write): the
+                # conversation stays where it was, as for any failed turn. Still under the lock, so no turn ran since.
+                n, awaiting = undo[0]
+                del session.history[n:]
+                session.awaiting_tool_result = awaiting
             turn_ms = int((time.time() - t0) * 1000)
             session.last_used = time.time()
             self._office_turn_end(session, office_key, {"turn": (reply, "local", None)} if outcome == "completed"
                                            else {"error": outcome})
             if outcome == "completed":
-                session.awaiting_tool_result = any(b.get("type") == "tool_use" for b in reply)
-                session.history.append(anthropic_wire.reply_fingerprint(reply))
                 if route.get("route_id") and not session.route_logged and reg.executed:
                     try:
                         reg.executed(route)
@@ -2784,7 +2905,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = search_lane.run(getattr(reg, "search_bin", None) or reg.claude_bin,
                                          query, who.config_dir, allowed=allowed, blocked=blocked, slot_held=True)
         except search_lane.SearchFailed as exc:
-            logger.warning("web search lane failed (%s): %s", exc.kind, exc.detail[:200])
+            logger.warning("web search lane failed (%s): %s", exc.kind, anthropic_wire.log_text(exc.detail, 200))
             if exc.kind == "start_failed" and reserved:
                 # The CLI never started, so nothing was spent: refund the reservation, once (#79). Every other failure
                 # ran the CLI (it may have spent quota) and keeps its reservation. Only an OSError from launching the
@@ -2831,10 +2952,11 @@ class Handler(BaseHTTPRequestHandler):
         """A complete, ordinary assistant reply whose text tells the model the server tools did not run. A reply,
         not a 4xx: the client hands the text to the model as the tool's output, so the model reads why and stops
         retrying, where an HTTP error may be retried or surface only as a generic API error."""
-        text = anthropic_wire.SERVER_TOOL_UNAVAILABLE.format(names=", ".join(sorted(set(names))))
+        shown = sorted({anthropic_wire.shown_name(n) for n in names})     # never a raw client name (#117)
+        text = anthropic_wire.SERVER_TOOL_UNAVAILABLE.format(names=", ".join(shown))
         if reason:
             text += f" (reason: {reason})"
-        logger.warning("request with server tool(s) %s answered as unavailable%s", sorted(set(names)),
+        logger.warning("request with server tool(s) %s answered as unavailable%s", shown,
                        f" ({reason})" if reason else "")
         return self._reply_text(turn, text, {}, wire)
 
@@ -2864,6 +2986,10 @@ class Handler(BaseHTTPRequestHandler):
         if dump:
             Path(dump).mkdir(parents=True, exist_ok=True)
             (Path(dump) / f"{time.time():.3f}.json").write_text(json.dumps(body, indent=1))
+        # The tool-schema budget (TOOL_SCHEMA_BUDGET_BYTES), first: before any lane, pin, lookup or backend, on both wires.
+        over = tool_schema_overrun(body)
+        if over:
+            return self._error(400, "invalid_request_error", over, wire, reason=TOOL_BUDGET_REASON)
         try:
             # The api/ lane relays the body verbatim to the Anthropic Messages API, so only a Messages-wire body can be
             # pinned to it; on /v1/responses an api/ (or sub/) name falls through to parse_request, which refuses any
@@ -2872,7 +2998,8 @@ class Handler(BaseHTTPRequestHandler):
             if api_model:
                 # api/ requests are stateless, so each is a new conversation: honour x-cortados-exclude-model here
                 # (the router, which applies it otherwise, is never called for this lane).
-                refused = self._exclusion_refusal(api_model, f"api/{api_model}", "pin another model or use cortados")
+                refused = self._exclusion_refusal(api_model, f"api/{routing.shown_pin(api_model)}",
+                                                "pin another model or use cortados")
                 if refused:
                     return self._error(400, "invalid_request_error", refused, wire)
                 # Pinned to the anthropic-api credit lane: proxy it directly, bypassing S1 and the session machinery.
@@ -2894,7 +3021,7 @@ class Handler(BaseHTTPRequestHandler):
             if server_tools:
                 # Mixed with client tools: parse_request dropped the server tools, the client tools are served.
                 logger.warning("request declares server tool(s) %s that this endpoint cannot run; served without them",
-                               sorted(set(server_tools)))
+                               sorted({anthropic_wire.shown_name(n) for n in server_tools}))
             # A tool-less request (a client's title or summary call) never joins a live session: it would hold that
             # session's lock while the session waits for a tool result. It gets its own throwaway CLI instead.
             one_shot = not turn.tools
@@ -2922,9 +3049,21 @@ class Handler(BaseHTTPRequestHandler):
                 # opening request's tools (Codex declares them once, on thread/start), so a tool added or dropped
                 # mid-conversation is never re-declared. Said once per conversation, names only; routing is unchanged.
                 session.tools_warned = True
+                added, dropped = sorted(names - session.tool_names), sorted(session.tool_names - names)
+                # The usual cause of an ADDED tool is a Claude Code client with tool search on (#117): it declares an
+                # MCP tool only once ToolSearch has loaded it. The backend cannot call it ("No such tool available"),
+                # so this says so plainly, and the model is told once (TOOLS_ADDED_NOTE) so it can tell the user
+                # instead of retrying. Growing the backend's tool set is #121; launch bounded clients with tool search
+                # off (session.TOOL_SEARCH_OFF).
                 logger.warning("conversation %s: the tool set changed mid-conversation (added %s, dropped %s); the "
-                               "running backend keeps the tools it started with", session.id[:8],
-                               sorted(names - session.tool_names), sorted(session.tool_names - names))
+                               "running backend keeps the tools it started with, so an added tool CANNOT be called in "
+                               "this conversation (calls fail as \"No such tool available\"; the model is told). "
+                               "Usual cause: a Claude Code client with tool search on; start it with "
+                               "ENABLE_TOOL_SEARCH=false or a new conversation (#117, #121)", session.id[:8],
+                               [anthropic_wire.shown_name(n) for n in added],
+                               [anthropic_wire.shown_name(n) for n in dropped])
+                if added:
+                    session.tools_note = TOOLS_ADDED_NOTE
             if one_shot:
                 # The transcript re-reads the whole history, so a shape error in an older user item surfaces here,
                 # not in parse_request: it is a request-shape error all the same and answers 400.
@@ -3077,9 +3216,13 @@ class Handler(BaseHTTPRequestHandler):
                     session.send_user(anthropic_wire.rebuild_content(seed, turn), timeout=deadline - time.time())
                     session.rebuild_seed = None
                 elif turn.tool_results:
-                    session.deliver(turn.tool_results, timeout=deadline - time.time())
+                    session.deliver(with_tools_note(turn.tool_results, getattr(session, "tools_note", None)),
+                                    timeout=deadline - time.time())
                 else:
-                    session.send_user(turn.content, timeout=deadline - time.time())
+                    note = getattr(session, "tools_note", None)
+                    session.send_user(turn.content + ([{"type": "text", "text": note}] if note else []),
+                                      timeout=deadline - time.time())
+                session.tools_note = None               # said once; a rebuilt backend starts with the current tools
                 _turn_t0 = time.time()
                 result = session.run_turn(deadline - time.time())
                 cur = session                           # the session this turn's answer belongs to
@@ -3509,7 +3652,7 @@ class Handler(BaseHTTPRequestHandler):
             shown = r.get("model")
         now = f"pinned to sub/{shown}" if r.get("pinned") else f"routed by S1 to {r.get('model') or 'its model'}"
         return (f"cortados: the model is fixed per conversation: this one is {now}, and this request asks for "
-                f"sub/{pinned}; start a new conversation to change models")
+                f"sub/{routing.shown_pin(pinned)}; start a new conversation to change models")
 
     @staticmethod
     def _resolved_pin(pinned: str) -> str:
@@ -3660,6 +3803,9 @@ class ProviderServer(ThreadingHTTPServer):
 
 def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, codex_home: str | None,
           fixed_model: str | None) -> None:
+    # #117 round 5: every handler formats through safe_text.SafeFormatter, so no log record (http.server's request
+    # lines via log_message included) can carry a raw newline or control character, whatever a call site passes.
+    install_log_sanitizer()
     router = executed = log_turn_outcome = None
     if not fixed_model:
         from cortados_router import core                  # loads the tables and the live scarcity reader

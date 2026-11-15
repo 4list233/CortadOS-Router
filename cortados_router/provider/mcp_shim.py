@@ -75,6 +75,38 @@ HEAP_SLACK = 64
 _WRITE_LOCK = threading.Lock()
 
 
+# ---- Error text sink (#117 round 5): a COPY of cortados_router.safe_text.escape_controls, since this file runs standalone
+# (no package import); tests/test_safe_text.py pins the copy to the original. Every error text this server returns passes
+# _safe_error, so the decoded text a model reads has no raw newline or other control character from client input.
+SAFE_ERROR_CAP = 2000
+
+
+def _escape_char(c):
+    if c in "\n\r\t":
+        return {"\n": "\\n", "\r": "\\r", "\t": "\\t"}[c]
+    o = ord(c)
+    return f"\\x{o:02x}" if o < 0x100 else f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}"
+
+
+def escape_controls(value, cap):
+    if not isinstance(value, str):
+        try:
+            value = str(value)
+        except Exception:
+            value = f"<{type(value).__name__}>"
+    head = value[:cap]
+    out = head if head.isprintable() else "".join(c if c == " " or c.isprintable() else _escape_char(c) for c in head)
+    if len(out) > cap:
+        out = out[:cap]
+        if out.endswith("\\"):
+            out = out[:-1]
+    return out + (f"...(+{len(value) - len(head)} chars)" if len(value) > cap else "")
+
+
+def _safe_error(text):
+    return escape_controls(text, SAFE_ERROR_CAP)
+
+
 def _abort(gateway, session, token):
     """Ask the server to close the backend, returning only once closure is confirmed."""
     body = json.dumps({"session": session, "abort": True}).encode()
@@ -112,6 +144,8 @@ def _emit(line):
 
 def _reply(mid, result=None, error=None):
     msg = {"jsonrpc": "2.0", "id": mid}
+    if error:
+        error = {**error, "message": _safe_error(error.get("message"))}     # the sink of every JSON-RPC error text
     msg.update({"error": error} if error else {"result": result})
     with _WRITE_LOCK:
         _emit(json.dumps(msg) + "\n")
@@ -132,7 +166,7 @@ def _forward(gateway, session, token, params):
     except (urllib.error.URLError, OSError, KeyError, ValueError) as exc:
         if not _abort(gateway, session, token):
             _terminate_owner()
-        return {"content": [{"type": "text", "text": f"cortados bridge: tool call failed: {exc}"}], "isError": True}
+        return {"content": [{"type": "text", "text": _safe_error(f"cortados bridge: tool call failed: {exc}")}], "isError": True}
 
 
 class _Dispatcher:

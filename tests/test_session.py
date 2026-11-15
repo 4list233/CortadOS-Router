@@ -155,12 +155,39 @@ class SessionTests(unittest.TestCase):
         self.assertIn("x-cortados-reveal: 1", env["ANTHROPIC_CUSTOM_HEADERS"])
         self.assertEqual(env["CORTADOS_WHOLE_SESSION"], "1")
         self.assertEqual(env["CLAUDE_CODE_ENTRYPOINT"], "cli")
+        # #117 review: an UNFILTERED whole session keeps deferred tool loading (the full MCP catalog would not fit
+        # the routes), in its env and in its flag-precedence settings
+        self.assertNotIn("ENABLE_TOOL_SEARCH", env)
+        with open(cmd[cmd.index("--settings") + 1]) as src:
+            self.assertNotIn("ENABLE_TOOL_SEARCH", json.load(src)["env"])
         for k in session.BLANKED:
             self.assertEqual(env[k], "")
         self.assertEqual(cmd[:3], ["claude", "--model", "sub/claude-fable-5-1"])
         self.assertIn("--settings", cmd)
         self.assertIn("--append-system-prompt", cmd)
         self.assertIn("MCP", cmd[cmd.index("--append-system-prompt") + 1])
+
+    def test_tool_search_off_only_for_a_bounded_mcp_catalog(self):
+        # #117: tool search off puts every MCP tool in the opening request (the provider's backend never gains a
+        # tool later), which only fits when the catalog is bounded: an explicitly filtered whole session
+        # (--strict-mcp-config) or a child task (--eager-tools; the provider's tool-schema budget bounds both).
+        def settings_env(cmd):
+            with open(cmd[cmd.index("--settings") + 1]) as src:
+                return json.load(src)["env"]
+        for flags, extra, eager in (([], ["--mcp-config", "a.json"], False),       # extra servers, not a filter
+                                    ([], ["--strict-mcp-config", "--mcp-config", "a.json"], True),
+                                    ([], ["--strict-mcp-config"], True),            # no MCP server at all
+                                    (["--eager-tools"], [], True)):
+            with self.subTest(flags=flags, extra=extra):
+                _, env, cmd = self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok] + flags
+                                           + ["--"] + extra)
+                if eager:
+                    self.assertEqual(env["ENABLE_TOOL_SEARCH"], "false")
+                    self.assertEqual(settings_env(cmd)["ENABLE_TOOL_SEARCH"], "false")
+                else:
+                    self.assertNotIn("ENABLE_TOOL_SEARCH", env)
+                    self.assertNotIn("ENABLE_TOOL_SEARCH", settings_env(cmd))
+                self.assertEqual(cmd[len(cmd) - len(extra):], extra)                 # passed through unchanged
 
     def test_url_from_shared_https_file(self):
         endpoint = os.path.join(self.tmp.name, "provider-url")

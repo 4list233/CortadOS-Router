@@ -53,11 +53,12 @@ import re
 import threading
 import time
 import urllib.parse
-from typing import Any
+from typing import Any, Callable
 
 from cortados_router import local_governor
 from cortados_router.compat import getenv
 from cortados_router.provider import effect_boundary
+from cortados_router.safe_text import safe_error_body, safe_error_text
 
 CONFIG_ENV = "CORTADOS_LOCAL_RESOURCES_CONFIG"
 LANE_PREFIX = "local-"
@@ -773,7 +774,10 @@ def _catalog_read(resp) -> bytes | None:
     return _read_capped(resp, CATALOG_MAX)
 
 
-def _send_json(handler, code: int, data: dict[str, Any], headers: dict[str, str] | None = None) -> None:
+def _send_json(handler, code: int, data: dict[str, Any], headers: dict[str, str] | None = None) -> bool:
+    """Write one JSON response. True when every byte was handed to the client's socket, False when the client's
+    connection failed on the way (BrokenPipeError, ConnectionResetError, any OSError): a caller that recorded state
+    before this write must treat False as an undelivered answer (#117 review round 7)."""
     raw = json.dumps(data).encode()
     try:
         handler.send_response(code)
@@ -782,9 +786,10 @@ def _send_json(handler, code: int, data: dict[str, Any], headers: dict[str, str]
         for k, v in (headers or {}).items():
             handler.send_header(k, v)
         handler.end_headers()
-        handler.wfile.write(raw)
+        handler.wfile.write(raw)                         # unbuffered (socket sendall): a failed send raises here
     except OSError:
-        pass
+        return False
+    return True
 
 
 def _refused(handler, code: int, kind: str, reason: str) -> None:
@@ -826,7 +831,7 @@ def _send_terminal(handler, code: int, data: dict[str, Any]) -> None:
 
 
 def _error(kind: str, message: str) -> dict[str, Any]:
-    return {"type": "error", "error": {"type": kind, "message": message}}
+    return {"type": "error", "error": {"type": kind, "message": safe_error_text(message)}}
 
 
 def _rename(event_line: bytes, name: str) -> bytes:
@@ -917,13 +922,14 @@ def _blocked(handler, hit: tuple[str, str], *, stream_started: bool = False) -> 
 def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
           echo_model: str, reply: list | None = None, auto_routed: bool = False,
           bind_reason: str | None = None, hook: bool = False, conversation: str | None = None,
-          reroute: bool = False) -> str:
+          reroute: bool = False, commit: Callable[[list], None] | None = None) -> str:
     """_serve, counted in the node's in-flight turns (busy) while it runs."""
     with _inflight_lock:
         _inflight[node["node"]] = _inflight.get(node["node"], 0) + 1
     try:
         return _serve(handler, body, node, model, echo_model=echo_model, reply=reply, auto_routed=auto_routed,
-                      bind_reason=bind_reason, hook=hook, conversation=conversation, reroute=reroute)
+                      bind_reason=bind_reason, hook=hook, conversation=conversation, reroute=reroute,
+                      commit=commit)
     finally:
         with _inflight_lock:
             left = _inflight.get(node["node"], 1) - 1
@@ -936,7 +942,7 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
 def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
            echo_model: str, reply: list | None = None, auto_routed: bool = False,
            bind_reason: str | None = None, hook: bool = False, conversation: str | None = None,
-           reroute: bool = False) -> str:
+           reroute: bool = False, commit: Callable[[list], None] | None = None) -> str:
     """Relay one turn to the node's /v1/messages and the answer back to the client. Returns the outcome: "completed"
     (a whole message or a parsed message_stop), "rejected" (the node answered an HTTP error, relayed as-is),
     "unreachable" (503 sent), or "incomplete" (the stream broke). The response names `echo_model` (what the client
@@ -945,7 +951,15 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
     fingerprint the reply and continue the conversation by its history, as for every other pin. `auto_routed`: the
     conversation was moved here by S1's auto-route (routing.auto_local), not pinned; an unavailable node (unreachable,
     dropping requests, refusing the token, or the gate's fixed policy refusal: battery, switch off) is then worded by
-    auto_routed_unavailable instead of naming a `sub/` pin the person never made.
+    auto_routed_unavailable instead of naming a `sub/` pin the person never made. `commit`, when given, is called with
+    the whole reply once, BEFORE the bytes that complete the answer reach the client (the non-streaming body, or the
+    SSE event carrying message_stop): the server records the conversation's history there, so a client that
+    continues the instant it has the answer always finds it (#117 review round 5). It is called only on a turn that
+    returns "completed" unless a later client write or flush fails (any OSError, never swallowed after a commit); the
+    server then undoes it (the outcome is "incomplete"). The reply it receives is the one relayed: a blocked turn never
+    commits, and tool-call ids are the provider-minted ones the client sees.
+    An error body from the node is relayed with its message escaped and capped (safe_error_body); a successful
+    answer's bytes are never altered beyond the model name and the boundary's minted tool-call ids.
 
     An auto-routed turn (every automatic move: auto_route, sensitive flag / prefer / keyword, a refusal bind, an index
     bind) also passes the effect boundary (effect_boundary.py) under the profile of `bind_reason` (the route's
@@ -1073,11 +1087,12 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
                 _send_json(handler, 502, _error("api_error", f"cortados: local node {node['node']} answered HTTP "
                                                 f"{resp.status} and its error body was truncated or stalled"))
                 return "incomplete"
-            try:
-                json.loads(raw)
-            except ValueError:
-                raw = json.dumps(_error("api_error", f"cortados: local node {node['node']} answered HTTP "
-                                        f"{resp.status}: {raw[:300].decode('utf-8', 'replace')}")).encode()
+            # A JSON error object is relayed with its message escaped and capped, every other field kept as sent;
+            # anything else becomes a cortados error quoting its start (through _error, so escaped as well).
+            safe = safe_error_body(raw)
+            raw = safe if safe is not None else json.dumps(_error(
+                "api_error", f"cortados: local node {node['node']} answered HTTP {resp.status}: "
+                f"{raw[:300].decode('utf-8', 'replace')}")).encode()
             code = resp.status if 400 <= resp.status < 600 else 502
             _refused(handler, code, "api_error", "the local node answered an HTTP error")
             try:
@@ -1113,13 +1128,21 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
                 msg["model"] = echo_model
             if isinstance(msg, dict) and isinstance(msg.get("content"), list):
                 reply.extend(b for b in msg["content"] if isinstance(b, dict))
-            _send_json(handler, 200, msg)
-            return "completed" if isinstance(msg, dict) and msg.get("type") == "message" else "incomplete"
-        started = False
+            complete = isinstance(msg, dict) and msg.get("type") == "message"
+            if complete and commit is not None:
+                commit(reply)                                    # recorded before the client can continue from it
+            if not _send_json(handler, 200, msg):
+                return "incomplete"                              # the client left: the server undoes the commit
+            return "completed" if complete else "incomplete"
+        started = committed = False
 
         def write(chunks: list) -> bool:
-            """Send the stream's headers (once) and `chunks`; False when the client has left."""
-            nonlocal started
+            """Send the stream's headers (once) and `chunks`; False when the client has left. Chunks written once
+            message_stop was seen (`done`) are the ones that complete the answer: `commit` runs first (#117)."""
+            nonlocal started, committed
+            if chunks and done and not committed and commit is not None:
+                commit(reply)                            # before message_stop's event reaches the client
+                committed = True
             try:
                 if not started:
                     handler.send_response(200)
@@ -1217,8 +1240,8 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
             ev = _error("api_error", f"cortados: local node {node['node']} stopped mid-answer (stalled past "
                         f"{node['read_timeout_s']:g}s or dropped the connection)")
             write([b"event: error\ndata: " + json.dumps(ev).encode() + b"\n\n"])
-        if not write([]):
-            return "incomplete"
+        if not write([]):                                        # every write() flushes: a failed one is reported
+            return "incomplete"                                  # the end of the answer never reached the client
         return "completed" if done else "incomplete"
     finally:
         conn.close()

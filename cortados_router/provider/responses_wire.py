@@ -16,7 +16,8 @@ import uuid
 from typing import Any, Iterator
 
 from cortados_router.provider import anthropic_wire
-from cortados_router.provider.anthropic_wire import (ClientTurn, WireError, check_tool_name, mcp_content,
+from cortados_router.safe_text import safe_error_text
+from cortados_router.provider.anthropic_wire import (ClientTurn, WireError, check_tool_name, log_safe, mcp_content,
                                                     reply_fingerprint, sse)
 
 MODEL_ID = anthropic_wire.MODEL_ID
@@ -77,7 +78,7 @@ def _blocks_of(content: Any) -> list[dict[str, Any]]:
         elif kind == "input_image":
             out.append(_image_block(item))
         else:
-            raise WireError(f"unsupported content item type {kind!r}")
+            raise WireError(f"unsupported content item type {log_safe(kind)}")
     return out
 
 
@@ -98,9 +99,9 @@ def _tool_use_block(item: dict[str, Any]) -> dict[str, Any]:
         try:
             args = json.loads(args) if args.strip() else {}
         except ValueError as exc:
-            raise WireError(f"function_call {call_id} arguments are not JSON: {exc}") from None
+            raise WireError(f"function_call {log_safe(call_id)} arguments are not JSON: {exc}") from None
     if not isinstance(args, dict):
-        raise WireError(f"function_call {call_id} arguments must be a JSON object")
+        raise WireError(f"function_call {log_safe(call_id)} arguments must be a JSON object")
     name = check_tool_name(str(item.get("name") or ""), "function_call name")
     return {"type": "tool_use", "id": call_id, "name": name, "input": args}
 
@@ -114,7 +115,7 @@ def _output_result(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         raise WireError("function_call_output must carry call_id")
     output = item.get("output")
     if not isinstance(output, (str, list)):
-        raise WireError(f"function_call_output {call_id} output must be a string or a list of content items")
+        raise WireError(f"function_call_output {log_safe(call_id)} output must be a string or a list of content items")
     return call_id, {"content": mcp_content(_blocks_of(output)), "isError": False}
 
 
@@ -130,14 +131,14 @@ def _classify(item: Any) -> str:
             return "system"
         if role in ("user", "assistant"):
             return role
-        raise WireError(f"unsupported message role {role!r}")
+        raise WireError(f"unsupported message role {log_safe(role)}")
     if kind == "function_call":
         return "assistant"
     if kind == "function_call_output":
         return "user"
     if kind in SKIPPED_ITEM_TYPES:
         return "skip"
-    raise WireError(f"unsupported input item type {kind!r} (this endpoint never produced it)")
+    raise WireError(f"unsupported input item type {log_safe(kind)} (this endpoint never produced it)")
 
 
 def _parse_tools(tools: Any) -> list[dict[str, Any]]:
@@ -166,13 +167,13 @@ def _parse_tools(tools: Any) -> list[dict[str, Any]]:
             # and no tool list, and "<namespace>__<tool>" is not invertible when the namespace itself contains
             # "__" and the tool starts with "_" (every observed one does), so a flattened call would fail inside
             # Codex mid-turn instead of here. Refused up front, with the flag that removes these tools.
-            raise WireError(f"namespace tool {t.get('name')!r} (ChatGPT apps) cannot be bridged; "
+            raise WireError(f"namespace tool {anthropic_wire.shown_name(t.get('name'))} (ChatGPT apps) cannot be bridged; "
                             "run Codex with --disable apps")
         else:
             dropped.append(str(kind))
     if dropped:
         logger.warning("responses wire: dropped %d non-function tool(s) the cortados model cannot serve: %s",
-                       len(dropped), ", ".join(sorted(set(dropped))))
+                       len(dropped), ", ".join(sorted({anthropic_wire.shown_name(k) for k in dropped})))
     return out
 
 
@@ -200,7 +201,7 @@ def _parse_request(body: dict[str, Any]) -> ClientTurn:
     if body.get("model") != MODEL_ID:
         # Codex checks the model the response echoes against the one it asked for; serving any other name would
         # fail on its side after the turn ran. Refuse first.
-        raise WireError(f"model must be {MODEL_ID!r}, got {body.get('model')!r}")
+        raise WireError(f"model must be {MODEL_ID!r}, got {log_safe(body.get('model'))}")
     if body.get("previous_response_id"):
         # The endpoint keeps no response store: a conversation is identified by the full input (Registry.find), and
         # continuing one from an id alone would mean guessing which session it meant.
@@ -212,7 +213,7 @@ def _parse_request(body: dict[str, Any]) -> ClientTurn:
     if choice != "auto":
         # The CLI session's tool set is fixed when it starts and the CLI decides itself whether to call one, so only
         # `auto` can be honoured; anything else is refused, never silently ignored (as on the Messages wire).
-        raise WireError(f"tool_choice {choice!r} is not supported by the cortados model; only 'auto'")
+        raise WireError(f"tool_choice {log_safe(choice)} is not supported by the cortados model; only 'auto'")
     items = body.get("input")
     if not isinstance(items, list) or not items:
         raise WireError("input must be a non-empty list of items")
@@ -272,7 +273,7 @@ def _parse_request(body: dict[str, Any]) -> ClientTurn:
         elif it.get("type") == "function_call_output":
             call_id, result = _output_result(it)
             if call_id in results:
-                raise WireError(f"two function_call_output items for call_id {call_id}")
+                raise WireError(f"two function_call_output items for call_id {log_safe(call_id)}")
             results[call_id] = result
         else:
             content += _blocks_of(it.get("content"))
@@ -412,7 +413,7 @@ def _output_items(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             items.append({"type": "function_call", "id": "fc_" + uuid.uuid4().hex[:24], "call_id": b["id"],
                           "name": b["name"], "arguments": json.dumps(b["input"]), "status": "completed"})
         else:
-            raise ValueError(f"unsupported block type {b['type']!r}")
+            raise ValueError(f"unsupported block type {log_safe(b['type'])}")
     return items
 
 
@@ -469,9 +470,11 @@ def sse_error(message: str, *, msg_id: str | None = None, model: str = MODEL_ID,
     """response.failed; Codex shows response.error.message. `terminal`: the non-retried code (TERMINAL_CODE)."""
     return _event("response.failed", sequence,
                   response=_response(msg_id or new_message_id(), model, "failed", [], None,
-                                     error={"code": TERMINAL_CODE if terminal else "server_error", "message": message}))
+                                     error={"code": TERMINAL_CODE if terminal else "server_error",
+                                            "message": safe_error_text(message)}))
 
 
 def error_json(kind: str, message: str) -> dict[str, Any]:
-    """The HTTP error body; Codex prints it verbatim."""
-    return {"error": {"type": kind, "message": message}}
+    """The HTTP error body; Codex prints it verbatim, so the message passes safe_error_text (the sink, see error_json in
+    anthropic_wire)."""
+    return {"error": {"type": kind, "message": safe_error_text(message)}}

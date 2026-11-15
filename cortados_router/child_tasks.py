@@ -70,6 +70,7 @@ if __name__ == "__main__" and not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cortados_router import exec_hosts, paths, redact, session, workspaces  # noqa: E402
+from cortados_router.safe_text import escape_controls, quoted  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TASKS_DIR = "~/.config/cortados/tasks"
@@ -408,7 +409,7 @@ def login_model(name) -> str:
     model = pin_model(name)
     model = model.split("/", 1)[1] if model.startswith("sub/") else model
     if not model.startswith("claude-"):
-        raise TaskError(f"chrome tasks run on the user's claude.ai login, which can only run Claude models; {name!r} "
+        raise TaskError(f"chrome tasks run on the user's claude.ai login, which can only run Claude models; {quoted(name)} "
                         f"({model}) is not one. Use cortados (= {LOGIN_DEFAULT_MODEL}) or a claude-* model.")
     return model
 
@@ -475,7 +476,7 @@ def _private_root() -> str:
 
 def task_path(task_id) -> str:
     if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
-        raise TaskError(f"invalid task_id {task_id!r}: expected the id start_task returned (t<14 digits>-<8 hex>)")
+        raise TaskError(f"invalid task_id {quoted(task_id)}: expected the id start_task returned (t<14 digits>-<8 hex>)")
     p = os.path.join(_private_root(), task_id)
     if not os.path.isdir(p):
         raise TaskError(f"no such task {task_id}")
@@ -538,12 +539,12 @@ def pin_model(name) -> str:
     (S1 routes) or a pinnable model or alias (fable, opus, sonnet, claude-*, gpt-*, ...). Returns the provider model id:
     'cortados' or 'sub/<id>' (session.resolve_model, which uses the provider's own alias table)."""
     if not isinstance(name, str):
-        raise TaskError(f"invalid model {name!r}: use 'cortados' or a pinnable model name (e.g. fable, opus, gpt-6.1-sol)")
+        raise TaskError(f"invalid model {quoted(name)}: use 'cortados' or a pinnable model name (e.g. fable, opus, gpt-6.1-sol)")
     # A friendly name's spaces become dashes (`GPT 6.1` -> `gpt-6.1`): the provider's resolver (routing.resolve_pin)
     # reads the two alike, and the id then stays one argv token for the child's --model.
     name = re.sub(r"\s+", "-", name.strip()).lower()
     if not ORCHESTRATOR_RE.fullmatch(name):
-        raise TaskError(f"invalid model {name!r}: use 'cortados' or a pinnable model name (e.g. fable, opus, gpt-6.1-sol, "
+        raise TaskError(f"invalid model {quoted(name)}: use 'cortados' or a pinnable model name (e.g. fable, opus, gpt-6.1-sol, "
                         "'GPT 6.1', 'ollama 27b q3km')")
     try:
         return session.resolve_model(name)
@@ -600,7 +601,7 @@ def _validate(task, cwd, orchestrator, permission_mode, allowed_tools):
         raise TaskError("cwd, when given, must be an absolute directory path on the execution host")
     pin_model(orchestrator)
     if permission_mode is not None and permission_mode not in PERMISSION_MODES:   # None: resolve_permission_mode picks
-        raise TaskError(f"permission_mode {permission_mode!r} is not allowed; choose one of {', '.join(PERMISSION_MODES)} "
+        raise TaskError(f"permission_mode {quoted(permission_mode)} is not allowed; choose one of {', '.join(PERMISSION_MODES)} "
                         "(bypassPermissions is deliberately unavailable for unattended children)")
     tools = []
     if allowed_tools is not None:
@@ -609,7 +610,7 @@ def _validate(task, cwd, orchestrator, permission_mode, allowed_tools):
         for t in allowed_tools:
             if (not isinstance(t, str) or not t.strip() or len(t) > MAX_TOOL_PATTERN or "," in t
                     or not t.isprintable()):
-                raise TaskError(f"invalid allowed_tools entry {t!r}: a printable pattern such as 'Bash(git diff:*)', "
+                raise TaskError(f"invalid allowed_tools entry {quoted(t)}: a printable pattern such as 'Bash(git diff:*)', "
                                 f"no commas, at most {MAX_TOOL_PATTERN} characters")
             tools.append(t.strip())
     return tools
@@ -623,7 +624,7 @@ def _check_cwd_here(cwd: str, host: "exec_hosts.Host") -> None:
     """cwd must exist on THIS host (the execution host). The message names the host so a path that exists only on the
     requesting machine is understood as such (start() adds that it exists there when it does)."""
     if not os.path.isdir(cwd):
-        raise TaskError(f"cwd {cwd!r} does not exist on execution host {host.describe()}; name a `repo` (and `branch`) "
+        raise TaskError(f"cwd {quoted(cwd)} does not exist on execution host {host.describe()}; name a `repo` (and `branch`) "
                         f"for a workspace under {host.root or '<root>'}/active/<task_id>, or a cwd that exists there")
 
 
@@ -815,15 +816,42 @@ def _max_s() -> int:
     return v
 
 
+ROUTE_SERVER = "cortados-route"     # the router's own MCP server (subagent_mcp.py)
+
+
+def route_server_entry(provider_url: str, token_file=None) -> dict:
+    """cortados-route as a connector child's strict MCP config carries it: the absolute path of subagent_mcp.py and the
+    interpreter on THIS host (the execution host: _prepare runs there), with the env the README's registration gives it
+    (CORTADOS_PROVIDER_URL, CORTADOS_CHILD_CLAUDE_BIN when set) plus the token FILE when one was given (never a token)
+    and NESTED_ENV, so start_task and route_task are refused even if the child's own env were not inherited."""
+    env = {NESTED_ENV: "1"}
+    if provider_url:
+        env["CORTADOS_PROVIDER_URL"] = provider_url
+    if token_file:
+        env["CORTADOS_PROVIDER_TOKEN_FILE"] = os.path.abspath(os.path.expanduser(token_file))
+    if os.environ.get("CORTADOS_CHILD_CLAUDE_BIN"):
+        env["CORTADOS_CHILD_CLAUDE_BIN"] = os.environ["CORTADOS_CHILD_CLAUDE_BIN"]
+    py = sys.executable if sys.executable and os.path.isabs(sys.executable) else "python3"
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subagent_mcp.py")
+    return {"type": "stdio", "command": py, "args": [script], "env": env}
+
+
 MAX_CONNECTORS = 32                 # a selection longer than this is not a selection
+# Round 2 of #117 asked each connectors.mcp.json entry for a "cortadosTools" count. Round 3 dropped it: a count bounds
+# nothing (descriptions vary without limit) and the host's own MCP servers were outside it. The provider now enforces
+# the real serialized size of every request's tools (provider/server.py TOOL_SCHEMA_BUDGET_BYTES). An entry that still
+# carries the key is accepted; the key is removed from the child's --mcp-config, where it means nothing to Claude Code.
+LEGACY_COUNT_KEY = "cortadosTools"
 
 
 def select_connectors(names) -> dict | None:
     """The connector servers a child gets: None for none (the default), else {name: server config} for exactly the
-    named servers in the connectors MCP config. Why opt-in: every connected server's tool schemas go up front in
-    every request (a custom provider URL gets no client-side tool search), and the full set measured ~1.1 MB (~290k
-    tokens, 495 MCP tools) on 2026-11-02, over a 200k model's input ceiling: the provider refused every such child
-    with 413 before it ran."""
+    named servers in the connectors MCP config (without a LEGACY_COUNT_KEY). Why opt-in: every connected server's
+    tool schemas go up front in every request (children run with tool search off, #117), and the full set measured
+    ~1.1 MB (~290k tokens, 495 MCP tools) on 2026-11-02, over a 200k model's input ceiling: the provider refused every
+    such child with 413 before it ran. The size of a selection is not checked here (its tools cannot be listed at
+    launch); the provider's tool-schema budget refuses an oversized one on the child's first request, naming the
+    largest namespaces."""
     if names is None or names == []:
         return None
     if not isinstance(names, list) or len(names) > MAX_CONNECTORS or not all(isinstance(n, str) and n for n in names):
@@ -839,8 +867,12 @@ def select_connectors(names) -> dict | None:
         raise TaskError(f"cannot read the connectors MCP config {path}: {type(exc).__name__}") from None
     unknown = [n for n in names if n not in servers]
     if unknown:
-        raise TaskError(f"unknown connector(s) {', '.join(unknown)}; available: {', '.join(sorted(servers)) or 'none'}")
-    return {n: servers[n] for n in dict.fromkeys(names)}
+        # Client names quoted and capped (#117 round 5); the MCP sink (subagent_mcp._err) escapes the whole text again.
+        raise TaskError(f"unknown connector(s) {', '.join(quoted(n) for n in unknown[:MAX_CONNECTORS])}; available: "
+                        f"{', '.join(sorted(servers)) or 'none'}")
+    chosen = list(dict.fromkeys(names))
+    return {n: ({k: v for k, v in servers[n].items() if k != LEGACY_COUNT_KEY} if isinstance(servers[n], dict)
+                else servers[n]) for n in chosen}
 
 
 def office_tags(cwd, title=None, session_tag=None) -> dict:
@@ -973,6 +1005,21 @@ def _stub(d: str):
     return rec if isinstance(rec, dict) and isinstance(rec.get("host"), str) else None
 
 
+STDERR_CAP = 16000
+
+
+def _stderr(text: str) -> None:
+    """One diagnostic line on stderr (a child's stderr.log, the --watch / --remote caller's terminal): control
+    characters escaped and capped (safe_text, #117 round 5), so client text in it (an id, a path) cannot forge a line."""
+    print(escape_controls(text, STDERR_CAP), file=sys.stderr, flush=True)
+
+
+def _stderr_traceback() -> None:
+    """The current exception's traceback through _stderr: one line, its newlines shown as `\\n`."""
+    import traceback
+    _stderr(traceback.format_exc())
+
+
 def start(*args, **kwargs) -> dict:
     """Start a child task (_start has the arguments). A TaskError passes through; any other exception becomes a
     StartFailed classified by how far the launch got (`progress`, advanced by _start at the launch boundary), so the
@@ -983,8 +1030,7 @@ def start(*args, **kwargs) -> dict:
     except TaskError:
         raise
     except Exception as exc:
-        import traceback
-        traceback.print_exc(file=sys.stderr)    # the full exception for the operator's log, not for the caller
+        _stderr_traceback()                     # the full exception for the operator's log, not for the caller
         raise StartFailed(type(exc).__name__, _start_where(), progress["launched"], progress["task_id"]) from None
 
 
@@ -1412,6 +1458,10 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
     # delegate and does the work itself (CHILD_DIRECTIVE). A pinned orchestrator only pins the child's main model; its
     # native subagents are still routed by S1 (CLAUDE_CODE_SUBAGENT_MODEL).
     launch += ["--no-delegate-directive", "--no-gate"]
+    # Tool search off (#117): the child's opening request declares every MCP tool, so the provider's backend has them.
+    # Bounded by the provider's tool-schema budget (server.TOOL_SCHEMA_BUDGET_BYTES, on the real serialized size),
+    # which also covers the host's own MCP servers a child without connectors inherits.
+    launch.append("--eager-tools")
     # --permission-prompts none: nobody is there to answer, so anything that would prompt is denied deterministically
     # (as s1/outcome/agents.py runs its headless claude).
     # stream-json (which -p only allows with --verbose): every event, not only the result record, so status can say
@@ -1429,11 +1479,17 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
         # Only the named servers, in a private file (session-*.json: removed with the settings when the child exits,
         # since server entries may carry their own credentials).
         conn = os.path.join(d, "session-connectors.json")
+        servers = {**selected, ROUTE_SERVER: route_server_entry(provider_url, token_file)}
         with open(os.open(conn, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as f:
-            json.dump({"mcpServers": selected}, f)
-        extra += ["--mcp-config", conn]
+            json.dump({"mcpServers": servers}, f)
+        # --strict-mcp-config (#117): only the selected connectors load, not also the execution host's own Claude Code
+        # MCP servers (user, project and plugin ones), which would add schemas the selection never chose. The one
+        # exception is cortados-route, added back explicitly (round 4): its local_switch tool IS allowed inside a child
+        # (subagent_mcp.py docstring); its start_task and route_task stay refused there (NESTED_ENV), as in any child.
+        extra += ["--strict-mcp-config", "--mcp-config", conn]
     else:
-        conn_note = "no connectors selected; the child has the user's Claude Code MCP servers only\n"
+        conn_note = ("no connectors selected; the child has the user's Claude Code MCP servers only (bounded by the "
+                     "provider's tool-schema budget)\n")
     base = {k: v for k, v in os.environ.items() if k not in STRIP_ENV}
     try:
         _args, env, cmd = session.prepare(launch + ["--"] + extra, base, MANAGED_DIRS)
@@ -2206,7 +2262,7 @@ def watch_main(argv: list) -> int:
             try:
                 opts[a[2:]] = float(argv[i + 1])
             except ValueError:
-                print(f"--watch: {a} needs a number of seconds, got {argv[i + 1]!r}", file=sys.stderr)
+                _stderr(f"--watch: {a} needs a number of seconds, got {quoted(argv[i + 1])}")
                 return 2
             i += 2
             continue
@@ -2221,7 +2277,7 @@ def watch_main(argv: list) -> int:
     try:
         return watch(ids, opts["timeout"], opts["interval"], opts["stall"])
     except TaskError as exc:
-        print(f"--watch: {exc}", file=sys.stderr)     # task_path / option errors: ids and settings, never credentials
+        _stderr(f"--watch: {exc}")     # task_path / option errors: ids and settings, never credentials
         return 2
     except KeyboardInterrupt:
         return 130
@@ -3901,7 +3957,7 @@ def serve_remote(stdin=None, stdout=None) -> int:
         elif op == "cancel":
             out = cancel(args.get("task_id"))
         else:
-            return reply(False, f"unknown remote operation {op!r}")
+            return reply(False, f"unknown remote operation {quoted(op)}")
     except StartFailed as exc:                  # classified by start() itself: carry it so the caller can say what to do
         return reply(False, str(exc), exc.failure())
     except TaskError as exc:
@@ -3909,8 +3965,7 @@ def serve_remote(stdin=None, stdout=None) -> int:
                                     "message (a cortados-router bug: please report it)")
         return reply(False, Redactor(tokens).text(text) if tokens else text)
     except Exception as exc:                    # the type only: the text is unscrubbed and could echo configuration
-        import traceback
-        traceback.print_exc(file=sys.stderr)
+        _stderr_traceback()
         # Outside start() (start classifies its own): for a start request nothing was launched yet.
         return reply(False, f"internal error on execution host {host.name} ({type(exc).__name__})",
                      {"type": type(exc).__name__, "launched": "none", "task_id": None})
@@ -3930,7 +3985,7 @@ def cleanup_main(argv: list) -> int:
         try:
             me = exec_hosts.load().local_entry()
         except exec_hosts.HostError as exc:
-            print(str(exc), file=sys.stderr)
+            _stderr(str(exc))
             return 2
         if me is None or not me.root:
             print(f"no entry in {exec_hosts.config_path()} names this machine with a workspace root; pass --root", file=sys.stderr)
