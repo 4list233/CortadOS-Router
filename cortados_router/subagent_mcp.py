@@ -150,8 +150,9 @@ CHILD_TOOLS = [
                     "user's claude.ai connectors). Refused if Claude settings set an API key/token/base URL."},
          "connectors": {"type": "array", "items": {"type": "string"}, "description": "Optional: names of servers "
                         "from ~/.config/cortados/connectors.mcp.json the child needs (default none). Each server's "
-                        "tool schemas are sent up front with every request, so each entry must declare its tool count "
-                        "(\"cortadosTools\") and a selection over 66 tools (~40k tokens) is refused."},
+                        "tool schemas are sent up front with every request, and only these servers load (not the "
+                        "host's own MCP servers). A selection whose schemas exceed the provider's tool-schema budget "
+                        "(~40k tokens of MCP tools) is refused on the child's first request; choose few."},
          "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional extra tool patterns "
                            "pre-approved for the child, e.g. ['Bash(npm test:*)', 'Bash(git diff:*)']."}},
          "required": ["task"]}},

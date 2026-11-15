@@ -620,9 +620,9 @@ class ChildTaskTests(ChildTaskBase):
 
     def test_connectors_are_opt_in_and_filtered(self):
         conn = os.path.join(self.tmp, "connectors.mcp.json")
-        servers = {"vercel": {"type": "http", "url": "https://vercel.example/mcp", "cortadosTools": 241},
-                   "notion": {"type": "http", "url": "https://notion.example/mcp", "cortadosTools": 14},
-                   "slack": {"type": "http", "url": "https://slack.example/mcp", "cortadosTools": 9}}
+        servers = {"vercel": {"type": "http", "url": "https://vercel.example/mcp"},
+                   "notion": {"type": "http", "url": "https://notion.example/mcp"},
+                   "slack": {"type": "http", "url": "https://slack.example/mcp"}}
         with open(conn, "w") as f:
             json.dump({"mcpServers": servers}, f)
         os.environ["CORTADOS_CONNECTORS_MCP_CONFIG"] = conn
@@ -630,6 +630,8 @@ class ChildTaskTests(ChildTaskBase):
         self.call("wait_task", task_id=tid, timeout_s=30)
         seen = _load(os.path.join(self.work, "fake-argv.json"))
         self.assertNotIn("--mcp-config", seen["argv"])
+        # Without connectors the child keeps the host's own MCP servers (bounded at the provider, #117).
+        self.assertNotIn("--strict-mcp-config", seen["argv"])
         self.assertEqual(seen["env"]["ENABLE_TOOL_SEARCH"], "false")  # #117: every child, connectors or not
         tid = self.start(connectors=["notion"])
         d = ct.task_path(tid)
@@ -643,6 +645,9 @@ class ChildTaskTests(ChildTaskBase):
         self.assertEqual(seen["settings"]["body"]["env"]["ENABLE_TOOL_SEARCH"], "false")
         path = a[a.index("--mcp-config") + 1]
         self.assertEqual(os.path.dirname(path), d)                 # a private per-task file, not the full config
+        # #117 round 3: only the selection loads, not also the execution host's own MCP servers.
+        self.assertEqual(a[a.index("--mcp-config") - 1], "--strict-mcp-config")
+        self.assertEqual(a.count("--strict-mcp-config"), 1)
         self.assertEqual(seen["mcp"], {"mcpServers": {"notion": {"type": "http", "url": "https://notion.example/mcp"}}})
         self.assertFalse(os.path.exists(path), "the selection (it may carry credentials) is removed at exit")
         self.assertEqual(_load(os.path.join(d, "meta.json"))["connectors"], ["notion"])
@@ -652,44 +657,35 @@ class ChildTaskTests(ChildTaskBase):
     def test_selected_connectors_file_content(self):
         conn = os.path.join(self.tmp, "connectors.mcp.json")
         with open(conn, "w") as f:
-            json.dump({"mcpServers": {"a": {"command": "x", "cortadosTools": 3},
-                                      "b": {"command": "y", "cortadosTools": 0}}}, f)
+            json.dump({"mcpServers": {"a": {"command": "x"}, "b": {"command": "y", "cortadosTools": 3}}}, f)
         os.environ["CORTADOS_CONNECTORS_MCP_CONFIG"] = conn
         self.assertIsNone(ct.select_connectors(None))
         self.assertIsNone(ct.select_connectors([]))
-        self.assertEqual(ct.select_connectors(["b"]), {"b": {"command": "y"}})       # our count key is not passed on
+        self.assertEqual(ct.select_connectors(["a"]), {"a": {"command": "x"}})
+        self.assertEqual(ct.select_connectors(["b"]), {"b": {"command": "y"}})   # a round-2 count key is not passed on
         for bad in ("a", [1], ["a"] * 40):
             with self.assertRaises(ct.TaskError):
                 ct.select_connectors(bad)
 
-    def test_an_over_budget_or_undeclared_connector_set_is_refused_before_anything_starts(self):
-        # #117: a child loads every connector tool schema up front (tool search off), so the selection is bounded
-        # at start_task, by declared tool count (the tool list cannot be read at launch), never silently cut down.
-        self.assertEqual((ct.EAGER_SCHEMA_BUDGET_TOKENS, ct.MAX_EAGER_TOOLS), (40_000, 66))
+    def test_connectors_with_no_tool_count_launch_strict_and_eager(self):
+        # #117 round 3: start_task needs no "cortadosTools" (a count bounded nothing); the provider's byte budget
+        # bounds the catalog. A large selection launches; it would be refused at the provider, not here.
+        self.assertFalse(hasattr(ct, "MAX_EAGER_TOOLS"))
         conn = os.path.join(self.tmp, "connectors.mcp.json")
         with open(conn, "w") as f:
-            json.dump({"mcpServers": {"vercel": {"type": "http", "url": "https://v.example", "cortadosTools": 241},
-                                      "figma": {"type": "http", "url": "https://f.example", "cortadosTools": 40},
-                                      "notion": {"type": "http", "url": "https://n.example", "cortadosTools": 26},
-                                      "apollo": {"type": "http", "url": "https://a.example"},
-                                      "odd": {"type": "http", "url": "https://o.example", "cortadosTools": True}}}, f)
+            json.dump({"mcpServers": {"vercel": {"type": "http", "url": "https://v.example"},
+                                      "apollo": {"type": "http", "url": "https://a.example"}}}, f)
         os.environ["CORTADOS_CONNECTORS_MCP_CONFIG"] = conn
-        self.assertEqual(sorted(ct.select_connectors(["figma", "notion"])), ["figma", "notion"])   # 66: at the bound
-        before = sorted(os.listdir(ct._private_root())) if os.path.isdir(ct._private_root()) else []
-        r, _ = self.call("start_task", task="x", cwd=self.work, connectors=["vercel", "notion"])
-        text = r["content"][0]["text"]
-        self.assertIn("connectors vercel (241 tools), notion (26 tools): 267 tools ≈160k tokens of tool schemas, over "
-                      "the child budget of 66 tools ≈40k tokens", text)
-        self.assertIn("start the task with fewer connectors", text)
-        with self.assertRaisesRegex(ct.TaskError, r"figma \(40 tools\), notion \(26 tools\), vercel"):
-            ct.select_connectors(["figma", "notion", "vercel"])
-        for bad in (["apollo"], ["odd"], ["notion", "apollo"]):
-            with self.subTest(bad=bad), self.assertRaisesRegex(ct.TaskError, r"declare no tool count: add "
-                                                                            r"\"cortadosTools\""):
-                ct.select_connectors(bad)
-        after = sorted(os.listdir(ct._private_root())) if os.path.isdir(ct._private_root()) else []
-        self.assertEqual(before, after, "a refused start leaves no task dir")
-        self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")), "no child was spawned")
+        tid = self.start(connectors=["vercel", "apollo"])
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        seen = _load(os.path.join(self.work, "fake-argv.json"))
+        a = seen["argv"]
+        self.assertIn("--strict-mcp-config", a)
+        self.assertEqual(seen["mcp"], {"mcpServers": {"vercel": {"type": "http", "url": "https://v.example"},
+                                                      "apollo": {"type": "http", "url": "https://a.example"}}})
+        self.assertEqual(seen["env"]["ENABLE_TOOL_SEARCH"], "false")
+        self.assertEqual(sorted(_load(os.path.join(ct.task_path(tid), "meta.json"))["connectors"]), ["apollo", "vercel"])
 
     def test_settings_file_exists_while_running(self):
         os.environ["FAKE_CLAUDE_MODE"] = "sleep"
@@ -1465,10 +1461,8 @@ class ChildTaskTests(ChildTaskBase):
     def _connectors_config(self):
         conn = os.path.join(self.tmp, "connectors.mcp.json")
         with open(conn, "w") as f:
-            json.dump({"mcpServers": {"wispr-flow": {"type": "http", "url": "https://wispr.example/mcp",
-                                                     "cortadosTools": 5},
-                                      "velox": {"type": "http", "url": "https://velox.example/mcp",
-                                                "cortadosTools": 12}}}, f)
+            json.dump({"mcpServers": {"wispr-flow": {"type": "http", "url": "https://wispr.example/mcp"},
+                                      "velox": {"type": "http", "url": "https://velox.example/mcp"}}}, f)
         os.environ["CORTADOS_CONNECTORS_MCP_CONFIG"] = conn
 
     def test_connectors_on_a_gui_host_launch_via_launchd_routed_and_without_the_chrome_lock(self):

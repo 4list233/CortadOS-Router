@@ -941,7 +941,7 @@ class Registry:
         s.client = client                           # the opener's User-Agent name: find's scope without an identity
         s.rebuild_budget = RebuildBudget()          # its lineage's rebuilds (REBUILD_MAX), shared on rebuild
         s.tool_names, s.tools_warned = {t["name"] for t in turn.tools}, False   # what the backend was started with
-        s.tools_note = None                         # tools_added_note, sent with the next turn once
+        s.tools_note = None                         # TOOLS_ADDED_NOTE, sent with the next turn once
         s.awaiting_tool_result = False
         s.opened_at = time.time()                   # the live view's elapsed (live_conversations)
         return s
@@ -1628,18 +1628,91 @@ def _failed_reason(exc: object) -> str:
     return "the conversation already failed (terminal)" + (f": {diag}" if diag else "")
 
 
-TOOLS_NOTE_NAMES = 20                          # names listed in the note; the log has them all
+# What the backend model is told, once, when the client added tools after the backend started (#117, #121): it must not
+# call them, and should say so if the task needs them. Only the provider can say it: the client lists the tools, and
+# the backend's own error ("No such tool available") does not say why. A FIXED text (#117 review round 2): a client's
+# tool name is not text the provider may put in its own voice (anthropic_wire.shown_name), and the model needs no list:
+# whatever it was shown but cannot call fails at once. The provider log names the tools (as shown_name renders them).
+TOOLS_ADDED_NOTE = ("[cortados provider] Tools were added to this conversation after it started. They cannot be called "
+                    "in it: only the tools available when the conversation started can be called. Do not call the "
+                    "added tools; if the task needs one, say so in your answer (it works in a new conversation that "
+                    "has it from its first request).")
 
 
-def tools_added_note(added: list) -> str:
-    """What the backend model is told, once, when the client added tools after the backend started (#117, #121): it
-    must not call them, and should say so if the task needs them. Only the provider can say it: the client lists the
-    tools, and the backend's own error ("No such tool available") does not say why."""
-    shown = ", ".join(added[:TOOLS_NOTE_NAMES]) + (f" and {len(added) - TOOLS_NOTE_NAMES} more"
-                                                    if len(added) > TOOLS_NOTE_NAMES else "")
-    return ("[cortados provider] These tools were added after this conversation started and cannot be called in it: "
-            f"{shown}. Do not call them; if the task needs them, say so in your answer (they work in a new "
-            "conversation that has them from its first request).")
+# The tool-schema budget (#117 review round 2). With tool search off (child tasks, --strict-mcp-config sessions) every
+# MCP tool schema is in every request, and a host's own MCP servers load too, outside any launch-time selection. A tool
+# COUNT bounds nothing (66 tools with 8,000-character descriptions came to ~133k tokens), and the launcher cannot list
+# a connector's tools (OAuth in the exec host's Keychain). So the provider enforces the real serialized size of each
+# request's `tools`, the one place every client's catalog arrives in full, before anything is routed or started.
+#   - BYTES_PER_TOKEN: the measured 290k tokens / ~1.1 MB of the full connector catalog (README "Connectors") is
+#     request_fit's own chars / 4 estimate (~3.8 bytes a token), not a tokenizer count, so it cannot set the factor.
+#     JSON schemas (quotes, braces, short identifiers, camelCase) tokenize denser than prose; 3 bytes a token is
+#     taken as the conservative factor (api_credits' cost bound uses 2 for a ceiling on a bill, not a budget).
+#   - CLIENT_BUILTIN_TOOLS_BYTES: Claude Code's own tools are in `tools` too and are not the catalog: 2.1.325 with tool
+#     search off and no MCP server sent 23 built-in tools = 70,034 bytes (local sink, 2026-11-14); 80 KB leaves room for
+#     a release's growth.
+#   - TOOL_CATALOG_BUDGET_TOKENS: 40k tokens of MCP schemas leaves a child on the 128k local lane room for its system
+#     prompt, the built-ins and the work itself.
+# Applied to EVERY request, not only eager ones: the provider cannot tell tool search on from off except by a client
+# detail (a ToolSearch tool), a deferred request (~70 KB of built-ins + ToolSearch) is far below the budget, and one
+# rule bounds every client alike (Codex declares its tools up front, always). A deferred session would trip it only
+# after loading >120 KB of MCP schemas, which then cost the same context on every turn anyway.
+# Refused with a 400, not a 413: retrying unchanged cannot succeed, and Claude Code shows a 413 as "Request too large
+# (max 32MB) ... images" (README "Connectors"). routing.request_fit still gates the whole request against each route.
+BYTES_PER_TOKEN = 3
+CLIENT_BUILTIN_TOOLS_BYTES = 80_000
+TOOL_CATALOG_BUDGET_TOKENS = 40_000
+TOOL_SCHEMA_BUDGET_BYTES = CLIENT_BUILTIN_TOOLS_BYTES + TOOL_CATALOG_BUDGET_TOKENS * BYTES_PER_TOKEN    # 200,000
+TOOL_BUDGET_NAMESPACES_SHOWN = 6
+TOOL_BUDGET_REASON = "the request's tool schemas are over the tool-schema budget"
+UNPREFIXED_TOOLS = "(tools without a server prefix)"
+
+
+def tool_namespace(name: Any) -> str:
+    """The namespace a tool's size is reported under: `mcp__<server>` for an MCP tool (Claude Code and Codex both name
+    them mcp__<server>__<tool>), UNPREFIXED_TOOLS for any other valid name (built-ins, Codex functions), and
+    anthropic_wire.INVALID_NAME for a name shown_name would not show."""
+    shown = anthropic_wire.shown_name(name)
+    if shown == anthropic_wire.INVALID_NAME:
+        return shown
+    if shown.startswith("mcp__"):
+        server = shown[len("mcp__"):].split("__", 1)[0]
+        return f"mcp__{server}" if server else UNPREFIXED_TOOLS
+    return UNPREFIXED_TOOLS
+
+
+def tool_schema_overrun(body: Any) -> str | None:
+    """None when the request's `tools` serialize within TOOL_SCHEMA_BUDGET_BYTES (or are absent or malformed:
+    parse_request reports that), else the client's error message: the size, the budget, the largest namespaces (only
+    as tool_namespace renders them: never a raw client string) and how to shrink the set. Measured as request_fit
+    measures the body (json.dumps, UTF-8 bytes)."""
+    tools = body.get("tools") if isinstance(body, dict) else None
+    if not isinstance(tools, list) or not tools:
+        return None
+    try:
+        total = len(json.dumps(tools).encode())
+        if total <= TOOL_SCHEMA_BUDGET_BYTES:
+            return None
+        sizes: dict[str, list[int]] = {}
+        for t in tools:
+            entry = sizes.setdefault(tool_namespace(t.get("name") if isinstance(t, dict) else None), [0, 0])
+            entry[0] += 1
+            entry[1] += len(json.dumps(t).encode())
+    except RecursionError:                  # nested past json's limit: parse_request answers it as a shape error
+        return None
+    ranked = sorted(sizes.items(), key=lambda kv: (-kv[1][1], kv[0]))
+    shown = "; ".join(f"{ns} ({n} tool{'s' if n != 1 else ''}, {b // 1000} KB)"
+                      for ns, (n, b) in ranked[:TOOL_BUDGET_NAMESPACES_SHOWN])
+    more = len(ranked) - TOOL_BUDGET_NAMESPACES_SHOWN
+    return (f"cortados: the request's tool definitions are {total // 1000} KB (≈{total // BYTES_PER_TOKEN // 1000}k "
+            f"tokens), over this endpoint's tool-schema budget of {TOOL_SCHEMA_BUDGET_BYTES // 1000} KB "
+            f"(≈{TOOL_SCHEMA_BUDGET_BYTES // BYTES_PER_TOKEN // 1000}k tokens: the client's built-in tools plus "
+            f"≈{TOOL_CATALOG_BUDGET_TOKENS // 1000}k tokens of MCP tools). Every tool schema is sent with every request "
+            f"(tool search is off), so the conversation would have no room. Largest tool namespaces: {shown}"
+            + (f"; and {more} more" if more > 0 else "") +
+            ". Shrink the tool set: fewer connectors (start_task `connectors`), or start Claude Code with "
+            "--strict-mcp-config and an --mcp-config naming only the servers this work needs (the host's own MCP "
+            "servers count too). Retrying unchanged cannot succeed.")
 
 
 def with_tools_note(results: dict, note: str | None) -> dict:
@@ -2519,10 +2592,11 @@ class Handler(BaseHTTPRequestHandler):
         """A complete, ordinary assistant reply whose text tells the model the server tools did not run. A reply,
         not a 4xx: the client hands the text to the model as the tool's output, so the model reads why and stops
         retrying, where an HTTP error may be retried or surface only as a generic API error."""
-        text = anthropic_wire.SERVER_TOOL_UNAVAILABLE.format(names=", ".join(sorted(set(names))))
+        shown = sorted({anthropic_wire.shown_name(n) for n in names})     # never a raw client name (#117)
+        text = anthropic_wire.SERVER_TOOL_UNAVAILABLE.format(names=", ".join(shown))
         if reason:
             text += f" (reason: {reason})"
-        logger.warning("request with server tool(s) %s answered as unavailable%s", sorted(set(names)),
+        logger.warning("request with server tool(s) %s answered as unavailable%s", shown,
                        f" ({reason})" if reason else "")
         return self._reply_text(turn, text, {}, wire)
 
@@ -2552,6 +2626,10 @@ class Handler(BaseHTTPRequestHandler):
         if dump:
             Path(dump).mkdir(parents=True, exist_ok=True)
             (Path(dump) / f"{time.time():.3f}.json").write_text(json.dumps(body, indent=1))
+        # The tool-schema budget (TOOL_SCHEMA_BUDGET_BYTES), first: before any lane, pin, lookup or backend, on both wires.
+        over = tool_schema_overrun(body)
+        if over:
+            return self._error(400, "invalid_request_error", over, wire, reason=TOOL_BUDGET_REASON)
         try:
             # The api/ lane relays the body verbatim to the Anthropic Messages API, so only a Messages-wire body can be
             # pinned to it; on /v1/responses an api/ (or sub/) name falls through to parse_request, which refuses any
@@ -2582,7 +2660,7 @@ class Handler(BaseHTTPRequestHandler):
             if server_tools:
                 # Mixed with client tools: parse_request dropped the server tools, the client tools are served.
                 logger.warning("request declares server tool(s) %s that this endpoint cannot run; served without them",
-                               sorted(set(server_tools)))
+                               sorted({anthropic_wire.shown_name(n) for n in server_tools}))
             # A tool-less request (a client's title or summary call) never joins a live session: it would hold that
             # session's lock while the session waits for a tool result. It gets its own throwaway CLI instead.
             one_shot = not turn.tools
@@ -2613,7 +2691,7 @@ class Handler(BaseHTTPRequestHandler):
                 added, dropped = sorted(names - session.tool_names), sorted(session.tool_names - names)
                 # The usual cause of an ADDED tool is a Claude Code client with tool search on (#117): it declares an
                 # MCP tool only once ToolSearch has loaded it. The backend cannot call it ("No such tool available"),
-                # so this says so plainly, and the model is told once (tools_added_note) so it can tell the user
+                # so this says so plainly, and the model is told once (TOOLS_ADDED_NOTE) so it can tell the user
                 # instead of retrying. Growing the backend's tool set is #121; launch bounded clients with tool search
                 # off (session.TOOL_SEARCH_OFF).
                 logger.warning("conversation %s: the tool set changed mid-conversation (added %s, dropped %s); the "
@@ -2621,9 +2699,10 @@ class Handler(BaseHTTPRequestHandler):
                                "this conversation (calls fail as \"No such tool available\"; the model is told). "
                                "Usual cause: a Claude Code client with tool search on; start it with "
                                "ENABLE_TOOL_SEARCH=false or a new conversation (#117, #121)", session.id[:8],
-                               added, dropped)
+                               [anthropic_wire.shown_name(n) for n in added],
+                               [anthropic_wire.shown_name(n) for n in dropped])
                 if added:
-                    session.tools_note = tools_added_note(added)
+                    session.tools_note = TOOLS_ADDED_NOTE
             if one_shot:
                 # The transcript re-reads the whole history, so a shape error in an older user item surfaces here,
                 # not in parse_request: it is a request-shape error all the same and answers 400.

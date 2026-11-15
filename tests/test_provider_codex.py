@@ -737,8 +737,7 @@ class CodexEndpointTests(unittest.TestCase):
         # #117: the model is told once, with the tool result, that the added tool cannot be called here
         [text] = [b["text"] for b in r2["content"]]
         self.assertTrue(text.startswith("tool said: hello"), text)
-        self.assertIn("[cortados provider] These tools were added after this conversation started and cannot be "
-                      "called in it: Edit.", text)
+        self.assertTrue(text.endswith(provider_server.TOOLS_ADDED_NOTE), text)
         lines = [l for l in logs.output if "tool set changed mid-conversation" in l]
         self.assertEqual(len(lines), 1)
         self.assertIn("added ['Edit'], dropped []", lines[0])

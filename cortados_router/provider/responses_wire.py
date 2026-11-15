@@ -166,13 +166,13 @@ def _parse_tools(tools: Any) -> list[dict[str, Any]]:
             # and no tool list, and "<namespace>__<tool>" is not invertible when the namespace itself contains
             # "__" and the tool starts with "_" (every observed one does), so a flattened call would fail inside
             # Codex mid-turn instead of here. Refused up front, with the flag that removes these tools.
-            raise WireError(f"namespace tool {t.get('name')!r} (ChatGPT apps) cannot be bridged; "
+            raise WireError(f"namespace tool {anthropic_wire.shown_name(t.get('name'))} (ChatGPT apps) cannot be bridged; "
                             "run Codex with --disable apps")
         else:
             dropped.append(str(kind))
     if dropped:
         logger.warning("responses wire: dropped %d non-function tool(s) the cortados model cannot serve: %s",
-                       len(dropped), ", ".join(sorted(set(dropped))))
+                       len(dropped), ", ".join(sorted({anthropic_wire.shown_name(k) for k in dropped})))
     return out
 
 

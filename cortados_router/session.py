@@ -135,12 +135,14 @@ def custom_headers(run_id: str | None = None, office_headers=None) -> str:
 # is only safe when the MCP catalog is BOUNDED: the full connector catalog measured ~290k tokens across 495 tools
 # (README "Connectors"), over the 200k routes and the 128k local lane, and routing.request_fit counts the whole request,
 # so eager schemas there would exclude routes or refuse the session outright. So the flag is set only for
-#   - child tasks (`--eager-tools`, passed by child_tasks.start only): their connectors are opt-in, filtered and checked
-#     against child_tasks.EAGER_SCHEMA_BUDGET_TOKENS before launch;
+#   - child tasks (`--eager-tools`, passed by child_tasks.start only): with connectors only those load (plus
+#     `--strict-mcp-config`, so not the host's own MCP servers); without, the host's own servers load;
 #   - whole sessions whose MCP set is explicitly filtered: `--strict-mcp-config` among the claude args (only the
 #     `--mcp-config` servers given load, so the user chose and can see the catalog).
-# Any other whole session keeps Claude Code's deferred loading; a tool it loads later still cannot be called through
-# the provider (the provider's warning says so) until provider-side tool-set growth lands (#121).
+# Either way the provider bounds what arrives: every request's tools are checked against its tool-schema budget on
+# their real serialized size (provider/server.py TOOL_SCHEMA_BUDGET_BYTES), and an oversized set is refused naming its
+# largest namespaces. Any other whole session keeps Claude Code's deferred loading; a tool it loads later still cannot
+# be called through the provider (the provider's warning says so) until provider-side tool-set growth lands (#121).
 TOOL_SEARCH_OFF = {"ENABLE_TOOL_SEARCH": "false"}
 STRICT_MCP_FLAG = "--strict-mcp-config"
 

@@ -42,6 +42,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from cortados_router.provider.anthropic_wire import shown_name
 from cortados_router.provider.bridge import SCRATCH_NOTE, SCRATCH_REFUSED, BridgeError, names_scratch, write_line
 from cortados_router.provider.codex_isolation import (BENIGN_MCP_TOOLS, DEFAULT_EXEC_YIELD_MS, LEAKED_ITEMS,
                                                        REFUSED_EFFORTS, V1_APPROVALS, V2_APPROVALS, check_account,
@@ -302,7 +303,8 @@ class CodexSession:
             return BridgeError(f"codex app-server refused a dynamic tool name this bridge cannot match to any of the "
                                f"client's declared tools (none of them is known to be wrong): {msg}")
         client = self._aliases.get(wire, wire)
-        shown = f"{client!r}" + (f" (declared to Codex as {wire!r})" if client != wire else "")
+        # The names as shown_name renders them (#117): a client's tool name never enters this message raw.
+        shown = f"'{shown_name(client)}'" + (f" (declared to Codex as '{shown_name(wire)}')" if client != wire else "")
         return BridgeError(f"codex app-server refused client tool {shown}: {msg}")
 
     def _read_stdout(self) -> None:

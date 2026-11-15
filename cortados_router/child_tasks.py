@@ -768,34 +768,21 @@ def _max_s() -> int:
 
 
 MAX_CONNECTORS = 32                 # a selection longer than this is not a selection
-# The eager-catalog bound (#117). A child runs with tool search off (session.TOOL_SEARCH_OFF), so every tool schema of
-# its connectors is in every request, and routing.request_fit counts all of it. 40k tokens leaves a child on the 128k
-# local lane ~88k for its system prompt, built-in tools, the user's own Claude Code MCP servers and the work itself; a
-# selection over it is refused at start_task, never silently cut down.
-EAGER_SCHEMA_BUDGET_TOKENS = 40_000
-# Why a tool COUNT and not the schema size: start_task cannot list a connector's tools at launch. The connectors are
-# HTTP MCP servers behind OAuth whose tokens are in the EXECUTION host's login Keychain (readable only from its gui
-# session; the host may be another machine), and listing them would open the user's connectors before the task is
-# even accepted. So each server entry in the connectors MCP config declares its tool count under TOOL_COUNT_KEY
-# (stripped from the child's --mcp-config), and the size is estimated from the measured average: ~290k tokens across
-# 495 MCP tools, 2026-11-02 (README "Connectors"), i.e. ~586 tokens a tool, rounded up.
-TOKENS_PER_TOOL = 600
-MAX_EAGER_TOOLS = EAGER_SCHEMA_BUDGET_TOKENS // TOKENS_PER_TOOL      # 66 tools
-TOOL_COUNT_KEY = "cortadosTools"
-
-
-def _tool_count(server) -> int | None:
-    n = server.get(TOOL_COUNT_KEY) if isinstance(server, dict) else None
-    return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
+# Round 2 of #117 asked each connectors.mcp.json entry for a "cortadosTools" count. Round 3 dropped it: a count bounds
+# nothing (descriptions vary without limit) and the host's own MCP servers were outside it. The provider now enforces
+# the real serialized size of every request's tools (provider/server.py TOOL_SCHEMA_BUDGET_BYTES). An entry that still
+# carries the key is accepted; the key is removed from the child's --mcp-config, where it means nothing to Claude Code.
+LEGACY_COUNT_KEY = "cortadosTools"
 
 
 def select_connectors(names) -> dict | None:
     """The connector servers a child gets: None for none (the default), else {name: server config} for exactly the
-    named servers in the connectors MCP config, without our TOOL_COUNT_KEY. Why opt-in: every connected server's tool
-    schemas go up front in every request (children run with tool search off, #117), and the full set measured ~1.1 MB
-    (~290k tokens, 495 MCP tools) on 2026-11-02, over a 200k model's input ceiling: the provider refused every such
-    child with 413 before it ran. The selection must declare its tool counts and stay within MAX_EAGER_TOOLS
-    (EAGER_SCHEMA_BUDGET_TOKENS); otherwise it is refused, naming the connectors and the size."""
+    named servers in the connectors MCP config (without a LEGACY_COUNT_KEY). Why opt-in: every connected server's
+    tool schemas go up front in every request (children run with tool search off, #117), and the full set measured
+    ~1.1 MB (~290k tokens, 495 MCP tools) on 2026-11-02, over a 200k model's input ceiling: the provider refused every
+    such child with 413 before it ran. The size of a selection is not checked here (its tools cannot be listed at
+    launch); the provider's tool-schema budget refuses an oversized one on the child's first request, naming the
+    largest namespaces."""
     if names is None or names == []:
         return None
     if not isinstance(names, list) or len(names) > MAX_CONNECTORS or not all(isinstance(n, str) and n for n in names):
@@ -813,22 +800,8 @@ def select_connectors(names) -> dict | None:
     if unknown:
         raise TaskError(f"unknown connector(s) {', '.join(unknown)}; available: {', '.join(sorted(servers)) or 'none'}")
     chosen = list(dict.fromkeys(names))
-    counts = {n: _tool_count(servers[n]) for n in chosen}
-    undeclared = [n for n in chosen if counts[n] is None]
-    if undeclared:
-        # An unknown size is not a bounded one: the child would load every schema up front (#117).
-        raise TaskError(f"connector(s) {', '.join(undeclared)} declare no tool count: add \"{TOOL_COUNT_KEY}\": <number "
-                        f"of tools> to each entry in {path} (the tool list cannot be read at launch; the child loads "
-                        f"every tool schema up front, bounded at {MAX_EAGER_TOOLS} tools ≈"
-                        f"{EAGER_SCHEMA_BUDGET_TOKENS // 1000}k tokens)")
-    total = sum(counts.values())
-    if total > MAX_EAGER_TOOLS:
-        parts = ", ".join(f"{n} ({counts[n]} tools)" for n in chosen)
-        raise TaskError(f"connectors {parts}: {total} tools ≈{total * TOKENS_PER_TOOL // 1000}k tokens of tool schemas, "
-                        f"over the child budget of {MAX_EAGER_TOOLS} tools ≈{EAGER_SCHEMA_BUDGET_TOKENS // 1000}k tokens "
-                        f"(a child loads every schema up front and must fit the 128k local lane with room for its "
-                        f"work); start the task with fewer connectors")
-    return {n: {k: v for k, v in servers[n].items() if k != TOOL_COUNT_KEY} for n in chosen}
+    return {n: ({k: v for k, v in servers[n].items() if k != LEGACY_COUNT_KEY} if isinstance(servers[n], dict)
+                else servers[n]) for n in chosen}
 
 
 def office_tags(cwd, title=None, session_tag=None) -> dict:
@@ -1335,7 +1308,8 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
     # native subagents are still routed by S1 (CLAUDE_CODE_SUBAGENT_MODEL).
     launch += ["--no-delegate-directive", "--no-gate"]
     # Tool search off (#117): the child's opening request declares every MCP tool, so the provider's backend has them.
-    # Bounded: connectors are opt-in, filtered and within MAX_EAGER_TOOLS (select_connectors, above).
+    # Bounded by the provider's tool-schema budget (server.TOOL_SCHEMA_BUDGET_BYTES, on the real serialized size),
+    # which also covers the host's own MCP servers a child without connectors inherits.
     launch.append("--eager-tools")
     # --permission-prompts none: nobody is there to answer, so anything that would prompt is denied deterministically
     # (as s1/outcome/agents.py runs its headless claude).
@@ -1356,9 +1330,14 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
         conn = os.path.join(d, "session-connectors.json")
         with open(os.open(conn, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as f:
             json.dump({"mcpServers": selected}, f)
-        extra += ["--mcp-config", conn]
+        # --strict-mcp-config (#117): only the selected connectors load, not also the execution host's own Claude Code
+        # MCP servers (user, project and plugin ones), which would add schemas the selection never chose. So a child
+        # with connectors has no host MCP server. Nothing it needs is lost: cortados-route is the one server the
+        # router itself registers, and its tools are refused inside a child (CHILD_DIRECTIVE), so it is not added.
+        extra += ["--strict-mcp-config", "--mcp-config", conn]
     else:
-        conn_note = "no connectors selected; the child has the user's Claude Code MCP servers only\n"
+        conn_note = ("no connectors selected; the child has the user's Claude Code MCP servers only (bounded by the "
+                     "provider's tool-schema budget)\n")
     base = {k: v for k, v in os.environ.items() if k not in STRIP_ENV}
     try:
         _args, env, cmd = session.prepare(launch + ["--"] + extra, base, MANAGED_DIRS)

@@ -14,6 +14,20 @@ from typing import Any, Iterator
 
 MODEL_ID = "cortados"
 
+# How the provider shows a client-supplied tool name in text of its OWN (an error, a log line, a note to the backend
+# model), #117 review round 2: names are only checked as valid Unicode on the wire (check_tool_name), so a name can
+# carry newlines or a sentence ("Ignore prior instructions ...") that would then read as the provider speaking.
+# A name is shown only if it fits this identifier grammar (every Claude Code, MCP and Codex tool name seen does);
+# anything else is shown as INVALID_NAME. fullmatch, not ^...$: `$` also matches before a trailing newline.
+SHOWN_NAME = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+INVALID_NAME = "<invalid name>"
+
+
+def shown_name(name: Any) -> str:
+    """`name` as provider-authored text may show it: itself if it is a plain identifier (SHOWN_NAME), else
+    INVALID_NAME. The only way a client's tool name enters the provider's own messages."""
+    return name if isinstance(name, str) and SHOWN_NAME.fullmatch(name) else INVALID_NAME
+
 
 # Anthropic server tools: the Messages API itself executes them (web search, web fetch, code execution) and answers with
 # server_tool_use / *_tool_result blocks. This endpoint's backends are a headless CLI or Codex serving only the client's
@@ -256,8 +270,8 @@ def check_tool_name(name: str, what: str = "tool name") -> str:
     try:
         name.encode("utf-8")
     except UnicodeEncodeError:
-        # !a escapes every non-ASCII code point, so the message itself can always be encoded (é and a surrogate alike).
-        raise WireError(f"{what} {name!a} is not valid Unicode "
+        # Never the name itself (shown_name: a lone surrogate is never an identifier, so this says <invalid name>).
+        raise WireError(f"{what} {shown_name(name)} is not valid Unicode "
                         "(it contains a lone surrogate)") from None
     return name
 

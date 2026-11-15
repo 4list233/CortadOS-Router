@@ -122,7 +122,7 @@ class SessionTests(unittest.TestCase):
     def test_tool_search_off_only_for_a_bounded_mcp_catalog(self):
         # #117: tool search off puts every MCP tool in the opening request (the provider's backend never gains a
         # tool later), which only fits when the catalog is bounded: an explicitly filtered whole session
-        # (--strict-mcp-config) or a child task (--eager-tools, after child_tasks' connector budget check).
+        # (--strict-mcp-config) or a child task (--eager-tools; the provider's tool-schema budget bounds both).
         def settings_env(cmd):
             with open(cmd[cmd.index("--settings") + 1]) as src:
                 return json.load(src)["env"]
