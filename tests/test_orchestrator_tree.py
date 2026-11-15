@@ -537,6 +537,8 @@ class SessionEndpointTest(tl.EndpointHarness):
                                            "CORTADOS_EXEC_HOSTS_FILE": os.path.join(self.home, "absent.json")})
         env.start()
         self.addCleanup(env.stop)
+        # the registry was built before the home was patched: its bindings file goes in this test's own home
+        self.reg.live = live.HeartbeatBoard(path=Path(self.home) / live.BINDINGS_FILE)
         cf = Path(self.scratch) / "clients.json"
         cf.write_text(json.dumps({"version": 1, "clients": [
             {"name": "pane", "token_sha256": clients.token_digest(SESSION_TOKEN), "scopes": ["live:session"]},
@@ -691,6 +693,41 @@ class SessionEndpointTest(tl.EndpointHarness):
         bad = {**body, "host": "studio"}
         self.assertEqual(self.request("POST", live.HEARTBEAT_PATH, tl.TOKEN, body=bad)[0], 400)
 
+    def test_a_heartbeat_task_joins_its_run_only_through_the_origin_the_provider_saw(self):
+        """Round 4 over the real endpoint: the Pro reports PRO_RUN under MINE; its run's routed request reaches the
+        provider. With x-cortados-origin: MINE (as the child runner sends it) the conversation and its tokens join the
+        task; a run that carried no origin, or another, joins nothing, whatever the heartbeat says."""
+        import time
+        from tests.test_provider import READ_TOOL
+        now = time.time()
+        runs = {PRO_RUN: MINE, PRO_THEIRS: None, PRO_NESTED: OTHER}
+        body = {"host": "pro", "ttl_s": 180, "jobs": [], "tasks": {"items": [
+            {"task_id": tid, "host": "pro", "state": "running", "title": "hb " + tid[-4:], "started_at": now - 60,
+             "origin_session": MINE, "session": "cccccccccccccc0b"} for tid in runs]}}
+        code, raw, _ = self.request("POST", live.HEARTBEAT_PATH, tl.TOKEN, body=body)
+        self.assertEqual(code, 200, raw)
+        for tid, origin in runs.items():
+            h = {"x-cortados-run-id": tid, "x-cortados-session": "cccccccccccccc0b"}
+            if origin:
+                h["x-cortados-origin"] = origin
+            code, raw, _ = self.request("POST", "/v1/messages", tl.TOKEN, headers=h, body={
+                "model": "cortados", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "use tool x"}]})
+            self.assertEqual(code, 200, raw)
+        self.assertEqual({k: v for k, v in self.reg.runs.run_origins().items() if k in runs},
+                         {PRO_RUN: MINE, PRO_NESTED: OTHER})
+        code, raw, _ = self.request("GET", live.SESSION_PATH + "?session=" + MINE, SESSION_TOKEN)
+        self.assertEqual(code, 200, raw)
+        tasks = {t["task_id"]: t for t in json.loads(raw)["orchestrators"]["items"][0]["tasks"]}
+        self.assertEqual(set(tasks), set(runs))
+        self.assertEqual([s["role"] for s in tasks[PRO_RUN]["sub_sessions"]], ["main"])
+        for tid in (PRO_THEIRS, PRO_NESTED):
+            self.assertEqual((tasks[tid]["sub_sessions"], tasks[tid]["tokens"], tasks[tid]["provider"]), ([], None, None))
+        for bad in ("x-cortados-origin", "_origin", "bind_origin", "cccccccccccccc0b"):
+            self.assertNotIn(bad, raw, bad)
+        # the conversation list itself never publishes the observed origin either (owner's fleet view)
+        fleet = self.request("GET", live.LIVE_PATH, tl.TOKEN)[1]
+        self.assertEqual([c.get("origin") for c in json.loads(fleet)["conversations"]["items"] if "origin" in c], [])
+
 
 PRO_RUN = "t20261111094000-f0000001"        # MINE's, run with host "here" on the Pro: only in the Pro's heartbeat
 PRO_THEIRS = "t20261111094100-f0000002"     # OTHER's, also on the Pro
@@ -774,9 +811,10 @@ class HostTasksTest(unittest.TestCase):
         self.assertEqual(g["attention"], 3)                        # AWAY, PRO_RUN, and PRO_NESTED under ROOT
 
     def test_a_pro_tasks_routed_conversations_are_its_sub_sessions(self):
+        # the provider saw the run's requests carry x-cortados-origin: MINE (the child runner sends it)
         conv = {"key": "r:" + PRO_RUN, "ref": "c-000000000030", "provider": "claude", "lane": "claude#a",
                 "model": "claude-haiku-5", "opened_at": NOW - 390, "last_used": NOW - 2, "busy": True,
-                "session": MINE}
+                "session": MINE, "origin": MINE}
         mine = view(MINE, heartbeats=beats_with(), conversations=lambda: tagged(backend()) + [conv])
         pro = next(t for t in mine["orchestrators"]["items"][0]["tasks"] if t["task_id"] == PRO_RUN)
         self.assertEqual([(s["ref"], s["role"], s["status"]) for s in pro["sub_sessions"]],
@@ -833,19 +871,20 @@ VICTIM_CHILD = "cccccccccccccc0b"           # its child's own Office tag (one ra
 VICTIM_SECRETS = ("Victim private title", "VictimSecretTool", "c-0000000000bb", "claude-opus-9")
 
 
-def victim_board():
-    """board() plus VICTIM's routed run: a worker with its child's own tag, OTHER's private title and current tool."""
+def victim_board(origin=OTHER):
+    """board() plus VICTIM's routed run: a worker with its child's own tag, OTHER's private title and current tool, and
+    the origin the provider saw on its requests (x-cortados-origin, sent by the child runner): OTHER."""
     b = board()
     tags = {"session": VICTIM_CHILD, "title": "Victim private title"}
     b.turn_start("r:" + VICTIM, tags, run_id=VICTIM, provider="claude", lane="claude#a", model="claude-opus-9",
-                 now=NOW - 100)
+                 now=NOW - 100, origin=origin)
     b.turn_end("r:" + VICTIM, tags, status="working", tool="VictimSecretTool", now=NOW - 5)
     return b
 
 
 VICTIM_CONV = {"key": "r:" + VICTIM, "ref": "c-0000000000bb", "provider": "claude", "lane": "claude#a",
                "model": "claude-opus-9", "opened_at": NOW - 90, "last_used": NOW - 2, "busy": True,
-               "session": VICTIM_CHILD, "title": "Victim private title",
+               "session": VICTIM_CHILD, "title": "Victim private title", "origin": OTHER,
                "tokens": {"input": 5, "output": 5, "cache_read": 0, "cache_write": 0}}
 
 
@@ -857,11 +896,14 @@ def claim(board_, host, origin, at, **extra):
     return board_.post(hb, at)
 
 
-def victim_view(session, beats, **over):
-    b = victim_board()
+def victim_view(session, beats, origin=OTHER, **over):
+    """The view with VICTIM's run as the provider recorded it: every record of it observed with `origin` (None: the
+    run's requests carried no x-cortados-origin, a child runner from before round 4)."""
+    b = victim_board(origin)
     args = dict(heartbeats=beats, office_view=lambda ev: b.view(ev, now=NOW, uncapped=True),
-                conversations=lambda: tagged(backend()) + [VICTIM_CONV], run_tokens=lambda: {
-                    VICTIM: {"input": 777, "output": 1, "cache_read": 0, "cache_write": 0}})
+                conversations=lambda: tagged(backend()) + [{**VICTIM_CONV, "origin": origin}], run_tokens=lambda: {
+                    VICTIM: {"input": 777, "output": 1, "cache_read": 0, "cache_write": 0}},
+                run_origins=lambda: {VICTIM: origin} if origin else {})
     args.update(over)
     v = view(session, **args)
     return live.session_view(v, session) if session else v
@@ -869,8 +911,8 @@ def victim_view(session, beats, **over):
 
 class HostBindingTest(unittest.TestCase):
     """Review round 3, P1: a task id's host and origin are bound once. A heartbeat from another host (or the same host
-    with another origin) cannot take over a task id, and the run's Office worker, sub-sessions and tokens join a
-    heartbeat's task only when they carry a tag the task is bound to."""
+    with another origin) cannot take over a task id, and (round 4) the run's Office worker, sub-sessions and tokens
+    join a heartbeat's task only when the provider itself saw the run's requests carry the task's bound origin."""
 
     def test_the_reviewers_repro_a_newer_heartbeat_cannot_take_another_hosts_task(self):
         hbs = live.HeartbeatBoard()
@@ -957,43 +999,236 @@ class HostBindingTest(unittest.TestCase):
             mine = [t for t in groups(v)[MINE]["tasks"] if t["task_id"] == AWAY]
             self.assertEqual([(t["state"], t["host"]) for t in mine], [("elsewhere", "studio")], host)
 
-    def test_a_conversation_of_the_run_with_a_foreign_tag_is_not_a_sub_session(self):
+    def test_a_conversation_of_the_run_with_another_observed_origin_is_not_a_sub_session(self):
         hbs = live.HeartbeatBoard()
         claim(hbs, "pro", OTHER, NOW - 10, session=VICTIM_CHILD)
-        stray = {**VICTIM_CONV, "ref": "c-0000000000cc", "session": "eeeeeeeeeeeeeeee"}
+        stray = {**VICTIM_CONV, "ref": "c-0000000000cc", "origin": MINE}
+        bare = {**VICTIM_CONV, "ref": "c-0000000000dd", "origin": None}
         v = victim_view(OTHER, lambda: hbs.snapshot(NOW),
-                        conversations=lambda: tagged(backend()) + [VICTIM_CONV, stray])
+                        conversations=lambda: tagged(backend()) + [VICTIM_CONV, stray, bare])
         t = next(t for t in v["orchestrators"]["items"][0]["tasks"] if t["task_id"] == VICTIM)
         self.assertEqual([s["ref"] for s in t["sub_sessions"]], ["c-0000000000bb"])
-        self.assertNotIn('"_session"', json.dumps(v))
-        self.assertNotIn(VICTIM_CHILD, json.dumps(v))           # compared, never published
+        for bad in ('"_origin"', '"_session"', '"bind_origin"', VICTIM_CHILD):
+            self.assertNotIn(bad, json.dumps(v), bad)            # compared, never published
 
-    def test_a_sender_update_may_add_the_child_tag_once_never_change_it(self):
-        # the Pro's sender predates the child tag, then is updated: the same claim, now with the tag, is not a conflict
+    def test_the_child_tag_is_no_part_of_the_claim(self):
+        # round 4: a heartbeat's child tag is the reporting host's word: neither a key nor part of the binding
         hbs = live.HeartbeatBoard()
         claim(hbs, "pro", OTHER, NOW - 40)
         self.assertNotIn("task_conflicts", claim(hbs, "pro", OTHER, NOW - 30, session=VICTIM_CHILD))
-        self.assertEqual(claim(hbs, "pro", OTHER, NOW - 20, session="dddddddddddddddd")["task_conflicts"], 1)
-        # the dropped report replaced the Pro's last beat: the id is off the board until the Pro reports it again (only
-        # the bound host's own beat can do that)
-        self.assertNotIn(VICTIM, json.dumps(victim_view(OTHER, lambda: hbs.snapshot(NOW))))
-        claim(hbs, "pro", OTHER, NOW - 10, session=VICTIM_CHILD)
+        self.assertNotIn("task_conflicts", claim(hbs, "pro", OTHER, NOW - 20, session="dddddddddddddddd"))
+        self.assertNotIn("session", hbs.snapshot(NOW)["pro"]["tasks"]["items"][0])   # checked, then dropped
         t = next(t for t in victim_view(OTHER, lambda: hbs.snapshot(NOW))["orchestrators"]["items"][0]["tasks"]
                  if t["task_id"] == VICTIM)
         self.assertEqual(t["tool"], "VictimSecretTool")
 
-    def test_the_bindings_are_bounded(self):
+
+def post_ids(board_, host, ids_, at, origin=None):
+    hb, bad = live.validate_heartbeat({"host": host, "jobs": [], "tasks": {"items": [
+        {"task_id": t, "state": "running", "started_at": NOW - 100, **({"origin_session": origin} if origin else {})}
+        for t in ids_]}}, NOW)
+    assert bad is None, bad
+    return board_.post(hb, at)
+
+
+class ProviderObservedJoinTest(unittest.TestCase):
+    """Review round 4: a join key is something the provider observed itself (the run's x-cortados-origin on its own
+    requests), never something a heartbeat supplied; ownership is checked against every first-hand record before any
+    session filtering; the bindings survive a restart and a full table refuses rather than evicts."""
+
+    def test_the_reviewers_p1_repro_a_heartbeat_supplied_child_tag_joins_nothing(self):
+        # claim(h, "studio", MINE, NOW-30, session=VICTIM_CHILD): the forger knows VICTIM's id AND its child tag
+        hbs = live.HeartbeatBoard()
+        claim(hbs, "studio", MINE, NOW - 30, session=VICTIM_CHILD)
+        mine = victim_view(MINE, lambda: hbs.snapshot(NOW))
+        t = next(t for t in mine["orchestrators"]["items"][0]["tasks"] if t["task_id"] == VICTIM)
+        self.assertEqual((t["title"], t["tool"], t["provider"], t["model"], t["sub_sessions"], t["tokens"]),
+                         (None, None, None, None, [], None))
+        raw = json.dumps(mine)
+        for bad in VICTIM_SECRETS + ("777",):
+            self.assertNotIn(bad, raw, bad)
+
+    def test_a_provider_observed_origin_joins_the_run(self):
+        hbs = live.HeartbeatBoard()
+        claim(hbs, "pro", OTHER, NOW - 30)                     # no child tag at all: the provider's record suffices
+        t = next(t for t in victim_view(OTHER, lambda: hbs.snapshot(NOW))["orchestrators"]["items"][0]["tasks"]
+                 if t["task_id"] == VICTIM)
+        self.assertEqual((t["title"], t["tool"], t["provider"], t["model"], [s["ref"] for s in t["sub_sessions"]],
+                          t["tokens"]["input"]),
+                         ("Victim private title", "VictimSecretTool", "claude", "claude-opus-9", ["c-0000000000bb"], 777))
+
+    def test_a_heartbeat_only_task_never_gets_joined_data(self):
+        """The run's requests carried no x-cortados-origin (a runner from before round 4): the heartbeat's own fields
+        only, however exactly the entry names the run's child tag and the right origin."""
+        hbs = live.HeartbeatBoard()
+        hb, _ = live.validate_heartbeat({"host": "pro", "jobs": [], "tasks": {"items": [
+            {"task_id": VICTIM, "state": "running", "started_at": NOW - 100, "origin_session": OTHER,
+             "session": VICTIM_CHILD, "title": "From the heartbeat", "model": "claude-haiku-5"}]}}, NOW)
+        hbs.post(hb, NOW - 20)
+        v = victim_view(OTHER, lambda: hbs.snapshot(NOW), origin=None)
+        t = next(t for t in v["orchestrators"]["items"][0]["tasks"] if t["task_id"] == VICTIM)
+        self.assertEqual((t["title"], t["model"], t["tool"], t["provider"], t["sub_sessions"], t["tokens"]),
+                         ("From the heartbeat", "claude-haiku-5", None, None, [], None))
+        for bad in VICTIM_SECRETS:
+            self.assertNotIn(bad, json.dumps(v), bad)
+        # a task with no origin of its own (inherited through a parent the heartbeat names) joins nothing either
+        hbs = live.HeartbeatBoard()
+        claim(hbs, "pro", None, NOW - 20, parent_task_id=ROOT)
+        t = next(t for t in ids_nodes(groups(victim_view(None, lambda: hbs.snapshot(NOW)))[MINE])
+                 if t["task_id"] == VICTIM)
+        self.assertEqual((t["title"], t["tool"], t["sub_sessions"], t["tokens"]), (None, None, [], None))
+
+    def test_a_run_seen_with_two_origins_joins_nothing(self):
+        self.assertEqual(live.office.note_origin(None, OTHER), OTHER)
+        self.assertEqual(live.office.note_origin(OTHER, None), OTHER)
+        self.assertEqual(live.office.note_origin(OTHER, MINE), live.office.ORIGIN_CONFLICT)
+        self.assertEqual(live.office.note_origin(live.office.ORIGIN_CONFLICT, OTHER), live.office.ORIGIN_CONFLICT)
+        b = victim_board()
+        b.turn_start("r:" + VICTIM, {}, run_id=VICTIM, provider="claude", lane=None, model=None, now=NOW - 4,
+                     origin=MINE)
+        hbs = live.HeartbeatBoard()
+        claim(hbs, "pro", OTHER, NOW - 20)
+        for who in (OTHER, MINE):
+            v = victim_view(who, lambda: hbs.snapshot(NOW), office_view=lambda ev: b.view(ev, now=NOW, uncapped=True),
+                            conversations=lambda: tagged(backend()) + [{**VICTIM_CONV, "origin": ""}],
+                            run_origins=lambda: {VICTIM: ""})
+            for bad in VICTIM_SECRETS + ("777",):
+                self.assertNotIn(bad, json.dumps(v), (who, bad))
+
+    def test_the_reviewers_p2_repro_another_sessions_stub_rejects_a_forgery_in_every_view(self):
+        """AWAY is MINE's start onto the Studio (a stub on this machine). The Pro forges it under OTHER. The session
+        endpoint reads no fleet scan and only OTHER's own index, so round 3 accepted it in OTHER's view."""
+        stubs = [{"task_id": AWAY, "host": "studio", "created_at": NOW - 30, "origin_session": MINE,
+                  "origin_project": "CortadOS-Router"}]
+        hbs = live.HeartbeatBoard()
+        hb, _ = live.validate_heartbeat({"host": "pro", "jobs": [], "tasks": {"items": [
+            {"task_id": AWAY, "state": "running", "title": "forged", "started_at": NOW - 20,
+             "origin_session": OTHER}]}}, NOW)
+        hbs.post(hb, NOW - 5)
+        lookups = []
+
+        def by_id(ids_):
+            lookups.append(list(ids_))
+            return [x for x in stubs if x["task_id"] in ids_]
+        for session in (OTHER, None):
+            v = view(session, heartbeats=lambda: hbs.snapshot(NOW), remote_stubs=None if session else lambda: stubs,
+                     session_stubs=own_stubs(lambda: stubs), stubs_by_id=by_id)
+            self.assertNotIn("forged", json.dumps(v), session)
+            if session:
+                self.assertNotIn(AWAY, json.dumps(v), session)
+            else:                                   # the fleet: MINE's own stub, never under OTHER
+                self.assertNotIn(AWAY, ids(groups(v)[OTHER]))
+                self.assertEqual([t["state"] for t in groups(v)[MINE]["tasks"] if t["task_id"] == AWAY], ["elsewhere"])
+        self.assertEqual(lookups, [[AWAY]])         # the fleet view read the stub in its scan: no extra read
+        self.assertEqual(view(heartbeats=lambda: hbs.snapshot(NOW), remote_stubs=lambda: stubs,
+                              stubs_by_id=by_id)["orchestrators"]["conflicts"], 1)
+        # the same over real stub files: child_tasks.remote_stubs_by_id reads exactly the claimed ids' stubs
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        child_tasks._write_stub(d, AWAY, "studio", {"origin_session": MINE})
+        with mock.patch.object(child_tasks, "tasks_dir", lambda: d):
+            self.assertEqual([(x["task_id"], x["host"], x["origin_session"])
+                              for x in child_tasks.remote_stubs_by_id([AWAY, PRO_RUN, "../x"])],
+                             [(AWAY, "studio", MINE)])
+            v = view(OTHER, heartbeats=lambda: hbs.snapshot(NOW), remote_stubs=None,
+                     session_stubs=lambda tag: child_tasks.StubList(), stubs_by_id=child_tasks.remote_stubs_by_id)
+            self.assertNotIn(AWAY, json.dumps(v))
+            # an unreadable stub: no report of that id is trusted, and the cause is not this session's error
+            Path(d, AWAY, child_tasks.REMOTE_STUB).write_text("{not json")
+            self.assertEqual(child_tasks.remote_stubs_by_id([AWAY]), [{"task_id": AWAY, "unreadable": True}])
+            v = view(OTHER, heartbeats=lambda: hbs.snapshot(NOW), remote_stubs=None,
+                     session_stubs=lambda tag: child_tasks.StubList(), stubs_by_id=child_tasks.remote_stubs_by_id)
+            self.assertNotIn(AWAY, json.dumps(v))
+
+    def test_a_failed_stub_lookup_trusts_no_claim_and_says_so(self):
+        def boom(ids_):
+            raise PermissionError("/private/tasks")
+        o = view(OTHER, heartbeats=beats_with(), remote_stubs=None, stubs_by_id=boom)["orchestrators"]
+        self.assertNotIn(PRO_THEIRS, json.dumps(o))
+        self.assertIn({"source": "task stubs", "error": "PermissionError"}, o["errors"])
+        self.assertEqual(o["status"], "partial")
+
+    def test_the_reviewers_restart_repro(self):
+        """VICTIM bound to Pro/OTHER, the provider restarts (a fresh board on the same file), the Studio posts first
+        claiming it under MINE: refused."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = Path(d, live.BINDINGS_FILE)
+        claim(live.HeartbeatBoard(path=path), "pro", OTHER, NOW - 60)
+        with mock.patch.object(live.time, "time", return_value=NOW):
+            fresh = live.HeartbeatBoard(path=path)               # the restart: loads the file
+        self.assertEqual(claim(fresh, "studio", MINE, NOW - 10, session=VICTIM_CHILD)["task_conflicts"], 1)
+        raw = json.dumps(victim_view(MINE, lambda: fresh.snapshot(NOW)))
+        for bad in (VICTIM,) + VICTIM_SECRETS:
+            self.assertNotIn(bad, raw, bad)
+        self.assertNotIn("task_conflicts", claim(fresh, "pro", OTHER, NOW - 5))   # the owner keeps reporting it
+
+    def test_bindings_persist_across_a_fresh_board(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = Path(d, "state", live.BINDINGS_FILE)
+        old, live_ = "t20261111094500-f0000101", "t20261111094500-f0000102"
+        b = live.HeartbeatBoard(path=path)
+        post_ids(b, "pro", [old], NOW - live.HEARTBEAT_KEEP_S + 100, origin=OTHER)
+        post_ids(b, "pro", [live_], NOW - 50, origin=MINE)
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(sorted(os.listdir(path.parent)), [live.BINDINGS_FILE])   # atomic: no temp file left
+        doc = json.loads(path.read_text())
+        self.assertEqual(doc["version"], live.BINDINGS_VERSION)
+        self.assertEqual({r[0]: r[1:4] for r in doc["bindings"]}, {old: ["pro", OTHER, None], live_: ["pro", MINE, None]})
+        self.assertNotIn("title", path.read_text())              # ids, hosts, origins, parents and times only
+        # a day later the first one has expired: a fresh board loads only the live one
+        with mock.patch.object(live.time, "time", return_value=NOW + 200):
+            fresh = live.HeartbeatBoard(path=path)
+        self.assertEqual(set(fresh._bindings), {live_})
+        self.assertEqual(fresh._bindings[live_]["bind"], ("pro", MINE, None))
+        self.assertEqual(fresh.errors(), [])
+        # an unreadable file: an empty table, said in the tree (never a failed start)
+        path.write_text("{oops")
+        broken = live.HeartbeatBoard(path=path)
+        self.assertEqual((broken._bindings, broken.errors()), ({}, [{"source": "task bindings", "error": "JSONDecodeError"}]))
+        o = view(binding_errors=broken.errors)["orchestrators"]
+        self.assertIn({"source": "task bindings", "error": "JSONDecodeError"}, o["errors"])
+        # entries that fail the rules are skipped, not trusted
+        path.write_text(json.dumps({"version": 1, "bindings": [
+            ["../etc", "pro", None, None, NOW], [live_, "Bad Host", None, None, NOW], [live_, "pro", "NOTHEX", None, NOW],
+            [old, "pro", OTHER, None, NOW - 10]]}))
+        with mock.patch.object(live.time, "time", return_value=NOW):
+            self.assertEqual(set(live.HeartbeatBoard(path=path)._bindings), {old})
+        # a save that fails keeps the table in memory and says so
+        ro = live.HeartbeatBoard(path=Path(d, "file-not-dir", live.BINDINGS_FILE))
+        Path(d, "file-not-dir").write_text("x")
+        post_ids(ro, "pro", [live_], NOW - 5, origin=MINE)
+        self.assertIn(live_, ro._bindings)
+        self.assertEqual([e["source"] for e in ro.errors()], ["task bindings"])
+
+    def test_a_full_table_refuses_new_ids_and_keeps_live_ones(self):
+        ids_ = [f"t20261111094500-f00000{i:02d}" for i in range(5)]
         hbs = live.HeartbeatBoard()
         with mock.patch.object(live, "TASK_BINDINGS_MAX", 3):
-            for i in range(5):
-                hb, _ = live.validate_heartbeat({"host": "pro", "jobs": [], "tasks": {"items": [
-                    {"task_id": f"t20261111094500-f00000{i:02d}", "state": "running", "started_at": NOW - 100}]}},
-                    NOW)
-                hbs.post(hb, NOW - 50 + i)
-        self.assertEqual(len(hbs._bindings), 3)
-        hbs.post(live.validate_heartbeat({"host": "pro", "jobs": [], "tasks": {"items": []}}, NOW)[0],
-                 NOW + live.HEARTBEAT_KEEP_S)
-        self.assertEqual(len(hbs._bindings), 0)                 # a binding not reported for a day expires
+            self.assertNotIn("task_conflicts", post_ids(hbs, "pro", ids_[:3], NOW - 50, origin=OTHER))
+            out = post_ids(hbs, "studio", ids_[3:], NOW - 40, origin=MINE)
+            self.assertEqual(out["task_conflicts"], 2)            # refused: no live binding was evicted
+            self.assertEqual(set(hbs._bindings), set(ids_[:3]))
+            self.assertEqual(hbs.snapshot(NOW)["studio"]["tasks"]["items"], [])
+            # the bound ids keep being reported by their owner
+            self.assertNotIn("task_conflicts", post_ids(hbs, "pro", ids_[:3], NOW - 30, origin=OTHER))
+            # nobody can take one over through the full table either
+            self.assertEqual(post_ids(hbs, "studio", ids_[:1], NOW - 20, origin=MINE)["task_conflicts"], 1)
+            self.assertEqual(view(heartbeats=lambda: hbs.snapshot(NOW))["orchestrators"]["conflicts"], 1)  # latest beats
+            # once expired (not reported for a day) they make room
+            out = post_ids(hbs, "studio", ids_[3:], NOW - 30 + live.HEARTBEAT_KEEP_S + 1, origin=MINE)
+            self.assertNotIn("task_conflicts", out)
+            self.assertEqual(set(hbs._bindings), set(ids_[3:]))
+
+
+def ids_nodes(node):
+    """Every task node in a node's subtree."""
+    out = []
+    for t in node.get("tasks") or []:
+        out.append(t)
+        out.extend(ids_nodes(t))
+    return out
 
 
 class LinkageTest(unittest.TestCase):

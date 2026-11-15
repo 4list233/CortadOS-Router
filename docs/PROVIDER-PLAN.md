@@ -852,8 +852,11 @@ the newest finished:
 Never the prompt, the cwd, a command or output: unknown keys are refused. The live view merges the entries into the
 orchestrator tree only (`live.heartbeat_rows`; the tasks section stays the provider host's log): the provider host's
 own log wins for a task id it also has; a heartbeat past its TTL shows its running or queued tasks as `unknown`
-("its host's heartbeat is stale"); a task routed through the provider gets its model, tool and sub-sessions from the
-run id as a local one does. The tree's `scope` is then `provider host and heartbeats`, with `task_hosts` naming the
+("its host's heartbeat is stale"); a task routed through the provider gets its model, tool, sub-sessions and tokens
+only when the provider itself saw the run's requests carry `x-cortados-origin` equal to the task's bound origin (the
+child runner sends it; never a heartbeat-supplied key, review round 4). Task ids are bound to (host, origin, parent)
+by the first report, against every stub and log row on this machine, and the bindings persist in
+`$CORTADOS_HOME/live-task-bindings.json` (docs/PULSE-PER-SESSION.md §9, with the threat note). The tree's `scope` is then `provider host and heartbeats`, with `task_hosts` naming the
 hosts whose heartbeat carried a block.
 
 A post replaces the host's previous one. Refusals: 401 without a token, 403 for a token without the scope, 413 over 48 KiB (24 KiB before the `tasks` block, 8 KiB before the `orchestrator` block)

@@ -1580,6 +1580,7 @@ class ChildTaskTests(ChildTaskBase):
         self.assertIn("x-cortados-task-title: draft README section", headers)
         self.assertIn("x-cortados-session: 3f9a1c2e9b7d4a10", headers)
         self.assertIn("x-cortados-project: work", headers)
+        self.assertFalse([h for h in headers if h.startswith("x-cortados-origin")])   # no orchestrator known: none
         ev = [e for e in _events() if e.get("task_id") == tid]
         self.assertEqual([(e["event"], e.get("title"), e.get("session"), e.get("project")) for e in ev],
                          [("started", "draft README section", "3f9a1c2e9b7d4a10", "work"),
@@ -1783,6 +1784,12 @@ class ChildTaskTests(ChildTaskBase):
         ev = [e for e in _events() if e.get("task_id") == child]
         self.assertEqual([(e["event"], e.get("origin_session"), e.get("origin_via"), e.get("parent_task_id"))
                           for e in ev], [("started", tag, "parent", parent), ("finished", tag, "parent", parent)])
+        # review round 4: the child's routed requests name its orchestrator (the inherited one here) to the provider,
+        # which records it as the run's owner: the live view's only join key for a task another host reports
+        with open(os.path.join(self.work, "fake-argv.json")) as f:
+            headers = json.load(f)["headers"].split("\n")
+        self.assertIn("x-cortados-origin: " + tag, headers)
+        self.assertIn("x-cortados-run-id: " + child, headers)
         meta = _load(os.path.join(ct.task_path(child), "meta.json"))
         self.assertEqual((meta["origin"]["origin_session"], meta["origin_via"]), (tag, "parent"))
         self.assertEqual(ct.parent_origin(ct.tasks_dir(), parent)["origin_session"], tag)

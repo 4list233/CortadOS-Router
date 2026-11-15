@@ -879,6 +879,7 @@ def clean_origin(origin) -> dict:
             "origin_project": ok(proj, _OFFICE_NAME_RE), "origin_device": ok(dev, _DEVICE_RE)}
 
 
+ORIGIN_HEADER = "x-cortados-origin"    # provider/office.ORIGIN_HEADER: the run's orchestrator, as the provider records it
 _OFFICE_HEADER_OF = {"session": "x-cortados-session", "project": "x-cortados-project", "device": "x-cortados-device",
                      "title": "x-cortados-task-title"}
 
@@ -1126,10 +1127,22 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     runner = None
     try:
+        org = clean_origin(origin)
+        via_parent = False
+        if org["origin_session"] is None and parent_id:
+            # No orchestrator of its own (a launching process with CORTADOS_PARENT_TASK_ID and no Claude Code session,
+            # a session without the Office salt): the parent's, so the task stays in its root orchestrator's tree.
+            inherited = parent_origin(root, parent_id)
+            if inherited:
+                org = {**org, **inherited}
+                via_parent = True
+        # Known before the launch: the child's routed requests carry it (x-cortados-origin), the provider's own
+        # record of which orchestrator the run belongs to (review round 4: the live view's join key).
         meta, env, cmd = _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file,
                                   start_red,
                                   chrome, max_s, exe, selected, login, office,
-                                  workspace=ws_spec, ws_root=target.root, host_name=target.name, launchd=launchd)
+                                  workspace=ws_spec, ws_root=target.root, host_name=target.name, launchd=launchd,
+                                  origin_tag=org["origin_session"])
         # Again with the child's launch env known: its credentials are the ones the export is checked against.
         launch_red = _start_redactor(red, env)
         _refuse_credentials(launch_red, caller_fields)
@@ -1138,14 +1151,8 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
         if meta.get("office"):
             meta["office"] = {k: launch_red.text(v) for k, v in meta["office"].items()}
         meta["task_preview"] = launch_red.text(task.strip())[:200]
-        org = clean_origin(origin)
-        if org["origin_session"] is None and parent_id:
-            # No orchestrator of its own (a launching process with CORTADOS_PARENT_TASK_ID and no Claude Code session,
-            # a session without the Office salt): the parent's, so the task stays in its root orchestrator's tree.
-            inherited = parent_origin(root, parent_id)
-            if inherited:
-                org = {**org, **inherited}
-                meta["origin_via"] = "parent"
+        if via_parent:
+            meta["origin_via"] = "parent"
         if any(org.values()):
             meta["origin"] = {k: launch_red.text(v) if v else v for k, v in org.items()}
         # For the run export (#91): the task that started this one (or why none is known); set before cmd.json's event
@@ -1348,8 +1355,10 @@ def _run_spec(cwd, max_s, meta, workspace=None, ws_root=None, launchd=False, chr
 
 
 def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file, red, chrome, max_s,
-             exe, selected=None, login=None, office=None, workspace=None, ws_root=None, host_name=None, launchd=False):
-    """Everything before the spawn: settings, prompt, cmd.json, meta.json. Returns (meta, env, cmd)."""
+             exe, selected=None, login=None, office=None, workspace=None, ws_root=None, host_name=None, launchd=False,
+             origin_tag=None):
+    """Everything before the spawn: settings, prompt, cmd.json, meta.json. Returns (meta, env, cmd). `origin_tag`: the
+    task's orchestrator (clean_origin's origin_session), sent as x-cortados-origin on the child's routed requests."""
     os.chmod(d, 0o700)                          # mkdir's mode is masked by umask; the launcher verifies exactly 0700
     if login:
         meta, env, cmd = _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe,
@@ -1360,6 +1369,8 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
         launch += ["--token-file", token_file]
     for k, v in (office or {}).items():         # validated by office_tags; session.py checks them again
         launch += ["--office-header", f"{_OFFICE_HEADER_OF[k]}: {v}"]
+    if isinstance(origin_tag, str) and ORIGIN_SESSION_RE.fullmatch(origin_tag):
+        launch += ["--office-header", f"{ORIGIN_HEADER}: {origin_tag}"]
     # Never the whole-session ORCHESTRATOR directive or its delegation gate, whatever the orchestrator: a child is the
     # delegate and does the work itself (CHILD_DIRECTIVE). A pinned orchestrator only pins the child's main model; its
     # native subagents are still routed by S1 (CLAUDE_CODE_SUBAGENT_MODEL).
@@ -2232,6 +2243,28 @@ def remote_stubs() -> list:
         try:
             rec = _stub(os.path.join(root, tid))
         except TaskError:
+            continue
+        if rec is not None:
+            out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at"),
+                        **clean_origin_meta(rec.get("origin"))})
+    return out
+
+
+def remote_stubs_by_id(task_ids) -> list:
+    """For the live view's ownership check (review round 4, P2): the remote stubs, if any, of exactly these task ids
+    (the ids other hosts' heartbeats report), as remote_stubs records. Each id is one stub read in its own task dir:
+    no listing, so the check sees every stub this machine wrote, not only the newest scanned or one session's index.
+    Bounded by the caller (the heartbeat board's ids). Read-only; an id with no stub (or no dir) is skipped, and one
+    whose stub exists but cannot be read is {"task_id", "unreadable": True}: the view then trusts no report of it."""
+    root = tasks_dir()
+    out = []
+    for tid in task_ids or ():
+        if not (isinstance(tid, str) and TASK_ID_RE.fullmatch(tid)):
+            continue
+        try:
+            rec = _stub(os.path.join(root, tid))
+        except TaskError:
+            out.append({"task_id": tid, "unreadable": True})
             continue
         if rec is not None:
             out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at"),

@@ -50,6 +50,16 @@ _HEADER_RULES: dict[str, re.Pattern] = {
     TITLE_HEADER: re.compile(r"[\x20-\x7e]{1,80}"),
 }
 TAG_FIELDS = {SESSION_HEADER: "session", PROJECT_HEADER: "project", DEVICE_HEADER: "device", TITLE_HEADER: "title"}
+# The orchestrator that started a child task (its origin tag: an Office session tag or a named origin such as
+# "grokbot", child_tasks.ORIGIN_SESSION_RE), sent by the child runner on every routed request of the run next to
+# x-cortados-run-id (review round 4). The provider records it per worker, per conversation and per run's tokens, and
+# the live view joins a heartbeat-reported task's run data only when the provider OBSERVED this origin on the run
+# (live.heartbeat_rows): a heartbeat's own fields are never a join key. Compared, never published. Read separately
+# from TAG_FIELDS (OfficeBoard.read_origin): it is no floor tag.
+ORIGIN_HEADER = "x-cortados-origin"
+_ORIGIN_RE = re.compile(r"[0-9a-f]{16,64}|grokbot")   # child_tasks.ORIGIN_SESSION_RE (a test keeps the two equal)
+# a run, worker or conversation that carried two different origins: matches no task (never a join key)
+ORIGIN_CONFLICT = ""
 # Heartbeat and view field rules. Model ids as the exclude header accepts them (server._EXCLUDE_MODEL_RE), capped at
 # 64; a lane key (claude#b, codex, local-studio); a tool name (Read, mcp__server__tool, mcp__claude-in-chrome__x).
 _MODEL_RE = re.compile(r"[A-Za-z0-9._/\[\]:-]{1,64}")
@@ -143,6 +153,17 @@ class OfficeBoard:
                 self.dropped.update(bad)
         return out
 
+    def read_origin(self, headers) -> str | None:
+        """The request's x-cortados-origin (ORIGIN_HEADER), or None; an invalid one is dropped and counted."""
+        raw = headers.get(ORIGIN_HEADER)
+        if raw is None:
+            return None
+        v = clean(raw, _ORIGIN_RE)
+        if v is None:
+            with self._lock:
+                self.dropped.update([ORIGIN_HEADER])
+        return v
+
     def _floor_locked(self, tags: dict[str, str], now: float) -> dict[str, Any] | None:
         s = tags.get("session")
         if not s:
@@ -176,7 +197,9 @@ class OfficeBoard:
         return None
 
     def turn_start(self, key: str | None, tags: dict[str, str], *, run_id: str | None, provider: str | None,
-                   lane: str | None, model: str | None, now: float | None = None) -> None:
+                   lane: str | None, model: str | None, now: float | None = None, origin: str | None = None) -> None:
+        """`origin`: the request's x-cortados-origin (read_origin), recorded on a run's worker as the provider saw it:
+        the first one seen, ORIGIN_CONFLICT once a request of the run names another (note_origin)."""
         if not key:
             return
         now = time.time() if now is None else now
@@ -200,6 +223,8 @@ class OfficeBoard:
                 w["title"] = tags["title"]
             if tags.get("session") and not w.get("session"):
                 w["session"] = tags["session"]
+            if origin is not None:
+                w["origin"] = note_origin(w.get("origin"), origin)
             self.workers[key] = w
             while len(self.workers) > MAX_WORKERS:
                 _, gone = self.workers.popitem(last=False)
@@ -332,8 +357,10 @@ class OfficeBoard:
             for w in eligible:
                 s = w.get("session")            # the worker's own tag, kept even when its floor was hidden or evicted
                 f = all_floors.get(s) or {}
+                # `origin`: the provider-observed x-cortados-origin of the run (live.heartbeat_rows compares it and
+                # never publishes it)
                 out["workers_all"].append({**_pub_worker(w), "session": s, "project": f.get("project"),
-                                           "device": f.get("device")})
+                                           "device": f.get("device"), "origin": w.get("origin")})
         return out
 
     def _expire_locked(self, now: float, keep: set[str] | frozenset = frozenset()) -> None:
@@ -446,6 +473,14 @@ def _orchestrator(hb: dict[str, Any] | None, main: dict[str, Any] | None) -> dic
         return {"model": main.get("model"), "status": "idle" if main.get("status") == "done" else main.get("status"),
                 "tool": main.get("tool"), "last_seen": _ts(main.get("updated")), "source": "routed"}
     return None
+
+
+def note_origin(prev: str | None, seen: str | None) -> str | None:
+    """A run's provider-observed origin after one more request: the first origin seen stays; a request naming another
+    makes it ORIGIN_CONFLICT for good (it then joins no task); a request without the header changes nothing."""
+    if seen is None or prev == seen:
+        return prev
+    return seen if prev is None else ORIGIN_CONFLICT
 
 
 def _pub_worker(w: dict[str, Any]) -> dict[str, Any]:

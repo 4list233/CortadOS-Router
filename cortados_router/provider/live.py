@@ -59,16 +59,21 @@ over HEARTBEAT_MAX_BYTES with 413. docs/PROVIDER-PLAN.md ("Live view") has the s
 """
 from __future__ import annotations
 
+import json
+import logging
 import math
 import os
 import re
 import threading
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Callable
 
 from cortados_router import child_tasks, router_db
 from cortados_router.provider import office, work_split
+
+logger = logging.getLogger("cortados.provider.live")
 
 VERSION = 1
 LIVE_PATH = "/v1/cortados/live"
@@ -100,11 +105,15 @@ HB_TASK_PHASES = ("waiting for the host's Chrome", "ended on its host; no end ev
 _HB_TASK_KEYS = {"task_id", "title", "state", "phase", "host", "lane", "model", "started_at", "ended_at", "workspace",
                  "browser", "origin_session", "origin_project", "origin_device", "origin_via", "parent_task_id",
                  "session"}
-# A task id's host and origin are bound once (HeartbeatBoard._bindings, review round 3 P1): the first host that reports
-# it owns it, with its origin, parent and Office tag (filled in once when its first report had none); a later claim
-# that differs is dropped and counted. Bounded: the
-# bindings last as long as the board keeps a heartbeat (HEARTBEAT_KEEP_S since the id was last reported), LRU past this.
+# A task id's host and origin are bound once (HeartbeatBoard._bindings, review rounds 3 and 4): the first host that
+# reports it owns it, with its origin and parent; a later claim that differs is dropped and counted. The bindings last
+# HEARTBEAT_KEEP_S (24 h, the heartbeat window) since the id was last reported and are kept in BINDINGS_FILE under
+# $CORTADOS_HOME, so a provider restart does not reopen them. At most TASK_BINDINGS_MAX: only expired ones are ever
+# evicted; a full table refuses a NEW id (counted as a conflict) rather than drop a live binding.
 TASK_BINDINGS_MAX = 4096
+BINDINGS_FILE = "live-task-bindings.json"
+BINDINGS_VERSION = 1
+BINDINGS_SAVE_SEEN_S = 3600.0   # a re-reported id's `seen` reaches the file at most hourly: the TTL may run 1 h short
 STALE_HB_PHASE = "its host's heartbeat is stale; state as last reported"
 HEARTBEAT_HOSTS_MAX = 16    # the fleet is three machines; LRU past this, configured hosts exempt (HeartbeatBoard)
 HEARTBEAT_KEEP_S = 24 * 3600.0
@@ -253,9 +262,9 @@ def validate_tasks(block: Any, host: str, now: float) -> tuple[dict[str, Any] | 
     start_task child that ran on THIS host (`host` must be the heartbeat's own: a host speaks for its own tasks only),
     every field re-checked by the rule the live view applies to its own log (tasks_section, _children). An entry
     whose newest time is outside the 24 h window is dropped, not refused: the sender filters by the same window, so
-    only clock skew puts one there. `session` is the child's own Office tag (its x-cortados-session, from its log): it
-    is never published, only compared, so the run's Office worker and conversations join the task only when they
-    carry the task's bound tags (heartbeat_rows)."""
+    only clock skew puts one there. `session` (the child's own Office tag, sent by senders since round 3) is checked and
+    then dropped: a heartbeat-supplied tag is never a join key (review round 4; heartbeat_rows joins on what the
+    provider itself observed)."""
     if not isinstance(block, dict) or set(block) - {"items", "truncated"}:
         return None, ""
     items = block.get("items", [])
@@ -282,9 +291,10 @@ def validate_tasks(block: Any, host: str, now: float) -> tuple[dict[str, Any] | 
             if t["phase"] not in HB_TASK_PHASES:
                 return None, where + ".phase"
             e["phase"] = t["phase"]
+        if t.get("session") is not None and office.clean(t["session"], office._HEADER_RULES[office.SESSION_HEADER]) is None:
+            return None, where + ".session"
         for k, rule in (("title", title_rule), ("lane", office._LANE_RE), ("model", office._MODEL_RE),
-                        ("workspace", _WS_STATE_RE), ("session", office._HEADER_RULES[office.SESSION_HEADER]),
-                        *_ORIGIN_RULES):
+                        ("workspace", _WS_STATE_RE), *_ORIGIN_RULES):
             if t.get(k) is not None:
                 e[k] = office.clean(t[k], rule)
                 if e[k] is None:
@@ -387,60 +397,149 @@ def _validate_s1(s1: Any) -> tuple[dict[str, Any] | None, str | None]:
 
 class HeartbeatBoard:
     """In-memory, locked, bounded: host -> its latest validated heartbeat. A restart forgets them (the next post
-    restores each), which the view shows honestly as "no heartbeat yet".
+    restores each), which the view shows honestly as "no heartbeat yet". The task-id bindings are the exception: with
+    `path` (the server passes $CORTADOS_HOME/BINDINGS_FILE) they are loaded at start and written atomically when they
+    change, so a restart cannot reopen an id to whichever host reports it first (review round 4, P2). Without `path`
+    (tests) they live in memory only.
 
     `protected` (optional) names the configured hosts; it is asked only when the board is over HEARTBEAT_HOSTS_MAX, and
     eviction then drops the least recently posted host that is NOT configured. Configured hosts are the owner's own
     list, so the board holds at most HEARTBEAT_HOSTS_MAX + their number. A failing `protected` protects nothing (the
     plain LRU), never an unbounded board. `generation` changes with every post (the live view's memo key)."""
 
-    def __init__(self, protected: Callable[[], Any] | None = None):
+    def __init__(self, protected: Callable[[], Any] | None = None, path: str | os.PathLike | None = None):
         self._lock = threading.Lock()
         self._hosts: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
         self._protected = protected
         self.generation = 0
-        # task id -> {"bind": (host, origin_session, parent_task_id, session), "seen": t}, LRU by last report
-        self._bindings: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        # task id -> {"bind": (host, origin_session, parent_task_id), "seen": t, "saved": the seen last written}
+        self._bindings: dict[str, dict[str, Any]] = {}
+        self._path = Path(path) if path is not None else None
+        self._load_error: str | None = None
+        self._save_error: str | None = None
+        if self._path is not None:
+            self._load(time.time())
 
     @staticmethod
     def binding(e: dict[str, Any]) -> tuple:
-        """What a task id is bound to: the host it ran on and who it belongs to (its origin, its parent, its child's
-        own Office tag). Any of these changing is a different claim on the id, not an update."""
-        return (e.get("host"), e.get("origin_session"), e.get("parent_task_id"), e.get("session"))
+        """What a task id is bound to: the host it ran on and who it belongs to (its origin, its parent). Any of these
+        changing is a different claim on the id, not an update. (The child's own Office tag is no part of it since
+        round 4: it was the reporting host's word, and nothing joins on it any more.)"""
+        return (e.get("host"), e.get("origin_session"), e.get("parent_task_id"))
 
     @staticmethod
     def same_claim(bound: tuple, want: tuple) -> bool:
-        """Whether a report `want` is the bound claim again. The child's own tag may be filled in once (a host whose
-        sender predates it reported none), never changed; host, origin and parent must be equal."""
-        return bound[:3] == want[:3] and (bound[3] is None or bound[3] == want[3])
+        """Whether a report `want` is the bound claim again: host, origin and parent all equal."""
+        return tuple(bound) == tuple(want)
 
-    def _bind_locked(self, hb: dict[str, Any], now: float) -> dict[str, Any]:
-        """The heartbeat with every task entry whose id is already bound to another host or another origin dropped,
-        and their number in tasks.conflicts. The first report of an id binds it (review round 3, P1: a newer
-        heartbeat from another host must not take over a task id and re-publish its run under a chosen origin)."""
-        block = hb.get("tasks")
-        if not isinstance(block, dict):
-            return hb
+    # ---- persistence (BINDINGS_FILE)
+    def _load(self, now: float) -> None:
+        """Read the bindings file: valid, unexpired entries only, the newest TASK_BINDINGS_MAX. A missing file is an
+        empty table; an unreadable or malformed one too, said in errors() (the tree's `task bindings` error) and
+        logged, never a failed start."""
+        try:
+            with open(self._path, encoding="utf-8") as f:
+                doc = json.load(f)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, RecursionError) as exc:
+            self._load_error = type(exc).__name__
+            logger.warning("live: task bindings unreadable, starting empty: %s", type(exc).__name__)
+            return
+        rows = doc.get("bindings") if isinstance(doc, dict) and doc.get("version") == BINDINGS_VERSION else None
+        if not isinstance(rows, list):
+            self._load_error = "ValueError"
+            logger.warning("live: task bindings malformed, starting empty")
+            return
+        ok: list[tuple[float, str, tuple]] = []
+        for r in rows:
+            if not (isinstance(r, list) and len(r) == 5):
+                continue
+            tid, host, origin, parent, seen = r
+            if not (isinstance(tid, str) and child_tasks.TASK_ID_RE.fullmatch(tid)
+                    and isinstance(host, str) and _HOST_RE.fullmatch(host)
+                    and (origin is None or (isinstance(origin, str) and _ORIGIN_SESSION_RE.fullmatch(origin)))
+                    and (parent is None or (isinstance(parent, str) and child_tasks.TASK_ID_RE.fullmatch(parent)))
+                    and _num(seen) and now - HEARTBEAT_KEEP_S <= seen <= now + SAMPLE_FUTURE_SKEW_S):
+                continue
+            ok.append((float(seen), tid, (host, origin, parent)))
+        ok.sort(reverse=True)
+        for seen, tid, bind in ok[:TASK_BINDINGS_MAX]:
+            self._bindings.setdefault(tid, {"bind": bind, "seen": seen, "saved": seen})
+
+    def _save_locked(self) -> None:
+        """Write the bindings atomically (a private temp file in the same directory, then os.replace), mode 0600. A
+        failure is logged and said in errors(); the in-memory table stands."""
+        tmp = None
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            doc = {"version": BINDINGS_VERSION,
+                   "bindings": [[t, *b["bind"], round(b["seen"], 3)] for t, b in self._bindings.items()]}
+            tmp = self._path.with_name(f"{self._path.name}.tmp{os.getpid()}-{threading.get_ident()}")
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(doc, f, separators=(",", ":"))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._path)
+            tmp = None
+            for b in self._bindings.values():
+                b["saved"] = b["seen"]
+            self._save_error = None
+        except Exception as exc:
+            self._save_error = type(exc).__name__
+            logger.warning("live: task bindings not saved: %s", type(exc).__name__)
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    def errors(self) -> list[dict[str, str]]:
+        """The bindings file's trouble ({source: "task bindings", error: <type>}), for the tree's errors: a provider
+        that could not load or save them says so instead of looking like a clean table."""
+        with self._lock:
+            return [_err("task bindings", e) for e in (self._load_error, self._save_error) if e]
+
+    def _bind_locked(self, hb: dict[str, Any], now: float) -> tuple[dict[str, Any], bool]:
+        """(heartbeat, changed): the heartbeat with every task entry whose id is already bound to another host, origin or parent dropped,
+        and their number in tasks.conflicts. The first report of an id binds it (review round 3, P1: a newer heartbeat
+        from another host must not take over a task id and re-publish its run under a chosen origin). Expired bindings
+        (not reported for HEARTBEAT_KEEP_S) are the only ones removed; with TASK_BINDINGS_MAX live ones a new id is
+        refused and counted, never bound by evicting another (review round 4, P2). `changed`: the table must be saved."""
+        changed = False
         for t in [t for t, b in self._bindings.items() if now - b["seen"] > HEARTBEAT_KEEP_S]:
             del self._bindings[t]
+            changed = True
+        block = hb.get("tasks")
+        if not isinstance(block, dict):
+            return hb, changed
         kept, conflicts = [], 0
         for e in block.get("items") or []:
             want = self.binding(e)
             b = self._bindings.get(e["task_id"])
-            if b is not None and not self.same_claim(b["bind"], want):
-                conflicts += 1                      # dropped: the id stays with its first host and origin
+            if b is not None:
+                if not self.same_claim(b["bind"], want):
+                    conflicts += 1                  # dropped: the id stays with its first host and origin
+                    continue
+                b["seen"] = max(b["seen"], now)
+                changed = changed or b["saved"] is None or b["seen"] - b["saved"] > BINDINGS_SAVE_SEEN_S
+            elif len(self._bindings) >= TASK_BINDINGS_MAX:
+                conflicts += 1                      # full of live bindings: refused, none evicted
                 continue
-            self._bindings.pop(e["task_id"], None)
-            self._bindings[e["task_id"]] = {"bind": want, "seen": now}
+            else:
+                self._bindings[e["task_id"]] = {"bind": want, "seen": now, "saved": None}
+                changed = True
             kept.append(e)
-        while len(self._bindings) > TASK_BINDINGS_MAX:
-            self._bindings.popitem(last=False)
-        return {**hb, "tasks": {**block, "items": kept, "conflicts": conflicts}}
+        return {**hb, "tasks": {**block, "items": kept, "conflicts": conflicts}}, changed
 
     def post(self, hb: dict[str, Any], now: float | None = None) -> dict[str, Any]:
         now = time.time() if now is None else now
         with self._lock:
-            hb = self._bind_locked(hb, now)
+            hb, changed = self._bind_locked(hb, now)
+            if changed and self._path is not None:
+                self._save_locked()
             self._hosts.pop(hb["host"], None)
             self._hosts[hb["host"]] = {**hb, "received_at": round(now, 3)}
             if len(self._hosts) > HEARTBEAT_HOSTS_MAX:
@@ -478,16 +577,21 @@ def heartbeat_rows(beats: dict[str, dict[str, Any]], now: float, known: dict[str
     for such an id is a conflict; otherwise a log row wins, and the host's own report replaces a stub (`stub` true: a
     start sent from here onto that host). Between heartbeats the board bound each id to the first host that reported it
     (HeartbeatBoard._bind_locked: later differing claims were already dropped and counted there); should two current
-    beats still disagree (a restart forgot the bindings), the earlier-received one keeps the id and the other counts.
+    beats still disagree (bindings lost with an unreadable bindings file), the earlier-received one keeps the id and
+    the other counts. A `known` entry marked `unverified` (its stub could not be read) drops the claim uncounted: an
+    id this machine may own is never handed to a heartbeat on a guess.
     A heartbeat past its TTL still lists its tasks, but a running or queued one is then `unknown` ("its host's
     heartbeat is stale"). A running task with no end after STALE_RUNNING_S is unknown, as tasks_section says.
 
-    The Office board's worker for the run (x-cortados-run-id: its title, model, lane, provider, current tool) joins
-    only when the worker's own session tag is one the task is bound to (its origin, or the child's own Office tag
-    its host reported): a run id alone is not proof, since the entry naming it is another host's claim. Each row
-    carries those tags in `bind_tags` (never published) so orchestrators_section applies the same rule to the run's
-    sub-sessions and tokens. Any worker with the run id is considered (a remote child's routed traffic makes a
-    `subagent` worker here; `child_task` ones come from this host's own log), a `child_task` one first."""
+    Joins (review round 4: a join key is something the provider observed itself, never something a heartbeat
+    supplied). The Office board's worker for the run (x-cortados-run-id: its title, model, lane, provider, current
+    tool) joins only when the provider saw the run's own requests carry x-cortados-origin equal to the task's bound
+    origin (the worker's `origin`, office.note_origin); a run id and every tag in the entry are the reporting host's
+    word. Each row carries its bound origin in `bind_origin` (never published) so orchestrators_section applies the
+    same rule to the run's sub-sessions (each conversation's observed origin) and tokens (the run's, RunRecords). A task
+    with no origin, or whose run the provider never saw with it, shows its heartbeat's own fields only. Any worker with
+    the run id is considered (a remote child's routed traffic makes a `subagent` worker here; `child_task` ones come
+    from this host's own log), a `child_task` one first."""
     by_run: dict[Any, dict[str, Any]] = {}
     for _, w in _all_workers(office_view or {}):
         if w.get("run_id") and (w["run_id"] not in by_run or w.get("kind") == "child_task"):
@@ -511,6 +615,8 @@ def heartbeat_rows(beats: dict[str, dict[str, Any]], now: float, known: dict[str
                 continue
             k = known.get(tid)
             if k is not None:
+                if k.get("unverified"):
+                    continue                        # this machine's own record could not be read: no claim on a guess
                 if (k.get("host") and k["host"] != h) or \
                         (k.get("origin_session") and e.get("origin_session") != k["origin_session"]):
                     conflicts += 1                  # the provider host's own record names another host or origin
@@ -531,10 +637,10 @@ def heartbeat_rows(beats: dict[str, dict[str, Any]], now: float, known: dict[str
                     state, phase = "unknown", STALE_HB_PHASE
                 elif start is not None and now - start > STALE_RUNNING_S:
                     state, phase = "unknown", "no end event after 10 h"
-            tags = {t for t in (e.get("origin_session"), e.get("session")) if t}
+            origin = e.get("origin_session")
             w = by_run.get(tid) or {}
-            if w.get("session") not in tags:
-                w = {}                              # not this task's run, as far as the board can tell
+            if not origin or w.get("origin") != origin:
+                w = {}                              # the provider never saw this run carry the task's origin
             elapsed = ((end if end is not None else now) - start) if start is not None else None
             rows[tid] = {
                 "task_id": tid, "title": e.get("title") or w.get("title"), "state": state, "phase": phase, "host": h,
@@ -546,7 +652,7 @@ def heartbeat_rows(beats: dict[str, dict[str, Any]], now: float, known: dict[str
                 "browser": e.get("browser") is True, "session": None, "project": None, "device": None,
                 "origin_session": e.get("origin_session"), "origin_project": e.get("origin_project"),
                 "origin_device": e.get("origin_device"), "origin_via": e.get("origin_via"),
-                "parent_task_id": e.get("parent_task_id"), "bind_tags": tags, "_bind": HeartbeatBoard.binding(e)}
+                "parent_task_id": e.get("parent_task_id"), "bind_origin": origin, "_bind": HeartbeatBoard.binding(e)}
     for r in rows.values():
         del r["_bind"]
     return list(rows.values()), sorted(hosts), cut, conflicts
@@ -841,8 +947,9 @@ def _subs_by_run(backend: list | None, ended: list | None, now: float) -> dict[s
                 continue
             n = _sub_node(c, now)
             if n is not None:
-                # the conversation's own Office tag, compared (never published) for a heartbeat's task: _task_subs
-                n["_session"] = office.clean(c.get("session"), office._HEADER_RULES[office.SESSION_HEADER])
+                # the origin the provider saw on this conversation's requests (x-cortados-origin), compared (never
+                # published) for a heartbeat's task: _task_subs
+                n["_origin"] = office.clean(c.get("origin"), office._ORIGIN_RE)
                 out.setdefault(rid, []).append(n)
     rank = {"running": 0, "waiting": 1, "failed": 2, "done": 3}
     for rid, subs in out.items():
@@ -852,20 +959,24 @@ def _subs_by_run(backend: list | None, ended: list | None, now: float) -> dict[s
     return out
 
 
-def _task_subs(r: dict[str, Any], subs: list[dict[str, Any]], tokens: Any) -> tuple[list[dict[str, Any]], Any]:
-    """A task's sub-sessions and run tokens, as published. For a row from another host's heartbeat (`bind_tags`) only
-    the run's conversations that carry one of the task's bound tags join, and its run tokens only when one did: the
-    run id is the other host's claim (heartbeat_rows). The provider host's own rows join by run id, as before."""
-    tags = r.get("bind_tags")
-    if tags is not None:
-        subs = [x for x in subs if x.get("_session") in tags]
-        if not subs:
+def _task_subs(r: dict[str, Any], subs: list[dict[str, Any]], tokens: Any,
+               run_origin: Any = None) -> tuple[list[dict[str, Any]], Any]:
+    """A task's sub-sessions and run tokens, as published. For a row from another host's heartbeat (`bind_origin`)
+    only the run's conversations whose requests the provider saw carry the task's bound origin join, and its run
+    tokens only when the run's own observed origin (`run_origin`, RunRecords.run_origins) is that origin: the run id
+    and the entry's tags are the other host's word (heartbeat_rows). The provider host's own rows (its log, its stubs)
+    join by run id, as before: first-hand."""
+    if "bind_origin" in r:
+        o = r["bind_origin"]
+        subs = [x for x in subs if o and x.get("_origin") == o]
+        if not (o and run_origin == o):
             tokens = None
-    return [{k: v for k, v in x.items() if k != "_session"} for x in subs], tokens
+    return [{k: v for k, v in x.items() if k != "_origin"} for x in subs], tokens
 
 
-def _task_node(r: dict[str, Any], subs: list[dict[str, Any]], tokens: Any, via: str | None) -> dict[str, Any]:
-    subs, tokens = _task_subs(r, subs, tokens)
+def _task_node(r: dict[str, Any], subs: list[dict[str, Any]], tokens: Any, via: str | None,
+               run_origin: Any = None) -> dict[str, Any]:
+    subs, tokens = _task_subs(r, subs, tokens, run_origin)
     st = r.get("state")
     sub = subs[:SUBSESSIONS_MAX]
     main = next((x for x in subs if x.get("role") == "main"), None) or {}   # a task with no model of its own: its loop's
@@ -891,7 +1002,8 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
                           conv: dict[str, Any] | None, backend: list | None, ended: list | None,
                           run_tokens: dict[str, Any] | None, now: float, errors: list | None = None,
                           session: str | None = None, inputs_truncated: list | None = None,
-                          task_hosts: list | None = None, conflicts: int | None = None) -> dict[str, Any]:
+                          task_hosts: list | None = None, conflicts: int | None = None,
+                          run_origins: dict[str, Any] | None = None) -> dict[str, Any]:
     """The orchestrator tree: each orchestrating main session (its Office tag), the bot gateway ("grokbot") and an
     unattributed group, each with the child tasks it started in the window (nested under their parent task through
     parent_task_id) and, under each task, its sub-sessions (the run's routed conversations, x-cortados-run-id).
@@ -909,8 +1021,11 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
     `task_hosts` (collect passes it): the hosts whose heartbeat carried task entries, already merged into `rows`
     (heartbeat_rows). The section's scope is then TREE_SCOPE and names them; None keeps the provider host's SCOPE.
     `conflicts` (the fleet view only): heartbeat claims on a task id that were dropped because the id is bound to
-    another host or origin; published as a count, never with the ids or what was claimed."""
+    another host or origin; published as a count, never with the ids or what was claimed.
+    `run_origins` (run id -> the origin the provider observed on the run's requests): a heartbeat row's run tokens
+    join only through it (_task_subs)."""
     run_tokens = run_tokens if isinstance(run_tokens, dict) else {}
+    run_origins = run_origins if isinstance(run_origins, dict) else {}
     subs = _subs_by_run(backend, ended, now)
     by_id = {r["task_id"]: r for r in rows if r.get("task_id")}
     away = [{"task_id": x["task_id"], "title": None, "state": "elsewhere", "phase": "runs on " + x["host"] +
@@ -927,7 +1042,8 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
         if session is not None and origin != session:
             continue                                # filtered before anything is built or capped
         origin_of[r["task_id"]] = origin
-        nodes[r["task_id"]] = _task_node(r, subs.get(r["task_id"], []), run_tokens.get(r["task_id"]), via)
+        nodes[r["task_id"]] = _task_node(r, subs.get(r["task_id"], []), run_tokens.get(r["task_id"]), via,
+                                         run_origins.get(r["task_id"]))
         g = groups.setdefault(origin, {"project": None, "device": None})
         g["project"] = g["project"] or r.get("origin_project")
         g["device"] = g["device"] or r.get("origin_device")
@@ -1422,6 +1538,9 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
             route_log: Callable[[], dict[str, Any]] = router_db.stats,
             ended_conversations: Callable[[], list] | None = None,
             run_tokens: Callable[[], dict[str, Any]] | None = None,
+            run_origins: Callable[[], dict[str, Any]] | None = None,
+            stubs_by_id: Callable[[list[str]], list] | None = None,
+            binding_errors: Callable[[], list] | None = None,
             session: str | None = None, peek_foreign: bool = True) -> dict[str, Any]:
     """The snapshot. Each input is a callable, run under its own guard: one that raises turns ITS section into
     status "error" with the exception's type (never its text: an OSError carries a path), the rest stand.
@@ -1430,7 +1549,12 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     `remote_stubs`: the fleet's stubs (child_tasks.remote_stubs, a scan of the newest task dirs) for the tasks section
     and the fleet tree; None skips the scan (the session endpoint). `session_stubs(origin)`: with `session`, that
     origin's own stubs (child_tasks.remote_stubs_for, the origin index), which then feed the tree instead of the fleet
-    scan: neither other sessions' stubs nor the fleet scan's cut can change or flag this session's tree."""
+    scan: neither other sessions' stubs nor the fleet scan's cut can change or flag this session's tree.
+    `stubs_by_id(ids)` (child_tasks.remote_stubs_by_id): this machine's stubs of exactly the ids the heartbeats report,
+    read before any session filtering, so ownership is checked against every stub here in every view (review round 4,
+    P2); the records found are compared, never published. `run_origins`: run id -> the origin the provider saw on the
+    run's requests (RunRecords.run_origins), the only key a heartbeat task's tokens join on. `binding_errors`: the
+    heartbeat board's bindings-file trouble (HeartbeatBoard.errors), shown in the tree's errors."""
     def guard(source: str, fn: Callable[[], Any], errs: list) -> Any:
         try:
             return fn()
@@ -1473,10 +1597,14 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     beats = guard("heartbeats", heartbeats, hb_errs) or {}
     ended = guard("ended conversations", ended_conversations, tree_errs) if ended_conversations is not None else None
     tok = guard("run tokens", run_tokens, tree_errs) if run_tokens is not None else None
+    r_orig = guard("run tokens", run_origins, tree_errs) if run_origins is not None else None
+    if binding_errors is not None:
+        tree_errs += guard("task bindings", binding_errors, tree_errs) or []
     # The tree's inputs: uncapped, narrowed to the session's own origin FIRST, then bounded by TREE_INPUT_MAX with the
     # cut named, so no other session's activity can push this session's items out (review 2026-11-14). A session's
     # stubs come from its own origin index when the caller gives one: then every flag in `inputs_truncated` is about
     # this session's own data only.
+    fleet_away = list(away)                         # the fleet scan's stubs (none in the session endpoint)
     own_index = session is not None and session_stubs is not None
     if own_index:
         own = guard("task stubs", lambda: session_stubs(session), tree_errs)
@@ -1489,10 +1617,28 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     if isinstance(evicted, list) and (session in evicted if session is not None else evicted):
         cut.append("routed workers")
     # Tasks that ran on another host (its own log, which this machine cannot read) arrive in its heartbeat. The
-    # provider host's own records are first-hand and bind their ids: its log rows, and the remote stubs it wrote for
-    # starts it sent elsewhere (the stubs this view read, before the session filter).
-    first_hand: dict[str, dict[str, Any]] = {x["task_id"]: {**x, "stub": True} for x in away}
+    # provider host's own records are first-hand and bind their ids: its log rows (every row, before the session
+    # filter), and EVERY remote stub it wrote for a start it sent elsewhere: the ones this view read, plus a read of
+    # the stub of each id a heartbeat names (stubs_by_id), so another session's stub rejects a forged report in this
+    # session's view as it does in the fleet's (review round 4, P2). Compared only: no foreign record is published.
+    first_hand: dict[str, dict[str, Any]] = {x["task_id"]: {**x, "stub": True} for x in fleet_away + away}
     first_hand.update({r["task_id"]: r for r in rows})
+    if stubs_by_id is not None:
+        claimed = list(dict.fromkeys(
+            e.get("task_id") for hb in beats.values() if isinstance(hb, dict) and isinstance(hb.get("tasks"), dict)
+            for e in hb["tasks"].get("items") or [] if isinstance(e, dict) and isinstance(e.get("task_id"), str)))
+        missing = [t for t in claimed if t not in first_hand]
+        if missing:
+            lookup_errs: list = []
+            found = guard("task stubs", lambda: stubs_by_id(missing), lookup_errs)
+            tree_errs += lookup_errs
+            if found is None:                       # could not check: no heartbeat claim on these ids this time
+                first_hand.update({t: {"task_id": t, "unverified": True} for t in missing})
+            for x in found or []:
+                if isinstance(x, dict) and x.get("task_id") in missing:
+                    first_hand[x["task_id"]] = ({"task_id": x["task_id"], "unverified": True} if x.get("unreadable")
+                                                else {"task_id": x["task_id"], "host": x.get("host"), "stub": True,
+                                                      "origin_session": x.get("origin_session")})
     hb_rows, task_hosts, hb_cut, hb_conflicts = heartbeat_rows(beats, now, first_hand, ov)
     # A host that had more tasks than its heartbeat carries: said in the fleet view. Not in a session's view: the cut
     # is over every session's tasks on that host, and a session's flags are about its own data only (§5).
@@ -1517,7 +1663,8 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
                                  ended if isinstance(ended, list) else None, tok, now,
                                  task_side + (conv["errors"] if conv["status"] != "ok" else []) + tree_errs + hb_errs,
                                  session, inputs_truncated=cut, task_hosts=task_hosts,
-                                 conflicts=hb_conflicts if session is None else None)
+                                 conflicts=hb_conflicts if session is None else None,
+                                 run_origins=r_orig if isinstance(r_orig, dict) else None)
     tv_errs: list = []
     tv = guard("router.db", tasks_view, tv_errs)
     # this process's failed router.db writes (#99): shown even when the read side failed, which is when they matter most

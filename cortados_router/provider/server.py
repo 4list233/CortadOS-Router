@@ -546,6 +546,10 @@ class RunRecords:
         # and without this a headless client could only learn "no routed request recorded". Recorded only for an
         # authenticated request (Handler._note_refusal), so a caller without the token cannot add or evict entries.
         self._refusals: "OrderedDict[str, list[dict[str, Any]]]" = OrderedDict()
+        # The x-cortados-origin the provider saw on each run's token-bearing requests (office.note_origin: the first,
+        # or office.ORIGIN_CONFLICT once two differ). The live view joins a heartbeat-reported task's run tokens only
+        # when this equals the task's bound origin (review round 4). Bounded with the tokens.
+        self._origins: "OrderedDict[str, str]" = OrderedDict()
 
     def refuse(self, run_id: str, *, status: int, kind: str, reason: str) -> None:
         """Record one refusal: the status, the error type and a fixed reason (Handler._note_refusal; never raw text)."""
@@ -576,14 +580,24 @@ class RunRecords:
             while len(self._runs) > self.MAX_RUNS:
                 self._runs.popitem(last=False)
 
-    def add_tokens(self, run_id: str, tokens: dict[str, int]) -> None:
-        """Add one backend turn's tokens (work_split.usage_tokens) to the run's total; bounded like the run records."""
+    def add_tokens(self, run_id: str, tokens: dict[str, int], origin: str | None = None) -> None:
+        """Add one backend turn's tokens (work_split.usage_tokens) to the run's total; bounded like the run records.
+        `origin`: the request's x-cortados-origin (OfficeBoard.read_origin), noted for the run (run_origins)."""
         with self._lock:
             t = self._tokens.pop(run_id, None) or {}
             work_split.add_tokens(t, tokens)
             self._tokens[run_id] = t
+            o = office.note_origin(self._origins.pop(run_id, None), origin)
+            if o is not None:
+                self._origins[run_id] = o
             while len(self._tokens) > self.MAX_RUNS:
-                self._tokens.popitem(last=False)
+                gone, _ = self._tokens.popitem(last=False)
+                self._origins.pop(gone, None)
+
+    def run_origins(self) -> dict[str, str]:
+        """run id -> the origin the provider observed on its requests (copies), for the live view's joins."""
+        with self._lock:
+            return dict(self._origins)
 
     def tokens_by_run(self) -> dict[str, dict[str, int]]:
         """run id -> its token total since this endpoint started (copies), for the live view."""
@@ -824,7 +838,11 @@ class Registry:
         self.runs = RunRecords()                    # x-cortados-run-id -> what its routed requests ran on
         self.office = office.OfficeBoard()          # floors / workers / heartbeats behind GET /v1/cortados/office
         # host job heartbeats behind GET /v1/cortados/live (provider/live.py); the LRU never evicts a configured host
-        self.live = live.HeartbeatBoard(protected=_configured_live_hosts)
+        # Its task-id bindings persist in $CORTADOS_HOME (live.BINDINGS_FILE, review round 4): a restart must not reopen
+        # a bound id to the first host that reports it afterwards.
+        from cortados_router import paths
+        self.live = live.HeartbeatBoard(protected=_configured_live_hosts,
+                                        path=paths.state_dir() / live.BINDINGS_FILE)
         # Scoped client tokens (clients.json). Consulted only when the owner token does not match, so the owner's
         # behaviour is unchanged; a client token opens only its scopes' endpoints and gets 403 everywhere else.
         self.clients = clients.ClientTokens(owner_token=token)
@@ -1484,6 +1502,9 @@ class Registry:
             "key": worker[0] if isinstance(worker, tuple) and worker and isinstance(worker[0], str) else None,
             "session": tags.get("session"), "project": tags.get("project"), "device": tags.get("device"),
             "title": tags.get("title"),
+            # the x-cortados-origin this conversation's requests carried (office.note_origin): compared by the live
+            # view's heartbeat joins, never published
+            "origin": getattr(s, "office_origin", None),
             "ref": "c-" + hashlib.sha256(str(s.id).encode()).hexdigest()[:12],
             "provider": office.provider_of(rp, local_lane.LANE_PREFIX),
             "lane": rp if rp.startswith(local_lane.LANE_PREFIX) else (_route_lane(route) if route else None),
@@ -2127,6 +2148,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._authed, self._bridge = False, None
         self._office_tags = {}
+        self._office_origin = None
         path = self.path.split("?")[0]
         if self._scope_gate("POST"):
             return
@@ -2164,6 +2186,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, "invalid_request_error", _RUN_ID_BAD, w, reason=_RUN_ID_BAD)
             try:   # cosmetic: an invalid tag is dropped and counted inside, and a bug here never refuses the request
                 self._office_tags = self.server.registry.office.read_tags(self.headers)
+                self._office_origin = self.server.registry.office.read_origin(self.headers)
             except Exception as exc:
                 logger.warning("office: tag read failed: %s", type(exc).__name__)
             return self._messages(body, w)
@@ -3082,6 +3105,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             board = self.server.registry.office
             tags = getattr(self, "_office_tags", None) or {}
+            origin = getattr(self, "_office_origin", None)
+            # the conversation's provider-observed origin, before any early return (a side call carries it too)
+            session.office_origin = office.note_origin(getattr(session, "office_origin", None), origin)
             run_id, valid = self._run_id()
             run_id = run_id if valid else None
             # untagged, no run id: named by a digest of the conversation's id (the id itself is never published)
@@ -3094,7 +3120,7 @@ class Handler(BaseHTTPRequestHandler):
             rp = str(route.get("provider") or "claude-cli")       # no route: a fixed-model endpoint, the Claude CLI
             lane = rp if rp.startswith(local_lane.LANE_PREFIX) else (_route_lane(route) if route else None)
             board.turn_start(key, tags, run_id=run_id or conv, provider=office.provider_of(rp, local_lane.LANE_PREFIX),
-                             lane=lane, model=route.get("model") or getattr(session, "model", None))
+                             lane=lane, model=route.get("model") or getattr(session, "model", None), origin=origin)
             # Kept on the conversation so an unexpected backend exit (Registry._backend_exited), with no request left
             # to end the turn, can still end this worker on the board. A failure here is reported by the warning below.
             session.office_worker = (key, dict(tags))
@@ -3174,7 +3200,7 @@ class Handler(BaseHTTPRequestHandler):
                 work_split.add_tokens(acc, t)
                 run_id, valid = self._run_id()
                 if run_id and valid:
-                    reg.runs.add_tokens(run_id, t)
+                    reg.runs.add_tokens(run_id, t, origin=getattr(self, "_office_origin", None))
             except Exception:
                 logger.debug("live token total not recorded", exc_info=True)
         route = getattr(session, "route", None)
@@ -3342,7 +3368,9 @@ class ProviderServer(ThreadingHTTPServer):
             remote_stubs=None if session_view else child_tasks.remote_stubs,
             session_stubs=child_tasks.remote_stubs_for, lane_enabled=live.lane_enabled,
             conversations=registry.live_conversations, ended_conversations=registry.ended_conversations,
-            run_tokens=registry.runs.tokens_by_run, session=session, peek_foreign=not session_view)
+            run_tokens=registry.runs.tokens_by_run, run_origins=registry.runs.run_origins,
+            stubs_by_id=child_tasks.remote_stubs_by_id, binding_errors=registry.live.errors,
+            session=session, peek_foreign=not session_view)
 
     def live_usage_view(self, registry: Registry, now: float) -> dict[str, Any]:
         """Lanes, S1 and hardware for the live view (usage.collect_live): the same sources usage_view reads."""

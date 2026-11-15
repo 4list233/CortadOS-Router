@@ -159,9 +159,11 @@ tool name, Office tag) or from fixed vocabularies (status, phase, role).
   tasks section and its tree, and says `task stubs` when that scan stopped; that flag never reaches a session view.
   Stubs written before the index existed are indexed by the next daily prune (`child_tasks.prune`), which also drops
   entries whose task dir is gone (O(index entries), never on a view). Until then such a stub shows only in the fleet
-  view. The session endpoint never opens another session's task directory (its own open tasks are peeked first, so
+  view. The session endpoint never peeks at another session's task directory (its own open tasks are peeked first, so
   others cannot use up the 64 peeks), and a task-dir error is published only with the task it belongs to: another
-  session's `PermissionError` never reaches this view or changes its status.
+  session's `PermissionError` never reaches this view or changes its status. Its one read outside its own records is the
+  ownership check of round 4 (§9): the `remote.json` of each task id another host's heartbeat names, compared and never
+  published.
 - Why not have the provider derive the session from the request? The provider never sees the session id, and must not:
   it is a `claude --resume` handle. Why not filter in the pane? The pane would then download every session's metadata,
   which was the old behaviour.
@@ -223,6 +225,18 @@ costs per input: §5.
 
 ## 8. Tests
 
+- Review round 4: `tests/test_orchestrator_tree.py` `ProviderObservedJoinTest`: the reviewer's P1 repro (the Studio
+  claims VICTIM first under MINE with VICTIM's child tag: MINE's view gets no title, tool, model, sub-session or
+  token), a provider-observed origin joining the run, a heartbeat-only task (no observed origin, or none of its own)
+  getting nothing joined, a run seen with two origins joining nothing, the P2 stub repro (another session's stub
+  rejects a forged report in OTHER's session view, also over real stub files; an unreadable stub or failed lookup
+  trusts no report), the restart repro (VICTIM bound to Pro/OTHER, a fresh board on the same file, the Studio posts
+  first: refused), persistence (0600, atomic, expired entries dropped at load, bad entries and an unreadable file
+  skipped and said, a failed save said), and a full table refusing new ids without evicting live ones.
+  `SessionEndpointTest.test_a_heartbeat_task_joins_its_run_only_through_the_origin_the_provider_saw` does it over the
+  real endpoint with real headers. `tests/test_office.py` `OriginHeaderTests`: the header's rule and name equal
+  child_tasks', invalid ones dropped and counted, never published by the Office. `tests/test_child_tasks.py`: a
+  nested child's requests carry its inherited `x-cortados-origin`; a task with no orchestrator sends none.
 - Review round 3: `tests/test_orchestrator_tree.py` `HostBindingTest`: the reviewer's repro (a newer Studio heartbeat
   claiming a Pro task under another origin gets nothing; the owner keeps it, with its run), the same host changing an
   origin or parent, a forger reporting first (it owns the id but gets no title, tool, model, sub-session or token of
@@ -286,23 +300,47 @@ log under that origin (`HostTasksTest.test_a_task_started_from_the_pro_onto_the_
 view's own reader (`office.read_child_events`, the bounded tail; `live.tasks_section` for the state, peeking at its own
 task dirs) and posts up to 40 entries of the last 24 h: task id, origin tag (and project/device), title, state, phase
 (fixed phrases only), model and lane when logged, host, start and end times, parent task id, workspace state, browser
-flag, and the child's own Office tag (`session`, its routed traffic's `x-cortados-session`, which the provider already
-sees; compared, never published). Never the prompt, cwd, command or output. `live.validate_tasks` re-checks every field
+flag, and the child's own Office tag (`session`; since round 4 the provider checks it and drops it, see below). Never
+the prompt, cwd, command or output. `live.validate_tasks` re-checks every field
 by the rule the view applies to its own log, refuses an entry for another host (a host speaks for its own tasks; a
 `live:heartbeat` token is already bound to its host) and drops entries outside the window.
 
-A task id's host and origin are bound once (review round 3, P1). The provider host's own records win: its log, and the
-remote stubs it wrote for starts it sent onto another host (that host's own report then replaces the stub). Otherwise
-the first host that reports an id owns it: the board binds each id to (host, origin, parent, child tag)
-(`HeartbeatBoard._bind_locked`, at most 4096 ids, each kept a day after its last report), and a later report that
-differs (another host, or the same host with another origin, parent or child tag) is dropped and counted. A child tag
-may be filled in once: a host whose sender predates it reported none. The count is the fleet
-view's `orchestrators.conflicts` and the poster's `task_conflicts`; it is never in a session's view, and never names
-an id. `live.heartbeat_rows` turns the entries into tree rows: a heartbeat past its TTL shows its running tasks as
-`unknown`. The run's Office worker (title, model, lane, provider, current tool), its routed conversations (the task's
-sub-sessions) and its run tokens join a heartbeat's task only when they carry one of the task's bound tags (its origin,
-or the child's own tag its host reported): the run id alone is another host's claim, so a host that claims an id first
-still gets nothing of the real run. The rows join the tree's input before the session filter, so `/v1/cortados/live/session` and the
+A task id's host and origin are bound once (review rounds 3 and 4). The provider host's own records win: its log,
+and every remote stub it wrote for a start it sent onto another host (that host's own report then replaces the stub).
+Ownership is checked against ALL of them before any session filtering, in every view: besides the stubs a view already
+read, the stub of each id a heartbeat names is read by id (`child_tasks.remote_stubs_by_id`: one file read per
+claimed id, no listing), so another session's stub rejects a forged report in this session's view exactly as in the
+fleet's. Those records are compared, never published; a stub that exists but cannot be read (or a failed lookup)
+makes the view trust no report of that id. Otherwise the first host that reports an id owns it: the board binds each
+id to (host, origin, parent) (`HeartbeatBoard._bind_locked`), and a later report that differs is dropped and counted.
+The bindings persist in `$CORTADOS_HOME/live-task-bindings.json` (0600, written atomically when they change; a
+re-reported id's time reaches the file at most hourly), loaded at start, so a restarted provider still refuses a
+newcomer's claim. Each lasts 24 h after its last report (the heartbeat window); only expired bindings are removed. At
+4096 live bindings a NEW id is refused and counted, never bound by evicting a live one. An unreadable file starts an
+empty table and says `task bindings` in the tree's errors. The count is the fleet view's `orchestrators.conflicts` and
+the poster's `task_conflicts`; it is never in a session's view, and never names an id. `live.heartbeat_rows` turns the
+entries into tree rows: a heartbeat past its TTL shows its running tasks as `unknown`.
+
+**Joins (round 4): a join key is something the provider observed itself, never something a heartbeat supplied.** The
+child runner sends `x-cortados-origin: <the task's origin tag>` (from the task's own metadata, the inherited one for a
+nested task) on every routed request of the run, next to `x-cortados-run-id` (`child_tasks._prepare`, allowed by
+`session.OFFICE_HEADERS`). The provider records it per Office worker, per conversation (`Registry._conversation_meta`)
+and per run's tokens (`RunRecords.run_origins`), the first one seen; a run that ever carries two different origins
+matches nothing (`office.note_origin`). A heartbeat's task gets the run's Office worker (title, model, lane, provider,
+current tool), its sub-sessions and its run tokens only when the provider observed the run's own requests carry the
+task's bound origin. A heartbeat-reported task with no such observation (a run never routed here, a runner from before
+round 4, a task without an origin) shows only its heartbeat's own fields. The child tag a sender still reports is
+checked and dropped: no key, and no part of the binding. The observed origin is never published.
+
+**Threat note.** Heartbeat clients are the owner's own machines (one `live:heartbeat` token per host, bound to its host
+name). Such a token cannot reach the model endpoints, so it cannot create the provider observations the joins need;
+`x-cortados-origin` is sent only by holders of the owner token, inside its existing trust boundary (like
+`x-cortados-run-id`). The residual risk after this round is integrity only: a compromised host can show fabricated
+entries for ids nobody has reported (under any origin, with its own titles), or report a real id first so the real
+host's report conflicts and is dropped. It cannot read anything: no title, tool, sub-session, token or other metadata
+of another session's run is joined onto what it reports, and a session's view still holds nothing of another session.
+
+The rows join the tree's input before the session filter, so `/v1/cortados/live/session` and the
 Orchestrators panel hold every host's tasks, each attributed by its origin tag (and the parent chain), and a session's
 view still holds nothing of another session. The tree's `scope` is `provider host and heartbeats`, and `task_hosts`
 names the hosts that sent a block (host names only). The Tasks panel keeps its provider-host scope.

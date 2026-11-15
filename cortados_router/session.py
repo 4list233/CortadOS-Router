@@ -96,10 +96,12 @@ def read_token(path: str) -> str:
 RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")   # the provider's x-cortados-run-id pattern (provider/server.py)
 
 
-# The Office tag headers a child task may carry (provider/office.py groups its traffic under its orchestrator's floor).
+# The Office tag headers a child task may carry (provider/office.py groups its traffic under its orchestrator's floor;
+# x-cortados-origin names the orchestrator that started the task, the provider's own record of the run's owner).
 # Only these names, and a value of printable ASCII up to 80 chars: the variable is newline-separated, so a newline in
 # a value would inject a header of its own (an x-api-key overriding the provider token).
-OFFICE_HEADERS = ("x-cortados-session", "x-cortados-project", "x-cortados-device", "x-cortados-task-title")
+OFFICE_HEADERS = ("x-cortados-session", "x-cortados-project", "x-cortados-device", "x-cortados-task-title",
+                  "x-cortados-origin")
 _OFFICE_VALUE_RE = re.compile(r"[\x20-\x7e]{1,80}")
 
 

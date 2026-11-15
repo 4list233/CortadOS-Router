@@ -378,7 +378,8 @@ def tasks_block(host: str, now: float, events: Callable[[], list] | None = None,
             e["phase"] = r["phase"]
         for k in ("title", "lane", "model", "workspace", "origin_session", "origin_project", "origin_device",
                   "origin_via", "parent_task_id", "started_at", "ended_at",
-                  "session"):                   # the child's own Office tag: binds its run's worker (live.heartbeat_rows)
+                  "session"):   # the child's own Office tag: still sent (older providers compare it); since round 4
+                                # the provider checks and drops it, joining only on what it observed itself
             if r.get(k) is not None:
                 e[k] = r[k]
         if r.get("browser"):
