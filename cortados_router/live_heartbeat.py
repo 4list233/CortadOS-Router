@@ -377,7 +377,8 @@ def tasks_block(host: str, now: float, events: Callable[[], list] | None = None,
         if r.get("phase") in live.HB_TASK_PHASES:
             e["phase"] = r["phase"]
         for k in ("title", "lane", "model", "workspace", "origin_session", "origin_project", "origin_device",
-                  "origin_via", "parent_task_id", "started_at", "ended_at"):
+                  "origin_via", "parent_task_id", "started_at", "ended_at",
+                  "session"):                   # the child's own Office tag: binds its run's worker (live.heartbeat_rows)
             if r.get(k) is not None:
                 e[k] = r[k]
         if r.get("browser"):
@@ -527,6 +528,29 @@ def main(argv: list[str] | None = None, *, run: Callable[..., Any] = subprocess.
         print(f"live_heartbeat: {exc}", file=sys.stderr)
         return 2
     code, msg = post(url, token, raw, opener)
+    # An older provider enforces its own, smaller byte cap (24 KiB before #118) with 413, before it looks at any field:
+    # a full 40-entry tasks block is over it. Shed the optional parts until it fits: fewer task entries (halved), then
+    # no tasks block, then no orchestrator block. The jobs, hardware and S1 are never shed (review round 3, P2).
+    while code == 413:
+        items = (body.get("tasks") or {}).get("items") or []
+        if len(items) > 1:
+            keep = len(items) // 2
+            print(f"live_heartbeat: provider refused the size ({msg or 413}); sending {keep} of {len(items)} task "
+                  "entries", file=sys.stderr)
+            body = {**body, "tasks": {"items": items[:keep], "truncated": True}}
+        elif "tasks" in body or "orchestrator" in body:
+            block = "tasks" if "tasks" in body else "orchestrator"
+            print(f"live_heartbeat: provider refused the size ({msg or 413}); posting without the {block} block",
+                  file=sys.stderr)
+            body = {k: v for k, v in body.items() if k != block}
+        else:
+            break
+        try:
+            raw = check(body)
+        except ConfigError as exc:
+            print(f"live_heartbeat: {exc}", file=sys.stderr)
+            return 2
+        code, msg = post(url, token, raw, opener)
     # A provider from before the tasks block (#118) or the work split: that block is an unknown field there. The
     # newest block goes first, so a provider that knows the orchestrator block keeps it.
     for block in ("tasks", "orchestrator"):

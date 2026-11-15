@@ -87,7 +87,7 @@ type TreeHeld = { data: PulseSessionView; at: number; tag: string; base: string 
 const tree = atom({ plugin: 'cortados-pulse', key: 'tree' } as const, null as TreeHeld | null)
 const treeErr = atom({ plugin: 'cortados-pulse', key: 'treeErr' } as const, null as string | null)
 /** This machine's own task log, this session's tasks in it (#118): merged into the tree by task id. */
-type LocalHeld = { tag: string; at: number; tasks: LocalTask[] }
+type LocalHeld = { tag: string; at: number; tasks: LocalTask[]; note?: string | null }
 const localHeld = atom({ plugin: 'cortados-pulse', key: 'local' } as const, null as LocalHeld | null)
 
 /** The machine's shared Office salt (cortados_router/subagent_mcp.py OFFICE_SALT_DEFAULT). */
@@ -227,7 +227,7 @@ let liveInFlight = false
 /** One /v1/cortados/live poll. A provider from before the live view answers 404: said as such, never as an outage.
  * One at a time: a tick that lands while the previous answer is still coming is skipped, never stacked. */
 /** What a live poll touches. With `me` (the hooks pass true) it also names this session ($.session), every poll. */
-type LiveDollar = Pick<EngineInterface, 'env' | 'fs' | 'http' | 'state' | 'clock'>
+type LiveDollar = Pick<EngineInterface, 'env' | 'fs' | 'process' | 'http' | 'state' | 'clock'>
 
 export async function pollLive($: LiveDollar, cfg: Cfg, me = false): Promise<void> {
   if (liveInFlight) return
@@ -547,10 +547,12 @@ export function treeLines(v: PulseSessionView, tag: string, since: number): Tree
   if (!g) return [...out, { text: 'no task started from this session in the last 24 h' }]
   const c = g.counts ?? {}
   const n = (k: string) => c[k] ?? 0
-  out.push({ text: join([n('running') ? n('running') + ' running' : null, n('waiting') ? n('waiting') + ' waiting' : null,
-    n('done') ? n('done') + ' done' : null, n('failed') ? n('failed') + ' failed' : null,
-    n('unknown') ? n('unknown') + ' unknown' : null]) || 'no task started from this session in the last 24 h' })
-  if (g.attention) out.push({ text: '! ' + g.attention + (g.attention === 1 ? ' needs' : ' need') + ' attention', attn: true })
+  // counts_at_least (mergeLocal): a local-only task may be one the provider counted but did not list: lower bounds
+  const ge = g.counts_at_least ? '≥' : ''
+  const cnt = (k: string) => n(k) ? ge + n(k) + ' ' + k : null
+  out.push({ text: join([cnt('running'), cnt('waiting'), cnt('done'), cnt('failed'), cnt('unknown')]) ||
+    'no task started from this session in the last 24 h' })
+  if (g.attention) out.push({ text: '! ' + ge + g.attention + (g.attention === 1 && !ge ? ' needs' : ' need') + ' attention', attn: true })
   const tasks = g.tasks ?? []
   const live = tasks.filter(t => t.status === 'running' || t.status === 'waiting')
   const rest = tasks.filter(t => !(t.status === 'running' || t.status === 'waiting'))
@@ -558,7 +560,7 @@ export function treeLines(v: PulseSessionView, tag: string, since: number): Tree
   if (live.length > RUNNING_MAX) out.push({ text: `  +${live.length - RUNNING_MAX} more running (dashboard)` })
   for (const t of rest.slice(0, MINE_RECENT_MAX)) out.push(...taskLines(t, 0, since))
   const hidden = Math.max(0, rest.length - MINE_RECENT_MAX) + (g.tasks_hidden ?? 0)
-  if (hidden) out.push({ text: `  +${hidden} more finished (dashboard)` })
+  if (hidden) out.push({ text: g.counts_at_least ? `  up to ${hidden} more finished (dashboard)` : `  +${hidden} more finished (dashboard)` })
   const routed = g.routed ?? []
   if (routed.length) {
     out.push({ text: 'routed directly' })
@@ -606,9 +608,10 @@ export type LocalTask = PulseTreeTask & { parent_task_id?: string | null }
 /** This session's own tasks in the log text (`tag`'s origin, or a parent's along parent_task_id within the log), the
  * last 24 h, newest first. Only the metadata fields are read, each by the provider's own rule; the cwd, the prompt
  * and anything else in a line are never kept. Pure: `nowS` is the clock in seconds. */
-export function parseLocalTasks(text: string, tag: string, nowS: number): LocalTask[] {
+export function parseLocalTasks(text: string, tag: string, nowS: number, cut = false): LocalTask[] {
   let tail = text.length > LOCAL_TAIL_BYTES ? text.slice(text.length - LOCAL_TAIL_BYTES) : text
-  if (tail.length < text.length) tail = tail.slice(tail.indexOf('\n') + 1)          // drop the cut first line
+  // drop the cut first line: cut here, or by the reader (`cut`: the text is already the file's tail, readLocalLog)
+  if (cut || tail.length < text.length) tail = tail.slice(tail.indexOf('\n') + 1)
   const lines = tail.split('\n')
   type Rec = { id: string; start: number | null; end: number | null; final: string | null; title: string | null;
     host: string | null; model: string | null; lane: string | null; origin: string | null; parent: string | null; dur: number | null }
@@ -685,6 +688,15 @@ export function mergeLocal(view: PulseSessionView | null, local: LocalTask[], ta
   const nodes = new Map<string, PulseTreeTask>()
   const walk = (ts: PulseTreeTask[] = []) => ts.forEach(t => { if (t.task_id) nodes.set(t.task_id, t); walk(t.tasks) })
   if (g) walk(g.tasks)
+  // The provider lists 20 top-level tasks and counts all of them (tasks_hidden). A top-level task only this log has
+  // (or one under such a task) may be one of the hidden ones, already counted: its group's counts are then lower
+  // bounds (counts_at_least), per status max(the provider's, those local-only tasks') plus the exact rest, never a
+  // sum that may count a task twice. A local-only task under a node the provider listed is exact: it was not hidden.
+  const capped = !!g && (g.tasks_hidden ?? 0) > 0
+  const orig = { ...(g?.counts ?? {}) }, origAttn = g?.attention ?? 0
+  const lower: Record<string, number> = {}
+  const maybeHidden = new Set<string>()
+  let lowerAttn = 0
   const counts = (gg: PulseOrchestrator) => (gg.counts ??= {})
   const tally = (gg: PulseOrchestrator, t: PulseTreeTask, k: number) => {
     const c = counts(gg)
@@ -716,8 +728,18 @@ export function mergeLocal(view: PulseSessionView | null, local: LocalTask[], ta
     if (parent) (parent.tasks ??= []).unshift(node)
     else (g.tasks ??= []).unshift(node)
     nodes.set(id, node)
-    tally(g, node, 1)
+    if (capped && (!parent || maybeHidden.has(t.parent_task_id!))) {   // maybe a hidden one: a lower bound
+      maybeHidden.add(id)
+      lower[node.status ?? 'unknown'] = (lower[node.status ?? 'unknown'] ?? 0) + 1
+      lowerAttn += attnOf(node)
+    } else tally(g, node, 1)
     added++
+  }
+  if (g && Object.keys(lower).length) {
+    const c = counts(g)
+    for (const [k, n] of Object.entries(lower)) c[k] = (c[k] ?? 0) + Math.max(0, n - (orig[k] ?? 0))
+    g.attention = (g.attention ?? 0) + Math.max(0, lowerAttn - origAttn)
+    g.counts_at_least = true
   }
   if (g) {
     const rank: Record<string, number> = { running: 0, waiting: 1, failed: 2, unknown: 3, done: 4 }
@@ -747,17 +769,41 @@ export async function localLogPath($: Pick<EngineInterface, 'env'>): Promise<str
   return String(dir).replace(/\/+$/, '') + '/' + LOCAL_LOG
 }
 
-/** Read this machine's log for `tag`'s tasks, at most every LOCAL_POLL_MS per tag. A missing or unreadable log is no
- * local tasks, said nowhere: the provider's view stands on its own then. Never throws. */
-export async function readLocal($: Pick<EngineInterface, 'env' | 'fs' | 'state' | 'clock'>, tag: string): Promise<void> {
+/** The note when the log is over LOCAL_TAIL_BYTES and its tail could not be read. */
+export const LOCAL_SKIP_NOTE = "this machine's task log is over 2 MiB and its tail could not be read: its tasks are not merged"
+
+/** The last LOCAL_TAIL_BYTES of the log, never the whole file (review round 3, P2). The mod host's `$.fs.read` has no
+ * offset or length (it reads a whole file, up to 4 MiB), so: `$.fs.stat` first; a log within the bound is read whole
+ * (that IS its tail); a larger one through `tail -c` (`$.process.run`, no shell, which seeks to the end and copies
+ * only those bytes). `cut`: the text starts mid-file (its first line is partial). Throws when the log is missing or
+ * unreadable; `{ text: null }` when it is over the bound and `tail` failed (the caller says so, LOCAL_SKIP_NOTE). */
+export async function readLocalLog($: Pick<EngineInterface, 'fs' | 'process'>, path: string): Promise<{ text: string | null; cut: boolean }> {
+  const st = await $.fs.stat(path)
+  if (st.kind !== 'file') throw new Error('not a file')
+  if (st.size <= LOCAL_TAIL_BYTES) return { text: String(await $.fs.read(path)), cut: false }
+  try {
+    const r = await $.process.run([TAIL_BIN, '-c', String(LOCAL_TAIL_BYTES), path], { timeoutMs: 10_000 })
+    if (r.exitCode === 0 && typeof r.stdout === 'string') return { text: r.stdout, cut: true }
+  } catch { /* cannot start or timed out: skipped below */ }
+  return { text: null, cut: true }
+}
+/** Absolute, so no PATH entry can stand in for it. */
+export const TAIL_BIN = '/usr/bin/tail'
+
+/** Read this machine's log for `tag`'s tasks, at most every LOCAL_POLL_MS per tag, its last LOCAL_TAIL_BYTES only
+ * (readLocalLog). A missing or unreadable log is no local tasks, said nowhere: the provider's view stands on its own
+ * then. A log over the bound whose tail could not be read is no local tasks, with LOCAL_SKIP_NOTE. Never throws. */
+export async function readLocal($: Pick<EngineInterface, 'env' | 'fs' | 'process' | 'state' | 'clock'>, tag: string): Promise<void> {
   const at = await $.clock.now()
   const cur = await read($, localHeld)
   if (cur && cur.tag === tag && at - cur.at < LOCAL_POLL_MS) return
-  let tasks: LocalTask[] = []
+  let tasks: LocalTask[] = [], note: string | null = null
   try {
-    tasks = parseLocalTasks(String(await $.fs.read(await localLogPath($))), tag, at / 1000)
+    const { text, cut } = await readLocalLog($, await localLogPath($))
+    if (text === null) note = LOCAL_SKIP_NOTE
+    else tasks = parseLocalTasks(text, tag, at / 1000, cut)
   } catch { /* no log yet, or unreadable: no local tasks */ }
-  await update($, localHeld, () => ({ tag, at, tasks }))
+  await update($, localHeld, () => ({ tag, at, tasks, note }))
 }
 
 const S1_FLAGS: Record<string, string> = { 'no-promote': 'promotion held', 'no-train-tonight': 'no training tonight',
@@ -855,6 +901,7 @@ export const register: Register = (on, options) => {
         head('This session'),
         ...treeLines(merged.view, tr.tag, since).map(l => l.attn ? Text({ bold: true, children: l.text }) : line(l.text)),
         ...(merged.added ? [dim(LOCAL_NOTE(merged.added))] : []),
+        ...(loc?.note && loc.tag === tr.tag ? [dim(loc.note)] : []),
         ...(trProblem ? [dim(trProblem + ' · showing ' + age(since) + ' old data')] : []),
         dim(CLEAR_NOTE),
       ]
@@ -872,6 +919,7 @@ export const register: Register = (on, options) => {
         ...(trProblem ? [dim(trProblem)] : []),
         ...(own ? sessionLines(own.data, me, (nowMs - own.at) / 1000).map(line) : []),
         ...mineLocal.map(l => l.attn ? Text({ bold: true, children: l.text }) : line(l.text)),
+        ...(loc?.note && me?.tag && loc.tag === me.tag ? [dim(loc.note)] : []),
         ...(lv ? [] : [dim(me && !me.tag ? me.why || '' : 'waiting for the live view…')]),
         ...(me?.tag ? [dim(CLEAR_NOTE)] : []),
         head('Running'),

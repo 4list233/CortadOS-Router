@@ -189,6 +189,8 @@ export interface PulseOrchestrator {
   tasks_hidden?: number
   routed?: PulseSubSession[]
   routed_hidden?: number
+  /** Set by the pane only (mergeLocal): a local-only task may be one the provider counted but hid; counts are lower bounds. */
+  counts_at_least?: boolean
 }
 export interface PulseSessionView {
   version?: number
@@ -198,7 +200,7 @@ export interface PulseSessionView {
   // scope "provider host and heartbeats": the tree also holds the tasks the hosts' heartbeats carry (#118),
   // task_hosts names those hosts
   orchestrators?: PulseLiveSection & { items?: PulseOrchestrator[]; scope?: string; truncated?: boolean;
-    inputs_truncated?: string[]; session_filter?: string; task_hosts?: string[] }
+    inputs_truncated?: string[]; session_filter?: string; task_hosts?: string[]; conflicts?: number }
   s1?: PulseLive['s1']
   hosts?: PulseLive['hosts']
 }
@@ -211,7 +213,7 @@ declare module 'claude-code' {
       mine: { tag: string | null; why: string | null } | null
       mineLive: { data: PulseLive; at: number; tag: string } | null
       tree: { data: PulseSessionView; at: number; tag: string; base: string } | null; treeErr: string | null
-      local: { tag: string; at: number; tasks: (PulseTreeTask & { parent_task_id?: string | null })[] } | null
+      local: { tag: string; at: number; tasks: (PulseTreeTask & { parent_task_id?: string | null })[]; note?: string | null } | null
     }
   }
 }

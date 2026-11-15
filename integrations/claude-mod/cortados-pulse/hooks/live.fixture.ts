@@ -657,7 +657,8 @@ export default {
     ],
     "truncated": false,
     "inputs_truncated": [],
-    "task_hosts": []
+    "task_hosts": [],
+    "conflicts": 0
   },
   "routed": {
     "as_of": 1800000000.0,

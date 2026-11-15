@@ -3,20 +3,46 @@ import { FALLBACK, POLL_MS, LIVE_POLL_MS, STALE_AFTER_S, expandHome, resolveProv
   pollLive, age, pct, gib, dur, leftPct, laneLabel, laneLines, usageLines, deviceLines, laneOrder, taskLine, conversationLine,
   runningLines, fleetLines, hwText, identify, sessionLines, sessionTag, OFFICE_SALT_FILE, MINE_RECENT_MAX, CLEAR_NOTE,
   SESSION_PATH, treeLines, tokShort, glyph, fetchTree, parseLocalTasks, mergeLocal, localLines, readLocal, LOCAL_POLL_MS,
-  LOCAL_TAIL_BYTES, LOCAL_NOTE, STALE_HB_PHASE } from './register'
+  LOCAL_TAIL_BYTES, LOCAL_NOTE, STALE_HB_PHASE, readLocalLog, LOCAL_SKIP_NOTE, TAIL_BIN } from './register'
 import liveFixture from './live.fixture'
 import sessionFixture from './session.fixture'
 
 const TOKEN = 'sekrit-token-123'
 
 /** A `$` with env, fs, http, state and clock: the five nouns poll() touches. */
-function fakeDollar(opts: { env?: Record<string, string>; files?: Record<string, string>; http?: (url: string, init: any) => any }) {
+/** The mod host's limits as the fake models them: $.fs.read refuses a file over 4 MiB (no offset or length exists);
+ * $.process.run's default is a `tail -c N <path>` over the fake files, each call recorded. */
+const HOST_READ_MAX = 4 * 2 ** 20
+const utf8 = (t: string) => new TextEncoder().encode(t)
+function fakeDollar(opts: { env?: Record<string, string>; files?: Record<string, string>; http?: (url: string, init: any) => any;
+  process?: (argv: readonly string[]) => any }) {
+  const io = { reads: [] as string[], runs: [] as (readonly string[])[] }
   const state = new Map<string, { value: unknown; version: number }>()
   const key = (ref: any) => ref.plugin + '/' + ref.key
   const calls: { urls: string[]; inits: any[] } = { urls: [], inits: [] }
   const $ = {
     env: { get: async (name: string) => opts.env?.[name] },
-    fs: { read: async (path: string) => { if (opts.files && path in opts.files) return opts.files[path]; throw new Error('ENOENT ' + path) } },
+    fs: {
+      read: async (path: string) => {
+        io.reads.push(path)
+        if (!opts.files || !(path in opts.files)) throw new Error('ENOENT ' + path)
+        if (utf8(opts.files[path]).length > HOST_READ_MAX) throw new Error('over 4 MiB')
+        return opts.files[path]
+      },
+      stat: async (path: string) => {
+        if (!opts.files || !(path in opts.files)) throw new Error('ENOENT ' + path)
+        return { kind: 'file', size: utf8(opts.files[path]).length, mtimeMs: 0, isLink: false }
+      },
+    },
+    process: { run: async (argv: readonly string[]) => {
+      io.runs.push(argv)
+      if (opts.process) return opts.process(argv)
+      const [bin, flag, n, path] = argv
+      if (bin !== '/usr/bin/tail' || flag !== '-c' || !opts.files || !(path in opts.files)) return { exitCode: 1, stdout: '', stderr: 'no' }
+      const bytes = utf8(opts.files[path])
+      return { exitCode: 0, stdout: new TextDecoder().decode(bytes.slice(Math.max(0, bytes.length - Number(n)))), stderr: '' }
+    } },
+    io,
     http: { fetch: async (url: string, init: any) => { calls.urls.push(url); calls.inits.push(init); return opts.http ? opts.http(url, init) : { status: 200, ok: true, headers: {}, text: '{}' } } },
     state: {
       get: async (ref: any) => state.get(key(ref)) ?? { value: undefined, version: 0 },
@@ -681,6 +707,77 @@ test('local tasks merge into the session view by task id, once, with the counts 
   expect(LOCAL_NOTE(1)).toMatch(/1 task from this machine's task log only/)
 })
 
+test('the local log is read bounded: stat first, a large log through tail -c only, never read whole', async () => {
+  const path = '/tmp/state/child-tasks.jsonl'
+  const env = { HOME: '/tmp/home', CORTADOS_HOME: '/tmp/state' }
+  // within the bound: read whole (that is its tail), no process
+  const small = fakeDollar({ env, files: { [path]: localLog() } })
+  expect(await readLocalLog(small as any, path)).toEqual({ text: localLog(), cut: false })
+  expect([small.io.reads, small.io.runs]).toEqual([[path], []])
+  // 5 MiB: over the bound and over the host's own 4 MiB read limit. Only the last 2 MiB cross, through tail -c; the
+  // file is never read, and the partial first line of the tail is dropped
+  const filler = (JSON.stringify({ ts: NOW_S - 10, event: 'started', task_id: 't20261114100000-000000ff', origin_session: MINE_TAG,
+    title: 'old filler' }) + '\n').repeat(Math.ceil(5 * 2 ** 20 / 120))
+  const big = filler + 'PARTIAL-' + localLog()
+  const $ = { ...fakeDollar({ env, files: { [path]: big } }), clock: { now: async () => NOW_S * 1000 } }
+  const got = await readLocalLog($ as any, path)
+  expect(got.cut).toBe(true)
+  expect(utf8(got.text!).length).toBe(LOCAL_TAIL_BYTES)
+  expect($.io.reads).toEqual([])
+  expect($.io.runs).toEqual([[TAIL_BIN, '-c', String(LOCAL_TAIL_BYTES), path]])
+  expect(TAIL_BIN).toBe('/usr/bin/tail')                     // absolute: no PATH entry stands in for it
+  await readLocal($ as any, MINE_TAG)
+  const held = (await ($ as any).state.get({ plugin: 'cortados-pulse', key: 'local' })).value
+  expect(held.tasks.map((t: any) => t.task_id)).toEqual(['t20261114100000-000000ff', HERE_KID, HERE, HERE_DONE])
+  expect(held.note).toBe(null)
+  expect($.io.reads).toEqual([])
+  // a cut text drops its first line even when it is shorter than the bound
+  const cutText = '{"ts": ' + (NOW_S - 5) + ', "event": "started", "task_id": "t20261114100000-000000ee", "origin_session": "' + MINE_TAG + '"}\n' + localLog()
+  expect(parseLocalTasks(cutText, MINE_TAG, NOW_S, true).some(t => t.task_id === 't20261114100000-000000ee')).toBe(false)
+  expect(parseLocalTasks(cutText, MINE_TAG, NOW_S).some(t => t.task_id === 't20261114100000-000000ee')).toBe(true)
+  // tail failing (or not starting): no local tasks, said, and still never a whole read
+  for (const proc of [() => ({ exitCode: 1, stdout: '', stderr: 'x' }), () => { throw new Error('cannot start') }]) {
+    const f = { ...fakeDollar({ env, files: { [path]: big }, process: proc }), clock: { now: async () => NOW_S * 1000 } }
+    await readLocal(f as any, MINE_TAG)
+    const h = (await (f as any).state.get({ plugin: 'cortados-pulse', key: 'local' })).value
+    expect([h.tasks, h.note, f.io.reads]).toEqual([[], LOCAL_SKIP_NOTE, []])
+  }
+  // missing: no tasks, nothing said
+  const none = fakeDollar({ env, files: {} })
+  await readLocal(none as any, MINE_TAG)
+  expect((await (none as any).state.get({ plugin: 'cortados-pulse', key: 'local' })).value.note).toBe(null)
+})
+
+test('a local-only task the provider may have counted but hidden makes the counts lower bounds, never a sum', () => {
+  // the provider's group: 20 listed, 1 more hidden past its cap, all counted (21 done). HERE_DONE (failed here) and
+  // HERE (running) are top-level and local-only: either may be the hidden one
+  const listed = Array.from({ length: 20 }, (_, i) => ({ task_id: `t20261114000000-${i.toString(16).padStart(8, '0')}`,
+    state: 'succeeded', status: 'done', started_at: NOW_S - 9000 + i, ended_at: NOW_S - 8000 + i, tasks: [] }))
+  const view = { session_filter: MINE_TAG, orchestrators: { status: 'ok', errors: [], items: [{ origin: MINE_TAG, kind: 'session',
+    counts: { done: 20, failed: 1 }, attention: 1, tasks: listed, tasks_hidden: 1 }] } }
+  const { view: v, added } = mergeLocal(view as any, parseLocalTasks(localLog(), MINE_TAG, NOW_S), MINE_TAG, NOW_S)
+  const g = v.orchestrators!.items![0]
+  expect(added).toBe(3)
+  // failed: max(provider 1, local 1) = 1, not 2; running: HERE and HERE_KID (under HERE: hidden with it, if at all)
+  expect([g.counts, g.attention, g.counts_at_least]).toEqual([{ done: 20, failed: 1, running: 2 }, 1, true])
+  const lines = treeLines(v, MINE_TAG, 0).map(l => l.text)
+  expect(lines[0]).toBe('≥2 running · ≥20 done · ≥1 failed')
+  expect(lines).toContain('! ≥1 need attention')
+  // 21 finished listed (20 + HERE_DONE), 3 drawn, 18 more, and the hidden 1 that may be one drawn here: up to 19
+  expect(lines).toContain('  up to 19 more finished (dashboard)')
+  // a local-only task under a task the provider listed was not hidden: exact, added on top of the bound
+  const kidOfListed = parseLocalTasks(localLog([{ ts: NOW_S - 20, event: 'started', task_id: 't20261114170000-000000dd',
+    parent_task_id: listed[0].task_id, origin_session: MINE_TAG, title: 'Under a listed one' }]), MINE_TAG, NOW_S)
+  const withKid = mergeLocal(view as any, kidOfListed, MINE_TAG, NOW_S).view.orchestrators!.items![0]
+  expect(withKid.counts).toEqual({ done: 20, failed: 1, running: 3 })
+  // nothing hidden: exact sums, as before
+  const open = { ...view, orchestrators: { ...view.orchestrators, items: [{ ...view.orchestrators.items[0], tasks_hidden: 0 }] } }
+  const exact = mergeLocal(open as any, parseLocalTasks(localLog(), MINE_TAG, NOW_S), MINE_TAG, NOW_S).view.orchestrators!.items![0]
+  expect([exact.counts, exact.attention, exact.counts_at_least]).toEqual([{ done: 20, failed: 2, running: 2 }, 2, undefined])
+  expect(treeLines(mergeLocal(open as any, parseLocalTasks(localLog(), MINE_TAG, NOW_S), MINE_TAG, NOW_S).view, MINE_TAG, 0)[0].text)
+    .toBe('2 running · 20 done · 2 failed')
+})
+
 test('a task this machine saw end, or knows first-hand, replaces an older report of it', () => {
   const view = { session_filter: MINE_TAG, orchestrators: { status: 'ok', errors: [], items: [{ origin: MINE_TAG, kind: 'session',
     counts: { running: 1, unknown: 1 }, attention: 1, tasks: [
@@ -716,7 +813,7 @@ test('the poll reads the local log every 30 s per session, and it stands when th
     http: () => { throw new Error('connect ECONNREFUSED') } })
   const realRead = base.fs.read
   const $ = { ...base, session: { id: async () => sid }, clock: { now: async () => now },
-    fs: { read: async (p: string) => { if (p.endsWith('child-tasks.jsonl')) reads++; return realRead(p) } } }
+    fs: { ...base.fs, read: async (p: string) => { if (p.endsWith('child-tasks.jsonl')) reads++; return realRead(p) } } }
   await pollLive($ as any, FALLBACK, true)
   const held = (await ($ as any).state.get({ plugin: 'cortados-pulse', key: 'local' })).value
   expect([held.tag, held.tasks.map((t: any) => t.task_id)]).toEqual([tag, [HERE_KID, HERE, HERE_DONE]])

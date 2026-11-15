@@ -338,8 +338,12 @@ class TasksBlockTest(Base):
         self.assertEqual((done["state"], done["model"], done["lane"], done["workspace"]),
                          ("succeeded", "claude-sonnet-5", "claude#a", "archived"))
         self.assertAlmostEqual(done["ended_at"] - done["started_at"], 600.0, places=2)
+        # the child's own Office tag (the routed traffic's x-cortados-session, which the provider already sees) is sent
+        # to bind the run's worker to the task (review round 3, P1); the view compares it and never publishes it
+        self.assertEqual((running["session"], done["session"]), ("1111111111111111", "1111111111111111"))
+        self.assertNotIn("session", queued)                         # a browser task has no Office tags
         raw = json.dumps(block)
-        for bad in (SECRET_PROMPT, "/Users", "secret-project", "claude-app", "1111111111111111", "cwd"):
+        for bad in (SECRET_PROMPT, "/Users", "secret-project", "claude-app", "cwd"):
             self.assertNotIn(bad, raw, bad)
         for e in block["items"]:
             self.assertLessEqual(set(e), live._HB_TASK_KEYS)
@@ -392,6 +396,72 @@ class TasksBlockTest(Base):
         self.assertTrue(sent["tasks"]["truncated"])
         self.assertEqual(sent["jobs"], [])
         self.assertIn("task entries", err.getvalue())
+
+    def old_provider(self, cap=24 * 1024, knows_tasks=False):
+        """A fake provider from before #118: its 24 KiB cap is checked first (413, before any field), then an unknown
+        block is a 400. Records every body it was sent."""
+        seen = []
+
+        def opener(req, timeout):
+            seen.append(json.loads(req.data))
+            if len(req.data) > cap:
+                raise urllib.error.HTTPError(req.full_url, 413, "big", {}, io.BytesIO(
+                    b'{"type": "error", "error": {"message": "cortados: the heartbeat is too large"}}'))
+            if "tasks" in seen[-1] and not knows_tasks:
+                raise urllib.error.HTTPError(req.full_url, 400, "bad", {}, io.BytesIO(
+                    b'{"type": "error", "error": {"message": "cortados: heartbeat field (unknown field) is invalid"}}'))
+            return FakeResponse(b"{}")
+        opener.seen = seen
+        return opener
+
+    def full_log(self, now):
+        """40 tasks with full-length titles and tags: a valid tasks block over the old 24 KiB cap."""
+        return [{"ts": now - 50 - i, "event": "finished", "task_id": f"t20261114100000-{i:08x}", "host": "pro",
+                 "status": "succeeded", "duration_s": 50.0, "workspace_state": "archived"}
+                for i in range(live.HB_TASKS_MAX)] + \
+            [{"ts": now - 100 - i, "event": "started", "task_id": f"t20261114100000-{i:08x}", "host": "pro",
+                 "title": "Long task title " + "x" * 64, "origin_session": "a" * 64, "origin_project": "p" * 64,
+                 "origin_device": "d" * 32, "session": "b" * 64, "lane": "claude#a", "model": "claude-sonnet-5",
+                 "parent_task_id": f"t20261114090000-{i:08x}", "origin_via": "parent"}
+                for i in range(live.HB_TASKS_MAX)]
+
+    def test_an_old_providers_413_sheds_task_entries_then_the_block_never_the_jobs(self):
+        now = time.time()
+        for knows_tasks in (False, True):
+            opener = self.old_provider(knows_tasks=knows_tasks)
+            code, _, err = self.main("--config", str(self.config(host="pro")), opener=opener,
+                                     task_events=lambda: self.full_log(now))
+            self.assertEqual(code, 0, err)
+            seen = opener.seen
+            first = json.dumps(seen[0], separators=(",", ":")).encode()
+            self.assertEqual(len(seen[0]["tasks"]["items"]), live.HB_TASKS_MAX)
+            self.assertGreater(len(first), 24 * 1024)                     # valid for this provider, too big for that
+            self.assertLessEqual(len(first), live.HEARTBEAT_MAX_BYTES)
+            self.assertIsNone(live.validate_heartbeat(seen[0], time.time())[1])
+            self.assertIn("provider refused the size", err)
+            self.assertEqual([len(b["tasks"]["items"]) for b in seen if "tasks" in b][:2], [40, 20])
+            for b in seen:                                                 # every try kept the jobs, hardware and S1
+                self.assertEqual([j["name"] for j in b["jobs"]], ["s1-scorer", "com.cortados.s1-nightly"])
+                self.assertIn("hardware", b)
+                self.assertIn("s1", b)
+            last = seen[-1]
+            if knows_tasks:                                                # a smaller block fit: it is said cut
+                self.assertEqual((len(last["tasks"]["items"]), last["tasks"]["truncated"]), (20, True))
+            else:                                                          # it fit, then the old fields rule said no
+                self.assertNotIn("tasks", last)
+                self.assertIn("refused the tasks block", err)
+
+    def test_a_413_that_never_fits_sheds_only_the_optional_blocks(self):
+        now = time.time()
+        opener = self.old_provider(cap=10)                                 # nothing fits: the post fails, said
+        code, _, err = self.main("--config", str(self.config(host="pro")), opener=opener,
+                                 task_events=lambda: self.full_log(now))
+        self.assertEqual(code, 1)
+        self.assertIn("413", err)
+        self.assertEqual([len(b["tasks"]["items"]) for b in opener.seen if "tasks" in b], [40, 20, 10, 5, 2, 1])
+        last = opener.seen[-1]
+        self.assertEqual(set(last), {"host", "ttl_s", "jobs", "hardware", "s1"})   # never the jobs or hardware
+        self.assertEqual(len(last["jobs"]), 2)
 
     def test_tasks_config_is_a_switch(self):
         self.assertFalse(hbs.load_config(self.config(tasks=False))["tasks"])
