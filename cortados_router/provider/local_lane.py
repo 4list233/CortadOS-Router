@@ -28,10 +28,10 @@ import http.client
 import json
 import os
 import urllib.parse
-from typing import Any
+from typing import Any, Callable
 
 from cortados_router.compat import getenv
-from cortados_router.safe_text import safe_error_text
+from cortados_router.safe_text import safe_error_body, safe_error_text
 
 CONFIG_ENV = "CORTADOS_LOCAL_RESOURCES_CONFIG"
 LANE_PREFIX = "local-"
@@ -429,7 +429,8 @@ def auto_routed_unavailable(node: dict[str, Any], model: dict[str, Any], reason:
 
 
 def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
-          echo_model: str, reply: list | None = None, auto_routed: bool = False) -> str:
+          echo_model: str, reply: list | None = None, auto_routed: bool = False,
+          commit: Callable[[list], None] | None = None) -> str:
     """Relay one turn to the node's /v1/messages and the answer back to the client. Returns the outcome: "completed"
     (a whole message or a parsed message_stop), "rejected" (the node answered an HTTP error, relayed as-is),
     "unreachable" (503 sent), or "incomplete" (the stream broke). The response names `echo_model` (what the client
@@ -438,7 +439,13 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
     fingerprint the reply and continue the conversation by its history, as for every other pin. `auto_routed`: the
     conversation was moved here by S1's auto-route (routing.auto_local), not pinned; an unavailable node (unreachable,
     dropping requests, refusing the token, or the gate's fixed policy refusal: battery, switch off) is then worded by
-    auto_routed_unavailable instead of naming a `sub/` pin the person never made."""
+    auto_routed_unavailable instead of naming a `sub/` pin the person never made. `commit`, when given, is called with
+    the whole reply once, BEFORE the bytes that complete the answer reach the client (the non-streaming body, or the
+    SSE event carrying message_stop): the server records the conversation's history there, so a client that
+    continues the instant it has the answer always finds it (#117 review round 5). It is called only on a turn that
+    returns "completed" unless a later client write fails; the server then undoes it (the outcome is "incomplete").
+    An error body from the node is relayed with its message escaped and capped (safe_error_body); a successful
+    answer's bytes are never altered beyond the model name."""
     reply = [] if reply is None else reply
     data = json.dumps(_node_body(body, model)).encode()
     # Safety net (#108): an auto-routed turn the client did not ask to think on, which still ended on max_tokens with
@@ -494,11 +501,12 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                 _send_json(handler, 502, _error("api_error", f"cortados: local node {node['node']} answered HTTP "
                                                 f"{resp.status} and its error body was truncated or stalled"))
                 return "incomplete"
-            try:
-                json.loads(raw)
-            except ValueError:
-                raw = json.dumps(_error("api_error", f"cortados: local node {node['node']} answered HTTP "
-                                        f"{resp.status}: {raw[:300].decode('utf-8', 'replace')}")).encode()
+            # A JSON error object is relayed with its message escaped and capped, every other field kept as sent;
+            # anything else becomes a cortados error quoting its start (through _error, so escaped as well).
+            safe = safe_error_body(raw)
+            raw = safe if safe is not None else json.dumps(_error(
+                "api_error", f"cortados: local node {node['node']} answered HTTP {resp.status}: "
+                f"{raw[:300].decode('utf-8', 'replace')}")).encode()
             code = resp.status if 400 <= resp.status < 600 else 502
             _refused(handler, code, "api_error", "the local node answered an HTTP error")
             try:
@@ -529,8 +537,11 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                 msg["model"] = echo_model
             if isinstance(msg, dict) and isinstance(msg.get("content"), list):
                 reply.extend(b for b in msg["content"] if isinstance(b, dict))
+            complete = isinstance(msg, dict) and msg.get("type") == "message"
+            if complete and commit is not None:
+                commit(reply)                                    # recorded before the client can continue from it
             _send_json(handler, 200, msg)
-            return "completed" if isinstance(msg, dict) and msg.get("type") == "message" else "incomplete"
+            return "completed" if complete else "incomplete"
         try:
             handler.send_response(200)
             handler.send_header("content-type", "text/event-stream")
@@ -540,7 +551,7 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
         except OSError:
             return "incomplete"
         handler.close_connection = True
-        done = starved = False
+        done = starved = committed = False
         pending: list = []                               # one SSE event's lines, written when its blank line arrives
         try:
             while True:
@@ -562,6 +573,9 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                         done = done or ev.get("type") == "message_stop"
                 pending.append(line)
                 if line in (b"\n", b"\r\n"):
+                    if done and not committed and commit is not None:
+                        commit(reply)                            # before message_stop's event is flushed
+                        committed = True
                     try:
                         handler.wfile.write(b"".join(pending))
                         handler.wfile.flush()
@@ -569,6 +583,9 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                         return "incomplete"                      # the client left
                     pending = []
             if pending and not starved:
+                if done and not committed and commit is not None:
+                    commit(reply)
+                    committed = True
                 try:
                     handler.wfile.write(b"".join(pending))
                 except OSError:

@@ -252,5 +252,27 @@ class LogSinkTests(unittest.TestCase):
         self.assertTrue(safe_text.handlers_sanitized())
 
 
+class SafeErrorBodyTests(unittest.TestCase):
+    """safe_error_body (#117 review round 5): an upstream error body's message escaped and capped, the rest kept."""
+
+    def test_the_message_shapes(self):
+        f = safe_text.safe_error_body
+        self.assertEqual(json.loads(f(b'{"type":"error","error":{"type":"x","message":"a\\nb","code":7},"id":1}')),
+                         {"type": "error", "error": {"type": "x", "message": "a\\nb", "code": 7}, "id": 1})
+        self.assertEqual(json.loads(f(b'{"error":"a\\u2028b"}')), {"error": "a\\u2028b"})
+        self.assertEqual(json.loads(f(b'{"message":"a\\tb","status":4}')), {"message": "a\\tb", "status": 4})
+        self.assertEqual(json.loads(f(b'{"error":{"message":{"nested":"a\\nb"}}}'))["error"]["message"],
+                         '{"nested": "a\\nb"}')                       # not a string: its JSON text, escaped
+        self.assertEqual(json.loads(f(b'{"error":{"type":"x"},"ok":true}')), {"error": {"type": "x"}, "ok": True})
+
+    def test_capped(self):
+        out = json.loads(safe_text.safe_error_body(json.dumps({"error": {"message": "m" * 5000}}).encode()))
+        self.assertEqual(out["error"]["message"], "m" * safe_text.ERROR_CAP + "...(+3000 chars)")
+
+    def test_not_a_json_object_is_none(self):
+        for raw in (b"<html>", b'"text"', b"[1]", b"\xff\xfe", b""):
+            self.assertIsNone(safe_text.safe_error_body(raw), raw)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,5 @@
 """Local model lanes (pin-only): sub/<local model> relays to a fake in-thread Ollama (Messages API + /api/tags)."""
+import http.client
 import json
 import os
 import sqlite3
@@ -406,6 +407,103 @@ class LocalPinTests(LocalHarness):
                     self.assertNotIn(secret[i:i + 4], text)
                 self.assertNotIn("xxxxxxxx", text)
 
+    def test_a_node_error_message_is_escaped_and_capped_its_other_fields_kept(self):
+        # #117 review round 5: the node's JSON error was forwarded as sent, its decoded message with raw newlines.
+        FakeOllama.error_body = json.dumps({"type": "error", "request_id": "r1", "error": {
+            "type": "invalid_request_error", "message": "bad\nFORGED: yes" + "q" * 3000}}).encode()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self.post(self.BODY)
+        finally:
+            FakeOllama.error_body = None
+        self.assertEqual(ctx.exception.code, 400)
+        body = json.loads(ctx.exception.read())
+        msg = body["error"]["message"]
+        self.assertTrue(msg.startswith("bad\\nFORGED: yes"))
+        self.assertNotIn("\n", msg)
+        self.assertLessEqual(len(msg), 2100)
+        self.assertEqual((body["type"], body["request_id"], body["error"]["type"]),
+                         ("error", "r1", "invalid_request_error"))
+        FakeOllama.error_body = json.dumps({"error": "ollama\r\nsays no"}).encode()   # Ollama's native shape
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self.post(self.BODY)
+        finally:
+            FakeOllama.error_body = None
+        self.assertEqual(json.loads(ctx.exception.read()), {"error": "ollama\\r\\nsays no"})
+
+    def test_successful_local_output_is_byte_identical_but_for_the_model(self):
+        # The sanitizing is for error bodies only: an answer full of newlines and escapes reaches the client as sent.
+        text = "line one\nline two\r\n\x1b[31m\u2028" + "w" * 3000
+        sent = {"id": "msg_9", "type": "message", "role": "assistant", "model": TAG,
+                "content": [{"type": "text", "text": text}], "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 3}}
+
+        class H:
+            close_connection = False
+
+            def __init__(self):
+                import io
+                self.wfile, self.status = io.BytesIO(), None
+
+            def send_response(self, code):
+                self.status = code
+
+            def send_header(self, *a):
+                pass
+
+            def end_headers(self):
+                pass
+
+        class Resp:
+            status = 200
+
+            def __init__(self, raw):
+                import io
+                self._f = io.BytesIO(raw)
+
+            def read(self, *a):
+                return self._f.read(*a)
+
+            def readline(self):
+                return self._f.readline()
+
+        class Conn:
+            def __init__(self, raw):
+                self.raw, self.sock = raw, mock.Mock()
+
+            def connect(self):
+                pass
+
+            def request(self, *a, **k):
+                pass
+
+            def getresponse(self):
+                return Resp(self.raw)
+
+            def close(self):
+                pass
+
+        node, model = local_lane.find("qwen-27b")
+        h = H()
+        with mock.patch.object(local_lane, "_connection", lambda *a: Conn(json.dumps(sent).encode())):
+            out = local_lane.serve(h, self.BODY, node, model, echo_model="sub/qwen-27b")
+        self.assertEqual(out, "completed")
+        self.assertEqual(h.wfile.getvalue(), json.dumps({**sent, "model": "sub/qwen-27b"}).encode())
+        events = [{"type": "message_start", "message": {**sent, "content": []}},
+                  {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                  {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+                  {"type": "content_block_stop", "index": 0},
+                  {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}},
+                  {"type": "message_stop"}]
+        stream = b"".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n".encode() for e in events)
+        h = H()
+        with mock.patch.object(local_lane, "_connection", lambda *a: Conn(stream)):
+            out = local_lane.serve(h, {**self.BODY, "stream": True}, node, model, echo_model="sub/qwen-27b")
+        self.assertEqual(out, "completed")
+        first, rest = stream.split(b"\n\n", 1)
+        self.assertEqual(h.wfile.getvalue().split(b"\n\n", 1)[1], rest)      # all but message_start's model rename
+
     def test_a_relay_crash_still_answers_and_cleans_up(self):
         real = local_lane.serve
         local_lane.serve = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
@@ -563,6 +661,9 @@ class LocalConversationPinTests(LocalHarness):
         got = self.post(first)
         session = next(iter(self.reg.sessions.values()))
         history = list(session.history)
+        # Recorded before the answer reached the client (#117 review round 5): this read no longer races the
+        # handler's post-delivery bookkeeping, which is what made this test flaky under load.
+        self.assertEqual(len(history), 1)
         big = self.follow(first, got["content"], "sub/qwen-27b")
         big["messages"][-1]["content"][0]["content"] = "x" * (4 * 40000)      # ≈40k tokens > 32k context
         code, msg = self.error_of(big)
@@ -611,6 +712,98 @@ class LocalConversationPinTests(LocalHarness):
         self.assertEqual(list(self.reg.sessions.values()), [new])
         # The conversation continues on the rebuilt session (before the fix this was a terminal no_writer).
         self.assertEqual(self.post(self.follow(compacted, rc["content"], "sub/qwen-27b"))["stop_reason"], "tool_use")
+
+    def _paused_after_delivery(self, deliver):
+        """#117 review round 5, the reviewer's technique: the first turn's handler is held in _office_turn_end (the
+        answer is already delivered, the turn lock still held); a continuation sent at that instant must find the
+        conversation (its lookup runs before the lock) and be served once the first turn ends, never a terminal
+        no_writer. `deliver(first)` sends the opener and returns its reply content once the client has it whole."""
+        first = self.opener("sub/qwen-27b", stream=False)
+        real_end, held, go = server.Handler._office_turn_end, threading.Event(), threading.Event()
+        looked_up, out = threading.Event(), {}
+
+        def end(handler, session, key, outcome):
+            if not held.is_set():
+                held.set()
+                go.wait(10)
+            return real_end(handler, session, key, outcome)
+
+        real_find = self.reg.find
+
+        def find(turn, *a, **kw):
+            try:
+                return real_find(turn, *a, **kw)
+            finally:
+                if turn.history:                            # the continuation's lookup, not the opener's
+                    looked_up.set()
+        with mock.patch.object(server.Handler, "_office_turn_end", end), \
+                mock.patch.object(self.reg, "find", find):
+            box = {}
+            t1 = threading.Thread(target=lambda: box.update(content=deliver(first)))
+            t1.start()
+            self.assertTrue(held.wait(10))                  # the answer is out; the handler is paused after it
+            deadline = time.time() + 10
+            while "content" not in box and time.time() < deadline:
+                time.sleep(0.01)                            # the client side finishing its read of the answer
+            self.assertIn("content", box)
+            nxt = self.follow(first, box["content"], "sub/qwen-27b")
+            t2 = threading.Thread(target=lambda: out.update(r=self.status_and_body(nxt)))
+            t2.start()
+            self.assertTrue(looked_up.wait(10))             # the continuation's lookup ran while the first was paused
+            go.set()
+            t1.join(30)
+            t2.join(30)
+        code, got = out["r"]
+        self.assertEqual(code, 200, got)
+        self.assertEqual(got["stop_reason"], "tool_use")
+        self.assertEqual(len(FakeOllama.seen), 2)
+        (session,) = self.reg.sessions.values()
+        self.assertEqual(len(session.history), 2)
+
+    def test_a_continuation_sent_the_instant_the_answer_arrives_is_served(self):
+        self._paused_after_delivery(lambda first: self.post(first)["content"])
+
+    def test_a_continuation_sent_the_instant_a_streamed_answer_ends_is_served(self):
+        def deliver(first):
+            # Read the stream only up to message_stop: the handler is still paused, so the socket never closes.
+            conn = http.client.HTTPConnection("127.0.0.1", self.httpd.server_port, timeout=30)
+            conn.request("POST", "/v1/messages", body=json.dumps({**first, "stream": True}).encode(),
+                         headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
+                                  # the same client name urllib sends: the conversation's scope includes it
+                                  "user-agent": f"Python-urllib/{sys.version_info[0]}.{sys.version_info[1]}",
+                                  **self.HEADERS})
+            resp = conn.getresponse()
+            blocks = []
+            while True:
+                line = resp.readline()
+                self.assertTrue(line, "the stream ended before message_stop")
+                if line.startswith(b"data:"):
+                    ev = json.loads(line[5:])
+                    if ev["type"] == "content_block_start":
+                        blocks.append(ev["content_block"])
+                    if ev["type"] == "message_stop":
+                        break
+            self.addCleanup(conn.close)
+            return blocks
+        self._paused_after_delivery(deliver)
+
+    def test_a_relay_failing_after_the_commit_leaves_the_history_as_it_was(self):
+        # The history is recorded before the final write; a turn that then fails (here the final write raises out of
+        # the relay; the server answers 502) is undone, so the same history retried continues the conversation.
+        first = self.opener("sub/qwen-27b")
+        got = self.post(first)
+        (session,) = self.reg.sessions.values()
+        before = (list(session.history), session.awaiting_tool_result)
+        real_send = local_lane._send_json
+
+        def broken(handler, code, obj):
+            raise RuntimeError("final write failed")
+        with mock.patch.object(local_lane, "_send_json", broken):
+            code, _ = self.status_and_body(self.follow(first, got["content"], "sub/qwen-27b"))
+        self.assertEqual(code, 502)
+        self.assertEqual((session.history, session.awaiting_tool_result), before)
+        self.assertIs(real_send, local_lane._send_json)
+        self.assertEqual(self.post(self.follow(first, got["content"], "sub/qwen-27b"))["stop_reason"], "tool_use")
 
     def status_and_body(self, body):
         try:

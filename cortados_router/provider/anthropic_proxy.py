@@ -21,6 +21,9 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
+from cortados_router.provider.anthropic_wire import error_json
+from cortados_router.safe_text import safe_error_body
+
 API_BASE = os.environ.get("CORTADOS_ANTHROPIC_API_BASE", "https://api.anthropic.com")
 API_VERSION = os.environ.get("CORTADOS_ANTHROPIC_API_VERSION", "2023-06-01")
 UPSTREAM_TIMEOUT_S = float(os.environ.get("CORTADOS_ANTHROPIC_API_TIMEOUT_S", "1800"))
@@ -179,6 +182,34 @@ def _reveal_chunk(chunk: bytes, suffix: str) -> tuple[bytes, bool]:
     return chunk, False
 
 
+def _send_error(handler: Any, code: int, kind: str, message: str) -> None:
+    """A cortados-generated error, built by anthropic_wire.error_json (its message escaped and capped, #117 review
+    round 5), sent best-effort: a client that is gone changes nothing."""
+    _send_raw_error(handler, code, "application/json", json.dumps(error_json(kind, message)).encode())
+
+
+def _send_raw_error(handler: Any, code: int, content_type: str, payload: bytes) -> None:
+    try:
+        handler.send_response(code)
+        handler.send_header("content-type", content_type)
+        handler.send_header("content-length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
+    except OSError:
+        pass
+
+
+def upstream_error_payload(code: int, payload: bytes) -> bytes:
+    """The body relayed for an upstream HTTP error: a JSON object with its error message escaped and capped and every
+    other field as the API sent it (safe_error_body); anything else (HTML from a proxy, a truncated body) becomes a
+    cortados error quoting its start, escaped the same way."""
+    safe = safe_error_body(payload)
+    if safe is not None:
+        return safe
+    return json.dumps(error_json("api_error", f"cortados: upstream rejected the request (HTTP {code}): "
+                                 f"{payload[:300].decode('utf-8', 'replace')}")).encode()
+
+
 def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: str | None = None,
           urlopen: Callable[..., Any] | None = None, model_suffix: str | None = None) -> tuple[dict[str, Any], str]:
     """Proxy one turn to the real API and relay the response to the client. Returns (usage, outcome):
@@ -196,31 +227,14 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         # A pre-dispatch construction/validation error (e.g. a misconfigured non-HTTPS/non-Anthropic upstream): the
         # request is NOT built and nothing is sent, so nothing is billed -> a certain rejection (settle zero). This
         # catch is scoped to build_upstream ONLY, so it never masks a post-dispatch opener/response error as rejected.
-        msg = json.dumps({"type": "error", "error": {"type": "invalid_request_error",
-                          "message": f"cortados: request not dispatched ({exc})"}}).encode()
-        try:
-            handler.send_response(400)
-            handler.send_header("content-type", "application/json")
-            handler.send_header("content-length", str(len(msg)))
-            handler.end_headers()
-            handler.wfile.write(msg)
-        except OSError:
-            pass
+        _send_error(handler, 400, "invalid_request_error", f"cortados: request not dispatched ({exc})")
         return {}, "rejected"
     bad_header = invalid_header(headers)
     if bad_header is not None:
         # A malformed outbound header (a client-supplied beta, or a mis-configured credit key) means nothing is sent,
         # so nothing is billed -> a certain pre-dispatch rejection. Relay a 400 naming the header (never its value).
-        msg = json.dumps({"type": "error", "error": {"type": "invalid_request_error",
-                          "message": f"cortados: outbound header {bad_header!r} is malformed; request not dispatched"}}).encode()
-        try:
-            handler.send_response(400)
-            handler.send_header("content-type", "application/json")
-            handler.send_header("content-length", str(len(msg)))
-            handler.end_headers()
-            handler.wfile.write(msg)
-        except OSError:
-            pass
+        _send_error(handler, 400, "invalid_request_error",
+                    f"cortados: outbound header {bad_header!r} is malformed; request not dispatched")
         return {}, "rejected"
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     streaming = bool(body.get("stream"))
@@ -228,43 +242,21 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         resp = open_fn(req, timeout=UPSTREAM_TIMEOUT_S)
     except urllib.error.HTTPError as exc:
         # The API REJECTED the turn: nothing is billed, regardless of whether we can read or relay the error body.
+        # Its body is relayed with the error message escaped and capped, the other fields as sent (#117 review round 5).
         try:
-            payload = exc.read()
+            payload = upstream_error_payload(exc.code, exc.read())
         except (OSError, http.client.HTTPException):
-            payload = b'{"type":"error","error":{"type":"api_error","message":"cortados: upstream rejected the request"}}'
-        try:
-            handler.send_response(exc.code)
-            handler.send_header("content-type", (exc.headers.get("content-type") if exc.headers else None) or "application/json")
-            handler.send_header("content-length", str(len(payload)))
-            handler.end_headers()
-            handler.wfile.write(payload)
-        except OSError:
-            pass
+            payload = json.dumps(error_json("api_error", "cortados: upstream rejected the request")).encode()
+        _send_raw_error(handler, exc.code, "application/json", payload)
         return {}, "rejected"
     except (urllib.error.URLError, OSError) as exc:
-        msg = json.dumps({"type": "error", "error": {"type": "api_error", "message": f"cortados: upstream API unreachable: {exc}"}}).encode()
-        try:
-            handler.send_response(502)
-            handler.send_header("content-type", "application/json")
-            handler.send_header("content-length", str(len(msg)))
-            handler.end_headers()
-            handler.wfile.write(msg)
-        except OSError:
-            pass
+        _send_error(handler, 502, "api_error", f"cortados: upstream API unreachable: {exc}")
         return {}, "unknown"   # dispatch may have reached the API; settle conservatively
     except Exception as exc:
         # Headers were validated above, so this is NOT a pre-dispatch rejection: the POST may well have been sent
         # (e.g. the stdlib raised parsing the response headers). The spend is uncertain -> "unknown", never a $0
         # rejection. Best-effort 502 to the client.
-        msg = json.dumps({"type": "error", "error": {"type": "api_error", "message": "cortados: upstream response could not be read"}}).encode()
-        try:
-            handler.send_response(502)
-            handler.send_header("content-type", "application/json")
-            handler.send_header("content-length", str(len(msg)))
-            handler.end_headers()
-            handler.wfile.write(msg)
-        except OSError:
-            pass
+        _send_error(handler, 502, "api_error", "cortados: upstream response could not be read")
         return {}, "unknown"
 
     try:

@@ -2449,9 +2449,20 @@ class Handler(BaseHTTPRequestHandler):
             t0 = time.time()
             office_key = self._office_turn_start(session, one_shot=one_shot)
             outcome = "incomplete"
+            # #117 review round 5: the reply's fingerprint is recorded BEFORE the client can see the answer complete
+            # (local_lane.serve calls this just before the final body / message_stop event is written). Recorded after
+            # delivery, a client continuing at once was looked up (Registry.find, before this lock) against the old
+            # history and refused terminally (no_writer). Undone below if the delivery then failed.
+            undo: list = []
+
+            def commit(blocks: list) -> None:
+                undo.append((len(session.history), session.awaiting_tool_result))
+                session.awaiting_tool_result = any(b.get("type") == "tool_use" for b in blocks)
+                session.history.append(anthropic_wire.reply_fingerprint(blocks))
+
             try:
                 outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model,
-                                           reply=reply, auto_routed=not route.get("pinned"))
+                                           reply=reply, auto_routed=not route.get("pinned"), commit=commit)
             except Exception as exc:             # serve handles its own I/O; anything else must still clean up
                 logger.exception("local lane: relay failed")
                 outcome = "incomplete"
@@ -2460,13 +2471,19 @@ class Handler(BaseHTTPRequestHandler):
                                 reason="the local relay failed")
                 except Exception:
                     pass                         # headers may already be out; the client sees a broken response
+            if outcome == "completed" and not undo:
+                commit(reply)                    # a serve that completed without calling it (defensive)
+            elif outcome != "completed" and undo:
+                # The client never received the whole answer (its connection broke on the final write): the
+                # conversation stays where it was, as for any failed turn. Still under the lock, so no turn ran since.
+                n, awaiting = undo[0]
+                del session.history[n:]
+                session.awaiting_tool_result = awaiting
             turn_ms = int((time.time() - t0) * 1000)
             session.last_used = time.time()
             self._office_turn_end(session, office_key, {"turn": (reply, "local", None)} if outcome == "completed"
                                            else {"error": outcome})
             if outcome == "completed":
-                session.awaiting_tool_result = any(b.get("type") == "tool_use" for b in reply)
-                session.history.append(anthropic_wire.reply_fingerprint(reply))
                 if route.get("route_id") and not session.route_logged and reg.executed:
                     try:
                         reg.executed(route)

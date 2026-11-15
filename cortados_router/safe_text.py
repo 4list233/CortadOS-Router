@@ -11,6 +11,9 @@ more sites. This module closes the class where the text leaves the process inste
 - `safe_error_text()` is applied by every error builder (anthropic_wire.error_json, responses_wire.error_json /
   sse_error, local_lane._error, subagent_mcp._err and its JSON-RPC errors, mcp_shim's replies): the DECODED text a
   model or user sees has no raw newline from client input; it shows as a visible `\\n`.
+- `safe_error_body()` does the same for an upstream HTTP error body relayed to a client (anthropic_proxy, local_lane;
+  #117 review round 5): its error message escaped and capped, every other field as sent. Successful answers never pass
+  through it.
 
 Escaping keeps every printable character (backslashes too, so a Windows path stays readable) and turns each other one
 into a Python-style escape: `\\n`, `\\r`, `\\t`, `\\xNN`, `\\uNNNN`, `\\UNNNNNNNN`. "Other" is what str.isprintable
@@ -20,6 +23,7 @@ carries a copy of `escape_controls`; tests/test_safe_text.py pins the copies to 
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -78,6 +82,32 @@ def quoted(value: Any, cap: int = QUOTED_CAP) -> str:
 def safe_error_text(message: Any, cap: int = ERROR_CAP) -> str:
     """An error message as a client may see it: control characters escaped visibly, length capped."""
     return escape_controls(message, cap)
+
+
+def safe_error_body(raw: bytes, cap: int = ERROR_CAP) -> bytes | None:
+    """An upstream HTTP error body (a JSON object) as a client may see it: each error MESSAGE string through
+    safe_error_text, every other field left as sent (#117 review round 5). The message is found where the APIs put it:
+    `error.message` (Anthropic, OpenAI), `error` as a string (Ollama's native shape) and a top-level `message`. A
+    message that is not a string becomes its escaped JSON text. None when `raw` is not a JSON object: the caller then
+    builds its own error. Only for ERROR bodies; a successful answer never passes through here."""
+    try:
+        body = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(body, dict):
+        return None
+
+    def clean(v: Any) -> str:
+        return safe_error_text(v if isinstance(v, str) else json.dumps(v), cap)
+
+    err = body.get("error")
+    if isinstance(err, dict) and "message" in err:
+        body["error"] = {**err, "message": clean(err["message"])}
+    elif isinstance(err, str):
+        body["error"] = clean(err)
+    if "message" in body:
+        body["message"] = clean(body["message"])
+    return json.dumps(body).encode()
 
 
 class SafeFormatter(logging.Formatter):
