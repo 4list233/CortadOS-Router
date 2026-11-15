@@ -257,7 +257,7 @@ class BoundaryBase(ContinuationRecheckBase):
     def raw_post(self, req, headers=None):
         r = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(req).encode(), method="POST",
                                    headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
-                                            **(self.HEADERS_OPEN if headers is None else headers)})
+                                            **self.HEADERS, **(self.HEADERS_OPEN if headers is None else headers)})
         try:
             with urllib.request.urlopen(r, timeout=30) as resp:
                 return resp.status, dict(resp.headers), resp.read().decode()
