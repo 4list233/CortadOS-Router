@@ -166,3 +166,94 @@ class LiveHomeCheckTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PerCallDegradedTest(unittest.TestCase):
+    """Each S1 call is judged on its own structural flags (degraded, engine error, exception), never on reason text:
+    a timeout's reason reads "S1 scoring failed (TimeoutError)" and has no "degraded" in it (review of #113)."""
+    OK = {"degraded": False, "engine_error": None}
+
+    def turn(self, admitted, why, *calls):
+        return {"admitted": admitted, "why": why, "calls": list(calls)}
+
+    def verdicts(self, r):
+        return {name: verdict for name, verdict, _ in verify.judge_continuation(r)}
+
+    def test_one_call_times_out_the_other_scores_is_blocked(self):
+        r = {"outward": self.turn(False, "S1 scoring failed (TimeoutError)", {"degraded": True, "exception": "TimeoutError"}),
+             "safe": self.turn(True, "admitted: band R1", self.OK)}
+        v = self.verdicts(r)
+        self.assertEqual(v["local-bound continuation is rescored by S1"], "BLOCKED")
+        self.assertEqual(v["degraded scorer admits no local continuation"], "PASS")
+
+    def test_engine_error_without_the_word_degraded_is_blocked(self):
+        r = {"outward": self.turn(False, "outward", self.OK),
+             "safe": self.turn(False, "S1 gave no decision", {"degraded": False, "engine_error": "TimeoutError: timed out"})}
+        self.assertEqual(self.verdicts(r)["local-bound continuation is rescored by S1"], "BLOCKED")
+
+    def test_a_turn_with_no_s1_call_is_blocked(self):
+        r = {"outward": self.turn(False, "outward", self.OK), "safe": self.turn(True, "cached")}
+        self.assertEqual(self.verdicts(r)["local-bound continuation is rescored by S1"], "BLOCKED")
+
+    def test_all_calls_score_is_pass(self):
+        r = {"outward": self.turn(False, "outward effect", self.OK), "safe": self.turn(True, "admitted", self.OK, self.OK)}
+        self.assertEqual(self.verdicts(r), {"local-bound continuation is rescored by S1": "PASS"})
+
+    def test_all_calls_fail_is_blocked(self):
+        t = {"degraded": True, "exception": "TimeoutError"}
+        r = {"outward": self.turn(False, "S1 scoring failed (TimeoutError)", t),
+             "safe": self.turn(False, "S1 scoring failed (TimeoutError)", t)}
+        v = self.verdicts(r)
+        self.assertEqual(v["local-bound continuation is rescored by S1"], "BLOCKED")
+        self.assertEqual(v["degraded scorer admits no local continuation"], "PASS")
+
+    def test_a_failed_turn_that_admits_fails(self):
+        r = {"outward": self.turn(False, "outward", self.OK),
+             "safe": self.turn(True, "admitted", {"degraded": True, "engine_error": "scorer down"})}
+        self.assertEqual(self.verdicts(r)["degraded scorer admits no local continuation"], "FAIL")
+
+    def test_routing_results_judged_on_their_own_flags(self):
+        r = {"flag": {"provider": "local-pro", "degraded": False}, "plain": {"provider": "codex-cli", "degraded": True},
+             "down": {"provider": "codex-cli"}}
+        self.assertEqual(list(verify.failed_calls(r)), ["plain"])
+        self.assertEqual(verify.failed_calls({"a": {"degraded": None}, "b": None}), {"b": None})
+
+    def test_continuation_scenario_records_each_call(self):
+        # Run the child script itself against fake core/routing modules (no S1, no router): the outward turn's S1 call
+        # times out, the bounded turn's scores. The recorder must carry that per turn and the judge must block.
+        import contextlib, json, sys, types
+        core = types.ModuleType("cortados_router.core")
+        def decide(text, ctx=None):
+            if "invoice" in text:
+                raise TimeoutError("timed out")
+            return {"answers": {"q": 1}, "degraded": False}
+        core.decide = decide
+        routing = types.ModuleType("cortados_router.provider.routing")
+        def admission(c, body, route):
+            try:
+                c.decide(body["messages"][-1]["content"])
+            except Exception as exc:
+                return False, f"S1 scoring failed ({type(exc).__name__})"
+            return True, "admitted"
+        routing.continuation_admission = admission
+        pkg, prov = types.ModuleType("cortados_router"), types.ModuleType("cortados_router.provider")
+        pkg.core, pkg.provider, prov.routing = core, prov, routing
+        fakes = {"cortados_router": pkg, "cortados_router.core": core, "cortados_router.provider": prov,
+                 "cortados_router.provider.routing": routing}
+        saved = {k: sys.modules.get(k) for k in fakes}
+        sys.modules.update(fakes)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                exec(verify.CONTINUATION_SCENARIO, {"__name__": "verify_child"})
+        finally:
+            for k, m in saved.items():
+                if m is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = m
+        r = json.loads(buf.getvalue().strip().splitlines()[-1])
+        self.assertEqual(r["outward"]["calls"], [{"degraded": True, "exception": "TimeoutError"}])
+        self.assertEqual(r["safe"]["calls"], [{"degraded": False, "engine_error": None}])
+        self.assertNotIn("degraded", r["outward"]["why"])
+        self.assertEqual(self.verdicts(r)["local-bound continuation is rescored by S1"], "BLOCKED")

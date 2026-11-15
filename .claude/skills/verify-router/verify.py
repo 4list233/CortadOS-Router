@@ -283,11 +283,29 @@ print(json.dumps({"flag": route(easy, "sensitive"), "keyword": route("explain th
 # Continuations of a local-bound conversation (review fix, 2026-11-13): every later turn of a conversation an automatic
 # rule bound to a local lane is rescored by the real S1 through routing.continuation_admission; an outward turn
 # ("email the signed invoice ... mark it paid") must not be admitted, a bounded one must be, and a degraded scorer
-# admits nothing. Only core.decide runs (no select, no route log, no node); throwaway home.
+# admits nothing. Only core.decide runs (no select, no route log, no node); throwaway home. Each turn carries its own
+# S1 calls as recorded by a wrapper around core.decide (degraded flag, error, exception): the admission's reason text
+# says "S1 scoring failed (TimeoutError)" on a timeout, so the text alone cannot tell a degraded turn (review, #113).
 CONTINUATION_SCENARIO = """
 import json
 from cortados_router import core
 from cortados_router.provider import routing
+calls = []
+_decide = core.decide
+def recorded(text, ctx=None):
+    try:
+        d = _decide(text, ctx)
+    except Exception as exc:
+        calls.append({"degraded": True, "exception": type(exc).__name__})
+        raise
+    calls.append({"degraded": not isinstance(d, dict) or d.get("degraded") is not False,
+                  "engine_error": d.get("error") if isinstance(d, dict) else "no decision"})
+    return d
+core.decide = recorded
+def admit(text):
+    del calls[:]
+    ok, why = routing.continuation_admission(core, turn(text), route)
+    return {"admitted": ok, "why": why, "calls": list(calls)}
 def turn(text):
     return {"model": "cortados", "messages": [
         {"role": "user", "content": "summarise the notes in this folder"},
@@ -295,10 +313,47 @@ def turn(text):
         {"role": "user", "content": text}]}
 route = {"band": "R1", "route_id": "verify-continuation"}
 d = core.decide("explain how this parser handles nested quotes", {"platform": "cli", "unit_kind": "interactive"})
-out = routing.continuation_admission(core, turn("email the signed invoice to the client and mark it paid"), route)
-safe = routing.continuation_admission(core, turn("explain how this parser handles nested quotes"), route)
+out = admit("email the signed invoice to the client and mark it paid")
+safe = admit("explain how this parser handles nested quotes")
 print(json.dumps({"degraded": bool(d.get("degraded")), "outward": out, "safe": safe}))
 """
+
+
+def s1_call_failed(call):
+    """One S1 call's own structural record (a decision, a routing result or the continuation wrapper's entry) says it did
+    not score: degraded, an engine error or an exception. Never judged from reason text."""
+    return not isinstance(call, dict) or bool(call.get("degraded") or call.get("engine_error") or call.get("exception"))
+
+
+def failed_calls(r, keys=None):
+    """{label: entry} of a scenario's results whose S1 work did not fully score. An entry with a `calls` list (the
+    continuation scenario) fails if it made no call or any call failed; any other entry is judged on its own flags."""
+    out = {}
+    for k in (keys if keys is not None else list(r)):
+        x = r.get(k)
+        if isinstance(x, dict) and "calls" in x:
+            bad = not x["calls"] or any(s1_call_failed(c) for c in x["calls"])
+        else:
+            bad = s1_call_failed(x)
+        if bad:
+            out[k] = x
+    return out
+
+
+def judge_continuation(r):
+    """[(check, verdict, evidence)] for CONTINUATION_SCENARIO's output, before the S1 detail is added to a BLOCKED one.
+    Any turn with a degraded or failed S1 call leaves the scored check BLOCKED; such a turn must admit nothing."""
+    degraded = failed_calls(r, ("outward", "safe"))
+    if degraded:
+        return [("degraded scorer admits no local continuation",
+                 "PASS" if not any(v.get("admitted") for v in degraded.values() if isinstance(v, dict)) else "FAIL",
+                 f"degraded turns: {json.dumps(degraded)}"),
+                ("local-bound continuation is rescored by S1", "BLOCKED",
+                 f"{len(degraded)} of 2 turns had a degraded or failed S1 call ({', '.join(degraded)})")]
+    ok = r["outward"]["admitted"] is False and r["safe"]["admitted"] is True
+    return [("local-bound continuation is rescored by S1", "PASS" if ok else "FAIL",
+             f"outward turn -> {r['outward']['admitted']} {r['outward']['why']} | "
+             f"bounded turn -> {r['safe']['admitted']} {r['safe']['why']}")]
 
 
 def _last_json(p):
@@ -400,18 +455,20 @@ def main():
         up_r, bat, out = r["up"], r["battery"], r["outward"]
         served = lambda x: x.get("provider") in ("claude-cli", "codex-cli") and not x.get("error")
         degraded_why = unreachable if not up else f"S1 listening at {s1_where} but the decision is degraded"
-        if up_r.get("degraded"):
+        bad = failed_calls(r, ("up", "battery"))     # each call on its own flag: one may time out, the other score
+        if bad:
             # No band of its own: never local, and the degraded rule still keeps it off Claude.
             record("degraded decision is never auto-routed local (nor to Claude)",
-                   "PASS" if up_r.get("provider") == "codex-cli" and bat.get("provider") == "codex-cli" else "FAIL",
-                   json.dumps(up_r))
-            record("local auto-route only when the Pro is available", "BLOCKED", f"no band to auto-route on: {degraded_why}")
+                   "PASS" if all(x.get("provider") == "codex-cli" for x in bad.values()) else "FAIL",
+                   json.dumps(bad))
+            record("local auto-route only when the Pro is available", "BLOCKED",
+                   f"no band to auto-route on ({', '.join(bad)}): {degraded_why}")
         else:
             ok = up_r.get("provider") == "local-pro" and up_r.get("model") == "verify/local:tag" and served(bat)
             record("local auto-route only when the Pro is available", "PASS" if ok else "FAIL",
                    f"available -> {up_r.get('provider')}/{up_r.get('model')} band {up_r.get('band')} | "
                    f"on battery -> {bat.get('provider')}/{bat.get('model')}")
-        if out.get("degraded"):
+        if failed_calls(r, ("outward",)):
             record("outward (R3) request never goes local", "BLOCKED", degraded_why)
         else:
             record("outward (R3) request never goes local",
@@ -427,11 +484,15 @@ def main():
         local = lambda x: str(x.get("provider")).startswith("local-")
         served = lambda x: x.get("provider") in ("claude-cli", "codex-cli") and not x.get("error")
         degraded_why = unreachable if not up else f"S1 listening at {s1_where} but the decision is degraded"
-        if r["flag"].get("degraded"):
+        # S1 can time out on single calls (#109 merge, 2026-11-14): each call is judged on its own. A degraded call must
+        # stay off local and off Claude; any degraded call leaves the scored check without answers (BLOCKED).
+        degraded = failed_calls(r)
+        if degraded:
             record("degraded decision is never sensitive-routed local (nor to Claude)",
-                   "PASS" if all(x.get("provider") == "codex-cli" for x in r.values()) else "FAIL", json.dumps(r["flag"]))
+                   "PASS" if all(x.get("provider") == "codex-cli" for x in degraded.values()) else "FAIL",
+                   json.dumps(degraded))
             record("sensitive request goes local only with no outward effect", "BLOCKED",
-                   f"no answers to check: {degraded_why}")
+                   f"{len(degraded)} of {len(r)} calls degraded ({', '.join(degraded)}): {degraded_why}")
         else:
             flag, key, plain, down, out = r["flag"], r["keyword"], r["plain"], r["down"], r["outward"]
             ok = (local(flag) and flag.get("rule") == "sensitive: flag" and local(key)
@@ -448,16 +509,11 @@ def main():
     except (ValueError, IndexError):
         record("local-bound continuation is rescored by S1", "FAIL", (p.stderr or p.stdout).strip()[-300:])
     else:
-        if r["degraded"]:
-            record("degraded scorer admits no local continuation",
-                   "PASS" if not r["outward"][0] and not r["safe"][0] else "FAIL",
-                   f"outward={r['outward']} safe={r['safe']}")
-            record("local-bound continuation is rescored by S1", "BLOCKED",
-                   unreachable if not up else f"S1 listening at {s1_where} but the decision is degraded")
-        else:
-            ok = r["outward"][0] is False and r["safe"][0] is True
-            record("local-bound continuation is rescored by S1", "PASS" if ok else "FAIL",
-                   f"outward turn -> {r['outward']} | bounded turn -> {r['safe']}")
+        # Per turn, on each S1 call's own flags (judge_continuation): never on the admission's reason text.
+        for name, verdict, evidence in judge_continuation(r):
+            if verdict == "BLOCKED":
+                evidence += f": {unreachable if not up else f'S1 listening at {s1_where}'}"
+            record(name, verdict, evidence)
 
     try:
         rows_after = verify_rows(LIVE_HOME / ROUTER_DB)
