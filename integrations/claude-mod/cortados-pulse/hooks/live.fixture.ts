@@ -18,6 +18,7 @@ export default {
     "route_log_errors": 0,
     "hosts_with_heartbeat": 2,
     "errors": 0,
+    "orchestrators": 2,
     "routed_token_pct_24h": 10.1
   },
   "tasks": {
@@ -56,7 +57,9 @@ export default {
         "device": "pro",
         "origin_session": "3f9a1c2e9b7d4a10",
         "origin_project": "CortadOS-Router",
-        "origin_device": "pro"
+        "origin_device": "pro",
+        "origin_via": null,
+        "parent_task_id": null
       }
     ],
     "queued": [
@@ -81,7 +84,9 @@ export default {
         "device": null,
         "origin_session": null,
         "origin_project": null,
-        "origin_device": null
+        "origin_device": null,
+        "origin_via": null,
+        "parent_task_id": null
       }
     ],
     "recent": [
@@ -106,7 +111,9 @@ export default {
         "device": null,
         "origin_session": "3f9a1c2e9b7d4a10",
         "origin_project": "CortadOS-Router",
-        "origin_device": "pro"
+        "origin_device": "pro",
+        "origin_via": null,
+        "parent_task_id": null
       },
       {
         "task_id": "t20261111060000-eeeeeeee",
@@ -129,7 +136,9 @@ export default {
         "device": null,
         "origin_session": "grokbot",
         "origin_project": null,
-        "origin_device": null
+        "origin_device": null,
+        "origin_via": null,
+        "parent_task_id": null
       },
       {
         "task_id": "t20261111070000-dddddddd",
@@ -152,7 +161,9 @@ export default {
         "device": null,
         "origin_session": null,
         "origin_project": null,
-        "origin_device": null
+        "origin_device": null,
+        "origin_via": null,
+        "parent_task_id": null
       },
       {
         "task_id": "t20261110060000-ffffffff",
@@ -175,7 +186,9 @@ export default {
         "device": null,
         "origin_session": null,
         "origin_project": null,
-        "origin_device": null
+        "origin_device": null,
+        "origin_via": null,
+        "parent_task_id": null
       }
     ],
     "truncated": false,
@@ -245,6 +258,13 @@ export default {
         "title": "Review the diff",
         "started_at": 1799999910.0,
         "last_activity": 1799999920.0,
+        "tokens": {
+          "input": 700,
+          "output": 300,
+          "cache_read": 0,
+          "cache_write": 0,
+          "fresh": 1000
+        },
         "elapsed_s": 90.0
       },
       {
@@ -263,6 +283,13 @@ export default {
         "title": "Refactor the scarcity reader",
         "started_at": 1799999900.0,
         "last_activity": 1799999980.0,
+        "tokens": {
+          "input": 4000,
+          "output": 1500,
+          "cache_read": 90000,
+          "cache_write": 6000,
+          "fresh": 11500
+        },
         "elapsed_s": 100.0
       },
       {
@@ -281,6 +308,7 @@ export default {
         "title": null,
         "started_at": 1799999100.0,
         "last_activity": 1799999985.0,
+        "tokens": null,
         "elapsed_s": 900.0,
         "tasks": {
           "running": 1,
@@ -326,10 +354,311 @@ export default {
         "title": null,
         "started_at": 1799999600.0,
         "last_activity": 1799999700.0,
+        "tokens": null,
         "elapsed_s": 400.0
       }
     ],
     "hidden": 0
+  },
+  "orchestrators": {
+    "as_of": 1800000000.0,
+    "status": "ok",
+    "errors": [],
+    "scope": "provider host and heartbeats",
+    "window_s": 86400,
+    "items": [
+      {
+        "origin": "3f9a1c2e9b7d4a10",
+        "kind": "session",
+        "project": "CortadOS-Router",
+        "device": "pro",
+        "status": "working",
+        "model": "claude-opus-5",
+        "tool": "Edit",
+        "last_activity": 1799999985.0,
+        "counts": {
+          "running": 1,
+          "waiting": 0,
+          "done": 1,
+          "failed": 0,
+          "unknown": 0
+        },
+        "attention": 0,
+        "tasks": [
+          {
+            "task_id": "t20261111090000-aaaaaaaa",
+            "title": "Refactor the scarcity reader",
+            "state": "running",
+            "status": "running",
+            "phase": null,
+            "tool": "Bash",
+            "host": "air",
+            "provider": "claude",
+            "lane": "claude#b",
+            "model": "claude-sonnet-5",
+            "started_at": 1799999875.0,
+            "ended_at": null,
+            "elapsed_s": 125.0,
+            "workspace": "active",
+            "browser": false,
+            "parent_task_id": null,
+            "parent_hidden": false,
+            "origin_via": null,
+            "tokens": {
+              "input": 5000,
+              "output": 2000,
+              "cache_read": 120000,
+              "cache_write": 8000,
+              "fresh": 15000
+            },
+            "sub_sessions": [
+              {
+                "ref": "c-000000000002",
+                "role": "main",
+                "status": "running",
+                "phase": "model turn",
+                "provider": "claude",
+                "lane": "claude#b",
+                "model": "claude-sonnet-5",
+                "started_at": 1799999900.0,
+                "ended_at": null,
+                "last_activity": 1799999980.0,
+                "elapsed_s": 100.0,
+                "tokens": {
+                  "input": 4000,
+                  "output": 1500,
+                  "cache_read": 90000,
+                  "cache_write": 6000,
+                  "fresh": 11500
+                }
+              },
+              {
+                "ref": "c-000000000005",
+                "role": "subagent",
+                "status": "done",
+                "phase": "closed idle",
+                "provider": "codex",
+                "lane": "codex",
+                "model": "gpt-6.1",
+                "started_at": 1799999920.0,
+                "ended_at": 1799999965.0,
+                "last_activity": 1799999960.0,
+                "elapsed_s": 45.0,
+                "tokens": {
+                  "input": 1000,
+                  "output": 500,
+                  "cache_read": 30000,
+                  "cache_write": 2000,
+                  "fresh": 3500
+                }
+              }
+            ],
+            "sub_sessions_hidden": 0,
+            "sub_sessions_failed": 0,
+            "tasks": []
+          },
+          {
+            "task_id": "t20261111080000-cccccccc",
+            "title": "Write the changelog",
+            "state": "succeeded",
+            "status": "done",
+            "phase": null,
+            "tool": null,
+            "host": "air",
+            "provider": null,
+            "lane": null,
+            "model": null,
+            "started_at": 1799996000.0,
+            "ended_at": 1799997000.0,
+            "elapsed_s": 1000.0,
+            "workspace": "archived",
+            "browser": false,
+            "parent_task_id": null,
+            "parent_hidden": false,
+            "origin_via": null,
+            "tokens": null,
+            "sub_sessions": [],
+            "sub_sessions_hidden": 0,
+            "sub_sessions_failed": 0,
+            "tasks": []
+          }
+        ],
+        "tasks_hidden": 0,
+        "routed": [
+          {
+            "ref": "sub-run-0001",
+            "role": "subagent",
+            "title": "Review the diff",
+            "status": "running",
+            "phase": "client running a tool",
+            "tool": "Read",
+            "provider": "codex",
+            "lane": "codex",
+            "model": "gpt-6.1",
+            "started_at": 1799999910.0,
+            "elapsed_s": 90.0,
+            "tokens": {
+              "input": 700,
+              "output": 300,
+              "cache_read": 0,
+              "cache_write": 0,
+              "fresh": 1000
+            }
+          }
+        ],
+        "routed_hidden": 0
+      },
+      {
+        "origin": null,
+        "kind": "unattributed",
+        "project": null,
+        "device": null,
+        "status": "n/a",
+        "model": null,
+        "tool": null,
+        "last_activity": 1799999400.0,
+        "counts": {
+          "running": 0,
+          "waiting": 1,
+          "done": 0,
+          "failed": 1,
+          "unknown": 1
+        },
+        "attention": 2,
+        "tasks": [
+          {
+            "task_id": "t20261111085000-bbbbbbbb",
+            "title": "Check the release page",
+            "state": "queued",
+            "status": "waiting",
+            "phase": "waiting for the host's Chrome",
+            "tool": null,
+            "host": "air",
+            "provider": null,
+            "lane": null,
+            "model": null,
+            "started_at": 1799999400.0,
+            "ended_at": null,
+            "elapsed_s": 600.0,
+            "workspace": null,
+            "browser": true,
+            "parent_task_id": null,
+            "parent_hidden": false,
+            "origin_via": null,
+            "tokens": null,
+            "sub_sessions": [],
+            "sub_sessions_hidden": 0,
+            "sub_sessions_failed": 0,
+            "tasks": []
+          },
+          {
+            "task_id": "t20261111070000-dddddddd",
+            "title": null,
+            "state": "failed",
+            "status": "failed",
+            "phase": null,
+            "tool": null,
+            "host": null,
+            "provider": null,
+            "lane": null,
+            "model": null,
+            "started_at": 1799992800.0,
+            "ended_at": 1799993100.0,
+            "elapsed_s": 300.0,
+            "workspace": "held",
+            "browser": false,
+            "parent_task_id": null,
+            "parent_hidden": false,
+            "origin_via": null,
+            "tokens": null,
+            "sub_sessions": [],
+            "sub_sessions_hidden": 0,
+            "sub_sessions_failed": 0,
+            "tasks": []
+          },
+          {
+            "task_id": "t20261110060000-ffffffff",
+            "title": null,
+            "state": "unknown",
+            "status": "unknown",
+            "phase": "no end event after 10 h",
+            "tool": null,
+            "host": "air",
+            "provider": null,
+            "lane": null,
+            "model": null,
+            "started_at": 1799960400.0,
+            "ended_at": null,
+            "elapsed_s": 39600.0,
+            "workspace": null,
+            "browser": false,
+            "parent_task_id": null,
+            "parent_hidden": false,
+            "origin_via": null,
+            "tokens": null,
+            "sub_sessions": [],
+            "sub_sessions_hidden": 0,
+            "sub_sessions_failed": 0,
+            "tasks": []
+          }
+        ],
+        "tasks_hidden": 0,
+        "routed": [],
+        "routed_hidden": 0
+      },
+      {
+        "origin": "grokbot",
+        "kind": "bot",
+        "project": null,
+        "device": null,
+        "status": "n/a",
+        "model": null,
+        "tool": null,
+        "last_activity": 1799995000.0,
+        "counts": {
+          "running": 0,
+          "waiting": 0,
+          "done": 1,
+          "failed": 0,
+          "unknown": 0
+        },
+        "attention": 0,
+        "tasks": [
+          {
+            "task_id": "t20261111060000-eeeeeeee",
+            "title": null,
+            "state": "cancelled",
+            "status": "done",
+            "phase": null,
+            "tool": null,
+            "host": null,
+            "provider": null,
+            "lane": null,
+            "model": null,
+            "started_at": null,
+            "ended_at": 1799995000.0,
+            "elapsed_s": null,
+            "workspace": null,
+            "browser": false,
+            "parent_task_id": null,
+            "parent_hidden": false,
+            "origin_via": null,
+            "tokens": null,
+            "sub_sessions": [],
+            "sub_sessions_hidden": 0,
+            "sub_sessions_failed": 0,
+            "tasks": []
+          }
+        ],
+        "tasks_hidden": 0,
+        "routed": [],
+        "routed_hidden": 0
+      }
+    ],
+    "truncated": false,
+    "inputs_truncated": [],
+    "task_hosts": [],
+    "conflicts": 0
   },
   "routed": {
     "as_of": 1800000000.0,

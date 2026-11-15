@@ -3,19 +3,23 @@
 A mod: a pane beside the chat that shows what CortadOS is running and the resource pool behind it. It reads two of the
 provider's views with the same token: `GET /v1/cortados/live` every 10 seconds and `GET /resources` every 20.
 
-- **This session** (from `/v1/cortados/live`, at the top) — the `start_task` children THIS session started: running and
-  queued (title, host, model, tool, elapsed), then the last three finished (state, how long they took). A task names
-  the session that started it in `origin_session`, the session's Office tag: sha256 of the machine's shared salt
-  (`~/.config/cortados/office-salt`, made by the `cortados-route` MCP server; `CORTADOS_OFFICE_SALT_FILE` overrides)
-  and the session id, cut to 16 hex, exactly as `cortados-routed-subagents` names its floor. The pane computes the
-  same tag every poll and never sends or shows the raw session id; without the salt file it says the session cannot
-  be identified. The tasks come from `GET /v1/cortados/live?session=<tag>`, which the provider filters BEFORE its list
-  caps (50 running, 40 finished), so a busy fleet cannot push this session's tasks out; a provider that ignores
-  `?session=` (no `session_filter` in its answer) is filtered in the pane, with a note when its capped lists may hide
-  some. A provider from before task origins (no `tasks.origins`) is said as such, not as "no task started". Under the
-  list, a dim line recalls that after `/clear` earlier tasks stay under the previous session (the dashboard has them).
-  Tasks run on another execution host log there and are not in the provider host's view (see scope);
-- **Running** (from `/v1/cortados/live`) — one summary line (children running and queued, conversations and how many
+- **This session** (at the top) — a live tree of THIS session's own work, in the style of claude-flightdeck
+  (`docs/PULSE-PER-SESSION.md`): a count line (running / waiting / done / failed / unknown) and `! N needs attention`
+  when a task failed or its state is unknown; each running or queued `start_task` child opened (title and elapsed time
+  counting between polls, then model, host, tool and fresh tokens, then its sub-sessions: the child's main loop and
+  routed subagents, `├ ● main loop · <model> · model turn · 4.9k tok · 4m 50s`); nested tasks indented under their
+  parent (`↳`); the last three finished folded to one line; tasks this machine started on another host (`?`, state
+  there); and the subagents the session routed directly. Glyphs: `●` running, `◷` waiting, `✓` done, `✕` failed, `?`
+  unknown, `⊘` cancelled; attention lines are bold. The pane names its session by its Office tag: sha256 of the
+  machine's shared salt (`~/.config/cortados/office-salt`, made by the `cortados-route` MCP server;
+  `CORTADOS_OFFICE_SALT_FILE` overrides) and the session id, cut to 16 hex, exactly as `cortados-routed-subagents`
+  names its floor and the MCP server names a task's origin. It never sends or shows the raw session id. With the tag it
+  reads ONLY `GET /v1/cortados/live/session?session=<tag>`, which the provider builds filtered: that one subtree plus
+  S1 and host health, nothing of another session (no fleet Running section is drawn then). Without the salt file, or
+  against a provider from before the per-session view (404), it falls back to the 0.4 behaviour below: the fleet view
+  `/v1/cortados/live?session=<tag>` filtered for this session, and the Running section. A dim line recalls that after
+  `/clear` earlier tasks stay under the previous session (the dashboard has them);
+- **Running** (fallback only: from `/v1/cortados/live`) — one summary line (children running and queued, conversations and how many
   are working), then each running or queued `start_task` child (title, host, model, current tool, elapsed time counting
   between polls) and every conversation the provider holds open (main sessions, subagents, untagged clients, and a
   child task's when it has no task line here: model, tool, elapsed). A section
@@ -67,7 +71,9 @@ printf '%s\n' "$CORTADOS_PROVIDER_TOKEN" > ~/.config/cortados/provider-token
 chmod 600 ~/.config/cortados/provider-token
 ```
 
-The pane needs the owner token (`/resources` has no scoped reader); a `live:read` client token opens only the live view.
+The pane needs the owner token (`/resources` has no scoped reader); a `live:read` client token opens only the live
+views, and a `live:session` client token only this session's tree (`/v1/cortados/live/session`; the resource sections
+then say the token was rejected).
 The token is sent only as the `Authorization: Bearer` header of each poll. It is never logged, rendered or kept in the
 mod's state, and every message the pane shows is scrubbed of it. A `401`/`403` is reported as "provider rejected the
 token" naming the token source (file path or `providerToken`), never the token.
@@ -80,9 +86,11 @@ Run the mod's tests in the native hook host (no model calls, no network):
 CORTADOS_HOME=$(mktemp -d) CORTADOS_SCARCITY_REFRESH=off claude plugin test integrations/claude-mod/cortados-pulse
 ```
 
-`hooks/resources.fixture.ts`, `hooks/stale-resources.fixture.ts` and `hooks/live.fixture.ts` are generated by the
-provider's own code (`tests/test_pulse_fixture.py` checks each still matches; after a deliberate change to the live view,
-`python3 -B -c "from tests import test_pulse_fixture as t; t.write_live_fixture()"` regenerates the live one).
+`hooks/resources.fixture.ts`, `hooks/stale-resources.fixture.ts`, `hooks/live.fixture.ts` and `hooks/session.fixture.ts`
+are generated by the provider's own code (`tests/test_pulse_fixture.py` and `tests/test_orchestrator_tree.py` check each
+still matches; after a deliberate change to the live view,
+`python3 -B -c "from tests import test_pulse_fixture as t; t.write_live_fixture()"` and
+`python3 -B -c "from tests import test_orchestrator_tree as t; t.write_session_fixture()"` regenerate them).
 
 `claude plugin validate integrations/claude-mod/cortados-pulse` lists what the module touches (`$.env.get` of
 `CORTADOS_PROVIDER_URL`, `CORTADOS_PROVIDER_URL_FILE`, `HOME`; `$.fs.read`; `$.http.fetch`). To type-check, load the mod

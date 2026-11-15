@@ -71,6 +71,37 @@ def _with_sums(t: dict[str, int]) -> dict[str, int]:
     return {**t, "fresh": ou.fresh_tokens(t), "all": ou.all_tokens(t)}
 
 
+# Messages-shaped usage (both bridges report it; core.log_tokens reads the same keys) -> TOKEN_FIELDS
+_USAGE_KEYS = {"input": "input_tokens", "output": "output_tokens", "cache_read": "cache_read_input_tokens",
+               "cache_write": "cache_creation_input_tokens"}
+
+
+def usage_tokens(usage: Any) -> dict[str, int]:
+    """One backend turn's usage as {input, output, cache_read, cache_write}: counts only, a bad value is 0 (as
+    core.log_tokens counts it). For the in-memory per-conversation and per-run totals of the orchestrator tree."""
+    u = usage if isinstance(usage, dict) else {}
+    out = {}
+    for k, src in _USAGE_KEYS.items():
+        v = u.get(src)
+        out[k] = int(v) if type(v) in (int, float) and math.isfinite(v) and 0 <= v < 1e12 else 0
+    return out
+
+
+def add_tokens(dst: dict[str, int], src: dict[str, int]) -> None:
+    """dst += src over TOKEN_FIELDS (dst may be empty)."""
+    for k in TOKEN_FIELDS:
+        dst[k] = int(dst.get(k, 0)) + int(src.get(k, 0))
+
+
+def pub_tokens(t: Any) -> dict[str, int] | None:
+    """A token total as published by the live view: the four counts and `fresh` (input + output + cache writes), or None
+    when nothing was recorded (never an estimate)."""
+    if not isinstance(t, dict) or not any(t.get(k) for k in TOKEN_FIELDS):
+        return None
+    clean = {k: int(t.get(k) or 0) for k in TOKEN_FIELDS}
+    return {**clean, "fresh": ou.fresh_tokens(clean)}
+
+
 def _pct(part: int, whole: int) -> float | None:
     return round(100.0 * part / whole, 1) if whole else None
 

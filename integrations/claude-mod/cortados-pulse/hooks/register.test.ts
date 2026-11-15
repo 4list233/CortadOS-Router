@@ -1,19 +1,48 @@
 import { test, expect } from 'claude-code/testing'
 import { FALLBACK, POLL_MS, LIVE_POLL_MS, STALE_AFTER_S, expandHome, resolveProviderUrl, resolveToken, scrub, readConfig, poll,
   pollLive, age, pct, gib, dur, leftPct, laneLabel, laneLines, usageLines, deviceLines, laneOrder, taskLine, conversationLine,
-  runningLines, fleetLines, hwText, identify, sessionLines, sessionTag, OFFICE_SALT_FILE, MINE_RECENT_MAX, CLEAR_NOTE } from './register'
+  runningLines, fleetLines, hwText, identify, sessionLines, sessionTag, OFFICE_SALT_FILE, MINE_RECENT_MAX, CLEAR_NOTE,
+  SESSION_PATH, treeLines, tokShort, glyph, fetchTree, parseLocalTasks, mergeLocal, localLines, readLocal, LOCAL_POLL_MS,
+  LOCAL_TAIL_BYTES, LOCAL_NOTE, STALE_HB_PHASE, readLocalLog, LOCAL_SKIP_NOTE, TAIL_BIN } from './register'
 import liveFixture from './live.fixture'
+import sessionFixture from './session.fixture'
 
 const TOKEN = 'sekrit-token-123'
 
 /** A `$` with env, fs, http, state and clock: the five nouns poll() touches. */
-function fakeDollar(opts: { env?: Record<string, string>; files?: Record<string, string>; http?: (url: string, init: any) => any }) {
+/** The mod host's limits as the fake models them: $.fs.read refuses a file over 4 MiB (no offset or length exists);
+ * $.process.run's default is a `tail -c N <path>` over the fake files, each call recorded. */
+const HOST_READ_MAX = 4 * 2 ** 20
+const utf8 = (t: string) => new TextEncoder().encode(t)
+function fakeDollar(opts: { env?: Record<string, string>; files?: Record<string, string>; http?: (url: string, init: any) => any;
+  process?: (argv: readonly string[]) => any }) {
+  const io = { reads: [] as string[], runs: [] as (readonly string[])[] }
   const state = new Map<string, { value: unknown; version: number }>()
   const key = (ref: any) => ref.plugin + '/' + ref.key
   const calls: { urls: string[]; inits: any[] } = { urls: [], inits: [] }
   const $ = {
     env: { get: async (name: string) => opts.env?.[name] },
-    fs: { read: async (path: string) => { if (opts.files && path in opts.files) return opts.files[path]; throw new Error('ENOENT ' + path) } },
+    fs: {
+      read: async (path: string) => {
+        io.reads.push(path)
+        if (!opts.files || !(path in opts.files)) throw new Error('ENOENT ' + path)
+        if (utf8(opts.files[path]).length > HOST_READ_MAX) throw new Error('over 4 MiB')
+        return opts.files[path]
+      },
+      stat: async (path: string) => {
+        if (!opts.files || !(path in opts.files)) throw new Error('ENOENT ' + path)
+        return { kind: 'file', size: utf8(opts.files[path]).length, mtimeMs: 0, isLink: false }
+      },
+    },
+    process: { run: async (argv: readonly string[]) => {
+      io.runs.push(argv)
+      if (opts.process) return opts.process(argv)
+      const [bin, flag, n, path] = argv
+      if (bin !== '/usr/bin/tail' || flag !== '-c' || !opts.files || !(path in opts.files)) return { exitCode: 1, stdout: '', stderr: 'no' }
+      const bytes = utf8(opts.files[path])
+      return { exitCode: 0, stdout: new TextDecoder().decode(bytes.slice(Math.max(0, bytes.length - Number(n)))), stderr: '' }
+    } },
+    io,
     http: { fetch: async (url: string, init: any) => { calls.urls.push(url); calls.inits.push(init); return opts.http ? opts.http(url, init) : { status: 200, ok: true, headers: {}, text: '{}' } } },
     state: {
       get: async (ref: any) => state.get(key(ref)) ?? { value: undefined, version: 0 },
@@ -253,11 +282,12 @@ test('session.start registers the command, opens the pane, polls once and keeps 
     clock: { ...base.clock, every: (ms: number, _fn: () => void) => { const t = { ms, cancelled: false }; every.push(t); return { cancel: () => { t.cancelled = true } } } },
   }
   expect(await hooks['session.start']($, { kind: 'start' }, async (e: any) => e)).toEqual({ kind: 'start' })
-  await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+  for (let i = 0; i < 30; i++) await Promise.resolve()       // the live poll identifies the session before it fetches
   expect(registered).toEqual([{ name: 'cortados-pulse', description: 'Open the CortadOS router pulse pane' }])
   expect(opened).toEqual([{ id: 'cortados-pulse', title: 'CortadOS pulse' }])
   expect(every.map(t => t.ms)).toEqual([LIVE_POLL_MS])
-  expect($.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live', 'http://air.example:8432/resources'])
+  // no salt file here: the session has no tag, so the fleet view is read (the fallback), never the per-session one
+  expect([...$.calls.urls].sort()).toEqual(['http://air.example:8432/resources', 'http://air.example:8432/v1/cortados/live'])
   expect($.held().data.usage.total_routes).toBe(1)
   await hooks['session.start']($, {}, async (e: any) => e)
   expect(every.length).toBe(2)
@@ -265,6 +295,7 @@ test('session.start registers the command, opens the pane, polls once and keeps 
   expect(every[1]!.cancelled).toBe(false)
   expect(await hooks['command.run']($, {})).toEqual({ text: 'CortadOS pulse pane opened.' })
   expect(opened.length).toBe(3)
+  for (let i = 0; i < 60; i++) await Promise.resolve()       // let the last poll settle: one live poll runs at a time
 })
 
 test('pollLive reads /v1/cortados/live with the Bearer token and keeps the provider base for the dashboard link', async () => {
@@ -476,7 +507,9 @@ test('pollLive asks the provider for this session\'s own view, and keeps it only
         // an older provider ignores ?session= and answers the fleet view
         text: JSON.stringify(url.includes('?session=') && filtered ? own : fleet) }) }), session: { id: async () => SID } }
     await pollLive($ as any, FALLBACK, true)
-    expect($.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live', 'http://air.example:8432/v1/cortados/live?session=' + tag])
+    // the per-session view is asked first; these answers are not a subtree (an older provider): the fleet fallback
+    expect($.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live/session?session=' + tag,
+      'http://air.example:8432/v1/cortados/live', 'http://air.example:8432/v1/cortados/live?session=' + tag])
     const held = (await ($ as any).state.get({ plugin: 'cortados-pulse', key: 'mineLive' })).value
     if (filtered) {
       expect(held.tag).toBe(tag)
@@ -502,4 +535,301 @@ test('the provider-generated fixture carries origins: its main session sees its 
     '● Refactor the scarcity reader · on air · claude-sonnet-5 (claude#b) · tool Bash · 2m 05s',
     '✓ Write the changelog · on air · succeeded · took 16m 40s',
   ])
+})
+
+// ---- this session's tree (GET /v1/cortados/live/session; tests/test_orchestrator_tree.py generates the fixture) ----
+
+const MINE_TAG = 'aaaaaaaaaaaaaaa1'                  // the fixture's session (tests/test_orchestrator_tree.MINE)
+
+test('the session view holds this session only, and the pane draws it as a tree', () => {
+  const raw = JSON.stringify(sessionFixture)
+  for (const other of ['bbbbbbbbbbbbbbb2', 'Grounds', 'Their secret plan', 'grokbot', 'Legacy task', 'SECRET']) {
+    expect(raw.includes(other)).toBe(false)
+  }
+  expect(SESSION_PATH).toBe('/v1/cortados/live/session')
+  const lines = treeLines(sessionFixture as any, MINE_TAG, 0)
+  expect(lines.map(l => l.text)).toEqual([
+    '2 running · 1 done · 1 unknown',
+    '! 1 needs attention',
+    '● Build the tree · 5m 00s',
+    '  claude-sonnet-5 · on air · tool Edit · 14k tok',
+    '  ├ ● main loop · claude-sonnet-5 · model turn · 4.9k tok · 4m 50s',
+    '  ├ ● subagent · gpt-6.1 · running a tool · 1m 00s',
+    '  └ ✓ subagent · qwen3-30b · closed idle · 1.0k tok · took 1m 30s',
+    '  ↳ ● Nested step · 3m 20s',
+    '      claude-haiku-5 · on air',
+    '      └ ◷ main loop · claude-haiku-5 · idle between turns · 3m 10s',
+    '    ↳ ✓ Deeper step · succeeded · took 50s',
+    '? task t20261111093000-a0000009 · on studio, state there',
+    'routed directly',
+    '└ ● Check the docs · gpt-6.1-mini · model turn · 40s',
+  ])
+  expect(lines.filter(l => l.attn).map(l => l.text)).toEqual(['! 1 needs attention',
+    '? task t20261111093000-a0000009 · on studio, state there'])
+  // clocks of live nodes keep counting between polls; finished ones do not
+  const later = treeLines(sessionFixture as any, MINE_TAG, 10).map(l => l.text)
+  expect(later[2]).toBe('● Build the tree · 5m 10s')
+  expect(later[10]).toBe('    ↳ ✓ Deeper step · succeeded · took 50s')
+  // another tag's pane draws nothing from this view (the provider would not have sent it, and the pane checks too)
+  expect(treeLines(sessionFixture as any, 'cccccccccccccccc', 0).map(l => l.text))
+    .toEqual(['no task started from this session in the last 24 h'])
+})
+
+test('tree glyphs, tokens and failures', () => {
+  expect([glyph('running'), glyph('waiting'), glyph('done'), glyph('failed'), glyph('unknown'), glyph('done', 'cancelled')])
+    .toEqual(['●', '◷', '✓', '✕', '?', '⊘'])
+  expect([tokShort({ fresh: 950 }), tokShort({ fresh: 4900 }), tokShort({ fresh: 14000 }), tokShort({ fresh: 2_500_000 }),
+    tokShort(null), tokShort({ fresh: 0 })]).toEqual(['950 tok', '4.9k tok', '14k tok', '2.5M tok', null, null])
+  const v = { session_filter: MINE_TAG, orchestrators: { status: 'ok', items: [{ origin: MINE_TAG, counts: { failed: 1 }, attention: 1,
+    tasks: [{ task_id: 't1', title: 'Broke', state: 'failed', status: 'failed', elapsed_s: 30, ended_at: 5 }] }] } }
+  expect(treeLines(v as any, MINE_TAG, 0)).toEqual([{ text: '1 failed' }, { text: '! 1 needs attention', attn: true },
+    { text: '✕ Broke · failed · took 30s', attn: true }])
+  expect(treeLines({ orchestrators: { status: 'error', errors: [{ source: 'child-tasks.jsonl', error: 'OSError' }] } } as any, MINE_TAG, 0))
+    .toEqual([{ text: 'tasks unavailable: child-tasks.jsonl: OSError', attn: true }])
+  const many = { orchestrators: { status: 'ok', items: [{ origin: MINE_TAG, counts: { running: 1 }, tasks: [{ task_id: 't', title: 'Fan',
+    status: 'running', state: 'running', elapsed_s: 1, sub_sessions: Array.from({ length: 6 }, () => ({ status: 'running', role: 'subagent' })),
+    sub_sessions_hidden: 2 }] }] } }
+  expect(treeLines(many as any, MINE_TAG, 0).slice(-1)).toEqual([{ text: '  └ +4 more sub-sessions' }])
+})
+
+test('a failed sub-session needs attention: on a running task, a folded finished task, and past the cap', () => {
+  const sub = (status: string) => ({ status, role: 'subagent' })
+  const v = { session_filter: MINE_TAG, orchestrators: { status: 'ok', inputs_truncated: ['conversations'], items: [{ origin: MINE_TAG,
+    counts: { running: 1, done: 1 }, attention: 3, tasks: [
+      { task_id: 't1', title: 'Runs on', state: 'running', status: 'running', elapsed_s: 10, sub_sessions_failed: 1,
+        sub_sessions: [sub('running'), sub('running'), sub('running'), sub('running'), sub('failed')] },
+      { task_id: 't2', title: 'Finished', state: 'succeeded', status: 'done', elapsed_s: 30, ended_at: 5, sub_sessions_failed: 2,
+        sub_sessions: [sub('failed'), sub('failed')] },
+      { task_id: 't3', title: 'Broke', state: 'failed', status: 'failed', elapsed_s: 30, ended_at: 5, sub_sessions_failed: 1 }] }] } }
+  const lines = treeLines(v as any, MINE_TAG, 0)
+  expect(lines.slice(0, 3)).toEqual([{ text: 'inputs capped (conversations): some items may be missing', attn: true },
+    { text: '1 running · 1 done' }, { text: '! 3 need attention', attn: true }])
+  expect(lines.filter(l => l.attn).map(l => l.text).slice(2)).toEqual([
+    '● Runs on · 1 sub-session failed · 10s',                // its failed subagent is past the pane's 4: said on the task
+    '✓ Finished · succeeded · 2 sub-sessions failed · took 30s',  // folded to one line, still said
+    '✕ Broke · failed · took 30s'])                           // a failed task once: no sub-session count on it
+})
+
+test('pollLive with a tag reads only the session view: nothing fleet-wide', async () => {
+  const salt = '0123456789abcdef0123456789abcdef', sid = '792b087a-1983-4baf-b701-77792e4b77e4'
+  const tag = await sessionTag(salt, sid)
+  const view = { ...sessionFixture, session_filter: tag, orchestrators: { ...(sessionFixture as any).orchestrators, session_filter: tag } }
+  const $ = { ...fakeDollar({ env: { HOME: '/tmp/home', CORTADOS_PROVIDER_URL: 'http://air.example:8432' },
+    files: { '/tmp/home/.config/cortados/provider-token': TOKEN, '/tmp/home/.config/cortados/office-salt': salt },
+    http: () => ({ status: 200, ok: true, headers: {}, text: JSON.stringify(view) }) }), session: { id: async () => sid } }
+  await pollLive($ as any, FALLBACK, true)
+  expect($.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live/session?session=' + tag])
+  expect($.calls.inits[0].headers.authorization).toBe('Bearer ' + TOKEN)
+  const held = (await ($ as any).state.get({ plugin: 'cortados-pulse', key: 'tree' })).value
+  expect([held.tag, held.base]).toEqual([tag, 'http://air.example:8432'])
+  // a provider failure settles the poll (said, the held tree kept); a 404 falls back to the fleet view
+  for (const [status, fallback] of [[503, false], [401, false], [404, true]] as const) {
+    const f = { ...fakeDollar({ env: { HOME: '/tmp/home', CORTADOS_PROVIDER_URL: 'http://air.example:8432' },
+      files: { '/tmp/home/.config/cortados/provider-token': TOKEN },
+      http: () => ({ status, ok: false, headers: {}, text: 'secret ' + TOKEN }) }) }
+    expect(await fetchTree(f as any, FALLBACK, tag)).toBe(!fallback)
+    const e = (await (f as any).state.get({ plugin: 'cortados-pulse', key: 'treeErr' })).value
+    if (fallback) expect(e).toBe(null)
+    else { expect(e).toMatch(status === 401 ? /rejected the token/ : /HTTP 503/); expect(String(e).includes(TOKEN)).toBe(false) }
+  }
+})
+
+// ---- this machine's own task log (#118) -------------------------------------------------------------------------------
+
+const NOW_S = 1_800_000_000                               // the fixture's clock (tests/test_live NOW)
+const HERE = 't20261114160000-0000000a'                   // a host "here" task on this machine, only in its own log
+const HERE_KID = 't20261114160500-0000000b'               // nested under HERE, no origin of its own
+const HERE_DONE = 't20261114150000-0000000c'
+const THEIRS_HERE = 't20261114160000-0000000f'           // another session's task on this machine
+const SECRET_LOCAL = 'SECRET-PROMPT-TEXT-0118'
+
+function localLog(extra: object[] = []): string {
+  const base = { cwd: '/Users/someone/secret-project', prompt: SECRET_LOCAL, orchestrator: 'claude-app', host: 'pro' }
+  return [
+    { ts: NOW_S - 30 * 3600, event: 'started', task_id: 't20261113010000-00000001', ...base, origin_session: MINE_TAG },
+    { ts: NOW_S - 600, event: 'started', task_id: HERE, ...base, origin_session: MINE_TAG, title: 'Here and now', model: 'claude-sonnet-5' },
+    { ts: NOW_S - 300, event: 'started', task_id: HERE_KID, ...base, parent_task_id: HERE, title: 'Its child' },
+    { ts: NOW_S - 4000, event: 'started', task_id: HERE_DONE, ...base, origin_session: MINE_TAG, title: 'Done here' },
+    { ts: NOW_S - 3000, event: 'finished', task_id: HERE_DONE, ...base, origin_session: MINE_TAG, status: 'failed', duration_s: 1000 },
+    { ts: NOW_S - 100, event: 'started', task_id: THEIRS_HERE, ...base, origin_session: 'bbbbbbbbbbbbbbb2', title: 'Their task here' },
+    { ts: NOW_S - 50, event: 'started', task_id: '../../etc/passwd', origin_session: MINE_TAG, title: 'bad id' },
+    { ts: NOW_S - 40, event: 'task_exported', task_id: HERE },
+    ...extra,
+  ].map(e => JSON.stringify(e)).join('\n') + '\nnot json\n'
+}
+
+test('the local log gives this session\'s own tasks only, metadata only', () => {
+  const got = parseLocalTasks(localLog(), MINE_TAG, NOW_S)
+  expect(got.map(t => [t.task_id, t.state, t.status, t.host])).toEqual([
+    [HERE_KID, 'running', 'running', 'pro'], [HERE, 'running', 'running', 'pro'], [HERE_DONE, 'failed', 'failed', 'pro']])
+  const kid = got[0]
+  expect([kid.parent_task_id, kid.origin_via]).toEqual([HERE, 'parent'])      // inherited through its parent
+  expect(got[1].model).toBe('claude-sonnet-5')
+  expect([got[2].started_at, got[2].ended_at]).toEqual([NOW_S - 4000, NOW_S - 3000])
+  const raw = JSON.stringify(got)
+  for (const bad of [SECRET_LOCAL, '/Users', 'claude-app', 'Their task here', THEIRS_HERE, 'passwd']) expect(raw.includes(bad)).toBe(false)
+  expect(parseLocalTasks(localLog(), 'cccccccccccccccc', NOW_S)).toEqual([])
+  // ten hours without an end event is unknown, never running
+  const late = parseLocalTasks(localLog(), MINE_TAG, NOW_S + 11 * 3600 - 700)
+  expect(late.find(t => t.task_id === HERE)?.state).toBe('unknown')
+  // the read is bounded: a log far past the tail still gives its newest tasks
+  const big = 'x'.repeat(LOCAL_TAIL_BYTES + 1000) + '\n' + localLog()
+  expect(parseLocalTasks(big, MINE_TAG, NOW_S).map(t => t.task_id)).toEqual([HERE_KID, HERE, HERE_DONE])
+})
+
+test('local tasks merge into the session view by task id, once, with the counts in step', () => {
+  const view = sessionFixture as any
+  const before = JSON.stringify(view)
+  const ROOT = 't20261111090000-a0000001'                  // in the view (from the provider host's log)
+  const local = parseLocalTasks(localLog([
+    { ts: NOW_S - 200, event: 'started', task_id: ROOT, origin_session: MINE_TAG, title: 'local copy of root' }]), MINE_TAG, NOW_S)
+  const { view: merged, added } = mergeLocal(view, local, MINE_TAG, NOW_S)
+  expect(JSON.stringify(view)).toBe(before)                 // the held view is never changed
+  expect(added).toBe(3)
+  const g = merged.orchestrators!.items!.find(x => x.origin === MINE_TAG)!
+  const all: string[] = []
+  const walk = (ts: any[] = []) => ts.forEach(t => { all.push(t.task_id); walk(t.tasks) })
+  walk(g.tasks)
+  expect(all.filter(x => x === ROOT).length).toBe(1)       // the provider's node, not doubled
+  expect(JSON.stringify(merged).includes('local copy of root')).toBe(false)
+  const here = g.tasks!.find(t => t.task_id === HERE)!
+  expect(here.tasks!.map(t => t.task_id)).toEqual([HERE_KID])          // nested under its parent
+  const og = (view.orchestrators.items as any[]).find(x => x.origin === MINE_TAG)
+  expect(g.counts!.running).toBe(og.counts.running + 2)
+  expect(g.counts!.failed ?? 0).toBe((og.counts.failed ?? 0) + 1)
+  expect(g.attention).toBe(og.attention + 1)
+  const lines = treeLines(merged, MINE_TAG, 0).map(l => l.text)
+  expect(lines.some(l => l.startsWith('● Here and now'))).toBe(true)
+  expect(lines.some(l => /↳ ● Its child/.test(l))).toBe(true)
+  expect(lines.some(l => l.startsWith('✕ Done here · failed · took 16m 40s'))).toBe(true)
+  // nothing local for this session: the view as it was
+  expect(mergeLocal(view, [], MINE_TAG, NOW_S).view).toEqual(view)
+  expect(LOCAL_NOTE(1)).toMatch(/1 task from this machine's task log only/)
+})
+
+test('the local log is read bounded: stat first, a large log through tail -c only, never read whole', async () => {
+  const path = '/tmp/state/child-tasks.jsonl'
+  const env = { HOME: '/tmp/home', CORTADOS_HOME: '/tmp/state' }
+  // within the bound: read whole (that is its tail), no process
+  const small = fakeDollar({ env, files: { [path]: localLog() } })
+  expect(await readLocalLog(small as any, path)).toEqual({ text: localLog(), cut: false })
+  expect([small.io.reads, small.io.runs]).toEqual([[path], []])
+  // 5 MiB: over the bound and over the host's own 4 MiB read limit. Only the last 2 MiB cross, through tail -c; the
+  // file is never read, and the partial first line of the tail is dropped
+  const filler = (JSON.stringify({ ts: NOW_S - 10, event: 'started', task_id: 't20261114100000-000000ff', origin_session: MINE_TAG,
+    title: 'old filler' }) + '\n').repeat(Math.ceil(5 * 2 ** 20 / 120))
+  const big = filler + 'PARTIAL-' + localLog()
+  const $ = { ...fakeDollar({ env, files: { [path]: big } }), clock: { now: async () => NOW_S * 1000 } }
+  const got = await readLocalLog($ as any, path)
+  expect(got.cut).toBe(true)
+  expect(utf8(got.text!).length).toBe(LOCAL_TAIL_BYTES)
+  expect($.io.reads).toEqual([])
+  expect($.io.runs).toEqual([[TAIL_BIN, '-c', String(LOCAL_TAIL_BYTES), path]])
+  expect(TAIL_BIN).toBe('/usr/bin/tail')                     // absolute: no PATH entry stands in for it
+  await readLocal($ as any, MINE_TAG)
+  const held = (await ($ as any).state.get({ plugin: 'cortados-pulse', key: 'local' })).value
+  expect(held.tasks.map((t: any) => t.task_id)).toEqual(['t20261114100000-000000ff', HERE_KID, HERE, HERE_DONE])
+  expect(held.note).toBe(null)
+  expect($.io.reads).toEqual([])
+  // a cut text drops its first line even when it is shorter than the bound
+  const cutText = '{"ts": ' + (NOW_S - 5) + ', "event": "started", "task_id": "t20261114100000-000000ee", "origin_session": "' + MINE_TAG + '"}\n' + localLog()
+  expect(parseLocalTasks(cutText, MINE_TAG, NOW_S, true).some(t => t.task_id === 't20261114100000-000000ee')).toBe(false)
+  expect(parseLocalTasks(cutText, MINE_TAG, NOW_S).some(t => t.task_id === 't20261114100000-000000ee')).toBe(true)
+  // tail failing (or not starting): no local tasks, said, and still never a whole read
+  for (const proc of [() => ({ exitCode: 1, stdout: '', stderr: 'x' }), () => { throw new Error('cannot start') }]) {
+    const f = { ...fakeDollar({ env, files: { [path]: big }, process: proc }), clock: { now: async () => NOW_S * 1000 } }
+    await readLocal(f as any, MINE_TAG)
+    const h = (await (f as any).state.get({ plugin: 'cortados-pulse', key: 'local' })).value
+    expect([h.tasks, h.note, f.io.reads]).toEqual([[], LOCAL_SKIP_NOTE, []])
+  }
+  // missing: no tasks, nothing said
+  const none = fakeDollar({ env, files: {} })
+  await readLocal(none as any, MINE_TAG)
+  expect((await (none as any).state.get({ plugin: 'cortados-pulse', key: 'local' })).value.note).toBe(null)
+})
+
+test('a local-only task the provider may have counted but hidden makes the counts lower bounds, never a sum', () => {
+  // the provider's group: 20 listed, 1 more hidden past its cap, all counted (21 done). HERE_DONE (failed here) and
+  // HERE (running) are top-level and local-only: either may be the hidden one
+  const listed = Array.from({ length: 20 }, (_, i) => ({ task_id: `t20261114000000-${i.toString(16).padStart(8, '0')}`,
+    state: 'succeeded', status: 'done', started_at: NOW_S - 9000 + i, ended_at: NOW_S - 8000 + i, tasks: [] }))
+  const view = { session_filter: MINE_TAG, orchestrators: { status: 'ok', errors: [], items: [{ origin: MINE_TAG, kind: 'session',
+    counts: { done: 20, failed: 1 }, attention: 1, tasks: listed, tasks_hidden: 1 }] } }
+  const { view: v, added } = mergeLocal(view as any, parseLocalTasks(localLog(), MINE_TAG, NOW_S), MINE_TAG, NOW_S)
+  const g = v.orchestrators!.items![0]
+  expect(added).toBe(3)
+  // failed: max(provider 1, local 1) = 1, not 2; running: HERE and HERE_KID (under HERE: hidden with it, if at all)
+  expect([g.counts, g.attention, g.counts_at_least]).toEqual([{ done: 20, failed: 1, running: 2 }, 1, true])
+  const lines = treeLines(v, MINE_TAG, 0).map(l => l.text)
+  expect(lines[0]).toBe('≥2 running · ≥20 done · ≥1 failed')
+  expect(lines).toContain('! ≥1 need attention')
+  // 21 finished listed (20 + HERE_DONE), 3 drawn, 18 more, and the hidden 1 that may be one drawn here: up to 19
+  expect(lines).toContain('  up to 19 more finished (dashboard)')
+  // a local-only task under a task the provider listed was not hidden: exact, added on top of the bound
+  const kidOfListed = parseLocalTasks(localLog([{ ts: NOW_S - 20, event: 'started', task_id: 't20261114170000-000000dd',
+    parent_task_id: listed[0].task_id, origin_session: MINE_TAG, title: 'Under a listed one' }]), MINE_TAG, NOW_S)
+  const withKid = mergeLocal(view as any, kidOfListed, MINE_TAG, NOW_S).view.orchestrators!.items![0]
+  expect(withKid.counts).toEqual({ done: 20, failed: 1, running: 3 })
+  // nothing hidden: exact sums, as before
+  const open = { ...view, orchestrators: { ...view.orchestrators, items: [{ ...view.orchestrators.items[0], tasks_hidden: 0 }] } }
+  const exact = mergeLocal(open as any, parseLocalTasks(localLog(), MINE_TAG, NOW_S), MINE_TAG, NOW_S).view.orchestrators!.items![0]
+  expect([exact.counts, exact.attention, exact.counts_at_least]).toEqual([{ done: 20, failed: 2, running: 2 }, 2, undefined])
+  expect(treeLines(mergeLocal(open as any, parseLocalTasks(localLog(), MINE_TAG, NOW_S), MINE_TAG, NOW_S).view, MINE_TAG, 0)[0].text)
+    .toBe('2 running · 20 done · 2 failed')
+})
+
+test('a task this machine saw end, or knows first-hand, replaces an older report of it', () => {
+  const view = { session_filter: MINE_TAG, orchestrators: { status: 'ok', errors: [], items: [{ origin: MINE_TAG, kind: 'session',
+    counts: { running: 1, unknown: 1 }, attention: 1, tasks: [
+      { task_id: HERE_DONE, state: 'running', status: 'running', host: 'pro', started_at: NOW_S - 4000, elapsed_s: 3990, tasks: [] },
+      { task_id: HERE, state: 'unknown', status: 'unknown', phase: STALE_HB_PHASE, host: 'pro', started_at: NOW_S - 600, tasks: [] }] }] } }
+  const { view: v, added } = mergeLocal(view as any, parseLocalTasks(localLog(), MINE_TAG, NOW_S), MINE_TAG, NOW_S)
+  const g = v.orchestrators!.items![0]
+  const node = (id: string) => g.tasks!.find(t => t.task_id === id)!
+  expect([node(HERE_DONE).status, node(HERE_DONE).ended_at]).toEqual(['failed', NOW_S - 3000])
+  expect([node(HERE).status, node(HERE).phase]).toEqual(['running', null])   // a stale heartbeat's guess, corrected
+  expect(added).toBe(1)                                                       // HERE_KID only
+  expect(g.counts).toEqual({ running: 2, unknown: 0, failed: 1 })
+  expect(g.attention).toBe(1)                                                 // the failed one; the unknown is gone
+})
+
+test('the fallback draws this machine\'s tasks the provider\'s lists do not have', () => {
+  const local = parseLocalTasks(localLog(), MINE_TAG, NOW_S)
+  const lines = localLines(local, MINE_TAG, new Set([HERE_DONE]), NOW_S, 5).map(l => l.text)
+  expect(lines[0]).toBe("from this machine's task log:")
+  expect(lines.some(l => l.startsWith('● Here and now') && l.endsWith('10m 05s'))).toBe(true)   // keeps counting
+  expect(lines.join('\n').includes('Done here')).toBe(false)                   // the provider's list has it
+  expect(localLines(local, MINE_TAG, new Set(local.map(t => t.task_id!)), NOW_S, 0)).toEqual([])
+})
+
+test('the poll reads the local log every 30 s per session, and it stands when the provider is unreachable', async () => {
+  const salt = '0123456789abcdef0123456789abcdef', sid = '792b087a-1983-4baf-b701-77792e4b77e4'
+  const tag = await sessionTag(salt, sid)
+  const log = localLog().split(MINE_TAG).join(tag)
+  let reads = 0, now = NOW_S * 1000
+  const base = fakeDollar({ env: { HOME: '/tmp/home', CORTADOS_HOME: '/tmp/state/', CORTADOS_PROVIDER_URL: 'http://air.example:8432' },
+    files: { '/tmp/home/.config/cortados/provider-token': TOKEN, '/tmp/home/.config/cortados/office-salt': salt,
+      '/tmp/state/child-tasks.jsonl': log },
+    http: () => { throw new Error('connect ECONNREFUSED') } })
+  const realRead = base.fs.read
+  const $ = { ...base, session: { id: async () => sid }, clock: { now: async () => now },
+    fs: { ...base.fs, read: async (p: string) => { if (p.endsWith('child-tasks.jsonl')) reads++; return realRead(p) } } }
+  await pollLive($ as any, FALLBACK, true)
+  const held = (await ($ as any).state.get({ plugin: 'cortados-pulse', key: 'local' })).value
+  expect([held.tag, held.tasks.map((t: any) => t.task_id)]).toEqual([tag, [HERE_KID, HERE, HERE_DONE]])
+  expect((await ($ as any).state.get({ plugin: 'cortados-pulse', key: 'treeErr' })).value).toMatch(/could not read the provider/)
+  expect((await ($ as any).state.get({ plugin: 'cortados-pulse', key: 'tree' })).value ?? null).toBe(null)
+  // with no provider answer at all, the fallback lines still show this session's local tasks
+  const lines = localLines(held.tasks, tag, new Set(), held.at / 1000, 0).map(l => l.text)
+  expect(lines.some(l => l.startsWith('● Here and now'))).toBe(true)
+  now += 10_000
+  await pollLive($ as any, FALLBACK, true)
+  expect(reads).toBe(1)                                         // within LOCAL_POLL_MS: not read again
+  now += LOCAL_POLL_MS
+  await pollLive($ as any, FALLBACK, true)
+  expect(reads).toBe(2)
+  // no log on this machine: no local tasks, nothing said
+  const none = { ...fakeDollar({ env: { HOME: '/tmp/home' }, files: {} }) }
+  await readLocal(none as any, tag)
+  expect((await (none as any).state.get({ plugin: 'cortados-pulse', key: 'local' })).value.tasks).toEqual([])
 })

@@ -176,12 +176,32 @@ def backend_conversations():
          "model": "claude-opus-5", "opened_at": NOW - 900, "last_used": NOW - 15, "busy": False, "awaiting_tool": True},
         {"key": "r:" + RUNNING, "ref": "c-000000000002", "provider": "claude", "lane": "claude#b",
          "model": "claude-sonnet-5", "opened_at": NOW - 100, "last_used": NOW - 20, "busy": True,
-         "awaiting_tool": False},
+         "awaiting_tool": False, "tokens": {"input": 4000, "output": 1500, "cache_read": 90000, "cache_write": 6000}},
         {"key": "r:sub-run-0001", "ref": "c-000000000003", "provider": "codex", "lane": "codex", "model": "gpt-6.1",
-         "opened_at": NOW - 90, "last_used": NOW - 80, "busy": False, "awaiting_tool": True},
+         "opened_at": NOW - 90, "last_used": NOW - 80, "busy": False, "awaiting_tool": True,
+         "tokens": {"input": 700, "output": 300, "cache_read": 0, "cache_write": 0}},
         {"key": None, "ref": "c-000000000004", "provider": "codex", "lane": "codex", "model": "gpt-6.1-mini",
          "opened_at": NOW - 400, "last_used": NOW - 300, "busy": False, "awaiting_tool": False},
     ]
+
+
+def ended_conversations():
+    """Registry.ended_conversations: a subagent of the running child that finished 35 s ago (with its tokens), one of
+    a run outside the window (dropped) and one with no run key (not a sub-session: dropped)."""
+    return [
+        {"key": "r:" + RUNNING, "ref": "c-000000000005", "provider": "codex", "lane": "codex", "model": "gpt-6.1",
+         "opened_at": NOW - 80, "last_used": NOW - 40, "busy": False, "awaiting_tool": False, "closed_at": NOW - 35,
+         "closed": "reaped", "tokens": {"input": 1000, "output": 500, "cache_read": 30000, "cache_write": 2000}},
+        {"key": "r:" + OLD, "ref": "c-000000000006", "provider": "claude", "opened_at": NOW - 30 * 3600,
+         "closed_at": NOW - 29 * 3600, "closed": "reaped"},
+        {"key": None, "ref": "c-000000000007", "provider": "claude", "opened_at": NOW - 50, "closed_at": NOW - 10,
+         "closed": "exited"},
+    ]
+
+
+def run_tokens():
+    """RunRecords.tokens_by_run: the running child's total over every turn of its conversations."""
+    return {RUNNING: {"input": 5000, "output": 2000, "cache_read": 120000, "cache_write": 8000}}
 
 
 def _n(x):
@@ -202,6 +222,7 @@ def fixture_view(**over):
     args = dict(now=NOW, child_events=events, office_view=lambda ev: board.view(ev, now=NOW),
                 tasks_view=lambda: tv, usage_view=lambda: u, heartbeats=lambda: beats.snapshot(NOW),
                 backend_sessions=4, peek=peek, conversations=backend_conversations,
+                ended_conversations=ended_conversations, run_tokens=run_tokens,
                 exec_hosts=lambda: ({"air": ["forests-macbook-air"], "studio": ["forests-mac-studio"]}, "air"),
                 self_host="forests-macbook-air", host_names=["air", "studio", "pro"])
     args.update(over)
@@ -650,6 +671,52 @@ class StubScanTest(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.root)), before)
 
 
+    def test_the_origin_index_reads_one_origins_stubs_only(self):
+        mine, theirs = "aaaaaaaaaaaaaaa1", "bbbbbbbbbbbbbbb2"
+        os.makedirs(self.root)
+        own = "t20261111080000-00000001"
+        child_tasks._write_stub(self.root, own, "studio", {"origin_session": mine, "origin_project": "Router"})
+        for i in range(300):                                         # newer, and more than the fleet scan reads
+            child_tasks._write_stub(self.root, f"t20261111090000-{i:08x}", "studio", {"origin_session": theirs})
+        child_tasks._write_stub(self.root, "t20261111100000-00000002", "studio")      # no origin: not indexed
+        fleet = child_tasks.remote_stubs()
+        self.assertTrue(fleet.truncated)
+        self.assertNotIn(own, [x["task_id"] for x in fleet])
+        before = sorted(os.listdir(self.root))
+        got = child_tasks.remote_stubs_for(mine)
+        self.assertEqual([(x["task_id"], x["host"], x["origin_session"], x["origin_project"]) for x in got],
+                         [(own, "studio", mine, "Router")])
+        self.assertFalse(got.truncated)
+        for tag in ("cccccccccccccccc", "grokbot", "../x", None):
+            got = child_tasks.remote_stubs_for(tag)
+            self.assertEqual((list(got), got.truncated), ([], False), tag)
+        self.assertEqual(len(child_tasks.remote_stubs_for(theirs)), child_tasks.REMOTE_STUBS_SCAN)
+        self.assertTrue(child_tasks.remote_stubs_for(theirs).truncated)       # its OWN volume, said to it
+        self.assertEqual(sorted(os.listdir(self.root)), before)              # read-only
+        # an entry whose stub names another origin (a hand-made or stale entry) is skipped
+        Path(self.root, child_tasks.ORIGIN_INDEX, mine, "t20261111090000-00000000").touch()
+        self.assertEqual([x["task_id"] for x in child_tasks.remote_stubs_for(mine)], [own])
+
+    def test_prune_keeps_the_origin_index_in_step(self):
+        mine = "aaaaaaaaaaaaaaa1"
+        os.makedirs(self.root)
+        old, kept = "t20261111080000-00000001", "t20261111090000-00000002"
+        child_tasks._write_stub(self.root, old, "studio", {"origin_session": mine})
+        os.makedirs(os.path.join(self.root, kept))                   # a stub from before the index
+        Path(self.root, kept, child_tasks.REMOTE_STUB).write_text(json.dumps(
+            {"host": "studio", "created_at": time.time(), "origin": {"origin_session": mine}}))
+        rec = json.loads(Path(self.root, old, child_tasks.REMOTE_STUB).read_text())
+        rec["created_at"] = time.time() - child_tasks.PRUNE_AGE_S - 60
+        Path(self.root, old, child_tasks.REMOTE_STUB).write_text(json.dumps(rec))
+        errors = []
+        self.assertEqual(child_tasks.prune(self.root, errors=errors), [old])
+        self.assertEqual(errors, [])
+        self.assertEqual(os.listdir(os.path.join(self.root, child_tasks.ORIGIN_INDEX, mine)), [kept])
+        shutil.rmtree(os.path.join(self.root, kept))
+        child_tasks.prune(self.root)
+        self.assertEqual(os.listdir(os.path.join(self.root, child_tasks.ORIGIN_INDEX)), [])
+
+
 class MemoTest(unittest.TestCase):
     def test_ttl_key_and_single_flight(self):
         clock = [0.0]
@@ -790,6 +857,52 @@ class HeartbeatTest(unittest.TestCase):
                 self.check({**self.GOOD, "jobs": [{**job, k: v}]}, f"jobs[0].{k}")
         for p in (-1, 101, "50", True):
             self.check({**self.GOOD, "jobs": [{**job, "progress_pct": p}]}, "jobs[0].progress_pct")
+
+    def test_tasks_block(self):
+        # #118: an exec host's own recent tasks, every field re-checked; a host speaks for its own tasks only
+        run = {"task_id": "t20261114160000-00000002", "state": "running", "title": "Fix the pane", "host": "pro",
+               "started_at": NOW - 600, "origin_session": SESSION, "origin_project": "CortadOS-Router",
+               "origin_device": "pro", "model": "claude-sonnet-5", "lane": "claude#a"}
+        done = {"task_id": "t20261114150000-00000003", "state": "succeeded", "started_at": NOW - 4000,
+                "ended_at": NOW - 3000, "parent_task_id": run["task_id"], "origin_via": "parent", "workspace": "archived",
+                "browser": False}
+        hb, bad = live.validate_heartbeat({"host": "pro", "tasks": {"items": [run, done], "truncated": True}}, NOW)
+        self.assertIsNone(bad)
+        self.assertEqual(hb["tasks"]["items"][0], {**run, "started_at": NOW - 600})
+        self.assertEqual(hb["tasks"]["items"][1]["host"], "pro")                       # absent: the heartbeat's host
+        self.assertTrue(hb["tasks"]["truncated"])
+        old = {**done, "task_id": "t20261113010000-00000005", "started_at": NOW - 30 * 3600, "ended_at": NOW - 25 * 3600}
+        hb, bad = live.validate_heartbeat({"host": "pro", "tasks": {"items": [old]}}, NOW)
+        self.assertEqual((bad, hb["tasks"]["items"]), (None, []))                     # outside 24 h: dropped, not refused
+        good = {"host": "pro", "tasks": {"items": [run]}}
+
+        def item(**kw):
+            return {**good, "tasks": {"items": [{**run, **kw}]}}
+        self.check({**good, "tasks": []}, "tasks")
+        self.check({**good, "tasks": {"items": [run], "cwd": "/x"}}, "tasks")
+        self.check({**good, "tasks": {"items": [run] * 2}}, "tasks.items[1].task_id")
+        self.check({**good, "tasks": {"items": [{**run, "task_id": f"t20261114160000-{i:08x}"}
+                                                for i in range(live.HB_TASKS_MAX + 1)]}}, "tasks.items")
+        self.check({**good, "tasks": {"items": [run], "truncated": "yes"}}, "tasks.truncated")
+        self.check(item(prompt=SECRET), "tasks.items[0]")
+        self.check(item(cwd="/Users/someone"), "tasks.items[0]")
+        self.check(item(task_id="../../etc/passwd"), "tasks.items[0].task_id")
+        self.check(item(host="air"), "tasks.items[0].host")                             # another host's task: refused
+        self.check(item(state="exploded"), "tasks.items[0].state")
+        self.check(item(phase="ran rm -rf /"), "tasks.items[0].phase")
+        for bad_title in ("line\nbreak", "x" * 81, 5):
+            self.check(item(title=bad_title), "tasks.items[0].title")
+        self.check(item(origin_session="/Users/someone"), "tasks.items[0].origin_session")
+        self.check(item(model="claude sonnet; rm"), "tasks.items[0].model")
+        self.check(item(origin_via="sibling"), "tasks.items[0].origin_via")
+        self.check(item(parent_task_id=run["task_id"]), "tasks.items[0].parent_task_id")
+        self.check(item(browser="no"), "tasks.items[0].browser")
+        for v in (NOW + 3600, float("inf"), "now", True):
+            self.check(item(started_at=v), "tasks.items[0].started_at")
+        self.check(item(started_at=None), "tasks.items[0].started_at")                  # no time at all
+        self.check(item(ended_at=NOW - 10), "tasks.items[0].ended_at")                  # running with an end time
+        self.check(item(state="failed"), "tasks.items[0].ended_at")                      # finished without one
+        self.check(item(state="failed", ended_at=NOW - 700), "tasks.items[0].ended_at")  # ended before it started
 
     def test_hardware_and_s1_blocks(self):
         hw = {"cpu_busy_pct": 12.345, "gpu_busy_pct": None, "mem_available_bytes": 2 ** 33, "mem_total_bytes": 2 ** 34,
@@ -1055,10 +1168,23 @@ class EndpointTest(EndpointHarness):
         cfg.write_text(json.dumps({"host": "studio", "provider_url": self.url, "token_file": str(tok), "ttl_s": 180,
                                    "jobs": [{"label": "com.cortados.s1-serve", "name": "s1-scorer"}],
                                    "s1": {"data_dir": str(d / "data"), "health_url": "http://s1.test"}}))
+        # #118: a task that ran on the Studio (its own log), started by SESSION, reaches the tree through the post
+        tid, now = "t20261114160000-5717d10a", time.time()
+        studio_log = [{"ts": now - 90, "event": "started", "task_id": tid, "host": "studio", "title": "Studio errand",
+                       "origin_session": SESSION, "cwd": "/Users/someone/secret", "prompt": SECRET}]
         with redirect_stderr(io.StringIO()):
             code = hbs.main(["--config", str(cfg)], run=fake_launchctl({"com.cortados.s1-serve": PRINT_RUNNING}),
-                            sample=fake_sample, fetch=lambda u: b'{"ok": true, "model": "CortadOS Router S1 v12"}')
+                            sample=fake_sample, fetch=lambda u: b'{"ok": true, "model": "CortadOS Router S1 v12"}',
+                            task_events=lambda: studio_log)
         self.assertEqual(code, 0)
+        self.httpd._live_memo = live.Memo()
+        raw = self.request("GET", live.SESSION_PATH + "?session=" + SESSION, TOKEN)[1]
+        tree = json.loads(raw)["orchestrators"]
+        self.assertEqual([(t["task_id"], t["host"], t["title"], t["status"]) for t in tree["items"][0]["tasks"]],
+                         [(tid, "studio", "Studio errand", "running")])
+        self.assertEqual(tree["task_hosts"], ["studio"])
+        for bad in (SECRET, "/Users/someone"):
+            self.assertNotIn(bad, raw)
         h = {x["name"]: x for x in json.loads(self.request("GET", live.LIVE_PATH, TOKEN)[1])["hosts"]["items"]}
         st = h["studio"]
         self.assertEqual((st["heartbeat_state"], st["heartbeat"]["jobs"][0]["state"]), ("fresh", "running"))

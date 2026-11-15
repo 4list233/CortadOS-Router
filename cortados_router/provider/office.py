@@ -50,6 +50,16 @@ _HEADER_RULES: dict[str, re.Pattern] = {
     TITLE_HEADER: re.compile(r"[\x20-\x7e]{1,80}"),
 }
 TAG_FIELDS = {SESSION_HEADER: "session", PROJECT_HEADER: "project", DEVICE_HEADER: "device", TITLE_HEADER: "title"}
+# The orchestrator that started a child task (its origin tag: an Office session tag or a named origin such as
+# "grokbot", child_tasks.ORIGIN_SESSION_RE), sent by the child runner on every routed request of the run next to
+# x-cortados-run-id (review round 4). The provider records it per worker, per conversation and per run's tokens, and
+# the live view joins a heartbeat-reported task's run data only when the provider OBSERVED this origin on the run
+# (live.heartbeat_rows): a heartbeat's own fields are never a join key. Compared, never published. Read separately
+# from TAG_FIELDS (OfficeBoard.read_origin): it is no floor tag.
+ORIGIN_HEADER = "x-cortados-origin"
+_ORIGIN_RE = re.compile(r"[0-9a-f]{16,64}|grokbot")   # child_tasks.ORIGIN_SESSION_RE (a test keeps the two equal)
+# a run, worker or conversation that carried two different origins: matches no task (never a join key)
+ORIGIN_CONFLICT = ""
 # Heartbeat and view field rules. Model ids as the exclude header accepts them (server._EXCLUDE_MODEL_RE), capped at
 # 64; a lane key (claude#b, codex, local-studio); a tool name (Read, mcp__server__tool, mcp__claude-in-chrome__x).
 _MODEL_RE = re.compile(r"[A-Za-z0-9._/\[\]:-]{1,64}")
@@ -120,6 +130,8 @@ class OfficeBoard:
         self.mains: dict[str, dict[str, Any]] = {}     # session -> the routed main loop (whole-session mode)
         self.heartbeats: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
         self.dropped: Counter = Counter()
+        # session -> when the MAX_WORKERS LRU last evicted one of its workers (bounded, MAX_HEARTBEATS sessions)
+        self.evicted: "OrderedDict[str, float]" = OrderedDict()
 
     # ---------------------------------------------------------------- inputs
     def read_tags(self, headers) -> dict[str, str]:
@@ -140,6 +152,17 @@ class OfficeBoard:
             with self._lock:
                 self.dropped.update(bad)
         return out
+
+    def read_origin(self, headers) -> str | None:
+        """The request's x-cortados-origin (ORIGIN_HEADER), or None; an invalid one is dropped and counted."""
+        raw = headers.get(ORIGIN_HEADER)
+        if raw is None:
+            return None
+        v = clean(raw, _ORIGIN_RE)
+        if v is None:
+            with self._lock:
+                self.dropped.update([ORIGIN_HEADER])
+        return v
 
     def _floor_locked(self, tags: dict[str, str], now: float) -> dict[str, Any] | None:
         s = tags.get("session")
@@ -174,7 +197,9 @@ class OfficeBoard:
         return None
 
     def turn_start(self, key: str | None, tags: dict[str, str], *, run_id: str | None, provider: str | None,
-                   lane: str | None, model: str | None, now: float | None = None) -> None:
+                   lane: str | None, model: str | None, now: float | None = None, origin: str | None = None) -> None:
+        """`origin`: the request's x-cortados-origin (read_origin), recorded on a run's worker as the provider saw it:
+        the first one seen, ORIGIN_CONFLICT once a request of the run names another (note_origin)."""
         if not key:
             return
         now = time.time() if now is None else now
@@ -198,9 +223,16 @@ class OfficeBoard:
                 w["title"] = tags["title"]
             if tags.get("session") and not w.get("session"):
                 w["session"] = tags["session"]
+            if origin is not None:
+                w["origin"] = note_origin(w.get("origin"), origin)
             self.workers[key] = w
             while len(self.workers) > MAX_WORKERS:
-                self.workers.popitem(last=False)
+                _, gone = self.workers.popitem(last=False)
+                if gone.get("session"):         # said in the live tree: that session's one-shot list may be short
+                    self.evicted.pop(gone["session"], None)
+                    self.evicted[gone["session"]] = now
+                    while len(self.evicted) > MAX_HEARTBEATS:
+                        self.evicted.popitem(last=False)
 
     def turn_end(self, key: str | None, tags: dict[str, str], *, status: str, tool: str | None = None,
                  now: float | None = None) -> None:
@@ -240,7 +272,13 @@ class OfficeBoard:
 
     # ---------------------------------------------------------------- the view
     def view(self, child_events: list[dict[str, Any]], *, now: float | None = None,
-             errors: list[dict[str, str]] | None = None) -> dict[str, Any]:
+             errors: list[dict[str, str]] | None = None, uncapped: bool = False) -> dict[str, Any]:
+        """The board as the Office shows it: floors capped at MAX_FLOORS, workers at MAX_WORKERS overall and
+        MAX_WORKERS_PER_FLOOR / MAX_LOBBY per floor. `uncapped` (the live view's orchestrator tree only, never the Office
+        endpoint) adds `workers_all`: every eligible worker before the floor, overall and per-floor caps, each with its
+        own session tag and that floor's project/device, so one session's workers never depend on the others' volume.
+        Its size is bounded by the board's memory (MAX_WORKERS LRU) plus the child tasks of the log window; the
+        sessions that lost a worker to that LRU within WORKER_KEEP_S are named in `workers_evicted`."""
         now = time.time() if now is None else now
         children = _children(child_events, now)
         with self._lock:
@@ -251,6 +289,7 @@ class OfficeBoard:
             mains = {s: dict(m) for s, m in self.mains.items() if s in self.floors}
             beats = {s: dict(h) for s, h in self.heartbeats.items()}
             dropped = dict(self.dropped)
+            evicted = {s: t for s, t in self.evicted.items() if now - t <= WORKER_KEEP_S}
         # Child tasks: merged into the worker their own traffic made (same run id), else a worker of their own. A child
         # with a tag opens (or keeps) its floor, as a routed request does.
         for tid, c in children.items():
@@ -278,6 +317,7 @@ class OfficeBoard:
                 floors[s] = f
         # Global caps cover the merged log AND live state. Keep the most recently active floors/workers; the log
         # tail may hold thousands of unique keys even though live state was already bounded.
+        all_floors = floors
         recent_floors = sorted(floors, key=lambda s: (-floors[s]["last"], s))[:MAX_FLOORS]
         floors_hidden = len(floors) - len(recent_floors)
         hidden_sessions = set(floors) - set(recent_floors)
@@ -307,10 +347,21 @@ class OfficeBoard:
                                "orchestrator": _orchestrator(beats.get(s), mains.get(s)),
                                "workers": ws["items"], "workers_hidden": ws["hidden"]})
         lobby = _cap(by_floor.get(None, []), MAX_LOBBY)
-        return {"version": VERSION, "ts": _ts(now), "floors": out_floors,
-                "floors_hidden": floors_hidden, "workers_hidden": workers_hidden,
-                "lobby": {"workers": lobby["items"], "workers_hidden": lobby["hidden"]},
-                "dropped_headers": dropped, "errors": list(errors or [])}
+        out = {"version": VERSION, "ts": _ts(now), "floors": out_floors,
+               "floors_hidden": floors_hidden, "workers_hidden": workers_hidden,
+               "lobby": {"workers": lobby["items"], "workers_hidden": lobby["hidden"]},
+               "dropped_headers": dropped, "errors": list(errors or [])}
+        if uncapped:
+            out["workers_evicted"] = sorted(evicted)   # sessions that lost a worker to the LRU in the keep window
+            out["workers_all"] = []
+            for w in eligible:
+                s = w.get("session")            # the worker's own tag, kept even when its floor was hidden or evicted
+                f = all_floors.get(s) or {}
+                # `origin`: the provider-observed x-cortados-origin of the run (live.heartbeat_rows compares it and
+                # never publishes it)
+                out["workers_all"].append({**_pub_worker(w), "session": s, "project": f.get("project"),
+                                           "device": f.get("device"), "origin": w.get("origin")})
+        return out
 
     def _expire_locked(self, now: float, keep: set[str] | frozenset = frozenset()) -> None:
         for s in [s for s, f in self.floors.items() if now - f.get("last", now) > FLOOR_TTL_S]:
@@ -422,6 +473,14 @@ def _orchestrator(hb: dict[str, Any] | None, main: dict[str, Any] | None) -> dic
         return {"model": main.get("model"), "status": "idle" if main.get("status") == "done" else main.get("status"),
                 "tool": main.get("tool"), "last_seen": _ts(main.get("updated")), "source": "routed"}
     return None
+
+
+def note_origin(prev: str | None, seen: str | None) -> str | None:
+    """A run's provider-observed origin after one more request: the first origin seen stays; a request naming another
+    makes it ORIGIN_CONFLICT for good (it then joins no task); a request without the header changes nothing."""
+    if seen is None or prev == seen:
+        return prev
+    return seen if prev is None else ORIGIN_CONFLICT
 
 
 def _pub_worker(w: dict[str, Any]) -> dict[str, Any]:

@@ -6,12 +6,18 @@
  * cached scarcity with its per-window "% left" (one row per lane and per Claude account), and the online local devices.
  * The last line links the browser dashboard (<provider>/dashboard), which shows the same live view in full.
  *
- * THIS SESSION, at the top: the start_task children this very session started (running and queued, then the last few
- * finished), picked out of the live view by their origin_session. The pane names its session the way
+ * THIS SESSION, at the top: a live tree of this session's own work, flightdeck-style (docs/PULSE-PER-SESSION.md): the
+ * start_task children it started, each child's sub-sessions (its routed conversations) under it, nested tasks under
+ * their parent, and the subagents this session routed directly; each node with its state glyph, model, phase or tool,
+ * tokens and an elapsed clock that keeps counting between polls. The pane names its session the way
  * cortados-routed-subagents names its Office floor and the cortados-route MCP server names a task's origin:
  * sha256("<salt>:<session id>") cut to 16 hex, the salt read from the machine's shared file
  * (~/.config/cortados/office-salt, made by the MCP server; CORTADOS_OFFICE_SALT_FILE overrides). The raw session id
  * never leaves the pane; without the salt file the section says the session cannot be identified.
+ *
+ * With its tag the pane reads ONLY GET /v1/cortados/live/session?session=<tag>, which the provider builds filtered: that
+ * one subtree plus fleet health that names no session (S1, hosts). The fleet view (/v1/cortados/live, every session's
+ * tasks and conversations) is read only as a fallback: no tag, or a provider from before the per-session view.
  *
  * Where the provider is comes from the plugin config, else CORTADOS_PROVIDER_URL, else the per-machine URL file
  * (CORTADOS_PROVIDER_URL_FILE or ~/.config/cortados/provider-url): the same chain as cortados-routed-subagents, and
@@ -23,7 +29,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Pulse, PulseDevices, PulseLaneHealth, PulseLive, PulseLiveConversation, PulseLiveHost, PulseLiveTask,
-  PulseReading, PulseUsage } from '../types'
+  PulseOrchestrator, PulseReading, PulseSessionView, PulseSubSession, PulseTokens, PulseTreeTask, PulseUsage } from '../types'
 
 type Cfg = {
   providerUrl: string
@@ -49,6 +55,12 @@ export const POLL_MS = 20_000
  * (no vendor CLI, no ssh), and the pane's one timer ticks at this rate, reading /resources every other tick. */
 export const LIVE_POLL_MS = 10_000
 export const LIVE_PATH = '/v1/cortados/live'
+/** This session's own subtree (provider/live.py SESSION_PATH, session_view). */
+export const SESSION_PATH = '/v1/cortados/live/session'
+/** Sub-sessions drawn under a running task before "+N more": a side pane, not the dashboard (which lists 8). */
+export const SUBS_MAX = 4
+/** Subagents this session routed directly, drawn after its tasks. */
+export const ROUTED_SHOWN = 3
 /** Lines the Running section draws per list before it says "+N more": the pane is a side column, not the dashboard. */
 export const RUNNING_MAX = 6
 export const CONVERSATIONS_MAX = 4
@@ -70,6 +82,13 @@ const mine = atom({ plugin: 'cortados-pulse', key: 'mine' } as const, null as Mi
  * pushes them out of the fleet view's lists). null: not fetched, or a provider that ignored ?session= (filter the fleet). */
 type MineLive = { data: PulseLive; at: number; tag: string }
 const mineLive = atom({ plugin: 'cortados-pulse', key: 'mineLive' } as const, null as MineLive | null)
+/** GET /v1/cortados/live/session?session=<tag>: this session's subtree. Drawn only for the tag it was fetched for. */
+type TreeHeld = { data: PulseSessionView; at: number; tag: string; base: string }
+const tree = atom({ plugin: 'cortados-pulse', key: 'tree' } as const, null as TreeHeld | null)
+const treeErr = atom({ plugin: 'cortados-pulse', key: 'treeErr' } as const, null as string | null)
+/** This machine's own task log, this session's tasks in it (#118): merged into the tree by task id. */
+type LocalHeld = { tag: string; at: number; tasks: LocalTask[]; note?: string | null }
+const localHeld = atom({ plugin: 'cortados-pulse', key: 'local' } as const, null as LocalHeld | null)
 
 /** The machine's shared Office salt (cortados_router/subagent_mcp.py OFFICE_SALT_DEFAULT). */
 export const OFFICE_SALT_FILE = '~/.config/cortados/office-salt'
@@ -208,7 +227,7 @@ let liveInFlight = false
 /** One /v1/cortados/live poll. A provider from before the live view answers 404: said as such, never as an outage.
  * One at a time: a tick that lands while the previous answer is still coming is skipped, never stacked. */
 /** What a live poll touches. With `me` (the hooks pass true) it also names this session ($.session), every poll. */
-type LiveDollar = Pick<EngineInterface, 'env' | 'fs' | 'http' | 'state' | 'clock'>
+type LiveDollar = Pick<EngineInterface, 'env' | 'fs' | 'process' | 'http' | 'state' | 'clock'>
 
 export async function pollLive($: LiveDollar, cfg: Cfg, me = false): Promise<void> {
   if (liveInFlight) return
@@ -221,16 +240,40 @@ export async function pollLive($: LiveDollar, cfg: Cfg, me = false): Promise<voi
 }
 
 async function pollLiveOnce($: LiveDollar, cfg: Cfg, me: boolean): Promise<void> {
+  // every poll: /clear and resume move the pane to another session id
+  const m = me ? await identify($ as Pick<EngineInterface, 'env' | 'fs' | 'session'>) : null
+  if (m) await update($, mine, () => m)
+  // this machine's own log first: it draws even when the provider cannot be reached (#118)
+  if (m?.tag) await readLocal($, m.tag)
+  // the per-session view answered (or failed in a way the fleet view would too): nothing fleet-wide is read
+  if (m?.tag && await fetchTree($, cfg, m.tag)) return
   try {
     await fetchLive($, cfg)
   } finally {
-    // after the fetch, every poll: /clear and resume move the pane to another session id
-    if (me) {
-      const m = await identify($ as Pick<EngineInterface, 'env' | 'fs' | 'session'>)
-      await update($, mine, () => m)
-      await fetchMine($, cfg, m.tag)
-    }
+    if (m) await fetchMine($, cfg, m.tag)
   }
+}
+
+/** GET /v1/cortados/live/session?session=<tag>. True when it settled the poll: the subtree is held, or the provider
+ * failed (401/403/5xx/network: said, the held subtree stays with its age). False only for a provider without the view
+ * (404, or an answer that is not this session's subtree): the pane then falls back to the fleet view. */
+export async function fetchTree($: LiveDollar, cfg: Cfg, tag: string): Promise<boolean> {
+  const f = await fetchView($, cfg, SESSION_PATH + '?session=' + tag)
+  if (f.ok) {
+    const data = f.data as PulseSessionView
+    if (data.session_filter === tag && data.orchestrators && typeof data.orchestrators === 'object') {
+      const at = await $.clock.now()
+      await update($, tree, () => ({ data, at, tag, base: f.url }))
+      await update($, treeErr, () => null)
+      return true
+    }
+  } else if (f.status !== 404) {
+    await update($, treeErr, () => 'live: ' + f.problem)
+    return true
+  }
+  await update($, tree, () => null)
+  await update($, treeErr, () => null)
+  return false
 }
 
 /** This session's own view (?session=). Kept only when the provider says it filtered for this tag (session_filter):
@@ -433,9 +476,335 @@ export function sessionLines(live: PulseLive, me: Mine | null, since: number): s
   return out
 }
 
+// ---- this session's tree (flightdeck-style; pure, tested) -----------------------------------------------------------
+
+/** A tree line: its text, and whether it needs attention (failed, unknown, or a task with a failed sub-session:
+ * drawn bold, the glyph or the words say which). */
+export type TreeLine = { text: string; attn?: boolean }
+
+const GLYPH: Record<string, string> = { running: '●', waiting: '◷', done: '✓', failed: '✕', unknown: '?' }
+export const glyph = (status?: string | null, state?: string | null): string =>
+  state === 'cancelled' ? '⊘' : GLYPH[status ?? ''] ?? '•'
+
+/** Fresh tokens (input + output + cache writes) in a few characters: 950 tok, 14k tok, 1.2M tok. */
+export function tokShort(t?: PulseTokens | null): string | null {
+  const n = t?.fresh
+  if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) return null
+  return (n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? Math.round(n / 1e3) + 'k' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n)) + ' tok'
+}
+
+/** Elapsed as it should read now: a node still running or waiting keeps counting from the snapshot (`since` s ago). */
+const clockOf = (x: { status?: string; ended_at?: number | null; elapsed_s?: number | null }, since: number): string | null =>
+  typeof x.elapsed_s !== 'number' ? null
+    : (x.status === 'running' || x.status === 'waiting') && x.ended_at == null ? dur(x.elapsed_s + since)
+    : 'took ' + dur(x.elapsed_s)
+
+function subLine(x: PulseSubSession, last: boolean, indent: string, since: number): TreeLine {
+  const who = x.title || (x.role === 'main' ? 'main loop' : 'subagent')
+  return { text: indent + (last ? '└ ' : '├ ') + glyph(x.status) + ' ' + join([who, x.model, x.tool ? 'tool ' + x.tool : x.phase,
+    tokShort(x.tokens), clockOf(x, since)]), attn: x.status === 'failed' }
+}
+
+/** One task and what hangs under it. A live task (running, waiting) opens: its model line and its sub-sessions; a
+ * finished one is one line, as flightdeck folds a finished card. Nested tasks follow, indented under their parent. */
+function taskLines(t: PulseTreeTask, depth: number, since: number): TreeLine[] {
+  const ind = '  '.repeat(depth)
+  const live = t.status === 'running' || t.status === 'waiting'
+  const bad = t.status === 'failed' || t.status === 'unknown'
+  // a task that is not itself failed but has failed sub-sessions (counted in the group's attention): said on its own
+  // line, which a finished task folds to, and also when the failed one is past the sub-session cap
+  const subFailed = bad ? 0 : Math.max(0, t.sub_sessions_failed ?? 0)
+  const attn = bad || subFailed > 0
+  const name = t.title || ('task ' + (t.task_id ?? '?'))
+  const out: TreeLine[] = [{ attn, text: ind + (depth ? '↳ ' : '') + glyph(t.status, t.state) + ' ' + join([name,
+    live ? null : t.state === 'elsewhere' ? 'on ' + t.host + ', state there' : t.state,
+    subFailed ? subFailed + ' sub-session' + (subFailed === 1 ? '' : 's') + ' failed' : null,
+    live ? clockOf(t, since) : clockOf(t, 0)]) }]
+  const pad = ind + (depth ? '  ' : '') + '  '
+  if (live) {
+    const meta = join([t.model, t.host ? 'on ' + t.host : null, t.tool ? 'tool ' + t.tool : t.phase, tokShort(t.tokens)])
+    if (meta) out.push({ text: pad + meta })
+    const subs = t.sub_sessions ?? []
+    const shown = subs.slice(0, SUBS_MAX)
+    const more = subs.length - shown.length + (t.sub_sessions_hidden ?? 0)
+    shown.forEach((x, i) => out.push(subLine(x, i === shown.length - 1 && more <= 0, pad, since)))
+    if (more > 0) out.push({ text: pad + '└ +' + more + ' more sub-sessions' })
+  }
+  for (const k of t.tasks ?? []) out.push(...taskLines(k, depth + 1, since))
+  return out
+}
+
+/** This session's tree from its session view: a count line, then its live tasks (opened), the last few finished
+ * (folded), and the subagents it routed directly. Only `items` whose origin is the session's own tag are drawn. */
+export function treeLines(v: PulseSessionView, tag: string, since: number): TreeLine[] {
+  const o = v.orchestrators ?? {}
+  if (o.status === 'error') return [{ text: 'tasks unavailable: ' + errs(o), attn: true }]
+  const g: PulseOrchestrator | undefined = (o.items ?? []).find(x => x.origin === tag)
+  const out: TreeLine[] = []
+  if (o.status === 'partial') out.push({ text: 'partial: ' + errs(o), attn: true })
+  // the provider bounds its inputs by a hard ceiling far above any real fleet; when it cuts one it says so
+  if (o.inputs_truncated?.length) out.push({ text: 'inputs capped (' + o.inputs_truncated.join(', ') + '): some items may be missing', attn: true })
+  if (!g) return [...out, { text: 'no task started from this session in the last 24 h' }]
+  const c = g.counts ?? {}
+  const n = (k: string) => c[k] ?? 0
+  // counts_at_least (mergeLocal): a local-only task may be one the provider counted but did not list: lower bounds
+  const ge = g.counts_at_least ? '≥' : ''
+  const cnt = (k: string) => n(k) ? ge + n(k) + ' ' + k : null
+  out.push({ text: join([cnt('running'), cnt('waiting'), cnt('done'), cnt('failed'), cnt('unknown')]) ||
+    'no task started from this session in the last 24 h' })
+  if (g.attention) out.push({ text: '! ' + ge + g.attention + (g.attention === 1 && !ge ? ' needs' : ' need') + ' attention', attn: true })
+  const tasks = g.tasks ?? []
+  const live = tasks.filter(t => t.status === 'running' || t.status === 'waiting')
+  const rest = tasks.filter(t => !(t.status === 'running' || t.status === 'waiting'))
+  for (const t of live.slice(0, RUNNING_MAX)) out.push(...taskLines(t, 0, since))
+  if (live.length > RUNNING_MAX) out.push({ text: `  +${live.length - RUNNING_MAX} more running (dashboard)` })
+  for (const t of rest.slice(0, MINE_RECENT_MAX)) out.push(...taskLines(t, 0, since))
+  const hidden = Math.max(0, rest.length - MINE_RECENT_MAX) + (g.tasks_hidden ?? 0)
+  if (hidden) out.push({ text: g.counts_at_least ? `  up to ${hidden} more finished (dashboard)` : `  +${hidden} more finished (dashboard)` })
+  const routed = g.routed ?? []
+  if (routed.length) {
+    out.push({ text: 'routed directly' })
+    const shown = routed.slice(0, ROUTED_SHOWN)
+    const more = routed.length - shown.length + (g.routed_hidden ?? 0)
+    shown.forEach((x, i) => out.push(subLine(x, i === shown.length - 1 && more <= 0, '', since)))
+    if (more > 0) out.push({ text: '└ +' + more + ' more' })
+  }
+  return out
+}
+
 /** Shown under This session: /clear gives the pane a new session id, while a task keeps the session it was started
  * for (and the cortados-route server keeps the id it started with: README "Which main session started which task"). */
 export const CLEAR_NOTE = 'after a /clear, earlier tasks stay under the previous session (dashboard)'
+
+// ---- this machine's own task log (#118; pure, tested) ----------------------------------------------------------------
+// A task started with host "here" runs on THIS machine and logs only here ($CORTADOS_HOME/child-tasks.jsonl). The
+// provider learns of it from this host's heartbeat, which may not exist yet (no sender installed) or may not reach it
+// (provider unreachable). So the pane also reads the local log for its own session's tasks and merges them, by task id,
+// into whatever the provider's view holds: the provider's node wins (it has the sub-sessions and tokens), except that
+// a task the local log saw finish is shown finished at once.
+
+/** The log's name in the state dir (child_tasks.EVENT_LOG, office.CHILD_EVENT_LOG). */
+export const LOCAL_LOG = 'child-tasks.jsonl'
+/** Read every third live tick: the log only grows (never rotated), and a task's start or end may wait 30 s here. */
+export const LOCAL_POLL_MS = 30_000
+/** The tail parsed, as the provider bounds its own read of the same log (usage.CHILD_TAIL_BYTES / CHILD_TAIL). */
+export const LOCAL_TAIL_BYTES = 2 * 2 ** 20
+export const LOCAL_TAIL_LINES = 5000
+const DAY_S = 86400
+const STALE_RUNNING_S = 10 * 3600          // live.STALE_RUNNING_S: no end event after 10 h is unknown, not running
+const TASK_ID = /^t\d{14}-[0-9a-f]{8}$/   // child_tasks.TASK_ID_RE
+const HOST = /^[a-z][a-z0-9-]{0,31}$/
+const TITLE = /^[\x20-\x7e]{1,80}$/
+const MODEL = /^[A-Za-z0-9._/\[\]:-]{1,64}$/
+const LANE = /^[A-Za-z0-9._#:/-]{1,64}$/
+const FINAL: Record<string, string> = { succeeded: 'done', failed: 'failed', cancelled: 'done' }
+/** live.STALE_HB_PHASE: the provider's word for a task whose host's heartbeat went stale (tests check they agree). */
+export const STALE_HB_PHASE = "its host's heartbeat is stale; state as last reported"
+const pick = (v: unknown, re: RegExp): string | null => typeof v === 'string' && re.test(v) ? v : null
+
+/** A task this machine's log knows: a tree node without sub-sessions, its times kept so the merge can clock it. */
+export type LocalTask = PulseTreeTask & { parent_task_id?: string | null }
+
+/** This session's own tasks in the log text (`tag`'s origin, or a parent's along parent_task_id within the log), the
+ * last 24 h, newest first. Only the metadata fields are read, each by the provider's own rule; the cwd, the prompt
+ * and anything else in a line are never kept. Pure: `nowS` is the clock in seconds. */
+export function parseLocalTasks(text: string, tag: string, nowS: number, cut = false): LocalTask[] {
+  let tail = text.length > LOCAL_TAIL_BYTES ? text.slice(text.length - LOCAL_TAIL_BYTES) : text
+  // drop the cut first line: cut here, or by the reader (`cut`: the text is already the file's tail, readLocalLog)
+  if (cut || tail.length < text.length) tail = tail.slice(tail.indexOf('\n') + 1)
+  const lines = tail.split('\n')
+  type Rec = { id: string; start: number | null; end: number | null; final: string | null; title: string | null;
+    host: string | null; model: string | null; lane: string | null; origin: string | null; parent: string | null; dur: number | null }
+  const by = new Map<string, Rec>()
+  for (const ln of lines.slice(-LOCAL_TAIL_LINES)) {
+    if (!ln.trim()) continue
+    let e: any
+    try { e = JSON.parse(ln) } catch { continue }
+    if (!e || typeof e !== 'object') continue
+    const ts = e.ts, id = pick(e.task_id, TASK_ID), ev = e.event
+    if (typeof ts !== 'number' || !Number.isFinite(ts) || ts < nowS - DAY_S || ts > nowS + 120 || !id) continue
+    if (ev !== 'started' && ev !== 'finished' && ev !== 'cancelled') continue
+    const r = by.get(id) ?? { id, start: null, end: null, final: null, title: null, host: null, model: null, lane: null,
+      origin: null, parent: null, dur: null }
+    by.set(id, r)
+    if (ev === 'started') r.start = ts
+    else {
+      r.end = ts
+      r.final = ev === 'cancelled' ? 'cancelled' : (e.status in FINAL ? e.status : 'failed')
+      if (typeof e.duration_s === 'number' && Number.isFinite(e.duration_s) && e.duration_s >= 0) r.dur = e.duration_s
+    }
+    r.title = pick(e.title, TITLE) ?? r.title
+    r.host = pick(e.host, HOST) ?? r.host
+    r.model = pick(e.model, MODEL) ?? r.model
+    r.lane = pick(e.lane, LANE) ?? r.lane
+    r.origin = typeof e.origin_session === 'string' && (e.origin_session === 'grokbot' || /^[0-9a-f]{16,64}$/.test(e.origin_session))
+      ? e.origin_session : r.origin
+    const p = pick(e.parent_task_id, TASK_ID)
+    if (p && p !== id) r.parent = p
+  }
+  // whose: its own origin, else the nearest ancestor's in this log (as live._origin_of)
+  const originOf = (r: Rec): [string | null, boolean] => {
+    if (r.origin) return [r.origin, false]
+    const seen = new Set([r.id])
+    let cur: Rec | undefined = r
+    while (cur?.parent && !seen.has(cur.parent) && seen.size <= 16) {
+      seen.add(cur.parent)
+      cur = by.get(cur.parent)
+      if (cur?.origin) return [cur.origin, true]
+    }
+    return [null, false]
+  }
+  const out: LocalTask[] = []
+  for (const r of by.values()) {
+    const [origin, viaParent] = originOf(r)
+    if (origin !== tag) continue
+    let state = r.final ?? 'running', phase: string | null = null
+    if (!r.final && r.start !== null && nowS - r.start > STALE_RUNNING_S) { state = 'unknown'; phase = 'no end event after 10 h' }
+    const start = r.start ?? (r.end !== null && r.dur !== null ? r.end - r.dur : null)
+    out.push({ task_id: r.id, title: r.title, state, status: (FINAL[state] ?? (state === 'running' ? 'running' : 'unknown')) as any,
+      phase, host: r.host, model: r.model, lane: r.lane, started_at: start, ended_at: r.end, elapsed_s: null,
+      origin_via: viaParent ? 'parent' : null, parent_task_id: r.parent, sub_sessions: [], tasks: [] })
+  }
+  return out.sort((a, b) => (b.ended_at ?? b.started_at ?? 0) - (a.ended_at ?? a.started_at ?? 0))
+}
+
+const isOpen = (s?: string | null) => s === 'running' || s === 'waiting' || s === 'unknown'
+const attnOf = (t: PulseTreeTask) => t.status === 'failed' || t.status === 'unknown' ? 1 : Math.max(0, t.sub_sessions_failed ?? 0)
+
+/** The session view with this machine's own tasks merged in, by task id (see above), counts and attention kept in
+ * step. `asOfS` is the time the view was fetched (its nodes' elapsed times are as of then; the render adds the time
+ * since). `view` null: a view of the local tasks alone. `local` holds only this session's tasks (parseLocalTasks).
+ * Returns the view (a copy; the held one is never changed) and how many tasks came from the local log alone. */
+export function mergeLocal(view: PulseSessionView | null, local: LocalTask[], tag: string,
+  asOfS: number): { view: PulseSessionView; added: number } {
+  const v: PulseSessionView = view ? JSON.parse(JSON.stringify(view))
+    : { session_filter: tag, orchestrators: { status: 'ok', errors: [], items: [] } }
+  if (!local.length) return { view: v, added: 0 }
+  const o = v.orchestrators ??= { status: 'ok', errors: [], items: [] }
+  const items = o.items ??= []
+  let g = items.find(x => x.origin === tag)
+  const make = () => ({ origin: tag, kind: 'session', status: 'not live', counts: {}, attention: 0, tasks: [],
+    tasks_hidden: 0, routed: [], routed_hidden: 0 } as PulseOrchestrator)
+  const nodes = new Map<string, PulseTreeTask>()
+  const walk = (ts: PulseTreeTask[] = []) => ts.forEach(t => { if (t.task_id) nodes.set(t.task_id, t); walk(t.tasks) })
+  if (g) walk(g.tasks)
+  // The provider lists 20 top-level tasks and counts all of them (tasks_hidden). A top-level task only this log has
+  // (or one under such a task) may be one of the hidden ones, already counted: its group's counts are then lower
+  // bounds (counts_at_least), per status max(the provider's, those local-only tasks') plus the exact rest, never a
+  // sum that may count a task twice. A local-only task under a node the provider listed is exact: it was not hidden.
+  const capped = !!g && (g.tasks_hidden ?? 0) > 0
+  const orig = { ...(g?.counts ?? {}) }, origAttn = g?.attention ?? 0
+  const lower: Record<string, number> = {}
+  const maybeHidden = new Set<string>()
+  let lowerAttn = 0
+  const counts = (gg: PulseOrchestrator) => (gg.counts ??= {})
+  const tally = (gg: PulseOrchestrator, t: PulseTreeTask, k: number) => {
+    const c = counts(gg)
+    c[t.status ?? 'unknown'] = (c[t.status ?? 'unknown'] ?? 0) + k
+    gg.attention = (gg.attention ?? 0) + k * attnOf(t)
+  }
+  const clock = (t: LocalTask): number | null => typeof t.started_at === 'number'
+    ? Math.max(0, (t.ended_at ?? asOfS) - t.started_at) : null
+  let added = 0
+  // oldest first, so a parent from the log is placed before a child that hangs under it
+  for (const t of [...local].reverse()) {
+    const id = t.task_id!
+    const known = nodes.get(id)
+    if (known) {
+      // first-hand: a task this machine saw end is ended, whatever an older report (a heartbeat, a stub) says; one
+      // the view knows only second-hand (a stale heartbeat, a stub) takes this log's state
+      const secondHand = known.state === 'elsewhere' || known.phase === STALE_HB_PHASE
+      if (g && ((t.ended_at != null && isOpen(known.status)) || (secondHand && t.status !== 'unknown'))) {
+        tally(g, known, -1)
+        Object.assign(known, { state: t.state, status: t.status, phase: null, ended_at: t.ended_at ?? null,
+          elapsed_s: clock(t), host: known.host ?? t.host, title: known.title ?? t.title })
+        tally(g, known, 1)
+      }
+      continue
+    }
+    if (!g) { g = make(); items.unshift(g) }
+    const node: PulseTreeTask = { ...t, elapsed_s: clock(t), sub_sessions: [], tasks: [] }
+    const parent = t.parent_task_id ? nodes.get(t.parent_task_id) : undefined
+    if (parent) (parent.tasks ??= []).unshift(node)
+    else (g.tasks ??= []).unshift(node)
+    nodes.set(id, node)
+    if (capped && (!parent || maybeHidden.has(t.parent_task_id!))) {   // maybe a hidden one: a lower bound
+      maybeHidden.add(id)
+      lower[node.status ?? 'unknown'] = (lower[node.status ?? 'unknown'] ?? 0) + 1
+      lowerAttn += attnOf(node)
+    } else tally(g, node, 1)
+    added++
+  }
+  if (g && Object.keys(lower).length) {
+    const c = counts(g)
+    for (const [k, n] of Object.entries(lower)) c[k] = (c[k] ?? 0) + Math.max(0, n - (orig[k] ?? 0))
+    g.attention = (g.attention ?? 0) + Math.max(0, lowerAttn - origAttn)
+    g.counts_at_least = true
+  }
+  if (g) {
+    const rank: Record<string, number> = { running: 0, waiting: 1, failed: 2, unknown: 3, done: 4 }
+    g.tasks = (g.tasks ?? []).sort((a, b) => (rank[a.status ?? ''] ?? 5) - (rank[b.status ?? ''] ?? 5) ||
+      (b.ended_at ?? b.started_at ?? 0) - (a.ended_at ?? a.started_at ?? 0))
+  }
+  return { view: v, added }
+}
+
+/** The note under a tree that took tasks from this machine's log alone. */
+export const LOCAL_NOTE = (n: number) => n + (n === 1 ? ' task' : ' tasks') + " from this machine's task log only (its host's heartbeat has not reported " + (n === 1 ? 'it' : 'them') + ')'
+
+/** The fallback view's extra lines: this session's tasks the local log has and the provider's lists do not (`shown`),
+ * as a tree. Empty when there are none. */
+export function localLines(local: LocalTask[], tag: string, shown: Set<string>, asOfS: number, since: number): TreeLine[] {
+  const only = local.filter(t => !shown.has(t.task_id ?? ''))
+  if (!only.length) return []
+  const { view } = mergeLocal(null, only, tag, asOfS)
+  return [{ text: "from this machine's task log:" }, ...treeLines(view, tag, since)]
+}
+
+/** The log's path: the state dir as paths.state_dir() finds it ($CORTADOS_HOME, else $CORTADOS_HERMES_HOME, else
+ * ~/.cortados). */
+export async function localLogPath($: Pick<EngineInterface, 'env'>): Promise<string> {
+  const dir = (await $.env.get('CORTADOS_HOME')) || (await $.env.get('CORTADOS_HERMES_HOME')) ||
+    expandHome('~/.cortados', await $.env.get('HOME'))
+  return String(dir).replace(/\/+$/, '') + '/' + LOCAL_LOG
+}
+
+/** The note when the log is over LOCAL_TAIL_BYTES and its tail could not be read. */
+export const LOCAL_SKIP_NOTE = "this machine's task log is over 2 MiB and its tail could not be read: its tasks are not merged"
+
+/** The last LOCAL_TAIL_BYTES of the log, never the whole file (review round 3, P2). The mod host's `$.fs.read` has no
+ * offset or length (it reads a whole file, up to 4 MiB), so: `$.fs.stat` first; a log within the bound is read whole
+ * (that IS its tail); a larger one through `tail -c` (`$.process.run`, no shell, which seeks to the end and copies
+ * only those bytes). `cut`: the text starts mid-file (its first line is partial). Throws when the log is missing or
+ * unreadable; `{ text: null }` when it is over the bound and `tail` failed (the caller says so, LOCAL_SKIP_NOTE). */
+export async function readLocalLog($: Pick<EngineInterface, 'fs' | 'process'>, path: string): Promise<{ text: string | null; cut: boolean }> {
+  const st = await $.fs.stat(path)
+  if (st.kind !== 'file') throw new Error('not a file')
+  if (st.size <= LOCAL_TAIL_BYTES) return { text: String(await $.fs.read(path)), cut: false }
+  try {
+    const r = await $.process.run([TAIL_BIN, '-c', String(LOCAL_TAIL_BYTES), path], { timeoutMs: 10_000 })
+    if (r.exitCode === 0 && typeof r.stdout === 'string') return { text: r.stdout, cut: true }
+  } catch { /* cannot start or timed out: skipped below */ }
+  return { text: null, cut: true }
+}
+/** Absolute, so no PATH entry can stand in for it. */
+export const TAIL_BIN = '/usr/bin/tail'
+
+/** Read this machine's log for `tag`'s tasks, at most every LOCAL_POLL_MS per tag, its last LOCAL_TAIL_BYTES only
+ * (readLocalLog). A missing or unreadable log is no local tasks, said nowhere: the provider's view stands on its own
+ * then. A log over the bound whose tail could not be read is no local tasks, with LOCAL_SKIP_NOTE. Never throws. */
+export async function readLocal($: Pick<EngineInterface, 'env' | 'fs' | 'process' | 'state' | 'clock'>, tag: string): Promise<void> {
+  const at = await $.clock.now()
+  const cur = await read($, localHeld)
+  if (cur && cur.tag === tag && at - cur.at < LOCAL_POLL_MS) return
+  let tasks: LocalTask[] = [], note: string | null = null
+  try {
+    const { text, cut } = await readLocalLog($, await localLogPath($))
+    if (text === null) note = LOCAL_SKIP_NOTE
+    else tasks = parseLocalTasks(text, tag, at / 1000, cut)
+  } catch { /* no log yet, or unreadable: no local tasks */ }
+  await update($, localHeld, () => ({ tag, at, tasks, note }))
+}
 
 const S1_FLAGS: Record<string, string> = { 'no-promote': 'promotion held', 'no-train-tonight': 'no training tonight',
   'nightly-stop': 'nightly loop stopping', 'sweep-requested': 'sweep requested' }
@@ -518,20 +887,48 @@ export const register: Register = (on, options) => {
     const lvProblem = await read($, liveErr)
     const me = await read($, mine)
     const ml = await read($, mineLive)
+    const tr = await read($, tree)
+    const trProblem = await read($, treeErr)
+    const loc = await read($, localHeld)
+    const localFor = (tag: string | null | undefined) => loc && tag && loc.tag === tag ? loc.tasks : []
     const nowMs = await $.clock.now()
-    // this session's own view when the provider filtered it (before its caps), else the fleet view filtered here
-    const own = ml && me?.tag === ml.tag ? ml : lv
-    const running = [
-      head('This session'),
-      ...(own ? sessionLines(own.data, me, (nowMs - own.at) / 1000).map(line) : []),
-      ...(lv ? [] : [dim(me && !me.tag ? me.why || '' : 'waiting for the live view…')]),
-      ...(me?.tag ? [dim(CLEAR_NOTE)] : []),
-      head('Running'),
-      ...(lv ? runningLines(lv.data, (nowMs - lv.at) / 1000).map(line) : lvProblem ? [] : [dim('loading the live view…')]),
-      ...(lvProblem ? [dim(lvProblem + (lv ? ' · showing ' + age((nowMs - lv.at) / 1000) + ' old data' : ''))] : []),
-    ]
-    const fleet = lv ? [head('Fleet'), ...fleetLines(lv.data).map(line)] : []
-    const link = lv ? [dim('dashboard ' + lv.base + '/dashboard')] : []
+    let running: ReturnType<typeof line>[], fleet: ReturnType<typeof line>[], link: ReturnType<typeof line>[]
+    if (tr && me?.tag === tr.tag) {
+      // the per-session view: this session's tree and session-free fleet health, nothing of another session
+      const since = (nowMs - tr.at) / 1000
+      const merged = mergeLocal(tr.data, localFor(tr.tag), tr.tag, tr.at / 1000)
+      running = [
+        head('This session'),
+        ...treeLines(merged.view, tr.tag, since).map(l => l.attn ? Text({ bold: true, children: l.text }) : line(l.text)),
+        ...(merged.added ? [dim(LOCAL_NOTE(merged.added))] : []),
+        ...(loc?.note && loc.tag === tr.tag ? [dim(loc.note)] : []),
+        ...(trProblem ? [dim(trProblem + ' · showing ' + age(since) + ' old data')] : []),
+        dim(CLEAR_NOTE),
+      ]
+      fleet = [head('Fleet'), ...fleetLines(tr.data as PulseLive).map(line)]
+      link = [dim('dashboard ' + tr.base + '/dashboard')]
+    } else {
+      // no tag, or a provider from before the per-session view: the fleet view, this session's tasks picked out of it
+      const own = ml && me?.tag === ml.tag ? ml : lv
+      // this machine's own tasks the provider's lists do not have (none reached yet, or a host "here" task)
+      const shownIds = new Set([...(own?.data.tasks?.running ?? []), ...(own?.data.tasks?.queued ?? []),
+        ...(own?.data.tasks?.recent ?? [])].map(x => x.task_id ?? ''))
+      const mineLocal = me?.tag && loc ? localLines(localFor(me.tag), me.tag, shownIds, loc.at / 1000, (nowMs - loc.at) / 1000) : []
+      running = [
+        head('This session'),
+        ...(trProblem ? [dim(trProblem)] : []),
+        ...(own ? sessionLines(own.data, me, (nowMs - own.at) / 1000).map(line) : []),
+        ...mineLocal.map(l => l.attn ? Text({ bold: true, children: l.text }) : line(l.text)),
+        ...(loc?.note && me?.tag && loc.tag === me.tag ? [dim(loc.note)] : []),
+        ...(lv ? [] : [dim(me && !me.tag ? me.why || '' : 'waiting for the live view…')]),
+        ...(me?.tag ? [dim(CLEAR_NOTE)] : []),
+        head('Running'),
+        ...(lv ? runningLines(lv.data, (nowMs - lv.at) / 1000).map(line) : lvProblem ? [] : [dim('loading the live view…')]),
+        ...(lvProblem ? [dim(lvProblem + (lv ? ' · showing ' + age((nowMs - lv.at) / 1000) + ' old data' : ''))] : []),
+      ]
+      fleet = lv ? [head('Fleet'), ...fleetLines(lv.data).map(line)] : []
+      link = lv ? [dim('dashboard ' + lv.base + '/dashboard')] : []
+    }
     if (!h) return Box({ flexDirection: 'column', children: [...running, ...fleet, dim(problem || 'loading the resource pool…'), ...link] })
     const s = h.data
     const nowS = typeof s.generated_at === 'number' ? s.generated_at + (nowMs - h.at) / 1000 : nowMs / 1000

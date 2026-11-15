@@ -1612,6 +1612,7 @@ class ChildTaskTests(ChildTaskBase):
         self.assertIn("x-cortados-task-title: draft README section", headers)
         self.assertIn("x-cortados-session: 3f9a1c2e9b7d4a10", headers)
         self.assertIn("x-cortados-project: work", headers)
+        self.assertFalse([h for h in headers if h.startswith("x-cortados-origin")])   # no orchestrator known: none
         ev = [e for e in _events() if e.get("task_id") == tid]
         self.assertEqual([(e["event"], e.get("title"), e.get("session"), e.get("project")) for e in ev],
                          [("started", "draft README section", "3f9a1c2e9b7d4a10", "work"),
@@ -1786,6 +1787,58 @@ class ChildTaskTests(ChildTaskBase):
             ev = [json.loads(x) for x in f]
         started = next(e for e in ev if e["event"] == "started" and e["task_id"] == tid)
         self.assertEqual(started["origin_session"], m.origin_tag(self.SALT, self.SID))
+
+    def test_remote_stub_names_the_orchestrator(self):
+        """A task started from here onto another host leaves a stub that names its orchestrator (the live view's tree
+        attributes it here, state unknown); metadata only, never the raw session id."""
+        self._air()
+        self._session()
+        r, out = self.call("start_task", task="hello", title="remote one")
+        self.assertFalse(r.get("isError"), r)
+        tid = out["task_id"]
+        self.call("wait_task", task_id=tid, timeout_s=30)
+        stub = next(s for s in ct.remote_stubs() if s["task_id"] == tid)
+        self.assertEqual((stub["host"], stub["origin_session"], stub["origin_project"]),
+                         ("air", m.origin_tag(self.SALT, self.SID), "work"))
+        with open(os.path.join(ct.tasks_dir(), tid, ct.REMOTE_STUB)) as f:
+            self.assertNotIn(self.SID, f.read())
+
+    # -- nested tasks: parent_task_id links them, and a task without an orchestrator of its own takes its parent's --
+
+    def test_nested_task_without_an_origin_inherits_its_parents(self):
+        self._session()
+        tag = m.origin_tag(self.SALT, self.SID)
+        parent = self.start(title="parent")
+        self.call("wait_task", task_id=parent, timeout_s=30)
+        self._session(sid="")                                   # a launcher with no Claude Code session id
+        child = self.start(title="nested", parent_task_id=parent)
+        self.call("wait_task", task_id=child, timeout_s=30)
+        ev = [e for e in _events() if e.get("task_id") == child]
+        self.assertEqual([(e["event"], e.get("origin_session"), e.get("origin_via"), e.get("parent_task_id"))
+                          for e in ev], [("started", tag, "parent", parent), ("finished", tag, "parent", parent)])
+        # review round 4: the child's routed requests name its orchestrator (the inherited one here) to the provider,
+        # which records it as the run's owner: the live view's only join key for a task another host reports
+        with open(os.path.join(self.work, "fake-argv.json")) as f:
+            headers = json.load(f)["headers"].split("\n")
+        self.assertIn("x-cortados-origin: " + tag, headers)
+        self.assertIn("x-cortados-run-id: " + child, headers)
+        meta = _load(os.path.join(ct.task_path(child), "meta.json"))
+        self.assertEqual((meta["origin"]["origin_session"], meta["origin_via"]), (tag, "parent"))
+        self.assertEqual(ct.parent_origin(ct.tasks_dir(), parent)["origin_session"], tag)
+        self.assertEqual(ct.parent_origin(ct.tasks_dir(), "t20991231000000-00000000"), {})   # unknown parent
+        self.assertEqual(ct.parent_origin(ct.tasks_dir(), "../../etc"), {})                   # not a task id
+
+    def test_nested_task_with_its_own_origin_keeps_it(self):
+        self._session()
+        parent = self.start(title="parent")
+        self.call("wait_task", task_id=parent, timeout_s=30)
+        other = "0b7e3c52-9d2f-4b0e-8f61-5a4d3c2b1a00"
+        self._session(sid=other)                                # another main session continues the work
+        child = self.start(title="follow-up", parent_task_id=parent)
+        self.call("wait_task", task_id=child, timeout_s=30)
+        ev = [e for e in _events() if e.get("task_id") == child]
+        self.assertEqual({(e.get("origin_session"), e.get("origin_via"), e.get("parent_task_id")) for e in ev},
+                         {(m.origin_tag(self.SALT, other), None, parent)})
 
     def test_a_bad_title_or_tag_is_refused_before_anything_runs(self):
         for kw in ({"title": "x" * 81}, {"title": "two\nlines"}, {"title": 7}):

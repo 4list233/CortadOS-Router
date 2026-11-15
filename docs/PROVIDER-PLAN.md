@@ -833,7 +833,34 @@ id, `last_at`, tokens per window), `sessions_hidden`, `excluded` counters. Valid
 (unknown keys, raw ids, paths and text are refused naming the field); the live view's `work_split` section joins it
 with router.db's routed tokens (README "Work split").
 
-A post replaces the host's previous one. Refusals: 401 without a token, 403 for a token without the scope, 413 over 24 KiB (8 KiB before the `orchestrator` block)
+An optional `tasks` block (2026-11-14, #118) carries the host's own start_task children of the last 24 h, from ITS
+child-task log, so the orchestrator tree shows tasks from every exec host (a host "here" task on the Pro logs only
+there). `{"items": [...], "truncated": bool}`, at most `live.HB_TASKS_MAX` (40) entries, running and queued first, then
+the newest finished:
+
+    {"task_id": "t20261114160000-0000000a",      # child_tasks.TASK_ID_RE; unique in the block
+     "host": "pro",                              # must be the heartbeat's own host (absent: taken as it); else 400
+     "state": "running",                         # running | queued | succeeded | failed | cancelled | unknown
+     "phase": null,                              # only the live view's own phrases (live.HB_TASK_PHASES)
+     "title": "Fix the pane",                    # the Office title rule: printable ASCII <= 80
+     "model": "claude-sonnet-5", "lane": "claude#a",   # when the task's events logged them
+     "started_at": 1794700000.0, "ended_at": null,     # within 30 d, never ahead of the clock by > 120 s; a finished
+                                                 # state needs ended_at, an open one has none; outside 24 h: dropped
+     "origin_session": "aaaaaaaaaaaaaaa1", "origin_project": "CortadOS-Router", "origin_device": "pro",
+     "origin_via": "parent", "parent_task_id": "t20261114155000-00000003", "workspace": "archived", "browser": false}
+
+Never the prompt, the cwd, a command or output: unknown keys are refused. The live view merges the entries into the
+orchestrator tree only (`live.heartbeat_rows`; the tasks section stays the provider host's log): the provider host's
+own log wins for a task id it also has; a heartbeat past its TTL shows its running or queued tasks as `unknown`
+("its host's heartbeat is stale"); a task routed through the provider gets its model, tool, sub-sessions and tokens
+only when the provider itself saw the run's requests carry `x-cortados-origin` equal to the task's bound origin (the
+child runner sends it; never a heartbeat-supplied key, review round 4), and nothing at all when any record of the run
+(worker, conversation, run tokens) was seen with another origin (a run-wide veto, round 5). Task ids are bound to (host, origin, parent)
+by the first report, against every stub and log row on this machine, and the bindings persist in
+`$CORTADOS_HOME/live-task-bindings.json` (docs/PULSE-PER-SESSION.md §9, with the threat note). The tree's `scope` is then `provider host and heartbeats`, with `task_hosts` naming the
+hosts whose heartbeat carried a block.
+
+A post replaces the host's previous one. Refusals: 401 without a token, 403 for a token without the scope, 413 over 48 KiB (24 KiB before the `tasks` block, 8 KiB before the `orchestrator` block)
 (checked from content-length before reading), 400 naming the bad field (`jobs[0].state`), never echoing its value. The
 board is in memory (16 hosts, LRU; a configured host, from `CORTADOS_LIVE_HOSTS` or the defaults and exec-hosts.json,
 is never evicted, so the board holds at most 16 + the configured hosts): after a provider restart each host shows "no
@@ -844,7 +871,7 @@ The sender is `cortados_router/live_heartbeat.py`, run every 60 s by the LaunchA
 provider host, copying it, installing on the Studio, the Air and the Pro). Config `~/.config/cortados/heartbeat.json`:
 `host`, `provider_url` (else `~/.config/cortados/provider-url`, else loopback), `token_file` (0600, owned by the user, or
 the sender refuses it), `ttl_s` (180: three missed posts before stale), `jobs` (launchd labels, or `{label, name}`;
-at most 14), `hardware`, `disk`, `s1` (`data_dir`, `health_url`). Jobs come from `launchctl print gui/<uid>/<label>`
+at most 14), `hardware`, `disk`, `s1` (`data_dir`, `health_url`), `tasks` (true unless false: the `tasks` block). Jobs come from `launchctl print gui/<uid>/<label>`
 (top-level `state`, `pid` presence, `runs`, `last exit code` only; nested blocks such as the environment are skipped and
 never sent): running, ok (last exit 0), idle (never exited), failed (non-zero), stopped (not loaded). The body is checked
 with `live.validate_heartbeat` and the byte cap before it is sent; on a 400 from an older provider it is re-sent once

@@ -175,6 +175,14 @@ RUN_FETCH_MIN_S = 1                 # a fetch with less than this left is not wo
 
 # --- execution host, workspaces, launchd (2026-11-08) -------------------------------------------------------------
 REMOTE_STUB = "remote.json"         # in a local task dir: {"host": <name>} — the task lives on that execution host
+# The most of a remote stub that is ever read. A stub is a host name, a time and four origin tags (well under 1 KiB);
+# the live view reads the stub of every task id another host's heartbeat names (remote_stubs_by_id), so a corrupt or
+# planted remote.json must cost a bounded read, never an unbounded parse (review round 5, P2).
+REMOTE_STUB_MAX_BYTES = 16 * 1024
+# Under the tasks root: by-origin/<origin_session>/<task id> (empty files), one per remote stub that names its
+# orchestrator. Not a task dir (the name never matches TASK_ID_RE). Written by _write_stub, read by remote_stubs_for,
+# pruned with its stubs by prune().
+ORIGIN_INDEX = "by-origin"
 WORKSPACE_FILE = "workspace.json"   # in the task dir on the host: the workspaces.prepare()/settle() record
 LAUNCHD_FILE = "launchd.json"       # in the task dir: {"label", "domain", "plist", "booted_out"} for a launchd task
 QUEUED_MARKER = "queued"            # in the task dir while the runner waits for the host's Chrome lock
@@ -474,12 +482,22 @@ def task_path(task_id) -> str:
     return p
 
 
-def _read_json(path: str):
+class RecordTooLarge(ValueError):
+    """A record over its read cap (_read_json's max_bytes): not parsed. Its type name is what a RecordError names."""
+
+
+def _read_json(path: str, max_bytes: int | None = None):
     """A task-dir record: None when the file does not exist, RecordError (a TaskError) when it exists but cannot be
-    read or parsed. Never a raw JSONDecodeError: its text quotes the file."""
+    read or parsed, or is over `max_bytes` (RecordTooLarge; None reads it whole). Never a raw JSONDecodeError: its
+    text quotes the file."""
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            if max_bytes is None:
+                return json.load(f)
+            data = f.read(max_bytes + 1)
+        if len(data) > max_bytes:               # characters, not bytes: a bound all the same (at most 4x)
+            raise RecordTooLarge()
+        return json.loads(data)
     except FileNotFoundError:
         return None
     except (OSError, ValueError, RecursionError) as exc:
@@ -699,10 +717,40 @@ def prune(root: str, now: float | None = None, errors: list | None = None, red=N
                     _launchd_bootout(d)         # idempotent; a corrupt launchd.json already raised from _state() above
                 shutil.rmtree(d)
                 removed.append(name)
+            elif state == "remote":             # a kept stub from before the index: indexed now (idempotent)
+                _index_origin(root, name, clean_origin_meta(meta.get("origin")).get("origin_session"))
         except OSError as exc:
             if errors is not None:
                 errors.append(f"{name}: {type(exc).__name__}: {exc}")
+    _prune_origin_index(root, errors)
     return removed
+
+
+def _prune_origin_index(root: str, errors: list | None = None) -> None:
+    """Drop origin-index entries whose task dir is gone (pruned above, or removed by hand), then empty origin dirs.
+    O(index entries); runs with prune(), never on a view."""
+    idx = os.path.join(root, ORIGIN_INDEX)
+    try:
+        origins = os.listdir(idx)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        if errors is not None:
+            errors.append(f"{ORIGIN_INDEX}: {type(exc).__name__}")
+        return
+    for origin in origins:
+        od = os.path.join(idx, origin)
+        try:
+            if os.path.islink(od) or not os.path.isdir(od):
+                continue
+            for tid in os.listdir(od):
+                if not (TASK_ID_RE.fullmatch(tid) and os.path.isdir(os.path.join(root, tid))):
+                    os.unlink(os.path.join(od, tid))
+            if not os.listdir(od):
+                os.rmdir(od)
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"{ORIGIN_INDEX}/{origin}: {type(exc).__name__}")
 
 
 def _remove_settings(d: str) -> list:
@@ -845,6 +893,7 @@ def clean_origin(origin) -> dict:
             "origin_project": ok(proj, _OFFICE_NAME_RE), "origin_device": ok(dev, _DEVICE_RE)}
 
 
+ORIGIN_HEADER = "x-cortados-origin"    # provider/office.ORIGIN_HEADER: the run's orchestrator, as the provider records it
 _OFFICE_HEADER_OF = {"session": "x-cortados-session", "project": "x-cortados-project", "device": "x-cortados-device",
                      "title": "x-cortados-task-title"}
 
@@ -889,16 +938,38 @@ def _remote(host_name: str, op: str, args: dict, timeout_s=None) -> dict:
     return out
 
 
-def _write_stub(root: str, task_id: str, host_name: str) -> None:
-    """The local record of a task running on execution host `host_name` (status, wait and cancel go there)."""
+def _write_stub(root: str, task_id: str, host_name: str, origin: dict | None = None) -> None:
+    """The local record of a task running on execution host `host_name` (status, wait and cancel go there), with the
+    orchestrator that started it (clean_origin fields, metadata only) so the live view attributes it here too."""
     d = os.path.join(root, task_id)
     os.mkdir(d, 0o700)
-    _write_json(os.path.join(d, REMOTE_STUB), {"host": host_name, "created_at": time.time()})
+    rec = {"host": host_name, "created_at": time.time()}
+    o = {k: v for k, v in (origin or {}).items() if v}
+    if o:
+        rec["origin"] = o
+    _write_json(os.path.join(d, REMOTE_STUB), rec)
+    _index_origin(root, task_id, o.get("origin_session"))
+
+
+def _index_origin(root: str, task_id: str, origin_session) -> None:
+    """Record a remote stub under its orchestrator in the origin index (<root>/by-origin/<origin>/<task id>, an empty
+    file), so the live session view finds ONE session's stubs without listing every task dir (remote_stubs_for).
+    Best effort: the stub itself is the record (the fleet view and status still find it); a failure is logged, never
+    a failed start."""
+    if not isinstance(origin_session, str) or not ORIGIN_SESSION_RE.fullmatch(origin_session):
+        return
+    try:
+        d = os.path.join(root, ORIGIN_INDEX, origin_session)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.close(os.open(os.path.join(d, task_id), os.O_WRONLY | os.O_CREAT, 0o600))
+    except OSError as exc:
+        log_event("origin_index_failed", task_id=task_id, error=type(exc).__name__)
 
 
 def _stub(d: str):
-    """The remote stub of a local task dir ({"host": ...}), or None for a task that runs on this machine."""
-    rec = _read_json(os.path.join(d, REMOTE_STUB))
+    """The remote stub of a local task dir ({"host": ...}), or None for a task that runs on this machine. Read bounded
+    (REMOTE_STUB_MAX_BYTES); an oversized or unparsable stub is a RecordError (a TaskError), as before."""
+    rec = _read_json(os.path.join(d, REMOTE_STUB), REMOTE_STUB_MAX_BYTES)
     return rec if isinstance(rec, dict) and isinstance(rec.get("host"), str) else None
 
 
@@ -981,12 +1052,15 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
                 "parent_task_id": parent_id,   # resolved here: the host's own env does not know this session
                 "origin": origin, **({"local": local} if local else {})}
         progress["launched"] = "maybe"         # from here the request may reach the host and launch a child
+        stub_origin = clean_origin(origin)
+        if stub_origin["origin_session"] is None and parent_id:
+            stub_origin = {**stub_origin, **parent_origin(root, parent_id)}   # as the host does (_start, local branch)
         try:
             out = _remote(target.name, "start", args)
         except StartFailed as exc:
             if exc.launched == "yes":
                 try:                            # the host has the task: make it trackable here, as a success would
-                    _write_stub(root, exc.task_id, target.name)
+                    _write_stub(root, exc.task_id, target.name, stub_origin)
                 except Exception:
                     raise StartFailed(exc.exc_type, exc.where, "maybe") from None
             raise
@@ -1003,7 +1077,7 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
         progress.update(launched="yes", task_id=tid)
         d = os.path.join(root, tid)
         try:
-            _write_stub(root, tid, target.name)
+            _write_stub(root, tid, target.name, stub_origin)
         except BaseException as exc:
             shutil.rmtree(d, ignore_errors=True)
             try:
@@ -1082,11 +1156,22 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     runner = None
     try:
+        org = clean_origin(origin)
+        via_parent = False
+        if org["origin_session"] is None and parent_id:
+            # No orchestrator of its own (a launching process with CORTADOS_PARENT_TASK_ID and no Claude Code session,
+            # a session without the Office salt): the parent's, so the task stays in its root orchestrator's tree.
+            inherited = parent_origin(root, parent_id)
+            if inherited:
+                org = {**org, **inherited}
+                via_parent = True
+        # Known before the launch: the child's routed requests carry it (x-cortados-origin), the provider's own
+        # record of which orchestrator the run belongs to (review round 4: the live view's join key).
         meta, env, cmd = _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file,
                                   start_red,
                                   chrome, max_s, exe, selected, login, office,
                                   workspace=ws_spec, ws_root=target.root, host_name=target.name, launchd=launchd,
-                                  local=local)
+                                  local=local, origin_tag=org["origin_session"])
         # Again with the child's launch env known: its credentials are the ones the export is checked against.
         launch_red = _start_redactor(red, env)
         _refuse_credentials(launch_red, caller_fields)
@@ -1095,9 +1180,15 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
         if meta.get("office"):
             meta["office"] = {k: launch_red.text(v) for k, v in meta["office"].items()}
         meta["task_preview"] = launch_red.text(task.strip())[:200]
-        org = clean_origin(origin)
+        if via_parent:
+            meta["origin_via"] = "parent"
         if any(org.values()):
             meta["origin"] = {k: launch_red.text(v) if v else v for k, v in org.items()}
+        # For the run export (#91): the task that started this one (or why none is known); set before cmd.json's event
+        # fields below, so the finished event names the parent too (the live view nests a task under it).
+        meta["parent_task_id"] = parent_id
+        if parent_note:
+            meta["parent_note"] = parent_note
         # cmd.json's event fields were written by _prepare before the client was known; the runner logs the finished
         # event from them, so rewrite them or that event loses its attribution (review r2 P3-8).
         cmd_path = os.path.join(d, "cmd.json")
@@ -1109,12 +1200,8 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
             meta["permission_mode_note"] = mode_note
         if launch_warning:
             meta["launch_warning"] = launch_warning
-        # For the run export (#91): the task that started this one (or why none is known), and the Office title.
-        meta["parent_task_id"] = parent_id
         if local:
             meta["local"] = local
-        if parent_note:
-            meta["parent_note"] = parent_note
         if office.get("title"):
             meta["title"] = launch_red.text(office["title"])
         meta[META_TEXT_MARK] = True             # every caller text above was redacted or refused with launch_red
@@ -1302,8 +1389,9 @@ def _run_spec(cwd, max_s, meta, workspace=None, ws_root=None, launchd=False, chr
 
 def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file, red, chrome, max_s,
              exe, selected=None, login=None, office=None, workspace=None, ws_root=None, host_name=None, launchd=False,
-             local=None):
-    """Everything before the spawn: settings, prompt, cmd.json, meta.json. Returns (meta, env, cmd)."""
+             local=None, origin_tag=None):
+    """Everything before the spawn: settings, prompt, cmd.json, meta.json. Returns (meta, env, cmd). `origin_tag`: the
+    task's orchestrator (clean_origin's origin_session), sent as x-cortados-origin on the child's routed requests."""
     os.chmod(d, 0o700)                          # mkdir's mode is masked by umask; the launcher verifies exactly 0700
     if login:
         meta, env, cmd = _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe,
@@ -1318,6 +1406,8 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
         launch += ["--local", local]
     if cwd:                                     # the boundary hook's interpreter and script must lie outside it
         launch += ["--project-dir", cwd]
+    if isinstance(origin_tag, str) and ORIGIN_SESSION_RE.fullmatch(origin_tag):
+        launch += ["--office-header", f"{ORIGIN_HEADER}: {origin_tag}"]
     # Never the whole-session ORCHESTRATOR directive or its delegation gate, whatever the orchestrator: a child is the
     # delegate and does the work itself (CHILD_DIRECTIVE). A pinned orchestrator only pins the child's main model; its
     # native subagents are still routed by S1 (CLAUDE_CODE_SUBAGENT_MODEL).
@@ -1482,7 +1572,30 @@ def _event_fields(meta: dict) -> dict:
     # The main session that started the task (clean_origin): which orchestrator's work this is, for the live view.
     for k, v in clean_origin_meta(meta.get("origin")).items():
         out[k] = v
+    if meta.get("origin_via") == "parent" and out.get("origin_session"):
+        out["origin_via"] = "parent"
+    # The task that started this one (#91), so the live view can nest it under its parent in the orchestrator tree.
+    parent = meta.get("parent_task_id")
+    if isinstance(parent, str) and TASK_ID_RE.fullmatch(parent):
+        out["parent_task_id"] = parent
     return out
+
+
+def parent_origin(root: str, parent_id) -> dict:
+    """The parent task's recorded origin ({origin_session, ...}, valid fields only) from its meta.json, or its remote
+    stub's, in this machine's tasks dir `root`; {} when the parent is unknown here or recorded no origin. Read-only."""
+    if not isinstance(parent_id, str) or not TASK_ID_RE.fullmatch(parent_id):
+        return {}
+    d = os.path.join(root, parent_id)
+    for name in ("meta.json", REMOTE_STUB):
+        try:
+            rec = _read_json(os.path.join(d, name))
+        except Exception:                           # unreadable: no origin to inherit, never a failed start
+            continue
+        o = clean_origin_meta(rec.get("origin")) if isinstance(rec, dict) else {}
+        if o.get("origin_session"):
+            return o
+    return {}
 
 
 def clean_origin_meta(rec) -> dict:
@@ -2143,24 +2256,84 @@ def peek_local(task_id) -> dict | None:
 REMOTE_STUBS_SCAN = 200            # newest task dirs looked at per call: a day of tasks at the owner's pace, a few stats each
 
 
+class StubList(list):
+    """remote_stubs()'s answer: a list, plus `truncated` True when more task dirs exist than REMOTE_STUBS_SCAN (older
+    stubs were not looked at; the live view's tree says so in `inputs_truncated`)."""
+    truncated = False
+
+
 def remote_stubs() -> list:
     """For GET /v1/cortados/live: the remote stubs among the newest REMOTE_STUBS_SCAN task dirs on this machine, as
-    [{task_id, host, created_at}] — tasks started FROM here onto another execution host. Metadata only, read-only (no
+    [{task_id, host, created_at, origin_*}] — tasks started FROM here onto another execution host. Metadata only, read-only (no
     ssh, never creates the tasks root; a missing root is no stubs). A stub that cannot be read is skipped: it is a
-    pointer, and the view says the section's scope rather than guessing its task's state."""
+    pointer, and the view says the section's scope rather than guessing its task's state. The list's `truncated`
+    (StubList) says the scan stopped at its cap."""
     root = tasks_dir()
     try:
-        names = sorted((x for x in os.listdir(root) if TASK_ID_RE.fullmatch(x)), reverse=True)[:REMOTE_STUBS_SCAN]
+        names = sorted((x for x in os.listdir(root) if TASK_ID_RE.fullmatch(x)), reverse=True)
     except FileNotFoundError:
-        return []
-    out = []
+        return StubList()
+    out = StubList()
+    out.truncated = len(names) > REMOTE_STUBS_SCAN
+    names = names[:REMOTE_STUBS_SCAN]
     for tid in names:
         try:
             rec = _stub(os.path.join(root, tid))
-        except TaskError:
+        except Exception:                       # a RecordError, or anything a planted stub makes the read raise
             continue
         if rec is not None:
-            out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at")})
+            out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at"),
+                        **clean_origin_meta(rec.get("origin"))})
+    return out
+
+
+def remote_stubs_by_id(task_ids) -> list:
+    """For the live view's ownership check (review round 4, P2): the remote stubs, if any, of exactly these task ids
+    (the ids other hosts' heartbeats report), as remote_stubs records. Each id is one stub read in its own task dir:
+    no listing, so the check sees every stub this machine wrote, not only the newest scanned or one session's index.
+    Bounded by the caller (the heartbeat board's ids). Read-only; an id with no stub (or no dir) is skipped, and one
+    whose stub exists but cannot be read is {"task_id", "unreadable": True}: the view then trusts no report of it."""
+    root = tasks_dir()
+    out = []
+    for tid in task_ids or ():
+        if not (isinstance(tid, str) and TASK_ID_RE.fullmatch(tid)):
+            continue
+        try:
+            rec = _stub(os.path.join(root, tid))
+        except Exception:                       # a RecordError, or anything a planted stub makes the read raise
+            out.append({"task_id": tid, "unreadable": True})
+            continue
+        if rec is not None:
+            out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at"),
+                        **clean_origin_meta(rec.get("origin"))})
+    return out
+
+
+def remote_stubs_for(origin) -> list:
+    """For GET /v1/cortados/live/session: the remote stubs ONE orchestrator started from here, found through the origin
+    index (by-origin/<origin>/), never by listing the task dirs: other sessions' stubs, however many and however new,
+    are neither read nor counted. Cost: one listdir of this origin's own index entries (O(its stubs since the last
+    daily prune)), then at most REMOTE_STUBS_SCAN stub reads, newest first. `truncated` (StubList) is True only when
+    THIS origin has more entries than that. An entry whose stub is gone, unreadable or names another origin is
+    skipped. Read-only; a missing index (or root) is no stubs."""
+    out = StubList()
+    if not isinstance(origin, str) or not ORIGIN_SESSION_RE.fullmatch(origin):
+        return out
+    root = tasks_dir()
+    try:
+        names = sorted((x for x in os.listdir(os.path.join(root, ORIGIN_INDEX, origin)) if TASK_ID_RE.fullmatch(x)),
+                       reverse=True)
+    except (FileNotFoundError, NotADirectoryError):
+        return out
+    out.truncated = len(names) > REMOTE_STUBS_SCAN
+    for tid in names[:REMOTE_STUBS_SCAN]:
+        try:
+            rec = _stub(os.path.join(root, tid))
+        except Exception:                       # a RecordError, or anything a planted stub makes the read raise
+            continue
+        o = clean_origin_meta(rec.get("origin")) if rec is not None else {}
+        if o.get("origin_session") == origin:
+            out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at"), **o})
     return out
 
 

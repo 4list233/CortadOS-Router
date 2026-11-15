@@ -1160,12 +1160,22 @@ tag and whether its main loop is live), Grok Bot and an "Unattributed" group; ea
 tasks first. One limit: the MCP server reads the session id once, at its start, so tasks started after `/clear` in the
 same process keep the session it was started for.
 
+**The orchestrator tree** (`docs/PULSE-PER-SESSION.md`). The live view's `orchestrators` section is each orchestrating
+main session (its Office tag), Grok Bot and an "Unattributed" group, each with its child tasks (nested by
+`parent_task_id`, now on every task event; a task with no origin of its own takes its parent's, `origin_via: "parent"`;
+tasks started onto another host are listed from their stub, which now records the origin) and under each task its
+sub-sessions: the run's provider conversations (`x-cortados-run-id`), open or recently closed, with status (running /
+waiting / done / failed / unknown), phase, model, elapsed and in-memory token totals. The dashboard's Live tab draws it
+as a collapsible tree. `GET /v1/cortados/live/session?session=<tag>` (owner token, `live:read`, or the narrow
+`live:session` scope that opens nothing else) returns ONLY that session's subtree plus S1 and host health, built
+filtered before any cap; the cortados-pulse pane (0.5.0) reads only that view once its session is identified.
+
 A host whose jobs the provider cannot see (the Mac Studio's S1 scorer and continuous training) reports them with
 `POST /v1/cortados/live/heartbeat` (owner token, or a write-only `live:heartbeat` client token bound to ONE host: the
 entry's `"host"` in clients.json, else the client's name; a post for any other host is 403, the owner token is never
 bound; `clients add <name> --scope live:heartbeat [--host studio] --token-file <path>`):
 `{"host": "studio", "ttl_s": 900, "jobs": [{"name": "s1-scorer", "state": "running", "summary": "serving v12"}]}`.
-Fields are validated strictly (24 KiB body cap, 16 jobs, fixed states, an 80-character summary with no address) and a
+Fields are validated strictly (48 KiB body cap, 16 jobs, 40 task entries, fixed states, an 80-character summary with no address) and a
 bad one is refused naming the field, never echoing its value. The board keeps 16 hosts (least recently posted out first),
 but never evicts a configured host (`CORTADOS_LIVE_HOSTS` or the defaults, and exec-hosts.json's names). A heartbeat may
 also carry `hardware` (cpu/gpu busy %, memory bytes, 1-min load, disk free %, chip name, sample time) and `s1` (health,
@@ -1197,8 +1207,18 @@ ssh studio chmod 600 .config/cortados/live-heartbeat-token
 # 3. on each host, from its checkout (the provider reads clients.json fresh: no restart needed for the token)
 scripts/install_live_heartbeat.sh studio      # s1 block on; jobs = every loaded com.cortados.* label there
 scripts/install_live_heartbeat.sh air         # provider, bot gateway, archive cleanup: whatever is loaded
-scripts/install_live_heartbeat.sh pro
+scripts/install_live_heartbeat.sh pro --orchestrator   # the owner's main sessions + a gui exec host (host "here")
 ```
+
+Every heartbeat also carries the host's own recent start_task children (the `tasks` block, #118; `--no-tasks` turns it
+off): a task started with host "here" on the Pro, or run on the Studio, logs only in that host's
+`~/.cortados/child-tasks.jsonl`, and reaches the live view's orchestrator tree (the pane's "This session", the
+dashboard's Orchestrators panel) only this way, under the session whose origin tag started it. Metadata only: task id,
+origin tag, title, state, model and lane when logged, start and end times, parent task, workspace state. On a gui exec
+host the default label sweep skips the per-task LaunchAgents (`com.cortados.task.<id>`). Deploy after the merge: `git
+pull` on each host whose sender is installed (the Air, the Studio; their configs need no change, absent `tasks` is on),
+restart the provider so it accepts the block (an older provider gets the body without it), and install the Pro's
+sender as above (mint `pro-heartbeat` on the Air first, step 1).
 
 The helper writes `~/.config/cortados/heartbeat.json` (host, provider URL — `--provider-url`, else the host's existing
 `~/.config/cortados/provider-url`, else loopback —, token file, labels — `--labels a,b` to choose —, checks; an existing

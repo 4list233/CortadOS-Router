@@ -9,8 +9,8 @@ It composes views that already exist rather than re-deriving them:
                    So the section's `scope` is always "provider host": a task running on another execution host logs
                    its events into THAT host's child-tasks.jsonl and is absent here. The one trace of such a task on
                    this machine, the remote stub a start_task from here leaves in the tasks dir, is listed as
-                   `elsewhere` ({task_id, host, started_at}, the last 10 h): started from here on another host, its
-                   state there unknown to this view.
+                   `elsewhere` ({task_id, host, started_at} and the origin_* fields its stub recorded, the last
+                   10 h): started from here on another host, its state there unknown to this view.
   - conversations  every conversation the provider holds open right now (Registry.live_conversations: model, lane,
                    opened, last used, busy), joined with the Office board for its kind, title, session and tool; child
                    tasks' own conversations included (kind child_task, run id = task id); plus the floors' orchestrators
@@ -21,6 +21,12 @@ It composes views that already exist rather than re-deriving them:
   - s1             the scorer's /health probe usage already memoises (reachable, HTTP status, latency).
   - hosts          the fleet (default air, studio, pro: CORTADOS_LIVE_HOSTS), each with its hardware sample (usage's
                    hardware cards) and its job heartbeat (POST /v1/cortados/live/heartbeat, below), or "none" said so.
+  - orchestrators  the tree the pulse pane and the dashboard draw (orchestrators_section): each orchestrating main
+                   session (Office tag), the bot gateway and an unattributed group -> the child tasks it started
+                   (nested through parent_task_id; a task without an origin takes its root's) -> each task's
+                   sub-sessions (the run's open and recently closed provider conversations, x-cortados-run-id), with
+                   status, timing, model and in-memory token totals. GET /v1/cortados/live/session?session=<tag>
+                   (session_view) is the pane's view: that one subtree and session-free fleet health, nothing else.
   - work_split     orchestrator tokens (the main sessions' own, from the heartbeats' `orchestrator` blocks) against
                    routed tokens (router.db, via tasks.collect's token_totals), overall and per main session
                    (provider/work_split.py has the definitions).
@@ -42,7 +48,9 @@ loop) POSTs its job states:
 A heartbeat may also carry an `orchestrator` block (cortados_router/orchestrator_usage.py: the host's main Claude Code
 sessions' tokens per window, by Office session tag; validated by work_split.validate_block), the host's `hardware` (cpu/gpu busy %, memory, load, disk free %: numbers and the chip
 name only) and, on the S1 host, an `s1` block (health, the served model's name, the pipeline's hold flags by fixed
-name, a pending candidate's reason slug); cortados_router/live_heartbeat.py is the sender (one per host, every 60 s).
+name, a pending candidate's reason slug), and a `tasks` block (#118: the host's own start_task children of the last 24 h,
+from its own child-task log, metadata only; validate_tasks, merged into the orchestrator tree by heartbeat_rows);
+cortados_router/live_heartbeat.py is the sender (one per host, every 60 s).
 A post replaces that host's previous one. It is shown fresh for ttl_s (default 900, 60..86400), then stale, and is
 forgotten after 24 h. A live:heartbeat client token posts for its bound host only (provider/clients.py; 403 otherwise),
 and the board's LRU never evicts a configured host (CORTADOS_LIVE_HOSTS / the defaults, exec-hosts.json), so posts for
@@ -51,16 +59,21 @@ over HEARTBEAT_MAX_BYTES with 413. docs/PROVIDER-PLAN.md ("Live view") has the s
 """
 from __future__ import annotations
 
+import json
+import logging
 import math
 import os
 import re
 import threading
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Callable
 
 from cortados_router import child_tasks, router_db
 from cortados_router.provider import office, work_split
+
+logger = logging.getLogger("cortados.provider.live")
 
 VERSION = 1
 LIVE_PATH = "/v1/cortados/live"
@@ -77,9 +90,35 @@ PEEK_MAX = 64               # task-dir peeks per snapshot (a few stats each): bo
 CONVERSATIONS_MAX = 64      # in-flight conversations listed; the rest are counted in `hidden`
 ROUTED_MAX = 25             # latest routing decisions shown; tasks.collect reads at most its own ROW_LIMIT (200)
 # ---- heartbeat rules ----
-# 16 jobs x ~300 bytes is under 5 KiB; the orchestrator block adds at most 30 sessions x ~350 bytes (~10 KiB). Larger
-# is not a heartbeat.
-HEARTBEAT_MAX_BYTES = 24576
+# 16 jobs x ~300 bytes is under 5 KiB; the orchestrator block adds at most 30 sessions x ~350 bytes (~10 KiB) and the
+# tasks block at most HB_TASKS_MAX entries x ~550 bytes (~22 KiB, all fields at their longest). Larger is not a
+# heartbeat. The sender trims its tasks block (then drops the orchestrator block) to fit, never the jobs.
+HEARTBEAT_MAX_BYTES = 49152
+# ---- a heartbeat's `tasks` block (#118): the host's own recent start_task children, metadata only ----
+# A host that runs children (an exec host: `host: "here"` on the Pro, the Studio) logs them in ITS child-task log,
+# which the provider cannot read. Its heartbeat carries them so the tree shows tasks from every host. 40 is the
+# live view's RECENT_MAX: a day's worth at the owner's pace; running ones are sent first, then the newest finished.
+HB_TASKS_MAX = 40
+HB_TASK_STATES = ("running", "queued", "succeeded", "failed", "cancelled", "unknown")
+# the phases tasks_section itself writes, the only ones a heartbeat may carry (a fixed vocabulary, never free text)
+HB_TASK_PHASES = ("waiting for the host's Chrome", "ended on its host; no end event logged", "no end event after 10 h")
+_HB_TASK_KEYS = {"task_id", "title", "state", "phase", "host", "lane", "model", "started_at", "ended_at", "workspace",
+                 "browser", "origin_session", "origin_project", "origin_device", "origin_via", "parent_task_id",
+                 "session"}
+# A task id's host and origin are bound once (HeartbeatBoard._bindings, review rounds 3 and 4): the first host that
+# reports it owns it, with its origin and parent; a later claim that differs is dropped and counted. The bindings last
+# HEARTBEAT_KEEP_S (24 h, the heartbeat window) since the id was last reported and are kept in BINDINGS_FILE under
+# $CORTADOS_HOME, so a provider restart does not reopen them. At most TASK_BINDINGS_MAX: only expired ones are ever
+# evicted; a full table refuses a NEW id (counted as a conflict) rather than drop a live binding.
+TASK_BINDINGS_MAX = 4096
+BINDINGS_FILE = "live-task-bindings.json"
+BINDINGS_VERSION = 1
+# The most of BINDINGS_FILE that is ever read. One entry is under 200 bytes (two task ids, a host, a 64-hex origin, a
+# time), so TASK_BINDINGS_MAX entries are under 1 MiB; 2 MiB leaves room and keeps a corrupt or planted file from
+# making the provider's start parse an unbounded document. A larger file is not read at all (said in errors()).
+BINDINGS_MAX_BYTES = 2 * 1024 * 1024
+BINDINGS_SAVE_SEEN_S = 3600.0   # a re-reported id's `seen` reaches the file at most hourly: the TTL may run 1 h short
+STALE_HB_PHASE = "its host's heartbeat is stale; state as last reported"
 HEARTBEAT_HOSTS_MAX = 16    # the fleet is three machines; LRU past this, configured hosts exempt (HeartbeatBoard)
 HEARTBEAT_KEEP_S = 24 * 3600.0
 TTL_DEFAULT_S = 900         # a job loop posting every 5 min misses two posts before it is shown stale
@@ -90,6 +129,8 @@ TIME_SKEW_S = 30 * 86400.0  # job timestamps within a month of the provider's cl
 SAMPLE_FUTURE_SKEW_S = 120.0  # a heartbeat hardware sampled_at may run ahead of the provider's clock by this much, no more
 ELSEWHERE_MAX = 50          # remote stubs listed (child_tasks.remote_stubs reads at most its own cap of dirs)
 SCOPE = "provider host"     # the tasks section sees this machine's child-task log only (see the module doc)
+# The orchestrator tree also sees what the hosts' heartbeats carry (#118): `task_hosts` names them.
+TREE_SCOPE = "provider host and heartbeats"
 MEMO_S = 2.0                # GET /v1/cortados/live: N pollers (dashboard tabs, pulse panes) share one collect per 2 s
 DEFAULT_HOSTS = ("air", "studio", "pro")
 HOSTS_ENV = "CORTADOS_LIVE_HOSTS"
@@ -103,11 +144,30 @@ _WS_STATE_RE = re.compile(r"[a-z_-]{1,24}")
 _TASK_STATES = ("succeeded", "failed", "cancelled")   # child_tasks.TERMINAL_STATES
 # The main session that started a task (child_tasks.clean_origin): its Office tag, or a named origin (the bot gateway)
 _ORIGIN_SESSION_RE = child_tasks.ORIGIN_SESSION_RE
+_ORIGIN_RULES = (("origin_session", _ORIGIN_SESSION_RE), ("origin_project", office._HEADER_RULES[office.PROJECT_HEADER]),
+                 ("origin_device", office._HEADER_RULES[office.DEVICE_HEADER]))
 SESSION_FILTER_RULE = "one Office session tag (16-64 lowercase hex) or " + " or ".join(child_tasks.ORIGIN_NAMED)
+# ---- the orchestrator tree (orchestrators_section) ----
+ORCH_MAX = 32               # orchestrator groups (sessions, the bot, unattributed); the rest flagged truncated
+ORCH_TASKS_MAX = 20         # top-level tasks per orchestrator (nested ones ride with their parent), active first
+NEST_MAX = 4                # nesting depth drawn (a parent chain longer than this is flattened at the cut)
+SUBSESSIONS_MAX = 8         # sub-sessions listed per task (main loop first, then working, then newest)
+ORCH_ROUTED_MAX = 8         # an orchestrator's own routed subagents (route_task, the routed-subagents mod) listed
+# The tree is built from the UNCAPPED conversation items and remote stubs (the fleet lists' own caps, 64 and 50, made
+# one session's items vanish behind another's: review 2026-11-14), filtered by origin first. Ownership comes from each
+# conversation's own tags and the board's uncapped workers, a session's stubs from its origin index
+# (child_tasks.remote_stubs_for), so every cut a session view names is its own (docs/PULSE-PER-SESSION.md §5 has each
+# input's bound and cost). This hard ceiling only bounds the work on a runaway fleet; when it cuts, the section names
+# the input in `inputs_truncated`.
+TREE_INPUT_MAX = 2000
+# Statuses in the owner's words (docs/PULSE-PER-SESSION.md): running, waiting (queued, or idle between turns), done,
+# failed, unknown (no end event after 10 h, ended without one, or on another host).
+_TASK_STATUS = {"running": "running", "queued": "waiting", "succeeded": "done", "cancelled": "done",
+                "failed": "failed", "unknown": "unknown", "elsewhere": "unknown"}
 MEMO_KEYS = 16              # live.Memo: the fleet view plus this many-1 session views memoised side by side
 ORIGINS_MAX = 32            # origin groups listed (sessions with a task in the window); the rest flagged truncated
 ORIGIN_IDS_MAX = 20         # task ids per origin group and per orchestrator item, newest first
-_HB_KEYS = {"host", "jobs", "ttl_s", "hardware", "s1", "orchestrator"}
+_HB_KEYS = {"host", "jobs", "ttl_s", "hardware", "s1", "orchestrator", "tasks"}
 # heartbeat `hardware`: percentages, byte counts, the 1-min load, the chip name and when it was sampled; nothing else
 _HB_PCT = ("cpu_busy_pct", "gpu_busy_pct", "disk_free_pct")
 _HB_BYTES = ("mem_available_bytes", "mem_total_bytes")
@@ -122,7 +182,14 @@ _JOB_KEYS = {"name", "state", "summary", "started_at", "finished_at", "next_at",
 
 
 def _num(x: Any) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    """A finite real number. Never raises: math.isfinite raises OverflowError for an int past a float's range (a JSON
+    `1e400` is inf, but `10**400` written out is an int), which a persisted file or a body may hold (review round 5)."""
+    if not isinstance(x, (int, float)) or isinstance(x, bool):
+        return False
+    try:
+        return math.isfinite(x)
+    except (OverflowError, ValueError):
+        return False
 
 
 def _r(x: Any, nd: int = 1) -> float | None:
@@ -193,7 +260,88 @@ def validate_heartbeat(body: Any, now: float) -> tuple[dict[str, Any] | None, st
         if bad is not None:
             return None, "orchestrator" + bad
         out["orchestrator"] = orch
+    if body.get("tasks") is not None:
+        tasks, bad = validate_tasks(body["tasks"], host, now)
+        if bad is not None:
+            return None, "tasks" + bad
+        out["tasks"] = tasks
     return out, None
+
+
+def validate_tasks(block: Any, host: str, now: float) -> tuple[dict[str, Any] | None, str | None]:
+    """A heartbeat's `tasks` block, {"items": [entry], "truncated": bool}, or (None, ".<bad field>"). Each entry is one
+    start_task child that ran on THIS host (`host` must be the heartbeat's own: a host speaks for its own tasks only),
+    every field re-checked by the rule the live view applies to its own log (tasks_section, _children). An entry
+    whose newest time is outside the 24 h window is dropped, not refused: the sender filters by the same window, so
+    only clock skew puts one there. `session` (the child's own Office tag, sent by senders since round 3) is checked and
+    then dropped: a heartbeat-supplied tag is never a join key (review round 4; heartbeat_rows joins on what the
+    provider itself observed)."""
+    if not isinstance(block, dict) or set(block) - {"items", "truncated"}:
+        return None, ""
+    items = block.get("items", [])
+    if not isinstance(items, list) or len(items) > HB_TASKS_MAX:
+        return None, ".items"
+    if not isinstance(block.get("truncated", False), bool):
+        return None, ".truncated"
+    out, seen = [], set()
+    title_rule = office._HEADER_RULES[office.TITLE_HEADER]
+    for i, t in enumerate(items):
+        where = f".items[{i}]"
+        if not isinstance(t, dict) or set(t) - _HB_TASK_KEYS:
+            return None, where
+        tid = t.get("task_id")
+        if not (isinstance(tid, str) and child_tasks.TASK_ID_RE.fullmatch(tid)) or tid in seen:
+            return None, where + ".task_id"
+        seen.add(tid)
+        if t.get("host", host) != host:
+            return None, where + ".host"
+        if t.get("state") not in HB_TASK_STATES:
+            return None, where + ".state"
+        e: dict[str, Any] = {"task_id": tid, "host": host, "state": t["state"]}
+        if t.get("phase") is not None:
+            if t["phase"] not in HB_TASK_PHASES:
+                return None, where + ".phase"
+            e["phase"] = t["phase"]
+        if t.get("session") is not None and office.clean(t["session"], office._HEADER_RULES[office.SESSION_HEADER]) is None:
+            return None, where + ".session"
+        for k, rule in (("title", title_rule), ("lane", office._LANE_RE), ("model", office._MODEL_RE),
+                        ("workspace", _WS_STATE_RE), *_ORIGIN_RULES):
+            if t.get(k) is not None:
+                e[k] = office.clean(t[k], rule)
+                if e[k] is None:
+                    return None, f"{where}.{k}"
+        if t.get("origin_via") not in (None, "parent"):
+            return None, where + ".origin_via"
+        if t.get("origin_via") == "parent":
+            e["origin_via"] = "parent"
+        parent = t.get("parent_task_id")
+        if parent is not None:
+            if not (isinstance(parent, str) and child_tasks.TASK_ID_RE.fullmatch(parent)) or parent == tid:
+                return None, where + ".parent_task_id"
+            e["parent_task_id"] = parent
+        if t.get("browser") is not None:
+            if not isinstance(t["browser"], bool):
+                return None, where + ".browser"
+            e["browser"] = t["browser"]
+        for k in ("started_at", "ended_at"):
+            v = t.get(k)
+            if v is None:
+                continue
+            # never from the future (a little skew allowed): a later stamp would order it above real activity
+            if not (_num(v) and now - TIME_SKEW_S <= v <= now + SAMPLE_FUTURE_SKEW_S):
+                return None, f"{where}.{k}"
+            e[k] = round(float(v), 3)
+        if e.get("started_at") is None and e.get("ended_at") is None:
+            return None, where + ".started_at"
+        if e.get("ended_at") is not None and e.get("started_at") is not None and e["ended_at"] < e["started_at"]:
+            return None, where + ".ended_at"
+        final = t["state"] in _TASK_STATES
+        if final != (e.get("ended_at") is not None):
+            return None, where + ".ended_at"        # a finished task has its end time, an open one has none
+        if max(e.get("ended_at") or 0, e.get("started_at") or 0) < now - CHILD_WINDOW_S:
+            continue                                # outside the window: dropped (see above)
+        out.append(e)
+    return {"items": out, "truncated": block.get("truncated", False) is True}, None
 
 
 def _validate_hw(hw: Any, now: float) -> tuple[dict[str, Any] | None, str | None]:
@@ -258,24 +406,185 @@ def _validate_s1(s1: Any) -> tuple[dict[str, Any] | None, str | None]:
     return out, None
 
 
+class BindingsTooLarge(ValueError):
+    """BINDINGS_FILE is over BINDINGS_MAX_BYTES: not read (its type name is the error the tree shows)."""
+
+
 class HeartbeatBoard:
     """In-memory, locked, bounded: host -> its latest validated heartbeat. A restart forgets them (the next post
-    restores each), which the view shows honestly as "no heartbeat yet".
+    restores each), which the view shows honestly as "no heartbeat yet". The task-id bindings are the exception: with
+    `path` (the server passes $CORTADOS_HOME/BINDINGS_FILE) they are loaded at start and written atomically when they
+    change, so a restart cannot reopen an id to whichever host reports it first (review round 4, P2). Without `path`
+    (tests) they live in memory only.
 
     `protected` (optional) names the configured hosts; it is asked only when the board is over HEARTBEAT_HOSTS_MAX, and
     eviction then drops the least recently posted host that is NOT configured. Configured hosts are the owner's own
     list, so the board holds at most HEARTBEAT_HOSTS_MAX + their number. A failing `protected` protects nothing (the
     plain LRU), never an unbounded board. `generation` changes with every post (the live view's memo key)."""
 
-    def __init__(self, protected: Callable[[], Any] | None = None):
+    def __init__(self, protected: Callable[[], Any] | None = None, path: str | os.PathLike | None = None):
         self._lock = threading.Lock()
         self._hosts: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
         self._protected = protected
         self.generation = 0
+        # task id -> {"bind": (host, origin_session, parent_task_id), "seen": t, "saved": the seen last written}
+        self._bindings: dict[str, dict[str, Any]] = {}
+        self._path = Path(path) if path is not None else None
+        self._load_error: str | None = None
+        self._save_error: str | None = None
+        if self._path is not None:
+            self._load(time.time())
+
+    @staticmethod
+    def binding(e: dict[str, Any]) -> tuple:
+        """What a task id is bound to: the host it ran on and who it belongs to (its origin, its parent). Any of these
+        changing is a different claim on the id, not an update. (The child's own Office tag is no part of it since
+        round 4: it was the reporting host's word, and nothing joins on it any more.)"""
+        return (e.get("host"), e.get("origin_session"), e.get("parent_task_id"))
+
+    @staticmethod
+    def same_claim(bound: tuple, want: tuple) -> bool:
+        """Whether a report `want` is the bound claim again: host, origin and parent all equal."""
+        return tuple(bound) == tuple(want)
+
+    # ---- persistence (BINDINGS_FILE)
+    def _load(self, now: float) -> None:
+        """Read the bindings file: valid, unexpired entries only, the newest TASK_BINDINGS_MAX. A missing file is an
+        empty table. An unreadable, oversized (BINDINGS_MAX_BYTES) or malformed file is an empty table too, and an
+        invalid entry is skipped; either is said in errors() (the tree's `task bindings` error, the type only) and
+        logged. Nothing raised while reading or validating ever leaves here: the Registry builds the board at
+        provider start, and a corrupt file must never stop the provider (review round 5, P2)."""
+        try:
+            ok, bad = self._read_bindings(now)
+        except Exception as exc:                    # unreadable, oversized, malformed: the whole file is skipped
+            self._load_error = type(exc).__name__
+            logger.warning("live: task bindings unreadable, starting empty: %s", type(exc).__name__)
+            return
+        if bad:
+            self._load_error = "InvalidEntry"
+            logger.warning("live: task bindings: %d invalid entries skipped", bad)
+        ok.sort(key=lambda x: x[0], reverse=True)
+        for seen, tid, bind in ok[:TASK_BINDINGS_MAX]:
+            self._bindings.setdefault(tid, {"bind": bind, "seen": seen, "saved": seen})
+
+    def _read_bindings(self, now: float) -> tuple[list[tuple[float, str, tuple]], int]:
+        """(valid unexpired entries, the number of invalid ones). Raises for a file that cannot be used at all (a
+        missing file is ([], 0)); one bad entry is counted and skipped, never the file."""
+        try:
+            with open(self._path, "rb") as f:
+                data = f.read(BINDINGS_MAX_BYTES + 1)
+        except FileNotFoundError:
+            return [], 0
+        if len(data) > BINDINGS_MAX_BYTES:
+            raise BindingsTooLarge()
+        doc = json.loads(data.decode("utf-8"))
+        rows = doc.get("bindings") if isinstance(doc, dict) and doc.get("version") == BINDINGS_VERSION else None
+        if not isinstance(rows, list):
+            raise ValueError("malformed")
+        ok: list[tuple[float, str, tuple]] = []
+        bad = 0
+        for r in rows:
+            try:
+                entry = self._valid_entry(r, now)
+            except Exception:                       # whatever a planted value makes a check raise: that entry only
+                entry = False
+            if entry is False:
+                bad += 1
+            elif entry is not None:
+                ok.append(entry)
+        return ok, bad
+
+    @staticmethod
+    def _valid_entry(r: Any, now: float) -> Any:
+        """(seen, task id, binding) for a valid unexpired entry; None for a valid expired one; False for an invalid
+        one: not a 5-list, a field of the wrong type or shape, a `seen` that is no finite number (NaN, Infinity, an
+        int past a float's range) or later than the clock allows."""
+        if not (isinstance(r, list) and len(r) == 5):
+            return False
+        tid, host, origin, parent, seen = r
+        if not (isinstance(tid, str) and child_tasks.TASK_ID_RE.fullmatch(tid)
+                and isinstance(host, str) and _HOST_RE.fullmatch(host)
+                and (origin is None or (isinstance(origin, str) and _ORIGIN_SESSION_RE.fullmatch(origin)))
+                and (parent is None or (isinstance(parent, str) and child_tasks.TASK_ID_RE.fullmatch(parent)))
+                and _num(seen) and seen <= now + SAMPLE_FUTURE_SKEW_S):
+            return False
+        if seen < now - HEARTBEAT_KEEP_S:
+            return None                             # expired: dropped as the board would, not an error
+        return float(seen), tid, (host, origin, parent)
+
+    def _save_locked(self) -> None:
+        """Write the bindings atomically (a private temp file in the same directory, then os.replace), mode 0600. A
+        failure is logged and said in errors(); the in-memory table stands."""
+        tmp = None
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            doc = {"version": BINDINGS_VERSION,
+                   "bindings": [[t, *b["bind"], round(b["seen"], 3)] for t, b in self._bindings.items()]}
+            tmp = self._path.with_name(f"{self._path.name}.tmp{os.getpid()}-{threading.get_ident()}")
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(doc, f, separators=(",", ":"))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._path)
+            tmp = None
+            for b in self._bindings.values():
+                b["saved"] = b["seen"]
+            self._save_error = None
+        except Exception as exc:
+            self._save_error = type(exc).__name__
+            logger.warning("live: task bindings not saved: %s", type(exc).__name__)
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    def errors(self) -> list[dict[str, str]]:
+        """The bindings file's trouble ({source: "task bindings", error: <type>}), for the tree's errors: a provider
+        that could not load or save them says so instead of looking like a clean table."""
+        with self._lock:
+            return [_err("task bindings", e) for e in (self._load_error, self._save_error) if e]
+
+    def _bind_locked(self, hb: dict[str, Any], now: float) -> tuple[dict[str, Any], bool]:
+        """(heartbeat, changed): the heartbeat with every task entry whose id is already bound to another host, origin or parent dropped,
+        and their number in tasks.conflicts. The first report of an id binds it (review round 3, P1: a newer heartbeat
+        from another host must not take over a task id and re-publish its run under a chosen origin). Expired bindings
+        (not reported for HEARTBEAT_KEEP_S) are the only ones removed; with TASK_BINDINGS_MAX live ones a new id is
+        refused and counted, never bound by evicting another (review round 4, P2). `changed`: the table must be saved."""
+        changed = False
+        for t in [t for t, b in self._bindings.items() if now - b["seen"] > HEARTBEAT_KEEP_S]:
+            del self._bindings[t]
+            changed = True
+        block = hb.get("tasks")
+        if not isinstance(block, dict):
+            return hb, changed
+        kept, conflicts = [], 0
+        for e in block.get("items") or []:
+            want = self.binding(e)
+            b = self._bindings.get(e["task_id"])
+            if b is not None:
+                if not self.same_claim(b["bind"], want):
+                    conflicts += 1                  # dropped: the id stays with its first host and origin
+                    continue
+                b["seen"] = max(b["seen"], now)
+                changed = changed or b["saved"] is None or b["seen"] - b["saved"] > BINDINGS_SAVE_SEEN_S
+            elif len(self._bindings) >= TASK_BINDINGS_MAX:
+                conflicts += 1                      # full of live bindings: refused, none evicted
+                continue
+            else:
+                self._bindings[e["task_id"]] = {"bind": want, "seen": now, "saved": None}
+                changed = True
+            kept.append(e)
+        return {**hb, "tasks": {**block, "items": kept, "conflicts": conflicts}}, changed
 
     def post(self, hb: dict[str, Any], now: float | None = None) -> dict[str, Any]:
         now = time.time() if now is None else now
         with self._lock:
+            hb, changed = self._bind_locked(hb, now)
+            if changed and self._path is not None:
+                self._save_locked()
             self._hosts.pop(hb["host"], None)
             self._hosts[hb["host"]] = {**hb, "received_at": round(now, 3)}
             if len(self._hosts) > HEARTBEAT_HOSTS_MAX:
@@ -286,14 +595,118 @@ class HeartbeatBoard:
                 for h in [h for h in self._hosts if h not in keep][:len(self._hosts) - HEARTBEAT_HOSTS_MAX]:
                     del self._hosts[h]
             self.generation += 1
-        return {"ok": True, "host": hb["host"], "jobs": len(hb["jobs"]), "fresh_for_s": hb["ttl_s"]}
+        out = {"ok": True, "host": hb["host"], "jobs": len(hb["jobs"]), "fresh_for_s": hb["ttl_s"]}
+        if isinstance(hb.get("tasks"), dict) and hb["tasks"]["conflicts"]:
+            out["task_conflicts"] = hb["tasks"]["conflicts"]   # the sender's own entries: no other host's data
+        return out
 
     def snapshot(self, now: float | None = None) -> dict[str, dict[str, Any]]:
         now = time.time() if now is None else now
         with self._lock:
             for h in [h for h, v in self._hosts.items() if now - v["received_at"] > HEARTBEAT_KEEP_S]:
                 del self._hosts[h]
-            return {h: {**v, "jobs": [dict(j) for j in v["jobs"]]} for h, v in self._hosts.items()}
+            return {h: {**v, "jobs": [dict(j) for j in v["jobs"]],
+                        **({"tasks": {**v["tasks"], "items": [dict(t) for t in v["tasks"]["items"]]}}
+                           if isinstance(v.get("tasks"), dict) else {})}
+                    for h, v in self._hosts.items()}
+
+
+def heartbeat_rows(beats: dict[str, dict[str, Any]], now: float, known: dict[str, dict[str, Any]],
+                   office_view: dict[str, Any] | None = None,
+                   conflicted: Any = frozenset()) -> tuple[list[dict[str, Any]], list[str], bool, int]:
+    """(rows, hosts, cut, conflicts): the heartbeats' task entries as tasks_section rows, for the orchestrator tree,
+    the hosts whose heartbeat carried a tasks block, whether any of those blocks was cut by its sender (`truncated`:
+    the host had more than HB_TASKS_MAX tasks in its window), and how many claims on a task id were dropped.
+
+    A task id's host and origin are authoritative and set once (review round 3, P1). `known` (task id -> row: the
+    provider host's own log and its remote stubs) is first-hand: an entry that names another host or another origin
+    for such an id is a conflict; otherwise a log row wins, and the host's own report replaces a stub (`stub` true: a
+    start sent from here onto that host). Between heartbeats the board bound each id to the first host that reported it
+    (HeartbeatBoard._bind_locked: later differing claims were already dropped and counted there); should two current
+    beats still disagree (bindings lost with an unreadable bindings file), the earlier-received one keeps the id and
+    the other counts. A `known` entry marked `unverified` (its stub could not be read) drops the claim uncounted: an
+    id this machine may own is never handed to a heartbeat on a guess.
+    A heartbeat past its TTL still lists its tasks, but a running or queued one is then `unknown` ("its host's
+    heartbeat is stale"). A running task with no end after STALE_RUNNING_S is unknown, as tasks_section says.
+
+    Joins (review round 4: a join key is something the provider observed itself, never something a heartbeat
+    supplied). The Office board's worker for the run (x-cortados-run-id: its title, model, lane, provider, current
+    tool) joins only when the provider saw the run's own requests carry x-cortados-origin equal to the task's bound
+    origin (the worker's `origin`, office.note_origin); a run id and every tag in the entry are the reporting host's
+    word. Each row carries its bound origin in `bind_origin` (never published) so orchestrators_section applies the
+    same rule to the run's sub-sessions (each conversation's observed origin) and tokens (the run's, RunRecords). A task
+    with no origin, or whose run the provider never saw with it, shows its heartbeat's own fields only. Any worker with
+    the run id is considered (a remote child's routed traffic makes a `subagent` worker here; `child_task` ones come
+    from this host's own log), a `child_task` one first.
+    `conflicted` (collect passes conflicted_runs over every record of every run, review round 5, P2): run ids the
+    provider saw with two origins, or ORIGIN_CONFLICT, anywhere. Such a run's row joins nothing at all: no worker
+    field here, and its `bind_origin` is None, so orchestrators_section joins none of its sub-sessions or tokens."""
+    workers = _all_workers(office_view or {})
+    conflicted = _UnionRuns(conflicted, conflicted_runs([w for _, w in workers], None, None))
+    by_run: dict[Any, dict[str, Any]] = {}
+    for _, w in workers:
+        if w.get("run_id") and (w["run_id"] not in by_run or w.get("kind") == "child_task"):
+            by_run[w["run_id"]] = w
+    rows: dict[str, dict[str, Any]] = {}
+    hosts: list[str] = []
+    cut = False
+    conflicts = 0
+    for h, hb in sorted(beats.items(), key=lambda kv: (kv[1].get("received_at") or 0, kv[0])):
+        block = hb.get("tasks")
+        if not isinstance(block, dict):
+            continue
+        hosts.append(h)
+        cut = cut or block.get("truncated") is True
+        if _num(block.get("conflicts")):
+            conflicts += int(block["conflicts"])
+        stale = now - (hb.get("received_at") or 0) > (hb.get("ttl_s") or TTL_DEFAULT_S)
+        for e in block.get("items") or []:
+            tid = e.get("task_id")
+            if e.get("host") != h:
+                continue
+            k = known.get(tid)
+            if k is not None:
+                if k.get("unverified"):
+                    continue                        # this machine's own record could not be read: no claim on a guess
+                if (k.get("host") and k["host"] != h) or \
+                        (k.get("origin_session") and e.get("origin_session") != k["origin_session"]):
+                    conflicts += 1                  # the provider host's own record names another host or origin
+                    continue
+                if not k.get("stub"):
+                    continue                        # the provider host's own log has it: first-hand, it wins
+                # a remote stub (started from here onto host h, same origin): h's own report replaces it
+            if tid in rows:
+                if not HeartbeatBoard.same_claim(rows[tid]["_bind"], HeartbeatBoard.binding(e)):
+                    conflicts += 1
+                continue
+            start, end = e.get("started_at"), e.get("ended_at")
+            if max(end or 0, start or 0) < now - CHILD_WINDOW_S:
+                continue                            # a day-old heartbeat's finished tasks age out as the log's do
+            state, phase = e["state"], e.get("phase")
+            if state in ("running", "queued"):
+                if stale:
+                    state, phase = "unknown", STALE_HB_PHASE
+                elif start is not None and now - start > STALE_RUNNING_S:
+                    state, phase = "unknown", "no end event after 10 h"
+            origin = e.get("origin_session") if tid not in conflicted else None   # the run-wide veto
+            w = by_run.get(tid) or {}
+            if not origin or w.get("origin") != origin:
+                w = {}                              # the provider never saw this run carry the task's origin
+            elapsed = ((end if end is not None else now) - start) if start is not None else None
+            rows[tid] = {
+                "task_id": tid, "title": e.get("title") or w.get("title"), "state": state, "phase": phase, "host": h,
+                "client": None, "provider": w.get("provider"), "lane": e.get("lane") or w.get("lane"),
+                "model": w.get("model") or e.get("model"),
+                "tool": w.get("tool") if state == "running" and w.get("status") == "working" else None,
+                "started_at": start, "ended_at": end,
+                "elapsed_s": _r(max(0.0, elapsed)) if _num(elapsed) else None, "workspace": e.get("workspace"),
+                "browser": e.get("browser") is True, "session": None, "project": None, "device": None,
+                "origin_session": e.get("origin_session"), "origin_project": e.get("origin_project"),
+                "origin_device": e.get("origin_device"), "origin_via": e.get("origin_via"),
+                "parent_task_id": e.get("parent_task_id"), "bind_origin": origin, "_bind": HeartbeatBoard.binding(e)}
+    for r in rows.values():
+        del r["_bind"]
+    return list(rows.values()), sorted(hosts), cut, conflicts
 
 
 # ================================================================ sections
@@ -347,6 +760,11 @@ def _children(events: list[dict[str, Any]], now: float) -> dict[str, dict[str, A
             v = office.clean(e.get(field), rule)
             if v is not None:
                 c[field] = v
+        parent = e.get("parent_task_id")
+        if isinstance(parent, str) and child_tasks.TASK_ID_RE.fullmatch(parent) and parent != tid:
+            c["parent_task_id"] = parent
+        if e.get("origin_via") == "parent":
+            c["origin_via"] = "parent"
     return out
 
 
@@ -361,9 +779,25 @@ def _office_workers(view: dict[str, Any]) -> list[tuple[dict[str, Any] | None, d
     return out
 
 
-def _elsewhere(stubs: list | None, known: set[str], now: float) -> list[dict[str, Any]]:
+def _all_workers(view: dict[str, Any]) -> list[tuple[dict[str, Any] | None, dict[str, Any]]]:
+    """(floor-like {session, project, device} or None, worker) for EVERY worker on the board, before the Office's
+    per-floor (32), lobby and overall caps, when the view carries them (OfficeBoard.view(uncapped=True): `workers_all`,
+    each worker with its own session tag); else the capped lists (_office_workers). The orchestrator tree joins
+    through this, so one session's workers never depend on how busy the other floors are (review 2026-11-14)."""
+    if not isinstance(view.get("workers_all"), list):
+        return _office_workers(view)
+    out = []
+    for w in view["workers_all"]:
+        if isinstance(w, dict):
+            out.append(({"session": w["session"], "project": w.get("project"), "device": w.get("device")}
+                        if w.get("session") else None, w))
+    return out
+
+
+def _elsewhere(stubs: list | None, known: set[str], now: float, cap: int | None = ELSEWHERE_MAX) -> list[dict[str, Any]]:
     """Remote stubs re-validated (the tasks dir is a file tree, read as untrusted), minus any task the local log already
-    shows, newest first, within STALE_RUNNING_S (no child runs longer: see the constant)."""
+    shows, newest first, within STALE_RUNNING_S (no child runs longer: see the constant). `cap` None: every one (the
+    tree filters by origin before it caps)."""
     out = []
     for s in stubs or []:
         if not isinstance(s, dict):
@@ -372,33 +806,56 @@ def _elsewhere(stubs: list | None, known: set[str], now: float) -> list[dict[str
             s.get("created_at")
         if tid is None or host is None or tid in known or not _num(at) or not now - STALE_RUNNING_S <= at <= now:
             continue
-        out.append({"task_id": tid, "host": host, "started_at": round(float(at), 3)})
+        org = {k: office.clean(s.get(k), rule) for k, rule in _ORIGIN_RULES}
+        out.append({"task_id": tid, "host": host, "started_at": round(float(at), 3),
+                    **{k: v for k, v in org.items() if v}})   # who started it, when the stub recorded it
     out.sort(key=lambda x: -x["started_at"])
-    return out[:ELSEWHERE_MAX]
+    return out if cap is None else out[:cap]
 
 
 def tasks_section(events: list[dict[str, Any]], office_view: dict[str, Any] | None,
                   peek: Callable[[str], dict[str, Any] | None] | None, now: float,
-                  errors: list | None = None, stubs: list | None = None, session: str | None = None) -> dict[str, Any]:
+                  errors: list | None = None, stubs: list | None = None, session: str | None = None,
+                  rows_out: list | None = None, peek_foreign: bool = True, task_errors_out: list | None = None,
+                  elsewhere_out: list | None = None) -> dict[str, Any]:
     """The tasks section. With `session` (a valid ?session= value) running, queued and recent hold only that session's
     tasks, filtered BEFORE the caps: filtering the capped fleet lists lost a busy fleet's older tasks from the session's
-    view while its origin group still listed them (review 2026-11-13). Counts and origins stay fleet-wide."""
+    view while its origin group still listed them (review 2026-11-13). Counts and origins stay fleet-wide. `rows_out`
+    (a list) receives every row of the window, uncapped, for the orchestrator tree (orchestrators_section);
+    `elsewhere_out` every remote stub, uncapped, for the same; `task_errors_out` a (task id, error) pair for each
+    task-dir error, so the tree publishes only the errors of tasks it shows.
+
+    With `session`, that session's open tasks are peeked first (PEEK_MAX is shared: other sessions' tasks must not use
+    it up), and with `peek_foreign` False (the session endpoint) no other task's directory is opened at all."""
     errors = list(errors or [])
-    by_run = {w.get("run_id"): w for _, w in _office_workers(office_view or {}) if w.get("kind") == "child_task"}
+    by_run = {w.get("run_id"): w for _, w in _all_workers(office_view or {}) if w.get("kind") == "child_task"}
     kids = _children(events, now)
+    own: set[str] | None = None
+    if session is not None:
+        lite = {tid: {"task_id": tid, "origin_session": c.get("origin_session"),
+                      "parent_task_id": c.get("parent_task_id")} for tid, c in kids.items()}
+        own = {tid for tid, r in lite.items() if _origin_of(lite, r)[0] == session}
+    peeked: dict[str, Any] = {}
+    if peek is not None:
+        open_ids = [tid for tid, c in kids.items() if c["final"] is None]
+        if own is not None:                         # stable: the fleet view peeks in log order, as before
+            open_ids.sort(key=lambda t: t not in own)
+            if not peek_foreign:
+                open_ids = [t for t in open_ids if t in own]
+        for tid in open_ids[:PEEK_MAX]:
+            try:
+                peeked[tid] = peek(tid)
+            except Exception as exc:                # one bad dir must not erase the section
+                e = _err("task_dir", exc)
+                errors.append(e)
+                if task_errors_out is not None:
+                    task_errors_out.append((tid, e))
     rows = []
-    peeks = 0
     for tid, c in kids.items():
         w = by_run.get(tid) or {}
         state, phase, ws = c["final"], None, c["workspace"]
         if state is None:
-            p = None
-            if peek is not None and peeks < PEEK_MAX:
-                peeks += 1
-                try:
-                    p = peek(tid)
-                except Exception as exc:            # one bad dir must not erase the section
-                    errors.append(_err("task_dir", exc))
+            p = peeked.get(tid)
             state = "running"
             if p:
                 ws = office.clean(p.get("workspace"), _WS_STATE_RE) or ws
@@ -428,8 +885,11 @@ def tasks_section(events: list[dict[str, Any]], office_view: dict[str, Any] | No
             "device": None if c["chrome"] else c.get("device"),
             # who started it (any task, browser ones too): the orchestrating session's tag, "grokbot", or None
             "origin_session": c.get("origin_session"), "origin_project": c.get("origin_project"),
-            "origin_device": c.get("origin_device"),
+            "origin_device": c.get("origin_device"), "origin_via": c.get("origin_via"),
+            "parent_task_id": c.get("parent_task_id"),
         })
+    if rows_out is not None:
+        rows_out.extend(rows)
     counts = {k: 0 for k in ("running", "queued", "succeeded", "failed", "cancelled", "unknown")}
     for r in rows:
         counts[r["state"]] += 1
@@ -439,10 +899,12 @@ def tasks_section(events: list[dict[str, Any]], office_view: dict[str, Any] | No
     recent = sorted([r for r in listed if r["state"] not in ("running", "queued")],
                     key=lambda r: -(r["ended_at"] or r["started_at"] or 0))
     truncated = len(running) > RUNNING_MAX or len(queued) > RUNNING_MAX or len(recent) > RECENT_MAX
-    away = _elsewhere(stubs, set(kids), now)
+    away = _elsewhere(stubs, set(kids), now, cap=None)
+    if elsewhere_out is not None:
+        elsewhere_out.extend(away)
     return _section(now, _status(errors, bool(rows) or bool(away)), errors, scope=SCOPE, window_s=int(CHILD_WINDOW_S),
                     counts=counts, running=running[:RUNNING_MAX], queued=queued[:RUNNING_MAX],
-                    recent=recent[:RECENT_MAX], truncated=truncated, elsewhere=away, **origins_of(rows))
+                    recent=recent[:RECENT_MAX], truncated=truncated, elsewhere=away[:ELSEWHERE_MAX], **origins_of(rows))
 
 
 def origins_of(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -480,6 +942,320 @@ def link_origins(conv: dict[str, Any], tasks: dict[str, Any]) -> None:
                        "finished": g.get("finished", 0), "task_ids": list(g.get("task_ids") or [])} if known else None
 
 
+# ================================================================ the orchestrator tree
+def _origin_of(rows_by_id: dict[str, dict[str, Any]], r: dict[str, Any]) -> tuple[str | None, str | None]:
+    """(origin, via): a task's own origin_session, else the nearest ancestor's through parent_task_id (via "parent"):
+    a nested task with no orchestrator of its own belongs to its root's. (None, None): unattributed."""
+    if r.get("origin_session"):
+        return r["origin_session"], r.get("origin_via")
+    seen, cur = {r.get("task_id")}, r
+    while cur.get("parent_task_id") and cur["parent_task_id"] not in seen and len(seen) <= 16:
+        seen.add(cur["parent_task_id"])
+        cur = rows_by_id.get(cur["parent_task_id"])
+        if cur is None:
+            break
+        if cur.get("origin_session"):
+            return cur["origin_session"], "parent"
+    return None, None
+
+
+class _AllRuns:
+    """Every run id: what conflicted_runs gives when a source of origin observations could not be read."""
+    def __contains__(self, rid: Any) -> bool:
+        return True
+
+
+class _UnionRuns:
+    """Membership in any of `parts` (sets, or _AllRuns)."""
+    def __init__(self, *parts: Any):
+        self._parts = parts
+
+    def __contains__(self, rid: Any) -> bool:
+        return any(rid in p for p in self._parts)
+
+
+def conflicted_runs(workers: list | None, conversations: list | None, run_origins: Any,
+                    unknown: bool = False) -> Any:
+    """The run ids a heartbeat row may join nothing of (review round 5, P2): every origin the provider observed for a
+    run, on any record (an Office worker's `origin`, each conversation's of key "r:<run>" in `conversations`, a list
+    of lists, and RunRecords' run origin), taken together. A run seen with ORIGIN_CONFLICT anywhere, with two
+    different origins across its records, or with a value that is no origin at all is conflicted: one record that
+    agrees with a heartbeat cannot outvote another that does not. `unknown` (a source of observations could not be
+    read this time): every run, so a missed observation never lets a join through."""
+    if unknown:
+        return _AllRuns()
+    seen: dict[str, set] = {}
+
+    def note(rid: Any, o: Any) -> None:
+        if not isinstance(rid, str) or o is None:
+            return                                  # no x-cortados-origin on that record: no observation
+        ok = office.clean(o, office._ORIGIN_RE) if o != office.ORIGIN_CONFLICT else None
+        seen.setdefault(rid, set()).add(ok if ok is not None else office.ORIGIN_CONFLICT)
+    for w in workers or []:
+        if isinstance(w, dict):
+            note(w.get("run_id"), w.get("origin"))
+    for src in conversations or []:
+        for c in src if isinstance(src, list) else []:
+            if isinstance(c, dict) and isinstance(c.get("key"), str) and c["key"].startswith("r:"):
+                note(c["key"][2:], c.get("origin"))
+    for rid, o in (run_origins.items() if isinstance(run_origins, dict) else ()):
+        note(rid, o)
+    return {rid for rid, s in seen.items() if office.ORIGIN_CONFLICT in s or len(s) > 1}
+
+
+def _sub_node(c: dict[str, Any], now: float) -> dict[str, Any] | None:
+    """One sub-session (a Registry conversation of a run, open or recently closed) as a tree node, re-validated."""
+    if not isinstance(c, dict):
+        return None
+    opened = c.get("opened_at") if _num(c.get("opened_at")) else None
+    closed = c.get("closed_at") if _num(c.get("closed_at")) else None
+    busy, waiting = c.get("busy") is True, c.get("awaiting_tool") is True
+    if closed is not None:
+        status = "failed" if c.get("closed") == "failed" else "done"
+        phase = {"failed": "failed", "exited": "backend exited", "reaped": "closed idle",
+                 "rebuilt": "rebuilt"}.get(c.get("closed"), "closed")
+    else:
+        status = "running" if busy or waiting else "waiting"
+        phase = "model turn" if busy else ("running a tool" if waiting else "idle between turns")
+    ref = office.clean(c.get("ref"), office._RUN_ID_RE)
+    return {"ref": ref, "role": "subagent", "status": status, "phase": phase,
+            "provider": c.get("provider") if c.get("provider") in office.PROVIDERS else None,
+            "lane": office.clean(c.get("lane"), office._LANE_RE), "model": office.clean(c.get("model"), office._MODEL_RE),
+            "started_at": _r(opened, 3), "ended_at": _r(closed, 3), "last_activity": _r(c.get("last_used"), 3),
+            "elapsed_s": _r(max(0.0, (closed if closed is not None else now) - opened)) if opened is not None else None,
+            "tokens": work_split.pub_tokens(c.get("tokens"))}
+
+
+def _subs_by_run(backend: list | None, ended: list | None, now: float) -> dict[str, list[dict[str, Any]]]:
+    """run id -> its sub-session nodes: the open conversations whose office key is "r:<run id>" and the recently closed
+    ones (Registry.ended, within the task window). The first-opened is the run's main loop (role "main"): Claude Code
+    opens a child's main conversation before any subagent's. Ordered main, running, waiting, then newest."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for src in (backend or [], ended or []):
+        for c in src:
+            if not isinstance(c, dict) or not isinstance(c.get("key"), str) or not c["key"].startswith("r:"):
+                continue
+            rid = office.clean(c["key"][2:], office._RUN_ID_RE)
+            if rid is None:
+                continue
+            if _num(c.get("closed_at")) and now - c["closed_at"] > CHILD_WINDOW_S:
+                continue
+            n = _sub_node(c, now)
+            if n is not None:
+                # the origin the provider saw on this conversation's requests (x-cortados-origin), compared (never
+                # published) for a heartbeat's task: _task_subs
+                n["_origin"] = office.clean(c.get("origin"), office._ORIGIN_RE)
+                out.setdefault(rid, []).append(n)
+    rank = {"running": 0, "waiting": 1, "failed": 2, "done": 3}
+    for rid, subs in out.items():
+        first = min(subs, key=lambda n: (n["started_at"] if n["started_at"] is not None else math.inf))
+        first["role"] = "main"
+        subs.sort(key=lambda n: (n["role"] != "main", rank.get(n["status"], 4), -(n["started_at"] or 0)))
+    return out
+
+
+def _task_subs(r: dict[str, Any], subs: list[dict[str, Any]], tokens: Any,
+               run_origin: Any = None, conflicted: bool = False) -> tuple[list[dict[str, Any]], Any]:
+    """A task's sub-sessions and run tokens, as published. For a row from another host's heartbeat (`bind_origin`)
+    only the run's conversations whose requests the provider saw carry the task's bound origin join, and its run
+    tokens only when the run's own observed origin (`run_origin`, RunRecords.run_origins) is that origin: the run id
+    and the entry's tags are the other host's word (heartbeat_rows). The provider host's own rows (its log, its stubs)
+    join by run id, as before: first-hand. `conflicted` (the run is in conflicted_runs: seen with two origins
+    anywhere) vetoes every join of a heartbeat row, whatever each conversation's own origin (review round 5, P2)."""
+    if "bind_origin" in r:
+        o = r["bind_origin"] if not conflicted else None
+        subs = [x for x in subs if o and x.get("_origin") == o]
+        if not (o and run_origin == o):
+            tokens = None
+    return [{k: v for k, v in x.items() if k != "_origin"} for x in subs], tokens
+
+
+def _task_node(r: dict[str, Any], subs: list[dict[str, Any]], tokens: Any, via: str | None,
+               run_origin: Any = None, conflicted: bool = False) -> dict[str, Any]:
+    subs, tokens = _task_subs(r, subs, tokens, run_origin, conflicted)
+    st = r.get("state")
+    sub = subs[:SUBSESSIONS_MAX]
+    main = next((x for x in subs if x.get("role") == "main"), None) or {}   # a task with no model of its own: its loop's
+    return {"task_id": r.get("task_id"), "title": r.get("title"), "state": st, "status": _TASK_STATUS.get(st, "unknown"),
+            "phase": r.get("phase"), "tool": r.get("tool"), "host": r.get("host"), "provider": r.get("provider"),
+            "lane": r.get("lane") or main.get("lane"), "model": r.get("model") or main.get("model"),
+            "started_at": r.get("started_at"),
+            "ended_at": r.get("ended_at"), "elapsed_s": r.get("elapsed_s"), "workspace": r.get("workspace"),
+            "browser": bool(r.get("browser")), "parent_task_id": r.get("parent_task_id"), "parent_hidden": False,
+            "origin_via": via,
+            "tokens": work_split.pub_tokens(tokens), "sub_sessions": sub,
+            "sub_sessions_hidden": max(0, len(subs) - SUBSESSIONS_MAX),
+            "sub_sessions_failed": sum(1 for x in subs if x.get("status") == "failed"),   # all, listed or not
+            "tasks": []}
+
+
+def _rank_task(n: dict[str, Any]) -> tuple:
+    order = {"running": 0, "waiting": 1, "failed": 2, "unknown": 3, "done": 4}
+    return (order.get(n["status"], 5), -(n.get("ended_at") or n.get("started_at") or 0))
+
+
+def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, Any]] | None,
+                          conv: dict[str, Any] | None, backend: list | None, ended: list | None,
+                          run_tokens: dict[str, Any] | None, now: float, errors: list | None = None,
+                          session: str | None = None, inputs_truncated: list | None = None,
+                          task_hosts: list | None = None, conflicts: int | None = None,
+                          run_origins: dict[str, Any] | None = None,
+                          conflicted: Any = frozenset()) -> dict[str, Any]:
+    """The orchestrator tree: each orchestrating main session (its Office tag), the bot gateway ("grokbot") and an
+    unattributed group, each with the child tasks it started in the window (nested under their parent task through
+    parent_task_id) and, under each task, its sub-sessions (the run's routed conversations, x-cortados-run-id).
+
+    Every node is metadata only, built from already-validated rows and conversation records. With `session` only that
+    origin's group is built, BEFORE any cap, and the unattributed group is never included: a session's view can hold
+    nothing of another session (docs/PULSE-PER-SESSION.md). `rows`, `elsewhere` and `conv` items must be the uncapped
+    inputs (collect bounds them by TREE_INPUT_MAX and names a cut input in `inputs_truncated`).
+
+    `errors`: a source's error (a dict) applies to every view; a (task id, error) pair belongs to that task and is
+    published only when the task is in this tree (a foreign task's PermissionError is not this session's failure).
+    `attention` counts failed and unknown tasks, plus each failed sub-session of a task that is neither (a failed task
+    is counted once, however many of its sub-sessions failed).
+
+    `task_hosts` (collect passes it): the hosts whose heartbeat carried task entries, already merged into `rows`
+    (heartbeat_rows). The section's scope is then TREE_SCOPE and names them; None keeps the provider host's SCOPE.
+    `conflicts` (the fleet view only): heartbeat claims on a task id that were dropped because the id is bound to
+    another host or origin; published as a count, never with the ids or what was claimed.
+    `run_origins` (run id -> the origin the provider observed on the run's requests): a heartbeat row's run tokens
+    join only through it (_task_subs). `conflicted`: run ids that join nothing (conflicted_runs; collect's covers the
+    Office workers too); the runs this function's own inputs show conflicted are added to it."""
+    run_tokens = run_tokens if isinstance(run_tokens, dict) else {}
+    run_origins = run_origins if isinstance(run_origins, dict) else {}
+    conflicted = _UnionRuns(conflicted, conflicted_runs(None, [backend, ended], run_origins))
+    subs = _subs_by_run(backend, ended, now)
+    by_id = {r["task_id"]: r for r in rows if r.get("task_id")}
+    away = [{"task_id": x["task_id"], "title": None, "state": "elsewhere", "phase": "runs on " + x["host"] +
+             "; its state is on that host", "host": x["host"], "started_at": x["started_at"], "ended_at": None,
+             "elapsed_s": None, "origin_session": x.get("origin_session"), "origin_project": x.get("origin_project"),
+             "origin_device": x.get("origin_device")} for x in elsewhere or [] if x.get("task_id") not in by_id]
+    for x in away:
+        by_id[x["task_id"]] = x
+    groups: dict[Any, dict[str, Any]] = {}
+    nodes: dict[str, dict[str, Any]] = {}
+    origin_of: dict[str, Any] = {}
+    for r in list(by_id.values()):
+        origin, via = _origin_of(by_id, r)
+        if session is not None and origin != session:
+            continue                                # filtered before anything is built or capped
+        origin_of[r["task_id"]] = origin
+        nodes[r["task_id"]] = _task_node(r, subs.get(r["task_id"], []), run_tokens.get(r["task_id"]), via,
+                                         run_origins.get(r["task_id"]), r["task_id"] in conflicted)
+        g = groups.setdefault(origin, {"project": None, "device": None})
+        g["project"] = g["project"] or r.get("origin_project")
+        g["device"] = g["device"] or r.get("origin_device")
+    errors = [e[1] if isinstance(e, tuple) else e for e in errors or []
+              if not isinstance(e, tuple) or e[0] in nodes]
+
+    def nests(tid: str) -> bool:
+        """Whether the task hangs under its parent: the parent is in the same group, and the chain of same-group
+        parents above it ends at a top-level task within NEST_MAX steps. A cycle (a parent chain that comes back) or a
+        longer chain is drawn flat: every task of it stays visible at the top, none is lost inside the loop."""
+        seen, cur = [tid], tid
+        while True:
+            parent = nodes[cur].get("parent_task_id")
+            if parent not in nodes or origin_of.get(parent) != origin_of[tid]:
+                return len(seen) > 1                # reached a top-level task: nested iff tid is not itself the top
+            if parent in seen or len(seen) > NEST_MAX:
+                return False
+            seen.append(parent)
+            cur = parent
+
+    flat = {tid for tid in nodes if not nests(tid)}
+    tops: dict[Any, list[dict[str, Any]]] = {}
+    for tid, n in nodes.items():
+        parent = n.get("parent_task_id")
+        if tid not in flat:                         # its parent is in the group and its chain ends at a top task
+            nodes[parent]["tasks"].append(n)
+        else:
+            tops.setdefault(origin_of[tid], []).append(n)
+        if parent is not None and parent not in nodes and session is not None:
+            # a parent outside this session's tree (another orchestrator's task): never named in a session's view
+            n["parent_task_id"], n["parent_hidden"] = None, True
+
+    def finish(n: dict[str, Any], counts: dict[str, int]) -> None:
+        counts[n["status"]] = counts.get(n["status"], 0) + 1
+        # a failed or unknown task once; otherwise each of its failed sub-sessions (a running task whose subagent
+        # failed needs a look too)
+        counts["_attention"] = counts.get("_attention", 0) + (
+            1 if n["status"] in ("failed", "unknown") else n["sub_sessions_failed"])
+        n["tasks"].sort(key=_rank_task)
+        for k in n["tasks"]:
+            finish(k, counts)
+
+    # Live orchestrators (conversations items of kind orchestrator: a heartbeat or the routed main loop) and their own
+    # routed subagents, by Office session tag.
+    live_orch: dict[str, dict[str, Any]] = {}
+    routed: dict[str, list[dict[str, Any]]] = {}
+    for it in (conv or {}).get("items") or []:
+        sess = it.get("session")
+        if not sess or (session is not None and sess != session):
+            continue
+        if it.get("kind") == "orchestrator":
+            live_orch.setdefault(sess, it)
+        elif it.get("kind") == "subagent" and it.get("run_id") not in by_id:   # a task's own run is its sub-sessions
+            routed.setdefault(sess, []).append({
+                "ref": it.get("run_id"), "role": "subagent", "title": it.get("title"),
+                "status": "running" if it.get("status") == "working" else "waiting",
+                "phase": it.get("phase"), "tool": it.get("tool"), "provider": it.get("provider"), "lane": it.get("lane"),
+                "model": it.get("model"), "started_at": it.get("started_at"), "elapsed_s": it.get("elapsed_s"),
+                "tokens": it.get("tokens")})
+    out = []
+    for origin in set(tops) | set(live_orch) | set(routed):
+        top = sorted(tops.get(origin, []), key=_rank_task)
+        counts: dict[str, int] = {}
+        for n in top:
+            finish(n, counts)
+        o = live_orch.get(origin) if origin else None
+        g = groups.get(origin) or {}
+        kind = "unattributed" if origin is None else "bot" if origin in child_tasks.ORIGIN_NAMED else "session"
+        rs = routed.get(origin, []) if origin else []
+        newest = max([n.get("ended_at") or n.get("started_at") or 0 for n in top] +
+                     [(o or {}).get("last_activity") or 0], default=0)
+        out.append({
+            "origin": origin, "kind": kind,
+            "project": g.get("project") or (o or {}).get("project"), "device": g.get("device") or (o or {}).get("device"),
+            "status": (o or {}).get("status") or ("n/a" if kind != "session" else "not live"),
+            "model": (o or {}).get("model"), "tool": (o or {}).get("tool"),
+            "last_activity": _r(newest, 3) if newest else None,
+            "counts": {k: counts.get(k, 0) for k in ("running", "waiting", "done", "failed", "unknown")},
+            "attention": counts.get("_attention", 0),
+            "tasks": top[:ORCH_TASKS_MAX], "tasks_hidden": max(0, len(top) - ORCH_TASKS_MAX),
+            "routed": rs[:ORCH_ROUTED_MAX], "routed_hidden": max(0, len(rs) - ORCH_ROUTED_MAX)})
+    # active first (a running or waiting task, a working main session), the unattributed group last among equals,
+    # then by the newest activity
+    out.sort(key=lambda x: (not (x["counts"]["running"] or x["counts"]["waiting"] or x["status"] == "working"),
+                            x["kind"] == "unattributed", -(x["last_activity"] or 0)))
+    cut = sorted(set(inputs_truncated or []))
+    fields = {"scope": SCOPE if task_hosts is None else TREE_SCOPE, "window_s": int(CHILD_WINDOW_S),
+              "items": out[:ORCH_MAX], "truncated": len(out) > ORCH_MAX or bool(cut), "inputs_truncated": cut}
+    if task_hosts is not None:
+        fields["task_hosts"] = sorted(task_hosts)   # host names only: fleet health, no session in it
+    if conflicts is not None:
+        fields["conflicts"] = conflicts
+    if session is not None:
+        fields["session_filter"] = session
+    return _section(now, _status(errors, bool(out)), errors, **fields)
+
+
+SESSION_PATH = "/v1/cortados/live/session"
+
+
+def session_view(snap: dict[str, Any], session: str) -> dict[str, Any]:
+    """GET /v1/cortados/live/session?session=<tag>: the pulse pane's view. ONLY that session's orchestrator subtree
+    (built filtered, see orchestrators_section) plus fleet health that names no session (S1, the hosts' job
+    heartbeats and hardware, the lowest subscription window). No task, conversation, routed call or count of any
+    other session is in it. `snap` must come from collect(session=session)."""
+    o = snap.get("overview") or {}
+    return {"version": VERSION, "generated_at": snap.get("generated_at"), "session_filter": session,
+            "overview": {"s1": o.get("s1"), "s1_latency_ms": o.get("s1_latency_ms"),
+                         "lowest_subscription": o.get("lowest_subscription"),
+                         "hosts_with_heartbeat": o.get("hosts_with_heartbeat")},
+            "orchestrators": snap.get("orchestrators"), "s1": snap.get("s1"), "hosts": snap.get("hosts")}
+
+
 def for_session(snap: dict[str, Any], session: str) -> dict[str, Any]:
     """GET /v1/cortados/live?session=<tag>: the snapshot narrowed to one orchestrating session: its tasks (running,
     queued, recent, by origin_session), its origin group, and the conversations on its floor. Counts, overview and
@@ -491,7 +1267,10 @@ def for_session(snap: dict[str, Any], session: str) -> dict[str, Any]:
     t["origins"] = [g for g in t.get("origins") or [] if g.get("session") == session]
     c = dict(snap.get("conversations") or {})
     c["items"] = [it for it in c.get("items") or [] if it.get("session") == session]
-    return {**snap, "session_filter": session, "tasks": t, "conversations": c}
+    o = dict(snap.get("orchestrators") or {})
+    o["items"] = [g for g in o.get("items") or [] if g.get("origin") == session]
+    o["session_filter"] = session
+    return {**snap, "session_filter": session, "tasks": t, "conversations": c, "orchestrators": o}
 
 
 def valid_session(v: Any) -> str | None:
@@ -499,11 +1278,20 @@ def valid_session(v: Any) -> str | None:
     return v if isinstance(v, str) and _ORIGIN_SESSION_RE.fullmatch(v) else None
 
 
+_TAG_RULES = (("session", office._HEADER_RULES[office.SESSION_HEADER]),
+              ("project", office._HEADER_RULES[office.PROJECT_HEADER]),
+              ("device", office._HEADER_RULES[office.DEVICE_HEADER]))
+
+
 def _backend_items(backend: list, view: dict[str, Any], now: float) -> tuple[list[dict[str, Any]], set[str]]:
     """One item per conversation the provider holds open (Registry.live_conversations), joined with the Office board by
     its office key, and the office run ids / main-loop sessions those conversations cover. Every field is re-validated
-    here: these records come from in-memory sessions whose models and lanes the routes chose."""
-    workers = {w.get("run_id"): (f, w) for f, w in _office_workers(view) if w.get("run_id")}
+    here: these records come from in-memory sessions whose models and lanes the routes chose.
+
+    Ownership (session, project, device) is the conversation's OWN Office tags, which the registry keeps per
+    conversation, uncapped; the board (its uncapped workers when the view has them) only fills what a conversation
+    does not carry. Joining through the board's capped floors lost a session's 33rd routed agent (review 2026-11-14)."""
+    workers = {w.get("run_id"): (f, w) for f, w in _all_workers(view) if w.get("run_id")}
     floors = {f.get("session"): f for f in view.get("floors") or [] if f.get("session")}
     items, covered = [], set()
     for c in backend or []:
@@ -529,28 +1317,54 @@ def _backend_items(backend: list, view: dict[str, Any], now: float) -> tuple[lis
         busy, waiting = c.get("busy") is True, c.get("awaiting_tool") is True
         status = "working" if busy or waiting else "idle"
         opened = c.get("opened_at") if _num(c.get("opened_at")) else None
+        own = {k: office.clean(c.get(k), rule) for k, rule in _TAG_RULES}
+        if kind_of == "main" and own["session"] is None:
+            own["session"] = office.clean(ident, _TAG_RULES[0][1])    # the main loop's key is its session tag
+        tag = {k: own[k] or (floor or {}).get(k) for k in own}
         items.append({
             "kind": kind, "run_id": office.clean(ident, office._RUN_ID_RE) if kind_of == "r" else
             office.clean(c.get("ref"), office._RUN_ID_RE),
-            "session": (floor or {}).get("session"), "project": (floor or {}).get("project"),
-            "device": (floor or {}).get("device"),
+            "session": tag["session"], "project": tag["project"], "device": tag["device"],
             "provider": c.get("provider") if c.get("provider") in office.PROVIDERS else w.get("provider"),
             "lane": office.clean(c.get("lane"), office._LANE_RE) or w.get("lane"),
             "model": office.clean(c.get("model"), office._MODEL_RE) or w.get("model"),
             "status": status, "tool": w.get("tool") if status == "working" and w.get("status") == "working" else None,
             "phase": "model turn" if busy else ("client running a tool" if waiting else "waiting for the client"),
-            "source": "provider", "title": w.get("title"), "started_at": _r(opened, 3),
-            "last_activity": _r(c.get("last_used"), 3)})
+            "source": "provider",
+            "title": w.get("title") or office.clean(c.get("title"), office._HEADER_RULES[office.TITLE_HEADER]),
+            "started_at": _r(opened, 3),
+            "last_activity": _r(c.get("last_used"), 3), "tokens": work_split.pub_tokens(c.get("tokens"))})
     return items, covered
 
 
 def conversations_section(view: dict[str, Any], backend_sessions: int | None, now: float,
-                          backend: list | None = None, errors: list | None = None) -> dict[str, Any]:
+                          backend: list | None = None, errors: list | None = None,
+                          items_out: list | None = None) -> dict[str, Any]:
     """In-flight routed work. With `backend` (the Registry's open conversations), one item per open conversation,
     child tasks' included; then each floor's orchestrator known from a heartbeat (a main session that does not route
     itself), and Office workers that are working or idle but hold no open conversation (one-shot calls). Without it,
-    the Office view alone (orchestrators and non-child workers), as before."""
+    the Office view alone (orchestrators and non-child workers), as before. `items_out` (a list) receives every item,
+    before the CONVERSATIONS_MAX cap and from the board's uncapped workers (_all_workers), for the orchestrator tree."""
     items, covered = _backend_items(backend, view, now) if backend is not None else ([], set())
+    items += _floor_orchestrators(view, covered)
+    tree = items + _worker_items(_all_workers(view), covered) if items_out is not None else None
+    items += _worker_items(_office_workers(view), covered)
+    for lst in (items, tree or []):
+        for it in lst:
+            it["elapsed_s"] = _r(max(0.0, now - it["started_at"])) if _num(it.get("started_at")) else None
+        lst.sort(key=lambda it: (it["status"] != "working", -(it.get("started_at") or 0)))
+    if items_out is not None:
+        items_out.extend(tree)
+    errors = [e for e in view.get("errors") or [] if isinstance(e, dict)] + list(errors or [])
+    return _section(now, _status(errors, True), errors, backend_sessions=backend_sessions,
+                    active=len(items), working=sum(1 for it in items if it["status"] == "working"),
+                    floors=len(view.get("floors") or []), items=items[:CONVERSATIONS_MAX],
+                    hidden=max(0, len(items) - CONVERSATIONS_MAX))
+
+
+def _floor_orchestrators(view: dict[str, Any], covered: set[str]) -> list[dict[str, Any]]:
+    """Each floor's orchestrator known from a heartbeat whose main loop holds no open conversation here."""
+    items = []
     for f in view.get("floors") or []:
         o = f.get("orchestrator")
         if "main:" + str(f.get("session")) in covered:
@@ -561,7 +1375,14 @@ def conversations_section(view: dict[str, Any], backend_sessions: int | None, no
                           "model": o.get("model"), "status": o.get("status"), "tool": o.get("tool"), "phase": None,
                           "source": o.get("source"), "title": None, "started_at": f.get("since"),
                           "last_activity": o.get("last_seen")})
-    for f, w in _office_workers(view):
+    return items
+
+
+def _worker_items(pairs: list, covered: set[str]) -> list[dict[str, Any]]:
+    """Office workers that are working or idle but hold no open conversation (one-shot calls), from `pairs`
+    (_office_workers for the fleet list, _all_workers for the tree)."""
+    items = []
+    for f, w in pairs:
         if w.get("run_id") in covered or w.get("status") not in ("working", "idle"):
             continue
         if w.get("kind") == "child_task":
@@ -572,14 +1393,7 @@ def conversations_section(view: dict[str, Any], backend_sessions: int | None, no
                       "model": w.get("model"), "status": w.get("status"), "tool": w.get("tool"), "phase": None,
                       "source": "routed", "title": w.get("title"), "started_at": w.get("started_at"),
                       "last_activity": None})
-    for it in items:
-        it["elapsed_s"] = _r(max(0.0, now - it["started_at"])) if _num(it.get("started_at")) else None
-    items.sort(key=lambda it: (it["status"] != "working", -(it.get("started_at") or 0)))
-    errors = [e for e in view.get("errors") or [] if isinstance(e, dict)] + list(errors or [])
-    return _section(now, _status(errors, True), errors, backend_sessions=backend_sessions,
-                    active=len(items), working=sum(1 for it in items if it["status"] == "working"),
-                    floors=len(view.get("floors") or []), items=items[:CONVERSATIONS_MAX],
-                    hidden=max(0, len(items) - CONVERSATIONS_MAX))
+    return items
 
 
 _CALL_KEYS = ("ts", "task_id", "session_id", "routing_kind", "band", "lane", "model", "actual_model", "elapsed_ms",
@@ -817,13 +1631,29 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
             exec_hosts: Callable[[], tuple[dict[str, list[str]], str | None]] | None = None,
             self_host: str | None = None, host_names: list[str] | None = None,
             remote_stubs: Callable[[], list] | None = None,
+            session_stubs: Callable[[str], list] | None = None,
             lane_enabled: Callable[[Any], bool] | None = None,
             conversations: Callable[[], list] | None = None, self_name: str | None = None,
             route_log: Callable[[], dict[str, Any]] = router_db.stats,
-            session: str | None = None) -> dict[str, Any]:
+            ended_conversations: Callable[[], list] | None = None,
+            run_tokens: Callable[[], dict[str, Any]] | None = None,
+            run_origins: Callable[[], dict[str, Any]] | None = None,
+            stubs_by_id: Callable[[list[str]], list] | None = None,
+            binding_errors: Callable[[], list] | None = None,
+            session: str | None = None, peek_foreign: bool = True) -> dict[str, Any]:
     """The snapshot. Each input is a callable, run under its own guard: one that raises turns ITS section into
     status "error" with the exception's type (never its text: an OSError carries a path), the rest stand.
-    `session` (already valid, valid_session): the ?session= view (for_session), its tasks filtered before the caps."""
+    `session` (already valid, valid_session): the ?session= view (for_session), its tasks filtered before the caps.
+    `peek_foreign` False (GET /v1/cortados/live/session): no other session's task directory is opened.
+    `remote_stubs`: the fleet's stubs (child_tasks.remote_stubs, a scan of the newest task dirs) for the tasks section
+    and the fleet tree; None skips the scan (the session endpoint). `session_stubs(origin)`: with `session`, that
+    origin's own stubs (child_tasks.remote_stubs_for, the origin index), which then feed the tree instead of the fleet
+    scan: neither other sessions' stubs nor the fleet scan's cut can change or flag this session's tree.
+    `stubs_by_id(ids)` (child_tasks.remote_stubs_by_id): this machine's stubs of exactly the ids the heartbeats report,
+    read before any session filtering, so ownership is checked against every stub here in every view (review round 4,
+    P2); the records found are compared, never published. `run_origins`: run id -> the origin the provider saw on the
+    run's requests (RunRecords.run_origins), the only key a heartbeat task's tokens join on. `binding_errors`: the
+    heartbeat board's bindings-file trouble (HeartbeatBoard.errors), shown in the tree's errors."""
     def guard(source: str, fn: Callable[[], Any], errs: list) -> Any:
         try:
             return fn()
@@ -837,22 +1667,111 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     ov = guard("office", lambda: office_view(office.recent_child_events(events or [], now)), office_errs)
     stub_errs: list = []
     stubs = guard("task stubs", remote_stubs, stub_errs) if remote_stubs is not None else None
-    tasks = tasks_section(events or [], ov, peek, now, child_errs + office_errs + stub_errs, stubs, session) \
-        if events is not None \
-        else _section(now, "error", child_errs + office_errs + stub_errs, scope=SCOPE, window_s=int(CHILD_WINDOW_S),
-                      counts=None, running=[], queued=[], recent=[], truncated=False,
-                      elsewhere=_elsewhere(stubs, set(), now), origins=[], origins_truncated=False)
+    rows: list = []
+    away: list = []                                 # every remote stub, uncapped (the tasks section lists 50)
+    task_errs: list = []                            # (task id, error) for each task-dir error
+    if events is not None:
+        tasks = tasks_section(events, ov, peek, now, child_errs + office_errs + stub_errs, stubs, session, rows,
+                              peek_foreign=peek_foreign, task_errors_out=task_errs, elsewhere_out=away)
+    else:
+        away = _elsewhere(stubs, set(), now, cap=None)
+        tasks = _section(now, "error", child_errs + office_errs + stub_errs, scope=SCOPE, window_s=int(CHILD_WINDOW_S),
+                         counts=None, running=[], queued=[], recent=[], truncated=False,
+                         elsewhere=away[:ELSEWHERE_MAX], origins=[], origins_truncated=False)
     conv_errs: list = []
     backend = guard("conversations", conversations, conv_errs) if conversations is not None else None
     if isinstance(backend, list):
         backend_sessions = len(backend)             # the count from the same snapshot as the list it heads
+    conv_items: list = []                           # every conversation item, uncapped (the section lists 64)
     if ov is not None or backend is not None:    # the open conversations stand without the board (partial)
         conv = conversations_section(ov if ov is not None else {"errors": office_errs}, backend_sessions, now,
-                                     backend, conv_errs)
+                                     backend, conv_errs, items_out=conv_items)
     else:
         conv = _section(now, "error", office_errs + conv_errs, backend_sessions=backend_sessions, active=None,
                         working=None, floors=None, items=[], hidden=0)
     link_origins(conv, tasks)
+    tree_errs: list = []
+    # The hosts' heartbeats, read once: the tree takes their task entries (#118), the hosts section their jobs.
+    hb_errs: list = []
+    beats = guard("heartbeats", heartbeats, hb_errs) or {}
+    ended = guard("ended conversations", ended_conversations, tree_errs) if ended_conversations is not None else None
+    tok = guard("run tokens", run_tokens, tree_errs) if run_tokens is not None else None
+    r_orig = guard("run tokens", run_origins, tree_errs) if run_origins is not None else None
+    if binding_errors is not None:
+        tree_errs += guard("task bindings", binding_errors, tree_errs) or []
+    # The tree's inputs: uncapped, narrowed to the session's own origin FIRST, then bounded by TREE_INPUT_MAX with the
+    # cut named, so no other session's activity can push this session's items out (review 2026-11-14). A session's
+    # stubs come from its own origin index when the caller gives one: then every flag in `inputs_truncated` is about
+    # this session's own data only.
+    fleet_away = list(away)                         # the fleet scan's stubs (none in the session endpoint)
+    own_index = session is not None and session_stubs is not None
+    if own_index:
+        own = guard("task stubs", lambda: session_stubs(session), tree_errs)
+        away = _elsewhere(own, set(), now, cap=None)
+        cut: list = ["task stubs"] if getattr(own, "truncated", False) is True else []
+    else:
+        cut = ["task stubs"] if getattr(stubs, "truncated", False) is True else []
+    # The board's memory (MAX_WORKERS LRU, fleet-wide) may have dropped a session's one-shot worker: said, per session.
+    evicted = (ov or {}).get("workers_evicted")
+    if isinstance(evicted, list) and (session in evicted if session is not None else evicted):
+        cut.append("routed workers")
+    # Tasks that ran on another host (its own log, which this machine cannot read) arrive in its heartbeat. The
+    # provider host's own records are first-hand and bind their ids: its log rows (every row, before the session
+    # filter), and EVERY remote stub it wrote for a start it sent elsewhere: the ones this view read, plus a read of
+    # the stub of each id a heartbeat names (stubs_by_id), so another session's stub rejects a forged report in this
+    # session's view as it does in the fleet's (review round 4, P2). Compared only: no foreign record is published.
+    first_hand: dict[str, dict[str, Any]] = {x["task_id"]: {**x, "stub": True} for x in fleet_away + away}
+    first_hand.update({r["task_id"]: r for r in rows})
+    if stubs_by_id is not None:
+        claimed = list(dict.fromkeys(
+            e.get("task_id") for hb in beats.values() if isinstance(hb, dict) and isinstance(hb.get("tasks"), dict)
+            for e in hb["tasks"].get("items") or [] if isinstance(e, dict) and isinstance(e.get("task_id"), str)))
+        missing = [t for t in claimed if t not in first_hand]
+        if missing:
+            lookup_errs: list = []
+            found = guard("task stubs", lambda: stubs_by_id(missing), lookup_errs)
+            tree_errs += lookup_errs
+            if found is None:                       # could not check: no heartbeat claim on these ids this time
+                first_hand.update({t: {"task_id": t, "unverified": True} for t in missing})
+            for x in found or []:
+                if isinstance(x, dict) and x.get("task_id") in missing:
+                    first_hand[x["task_id"]] = ({"task_id": x["task_id"], "unverified": True} if x.get("unreadable")
+                                                else {"task_id": x["task_id"], "host": x.get("host"), "stub": True,
+                                                      "origin_session": x.get("origin_session")})
+    # Run-wide origin conflicts over every record the provider holds (workers, open and ended conversations, run
+    # origins), before any join: a source given but unreadable vetoes every heartbeat join (review round 5, P2).
+    conflicted = conflicted_runs(
+        [w for _, w in _all_workers(ov)] if isinstance(ov, dict) else None,
+        [x for x in (backend, ended) if isinstance(x, list)], r_orig,
+        unknown=not isinstance(ov, dict) or (conversations is not None and not isinstance(backend, list))
+        or (ended_conversations is not None and not isinstance(ended, list))
+        or (run_origins is not None and not isinstance(r_orig, dict)))
+    hb_rows, task_hosts, hb_cut, hb_conflicts = heartbeat_rows(beats, now, first_hand, ov, conflicted)
+    # A host that had more tasks than its heartbeat carries: said in the fleet view. Not in a session's view: the cut
+    # is over every session's tasks on that host, and a session's flags are about its own data only (§5).
+    if hb_cut and session is None:
+        cut.append("host tasks")
+    if session is not None:
+        away = [x for x in away if x.get("origin_session") == session]
+        conv_items = [it for it in conv_items if it.get("session") == session]
+    for name, lst in (("task stubs", away), ("conversations", conv_items)):
+        if len(lst) > TREE_INPUT_MAX:
+            del lst[TREE_INPUT_MAX:]                # both are newest / working first
+            cut.append(name)
+    # A task-dir error belongs to its task (the tree drops it with a task it does not show); the sources' errors
+    # (the log, the board, the stubs, the conversations) apply to every view.
+    tid_of = {id(e): tid for tid, e in task_errs}
+    task_side = [(tid_of[id(e)], e) if id(e) in tid_of else e for e in tasks["errors"]
+                 # the fleet scan's error is not the tree's when the session's own index was read instead
+                 if not (own_index and isinstance(e, dict) and e.get("source") == "task stubs")] \
+        if tasks["status"] != "ok" else []
+    orch = orchestrators_section(rows + hb_rows, away, {"items": conv_items},
+                                 backend if isinstance(backend, list) else None,
+                                 ended if isinstance(ended, list) else None, tok, now,
+                                 task_side + (conv["errors"] if conv["status"] != "ok" else []) + tree_errs + hb_errs,
+                                 session, inputs_truncated=cut, task_hosts=task_hosts,
+                                 conflicts=hb_conflicts if session is None else None,
+                                 run_origins=r_orig if isinstance(r_orig, dict) else None, conflicted=conflicted)
     tv_errs: list = []
     tv = guard("router.db", tasks_view, tv_errs)
     # this process's failed router.db writes (#99): shown even when the read side failed, which is when they matter most
@@ -865,8 +1784,6 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     u = guard("usage", usage_view, u_errs)
     subs = subscriptions_section(u, now, lane_enabled) if u is not None else _section(now, "error", u_errs, lanes=[], lowest=None)
     s1 = s1_section(u, now, u_errs or None)
-    hb_errs: list = []
-    beats = guard("heartbeats", heartbeats, hb_errs) or {}
     ex_errs: list = []
     ex = guard("exec-hosts", exec_hosts, ex_errs) if exec_hosts is not None else None
     ex_hosts, ex_default = ex if isinstance(ex, tuple) else ({}, None)
@@ -886,11 +1803,12 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
         "route_log_errors": (rl or {}).get("count"),
         "hosts_with_heartbeat": sum(1 for h in hosts["items"] if h["heartbeat_state"] == "fresh"),
         "errors": sum(len(s["errors"]) for s in (tasks, conv, routed, subs, s1, hosts)),
+        "orchestrators": sum(1 for g in orch["items"] if g["kind"] != "unattributed"),
         "routed_token_pct_24h": ((ws.get("overall") or {}).get("24h") or {}).get("routed_pct"),
     }
     snap = {"version": VERSION, "generated_at": round(now, 3), "overview": overview, "tasks": tasks,
-            "conversations": conv, "routed": routed, "subscriptions": subs, "s1": s1, "hosts": hosts,
-            "work_split": ws}
+            "conversations": conv, "orchestrators": orch, "routed": routed, "subscriptions": subs, "s1": s1,
+            "hosts": hosts, "work_split": ws}
     return for_session(snap, session) if session is not None else snap
 
 

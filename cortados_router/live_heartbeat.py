@@ -14,6 +14,12 @@ What it reports, all metadata:
               tag (cortados_router/orchestrator_usage.py; never a raw session id, path or text). The transcript scan
               runs at most every `every_s` (default 300 s); between scans the cached summary is sent as it was, with
               its own sampled_at, so the provider shows its age.
+  - tasks     (#118) this host's own start_task children of the last 24 h, from ITS child-task log
+              ($CORTADOS_HOME/child-tasks.jsonl, else ~/.cortados; the bounded tail the live view reads): task id, the
+              origin tag of the session that started it, title, state, model and lane when logged, host, start and end
+              times, parent task id and workspace state. Running and queued first, then the newest finished, at most
+              live.HB_TASKS_MAX. Never the prompt, the cwd, a command or any output. The provider merges them into the
+              orchestrator tree, so a task run with host "here" on the Pro shows under the session that started it.
 Never a token, environment, path, command line or file contents beyond those fixed names and the validated reason slug.
 The body is checked against the server's own validator (provider/live.validate_heartbeat) and its byte cap before it is
 sent, so a sender bug shows here, not as a 400 on the provider.
@@ -27,14 +33,17 @@ Config, ~/.config/cortados/heartbeat.json (CORTADOS_HEARTBEAT_CONFIG; written by
      "hardware": true, "disk": true,
      "s1": {"data_dir": "~/cortados/train/data", "health_url": "http://127.0.0.1:8431"},
      "orchestrator": {"projects": "~/.claude/projects", "task_roots": ["~/CortadOS"], "every_s": 300,
-                      "cache": "~/.cache/cortados/orchestrator-usage.json"}}       (all optional; absent = off)
+                      "cache": "~/.cache/cortados/orchestrator-usage.json"},       (all optional; absent = off)
+     "tasks": true}                                              (optional; absent = on, false = off)
 `s1.health_url` defaults to the scorer's bind address (s1_endpoint.bind_address; a wildcard bind is asked on loopback).
 The disk measured is the home directory's volume.
 
 CLI:  python3 -B -m cortados_router.live_heartbeat [--config PATH] [--dry-run | --check]
 Exit 0 posted (or printed, --dry-run; or the config, URL and token file are fine, --check), 1 the post failed, 2 the config or body is invalid (nothing sent).
-On an older provider that refuses the `orchestrator` block (400), it posts once more without it; one that also refuses
-the `hardware`/`s1` blocks gets them folded into job summaries, so the host still shows while the provider is behind.
+On an older provider that refuses the `tasks` or `orchestrator` block (400), it posts again without them (the tasks
+block first); one that also refuses the `hardware`/`s1` blocks gets them folded into job summaries, so the host still
+shows while the provider is behind. A body over the byte cap sheds its oldest task entries (said, `truncated`), then
+the orchestrator block, never the jobs.
 """
 from __future__ import annotations
 
@@ -121,6 +130,9 @@ def load_config(path: str | os.PathLike | None = None) -> dict[str, Any]:
     s1 = cfg.get("s1")
     if s1 is not None and not isinstance(s1, dict):
         raise ConfigError(f"{p}: s1 must be an object")
+    tasks = cfg.get("tasks", True)
+    if not isinstance(tasks, bool):
+        raise ConfigError(f"{p}: tasks must be true or false")
     orch = cfg.get("orchestrator")
     if orch is not None:
         if orch is True:
@@ -138,7 +150,7 @@ def load_config(path: str | os.PathLike | None = None) -> dict[str, Any]:
                 raise ConfigError(f"{p}: orchestrator.{k} must be a path")
         orch = {"projects": orch.get("projects"), "task_roots": roots, "every_s": int(every), "cache": orch.get("cache")}
     return {"host": host, "ttl_s": int(ttl), "jobs": jobs, "hardware": cfg.get("hardware", True) is True,
-            "disk": cfg.get("disk", True) is True, "s1": s1, "orchestrator": orch,
+            "disk": cfg.get("disk", True) is True, "s1": s1, "orchestrator": orch, "tasks": tasks,
             "provider_url": cfg.get("provider_url"), "token_file": cfg.get("token_file") or DEFAULT_TOKEN_FILE}
 
 
@@ -338,11 +350,58 @@ def orchestrator_block(cfg: dict[str, Any], now: float, scan: Callable[..., dict
     return block
 
 
+def tasks_block(host: str, now: float, events: Callable[[], list] | None = None,
+                peek: Callable[[str], Any] | None = None) -> dict[str, Any] | None:
+    """This host's own recent tasks (see the module doc), as the provider's validate_tasks accepts them. The rows come
+    from the live view's own reader (office.read_child_events, the bounded tail; live.tasks_section, which re-checks
+    every field and derives the state, peeking at this machine's task dirs for queued and ended-without-event).
+    None when the log cannot be read or the block would be refused (said on stderr by type only; the rest goes)."""
+    from cortados_router import child_tasks, paths
+    from cortados_router.provider import office
+    try:
+        evs = events() if events is not None else office.read_child_events(
+            paths.state_dir() / office.CHILD_EVENT_LOG, now, window_s=live.CHILD_WINDOW_S)
+        rows: list[dict[str, Any]] = []
+        live.tasks_section(evs, None, peek if events is not None else (peek or child_tasks.peek_local), now,
+                           rows_out=rows)
+    except Exception as exc:
+        print(f"live_heartbeat: tasks block skipped: {type(exc).__name__}", file=sys.stderr)
+        return None
+    active = sorted((r for r in rows if r["state"] in ("running", "queued")), key=lambda r: -(r["started_at"] or 0))
+    done = sorted((r for r in rows if r["state"] not in ("running", "queued")),
+                  key=lambda r: -(r["ended_at"] or r["started_at"] or 0))
+    picked = (active + done)[:live.HB_TASKS_MAX]
+    items = []
+    for r in picked:
+        e = {"task_id": r["task_id"], "host": host, "state": r["state"]}
+        if r.get("phase") in live.HB_TASK_PHASES:
+            e["phase"] = r["phase"]
+        for k in ("title", "lane", "model", "workspace", "origin_session", "origin_project", "origin_device",
+                  "origin_via", "parent_task_id", "started_at", "ended_at",
+                  "session"):   # the child's own Office tag: still sent (older providers compare it); since round 4
+                                # the provider checks and drops it, joining only on what it observed itself
+            if r.get(k) is not None:
+                e[k] = r[k]
+        if r.get("browser"):
+            e["browser"] = True
+        if e["state"] in ("running", "queued", "unknown"):
+            e.pop("ended_at", None)                  # an open task has no end time (the server's rule)
+        items.append(e)
+    block = {"items": items, "truncated": len(rows) > len(picked)}
+    ok, bad = live.validate_tasks(block, host, now)
+    if bad is not None:                             # a sender bug costs the block, never the heartbeat
+        print(f"live_heartbeat: tasks block dropped: field tasks{bad} would be refused", file=sys.stderr)
+        return None
+    block["items"] = [e for e in items if e["task_id"] in {x["task_id"] for x in ok["items"]}]
+    return block
+
+
 # ================================================================ the body
 def build(cfg: dict[str, Any], *, run: Callable[..., Any] = subprocess.run,
           sample: Callable[[], dict[str, Any]] | None = None, fetch: Callable[[str], bytes] | None = None,
           disk_usage: Callable[[str], Any] = shutil.disk_usage, now: float | None = None,
-          scan: Callable[..., dict[str, Any]] | None = None, salt: Callable[[], str | None] | None = None) -> dict[str, Any]:
+          scan: Callable[..., dict[str, Any]] | None = None, salt: Callable[[], str | None] | None = None,
+          task_events: Callable[[], list] | None = None, peek: Callable[[str], Any] | None = None) -> dict[str, Any]:
     now = time.time() if now is None else now
     body: dict[str, Any] = {"host": cfg["host"], "ttl_s": cfg["ttl_s"],
                             "jobs": [launchd_job(label, name, run) for label, name in cfg["jobs"]]}
@@ -360,6 +419,10 @@ def build(cfg: dict[str, Any], *, run: Callable[..., Any] = subprocess.run,
         block = orchestrator_block(cfg["orchestrator"], now, scan, salt)
         if block is not None:
             body["orchestrator"] = block
+    if cfg.get("tasks", True):
+        tb = tasks_block(cfg["host"], now, task_events, peek)
+        if tb is not None:
+            body["tasks"] = tb
     return body
 
 
@@ -379,21 +442,28 @@ def check(body: dict[str, Any], now: float | None = None) -> bytes:
 
 
 def check_fit(body: dict[str, Any], now: float | None = None) -> tuple[dict[str, Any], bytes]:
-    """check(), except that an oversize body with an `orchestrator` block is sent without that block (said on stderr):
-    the work split is the optional part; the jobs, hardware and S1 must still arrive. Returns the body actually sent."""
-    try:
-        return body, check(body, now)
-    except OversizeError as exc:
-        if "orchestrator" not in body:
-            raise
-        print(f"live_heartbeat: {exc}; posting without the orchestrator block", file=sys.stderr)
-        body = {k: v for k, v in body.items() if k != "orchestrator"}
-        return body, check(body, now)
+    """check(), except that an oversize body first sheds its oldest task entries (halving the list, `truncated` set),
+    then goes without its `orchestrator` block (each said on stderr): the tasks and the work split are the optional
+    parts; the jobs, hardware and S1 must still arrive. Returns the body actually sent."""
+    while True:
+        try:
+            return body, check(body, now)
+        except OversizeError as exc:
+            items = (body.get("tasks") or {}).get("items") or []
+            if items:
+                keep = len(items) // 2
+                print(f"live_heartbeat: {exc}; sending {keep} of {len(items)} task entries", file=sys.stderr)
+                body = {**body, "tasks": {"items": items[:keep], "truncated": True}}
+            elif "orchestrator" in body:
+                print(f"live_heartbeat: {exc}; posting without the orchestrator block", file=sys.stderr)
+                body = {k: v for k, v in body.items() if k != "orchestrator"}
+            else:
+                raise
 
 
 def legacy(body: dict[str, Any]) -> dict[str, Any]:
     """The same heartbeat for a provider that predates the hardware/s1 blocks: both folded into job summaries."""
-    out = {k: v for k, v in body.items() if k not in ("hardware", "s1", "orchestrator")}
+    out = {k: v for k, v in body.items() if k not in ("hardware", "s1", "orchestrator", "tasks")}
     jobs = list(out.get("jobs") or [])
     hw = body.get("hardware")
     if hw:
@@ -434,7 +504,8 @@ def post(url: str, token: str, raw: bytes, opener: Callable[..., Any] = urllib.r
 def main(argv: list[str] | None = None, *, run: Callable[..., Any] = subprocess.run,
          sample: Callable[[], dict[str, Any]] | None = None, fetch: Callable[[str], bytes] | None = None,
          opener: Callable[..., Any] = urllib.request.urlopen, disk_usage: Callable[[str], Any] = shutil.disk_usage,
-         scan: Callable[..., dict[str, Any]] | None = None, salt: Callable[[], str | None] | None = None) -> int:
+         scan: Callable[..., dict[str, Any]] | None = None, salt: Callable[[], str | None] | None = None,
+         task_events: Callable[[], list] | None = None, peek: Callable[[str], Any] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Post this host's heartbeat to the CortadOS live view (never prints a token).")
     ap.add_argument("--config", help=f"default ${CONFIG_ENV} or {DEFAULT_CONFIG}")
     ap.add_argument("--dry-run", action="store_true", help="print the body it would post; send nothing")
@@ -447,7 +518,8 @@ def main(argv: list[str] | None = None, *, run: Callable[..., Any] = subprocess.
             provider_url(cfg), read_token(cfg["token_file"])
             print(f"live_heartbeat: config ok for host {cfg['host']} ({len(cfg['jobs'])} jobs)")
             return 0
-        body = build(cfg, run=run, sample=sample, fetch=fetch, disk_usage=disk_usage, scan=scan, salt=salt)
+        body = build(cfg, run=run, sample=sample, fetch=fetch, disk_usage=disk_usage, scan=scan, salt=salt,
+                     task_events=task_events, peek=peek)
         body, raw = check_fit(body)
         if a.dry_run:
             print(json.dumps(body, indent=1))
@@ -457,11 +529,36 @@ def main(argv: list[str] | None = None, *, run: Callable[..., Any] = subprocess.
         print(f"live_heartbeat: {exc}", file=sys.stderr)
         return 2
     code, msg = post(url, token, raw, opener)
-    if code == 400 and "orchestrator" in body:
-        # a provider from before the work split: the orchestrator block is an unknown field there
-        print(f"live_heartbeat: provider refused the orchestrator block ({msg or 400}); posting without it",
-              file=sys.stderr)
-        body = {k: v for k, v in body.items() if k != "orchestrator"}
+    # An older provider enforces its own, smaller byte cap (24 KiB before #118) with 413, before it looks at any field:
+    # a full 40-entry tasks block is over it. Shed the optional parts until it fits: fewer task entries (halved), then
+    # no tasks block, then no orchestrator block. The jobs, hardware and S1 are never shed (review round 3, P2).
+    while code == 413:
+        items = (body.get("tasks") or {}).get("items") or []
+        if len(items) > 1:
+            keep = len(items) // 2
+            print(f"live_heartbeat: provider refused the size ({msg or 413}); sending {keep} of {len(items)} task "
+                  "entries", file=sys.stderr)
+            body = {**body, "tasks": {"items": items[:keep], "truncated": True}}
+        elif "tasks" in body or "orchestrator" in body:
+            block = "tasks" if "tasks" in body else "orchestrator"
+            print(f"live_heartbeat: provider refused the size ({msg or 413}); posting without the {block} block",
+                  file=sys.stderr)
+            body = {k: v for k, v in body.items() if k != block}
+        else:
+            break
+        try:
+            raw = check(body)
+        except ConfigError as exc:
+            print(f"live_heartbeat: {exc}", file=sys.stderr)
+            return 2
+        code, msg = post(url, token, raw, opener)
+    # A provider from before the tasks block (#118) or the work split: that block is an unknown field there. The
+    # newest block goes first, so a provider that knows the orchestrator block keeps it.
+    for block in ("tasks", "orchestrator"):
+        if code != 400 or block not in body:
+            continue
+        print(f"live_heartbeat: provider refused the {block} block ({msg or 400}); posting without it", file=sys.stderr)
+        body = {k: v for k, v in body.items() if k != block}
         try:
             raw = check(body)
         except ConfigError as exc:

@@ -11,6 +11,7 @@ import time
 os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp())
 os.environ.setdefault("CORTADOS_SCARCITY_REFRESH", "off")
 import unittest
+import unittest.mock
 import urllib.error
 from collections import namedtuple
 from contextlib import redirect_stderr, redirect_stdout
@@ -107,7 +108,7 @@ class Base(unittest.TestCase):
         p.write_text(json.dumps(cfg))
         return p
 
-    def main(self, *argv, outputs=None, opener=None, fetch=None, sample=fake_sample):
+    def main(self, *argv, outputs=None, opener=None, fetch=None, sample=fake_sample, task_events=lambda: [], peek=None):
         run = fake_launchctl(outputs if outputs is not None else
                              {"com.cortados.s1-serve": PRINT_RUNNING, "com.cortados.s1-nightly": PRINT_DONE})
         out, err = io.StringIO(), io.StringIO()
@@ -116,7 +117,7 @@ class Base(unittest.TestCase):
                             fetch=fetch or (lambda url: json.dumps({"ok": True, "model": "CortadOS Router S1 v12 (run-a)",
                                                                     "loaded_s": 40.04}).encode()),
                             opener=opener or (lambda req, timeout: FakeResponse(b"{}")),
-                            disk_usage=lambda p: Usage(1000, 400, 600))
+                            disk_usage=lambda p: Usage(1000, 400, 600), task_events=task_events, peek=peek)
         return code, out.getvalue(), err.getvalue()
 
 
@@ -189,7 +190,8 @@ class BodyTest(Base):
             self.assertNotIn(bad, out, bad)
 
     def test_no_s1_no_hardware(self):
-        code, out, _ = self.main("--config", str(self.config(s1=None, hardware=False, disk=False)), "--dry-run")
+        code, out, _ = self.main("--config", str(self.config(s1=None, hardware=False, disk=False, tasks=False)),
+                                 "--dry-run")
         self.assertEqual(code, 0)
         self.assertEqual(set(json.loads(out)), {"host", "ttl_s", "jobs"})
 
@@ -269,7 +271,9 @@ class PostTest(Base):
         code, _, err = self.main("--config", str(self.config()), opener=opener)
         self.assertEqual(code, 0, err)
         self.assertIn("legacy body", err)
-        legacy = seen[1]
+        self.assertIn("refused the tasks block", err)           # the newest block is dropped first
+        self.assertEqual(["tasks" in b for b in seen], [True, False, False])
+        legacy = seen[-1]
         self.assertEqual(set(legacy), {"host", "ttl_s", "jobs"})
         jobs = {j["name"]: j for j in legacy["jobs"]}
         self.assertEqual(jobs["hardware"]["summary"], "cpu 30%, mem 62% used, disk 60% free")
@@ -292,14 +296,189 @@ class PostTest(Base):
         self.assertIn("no answer URLError", err)
 
 
+PRO_TAG = "aaaaaaaaaaaaaaa1"
+SECRET_PROMPT = "SECRET-PROMPT-TEXT-0118"
+
+
+def host_events(now):
+    """This host's child-task log as child_tasks.log_event writes it on the Pro (host "here" runs as host "pro"), with
+    the cwd and an injected prompt the block must never carry."""
+    base = {"cwd": "/Users/someone/secret-project", "orchestrator": "claude-app", "chrome": False,
+            "prompt": SECRET_PROMPT, "task_preview": SECRET_PROMPT, "session": "1111111111111111"}
+    mine = {"origin_session": PRO_TAG, "origin_project": "CortadOS-Router", "origin_device": "pro"}
+    return [
+        {"ts": now - 30 * 3600, "event": "started", "task_id": "t20261113100000-00000001", **base, **mine},
+        {"ts": now - 600, "event": "started", "task_id": "t20261114160000-00000002", **base, **mine, "host": "pro",
+         "title": "Fix the pane"},
+        {"ts": now - 900, "event": "started", "task_id": "t20261114155000-00000003", **base, **mine, "host": "pro",
+         "title": "Write the docs", "lane": "claude#a", "model": "claude-sonnet-5"},
+        {"ts": now - 300, "event": "finished", "task_id": "t20261114155000-00000003", **base, **mine, "host": "pro",
+         "status": "succeeded", "duration_s": 600.0, "workspace_state": "archived"},
+        {"ts": now - 120, "event": "started", "task_id": "t20261114165800-00000004", **base, "host": "pro",
+         "parent_task_id": "t20261114160000-00000002", "origin_via": "parent", **mine, "chrome": True},
+    ]
+
+
+class TasksBlockTest(Base):
+    """The heartbeat's `tasks` block (#118): this host's own recent tasks, metadata only, valid by the server's rules."""
+
+    def test_metadata_only_valid_and_running_first(self):
+        now = time.time()
+        block = hbs.tasks_block("pro", now, events=lambda: host_events(now),
+                                peek=lambda tid: {"phase": "queued", "ended": False} if tid.endswith("4") else None)
+        ids = [e["task_id"] for e in block["items"]]
+        self.assertEqual(ids, ["t20261114165800-00000004", "t20261114160000-00000002", "t20261114155000-00000003"])
+        self.assertFalse(block["truncated"])
+        queued, running, done = block["items"]
+        self.assertEqual((queued["state"], queued["phase"], queued["browser"], queued["parent_task_id"]),
+                         ("queued", "waiting for the host's Chrome", True, "t20261114160000-00000002"))
+        self.assertEqual((running["state"], running["title"], running["origin_session"], running["host"]),
+                         ("running", "Fix the pane", PRO_TAG, "pro"))
+        self.assertNotIn("ended_at", running)
+        self.assertEqual((done["state"], done["model"], done["lane"], done["workspace"]),
+                         ("succeeded", "claude-sonnet-5", "claude#a", "archived"))
+        self.assertAlmostEqual(done["ended_at"] - done["started_at"], 600.0, places=2)
+        # the child's own Office tag (the routed traffic's x-cortados-session, which the provider already sees) is sent
+        # to bind the run's worker to the task (review round 3, P1); the view compares it and never publishes it
+        self.assertEqual((running["session"], done["session"]), ("1111111111111111", "1111111111111111"))
+        self.assertNotIn("session", queued)                         # a browser task has no Office tags
+        raw = json.dumps(block)
+        for bad in (SECRET_PROMPT, "/Users", "secret-project", "claude-app", "cwd"):
+            self.assertNotIn(bad, raw, bad)
+        for e in block["items"]:
+            self.assertLessEqual(set(e), live._HB_TASK_KEYS)
+        self.assertEqual(live.validate_tasks(block, "pro", now)[1], None)
+
+    def test_the_heartbeat_carries_it_and_the_server_accepts_it(self):
+        now = time.time()
+        code, out, err = self.main("--config", str(self.config(host="pro", s1=None)), "--dry-run",
+                                   task_events=lambda: host_events(now))
+        self.assertEqual(code, 0, err)
+        body = json.loads(out)
+        self.assertEqual(len(body["tasks"]["items"]), 3)
+        hb, bad = live.validate_heartbeat(body, time.time())
+        self.assertIsNone(bad)
+        self.assertEqual({e["host"] for e in hb["tasks"]["items"]}, {"pro"})
+        self.assertNotIn(SECRET_PROMPT, out)
+
+    def test_capped_newest_first_and_said(self):
+        now = time.time()
+        evs = []
+        for i in range(live.HB_TASKS_MAX + 10):
+            tid = f"t20261114100000-{i:08x}"
+            evs += [{"ts": now - 5000 + i, "event": "started", "task_id": tid, "host": "pro"},
+                    {"ts": now - 4000 + i, "event": "finished", "task_id": tid, "host": "pro", "status": "failed"}]
+        block = hbs.tasks_block("pro", now, events=lambda: evs)
+        self.assertEqual(len(block["items"]), live.HB_TASKS_MAX)
+        self.assertTrue(block["truncated"])
+        self.assertEqual(block["items"][0]["task_id"], f"t20261114100000-{live.HB_TASKS_MAX + 9:08x}")
+
+    def test_an_unreadable_log_costs_the_block_only(self):
+        def boom():
+            raise PermissionError("/Users/someone/.cortados/child-tasks.jsonl")
+        code, out, err = self.main("--config", str(self.config(host="pro", s1=None)), "--dry-run", task_events=boom)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("tasks", json.loads(out))
+        self.assertIn("tasks block skipped: PermissionError", err)
+        self.assertNotIn("/Users", err)
+
+    def test_an_oversize_body_sheds_task_entries_before_anything_else(self):
+        now = time.time()
+        evs = [{"ts": now - 100 - i, "event": "started", "task_id": f"t20261114100000-{i:08x}", "host": "pro",
+                "title": "x" * 80, "origin_session": "a" * 64} for i in range(live.HB_TASKS_MAX)]
+        body = {"host": "pro", "ttl_s": 180, "jobs": [], "tasks": hbs.tasks_block("pro", now, events=lambda: evs)}
+        small = len(json.dumps({**body, "tasks": {"items": body["tasks"]["items"][:5], "truncated": True}},
+                               separators=(",", ":")))
+        err = io.StringIO()
+        with unittest.mock.patch.object(live, "HEARTBEAT_MAX_BYTES", small + 10), redirect_stderr(err):
+            sent, raw = hbs.check_fit(body, now)
+        self.assertEqual(len(sent["tasks"]["items"]), 5)
+        self.assertTrue(sent["tasks"]["truncated"])
+        self.assertEqual(sent["jobs"], [])
+        self.assertIn("task entries", err.getvalue())
+
+    def old_provider(self, cap=24 * 1024, knows_tasks=False):
+        """A fake provider from before #118: its 24 KiB cap is checked first (413, before any field), then an unknown
+        block is a 400. Records every body it was sent."""
+        seen = []
+
+        def opener(req, timeout):
+            seen.append(json.loads(req.data))
+            if len(req.data) > cap:
+                raise urllib.error.HTTPError(req.full_url, 413, "big", {}, io.BytesIO(
+                    b'{"type": "error", "error": {"message": "cortados: the heartbeat is too large"}}'))
+            if "tasks" in seen[-1] and not knows_tasks:
+                raise urllib.error.HTTPError(req.full_url, 400, "bad", {}, io.BytesIO(
+                    b'{"type": "error", "error": {"message": "cortados: heartbeat field (unknown field) is invalid"}}'))
+            return FakeResponse(b"{}")
+        opener.seen = seen
+        return opener
+
+    def full_log(self, now):
+        """40 tasks with full-length titles and tags: a valid tasks block over the old 24 KiB cap."""
+        return [{"ts": now - 50 - i, "event": "finished", "task_id": f"t20261114100000-{i:08x}", "host": "pro",
+                 "status": "succeeded", "duration_s": 50.0, "workspace_state": "archived"}
+                for i in range(live.HB_TASKS_MAX)] + \
+            [{"ts": now - 100 - i, "event": "started", "task_id": f"t20261114100000-{i:08x}", "host": "pro",
+                 "title": "Long task title " + "x" * 64, "origin_session": "a" * 64, "origin_project": "p" * 64,
+                 "origin_device": "d" * 32, "session": "b" * 64, "lane": "claude#a", "model": "claude-sonnet-5",
+                 "parent_task_id": f"t20261114090000-{i:08x}", "origin_via": "parent"}
+                for i in range(live.HB_TASKS_MAX)]
+
+    def test_an_old_providers_413_sheds_task_entries_then_the_block_never_the_jobs(self):
+        now = time.time()
+        for knows_tasks in (False, True):
+            opener = self.old_provider(knows_tasks=knows_tasks)
+            code, _, err = self.main("--config", str(self.config(host="pro")), opener=opener,
+                                     task_events=lambda: self.full_log(now))
+            self.assertEqual(code, 0, err)
+            seen = opener.seen
+            first = json.dumps(seen[0], separators=(",", ":")).encode()
+            self.assertEqual(len(seen[0]["tasks"]["items"]), live.HB_TASKS_MAX)
+            self.assertGreater(len(first), 24 * 1024)                     # valid for this provider, too big for that
+            self.assertLessEqual(len(first), live.HEARTBEAT_MAX_BYTES)
+            self.assertIsNone(live.validate_heartbeat(seen[0], time.time())[1])
+            self.assertIn("provider refused the size", err)
+            self.assertEqual([len(b["tasks"]["items"]) for b in seen if "tasks" in b][:2], [40, 20])
+            for b in seen:                                                 # every try kept the jobs, hardware and S1
+                self.assertEqual([j["name"] for j in b["jobs"]], ["s1-scorer", "com.cortados.s1-nightly"])
+                self.assertIn("hardware", b)
+                self.assertIn("s1", b)
+            last = seen[-1]
+            if knows_tasks:                                                # a smaller block fit: it is said cut
+                self.assertEqual((len(last["tasks"]["items"]), last["tasks"]["truncated"]), (20, True))
+            else:                                                          # it fit, then the old fields rule said no
+                self.assertNotIn("tasks", last)
+                self.assertIn("refused the tasks block", err)
+
+    def test_a_413_that_never_fits_sheds_only_the_optional_blocks(self):
+        now = time.time()
+        opener = self.old_provider(cap=10)                                 # nothing fits: the post fails, said
+        code, _, err = self.main("--config", str(self.config(host="pro")), opener=opener,
+                                 task_events=lambda: self.full_log(now))
+        self.assertEqual(code, 1)
+        self.assertIn("413", err)
+        self.assertEqual([len(b["tasks"]["items"]) for b in opener.seen if "tasks" in b], [40, 20, 10, 5, 2, 1])
+        last = opener.seen[-1]
+        self.assertEqual(set(last), {"host", "ttl_s", "jobs", "hardware", "s1"})   # never the jobs or hardware
+        self.assertEqual(len(last["jobs"]), 2)
+
+    def test_tasks_config_is_a_switch(self):
+        self.assertFalse(hbs.load_config(self.config(tasks=False))["tasks"])
+        self.assertTrue(hbs.load_config(self.config())["tasks"])                # absent: on
+        with self.assertRaises(hbs.ConfigError):
+            hbs.load_config(self.config(tasks="yes"))
+
+
 REPO = Path(__file__).resolve().parents[1]
-INSTALL = REPO / "scripts" / "install_live_heartbeat.sh"
+INSTALL =REPO / "scripts" / "install_live_heartbeat.sh"
 FAKE_LAUNCHCTL = """#!/bin/sh
 echo "$*" >> "$FAKE_LOG"
 if [ "$1" = list ]; then
   printf 'PID\tStatus\tLabel\n'
   printf '123\t0\tcom.cortados.provider\n-\t0\tcom.cortados.archive-cleanup\n'
   printf '77\t0\tcom.cortados.live-heartbeat\n88\t0\tcom.apple.something\n'
+  printf '99\t0\tcom.cortados.task.t20261114170942-14922685\n'
 fi
 exit 0
 """
@@ -339,7 +518,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(cfg, {"version": 1, "host": "studio", "token_file": "~/.config/cortados/live-heartbeat-token",
                                "ttl_s": 180, "jobs": ["com.cortados.archive-cleanup", "com.cortados.provider"],
                                "hardware": True, "disk": True, "provider_url": "http://air.tail:8432",
-                               "s1": {"data_dir": "~/cortados/train/data"}})
+                               "s1": {"data_dir": "~/cortados/train/data"}, "tasks": True})
         plist_path = self.home / "Library" / "LaunchAgents" / "com.cortados.live-heartbeat.plist"
         raw = plist_path.read_text()
         pl = plistlib.loads(raw.encode())
@@ -389,6 +568,23 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(cfg["orchestrator"], {"task_roots": ["~/CortadOS"]})
         self.assertEqual(hbs.load_config(self.home / ".config" / "cortados" / "heartbeat.json")["orchestrator"]["every_s"],
                          hbs.ORCH_EVERY_S)
+
+    def test_the_pro_a_gui_exec_host_reports_its_tasks_never_its_task_agents(self):
+        # #118: the Pro runs host "here" children, some as per-task LaunchAgents (com.cortados.task.<id>): those come
+        # and go, so the default label sweep skips them; its tasks travel in the heartbeat's tasks block instead.
+        self.mint()
+        r = self.install("pro", "--orchestrator")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        conf = self.home / ".config" / "cortados" / "heartbeat.json"
+        cfg = json.loads(conf.read_text())
+        self.assertEqual(cfg["jobs"], ["com.cortados.archive-cleanup", "com.cortados.provider"])
+        self.assertEqual((cfg["tasks"], "s1" in cfg, cfg["orchestrator"]), (True, False, {"task_roots": ["~/CortadOS"]}))
+        loaded = hbs.load_config(conf)
+        self.assertEqual((loaded["host"], loaded["tasks"]), ("pro", True))
+        self.assertIn(f"bootstrap gui/{os.getuid()}", " ".join(self.calls()))
+        r = self.install("pro", "--no-tasks", "--force")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(json.loads(conf.read_text())["tasks"])
 
     def test_refusals_load_nothing(self):
         r = self.install("studio")

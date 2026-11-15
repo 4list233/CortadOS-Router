@@ -438,6 +438,35 @@ class HeartbeatTests(OfficeHarness):
         self.assertEqual(b.view(ended, now=at + 1)["floors"][0]["workers"][0]["status"], "done")
 
 
+class OriginHeaderTests(unittest.TestCase):
+    """Review round 4: x-cortados-origin, the child runner's own statement of its orchestrator, recorded by the
+    provider per worker (compared by the live view's joins, never published)."""
+
+    def test_the_rule_and_name_are_child_tasks_own(self):
+        from cortados_router import session as launcher
+        self.assertEqual(office._ORIGIN_RE.pattern, child_tasks.ORIGIN_SESSION_RE.pattern)
+        self.assertEqual(office.ORIGIN_HEADER, child_tasks.ORIGIN_HEADER)
+        self.assertIn(office.ORIGIN_HEADER, launcher.OFFICE_HEADERS)
+        self.assertNotIn(office.ORIGIN_HEADER, office.TAG_FIELDS)     # no floor tag
+
+    def test_read_origin_and_the_worker_record(self):
+        b = office.OfficeBoard()
+        self.assertEqual(b.read_origin({"x-cortados-origin": "a" * 16}), "a" * 16)
+        self.assertEqual(b.read_origin({"x-cortados-origin": "grokbot"}), "grokbot")
+        self.assertIsNone(b.read_origin({}))
+        self.assertIsNone(b.read_origin({"x-cortados-origin": "NOT-A-TAG"}))
+        self.assertEqual(b.view([], uncapped=True)["dropped_headers"], {"x-cortados-origin": 1})
+        rid = "t20261104120000-0a1b2c3d"
+        b.turn_start("r:" + rid, {"session": SESSION}, run_id=rid, provider="claude", lane=None, model=None,
+                     origin="a" * 16)
+        b.turn_start("r:" + rid, {"session": SESSION}, run_id=rid, provider="claude", lane=None, model=None)
+        v = b.view([], uncapped=True)
+        self.assertEqual([w["origin"] for w in v["workers_all"]], ["a" * 16])
+        self.assertNotIn("a" * 16, json.dumps({k: v[k] for k in v if k != "workers_all"}))   # the Office never shows it
+        b.turn_start("r:" + rid, {}, run_id=rid, provider="claude", lane=None, model=None, origin="b" * 16)
+        self.assertEqual([w["origin"] for w in b.view([], uncapped=True)["workers_all"]], [office.ORIGIN_CONFLICT])
+
+
 class ChildTaskViewTests(OfficeHarness):
     def test_child_events_make_workers_and_floors(self):
         self.assertEqual(office.CHILD_EVENT_LOG, child_tasks.EVENT_LOG)

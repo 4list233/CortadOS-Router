@@ -375,7 +375,8 @@ class SenderTest(unittest.TestCase):
     def config(self, orch):
         p = self.dir / "heartbeat.json"
         p.write_text(json.dumps({"version": 1, "host": "air", "provider_url": "http://provider.test:8432",
-                                 "token_file": str(self.token), "jobs": [], "hardware": False, "orchestrator": orch}))
+                                 "token_file": str(self.token), "jobs": [], "hardware": False, "orchestrator": orch,
+                                 "tasks": False}))                  # the orchestrator block alone (#118's is apart)
         return p
 
     def test_config_rules(self):

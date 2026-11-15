@@ -57,7 +57,7 @@ from cortados_router import http_body
 from cortados_router.compat import getenv
 from cortados_router.compaction import prune as compaction_prune, store as compaction_store
 from cortados_router.provider import (anthropic_wire, clients, dashboard_auth, effect_boundary, live, local_lane,
-                                      local_switch, office, responses_wire, routing, search_lane)
+                                      local_switch, office, responses_wire, routing, search_lane, work_split)
 from cortados_router.provider.bridge import BridgeError, BridgeSession, ToolWaitExpired, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
 from cortados_router.provider.timeouts import IDLE_S, TOOL_WAIT_S, TURN_TIMEOUT_S, effective_tool_wait
@@ -101,6 +101,9 @@ REBUILD_WAIT_S = 60.0
 # of a busy endpoint, and an hour, past which a reap no longer explains a 409.
 CLOSED_RECORD_MAX = 128
 CLOSED_RECORD_TTL_S = 3600.0
+# Ended run conversations kept for the live view's tree (Registry.ended): a few hundred child sub-sessions is hours of
+# the owner's fan-out; the view shows each for live.SUBSESSION_KEEP_S after it closed.
+ENDED_CONVERSATIONS_MAX = 256
 # Largest last response a session keeps for a retry replay (_remember_reply): 1 MiB covers ordinary replies (text plus
 # tool calls) while bounding what each idle session can hold. One reply per live session, so the aggregate is at most
 # live sessions x this cap, and the idle reaper (IDLE_S) bounds how long any of it is held.
@@ -553,10 +556,17 @@ class RunRecords:
     def __init__(self):
         self._lock = threading.Lock()
         self._runs: "OrderedDict[str, list[dict[str, Any]]]" = OrderedDict()
+        # Backend tokens per run id (work_split.usage_tokens summed over every turn of the run's conversations), for the
+        # live view's orchestrator tree: a child task's total survives its conversations being reaped. In memory only.
+        self._tokens: "OrderedDict[str, dict[str, int]]" = OrderedDict()
         # Refused requests per run id: a request refused before routing (413 too large, a bad pin) has no route entry,
         # and without this a headless client could only learn "no routed request recorded". Recorded only for an
         # authenticated request (Handler._note_refusal), so a caller without the token cannot add or evict entries.
         self._refusals: "OrderedDict[str, list[dict[str, Any]]]" = OrderedDict()
+        # The x-cortados-origin the provider saw on each run's token-bearing requests (office.note_origin: the first,
+        # or office.ORIGIN_CONFLICT once two differ). The live view joins a heartbeat-reported task's run tokens only
+        # when this equals the task's bound origin (review round 4). Bounded with the tokens.
+        self._origins: "OrderedDict[str, str]" = OrderedDict()
 
     def refuse(self, run_id: str, *, status: int, kind: str, reason: str) -> None:
         """Record one refusal: the status, the error type and a fixed reason (Handler._note_refusal; never raw text)."""
@@ -586,6 +596,30 @@ class RunRecords:
             self._runs[run_id] = entries
             while len(self._runs) > self.MAX_RUNS:
                 self._runs.popitem(last=False)
+
+    def add_tokens(self, run_id: str, tokens: dict[str, int], origin: str | None = None) -> None:
+        """Add one backend turn's tokens (work_split.usage_tokens) to the run's total; bounded like the run records.
+        `origin`: the request's x-cortados-origin (OfficeBoard.read_origin), noted for the run (run_origins)."""
+        with self._lock:
+            t = self._tokens.pop(run_id, None) or {}
+            work_split.add_tokens(t, tokens)
+            self._tokens[run_id] = t
+            o = office.note_origin(self._origins.pop(run_id, None), origin)
+            if o is not None:
+                self._origins[run_id] = o
+            while len(self._tokens) > self.MAX_RUNS:
+                gone, _ = self._tokens.popitem(last=False)
+                self._origins.pop(gone, None)
+
+    def run_origins(self) -> dict[str, str]:
+        """run id -> the origin the provider observed on its requests (copies), for the live view's joins."""
+        with self._lock:
+            return dict(self._origins)
+
+    def tokens_by_run(self) -> dict[str, dict[str, int]]:
+        """run id -> its token total since this endpoint started (copies), for the live view."""
+        with self._lock:
+            return {k: dict(v) for k, v in self._tokens.items()}
 
     def all_refusals(self) -> list[dict[str, Any]]:
         """Every recorded refusal (for GET /v1/cortados/usage's 24-hour counts)."""
@@ -828,7 +862,11 @@ class Registry:
         self.runs = RunRecords()                    # x-cortados-run-id -> what its routed requests ran on
         self.office = office.OfficeBoard()          # floors / workers / heartbeats behind GET /v1/cortados/office
         # host job heartbeats behind GET /v1/cortados/live (provider/live.py); the LRU never evicts a configured host
-        self.live = live.HeartbeatBoard(protected=_configured_live_hosts)
+        # Its task-id bindings persist in $CORTADOS_HOME (live.BINDINGS_FILE, review round 4): a restart must not reopen
+        # a bound id to the first host that reports it afterwards.
+        from cortados_router import paths
+        self.live = live.HeartbeatBoard(protected=_configured_live_hosts,
+                                        path=paths.state_dir() / live.BINDINGS_FILE)
         # Scoped client tokens (clients.json). Consulted only when the owner token does not match, so the owner's
         # behaviour is unchanged; a client token opens only its scopes' endpoints and gets 403 everywhere else.
         self.clients = clients.ClientTokens(owner_token=token)
@@ -841,6 +879,11 @@ class Registry:
         # history. Fingerprints are digests of reply text, never logged; bounded by count and age so a long-running
         # endpoint keeps only what can still explain a 409 burst.
         self.closed: "deque[tuple[float, str, str, int]]" = deque(maxlen=CLOSED_RECORD_MAX)
+        # Recently closed conversations of a run (office key "r:<run id>": a child task's main loop and subagents), as
+        # the same metadata live_conversations publishes plus when and why they closed: the live view's orchestrator
+        # tree shows a child's finished sub-sessions for a while instead of dropping them. Bounded by count; the view
+        # applies its own age limit.
+        self.ended: "deque[dict[str, Any]]" = deque(maxlen=ENDED_CONVERSATIONS_MAX)
 
     def claude_config_dir(self, account: str | None) -> str | None:
         """The CLAUDE_CONFIG_DIR for a routed Claude account id, from tables/accounts.json; None (the default login)
@@ -1380,12 +1423,30 @@ class Registry:
                 f"candidate_len={len(best)}")
 
     def note_closed(self, s, reason: str) -> None:
-        """Remember a closed conversation for _lost_diagnostic (see self.closed)."""
+        """Remember a closed conversation for _lost_diagnostic (see self.closed) and, for a run's, the live tree."""
         compaction_prune.shadow_decide_async(str(s.id))     # background thread; no-op unless the store is on
         hist = getattr(s, "history", None)
-        if hist:
-            with self._lock:
+        with self._lock:
+            if hist:
                 self.closed.append((time.time(), reason, hist[0], len(hist)))
+            self._note_ended_locked(s, reason)
+
+    def _note_ended_locked(self, s, reason: str) -> None:
+        """Under self._lock: keep a closed run conversation's metadata for the live view (self.ended). Never raises."""
+        try:
+            worker = getattr(s, "office_worker", None)
+            key = worker[0] if isinstance(worker, tuple) and worker else None
+            if isinstance(key, str) and key.startswith("r:"):      # only a run's conversations: nothing else is read
+                meta = self._conversation_meta(s)
+                self.ended.append({**meta, "busy": False, "awaiting_tool": False, "closed_at": time.time(),
+                                   "closed": reason})
+        except Exception:
+            logger.debug("ended conversation not recorded", exc_info=True)
+
+    def ended_conversations(self) -> list[dict[str, Any]]:
+        """The recently closed run conversations (self.ended), oldest first, for the live view's orchestrator tree."""
+        with self._lock:
+            return [dict(e) for e in self.ended]
 
     def failure(self, key: str | None, history: list | None = None,
                 scope: str | None = None) -> "FailedSession | None":
@@ -1470,22 +1531,35 @@ class Registry:
         for the client's tool results. Never history, system text, tools or paths."""
         with self._lock:
             sessions = list(self.sessions.values())
-        out = []
-        for s in sessions:
-            route = getattr(s, "route", None) or {}
-            rp = str(route.get("provider") or "claude-cli")
-            lock = getattr(s, "lock", None)
-            worker = getattr(s, "office_worker", None)
-            out.append({
-                "key": worker[0] if isinstance(worker, tuple) and worker and isinstance(worker[0], str) else None,
-                "ref": "c-" + hashlib.sha256(str(s.id).encode()).hexdigest()[:12],
-                "provider": office.provider_of(rp, local_lane.LANE_PREFIX),
-                "lane": rp if rp.startswith(local_lane.LANE_PREFIX) else (_route_lane(route) if route else None),
-                "model": route.get("model") or getattr(s, "model", None),
-                "opened_at": getattr(s, "opened_at", None), "last_used": getattr(s, "last_used", None),
-                "busy": bool(lock is not None and hasattr(lock, "locked") and lock.locked()),
-                "awaiting_tool": bool(getattr(s, "awaiting_tool_result", False))})
-        return out
+        return [self._conversation_meta(s) for s in sessions]
+
+    @staticmethod
+    def _conversation_meta(s) -> dict[str, Any]:
+        """One conversation's live-view metadata (live_conversations). Its tokens are the in-memory sum of its backend
+        turns (Handler._log_turn_tokens), None before the first recorded turn."""
+        route = getattr(s, "route", None) or {}
+        rp = str(route.get("provider") or "claude-cli")
+        lock = getattr(s, "lock", None)
+        worker = getattr(s, "office_worker", None)
+        tok = getattr(s, "live_tokens", None)
+        # The request's own Office tags (OfficeBoard.read_tags, already validated; live.py re-checks them): which
+        # session owns this conversation, without joining through the board's capped worker lists.
+        tags = worker[1] if isinstance(worker, tuple) and len(worker) > 1 and isinstance(worker[1], dict) else {}
+        return {
+            "key": worker[0] if isinstance(worker, tuple) and worker and isinstance(worker[0], str) else None,
+            "session": tags.get("session"), "project": tags.get("project"), "device": tags.get("device"),
+            "title": tags.get("title"),
+            # the x-cortados-origin this conversation's requests carried (office.note_origin): compared by the live
+            # view's heartbeat joins, never published
+            "origin": getattr(s, "office_origin", None),
+            "ref": "c-" + hashlib.sha256(str(s.id).encode()).hexdigest()[:12],
+            "provider": office.provider_of(rp, local_lane.LANE_PREFIX),
+            "lane": rp if rp.startswith(local_lane.LANE_PREFIX) else (_route_lane(route) if route else None),
+            "model": route.get("model") or getattr(s, "model", None),
+            "opened_at": getattr(s, "opened_at", None), "last_used": getattr(s, "last_used", None),
+            "busy": bool(lock is not None and hasattr(lock, "locked") and lock.locked()),
+            "awaiting_tool": bool(getattr(s, "awaiting_tool_result", False)),
+            "tokens": dict(tok) if isinstance(tok, dict) else None}
 
     def drop(self, s, reason: str = "dropped") -> None:
         self.note_closed(s, reason)
@@ -1510,6 +1584,7 @@ class Registry:
                         hist = getattr(s, "history", None)
                         if hist:
                             self.closed.append((time.time(), "reaped", hist[0], len(hist)))
+                        self._note_ended_locked(s, "reaped")
                 if expired:
                     compaction_prune.shadow_decide_async(str(s.id))   # background thread; no-op unless the store is on
                 if expired:
@@ -2017,6 +2092,22 @@ class Handler(BaseHTTPRequestHandler):
                 logger.warning("live: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: live view unavailable (see provider log)")
             return self._json(200, body, headers=VIEW_HEADERS)
+        if self.path.split("?")[0] == live.SESSION_PATH:
+            # One orchestrating session's own tree (live.session_view): the pulse pane. Owner token, live:read or the
+            # narrower live:session scope. ?session=<tag> is required: this endpoint never lists sessions, so a
+            # live:session token reads only a subtree whose tag it already holds (docs/PULSE-PER-SESSION.md).
+            if not self._owner_or_session("GET"):
+                return self._refuse_auth()
+            sess = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("session")
+            if not sess or len(sess) != 1 or live.valid_session(sess[0]) is None:
+                return self._error(400, "invalid_request_error",
+                                   "cortados: session is required and must be " + live.SESSION_FILTER_RULE)
+            try:
+                body = self.server.live_body(self.server.registry, sess[0], session_view=True)
+            except Exception as exc:
+                logger.warning("live: session view failed: %s", type(exc).__name__)
+                return self._error(500, "api_error", "cortados: live view unavailable (see provider log)")
+            return self._json(200, body, headers=VIEW_HEADERS)
         if self.path == "/health":
             return self._json(200, {"ok": True, "conversations": len(self.server.registry.sessions)})
         if self.path in ("/", "/dashboard"):
@@ -2104,6 +2195,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._authed, self._bridge = False, None
         self._office_tags = {}
+        self._office_origin = None
         path = self.path.split("?")[0]
         if self._scope_gate("POST"):
             return
@@ -2141,6 +2233,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, "invalid_request_error", _RUN_ID_BAD, w, reason=_RUN_ID_BAD)
             try:   # cosmetic: an invalid tag is dropped and counted inside, and a bug here never refuses the request
                 self._office_tags = self.server.registry.office.read_tags(self.headers)
+                self._office_origin = self.server.registry.office.read_origin(self.headers)
             except Exception as exc:
                 logger.warning("office: tag read failed: %s", type(exc).__name__)
             return self._messages(body, w)
@@ -3259,6 +3352,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             board = self.server.registry.office
             tags = getattr(self, "_office_tags", None) or {}
+            origin = getattr(self, "_office_origin", None)
+            # the conversation's provider-observed origin, before any early return (a side call carries it too)
+            session.office_origin = office.note_origin(getattr(session, "office_origin", None), origin)
             run_id, valid = self._run_id()
             run_id = run_id if valid else None
             # untagged, no run id: named by a digest of the conversation's id (the id itself is never published)
@@ -3271,7 +3367,7 @@ class Handler(BaseHTTPRequestHandler):
             rp = str(route.get("provider") or "claude-cli")       # no route: a fixed-model endpoint, the Claude CLI
             lane = rp if rp.startswith(local_lane.LANE_PREFIX) else (_route_lane(route) if route else None)
             board.turn_start(key, tags, run_id=run_id or conv, provider=office.provider_of(rp, local_lane.LANE_PREFIX),
-                             lane=lane, model=route.get("model") or getattr(session, "model", None))
+                             lane=lane, model=route.get("model") or getattr(session, "model", None), origin=origin)
             # Kept on the conversation so an unexpected backend exit (Registry._backend_exited), with no request left
             # to end the turn, can still end this worker on the board. A failure here is reported by the warning below.
             session.office_worker = (key, dict(tags))
@@ -3339,6 +3435,21 @@ class Handler(BaseHTTPRequestHandler):
         provider/work_split.py). Off the critical path like the outcome log: a slow SQLite write must not hold the
         session lock or delay the reply. Never raises; core.log_tokens counts a lost write in router_db."""
         reg = self.server.registry
+        if isinstance(usage, dict):
+            # the live view's in-memory totals (orchestrator tree): per conversation and per run id, also when router.db
+            # does not record tokens (fixed-model endpoint, local lane). Bookkeeping: never fails a turn.
+            try:
+                t = work_split.usage_tokens(usage)
+                acc = getattr(session, "live_tokens", None)
+                if not isinstance(acc, dict):
+                    acc = {}
+                    session.live_tokens = acc
+                work_split.add_tokens(acc, t)
+                run_id, valid = self._run_id()
+                if run_id and valid:
+                    reg.runs.add_tokens(run_id, t, origin=getattr(self, "_office_origin", None))
+            except Exception:
+                logger.debug("live token total not recorded", exc_info=True)
         route = getattr(session, "route", None)
         if not reg.log_tokens or not isinstance(route, dict) or not route.get("route_id") or not isinstance(usage, dict):
             return
@@ -3463,24 +3574,29 @@ class ProviderServer(ThreadingHTTPServer):
         """POST /v1/cortados/local/switch: set a node's switch through its gate (local_switch.switch). Tests replace it."""
         return local_switch.switch(node, on)
 
-    def live_body(self, registry: Registry, session: str | None = None) -> bytes:
+    def live_body(self, registry: Registry, session: str | None = None, session_view: bool = False) -> bytes:
         """The encoded live view, memoised live.MEMO_S with single flight (live.Memo): every dashboard tab and pulse
         pane polling at once costs one collect per view (the fleet, each ?session=). A heartbeat post (the board's
         generation) invalidates it. `session` must already be valid (live.valid_session)."""
         from cortados_router import paths
-        key = (str(paths.state_dir()), id(registry), registry.live.generation, session)
+        key = (str(paths.state_dir()), id(registry), registry.live.generation, session, session_view)
+        if session_view:                                # GET /v1/cortados/live/session: that session's subtree only
+            return self._live_memo.get(key, lambda: json.dumps(
+                live.session_view(self.live_view(registry, session, session_view=True), session),
+                allow_nan=False).encode())
         return self._live_memo.get(key, lambda: json.dumps(self.live_view(registry, session), allow_nan=False).encode())
 
-    def live_view(self, registry: Registry, session: str | None = None) -> dict[str, Any]:
+    def live_view(self, registry: Registry, session: str | None = None, session_view: bool = False) -> dict[str, Any]:
         """GET /v1/cortados/live (provider/live.py): composes the office board, the tasks and the live slice of the usage
         view, the child-task log (read once, 24 h) and the host heartbeats. Cache-only: no vendor CLI, no ssh. Tests
-        replace the inputs it calls (office_view's board, tasks_view, live_usage_view) or this method."""
+        replace the inputs it calls (office_view's board, tasks_view, live_usage_view) or this method. `session_view`
+        (GET /v1/cortados/live/session): no other session's task directory is peeked."""
         from cortados_router import child_tasks, exec_hosts, paths
         now = time.time()
         state = paths.state_dir()
 
         def office_of(events):
-            return registry.office.view(events, now=now, errors=[])
+            return registry.office.view(events, now=now, errors=[], uncapped=True)
 
         def hosts():
             if not os.path.exists(exec_hosts.config_path()):
@@ -3495,8 +3611,13 @@ class ProviderServer(ThreadingHTTPServer):
             usage_view=lambda: self.live_usage_view(registry, now),
             heartbeats=lambda: registry.live.snapshot(now), backend_sessions=len(registry.sessions),
             peek=child_tasks.peek_local, exec_hosts=hosts, self_host=exec_hosts.short_hostname(),
-            remote_stubs=child_tasks.remote_stubs, lane_enabled=live.lane_enabled,
-            conversations=registry.live_conversations, session=session)
+            # the session endpoint never lists the task dirs: its stubs come from the origin index (remote_stubs_for)
+            remote_stubs=None if session_view else child_tasks.remote_stubs,
+            session_stubs=child_tasks.remote_stubs_for, lane_enabled=live.lane_enabled,
+            conversations=registry.live_conversations, ended_conversations=registry.ended_conversations,
+            run_tokens=registry.runs.tokens_by_run, run_origins=registry.runs.run_origins,
+            stubs_by_id=child_tasks.remote_stubs_by_id, binding_errors=registry.live.errors,
+            session=session, peek_foreign=not session_view)
 
     def live_usage_view(self, registry: Registry, now: float) -> dict[str, Any]:
         """Lanes, S1 and hardware for the live view (usage.collect_live): the same sources usage_view reads."""
