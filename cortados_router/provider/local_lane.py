@@ -459,9 +459,14 @@ def _node_body(body: dict[str, Any], model: dict[str, Any]) -> dict[str, Any]:
     """The request as the node gets it: `model` rewritten to the node's tag and, under off-unless-asked, thinking
     turned off when the client did not ask for it (a missing field, or one of another shape). An index-routed think
     variant (`variant_thinking` "on") the client did not ask to think is sent thinking enabled with think_budget, or
-    disabled when this turn's max_tokens leaves no room for it; a client's own `thinking` always passes through."""
+    disabled when this turn's max_tokens leaves no room for it; a client's own `thinking` passes through, except on a
+    sensitive route that found no variant for it (routing.choose_variant: thinking asked with max_tokens below
+    THINK_MIN_MAX_TOKENS), whose model carries `thinking_forced_off` and is sent thinking disabled."""
     out = dict(body)
     out["model"] = model["id"]
+    if model.get("thinking_forced_off"):
+        out["thinking"] = {"type": "disabled"}
+        return out
     if client_asked_thinking(body):
         return out
     if model.get("variant_thinking") == "on":
@@ -790,7 +795,7 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
     # no text or tool_use, is answered with an error naming the cause instead of a silent empty answer. Not retried:
     # thinking was already asked off (or the model is set to passthrough), so the same request would fail the same
     # way. A pinned model (the person's choice) and a client that asked for thinking get the reply as the node sent it.
-    guard = auto_routed and not client_asked_thinking(body)
+    guard = auto_routed and (not client_asked_thinking(body) or bool(model.get("thinking_forced_off")))
     conn = _connection(node["base_url"], node["connect_timeout_s"])
     try:
         try:

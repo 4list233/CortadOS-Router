@@ -108,6 +108,14 @@ class VariantChoiceTests(IndexBase):
         self.logged.clear()
         self.assertS1Route(self.route(10.0, max_tokens=1024, extra=asked))
 
+    def test_reviewers_repro_on_the_index_route_falls_back_to_s1_cloud_route(self):
+        # Thinking asked with max_tokens 2048: neither variant qualifies, so the ordinary index route keeps S1's
+        # cloud route (no forced-off local serve: that is for sensitive routes only).
+        repro = {"thinking": {"type": "enabled", "budget_tokens": 1900}}
+        for req in (0.0, 10.0, 30.0):
+            self.assertS1Route(self.route(req, max_tokens=2048, band="R0" if req == 0.0 else "R1", extra=repro))
+        self.assertEqual(self.probes, [])
+
     def test_r0_requirement_zero_takes_the_non_thinking_variant(self):
         self.assertEqual(self.route(0.0, band="R0")["local"]["model"]["variant"], "qwen-27b")
 
@@ -363,6 +371,49 @@ class SensitiveVariantTests(SensitiveBase):
         self.assertEqual(moved["bind_reason"], "refusal")
         self.assertEqual(self.variant(moved), ("qwen-27b-think", "on"))
         self.assertEqual(sent[0]["thinking"], {"type": "enabled", "budget_tokens": 4096})
+
+    # Review P2: thinking asked with max_tokens < 4096 rejects both variants; the reviewer's repro went out with the
+    # client's thinking unchanged (1900 of 2048 tokens, 148 left for the answer).
+    REPRO = {"max_tokens": 2048, "thinking": {"type": "enabled", "budget_tokens": 1900}}
+    FORCED = "thinking requested but max_tokens < 4096: served without thinking"
+
+    def assertForcedOff(self, r, b, sent=None):
+        self.assertEqual(self.variant(r), ("qwen-27b", "off"))
+        self.assertTrue(r["local"]["model"]["thinking_forced_off"])
+        (_, _, _, route), = self.logged
+        self.assertEqual(route["chosen"]["variant_why"], self.FORCED)
+        self.assertTrue(route["chosen"]["thinking_forced_off"])
+        out = sent if sent is not None else local_lane._node_body(b, r["local"]["model"])
+        self.assertEqual(out["thinking"], {"type": "disabled"})
+        self.assertEqual(out["max_tokens"], 2048)
+
+    def test_flag_with_thinking_asked_and_no_room_is_served_without_thinking(self):
+        self.scored(10.0)
+        b = body("hello", **self.REPRO)
+        r = self.choose(b, local="sensitive")
+        self.assertLocal(r, "sensitive: flag")
+        self.assertForcedOff(r, b)
+
+    def test_refusal_with_thinking_asked_and_no_room_is_served_without_thinking(self):
+        self.scored(10.0)
+        b = body("hello", **self.REPRO)
+        r = self.choose(b)
+        sent = []
+        moved = routing.refusal_route(core, b, r, lambda m: sent.append(local_lane._node_body(b, m["local"]["model"]))
+                                      or True)
+        self.assertEqual(moved["bind_reason"], "refusal")
+        self.assertForcedOff(moved, b, sent[0])
+
+    def test_thinking_asked_and_no_room_with_only_a_think_variant_still_goes_out_without_thinking(self):
+        self.scored(10.0)
+        core.model_scores = lambda: {"models": [], "local_models": [THINK]}
+        b = body("hello", **self.REPRO)
+        r = self.choose(b, local="sensitive")
+        self.assertLocal(r, "sensitive: flag")
+        self.assertNotIn("variant", r["local"]["model"])
+        (_, _, _, route), = self.logged
+        self.assertEqual(route["chosen"]["variant_why"], self.FORCED)
+        self.assertEqual(local_lane._node_body(b, r["local"]["model"])["thinking"], {"type": "disabled"})
 
     def test_passthrough_entry_or_no_variants_keeps_the_model_unvaried(self):
         self.scored(10.0)

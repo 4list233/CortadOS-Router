@@ -308,7 +308,9 @@ print(json.dumps({"syn": syn, "easy": real("rename the variable in utils.py", 64
 # sensitive_local / refusal_route on the REAL generated scores. An R3 route (above both variants' index) flagged
 # sensitive runs local on the strongest eligible variant: qwen-27b-think with max_tokens 8192, qwen-27b with 1024 (no
 # room to think); one the non-thinking variant clears takes qwen-27b; the refusal fallback chooses the same way and its
-# node body carries the variant's thinking. S1-free (synthetic S1-shaped routes); faked probe, throwaway config.
+# node body carries the variant's thinking. Review P2: the reviewer's repro (thinking asked, budget 1900, max_tokens 2048)
+# qualifies for neither variant, yet a sensitive route must stay local: flag and refusal both serve qwen-27b with
+# thinking disabled and record why, never the client's thinking unchanged. S1-free (synthetic S1-shaped routes); faked probe, throwaway config.
 SENSITIVE_VARIANT_SCENARIO = """
 import json, os, tempfile
 from cortados_router import core
@@ -339,7 +341,21 @@ routing._auto_down.clear()
 marked = routing.sensitive_local(core, b(8192), r(99.0), client="verify", conversation_id="verify-sv")
 sent = []
 mv = routing.refusal_route(core, b(8192), marked, lambda m: sent.append(local_lane._node_body(b(8192), m["local"]["model"])) or True)
-print(json.dumps({"idx": idx, "high_8192": flag(99.0, 8192), "high_1024": flag(99.0, 1024),
+ask = {"model": "cortados", "max_tokens": 2048, "thinking": {"type": "enabled", "budget_tokens": 1900},
+       "messages": [{"role": "user", "content": "x"}]}
+def forced(m, out):
+    lm = (m or {}).get("local", {}).get("model") or {}
+    return [(m or {}).get("provider"), lm.get("variant"), out.get("thinking") if out else None,
+            (m or {}).get("route", {}).get("chosen", {}).get("variant_why")]
+routing._auto_down.clear()
+fm = routing.sensitive_local(core, ask, r(10.0), client="verify", conversation_id="verify-sv", local="sensitive")
+asked_flag = forced(fm, local_lane._node_body(ask, fm["local"]["model"]) if fm.get("local") else None)
+routing._auto_down.clear()
+marked2 = routing.sensitive_local(core, ask, r(10.0), client="verify", conversation_id="verify-sv")
+sent2 = []
+mv2 = routing.refusal_route(core, ask, marked2, lambda m: sent2.append(local_lane._node_body(ask, m["local"]["model"])) or True)
+asked_refusal = forced(mv2, sent2[0] if sent2 else None)
+print(json.dumps({"asked_flag": asked_flag, "asked_refusal": asked_refusal, "idx": idx, "high_8192": flag(99.0, 8192), "high_1024": flag(99.0, 1024),
                   "clears_non": flag(idx["qwen-27b"], 32000),
                   "refusal": [(mv or {}).get("provider"), ((mv or {}).get("local") or {}).get("model", {}).get("variant"),
                               sent[0].get("thinking") if sent else None]}))
@@ -588,9 +604,12 @@ def main():
         off = {"type": "disabled"}
         ok = (r["high_8192"] == ["local-pro", "qwen-27b-think", on] and r["high_1024"] == ["local-pro", "qwen-27b", off]
               and r["clears_non"] == ["local-pro", "qwen-27b", off] and r["refusal"] == ["local-pro", "qwen-27b-think", on])
+        why = "thinking requested but max_tokens < 4096: served without thinking"
+        ok = ok and r["asked_flag"] == r["asked_refusal"] == ["local-pro", "qwen-27b", off, why]
         record("sensitive route picks the published-index variant (S1-free)", "PASS" if ok else "FAIL",
                f"code index {r['idx']} | R3 flag 8192 -> {r['high_8192']} | 1024 -> {r['high_1024']} | "
-               f"req {r['idx'].get('qwen-27b')} -> {r['clears_non']} | refusal 8192 -> {r['refusal']}")
+               f"req {r['idx'].get('qwen-27b')} -> {r['clears_non']} | refusal 8192 -> {r['refusal']} | "
+               f"thinking asked 2048: flag -> {r['asked_flag'][:3]}, refusal -> {r['asked_refusal'][:3]}")
 
     p = runner.run(["-c", CONTINUATION_SCENARIO], prefix="verify-router-continuation-", timeout=300)
     try:
