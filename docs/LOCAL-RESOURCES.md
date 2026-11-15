@@ -593,7 +593,10 @@ gate's client-facing routes do not grow. On `POST /v1/messages` to vllm-mlx the 
   value, is a `400 invalid_request_error` with `x-should-retry: false`. vllm-mlx 0.6.0 merges these kwargs into the
   template call (`engine/batched.py` `_apply_chat_template`: `template_kwargs.update(chat_template_kwargs)`), so a
   client could replace the template itself: `{"chat_template": "{{ 'a!' * 50000 }}"}` is a 155-byte body that renders
-  a 100k-token prompt, which no bound read from the body can see;
+  a 100k-token prompt, which no bound read from the body can see. The server's own default
+  (`vllm_mlx.serve.default_chat_template_kwargs`, emitted as `--default-chat-template-kwargs`) reaches the same
+  template call, so it is held to the same allowlist: `local_backend.check()` refuses the config and `serve_argv()`
+  re-checks before it emits the flag (round 6);
 - refuses a body nested too deeply to parse or re-encode (Python's recursion limit, ~1,000 levels) with the same
   structured 400, instead of an uncaught `RecursionError` that dropped the connection;
 - rewraps FastAPI's `{"detail": …}` errors in Anthropic's error shape. The backend prompt guard's refusal (below)
@@ -769,13 +772,22 @@ LaunchAgent runs `<venv>/bin/python <venv>/bin/cortados-vllm-mlx-guard.py --cont
 -- serve <model> …` (`local_backend.serve_argv`). The guard installs itself and hands over to vllm-mlx's own CLI
 (`vllm_mlx.cli.main`); it loads no model itself. It runs in the MLX venv, so the router package's stdlib-only rule
 does not apply to it (it imports `vllm_mlx` and `fastapi` from there). It is pinned: `vllm_mlx.__version__` must be
-`0.6.0` and `scheduler.py`, `engine_core.py` and `engine/batched.py` must match the sha256 of the PyPI wheel
+`0.6.0` and `scheduler.py`, `engine_core.py`, `engine/batched.py` and the engine dispatch (`cli.py`, `server.py`,
+`model_registry.py`, `engine/__init__.py`, `engine/base.py`) must match the sha256 of the PyPI wheel
 `vllm_mlx-0.6.0-py3-none-any.whl` (`a5e5a52a…f062`). Anything else stops startup, so a new vllm-mlx gets this argument
 re-read before it serves. The multimodal route (`MLLMScheduler`) tokenizes for generation inside mlx_vlm's
 `prepare_inputs`, which the guard cannot count the same way, so it is refused: the guard stops startup if vllm-mlx
 resolves the model to the MLLM route, and `MLLMScheduler.add_request` refuses every request. The install script runs
 `--check <model dir>` (pins and route; serves nothing) before it writes the plist, so a model that would take the MLLM
-route is reported at install time and nothing is installed. Tests use a fake `vllm_mlx` package
+route is reported at install time and nothing is installed.
+
+Only the batched engine is guarded, so only it may serve (round 6). vllm-mlx 0.6.0 picks `BatchedEngine` (its text
+route is `AsyncEngineCore` → `Scheduler.add_request`) when served with `--continuous-batching`, and `SimpleEngine`
+(mlx-lm directly, no scheduler, no cap) otherwise. Pins on the files that choose do not prove the choice, so the guard
+enforces it at runtime: `serve` without the exact `--continuous-batching` flag is refused before vllm-mlx starts;
+`BaseEngine.__new__` admits only `BatchedEngine` itself, so building `SimpleEngine` (or any other engine) raises and
+the server exits at startup; every other engine's `start`/`generate`/`stream_generate`/`chat`/`stream_chat` raises; and
+a `BaseEngine` subclass defined after install is refused at class creation. Tests use a fake `vllm_mlx` package
 (`tests/test_vllm_mlx_guard.py`).
 
 What the client sees. A non-streamed turn gets vllm-mlx's 413 `{"detail": …}`, which the gate answers as its own
@@ -783,7 +795,11 @@ never-fits refusal (`413 request_too_large`, `x-should-retry: false`, message `l
 memory (cortados guard: …)`), so the provider routes the turn elsewhere as for any never-fits turn. A streamed turn
 has already received `message_start` from vllm-mlx before the scheduler is reached. It ends with an Anthropic `error`
 event carrying the guard's text, then `message_stop`, and is not rerouted. Either way nothing ran on the node. Only a
-turn whose real prompt + max_tokens exceeds 131k tokens gets this.
+turn whose real prompt + max_tokens exceeds 131k tokens gets this. A pre-stream refusal (a clean 413 for streamed
+turns too) was considered in round 6 and not taken: vllm-mlx renders the template inside `BatchedEngine.stream_chat`,
+which `server._stream_anthropic_messages` calls lazily inside the `StreamingResponse`, so a check before the response
+would render and tokenize the whole prompt a second time on the event loop, and its ids could not be reused without
+also patching `stream_chat`, `stream_generate` and `AsyncEngineCore`.
 
 Keep the two numbers in step. The gate's cap and the guard's come from the same config value (`context_tokens`). After
 lowering it, reinstall the backend (`install_mlx_backend.sh`) **before** restarting the gate; after raising it,

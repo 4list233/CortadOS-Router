@@ -410,6 +410,30 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(local_backend.BackendConfigError):
             local_backend.load(str(Path(self.dir) / "missing.json"))
 
+    def test_round5_server_default_template_kwargs_are_held_to_the_request_allowlist(self):
+        # The round 5 review's repro: the server default reaches the same template call as a request's kwargs, so a
+        # `chat_template` there rendered ~100k tokens for a minimal request the gate reserved ~1.1k for.
+        for bad in ({"chat_template": "{{ 'a!' * 50000 }}"}, {"enable_thinking": False, "tools": []},
+                    {"enable_thinking": "false"}, ["enable_thinking"], "x"):
+            with self.subTest(bad):
+                self.example["vllm_mlx"]["serve"]["default_chat_template_kwargs"] = bad
+                with self.assertRaises(local_backend.BackendConfigError) as cm:
+                    local_backend.load(self.write(self.example))
+                self.assertIn("vllm_mlx.serve.default_chat_template_kwargs", str(cm.exception))
+        # serve_argv re-checks a cfg that did not come through check(), and never emits the flag for it
+        c = local_backend.load(str(EXAMPLE))
+        argv = local_backend.serve_argv(c)
+        self.assertEqual(argv[argv.index("--default-chat-template-kwargs") + 1], '{"enable_thinking": false}')
+        c["serve"] = {**c["serve"], "default_chat_template_kwargs": {"chat_template": "{{ 'a!' * 50000 }}"}}
+        with self.assertRaises(local_backend.BackendConfigError):
+            local_backend.serve_argv(c)
+        with self.assertRaises(local_backend.BackendConfigError):
+            local_backend.launch_agent_plist(c, self.dir)
+        for none in ({}, None):                                               # no default: no flag
+            self.example["vllm_mlx"]["serve"]["default_chat_template_kwargs"] = none
+            argv = local_backend.serve_argv(local_backend.load(self.write(self.example)))
+            self.assertNotIn("--default-chat-template-kwargs", argv)
+
     def test_model_path_is_config_and_a_six_bit_copy_is_a_config_change(self):
         self.example["vllm_mlx"]["model"] = "qwen-27b-6bit"
         self.example["vllm_mlx"]["models"]["qwen-27b-6bit"]["path"] = "/models/q6"

@@ -72,8 +72,74 @@ FAKE = {
                 self.waiting.append(request)
         '''),
     "vllm_mlx/engine_core.py": "# engine_core\n",
-    "vllm_mlx/engine/__init__.py": "",
-    "vllm_mlx/engine/batched.py": "# batched\n",
+    # The engines, as in 0.6.0: BatchedEngine's text route reaches Scheduler.add_request; SimpleEngine never does.
+    "vllm_mlx/engine/__init__.py": "from .base import BaseEngine\n",
+    "vllm_mlx/engine/base.py": textwrap.dedent('''
+        from abc import ABC, abstractmethod
+
+        class BaseEngine(ABC):
+            @abstractmethod
+            async def start(self): ...
+            @abstractmethod
+            async def generate(self, prompt, max_tokens=256): ...
+            @abstractmethod
+            async def stream_generate(self, prompt, max_tokens=256): ...
+            @abstractmethod
+            async def chat(self, messages, max_tokens=256): ...
+            @abstractmethod
+            async def stream_chat(self, messages, max_tokens=256): ...
+        '''),
+    "vllm_mlx/engine/batched.py": textwrap.dedent('''
+        from vllm_mlx.engine.base import BaseEngine
+        from vllm_mlx.request import Request, SamplingParams
+        from vllm_mlx.scheduler import Scheduler
+
+        class BatchedEngine(BaseEngine):
+            def __init__(self, model_name, scheduler_config=None):
+                self.model_name, self.scheduler = model_name, Scheduler()
+            async def start(self):
+                return None
+            async def generate(self, prompt, max_tokens=256):
+                self.scheduler.add_request(Request("g", prompt, SamplingParams(max_tokens)))
+                return "batched"
+            async def stream_generate(self, prompt, max_tokens=256):
+                yield await self.generate(prompt, max_tokens)
+            async def chat(self, messages, max_tokens=256):
+                return await self.generate(messages[-1]["content"], max_tokens)
+            async def stream_chat(self, messages, max_tokens=256):
+                yield await self.chat(messages, max_tokens)
+        '''),
+    "vllm_mlx/engine/simple.py": textwrap.dedent('''
+        from vllm_mlx.engine.base import BaseEngine
+
+        class SimpleEngine(BaseEngine):
+            """Generates through mlx-lm directly: no scheduler, so no cap."""
+            GENERATED = []
+            def __init__(self, model_name, **kw):
+                self.model_name = model_name
+            async def start(self):
+                return None
+            async def generate(self, prompt, max_tokens=256):
+                SimpleEngine.GENERATED.append(prompt)
+                return "simple"
+            async def stream_generate(self, prompt, max_tokens=256):
+                yield await self.generate(prompt, max_tokens)
+            async def chat(self, messages, max_tokens=256):
+                return await self.generate(messages[-1]["content"], max_tokens)
+            async def stream_chat(self, messages, max_tokens=256):
+                yield await self.chat(messages, max_tokens)
+        '''),
+    "vllm_mlx/server.py": textwrap.dedent('''
+        from vllm_mlx.engine.base import BaseEngine
+        from vllm_mlx.engine.batched import BatchedEngine
+        from vllm_mlx.engine.simple import SimpleEngine
+        _engine = None
+        def load_model(model_name, use_batching=False, scheduler_config=None):
+            global _engine
+            _engine = BatchedEngine(model_name, scheduler_config) if use_batching else SimpleEngine(model_name)
+            return _engine
+        '''),
+    "vllm_mlx/model_registry.py": "# model_registry\n",
     "vllm_mlx/mllm_scheduler.py": textwrap.dedent('''
         class MLLMScheduler:
             def add_request(self, prompt, **kw):
@@ -92,9 +158,11 @@ FAKE = {
         import sys
         CALLS = []
         def main():
+            from vllm_mlx import server
             from vllm_mlx.api.utils import resolve_mllm_route
             CALLS.append(list(sys.argv))
             resolve_mllm_route(sys.argv[2], sys.argv[2])
+            server.load_model(sys.argv[2], use_batching="--continuous-batching" in sys.argv)
         '''),
     "fastapi/__init__.py": textwrap.dedent('''
         class HTTPException(Exception):
@@ -103,7 +171,9 @@ FAKE = {
                 self.status_code, self.detail = status_code, detail
         '''),
 }
-PINNED_FILES = ("scheduler.py", "engine_core.py", "engine/batched.py")
+PINNED_FILES = ("scheduler.py", "engine_core.py", "engine/batched.py", "cli.py", "server.py", "model_registry.py",
+                "engine/__init__.py", "engine/base.py")
+SERVE = ["--context-tokens", "131072", "--", "serve", "/models/text", "--continuous-batching"]
 
 
 class GuardBase(unittest.TestCase):
@@ -132,11 +202,23 @@ class GuardBase(unittest.TestCase):
             if name.split(".")[0] in ("vllm_mlx", "fastapi"):
                 del sys.modules[name]
 
+    def repin(self):
+        self.pins.update({rel: hashlib.sha256((Path(self.dir) / "vllm_mlx" / rel).read_bytes()).hexdigest()
+                          for rel in PINNED_FILES})
+
+    def run_main(self, argv):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = self.guard.main(argv)
+        return rc, err.getvalue()
+
     def installed(self, context=131072):
         import fastapi
         from vllm_mlx import mllm_scheduler, scheduler
         from vllm_mlx.api import utils
-        self.guard.install(context, scheduler.Scheduler, mllm_scheduler.MLLMScheduler, utils, fastapi.HTTPException)
+        from vllm_mlx.engine import base, batched, simple  # noqa: F401
+        self.guard.install(context, scheduler.Scheduler, mllm_scheduler.MLLMScheduler, utils, fastapi.HTTPException,
+                           base.BaseEngine, batched.BatchedEngine)
         return scheduler
 
     def request(self, prompt, max_tokens, rid="r1"):
@@ -210,31 +292,33 @@ class GuardCapTests(GuardBase):
 
 
 class GuardStartupTests(GuardBase):
-    def run_main(self, argv):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-            rc = self.guard.main(argv)
-        return rc, err.getvalue()
 
     def test_serve_hands_over_to_vllm_mlx_with_the_guard_installed(self):
-        rc, err = self.run_main(["--context-tokens", "131072", "--", "serve", "/models/text", "--port", "8000"])
-        from vllm_mlx import cli, scheduler
+        rc, err = self.run_main(SERVE + ["--port", "8000"])
+        from vllm_mlx import cli, scheduler, server
+        from vllm_mlx.engine.batched import BatchedEngine
         self.assertEqual(rc, 0)
-        self.assertEqual(cli.CALLS, [["vllm-mlx", "serve", "/models/text", "--port", "8000"]])
+        self.assertEqual(cli.CALLS, [["vllm-mlx", "serve", "/models/text", "--continuous-batching", "--port", "8000"]])
         self.assertTrue(scheduler.Scheduler.add_request.__cortados_guard__)
+        self.assertIs(type(server._engine), BatchedEngine)
         self.assertIn("capped at 131072", err)
 
     def test_another_version_or_changed_files_stop_startup(self):
         from vllm_mlx import scheduler
         with patch.object(sys.modules["vllm_mlx"], "__version__", "0.6.1"):
-            rc, err = self.run_main(["--context-tokens", "131072", "--", "serve", "/models/text"])
+            rc, err = self.run_main(SERVE)
         self.assertEqual(rc, 2)
         self.assertIn("0.6.1 is not 0.6.0", err)
         self.assertFalse(hasattr(scheduler.Scheduler.add_request, "__cortados_guard__"))
-        Path(self.dir, "vllm_mlx", "scheduler.py").write_text(FAKE["vllm_mlx/scheduler.py"] + "# patched\n")
-        rc, err = self.run_main(["--context-tokens", "131072", "--", "serve", "/models/text"])
-        self.assertEqual(rc, 2)
-        self.assertIn("scheduler.py differs", err)
+        for rel in PINNED_FILES:
+            with self.subTest(rel):
+                path = Path(self.dir, "vllm_mlx", *rel.split("/"))
+                text = path.read_text()
+                path.write_text(text + "# patched\n")
+                rc, err = self.run_main(SERVE)
+                path.write_text(text)
+                self.assertEqual(rc, 2)
+                self.assertIn(f"{rel} differs", err)
 
     def test_the_real_pins_are_the_060_wheel(self):
         real = load_guard()
@@ -250,14 +334,77 @@ class GuardStartupTests(GuardBase):
         self.assertIn("MLLM route", err)
         self.assertEqual(self.run_main(["--check", "/models/text"])[0], 0)
         with self.assertRaises(SystemExit):                            # and serving it never starts
-            self.run_main(["--context-tokens", "131072", "--", "serve", "/models/vl"])
+            self.run_main(["--context-tokens", "131072", "--", "serve", "/models/vl", "--continuous-batching"])
 
     def test_bad_command_lines_are_refused(self):
         for argv in ([], ["serve", "/m"], ["--context-tokens", "x", "--", "serve", "/m"],
                      ["--context-tokens", "131072", "--", "bench"], ["--check"],
-                     ["--context-tokens", "0", "--", "serve", "/m"]):
+                     ["--context-tokens", "0", "--", "serve", "/m", "--continuous-batching"],
+                     ["--context-tokens", "131072", "--", "serve", "/m"]):
             with self.subTest(argv):
                 self.assertEqual(self.run_main(argv)[0], 2)
+
+
+class GuardEngineTests(GuardBase):
+    """Round 5 review: only BatchedEngine reaches Scheduler.add_request, so any other engine is refused at runtime,
+    whatever the dispatch files say."""
+
+    def test_round5_repro_cli_selecting_simple_engine_stops_startup_even_with_matching_pins(self):
+        # The review's mutation: cli.py's `use_batching=args.continuous_batching` becomes False. Re-pinned, so the
+        # pins match and only the runtime refusal stands between it and an uncapped SimpleEngine.
+        cli = Path(self.dir, "vllm_mlx", "cli.py")
+        cli.write_text(FAKE["vllm_mlx/cli.py"].replace('use_batching="--continuous-batching" in sys.argv',
+                                                       "use_batching=False"))
+        self.repin()
+        with self.assertRaises(self.guard.UnguardedEngine) as cm:
+            self.run_main(SERVE)
+        self.assertIn("refused SimpleEngine", str(cm.exception))
+        from vllm_mlx import server
+        self.assertIsNone(server._engine)
+
+    def test_serve_without_continuous_batching_is_refused_before_vllm_mlx_starts(self):
+        rc, err = self.run_main(["--context-tokens", "131072", "--", "serve", "/models/text"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--continuous-batching", err)
+        from vllm_mlx import cli
+        self.assertEqual(cli.CALLS, [])
+
+    def test_only_batched_engine_is_built_and_other_engines_never_generate(self):
+        import asyncio
+        self.installed(context=10)
+        from vllm_mlx.engine.base import BaseEngine
+        from vllm_mlx.engine.batched import BatchedEngine
+        from vllm_mlx.engine.simple import SimpleEngine
+        e = BatchedEngine("m")
+        self.assertEqual(asyncio.run(e.generate("abc", 5)), "batched")      # the guarded route still serves
+        import fastapi
+        with self.assertRaises(fastapi.HTTPException):                       # and is capped
+            asyncio.run(e.generate("abcdef", 5))
+        with self.assertRaises(self.guard.UnguardedEngine):
+            SimpleEngine("m")
+        # An instance made without __new__ still cannot start or generate (each method raises when called).
+        s = object.__new__(SimpleEngine)
+        for name in self.guard.ENGINE_METHODS:
+            with self.subTest(name), self.assertRaises(self.guard.UnguardedEngine):
+                getattr(s, name)("x")
+        self.assertEqual(SimpleEngine.GENERATED, [])
+        with self.assertRaises(self.guard.UnguardedEngine):                  # a new engine class, or a subclass
+            type("OtherEngine", (BaseEngine,), {})
+        with self.assertRaises(self.guard.UnguardedEngine):
+            type("TweakedBatched", (BatchedEngine,), {})
+        with self.assertRaises(self.guard.GuardError):                        # installed once
+            self.guard.refuse_other_engines(BaseEngine, BatchedEngine)
+
+    def test_an_engine_with_its_own_new_stops_install(self):
+        from vllm_mlx.engine import base
+        from vllm_mlx.engine.batched import BatchedEngine
+        sneaky = type("SneakyEngine", (base.BaseEngine,), {"__new__": lambda cls, *a, **k: object.__new__(cls)})
+        self.addCleanup(lambda: sneaky)                                      # keep it alive (__subclasses__ is weak)
+        with self.assertRaises(self.guard.GuardError):
+            self.guard.refuse_other_engines(base.BaseEngine, BatchedEngine)
+        rc, err = self.run_main(["--check", "/models/text"])                # install_mlx_backend.sh sees it first
+        self.assertEqual(rc, 2)
+        self.assertIn("SneakyEngine defines __new__", err)
 
 
 class ServeArgvTests(unittest.TestCase):

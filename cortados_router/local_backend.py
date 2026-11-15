@@ -61,6 +61,8 @@ GUARD_REFUSAL = "cortados guard: prompt too long for this node's context"
 # The chat_template_kwargs a request may carry to vllm-mlx, with the type each must have. Only what routing needs:
 # enable_thinking, which the gate also sets from Anthropic's `thinking`. Anything else could change what the template
 # renders (chat_template, tools, add_generation_prompt, ...) beyond what the input bound reads from the body.
+# The server's own default (vllm_mlx.serve.default_chat_template_kwargs → --default-chat-template-kwargs) is merged
+# into the same template call, so it is held to the same allowlist (check() and serve_argv()).
 ALLOWED_TEMPLATE_KWARGS: dict[str, type] = {"enable_thinking": bool}
 # vllm-mlx serve settings the example sets, and why (each becomes a CLI flag in serve_argv):
 SERVE_DEFAULTS: dict[str, Any] = {
@@ -99,6 +101,34 @@ EXTRA_ARGS_ALLOWED: dict[str, bool] = {
 
 class BackendConfigError(ValueError):
     pass
+
+
+def template_kwargs_problem(kwargs: Any) -> str | None:
+    """Why these chat_template_kwargs may not reach vllm-mlx's template call (ALLOWED_TEMPLATE_KWARGS), or None."""
+    if not isinstance(kwargs, dict):
+        return "chat_template_kwargs must be an object"
+    for key, value in kwargs.items():
+        kind = ALLOWED_TEMPLATE_KWARGS.get(key)
+        if kind is None:
+            shown = key if isinstance(key, str) and key.isidentifier() and len(key) <= 40 else "a key"
+            return (f"chat_template_kwargs: {shown} is not allowed (allowed: "
+                    f"{', '.join(sorted(ALLOWED_TEMPLATE_KWARGS))})")
+        if type(value) is not kind:
+            return f"chat_template_kwargs: {key} must be a {kind.__name__}"
+    return None
+
+
+def check_default_template_kwargs(value: Any) -> dict[str, Any]:
+    """vllm_mlx.serve.default_chat_template_kwargs, held to the request allowlist: vllm-mlx merges the server default
+    into every template call, so a `chat_template` here would render prompts no bound read from the body can see
+    (BackendConfigError naming the problem). None or {} is no default."""
+    if value is None:
+        return {}
+    why = template_kwargs_problem(value)
+    if why is not None:
+        raise BackendConfigError(f"vllm_mlx.serve.default_{why} (the server default reaches the same template call "
+                                 "as a request's, so it has the same allowlist)")
+    return dict(value)
 
 
 def check_extra_args(extra: Any) -> list[str]:
@@ -193,6 +223,7 @@ def check(raw: Any, path: str | None = None) -> dict[str, Any]:
             raise BackendConfigError("vllm_mlx.serve.host must be loopback: the gate is the only door to the backend")
         if isinstance(serve["port"], bool) or not isinstance(serve["port"], int) or not 0 < serve["port"] < 65536:
             raise BackendConfigError("vllm_mlx.serve.port must be a TCP port")
+        serve["default_chat_template_kwargs"] = check_default_template_kwargs(serve["default_chat_template_kwargs"])
         venv = section.get("venv")
         if not isinstance(venv, str) or not venv.strip():
             raise BackendConfigError("vllm_mlx.venv must name the venv holding vllm-mlx")
@@ -268,17 +299,11 @@ def adapt_messages_body(cfg: dict[str, Any], raw: bytes) -> bytes:
     body["model"] = served
     thinking = body.get("thinking")
     kwargs = body.get("chat_template_kwargs")
-    if kwargs is not None and not isinstance(kwargs, dict):
-        raise Refusal(400, "invalid_request_error", "chat_template_kwargs must be an object")
-    kwargs = dict(kwargs or {})
-    for key, value in kwargs.items():
-        kind = ALLOWED_TEMPLATE_KWARGS.get(key)
-        if kind is None:
-            shown = key if key.isidentifier() and len(key) <= 40 else "a key"
-            raise Refusal(400, "invalid_request_error", f"chat_template_kwargs: {shown} is not allowed (allowed: "
-                                                        f"{', '.join(sorted(ALLOWED_TEMPLATE_KWARGS))})")
-        if type(value) is not kind:
-            raise Refusal(400, "invalid_request_error", f"chat_template_kwargs: {key} must be a {kind.__name__}")
+    kwargs = {} if kwargs is None else kwargs
+    why = template_kwargs_problem(kwargs)
+    if why is not None:
+        raise Refusal(400, "invalid_request_error", why)
+    kwargs = dict(kwargs)
     if isinstance(thinking, dict) and "enable_thinking" not in kwargs:
         kwargs["enable_thinking"] = thinking.get("type") != "disabled"
     if kwargs:
@@ -363,8 +388,10 @@ def serve_argv(cfg: dict[str, Any]) -> list[str]:
         argv += ["--enable-auto-tool-choice", "--tool-call-parser", str(s["tool_call_parser"])]
     if s["reasoning_parser"]:
         argv += ["--reasoning-parser", str(s["reasoning_parser"])]
-    if s["default_chat_template_kwargs"]:
-        argv += ["--default-chat-template-kwargs", json.dumps(s["default_chat_template_kwargs"])]
+    # Re-checked here (as extra_args below): a cfg built without check() must not slip a template past the allowlist.
+    defaults = check_default_template_kwargs(s.get("default_chat_template_kwargs"))
+    if defaults:
+        argv += ["--default-chat-template-kwargs", json.dumps(defaults)]
     # Re-checked here too: a cfg built without check() must not slip an override past the allowlist.
     return argv + check_extra_args(list(cfg.get("extra_args") or []))
 
