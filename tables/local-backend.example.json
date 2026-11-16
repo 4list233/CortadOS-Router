@@ -19,6 +19,35 @@
     "context_tokens": 131072,
     "_comment": "Measured 2026-11-14 on the Pro: peak aggregate 87.9 tok/s at 8, 31 GB peak footprint (~8.5k-token prompts). weights_bytes 15 GiB. KV: 16 full-attention layers x K/V x 4 KV heads x head_dim 256 x fp16 = 65,536 bytes/token (a 128k context holds 8 GiB), plus ~0.15 GiB recurrent state per sequence; vllm-mlx keeps the KV cache unquantized."
    },
+   "qwen-27b-4bit-vision": {
+    "path": "~/models/mlx/Qwen3.8-27B-heretic-ara-4bit-vision",
+    "served_model_name": "Qwen27b_heretic:latest",
+    "idle_cap": 8,
+    "weights_bytes": 17716740096,
+    "kv_bytes_per_token": 65536,
+    "per_seq_state_bytes": 161061273,
+    "prefill_margin_bytes": 1610612736,
+    "context_tokens": 131072,
+    "vision": {
+     "max_images": 5,
+     "image_tokens_max": 1024,
+     "image_context_tokens": 65536,
+     "image_concurrency": 1,
+     "vision_margin_bytes": 2147483648,
+     "max_image_bytes": 5242880,
+     "max_image_pixels": 33554432,
+     "_reasons": {
+      "max_images": "Owner decision 2026-11-15/16: up to 5 still images per request.",
+      "image_tokens_max": "Each image at most 1,024 language-model tokens (~1 MP after the processor's resize: 16-pixel patches merged 2x2 are 1,024 pixels per token). The guard sets the processor's max_pixels to 1,048,576; upstream's 16.7 MP would be 16,384 tokens and 1 GiB of KV cache per image. 64 MiB of KV per image at 65,536 B/token.",
+      "image_context_tokens": "Image-bearing requests capped at 64k combined context (input + max_tokens) until measured; the guard refuses a longer one exactly after counting its image tokens.",
+      "image_concurrency": "One image-bearing request at a time until measured (vision encoding is the unmeasured peak); text turns still run beside it under the owner's count.",
+      "vision_margin_bytes": "Provisional 2 GiB per image-bearing sequence for the vision tower's activations and pixel tensors beside its KV cache.",
+      "max_image_bytes": "5 MiB decoded per image: the Anthropic API's own per-image limit, so a turn the cloud takes fits here too.",
+      "max_image_pixels": "32 Mi decoded pixels per image from the file header, before anything is decoded (an 8K screenshot fits); PIL's bomb limit is set to the same."
+     }
+    },
+    "_comment": "PROVISIONAL until measured on the Pro (the production switch needs the owner's approval after measurements): the 4-bit language weights plus the BF16 vision tower (qwen3_5, Qwen3_5ForConditionalGeneration). weights_bytes = the 4-bit entry's 15 GiB + ~1.5 GiB assumed for the tower: replace with the measured resident size. The guard runs in vision mode for this entry (local_backend.vision_argv)."
+   },
    "qwen-27b-6bit": {
     "path": "~/models/mlx/<6-bit copy>",
     "served_model_name": "Qwen27b_heretic:latest",

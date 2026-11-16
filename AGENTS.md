@@ -23,7 +23,9 @@ is the long form.
   guard `integrations/vllm-mlx/cortados_vllm_mlx_guard.py`, pinned to vllm-mlx 0.6.0, which refuses a prompt + max_tokens
   over the context before vllm-mlx schedules it), `local_governor.py` (the gate's admission: a count from owner idle
   time and memory pressure, and a byte budget each request reserves its KV cache from; over either a retryable 529, never
-  fitting a non-retryable 413 the provider routes elsewhere; input tokens bounded by the body's bytes as received plus a template allowance, never a backend count; images and documents refused for the text-only model; docs/LOCAL-RESOURCES.md "MLX backend"), `subagent_mcp.py` (stdio MCP server: a `route_task` tool that delegates a
+  fitting a non-retryable 413 the provider routes elsewhere; input tokens bounded by the body's bytes as received plus a template allowance, never a backend count; images and documents refused for the text-only model, and for a model entry declaring `vision` (#125) still images
+  within its policy, an image slot and a vision margin in the same atomic reservation; `image_check.py` reads image
+  headers for it and for the guard's vision mode; docs/LOCAL-RESOURCES.md "MLX backend" and "Vision"), `subagent_mcp.py` (stdio MCP server: a `route_task` tool that delegates a
   self-contained subtask to the `cortados` provider endpoint and returns the routed model's text; stdlib, runs standalone),
   `child_tasks.py` (whole tasks as headless Claude Code children; `--run` runner, `--remote` host side, `--cleanup-archive`;
   the runner appends each finished run, redacted, to the append-only `$CORTADOS_HOME/exports/task-runs.jsonl` for

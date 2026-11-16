@@ -34,6 +34,16 @@ and a request is admitted only while the reservations in flight plus its own fit
   memory_budget_bytes - weights_bytes.
 The count slot and the bytes are taken together (Admission.try_acquire). A request a text-only model cannot read
 (non_text_content: an image, a document) is refused by the gate before admission.
+
+IMAGES (#125, a model entry with a `vision` block: check_vision): a vision model takes STILL images within its policy
+(image_policy: count, inline base64 only, type, encoded bytes, real file type, header dimensions and pixels, user
+messages only, never inside a tool_result, which vllm-mlx 0.6.0's adapter would drop). An image-bearing request reserves
+  tokens   = min(text input tokens + images x image_tokens_max + max_tokens, image_context_tokens)
+  reserved = tokens * kv_bytes_per_token + per_seq_state_bytes + prefill_margin_bytes + vision_margin_bytes
+where the text input bound is input_tokens() with the validated image data's bytes left out (the base64 is not text the
+model reads; every other byte of the body still counts), and image_tokens_max bounds each image's tokens from above (the
+guard sets the processor's max_pixels to it). It also takes one of image_concurrency image slots, in the same atomic
+step as the count slot and the bytes.
 Defaults (Qwen3.8 27B, 4-bit): 64 KiB per token (16 full-attention layers x K/V x 4 KV heads x head_dim 256 x fp16),
 0.15 GiB recurrent state, 1.5 GiB prefill margin: a 128k-token request reserves 9.65 GiB, so two fit beside 15 GiB of
 weights in a 40 GiB budget and a third does not, while eight ~9k-token requests (2.2 GiB each) fit.
@@ -56,6 +66,8 @@ import threading
 import time
 import unicodedata
 from typing import Any, Callable
+
+from cortados_router import image_check
 
 GIB = 2 ** 30
 # Every threshold, its default and the reason for it. The example config (tables/local-backend.example.json) repeats
@@ -155,6 +167,57 @@ class GovernorConfigError(ValueError):
     pass
 
 
+# A vision model's still-image policy (#125, owner decisions 2026-11-15/16), each a model entry's `vision` key. Initial
+# values until measured; tables/local-backend.example.json repeats each reason next to its value.
+VISION_DEFAULTS: dict[str, int] = {
+    # Up to 5 still images per request.
+    "max_images": 5,
+    # Each image at most 1,024 language-model tokens: Qwen3.5's 16-pixel patches merged 2x2 make 1,024 pixels per
+    # token, so ~1 megapixel after the processor's resize (the guard sets the processor's max_pixels to
+    # image_tokens_max x 1,024; upstream allows 16.7 MP = 16,384 tokens and 1 GiB of KV cache per image).
+    "image_tokens_max": 1024,
+    # An image-bearing request is capped at a 64k combined context (input + max_tokens) until measured; the guard
+    # refuses a longer one exactly, after counting its image tokens.
+    "image_context_tokens": 65536,
+    # One image-bearing request at a time until measured (vision encoding is the unmeasured peak).
+    "image_concurrency": 1,
+    # Per image-bearing sequence, beside its KV cache: the vision tower's activations and pixel tensors. Provisional.
+    "vision_margin_bytes": 2 * GIB,
+    # Encoded bytes per image (decoded from base64): the Anthropic API's own 5 MB per image, so a turn the cloud takes
+    # fits here too.
+    "max_image_bytes": 5 * 2 ** 20,
+    # Decoded pixels per image, from the file header before anything is decoded (a decompression bomb is refused from
+    # its header): 32 Mi pixels holds an 8K screenshot (7680 x 4320); the guard sets PIL's bomb limit to the same.
+    "max_image_pixels": 32 * 2 ** 20,
+}
+
+
+def check_vision(raw: Any, cfg: dict[str, Any] | None = None) -> dict[str, int] | None:
+    """A model entry's `vision` block, validated (None: a text-only model). `true` is every default. Positive integers
+    only; image_context_tokens no more than the model's context_tokens (cfg), and room for one image in it."""
+    if raw is None or raw is False:
+        return None
+    if raw is True:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise GovernorConfigError("vision must be an object, true, or absent")
+    out = dict(VISION_DEFAULTS)
+    for key, v in raw.items():
+        if key.startswith("_"):
+            continue
+        if key not in VISION_DEFAULTS:
+            raise GovernorConfigError(f"vision: unknown key {key!r}")
+        out[key] = v
+    for key, v in out.items():
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            raise GovernorConfigError(f"vision: {key} must be a positive integer, got {v!r}")
+    if cfg is not None and out["image_context_tokens"] > cfg["context_tokens"]:
+        raise GovernorConfigError("vision: image_context_tokens must not exceed context_tokens")
+    if out["image_tokens_max"] >= out["image_context_tokens"]:
+        raise GovernorConfigError("vision: image_tokens_max must be below image_context_tokens")
+    return out
+
+
 def check_config(raw: dict[str, Any] | None, model: dict[str, Any] | None = None) -> dict[str, Any]:
     """The governor settings: DEFAULTS, then the config's `governor` section, then the model entry's MODEL_KEYS.
     Unknown keys and bad values are refused (a threshold silently ignored would govern by a number nobody chose)."""
@@ -188,6 +251,8 @@ def check_config(raw: dict[str, Any] | None, model: dict[str, Any] | None = None
         raise GovernorConfigError(f"governor: unknown_pressure must be one of {', '.join(PRESSURES)}")
     if out["idle_cap"] < 1:
         raise GovernorConfigError("governor: idle_cap must be at least 1")
+    # The model's declared image capability (None: text-only), checked against this context.
+    out["vision"] = check_vision(model.get("vision"), out)
     return out
 
 
@@ -260,6 +325,66 @@ def non_text_content(body: dict[str, Any]) -> str | None:
             if kind == "tool_result" and isinstance(b.get("content"), list) and not _text_only_list(b["content"]):
                 return f"non-text tool_result content in message {i + 1}"
     return None
+
+
+class ImagePlan:
+    """What image_policy found in a request a vision model may serve: the images (each {"kind", "width", "height",
+    "bytes"}) and `data_chars`, the characters of their validated base64 data, which the text bound leaves out."""
+
+    def __init__(self, images: list[dict[str, Any]], data_chars: int):
+        self.images, self.data_chars = images, data_chars
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+
+def image_policy(body: dict[str, Any], vision: dict[str, Any]) -> tuple[str | None, ImagePlan]:
+    """(why refused or None, ImagePlan) for a VISION model (#125; module docstring "IMAGES"). Text-only content follows
+    non_text_content's rules. On top of them an image block is taken only:
+      * in a user message's own content (not the system prompt, not an assistant turn, never inside a tool_result:
+        vllm-mlx 0.6.0's adapter keeps only the text of a tool_result, so an image there would be dropped silently);
+      * as an inline base64 source (a url source would make the node fetch it: refused, nothing is fetched);
+      * within image_check: PNG / JPEG / WebP still, real type equal to the declared media_type, at most
+        max_image_bytes decoded, header dimensions at most max_image_pixels, aspect ratio at most 200;
+      * at most max_images of them in the request.
+    Every other non-text block (a document, ...) is refused as before. The first problem is reported; nothing of the
+    image is in the message."""
+    images: list[dict[str, Any]] = []
+    chars = 0
+    system = body.get("system")
+    if isinstance(system, list) and not _text_only_list(system):
+        return "non-text system block", ImagePlan([], 0)
+    for i, m in enumerate(_messages(body)):
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            kind = b.get("type") if isinstance(b, dict) else None
+            if kind == "image":
+                if m.get("role") != "user":
+                    return f"image in a non-user message {i + 1}", ImagePlan([], 0)
+                src = b.get("source")
+                if not isinstance(src, dict) or src.get("type") != "base64":
+                    return (f"image in message {i + 1} is not an inline base64 image (url and other sources are "
+                            "not fetched)"), ImagePlan([], 0)
+                if len(images) >= vision["max_images"]:
+                    return f"more than {vision['max_images']} images", ImagePlan([], 0)
+                try:
+                    info, _ = image_check.check_base64(src.get("media_type"), src.get("data"),
+                                                       max_bytes=vision["max_image_bytes"],
+                                                       max_pixels=vision["max_image_pixels"])
+                except image_check.ImageRefused as exc:
+                    return f"image {len(images) + 1} (message {i + 1}): {exc}", ImagePlan([], 0)
+                images.append(info)
+                chars += len(src["data"])
+                continue
+            if kind not in TEXT_BLOCKS:
+                name = kind if isinstance(kind, str) and kind.isidentifier() and len(kind) <= 40 else "non-text"
+                return f"{name} block in message {i + 1}", ImagePlan([], 0)
+            if kind == "tool_result" and isinstance(b.get("content"), list) and not _text_only_list(b["content"]):
+                return (f"non-text tool_result content in message {i + 1} (images inside a tool result are not "
+                        "carried to the model)"), ImagePlan([], 0)
+    return None, ImagePlan(images, chars)
 
 
 # What vllm-mlx's adapter (api/anthropic_adapter._convert_tool) sends for a tool defined without input_schema.
@@ -384,23 +509,27 @@ def normalization_bytes(body: dict[str, Any], left: int = sys.maxsize) -> int:
     return total
 
 
-def input_tokens(raw: bytes, cap: int | None = None) -> int:
+def input_tokens(raw: bytes, cap: int | None = None, exclude_chars: int = 0) -> int:
     """An upper bound on a turn's input tokens, never an estimate (docs/LOCAL-RESOURCES.md "The input bound"):
         len(raw) + template_tokens(body) + reserialized_bytes(body) + normalization_bytes(body)
     capped at `cap` (the model's context; None: uncapped). `raw` is the request body EXACTLY as the client sent it:
     every character the model sees from the body costs at least one byte there, a byte-level BPE token covers at least
     one byte of the normalized text, the template allowance covers the template's own text, reserialized_bytes what
     vllm-mlx writes wider than it came and normalization_bytes what NFC writes wider. A body that is not a JSON object
-    is bounded by its length plus the fixed allowance (the gate refuses it before this is asked)."""
+    is bounded by its length plus the fixed allowance (the gate refuses it before this is asked).
+    `exclude_chars` (#125): characters of validated image data (ImagePlan.data_chars) the model never reads as text;
+    each was at least one byte of `raw` (base64 is ASCII; JSON may only escape it longer), so leaving them out keeps
+    the bound an upper bound. The images' own tokens are added by request_tokens."""
     limit = sys.maxsize if cap is None else max(0, int(cap))
     raw = bytes(raw)
+    excluded = max(0, min(int(exclude_chars), len(raw)))
     try:
         body = json.loads(raw)
     except (ValueError, RecursionError):
         body = None
     if not isinstance(body, dict):
         return min(limit, len(raw) + TEMPLATE_TOKENS_FIXED)
-    total = len(raw) + template_tokens(body)
+    total = len(raw) - excluded + template_tokens(body)
     if total < limit:
         total += reserialized_bytes(body, limit - total)
     if total < limit:
@@ -408,17 +537,27 @@ def input_tokens(raw: bytes, cap: int | None = None) -> int:
     return min(limit, total)
 
 
-def request_tokens(cfg: dict[str, Any], input_tokens: int, max_tokens: Any) -> int:
+def request_tokens(cfg: dict[str, Any], input_tokens: int, max_tokens: Any, images: int = 0) -> int:
     """The context a request will hold: its input tokens (input_tokens(): an upper bound) plus the output it may
-    write (max_tokens; default_max_tokens when absent or not a positive integer), capped at context_tokens."""
+    write (max_tokens; default_max_tokens when absent or not a positive integer), capped at context_tokens. With
+    `images` (#125, a vision model): plus image_tokens_max per image, capped at image_context_tokens instead (the
+    guard refuses a longer image-bearing prompt exactly)."""
     out = max_tokens if isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0 \
         else cfg["default_max_tokens"]
+    vision = cfg.get("vision") if images else None
+    if images and vision is None:
+        raise ValueError("an image-bearing request needs a vision model's settings")
+    if vision:
+        return min(vision["image_context_tokens"],
+                   max(0, int(input_tokens)) + images * vision["image_tokens_max"] + out)
     return min(cfg["context_tokens"], max(0, int(input_tokens)) + out)
 
 
-def request_bytes(cfg: dict[str, Any], input_tokens: int, max_tokens: Any) -> int:
-    """request_tokens as a reservation in bytes (module docstring)."""
-    return tokens_bytes(cfg, request_tokens(cfg, input_tokens, max_tokens))
+def request_bytes(cfg: dict[str, Any], input_tokens: int, max_tokens: Any, images: int = 0) -> int:
+    """request_tokens as a reservation in bytes (module docstring), plus vision_margin_bytes for an image-bearing
+    request."""
+    margin = cfg["vision"]["vision_margin_bytes"] if images and cfg.get("vision") else 0
+    return tokens_bytes(cfg, request_tokens(cfg, input_tokens, max_tokens, images)) + margin
 
 
 def max_seqs(cfg: dict[str, Any]) -> int:
@@ -508,8 +647,8 @@ class Ticket:
     """One admitted request's hold: a COUNT slot and the bytes it reserved. release() gives both back, once (a second
     call, from a later finally or error path, does nothing)."""
 
-    def __init__(self, admission: "Admission", reserved: int):
-        self._admission, self.reserved, self._done = admission, reserved, False
+    def __init__(self, admission: "Admission", reserved: int, image: bool = False):
+        self._admission, self.reserved, self._done, self.image = admission, reserved, False, image
 
     def release(self) -> None:
         self._admission._release(self)
@@ -527,13 +666,18 @@ class Admission:
         self._lock = threading.Lock()
         self.inflight = 0
         self.reserved = 0                    # bytes held by the admitted requests in flight
+        self.image_inflight = 0              # image-bearing requests in flight (#125)
 
     def _report(self, g: dict[str, Any]) -> dict[str, Any]:
         """The state report under the lock: the count sample, in flight, and (governed) the bytes and token room."""
         out = {**g, "inflight": self.inflight}
         if self.governor is None:
-            return {**out, "reserved_bytes": None, "free_bytes": None, "fit_tokens": None, "free_tokens": None}
+            return {**out, "reserved_bytes": None, "free_bytes": None, "fit_tokens": None, "free_tokens": None,
+                    "image_inflight": None, "image_limit": None}
         cfg = self.governor.cfg
+        vision = cfg.get("vision")
+        out.update(image_inflight=self.image_inflight if vision else None,
+                   image_limit=vision["image_concurrency"] if vision else None)
         free = max(0, available_bytes(cfg) - self.reserved)
         full = g["limit"] is not None and self.inflight >= g["limit"]
         return {**out, "reserved_bytes": self.reserved, "free_bytes": free,
@@ -553,16 +697,26 @@ class Admission:
         """The served model's context (input_tokens' cap), None without a governor."""
         return self.governor.cfg["context_tokens"] if self.governor else None
 
-    def request_bytes(self, input_tokens: int, max_tokens: Any) -> int:
-        """The reservation a request asks for (0 without a governor: nothing is budgeted)."""
-        return request_bytes(self.governor.cfg, input_tokens, max_tokens) if self.governor else 0
+    @property
+    def vision(self) -> dict[str, Any] | None:
+        """The served model's image policy (check_vision), None for a text-only model or without a governor."""
+        return self.governor.cfg.get("vision") if self.governor else None
 
-    def try_acquire(self, reserve: int = 0) -> tuple[Ticket | None, dict[str, Any]]:
+    def request_bytes(self, input_tokens: int, max_tokens: Any, images: int = 0) -> int:
+        """The reservation a request asks for (0 without a governor: nothing is budgeted)."""
+        return request_bytes(self.governor.cfg, input_tokens, max_tokens, images) if self.governor else 0
+
+    def try_acquire(self, reserve: int = 0, image: bool = False) -> tuple[Ticket | None, dict[str, Any]]:
         """(ticket, report) when admitted; (None, report) when not, report["refused"] saying why: "too_large" (more
-        than the whole budget beside the weights: never, even when the count is full too) or "busy" (the count limit
-        or the bytes left now; retryable). The count slot and the bytes are taken together, atomically."""
+        than the whole budget beside the weights: never, even when the count is full too) or "busy" (the count limit,
+        the bytes left now, or for an `image`-bearing request every image slot taken; retryable). The count slot, the
+        bytes and the image slot are taken together, atomically. An image-bearing request on a model without a vision
+        policy (or without a governor) is "unsupported": the gate checks that first, this only fails closed."""
         g = self.governor.current() if self.governor else NO_GOVERNOR
         with self._lock:
+            vision = self.vision
+            if image and vision is None:
+                return None, {**self._report(g), "refused": "unsupported", "reason": "the model reads no images"}
             if self.governor is None:
                 self.inflight += 1
                 return Ticket(self, 0), self._report(g)
@@ -574,6 +728,9 @@ class Admission:
                                                              f"{_gib(avail)} GiB budget beside the weights"}
             elif g["limit"] is not None and self.inflight >= g["limit"]:
                 refused = {"refused": "busy"}                       # the sample's reason: owner / pressure
+            elif image and self.image_inflight >= vision["image_concurrency"]:
+                refused = {"refused": "busy", "reason": f"image turns: {self.image_inflight} of "
+                                                        f"{vision['image_concurrency']} running"}
             elif self.reserved + nbytes > avail:
                 refused = {"refused": "busy", "reason": f"memory budget: {_gib(avail - self.reserved)} GiB free, "
                                                         f"request needs {_gib(nbytes)} GiB"}
@@ -581,7 +738,9 @@ class Admission:
                 return None, {**self._report(g), **refused, "request_bytes": nbytes}
             self.inflight += 1
             self.reserved += nbytes
-            return Ticket(self, nbytes), self._report(g)
+            if image:
+                self.image_inflight += 1
+            return Ticket(self, nbytes, image), self._report(g)
 
     def _release_locked(self, ticket: Ticket) -> None:
         if ticket._done:
@@ -589,6 +748,8 @@ class Admission:
         ticket._done = True
         self.inflight = max(0, self.inflight - 1)
         self.reserved = max(0, self.reserved - ticket.reserved)
+        if ticket.image:
+            self.image_inflight = max(0, self.image_inflight - 1)
 
     def _release(self, ticket: Ticket) -> None:
         with self._lock:

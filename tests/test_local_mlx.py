@@ -733,7 +733,8 @@ class MlxGateRouteTests(MlxGateHarness):
         self.assertEqual(data["models"], [{"name": SERVED, "model": SERVED}])
         self.assertEqual(data["cortados_gate"], {"backend": "vllm-mlx", "limit": None, "inflight": 0, "owner": None,
                                                  "pressure": None, "reason": "no governor", "reserved_bytes": None,
-                                                 "free_bytes": None, "fit_tokens": None, "free_tokens": None})
+                                                 "free_bytes": None, "fit_tokens": None, "free_tokens": None,
+                                                 "image_inflight": None, "image_limit": None, "vision": None})
         self.assertEqual(FakeVllm.seen, [("GET", "/v1/models", None)])
 
     def test_messages_are_relayed_with_thinking_mapped(self):

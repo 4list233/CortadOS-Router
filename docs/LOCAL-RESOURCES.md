@@ -1108,6 +1108,93 @@ S1's route stands ("routes elsewhere"). A turn the gate still refuses:
 
 The refusal fallback (`local_lane.complete`) treats a busy, too-large or text-only refusal as an unavailable node.
 
+### Vision: still images on the MLX lane (#125)
+
+Owner decisions 2026-11-15/16: the Pro's model may read images, served from a separate folder holding the 4-bit language
+weights plus the BF16 vision tower (`~/models/mlx/Qwen3.8-27B-heretic-ara-4bit-vision`, `qwen3_5`,
+`Qwen3_5ForConditionalGeneration`). **The production switch needs the owner's separate approval after measurements**;
+until then the text-only entry stays the served one, and nothing below changes a running node.
+
+**The policy** (a model entry's `vision` block in the backend config; `local_governor.VISION_DEFAULTS` has each reason,
+the example's `qwen-27b-4bit-vision` entry repeats them):
+
+| setting | initial | what it bounds |
+| --- | --- | --- |
+| `max_images` | 5 | still images per request (counted over the whole conversation the client resends) |
+| `image_tokens_max` | 1,024 | tokens per image: ~1 MP after the processor's resize (1,024 pixels per token); the guard sets the processor's `max_pixels` to 1,048,576 (upstream: 16.7 MP = 16,384 tokens) |
+| `image_context_tokens` | 65,536 | input + max_tokens of an image-bearing request, until measured |
+| `image_concurrency` | 1 | image-bearing requests at once, until measured (text turns still run beside it) |
+| `vision_margin_bytes` | 2 GiB | per image-bearing sequence: tower activations and pixel tensors (provisional) |
+| `max_image_bytes` | 5 MiB | encoded bytes per image (the Anthropic API's own limit) |
+| `max_image_pixels` | 32 Mi | decoded pixels per image, read from the header before decoding; PIL's bomb limit is the same |
+
+Only inline base64 PNG, JPEG and WebP **stills** are taken, in a user message's own content. Refused, before any
+admission and non-retryably (the gate's `UNSUPPORTED_MESSAGE`, which the provider routes elsewhere as before): url
+sources (nothing is fetched: no SSRF), GIF, animated PNG/WebP, multi-picture JPEG, a declared type that is not the real
+one, video, audio, documents, images in the system prompt or an assistant turn, and **images inside a `tool_result`**
+(vllm-mlx 0.6.0's adapter keeps only a tool result's text, so such an image would be dropped silently; failing
+explicitly is the rule). `cortados_router/image_check.py` holds the header checks; the gate and the guard both use it.
+
+**Memory** (KV cache 65,536 B per token, "The governor" above). One image at its ceiling is 1,024 tokens = 64 MiB of KV;
+five are 320 MiB. An image-bearing request reserves
+
+    tokens   = min(text input bound + images x 1,024 + max_tokens, 65,536)
+    reserved = tokens x 65,536 + 0.15 GiB state + 1.5 GiB prefill margin + 2 GiB vision margin
+
+where the text input bound is "The input bound" with the validated base64 left out (it is not text the model reads; a
+1 MB screenshot is ~1.3 MB of base64 and at most 1,024 tokens). The largest image reservation is 4 GiB + 3.65 GiB =
+7.65 GiB. Beside ~16.5 GiB of weights (15 GiB language + the tower, provisional: measure it) in the 40 GiB budget,
+23.5 GiB remain: with the owner active (2 at once) one image turn at its cap and one 128k text turn (9.65 GiB) together
+reserve 17.3 GiB. The count slot, the bytes and the image slot are taken in one step under one lock
+(`Admission.try_acquire(reserve, image=True)`); busy (529, retryable) and never-fits (413, non-retryable) keep their
+meaning, and a reservation is released however the turn ends.
+
+**The guard's vision mode** (`--vision` and its flags, built by `local_backend.vision_argv` from the model entry). On an
+MLLM model every request, text-only included, goes `BatchedEngine` → `MLLMScheduler` → `MLLMBatchGenerator`, so the text
+route's cap never runs; the MLLM route counts text tokens only (`mllm_scheduler.py:486`), and the real length is known
+only after `mlx_vlm.utils.prepare_inputs` expands each image placeholder. The guard extends itself, never bypassed:
+
+- route: only a model dir whose `config.json` is `qwen3_5` / `Qwen3_5ForConditionalGeneration` with a `vision_config`,
+  only the MLLM route, only BatchedEngine (the engine refusal is unchanged); in vision mode the text `Scheduler` refuses
+  every request (a vision model must never be served by the text route, whose chat drops images);
+- startup (`MLLMScheduler.__init__`): the model and processor are mlx-vlm's `qwen3_5.Model` / `Qwen3VLProcessor` with 16 x
+  2 patches; drafters and specprefill refused; the processor's `max_pixels` overridden;
+- layer 1 (`MLLMScheduler.add_request`, the one entry to the MLLM queue, before anything is queued): images checked from
+  their bytes, one placeholder per image, then the exact length P = text tokens − placeholders + Σ the processor's own
+  `num_image_tokens(h, w)` (the function its preprocessing shares, `processing_qwen3_vl.py:459-488`); P + max_tokens
+  over the context (64k with images) is the text route's 413, which the gate turns into its never-fits 413;
+- layer 2 (`MLLMBatchGenerator._preprocess_request`, every path to the vision encoder and prefill: the normal batch,
+  mid-batch extend, chunked prefill, the early text preprocessing, the pixel cache's hit branch and its miss branch):
+  after `prepare_inputs`, the actual P and the placeholder, `image_grid_thw` and pixel-row counts must agree. A
+  refusal releases the request's tensors and fails only that request (a mismatch left to the model would raise inside
+  prefill and fail every request of its batch);
+- decode (`models.mllm.process_image_input`): checked `data:` URLs only, inside layer 2 only, to a private temp file
+  removed after preprocessing (upstream downloads http(s) URLs and caches every base64 image as a temp file until exit);
+- caches: `VisionEmbeddingCache` (count-only, 100 / 50 entries) is disabled. The prefix cache serves text-only requests
+  only (`memory_cache.is_text_only_prefix_cache_request`), unchanged.
+
+Pinned on top of the text route's pins: vllm-mlx 0.6.0's MLLM files (`VISION_PINNED_SHA256`) and mlx-vlm 0.7.12
+(`MLX_VLM_PINNED_SHA256`, from the PyPI wheel `mlx_vlm-0.7.12-py3-none-any.whl`, sha256 `0412a883…8e37`); any drift stops
+startup. `scripts/install_mlx_backend.sh` copies `cortados_router/image_check.py` beside the guard as
+`cortados_image_check.py` and runs `--check` with the entry's vision flags.
+
+**The provider** relays the client's `/v1/messages` body to the node unchanged (images included). On the provider
+host, give the node's model `"vision": true` (or `{"max_images": 5, "image_tokens": 1024}`) in `tables/resources.json`
+so the local lane's fit checks (`local_lane.input_tokens`: the pin, the auto and index routes, every turn) count each
+image as its tokens rather than its base64 as text; without it a screenshot's base64 alone exceeds the 131k context.
+The gate's capacity report carries the served model's `vision` settings and `image_inflight` / `image_limit`.
+
+**Switching it on** (owner steps, after the measurements are approved): select `qwen-27b-4bit-vision` as
+`vllm_mlx.model` with its measured `weights_bytes`, rerun `scripts/install_mlx_backend.sh` (its `--check` must print
+`vision route qwen3_5`), restart the gate, and declare `vision` on the provider host's model entry. Rolling back is
+selecting the text entry again.
+
+**Not covered yet**: images inside tool results (refused, so Claude Code's image reads go elsewhere); GIF; a client whose
+max_tokens leaves no room under the 64k image context (Claude Code's 32k default leaves ~32k for text and images; a
+larger max_tokens is refused by the guard and the turn routed elsewhere); the vision margin, the tower's resident size
+and the concurrency of one are provisional until measured; layer 2's refusal reaches a client as vllm-mlx's generic
+generation error (layer 1 refuses everything layer 2 would, so it is a backstop, not a path).
+
 ### Switch the Pro to MLX
 
 Owner steps; nothing here was run by the build. The provider's lane config needs no protocol change.

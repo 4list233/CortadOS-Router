@@ -559,7 +559,7 @@ def _choose_local(core, body: dict[str, Any], node: dict[str, Any], entry: dict[
         return {"router": execution_routing.ROUTER,
                 "error": f"sub/{pin}: node {node['node']} does not list {entry['id']} (ollama pull it there); "
                          "no other model was tried"}
-    need = int(request_fit(body)["input_tokens"])
+    need = local_lane.input_tokens(body, entry)      # request_fit's estimate, images as the model reads them (#125)
     if need > entry["context_length"]:
         return {"router": execution_routing.ROUTER, "fit_blocked": True,
                 "error": f"sub/{pin}: the request (≈{need // 1000}k tokens) exceeds {entry['id']}'s configured "
@@ -793,10 +793,14 @@ def _node_why(node: dict[str, Any], entry: dict[str, Any], body: dict[str, Any],
     full = local_lane.gate_busy(node)              # the gate's own admission limit (an MLX node's governor)
     if full:
         return f"node busy ({full})", False
-    if not need:
-        need.append(int(request_fit(body)["input_tokens"]))
-    if need[0] > entry["context_length"]:
-        return f"request ≈{need[0] // 1000}k tokens exceeds its {entry['context_length'] // 1000}k context", False
+    if entry.get("vision"):                        # images sized as the model reads them (#125), per model
+        tokens = local_lane.input_tokens(body, entry)
+    else:
+        if not need:
+            need.append(int(request_fit(body)["input_tokens"]))
+        tokens = need[0]
+    if tokens > entry["context_length"]:
+        return f"request ≈{tokens // 1000}k tokens exceeds its {entry['context_length'] // 1000}k context", False
     room = local_lane.gate_fit(node, local_lane.request_tokens(body, entry))   # the gate's memory budget
     if room:
         return _room_why(room), False
@@ -1378,8 +1382,9 @@ def index_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, c
             skip(what, f"node busy ({full})")
             continue
         need = int(request_fit(body)["input_tokens"]) if need is None else need
-        if need > entry["context_length"]:
-            skip(what, f"request ≈{need // 1000}k tokens exceeds its {entry['context_length'] // 1000}k context")
+        tokens = local_lane.input_tokens(body, entry) if entry.get("vision") else need   # #125: images as read
+        if tokens > entry["context_length"]:
+            skip(what, f"request ≈{tokens // 1000}k tokens exceeds its {entry['context_length'] // 1000}k context")
             continue
         room = local_lane.gate_fit(node, local_lane.request_tokens(body, entry))   # the gate's memory budget
         if room:
