@@ -1397,10 +1397,10 @@ def _worker_items(pairs: list, covered: set[str]) -> list[dict[str, Any]]:
 
 
 _CALL_KEYS = ("ts", "task_id", "session_id", "routing_kind", "band", "lane", "model", "actual_model", "elapsed_ms",
-              "degraded", "s1_reason", "request_chars", "response_chars")
+              "degraded", "s1_reason", "request_chars", "response_chars", "sensitive_cloud")
 
 
-_LOG_OPS = ("log_route", "log_execution", "log_outcome", "log_tokens")
+_LOG_OPS = ("log_route", "log_execution", "log_outcome", "log_tokens", "log_sensitive_cloud")
 _TYPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,63}")
 
 

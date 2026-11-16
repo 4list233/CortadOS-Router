@@ -77,7 +77,7 @@ class CollectTest(unittest.TestCase):
         t = v["tasks"][0]
         self.assertEqual(set(t), {"task_id", "ts", "session_id", "lane", "model", "actual_model", "band", "degraded",
                                   "elapsed_ms", "request_chars", "response_chars", "tokens", "tokens_status",
-                                  "routing_kind", "s1_reason"})
+                                  "routing_kind", "s1_reason", "sensitive_cloud"})
         for absent in ("request", "context", "task_context", "engine_error", "answers", "hard_rules", "engine", "features"):
             self.assertNotIn(absent, t)
         self.assertEqual((t["lane"], t["model"], t["actual_model"], t["band"], t["degraded"]),
@@ -113,7 +113,8 @@ class CollectTest(unittest.TestCase):
         self.assertEqual((by["sess-b"]["routed_pct"], by["sess-b"]["pinned"]), (0.0, 2))      # pinned work is not routed
         self.assertEqual((by["sess-c"]["routed_pct"], by["sess-c"]["unselected"]), (0.0, 1))
         self.assertEqual(v["unassigned_decisions"], 1)                                         # counted, not pooled
-        self.assertEqual(v["totals"], {"decisions": 8, "routed": 4, "pinned": 3, "unselected": 1, "routed_pct": 50.0})
+        self.assertEqual(v["totals"], {"decisions": 8, "routed": 4, "pinned": 3, "unselected": 1, "sensitive_cloud": 0,
+                                       "routed_pct": 50.0})
 
     def test_degraded_decision_counts_as_routed(self):
         insert(self.home, degraded=1, answers="null", band="R2",

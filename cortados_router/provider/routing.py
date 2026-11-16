@@ -58,6 +58,7 @@ from cortados_router.provider import anthropic_wire as wire
 from cortados_router.provider import effect_boundary
 from cortados_router.provider import floor
 from cortados_router.provider import local_lane
+from cortados_router.provider import sensitive_notice
 
 logger = logging.getLogger("cortados.provider.routing")
 
@@ -733,11 +734,15 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
         # Decided once, from the request and S1's answers, before any rule binds it (#122 round 2): sensitivity is
         # never inferred from which rule moved the request, and it wins over the cost preference.
         sensitive = request_sensitivity(body, r, local)
-        r = sensitive_local(core, body, r, client=client, conversation_id=conversation_id, excluded=hit, local=local)
+        skipped: list[str] = []                    # why sensitive_local did not take it, as reason categories
+        r = sensitive_local(core, body, r, client=client, conversation_id=conversation_id, excluded=hit, local=local,
+                            why_out=skipped)
         if not r.get("local"):
             r = auto_local(core, body, r, client=client, conversation_id=conversation_id, excluded=hit)
         if r.get("local"):
             r = _stamp_sensitivity(r, sensitive)
+        elif sensitive is not None:
+            r = _stamp_cloud(r, sensitive, skipped)
     if min_left_pct is not None and not r.get("error"):
         # The routed path's floor check runs on the account select chose (execution_routing ranks inside select); a
         # chosen account below the client's floor is refused like a spent one, never swapped for an unscored sibling.
@@ -767,6 +772,9 @@ NO_LOCAL_KEY = "_cortados_no_local"
 # takes effect within this window. Pins never use it (a person who pins a model is told the node's state now).
 AUTO_DOWN_S = 30.0
 _auto_down: dict[str, float] = {}
+# The reason category (why_category) of the probe failure that opened each node's AUTO_DOWN_S window, so a request skipped
+# inside the window is told the same reason (switched off, on battery) as the one that probed (#124).
+_auto_down_why: dict[str, str] = {}
 
 
 def _node_why(node: dict[str, Any], entry: dict[str, Any], body: dict[str, Any],
@@ -784,6 +792,7 @@ def _node_why(node: dict[str, Any], entry: dict[str, Any], body: dict[str, Any],
         tags = local_lane.probe(node)
     except local_lane.LocalUnavailable as exc:
         _auto_down[node["node"]] = _now() + AUTO_DOWN_S
+        _auto_down_why[node["node"]] = why_category(f"unavailable ({exc})")
         # A gate 401 is the provider's misconfiguration (token files out of step), not the node's state: it needs the
         # owner's attention, so it is a warning, where battery or a switched-off node is routine.
         return f"unavailable ({exc})", str(exc) == local_lane.GATE_REFUSED.format(node=node["node"])
@@ -1499,14 +1508,68 @@ def _stamp_sensitivity(r: dict[str, Any], sensitive: str | None) -> dict[str, An
     so the effect boundary gives it the sensitive profile: sensitivity wins over cost wherever the bind reason is read."""
     out = dict(r)
     out.pop(CLOUD_REROUTE_OK, None)
+    out.pop(sensitive_notice.DETECTOR_KEY, None)
     if sensitive is None:
         out[CLOUD_REROUTE_OK] = True
         return out
+    out[sensitive_notice.DETECTOR_KEY] = sensitive  # named by the server's notice if the node cannot take the turn
     if sensitive != "unknown" and effect_boundary.profile_for(out.get("bind_reason")) == effect_boundary.COST:
         logger.info("%s: route %s bound by %s is sensitive: sensitive profile", _rule_label(sensitive),
                     out.get("route_id"), out.get("bind_reason"))
         out["bind_reason"] = TRIGGER_REASONS.get(sensitive, sensitive)   # "s1": unknown there, the strictest profile
     return out
+
+
+def _stamp_cloud(r: dict[str, Any], sensitive: str, skipped: list[str]) -> dict[str, Any]:
+    """A cloud route `choose` kept for a request a detector marked (#124): the route carries sensitive_notice.ROUTE_KEY
+    (the detector and why the Pro did not take it, categories only), which the server turns into the reply's notice and
+    the route row's record. The reason is the first node's skip (sensitive_local's why_out); none recorded means no
+    node was asked: a config error when a detector could not be read, else no sensitive model is configured."""
+    why = skipped[0] if skipped else ("config_error" if sensitive == "unknown" else "not_configured")
+    logger.warning("sensitive: route %s marked %s is served in the cloud by %s/%s: the Pro did not take it (%s)",
+                   r.get("route_id"), sensitive_notice.detector(sensitive), r.get("provider"), r.get("model"),
+                   sensitive_notice.reason(why))
+    return {**r, sensitive_notice.ROUTE_KEY: sensitive_notice.mark(sensitive, why)}
+
+
+def _skip_category(node: dict[str, Any], why: str | None) -> str:
+    """why_category of a node skip; inside the node's AUTO_DOWN_S window, the category of the probe that opened it."""
+    if (why or "").startswith("probe failed within"):
+        return _auto_down_why.get(node.get("node"), "unavailable")
+    return why_category(why)
+
+
+def why_category(why: str | None) -> str:
+    """A skip reason as routing writes it (_node_why, route_admission, the wire) -> a sensitive_notice.REASONS key.
+    Matched on routing's own fixed wording; anything unrecognised is "unavailable"."""
+    w = why or ""
+    if w.startswith("excluded by the client"):
+        return "excluded"
+    if w.startswith("unavailable ("):
+        if "local switch off" in w:
+            return "switched_off"
+        if "on battery" in w:
+            return "on_battery"
+        if "refused the provider token" in w:
+            return "gate_token"
+        return "unavailable"
+    if w.startswith("probe failed within"):
+        return "unavailable"
+    if w.startswith("does not list"):
+        return "model_missing"
+    if w.startswith("node busy"):
+        return "busy"
+    if w.startswith("request ≈") or w.startswith("too large for the node"):
+        return "too_large"
+    if "/v1/responses" in w:
+        return "responses_wire"
+    if w.startswith("S1 is degraded") or w.startswith("S1's degraded flag"):
+        return "s1_degraded"
+    if w.startswith("outward effect") or w.startswith("blast_radius "):
+        return "outward_effect"
+    if w.startswith("no band") or w.startswith("S1 gave no") or w.startswith("S1's ") or "malformed" in w:
+        return "not_admitted"
+    return "unavailable"
 
 
 # sensitive_trigger's rule -> the route's bind_reason (effect_boundary.BIND_PROFILES). "s1" (the planned S1 signal, not
@@ -1525,7 +1588,8 @@ def _rule_label(rule: str) -> str:
 
 
 def sensitive_local(core, body: dict[str, Any], r: dict[str, Any], *, client: str, conversation_id: str,
-                    excluded: Callable[[str], bool] = lambda name: False, local: str | None = None) -> dict[str, Any]:
+                    excluded: Callable[[str], bool] = lambda name: False, local: str | None = None,
+                    why_out: list[str] | None = None) -> dict[str, Any]:
     """S1's route `r`, or the same decision moved to a node's `sensitive.model` when a trigger marks the request
     (sensitive_trigger: flag, prefer, keyword) and it is eligible: on a wire the relay serves (no NO_LOCAL_KEY), with no
     effect outside this machine (local_admission; this also refuses a degraded scorer), and through the same local
@@ -1535,19 +1599,25 @@ def sensitive_local(core, body: dict[str, Any], r: dict[str, Any], *, client: st
 
     When the request is not moved but a node has `refusal_fallback` on and the request is eligible except for the
     node's live state, the route carries `refusal_fallback` (the candidate nodes, the conversation id and the client),
-    which refusal_route reads if the cloud model refuses the opening turn."""
+    which refusal_route reads if the cloud model refuses the opening turn.
+
+    `why_out`, when given, receives each skip of a node a trigger marked as a reason category (why_category), or
+    "config_error" / "not_configured" when no node could be asked: routing.choose's notice reason (#124)."""
+    why_out = [] if why_out is None else why_out
     if r.get("error") or not r.get("route_id") or r.get("pinned"):
         return r
     try:
         targets = local_lane.sensitive_routes()
     except local_lane.LocalConfigError as exc:
         logger.warning("sensitive: skipped: local config error on node %s: %s", exc.node, exc)
+        why_out.append("config_error")
         return r
     rid = r["route_id"]
     if not targets:
         if local:
             logger.info("%s not taken for %s: no local node has a sensitive section", _rule_label(
                 "flag" if local == "sensitive" else local), rid)
+        why_out.append("not_configured")
         return r
     static = "the request came in on /v1/responses (the local relay speaks Messages only)" \
         if body.get(NO_LOCAL_KEY) else _not_admitted(r)
@@ -1561,6 +1631,7 @@ def sensitive_local(core, body: dict[str, Any], r: dict[str, Any], *, client: st
         if why:
             logger.log(logging.WARNING if gate_refused else logging.INFO, "%s: %s/%s not taken for %s: %s",
                        _rule_label(rule), node["lane"], local_lane.pin_id(entry), rid, why)
+            why_out.append(_skip_category(node, why))
             continue
         pin = local_lane.pin_id(entry)
         run_entry, extra = choose_variant(core, body, r, entry)
@@ -1583,28 +1654,34 @@ def sensitive_local(core, body: dict[str, Any], r: dict[str, Any], *, client: st
 
 
 def refusal_route(core, body: dict[str, Any], route: dict[str, Any] | None,
-                  run: Callable[[dict[str, Any]], bool]) -> dict[str, Any] | None:
+                  run: Callable[[dict[str, Any]], bool], why_out: list[str] | None = None) -> dict[str, Any] | None:
     """The opening turn of an S1-routed conversation was refused by its cloud model (server.py checks that it was the
     opening turn, on /v1/messages, with no tool run). Returns the route moved to a node's `sensitive.model`, or None.
     Eligibility was settled when the route was chosen (sensitive_local's `refusal_fallback` marker: no outward effect,
     not degraded, the client's exclusions) and local_admission is applied again to the route's own decision; here the
     node's live state is checked again (_node_why) and `run(moved)`
     must produce the local answer (True) before the routes row is rewritten, so a failed fallback leaves S1's record
-    as it was. Logs the rule (`sensitive: refusal`) and metadata reasons only."""
+    as it was. Logs the rule (`sensitive: refusal`) and metadata reasons only. `why_out`, when given, receives why the
+    fallback was not taken as reason categories (why_category; "no_answer" when the local model gave none): the notice
+    reason of the refusal the client then gets (#124)."""
+    why_out = [] if why_out is None else why_out
     marker = (route or {}).get("refusal_fallback")
     rid = (route or {}).get("route_id")
     if not marker:
         logger.info("sensitive: refusal not taken for %s: not eligible when routed (no refusal_fallback node, an "
                     "outward effect, a degraded scorer, a pin, an exclusion or the /v1/responses wire)", rid)
+        why_out.append("not_admitted")
         return None
     try:
         targets = local_lane.sensitive_routes()
     except local_lane.LocalConfigError as exc:
         logger.warning("sensitive: refusal not taken for %s: local config error on node %s: %s", rid, exc.node, exc)
+        why_out.append("config_error")
         return None
     ok, why = route_admission(route)                 # the shared gate again: the marker alone is not admission
     if not ok:
         logger.info("sensitive: refusal not taken for %s: %s", rid, why)
+        why_out.append(why_category(why))
         return None
     wanted = {(t.get("node"), t.get("model")) for t in marker.get("targets") or []}
     need: list = []
@@ -1629,8 +1706,13 @@ def refusal_route(core, body: dict[str, Any], route: dict[str, Any] | None,
                 logger.info("sensitive: refusal: %s -> %s/%s", rid, node["lane"], pin)
                 return moved
             why = "the local model gave no usable answer"
+            why_out.append("no_answer")
+        else:
+            why_out.append(_skip_category(node, why))
         logger.log(logging.WARNING if gate_refused else logging.INFO, "sensitive: refusal: %s/%s not taken for %s: %s",
                    node["lane"], pin, rid, why)
+    if not why_out:
+        why_out.append("not_configured")             # no node of the marker has a refusal_fallback section now
     return None
 
 

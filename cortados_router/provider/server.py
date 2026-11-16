@@ -58,7 +58,8 @@ from cortados_router.compat import getenv
 from cortados_router.safe_text import install_log_sanitizer
 from cortados_router.compaction import prune as compaction_prune, store as compaction_store
 from cortados_router.provider import (anthropic_wire, clients, dashboard_auth, effect_boundary, live, local_lane,
-                                      local_switch, office, responses_wire, routing, search_lane, work_split)
+                                      local_switch, office, responses_wire, routing, search_lane, sensitive_notice,
+                                      work_split)
 from cortados_router.provider.bridge import BridgeError, BridgeSession, ToolWaitExpired, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
 from cortados_router.provider.timeouts import IDLE_S, TOOL_WAIT_S, TURN_TIMEOUT_S, effective_tool_wait
@@ -837,9 +838,13 @@ class Registry:
         # floor_release(rid) -> bool: refunds a floor_search reservation whose search CLI failed to start (a reservation
         # only counts once the run started). None: nothing to refund with; the row ages out as before, logged.
         self.floor_release: Callable[[str], bool] | None = None
-        # refusal_route(body, route, run) -> moved route or None: the refusal fallback's re-route of a refused opening
-        # turn to a node's sensitive model (routing.refusal_route). None: no fallback (a fixed-model endpoint).
-        self.refusal_route: Callable[[dict, dict | None, Callable[[dict], bool]], dict | None] | None = None
+        # refusal_route(body, route, run, why_out=None) -> moved route or None: the refusal fallback's re-route of a
+        # refused opening turn to a node's sensitive model (routing.refusal_route; why_out receives the reason
+        # categories when it is not taken, #124). None: no fallback (a fixed-model endpoint).
+        self.refusal_route: Callable[..., dict | None] | None = None
+        # sensitive_cloud(route_id, record) -> bool: the route row's sensitive-cloud record (core.log_sensitive_cloud,
+        # #124: detector, reason, notice shown or opted out; categories only). None: logged, not recorded.
+        self.sensitive_cloud: Callable[[str, dict], bool] | None = None
         # local_recheck(body, route) -> (admitted, metadata reason): S1 rescores a continuation of a conversation an
         # AUTOMATIC rule bound to a local lane (routing.continuation_admission, which applies routing.local_admission).
         # None: such a continuation cannot be checked and is refused (fails closed). Explicit local pins never use it.
@@ -2782,7 +2787,7 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _refusal_fallback(self, session, turn, body: dict[str, Any], result, *, created: bool, one_shot: bool,
-                          wire: Wire):
+                          wire: Wire, why_out: list[str] | None = None):
         """The refusal fallback (docs/LOCAL-RESOURCES.md "Sensitive requests"): when the cloud backend refused this
         turn (stop "refusal"; only the Claude bridge reports one, the Codex app-server has no refusal signal), re-run it
         on a node's sensitive model and bind the conversation there. Returns (session, local result) or None (the
@@ -2791,31 +2796,41 @@ class Handler(BaseHTTPRequestHandler):
         holding a tool_use, is never re-run, so a tool's effect can never repeat. Eligibility of the request itself (no
         outward effect, scorer not degraded, exclusions) was settled when it was routed (routing.sensitive_local);
         routing.refusal_route rechecks the node and rewrites the routes row only once the local answer exists. Logs the
-        rule and metadata reasons only, never the request or the reply."""
+        rule and metadata reasons only, never the request or the reply. `why_out` receives why a refusal of an
+        S1-routed cloud conversation was not moved, as sensitive_notice reason categories (#124); nothing for a
+        pinned or local conversation or a fixed-model endpoint (no detector applies there)."""
+        why_out = [] if why_out is None else why_out
         blocks, stop, _usage = result
         if stop != "refusal":
             return None
         reg = self.server.registry
         route = getattr(session, "route", None)
         rid = (route or {}).get("route_id")
-        why = None
+        why, category = None, None
         if wire is not ANTHROPIC:
             why = "the conversation is on /v1/responses (the local relay speaks Messages only)"
+            category = "responses_wire"
         elif not created:
             # HOOK(rebuild-on-409): a refusal later in a conversation could move it too, by seeding the local lane from
             # the client's transcript as branch rebuild-on-409 does for a lost backend. Not built: the conversation
             # stays on its cloud model and the client sees the refusal.
             why = "a refusal after the opening turn does not move the conversation (follow-up: rebuild-on-409)"
+            category = "not_opening_turn"
         elif (turn.tool_results or any(isinstance(m, dict) and m.get("role") == "assistant"
                                        for m in body.get("messages") or [])
               or any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks)):
             why = "client tools ran or were requested in this conversation; a turn with tool effects is never re-run"
+            category = "tools_ran"
         elif not route or route.get("local") or route.get("pinned"):
             why = "the conversation is not S1-routed to a cloud model"
         elif reg.refusal_route is None:
             why = "this endpoint has no refusal fallback (fixed model)"
+        if route and (route.get("local") or route.get("pinned")):
+            category = None                             # a pin or a local lane: the person's or a local answer
         if why:
             logger.info("sensitive: refusal not taken for %s: %s", rid, why)
+            if category:
+                why_out.append(category)
             return None
         got: dict[str, Any] = {}
 
@@ -2832,12 +2847,15 @@ class Handler(BaseHTTPRequestHandler):
             return True
 
         try:
-            moved = reg.refusal_route(body, route, run)
+            moved = reg.refusal_route(body, route, run, why_out=why_out)
         except Exception as exc:                        # a fallback bug must never cost the client the cloud answer
             logger.exception("sensitive: refusal fallback failed for %s (%s); the refusal stands", rid,
                              type(exc).__name__)
+            why_out.append("no_answer")
             return None
         if not moved or "turn" not in got:
+            if not why_out:
+                why_out.append("no_answer")
             return None
         if one_shot:
             session.route = moved                       # a throwaway backend: nothing to rebind; the record is local
@@ -2847,7 +2865,39 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             logger.exception("sensitive: refusal: binding %s to the local lane failed (%s); the refusal stands", rid,
                              type(exc).__name__)
+            why_out.append("no_answer")
             return None
+
+    def _sensitive_cloud_notice(self, session, *, created: bool, stop: Any, refusal_why: list[str]) -> dict | None:
+        """The sensitive-cloud notice of this turn (#124, sensitive_notice.py), or None. Only the turn that opened the
+        conversation carries it (the turn whose routing kept the request off the Pro; a continuation stays where its
+        conversation is): a route routing.choose marked (sensitive_notice.ROUTE_KEY), or a refused opening turn whose
+        refusal fallback was not taken (detector "refusal", the reason refusal_why names). Every such turn is logged
+        and recorded on its route's row (detector, reason, notice shown or opted out: categories only, never text);
+        the client's OPT_OUT_HEADER suppresses only the injected block. Bookkeeping never fails the turn."""
+        if not created:
+            return None
+        route = getattr(session, "route", None) or {}
+        mark = route.get(sensitive_notice.ROUTE_KEY)
+        if not mark and stop == "refusal" and refusal_why:
+            mark = sensitive_notice.mark("refusal", refusal_why[0])
+            session.route = {**route, sensitive_notice.ROUTE_KEY: mark}
+        if not mark:
+            return None
+        out = sensitive_notice.opted_out(self.headers)
+        rec = sensitive_notice.record(mark, sensitive_notice.OPTED_OUT if out else sensitive_notice.SHOWN)
+        rid = route.get("route_id")
+        logger.warning("sensitive-cloud: route %s marked by %s answered in the cloud by %s/%s: the Pro did not take it "
+                       "(%s); notice %s", rid, rec["detector"], route.get("provider"), route.get("model"),
+                       rec["reason"], rec["notice"])
+        hook = self.server.registry.sensitive_cloud
+        if hook is not None and rid:
+            try:
+                if hook(str(rid), rec) is False:
+                    logger.warning("sensitive-cloud: route %s: the route row's record was not written", rid)
+            except Exception as exc:                    # the reply is good; only its record failed
+                logger.warning("sensitive-cloud: route %s: recording failed: %s", rid, type(exc).__name__)
+        return None if out else sensitive_notice.block(rec["detector"], rec["reason"], route.get("model"))
 
     def _exclusion_refusal(self, model: str, label: str, advice: str) -> str | None:
         """Why x-cortados-exclude-model refuses a request that can only run on `model` (a lane that never reaches the
@@ -3117,10 +3167,20 @@ class Handler(BaseHTTPRequestHandler):
                        "cannot hold the opening turn" if outcome == local_lane.TOO_LARGE else
                        "cannot read the opening turn's content (text-only model)" if outcome == local_lane.UNSUPPORTED
                        else "answered the opening turn with an HTTP 5xx before any byte reached the client")
+            bound = session.route or {}
             session = self._open_conversation(turn, body, wire, one_shot=one_shot, floor=floor, scope=scope,
                                               also_exclude=str((moved.get("model") or {}).get("id") or ""))
             if session is None:
                 return
+            if not isinstance(session, LocalSession):
+                # #124: a request a detector marked now leaves the machine because the node could not take it. The
+                # reason is the gate's outcome (the re-route's own skip only says the model was excluded); the
+                # detector is the new route's, else the one the local bind recorded.
+                det = ((session.route or {}).get(sensitive_notice.ROUTE_KEY) or {}).get("detector") or \
+                    bound.get(sensitive_notice.DETECTOR_KEY)
+                if det:
+                    session.route = {**(session.route or {}),
+                                     sensitive_notice.ROUTE_KEY: sensitive_notice.mark(det, outcome)}
             if isinstance(session, LocalSession):
                 self._relay_local(session, turn, body, created=True, one_shot=one_shot, wire=wire, reroute=False)
                 return
@@ -3234,8 +3294,13 @@ class Handler(BaseHTTPRequestHandler):
                 _turn_t0 = time.time()
                 result = session.run_turn(deadline - time.time())
                 cur = session                           # the session this turn's answer belongs to
+                refusal_why: list[str] = []
                 moved = self._refusal_fallback(session, turn, body, result, created=created, one_shot=one_shot,
-                                               wire=wire)
+                                               wire=wire, why_out=refusal_why)
+                if not moved:
+                    # #124: a request a detector marked, answered in the cloud: the notice leads the reply.
+                    outcome["notice"] = self._sensitive_cloud_notice(session, created=created, stop=result[1],
+                                                                     refusal_why=refusal_why)
                 if moved:
                     try:
                         _ledger_turn(session, result[2])   # the refused cloud turn was spent all the same
@@ -3246,7 +3311,8 @@ class Handler(BaseHTTPRequestHandler):
                     outcome["moved"] = cur
                 outcome["turn"] = result
                 _turn_ms = int((time.time() - _turn_t0) * 1000)
-                _remember_reply(cur, turn, msg_id, model, outcome["turn"])
+                shown_blocks = sensitive_notice.prepend(outcome["turn"][0], outcome.get("notice"))
+                _remember_reply(cur, turn, msg_id, model, (shown_blocks, *outcome["turn"][1:]))
                 # Compaction content store (shadow, off unless CORTADOS_COMPACTION_STORE=1): the one point where the
                 # turn's new user content / tool results and the backend's reply are both known. It only reads them
                 # and enqueues for the store's background writer; it never raises or blocks (failures are counted).
@@ -3379,6 +3445,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 return self._json(502, wire.error_json("api_error", str(outcome["error"])))
             blocks, stop, usage = outcome["turn"]
+            blocks = sensitive_notice.prepend(blocks, outcome.get("notice"))   # its own leading block (#124)
             logger.info("conversation %s: %s, %d blocks%s", session.id[:8], stop, len(blocks),
                         " (client gone; reply not sent)" if client_gone else "")
             if not client_gone:
@@ -3837,9 +3904,11 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
         registry.floor_turn = lambda route, floor: routing.floor_turn(core, route, floor, codex_home)
         registry.floor_search = lambda cand, floor, rid: _floor_search(core, cand, floor, rid)
         registry.floor_release = lambda rid: _floor_release(core, rid)
-        registry.refusal_route = lambda body, route, run: routing.refusal_route(core, body, route, run)
+        registry.refusal_route = lambda body, route, run, why_out=None: routing.refusal_route(core, body, route, run,
+                                                                                               why_out)
         registry.local_recheck = lambda body, route: routing.continuation_admission(core, body, route)
         registry.log_tokens = core.log_tokens
+        registry.sensitive_cloud = core.log_sensitive_cloud
     httpd = ProviderServer((host, port), registry)
 
     def reaper():

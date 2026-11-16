@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
+from cortados_router.provider import sensitive_notice
 from cortados_router.safe_text import safe_error_text
 
 MODEL_ID = "cortados"
@@ -214,7 +215,9 @@ def reply_fingerprint(blocks: Any) -> str:
     ids. Every assistant message in a conversation was written by this endpoint, so the sequence of fingerprints
     identifies the conversation and proves the client's history agrees with the CLI session's."""
     bs = _blocks(blocks)
-    text = "".join(b.get("text", "") for b in bs if b.get("type") == "text").strip()
+    # A leading sensitive-cloud notice (#124) is the endpoint's, not the model's: the session's fingerprint is taken
+    # over the model's blocks, and a client sends the notice back (as its own block, merged, or dropped).
+    text = sensitive_notice.strip_leading("".join(b.get("text", "") for b in bs if b.get("type") == "text")).strip()
     ids = [b.get("id") for b in bs if b.get("type") == "tool_use"]
     return hashlib.sha256(json.dumps([text, ids]).encode()).hexdigest()
 
@@ -573,6 +576,8 @@ def rebuild_transcript(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             blocks = _blocks(m.get("content"))
         except WireError:
             blocks = [{"type": "_raw", "content": m.get("content")}]
+        if role == "assistant":
+            blocks = sensitive_notice.without_notice(blocks)   # the endpoint's notice (#124), never the model's words
         body = [p for b in blocks for p in (_replay_block(b, n, role) or [])]
         if body:
             if parts:

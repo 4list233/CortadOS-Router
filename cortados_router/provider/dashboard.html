@@ -280,6 +280,11 @@ function dur(s) {
   return Math.floor(s / 86400) + "d " + Math.floor(s % 86400 / 3600) + "h";
 }
 function ago(ts, now) { return isNum(ts) ? age(Math.max(0, now - ts)) + " ago" : "–"; }
+// #124: a sensitive request answered in the cloud because the Pro could not take it: the detector and reason categories.
+function sensCloud(r) {
+  if (!r || typeof r !== "object") return "–";
+  return "⚠ " + String(r.detector || "?") + " · " + String(r.reason || "?") + (r.notice === "opted_out" ? " (notice opted out)" : "");
+}
 function ms(v) { return (typeof v === "number") ? (v >= 1000 ? (v / 1000).toFixed(1) + " s" : Math.round(v) + " ms") : "–"; }
 function short(id) { return (typeof id === "string" && id.length > 14) ? id.slice(0, 6) + "…" + id.slice(-6) : (id || "–"); }
 function join(parts) { return parts.filter(x => x !== null && x !== undefined && x !== "").join(" · "); }
@@ -583,6 +588,7 @@ function renderConversations(box, s) {
 }
 function renderRouted(box, s, now) {
   const P = panel("p-routed", "Routed calls", "span-7");
+  // #124: a sensitive request answered in the cloud because the Pro could not take it (categories only)
   const tot = s.totals || {};
   P.meta.textContent = isNum(tot.decisions) && tot.decisions ? "routed " + pct(tot.routed_pct) + " of the latest " + tot.decisions + " decisions" : "";
   secErrors(P.body, s);
@@ -593,6 +599,7 @@ function renderRouted(box, s, now) {
     add(wide, table(routedAll ? calls : calls.slice(0, ROUTED_SHOWN), [
       {h: "when", v: x => ago(x.ts, now)}, {h: "band", v: x => x.band || "–"}, {h: "kind", v: x => x.routing_kind || "–"},
       {h: "model", v: x => x.model ? x.model + (x.lane ? " (" + x.lane + ")" : "") : (x.lane || "–")}, {h: "elapsed", num: true, v: x => ms(x.elapsed_ms)},
+      {h: "sensitive in cloud", v: x => sensCloud(x.sensitive_cloud)},
       {h: "S1 reason", cls: "reason", v: x => x.s1_reason || "–"}]));
     add(P.body, wide);
     if (calls.length > ROUTED_SHOWN) {
@@ -944,6 +951,7 @@ function renderTasks(t, failure) {
     {h: "ran on", v: x => x.actual_model || "–"}, {h: "elapsed", num: true, v: x => ms(x.elapsed_ms)},
     {h: "req chars", num: true, v: x => tok(x.request_chars)}, {h: "resp chars", num: true, v: x => tok(x.response_chars)},
     {h: "tokens", num: true, v: x => (typeof x.tokens === "number") ? tok(x.tokens) : (x.tokens_status || "not recorded")},
+    {h: "sensitive in cloud", v: x => sensCloud(x.sensitive_cloud)},
     {h: "S1 reason", cls: "reason", v: x => x.s1_reason || "–"}]));
   add(box, add(tc, wide));
   const notes = el("ul"); (t.notes || []).forEach(n => add(notes, el("li", "sub", n)));

@@ -324,7 +324,7 @@ class RefusalFallbackEndToEndTests(LocalHarness):
         core.log_route = lambda turn_id, meta, decision, r: self.route_log.append((turn_id, r)) or True
         self.marker = {"targets": [{"node": "pro", "model": TAG}], "conversation_id": "c", "client": "t"}
         self.reg.router = self.router
-        self.reg.refusal_route = lambda b, route, run: routing.refusal_route(core, b, route, run)
+        self.reg.refusal_route = lambda b, route, run, why_out=None: routing.refusal_route(core, b, route, run, why_out)
         # A refusal-bound conversation's continuations are rescored (ContinuationRecheckBase covers the refusals).
         self.reg.local_recheck = lambda b, route: routing.continuation_admission(core, b, route)
         self.scored = []
@@ -413,6 +413,50 @@ class RefusalFallbackEndToEndTests(LocalHarness):
         got = self.post(body("hello there"))
         self.assertEqual(got["content"][0]["text"], "echo: hello there")
         self.assertEqual(self.posts(), [])
+
+    # #124: a refusal is a sensitivity detector. When its fallback is not taken, the refusal the client gets leads with
+    # the notice (detector "cloud refusal"), and the route row records it; a moved refusal or a normal answer does not.
+    def refusal_notice(self, got, reason):
+        from cortados_router.provider import sensitive_notice
+        self.assertEqual(got["content"][0], sensitive_notice.block("refusal", reason, "claude-test"))
+        self.assertEqual(got["stop_reason"], "refusal")
+        self.assertEqual(self.records[-1][1], {"detector": "refusal", "reason": reason, "notice": "shown"})
+
+    def records_on(self):
+        self.records = []
+        self.reg.sensitive_cloud = lambda rid, rec: self.records.append((rid, rec)) or True
+
+    def test_notice_when_the_node_is_down_at_refusal_time(self):
+        self.records_on()
+        self.ollama.shutdown()
+        self.ollama.server_close()
+        self.refusal_notice(self.post(body("please refuse")), "unavailable")
+        raw = self.post(body("please refuse", stream=True))
+        events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]
+        first = next(e for e in events if e["type"] == "content_block_delta")
+        self.assertEqual(first["index"], 0)
+        self.assertIn("marked sensitive (cloud refusal)", first["delta"]["text"])
+        self.assertEqual(len(self.records), 2)
+
+    def test_notice_when_ineligible_and_after_a_tool(self):
+        self.records_on()
+        self.marker = None
+        self.refusal_notice(self.post(body("please refuse")), "not_admitted")
+        self.marker = {"targets": [{"node": "pro", "model": TAG}], "conversation_id": "c", "client": "t"}
+        first = {**body("refuse after tool"), "tools": [READ_TOOL]}
+        got = self.post(first)
+        uses = [b for b in got["content"] if b["type"] == "tool_use"]
+        nxt = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": uses[0]["id"], "content": "ok"}]}
+        got = self.post({**first, "messages": first["messages"] + [{"role": "assistant", "content": got["content"]},
+                                                                    nxt]})
+        self.assertEqual(got["stop_reason"], "refusal")
+        self.assertFalse(any("CortadOS: this request" in b.get("text", "") for b in got["content"]))   # not the opening
+
+    def test_no_notice_when_the_refusal_is_answered_locally(self):
+        self.records_on()
+        got = self.post(body("please refuse"))
+        self.assertEqual(got["content"], [{"type": "text", "text": "hello from qwen"}])
+        self.assertEqual(self.records, [])
 
 
 class BridgeRefusalTests(unittest.TestCase):
@@ -613,7 +657,7 @@ class ContinuationRecheckBase(LocalHarness):
         self._log_route = core.log_route
         core.log_route = lambda *a: True
         self.reg.local_recheck = lambda b, route: routing.continuation_admission(core, b, route)
-        self.reg.refusal_route = lambda b, route, run: routing.refusal_route(core, b, route, run)
+        self.reg.refusal_route = lambda b, route, run, why_out=None: routing.refusal_route(core, b, route, run, why_out)
         self.scored = []
         core.decide = fake_decide(self.scored)
         routing._auto_down.clear()
@@ -851,7 +895,7 @@ class RefusalFallbackUsableAnswerTests(LocalHarness):
         self.reg.router = lambda b, client, **kw: json.loads(json.dumps(
             {**R3_ROUTE, "provider": "claude-cli", "model": "claude-test", "refusal_fallback": marker,
              "route_id": "execution:provider:call:" + uuid.uuid4().hex[:8]}))
-        self.reg.refusal_route = lambda b, route, run: routing.refusal_route(core, b, route, run)
+        self.reg.refusal_route = lambda b, route, run, why_out=None: routing.refusal_route(core, b, route, run, why_out)
         self.executed = []
         self.reg.executed = lambda route: self.executed.append((route["provider"], route["model"]))
         routing._auto_down.clear()
