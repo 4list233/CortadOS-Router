@@ -414,7 +414,9 @@ print(json.dumps({"flag": route(easy, "sensitive"), "keyword": route("explain th
 # A flagged or keyword request the Pro cannot take (switched off, on battery, the /v1/responses wire) keeps the cloud route
 # and carries the mark (detector + reason categories); a request no detector marks, or one only `prefer`s, carries none.
 # Then the real wires: the notice is content block 0 / output item 0, the model's blocks follow with their own indices and
-# stop reason, and reply_fingerprint is the same with the notice as its own block, merged, or absent.
+# stop reason, and the session's recorded injection (sensitive_notice.Injected, review round 3: provenance, not shape)
+# matches the client's copy with the notice as its own block, merged, or absent, while a reply the model wrote that only
+# quotes the notice keeps it in its fingerprint.
 NOTICE_SCENARIO = """
 import json, os, sys, tempfile
 from cortados_router import core
@@ -459,14 +461,17 @@ evs = [json.loads(l[6:]) for c in anthropic_wire.sse_body(shown, "tool_use", {})
        if l.startswith("data: ")]
 msg = anthropic_wire.message_json("m", "cortados", shown, "tool_use", {})
 resp = responses_wire.message_json("r", "cortados", shown, "tool_use", {})
-fp = anthropic_wire.reply_fingerprint
+fp, cfp = anthropic_wire.reply_fingerprint, anthropic_wire.client_fingerprint
 merged = [{"type": "text", "text": note["text"] + "\\n\\n" + model[0]["text"]}, model[1]]
+rec = sensitive_notice.Injected(fp(model), note["text"], 0)
+quoted = [{"type": "text", "text": note["text"] + " is the warning the docs need."}]
 print(json.dumps({"routes": routes, "text": note["text"],
                   "sse": [[e["index"], e["content_block"]["type"]] for e in evs if e["type"] == "content_block_start"],
                   "sse_stop": [e["delta"]["stop_reason"] for e in evs if e["type"] == "message_delta"],
                   "json": [b["type"] for b in msg["content"]], "json_stop": msg["stop_reason"],
                   "responses": [i["type"] for i in resp["output"]],
-                  "fingerprint": fp(shown) == fp(model) == fp(merged)}))
+                  "fingerprint": rec == cfp(shown) and rec == cfp(model) and rec == cfp(merged)
+                                 and cfp(quoted) == fp(quoted) and fp(quoted) != fp([])}))
 """
 
 # Continuations of a local-bound conversation (review fix, 2026-11-13): every later turn of a conversation an automatic

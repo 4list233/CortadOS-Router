@@ -210,16 +210,29 @@ def tool_use_ids(blocks: Any) -> list[str]:
             if b.get("type") == "tool_use" and isinstance(b.get("id"), str) and b["id"]]
 
 
+def _fingerprint(text: str, ids: list) -> str:
+    return hashlib.sha256(json.dumps([text.strip(), ids]).encode()).hexdigest()
+
+
 def reply_fingerprint(blocks: Any) -> str:
     """One assistant message as the endpoint wrote it: its text (whitespace-trimmed, blocks joined) and its tool_use
     ids. Every assistant message in a conversation was written by this endpoint, so the sequence of fingerprints
-    identifies the conversation and proves the client's history agrees with the CLI session's."""
+    identifies the conversation and proves the client's history agrees with the CLI session's. Nothing is removed: a
+    sensitive-cloud notice the endpoint injected is matched by provenance (sensitive_notice.Injected), not by shape."""
     bs = _blocks(blocks)
-    # A leading sensitive-cloud notice (#124) is the endpoint's, not the model's: the session's fingerprint is taken
-    # over the model's blocks, and a client sends the notice back (as its own block, merged, or dropped).
-    text = sensitive_notice.strip_leading("".join(b.get("text", "") for b in bs if b.get("type") == "text")).strip()
+    return _fingerprint("".join(b.get("text", "") for b in bs if b.get("type") == "text"),
+                        [b.get("id") for b in bs if b.get("type") == "tool_use"])
+
+
+def client_fingerprint(blocks: Any) -> sensitive_notice.Fingerprint:
+    """An assistant message of a client's history: reply_fingerprint's value, plus the candidate a session's recorded
+    notice injection (#124) may accept: (the notice-shaped leading text, the fingerprint without it), else None."""
+    bs = _blocks(blocks)
+    joined = "".join(b.get("text", "") for b in bs if b.get("type") == "text")
     ids = [b.get("id") for b in bs if b.get("type") == "tool_use"]
-    return hashlib.sha256(json.dumps([text, ids]).encode()).hexdigest()
+    lead = sensitive_notice.split_leading(joined)
+    return sensitive_notice.Fingerprint(_fingerprint(joined, ids),
+                                        (lead[0], _fingerprint(lead[1], ids)) if lead else None)
 
 
 # Client-injected transient text inside user content. Claude Code wraps its reminders (todo state, file-change notes,
@@ -393,7 +406,7 @@ def _parse_request(body: dict[str, Any]) -> ClientTurn:
     return ClientTurn(system=_system_text(body.get("system")), tools=[without_cache_control(t) for t in tools
                                                                      if t.get("name") and not is_server_tool(t)],
                       content=content, tool_results=results,
-                      history=[reply_fingerprint(m.get("content")) for m in messages if m.get("role") == "assistant"],
+                      history=[client_fingerprint(m.get("content")) for m in messages if m.get("role") == "assistant"],
                       stream=bool(body.get("stream")), model=str(body.get("model") or MODEL_ID),
                       prefix_digest=conversation_digest(messages[:start]),
                       history_tool_ids=any(tool_use_ids(m.get("content")) for m in messages
@@ -564,12 +577,16 @@ def history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [m for m in messages[:start] if isinstance(m, dict)]
 
 
-def rebuild_transcript(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def rebuild_transcript(messages: list[dict[str, Any]],
+                       notices: dict[int, str] | None = None) -> list[dict[str, Any]]:
     """Anthropic-shaped history messages as one labelled transcript (see REBUILD_NOTE), as content blocks: text, with
     each historical image kept in place as an image block (see _image_parts). Content that _blocks refuses in an
-    earlier message is shown as its JSON, never a 400: the endpoint already accepted it once."""
+    earlier message is shown as its JSON, never a 400: the endpoint already accepted it once. `notices`: the
+    sensitive-cloud notices the session injected (#124; sensitive_notice.injected: assistant message index -> exact
+    text); exactly those are left out of their own assistant message, and nothing else is."""
     parts: list = []
     n = [0]                                         # images numbered across the whole transcript
+    k = -1                                          # assistant message index
     for m in messages:
         role = {"assistant": "assistant", "user": "user", "system": "operator"}.get(m.get("role"), str(m.get("role")))
         try:
@@ -577,7 +594,9 @@ def rebuild_transcript(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         except WireError:
             blocks = [{"type": "_raw", "content": m.get("content")}]
         if role == "assistant":
-            blocks = sensitive_notice.without_notice(blocks)   # the endpoint's notice (#124), never the model's words
+            k += 1
+            # the endpoint's own injected notice (#124), by provenance; never the model's words
+            blocks = sensitive_notice.without_injected(blocks, (notices or {}).get(k))
         body = [p for b in blocks for p in (_replay_block(b, n, role) or [])]
         if body:
             if parts:

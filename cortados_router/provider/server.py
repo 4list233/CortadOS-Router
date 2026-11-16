@@ -737,6 +737,14 @@ def _pct_label(model: str, pct_left: float | None) -> str:
     return model if pct_left is None else f"{model} · {round(pct_left)}% left"
 
 
+def _routed_cloud(route: Any) -> bool:
+    """Whether `route` is an S1 route to a cloud model (#124): a dict naming its provider and model, neither a pin nor a
+    local lane. Only such a conversation has a detector and a routes row, so only it can carry a sensitive-cloud notice;
+    an unrouted session (a fixed-model endpoint: route None) never does."""
+    return (isinstance(route, dict) and bool(route.get("provider")) and bool(route.get("model"))
+            and not route.get("local") and not route.get("pinned"))
+
+
 def reveal_model(route: dict | None) -> str | None:
     """`<model> · <pct>% left` for a revealing client, `<model>` when the % is unknown, None (answer `cortados`) when
     there is no route or it is degraded. Never raises: a reveal is cosmetic and must not fail a turn."""
@@ -1328,7 +1336,7 @@ class Registry:
             except BaseException:
                 self.release_opening()
                 raise
-            new.history = list(turn.history)
+            new.history = sensitive_notice.carry(old.history, list(turn.history))   # keeps injected-notice provenance
             new.rebuild_seed = None if isinstance(new, LocalSession) else transcript   # local: the relay is stateless
             new.rebuild_budget = budget
             new.rebuilt_for = rebuilt_for       # (gate key, new turn's fingerprint): rebuild()'s twin check
@@ -2807,11 +2815,15 @@ class Handler(BaseHTTPRequestHandler):
         route = getattr(session, "route", None)
         rid = (route or {}).get("route_id")
         why, category = None, None
-        if not created:
+        if not _routed_cloud(route):
+            # Checked before any notice category (#124 round 3): an unrouted conversation (a fixed-model endpoint), a
+            # pin or a local lane has no detector and no route row, so no category is named and nothing is re-run.
+            why = "the conversation is not S1-routed to a cloud model"
+        elif not created:
             # HOOK(rebuild-on-409): a refusal later in a conversation could move it too, by seeding the local lane from
             # the client's transcript as branch rebuild-on-409 does for a lost backend. Not built: the conversation
             # stays on its cloud model and the client sees the refusal, with the notice saying so (#124 round 2).
-            # Checked first: on either wire a continuation is never moved, and its notice is the continuation one.
+            # Checked before the wire: on either wire a continuation is never moved; its notice is the continuation one.
             why = "a refusal after the opening turn does not move the conversation (follow-up: rebuild-on-409)"
             category = sensitive_notice.REFUSED_CONTINUATION
         elif wire is not ANTHROPIC:
@@ -2822,12 +2834,8 @@ class Handler(BaseHTTPRequestHandler):
               or any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks)):
             why = "client tools ran or were requested in this conversation; a turn with tool effects is never re-run"
             category = "tools_ran"
-        elif not route or route.get("local") or route.get("pinned"):
-            why = "the conversation is not S1-routed to a cloud model"
         elif reg.refusal_route is None:
-            why = "this endpoint has no refusal fallback (fixed model)"
-        if route and (route.get("local") or route.get("pinned")):
-            category = None                             # a pin or a local lane: the person's or a local answer
+            why = "this endpoint has no refusal fallback"
         if why:
             logger.info("sensitive: refusal not taken for %s: %s", rid, why)
             if category:
@@ -2880,7 +2888,9 @@ class Handler(BaseHTTPRequestHandler):
         categories only, never text), except that a continuation never overwrites a record the row already holds (the
         first detection stays; the log line still names this one); the client's OPT_OUT_HEADER suppresses only the
         injected block. Bookkeeping never fails the turn."""
-        route = getattr(session, "route", None) or {}
+        route = getattr(session, "route", None)
+        if not _routed_cloud(route):
+            return None                                 # no S1 route (fixed model, pin, local lane): no detector, no row
         mark = route.get(sensitive_notice.ROUTE_KEY)
         write = True
         if not created:
@@ -3343,7 +3353,12 @@ class Handler(BaseHTTPRequestHandler):
                         # reply would go out while history fell behind the client, killing the conversation on its next
                         # continuation.
                         _log_ledger_hook_failure(exc)
-                cur.history.append(anthropic_wire.reply_fingerprint(outcome["turn"][0]))
+                fp = anthropic_wire.reply_fingerprint(outcome["turn"][0])   # the model's own blocks
+                if outcome.get("notice") and cur is session:
+                    # #124 round 3: provenance. The session records the notice it injected into this reply (exact text,
+                    # block 0, this turn): only that is ever taken out of the client's copy of the reply.
+                    fp = sensitive_notice.Injected(fp, outcome["notice"]["text"], 0)
+                cur.history.append(fp)
                 if cur.route and not cur.route_logged and reg.executed:
                     try:
                         reg.executed(cur.route)
@@ -3546,7 +3561,8 @@ class Handler(BaseHTTPRequestHandler):
             self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
             return None
         try:
-            transcript = anthropic_wire.rebuild_transcript(wire.history_messages(body))
+            transcript = anthropic_wire.rebuild_transcript(wire.history_messages(body),
+                                                           sensitive_notice.injected(rb.session.history))
         except (wire.WireError, RecursionError) as exc:
             self._error(400, "invalid_request_error", f"cortados: the history cannot be replayed: {exc}", wire,
                         reason="the request does not parse on this wire")
@@ -3764,9 +3780,16 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
     def _route_header(self, session) -> None:
+        """The x-cortados-route header of a routed session. Cosmetic metadata: a partial route (one missing provider
+        or model, #124 round 3) sends no header, and the header can never fail the reply it rides on."""
         r = getattr(session, "route", None)
-        if r:
-            self.send_header("x-cortados-route", f"{r['provider']}/{r['model']} band={r['band']} id={r['route_id']}")
+        if not isinstance(r, dict) or not r.get("provider") or not r.get("model"):
+            return
+        try:
+            self.send_header("x-cortados-route", f"{r['provider']}/{r['model']} band={r.get('band', '?')} "
+                                                 f"id={r.get('route_id', '?')}")
+        except Exception:                               # a header value send_header refuses: the reply goes without it
+            logger.debug("x-cortados-route header not sent", exc_info=True)
 
 
 class ProviderServer(ThreadingHTTPServer):

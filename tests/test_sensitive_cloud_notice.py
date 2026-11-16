@@ -20,7 +20,7 @@ from cortados_router.provider import (anthropic_wire, live, local_lane, response
                                       server, tasks)
 from tests.test_local_effort_reroute import RerouteEndToEndBase
 from tests.test_local_mlx import _gate_too_large, _gate_unsupported
-from tests.test_provider import READ_TOOL, TOKEN
+from tests.test_provider import READ_TOOL, TOKEN, EndpointHarness
 from tests.test_provider_local import FakeOllama, TAG
 from tests.test_provider_local_auto import body
 from tests.test_provider_sensitive import (CLEAN, R3_ROUTE, SECRET_TERM, ContinuationRecheckBase, SensitiveBase,
@@ -72,11 +72,11 @@ class VocabularyTests(unittest.TestCase):
             for why in sensitive_notice.REASONS:
                 t = notice(det, why)
                 self.assertTrue(sensitive_notice.is_notice(t), t)
-                self.assertEqual(sensitive_notice.strip_leading(t + "the answer"), "the answer")
+                self.assertEqual(sensitive_notice.split_leading(t + "the answer"), (t, "the answer"))
 
-    def test_strip_leading_leaves_other_text_alone(self):
+    def test_split_leading_finds_no_candidate_in_other_text(self):
         for t in ("the answer", "⚠ CortadOS: something else", "x " + notice("flag", "busy")):
-            self.assertEqual(sensitive_notice.strip_leading(t), t)
+            self.assertIsNone(sensitive_notice.split_leading(t))
 
     def test_opt_out_header(self):
         self.assertTrue(sensitive_notice.opted_out({"x-cortados-sensitive-notice": " OFF "}))
@@ -91,29 +91,106 @@ class VocabularyTests(unittest.TestCase):
 
 
 class FingerprintTests(unittest.TestCase):
-    """The session fingerprints the model's blocks; the client sends the notice back however it kept it."""
+    """Review round 3 (P2): provenance, never shape. The session records the notice it injected (sensitive_notice.
+    Injected: exact text, block 0, that turn) over the fingerprint of the model's blocks; the client sends the reply
+    back however it kept it. Text the model wrote that only looks like a notice is never removed."""
 
     MODEL = [{"type": "text", "text": "Let me look."}, {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}]
+    WARNING = notice("flag", "too_large")
 
-    def test_separate_merged_or_dropped_notice_all_match(self):
-        want = anthropic_wire.reply_fingerprint(self.MODEL)
-        n = notice("flag", "too_large")
+    def injected(self, n=None):
+        return sensitive_notice.Injected(anthropic_wire.reply_fingerprint(self.MODEL), n or self.WARNING, 0)
+
+    def client(self, blocks):
+        return anthropic_wire.client_fingerprint(blocks)
+
+    def test_an_injected_notice_kept_merged_or_dropped_matches_the_continuation(self):
+        n = self.WARNING
         separate = [{"type": "text", "text": n}] + self.MODEL
         merged = [{"type": "text", "text": n + "\n\nLet me look."}, self.MODEL[1]]
-        for blocks in (separate, merged, self.MODEL):
-            self.assertEqual(anthropic_wire.reply_fingerprint(blocks), want)
+        merged_tight = [{"type": "text", "text": n + "Let me look."}, self.MODEL[1]]
+        for blocks in (separate, merged, merged_tight, self.MODEL):
+            c = self.client(blocks)
+            # both sides of ==, and inside history lists (Registry compares lists, in either order)
+            self.assertTrue(self.injected() == c and c == self.injected(), blocks)
+            self.assertFalse(self.injected() != c or c != self.injected(), blocks)
+            self.assertEqual([self.injected()], [c])
+            self.assertEqual([c], [self.injected()])
+            self.assertIn(c, [self.injected()])
+
+    def test_only_the_exact_recorded_text_is_accepted(self):
+        other = notice("keyword", "busy")
+        c = self.client([{"type": "text", "text": other}] + self.MODEL)
+        self.assertNotEqual(self.injected(), c)
+        self.assertNotEqual(c, self.injected())
+        # with no injection recorded for the turn, a notice-shaped leading text is part of the reply
+        self.assertNotEqual(anthropic_wire.reply_fingerprint(self.MODEL),
+                            self.client([{"type": "text", "text": self.WARNING}] + self.MODEL))
+
+    def test_model_authored_notice_text_stays_in_the_fingerprint(self):
+        doc = [{"type": "text", "text": "The documentation must include this exact warning: " + self.WARNING}]
+        leading = [{"type": "text", "text": self.WARNING + "\n\nThat is the warning the docs need."}]
+        for blocks in (doc, leading):
+            session_fp = anthropic_wire.reply_fingerprint(blocks)    # no injection: the model's blocks as written
+            self.assertEqual(self.client(blocks), session_fp)
+            stripped = [{"type": "text", "text": "The documentation must include this exact warning: "}] \
+                if blocks is doc else [{"type": "text", "text": "That is the warning the docs need."}]
+            self.assertNotEqual(session_fp, anthropic_wire.reply_fingerprint(stripped))
+
+    def test_two_different_notice_only_replies_get_different_fingerprints(self):
+        a = [{"type": "text", "text": notice("flag", "busy")}]
+        b = [{"type": "text", "text": notice("keyword", "too_large")}]
+        self.assertNotEqual(anthropic_wire.reply_fingerprint(a), anthropic_wire.reply_fingerprint(b))
+        self.assertNotEqual(self.client(a), self.client(b))
+        self.assertNotEqual(anthropic_wire.reply_fingerprint(a), anthropic_wire.reply_fingerprint([]))
 
     def test_a_notice_does_not_hide_a_different_reply(self):
-        other = [{"type": "text", "text": notice("flag", "busy")}, {"type": "text", "text": "Something else."}]
+        other = [{"type": "text", "text": self.WARNING}, {"type": "text", "text": "Something else."}]
+        self.assertNotEqual(self.client(other), self.injected())
         self.assertNotEqual(anthropic_wire.reply_fingerprint(other), anthropic_wire.reply_fingerprint(self.MODEL))
 
-    def test_rebuild_transcript_leaves_the_notice_out(self):
-        msgs = [{"role": "user", "content": "hi"},
-                {"role": "assistant", "content": [{"type": "text", "text": notice("flag", "too_large")},
-                                                  {"type": "text", "text": "hello"}]}]
-        text = json.dumps(anthropic_wire.rebuild_transcript(msgs))
-        self.assertNotIn("CortadOS: this request", text)
-        self.assertIn("hello", text)
+    def test_carry_keeps_provenance_through_a_rebuild(self):
+        c = self.client([{"type": "text", "text": self.WARNING}] + self.MODEL)
+        kept = sensitive_notice.carry([self.injected()], [c])
+        self.assertIsInstance(kept[0], sensitive_notice.Injected)
+        self.assertEqual(sensitive_notice.injected(kept), {0: self.WARNING})
+        plain = self.client([{"type": "text", "text": "other"}])
+        self.assertIs(sensitive_notice.carry([self.injected()], [plain])[0], plain)
+
+    def rebuilt(self, msgs, notices=None):
+        return "".join(b.get("text", "") for b in anthropic_wire.rebuild_transcript(msgs, notices))
+
+    def test_rebuild_transcript_leaves_out_the_injected_notice_only(self):
+        n = self.WARNING
+        for content in ([{"type": "text", "text": n}, {"type": "text", "text": "hello"}],
+                        [{"type": "text", "text": n + "\n\nhello"}]):
+            msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": content}]
+            text = self.rebuilt(msgs, {0: n})
+            self.assertNotIn("CortadOS: this request", text)
+            self.assertIn("hello", text)
+            # recorded for another turn, or a different text: nothing is removed
+            self.assertIn(n, self.rebuilt(msgs, {1: n}))
+            self.assertIn(n, self.rebuilt(msgs, {0: notice("keyword", "busy")}))
+
+    def test_model_authored_warning_survives_rebuild_leading_and_not(self):
+        n = self.WARNING
+        doc = "The documentation must include this exact warning: " + n
+        cases = ([{"type": "text", "text": doc}],                                    # non-leading, one block
+                 [{"type": "text", "text": "The docs need:"}, {"type": "text", "text": n}],   # non-leading block
+                 [{"type": "text", "text": n}, {"type": "text", "text": "is the warning."}])  # leading, model's own
+        for content in cases:
+            msgs = [{"role": "user", "content": "write the docs"}, {"role": "assistant", "content": content}]
+            self.assertIn(n, self.rebuilt(msgs), content)               # no injection recorded
+        # an injection on turn 0 removes only turn 0's leading copy; the model's copy on turn 1 stays
+        msgs = [{"role": "user", "content": "a"},
+                {"role": "assistant", "content": [{"type": "text", "text": n}, {"type": "text", "text": "x"}]},
+                {"role": "user", "content": "b"},
+                {"role": "assistant", "content": [{"type": "text", "text": doc}]},
+                {"role": "user", "content": "c"},
+                {"role": "assistant", "content": [{"type": "text", "text": "intro "}, {"type": "text", "text": n}]}]
+        text = self.rebuilt(msgs, {0: n, 2: n})
+        self.assertEqual(text.count(n), 2, text)
+        self.assertIn(doc, text)
 
 
 class WhyCategoryTests(unittest.TestCase):
@@ -508,8 +585,11 @@ class ResponsesWireTests(NoticeHarness):
         self.assertIn("and the second one", again["output"][0]["content"][0]["text"])
         self.assertEqual(list(self.reg.sessions.values()), [s])
         parsed = responses_wire.parse_request(nxt)
-        self.assertEqual(parsed.history, [anthropic_wire.reply_fingerprint(
-            [{"type": "text", "text": got["output"][1]["content"][0]["text"]}])])
+        # the session recorded its injection; the client's copy, notice item included, matches it by provenance
+        self.assertEqual(s.history[:1], parsed.history)
+        self.assertIsInstance(s.history[0], sensitive_notice.Injected)
+        self.assertEqual(str(s.history[0]), anthropic_wire.reply_fingerprint(
+            [{"type": "text", "text": got["output"][1]["content"][0]["text"]}]))
 
 
 class RouteRowRecordTests(unittest.TestCase):
@@ -563,3 +643,78 @@ class RouteRowRecordTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FixedModelRefusedContinuationTests(EndpointHarness):
+    """Review round 3 (P1-shaped P2): a fixed-model endpoint (no router: session.route is None) whose cloud model
+    refuses a continuation. No detector applies there: the client gets the refusal as it is, no notice, no record, and
+    the reply is never broken by a partial route (it was a KeyError in _route_header, the client saw a dropped
+    connection)."""
+
+    HEADERS = {"X-Claude-Code-Session-Id": "6a1d0c3e-fixed-refusal"}
+
+    def test_refused_continuation_gets_a_clean_refusal(self):
+        records = []
+        self.reg.sensitive_cloud = lambda rid, rec: records.append((rid, rec)) or True
+        first = {**body("refuse after tool"), "tools": [READ_TOOL]}
+        got = self.post(first)
+        (s,) = self.reg.sessions.values()
+        self.assertIsNone(s.route)
+        uses = [b for b in got["content"] if b["type"] == "tool_use"]
+        nxt = {**first, "messages": first["messages"] + [
+            {"role": "assistant", "content": got["content"]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": uses[0]["id"], "content": "ok"}]}]}
+        for stream in (False, True):
+            if stream:
+                for old in list(self.reg.sessions.values()):
+                    self.reg.drop(old)
+                got = self.post(first)
+                uses = [b for b in got["content"] if b["type"] == "tool_use"]
+                nxt = {**first, "stream": True, "messages": first["messages"] + [
+                    {"role": "assistant", "content": got["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": uses[0]["id"],
+                                                  "content": "ok"}]}]}
+                raw = self.post(nxt)
+                self.assertIn("refusal", raw)
+                self.assertNotIn("CortadOS", raw)
+            else:
+                got = self.post(nxt)
+                self.assertEqual(got["stop_reason"], "refusal")
+                self.assertEqual(got["content"], [{"type": "text", "text": "API Error: the model refused"}])
+            (s,) = self.reg.sessions.values()
+            self.assertIsNone(s.route)                  # no partial route was made up
+            self.assertFalse(any(isinstance(h, sensitive_notice.Injected) for h in s.history))
+        self.assertEqual(records, [])
+
+
+class RouteHeaderTests(unittest.TestCase):
+    """_route_header is cosmetic: a partial route sends no header (or a placeholder field) and never raises."""
+
+    def handler(self):
+        h = object.__new__(server.Handler)
+        h.sent = []
+        h.send_header = lambda k, v: h.sent.append((k, v))
+        return h
+
+    def test_partial_routes_never_raise(self):
+        for route in (None, {}, {"sensitive_cloud": {"detector": "refusal", "reason": "refused_continuation"}},
+                      {"provider": "claude-cli"}, {"model": "m"}, "not a dict"):
+            h = self.handler()
+            h._route_header(type("S", (), {"route": route})())
+            self.assertEqual(h.sent, [], route)
+
+    def test_a_route_without_band_or_id_still_names_its_model(self):
+        h = self.handler()
+        h._route_header(type("S", (), {"route": {"provider": "claude-cli", "model": "claude-test"}})())
+        self.assertEqual(h.sent, [("x-cortados-route", "claude-cli/claude-test band=? id=?")])
+        h = self.handler()
+        h._route_header(type("S", (), {"route": {"provider": "p", "model": "m", "band": "R2", "route_id": "r1"}})())
+        self.assertEqual(h.sent, [("x-cortados-route", "p/m band=R2 id=r1")])
+
+    def test_a_header_send_failure_does_not_fail_the_reply(self):
+        h = self.handler()
+
+        def boom(k, v):
+            raise ValueError("bad header")
+        h.send_header = boom
+        h._route_header(type("S", (), {"route": {"provider": "p", "model": "m"}})())   # no exception

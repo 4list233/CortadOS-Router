@@ -772,11 +772,16 @@ model's blocks follow from index 1). On `/v1/responses` it is a separate leading
 detector and reason labels and the routed model only, never a keyword, a matched term or request text. A value outside
 the vocabulary is shown as the fallback label, never as itself.
 
-**History.** The backend never sees the notice. `anthropic_wire.reply_fingerprint` drops a leading notice (either form) before
-hashing, so a continuation matches its session however the client kept the reply: notice as its own block, merged into
-the next text block, or dropped. This covers both wires (`responses_wire` fingerprints through the same function), the
-failed-session digest and the replay of a retried turn, which stores the reply as shown. A rebuilt backend's transcript
-leaves notice blocks out (`anthropic_wire.rebuild_transcript`).
+**History.** The backend never sees the notice. Notices are matched by provenance, never by shape (review round 3):
+when the endpoint injects one, the session records it in its own history (`sensitive_notice.Injected`: the exact text,
+block index 0, at that turn), over the fingerprint of the model's own blocks. A continuation matches its session however
+the client kept the reply: notice as its own block, merged into the next text block (a leading prefix exactly equal to
+the recorded text), or dropped. This covers both wires (`responses_wire` fingerprints through
+`anthropic_wire.client_fingerprint`) and the replay of a retried turn, which stores the reply as shown. A rebuilt
+backend's transcript leaves out exactly the recorded injections (`anthropic_wire.rebuild_transcript`), and a rebuilt
+session keeps them (`sensitive_notice.carry`). Text the model wrote that only looks like a notice (a reply that quotes
+the warning, leading or not) is never removed, and fingerprints are taken over everything the client sent, so two
+different notice-only replies never share one.
 
 **Opt-out.** A caller that must not get injected text (one parsing the reply as data) sends
 `x-cortados-sensitive-notice: off` on the request. Only the block is suppressed: the warning log line and the route

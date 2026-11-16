@@ -18,7 +18,7 @@ from typing import Any, Iterator
 from cortados_router.provider import anthropic_wire
 from cortados_router.safe_text import safe_error_text
 from cortados_router.provider.anthropic_wire import (ClientTurn, WireError, check_tool_name, log_safe, mcp_content,
-                                                    reply_fingerprint, sse)
+                                                    client_fingerprint, reply_fingerprint, sse)
 
 MODEL_ID = anthropic_wire.MODEL_ID
 # Item types Codex re-sends that this endpoint never produced and that carry no conversation content: they are
@@ -237,7 +237,7 @@ def _parse_request(body: dict[str, Any]) -> ClientTurn:
 
     def end_run():
         if run:
-            history.append(reply_fingerprint(run))
+            history.append(client_fingerprint(run))
             tokens.append(["a", history[-1]])
             run.clear()
 

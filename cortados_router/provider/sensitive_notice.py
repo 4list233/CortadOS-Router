@@ -12,10 +12,12 @@ Owner of three rules:
   framing      the notice is its own leading text block (prepend): on /v1/messages a separate content block before
                the model's content (JSON and SSE, indices following from the block list), on /v1/responses a separate
                leading `message` output item. tool_use blocks and the stop reason are the model's, untouched.
-  history      reply_fingerprint (anthropic_wire) drops a leading notice (strip_leading), so a client that sends the
-               notice back in its history, as received, merged into the next text block, or not at all, matches
-               the session's fingerprint, which is taken over the model's own blocks. A rebuilt backend's transcript
-               leaves notice blocks out (without_notice): the model never wrote them.
+  history      provenance, never shape (#124 round 3): the session records each notice it injects (Injected: its
+               exact text, at its turn, block index 0) in its own history, whose entry is the fingerprint of the
+               model's own blocks. A client that sends the reply back as received, with the notice merged into the
+               next text block, or without it, matches that entry; a rebuilt backend's transcript leaves out exactly
+               that injected text (without_injected). Text the model wrote that only looks like a notice is never
+               removed, and fingerprints are taken over everything the client sent (anthropic_wire.client_fingerprint).
 
 Escape hatch: OPT_OUT_HEADER: off on the request that would carry the notice suppresses the injected block only; the
 route row and the log line are written all the same, marked `opted_out`.
@@ -83,7 +85,7 @@ REFUSED_PREFIX = "⚠ CortadOS: "
 REFUSED_TEMPLATE = (REFUSED_PREFIX + "{model} in the cloud refused this turn (marked sensitive: {detector}). The turn "
                     "was not moved to the Pro ({reason}): only a conversation's opening turn can be moved, so the "
                     "refusal stands.")
-# What strip_leading recognises: either template with any short parenthesised labels and any model token, so a notice
+# What split_leading recognises as a candidate: either template with any short parenthesised labels and any model token, so a notice
 # written under an older vocabulary still matches. Anchored at the start; the model token holds no whitespace.
 _MODEL_TOKEN = r"(?:\S{1,120}|" + re.escape(UNNAMED_MODEL) + r")"
 _NOTICE_RE = re.compile(
@@ -149,19 +151,105 @@ def valid_record(value: Any) -> dict[str, str] | None:
 
 
 def is_notice(text_: Any) -> bool:
+    """Whether `text_` is SHAPED like a notice. Shape alone never removes anything: only an injection the session
+    recorded (Injected) is ever taken out of a fingerprint or a rebuilt transcript."""
     return isinstance(text_, str) and _NOTICE_RE.fullmatch(text_.strip()) is not None
 
 
-def strip_leading(joined: str) -> str:
-    """`joined` (an assistant message's text blocks joined) without a leading notice: what reply_fingerprint hashes."""
-    s = joined.lstrip()
+def split_leading(joined: str) -> tuple[str, str] | None:
+    """(notice-shaped prefix, the rest) of an assistant message's joined text, or None. A CANDIDATE only: a client's
+    Fingerprint carries it, and only a session's Injected entry with exactly that text, at that turn, accepts it."""
+    s = joined.lstrip() if isinstance(joined, str) else ""
     m = _NOTICE_RE.match(s)
-    return s[m.end():] if m else joined
+    return (m.group(0), s[m.end():]) if m else None
 
 
-def without_notice(blocks: list) -> list:
-    """An assistant message's blocks without notice text blocks (for a rebuilt backend's transcript)."""
-    return [b for b in blocks if not (isinstance(b, dict) and b.get("type") == "text" and is_notice(b.get("text")))]
+class Fingerprint(str):
+    """One assistant message of a client's history, as anthropic_wire.client_fingerprint gives it: the str value is
+    the fingerprint of the message exactly as sent (nothing removed), and `leading` is (notice-shaped prefix,
+    fingerprint of the message without it) when its text starts with one, else None. Equality is the str's: only a
+    session's Injected entry looks at `leading`."""
+    leading: tuple[str, str] | None = None           # (str subclasses take no __slots__)
+
+    def __new__(cls, value: str, leading: tuple[str, str] | None = None):
+        o = super().__new__(cls, value)
+        o.leading = leading
+        return o
+
+
+class Injected(Fingerprint):
+    """Provenance (#124 round 3): a session's history entry for a reply this endpoint sent with an injected notice.
+    The str value is the fingerprint of the model's own blocks; `notice` is the exact injected text, and `index` its
+    block index in that reply (always 0: the notice leads). It is recorded in the session's own history, at the turn
+    it was injected in, so it stays with that turn through every copy of the history.
+
+    It equals a client's entry for the same turn when the client sent the reply without the notice (the str value) or
+    with a leading prefix that is exactly the injected text, as its own block or merged into the next text
+    (Fingerprint.leading). Nothing else is accepted: model-authored text that only looks like a notice stays in the
+    fingerprint. A subclass of Fingerprint, so Python asks it first whichever side of == it is on. Its hash is the
+    str's, so an Injected must never be a set member or dict key next to client fingerprints (history lists are
+    compared with ==, never hashed)."""
+    notice: str = ""
+    index: int = 0
+
+    def __new__(cls, value: str, notice: str, index: int = 0):
+        o = super().__new__(cls, value)
+        o.notice, o.index = notice, index
+        return o
+
+    def accepts(self, other: Any) -> bool:
+        if not isinstance(other, str):
+            return False
+        if str.__eq__(self, other):
+            return True
+        lead = getattr(other, "leading", None)
+        return bool(lead) and self.index == 0 and lead[0] == self.notice and str.__eq__(self, lead[1])
+
+    def __eq__(self, other: Any):
+        if not isinstance(other, str):
+            return NotImplemented
+        if isinstance(other, Injected):
+            return str.__eq__(self, other)
+        return self.accepts(other)
+
+    def __ne__(self, other: Any):
+        eq = self.__eq__(other)
+        return eq if eq is NotImplemented else not eq
+
+    __hash__ = str.__hash__
+
+
+def injected(history: Any) -> dict[int, str]:
+    """{assistant message index: exact injected notice text} of a session's history (the Injected entries)."""
+    return {i: h.notice for i, h in enumerate(history or []) if isinstance(h, Injected)}
+
+
+def carry(old: Any, new: list) -> list:
+    """A rebuilt session's history (`new`, the client's entries) keeping the old session's Injected entries where the
+    client's entry at the same index matches one, so the provenance survives a rebuild."""
+    old = list(old or [])
+    return [o if i < len(old) and isinstance(o := old[i], Injected) and o == c else c for i, c in enumerate(new)]
+
+
+def without_injected(blocks: list, notice: str | None) -> list:
+    """An assistant message's blocks without the notice this endpoint injected into it (`notice`, its exact text; None:
+    nothing was injected, nothing is removed). Only the leading text (the first text block, with no text before it)
+    is touched: removed when it is exactly the notice, else stripped of a prefix that is exactly the notice (a client
+    that merged it into the model's text). Text that only looks like a notice, anywhere, is the model's and stays."""
+    if not notice:
+        return list(blocks)
+    out = list(blocks)
+    for i, b in enumerate(out):
+        if not (isinstance(b, dict) and b.get("type") == "text"):
+            continue
+        t = b.get("text")
+        if isinstance(t, str):
+            if t.strip() == notice:
+                del out[i]
+            elif t.lstrip().startswith(notice):
+                out[i] = {**b, "text": t.lstrip()[len(notice):].lstrip()}
+        break                                           # the first text block only
+    return out
 
 
 def prepend(blocks: list, notice: dict[str, Any] | None) -> list:
