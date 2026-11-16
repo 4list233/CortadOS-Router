@@ -48,6 +48,16 @@ class VocabularyTests(unittest.TestCase):
         self.assertIn("(cloud refusal)", notice("refusal", "unavailable"))
         self.assertIn("(image or unsupported content)", notice("keyword", "unsupported"))
 
+    def test_refused_continuation_wording(self):
+        # Review round 2: a refused continuation says plainly that the cloud model refused and the turn stayed.
+        self.assertEqual(notice("refusal", "refused_continuation"),
+                         "⚠ CortadOS: claude-opus-test in the cloud refused this turn (marked sensitive: cloud refusal)."
+                         " The turn was not moved to the Pro (refusal after the opening turn): only a conversation's"
+                         " opening turn can be moved, so the refusal stands.")
+        got = notice(f"keyword: {SECRET_TERM}", "refused_continuation", f"model with {SECRET_TERM}")
+        self.assertNotIn("zebra", got)
+        self.assertTrue(sensitive_notice.is_notice(got))
+
     def test_only_categories_ever_reach_the_text(self):
         # A caller handing request text or a matched term as a category gets the fallback labels, never the string.
         got = notice(f"keyword: {SECRET_TERM}", f"the {SECRET_TERM} is too big", f"model with {SECRET_TERM}")

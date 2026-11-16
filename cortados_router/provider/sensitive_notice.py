@@ -65,7 +65,8 @@ REASONS = {
     "gate_token": "gate token mismatch",
     "node_error": "node error",
     "no_answer": "no usable local answer",
-    "not_opening_turn": "not the opening turn",
+    "not_opening_turn": "not the opening turn",         # kept for rows written before refused_continuation
+    "refused_continuation": "refusal after the opening turn",
     "tools_ran": "tools already ran",
 }
 FALLBACK_DETECTOR, FALLBACK_REASON = "unknown", "unavailable"
@@ -74,10 +75,23 @@ _MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,99}")
 UNNAMED_MODEL = "a cloud model"
 PREFIX = "⚠ CortadOS: this request was marked sensitive ("
 TEMPLATE = (PREFIX + "{detector}) but the Pro couldn't take it ({reason}), so it was answered by {model} in the cloud.")
-# What strip_leading recognises: the template with any short parenthesised labels and any model token, so a notice
+# A refusal of a turn after the opening one (reason REFUSED_CONTINUATION): the cloud model's refusal is the reply and
+# the turn was not moved (only an opening turn is, and a turn with tool effects is never re-run), so the notice says
+# exactly that instead of "answered by".
+REFUSED_CONTINUATION = "refused_continuation"
+REFUSED_PREFIX = "⚠ CortadOS: "
+REFUSED_TEMPLATE = (REFUSED_PREFIX + "{model} in the cloud refused this turn (marked sensitive: {detector}). The turn "
+                    "was not moved to the Pro ({reason}): only a conversation's opening turn can be moved, so the "
+                    "refusal stands.")
+# What strip_leading recognises: either template with any short parenthesised labels and any model token, so a notice
 # written under an older vocabulary still matches. Anchored at the start; the model token holds no whitespace.
-_NOTICE_RE = re.compile(re.escape(PREFIX) + r"[^()\n]{1,60}\) but the Pro couldn't take it \([^()\n]{1,80}\), so it "
-                        r"was answered by (?:\S{1,120}|" + re.escape(UNNAMED_MODEL) + r") in the cloud\.")
+_MODEL_TOKEN = r"(?:\S{1,120}|" + re.escape(UNNAMED_MODEL) + r")"
+_NOTICE_RE = re.compile(
+    r"(?:" + re.escape(PREFIX) + r"[^()\n]{1,60}\) but the Pro couldn't take it \([^()\n]{1,80}\), so it "
+    r"was answered by " + _MODEL_TOKEN + r" in the cloud\."
+    r"|" + re.escape(REFUSED_PREFIX) + _MODEL_TOKEN + r" in the cloud refused this turn \(marked sensitive: "
+    r"[^()\n]{1,60}\)\. The turn was not moved to the Pro \([^()\n]{1,80}\): only a conversation's opening turn "
+    r"can be moved, so the refusal stands\.)")
 
 
 def detector(value: Any) -> str:
@@ -93,7 +107,10 @@ def model_label(model: Any) -> str:
 
 
 def text(det: Any, why: Any, model: Any) -> str:
-    """The notice's wording: fixed labels only."""
+    """The notice's wording: fixed labels only. A refused continuation says the refusal stands and the turn stayed."""
+    if reason(why) == REFUSED_CONTINUATION:
+        return REFUSED_TEMPLATE.format(detector=DETECTORS[detector(det)], reason=REASONS[REFUSED_CONTINUATION],
+                                       model=model_label(model))
     return TEMPLATE.format(detector=DETECTORS[detector(det)], reason=REASONS[reason(why)], model=model_label(model))
 
 

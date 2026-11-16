@@ -2807,15 +2807,16 @@ class Handler(BaseHTTPRequestHandler):
         route = getattr(session, "route", None)
         rid = (route or {}).get("route_id")
         why, category = None, None
-        if wire is not ANTHROPIC:
-            why = "the conversation is on /v1/responses (the local relay speaks Messages only)"
-            category = "responses_wire"
-        elif not created:
+        if not created:
             # HOOK(rebuild-on-409): a refusal later in a conversation could move it too, by seeding the local lane from
             # the client's transcript as branch rebuild-on-409 does for a lost backend. Not built: the conversation
-            # stays on its cloud model and the client sees the refusal.
+            # stays on its cloud model and the client sees the refusal, with the notice saying so (#124 round 2).
+            # Checked first: on either wire a continuation is never moved, and its notice is the continuation one.
             why = "a refusal after the opening turn does not move the conversation (follow-up: rebuild-on-409)"
-            category = "not_opening_turn"
+            category = sensitive_notice.REFUSED_CONTINUATION
+        elif wire is not ANTHROPIC:
+            why = "the conversation is on /v1/responses (the local relay speaks Messages only)"
+            category = "responses_wire"
         elif (turn.tool_results or any(isinstance(m, dict) and m.get("role") == "assistant"
                                        for m in body.get("messages") or [])
               or any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks)):
@@ -2869,17 +2870,28 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
     def _sensitive_cloud_notice(self, session, *, created: bool, stop: Any, refusal_why: list[str]) -> dict | None:
-        """The sensitive-cloud notice of this turn (#124, sensitive_notice.py), or None. Only the turn that opened the
-        conversation carries it (the turn whose routing kept the request off the Pro; a continuation stays where its
-        conversation is): a route routing.choose marked (sensitive_notice.ROUTE_KEY), or a refused opening turn whose
-        refusal fallback was not taken (detector "refusal", the reason refusal_why names). Every such turn is logged
-        and recorded on its route's row (detector, reason, notice shown or opted out: categories only, never text);
-        the client's OPT_OUT_HEADER suppresses only the injected block. Bookkeeping never fails the turn."""
-        if not created:
-            return None
+        """The sensitive-cloud notice of this turn (#124, sensitive_notice.py), or None. The turn that opened the
+        conversation carries it (the turn whose routing kept the request off the Pro): a route routing.choose marked
+        (sensitive_notice.ROUTE_KEY), or a refused opening turn whose refusal fallback was not taken (detector
+        "refusal", the reason refusal_why names). A continuation stays where its conversation is, so it carries a
+        notice only when the cloud model refused it (round 2: the refusal detector fired on this turn; reason
+        refused_continuation, worded as "refused, not moved, the refusal stands"); its earlier mark is not repeated.
+        Every such turn is logged and recorded on its route's row (detector, reason, notice shown or opted out:
+        categories only, never text), except that a continuation never overwrites a record the row already holds (the
+        first detection stays; the log line still names this one); the client's OPT_OUT_HEADER suppresses only the
+        injected block. Bookkeeping never fails the turn."""
         route = getattr(session, "route", None) or {}
         mark = route.get(sensitive_notice.ROUTE_KEY)
-        if not mark and stop == "refusal" and refusal_why:
+        write = True
+        if not created:
+            if stop != "refusal" or not refusal_why:
+                return None
+            write = not mark                            # the row keeps its first record
+            if not mark:
+                session.route = {**route, sensitive_notice.ROUTE_KEY: sensitive_notice.mark("refusal",
+                                                                                            refusal_why[0])}
+            mark = sensitive_notice.mark("refusal", refusal_why[0])
+        elif not mark and stop == "refusal" and refusal_why:
             mark = sensitive_notice.mark("refusal", refusal_why[0])
             session.route = {**route, sensitive_notice.ROUTE_KEY: mark}
         if not mark:
@@ -2887,11 +2899,16 @@ class Handler(BaseHTTPRequestHandler):
         out = sensitive_notice.opted_out(self.headers)
         rec = sensitive_notice.record(mark, sensitive_notice.OPTED_OUT if out else sensitive_notice.SHOWN)
         rid = route.get("route_id")
-        logger.warning("sensitive-cloud: route %s marked by %s answered in the cloud by %s/%s: the Pro did not take it "
-                       "(%s); notice %s", rid, rec["detector"], route.get("provider"), route.get("model"),
-                       rec["reason"], rec["notice"])
+        if rec["reason"] == sensitive_notice.REFUSED_CONTINUATION:
+            logger.warning("sensitive-cloud: route %s: %s/%s refused a turn after the opening one; not moved to the Pro, "
+                           "the refusal stands; notice %s%s", rid, route.get("provider"), route.get("model"),
+                           rec["notice"], "" if write else " (route row keeps its earlier record)")
+        else:
+            logger.warning("sensitive-cloud: route %s marked by %s answered in the cloud by %s/%s: the Pro did not "
+                           "take it (%s); notice %s", rid, rec["detector"], route.get("provider"), route.get("model"),
+                           rec["reason"], rec["notice"])
         hook = self.server.registry.sensitive_cloud
-        if hook is not None and rid:
+        if write and hook is not None and rid:
             try:
                 if hook(str(rid), rec) is False:
                     logger.warning("sensitive-cloud: route %s: the route row's record was not written", rid)

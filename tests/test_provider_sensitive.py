@@ -449,8 +449,104 @@ class RefusalFallbackEndToEndTests(LocalHarness):
         nxt = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": uses[0]["id"], "content": "ok"}]}
         got = self.post({**first, "messages": first["messages"] + [{"role": "assistant", "content": got["content"]},
                                                                     nxt]})
-        self.assertEqual(got["stop_reason"], "refusal")
-        self.assertFalse(any("CortadOS: this request" in b.get("text", "") for b in got["content"]))   # not the opening
+        # Round 2: the refused continuation is warned and recorded too, as a refusal that was not moved.
+        self.refusal_notice(got, "refused_continuation")
+        self.assertFalse(any("CortadOS: this request" in b.get("text", "") for b in got["content"]))
+        self.assertEqual(len(self.records), 2)
+
+    # Review round 2 (P2): a refusal of a continuation (a turn after client tools ran) is never re-run, but the refusal
+    # detector fired: the reply leads with the refused-continuation notice and the route row records it.
+    def refused_continuation(self, stream=False, headers=None):
+        first = {**body("refuse after tool"), "tools": [READ_TOOL]}
+        got = self.post(first)
+        (s,) = self.reg.sessions.values()
+        uses = [b for b in got["content"] if b["type"] == "tool_use"]
+        nxt = {**first, "stream": stream, "messages": first["messages"] + [
+            {"role": "assistant", "content": got["content"]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": uses[0]["id"], "content": "ok"}]}]}
+        return s, nxt, self.post(nxt, headers=headers) if headers else self.post(nxt)
+
+    def assertNotRerun(self, s):
+        self.assertEqual(self.posts(), [])                              # the node never saw the tool turn
+        self.assertEqual(list(self.reg.sessions.values()), [s])         # same cloud session, not rebound
+        self.assertNotIsInstance(s, server.LocalSession)
+        self.assertEqual(self.route_log, [])                            # the route row was not rewritten as local
+
+    def test_refused_continuation_json_is_warned_recorded_and_not_rerun(self):
+        from cortados_router.provider import sensitive_notice
+        self.records_on()
+        s, _, got = self.refused_continuation()
+        self.refusal_notice(got, "refused_continuation")
+        self.assertIn("refused this turn", got["content"][0]["text"])
+        self.assertIn("was not moved to the Pro", got["content"][0]["text"])
+        self.assertIn("the refusal stands", got["content"][0]["text"])
+        self.assertEqual(got["content"][1:], [{"type": "text", "text": "API Error: the model refused"}])
+        (rid, rec), = self.records
+        self.assertEqual(rid, s.route["route_id"])
+        self.assertEqual(s.route[sensitive_notice.ROUTE_KEY],
+                         {"detector": "refusal", "reason": "refused_continuation"})
+        self.assertNotRerun(s)
+
+    def test_refused_continuation_sse_is_warned_recorded_and_not_rerun(self):
+        from cortados_router.provider import sensitive_notice
+        self.records_on()
+        s, _, raw = self.refused_continuation(stream=True)
+        events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]
+        starts = [e["index"] for e in events if e["type"] == "content_block_start"]
+        self.assertEqual(starts, [0, 1])
+        first = next(e for e in events if e["type"] == "content_block_delta")
+        self.assertEqual(first["index"], 0)
+        self.assertEqual(first["delta"]["text"], sensitive_notice.text("refusal", "refused_continuation", "claude-test"))
+        self.assertEqual([e["delta"]["stop_reason"] for e in events if e["type"] == "message_delta"], ["refusal"])
+        self.assertEqual([r for _, r in self.records],
+                         [{"detector": "refusal", "reason": "refused_continuation", "notice": "shown"}])
+        self.assertNotRerun(s)
+
+    def test_the_continuation_after_a_refused_one_still_matches(self):
+        # The client keeps the refused reply as received, with the notice merged into the next text, or dropped: the
+        # session's fingerprint is the model's blocks, so the next turn reaches the same backend, with no notice.
+        from cortados_router.provider import sensitive_notice
+        for keep in ("separate", "merged", "dropped"):
+            for old in list(self.reg.sessions.values()):
+                self.reg.drop(old)
+            self.records_on()
+            s, nxt, got = self.refused_continuation()
+            content = got["content"]
+            if keep == "merged":
+                content = [{"type": "text", "text": content[0]["text"] + "\n\n" + content[1]["text"]}]
+            elif keep == "dropped":
+                content = content[1:]
+            after = {**nxt, "messages": nxt["messages"] + [{"role": "assistant", "content": content},
+                                                            {"role": "user", "content": "carry on"}]}
+            got = self.post(after)
+            self.assertEqual(got["content"], [{"type": "text", "text": "echo: carry on"}], keep)
+            self.assertEqual(list(self.reg.sessions.values()), [s], keep)
+            self.assertFalse(any(sensitive_notice.is_notice(b.get("text")) for b in got["content"]))
+            self.assertEqual(len(self.records), 1, keep)                  # the refused turn only
+            self.assertNotRerun(s)
+
+    def test_refused_continuation_keeps_an_earlier_record_and_honours_the_opt_out(self):
+        from cortados_router.provider import sensitive_notice
+        self.records_on()
+        first = {**body("refuse after tool"), "tools": [READ_TOOL]}
+        got = self.post(first)
+        (s,) = self.reg.sessions.values()
+        earlier = sensitive_notice.mark("keyword", "busy")
+        s.route = {**s.route, sensitive_notice.ROUTE_KEY: earlier}    # as if the opening turn had been warned
+        uses = [b for b in got["content"] if b["type"] == "tool_use"]
+        nxt = {**first, "messages": first["messages"] + [
+            {"role": "assistant", "content": got["content"]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": uses[0]["id"], "content": "ok"}]}]}
+        got = self.post(nxt)
+        self.assertEqual(got["content"][0], sensitive_notice.block("refusal", "refused_continuation", "claude-test"))
+        self.assertEqual(self.records, [])                              # the row keeps its first record
+        self.assertEqual(s.route[sensitive_notice.ROUTE_KEY], earlier)
+        # Opt-out: a fresh conversation's refused continuation is recorded `opted_out`, and no block is injected.
+        self.reg.drop(s)
+        _, _, got = self.refused_continuation(headers={**self.HEADERS, sensitive_notice.OPT_OUT_HEADER: "off"})
+        self.assertEqual(got["content"], [{"type": "text", "text": "API Error: the model refused"}])
+        self.assertEqual([r for _, r in self.records],
+                         [{"detector": "refusal", "reason": "refused_continuation", "notice": "opted_out"}])
 
     def test_no_notice_when_the_refusal_is_answered_locally(self):
         self.records_on()

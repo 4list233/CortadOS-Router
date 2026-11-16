@@ -746,15 +746,25 @@ anyway, and the owner is told. The same rule covers private data sent while the 
   outcome (`too_large`, `unsupported`), with the detector from the new route or from the one the local bind recorded
   (`sensitivity` on the local route).
 - **Refusals** (`server.Handler._refusal_fallback`). A refused opening turn whose fallback was not taken leads with the
-  notice under detector `cloud refusal`, with the node's skip reason, `no_answer`, `not_admitted`,
-  `not_opening_turn`, `tools_ran` or `responses_wire`.
+  notice under detector `cloud refusal`, with the node's skip reason, `no_answer`, `not_admitted`, `tools_ran` or
+  `responses_wire`.
+- **Refused continuations** (review round 2). A turn after the opening one is never moved (a turn with tool effects is
+  never re-run, and moving a later turn is the unbuilt rebuild-on-409 follow-up), but when the cloud model refuses it
+  the refusal detector has fired all the same: the refusal leads with its own notice under reason
+  `refused_continuation`, and the route row records it unless the row already holds a record (the first detection
+  stays; the log line names every one). Rows written before round 2 may hold `not_opening_turn`, still valid.
 - **Unchanged (#122).** A node 5xx on a sensitive request is answered from the node and never re-routed, so it never
   reaches this path.
 
-**What the client sees.** Only the opening turn carries the notice, because that is the turn whose routing kept the
-request off the Pro. It comes as its own leading text block, before the model's content:
+**What the client sees.** The opening turn carries the notice, because that is the turn whose routing kept the
+request off the Pro; a later turn carries one only when the cloud model refused it. It comes as its own leading text
+block, before the model's content:
 
     ⚠ CortadOS: this request was marked sensitive (<detector>) but the Pro couldn't take it (<reason>), so it was answered by <model> in the cloud.
+
+A refused continuation reads instead:
+
+    ⚠ CortadOS: <model> in the cloud refused this turn (marked sensitive: cloud refusal). The turn was not moved to the Pro (refusal after the opening turn): only a conversation's opening turn can be moved, so the refusal stands.
 
 On `/v1/messages` it is content block 0, in both the JSON reply and SSE (start, delta and stop at index 0, so the
 model's blocks follow from index 1). On `/v1/responses` it is a separate leading `message` output item (output_index
@@ -762,7 +772,7 @@ model's blocks follow from index 1). On `/v1/responses` it is a separate leading
 detector and reason labels and the routed model only, never a keyword, a matched term or request text. A value outside
 the vocabulary is shown as the fallback label, never as itself.
 
-**History.** The backend never sees the notice. `anthropic_wire.reply_fingerprint` drops a leading notice before
+**History.** The backend never sees the notice. `anthropic_wire.reply_fingerprint` drops a leading notice (either form) before
 hashing, so a continuation matches its session however the client kept the reply: notice as its own block, merged into
 the next text block, or dropped. This covers both wires (`responses_wire` fingerprints through the same function), the
 failed-session digest and the replay of a retried turn, which stores the reply as shown. A rebuilt backend's transcript
