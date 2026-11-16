@@ -1126,7 +1126,7 @@ the example's `qwen-27b-4bit-vision` entry repeats them):
 | `image_concurrency` | 1 | image-bearing requests at once, until measured (text turns still run beside it) |
 | `prefill_chunk_tokens` | 256 | the guard's media prefill chunk (`--image-prefill-tokens`); bounds the attention scores (below) |
 | `score_buffers`, `act_bytes` | 4, 2 | the formula's allocator and dtype counts (below) |
-| model dimensions | Qwen3.8 27B | `hidden_size` 5,120, `intermediate_size` 17,408, 24 attention / 4 KV heads, `head_dim` 256, linear attention 16 key / 48 value heads of 128, `vocab_size` 248,320, tower 1,152 / 4,304; checked against `config.json` at startup (`--image-dims`) |
+| model dimensions | Qwen3.8 27B | `hidden_size` 5,120, `intermediate_size` 17,408, 24 attention / 4 KV heads, `head_dim` 256, linear attention 16 key / 48 value heads of 128, `vocab_size` 248,320, tower 1,152 / 4,304 with 16 heads (`vision_num_heads`) and 27 blocks (`vision_depth`); checked against `config.json` and the loaded tower at startup (`--image-dims`) |
 | `max_image_bytes` | 5 MiB | encoded bytes per image (the Anthropic API's own limit) |
 | `max_image_pixels` | 32 Mi | decoded pixels per image, read from the header before decoding; PIL's bomb limit is the same |
 
@@ -1168,6 +1168,24 @@ Iv 4,304):
 | scores | 4 x Hq x C x P x a + C x P | one chunk's unfused attention against the whole context (q·kᵀ, masked copy, softmax, one held by the allocator) and the causal mask |
 | chunk | 2 x C x a x (3I + max(3 Hq D + 2 Hkv D, 4 (Kh Kd + Vh Vd)) + 4H) | one layer's activations for a chunk (MLP gate/up/product; attention or linear-attention projections; residual and norms), doubled for the allocator |
 | logits | V x (a + 8) | the one kept position's logits and float32 log-probabilities |
+| encoder_scores | 0 when fused; else images x heads x n² x (4a + 4), n = 4 x `image_tokens_max` | the vision encoder's own attention scores when its head_dim is outside MLX's fused kernel (below) |
+
+**The encoder's attention** (#125 review round 3). The tower (mlx-vlm 0.7.12 `qwen3_vl/vision.py`, which
+`qwen3_5/vision.py` only inherits) runs every one of its blocks as full attention over one image at a time (`cu_seqlens`
+splits; `window_size` and `fullatt_block_indexes` are read into its config and used by no block) through
+`ensure_fused_sdpa`, which pads a head_dim up to 64 / 80 / 128 for MLX's fused kernel. A head_dim over 128 is left as
+it is, and MLX's unfused fallback materializes heads x n x n scores per image: at 8 heads (head_dim 144) and an
+`image_tokens_max` of 8,192 (n = 32,768 patches) that is 16 GiB for one bf16 score tensor, which the default formula
+did not count. So: the guard refuses to start unless `vision_config` has exactly the `--image-dims` `num_heads` and
+`depth`, `hidden_size / num_heads` is whole and at most 128, `patch_size` 16, `spatial_merge_size` 2,
+`temporal_patch_size` 2, `in_channels` 3 (absent keys take mlx-vlm's `VisionConfig` defaults, so a missing
+`patch_size` is 14 and refused) and no `deepstack_visual_indexes`; `MLLMScheduler.__init__` checks the loaded tower
+the same way (block count, every block's `attn.num_heads` / `head_dim`, the patch embed's geometry). The gate counts
+`encoder_scores` whenever the head_dim is not fused-provable (`local_governor.vision_attention_fused`), refuses a
+`vision_hidden_size` that does not split evenly over `vision_num_heads`, and refuses at config load a policy whose
+smallest image turn (one image at `image_tokens_max`) could not be admitted beside the weights; that is where the
+reviewer's repro (8 heads, `image_tokens_max` 8,192: 100 GiB) stops. With the defaults the head_dim is 72, the
+term is 0 and every reservation is unchanged.
 
 At the 64k image context with 5 images: sequence 2.50, media 1.37, kv_regrow 4.00, scores 3.02, chunk 0.10, logits
 0.002 GiB = 11.0 GiB, so the largest image reservation is 4 GiB KV + 0.15 GiB + 11.0 GiB = **15.15 GiB** (the reviewer's
@@ -1225,7 +1243,30 @@ only after `mlx_vlm.utils.prepare_inputs` expands each image placeholder. The gu
 
 Pinned on top of the text route's pins: vllm-mlx 0.6.0's MLLM files (`VISION_PINNED_SHA256`) and mlx-vlm 0.7.12
 (`MLX_VLM_PINNED_SHA256`, from the PyPI wheel `mlx_vlm-0.7.12-py3-none-any.whl`, sha256 `0412a883…8e37`); any drift stops
-startup. `scripts/install_mlx_backend.sh` copies `cortados_router/image_check.py` beside the guard as
+startup. The full set, by sha256 from the released wheels:
+
+- vllm-mlx 0.6.0: `mllm_scheduler.py`, `mllm_batch_generator.py`, `vision_embedding_cache.py`, `models/mllm.py`,
+  `api/anthropic_adapter.py`, `api/utils.py`, `memory_cache.py`, `multimodal_processor.py`, `patches/qwen3_5_mllm.py`
+  (and the text route's `PINNED_SHA256`);
+- mlx-vlm 0.7.12, the processor and loader: `version.py`, `utils.py`, `models/qwen3_vl/processing_qwen3_vl.py`;
+- the model: `models/base.py` (`ensure_fused_sdpa`, `scaled_dot_product_attention`, `project_logits`),
+  `models/qwen3_vl/qwen3_vl.py`, `models/qwen3_5/__init__.py`, `models/qwen3_5/qwen3_5.py`,
+  `models/qwen3_5/language.py`, `models/qwen3_5/config.py`, `models/qwen3_5/speculative_verifier.py`,
+  `models/qwen3_vl/__init__.py`, `models/qwen3_vl/language.py`;
+- the vision encoder (round 3): `models/qwen3_5/vision.py` (inherits only) and the real encoder
+  `models/qwen3_vl/vision.py`, its `VisionConfig` defaults `models/qwen3_vl/config.py`;
+- the linear (recurrent) attention: `models/qwen3_5/gated_delta.py`;
+- the caches and the attention dispatch's cache types: `models/cache.py`, `turboquant.py`, `kv_quant.py`;
+- the rest of the import chain: `models/rope_utils.py`, `models/activations.py`, `models/fast_ops.py`,
+  `models/linear.py`, `models/mlp.py`, `models/switch_layers.py`, `models/quantized_verifier.py`,
+  `models/exact_speculative_verify.py`, `quantization/nvfp4.py`, `speculative/cache_state.py`,
+  `speculative/ops/linear.py`, and the package files `__init__.py`, `models/__init__.py`, `speculative/__init__.py`,
+  `speculative/ops/__init__.py`, `quantization/__init__.py`.
+
+Not pinned: the lazy `deepseek_v4/hyper_connection.py` import inside `switch_layers.py`'s DeepSeek-only branch, the
+modules `mlx_vlm/__init__.py` pulls in for generation, conversion and training, and the drafters `speculative/__init__.py`
+imports (the guard refuses drafters); and MLX itself (`mlx.core`, a compiled library whose fused head dims the argument
+reads from mlx-vlm's pinned `ensure_fused_sdpa`). `scripts/install_mlx_backend.sh` copies `cortados_router/image_check.py` beside the guard as
 `cortados_image_check.py` and runs `--check` with the entry's vision flags.
 
 **The provider** relays the client's `/v1/messages` body to the node unchanged (images included). On the provider

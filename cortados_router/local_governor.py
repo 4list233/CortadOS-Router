@@ -214,11 +214,19 @@ VISION_DEFAULTS: dict[str, int] = {
     "vocab_size": 248320,
     "vision_hidden_size": 1152,
     "vision_intermediate_size": 4304,
+    # #125 review round 3: the vision encoder's attention heads and depth (vision_config num_heads, depth). 1,152 / 16
+    # = head_dim 72, which MLX's fused attention takes (padded to 80): no heads x N x N scores. A head_dim over 128
+    # is not fused, and image_prefill_bytes then counts the scores (encoder_scores); the guard refuses that model.
+    "vision_num_heads": 16,
+    "vision_depth": 27,
 }
 # The keys of VISION_DEFAULTS the guard checks against the model's config.json (--image-dims, in this order).
 VISION_DIM_KEYS = ("hidden_size", "intermediate_size", "num_attention_heads", "num_key_value_heads", "head_dim",
                    "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
-                   "vocab_size", "vision_hidden_size", "vision_intermediate_size")
+                   "vocab_size", "vision_hidden_size", "vision_intermediate_size", "vision_num_heads", "vision_depth")
+# The largest head dim MLX's fused attention kernel takes (mlx-vlm 0.7.12 models/base.py ensure_fused_sdpa pads a
+# smaller one up to 64 / 80 / 128); the guard's FUSED_SDPA_HEAD_DIMS.
+FUSED_SDPA_MAX_HEAD_DIM = 128
 # Keys a vision block may no longer carry, refused by name (the fixed margins the computed reservation replaced).
 VISION_REPLACED = {"vision_margin_bytes": "image_prefill_bytes(), computed from the model's dimensions "
                                           "(docs/LOCAL-RESOURCES.md \"Vision\")"}
@@ -257,7 +265,16 @@ def check_vision(raw: Any, cfg: dict[str, Any] | None = None) -> dict[str, int] 
         raise GovernorConfigError("vision: prefill_chunk_tokens must not exceed image_context_tokens")
     if out["act_bytes"] not in (2, 4):
         raise GovernorConfigError("vision: act_bytes must be 2 (bfloat16 / float16) or 4 (float32)")
+    if out["vision_hidden_size"] % out["vision_num_heads"]:
+        raise GovernorConfigError("vision: vision_hidden_size must split evenly over vision_num_heads")
     return out
+
+
+def vision_attention_fused(v: dict[str, Any]) -> bool:
+    """Whether the vision encoder's attention runs in MLX's fused kernel (no heads x N x N scores held): its head_dim
+    (vision_hidden_size / vision_num_heads) a whole number no larger than FUSED_SDPA_MAX_HEAD_DIM."""
+    heads, hidden = v["vision_num_heads"], v["vision_hidden_size"]
+    return heads > 0 and hidden % heads == 0 and hidden // heads <= FUSED_SDPA_MAX_HEAD_DIM
 
 
 def check_config(raw: dict[str, Any] | None, model: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -295,6 +312,15 @@ def check_config(raw: dict[str, Any] | None, model: dict[str, Any] | None = None
         raise GovernorConfigError("governor: idle_cap must be at least 1")
     # The model's declared image capability (None: text-only), checked against this context.
     out["vision"] = check_vision(model.get("vision"), out)
+    if out["vision"]:
+        # A policy whose smallest image turn (one image at image_tokens_max, nothing else) could never be admitted is
+        # refused here rather than served as a node that answers every image too_large (#125 round 3: e.g. an
+        # unfused encoder at a raised image_tokens_max, whose scores alone are tens of GiB).
+        one = request_bytes(out, 0, 1, images=1)
+        if one > available_bytes(out):
+            raise GovernorConfigError(f"vision: one image turn reserves {_gib(one)} GiB, more than the "
+                                      f"{_gib(available_bytes(out))} GiB budget beside the weights; lower "
+                                      "image_tokens_max or check the vision dimensions")
     return out
 
 
@@ -620,6 +646,11 @@ def image_prefill_bytes(cfg: dict[str, Any], tokens: int, images: int) -> dict[s
                                           one layer's activations for a chunk (MLP gate/up/product, attention or
                                           linear-attention projections, residual and norms), doubled for the allocator
       logits    V x (a + 8)               the one kept position's logits and its float32 log-probabilities
+      encoder_scores                      0 when the vision encoder's attention is fused (vision_attention_fused:
+                                          head_dim Hv / heads <= 128, the default 72); otherwise, per image, its
+                                          unfused attention scores over its n = 4 x image_tokens_max patches,
+                images x heads x n^2 x (score_buffers x a + 4)
+                                          (q.k^T, softmax and the allocator's copies, plus a float32 softmax copy)
     What the old atomic forward computed beside these (every position projected to the vocabulary: P x V x a, 27.8 GiB
     at 60k tokens) is gone: the guard keeps one position."""
     v = cfg["vision"]
@@ -641,6 +672,9 @@ def image_prefill_bytes(cfg: dict[str, Any], tokens: int, images: int) -> dict[s
         "scores": v["score_buffers"] * hq * c * p * a + c * p,
         "chunk": 2 * c * a * width,
         "logits": v["vocab_size"] * (a + 8),
+        "encoder_scores": 0 if vision_attention_fused(v) else (
+            max(0, int(images)) * v["vision_num_heads"] * (v["image_tokens_max"] * PATCHES_PER_IMAGE_TOKEN) ** 2
+            * (v["score_buffers"] * a + 4)),
     }
     out["total"] = sum(out.values())
     return out

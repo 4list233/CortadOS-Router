@@ -426,6 +426,64 @@ class ImagePrefillReservationTests(unittest.TestCase):
         # the KV cache per token the governor reserves is these dimensions' (16 full-attention layers of 64)
         self.assertEqual(16 * 2 * v["num_key_value_heads"] * v["head_dim"] * v["act_bytes"],
                          local_governor.DEFAULTS["kv_bytes_per_token"])
+        self.assertEqual(local_governor.FUSED_SDPA_MAX_HEAD_DIM, max(guard.FUSED_SDPA_HEAD_DIMS))
+
+
+class EncoderAttentionReservationTests(unittest.TestCase):
+    """#125 review round 3 (P1): the vision encoder's own attention, fused or reserved, and the override validated."""
+    REPRO = {"vision_num_heads": 8, "image_tokens_max": 8192}
+
+    def test_defaults_are_unchanged_and_the_encoder_is_fused(self):
+        cfg = vision_cfg()
+        v = cfg["vision"]
+        self.assertEqual((v["vision_num_heads"], v["vision_depth"]), (16, 27))
+        self.assertTrue(local_governor.vision_attention_fused(v))             # 1,152 / 16 = 72, padded to 80
+        got = local_governor.image_prefill_bytes(cfg, 65536, 5)
+        self.assertEqual(got["encoder_scores"], 0)
+        largest = local_governor.request_bytes(cfg, 200_000, 32_000, images=5)
+        self.assertAlmostEqual(largest / GIB, 15.15, places=2)                # the round-2 number, byte for byte
+        self.assertEqual(largest, 65536 * 65536 + cfg["per_seq_state_bytes"]
+                         + sum(v for k, v in got.items() if k not in ("total", "encoder_scores")))
+
+    def test_the_reviewers_repro_is_refused_at_config_load(self):
+        # 8 vision heads (head_dim 144: outside MLX's fused kernel) and image_tokens_max 8192: one 4096 x 2048 PNG is
+        # 32,768 patches, 8 x 32768^2 x 2 B = 16 GiB for one bf16 score tensor; round 2 reserved 4.4 GiB for it.
+        with self.assertRaisesRegex(local_governor.GovernorConfigError, "one image turn reserves"):
+            vision_cfg(**self.REPRO)
+        with self.assertRaisesRegex(local_governor.GovernorConfigError, "split evenly"):
+            vision_cfg(vision_num_heads=7)
+
+    def test_an_unfused_encoder_that_fits_reserves_its_scores(self):
+        cfg = local_governor.check_config({"memory_budget_bytes": 256 * GIB}, {"vision": self.REPRO})
+        self.assertFalse(local_governor.vision_attention_fused(cfg["vision"]))
+        body = body_with(image_block(png(4096, 2048)), max_tokens=100)
+        raw = json.dumps(body).encode()
+        # (the reviewer's file was a real 24,529-byte PNG; only its header's 4096 x 2048 reaches the bound)
+        why, plan = local_governor.image_policy(body, cfg["vision"])
+        self.assertIsNone(why)
+        text = local_governor.input_tokens(raw, cfg["context_tokens"], plan.data_chars)
+        reserve = local_governor.request_bytes(cfg, text, 100, images=len(plan))
+        n = 4096 * 2048 // (16 * 16)                                          # the image's patches: 32,768
+        self.assertEqual(n, 8192 * local_governor.PATCHES_PER_IMAGE_TOKEN)
+        one_score_tensor = 8 * n * n * 2                                      # 16 GiB
+        self.assertEqual(one_score_tensor, 16 * GIB)
+        tokens = local_governor.request_tokens(cfg, text, 100, images=1)
+        terms = local_governor.image_prefill_bytes(cfg, tokens, 1)
+        self.assertEqual(terms["encoder_scores"], 8 * n * n * (4 * 2 + 4))    # q.k^T, softmax, copies + fp32 softmax
+        self.assertGreaterEqual(reserve, tokens * 65536 + 4 * one_score_tensor)
+        a = local_governor.Admission(local_governor.Governor(cfg, idle_reader=lambda: 3600.0,
+                                                             pressure_reader=lambda: "normal", clock=lambda: 0.0))
+        t, _ = a.try_acquire(a.request_bytes(text, 100, images=1), image=True)
+        self.assertIsNotNone(t)
+        self.assertEqual(a.reserved, reserve)
+        t.release()
+
+    def test_a_fused_override_of_image_tokens_max_holds_no_quadratic_term(self):
+        cfg = vision_cfg(image_tokens_max=8192)                               # 16 heads: head_dim 72, fused
+        self.assertEqual(local_governor.image_prefill_bytes(cfg, 20_000, 1)["encoder_scores"], 0)
+        self.assertEqual(local_backend.vision_argv({"backend": "vllm-mlx", "governor": cfg,
+                                                    "model": {}})[-1].split(",")[-3:-1],
+                         ["vision_num_heads=16", "vision_depth=27"])
 
 
 # --------------------------------------------------------------------------------------------------- gate
@@ -629,9 +687,29 @@ VISION_FAKE = {
                 return {"inputs_embeds": self.inputs_embeds, "attention_mask_4d": None, "visual_pos_masks": None,
                         "attention_mask": None, "position_ids": self.position_ids, "rope_deltas": self.rope_deltas}
 
+        class Attention:
+            def __init__(self, heads, head_dim):
+                self.num_heads, self.head_dim = heads, head_dim
+
+        class Block:
+            def __init__(self, heads, head_dim):
+                self.attn = Attention(heads, head_dim)
+
+        class PatchEmbed:
+            patch_size, temporal_patch_size, in_channels = 16, 2, 3
+
+        class VisionTower:
+            """qwen3_vl/vision.py VisionModel as far as the guard reads it (TOWER: a test's overrides)."""
+            def __init__(self, depth=27, heads=16, hidden=1152):
+                self.blocks = [Block(heads, hidden // heads) for _ in range(depth)]
+                self.patch_embed, self.spatial_merge_size = PatchEmbed(), 2
+
+        TOWER = {}
+
         class Model:
             def __init__(self):
                 self.language_model = LanguageModel()
+                self.vision_tower = VisionTower(**TOWER)
                 self.embedded = []
             def get_input_embeddings(self, input_ids, pixel_values=None, **kwargs):
                 from mlx_vlm.utils import Arr
@@ -963,6 +1041,15 @@ VISION_FAKE = {
     "vllm_mlx/patches/__init__.py": "",
     "vllm_mlx/patches/qwen3_5_mllm.py": "# patch\n",
     "PIL/__init__.py": "",
+    # #125 round 3: the encoder, linear attention, caches and the rest of the import chain (pinned, contents faked)
+    **{f"mlx_vlm/{rel}": f"# {rel}\n" for rel in (
+        "models/qwen3_vl/vision.py", "models/qwen3_vl/config.py", "models/qwen3_vl/language.py",
+        "models/qwen3_5/gated_delta.py", "models/qwen3_5/speculative_verifier.py", "models/cache.py", "turboquant.py",
+        "kv_quant.py", "models/rope_utils.py", "models/activations.py", "models/fast_ops.py", "models/linear.py",
+        "models/mlp.py", "models/switch_layers.py", "models/quantized_verifier.py",
+        "models/exact_speculative_verify.py", "quantization/nvfp4.py", "speculative/cache_state.py",
+        "speculative/ops/linear.py", "speculative/__init__.py", "speculative/ops/__init__.py",
+        "quantization/__init__.py")},
     "PIL/Image.py": "MAX_IMAGE_PIXELS = 89478485\n\nclass DecompressionBombWarning(RuntimeWarning):\n    pass\n",
 }
 DIMS = {k: local_governor.VISION_DEFAULTS[k] for k in (*local_governor.VISION_DIM_KEYS, "act_bytes")}
@@ -973,8 +1060,11 @@ VISION_ARGS = ["--vision", "--max-images", "5", "--image-tokens", "1024", "--ima
 TEXT_CONFIG = {k: DIMS[k] for k in DIMS if not k.startswith("vision_") and k != "act_bytes"}
 QWEN_CONFIG = {"model_type": "qwen3_5", "architectures": ["Qwen3_5ForConditionalGeneration"],
                "text_config": {**TEXT_CONFIG, "dtype": "bfloat16", "num_hidden_layers": 64},
-               "vision_config": {"depth": 27, "hidden_size": DIMS["vision_hidden_size"],
-                                 "intermediate_size": DIMS["vision_intermediate_size"]}}
+               "vision_config": {"depth": DIMS["vision_depth"], "hidden_size": DIMS["vision_hidden_size"],
+                                 "intermediate_size": DIMS["vision_intermediate_size"],
+                                 "num_heads": DIMS["vision_num_heads"], "patch_size": 16, "spatial_merge_size": 2,
+                                 "temporal_patch_size": 2, "in_channels": 3, "out_hidden_size": 5120,
+                                 "deepstack_visual_indexes": []}}
 
 
 def prompt_for(n_images, text="describe"):
@@ -1478,6 +1568,125 @@ class GuardVisionStartupTests(VisionGuardBase):
             rc, err = self.run_main(self.serve(model))
         self.assertEqual(rc, 2)
         self.assertIn("mlx-vlm 0.7.13 is not 0.7.12", err)
+
+    ROUND3_PINS = ("models/qwen3_vl/vision.py", "models/qwen3_5/gated_delta.py", "models/cache.py",
+                   "models/qwen3_vl/config.py", "models/qwen3_vl/__init__.py", "models/qwen3_vl/language.py",
+                   "models/qwen3_5/speculative_verifier.py", "turboquant.py", "kv_quant.py", "models/rope_utils.py",
+                   "models/activations.py", "models/fast_ops.py", "models/linear.py", "models/mlp.py",
+                   "models/switch_layers.py", "models/quantized_verifier.py", "models/exact_speculative_verify.py",
+                   "quantization/nvfp4.py", "speculative/cache_state.py", "speculative/ops/linear.py", "__init__.py",
+                   "models/__init__.py", "speculative/__init__.py", "speculative/ops/__init__.py",
+                   "quantization/__init__.py")
+
+    def test_round3_each_new_pin_s_drift_stops_check_and_startup(self):
+        """#125 review round 3 (P2): the encoder, the linear attention, the caches and the rest of the import chain
+        are pinned; altering any one of them is refused (round 2 accepted these)."""
+        from tests.test_vllm_mlx_guard import load_guard
+        real = load_guard()
+        self.assertEqual(sorted(set(self.ROUND3_PINS) - set(real.MLX_VLM_PINNED_SHA256)), [])
+        from vllm_mlx.api import utils
+        model = str(self.models / "vl")
+        utils.MLLM.add(model)
+        for rel in self.ROUND3_PINS:
+            with self.subTest(rel):
+                self.assertIn(rel, self.mpins)
+                path = Path(self.dir, "mlx_vlm", *rel.split("/"))
+                text = path.read_text()
+                path.write_text(text + "# drift\n")
+                try:
+                    rc, err = self.run_main(["--check", model, *VISION_ARGS])
+                    self.assertEqual(rc, 2)
+                    self.assertIn(f"mlx_vlm/{rel} differs", err)
+                    self._fresh()
+                    from vllm_mlx.api import utils as fresh
+                    fresh.MLLM.add(model)
+                    rc, err = self.run_main(self.serve(model))
+                    self.assertEqual(rc, 2)
+                    self.assertIn(f"mlx_vlm/{rel} differs", err)
+                finally:
+                    path.write_text(text)
+                    self._fresh()
+                    from vllm_mlx.api import utils as fresh
+                    fresh.MLLM.add(model)
+
+    def test_round3_the_new_pins_are_the_released_wheel(self):
+        from tests.test_vllm_mlx_guard import load_guard
+        pins = load_guard().MLX_VLM_PINNED_SHA256
+        self.assertEqual(len(pins), 35)
+        for rel, want in (("models/qwen3_vl/vision.py", "9885d83cf85e037a88f8364817007094a82b5941d49e909d2d9fe11b5e03bf6c"),
+                          ("models/qwen3_5/gated_delta.py",
+                           "71da97ef25a013e185c4d19168b39c452b90f40d5462f4d08ff084a82e922d2f"),
+                          ("models/cache.py", "d2e9900b3cd0fdf7e5410c904bbc320b8773c24aeda8f60858a0b58cf9b6b36b"),
+                          ("models/qwen3_vl/config.py",
+                           "8b529cfbd568c7d202140b4d5212be7fe740310c1a80374fa7dd4e59b9763017"),
+                          ("models/qwen3_5/vision.py",
+                           "a1db23800b564caaedcc79d6a27d76e3186b9315cb68b612d61afbfa69487600")):
+            self.assertEqual(pins[rel], want, rel)
+        self.assertTrue(all(len(v) == 64 and int(v, 16) >= 0 for v in pins.values()))
+
+    def _model_dir(self, name, cfg):
+        from vllm_mlx.api import utils
+        d = self.models / name
+        d.mkdir()
+        (d / "config.json").write_text(json.dumps(cfg))
+        utils.MLLM.add(str(d))
+        return str(d)
+
+    def test_round3_an_unfused_vision_head_count_is_refused_at_startup(self):
+        """The reviewer's repro: vision_config.num_heads 8 (head_dim 144), the other checked dimensions kept."""
+        vc = QWEN_CONFIG["vision_config"]
+        heads8 = {**QWEN_CONFIG, "vision_config": {**vc, "num_heads": 8}}
+        d = self._model_dir("heads8", heads8)
+        rc, err = self.run_main(["--check", d, *VISION_ARGS])                   # round 2: 0
+        self.assertEqual(rc, 2)
+        self.assertIn("num_heads is 8", err)
+        with self.assertRaises(SystemExit) as cm:
+            self.run_main(self.serve(d))
+        self.assertIn("config.json", str(cm.exception))
+        # passing the matching dims does not help: the head_dim itself is outside the fused kernel
+        args = list(VISION_ARGS)
+        args[-1] = DIMS_ARG.replace("vision_num_heads=16", "vision_num_heads=8")
+        rc, err = self.run_main(["--check", d, *args])
+        self.assertEqual(rc, 2)
+        self.assertIn("head_dim 144", err)
+        with self.assertRaises(self.guard.GuardError):
+            self.policy(dims={**DIMS, "vision_num_heads": 8})
+        self.assertIsNone(self.guard.vision_attention_problem(1152, 16))
+        self.assertIsNotNone(self.guard.vision_attention_problem(1152, 7))
+
+    def test_round3_the_tower_s_geometry_and_depth_are_checked(self):
+        vc = QWEN_CONFIG["vision_config"]
+        cases = {"depth": {**vc, "depth": 32}, "patch14": {**vc, "patch_size": 14},
+                 "no-patch-size": {k: v for k, v in vc.items() if k != "patch_size"},   # mlx-vlm's default: 14
+                 "merge": {**vc, "spatial_merge_size": 4}, "temporal": {**vc, "temporal_patch_size": 1},
+                 "deepstack": {**vc, "deepstack_visual_indexes": [8]}, "no-heads": {k: v for k, v in vc.items()
+                                                                                     if k != "num_heads"}}
+        for name, bad in cases.items():
+            with self.subTest(name):
+                self._fresh()
+                d = self._model_dir(name, {**QWEN_CONFIG, "vision_config": bad})
+                self.assertEqual(self.run_main(["--check", d, *VISION_ARGS])[0], 2)
+        self._fresh()
+        d = self._model_dir("window", {**QWEN_CONFIG, "vision_config": {**vc, "window_size": 64,
+                                                                         "fullatt_block_indexes": [1]}})
+        self.assertEqual(self.run_main(["--check", d, *VISION_ARGS])[0], 0)   # read by no block of this encoder
+
+    def test_round3_the_loaded_tower_is_checked_when_the_scheduler_is_built(self):
+        self.vision()                                                         # the default tower: accepted
+        from vllm_mlx import mllm_scheduler
+        from mlx_vlm.models.qwen3_5 import qwen3_5
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+        for name, tower in (("heads", {"heads": 8}), ("depth", {"depth": 26})):
+            with self.subTest(name), patch.dict(qwen3_5.TOWER, tower):
+                with self.assertRaisesRegex(self.guard.GuardError, "vision tower"):
+                    mllm_scheduler.MLLMScheduler(model=qwen3_5.Model(), processor=Qwen3VLProcessor())
+        m = qwen3_5.Model()
+        m.vision_tower.patch_embed.patch_size = 14
+        with self.assertRaisesRegex(self.guard.GuardError, "geometry"):
+            mllm_scheduler.MLLMScheduler(model=m, processor=Qwen3VLProcessor())
+        del m.vision_tower
+        with self.assertRaisesRegex(self.guard.GuardError, "missing"):
+            mllm_scheduler.MLLMScheduler(model=m, processor=Qwen3VLProcessor())
 
     def test_the_real_vision_pins_are_the_releases(self):
         from tests.test_vllm_mlx_guard import load_guard

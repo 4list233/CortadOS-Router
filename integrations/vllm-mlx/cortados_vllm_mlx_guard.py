@@ -71,7 +71,13 @@ files are removed after preprocessing; VisionEmbeddingCache (count-only, 100/50 
 is the pixel bound; drafters and specprefill are refused; and only a model dir whose config.json is qwen3_5 /
 Qwen3_5ForConditionalGeneration with a vision_config (and the --image-dims dimensions) may serve. The text Scheduler
 refuses every request in this mode.
-Pinned on top: the MLLM files of vllm-mlx 0.6.0 (VISION_PINNED_SHA256) and mlx-vlm 0.7.12 (MLX_VLM_PINNED_SHA256).
+The vision encoder's own attention (#125 round 3) is counted as fused, so startup also stops unless config.json's
+vision_config and the loaded tower have the --image-dims heads and depth, a head_dim (hidden / heads) MLX's fused kernel
+takes (FUSED_SDPA_HEAD_DIMS) and the reservation's patch geometry (VISION_TOWER_GEOMETRY): vision_attention_problem,
+check_vision_model, vision_tower_problem.
+Pinned on top: the MLLM files of vllm-mlx 0.6.0 (VISION_PINNED_SHA256) and mlx-vlm 0.7.12 (MLX_VLM_PINNED_SHA256: the
+processor, the model, the vision encoder, the linear attention, the caches and the rest of their import chain;
+docs/LOCAL-RESOURCES.md "Vision" lists them).
 
 Pinned: vllm-mlx 0.6.0 (`vllm_mlx.__version__`) and the sha256 of the files the argument above reads
 (PINNED_SHA256: scheduler.py, engine_core.py, engine/batched.py, and the engine dispatch cli.py, server.py,
@@ -305,6 +311,39 @@ MLX_VLM_PINNED_SHA256 = {
     "models/qwen3_5/vision.py": "a1db23800b564caaedcc79d6a27d76e3186b9315cb68b612d61afbfa69487600",
     "models/qwen3_5/language.py": "9cd5b798c183ac70d6c4ba0bdfabb04d1da126cd133e25089958d24d674cadac",
     "models/qwen3_5/config.py": "b4db2144b162bbc27c0d843833fdd969413b44260ed1f024866eeadf1832dc0f",
+    # #125 review round 3 (P2): every file the reservation and the chunk-equivalence argument read, beyond the above
+    # (the qwen3_5 import chain, read from the same wheel; docs/LOCAL-RESOURCES.md "Vision" lists them all).
+    # The vision encoder qwen3_5/vision.py only inherits: Attention (one image per split, ensure_fused_sdpa, no
+    # windowed blocks), the blocks, PatchEmbed, the merger; and the VisionConfig defaults qwen3_5's inherits.
+    "models/qwen3_vl/vision.py": "9885d83cf85e037a88f8364817007094a82b5941d49e909d2d9fe11b5e03bf6c",
+    "models/qwen3_vl/config.py": "8b529cfbd568c7d202140b4d5212be7fe740310c1a80374fa7dd4e59b9763017",
+    "models/qwen3_vl/__init__.py": "da4897a091e4ddce3d19e8dd01b7b52cc0ed5af484da0a4aa9b65804c2b8d808",
+    "models/qwen3_vl/language.py": "f01e7b266a4083ffd64b180474e2a64c397077ebd31dd133b0eef890be1f2c71",
+    # The linear (recurrent) attention: gated_delta_update, whose state carries across chunks.
+    "models/qwen3_5/gated_delta.py": "71da97ef25a013e185c4d19168b39c452b90f40d5462f4d08ff084a82e922d2f",
+    "models/qwen3_5/speculative_verifier.py": "32b632f3ade3bcdfdab61d280ac3c219edc3b7b54881a2fba8b06415396302e9",
+    # The caches (KVCache's 256-step growth, ArraysCache) and the attention dispatch's cache types.
+    "models/cache.py": "d2e9900b3cd0fdf7e5410c904bbc320b8773c24aeda8f60858a0b58cf9b6b36b",
+    "turboquant.py": "7ea10cdb828b44f52dc53dff61a93ae86e6e88e4df145b39a2e3b10b39ccf85c",
+    "kv_quant.py": "2936878096435dd2540e7a029b986259e5b7101c972a5be7168495a58e7fbfa3",
+    # The rest of the chain: rotary embeddings, activations, the layers and kernels the model's modules use.
+    "models/rope_utils.py": "6944f69a03c41cbb9613afbd2f1b54b71c504840aaeb0eade39c6109dbfdd25b",
+    "models/activations.py": "2ce04422f5670d8c3507f723d33253632e14121f45f2aa8070b08544ea92dfc9",
+    "models/fast_ops.py": "d4ebf917ded3911959e7dd37aeb78cd631b7e6ab29a57cfa1daad1e7ee606286",
+    "models/linear.py": "148a56193feaf170097ff1c5edccca8165c1b5df878f1605778c4d3642a4d2fa",
+    "models/mlp.py": "e5413aa08a61ee26ab3bf70fac9aeef2ac9c13342e2a4507c2e7cc908a3273e7",
+    "models/switch_layers.py": "a8b688e0c0ed37ffe88804efe287fc19998eec9686b76f981b2e2ff635f76751",
+    "models/quantized_verifier.py": "b01182801e18ca63ff1e0cb8be3146131c7204c91dfae656ab3c9ddb51256e13",
+    "models/exact_speculative_verify.py": "170d189df3cf4be1d0044ea497e863f04160c6d9f11719462e43f201124b2b96",
+    "quantization/nvfp4.py": "a1ef4a7e8d1d21fe32490273873ba182d6ae3618fb671147eb3363976ad7de5c",
+    "speculative/cache_state.py": "bbc2af0ca2123b4c550133e142223575ef6b798b3475839d058ba806d1f1d8fa",
+    "speculative/ops/linear.py": "6a42ec72dd65e9f304b65058d85945a36c9d7d8eab4bb70bcb96a080a219c5c9",
+    # The package __init__ files importing the chain runs.
+    "__init__.py": "609662121e39f1b1a945000d5cca0de94059b882c584dbf21cffeac3c5e02e7f",
+    "models/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "speculative/__init__.py": "1f98ff6655dc4629b8d8c5001a32d5a95d232e156722be5b1adac848ff6f0559",
+    "speculative/ops/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "quantization/__init__.py": "7dac848bf14e9db1a3da4bb3a8c30093c3a5fdfeb53ef8137af9234831b3fe1a",
 }
 VISION_MODEL_TYPE = "qwen3_5"
 VISION_ARCHITECTURES = ["Qwen3_5ForConditionalGeneration"]
@@ -341,8 +380,22 @@ IMAGE_DIMS = {
     "vocab_size": ("text_config", "vocab_size"),
     "vision_hidden_size": ("vision_config", "hidden_size"),
     "vision_intermediate_size": ("vision_config", "intermediate_size"),
+    # #125 review round 3 (P1): the encoder's attention heads and depth. The reservation counts the encoder's
+    # attention as fused (no heads x N x N scores); that holds only for a head_dim MLX's fused kernel takes.
+    "vision_num_heads": ("vision_config", "num_heads"),
+    "vision_depth": ("vision_config", "depth"),
 }
 DIMS_KEYS = (*IMAGE_DIMS, "act_bytes")
+# The head dims MLX's fused attention kernel takes (mlx-vlm 0.7.12 models/base.py ensure_fused_sdpa, pinned): a
+# smaller head_dim is zero-padded up to the next of them; a larger one falls back to MLX's unfused attention, which
+# materializes heads x N x N scores for each image's N patches (16 GiB at 8 heads and 32,768 patches). The vision
+# encoder (qwen3_vl/vision.py Attention, pinned) runs every block as full attention over one image at a time
+# (cu_seqlens splits; window_size and fullatt_block_indexes are read into its config and used by no block).
+FUSED_SDPA_HEAD_DIMS = (64, 80, 128)
+# The vision tower's geometry as config.json must give it (absent keys take mlx-vlm 0.7.12's qwen3_vl VisionConfig
+# defaults, pinned: patch_size 14 would be refused), matching VISION_GEOMETRY and local_governor's patch constants.
+VISION_TOWER_GEOMETRY = {"patch_size": 16, "spatial_merge_size": 2, "temporal_patch_size": 2, "in_channels": 3}
+VISION_CONFIG_DEFAULTS = {"patch_size": 14, "spatial_merge_size": 2, "temporal_patch_size": 2, "in_channels": 3}
 # Bytes per element of the dtypes a config.json may name (the activations are computed in it).
 DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "float32": 4}
 
@@ -371,6 +424,9 @@ class VisionPolicy:
         if sorted(dims) != sorted(DIMS_KEYS) or any(isinstance(v, bool) or not isinstance(v, int) or v <= 0
                                                     for v in dims.values()):
             raise GuardError(f"vision: {DIMS_FLAG} needs exactly {', '.join(DIMS_KEYS)} as positive integers")
+        why = vision_attention_problem(dims["vision_hidden_size"], dims["vision_num_heads"])
+        if why is not None:
+            raise GuardError(f"vision: {DIMS_FLAG} {why}")
         self.dims = dims
 
     @property
@@ -378,6 +434,18 @@ class VisionPolicy:
         """The processor's max_pixels: image_tokens tokens of (patch x merge)^2 pixels each."""
         f = VISION_GEOMETRY["patch_size"] * VISION_GEOMETRY["merge_size"]
         return self.image_tokens * f * f
+
+
+def vision_attention_problem(hidden: Any, heads: Any) -> str | None:
+    """Why the vision encoder's attention would not run fused (so its heads x N x N scores would be materialized), or
+    None: the head_dim hidden / heads must be a whole number no larger than MLX's largest fused head dim."""
+    if isinstance(hidden, bool) or isinstance(heads, bool) or not isinstance(hidden, int) \
+            or not isinstance(heads, int) or hidden <= 0 or heads <= 0 or hidden % heads:
+        return f"vision hidden_size {hidden!r} is not split evenly over {heads!r} heads"
+    if hidden // heads > max(FUSED_SDPA_HEAD_DIMS):
+        return (f"vision head_dim {hidden // heads} ({hidden} / {heads} heads) is outside MLX's fused attention "
+                f"({'/'.join(map(str, FUSED_SDPA_HEAD_DIMS))}): the encoder would materialize heads x N x N scores")
+    return None
 
 
 def parse_vision(args: list[str]) -> tuple["VisionPolicy | None", list[str]]:
@@ -446,6 +514,17 @@ def check_vision_model(model_dir: Any, dims: dict | None = None) -> None:
         if got != dims[name]:
             raise GuardError(f"vision mode: config.json {section}.{key} is {got!r}, but the gate's image reservation "
                              f"was computed for {dims[name]} ({DIMS_FLAG} {name}); recompute it for this model")
+    vc = cfg["vision_config"]
+    why = vision_attention_problem(vc.get("hidden_size"), vc.get("num_heads"))
+    if why is not None:
+        raise GuardError(f"vision mode: config.json {why}")
+    for key, want in VISION_TOWER_GEOMETRY.items():
+        got = vc.get(key, VISION_CONFIG_DEFAULTS[key])
+        if got != want:
+            raise GuardError(f"vision mode: config.json vision_config.{key} is {got!r}, not {want}: the reservation's "
+                             "patch geometry")
+    if vc.get("deepstack_visual_indexes"):
+        raise GuardError("vision mode: config.json vision_config.deepstack_visual_indexes is set (qwen3_5 has none)")
     text = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
     for where in (text, cfg):
         dtype = where.get("dtype", where.get("torch_dtype"))
@@ -454,6 +533,31 @@ def check_vision_model(model_dir: Any, dims: dict | None = None) -> None:
         if DTYPE_BYTES.get(dtype, 0) == 0 or DTYPE_BYTES[dtype] > dims["act_bytes"]:
             raise GuardError(f"vision mode: config.json's dtype {dtype!r} is not covered by act_bytes "
                              f"{dims['act_bytes']}")
+
+
+def vision_tower_problem(tower: Any, dims: dict) -> str | None:
+    """The loaded vision tower against the dimensions the reservation was computed for, or None when it agrees: the
+    model as built (qwen3_vl/vision.py VisionModel), not only its config.json. Every block's attention has the
+    checked heads and a fused head_dim, there are `vision_depth` blocks, and the patch geometry is the reservation's."""
+    blocks = getattr(tower, "blocks", None)
+    if tower is None or not isinstance(blocks, (list, tuple)):
+        return "is missing or has no blocks"
+    if len(blocks) != dims["vision_depth"]:
+        return f"has {len(blocks)} blocks, not {dims['vision_depth']}"
+    want_d = dims["vision_hidden_size"] // dims["vision_num_heads"]
+    for n, blk in enumerate(blocks):
+        attn = getattr(blk, "attn", None)
+        heads, d = getattr(attn, "num_heads", None), getattr(attn, "head_dim", None)
+        if heads != dims["vision_num_heads"] or d != want_d or not isinstance(d, int) \
+                or d > max(FUSED_SDPA_HEAD_DIMS):
+            return f"block {n} attention has {heads!r} heads of {d!r}, not {dims['vision_num_heads']} of {want_d}"
+    pe = getattr(tower, "patch_embed", None)
+    got = {"patch_size": getattr(pe, "patch_size", None), "temporal_patch_size": getattr(pe, "temporal_patch_size", None),
+           "spatial_merge_size": getattr(tower, "spatial_merge_size", None),
+           "in_channels": getattr(pe, "in_channels", None)}
+    if got != VISION_TOWER_GEOMETRY:
+        return f"geometry is {got}, not {VISION_TOWER_GEOMETRY}"
+    return None
 
 
 def verify_vision(vllm_dir: str, vlm_dir: str, vlm_version: str, pins: dict | None = None,
@@ -664,6 +768,9 @@ def install_vision(context_tokens: int, policy: VisionPolicy, *, mllm_scheduler_
         if not _same(model, VISION_MODEL_CLASS):
             raise GuardError(f"vision mode: the model is {type(model).__module__}.{type(model).__name__}, not "
                              f"{'.'.join(VISION_MODEL_CLASS)}")
+        why = vision_tower_problem(getattr(model, "vision_tower", None), policy.dims)
+        if why is not None:
+            raise GuardError(f"vision mode: the loaded vision tower {why}")
         ip = getattr(processor, "image_processor", None)
         if not _same(processor, VISION_PROCESSOR_CLASS) or not _same(ip, VISION_IMAGE_PROCESSOR_CLASS):
             raise GuardError("vision mode: the processor is not mlx-vlm's Qwen3VLProcessor / Qwen3VLImageProcessor")

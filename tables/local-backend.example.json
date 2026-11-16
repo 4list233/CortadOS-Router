@@ -50,6 +50,8 @@
      "vocab_size": 248320,
      "vision_hidden_size": 1152,
      "vision_intermediate_size": 4304,
+     "vision_num_heads": 16,
+     "vision_depth": 27,
      "_reasons": {
       "max_images": "Owner decision 2026-11-15/16: up to 5 still images per request.",
       "image_tokens_max": "Each image at most 1,024 language-model tokens (~1 MP after the processor's resize: 16-pixel patches merged 2x2 are 1,024 pixels per token). The guard sets the processor's max_pixels to 1,048,576; upstream's 16.7 MP would be 16,384 tokens and 1 GiB of KV cache per image. 64 MiB of KV per image at 65,536 B/token.",
@@ -60,7 +62,8 @@
       "prefill_chunk_tokens": "The guard prefills an image-bearing prompt in chunks of this many tokens, projecting only the last position to the vocabulary (upstream: one atomic forward projecting every position, 27.8 GiB of logits at 60k tokens). head_dim 256 is outside MLX's fused attention kernel, so a chunk holds heads x chunk x context scores: 256 keeps them at 3 GiB at the 64k image context.",
       "score_buffers": "Score-sized buffers per chunk: q.k^T, the masked copy, the softmax output, and one the allocator holds from the previous layer.",
       "act_bytes": "bfloat16 activations; the guard refuses a model whose config.json names a wider dtype.",
-      "_dims": "hidden_size .. vision_intermediate_size: the model's config.json text_config and vision_config widths the reservation is computed from (local_governor.image_prefill_bytes). The guard is passed them (--image-dims) and stops vision mode unless config.json has exactly these: a different model needs the reservation recomputed. Values are the public Qwen3.5-27B layout; the Pro's own config.json is checked at startup.",
+      "_encoder": "vision_num_heads, vision_depth: the vision tower's heads and blocks (vision_config num_heads, depth). 1,152 / 16 = head_dim 72, inside MLX's fused attention (64/80/128), so the encoder holds no heads x N x N scores; the guard refuses a model whose head_dim is over 128, and the gate counts those scores (encoder_scores) whenever fusion is not provable.",
+      "_dims": "hidden_size .. vision_depth: the model's config.json text_config and vision_config widths the reservation is computed from (local_governor.image_prefill_bytes). The guard is passed them (--image-dims) and stops vision mode unless config.json has exactly these: a different model needs the reservation recomputed. Values are the public Qwen3.5-27B layout; the Pro's own config.json is checked at startup.",
       "_acceptance": "The image reservation is a computed upper bound (docs/LOCAL-RESOURCES.md \"Vision\"). The real-model peak measured in the hardware test window (64k image context, 5 images; and the reviewer's ~60k tokens + one small image) is the acceptance gate for these numbers."
      }
     },
