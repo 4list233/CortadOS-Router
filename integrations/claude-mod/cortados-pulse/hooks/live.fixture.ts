@@ -1466,6 +1466,7 @@ export default {
         }
       }
     ],
+    "tag_conflicts": 0,
     "split_keys": true
   }
 }

@@ -25,7 +25,11 @@ Per-session attribution of routed work (#127), only on keys the provider observe
   - subagent     no run id, no via: the row's office_session (the cortados-routed-subagents mod's tag).
 A heartbeat's fields are never a routed join key. A native row (heartbeat) matches a routed tag on its `session` or, when
 the sender also had the mod's older store salt, its `session_alt` (both exact hashes; `matched_on` says which). A tag
-found on one side only is published as such (`match`: "native only" / "routed only"), never paired by guess. Rows
+found on one side only is published as such (`match`: "native only" / "routed only"), never paired by guess. A routed tag
+is attributed to at most one native row (`_claims`: a `session` claim beats a `session_alt` one, then the most recent
+last_at, then host name); a row that loses a tag lists its role in `conflicts` and the section counts them in
+`tag_conflicts`, so overlapping claims never count one routed total twice. The pane's row is selected before the fleet
+table's SESSIONS_MAX cap (`session_row`). Rows
 written before #127 have no origin, run or via: their child-task work sits under the cortados-route server's tag, a
 "routed only" row with no native side.
 
@@ -360,6 +364,8 @@ def validate_block(b: Any, now: float, skew_s: float) -> tuple[dict[str, Any] | 
                 row[k] = office.clean(s[k], rule)
                 if row[k] is None:
                     return None, f"{where}.{k}"
+        if row["session_alt"] is not None and row["session_alt"] == row["session"]:
+            row["session_alt"] = None           # the same tag twice is one tag (never two claims on one routed total)
         la = s.get("last_at")
         if not (type(la) in (int, float) and math.isfinite(la) and now - skew_s <= la <= now + 600):
             return None, where + ".last_at"
@@ -429,7 +435,7 @@ def _routed_of(by_window: dict[str, Any], w: str, tags: list[str]) -> dict[str, 
     """The routed side of a session in window `w`, summed over its matched tags (`session` and `session_alt` can both
     carry routed work: the mod's routed subagents under the store salt, start_task and route_task under the shared one).
     None when no tag has routed work in the window."""
-    found = [r for r in (((by_window.get(w) or {}).get("by_session") or {}).get(t) for t in tags) if r]
+    found = [r for r in (((by_window.get(w) or {}).get("by_session") or {}).get(t) for t in dict.fromkeys(tags)) if r]
     if not found:
         return None
     if len(found) == 1:
@@ -459,11 +465,32 @@ def _window_row(native: dict[str, Any] | None, routed: dict[str, Any] | None) ->
             "native": native, "routed": routed}
 
 
+def _claims(orch_rows: list[dict[str, Any]], routed_tags: set[str]) -> dict[str, int]:
+    """Which native row owns each routed tag: {tag: index into orch_rows}. A routed conversation or run is attributed
+    to at most ONE session, so two rows claiming one tag (two hosts reporting the same tag, or one row's `session`
+    equal to another's `session_alt`) never count its tokens twice. The rule, deterministic: a claim on `session` beats
+    one on `session_alt`; then the most recently active row (last_at); then host name; then the row's tag. The losing
+    rows publish the tag's role in `conflicts`, with no routed tokens for it."""
+    best: dict[str, tuple] = {}
+    for i, s in enumerate(orch_rows):
+        for role, t in (("session", s.get("session")), ("session_alt", s.get("session_alt"))):
+            if not t or t not in routed_tags:
+                continue
+            key = (role != "session", -float(s.get("last_at") or 0), str(s.get("host") or ""),
+                   str(s.get("session") or ""), i)
+            if t not in best or key < best[t]:
+                best[t] = key
+    return {t: k[-1] for t, k in best.items()}
+
+
 def section(routed: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]], now: float,
-            errors: list | None = None, run_origins: dict[str, str] | None = None) -> dict[str, Any]:
+            errors: list | None = None, run_origins: dict[str, str] | None = None,
+            session: str | None = None) -> dict[str, Any]:
     """The live view's `work_split` section from routed_tokens() (via tasks.collect's `token_totals`) and the hosts'
     heartbeat `orchestrator` blocks. Each side's absence is an entry in `errors`, never a zero. `run_origins` (run id ->
-    origin tag, from the provider host's own task log) resolves child runs whose requests carried no origin."""
+    origin tag, from the provider host's own task log) resolves child runs whose requests carried no origin.
+    `session` (the pulse pane's tag): its row is also returned as `session_row`, found before the fleet table's
+    SESSIONS_MAX display cap (absent without `session`; None when no row has that tag)."""
     errors = list(errors or [])
     routed = resolve_pending(routed, run_origins)
     hosts, orch_rows = [], []
@@ -512,10 +539,14 @@ def section(routed: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]]
     for w in WINDOWS:
         routed_tags |= set(((by_window.get(w) or {}).get("by_session") or {}))
     sessions, seen = [], set()
-    orch_rows.sort(key=lambda s: s["last_at"], reverse=True)
-    for s in orch_rows:
-        tags = [t for t in (s.get("session"), s.get("session_alt")) if t]
-        matched = [t for t in tags if t in routed_tags]
+    orch_rows.sort(key=lambda s: (-s["last_at"], s["host"], s.get("session") or ""))
+    owner = _claims(orch_rows, routed_tags)
+    conflicts = 0
+    for i, s in enumerate(orch_rows):
+        tags = list(dict.fromkeys(t for t in (s.get("session"), s.get("session_alt")) if t))
+        matched = [t for t in tags if t in routed_tags and owner.get(t) == i]
+        lost = [t for t in tags if t in routed_tags and owner.get(t) != i]
+        conflicts += len(lost)
         row = {k: s.get(k) for k in ("session", "host", "project", "model", "last_at")}
         if s.get("session_alt"):
             row["session_alt"] = s["session_alt"]
@@ -523,6 +554,8 @@ def section(routed: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]]
         row["native_age_s"] = s["_age"]
         row["matched_on"] = ["session" if t == s.get("session") else "session_alt" for t in matched]
         row["match"] = "both" if matched else ("native only" if tags else "untagged")
+        if lost:                    # routed work under these tags is counted once, on the row that owns it (_claims)
+            row["conflicts"] = ["session" if t == s.get("session") else "session_alt" for t in lost]
         for w in WINDOWS:
             row[w] = _window_row(_native(s, w), _routed_of(by_window, w, matched))
         seen.update(tags)
@@ -539,10 +572,19 @@ def section(routed: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]]
         sessions.append(row)
     has = bool(hosts) or bool(by_window)
     status = "ok" if not errors else ("partial" if has else "error")
-    return {"as_of": round(now, 3), "status": status, "errors": errors, "definition": DEFINITION,
-            "windows": {w: int(s) for w, s in WINDOWS.items()}, "overall": overall, "sessions": sessions[:SESSIONS_MAX],
-            "sessions_hidden": max(0, len(sessions) - SESSIONS_MAX), "hosts": hosts,
-            "split_keys": bool((routed or {}).get("split_keys"))}
+    out = {"as_of": round(now, 3), "status": status, "errors": errors, "definition": DEFINITION,
+           "windows": {w: int(s) for w, s in WINDOWS.items()}, "overall": overall, "sessions": sessions[:SESSIONS_MAX],
+           "sessions_hidden": max(0, len(sessions) - SESSIONS_MAX), "hosts": hosts, "tag_conflicts": conflicts,
+           "split_keys": bool((routed or {}).get("split_keys"))}
+    if session is not None:         # selected from the uncapped list: the display cap is the fleet table's only
+        out["session_row"] = _find_row(sessions, session)
+    return out
+
+
+def _find_row(rows: list[dict[str, Any]], tag: str) -> dict[str, Any] | None:
+    """The row of session `tag`: its `session` first (the shared salt), else a sender's `session_alt`."""
+    return next((r for r in rows if r.get("session") == tag), None) \
+        or next((r for r in rows if r.get("session_alt") == tag), None)
 
 
 SESSION_NOTES = {
@@ -552,6 +594,7 @@ SESSION_NOTES = {
     "routed_not_recorded": "routed tokens are not recorded on the provider (router.db not migrated or unreadable)",
     "no_hosts": "no host has reported orchestrator tokens",
     "untagged": "the sender has no Office salt, so its sessions cannot be matched",
+    "conflict": "another reported session row carries the same tag; its routed work is counted once, on that row",
 }
 
 
@@ -559,8 +602,9 @@ def session_split(ws: dict[str, Any], tag: str) -> dict[str, Any]:
     """The pulse pane's work split: ONLY the row of session `tag` (its `session`, or the sender's `session_alt`) from
     section()'s output, plus partial-data notes that name no other session. Nothing of another session is in it: no
     other row, no fleet totals, no host list (the row's own host, age and staleness only)."""
-    rows = [r for r in ws.get("sessions") or [] if tag in (r.get("session"), r.get("session_alt"))]
-    row = rows[0] if rows else None
+    row = ws["session_row"] if "session_row" in ws else _find_row(ws.get("sessions") or [], tag)
+    if row is not None and tag not in (row.get("session"), row.get("session_alt")):
+        row = _find_row(ws.get("sessions") or [], tag)  # a section built for another session: never its row
     notes = []
     errs = ws.get("errors") or []
     if any(isinstance(e, dict) and e.get("source") == "router.db" for e in errs):
@@ -572,6 +616,8 @@ def session_split(ws: dict[str, Any], tag: str) -> dict[str, Any]:
     elif row.get("native_stale"):
         notes.append(f"native tokens are {round((row.get('native_age_s') or 0) / 60)} min old: "
                      f"the {row.get('host') or 'host'} heartbeat is stale")
+    if row is not None and row.get("conflicts"):
+        notes.append(SESSION_NOTES["conflict"])
     if row is not None and row.get("host"):
         h = next((x for x in ws.get("hosts") or [] if x.get("host") == row["host"]), None)
         bad = int(((h or {}).get("excluded") or {}).get("unreadable_files") or 0)

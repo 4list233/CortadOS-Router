@@ -110,7 +110,8 @@ export const LOCAL_SWITCH_PATH = '/v1/cortados/local'
 /** Read every third live tick: each read asks every node's gate (pmset, the backend's model list). */
 export const NODES_POLL_MS = 30_000
 /** Every provider read is given up after this long, so one hung request can never stop the polling (the mod host's
- * fetch has no timeout of its own; the poll runs one at a time and would wait on it forever). */
+ * fetch has no timeout of its own; the poll runs one at a time and would wait on it forever). The read is aborted then,
+ * and stays outstanding (fetchBounded) until the host's fetch settles. */
 export const FETCH_TIMEOUT_MS = 15_000
 /** The cortados-route MCP server's start_task, under any MCP prefix (a user, project or plugin server). */
 export const START_TASK_TOOL = /^mcp__.*cortados-route__start_task$/
@@ -237,17 +238,56 @@ export async function fetchView($: Pick<EngineInterface, 'env' | 'fs' | 'http' |
   }
 }
 
+/** Provider reads whose underlying $.http.fetch has not settled yet, by URL. A read counts here until the host's fetch
+ * itself resolves or rejects, not until the poll gave up on it: a timed-out read is aborted, and only a host that
+ * honours the abort ends it. A host that does not (this build's HttpInit declares no `signal`) keeps it outstanding,
+ * and no second read of the same URL starts until it settles, so hung reads never pile up (one per view at most). */
+const outstanding = new Map<string, object>()
+/** The host refused a fetch carrying `signal` (an init it cannot take or clone): later reads go without it. */
+let signalRefused = false
+
+/** How many provider reads are still outstanding (their host fetch has not settled). */
+export function outstandingReads(): number {
+  return outstanding.size
+}
+
 /** $.http.fetch, given up after FETCH_TIMEOUT_MS (a rejection, said as the poll's problem) when the host has a clock
- * timer; the timer is cancelled once the answer comes. */
+ * timer; the timer is cancelled once the answer comes. A read that times out is aborted through its AbortController
+ * (passed as init.signal). Refused at once while an earlier read of the same URL is still outstanding. */
 export async function fetchBounded($: Pick<EngineInterface, 'http' | 'clock'>, url: string, init: any): Promise<any> {
+  if (outstanding.has(url)) throw new Error('the previous read of this view has not ended yet')
+  const stop = typeof AbortController === 'function' ? new AbortController() : null
+  const send = (withSignal: boolean): Promise<any> => {
+    try {
+      return Promise.resolve($.http.fetch(url, withSignal && stop ? { ...init, signal: stop.signal } : init))
+    } catch (e) {
+      return Promise.reject(e)
+    }
+  }
+  const req = send(!signalRefused && stop !== null).catch(e => {
+    // a host that cannot take the signal says so at once: send it again without, and never with one again
+    const why = String((e as Error)?.name ?? '') + ' ' + String((e as Error)?.message ?? e)
+    if (!signalRefused && stop && !stop.signal.aborted && /signal|clone/i.test(why)) {
+      signalRefused = true
+      return send(false)
+    }
+    throw e
+  })
+  const mark = {}
+  outstanding.set(url, mark)
+  const done = () => { if (outstanding.get(url) === mark) outstanding.delete(url) }
+  req.then(done, done)
   let timer: Timer | null = null
   const late = new Promise<never>((_, reject) => {
     try {
-      timer = $.clock.after(FETCH_TIMEOUT_MS, () => reject(new Error('no answer within ' + FETCH_TIMEOUT_MS / 1000 + ' s')))
+      timer = $.clock.after(FETCH_TIMEOUT_MS, () => {
+        try { stop?.abort() } catch { /* nothing to abort */ }
+        reject(new Error('no answer within ' + FETCH_TIMEOUT_MS / 1000 + ' s'))
+      })
     } catch { /* a host without timers: the fetch alone decides */ }
   })
   try {
-    return await Promise.race([$.http.fetch(url, init), late])
+    return await Promise.race([req, late])
   } finally {
     try { (timer as Timer | null)?.cancel() } catch { /* already fired */ }
   }

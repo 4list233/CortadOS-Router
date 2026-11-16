@@ -1818,7 +1818,7 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
                           errors=hb_errs + ex_errs + (u_errs if u is None else []),
                           self_name=self_name if self_name is not None else _slug(os.environ.get(SELF_ENV)))
     ws = work_split.section(tv.get("token_totals") if isinstance(tv, dict) else None, beats, now,
-                            tv_errs if tv is None else None)
+                            tv_errs if tv is None else None, session=session)
     counts = tasks.get("counts") or {}
     overview = {
         "running_tasks": counts.get("running") if tasks["status"] != "error" else None,

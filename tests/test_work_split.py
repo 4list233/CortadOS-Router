@@ -585,6 +585,69 @@ class PerSessionSplitTest(unittest.TestCase):
         allowed = {TAG, "pro", "CortadOS-Router", "claude-opus-5-5", "both", "session", "codex/gpt-6.1"}
         self.assertLessEqual(set(strings), allowed)
 
+    def test_the_same_tag_as_session_and_session_alt_is_counted_once(self):
+        # review round 2, finding 1: one routed conversation (fresh 7, all 10) under a row whose two tags are equal
+        routed = self.routed([(TAG, None, None, None, "codex", "gpt-6.1", (5, 2, 3, 0))])
+        valid = self_valid(block(sessions=[self.row(TAG, session_alt=TAG)]))
+        self.assertIsNone(valid["sessions"][0]["session_alt"])         # the validator keeps one tag
+        for o in (valid, {**valid, "sessions": [{**valid["sessions"][0], "session_alt": TAG}]}):   # and section alone
+            s = work_split.section(routed, {"pro": {"orchestrator": o}}, NOW)
+            [row] = s["sessions"]
+            r = row["24h"]["routed"]
+            self.assertEqual((r["fresh"], r["all"], r["conversations"]), (7, 10, 1))
+            self.assertEqual((row["24h"]["routed_fresh"], row["24h"]["routed_conversations"]), (7, 1))
+            self.assertEqual(row["matched_on"], ["session"])
+            self.assertEqual(s["tag_conflicts"], 0)
+
+    def test_two_sessions_claiming_one_tag_are_a_conflict_never_counted_twice(self):
+        routed = self.routed([(TAG, None, None, None, "codex", "gpt-6.1", (5, 2, 3, 0))])
+        other = "eeeeeeeeeeeeeeee"
+        # two hosts report the same tag: the most recently active row owns the routed work, the other lists a conflict
+        hb = {"air": {"orchestrator": self_valid(block(sampled_at=NOW - 30, sessions=[self.row(TAG, last_at=NOW - 600)]))},
+              "pro": {"orchestrator": self_valid(block(sampled_at=NOW - 30, sessions=[self.row(TAG, last_at=NOW - 60)]))}}
+        s = work_split.section(routed, hb, NOW)
+        by = {r["host"]: r for r in s["sessions"]}
+        self.assertEqual((by["pro"]["24h"]["routed_fresh"], by["air"]["24h"]["routed_fresh"]), (7, 0))
+        self.assertEqual((by["pro"].get("conflicts"), by["air"]["conflicts"]), (None, ["session"]))
+        self.assertEqual(sum(r["24h"]["routed_conversations"] for r in s["sessions"]), 1)
+        self.assertEqual((s["tag_conflicts"], s["overall"]["24h"]["routed"]["fresh"]), (1, 7))
+        ws = work_split.session_split(s, TAG)
+        self.assertEqual(ws["row"]["host"], "pro")                       # the owner's row, deterministically
+        # a `session` claim beats a more recent row's `session_alt` claim on the same tag
+        s = work_split.section(routed, self.hb([self.row(other, session_alt=TAG, last_at=NOW - 10),
+                                                self.row(TAG, last_at=NOW - 900)]), NOW)
+        by = {r["session"]: r for r in s["sessions"]}
+        self.assertEqual((by[TAG]["24h"]["routed_fresh"], by[other]["24h"]["routed_fresh"]), (7, 0))
+        self.assertEqual((by[other]["conflicts"], by[other]["match"]), (["session_alt"], "native only"))
+        self.assertEqual(sum(r["24h"]["routed_fresh"] for r in s["sessions"]), 7)
+        ws = work_split.session_split(s, other)
+        self.assertIn(work_split.SESSION_NOTES["conflict"], ws["notes"])
+        self.assertNotIn(TAG, json.dumps(ws["notes"]))
+        # the same input in another order gives the same owner
+        s2 = work_split.section(routed, self.hb([self.row(TAG, last_at=NOW - 900),
+                                                 self.row(other, session_alt=TAG, last_at=NOW - 10)]), NOW)
+        self.assertEqual(s2["sessions"], s["sessions"])
+
+    def test_the_requested_session_is_found_beyond_the_fleet_cap(self):
+        # review round 2, finding 2: host blocks of 30 + 11 sessions; the oldest (41st) is the pane's own
+        tags = [f"{i:016x}" for i in range(1, 42)]
+        rows = [self.row(t, last_at=NOW - 60 - i) for i, t in enumerate(tags)]
+        hb = {"air": {"orchestrator": self_valid(block(sessions=rows[:30]))},
+              "pro": {"orchestrator": self_valid(block(sessions=rows[30:]))}}
+        routed = self.routed([(tags[-1], None, None, None, "codex", "gpt-6.1", (5, 2, 3, 0))])
+        fleet = work_split.section(routed, hb, NOW)
+        self.assertEqual((len(fleet["sessions"]), fleet["sessions_hidden"]), (work_split.SESSIONS_MAX, 1))
+        self.assertNotIn("session_row", fleet)
+        self.assertNotIn(tags[-1], [r["session"] for r in fleet["sessions"]])
+        s = work_split.section(routed, hb, NOW, session=tags[-1])
+        self.assertEqual(len(s["sessions"]), work_split.SESSIONS_MAX)    # the cap is the fleet table's only
+        ws = work_split.session_split(s, tags[-1])
+        self.assertEqual((ws["row"]["session"], ws["row"]["host"], ws["row"]["24h"]["routed_fresh"]), (tags[-1], "pro", 7))
+        self.assertEqual(ws["status"], "ok")
+        self.assertIsNone(work_split.session_split(s, "ffffffffffffffff")["row"])   # another tag: never this row
+        self.assertIsNone(work_split.session_split(work_split.section(routed, hb, NOW, session="ffffffffffffffff"),
+                                                   "ffffffffffffffff")["row"])
+
     def test_an_old_db_without_the_split_columns_still_reads(self):
         c = sqlite3.connect(":memory:")
         c.executescript(core.DDL)

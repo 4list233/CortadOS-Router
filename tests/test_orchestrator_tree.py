@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from cortados_router import child_tasks
-from cortados_router.provider import clients, live
+from cortados_router.provider import clients, live, work_split
 from tests import test_live as tl
 
 NOW = tl.NOW
@@ -1468,6 +1468,13 @@ class WorkSplitSessionTest(unittest.TestCase):
         self.assertEqual(r["by_via"]["route_task"]["fresh"], 25000)
         self.assertEqual(r["by_via"]["subagent"]["fresh"], 50000)
         self.assertEqual(r["by_route"][0]["route"], "codex/gpt-6.1-sol")
+
+    def test_the_session_view_finds_its_row_past_the_fleet_cap(self):
+        # review round 2, finding 2: collect(session=) selects the pane's row before the fleet table's display cap
+        with mock.patch.object(work_split, "SESSIONS_MAX", 0):
+            self.assertEqual(split_view()["work_split"]["sessions"], [])
+            row = self.split()["row"]
+        self.assertEqual((row["session"], row["match"]), (MINE, "both"))
 
     def test_fresh_and_all_token_shares(self):
         d = self.split()["row"]["24h"]

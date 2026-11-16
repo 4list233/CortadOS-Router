@@ -2,7 +2,7 @@
 // under another tag. The session view is the provider-generated fixture (tests/test_orchestrator_tree.session_fixture).
 import { test, expect, mock } from 'claude-code/testing'
 import { workSplitLines, tokAmt, nodeLines, localNodeLines, deviceLines, laneLines, startedOf, aliasTag, fetchAlias,
-  fetchBounded, FETCH_TIMEOUT_MS, START_TASK_TOOL, register, sessionTag, LOCAL_SWITCH_PATH, ALIAS_NOTE } from './register'
+  fetchBounded, outstandingReads, FETCH_TIMEOUT_MS, START_TASK_TOOL, register, sessionTag, LOCAL_SWITCH_PATH, ALIAS_NOTE } from './register'
 import sessionFixture from './session.fixture'
 
 const TOKEN = 'sekrit-token-123'
@@ -94,7 +94,7 @@ test('a start_task result names the origin its task was recorded under; another 
 })
 
 /** A minimal `$` for the hooks: env, fs, http, state, clock (with timers). */
-function dollar(http: (url: string) => any) {
+function dollar(http: (url: string, init?: any) => any) {
   const state = new Map<string, any>()
   const key = (ref: any) => ref.plugin + '/' + ref.key
   const urls: string[] = []
@@ -105,7 +105,7 @@ function dollar(http: (url: string) => any) {
     fs: { read: async (p: string) => { if (p === '/tmp/home/.config/cortados/provider-token') return TOKEN; throw new Error('ENOENT') },
       stat: async () => { throw new Error('ENOENT') } },
     process: { run: async () => ({ exitCode: 1, stdout: '', stderr: '' }) },
-    http: { fetch: async (url: string) => { urls.push(url); return http(url) } },
+    http: { fetch: async (url: string, init?: any) => { urls.push(url); return http(url, init) } },
     state: {
       get: async (ref: any) => state.get(key(ref)) ?? { value: undefined, version: 0 },
       set: async (ref: any, value: unknown) => { const v = (state.get(key(ref))?.version ?? 0) + 1; state.set(key(ref), { value, version: v }); return { isSet: true, version: v } },
@@ -143,15 +143,72 @@ test('the alias tag\'s session view is read and held only for a tag this session
   expect(($.value('alias') as any).tag).toBe(OTHER)
 })
 
-test('a provider read that never answers is given up, so the one-at-a-time poll cannot stall', async () => {
-  const $ = dollar(() => new Promise(() => {}))
+/** A host fetch that never answers on its own and honours init.signal: it rejects when the read is aborted. */
+function hung(aborts: string[]) {
+  return (url: string, init?: any) => new Promise((_, reject) => {
+    init?.signal?.addEventListener('abort', () => { aborts.push(url); reject(new Error('aborted')) })
+  })
+}
+
+test('a provider read that never answers is given up and aborted, so the one-at-a-time poll cannot stall', async () => {
+  const aborts: string[] = []
+  const $ = dollar(hung(aborts))
   const p = fetchBounded($ as any, 'http://air.example:8432/v1/cortados/live', {})
   expect($.timers.map(t => t.ms)).toEqual([FETCH_TIMEOUT_MS])
+  expect(outstandingReads()).toBe(1)
   $.timers[0]!.fn()
   await expect(p).rejects.toThrow(/no answer within 15 s/)
+  for (let i = 0; i < 5; i++) await Promise.resolve()
+  expect(aborts).toEqual(['http://air.example:8432/v1/cortados/live'])
+  expect(outstandingReads()).toBe(0)
   const ok = dollar(() => ({ status: 200 }))
   expect(await fetchBounded(ok as any, 'http://x/', {})).toEqual({ status: 200 })
   expect(ok.timers[0]!.cancelled).toBe(true)
+  expect(outstandingReads()).toBe(0)
+})
+
+test('three reads that never answer leave none outstanding once their timeouts abort them', async () => {
+  const aborts: string[] = []
+  const $ = dollar(hung(aborts))
+  const urls = ['/v1/cortados/live', '/v1/cortados/live/session?session=' + MINE, '/v1/cortados/local'].map(p => 'http://air.example:8432' + p)
+  const reads = urls.map(u => fetchBounded($ as any, u, {}).then(() => 'answered', e => (e as Error).message))
+  expect(outstandingReads()).toBe(3)
+  for (const t of $.timers) t.fn()
+  expect(await Promise.all(reads)).toEqual(urls.map(() => 'no answer within 15 s'))
+  for (let i = 0; i < 5; i++) await Promise.resolve()
+  expect([...aborts].sort()).toEqual([...urls].sort())
+  expect(outstandingReads()).toBe(0)
+  // the next poll reads them again: nothing holds them
+  const again = dollar(() => ({ status: 200 }))
+  for (const u of urls) expect(await fetchBounded(again as any, u, {})).toEqual({ status: 200 })
+  expect(outstandingReads()).toBe(0)
+})
+
+test('a host that cannot cancel keeps the hung read outstanding, and no second read of that view piles on', async () => {
+  let release: (v: any) => void = () => {}
+  const deaf = dollar(() => new Promise(r => { release = r }))      // ignores init.signal
+  const url = 'http://air.example:8432/v1/cortados/live?session=' + OTHER
+  const p = fetchBounded(deaf as any, url, {})
+  deaf.timers[0]!.fn()
+  await expect(p).rejects.toThrow(/no answer within 15 s/)
+  expect(outstandingReads()).toBe(1)
+  await expect(fetchBounded(deaf as any, url, {})).rejects.toThrow(/previous read of this view has not ended/)
+  expect(deaf.urls).toEqual([url])                                   // the second poll never reached the host
+  release({ status: 200 })
+  for (let i = 0; i < 5; i++) await Promise.resolve()
+  expect(outstandingReads()).toBe(0)
+  expect(await fetchBounded(dollar(() => ({ status: 204 })) as any, url, {})).toEqual({ status: 204 })
+})
+
+test('a host that refuses an init carrying a signal is asked again without one, and never with one after', async () => {
+  const inits: any[] = []
+  const picky = dollar((_u, init) => { inits.push(init); if (init?.signal) throw new Error('DataCloneError: AbortSignal could not be cloned'); return { status: 200 } })
+  expect(await fetchBounded(picky as any, 'http://y/', { headers: { a: 'b' } })).toEqual({ status: 200 })
+  expect(inits.map(i => 'signal' in i)).toEqual([true, false])
+  expect(inits[1]).toEqual({ headers: { a: 'b' } })
+  expect(await fetchBounded(picky as any, 'http://y/', {})).toEqual({ status: 200 })
+  expect(inits.length).toBe(3)
+  expect(outstandingReads()).toBe(0)
 })
 
 test('the mounted pane: this session\'s work split with its breakdown button, and the local nodes section', { options: { providerUrl: 'http://air.example:8432', providerToken: TOKEN } }, async ($, on) => {

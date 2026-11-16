@@ -1293,10 +1293,13 @@ tags are now under the machine's shared Office salt (`~/.config/cortados/office-
 route_task and the pulse pane use; before #127 the sender hashed with the routed-subagents mod's store salt, so its
 tags matched nothing. When the mod's store salt also exists the sender adds the session's tag under it as
 `session_alt` (the mod used it for sessions that began before the shared file existed), and the join takes either.
-A tag found on one side only is published as `native only` / `routed only`. The live view's `work_split.sessions`
+A tag found on one side only is published as `native only` / `routed only`. A routed tag is attributed to at most one
+native row, so overlapping claims never count its tokens twice: a claim on `session` beats one on `session_alt`, then
+the most recently active row wins, then the host name; a losing row lists the tag's role in `conflicts` (the section
+counts them in `tag_conflicts`). The live view's `work_split.sessions`
 rows carry it (`match`, `matched_on`, per window `native`, `routed`, `routed_pct`, `routed_pct_all`), the dashboard's
 Work split panel has a per-session table, and `GET /v1/cortados/live/session` carries the asking session's own row
-only (`work_split.row` and `notes` on what is partial: no native report, a stale heartbeat, unreadable transcripts,
+only (`work_split.row`, selected before the fleet table's 40-row cap, and `notes` on what is partial: no native report, a stale heartbeat, unreadable transcripts,
 routed tokens not recorded), which the pulse pane draws as one line plus a `w` breakdown.
 
 The dashboard's **Live** tab reads it every 5 s while the tab is visible: an overview strip (running tasks, active
