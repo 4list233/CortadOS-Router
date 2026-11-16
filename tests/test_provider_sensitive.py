@@ -10,6 +10,7 @@ import unittest
 import urllib.error
 import urllib.request
 import uuid
+from unittest.mock import patch
 from pathlib import Path
 
 os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp())
@@ -504,7 +505,8 @@ class RefusalFallbackEndToEndTests(LocalHarness):
 
     def test_the_continuation_after_a_refused_one_still_matches(self):
         # The client keeps the refused reply as received, with the notice merged into the next text, or dropped: the
-        # session's fingerprint is the model's blocks, so the next turn reaches the same backend, with no notice.
+        # session holds the delivered form and the injection's accepted forms (#124 round 4), so the next turn reaches
+        # the same backend, with no notice.
         from cortados_router.provider import sensitive_notice
         for keep in ("separate", "merged", "dropped"):
             for old in list(self.reg.sessions.values()):
@@ -524,6 +526,48 @@ class RefusalFallbackEndToEndTests(LocalHarness):
             self.assertFalse(any(sensitive_notice.is_notice(b.get("text")) for b in got["content"]))
             self.assertEqual(len(self.records), 1, keep)                  # the refused turn only
             self.assertNotRerun(s)
+
+    def test_compaction_shifting_indices_keeps_matching_without_a_second_rebuild(self):
+        # Review round 3 (P2-1): the injected turn's assistant index shifts when the client compacts the history. The
+        # accepted forms are keyed by content, so the compaction's own rebuild keeps them, and a later continuation that
+        # drops the notice matches the rebuilt session exactly: no second rebuild, no budget spent, no refusal.
+        from cortados_router.provider import anthropic_wire, sensitive_notice
+        self.records_on()
+        s, nxt, got = self.refused_continuation()
+        refused = got["content"]                                        # [notice, model refusal]
+        self.assertEqual(s.history[-1], anthropic_wire.reply_fingerprint(refused))     # delivered form, as sent
+        after = {**nxt, "messages": nxt["messages"] + [{"role": "assistant", "content": refused},
+                                                        {"role": "user", "content": "carry on"}]}
+        echoed = self.post(after)["content"]
+        self.assertEqual(list(self.reg.sessions.values()), [s])
+        # Compaction: the opening exchange (tool_use + result) is summarised away; the refused turn is now index 0.
+        seen = []
+        real = anthropic_wire.rebuild_transcript
+        with patch.object(anthropic_wire, "rebuild_transcript",
+                          lambda msgs, notices=None: seen.append(real(msgs, notices)) or seen[-1]):
+            compacted = {**after, "messages": [{"role": "user", "content": "summary of the earlier turns"},
+                                               {"role": "assistant", "content": refused},
+                                               {"role": "user", "content": "carry on"},
+                                               {"role": "assistant", "content": echoed},
+                                               {"role": "user", "content": "next"}]}
+            third = self.post(compacted)["content"]
+        (r,) = self.reg.sessions.values()
+        self.assertIsNot(r, s)                                          # the compaction itself is one rebuild
+        self.assertEqual(r.rebuild_budget.used, 1)
+        text = "".join(b.get("text", "") for b in seen[-1])
+        self.assertIn(sensitive_notice.REBUILD_LABEL + refused[0]["text"], text)   # kept, labelled, never removed
+        self.assertIn(refused[1]["text"], text)
+        # The next continuation drops the notice: same session, exactly, no rebuild.
+        dropped = {**compacted, "messages": [compacted["messages"][0], {"role": "assistant", "content": refused[1:]},
+                                             *compacted["messages"][2:], {"role": "assistant", "content": third},
+                                             {"role": "user", "content": "and more"}]}
+        got = self.post(dropped)
+        self.assertEqual(got["content"], [{"type": "text", "text": "echo: and more"}])
+        self.assertEqual(list(self.reg.sessions.values()), [r])
+        self.assertEqual(r.rebuild_budget.used, 1)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(len(self.records), 1)                          # the refused turn only
+        self.assertNotRerun(r)
 
     def test_refused_continuation_keeps_an_earlier_record_and_honours_the_opt_out(self):
         from cortados_router.provider import sensitive_notice

@@ -12,12 +12,14 @@ Owner of three rules:
   framing      the notice is its own leading text block (prepend): on /v1/messages a separate content block before
                the model's content (JSON and SSE, indices following from the block list), on /v1/responses a separate
                leading `message` output item. tool_use blocks and the stop reason are the model's, untouched.
-  history      provenance, never shape (#124 round 3): the session records each notice it injects (Injected: its
-               exact text, at its turn, block index 0) in its own history, whose entry is the fingerprint of the
-               model's own blocks. A client that sends the reply back as received, with the notice merged into the
-               next text block, or without it, matches that entry; a rebuilt backend's transcript leaves out exactly
-               that injected text (without_injected). Text the model wrote that only looks like a notice is never
-               removed, and fingerprints are taken over everything the client sent (anthropic_wire.client_fingerprint).
+  history      the delivered form is canonical (#124 round 4): the session's history holds the reply exactly as the
+               client received it (notice + model blocks), so a client echoing it matches exactly. The backend never
+               saw the notice, so each injection records its accepted client forms as exact fingerprints (Forms:
+               kept, merged into the next text, dropped), keyed by the model-only fingerprint in the lineage's
+               Provenance, never by assistant index. Comparisons go through same_reply / same_history (explicit,
+               directional); a rebuilt session remaps the client's history by verified matches (canonical). Nothing
+               is ever stripped: a rebuilt transcript keeps a kept notice and labels it (labelled); model-authored
+               text that looks like a notice is always preserved.
 
 Escape hatch: OPT_OUT_HEADER: off on the request that would carry the notice suppresses the injected block only; the
 route row and the log line are written all the same, marked `opted_out`.
@@ -27,7 +29,7 @@ Stdlib only, and no provider imports: anthropic_wire imports this module.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, NamedTuple
 
 # The route key routing.choose sets on a cloud route whose request a detector marked: {"detector": ..., "reason": ...}.
 ROUTE_KEY = "sensitive_cloud"
@@ -85,8 +87,8 @@ REFUSED_PREFIX = "⚠ CortadOS: "
 REFUSED_TEMPLATE = (REFUSED_PREFIX + "{model} in the cloud refused this turn (marked sensitive: {detector}). The turn "
                     "was not moved to the Pro ({reason}): only a conversation's opening turn can be moved, so the "
                     "refusal stands.")
-# What split_leading recognises as a candidate: either template with any short parenthesised labels and any model token, so a notice
-# written under an older vocabulary still matches. Anchored at the start; the model token holds no whitespace.
+# What is_notice recognises (tests and the verify scenario only): either template with any short parenthesised labels
+# and any model token, so a notice written under an older vocabulary still matches. Anchored at the start; the model token holds no whitespace.
 _MODEL_TOKEN = r"(?:\S{1,120}|" + re.escape(UNNAMED_MODEL) + r")"
 _NOTICE_RE = re.compile(
     r"(?:" + re.escape(PREFIX) + r"[^()\n]{1,60}\) but the Pro couldn't take it \([^()\n]{1,80}\), so it "
@@ -151,104 +153,117 @@ def valid_record(value: Any) -> dict[str, str] | None:
 
 
 def is_notice(text_: Any) -> bool:
-    """Whether `text_` is SHAPED like a notice. Shape alone never removes anything: only an injection the session
-    recorded (Injected) is ever taken out of a fingerprint or a rebuilt transcript."""
+    """Whether `text_` is SHAPED like a notice. Tests and the verify scenario only: nothing is ever removed or relabelled
+    by shape (#124 round 4); the provider only recognises a notice by the exact forms it recorded (Provenance)."""
     return isinstance(text_, str) and _NOTICE_RE.fullmatch(text_.strip()) is not None
 
 
-def split_leading(joined: str) -> tuple[str, str] | None:
-    """(notice-shaped prefix, the rest) of an assistant message's joined text, or None. A CANDIDATE only: a client's
-    Fingerprint carries it, and only a session's Injected entry with exactly that text, at that turn, accepts it."""
-    s = joined.lstrip() if isinstance(joined, str) else ""
-    m = _NOTICE_RE.match(s)
-    return (m.group(0), s[m.end():]) if m else None
+# Forms of one reply with an injected notice (#124 round 4). The delivered form is canonical: the session's history
+# holds the fingerprint of the reply exactly as the client received it (notice block + model blocks). The backend never
+# saw the notice, so a client may send the turn back in any of three forms, each recorded at injection time as an exact
+# fingerprint: (a) the notice kept as its own block (= delivered), (b) merged into the model's first text with one of
+# MERGE_SEPARATORS between them, (c) dropped (= the fingerprint of the model's own blocks, the record's key).
+MERGE_SEPARATORS = ("\n\n", "\n", " ")
+# What a rebuilt backend's transcript puts before a notice the client kept (form a or b), so the model knows the text
+# that follows is the provider's: the client's text itself is never removed or changed.
+REBUILD_LABEL = "[CortadOS provider notice: added to this reply by the endpoint, not written by the assistant]\n"
 
 
-class Fingerprint(str):
-    """One assistant message of a client's history, as anthropic_wire.client_fingerprint gives it: the str value is
-    the fingerprint of the message exactly as sent (nothing removed), and `leading` is (notice-shaped prefix,
-    fingerprint of the message without it) when its text starts with one, else None. Equality is the str's: only a
-    session's Injected entry looks at `leading`."""
-    leading: tuple[str, str] | None = None           # (str subclasses take no __slots__)
-
-    def __new__(cls, value: str, leading: tuple[str, str] | None = None):
-        o = super().__new__(cls, value)
-        o.leading = leading
-        return o
+class Forms(NamedTuple):
+    """One injection's accepted client forms (exact fingerprints, anthropic_wire.notice_forms builds it)."""
+    model: str                  # (c) the model's own blocks: the record's content key
+    delivered: str              # (a) the reply as sent: the session's history entry
+    accepted: frozenset         # (a), (b) and (c)
+    notice: str                 # the exact injected text (a rebuilt transcript labels it; nothing removes it)
 
 
-class Injected(Fingerprint):
-    """Provenance (#124 round 3): a session's history entry for a reply this endpoint sent with an injected notice.
-    The str value is the fingerprint of the model's own blocks; `notice` is the exact injected text, and `index` its
-    block index in that reply (always 0: the notice leads). It is recorded in the session's own history, at the turn
-    it was injected in, so it stays with that turn through every copy of the history.
+class Provenance:
+    """The injections of one conversation lineage, keyed by content (the model-only fingerprint), never by assistant
+    index, so a compaction or rewrite that shifts indices cannot lose them. Copied to a rebuilt session with its
+    history; memory-only, like that history (a restarted endpoint holds neither: the safe terminal no_writer)."""
 
-    It equals a client's entry for the same turn when the client sent the reply without the notice (the str value) or
-    with a leading prefix that is exactly the injected text, as its own block or merged into the next text
-    (Fingerprint.leading). Nothing else is accepted: model-authored text that only looks like a notice stays in the
-    fingerprint. A subclass of Fingerprint, so Python asks it first whichever side of == it is on. Its hash is the
-    str's, so an Injected must never be a set member or dict key next to client fingerprints (history lists are
-    compared with ==, never hashed)."""
-    notice: str = ""
-    index: int = 0
+    def __init__(self, records: Any = ()):
+        self._by_model: dict[str, list[Forms]] = {}
+        self._by_delivered: dict[str, Forms] = {}
+        self._by_form: dict[str, list[Forms]] = {}
+        for r in records:
+            self.add(r)
 
-    def __new__(cls, value: str, notice: str, index: int = 0):
-        o = super().__new__(cls, value)
-        o.notice, o.index = notice, index
-        return o
+    def add(self, rec: Forms) -> None:
+        if rec in self._by_model.get(rec.model, ()):
+            return
+        self._by_model.setdefault(rec.model, []).append(rec)
+        self._by_delivered.setdefault(rec.delivered, rec)
+        for f in rec.accepted:
+            self._by_form.setdefault(f, []).append(rec)
 
-    def accepts(self, other: Any) -> bool:
-        if not isinstance(other, str):
-            return False
-        if str.__eq__(self, other):
-            return True
-        lead = getattr(other, "leading", None)
-        return bool(lead) and self.index == 0 and lead[0] == self.notice and str.__eq__(self, lead[1])
+    def records(self) -> list[Forms]:
+        return [r for rs in self._by_model.values() for r in rs]
 
-    def __eq__(self, other: Any):
-        if not isinstance(other, str):
-            return NotImplemented
-        if isinstance(other, Injected):
-            return str.__eq__(self, other)
-        return self.accepts(other)
+    def copy(self) -> "Provenance":
+        return Provenance(self.records())
 
-    def __ne__(self, other: Any):
-        eq = self.__eq__(other)
-        return eq if eq is NotImplemented else not eq
+    def __len__(self) -> int:
+        return len(self._by_delivered)
 
-    __hash__ = str.__hash__
+    def delivered(self, fp: Any) -> Forms | None:
+        """The record whose delivered form (a session history entry) is `fp`, else None."""
+        return self._by_delivered.get(fp) if isinstance(fp, str) else None
+
+    def accepting(self, fp: Any) -> list[Forms]:
+        """Every record that accepts `fp` as one of its forms."""
+        return list(self._by_form.get(fp, ())) if isinstance(fp, str) else []
 
 
-def injected(history: Any) -> dict[int, str]:
-    """{assistant message index: exact injected notice text} of a session's history (the Injected entries)."""
-    return {i: h.notice for i, h in enumerate(history or []) if isinstance(h, Injected)}
+def same_reply(prov: Provenance | None, mine: Any, theirs: Any) -> bool:
+    """Whether the client's entry `theirs` is the session's entry `mine`: equal, or `mine` is the delivered form of a
+    recorded injection and `theirs` one of its accepted forms. Directional (the session's side first), explicit, and
+    plain str equality underneath: nothing about a fingerprint's own == is overloaded."""
+    if mine == theirs:
+        return True
+    rec = prov.delivered(mine) if prov is not None else None
+    return rec is not None and theirs in rec.accepted
 
 
-def carry(old: Any, new: list) -> list:
-    """A rebuilt session's history (`new`, the client's entries) keeping the old session's Injected entries where the
-    client's entry at the same index matches one, so the provenance survives a rebuild."""
-    old = list(old or [])
-    return [o if i < len(old) and isinstance(o := old[i], Injected) and o == c else c for i, c in enumerate(new)]
+def same_history(prov: Provenance | None, mine: Any, theirs: Any) -> bool:
+    """same_reply over two whole histories (lists of fingerprints, the session's first)."""
+    mine, theirs = list(mine or []), list(theirs or [])
+    return len(mine) == len(theirs) and all(same_reply(prov, m, t) for m, t in zip(mine, theirs))
 
 
-def without_injected(blocks: list, notice: str | None) -> list:
-    """An assistant message's blocks without the notice this endpoint injected into it (`notice`, its exact text; None:
-    nothing was injected, nothing is removed). Only the leading text (the first text block, with no text before it)
-    is touched: removed when it is exactly the notice, else stripped of a prefix that is exactly the notice (a client
-    that merged it into the model's text). Text that only looks like a notice, anywhere, is the model's and stays."""
-    if not notice:
+def holds(prov: Provenance | None, mine: Any, theirs: Any) -> bool:
+    """Whether some entry of the session's history `mine` is the client's entry `theirs` (same_reply)."""
+    return any(same_reply(prov, m, theirs) for m in (mine or []))
+
+
+def canonical(prov: Provenance | None, theirs: Any) -> list:
+    """A client's history as a rebuilt session holds it: each entry that is a verified accepted form of exactly one
+    delivered reply (every record accepting it agrees) is remapped to that delivered form, so later continuations in any
+    form keep matching; every other entry is kept as sent."""
+    out = []
+    for t in list(theirs or []):
+        if prov is not None and prov.delivered(t) is None:
+            ds = {r.delivered for r in prov.accepting(t)}
+            if len(ds) == 1:
+                t = next(iter(ds))
+        out.append(t)
+    return out
+
+
+def labelled(blocks: list, rec: Forms | None) -> list:
+    """An assistant message's blocks for a rebuilt transcript. `rec`: the injection whose kept or merged form this
+    message verifiably is (its fingerprint matched; None otherwise). Then the first text block, if it starts with that
+    exact notice, gets REBUILD_LABEL in front; nothing is ever removed, and text that only looks like a notice (no
+    verified record, or not leading) is the model's and stays exactly as it is."""
+    if rec is None:
         return list(blocks)
     out = list(blocks)
     for i, b in enumerate(out):
-        if not (isinstance(b, dict) and b.get("type") == "text"):
-            continue
-        t = b.get("text")
-        if isinstance(t, str):
-            if t.strip() == notice:
-                del out[i]
-            elif t.lstrip().startswith(notice):
-                out[i] = {**b, "text": t.lstrip()[len(notice):].lstrip()}
-        break                                           # the first text block only
+        if isinstance(b, dict) and b.get("type") == "text":
+            t = b.get("text")
+            if isinstance(t, str) and t.lstrip().startswith(rec.notice):
+                out[i] = {**b, "text": REBUILD_LABEL + t}
+            break                                       # the first text block only
     return out
 
 

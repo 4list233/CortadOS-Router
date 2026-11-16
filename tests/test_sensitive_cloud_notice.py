@@ -70,13 +70,13 @@ class VocabularyTests(unittest.TestCase):
     def test_every_reason_and_detector_round_trips_through_the_recogniser(self):
         for det in sensitive_notice.DETECTORS:
             for why in sensitive_notice.REASONS:
-                t = notice(det, why)
-                self.assertTrue(sensitive_notice.is_notice(t), t)
-                self.assertEqual(sensitive_notice.split_leading(t + "the answer"), (t, "the answer"))
+                self.assertTrue(sensitive_notice.is_notice(notice(det, why)), (det, why))
 
-    def test_split_leading_finds_no_candidate_in_other_text(self):
-        for t in ("the answer", "⚠ CortadOS: something else", "x " + notice("flag", "busy")):
-            self.assertIsNone(sensitive_notice.split_leading(t))
+    def test_round_4_removed_the_stripping_code(self):
+        for gone in ("Injected", "Fingerprint", "split_leading", "carry", "injected", "without_injected",
+                     "strip_leading", "without_notice"):
+            self.assertFalse(hasattr(sensitive_notice, gone), gone)
+        self.assertFalse(hasattr(anthropic_wire, "client_fingerprint"))
 
     def test_opt_out_header(self):
         self.assertTrue(sensitive_notice.opted_out({"x-cortados-sensitive-notice": " OFF "}))
@@ -90,107 +90,159 @@ class VocabularyTests(unittest.TestCase):
             self.assertIsNone(sensitive_notice.valid_record(bad))
 
 
-class FingerprintTests(unittest.TestCase):
-    """Review round 3 (P2): provenance, never shape. The session records the notice it injected (sensitive_notice.
-    Injected: exact text, block 0, that turn) over the fingerprint of the model's blocks; the client sends the reply
-    back however it kept it. Text the model wrote that only looks like a notice is never removed."""
+class ProvenanceTests(unittest.TestCase):
+    """#124 round 4: the delivered form is canonical. The session's history holds the reply as the client received it;
+    the injection records its accepted client forms (kept, merged, dropped) as exact fingerprints, keyed by the
+    model-only fingerprint; matching is an explicit helper (same_reply / same_history) over plain strings. Nothing is
+    ever stripped: a rebuilt transcript labels a kept notice and keeps every word of the client's text."""
 
     MODEL = [{"type": "text", "text": "Let me look."}, {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}]
     WARNING = notice("flag", "too_large")
 
-    def injected(self, n=None):
-        return sensitive_notice.Injected(anthropic_wire.reply_fingerprint(self.MODEL), n or self.WARNING, 0)
+    def forms(self, model=None, n=None):
+        return anthropic_wire.notice_forms(self.MODEL if model is None else model, n or self.WARNING)
 
-    def client(self, blocks):
-        return anthropic_wire.client_fingerprint(blocks)
+    def prov(self, *recs):
+        return sensitive_notice.Provenance(recs or (self.forms(),))
 
-    def test_an_injected_notice_kept_merged_or_dropped_matches_the_continuation(self):
+    def fp(self, blocks):
+        return anthropic_wire.reply_fingerprint(blocks)
+
+    def client_forms(self, model=None, n=None):
+        model, n = self.MODEL if model is None else model, n or self.WARNING
+        text = [b for b in model if b["type"] == "text"]
+        rest = [b for b in model if b["type"] != "text"]
+        first = text[0]["text"] if text else ""
+        merged = [[{"type": "text", "text": n + sep + first}, *text[1:], *rest] for sep in ("\n\n", "\n", " ", "")]
+        return {"kept": [{"type": "text", "text": n}, *model], "merged": merged, "dropped": list(model)}
+
+    def test_the_delivered_form_is_the_reply_as_sent(self):
+        rec = self.forms()
+        self.assertEqual(rec.delivered, self.fp(sensitive_notice.prepend(self.MODEL, sensitive_notice.block(
+            "flag", "too_large", CLOUD))))
+        self.assertEqual(rec.model, self.fp(self.MODEL))
+        self.assertIs(type(rec.delivered), str)                         # plain strings: no overloaded ==
+        self.assertIs(type(rec.model), str)
+
+    def test_all_three_client_forms_match(self):
+        prov, rec = self.prov(), self.forms()
+        cf = self.client_forms()
+        for name, blocks in [("kept", cf["kept"]), ("dropped", cf["dropped"])] + [("merged", m) for m in cf["merged"]]:
+            c = self.fp(blocks)
+            self.assertIn(c, rec.accepted, name)
+            self.assertTrue(sensitive_notice.same_reply(prov, rec.delivered, c), name)
+            self.assertTrue(sensitive_notice.same_history(prov, ["p", rec.delivered, "q"], ["p", c, "q"]), name)
+            self.assertTrue(sensitive_notice.holds(prov, ["p", rec.delivered], c), name)
+
+    def test_no_record_means_plain_equality(self):
+        rec = self.forms()
+        dropped = self.fp(self.MODEL)
+        for prov in (None, sensitive_notice.Provenance()):
+            self.assertFalse(sensitive_notice.same_reply(prov, rec.delivered, dropped))
+            self.assertTrue(sensitive_notice.same_reply(prov, rec.delivered, rec.delivered))
+        self.assertFalse(sensitive_notice.same_history(self.prov(), [rec.delivered], [dropped, dropped]))
+
+    def test_matching_is_directional(self):
+        # A plain session entry (no injection there) never accepts a notice the endpoint did not send at that place.
+        prov, rec = self.prov(), self.forms()
+        self.assertFalse(sensitive_notice.same_reply(prov, rec.model, rec.delivered))
+
+    def test_only_the_exact_recorded_text_and_reply_are_accepted(self):
+        prov, rec = self.prov(), self.forms()
+        other_notice = self.fp([{"type": "text", "text": notice("keyword", "busy")}, *self.MODEL])
+        other_reply = self.fp([{"type": "text", "text": self.WARNING}, {"type": "text", "text": "Something else."}])
+        lookalike = self.fp([{"type": "text", "text": self.WARNING + " Let me look."}, self.MODEL[1]])  # unknown sep
+        for c in (other_notice, other_reply, self.fp([self.MODEL[0]])):
+            self.assertFalse(sensitive_notice.same_reply(prov, rec.delivered, c))
+        self.assertTrue(sensitive_notice.same_reply(prov, rec.delivered, lookalike))     # " " is a recorded separator
+
+    def test_distinct_notice_only_replies_get_distinct_fingerprints(self):
+        a, b = self.forms([], notice("flag", "busy")), self.forms([], notice("keyword", "too_large"))
+        self.assertNotEqual(a.delivered, b.delivered)
+        self.assertNotEqual(a.delivered, self.fp([]))
+        prov = self.prov(a, b)
+        self.assertFalse(sensitive_notice.same_reply(prov, a.delivered, b.delivered))
+        self.assertFalse(sensitive_notice.same_history(prov, [a.delivered, b.delivered], [b.delivered, a.delivered]))
+        self.assertTrue(sensitive_notice.same_history(prov, [a.delivered, b.delivered], [self.fp([])] * 2))  # dropped
+        self.assertEqual(len(prov), 2)
+
+    def test_keyed_by_content_so_shifted_indices_still_match(self):
+        # Review round 3 (P2-1): a compaction shifts the injected turn's index; the record is found by content.
+        rec, other = self.forms(), self.forms([{"type": "text", "text": "later"}], notice("s1", "busy"))
+        prov = self.prov(rec, other)
+        session = ["p0", "p1", rec.delivered, "e", other.delivered]
+        compacted = [rec.model, "e", other.model]                       # two replies gone, both notices dropped
+        self.assertTrue(sensitive_notice.same_history(prov, session[2:], compacted))
+        self.assertTrue(sensitive_notice.holds(prov, session, other.model))
+        # a rebuilt session remaps the client's entries to the delivered forms they verifiably are
+        self.assertEqual(sensitive_notice.canonical(prov, compacted), [rec.delivered, "e", other.delivered])
+        self.assertEqual(sensitive_notice.canonical(None, compacted), compacted)
+        copy = prov.copy()
+        copy.add(self.forms([], notice("flag", "busy")))
+        self.assertEqual((len(prov), len(copy)), (2, 3))               # a branch's copy never writes back
+
+    def rebuilt(self, msgs, prov=None):
+        return "".join(b.get("text", "") for b in anthropic_wire.rebuild_transcript(msgs, prov))
+
+    def test_rebuild_transcript_labels_a_kept_notice_and_removes_nothing(self):
+        n, label = self.WARNING, sensitive_notice.REBUILD_LABEL
+        model = [{"type": "text", "text": "hello"}]
+        prov = self.prov(self.forms(model))
+        cf = self.client_forms(model)
+        for name, content in [("kept", cf["kept"])] + [("merged", m) for m in cf["merged"]]:
+            text = self.rebuilt([{"role": "user", "content": "hi"}, {"role": "assistant", "content": content}], prov)
+            self.assertIn(label + n, text, name)
+            self.assertEqual(text.count(n), 1, name)
+            self.assertIn("hello", text, name)
+            self.assertNotIn(label, self.rebuilt([{"role": "user", "content": "hi"},
+                                                  {"role": "assistant", "content": content}]), name)   # no record
+        dropped = self.rebuilt([{"role": "user", "content": "hi"}, {"role": "assistant", "content": cf["dropped"]}],
+                               prov)
+        self.assertNotIn(label, dropped)
+        self.assertIn("hello", dropped)
+
+    def test_model_text_starting_with_the_notice_and_a_dropped_injection_is_preserved(self):
+        # Review round 3 (P2-2): the model's own reply begins with text identical to the notice; the endpoint injected
+        # that notice too, and the client dropped the injection. Every word the model wrote is replayed, unlabelled.
         n = self.WARNING
-        separate = [{"type": "text", "text": n}] + self.MODEL
-        merged = [{"type": "text", "text": n + "\n\nLet me look."}, self.MODEL[1]]
-        merged_tight = [{"type": "text", "text": n + "Let me look."}, self.MODEL[1]]
-        for blocks in (separate, merged, merged_tight, self.MODEL):
-            c = self.client(blocks)
-            # both sides of ==, and inside history lists (Registry compares lists, in either order)
-            self.assertTrue(self.injected() == c and c == self.injected(), blocks)
-            self.assertFalse(self.injected() != c or c != self.injected(), blocks)
-            self.assertEqual([self.injected()], [c])
-            self.assertEqual([c], [self.injected()])
-            self.assertIn(c, [self.injected()])
+        model = [{"type": "text", "text": n + "\n\nThat is the warning the docs need."}]
+        prov = self.prov(self.forms(model))
+        msgs = [{"role": "user", "content": "write the warning"}, {"role": "assistant", "content": model}]
+        text = self.rebuilt(msgs, prov)
+        self.assertIn(model[0]["text"], text)
+        self.assertNotIn(sensitive_notice.REBUILD_LABEL, text)
+        self.assertTrue(sensitive_notice.same_reply(prov, prov.records()[0].delivered, self.fp(model)))
+        # kept: the injected copy is labelled, the model's own copy follows untouched
+        kept = self.rebuilt([msgs[0], {"role": "assistant", "content": [{"type": "text", "text": n}, *model]}], prov)
+        self.assertEqual(kept.count(n), 2)
+        self.assertEqual(kept.count(sensitive_notice.REBUILD_LABEL), 1)
+        self.assertIn(model[0]["text"], kept)
 
-    def test_only_the_exact_recorded_text_is_accepted(self):
-        other = notice("keyword", "busy")
-        c = self.client([{"type": "text", "text": other}] + self.MODEL)
-        self.assertNotEqual(self.injected(), c)
-        self.assertNotEqual(c, self.injected())
-        # with no injection recorded for the turn, a notice-shaped leading text is part of the reply
-        self.assertNotEqual(anthropic_wire.reply_fingerprint(self.MODEL),
-                            self.client([{"type": "text", "text": self.WARNING}] + self.MODEL))
-
-    def test_model_authored_notice_text_stays_in_the_fingerprint(self):
-        doc = [{"type": "text", "text": "The documentation must include this exact warning: " + self.WARNING}]
-        leading = [{"type": "text", "text": self.WARNING + "\n\nThat is the warning the docs need."}]
-        for blocks in (doc, leading):
-            session_fp = anthropic_wire.reply_fingerprint(blocks)    # no injection: the model's blocks as written
-            self.assertEqual(self.client(blocks), session_fp)
-            stripped = [{"type": "text", "text": "The documentation must include this exact warning: "}] \
-                if blocks is doc else [{"type": "text", "text": "That is the warning the docs need."}]
-            self.assertNotEqual(session_fp, anthropic_wire.reply_fingerprint(stripped))
-
-    def test_two_different_notice_only_replies_get_different_fingerprints(self):
-        a = [{"type": "text", "text": notice("flag", "busy")}]
-        b = [{"type": "text", "text": notice("keyword", "too_large")}]
-        self.assertNotEqual(anthropic_wire.reply_fingerprint(a), anthropic_wire.reply_fingerprint(b))
-        self.assertNotEqual(self.client(a), self.client(b))
-        self.assertNotEqual(anthropic_wire.reply_fingerprint(a), anthropic_wire.reply_fingerprint([]))
-
-    def test_a_notice_does_not_hide_a_different_reply(self):
-        other = [{"type": "text", "text": self.WARNING}, {"type": "text", "text": "Something else."}]
-        self.assertNotEqual(self.client(other), self.injected())
-        self.assertNotEqual(anthropic_wire.reply_fingerprint(other), anthropic_wire.reply_fingerprint(self.MODEL))
-
-    def test_carry_keeps_provenance_through_a_rebuild(self):
-        c = self.client([{"type": "text", "text": self.WARNING}] + self.MODEL)
-        kept = sensitive_notice.carry([self.injected()], [c])
-        self.assertIsInstance(kept[0], sensitive_notice.Injected)
-        self.assertEqual(sensitive_notice.injected(kept), {0: self.WARNING})
-        plain = self.client([{"type": "text", "text": "other"}])
-        self.assertIs(sensitive_notice.carry([self.injected()], [plain])[0], plain)
-
-    def rebuilt(self, msgs, notices=None):
-        return "".join(b.get("text", "") for b in anthropic_wire.rebuild_transcript(msgs, notices))
-
-    def test_rebuild_transcript_leaves_out_the_injected_notice_only(self):
-        n = self.WARNING
-        for content in ([{"type": "text", "text": n}, {"type": "text", "text": "hello"}],
-                        [{"type": "text", "text": n + "\n\nhello"}]):
-            msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": content}]
-            text = self.rebuilt(msgs, {0: n})
-            self.assertNotIn("CortadOS: this request", text)
-            self.assertIn("hello", text)
-            # recorded for another turn, or a different text: nothing is removed
-            self.assertIn(n, self.rebuilt(msgs, {1: n}))
-            self.assertIn(n, self.rebuilt(msgs, {0: notice("keyword", "busy")}))
-
-    def test_model_authored_warning_survives_rebuild_leading_and_not(self):
+    def test_model_authored_notice_like_text_is_never_removed(self):
         n = self.WARNING
         doc = "The documentation must include this exact warning: " + n
-        cases = ([{"type": "text", "text": doc}],                                    # non-leading, one block
-                 [{"type": "text", "text": "The docs need:"}, {"type": "text", "text": n}],   # non-leading block
-                 [{"type": "text", "text": n}, {"type": "text", "text": "is the warning."}])  # leading, model's own
-        for content in cases:
+        cases = {"leading": [{"type": "text", "text": n}, {"type": "text", "text": "is the warning."}],
+                 "non-leading": [{"type": "text", "text": doc}],
+                 "non-leading block": [{"type": "text", "text": "The docs need:"}, {"type": "text", "text": n}],
+                 "exact duplicate": [{"type": "text", "text": n}]}
+        for name, content in cases.items():
             msgs = [{"role": "user", "content": "write the docs"}, {"role": "assistant", "content": content}]
-            self.assertIn(n, self.rebuilt(msgs), content)               # no injection recorded
-        # an injection on turn 0 removes only turn 0's leading copy; the model's copy on turn 1 stays
-        msgs = [{"role": "user", "content": "a"},
-                {"role": "assistant", "content": [{"type": "text", "text": n}, {"type": "text", "text": "x"}]},
-                {"role": "user", "content": "b"},
-                {"role": "assistant", "content": [{"type": "text", "text": doc}]},
-                {"role": "user", "content": "c"},
-                {"role": "assistant", "content": [{"type": "text", "text": "intro "}, {"type": "text", "text": n}]}]
-        text = self.rebuilt(msgs, {0: n, 2: n})
-        self.assertEqual(text.count(n), 2, text)
-        self.assertIn(doc, text)
+            want = "".join(b["text"] for b in content).count(n)
+            for prov in (None, sensitive_notice.Provenance(), self.prov(), self.prov(self.forms(content))):
+                text = self.rebuilt(msgs, prov)
+                self.assertGreaterEqual(text.count(n), want, (name, prov))
+                for b in content:
+                    self.assertIn(b["text"], text, (name, prov))
+            # the session's own fingerprint of such a reply is taken over everything the model wrote
+            without = ([{"type": "text", "text": doc[:-len(n)]}] if name == "non-leading"
+                       else [b for b in content if b["text"] != n])
+            self.assertNotEqual(self.fp(content), self.fp(without), name)
+        # exact duplicate with the injection kept: both copies are replayed, the injected one labelled
+        dup = [{"type": "text", "text": n}]
+        text = self.rebuilt([{"role": "user", "content": "x"},
+                             {"role": "assistant", "content": [{"type": "text", "text": n}, *dup]}],
+                            self.prov(self.forms(dup)))
+        self.assertEqual((text.count(n), text.count(sensitive_notice.REBUILD_LABEL)), (2, 1))
 
 
 class WhyCategoryTests(unittest.TestCase):
@@ -585,11 +637,23 @@ class ResponsesWireTests(NoticeHarness):
         self.assertIn("and the second one", again["output"][0]["content"][0]["text"])
         self.assertEqual(list(self.reg.sessions.values()), [s])
         parsed = responses_wire.parse_request(nxt)
-        # the session recorded its injection; the client's copy, notice item included, matches it by provenance
+        # round 4: the session holds the reply as delivered, so the client's copy, notice item included, is equal
         self.assertEqual(s.history[:1], parsed.history)
-        self.assertIsInstance(s.history[0], sensitive_notice.Injected)
-        self.assertEqual(str(s.history[0]), anthropic_wire.reply_fingerprint(
+        (rec,) = s.notices.records()
+        self.assertEqual(rec.model, anthropic_wire.reply_fingerprint(
             [{"type": "text", "text": got["output"][1]["content"][0]["text"]}]))
+        self.assertEqual(s.history[0], rec.delivered)
+
+    def test_continuation_with_the_notice_item_dropped(self):
+        from tests.test_provider_responses import request, user
+        first = request(user("summarise the notes"))
+        got = self.post(first, path="/v1/responses", headers={"x-cortados-local": "sensitive"})
+        (s,) = self.reg.sessions.values()
+        nxt = request(*first["input"], *got["output"][1:], user("and the second one"))
+        again = self.post(nxt, path="/v1/responses")
+        self.assertIn("and the second one", again["output"][0]["content"][0]["text"])
+        self.assertEqual(list(self.reg.sessions.values()), [s])
+        self.assertEqual(getattr(s, "rebuilds", 0), 0)
 
 
 class RouteRowRecordTests(unittest.TestCase):
@@ -683,7 +747,7 @@ class FixedModelRefusedContinuationTests(EndpointHarness):
                 self.assertEqual(got["content"], [{"type": "text", "text": "API Error: the model refused"}])
             (s,) = self.reg.sessions.values()
             self.assertIsNone(s.route)                  # no partial route was made up
-            self.assertFalse(any(isinstance(h, sensitive_notice.Injected) for h in s.history))
+            self.assertEqual(len(server._notices(s)), 0)          # nothing injected, nothing recorded
         self.assertEqual(records, [])
 
 

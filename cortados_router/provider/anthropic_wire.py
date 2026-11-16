@@ -218,21 +218,25 @@ def reply_fingerprint(blocks: Any) -> str:
     """One assistant message as the endpoint wrote it: its text (whitespace-trimmed, blocks joined) and its tool_use
     ids. Every assistant message in a conversation was written by this endpoint, so the sequence of fingerprints
     identifies the conversation and proves the client's history agrees with the CLI session's. Nothing is removed: a
-    sensitive-cloud notice the endpoint injected is matched by provenance (sensitive_notice.Injected), not by shape."""
+    reply with a sensitive-cloud notice (#124) is recorded as delivered, with its accepted forms (notice_forms)."""
     bs = _blocks(blocks)
     return _fingerprint("".join(b.get("text", "") for b in bs if b.get("type") == "text"),
                         [b.get("id") for b in bs if b.get("type") == "tool_use"])
 
 
-def client_fingerprint(blocks: Any) -> sensitive_notice.Fingerprint:
-    """An assistant message of a client's history: reply_fingerprint's value, plus the candidate a session's recorded
-    notice injection (#124) may accept: (the notice-shaped leading text, the fingerprint without it), else None."""
+def notice_forms(blocks: Any, notice: str) -> sensitive_notice.Forms:
+    """The accepted client forms (#124 round 4) of a reply whose model blocks are `blocks` and that went out with the
+    injected `notice` text leading it: (a) kept as its own block (the delivered fingerprint), (b) merged into the
+    model's first text (sensitive_notice.MERGE_SEPARATORS), (c) dropped (the model's own fingerprint). Exact
+    fingerprints, computed once, when the notice is injected."""
     bs = _blocks(blocks)
-    joined = "".join(b.get("text", "") for b in bs if b.get("type") == "text")
+    text = "".join(b.get("text", "") for b in bs if b.get("type") == "text")
     ids = [b.get("id") for b in bs if b.get("type") == "tool_use"]
-    lead = sensitive_notice.split_leading(joined)
-    return sensitive_notice.Fingerprint(_fingerprint(joined, ids),
-                                        (lead[0], _fingerprint(lead[1], ids)) if lead else None)
+    model = _fingerprint(text, ids)
+    delivered = reply_fingerprint(sensitive_notice.prepend(list(bs), {"type": "text", "text": notice}))
+    merged = {_fingerprint(notice + sep + text, ids) for sep in sensitive_notice.MERGE_SEPARATORS}
+    return sensitive_notice.Forms(model=model, delivered=delivered, accepted=frozenset({delivered, model, *merged}),
+                                  notice=notice)
 
 
 # Client-injected transient text inside user content. Claude Code wraps its reminders (todo state, file-change notes,
@@ -406,7 +410,7 @@ def _parse_request(body: dict[str, Any]) -> ClientTurn:
     return ClientTurn(system=_system_text(body.get("system")), tools=[without_cache_control(t) for t in tools
                                                                      if t.get("name") and not is_server_tool(t)],
                       content=content, tool_results=results,
-                      history=[client_fingerprint(m.get("content")) for m in messages if m.get("role") == "assistant"],
+                      history=[reply_fingerprint(m.get("content")) for m in messages if m.get("role") == "assistant"],
                       stream=bool(body.get("stream")), model=str(body.get("model") or MODEL_ID),
                       prefix_digest=conversation_digest(messages[:start]),
                       history_tool_ids=any(tool_use_ids(m.get("content")) for m in messages
@@ -578,25 +582,24 @@ def history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def rebuild_transcript(messages: list[dict[str, Any]],
-                       notices: dict[int, str] | None = None) -> list[dict[str, Any]]:
+                       notices: "sensitive_notice.Provenance | None" = None) -> list[dict[str, Any]]:
     """Anthropic-shaped history messages as one labelled transcript (see REBUILD_NOTE), as content blocks: text, with
     each historical image kept in place as an image block (see _image_parts). Content that _blocks refuses in an
     earlier message is shown as its JSON, never a 400: the endpoint already accepted it once. `notices`: the
-    sensitive-cloud notices the session injected (#124; sensitive_notice.injected: assistant message index -> exact
-    text); exactly those are left out of their own assistant message, and nothing else is."""
+    conversation's recorded sensitive-cloud injections (#124 round 4, sensitive_notice.Provenance). No client text is
+    ever removed: an assistant message whose fingerprint is verifiably the kept or merged form of one of them gets
+    sensitive_notice.REBUILD_LABEL before that notice, so the rebuilt model knows the provider wrote it; anything else,
+    notice-like model text included, is replayed exactly as sent."""
     parts: list = []
     n = [0]                                         # images numbered across the whole transcript
-    k = -1                                          # assistant message index
     for m in messages:
         role = {"assistant": "assistant", "user": "user", "system": "operator"}.get(m.get("role"), str(m.get("role")))
         try:
             blocks = _blocks(m.get("content"))
         except WireError:
             blocks = [{"type": "_raw", "content": m.get("content")}]
-        if role == "assistant":
-            k += 1
-            # the endpoint's own injected notice (#124), by provenance; never the model's words
-            blocks = sensitive_notice.without_injected(blocks, (notices or {}).get(k))
+        if role == "assistant" and notices:
+            blocks = sensitive_notice.labelled(blocks, _kept_notice(blocks, notices))
         body = [p for b in blocks for p in (_replay_block(b, n, role) or [])]
         if body:
             if parts:
@@ -606,6 +609,19 @@ def rebuild_transcript(messages: list[dict[str, Any]],
                 parts += (["\n"] if i else []) + [p]
             parts.append(f"\n</{role}>")
     return _coalesce(parts)
+
+
+def _kept_notice(blocks: list, notices: "sensitive_notice.Provenance") -> "sensitive_notice.Forms | None":
+    """The injection whose kept or merged form this assistant message is (its fingerprint matched exactly, and it is not
+    the dropped form), else None. Content-keyed: the message's position in the history plays no part."""
+    try:
+        fp = reply_fingerprint(blocks)
+    except Exception:                                   # a _raw block: replayed as JSON, nothing to label
+        return None
+    for rec in notices.accepting(fp):
+        if fp != rec.model:
+            return rec
+    return None
 
 
 def rebuild_content(transcript: list[dict[str, Any]], turn: ClientTurn) -> list[dict[str, Any]]:
