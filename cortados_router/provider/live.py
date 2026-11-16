@@ -1548,6 +1548,25 @@ def _merge_hardware(readings: list[dict[str, Any]]) -> dict[str, Any]:
     return out
 
 
+def heartbeat_stale(hb: dict[str, Any], now: float) -> bool:
+    """A stored heartbeat (HeartbeatBoard.snapshot) is stale past its own ttl_s since it was received."""
+    return now - hb["received_at"] > hb["ttl_s"]
+
+
+def fresh_hardware(heartbeats: dict[str, dict[str, Any]], now: float) -> list[tuple[str, dict[str, Any], float]]:
+    """(host, hardware block, age_s) for each fresh heartbeat that carries hardware, by host name. The block is the one
+    validate_heartbeat already checked (_HB_HW_KEYS only); age_s runs from its sampled_at, else from receipt. The one
+    reader of the board's hardware: the hosts section here and the Usage view (usage._collect) both use it."""
+    out = []
+    for h, hb in sorted(heartbeats.items()):
+        hh = hb.get("hardware")
+        if not isinstance(hh, dict) or heartbeat_stale(hb, now):
+            continue
+        at = hh.get("sampled_at") if _num(hh.get("sampled_at")) else hb["received_at"]
+        out.append((h, dict(hh), round(max(0.0, now - at), 1)))
+    return out
+
+
 def hosts_section(u: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]], *, names: list[str],
                   exec_hosts: dict[str, list[str]] | None, exec_default: str | None, self_host: str | None,
                   now: float, errors: list | None = None, self_name: str | None = None) -> dict[str, Any]:
@@ -1600,18 +1619,16 @@ def hosts_section(u: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]
         cands.setdefault(name, []).append(hw)
     for h, hb in heartbeats.items():
         age = max(0.0, now - hb["received_at"])
-        stale = age > hb["ttl_s"]
+        stale = heartbeat_stale(hb, now)
         it = item(h)
         it["heartbeat_state"] = "stale" if stale else "fresh"
         it["heartbeat"] = {"received_at": hb["received_at"], "age_s": round(age, 1), "ttl_s": hb["ttl_s"],
                            "stale": stale, "jobs": hb["jobs"], "s1": hb.get("s1")}
-        hh = hb.get("hardware")
-        if isinstance(hh, dict) and not stale:
-            at = hh.get("sampled_at") if _num(hh.get("sampled_at")) else hb["received_at"]
-            hw = {k: hh.get(k) for k in _HW_PICK if k != "chip"}
-            hw.update(chip=hh.get("chip"), load_1m=hh.get("load_1m"), age_s=round(max(0.0, now - at), 1),
-                      disk_free_pct=hh.get("disk_free_pct"), source="heartbeat")
-            cands.setdefault(h, []).append(hw)
+    for h, hh, hw_age in fresh_hardware(heartbeats, now):
+        hw = {k: hh.get(k) for k in _HW_PICK if k != "chip"}
+        hw.update(chip=hh.get("chip"), load_1m=hh.get("load_1m"), age_s=hw_age,
+                  disk_free_pct=hh.get("disk_free_pct"), source="heartbeat")
+        cands.setdefault(h, []).append(hw)
     for name, readings in cands.items():
         item(name)["hardware"] = _merge_hardware(readings)
     errors += [e for e in (u or {}).get("errors") or []

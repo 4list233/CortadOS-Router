@@ -398,6 +398,24 @@ class DashboardRenderTest(unittest.TestCase):
         self.assertIn("cache r", out); self.assertIn("HTTP 200", out)
         self.assertNotIn("[object Object]", out)
 
+    def test_render_heartbeat_hardware_cards(self):
+        # #123: the Usage tab's hardware from the heartbeat board, the provider host holding no hardware/ directory
+        from tests import test_usage as tu
+        home = self.tmp()
+        out = self.run_page(self.view(home, heartbeats=lambda: tu._board(("air", tu.HB_HW, 180, tu.NOW - 30)).snapshot(tu.NOW)))
+        self.assertIn("Apple M5 Max", out)
+        self.assertIn("CPU busy 13%", out)
+        self.assertIn("load (1 min): 1.25", out)
+        self.assertIn("disk free: 41%", out)
+        self.assertIn("memory total: 32.0 GB", out)
+        self.assertIn("sample 20 s old (heartbeat)", out)
+        self.assertNotIn("hardware: absent", out)
+        self.assertNotIn("no hardware samples", out)
+        self.assertNotIn("Ollama:", out)                                         # a heartbeat carries no model list
+        self.assertNotIn("[object Object]", out)
+        out = self.run_page(self.view(home))                                     # no heartbeat, no legacy dir
+        self.assertIn("[ERR] no hardware samples (hardware: no host has sent hardware in the last 15 min)", out)
+
     def test_render_missing_sources(self):
         def boom():
             raise OSError("no cache")

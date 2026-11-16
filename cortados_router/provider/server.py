@@ -3792,7 +3792,8 @@ class ProviderServer(ThreadingHTTPServer):
         return tasks.collect(paths.state_dir())
 
     def usage_view(self, registry: Registry) -> dict[str, Any] | bytes:
-        """GET /v1/cortados/usage (provider/usage.py): cache-only reads plus one short S1 health call. Tests replace it."""
+        """GET /v1/cortados/usage (provider/usage.py): cache-only reads plus one short S1 health call; hardware from the
+        live heartbeat board (registry.live), the same store the live view's hosts section reads. Tests replace it."""
         from cortados_router import paths, scarcity
         from cortados_router.provider import usage
         try:
@@ -3806,7 +3807,7 @@ class ProviderServer(ThreadingHTTPServer):
         return usage.collect(state_dir=state, scarcity_reader=lambda: usage.read_scarcity_cache(state / "scarcity.json"),
                              refusals=registry.runs.all_refusals(), runs_since_start=registry.runs.model_counts(),
                              s1_url=s1_url, freshness=scarcity.reading_freshness, claude_lanes=scarcity.claude_lanes(),
-                             encoded=True)
+                             heartbeats=registry.live.snapshot, encoded=True)
 
 
 def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, codex_home: str | None,
