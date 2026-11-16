@@ -214,7 +214,7 @@ test('provider-generated snapshot preserves account and pool readings and local 
   expect(laneLines('claude#b', s.subscriptions['claude#b'], s.readings['claude#b'], s.generated_at)).toEqual([
     'claude#b @.claude-acctB: ok · scarcity -0.20 · sample 60 s old', '  week [fable]: 55% left'])
   expect(laneLines('local', s.subscriptions.local, undefined, s.generated_at)).toEqual([
-    'local: eligible · available: measured local resources'])
+    'local (resource-pool deployments): eligible · available: measured local resources'])
   expect(laneLines('codex', s.subscriptions.codex, undefined, s.generated_at)).toEqual(['codex: quota unknown'])
 })
 
@@ -236,7 +236,7 @@ test('lane samples retain age, failure, stale windows and spent reasons', () => 
     { window: 'month', pool: 'other', used_pct: 70, stale: true }, { window: '5h', pool: 'all', headroom_pct: 91 }] }, now))
     .toEqual(['cursor: SPENT · scarcity 1.20', '  month spent', '  month [other]: 30% left (stale)', '  5h: 91% left'])
   expect(laneLines('local', { ok: false, why: 'no verified deployment' }, undefined, now))
-    .toEqual(['local: unavailable · no verified deployment'])
+    .toEqual(['local (resource-pool deployments): none verified · see Local nodes for the gate'])
   expect(laneLabel('claude', {})).toBe('claude')
 })
 
@@ -287,7 +287,9 @@ test('session.start registers the command, opens the pane, polls once and keeps 
   expect(opened).toEqual([{ id: 'cortados-pulse', title: 'CortadOS pulse' }])
   expect(every.map(t => t.ms)).toEqual([LIVE_POLL_MS])
   // no salt file here: the session has no tag, so the fleet view is read (the fallback), never the per-session one
-  expect([...$.calls.urls].sort()).toEqual(['http://air.example:8432/resources', 'http://air.example:8432/v1/cortados/live'])
+  // #127: and the local nodes' own state, through the provider's local switch view
+  expect([...$.calls.urls].sort()).toEqual(['http://air.example:8432/resources', 'http://air.example:8432/v1/cortados/live',
+    'http://air.example:8432/v1/cortados/local'])
   expect($.held().data.usage.total_routes).toBe(1)
   await hooks['session.start']($, {}, async (e: any) => e)
   expect(every.length).toBe(2)

@@ -37,8 +37,19 @@ window are not opened (nothing in them can be newer than the file).
 
 Never sent: a raw session id (only the Office tag: sha256(salt:session id) cut to 16 hex, the same tag the
 cortados-routed-subagents mod puts on routed requests, so the provider can join the two sides), prompt or reply text,
-paths, tool inputs. A session's project is the cwd's last folder name, as the Office already shows it. Without the
-mod's salt (mod not installed), sessions have no tag: they count in the totals only and `salt` says false.
+paths, tool inputs. A session's project is the cwd's last folder name, as the Office already shows it.
+
+The salt (#127): the machine's SHARED Office salt (~/.config/cortados/office-salt, subagent_mcp.read_office_salt), the
+one start_task's task origins, route_task's session header, the pulse pane and the mod (once the file exists) all hash
+with. Before #127 this read the mod's per-install store salt, which the mod uses only for a session that started
+before the shared file existed: every other session's row then carried a tag no routed request ever had. Now the
+shared salt names `session`; when the mod's store salt also exists and differs, `session_alt` carries the tag under it,
+so a session the mod pinned to its store salt still joins (both are exact hashes of the same session id; nothing is
+guessed). `salt_source` says which salt `session` is under ("shared", "store" when only the store salt exists, or
+None). Without any salt, sessions have no tag: they count in the totals only and `salt` says false.
+
+Per session, `models` breaks the session's tokens down by model (the main loop and its direct subagents together), per
+window, as [input, output, cache_read, cache_write]: at most MODELS_PER_SESSION models, the rest summed under "other".
 
 CLI (prints the summary; reads only): python3 -B -m cortados_router.orchestrator_usage [--projects DIR] [--now EPOCH]
 """
@@ -60,7 +71,7 @@ if __package__ in (None, ""):                       # run as a file: make the pa
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cortados_router.provider import bridge as _bridge, search_lane as _search_lane  # noqa: E402
 
-VERSION = 1
+VERSION = 2                                     # 2: shared salt, session_alt, salt_source, per-session models (#127)
 DEFAULT_PROJECTS = "~/.claude/projects"
 # The mod's $.store file (Claude Code keeps one JSON per plugin under plugins/store); key officeSalt, 32 hex.
 SALT_STORE_GLOB = "~/.claude/plugins/store/cortados-routed-subagents_*.json"
@@ -72,6 +83,8 @@ WINDOWS: dict[str, int] = {"24h": 24 * 3600, "7d": 7 * 24 * 3600}
 # for the jobs and hardware; the owner runs a handful of main sessions a day, so 30 covers a busy week. The totals
 # always include every session, the rows past the cap are counted in `sessions_hidden`.
 SESSIONS_MAX = 30
+MODELS_PER_SESSION = 3                          # models listed per session row; the rest are summed under OTHER_MODEL
+OTHER_MODEL = "other"
 TOKEN_FIELDS = ("input", "output", "cache_read", "cache_write")
 _USAGE_KEYS = {"input": "input_tokens", "output": "output_tokens", "cache_read": "cache_read_input_tokens",
                "cache_write": "cache_creation_input_tokens"}
@@ -107,7 +120,20 @@ def session_tag(salt: str, session_id: str) -> str:
     return hashlib.sha256(f"{salt}:{session_id}".encode()).hexdigest()[:TAG_HEX]
 
 
-def read_salt(pattern: str = SALT_STORE_GLOB) -> str | None:
+def read_salt(env: dict | None = None) -> str | None:
+    """The salt `session` tags are under: the machine's shared Office salt (module doc), else the mod's store salt
+    (read_store_salt), else None."""
+    return read_shared_salt(env) or read_store_salt()
+
+
+def read_shared_salt(env: dict | None = None) -> str | None:
+    """~/.config/cortados/office-salt (CORTADOS_OFFICE_SALT_FILE overrides), read as subagent_mcp reads it; None when
+    absent or not 32 hex. Never creates it (the cortados-route MCP server does)."""
+    from cortados_router import subagent_mcp
+    return subagent_mcp.read_office_salt(env)
+
+
+def read_store_salt(pattern: str = SALT_STORE_GLOB) -> str | None:
     """The mod's per-install salt, or None (no mod store, unreadable, or not 32 hex). With several stores (a reinstall),
     the most recently written one: that is the one the running mod reads."""
     paths = []
@@ -198,7 +224,8 @@ def _routed_model(model: str) -> bool:
 
 def scan(projects_dir: str | os.PathLike = DEFAULT_PROJECTS, *, now: float | None = None,
          windows: dict[str, int] | None = None, salt: str | None = None,
-         task_roots: Iterable[str] = (), sessions_max: int = SESSIONS_MAX) -> dict[str, Any]:
+         task_roots: Iterable[str] = (), sessions_max: int = SESSIONS_MAX, alt_salt: str | None = None,
+         salt_source: str | None = None) -> dict[str, Any]:
     """The summary (module doc). Reads only; a file that cannot be read is counted in `unreadable_files`."""
     now = time.time() if now is None else now
     windows = dict(WINDOWS if windows is None else windows)
@@ -278,13 +305,16 @@ def scan(projects_dir: str | os.PathLike = DEFAULT_PROJECTS, *, now: float | Non
             excl["child_task_files"] += 1
             continue
         msgs.update(file_msgs)
-    return summarize(msgs.values(), now=now, windows=windows, salt=salt, sessions_max=sessions_max, excluded=excl)
+    return summarize(msgs.values(), now=now, windows=windows, salt=salt, sessions_max=sessions_max, excluded=excl,
+                     alt_salt=alt_salt, salt_source=salt_source)
 
 
 def summarize(messages: Iterable[tuple], *, now: float,
-              windows: dict[str, int], salt: str | None, sessions_max: int, excluded: dict[str, int]) -> dict[str, Any]:
+              windows: dict[str, int], salt: str | None, sessions_max: int, excluded: dict[str, int],
+              alt_salt: str | None = None, salt_source: str | None = None) -> dict[str, Any]:
     """messages: (session id, ts, model, tokens, cwd[, sidechain]). Sidechain (subagent) tokens count in the totals and
-    their session's row like the main loop's, and again in `subagent` (a sub-total of `totals`, per window)."""
+    their session's row like the main loop's, and again in `subagent` (a sub-total of `totals`, per window). A row's
+    `models`: its tokens per model and window (module doc)."""
     widest_name = max(windows, key=windows.get)
     totals = {w: {**_zero(), "sessions": 0} for w in windows}
     subagent = {w: _zero() for w in windows}
@@ -292,13 +322,15 @@ def summarize(messages: Iterable[tuple], *, now: float,
     for sid, ts, model, tok, cwd, *rest in messages:
         side = bool(rest and rest[0])
         s = sessions.setdefault(sid, {"windows": {w: _zero() for w in windows}, "models": {}, "last_at": 0.0,
-                                      "project": None})
+                                      "project": None, "by_model": {}})
         s["last_at"] = max(s["last_at"], ts)
         if cwd and s["project"] is None:
             s["project"] = os.path.basename(os.path.normpath(cwd))
+        bm = s["by_model"].setdefault(model or "?", {w: _zero() for w in windows})
         for w, span in windows.items():
             if ts >= now - span:
                 for k in TOKEN_FIELDS:
+                    bm[w][k] += tok[k]
                     s["windows"][w][k] += tok[k]
                     totals[w][k] += tok[k]
                     if side:
@@ -312,15 +344,54 @@ def summarize(messages: Iterable[tuple], *, now: float,
                 totals[w]["sessions"] += 1
         model = max(s["models"], key=s["models"].get) if s["models"] else None
         project = s["project"] if s["project"] and _PROJECT_RE.fullmatch(s["project"]) else None
-        rows.append({"session": session_tag(salt, sid) if salt else None, "project": project,
-                     "model": model if model and _MODEL_RE.fullmatch(model) else None,
-                     "last_at": round(s["last_at"], 3), **{w: dict(s["windows"][w]) for w in windows}})
+        row = {"session": session_tag(salt, sid) if salt else None, "project": project,
+               "model": model if model and _MODEL_RE.fullmatch(model) else None,
+               "last_at": round(s["last_at"], 3), **{w: dict(s["windows"][w]) for w in windows},
+               "models": _row_models(s["by_model"], windows)}
+        if salt and alt_salt and alt_salt != salt:
+            row["session_alt"] = session_tag(alt_salt, sid)
+        rows.append(row)
     rows.sort(key=lambda r: (fresh_tokens(r[widest_name]), r["last_at"]), reverse=True)
     return {"version": VERSION, "sampled_at": round(now, 3), "salt": bool(salt),
+            "salt_source": salt_source if salt and salt_source in ("shared", "store") else None,
             "windows": {w: int(span) for w, span in windows.items()}, "totals": totals,
             "subagent": subagent,
             "sessions": rows[:sessions_max], "sessions_hidden": max(0, len(rows) - sessions_max),
             "excluded": dict(excluded)}
+
+
+def _row_models(by_model: dict[str, dict[str, dict[str, int]]], windows: dict[str, int]) -> dict[str, Any]:
+    """A session's tokens per model (module doc): the MODELS_PER_SESSION largest by fresh tokens over the widest window,
+    each {window: [input, output, cache_read, cache_write]}; the rest, and any model id the provider would refuse,
+    summed under OTHER_MODEL. Models with nothing in any window are left out."""
+    widest = max(windows, key=windows.get)
+    named = [(m, t) for m, t in by_model.items() if any(any(t[w].values()) for w in windows)]
+    named.sort(key=lambda mt: (fresh_tokens(mt[1][widest]), all_tokens(mt[1][widest])), reverse=True)
+    out: dict[str, Any] = {}
+    other = {w: _zero() for w in windows}
+    has_other = False
+    for m, t in named:
+        if len(out) < MODELS_PER_SESSION and m != OTHER_MODEL and _MODEL_RE.fullmatch(m):
+            out[m] = {w: [t[w][k] for k in TOKEN_FIELDS] for w in windows}
+        else:
+            has_other = True
+            for w in windows:
+                for k in TOKEN_FIELDS:
+                    other[w][k] += t[w][k]
+    if has_other:
+        out[OTHER_MODEL] = {w: [other[w][k] for k in TOKEN_FIELDS] for w in windows}
+    return out
+
+
+def salts(env: dict | None = None) -> tuple[str | None, str | None, str | None]:
+    """(salt, alt_salt, salt_source) for scan(): the shared salt with the store salt as the alternative, else the store
+    salt alone, else nothing (module doc)."""
+    shared, store = read_shared_salt(env), read_store_salt()
+    if shared:
+        return shared, (store if store and store != shared else None), "shared"
+    if store:
+        return store, None, "store"
+    return None, None, None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -330,7 +401,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--now", type=float, default=None)
     a = ap.parse_args(argv)
     t0 = time.time()
-    out = scan(a.projects, now=a.now, salt=read_salt(), task_roots=a.task_root)
+    salt, alt, source = salts()
+    out = scan(a.projects, now=a.now, salt=salt, alt_salt=alt, salt_source=source, task_roots=a.task_root)
     out["scan_ms"] = int((time.time() - t0) * 1000)
     print(json.dumps(out, indent=1))
     return 0

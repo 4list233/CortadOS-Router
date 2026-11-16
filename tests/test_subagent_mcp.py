@@ -62,6 +62,37 @@ class RouteTaskTests(unittest.TestCase):
         self.assertIn("task text", seen["body"]["messages"][0]["content"][0]["text"])
         self.assertIn("extra", seen["body"]["messages"][0]["content"][0]["text"])
 
+    def test_route_task_is_attributed_to_its_session(self):
+        # #127: the session's Office tag (the start_task origin and the pulse pane's tag) and the via marker; no salt or
+        # no session id: no session header, never a guessed one; a named client (the bot) is not a session
+        import os
+        import tempfile
+        from cortados_router.provider import office
+        self.assertEqual(m.VIA_HEADER, office.VIA_HEADER)
+        self.assertIn("route_task", office.VIA_VALUES)
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        salt_file = os.path.join(d, "office-salt")
+        sid = "11111111-2222-3333-4444-555555555555"
+        env = {m.OFFICE_SALT_ENV: salt_file, m.SESSION_ID_ENV: sid, "HOME": d}
+        seen = []
+
+        def _open(req, timeout=None):
+            seen.append({k.lower(): v for k, v in req.header_items()})
+            return FakeResp({"content": [{"type": "text", "text": "ok"}]})
+        with unittest.mock.patch.dict("os.environ", env, clear=True):
+            m.route_task("http://h:8432", "secret-test-0001", "t", urlopen=_open)           # no salt file yet
+            with open(salt_file, "w") as f:
+                f.write("0123456789abcdef0123456789abcdef\n")
+            m.route_task("http://h:8432", "secret-test-0001", "t", urlopen=_open)
+            m.route_task("http://h:8432", "secret-test-0001", "t", urlopen=_open, client="grokbot")
+        self.assertEqual([h.get("x-cortados-via") for h in seen], ["route_task"] * 3)
+        self.assertNotIn("x-cortados-session", seen[0])
+        self.assertEqual(seen[1]["x-cortados-session"], m.origin_tag("0123456789abcdef0123456789abcdef", sid))
+        self.assertEqual(seen[1]["x-cortados-session"], m.origin_identity(env)["session"])    # = start_task's origin
+        self.assertNotIn("x-cortados-session", seen[2])
+        self.assertNotIn(sid, json.dumps(seen))
+
     def test_model_pin(self):
         from cortados_router.provider import routing
         seen = []

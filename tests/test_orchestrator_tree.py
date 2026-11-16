@@ -159,9 +159,73 @@ def ids(node):
     return out
 
 
+# ---- the per-session work split (#127) over the same tree fixtures
+CHILD_MCP_TAG = "c0ffeec0ffee0001"     # a child's own x-cortados-session: the cortados-route server's random tag
+
+
+def split_token_totals():
+    """work_split.routed_tokens over a real routes table: MINE's child task ROOT (origin observed on its requests), its
+    nested NESTED (a run whose requests carried no origin: the provider host's task log names MINE through ROOT), a
+    routed subagent and a route_task call of MINE's, and OTHER's follow-up FOLLOW."""
+    import sqlite3
+    from cortados_router import core
+    from cortados_router.provider import work_split
+    c = sqlite3.connect(":memory:")
+    c.executescript(core.DDL)
+    for col, kind in (("scarcity", "TEXT"), ("context", "TEXT"), ("task_context", "TEXT"), *core.TOKEN_COLUMNS):
+        c.execute(f"ALTER TABLE routes ADD COLUMN {col} {kind}")
+    for tid, ts, lane, model, sess, origin, run, via, tok in (
+            ("w-1", NOW - 300, "claude#b", "claude-opus-5-5", CHILD_MCP_TAG, MINE, ROOT, None, (300000, 120000, 4000000, 80000)),
+            ("w-2", NOW - 200, "codex", "gpt-6.1-sol", CHILD_MCP_TAG, None, NESTED, None, (600000, 200000, 0, 0)),
+            ("w-3", NOW - 100, "codex", "gpt-6.1-mini", MINE, None, None, None, (40000, 10000, 0, 0)),
+            ("w-4", NOW - 50, "claude#b", "claude-haiku-5", MINE, None, None, "route_task", (20000, 5000, 0, 0)),
+            ("w-5", NOW - 120, "codex", "gpt-6.1", CHILD_MCP_TAG, OTHER, FOLLOW, None, (999, 999, 0, 0))):
+        c.execute("INSERT INTO routes (turn_id, ts, lane, model, request, office_session, office_origin, office_run, "
+                  "office_via, tok_input, tok_output, tok_cache_read, tok_cache_write, tok_turns) "
+                  "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1)", (tid, ts, lane, model, SECRET, sess, origin, run, via, *tok))
+    try:
+        return work_split.routed_tokens(c, NOW)
+    finally:
+        c.close()
+
+
+def split_tasks_view():
+    return {**tl.tasks_view(3), "token_totals": split_token_totals()}
+
+
+def split_orchestrator_block(at=NOW - 60):
+    z = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    mine = {"input": 50000, "output": 250000, "cache_read": 30000000, "cache_write": 400000}
+    return {"version": 2, "sampled_at": at, "salt": True, "salt_source": "shared", "windows": {"24h": 86400, "7d": 604800},
+            "totals": {w: {"input": 50100, "output": 250100, "cache_read": 30000000, "cache_write": 400000, "sessions": 2}
+                       for w in ("24h", "7d")},
+            "sessions": [{"session": MINE, "project": "CortadOS-Router", "model": "claude-opus-5-5", "last_at": NOW - 70,
+                          "24h": mine, "7d": mine,
+                          "models": {"claude-opus-5-5": {w: [45000, 240000, 29000000, 380000] for w in ("24h", "7d")},
+                                     "claude-haiku-5": {w: [5000, 10000, 1000000, 20000] for w in ("24h", "7d")}}},
+                         {"session": OTHER, "project": "Grounds", "model": "claude-opus-5", "last_at": NOW - 90,
+                          "24h": dict(z, input=100, output=100), "7d": dict(z, input=100, output=100)}],
+            "sessions_hidden": 0, "excluded": {"child_task_files": 1, "routed_model_entries": 3, "unreadable_files": 0,
+                                               "bad_lines": 0}}
+
+
+def split_heartbeats(at=NOW - 60):
+    b = tl.heartbeats()
+    hb, bad = live.validate_heartbeat({"host": "pro", "ttl_s": 900, "jobs": [],
+                                       "orchestrator": split_orchestrator_block(at)}, NOW)
+    assert bad is None, bad
+    b.post(hb, at)
+    return b
+
+
+def split_view(session=None, at=NOW - 60, **over):
+    return view(session, tasks_view=split_tasks_view, heartbeats=lambda: split_heartbeats(at).snapshot(NOW), **over)
+
+
 def session_fixture():
-    """GET /v1/cortados/live/session?session=MINE as the pane receives it (hooks/session.fixture.ts)."""
-    return live.session_view(view(MINE), MINE)
+    """GET /v1/cortados/live/session?session=MINE as the pane receives it (hooks/session.fixture.ts), with MINE's work
+    split: native on the Pro, routed through a child task, its nested child, a routed subagent and a route_task call."""
+    return live.session_view(split_view(MINE), MINE)
 
 
 FIXTURE = Path(__file__).resolve().parents[1] / "integrations/claude-mod/cortados-pulse/hooks/session.fixture.ts"
@@ -305,7 +369,7 @@ class SessionFilterTest(unittest.TestCase):
         for bad in self.FOREIGN + (SECRET, "/Users/"):
             self.assertNotIn(bad, raw, bad)
         self.assertEqual(set(v), {"version", "generated_at", "session_filter", "overview", "orchestrators", "s1",
-                                  "hosts"})
+                                  "hosts", "work_split"})
         self.assertEqual(set(v["overview"]), {"s1", "s1_latency_ms", "lowest_subscription", "hosts_with_heartbeat"})
         self.assertEqual([g["origin"] for g in v["orchestrators"]["items"]], [MINE])
         self.assertEqual(v["orchestrators"]["session_filter"], MINE)
@@ -1378,3 +1442,82 @@ class LinkageTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkSplitSessionTest(unittest.TestCase):
+    """#127: the per-session work split in the session view, over the tree's own fixtures. Routed work is attributed on
+    provider-observed keys only: the child's origin header, the provider host's own task log (nested runs), the session
+    tag of a routed subagent or route_task call; never a child's own (MCP-server) tag or a heartbeat field."""
+
+    def split(self, session=MINE, **kw):
+        return live.session_view(split_view(session, **kw), session)["work_split"]
+
+    def test_native_and_routed_join_for_one_session(self):
+        ws = self.split()
+        self.assertEqual(ws["status"], "ok")
+        row = ws["row"]
+        self.assertEqual((row["session"], row["host"], row["match"], row["matched_on"]), (MINE, "pro", "both", ["session"]))
+        d = row["24h"]
+        self.assertEqual(d["native"]["fresh"], 700000)
+        self.assertEqual([m["model"] for m in d["native"]["models"]], ["claude-opus-5-5", "claude-haiku-5"])
+        self.assertEqual(d["native"]["models"][0]["cache_read"], 29000000)       # the four kinds stay apart
+        r = d["routed"]
+        self.assertEqual(r["fresh"], 300000 + 120000 + 80000 + 800000 + 50000 + 25000)
+        self.assertEqual(set(r["by_via"]), {"child_task", "subagent", "route_task"})
+        self.assertEqual(r["by_via"]["child_task"]["conversations"], 2)          # ROOT and its nested NESTED
+        self.assertEqual(r["by_via"]["route_task"]["fresh"], 25000)
+        self.assertEqual(r["by_via"]["subagent"]["fresh"], 50000)
+        self.assertEqual(r["by_route"][0]["route"], "codex/gpt-6.1-sol")
+
+    def test_fresh_and_all_token_shares(self):
+        d = self.split()["row"]["24h"]
+        fresh_r, fresh_n = d["routed"]["fresh"], d["native"]["fresh"]
+        all_r, all_n = d["routed"]["all"], d["native"]["all"]
+        self.assertEqual(d["routed_pct"], round(100 * fresh_r / (fresh_r + fresh_n), 1))
+        self.assertEqual(d["routed_pct_all"], round(100 * all_r / (all_r + all_n), 1))
+        self.assertGreater(d["routed_pct"], 50)                  # 66.3: most fresh work went through the router
+        self.assertLess(d["routed_pct_all"], 20)                 # 14.9: the native cache reads dominate all tokens
+
+    def test_nested_child_resolves_through_the_task_log_only(self):
+        # NESTED's requests carried no origin; the provider host's own log has NESTED -> parent ROOT -> origin MINE
+        r = self.split()["row"]["24h"]["routed"]
+        self.assertIn("codex/gpt-6.1-sol", [x["route"] for x in r["by_route"]])
+        # without NESTED in the log there is no join: its tokens are unattributed, never guessed onto MINE
+        no_nested = [e for e in events() if e.get("task_id") != NESTED]
+        r = self.split(child_events=lambda: no_nested)["row"]["24h"]["routed"]
+        self.assertNotIn("codex/gpt-6.1-sol", [x["route"] for x in r["by_route"]])
+        fleet = split_view(child_events=lambda: no_nested)["work_split"]
+        self.assertEqual(fleet["overall"]["24h"]["routed_unattributed_fresh"], 800000)
+        # with it, the log resolved it, and the section says how much came through the log
+        self.assertEqual(split_view()["work_split"]["overall"]["24h"]["routed_from_task_log_fresh"], 800000)
+
+    def test_a_childs_own_session_tag_is_never_the_orchestrator(self):
+        fleet = split_view()["work_split"]
+        tags = [s["session"] for s in fleet["sessions"]]
+        self.assertNotIn(CHILD_MCP_TAG, tags)
+        self.assertIn(OTHER, tags)                               # FOLLOW's run, by its own observed origin
+
+    def test_another_session_sees_nothing_of_mine(self):
+        raw = json.dumps(self.split(OTHER))
+        for bad in (MINE, "CortadOS-Router", "claude-opus-5-5", "gpt-6.1-sol", SECRET, CHILD_MCP_TAG, ROOT, NESTED):
+            self.assertNotIn(bad, raw, bad)
+        raw = json.dumps(self.split())
+        for bad in (OTHER, "Grounds", SECRET, CHILD_MCP_TAG, ROOT, NESTED, FOLLOW, "pending_runs"):
+            self.assertNotIn(bad, raw, bad)
+
+    def test_an_unmatched_tag_is_said(self):
+        ws = self.split("cccccccccccccccc")
+        self.assertEqual((ws["status"], ws["row"]), ("none", None))
+        self.assertTrue(any("native" in n for n in ws["notes"]))
+        self.assertTrue(any("no routed work" in n for n in ws["notes"]))
+
+    def test_a_stale_heartbeat_is_said(self):
+        ws = self.split(at=NOW - 3600)
+        self.assertEqual(ws["status"], "partial")
+        self.assertTrue(ws["row"]["native_stale"])
+        self.assertTrue(any("stale" in n and "pro" in n for n in ws["notes"]))
+
+    def test_published_routed_totals_carry_no_run_ids(self):
+        raw = json.dumps(split_view()["routed"])
+        for bad in ("pending_runs", ROOT, NESTED, FOLLOW):
+            self.assertNotIn(bad, raw, bad)

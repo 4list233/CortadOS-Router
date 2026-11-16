@@ -29,7 +29,8 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Pulse, PulseDevices, PulseLaneHealth, PulseLive, PulseLiveConversation, PulseLiveHost, PulseLiveTask,
-  PulseOrchestrator, PulseReading, PulseSessionView, PulseSubSession, PulseTokens, PulseTreeTask, PulseUsage } from '../types'
+  PulseLocalNode, PulseLocalView, PulseOrchestrator, PulseReading, PulseSessionSplit, PulseSessionView, PulseSplitTokens,
+  PulseSplitWindow, PulseSubSession, PulseTokens, PulseTreeTask, PulseUsage } from '../types'
 
 type Cfg = {
   providerUrl: string
@@ -89,6 +90,32 @@ const treeErr = atom({ plugin: 'cortados-pulse', key: 'treeErr' } as const, null
 /** This machine's own task log, this session's tasks in it (#118): merged into the tree by task id. */
 type LocalHeld = { tag: string; at: number; tasks: LocalTask[]; note?: string | null }
 const localHeld = atom({ plugin: 'cortados-pulse', key: 'local' } as const, null as LocalHeld | null)
+
+/** #127: the expanded work split breakdown, toggled by its `w` button. */
+const wsOpen = atom({ plugin: 'cortados-pulse', key: 'wsOpen' } as const, false as boolean)
+/** #127: GET /v1/cortados/local (provider/local_switch.py): the local nodes as their gates report them. */
+type NodesHeld = { data: PulseLocalView; at: number }
+const nodes = atom({ plugin: 'cortados-pulse', key: 'nodes' } as const, null as NodesHeld | null)
+const nodesErr = atom({ plugin: 'cortados-pulse', key: 'nodesErr' } as const, null as string | null)
+/** #127: the origin tags this session's own start_task results named (child_tasks.start's origin_session). */
+type Started = { tag: string; task_id: string; at: number }
+const started = atom({ plugin: 'cortados-pulse', key: 'started' } as const, [] as Started[])
+/** #127: the session view of the newest such tag that is not this session's own. */
+type AliasHeld = { data: PulseSessionView; at: number; tag: string }
+const alias = atom({ plugin: 'cortados-pulse', key: 'alias' } as const, null as AliasHeld | null)
+
+/** GET /v1/cortados/local: each local node's switch, admission, backend, loaded models and capacity, asked through its
+ * gate (the provider bounds each gate call at 6 s). The owner token opens it. */
+export const LOCAL_SWITCH_PATH = '/v1/cortados/local'
+/** Read every third live tick: each read asks every node's gate (pmset, the backend's model list). */
+export const NODES_POLL_MS = 30_000
+/** Every provider read is given up after this long, so one hung request can never stop the polling (the mod host's
+ * fetch has no timeout of its own; the poll runs one at a time and would wait on it forever). */
+export const FETCH_TIMEOUT_MS = 15_000
+/** The cortados-route MCP server's start_task, under any MCP prefix (a user, project or plugin server). */
+export const START_TASK_TOOL = /^mcp__.*cortados-route__start_task$/
+export const STARTED_MAX = 8
+const ORIGIN_TAG = /^[0-9a-f]{16,64}$/
 
 /** The machine's shared Office salt (cortados_router/subagent_mcp.py OFFICE_SALT_DEFAULT). */
 export const OFFICE_SALT_FILE = '~/.config/cortados/office-salt'
@@ -191,12 +218,12 @@ type Fetched = { ok: true; data: object; url: string } | { ok: false; problem: s
 
 /** GET <provider><path> with the Bearer token: the JSON object (scrubbed of the token, strings and keys alike) or the
  * one-line problem. Shared by both polls so the token rules are written once. */
-export async function fetchView($: Pick<EngineInterface, 'env' | 'fs' | 'http'>, cfg: Cfg, path: string): Promise<Fetched> {
+export async function fetchView($: Pick<EngineInterface, 'env' | 'fs' | 'http' | 'clock'>, cfg: Cfg, path: string): Promise<Fetched> {
   let token = ''
   try {
     const url = await resolveProviderUrl($, cfg.providerUrl)
     token = await resolveToken($, cfg)
-    const r = await $.http.fetch(url + path, { headers: { authorization: 'Bearer ' + token } })
+    const r = await fetchBounded($, url + path, { headers: { authorization: 'Bearer ' + token } })
     if (r.status === 401 || r.status === 403) {
       return { ok: false, status: r.status, problem: 'provider rejected the token (HTTP ' + r.status + '): check ' + (cfg.providerToken ? 'providerToken' : cfg.providerTokenFile) }
     }
@@ -208,6 +235,53 @@ export async function fetchView($: Pick<EngineInterface, 'env' | 'fs' | 'http'>,
     const why = (e as Error)?.message ?? String(e)
     return { ok: false, problem: scrub('could not read the provider (' + why + ')', token) }
   }
+}
+
+/** $.http.fetch, given up after FETCH_TIMEOUT_MS (a rejection, said as the poll's problem) when the host has a clock
+ * timer; the timer is cancelled once the answer comes. */
+export async function fetchBounded($: Pick<EngineInterface, 'http' | 'clock'>, url: string, init: any): Promise<any> {
+  let timer: Timer | null = null
+  const late = new Promise<never>((_, reject) => {
+    try {
+      timer = $.clock.after(FETCH_TIMEOUT_MS, () => reject(new Error('no answer within ' + FETCH_TIMEOUT_MS / 1000 + ' s')))
+    } catch { /* a host without timers: the fetch alone decides */ }
+  })
+  try {
+    return await Promise.race([$.http.fetch(url, init), late])
+  } finally {
+    try { (timer as Timer | null)?.cancel() } catch { /* already fired */ }
+  }
+}
+
+/** One GET /v1/cortados/local: the nodes, or the problem in a line (a scoped token is told it needs the owner's). */
+export async function pollNodes($: Pick<EngineInterface, 'env' | 'fs' | 'http' | 'state' | 'clock'>, cfg: Cfg): Promise<void> {
+  const f = await fetchView($, cfg, LOCAL_SWITCH_PATH)
+  if (!f.ok) {
+    await update($, nodesErr, () => f.status === 404 ? 'this provider has no local switch view (update it)'
+      : f.status === 401 || f.status === 403 ? 'local node status needs the owner token (a scoped pane token cannot read it)'
+      : 'local nodes: ' + f.problem)
+    return
+  }
+  const at = await $.clock.now()
+  await update($, nodes, () => ({ data: f.data as PulseLocalView, at }))
+  await update($, nodesErr, () => null)
+}
+
+/** A start_task result as the model read it: the task id and the origin tag it was recorded under, or null. */
+export function startedOf(text: unknown): { tag: string; task_id: string } | null {
+  if (typeof text !== 'string' || text.length > 200_000) return null
+  try {
+    const o = JSON.parse(text)
+    const tag = o?.origin_session, id = o?.task_id
+    return typeof tag === 'string' && ORIGIN_TAG.test(tag) && typeof id === 'string' && TASK_ID.test(id) ? { tag, task_id: id } : null
+  } catch { return null }
+}
+
+/** The newest origin a start_task of THIS session named that is not its own tag: the cortados-route server records
+ * the session id it was started with, so after a /clear (or wherever the server's id differs) its tasks are under that
+ * tag, not the pane's. null when every task went under the pane's own tag. */
+export function aliasTag(list: Started[], own: string | null | undefined): string | null {
+  return list.find(x => x.tag !== own)?.tag ?? null
 }
 
 /** One /resources poll: keep the snapshot; any failure becomes the pane's one-line problem. */
@@ -245,6 +319,8 @@ async function pollLiveOnce($: LiveDollar, cfg: Cfg, me: boolean): Promise<void>
   if (m) await update($, mine, () => m)
   // this machine's own log first: it draws even when the provider cannot be reached (#118)
   if (m?.tag) await readLocal($, m.tag)
+  // #127: tasks this session started under another tag (its cortados-route server's): that tag's view too
+  if (m?.tag) await fetchAlias($, cfg, m.tag)
   // the per-session view answered (or failed in a way the fleet view would too): nothing fleet-wide is read
   if (m?.tag && await fetchTree($, cfg, m.tag)) return
   try {
@@ -274,6 +350,22 @@ export async function fetchTree($: LiveDollar, cfg: Cfg, tag: string): Promise<b
   await update($, tree, () => null)
   await update($, treeErr, () => null)
   return false
+}
+
+/** The session view of aliasTag(started, own) (see there), held for that tag; dropped when there is none. A failed
+ * read keeps what was held (the main view says the provider's problem). */
+export async function fetchAlias($: LiveDollar, cfg: Cfg, own: string): Promise<void> {
+  const tag = aliasTag(await read($, started), own)
+  if (!tag) {
+    if (await read($, alias)) await update($, alias, () => null)
+    return
+  }
+  const f = await fetchView($, cfg, SESSION_PATH + '?session=' + tag)
+  if (!f.ok) return
+  const data = f.data as PulseSessionView
+  if (data.session_filter !== tag) return
+  const at = await $.clock.now()
+  await update($, alias, () => ({ data, at, tag }))
 }
 
 /** This session's own view (?session=). Kept only when the provider says it filtered for this tag (session_filter):
@@ -331,8 +423,11 @@ export function laneLines(lane: string, health: PulseLaneHealth | null | undefin
   const out: string[] = []
   health ??= {}
   // The projection exposes local admission and its reason, not deployment counts. Never infer quota from admission.
-  if (lane === 'local') return [`local: ${health.ok === false ? 'unavailable' : health.ok === true ? 'eligible' : 'unknown'}` +
-    (health.why ? ` · ${health.why}` : '')]
+  // #127: this is the scarcity cache's `local` lane, read from the resource-pool sample's configured deployments
+  // (local_resources.sample), not the local gate that serves the local lane: labelled as such; the gate's own state is
+  // the Local nodes section
+  if (lane === 'local') return [`local (resource-pool deployments): ${health.ok === false ? 'none verified' : health.ok === true ? 'eligible' : 'unknown'}` +
+    (health.why && health.ok !== false ? ` · ${health.why}` : '') + (health.ok === false ? ' · see Local nodes for the gate' : '')]
   // Only the provider's valid projection establishes quota; historical windows survive freshness invalidation.
   const known = typeof health.scarcity === 'number' && Number.isFinite(health.scarcity)
   const bits = [health.ok === false ? 'SPENT' : known ? 'ok' : 'quota unknown']
@@ -366,21 +461,68 @@ export function usageLines(u: PulseUsage): string[] {
   return out
 }
 
+/** The Devices section: the resource-pool probe (`/resources` devices, local_resources.sample over the fleet config's
+ * SSH targets). It is NOT the local lane's state: a node with no SSH target in that config is "not probed", never
+ * "free · fits 0", and the pool line is drawn only over nodes the probe actually reached (#127). */
 export function deviceLines(dev: PulseDevices): string[] {
   const out: string[] = []
   if (dev.status !== 'ok') {
     out.push(dev.status === 'pending' ? 'sample pending' : 'unavailable' + (dev.error ? ': ' + dev.error : ''))
     return out
   }
-  for (const n of dev.nodes ?? []) {
-    out.push(`${n.id} ${n.status ?? ''} · ${gib(n.gpu_headroom_estimate_bytes)} free` +
+  const list = dev.nodes ?? []
+  for (const n of list) {
+    if (n.status === 'unconfigured') { out.push(`${n.id}: not probed (no SSH target in the resource-pool config)`); continue }
+    if (n.status !== 'online') { out.push(`${n.id}: ${n.status ?? 'unknown'}`); continue }
+    out.push(`${n.id} online · ${gib(n.gpu_headroom_estimate_bytes)} free` +
       (typeof n.gpu_utilization_pct === 'number' ? ` · gpu ${Math.round(n.gpu_utilization_pct)}%` : '') +
       ` · fits ${(n.fits ?? []).length}`)
   }
-  if (typeof dev.pool_headroom_estimate_bytes === 'number') {
+  if (typeof dev.pool_headroom_estimate_bytes === 'number' && list.some(n => n.status === 'online')) {
     out.push(`pool ${gib(dev.pool_headroom_estimate_bytes)} · fits ${(dev.pool_fits ?? []).length}`)
   }
-  if (!(dev.nodes ?? []).length) out.push('no nodes online')
+  if (!list.length) out.push('no nodes online')
+  return out
+}
+
+/** One local node as its gate reports it (GET /v1/cortados/local): switch, admission and why, power, backend and its
+ * reachability, loaded models; then the gate's admission: in flight / limit, owner, memory pressure, free memory. */
+export function nodeLines(n: PulseLocalNode): string[] {
+  const name = n.node ?? '?'
+  if (!n.reachable) return [`${name}: unreachable` + (n.error ? ' · ' + n.error : '')]
+  const loaded = n.models_loaded ?? null
+  const head = join([
+    'switch ' + (n.switch ?? 'unknown'),
+    n.allowed === true ? 'allowed' : n.allowed === false ? 'NOT allowed' : 'allowed unknown',
+    n.power && n.power !== 'unknown' ? (n.power === 'ac' ? 'AC' : n.power) : null,
+    n.training ? 'training' : null,
+  ])
+  const out = [`${name}: ${head}`]
+  if (n.reason) out.push('  ' + n.reason)
+  out.push('  ' + join([(n.backend ?? 'unknown') + (n.ollama && n.ollama !== 'up' ? ' ' + n.ollama : n.ollama === 'up' ? ' up' : ''),
+    loaded === null ? 'loaded unknown' : loaded.length ? 'loaded ' + loaded.join(', ') : 'no model loaded']))
+  const c = n.capacity
+  if (c) {
+    const num = (v: unknown) => typeof v === 'number' && Number.isFinite(v)
+    out.push('  ' + join([
+      num(c.limit) ? `${num(c.inflight) ? c.inflight : '?'}/${c.limit} in flight` : 'no admission limit',
+      c.owner ? 'owner ' + c.owner : null,
+      c.pressure ? 'pressure ' + c.pressure : null,
+      num(c.free_bytes) ? gib(c.free_bytes) + ' free' : null,
+    ]))
+    if (c.reason) out.push('  ' + c.reason)
+  }
+  return out
+}
+
+/** The Local nodes section: each node, or the view's note (none configured) or problem. */
+export function localNodeLines(v: PulseLocalView | null, problem: string | null): string[] {
+  const out: string[] = []
+  if (problem) out.push(problem)
+  if (!v) return problem ? out : ['loading the local nodes…']
+  const list = v.nodes ?? []
+  if (!list.length) out.push(v.note || 'no local node is configured on the provider')
+  for (const n of list) out.push(...nodeLines(n))
   return out
 }
 
@@ -572,9 +714,79 @@ export function treeLines(v: PulseSessionView, tag: string, since: number): Tree
   return out
 }
 
+// ---- this session's work split (#127; pure, tested) ---------------------------------------------------------------
+
+/** The window the compact line speaks for; the breakdown adds the other. */
+export const SPLIT_WINDOW = '24h'
+/** Token amounts as the work split line writes them: 1.4M, 0.8M, 25k, 950. */
+export function tokAmt(n?: number | null): string {
+  if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) return '—'
+  if (n >= 1e5) return (n / 1e6).toFixed(1) + 'M'
+  if (n >= 1e3) return Math.round(n / 1e3) + 'k'
+  return String(Math.round(n))
+}
+const VIA_WORDS: Record<string, string> = { child_task: 'child tasks', subagent: 'routed subagents', route_task: 'route_task' }
+const kinds = (t: PulseSplitTokens) => join(['in ' + tokAmt(t.input), 'out ' + tokAmt(t.output),
+  'cache write ' + tokAmt(t.cache_write), 'cache read ' + tokAmt(t.cache_read)])
+
+/** A work split line: its text, and whether it is a note (drawn dim). */
+export type SplitLine = { text: string; dim?: boolean }
+
+/** This session's work split (GET /v1/cortados/live/session's `work_split`): one compact line for SPLIT_WINDOW, e.g.
+ * `work split 24h: routed 66% fresh (1.4M tok: codex/gpt-6.1-sol 0.8M, claude#b/claude-opus-5-5 0.5M) · native 0.7M
+ * (claude-opus-5-5) · 15% counting cache reads`; with `open`, the breakdown (by route, by how it was handed over,
+ * native by model, the four token kinds, the other window); then the provider's notes on what is partial. Fresh =
+ * input + output + cache writes. `label` prefixes the line (the alias view). */
+export function workSplitLines(ws: PulseSessionSplit | null | undefined, open: boolean, label = 'work split'): SplitLine[] {
+  if (!ws) return [{ text: label + ': this provider reports no per-session split yet (update it)', dim: true }]
+  const notes = (ws.notes ?? []).map(n => ({ text: '  ' + n, dim: true }))
+  const row = ws.row
+  const w = row ? row[SPLIT_WINDOW] as PulseSplitWindow | undefined : undefined
+  if (!row || !w) return [{ text: label + ': nothing recorded for this session yet' }, ...notes]
+  const r = w.routed, n = w.native
+  const routes = (r?.by_route ?? []).slice(0, 2).map(x => `${x.route} ${tokAmt(x.fresh)}`)
+  const routed = r ? 'routed ' + (typeof w.routed_pct === 'number' ? pct(w.routed_pct) + ' fresh ' : '') +
+    `(${tokAmt(r.fresh)} tok` + (routes.length ? ': ' + routes.join(', ') + ((r.by_route ?? []).length > 2 ? ', …' : '') : '') + ')'
+    : 'routed none'
+  const models = (n?.models ?? []).filter(m => m.model !== 'other').slice(0, 2).map(m => m.model)
+  const native = n ? `native ${tokAmt(n.fresh)}` + (models.length ? ` (${models.join(', ')})` : '') : 'native not reported'
+  const out: SplitLine[] = [{ text: `${label} ${SPLIT_WINDOW}: ` + join([routed, native,
+    typeof w.routed_pct_all === 'number' ? pct(w.routed_pct_all) + ' counting cache reads' : null]) }]
+  if (open) {
+    if (r) {
+      out.push({ text: '  routed by route (fresh):' })
+      for (const x of r.by_route ?? []) out.push({ text: `    ${x.route} ${tokAmt(x.fresh)} · ${x.conversations ?? 0} conv` })
+      const via = Object.entries(r.by_via ?? {}).map(([k, v]) => `${VIA_WORDS[k] ?? k} ${tokAmt(v.fresh)}`)
+      if (via.length) out.push({ text: '  routed by how: ' + via.join(' · ') })
+      out.push({ text: '  routed tokens: ' + kinds(r) })
+    }
+    if (n) {
+      out.push({ text: '  native by model (fresh):' })
+      for (const m of n.models ?? []) out.push({ text: `    ${m.model} ${tokAmt(m.fresh)} · ${kinds(m)}` })
+      out.push({ text: '  native tokens: ' + kinds(n) })
+    }
+    for (const k of Object.keys(ws.windows ?? {})) {
+      if (k === SPLIT_WINDOW) continue
+      const o = row[k] as PulseSplitWindow | undefined
+      if (o) out.push({ text: `  ${k}: ` + join([typeof o.routed_pct === 'number' ? 'routed ' + pct(o.routed_pct) + ' fresh' : null,
+        typeof o.routed_pct_all === 'number' ? pct(o.routed_pct_all) + ' counting cache reads' : null,
+        'routed ' + tokAmt(o.routed_fresh), o.native ? 'native ' + tokAmt(o.native.fresh) : 'native not reported']) })
+    }
+    const on = row.matched_on ?? []
+    out.push({ text: '  ' + (row.match === 'both' ? 'joined on ' + (on.includes('session_alt') ? (on.includes('session') ? 'both salts\' tags' : 'the older-salt tag') : 'the session tag')
+      : row.match === 'routed only' ? 'no native report for this tag' : row.match === 'native only' ? 'no routed work under this tag' : String(row.match ?? '')) +
+      (row.host ? ' · native from ' + row.host : ''), dim: true })
+    out.push({ text: '  fresh = input + output + cache writes; cache reads are left out of the headline %', dim: true })
+  }
+  return [...out, ...notes]
+}
+
 /** Shown under This session: /clear gives the pane a new session id, while a task keeps the session it was started
  * for (and the cortados-route server keeps the id it started with: README "Which main session started which task"). */
 export const CLEAR_NOTE = 'after a /clear, earlier tasks stay under the previous session (dashboard)'
+/** Above the tree of a tag this session's own start_task named that is not the pane's (aliasTag). */
+export const ALIAS_NOTE = (tag: string) => 'tasks this session started under its cortados-route server\'s tag ' + tag.slice(0, 8) +
+  ' (its session id predates a /clear or resume):'
 
 // ---- this machine's own task log (#118; pure, tested) ----------------------------------------------------------------
 // A task started with host "here" runs on THIS machine and logs only here ($CORTADOS_HOME/child-tasks.jsonl). The
@@ -858,26 +1070,47 @@ export const register: Register = (on, options) => {
     void $.ui.open({ id: PANE, title: 'CortadOS pulse' })
     void pollLive($, cfg, true)
     void poll($, cfg)
+    void pollNodes($, cfg)
     ticking?.cancel()                                          // a second session.start must not double the polling
     ticks = 0
     ticking = $.clock.every(LIVE_POLL_MS, () => {              // live every tick, /resources every POLL_MS
       void pollLive($, cfg, true)
       if (++ticks % (POLL_MS / LIVE_POLL_MS) === 0) void poll($, cfg)
+      if (ticks % (NODES_POLL_MS / LIVE_POLL_MS) === 0) void pollNodes($, cfg)
     })
     return next(e)
+  })
+
+  // #127: a start_task of this session names the origin its task was recorded under. The pane remembers it (so a task
+  // recorded under the cortados-route server's tag, after a /clear, is still drawn) and reads the live view at once
+  // instead of on the next 10 s tick. The result goes on unchanged.
+  on('tool.call', async ($, e, next) => {
+    const ran = await next(e)
+    try {
+      if (START_TASK_TOOL.test(String((e as any).tool ?? '')) && !(ran as any).isError && !(ran as any).deny) {
+        const got = startedOf((ran as any).text)
+        if (got) {
+          const at = await $.clock.now()
+          await update($, started, list => [{ ...got, at }, ...list.filter(x => x.task_id !== got.task_id)].slice(0, STARTED_MAX))
+          void pollLive($, cfg, true)
+        }
+      }
+    } catch { /* bookkeeping only: never the tool's result */ }
+    return ran
   })
 
   on('command.run', { command: 'cortados-pulse' }, async $ => {
     await $.ui.open({ id: PANE, title: 'CortadOS pulse' })
     void pollLive($, cfg, true)
     void poll($, cfg)
+    void pollNodes($, cfg)
     return { text: 'CortadOS pulse pane opened.' }
   })
 
   // The tree is built with the element table's constructors (what JSX compiles to under the engine's `h`) rather
   // than JSX, so the module has no JSX factory to resolve and the pane draws identically under `claude plugin test`.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
     const line = (text: string) => Text({ children: text })
     const dim = (text: string) => Text({ dimColor: true, children: text })
     const head = (text: string) => Text({ bold: true, children: text })
@@ -890,6 +1123,13 @@ export const register: Register = (on, options) => {
     const tr = await read($, tree)
     const trProblem = await read($, treeErr)
     const loc = await read($, localHeld)
+    const open = await read($, wsOpen)
+    const nv = await read($, nodes)
+    const nvProblem = await read($, nodesErr)
+    const al = await read($, alias)
+    const splitRows = (lines: SplitLine[]) => lines.map(l => l.dim ? dim(l.text) : line(l.text))
+    const toggle = Button({ key: 'cortados-pulse-ws', label: open ? 'w: hide the work split breakdown' : 'w: work split breakdown',
+      hotkey: 'w', plain: true, dimColor: true, onPress: () => { void update($, wsOpen, v => !v) } })
     const localFor = (tag: string | null | undefined) => loc && tag && loc.tag === tag ? loc.tasks : []
     const nowMs = await $.clock.now()
     let running: ReturnType<typeof line>[], fleet: ReturnType<typeof line>[], link: ReturnType<typeof line>[]
@@ -897,11 +1137,20 @@ export const register: Register = (on, options) => {
       // the per-session view: this session's tree and session-free fleet health, nothing of another session
       const since = (nowMs - tr.at) / 1000
       const merged = mergeLocal(tr.data, localFor(tr.tag), tr.tag, tr.at / 1000)
+      // tasks this session started under another tag (its cortados-route server's, after a /clear): drawn too
+      const aliasRows = al && al.tag !== tr.tag ? [
+        dim(ALIAS_NOTE(al.tag)),
+        ...treeLines(al.data, al.tag, (nowMs - al.at) / 1000).map(l => l.attn ? Text({ bold: true, children: l.text }) : line(l.text)),
+        ...(al.data.work_split ? splitRows(workSplitLines(al.data.work_split, false, 'work split (server tag)')) : []),
+      ] : []
       running = [
         head('This session'),
+        ...splitRows(workSplitLines(tr.data.work_split, open)),
+        ...(tr.data.work_split?.row ? [toggle] : []),
         ...treeLines(merged.view, tr.tag, since).map(l => l.attn ? Text({ bold: true, children: l.text }) : line(l.text)),
         ...(merged.added ? [dim(LOCAL_NOTE(merged.added))] : []),
         ...(loc?.note && loc.tag === tr.tag ? [dim(loc.note)] : []),
+        ...aliasRows,
         ...(trProblem ? [dim(trProblem + ' · showing ' + age(since) + ' old data')] : []),
         dim(CLEAR_NOTE),
       ]
@@ -947,7 +1196,10 @@ export const register: Register = (on, options) => {
       ...(lanes.length === 0 && !subsError ? [dim('none cached')] : []),
       ...lanes.flatMap(lane => laneLines(lane, subs[lane] as PulseLaneHealth,
         typeof readings[lane] === 'object' ? readings[lane] as PulseReading : undefined, nowS)).map(line),
+      head('Local nodes'),
+      ...localNodeLines(nv?.data ?? null, nvProblem).map(line),
       head('Devices'),
+      dim('resource-pool probe (fleet config SSH targets), not the local gate'),
       ...deviceLines(s.devices ?? { status: 'pending', nodes: [] }).map(line),
       ...fleet,
       dim('snapshot ' + age((nowMs - h.at) / 1000) + ' old' + (problem ? ' · ' + problem : '')),

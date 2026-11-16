@@ -19,7 +19,8 @@ test('the pane draws the lanes from /resources and never the token', { options: 
   await clock.advance(1)                                        // lets the poll's state write settle
   expect(opened.length).toBe(1)
   expect(opened[0].id).toBe('cortados-pulse')
-  expect(fetched.map(f => f.url).sort()).toEqual(['http://air.example:8432/resources', 'http://air.example:8432/v1/cortados/live'])
+  expect(fetched.map(f => f.url).sort()).toEqual(['http://air.example:8432/resources', 'http://air.example:8432/v1/cortados/live',
+    'http://air.example:8432/v1/cortados/local'])
   for (const f of fetched) expect(f.init.headers.authorization).toBe('Bearer ' + TOKEN)
   const ui = await $.ui.mount({ plugin: 'cortados-pulse', surface: 'terminal', component: 'Pane', requestId: 'cortados-pulse',
     props: { title: 'CortadOS pulse', isFocused: false, bodyColumns: 80, placement: 'dock' } as any })

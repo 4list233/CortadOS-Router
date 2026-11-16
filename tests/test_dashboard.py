@@ -558,6 +558,20 @@ class DashboardRenderTest(unittest.TestCase):
         self.assertIn("no host reports orchestrator tokens yet", empty)
         self.assertIn("work split unknown", empty)
 
+    def test_work_split_per_session_table(self):
+        # #127: every main session's native and routed tokens, by model / route / via, both shares, the join named
+        from tests import test_orchestrator_tree as ot
+        out = self.run_page(None, "live", live_view=ot.split_view())
+        panel = out[out.index("Work split"):]
+        for want in ("Per main session: native = the session's own model", "% routed fresh", "% routed (all)",
+                     "CortadOS-Router · on pro", "joined",
+                     "700.0k fresh · claude-opus-5-5 665.0k, claude-haiku-5 35.0k",
+                     "child tasks 1.3M, route_task 25.0k, routed subagents 50.0k",
+                     "codex/gpt-6.1-sol 800.0k", "66%", "15%", "Grounds"):
+            self.assertIn(want, panel, want)
+        for bad in (ot.CHILD_MCP_TAG, ot.MINE, "pending_runs", ot.SECRET, "undefined", "NaN"):
+            self.assertNotIn(bad, out, bad)
+
     def test_live_tasks_grouped_under_their_main_session(self):
         from tests import test_live as tl
         out = self.run_page(None, "live", live_view=self.live())

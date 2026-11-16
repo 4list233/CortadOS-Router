@@ -844,9 +844,9 @@ class Registry:
         # AUTOMATIC rule bound to a local lane (routing.continuation_admission, which applies routing.local_admission).
         # None: such a continuation cannot be checked and is refused (fails closed). Explicit local pins never use it.
         self.local_recheck: Callable[[dict, dict], tuple[bool, str]] | None = None
-        # log_tokens(route_id, usage, office session tag or None): one backend turn's tokens onto its route's row
-        # (core.log_tokens). None: tokens are not recorded (fixed-model endpoint, tests).
-        self.log_tokens: Callable[[str, dict, str | None], Any] | None = None
+        # log_tokens(route_id, usage, office session tag or None, *, office_origin, office_run, office_via): one backend
+        # turn's tokens onto its route's row (core.log_tokens). None: tokens are not recorded (fixed-model endpoint, tests).
+        self.log_tokens: Callable[..., Any] | None = None
         self._factories = SESSION_FACTORIES if session_factories is None else session_factories
         self._lock = threading.Lock()
         # Orders a conversation's backend-exit Office transition against its requests' turn-end writes, so the exit's
@@ -2266,7 +2266,11 @@ class Handler(BaseHTTPRequestHandler):
             if not self._owner_or_session("GET"):        # the owner token or a dashboard session
                 return self._refuse_auth()
             try:
-                body = json.dumps(self.server.tasks_view(self.server.registry), allow_nan=False).encode()
+                tv = self.server.tasks_view(self.server.registry)
+                if isinstance(tv, dict) and isinstance(tv.get("token_totals"), dict):
+                    # the work split's internal pending child runs are counted unattributed here (no task log join)
+                    tv = {**tv, "token_totals": work_split.resolve_pending(tv["token_totals"], None)}
+                body = json.dumps(tv, allow_nan=False).encode()
             except Exception as exc:
                 logger.warning("tasks: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: tasks view unavailable (see provider log)")
@@ -3605,10 +3609,19 @@ class Handler(BaseHTTPRequestHandler):
         if not reg.log_tokens or not isinstance(route, dict) or not route.get("route_id") or not isinstance(usage, dict):
             return
         tag = office.clean(self.headers.get(office.SESSION_HEADER), office._HEADER_RULES[office.SESSION_HEADER])
+        # The per-session work split's provider-observed keys (#127): a child's orchestrator (x-cortados-origin, as
+        # read and validated for this request), its run id (valid only) and the front door (route_task).
+        keys: dict[str, str | None] = {"office_origin": getattr(self, "_office_origin", None) or None,
+                                       "office_run": None, "office_via": office.read_via(self.headers)}
+        try:
+            run_id, valid = self._run_id()
+            keys["office_run"] = run_id if run_id and valid else None
+        except Exception:
+            pass
 
-        def _write(route_id=route["route_id"], usage=dict(usage), tag=tag):
+        def _write(route_id=route["route_id"], usage=dict(usage), tag=tag, keys=keys):
             try:
-                reg.log_tokens(route_id, usage, tag)
+                reg.log_tokens(route_id, usage, tag, **keys)
             except Exception:
                 logger.exception("token log for route %s failed", route_id)
         threading.Thread(target=_write, name="cortados-token-log", daemon=True).start()

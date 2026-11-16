@@ -504,7 +504,7 @@ class ResponsesOnCodexTests(ResponsesEndpointTests):
         # work split: the app-server's tokenUsage delta for the turn (the fake reports 100 in / 10 out per model
         # request), in the Messages shape, onto the route's row with the client's x-cortados-session tag
         logged, done = [], threading.Event()
-        self.reg.log_tokens = lambda rid, usage, tag: (logged.append((rid, usage, tag)), done.set())
+        self.reg.log_tokens = lambda rid, usage, tag, **keys: (logged.append((rid, usage, tag)), done.set())
         with self.send(request(user("hi")), headers=dict(CODEX_HEADERS, **{"x-cortados-session": "ab" * 8})) as r:
             r.read()
         self.assertTrue(done.wait(10), "the turn's tokens were never logged")

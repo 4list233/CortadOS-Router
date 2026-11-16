@@ -1279,6 +1279,26 @@ fresh), fresh = input + output + cache writes (cache reads are shown beside it).
 section and shown on the dashboard's Work split panel. A heartbeat that would exceed the server's byte cap is sent
 without its `orchestrator` block (said on stderr) rather than not at all.
 
+**Per-session work split (#127).** For each main session: native = its own transcript tokens (main loop plus direct
+subagents) per model, and routed = every routed call attributed to it, per lane/model and per hand-over kind (child
+task, routed subagent, route_task), each with input, output, cache read and cache write kept apart; % routed is given
+on fresh tokens (`routed_pct`) and on all tokens (`routed_pct_all`, which long native sessions' cache reads dominate).
+Attribution uses only keys the provider observed on the requests: the routes row now also records `office_origin`
+(`x-cortados-origin`, which a child runner sends with its task's origin, inherited by nested tasks), `office_run`
+(`x-cortados-run-id`) and `office_via` (`x-cortados-via: route_task`, sent by `route_task` together with the
+session's own `x-cortados-session`). A child run is attributed by its origin, else through the provider host's own
+task log (`origin_session`, then the `parent_task_id` chain), never by its own `x-cortados-session` (the
+cortados-route server's random per-process tag); a run neither names is counted as unattributed. The native side's
+tags are now under the machine's shared Office salt (`~/.config/cortados/office-salt`), the one task origins,
+route_task and the pulse pane use; before #127 the sender hashed with the routed-subagents mod's store salt, so its
+tags matched nothing. When the mod's store salt also exists the sender adds the session's tag under it as
+`session_alt` (the mod used it for sessions that began before the shared file existed), and the join takes either.
+A tag found on one side only is published as `native only` / `routed only`. The live view's `work_split.sessions`
+rows carry it (`match`, `matched_on`, per window `native`, `routed`, `routed_pct`, `routed_pct_all`), the dashboard's
+Work split panel has a per-session table, and `GET /v1/cortados/live/session` carries the asking session's own row
+only (`work_split.row` and `notes` on what is partial: no native report, a stale heartbeat, unreadable transcripts,
+routed tokens not recorded), which the pulse pane draws as one line plus a `w` breakdown.
+
 The dashboard's **Live** tab reads it every 5 s while the tab is visible: an overview strip (running tasks, active
 conversations, S1 health, the lowest subscription, host heartbeats), the Tasks panel (running first, elapsed ticking each
 second, then the last 24 h), Conversations, Routed calls, Subscriptions (% left bars per window, stale readings hatched)
