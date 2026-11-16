@@ -165,7 +165,7 @@ in selection (Local models in selection, below). The provider reads the same fil
 | `index_route` | `true` (default) or `false`: whether this node's models with a published proxy index are offered in selection (Local models in selection, below); anything else is refused |
 | `max_inflight` | positive integer, default 1: how many turns this provider is relaying to the node at once make it busy; a busy node is not offered by the index route (pins and the manual `auto_route` are unaffected) |
 | `probe_timeout_s` / `connect_timeout_s` / `read_timeout_s` | `/api/tags` probe (2), connect (3), wait per response chunk (300; a first model load can take a minute); each must be positive |
-| `models[]` | `id` (the Ollama tag, required), `alias` (the short pin name), `name` (display name), `context_length` (a positive integer of tokens; default 32768 when absent, the input-fit gate; set it to the node's Ollama context; the owner's decision is 128k, 131072, on the Pro); `thinking` (`"off-unless-asked"`, the default, or `"passthrough"`; anything else is refused: Thinking models, below) |
+| `models[]` | `id` (the Ollama tag, required), `alias` (the short pin name), `name` (display name), `context_length` (a positive integer of tokens; default 32768 when absent, the input-fit gate; set it to the node's Ollama context; the owner's decision is 128k, 131072, on the Pro); `thinking` (`"off-unless-asked"`, the default, or `"passthrough"`; anything else is refused: Thinking models, below); `efforts` (optional: the reasoning-effort levels the node accepts, a non-empty list from `low`, `medium`, `high`, `xhigh`, `max`; absent, the client's effort is dropped: Reasoning effort, below) |
 
 Pin names (aliases and tags, case-insensitive) must be unique across nodes. Behaviour:
 
@@ -683,6 +683,50 @@ already asked off (or the model is set to `passthrough`), so the same request wo
 (the person's choice) and a client that asked for thinking get the reply exactly as the node sent it. No prompt or reply
 text is logged; the refusal record carries a fixed reason only.
 
+**Reasoning effort (#122).** Claude Code sends `output_config: {"effort": "high"}` beside
+`thinking: {"type": "adaptive"}`. Ollama's `/v1/messages` turns that effort into the chat request's think level
+whenever `thinking` is neither `enabled` nor `disabled`; it rewrites `xhigh` to `high` first. The level reaches the
+model's chat template as its reasoning effort, and a template that does not accept it fails the turn with HTTP 500. This
+was observed 2026-11-15 under llama-server: `Unexpected reasoning effort high. Supported types are xhigh (default),
+medium, and low.` So the relay (`local_lane._node_body`, on every turn, pins included) holds `output_config.effort` to
+the model entry's `efforts`:
+
+- absent (the default): the effort is dropped, and an `output_config` left empty is dropped too. The template keeps its
+  own default, so no client value can fail the turn.
+- declared: the client's level is sent when it is listed. Otherwise the relay sends the highest listed level below it,
+  never more effort than the client asked, because the local node's time is the scarce resource. When no listed level
+  is lower, it sends the lowest one. An unknown value is dropped.
+
+Declare the levels as the node's API passes them on. Through Ollama, `xhigh` arrives as `high`, so the template above
+is declared `["medium", "low"]`, and Claude Code's `high` (also `xhigh` and `max`) is sent as `medium`. `high→xhigh`
+cannot be expressed through Ollama at all. The MLX backend is unchanged: an effort never becomes a
+`chat_template_kwargs` key (only `enable_thinking` is allowed).
+
+**A node error before any byte is routed elsewhere on a cost bind (#122).** Every other HTTP 5xx from the node is
+handed back unanswered when all of these hold: it arrives before anything was written to the client, it is not the
+gate's 529 busy answer (that keeps its retry), it answers the **opening turn** of a conversation that a COST-profile
+rule moved here (`auto_route`, `index`, `prefer`: local because it is cheaper), and **no sensitivity detector marks the
+request**. That last check is asked of the request itself, never inferred from the bind reason's name
+(`routing.request_sensitivity`, decided once in `routing.choose` before any rule binds; the route carries
+`cloud_reroute_ok: true` only when the flag, every node's keyword list and the S1 signal all cleared it; an unreadable
+keyword list or local config is doubt, and doubt is not clearance). Sensitivity wins over preference everywhere:
+`routing.sensitive_trigger` asks flag, keyword and S1 before `prefer` (`routing.TRIGGER_PRECEDENCE`), so a
+keyword-sensitive request carrying `x-cortados-local: prefer` is bound `keyword`; and a request a detector marks that a
+cost rule bound anyway (auto_route or index after the sensitive move was not taken) takes the detector's bind reason, so
+the effect boundary gives it the sensitive profile (#122 round 2). The provider then routes the
+conversation again, once, with that local model excluded, as for a never-fits turn (`local_lane.NODE_ERROR`, one of
+`local_lane.REROUTE`, logged as a warning with the status only). These cases still answer the node's error as before,
+and nothing leaves the machine:
+
+- a request any sensitivity detector marks (flag, keyword, S1), or one a detector could not check, whatever rule bound
+  it (`prefer` included);
+- a SENSITIVE-profile bind (the sensitive flag, a keyword, a cloud refusal, an unknown reason; #109: sensitive work never
+  goes outward by this path);
+- a pin;
+- a continuation;
+- a stream that breaks after its first byte;
+- a 4xx.
+
 **Context length must match the node.** A model's `context_length` here is only the provider's input-fit gate; Ollama
 uses the node's own `OLLAMA_CONTEXT_LENGTH` (or Ollama.app's setting). Set the node to the same value, or requests the
 provider admits get truncated by Ollama. The gate does not check this at startup.
@@ -1057,6 +1101,10 @@ S1's route stands ("routes elsewhere"). A turn the gate still refuses:
   a conversation a rule moved to the node it is routed again with that local model excluded (`local_lane.UNSUPPORTED`,
   one of `local_lane.REROUTE`); on a pinned turn or a continuation, a terminal `400 invalid_request_error` with
   `x-should-retry: false`, saying the node serves a text-only model (pin a model that reads images, or send text only).
+
+- any other HTTP 5xx before the first byte, on the opening turn of a COST-profile bind of a request no sensitivity
+  detector marks: routed again the same way (`local_lane.NODE_ERROR`; "A node error before any byte" above). A
+  sensitive request or bind, a pin or a continuation gets the node's error as before.
 
 The refusal fallback (`local_lane.complete`) treats a busy, too-large or text-only refusal as an unavailable node.
 

@@ -397,13 +397,16 @@ def route(text, local=None, down=None):
     r = routing.choose(core, body, client="verify", conversation_id="verify-sensitive", claude_bin=sys.executable,
                        codex_bin=sys.executable, local=local)
     rules = (r.get("route") or {}).get("hard_rules") or []
-    return {**{k: r.get(k) for k in ("provider", "model", "band", "degraded", "error")},
+    return {**{k: r.get(k) for k in ("provider", "model", "band", "degraded", "error", "bind_reason")},
+            "cloud_ok": r.get(local_lane.CLOUD_REROUTE_OK),
             "rule": next((h.split(":")[0] + ":" + h.split(":")[1] for h in rules if h.startswith("sensitive")), None)}
 easy = "explain how this parser handles nested quotes"
 print(json.dumps({"flag": route(easy, "sensitive"), "keyword": route("explain the Verify Placeholder Term"),
                   "plain": route(easy), "down": route(easy, "sensitive", "node pro: local gate: local switch off"),
                   "outward": route("email the signed invoice about the verify placeholder term to the client and mark "
-                                   "it paid", "sensitive")}))
+                                   "it paid", "sensitive"),
+                  "keyword_prefer": route("explain the Verify Placeholder Term", "prefer"),
+                  "prefer": route(easy, "prefer")}))
 """
 
 # Continuations of a local-bound conversation (review fix, 2026-11-13): every later turn of a conversation an automatic
@@ -628,6 +631,17 @@ def main():
                    f"flag -> {flag.get('provider')} band {flag.get('band')} | keyword -> {key.get('provider')} "
                    f"band {key.get('band')} | unflagged -> {plain.get('provider')} | node off -> {down.get('provider')} | "
                    f"outward+flag+keyword -> band {out.get('band')} {out.get('provider')}/{out.get('model')}")
+            # #122 round 2: sensitivity wins over the cost preference. A keyword request carrying `prefer` is bound as
+            # keyword (sensitive profile) and never cleared for the node-error cloud re-route; plain `prefer` keeps its
+            # cost bind and is cleared (its healthy-node routing unchanged).
+            kp, pf = r["keyword_prefer"], r["prefer"]
+            ok = (local(kp) and kp.get("rule") == "sensitive: keyword" and kp.get("bind_reason") == "keyword"
+                  and kp.get("cloud_ok") is None and local(pf) and pf.get("bind_reason") == "prefer"
+                  and pf.get("cloud_ok") is True)
+            record("sensitivity wins over prefer; only a cleared request may leave on a node error",
+                   "PASS" if ok else "FAIL",
+                   f"keyword+prefer -> {kp.get('provider')} bind {kp.get('bind_reason')} cloud_ok {kp.get('cloud_ok')} | "
+                   f"prefer -> {pf.get('provider')} bind {pf.get('bind_reason')} cloud_ok {pf.get('cloud_ok')}")
 
     p = runner.run(["-c", INDEX_SCENARIO], prefix="verify-router-index-", timeout=300)
     try:

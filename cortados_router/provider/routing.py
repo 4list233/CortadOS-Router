@@ -55,6 +55,7 @@ from typing import Any, Callable
 
 from cortados_router import execution_routing
 from cortados_router.provider import anthropic_wire as wire
+from cortados_router.provider import effect_boundary
 from cortados_router.provider import floor
 from cortados_router.provider import local_lane
 
@@ -729,9 +730,14 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
                 "error": f"internal: routed to the excluded model {r.get('model')} ({r.get('provider')}); refused "
                          "(x-cortados-exclude-model)"}
     if not r.get("error"):
+        # Decided once, from the request and S1's answers, before any rule binds it (#122 round 2): sensitivity is
+        # never inferred from which rule moved the request, and it wins over the cost preference.
+        sensitive = request_sensitivity(body, r, local)
         r = sensitive_local(core, body, r, client=client, conversation_id=conversation_id, excluded=hit, local=local)
         if not r.get("local"):
             r = auto_local(core, body, r, client=client, conversation_id=conversation_id, excluded=hit)
+        if r.get("local"):
+            r = _stamp_sensitivity(r, sensitive)
     if min_left_pct is not None and not r.get("error"):
         # The routed path's floor check runs on the account select chose (execution_routing ranks inside select); a
         # chosen account below the client's floor is refused like a spent one, never swapped for an unscored sibling.
@@ -1426,20 +1432,81 @@ def sensitive_trigger(body: dict[str, Any], r: dict[str, Any], section: dict[str
     """Which trigger marks this request for `section`'s node: "flag" (x-cortados-local: sensitive), "prefer"
     (x-cortados-local: prefer), "keyword" (the latest user turn matches the node's keyword list), "s1" (the planned S1
     signal, S1_SENSITIVE_ANSWER), or None. A keyword list that cannot be read is a warning naming the file, never a
-    term, and matches nothing."""
+    term, and matches nothing.
+
+    Precedence is TRIGGER_PRECEDENCE: every sensitivity detector is asked BEFORE the cost preference, so a request
+    that is sensitive by any detector is bound as sensitive (sensitive profile, never re-routed to the cloud) even
+    when it also carries `x-cortados-local: prefer` (#122 round 2: `prefer` returned first let a keyword-sensitive
+    request take the cost profile and the node-error re-route to a cloud lane)."""
     if local == "sensitive":
         return "flag"
-    if local == "prefer":
-        return "prefer"
     try:
         if local_lane.keyword_match(section, latest_user_text(body) if text is None else text):
             return "keyword"
     except local_lane.KeywordListError as exc:
         logger.warning("sensitive: keyword list skipped: %s", exc)
-    ans = (r.get("decision") or {}).get("answers") or {}
-    if S1_SENSITIVE_ANSWER and ans.get(S1_SENSITIVE_ANSWER) is True:
+    if _s1_marks_sensitive(r):
         return "s1"
+    if local == "prefer":
+        return "prefer"
     return None
+
+
+# The order sensitive_trigger asks its triggers in: every sensitivity detector first, the cost preference last.
+TRIGGER_PRECEDENCE = ("flag", "keyword", "s1", "prefer")
+
+
+def _s1_marks_sensitive(r: dict[str, Any]) -> bool:
+    ans = (r.get("decision") or {}).get("answers") or {}
+    return bool(S1_SENSITIVE_ANSWER and ans.get(S1_SENSITIVE_ANSWER) is True)
+
+
+# local_lane.CLOUD_REROUTE_OK: set True on a route `choose` moved to a local node only when every sensitivity detector
+# cleared the request (request_sensitivity returned None).
+CLOUD_REROUTE_OK = local_lane.CLOUD_REROUTE_OK
+
+
+def request_sensitivity(body: dict[str, Any], r: dict[str, Any], local: str | None) -> str | None:
+    """Whether the request is sensitive by ANY detector, independent of which rule binds it and of `prefer`: "flag"
+    (x-cortados-local: sensitive), "keyword" (the latest user turn matches ANY node's keyword list), "s1" (the planned
+    S1 signal), "unknown" (a detector could not answer: the local config or a keyword list unreadable; doubt counts as
+    sensitive for the cloud re-route), or None (cleared by every detector). Logs metadata only, never text or terms."""
+    if local == "sensitive":
+        return "flag"
+    if _s1_marks_sensitive(r):
+        return "s1"
+    try:
+        targets = local_lane.sensitive_routes()
+    except local_lane.LocalConfigError as exc:
+        logger.warning("sensitive: cannot check the keyword lists (local config error on node %s): treated as "
+                       "sensitive for any cloud re-route", exc.node)
+        return "unknown"
+    text = latest_user_text(body)
+    doubt = False
+    for _node, _entry, section in targets:
+        try:
+            if local_lane.keyword_match(section, text):
+                return "keyword"
+        except local_lane.KeywordListError:
+            doubt = True
+    return "unknown" if doubt else None
+
+
+def _stamp_sensitivity(r: dict[str, Any], sensitive: str | None) -> dict[str, Any]:
+    """A route `choose` moved to a local node, marked with request_sensitivity's verdict: CLOUD_REROUTE_OK only when
+    every detector cleared the request. A request a detector positively marks that a COST-profile rule bound (auto_route
+    or index after the sensitive move was not taken, or any future cost rule) takes that detector's bind reason instead,
+    so the effect boundary gives it the sensitive profile: sensitivity wins over cost wherever the bind reason is read."""
+    out = dict(r)
+    out.pop(CLOUD_REROUTE_OK, None)
+    if sensitive is None:
+        out[CLOUD_REROUTE_OK] = True
+        return out
+    if sensitive != "unknown" and effect_boundary.profile_for(out.get("bind_reason")) == effect_boundary.COST:
+        logger.info("%s: route %s bound by %s is sensitive: sensitive profile", _rule_label(sensitive),
+                    out.get("route_id"), out.get("bind_reason"))
+        out["bind_reason"] = TRIGGER_REASONS.get(sensitive, sensitive)   # "s1": unknown there, the strictest profile
+    return out
 
 
 # sensitive_trigger's rule -> the route's bind_reason (effect_boundary.BIND_PROFILES). "s1" (the planned S1 signal, not

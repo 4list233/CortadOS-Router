@@ -131,7 +131,7 @@ def nodes(path: str | None = None) -> list[dict[str, Any]]:
                 raise LocalConfigError(f"node {nid}: every model needs an `id` (the Ollama tag)", nid)
             entry = {"id": mid, "alias": (str(m["alias"]).strip() or None) if m.get("alias") else None,
                      "name": m.get("name") or mid, "context_length": _context_length(m, nid, mid),
-                     "thinking": _thinking_mode(m, nid, mid)}
+                     "thinking": _thinking_mode(m, nid, mid), "efforts": _efforts(m, nid, mid)}
             for pin in {mid.casefold(), (entry["alias"] or mid).casefold()}:
                 if pin in seen:
                     raise LocalConfigError(f"pin name {pin!r} is offered twice (nodes {seen[pin]} and {nid})", nid)
@@ -430,6 +430,64 @@ def _thinking_mode(m: dict[str, Any], nid: str, mid: str) -> str:
     return v
 
 
+# A model entry's `efforts` (#122): the reasoning-effort levels the node accepts in `output_config.effort`. Claude Code
+# sends `output_config: {"effort": "high"}` with `thinking: {"type": "adaptive"}`; Ollama's /v1/messages turns the
+# effort into the chat request's think level whenever `thinking` is neither enabled nor disabled (rewriting `xhigh` to
+# `high` first), and the level reaches the model's chat template as its reasoning effort. A template that does not
+# accept the level fails the whole turn with HTTP 500 (observed 2026-11-15: a template accepting only xhigh, medium and
+# low refused `high`). So the client's effort reaches the node only as a level the model entry declares:
+#   absent (default)  `output_config.effort` is dropped (an `output_config` left empty is dropped too): the template
+#                     keeps its own default, and no client value can fail the turn.
+#   a list            the client's level, when declared, is sent as is; otherwise the highest declared level BELOW it
+#                     (never more effort than the client asked: a local node's time is the scarce resource), or the
+#                     lowest declared level when none is below it. An unknown client value is dropped.
+# Declare the levels as the node's API passes them on, not as the template names them: through Ollama, `xhigh` arrives
+# as `high`, so a template accepting xhigh/medium/low is declared ["medium", "low"] (`high` maps to `medium`). The MLX
+# backend's chat_template_kwargs allowlist (local_backend.ALLOWED_TEMPLATE_KWARGS: enable_thinking only) is unchanged:
+# an effort never becomes a template kwarg.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _efforts(m: dict[str, Any], nid: str, mid: str) -> list[str] | None:
+    """A model's validated `efforts` (EFFORT_LEVELS, in that order, no duplicates); None when absent."""
+    v = m.get("efforts")
+    if v is None:
+        return None
+    if (not isinstance(v, list) or not v or any(not isinstance(e, str) or e not in EFFORT_LEVELS for e in v)
+            or len(set(v)) != len(v)):
+        raise LocalConfigError(f"node {nid}: model {mid}: efforts must be a non-empty list of distinct levels from "
+                               f"{', '.join(EFFORT_LEVELS)}, got {v!r}", nid)
+    return [e for e in EFFORT_LEVELS if e in v]
+
+
+def node_effort(asked: Any, efforts: list[str] | None) -> str | None:
+    """The effort level a node is sent for the client's `asked` (the comment above EFFORT_LEVELS), or None: dropped."""
+    if not efforts or not isinstance(asked, str):
+        return None
+    level = asked.strip().lower()
+    if level not in EFFORT_LEVELS:
+        return None
+    if level in efforts:
+        return level
+    below = [e for e in efforts if EFFORT_LEVELS.index(e) < EFFORT_LEVELS.index(level)]
+    return below[-1] if below else efforts[0]
+
+
+def _with_effort(out: dict[str, Any], efforts: list[str] | None) -> None:
+    """Rewrite `out`'s output_config.effort in place to what the node accepts (node_effort), or drop it."""
+    oc = out.get("output_config")
+    if not isinstance(oc, dict) or "effort" not in oc:
+        return
+    oc = dict(oc)
+    level = node_effort(oc.pop("effort"), efforts)
+    if level is not None:
+        oc["effort"] = level
+    if oc:
+        out["output_config"] = oc
+    else:
+        out.pop("output_config", None)
+
+
 # Thinking variants (index_route, tables/local-models.json → index_proxies). Reason for the threshold (#108): Qwen3.8 27B
 # with thinking on spent all of max_tokens=20 thinking and wrote no answer, and the thinking counts against max_tokens.
 # Anthropic's extended thinking needs budget_tokens >= 1024 and < max_tokens, and the answer needs room after it; the
@@ -463,7 +521,29 @@ GATE_UNSUPPORTED = "local gate: content this node's model cannot read"
 # than the node's whole budget; UNSUPPORTED: content its text-only model cannot read.
 TOO_LARGE = "too_large"
 UNSUPPORTED = "unsupported"
-REROUTE = (TOO_LARGE, UNSUPPORTED)
+# NODE_ERROR (#122): the node answered an HTTP 5xx (not the gate's 529 busy answer, which keeps its retry) before any
+# byte reached the client, on the opening turn of a conversation a COST-profile rule bound here (node_error_reroutes).
+# The request may leave the machine, so the server routes it elsewhere as it does for an unavailable node.
+NODE_ERROR = "node_error"
+REROUTE = (TOO_LARGE, UNSUPPORTED, NODE_ERROR)
+# The route key (routing._stamp_sensitivity) saying every sensitivity detector cleared the request, so NODE_ERROR may hand
+# it to a cloud lane. Set True only by routing.choose, from the request itself (routing.request_sensitivity), never
+# inferred from the bind reason's name; absent or anything but True: not cleared, never re-routed that way (fail closed).
+CLOUD_REROUTE_OK = "cloud_reroute_ok"
+
+
+def node_error_reroutes(reroute: bool, auto_routed: bool, bind_reason: Any, cloud_ok: Any = False) -> bool:
+    """Whether a node's pre-byte 5xx hands the turn back for re-routing (NODE_ERROR) instead of answering it: only an
+    opening turn the server may re-route (`reroute`), moved here automatically, that BOTH
+      - every sensitivity detector cleared (`cloud_ok` is exactly True: the route's routing.CLOUD_REROUTE_OK, decided
+        from the request itself by routing.request_sensitivity; absent, False or anything else is not cleared), and
+      - a rule whose effect-boundary profile is COST bound (auto_route, index, prefer: local because it is cheaper).
+    Sensitivity is never inferred from the bind reason's name alone (#122 round 2: a keyword-sensitive request carrying
+    `prefer` was bound `prefer`). A sensitive request, a SENSITIVE-profile bind (the sensitive flag, a keyword, a cloud
+    refusal, or an unknown reason: effect_boundary.profile_for fails closed) or any doubt never leaves the machine this
+    way (#109): its error is answered as before. A pin is the person's choice and is never moved."""
+    return bool(reroute and auto_routed and cloud_ok is True
+                and effect_boundary.profile_for(bind_reason) == effect_boundary.COST)
 GATE_REPORT_TTL_S = 10.0
 BUSY_RETRY_AFTER_S = 5                     # when a 529 from the gate carries no usable Retry-After
 _gate_reports: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -609,9 +689,12 @@ def _node_body(body: dict[str, Any], model: dict[str, Any]) -> dict[str, Any]:
     variant (`variant_thinking` "on") the client did not ask to think is sent thinking enabled with think_budget, or
     disabled when this turn's max_tokens leaves no room for it; a client's own `thinking` passes through, except on a
     sensitive route that found no variant for it (routing.choose_variant: thinking asked with max_tokens below
-    THINK_MIN_MAX_TOKENS), whose model carries `thinking_forced_off` and is sent thinking disabled."""
+    THINK_MIN_MAX_TOKENS), whose model carries `thinking_forced_off` and is sent thinking disabled. On every turn, pins
+    included, `output_config.effort` is held to the model's `efforts` (node_effort; dropped when none is declared,
+    #122)."""
     out = dict(body)
     out["model"] = model["id"]
+    _with_effort(out, model.get("efforts"))
     if model.get("thinking_forced_off"):
         out["thinking"] = {"type": "disabled"}
         return out
@@ -922,14 +1005,14 @@ def _blocked(handler, hit: tuple[str, str], *, stream_started: bool = False) -> 
 def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
           echo_model: str, reply: list | None = None, auto_routed: bool = False,
           bind_reason: str | None = None, hook: bool = False, conversation: str | None = None,
-          reroute: bool = False, commit: Callable[[list], None] | None = None) -> str:
+          reroute: bool = False, commit: Callable[[list], None] | None = None, cloud_ok: bool = False) -> str:
     """_serve, counted in the node's in-flight turns (busy) while it runs."""
     with _inflight_lock:
         _inflight[node["node"]] = _inflight.get(node["node"], 0) + 1
     try:
         return _serve(handler, body, node, model, echo_model=echo_model, reply=reply, auto_routed=auto_routed,
                       bind_reason=bind_reason, hook=hook, conversation=conversation, reroute=reroute,
-                      commit=commit)
+                      commit=commit, cloud_ok=cloud_ok)
     finally:
         with _inflight_lock:
             left = _inflight.get(node["node"], 1) - 1
@@ -942,7 +1025,7 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
 def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
            echo_model: str, reply: list | None = None, auto_routed: bool = False,
            bind_reason: str | None = None, hook: bool = False, conversation: str | None = None,
-           reroute: bool = False, commit: Callable[[list], None] | None = None) -> str:
+           reroute: bool = False, commit: Callable[[list], None] | None = None, cloud_ok: bool = False) -> str:
     """Relay one turn to the node's /v1/messages and the answer back to the client. Returns the outcome: "completed"
     (a whole message or a parsed message_stop), "rejected" (the node answered an HTTP error, relayed as-is),
     "unreachable" (503 sent), or "incomplete" (the stream broke). The response names `echo_model` (what the client
@@ -982,7 +1065,11 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
     returned, so the server opens the conversation on another route; otherwise the client gets a terminal 413
     (x-should-retry: false) saying so, never a 529 it would retry forever. The gate's text-only refusal
     (GATE_UNSUPPORTED: an image or document for a text-only model) is handled the same way: UNSUPPORTED with
-    `reroute`, otherwise a terminal 400."""
+    `reroute`, otherwise a terminal 400. Any other HTTP 5xx from the node (a chat-template error is a 500) returns
+    NODE_ERROR unanswered when node_error_reroutes allows it (`reroute`, auto-routed, `cloud_ok`: every sensitivity
+    detector cleared the request, and a COST-profile `bind_reason`), so
+    the server routes the opening turn elsewhere; otherwise it is relayed as before. Only an answer whose status line
+    came back before anything was written moves: a stream that breaks after its first byte stays "incomplete"."""
     reply = [] if reply is None else reply
     fence = (effect_boundary.Boundary.for_turn(bind_reason, body, hook=hook, conversation=conversation)
              if auto_routed else None)
@@ -1045,6 +1132,10 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
                            f"cortados: local node {node['node']} is busy for sub/{pin_id(model)} ({why}); retry "
                            "shortly. No other model was tried."))
                 return "rejected"
+            if 500 <= resp.status < 600 and node_error_reroutes(reroute, auto_routed, bind_reason, cloud_ok):
+                # Nothing was written to the client yet: the server opens the conversation on another route (#122). The
+                # node's text is not logged (it may quote the request); the status is.
+                return NODE_ERROR
             big = _gate_too_large_answer(raw) if resp.status == 413 else None
             if big is not None:                                  # never fits this node: retrying cannot help
                 _note_gate(node, big.get(GATE_KEY))
