@@ -526,15 +526,24 @@ UNSUPPORTED = "unsupported"
 # The request may leave the machine, so the server routes it elsewhere as it does for an unavailable node.
 NODE_ERROR = "node_error"
 REROUTE = (TOO_LARGE, UNSUPPORTED, NODE_ERROR)
+# The route key (routing._stamp_sensitivity) saying every sensitivity detector cleared the request, so NODE_ERROR may hand
+# it to a cloud lane. Set True only by routing.choose, from the request itself (routing.request_sensitivity), never
+# inferred from the bind reason's name; absent or anything but True: not cleared, never re-routed that way (fail closed).
+CLOUD_REROUTE_OK = "cloud_reroute_ok"
 
 
-def node_error_reroutes(reroute: bool, auto_routed: bool, bind_reason: Any) -> bool:
+def node_error_reroutes(reroute: bool, auto_routed: bool, bind_reason: Any, cloud_ok: Any = False) -> bool:
     """Whether a node's pre-byte 5xx hands the turn back for re-routing (NODE_ERROR) instead of answering it: only an
-    opening turn the server may re-route (`reroute`), moved here automatically, by a rule whose effect-boundary profile
-    is COST (auto_route, index, prefer: local because it is cheaper). A SENSITIVE-profile bind (the sensitive flag, a
-    keyword, a cloud refusal, or an unknown reason: effect_boundary.profile_for fails closed) never leaves the machine
-    this way (#109): its error is answered as before. A pin is the person's choice and is never moved."""
-    return bool(reroute and auto_routed and effect_boundary.profile_for(bind_reason) == effect_boundary.COST)
+    opening turn the server may re-route (`reroute`), moved here automatically, that BOTH
+      - every sensitivity detector cleared (`cloud_ok` is exactly True: the route's routing.CLOUD_REROUTE_OK, decided
+        from the request itself by routing.request_sensitivity; absent, False or anything else is not cleared), and
+      - a rule whose effect-boundary profile is COST bound (auto_route, index, prefer: local because it is cheaper).
+    Sensitivity is never inferred from the bind reason's name alone (#122 round 2: a keyword-sensitive request carrying
+    `prefer` was bound `prefer`). A sensitive request, a SENSITIVE-profile bind (the sensitive flag, a keyword, a cloud
+    refusal, or an unknown reason: effect_boundary.profile_for fails closed) or any doubt never leaves the machine this
+    way (#109): its error is answered as before. A pin is the person's choice and is never moved."""
+    return bool(reroute and auto_routed and cloud_ok is True
+                and effect_boundary.profile_for(bind_reason) == effect_boundary.COST)
 GATE_REPORT_TTL_S = 10.0
 BUSY_RETRY_AFTER_S = 5                     # when a 529 from the gate carries no usable Retry-After
 _gate_reports: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -996,14 +1005,14 @@ def _blocked(handler, hit: tuple[str, str], *, stream_started: bool = False) -> 
 def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
           echo_model: str, reply: list | None = None, auto_routed: bool = False,
           bind_reason: str | None = None, hook: bool = False, conversation: str | None = None,
-          reroute: bool = False, commit: Callable[[list], None] | None = None) -> str:
+          reroute: bool = False, commit: Callable[[list], None] | None = None, cloud_ok: bool = False) -> str:
     """_serve, counted in the node's in-flight turns (busy) while it runs."""
     with _inflight_lock:
         _inflight[node["node"]] = _inflight.get(node["node"], 0) + 1
     try:
         return _serve(handler, body, node, model, echo_model=echo_model, reply=reply, auto_routed=auto_routed,
                       bind_reason=bind_reason, hook=hook, conversation=conversation, reroute=reroute,
-                      commit=commit)
+                      commit=commit, cloud_ok=cloud_ok)
     finally:
         with _inflight_lock:
             left = _inflight.get(node["node"], 1) - 1
@@ -1016,7 +1025,7 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
 def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
            echo_model: str, reply: list | None = None, auto_routed: bool = False,
            bind_reason: str | None = None, hook: bool = False, conversation: str | None = None,
-           reroute: bool = False, commit: Callable[[list], None] | None = None) -> str:
+           reroute: bool = False, commit: Callable[[list], None] | None = None, cloud_ok: bool = False) -> str:
     """Relay one turn to the node's /v1/messages and the answer back to the client. Returns the outcome: "completed"
     (a whole message or a parsed message_stop), "rejected" (the node answered an HTTP error, relayed as-is),
     "unreachable" (503 sent), or "incomplete" (the stream broke). The response names `echo_model` (what the client
@@ -1057,7 +1066,8 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
     (x-should-retry: false) saying so, never a 529 it would retry forever. The gate's text-only refusal
     (GATE_UNSUPPORTED: an image or document for a text-only model) is handled the same way: UNSUPPORTED with
     `reroute`, otherwise a terminal 400. Any other HTTP 5xx from the node (a chat-template error is a 500) returns
-    NODE_ERROR unanswered when node_error_reroutes allows it (`reroute`, auto-routed, a COST-profile `bind_reason`), so
+    NODE_ERROR unanswered when node_error_reroutes allows it (`reroute`, auto-routed, `cloud_ok`: every sensitivity
+    detector cleared the request, and a COST-profile `bind_reason`), so
     the server routes the opening turn elsewhere; otherwise it is relayed as before. Only an answer whose status line
     came back before anything was written moves: a stream that breaks after its first byte stays "incomplete"."""
     reply = [] if reply is None else reply
@@ -1122,7 +1132,7 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
                            f"cortados: local node {node['node']} is busy for sub/{pin_id(model)} ({why}); retry "
                            "shortly. No other model was tried."))
                 return "rejected"
-            if 500 <= resp.status < 600 and node_error_reroutes(reroute, auto_routed, bind_reason):
+            if 500 <= resp.status < 600 and node_error_reroutes(reroute, auto_routed, bind_reason, cloud_ok):
                 # Nothing was written to the client yet: the server opens the conversation on another route (#122). The
                 # node's text is not logged (it may quote the request); the status is.
                 return NODE_ERROR

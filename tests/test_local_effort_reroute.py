@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp())
 
-from cortados_router.provider import local_lane, server
+from cortados_router.provider import effect_boundary, local_lane, routing, server
 from tests.test_provider import TOKEN
 from tests.test_provider_local import FakeOllama, TAG
 from tests.test_provider_local_auto import FakeHandler, RelayConnection, body
@@ -97,23 +97,122 @@ class NodeErrorRerouteRuleTests(unittest.TestCase):
     def test_cost_profile_opening_turn_is_handed_back_unanswered(self):
         for reason in ("auto_route", "index", "prefer"):
             for status in (500, 502, 503, 504):
-                self.assertEqual(self.serve(status, auto_routed=True, bind_reason=reason, reroute=True),
+                self.assertEqual(self.serve(status, auto_routed=True, bind_reason=reason, reroute=True, cloud_ok=True),
                                  (local_lane.NODE_ERROR, None), (reason, status))
 
     def test_sensitive_profile_binds_keep_the_answered_error(self):
         for reason in ("sensitive_flag", "keyword", "refusal", None, "something-new"):
+            self.assertEqual(self.serve(auto_routed=True, bind_reason=reason, reroute=True, cloud_ok=True),
+                             ("rejected", 500), reason)
+
+    def test_a_cost_bind_not_cleared_by_the_detectors_keeps_the_answered_error(self):
+        # #122 round 2: the bind reason's name is never proof the request is not sensitive. Only an explicit True from
+        # routing.request_sensitivity (local_lane.CLOUD_REROUTE_OK) clears it; absent or anything else fails closed.
+        for reason in ("auto_route", "index", "prefer"):
+            for cloud_ok in (False, None, "true", 1):
+                self.assertEqual(self.serve(auto_routed=True, bind_reason=reason, reroute=True, cloud_ok=cloud_ok),
+                                 ("rejected", 500), (reason, cloud_ok))
             self.assertEqual(self.serve(auto_routed=True, bind_reason=reason, reroute=True), ("rejected", 500), reason)
 
     def test_pins_continuations_and_client_errors_are_not_moved(self):
-        self.assertEqual(self.serve(auto_routed=False, reroute=True), ("rejected", 500))           # a pin
-        self.assertEqual(self.serve(auto_routed=True, bind_reason="index", reroute=False), ("rejected", 500))
+        self.assertEqual(self.serve(auto_routed=False, reroute=True, cloud_ok=True), ("rejected", 500))   # a pin
+        self.assertEqual(self.serve(auto_routed=True, bind_reason="index", reroute=False, cloud_ok=True),
+                         ("rejected", 500))
         bad = json.dumps({"type": "error", "error": {"type": "invalid_request_error", "message": "bad"}}).encode()
-        self.assertEqual(self.serve(400, bad, auto_routed=True, bind_reason="index", reroute=True), ("rejected", 400))
+        self.assertEqual(self.serve(400, bad, auto_routed=True, bind_reason="index", reroute=True, cloud_ok=True),
+                         ("rejected", 400))
 
     def test_the_gates_busy_answer_keeps_its_retry(self):
         busy = json.dumps({"type": "error", "error": {"type": "overloaded_error", "message": local_lane.GATE_BUSY},
                            local_lane.GATE_KEY: {"limit": 1, "inflight": 1, "reason": "owner idle"}}).encode()
-        self.assertEqual(self.serve(529, busy, auto_routed=True, bind_reason="index", reroute=True), ("rejected", 529))
+        self.assertEqual(self.serve(529, busy, auto_routed=True, bind_reason="index", reroute=True, cloud_ok=True),
+                         ("rejected", 529))
+
+
+class SensitivityPrecedenceTests(unittest.TestCase):
+    """#122 round 2 guard: every sensitivity detector is asked before the cost preference, and the cloud re-route's
+    clearance comes from the request itself (routing.request_sensitivity), never from the bind reason's name."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self._env = os.environ.get(local_lane.CONFIG_ENV)
+        os.environ[local_lane.CONFIG_ENV] = write_config(self.dir, "http://127.0.0.1:9", sensitive=True,
+                                                         keywords=f"{SECRET_TERM}\n")
+        self.addCleanup(self._restore)
+        (_node, _entry, self.section), = local_lane.sensitive_routes()
+        self.r = {"decision": {"answers": {"sensitive": True}}}
+
+    def _restore(self):
+        if self._env is None:
+            os.environ.pop(local_lane.CONFIG_ENV, None)
+        else:
+            os.environ[local_lane.CONFIG_ENV] = self._env
+
+    def secret(self):
+        return body(f"explain the {SECRET_TERM}")
+
+    def test_the_order_puts_every_detector_before_the_preference(self):
+        self.assertEqual(routing.TRIGGER_PRECEDENCE[-1], "prefer")
+        self.assertEqual(set(routing.TRIGGER_PRECEDENCE[:-1]), {"flag", "keyword", "s1"})
+        for rule in routing.TRIGGER_PRECEDENCE[:-1]:                 # each detector binds a SENSITIVE profile
+            self.assertEqual(effect_boundary.profile_for(routing.TRIGGER_REASONS.get(rule, rule)),
+                             effect_boundary.SENSITIVE, rule)
+        self.assertEqual(effect_boundary.profile_for(routing.TRIGGER_REASONS["prefer"]), effect_boundary.COST)
+
+    def test_a_keyword_beats_prefer(self):
+        self.assertEqual(routing.sensitive_trigger(self.secret(), {}, self.section, "prefer"), "keyword")
+        self.assertEqual(routing.sensitive_trigger(body("hello"), {}, self.section, "prefer"), "prefer")
+
+    def test_the_s1_signal_beats_prefer(self):
+        with patch.object(routing, "S1_SENSITIVE_ANSWER", "sensitive"):
+            self.assertEqual(routing.sensitive_trigger(body("hello"), self.r, self.section, "prefer"), "s1")
+            self.assertEqual(routing.request_sensitivity(body("hello"), self.r, "prefer"), "s1")
+
+    def test_the_flag_wins(self):
+        self.assertEqual(routing.sensitive_trigger(self.secret(), {}, self.section, "sensitive"), "flag")
+        self.assertEqual(routing.request_sensitivity(body("hello"), {}, "sensitive"), "flag")
+
+    def test_request_sensitivity_ignores_the_preference(self):
+        self.assertEqual(routing.request_sensitivity(self.secret(), {}, "prefer"), "keyword")
+        self.assertEqual(routing.request_sensitivity(self.secret(), {}, None), "keyword")
+        self.assertIsNone(routing.request_sensitivity(body("hello"), {}, "prefer"))
+
+    def test_doubt_is_not_clearance(self):
+        Path(self.dir, "keywords.txt").unlink()                    # an unreadable keyword list
+        with self.assertLogs(routing.logger, level="WARNING"):
+            self.assertEqual(routing.sensitive_trigger(self.secret(), {}, self.section, None), None)
+        self.assertEqual(routing.request_sensitivity(self.secret(), {}, "prefer"), "unknown")
+        Path(os.environ[local_lane.CONFIG_ENV]).write_text("{not json")   # an unreadable local config
+        with self.assertLogs(routing.logger, level="WARNING"):
+            self.assertEqual(routing.request_sensitivity(body("hello"), {}, None), "unknown")
+
+    def test_stamp_clears_only_when_every_detector_cleared(self):
+        moved = {"route_id": "x", "local": {}, "bind_reason": "auto_route"}
+        self.assertIs(routing._stamp_sensitivity(moved, None)[local_lane.CLOUD_REROUTE_OK], True)
+        for verdict in ("flag", "keyword", "s1", "unknown"):
+            out = routing._stamp_sensitivity({**moved, local_lane.CLOUD_REROUTE_OK: True}, verdict)
+            self.assertNotIn(local_lane.CLOUD_REROUTE_OK, out, verdict)
+
+    def test_choose_binds_a_keyword_request_moved_by_a_cost_rule_as_sensitive(self):
+        # keyword + auto_route / index: the sensitive move was not taken, a COST rule bound the request. It is still
+        # sensitive by a detector: never cleared for the cloud re-route, and the effect boundary's profile is SENSITIVE.
+        for reason in ("auto_route", "index"):
+            got = self._choose(self.secret(), reason)
+            self.assertNotIn(local_lane.CLOUD_REROUTE_OK, got, reason)
+            self.assertEqual(got["bind_reason"], "keyword", reason)
+            self.assertEqual(effect_boundary.profile_for(got["bind_reason"]), effect_boundary.SENSITIVE)
+            clean = self._choose(body("hello"), reason)              # a request no detector marks keeps its cost bind
+            self.assertIs(clean[local_lane.CLOUD_REROUTE_OK], True, reason)
+            self.assertEqual(clean["bind_reason"], reason)
+
+    def _choose(self, req, reason):
+        s1 = {"route_id": "r1", "provider": "claude-cli", "model": "m", "band": "R0", "decision": {"answers": {}}}
+        moved = {**s1, "provider": "local-pro", "local": {"node": {}, "model": {}}, "bind_reason": reason}
+        with patch.object(routing.execution_routing, "select", lambda *a, **k: dict(s1)), \
+                patch.object(routing, "served_routes", lambda core: []), \
+                patch.object(routing, "sensitive_local", lambda core, b, r, **kw: r), \
+                patch.object(routing, "auto_local", lambda core, b, r, **kw: dict(moved)):
+            return routing.choose(object(), req, client="t", conversation_id="c")
 
 
 def _node_500(handler):
@@ -188,19 +287,24 @@ class RerouteEndToEndBase(ContinuationRecheckBase):
             self.assertEqual(len(self.node_posts()), 1, stream)                   # tried once, never again
             self.assertNotIn("output_config", FakeOllama.seen[0][1])               # the effort never reached the node
             self.assertEqual([r.get("provider") for _, r in self.routes], ["local-pro", "claude-cli"])
-            self.assertEqual(self.routes[1][0], TAG)                               # the node's model excluded
+            self.assertIn(TAG, self.routes[1][0].split(","))                      # the node's model excluded
             said = "\n".join(cm.output)
             self.assertIn("HTTP 5xx before any byte reached the client; routing it elsewhere", said)
             self.assertNotIn("Jinja", said)                                        # the node's text is not logged
             self.assertEqual(local_lane._inflight, {})
 
-    def assertAnsweredLocally(self, headers=None, text="summarise the notes in this folder"):
-        code, got = self.send(self.request(text), headers)
-        self.assertEqual(code, 500)
-        self.assertIn("Unexpected reasoning effort", got["error"]["message"])
-        self.assertEqual(len(self.node_posts()), 1)
-        self.assertEqual([r.get("provider") for _, r in self.routes], ["local-pro"])    # never routed to the cloud
-        self.assertEqual(self.reg.sessions, {})                                          # nothing left bound
+    def assertAnsweredLocally(self, headers=None, text="summarise the notes in this folder", streams=(False,)):
+        for stream in streams:
+            FakeOllama.seen.clear()
+            self.routes.clear()
+            code, got = self.send(self.request(text, stream), headers)
+            self.assertEqual(code, 500, stream)
+            self.assertIn("Unexpected reasoning effort", got["error"]["message"])
+            self.assertEqual(len(self.node_posts()), 1, stream)
+            self.assertEqual([r.get("provider") for _, r in self.routes], ["local-pro"], stream)   # never the cloud
+            self.assertNotIn(local_lane.CLOUD_REROUTE_OK, self.routes[0][1])         # never cleared for the cloud
+            self.assertEqual(self.reg.sessions, {})                                  # nothing left bound
+            self.assertEqual(local_lane._inflight, {})
 
 
 class AutoRouteNodeErrorTests(RerouteEndToEndBase):
@@ -226,11 +330,55 @@ class PreferNodeErrorTests(RerouteEndToEndBase):
         self.assertRerouted(self.HEADERS_OPEN)
 
 
+class PreferWithKeywordNodeErrorTests(RerouteEndToEndBase):
+    """#122 round 2 (P1): a keyword-sensitive request that also carries `prefer` is sensitive, never a cost bind: the
+    node's 500 is answered and no cloud backend is called, streaming or not. Before the fix sensitive_trigger returned
+    "prefer" before it looked at the keywords, so the route log read [local-pro (prefer), claude-cli]."""
+    HEADERS_OPEN = {"x-cortados-local": "prefer"}
+
+    def setUp(self):
+        super().setUp()
+        write_config(self.scratch, f"http://127.0.0.1:{self.ollama.server_port}", sensitive=True,
+                     keywords=f"{SECRET_TERM}\n")
+
+    def test_a_pre_byte_500_is_answered_and_never_leaves_the_machine(self):
+        self.assertAnsweredLocally(self.HEADERS_OPEN, text=f"explain the {SECRET_TERM}", streams=(False, True))
+
+    def test_the_bind_is_the_keyword_not_prefer(self):
+        self.assertAnsweredLocally(self.HEADERS_OPEN, text=f"explain the {SECRET_TERM}")
+        self.assertEqual(self.routes[0][1].get("bind_reason"), "keyword")
+
+    def test_prefer_without_a_keyword_is_still_a_cost_bind_and_rerouted(self):
+        self.assertRerouted(self.HEADERS_OPEN)
+
+
 class SensitiveFlagNodeErrorTests(RerouteEndToEndBase):
     HEADERS_OPEN = {"x-cortados-local": "sensitive"}
 
     def test_a_pre_byte_500_is_answered_and_never_leaves_the_machine(self):
-        self.assertAnsweredLocally(self.HEADERS_OPEN)
+        self.assertAnsweredLocally(self.HEADERS_OPEN, streams=(False, True))
+
+
+class KeywordAutoRouteNodeErrorTests(RerouteEndToEndBase):
+    """A keyword-sensitive request the sensitive move did not take (its model, phi, excluded by the client) that the R0
+    auto_route rule then bound: sensitive by a detector, so it takes the keyword bind and never reaches the cloud."""
+    BAND = "R0"
+    HEADERS_OPEN = {"x-cortados-exclude-model": "phi:latest"}
+
+    def setUp(self):
+        super().setUp()
+        write_config(self.scratch, f"http://127.0.0.1:{self.ollama.server_port}",
+                     sensitive={"model": "phi:latest", "keywords_file": str(Path(self.scratch) / "keywords.txt"),
+                                "refusal_fallback": False},
+                     keywords=f"{SECRET_TERM}\n", auto_route={"model": "qwen-27b", "bands": ["R0", "R1"]})
+
+    def test_a_pre_byte_500_is_answered_and_never_leaves_the_machine(self):
+        self.assertAnsweredLocally(self.HEADERS_OPEN, text=f"explain the {SECRET_TERM}", streams=(False, True))
+        self.assertEqual(self.routes[0][1]["local"]["model"]["id"], TAG)          # bound by auto_route's model
+        self.assertEqual(self.routes[0][1].get("bind_reason"), "keyword")         # but as sensitive
+
+    def test_without_the_keyword_auto_route_is_still_rerouted(self):
+        self.assertRerouted(self.HEADERS_OPEN)
 
 
 class KeywordNodeErrorTests(RerouteEndToEndBase):
@@ -240,7 +388,7 @@ class KeywordNodeErrorTests(RerouteEndToEndBase):
                      keywords=f"{SECRET_TERM}\n")
 
     def test_a_pre_byte_500_is_answered_and_never_leaves_the_machine(self):
-        self.assertAnsweredLocally(text=f"explain the {SECRET_TERM}")
+        self.assertAnsweredLocally(text=f"explain the {SECRET_TERM}", streams=(False, True))
 
 
 class DeclaredEffortEndToEndTests(RerouteEndToEndBase):

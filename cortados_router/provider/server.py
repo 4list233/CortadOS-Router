@@ -2636,7 +2636,8 @@ class Handler(BaseHTTPRequestHandler):
         Returns the lane's outcome (None when refused before the relay). `reroute` (default: an opening turn a rule
         moved here, not a pin) lets the lane hand back local_lane.TOO_LARGE, UNSUPPORTED or NODE_ERROR
         (local_lane.REROUTE), unanswered, when the node's gate can never take the turn or the node answered a 5xx on a
-        COST-profile bind; the caller then routes the conversation elsewhere."""
+        COST-profile bind of a request every sensitivity detector cleared (local_lane.CLOUD_REROUTE_OK); the caller then
+        routes the conversation elsewhere."""
         reg = self.server.registry
         route = session.route or {}
         if not session.lock.acquire(timeout=TURN_TIMEOUT_S):
@@ -2691,7 +2692,9 @@ class Handler(BaseHTTPRequestHandler):
                                            reply=reply, auto_routed=not route.get("pinned"),
                                            bind_reason=route.get("bind_reason"), hook=self._boundary_hook(),
                                            conversation=str(session.id), reroute=reroute,
-                                           commit=commit)
+                                           commit=commit,
+                                           # cleared by every sensitivity detector when routed (#122 round 2)
+                                           cloud_ok=route.get(local_lane.CLOUD_REROUTE_OK) is True)
             except Exception as exc:             # serve handles its own I/O; anything else must still clean up
                 logger.exception("local lane: relay failed")
                 outcome = "incomplete"
@@ -3103,7 +3106,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             # The node's gate can never take this opening turn (TOO_LARGE: more memory than its whole budget;
             # UNSUPPORTED: an image or document its text-only model cannot read), or the node answered a 5xx on a
-            # COST-profile bind (NODE_ERROR, #122; a sensitive bind never gets here: local_lane.node_error_reroutes):
+            # COST-profile bind of a request no sensitivity detector marked (NODE_ERROR, #122; a sensitive request or
+            # bind, or any doubt, never gets here: local_lane.node_error_reroutes, local_lane.CLOUD_REROUTE_OK):
             # nothing was sent and the conversation was dropped, so it is routed again with that local model excluded
             # (S1's route, or another node), once. A second refusal is answered by the lane itself (reroute off).
             moved = (session.route or {}).get("local") or {}
