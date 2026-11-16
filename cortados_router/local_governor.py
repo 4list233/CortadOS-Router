@@ -39,11 +39,12 @@ IMAGES (#125, a model entry with a `vision` block: check_vision): a vision model
 (image_policy: count, inline base64 only, type, encoded bytes, real file type, header dimensions and pixels, user
 messages only, never inside a tool_result, which vllm-mlx 0.6.0's adapter would drop). An image-bearing request reserves
   tokens   = min(text input tokens + images x image_tokens_max + max_tokens, image_context_tokens)
-  reserved = tokens * kv_bytes_per_token + per_seq_state_bytes + prefill_margin_bytes + vision_margin_bytes
+  reserved = tokens * kv_bytes_per_token + per_seq_state_bytes + image_prefill_bytes(tokens, images)
 where the text input bound is input_tokens() with the validated image data's bytes left out (the base64 is not text the
 model reads; every other byte of the body still counts), and image_tokens_max bounds each image's tokens from above (the
-guard sets the processor's max_pixels to it). It also takes one of image_concurrency image slots, in the same atomic
-step as the count slot and the bytes.
+guard sets the processor's max_pixels to it). image_prefill_bytes is the computed worst case of the guard's chunked media
+prefill (its docstring has the formula and every input; docs/LOCAL-RESOURCES.md "Vision" the reasoning), not a fixed
+margin. It also takes one of image_concurrency image slots, in the same atomic step as the count slot and the bytes.
 Defaults (Qwen3.8 27B, 4-bit): 64 KiB per token (16 full-attention layers x K/V x 4 KV heads x head_dim 256 x fp16),
 0.15 GiB recurrent state, 1.5 GiB prefill margin: a 128k-token request reserves 9.65 GiB, so two fit beside 15 GiB of
 weights in a 40 GiB budget and a third does not, while eight ~9k-token requests (2.2 GiB each) fit.
@@ -181,15 +182,50 @@ VISION_DEFAULTS: dict[str, int] = {
     "image_context_tokens": 65536,
     # One image-bearing request at a time until measured (vision encoding is the unmeasured peak).
     "image_concurrency": 1,
-    # Per image-bearing sequence, beside its KV cache: the vision tower's activations and pixel tensors. Provisional.
-    "vision_margin_bytes": 2 * GIB,
     # Encoded bytes per image (decoded from base64): the Anthropic API's own 5 MB per image, so a turn the cloud takes
     # fits here too.
     "max_image_bytes": 5 * 2 ** 20,
     # Decoded pixels per image, from the file header before anything is decoded (a decompression bomb is refused from
     # its header): 32 Mi pixels holds an 8K screenshot (7680 x 4320); the guard sets PIL's bomb limit to the same.
     "max_image_pixels": 32 * 2 ** 20,
+    # ---- image_prefill_bytes(): the computed worst case of the guard's chunked media prefill (#125 review round 2).
+    # The guard prefills an image-bearing prompt in chunks of this many tokens, projecting only the last position to
+    # the vocabulary (cortados_vllm_mlx_guard.py "Media prefill"); the guard gets the same number
+    # (--image-prefill-tokens). The full-attention head_dim 256 is outside MLX's fused attention kernel (mlx-vlm
+    # 0.7.12 models/base.py ensure_fused_sdpa: 64/80/128), so each chunk materializes heads x chunk x context scores:
+    # 256 keeps them at 3 GiB at the 64k image context (1,024 would be 12 GiB).
+    "prefill_chunk_tokens": 256,
+    # Score-sized buffers counted per chunk: the q.k^T product, the causal-masked copy, the softmax output, and one
+    # more for the allocator holding the previous layer's buffer until it is reused.
+    "score_buffers": 4,
+    # Bytes per activation element: the model computes in bfloat16 (config.json's dtype; the guard refuses a wider one).
+    "act_bytes": 2,
+    # The model's dimensions (config.json; the guard refuses to start vision mode when they differ, --image-dims):
+    # Qwen3.8 27B (qwen3_5) text_config, and its vision_config's widths.
+    "hidden_size": 5120,
+    "intermediate_size": 17408,
+    "num_attention_heads": 24,
+    "num_key_value_heads": 4,
+    "head_dim": 256,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 48,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "vocab_size": 248320,
+    "vision_hidden_size": 1152,
+    "vision_intermediate_size": 4304,
 }
+# The keys of VISION_DEFAULTS the guard checks against the model's config.json (--image-dims, in this order).
+VISION_DIM_KEYS = ("hidden_size", "intermediate_size", "num_attention_heads", "num_key_value_heads", "head_dim",
+                   "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
+                   "vocab_size", "vision_hidden_size", "vision_intermediate_size")
+# Keys a vision block may no longer carry, refused by name (the fixed margins the computed reservation replaced).
+VISION_REPLACED = {"vision_margin_bytes": "image_prefill_bytes(), computed from the model's dimensions "
+                                          "(docs/LOCAL-RESOURCES.md \"Vision\")"}
+# Qwen3.5's vision geometry (the guard's VISION_GEOMETRY, checked at startup): 16-pixel patches, stills duplicated
+# over a temporal patch of 2, 3 channels, merged 2 x 2 into one language-model token.
+IMAGE_PATCH_VALUES = 3 * 2 * 16 * 16
+PATCHES_PER_IMAGE_TOKEN = 2 * 2
 
 
 def check_vision(raw: Any, cfg: dict[str, Any] | None = None) -> dict[str, int] | None:
@@ -205,6 +241,8 @@ def check_vision(raw: Any, cfg: dict[str, Any] | None = None) -> dict[str, int] 
     for key, v in raw.items():
         if key.startswith("_"):
             continue
+        if key in VISION_REPLACED:
+            raise GovernorConfigError(f"vision: {key} was replaced by {VISION_REPLACED[key]}")
         if key not in VISION_DEFAULTS:
             raise GovernorConfigError(f"vision: unknown key {key!r}")
         out[key] = v
@@ -215,6 +253,10 @@ def check_vision(raw: Any, cfg: dict[str, Any] | None = None) -> dict[str, int] 
         raise GovernorConfigError("vision: image_context_tokens must not exceed context_tokens")
     if out["image_tokens_max"] >= out["image_context_tokens"]:
         raise GovernorConfigError("vision: image_tokens_max must be below image_context_tokens")
+    if out["prefill_chunk_tokens"] > out["image_context_tokens"]:
+        raise GovernorConfigError("vision: prefill_chunk_tokens must not exceed image_context_tokens")
+    if out["act_bytes"] not in (2, 4):
+        raise GovernorConfigError("vision: act_bytes must be 2 (bfloat16 / float16) or 4 (float32)")
     return out
 
 
@@ -553,11 +595,65 @@ def request_tokens(cfg: dict[str, Any], input_tokens: int, max_tokens: Any, imag
     return min(cfg["context_tokens"], max(0, int(input_tokens)) + out)
 
 
+def image_prefill_bytes(cfg: dict[str, Any], tokens: int, images: int) -> dict[str, int]:
+    """The computed worst case, in bytes, of what an image-bearing request holds beside its KV cache and recurrent
+    state while the guard prefills it (cortados_vllm_mlx_guard.py "Media prefill"), by term; "total" is their sum.
+    P = tokens (the request's whole context: prompt + max_tokens, a bound on the prompt), C = min(chunk, P),
+    T = images x image_tokens_max image tokens, N = 4 T vision patches; a = act_bytes; H, I = hidden and intermediate
+    size; Hq, Hkv, D = attention heads, KV heads, head_dim; Kh, Vh, Kd, Vd the linear-attention heads and head dims;
+    V = vocab; Hv, Iv the vision tower's widths. Each term holds at once with the others (a sum, not a maximum):
+      sequence  P x (3aH + 2H + 64)       the whole prompt's embeddings, live for the whole prefill: embed_tokens'
+                                          output, the merged copy masked_scatter writes, one more copy (a), the image
+                                          mask broadcast to P x H and its numpy copy (2H bool), ids / position ids /
+                                          attention mask (64)
+      media     T x H x (a + 12)          the merged image features plus masked_scatter's int64 and uint32 indices
+              + N x (1536 x (4 + a)       the pixel rows (3 x 2 x 16 x 16 float32) and their activation-dtype copy
+                 + a x (12 Hv + 2 Iv))    one vision block's activations per patch (norms, qkv, rotated and padded
+                                          q/k/v, attention output and projection; MLP in and out)
+      kv_regrow P x kv_bytes_per_token    the KV cache's growth copy: KVCache grows in 256-token steps by
+                                          concatenation, and the replaced buffers wait in MLX's allocator cache until
+                                          the guard clears it after each chunk
+      scores    score_buffers x Hq x C x P x a + C x P
+                                          one chunk's attention against the whole context, unfused (head_dim 256), and
+                                          the causal mask
+      chunk     2 x C x a x (3I + max(3 Hq D + 2 Hkv D, 4 (Kh Kd + Vh Vd)) + 4H)
+                                          one layer's activations for a chunk (MLP gate/up/product, attention or
+                                          linear-attention projections, residual and norms), doubled for the allocator
+      logits    V x (a + 8)               the one kept position's logits and its float32 log-probabilities
+    What the old atomic forward computed beside these (every position projected to the vocabulary: P x V x a, 27.8 GiB
+    at 60k tokens) is gone: the guard keeps one position."""
+    v = cfg["vision"]
+    p = max(0, int(tokens))
+    c = min(v["prefill_chunk_tokens"], p)
+    a, h, i = v["act_bytes"], v["hidden_size"], v["intermediate_size"]
+    hq, hkv, d = v["num_attention_heads"], v["num_key_value_heads"], v["head_dim"]
+    img = max(0, int(images)) * v["image_tokens_max"]
+    patches = img * PATCHES_PER_IMAGE_TOKEN
+    width = 3 * i + max(3 * hq * d + 2 * hkv * d,
+                        4 * (v["linear_num_key_heads"] * v["linear_key_head_dim"]
+                             + v["linear_num_value_heads"] * v["linear_value_head_dim"])) + 4 * h
+    out = {
+        "sequence": p * (3 * a * h + 2 * h + 64),
+        "media": img * h * (a + 12) + patches * (IMAGE_PATCH_VALUES * (4 + a)
+                                                 + a * (12 * v["vision_hidden_size"]
+                                                        + 2 * v["vision_intermediate_size"])),
+        "kv_regrow": p * cfg["kv_bytes_per_token"],
+        "scores": v["score_buffers"] * hq * c * p * a + c * p,
+        "chunk": 2 * c * a * width,
+        "logits": v["vocab_size"] * (a + 8),
+    }
+    out["total"] = sum(out.values())
+    return out
+
+
 def request_bytes(cfg: dict[str, Any], input_tokens: int, max_tokens: Any, images: int = 0) -> int:
-    """request_tokens as a reservation in bytes (module docstring), plus vision_margin_bytes for an image-bearing
-    request."""
-    margin = cfg["vision"]["vision_margin_bytes"] if images and cfg.get("vision") else 0
-    return tokens_bytes(cfg, request_tokens(cfg, input_tokens, max_tokens, images)) + margin
+    """request_tokens as a reservation in bytes (module docstring). An image-bearing request reserves its KV cache and
+    state plus image_prefill_bytes (no fixed margins); a text-only one tokens_bytes, unchanged."""
+    tokens = request_tokens(cfg, input_tokens, max_tokens, images)
+    if images and cfg.get("vision"):
+        return tokens * cfg["kv_bytes_per_token"] + cfg["per_seq_state_bytes"] \
+            + image_prefill_bytes(cfg, tokens, images)["total"]
+    return tokens_bytes(cfg, tokens)
 
 
 def max_seqs(cfg: dict[str, Any]) -> int:

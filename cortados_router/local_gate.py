@@ -20,7 +20,7 @@ Ollama has no authentication, so it listens on 127.0.0.1 only and this gate is t
     carrying content the served model cannot take is refused non-retryably before admission (UNSUPPORTED_MESSAGE): for a
     text-only model any non-text block; for a vision model (#125, its entry's `vision` block) anything outside its
     still-image policy (local_governor.image_policy). An admitted image turn also takes one of the model's image slots,
-    in the same step as its count slot and bytes, and reserves its image tokens and vision margin. A body the gate cannot accept (another model, a chat_template_kwargs key other
+    in the same step as its count slot and bytes, and reserves its image tokens and the computed media-prefill bytes (local_governor.image_prefill_bytes). A body the gate cannot accept (another model, a chat_template_kwargs key other
     than enable_thinking, JSON nested too deeply) is a non-retryable 4xx (x-should-retry: false). The reservation is
     capped at the context because vllm-mlx runs under a prompt guard that refuses longer prompts; its refusal becomes
     the gate's never-fits 413 (local_backend.guard_refusal). Running requests are never

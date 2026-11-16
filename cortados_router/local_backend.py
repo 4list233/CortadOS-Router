@@ -261,7 +261,7 @@ def check(raw: Any, path: str | None = None) -> dict[str, Any]:
     except local_governor.GovernorConfigError as exc:
         raise BackendConfigError(str(exc)) from None
     if model is not None and model.get("vision") not in (None, False) and out["governor"] is None:
-        # Images are admitted only by the governor's reservation (image tokens, vision margin, image slots).
+        # Images are admitted only by the governor's reservation (image tokens, computed prefill bytes, image slots).
         raise BackendConfigError(f"vllm_mlx.models.{out['model']['key']}.vision "
                                  "needs a `governor` section: image turns are admitted by its reservation")
     return out
@@ -379,14 +379,18 @@ def install_paths(cfg: dict[str, Any]) -> dict[str, str]:
 def vision_argv(cfg: dict[str, Any]) -> list[str]:
     """The guard's vision flags for the served model (#125): none for a text-only model (the guard then refuses the
     multimodal route, as before); for a model entry with a `vision` block, --vision and its image policy, which the
-    guard enforces inside vllm-mlx (cortados_vllm_mlx_guard.py, "Vision mode")."""
+    guard enforces inside vllm-mlx (cortados_vllm_mlx_guard.py, "Vision mode"), plus the media prefill's chunk and
+    the model dimensions the gate's image reservation was computed from (local_governor.image_prefill_bytes), which
+    the guard checks against the model's config.json."""
     gov = cfg.get("governor") or local_governor.check_config({}, cfg["model"])
     v = gov.get("vision")
     if not v:
         return []
+    dims = ",".join(f"{k}={v[k]}" for k in (*local_governor.VISION_DIM_KEYS, "act_bytes"))
     return ["--vision", "--max-images", str(v["max_images"]), "--image-tokens", str(v["image_tokens_max"]),
             "--image-context-tokens", str(v["image_context_tokens"]), "--max-image-bytes", str(v["max_image_bytes"]),
-            "--max-image-pixels", str(v["max_image_pixels"])]
+            "--max-image-pixels", str(v["max_image_pixels"]), "--image-prefill-tokens", str(v["prefill_chunk_tokens"]),
+            "--image-dims", dims]
 
 
 def serve_argv(cfg: dict[str, Any]) -> list[str]:

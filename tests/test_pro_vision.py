@@ -198,7 +198,13 @@ class VisionPolicyTests(unittest.TestCase):
     def test_defaults_and_validation(self):
         v = local_governor.check_vision(True)
         self.assertEqual((v["max_images"], v["image_tokens_max"], v["image_context_tokens"], v["image_concurrency"],
-                          v["vision_margin_bytes"]), (5, 1024, 65536, 1, 2 * GIB))
+                          v["prefill_chunk_tokens"], v["hidden_size"], v["vocab_size"]),
+                         (5, 1024, 65536, 1, 256, 5120, 248320))
+        with self.assertRaisesRegex(local_governor.GovernorConfigError, "vision_margin_bytes was replaced"):
+            local_governor.check_vision({"vision_margin_bytes": 2 * GIB})   # the fixed margin is gone, by name
+        for bad in ({"prefill_chunk_tokens": 70000}, {"act_bytes": 3}):
+            with self.subTest(bad), self.assertRaises(local_governor.GovernorConfigError):
+                local_governor.check_vision(bad)
         self.assertIsNone(local_governor.check_vision(None))
         self.assertIsNone(local_governor.check_config({})["vision"])         # text-only unless declared
         for bad in ({"max_images": 0}, {"image_tokens_max": True}, {"nope": 1}, {"image_context_tokens": 512}, "x"):
@@ -265,14 +271,16 @@ class VisionReservationTests(unittest.TestCase):
         tokens = local_governor.request_tokens(cfg, text, 2000, images=2)
         self.assertEqual(tokens, text + 2 * 1024 + 2000)
         self.assertEqual(local_governor.request_bytes(cfg, text, 2000, images=2),
-                         tokens * 65536 + cfg["per_seq_state_bytes"] + cfg["prefill_margin_bytes"] + 2 * GIB)
+                         tokens * 65536 + cfg["per_seq_state_bytes"]
+                         + local_governor.image_prefill_bytes(cfg, tokens, 2)["total"])
 
     def test_an_image_request_is_capped_at_the_image_context_and_a_text_one_is_not(self):
         cfg = vision_cfg()
         self.assertEqual(local_governor.request_tokens(cfg, 100_000, 64_000, images=1), 65536)
         self.assertEqual(local_governor.request_tokens(cfg, 100_000, 64_000), 131072)
         self.assertEqual(local_governor.request_bytes(cfg, 100_000, 64_000, images=1),
-                         65536 * 65536 + cfg["per_seq_state_bytes"] + cfg["prefill_margin_bytes"] + 2 * GIB)
+                         65536 * 65536 + cfg["per_seq_state_bytes"]
+                         + local_governor.image_prefill_bytes(cfg, 65536, 1)["total"])
         with self.assertRaises(ValueError):                                  # no images on a text-only model
             local_governor.request_tokens(local_governor.check_config({}), 10, 10, images=1)
 
@@ -335,6 +343,89 @@ class VisionReservationTests(unittest.TestCase):
         for t in held:
             t.release()
         self.assertEqual((a.image_inflight, a.inflight, a.reserved), (0, 0, 0))
+
+
+class ImagePrefillReservationTests(unittest.TestCase):
+    """#125 review round 2: the image reservation is the computed worst case of the guard's chunked media prefill."""
+    V, H = 248320, 5120
+
+    def test_the_reviewers_60k_tokens_and_a_tiny_image_reserve_their_computed_peak(self):
+        cfg = vision_cfg()
+        text, out = 60_000, 1000
+        tokens = local_governor.request_tokens(cfg, text, out, images=1)
+        self.assertEqual(tokens, 60_000 + 1024 + 1000)                       # under the 64k image context
+        reserve = local_governor.request_bytes(cfg, text, out, images=1)
+        # The peak, from first principles (not the formula): the KV cache and state, the whole prompt's embeddings,
+        # one 256-token chunk's unfused attention scores (24 heads x 256 x P, bf16, three live copies), the kept
+        # position's logits.
+        peak = (tokens * 65536 + cfg["per_seq_state_bytes"] + tokens * self.H * 2 + 3 * 24 * 256 * tokens * 2
+                + self.V * 2)
+        self.assertGreaterEqual(reserve, peak)
+        self.assertGreater(reserve, int(7.65 * GIB))                          # the old fixed margins under-reserved
+        # The released forward's logits alone (every position projected, bf16) could never be reserved: no
+        # reservation covers them, so the guard keeps one position instead.
+        avail = local_governor.available_bytes(cfg)
+        self.assertGreater(tokens * self.V * 2, avail)
+        a = local_governor.Admission(local_governor.Governor(cfg, idle_reader=lambda: 3600.0,
+                                                             pressure_reader=lambda: "normal", clock=lambda: 0.0))
+        t, snap = a.try_acquire(reserve, image=True)                          # admitted, with that reservation
+        self.assertIsNotNone(t, snap)
+        self.assertEqual(a.reserved, reserve)
+        t.release()
+
+    def test_the_formula_by_term_at_the_largest_image_turn(self):
+        cfg = vision_cfg()
+        p, c = 65536, 256
+        got = local_governor.image_prefill_bytes(cfg, p, 5)
+        self.assertEqual(got["scores"], 4 * 24 * c * p * 2 + c * p)
+        self.assertEqual(got["logits"], self.V * 10)
+        self.assertEqual(got["sequence"], p * (3 * 2 * self.H + 2 * self.H + 64))
+        self.assertEqual(got["kv_regrow"], p * 65536)
+        self.assertEqual(got["chunk"], 2 * c * 2 * (3 * 17408 + max(3 * 24 * 256 + 2 * 4 * 256,
+                                                                    4 * (16 * 128 + 48 * 128)) + 4 * self.H))
+        self.assertEqual(got["media"], 5 * 1024 * self.H * 14 + 4 * 5 * 1024 * (1536 * 6 + 2 * (12 * 1152 + 2 * 4304)))
+        self.assertEqual(got["total"], sum(v for k, v in got.items() if k != "total"))
+        largest = local_governor.request_bytes(cfg, 200_000, 32_000, images=5)
+        self.assertEqual(largest, p * 65536 + cfg["per_seq_state_bytes"] + got["total"])
+        self.assertAlmostEqual(largest / GIB, 15.15, places=2)                # docs/LOCAL-RESOURCES.md "Vision"
+        avail = local_governor.available_bytes(cfg)
+        self.assertLessEqual(largest, avail)                                  # fits alone ...
+        text = local_governor.request_bytes(cfg, 200_000, 32_000)
+        self.assertLessEqual(largest + text, avail)                           # ... and beside a full 128k text turn
+        # a longer chunk is the score term growing with it
+        bigger = local_governor.image_prefill_bytes(vision_cfg(prefill_chunk_tokens=1024), p, 5)
+        self.assertEqual(bigger["scores"] - got["scores"], (1024 - c) * (4 * 24 * p * 2 + p))
+
+    def test_an_image_turn_that_cannot_fit_is_refused_for_good(self):
+        cfg = local_governor.check_config({"memory_budget_bytes": 26 * GIB}, {"vision": True})   # 11 GiB to share
+        reserve = local_governor.request_bytes(cfg, 60_000, 1000, images=1)
+        a = local_governor.Admission(local_governor.Governor(cfg, idle_reader=lambda: 3600.0,
+                                                             pressure_reader=lambda: "normal", clock=lambda: 0.0))
+        t, snap = a.try_acquire(reserve, image=True)
+        self.assertEqual((t, snap["refused"]), (None, "too_large"))           # the gate's non-retryable 413
+        t, _ = a.try_acquire(local_governor.request_bytes(cfg, 2000, 1000, images=1), image=True)
+        self.assertIsNotNone(t)                                               # a short image turn still fits
+        t.release()
+
+    def test_text_only_reservations_are_unchanged(self):
+        for cfg in (vision_cfg(), local_governor.check_config({})):
+            for text, out in ((10, 10), (9000, 4000), (200_000, 32_000)):
+                with self.subTest(text=text, vision=bool(cfg["vision"])):
+                    tokens = min(cfg["context_tokens"], text + out)
+                    self.assertEqual(local_governor.request_bytes(cfg, text, out),
+                                     tokens * 65536 + cfg["per_seq_state_bytes"] + cfg["prefill_margin_bytes"])
+
+    def test_the_guard_checks_the_dimensions_the_formula_uses(self):
+        from tests.test_vllm_mlx_guard import load_guard
+        guard = load_guard()
+        self.assertEqual(guard.DIMS_KEYS, (*local_governor.VISION_DIM_KEYS, "act_bytes"))
+        geo = guard.VISION_GEOMETRY
+        self.assertEqual(local_governor.IMAGE_PATCH_VALUES, 3 * geo["temporal_patch_size"] * geo["patch_size"] ** 2)
+        self.assertEqual(local_governor.PATCHES_PER_IMAGE_TOKEN, geo["merge_size"] ** 2)
+        v = local_governor.VISION_DEFAULTS
+        # the KV cache per token the governor reserves is these dimensions' (16 full-attention layers of 64)
+        self.assertEqual(16 * 2 * v["num_key_value_heads"] * v["head_dim"] * v["act_bytes"],
+                         local_governor.DEFAULTS["kv_bytes_per_token"])
 
 
 # --------------------------------------------------------------------------------------------------- gate
@@ -449,6 +540,15 @@ class VisionGateTests(VisionGateHarness):
         t.join(5)
         self.assertTrue(self.free())
 
+    def test_an_image_turn_over_the_budget_is_a_non_retryable_413(self):
+        self.gate.admission = local_governor.Admission(VisionGovernor(memory_budget_bytes=24 * GIB))
+        body = body_with(image_block(), text="x" * 40_000, max_tokens=20_000)
+        code, raw, headers = self.call("/v1/messages", body)
+        self.assertEqual(code, 413)
+        self.assertEqual({k.lower(): v for k, v in headers.items()}.get("x-should-retry"), "false")
+        self.assertEqual(turns(), [])
+        self.assertTrue(self.free())
+
     def test_the_report_carries_the_image_capability(self):
         code, raw, _ = self.call("/api/tags")
         report = json.loads(raw)["cortados_gate"]
@@ -481,10 +581,76 @@ VISION_FAKE = {
     "mlx_vlm/models/base.py": "# base\n",
     "mlx_vlm/models/qwen3_5/__init__.py": "",
     "mlx_vlm/models/qwen3_5/vision.py": "# vision\n",
-    "mlx_vlm/models/qwen3_5/language.py": "# language\n",
+    "mlx_vlm/models/qwen3_5/language.py": textwrap.dedent('''
+        VOCAB = 7
+
+        class Output:
+            def __init__(self, logits):
+                self.logits = logits
+
+        def row(prefix_sum, position):
+            """The fake model's next-token logits at one position: a function of everything up to it."""
+            return [(prefix_sum * (v + 3) + position * 31) % 9973 for v in range(VOCAB)]
+
+        class LanguageModel:
+            """qwen3_5's LanguageModel as far as the media prefill reaches it: writes every input position into the
+            cache, projects only the trailing logits_to_keep positions (all when 0/None, base.py project_logits)."""
+            def __init__(self):
+                self.calls, self._rope_deltas = [], None
+            def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
+                from mlx_vlm.utils import Arr
+                ids = inputs.tolist()[0]
+                keep = kwargs.get("logits_to_keep")
+                pos = kwargs.get("position_ids")
+                self.calls.append({"n": len(ids), "offset": cache.offset, "keep": keep,
+                                   "embeds": inputs_embeds.shape if inputs_embeds is not None else None,
+                                   "positions": pos.tolist() if pos is not None else None,
+                                   "kwargs": sorted(k for k, v in kwargs.items() if v is not None)})
+                if kwargs.get("pixel_values") is not None:
+                    self._rope_deltas = None
+                if kwargs.get("rope_deltas") is not None:
+                    self._rope_deltas = kwargs["rope_deltas"]
+                sums = []
+                for t in ids:
+                    cache.write(t)
+                    sums.append((cache.sum, cache.offset - 1))
+                kept = sums[-keep:] if keep else sums
+                return Output(Arr([[row(s, p) for s, p in kept]], (1, len(kept), VOCAB)))
+        '''),
     "mlx_vlm/models/qwen3_5/config.py": "# config\n",
-    "mlx_vlm/models/qwen3_5/qwen3_5.py": "class Model:\n    pass\n\nclass OtherModel:\n    pass\n",
+    "mlx_vlm/models/qwen3_5/qwen3_5.py": textwrap.dedent('''
+        from mlx_vlm.models.qwen3_5.language import LanguageModel
+
+        class Features:
+            """InputEmbeddingsFeatures.to_dict as base.py has it (attention_mask None overrides the request's)."""
+            def __init__(self, inputs_embeds, position_ids, rope_deltas):
+                self.inputs_embeds, self.position_ids, self.rope_deltas = inputs_embeds, position_ids, rope_deltas
+            def to_dict(self):
+                return {"inputs_embeds": self.inputs_embeds, "attention_mask_4d": None, "visual_pos_masks": None,
+                        "attention_mask": None, "position_ids": self.position_ids, "rope_deltas": self.rope_deltas}
+
+        class Model:
+            def __init__(self):
+                self.language_model = LanguageModel()
+                self.embedded = []
+            def get_input_embeddings(self, input_ids, pixel_values=None, **kwargs):
+                from mlx_vlm.utils import Arr
+                ids = input_ids.tolist()[0]
+                self.embedded.append((len(ids), getattr(pixel_values, "shape", None), sorted(kwargs)))
+                pos = [[[p + 1000 * axis for p in range(len(ids))]] for axis in range(3)]
+                return Features(Arr([[[t] for t in ids]], (1, len(ids), 1)), Arr(pos, (3, 1, len(ids))),
+                                "rope-deltas")
+            def __call__(self, input_ids, pixel_values=None, mask=None, cache=None, **kwargs):
+                """qwen3_vl's Model.__call__ (qwen3_vl.py 215-236), which qwen3_5.Model inherits."""
+                f = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
+                kwargs.update({"pixel_values": pixel_values, **f.to_dict()})
+                return self.language_model(input_ids, mask=mask, cache=cache, **kwargs)
+
+        class OtherModel:
+            pass
+        '''),
     "mlx_vlm/models/qwen3_vl/__init__.py": "",
+    "mlx_vlm/models/qwen3_vl/qwen3_vl.py": "# qwen3_vl Model (the fake's __call__ lives on qwen3_5.Model)\n",
     "mlx_vlm/models/qwen3_vl/processing_qwen3_vl.py": textwrap.dedent('''
         from cortados_router import image_check
 
@@ -537,8 +703,26 @@ VISION_FAKE = {
                 self.value = value
                 self.shape = shape if shape is not None else (len(value),)
                 self.size = len(value[0]) if value and isinstance(value[0], list) else len(value)
+            @property
+            def ndim(self):
+                return len(self.shape)
             def tolist(self):
                 return self.value
+            def __getitem__(self, idx):
+                """Basic indexing: slices and None (a new leading axis), as the media prefill uses it."""
+                idx = idx if isinstance(idx, tuple) else (idx,)
+                if idx and idx[0] is None:
+                    return Arr([self.value], (1, *self.shape))[idx[1:]] if idx[1:] else Arr([self.value],
+                                                                                          (1, *self.shape))
+                def take(v, ix, shape):
+                    if not ix:
+                        return v, shape
+                    r = range(*ix[0].indices(shape[0]))
+                    parts = [take(v[j], ix[1:], shape[1:]) for j in r]
+                    rest = parts[0][1] if parts else shape[1:]
+                    return [p[0] for p in parts], (len(r), *rest)
+                v, shape = take(self.value, idx, self.shape)
+                return Arr(v, shape)
 
         def prepare_inputs(processor, images=None, audio=None, prompts=None, image_token_index=None, **kw):
             """mlx-vlm's prepare_inputs as the Qwen3-VL processor does it: each image placeholder expanded to
@@ -647,6 +831,32 @@ VISION_FAKE = {
     "vllm_mlx/mllm_batch_generator.py": textwrap.dedent('''
         from vllm_mlx.vision_embedding_cache import VisionEmbeddingCache
 
+        EVALS = []
+
+        class PrefillAbortedError(Exception):
+            pass
+
+        class _Mx:
+            cleared = 0
+            def clear_cache(self):
+                _Mx.cleared += 1
+
+        mx = _Mx()
+
+        def _eval_prompt_cache(cache):
+            EVALS.append(cache.offset)
+
+        class PromptCache:
+            """Every position the language model wrote (the KV cache and recurrent state, as one list)."""
+            def __init__(self):
+                self.tokens, self.sum = [], 0
+            @property
+            def offset(self):
+                return len(self.tokens)
+            def write(self, t):
+                self.tokens.append(t)
+                self.sum += t
+
         class MLLMBatchRequest:
             def __init__(self, request_id, prompt, images=None, videos=None, audio=None, max_tokens=256):
                 self.request_id, self.prompt, self.images, self.videos, self.audio = (request_id, prompt, images,
@@ -659,10 +869,36 @@ VISION_FAKE = {
             def __init__(self, model, processor, mm_processor=None, max_tokens=256, enable_vision_cache=True,
                          vision_cache_size=100, **kw):
                 self.model, self.processor = model, processor
+                self.language_model = getattr(model, "language_model", model)
                 self.vision_cache = VisionEmbeddingCache(max_pixel_entries=vision_cache_size,
                                                          max_encoding_entries=vision_cache_size // 2,
                                                          enabled=enable_vision_cache)
-                self.encoded, self.errors = [], []
+                self.encoded, self.errors, self.prefilled = [], [], {}
+                self._aborted_request_ids, self._prefill_progress = set(), {}
+
+            def _run_vision_encoding(self, request, cache=None):
+                """0.6.0's (1615-1662): ONE forward of the whole prompt through the VLM, every position's logits."""
+                kwargs = dict(request.extra_kwargs)
+                if request.pixel_values is not None:
+                    kwargs["pixel_values"] = request.pixel_values
+                if request.attention_mask is not None:
+                    kwargs["attention_mask"] = request.attention_mask
+                if request.image_grid_thw is not None:
+                    kwargs["image_grid_thw"] = request.image_grid_thw
+                input_ids = request.input_ids
+                if input_ids.ndim == 1:
+                    input_ids = input_ids[None, :]
+                output = self.model(input_ids, cache=cache, **kwargs)
+                request.vision_encoded = True
+                self._release_preprocessed_inputs(request)
+                return output.logits if hasattr(output, "logits") else output
+
+            @staticmethod
+            def _release_preprocessed_inputs(request):
+                request.pixel_values = None
+                request.attention_mask = None
+                request.image_grid_thw = None
+                request.extra_kwargs.clear()
 
             def _preprocess_request(self, request):
                 """0.6.0's control flow: the text-only early return, process_image_input per image, the pixel
@@ -710,6 +946,14 @@ VISION_FAKE = {
                         continue
                     ok.append(req)
                 for req in ok:
+                    if not req.is_text_only:                   # a cache miss: the media prefill (2233-2261)
+                        cache = PromptCache()
+                        try:
+                            logits = self._run_vision_encoding(req, cache=cache)
+                        except PrefillAbortedError:
+                            self.errors.append((req.request_id, "PrefillAbortedError", ""))
+                            continue
+                        self.prefilled[req.request_id] = (cache, logits.tolist()[0][-1], logits.shape)
                     self.encoded.append(req.request_id)
                 return ok
         '''),
@@ -721,10 +965,16 @@ VISION_FAKE = {
     "PIL/__init__.py": "",
     "PIL/Image.py": "MAX_IMAGE_PIXELS = 89478485\n\nclass DecompressionBombWarning(RuntimeWarning):\n    pass\n",
 }
+DIMS = {k: local_governor.VISION_DEFAULTS[k] for k in (*local_governor.VISION_DIM_KEYS, "act_bytes")}
+DIMS_ARG = ",".join(f"{k}={v}" for k, v in DIMS.items())
 VISION_ARGS = ["--vision", "--max-images", "5", "--image-tokens", "1024", "--image-context-tokens", "4096",
-               "--max-image-bytes", str(5 * 2 ** 20), "--max-image-pixels", str(32 * 2 ** 20)]
+               "--max-image-bytes", str(5 * 2 ** 20), "--max-image-pixels", str(32 * 2 ** 20),
+               "--image-prefill-tokens", "256", "--image-dims", DIMS_ARG]
+TEXT_CONFIG = {k: DIMS[k] for k in DIMS if not k.startswith("vision_") and k != "act_bytes"}
 QWEN_CONFIG = {"model_type": "qwen3_5", "architectures": ["Qwen3_5ForConditionalGeneration"],
-               "vision_config": {"depth": 27}}
+               "text_config": {**TEXT_CONFIG, "dtype": "bfloat16", "num_hidden_layers": 64},
+               "vision_config": {"depth": 27, "hidden_size": DIMS["vision_hidden_size"],
+                                 "intermediate_size": DIMS["vision_intermediate_size"]}}
 
 
 def prompt_for(n_images, text="describe"):
@@ -758,6 +1008,13 @@ class VisionGuardBase(GuardBase):
     def _sha(self, pkg, rel):
         return hashlib.sha256((Path(self.dir) / pkg / rel).read_bytes()).hexdigest()
 
+    def _fresh(self):
+        """Every fake module unimported (sys.path kept): the next import is unpatched."""
+        import sys
+        for name in list(sys.modules):
+            if name.split(".")[0] in ("vllm_mlx", "fastapi", "mlx_vlm", "PIL", "cortados_image_check"):
+                del sys.modules[name]
+
     def _unimport(self):
         super()._unimport()
         import sys
@@ -767,7 +1024,7 @@ class VisionGuardBase(GuardBase):
 
     def policy(self, **kw):
         args = dict(max_images=5, image_tokens=1024, image_context_tokens=4096, max_image_bytes=5 * 2 ** 20,
-                    max_image_pixels=32 * 2 ** 20)
+                    max_image_pixels=32 * 2 ** 20, prefill_tokens=64, dims=DIMS)
         args.update(kw)
         return self.guard.VisionPolicy(**args)
 
@@ -1048,6 +1305,140 @@ class GuardVisionPreparedTests(VisionGuardBase):
         self.assertEqual((g.encoded, req.input_ids.value, req.pixel_values), ([rid], [list(b"hello")], None))
 
 
+class GuardMediaPrefillTests(VisionGuardBase):
+    """The media prefill (MLLMBatchGenerator._run_vision_encoding): chunked, one position's logits kept."""
+
+    def queued(self, s, text="describe", raw=None, max_tokens=100):
+        return s.add_request(prompt_for(1, text), images=[data_url(raw or png(640, 480))], max_tokens=max_tokens)
+
+    def atomic(self, g, s, rid):
+        """The released forward on an identical request: the original _run_vision_encoding, unguarded."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, PromptCache
+        req = self.batch(s, rid)
+        g._preprocess_request(req)
+        cache = PromptCache()
+        logits = MLLMBatchGenerator._run_vision_encoding.__wrapped__(g, req, cache=cache)
+        return cache, logits
+
+    def test_logits_are_computed_only_for_the_kept_position_and_the_result_is_the_atomic_one(self):
+        from vllm_mlx import mllm_batch_generator as mbg
+        s, g = self.vision()                                                  # prefill_tokens 64
+        rid = self.queued(s, text="x" * 200)
+        req = self.batch(s, rid)
+        lm = g.model.language_model
+        evals, cleared = len(mbg.EVALS), mbg.mx.cleared
+        g._process_prompts([req])
+        self.assertEqual((g.errors, g.encoded), ([], [rid]))
+        cache, last_row, shape = g.prefilled[rid]
+        calls = list(lm.calls)
+        P = cache.offset
+        self.assertGreater(P, 300)                                            # several chunks
+        self.assertEqual(shape, (1, 1, 7))                                    # one position's logits, never P
+        self.assertTrue(all(c["keep"] == 1 for c in calls))                   # asked of the model on every chunk
+        self.assertEqual([c["n"] for c in calls], [64] * (P // 64) + ([P % 64] if P % 64 else []))
+        self.assertEqual([c["offset"] for c in calls], list(range(0, P, 64)))
+        # the embeddings once over the whole prompt (vision tower + merge), with the request's pixels and grid
+        (n, pixels, kw), = g.model.embedded
+        self.assertEqual((n, pixels is not None, kw), (P, True, ["attention_mask", "image_grid_thw"]))
+        # each chunk got its slice of the full prompt's mRoPE positions and the atomic call's other kwargs
+        full = [[[p + 1000 * a for p in range(P)]] for a in range(3)]
+        for c in calls:
+            o, k = c["offset"], c["n"]
+            self.assertEqual(c["positions"], [[row[0][o:o + k]] for row in full])
+            self.assertEqual(c["embeds"], (1, k, 1))
+            self.assertEqual(c["kwargs"], ["image_grid_thw", "logits_to_keep", "pixel_values", "position_ids",
+                                          "rope_deltas"])
+        self.assertEqual(lm._rope_deltas, "rope-deltas")                      # what _capture_dense_rope_delta reads
+        self.assertEqual(len(mbg.EVALS) - evals, len(calls) - 1)              # the lazy graph cut between chunks
+        self.assertEqual(mbg.mx.cleared - cleared, len(calls) - 1)
+        self.assertEqual((req.pixel_values, req.image_grid_thw, req.extra_kwargs), (None, None, {}))
+        self.assertTrue(req.vision_encoded)
+        # the released forward on the same request: every position projected; the kept row and the cache are its
+        lm.calls.clear()
+        ref_cache, ref = self.atomic(g, s, self.queued(s, text="x" * 200))
+        (atomic_call,) = lm.calls
+        self.assertIsNone(atomic_call["keep"])
+        self.assertEqual(ref.shape, (1, P, 7))
+        self.assertEqual(ref.tolist()[0][-1], last_row)
+        self.assertEqual(ref_cache.tokens, cache.tokens)                      # every position written either way
+
+    def test_a_prompt_within_one_chunk_is_the_atomic_call_keeping_one_position(self):
+        s, g = self.vision(prefill_tokens=4096)
+        rid = self.queued(s)
+        g._process_prompts([self.batch(s, rid)])
+        (call,) = g.model.language_model.calls
+        cache, _, shape = g.prefilled[rid]
+        self.assertEqual((call["n"], call["offset"], call["keep"], shape), (cache.offset, 0, 1, (1, 1, 7)))
+
+    def test_the_reviewers_60k_token_prompt_with_a_tiny_image(self):
+        s, g = self.vision(context=131072, image_context_tokens=65536, prefill_tokens=256)
+        rid = self.queued(s, text="a" * 60_000, raw=png(16, 16), max_tokens=1000)   # both layers admit it
+        req = self.batch(s, rid)
+        g._process_prompts([req])
+        self.assertEqual(g.errors, [])
+        cache, _, shape = g.prefilled[rid]
+        calls = g.model.language_model.calls
+        self.assertGreater(cache.offset, 60_000)
+        self.assertEqual(shape, (1, 1, 7))
+        self.assertTrue(all(c["keep"] == 1 and c["n"] <= 256 for c in calls))
+        self.assertEqual(sum(c["n"] for c in calls), cache.offset)
+
+    def test_logits_for_more_than_the_kept_position_are_refused(self):
+        s, g = self.vision()
+        lm = g.model.language_model
+        real = type(lm).__call__
+
+        def ignores_keep(self_, inputs, **kw):
+            kw.pop("logits_to_keep", None)
+            return real(self_, inputs, **kw)
+        with patch.object(type(lm), "__call__", ignores_keep), self.assertRaisesRegex(RuntimeError, "not the one"):
+            g._process_prompts([self.batch(s, self.queued(s))])
+
+    def test_an_abort_stops_the_prefill_before_the_next_chunk(self):
+        s, g = self.vision()
+        rid = self.queued(s)
+        g._aborted_request_ids.add(rid)
+        g._process_prompts([self.batch(s, rid)])
+        self.assertEqual((g.errors, g.model.language_model.calls, g._aborted_request_ids),
+                         ([(rid, "PrefillAbortedError", "")], [], set()))
+
+    def test_text_only_requests_do_not_take_the_media_prefill(self):
+        s, g = self.vision()
+        rid = s.add_request("hello", max_tokens=10)
+        g._process_prompts([self.batch(s, rid)])
+        self.assertEqual((g.encoded, g.prefilled, g.model.embedded, g.model.language_model.calls),
+                         ([rid], {}, [], []))
+
+    def test_a_drifted_prefill_seam_stops_startup(self):
+        from vllm_mlx import mllm_batch_generator as mbg
+        for name in ("_eval_prompt_cache", "PrefillAbortedError", "mx"):
+            with self.subTest(name), patch.object(mbg, name, None), self.assertRaises(self.guard.GuardError):
+                self.guard.media_prefill_seam(mbg.MLLMBatchGenerator)
+        for attr in ("_run_vision_encoding", "_release_preprocessed_inputs"):
+            with self.subTest(attr):
+                cls = type("Drifted", (), {k: v for k, v in vars(mbg.MLLMBatchGenerator).items() if k != attr})
+                cls.__module__ = mbg.__name__
+                with self.assertRaises(self.guard.GuardError):
+                    self.guard.media_prefill_seam(cls)
+        with patch.object(mbg, "_eval_prompt_cache", None), self.assertRaises(self.guard.GuardError):
+            self.vision()                                                     # install_vision refuses as a whole
+        self.assertFalse(getattr(mbg.MLLMBatchGenerator._preprocess_request, "__cortados_guard__", False))
+
+    def test_the_generator_refuses_a_model_that_is_not_qwen3_5_s(self):
+        s, g = self.vision()
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+        from mlx_vlm.models.qwen3_5.qwen3_5 import Model, OtherModel
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+        p = s.processor
+        with self.assertRaises(self.guard.GuardError):
+            MLLMBatchGenerator(OtherModel(), p)
+        m = Model()
+        m.language_model = object()
+        with self.assertRaises(self.guard.GuardError):
+            MLLMBatchGenerator(m, p)
+        self.assertIsNotNone(Qwen3VLProcessor)
+
+
 class GuardVisionStartupTests(VisionGuardBase):
     SERVE_VISION = ["--context-tokens", "131072", *VISION_ARGS, "--", "serve", None, "--continuous-batching"]
 
@@ -1096,6 +1487,15 @@ class GuardVisionStartupTests(VisionGuardBase):
             self.assertTrue(table and all(len(v) == 64 and int(v, 16) >= 0 for v in table.values()))
         self.assertIn("mllm_batch_generator.py", real.VISION_PINNED_SHA256)
         self.assertIn("models/qwen3_vl/processing_qwen3_vl.py", real.MLX_VLM_PINNED_SHA256)
+        # the media prefill's seam: Model.__call__ / masked_scatter, the language model, project_logits
+        self.assertEqual(real.MLX_VLM_PINNED_SHA256["models/qwen3_vl/qwen3_vl.py"],
+                         "12f0393421918eb1cbaa6daa447d93a405762e997f688676688e5c71d987d3ee")
+        self.assertEqual(real.MLX_VLM_PINNED_SHA256["models/qwen3_5/language.py"],
+                         "9cd5b798c183ac70d6c4ba0bdfabb04d1da126cd133e25089958d24d674cadac")
+        self.assertEqual(real.MLX_VLM_PINNED_SHA256["models/base.py"],
+                         "c75bf1f678270f33acae85a0ed7cbc6b656f51cac6664ecd8a4b23344f46a6cf")
+        self.assertEqual(real.VISION_PINNED_SHA256["mllm_batch_generator.py"],
+                         "592e1955cd00fd997ab52bf841b61cc5ee8c21871b0268b4545b8db0cd830e98")
         # the text route's pins are the same wheel: scheduler.py and engine/batched.py unchanged
         self.assertEqual(real.PINNED_SHA256["scheduler.py"],
                          "6fa94c0af2c4d653290a7cdfa8a1bf63c1d54a2017e2b300e7fa8cea3d24b6be")
@@ -1135,6 +1535,35 @@ class GuardVisionStartupTests(VisionGuardBase):
         with self.assertRaises(self.guard.GuardError):
             mllm_scheduler.MLLMScheduler(model=Model(), processor=Qwen3VLProcessor(), draft_model=object())
 
+    def test_a_model_whose_dimensions_differ_from_the_reservation_s_is_not_served(self):
+        from vllm_mlx.api import utils
+        cases = {"wider": {**QWEN_CONFIG, "text_config": {**QWEN_CONFIG["text_config"], "intermediate_size": 25600}},
+                 "tower": {**QWEN_CONFIG, "vision_config": {**QWEN_CONFIG["vision_config"], "hidden_size": 1280}},
+                 "no-head-dim": {**QWEN_CONFIG, "text_config": {k: v for k, v in QWEN_CONFIG["text_config"].items()
+                                                                if k != "head_dim"}},
+                 "float32": {**QWEN_CONFIG, "text_config": {**QWEN_CONFIG["text_config"], "dtype": "float32"}},
+                 "odd-dtype": {**QWEN_CONFIG, "torch_dtype": "float8"}}
+        for name, cfg in cases.items():
+            with self.subTest(name):
+                self._fresh()                                                 # a fresh, unpatched vllm-mlx each time
+                from vllm_mlx.api import utils
+                d = self.models / name
+                d.mkdir()
+                (d / "config.json").write_text(json.dumps(cfg))
+                utils.MLLM.add(str(d))
+                self.assertEqual(self.run_main(["--check", str(d), *VISION_ARGS])[0], 2)
+                with self.assertRaises(SystemExit) as cm:
+                    self.run_main(self.serve(str(d)))
+                self.assertIn("config.json", str(cm.exception))
+        self._fresh()
+        from vllm_mlx.api import utils
+        d = self.models / "no-dtype"                                          # a config without a dtype is taken
+        d.mkdir()
+        cfg = {**QWEN_CONFIG, "text_config": {k: v for k, v in QWEN_CONFIG["text_config"].items() if k != "dtype"}}
+        (d / "config.json").write_text(json.dumps(cfg))
+        utils.MLLM.add(str(d))
+        self.assertEqual(self.run_main(["--check", str(d), *VISION_ARGS])[0], 0)
+
     def test_bad_vision_command_lines_are_refused(self):
         for argv in (["--context-tokens", "131072", "--vision", "--", "serve", "/m", "--continuous-batching"],
                      ["--context-tokens", "131072", "--max-images", "5", "--", "serve", "/m",
@@ -1143,7 +1572,16 @@ class GuardVisionStartupTests(VisionGuardBase):
                       "--continuous-batching"],
                      ["--context-tokens", "131072", "--vision", "--max-images", "5", "--image-tokens", "9000",
                       "--image-context-tokens", "4096", "--max-image-bytes", "1", "--max-image-pixels", "1", "--",
-                      "serve", "/m", "--continuous-batching"]):
+                      "serve", "/m", "--continuous-batching"],
+                     ["--context-tokens", "131072", *VISION_ARGS[:-2], "--", "serve", "/m", "--continuous-batching"],
+                     ["--context-tokens", "131072", *VISION_ARGS[:-1], DIMS_ARG.replace("hidden_size=5120,", ""),
+                      "--", "serve", "/m", "--continuous-batching"],
+                     ["--context-tokens", "131072", *VISION_ARGS[:-1], DIMS_ARG + ",extra=1", "--", "serve", "/m",
+                      "--continuous-batching"],
+                     ["--context-tokens", "131072", *VISION_ARGS[:-1], "hidden_size:5120", "--", "serve", "/m",
+                      "--continuous-batching"],
+                     ["--context-tokens", "131072", *VISION_ARGS[:-3], "9000", *VISION_ARGS[-2:], "--", "serve",
+                      "/m", "--continuous-batching"]):
             with self.subTest(argv):
                 self.assertEqual(self.run_main(argv)[0], 2)
 
@@ -1166,7 +1604,7 @@ class VisionBackendConfigTests(unittest.TestCase):
         self.assertEqual(argv[2:cut], ["--context-tokens", "131072", "--vision", "--max-images", "5",
                                        "--image-tokens", "1024", "--image-context-tokens", "65536",
                                        "--max-image-bytes", str(5 * 2 ** 20), "--max-image-pixels",
-                                       str(32 * 2 ** 20)])
+                                       str(32 * 2 ** 20), "--image-prefill-tokens", "256", "--image-dims", DIMS_ARG])
         paths = local_backend.install_paths(c)
         self.assertTrue(paths["image_check"].endswith("/bin/cortados_image_check.py"))
         self.assertEqual(Path(paths["image_check_source"]), ROOT / "cortados_router" / "image_check.py")

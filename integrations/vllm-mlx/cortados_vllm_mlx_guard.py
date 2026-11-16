@@ -60,11 +60,17 @@ grid_h x grid_w / 4 tokens (mlx-vlm 0.7.12 processing_qwen3_vl.py 892-904). So t
     prefill: the actual P, and the placeholders, image_grid_thw rows and pixel rows must agree (the qwen3_5 merge
     raises inside prefill on a mismatch, which fails every request of that batch). A refusal releases the request's
     tensors and fails it alone (_process_prompts' per-request error path, line 1876-1903).
+  * the prefill, MLLMBatchGenerator._run_vision_encoding (the one forward of an image-bearing prompt, upstream atomic
+    and projecting every position to the vocabulary): replaced by media_prefill, chunked (--image-prefill-tokens) with
+    logits_to_keep=1, so its memory is the computed bound the gate reserves (local_governor.image_prefill_bytes; the
+    argument is at media_prefill below). --image-dims carries the model dimensions that bound was computed from, and
+    startup stops unless config.json has exactly those.
 Also: the processor's max_pixels set to image_tokens x 1,024 (upstream allows 16.7 MP = 16,384 tokens per image);
 process_image_input takes checked data: URLs only (no download, no unbounded base64 temp-file cache) and its temp
 files are removed after preprocessing; VisionEmbeddingCache (count-only, 100/50 entries) is disabled; PIL's bomb limit
 is the pixel bound; drafters and specprefill are refused; and only a model dir whose config.json is qwen3_5 /
-Qwen3_5ForConditionalGeneration with a vision_config may serve. The text Scheduler refuses every request in this mode.
+Qwen3_5ForConditionalGeneration with a vision_config (and the --image-dims dimensions) may serve. The text Scheduler
+refuses every request in this mode.
 Pinned on top: the MLLM files of vllm-mlx 0.6.0 (VISION_PINNED_SHA256) and mlx-vlm 0.7.12 (MLX_VLM_PINNED_SHA256).
 
 Pinned: vllm-mlx 0.6.0 (`vllm_mlx.__version__`) and the sha256 of the files the argument above reads
@@ -291,6 +297,9 @@ MLX_VLM_PINNED_SHA256 = {
     "utils.py": "d67f2f49bff354bad36cc4adebb375ad0bcee5fbca74976b5fcda29ef4e78c5e",
     "models/base.py": "c75bf1f678270f33acae85a0ed7cbc6b656f51cac6664ecd8a4b23344f46a6cf",
     "models/qwen3_vl/processing_qwen3_vl.py": "bbd3c89872bef5741865ba8397aad184466cdf5a36d84c0b0a48cc5bb5f5fb5d",
+    # Model.__call__ (qwen3_vl.py 215-236), which qwen3_5.Model inherits: get_input_embeddings, then the language
+    # model with **kwargs (so logits_to_keep reaches it); and masked_scatter (14-32), the merge the media prefill runs.
+    "models/qwen3_vl/qwen3_vl.py": "12f0393421918eb1cbaa6daa447d93a405762e997f688676688e5c71d987d3ee",
     "models/qwen3_5/__init__.py": "d5a1cf335ae0845d0033dcc77dfdd6174f801aa77375cd8d57d69bc0c26f3d2b",
     "models/qwen3_5/qwen3_5.py": "7c0e360a35e1f5d3819677cd6f7e4d7349f4f3dd2fad5fc8f1e374bd514e8f1b",
     "models/qwen3_5/vision.py": "a1db23800b564caaedcc79d6a27d76e3186b9315cb68b612d61afbfa69487600",
@@ -301,6 +310,7 @@ VISION_MODEL_TYPE = "qwen3_5"
 VISION_ARCHITECTURES = ["Qwen3_5ForConditionalGeneration"]
 # The runtime classes the argument was read against (module, class name).
 VISION_MODEL_CLASS = ("mlx_vlm.models.qwen3_5.qwen3_5", "Model")
+VISION_LANGUAGE_CLASS = ("mlx_vlm.models.qwen3_5.language", "LanguageModel")
 VISION_PROCESSOR_CLASS = ("mlx_vlm.models.qwen3_vl.processing_qwen3_vl", "Qwen3VLProcessor")
 VISION_IMAGE_PROCESSOR_CLASS = ("mlx_vlm.models.qwen3_vl.processing_qwen3_vl", "Qwen3VLImageProcessor")
 # Qwen3.5's vision geometry: 16-pixel patches merged 2 x 2 (1,024 pixels per token), stills duplicated over T = 2.
@@ -313,7 +323,28 @@ PREPARED_REFUSAL = "cortados guard: prepared multimodal input refused"
 TEXT_ROUTE_REFUSAL = "cortados guard: vision mode serves through the MLLM scheduler only"
 VISION_FLAGS = {"--max-images": "max_images", "--image-tokens": "image_tokens",
                 "--image-context-tokens": "image_context_tokens", "--max-image-bytes": "max_image_bytes",
-                "--max-image-pixels": "max_image_pixels"}
+                "--max-image-pixels": "max_image_pixels", "--image-prefill-tokens": "prefill_tokens"}
+# --image-dims k=v,...: the model dimensions the gate's reservation was computed from (local_governor.VISION_DIM_KEYS
+# and act_bytes, image_prefill_bytes); checked against the model's config.json at startup (check_vision_model).
+DIMS_FLAG = "--image-dims"
+# Each name, where config.json holds it: (sub-config, key).
+IMAGE_DIMS = {
+    "hidden_size": ("text_config", "hidden_size"),
+    "intermediate_size": ("text_config", "intermediate_size"),
+    "num_attention_heads": ("text_config", "num_attention_heads"),
+    "num_key_value_heads": ("text_config", "num_key_value_heads"),
+    "head_dim": ("text_config", "head_dim"),
+    "linear_num_key_heads": ("text_config", "linear_num_key_heads"),
+    "linear_num_value_heads": ("text_config", "linear_num_value_heads"),
+    "linear_key_head_dim": ("text_config", "linear_key_head_dim"),
+    "linear_value_head_dim": ("text_config", "linear_value_head_dim"),
+    "vocab_size": ("text_config", "vocab_size"),
+    "vision_hidden_size": ("vision_config", "hidden_size"),
+    "vision_intermediate_size": ("vision_config", "intermediate_size"),
+}
+DIMS_KEYS = (*IMAGE_DIMS, "act_bytes")
+# Bytes per element of the dtypes a config.json may name (the activations are computed in it).
+DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "float32": 4}
 
 
 class VisionInputRefused(ValueError):
@@ -324,15 +355,23 @@ class VisionPolicy:
     """The still-image policy the guard enforces (local_backend.vision_argv passes the model entry's `vision`)."""
 
     def __init__(self, max_images: int, image_tokens: int, image_context_tokens: int, max_image_bytes: int,
-                 max_image_pixels: int):
+                 max_image_pixels: int, prefill_tokens: int, dims: dict | None = None):
         self.max_images, self.image_tokens = max_images, image_tokens
         self.image_context_tokens = image_context_tokens
         self.max_image_bytes, self.max_image_pixels = max_image_bytes, max_image_pixels
+        self.prefill_tokens = prefill_tokens
         for k, v in vars(self).items():
             if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
                 raise GuardError(f"vision: {k} must be a positive integer, got {v!r}")
         if image_tokens >= image_context_tokens:
             raise GuardError("vision: --image-tokens must be below --image-context-tokens")
+        if prefill_tokens > image_context_tokens:
+            raise GuardError("vision: --image-prefill-tokens must not exceed --image-context-tokens")
+        dims = dict(dims or {})
+        if sorted(dims) != sorted(DIMS_KEYS) or any(isinstance(v, bool) or not isinstance(v, int) or v <= 0
+                                                    for v in dims.values()):
+            raise GuardError(f"vision: {DIMS_FLAG} needs exactly {', '.join(DIMS_KEYS)} as positive integers")
+        self.dims = dims
 
     @property
     def max_pixels(self) -> int:
@@ -355,6 +394,9 @@ def parse_vision(args: list[str]) -> tuple["VisionPolicy | None", list[str]]:
                 raise GuardError(f"{a} needs a positive integer")
             got[VISION_FLAGS[a]] = int(args[i + 1])
             i += 1
+        elif a == DIMS_FLAG:
+            got["dims"] = parse_dims(args[i + 1] if i + 1 < len(args) else "")
+            i += 1
         else:
             rest.append(a)
         i += 1
@@ -362,15 +404,29 @@ def parse_vision(args: list[str]) -> tuple["VisionPolicy | None", list[str]]:
         if got:
             raise GuardError("image flags need --vision")
         return None, rest
-    missing = [f for f, k in VISION_FLAGS.items() if k not in got]
+    missing = [f for f, k in [*VISION_FLAGS.items(), (DIMS_FLAG, "dims")] if k not in got]
     if missing:
         raise GuardError(f"--vision needs {', '.join(missing)}")
     return VisionPolicy(**got), rest
 
 
-def check_vision_model(model_dir: Any) -> None:
+def parse_dims(text: str) -> dict:
+    """--image-dims' value, `name=N,name=N,...`, as a dict (VisionPolicy checks the names). GuardError if malformed."""
+    out = {}
+    for part in text.split(","):
+        name, eq, value = part.partition("=")
+        if not eq or not value.isdigit() or name in out:
+            raise GuardError(f"{DIMS_FLAG} takes name=N,name=N,... (got {text!r})")
+        out[name] = int(value)
+    return out
+
+
+def check_vision_model(model_dir: Any, dims: dict | None = None) -> None:
     """GuardError unless the model directory's config.json is the verified route: model_type qwen3_5,
-    architectures [Qwen3_5ForConditionalGeneration] and a vision_config (the tower)."""
+    architectures [Qwen3_5ForConditionalGeneration] and a vision_config (the tower). With `dims` (the policy's
+    --image-dims): every dimension the gate's image reservation was computed from equals config.json's, and the
+    config's dtype (when it names one) is no wider than the act_bytes counted; a different model needs its
+    reservation recomputed, so vision mode does not start on it."""
     import json
     path = os.path.join(str(model_dir), "config.json")
     try:
@@ -382,6 +438,22 @@ def check_vision_model(model_dir: Any) -> None:
             or cfg.get("architectures") != VISION_ARCHITECTURES or not isinstance(cfg.get("vision_config"), dict):
         raise GuardError(f"vision mode serves only {VISION_MODEL_TYPE} / {VISION_ARCHITECTURES[0]} with a "
                          "vision_config; this model is not that route")
+    if dims is None:
+        return
+    for name, (section, key) in IMAGE_DIMS.items():
+        sub = cfg.get(section)
+        got = sub.get(key) if isinstance(sub, dict) else None
+        if got != dims[name]:
+            raise GuardError(f"vision mode: config.json {section}.{key} is {got!r}, but the gate's image reservation "
+                             f"was computed for {dims[name]} ({DIMS_FLAG} {name}); recompute it for this model")
+    text = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
+    for where in (text, cfg):
+        dtype = where.get("dtype", where.get("torch_dtype"))
+        if dtype is None:
+            continue
+        if DTYPE_BYTES.get(dtype, 0) == 0 or DTYPE_BYTES[dtype] > dims["act_bytes"]:
+            raise GuardError(f"vision mode: config.json's dtype {dtype!r} is not covered by act_bytes "
+                             f"{dims['act_bytes']}")
 
 
 def verify_vision(vllm_dir: str, vlm_dir: str, vlm_version: str, pins: dict | None = None,
@@ -551,9 +623,12 @@ def install_vision(context_tokens: int, policy: VisionPolicy, *, mllm_scheduler_
                    image temp files removed however it ends;
       decode       models.mllm.process_image_input: checked data: URLs only, inside layer 2 only, to a private temp
                    file per call (no URL download, no unbounded base64 file cache);
-      caches       VisionEmbeddingCache built disabled (and MLLMBatchGenerator's instance disabled again)."""
+      caches       VisionEmbeddingCache built disabled (and MLLMBatchGenerator's instance disabled again);
+      prefill      MLLMBatchGenerator._run_vision_encoding (the one media prefill): chunked, and only the last
+                   position projected to the vocabulary (media_prefill and the "Media prefill" comment above it)."""
     if getattr(mllm_scheduler_cls.add_request, "__cortados_guard__", False):
         raise GuardError("the vision guard is already installed")
+    seam = media_prefill_seam(batch_generator_cls)          # before anything is patched: a drifted seam stops here
     import tempfile
     import threading
     tmp = tmp_dir or tempfile.mkdtemp(prefix="cortados-vision-")     # 0700
@@ -572,7 +647,7 @@ def install_vision(context_tokens: int, policy: VisionPolicy, *, mllm_scheduler_
             raise SystemExit("cortados-vllm-mlx-guard: vision mode, but this model resolves to the text route; serve "
                              "the vision model folder or drop the model entry's `vision` block")
         try:
-            check_vision_model(resolved_path or model_name)
+            check_vision_model(resolved_path or model_name, policy.dims)
         except GuardError as exc:
             raise SystemExit(f"cortados-vllm-mlx-guard: {exc}") from None
         return route
@@ -656,6 +731,9 @@ def install_vision(context_tokens: int, policy: VisionPolicy, *, mllm_scheduler_
         ip = getattr(self.processor, "image_processor", None)
         if getattr(ip, "max_pixels", None) != policy.max_pixels:
             raise GuardError("vision mode: the batch generator's processor is not the guarded one")
+        if not _same(self.model, VISION_MODEL_CLASS) \
+                or not _same(getattr(self.model, "language_model", None), VISION_LANGUAGE_CLASS):
+            raise GuardError("vision mode: the batch generator's model is not mlx-vlm's qwen3_5 Model / LanguageModel")
         self._cortados_vision = {"image_token_id": self.processor.image_token_id,
                                  "video_token_id": self.processor.video_token_id, "merge_size": ip.merge_size}
 
@@ -727,6 +805,121 @@ def install_vision(context_tokens: int, policy: VisionPolicy, *, mllm_scheduler_
     process_image_input.__cortados_guard__ = True
     mllm_models.process_image_input = process_image_input
 
+    # prefill -------------------------------------------------------------------------------------------------------
+    def run_vision_encoding(self, request, cache=None):
+        if getattr(self, "_cortados_vision", None) is None:
+            raise VisionInputRefused(f"{PREPARED_REFUSAL} (batch generator not set up by the guard)")
+        return media_prefill(self, request, cache, policy.prefill_tokens, seam)
+
+    run_vision_encoding.__cortados_guard__ = True
+    run_vision_encoding.__wrapped__ = seam["original"]
+    batch_generator_cls._run_vision_encoding = run_vision_encoding
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Media prefill (#125 review round 2). The released route prefills an image-bearing prompt in ONE forward:
+# _process_prompts (mllm_batch_generator.py 2233-2261) sends every media request on a cache miss to
+# _run_vision_encoding (1615-1662), which calls self.model(input_ids, cache=cache, **kwargs) over the whole prompt
+# with no logits_to_keep, so qwen3_5's LanguageModel (language.py 1910-1920) projects EVERY position to the 248,320-
+# word vocabulary (base.py project_logits 64-80 keeps all when logits_to_keep is 0/None) before the scheduler keeps
+# the last row: 27.8 GiB of bfloat16 logits at 60k tokens. Unchunked, its attention (head_dim 256, outside MLX's fused
+# kernel: base.py ensure_fused_sdpa) would also hold heads x P x P scores.
+# The guard replaces _run_vision_encoding with media_prefill, which is mlx-vlm 0.7.12's own chunked VLM prefill
+# (generate/ar.py 422-517, enabled for qwen3_5 by LanguageModel.chunked_prefill_policy, 1487-1507, when there is no
+# drafter, which vision mode refuses) on vllm-mlx's cache and bookkeeping:
+#   1. the embeddings once, exactly as Model.__call__ (qwen3_vl.py 224-233) builds them: get_input_embeddings runs the
+#      vision tower and merges the features (masked_scatter), and its output (inputs_embeds, position_ids,
+#      rope_deltas; attention_mask None) overrides the request's kwargs;
+#   2. the language model over chunks of `step` tokens: input_ids and inputs_embeds sliced, position_ids sliced to the
+#      chunk (the full prompt's mRoPE positions, as vllm-mlx's own chunked text prefill passes them,
+#      _language_model_kwargs 1376-1394), every other kwarg as the atomic call had it, and logits_to_keep=1;
+#      between chunks the cache is evaluated (_eval_prompt_cache, as _run_chunked_text_prefill does, so the lazy
+#      graph never spans the prompt) and MLX's buffer cache cleared (the grown scores and replaced KV buffers);
+#   3. then what the original does after its forward: vision_encoded, the inputs released, the logits returned.
+# Why it is the same result: logits_to_keep slices only the hidden states handed to the vocabulary projection, after
+# the model has run every position and written every position's K/V and recurrent state into the cache (project_logits
+# docstring: "never to caches"); the projection is row-wise, so the kept row is the computation the scheduler's
+# logits[:, -1, :] read from the full matrix (on Metal a one-row matmul may take another kernel than a many-row one,
+# the same rounding-level difference decode has). Chunking is causal attention against the cached keys plus the
+# gated-delta recurrence carried in the cache, the path vllm-mlx's text prefill and mlx-vlm's generate take for this
+# model. A short prompt (one chunk) is the atomic call with logits_to_keep=1. A one-token chunk takes the ordinary
+# forward too: the LanguageModel's one-token shortcut needs a _batch_invariant_decode hook, which neither pinned release
+# sets on qwen3_5 (language.py 1872-1892; only qwen4_exp defines one).
+# The seam is pinned: the files above (mllm_batch_generator.py, qwen3_vl.py, qwen3_5 language.py, base.py) by sha256;
+# media_prefill_seam refuses a generator class without what media_prefill calls; MLLMBatchGenerator.__init__ checks the
+# model is qwen3_5's Model with its LanguageModel; media_prefill refuses logits that are not one position.
+def media_prefill_seam(batch_generator_cls: Any) -> dict:
+    """What media_prefill needs from vllm-mlx's batch generator module, or GuardError (read only)."""
+    original = getattr(batch_generator_cls, "_run_vision_encoding", None)
+    if not callable(original) or getattr(original, "__cortados_guard__", False):
+        raise GuardError("vision mode: MLLMBatchGenerator._run_vision_encoding is missing or already patched: "
+                         "re-read the guard's media prefill argument")
+    if not callable(getattr(batch_generator_cls, "_release_preprocessed_inputs", None)):
+        raise GuardError("vision mode: MLLMBatchGenerator._release_preprocessed_inputs is missing")
+    mod = sys.modules.get(batch_generator_cls.__module__)
+    eval_cache = getattr(mod, "_eval_prompt_cache", None)
+    aborted = getattr(mod, "PrefillAbortedError", None)
+    clear = getattr(getattr(mod, "mx", None), "clear_cache", None)
+    if not callable(eval_cache) or not callable(clear) or not (isinstance(aborted, type)
+                                                               and issubclass(aborted, BaseException)):
+        raise GuardError("vision mode: vllm_mlx.mllm_batch_generator lacks _eval_prompt_cache, PrefillAbortedError or "
+                         "mx.clear_cache: re-read the guard's media prefill argument")
+    return {"original": original, "eval_cache": eval_cache, "aborted": aborted, "clear_cache": clear}
+
+
+def _positions(x: Any, start: int, end: int) -> Any:
+    """Position ids for tokens start..end: the sequence is the LAST axis, (B, P) or mRoPE's (3, B, P) (as
+    _language_model_kwargs slices them, mllm_batch_generator.py 1388-1393)."""
+    return x[:, :, start:end] if x.ndim == 3 else x[:, start:end]
+
+
+def media_prefill(gen: Any, request: Any, cache: Any, step: int, seam: dict) -> Any:
+    """The guarded _run_vision_encoding (comment above): the prompt's embeddings once, then the language model in
+    chunks of `step` tokens with logits_to_keep=1. Returns the (1, 1, vocab) logits of the last position."""
+    if cache is None:
+        raise RuntimeError(f"{PREPARED_REFUSAL} (a media prefill without a prompt cache)")
+    kwargs = dict(request.extra_kwargs)                    # as the original builds them (1633-1640)
+    if request.attention_mask is not None:
+        kwargs["attention_mask"] = request.attention_mask
+    if request.image_grid_thw is not None:
+        kwargs["image_grid_thw"] = request.image_grid_thw
+    pixel_values = request.pixel_values
+    input_ids = request.input_ids
+    if input_ids.ndim == 1:
+        input_ids = input_ids[None, :]
+    model = gen.model
+    feats = model.get_input_embeddings(input_ids, pixel_values, **kwargs)         # qwen3_vl.py 224
+    lm_kwargs = {**kwargs, "pixel_values": pixel_values, **feats.to_dict()}       # qwen3_vl.py 228-233
+    embeds = lm_kwargs.pop("inputs_embeds")
+    positions = lm_kwargs.pop("position_ids")
+    if embeds is None or positions is None:
+        raise RuntimeError(f"{PREPARED_REFUSAL} (the embeddings carry no inputs_embeds or position_ids)")
+    lm_kwargs["logits_to_keep"] = 1
+    lm = model.language_model
+    total = input_ids.shape[1]
+    start, out = 0, None
+    while start < total:
+        if request.request_id in gen._aborted_request_ids:   # a disconnect between chunks (as the text prefill)
+            gen._aborted_request_ids.discard(request.request_id)
+            raise seam["aborted"](request.request_id)
+        end = min(start + step, total)
+        # input_ids (B, P) and inputs_embeds (B, P, hidden): the sequence is axis 1 (generate/ar.py 499-500)
+        out = lm(input_ids[:, start:end], inputs_embeds=embeds[:, start:end], cache=cache,
+                 position_ids=_positions(positions, start, end), **lm_kwargs)
+        start = end
+        gen._prefill_progress[request.request_id] = (start, total)
+        if start < total:
+            seam["eval_cache"](cache)
+            seam["clear_cache"]()
+    del embeds, positions, feats, lm_kwargs
+    request.vision_encoded = True
+    gen._release_preprocessed_inputs(request)             # as the original, after its forward (1653-1656)
+    logits = out.logits if hasattr(out, "logits") else out
+    if logits.ndim != 3 or logits.shape[1] != 1:
+        raise RuntimeError(f"{PREPARED_REFUSAL} (the media prefill returned logits for {logits.shape} positions, "
+                           "not the one kept)")
+    return logits
+
 
 def _vision_modules():
     """vllm-mlx's MLLM modules, mlx-vlm, PIL and the image checker, verified against the vision pins."""
@@ -758,7 +951,7 @@ def _engines():
 def _usage(msg: str) -> int:
     print(f"cortados-vllm-mlx-guard: {msg}\nusage: cortados-vllm-mlx-guard.py --context-tokens N [vision flags] -- serve "
           "<model> [vllm-mlx args]\n       cortados-vllm-mlx-guard.py --check <model dir> [vision flags]\nvision flags: "
-          "--vision " + " N ".join(VISION_FLAGS) + " N", file=sys.stderr)
+          "--vision " + " N ".join(VISION_FLAGS) + f" N {DIMS_FLAG} name=N,...", file=sys.stderr)
     return EXIT_REFUSED
 
 
@@ -775,7 +968,7 @@ def main(argv: list[str] | None = None) -> int:
             check_engines(*_engines())            # the engine refusal would hold on this vllm-mlx (read only)
             if policy is not None:
                 _vision_modules()                 # mlx-vlm's version and the vision pins
-                check_vision_model(argv[1])
+                check_vision_model(argv[1], policy.dims)
             route = api_utils.resolve_mllm_route(argv[1], argv[1])
         except GuardError as exc:
             print(f"cortados-vllm-mlx-guard: {exc}", file=sys.stderr)
@@ -831,7 +1024,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cortados-vllm-mlx-guard: {exc}", file=sys.stderr)
         return EXIT_REFUSED
     what = (f"; vision: {policy.max_images} images of at most {policy.image_tokens} tokens, image requests capped at "
-            f"{policy.image_context_tokens}" if policy is not None else "")
+            f"{policy.image_context_tokens}, media prefill in chunks of {policy.prefill_tokens} keeping one position's "
+            "logits" if policy is not None else "")
     print(f"cortados-vllm-mlx-guard: prompt + max_tokens capped at {own[1]} tokens (vllm-mlx {VLLM_MLX_VERSION})"
           f"{what}", file=sys.stderr)
     from vllm_mlx import cli

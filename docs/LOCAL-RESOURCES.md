@@ -1124,7 +1124,9 @@ the example's `qwen-27b-4bit-vision` entry repeats them):
 | `image_tokens_max` | 1,024 | tokens per image: ~1 MP after the processor's resize (1,024 pixels per token); the guard sets the processor's `max_pixels` to 1,048,576 (upstream: 16.7 MP = 16,384 tokens) |
 | `image_context_tokens` | 65,536 | input + max_tokens of an image-bearing request, until measured |
 | `image_concurrency` | 1 | image-bearing requests at once, until measured (text turns still run beside it) |
-| `vision_margin_bytes` | 2 GiB | per image-bearing sequence: tower activations and pixel tensors (provisional) |
+| `prefill_chunk_tokens` | 256 | the guard's media prefill chunk (`--image-prefill-tokens`); bounds the attention scores (below) |
+| `score_buffers`, `act_bytes` | 4, 2 | the formula's allocator and dtype counts (below) |
+| model dimensions | Qwen3.8 27B | `hidden_size` 5,120, `intermediate_size` 17,408, 24 attention / 4 KV heads, `head_dim` 256, linear attention 16 key / 48 value heads of 128, `vocab_size` 248,320, tower 1,152 / 4,304; checked against `config.json` at startup (`--image-dims`) |
 | `max_image_bytes` | 5 MiB | encoded bytes per image (the Anthropic API's own limit) |
 | `max_image_pixels` | 32 Mi | decoded pixels per image, read from the header before decoding; PIL's bomb limit is the same |
 
@@ -1139,15 +1141,51 @@ explicitly is the rule). `cortados_router/image_check.py` holds the header check
 five are 320 MiB. An image-bearing request reserves
 
     tokens   = min(text input bound + images x 1,024 + max_tokens, 65,536)
-    reserved = tokens x 65,536 + 0.15 GiB state + 1.5 GiB prefill margin + 2 GiB vision margin
+    reserved = tokens x 65,536 + 0.15 GiB state + image_prefill_bytes(tokens, images)
 
 where the text input bound is "The input bound" with the validated base64 left out (it is not text the model reads; a
-1 MB screenshot is ~1.3 MB of base64 and at most 1,024 tokens). The largest image reservation is 4 GiB + 3.65 GiB =
-7.65 GiB. Beside ~16.5 GiB of weights (15 GiB language + the tower, provisional: measure it) in the 40 GiB budget,
-23.5 GiB remain: with the owner active (2 at once) one image turn at its cap and one 128k text turn (9.65 GiB) together
-reserve 17.3 GiB. The count slot, the bytes and the image slot are taken in one step under one lock
-(`Admission.try_acquire(reserve, image=True)`); busy (529, retryable) and never-fits (413, non-retryable) keep their
-meaning, and a reservation is released however the turn ends.
+1 MB screenshot is ~1.3 MB of base64 and at most 1,024 tokens). `image_prefill_bytes` (`local_governor`) is the
+computed worst case of the guard's media prefill below, not a fixed margin (#125 review round 2 found the fixed
+1.5 + 2 GiB margins far below the released prefill's real peak).
+
+**Why a formula, and which one.** vllm-mlx 0.6.0 prefills an image-bearing prompt in ONE forward
+(`mllm_batch_generator.py` 2233-2261 → `_run_vision_encoding` 1615-1662: `self.model(input_ids, cache=cache, ...)`
+with no `logits_to_keep`), so mlx-vlm 0.7.12's qwen3_5 language model projects EVERY position to the 248,320-word
+vocabulary (`language.py` 1910-1920, `models/base.py` `project_logits` 64-80) before the scheduler keeps the last row:
+27.8 GiB of bfloat16 logits for a ~60k-token prompt with one tiny image, which passed both guard layers and reserved
+7.65 GiB. Unchunked, its full attention (head_dim 256, outside MLX's fused kernel for 64/80/128,
+`models/base.py` `ensure_fused_sdpa`) would also hold heads x P x P scores. So the guard replaces that forward
+("Media prefill" below): chunks of `prefill_chunk_tokens`, the last position's logits only. What remains is bounded
+per term, and the reservation is their sum (P = tokens, C = min(256, P), T = images x 1,024 image tokens, N = 4T vision
+patches, a = 2 bytes; H 5,120, I 17,408, Hq 24, Hkv 4, D 256, linear Kh 16 / Vh 48 of 128, V 248,320, tower Hv 1,152 /
+Iv 4,304):
+
+| term | bytes | what it holds |
+| --- | --- | --- |
+| sequence | P x (3aH + 2H + 64) | the whole prompt's embeddings, live for the whole prefill: `embed_tokens`' output, `masked_scatter`'s merged copy and one more, the image mask broadcast to P x H and its numpy copy, ids and mRoPE position ids |
+| media | T x H x (a + 12) + N x (1,536 x (4 + a) + a x (12 Hv + 2 Iv)) | merged image features and the scatter's int64/uint32 indices; float32 pixel rows and their bf16 copy; one tower block's activations per patch (attention per image is fused: tower head_dim 72 is padded to 80) |
+| kv_regrow | P x 65,536 | `KVCache` grows in 256-token steps by concatenation; the replaced buffers wait in MLX's allocator cache until the guard clears it after each chunk |
+| scores | 4 x Hq x C x P x a + C x P | one chunk's unfused attention against the whole context (q·kᵀ, masked copy, softmax, one held by the allocator) and the causal mask |
+| chunk | 2 x C x a x (3I + max(3 Hq D + 2 Hkv D, 4 (Kh Kd + Vh Vd)) + 4H) | one layer's activations for a chunk (MLP gate/up/product; attention or linear-attention projections; residual and norms), doubled for the allocator |
+| logits | V x (a + 8) | the one kept position's logits and float32 log-probabilities |
+
+At the 64k image context with 5 images: sequence 2.50, media 1.37, kv_regrow 4.00, scores 3.02, chunk 0.10, logits
+0.002 GiB = 11.0 GiB, so the largest image reservation is 4 GiB KV + 0.15 GiB + 11.0 GiB = **15.15 GiB** (the reviewer's
+60k tokens + one image: 13.3 GiB). Beside ~16.5 GiB of weights (15 GiB language + the tower, provisional: measure it) in
+the 40 GiB budget, 23.5 GiB remain: one image turn at its cap fits alone, and beside a full 128k text turn (9.65 GiB)
+the two reserve 24.8 GiB, so with the 16.5 GiB weights estimate they no longer fit together and the second is a
+retryable 529 (with the 15 GiB `weights_bytes` default they do). A request whose reservation exceeds the budget
+beside the weights is never-fits (413, non-retryable): the provider routes it elsewhere. The chunk is the lever: the
+score term is linear in it (1,024 would make it 12 GiB at 64k). The count slot, the bytes and the image slot are taken
+in one step under one lock (`Admission.try_acquire(reserve, image=True)`); busy (529, retryable) and never-fits (413,
+non-retryable) keep their meaning, and a reservation is released however the turn ends. Text-only turns, on either
+model, reserve exactly as before.
+
+**These numbers are a computed bound, not a measurement.** The acceptance gate is the real-model peak measured in the
+hardware test window: the 64k image context with 5 images at ~1 MP, and the reviewer's ~60k tokens + one small image,
+each read as the process's peak footprint (and MLX's `get_peak_memory`) against its reservation. If a measured peak
+exceeds its reservation, the formula's counts (`score_buffers`, the allocator doublings) or the chunk are corrected
+before the vision entry is served; the owner's production switch waits for that measurement anyway.
 
 **The guard's vision mode** (`--vision` and its flags, built by `local_backend.vision_argv` from the model entry). On an
 MLLM model every request, text-only included, goes `BatchedEngine` → `MLLMScheduler` → `MLLMBatchGenerator`, so the text
@@ -1171,7 +1209,19 @@ only after `mlx_vlm.utils.prepare_inputs` expands each image placeholder. The gu
 - decode (`models.mllm.process_image_input`): checked `data:` URLs only, inside layer 2 only, to a private temp file
   removed after preprocessing (upstream downloads http(s) URLs and caches every base64 image as a temp file until exit);
 - caches: `VisionEmbeddingCache` (count-only, 100 / 50 entries) is disabled. The prefix cache serves text-only requests
-  only (`memory_cache.is_text_only_prefix_cache_request`), unchanged.
+  only (`memory_cache.is_text_only_prefix_cache_request`), unchanged;
+- media prefill (`MLLMBatchGenerator._run_vision_encoding`, the one forward of an image-bearing prompt; guard
+  `media_prefill`): mlx-vlm 0.7.12's own chunked VLM prefill (`generate/ar.py` 422-517, which `LanguageModel.
+  chunked_prefill_policy` enables for qwen3_5 without a drafter) on vllm-mlx's cache: the embeddings once, exactly as
+  `Model.__call__` builds them (`qwen3_vl.py` 224-233: tower, merge, mRoPE positions, `rope_deltas`), then the language
+  model over chunks of `--image-prefill-tokens` with `logits_to_keep=1` and the chunk's slice of the positions; the
+  cache evaluated and MLX's buffer cache cleared between chunks; the result checked to be one position. Same result:
+  `logits_to_keep` slices only what the vocabulary projection sees, after every position's K/V and recurrent state is
+  in the cache (`project_logits`: "never to caches"), and the projection is row-wise; chunking is causal attention
+  against cached keys plus the gated-delta state carried in the cache, the path vllm-mlx's text prefill and mlx-vlm's
+  generate take for this model. Pinned: `qwen3_vl.py` joins the mlx-vlm pins, and startup stops unless the generator
+  class has the seam, its module `_eval_prompt_cache` / `PrefillAbortedError` / `mx.clear_cache`, and its model is
+  qwen3_5's `Model` with its `LanguageModel`; `config.json` must have exactly the `--image-dims` the reservation used.
 
 Pinned on top of the text route's pins: vllm-mlx 0.6.0's MLLM files (`VISION_PINNED_SHA256`) and mlx-vlm 0.7.12
 (`MLX_VLM_PINNED_SHA256`, from the PyPI wheel `mlx_vlm-0.7.12-py3-none-any.whl`, sha256 `0412a883…8e37`); any drift stops
@@ -1191,8 +1241,12 @@ selecting the text entry again.
 
 **Not covered yet**: images inside tool results (refused, so Claude Code's image reads go elsewhere); GIF; a client whose
 max_tokens leaves no room under the 64k image context (Claude Code's 32k default leaves ~32k for text and images; a
-larger max_tokens is refused by the guard and the turn routed elsewhere); the vision margin, the tower's resident size
-and the concurrency of one are provisional until measured; layer 2's refusal reaches a client as vllm-mlx's generic
+larger max_tokens is refused by the guard and the turn routed elsewhere); the image reservation's formula, the tower's
+resident size and the concurrency of one are provisional until measured; text-only prompts still prefill through
+vllm-mlx's own chunked text path (1,024-token chunks, last chunk's logits all projected: up to 1,024 x V x 2 = 485 MiB)
+whose unfused attention scores grow with the context (24 x 1,024 x P x 2 bytes per buffer: 6 GiB at 128k) beyond the
+1.5 GiB `prefill_margin_bytes` measured at ~9k tokens: the text reservation's long-context peak is a follow-up, not
+changed here; layer 2's refusal reaches a client as vllm-mlx's generic
 generation error (layer 1 refuses everything layer 2 would, so it is a backstop, not a path).
 
 ### Switch the Pro to MLX
