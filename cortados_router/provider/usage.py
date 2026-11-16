@@ -1,8 +1,9 @@
 """GET /v1/cortados/usage: one cheap JSON view across every resource, for a usage dashboard.
 
 Every source is injectable (tests pass fixtures). Reading is cheap by rule: the cached scarcity.json only (never a
-sample, which opens vendor CLIs), router.db read-only, child-tasks.jsonl and hardware/*.json from the state dir, and
-one short S1 health call. A source that fails is named in `errors`; nothing falls back silently."""
+sample, which opens vendor CLIs), router.db read-only, child-tasks.jsonl from the state dir, the hosts' hardware from
+the live heartbeat board (legacy hardware/*.json files too, where that directory still exists), and one short S1
+health call. A source that fails is named in `errors`; nothing falls back silently."""
 from __future__ import annotations
 
 import json
@@ -386,6 +387,44 @@ def _hw_sample(raw: Any) -> dict[str, Any]:
     return {k: raw[k] for k in _HW_KEYS + ("headroom", "ollama_models", "errors") if k in raw}
 
 
+def _heartbeat_hardware(beats: dict[str, dict[str, Any]], now: float) -> list[dict[str, Any]]:
+    """One card per host whose fresh heartbeat carries hardware (live.fresh_hardware, the live view's own reader of the
+    heartbeat board), in the legacy card shape: `file` is the host's name, `source` "heartbeat". The block is already
+    validated (live.validate_heartbeat); its values still leave only through the publish pass (_HW_CARD)."""
+    from cortados_router.provider import live
+    cards = []
+    for host, hh, age in live.fresh_hardware(beats, now):
+        load = hh.get("load_1m")
+        data = {"host": host, "chip": hh.get("chip"), "sampled_at": hh.get("sampled_at"),
+                "cpu_busy_pct": hh.get("cpu_busy_pct"), "gpu_busy_pct": hh.get("gpu_busy_pct"),
+                "mem_available_bytes": hh.get("mem_available_bytes"), "mem_total_bytes": hh.get("mem_total_bytes"),
+                "load_avg": [load] if _num(load) else None, "disk_free_pct": hh.get("disk_free_pct")}
+        cards.append({"file": host, "source": "heartbeat", "age_s": age,
+                      "data": {k: v for k, v in data.items() if v is not None}})
+    return cards
+
+
+def _hardware_view(state_dir: Path, beats: dict[str, dict[str, Any]], now: float, errors: list) -> list[dict[str, Any]]:
+    """The Usage view's hardware cards: every host's fresh heartbeat hardware first, then the legacy hardware/<host>.json
+    files (written by the retired `hardware.py sample --out` job) only when that directory exists, minus a file whose
+    host a heartbeat card already shows. A missing legacy directory is not an error. With no card at all (no fresh
+    heartbeat carrying hardware and no legacy card) the one error says what is missing, never `absent`."""
+    from cortados_router.provider import live
+    cards = _heartbeat_hardware(beats, now)
+    hw = state_dir / "hardware"
+    if hw.is_dir():
+        shown: dict[str, set[str]] = {c["file"]: set() for c in cards}
+        for c in _hardware(hw, now, errors):
+            host = (c.get("data") or {}).get("host")
+            if not (shown and isinstance(host, str) and live._match(host, shown)):
+                cards.append({**c, "source": "file"})
+    if not cards:
+        ttls = [hb["ttl_s"] for hb in beats.values() if isinstance(hb, dict) and _num(hb.get("ttl_s"))]
+        mins = max(1, round(max(ttls, default=live.TTL_DEFAULT_S) / 60))
+        errors.append({"source": "hardware", "error": f"no host has sent hardware in the last {mins} min"})
+    return cards
+
+
 def _hardware(d: Path, now: float, errors: list) -> list[dict[str, Any]]:
     try:   # Path.glob swallows a listing OSError, which would look exactly like "no samples yet"
         files = [p for p in (d / n for n in os.listdir(d)) if p.suffix == ".json"]
@@ -558,6 +597,7 @@ _LANE = _Obj({"lane": _label, "label": _label, "account": _label, "left_pct": _n
               "shared_with": _List(_label, SHARED_MAX, "shared_with_truncated")}, source=("scarcity", "lane"))
 _HW_CARD = _Obj({**{k: _Hw(_text if k in ("host", "os", "chip") else _number) for k in _HW_KEYS},
                  "load_avg": _Hw(_List(_number, LOAD_AVG_LEN, "load_avg_truncated")),
+                 "disk_free_pct": _Hw(_number),   # heartbeat cards only (live_heartbeat.hardware_block)
                  "headroom": _Obj({k: _Hw(_number) for k in _HW_HEADROOM_KEYS}),
                  "ollama_models": _Hw(_List(_Obj({"name": _model_name, "size": _number, "size_vram": _number}),
                                             HW_MODELS_MAX, "models_truncated")),
@@ -593,7 +633,8 @@ _VIEW = _Obj({
                   "by_tool": _COUNTS("by_tool_truncated"), "by_outcome": _COUNTS("by_outcome_truncated"),
                   "unparsable_lines": _number, "truncated": _bool}),
     "s1": _Obj({"available": _bool, "status": _number, "latency_ms": _number, "reason": _label}),
-    "hardware": _List(_Obj({"file": _file, "age_s": _number, "data": _HW_CARD}, source=("hardware", "file")),
+    "hardware": _List(_Obj({"file": _file, "source": _enum("heartbeat", "file"), "age_s": _number, "data": _HW_CARD},
+                           source=("hardware", "file")),
                       HW_MAX_FILES, "too_many_files"),
     "notes": _List(_enum(_NOTE_RUNS, _NOTE_REFUSALS), NOTES_MAX, "notes_truncated"),
 })
@@ -702,12 +743,14 @@ def collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], r
             runs_since_start: dict[str, int] | None = None, s1_url: str | None = None,
             s1_probe: Callable[[str | None], dict[str, Any]] = _s1, freshness: Callable | None = None,
             claude_lanes: list[tuple[str, str | None]] | None = None, now: float | None = None,
+            heartbeats: Callable[[], dict[str, dict[str, Any]]] | None = None,
             encoded: bool = False) -> dict[str, Any] | bytes:
     """The published view (a fresh dict), or with encoded=True its strict-JSON bytes (what the endpoint sends: the
-    memo holds the bytes, so a hit serialises nothing)."""
+    memo holds the bytes, so a hit serialises nothing). `heartbeats`: the live heartbeat board's snapshot
+    (live.HeartbeatBoard.snapshot), the hardware cards' source; None reads only legacy hardware files."""
     args = dict(state_dir=state_dir, scarcity_reader=scarcity_reader, refusals=refusals,
                 runs_since_start=runs_since_start, s1_url=s1_url, s1_probe=s1_probe, freshness=freshness,
-                claude_lanes=claude_lanes)
+                claude_lanes=claude_lanes, heartbeats=heartbeats)
     if now is not None:   # tests pass now and never touch the memo
         view = _collect(now=now, **args)
         return _encode(view) if encoded else view
@@ -760,19 +803,17 @@ def collect_live(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any
     out["s1"] = guard("s1", lambda: s1_probe(s1_url), {"available": False, "reason": "probe failed"})
     if not isinstance(out["s1"], dict) or not out["s1"].get("available"):
         errors.append({"source": "s1", "error": str(out["s1"].get("reason") if isinstance(out["s1"], dict) else None)})
+    # Legacy hardware/<host>.json files only, when present: the live view merges each host's heartbeat hardware itself
+    # (live.hosts_section) and reports a host without one there, so a missing directory is no error here.
     hw = state_dir / "hardware"
-    if hw.is_dir():
-        out["hardware"] = guard("hardware", lambda: _hardware(hw, now, errors), [])
-    else:
-        errors.append({"source": "hardware", "error": "absent"})
-        out["hardware"] = []
+    out["hardware"] = guard("hardware", lambda: _hardware(hw, now, errors), []) if hw.is_dir() else []
     return _publish(out, errors)
 
 
 def _collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], refusals: list[dict[str, Any]],
              runs_since_start: dict[str, int] | None, s1_url: str | None, s1_probe: Callable[[str | None], dict[str, Any]],
              freshness: Callable | None, claude_lanes: list[tuple[str, str | None]] | None,
-             now: float) -> dict[str, Any]:
+             now: float, heartbeats: Callable[[], dict[str, dict[str, Any]]] | None = None) -> dict[str, Any]:
     errors: list[dict[str, str]] = []
     notes: list[str] = []
     out: dict[str, Any] = {"generated_at": round(now, 3)}
@@ -831,12 +872,10 @@ def _collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], 
     out["s1"] = guard("s1", lambda: s1_probe(s1_url), {"available": False, "reason": "probe failed"})
     if not isinstance(out["s1"], dict) or not out["s1"].get("available"):
         errors.append({"source": "s1", "error": str(out["s1"].get("reason") if isinstance(out["s1"], dict) else None)})
-    hw = state_dir / "hardware"
-    if hw.is_dir():
-        out["hardware"] = guard("hardware", lambda: _hardware(hw, now, errors), [])
-    else:
-        errors.append({"source": "hardware", "error": "absent"})
-        out["hardware"] = []
+    # hardware: the hosts' heartbeats (live.HeartbeatBoard), plus legacy hardware/<host>.json files where they exist
+    beats = guard("hardware", heartbeats, {}) if heartbeats is not None else {}
+    out["hardware"] = guard("hardware", lambda: _hardware_view(state_dir, beats if isinstance(beats, dict) else {},
+                                                                now, errors), [])
     out["notes"] = notes
     # last step, over the whole view: the declared schema is the only way out (see _publish)
     return _publish(out, errors)

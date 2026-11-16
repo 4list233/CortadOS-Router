@@ -95,7 +95,10 @@ resource in the pool next to subscription "% left".
 - Other OSes: host, load and CPU count are reported; the rest is `{"available": false, "reason": ...}`. Never crashes.
 - Every command has a 4 s timeout, the Ollama fetch 0.5 s per socket operation within a 2 s whole-body budget; each failure is an entry in `errors`.
 - `sample --out` writes `<state dir>/hardware/<host>.json` atomically (state dir per `paths.state_dir()`; 0600 file; only directories it creates are tightened to 0700). `--out PATH` never changes the mode of an existing directory. GPU is read from `ioreg -a` (plist), never the width-clipped text form.
-- Next: the `/resources` snapshot and dashboard show these files per host; later, routing can use `headroom` and
+- No installer schedules `sample --out` any more: each host's live heartbeat (`cortados_router/live_heartbeat.py`)
+  carries the sample, and the dashboard's Usage and Live tabs read it from the provider's heartbeat board; a
+  `hardware/` directory is only read, as a fallback, where it still exists (#123).
+- Next: the `/resources` snapshot shows these samples per host; later, routing can use `headroom` and
   the resident models to decide whether a local lane is worth trying (a loaded model costs no load time). This
   ticket does not wire it into routing or admission.
 

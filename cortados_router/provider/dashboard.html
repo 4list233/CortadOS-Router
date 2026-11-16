@@ -1027,6 +1027,8 @@ function render(d) {
   add(h, s1c);
   add(m, h);
 
+  // Cards: each host's fresh heartbeat hardware (source "heartbeat": file is the host name, load_avg the 1-min load only,
+  // disk_free_pct) and legacy hardware/<host>.json files (source "file") where that directory still exists.
   add(m, section("Hardware"));
   const hw = el("div", "grid");
   (d.hardware || []).forEach(x => { const v = x.data || {};
@@ -1035,7 +1037,8 @@ function render(d) {
       if (typeof v[k] === "number") add(c, el("div", "sub", n + " " + pct(v[k])), bar(v[k])); else hwLine(c, n, v[k]); });
     hwLine(c, "memory available", v.mem_available_bytes, gb);
     hwLine(c, "memory total", v.mem_total_bytes, gb);
-    hwLine(c, "load", v.load_avg, a => Array.isArray(a) ? a.map(n => typeof n === "number" ? n.toFixed(2) : "–").join(" ") : a);
+    hwLine(c, x.source === "heartbeat" ? "load (1 min)" : "load", v.load_avg, a => Array.isArray(a) ? a.map(n => typeof n === "number" ? n.toFixed(2) : "–").join(" ") : a);
+    hwLine(c, "disk free", v.disk_free_pct, pct);
     const hr = v.headroom;
     if (hr && typeof hr === "object") {
       hwLine(c, "free memory", hr.free_mem_gb, n => n + " GB");
@@ -1044,10 +1047,10 @@ function render(d) {
     }
     const om = v.ollama_models;
     if (off(om)) hwLine(c, "Ollama", om);
-    else add(c, el("div", "sub", "Ollama: " + ((om || []).length ? om.map(o => (o && o.name) || "?").join(", ") : "none resident")));
+    else if (x.source !== "heartbeat") add(c, el("div", "sub", "Ollama: " + ((om || []).length ? om.map(o => (o && o.name) || "?").join(", ") : "none resident")));
     (v.errors || []).forEach(e => add(c, el("div", "sub err", "error " + (e.field || "unknown") + ": " + (e.error || "error"))));
     bySrc("hardware/" + x.file).forEach(e => add(c, el("div", "sub err", errText(e))));
-    add(c, el("div", "sub", "sample " + age(x.age_s) + " old"));
+    add(c, el("div", "sub", "sample " + age(x.age_s) + " old" + (x.source === "heartbeat" ? " (heartbeat)" : x.source === "file" ? " (hardware file)" : "")));
     add(hw, c);
   });
   if (!(d.hardware || []).length) {

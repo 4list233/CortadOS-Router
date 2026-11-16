@@ -230,7 +230,7 @@ class CollectTest(unittest.TestCase):
             out = self.collect(home)
         errs = {e["source"]: e["error"] for e in out["errors"]}
         self.assertEqual(errs["child-tasks.jsonl"], "PermissionError")
-        self.assertEqual(errs["hardware"], "PermissionError")              # an unlistable dir is reported, not []
+        self.assertIn({"source": "hardware", "error": "PermissionError"}, out["errors"])   # an unlistable dir is reported, not []
         self.assertIn("router.db", errs)
         self.assertEqual(out["hardware"], [])
         blob = json.dumps(out)
@@ -868,11 +868,122 @@ class EndpointTest(unittest.TestCase):
         self.assertEqual(out["errors"], [{"source": "s1", "error": "test"}])
 
 
+def _board(*beats) -> "live.HeartbeatBoard":
+    """An in-memory heartbeat board holding `beats` as (host, hardware block or None, ttl_s, received_at), each one
+    checked by live.validate_heartbeat first: the fixture is what the provider itself would have stored."""
+    from cortados_router.provider import live
+    board = live.HeartbeatBoard()
+    for host, hw, ttl, at in beats:
+        body = {"host": host, "ttl_s": ttl, "jobs": []}
+        if hw is not None:
+            body["hardware"] = hw
+        hb, bad = live.validate_heartbeat(body, at)
+        assert bad is None, bad
+        board.post(hb, now=at)
+    return board
+
+
+HB_HW = {"cpu_busy_pct": 12.5, "gpu_busy_pct": 3.0, "mem_available_bytes": 8 << 30, "mem_total_bytes": 32 << 30,
+         "load_1m": 1.25, "disk_free_pct": 41.0, "chip": "Apple M5 Max", "sampled_at": NOW - 20}
+
+
+class HeartbeatHardwareTest(unittest.TestCase):
+    """The Usage view's hardware from the live heartbeat board (#123): legacy hardware/<host>.json only as a fallback."""
+
+    def collect(self, home, board=None, **kw):
+        args = dict(state_dir=home, scarcity_reader=lambda: SCARCITY, refusals=[],
+                    s1_probe=lambda url: {"available": True}, now=NOW)
+        if board is not None:
+            args["heartbeats"] = lambda: board.snapshot(NOW)
+        args.update(kw)
+        return usage.collect(**args)
+
+    def empty_home(self) -> Path:
+        d = Path(tempfile.mkdtemp()); _TMP.append(d)
+        return d
+
+    def hw_errors(self, out):
+        return [e for e in out["errors"] if e["source"].startswith("hardware")]
+
+    def test_heartbeat_hardware_without_legacy_dir_shows_cards_and_no_error(self):
+        home = self.empty_home()
+        self.assertFalse((home / "hardware").exists())
+        out = self.collect(home, _board(("air", HB_HW, 180, NOW - 30), ("pro", {"cpu_busy_pct": 50.0}, 180, NOW - 5)))
+        self.assertEqual(self.hw_errors(out), [])
+        self.assertNotIn({"source": "hardware", "error": "absent"}, out["errors"])
+        cards = {c["file"]: c for c in out["hardware"]}
+        self.assertEqual(sorted(cards), ["air", "pro"])
+        air = cards["air"]
+        self.assertEqual(air["source"], "heartbeat")
+        self.assertEqual(air["age_s"], 20.0)                              # from the block's sampled_at, not receipt
+        self.assertEqual(air["data"], {"host": "air", "chip": "Apple M5 Max", "sampled_at": NOW - 20,
+                                       "cpu_busy_pct": 12.5, "gpu_busy_pct": 3.0, "mem_available_bytes": 8 << 30,
+                                       "mem_total_bytes": 32 << 30, "load_avg": [1.25], "disk_free_pct": 41.0})
+        self.assertEqual(cards["pro"]["age_s"], 5.0)                      # no sampled_at: aged from receipt
+        self.assertEqual(cards["pro"]["data"], {"host": "pro", "cpu_busy_pct": 50.0})
+
+    def test_no_heartbeat_and_no_legacy_dir_names_what_is_missing(self):
+        out = self.collect(self.empty_home(), _board())
+        self.assertEqual(out["hardware"], [])
+        self.assertEqual(self.hw_errors(out),
+                         [{"source": "hardware", "error": "no host has sent hardware in the last 15 min"}])
+        out = self.collect(self.empty_home())                              # no board wired at all: the same words
+        self.assertIn({"source": "hardware", "error": "no host has sent hardware in the last 15 min"}, out["errors"])
+
+    def test_stale_heartbeat_is_not_shown_and_named_by_its_window(self):
+        # received 10 min ago with a 3 min ttl: stale, as the live view's hosts section calls it
+        board = _board(("studio", {**HB_HW, "sampled_at": NOW - 610}, 180, NOW - 600), ("pro", None, 180, NOW - 10))   # pro: fresh, no hardware
+        out = self.collect(self.empty_home(), board)
+        self.assertEqual(out["hardware"], [])
+        self.assertEqual(self.hw_errors(out),
+                         [{"source": "hardware", "error": "no host has sent hardware in the last 3 min"}])
+
+    def test_legacy_files_only(self):
+        out = self.collect(fixture_home(), _board())
+        self.assertEqual([(c["file"], c["source"]) for c in out["hardware"]], [("studio.json", "file")])
+        self.assertEqual(self.hw_errors(out), [])
+        self.assertNotIn("ssh_target", json.dumps(out))                   # the legacy reduction still applies
+
+    def test_stale_heartbeat_with_legacy_file_shows_the_file(self):
+        out = self.collect(fixture_home(), _board(("air", {**HB_HW, "sampled_at": NOW - 3610}, 180, NOW - 3600)))
+        self.assertEqual([c["file"] for c in out["hardware"]], ["studio.json"])
+        self.assertEqual(self.hw_errors(out), [])
+
+    def test_legacy_file_of_a_heartbeat_host_is_not_shown_twice(self):
+        home = fixture_home()                                              # hardware/studio.json, host "studio"
+        (home / "hardware" / "other.json").write_text(json.dumps({**HW_SAMPLE, "host": "forests-mac-mini"}))
+        out = self.collect(home, _board(("studio", HB_HW, 180, NOW - 30)))
+        self.assertEqual([(c["file"], c["source"]) for c in out["hardware"]],
+                         [("studio", "heartbeat"), ("other.json", "file")])
+
+    def test_heartbeat_card_keeps_the_publish_rules(self):
+        hw = {**HB_HW, "chip": "M5 {Max} <b>"}                             # printable ASCII: valid in a heartbeat
+        out = self.collect(self.empty_home(), _board(("air", hw, 180, NOW - 30)))
+        self.assertEqual(out["hardware"][0]["data"]["chip"], "error")      # the text rule still applies (_HW_CARD)
+        self.assertNotIn("{Max}", json.dumps(out))
+
+    def test_failing_board_is_named_and_legacy_still_read(self):
+        def boom():
+            raise RuntimeError("board /Users/someone")
+        with self.assertLogs("cortados.provider.usage", "WARNING"):
+            out = self.collect(fixture_home(), heartbeats=boom)
+        self.assertIn({"source": "hardware", "error": "RuntimeError"}, out["errors"])
+        self.assertEqual([c["file"] for c in out["hardware"]], ["studio.json"])
+        self.assertNotIn("/Users/", json.dumps(out))
+
+    def test_live_slice_no_longer_reports_a_missing_legacy_dir(self):
+        # the live view merges heartbeat hardware per host itself (live.hosts_section); a missing dir is no error there
+        out = usage.collect_live(state_dir=self.empty_home(), scarcity_reader=lambda: SCARCITY,
+                                 s1_probe=lambda url: {"available": True}, now=NOW)
+        self.assertEqual(out["hardware"], [])
+        self.assertEqual(self.hw_errors(out), [])
+
+
 class RealWiringTest(unittest.TestCase):
     """ProviderServer.usage_view itself, with the real scarcity reader (scarcity.current is never called, nothing samples),
     state from the env's throwaway CORTADOS_HOME."""
 
-    def view(self, home: Path) -> dict:
+    def view(self, home: Path, before=None) -> dict:
         import cortados_router.s1_endpoint as s1e
         keep = (scarcity.current, scarcity.sample, s1e.resolve_url, os.environ.get("CORTADOS_SCARCITY_REFRESH"),
                 os.environ.get("CORTADOS_HOME"))
@@ -887,6 +998,8 @@ class RealWiringTest(unittest.TestCase):
             reg = Registry(gateway_url="", token=TOKEN, claude_bin=["true"])
             httpd = ProviderServer(("127.0.0.1", 0), reg)
             try:
+                if before is not None:
+                    before(reg)
                 raw = httpd.usage_view(reg)
                 self.assertIsInstance(raw, bytes)                   # the live view arrives encoded (memoised bytes)
                 return json.loads(raw)
@@ -908,6 +1021,18 @@ class RealWiringTest(unittest.TestCase):
         self.assertTrue(out["lanes"])
         self.assertNotIn("scarcity", [e["source"] for e in out["errors"]])
         self.assertFalse(out["s1"]["available"])                  # resolve_url raising lands in the s1 section, not a 500
+
+    def test_usage_view_reads_the_registrys_heartbeat_board(self):
+        from cortados_router.provider import live
+        home = fixture_home()
+        shutil.rmtree(home / "hardware")                                   # the provider host has no legacy files
+        now = time.time()
+        hb, bad = live.validate_heartbeat({"host": "air", "ttl_s": 180, "jobs": [],
+                                           "hardware": {**HB_HW, "sampled_at": now - 5}}, now)
+        self.assertIsNone(bad)
+        out = self.view(home, before=lambda reg: reg.live.post(hb, now=now))
+        self.assertEqual([(c["file"], c["source"]) for c in out["hardware"]], [("air", "heartbeat")])
+        self.assertEqual([e for e in out["errors"] if e["source"].startswith("hardware")], [])
 
     def test_missing_scarcity_cache_is_an_error_not_empty_lanes(self):
         # Review P2: scarcity.current() returned an empty cache for a missing file, so the view showed lanes: [] silently

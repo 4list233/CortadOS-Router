@@ -707,7 +707,7 @@ the usage ledger against the Claude lane it ran on (`claude`, or the named accou
 
 ## Usage endpoint (GET /v1/cortados/usage)
 
-`GET /v1/cortados/usage` (token required, 401 otherwise): one cheap JSON view for a usage dashboard, built by `cortados_router/provider/usage.py` — `lanes` (cached scarcity.json only: % left, windows/resets, sample age, `stale` by the routing freshness rule), `routed` (router.db counts per lane/model today and 7 d, top S1 bands; plus `provider_since_start` from the in-memory run records), `refusals` (24 h by reason, in-memory), `child_tasks` (7 d by last event from child-tasks.jsonl), `s1` (1.5 s `/health` probe), `hardware` (`$CORTADOS_HOME/hardware/*.json` passed through with age), `notes`, `errors` (every failed or absent source), `generated_at`. Opens no vendor CLI.
+`GET /v1/cortados/usage` (token required, 401 otherwise): one cheap JSON view for a usage dashboard, built by `cortados_router/provider/usage.py` — `lanes` (cached scarcity.json only: % left, windows/resets, sample age, `stale` by the routing freshness rule), `routed` (router.db counts per lane/model today and 7 d, top S1 bands; plus `provider_since_start` from the in-memory run records), `refusals` (24 h by reason, in-memory), `child_tasks` (7 d by last event from child-tasks.jsonl), `s1` (1.5 s `/health` probe), `hardware` (each host's fresh live-heartbeat hardware via `live.fresh_hardware`, then legacy `$CORTADOS_HOME/hardware/*.json` where that directory exists, with age and `source`; with neither, `no host has sent hardware in the last N min`, #123), `notes`, `errors` (every failed or absent source), `generated_at`. Opens no vendor CLI.
 
 ## Dashboard password (2026-11-13)
 
@@ -797,7 +797,9 @@ is then shown under it. A host's `hardware` is the fresher of its sample file an
 heartbeat's hardware is not shown); the heartbeat adds `disk_free_pct` to a fresher sample card. The second bug of
 2026-11-11: the Air (the provider host) showed no hardware because nothing on it writes `hardware/<host>.json` (no
 sampler job exists; `usage` reports the directory as `absent`, which the hosts section does not list as an error), so
-the heartbeat sender now carries the sample.
+the heartbeat sender now carries the sample. 2026-11-15 (#123): the Usage tab still showed `hardware: absent` for the same
+reason; it now reads the heartbeat board too (`live.fresh_hardware`, shared with the hosts section), legacy files only
+where the directory exists, and `collect_live` no longer reports a missing directory.
 
 **Heartbeat.** `POST /v1/cortados/live/heartbeat` (owner token or a write-only `live:heartbeat` client token). A
 heartbeat client is bound to one host: the clients.json entry's `"host"` field, else its name when that is a host slug
