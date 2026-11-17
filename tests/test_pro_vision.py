@@ -1113,8 +1113,10 @@ class VisionGuardBase(GuardBase):
         self.vpins = {rel: self._sha("vllm_mlx", rel) for rel in self.guard.VISION_PINNED_SHA256}
         self.mpins = {rel: self._sha("mlx_vlm", rel) for rel in self.guard.MLX_VLM_PINNED_SHA256}
         self.mlx_pins, self.metal_pins = self.fake_mlx(Path(self.dir))
+        self.mlx_py_pins = self.fake_mlx_python(Path(self.dir), self.guard.MLX_PY_SHA256)
         for name, value in (("VISION_PINNED_SHA256", self.vpins), ("MLX_VLM_PINNED_SHA256", self.mpins),
-                            ("MLX_PINNED_RECORD", self.mlx_pins), ("MLX_METAL_PINNED_RECORD", self.metal_pins)):
+                            ("MLX_PINNED_RECORD", self.mlx_pins), ("MLX_METAL_PINNED_RECORD", self.metal_pins),
+                            ("MLX_PY_PINNED_SHA256", {FAKE_MLX_TAG: self.mlx_py_pins})):
             p = patch.object(self.guard, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -1132,7 +1134,8 @@ class VisionGuardBase(GuardBase):
     def fake_mlx(root, version="0.32.4", tag=FAKE_MLX_TAG, metal_tag=FAKE_METAL_TAG):
         """Fake installed mlx and mlx-metal distributions under `root` (dist-info METADATA / WHEEL / RECORD and the
         files they name; mlx.core a plain module), and the pin tables that accept them."""
-        files = {"mlx/__init__.py": "", "mlx/core.py": "# the fake mlx.core extension\n",
+        # mlx is a namespace package, as in every released wheel (no mlx/__init__.py; #126 review round 2)
+        files = {"mlx/core.py": "# the fake mlx.core extension\n",
                  "mlx/lib/libmlx.dylib": "fake libmlx\n", "mlx/lib/mlx.metallib": "fake metallib\n"}
         for rel, text in files.items():
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -1149,6 +1152,17 @@ class VisionGuardBase(GuardBase):
                                          + f"{dist}-{version}.dist-info/RECORD,,\n")
         return ({FAKE_MLX_TAG: ("mlx/core.py", h["mlx/core.py"])},
                 {FAKE_METAL_TAG: {rel: h[rel] for rel in ("mlx/lib/libmlx.dylib", "mlx/lib/mlx.metallib")}})
+
+    @staticmethod
+    def fake_mlx_python(root, names):
+        """mlx's pinned Python files (the names of MLX_PY_SHA256) as fakes under `root`/mlx, and their pins."""
+        pins = {}
+        for rel in names:
+            p = root / "mlx" / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(f"# fake mlx/{rel}\n")
+            pins[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+        return pins
 
     def _sha(self, pkg, rel):
         return hashlib.sha256((Path(self.dir) / pkg / rel).read_bytes()).hexdigest()

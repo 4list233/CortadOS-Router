@@ -54,10 +54,18 @@ FAKE = {
                 self.calls += 1
                 return list(text.encode("utf-8"))
 
+        class SchedulerConfig:
+            def __init__(self, enable_prefix_cache=True):
+                self.enable_prefix_cache = enable_prefix_cache
+
         class Scheduler:
-            def __init__(self, tokenizer=None):
+            def __init__(self, model=None, tokenizer=None, config=None):
                 self.tokenizer = tokenizer or ByteTokenizer()
                 self.requests, self.waiting = {}, deque()
+                # 0.6.0 (scheduler.py 1396-1445): the prefix cache exists unless the config turns it off
+                self.config = config or SchedulerConfig()
+                self.prefix_cache = self.block_aware_cache = self.paged_cache_manager = self._ssd_tier = None
+                self.memory_aware_cache = object() if self.config.enable_prefix_cache else None
             def add_request(self, request):
                 if request.request_id in self.requests:
                     raise ValueError(f"Request {request.request_id} already exists")
@@ -118,7 +126,7 @@ FAKE = {
 
         class BatchedEngine(BaseEngine):
             def __init__(self, model_name, scheduler_config=None):
-                self.model_name, self.scheduler = model_name, Scheduler()
+                self.model_name, self.scheduler = model_name, Scheduler(config=scheduler_config)
             async def start(self):
                 return None
             async def generate(self, prompt, max_tokens=256):
@@ -182,9 +190,12 @@ FAKE = {
         def main():
             from vllm_mlx import server
             from vllm_mlx.api.utils import resolve_mllm_route
+            from vllm_mlx.scheduler import SchedulerConfig
             CALLS.append(list(sys.argv))
             resolve_mllm_route(sys.argv[2], sys.argv[2])
-            server.load_model(sys.argv[2], use_batching="--continuous-batching" in sys.argv)
+            # 0.6.0 (cli.py 319-328): enable_prefix_cache = --enable-prefix-cache (default on) and not --disable-...
+            config = SchedulerConfig(enable_prefix_cache="--disable-prefix-cache" not in sys.argv)
+            server.load_model(sys.argv[2], use_batching="--continuous-batching" in sys.argv, scheduler_config=config)
         '''),
     "fastapi/__init__.py": textwrap.dedent('''
         class HTTPException(Exception):
@@ -196,7 +207,8 @@ FAKE = {
 PINNED_FILES = ("scheduler.py", "engine_core.py", "engine/batched.py", "cli.py", "server.py", "model_registry.py",
                 "engine/__init__.py", "engine/base.py")
 TEXT = ["--text-prefill-tokens", "256", "--buffer-cache-bytes", str(2 ** 30)]   # the text route's prefill bounds (#126)
-SERVE = ["--context-tokens", "131072", *TEXT, "--", "serve", "/models/text", "--continuous-batching"]
+SERVE = ["--context-tokens", "131072", *TEXT, "--", "serve", "/models/text", "--continuous-batching",
+         "--disable-prefix-cache"]
 
 
 class GuardBase(unittest.TestCase):
@@ -332,7 +344,8 @@ class GuardStartupTests(GuardBase):
         from vllm_mlx import cli, scheduler, server
         from vllm_mlx.engine.batched import BatchedEngine
         self.assertEqual(rc, 0)
-        self.assertEqual(cli.CALLS, [["vllm-mlx", "serve", "/models/text", "--continuous-batching", "--port", "8000"]])
+        self.assertEqual(cli.CALLS, [["vllm-mlx", "serve", "/models/text", "--continuous-batching",
+                                      "--disable-prefix-cache", "--port", "8000"]])
         self.assertTrue(scheduler.Scheduler.add_request.__cortados_guard__)
         self.assertIs(type(server._engine), BatchedEngine)
         self.assertIn("capped at 131072", err)
@@ -368,7 +381,8 @@ class GuardStartupTests(GuardBase):
         self.assertIn("MLLM route", err)
         self.assertEqual(self.run_main(["--check", "/models/text"])[0], 0)
         with self.assertRaises(SystemExit):                            # and serving it never starts
-            self.run_main(["--context-tokens", "131072", *TEXT, "--", "serve", "/models/vl", "--continuous-batching"])
+            self.run_main(["--context-tokens", "131072", *TEXT, "--", "serve", "/models/vl", "--continuous-batching",
+                           "--disable-prefix-cache"])
 
     def test_bad_command_lines_are_refused(self):
         for argv in ([], ["serve", "/m"], ["--context-tokens", "x", "--", "serve", "/m"],

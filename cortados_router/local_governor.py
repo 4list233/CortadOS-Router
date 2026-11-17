@@ -1017,6 +1017,7 @@ class Admission:
         self._loads: list[TextLoad] = []     # the text route's requests in flight (#126): reserved as one set
         self._high_water = 0                 # the longest text context admitted since the set was last empty
         self._peak = (0, 0)                  # the set's largest (cells, cache_overshoot) since it was last empty
+        self._draining = False               # stale width / rows refused a turn: no new text turn until the set drains
 
     def _report(self, g: dict[str, Any]) -> dict[str, Any]:
         """The state report under the lock: the count sample, in flight, and (governed) the bytes and token room."""
@@ -1033,8 +1034,9 @@ class Admission:
         if text_route(cfg):
             # the text route's set reservation: what one more request may hold beside the set in flight (#126)
             fit = text_room(cfg, [], available_bytes(cfg))
-            room = 0 if full else text_room(cfg, self._loads, available_bytes(cfg) - self._summed_bytes(),
-                                            self._high_water, self._peak)
+            room = 0 if full or self._draining else text_room(cfg, self._loads,
+                                                              available_bytes(cfg) - self._summed_bytes(),
+                                                              self._high_water, self._peak)
         else:
             fit, room = bytes_tokens(cfg, available_bytes(cfg)), 0 if full else bytes_tokens(cfg, free)
         return {**out, "reserved_bytes": self.reserved, "free_bytes": free,
@@ -1090,7 +1092,14 @@ class Admission:
         reservation is computed over every load in flight (text_set_bytes: the decode batch pads each row to the
         longest) at the longest context admitted since the set was last empty (a departed long row's width survives in
         the filtered batch), so its bytes are the set's growth, not a fixed size; `reserve` is then ignored. too_large
-        compares the request alone with the budget."""
+        compares the request alone with the budget.
+        The drain (#126 review round 2, P2a): the high-water width and peak rows are kept while any text turn runs
+        (the lazy-free protection above), so under overlapping traffic they could outlive their turn forever. When a
+        text turn is refused for bytes that the set's stale terms alone take (it would fit beside the live loads
+        reserved as if fresh: text_set_bytes without high_water and peak), the set drains: every new text turn is
+        a retryable 529 until the turns in flight end, which bounds the wait by their max_tokens and the gate's read
+        timeout; the empty set then resets (_release_locked) and admission resumes at the fresh size. The reservation
+        never shrinks while a turn of the old set runs, so no buffer that may still be live is ever given away."""
         g = self.governor.current() if self.governor else NO_GOVERNOR
         with self._lock:
             vision = self.vision
@@ -1122,9 +1131,17 @@ class Admission:
             elif image and self.image_inflight >= vision["image_concurrency"]:
                 refused = {"refused": "busy", "reason": f"image turns: {self.image_inflight} of "
                                                         f"{vision['image_concurrency']} running"}
+            elif load is not None and self._draining:
+                refused = {"refused": "busy", "reason": f"text set draining: {len(self._loads)} running turns keep "
+                                                        "a departed turn's width; admission resumes when they end"}
             elif after > avail:
                 refused = {"refused": "busy", "reason": f"memory budget: {_gib(avail - self.reserved)} GiB free, "
                                                         f"request needs {_gib(nbytes)} GiB"}
+                if load is not None and self._summed_bytes() + text_set_bytes(cfg, [*self._loads, load])["total"] \
+                        <= avail:
+                    # only the departed turns' width / rows refuse it: drain so they can be reclaimed (docstring)
+                    self._draining = True
+                    refused["reason"] += " (stale text set width: draining)"
             if refused is not None:
                 return None, {**self._report(g), **refused, "request_bytes": nbytes}
             self.inflight += 1
@@ -1149,7 +1166,8 @@ class Admission:
             if at is not None:
                 del self._loads[at]                 # this ticket's entry only (one load object may be admitted twice)
             if not self._loads:
-                self._high_water, self._peak = 0, (0, 0)   # the decode batch is empty, MLX's cache cleared
+                # the decode batch is empty, MLX's cache cleared: the stale terms and any drain end here
+                self._high_water, self._peak, self._draining = 0, (0, 0), False
             self.reserved = summed + self._set_bytes()
         else:
             self.reserved = max(0, self.reserved - ticket.reserved)

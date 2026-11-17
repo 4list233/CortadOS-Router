@@ -1327,8 +1327,24 @@ counts ~4 body bytes per real token of code):
 
 A mixed set pays for its longest row: a short turn beside a 128k one now waits (529) instead of running, because it
 would hold 128k of KV in the padded batch. After a long turn, or a full batch, ends, the turns still running keep
-its width and row count in the reservation until no text turn runs. So under steady overlapping traffic, new turns may
-wait (529) longer than the set's current rows suggest. That is the price of not knowing when the backend compacts. `fit_tokens` / `free_tokens` in the capacity report are computed from
+its width and row count in the reservation until no text turn runs. That is the price of not knowing when the backend
+compacts.
+
+**The drain** (#126 review round 2, P2a). Kept that way alone, the stale width could last forever: overlapping short
+turns keep the set from ever being empty, and the reviewer's repro (a 64k turn, then 100 overlapping replacements of a
+short one) ended with two 100-token turns holding 17.6 GiB and a third refused. So when a text turn is refused for
+bytes that only the stale terms take (it would fit beside the live turns reserved at their own size: `text_set_bytes`
+without the high-water and peak), the set **drains**. Every new text turn is a retryable 529 ("text set draining") and
+`free_tokens` reports 0, until the turns in flight end. The empty set then resets and admission resumes at the fresh
+size. The wait is bounded by those turns' `max_tokens` and the gate's read timeout. A turn that would not fit a fresh
+set either, or a full count, is plain busy and starts no drain.
+
+Why a drain rather than reclaiming when the backend says its batch shrank: the gate cannot see when `filter`'s lazy
+gather is evaluated, when the old wide buffer is dropped, or which freed buffer sits in MLX's cache. A "freed" report
+from the guard would need a safe point in mlx-lm's generation loop where all of that is known, and the released code
+offers none without patching the loop. The drain needs no backend signal: it never shrinks the reservation while a
+turn of the old set runs, so the lazy-free protection holds, and it costs only a short pause in admissions after a
+long turn ends beside short ones. `fit_tokens` / `free_tokens` in the capacity report are computed from
 the same set formula (`text_room`), so the provider's skip check sees the new room. Short turns are unchanged: their
 old reservation was already at least the computed peak, so it stands byte for byte (eight ~2k-token turns still run
 at once). A vision model's turns, text-only ones included, reserve exactly as in #125 (`text_route` is false there).
@@ -1340,18 +1356,39 @@ The acceptance gate is the Pro's peak footprint and `mx.get_peak_memory()` in th
 128k turn, a 64k turn beside short ones, and eight short turns. If a measured peak exceeds its reservation, the counts
 or the chunk are corrected before relying on them.
 
-**Not covered: the prefix cache.** vllm-mlx's own prefix cache (`MemoryAwarePrefixCache`, on by default,
-`scheduler.py` 93-99 and 1402-1432) keeps finished prompts' KV as separate copies, up to 20% of the RAM available when
-it starts (`--cache-memory-mb` unset), across requests. That pool is outside every reservation, as it was before #126.
-With ~4 GiB in it, a full-context turn's 24.57 GiB plus the pool is ~28.6 GiB beside the weights, over the 25 GiB
-budget. So the reservation is the peak of the requests in flight, not of the whole process. Closing it is an owner
-decision between prefix reuse (time to first token on multi-turn conversations) and admission room:
+**The prefix cache is off on the text route** (#126 review round 2, P1). vllm-mlx's own prefix cache
+(`MemoryAwarePrefixCache`, on by default, `scheduler.py` 93-99 and 1402-1445) keeps finished prompts' KV as separate
+copies, up to 20% of the RAM available when it starts (`--cache-memory-mb` unset), across requests. That pool was
+outside every reservation: with ~4 GiB in it, a full-context turn's 24.57 GiB plus the pool is ~28.6 GiB beside the
+weights, over the 25 GiB budget. Its insertions are unbounded too: `memory_cache.py` `commit_prepared` (1551-1568)
+materialises a turn's new snapshot before it evicts older entries.
 
-- `--disable-prefix-cache` (already in `extra_args`' allowlist) removes the pool;
-- or a fixed `--cache-memory-mb` that the governor subtracts from the budget. A full-context turn on the 4-bit model
-  then fits only while the pool is ≤ 0.43 GiB.
+So the text route serves with it off:
 
-It is left to a follow-up issue.
+- `local_backend.text_argv` gives vllm-mlx `--disable-prefix-cache` (`PREFIX_CACHE_OFF`), so the generated
+  LaunchAgent always carries it. In 0.6.0 (`cli.py` 319-328) `enable_prefix_cache` is `--enable-prefix-cache` (default
+  on) and not `--disable-prefix-cache`, and no flag turns it back on.
+- The guard refuses to start the text route without that exact argument (an abbreviation such as `--disable-prefix`,
+  which argparse would accept, is refused too). At runtime it wraps `Scheduler.__init__`: a Scheduler built with no
+  config (0.6.0's default enables the cache) or `enable_prefix_cache` not False is refused before it builds anything,
+  and one that still ends up holding a `prefix_cache`, `memory_aware_cache`, `block_aware_cache`, `paged_cache_manager`
+  or SSD tier is refused after. Either stops the engine from starting.
+- With no pool, cached earlier turns cannot add to the process's footprint: what runs beside the weights is the
+  reservation.
+
+**The trade-off.** Without the cache, every turn prefills its whole prompt. A multi-turn conversation's next turn
+re-reads the earlier turns instead of reusing their KV, so the **first token comes later on multi-turn
+conversations**, roughly by the prefill time of the history (at 256-token chunks, one prompt at a time). Output tokens
+per second and the answers themselves do not change. The owner is asked to confirm "cache off".
+
+**No "cache on with a reserved budget" option.** The obvious alternative is a fixed `--cache-memory-mb` that the
+governor subtracts from the budget, plus one snapshot's transient. It is left out because it is not sound against the
+released code without a further read: the pool's accounting estimates an entry from its arrays' sizes, while an entry
+cut from a filtered batch row can be a slice that keeps the whole padded buffer alive, so the pool's real footprint
+can exceed its limit. And the room it would cost is large: a full-context turn on the 4-bit model fits only while the
+pool is ≤ 0.43 GiB. If prefix reuse is wanted later, it needs its own issue that reads `memory_cache.py`'s estimate
+and eviction and bounds both. The vision route is unchanged (#125): its MLLM scheduler's text-only prefix cache is not
+touched here.
 
 ### Vision: still images on the MLX lane (#125)
 
@@ -1455,7 +1492,16 @@ dispatches to the fused kernel or an unfused fallback is decided in MLX itself. 
 dist-info's version, its single `WHEEL` tag (which must have a pinned row; mlx's and mlx-metal's macOS tags must agree),
 the `RECORD` entries of the files that implement the dispatch, equal to the released wheels' — `mlx/core.cpython-*-darwin.so`
 (mlx), `mlx/lib/libmlx.dylib` and `mlx/lib/mlx.metallib` (mlx-metal) — and those files' own sha256 equal to them; and the
-`mlx.core` actually imported must be that pinned file, beside that `libmlx.dylib`. Any mismatch fails closed. The
+`mlx.core` actually imported must be that pinned file, beside that `libmlx.dylib`. MLX's Python side is pinned too
+(#126 review round 2, P2b; `MLX_PY_SHA256`): the models import `mlx.nn`, whose `__init__` imports every module under
+`mlx/nn` (activations, `Linear` / `QuantizedLinear`, `RMSNorm`, `Embedding`, `Module`, ...), and `mlx.utils`, and the
+extension imports `mlx._reprlib_fix` and `mlx.__array_api_info`. Those 24 files (`utils.py`, `_reprlib_fix.py`,
+`__array_api_info.py`, `nn/__init__.py`, `nn/init.py`, `nn/losses.py`, `nn/utils.py` and the 16 files of `nn/layers/`)
+must equal the released wheels' bytes beside the pinned `mlx.core`. They are byte-identical in all 27 macOS arm64
+wheels (fetched from PyPI 2026-11-17), so every tag's row is one table. `mlx` must stay a namespace package (no
+`mlx/__init__.py`, which would run on import), and `mlx.nn`, `mlx.utils`, `mlx._reprlib_fix` and `mlx.__array_api_info`
+must resolve to the pinned files. A drifted file, such as `silu` promoting to float32, stops startup. Any mismatch
+fails closed. The
 expected hashes come from the released PyPI wheels (fetched 2026-11-16; each RECORD hash re-checked against the file
 bytes in its wheel). The Pro's Python and macOS tag could not be read from the build machine, so every macOS arm64
 wheel of 0.32.4 is pinned: CPython 3.10–3.15 and the free-threaded 3.13t–3.15t (27 mlx rows), macOS 14.0 / 15.0 / 26.0

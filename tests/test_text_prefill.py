@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cortados_router import local_backend, local_governor
+from tests.test_pro_vision import DIMS_ARG, FAKE_MLX_TAG, VISION_ARGS, VisionGuardBase  # noqa: F401
 from tests.test_vllm_mlx_guard import GuardBase, TEXT, load_guard
 
 GIB = 2 ** 30
@@ -491,7 +492,7 @@ class InstallTextTests(GuardBase):
         self.assertEqual(rc, 0, err)
         from vllm_mlx import scheduler
         from vllm_mlx.engine import batched
-        bg = scheduler.Scheduler()._create_batch_generator()
+        bg = scheduler.Scheduler(config=scheduler.SchedulerConfig(enable_prefix_cache=False))._create_batch_generator()
         self.assertEqual((bg.prefill_batch_size, bg.prefill_step_size, bg._prompt_batch.prefill_step_size),
                          (1, 256, 256))
         self.assertEqual(batched._resolve_metal_buffer_cache_limit(48 * GIB, 0.9),
@@ -536,7 +537,282 @@ class InstallTextTests(GuardBase):
         self.assertEqual(self.text_models, ["/models/text"])
 
 
-SERVE_TEXT = ["--context-tokens", "131072", *TEXT, "--", "serve", "/models/text", "--continuous-batching"]
+SERVE_TEXT = ["--context-tokens", "131072", *TEXT, "--", "serve", "/models/text", "--continuous-batching",
+              "--disable-prefix-cache"]
+
+
+
+class TextSetDrainTests(unittest.TestCase):
+    """#126 review round 2 (P2a): the departed turns' width and rows stay reserved while any text turn runs (the
+    lazy-free protection), and a turn refused for those stale bytes alone drains the set, so they are reclaimed in a
+    bounded number of steps instead of never under overlapping traffic."""
+
+    def setUp(self):
+        self.a = local_governor.Admission(FixedGovernor())             # owner idle: count 8, 25 GiB beside the weights
+        self.cfg = self.a.governor.cfg
+
+    def short(self):
+        return self.a.try_acquire(load=self.a.text_load(100, 1))
+
+    def test_round2_repro_recovers_within_a_bounded_number_of_steps(self):
+        t_long, _ = self.a.try_acquire(load=self.a.text_load(64000, 1))
+        live, _ = self.short()
+        t_long.release()
+        for _ in range(100):                                           # overlapping replacement: admit, then release
+            nxt, snap = self.short()
+            self.assertIsNotNone(nxt, snap.get("reason"))
+            live.release()
+            live = nxt
+        second, _ = self.short()
+        self.assertIsNotNone(second)
+        third, snap = self.short()
+        # the reviewer's state: 529, the high-water 64,001, two tiny turns holding 17.6 GiB
+        self.assertEqual((third, snap["refused"], self.a._high_water), (None, "busy", 64001))
+        self.assertGreater(self.a.reserved, 17 * GIB)
+        self.assertIn("draining", snap["reason"])
+        self.assertTrue(self.a._draining)
+        self.assertEqual(snap["free_tokens"], 0)                       # the provider sees no room while draining
+        # draining: every new text turn waits (retryable) until the two in flight end, then the set resets
+        for _ in range(3):
+            t, snap = self.short()
+            self.assertEqual((t, snap["refused"]), (None, "busy"))
+            self.assertIn("text set draining", snap["reason"])
+        live.release()
+        self.assertTrue(self.a._draining)                              # one turn of the old set still runs
+        second.release()
+        self.assertEqual((self.a._draining, self.a._high_water, self.a._peak, self.a.reserved), (False, 0, (0, 0), 0))
+        tickets = [self.short()[0] for _ in range(3)]                  # the third tiny turn now runs, at the fresh size
+        self.assertTrue(all(tickets))
+        self.assertEqual(self.a.reserved, local_governor.text_set_bytes(self.cfg, [t.load for t in tickets])["total"])
+        self.assertLess(self.a.reserved, 6 * GIB)
+
+    def test_a_steady_stream_of_short_turns_after_a_long_one_is_not_starved(self):
+        # a client wants three short turns in flight and retries what is refused; a turn that was refused lets the
+        # oldest in flight finish. Without the drain the third never runs (the high-water stays at 64,001 forever)
+        t_long, _ = self.a.try_acquire(load=self.a.text_load(64000, 1))
+        live = [self.short()[0]]
+        self.assertIsNotNone(live[0])
+        t_long.release()
+        recovered = None
+        for step in range(50):
+            t, _ = self.short()
+            if t is not None:
+                live.append(t)
+            if len(live) == 3:
+                recovered = step
+                break
+            if t is None and live:
+                live.pop(0).release()                                   # the oldest finishes
+        self.assertIsNotNone(recovered, "three short turns never ran together")
+        self.assertLessEqual(recovered, 6)                              # the drain lasts as long as the old set's turns
+        self.assertEqual(self.a._high_water, 101)                       # at the fresh width
+        self.assertEqual(self.a.reserved, local_governor.text_set_bytes(self.cfg, [t.load for t in live])["total"])
+
+    def test_the_departed_width_stays_reserved_while_its_set_runs(self):
+        # the lazy-free protection: no byte of the departed 64k row is given back while a turn that may share its
+        # batch runs, drain or no drain
+        long, short = self.a.text_load(64000, 1), self.a.text_load(100, 1)
+        t_long, t_short = self.a.try_acquire(load=long)[0], self.a.try_acquire(load=short)[0]
+        held = self.a.reserved
+        t_long.release()
+        stale = local_governor.text_set_bytes(self.cfg, [short], long.tokens, self.a._peak)["total"]
+        self.assertEqual(self.a.reserved, stale)
+        self.assertGreater(stale, local_governor.text_set_bytes(self.cfg, [short])["total"])
+        t2 = self.short()[0]
+        self.assertIsNotNone(t2)
+        before = self.a.reserved
+        refused, snap = self.short()                                   # starts the drain
+        self.assertIsNone(refused)
+        self.assertTrue(self.a._draining)
+        self.assertEqual(self.a.reserved, before)                      # a refusal changes nothing
+        self.assertGreaterEqual(self.a.reserved, local_governor.text_set_bytes(self.cfg, [short, t2.load],
+                                                                             long.tokens)["total"])
+        t_short.release()
+        self.assertEqual(self.a.reserved, local_governor.text_set_bytes(self.cfg, [t2.load], long.tokens,
+                                                                        self.a._peak)["total"])
+        self.assertLessEqual(self.a.reserved, held + local_governor.text_set_bytes(self.cfg, [t2.load], long.tokens,
+                                                                                   self.a._peak)["total"])
+        t2.release()
+        self.assertEqual(self.a.reserved, 0)
+
+    def test_no_drain_when_the_turn_would_not_fit_a_fresh_set_either_or_the_count_is_full(self):
+        # a turn too big for the live set even at its fresh size is plain busy: draining would not be what admits it
+        t_long, _ = self.a.try_acquire(load=self.a.text_load(64000, 1))
+        live, _ = self.short()
+        t_long.release()
+        big, snap = self.a.try_acquire(load=self.a.text_load(120_000, 4096))
+        self.assertEqual((big, snap["refused"]), (None, "busy"))
+        self.assertNotIn("draining", snap["reason"])
+        self.assertFalse(self.a._draining)
+        live.release()
+        # the count limit is the governor's sample, never a drain
+        busy = local_governor.Admission(FixedGovernor(idle_s=0.0))      # owner active: the active cap
+        tickets = []
+        while True:
+            t, snap = busy.try_acquire(load=busy.text_load(100, 1))
+            if t is None:
+                break
+            tickets.append(t)
+        self.assertFalse(busy._draining)
+        self.assertNotIn("draining", snap["reason"])
+
+
+class PrefixCacheOffTests(GuardBase):
+    """#126 review round 2 (P1): vllm-mlx's prefix cache pool (up to 20% of free RAM) and its insertion snapshots are
+    outside the text reservation, so the text route serves with it off, and the guard refuses to start otherwise."""
+
+    def test_the_launch_agent_turns_the_prefix_cache_off_on_the_text_route(self):
+        c = local_backend.load(str(ROOT / "tables" / "local-backend.example.json"))
+        argv = local_backend.serve_argv(c)
+        self.assertEqual(local_backend.PREFIX_CACHE_OFF, "--disable-prefix-cache")
+        self.assertEqual(local_backend.PREFIX_CACHE_OFF, self.guard.PREFIX_CACHE_FLAG)
+        self.assertIn("--disable-prefix-cache", argv[argv.index("--") + 1:])     # a vllm-mlx serve argument
+        self.assertNotIn("--enable-prefix-cache", argv)
+        self.assertIn("--disable-prefix-cache", local_backend.text_argv(c)[1])
+        plist = local_backend.launch_agent_plist(c, "/tmp/logs")
+        self.assertIn(b"<string>--disable-prefix-cache</string>", plist)
+
+    def test_the_guard_refuses_a_cache_enabled_start(self):
+        rc, err = self.run_main(SERVE_TEXT[:-1])                       # serve without --disable-prefix-cache
+        self.assertEqual(rc, 2)
+        self.assertIn(self.guard.PREFIX_CACHE_REFUSAL, err)
+        from vllm_mlx import cli
+        self.assertEqual(cli.CALLS, [])
+        # a different spelling (argparse would expand `--disable-prefix`) is not the flag the argument read
+        rc, err = self.run_main([*SERVE_TEXT[:-1], "--disable-prefix"])
+        self.assertEqual(rc, 2)
+        self.assertIn(self.guard.PREFIX_CACHE_FLAG, err)
+
+    def test_the_runtime_refuses_a_scheduler_with_a_prefix_cache(self):
+        # the flag reached the guard, but vllm-mlx's cli did not apply it (here: a mutated, re-pinned cli.py):
+        # the Scheduler the engine builds is refused before it holds a pool
+        cli = Path(self.dir, "vllm_mlx", "cli.py")
+        cli.write_text(cli.read_text().replace('enable_prefix_cache="--disable-prefix-cache" not in sys.argv',
+                                               "enable_prefix_cache=True"))
+        self.repin()
+        with self.assertRaisesRegex(self.guard.GuardError, "enable_prefix_cache is True"):
+            self.run_main(SERVE_TEXT)
+        from vllm_mlx import scheduler, server
+        self.assertIsNone(server._engine)
+        with self.assertRaisesRegex(self.guard.GuardError, "no scheduler config"):
+            scheduler.Scheduler()                                      # 0.6.0's default config enables the cache
+        # a Scheduler that builds a cache although its config says off is refused after its __init__
+        original = scheduler.Scheduler.__init__.__wrapped__
+
+        def leaky(self, *a, **k):
+            original(self, *a, **k)
+            self.block_aware_cache = object()
+        with patch.object(scheduler.Scheduler, "__init__", self._rewrap(scheduler.Scheduler, leaky)):
+            with self.assertRaisesRegex(self.guard.GuardError, "built block_aware_cache"):
+                scheduler.Scheduler(None, None, scheduler.SchedulerConfig(enable_prefix_cache=False))
+
+    def _rewrap(self, cls, init):
+        """install_text's wrapper around `init` (a fresh install on a copy of the class)."""
+        from vllm_mlx.engine import batched
+        copy = type("Scheduler", (), {"__init__": init, "_create_batch_generator": lambda self: None})
+        fake_batched = type(sys)("batched")
+        fake_batched._resolve_metal_buffer_cache_limit = batched._resolve_metal_buffer_cache_limit.__wrapped__
+        self.guard.install_text(self.guard.TextPolicy(256, GIB), copy, fake_batched)
+        return copy.__init__
+
+    def test_round2_repro_cache_occupancy_cannot_change_the_bound(self):
+        # the reviewer's numbers: a full-context turn reserves 24.57 of 25 GiB, and a 4 GiB prefix pool beside it
+        # would make 28.57. With the cache off there is no pool: the served engine's scheduler holds none, so what
+        # the process holds beyond the weights is the reservation, whatever earlier turns were cached
+        rc, err = self.run_main(SERVE_TEXT)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("prefix cache off", err)
+        from vllm_mlx import server
+        sched = server._engine.scheduler
+        self.assertIs(sched.config.enable_prefix_cache, False)
+        for attr in self.guard.PREFIX_CACHE_ATTRS:
+            self.assertIsNone(getattr(sched, attr), attr)
+        cfg = local_governor.check_config({})
+        full = local_governor.text_set_bytes(cfg, [local_governor.text_load(cfg, 131071, 1)])["total"]
+        self.assertAlmostEqual(full / GIB, 24.57, places=2)
+        pool = 0                                                       # no prefix cache: nothing to occupy
+        self.assertLessEqual(full + pool, local_governor.available_bytes(cfg))
+        self.assertGreater(full + 4 * GIB, local_governor.available_bytes(cfg))   # why the pool had to go
+
+
+class MlxPythonPinTests(VisionGuardBase):
+    """#126 review round 2 (P2b): mlx's Python files on the models' import chain are pinned to the released 0.32.4
+    wheels, so a drifted mlx.nn (e.g. silu promoting to float32) stops startup."""
+
+    NAMES = {"__array_api_info.py", "_reprlib_fix.py", "utils.py", "nn/__init__.py", "nn/init.py", "nn/losses.py",
+             "nn/utils.py", "nn/layers/__init__.py", "nn/layers/activations.py", "nn/layers/base.py",
+             "nn/layers/containers.py", "nn/layers/convolution.py", "nn/layers/convolution_transpose.py",
+             "nn/layers/distributed.py", "nn/layers/dropout.py", "nn/layers/embedding.py", "nn/layers/linear.py",
+             "nn/layers/normalization.py", "nn/layers/pooling.py", "nn/layers/positional_encoding.py",
+             "nn/layers/quantized.py", "nn/layers/recurrent.py", "nn/layers/transformer.py", "nn/layers/upsample.py"}
+
+    def test_the_real_python_pins_are_the_released_wheels(self):
+        real = load_guard()
+        self.assertEqual(set(real.MLX_PY_SHA256), self.NAMES)
+        self.assertEqual(set(real.MLX_PY_PINNED_SHA256), set(real.MLX_PINNED_RECORD))      # every pinned wheel tag
+        for tag, table in real.MLX_PY_PINNED_SHA256.items():
+            self.assertEqual(table, real.MLX_PY_SHA256, tag)            # byte-identical in all 27 macOS wheels
+        for rel, want in (("nn/layers/activations.py",
+                           "244a4acb0f77fac196e3e355dcae0a5195691b7f9f12d6c5aeb243c6cb021ae1"),
+                          ("nn/layers/quantized.py", "8ca4574a212f14cbec4c446826474583ef0bf1e2cb1630574fd730c77af03b33"),
+                          ("nn/layers/normalization.py",
+                           "d038fced58d7bf972e80e5ea508c9285e81bd9d523773deb50c5a935b25af9af"),
+                          ("utils.py", "e55d7c63e7b706a0d31728343760f3f98d90e44d34054be4cf076586fdbe1616")):
+            self.assertEqual(real.MLX_PY_SHA256[rel], want, rel)
+        self.assertTrue(all(len(v) == 64 and int(v, 16) >= 0 for v in real.MLX_PY_SHA256.values()))
+        self.assertEqual(set(real.MLX_PY_MODULES), {"nn", "utils", "_reprlib_fix", "__array_api_info"})
+
+    def test_matching_files_pass(self):
+        self.assertEqual(self.guard.verify_mlx(), FAKE_MLX_TAG)
+
+    def test_a_drift_in_any_pinned_python_file_is_refused(self):
+        for rel in sorted(self.mlx_py_pins):
+            with self.subTest(rel):
+                path = Path(self.dir, "mlx", *rel.split("/"))
+                text = path.read_text()
+                path.write_text(text + "# patched\n")
+                try:
+                    with self.assertRaisesRegex(self.guard.GuardError, f"mlx/{rel} differs"):
+                        self.guard.verify_mlx()
+                    path.unlink()
+                    with self.assertRaisesRegex(self.guard.GuardError, f"mlx/{rel} unreadable"):
+                        self.guard.verify_mlx()
+                finally:
+                    path.write_text(text)
+        self.guard.verify_mlx()
+
+    def test_round2_repro_silu_promoting_to_float32_is_refused(self):
+        act = Path(self.dir, "mlx", "nn", "layers", "activations.py")
+        released = ("import mlx.core as mx\n\n\ndef silu(x):\n    return x * mx.sigmoid(x)\n")
+        act.write_text(released)
+        self.mlx_py_pins["nn/layers/activations.py"] = hashlib.sha256(released.encode()).hexdigest()
+        self.assertEqual(self.guard.verify_mlx(), FAKE_MLX_TAG)
+        act.write_text(released.replace("return x * mx.sigmoid(x)",
+                                        "x = x.astype(mx.float32)\n    return x * mx.sigmoid(x)"))
+        with self.assertRaisesRegex(self.guard.GuardError, "mlx/nn/layers/activations.py differs"):
+            self.guard.verify_mlx()
+        # and startup stops: --check runs verify_mlx (vision mode here; the text route through _text_modules)
+        rc, err = self.run_main(["--check", str(self.models / "vl"), *VISION_ARGS])
+        self.assertEqual(rc, 2)
+        self.assertIn("activations.py differs", err)
+
+    def test_a_planted_init_a_shadowed_module_or_an_unpinned_tag_is_refused(self):
+        init = Path(self.dir, "mlx", "__init__.py")
+        init.write_text("")
+        try:
+            with self.assertRaisesRegex(self.guard.GuardError, "mlx/__init__.py exists"):
+                self.guard.verify_mlx()
+        finally:
+            init.unlink()
+        other = Path(self.tmp, "mlx", "nn", "__init__.py")
+        other.parent.mkdir(parents=True)
+        other.write_text("# a shadowing mlx.nn\n")
+        spec = type("Spec", (), {"origin": str(other)})
+        with self.assertRaisesRegex(self.guard.GuardError, "mlx.nn resolves to"):
+            self.guard.verify_mlx(find_spec=lambda name: spec if name == "mlx.nn" else
+                                  type("S", (), {"origin": str(Path(self.dir, "mlx", name[4:] + ".py"))}))
+        with self.assertRaisesRegex(self.guard.GuardError, "no Python file pins"):
+            self.guard.verify_mlx(py_pins={})
 
 
 if __name__ == "__main__":

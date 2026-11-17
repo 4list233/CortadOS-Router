@@ -77,7 +77,8 @@ anything loads), config.json's vision_config exactly VISION_ENCODER_CONFIG (chec
 route resolution) and the loaded tower the same (vision_tower_problem, when MLLMScheduler is built). And the fused
 kernel's implementation is pinned: mlx and mlx-metal 0.32.4, their installed dist-info RECORD entries and the files
 themselves (the mlx.core extension, libmlx.dylib, mlx.metallib) against the released macOS arm64 wheels' RECORDs
-(MLX_PINNED_RECORD / MLX_METAL_PINNED_RECORD, verify_mlx), and the mlx.core actually imported must be that file.
+(MLX_PINNED_RECORD / MLX_METAL_PINNED_RECORD, verify_mlx), and the mlx.core actually imported must be that file;
+mlx's Python files on the models' import chain (mlx.nn, mlx.utils, ...) are pinned beside it (MLX_PY_SHA256).
 Pinned on top: the MLLM files of vllm-mlx 0.6.0 (VISION_PINNED_SHA256) and mlx-vlm 0.7.12 (MLX_VLM_PINNED_SHA256: the
 processor, the model, the vision encoder, the linear attention, the caches and the rest of their import chain;
 docs/LOCAL-RESOURCES.md "Vision" lists them).
@@ -402,6 +403,42 @@ MLX_METAL_PINNED_RECORD = {
         "mlx/lib/mlx.metallib": "sha256=xtej-suDVo9uTLLPSoxzbuKTAlcaSDQ8uaOk0c0-OJM",
     },
 }
+# #126 review round 2 (P2b): mlx's Python side. The models import mlx.nn (whose __init__ imports every module under
+# mlx/nn: the activations, Linear / QuantizedLinear, RMSNorm, Embedding, Module, ...) and mlx.utils, and the mlx.core
+# extension imports mlx._reprlib_fix at init and mlx.__array_api_info on use. Those Python files decide dtypes and
+# shapes the reservation counts (e.g. silu in the activations' dtype), so they are pinned by sha256 against the
+# released 0.32.4 wheels (fetched from PyPI 2026-11-17, each wheel's digest checked against PyPI's): the files are
+# byte-identical in all 27 macOS arm64 wheels, so every tag's row is the one table below. mlx is a namespace package
+# (no mlx/__init__.py in any wheel): a planted one would run on `import mlx.core`, so its absence is checked too, and
+# mlx.nn, mlx.utils, mlx._reprlib_fix and mlx.__array_api_info must resolve to the pinned files (verify_mlx).
+MLX_PY_SHA256 = {
+    "__array_api_info.py": "67bd1bf52f853f2ea96fd6d4f0c64435899f36292290e3d528327a799f863912",
+    "_reprlib_fix.py": "f748ea4f10995bf30ed6ba76ed3539f23c18cdf541031e1c0968dd60dc98f723",
+    "utils.py": "e55d7c63e7b706a0d31728343760f3f98d90e44d34054be4cf076586fdbe1616",
+    "nn/__init__.py": "6d578784bfe696a3ba6eca2a559c87e9fd1ec5eaa5e6d4e199e6e959ebe0a492",
+    "nn/init.py": "c6ef640bf114039d5c6c5f2d0d9e53675c171ba1456beba20278c9cc12922831",
+    "nn/losses.py": "221ce6a2395cddb065049bf66212620945e50a8f592bb131fa1c21b8341d8f31",
+    "nn/utils.py": "a5ab60f6731a7a8d3821b7e44ad96961ef848ae0315090f47a895627ede102a8",
+    "nn/layers/__init__.py": "1eb646e38a87579eb63201100c3f9b038e2466d7fbad509c2f32841bc1f2a007",
+    "nn/layers/activations.py": "244a4acb0f77fac196e3e355dcae0a5195691b7f9f12d6c5aeb243c6cb021ae1",
+    "nn/layers/base.py": "cefa99a579f3c2016b70e15c183ae5e8bbef103ce9a0d89cb3789d9aedb23503",
+    "nn/layers/containers.py": "29ef203c13d9bebb6b8cad6aadb44d1ad495e2bbc19184ca5415b6a505eb36f6",
+    "nn/layers/convolution.py": "dbcffc87c082fedeba9611d6f0028517b1ae3425641ff64164c9882001dfaf1a",
+    "nn/layers/convolution_transpose.py": "b879cc91dc655ded2b5876c4828f93516c2211b72099d72921995224ae4628ec",
+    "nn/layers/distributed.py": "d1166464c6e3bab613881a71e045754d22647e97544a395996c274b2c59eb3c2",
+    "nn/layers/dropout.py": "b5630720b002f7ab16d4c9db3b94102ce5e4f3c301d5574af04e41c9e95e7264",
+    "nn/layers/embedding.py": "b1eb18c3fa00e37741a3a180cb08fbe622da1f729084eb4057396153d7707cab",
+    "nn/layers/linear.py": "20514004a56ecfed5e03d43a7ca618a0f54ff7bca038ec565e3e9af76aa1f639",
+    "nn/layers/normalization.py": "d038fced58d7bf972e80e5ea508c9285e81bd9d523773deb50c5a935b25af9af",
+    "nn/layers/pooling.py": "0b4bf256c9cd70113b4cb7d4dc0738d12d740b139f0c401a8beb72f4b0874538",
+    "nn/layers/positional_encoding.py": "e02215591daa503f99bdd2f6b38c9641fdf381bac36641225da0911a6704ef4c",
+    "nn/layers/quantized.py": "8ca4574a212f14cbec4c446826474583ef0bf1e2cb1630574fd730c77af03b33",
+    "nn/layers/recurrent.py": "553738db5ffede77d4d97a6b431ac82475b99c34902a9a32e05b940a95f34ae7",
+    "nn/layers/transformer.py": "0661d4b2f0e21638d051e6707d700a6a82c659a4f942535f5793a7d25f4ab0c8",
+    "nn/layers/upsample.py": "c50aff4aca3cf11f7b8def94be5f0ecfb386504a89da480fab7f9a6b4a202650",
+}
+MLX_PY_PINNED_SHA256 = {tag: MLX_PY_SHA256 for tag in MLX_PINNED_RECORD}
+MLX_PY_MODULES = ("nn", "utils", "_reprlib_fix", "__array_api_info")   # the chain's entry points under mlx
 
 VISION_MODEL_TYPE = "qwen3_5"
 VISION_ARCHITECTURES = ["Qwen3_5ForConditionalGeneration"]
@@ -641,12 +678,15 @@ def _record_hash(path: str) -> str:
 
 
 def verify_mlx(find: Any = None, core_file: Any = None, pins: dict | None = None,
-               metal_pins: dict | None = None) -> str:
+               metal_pins: dict | None = None, py_pins: dict | None = None, find_spec: Any = None) -> str:
     """GuardError unless the installed mlx and mlx-metal are the released 0.32.4 wheels for this platform (module
     docstring; MLX_PINNED_RECORD): the version, one WHEEL tag that has a pinned row, the RECORD entries of the files
     that implement fast.scaled_dot_product_attention's dispatch equal to the release's, those files' bytes equal to
     them, and the mlx.core imported (`core_file`, else mlx.core.__file__) that very file, beside that libmlx.dylib.
-    `find` is importlib.metadata.distribution (tests pass a fake). Returns the mlx wheel tag."""
+    Then mlx's Python side (MLX_PY_PINNED_SHA256, #126 review round 2): every pinned file beside that mlx.core equal
+    to the release's bytes, no mlx/__init__.py, and the chain's entry modules (MLX_PY_MODULES) resolving to those
+    files (`find_spec`, importlib.util.find_spec: loads no mlx module code). `find` is importlib.metadata.distribution
+    (tests pass a fake). Returns the mlx wheel tag."""
     if find is None:
         from importlib import metadata
         find = metadata.distribution
@@ -689,16 +729,51 @@ def verify_mlx(find: Any = None, core_file: Any = None, pins: dict | None = None
     (mlx_tag, mlx_paths), (metal_tag, metal_paths) = found["mlx"], found["mlx_metal"]
     if mlx_tag.split("-")[-1] != metal_tag.split("-")[-1]:
         raise GuardError(f"mlx ({mlx_tag}) and mlx-metal ({metal_tag}) are built for different platforms")
+    # mlx's Python side, checked beside the pinned extension before `import mlx.core` runs mlx._reprlib_fix
+    pinned_core = next(iter(mlx_paths.values()))
+    verify_mlx_python(os.path.dirname(pinned_core), mlx_tag, MLX_PY_PINNED_SHA256 if py_pins is None else py_pins,
+                      find_spec)
     if core_file is None:
         import mlx.core
         core_file = getattr(mlx.core, "__file__", None)
     core = os.path.realpath(str(core_file)) if core_file else None
-    if core != next(iter(mlx_paths.values())):
+    if core != pinned_core:
         raise GuardError(f"the imported mlx.core ({core_file}) is not the pinned mlx {MLX_VERSION} extension")
     lib = os.path.realpath(os.path.join(os.path.dirname(core), "lib", "libmlx.dylib"))
     if lib != metal_paths["mlx/lib/libmlx.dylib"]:
         raise GuardError("the imported mlx.core does not sit beside the pinned mlx-metal libmlx.dylib")
     return mlx_tag
+
+
+def verify_mlx_python(mlx_dir: str, tag: str, table: dict, find_spec: Any = None) -> None:
+    """GuardError unless mlx's Python files in `mlx_dir` (the pinned mlx.core's folder) are the released 0.32.4's
+    for this wheel tag, mlx is still a namespace package there, and MLX_PY_MODULES import from those files."""
+    if tag not in table:
+        raise GuardError(f"mlx {MLX_VERSION}: no Python file pins for wheel tag {tag!r}")
+    files = {}
+    for rel, want in table[tag].items():
+        path = os.path.join(mlx_dir, *rel.split("/"))
+        try:
+            with open(path, "rb") as f:
+                got = hashlib.sha256(f.read()).hexdigest()
+        except OSError as exc:
+            raise GuardError(f"mlx/{rel} unreadable ({type(exc).__name__})") from None
+        if got != want:
+            raise GuardError(f"mlx/{rel} differs from the released {MLX_VERSION} wheel ({tag})")
+        files[rel] = os.path.realpath(path)
+    if os.path.lexists(os.path.join(mlx_dir, "__init__.py")):
+        raise GuardError(f"mlx/__init__.py exists: no released {MLX_VERSION} wheel has one (it would run on import)")
+    if find_spec is None:
+        from importlib.util import find_spec
+    for name in MLX_PY_MODULES:
+        rel = "nn/__init__.py" if name == "nn" else f"{name}.py"
+        try:
+            spec = find_spec(f"mlx.{name}")
+        except (ImportError, ValueError) as exc:
+            raise GuardError(f"mlx.{name} cannot be resolved ({type(exc).__name__})") from None
+        origin = getattr(spec, "origin", None)
+        if not origin or os.path.realpath(origin) != files.get(rel):
+            raise GuardError(f"mlx.{name} resolves to {origin!r}, not the pinned mlx/{rel}")
 
 
 def load_image_check() -> Any:
@@ -1214,6 +1289,31 @@ TEXT_ACT_BYTES = 2
 TEXT_MODEL_TYPE = "qwen3_5"
 TEXT_MODEL_MODULES = ("mlx_lm.models.qwen3_5",)
 TEXT_PREFILL_REFUSAL = "cortados guard: the text prefill could not be bounded"
+# The prefix cache (#126 review round 2, P1). vllm-mlx 0.6.0's Scheduler keeps finished prompts' KV in a prefix cache
+# (scheduler.py 1402-1445: MemoryAwarePrefixCache by default, up to 20% of the RAM free at start; the legacy
+# PrefixCacheManager; or the paged BlockAwarePrefixCache), and memory_cache.py commit_prepared (1551-1568) materialises
+# a new snapshot before it evicts, so neither the pool nor its insertion transient is in the gate's text reservation.
+# The text route serves with it OFF: serve's arguments must carry PREFIX_CACHE_FLAG (cli.py: enable_prefix_cache =
+# --enable-prefix-cache and not --disable-prefix-cache; nothing turns it back on), and every Scheduler the engine builds
+# must be given a config with enable_prefix_cache False and end up holding none of PREFIX_CACHE_ATTRS (the runtime
+# proof, install_text). No option re-enables it with a reserved budget: the pool's own accounting estimates an entry's
+# KV from its sliced arrays, while a filtered batch row's slice can keep the whole padded buffer alive, so a fixed
+# --cache-memory-mb is not a bound the gate could reserve without re-reading memory_cache.py's estimate (docs).
+PREFIX_CACHE_FLAG = "--disable-prefix-cache"
+PREFIX_CACHE_REFUSAL = ("cortados guard: the text route serves with vllm-mlx's prefix cache off "
+                        f"({PREFIX_CACHE_FLAG}): its pool is outside the gate's memory reservation")
+PREFIX_CACHE_ATTRS = ("prefix_cache", "memory_aware_cache", "block_aware_cache", "paged_cache_manager", "_ssd_tier")
+
+
+def prefix_cache_problem(config: Any) -> str | None:
+    """Why a Scheduler built with this SchedulerConfig would hold a prefix cache, or None (enable_prefix_cache is
+    False). No config is 0.6.0's default SchedulerConfig(), whose enable_prefix_cache is True."""
+    if config is None:
+        return "no scheduler config (vllm-mlx's default enables the prefix cache)"
+    on = getattr(config, "enable_prefix_cache", True)
+    if on is not False:
+        return f"enable_prefix_cache is {on!r}"
+    return None
 
 
 class TextPolicy:
@@ -1336,11 +1436,27 @@ def install_text(policy: TextPolicy, scheduler_cls: Any, batched_module: Any) ->
     policy's."""
     original = getattr(scheduler_cls, "_create_batch_generator", None)
     resolve = getattr(batched_module, "_resolve_metal_buffer_cache_limit", None)
-    if not callable(original) or not callable(resolve):
-        raise GuardError("text route: Scheduler._create_batch_generator or engine.batched."
+    sched_init = scheduler_cls.__dict__.get("__init__")
+    if not callable(original) or not callable(resolve) or not callable(sched_init):
+        raise GuardError("text route: Scheduler.__init__, Scheduler._create_batch_generator or engine.batched."
                          "_resolve_metal_buffer_cache_limit is missing: re-read the guard's text prefill argument")
-    if getattr(original, "__cortados_guard__", False) or getattr(resolve, "__cortados_guard__", False):
+    if any(getattr(f, "__cortados_guard__", False) for f in (original, resolve, sched_init)):
         raise GuardError("the text prefill guard is already installed")
+
+    def scheduler_init(self, *args, **kwargs):
+        # Scheduler(model, tokenizer, config=None) in 0.6.0 (scheduler.py 1357-1362): refuse before any cache is built
+        config = kwargs["config"] if "config" in kwargs else args[2] if len(args) > 2 else None
+        why = prefix_cache_problem(config)
+        if why is not None:
+            raise GuardError(f"{PREFIX_CACHE_REFUSAL} ({why})")
+        sched_init(self, *args, **kwargs)
+        held = [a for a in PREFIX_CACHE_ATTRS if getattr(self, a, None) is not None]
+        if held:
+            raise GuardError(f"{PREFIX_CACHE_REFUSAL} (the scheduler built {', '.join(held)})")
+
+    scheduler_init.__cortados_guard__ = True
+    scheduler_init.__wrapped__ = sched_init
+    scheduler_cls.__init__ = scheduler_init
 
     def create_batch_generator(self, *args, **kwargs):
         return enforce_text_prefill(original(self, *args, **kwargs), policy.prefill_tokens)
@@ -1464,6 +1580,8 @@ def main(argv: list[str] | None = None) -> int:
         return _usage("the text flags are for the text route; vision mode bounds its own prefill")
     if BATCHING_FLAG not in rest:
         return _usage(f"{ENGINE_REFUSAL} (`{BATCHING_FLAG}` missing from the serve arguments)")
+    if text is not None and PREFIX_CACHE_FLAG not in rest:
+        return _usage(f"{PREFIX_CACHE_REFUSAL} (`{PREFIX_CACHE_FLAG}` missing from the serve arguments)")
     try:
         _, scheduler, mllm_scheduler, api_utils, http_exception = _modules()
         if policy is not None:
@@ -1489,7 +1607,7 @@ def main(argv: list[str] | None = None) -> int:
     what = (f"; vision: {policy.max_images} images of at most {policy.image_tokens} tokens, image requests capped at "
             f"{policy.image_context_tokens}, media prefill in chunks of {policy.prefill_tokens} keeping one position's "
             "logits" if policy is not None else f"; text prefill one sequence at a time in chunks of at most "
-            f"{text.prefill_tokens}, MLX buffer cache {text.buffer_cache_bytes} bytes")
+            f"{text.prefill_tokens}, MLX buffer cache {text.buffer_cache_bytes} bytes, prefix cache off")
     print(f"cortados-vllm-mlx-guard: prompt + max_tokens capped at {own[1]} tokens (vllm-mlx {VLLM_MLX_VERSION})"
           f"{what}", file=sys.stderr)
     from vllm_mlx import cli
