@@ -609,7 +609,8 @@ an effect; permission prompts remain the guard there too.
 (the relay speaks Messages only; a `/v1/responses` request is logged and stays on S1's route); the client's
 `x-cortados-exclude-model` is honoured (an excluded sensitive model also turns the refusal fallback off); the node must
 answer its probe (on the Pro: AC power + manual switch + gate up) and list the model; the request must fit the model's
-`context_length`. A request that fails any check keeps S1's route, and the reason is logged. When a request moves, the
+`context_length`. A request that fails any check keeps S1's route, and the reason is logged; if a detector marked it,
+the reply tells the owner so ("Sensitive requests answered in the cloud" below). When a request moves, the
 routes row is rewritten under the same route_id as for auto-route, with a `sensitive: flag|keyword|refusal|s1` or
 `local: prefer` hard-rules entry. The sensitive check runs before auto-route; a request it does not move still goes
 through auto-route as before.
@@ -729,6 +730,89 @@ and nothing leaves the machine:
 - a continuation;
 - a stream that breaks after its first byte;
 - a 4xx.
+
+**Sensitive requests answered in the cloud: warn, then use the cloud (#124).** Owner decision 2026-11-15: a request a
+sensitivity detector marked normally runs only on the Pro. When the Pro cannot take it, the request goes to the cloud
+anyway, and the owner is told. The same rule covers private data sent while the Pro is away. The detectors are the
+`x-cortados-local: sensitive` flag, the node keyword list, the S1 signal, a detector that could not be read
+(`unknown`), and a cloud refusal whose fallback was not taken. One mechanism serves every path
+(`provider/sensitive_notice.py`):
+
+- **Routing** (`routing.choose`). A marked request that `sensitive_local` did not take stays on S1's cloud route.
+  That route then carries `sensitive_cloud: {detector, reason}`, and the reason is the first node's skip as a
+  category (`routing.why_category`): `switched_off`, `on_battery`, `unavailable` (no answer to the probe, or inside
+  the `AUTO_DOWN_S` window, which keeps the reason of the probe that opened it), `busy`, `model_missing`,
+  `too_large` (over the model's context or the gate's memory), `excluded`, `outward_effect`, `s1_degraded`,
+  `not_admitted`, `responses_wire` (the local relay speaks Messages only, so a flagged `/v1/responses` request
+  always lands here), `not_configured` (no node has a `sensitive` section) or `config_error`.
+- **Gate refusals of a bound opening turn** (`local_lane.TOO_LARGE` / `UNSUPPORTED`). The re-route names the gate's
+  outcome (`too_large`, `unsupported`), with the detector from the new route or from the one the local bind recorded
+  (`sensitivity` on the local route).
+- **Refusals** (`server.Handler._refusal_fallback`). A refused opening turn whose fallback was not taken leads with the
+  notice under detector `cloud refusal`, with the node's skip reason, `no_answer`, `not_admitted`, `tools_ran` or
+  `responses_wire`.
+- **Refused continuations** (review round 2). A turn after the opening one is never moved (a turn with tool effects is
+  never re-run, and moving a later turn is the unbuilt rebuild-on-409 follow-up), but when the cloud model refuses it
+  the refusal detector has fired all the same: the refusal leads with its own notice under reason
+  `refused_continuation`, and the route row records it unless the row already holds a record (the first detection
+  stays; the log line names every one). Rows written before round 2 may hold `not_opening_turn`, still valid.
+- **Unchanged (#122).** A node 5xx on a sensitive request is answered from the node and never re-routed, so it never
+  reaches this path.
+
+**What the client sees.** The opening turn carries the notice, because that is the turn whose routing kept the
+request off the Pro; a later turn carries one only when the cloud model refused it. It comes as its own leading text
+block, before the model's content:
+
+    ⚠ CortadOS: this request was marked sensitive (<detector>) but the Pro couldn't take it (<reason>), so it was answered by <model> in the cloud.
+
+A refused continuation reads instead:
+
+    ⚠ CortadOS: <model> in the cloud refused this turn (marked sensitive: cloud refusal). The turn was not moved to the Pro (refusal after the opening turn): only a conversation's opening turn can be moved, so the refusal stands.
+
+On `/v1/messages` it is content block 0, in both the JSON reply and SSE (start, delta and stop at index 0, so the
+model's blocks follow from index 1). On `/v1/responses` it is a separate leading `message` output item (output_index
+0). `tool_use` blocks, `function_call` items and the stop reason are the model's own, unchanged. The text names fixed
+detector and reason labels and the routed model only, never a keyword, a matched term or request text. A value outside
+the vocabulary is shown as the fallback label, never as itself.
+
+**History.** The delivered form is the only form (review round 5; rounds 2 and 3 stripped the notice back out of
+history, round 4 accepted recorded variant forms by content, and each rule broke: content-keyed provenance let an edit
+to one turn pass as another turn's accepted form). The session's history holds the reply exactly as the client received
+it, notice included, and every history comparison is plain equality against that delivered form, on both wires and for
+the replay of a retried turn (which stores the reply as shown). A client that sends an earlier turn in any other form
+(the notice merged into the model's text or dropped, for example by its own compaction) has rewritten its history, and
+it is handled like any other rewritten history: the rebuild-on-rewrite path or the 409, with the same rebuild budget and
+terminal behaviour, and no special case. So, as for any edited reply: when the changed turn is the request's last
+reply, no live session wrote it and the request gets the existing terminal refusal; when a later reply is intact, the
+conversation is rebuilt once from the lineage's budget. A rebuilt backend's transcript replays the client's text as
+sent, with no labelling by wording (wording cannot tell model text from provider text): the rebuilt model may read the
+notice as part of a past assistant turn. That is harmless and intended: the notice is true and is part of what the
+user saw. Nothing is kept per injection, so no conversation state grows with notices. Two different notice-only replies
+have different fingerprints (the notice text is in them).
+
+**Opt-out.** A caller that must not get injected text (one parsing the reply as data) sends
+`x-cortados-sensitive-notice: off` on the request. Only the block is suppressed: the warning log line and the route
+row's record are still written, marked `opted_out`. Any other value, or no header, shows the notice.
+
+**Record.** Each warned turn is:
+
+- logged as a warning: `sensitive-cloud: route <id> marked by <detector> answered in the cloud by <provider>/<model>:
+  the Pro did not take it (<reason>); notice shown|opted_out`;
+- written to the route's router.db row as `sensitive_cloud` (JSON `{detector, reason, notice}`, written by
+  `core.log_sensitive_cloud`; a nullable column added on open like the token columns; a lost write is counted like any
+  route-log error, #99).
+
+GET /v1/cortados/tasks publishes it per decision, re-validated against the vocabulary (anything else is dropped), and
+counts it in `totals.sensitive_cloud`. The Live view's routed calls carry it, and the dashboard's Routed calls and
+Decisions tables show it in a "sensitive in cloud" column.
+
+**Not covered (by design).** These cases get no notice:
+
+- a `sub/` or `api/` pin: the person chose the model, and `choose` ignores the flag for a pin;
+- the web-search lane: a search is an outward call by nature, and the Pro has no search;
+- a fixed-model endpoint (`--fixed-model`): no routing, so no detector runs;
+- a later turn of a conversation already on a cloud model whose new words match a keyword: a conversation is routed
+  once, and this turn did not go to the cloud because the Pro could not take it.
 
 **Context length must match the node.** A model's `context_length` here is only the provider's input-fit gate; Ollama
 uses the node's own `OLLAMA_CONTEXT_LENGTH` (or Ollama.app's setting). Set the node to the same value, or requests the

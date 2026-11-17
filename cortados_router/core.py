@@ -994,6 +994,10 @@ CREATE INDEX IF NOT EXISTS routes_ts ON routes(ts);"""
 TOKEN_COLUMNS = (("tok_input", "INTEGER"), ("tok_output", "INTEGER"), ("tok_cache_read", "INTEGER"),
                  ("tok_cache_write", "INTEGER"), ("tok_turns", "INTEGER"), ("office_session", "TEXT"),
                  ("office_origin", "TEXT"), ("office_run", "TEXT"), ("office_via", "TEXT"))
+# #124: a request a sensitivity detector marked, answered in the cloud because the Pro could not take it. JSON of
+# provider/sensitive_notice.record (detector, reason, notice shown or opted out: fixed categories, never text); NULL for
+# every other route. Additive and nullable like the token columns.
+EXTRA_COLUMNS = TOKEN_COLUMNS + (("sensitive_cloud", "TEXT"),)
 
 
 def _db() -> sqlite3.Connection:
@@ -1011,7 +1015,7 @@ def _db() -> sqlite3.Connection:
     # columns only, so an old reader never sees a change and a NULL means "not recorded" (rows from before this). Two
     # processes opening an old db at once can both try the same ALTER: the loser's "duplicate column" is the outcome
     # it wanted, so only that error is passed over.
-    for col, kind in TOKEN_COLUMNS:
+    for col, kind in EXTRA_COLUMNS:
         if col not in cols:
             try:
                 c.execute(f"ALTER TABLE routes ADD COLUMN {col} {kind}")
@@ -1085,6 +1089,16 @@ def log_execution(route_id: str, provider: str, model: str) -> None:
 def log_outcome(turn_id: str, response_chars: int, turn_ms: int) -> None:
     _write_routes("log_outcome", lambda c: c.execute("UPDATE routes SET response_chars=?, turn_ms=? WHERE turn_id=?",
                                                      (response_chars, turn_ms, turn_id)), raise_final=True)
+
+
+def log_sensitive_cloud(turn_id: str, record: dict[str, Any]) -> bool:
+    """Mark a route's row as a sensitive request answered in the cloud (#124). `record` is sensitive_notice.record's
+    categories; only its three known keys are written, as strings. Never raises sqlite3.Error (a lost write is counted
+    in router_db, #99): the reply was already good. Returns False when it was not written."""
+    rec = {k: str(record.get(k)) for k in ("detector", "reason", "notice") if record.get(k) is not None}
+    return _write_routes("log_sensitive_cloud", lambda c: c.execute(
+        "UPDATE routes SET sensitive_cloud=? WHERE turn_id=?", (json.dumps(rec, sort_keys=True), turn_id)),
+        raise_final=False)
 
 
 def log_tokens(turn_id: str, usage: dict[str, Any], office_session: str | None = None, *,

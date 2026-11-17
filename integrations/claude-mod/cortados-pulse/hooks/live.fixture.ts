@@ -678,7 +678,8 @@ export default {
         "degraded": false,
         "s1_reason": "S1 decision; band R2; steps=1",
         "request_chars": 900,
-        "response_chars": 300
+        "response_chars": 300,
+        "sensitive_cloud": null
       },
       {
         "ts": 1799999940.0,
@@ -693,7 +694,8 @@ export default {
         "degraded": false,
         "s1_reason": "S1 decision; band R2; steps=1",
         "request_chars": 900,
-        "response_chars": 300
+        "response_chars": 300,
+        "sensitive_cloud": null
       },
       {
         "ts": 1799999880.0,
@@ -708,7 +710,8 @@ export default {
         "degraded": false,
         "s1_reason": "S1 decision; band R2; steps=1",
         "request_chars": 900,
-        "response_chars": 300
+        "response_chars": 300,
+        "sensitive_cloud": null
       }
     ],
     "totals": {

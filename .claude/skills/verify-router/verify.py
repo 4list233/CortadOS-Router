@@ -409,6 +409,79 @@ print(json.dumps({"flag": route(easy, "sensitive"), "keyword": route("explain th
                   "prefer": route(easy, "prefer")}))
 """
 
+# Sensitive requests answered in the cloud (#124, owner 2026-11-15: warn, then use cloud). S1-free: the real
+# routing.choose on a synthetic S1-shaped R3 route (select stubbed, no route log), a faked probe and throwaway config.
+# A flagged or keyword request the Pro cannot take (switched off, on battery, the /v1/responses wire) keeps the cloud route
+# and carries the mark (detector + reason categories); a request no detector marks, or one only `prefer`s, carries none.
+# Then the real wires: the notice is content block 0 / output item 0, the model's blocks follow with their own indices and
+# stop reason. History (review round 5, the delivered form is the only form): the session's entry is the reply as
+# delivered and matching is plain equality, so a merged or dropped notice is a different entry (a rewrite, never exact);
+# the Responses wire's echoed items fingerprint to the delivered entry, and a rebuilt transcript replays client text as
+# sent (no label, nothing removed).
+NOTICE_SCENARIO = """
+import json, os, sys, tempfile
+from cortados_router import core
+from cortados_router.provider import anthropic_wire, local_lane, responses_wire, routing, sensitive_notice
+d = tempfile.mkdtemp()
+kw = os.path.join(d, "keywords.txt")
+open(kw, "w").write("verify placeholder term\\n")
+cfg = os.path.join(d, "resources.json")
+json.dump({"nodes": [{"id": "pro", "ollama": {"base_url": "http://127.0.0.1:9",
+           "sensitive": {"model": "verify-local", "keywords_file": kw, "refusal_fallback": True},
+           "models": [{"id": "verify/local:tag", "alias": "verify-local", "context_length": 65536}]}}]}, open(cfg, "w"))
+os.environ[local_lane.CONFIG_ENV] = cfg
+state = {"down": None}
+def probe(node):
+    if state["down"]:
+        raise local_lane.LocalUnavailable(state["down"])
+    return {"verify/local:tag"}
+local_lane.probe = probe
+core.log_route = lambda *a, **k: True
+answers = {"outward": False, "blast_radius": 0}
+s1 = {"router": "cortados", "provider": "claude-cli", "model": "claude-verify", "band": "R3", "route_id": "verify:notice",
+      "degraded": False, "decision": {"answers": answers, "degraded": False, "engine": "s1", "engine_ms": 1},
+      "route": {"band": "R3", "chosen": {"lane": "claude", "provider": "claude-cli", "model": "claude-verify"},
+                "hard_rules": []}}
+routing.execution_routing.select = lambda core_, **k: json.loads(json.dumps(s1))
+def mark(text, local=None, down=None, **extra):
+    state["down"] = down
+    routing._auto_down.clear()
+    body = {"model": "cortados", "messages": [{"role": "user", "content": text}], **extra}
+    r = routing.choose(core, body, client="verify", conversation_id="verify-notice", claude_bin=sys.executable,
+                       codex_bin=sys.executable, local=local)
+    return [r.get("provider"), r.get(sensitive_notice.ROUTE_KEY)]
+off, battery = "node pro: local gate: local switch off", "node pro: local gate: local disabled: on battery"
+easy = "explain how this parser handles nested quotes"
+routes = {"flag_off": mark(easy, "sensitive", off), "keyword_battery": mark("explain the Verify Placeholder Term", None, battery),
+          "responses": mark(easy, "sensitive", **{routing.NO_LOCAL_KEY: True}), "plain_off": mark(easy, None, off),
+          "prefer_off": mark(easy, "prefer", off), "flag_up": mark(easy, "sensitive")}
+model = [{"type": "text", "text": "Let me look."}, {"type": "tool_use", "id": "toolu_v", "name": "Read", "input": {"p": 1}}]
+note = sensitive_notice.block("flag", "switched_off", "claude-verify")
+shown = sensitive_notice.prepend(model, note)
+evs = [json.loads(l[6:]) for c in anthropic_wire.sse_body(shown, "tool_use", {}) for l in c.decode().splitlines()
+       if l.startswith("data: ")]
+msg = anthropic_wire.message_json("m", "cortados", shown, "tool_use", {})
+resp = responses_wire.message_json("r", "cortados", shown, "tool_use", {})
+fp = anthropic_wire.reply_fingerprint
+merged = [{"type": "text", "text": note["text"] + "\\n\\n" + model[0]["text"]}, model[1]]
+def rebuilt(content):
+    return "".join(b.get("text", "") for b in anthropic_wire.rebuild_transcript(
+        [{"role": "user", "content": "q"}, {"role": "assistant", "content": content}]))
+rin = {"model": "cortados", "input": [{"type": "message", "role": "user", "content": "q"}, *resp["output"],
+       {"type": "message", "role": "user", "content": "next"}]}
+delivered = fp(shown)
+history = (type(delivered) is str and delivered not in (fp(merged), fp(model))
+           and responses_wire.parse_request(rin).history == [delivered])
+rebuild = note["text"] in rebuilt(shown) and model[0]["text"] in rebuilt(shown) and "[CortadOS" not in rebuilt(shown)
+print(json.dumps({"routes": routes, "text": note["text"],
+                  "sse": [[e["index"], e["content_block"]["type"]] for e in evs if e["type"] == "content_block_start"],
+                  "sse_stop": [e["delta"]["stop_reason"] for e in evs if e["type"] == "message_delta"],
+                  "json": [b["type"] for b in msg["content"]], "json_stop": msg["stop_reason"],
+                  "responses": [i["type"] for i in resp["output"]],
+                  "fingerprint": history, "rebuild": rebuild,
+                  "distinct": fp([note]) != fp([sensitive_notice.block("keyword", "busy", "x")])}))
+"""
+
 # Continuations of a local-bound conversation (review fix, 2026-11-13): every later turn of a conversation an automatic
 # rule bound to a local lane is rescored by the real S1 through routing.continuation_admission; an outward turn
 # ("email the signed invoice ... mark it paid") must not be admitted, a bounded one must be, and a degraded scorer
@@ -700,6 +773,30 @@ def main():
                f"req {r['idx'].get('qwen-27b')} -> {r['clears_non']} | refusal 8192 -> {r['refusal']} | "
                f"thinking asked 2048: flag -> {r['asked_flag'][:3]}, refusal -> {r['asked_refusal'][:3]}, "
                f"passthrough entry -> {r['asked_passthrough'][:3]}")
+
+    p = runner.run(["-c", NOTICE_SCENARIO], prefix="verify-router-notice-", timeout=300)
+    try:
+        r = _last_json(p)
+    except (ValueError, IndexError):
+        record("sensitive request the Pro cannot take is answered in the cloud with a notice (S1-free)", "FAIL",
+               (p.stderr or p.stdout).strip()[-300:])
+    else:
+        rt = r["routes"]
+        cloud = lambda x, det, why: x[0] == "claude-cli" and x[1] == {"detector": det, "reason": why}
+        ok = (cloud(rt["flag_off"], "flag", "switched_off") and cloud(rt["keyword_battery"], "keyword", "on_battery")
+              and cloud(rt["responses"], "flag", "responses_wire") and rt["plain_off"] == ["claude-cli", None]
+              and rt["prefer_off"] == ["claude-cli", None] and rt["flag_up"] == ["local-pro", None]
+              and r["sse"] == [[0, "text"], [1, "text"], [2, "tool_use"]] and r["sse_stop"] == ["tool_use"]
+              and r["json"] == ["text", "text", "tool_use"] and r["json_stop"] == "tool_use"
+              and r["responses"] == ["message", "message", "function_call"] and r["fingerprint"] is True
+              and r["rebuild"] is True and r["distinct"] is True and "verify placeholder" not in r["text"].lower())
+        record("sensitive request the Pro cannot take is answered in the cloud with a notice (S1-free)",
+               "PASS" if ok else "FAIL",
+               f"flag+off -> {rt['flag_off']} | keyword+battery -> {rt['keyword_battery']} | responses -> "
+               f"{rt['responses'][1]} | plain/prefer+off -> {rt['plain_off'][1]}/{rt['prefer_off'][1]} | flag+up -> "
+               f"{rt['flag_up'][0]} | sse {r['sse']} stop {r['sse_stop']} | responses {r['responses']} | "
+               f"history exact-only {r['fingerprint']} | rebuild replays as sent {r['rebuild']} | notice-only distinct "
+               f"{r['distinct']} | \"{r['text']}\"")
 
     p = runner.run(["-c", CONTINUATION_SCENARIO], prefix="verify-router-continuation-", timeout=300)
     try:

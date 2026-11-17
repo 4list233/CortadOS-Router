@@ -72,7 +72,7 @@ class MigrationTest(StateBase):
         core._db().close()
         after = cols(core.STATE)
         self.assertEqual(after[:len(before)], before)                    # nothing renamed, dropped or reordered
-        self.assertEqual(after[len(before):], [c for c, _ in core.TOKEN_COLUMNS])
+        self.assertEqual(after[len(before):], [c for c, _ in core.EXTRA_COLUMNS])   # tokens, then #124's record
         core._db().close()                                               # a second open changes nothing
         self.assertEqual(cols(core.STATE), after)
         c = sqlite3.connect(core.STATE / "router.db")

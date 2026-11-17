@@ -11,6 +11,9 @@ What is real here and what is not:
   the S1 inputs (answers, hard_rules) are recorded per route and published as metadata.
 - the `request`, `context`, `task_context`, `engine_error` and `features` columns are never read: the
   SELECT names its columns, and the two JSON inputs are reduced to fixed labels before publishing.
+- sensitive_cloud (#124): a request a sensitivity detector marked, answered in the cloud because the Pro could not
+  take it. Published as its fixed categories only (detector, reason, notice shown or opted out), re-validated against
+  provider/sensitive_notice's vocabulary; anything else is dropped. Counted per window in totals.sensitive_cloud.
 - tokens: recorded per routed conversation since the work-split change (core.log_tokens sums each backend turn's
   input / output / cache read / cache write onto the route's row). A row with no recorded turn (older rows, the local
   lane, a turn that never completed) says `tokens_status: not recorded` and carries no estimate. `token_totals` sums
@@ -27,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from cortados_router import core
-from cortados_router.provider import office, usage, work_split
+from cortados_router.provider import office, sensitive_notice, usage, work_split
 
 # 200 decisions gives a useful recent task table without shipping history on each 30 s dashboard
 # poll. A smaller cap hides recent tasks; a larger one costs DB read time and DOM size. One
@@ -38,6 +41,7 @@ ROW_LIMIT = 200
 # reported as "unreadable" by _reason, never silently read as "no rules".
 ANSWERS_MAX = 4096
 RULES_MAX = 16384
+SENS_MAX = 512                  # sensitive_cloud: three short category strings as JSON
 DEFINITION = (
     "% routed = 100 × routed decisions ÷ all logged decisions of that session, within the latest "
     f"{ROW_LIMIT} decisions. Routed = S1 (or its degraded fallback) selected the lane and model; pinned = the "
@@ -52,6 +56,8 @@ NOTES = [
     "Tokens are the backends' reported usage summed over a routed conversation's turns; rows from before token "
     "recording, local-lane rows and conversations with no completed turn show 'not recorded', never an estimate. "
     "Request and response sizes are recorded character counts.",
+    "Sensitive in cloud: a request a sensitivity detector (flag, keyword, S1, cloud refusal) marked, answered by a "
+    "cloud model because the Pro could not take it; shown as the detector and reason categories only.",
     "S1 reason summarises the recorded band, typed answers and hard rules by fixed category, never scorer prose; "
     "rules that can embed free text (escalation reasons, fit failures) are named by category only.",
 ]
@@ -178,7 +184,8 @@ def collect(state_dir: Path, now: float | None = None) -> dict[str, Any]:
     folded into one invented session.
     """
     view: dict[str, Any] = {
-        "tasks": [], "sessions": [], "totals": {"decisions": 0, "routed": 0, "pinned": 0, "unselected": 0},
+        "tasks": [], "sessions": [], "totals": {"decisions": 0, "routed": 0, "pinned": 0, "unselected": 0,
+                                                "sensitive_cloud": 0},
         "row_limit": ROW_LIMIT, "truncated": False, "unassigned_decisions": 0,
         "tokens_status": "not recorded", "percentage_definition": DEFINITION, "notes": list(NOTES), "errors": [],
         "token_totals": None,
@@ -200,10 +207,13 @@ def collect(state_dir: Path, now: float | None = None) -> dict[str, Any]:
             tok_sql = ("tok_input, tok_output, tok_cache_read, tok_cache_write, tok_turns" if has_tok else
                        "NULL AS tok_input, NULL AS tok_output, NULL AS tok_cache_read, NULL AS tok_cache_write, "
                        "NULL AS tok_turns")
+            has_sens = "sensitive_cloud" in {r[1] for r in conn.execute("PRAGMA table_info(routes)")}
+            sens_sql = "substr(sensitive_cloud,1,?) AS sensitive_cloud" if has_sens else "? AS sensitive_cloud"
             rows = conn.execute(
                 "SELECT turn_id, ts, session_id, lane, model, actual_model, band, engine, degraded, turn_ms, "
                 "request_chars, response_chars, substr(answers,1,?) AS answers, substr(hard_rules,1,?) AS hard_rules, "
-                f"{tok_sql} FROM routes ORDER BY ts DESC LIMIT ?", (ANSWERS_MAX, RULES_MAX, ROW_LIMIT + 1),
+                f"{tok_sql}, {sens_sql} FROM routes ORDER BY ts DESC LIMIT ?",
+                (ANSWERS_MAX, RULES_MAX, SENS_MAX if has_sens else None, ROW_LIMIT + 1),
             ).fetchall()
             view["token_totals"] = work_split.routed_tokens(conn, now if now is not None else time.time())
         finally:
@@ -239,6 +249,10 @@ def collect(state_dir: Path, now: float | None = None) -> dict[str, Any]:
         else:
             row["tokens"] = None
             row["tokens_status"] = "not recorded"
+        sens, _ = _json(row.pop("sensitive_cloud"), dict)
+        row["sensitive_cloud"] = sensitive_notice.valid_record(sens)
+        if row["sensitive_cloud"]:
+            view["totals"]["sensitive_cloud"] += 1
         row["routing_kind"] = _kind(row, pinned)
         view["tasks"].append(row)
         view["totals"]["decisions"] += 1
