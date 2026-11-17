@@ -17,8 +17,10 @@ Ollama has no authentication, so it listens on 127.0.0.1 only and this gate is t
     backend call). The count slot and the bytes are taken in one step. A request over either, now, gets a retryable
     529 overloaded_error with Retry-After at once (never queued here); one that could not fit the budget even alone gets
     a non-retryable 413 request_too_large (TOO_LARGE_MESSAGE), which the provider routes elsewhere. On vllm-mlx a turn
-    carrying non-text content (an image, a document) is refused non-retryably before admission (UNSUPPORTED_MESSAGE):
-    the node serves a text-only model. A body the gate cannot accept (another model, a chat_template_kwargs key other
+    carrying content the served model cannot take is refused non-retryably before admission (UNSUPPORTED_MESSAGE): for a
+    text-only model any non-text block; for a vision model (#125, its entry's `vision` block) anything outside its
+    still-image policy (local_governor.image_policy). An admitted image turn also takes one of the model's image slots,
+    in the same step as its count slot and bytes, and reserves its image tokens and the computed media-prefill bytes (local_governor.image_prefill_bytes). A body the gate cannot accept (another model, a chat_template_kwargs key other
     than enable_thinking, JSON nested too deeply) is a non-retryable 4xx (x-should-retry: false). The reservation is
     capped at the context because vllm-mlx runs under a prompt guard that refuses longer prompts; its refusal becomes
     the gate's never-fits 413 (local_backend.guard_refusal). Running requests are never
@@ -109,16 +111,21 @@ BUSY_MESSAGE = "local gate: busy"           # the fixed prefix of an over-limit 
 # The fixed prefix of a refusal that no retry can change: the request's reservation exceeds the node's whole byte
 # budget (local_lane.GATE_TOO_LARGE). Answered 413 request_too_large with x-should-retry: false.
 TOO_LARGE_MESSAGE = "local gate: too large for this node's memory"
-# The fixed prefix of the other refusal no retry can change: the turn carries content the node's TEXT-ONLY model cannot
-# see (an image, a document, any non-text block; local_governor.non_text_content), on a vllm-mlx node (its 27B is
-# served with the vision tower excluded). Answered 400 invalid_request_error with x-should-retry: false, before any
+# The fixed prefix of the other refusal no retry can change: the turn carries content the node's model cannot take, on
+# a vllm-mlx node: for a TEXT-ONLY model an image, a document, any non-text block (local_governor.non_text_content);
+# for a vision model anything outside its still-image policy (local_governor.image_policy, #125). Answered 400 invalid_request_error with x-should-retry: false, before any
 # admission; the provider routes the turn elsewhere (local_lane.GATE_UNSUPPORTED).
 UNSUPPORTED_MESSAGE = "local gate: content this node's model cannot read"
 # The capacity report's fields (GateServer.capacity, the 529 and 413 answers). Bytes and tokens are None without a
 # governor: reserved/free bytes of the budget beside the weights, and the most tokens one request may hold alone
 # (fit_tokens) and beside what runs now (free_tokens), which the provider's routing reads.
 CAPACITY_KEYS = ("limit", "inflight", "owner", "pressure", "reason", "reserved_bytes", "free_bytes", "fit_tokens",
-                 "free_tokens")
+                 "free_tokens", "image_inflight", "image_limit")
+# The served model's declared image capability in the report (#125): None for a text-only model, else these settings of
+# its vision policy (local_governor.VISION_DEFAULTS), so the provider sees that the node reads still images and within
+# which limits. Static config, no request data.
+VISION_REPORT_KEYS = ("max_images", "image_tokens_max", "image_context_tokens", "image_concurrency",
+                      "max_image_bytes", "max_image_pixels")
 # The gate's own switch endpoint (module docstring). Not in ROUTES: it never reaches Ollama as a forwarded request.
 SWITCH_PATH = "/cortados/local-switch"
 # A switch request body is {"on": true} or {"on": false}; 1 KiB is ample, and a larger one is refused unread.
@@ -446,7 +453,9 @@ class GateServer(ThreadingHTTPServer):
         return self.report(self.admission.snapshot())
 
     def report(self, snap: dict) -> dict:
-        return {"backend": self.backend["backend"], **{k: snap.get(k) for k in CAPACITY_KEYS}}
+        vision = self.admission.vision
+        return {"backend": self.backend["backend"], **{k: snap.get(k) for k in CAPACITY_KEYS},
+                "vision": {k: vision[k] for k in VISION_REPORT_KEYS} if vision else None}
 
     def process_request(self, request, client_address):
         if self.slots is None:                      # unlimited: no slot to take or give back
@@ -602,7 +611,7 @@ class GateHandler(BaseHTTPRequestHandler):
             if self._drain():
                 self._error(503, "overloaded_error", reason)
             return
-        body = raw = None
+        body = raw = plan = None
         if method == "POST":
             try:
                 n = int(self.headers.get("content-length") or "-1")
@@ -617,9 +626,9 @@ class GateHandler(BaseHTTPRequestHandler):
                 return
             try:
                 body = local_backend.adapt_messages_body(self.server.backend, raw)
-                # a text-only model: refused before any admission (adapt_messages_body checked the body parses)
-                why = local_governor.non_text_content(json.loads(body)) \
-                    if self.server.backend["backend"] == "vllm-mlx" else None
+                # Refused before any admission (adapt_messages_body checked the body parses): on a text-only model
+                # anything but text; on a vision model (#125) anything outside its still-image policy.
+                why, plan = self._content(json.loads(body))
             except local_backend.Refusal as exc:
                 return self._refuse(exc.status, exc.kind, str(exc))
             except RecursionError:                 # the adapted body re-parsed deeper than the original
@@ -656,11 +665,17 @@ class GateHandler(BaseHTTPRequestHandler):
                 return self._error(503, "overloaded_error", reason)
             if method == "POST":             # admission: only a model turn takes a slot, never the probe
                 adm = self.server.admission
-                # The bound comes from the body as the client sent it (raw), before the gate's own adaptation.
-                need = adm.request_bytes(local_governor.input_tokens(raw, adm.context_tokens), _max_tokens(body)) \
-                    if adm.governor is not None else 0
-                ticket, snap = adm.try_acquire(need)       # count slot and bytes together, or neither
+                images = len(plan) if plan is not None else 0
+                # The bound comes from the body as the client sent it (raw), before the gate's own adaptation; the
+                # validated image data is left out of the text bound and each image counted as image_tokens_max.
+                need = adm.request_bytes(local_governor.input_tokens(raw, adm.context_tokens,
+                                                                     plan.data_chars if images else 0),
+                                         _max_tokens(body), images) if adm.governor is not None else 0
+                # count slot, bytes and (an image turn) the image slot together, or none of them
+                ticket, snap = adm.try_acquire(need, image=images > 0)
                 if ticket is None:
+                    if snap.get("refused") == "unsupported":
+                        return self._unsupported(snap.get("reason") or "the model reads no images")
                     return self._too_large(snap) if snap.get("refused") == "too_large" else self._busy(snap)
             self._forward(method, path, body)
         finally:
@@ -706,11 +721,24 @@ class GateHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         self.close_connection = True
 
+    def _content(self, body: dict):
+        """(why the node's model cannot take this turn's content or None, the ImagePlan or None): an Ollama node is
+        not checked; a vllm-mlx node serving a text-only model takes text only (non_text_content); one serving a
+        vision model takes still images within its policy (image_policy, #125)."""
+        if self.server.backend["backend"] != "vllm-mlx":
+            return None, None
+        vision = self.server.admission.vision
+        if vision is None:
+            why = local_governor.non_text_content(body)
+            return (None if why is None else f"{why}; it serves a text-only model"), None
+        why, plan = local_governor.image_policy(body, vision)
+        return (None if why is None else f"{why}; it reads still images only, within its image policy"), plan
+
     def _unsupported(self, why: str) -> None:
-        """The text-only refusal (UNSUPPORTED_MESSAGE): 400 invalid_request_error, x-should-retry: false, no
+        """The content refusal (UNSUPPORTED_MESSAGE): 400 invalid_request_error, x-should-retry: false, no
         Retry-After. Nothing was admitted or sent to the backend; the provider routes the turn elsewhere."""
         body = json.dumps({"type": "error", "error": {"type": "invalid_request_error", "message":
-                           f"{UNSUPPORTED_MESSAGE} ({why}; it serves a text-only model)"}}).encode()
+                           f"{UNSUPPORTED_MESSAGE} ({why})"}}).encode()
         self.send_response(400)
         self.send_header("content-type", "application/json")
         self.send_header("x-should-retry", "false")

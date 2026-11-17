@@ -67,15 +67,22 @@ BACKEND="$(printf '%s' "$RESOLVED" | "$PYTHON" -I -c 'import json,sys; print(jso
 PATHS="$("$PYTHON" -B -m cortados_router.local_backend --config "$CONFIG" --install-paths)"
 path_of() { printf '%s' "$PATHS" | "$PYTHON" -I -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
 VPY="$(path_of python)"; GUARD="$(path_of guard)"; GUARD_SRC="$(path_of guard_source)"; MODEL_DIR="$(path_of model)"
+# The still-image checker the guard imports in vision mode (#125), and the guard's vision flags (none: text-only).
+IMGCHK="$(path_of image_check)"; IMGCHK_SRC="$(path_of image_check_source)"
+CHECK_ARGS="$(printf '%s' "$PATHS" | "$PYTHON" -I -c 'import json,sys; print(" ".join(json.load(sys.stdin)["check_args"]))')"
 [ -x "$VPY" ] || die "no python at $VPY (the venv the config names, with vllm-mlx 0.6.0 installed)"
 [ -f "$GUARD_SRC" ] || die "no guard source at $GUARD_SRC"
+[ -f "$IMGCHK_SRC" ] || die "no image checker source at $IMGCHK_SRC"
 [ -d "$MODEL_DIR" ] || die "no model directory at $MODEL_DIR (vllm_mlx.models.<model>.path in $CONFIG)"
-# The guard's own check, run from the source: vllm-mlx version and pinned files, and the model's route.
-"$VPY" -B "$GUARD_SRC" --check "$MODEL_DIR" || die "the prompt guard refused this venv or model; nothing was installed"
+# The guard's own check, run from the source: vllm-mlx version and pinned files, and the model's route (in vision mode
+# also mlx-vlm's and mlx / mlx-metal's versions and pins and the model's verified qwen3_5 geometry). CHECK_ARGS is
+# flags only, split on purpose.
+# shellcheck disable=SC2086
+"$VPY" -B "$GUARD_SRC" --check "$MODEL_DIR" $CHECK_ARGS || die "the prompt guard refused this venv or model; nothing was installed"
 PLIST_XML="$("$PYTHON" -B -m cortados_router.local_backend --config "$CONFIG" --plist "$LOG_DIR")"
 
 if [ "$DRY" = 1 ]; then
-  echo "# would copy $GUARD_SRC to $GUARD"
+  echo "# would copy $GUARD_SRC to $GUARD and $IMGCHK_SRC to $IMGCHK"
   echo "# $PLIST"
   printf '%s\n' "$PLIST_XML"
   echo "# then: $LAUNCHCTL bootout gui/$(id -u)/$LABEL; $LAUNCHCTL bootstrap gui/$(id -u) $PLIST"
@@ -83,6 +90,7 @@ if [ "$DRY" = 1 ]; then
 fi
 
 mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+install -m 0644 "$IMGCHK_SRC" "$IMGCHK.tmp" && mv "$IMGCHK.tmp" "$IMGCHK"
 install -m 0644 "$GUARD_SRC" "$GUARD.tmp" && mv "$GUARD.tmp" "$GUARD"
 printf '%s\n' "$PLIST_XML" > "$PLIST.tmp" && mv "$PLIST.tmp" "$PLIST"
 chmod 644 "$PLIST"

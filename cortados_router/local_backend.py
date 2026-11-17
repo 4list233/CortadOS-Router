@@ -56,6 +56,10 @@ LAUNCH_LABEL = "com.cortados.vllm-mlx"
 # The prompt guard: its source in this checkout, and its name in the venv's bin/ (install_mlx_backend.sh copies it).
 GUARD_SOURCE = Path(__file__).resolve().parent.parent / "integrations" / "vllm-mlx" / "cortados_vllm_mlx_guard.py"
 GUARD_NAME = "cortados-vllm-mlx-guard.py"
+# The still-image checker the guard imports in vision mode (#125): this package's image_check.py, copied next to the
+# guard under an importable name (the guard's directory is first on its sys.path).
+IMAGE_CHECK_SOURCE = Path(__file__).resolve().parent / "image_check.py"
+IMAGE_CHECK_NAME = "cortados_image_check.py"
 # The prefix of the guard's refusal (cortados_vllm_mlx_guard.REFUSAL; a test keeps the two equal).
 GUARD_REFUSAL = "cortados guard: prompt too long for this node's context"
 # The chat_template_kwargs a request may carry to vllm-mlx, with the type each must have. Only what routing needs:
@@ -256,6 +260,10 @@ def check(raw: Any, path: str | None = None) -> dict[str, Any]:
         out["governor"] = local_governor.check_config(gov, model) if gov is not None else None
     except local_governor.GovernorConfigError as exc:
         raise BackendConfigError(str(exc)) from None
+    if model is not None and model.get("vision") not in (None, False) and out["governor"] is None:
+        # Images are admitted only by the governor's reservation (image tokens, computed prefill bytes, image slots).
+        raise BackendConfigError(f"vllm_mlx.models.{out['model']['key']}.vision "
+                                 "needs a `governor` section: image turns are admitted by its reservation")
     return out
 
 
@@ -364,7 +372,25 @@ def install_paths(cfg: dict[str, Any]) -> dict[str, str]:
         raise BackendConfigError("install paths need backend vllm-mlx")
     bin_dir = Path(_expand(cfg["venv"])) / "bin"
     return {"python": str(bin_dir / "python"), "guard": str(bin_dir / GUARD_NAME), "guard_source": str(GUARD_SOURCE),
-            "model": _expand(cfg["model"]["path"])}
+            "image_check": str(bin_dir / IMAGE_CHECK_NAME), "image_check_source": str(IMAGE_CHECK_SOURCE),
+            "model": _expand(cfg["model"]["path"]), "check_args": vision_argv(cfg)}
+
+
+def vision_argv(cfg: dict[str, Any]) -> list[str]:
+    """The guard's vision flags for the served model (#125): none for a text-only model (the guard then refuses the
+    multimodal route, as before); for a model entry with a `vision` block, --vision and its image policy, which the
+    guard enforces inside vllm-mlx (cortados_vllm_mlx_guard.py, "Vision mode"), plus the media prefill's chunk and
+    the model dimensions the gate's image reservation was computed from (local_governor.image_prefill_bytes), which
+    the guard checks against the model's config.json."""
+    gov = cfg.get("governor") or local_governor.check_config({}, cfg["model"])
+    v = gov.get("vision")
+    if not v:
+        return []
+    dims = ",".join(f"{k}={v[k]}" for k in (*local_governor.VISION_DIM_KEYS, "act_bytes"))
+    return ["--vision", "--max-images", str(v["max_images"]), "--image-tokens", str(v["image_tokens_max"]),
+            "--image-context-tokens", str(v["image_context_tokens"]), "--max-image-bytes", str(v["max_image_bytes"]),
+            "--max-image-pixels", str(v["max_image_pixels"]), "--image-prefill-tokens", str(v["prefill_chunk_tokens"]),
+            "--image-dims", dims]
 
 
 def serve_argv(cfg: dict[str, Any]) -> list[str]:
@@ -378,7 +404,7 @@ def serve_argv(cfg: dict[str, Any]) -> list[str]:
     # many empty-context reservations fit the byte budget), so a request that slipped past the gate could not add more.
     seqs = local_governor.max_seqs(gov)
     paths = install_paths(cfg)
-    argv = [paths["python"], paths["guard"], "--context-tokens", str(gov["context_tokens"]), "--",
+    argv = [paths["python"], paths["guard"], "--context-tokens", str(gov["context_tokens"]), *vision_argv(cfg), "--",
             "serve", paths["model"],
             "--served-model-name", cfg["served_model"], "--host", s["host"], "--port", str(s["port"]),
             "--continuous-batching", "--max-num-seqs", str(seqs),

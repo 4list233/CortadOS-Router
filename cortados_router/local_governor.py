@@ -34,6 +34,17 @@ and a request is admitted only while the reservations in flight plus its own fit
   memory_budget_bytes - weights_bytes.
 The count slot and the bytes are taken together (Admission.try_acquire). A request a text-only model cannot read
 (non_text_content: an image, a document) is refused by the gate before admission.
+
+IMAGES (#125, a model entry with a `vision` block: check_vision): a vision model takes STILL images within its policy
+(image_policy: count, inline base64 only, type, encoded bytes, real file type, header dimensions and pixels, user
+messages only, never inside a tool_result, which vllm-mlx 0.6.0's adapter would drop). An image-bearing request reserves
+  tokens   = min(text input tokens + images x image_tokens_max + max_tokens, image_context_tokens)
+  reserved = tokens * kv_bytes_per_token + per_seq_state_bytes + image_prefill_bytes(tokens, images)
+where the text input bound is input_tokens() with the validated image data's bytes left out (the base64 is not text the
+model reads; every other byte of the body still counts), and image_tokens_max bounds each image's tokens from above (the
+guard sets the processor's max_pixels to it). image_prefill_bytes is the computed worst case of the guard's chunked media
+prefill (its docstring has the formula and every input; docs/LOCAL-RESOURCES.md "Vision" the reasoning), not a fixed
+margin. It also takes one of image_concurrency image slots, in the same atomic step as the count slot and the bytes.
 Defaults (Qwen3.8 27B, 4-bit): 64 KiB per token (16 full-attention layers x K/V x 4 KV heads x head_dim 256 x fp16),
 0.15 GiB recurrent state, 1.5 GiB prefill margin: a 128k-token request reserves 9.65 GiB, so two fit beside 15 GiB of
 weights in a 40 GiB budget and a third does not, while eight ~9k-token requests (2.2 GiB each) fit.
@@ -56,6 +67,8 @@ import threading
 import time
 import unicodedata
 from typing import Any, Callable
+
+from cortados_router import image_check
 
 GIB = 2 ** 30
 # Every threshold, its default and the reason for it. The example config (tables/local-backend.example.json) repeats
@@ -155,6 +168,119 @@ class GovernorConfigError(ValueError):
     pass
 
 
+# A vision model's still-image policy (#125, owner decisions 2026-11-15/16), each a model entry's `vision` key. Initial
+# values until measured; tables/local-backend.example.json repeats each reason next to its value.
+VISION_DEFAULTS: dict[str, int] = {
+    # Up to 5 still images per request.
+    "max_images": 5,
+    # Each image at most 1,024 language-model tokens: Qwen3.5's 16-pixel patches merged 2x2 make 1,024 pixels per
+    # token, so ~1 megapixel after the processor's resize (the guard sets the processor's max_pixels to
+    # image_tokens_max x 1,024; upstream allows 16.7 MP = 16,384 tokens and 1 GiB of KV cache per image).
+    "image_tokens_max": 1024,
+    # An image-bearing request is capped at a 64k combined context (input + max_tokens) until measured; the guard
+    # refuses a longer one exactly, after counting its image tokens.
+    "image_context_tokens": 65536,
+    # One image-bearing request at a time until measured (vision encoding is the unmeasured peak).
+    "image_concurrency": 1,
+    # Encoded bytes per image (decoded from base64): the Anthropic API's own 5 MB per image, so a turn the cloud takes
+    # fits here too.
+    "max_image_bytes": 5 * 2 ** 20,
+    # Decoded pixels per image, from the file header before anything is decoded (a decompression bomb is refused from
+    # its header): 32 Mi pixels holds an 8K screenshot (7680 x 4320); the guard sets PIL's bomb limit to the same.
+    "max_image_pixels": 32 * 2 ** 20,
+    # ---- image_prefill_bytes(): the computed worst case of the guard's chunked media prefill (#125 review round 2).
+    # The guard prefills an image-bearing prompt in chunks of this many tokens, projecting only the last position to
+    # the vocabulary (cortados_vllm_mlx_guard.py "Media prefill"); the guard gets the same number
+    # (--image-prefill-tokens). The full-attention head_dim 256 is outside MLX's fused attention kernel (mlx-vlm
+    # 0.7.12 models/base.py ensure_fused_sdpa: 64/80/128), so each chunk materializes heads x chunk x context scores:
+    # 256 keeps them at 3 GiB at the 64k image context (1,024 would be 12 GiB).
+    "prefill_chunk_tokens": 256,
+    # Score-sized buffers counted per chunk: the q.k^T product, the causal-masked copy, the softmax output, and one
+    # more for the allocator holding the previous layer's buffer until it is reused.
+    "score_buffers": 4,
+    # Bytes per activation element: the model computes in bfloat16 (config.json's dtype; the guard refuses a wider one).
+    "act_bytes": 2,
+    # The model's dimensions (config.json; the guard refuses to start vision mode when they differ, --image-dims):
+    # Qwen3.8 27B (qwen3_5) text_config, and its vision_config's widths.
+    "hidden_size": 5120,
+    "intermediate_size": 17408,
+    "num_attention_heads": 24,
+    "num_key_value_heads": 4,
+    "head_dim": 256,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 48,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "vocab_size": 248320,
+    "vision_hidden_size": 1152,
+    "vision_intermediate_size": 4304,
+    # The vision encoder's attention heads and depth (vision_config num_heads, depth): 1,152 / 16 = head_dim 72.
+    "vision_num_heads": 16,
+    "vision_depth": 27,
+}
+# The keys of VISION_DEFAULTS the guard checks against the model's config.json (--image-dims, in this order).
+VISION_DIM_KEYS = ("hidden_size", "intermediate_size", "num_attention_heads", "num_key_value_heads", "head_dim",
+                   "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
+                   "vocab_size", "vision_hidden_size", "vision_intermediate_size", "vision_num_heads", "vision_depth")
+# #125 review round 4: vision mode serves exactly ONE verified geometry, the Pro's Qwen3.8 27B (config.json checked by
+# the orchestrator 2026-11-16; the guard's VISION_DIMS_ALLOWED and VISION_ENCODER_CONFIG are the same values). Every
+# dimension and act_bytes is fixed: a `vision` block may repeat them but never change them, because the reservation
+# below is argued for this geometry only (rounds 2 and 3 each found a geometry the general formula did not bound). A
+# future model gets its own allowlist entry with its own reservation argument (docs/LOCAL-RESOURCES.md "Vision").
+VISION_FIXED_KEYS = (*VISION_DIM_KEYS, "act_bytes")
+# The tower's attention runs through mlx-vlm 0.7.12's ensure_fused_sdpa (models/base.py, pinned), which zero-pads
+# q, k and v from head_dim d to the first of (64, 80, 128) that is >= d and calls MLX's fused
+# mx.fast.scaled_dot_product_attention (mlx 0.32.4 / mlx-metal 0.32.4, pinned by the guard); its output is the padded
+# width too, sliced back to d. For this geometry d = 1,152 / 16 = 72, so the pad target is 80 and the padded
+# per-patch width 16 x 80 = 1,280 (not 1,152): image_prefill_bytes counts the four padded tensors at that width.
+FUSED_SDPA_HEAD_DIMS = (64, 80, 128)
+VISION_HEAD_DIM = VISION_DEFAULTS["vision_hidden_size"] // VISION_DEFAULTS["vision_num_heads"]            # 72
+VISION_PADDED_HEAD_DIM = next(t for t in FUSED_SDPA_HEAD_DIMS if VISION_HEAD_DIM <= t)                   # 80
+VISION_PADDED_WIDTH = VISION_DEFAULTS["vision_num_heads"] * VISION_PADDED_HEAD_DIM                       # 1,280
+# Keys a vision block may no longer carry, refused by name (the fixed margins the computed reservation replaced).
+VISION_REPLACED = {"vision_margin_bytes": "image_prefill_bytes(), computed from the model's dimensions "
+                                          "(docs/LOCAL-RESOURCES.md \"Vision\")"}
+# Qwen3.5's vision geometry (the guard's VISION_GEOMETRY, checked at startup): 16-pixel patches, stills duplicated
+# over a temporal patch of 2, 3 channels, merged 2 x 2 into one language-model token.
+IMAGE_PATCH_VALUES = 3 * 2 * 16 * 16
+PATCHES_PER_IMAGE_TOKEN = 2 * 2
+
+
+def check_vision(raw: Any, cfg: dict[str, Any] | None = None) -> dict[str, int] | None:
+    """A model entry's `vision` block, validated (None: a text-only model). `true` is every default. Positive integers
+    only; image_context_tokens no more than the model's context_tokens (cfg), and room for one image in it."""
+    if raw is None or raw is False:
+        return None
+    if raw is True:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise GovernorConfigError("vision must be an object, true, or absent")
+    out = dict(VISION_DEFAULTS)
+    for key, v in raw.items():
+        if key.startswith("_"):
+            continue
+        if key in VISION_REPLACED:
+            raise GovernorConfigError(f"vision: {key} was replaced by {VISION_REPLACED[key]}")
+        if key not in VISION_DEFAULTS:
+            raise GovernorConfigError(f"vision: unknown key {key!r}")
+        out[key] = v
+    for key, v in out.items():
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            raise GovernorConfigError(f"vision: {key} must be a positive integer, got {v!r}")
+    if cfg is not None and out["image_context_tokens"] > cfg["context_tokens"]:
+        raise GovernorConfigError("vision: image_context_tokens must not exceed context_tokens")
+    if out["image_tokens_max"] >= out["image_context_tokens"]:
+        raise GovernorConfigError("vision: image_tokens_max must be below image_context_tokens")
+    if out["prefill_chunk_tokens"] > out["image_context_tokens"]:
+        raise GovernorConfigError("vision: prefill_chunk_tokens must not exceed image_context_tokens")
+    for key in VISION_FIXED_KEYS:
+        if out[key] != VISION_DEFAULTS[key]:
+            raise GovernorConfigError(f"vision: {key} is {out[key]!r}, but vision mode serves only the verified "
+                                      f"geometry ({key} {VISION_DEFAULTS[key]}); a different model needs its own "
+                                      "allowlist entry and reservation (docs/LOCAL-RESOURCES.md \"Vision\")")
+    return out
+
+
 def check_config(raw: dict[str, Any] | None, model: dict[str, Any] | None = None) -> dict[str, Any]:
     """The governor settings: DEFAULTS, then the config's `governor` section, then the model entry's MODEL_KEYS.
     Unknown keys and bad values are refused (a threshold silently ignored would govern by a number nobody chose)."""
@@ -188,6 +314,17 @@ def check_config(raw: dict[str, Any] | None, model: dict[str, Any] | None = None
         raise GovernorConfigError(f"governor: unknown_pressure must be one of {', '.join(PRESSURES)}")
     if out["idle_cap"] < 1:
         raise GovernorConfigError("governor: idle_cap must be at least 1")
+    # The model's declared image capability (None: text-only), checked against this context.
+    out["vision"] = check_vision(model.get("vision"), out)
+    if out["vision"]:
+        # An image_tokens_max (or any policy) whose smallest image turn (one image at image_tokens_max, nothing else)
+        # could never be admitted is refused here rather than served as a node that answers every image too_large:
+        # the computed peak, with the encoder's padded widths, must fit the budget beside the weights.
+        one = request_bytes(out, 0, 1, images=1)
+        if one > available_bytes(out):
+            raise GovernorConfigError(f"vision: one image turn reserves {_gib(one)} GiB, more than the "
+                                      f"{_gib(available_bytes(out))} GiB budget beside the weights; lower "
+                                      "image_tokens_max or check the vision dimensions")
     return out
 
 
@@ -260,6 +397,66 @@ def non_text_content(body: dict[str, Any]) -> str | None:
             if kind == "tool_result" and isinstance(b.get("content"), list) and not _text_only_list(b["content"]):
                 return f"non-text tool_result content in message {i + 1}"
     return None
+
+
+class ImagePlan:
+    """What image_policy found in a request a vision model may serve: the images (each {"kind", "width", "height",
+    "bytes"}) and `data_chars`, the characters of their validated base64 data, which the text bound leaves out."""
+
+    def __init__(self, images: list[dict[str, Any]], data_chars: int):
+        self.images, self.data_chars = images, data_chars
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+
+def image_policy(body: dict[str, Any], vision: dict[str, Any]) -> tuple[str | None, ImagePlan]:
+    """(why refused or None, ImagePlan) for a VISION model (#125; module docstring "IMAGES"). Text-only content follows
+    non_text_content's rules. On top of them an image block is taken only:
+      * in a user message's own content (not the system prompt, not an assistant turn, never inside a tool_result:
+        vllm-mlx 0.6.0's adapter keeps only the text of a tool_result, so an image there would be dropped silently);
+      * as an inline base64 source (a url source would make the node fetch it: refused, nothing is fetched);
+      * within image_check: PNG / JPEG / WebP still, real type equal to the declared media_type, at most
+        max_image_bytes decoded, header dimensions at most max_image_pixels, aspect ratio at most 200;
+      * at most max_images of them in the request.
+    Every other non-text block (a document, ...) is refused as before. The first problem is reported; nothing of the
+    image is in the message."""
+    images: list[dict[str, Any]] = []
+    chars = 0
+    system = body.get("system")
+    if isinstance(system, list) and not _text_only_list(system):
+        return "non-text system block", ImagePlan([], 0)
+    for i, m in enumerate(_messages(body)):
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            kind = b.get("type") if isinstance(b, dict) else None
+            if kind == "image":
+                if m.get("role") != "user":
+                    return f"image in a non-user message {i + 1}", ImagePlan([], 0)
+                src = b.get("source")
+                if not isinstance(src, dict) or src.get("type") != "base64":
+                    return (f"image in message {i + 1} is not an inline base64 image (url and other sources are "
+                            "not fetched)"), ImagePlan([], 0)
+                if len(images) >= vision["max_images"]:
+                    return f"more than {vision['max_images']} images", ImagePlan([], 0)
+                try:
+                    info, _ = image_check.check_base64(src.get("media_type"), src.get("data"),
+                                                       max_bytes=vision["max_image_bytes"],
+                                                       max_pixels=vision["max_image_pixels"])
+                except image_check.ImageRefused as exc:
+                    return f"image {len(images) + 1} (message {i + 1}): {exc}", ImagePlan([], 0)
+                images.append(info)
+                chars += len(src["data"])
+                continue
+            if kind not in TEXT_BLOCKS:
+                name = kind if isinstance(kind, str) and kind.isidentifier() and len(kind) <= 40 else "non-text"
+                return f"{name} block in message {i + 1}", ImagePlan([], 0)
+            if kind == "tool_result" and isinstance(b.get("content"), list) and not _text_only_list(b["content"]):
+                return (f"non-text tool_result content in message {i + 1} (images inside a tool result are not "
+                        "carried to the model)"), ImagePlan([], 0)
+    return None, ImagePlan(images, chars)
 
 
 # What vllm-mlx's adapter (api/anthropic_adapter._convert_tool) sends for a tool defined without input_schema.
@@ -384,23 +581,27 @@ def normalization_bytes(body: dict[str, Any], left: int = sys.maxsize) -> int:
     return total
 
 
-def input_tokens(raw: bytes, cap: int | None = None) -> int:
+def input_tokens(raw: bytes, cap: int | None = None, exclude_chars: int = 0) -> int:
     """An upper bound on a turn's input tokens, never an estimate (docs/LOCAL-RESOURCES.md "The input bound"):
         len(raw) + template_tokens(body) + reserialized_bytes(body) + normalization_bytes(body)
     capped at `cap` (the model's context; None: uncapped). `raw` is the request body EXACTLY as the client sent it:
     every character the model sees from the body costs at least one byte there, a byte-level BPE token covers at least
     one byte of the normalized text, the template allowance covers the template's own text, reserialized_bytes what
     vllm-mlx writes wider than it came and normalization_bytes what NFC writes wider. A body that is not a JSON object
-    is bounded by its length plus the fixed allowance (the gate refuses it before this is asked)."""
+    is bounded by its length plus the fixed allowance (the gate refuses it before this is asked).
+    `exclude_chars` (#125): characters of validated image data (ImagePlan.data_chars) the model never reads as text;
+    each was at least one byte of `raw` (base64 is ASCII; JSON may only escape it longer), so leaving them out keeps
+    the bound an upper bound. The images' own tokens are added by request_tokens."""
     limit = sys.maxsize if cap is None else max(0, int(cap))
     raw = bytes(raw)
+    excluded = max(0, min(int(exclude_chars), len(raw)))
     try:
         body = json.loads(raw)
     except (ValueError, RecursionError):
         body = None
     if not isinstance(body, dict):
         return min(limit, len(raw) + TEMPLATE_TOKENS_FIXED)
-    total = len(raw) + template_tokens(body)
+    total = len(raw) - excluded + template_tokens(body)
     if total < limit:
         total += reserialized_bytes(body, limit - total)
     if total < limit:
@@ -408,17 +609,93 @@ def input_tokens(raw: bytes, cap: int | None = None) -> int:
     return min(limit, total)
 
 
-def request_tokens(cfg: dict[str, Any], input_tokens: int, max_tokens: Any) -> int:
+def request_tokens(cfg: dict[str, Any], input_tokens: int, max_tokens: Any, images: int = 0) -> int:
     """The context a request will hold: its input tokens (input_tokens(): an upper bound) plus the output it may
-    write (max_tokens; default_max_tokens when absent or not a positive integer), capped at context_tokens."""
+    write (max_tokens; default_max_tokens when absent or not a positive integer), capped at context_tokens. With
+    `images` (#125, a vision model): plus image_tokens_max per image, capped at image_context_tokens instead (the
+    guard refuses a longer image-bearing prompt exactly)."""
     out = max_tokens if isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0 \
         else cfg["default_max_tokens"]
+    vision = cfg.get("vision") if images else None
+    if images and vision is None:
+        raise ValueError("an image-bearing request needs a vision model's settings")
+    if vision:
+        return min(vision["image_context_tokens"],
+                   max(0, int(input_tokens)) + images * vision["image_tokens_max"] + out)
     return min(cfg["context_tokens"], max(0, int(input_tokens)) + out)
 
 
-def request_bytes(cfg: dict[str, Any], input_tokens: int, max_tokens: Any) -> int:
-    """request_tokens as a reservation in bytes (module docstring)."""
-    return tokens_bytes(cfg, request_tokens(cfg, input_tokens, max_tokens))
+def image_prefill_bytes(cfg: dict[str, Any], tokens: int, images: int) -> dict[str, int]:
+    """The computed worst case, in bytes, of what an image-bearing request holds beside its KV cache and recurrent
+    state while the guard prefills it (cortados_vllm_mlx_guard.py "Media prefill"), by term; "total" is their sum.
+    P = tokens (the request's whole context: prompt + max_tokens, a bound on the prompt), C = min(chunk, P),
+    T = images x image_tokens_max image tokens, N = 4 T vision patches; a = act_bytes; H, I = hidden and intermediate
+    size; Hq, Hkv, D = attention heads, KV heads, head_dim; Kh, Vh, Kd, Vd the linear-attention heads and head dims;
+    V = vocab; Hv, Iv the vision tower's widths, Wp = VISION_PADDED_WIDTH (16 heads x 80, ensure_fused_sdpa's pad of
+    head_dim 72). Every dimension is the one verified geometry (VISION_FIXED_KEYS). Each term holds at once with the
+    others (a sum, not a maximum):
+      sequence  P x (3aH + 2H + 64)       the whole prompt's embeddings, live for the whole prefill: embed_tokens'
+                                          output, the merged copy masked_scatter writes, one more copy (a), the image
+                                          mask broadcast to P x H and its numpy copy (2H bool), ids / position ids /
+                                          attention mask (64)
+      media     T x H x (a + 12)          the merged image features plus masked_scatter's int64 and uint32 indices
+              + N x (1536 x (4 + a)       the pixel rows (3 x 2 x 16 x 16 float32) and their activation-dtype copy
+                 + a x (13 Hv + 4 Wp      one vision block's activations per patch: the residual in, two norms, qkv
+                        + 2 Iv)           (3), rotated q and k (2), the attention output concatenated and reshaped
+                                          (2), the projection, the residual sum and the MLP out (13 Hv); q, k, v
+                                          zero-padded to 80 and the fused kernel's padded output (4 Wp); MLP in and
+                                          its activation (2 Iv)
+                 + 24 Hv)                 the rotary embedding's float32 temporaries (apply_rotary_pos_emb_vision
+                                          multiplies by float32 cos / sin): three Hv-wide float32 arrays for each of
+                                          q and k
+      kv_regrow P x kv_bytes_per_token    the KV cache's growth copy: KVCache grows in 256-token steps by
+                                          concatenation, and the replaced buffers wait in MLX's allocator cache until
+                                          the guard clears it after each chunk
+      scores    score_buffers x Hq x C x P x a + C x P
+                                          one chunk's attention against the whole context, unfused (head_dim 256), and
+                                          the causal mask
+      chunk     2 x C x a x (3I + max(3 Hq D + 2 Hkv D, 4 (Kh Kd + Vh Vd)) + 4H)
+                                          one layer's activations for a chunk (MLP gate/up/product, attention or
+                                          linear-attention projections, residual and norms), doubled for the allocator
+      logits    V x (a + 8)               the one kept position's logits and its float32 log-probabilities
+    The encoder's attention holds no heads x N x N scores: head_dim 72 is padded to 80, which MLX's fused kernel
+    takes, and the guard pins that kernel's implementation (mlx / mlx-metal 0.32.4, by RECORD and file hashes) and
+    refuses every other geometry, so no encoder-score term exists to count.
+    What the old atomic forward computed beside these (every position projected to the vocabulary: P x V x a, 27.8 GiB
+    at 60k tokens) is gone: the guard keeps one position."""
+    v = cfg["vision"]
+    p = max(0, int(tokens))
+    c = min(v["prefill_chunk_tokens"], p)
+    a, h, i = v["act_bytes"], v["hidden_size"], v["intermediate_size"]
+    hq, hkv, d = v["num_attention_heads"], v["num_key_value_heads"], v["head_dim"]
+    img = max(0, int(images)) * v["image_tokens_max"]
+    patches = img * PATCHES_PER_IMAGE_TOKEN
+    width = 3 * i + max(3 * hq * d + 2 * hkv * d,
+                        4 * (v["linear_num_key_heads"] * v["linear_key_head_dim"]
+                             + v["linear_num_value_heads"] * v["linear_value_head_dim"])) + 4 * h
+    out = {
+        "sequence": p * (3 * a * h + 2 * h + 64),
+        "media": img * h * (a + 12) + patches * (IMAGE_PATCH_VALUES * (4 + a)
+                                                 + a * (13 * v["vision_hidden_size"] + 4 * VISION_PADDED_WIDTH
+                                                        + 2 * v["vision_intermediate_size"])
+                                                 + 24 * v["vision_hidden_size"]),
+        "kv_regrow": p * cfg["kv_bytes_per_token"],
+        "scores": v["score_buffers"] * hq * c * p * a + c * p,
+        "chunk": 2 * c * a * width,
+        "logits": v["vocab_size"] * (a + 8),
+    }
+    out["total"] = sum(out.values())
+    return out
+
+
+def request_bytes(cfg: dict[str, Any], input_tokens: int, max_tokens: Any, images: int = 0) -> int:
+    """request_tokens as a reservation in bytes (module docstring). An image-bearing request reserves its KV cache and
+    state plus image_prefill_bytes (no fixed margins); a text-only one tokens_bytes, unchanged."""
+    tokens = request_tokens(cfg, input_tokens, max_tokens, images)
+    if images and cfg.get("vision"):
+        return tokens * cfg["kv_bytes_per_token"] + cfg["per_seq_state_bytes"] \
+            + image_prefill_bytes(cfg, tokens, images)["total"]
+    return tokens_bytes(cfg, tokens)
 
 
 def max_seqs(cfg: dict[str, Any]) -> int:
@@ -508,8 +785,8 @@ class Ticket:
     """One admitted request's hold: a COUNT slot and the bytes it reserved. release() gives both back, once (a second
     call, from a later finally or error path, does nothing)."""
 
-    def __init__(self, admission: "Admission", reserved: int):
-        self._admission, self.reserved, self._done = admission, reserved, False
+    def __init__(self, admission: "Admission", reserved: int, image: bool = False):
+        self._admission, self.reserved, self._done, self.image = admission, reserved, False, image
 
     def release(self) -> None:
         self._admission._release(self)
@@ -527,13 +804,18 @@ class Admission:
         self._lock = threading.Lock()
         self.inflight = 0
         self.reserved = 0                    # bytes held by the admitted requests in flight
+        self.image_inflight = 0              # image-bearing requests in flight (#125)
 
     def _report(self, g: dict[str, Any]) -> dict[str, Any]:
         """The state report under the lock: the count sample, in flight, and (governed) the bytes and token room."""
         out = {**g, "inflight": self.inflight}
         if self.governor is None:
-            return {**out, "reserved_bytes": None, "free_bytes": None, "fit_tokens": None, "free_tokens": None}
+            return {**out, "reserved_bytes": None, "free_bytes": None, "fit_tokens": None, "free_tokens": None,
+                    "image_inflight": None, "image_limit": None}
         cfg = self.governor.cfg
+        vision = cfg.get("vision")
+        out.update(image_inflight=self.image_inflight if vision else None,
+                   image_limit=vision["image_concurrency"] if vision else None)
         free = max(0, available_bytes(cfg) - self.reserved)
         full = g["limit"] is not None and self.inflight >= g["limit"]
         return {**out, "reserved_bytes": self.reserved, "free_bytes": free,
@@ -553,16 +835,26 @@ class Admission:
         """The served model's context (input_tokens' cap), None without a governor."""
         return self.governor.cfg["context_tokens"] if self.governor else None
 
-    def request_bytes(self, input_tokens: int, max_tokens: Any) -> int:
-        """The reservation a request asks for (0 without a governor: nothing is budgeted)."""
-        return request_bytes(self.governor.cfg, input_tokens, max_tokens) if self.governor else 0
+    @property
+    def vision(self) -> dict[str, Any] | None:
+        """The served model's image policy (check_vision), None for a text-only model or without a governor."""
+        return self.governor.cfg.get("vision") if self.governor else None
 
-    def try_acquire(self, reserve: int = 0) -> tuple[Ticket | None, dict[str, Any]]:
+    def request_bytes(self, input_tokens: int, max_tokens: Any, images: int = 0) -> int:
+        """The reservation a request asks for (0 without a governor: nothing is budgeted)."""
+        return request_bytes(self.governor.cfg, input_tokens, max_tokens, images) if self.governor else 0
+
+    def try_acquire(self, reserve: int = 0, image: bool = False) -> tuple[Ticket | None, dict[str, Any]]:
         """(ticket, report) when admitted; (None, report) when not, report["refused"] saying why: "too_large" (more
-        than the whole budget beside the weights: never, even when the count is full too) or "busy" (the count limit
-        or the bytes left now; retryable). The count slot and the bytes are taken together, atomically."""
+        than the whole budget beside the weights: never, even when the count is full too) or "busy" (the count limit,
+        the bytes left now, or for an `image`-bearing request every image slot taken; retryable). The count slot, the
+        bytes and the image slot are taken together, atomically. An image-bearing request on a model without a vision
+        policy (or without a governor) is "unsupported": the gate checks that first, this only fails closed."""
         g = self.governor.current() if self.governor else NO_GOVERNOR
         with self._lock:
+            vision = self.vision
+            if image and vision is None:
+                return None, {**self._report(g), "refused": "unsupported", "reason": "the model reads no images"}
             if self.governor is None:
                 self.inflight += 1
                 return Ticket(self, 0), self._report(g)
@@ -574,6 +866,9 @@ class Admission:
                                                              f"{_gib(avail)} GiB budget beside the weights"}
             elif g["limit"] is not None and self.inflight >= g["limit"]:
                 refused = {"refused": "busy"}                       # the sample's reason: owner / pressure
+            elif image and self.image_inflight >= vision["image_concurrency"]:
+                refused = {"refused": "busy", "reason": f"image turns: {self.image_inflight} of "
+                                                        f"{vision['image_concurrency']} running"}
             elif self.reserved + nbytes > avail:
                 refused = {"refused": "busy", "reason": f"memory budget: {_gib(avail - self.reserved)} GiB free, "
                                                         f"request needs {_gib(nbytes)} GiB"}
@@ -581,7 +876,9 @@ class Admission:
                 return None, {**self._report(g), **refused, "request_bytes": nbytes}
             self.inflight += 1
             self.reserved += nbytes
-            return Ticket(self, nbytes), self._report(g)
+            if image:
+                self.image_inflight += 1
+            return Ticket(self, nbytes, image), self._report(g)
 
     def _release_locked(self, ticket: Ticket) -> None:
         if ticket._done:
@@ -589,6 +886,8 @@ class Admission:
         ticket._done = True
         self.inflight = max(0, self.inflight - 1)
         self.reserved = max(0, self.reserved - ticket.reserved)
+        if ticket.image:
+            self.image_inflight = max(0, self.image_inflight - 1)
 
     def _release(self, ticket: Ticket) -> None:
         with self._lock:

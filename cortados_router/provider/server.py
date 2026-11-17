@@ -2663,7 +2663,7 @@ class Handler(BaseHTTPRequestHandler):
             local = route["local"]
             # The same input-fit gate as the opener (routing._choose_local), on every turn: the conversation grows,
             # and Ollama would silently truncate an over-long one. A refusal keeps the history (nothing was sent).
-            need = int(routing.request_fit(body)["input_tokens"])
+            need = local_lane.input_tokens(body, local["model"])   # request_fit's estimate; images as read (#125)
             cap = int(local["model"]["context_length"])
             if need > cap:
                 return self._error(413, "request_too_large",

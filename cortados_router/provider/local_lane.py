@@ -131,7 +131,8 @@ def nodes(path: str | None = None) -> list[dict[str, Any]]:
                 raise LocalConfigError(f"node {nid}: every model needs an `id` (the Ollama tag)", nid)
             entry = {"id": mid, "alias": (str(m["alias"]).strip() or None) if m.get("alias") else None,
                      "name": m.get("name") or mid, "context_length": _context_length(m, nid, mid),
-                     "thinking": _thinking_mode(m, nid, mid), "efforts": _efforts(m, nid, mid)}
+                     "thinking": _thinking_mode(m, nid, mid), "efforts": _efforts(m, nid, mid),
+                     "vision": _vision(m, nid, mid)}
             for pin in {mid.casefold(), (entry["alias"] or mid).casefold()}:
                 if pin in seen:
                     raise LocalConfigError(f"pin name {pin!r} is offered twice (nodes {seen[pin]} and {nid})", nid)
@@ -460,6 +461,59 @@ def _efforts(m: dict[str, Any], nid: str, mid: str) -> list[str] | None:
     return [e for e in EFFORT_LEVELS if e in v]
 
 
+# A local model's declared image capability (#125), on the PROVIDER host's node config: `"vision": true` or
+# {"max_images": N, "image_tokens": N}. It changes only how the local lane sizes a turn (input_tokens, request_tokens):
+# an image's base64 is not text the model reads, so it is left out of the estimate and each image counted as
+# `image_tokens` (the node's per-image ceiling, its gate report's vision.image_tokens_max). Whether a turn's images are
+# taken is the node gate's decision alone (local_governor.image_policy); absent: a text-only model, sized as before.
+VISION_DEFAULTS = {"max_images": 5, "image_tokens": 1024}
+
+
+def _vision(m: dict[str, Any], nid: str, mid: str) -> dict[str, int] | None:
+    v = m.get("vision")
+    if v is None or v is False:
+        return None
+    if v is True:
+        return dict(VISION_DEFAULTS)
+    if not isinstance(v, dict) or set(v) - set(VISION_DEFAULTS) or any(
+            isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in v.values()):
+        raise LocalConfigError(f"node {nid}: model {mid}: vision must be true or an object of positive integers "
+                               f"({', '.join(VISION_DEFAULTS)})", nid)
+    return {**VISION_DEFAULTS, **v}
+
+
+def image_data(body: dict[str, Any]) -> tuple[int, int]:
+    """(images, characters of their inline base64 data) anywhere in the request's messages, tool results included."""
+    n = chars = 0
+    stack: list = [m.get("content") for m in body.get("messages") or [] if isinstance(m, dict)]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, list):
+            stack.extend(v)
+        elif isinstance(v, dict):
+            if v.get("type") == "image":
+                n += 1
+                src = v.get("source")
+                data = src.get("data") if isinstance(src, dict) else None
+                chars += len(data) if isinstance(data, str) else 0
+            elif v.get("type") == "tool_result":
+                stack.append(v.get("content"))
+    return n, chars
+
+
+def input_tokens(body: dict[str, Any], model: dict[str, Any]) -> int:
+    """The input estimate the local lane's fit checks use (routing._node_why, _choose_local, the index route and every
+    turn of a local conversation): routing.request_fit's chars / 4, except that for a model declaring `vision` the
+    images' base64 is left out and each image counts as its `image_tokens` (a 1 MB screenshot is ~330k characters of
+    base64 but at most 1,024 tokens to the model)."""
+    raw = len(json.dumps(body))
+    vision = model.get("vision")
+    if not vision:
+        return raw // 4
+    n, chars = image_data(body)
+    return max(0, raw - chars) // 4 + n * vision["image_tokens"]
+
+
 def node_effort(asked: Any, efforts: list[str] | None) -> str | None:
     """The effort level a node is sent for the client's `asked` (the comment above EFFORT_LEVELS), or None: dropped."""
     if not efforts or not isinstance(asked, str):
@@ -603,7 +657,10 @@ def request_tokens(body: dict[str, Any], model: dict[str, Any]) -> int:
     """The context a turn will hold on the node, ESTIMATED (body characters / ESTIMATE_CHARS_PER_TOKEN + max_tokens,
     the backend default when absent; local_governor.request_tokens), capped at the model's context_length."""
     cfg = {**local_governor.DEFAULTS, "context_tokens": int(model.get("context_length") or DEFAULT_CONTEXT)}
-    estimate = -(-len(json.dumps(body)) // ESTIMATE_CHARS_PER_TOKEN)
+    size = len(json.dumps(body))
+    vision = model.get("vision")
+    n, chars = image_data(body) if vision else (0, 0)
+    estimate = -(-max(0, size - chars) // ESTIMATE_CHARS_PER_TOKEN) + n * (vision or {}).get("image_tokens", 0)
     return local_governor.request_tokens(cfg, int(estimate), body.get("max_tokens"))
 
 
