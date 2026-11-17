@@ -218,7 +218,7 @@ costs per input: §5.
    their checkout is updated (`git pull` on each exec host).
 3. **The pulse mod (each machine):** installed from the marketplace:
    `/plugin marketplace update cortados-router`, then `/plugin update cortados-pulse@cortados-router` (or `/plugin`
-   → cortados-pulse → Update), then `/reload-plugins`. The version reads 0.5.2 (#118, §9). Loaded with `--plugin-dir`: pull the
+   → cortados-pulse → Update), then `/reload-plugins`. The version reads 0.6.0 (#127, §10; 0.5.2 was #118, §9). Loaded with `--plugin-dir`: pull the
    checkout and restart Claude Code (or `/reload-plugins`). Nothing to configure. The salt file
    `~/.config/cortados/office-salt` is made by the cortados-route MCP server on first start, as before.
 4. **Optional:** a narrow `live:session` token for panes (§5).
@@ -400,3 +400,66 @@ provider's lists lack. So a host "here" task shows in its own session's pane at 
    main sessions' tokens to the Work split, as on the Air.
 4. Each machine's pulse mod: `/plugin marketplace update cortados-router`, then
    `/plugin update cortados-pulse@cortados-router`, then `/reload-plugins` (0.5.2).
+
+## 10. Work split per session, and two pane fixes (#127, pulse 0.6.0)
+
+**Work split.** "This session" opens with one line: how much of the session's work the router served (routed) and how
+much its own Claude model did (native), in tokens, e.g. `work split 24h: routed 66% fresh (1.4M tok: codex/gpt-6.1-sol
+0.8M, claude#b/claude-opus-5-5 0.5M, …) · native 0.7M (claude-opus-5-5, claude-haiku-5) · 15% counting cache reads`.
+The `w` button opens the breakdown (by route, by hand-over kind, native by model, the four token kinds, 7 days). The
+headline % is on fresh tokens (input + output + cache writes); the all-token % is beside it, because a long native
+session re-reads its cached context every turn. Definitions and join rules: README "Per-session work split" and the
+module doc of `provider/work_split.py`. The session view's `work_split` holds ONLY the asking session's row and notes
+(`work_split.session_split`): no other row, no fleet totals, no host list.
+
+Join keys, provider-observed only:
+
+| Routed work | Key | Recorded as |
+| --- | --- | --- |
+| child task | `x-cortados-origin` (the child runner sends the task's origin; a nested task without one of its own inherits its parent's at start) | `routes.office_origin`, with `office_run` = `x-cortados-run-id` |
+| child run whose requests carried no origin (a runner from before round 4) | the provider host's own task log: `origin_session`, else the nearest ancestor's through `parent_task_id` (`live._origin_of`) | resolved in `live.collect`, never from a heartbeat |
+| routed subagent | `x-cortados-session` (the routed-subagents mod) | `routes.office_session` |
+| route_task | `x-cortados-session` + `x-cortados-via: route_task` (sent by `route_task` since #127) | `office_session`, `office_via` |
+| native | the heartbeat's session tag under the shared Office salt, or its `session_alt` under the mod's older store salt | — |
+
+A child's own `x-cortados-session` is never used: it is the cortados-route server's random per-process tag. Before
+#127 the native side hashed with the mod's store salt and child rows were grouped under that random tag, so the
+per-session join matched nothing for most sessions.
+
+**Local status fix.** The pane's `local: unavailable · no verified local deployment currently available` came from the
+scarcity cache's `local` lane, which `local_resources.sample` derives from the fleet config's `deployments` (Ollama-era
+readiness entries), and `pro unconfigured — free · fits 0` / `pool 0.0 GiB` from the same sample's SSH probe, where the
+Pro has no SSH target. Neither reads the local gate that actually serves the local lane. The pane now has a **Local
+nodes** section from `GET /v1/cortados/local` (the same view as the `local_switch` tool): switch, allowed and why,
+power, backend and reachability, loaded models, in-flight / limit, owner, memory pressure, free memory. The old lines
+stay, labelled for what they are: `local (resource-pool deployments): none verified · see Local nodes for the gate`, and
+under Devices a dim "resource-pool probe" line, with an unprobed node shown as `not probed (no SSH target in the
+resource-pool config)` and the pool line only over nodes the probe reached.
+
+**"no task started from this session" while a start_task was running.** What the code shows:
+
+- Not turn timing. The pane polls on its own 10 s timer (`$.clock.every`), not at the end of a turn; the local log is
+  read every 30 s. A task running for over a minute is past several polls.
+- Not the Pro→Air join. The Pro's `start_task` sends the origin; the Air's `--remote` start records it in the Air's own
+  log, which the session view reads (`HostTasksTest.test_a_task_started_from_the_pro_onto_the_air_needs_no_stub_on_the_air`;
+  `WorkSplitSessionTest` uses the same path).
+- Two causes do give exactly this symptom, and both are fixed:
+  1. **The tags differ.** The cortados-route MCP server computes the origin from `CLAUDE_CODE_SESSION_ID` as it was when
+     the server started; the pane computes its tag from `$.session.id()` on every poll. After a `/clear`, or wherever the
+     two ids differ, the task is under the server's tag and the pane asks for its own. Fix: `start_task`'s result now
+     carries `origin_session`; the pane's `tool.call` hook reads it, polls at once, and when it differs from the pane's
+     tag also reads that tag's session view and draws it under "tasks this session started under its cortados-route
+     server's tag …".
+  2. **A stalled poll.** The mod host's `$.http.fetch` has no timeout, and the pane runs one live poll at a time: one
+     request that never answered stopped every later poll, leaving the last view (from before the task) on screen. Fix:
+     every provider read is given up after 15 s (`fetchBounded`).
+- Which of the two happened in the owner's session on 2026-11-16 was not checked from here (it would need that
+  session's tag and the Air's log entry for the task, read-only). Comparing the task's `origin_session` in
+  `list_tasks` with the pane's tag answers it next time; with 0.6.0 either case now shows the task.
+
+**Deploy (after review; nothing is installed by this branch):** merge, `git pull` on the Air and restart the provider
+(`com.cortados.provider`) for the new route columns, the session view's `work_split` and the `/tasks` cleanup; `git
+pull` on every host that runs the heartbeat sender with `--orchestrator` (its block moves to version 2 and the shared
+salt on the next scan) and on every machine whose cortados-route MCP server should send route_task's session header
+and return `origin_session` (restart Claude Code there, or `/mcp` reconnect); update the pulse mod to 0.6.0
+(`/plugin marketplace update cortados-router`, `/plugin update cortados-pulse@cortados-router`, `/reload-plugins`).

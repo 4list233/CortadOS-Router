@@ -60,6 +60,17 @@ ORIGIN_HEADER = "x-cortados-origin"
 _ORIGIN_RE = re.compile(r"[0-9a-f]{16,64}|grokbot")   # child_tasks.ORIGIN_SESSION_RE (a test keeps the two equal)
 # a run, worker or conversation that carried two different origins: matches no task (never a join key)
 ORIGIN_CONFLICT = ""
+# Which front door made a routed request, for the per-session work split (#127, work_split.py): route_task sends
+# "route_task" (subagent_mcp.route_task); routed subagents and child tasks send none. A fixed vocabulary: anything
+# else is dropped. Recorded on the route's router.db row (core.log_tokens office_via), never published as free text.
+VIA_HEADER = "x-cortados-via"
+VIA_VALUES = ("route_task",)
+
+
+def read_via(headers) -> str | None:
+    """The request's x-cortados-via when it is one of VIA_VALUES, else None."""
+    v = (headers.get(VIA_HEADER) or "").strip() if headers is not None else ""
+    return v if v in VIA_VALUES else None
 # Heartbeat and view field rules. Model ids as the exclude header accepts them (server._EXCLUDE_MODEL_RE), capped at
 # 64; a lane key (claude#b, codex, local-studio); a tool name (Read, mcp__server__tool, mcp__claude-in-chrome__x).
 _MODEL_RE = re.compile(r"[A-Za-z0-9._/\[\]:-]{1,64}")

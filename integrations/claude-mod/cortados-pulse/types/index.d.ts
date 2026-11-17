@@ -203,7 +203,70 @@ export interface PulseSessionView {
     inputs_truncated?: string[]; session_filter?: string; task_hosts?: string[]; conflicts?: number }
   s1?: PulseLive['s1']
   hosts?: PulseLive['hosts']
+  /** #127: this session's own work split row only (provider/work_split.session_split) */
+  work_split?: PulseSessionSplit
 }
+
+/** Four token counts plus fresh (input + output + cache writes) and all (fresh + cache reads). */
+export interface PulseSplitTokens { input?: number; output?: number; cache_read?: number; cache_write?: number; fresh?: number; all?: number }
+export interface PulseSplitWindow {
+  orchestrator_fresh?: number | null
+  orchestrator_all?: number | null
+  routed_fresh?: number
+  routed_all?: number
+  routed_conversations?: number
+  /** routed fresh ÷ (native fresh + routed fresh); null without a native side */
+  routed_pct?: number | null
+  /** the same on all tokens, cache reads included */
+  routed_pct_all?: number | null
+  native?: (PulseSplitTokens & { models?: (PulseSplitTokens & { model?: string })[] | null }) | null
+  routed?: (PulseSplitTokens & { conversations?: number; by_route?: (PulseSplitTokens & { route?: string; conversations?: number })[];
+    by_via?: Record<string, PulseSplitTokens & { conversations?: number }> }) | null
+}
+export interface PulseSplitRow {
+  session?: string | null
+  session_alt?: string | null
+  host?: string | null
+  project?: string | null
+  model?: string | null
+  last_at?: number | null
+  native_stale?: boolean | null
+  native_age_s?: number | null
+  match?: 'both' | 'native only' | 'routed only' | 'untagged' | string
+  matched_on?: string[]
+  [window: string]: unknown
+}
+export interface PulseSessionSplit {
+  as_of?: number
+  status?: 'ok' | 'partial' | 'none' | string
+  session?: string
+  definition?: string
+  windows?: Record<string, number>
+  row?: PulseSplitRow | null
+  notes?: string[]
+}
+
+/** GET /v1/cortados/local (provider/local_switch.py view): each local node as its gate reports it. */
+export interface PulseLocalNode {
+  node?: string
+  label?: string | null
+  reachable?: boolean
+  error?: string | null
+  switch?: 'on' | 'off' | 'unknown'
+  allowed?: boolean | null
+  reason?: string | null
+  power?: 'ac' | 'battery' | 'unknown'
+  training?: boolean | null
+  ollama?: 'up' | 'unreachable' | 'unreadable' | 'unknown'
+  backend?: 'ollama' | 'vllm-mlx' | 'unknown'
+  models_loaded?: string[] | null
+  models?: string[]
+  auto_route?: { model?: string; bands?: string[] } | null
+  capacity?: { limit?: number | null; inflight?: number | null; owner?: string | null; pressure?: string | null;
+    reason?: string | null; reserved_bytes?: number | null; free_bytes?: number | null; fit_tokens?: number | null;
+    free_tokens?: number | null } | null
+}
+export interface PulseLocalView { nodes?: PulseLocalNode[]; note?: string }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -214,6 +277,14 @@ declare module 'claude-code' {
       mineLive: { data: PulseLive; at: number; tag: string } | null
       tree: { data: PulseSessionView; at: number; tag: string; base: string } | null; treeErr: string | null
       local: { tag: string; at: number; tasks: (PulseTreeTask & { parent_task_id?: string | null })[]; note?: string | null } | null
+      /** #127: the expanded work split breakdown (the `w` button) */
+      wsOpen: boolean
+      /** #127: GET /v1/cortados/local, the local nodes as their gates report them */
+      nodes: { data: PulseLocalView; at: number } | null; nodesErr: string | null
+      /** #127: the origin tags this session's own start_task results named, newest first */
+      started: { tag: string; task_id: string; at: number }[]
+      /** #127: the session view of the newest such tag that is not this session's own (a /clear or resume) */
+      alias: { data: PulseSessionView; at: number; tag: string } | null
     }
   }
 }

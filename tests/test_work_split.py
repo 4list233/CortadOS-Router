@@ -144,6 +144,19 @@ class LogTokensTest(StateBase):
         c.close()
         self.assertEqual(row, (13, 7, 1000, 200, 3, TAG))
 
+    def test_the_attribution_keys_keep_the_first_seen(self):
+        self.insert("r1")
+        self.assertTrue(core.log_tokens("r1", {"input_tokens": 1}, "c0ffeec0ffee0001", office_origin=TAG,
+                                        office_run="t20261116160946-4437347b"))
+        self.assertTrue(core.log_tokens("r1", {"input_tokens": 1}, None, office_origin="ffffffffffffffff",
+                                        office_run="t20990101000000-00000000", office_via="route_task"))
+        c = sqlite3.connect(core.STATE / "router.db")
+        try:
+            row = c.execute("SELECT office_session, office_origin, office_run, office_via, tok_turns FROM routes").fetchone()
+        finally:
+            c.close()
+        self.assertEqual(row, ("c0ffeec0ffee0001", TAG, "t20261116160946-4437347b", "route_task", 2))
+
     def test_no_matching_row_is_a_lost_write_not_a_success(self):
         self.insert("r1")
         before = router_db.stats()
@@ -211,8 +224,14 @@ class RoutedTokensTest(StateBase):
         self.assertEqual(d["totals"], {"input": 1500, "output": 1000, "cache_read": 50000, "cache_write": 2000,
                                        "fresh": 4500, "all": 54500})
         self.assertEqual((d["conversations"], d["recorded"], d["unrecorded"], d["unattributed_fresh"]), (3, 2, 1, 500))
-        self.assertEqual(d["by_session"], {TAG: {"input": 1200, "output": 800, "cache_read": 50000, "cache_write": 2000,
-                                                 "fresh": 4000, "all": 54000, "conversations": 1}})   # r4: no turn, no tag
+        totals = {"input": 1200, "output": 800, "cache_read": 50000, "cache_write": 2000, "fresh": 4000, "all": 54000}
+        self.assertEqual(set(d["by_session"]), {TAG})                     # r4: no turn, no tag
+        got = d["by_session"][TAG]
+        self.assertEqual({k: got[k] for k in totals}, totals)
+        self.assertEqual(got["conversations"], 1)
+        # a tagged conversation with no run id and no via is a routed subagent (#127)
+        self.assertEqual(got["by_route"], [{"route": "claude#b/claude-sonnet-5", **totals, "conversations": 1}])
+        self.assertEqual(got["by_via"], {"subagent": {**totals, "conversations": 1}})
         self.assertEqual([m["route"] for m in d["by_model"]], ["claude#b/claude-sonnet-5", "codex/gpt-6.1"])
         self.assertEqual(w["by_session"][TAG]["fresh"], 14000)
         self.assertEqual(w["by_model"][0]["route"], "codex/gpt-6.1")      # most fresh tokens first
@@ -226,7 +245,7 @@ class RoutedTokensTest(StateBase):
 
 
 def block(**over):
-    b = {"version": 1, "sampled_at": NOW - 30, "salt": True, "windows": {"24h": 86400, "7d": 604800},
+    b = {"version": ou.VERSION, "sampled_at": NOW - 30, "salt": True, "windows": {"24h": 86400, "7d": 604800},
          "totals": {"24h": {"input": 4000, "output": 6000, "cache_read": 900000, "cache_write": 30000, "sessions": 1},
                     "7d": {"input": 4000, "output": 6000, "cache_read": 900000, "cache_write": 30000, "sessions": 1}},
          "sessions": [{"session": TAG, "project": "CortadOS-Router", "model": "claude-opus-5", "last_at": NOW - 60,
@@ -467,3 +486,240 @@ class SenderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PerSessionSplitTest(unittest.TestCase):
+    """#127: the per-session join in work_split.section, on a real routes table (core.TOKEN_COLUMNS)."""
+    ALT = "abcdefabcdef0001"           # the same session under the mod's older store salt (session_alt)
+    MCP = "c0ffeec0ffee0001"           # a child's own x-cortados-session: never an orchestrator
+    RUN = "t20261116160946-4437347b"
+
+    def routed(self, rows):
+        c = sqlite3.connect(":memory:")
+        c.executescript(core.DDL)
+        for col, kind in core.TOKEN_COLUMNS:
+            c.execute(f"ALTER TABLE routes ADD COLUMN {col} {kind}")
+        for i, (sess, origin, run, via, lane, model, tok) in enumerate(rows):
+            c.execute("INSERT INTO routes (turn_id, ts, lane, model, office_session, office_origin, office_run, "
+                      "office_via, tok_input, tok_output, tok_cache_read, tok_cache_write, tok_turns) "
+                      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)", (f"x{i}", NOW - 60, lane, model, sess, origin, run, via, *tok))
+        try:
+            return work_split.routed_tokens(c, NOW)
+        finally:
+            c.close()
+
+    def hb(self, sessions, at=NOW - 30):
+        return {"pro": {"orchestrator": self_valid(block(sampled_at=at, sessions=sessions))}}
+
+    def row(self, tag, **over):
+        z = {"input": 1000, "output": 1000, "cache_read": 100000, "cache_write": 0}
+        return {"session": tag, "project": "CortadOS-Router", "model": "claude-opus-5-5", "last_at": NOW - 60,
+                "24h": z, "7d": z, **over}
+
+    def test_routed_under_both_salts_of_one_session_joins_once(self):
+        routed = self.routed([(self.ALT, None, None, None, "codex", "gpt-6.1-sol", (500, 500, 0, 0)),   # mod, store salt
+                              (TAG, None, None, "route_task", "codex", "gpt-6.1-sol", (200, 0, 0, 0)),
+                              (self.MCP, TAG, self.RUN, None, "claude#b", "claude-opus-5-5", (3000, 0, 0, 0))])
+        s = work_split.section(routed, self.hb([self.row(TAG, session_alt=self.ALT)]), NOW)
+        [row] = s["sessions"]
+        self.assertEqual((row["match"], row["matched_on"]), ("both", ["session", "session_alt"]))
+        r = row["24h"]["routed"]
+        self.assertEqual(r["fresh"], 4200)
+        self.assertEqual({k: v["fresh"] for k, v in r["by_via"].items()},
+                         {"subagent": 1000, "route_task": 200, "child_task": 3000})
+        self.assertEqual(r["by_route"][0], {"route": "claude#b/claude-opus-5-5", "input": 3000, "output": 0,
+                                            "cache_read": 0, "cache_write": 0, "fresh": 3000, "all": 3000,
+                                            "conversations": 1})
+        self.assertEqual(row["24h"]["routed_pct"], round(100 * 4200 / (4200 + 2000), 1))
+        self.assertEqual(row["24h"]["routed_pct_all"], round(100 * 4200 / (4200 + 102000), 1))
+
+    def test_unmatched_tags_on_either_side_are_said_never_paired(self):
+        routed = self.routed([("dddddddddddddddd", None, None, None, "codex", "gpt-6.1", (100, 0, 0, 0))])
+        s = work_split.section(routed, self.hb([self.row(TAG)]), NOW)
+        by = {r["session"]: r for r in s["sessions"]}
+        self.assertEqual((by[TAG]["match"], by[TAG]["24h"]["routed"], by[TAG]["24h"]["routed_pct"]),
+                         ("native only", None, 0.0))
+        other = by["dddddddddddddddd"]
+        self.assertEqual((other["match"], other["24h"]["native"], other["24h"]["routed_pct"]), ("routed only", None, None))
+        ws = work_split.session_split(s, "dddddddddddddddd")
+        self.assertEqual(ws["status"], "partial")
+        self.assertIn(work_split.SESSION_NOTES["no_native"], ws["notes"])
+        # a child run with no observed origin and no task-log entry is unattributed, not anyone's
+        routed = self.routed([(self.MCP, None, self.RUN, None, "codex", "gpt-6.1", (700, 0, 0, 0))])
+        s = work_split.section(routed, self.hb([self.row(TAG)]), NOW)
+        self.assertEqual(s["overall"]["24h"]["routed_unattributed_fresh"], 700)
+        self.assertEqual([r["session"] for r in s["sessions"]], [TAG])
+        s = work_split.section(self.routed([(self.MCP, None, self.RUN, None, "codex", "gpt-6.1", (700, 0, 0, 0))]),
+                               self.hb([self.row(TAG)]), NOW, run_origins={self.RUN: TAG})
+        self.assertEqual(s["sessions"][0]["24h"]["routed"]["by_via"]["child_task"]["fresh"], 700)
+        self.assertEqual(s["overall"]["24h"]["routed_from_task_log_fresh"], 700)
+
+    def test_a_stale_heartbeat_and_unreadable_transcripts_are_partial(self):
+        b = block(sampled_at=NOW - 3600, sessions=[self.row(TAG)],
+                  excluded=dict(block()["excluded"], unreadable_files=2))
+        s = work_split.section(self.routed([]), {"pro": {"orchestrator": self_valid(b)}}, NOW)
+        ws = work_split.session_split(s, TAG)
+        self.assertEqual(ws["status"], "partial")
+        self.assertTrue(any("stale" in n for n in ws["notes"]))
+        self.assertIn("2 transcript files on pro could not be read", ws["notes"])
+
+    def test_session_split_is_metadata_of_one_session_only(self):
+        routed = self.routed([(TAG, None, None, None, "codex", "gpt-6.1", (1, 1, 0, 0)),
+                              ("dddddddddddddddd", None, None, None, "codex", "gpt-6.1", (9, 9, 0, 0))])
+        s = work_split.section(routed, self.hb([self.row(TAG), self.row("eeeeeeeeeeeeeeee", project="Grounds")]), NOW)
+        ws = work_split.session_split(s, TAG)
+        raw = json.dumps(ws)
+        for bad in ("dddddddddddddddd", "eeeeeeeeeeeeeeee", "Grounds", SECRET, "pending_runs", "hosts", "overall"):
+            self.assertNotIn(bad, raw, bad)
+        self.assertEqual(set(ws), {"as_of", "status", "session", "definition", "windows", "row", "notes"})
+        # no text field anywhere: every string is a tag, a model or route id, a project, a host or a fixed phrase
+        strings = []
+        def walk(v):
+            if isinstance(v, dict):
+                [walk(x) for x in v.values()]
+            elif isinstance(v, list):
+                [walk(x) for x in v]
+            elif isinstance(v, str):
+                strings.append(v)
+        walk(ws["row"])
+        allowed = {TAG, "pro", "CortadOS-Router", "claude-opus-5-5", "both", "session", "codex/gpt-6.1"}
+        self.assertLessEqual(set(strings), allowed)
+
+    def test_the_same_tag_as_session_and_session_alt_is_counted_once(self):
+        # review round 2, finding 1: one routed conversation (fresh 7, all 10) under a row whose two tags are equal
+        routed = self.routed([(TAG, None, None, None, "codex", "gpt-6.1", (5, 2, 3, 0))])
+        valid = self_valid(block(sessions=[self.row(TAG, session_alt=TAG)]))
+        self.assertIsNone(valid["sessions"][0]["session_alt"])         # the validator keeps one tag
+        for o in (valid, {**valid, "sessions": [{**valid["sessions"][0], "session_alt": TAG}]}):   # and section alone
+            s = work_split.section(routed, {"pro": {"orchestrator": o}}, NOW)
+            [row] = s["sessions"]
+            r = row["24h"]["routed"]
+            self.assertEqual((r["fresh"], r["all"], r["conversations"]), (7, 10, 1))
+            self.assertEqual((row["24h"]["routed_fresh"], row["24h"]["routed_conversations"]), (7, 1))
+            self.assertEqual(row["matched_on"], ["session"])
+            self.assertEqual(s["tag_conflicts"], 0)
+
+    def test_two_sessions_claiming_one_tag_are_a_conflict_never_counted_twice(self):
+        routed = self.routed([(TAG, None, None, None, "codex", "gpt-6.1", (5, 2, 3, 0))])
+        other = "eeeeeeeeeeeeeeee"
+        # two hosts report the same tag: the most recently active row owns the routed work, the other lists a conflict
+        hb = {"air": {"orchestrator": self_valid(block(sampled_at=NOW - 30, sessions=[self.row(TAG, last_at=NOW - 600)]))},
+              "pro": {"orchestrator": self_valid(block(sampled_at=NOW - 30, sessions=[self.row(TAG, last_at=NOW - 60)]))}}
+        s = work_split.section(routed, hb, NOW)
+        by = {r["host"]: r for r in s["sessions"]}
+        self.assertEqual((by["pro"]["24h"]["routed_fresh"], by["air"]["24h"]["routed_fresh"]), (7, 0))
+        self.assertEqual((by["pro"].get("conflicts"), by["air"]["conflicts"]), (None, ["session"]))
+        self.assertEqual(sum(r["24h"]["routed_conversations"] for r in s["sessions"]), 1)
+        self.assertEqual((s["tag_conflicts"], s["overall"]["24h"]["routed"]["fresh"]), (1, 7))
+        ws = work_split.session_split(s, TAG)
+        self.assertEqual(ws["row"]["host"], "pro")                       # the owner's row, deterministically
+        # a `session` claim beats a more recent row's `session_alt` claim on the same tag
+        s = work_split.section(routed, self.hb([self.row(other, session_alt=TAG, last_at=NOW - 10),
+                                                self.row(TAG, last_at=NOW - 900)]), NOW)
+        by = {r["session"]: r for r in s["sessions"]}
+        self.assertEqual((by[TAG]["24h"]["routed_fresh"], by[other]["24h"]["routed_fresh"]), (7, 0))
+        self.assertEqual((by[other]["conflicts"], by[other]["match"]), (["session_alt"], "native only"))
+        self.assertEqual(sum(r["24h"]["routed_fresh"] for r in s["sessions"]), 7)
+        ws = work_split.session_split(s, other)
+        self.assertIn(work_split.SESSION_NOTES["conflict"], ws["notes"])
+        self.assertNotIn(TAG, json.dumps(ws["notes"]))
+        # the same input in another order gives the same owner
+        s2 = work_split.section(routed, self.hb([self.row(TAG, last_at=NOW - 900),
+                                                 self.row(other, session_alt=TAG, last_at=NOW - 10)]), NOW)
+        self.assertEqual(s2["sessions"], s["sessions"])
+
+    def test_the_requested_session_is_found_beyond_the_fleet_cap(self):
+        # review round 2, finding 2: host blocks of 30 + 11 sessions; the oldest (41st) is the pane's own
+        tags = [f"{i:016x}" for i in range(1, 42)]
+        rows = [self.row(t, last_at=NOW - 60 - i) for i, t in enumerate(tags)]
+        hb = {"air": {"orchestrator": self_valid(block(sessions=rows[:30]))},
+              "pro": {"orchestrator": self_valid(block(sessions=rows[30:]))}}
+        routed = self.routed([(tags[-1], None, None, None, "codex", "gpt-6.1", (5, 2, 3, 0))])
+        fleet = work_split.section(routed, hb, NOW)
+        self.assertEqual((len(fleet["sessions"]), fleet["sessions_hidden"]), (work_split.SESSIONS_MAX, 1))
+        self.assertNotIn("session_row", fleet)
+        self.assertNotIn(tags[-1], [r["session"] for r in fleet["sessions"]])
+        s = work_split.section(routed, hb, NOW, session=tags[-1])
+        self.assertEqual(len(s["sessions"]), work_split.SESSIONS_MAX)    # the cap is the fleet table's only
+        ws = work_split.session_split(s, tags[-1])
+        self.assertEqual((ws["row"]["session"], ws["row"]["host"], ws["row"]["24h"]["routed_fresh"]), (tags[-1], "pro", 7))
+        self.assertEqual(ws["status"], "ok")
+        self.assertIsNone(work_split.session_split(s, "ffffffffffffffff")["row"])   # another tag: never this row
+        self.assertIsNone(work_split.session_split(work_split.section(routed, hb, NOW, session="ffffffffffffffff"),
+                                                   "ffffffffffffffff")["row"])
+
+    def test_the_101st_routed_tag_keeps_its_routed_work(self):
+        # review round 3, finding 1: 101 routed tags, totals descending; the 101st (900 fresh) is the pane's session
+        tags = [f"{i:016x}" for i in range(1, 102)]
+        routed = self.routed([(t, None, None, None, "codex", "gpt-6.1", (900 + (101 - i) * 100, 0, 0, 0))
+                              for i, t in enumerate(tags, 1)])
+        self.assertEqual(len(routed["by_window"]["24h"]["by_session"]), 101)        # the read keeps every tag
+        hb = self.hb([self.row(tags[-1])])
+        ws = work_split.session_split(work_split.section(routed, hb, NOW, session=tags[-1]), tags[-1])
+        self.assertEqual((ws["row"]["24h"]["routed_fresh"], ws["row"]["match"], ws["status"]), (900, "both", "ok"))
+        self.assertNotIn(work_split.SESSION_NOTES["no_routed"], ws["notes"])
+        # the published copy (the routed section, GET /v1/cortados/tasks) is still capped at BY_SESSION_MAX
+        pub = work_split.resolve_pending(routed, None)["by_window"]["24h"]
+        self.assertEqual((len(pub["by_session"]), pub["by_session_hidden"]), (work_split.BY_SESSION_MAX, 1))
+        self.assertNotIn(tags[-1], pub["by_session"])
+        # and a child run whose origin only the task log knows survives too (no pending-run cap)
+        many = [(self.MCP, None, f"t20261116160946-{i:08x}", None, "codex", "gpt-6.1", (10, 0, 0, 0)) for i in range(600)]
+        last = many[-1][2]
+        s = work_split.section(self.routed(many), hb, NOW, run_origins={last: tags[-1]}, session=tags[-1])
+        self.assertEqual(work_split.session_split(s, tags[-1])["row"]["24h"]["routed_fresh"], 10)
+
+    def test_every_cap_small_still_gives_the_requested_sessions_full_row(self):
+        # review round 3: the caps bound the fleet display only; at 1 each, the pane's row is whole
+        tags = [f"{i:016x}" for i in range(1, 6)]
+        mine, alt = tags[-1], "abcdefabcdef0001"
+        rows = [(t, None, None, None, "codex", "gpt-6.1", (5000 - 100 * i, 0, 0, 0)) for i, t in enumerate(tags[:-1])]
+        rows += [(mine, None, None, "route_task", "codex", "gpt-6.1-sol", (300, 0, 0, 0)),
+                 (alt, None, None, None, "claude#b", "claude-haiku-5", (200, 0, 0, 0)),
+                 (self.MCP, mine, self.RUN, None, "claude#b", "claude-opus-5-5", (400, 0, 0, 0))]
+        full = None
+        for small in (False, True):
+            caps = {k: 1 if small else getattr(work_split, k)
+                    for k in ("BY_SESSION_MAX", "SESSIONS_MAX", "BY_MODEL_MAX", "SESSION_ROUTES_MAX")}
+            with mock.patch.multiple(work_split, **caps), mock.patch.object(ou, "SESSIONS_MAX", 1 if small else 30):
+                routed = self.routed(rows)
+                natives = [self.row(t, last_at=NOW - 3000 - i) for i, t in enumerate(tags[:-1])]
+                natives.append(self.row(mine, session_alt=alt, last_at=NOW - 3500,
+                                        **{w: {"input": 7, "output": 0, "cache_read": 0, "cache_write": 0}
+                                           for w in ("24h", "7d")}))
+                hb = {f"h{i}": {"orchestrator": self_valid(block(sessions=[r]))} for i, r in enumerate(natives)}
+                s = work_split.section(routed, hb, NOW, session=mine)
+                if small:
+                    self.assertEqual((len(s["sessions"]), s["sessions_hidden"]), (1, 4))
+                ws = work_split.session_split(s, mine)
+            row = ws["row"]
+            self.assertEqual((ws["status"], row["match"], row["matched_on"]), ("ok", "both", ["session", "session_alt"]))
+            got = {w: (row[w]["routed_fresh"], row[w]["orchestrator_fresh"], row[w]["routed_conversations"],
+                       {k: v["fresh"] for k, v in row[w]["routed"]["by_via"].items()},
+                       sum(r["fresh"] for r in row[w]["routed"]["by_route"])) for w in ("24h", "7d")}
+            self.assertEqual(got["24h"], (900, 7, 3, {"route_task": 300, "subagent": 200, "child_task": 400}, 900))
+            if full is None:
+                full = got
+            self.assertEqual(got, full)               # the same row as with the real caps
+        # the sender's own cap keeps the active (pane's) session before heavier quiet ones
+        msgs = [("heavy", NOW - 5000, "claude-opus-5-5", {"input": 9000, "output": 0, "cache_read": 0, "cache_write": 0},
+                 None), ("pane", NOW - 60, "claude-opus-5-5", {"input": 3, "output": 0, "cache_read": 0, "cache_write": 0},
+                         None)]
+        b = ou.summarize(msgs, now=NOW, windows=dict(ou.WINDOWS), salt="00" * 16, sessions_max=1, excluded={})
+        self.assertEqual(([r["24h"]["input"] for r in b["sessions"]], b["sessions_hidden"]), ([3], 1))
+        b = ou.summarize(msgs, now=NOW, windows=dict(ou.WINDOWS), salt="00" * 16, sessions_max=2, excluded={})
+        self.assertEqual([r["24h"]["input"] for r in b["sessions"]], [9000, 3])      # under the cap: tokens first
+
+    def test_an_old_db_without_the_split_columns_still_reads(self):
+        c = sqlite3.connect(":memory:")
+        c.executescript(core.DDL)
+        for col, kind in core.TOKEN_COLUMNS[:6]:                         # the work split's first columns only
+            c.execute(f"ALTER TABLE routes ADD COLUMN {col} {kind}")
+        c.execute("INSERT INTO routes (turn_id, ts, lane, model, office_session, tok_input, tok_output, tok_turns) "
+                  "VALUES ('o', ?, 'codex', 'gpt-6.1', ?, 5, 5, 1)", (NOW - 60, TAG))
+        try:
+            r = work_split.routed_tokens(c, NOW)
+        finally:
+            c.close()
+        self.assertFalse(r["split_keys"])
+        self.assertEqual(r["by_window"]["24h"]["by_session"][TAG]["by_via"], {"subagent": {
+            "input": 5, "output": 5, "cache_read": 0, "cache_write": 0, "fresh": 10, "all": 10, "conversations": 1}})

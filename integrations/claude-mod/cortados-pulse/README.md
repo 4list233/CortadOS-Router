@@ -19,6 +19,20 @@ provider's views with the same token: `GET /v1/cortados/live` every 10 seconds a
   against a provider from before the per-session view (404), it falls back to the 0.4 behaviour below: the fleet view
   `/v1/cortados/live?session=<tag>` filtered for this session, and the Running section. A dim line recalls that after
   `/clear` earlier tasks stay under the previous session (the dashboard has them);
+  Under the heading, **this session's work split** (#127, from the same session view): one line,
+  `work split 24h: routed 66% fresh (1.4M tok: codex/gpt-6.1-sol 0.8M, claude#b/claude-opus-5-5 0.5M, …) · native 0.7M
+  (claude-opus-5-5, claude-haiku-5) · 15% counting cache reads` — routed is what the provider served for this session
+  (its child tasks, nested ones included, its routed subagents and its route_task calls), native is the session's own
+  model (main loop and direct subagents), fresh = input + output + cache writes. The `w` button (or key `w` while the
+  pane has the focus) opens the breakdown: every route, by hand-over kind, native by model, the four token kinds and the
+  7-day figures. The provider's notes on partial data are drawn dim under it (no native report from this machine's
+  heartbeat, a stale heartbeat, unreadable transcripts, routed tokens not recorded). A `start_task` of this session
+  whose result names another origin tag than the pane's (the cortados-route server keeps the session id it started
+  with, so after a `/clear` its tasks are under the old tag) makes the pane read that tag's view too and draw it under
+  a dim "tasks this session started under its cortados-route server's tag" line. That view is read by the same helper
+  as the session's own (`readSessionView`) and says its last problem with the held data's age; when a read of it is still
+  outstanding 30 s (2× the 15 s timeout) after it began (a host that ignored the abort), the view is marked "stale since
+  …" and its tasks are dropped, so no elapsed time keeps counting on data that is not coming;
 - **Running** (fallback only: from `/v1/cortados/live`) — one summary line (children running and queued, conversations and how many
   are working), then each running or queued `start_task` child (title, host, model, current tool, elapsed time counting
   between polls) and every conversation the provider holds open (main sessions, subagents, untagged clients, and a
@@ -31,11 +45,23 @@ provider's views with the same token: `GET /v1/cortados/live` every 10 seconds a
   ok/SPENT or explicit unknown quota, scarcity, expiring credit, the age of its usage sample, and every cached window's
   **% left** (weekly, 5-hourly, the Fable pool, …) — the same figures the S1 outcome loop's quota door reads. The `local`
   lane shows routing eligibility and its measured-resource reason; `/resources` does not expose deployment counts;
-- **devices** — the online local nodes with their GPU headroom, utilisation and how many local models fit, plus the pool;
+- **Local nodes** (#127, `GET /v1/cortados/local` every 30 s, the owner token) — each local node as its gate reports
+  it: switch, allowed or not and why, power, backend (ollama / vllm-mlx) and whether it answers, the loaded models, then
+  the gate's admission: in flight / limit, owner activity, memory pressure, free memory. This is the local lane's real
+  state. The subscriptions' `local` row is the scarcity cache's resource-pool deployment check and is labelled so
+  (`local (resource-pool deployments): …`);
+- **devices** — the resource-pool probe over the fleet config's SSH targets (not the local gate): each probed node's
+  GPU headroom, utilisation and how many local models fit, plus the pool over the nodes it reached; a node without an
+  SSH target in that config is `not probed`, never `free · fits 0`;
 - **Fleet** (from `/v1/cortados/live`) — S1 up/down and latency, the lowest fresh subscription window, and each host's job
   heartbeat (`studio: s1-scorer running, s1-continuous running 38% · cpu 30% · disk 62% free`, and on the S1 host
   `S1 up: <model> · promotion held · candidate promotion held`) or `no heartbeat yet`;
 - the last line links the browser dashboard, `<provider>/dashboard`, which shows the same live view in full.
+
+**Refresh timing.** The pane polls on its own 10 s timer (not at the end of a turn): the session view every tick,
+`/resources` every 20 s, the local nodes and this machine's own task log every 30 s, and once more right after a
+`start_task` of this session returns. Each provider read is given up after 15 s, so a request that never answers
+cannot stop the polling (the polls run one at a time).
 
 Both views are cache-only on the provider (they never open a vendor CLI or ssh), so the polls are cheap. The served
 dashboard (`GET /dashboard`) has a Live tab over the same `/v1/cortados/live` and a Usage tab over the richer

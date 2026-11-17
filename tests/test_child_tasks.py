@@ -1693,7 +1693,11 @@ class ChildTaskTests(ChildTaskBase):
         self._session()
         tag = m.origin_tag(self.SALT, self.SID)
         self.assertEqual(len(tag), 16)
-        tid = self.start()
+        r, out = self.call("start_task", task="hello", cwd=self.work)
+        self.assertFalse(r.get("isError"), r)
+        tid = out["task_id"]
+        # #127: the result names the origin the task is recorded under (the pulse pane follows it after a /clear)
+        self.assertEqual(out["origin_session"], tag)
         _, w = self.call("wait_task", task_id=tid, timeout_s=30)
         self.assertEqual(w["state"], "succeeded", w)
         meta = _load(os.path.join(ct.task_path(tid), "meta.json"))
@@ -1836,6 +1840,7 @@ class ChildTaskTests(ChildTaskBase):
         r, out = self.call("start_task", task="hello", title="remote one")
         self.assertFalse(r.get("isError"), r)
         tid = out["task_id"]
+        self.assertEqual(out["origin_session"], m.origin_tag(self.SALT, self.SID))      # #127, as recorded here
         self.call("wait_task", task_id=tid, timeout_s=30)
         with open(os.path.join(self.air_home, "state", "child-tasks.jsonl")) as f:
             ev = [json.loads(x) for x in f]

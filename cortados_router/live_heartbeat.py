@@ -323,14 +323,19 @@ def orchestrator_block(cfg: dict[str, Any], now: float, scan: Callable[..., dict
     try:
         cached = json.loads(cache.read_text())
         if isinstance(cached, dict) and live._num(cached.get("sampled_at")) \
+                and cached.get("version") == ou.VERSION \
                 and 0 <= now - cached["sampled_at"] < cfg["every_s"] \
                 and live.work_split.validate_block(cached, now, live.TIME_SKEW_S)[1] is None:
             return cached                           # an invalid cache (an older sender's format) is rescanned
     except (OSError, ValueError):
         pass                                        # no cache yet, or unreadable: scan
     try:
-        block = (scan or ou.scan)(cfg.get("projects") or ou.DEFAULT_PROJECTS, now=now,
-                                  salt=(salt or ou.read_salt)(), task_roots=cfg.get("task_roots") or ())
+        # the shared Office salt, with the mod's store salt as `session_alt` when it differs (#127); an injected
+        # `salt` (tests) is used alone
+        sv, alt, source = (salt(), None, None) if salt else ou.salts()
+        block = (scan or ou.scan)(cfg.get("projects") or ou.DEFAULT_PROJECTS, now=now, salt=sv,
+                                  task_roots=cfg.get("task_roots") or (),
+                                  **({"alt_salt": alt, "salt_source": source} if scan is None and not salt else {}))
     except Exception as exc:
         print(f"live_heartbeat: orchestrator scan failed: {type(exc).__name__}", file=sys.stderr)
         return None

@@ -1,5 +1,6 @@
 """cortados_router/orchestrator_usage.py: main-session tokens from Claude Code transcripts. Fixture jsonl files in a
-throwaway projects folder only; the real ~/.claude is never read (every scan names its folder, and read_salt its glob)."""
+throwaway projects folder only; the real ~/.claude is never read (every scan names its folder, read_store_salt its glob
+and salts() a throwaway salt file)."""
 import json
 import os
 import shutil
@@ -206,14 +207,57 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(s["sessions"], [])
         self.assertEqual(s["totals"]["7d"]["sessions"], 0)
 
-    def test_read_salt(self):
+    def test_read_store_salt(self):
         store = self.root / "store"
         store.mkdir()
-        self.assertIsNone(ou.read_salt(str(store / "cortados-routed-subagents_*.json")))
+        self.assertIsNone(ou.read_store_salt(str(store / "cortados-routed-subagents_*.json")))
         (store / "cortados-routed-subagents_a.json").write_text(json.dumps({"officeSalt": "not-hex"}))
-        self.assertIsNone(ou.read_salt(str(store / "cortados-routed-subagents_*.json")))
+        self.assertIsNone(ou.read_store_salt(str(store / "cortados-routed-subagents_*.json")))
         (store / "cortados-routed-subagents_b.json").write_text(json.dumps({"officeSalt": SALT}))
-        self.assertEqual(ou.read_salt(str(store / "cortados-routed-subagents_*.json")), SALT)
+        self.assertEqual(ou.read_store_salt(str(store / "cortados-routed-subagents_*.json")), SALT)
+
+    def test_the_shared_salt_names_sessions_the_store_salt_is_the_alternative(self):
+        # #127: the tag routed traffic, task origins and the pane use is the shared salt's; the mod's store salt (used
+        # only for a session that began before the shared file existed) rides along as session_alt, never instead
+        shared = "fedcba9876543210fedcba9876543210"
+        path = self.root / "office-salt"
+        env = {"CORTADOS_OFFICE_SALT_FILE": str(path), "HOME": str(self.root)}
+        with mock.patch.object(ou, "read_store_salt", return_value=None):
+            self.assertEqual(ou.salts(env), (None, None, None))
+        with mock.patch.object(ou, "read_store_salt", return_value=SALT):
+            self.assertEqual(ou.salts(env), (SALT, None, "store"))
+            path.write_text(shared + "\n")
+            self.assertEqual(ou.salts(env), (shared, SALT, "shared"))
+            self.assertEqual(ou.read_salt(env), shared)
+        with mock.patch.object(ou, "read_store_salt", return_value=shared):
+            self.assertEqual(ou.salts(env), (shared, None, "shared"))     # the same salt is not sent twice
+        self.write(f"-Users-o-p/{MAIN}.jsonl", [line(MAIN, "m1", NOW - 60, inp=7, cwd="/Users/o/p")])
+        s = ou.scan(self.root, now=NOW, salt=shared, alt_salt=SALT, salt_source="shared")
+        [row] = s["sessions"]
+        self.assertEqual((row["session"], row["session_alt"], s["salt_source"]),
+                         (ou.session_tag(shared, MAIN), ou.session_tag(SALT, MAIN), "shared"))
+        self.assertIsNone(work_split.validate_block(s, NOW, live.TIME_SKEW_S)[1])
+        self.assertNotIn("session_alt", ou.scan(self.root, now=NOW, salt=shared)["sessions"][0])
+
+    def test_per_session_models_keep_the_four_kinds_apart(self):
+        self.write(f"-Users-o-p/{MAIN}.jsonl", [
+            line(MAIN, "m1", NOW - 60, inp=10, out=20, cr=3000, cw=40, model="claude-opus-5-5"),
+            line(MAIN, "m2", NOW - 3 * 86400, inp=1, out=2, cr=3, cw=4, model="claude-opus-5-5"),
+            line(MAIN, "m3", NOW - 120, inp=5, out=5, cr=0, cw=0, model="claude-haiku-5"),
+            line(MAIN, "s1", NOW - 90, inp=7, out=1, cr=0, cw=0, model="claude-sonnet-5", isSidechain=True),
+            line(MAIN, "x1", NOW - 90, inp=1, out=1, model="claude-a"),
+            line(MAIN, "x2", NOW - 90, inp=1, out=0, model="claude-b"),
+        ])
+        [row] = self.scan()["sessions"]
+        m = row["models"]
+        self.assertEqual(list(m)[:3], ["claude-opus-5-5", "claude-haiku-5", "claude-sonnet-5"])
+        self.assertEqual(m["claude-opus-5-5"], {"24h": [10, 20, 3000, 40], "7d": [11, 22, 3003, 44]})
+        self.assertEqual(m["claude-sonnet-5"]["24h"], [7, 1, 0, 0])      # a direct subagent counts on its own model
+        self.assertEqual(m[ou.OTHER_MODEL], {"24h": [2, 1, 0, 0], "7d": [2, 1, 0, 0]})   # past MODELS_PER_SESSION
+        out, bad = work_split.validate_block(self.scan(), NOW, live.TIME_SKEW_S)
+        self.assertIsNone(bad)
+        self.assertEqual(out["sessions"][0]["models"]["claude-opus-5-5"]["24h"],
+                         {"input": 10, "output": 20, "cache_read": 3000, "cache_write": 40})
 
     def test_timestamps(self):
         self.assertEqual(ou._ts("2027-01-15T08:00:00Z"), NOW)
@@ -226,7 +270,7 @@ class ScanTest(unittest.TestCase):
     def test_cli_prints_the_summary(self):
         self.write(f"-Users-o-p/{MAIN}.jsonl", [line(MAIN, "m1", NOW - 60, inp=7, cwd="/Users/o/p")])
         out = StringIO()
-        with redirect_stdout(out), mock.patch.object(ou, "read_salt", return_value=None):
+        with redirect_stdout(out), mock.patch.object(ou, "salts", return_value=(None, None, None)):
             self.assertEqual(ou.main(["--projects", str(self.root), "--now", str(NOW)]), 0)
         d = json.loads(out.getvalue())
         self.assertEqual(d["totals"]["24h"]["input"], 7)

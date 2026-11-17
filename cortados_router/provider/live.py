@@ -1253,7 +1253,9 @@ def session_view(snap: dict[str, Any], session: str) -> dict[str, Any]:
             "overview": {"s1": o.get("s1"), "s1_latency_ms": o.get("s1_latency_ms"),
                          "lowest_subscription": o.get("lowest_subscription"),
                          "hosts_with_heartbeat": o.get("hosts_with_heartbeat")},
-            "orchestrators": snap.get("orchestrators"), "s1": snap.get("s1"), "hosts": snap.get("hosts")}
+            "orchestrators": snap.get("orchestrators"), "s1": snap.get("s1"), "hosts": snap.get("hosts"),
+            # this session's own work split row only (work_split.session_split): no other session, no fleet totals
+            "work_split": work_split.session_split(snap.get("work_split") or {}, session)}
 
 
 def for_session(snap: dict[str, Any], session: str) -> dict[str, Any]:
@@ -1791,6 +1793,17 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
                                  run_origins=r_orig if isinstance(r_orig, dict) else None, conflicted=conflicted)
     tv_errs: list = []
     tv = guard("router.db", tasks_view, tv_errs)
+    # The work split's child runs whose requests carried no origin are attributed through the provider host's OWN task
+    # log (every row of the window, before any session filter; the parent chain as the tree walks it), never a
+    # heartbeat's report (#127). The published token totals carry no run ids.
+    by_id = {r["task_id"]: r for r in rows if isinstance(r, dict) and r.get("task_id")}
+    run_orig = {tid: o for tid, o in ((tid, _origin_of(by_id, r)[0]) for tid, r in by_id.items()) if o}
+    # Every session tag stays in `split_totals` for the work split's join (the pane's session survives every display
+    # cap, review round 3); the routed section publishes the BY_SESSION_MAX-capped copy.
+    split_totals = None
+    if isinstance(tv, dict) and isinstance(tv.get("token_totals"), dict):
+        split_totals = work_split.resolve_pending(tv["token_totals"], run_orig, cap=False)
+        tv = {**tv, "token_totals": work_split.cap_sessions(split_totals)}
     # this process's failed router.db writes (#99): shown even when the read side failed, which is when they matter most
     rl_errs: list = []
     rl = route_log_errors(guard("route log", route_log, rl_errs))
@@ -1808,8 +1821,9 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
                           exec_hosts=ex_hosts, exec_default=ex_default, self_host=self_host, now=now,
                           errors=hb_errs + ex_errs + (u_errs if u is None else []),
                           self_name=self_name if self_name is not None else _slug(os.environ.get(SELF_ENV)))
-    ws = work_split.section(tv.get("token_totals") if isinstance(tv, dict) else None, beats, now,
-                            tv_errs if tv is None else None)
+    if split_totals is None and isinstance(tv, dict):
+        split_totals = tv.get("token_totals")
+    ws = work_split.section(split_totals, beats, now, tv_errs if tv is None else None, session=session)
     counts = tasks.get("counts") or {}
     overview = {
         "running_tasks": counts.get("running") if tasks["status"] != "error" else None,

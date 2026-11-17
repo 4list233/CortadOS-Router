@@ -59,7 +59,9 @@ is the long form.
   the pane's view (scope `live:session`; design and privacy in `docs/PULSE-PER-SESSION.md`). Its host-side sender is `cortados_router/live_heartbeat.py` (launchd jobs, hardware, the Studio's S1
   flags and /health, and the host's own recent child tasks, merged into the orchestrator tree so host "here" tasks on the
   Pro show, #118; installed per host by `scripts/install_live_heartbeat.sh`, README "Live view"). `work_split.py` joins routed tokens (router.db `tok_*` columns, written per backend turn by `core.log_tokens`) with the
-  heartbeats' orchestrator tokens into the live view's `work_split` section and the dashboard's Work split panel.
+  heartbeats' orchestrator tokens into the live view's `work_split` section and the dashboard's Work split panel, also
+  per main session on provider-observed keys only (`routes.office_origin/office_run/office_via`; the session view and
+  the pulse pane get the asking session's row only: README "Per-session work split", #127).
   `usage.py` builds `GET /v1/cortados/usage` and `tasks.py` builds
   `GET /v1/cortados/tasks` (the latest 200 `routes` rows as metadata: model, band, S1 reason by category, elapsed, % routed
   per session; never the request text; tokens per routed conversation since the work split, `not recorded` before), both behind the owner token and both read by

@@ -1135,6 +1135,8 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
                             "the remote task was cancelled") from None
         out["host"] = target.name
         out["watch_command"] = watch_command(tid)   # THIS machine's command (the host's own, if any, is not ours)
+        # the origin recorded for the task, as this machine recorded it in the stub (the pulse pane follows it, #127)
+        out["origin_session"] = stub_origin.get("origin_session")
         if local and out.get("local") != local:
             # An execution host on an older checkout ignores the option it does not know: say so, never imply it held.
             out.setdefault("warnings", []).append(
@@ -1311,7 +1313,11 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
     if runner is not None:
         _REAP[task_id] = runner
     out = {"task_id": task_id, "state": "running", "dir": d, "permission_mode": permission_mode, "host": target.name,
-           "launch": "launchd" if launchd else "spawn", "watch_command": watch_command(task_id)}
+           "launch": "launchd" if launchd else "spawn", "watch_command": watch_command(task_id),
+           # the orchestrator the task is recorded under (an Office tag, "grokbot" or None): the pulse pane of the session
+           # that called start_task reads it from this result, so a task recorded under the tag the cortados-route
+           # server started with (before a /clear or a resume) is still found by that session (#127)
+           "origin_session": org["origin_session"]}
     if ws_spec is not None:
         out["workspace"] = {"kind": ws_spec["kind"], "path": os.path.join(target.root, "active", task_id),
                             **({"repo": ws_spec["name"], "branch": ws_spec.get("branch") or workspaces.TASK_BRANCH_PREFIX + task_id}

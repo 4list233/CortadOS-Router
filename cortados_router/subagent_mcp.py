@@ -452,6 +452,25 @@ def _rpc_error(base: dict, code: int, message: str) -> dict:
     return {**base, "error": {"code": code, "message": _safe_error(message)}}
 
 
+VIA_HEADER = "x-cortados-via"                       # provider/office.VIA_HEADER (a test keeps the two equal)
+
+
+def route_task_office_headers(client=None, env=None) -> dict:
+    """The work split's attribution of a route_task call (#127): x-cortados-session = this session's Office tag (the same
+    tag start_task records as a task's origin and the pulse pane computes: origin_tag of the machine's shared salt and
+    CLAUDE_CODE_SESSION_ID), and x-cortados-via: route_task. Without the salt or a session id, no session header: the
+    call stays unattributed rather than guessed. A named client (the bot gateway) is not a session: via only."""
+    out = {VIA_HEADER: "route_task"}
+    if client:
+        return out
+    env = os.environ if env is None else env
+    sid = (env.get(SESSION_ID_ENV) or "").strip()
+    salt = read_office_salt(env) if _SESSION_ID_RE.fullmatch(sid) else None
+    if salt:
+        out["x-cortados-session"] = origin_tag(salt, sid)
+    return out
+
+
 def route_task(provider_url: str, token: str, task: str, context: str = "", max_tokens: int = DEFAULT_MAX_TOKENS,
                urlopen=urllib.request.urlopen, model=None, client=None, local=None) -> dict:
     """Post the subtask to the provider's /v1/messages and return the routed model's text as an MCP tool result.
@@ -506,7 +525,8 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
                                           "x-cortados-reveal": "1",
                                           # attribution: which front door asked (e.g. the bot gateway's "grokbot")
                                           **({"x-cortados-client": str(client)} if client else {}),
-                                          **({LOCAL_HEADER: local} if local else {})})
+                                          **({LOCAL_HEADER: local} if local else {}),
+                                          **route_task_office_headers(client)})
     try:
         # Parse this operation-specific setting only when route_task needs it. Importers use the URL resolver too;
         # unrelated ambient route settings must not break those imports.

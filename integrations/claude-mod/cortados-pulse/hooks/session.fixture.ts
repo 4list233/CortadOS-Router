@@ -12,7 +12,7 @@ export default {
       "left_pct": 70.0,
       "window": "month (Cursor models: Grok, Composer, Auto)"
     },
-    "hosts_with_heartbeat": 2
+    "hosts_with_heartbeat": 3
   },
   "orchestrators": {
     "as_of": 1800000000.0,
@@ -350,11 +350,276 @@ export default {
       {
         "name": "pro",
         "roles": [],
-        "heartbeat_state": "none",
-        "heartbeat": null,
+        "heartbeat_state": "fresh",
+        "heartbeat": {
+          "received_at": 1799999940.0,
+          "age_s": 60.0,
+          "ttl_s": 900,
+          "stale": false,
+          "jobs": [],
+          "s1": null
+        },
         "hardware": null
       }
     ],
     "heartbeat_path": "/v1/cortados/live/heartbeat"
+  },
+  "work_split": {
+    "as_of": 1800000000.0,
+    "status": "ok",
+    "session": "aaaaaaaaaaaaaaa1",
+    "definition": "Tokens, per window (24h, 7d). Orchestrator = what the owner's main Claude Code sessions spent directly with Anthropic, read from their local transcripts and reported by each host's heartbeat; it includes their Agent-tool subagents that ran on a direct model (shown again as the 'subagent' sub-total) and excludes child-task transcripts, the provider's own headless CLIs and any message served by the provider. Routed = what the CortadOS provider's backends reported for routed conversations (child tasks, routed subagents, route_task), joined to the main session by its Office session tag. Fresh tokens = input + output + cache writes; 'all' adds cache reads. % routed = routed fresh ÷ (orchestrator fresh + routed fresh); '% routed (all)' is the same on all tokens, cache reads included, which long native sessions dominate. Per session, routed work is attributed only on keys the provider observed: a child task by the orchestrator tag its requests carried (else the provider host's own task log, through parent tasks), a routed subagent or route_task call by its session tag; native and routed rows join on the session tag (or the sender's older-salt tag), and a tag seen on one side only is shown as such. A routed conversation counts in the window it was routed in; an orchestrator message by its own time. Local-lane and search-lane work, and routed conversations from before token recording, are not recorded and not estimated.",
+    "windows": {
+      "24h": 86400,
+      "7d": 604800
+    },
+    "row": {
+      "session": "aaaaaaaaaaaaaaa1",
+      "host": "pro",
+      "project": "CortadOS-Router",
+      "model": "claude-opus-5-5",
+      "last_at": 1799999930.0,
+      "native_stale": false,
+      "native_age_s": 60.0,
+      "matched_on": [
+        "session"
+      ],
+      "match": "both",
+      "24h": {
+        "orchestrator_fresh": 700000,
+        "orchestrator_all": 30700000,
+        "routed_fresh": 1375000,
+        "routed_all": 5375000,
+        "routed_conversations": 4,
+        "routed_pct": 66.3,
+        "routed_pct_all": 14.9,
+        "native": {
+          "input": 50000,
+          "output": 250000,
+          "cache_read": 30000000,
+          "cache_write": 400000,
+          "fresh": 700000,
+          "all": 30700000,
+          "models": [
+            {
+              "model": "claude-opus-5-5",
+              "input": 45000,
+              "output": 240000,
+              "cache_read": 29000000,
+              "cache_write": 380000,
+              "fresh": 665000,
+              "all": 29665000
+            },
+            {
+              "model": "claude-haiku-5",
+              "input": 5000,
+              "output": 10000,
+              "cache_read": 1000000,
+              "cache_write": 20000,
+              "fresh": 35000,
+              "all": 1035000
+            }
+          ]
+        },
+        "routed": {
+          "input": 960000,
+          "output": 335000,
+          "cache_read": 4000000,
+          "cache_write": 80000,
+          "fresh": 1375000,
+          "all": 5375000,
+          "conversations": 4,
+          "by_route": [
+            {
+              "route": "codex/gpt-6.1-sol",
+              "input": 600000,
+              "output": 200000,
+              "cache_read": 0,
+              "cache_write": 0,
+              "fresh": 800000,
+              "all": 800000,
+              "conversations": 1
+            },
+            {
+              "route": "claude#b/claude-opus-5-5",
+              "input": 300000,
+              "output": 120000,
+              "cache_read": 4000000,
+              "cache_write": 80000,
+              "fresh": 500000,
+              "all": 4500000,
+              "conversations": 1
+            },
+            {
+              "route": "codex/gpt-6.1-mini",
+              "input": 40000,
+              "output": 10000,
+              "cache_read": 0,
+              "cache_write": 0,
+              "fresh": 50000,
+              "all": 50000,
+              "conversations": 1
+            },
+            {
+              "route": "claude#b/claude-haiku-5",
+              "input": 20000,
+              "output": 5000,
+              "cache_read": 0,
+              "cache_write": 0,
+              "fresh": 25000,
+              "all": 25000,
+              "conversations": 1
+            }
+          ],
+          "by_via": {
+            "child_task": {
+              "input": 900000,
+              "output": 320000,
+              "cache_read": 4000000,
+              "cache_write": 80000,
+              "fresh": 1300000,
+              "all": 5300000,
+              "conversations": 2
+            },
+            "route_task": {
+              "input": 20000,
+              "output": 5000,
+              "cache_read": 0,
+              "cache_write": 0,
+              "fresh": 25000,
+              "all": 25000,
+              "conversations": 1
+            },
+            "subagent": {
+              "input": 40000,
+              "output": 10000,
+              "cache_read": 0,
+              "cache_write": 0,
+              "fresh": 50000,
+              "all": 50000,
+              "conversations": 1
+            }
+          }
+        }
+      },
+      "7d": {
+        "orchestrator_fresh": 700000,
+        "orchestrator_all": 30700000,
+        "routed_fresh": 1375000,
+        "routed_all": 5375000,
+        "routed_conversations": 4,
+        "routed_pct": 66.3,
+        "routed_pct_all": 14.9,
+        "native": {
+          "input": 50000,
+          "output": 250000,
+          "cache_read": 30000000,
+          "cache_write": 400000,
+          "fresh": 700000,
+          "all": 30700000,
+          "models": [
+            {
+              "model": "claude-opus-5-5",
+              "input": 45000,
+              "output": 240000,
+              "cache_read": 29000000,
+              "cache_write": 380000,
+              "fresh": 665000,
+              "all": 29665000
+            },
+            {
+              "model": "claude-haiku-5",
+              "input": 5000,
+              "output": 10000,
+              "cache_read": 1000000,
+              "cache_write": 20000,
+              "fresh": 35000,
+              "all": 1035000
+            }
+          ]
+        },
+        "routed": {
+          "input": 960000,
+          "output": 335000,
+          "cache_read": 4000000,
+          "cache_write": 80000,
+          "fresh": 1375000,
+          "all": 5375000,
+          "conversations": 4,
+          "by_route": [
+            {
+              "route": "codex/gpt-6.1-sol",
+              "input": 600000,
+              "output": 200000,
+              "cache_read": 0,
+              "cache_write": 0,
+              "fresh": 800000,
+              "all": 800000,
+              "conversations": 1
+            },
+            {
+              "route": "claude#b/claude-opus-5-5",
+              "input": 300000,
+              "output": 120000,
+              "cache_read": 4000000,
+              "cache_write": 80000,
+              "fresh": 500000,
+              "all": 4500000,
+              "conversations": 1
+            },
+            {
+              "route": "codex/gpt-6.1-mini",
+              "input": 40000,
+              "output": 10000,
+              "cache_read": 0,
+              "cache_write": 0,
+              "fresh": 50000,
+              "all": 50000,
+              "conversations": 1
+            },
+            {
+              "route": "claude#b/claude-haiku-5",
+              "input": 20000,
+              "output": 5000,
+              "cache_read": 0,
+              "cache_write": 0,
+              "fresh": 25000,
+              "all": 25000,
+              "conversations": 1
+            }
+          ],
+          "by_via": {
+            "child_task": {
+              "input": 900000,
+              "output": 320000,
+              "cache_read": 4000000,
+              "cache_write": 80000,
+              "fresh": 1300000,
+              "all": 5300000,
+              "conversations": 2
+            },
+            "route_task": {
+              "input": 20000,
+              "output": 5000,
+              "cache_read": 0,
+              "cache_write": 0,
+              "fresh": 25000,
+              "all": 25000,
+              "conversations": 1
+            },
+            "subagent": {
+              "input": 40000,
+              "output": 10000,
+              "cache_read": 0,
+              "cache_write": 0,
+              "fresh": 50000,
+              "all": 50000,
+              "conversations": 1
+            }
+          }
+        }
+      }
+    },
+    "notes": []
   }
 }

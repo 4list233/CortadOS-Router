@@ -647,13 +647,30 @@ function renderWorkSplit(box, s, now) {
   }
   const rows = (s.sessions || []).filter(x => x[wsWin] && ((x[wsWin].orchestrator_fresh || 0) + (x[wsWin].routed_fresh || 0)) > 0);
   if (rows.length) {
+    // Per session (#127): native = the session's own transcript tokens by model; routed = what the provider served for
+    // it, by route and by how it was handed over (child task, routed subagent, route_task). Both shares are shown.
+    add(P.body, el("div", "sub", "Per main session: native = the session's own model (main loop and direct subagents); " +
+      "routed = its child tasks, routed subagents and route_task calls. % routed fresh leaves cache reads out; " +
+      "% routed (all) counts them."));
+    const VIA = {child_task: "child tasks", subagent: "routed subagents", route_task: "route_task"};
+    const nat = x => { const n = x[wsWin].native;
+      if (!n) return x.match === "routed only" ? "not reported" : "–";
+      return join([tok(n.fresh) + " fresh", (n.models || []).map(m => m.model + " " + tok(m.fresh)).join(", ") || null]); };
+    const rout = x => { const r = x[wsWin].routed;
+      if (!r) return "none";
+      return join([tok(r.fresh) + " fresh", Object.keys(r.by_via || {}).map(k => (VIA[k] || k) + " " + tok(r.by_via[k].fresh)).join(", "),
+        (r.by_route || []).slice(0, 3).map(m => m.route + " " + tok(m.fresh)).join(", ") +
+        ((r.by_route || []).length > 3 ? " +" + ((r.by_route || []).length - 3) + " more" : "")]); };
+    const MATCH = {both: "joined", "native only": "native only", "routed only": "routed only (no native report)", untagged: "no session tag"};
     const wide = el("div", "wide");
     add(wide, table(rows, [
-      {h: "main session", v: x => join([x.project || (x.session ? short(x.session) : "untagged"), x.host ? "on " + x.host : null])},
-      {h: "model", v: x => x.model || "–"},
-      {h: "orchestrator", num: true, v: x => x[wsWin].orchestrator_fresh === null ? "not reported" : tok(x[wsWin].orchestrator_fresh)},
-      {h: "routed", num: true, v: x => tok(x[wsWin].routed_fresh)},
-      {h: "% routed", num: true, v: x => pct(x[wsWin].routed_pct)},
+      {h: "main session", v: x => join([x.project || (x.session ? short(x.session) : "untagged"), x.host ? "on " + x.host : null,
+        x.native_stale ? "stale" : null])},
+      {h: "join", v: x => MATCH[x.match] || x.match || "–"},
+      {h: "native", v: nat},
+      {h: "routed", v: rout},
+      {h: "% routed fresh", num: true, v: x => pct(x[wsWin].routed_pct)},
+      {h: "% routed (all)", num: true, v: x => pct(x[wsWin].routed_pct_all)},
       {h: "conversations", num: true, v: x => x[wsWin].routed_conversations},
       {h: "last", v: x => ago(x.last_at, now)}]));
     add(P.body, wide);

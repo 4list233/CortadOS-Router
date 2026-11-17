@@ -988,8 +988,12 @@ CREATE INDEX IF NOT EXISTS routes_ts ON routes(ts);"""
 
 # Tokens a routed conversation spent, summed over its backend turns (log_tokens), and the x-cortados-session tag of the
 # orchestrator whose work it was. provider/work_split.py and provider/tasks.py read them; NULL = not recorded.
+# The per-session work split (#127) adds three provider-observed keys, each the first one seen on the conversation:
+# office_origin (x-cortados-origin: a child task's orchestrator, which a child's own x-cortados-session is not),
+# office_run (x-cortados-run-id: the child task) and office_via (x-cortados-via: "route_task" for a route_task call).
 TOKEN_COLUMNS = (("tok_input", "INTEGER"), ("tok_output", "INTEGER"), ("tok_cache_read", "INTEGER"),
-                 ("tok_cache_write", "INTEGER"), ("tok_turns", "INTEGER"), ("office_session", "TEXT"))
+                 ("tok_cache_write", "INTEGER"), ("tok_turns", "INTEGER"), ("office_session", "TEXT"),
+                 ("office_origin", "TEXT"), ("office_run", "TEXT"), ("office_via", "TEXT"))
 
 
 def _db() -> sqlite3.Connection:
@@ -1083,10 +1087,12 @@ def log_outcome(turn_id: str, response_chars: int, turn_ms: int) -> None:
                                                      (response_chars, turn_ms, turn_id)), raise_final=True)
 
 
-def log_tokens(turn_id: str, usage: dict[str, Any], office_session: str | None = None) -> bool:
+def log_tokens(turn_id: str, usage: dict[str, Any], office_session: str | None = None, *,
+               office_origin: str | None = None, office_run: str | None = None, office_via: str | None = None) -> bool:
     """Add one backend turn's tokens to its route's row (Messages-shaped usage: input_tokens excludes the cache reads
     and writes, which come as cache_read_input_tokens / cache_creation_input_tokens; both bridges report that shape)
-    and remember the first orchestrator session tag seen. Never raises sqlite3.Error: accounting must not fail a reply;
+    and remember the first orchestrator session tag seen, and the first origin, run id and via (TOKEN_COLUMNS); the
+    caller (the provider) has validated each. Never raises sqlite3.Error: accounting must not fail a reply;
     a lost write is counted in router_db like a lost route (#99). Returns False when it was not written, including when
     no routes row has this turn_id (the tokens have nowhere to go: counted in router_db as a lost write too)."""
     def n(k: str) -> int:
@@ -1099,8 +1105,10 @@ def log_tokens(turn_id: str, usage: dict[str, Any], office_session: str | None =
         matched[0] = c.execute(
             "UPDATE routes SET tok_input=COALESCE(tok_input,0)+?, tok_output=COALESCE(tok_output,0)+?, "
             "tok_cache_read=COALESCE(tok_cache_read,0)+?, tok_cache_write=COALESCE(tok_cache_write,0)+?, "
-            "tok_turns=COALESCE(tok_turns,0)+1, office_session=COALESCE(office_session,?) WHERE turn_id=?",
-            (*vals, office_session, turn_id)).rowcount
+            "tok_turns=COALESCE(tok_turns,0)+1, office_session=COALESCE(office_session,?), "
+            "office_origin=COALESCE(office_origin,?), office_run=COALESCE(office_run,?), office_via=COALESCE(office_via,?) "
+            "WHERE turn_id=?",
+            (*vals, office_session, office_origin, office_run, office_via, turn_id)).rowcount
     if not _write_routes("log_tokens", write, raise_final=False):
         return False
     if matched[0] == 0:                             # e.g. the route's own log_route was lost: no row to add to

@@ -2615,7 +2615,7 @@ class TokenLogTests(RoutedHarness):
     def test_each_turn_is_logged_on_its_route_with_the_session_tag(self):
         logged, done = [], threading.Semaphore(0)
 
-        def record(route_id, usage, tag):
+        def record(route_id, usage, tag, **keys):
             logged.append((route_id, usage, tag)); done.release()
         self.reg.log_tokens = record
         history = [{"role": "user", "content": "please use tool"}]
@@ -2632,7 +2632,7 @@ class TokenLogTests(RoutedHarness):
     def test_a_failing_token_log_never_breaks_the_reply(self):
         done = threading.Event()
 
-        def boom(*a):
+        def boom(*a, **k):
             done.set()
             raise sqlite3.OperationalError("database is locked")
         self.reg.log_tokens = boom
@@ -2644,6 +2644,31 @@ class TokenLogTests(RoutedHarness):
                 time.sleep(0.01)
         self.assertTrue(any("token log for route r1 failed" in m for m in cm.output), cm.output)
         self.assertEqual(r["stop_reason"], "end_turn")
+
+    def test_the_work_split_keys_are_the_ones_the_provider_observed(self):
+        # #127: a child's origin and run id, and route_task's via marker, reach the route row as validated keys; an
+        # invalid origin or an unknown via is dropped, never stored
+        logged, done = [], threading.Semaphore(0)
+
+        def record(route_id, usage, tag, **keys):
+            logged.append((tag, keys)); done.release()
+        self.reg.log_tokens = record
+        for extra in ({"x-cortados-origin": "aaaaaaaaaaaaaaa1", "x-cortados-run-id": "t20261116160946-4437347b",
+                       "x-cortados-session": "c0ffeec0ffee0001"},
+                      {"x-cortados-session": "3f9a1c2e9b7d4a10", "x-cortados-via": "route_task"},
+                      {"x-cortados-origin": "NOT AN ORIGIN", "x-cortados-via": "anything-else"}):
+            h = {"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
+                 "user-agent": "claude-cli/2.1.304 (external, cli)", **extra}
+            req = urllib.request.Request(self.url + "/v1/messages", method="POST", headers=h,
+                                         data=json.dumps({"messages": [{"role": "user", "content": "hello"}]}).encode())
+            with urllib.request.urlopen(req, timeout=30) as r:
+                r.read()
+            self.assertTrue(done.acquire(timeout=10), "a turn's tokens were never logged")
+        self.assertEqual(logged, [
+            ("c0ffeec0ffee0001", {"office_origin": "aaaaaaaaaaaaaaa1", "office_run": "t20261116160946-4437347b",
+                                  "office_via": None}),
+            ("3f9a1c2e9b7d4a10", {"office_origin": None, "office_run": None, "office_via": "route_task"}),
+            (None, {"office_origin": None, "office_run": None, "office_via": None})])
 
     def test_unrouted_or_unconfigured_logs_nothing(self):
         self.reg.log_tokens = None                                   # fixed-model endpoint: tokens are not recorded
