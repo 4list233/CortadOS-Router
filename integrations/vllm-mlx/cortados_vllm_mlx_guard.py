@@ -71,10 +71,13 @@ files are removed after preprocessing; VisionEmbeddingCache (count-only, 100/50 
 is the pixel bound; drafters and specprefill are refused; and only a model dir whose config.json is qwen3_5 /
 Qwen3_5ForConditionalGeneration with a vision_config (and the --image-dims dimensions) may serve. The text Scheduler
 refuses every request in this mode.
-The vision encoder's own attention (#125 round 3) is counted as fused, so startup also stops unless config.json's
-vision_config and the loaded tower have the --image-dims heads and depth, a head_dim (hidden / heads) MLX's fused kernel
-takes (FUSED_SDPA_HEAD_DIMS) and the reservation's patch geometry (VISION_TOWER_GEOMETRY): vision_attention_problem,
-check_vision_model, vision_tower_problem.
+The vision encoder's own attention (#125 rounds 3-4) is counted as fused with its padded width, which holds for ONE
+verified geometry only: --image-dims must be exactly VISION_DIMS_ALLOWED (refused at --check and at serve, before
+anything loads), config.json's vision_config exactly VISION_ENCODER_CONFIG (check_vision_model, at --check and at
+route resolution) and the loaded tower the same (vision_tower_problem, when MLLMScheduler is built). And the fused
+kernel's implementation is pinned: mlx and mlx-metal 0.32.4, their installed dist-info RECORD entries and the files
+themselves (the mlx.core extension, libmlx.dylib, mlx.metallib) against the released macOS arm64 wheels' RECORDs
+(MLX_PINNED_RECORD / MLX_METAL_PINNED_RECORD, verify_mlx), and the mlx.core actually imported must be that file.
 Pinned on top: the MLLM files of vllm-mlx 0.6.0 (VISION_PINNED_SHA256) and mlx-vlm 0.7.12 (MLX_VLM_PINNED_SHA256: the
 processor, the model, the vision encoder, the linear attention, the caches and the rest of their import chain;
 docs/LOCAL-RESOURCES.md "Vision" lists them).
@@ -345,6 +348,61 @@ MLX_VLM_PINNED_SHA256 = {
     "speculative/ops/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "quantization/__init__.py": "7dac848bf14e9db1a3da4bb3a8c30093c3a5fdfeb53ef8137af9234831b3fe1a",
 }
+# #125 review round 4 (P2): the fused kernel's implementation. ensure_fused_sdpa only pads and calls
+# mlx.core.fast.scaled_dot_product_attention; which kernel that dispatches to (fused, or an unfused fallback that holds
+# heads x N x N scores) is decided in the compiled mlx.core extension, libmlx.dylib and mlx.metallib. So mlx and
+# mlx-metal are pinned to 0.32.4 (the Pro's installed versions) by their installed dist-info RECORD entries AND the
+# files' own sha256, against the RECORDs of the released PyPI wheels (fetched 2026-11-16; each RECORD hash was checked
+# against the file bytes in its wheel). Pinned: every macOS arm64 wheel of 0.32.4 (CPython 3.10-3.15, free-threaded
+# builds included, macosx 14.0 / 15.0 / 26.0: the Pro's Python and macOS tag were not readable from the build machine);
+# the installed WHEEL tag picks the row, and mlx's and mlx-metal's macOS tags must agree. Any other platform, version or byte fails closed (verify_mlx).
+MLX_VERSION = "0.32.4"
+# mlx (one row per wheel tag): the mlx.core extension, as RECORD names it and its RECORD hash.
+MLX_PINNED_RECORD = {
+    "cp310-cp310-macosx_14_0_arm64": ("mlx/core.cpython-310-darwin.so", "sha256=ozADsGv_W8ufM3WQaucH0w3iI8AigNLjt3KlMDXNWE4"),
+    "cp310-cp310-macosx_15_0_arm64": ("mlx/core.cpython-310-darwin.so", "sha256=vk_Y_xORAxATEsDbekJQrgI35XveqdsLartsd7SokKU"),
+    "cp310-cp310-macosx_26_0_arm64": ("mlx/core.cpython-310-darwin.so", "sha256=ubmrEwEjeXwlLSExQvV6FMRnf-y6WZBB_H10hYBDdb4"),
+    "cp311-cp311-macosx_14_0_arm64": ("mlx/core.cpython-311-darwin.so", "sha256=6eHpkzhXoWWNXnQshFoZb4XpSaDgD7Jh0NvPL1Co8Yg"),
+    "cp311-cp311-macosx_15_0_arm64": ("mlx/core.cpython-311-darwin.so", "sha256=O8eTCprg14wD9DN3VZDmtniWwFdqU-ukrlzcnp76nIw"),
+    "cp311-cp311-macosx_26_0_arm64": ("mlx/core.cpython-311-darwin.so", "sha256=njvJ2z6Qrk7_U772V0Ad8pbmi466FaHlI-L3jI_CG7I"),
+    "cp312-cp312-macosx_14_0_arm64": ("mlx/core.cpython-312-darwin.so", "sha256=ikDhN76IMe8run8XsKJR7IfkDomgqhaIf3ENpf7IdQQ"),
+    "cp312-cp312-macosx_15_0_arm64": ("mlx/core.cpython-312-darwin.so", "sha256=Jf86zDz7li2aIcAY4OAPRLWTWIj3aTYWPgDCFZYwnmY"),
+    "cp312-cp312-macosx_26_0_arm64": ("mlx/core.cpython-312-darwin.so", "sha256=AzYCMA_gZc7wlZEWkM5k9QuT7-JTg_5XXfEKudGBJg0"),
+    "cp313-cp313-macosx_14_0_arm64": ("mlx/core.cpython-313-darwin.so", "sha256=7yA1QHijOOQ34BiN9qcU-5FJCQXTafsSNQDdEN8FPLo"),
+    "cp313-cp313-macosx_15_0_arm64": ("mlx/core.cpython-313-darwin.so", "sha256=kgEm6ULPdHpdkYLEb5lROCbDiQgVKrhGwDEBPnXrs5Q"),
+    "cp313-cp313-macosx_26_0_arm64": ("mlx/core.cpython-313-darwin.so", "sha256=LgmHIqREybUahLHOKG5OLBaAwUbIiRY82QqCGcPUTRA"),
+    "cp313-cp313t-macosx_14_0_arm64": ("mlx/core.cpython-313t-darwin.so", "sha256=hwQKl1ND205Lt6bOUH9fhRgCIlOk7O2ptDd9vG1rJvU"),
+    "cp313-cp313t-macosx_15_0_arm64": ("mlx/core.cpython-313t-darwin.so", "sha256=0HRHD3MMLD4i9YTqOOMNeGT43MJ_dJwZaZoQuunC0wk"),
+    "cp313-cp313t-macosx_26_0_arm64": ("mlx/core.cpython-313t-darwin.so", "sha256=Rjjgq01INCeW-wI2ymeXNYf6zOg09HgDY0PP2jXivqQ"),
+    "cp314-cp314-macosx_14_0_arm64": ("mlx/core.cpython-314-darwin.so", "sha256=l2tRufhC83Dp-0HMvd9TtPwjxQ8KV9Y45CYqh3v8sRQ"),
+    "cp314-cp314-macosx_15_0_arm64": ("mlx/core.cpython-314-darwin.so", "sha256=Wd6Gx-mbRTpok_2EFUVZU7vwk9kn2fygitAXUGY7NdI"),
+    "cp314-cp314-macosx_26_0_arm64": ("mlx/core.cpython-314-darwin.so", "sha256=V6xBxzY-SULesBzq-ny1U7Akxx_bx3xZStDciCSZQLE"),
+    "cp314-cp314t-macosx_14_0_arm64": ("mlx/core.cpython-314t-darwin.so", "sha256=0iryGq6fv5Vmgt2HREbAWXgWAycR6EaMt5QPrtrsj0o"),
+    "cp314-cp314t-macosx_15_0_arm64": ("mlx/core.cpython-314t-darwin.so", "sha256=97JD7RkVjuLybapNFXF5g9cIQITWgyqGoP8gSsnLejs"),
+    "cp314-cp314t-macosx_26_0_arm64": ("mlx/core.cpython-314t-darwin.so", "sha256=WYIimOQwHm4pAzBsgBTyo3UvMwMHCPK2KNcgHs4BwdY"),
+    "cp315-cp315-macosx_14_0_arm64": ("mlx/core.cpython-315-darwin.so", "sha256=QIs1iKFWnuAQyWxohmtfb2KYxKNqN86vHXq7uczYEgE"),
+    "cp315-cp315-macosx_15_0_arm64": ("mlx/core.cpython-315-darwin.so", "sha256=QDdjJat5nNvtOVQs21FYbchcnooy9TBGTYfYZAjGmYQ"),
+    "cp315-cp315-macosx_26_0_arm64": ("mlx/core.cpython-315-darwin.so", "sha256=GNmOuRVPyTle0sc34ZdJLcZ8zVWaIimJdj4xWZf0dFE"),
+    "cp315-cp315t-macosx_14_0_arm64": ("mlx/core.cpython-315t-darwin.so", "sha256=-54upqKAxh6QNsYYbodgGFhPgE8HkUmtB1w3VCYVAwQ"),
+    "cp315-cp315t-macosx_15_0_arm64": ("mlx/core.cpython-315t-darwin.so", "sha256=uUaHPMnk3xa3s3_oLchztUN0fwYhrHvvMLCPw5d21Ug"),
+    "cp315-cp315t-macosx_26_0_arm64": ("mlx/core.cpython-315t-darwin.so", "sha256=KInAQpRORsuXfkhIXmJFpUoxbD3Z3xVv86Up4LDA3P0"),
+}
+# mlx-metal (one row per wheel tag): the C++ library and the Metal kernels.
+MLX_METAL_PINNED_RECORD = {
+    "py3-none-macosx_14_0_arm64": {
+        "mlx/lib/libmlx.dylib": "sha256=dc71Z7mLHGM0KjV9q3vhzuX6ysjyAdnto_NEQvlB-mI",
+        "mlx/lib/mlx.metallib": "sha256=1wqyE9TPqfJnPk2ywqRHTIatnMdnRWS-xN1KyUCdpnU",
+    },
+    "py3-none-macosx_15_0_arm64": {
+        "mlx/lib/libmlx.dylib": "sha256=u-TuWrCiO7SpXGxe6d3HUgq7-91kYV7p-7OtIY1EeGs",
+        "mlx/lib/mlx.metallib": "sha256=82sBxE3V8tkCDesaxq1T3Ahd6Brxk5ZpTFlj7zoSE38",
+    },
+    "py3-none-macosx_26_0_arm64": {
+        "mlx/lib/libmlx.dylib": "sha256=2Mk5PVhOeBOTw-_8z8zYuoWtDHAmTtr5-JfcqYdTdcY",
+        "mlx/lib/mlx.metallib": "sha256=xtej-suDVo9uTLLPSoxzbuKTAlcaSDQ8uaOk0c0-OJM",
+    },
+}
+
 VISION_MODEL_TYPE = "qwen3_5"
 VISION_ARCHITECTURES = ["Qwen3_5ForConditionalGeneration"]
 # The runtime classes the argument was read against (module, class name).
@@ -380,22 +438,30 @@ IMAGE_DIMS = {
     "vocab_size": ("text_config", "vocab_size"),
     "vision_hidden_size": ("vision_config", "hidden_size"),
     "vision_intermediate_size": ("vision_config", "intermediate_size"),
-    # #125 review round 3 (P1): the encoder's attention heads and depth. The reservation counts the encoder's
-    # attention as fused (no heads x N x N scores); that holds only for a head_dim MLX's fused kernel takes.
     "vision_num_heads": ("vision_config", "num_heads"),
     "vision_depth": ("vision_config", "depth"),
 }
 DIMS_KEYS = (*IMAGE_DIMS, "act_bytes")
-# The head dims MLX's fused attention kernel takes (mlx-vlm 0.7.12 models/base.py ensure_fused_sdpa, pinned): a
-# smaller head_dim is zero-padded up to the next of them; a larger one falls back to MLX's unfused attention, which
-# materializes heads x N x N scores for each image's N patches (16 GiB at 8 heads and 32,768 patches). The vision
-# encoder (qwen3_vl/vision.py Attention, pinned) runs every block as full attention over one image at a time
-# (cu_seqlens splits; window_size and fullatt_block_indexes are read into its config and used by no block).
-FUSED_SDPA_HEAD_DIMS = (64, 80, 128)
-# The vision tower's geometry as config.json must give it (absent keys take mlx-vlm 0.7.12's qwen3_vl VisionConfig
-# defaults, pinned: patch_size 14 would be refused), matching VISION_GEOMETRY and local_governor's patch constants.
+# #125 review round 4: the ONE geometry vision mode serves (the Pro's Qwen3.8 27B, config.json checked 2026-11-16;
+# local_governor.VISION_DEFAULTS / VISION_FIXED_KEYS hold the same values). The reservation's encoder term is argued
+# for it only: head_dim 1,152 / 16 = 72, which mlx-vlm 0.7.12's ensure_fused_sdpa (models/base.py, pinned) pads to 80
+# for MLX's fused kernel, counted at that padded width. Rounds 2 and 3 each found another geometry the general formula
+# did not bound (8 heads, unfused; 288 heads of 4, padded to 64), so there is no general acceptance: a future model
+# is added here explicitly, with its own reservation argument.
+VISION_DIMS_ALLOWED = {
+    "hidden_size": 5120, "intermediate_size": 17408, "num_attention_heads": 24, "num_key_value_heads": 4,
+    "head_dim": 256, "linear_num_key_heads": 16, "linear_num_value_heads": 48, "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128, "vocab_size": 248320, "vision_hidden_size": 1152, "vision_intermediate_size": 4304,
+    "vision_num_heads": 16, "vision_depth": 27, "act_bytes": 2,
+}
+# config.json's vision_config, exactly (every key present: mlx-vlm's VisionConfig defaults differ, e.g. depth 32 and
+# patch_size 14), plus in_channels 3 (its default when absent). The vision encoder (qwen3_vl/vision.py Attention,
+# pinned) runs every block as full attention over one image at a time (cu_seqlens splits; window_size and
+# fullatt_block_indexes are read into its config and used by no block).
+VISION_ENCODER_CONFIG = {"depth": 27, "num_heads": 16, "hidden_size": 1152, "intermediate_size": 4304,
+                         "patch_size": 16, "spatial_merge_size": 2, "temporal_patch_size": 2, "out_hidden_size": 5120}
 VISION_TOWER_GEOMETRY = {"patch_size": 16, "spatial_merge_size": 2, "temporal_patch_size": 2, "in_channels": 3}
-VISION_CONFIG_DEFAULTS = {"patch_size": 14, "spatial_merge_size": 2, "temporal_patch_size": 2, "in_channels": 3}
+VISION_HEAD_DIM = VISION_ENCODER_CONFIG["hidden_size"] // VISION_ENCODER_CONFIG["num_heads"]          # 72
 # Bytes per element of the dtypes a config.json may name (the activations are computed in it).
 DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "float32": 4}
 
@@ -424,9 +490,10 @@ class VisionPolicy:
         if sorted(dims) != sorted(DIMS_KEYS) or any(isinstance(v, bool) or not isinstance(v, int) or v <= 0
                                                     for v in dims.values()):
             raise GuardError(f"vision: {DIMS_FLAG} needs exactly {', '.join(DIMS_KEYS)} as positive integers")
-        why = vision_attention_problem(dims["vision_hidden_size"], dims["vision_num_heads"])
-        if why is not None:
-            raise GuardError(f"vision: {DIMS_FLAG} {why}")
+        for k, want in VISION_DIMS_ALLOWED.items():
+            if dims[k] != want:
+                raise GuardError(f"vision: {DIMS_FLAG} {k}={dims[k]} is not the verified geometry ({k}={want}); "
+                                 "vision mode serves that one geometry only (VISION_DIMS_ALLOWED)")
         self.dims = dims
 
     @property
@@ -434,18 +501,6 @@ class VisionPolicy:
         """The processor's max_pixels: image_tokens tokens of (patch x merge)^2 pixels each."""
         f = VISION_GEOMETRY["patch_size"] * VISION_GEOMETRY["merge_size"]
         return self.image_tokens * f * f
-
-
-def vision_attention_problem(hidden: Any, heads: Any) -> str | None:
-    """Why the vision encoder's attention would not run fused (so its heads x N x N scores would be materialized), or
-    None: the head_dim hidden / heads must be a whole number no larger than MLX's largest fused head dim."""
-    if isinstance(hidden, bool) or isinstance(heads, bool) or not isinstance(hidden, int) \
-            or not isinstance(heads, int) or hidden <= 0 or heads <= 0 or hidden % heads:
-        return f"vision hidden_size {hidden!r} is not split evenly over {heads!r} heads"
-    if hidden // heads > max(FUSED_SDPA_HEAD_DIMS):
-        return (f"vision head_dim {hidden // heads} ({hidden} / {heads} heads) is outside MLX's fused attention "
-                f"({'/'.join(map(str, FUSED_SDPA_HEAD_DIMS))}): the encoder would materialize heads x N x N scores")
-    return None
 
 
 def parse_vision(args: list[str]) -> tuple["VisionPolicy | None", list[str]]:
@@ -515,14 +570,11 @@ def check_vision_model(model_dir: Any, dims: dict | None = None) -> None:
             raise GuardError(f"vision mode: config.json {section}.{key} is {got!r}, but the gate's image reservation "
                              f"was computed for {dims[name]} ({DIMS_FLAG} {name}); recompute it for this model")
     vc = cfg["vision_config"]
-    why = vision_attention_problem(vc.get("hidden_size"), vc.get("num_heads"))
-    if why is not None:
-        raise GuardError(f"vision mode: config.json {why}")
-    for key, want in VISION_TOWER_GEOMETRY.items():
-        got = vc.get(key, VISION_CONFIG_DEFAULTS[key])
-        if got != want:
-            raise GuardError(f"vision mode: config.json vision_config.{key} is {got!r}, not {want}: the reservation's "
-                             "patch geometry")
+    for key, want in (*VISION_ENCODER_CONFIG.items(), ("in_channels", 3)):
+        got = vc.get(key, 3 if key == "in_channels" else None)
+        if isinstance(got, bool) or got != want:
+            raise GuardError(f"vision mode: config.json vision_config.{key} is {got!r}, not {want}: vision mode serves "
+                             "the one verified encoder geometry (VISION_ENCODER_CONFIG)")
     if vc.get("deepstack_visual_indexes"):
         raise GuardError("vision mode: config.json vision_config.deepstack_visual_indexes is set (qwen3_5 has none)")
     text = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
@@ -536,21 +588,22 @@ def check_vision_model(model_dir: Any, dims: dict | None = None) -> None:
 
 
 def vision_tower_problem(tower: Any, dims: dict) -> str | None:
-    """The loaded vision tower against the dimensions the reservation was computed for, or None when it agrees: the
-    model as built (qwen3_vl/vision.py VisionModel), not only its config.json. Every block's attention has the
-    checked heads and a fused head_dim, there are `vision_depth` blocks, and the patch geometry is the reservation's."""
+    """The loaded vision tower against the verified geometry, or None when it agrees: the model as built
+    (qwen3_vl/vision.py VisionModel), not only its config.json. VISION_ENCODER_CONFIG's depth blocks, every block's
+    attention 16 heads of 72, and the patch geometry the reservation's. `dims` is the policy's (VISION_DIMS_ALLOWED)."""
     blocks = getattr(tower, "blocks", None)
     if tower is None or not isinstance(blocks, (list, tuple)):
         return "is missing or has no blocks"
-    if len(blocks) != dims["vision_depth"]:
-        return f"has {len(blocks)} blocks, not {dims['vision_depth']}"
-    want_d = dims["vision_hidden_size"] // dims["vision_num_heads"]
+    if dims != VISION_DIMS_ALLOWED:
+        return "was checked against dimensions other than the verified geometry"
+    if len(blocks) != VISION_ENCODER_CONFIG["depth"]:
+        return f"has {len(blocks)} blocks, not {VISION_ENCODER_CONFIG['depth']}"
+    want_h = VISION_ENCODER_CONFIG["num_heads"]
     for n, blk in enumerate(blocks):
         attn = getattr(blk, "attn", None)
         heads, d = getattr(attn, "num_heads", None), getattr(attn, "head_dim", None)
-        if heads != dims["vision_num_heads"] or d != want_d or not isinstance(d, int) \
-                or d > max(FUSED_SDPA_HEAD_DIMS):
-            return f"block {n} attention has {heads!r} heads of {d!r}, not {dims['vision_num_heads']} of {want_d}"
+        if isinstance(heads, bool) or isinstance(d, bool) or heads != want_h or d != VISION_HEAD_DIM:
+            return f"block {n} attention has {heads!r} heads of {d!r}, not {want_h} of {VISION_HEAD_DIM}"
     pe = getattr(tower, "patch_embed", None)
     got = {"patch_size": getattr(pe, "patch_size", None), "temporal_patch_size": getattr(pe, "temporal_patch_size", None),
            "spatial_merge_size": getattr(tower, "spatial_merge_size", None),
@@ -575,6 +628,77 @@ def verify_vision(vllm_dir: str, vlm_dir: str, vlm_version: str, pins: dict | No
                 raise GuardError(f"{name}/{rel} unreadable ({type(exc).__name__})") from None
             if got != want:
                 raise GuardError(f"{name}/{rel} differs from the release the guard's vision argument was read against")
+
+
+def _record_hash(path: str) -> str:
+    """A file's hash in a RECORD's form: sha256= and the urlsafe base64 digest without padding."""
+    import base64
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return "sha256=" + base64.urlsafe_b64encode(h.digest()).rstrip(b"=").decode()
+
+
+def verify_mlx(find: Any = None, core_file: Any = None, pins: dict | None = None,
+               metal_pins: dict | None = None) -> str:
+    """GuardError unless the installed mlx and mlx-metal are the released 0.32.4 wheels for this platform (module
+    docstring; MLX_PINNED_RECORD): the version, one WHEEL tag that has a pinned row, the RECORD entries of the files
+    that implement fast.scaled_dot_product_attention's dispatch equal to the release's, those files' bytes equal to
+    them, and the mlx.core imported (`core_file`, else mlx.core.__file__) that very file, beside that libmlx.dylib.
+    `find` is importlib.metadata.distribution (tests pass a fake). Returns the mlx wheel tag."""
+    if find is None:
+        from importlib import metadata
+        find = metadata.distribution
+    found = {}
+    for name, table in (("mlx", MLX_PINNED_RECORD if pins is None else pins),
+                        ("mlx_metal", MLX_METAL_PINNED_RECORD if metal_pins is None else metal_pins)):
+        try:
+            dist = find(name)
+        except Exception as exc:                  # importlib.metadata.PackageNotFoundError
+            raise GuardError(f"{name} is not installed ({type(exc).__name__}): vision mode needs {name} "
+                             f"{MLX_VERSION}") from None
+        version = dist.version
+        if version != MLX_VERSION:
+            raise GuardError(f"{name} {version} is not {MLX_VERSION}: re-read the guard's vision argument first")
+        tags = [ln.split(":", 1)[1].strip() for ln in (dist.read_text("WHEEL") or "").splitlines()
+                if ln.startswith("Tag:")]
+        if len(tags) != 1 or tags[0] not in table:
+            raise GuardError(f"{name} {MLX_VERSION}: wheel tag {tags!r} is not one of the pinned releases")
+        want = table[tags[0]]
+        if name == "mlx":
+            want = {want[0]: want[1]}
+        record = {}
+        for ln in (dist.read_text("RECORD") or "").splitlines():
+            parts = ln.rsplit(",", 2)
+            if len(parts) == 3:
+                record[parts[0]] = parts[1]
+        paths = {}
+        for rel, h in want.items():
+            if record.get(rel) != h:
+                raise GuardError(f"{name} {MLX_VERSION}: RECORD's {rel} is not the released wheel's ({tags[0]})")
+            path = os.path.realpath(str(dist.locate_file(rel)))
+            try:
+                got = _record_hash(path)
+            except OSError as exc:
+                raise GuardError(f"{name}/{rel} unreadable ({type(exc).__name__})") from None
+            if got != h:
+                raise GuardError(f"{name}/{rel} differs from the released {MLX_VERSION} wheel ({tags[0]})")
+            paths[rel] = path
+        found[name] = (tags[0], paths)
+    (mlx_tag, mlx_paths), (metal_tag, metal_paths) = found["mlx"], found["mlx_metal"]
+    if mlx_tag.split("-")[-1] != metal_tag.split("-")[-1]:
+        raise GuardError(f"mlx ({mlx_tag}) and mlx-metal ({metal_tag}) are built for different platforms")
+    if core_file is None:
+        import mlx.core
+        core_file = getattr(mlx.core, "__file__", None)
+    core = os.path.realpath(str(core_file)) if core_file else None
+    if core != next(iter(mlx_paths.values())):
+        raise GuardError(f"the imported mlx.core ({core_file}) is not the pinned mlx {MLX_VERSION} extension")
+    lib = os.path.realpath(os.path.join(os.path.dirname(core), "lib", "libmlx.dylib"))
+    if lib != metal_paths["mlx/lib/libmlx.dylib"]:
+        raise GuardError("the imported mlx.core does not sit beside the pinned mlx-metal libmlx.dylib")
+    return mlx_tag
 
 
 def load_image_check() -> Any:
@@ -1029,11 +1153,13 @@ def media_prefill(gen: Any, request: Any, cache: Any, step: int, seam: dict) -> 
 
 
 def _vision_modules():
-    """vllm-mlx's MLLM modules, mlx-vlm, PIL and the image checker, verified against the vision pins."""
+    """vllm-mlx's MLLM modules, mlx-vlm, PIL and the image checker, verified against the vision pins (and mlx /
+    mlx-metal against theirs)."""
     import vllm_mlx
     import mlx_vlm
     verify_vision(os.path.dirname(os.path.abspath(vllm_mlx.__file__)), os.path.dirname(os.path.abspath(mlx_vlm.__file__)),
                   getattr(mlx_vlm, "__version__", "?"))
+    verify_mlx()                                  # the fused kernel's implementation (mlx / mlx-metal 0.32.4)
     from vllm_mlx import mllm_batch_generator, vision_embedding_cache
     from vllm_mlx.models import mllm
     return mllm_batch_generator, vision_embedding_cache, mllm, load_image_check()
@@ -1074,7 +1200,7 @@ def main(argv: list[str] | None = None) -> int:
             _, _, _, api_utils, _ = _modules()
             check_engines(*_engines())            # the engine refusal would hold on this vllm-mlx (read only)
             if policy is not None:
-                _vision_modules()                 # mlx-vlm's version and the vision pins
+                _vision_modules()                 # mlx-vlm's and mlx's versions and the vision pins
                 check_vision_model(argv[1], policy.dims)
             route = api_utils.resolve_mllm_route(argv[1], argv[1])
         except GuardError as exc:
@@ -1089,7 +1215,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"cortados-vllm-mlx-guard: vision mode, but {argv[1]} resolves to the text route",
                       file=sys.stderr)
                 return EXIT_REFUSED
-            print(f"cortados-vllm-mlx-guard: ok (vllm-mlx {VLLM_MLX_VERSION} and mlx-vlm {MLX_VLM_VERSION}, pinned "
+            print(f"cortados-vllm-mlx-guard: ok (vllm-mlx {VLLM_MLX_VERSION}, mlx-vlm {MLX_VLM_VERSION} and mlx / "
+                  f"mlx-metal {MLX_VERSION}, pinned "
                   f"files match, only BatchedEngine may serve, vision route {VISION_MODEL_TYPE})")
             return 0
         if getattr(route, "is_mllm", True):

@@ -75,7 +75,8 @@ CHECK_ARGS="$(printf '%s' "$PATHS" | "$PYTHON" -I -c 'import json,sys; print(" "
 [ -f "$IMGCHK_SRC" ] || die "no image checker source at $IMGCHK_SRC"
 [ -d "$MODEL_DIR" ] || die "no model directory at $MODEL_DIR (vllm_mlx.models.<model>.path in $CONFIG)"
 # The guard's own check, run from the source: vllm-mlx version and pinned files, and the model's route (in vision mode
-# also mlx-vlm's version and pins and the model's qwen3_5 config). CHECK_ARGS is flags only, split on purpose.
+# also mlx-vlm's and mlx / mlx-metal's versions and pins and the model's verified qwen3_5 geometry). CHECK_ARGS is
+# flags only, split on purpose.
 # shellcheck disable=SC2086
 "$VPY" -B "$GUARD_SRC" --check "$MODEL_DIR" $CHECK_ARGS || die "the prompt guard refused this venv or model; nothing was installed"
 PLIST_XML="$("$PYTHON" -B -m cortados_router.local_backend --config "$CONFIG" --plist "$LOG_DIR")"

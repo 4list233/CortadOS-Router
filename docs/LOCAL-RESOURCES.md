@@ -1125,8 +1125,8 @@ the example's `qwen-27b-4bit-vision` entry repeats them):
 | `image_context_tokens` | 65,536 | input + max_tokens of an image-bearing request, until measured |
 | `image_concurrency` | 1 | image-bearing requests at once, until measured (text turns still run beside it) |
 | `prefill_chunk_tokens` | 256 | the guard's media prefill chunk (`--image-prefill-tokens`); bounds the attention scores (below) |
-| `score_buffers`, `act_bytes` | 4, 2 | the formula's allocator and dtype counts (below) |
-| model dimensions | Qwen3.8 27B | `hidden_size` 5,120, `intermediate_size` 17,408, 24 attention / 4 KV heads, `head_dim` 256, linear attention 16 key / 48 value heads of 128, `vocab_size` 248,320, tower 1,152 / 4,304 with 16 heads (`vision_num_heads`) and 27 blocks (`vision_depth`); checked against `config.json` and the loaded tower at startup (`--image-dims`) |
+| `score_buffers`, `act_bytes` | 4, 2 | the formula's allocator and dtype counts (below); `act_bytes` is fixed with the geometry |
+| model dimensions | Qwen3.8 27B | `hidden_size` 5,120, `intermediate_size` 17,408, 24 attention / 4 KV heads, `head_dim` 256, linear attention 16 key / 48 value heads of 128, `vocab_size` 248,320, tower 1,152 / 4,304 with 16 heads (`vision_num_heads`) and 27 blocks (`vision_depth`); **fixed** (the one verified geometry, below: a block may repeat them, never change them); checked against `config.json` and the loaded tower at startup (`--image-dims`) |
 | `max_image_bytes` | 5 MiB | encoded bytes per image (the Anthropic API's own limit) |
 | `max_image_pixels` | 32 Mi | decoded pixels per image, read from the header before decoding; PIL's bomb limit is the same |
 
@@ -1158,41 +1158,72 @@ vocabulary (`language.py` 1910-1920, `models/base.py` `project_logits` 64-80) be
 ("Media prefill" below): chunks of `prefill_chunk_tokens`, the last position's logits only. What remains is bounded
 per term, and the reservation is their sum (P = tokens, C = min(256, P), T = images x 1,024 image tokens, N = 4T vision
 patches, a = 2 bytes; H 5,120, I 17,408, Hq 24, Hkv 4, D 256, linear Kh 16 / Vh 48 of 128, V 248,320, tower Hv 1,152 /
-Iv 4,304):
+Iv 4,304, Wp 1,280 = the tower's padded attention width, below):
 
 | term | bytes | what it holds |
 | --- | --- | --- |
 | sequence | P x (3aH + 2H + 64) | the whole prompt's embeddings, live for the whole prefill: `embed_tokens`' output, `masked_scatter`'s merged copy and one more, the image mask broadcast to P x H and its numpy copy, ids and mRoPE position ids |
-| media | T x H x (a + 12) + N x (1,536 x (4 + a) + a x (12 Hv + 2 Iv)) | merged image features and the scatter's int64/uint32 indices; float32 pixel rows and their bf16 copy; one tower block's activations per patch (attention per image is fused: tower head_dim 72 is padded to 80) |
+| media | T x H x (a + 12) + N x (1,536 x (4 + a) + a x (13 Hv + 4 Wp + 2 Iv) + 24 Hv) | merged image features and the scatter's int64/uint32 indices; float32 pixel rows and their bf16 copy; one tower block's activations per patch: 13 unpadded (residual in, two norms, qkv x 3, rotated q and k, the attention output concatenated and reshaped, projection, residual sum, MLP out), q / k / v padded to 80 and the fused kernel's padded output (4 Wp), MLP in and its activation (2 Iv); the rotary embedding's float32 temporaries (three Hv-wide float32 arrays for each of q and k) |
 | kv_regrow | P x 65,536 | `KVCache` grows in 256-token steps by concatenation; the replaced buffers wait in MLX's allocator cache until the guard clears it after each chunk |
 | scores | 4 x Hq x C x P x a + C x P | one chunk's unfused attention against the whole context (q·kᵀ, masked copy, softmax, one held by the allocator) and the causal mask |
 | chunk | 2 x C x a x (3I + max(3 Hq D + 2 Hkv D, 4 (Kh Kd + Vh Vd)) + 4H) | one layer's activations for a chunk (MLP gate/up/product; attention or linear-attention projections; residual and norms), doubled for the allocator |
 | logits | V x (a + 8) | the one kept position's logits and float32 log-probabilities |
-| encoder_scores | 0 when fused; else images x heads x n² x (4a + 4), n = 4 x `image_tokens_max` | the vision encoder's own attention scores when its head_dim is outside MLX's fused kernel (below) |
 
-**The encoder's attention** (#125 review round 3). The tower (mlx-vlm 0.7.12 `qwen3_vl/vision.py`, which
-`qwen3_5/vision.py` only inherits) runs every one of its blocks as full attention over one image at a time (`cu_seqlens`
-splits; `window_size` and `fullatt_block_indexes` are read into its config and used by no block) through
-`ensure_fused_sdpa`, which pads a head_dim up to 64 / 80 / 128 for MLX's fused kernel. A head_dim over 128 is left as
-it is, and MLX's unfused fallback materializes heads x n x n scores per image: at 8 heads (head_dim 144) and an
-`image_tokens_max` of 8,192 (n = 32,768 patches) that is 16 GiB for one bf16 score tensor, which the default formula
-did not count. So: the guard refuses to start unless `vision_config` has exactly the `--image-dims` `num_heads` and
-`depth`, `hidden_size / num_heads` is whole and at most 128, `patch_size` 16, `spatial_merge_size` 2,
-`temporal_patch_size` 2, `in_channels` 3 (absent keys take mlx-vlm's `VisionConfig` defaults, so a missing
-`patch_size` is 14 and refused) and no `deepstack_visual_indexes`; `MLLMScheduler.__init__` checks the loaded tower
-the same way (block count, every block's `attn.num_heads` / `head_dim`, the patch embed's geometry). The gate counts
-`encoder_scores` whenever the head_dim is not fused-provable (`local_governor.vision_attention_fused`), refuses a
-`vision_hidden_size` that does not split evenly over `vision_num_heads`, and refuses at config load a policy whose
-smallest image turn (one image at `image_tokens_max`) could not be admitted beside the weights; that is where the
-reviewer's repro (8 heads, `image_tokens_max` 8,192: 100 GiB) stops. With the defaults the head_dim is 72, the
-term is 0 and every reservation is unchanged.
+**The encoder's attention: one verified geometry** (#125 review rounds 3-4). The tower (mlx-vlm 0.7.12
+`qwen3_vl/vision.py`, which `qwen3_5/vision.py` only inherits) runs every one of its blocks as full attention over one
+image at a time (`cu_seqlens` splits; `window_size` and `fullatt_block_indexes` are read into its config and used by no
+block) through `ensure_fused_sdpa` (`models/base.py`, pinned), which zero-pads q, k and v from head_dim d to the first
+of 64 / 80 / 128 that is ≥ d, calls `mlx.core.fast.scaled_dot_product_attention` and slices the output back to d.
+Each review round found a geometry the general formula did not bound: round 2, 8 heads (head_dim 144, past 128, so
+MLX's unfused fallback held 8 x n x n scores, 16 GiB at n = 32,768 patches); round 3, 288 heads of 4, which pass a
+"head_dim ≤ 128" rule but are padded to 64, so q, k, v and the output take 288 x 64 = 18,432 per patch, not 1,152
+(4.5 GiB at 32,768 patches against 4.18 GiB reserved). So the class is closed by restriction, not by a more general
+formula: vision mode serves **exactly one** geometry, the Pro's (`config.json` checked by the orchestrator 2026-11-16):
 
-At the 64k image context with 5 images: sequence 2.50, media 1.37, kv_regrow 4.00, scores 3.02, chunk 0.10, logits
-0.002 GiB = 11.0 GiB, so the largest image reservation is 4 GiB KV + 0.15 GiB + 11.0 GiB = **15.15 GiB** (the reviewer's
-60k tokens + one image: 13.3 GiB). Beside ~16.5 GiB of weights (15 GiB language + the tower, provisional: measure it) in
-the 40 GiB budget, 23.5 GiB remain: one image turn at its cap fits alone, and beside a full 128k text turn (9.65 GiB)
-the two reserve 24.8 GiB, so with the 16.5 GiB weights estimate they no longer fit together and the second is a
-retryable 529 (with the 15 GiB `weights_bytes` default they do). A request whose reservation exceeds the budget
+| where | must be exactly |
+| --- | --- |
+| `vision_config` | `depth` 27, `num_heads` 16, `hidden_size` 1,152, `intermediate_size` 4,304, `patch_size` 16, `spatial_merge_size` 2, `temporal_patch_size` 2, `out_hidden_size` 5,120 (every key present: mlx-vlm's `VisionConfig` defaults differ), `in_channels` 3 (its default when absent), no `deepstack_visual_indexes` |
+| `text_config` | the language dims of the policy table above (`hidden_size` 5,120 … `vocab_size` 248,320) |
+| `--image-dims` / the `vision` block | those values and `act_bytes` 2 (`guard.VISION_DIMS_ALLOWED` = `local_governor.VISION_DEFAULTS` over `VISION_FIXED_KEYS`) |
+
+Refused otherwise at every check point: config load (`local_governor.check_vision`: a `vision` block may repeat a
+dimension but not change it), `--check` and `serve` (`VisionPolicy`: `--image-dims` must be the allowlist, before
+anything loads), route resolution and `--check` (`check_vision_model`: `config.json`), and when `MLLMScheduler` is
+built (`vision_tower_problem`: 27 blocks, each `attn` 16 heads of 72, the patch geometry). There is no "any head count
+that divides evenly" acceptance any more. **A future model with another geometry is added to both allowlists
+explicitly, with its own reservation argument** (its pad target, its fused-kernel proof, its per-patch count); nothing
+generalises to it.
+
+The padding, for the allowed geometry: d = 1,152 / 16 = 72; `ensure_fused_sdpa`'s first fused dim ≥ 72 is 80, so q, k,
+v and the kernel's output are 16 x 80 = **1,280** wide (`VISION_PADDED_WIDTH`), 128 more per patch than 1,152. Per
+patch and block, at a = 2: a x (13 x 1,152 + 4 x 1,280 + 2 x 4,304) + 24 x 1,152 = 2 x 28,704 + 27,648 = 85,056 bytes
+(round 3 counted 2 x (12 x 1,152 + 2 x 4,304) = 44,864: no padding, no float32 rotary temporaries, no residuals), plus
+the pixel rows' 1,536 x 6 = 9,216: 94,272 bytes per patch, 368.25 MiB per 1,024-token image (4,096 patches), plus its
+1,024 x 5,120 x 14 = 70 MiB of merged features and indices. The encoder holds no heads x n x n scores (the kernel is
+fused), so there is no `encoder_scores` term. An `image_tokens_max` override is accepted only while its computed peak
+(this padded count, linear in the patches) fits: config load refuses a policy whose one-image turn could not be
+admitted beside the weights (e.g. 32,768 tokens in a 20 GiB budget).
+
+**MLX is pinned too** (round 4, P2): `ensure_fused_sdpa` only pads; whether `fast.scaled_dot_product_attention`
+dispatches to the fused kernel or an unfused fallback is decided in MLX itself. So vision mode requires `mlx` 0.32.4 and
+`mlx-metal` 0.32.4 (the Pro's installed versions), checked by `verify_mlx` at `--check` and `serve`: the installed
+dist-info's version, its single `WHEEL` tag (which must have a pinned row; mlx's and mlx-metal's macOS tags must agree),
+the `RECORD` entries of the files that implement the dispatch, equal to the released wheels' — `mlx/core.cpython-*-darwin.so`
+(mlx), `mlx/lib/libmlx.dylib` and `mlx/lib/mlx.metallib` (mlx-metal) — and those files' own sha256 equal to them; and the
+`mlx.core` actually imported must be that pinned file, beside that `libmlx.dylib`. Any mismatch fails closed. The
+expected hashes come from the released PyPI wheels (fetched 2026-11-16; each RECORD hash re-checked against the file
+bytes in its wheel). The Pro's Python and macOS tag could not be read from the build machine, so every macOS arm64
+wheel of 0.32.4 is pinned: CPython 3.10–3.15 and the free-threaded 3.13t–3.15t (27 mlx rows), macOS 14.0 / 15.0 / 26.0
+(3 mlx-metal rows); the installed `WHEEL` tag picks the row. A Linux or Intel build, another version or a rebuilt
+binary is refused.
+
+At the 64k image context with 5 images: sequence 2.50, media 2.14, kv_regrow 4.00, scores 3.02, chunk 0.10, logits
+0.002 GiB = 11.76 GiB, so the largest image reservation is 4 GiB KV + 0.15 GiB + 11.76 GiB = **15.91 GiB** (the
+reviewer's 60k tokens + one image: 13.48 GiB). Beside ~16.5 GiB of weights (15 GiB language + the tower, provisional:
+measure it) in the 40 GiB budget, 23.5 GiB remain: one image turn at its cap fits alone, and beside a full 128k text
+turn (9.65 GiB) the two reserve 25.56 GiB, which fits neither the 23.5 GiB nor the 25 GiB of the 15 GiB `weights_bytes`
+default, so the second is a retryable 529 (a short image turn still runs beside a full text turn). A request whose
+reservation exceeds the budget
 beside the weights is never-fits (413, non-retryable): the provider routes it elsewhere. The chunk is the lever: the
 score term is linear in it (1,024 would make it 12 GiB at 64k). The count slot, the bytes and the image slot are taken
 in one step under one lock (`Admission.try_acquire(reserve, image=True)`); busy (529, retryable) and never-fits (413,
@@ -1265,8 +1296,7 @@ startup. The full set, by sha256 from the released wheels:
 
 Not pinned: the lazy `deepseek_v4/hyper_connection.py` import inside `switch_layers.py`'s DeepSeek-only branch, the
 modules `mlx_vlm/__init__.py` pulls in for generation, conversion and training, and the drafters `speculative/__init__.py`
-imports (the guard refuses drafters); and MLX itself (`mlx.core`, a compiled library whose fused head dims the argument
-reads from mlx-vlm's pinned `ensure_fused_sdpa`). `scripts/install_mlx_backend.sh` copies `cortados_router/image_check.py` beside the guard as
+imports (the guard refuses drafters). MLX (`mlx` and `mlx-metal` 0.32.4) is pinned separately, above. `scripts/install_mlx_backend.sh` copies `cortados_router/image_check.py` beside the guard as
 `cortados_image_check.py` and runs `--check` with the entry's vision flags.
 
 **The provider** relays the client's `/v1/messages` body to the node unchanged (images included). On the provider

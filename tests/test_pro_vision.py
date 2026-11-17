@@ -383,15 +383,19 @@ class ImagePrefillReservationTests(unittest.TestCase):
         self.assertEqual(got["kv_regrow"], p * 65536)
         self.assertEqual(got["chunk"], 2 * c * 2 * (3 * 17408 + max(3 * 24 * 256 + 2 * 4 * 256,
                                                                     4 * (16 * 128 + 48 * 128)) + 4 * self.H))
-        self.assertEqual(got["media"], 5 * 1024 * self.H * 14 + 4 * 5 * 1024 * (1536 * 6 + 2 * (12 * 1152 + 2 * 4304)))
+        # #125 round 4: the tower block at its padded width (16 heads x 80 = 1,280 for q, k, v and the fused output)
+        # and the rotary embedding's float32 temporaries (3 x 4 bytes x 1,152 for each of q and k)
+        self.assertEqual(got["media"], 5 * 1024 * self.H * 14
+                         + 4 * 5 * 1024 * (1536 * 6 + 2 * (13 * 1152 + 4 * 1280 + 2 * 4304) + 24 * 1152))
         self.assertEqual(got["total"], sum(v for k, v in got.items() if k != "total"))
         largest = local_governor.request_bytes(cfg, 200_000, 32_000, images=5)
         self.assertEqual(largest, p * 65536 + cfg["per_seq_state_bytes"] + got["total"])
-        self.assertAlmostEqual(largest / GIB, 15.15, places=2)                # docs/LOCAL-RESOURCES.md "Vision"
+        self.assertAlmostEqual(largest / GIB, 15.91, places=2)                # docs/LOCAL-RESOURCES.md "Vision"
         avail = local_governor.available_bytes(cfg)
         self.assertLessEqual(largest, avail)                                  # fits alone ...
         text = local_governor.request_bytes(cfg, 200_000, 32_000)
-        self.assertLessEqual(largest + text, avail)                           # ... and beside a full 128k text turn
+        self.assertGreater(largest + text, avail)                             # ... but not beside a full 128k text turn
+        self.assertLessEqual(local_governor.request_bytes(cfg, 2000, 1000, images=5) + text, avail)
         # a longer chunk is the score term growing with it
         bigger = local_governor.image_prefill_bytes(vision_cfg(prefill_chunk_tokens=1024), p, 5)
         self.assertEqual(bigger["scores"] - got["scores"], (1024 - c) * (4 * 24 * p * 2 + p))
@@ -426,61 +430,68 @@ class ImagePrefillReservationTests(unittest.TestCase):
         # the KV cache per token the governor reserves is these dimensions' (16 full-attention layers of 64)
         self.assertEqual(16 * 2 * v["num_key_value_heads"] * v["head_dim"] * v["act_bytes"],
                          local_governor.DEFAULTS["kv_bytes_per_token"])
-        self.assertEqual(local_governor.FUSED_SDPA_MAX_HEAD_DIM, max(guard.FUSED_SDPA_HEAD_DIMS))
+        # one verified geometry, the same on both sides (#125 round 4)
+        self.assertEqual(guard.VISION_DIMS_ALLOWED, {k: v[k] for k in local_governor.VISION_FIXED_KEYS})
+        enc = guard.VISION_ENCODER_CONFIG
+        self.assertEqual((enc["hidden_size"], enc["intermediate_size"], enc["num_heads"], enc["depth"]),
+                         (v["vision_hidden_size"], v["vision_intermediate_size"], v["vision_num_heads"],
+                          v["vision_depth"]))
+        self.assertEqual(enc["out_hidden_size"], v["hidden_size"])
+        self.assertEqual(guard.VISION_HEAD_DIM, local_governor.VISION_HEAD_DIM)
 
 
 class EncoderAttentionReservationTests(unittest.TestCase):
-    """#125 review round 3 (P1): the vision encoder's own attention, fused or reserved, and the override validated."""
-    REPRO = {"vision_num_heads": 8, "image_tokens_max": 8192}
+    """#125 review rounds 3-4: the vision encoder's attention. One verified geometry (16 heads of 72, padded to 80 by
+    ensure_fused_sdpa), every other refused; the reservation counts the padded width."""
 
-    def test_defaults_are_unchanged_and_the_encoder_is_fused(self):
-        cfg = vision_cfg()
-        v = cfg["vision"]
-        self.assertEqual((v["vision_num_heads"], v["vision_depth"]), (16, 27))
-        self.assertTrue(local_governor.vision_attention_fused(v))             # 1,152 / 16 = 72, padded to 80
-        got = local_governor.image_prefill_bytes(cfg, 65536, 5)
-        self.assertEqual(got["encoder_scores"], 0)
-        largest = local_governor.request_bytes(cfg, 200_000, 32_000, images=5)
-        self.assertAlmostEqual(largest / GIB, 15.15, places=2)                # the round-2 number, byte for byte
-        self.assertEqual(largest, 65536 * 65536 + cfg["per_seq_state_bytes"]
-                         + sum(v for k, v in got.items() if k not in ("total", "encoder_scores")))
+    def test_the_round3_and_round4_repros_are_refused_at_config_load(self):
+        # round 2: 8 heads (head_dim 144, unfused); round 3: 288 heads of 4, padded to 64 (4.18 GiB reserved for
+        # 4.5 GiB of padded q/k/v + output at image_tokens_max 8192). Neither is the verified geometry.
+        for repro in ({"vision_num_heads": 8, "image_tokens_max": 8192},
+                      {"vision_num_heads": 288, "image_tokens_max": 8192, "image_context_tokens": 65536}):
+            with self.subTest(repro), self.assertRaisesRegex(local_governor.GovernorConfigError,
+                                                             "vision_num_heads is .* verified geometry"):
+                vision_cfg(**repro)
 
-    def test_the_reviewers_repro_is_refused_at_config_load(self):
-        # 8 vision heads (head_dim 144: outside MLX's fused kernel) and image_tokens_max 8192: one 4096 x 2048 PNG is
-        # 32,768 patches, 8 x 32768^2 x 2 B = 16 GiB for one bf16 score tensor; round 2 reserved 4.4 GiB for it.
+    def test_every_single_field_geometry_deviation_is_refused(self):
+        for key in local_governor.VISION_FIXED_KEYS:
+            want = local_governor.VISION_DEFAULTS[key]
+            for bad in (want + 1, max(1, want // 2) if want > 1 else 4):
+                with self.subTest(key=key, value=bad), self.assertRaisesRegex(local_governor.GovernorConfigError,
+                                                                              f"vision: {key} is"):
+                    vision_cfg(**{key: bad})
+        # repeating a verified value is not an override
+        self.assertEqual(vision_cfg(vision_num_heads=16, act_bytes=2)["vision"]["vision_num_heads"], 16)
+
+    def test_the_default_geometry_is_accepted_and_reserves_its_padded_peak(self):
+        self.assertEqual((local_governor.VISION_HEAD_DIM, local_governor.VISION_PADDED_HEAD_DIM,
+                          local_governor.VISION_PADDED_WIDTH), (72, 80, 1280))
+        for itm in (1024, 8192):                                              # the default and a raised override
+            cfg = vision_cfg(image_tokens_max=itm)
+            n = itm * local_governor.PATCHES_PER_IMAGE_TOKEN                  # patches of one image
+            terms = local_governor.image_prefill_bytes(cfg, 2 * itm, 1)
+            self.assertNotIn("encoder_scores", terms)
+            # first principles, one tower block per patch at bf16: q, k, v zero-padded to 80 and the fused kernel's
+            # padded output (4 x 1,280), the unpadded widths (qkv, rotated q/k, norms, output copies, projection,
+            # residuals: 13 x 1,152), the MLP (2 x 4,304); the rotary float32 temporaries; the pixel rows
+            padded = 4 * n * 1280 * 2
+            block = n * 2 * (13 * 1152 + 2 * 4304) + padded + n * 24 * 1152 + n * 1536 * 6
+            self.assertGreaterEqual(terms["media"], block + itm * 5120 * 14)
+            self.assertGreater(padded, 4 * n * 1152 * 2)                      # padding is counted, not the raw width
+            reserve = local_governor.request_bytes(cfg, 0, 1, images=1)
+            self.assertLessEqual(reserve, local_governor.available_bytes(cfg))
+
+    def test_an_image_tokens_max_whose_padded_peak_cannot_fit_is_refused(self):
         with self.assertRaisesRegex(local_governor.GovernorConfigError, "one image turn reserves"):
-            vision_cfg(**self.REPRO)
-        with self.assertRaisesRegex(local_governor.GovernorConfigError, "split evenly"):
-            vision_cfg(vision_num_heads=7)
+            local_governor.check_config({"memory_budget_bytes": 20 * GIB},
+                                        {"vision": {"image_tokens_max": 32768, "image_context_tokens": 65536}})
+        # the same override fits a budget that holds its computed peak
+        cfg = local_governor.check_config({"memory_budget_bytes": 64 * GIB},
+                                          {"vision": {"image_tokens_max": 32768, "image_context_tokens": 65536}})
+        self.assertLessEqual(local_governor.request_bytes(cfg, 0, 1, images=1), local_governor.available_bytes(cfg))
 
-    def test_an_unfused_encoder_that_fits_reserves_its_scores(self):
-        cfg = local_governor.check_config({"memory_budget_bytes": 256 * GIB}, {"vision": self.REPRO})
-        self.assertFalse(local_governor.vision_attention_fused(cfg["vision"]))
-        body = body_with(image_block(png(4096, 2048)), max_tokens=100)
-        raw = json.dumps(body).encode()
-        # (the reviewer's file was a real 24,529-byte PNG; only its header's 4096 x 2048 reaches the bound)
-        why, plan = local_governor.image_policy(body, cfg["vision"])
-        self.assertIsNone(why)
-        text = local_governor.input_tokens(raw, cfg["context_tokens"], plan.data_chars)
-        reserve = local_governor.request_bytes(cfg, text, 100, images=len(plan))
-        n = 4096 * 2048 // (16 * 16)                                          # the image's patches: 32,768
-        self.assertEqual(n, 8192 * local_governor.PATCHES_PER_IMAGE_TOKEN)
-        one_score_tensor = 8 * n * n * 2                                      # 16 GiB
-        self.assertEqual(one_score_tensor, 16 * GIB)
-        tokens = local_governor.request_tokens(cfg, text, 100, images=1)
-        terms = local_governor.image_prefill_bytes(cfg, tokens, 1)
-        self.assertEqual(terms["encoder_scores"], 8 * n * n * (4 * 2 + 4))    # q.k^T, softmax, copies + fp32 softmax
-        self.assertGreaterEqual(reserve, tokens * 65536 + 4 * one_score_tensor)
-        a = local_governor.Admission(local_governor.Governor(cfg, idle_reader=lambda: 3600.0,
-                                                             pressure_reader=lambda: "normal", clock=lambda: 0.0))
-        t, _ = a.try_acquire(a.request_bytes(text, 100, images=1), image=True)
-        self.assertIsNotNone(t)
-        self.assertEqual(a.reserved, reserve)
-        t.release()
-
-    def test_a_fused_override_of_image_tokens_max_holds_no_quadratic_term(self):
-        cfg = vision_cfg(image_tokens_max=8192)                               # 16 heads: head_dim 72, fused
-        self.assertEqual(local_governor.image_prefill_bytes(cfg, 20_000, 1)["encoder_scores"], 0)
+    def test_the_argv_carries_the_verified_geometry(self):
+        cfg = vision_cfg(image_tokens_max=8192)
         self.assertEqual(local_backend.vision_argv({"backend": "vllm-mlx", "governor": cfg,
                                                     "model": {}})[-1].split(",")[-3:-1],
                          ["vision_num_heads=16", "vision_depth=27"])
@@ -1067,6 +1078,15 @@ QWEN_CONFIG = {"model_type": "qwen3_5", "architectures": ["Qwen3_5ForConditional
                                  "deepstack_visual_indexes": []}}
 
 
+FAKE_MLX_TAG = "cp39-cp39-macosx_26_0_arm64"
+FAKE_METAL_TAG = "py3-none-macosx_26_0_arm64"
+
+
+def record_hash(data):
+    """A RECORD line's hash of `data`: sha256= and the urlsafe base64 digest without padding."""
+    return "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+
+
 def prompt_for(n_images, text="describe"):
     return ("<|im_start|>user\n" + "<|vision_start|><|image_pad|><|vision_end|>" * n_images + text
             + "<|im_end|>\n<|im_start|>assistant\n")
@@ -1081,7 +1101,9 @@ class VisionGuardBase(GuardBase):
             p.write_text(text)
         self.vpins = {rel: self._sha("vllm_mlx", rel) for rel in self.guard.VISION_PINNED_SHA256}
         self.mpins = {rel: self._sha("mlx_vlm", rel) for rel in self.guard.MLX_VLM_PINNED_SHA256}
-        for name, value in (("VISION_PINNED_SHA256", self.vpins), ("MLX_VLM_PINNED_SHA256", self.mpins)):
+        self.mlx_pins, self.metal_pins = self.fake_mlx(Path(self.dir))
+        for name, value in (("VISION_PINNED_SHA256", self.vpins), ("MLX_VLM_PINNED_SHA256", self.mpins),
+                            ("MLX_PINNED_RECORD", self.mlx_pins), ("MLX_METAL_PINNED_RECORD", self.metal_pins)):
             p = patch.object(self.guard, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -1095,6 +1117,28 @@ class VisionGuardBase(GuardBase):
         filters.__enter__()
         self.addCleanup(filters.__exit__, None, None, None)
 
+    @staticmethod
+    def fake_mlx(root, version="0.32.4", tag=FAKE_MLX_TAG, metal_tag=FAKE_METAL_TAG):
+        """Fake installed mlx and mlx-metal distributions under `root` (dist-info METADATA / WHEEL / RECORD and the
+        files they name; mlx.core a plain module), and the pin tables that accept them."""
+        files = {"mlx/__init__.py": "", "mlx/core.py": "# the fake mlx.core extension\n",
+                 "mlx/lib/libmlx.dylib": "fake libmlx\n", "mlx/lib/mlx.metallib": "fake metallib\n"}
+        for rel, text in files.items():
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text(text)
+        h = {rel: record_hash((root / rel).read_bytes()) for rel in files}
+        for dist, name, t, owned in (("mlx", "mlx", tag, ("mlx/core.py",)),
+                                     ("mlx_metal", "mlx-metal", metal_tag,
+                                      ("mlx/lib/libmlx.dylib", "mlx/lib/mlx.metallib"))):
+            info = root / f"{dist}-{version}.dist-info"
+            info.mkdir(exist_ok=True)
+            (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+            (info / "WHEEL").write_text(f"Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: {t}\n")
+            (info / "RECORD").write_text("".join(f"{rel},{h[rel]},1\n" for rel in owned)
+                                         + f"{dist}-{version}.dist-info/RECORD,,\n")
+        return ({FAKE_MLX_TAG: ("mlx/core.py", h["mlx/core.py"])},
+                {FAKE_METAL_TAG: {rel: h[rel] for rel in ("mlx/lib/libmlx.dylib", "mlx/lib/mlx.metallib")}})
+
     def _sha(self, pkg, rel):
         return hashlib.sha256((Path(self.dir) / pkg / rel).read_bytes()).hexdigest()
 
@@ -1102,14 +1146,14 @@ class VisionGuardBase(GuardBase):
         """Every fake module unimported (sys.path kept): the next import is unpatched."""
         import sys
         for name in list(sys.modules):
-            if name.split(".")[0] in ("vllm_mlx", "fastapi", "mlx_vlm", "PIL", "cortados_image_check"):
+            if name.split(".")[0] in ("vllm_mlx", "fastapi", "mlx_vlm", "mlx", "PIL", "cortados_image_check"):
                 del sys.modules[name]
 
     def _unimport(self):
         super()._unimport()
         import sys
         for name in list(sys.modules):
-            if name.split(".")[0] in ("mlx_vlm", "PIL", "cortados_image_check"):
+            if name.split(".")[0] in ("mlx_vlm", "mlx", "PIL", "cortados_image_check"):
                 del sys.modules[name]
 
     def policy(self, **kw):
@@ -1632,27 +1676,114 @@ class GuardVisionStartupTests(VisionGuardBase):
         utils.MLLM.add(str(d))
         return str(d)
 
-    def test_round3_an_unfused_vision_head_count_is_refused_at_startup(self):
-        """The reviewer's repro: vision_config.num_heads 8 (head_dim 144), the other checked dimensions kept."""
+    def test_round4_the_8_and_288_head_repros_are_refused_at_check_and_serve(self):
+        """Round 2's 8 heads (head_dim 144, unfused) and round 3's 288 heads of 4 (padded to 64): refused whether
+        config.json alone has them or the --image-dims passed match them."""
         vc = QWEN_CONFIG["vision_config"]
-        heads8 = {**QWEN_CONFIG, "vision_config": {**vc, "num_heads": 8}}
-        d = self._model_dir("heads8", heads8)
-        rc, err = self.run_main(["--check", d, *VISION_ARGS])                   # round 2: 0
-        self.assertEqual(rc, 2)
-        self.assertIn("num_heads is 8", err)
-        with self.assertRaises(SystemExit) as cm:
-            self.run_main(self.serve(d))
-        self.assertIn("config.json", str(cm.exception))
-        # passing the matching dims does not help: the head_dim itself is outside the fused kernel
-        args = list(VISION_ARGS)
-        args[-1] = DIMS_ARG.replace("vision_num_heads=16", "vision_num_heads=8")
-        rc, err = self.run_main(["--check", d, *args])
-        self.assertEqual(rc, 2)
-        self.assertIn("head_dim 144", err)
-        with self.assertRaises(self.guard.GuardError):
-            self.policy(dims={**DIMS, "vision_num_heads": 8})
-        self.assertIsNone(self.guard.vision_attention_problem(1152, 16))
-        self.assertIsNotNone(self.guard.vision_attention_problem(1152, 7))
+        for heads in (8, 288):
+            with self.subTest(heads=heads):
+                self._fresh()
+                d = self._model_dir(f"heads{heads}", {**QWEN_CONFIG, "vision_config": {**vc, "num_heads": heads}})
+                rc, err = self.run_main(["--check", d, *VISION_ARGS])
+                self.assertEqual(rc, 2)
+                self.assertIn(f"num_heads is {heads}", err)
+                with self.assertRaises(SystemExit) as cm:
+                    self.run_main(self.serve(d))
+                self.assertIn("config.json", str(cm.exception))
+                args = list(VISION_ARGS)
+                args[-1] = DIMS_ARG.replace("vision_num_heads=16", f"vision_num_heads={heads}")
+                rc, err = self.run_main(["--check", d, *args])
+                self.assertEqual(rc, 2)
+                self.assertIn("not the verified geometry", err)
+                with self.assertRaisesRegex(self.guard.GuardError, "verified geometry"):
+                    self.policy(dims={**DIMS, "vision_num_heads": heads})
+        self.assertFalse(hasattr(self.guard, "vision_attention_problem"))     # no general head-count acceptance
+
+    def test_round4_every_single_field_deviation_is_refused(self):
+        vc = QWEN_CONFIG["vision_config"]
+        self.assertEqual({k: vc[k] for k in self.guard.VISION_ENCODER_CONFIG}, self.guard.VISION_ENCODER_CONFIG)
+        for key, want in self.guard.VISION_ENCODER_CONFIG.items():
+            for name, bad in ((f"{key}+1", {**vc, key: want + 1}), (f"no-{key}", {k: v for k, v in vc.items()
+                                                                                    if k != key})):
+                with self.subTest(name):
+                    self._fresh()
+                    d = self._model_dir(name, {**QWEN_CONFIG, "vision_config": bad})
+                    rc, err = self.run_main(["--check", d, *VISION_ARGS])
+                    self.assertEqual(rc, 2, err)
+                    self.assertIn(f"vision_config.{key}", err)
+        for key, want in self.guard.VISION_DIMS_ALLOWED.items():                 # --image-dims, field by field
+            with self.subTest(dims=key), self.assertRaisesRegex(self.guard.GuardError, f"{key}={want + 1} is not"):
+                self.policy(dims={**DIMS, key: want + 1})
+        self._fresh()
+        d = self._model_dir("in-channels", {**QWEN_CONFIG, "vision_config": {**vc, "in_channels": 4}})
+        self.assertEqual(self.run_main(["--check", d, *VISION_ARGS])[0], 2)
+        self._fresh()
+        d = self._model_dir("default", QWEN_CONFIG)
+        rc, err = self.run_main(["--check", d, *VISION_ARGS])
+        self.assertEqual(rc, 0, err)                                          # the verified geometry is accepted
+
+    def test_round4_mlx_and_mlx_metal_are_pinned(self):
+        self.assertEqual(self.guard.verify_mlx(), FAKE_MLX_TAG)               # the fakes, pinned: accepted
+        info = Path(self.dir) / "mlx-0.32.4.dist-info"
+        metal = Path(self.dir) / "mlx_metal-0.32.4.dist-info"
+        core = Path(self.dir) / "mlx" / "core.py"
+        lib = Path(self.dir) / "mlx" / "lib" / "mlx.metallib"
+        cases = {
+            "version": (info / "METADATA", lambda t: t.replace("Version: 0.32.4", "Version: 0.32.5"), "0.32.5 is not"),
+            "metal-version": (metal / "METADATA", lambda t: t.replace("0.32.4", "0.31.0"), "mlx_metal 0.31.0"),
+            "tag": (info / "WHEEL", lambda t: t.replace("macosx_26_0", "macosx_13_0"), "wheel tag"),
+            "record": (info / "RECORD", lambda t: t.replace("sha256=", "sha256=A", 1), "RECORD's mlx/core.py"),
+            "metal-record": (metal / "RECORD", lambda t: t.replace("sha256=", "sha256=A", 1), "RECORD's mlx/lib"),
+            "core-bytes": (core, lambda t: t + "# patched: an unfused fallback\n", "mlx/mlx/core.py differs"),
+            "metallib-bytes": (lib, lambda t: t + "x", "mlx.metallib differs"),
+        }
+        for name, (path, change, why) in cases.items():
+            with self.subTest(name):
+                text = path.read_text()
+                path.write_text(change(text))
+                try:
+                    with self.assertRaisesRegex(self.guard.GuardError, why):
+                        self.guard.verify_mlx()
+                    self._fresh()
+                    d = self._model_dir(f"mlx-{name}", QWEN_CONFIG)
+                    rc, err = self.run_main(["--check", d, *VISION_ARGS])
+                    self.assertEqual(rc, 2)
+                    self.assertIn(why.split(" ")[0], err)
+                finally:
+                    path.write_text(text)
+        # the platforms must agree, the imported mlx.core must be the pinned file, and both must be installed
+        (metal / "WHEEL").write_text((metal / "WHEEL").read_text().replace("macosx_26_0", "macosx_15_0"))
+        with patch.dict(self.guard.MLX_METAL_PINNED_RECORD,
+                        {"py3-none-macosx_15_0_arm64": self.metal_pins[FAKE_METAL_TAG]}):
+            with self.assertRaisesRegex(self.guard.GuardError, "different platforms"):
+                self.guard.verify_mlx()
+        (metal / "WHEEL").write_text((metal / "WHEEL").read_text().replace("macosx_15_0", "macosx_26_0"))
+        other = Path(self.tmp) / "core.py"
+        other.write_text(core.read_text())
+        with self.assertRaisesRegex(self.guard.GuardError, "imported mlx.core"):
+            self.guard.verify_mlx(core_file=str(other))
+
+        def missing(name):
+            from importlib import metadata
+            raise metadata.PackageNotFoundError(name)
+        with self.assertRaisesRegex(self.guard.GuardError, "mlx is not installed"):
+            self.guard.verify_mlx(find=missing)
+
+    def test_round4_the_real_mlx_pins_are_the_released_wheels(self):
+        from tests.test_vllm_mlx_guard import load_guard
+        real = load_guard()
+        self.assertEqual(real.MLX_VERSION, "0.32.4")
+        self.assertEqual(len(real.MLX_PINNED_RECORD), 27)                     # cp310-cp315 (+3.13t-3.15t) x macOS 14/15/26
+        self.assertEqual(sorted(real.MLX_METAL_PINNED_RECORD),
+                         [f"py3-none-macosx_{v}_0_arm64" for v in (14, 15, 26)])
+        self.assertEqual(real.MLX_PINNED_RECORD["cp312-cp312-macosx_26_0_arm64"],
+                         ("mlx/core.cpython-312-darwin.so", "sha256=AzYCMA_gZc7wlZEWkM5k9QuT7-JTg_5XXfEKudGBJg0"))
+        self.assertEqual(real.MLX_METAL_PINNED_RECORD["py3-none-macosx_26_0_arm64"],
+                         {"mlx/lib/libmlx.dylib": "sha256=2Mk5PVhOeBOTw-_8z8zYuoWtDHAmTtr5-JfcqYdTdcY",
+                          "mlx/lib/mlx.metallib": "sha256=xtej-suDVo9uTLLPSoxzbuKTAlcaSDQ8uaOk0c0-OJM"})
+        for tag, (rel, h) in real.MLX_PINNED_RECORD.items():
+            self.assertTrue(tag.endswith("_arm64") and "macosx_" in tag and rel.startswith("mlx/core.cpython-"))
+            self.assertRegex(h, r"^sha256=[A-Za-z0-9_-]{43}$")
 
     def test_round3_the_tower_s_geometry_and_depth_are_checked(self):
         vc = QWEN_CONFIG["vision_config"]
@@ -1676,7 +1807,8 @@ class GuardVisionStartupTests(VisionGuardBase):
         from vllm_mlx import mllm_scheduler
         from mlx_vlm.models.qwen3_5 import qwen3_5
         from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
-        for name, tower in (("heads", {"heads": 8}), ("depth", {"depth": 26})):
+        for name, tower in (("heads", {"heads": 8}), ("heads288", {"heads": 288}), ("depth", {"depth": 26}),
+                            ("hidden", {"hidden": 1280})):
             with self.subTest(name), patch.dict(qwen3_5.TOWER, tower):
                 with self.assertRaisesRegex(self.guard.GuardError, "vision tower"):
                     mllm_scheduler.MLLMScheduler(model=qwen3_5.Model(), processor=Qwen3VLProcessor())

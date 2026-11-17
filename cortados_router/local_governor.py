@@ -214,9 +214,7 @@ VISION_DEFAULTS: dict[str, int] = {
     "vocab_size": 248320,
     "vision_hidden_size": 1152,
     "vision_intermediate_size": 4304,
-    # #125 review round 3: the vision encoder's attention heads and depth (vision_config num_heads, depth). 1,152 / 16
-    # = head_dim 72, which MLX's fused attention takes (padded to 80): no heads x N x N scores. A head_dim over 128
-    # is not fused, and image_prefill_bytes then counts the scores (encoder_scores); the guard refuses that model.
+    # The vision encoder's attention heads and depth (vision_config num_heads, depth): 1,152 / 16 = head_dim 72.
     "vision_num_heads": 16,
     "vision_depth": 27,
 }
@@ -224,9 +222,21 @@ VISION_DEFAULTS: dict[str, int] = {
 VISION_DIM_KEYS = ("hidden_size", "intermediate_size", "num_attention_heads", "num_key_value_heads", "head_dim",
                    "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
                    "vocab_size", "vision_hidden_size", "vision_intermediate_size", "vision_num_heads", "vision_depth")
-# The largest head dim MLX's fused attention kernel takes (mlx-vlm 0.7.12 models/base.py ensure_fused_sdpa pads a
-# smaller one up to 64 / 80 / 128); the guard's FUSED_SDPA_HEAD_DIMS.
-FUSED_SDPA_MAX_HEAD_DIM = 128
+# #125 review round 4: vision mode serves exactly ONE verified geometry, the Pro's Qwen3.8 27B (config.json checked by
+# the orchestrator 2026-11-16; the guard's VISION_DIMS_ALLOWED and VISION_ENCODER_CONFIG are the same values). Every
+# dimension and act_bytes is fixed: a `vision` block may repeat them but never change them, because the reservation
+# below is argued for this geometry only (rounds 2 and 3 each found a geometry the general formula did not bound). A
+# future model gets its own allowlist entry with its own reservation argument (docs/LOCAL-RESOURCES.md "Vision").
+VISION_FIXED_KEYS = (*VISION_DIM_KEYS, "act_bytes")
+# The tower's attention runs through mlx-vlm 0.7.12's ensure_fused_sdpa (models/base.py, pinned), which zero-pads
+# q, k and v from head_dim d to the first of (64, 80, 128) that is >= d and calls MLX's fused
+# mx.fast.scaled_dot_product_attention (mlx 0.32.4 / mlx-metal 0.32.4, pinned by the guard); its output is the padded
+# width too, sliced back to d. For this geometry d = 1,152 / 16 = 72, so the pad target is 80 and the padded
+# per-patch width 16 x 80 = 1,280 (not 1,152): image_prefill_bytes counts the four padded tensors at that width.
+FUSED_SDPA_HEAD_DIMS = (64, 80, 128)
+VISION_HEAD_DIM = VISION_DEFAULTS["vision_hidden_size"] // VISION_DEFAULTS["vision_num_heads"]            # 72
+VISION_PADDED_HEAD_DIM = next(t for t in FUSED_SDPA_HEAD_DIMS if VISION_HEAD_DIM <= t)                   # 80
+VISION_PADDED_WIDTH = VISION_DEFAULTS["vision_num_heads"] * VISION_PADDED_HEAD_DIM                       # 1,280
 # Keys a vision block may no longer carry, refused by name (the fixed margins the computed reservation replaced).
 VISION_REPLACED = {"vision_margin_bytes": "image_prefill_bytes(), computed from the model's dimensions "
                                           "(docs/LOCAL-RESOURCES.md \"Vision\")"}
@@ -263,18 +273,12 @@ def check_vision(raw: Any, cfg: dict[str, Any] | None = None) -> dict[str, int] 
         raise GovernorConfigError("vision: image_tokens_max must be below image_context_tokens")
     if out["prefill_chunk_tokens"] > out["image_context_tokens"]:
         raise GovernorConfigError("vision: prefill_chunk_tokens must not exceed image_context_tokens")
-    if out["act_bytes"] not in (2, 4):
-        raise GovernorConfigError("vision: act_bytes must be 2 (bfloat16 / float16) or 4 (float32)")
-    if out["vision_hidden_size"] % out["vision_num_heads"]:
-        raise GovernorConfigError("vision: vision_hidden_size must split evenly over vision_num_heads")
+    for key in VISION_FIXED_KEYS:
+        if out[key] != VISION_DEFAULTS[key]:
+            raise GovernorConfigError(f"vision: {key} is {out[key]!r}, but vision mode serves only the verified "
+                                      f"geometry ({key} {VISION_DEFAULTS[key]}); a different model needs its own "
+                                      "allowlist entry and reservation (docs/LOCAL-RESOURCES.md \"Vision\")")
     return out
-
-
-def vision_attention_fused(v: dict[str, Any]) -> bool:
-    """Whether the vision encoder's attention runs in MLX's fused kernel (no heads x N x N scores held): its head_dim
-    (vision_hidden_size / vision_num_heads) a whole number no larger than FUSED_SDPA_MAX_HEAD_DIM."""
-    heads, hidden = v["vision_num_heads"], v["vision_hidden_size"]
-    return heads > 0 and hidden % heads == 0 and hidden // heads <= FUSED_SDPA_MAX_HEAD_DIM
 
 
 def check_config(raw: dict[str, Any] | None, model: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -313,9 +317,9 @@ def check_config(raw: dict[str, Any] | None, model: dict[str, Any] | None = None
     # The model's declared image capability (None: text-only), checked against this context.
     out["vision"] = check_vision(model.get("vision"), out)
     if out["vision"]:
-        # A policy whose smallest image turn (one image at image_tokens_max, nothing else) could never be admitted is
-        # refused here rather than served as a node that answers every image too_large (#125 round 3: e.g. an
-        # unfused encoder at a raised image_tokens_max, whose scores alone are tens of GiB).
+        # An image_tokens_max (or any policy) whose smallest image turn (one image at image_tokens_max, nothing else)
+        # could never be admitted is refused here rather than served as a node that answers every image too_large:
+        # the computed peak, with the encoder's padded widths, must fit the budget beside the weights.
         one = request_bytes(out, 0, 1, images=1)
         if one > available_bytes(out):
             raise GovernorConfigError(f"vision: one image turn reserves {_gib(one)} GiB, more than the "
@@ -627,15 +631,23 @@ def image_prefill_bytes(cfg: dict[str, Any], tokens: int, images: int) -> dict[s
     P = tokens (the request's whole context: prompt + max_tokens, a bound on the prompt), C = min(chunk, P),
     T = images x image_tokens_max image tokens, N = 4 T vision patches; a = act_bytes; H, I = hidden and intermediate
     size; Hq, Hkv, D = attention heads, KV heads, head_dim; Kh, Vh, Kd, Vd the linear-attention heads and head dims;
-    V = vocab; Hv, Iv the vision tower's widths. Each term holds at once with the others (a sum, not a maximum):
+    V = vocab; Hv, Iv the vision tower's widths, Wp = VISION_PADDED_WIDTH (16 heads x 80, ensure_fused_sdpa's pad of
+    head_dim 72). Every dimension is the one verified geometry (VISION_FIXED_KEYS). Each term holds at once with the
+    others (a sum, not a maximum):
       sequence  P x (3aH + 2H + 64)       the whole prompt's embeddings, live for the whole prefill: embed_tokens'
                                           output, the merged copy masked_scatter writes, one more copy (a), the image
                                           mask broadcast to P x H and its numpy copy (2H bool), ids / position ids /
                                           attention mask (64)
       media     T x H x (a + 12)          the merged image features plus masked_scatter's int64 and uint32 indices
               + N x (1536 x (4 + a)       the pixel rows (3 x 2 x 16 x 16 float32) and their activation-dtype copy
-                 + a x (12 Hv + 2 Iv))    one vision block's activations per patch (norms, qkv, rotated and padded
-                                          q/k/v, attention output and projection; MLP in and out)
+                 + a x (13 Hv + 4 Wp      one vision block's activations per patch: the residual in, two norms, qkv
+                        + 2 Iv)           (3), rotated q and k (2), the attention output concatenated and reshaped
+                                          (2), the projection, the residual sum and the MLP out (13 Hv); q, k, v
+                                          zero-padded to 80 and the fused kernel's padded output (4 Wp); MLP in and
+                                          its activation (2 Iv)
+                 + 24 Hv)                 the rotary embedding's float32 temporaries (apply_rotary_pos_emb_vision
+                                          multiplies by float32 cos / sin): three Hv-wide float32 arrays for each of
+                                          q and k
       kv_regrow P x kv_bytes_per_token    the KV cache's growth copy: KVCache grows in 256-token steps by
                                           concatenation, and the replaced buffers wait in MLX's allocator cache until
                                           the guard clears it after each chunk
@@ -646,11 +658,9 @@ def image_prefill_bytes(cfg: dict[str, Any], tokens: int, images: int) -> dict[s
                                           one layer's activations for a chunk (MLP gate/up/product, attention or
                                           linear-attention projections, residual and norms), doubled for the allocator
       logits    V x (a + 8)               the one kept position's logits and its float32 log-probabilities
-      encoder_scores                      0 when the vision encoder's attention is fused (vision_attention_fused:
-                                          head_dim Hv / heads <= 128, the default 72); otherwise, per image, its
-                                          unfused attention scores over its n = 4 x image_tokens_max patches,
-                images x heads x n^2 x (score_buffers x a + 4)
-                                          (q.k^T, softmax and the allocator's copies, plus a float32 softmax copy)
+    The encoder's attention holds no heads x N x N scores: head_dim 72 is padded to 80, which MLX's fused kernel
+    takes, and the guard pins that kernel's implementation (mlx / mlx-metal 0.32.4, by RECORD and file hashes) and
+    refuses every other geometry, so no encoder-score term exists to count.
     What the old atomic forward computed beside these (every position projected to the vocabulary: P x V x a, 27.8 GiB
     at 60k tokens) is gone: the guard keeps one position."""
     v = cfg["vision"]
@@ -666,15 +676,13 @@ def image_prefill_bytes(cfg: dict[str, Any], tokens: int, images: int) -> dict[s
     out = {
         "sequence": p * (3 * a * h + 2 * h + 64),
         "media": img * h * (a + 12) + patches * (IMAGE_PATCH_VALUES * (4 + a)
-                                                 + a * (12 * v["vision_hidden_size"]
-                                                        + 2 * v["vision_intermediate_size"])),
+                                                 + a * (13 * v["vision_hidden_size"] + 4 * VISION_PADDED_WIDTH
+                                                        + 2 * v["vision_intermediate_size"])
+                                                 + 24 * v["vision_hidden_size"]),
         "kv_regrow": p * cfg["kv_bytes_per_token"],
         "scores": v["score_buffers"] * hq * c * p * a + c * p,
         "chunk": 2 * c * a * width,
         "logits": v["vocab_size"] * (a + 8),
-        "encoder_scores": 0 if vision_attention_fused(v) else (
-            max(0, int(images)) * v["vision_num_heads"] * (v["image_tokens_max"] * PATCHES_PER_IMAGE_TOKEN) ** 2
-            * (v["score_buffers"] * a + 4)),
     }
     out["total"] = sum(out.values())
     return out
