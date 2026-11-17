@@ -28,8 +28,10 @@ the sender also had the mod's older store salt, its `session_alt` (both exact ha
 found on one side only is published as such (`match`: "native only" / "routed only"), never paired by guess. A routed tag
 is attributed to at most one native row (`_claims`: a `session` claim beats a `session_alt` one, then the most recent
 last_at, then host name); a row that loses a tag lists its role in `conflicts` and the section counts them in
-`tag_conflicts`, so overlapping claims never count one routed total twice. The pane's row is selected before the fleet
-table's SESSIONS_MAX cap (`session_row`). Rows
+`tag_conflicts`, so overlapping claims never count one routed total twice. The pane's row is selected before every
+display cap (`session_row`): routed_tokens() keeps every tag and every pending run, BY_SESSION_MAX is applied only where
+the routed totals are published (resolve_pending's `cap`, cap_sessions), and section() joins the uncapped lists before
+its own SESSIONS_MAX (review round 3, #127). The caps bound the fleet display only. Rows
 written before #127 have no origin, run or via: their child-task work sits under the cortados-route server's tag, a
 "routed only" row with no native side.
 
@@ -60,10 +62,9 @@ WINDOWS = dict(ou.WINDOWS)                         # the same names and spans th
 TOKEN_FIELDS = ou.TOKEN_FIELDS                     # input, output, cache_read, cache_write
 _DB_COLS = {"input": "tok_input", "output": "tok_output", "cache_read": "tok_cache_read",
             "cache_write": "tok_cache_write"}
-BY_SESSION_MAX = 100       # tags per window in the routed view: the owner's sessions in a week are far fewer
+BY_SESSION_MAX = 100       # tags per window in the PUBLISHED routed view (cap_sessions): a display cap, never a read one
 BY_MODEL_MAX = 24          # lane/model pairs per window: the pool has about a dozen routes
 SESSION_ROUTES_MAX = 8     # lane/model pairs per session and window (the rest summed as "other")
-PENDING_RUNS_MAX = 500     # child runs per window whose requests carried no origin, kept for the task-log lookup
 VIAS = ("child_task", "subagent", "route_task")
 _SPLIT_COLS = ("office_origin", "office_run", "office_via")
 SESSIONS_MAX = 40          # joined session rows in the live section
@@ -206,7 +207,9 @@ def routed_tokens(conn: sqlite3.Connection, now: float, windows: dict[str, int] 
     """Per window: routed tokens overall, by orchestrator session tag (attributed by the module doc's rules, with each
     session's lane/model and via breakdown) and by lane/model, from router.db (one grouped query per window over the
     routes(ts) index). Child runs whose requests carried no origin are kept by run id in `pending_runs` for section()
-    to resolve. A db not yet migrated (no token columns) says `not recorded`."""
+    to resolve. `by_session` holds EVERY tag (no cap: the rows are already the window's grouped query, and the pane's
+    session must survive to section()); the published copies are capped by resolve_pending / cap_sessions. A db not
+    yet migrated (no token columns) says `not recorded`."""
     windows = dict(WINDOWS if windows is None else windows)
     if not has_token_columns(conn):
         return {"status": "not recorded", "windows": {w: int(s) for w, s in windows.items()}, "by_window": {}}
@@ -232,7 +235,7 @@ def routed_tokens(conn: sqlite3.Connection, now: float, windows: dict[str, int] 
             via, tag, run_id = _attribute(sess, origin, run, via_raw)
             if tag:
                 _acc_add(by_session.setdefault(tag, _session_acc()), via, key, t, n)
-            elif run_id and (run_id in pending or len(pending) < PENDING_RUNS_MAX):
+            elif run_id:            # every one: a cap here would drop a session's work before its row is selected
                 _acc_add(pending.setdefault(run_id, _session_acc()), via, key, t, n)
             else:
                 unattributed += ou.fresh_tokens(t)
@@ -243,8 +246,8 @@ def routed_tokens(conn: sqlite3.Connection, now: float, windows: dict[str, int] 
         models = sorted(by_model.items(), key=lambda kv: ou.fresh_tokens(kv[1]), reverse=True)
         out[w] = {"totals": _with_sums(total), "conversations": conversations, "recorded": recorded,
                   "unrecorded": conversations - recorded, "unattributed_fresh": unattributed,
-                  "by_session": {k: _pub_session(v) for k, v in sessions[:BY_SESSION_MAX]},
-                  "by_session_hidden": max(0, len(sessions) - BY_SESSION_MAX),
+                  "by_session": {k: _pub_session(v) for k, v in sessions},
+                  "by_session_hidden": 0,
                   "by_model": [{"route": k, **_with_sums({f: v[f] for f in TOKEN_FIELDS}),
                                 "conversations": v["conversations"]} for k, v in models[:BY_MODEL_MAX]],
                   # internal (section() resolves and drops it): child runs with no observed origin, by run id
@@ -253,10 +256,27 @@ def routed_tokens(conn: sqlite3.Connection, now: float, windows: dict[str, int] 
             "by_window": out}
 
 
-def resolve_pending(routed: dict[str, Any] | None, run_origins: dict[str, str] | None) -> dict[str, Any] | None:
+def cap_sessions(routed: dict[str, Any] | None, cap: int | None = None) -> dict[str, Any] | None:
+    """A copy of routed totals with each window's `by_session` cut to `cap` (default BY_SESSION_MAX) tags, largest
+    first, the rest counted in `by_session_hidden`: the published (fleet display) form. Never applied before section()
+    has selected a session's row."""
+    if not isinstance(routed, dict):
+        return routed
+    cap = BY_SESSION_MAX if cap is None else cap
+    out = {**routed, "by_window": {}}
+    for w, rw in (routed.get("by_window") or {}).items():
+        rows = list((rw.get("by_session") or {}).items())
+        out["by_window"][w] = {**rw, "by_session": dict(rows[:cap]),
+                               "by_session_hidden": int(rw.get("by_session_hidden") or 0) + max(0, len(rows) - cap)}
+    return out
+
+
+def resolve_pending(routed: dict[str, Any] | None, run_origins: dict[str, str] | None,
+                    cap: bool = True) -> dict[str, Any] | None:
     """routed_tokens() with its pending child runs moved onto their orchestrator's session when the provider host's own
     task log names one (`run_origins`: run id -> origin tag), the rest counted as unattributed. Returns a copy without
-    `pending_runs` (internal: run ids are not published here); None stays None."""
+    `pending_runs` (internal: run ids are not published here); None stays None. `cap` (the published form) cuts
+    `by_session` to BY_SESSION_MAX after the merge (cap_sessions); cap=False keeps every tag, for section()."""
     if not isinstance(routed, dict):
         return routed
     out = {**routed, "by_window": {}}
@@ -289,7 +309,7 @@ def resolve_pending(routed: dict[str, Any] | None, run_origins: dict[str, str] |
         rw["by_session"] = dict(sorted(by_session.items(), key=lambda kv: kv[1].get("fresh", 0), reverse=True))
         rw["resolved_from_task_log_fresh"] = int(rw.get("resolved_from_task_log_fresh") or 0) + resolved_fresh
         out["by_window"][w] = rw
-    return out
+    return cap_sessions(out) if cap else out
 
 
 # ================================================================ the heartbeat block (provider side)
@@ -492,7 +512,7 @@ def section(routed: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]]
     `session` (the pulse pane's tag): its row is also returned as `session_row`, found before the fleet table's
     SESSIONS_MAX display cap (absent without `session`; None when no row has that tag)."""
     errors = list(errors or [])
-    routed = resolve_pending(routed, run_origins)
+    routed = resolve_pending(routed, run_origins, cap=False)      # every tag: the caps below are display caps only
     hosts, orch_rows = [], []
     orch_tot = {w: _zero() for w in WINDOWS}
     sub_tot: dict[str, dict[str, int] | None] = {w: _zero() for w in WINDOWS}

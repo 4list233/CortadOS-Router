@@ -1798,8 +1798,12 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     # heartbeat's report (#127). The published token totals carry no run ids.
     by_id = {r["task_id"]: r for r in rows if isinstance(r, dict) and r.get("task_id")}
     run_orig = {tid: o for tid, o in ((tid, _origin_of(by_id, r)[0]) for tid, r in by_id.items()) if o}
+    # Every session tag stays in `split_totals` for the work split's join (the pane's session survives every display
+    # cap, review round 3); the routed section publishes the BY_SESSION_MAX-capped copy.
+    split_totals = None
     if isinstance(tv, dict) and isinstance(tv.get("token_totals"), dict):
-        tv = {**tv, "token_totals": work_split.resolve_pending(tv["token_totals"], run_orig)}
+        split_totals = work_split.resolve_pending(tv["token_totals"], run_orig, cap=False)
+        tv = {**tv, "token_totals": work_split.cap_sessions(split_totals)}
     # this process's failed router.db writes (#99): shown even when the read side failed, which is when they matter most
     rl_errs: list = []
     rl = route_log_errors(guard("route log", route_log, rl_errs))
@@ -1817,8 +1821,9 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
                           exec_hosts=ex_hosts, exec_default=ex_default, self_host=self_host, now=now,
                           errors=hb_errs + ex_errs + (u_errs if u is None else []),
                           self_name=self_name if self_name is not None else _slug(os.environ.get(SELF_ENV)))
-    ws = work_split.section(tv.get("token_totals") if isinstance(tv, dict) else None, beats, now,
-                            tv_errs if tv is None else None, session=session)
+    if split_totals is None and isinstance(tv, dict):
+        split_totals = tv.get("token_totals")
+    ws = work_split.section(split_totals, beats, now, tv_errs if tv is None else None, session=session)
     counts = tasks.get("counts") or {}
     overview = {
         "running_tasks": counts.get("running") if tasks["status"] != "error" else None,

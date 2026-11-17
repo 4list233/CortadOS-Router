@@ -101,8 +101,12 @@ const nodesErr = atom({ plugin: 'cortados-pulse', key: 'nodesErr' } as const, nu
 type Started = { tag: string; task_id: string; at: number }
 const started = atom({ plugin: 'cortados-pulse', key: 'started' } as const, [] as Started[])
 /** #127: the session view of the newest such tag that is not this session's own. */
-type AliasHeld = { data: PulseSessionView; at: number; tag: string }
+export type AliasHeld = { data: PulseSessionView; at: number; tag: string }
 const alias = atom({ plugin: 'cortados-pulse', key: 'alias' } as const, null as AliasHeld | null)
+/** The alias view's last failed read (its tag, the problem, and since when a read of it has been outstanding when the
+ * failure was that one, readSessionView's pendingSince): shown under its tasks as the main view shows treeErr. */
+export type AliasErr = { tag: string; problem: string; pendingSince: number | null }
+const aliasErr = atom({ plugin: 'cortados-pulse', key: 'aliasErr' } as const, null as AliasErr | null)
 
 /** GET /v1/cortados/local: each local node's switch, admission, backend, loaded models and capacity, asked through its
  * gate (the provider bounds each gate call at 6 s). The owner token opens it. */
@@ -113,6 +117,9 @@ export const NODES_POLL_MS = 30_000
  * fetch has no timeout of its own; the poll runs one at a time and would wait on it forever). The read is aborted then,
  * and stays outstanding (fetchBounded) until the host's fetch settles. */
 export const FETCH_TIMEOUT_MS = 15_000
+/** A read still outstanding this long after it started (a host that ignored the abort, its fetch never settling) makes
+ * the alias view stale: its task list is dropped (no elapsed time keeps ticking) and "stale since …" is shown. */
+export const STALE_AFTER_MS = 2 * FETCH_TIMEOUT_MS
 /** The cortados-route MCP server's start_task, under any MCP prefix (a user, project or plugin server). */
 export const START_TASK_TOOL = /^mcp__.*cortados-route__start_task$/
 export const STARTED_MAX = 8
@@ -215,7 +222,9 @@ export function readConfig(options: unknown): Cfg {
   }
 }
 
-type Fetched = { ok: true; data: object; url: string } | { ok: false; problem: string; status?: number }
+/** pendingSince: the start (clock ms) of an earlier read of the same URL that is still outstanding, when that is why
+ * this one was refused (fetchBounded). */
+type Fetched = { ok: true; data: object; url: string } | { ok: false; problem: string; status?: number; pendingSince?: number }
 
 /** GET <provider><path> with the Bearer token: the JSON object (scrubbed of the token, strings and keys alike) or the
  * one-line problem. Shared by both polls so the token rules are written once. */
@@ -234,7 +243,9 @@ export async function fetchView($: Pick<EngineInterface, 'env' | 'fs' | 'http' |
     return { ok: true, data, url }
   } catch (e) {
     const why = (e as Error)?.message ?? String(e)
-    return { ok: false, problem: scrub('could not read the provider (' + why + ')', token) }
+    const since = (e as any)?.pendingSince
+    return { ok: false, problem: scrub('could not read the provider (' + why + ')', token),
+      ...(typeof since === 'number' ? { pendingSince: since } : {}) }
   }
 }
 
@@ -242,7 +253,7 @@ export async function fetchView($: Pick<EngineInterface, 'env' | 'fs' | 'http' |
  * itself resolves or rejects, not until the poll gave up on it: a timed-out read is aborted, and only a host that
  * honours the abort ends it. A host that does not (this build's HttpInit declares no `signal`) keeps it outstanding,
  * and no second read of the same URL starts until it settles, so hung reads never pile up (one per view at most). */
-const outstanding = new Map<string, object>()
+const outstanding = new Map<string, { since: number | null }>()
 /** The host refused a fetch carrying `signal` (an init it cannot take or clone): later reads go without it. */
 let signalRefused = false
 
@@ -253,9 +264,12 @@ export function outstandingReads(): number {
 
 /** $.http.fetch, given up after FETCH_TIMEOUT_MS (a rejection, said as the poll's problem) when the host has a clock
  * timer; the timer is cancelled once the answer comes. A read that times out is aborted through its AbortController
- * (passed as init.signal). Refused at once while an earlier read of the same URL is still outstanding. */
+ * (passed as init.signal). Refused at once while an earlier read of the same URL is still outstanding; the refusal
+ * carries `pendingSince`, that read's start (clock ms), so a view can tell a read that never ends from a slow one. */
 export async function fetchBounded($: Pick<EngineInterface, 'http' | 'clock'>, url: string, init: any): Promise<any> {
-  if (outstanding.has(url)) throw new Error('the previous read of this view has not ended yet')
+  const prev = outstanding.get(url)
+  if (prev) throw Object.assign(new Error('the previous read of this view has not ended yet'),
+    prev.since !== null ? { pendingSince: prev.since } : {})
   const stop = typeof AbortController === 'function' ? new AbortController() : null
   const send = (withSignal: boolean): Promise<any> => {
     try {
@@ -273,8 +287,10 @@ export async function fetchBounded($: Pick<EngineInterface, 'http' | 'clock'>, u
     }
     throw e
   })
-  const mark = {}
+  const mark: { since: number | null } = { since: null }
   outstanding.set(url, mark)
+  // the start, for pendingSince (set before any timeout can fire; a clock that fails leaves it unknown, never stale)
+  try { Promise.resolve($.clock.now()).then(t => { if (typeof t === 'number') mark.since = t }, () => {}) } catch { /* no clock */ }
   const done = () => { if (outstanding.get(url) === mark) outstanding.delete(url) }
   req.then(done, done)
   let timer: Timer | null = null
@@ -370,21 +386,36 @@ async function pollLiveOnce($: LiveDollar, cfg: Cfg, me: boolean): Promise<void>
   }
 }
 
+/** One read of GET /v1/cortados/live/session?session=<tag>, shared by the main view (fetchTree) and the alias view
+ * (fetchAlias) so the two cannot diverge: `held` (that tag's subtree), `absent` (a provider without the view: 404, or an
+ * answer that is not that tag's subtree) or `failed` (401/403/5xx/network/timeout, said in a line; `pendingSince` when
+ * an earlier read of the view is still outstanding). */
+export type SessionRead = { kind: 'held'; data: PulseSessionView; url: string } | { kind: 'absent' }
+  | { kind: 'failed'; problem: string; pendingSince: number | null }
+
+export async function readSessionView($: LiveDollar, cfg: Cfg, tag: string): Promise<SessionRead> {
+  const f = await fetchView($, cfg, SESSION_PATH + '?session=' + tag)
+  if (f.ok) {
+    const data = f.data as PulseSessionView
+    return data.session_filter === tag && data.orchestrators && typeof data.orchestrators === 'object'
+      ? { kind: 'held', data, url: f.url } : { kind: 'absent' }
+  }
+  return f.status === 404 ? { kind: 'absent' } : { kind: 'failed', problem: f.problem, pendingSince: f.pendingSince ?? null }
+}
+
 /** GET /v1/cortados/live/session?session=<tag>. True when it settled the poll: the subtree is held, or the provider
  * failed (401/403/5xx/network: said, the held subtree stays with its age). False only for a provider without the view
  * (404, or an answer that is not this session's subtree): the pane then falls back to the fleet view. */
 export async function fetchTree($: LiveDollar, cfg: Cfg, tag: string): Promise<boolean> {
-  const f = await fetchView($, cfg, SESSION_PATH + '?session=' + tag)
-  if (f.ok) {
-    const data = f.data as PulseSessionView
-    if (data.session_filter === tag && data.orchestrators && typeof data.orchestrators === 'object') {
-      const at = await $.clock.now()
-      await update($, tree, () => ({ data, at, tag, base: f.url }))
-      await update($, treeErr, () => null)
-      return true
-    }
-  } else if (f.status !== 404) {
-    await update($, treeErr, () => 'live: ' + f.problem)
+  const r = await readSessionView($, cfg, tag)
+  if (r.kind === 'held') {
+    const at = await $.clock.now()
+    await update($, tree, () => ({ data: r.data, at, tag, base: r.url }))
+    await update($, treeErr, () => null)
+    return true
+  }
+  if (r.kind === 'failed') {
+    await update($, treeErr, () => 'live: ' + r.problem)
     return true
   }
   await update($, tree, () => null)
@@ -392,20 +423,25 @@ export async function fetchTree($: LiveDollar, cfg: Cfg, tag: string): Promise<b
   return false
 }
 
-/** The session view of aliasTag(started, own) (see there), held for that tag; dropped when there is none. A failed
- * read keeps what was held (the main view says the provider's problem). */
+/** The session view of aliasTag(started, own) (see there), held for that tag; dropped when there is none or the
+ * provider has no such view. A failed read keeps what was held for that tag and says the problem (aliasErr), which
+ * aliasLines draws with the held data's age, or as stale with no tasks once a read has hung past STALE_AFTER_MS. */
 export async function fetchAlias($: LiveDollar, cfg: Cfg, own: string): Promise<void> {
   const tag = aliasTag(await read($, started), own)
   if (!tag) {
     if (await read($, alias)) await update($, alias, () => null)
+    if (await read($, aliasErr)) await update($, aliasErr, () => null)
     return
   }
-  const f = await fetchView($, cfg, SESSION_PATH + '?session=' + tag)
-  if (!f.ok) return
-  const data = f.data as PulseSessionView
-  if (data.session_filter !== tag) return
+  const r = await readSessionView($, cfg, tag)
+  if (r.kind === 'failed') {
+    if ((await read($, alias))?.tag !== tag) await update($, alias, () => null)   // never another tag's held view
+    await update($, aliasErr, () => ({ tag, problem: 'live: ' + r.problem, pendingSince: r.pendingSince }))
+    return
+  }
   const at = await $.clock.now()
-  await update($, alias, () => ({ data, at, tag }))
+  await update($, alias, () => r.kind === 'held' ? { data: r.data, at, tag } : null)
+  await update($, aliasErr, () => null)
 }
 
 /** This session's own view (?session=). Kept only when the provider says it filtered for this tag (session_filter):
@@ -828,6 +864,34 @@ export const CLEAR_NOTE = 'after a /clear, earlier tasks stay under the previous
 export const ALIAS_NOTE = (tag: string) => 'tasks this session started under its cortados-route server\'s tag ' + tag.slice(0, 8) +
   ' (its session id predates a /clear or resume):'
 
+/** A pane line of the alias view: its text, dim (a note) or attn (bold). */
+export type AliasLine = { text: string; dim?: boolean; attn?: boolean }
+
+/** The alias view under This session (pure): ALIAS_NOTE, that tag's tree and work split, and its last problem with the
+ * held data's age, as the main view says treeErr. When a read of the view has been outstanding past STALE_AFTER_MS (a
+ * host that ignored the abort), the view is stale: its tasks and split are dropped, so no elapsed time keeps ticking,
+ * and "stale since …" is said instead. Nothing for no alias, or an alias equal to the pane's own tag. */
+export function aliasLines(al: AliasHeld | null, ae: AliasErr | null, own: string, nowMs: number): AliasLine[] {
+  const tag = ae?.tag ?? al?.tag
+  if (!tag || tag === own) return []
+  const h = al && al.tag === tag ? al : null
+  const e = ae && ae.tag === tag ? ae : null
+  const out: AliasLine[] = [{ text: ALIAS_NOTE(tag), dim: true }]
+  const hung = e && typeof e.pendingSince === 'number' ? nowMs - e.pendingSince : null
+  if (e && hung !== null && hung > STALE_AFTER_MS) {
+    const since = h ? h.at : (e.pendingSince as number)
+    out.push({ text: 'stale since ' + age((nowMs - since) / 1000) + ' ago: a read of this view has not ended for ' +
+      age(hung / 1000) + ' (past its ' + FETCH_TIMEOUT_MS / 1000 + ' s timeout); its tasks are hidden until it does', dim: true })
+    return out
+  }
+  if (h) {
+    out.push(...treeLines(h.data, tag, (nowMs - h.at) / 1000).map(l => ({ text: l.text, ...(l.attn ? { attn: true } : {}) })))
+    if (h.data.work_split) out.push(...workSplitLines(h.data.work_split, false, 'work split (server tag)'))
+  }
+  if (e) out.push({ text: e.problem + (h ? ' · showing ' + age((nowMs - h.at) / 1000) + ' old data' : ''), dim: true })
+  return out
+}
+
 // ---- this machine's own task log (#118; pure, tested) ----------------------------------------------------------------
 // A task started with host "here" runs on THIS machine and logs only here ($CORTADOS_HOME/child-tasks.jsonl). The
 // provider learns of it from this host's heartbeat, which may not exist yet (no sender installed) or may not reach it
@@ -1167,6 +1231,7 @@ export const register: Register = (on, options) => {
     const nv = await read($, nodes)
     const nvProblem = await read($, nodesErr)
     const al = await read($, alias)
+    const alErr = await read($, aliasErr)
     const splitRows = (lines: SplitLine[]) => lines.map(l => l.dim ? dim(l.text) : line(l.text))
     const toggle = Button({ key: 'cortados-pulse-ws', label: open ? 'w: hide the work split breakdown' : 'w: work split breakdown',
       hotkey: 'w', plain: true, dimColor: true, onPress: () => { void update($, wsOpen, v => !v) } })
@@ -1178,11 +1243,8 @@ export const register: Register = (on, options) => {
       const since = (nowMs - tr.at) / 1000
       const merged = mergeLocal(tr.data, localFor(tr.tag), tr.tag, tr.at / 1000)
       // tasks this session started under another tag (its cortados-route server's, after a /clear): drawn too
-      const aliasRows = al && al.tag !== tr.tag ? [
-        dim(ALIAS_NOTE(al.tag)),
-        ...treeLines(al.data, al.tag, (nowMs - al.at) / 1000).map(l => l.attn ? Text({ bold: true, children: l.text }) : line(l.text)),
-        ...(al.data.work_split ? splitRows(workSplitLines(al.data.work_split, false, 'work split (server tag)')) : []),
-      ] : []
+      const aliasRows = aliasLines(al, alErr, tr.tag, nowMs)
+        .map(l => l.attn ? Text({ bold: true, children: l.text }) : l.dim ? dim(l.text) : line(l.text))
       running = [
         head('This session'),
         ...splitRows(workSplitLines(tr.data.work_split, open)),

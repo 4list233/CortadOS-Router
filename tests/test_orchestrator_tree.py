@@ -1476,6 +1476,17 @@ class WorkSplitSessionTest(unittest.TestCase):
             row = self.split()["row"]
         self.assertEqual((row["session"], row["match"]), (MINE, "both"))
 
+    def test_the_session_view_survives_every_cap_at_its_smallest(self):
+        # review round 3, finding 1: the routed read, the published cap and the fleet table at 0; the pane's row is whole
+        whole = self.split()["row"]
+        caps = {"BY_SESSION_MAX": 0, "SESSIONS_MAX": 0, "BY_MODEL_MAX": 0}
+        with mock.patch.multiple(work_split, **caps):
+            snap = split_view()
+            self.assertEqual(snap["routed"]["totals"]["tokens"]["by_window"]["24h"]["by_session"], {})
+            self.assertGreater(snap["routed"]["totals"]["tokens"]["by_window"]["24h"]["by_session_hidden"], 0)
+            self.assertEqual(snap["work_split"]["sessions"], [])
+            self.assertEqual(self.split()["row"], whole)
+
     def test_fresh_and_all_token_shares(self):
         d = self.split()["row"]["24h"]
         fresh_r, fresh_n = d["routed"]["fresh"], d["native"]["fresh"]

@@ -29,7 +29,10 @@ provider's views with the same token: `GET /v1/cortados/live` every 10 seconds a
   heartbeat, a stale heartbeat, unreadable transcripts, routed tokens not recorded). A `start_task` of this session
   whose result names another origin tag than the pane's (the cortados-route server keeps the session id it started
   with, so after a `/clear` its tasks are under the old tag) makes the pane read that tag's view too and draw it under
-  a dim "tasks this session started under its cortados-route server's tag" line;
+  a dim "tasks this session started under its cortados-route server's tag" line. That view is read by the same helper
+  as the session's own (`readSessionView`) and says its last problem with the held data's age; when a read of it is still
+  outstanding 30 s (2× the 15 s timeout) after it began (a host that ignored the abort), the view is marked "stale since
+  …" and its tasks are dropped, so no elapsed time keeps counting on data that is not coming;
 - **Running** (fallback only: from `/v1/cortados/live`) — one summary line (children running and queued, conversations and how many
   are working), then each running or queued `start_task` child (title, host, model, current tool, elapsed time counting
   between polls) and every conversation the provider holds open (main sessions, subagents, untagged clients, and a

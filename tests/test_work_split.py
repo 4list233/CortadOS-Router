@@ -648,6 +648,67 @@ class PerSessionSplitTest(unittest.TestCase):
         self.assertIsNone(work_split.session_split(work_split.section(routed, hb, NOW, session="ffffffffffffffff"),
                                                    "ffffffffffffffff")["row"])
 
+    def test_the_101st_routed_tag_keeps_its_routed_work(self):
+        # review round 3, finding 1: 101 routed tags, totals descending; the 101st (900 fresh) is the pane's session
+        tags = [f"{i:016x}" for i in range(1, 102)]
+        routed = self.routed([(t, None, None, None, "codex", "gpt-6.1", (900 + (101 - i) * 100, 0, 0, 0))
+                              for i, t in enumerate(tags, 1)])
+        self.assertEqual(len(routed["by_window"]["24h"]["by_session"]), 101)        # the read keeps every tag
+        hb = self.hb([self.row(tags[-1])])
+        ws = work_split.session_split(work_split.section(routed, hb, NOW, session=tags[-1]), tags[-1])
+        self.assertEqual((ws["row"]["24h"]["routed_fresh"], ws["row"]["match"], ws["status"]), (900, "both", "ok"))
+        self.assertNotIn(work_split.SESSION_NOTES["no_routed"], ws["notes"])
+        # the published copy (the routed section, GET /v1/cortados/tasks) is still capped at BY_SESSION_MAX
+        pub = work_split.resolve_pending(routed, None)["by_window"]["24h"]
+        self.assertEqual((len(pub["by_session"]), pub["by_session_hidden"]), (work_split.BY_SESSION_MAX, 1))
+        self.assertNotIn(tags[-1], pub["by_session"])
+        # and a child run whose origin only the task log knows survives too (no pending-run cap)
+        many = [(self.MCP, None, f"t20261116160946-{i:08x}", None, "codex", "gpt-6.1", (10, 0, 0, 0)) for i in range(600)]
+        last = many[-1][2]
+        s = work_split.section(self.routed(many), hb, NOW, run_origins={last: tags[-1]}, session=tags[-1])
+        self.assertEqual(work_split.session_split(s, tags[-1])["row"]["24h"]["routed_fresh"], 10)
+
+    def test_every_cap_small_still_gives_the_requested_sessions_full_row(self):
+        # review round 3: the caps bound the fleet display only; at 1 each, the pane's row is whole
+        tags = [f"{i:016x}" for i in range(1, 6)]
+        mine, alt = tags[-1], "abcdefabcdef0001"
+        rows = [(t, None, None, None, "codex", "gpt-6.1", (5000 - 100 * i, 0, 0, 0)) for i, t in enumerate(tags[:-1])]
+        rows += [(mine, None, None, "route_task", "codex", "gpt-6.1-sol", (300, 0, 0, 0)),
+                 (alt, None, None, None, "claude#b", "claude-haiku-5", (200, 0, 0, 0)),
+                 (self.MCP, mine, self.RUN, None, "claude#b", "claude-opus-5-5", (400, 0, 0, 0))]
+        full = None
+        for small in (False, True):
+            caps = {k: 1 if small else getattr(work_split, k)
+                    for k in ("BY_SESSION_MAX", "SESSIONS_MAX", "BY_MODEL_MAX", "SESSION_ROUTES_MAX")}
+            with mock.patch.multiple(work_split, **caps), mock.patch.object(ou, "SESSIONS_MAX", 1 if small else 30):
+                routed = self.routed(rows)
+                natives = [self.row(t, last_at=NOW - 3000 - i) for i, t in enumerate(tags[:-1])]
+                natives.append(self.row(mine, session_alt=alt, last_at=NOW - 3500,
+                                        **{w: {"input": 7, "output": 0, "cache_read": 0, "cache_write": 0}
+                                           for w in ("24h", "7d")}))
+                hb = {f"h{i}": {"orchestrator": self_valid(block(sessions=[r]))} for i, r in enumerate(natives)}
+                s = work_split.section(routed, hb, NOW, session=mine)
+                if small:
+                    self.assertEqual((len(s["sessions"]), s["sessions_hidden"]), (1, 4))
+                ws = work_split.session_split(s, mine)
+            row = ws["row"]
+            self.assertEqual((ws["status"], row["match"], row["matched_on"]), ("ok", "both", ["session", "session_alt"]))
+            got = {w: (row[w]["routed_fresh"], row[w]["orchestrator_fresh"], row[w]["routed_conversations"],
+                       {k: v["fresh"] for k, v in row[w]["routed"]["by_via"].items()},
+                       sum(r["fresh"] for r in row[w]["routed"]["by_route"])) for w in ("24h", "7d")}
+            self.assertEqual(got["24h"], (900, 7, 3, {"route_task": 300, "subagent": 200, "child_task": 400}, 900))
+            if full is None:
+                full = got
+            self.assertEqual(got, full)               # the same row as with the real caps
+        # the sender's own cap keeps the active (pane's) session before heavier quiet ones
+        msgs = [("heavy", NOW - 5000, "claude-opus-5-5", {"input": 9000, "output": 0, "cache_read": 0, "cache_write": 0},
+                 None), ("pane", NOW - 60, "claude-opus-5-5", {"input": 3, "output": 0, "cache_read": 0, "cache_write": 0},
+                         None)]
+        b = ou.summarize(msgs, now=NOW, windows=dict(ou.WINDOWS), salt="00" * 16, sessions_max=1, excluded={})
+        self.assertEqual(([r["24h"]["input"] for r in b["sessions"]], b["sessions_hidden"]), ([3], 1))
+        b = ou.summarize(msgs, now=NOW, windows=dict(ou.WINDOWS), salt="00" * 16, sessions_max=2, excluded={})
+        self.assertEqual([r["24h"]["input"] for r in b["sessions"]], [9000, 3])      # under the cap: tokens first
+
     def test_an_old_db_without_the_split_columns_still_reads(self):
         c = sqlite3.connect(":memory:")
         c.executescript(core.DDL)

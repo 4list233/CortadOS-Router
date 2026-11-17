@@ -83,6 +83,11 @@ WINDOWS: dict[str, int] = {"24h": 24 * 3600, "7d": 7 * 24 * 3600}
 # for the jobs and hardware; the owner runs a handful of main sessions a day, so 30 covers a busy week. The totals
 # always include every session, the rows past the cap are counted in `sessions_hidden`.
 SESSIONS_MAX = 30
+# The cap keeps the sessions active in the last ACTIVE_S first (most recent first), then the rest by tokens: a pane's
+# own session is an active one, so a quiet session the owner is in never loses its row to heavier old ones (review
+# round 3, #127: the caps bound the fleet display only). The sender does not know which session a pane asks for; more
+# than SESSIONS_MAX sessions active at once is the one case left, and the pane says its native side is not reported.
+ACTIVE_S = 30 * 60
 MODELS_PER_SESSION = 3                          # models listed per session row; the rest are summed under OTHER_MODEL
 OTHER_MODEL = "other"
 TOKEN_FIELDS = ("input", "output", "cache_read", "cache_write")
@@ -352,6 +357,10 @@ def summarize(messages: Iterable[tuple], *, now: float,
             row["session_alt"] = session_tag(alt_salt, sid)
         rows.append(row)
     rows.sort(key=lambda r: (fresh_tokens(r[widest_name]), r["last_at"]), reverse=True)
+    active = sorted((r for r in rows if r["last_at"] >= now - ACTIVE_S), key=lambda r: r["last_at"], reverse=True)
+    if len(rows) > sessions_max and active:             # only the cut changes: under the cap the order is unchanged
+        ids = {id(r) for r in active}
+        rows = active + [r for r in rows if id(r) not in ids]
     return {"version": VERSION, "sampled_at": round(now, 3), "salt": bool(salt),
             "salt_source": salt_source if salt and salt_source in ("shared", "store") else None,
             "windows": {w: int(span) for w, span in windows.items()}, "totals": totals,

@@ -2,7 +2,8 @@
 // under another tag. The session view is the provider-generated fixture (tests/test_orchestrator_tree.session_fixture).
 import { test, expect, mock } from 'claude-code/testing'
 import { workSplitLines, tokAmt, nodeLines, localNodeLines, deviceLines, laneLines, startedOf, aliasTag, fetchAlias,
-  fetchBounded, outstandingReads, FETCH_TIMEOUT_MS, START_TASK_TOOL, register, sessionTag, LOCAL_SWITCH_PATH, ALIAS_NOTE } from './register'
+  fetchBounded, outstandingReads, FETCH_TIMEOUT_MS, START_TASK_TOOL, register, sessionTag, LOCAL_SWITCH_PATH, ALIAS_NOTE,
+  aliasLines, fetchTree, treeLines, STALE_AFTER_MS } from './register'
 import sessionFixture from './session.fixture'
 
 const TOKEN = 'sekrit-token-123'
@@ -208,6 +209,70 @@ test('a host that refuses an init carrying a signal is asked again without one, 
   expect(inits[1]).toEqual({ headers: { a: 'b' } })
   expect(await fetchBounded(picky as any, 'http://y/', {})).toEqual({ status: 200 })
   expect(inits.length).toBe(3)
+  expect(outstandingReads()).toBe(0)
+})
+
+test('an alias read that never settles and ignores the abort goes stale: said, its tasks dropped, nothing ticking', async () => {
+  const CFG = { providerUrl: '', providerTokenFile: '~/.config/cortados/provider-token', providerToken: '' }
+  const T0 = 1_700_000_000_000
+  const view = { ...(sessionFixture as any), session_filter: OTHER,
+    orchestrators: { ...(sessionFixture as any).orchestrators, items: (sessionFixture as any).orchestrators.items.map((g: any) => ({ ...g, origin: OTHER })) } }
+  const mineView = { ...(sessionFixture as any), session_filter: MINE }
+  let deaf = false
+  const releases: ((v: any) => void)[] = []
+  const answer = (v: any) => ({ status: 200, ok: true, headers: {}, text: JSON.stringify(v) })
+  const $ = dollar(url => deaf ? new Promise(r => { releases.push(r) })      // never settles, ignores init.signal
+    : answer(url.endsWith(OTHER) ? view : mineView))
+  let t = T0
+  $.clock.now = async () => t
+  await $.state.set({ plugin: 'cortados-pulse', key: 'started' }, [{ tag: OTHER, task_id: 't20261116160946-4437347b', at: 1 }])
+  await fetchAlias($ as any, CFG, MINE)
+  expect(await fetchTree($ as any, CFG, MINE)).toBe(true)
+  const al = $.value('alias') as any
+  expect(al.tag).toBe(OTHER)
+  const tasks = treeLines(view as any, OTHER, 0).map(l => l.text)
+  expect(tasks.length).toBeGreaterThan(0)
+  const texts = (now: number) => aliasLines($.value('alias') as any, ($.value('aliasErr') ?? null) as any, MINE, now).map(l => l.text)
+  expect(texts(T0)).toEqual(aliasLines(al, null, MINE, T0).map(l => l.text))
+  expect(texts(T0).slice(1, 1 + tasks.length)).toEqual(tasks)
+  // the host stops answering and cannot cancel: the read times out, the next poll is refused while it is outstanding
+  deaf = true
+  t = T0 + 10_000
+  const p = fetchAlias($ as any, CFG, MINE)
+  for (let i = 0; i < 20 && !$.timers.some(x => !x.cancelled && x.ms === FETCH_TIMEOUT_MS && x.fn); i++) await Promise.resolve()
+  t = T0 + 25_000
+  $.timers[$.timers.length - 1]!.fn()
+  await p
+  expect(($.value('aliasErr') as any).problem).toMatch(/no answer within 15 s/)
+  let shown = texts(t)
+  expect(shown.slice(1, 1 + tasks.length).length).toBe(tasks.length)   // within the grace: tasks and the problem, aged
+  expect(shown[shown.length - 1]).toMatch(/no answer within 15 s.* · showing 25 s old data$/)
+  t = T0 + 35_000
+  await fetchAlias($ as any, CFG, MINE)
+  const e = $.value('aliasErr') as any
+  expect([e.problem.includes('previous read of this view has not ended'), e.pendingSince]).toEqual([true, T0 + 10_000])
+  expect(T0 + 35_000 - e.pendingSince).toBeLessThan(STALE_AFTER_MS + 1)
+  // past 2x the timeout since the read began: stale, the task list dropped, so nothing keeps ticking
+  for (const now of [T0 + 41_000, T0 + 600_000]) {
+    shown = texts(now)
+    expect(shown.length).toBe(2)
+    expect(shown[0]).toBe(ALIAS_NOTE(OTHER))
+    expect(shown[1]).toMatch(/^stale since .* ago: a read of this view has not ended for .* \(past its 15 s timeout\); its tasks are hidden until it does$/)
+    for (const x of tasks) expect(shown.includes(x)).toBe(false)
+  }
+  expect(texts(T0 + 41_000)[1]).toMatch(/^stale since 41 s ago: .* not ended for 31 s/)
+  expect(texts(T0 + 600_000)[1]).toMatch(/^stale since 10 min ago: .* not ended for 10 min/)
+  // the main view is unchanged: its read, on its own URL, still answers and holds its tree
+  deaf = false
+  expect(await fetchTree($ as any, CFG, MINE)).toBe(true)
+  expect([($.value('tree') as any).tag, $.value('treeErr')]).toEqual([MINE, null])
+  // once the hung read finally settles, the next poll reads the alias again and the stale mark goes
+  for (const r of releases) r(answer(view))
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+  t = T0 + 700_000
+  await fetchAlias($ as any, CFG, MINE)
+  expect($.value('aliasErr')).toBe(null)
+  expect(texts(t).slice(1, 1 + tasks.length).length).toBe(tasks.length)
   expect(outstandingReads()).toBe(0)
 })
 

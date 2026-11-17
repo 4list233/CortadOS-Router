@@ -1299,7 +1299,9 @@ the most recently active row wins, then the host name; a losing row lists the ta
 counts them in `tag_conflicts`). The live view's `work_split.sessions`
 rows carry it (`match`, `matched_on`, per window `native`, `routed`, `routed_pct`, `routed_pct_all`), the dashboard's
 Work split panel has a per-session table, and `GET /v1/cortados/live/session` carries the asking session's own row
-only (`work_split.row`, selected before the fleet table's 40-row cap, and `notes` on what is partial: no native report, a stale heartbeat, unreadable transcripts,
+only (`work_split.row`, selected before every display cap: the routed read keeps every session tag and every
+pending child run, the 100-tag cap applies only to the published routed totals and the 40-row cap only to the fleet
+table, and the heartbeat sender keeps the sessions active in the last 30 min ahead of its 30-row token ranking; and `notes` on what is partial: no native report, a stale heartbeat, unreadable transcripts,
 routed tokens not recorded), which the pulse pane draws as one line plus a `w` breakdown.
 
 The dashboard's **Live** tab reads it every 5 s while the tab is visible: an overview strip (running tasks, active
