@@ -412,12 +412,23 @@ class ImagePrefillReservationTests(unittest.TestCase):
         t.release()
 
     def test_text_only_reservations_are_unchanged(self):
+        # On a vision model every text turn reserves exactly as before #125 (and #126 leaves that route alone). On a
+        # text-only model #126's text route reservation applies: never below the old one, and equal to it where the
+        # old one was already at least the computed peak (a short turn).
         for cfg in (vision_cfg(), local_governor.check_config({})):
             for text, out in ((10, 10), (9000, 4000), (200_000, 32_000)):
                 with self.subTest(text=text, vision=bool(cfg["vision"])):
                     tokens = min(cfg["context_tokens"], text + out)
-                    self.assertEqual(local_governor.request_bytes(cfg, text, out),
-                                     tokens * 65536 + cfg["per_seq_state_bytes"] + cfg["prefill_margin_bytes"])
+                    old = tokens * 65536 + cfg["per_seq_state_bytes"] + cfg["prefill_margin_bytes"]
+                    got = local_governor.request_bytes(cfg, text, out)
+                    if cfg["vision"]:
+                        self.assertEqual(got, old)
+                    else:
+                        want = local_governor.text_set_bytes(cfg, [local_governor.text_load(cfg, text, out)])
+                        self.assertEqual(got, want["total"])
+                        self.assertEqual(got, max(old, want["computed"]))
+                        if text == 10:
+                            self.assertEqual(got, old)
 
     def test_the_guard_checks_the_dimensions_the_formula_uses(self):
         from tests.test_vllm_mlx_guard import load_guard

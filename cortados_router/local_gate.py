@@ -668,11 +668,16 @@ class GateHandler(BaseHTTPRequestHandler):
                 images = len(plan) if plan is not None else 0
                 # The bound comes from the body as the client sent it (raw), before the gate's own adaptation; the
                 # validated image data is left out of the text bound and each image counted as image_tokens_max.
-                need = adm.request_bytes(local_governor.input_tokens(raw, adm.context_tokens,
-                                                                     plan.data_chars if images else 0),
-                                         _max_tokens(body), images) if adm.governor is not None else 0
+                need, load = 0, None
+                if adm.governor is not None:
+                    bound = local_governor.input_tokens(raw, adm.context_tokens, plan.data_chars if images else 0)
+                    # #126: a text turn on a text-only model joins the text route's set reservation (the decode
+                    # batch pads every row to the longest); anything else reserves its own bytes, as before
+                    load = adm.text_load(bound, _max_tokens(body)) if not images else None
+                    if load is None:
+                        need = adm.request_bytes(bound, _max_tokens(body), images)
                 # count slot, bytes and (an image turn) the image slot together, or none of them
-                ticket, snap = adm.try_acquire(need, image=images > 0)
+                ticket, snap = adm.try_acquire(need, image=images > 0, load=load)
                 if ticket is None:
                     if snap.get("refused") == "unsupported":
                         return self._unsupported(snap.get("reason") or "the model reads no images")

@@ -206,19 +206,27 @@ LONG_CHARS = int(LONG_IN * 3.5)                             # the gate tests' lo
 
 
 class ByteBudgetTests(unittest.TestCase):
-    """The BYTE bound: each request reserves (input + max_tokens, capped) x 64 KiB + state + margin, and requests are
-    admitted while the reservations fit in budget - weights (defaults: 40 GiB - 15 GiB = 25 GiB)."""
+    """The BYTE bound on the default (text-only) model, as the gate takes it (#126): each text turn joins the text
+    route's set reservation (local_governor.text_set_bytes: the decode batch pads every row to the longest, one replaced
+    KV copy, the guard's chunked prefill one sequence at a time, MLX's capped buffer cache), never less than the old
+    per-request sum, and turns are admitted while the set fits in budget - weights (defaults: 40 - 15 = 25 GiB)."""
 
     def setUp(self):
         self.g = FixedGovernor(idle_s=3600)                           # owner idle, pressure normal: count limit 8
         self.a = local_governor.Admission(self.g)
         self.c = self.g.cfg
 
-    def long(self):
-        return self.a.request_bytes(LONG_IN, LONG_MAX)
+    def long(self, a=None):
+        return (a or self.a).text_load(LONG_IN, LONG_MAX)
 
-    def short(self):
-        return self.a.request_bytes(SHORT_IN, SHORT_MAX)
+    def short(self, a=None):
+        return (a or self.a).text_load(SHORT_IN, SHORT_MAX)
+
+    def take(self, load, a=None):
+        return (a or self.a).try_acquire(load=load)
+
+    def alone(self, load):
+        return local_governor.text_set_bytes(self.c, [load])["total"]
 
     def test_the_defaults_are_the_measured_model(self):
         c = self.c
@@ -226,131 +234,151 @@ class ByteBudgetTests(unittest.TestCase):
         self.assertEqual(c["kv_bytes_per_token"], 16 * 2 * 4 * 256 * 2)            # 65,536 bytes per token
         self.assertEqual(131072 * c["kv_bytes_per_token"], 8 * GIB)               # a 128k context holds 8 GiB
         self.assertEqual(local_governor.request_tokens(c, LONG_IN, LONG_MAX), 131072)   # capped at the context
-        self.assertEqual(self.long(), 8 * GIB + int(0.15 * GIB) + int(1.5 * GIB))
+        # the old per-request reservation, now the floor: 8 GiB + state + the 1.5 GiB margin
+        self.assertEqual(self.long().legacy, 8 * GIB + int(0.15 * GIB) + int(1.5 * GIB))
+        # the computed peak governs a long turn: two KV copies of 128k (+ a cache step), its prefill chunk's scores
+        self.assertEqual(self.a.request_bytes(LONG_IN, LONG_MAX), self.alone(self.long()))
+        self.assertGreater(self.alone(self.long()), 22 * GIB)
+        self.assertLess(self.alone(self.long()), 25 * GIB)                         # but it fits alone
         self.assertEqual(local_governor.request_tokens(c, SHORT_IN, SHORT_MAX), 8512)
         # no max_tokens: the backend's default output is reserved
         self.assertEqual(local_governor.request_tokens(c, 2, None), 2 + 32768)
         self.assertEqual(local_governor.max_seqs(c), 8)
 
-    def test_two_128k_requests_fit_the_4bit_budget_and_a_third_does_not(self):
-        t1, t2 = self.a.try_acquire(self.long())[0], self.a.try_acquire(self.long())[0]
+    def test_one_128k_request_fits_the_4bit_budget_and_a_second_waits(self):
+        t1 = self.take(self.long())[0]
         self.assertIsNotNone(t1)
-        self.assertIsNotNone(t2)
-        ticket, snap = self.a.try_acquire(self.long())
+        ticket, snap = self.take(self.long())
         self.assertIsNone(ticket)
         self.assertEqual(snap["refused"], "busy")                    # it fits alone: retryable, not too_large
-        self.assertTrue(snap["reason"].startswith("memory budget: 5.7 GiB free, request needs 9.6 GiB"), snap)
-        self.assertEqual((snap["inflight"], snap["limit"]), (2, 8))  # the count had room: the bytes refused it
-        self.assertEqual(snap["reserved_bytes"], 2 * self.long())
-        self.assertEqual(snap["free_bytes"], 25 * GIB - 2 * self.long())
+        self.assertTrue(snap["reason"].startswith("memory budget: 1.1 GiB free, request needs"), snap)
+        self.assertEqual((snap["inflight"], snap["limit"]), (1, 8))  # the count had room: the bytes refused it
+        self.assertEqual(snap["reserved_bytes"], self.alone(self.long()))
+        self.assertEqual(snap["free_bytes"], 25 * GIB - self.alone(self.long()))
         t1.release()
-        self.assertIsNotNone(self.a.try_acquire(self.long())[0])     # a long one ended: room for another
+        self.assertIsNotNone(self.take(self.long())[0])              # the long one ended: room for another
 
-    def test_eight_short_requests_fit_while_idle(self):
-        held = [self.a.try_acquire(self.short())[0] for _ in range(8)]
+    def test_eight_short_requests_fit_while_idle_and_reserve_exactly_what_they_did(self):
+        loads = [self.short() for _ in range(8)]
+        held = [self.take(x)[0] for x in loads]
         self.assertTrue(all(held))
+        # the old per-request sum is at least the computed set peak here, so it stands byte for byte
+        self.assertEqual(self.a.reserved, 8 * local_governor.tokens_bytes(self.c, 8512))
         self.assertLessEqual(self.a.reserved, 25 * GIB)
-        ticket, snap = self.a.try_acquire(self.short())
+        ticket, snap = self.take(self.short())
         self.assertIsNone(ticket)
         self.assertEqual(snap["reason"], "owner idle")               # the ninth is refused by the count, not bytes
         self.assertEqual(snap["free_tokens"], 0)                     # full: no room reported
 
-    def test_a_mix_of_long_and_short(self):
-        longs = [self.a.try_acquire(self.long())[0] for _ in range(2)]
-        shorts = [self.a.try_acquire(self.short())[0] for _ in range(2)]
-        self.assertTrue(all(longs + shorts))                         # 2 x 9.65 + 2 x 2.17 = 23.6 GiB of 25
-        ticket, snap = self.a.try_acquire(self.short())
-        self.assertIsNone(ticket)                                    # a third short does not fit beside two long
+    def test_a_short_request_waits_beside_a_long_one(self):
+        # the decode batch pads every row to the longest: a short turn beside a 128k one holds 128k of KV
+        long = self.take(self.long())[0]
+        ticket, snap = self.take(self.short())
+        self.assertIsNone(ticket)
         self.assertIn("memory budget", snap["reason"])
-        self.assertEqual(snap["inflight"], 4)
-        self.assertLess(snap["free_tokens"], 8512)
-        longs[0].release()
-        more = [self.a.try_acquire(self.short())[0] for _ in range(4)]
-        self.assertTrue(all(more))                                   # one long gone: four shorts in its place
-        self.assertEqual(self.a.inflight, 7)
-        # one long and several short: a second long no longer fits beside them
-        self.assertIsNone(self.a.try_acquire(self.long())[0])
+        self.assertEqual(snap["refused"], "busy")
+        long.release()
+        shorts = [self.take(self.short())[0] for _ in range(4)]
+        self.assertTrue(all(shorts))                                 # the long one gone: short ones run together
+        self.assertIsNone(self.take(self.long())[0])                 # and a long one waits beside them
+        self.assertEqual(self.a.inflight, 4)
 
     def test_the_owner_and_pressure_caps_still_apply_when_bytes_fit(self):
         self.g.set(idle_s=5)                                         # owner active: 2, though 8 short would fit
-        held = [self.a.try_acquire(self.short())[0] for _ in range(2)]
+        held = [self.take(self.short())[0] for _ in range(2)]
         self.assertTrue(all(held))
-        self.assertEqual(self.a.try_acquire(self.short())[1]["reason"], "owner active")
+        self.assertEqual(self.take(self.short())[1]["reason"], "owner active")
         for t in held:
             t.release()
         self.g.set(idle_s=3600, pressure="warn")                     # the safety net: 1 at once whatever the bytes
-        self.assertIsNotNone(self.a.try_acquire(self.short())[0])
-        self.assertEqual(self.a.try_acquire(self.short())[1]["reason"], "memory pressure warn")
+        self.assertIsNotNone(self.take(self.short())[0])
+        self.assertEqual(self.take(self.short())[1]["reason"], "memory pressure warn")
         self.g.set(pressure="critical")
-        self.assertIsNone(self.a.try_acquire(self.short())[0])
+        self.assertIsNone(self.take(self.short())[0])
 
-    def test_a_single_request_that_fits_alone_is_admitted_when_nothing_runs(self):
+    def test_the_six_bit_copy_refuses_a_full_context_turn_non_retryably(self):
         six = local_governor.Admission(FixedGovernor(idle_s=3600, idle_cap=6, weights_bytes=int(22.4 * GIB)))
-        first, snap = six.try_acquire(self.long())                   # 17.6 GiB free: one 128k request (9.65)
+        ticket, snap = self.take(self.long(six), six)                # 17.6 GiB beside the weights: never fits
+        self.assertEqual((ticket, snap["refused"]), (None, "too_large"))
+        self.assertEqual(snap["fit_tokens"], local_governor.text_room(six.governor.cfg, [],
+                                                                      int(40 * GIB - int(22.4 * GIB))))
+        self.assertLess(snap["fit_tokens"], 131072)
+        first = self.take(six.text_load(40_000, 32_000), six)[0]     # a 72k-token turn fits alone
         self.assertIsNotNone(first)
-        ticket, snap = six.try_acquire(self.long())
-        self.assertEqual((ticket, snap["refused"]), (None, "busy"))  # not two
-        first.release()
-        self.assertIsNotNone(six.try_acquire(self.long())[0])
 
     def test_a_request_too_large_to_ever_fit_is_refused_non_retryably(self):
         small = local_governor.Admission(FixedGovernor(idle_s=3600, memory_budget_bytes=20 * GIB))   # 5 GiB room
-        ticket, snap = small.try_acquire(small.request_bytes(LONG_IN, LONG_MAX))
+        ticket, snap = self.take(self.long(small), small)
         self.assertIsNone(ticket)
         self.assertEqual(snap["refused"], "too_large")               # with nothing in flight: never
         self.assertIn("more than the 5.0 GiB budget beside the weights", snap["reason"])
         self.assertEqual(small.inflight, 0)
-        self.assertEqual(snap["fit_tokens"], (5 * GIB - int(0.15 * GIB) - int(1.5 * GIB)) // 65536)
-        self.assertIsNotNone(small.try_acquire(small.request_bytes(SHORT_IN, SHORT_MAX))[0])
+        self.assertEqual(snap["fit_tokens"], local_governor.text_room(small.governor.cfg, [], 5 * GIB))
+        self.assertIsNotNone(self.take(self.short(small), small)[0])
 
     def test_release_gives_back_once(self):
-        t = self.a.try_acquire(self.long())[0]
+        t = self.take(self.long())[0]
         t.release()
         t.release()                                                  # a second path calling it: no double free
         self.assertEqual((self.a.inflight, self.a.reserved), (0, 0))
-        other = self.a.try_acquire(self.short())[0]
+        other = self.take(self.short())[0]
         t.release()
-        self.assertEqual((self.a.inflight, self.a.reserved), (1, self.short()))
+        self.assertEqual((self.a.inflight, self.a.reserved), (1, self.alone(self.short())))
         other.release()
+        self.assertEqual((self.a.inflight, self.a.reserved), (0, 0))
+
+    def test_the_set_keeps_its_peak_until_it_drains_then_starts_afresh(self):
+        long = self.take(self.long())[0]
+        long.release()                                               # drained: nothing of the long one is kept
+        self.assertEqual((self.a._high_water, self.a._peak, self.a.reserved), (0, (0, 0), 0))
+        held = [self.take(self.short())[0] for _ in range(3)]
+        reserved = self.a.reserved
+        held[0].release()     # recomputed over the two left at the set's peak (the backend's batch shrinks lazily)
+        self.assertEqual(self.a.reserved, local_governor.text_set_bytes(
+            self.c, [h.load for h in held[1:]], self.a._high_water, self.a._peak)["total"])
+        self.assertLessEqual(self.a.reserved, reserved)
+        for h in held[1:]:
+            h.release()
+        self.assertEqual(self.a.reserved, 0)
 
     def test_the_count_slot_and_the_bytes_are_taken_together(self):
-        held = [self.a.try_acquire(self.long())[0] for _ in range(2)]       # 19.3 of 25 GiB
-        ticket, snap = self.a.try_acquire(self.long())                      # busy on bytes: retryable
+        held = self.take(self.long())[0]
+        ticket, snap = self.take(self.long())                        # busy on bytes: retryable
         self.assertEqual((ticket, snap["refused"]), (None, "busy"))
-        self.assertEqual((self.a.inflight, self.a.reserved), (2, 2 * self.long()))   # nothing taken
-        ticket, snap = self.a.try_acquire(26 * GIB)                         # never fits: not retryable
+        self.assertEqual((self.a.inflight, self.a.reserved), (1, self.alone(self.long())))   # nothing taken
+        ticket, snap = self.a.try_acquire(26 * GIB)                  # never fits: not retryable
         self.assertEqual((ticket, snap["refused"], snap["request_bytes"]), (None, "too_large", 26 * GIB))
-        self.assertEqual((self.a.inflight, self.a.reserved), (2, 2 * self.long()))
-        for h in held:
-            h.release()
+        self.assertEqual((self.a.inflight, self.a.reserved), (1, self.alone(self.long())))
+        held.release()
         self.assertEqual((self.a.inflight, self.a.reserved), (0, 0))
 
     def test_a_full_count_refuses_with_the_owner_reason_and_never_fits_wins_over_it(self):
         active = local_governor.Admission(FixedGovernor(idle_s=5))          # owner active: 2
-        slots = [active.try_acquire(self.short())[0] for _ in range(2)]
-        ticket, snap = active.try_acquire(self.short())
+        slots = [self.take(self.short(active), active)[0] for _ in range(2)]
+        ticket, snap = self.take(self.short(active), active)
         self.assertEqual((ticket, snap["refused"], snap["reason"]), (None, "busy", "owner active"))
         ticket, snap = active.try_acquire(26 * GIB)                         # full count, but it could never fit
         self.assertEqual((ticket, snap["refused"]), (None, "too_large"))
-        self.assertEqual((active.inflight, active.reserved), (2, 2 * self.short()))
+        self.assertEqual((active.inflight, active.reserved), (2, 2 * local_governor.tokens_bytes(self.c, 8512)))
         for t in slots:
             t.release()
         self.assertEqual((active.inflight, active.reserved), (0, 0))
         free = local_governor.Admission(None)                               # no governor: unlimited, no bytes
+        self.assertIsNone(free.text_load(LONG_IN, LONG_MAX))
         t, _ = free.try_acquire(10 ** 15)
         self.assertEqual((free.inflight, free.reserved), (1, 0))
         t.release()
         self.assertEqual(free.inflight, 0)
 
     def test_concurrent_acquires_never_overshoot_either_bound_and_release_exactly_once(self):
-        # 40 threads at once, no counting anywhere: the bytes admit two 128k turns, the count (owner active) two short
-        for admission, size, want in ((self.a, self.long(), 2),
-                                      (local_governor.Admission(FixedGovernor(idle_s=5)), self.short(), 2)):
+        # 40 threads at once, no counting anywhere: the bytes admit one 128k turn, the count (owner active) two short
+        for admission, make, want in ((self.a, self.long, 1),
+                                      (local_governor.Admission(FixedGovernor(idle_s=5)), self.short, 2)):
             go, got = threading.Barrier(40), []
 
             def one():
                 go.wait(5)
-                got.append(admission.try_acquire(size)[0])
+                got.append(self.take(make(admission), admission)[0])
             threads = [threading.Thread(target=one) for _ in range(40)]
             for t in threads:
                 t.start()
@@ -358,21 +386,26 @@ class ByteBudgetTests(unittest.TestCase):
                 t.join(5)
             admitted = [t for t in got if t is not None]
             self.assertEqual(len(admitted), want)
-            self.assertEqual((admission.inflight, admission.reserved), (want, want * size))
+            self.assertEqual(admission.inflight, want)
+            self.assertEqual(admission.reserved,
+                             local_governor.text_set_bytes(self.c, [t.load for t in admitted])["total"])
             for t in admitted + admitted:                                   # every ticket released twice
                 t.release()
             self.assertEqual((admission.inflight, admission.reserved), (0, 0))
 
     def test_the_report_carries_bytes_and_token_room(self):
-        t = self.a.try_acquire(self.long())[0]
+        t = self.take(self.long())[0]
         snap = self.a.snapshot()
-        self.assertEqual(snap["reserved_bytes"], self.long())
-        self.assertEqual(snap["free_bytes"], 25 * GIB - self.long())
+        self.assertEqual(snap["reserved_bytes"], self.alone(self.long()))
+        self.assertEqual(snap["free_bytes"], 25 * GIB - self.alone(self.long()))
         self.assertEqual(snap["fit_tokens"], 131072)                  # anything up to the context fits alone
-        self.assertEqual(snap["free_tokens"], 131072)                 # and a second 128k fits beside it
-        self.a.try_acquire(self.long())
-        self.assertLess(self.a.snapshot()["free_tokens"], 131072)
+        self.assertEqual(snap["free_tokens"], 0)                      # nothing fits beside a 128k turn (padding)
         t.release()
+        self.take(self.short())
+        room = self.a.snapshot()["free_tokens"]
+        self.assertGreater(room, 8512)
+        self.assertLess(room, 131072)
+        self.assertEqual(room, local_governor.text_room(self.c, list(self.a._loads), 25 * GIB))
 
 
 # ----------------------------------------------------------------------------------------------------- backend config
@@ -439,7 +472,7 @@ class ConfigTests(unittest.TestCase):
         self.example["vllm_mlx"]["models"]["qwen-27b-6bit"]["path"] = "/models/q6"
         c = local_backend.load(self.write(self.example))
         argv = local_backend.serve_argv(c)
-        self.assertEqual(argv[5:7], ["serve", "/models/q6"])                 # after the guard's own arguments
+        self.assertEqual(argv[9:11], ["serve", "/models/q6"])                # after the guard's own arguments (#126: text flags)
         self.assertEqual(argv[argv.index("--max-num-seqs") + 1], "6")      # the 6-bit entry's own idle cap
         self.assertEqual(c["governor"]["weights_bytes"], int(22.4 * GIB))      # measured, no longer a placeholder
         self.assertEqual(c["governor"]["default_max_tokens"], 32768)          # vllm_mlx.serve.max_tokens
@@ -1027,21 +1060,20 @@ class MlxGateBytesTests(MlxGateHarness):
         self.assertEqual(results[0][0], 200)
         self.assertTrue(self.free())
 
-    def test_two_long_turns_run_and_a_third_is_a_retryable_529_naming_memory(self):
+    def test_a_long_turn_runs_and_a_second_is_a_retryable_529_naming_memory(self):
+        # #126: a 128k text turn reserves its computed peak (24.6 GiB of the 25), so a second one waits
         a, _ = self.held(LONG_MSG)
-        b, _ = self.held(LONG_MSG)
         code, raw, headers = self.call("/v1/messages", LONG_MSG)
         self.assertEqual(code, 529)
         self.assertEqual({k.lower(): v for k, v in headers.items()}["retry-after"], "5")
         data = json.loads(raw)
         self.assertTrue(data["error"]["message"].startswith(local_gate.BUSY_MESSAGE))
         self.assertIn("memory budget", data["error"]["message"])
-        self.assertEqual(data["cortados_gate"]["inflight"], 2)
-        self.assertEqual(len(turns()), 2)
-        self.assertGreaterEqual(data["cortados_gate"]["free_tokens"], 8512)   # a short one still fits beside them
+        self.assertEqual(data["cortados_gate"]["inflight"], 1)
+        self.assertEqual(len(turns()), 1)
+        self.assertEqual(data["cortados_gate"]["free_tokens"], 0)     # the decode batch would pad a short one to 128k
         FakeVllm.hold.set()
         a.join(5)
-        b.join(5)
         self.assertTrue(self.free())
 
     def test_released_after_a_backend_error(self):
@@ -1378,16 +1410,17 @@ class MlxGateBoundTests(MlxGateHarness):
 
     def test_token_dense_input_is_not_over_admitted(self):
         # an earlier review's case: 100,000 chars of `a!` are 100,000 tokens. The old chars / 3.5 estimate (29,103
-        # tokens) admitted 7 at once; each really holds ~7.9 GiB, so 3 fit in 25 GiB and no more.
+        # tokens) admitted 7 at once. #126: each holds its 100k-token KV twice over plus its prefill chunk's scores
+        # (~19 GiB computed), so one fits in 25 GiB and no more.
         body = dense_msg()
-        held = [self.held(body) for _ in range(3)]
-        self.assertEqual(self.gate.admission.reserved, 3 * self.expect(json.dumps(body).encode(), 1024))
+        held = [self.held(body)]
+        self.assertEqual(self.gate.admission.reserved, self.expect(json.dumps(body).encode(), 1024))
         self.assertLessEqual(self.gate.admission.reserved, 25 * GIB)
         for _ in range(4):
             code, raw, _ = self.call("/v1/messages", body)
             self.assertEqual(code, 529)
             self.assertIn("memory budget", json.loads(raw)["error"]["message"])
-        self.assertEqual((self.gate.admission.inflight, len(turns())), (3, 3))
+        self.assertEqual((self.gate.admission.inflight, len(turns())), (1, 1))
         self.assertEqual(FakeVllm.seen, turns())                         # nothing but the turns reached the backend
         FakeVllm.hold.set()
         for t, _ in held:
@@ -1460,17 +1493,17 @@ class MlxGateBoundTests(MlxGateHarness):
     def test_a_refused_turn_takes_nothing(self):
         # busy on bytes (529) and never fits (413): neither the count slot nor any bytes are held afterwards
         body = dense_msg()
-        held = [self.held(body) for _ in range(3)]                       # 3 x ~7.9 GiB of the 25 GiB
+        held = [self.held(body)]                                         # ~19 GiB computed of the 25 GiB (#126)
         reserved = self.gate.admission.reserved
         code, raw, _ = self.call("/v1/messages", body)
         self.assertEqual(code, 529)
         self.assertIn("memory budget", json.loads(raw)["error"]["message"])
-        self.assertEqual((self.gate.admission.inflight, self.gate.admission.reserved), (3, reserved))
+        self.assertEqual((self.gate.admission.inflight, self.gate.admission.reserved), (1, reserved))
         too_big = {**dense_msg(), "max_tokens": 10 ** 6}                 # ~1.1M tokens: more than the whole budget
         self.governor.cfg = {**self.governor.cfg, "context_tokens": 10 ** 6}
         code, raw, headers = self.call("/v1/messages", too_big)
         self.assertEqual(code, 413)
-        self.assertEqual((self.gate.admission.inflight, self.gate.admission.reserved), (3, reserved))
+        self.assertEqual((self.gate.admission.inflight, self.gate.admission.reserved), (1, reserved))
         FakeVllm.hold.set()
         for t, _ in held:
             t.join(5)
@@ -1505,7 +1538,10 @@ class MlxGateBoundTests(MlxGateHarness):
         body = {"model": TAG, "max_tokens": 1, "messages": [{"role": "user", "content": "a!" * 100000}]}
         self.assertEqual(local_governor.input_tokens(json.dumps(body).encode(), CONTEXT), CONTEXT)
         t, results = self.held(body)
-        self.assertEqual(self.gate.admission.reserved, local_governor.tokens_bytes(self.governor.cfg, CONTEXT))
+        cfg = self.governor.cfg                                           # the whole context, as #126 computes it
+        self.assertEqual(self.gate.admission.reserved,
+                         local_governor.text_set_bytes(cfg, [local_governor.text_load(cfg, CONTEXT, 1)])["total"])
+        self.assertEqual(self.gate.admission.reserved, self.gate.admission.request_bytes(CONTEXT, 1))
         FakeVllm.error = (413, {"detail": f"{local_backend.GUARD_REFUSAL} (prompt 200017 tokens + max_tokens 1 = "
                                           "200018, over the 131072-token context)"})
         FakeVllm.hold.set()

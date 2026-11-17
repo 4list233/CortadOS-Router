@@ -907,6 +907,13 @@ reserved = tokens × kv_bytes_per_token + per_seq_state_bytes + prefill_margin_b
 admit    iff  count < count limit  and  reserved in flight + reserved ≤ memory_budget_bytes − weights_bytes
 ```
 
+**Since #126 this per-request formula is a floor on the served text-only model, not the reservation.** Its text turns
+are reserved as one set, from the computed peak of the guard's chunked prefill and of the decode batch, which pads
+every request's KV cache to the longest one. That peak is never less than this formula's sum. "Text prefill and the
+text route's reservation (#126)" below has the formula, the numbers and what changed. A vision model's turns (#125)
+still reserve per request, as here. The tables in this section are the per-request numbers: the floor on the text-only
+model, and the reservation on a vision model.
+
 **The input bound** (`local_governor.input_tokens`). A turn's input tokens are bounded from above, never estimated and
 never asked of the backend:
 
@@ -1002,8 +1009,8 @@ for ~20 messages and 40 blocks:
 
 The count limit applies on top: 2 with the owner active, 8 idle (6 for the 6-bit), 1 under warn pressure. So:
 
-- Two full 128k turns still run at once at 4-bit; a third waits (529). This is the same as before, since long turns
-  were already capped.
+- (Before #126.) Two full 128k turns ran at once at 4-bit. On the text-only model a full 128k turn now reserves 24.6
+  GiB alone, and nothing else runs beside it (#126, below).
 - With the owner active, every row admits at least 2 by bytes, so short turns are limited by the count cap first.
 - With the owner idle, bytes limit before the count of 8 except for small turns with small max_tokens. A turn with
   vllm-mlx's default max_tokens (32k, as Claude Code sends) reserves ≥ 4.2 GiB whatever its size.
@@ -1106,11 +1113,17 @@ recurrent; vllm-mlx keeps the KV cache unquantized, fp16):
 | `weights_bytes` | 15 GiB (4-bit); 22.4 GB (6-bit, measured idle) | resident weights |
 | `kv_bytes_per_token` | 65,536 | 16 full-attention layers × K/V × 4 KV heads × head_dim 256 × 2 bytes; 128k tokens = 8 GiB |
 | `per_seq_state_bytes` | 0.15 GiB | the recurrent layers' state per sequence |
-| `prefill_margin_bytes` | 1.5 GiB | prefill activations and allocator slack: the 6-bit copy used 2.3 GB over idle for one ~9k-token request, KV + state explain ~0.7 GiB |
+| `prefill_margin_bytes` | 1.5 GiB | prefill activations and allocator slack: the 6-bit copy used 2.3 GB over idle for one ~9k-token request, KV + state explain ~0.7 GiB. Since #126 the per-request floor on the text-only model (its text turns reserve the computed set peak, "Text prefill" below) |
 | `context_tokens` | 131072 | the Pro block's `context_length` on the provider host; tokens are capped here |
+| `text_prefill_chunk_tokens` | 256 | #126: the guard's text prefill chunk (`--text-prefill-tokens`; upstream 2,048); the score term is linear in it |
+| `text_score_buffers` | 4 | #126: score-sized buffers per chunk (q·kᵀ, masked copy, softmax, one for the allocator); computed, to be measured |
+| `kv_copies` | 2 | #126: the padded decode batch's KV and one replaced copy; at least 2 |
+| `buffer_cache_bytes` | 512 MiB | #126: MLX's buffer cache limit as the guard sets it (`--buffer-cache-bytes`; upstream 90% of the GPU working set); a recycling threshold, so one largest buffer is counted on top |
 
-What that admits, in RESERVED tokens (the bound's, not a turn's real size; "The cost" above maps one to the other;
-owner idle, pressure normal; 25 GiB beside the 4-bit weights, 17.6 GiB beside the 6-bit):
+What the per-request formula admits, in RESERVED tokens (the bound's, not a turn's real size; "The cost" above maps one
+to the other; owner idle, pressure normal; 25 GiB beside the 4-bit weights, 17.6 GiB beside the 6-bit). On the
+text-only model these are superseded by #126's set reservation ("Text prefill", below). Only the short rows still
+stand there, byte for byte:
 
 | Mix | Reserved | 4-bit | 6-bit |
 |---|---|---|---|
@@ -1194,6 +1207,151 @@ S1's route stands ("routes elsewhere"). A turn the gate still refuses:
   sensitive request or bind, a pin or a continuation gets the node's error as before.
 
 The refusal fallback (`local_lane.complete`) treats a busy, too-large or text-only refusal as an unavailable node.
+
+### Text prefill and the text route's reservation (#126)
+
+**What the released code does** (vllm-mlx 0.6.0, mlx-lm 0.31.3, MLX 0.32.4; read from the PyPI wheels and MLX's
+v0.32.4 source, never run). On a text-only model, `Scheduler._create_batch_generator` (`scheduler.py` 1518-1600) builds
+mlx-lm's `BatchGenerator` with vllm-mlx's `--prefill-step-size` (default **2,048**, not 1,024 as #126 first said) and
+`--prefill-batch-size` (default 8).
+
+- **Chunking: yes, at 2,048, up to 8 prompts together.** `PromptProcessingBatch.prompt` (`generate.py` 1124-1170)
+  runs the model over at most `prefill_step_size` tokens at a time for every prompt in the prompt batch, right-padded
+  to the longest, against one `BatchKVCache`. Between steps it evaluates the cache state and clears MLX's cache.
+- **Full-vocabulary logits: no.** The prefill evaluates only `[c.state for c in cache]`, so the vocabulary projection
+  of prompt positions is never computed (MLX is lazy). The last prompt token goes to the first decode step, which keeps
+  `logits[:, -1, :]` of a one-token input. Nothing like #125's 27.8 GiB of logits exists on this route.
+- **Attention scores: unfused, per chunk against the whole prompt.** qwen3_5's full-attention layers
+  (`qwen3_next.Qwen3NextAttention`) call `mx.fast.scaled_dot_product_attention` with the batch cache's boolean mask.
+  MLX 0.32.4's `use_fallback` (`scaled_dot_product_attention.cpp` 1390-1462) takes the unfused path for head_dim 256
+  below 1,024 query tokens. Above that it does so too, unless the GPU has neural accelerators or the chunk is the first
+  one. The fallback (`fast.cpp`) builds bfloat16 `q·kᵀ`, a masked copy and a softmax of Hq × chunk × context each.
+  At the upstream step, a buffer is up to **8 × 24 × 2,048 × 131,072 × 2 bytes = 96 GiB** (12 GiB for one prompt). The
+  issue's "6 GiB a buffer" was one prompt at 1,024.
+- **The decode batch pads.** `GenerationBatch.extend` → `BatchKVCache.extend` (`cache.py` 1035-1078) pads every row's
+  KV to the longest row. So n requests beside a 128k one hold n × 128k of KV, not the sum of their lengths. The
+  per-request formula above is not a bound for a mixed set.
+- **KV growth.** `KVCache` / `BatchKVCache` grow by 256 positions by concatenation. A request joining or leaving the
+  batch (`extend`, `filter`) and a finished request's extracted row (`extract`) each build a new copy beside the old
+  one. vllm-mlx sets MLX's buffer cache limit to 90% of the GPU's working set (`engine/batched.py`
+  `_resolve_metal_buffer_cache_limit`), so freed copies stayed resident until the next periodic clear (every ≤ 32
+  scheduler steps).
+- **The gated-delta state.** Per sequence, 48 linear-attention layers × 48 × 128 × 128 float32 (`gated_delta.py` 279)
+  plus the conv state = 0.144 GiB, under `per_seq_state_bytes` (0.15 GiB). It is copied when the batch is reshaped.
+
+**What the guard changes** (`cortados_vllm_mlx_guard.py` "Text prefill"; flags from `local_backend.text_argv`):
+
+- Every `BatchGenerator` the Scheduler builds prefills **one sequence at a time**, in chunks of at most
+  `text_prefill_chunk_tokens` (256): `prefill_batch_size = 1`, `prefill_step_size` and the prompt batch's own step
+  clamped. vllm-mlx also gets `--prefill-step-size 256 --prefill-batch-size 1`, but the runtime clamp is the proof. A
+  generator without that layout, or a model other than mlx-lm's `qwen3_5`, fails the request instead of prefilling it.
+- MLX's buffer cache limit is set to `buffer_cache_bytes` (512 MiB, `--buffer-cache-bytes`). The limit is a
+  recycling threshold, not a hard cap. MLX's allocator (`allocator.cpp` `free`) caches a whole freed buffer whenever
+  the cache is under the limit, and trims back to the limit on the next allocation. So the cache holds at most the
+  limit plus one buffer, and the reservation counts both (`buffer_cache` + `cache_overshoot`). A replaced KV copy or
+  score buffer no longer stays resident until the next periodic clear.
+- **Same outputs.** A chunk boundary only splits the prompt into causal attention against the cached keys plus the
+  gated-delta and conv state carried in the cache. That is the path upstream already takes at 2,048. Not batching
+  prefills is a scheduling choice: each row was already masked to its own tokens. Floating-point results can differ
+  at the rounding level, as between any two chunk sizes, because GEMM tiling depends on the chunk's rows. No token is
+  dropped or reordered. The cost is prefill speed: more, smaller steps, and concurrent prompts prefill one after
+  another. Not measured.
+- **Pinned.** mlx-lm 0.31.3 (`MLX_LM_PINNED_SHA256`, from the wheel `mlx_lm-0.31.3-py3-none-any.whl`, sha256
+  `758cfddf…83b8`): `generate.py`, `sample_utils.py`, `models/cache.py`, `models/base.py`, `models/qwen3_5.py`,
+  `models/qwen3_next.py`, `models/gated_delta.py`, `models/activations.py`, `models/rope_utils.py`,
+  `models/switch_layers.py`, and `__init__.py`, `_version.py`, `models/__init__.py`. The vllm-mlx files are the text
+  route's existing pins (`scheduler.py`, `engine/batched.py`, `engine_core.py`). The text route now also requires
+  `mlx` / `mlx-metal` 0.32.4 (`verify_mlx`, as vision mode does), because the attention fallback and the allocator are
+  in the compiled library. And `config.json` must be the verified text geometry (`check_text_model`, `TEXT_DIMS`: the
+  language dimensions above, 64 layers, full attention every 4th, dense, bfloat16). This is checked at `--check` and
+  before `serve`. Any drift stops startup.
+
+**The reservation** (`local_governor.text_set_bytes`). Every text turn on the text-only model joins one set; the
+gate admits it while the set's total fits beside the weights. Notation: n = turns in the set; M = the longest turn's
+tokens (input bound + max_tokens, capped) + 256; P = a turn's prompt bound (its input bound, capped at the context);
+C = min(256, P); a = 2; Hq 24, Hkv 4, D 256, V 248,320; width = 314,112 bytes per token and layer. M also covers
+the widest turn admitted since the set was last empty (a high-water mark, #126 review). When the longest row leaves
+the decode batch, `BatchKVCache.filter` (`cache.py` 1016-1033) gathers the survivors at the old width and slices the
+padding off. The slice is a view, so the wide buffer stays alive until the batch grows, a turn joins, or the batch
+empties. The gate cannot see that moment, so it keeps the width until no text turn runs. For the same reason (review
+round 2), the set's rows × width (n × M, "cells") and its `cache_overshoot` never shrink while any text turn runs.
+filter's gather is lazy: it is evaluated on the survivors' next step, so a batch of eight can outlive seven finished
+tickets. And the buffer the cache overshoots by can be a departed turn's. Both reset when the set drains: an empty
+batch holds nothing, and vllm-mlx clears MLX's cache when requests finish (`scheduler.py` `_cleanup_finished`).
+
+| term | bytes | what it holds |
+| --- | --- | --- |
+| kv | kv_copies (2) × n × M × 65,536 | the decode batch, every row padded to the longest, and one replaced copy |
+| decode | 4 × Hq × n × M × a + n × M | one decode step's attention rows and mask against the padded batch |
+| fixed | n × (2 × per_seq_state_bytes + V × (a + 8)) | each turn's recurrent state and one copy; its decode row's logits and float32 log-probabilities |
+| prefill | max over the set of: 4 × Hq × C × P × a + 2 × C × P + 2 × C × width + 8 × P | ONE prompt's chunk at a time: unfused scores (q·kᵀ, masked copy, softmax, one for the allocator), the boolean mask and its left-padding product, one layer's activations doubled for the allocator, the prompt's ids |
+| buffer_cache | buffer_cache_bytes (512 MiB) | MLX's buffer cache limit as the guard sets it, once while anything runs |
+| cache_overshoot | max(Hq × C × P × a, n × M × Hkv × D × a), P the longest prompt | the one buffer the cache can hold over its limit: a chunk's score buffer, or one layer's K (or V) of the padded batch |
+| **total** | max(sum of the above, the per-request formula summed) | the old reservation stands, byte for byte, wherever it was already at least the computed peak |
+
+width is the larger layer: the MLP's gate, up and product plus the residual, norms and output: 2 × (3 × 17,408 + 4 ×
+5,120). Plus the linear-attention layer: in_proj_qkv, the conv input and output (3 × 10,240), z, the gated-delta
+output, its norm and gated product (4 × 6,144), the normed q and k (2 × 2,048), all bfloat16, and the float32
+precise-swiglu and gate temporaries (4 × (2 × 6,144 + 4 × 48)). The full-attention layer is smaller (2 × (6 × 24 × 256
++ 4 × 4 × 256)).
+
+By term, one turn whose prompt is its whole context (4-bit defaults; `tests/test_text_prefill.py`):
+
+| tokens | scores | mask + chunk + ids | kv | decode + fixed | buffer cache + overshoot | **total** | old formula |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1,024 | 0.05 GiB | 0.15 GiB | 0.16 GiB | 0.30 GiB | 0.51 GiB | **1.71 GiB** (the old formula: computed 1.17) | 1.71 GiB |
+| 32,768 | 1.50 GiB | 0.17 GiB | 4.03 GiB | 0.31 GiB | 0.88 GiB | **6.88 GiB** | 3.65 GiB |
+| 65,536 | 3.00 GiB | 0.18 GiB | 8.03 GiB | 0.31 GiB | 1.25 GiB | **12.78 GiB** | 5.65 GiB |
+| 131,072 | 6.00 GiB | 0.21 GiB | 16.03 GiB | 0.33 GiB | 2.00 GiB | **24.57 GiB** | 9.65 GiB |
+
+**The maximum admitted text prompt.** 4-bit (25 GiB beside 15 GiB of weights): **the whole context**. Any prompt
+with prompt + max_tokens ≤ 131,072 fits, alone (24.57 GiB at the cap, so nothing runs beside a full-context turn). The
+6-bit copy (17.6 GiB beside 22.4 GB): at most **92,338 tokens of context** alone (`fit_tokens` reports 92,337,
+counting the prompt as the whole context). In the gate's input bound, that is 92,337 with max_tokens 1, 89,555 with
+4,096, and 70,077 with Claude Code's 32,768. Anything larger is a
+**413 never-fits** (`x-should-retry: false`), which the provider routes elsewhere. A turn that fits alone but not
+beside what runs now is a retryable **529**, as before.
+
+**What changes for current traffic** (text-only 4-bit, owner idle, count 8; per-turn size from the input bound, which
+counts ~4 body bytes per real token of code):
+
+| input bound + max_tokens | reserved before → now | fit at once before → now |
+| --- | --- | --- |
+| 1,000 + 256 | 1.73 → 1.73 GiB | 8 → 8 (the count) |
+| 8,000 + 512 (~2k real) | 2.17 → 2.49 GiB alone; 8 together reserve exactly the old 17.4 GiB | 8 → 8 |
+| 36,000 + 512 (~9k real) | 3.88 → 7.52 GiB | 6 → 4 |
+| 8,000 + 32,000 (~2k real, Claude Code) | 4.09 → 6.34 GiB | 6 → 4 |
+| 34,000 + 32,000 (~8.5k real, Claude Code) | 5.68 → 11.01 GiB | 4 → 2 |
+| 64,000 + 4,096 | 5.81 → 13.00 GiB | 4 → 2 |
+| ≥ 99k + 32,000 (the cap) | 9.65 → 24.57 GiB | 2 → 1 |
+
+A mixed set pays for its longest row: a short turn beside a 128k one now waits (529) instead of running, because it
+would hold 128k of KV in the padded batch. After a long turn, or a full batch, ends, the turns still running keep
+its width and row count in the reservation until no text turn runs. So under steady overlapping traffic, new turns may
+wait (529) longer than the set's current rows suggest. That is the price of not knowing when the backend compacts. `fit_tokens` / `free_tokens` in the capacity report are computed from
+the same set formula (`text_room`), so the provider's skip check sees the new room. Short turns are unchanged: their
+old reservation was already at least the computed peak, so it stands byte for byte (eight ~2k-token turns still run
+at once). A vision model's turns, text-only ones included, reserve exactly as in #125 (`text_route` is false there).
+
+**These are computed bounds, not measurements.** The counts `text_score_buffers` (4) and `kv_copies` (2) are the
+formula's assumptions, like the image prefill's `score_buffers`. The 6-bit copy's 2.3 GB measured over idle for one
+~9k-token request implies fewer live score buffers than 4 (at the old 2,048 step, 4 buffers would be 3.4 GiB alone).
+The acceptance gate is the Pro's peak footprint and `mx.get_peak_memory()` in the hardware test window: one full
+128k turn, a 64k turn beside short ones, and eight short turns. If a measured peak exceeds its reservation, the counts
+or the chunk are corrected before relying on them.
+
+**Not covered: the prefix cache.** vllm-mlx's own prefix cache (`MemoryAwarePrefixCache`, on by default,
+`scheduler.py` 93-99 and 1402-1432) keeps finished prompts' KV as separate copies, up to 20% of the RAM available when
+it starts (`--cache-memory-mb` unset), across requests. That pool is outside every reservation, as it was before #126.
+With ~4 GiB in it, a full-context turn's 24.57 GiB plus the pool is ~28.6 GiB beside the weights, over the 25 GiB
+budget. So the reservation is the peak of the requests in flight, not of the whole process. Closing it is an owner
+decision between prefix reuse (time to first token on multi-turn conversations) and admission room:
+
+- `--disable-prefix-cache` (already in `extra_args`' allowlist) removes the pool;
+- or a fixed `--cache-memory-mb` that the governor subtracts from the budget. A full-context turn on the 4-bit model
+  then fits only while the pool is ≤ 0.43 GiB.
+
+It is left to a follow-up issue.
 
 ### Vision: still images on the MLX lane (#125)
 
@@ -1400,11 +1558,9 @@ selecting the text entry again.
 **Not covered yet**: images inside tool results (refused, so Claude Code's image reads go elsewhere); GIF; a client whose
 max_tokens leaves no room under the 64k image context (Claude Code's 32k default leaves ~32k for text and images; a
 larger max_tokens is refused by the guard and the turn routed elsewhere); the image reservation's formula, the tower's
-resident size and the concurrency of one are provisional until measured; text-only prompts still prefill through
-vllm-mlx's own chunked text path (1,024-token chunks, last chunk's logits all projected: up to 1,024 x V x 2 = 485 MiB)
-whose unfused attention scores grow with the context (24 x 1,024 x P x 2 bytes per buffer: 6 GiB at 128k) beyond the
-1.5 GiB `prefill_margin_bytes` measured at ~9k tokens: the text reservation's long-context peak is a follow-up, not
-changed here; layer 2's refusal reaches a client as vllm-mlx's generic
+resident size and the concurrency of one are provisional until measured; text-only prompts on a vision model still
+reserve the per-request formula (#126 bounds the text-only model's text route, above; a vision model's text turns go
+through the MLLM route, which #126 did not read); layer 2's refusal reaches a client as vllm-mlx's generic
 generation error (layer 1 refuses everything layer 2 would, so it is a backstop, not a path).
 
 ### Switch the Pro to MLX
@@ -1418,7 +1574,7 @@ Owner steps; nothing here was run by the build. The provider's lane config needs
    `python3 -B -m cortados_router.local_backend --print-config`.
 2. On the Pro: `scripts/install_mlx_backend.sh --dry-run`, then `scripts/install_mlx_backend.sh` (LaunchAgent
    `com.cortados.vllm-mlx` on 127.0.0.1:8000 under the prompt guard, log `~/.cortados/vllm-mlx.log`). Both run the
-   guard's `--check`: it must print `ok (vllm-mlx 0.6.0, pinned files match, text route)`. Wait for `curl -s
+   guard's `--check`: it must print `ok (vllm-mlx 0.6.0, mlx-lm 0.31.3 and mlx / mlx-metal 0.32.4, pinned files match, only BatchedEngine may serve, text route)` (#126: the text route also needs mlx-lm 0.31.3, mlx / mlx-metal 0.32.4 and the verified text geometry in `config.json`). An already-installed LaunchAgent from before #126 runs without the text prefill bounds: reinstall it, then restart the gate. Wait for `curl -s
    http://127.0.0.1:8000/health`; the log's first line names the cap (`prompt + max_tokens capped at 131072 tokens`).
    An already-installed LaunchAgent from before the guard runs vllm-mlx without it: reinstall it before the gate runs
    with this version.

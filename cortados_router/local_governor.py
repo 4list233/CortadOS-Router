@@ -32,6 +32,12 @@ input tokens (`input_tokens()`) are an upper bound, never an estimate and never 
   which refuses a prompt whose exact token count + max_tokens exceeds context_tokens before it is scheduled.
 and a request is admitted only while the reservations in flight plus its own fit in
   memory_budget_bytes - weights_bytes.
+TEXT ROUTE (#126, a text-only model: text_route): that per-request formula is a floor, not the reservation. Text turns
+are reserved as ONE set (text_set_bytes, Admission.try_acquire's `load`): mlx-lm 0.31.3's decode batch pads every row's
+KV to the longest, so the set holds kv_copies x n x the longest context of KV, plus one prompt's prefill chunk at a time
+(the guard prefills one sequence in chunks of text_prefill_chunk_tokens: unfused scores, mask, activations; no prompt
+logits), each turn's state and decode row, and MLX's buffer cache at its limit plus one buffer; never less than the
+per-request sum, so a short turn reserves exactly what it did (docs/LOCAL-RESOURCES.md "Text prefill").
 The count slot and the bytes are taken together (Admission.try_acquire). A request a text-only model cannot read
 (non_text_content: an image, a document) is refused by the gate before admission.
 
@@ -121,14 +127,35 @@ DEFAULTS: dict[str, Any] = {
     # An unreadable pressure level counts as warn: the node keeps serving, one at a time, rather than either stopping
     # (critical) or trusting an unknown memory state (normal).
     "unknown_pressure": "warn",
+    # ---- The text route's computed reservation (#126; text_set_bytes, docs/LOCAL-RESOURCES.md "Text prefill").
+    # The guard prefills a text prompt in chunks of at most this many tokens, one sequence at a time
+    # (--text-prefill-tokens; upstream mlx-lm 0.31.3 takes vllm-mlx's --prefill-step-size, 2,048, and up to 8 sequences
+    # at once). head_dim 256 runs MLX 0.32.4's unfused attention for chunks under 1,024 tokens, so a chunk holds
+    # heads x chunk x context scores: 256 keeps them at 1.5 GiB a buffer at 128k (2,048 would be 12 GiB).
+    "text_prefill_chunk_tokens": 256,
+    # Score-sized buffers counted per chunk: MLX's fallback q.k^T, the masked copy, the softmax, and one more for the
+    # allocator (the same count as the image prefill's score_buffers).
+    "text_score_buffers": 4,
+    # Copies of the batch's KV counted: the live cache and one replaced copy. The cache's growth (256 positions at a
+    # time), a request joining or leaving the decode batch, and a finished request's extracted row each build a new
+    # copy beside the old one before the old is freed; the guard limits MLX's buffer cache (buffer_cache_bytes, plus
+    # the one buffer it may overshoot by), so a freed copy does not linger.
+    "kv_copies": 2,
+    # MLX's buffer cache limit, set by the guard (--buffer-cache-bytes; upstream vllm-mlx sets it to 90% of the GPU's
+    # working set, so freed KV copies and score buffers stayed resident until the next clear). A recycling threshold,
+    # not a hard cap: MLX caches a freed buffer whenever the cache is under it, so text_set_bytes adds one largest
+    # buffer on top (cache_overshoot). Counted once per node. 512 MiB keeps a full-context turn within the 4-bit budget.
+    "buffer_cache_bytes": GIB // 2,
 }
 # The keys a model entry may override (per-model sizing: a 6-bit copy has heavier weights and a different cap).
 MODEL_KEYS = ("idle_cap", "weights_bytes", "kv_bytes_per_token", "per_seq_state_bytes", "prefill_margin_bytes",
               "context_tokens")
 INT_KEYS = ("active_idle_s", "active_cap", "idle_cap", "warn_cap", "critical_cap", "retry_after_s",
             "memory_budget_bytes", "weights_bytes", "kv_bytes_per_token", "per_seq_state_bytes",
-            "prefill_margin_bytes", "context_tokens", "default_max_tokens")
-POSITIVE_KEYS = ("memory_budget_bytes", "weights_bytes", "kv_bytes_per_token", "context_tokens", "default_max_tokens")
+            "prefill_margin_bytes", "context_tokens", "default_max_tokens", "text_prefill_chunk_tokens",
+            "text_score_buffers", "kv_copies", "buffer_cache_bytes")
+POSITIVE_KEYS = ("memory_budget_bytes", "weights_bytes", "kv_bytes_per_token", "context_tokens", "default_max_tokens",
+                 "text_prefill_chunk_tokens", "text_score_buffers", "kv_copies", "buffer_cache_bytes")
 FLOAT_KEYS = ("sample_s",)
 # Keys of the count-only governor this replaced: refused by name, so an old config is not run on numbers that no
 # longer mean anything (the fixed per-request size could not see a 128k-token turn).
@@ -314,6 +341,10 @@ def check_config(raw: dict[str, Any] | None, model: dict[str, Any] | None = None
         raise GovernorConfigError(f"governor: unknown_pressure must be one of {', '.join(PRESSURES)}")
     if out["idle_cap"] < 1:
         raise GovernorConfigError("governor: idle_cap must be at least 1")
+    if out["kv_copies"] < 2:
+        raise GovernorConfigError("governor: kv_copies must be at least 2 (the live KV cache and one replaced copy)")
+    if out["text_prefill_chunk_tokens"] > out["context_tokens"]:
+        raise GovernorConfigError("governor: text_prefill_chunk_tokens must not exceed context_tokens")
     # The model's declared image capability (None: text-only), checked against this context.
     out["vision"] = check_vision(model.get("vision"), out)
     if out["vision"]:
@@ -688,14 +719,192 @@ def image_prefill_bytes(cfg: dict[str, Any], tokens: int, images: int) -> dict[s
     return out
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# The text route's reservation (#126; docs/LOCAL-RESOURCES.md "Text prefill"). A text-only model is served by vllm-mlx
+# 0.6.0's Scheduler on mlx-lm 0.31.3's BatchGenerator, whose memory is read from the released code:
+#   * prefill: PromptProcessingBatch.prompt (generate.py 1124-1170) runs the model over prefill_step_size tokens at a
+#     time and evaluates only the cache state (mx.eval([c.state ...]), then mx.clear_cache()), so the vocabulary
+#     projection of prompt positions is never computed; the last prompt token is fed to the first decode step, which
+#     keeps logits[:, -1, :]. Up to prefill_batch_size (8) sequences prefill together, right-padded, against one
+#     BatchKVCache. The guard makes it one sequence in chunks of text_prefill_chunk_tokens.
+#   * attention: qwen3_5's full-attention layers (qwen3_next.Qwen3NextAttention) call mx.fast.scaled_dot_product_attention
+#     with BatchKVCache's boolean array mask; MLX 0.32.4 (scaled_dot_product_attention.cpp use_fallback) takes the
+#     unfused fallback for head_dim 256 under 1,024 query tokens, which builds Hq x C x S scores in bfloat16 (fast.cpp).
+#   * decode: GenerationBatch.extend / BatchKVCache.extend (cache.py 1035-1078) pad every row's KV to the longest row,
+#     so the batch holds n x the longest sequence, not the sum of the sequences.
+#   * state: ArraysCache per linear-attention layer, the gated-delta state float32 (gated_delta.py 279) and the conv
+#     state: per_seq_state_bytes (48 layers x 48 x 128 x 128 x 4 B + conv = 0.144 GiB).
+# The dimensions are the one verified geometry (the Pro's Qwen3.8 27B text_config); the guard checks config.json
+# against TEXT_DIMS at --check and serve (cortados_vllm_mlx_guard.TEXT_DIMS has the same values).
+TEXT_DIMS: dict[str, int] = {
+    "hidden_size": 5120, "intermediate_size": 17408, "num_attention_heads": 24, "num_key_value_heads": 4,
+    "head_dim": 256, "linear_num_key_heads": 16, "linear_num_value_heads": 48, "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128, "vocab_size": 248320, "num_hidden_layers": 64, "full_attention_interval": 4,
+    "linear_conv_kernel_dim": 4, "act_bytes": 2,
+}
+TEXT_KV_STEP = 256                      # KVCache and BatchKVCache grow in steps of 256 positions (cache.py 326, 913)
+
+
+def _text_token_width(d: dict[str, int] = TEXT_DIMS) -> int:
+    """Bytes one prompt token's activations take in one layer while a chunk runs (the larger of the two layer kinds):
+    MLP gate, up and product (3I) plus residual, two norms and the layer output (4H), at act_bytes; full attention:
+    q_proj's 2 Hq D (queries and gate), the normed and rotated queries, the attention output and the gated output (4 Hq
+    D), K and V projected, normed and rotated (4 Hkv D); linear attention: in_proj_qkv, the conv input and output (3
+    conv_dim), z, the gated-delta output, its norm and the gated product (4 Vh Vd), the normed q and k (2 Kh Kd), and
+    the float32 temporaries of the precise swiglu (2 Vh Vd) and the g / beta gates (4 Vh)."""
+    a, h, i = d["act_bytes"], d["hidden_size"], d["intermediate_size"]
+    hq, hkv, hd = d["num_attention_heads"], d["num_key_value_heads"], d["head_dim"]
+    kk = d["linear_num_key_heads"] * d["linear_key_head_dim"]
+    vv = d["linear_num_value_heads"] * d["linear_value_head_dim"]
+    conv = 2 * kk + vv
+    attention = a * (6 * hq * hd + 4 * hkv * hd)
+    linear = a * (3 * conv + 4 * vv + 2 * kk) + 4 * (2 * vv + 4 * d["linear_num_value_heads"])
+    return a * (3 * i + 4 * h) + max(attention, linear)
+
+
+def text_prefill_bytes(cfg: dict[str, Any], prompt_tokens: int) -> dict[str, int]:
+    """The computed worst case, by term, of what one text prompt holds beside its KV cache and state while the guard's
+    chunked prefill runs (docs/LOCAL-RESOURCES.md "Text prefill"); "total" is their sum. P = prompt tokens (capped at
+    the context), C = min(text_prefill_chunk_tokens, P); dimensions TEXT_DIMS:
+      scores  text_score_buffers x Hq x C x P x a   one chunk's unfused attention against the whole prompt: MLX's q.k^T,
+                                                    the masked copy, the softmax, and one for the allocator
+      mask    2 x C x P                             BatchKVCache's boolean causal mask and its left-padding product
+      chunk   2 x C x width                         one layer's activations for the chunk (_text_token_width), doubled
+                                                    for the allocator
+      ids     8 x P                                 the prompt's int32 ids and one copy
+    No term for logits: prefill evaluates only the cache state, so no prompt position is projected to the vocabulary
+    (the one decode row's logits are in text_load's fixed part)."""
+    d = TEXT_DIMS
+    p = max(0, min(int(prompt_tokens), cfg["context_tokens"]))
+    c = min(cfg["text_prefill_chunk_tokens"], p)
+    out = {
+        "scores": cfg["text_score_buffers"] * d["num_attention_heads"] * c * p * d["act_bytes"],
+        "mask": 2 * c * p,
+        "chunk": 2 * c * _text_token_width(d),
+        "ids": 8 * p,
+    }
+    out["total"] = sum(out.values())
+    return out
+
+
+class TextLoad:
+    """One text request's part of the text route's reservation (text_load): its context in tokens (input bound +
+    max_tokens, capped), its prompt bound, the old per-request reservation (tokens_bytes: the floor, so a short turn
+    reserves exactly what it did), its fixed bytes and its prefill transient."""
+    __slots__ = ("tokens", "prompt", "legacy", "fixed", "prefill")
+
+    def __init__(self, tokens: int, prompt: int, legacy: int, fixed: int, prefill: int):
+        self.tokens, self.prompt, self.legacy, self.fixed, self.prefill = tokens, prompt, legacy, fixed, prefill
+
+
+def _text_load(cfg: dict[str, Any], tokens: int, prompt: int) -> TextLoad:
+    d = TEXT_DIMS
+    tokens = max(0, min(int(tokens), cfg["context_tokens"]))
+    prompt = max(0, min(int(prompt), cfg["context_tokens"]))
+    # fixed: the recurrent state and one replaced copy of it (ArraysCache.extend / filter concatenate and gather the
+    # batch's state), and the decode row's logits with their float32 log-probabilities
+    fixed = 2 * cfg["per_seq_state_bytes"] + d["vocab_size"] * (d["act_bytes"] + 8)
+    return TextLoad(tokens, prompt, tokens_bytes(cfg, tokens), fixed, text_prefill_bytes(cfg, prompt)["total"])
+
+
+def text_load(cfg: dict[str, Any], input_tokens: int, max_tokens: Any) -> TextLoad:
+    """A text request's TextLoad: its context request_tokens(), its prompt bounded by input_tokens (an upper bound,
+    capped at the context: the guard refuses a longer prompt)."""
+    return _text_load(cfg, request_tokens(cfg, input_tokens, max_tokens), input_tokens)
+
+
+def text_set_bytes(cfg: dict[str, Any], loads: list, high_water: int = 0,
+                   peak: tuple[int, int] = (0, 0)) -> dict[str, int]:
+    """The text route's reservation for the requests in flight together (`loads`, TextLoad), by term; "total" is what
+    admission compares with the budget beside the weights. n = len(loads), M = the longest context, or `high_water`
+    when larger, + TEXT_KV_STEP (a row's KV capacity is its length rounded up to the cache's 256-position step).
+    high_water is the longest context admitted since the set was last empty (Admission keeps it): when the longest row
+    leaves the decode batch, BatchKVCache.filter (cache.py 1016-1033) gathers the survivors at the old width and only
+    slices the padding off, a view that keeps the wide buffer alive until the next growth or join. `peak` is
+    (cells, overshoot), the largest n x M and cache_overshoot reached since the set was last empty (#126 review round
+    2): filter's gather is lazy (evaluated on the survivors' next step), so the old many-row batch can outlive the
+    finished requests' tickets, and a buffer the cache overshoots by can belong to a departed request. Within a set
+    those terms never shrink; vllm-mlx clears MLX's cache when requests finish (scheduler.py _cleanup_finished), and an
+    empty set holds no batch, so Admission resets them when the set drains. "cells" (n x M as counted) is returned
+    for Admission and is not a byte term:
+      kv            kv_copies x n x M x kv_bytes_per_token   the decode batch pads every row to the longest
+                                                             (BatchKVCache.extend), plus one replaced copy
+      decode        text_score_buffers x Hq x n x M x a + n x M   one decode step's attention rows and mask
+      fixed         sum of the loads' fixed bytes (state twice, the decode row's logits)
+      prefill       the largest load's text_prefill_bytes: the guard prefills one sequence at a time
+      buffer_cache  buffer_cache_bytes, MLX's buffer cache limit as the guard sets it (once, while anything runs)
+      cache_overshoot  the largest single buffer, max(Hq x C x P x a, n x M x Hkv x D x a) for the longest prompt P:
+                    MLX caches a freed buffer whenever the cache is under its limit (allocator.cpp free), so the cache
+                    can exceed the limit by one buffer until the next allocation trims it
+      computed      the sum of the above
+      legacy        the loads' old reservations summed (tokens_bytes: tokens x kv + state + prefill_margin_bytes)
+      total         max(computed, legacy): where the old reservation was already at least the computed peak, it
+                    stands, byte for byte."""
+    keys = ("kv", "decode", "fixed", "prefill", "buffer_cache", "cache_overshoot", "computed", "legacy", "total",
+            "cells")
+    if not loads:
+        return dict.fromkeys(keys, 0)
+    d = TEXT_DIMS
+    a = d["act_bytes"]
+    n = len(loads)
+    m = max(max(x.tokens for x in loads), int(high_water)) + TEXT_KV_STEP
+    p = max(x.prompt for x in loads)
+    c = min(cfg["text_prefill_chunk_tokens"], p)
+    cells = max(n * m, int(peak[0]))           # rows x row width of KV the batch may hold, as counted
+    out = {
+        "kv": cfg["kv_copies"] * cells * cfg["kv_bytes_per_token"],
+        "decode": cfg["text_score_buffers"] * d["num_attention_heads"] * cells * a + cells,
+        "fixed": sum(x.fixed for x in loads),
+        "prefill": max(x.prefill for x in loads),
+        "buffer_cache": cfg["buffer_cache_bytes"],
+        "cache_overshoot": max(d["num_attention_heads"] * c * p * a,
+                               cells * d["num_key_value_heads"] * d["head_dim"] * a, int(peak[1])),
+    }
+    out["computed"] = sum(out.values())
+    out["legacy"] = sum(x.legacy for x in loads)
+    out["total"] = max(out["computed"], out["legacy"])
+    out["cells"] = cells
+    return out
+
+
+def text_route(cfg: dict[str, Any]) -> bool:
+    """True when the served model is text-only (no `vision` block): its requests go through vllm-mlx's text
+    Scheduler, and the text route's set reservation (text_set_bytes) admits them. A vision model's requests, text-only
+    included, go through the MLLM route and reserve as before (#125)."""
+    return cfg.get("vision") is None
+
+
+def text_room(cfg: dict[str, Any], loads: list, budget: int, high_water: int = 0,
+              peak: tuple[int, int] = (0, 0)) -> int:
+    """The most tokens of context (prompt as long as the context: the worst case) one more text request may hold
+    beside `loads` (and their high_water) within `budget` bytes, 0 when not even an empty one fits. Monotone in the
+    tokens, so a bisection."""
+    def fits(t: int) -> bool:
+        return text_set_bytes(cfg, [*loads, _text_load(cfg, t, t)], high_water, peak)["total"] <= budget
+    if not fits(0):
+        return 0
+    lo, hi = 0, cfg["context_tokens"]
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
 def request_bytes(cfg: dict[str, Any], input_tokens: int, max_tokens: Any, images: int = 0) -> int:
-    """request_tokens as a reservation in bytes (module docstring). An image-bearing request reserves its KV cache and
-    state plus image_prefill_bytes (no fixed margins); a text-only one tokens_bytes, unchanged."""
-    tokens = request_tokens(cfg, input_tokens, max_tokens, images)
-    if images and cfg.get("vision"):
+    """request_tokens as a reservation in bytes (module docstring), the request alone. An image-bearing request
+    reserves its KV cache and state plus image_prefill_bytes (no fixed margins). A text-only request on a text-only
+    model (text_route) the text route's set reservation of it alone (text_set_bytes; admission computes it over the
+    whole set in flight, Admission.try_acquire's `load`); on a vision model tokens_bytes, unchanged."""
+    if images:
+        tokens = request_tokens(cfg, input_tokens, max_tokens, images)     # ValueError without a vision policy
         return tokens * cfg["kv_bytes_per_token"] + cfg["per_seq_state_bytes"] \
             + image_prefill_bytes(cfg, tokens, images)["total"]
-    return tokens_bytes(cfg, tokens)
+    if text_route(cfg):
+        return text_set_bytes(cfg, [text_load(cfg, input_tokens, max_tokens)])["total"]
+    return tokens_bytes(cfg, request_tokens(cfg, input_tokens, max_tokens, images))
 
 
 def max_seqs(cfg: dict[str, Any]) -> int:
@@ -785,8 +994,8 @@ class Ticket:
     """One admitted request's hold: a COUNT slot and the bytes it reserved. release() gives both back, once (a second
     call, from a later finally or error path, does nothing)."""
 
-    def __init__(self, admission: "Admission", reserved: int, image: bool = False):
-        self._admission, self.reserved, self._done, self.image = admission, reserved, False, image
+    def __init__(self, admission: "Admission", reserved: int, image: bool = False, load: TextLoad | None = None):
+        self._admission, self.reserved, self._done, self.image, self.load = admission, reserved, False, image, load
 
     def release(self) -> None:
         self._admission._release(self)
@@ -805,6 +1014,9 @@ class Admission:
         self.inflight = 0
         self.reserved = 0                    # bytes held by the admitted requests in flight
         self.image_inflight = 0              # image-bearing requests in flight (#125)
+        self._loads: list[TextLoad] = []     # the text route's requests in flight (#126): reserved as one set
+        self._high_water = 0                 # the longest text context admitted since the set was last empty
+        self._peak = (0, 0)                  # the set's largest (cells, cache_overshoot) since it was last empty
 
     def _report(self, g: dict[str, Any]) -> dict[str, Any]:
         """The state report under the lock: the count sample, in flight, and (governed) the bytes and token room."""
@@ -818,10 +1030,26 @@ class Admission:
                    image_limit=vision["image_concurrency"] if vision else None)
         free = max(0, available_bytes(cfg) - self.reserved)
         full = g["limit"] is not None and self.inflight >= g["limit"]
+        if text_route(cfg):
+            # the text route's set reservation: what one more request may hold beside the set in flight (#126)
+            fit = text_room(cfg, [], available_bytes(cfg))
+            room = 0 if full else text_room(cfg, self._loads, available_bytes(cfg) - self._summed_bytes(),
+                                            self._high_water, self._peak)
+        else:
+            fit, room = bytes_tokens(cfg, available_bytes(cfg)), 0 if full else bytes_tokens(cfg, free)
         return {**out, "reserved_bytes": self.reserved, "free_bytes": free,
                 # the most tokens one request may hold: alone (ever), and beside what runs now (0 when the count is full)
-                "fit_tokens": bytes_tokens(cfg, available_bytes(cfg)),
-                "free_tokens": 0 if full else bytes_tokens(cfg, free)}
+                "fit_tokens": fit, "free_tokens": room}
+
+    def _set_bytes(self) -> int:
+        """The text route's set reservation of the loads in flight (0 when none, or without a governor)."""
+        if not self._loads or self.governor is None:
+            return 0
+        return text_set_bytes(self.governor.cfg, self._loads, self._high_water, self._peak)["total"]
+
+    def _summed_bytes(self) -> int:
+        """The part of `reserved` held by per-request reservations (everything but the text set)."""
+        return max(0, self.reserved - self._set_bytes())
 
     def snapshot(self) -> dict[str, Any]:
         """{"limit", "inflight", "owner", "pressure", "reason", "reserved_bytes", "free_bytes", "fit_tokens",
@@ -844,12 +1072,25 @@ class Admission:
         """The reservation a request asks for (0 without a governor: nothing is budgeted)."""
         return request_bytes(self.governor.cfg, input_tokens, max_tokens, images) if self.governor else 0
 
-    def try_acquire(self, reserve: int = 0, image: bool = False) -> tuple[Ticket | None, dict[str, Any]]:
+    def text_load(self, input_tokens: int, max_tokens: Any) -> TextLoad | None:
+        """A text request's TextLoad when the served model is text-only (text_route), for try_acquire's `load`; None
+        without a governor or on a vision model (whose requests reserve request_bytes, summed)."""
+        if self.governor is None or not text_route(self.governor.cfg):
+            return None
+        return text_load(self.governor.cfg, input_tokens, max_tokens)
+
+    def try_acquire(self, reserve: int = 0, image: bool = False,
+                    load: TextLoad | None = None) -> tuple[Ticket | None, dict[str, Any]]:
         """(ticket, report) when admitted; (None, report) when not, report["refused"] saying why: "too_large" (more
         than the whole budget beside the weights: never, even when the count is full too) or "busy" (the count limit,
         the bytes left now, or for an `image`-bearing request every image slot taken; retryable). The count slot, the
         bytes and the image slot are taken together, atomically. An image-bearing request on a model without a vision
-        policy (or without a governor) is "unsupported": the gate checks that first, this only fails closed."""
+        policy (or without a governor) is "unsupported": the gate checks that first, this only fails closed.
+        `load` (#126, a text request on a text-only model: text_load): the request joins the text route's set, whose
+        reservation is computed over every load in flight (text_set_bytes: the decode batch pads each row to the
+        longest) at the longest context admitted since the set was last empty (a departed long row's width survives in
+        the filtered batch), so its bytes are the set's growth, not a fixed size; `reserve` is then ignored. too_large
+        compares the request alone with the budget."""
         g = self.governor.current() if self.governor else NO_GOVERNOR
         with self._lock:
             vision = self.vision
@@ -858,34 +1099,60 @@ class Admission:
             if self.governor is None:
                 self.inflight += 1
                 return Ticket(self, 0), self._report(g)
-            nbytes = max(0, int(reserve))
-            avail = available_bytes(self.governor.cfg)
+            cfg = self.governor.cfg
+            avail = available_bytes(cfg)
+            if load is not None:
+                if image or not text_route(cfg):
+                    raise ValueError("a text load is admitted only for a text-only request on a text-only model")
+                alone = text_set_bytes(cfg, [load])["total"]
+                high = max(self._high_water, load.tokens)
+                grown = text_set_bytes(cfg, [*self._loads, load], high, self._peak)
+                after = self._summed_bytes() + grown["total"]
+                nbytes = after - self.reserved
+            else:
+                alone = nbytes = max(0, int(reserve))
+                after = self.reserved + nbytes
             refused = None
-            if nbytes > avail:
-                refused = {"refused": "too_large", "reason": f"request needs {_gib(nbytes)} GiB, more than the "
+            if alone > avail:
+                refused = {"refused": "too_large", "reason": f"request needs {_gib(alone)} GiB, more than the "
                                                              f"{_gib(avail)} GiB budget beside the weights"}
+                nbytes = alone
             elif g["limit"] is not None and self.inflight >= g["limit"]:
                 refused = {"refused": "busy"}                       # the sample's reason: owner / pressure
             elif image and self.image_inflight >= vision["image_concurrency"]:
                 refused = {"refused": "busy", "reason": f"image turns: {self.image_inflight} of "
                                                         f"{vision['image_concurrency']} running"}
-            elif self.reserved + nbytes > avail:
+            elif after > avail:
                 refused = {"refused": "busy", "reason": f"memory budget: {_gib(avail - self.reserved)} GiB free, "
                                                         f"request needs {_gib(nbytes)} GiB"}
             if refused is not None:
                 return None, {**self._report(g), **refused, "request_bytes": nbytes}
             self.inflight += 1
-            self.reserved += nbytes
+            if load is not None:
+                self._loads.append(load)
+                self._high_water = high
+                self._peak = (grown["cells"], grown["cache_overshoot"])
+            self.reserved = after
             if image:
                 self.image_inflight += 1
-            return Ticket(self, nbytes, image), self._report(g)
+            return Ticket(self, nbytes, image, load), self._report(g)
 
     def _release_locked(self, ticket: Ticket) -> None:
         if ticket._done:
             return
         ticket._done = True
         self.inflight = max(0, self.inflight - 1)
-        self.reserved = max(0, self.reserved - ticket.reserved)
+        if ticket.load is not None:
+            # the set shrinks: recompute it (the longest row may have left), never subtract a stale share
+            summed = self._summed_bytes()
+            at = next((i for i, x in enumerate(self._loads) if x is ticket.load), None)
+            if at is not None:
+                del self._loads[at]                 # this ticket's entry only (one load object may be admitted twice)
+            if not self._loads:
+                self._high_water, self._peak = 0, (0, 0)   # the decode batch is empty, MLX's cache cleared
+            self.reserved = summed + self._set_bytes()
+        else:
+            self.reserved = max(0, self.reserved - ticket.reserved)
         if ticket.image:
             self.image_inflight = max(0, self.image_inflight - 1)
 

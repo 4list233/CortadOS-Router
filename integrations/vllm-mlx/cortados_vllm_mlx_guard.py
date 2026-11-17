@@ -1152,6 +1152,220 @@ def media_prefill(gen: Any, request: Any, cache: Any, step: int, seam: dict) -> 
     return logits
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Text prefill (#126; docs/LOCAL-RESOURCES.md "Text prefill"). On the text route, vllm-mlx 0.6.0's Scheduler
+# (scheduler.py 1518-1600, _create_batch_generator) builds mlx-lm 0.31.3's BatchGenerator with vllm-mlx's
+# --prefill-step-size (2,048) and --prefill-batch-size (8). mlx-lm prefills (generate.py 1124-1170,
+# PromptProcessingBatch.prompt) up to prefill_batch_size sequences together, right-padded, against one BatchKVCache, in
+# steps of prefill_step_size tokens, evaluating only the cache state (no prompt position is projected to the
+# vocabulary). Its full attention at head_dim 256 runs MLX 0.32.4's unfused fallback under 1,024 query tokens
+# (scaled_dot_product_attention.cpp use_fallback; fast.cpp's fallback: bf16 scores, a masked copy, the softmax), so one
+# step holds sequences x heads x step x context scores: 8 x 24 x 2,048 x 131,072 x 2 bytes = 96 GiB a buffer at worst.
+# The guard bounds it where the generator is built:
+#   * every BatchGenerator the Scheduler creates prefills ONE sequence at a time (prefill_batch_size 1) in chunks of
+#     at most --text-prefill-tokens (prefill_step_size, and the empty PromptProcessingBatch's own step, which is the
+#     one PromptProcessingBatch.prompt chunks by, since extend() keeps it); a generator without that seam, or a model
+#     other than mlx-lm's qwen3_5, fails the request (fail closed);
+#   * MLX's buffer cache limit is --buffer-cache-bytes (engine/batched.py _resolve_metal_buffer_cache_limit, which
+#     vllm-mlx calls through its module global at engine start; upstream 90% of the GPU's working set): freed KV
+#     copies and score buffers are released rather than kept resident until the next clear. The limit is a recycling
+#     threshold (MLX allocator: free() caches a whole buffer while the cache is under the limit, malloc trims it back),
+#     so the cache holds at most the limit plus one buffer; the gate counts both.
+# Same result: a chunk boundary only splits the prompt into causal attention against the cached keys plus the
+# gated-delta and conv state carried in the cache, the path upstream already takes at 2,048; batching prefills is a
+# scheduling choice (each row's attention is masked to its own tokens). Floating-point results may differ at the
+# rounding level, as between any two chunk sizes (GEMM tiling depends on the chunk's rows); no token is dropped.
+# The gate reserves the result (local_governor.text_set_bytes). Pinned: mlx-lm 0.31.3 (MLX_LM_PINNED_SHA256), the
+# vllm-mlx files above (PINNED_SHA256: scheduler.py, engine/batched.py) and mlx / mlx-metal 0.32.4 (verify_mlx: the
+# fallback and the allocator are in the compiled library).
+MLX_LM_VERSION = "0.31.3"
+# mlx-lm 0.31.3 (PyPI wheel mlx_lm-0.31.3-py3-none-any.whl, sha256 758cfddf...83b8): the batch generator, the caches
+# and mask, the qwen3_5 model and its import chain, and the sampler the decode rows run.
+MLX_LM_PINNED_SHA256 = {
+    "__init__.py": "f9ffa88772d26e537a98aa39ab16488a7a0d13cc1fac5d665376132c94b49608",
+    "_version.py": "f0da9bc5c5c1bf21d576f7aa67b4eda887f1c7f0666746187b493e6831c4af6c",
+    # BatchGenerator, PromptProcessingBatch (prefill steps, cache-state-only eval), GenerationBatch (extend / filter)
+    "generate.py": "270778ad53eaca55a8533d82e6752660fe5d2605c4aa0879b48a50a91f69345f",
+    "sample_utils.py": "c0ce439f8dbf0d4e6d0f37f728a324f3f72878e6a9123df41be520804c596d67",
+    "models/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    # KVCache / BatchKVCache (256-step growth, extend pads to the longest row), ArraysCache (the recurrent state)
+    "models/cache.py": "819ed95dcbf755652363cfdb15a639890447abb534a06dcefd52c7fff5055750",
+    # create_causal_mask, scaled_dot_product_attention -> mx.fast.scaled_dot_product_attention
+    "models/base.py": "61330e1c065739cd712bfeb09d673f33797cde7e613e95bf6d9ebbee9006f373",
+    "models/qwen3_5.py": "f0daa30bba5cb521c8bdfa7093101a544c6a37bbba09bca582288219cb04ae3a",
+    "models/qwen3_next.py": "3c572fe3fbb36721efab4d80d1bb6af11beb4ad1caae18deefc9fc84cbcd9b79",
+    "models/gated_delta.py": "79c8376a51c694b03e54d2f996ced6ea6c8c42868b8571529f97334db165a3e1",
+    "models/activations.py": "dbca5bae41ba0a8380a53903c3e98da37c1e15b46383bc2edb5806ba94fafe72",
+    "models/rope_utils.py": "9f68c938c040fa111d13f2ed95c70e8261515fb3b54f8a0a474c096baf4e087a",
+    "models/switch_layers.py": "073a6a808d5c90bb699a2ecca0e559b06727ae96dbc1f0253e4c7e77e4ee1ef2",
+}
+TEXT_FLAGS = {"--text-prefill-tokens": "prefill_tokens", "--buffer-cache-bytes": "buffer_cache_bytes"}
+# The one verified text geometry (local_governor.TEXT_DIMS, the same values): the Pro's Qwen3.8 27B text_config. A key
+# config.json leaves out takes mlx-lm 0.31.3's TextModelArgs default (models/qwen3_5.py 25-70) when that default is the
+# verified value (full_attention_interval 4, linear_conv_kernel_dim 4), and is refused otherwise.
+TEXT_DIMS = {
+    "hidden_size": 5120, "intermediate_size": 17408, "num_attention_heads": 24, "num_key_value_heads": 4,
+    "head_dim": 256, "linear_num_key_heads": 16, "linear_num_value_heads": 48, "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128, "vocab_size": 248320, "num_hidden_layers": 64, "full_attention_interval": 4,
+    "linear_conv_kernel_dim": 4,
+}
+TEXT_DIMS_DEFAULTS = {"full_attention_interval": 4, "linear_conv_kernel_dim": 4}
+TEXT_ACT_BYTES = 2
+TEXT_MODEL_TYPE = "qwen3_5"
+TEXT_MODEL_MODULES = ("mlx_lm.models.qwen3_5",)
+TEXT_PREFILL_REFUSAL = "cortados guard: the text prefill could not be bounded"
+
+
+class TextPolicy:
+    """The text route's prefill bounds (--text-prefill-tokens, --buffer-cache-bytes), positive integers."""
+
+    def __init__(self, prefill_tokens: int, buffer_cache_bytes: int):
+        for name, v in (("--text-prefill-tokens", prefill_tokens), ("--buffer-cache-bytes", buffer_cache_bytes)):
+            if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                raise GuardError(f"{name} must be a positive integer, got {v!r}")
+        self.prefill_tokens, self.buffer_cache_bytes = prefill_tokens, buffer_cache_bytes
+
+
+def parse_text(args: list[str]) -> tuple["TextPolicy | None", list[str]]:
+    """(TextPolicy or None, the other arguments): the text flags, each `--flag N` once; both or neither."""
+    got: dict[str, int] = {}
+    rest: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in TEXT_FLAGS:
+            if a in got or i + 1 >= len(args) or not args[i + 1].isdigit():
+                raise GuardError(f"{a} takes one positive integer, once")
+            got[a] = int(args[i + 1])
+            i += 2
+            continue
+        rest.append(a)
+        i += 1
+    if not got:
+        return None, rest
+    if len(got) != len(TEXT_FLAGS):
+        raise GuardError(f"the text flags go together: {' N '.join(TEXT_FLAGS)} N")
+    return TextPolicy(got["--text-prefill-tokens"], got["--buffer-cache-bytes"]), rest
+
+
+def check_text_model(model_dir: Any) -> None:
+    """GuardError unless config.json (its text_config when it has one, else the top level) is the verified text
+    geometry TEXT_DIMS, dense (no experts), in a dtype no wider than TEXT_ACT_BYTES: the gate's text reservation was
+    computed for it (local_governor.text_set_bytes), so the text route does not start on another model."""
+    import json
+    path = os.path.join(str(model_dir), "config.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise GuardError(f"text route: {path} unreadable ({type(exc).__name__})") from None
+    if not isinstance(cfg, dict):
+        raise GuardError(f"text route: {path} is not an object")
+    # mlx-lm 0.31.3 loads mlx_lm.models.<model_type> (utils._get_classes; no remapping for qwen3_5), whose ModelArgs
+    # reads text_config when there is one and the top level otherwise (models/qwen3_5.py 360-364): the module the
+    # runtime check (TEXT_MODEL_MODULES) expects, caught here at install time rather than on the first request
+    if cfg.get("model_type") != TEXT_MODEL_TYPE:
+        raise GuardError(f"text route: config.json model_type is {cfg.get('model_type')!r}, not {TEXT_MODEL_TYPE!r} "
+                         "(mlx-lm's qwen3_5, the model the text reservation was computed for)")
+    text = cfg["text_config"] if "text_config" in cfg else cfg
+    if not isinstance(text, dict):
+        raise GuardError("text route: config.json text_config is not an object")
+    for key, want in TEXT_DIMS.items():
+        got = text.get(key, TEXT_DIMS_DEFAULTS.get(key))
+        if isinstance(got, bool) or got != want:
+            raise GuardError(f"text route: config.json {key} is {got!r}, but the gate's text reservation was computed "
+                             f"for {want} (TEXT_DIMS); a different model needs its own reservation")
+    if text.get("num_experts", 0):
+        raise GuardError("text route: config.json names experts; the text reservation is for the dense model")
+    for where in (text, cfg):
+        dtype = where.get("dtype", where.get("torch_dtype"))
+        if dtype is not None and (DTYPE_BYTES.get(dtype, 0) == 0 or DTYPE_BYTES[dtype] > TEXT_ACT_BYTES):
+            raise GuardError(f"text route: config.json's dtype {dtype!r} is wider than the {TEXT_ACT_BYTES} bytes "
+                             "the text reservation counts")
+
+
+def verify_text(lm_dir: str, lm_version: str, pins: dict | None = None) -> None:
+    """GuardError unless mlx-lm is the 0.31.3 release the text prefill argument was read from, file for file."""
+    if lm_version != MLX_LM_VERSION:
+        raise GuardError(f"mlx-lm {lm_version} is not {MLX_LM_VERSION}: re-read the guard's text prefill argument")
+    for rel, want in (MLX_LM_PINNED_SHA256 if pins is None else pins).items():
+        path = os.path.join(lm_dir, *rel.split("/"))
+        try:
+            with open(path, "rb") as f:
+                got = hashlib.sha256(f.read()).hexdigest()
+        except OSError as exc:
+            raise GuardError(f"mlx_lm/{rel} unreadable ({type(exc).__name__})") from None
+        if got != want:
+            raise GuardError(f"mlx_lm/{rel} differs from the {MLX_LM_VERSION} release the guard was written against")
+
+
+def text_prefill_problem(bg: Any) -> str | None:
+    """Why this BatchGenerator lacks the seam enforce_text_prefill sets, or None (mlx-lm 0.31.3's native layout)."""
+    for attr in ("prefill_batch_size", "prefill_step_size", "_prompt_batch", "_generation_batch",
+                 "_unprocessed_sequences", "_next", "model"):
+        if not hasattr(bg, attr):
+            return f"the batch generator has no {attr}"
+    pb = bg._prompt_batch
+    if not hasattr(pb, "prefill_step_size") or not hasattr(pb, "uids") or len(pb.uids) != 0:
+        return "the batch generator's prompt batch is not mlx-lm 0.31.3's empty PromptProcessingBatch"
+    module = type(bg.model).__module__
+    if module not in TEXT_MODEL_MODULES:
+        return f"the served model is {module}.{type(bg.model).__name__}, not mlx-lm's qwen3_5 (TEXT_DIMS)"
+    for name in ("prefill_batch_size", "prefill_step_size"):
+        v = getattr(bg, name)
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            return f"the batch generator's {name} is {v!r}"
+    return None
+
+
+def enforce_text_prefill(bg: Any, chunk: int) -> Any:
+    """One sequence prefills at a time, in chunks of at most `chunk` tokens (module comment above); RuntimeError (the
+    request fails, nothing is prefilled) when the generator is not the layout the argument read."""
+    why = text_prefill_problem(bg)
+    if why is not None:
+        raise RuntimeError(f"{TEXT_PREFILL_REFUSAL} ({why})")
+    bg.prefill_batch_size = 1
+    bg.prefill_step_size = min(bg.prefill_step_size, chunk)
+    bg._prompt_batch.prefill_step_size = min(int(bg._prompt_batch.prefill_step_size), chunk)
+    return bg
+
+
+def install_text(policy: TextPolicy, scheduler_cls: Any, batched_module: Any) -> None:
+    """Patch the text route (before any request exists): every BatchGenerator the Scheduler builds is held to the
+    policy's prefill (enforce_text_prefill), and MLX's buffer cache limit vllm-mlx sets at engine start is the
+    policy's."""
+    original = getattr(scheduler_cls, "_create_batch_generator", None)
+    resolve = getattr(batched_module, "_resolve_metal_buffer_cache_limit", None)
+    if not callable(original) or not callable(resolve):
+        raise GuardError("text route: Scheduler._create_batch_generator or engine.batched."
+                         "_resolve_metal_buffer_cache_limit is missing: re-read the guard's text prefill argument")
+    if getattr(original, "__cortados_guard__", False) or getattr(resolve, "__cortados_guard__", False):
+        raise GuardError("the text prefill guard is already installed")
+
+    def create_batch_generator(self, *args, **kwargs):
+        return enforce_text_prefill(original(self, *args, **kwargs), policy.prefill_tokens)
+
+    create_batch_generator.__cortados_guard__ = True
+    create_batch_generator.__wrapped__ = original
+    scheduler_cls._create_batch_generator = create_batch_generator
+
+    def resolve_metal_buffer_cache_limit(*args, **kwargs):
+        return policy.buffer_cache_bytes, "cortados guard (--buffer-cache-bytes)"
+
+    resolve_metal_buffer_cache_limit.__cortados_guard__ = True
+    resolve_metal_buffer_cache_limit.__wrapped__ = resolve
+    batched_module._resolve_metal_buffer_cache_limit = resolve_metal_buffer_cache_limit
+
+
+def _text_modules():
+    """mlx-lm verified against its pins, mlx / mlx-metal against theirs, and vllm-mlx's engine.batched module."""
+    import mlx_lm
+    verify_text(os.path.dirname(os.path.abspath(mlx_lm.__file__)), getattr(mlx_lm, "__version__", "?"))
+    verify_mlx()                                  # the attention fallback and the allocator (mlx / mlx-metal 0.32.4)
+    from vllm_mlx.engine import batched
+    return batched
+
+
 def _vision_modules():
     """vllm-mlx's MLLM modules, mlx-vlm, PIL and the image checker, verified against the vision pins (and mlx /
     mlx-metal against theirs)."""
@@ -1182,9 +1396,11 @@ def _engines():
 
 
 def _usage(msg: str) -> int:
-    print(f"cortados-vllm-mlx-guard: {msg}\nusage: cortados-vllm-mlx-guard.py --context-tokens N [vision flags] -- serve "
-          "<model> [vllm-mlx args]\n       cortados-vllm-mlx-guard.py --check <model dir> [vision flags]\nvision flags: "
-          "--vision " + " N ".join(VISION_FLAGS) + f" N {DIMS_FLAG} name=N,...", file=sys.stderr)
+    print(f"cortados-vllm-mlx-guard: {msg}\nusage: cortados-vllm-mlx-guard.py --context-tokens N "
+          "(text flags | vision flags) -- serve <model> [vllm-mlx args]\n"
+          "       cortados-vllm-mlx-guard.py --check <model dir> [vision flags]\n"
+          "text flags: " + " N ".join(TEXT_FLAGS) + " N\nvision flags: --vision " + " N ".join(VISION_FLAGS)
+          + f" N {DIMS_FLAG} name=N,...", file=sys.stderr)
     return EXIT_REFUSED
 
 
@@ -1202,6 +1418,9 @@ def main(argv: list[str] | None = None) -> int:
             if policy is not None:
                 _vision_modules()                 # mlx-vlm's and mlx's versions and the vision pins
                 check_vision_model(argv[1], policy.dims)
+            else:
+                _text_modules()                   # mlx-lm's and mlx's versions and the text prefill pins (#126)
+                check_text_model(argv[1])
             route = api_utils.resolve_mllm_route(argv[1], argv[1])
         except GuardError as exc:
             print(f"cortados-vllm-mlx-guard: {exc}", file=sys.stderr)
@@ -1223,8 +1442,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"cortados-vllm-mlx-guard: {MLLM_REFUSAL}; {argv[1]} resolves to the MLLM route "
                   f"({getattr(route, 'source', '?')})", file=sys.stderr)
             return EXIT_REFUSED
-        print(f"cortados-vllm-mlx-guard: ok (vllm-mlx {VLLM_MLX_VERSION}, pinned files match, only BatchedEngine "
-              "may serve, text route)")
+        print(f"cortados-vllm-mlx-guard: ok (vllm-mlx {VLLM_MLX_VERSION}, mlx-lm {MLX_LM_VERSION} and mlx / mlx-metal "
+              f"{MLX_VERSION}, pinned files match, only BatchedEngine may serve, text route)")
         return 0
     if "--" not in argv:
         return _usage("missing `--` before the vllm-mlx arguments")
@@ -1232,20 +1451,30 @@ def main(argv: list[str] | None = None) -> int:
     own, rest = argv[:cut], argv[cut + 1:]
     try:
         policy, own = parse_vision(own)
+        text, own = parse_text(own)
     except GuardError as exc:
         return _usage(str(exc))
     if len(own) != 2 or own[0] != "--context-tokens" or not own[1].isdigit():
         return _usage("expected --context-tokens N")
-    if rest[:1] != ["serve"]:
-        return _usage("only `serve` is run through the guard")
+    if rest[:1] != ["serve"] or len(rest) < 2:
+        return _usage("only `serve <model>` is run through the guard")
+    if policy is None and text is None:
+        return _usage("the text route needs " + " N ".join(TEXT_FLAGS) + " N (#126: its prefill is bounded)")
+    if policy is not None and text is not None:
+        return _usage("the text flags are for the text route; vision mode bounds its own prefill")
     if BATCHING_FLAG not in rest:
         return _usage(f"{ENGINE_REFUSAL} (`{BATCHING_FLAG}` missing from the serve arguments)")
     try:
         _, scheduler, mllm_scheduler, api_utils, http_exception = _modules()
         if policy is not None:
             batch_generator, vision_cache, mllm_models, image_check = _vision_modules()
+        if text is not None:
+            batched = _text_modules()
+            check_text_model(rest[1])
         install(int(own[1]), scheduler.Scheduler, mllm_scheduler.MLLMScheduler, api_utils, http_exception,
                 *_engines(), vision=policy)
+        if text is not None:
+            install_text(text, scheduler.Scheduler, batched)
         if policy is not None:
             import warnings
             from PIL import Image
@@ -1259,7 +1488,8 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_REFUSED
     what = (f"; vision: {policy.max_images} images of at most {policy.image_tokens} tokens, image requests capped at "
             f"{policy.image_context_tokens}, media prefill in chunks of {policy.prefill_tokens} keeping one position's "
-            "logits" if policy is not None else "")
+            "logits" if policy is not None else f"; text prefill one sequence at a time in chunks of at most "
+            f"{text.prefill_tokens}, MLX buffer cache {text.buffer_cache_bytes} bytes")
     print(f"cortados-vllm-mlx-guard: prompt + max_tokens capped at {own[1]} tokens (vllm-mlx {VLLM_MLX_VERSION})"
           f"{what}", file=sys.stderr)
     from vllm_mlx import cli
