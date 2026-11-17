@@ -772,23 +772,20 @@ model's blocks follow from index 1). On `/v1/responses` it is a separate leading
 detector and reason labels and the routed model only, never a keyword, a matched term or request text. A value outside
 the vocabulary is shown as the fallback label, never as itself.
 
-**History.** The delivered form is canonical (review round 4; rounds 2 and 3 stripped the notice back out of history,
-and each stripping rule broke). The session's history holds the reply exactly as the client received it, notice
-included, so a client that echoes it back matches exactly. The backend never saw the notice, so each injection also
-records its accepted client forms as exact fingerprints (`anthropic_wire.notice_forms` → `sensitive_notice.Forms`):
-(a) the notice kept as its own block (= the delivered form), (b) merged into the model's first text (separated by
-`\n\n`, `\n`, a space or nothing), (c) dropped (= the model's own blocks). They live in the conversation lineage's
-`sensitive_notice.Provenance`, keyed by content (the model-only fingerprint), never by assistant index, so a compaction
-that shifts indices loses nothing. Every comparison of a client history with a session's goes through the explicit,
-directional helpers `same_reply` / `same_history` / `holds` (the session's entry first: only a delivered form with a
-record accepts another form; plain strings, no overloaded equality). A rebuilt session copies the lineage's records and
-remaps the client's entries to the delivered forms they verifiably are (`canonical`). A rebuilt backend's transcript
-never removes client text: a message that is exactly the kept or merged form of a record gets
-`sensitive_notice.REBUILD_LABEL` before the notice, so the model knows the provider wrote it; model-authored text that
-looks like a notice (leading, not leading, an exact duplicate, or a reply starting with the notice whose injection the
-client dropped) is replayed as sent. Two different notice-only replies have different delivered fingerprints. This
-covers both wires and the replay of a retried turn, which stores the reply as shown. Provenance is memory-only, like
-the history it belongs to: after a restart neither exists, and the continuation gets the terminal `no_writer` refusal.
+**History.** The delivered form is the only form (review round 5; rounds 2 and 3 stripped the notice back out of
+history, round 4 accepted recorded variant forms by content, and each rule broke: content-keyed provenance let an edit
+to one turn pass as another turn's accepted form). The session's history holds the reply exactly as the client received
+it, notice included, and every history comparison is plain equality against that delivered form, on both wires and for
+the replay of a retried turn (which stores the reply as shown). A client that sends an earlier turn in any other form
+(the notice merged into the model's text or dropped, for example by its own compaction) has rewritten its history, and
+it is handled like any other rewritten history: the rebuild-on-rewrite path or the 409, with the same rebuild budget and
+terminal behaviour, and no special case. So, as for any edited reply: when the changed turn is the request's last
+reply, no live session wrote it and the request gets the existing terminal refusal; when a later reply is intact, the
+conversation is rebuilt once from the lineage's budget. A rebuilt backend's transcript replays the client's text as
+sent, with no labelling by wording (wording cannot tell model text from provider text): the rebuilt model may read the
+notice as part of a past assistant turn. That is harmless and intended: the notice is true and is part of what the
+user saw. Nothing is kept per injection, so no conversation state grows with notices. Two different notice-only replies
+have different fingerprints (the notice text is in them).
 
 **Opt-out.** A caller that must not get injected text (one parsing the reply as data) sends
 `x-cortados-sensitive-notice: off` on the request. Only the block is suppressed: the warning log line and the route

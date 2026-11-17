@@ -503,71 +503,71 @@ class RefusalFallbackEndToEndTests(LocalHarness):
                          [{"detector": "refusal", "reason": "refused_continuation", "notice": "shown"}])
         self.assertNotRerun(s)
 
-    def test_the_continuation_after_a_refused_one_still_matches(self):
-        # The client keeps the refused reply as received, with the notice merged into the next text, or dropped: the
-        # session holds the delivered form and the injection's accepted forms (#124 round 4), so the next turn reaches
-        # the same backend, with no notice.
-        from cortados_router.provider import sensitive_notice
-        for keep in ("separate", "merged", "dropped"):
+    def test_the_continuation_after_a_refused_one_echoed_as_delivered_matches(self):
+        # The client keeps the refused reply as received, notice block included: the session holds that delivered
+        # form, so the next turn reaches the same backend, exactly, with no notice and no rebuild.
+        from cortados_router.provider import anthropic_wire, sensitive_notice
+        self.records_on()
+        s, nxt, got = self.refused_continuation()
+        self.assertEqual(s.history[-1], anthropic_wire.reply_fingerprint(got["content"]))
+        after = {**nxt, "messages": nxt["messages"] + [{"role": "assistant", "content": got["content"]},
+                                                        {"role": "user", "content": "carry on"}]}
+        got = self.post(after)
+        self.assertEqual(got["content"], [{"type": "text", "text": "echo: carry on"}])
+        self.assertFalse(any(sensitive_notice.is_notice(b.get("text")) for b in got["content"]))
+        self.assertEqual(getattr(s, "rebuilds", 0), 0)
+        self.assertEqual(len(self.records), 1)                          # the refused turn only
+        self.assertNotRerun(s)
+
+    def test_a_compaction_or_a_merged_or_dropped_notice_is_an_ordinary_rewrite(self):
+        # #124 round 5: no special case. A compaction (notice kept), or the notice merged or dropped, is a rewritten
+        # history: one rebuild from the lineage's budget, the client's text replayed as sent (no label, nothing
+        # removed: the rebuilt model may read the notice as a past assistant turn, which is intended), and a later
+        # continuation that echoes the rebuilt session's history exactly reaches it with no second rebuild.
+        from cortados_router.provider import anthropic_wire, sensitive_notice
+        for keep in ("compacted", "merged", "dropped"):
             for old in list(self.reg.sessions.values()):
                 self.reg.drop(old)
             self.records_on()
             s, nxt, got = self.refused_continuation()
-            content = got["content"]
-            if keep == "merged":
-                content = [{"type": "text", "text": content[0]["text"] + "\n\n" + content[1]["text"]}]
-            elif keep == "dropped":
-                content = content[1:]
-            after = {**nxt, "messages": nxt["messages"] + [{"role": "assistant", "content": content},
-                                                            {"role": "user", "content": "carry on"}]}
-            got = self.post(after)
-            self.assertEqual(got["content"], [{"type": "text", "text": "echo: carry on"}], keep)
-            self.assertEqual(list(self.reg.sessions.values()), [s], keep)
-            self.assertFalse(any(sensitive_notice.is_notice(b.get("text")) for b in got["content"]))
-            self.assertEqual(len(self.records), 1, keep)                  # the refused turn only
-            self.assertNotRerun(s)
-
-    def test_compaction_shifting_indices_keeps_matching_without_a_second_rebuild(self):
-        # Review round 3 (P2-1): the injected turn's assistant index shifts when the client compacts the history. The
-        # accepted forms are keyed by content, so the compaction's own rebuild keeps them, and a later continuation that
-        # drops the notice matches the rebuilt session exactly: no second rebuild, no budget spent, no refusal.
-        from cortados_router.provider import anthropic_wire, sensitive_notice
-        self.records_on()
-        s, nxt, got = self.refused_continuation()
-        refused = got["content"]                                        # [notice, model refusal]
-        self.assertEqual(s.history[-1], anthropic_wire.reply_fingerprint(refused))     # delivered form, as sent
-        after = {**nxt, "messages": nxt["messages"] + [{"role": "assistant", "content": refused},
-                                                        {"role": "user", "content": "carry on"}]}
-        echoed = self.post(after)["content"]
-        self.assertEqual(list(self.reg.sessions.values()), [s])
-        # Compaction: the opening exchange (tool_use + result) is summarised away; the refused turn is now index 0.
-        seen = []
-        real = anthropic_wire.rebuild_transcript
-        with patch.object(anthropic_wire, "rebuild_transcript",
-                          lambda msgs, notices=None: seen.append(real(msgs, notices)) or seen[-1]):
-            compacted = {**after, "messages": [{"role": "user", "content": "summary of the earlier turns"},
-                                               {"role": "assistant", "content": refused},
-                                               {"role": "user", "content": "carry on"},
-                                               {"role": "assistant", "content": echoed},
-                                               {"role": "user", "content": "next"}]}
-            third = self.post(compacted)["content"]
-        (r,) = self.reg.sessions.values()
-        self.assertIsNot(r, s)                                          # the compaction itself is one rebuild
-        self.assertEqual(r.rebuild_budget.used, 1)
-        text = "".join(b.get("text", "") for b in seen[-1])
-        self.assertIn(sensitive_notice.REBUILD_LABEL + refused[0]["text"], text)   # kept, labelled, never removed
-        self.assertIn(refused[1]["text"], text)
-        # The next continuation drops the notice: same session, exactly, no rebuild.
-        dropped = {**compacted, "messages": [compacted["messages"][0], {"role": "assistant", "content": refused[1:]},
-                                             *compacted["messages"][2:], {"role": "assistant", "content": third},
-                                             {"role": "user", "content": "and more"}]}
-        got = self.post(dropped)
-        self.assertEqual(got["content"], [{"type": "text", "text": "echo: and more"}])
-        self.assertEqual(list(self.reg.sessions.values()), [r])
-        self.assertEqual(r.rebuild_budget.used, 1)
-        self.assertEqual(len(seen), 1)
-        self.assertEqual(len(self.records), 1)                          # the refused turn only
-        self.assertNotRerun(r)
+            refused = got["content"]                                    # [notice, model refusal]
+            content = {"compacted": refused, "dropped": refused[1:],
+                       "merged": [{"type": "text", "text": refused[0]["text"] + "\n\n" + refused[1]["text"]}]}[keep]
+            msgs = [{"role": "user", "content": "summary of the earlier turns"}]    # the client's compaction
+            if keep != "compacted":
+                # as the request's last reply, an edited reply: the existing terminal 400, nothing rebuilt
+                self.assertEqual(self.status_of({**nxt, "messages": msgs + [
+                    {"role": "assistant", "content": content}, {"role": "user", "content": "carry on"}]}), 400, keep)
+                self.assertEqual(list(self.reg.sessions.values()), [s], keep)
+            # an earlier turn under an intact last reply: the rewrite is rebuilt once
+            first = self.post({**nxt, "messages": nxt["messages"] + [{"role": "assistant", "content": refused},
+                                                                      {"role": "user", "content": "carry on"}]})
+            self.assertEqual(list(self.reg.sessions.values()), [s], keep)        # echoed as delivered: exact
+            after = {**nxt, "messages": msgs + [{"role": "assistant", "content": content},
+                                                {"role": "user", "content": "carry on"},
+                                                {"role": "assistant", "content": first["content"]},
+                                                {"role": "user", "content": "then go on"}]}
+            seen = []
+            real = anthropic_wire.rebuild_transcript
+            with patch.object(anthropic_wire, "rebuild_transcript", lambda m: seen.append(real(m)) or seen[-1]):
+                echoed = self.post(after)["content"]
+            self.assertTrue(echoed, keep)                               # answered by the rebuilt backend
+            (r,) = self.reg.sessions.values()
+            self.assertIsNot(r, s, keep)
+            self.assertEqual(r.rebuild_budget.used, 1, keep)
+            text = "".join(b.get("text", "") for b in seen[-1])
+            self.assertEqual(text.count(refused[0]["text"]), 0 if keep == "dropped" else 1, keep)
+            self.assertIn(refused[1]["text"], text, keep)
+            self.assertNotIn("[CortadOS", text, keep)
+            again = {**after, "messages": after["messages"] + [{"role": "assistant", "content": echoed},
+                                                               {"role": "user", "content": "and more"}]}
+            got = self.post(again)
+            self.assertEqual(got["content"], [{"type": "text", "text": "echo: and more"}], keep)
+            self.assertEqual(list(self.reg.sessions.values()), [r], keep)
+            self.assertEqual((r.rebuild_budget.used, len(seen)), (1, 1), keep)
+            self.assertFalse(any(sensitive_notice.is_notice(b.get("text")) for b in got["content"]), keep)
+            self.assertEqual(len(self.records), 1, keep)                # the refused turn only
+            self.assertNotRerun(r)
 
     def test_refused_continuation_keeps_an_earlier_record_and_honours_the_opt_out(self):
         from cortados_router.provider import sensitive_notice

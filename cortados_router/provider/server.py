@@ -745,19 +745,6 @@ def _routed_cloud(route: Any) -> bool:
             and not route.get("local") and not route.get("pinned"))
 
 
-def _notices(s) -> "sensitive_notice.Provenance":
-    """The sensitive-cloud injections (#124 round 4) recorded for `s`'s conversation lineage, created on first use (a
-    session class or a test's fake that never set one)."""
-    prov = getattr(s, "notices", None)
-    if not isinstance(prov, sensitive_notice.Provenance):
-        prov = sensitive_notice.Provenance()
-        try:
-            s.notices = prov
-        except AttributeError:
-            pass
-    return prov
-
-
 def reveal_model(route: dict | None) -> str | None:
     """`<model> · <pct>% left` for a revealing client, `<model>` when the % is unknown, None (answer `cortados`) when
     there is no route or it is degraded. Never raises: a reveal is cosmetic and must not fail a turn."""
@@ -1000,7 +987,6 @@ class Registry:
         new = self._new(turn, keep=True, route=route, scope=getattr(old, "scope", None),
                         wire_path=getattr(old, "wire_path", None), client=getattr(old, "client", None))
         new.history = list(old.history)
-        new.notices = _notices(old).copy()             # #124: the lineage's recorded injections go with its history
         new.rebuild_budget = getattr(old, "rebuild_budget", new.rebuild_budget)   # the same lineage
         if getattr(old, "office_worker", None):
             new.office_worker = old.office_worker
@@ -1147,7 +1133,7 @@ class Registry:
     def _exact(self, history: list, scope: str | None, wire_path: str | None, client: str | None = None) -> list:
         """Live sessions of the request's scope and wire whose replies are exactly `history` (under self._lock).
         Identity-less (scope None): only identity-less sessions opened by the same client name."""
-        return [s for s in self.sessions.values() if sensitive_notice.same_history(_notices(s), s.history, history)
+        return [s for s in self.sessions.values() if s.history == history
                 and getattr(s, "scope", None) == scope and getattr(s, "wire_path", None) == wire_path
                 and (scope is not None or getattr(s, "client", None) == client)]
 
@@ -1181,7 +1167,7 @@ class Registry:
             cands = [] if scope is None or wire_path is None else [
                 s for s in self.sessions.values()
                 if getattr(s, "scope", None) == scope and getattr(s, "wire_path", None) == wire_path
-                and sensitive_notice.holds(_notices(s), s.history, anchor)]
+                and anchor in s.history]
             inflight = self._rebuild_in_flight(scope, wire_path)
         if REBUILD_MAX <= 0:
             # Rebuilds switched off: the pre-#43 409 (tests use it to pin what find and the replay guard decide alone).
@@ -1213,7 +1199,7 @@ class Registry:
                 logger.warning("rebuild refused: conversation %s reached REBUILD_MAX (%d); terminal",
                                str(s.id)[:8], REBUILD_MAX)
                 raise RebuildLimit(rebuild_limit_message())
-            raise Rebuild(s, superseded=sensitive_notice.same_reply(_notices(s), s.history[-1], anchor))
+            raise Rebuild(s, superseded=s.history[-1] == anchor)
         logger.warning("refused lost conversation: %s rebuild=refused:%s; terminal", self._lost_diagnostic(turn), code)
         raise Refused(why, code=code)
 
@@ -1281,8 +1267,7 @@ class Registry:
                     advanced = [] if joined else [
                         s for s in self.sessions.values()
                         if getattr(s, "rebuilt_for", None) == (key, fp)
-                        and len(s.history) == n + 1
-                        and sensitive_notice.same_history(_notices(s), s.history[:n], turn.history)]
+                        and len(s.history) == n + 1 and s.history[:n] == turn.history]
                     last = getattr(advanced[0], "last_reply", None) if len(advanced) == 1 else None
                     if last and last[0] == n + 1 and last[1] == fp:
                         advanced[0].last_used = time.time()     # a retry loop's use, as in find()
@@ -1333,7 +1318,7 @@ class Registry:
                 if self.get(old.id) is not old:
                     raise ConversationBusy("cortados: the conversation was rebuilt or closed while this request was "
                                            "looked up; retry")
-                if not old.history or not sensitive_notice.same_reply(_notices(old), old.history[-1], anchor):
+                if not old.history or old.history[-1] != anchor:
                     logger.info("conversation %s advanced after the rebuild lookup; served as a branch, kept",
                                 str(old.id)[:8])
                     old.lock.release()
@@ -1351,10 +1336,7 @@ class Registry:
             except BaseException:
                 self.release_opening()
                 raise
-            # #124 round 4: the lineage's recorded injections, keyed by content, go with it; the client's entries are
-            # remapped to their delivered forms by verified content matches only, so index shifts lose nothing.
-            new.notices = _notices(old).copy()
-            new.history = sensitive_notice.canonical(new.notices, turn.history)
+            new.history = list(turn.history)
             new.rebuild_seed = None if isinstance(new, LocalSession) else transcript   # local: the relay is stateless
             new.rebuild_budget = budget
             new.rebuilt_for = rebuilt_for       # (gate key, new turn's fingerprint): rebuild()'s twin check
@@ -1409,7 +1391,7 @@ class Registry:
             last = getattr(s, "last_reply", None)
             if (last and getattr(s, "scope", None) == scope and getattr(s, "wire_path", None) == wire_path
                     and last[0] == len(s.history) == n + 1
-                    and sensitive_notice.same_history(_notices(s), s.history[:n], turn.history)):
+                    and s.history[:n] == turn.history):
                 fp = fp or anthropic_wire.turn_fingerprint(turn)
                 if last[1] == fp:
                     out.append((s, last))
@@ -1503,8 +1485,7 @@ class Registry:
             # Checked under the same lock as the tombstone lookup, so no fail() or turn can slip in between.
             if dead and scope and history is not None:
                 n = len(history)
-                if any(getattr(s, "scope", None) == scope and len(s.history) > n
-                       and sensitive_notice.same_history(_notices(s), s.history[:n], history)
+                if any(getattr(s, "scope", None) == scope and len(s.history) > n and s.history[:n] == history
                        for s in self.sessions.values()):
                     dead = None
         if not dead:
@@ -2684,7 +2665,7 @@ class Handler(BaseHTTPRequestHandler):
                             str(session.id)[:8])
                 return self._error(BUSY_STATUS, "overloaded_error", "cortados: conversation busy: it was rebuilt or "
                                    "closed while this request waited for it; retry", wire)
-            if not created and not sensitive_notice.same_history(_notices(session), session.history, turn.history):
+            if not created and session.history != turn.history:
                 return self._error(409, "invalid_request_error", "the conversation moved on while this request waited "
                                    "for it: another request with the same history was served first; send the current "
                                    "history", wire)
@@ -3304,7 +3285,7 @@ class Handler(BaseHTTPRequestHandler):
                         "the conversation was closed while this request waited for it; start a new conversation")
                     outcome["stale_class"] = "closed_while_waiting"
                     return
-                if not created and not sensitive_notice.same_history(_notices(session), session.history, turn.history):
+                if not created and session.history != turn.history:
                     # Registry.find ran before the lock: a second continuation with the same history (a client
                     # retry, two overlapping requests) found the session too, and the one that lost the lock now
                     # sees a conversation that has moved on. Delivering its results would fail inside the backend
@@ -3372,12 +3353,9 @@ class Handler(BaseHTTPRequestHandler):
                         # reply would go out while history fell behind the client, killing the conversation on its next
                         # continuation.
                         _log_ledger_hook_failure(exc)
-                # #124 round 4: the delivered form is canonical. History holds the reply as the client got it (notice
-                # included); the injection's accepted client forms (kept, merged, dropped) are recorded by content.
-                fp = anthropic_wire.reply_fingerprint(shown_blocks)
-                if outcome.get("notice"):
-                    _notices(cur).add(anthropic_wire.notice_forms(outcome["turn"][0], outcome["notice"]["text"]))
-                cur.history.append(fp)
+                # #124: history holds the reply exactly as delivered (notice included); a client that echoes it matches
+                # exactly; any other form of it is a rewritten history like any other (rebuild, 409 or terminal).
+                cur.history.append(anthropic_wire.reply_fingerprint(shown_blocks))
                 if cur.route and not cur.route_logged and reg.executed:
                     try:
                         reg.executed(cur.route)
@@ -3580,7 +3558,7 @@ class Handler(BaseHTTPRequestHandler):
             self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
             return None
         try:
-            transcript = anthropic_wire.rebuild_transcript(wire.history_messages(body), _notices(rb.session))
+            transcript = anthropic_wire.rebuild_transcript(wire.history_messages(body))
         except (wire.WireError, RecursionError) as exc:
             self._error(400, "invalid_request_error", f"cortados: the history cannot be replayed: {exc}", wire,
                         reason="the request does not parse on this wire")

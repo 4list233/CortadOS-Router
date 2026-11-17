@@ -41,7 +41,7 @@ is the long form.
   `/v1/messages`) and `responses_wire.py` (Codex, `/v1/responses`) turn requests into one `ClientTurn`;
   `routing.py` picks the lane through the router's execution policy; `effect_boundary.py` is the effect boundary of
   automatically local-routed turns (a profile per bind reason: sensitive = no shell, cost = Bash with best-effort outward patterns; tool allowlist; project-folder path rules for file writes; applied by `local_lane.serve`/`complete`); `sensitive_notice.py` is the "warn, then use cloud" notice of a sensitive-marked request the Pro could
-  not take (#124: a leading text block / output item, fixed categories only, dropped by `reply_fingerprint`, recorded
+  not take (#124: a leading text block / output item, fixed categories only, kept in history exactly as delivered, recorded
   as the routes row's `sensitive_cloud`; docs/LOCAL-RESOURCES.md); `bridge.py` drives a headless Claude CLI with
   `mcp_shim.py` serving the client's tools; `codex_bridge.py` drives `codex app-server` with the client's tools as
   dynamic tools, under the isolation policy of `codex_isolation.py` (command line, config and login checks, aliases).

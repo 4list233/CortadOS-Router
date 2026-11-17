@@ -414,11 +414,10 @@ print(json.dumps({"flag": route(easy, "sensitive"), "keyword": route("explain th
 # A flagged or keyword request the Pro cannot take (switched off, on battery, the /v1/responses wire) keeps the cloud route
 # and carries the mark (detector + reason categories); a request no detector marks, or one only `prefer`s, carries none.
 # Then the real wires: the notice is content block 0 / output item 0, the model's blocks follow with their own indices and
-# stop reason. History (review round 4, the delivered form is canonical): the session's entry is the reply as delivered,
-# the injection's accepted forms (kept, merged, dropped) match by an explicit helper and by content (an index shift from
-# a compaction loses nothing), the Responses wire's echoed items fingerprint to the delivered entry, and a rebuilt
-# transcript never removes client text: a kept notice is labelled, model text that starts with the notice (its injection
-# dropped) or only quotes it is replayed exactly.
+# stop reason. History (review round 5, the delivered form is the only form): the session's entry is the reply as
+# delivered and matching is plain equality, so a merged or dropped notice is a different entry (a rewrite, never exact);
+# the Responses wire's echoed items fingerprint to the delivered entry, and a rebuilt transcript replays client text as
+# sent (no label, nothing removed).
 NOTICE_SCENARIO = """
 import json, os, sys, tempfile
 from cortados_router import core
@@ -463,36 +462,24 @@ evs = [json.loads(l[6:]) for c in anthropic_wire.sse_body(shown, "tool_use", {})
        if l.startswith("data: ")]
 msg = anthropic_wire.message_json("m", "cortados", shown, "tool_use", {})
 resp = responses_wire.message_json("r", "cortados", shown, "tool_use", {})
-fp, same = anthropic_wire.reply_fingerprint, sensitive_notice.same_reply
+fp = anthropic_wire.reply_fingerprint
 merged = [{"type": "text", "text": note["text"] + "\\n\\n" + model[0]["text"]}, model[1]]
-rec = anthropic_wire.notice_forms(model, note["text"])
-prov = sensitive_notice.Provenance([rec])
-quoted = [{"type": "text", "text": note["text"] + " is the warning the docs need."}]
-qrec = anthropic_wire.notice_forms(quoted, note["text"])          # the model's own text starts with the notice
-def rebuilt(content, pv):
+def rebuilt(content):
     return "".join(b.get("text", "") for b in anthropic_wire.rebuild_transcript(
-        [{"role": "user", "content": "q"}, {"role": "assistant", "content": content}], pv))
+        [{"role": "user", "content": "q"}, {"role": "assistant", "content": content}]))
 rin = {"model": "cortados", "input": [{"type": "message", "role": "user", "content": "q"}, *resp["output"],
        {"type": "message", "role": "user", "content": "next"}]}
-label = sensitive_notice.REBUILD_LABEL
-history = (rec.delivered == fp(shown) and type(rec.delivered) is str
-           and all(same(prov, rec.delivered, fp(c)) for c in (shown, merged, model))
-           and not same(prov, rec.delivered, fp(quoted))
-           and sensitive_notice.same_history(prov, ["p0", rec.delivered, "e"][1:], [fp(model), "e"])
-           and sensitive_notice.canonical(prov, [fp(model), "e"]) == [rec.delivered, "e"]
-           and responses_wire.parse_request(rin).history == [rec.delivered])
-rebuild = (label + note["text"] in rebuilt(shown, prov) and model[0]["text"] in rebuilt(shown, prov)
-           and rebuilt(quoted, sensitive_notice.Provenance([qrec])) == rebuilt(quoted, None)
-           and quoted[0]["text"] in rebuilt(quoted, sensitive_notice.Provenance([qrec]))
-           and label not in rebuilt(quoted, sensitive_notice.Provenance([qrec])))
+delivered = fp(shown)
+history = (type(delivered) is str and delivered not in (fp(merged), fp(model))
+           and responses_wire.parse_request(rin).history == [delivered])
+rebuild = note["text"] in rebuilt(shown) and model[0]["text"] in rebuilt(shown) and "[CortadOS" not in rebuilt(shown)
 print(json.dumps({"routes": routes, "text": note["text"],
                   "sse": [[e["index"], e["content_block"]["type"]] for e in evs if e["type"] == "content_block_start"],
                   "sse_stop": [e["delta"]["stop_reason"] for e in evs if e["type"] == "message_delta"],
                   "json": [b["type"] for b in msg["content"]], "json_stop": msg["stop_reason"],
                   "responses": [i["type"] for i in resp["output"]],
                   "fingerprint": history, "rebuild": rebuild,
-                  "distinct": anthropic_wire.notice_forms([], note["text"]).delivered
-                              != anthropic_wire.notice_forms([], sensitive_notice.text("keyword", "busy", "x")).delivered}))
+                  "distinct": fp([note]) != fp([sensitive_notice.block("keyword", "busy", "x")])}))
 """
 
 # Continuations of a local-bound conversation (review fix, 2026-11-13): every later turn of a conversation an automatic
@@ -808,7 +795,7 @@ def main():
                f"flag+off -> {rt['flag_off']} | keyword+battery -> {rt['keyword_battery']} | responses -> "
                f"{rt['responses'][1]} | plain/prefer+off -> {rt['plain_off'][1]}/{rt['prefer_off'][1]} | flag+up -> "
                f"{rt['flag_up'][0]} | sse {r['sse']} stop {r['sse_stop']} | responses {r['responses']} | "
-               f"history forms {r['fingerprint']} | rebuild keeps text {r['rebuild']} | notice-only distinct "
+               f"history exact-only {r['fingerprint']} | rebuild replays as sent {r['rebuild']} | notice-only distinct "
                f"{r['distinct']} | \"{r['text']}\"")
 
     p = runner.run(["-c", CONTINUATION_SCENARIO], prefix="verify-router-continuation-", timeout=300)
