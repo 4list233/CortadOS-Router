@@ -1147,7 +1147,9 @@ Rules on top:
 - Both bounds gate **admission only**: when the owner comes back with 6 running, the limit drops to 2, nothing new is
   admitted until fewer than 2 run, and the 6 finish on their own (never killed). A reservation is released however
   its turn ends: answered, backend error, upstream timeout, backend unreachable, client gone mid-stream, or an
-  exception in the relay (a `Ticket`, released once in the gate's `finally`).
+  exception in the relay (a `Ticket`, released once). On Ollama and on a vision model it is released in the gate's
+  `finally`; on a vllm-mlx text-only model only when the guard confirms the turn left vllm-mlx's scheduler
+  ("Retirement" below), because closing the connection does not end the request there.
 - vllm-mlx's own `--max-num-seqs` is `max_seqs()`: the idle cap, bounded by how many empty-context reservations fit.
 - **`vllm_mlx.extra_args` cannot override what the generator sets.** argparse keeps the last value of a repeated flag
   and expands abbreviations (`--ho` is `--host`), so `["--host", "0.0.0.0", "--max-num-seqs", "64"]` would expose the
@@ -1330,21 +1332,56 @@ would hold 128k of KV in the padded batch. After a long turn, or a full batch, e
 its width and row count in the reservation until no text turn runs. That is the price of not knowing when the backend
 compacts.
 
-**The drain** (#126 review round 2, P2a). Kept that way alone, the stale width could last forever: overlapping short
-turns keep the set from ever being empty, and the reviewer's repro (a 64k turn, then 100 overlapping replacements of a
-short one) ended with two 100-token turns holding 17.6 GiB and a third refused. So when a text turn is refused for
-bytes that only the stale terms take (it would fit beside the live turns reserved at their own size: `text_set_bytes`
-without the high-water and peak), the set **drains**. Every new text turn is a retryable 529 ("text set draining") and
-`free_tokens` reports 0, until the turns in flight end. The empty set then resets and admission resumes at the fresh
-size. The wait is bounded by those turns' `max_tokens` and the gate's read timeout. A turn that would not fit a fresh
-set either, or a full count, is plain busy and starts no drain.
+**The drain** (#126 review rounds 2 and 3, P2a). Kept that way alone, the stale width could last forever: overlapping
+short turns keep the set from ever being empty, and the reviewer's repro (a 64k turn, then 100 overlapping replacements
+of a short one) ended with two 100-token turns holding 17.6 GiB and a third refused. So the set **drains** when the
+kept terms (the high-water width and peak rows) withhold room: the most tokens one more turn may hold beside the live
+turns (`text_room`, the report's `free_tokens`) is smaller with them than for the live turns reserved as a fresh set.
+The governor checks this on its own state, at every departure, admission and capacity snapshot (round 3: the
+provider reads `free_tokens` before sending, `local_lane.gate_fit`, and skips a node with no room, so a refusal that
+would start the drain may never come). A text turn refused for bytes only the stale terms take drains the set too.
+While draining, every new text turn is a retryable 529 ("text set draining"), the report says so in `reason` and
+`draining`, and `free_tokens` is 0, so the provider counts the node busy, not too small. When the turns in flight end
+(and are retired) the empty set resets and admission resumes at the fresh size. The wait is bounded by those turns'
+`max_tokens` and the gate's read timeout. Room, not bytes, is the trigger: `text_room` is monotone in the tokens, so
+equal rooms mean the kept terms refuse no request size a fresh set would admit, while their bytes differ after almost
+every overlapping departure (two 20k turns overlapping: 9.0 against 5.6 GiB kept, the same room), which would drain
+for nothing. A turn that would not fit a fresh set either, or a full count, is plain busy and starts no drain.
 
 Why a drain rather than reclaiming when the backend says its batch shrank: the gate cannot see when `filter`'s lazy
 gather is evaluated, when the old wide buffer is dropped, or which freed buffer sits in MLX's cache. A "freed" report
 from the guard would need a safe point in mlx-lm's generation loop where all of that is known, and the released code
 offers none without patching the loop. The drain needs no backend signal: it never shrinks the reservation while a
 turn of the old set runs, so the lazy-free protection holds, and it costs only a short pause in admissions after a
-long turn ends beside short ones. `fit_tokens` / `free_tokens` in the capacity report are computed from
+long turn ends beside short ones. Retirement (below) tells the gate when a request has left the scheduler, which is
+when its ticket may leave the set; it does not say when the batch's lazy buffers go, so the set's kept terms stay.
+
+**Retirement** (#126 review round 3, P1). Closing the upstream connection does not end a request in vllm-mlx 0.6.0:
+`_disconnect_guard` defers the stream generator's close by 0.5 s (`server.py` 5481-5497), and `Scheduler.abort_request`
+only queues the id (`scheduler.py` 2227-2242) until the executor's next `step()` processes it
+(`_process_pending_aborts`, then `_do_abort_request` removes its rows from the batch generator). Releasing a ticket when
+forwarding ended let the reviewer's repro run 8 rows upstream (a timed-out 64k turn and 7 short ones, 31.25 GiB of KV)
+against 7 tickets and 12.05 GiB reserved. Now, on a vllm-mlx node serving a text-only model (governed or not):
+
+- each forwarded turn carries a fresh ticket id (`x-cortados-ticket: <unix ms>.<32 hex>`, random, no request data);
+- when forwarding ends the ticket turns **retiring**: it keeps its count slot, its bytes and its place in the text set,
+  and the report counts it under `retiring` (`reason`: "N ended turns await backend release");
+- the gate's `Retirer` thread asks the guard (`POST /cortados/retire {"tickets": [...]}` on the loopback backend, every
+  0.2 s while any ticket retires, backing off to 2 s after a failure) and releases exactly the ids it answers retired;
+- the guard (`TicketLedger`) refuses a generating request (any method but GET / HEAD / OPTIONS) without a fresh, unused
+  ticket (409, before vllm-mlx reads it), binds every scheduler request id to its ticket in `EngineCore.add_request`
+  (the request's own task; a scheduler request bound to no open ticket is refused), and at the **safe point**, the end
+  of every `Scheduler.step()` and `reset()` (or on a query when no step is running), marks a request gone once it is in
+  none of the waiting queue, the running map, the request-to-uid map (rows in the batch generator) or the unfinished
+  requests. A ticket is retired when its HTTP exchange has ended and every request bound to it is gone or never entered
+  the queue; it is then closed, and nothing more may bind to it.
+- An id the guard never saw is tombstoned (refused should it still arrive) and retired: it never entered this process's
+  scheduler. So a backend restart, a new process whose rows are all freed, retires every retiring ticket.
+- **Fail closed**: no confirmation (the guard hung, a step that never returns, the backend unreachable) keeps the ticket
+  reserved and the node busy. A connect that failed sent nothing and is released at once.
+
+The gate and the guard ship together: an old guard answers 404 there, so every ticket would stay retiring and the node
+busy. A vision model's turns are unchanged (#125): its guard has no ledger and the gate releases them as before. `fit_tokens` / `free_tokens` in the capacity report are computed from
 the same set formula (`text_room`), so the provider's skip check sees the new room. Short turns are unchanged: their
 old reservation was already at least the computed peak, so it stands byte for byte (eight ~2k-token turns still run
 at once). A vision model's turns, text-only ones included, reserve exactly as in #125 (`text_route` is false there).
@@ -1500,8 +1537,15 @@ extension imports `mlx._reprlib_fix` and `mlx.__array_api_info`. Those 24 files 
 must equal the released wheels' bytes beside the pinned `mlx.core`. They are byte-identical in all 27 macOS arm64
 wheels (fetched from PyPI 2026-11-17), so every tag's row is one table. `mlx` must stay a namespace package (no
 `mlx/__init__.py`, which would run on import), and `mlx.nn`, `mlx.utils`, `mlx._reprlib_fix` and `mlx.__array_api_info`
-must resolve to the pinned files. A drifted file, such as `silu` promoting to float32, stops startup. Any mismatch
-fails closed. The
+must resolve to the pinned files. A drifted file, such as `silu` promoting to float32, stops startup. `mlx.nn` itself
+is a regular package in every 0.32.4 wheel, so its `nn/__init__.py` is pinned by hash rather than required absent.
+Any mismatch fails closed. **Order** (#126 review round 3, P2b): every one of these checks reads the disk only, and
+all of them run before anything is imported (`_preflight`: vllm-mlx's pinned files, its package `__init__.py` now
+among them; mlx-lm's or mlx-vlm's; mlx's and mlx-metal's), each package located with `importlib.util.find_spec` of
+its top-level name and the dist-info `RECORD`s, neither of which runs package code. Only then are they imported, and
+each import is checked to come from the folder verified (and `mlx.core` to be the pinned extension). Before, importing
+vllm-mlx's scheduler pulled in `mlx.core`, `mlx_lm` and `mlx.nn` ahead of their checks, so a line planted in
+`mlx/nn/__init__.py` ran even though startup then refused. The
 expected hashes come from the released PyPI wheels (fetched 2026-11-16; each RECORD hash re-checked against the file
 bytes in its wheel). The Pro's Python and macOS tag could not be read from the build machine, so every macOS arm64
 wheel of 0.32.4 is pinned: CPython 3.10–3.15 and the free-threaded 3.13t–3.15t (27 mlx rows), macOS 14.0 / 15.0 / 26.0

@@ -1633,6 +1633,7 @@ class GuardVisionStartupTests(VisionGuardBase):
                 self.assertEqual(rc, 2)
                 self.assertIn(f"{pkg}/{rel} differs", err)
         import sys
+        import mlx_vlm                                    # the drifts above stopped startup before any import (P2b)
         with patch.object(sys.modules["mlx_vlm"], "__version__", "0.7.13"):
             rc, err = self.run_main(self.serve(model))
         self.assertEqual(rc, 2)

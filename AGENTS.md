@@ -26,7 +26,9 @@ is the long form.
   (its Python files too), #126), `local_governor.py` (the gate's admission: a count from owner idle
   time and memory pressure, and a byte budget each request reserves its KV cache from (a text-only model's text turns as one
   set: the padded decode batch and the guard's one-at-a-time 256-token text prefill, drained when a departed
-  turn's width alone refuses one, #126); over either a retryable 529, never
+  turn's kept width withholds room, checked on the governor's own state, #126; a vllm-mlx text turn is released only
+  when the guard's `TicketLedger` confirms it left the scheduler: `local_gate.Retirer`, docs/LOCAL-RESOURCES.md
+  "Retirement"); over either a retryable 529, never
   fitting a non-retryable 413 the provider routes elsewhere; input tokens bounded by the body's bytes as received plus a template allowance, never a backend count; images and documents refused for the text-only model, and for a model entry declaring `vision` (#125) still images
   within its policy, an image slot and the computed media-prefill bytes (`image_prefill_bytes`, the guard prefills
   image prompts in chunks keeping one position's logits) in the same atomic reservation; `image_check.py` reads image

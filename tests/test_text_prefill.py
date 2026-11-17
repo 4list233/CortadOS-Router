@@ -208,12 +208,15 @@ class TextAdmissionTests(unittest.TestCase):
         self.assertEqual(self.a.reserved, local_governor.text_set_bytes(cfg, [short], long.tokens, self.a._peak)["total"])
         self.assertGreaterEqual(self.a.reserved, local_governor.text_set_bytes(cfg, [short], long.tokens)["total"])
         self.assertGreater(self.a.reserved, local_governor.text_set_bytes(cfg, [short])["total"])
-        # a second short one is reserved as if 64k wide too
+        # a second short one would be reserved as if 64k wide too: whether it is admitted beside the kept width or
+        # the set drains first (#126 round 3: when the kept width withholds room), the width stays until the set ends
         t2, snap = self.a.try_acquire(load=self.a.text_load(4000, 512))
-        self.assertEqual(snap["reserved_bytes"],
-                         local_governor.text_set_bytes(cfg, [short, t2.load], long.tokens, self.a._peak)["total"])
-        t_short.release()
-        t2.release()                                                   # drained: the width is gone
+        if t2 is not None:
+            self.assertEqual(snap["reserved_bytes"],
+                             local_governor.text_set_bytes(cfg, [short, t2.load], long.tokens, self.a._peak)["total"])
+            t2.release()
+        self.assertEqual(self.a._high_water, long.tokens)
+        t_short.release()                                              # drained: the width is gone
         self.assertEqual((self.a._high_water, self.a.reserved), (0, 0))
         t3 = self.a.try_acquire(load=self.a.text_load(4000, 512))[0]
         self.assertEqual(self.a.reserved, local_governor.text_set_bytes(cfg, [t3.load])["total"])
@@ -353,8 +356,17 @@ class MlxLmPinTests(unittest.TestCase):
                     self.guard.verify_text(self.lm, "0.31.3", self.pins)
                 path.write_text(text)
 
-    def test_the_text_modules_check_mlx_lm_and_mlx(self):
+    def test_the_text_checks_run_on_disk_first_and_then_check_what_was_imported(self):
+        # #126 review round 3 (P2b): the preflight reads files only; the imports come after it, each checked
         calls = []
+        with patch.object(self.guard, "_locate", lambda name: calls.append(("locate", name)) or self.lm), \
+                patch.object(self.guard, "verify_text", lambda d, v, *a: calls.append(("text", v))), \
+                patch.object(self.guard, "verify_mlx_files", lambda *a, **k: calls.append(("mlx files",))
+                             or ("tag", "core", "lib")):
+            found = self.guard._text_preflight()
+        self.assertEqual(calls, [("locate", "mlx_lm"), ("text", None), ("mlx files",)])
+        self.assertEqual(found, {"mlx_lm": self.lm, "mlx": ("tag", "core", "lib")})
+        calls.clear()
         fake = type(sys)("mlx_lm")
         fake.__file__ = os.path.join(self.lm, "__init__.py")
         fake.__version__ = "0.31.3"
@@ -363,10 +375,13 @@ class MlxLmPinTests(unittest.TestCase):
         engine.batched = batched
         mods = {"mlx_lm": fake, "vllm_mlx.engine": engine, "vllm_mlx.engine.batched": batched}
         with patch.dict(sys.modules, mods), \
-                patch.object(self.guard, "verify_text", lambda *a: calls.append(("text", a[1]))), \
-                patch.object(self.guard, "verify_mlx", lambda *a, **k: calls.append(("mlx",))):
-            self.assertIs(self.guard._text_modules(), batched)
-        self.assertEqual(calls, [("text", "0.31.3"), ("mlx",)])
+                patch.object(self.guard, "verify_text", lambda d, v, *a: calls.append(("text", v))), \
+                patch.object(self.guard, "verify_mlx_core", lambda *a: calls.append(("core",) + a)):
+            self.assertIs(self.guard._text_modules(found), batched)
+            self.assertEqual(calls, [("text", "0.31.3"), ("core", "core", "lib")])
+            fake.__file__ = os.path.join(self.dir, "elsewhere", "mlx_lm", "__init__.py")
+            with self.assertRaisesRegex(self.guard.GuardError, "mlx_lm was imported from"):
+                self.guard._text_modules(found)
 
 
 def text_config(**over) -> dict:
@@ -543,36 +558,84 @@ SERVE_TEXT = ["--context-tokens", "131072", *TEXT, "--", "serve", "/models/text"
 
 
 class TextSetDrainTests(unittest.TestCase):
-    """#126 review round 2 (P2a): the departed turns' width and rows stay reserved while any text turn runs (the
-    lazy-free protection), and a turn refused for those stale bytes alone drains the set, so they are reclaimed in a
-    bounded number of steps instead of never under overlapping traffic."""
+    """#126 review rounds 2 and 3 (P2a): the departed turns' width and rows stay reserved while any text turn runs (the
+    lazy-free protection), and the set drains as soon as they withhold room the live turns would leave as a fresh set:
+    from the governor's own state (a departure, an admission, a snapshot), not only from a refused POST, because the
+    provider reads the capacity report first and never sends a turn the report has no room for."""
 
     def setUp(self):
         self.a = local_governor.Admission(FixedGovernor())             # owner idle: count 8, 25 GiB beside the weights
         self.cfg = self.a.governor.cfg
+        from cortados_router.provider import local_lane
+        self.lane = local_lane
+        self.node = {"node": "test-drain-node"}
+        self.addCleanup(local_lane._gate_reports.pop, self.node["node"], None)
 
     def short(self):
         return self.a.try_acquire(load=self.a.text_load(100, 1))
 
-    def test_round2_repro_recovers_within_a_bounded_number_of_steps(self):
+    def preflight(self, tokens):
+        """What the provider decides before sending (routing: local_lane.gate_fit on the gate's latest report)."""
+        self.lane._note_gate(self.node, {"backend": "vllm-mlx", **self.a.snapshot()})
+        return self.lane.gate_fit(self.node, tokens)
+
+    def fresh_room(self, loads):
+        return local_governor.text_room(self.cfg, loads, local_governor.available_bytes(self.cfg))
+
+    def test_round3_repro_the_preflight_cannot_keep_the_stale_width_forever(self):
+        # the reviewer's repro: a departed 64k width kept by two short turns, 100 rounds of "the provider's preflight
+        # skips a third, one short turn finishes, its replacement is admitted". Before: never draining, the
+        # high-water 64,001, 17.6 GiB held, free_tokens 0 forever. Now the governor drains on its own state
+        tokens = local_governor.request_tokens(self.cfg, 100, 1)
+        t_long, _ = self.a.try_acquire(load=self.a.text_load(64000, 1))
+        live = [self.short()[0]]
+        t_long.release()
+        # one short turn beside the kept width withholds no room yet (a second row at 64k fits either way)
+        self.assertFalse(self.a.snapshot()["draining"])
+        live.append(self.short()[0])
+        self.assertTrue(all(live))
+        # two do: a third row at the kept 64k width fits nowhere, while a fresh set has room. The governor drains on
+        # its own state, without any refused POST
+        self.assertTrue(self.a._draining)
+        recovered = None
+        for step in range(100):
+            fit = self.preflight(tokens)
+            if fit is None:                                            # the provider sends the turn
+                t, snap = self.short()
+                self.assertIsNotNone(t, snap.get("reason"))
+                live.append(t)
+                if not self.a._draining and self.a._high_water < 64000:
+                    recovered = step
+                    break
+            else:
+                self.assertEqual(fit[0], "busy")                       # retryable, never "too_large"
+                self.assertIn("draining", self.lane.gate_report(self.node)["reason"])
+            if live:
+                live.pop(0).release()                                  # one short turn finishes
+            t, snap = self.short()                                      # its replacement
+            if t is not None:
+                live.append(t)
+            else:
+                self.assertEqual(snap["refused"], "busy")
+        self.assertIsNotNone(recovered, "the stale width was never reclaimed")
+        self.assertLessEqual(recovered, 3)                             # bounded by the two turns of the old set
+        self.assertEqual(self.a.reserved, local_governor.text_set_bytes(self.cfg, [t.load for t in live])["total"])
+        self.assertLess(self.a.reserved, 6 * GIB)
+        self.assertEqual(self.a.snapshot()["free_tokens"], self.fresh_room([t.load for t in live]))
+
+    def test_round2_repro_a_refused_turn_still_drains_the_set(self):
+        # the direct-admission path (a turn the preflight let through, refused for the stale bytes alone)
         t_long, _ = self.a.try_acquire(load=self.a.text_load(64000, 1))
         live, _ = self.short()
         t_long.release()
-        for _ in range(100):                                           # overlapping replacement: admit, then release
-            nxt, snap = self.short()
-            self.assertIsNotNone(nxt, snap.get("reason"))
-            live.release()
-            live = nxt
         second, _ = self.short()
         self.assertIsNotNone(second)
+        self.a._draining = False                                       # as if the governor had not looked yet
         third, snap = self.short()
-        # the reviewer's state: 529, the high-water 64,001, two tiny turns holding 17.6 GiB
         self.assertEqual((third, snap["refused"], self.a._high_water), (None, "busy", 64001))
-        self.assertGreater(self.a.reserved, 17 * GIB)
         self.assertIn("draining", snap["reason"])
         self.assertTrue(self.a._draining)
         self.assertEqual(snap["free_tokens"], 0)                       # the provider sees no room while draining
-        # draining: every new text turn waits (retryable) until the two in flight end, then the set resets
         for _ in range(3):
             t, snap = self.short()
             self.assertEqual((t, snap["refused"]), (None, "busy"))
@@ -584,75 +647,55 @@ class TextSetDrainTests(unittest.TestCase):
         tickets = [self.short()[0] for _ in range(3)]                  # the third tiny turn now runs, at the fresh size
         self.assertTrue(all(tickets))
         self.assertEqual(self.a.reserved, local_governor.text_set_bytes(self.cfg, [t.load for t in tickets])["total"])
-        self.assertLess(self.a.reserved, 6 * GIB)
-
-    def test_a_steady_stream_of_short_turns_after_a_long_one_is_not_starved(self):
-        # a client wants three short turns in flight and retries what is refused; a turn that was refused lets the
-        # oldest in flight finish. Without the drain the third never runs (the high-water stays at 64,001 forever)
-        t_long, _ = self.a.try_acquire(load=self.a.text_load(64000, 1))
-        live = [self.short()[0]]
-        self.assertIsNotNone(live[0])
-        t_long.release()
-        recovered = None
-        for step in range(50):
-            t, _ = self.short()
-            if t is not None:
-                live.append(t)
-            if len(live) == 3:
-                recovered = step
-                break
-            if t is None and live:
-                live.pop(0).release()                                   # the oldest finishes
-        self.assertIsNotNone(recovered, "three short turns never ran together")
-        self.assertLessEqual(recovered, 6)                              # the drain lasts as long as the old set's turns
-        self.assertEqual(self.a._high_water, 101)                       # at the fresh width
-        self.assertEqual(self.a.reserved, local_governor.text_set_bytes(self.cfg, [t.load for t in live])["total"])
 
     def test_the_departed_width_stays_reserved_while_its_set_runs(self):
         # the lazy-free protection: no byte of the departed 64k row is given back while a turn that may share its
         # batch runs, drain or no drain
         long, short = self.a.text_load(64000, 1), self.a.text_load(100, 1)
         t_long, t_short = self.a.try_acquire(load=long)[0], self.a.try_acquire(load=short)[0]
-        held = self.a.reserved
         t_long.release()
-        stale = local_governor.text_set_bytes(self.cfg, [short], long.tokens, self.a._peak)["total"]
-        self.assertEqual(self.a.reserved, stale)
-        self.assertGreater(stale, local_governor.text_set_bytes(self.cfg, [short])["total"])
         t2 = self.short()[0]
         self.assertIsNotNone(t2)
-        before = self.a.reserved
-        refused, snap = self.short()                                   # starts the drain
-        self.assertIsNone(refused)
         self.assertTrue(self.a._draining)
-        self.assertEqual(self.a.reserved, before)                      # a refusal changes nothing
-        self.assertGreaterEqual(self.a.reserved, local_governor.text_set_bytes(self.cfg, [short, t2.load],
-                                                                             long.tokens)["total"])
+        stale = local_governor.text_set_bytes(self.cfg, [short, t2.load], long.tokens, self.a._peak)["total"]
+        self.assertEqual(self.a.reserved, stale)
+        self.assertGreater(stale, local_governor.text_set_bytes(self.cfg, [short, t2.load])["total"])
+        refused, snap = self.short()
+        self.assertIsNone(refused)
+        self.assertEqual(self.a.reserved, stale)                       # a refusal changes nothing
         t_short.release()
         self.assertEqual(self.a.reserved, local_governor.text_set_bytes(self.cfg, [t2.load], long.tokens,
                                                                         self.a._peak)["total"])
-        self.assertLessEqual(self.a.reserved, held + local_governor.text_set_bytes(self.cfg, [t2.load], long.tokens,
-                                                                                   self.a._peak)["total"])
         t2.release()
         self.assertEqual(self.a.reserved, 0)
 
-    def test_no_drain_when_the_turn_would_not_fit_a_fresh_set_either_or_the_count_is_full(self):
-        # a turn too big for the live set even at its fresh size is plain busy: draining would not be what admits it
-        t_long, _ = self.a.try_acquire(load=self.a.text_load(64000, 1))
-        live, _ = self.short()
-        t_long.release()
+    def test_no_drain_while_the_kept_terms_withhold_no_room(self):
+        # overlapping turns of similar size: the departed one's rows stay reserved (bytes), but the room the report
+        # advertises is the fresh set's, so no request size is held back and admission goes on without a drain
+        a, b = self.a.text_load(20000, 8000), self.a.text_load(20000, 8000)
+        ta, tb = self.a.try_acquire(load=a)[0], self.a.try_acquire(load=b)[0]
+        ta.release()
+        self.assertGreater(self.a.reserved, local_governor.text_set_bytes(self.cfg, [b])["total"])   # bytes kept
+        snap = self.a.snapshot()
+        self.assertFalse(snap["draining"])
+        self.assertEqual(snap["free_tokens"], self.fresh_room([b]))
+        for _ in range(20):                                            # steady overlap: never a drain
+            nxt, snap = self.a.try_acquire(load=self.a.text_load(20000, 8000))
+            self.assertIsNotNone(nxt, snap.get("reason"))
+            tb.release()
+            tb = nxt
+            self.assertFalse(self.a.snapshot()["draining"])
+        # a turn too big for the live set even at its fresh size is plain busy: draining would not admit it
         big, snap = self.a.try_acquire(load=self.a.text_load(120_000, 4096))
         self.assertEqual((big, snap["refused"]), (None, "busy"))
         self.assertNotIn("draining", snap["reason"])
         self.assertFalse(self.a._draining)
-        live.release()
         # the count limit is the governor's sample, never a drain
         busy = local_governor.Admission(FixedGovernor(idle_s=0.0))      # owner active: the active cap
-        tickets = []
         while True:
             t, snap = busy.try_acquire(load=busy.text_load(100, 1))
             if t is None:
                 break
-            tickets.append(t)
         self.assertFalse(busy._draining)
         self.assertNotIn("draining", snap["reason"])
 

@@ -51,6 +51,7 @@ import json
 import logging
 import math
 import os
+import secrets
 import socket
 import stat
 import sys
@@ -119,8 +120,28 @@ UNSUPPORTED_MESSAGE = "local gate: content this node's model cannot read"
 # The capacity report's fields (GateServer.capacity, the 529 and 413 answers). Bytes and tokens are None without a
 # governor: reserved/free bytes of the budget beside the weights, and the most tokens one request may hold alone
 # (fit_tokens) and beside what runs now (free_tokens), which the provider's routing reads.
-CAPACITY_KEYS = ("limit", "inflight", "owner", "pressure", "reason", "reserved_bytes", "free_bytes", "fit_tokens",
-                 "free_tokens", "image_inflight", "image_limit")
+CAPACITY_KEYS = ("limit", "inflight", "retiring", "draining", "owner", "pressure", "reason", "reserved_bytes",
+                 "free_bytes", "fit_tokens", "free_tokens", "image_inflight", "image_limit")
+# Retirement (#126 review round 3, P1). On a vllm-mlx node serving a text-only model under a governor, a text turn's
+# ticket is NOT released when forwarding ends: closing the upstream connection does not end the request in vllm-mlx
+# (it defers the stream's close by 0.5 s and queues the scheduler abort until the executor's next step), so its rows
+# may still be in the decode batch. Each forwarded turn carries a fresh ticket id (TICKET_HEADER: "<unix ms>.<32 hex>",
+# random, no request data); when forwarding ends the ticket turns "retiring" (it keeps its count slot, its bytes and its
+# place in the text set) and the Retirer asks the prompt guard inside vllm-mlx (RETIRE_PATH on the upstream) which
+# retiring ids it has seen leave the scheduler. Only that confirmation releases the ticket. The guard confirms an id
+# it never saw by tombstoning it (refusing it should it still arrive), so a backend restart (a new process: every row
+# freed) confirms every old id. No confirmation (backend hung or unreachable): the ticket stays reserved and the node
+# reports busy ("retiring" in the capacity report): fail closed. A connect that failed sent nothing: released at once.
+# This holds on every vllm-mlx node serving a text-only model, governed or not: its guard refuses a generating request
+# without a fresh ticket (409), so the gate and the guard ship together (scripts/install_mlx_backend.sh copies both).
+# integrations/vllm-mlx/cortados_vllm_mlx_guard.py (TicketLedger) is the other side; a test keeps the names equal.
+TICKET_HEADER = "x-cortados-ticket"
+RETIRE_PATH = "/cortados/retire"
+RETIRE_POLL_S = 0.2                         # between confirmation polls while tickets are retiring
+RETIRE_BACKOFF_S = 2.0                      # the longest wait between polls after a failed one
+RETIRE_TIMEOUT_S = 5.0                      # one poll, end to end (deadline_call)
+RETIRE_BATCH = 256                          # ids per poll
+RETIRE_MAX_BYTES = 1 << 20                  # the guard's answer is ids it was asked about only
 # The served model's declared image capability in the report (#125): None for a text-only model, else these settings of
 # its vision policy (local_governor.VISION_DEFAULTS), so the provider sees that the node reads still images and within
 # which limits. Static config, no request data.
@@ -445,7 +466,18 @@ class GateServer(ThreadingHTTPServer):
         if self.backend["backend"] not in local_backend.BACKENDS:
             raise GateConfigError(f"unknown backend {self.backend['backend']!r}")
         self.admission = admission if admission is not None else local_governor.Admission(None)
+        # Retirement (RETIRE_PATH): a vllm-mlx node serving a text-only model, whose guard serves the text route with
+        # the ticket ledger installed and confirms each release (a vision model's guard has no ledger: #125 unchanged).
+        gov = self.admission.governor
+        vision = gov.cfg.get("vision") if gov is not None else (self.backend.get("model") or {}).get("vision")
+        self.retirer = Retirer(self.upstream_host, self.upstream_port, connect_timeout=connect_timeout) \
+            if self.backend["backend"] == "vllm-mlx" and not vision else None
         super().__init__(addr, GateHandler)
+
+    def server_close(self):
+        if self.retirer is not None:
+            self.retirer.stop()
+        super().server_close()
 
     def capacity(self) -> dict:
         """The read-only capacity report: backend, the admission limit (None: unlimited) and how many run now, and
@@ -482,6 +514,101 @@ class GateServer(ThreadingHTTPServer):
         finally:
             if self.slots is not None:
                 self.slots.release()
+
+
+def new_ticket_id(now: float | None = None) -> str:
+    """A fresh retirement id (TICKET_HEADER): the minting time in unix milliseconds and 128 random bits."""
+    return f"{int((time.time() if now is None else now) * 1000)}.{secrets.token_hex(16)}"
+
+
+class Retirer:
+    """The retiring tickets (TICKET_HEADER / RETIRE_PATH above) and the one thread that asks the guard about them.
+    hand_over(ticket, id) marks the ticket retiring and queues it; a poll POSTs {"tickets": [ids]} to the upstream's
+    RETIRE_PATH and releases exactly the ids the answer lists under "retired". A failed poll (unreachable, an error
+    status, an unreadable answer) releases nothing and backs off up to RETIRE_BACKOFF_S: fail closed. `call` (tests)
+    replaces the HTTP call: call(ids) -> the parsed answer."""
+
+    def __init__(self, host: str, port: int, *, connect_timeout: float = CONNECT_TIMEOUT_S,
+                 interval: float = RETIRE_POLL_S, call=None, start: bool = True):
+        self.host, self.port, self.connect_timeout, self.interval = host, port, connect_timeout, interval
+        self._call = call or self._http
+        self._cv = threading.Condition()
+        self._pending: dict[str, local_governor.Ticket] = {}
+        self._stopped = False
+        self._start = start
+        self._thread: threading.Thread | None = None
+        self.last_error: str | None = None
+
+    def hand_over(self, ticket: local_governor.Ticket, ticket_id: str) -> None:
+        ticket.mark_retiring()
+        with self._cv:
+            self._pending[ticket_id] = ticket
+            if self._start and not self._stopped and (self._thread is None or not self._thread.is_alive()):
+                self._thread = threading.Thread(target=self._run, name="gate-retirer", daemon=True)
+                self._thread.start()
+            self._cv.notify_all()
+
+    def pending(self) -> list[str]:
+        with self._cv:
+            return list(self._pending)
+
+    def stop(self) -> None:
+        with self._cv:
+            self._stopped = True
+            self._cv.notify_all()
+
+    def _http(self, ids: list[str]) -> object:
+        conn = http.client.HTTPConnection(self.host, self.port)
+        try:
+            status, raw = deadline_call(conn, RETIRE_TIMEOUT_S, "POST", RETIRE_PATH,
+                                        body=json.dumps({"tickets": ids}).encode(),
+                                        headers={"content-type": "application/json"}, max_bytes=RETIRE_MAX_BYTES,
+                                        connect_s=min(self.connect_timeout, RETIRE_TIMEOUT_S))
+        finally:
+            conn.close()
+        if status != 200:
+            raise ValueError(f"the guard answered {status}")
+        return json.loads(raw)
+
+    def poll_once(self) -> int:
+        """Ask about up to RETIRE_BATCH retiring ids; release the confirmed ones. The number released; ValueError,
+        OSError or http.client.HTTPException when the poll failed (nothing released)."""
+        ids = self.pending()[:RETIRE_BATCH]
+        if not ids:
+            return 0
+        answer = self._call(ids)
+        retired = answer.get("retired") if isinstance(answer, dict) else None
+        if not isinstance(retired, list):
+            raise ValueError("the guard's answer has no retired list")
+        asked, done = set(ids), []
+        with self._cv:
+            for rid in retired:
+                if isinstance(rid, str) and rid in asked and rid in self._pending:
+                    done.append(self._pending.pop(rid))
+        for ticket in done:
+            ticket.release()
+        return len(done)
+
+    def _run(self) -> None:
+        wait = self.interval
+        while True:
+            with self._cv:
+                while not self._pending and not self._stopped:
+                    self._cv.wait()
+                if self._stopped:
+                    return
+            try:
+                self.poll_once()
+                self.last_error, wait = None, self.interval
+            except Exception as exc:                 # noqa: BLE001 (the thread must outlive any one poll)
+                # fail closed: the tickets stay reserved, the node reports them retiring
+                if self.last_error is None:
+                    logger.warning("retirement poll failed (%s): %d tickets stay reserved", type(exc).__name__,
+                                   len(self.pending()))
+                self.last_error, wait = type(exc).__name__, min(RETIRE_BACKOFF_S, wait * 2)
+            with self._cv:
+                if self._pending and not self._stopped:
+                    self._cv.wait(wait)
 
 
 class GateHandler(BaseHTTPRequestHandler):
@@ -638,7 +765,8 @@ class GateHandler(BaseHTTPRequestHandler):
         # Admission: hold LOCK_SH on the node lock from here until the response is fully relayed. A trainer holds
         # LOCK_EX for its whole run (studio_capacity.training_gate), so the kernel guarantees no request reaches
         # Ollama while training runs, and the trainer cannot start while this request is in flight.
-        lock_fd, ticket = None, None
+        lock_fd, ticket, ticket_id = None, None, None
+        self._upstream_sent = False
         if self.server.studio_gate_dir is not None:
             try:
                 # create=False: a request never recreates a missing/renamed-away gate dir (studio_capacity.open_node_lock);
@@ -682,12 +810,20 @@ class GateHandler(BaseHTTPRequestHandler):
                     if snap.get("refused") == "unsupported":
                         return self._unsupported(snap.get("reason") or "the model reads no images")
                     return self._too_large(snap) if snap.get("refused") == "too_large" else self._busy(snap)
-            self._forward(method, path, body)
+                if self.server.retirer is not None and not images:
+                    ticket_id = new_ticket_id()          # retirement: the guard reports this id's release
+            self._forward(method, path, body, ticket_id)
         finally:
             if ticket is not None:
-                # However the turn ended (relayed, an upstream error or timeout, the client gone, an exception on the
-                # way out): its slot and bytes are free. Ticket.release is idempotent.
-                ticket.release()
+                if ticket_id is not None and self._upstream_sent:
+                    # A text turn on a guarded vllm-mlx: its rows may outlive this connection, so the ticket stays
+                    # reserved (retiring) until the guard confirms the request left the scheduler (RETIRE_PATH).
+                    self.server.retirer.hand_over(ticket, ticket_id)
+                else:
+                    # However the turn ended (relayed, an upstream error or timeout, the client gone, an exception on
+                    # the way out): its slot and bytes are free. Nothing was sent upstream for a retiring turn whose
+                    # connect failed. Ticket.release is idempotent.
+                    ticket.release()
             if lock_fd is not None:
                 os.close(lock_fd)            # releases LOCK_SH
 
@@ -823,18 +959,22 @@ class GateHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-    def _forward(self, method: str, path: str, body: bytes | None) -> None:
+    def _forward(self, method: str, path: str, body: bytes | None, ticket_id: str | None = None) -> None:
         backend = self.server.backend["backend"]
         name = "Ollama" if backend == "ollama" else backend
         up_method, up_path = local_backend.UPSTREAM[backend][(method, path)]
         conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port,
                                           timeout=self.server.connect_timeout)
+        headers = {"content-type": self.headers.get("content-type") or "application/json"}
+        if ticket_id is not None:
+            headers[TICKET_HEADER] = ticket_id
         try:
             try:
                 conn.connect()
+                # connected: from here bytes may reach the backend, so a retiring ticket waits for its confirmation
+                self._upstream_sent = True
                 conn.sock.settimeout(self.server.read_timeout)
-                conn.request(up_method, up_path, body=body,
-                             headers={"content-type": self.headers.get("content-type") or "application/json"})
+                conn.request(up_method, up_path, body=body, headers=headers)
                 resp = conn.getresponse()
             except (OSError, http.client.HTTPException) as exc:
                 return self._error(502, "api_error", f"{name} unreachable on loopback ({type(exc).__name__})")

@@ -992,13 +992,20 @@ NO_GOVERNOR = {"limit": None, "owner": None, "pressure": None, "reason": "no gov
 
 class Ticket:
     """One admitted request's hold: a COUNT slot and the bytes it reserved. release() gives both back, once (a second
-    call, from a later finally or error path, does nothing)."""
+    call, from a later finally or error path, does nothing). mark_retiring() (#126 review round 3, P1): the gate is
+    done with the request but the backend has not yet confirmed that it left the scheduler; the ticket keeps its
+    slot, its bytes and its place in the text set (width and rows) until release(), and the capacity report counts
+    it under "retiring"."""
 
     def __init__(self, admission: "Admission", reserved: int, image: bool = False, load: TextLoad | None = None):
         self._admission, self.reserved, self._done, self.image, self.load = admission, reserved, False, image, load
+        self.retiring = False
 
     def release(self) -> None:
         self._admission._release(self)
+
+    def mark_retiring(self) -> None:
+        self._admission._mark_retiring(self)
 
 
 class Admission:
@@ -1017,11 +1024,19 @@ class Admission:
         self._loads: list[TextLoad] = []     # the text route's requests in flight (#126): reserved as one set
         self._high_water = 0                 # the longest text context admitted since the set was last empty
         self._peak = (0, 0)                  # the set's largest (cells, cache_overshoot) since it was last empty
-        self._draining = False               # stale width / rows refused a turn: no new text turn until the set drains
+        self._draining = False               # stale width / rows reserved: no new text turn until the set drains
+        self.retiring = 0                    # tickets the gate is done with, awaiting the backend's confirmation
 
     def _report(self, g: dict[str, Any]) -> dict[str, Any]:
-        """The state report under the lock: the count sample, in flight, and (governed) the bytes and token room."""
-        out = {**g, "inflight": self.inflight}
+        """The state report under the lock: the count sample, in flight, and (governed) the bytes and token room.
+        "retiring" counts the in-flight tickets awaiting the backend's release confirmation; "draining" says the text
+        set is draining (its free_tokens is then 0, a retryable busy: admission resumes when the set empties), and the
+        reason says so."""
+        out = {**g, "inflight": self.inflight, "retiring": self.retiring, "draining": self._draining}
+        if self._draining:
+            out["reason"] = "text set draining: a departed turn's width is held until the running turns end"
+        if self.retiring:
+            out["reason"] = f"{out.get('reason') or 'governor'}; {self.retiring} ended turns await backend release"
         if self.governor is None:
             return {**out, "reserved_bytes": None, "free_bytes": None, "fit_tokens": None, "free_tokens": None,
                     "image_inflight": None, "image_limit": None}
@@ -1053,11 +1068,32 @@ class Admission:
         """The part of `reserved` held by per-request reservations (everything but the text set)."""
         return max(0, self.reserved - self._set_bytes())
 
+    def _stale_locked(self) -> bool:
+        """True when the text set's kept terms (the high-water width and peak rows of turns that have left) cost room
+        the loads in flight would leave as a fresh set: the free_tokens the report advertises (text_room) is smaller
+        with them than without. Room, not bytes: text_room is monotone in the tokens, so equal rooms mean the kept
+        terms refuse no request size the fresh set would admit, while their bytes alone differ after almost every
+        overlapping departure (two 20k turns: 9.0 against 5.6 GiB, the same room). What the provider never sees
+        offered (local_lane.gate_fit skips a request over free_tokens) is exactly what a smaller room withholds."""
+        if not self._loads or self.governor is None:
+            return False
+        cfg = self.governor.cfg
+        budget = available_bytes(cfg) - self._summed_bytes()
+        return text_room(cfg, self._loads, budget, self._high_water, self._peak) < text_room(cfg, self._loads, budget)
+
+    def _check_drain_locked(self) -> None:
+        """Enter the drain from the governor's own state (#126 review round 3, P2a): as soon as a departure leaves
+        stale width or rows reserved, not only when a turn is refused for them. The provider reads the capacity report
+        before sending (local_lane.gate_fit) and skips a node with no room, so a refusal may never come."""
+        if not self._draining and self._stale_locked():
+            self._draining = True
+
     def snapshot(self) -> dict[str, Any]:
-        """{"limit", "inflight", "owner", "pressure", "reason", "reserved_bytes", "free_bytes", "fit_tokens",
-        "free_tokens"}: what the gate reports (bytes and tokens None without a governor)."""
+        """{"limit", "inflight", "retiring", "draining", "owner", "pressure", "reason", "reserved_bytes", "free_bytes",
+        "fit_tokens", "free_tokens"}: what the gate reports (bytes and tokens None without a governor)."""
         g = self.governor.current() if self.governor else NO_GOVERNOR
         with self._lock:
+            self._check_drain_locked()
             return self._report(g)
 
     @property
@@ -1093,13 +1129,15 @@ class Admission:
         longest) at the longest context admitted since the set was last empty (a departed long row's width survives in
         the filtered batch), so its bytes are the set's growth, not a fixed size; `reserve` is then ignored. too_large
         compares the request alone with the budget.
-        The drain (#126 review round 2, P2a): the high-water width and peak rows are kept while any text turn runs
-        (the lazy-free protection above), so under overlapping traffic they could outlive their turn forever. When a
-        text turn is refused for bytes that the set's stale terms alone take (it would fit beside the live loads
-        reserved as if fresh: text_set_bytes without high_water and peak), the set drains: every new text turn is
-        a retryable 529 until the turns in flight end, which bounds the wait by their max_tokens and the gate's read
-        timeout; the empty set then resets (_release_locked) and admission resumes at the fresh size. The reservation
-        never shrinks while a turn of the old set runs, so no buffer that may still be live is ever given away."""
+        The drain (#126 review rounds 2 and 3, P2a): the high-water width and peak rows are kept while any text turn
+        runs (the lazy-free protection above), so under overlapping traffic they could outlive their turn forever.
+        The set drains as soon as they withhold room the live loads would leave as a fresh set (_stale_locked; checked
+        on a departure, on a snapshot, and here), and also when a text turn is refused for bytes the stale terms alone
+        take: every new text turn is then a retryable 529 and the report's free_tokens 0, until the turns in flight
+        end (retire: the backend confirms they left its scheduler, local_gate.Retirer), which bounds the wait by
+        their max_tokens and the gate's read timeout; the empty set then resets (_release_locked) and admission
+        resumes at the fresh size. The reservation never shrinks while a turn of the old set runs, so no buffer that
+        may still be live is ever given away."""
         g = self.governor.current() if self.governor else NO_GOVERNOR
         with self._lock:
             vision = self.vision
@@ -1110,6 +1148,7 @@ class Admission:
                 return Ticket(self, 0), self._report(g)
             cfg = self.governor.cfg
             avail = available_bytes(cfg)
+            self._check_drain_locked()
             if load is not None:
                 if image or not text_route(cfg):
                     raise ValueError("a text load is admitted only for a text-only request on a text-only model")
@@ -1152,12 +1191,22 @@ class Admission:
             self.reserved = after
             if image:
                 self.image_inflight += 1
+            if load is not None:
+                self._check_drain_locked()         # this turn beside a kept width may leave the next one no room
             return Ticket(self, nbytes, image, load), self._report(g)
+
+    def _mark_retiring(self, ticket: Ticket) -> None:
+        with self._lock:
+            if not ticket._done and not ticket.retiring:
+                ticket.retiring = True
+                self.retiring += 1
 
     def _release_locked(self, ticket: Ticket) -> None:
         if ticket._done:
             return
         ticket._done = True
+        if ticket.retiring:
+            self.retiring = max(0, self.retiring - 1)
         self.inflight = max(0, self.inflight - 1)
         if ticket.load is not None:
             # the set shrinks: recompute it (the longest row may have left), never subtract a stale share
@@ -1169,6 +1218,7 @@ class Admission:
                 # the decode batch is empty, MLX's cache cleared: the stale terms and any drain end here
                 self._high_water, self._peak, self._draining = 0, (0, 0), False
             self.reserved = summed + self._set_bytes()
+            self._check_drain_locked()              # a departure that leaves stale width / rows starts the drain
         else:
             self.reserved = max(0, self.reserved - ticket.reserved)
         if ticket.image:

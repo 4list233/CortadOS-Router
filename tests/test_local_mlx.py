@@ -656,6 +656,8 @@ class FakeVllm(BaseHTTPRequestHandler):
     hold = None                                  # set: POST /v1/messages waits on it (a long generation)
     entered: threading.Semaphore = threading.Semaphore(0)
     error = None                                 # (status, body) to answer POSTs with
+    tickets: list = []                           # the ticket header of each POST (#126 round 3)
+    retire_polls: list = []                      # the ids of each retirement poll
 
     def log_message(self, *a):
         pass
@@ -676,7 +678,11 @@ class FakeVllm(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+        if self.path == local_gate.RETIRE_PATH:     # the guard's retirement answer (#126 round 3): all ended at once
+            FakeVllm.retire_polls.append(body["tickets"])
+            return self._json(200, {"retired": body["tickets"], "boot": "fake"})
         FakeVllm.seen.append(("POST", self.path, body))
+        FakeVllm.tickets.append(self.headers.get(local_gate.TICKET_HEADER))
         if self.path != "/v1/messages":
             return self._json(404, {"detail": "Not Found"})
         FakeVllm.entered.release()
@@ -712,6 +718,8 @@ def reset_fake():
     FakeVllm.hold = None
     FakeVllm.entered = threading.Semaphore(0)
     FakeVllm.error = None
+    FakeVllm.tickets = []
+    FakeVllm.retire_polls = []
 
 
 def turns():
@@ -764,7 +772,8 @@ class MlxGateRouteTests(MlxGateHarness):
         self.assertEqual(code, 200)
         data = json.loads(raw)
         self.assertEqual(data["models"], [{"name": SERVED, "model": SERVED}])
-        self.assertEqual(data["cortados_gate"], {"backend": "vllm-mlx", "limit": None, "inflight": 0, "owner": None,
+        self.assertEqual(data["cortados_gate"], {"backend": "vllm-mlx", "limit": None, "inflight": 0, "retiring": 0,
+                                                 "draining": False, "owner": None,
                                                  "pressure": None, "reason": "no governor", "reserved_bytes": None,
                                                  "free_bytes": None, "fit_tokens": None, "free_tokens": None,
                                                  "image_inflight": None, "image_limit": None, "vision": None})
@@ -853,7 +862,8 @@ class MlxGateAdmissionTests(MlxGateHarness):
         for t in threads:
             t.join(5)
         self.assertEqual(results[0][0], 200)
-        self.assertEqual(self.gate.admission.inflight, 0)                    # the slot was given back
+        # the slot was given back once the guard confirmed the turn left vllm-mlx (the fake confirms at once, #126)
+        self.assertTrue(wait_for(lambda: self.gate.admission.inflight == 0))
         self.assertEqual(self.call("/v1/messages", MSG)[0], 200)
 
     def test_critical_pressure_admits_nothing(self):
@@ -866,7 +876,7 @@ class MlxGateAdmissionTests(MlxGateHarness):
     def test_a_failed_relay_frees_its_slot(self):
         FakeVllm.error = (500, {"detail": "boom"})
         self.assertEqual(self.call("/v1/messages", MSG)[0], 500)
-        self.assertEqual(self.gate.admission.inflight, 0)
+        self.assertTrue(wait_for(lambda: self.gate.admission.inflight == 0))
 
 
 # ------------------------------------------------------------------------------------- the provider and a busy gate

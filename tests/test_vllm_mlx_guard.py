@@ -66,6 +66,12 @@ FAKE = {
                 self.config = config or SchedulerConfig()
                 self.prefix_cache = self.block_aware_cache = self.paged_cache_manager = self._ssd_tier = None
                 self.memory_aware_cache = object() if self.config.enable_prefix_cache else None
+                self.running, self.request_id_to_uid = {}, {}
+            def step(self):
+                return None
+            def reset(self):
+                self.waiting.clear()
+                self.requests.clear()
             def add_request(self, request):
                 if request.request_id in self.requests:
                     raise ValueError(f"Request {request.request_id} already exists")
@@ -98,7 +104,21 @@ FAKE = {
             def _next(self):
                 return [], []
         '''),
-    "vllm_mlx/engine_core.py": "# engine_core\n",
+    # 0.6.0's EngineCore.add_request (engine_core.py 446-510): the id, then Scheduler.add_request (#126 round 3)
+    "vllm_mlx/engine_core.py": textwrap.dedent('''
+        import uuid
+
+        class EngineCore:
+            def __init__(self, scheduler):
+                self.scheduler = scheduler
+            async def add_request(self, prompt, sampling_params=None, request_id=None, images=None, videos=None,
+                                  prefix_boundary=0):
+                from vllm_mlx.request import Request
+                if request_id is None:
+                    request_id = str(uuid.uuid4())
+                self.scheduler.add_request(Request(request_id, prompt, sampling_params))
+                return request_id
+        '''),
     # The engines, as in 0.6.0: BatchedEngine's text route reaches Scheduler.add_request; SimpleEngine never does.
     "vllm_mlx/engine/__init__.py": "from .base import BaseEngine\n",
     "vllm_mlx/engine/base.py": textwrap.dedent('''
@@ -164,6 +184,14 @@ FAKE = {
         from vllm_mlx.engine.batched import BatchedEngine
         from vllm_mlx.engine.simple import SimpleEngine
         _engine = None
+
+        class _App:
+            """server.app's add_middleware (Starlette: the latest added is the outermost)."""
+            def __init__(self):
+                self.middleware = []
+            def add_middleware(self, cls, **kw):
+                self.middleware.insert(0, (cls, kw))
+        app = _App()
         def load_model(model_name, use_batching=False, scheduler_config=None):
             global _engine
             _engine = BatchedEngine(model_name, scheduler_config) if use_batching else SimpleEngine(model_name)
@@ -204,7 +232,7 @@ FAKE = {
                 self.status_code, self.detail = status_code, detail
         '''),
 }
-PINNED_FILES = ("scheduler.py", "engine_core.py", "engine/batched.py", "cli.py", "server.py", "model_registry.py",
+PINNED_FILES = ("__init__.py", "scheduler.py", "engine_core.py", "engine/batched.py", "cli.py", "server.py", "model_registry.py",
                 "engine/__init__.py", "engine/base.py")
 TEXT = ["--text-prefill-tokens", "256", "--buffer-cache-bytes", str(2 ** 30)]   # the text route's prefill bounds (#126)
 SERVE = ["--context-tokens", "131072", *TEXT, "--", "serve", "/models/text", "--continuous-batching",
@@ -233,11 +261,13 @@ class GuardBase(unittest.TestCase):
         # #126: the text route's mlx-lm / mlx pins and config.json check have their own tests (test_text_prefill.py);
         # here they pass, and the fake vllm-mlx's engine.batched is the module the guard patches
         self.text_models = []
+        self.real = {name: getattr(self.guard, name) for name in ("_text_preflight", "_text_modules")}
 
-        def text_modules():
+        def text_modules(found):
             from vllm_mlx.engine import batched
             return batched
-        for name, fake in (("_text_modules", text_modules), ("check_text_model", self.text_models.append)):
+        for name, fake in (("_text_modules", text_modules), ("check_text_model", self.text_models.append),
+                           ("_text_preflight", lambda: {"mlx_lm": None, "mlx": None})):
             p = patch.object(self.guard, name, fake)
             p.start()
             self.addCleanup(p.stop)
