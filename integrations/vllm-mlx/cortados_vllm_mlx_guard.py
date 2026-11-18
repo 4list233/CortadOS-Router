@@ -777,6 +777,12 @@ def find_without_import(fullname: str, path: Any = None) -> Any:
     mod = sys.modules.get(fullname)
     if mod is not None:
         return getattr(mod, "__spec__", None)
+    return find_on_disk(fullname, path)
+
+
+def find_on_disk(fullname: str, path: Any = None) -> Any:
+    """find_without_import's answer from the finders alone, even when `fullname` is already imported: what an import
+    in a fresh process would load (the disk-first checks run before anything is imported)."""
     for finder in sys.meta_path:
         find = getattr(finder, "find_spec", None)
         if find is None:
@@ -1351,9 +1357,13 @@ MLX_LM_PINNED_SHA256 = {
     "chat_templates/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "chat_templates/deepseek_v32.py": "4df892725d65d936044d70d365e9a78eb0e10f201059120c7b0b965e66f669b7",
 }
-# mlx-lm's own module directories whose every .py the pins above must cover (a file added there, e.g. a new tool
-# parser a tokenizer could name, is refused: verify_text)
+# mlx-lm's own module directories whose every entry the pins above must cover (#126 review round 5, P2c): a tokenizer
+# imports a module there by name (tokenizer_utils.load), so anything the release does not have is refused (verify_text):
+# a new .py, an extension module of any suffix, a .pth, a subdirectory (a regular or namespace package shadows the
+# pinned module of the same name: FileFinder tries the package first). The one exception is __pycache__, which is never
+# read: the guard serves with its bytecode isolated (isolate_bytecode).
 MLX_LM_PINNED_DIRS = ("tool_parsers", "chat_templates")
+PYCACHE = "__pycache__"
 TEXT_FLAGS = {"--text-prefill-tokens": "prefill_tokens", "--buffer-cache-bytes": "buffer_cache_bytes"}
 # The one verified text geometry (local_governor.TEXT_DIMS, the same values): the Pro's Qwen3.8 27B text_config. A key
 # config.json leaves out takes mlx-lm 0.31.3's TextModelArgs default (models/qwen3_5.py 25-70) when that default is the
@@ -1481,15 +1491,77 @@ def verify_text(lm_dir: str, lm_version: str | None, pins: dict | None = None) -
         if got != want:
             raise GuardError(f"mlx_lm/{rel} differs from the {MLX_LM_VERSION} release the guard was written against")
     table = MLX_LM_PINNED_SHA256 if pins is None else pins
-    for folder in MLX_LM_PINNED_DIRS if table else ():     # {}: the version only (the files were checked before)
+    if not table:                                          # {}: the version only (the files were checked before)
+        return
+    for folder in MLX_LM_PINNED_DIRS:
         try:
             names = sorted(os.listdir(os.path.join(lm_dir, folder)))
-        except OSError:
-            names = []
+        except OSError as exc:
+            raise GuardError(f"mlx_lm/{folder} unreadable ({type(exc).__name__})") from None
         for name in names:
-            if name.endswith((".py", ".pyc", ".so")) and f"{folder}/{name}" not in table:
-                raise GuardError(f"mlx_lm/{folder}/{name} is not in the {MLX_LM_VERSION} release the guard was "
-                                 "written against (a tokenizer could import it by name)")
+            if f"{folder}/{name}" in table and os.path.isfile(os.path.join(lm_dir, folder, name)):
+                continue
+            if name == PYCACHE and not os.path.islink(os.path.join(lm_dir, folder, name)):
+                if not bytecode_isolated():
+                    raise GuardError(f"mlx_lm/{folder}/{PYCACHE} would be read: the guard runs with its bytecode "
+                                     "isolated (isolate_bytecode)")
+                continue
+            raise GuardError(f"mlx_lm/{folder}/{name} is not in the {MLX_LM_VERSION} release the guard was "
+                             "written against (a tokenizer could import it by name)")
+    verify_lm_resolution(lm_dir, table)
+
+
+def _lm_module(rel: str) -> str:
+    """mlx_lm's module name for the pinned file `rel` ("models/cache.py" -> mlx_lm.models.cache, "x/__init__.py" ->
+    mlx_lm.x)."""
+    parts = rel[:-len(".py")].split("/")
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(["mlx_lm", *parts])
+
+
+def verify_lm_resolution(lm_dir: str, table: dict, find_spec: Any = None) -> None:
+    """GuardError unless every pinned mlx-lm module resolves, through the finders and without importing anything
+    (find_without_import), to its pinned file in `lm_dir` (#126 review round 5, P2c): a package or extension module of
+    the same name beside a pinned file would be imported in its place."""
+    import importlib
+    importlib.invalidate_caches()                          # a folder changed since a finder last listed it
+    find = find_spec or find_on_disk
+    for rel in sorted(table, key=lambda r: r.count("/")):
+        if not rel.endswith(".py") or rel in ("__init__.py", "_version.py"):
+            continue                                       # the package itself: _locate / _imported_from
+        name = _lm_module(rel)
+        parent = name.rsplit(".", 1)[0]
+        where = [os.path.join(lm_dir, *parent.split(".")[1:])]
+        try:
+            spec = find(name, where)
+        except (ImportError, ValueError) as exc:
+            raise GuardError(f"{name} cannot be resolved ({type(exc).__name__})") from None
+        origin = getattr(spec, "origin", None)
+        pinned = os.path.realpath(os.path.join(lm_dir, *rel.split("/")))
+        if not origin or os.path.realpath(origin) != pinned:
+            raise GuardError(f"{name} resolves to {origin!r}, not the pinned mlx_lm/{rel}")
+
+
+def isolate_bytecode() -> str:
+    """No cached bytecode is read or written by this process from here on (#126 review round 5, P2c): Python checks a
+    __pycache__ file against its source's mtime and size only, so one written beside a pinned file could run in its
+    place. sys.pycache_prefix points every cache lookup at a fresh empty directory of this process's own, and nothing
+    is written there (sys.dont_write_bytecode): each verified source is compiled as it is imported. Called first thing
+    in main(), before anything outside the standard library is imported. The directory."""
+    import atexit
+    import tempfile
+    prefix = tempfile.mkdtemp(prefix="cortados-guard-pyc-")
+    sys.dont_write_bytecode = True
+    sys.pycache_prefix = prefix
+    atexit.register(lambda: os.path.isdir(prefix) and not os.listdir(prefix) and os.rmdir(prefix))
+    return prefix
+
+
+def bytecode_isolated() -> bool:
+    """True when this process reads no in-tree __pycache__ (isolate_bytecode ran)."""
+    prefix = getattr(sys, "pycache_prefix", None)
+    return bool(sys.dont_write_bytecode and prefix and os.path.isdir(prefix) and not os.listdir(prefix))
 
 
 def text_prefill_problem(bg: Any) -> str | None:
@@ -1574,9 +1646,11 @@ def install_text(policy: TextPolicy, scheduler_cls: Any, batched_module: Any) ->
 # generator (_do_abort_request, 2250-2315). A finished turn leaves in the step that finished it (_cleanup_finished,
 # 2974-3123). The protocol (the gate's side: cortados_router/local_gate.py Retirer):
 #   * every request that may generate (any method but GET / HEAD / OPTIONS) carries the gate's ticket id
-#     (TICKET_HEADER, "<unix ms>.<32 hex>", random, no request data); the ASGI middleware (TicketMiddleware, the
-#     outermost) refuses one without a valid fresh id, or with an id it has seen, before vllm-mlx reads it, and holds
-#     the id in a context variable for the request's task and every task it starts;
+#     (TICKET_HEADER, "<generation>.<seq>.<rand>", no request data: the gate generation below, the gate's own
+#     strictly increasing counter, 128 random bits); the ASGI middleware (TicketMiddleware, the outermost) refuses one
+#     without a well-formed id of the current generation, or with an id it has seen or one below the generation's
+#     floor, before vllm-mlx reads it, and holds the id in a context variable for the request's task and every task it
+#     starts;
 #   * EngineCore.add_request (engine_core.py 446-510, the one way the text route's requests reach Scheduler.add_request,
 #     awaited in the request's own task; its worker job runs to completion even when cancelled, base.py 195-225) binds
 #     the scheduler request id to that ticket; Scheduler.add_request refuses an id no ticket is bound to, or whose
@@ -1586,9 +1660,12 @@ def install_text(policy: TextPolicy, scheduler_cls: Any, batched_module: Any) ->
 #     the batch generator) or unfinished requests; with no step running (the lock free) the same check runs on query;
 #   * POST RETIRE_PATH {"tickets": [ids]} answers {"retired": [ids], "boot": <this process's id>}: an id is retired when
 #     its HTTP exchange has ended and every request bound to it is gone or never entered the scheduler (it is then
-#     closed: nothing more may bind to it). An id this process never saw is tombstoned (refused should it still arrive)
-#     and retired: it never entered this process's scheduler, and a previous process's rows went with that process (a
-#     backend restart clears every retiring ticket). Nothing else is retired: a hung step keeps its tickets reserved.
+#     closed: nothing more may bind to it). An id this process never saw is retired when it can never be admitted here:
+#     malformed, of a generation other than the current one, or below the current generation's floor; or, of the
+#     current generation, once it is tombstoned (refused should it still arrive). It never entered this process's
+#     scheduler, and a previous process's rows went with that process (a backend restart clears every retiring
+#     ticket). An id of a generation that is not refused (none is current yet) is never retired: the gate fences on the
+#     new boot id first. Nothing else is retired: a hung step keeps its tickets reserved.
 # Atomicity (#126 review round 4, P1a). Admission and the "gone" transition exclude each other: Scheduler.add_request
 # (entering, the scheduler's own add, entered) runs under TicketLedger.admit_lock, and so does every safe point from the
 # moment it notes the entry sequence until it has marked what is gone. Each request is numbered as its add completes
@@ -1596,52 +1673,63 @@ def install_text(policy: TextPolicy, scheduler_cls: Any, batched_module: Any) ->
 # gone only a request numbered below it, i.e. one whose add had completed (so it was queued) before the read began. The
 # lock makes the number check redundant; the number keeps it true should any path ever add outside the lock. The retire
 # query takes the step lock and the admit lock without waiting: with either busy it answers from the last safe point.
+# Generations (#126 review round 5, P2a/P2b: no wall clock decides anything here). Each gate process draws a random
+# 128-bit generation at start and numbers its tickets with a counter that only goes up. This process has at most one
+# current generation: the first well-formed ticket it ever opens makes its generation current (a fresh process has no
+# rows anyone could have left), and every fence query makes the asking gate's generation current. A generation that
+# is not current is refused from then on, for open, bind and Scheduler.add_request alike, and a generation that was
+# replaced can never be made current again (a bounded memory of PAST_GENERATIONS; a gate's start is rare).
 # The fence (#126 review round 4, P1b). A gate that has just started (or lost track of this process) knows none of the
-# rows a previous gate's turns left here, so it admits no text turn until POST FENCE_PATH {"floor_ms": N, "known":
-# [ids]} answers {"clear": true}: from then on no ticket minted before N is admitted (the floor; the gate mints at or
-# after its own start), and, atomically with setting it, no request bound to a ticket outside `known` is pending,
-# queued or in the scheduler, and no such ticket's exchange is open. Otherwise: {"clear": false, "unknown": n}.
-# Bounded (#126 review round 4, P2b): at most TICKET_MAX ids are tracked. A closed id (and an ended one below the floor
-# whose requests are all gone: no live gate can ask about it) may be evicted, oldest first; the floor then rises past
-# every evicted id, and an id below the floor is refused on arrival and, unknown, retired without being tracked: an
-# evicted tombstone can never be replayed. An unknown id that cannot be tracked (every slot an open turn): not retired.
+# rows a previous gate's turns left here, so it admits no text turn until POST FENCE_PATH {"generation": G, "known":
+# [ids]} answers {"clear": true}: atomically, G is now the only generation admitted, and no request bound to a ticket
+# outside `known` is pending, queued or in the scheduler, and no such ticket's exchange is open. Otherwise:
+# {"clear": false, "unknown": n}; a generation that was replaced: {"clear": false, "refused": true}.
+# Bounded (#126 review round 4, P2b): at most TICKET_MAX ids are tracked. A closed id (and an ended one of a generation
+# no longer current whose requests are all gone: no live gate can ask about it) may be evicted, old generations first,
+# then the current one by counter; the current generation's floor then rises past every evicted counter, and an id
+# below the floor is refused on arrival and, unknown, retired without being tracked: an evicted tombstone can never be
+# replayed. An unknown id that cannot be tracked (every slot an open turn): not retired.
 TICKET_HEADER = "x-cortados-ticket"
 RETIRE_PATH = "/cortados/retire"
 FENCE_PATH = "/cortados/fence"
 TICKET_REFUSAL = "cortados guard: a request needs a fresh gate ticket"
-TICKET_MAX_AGE_S = 600.0            # a ticket older than this on arrival is refused (its gate turn is long given up)
-TICKET_SKEW_S = 60.0                # a ticket minted this far in the future is refused too
 TICKET_MAX = 8192                   # ids tracked at once (open, ended, closed and tombstoned): a hard bound
+TICKET_LEN = 32 + 1 + 16 + 1 + 32   # "<generation: 32 hex>.<seq: 16 hex>.<rand: 32 hex>"
+PAST_GENERATIONS = 1024             # replaced generations remembered (never made current again)
 RETIRE_MAX_BODY = 1 << 20
+_HEX = frozenset("0123456789abcdef")
 
 
-def _ticket_problem(tid: Any, now: float) -> str | None:
-    """Why `tid` is not a well-formed fresh ticket id, or None."""
-    if not isinstance(tid, str) or len(tid) != 46 or tid[13] != "." or not tid[:13].isdigit() \
-            or any(c not in "0123456789abcdef" for c in tid[14:]):
-        return "no well-formed ticket id"
-    age = now - int(tid[:13]) / 1000
-    if age > TICKET_MAX_AGE_S or age < -TICKET_SKEW_S:
-        return "a stale ticket id"
-    return None
+def _is_hex(s: str, n: int) -> bool:
+    return len(s) == n and all(c in _HEX for c in s)
 
 
-def _ticket_ms(tid: str) -> int:
-    return int(tid[:13])
+def ticket_parts(tid: Any) -> tuple | None:
+    """(generation, seq) of a well-formed ticket id (TICKET_HEADER: lower-case hex, fixed widths), or None."""
+    if not isinstance(tid, str) or len(tid) != TICKET_LEN:
+        return None
+    parts = tid.split(".")
+    if len(parts) != 3 or not (_is_hex(parts[0], 32) and _is_hex(parts[1], 16) and _is_hex(parts[2], 32)):
+        return None
+    return parts[0], int(parts[1], 16)
+
+
+def is_generation(gen: Any) -> bool:
+    return isinstance(gen, str) and _is_hex(gen, 32)
 
 
 class TicketLedger:
     """The tickets this process has seen and the scheduler requests bound to them (the retirement protocol above).
     `_lock` guards the records; it is touched from the event loop (middleware, EngineCore.add_request, the retire and
     fence queries) and the executor thread (Scheduler.add_request, the step safe point). `admit_lock` makes admission
-    and a safe point's read-and-mark atomic (P1a above); lock order: step_lock, admit_lock, _lock. `clock` is
-    time.time (tests pass a fake)."""
+    and a safe point's read-and-mark atomic (P1a above); lock order: step_lock, admit_lock, _lock. No decision reads a
+    clock (generations above)."""
 
-    def __init__(self, clock: Any = None):
+    def __init__(self):
+        import collections
         import threading
         import uuid
         import weakref
-        self._clock = clock or __import__("time").time
         self._lock = threading.Lock()
         self.step_lock = threading.RLock()     # held across every Scheduler.step(): its end is the safe point
         self.admit_lock = threading.RLock()    # Scheduler.add_request, and a safe point's snapshot + transition
@@ -1649,7 +1737,9 @@ class TicketLedger:
         # scheduler request id -> [ticket id, pending | adding | entered | gone | closed, entry sequence number]
         self._rids: dict = {}
         self._seq = 0                          # the next entry sequence number
-        self.floor_ms = 0                      # an id minted before this is never admitted (fence, eviction)
+        self.generation: str | None = None     # the one generation admitted (None: none yet; generations above)
+        self._past: Any = collections.deque(maxlen=PAST_GENERATIONS)   # generations replaced: never current again
+        self.floor = 0                         # a current-generation counter below this is never admitted (eviction)
         self._schedulers = weakref.WeakSet()
         self.boot = uuid.uuid4().hex
 
@@ -1657,43 +1747,62 @@ class TicketLedger:
     def _done_locked(self, rec: dict) -> bool:
         return all(self._rids.get(rid, [None, "gone"])[1] in ("gone", "closed") for rid in rec["rids"])
 
+    def _current_locked(self, tid: str) -> bool:
+        return self.generation is not None and tid[:32] == self.generation
+
+    def _order_locked(self, tid: str) -> tuple:
+        """Eviction order: generations no longer current first, then the current one by its counter."""
+        return (self._current_locked(tid), int(tid[33:49], 16))
+
     def _evictable_locked(self, tid: str, rec: dict) -> bool:
-        return rec["state"] == "closed" or (rec["state"] == "ended" and _ticket_ms(tid) < self.floor_ms
+        return rec["state"] == "closed" or (rec["state"] == "ended" and not self._current_locked(tid)
                                             and self._done_locked(rec))
 
     def _evict_locked(self, tids: list) -> None:
         for tid in tids:
             for rid in self._tickets.pop(tid)["rids"]:
                 self._rids.pop(rid, None)
-            self.floor_ms = max(self.floor_ms, _ticket_ms(tid) + 1)
+            if self._current_locked(tid):
+                self.floor = max(self.floor, int(tid[33:49], 16) + 1)
 
-    def _room_locked(self, now: float) -> bool:
+    def _room_locked(self) -> bool:
         """True when one more id may be tracked (evicting what may go, oldest first): the bound, on every insert."""
         if len(self._tickets) < TICKET_MAX:
             return True
-        old = sorted((t for t, rec in self._tickets.items() if self._evictable_locked(t, rec)), key=_ticket_ms)
+        old = sorted((t for t, rec in self._tickets.items() if self._evictable_locked(t, rec)), key=self._order_locked)
         if not old:
             return False
-        # every id past the age (refused on arrival anyway) and at least the oldest quarter (amortised: a flood of
-        # tombstones costs O(log n) per id); `old` is sorted, so the stale ids are its prefix
-        n = max(sum(1 for t in old if now - _ticket_ms(t) / 1000 > TICKET_MAX_AGE_S), max(1, len(old) // 4))
+        # every id of a generation no longer current (refused on arrival anyway) and at least the oldest quarter
+        # (amortised: a flood of tombstones costs O(log n) per id); `old` is sorted, so those ids are its prefix
+        n = max(sum(1 for t in old if not self._current_locked(t)), max(1, len(old) // 4))
         self._evict_locked(old[:n])
         return len(self._tickets) < TICKET_MAX
 
-    def _below_floor(self, tid: str) -> bool:
-        return _ticket_ms(tid) < self.floor_ms
+    def _refused_locked(self, tid: str) -> str | None:
+        """Why a well-formed `tid` can never be admitted here, or None (generations above)."""
+        if self.generation is None:
+            return None
+        if tid[:32] != self.generation:
+            return "a ticket of another gate generation (replaced at the fence)"
+        if int(tid[33:49], 16) < self.floor:
+            return "a ticket id below its generation's floor (already retired)"
+        return None
 
     # ---- the exchange
     def open(self, tid: Any) -> str | None:
         """Admit a request carrying `tid`: None, or why it is refused (nothing of it reaches vllm-mlx)."""
-        now = self._clock()
-        why = _ticket_problem(tid, now)
-        if why is not None:
-            return why
+        parts = ticket_parts(tid)
+        if parts is None:
+            return "no well-formed ticket id"
         with self._lock:
-            if tid in self._tickets or self._below_floor(tid):
-                return "a ticket id already used, retired or minted before the gate's fence"
-            if not self._room_locked(now):
+            if self.generation is None and parts[0] not in self._past:
+                self.generation, self.floor = parts[0], 0    # a fresh process: its first gate's generation
+            why = self._refused_locked(tid)
+            if why is not None:
+                return why
+            if tid in self._tickets:
+                return "a ticket id already used or retired"
+            if not self._room_locked():
                 return "too many tickets tracked"
             self._tickets[tid] = {"state": "open", "rids": set()}
         return None
@@ -1709,8 +1818,8 @@ class TicketLedger:
         """Bind scheduler request `rid` to ticket `tid` (EngineCore.add_request): None, or why it is refused."""
         with self._lock:
             rec = self._tickets.get(tid) if isinstance(tid, str) else None
-            if rec is None or rec["state"] == "closed":
-                return "no open gate ticket for this request"
+            if rec is None or rec["state"] == "closed" or not self._current_locked(tid):
+                return "no open gate ticket of the current generation for this request"
             if rid in self._rids:
                 return "a request id already bound"
             rec["rids"].add(rid)
@@ -1725,11 +1834,11 @@ class TicketLedger:
                 got[1] = "closed"
 
     def entering(self, rid: str) -> bool:
-        """Scheduler.add_request is about to queue `rid` (admit_lock held): False (refuse it) unless it is bound and
-        still pending."""
+        """Scheduler.add_request is about to queue `rid` (admit_lock held): False (refuse it) unless it is bound to a
+        ticket of the current generation and still pending."""
         with self._lock:
             got = self._rids.get(rid)
-            if got is None or got[1] != "pending":
+            if got is None or got[1] != "pending" or not self._current_locked(got[0]):
                 return False
             got[1] = "adding"
             return True
@@ -1794,17 +1903,18 @@ class TicketLedger:
     def retire(self, ids: Any) -> list:
         """The retire query (RETIRE_PATH): which of `ids` are retired, closing them (module comment above)."""
         self._fresh_safe_point()
-        now = self._clock()
         out = []
         with self._lock:
             for tid in ids if isinstance(ids, list) else []:
-                if not isinstance(tid, str) or len(tid) > 64:
+                if not isinstance(tid, str) or len(tid) > 2 * TICKET_LEN:
                     continue
                 rec = self._tickets.get(tid)
                 if rec is None:
-                    if _ticket_problem(tid, now) is not None or self._below_floor(tid):
+                    if ticket_parts(tid) is None or self._refused_locked(tid) is not None:
                         out.append(tid)                     # never admitted here, and never will be: not tracked
-                    elif self._room_locked(now):            # tombstone: refused should it still arrive
+                    elif self.generation is None:
+                        pass                                # not refused yet: not retired (the gate fences first)
+                    elif self._room_locked():               # tombstone: refused should it still arrive
                         self._tickets[tid] = {"state": "closed", "rids": set()}
                         out.append(tid)
                     continue                                # no room: not retired (the gate keeps it reserved)
@@ -1815,23 +1925,29 @@ class TicketLedger:
                     out.append(tid)
         return out
 
-    def fence(self, floor_ms: Any, known: Any) -> dict:
-        """The fence query (FENCE_PATH, module comment above): raise the floor to `floor_ms`, then say whether any
-        request bound to a ticket outside `known` may still be in the scheduler or reach it."""
+    def fence(self, generation: Any, known: Any) -> dict:
+        """The fence query (FENCE_PATH, module comment above): make `generation` the only one admitted, then say
+        whether any request bound to a ticket outside `known` may still be in the scheduler or reach it."""
+        if not is_generation(generation):
+            raise ValueError("a generation is 32 lower-case hex characters")
         self._fresh_safe_point()
         known = {t for t in known if isinstance(t, str)} if isinstance(known, list) else set()
         with self._lock:
-            if isinstance(floor_ms, int) and not isinstance(floor_ms, bool) and floor_ms > 0:
-                self.floor_ms = max(self.floor_ms, floor_ms)
+            if generation in self._past:
+                return {"clear": False, "refused": True, "unknown": 0, "generation": self.generation}
+            if self.generation != generation:
+                if self.generation is not None:
+                    self._past.append(self.generation)
+                self.generation, self.floor = generation, 0
             unknown = 0
             for tid, rec in self._tickets.items():
                 if tid in known:
                     continue
                 if rec["state"] == "open" or not self._done_locked(rec):
                     unknown += 1
-                elif rec["state"] == "ended" and self._below_floor(tid):
+                elif rec["state"] == "ended" and not self._current_locked(tid):
                     rec["state"] = "closed"                  # its gate is gone: nothing will ever ask about it
-            return {"clear": unknown == 0, "unknown": unknown, "floor_ms": self.floor_ms}
+            return {"clear": unknown == 0, "unknown": unknown, "generation": self.generation}
 
 
 class TicketMiddleware:
@@ -1865,10 +1981,11 @@ class TicketMiddleware:
         except ValueError:
             data = None
         if fence:
-            floor, known = (data.get("floor_ms"), data.get("known")) if isinstance(data, dict) else (None, None)
-            if not isinstance(floor, int) or isinstance(floor, bool) or not isinstance(known, list):
-                return await self._answer(send, 400, {"detail": 'body must be {"floor_ms": N, "known": [ids]}'})
-            return await self._answer(send, 200, {**self.ledger.fence(floor, known), "boot": self.ledger.boot})
+            gen, known = (data.get("generation"), data.get("known")) if isinstance(data, dict) else (None, None)
+            if not is_generation(gen) or not isinstance(known, list):
+                return await self._answer(send, 400, {"detail": 'body must be {"generation": "<32 hex>", "known": '
+                                                                '[ids]}'})
+            return await self._answer(send, 200, {**self.ledger.fence(gen, known), "boot": self.ledger.boot})
         ids = data.get("tickets") if isinstance(data, dict) else None
         if not isinstance(ids, list):
             return await self._answer(send, 400, {"detail": 'body must be {"tickets": [ids]}'})
@@ -2074,6 +2191,7 @@ def _usage(msg: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    isolate_bytecode()                            # before any pinned file is located or imported (P2c)
     if argv[:1] == ["--check"]:
         if len(argv) < 2:
             return _usage("--check takes one model directory")

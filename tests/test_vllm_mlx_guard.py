@@ -284,8 +284,15 @@ class GuardBase(unittest.TestCase):
 
     def run_main(self, argv):
         err = io.StringIO()
-        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-            rc = self.guard.main(argv)
+        saved = (sys.dont_write_bytecode, sys.pycache_prefix)          # main() isolates its bytecode (P2c)
+        try:
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = self.guard.main(argv)
+        finally:
+            prefix = sys.pycache_prefix
+            sys.dont_write_bytecode, sys.pycache_prefix = saved
+            if prefix and prefix != saved[1] and os.path.isdir(prefix) and not os.listdir(prefix):
+                os.rmdir(prefix)
         return rc, err.getvalue()
 
     def installed(self, context=131072):

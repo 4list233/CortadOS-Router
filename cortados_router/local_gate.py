@@ -123,27 +123,29 @@ UNSUPPORTED_MESSAGE = "local gate: content this node's model cannot read"
 CAPACITY_KEYS = ("limit", "inflight", "retiring", "draining", "owner", "pressure", "reason", "reserved_bytes",
                  "free_bytes", "fit_tokens", "free_tokens", "image_inflight", "image_limit")
 # Retirement (#126 review round 3, P1). On a vllm-mlx node serving a text-only model under a governor, a text turn's
-# ticket is NOT released when forwarding ends: closing the upstream connection does not end the request in vllm-mlx
-# (it defers the stream's close by 0.5 s and queues the scheduler abort until the executor's next step), so its rows
-# may still be in the decode batch. Each forwarded turn carries a fresh ticket id (TICKET_HEADER: "<unix ms>.<32 hex>",
-# random, no request data); when forwarding ends the ticket turns "retiring" (it keeps its count slot, its bytes and its
-# place in the text set) and the Retirer asks the prompt guard inside vllm-mlx (RETIRE_PATH on the upstream) which
-# retiring ids it has seen leave the scheduler. Only that confirmation releases the ticket. The guard confirms an id
-# it never saw by tombstoning it (refusing it should it still arrive), so a backend restart (a new process: every row
-# freed) confirms every old id. No confirmation (backend hung or unreachable): the ticket stays reserved and the node
-# reports busy ("retiring" in the capacity report): fail closed. A connect that failed sent nothing: released at once.
-# This holds on every vllm-mlx node serving a text-only model, governed or not: its guard refuses a generating request
-# without a fresh ticket (409), so the gate and the guard ship together (scripts/install_mlx_backend.sh copies both).
+# ticket is NOT released when forwarding ends: closing the upstream connection does not end the request in vllm-mlx (it
+# defers the stream's close by 0.5 s and queues the scheduler abort until the executor's next step), so its rows may
+# still be in the decode batch. Each forwarded turn carries a fresh ticket id (TICKET_HEADER:
+# "<generation>.<seq>.<rand>", no request data: this gate process's random 128-bit generation, its counter that only
+# goes up, 128 random bits; no wall clock, #126 review round 5); when forwarding ends the ticket turns "retiring" (it
+# keeps its count slot, its bytes and its place in the text set) and the Retirer asks the prompt guard inside vllm-mlx
+# (RETIRE_PATH on the upstream) which retiring ids it has seen leave the scheduler. Only that confirmation releases the
+# ticket. The guard confirms an id it never saw by tombstoning it (refusing it should it still arrive) or because its
+# generation is refused, so a backend restart (a new process: every row freed) confirms every old id once this gate has
+# fenced it. No confirmation (backend hung or unreachable): the ticket stays reserved and the node reports busy
+# ("retiring" in the capacity report): fail closed. A connect that failed sent nothing: released at once. This holds on
+# every vllm-mlx node serving a text-only model, governed or not: its guard refuses a generating request without a fresh
+# ticket (409), so the gate and the guard ship together (scripts/install_mlx_backend.sh copies both).
 # integrations/vllm-mlx/cortados_vllm_mlx_guard.py (TicketLedger) is the other side; a test keeps the names equal.
 # The fence (#126 review round 4, P1b). The gate's admissions and retiring tickets live in this process only, and the
-# gate's LaunchAgent restarts it (KeepAlive) while vllm-mlx runs on: rows a previous gate's turns left in the batch
-# are reserved by nobody. So the gate starts fenced: it admits no text turn (529, busy: retry, with the reason in the
-# capacity report's "fence") until the guard answers FENCE_PATH {"floor_ms": <this gate's start>, "known": [every id
-# this gate minted and has not released]} with "clear": no ticket minted before the floor is admitted any more, and
+# gate's LaunchAgent restarts it (KeepAlive) while vllm-mlx runs on: rows a previous gate's turns left in the batch are
+# reserved by nobody. So the gate starts fenced: it admits no text turn (529, busy: retry, with the reason in the
+# capacity report's "fence") until the guard answers FENCE_PATH {"generation": <this gate's>, "known": [every id this
+# gate minted and has not released]} with "clear": no ticket of any other generation is admitted or bound any more, and
 # no request bound to a ticket outside `known` is pending, queued or in the scheduler (atomic with admission in the
 # guard: TicketLedger.fence). The gate fences itself again whenever it can no longer vouch for the backend's state: a
 # retirement poll or fence query failed (lost contact), or the guard's boot id changed (a new vllm-mlx process: its
-# predecessor's rows went with it, and the new one tombstones and retires every old id, so the fence lifts at once).
+# predecessor's rows went with it: the fence lifts at once, and then every old id is retired).
 # Chosen over reserving the backend's reported rows at full width: that needs the rows' widths or a worst case per
 # row, and a second reservation path; the fence needs one query and admits nothing it cannot account for.
 TICKET_HEADER = "x-cortados-ticket"
@@ -530,10 +532,12 @@ class GateServer(ThreadingHTTPServer):
                 self.slots.release()
 
 
-def new_ticket_id(now: float | None = None, floor_ms: int = 0) -> str:
-    """A fresh retirement id (TICKET_HEADER): the minting time in unix milliseconds (never below `floor_ms`, the
-    gate's start: the guard refuses ids minted before the fence's floor) and 128 random bits."""
-    return f"{max(int((time.time() if now is None else now) * 1000), floor_ms)}.{secrets.token_hex(16)}"
+def new_ticket_id(generation: str, seq: int) -> str:
+    """A retirement id (TICKET_HEADER): "<generation: 32 hex>.<seq: 16 hex>.<rand: 32 hex>", the gate process's
+    generation, its counter (strictly increasing within the generation) and 128 random bits. No clock in it."""
+    if len(generation) != 32 or not 0 <= seq < 1 << 64:
+        raise ValueError("a ticket needs a 32-hex generation and a 64-bit counter")
+    return f"{generation}.{seq:016x}.{secrets.token_hex(16)}"
 
 
 class Retirer:
@@ -543,10 +547,10 @@ class Retirer:
     poll POSTs {"tickets": [ids]} to the upstream's RETIRE_PATH and releases exactly the ids the answer lists under
     "retired". A failed poll (unreachable, an error status, an unreadable answer) releases nothing, fences the gate and
     backs off up to RETIRE_BACKOFF_S: fail closed. `call` (tests) replaces the HTTP call: call(path, body) -> the parsed
-    answer. `start_ms` is the gate's start (the fence's floor)."""
+    answer. `generation` is this gate's (random, 128 bits, drawn at start; tests may pass one)."""
 
     def __init__(self, host: str, port: int, *, connect_timeout: float = CONNECT_TIMEOUT_S,
-                 interval: float = RETIRE_POLL_S, call=None, start: bool = True, start_ms: int | None = None):
+                 interval: float = RETIRE_POLL_S, call=None, start: bool = True, generation: str | None = None):
         self.host, self.port, self.connect_timeout, self.interval = host, port, connect_timeout, interval
         self._call = call or self._http
         self._cv = threading.Condition()
@@ -556,7 +560,8 @@ class Retirer:
         self._start = start
         self._thread: threading.Thread | None = None
         self.last_error: str | None = None
-        self.start_ms = int(time.time() * 1000) if start_ms is None else start_ms
+        self.generation = secrets.token_hex(16) if generation is None else generation
+        self._seq = 0                        # the next ticket's counter (under _cv)
         self._fence: str | None = FENCE_STARTING
         self._fence_lock = threading.Lock()  # one fence query at a time (the thread or a waiting request)
         self._fence_gen = 0                  # fence queries started
@@ -603,7 +608,7 @@ class Retirer:
                 self._fence_gen += 1
                 known = sorted(self._minted | set(self._pending))
             try:
-                answer = self._call(FENCE_PATH, {"floor_ms": self.start_ms, "known": known})
+                answer = self._call(FENCE_PATH, {"generation": self.generation, "known": known})
                 if not isinstance(answer, dict) or not isinstance(answer.get("clear"), bool):
                     raise ValueError("the guard's fence answer has no clear flag")
             except Exception as exc:              # noqa: BLE001 (any failure keeps the fence up)
@@ -612,6 +617,10 @@ class Retirer:
                     self._fence = f"fenced: the backend's guard did not confirm the fence ({type(exc).__name__})"
                     return self._fence
             with self._cv:
+                if not answer["clear"] and answer.get("refused") is True:
+                    self._fence = ("fenced: the backend's guard refuses this gate's generation (a newer gate fenced "
+                                   "it): restart this gate")
+                    return self._fence
                 if not answer["clear"]:
                     n = answer.get("unknown")
                     self._fence = (f"fenced: the backend still holds {n if isinstance(n, int) else 'some'} "
@@ -635,8 +644,9 @@ class Retirer:
 
     # ---- the ids
     def mint(self) -> str:
-        tid = new_ticket_id(floor_ms=self.start_ms)
         with self._cv:
+            tid = new_ticket_id(self.generation, self._seq)
+            self._seq += 1
             self._minted.add(tid)
         return tid
 

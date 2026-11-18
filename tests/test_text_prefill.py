@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from cortados_router import local_backend, local_governor
@@ -360,6 +361,70 @@ class MlxLmPinTests(unittest.TestCase):
                 with self.assertRaisesRegex(self.guard.GuardError, f"mlx_lm/{rel} unreadable"):
                     self.guard.verify_text(self.lm, "0.31.3", self.pins)
                 path.write_text(text)
+
+    def test_round5_every_entry_of_the_by_name_folders_must_be_released(self):
+        # #126 review round 5 (P2c): a package (regular or namespace), an extension module of any suffix, a .pth or any
+        # other entry the 0.31.3 release lacks is refused; the reviewer's qwen3_coder/__init__.py first
+        import importlib.machinery
+        for folder, stem in (("tool_parsers", "qwen3_coder"), ("chat_templates", "deepseek_v32")):
+            entries = [f"{stem}/__init__.py", f"{stem}/", "nsdir/mod.py", "x.pth", f"{stem}.pyc", "README"]
+            entries += [f"{stem}{sfx}" for sfx in importlib.machinery.all_suffixes() if sfx != ".py"]
+            for rel in entries:
+                with self.subTest(f"{folder}/{rel}"):
+                    path = Path(self.lm, folder, rel)
+                    if rel.endswith("/"):
+                        path.mkdir()
+                    else:
+                        path.parent.mkdir(exist_ok=True)
+                        path.write_text("x = 1\n")
+                    top = Path(self.lm, folder, rel.split("/")[0])
+                    try:
+                        with self.assertRaisesRegex(self.guard.GuardError,
+                                                    f"mlx_lm/{folder}/{rel.split('/')[0]} is not in the 0.31.3"):
+                            self.guard.verify_text(self.lm, "0.31.3", self.pins)
+                    finally:
+                        shutil.rmtree(top) if top.is_dir() else top.unlink()
+        self.guard.verify_text(self.lm, "0.31.3", self.pins)
+
+    def test_round5_a_pinned_name_that_is_a_folder_or_a_link_is_refused(self):
+        path = Path(self.lm, "tool_parsers", "qwen3_coder.py")
+        path.unlink()
+        path.mkdir()
+        with self.assertRaisesRegex(self.guard.GuardError, "qwen3_coder.py"):
+            self.guard.verify_text(self.lm, "0.31.3", self.pins)
+
+    def test_round5_pycache_is_accepted_only_with_the_bytecode_isolated(self):
+        Path(self.lm, "tool_parsers", "__pycache__").mkdir()
+        with patch.object(sys, "pycache_prefix", None):
+            with self.assertRaisesRegex(self.guard.GuardError, "tool_parsers/__pycache__ would be read"):
+                self.guard.verify_text(self.lm, "0.31.3", self.pins)
+        empty = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, empty, True)
+        with patch.object(sys, "pycache_prefix", empty), patch.object(sys, "dont_write_bytecode", True):
+            self.assertTrue(self.guard.bytecode_isolated())
+            self.guard.verify_text(self.lm, "0.31.3", self.pins)
+        with patch.object(sys, "pycache_prefix", empty), patch.object(sys, "dont_write_bytecode", False):
+            self.assertFalse(self.guard.bytecode_isolated())            # it would write there: not isolated
+        os.rmdir(Path(self.lm, "tool_parsers", "__pycache__"))
+        os.symlink(empty, Path(self.lm, "tool_parsers", "__pycache__"))
+        with self.assertRaisesRegex(self.guard.GuardError, "__pycache__ is not in the 0.31.3"):
+            self.guard.verify_text(self.lm, "0.31.3", self.pins)
+
+    def test_round5_each_pinned_module_resolves_to_its_pinned_file(self):
+        seen = []
+
+        def find(name, path):
+            seen.append(name)
+            return self.guard.find_on_disk(name, path)
+        self.guard.verify_lm_resolution(self.lm, self.pins, find)
+        self.assertIn("mlx_lm.tool_parsers.qwen3_coder", seen)
+        self.assertIn("mlx_lm.chat_templates", seen)
+        self.assertIn("mlx_lm.models.qwen3_5", seen)
+        self.assertNotIn("mlx_lm", seen)                                 # the package itself: _locate's job
+        other = SimpleNamespace(origin=os.path.join(self.dir, "elsewhere.py"))
+        with self.assertRaisesRegex(self.guard.GuardError, "mlx_lm.tool_parsers.qwen3_coder resolves to"):
+            self.guard.verify_lm_resolution(
+                self.lm, self.pins, lambda n, p: other if n.endswith("qwen3_coder") else self.guard.find_on_disk(n, p))
 
     def test_the_text_checks_run_on_disk_first_and_then_check_what_was_imported(self):
         # #126 review round 3 (P2b): the preflight reads files only; the imports come after it, each checked
