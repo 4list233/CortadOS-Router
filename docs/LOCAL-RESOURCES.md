@@ -1270,9 +1270,15 @@ mlx-lm's `BatchGenerator` with vllm-mlx's `--prefill-step-size` (default **2,048
   `FileFinder` tries the package first: the reviewer's `tool_parsers/qwen3_coder/__init__.py`), an extension module of
   any suffix in `importlib.machinery.all_suffixes()`, a `.pth`, a stray `.pyc`, or a pinned name that is not a regular
   file. The one exception is `__pycache__` (a real directory, not a link), accepted only while the guard's bytecode is
-  isolated. Every pinned mlx-lm module (all of `MLX_LM_PINNED_SHA256` but the package's own `__init__.py` and
-  `_version.py`) must also resolve, through the import system's finders and without importing anything
-  (`verify_lm_resolution`), to its pinned file: a `utils/` package beside `utils.py` is refused too. **Bytecode**:
+  isolated. Every pinned mlx-lm module must also resolve, through the import system's finders and without importing
+  anything (`verify_lm_resolution`), to its pinned file: a `utils/` package beside `utils.py` is refused too. Since
+  #126 review round 6 (P2c) none is skipped: `mlx_lm` itself (resolved within the folder holding it) and `_version`
+  (`__init__` runs `from ._version import __version__`; a pyc-only `_version/` package won over the pinned file and
+  ran). **Sourceless modules** (round 6): `sys.pycache_prefix` keeps `__pycache__` unread but does not stop Python's
+  sourceless loader, so in every verified package tree (vllm-mlx, mlx-lm, mlx-vlm and mlx's Python folder,
+  `verify_sources_only`, before anything is imported) a `.pyc` / `.pyo` outside `__pycache__`, an extension module
+  beside a `.py` of its name, and a package folder (an `__init__` of any importable suffix) beside a `.py` of its name
+  are refused. **Bytecode**:
   Python accepts a `__pycache__` file whose header carries its source's mtime and size, without reading the source, so a
   cached file beside a pinned source could run in its place. The guard's `main()` first sets `sys.dont_write_bytecode`
   and points `sys.pycache_prefix` at a fresh empty directory of its own (`isolate_bytecode`), before anything outside
@@ -1379,9 +1385,9 @@ only queues the id (`scheduler.py` 2227-2242) until the executor's next `step()`
 forwarding ended let the reviewer's repro run 8 rows upstream (a timed-out 64k turn and 7 short ones, 31.25 GiB of KV)
 against 7 tickets and 12.05 GiB reserved. Now, on a vllm-mlx node serving a text-only model (governed or not):
 
-- each forwarded turn carries a fresh ticket id (`x-cortados-ticket: <generation>.<seq>.<rand>`: 32 hex, 16 hex, 32
-  hex, no request data; the gate process's random 128-bit generation, its counter that only goes up, 128 random bits;
-  generations below);
+- each forwarded turn carries a fresh ticket id (`x-cortados-ticket: <epoch>.<seq>.<nonce>`: 16 hex, 16 hex, 32 hex,
+  no request data; the gate process's epoch, its counter that only goes up, and 128 random bits that only make the id
+  unguessable; epochs below);
 - when forwarding ends the ticket turns **retiring**: it keeps its count slot, its bytes and its place in the text set,
   and the report counts it under `retiring` (`reason`: "N ended turns await backend release");
 - the gate's `Retirer` thread asks the guard (`POST /cortados/retire {"tickets": [...]}` on the loopback backend, every
@@ -1393,22 +1399,34 @@ against 7 tickets and 12.05 GiB reserved. Now, on a vllm-mlx node serving a text
   none of the waiting queue, the running map, the request-to-uid map (rows in the batch generator) or the unfinished
   requests. A ticket is retired when its HTTP exchange has ended and every request bound to it is gone or never entered
   the queue; it is then closed, and nothing more may bind to it.
-- An id the guard never saw is retired when it can never be admitted: malformed, of a generation that is not the
-  current one, or below the current generation's floor; of the current generation it is tombstoned first (refused
-  should it still arrive). It never entered this process's scheduler. An id of a generation that is not refused yet (a
-  new process before any fence) is never retired. So a backend restart, a new process whose rows are all freed,
-  retires every retiring ticket once the gate has fenced it (the gate fences on the new boot id).
-- **Generations, no wall clock** (#126 review round 5, P2a/P2b). Until round 4 an id began with its minting time and
-  the guard refused an id more than 600 s old or 60 s in the future; the fence's floor was the gate's start in unix
-  ms. Both leaned on wall clocks: an id dated in the future was acknowledged retired without a tombstone and admitted
-  later, and after a clock rollback a previous gate's id minted "after" the new floor was admitted. Now nothing reads
-  a clock. Each gate process draws a random generation at start and numbers its ids from 0. The guard has at most one
-  **current generation**: the first well-formed id a fresh process opens makes its generation current (that process
-  holds no rows anyone could have left), and every fence query makes the asking gate's generation current. From then
-  on an id of any other generation is refused on arrival (409), at `bind` (`EngineCore.add_request`) and at
-  `Scheduler.add_request`, and a generation that was replaced can never be made current again (a fence by it answers
-  `"refused": true`; the last 1024 are remembered). Replay within a generation is stopped by the record (open, ended,
-  closed or tombstoned) and, once evicted, by the generation's counter floor.
+- An id the guard never saw is retired, untracked, only when it can never be admitted: malformed, of an epoch below
+  the current one, or of the current epoch below its floor; of the current epoch it is tombstoned first (tracked,
+  refused should it still arrive). It never entered this process's scheduler. An unseen id of an epoch above the
+  current one, and any id while no epoch is current (a new process before any fence), is never retired: that epoch
+  may still be fenced and the id admitted. So a backend restart, a new process whose rows are all freed, retires every
+  retiring ticket once the gate has fenced it (the gate fences on the new boot id).
+- **Epochs, no wall clock** (#126 review rounds 5 and 6). Until round 4 an id began with its minting time; round 5
+  replaced the clock with a random 128-bit gate generation, which gave identity but not order: a fresh guard adopted
+  the first ticket's generation, acknowledged another generation's unseen id without recording it, and that
+  generation could still be fenced and its delayed id admitted after its reservation was released (round 6, P2a); and
+  a delayed old fence reaching a fresh guard after the live gate's recorded the live gate as replaced, fencing it out
+  for good (P2b). Now each gate start takes the node's next **epoch**, a strictly increasing integer
+  (`local_gate.next_epoch`, `~/.config/cortados/local-gate-epoch`, overridable with `CORTADOS_LOCAL_GATE_EPOCH_FILE`):
+  under an exclusive `flock` on `<file>.lock` it reads the last epoch (a missing file is 0), adds 1, writes it to a
+  temp file, fsyncs it, renames it over the file and fsyncs the directory, before the epoch is used. Files are 0600,
+  a created directory 0700. A file that is not one decimal integer from 1 to 2^64-1, not a regular file, or a link is
+  refused loudly and the gate does not start; it is never reset (a reset could hand out an epoch the guard already
+  superseded). The guard has **no current epoch until a fence arrives** (no adoption: a fresh process refuses every
+  ticket, 409); a fence of epoch E is accepted only if E is at least the current epoch (the highest this process has
+  seen) and a lower one is refused (`"refused": true`) and changes nothing; once E is current an id of any other epoch
+  is refused on arrival, at `bind` (`EngineCore.add_request`) and at `Scheduler.add_request`: one below E for good,
+  one above E until its gate fences. A guard restart forgets everything, which is safe: the new process holds no rows,
+  and a delayed old fence reaching it first is superseded by the live gate's higher epoch. Replay within an epoch is
+  stopped by the record (open, ended, closed or tombstoned) and, once evicted, by the epoch's counter floor. On the
+  guard's 409 ticket refusal (a backend restart while the gate sat idle, so no poll saw the new boot id) the gate
+  fences again and retries the turn once, under a new id and the same reservation, once the fence lifts: the first
+  turn after a backend restart costs one upstream retry and no client retry; the refused id stays known to the fence,
+  with no reservation of its own, until the guard retires it. A refused retry answers 529 busy.
 - **Fail closed**: no confirmation (the guard hung, a step that never returns, the backend unreachable) keeps the ticket
   reserved and the node busy. A connect that failed sent nothing and is released at once.
 - **Atomic with admission** (#126 review round 4, P1a). `Scheduler.add_request` is not under the step lock, so a
@@ -1420,9 +1438,9 @@ against 7 tickets and 12.05 GiB reserved. Now, on a vllm-mlx node serving a text
   ever adds outside the lock. A query takes the step lock and the admit lock without waiting: with either busy it
   answers from the last safe point.
 - **Bounded** (P2b). The guard tracks at most `TICKET_MAX` (8192) ids on every insert path (arrival and tombstone). At
-  the bound it evicts closed ids (and ended ones of a generation no longer current whose requests are all gone), old
-  generations first, then the current one by counter (every id of an old generation, and at least the oldest quarter),
-  and the current generation's **floor** rises past every evicted counter: an id below the floor is refused on arrival
+  the bound it evicts closed ids (and ended ones of an epoch no longer current whose requests are all gone), old
+  epochs first, then the current one by counter (every id of an old epoch, and at least the oldest quarter), and the
+  current epoch's **floor** rises past every evicted counter: an id below the floor is refused on arrival
   and, asked about, retired without being tracked. So an evicted tombstone can never be replayed. Open turns are never
   evicted; an unknown id that cannot be tracked (every slot an open turn) is not retired, so the gate keeps it reserved.
 
@@ -1432,15 +1450,15 @@ restart, and the fresh gate admits two more 64k turns, 28.8 GiB computed against
 node starts **fenced**:
 
 - it admits no text turn (529 busy, `Retry-After`, the reason in the message and in the capacity report's `fence`)
-  until the guard answers `POST /cortados/fence {"generation": <this gate's>, "known": [ids this gate minted and has
+  until the guard answers `POST /cortados/fence {"epoch": <this gate's>, "known": [ids this gate minted and has
   not released]}` with `"clear": true`;
-- the guard, under the same locks as the safe point, makes that generation the only one admitted (no id of a previous
+- the guard, under the same locks as the safe point, makes that epoch the only one admitted (no id of a previous
   gate is admitted or bound any more, whatever either clock says: a request a dead gate sent late cannot slip in
   afterwards), and answers clear only if no request bound to a ticket outside `known` is pending, queued or in the
   scheduler and no such exchange is open. It counts a request as present until a safe point has seen it leave, so it
-  errs towards fenced. A gate whose generation was replaced (two gates on one backend) stays fenced;
+  errs towards fenced. A gate whose epoch is below the guard's (a newer gate fenced it) stays fenced;
 - the gate fences itself again whenever it cannot vouch for the backend's state: a retirement poll or a fence query
-  failed (lost contact), or the guard's boot id changed. A changed boot id is a new vllm-mlx process: the old rows went
+  failed (lost contact), the guard's boot id changed, or the guard refused a turn's ticket (409). A changed boot id is a new vllm-mlx process: the old rows went
   with the old process, so with only this gate's own turns known the fence lifts at once, and the new process then
   retires every old id (the restart path above);
 - a hung or unreachable guard keeps the fence up, visibly (`fence`: "the backend's guard did not confirm the fence");

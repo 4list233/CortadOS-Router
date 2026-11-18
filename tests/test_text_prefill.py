@@ -3,6 +3,9 @@ prefill bounds (cortados_vllm_mlx_guard.py "Text prefill"). Fakes only: no MLX, 
 from __future__ import annotations
 
 import hashlib
+import marshal
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
@@ -420,11 +423,67 @@ class MlxLmPinTests(unittest.TestCase):
         self.assertIn("mlx_lm.tool_parsers.qwen3_coder", seen)
         self.assertIn("mlx_lm.chat_templates", seen)
         self.assertIn("mlx_lm.models.qwen3_5", seen)
-        self.assertNotIn("mlx_lm", seen)                                 # the package itself: _locate's job
+        self.assertIn("mlx_lm", seen)                                    # round 6: none skipped, the package
+        self.assertIn("mlx_lm._version", seen)                           # and its _version either
         other = SimpleNamespace(origin=os.path.join(self.dir, "elsewhere.py"))
         with self.assertRaisesRegex(self.guard.GuardError, "mlx_lm.tool_parsers.qwen3_coder resolves to"):
             self.guard.verify_lm_resolution(
                 self.lm, self.pins, lambda n, p: other if n.endswith("qwen3_coder") else self.guard.find_on_disk(n, p))
+
+    def test_round6_a_sourceless_package_beside_a_pinned_module_does_not_resolve_to_it(self):
+        # the reviewer's _version: a pyc-only package wins over the pinned _version.py at import
+        pkg = Path(self.lm, "_version")
+        pkg.mkdir()
+        (pkg / "__init__.pyc").write_bytes(importlib.util.MAGIC_NUMBER + b"\0" * 12 + marshal.dumps(compile("", "x", "exec")))
+        self.assertTrue(self.guard.find_on_disk("mlx_lm._version", [self.lm]).origin.endswith(".pyc"))   # the control
+        with self.assertRaisesRegex(self.guard.GuardError, "mlx_lm._version resolves to"):
+            self.guard.verify_lm_resolution(self.lm, self.pins)
+        with self.assertRaisesRegex(self.guard.GuardError, "mlx_lm/_version is a package beside _version.py"):
+            self.guard.verify_text(self.lm, "0.31.3", self.pins)
+
+    def test_round6_no_sourceless_or_shadowing_module_anywhere_in_the_tree(self):
+        sfx = importlib.machinery.EXTENSION_SUFFIXES[0]
+        for rel, why in (("stray.pyc", "mlx_lm/stray.pyc is sourceless bytecode"),
+                         ("models/qwen3_5.pyc", "mlx_lm/models/qwen3_5.pyc is sourceless bytecode"),
+                         ("models/deep/x.pyo", "mlx_lm/models/deep/x.pyo is sourceless bytecode"),
+                         ("generate/__init__.pyc", "mlx_lm/generate is a package beside generate.py"),
+                         ("planted/__init__.pyc", "mlx_lm/planted/__init__.pyc is sourceless"),
+                         (f"utils{sfx}", f"mlx_lm/utils{sfx} is an extension module beside utils.py"),
+                         (f"models/cache{sfx}", "is an extension module beside cache.py"),
+                         ("convert/__init__.py", "mlx_lm/convert is a package beside convert.py"),
+                         (f"sample_utils/__init__{sfx}", "mlx_lm/sample_utils is a package beside sample_utils.py")):
+            with self.subTest(rel):
+                path = Path(self.lm, *rel.split("/"))
+                made = path.parent if not path.parent.exists() else None
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x = 1\n")
+                try:
+                    with self.assertRaisesRegex(self.guard.GuardError, why):
+                        self.guard.verify_text(self.lm, "0.31.3", self.pins)
+                finally:
+                    path.unlink()
+                    if made is not None:
+                        shutil.rmtree(made)
+        # what the release itself may hold: an extension module with no .py of its name, a cache folder, stubs
+        Path(self.lm, f"fast{sfx}").write_bytes(b"\0")
+        Path(self.lm, "__pycache__").mkdir()
+        Path(self.lm, "__pycache__", "utils.cpython-312.pyc").write_bytes(b"\0")
+        Path(self.lm, "models", "cache.pyi").write_text("x: int\n")
+        empty = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, empty, True)
+        with patch.object(sys, "pycache_prefix", empty), patch.object(sys, "dont_write_bytecode", True):
+            self.guard.verify_text(self.lm, "0.31.3", self.pins)
+        self.guard.verify_sources_only(self.lm, "mlx_lm")
+        loop = Path(self.lm, "models", "loop")
+        os.symlink(self.lm, loop)                                        # a linked folder: followed once, no loop
+        self.guard.verify_sources_only(self.lm, "mlx_lm")
+        os.unlink(loop)
+        elsewhere = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, elsewhere, True)
+        Path(elsewhere, "evil.pyc").write_bytes(b"\0")
+        os.symlink(elsewhere, Path(self.lm, "models", "linked"))         # ...and what it holds is checked
+        with self.assertRaisesRegex(self.guard.GuardError, "mlx_lm/models/linked/evil.pyc is sourceless"):
+            self.guard.verify_sources_only(self.lm, "mlx_lm")
 
     def test_the_text_checks_run_on_disk_first_and_then_check_what_was_imported(self):
         # #126 review round 3 (P2b): the preflight reads files only; the imports come after it, each checked

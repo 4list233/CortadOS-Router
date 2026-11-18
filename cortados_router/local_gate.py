@@ -71,6 +71,9 @@ logger = logging.getLogger("cortados.local_gate")
 DEFAULT_PORT = 11435                      # next to Ollama's 11434, which stays on loopback
 DEFAULT_UPSTREAM = "http://127.0.0.1:11434"
 DEFAULT_TOKEN_FILE = "~/.config/cortados/local-gate-token"
+# The node's gate epoch (next_epoch): the last epoch a gate on this node started with, one decimal integer, 0600.
+DEFAULT_EPOCH_FILE = "~/.config/cortados/local-gate-epoch"
+EPOCH_FILE_ENV = "CORTADOS_LOCAL_GATE_EPOCH_FILE"
 # A guessable token would make the gate decoration. The floor is 32 hex characters (128 bits, what
 # `openssl rand -hex 16` prints); the documented command, `openssl rand -hex 32`, prints 64 (256 bits).
 MIN_TOKEN_CHARS = 32
@@ -126,13 +129,14 @@ CAPACITY_KEYS = ("limit", "inflight", "retiring", "draining", "owner", "pressure
 # ticket is NOT released when forwarding ends: closing the upstream connection does not end the request in vllm-mlx (it
 # defers the stream's close by 0.5 s and queues the scheduler abort until the executor's next step), so its rows may
 # still be in the decode batch. Each forwarded turn carries a fresh ticket id (TICKET_HEADER:
-# "<generation>.<seq>.<rand>", no request data: this gate process's random 128-bit generation, its counter that only
-# goes up, 128 random bits; no wall clock, #126 review round 5); when forwarding ends the ticket turns "retiring" (it
+# "<epoch>.<seq>.<nonce>", no request data: this gate process's epoch (next_epoch: strictly increasing per node, kept
+# in a state file), its counter that only goes up, 128 random bits that only make it unguessable; no wall clock, #126
+# review rounds 5 and 6); when forwarding ends the ticket turns "retiring" (it
 # keeps its count slot, its bytes and its place in the text set) and the Retirer asks the prompt guard inside vllm-mlx
 # (RETIRE_PATH on the upstream) which retiring ids it has seen leave the scheduler. Only that confirmation releases the
 # ticket. The guard confirms an id it never saw by tombstoning it (refusing it should it still arrive) or because its
-# generation is refused, so a backend restart (a new process: every row freed) confirms every old id once this gate has
-# fenced it. No confirmation (backend hung or unreachable): the ticket stays reserved and the node reports busy
+# epoch is below the current one, so a backend restart (a new process: every row freed) confirms every old id once this
+# gate has fenced it. No confirmation (backend hung or unreachable): the ticket stays reserved and the node reports busy
 # ("retiring" in the capacity report): fail closed. A connect that failed sent nothing: released at once. This holds on
 # every vllm-mlx node serving a text-only model, governed or not: its guard refuses a generating request without a fresh
 # ticket (409), so the gate and the guard ship together (scripts/install_mlx_backend.sh copies both).
@@ -140,18 +144,25 @@ CAPACITY_KEYS = ("limit", "inflight", "retiring", "draining", "owner", "pressure
 # The fence (#126 review round 4, P1b). The gate's admissions and retiring tickets live in this process only, and the
 # gate's LaunchAgent restarts it (KeepAlive) while vllm-mlx runs on: rows a previous gate's turns left in the batch are
 # reserved by nobody. So the gate starts fenced: it admits no text turn (529, busy: retry, with the reason in the
-# capacity report's "fence") until the guard answers FENCE_PATH {"generation": <this gate's>, "known": [every id this
-# gate minted and has not released]} with "clear": no ticket of any other generation is admitted or bound any more, and
+# capacity report's "fence") until the guard answers FENCE_PATH {"epoch": <this gate's>, "known": [every id this
+# gate minted and has not released]} with "clear": no ticket of any other epoch is admitted or bound any more, and
 # no request bound to a ticket outside `known` is pending, queued or in the scheduler (atomic with admission in the
 # guard: TicketLedger.fence). The gate fences itself again whenever it can no longer vouch for the backend's state: a
-# retirement poll or fence query failed (lost contact), or the guard's boot id changed (a new vllm-mlx process: its
-# predecessor's rows went with it: the fence lifts at once, and then every old id is retired).
+# retirement poll or fence query failed (lost contact), the guard's boot id changed (a new vllm-mlx process: its
+# predecessor's rows went with it: the fence lifts at once, and then every old id is retired), or the guard refused a
+# turn's ticket (409 TICKET_REFUSAL: a fresh guard admits nothing until fenced, #126 review round 6). On that 409 the
+# turn is retried once, inside the gate, after the fence lifts: the first turn after a backend restart costs one
+# upstream retry and no client retry. A guard that refuses this gate's epoch (it has fenced a higher one: a newer gate
+# runs) keeps it fenced for good.
 # Chosen over reserving the backend's reported rows at full width: that needs the rows' widths or a worst case per
 # row, and a second reservation path; the fence needs one query and admits nothing it cannot account for.
 TICKET_HEADER = "x-cortados-ticket"
 RETIRE_PATH = "/cortados/retire"
 FENCE_PATH = "/cortados/fence"
 FENCE_STARTING = "fenced: starting, waiting for the backend's guard to confirm no rows of a previous gate remain"
+TICKET_REFUSAL = "cortados guard: a request needs a fresh gate ticket"   # the guard's 409 (its TICKET_REFUSAL)
+EPOCH_MAX = (1 << 64) - 1                   # an epoch is 16 hex digits in a ticket id
+REFUSED_TICKET = object()                   # GateHandler._forward: the guard refused the turn's ticket (retry once)
 RETIRE_POLL_S = 0.2                         # between confirmation polls while tickets are retiring
 RETIRE_BACKOFF_S = 2.0                      # the longest wait between polls after a failed one
 RETIRE_TIMEOUT_S = 5.0                      # one poll, end to end (deadline_call)
@@ -457,7 +468,8 @@ class GateServer(ThreadingHTTPServer):
                  read_timeout: float = READ_TIMEOUT_S, idle_timeout: float = IDLE_TIMEOUT_S,
                  header_deadline: float = HEADER_DEADLINE_S, body_deadline: float = BODY_DEADLINE_S,
                  drain_deadline: float = DRAIN_DEADLINE_S, studio_gate_dir: str | os.PathLike | None = None,
-                 backend: dict | None = None, admission: local_governor.Admission | None = None):
+                 backend: dict | None = None, admission: local_governor.Admission | None = None,
+                 epoch: int | None = None, epoch_file: str | os.PathLike | None = None):
         check_max_connections(max_connections)
         check_limits(max_body=max_body, connect_timeout=connect_timeout,
                      read_timeout=read_timeout, idle_timeout=idle_timeout, header_deadline=header_deadline,
@@ -485,8 +497,12 @@ class GateServer(ThreadingHTTPServer):
         # the ticket ledger installed and confirms each release (a vision model's guard has no ledger: #125 unchanged).
         gov = self.admission.governor
         vision = gov.cfg.get("vision") if gov is not None else (self.backend.get("model") or {}).get("vision")
-        self.retirer = Retirer(self.upstream_host, self.upstream_port, connect_timeout=connect_timeout) \
-            if self.backend["backend"] == "vllm-mlx" and not vision else None
+        # Its epoch (next_epoch): `epoch` when given (tests), else the node's next one from `epoch_file` (default
+        # default_epoch_file()); a corrupt epoch file refuses to start (GateConfigError).
+        self.retirer = None
+        if self.backend["backend"] == "vllm-mlx" and not vision:
+            self.retirer = Retirer(self.upstream_host, self.upstream_port, connect_timeout=connect_timeout,
+                                   epoch=epoch if epoch is not None else next_epoch(epoch_file))
         super().__init__(addr, GateHandler)
 
     def server_close(self):
@@ -532,12 +548,73 @@ class GateServer(ThreadingHTTPServer):
                 self.slots.release()
 
 
-def new_ticket_id(generation: str, seq: int) -> str:
-    """A retirement id (TICKET_HEADER): "<generation: 32 hex>.<seq: 16 hex>.<rand: 32 hex>", the gate process's
-    generation, its counter (strictly increasing within the generation) and 128 random bits. No clock in it."""
-    if len(generation) != 32 or not 0 <= seq < 1 << 64:
-        raise ValueError("a ticket needs a 32-hex generation and a 64-bit counter")
-    return f"{generation}.{seq:016x}.{secrets.token_hex(16)}"
+def default_epoch_file() -> str:
+    return os.environ.get(EPOCH_FILE_ENV) or DEFAULT_EPOCH_FILE
+
+
+def _fsync_dir(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def next_epoch(path: str | os.PathLike | None = None) -> int:
+    """Take this node's next gate epoch (#126 review round 6): under an exclusive flock on `<path>.lock`, read the
+    last epoch from `path` (missing: 0), add 1, write it to a temp file, fsync it, rename it over `path` and fsync the
+    directory, all before the epoch is used. Two gates starting at once get distinct, increasing epochs. A file that is
+    not one decimal integer from 1 to EPOCH_MAX (a newline after it allowed), not a regular file, or a link is refused
+    (GateConfigError: the gate does not start), never reset: a reset could hand out an epoch the guard already
+    superseded. Files 0600, a created directory 0700."""
+    p = os.path.abspath(os.path.expanduser(str(path if path is not None else default_epoch_file())))
+    folder = os.path.dirname(p)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    lock = os.open(p + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            st = os.lstat(p)
+        except FileNotFoundError:
+            last = 0
+        else:
+            if not stat.S_ISREG(st.st_mode):
+                raise GateConfigError(f"gate epoch file {p} is not a regular file: refusing to start (fix it by hand)")
+            fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                raw = os.read(fd, 64)
+            finally:
+                os.close(fd)
+            text = raw[:-1] if raw.endswith(b"\n") else raw
+            if not (0 < len(text) <= 20 and text.isdigit() and not text.startswith(b"0")) or int(text) > EPOCH_MAX:
+                raise GateConfigError(f"gate epoch file {p} is corrupt (not one integer from 1 to {EPOCH_MAX}): "
+                                      "refusing to start; it is never reset silently (fix it by hand to at least "
+                                      "the last epoch used)")
+            last = int(text)
+        if last >= EPOCH_MAX:
+            raise GateConfigError(f"gate epoch file {p}: the epochs are used up")
+        epoch = last + 1
+        tmp = f"{p}.tmp.{os.getpid()}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, f"{epoch}\n".encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, p)
+        _fsync_dir(folder)
+        return epoch
+    finally:
+        os.close(lock)                         # releases the flock
+
+
+def new_ticket_id(epoch: int, seq: int) -> str:
+    """A retirement id (TICKET_HEADER): "<epoch: 16 hex>.<seq: 16 hex>.<nonce: 32 hex>", the gate process's epoch
+    (next_epoch), its counter (strictly increasing within the epoch) and 128 random bits (unguessable only). No clock
+    in it."""
+    if type(epoch) is not int or not 1 <= epoch <= EPOCH_MAX or not 0 <= seq < 1 << 64:
+        raise ValueError("a ticket needs an epoch from 1 to 2**64-1 and a 64-bit counter")
+    return f"{epoch:016x}.{seq:016x}.{secrets.token_hex(16)}"
 
 
 class Retirer:
@@ -547,20 +624,22 @@ class Retirer:
     poll POSTs {"tickets": [ids]} to the upstream's RETIRE_PATH and releases exactly the ids the answer lists under
     "retired". A failed poll (unreachable, an error status, an unreadable answer) releases nothing, fences the gate and
     backs off up to RETIRE_BACKOFF_S: fail closed. `call` (tests) replaces the HTTP call: call(path, body) -> the parsed
-    answer. `generation` is this gate's (random, 128 bits, drawn at start; tests may pass one)."""
+    answer. `epoch` is this gate's (next_epoch, taken once at start)."""
 
-    def __init__(self, host: str, port: int, *, connect_timeout: float = CONNECT_TIMEOUT_S,
-                 interval: float = RETIRE_POLL_S, call=None, start: bool = True, generation: str | None = None):
+    def __init__(self, host: str, port: int, *, epoch: int, connect_timeout: float = CONNECT_TIMEOUT_S,
+                 interval: float = RETIRE_POLL_S, call=None, start: bool = True):
+        if type(epoch) is not int or not 1 <= epoch <= EPOCH_MAX:
+            raise ValueError("a gate epoch is an integer from 1 to 2**64-1 (next_epoch)")
         self.host, self.port, self.connect_timeout, self.interval = host, port, connect_timeout, interval
         self._call = call or self._http
         self._cv = threading.Condition()
-        self._pending: dict[str, local_governor.Ticket] = {}
+        self._pending: dict[str, local_governor.Ticket | None] = {}   # None: an id refused upstream (refused())
         self._minted: set[str] = set()       # ids minted and not yet handed over or forgotten
         self._stopped = False
         self._start = start
         self._thread: threading.Thread | None = None
         self.last_error: str | None = None
-        self.generation = secrets.token_hex(16) if generation is None else generation
+        self.epoch = epoch
         self._seq = 0                        # the next ticket's counter (under _cv)
         self._fence: str | None = FENCE_STARTING
         self._fence_lock = threading.Lock()  # one fence query at a time (the thread or a waiting request)
@@ -608,7 +687,7 @@ class Retirer:
                 self._fence_gen += 1
                 known = sorted(self._minted | set(self._pending))
             try:
-                answer = self._call(FENCE_PATH, {"generation": self.generation, "known": known})
+                answer = self._call(FENCE_PATH, {"epoch": self.epoch, "known": known})
                 if not isinstance(answer, dict) or not isinstance(answer.get("clear"), bool):
                     raise ValueError("the guard's fence answer has no clear flag")
             except Exception as exc:              # noqa: BLE001 (any failure keeps the fence up)
@@ -618,8 +697,8 @@ class Retirer:
                     return self._fence
             with self._cv:
                 if not answer["clear"] and answer.get("refused") is True:
-                    self._fence = ("fenced: the backend's guard refuses this gate's generation (a newer gate fenced "
-                                   "it): restart this gate")
+                    self._fence = ("fenced: the backend's guard refuses this gate's epoch (a newer gate fenced a "
+                                   "higher one)")
                     return self._fence
                 if not answer["clear"]:
                     n = answer.get("unknown")
@@ -645,7 +724,7 @@ class Retirer:
     # ---- the ids
     def mint(self) -> str:
         with self._cv:
-            tid = new_ticket_id(self.generation, self._seq)
+            tid = new_ticket_id(self.epoch, self._seq)
             self._seq += 1
             self._minted.add(tid)
         return tid
@@ -653,6 +732,16 @@ class Retirer:
     def forget(self, ticket_id: str) -> None:
         with self._cv:
             self._minted.discard(ticket_id)
+
+    def refused(self, ticket_id: str) -> None:
+        """The guard refused this id's turn (409 TICKET_REFUSAL: nothing of it reached the scheduler): fence again,
+        and keep asking about the id, with no reservation of its own, until the guard retires it (it stays in the
+        fence's `known` meanwhile: its exchange may still be closing there)."""
+        with self._cv:
+            self._minted.discard(ticket_id)
+            self._pending[ticket_id] = None
+        self._raise_fence("fenced: the backend's guard refused a ticket (it has not been fenced by this gate: a new "
+                          "guard process, or another gate's fence)")
 
     def hand_over(self, ticket: local_governor.Ticket, ticket_id: str) -> None:
         ticket.mark_retiring()
@@ -706,7 +795,8 @@ class Retirer:
                 if isinstance(rid, str) and rid in asked and rid in self._pending:
                     done.append(self._pending.pop(rid))
         for ticket in done:
-            ticket.release()
+            if ticket is not None:
+                ticket.release()
         return len(done)
 
     def _run(self) -> None:
@@ -941,7 +1031,17 @@ class GateHandler(BaseHTTPRequestHandler):
                     return self._too_large(snap) if snap.get("refused") == "too_large" else self._busy(snap)
                 if self.server.retirer is not None and not images:
                     ticket_id = self.server.retirer.mint()   # retirement: the guard reports this id's release
-            self._forward(method, path, body, ticket_id)
+            if self._forward(method, path, body, ticket_id, may_retry=ticket_id is not None) is REFUSED_TICKET:
+                # The guard refused the ticket (a fresh guard is not fenced yet): nothing of the turn reached its
+                # scheduler, so it is sent once more under a new id once the fence lifts, with the same reservation.
+                self.server.retirer.refused(ticket_id)
+                ticket_id = None
+                fence = self.server.retirer.lift_now()
+                if fence is not None:
+                    return self._busy({**self.server.admission.snapshot(), "reason": fence})
+                ticket_id = self.server.retirer.mint()
+                self._upstream_sent = False
+                self._forward(method, path, body, ticket_id)
         finally:
             if ticket is not None:
                 if ticket_id is not None and self._upstream_sent:
@@ -1090,7 +1190,10 @@ class GateHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-    def _forward(self, method: str, path: str, body: bytes | None, ticket_id: str | None = None) -> None:
+    def _forward(self, method: str, path: str, body: bytes | None, ticket_id: str | None = None,
+                 may_retry: bool = False):
+        """Relay the turn upstream and the answer back. `may_retry`: a guard's ticket refusal (409 TICKET_REFUSAL) is
+        not relayed; REFUSED_TICKET is returned instead (nothing was written to the client), for one retry."""
         backend = self.server.backend["backend"]
         name = "Ollama" if backend == "ollama" else backend
         up_method, up_path = local_backend.UPSTREAM[backend][(method, path)]
@@ -1117,6 +1220,8 @@ class GateHandler(BaseHTTPRequestHandler):
                     return self._error(502, "api_error", f"{name} response unreadable ({type(exc).__name__})")
                 if path == "/api/tags" and resp.status == 200:
                     return self._tags(data, backend, ctype)
+                if may_retry and resp.status == 409 and TICKET_REFUSAL.encode() in data:
+                    return REFUSED_TICKET
                 if resp.status != 200 and backend != "ollama":
                     guarded = local_backend.guard_refusal(resp.status, data)
                     if guarded is not None:          # the backend's prompt guard: never fits, like the gate's own 413

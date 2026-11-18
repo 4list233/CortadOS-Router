@@ -28,7 +28,9 @@ is the long form.
   set: the padded decode batch and the guard's one-at-a-time 256-token text prefill, drained when a departed
   turn's kept width withholds room, checked on the governor's own state, #126; a vllm-mlx text turn is released only
   when the guard's `TicketLedger` confirms it left the scheduler: `local_gate.Retirer`, and a gate admits no text
-  turn until the guard confirms no row of a turn it does not know remains (the fence, `FENCE_PATH`, #126 round 4), docs/LOCAL-RESOURCES.md
+  turn until the guard confirms no row of a turn it does not know remains (the fence, `FENCE_PATH`, #126 round 4); each gate start takes the node's next
+  epoch (`next_epoch`, `~/.config/cortados/local-gate-epoch`, flock + fsync, corrupt refuses to start) and the guard
+  admits only the highest epoch fenced (#126 round 6), docs/LOCAL-RESOURCES.md
   "Retirement"); over either a retryable 529, never
   fitting a non-retryable 413 the provider routes elsewhere; input tokens bounded by the body's bytes as received plus a template allowance, never a backend count; images and documents refused for the text-only model, and for a model entry declaring `vision` (#125) still images
   within its policy, an image slot and the computed media-prefill bytes (`image_prefill_bytes`, the guard prefills

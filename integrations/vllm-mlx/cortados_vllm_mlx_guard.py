@@ -157,6 +157,41 @@ def verify(package_dir: str, version: str | None, pins: dict[str, str] | None = 
             raise GuardError(f"vllm_mlx/{rel} unreadable ({type(exc).__name__})") from None
         if got != want:
             raise GuardError(f"vllm_mlx/{rel} differs from the 0.6.0 release the guard was written against")
+    if (PINNED_SHA256 if pins is None else pins):          # {}: the version only (the tree was checked before)
+        verify_sources_only(package_dir, "vllm_mlx")
+
+
+def verify_sources_only(root: str, label: str) -> None:
+    """GuardError unless nothing in the package tree `root` can be imported in place of a released source file (#126
+    review round 6, P2c). isolate_bytecode keeps __pycache__ unread, but Python still imports SOURCELESS bytecode: a
+    `.pyc` outside __pycache__ is a module of its own (a `_version/__init__.pyc` package wins over `_version.py`). So:
+    no `.pyc` / `.pyo` anywhere outside __pycache__; no extension module whose name has a `.py` beside it (the
+    extension loader comes first); no package folder (an `__init__` of any importable suffix) beside a `.py` of its
+    name (a package wins over a module). Linked folders are followed, each once. Reads names only."""
+    import importlib.machinery
+    ext = tuple(importlib.machinery.EXTENSION_SUFFIXES)
+    inits = tuple(f"__init__{sfx}" for sfx in importlib.machinery.all_suffixes())
+    seen = set()
+    for folder, dirs, files in os.walk(root, followlinks=True):
+        real = os.path.realpath(folder)
+        if real in seen or os.path.basename(folder) == PYCACHE:
+            dirs[:] = []                                   # a loop, or a cache this process never reads
+            continue
+        seen.add(real)
+        names = set(files)
+        rel = os.path.relpath(folder, root)
+        where = label if rel == "." else f"{label}/{rel.replace(os.sep, '/')}"
+        for name in sorted(files):
+            if name.endswith((".pyc", ".pyo")):
+                raise GuardError(f"{where}/{name} is sourceless bytecode outside __pycache__ (it would be imported "
+                                 "in place of a released source)")
+            for sfx in ext:
+                if name.endswith(sfx) and f"{name[:-len(sfx)]}.py" in names:
+                    raise GuardError(f"{where}/{name} is an extension module beside {name[:-len(sfx)]}.py (it would "
+                                     "be imported in its place)")
+        for d in sorted(dirs):
+            if f"{d}.py" in names and any(os.path.lexists(os.path.join(folder, d, i)) for i in inits):
+                raise GuardError(f"{where}/{d} is a package beside {d}.py (it would be imported in its place)")
 
 
 def prompt_token_ids(tokenizer: Any, prompt: Any) -> list:
@@ -673,6 +708,8 @@ def verify_vision(vllm_dir: str, vlm_dir: str, vlm_version: str | None, pins: di
                 raise GuardError(f"{name}/{rel} unreadable ({type(exc).__name__})") from None
             if got != want:
                 raise GuardError(f"{name}/{rel} differs from the release the guard's vision argument was read against")
+    if MLX_VLM_PINNED_SHA256 if vlm_pins is None else vlm_pins:    # {}: the version only (checked before)
+        verify_sources_only(vlm_dir, "mlx_vlm")
 
 
 def _record_hash(path: str) -> str:
@@ -814,6 +851,7 @@ def verify_mlx_python(mlx_dir: str, tag: str, table: dict, find_spec: Any = None
         files[rel] = os.path.realpath(path)
     if os.path.lexists(os.path.join(mlx_dir, "__init__.py")):
         raise GuardError(f"mlx/__init__.py exists: no released {MLX_VERSION} wheel has one (it would run on import)")
+    verify_sources_only(mlx_dir, "mlx")
     find = find_spec or find_without_import
     try:
         top = find("mlx", None)
@@ -1508,6 +1546,7 @@ def verify_text(lm_dir: str, lm_version: str | None, pins: dict | None = None) -
                 continue
             raise GuardError(f"mlx_lm/{folder}/{name} is not in the {MLX_LM_VERSION} release the guard was "
                              "written against (a tokenizer could import it by name)")
+    verify_sources_only(lm_dir, "mlx_lm")
     verify_lm_resolution(lm_dir, table)
 
 
@@ -1522,17 +1561,21 @@ def _lm_module(rel: str) -> str:
 
 def verify_lm_resolution(lm_dir: str, table: dict, find_spec: Any = None) -> None:
     """GuardError unless every pinned mlx-lm module resolves, through the finders and without importing anything
-    (find_without_import), to its pinned file in `lm_dir` (#126 review round 5, P2c): a package or extension module of
-    the same name beside a pinned file would be imported in its place."""
+    (find_on_disk), to its pinned file in `lm_dir` (#126 review round 5, P2c): a package, extension module or
+    sourceless bytecode of the same name beside a pinned file would be imported in its place. Every pinned module, none
+    skipped (round 6, P2c: `from ._version import __version__` runs on `import mlx_lm`): mlx_lm itself is resolved
+    within the folder holding `lm_dir`."""
     import importlib
     importlib.invalidate_caches()                          # a folder changed since a finder last listed it
     find = find_spec or find_on_disk
     for rel in sorted(table, key=lambda r: r.count("/")):
-        if not rel.endswith(".py") or rel in ("__init__.py", "_version.py"):
-            continue                                       # the package itself: _locate / _imported_from
+        if not rel.endswith(".py"):
+            continue
         name = _lm_module(rel)
-        parent = name.rsplit(".", 1)[0]
-        where = [os.path.join(lm_dir, *parent.split(".")[1:])]
+        if "." in name:
+            where = [os.path.join(lm_dir, *name.rsplit(".", 1)[0].split(".")[1:])]
+        else:                                              # mlx_lm itself, within its own folder
+            where = [os.path.dirname(os.path.abspath(lm_dir))]
         try:
             spec = find(name, where)
         except (ImportError, ValueError) as exc:
@@ -1646,11 +1689,11 @@ def install_text(policy: TextPolicy, scheduler_cls: Any, batched_module: Any) ->
 # generator (_do_abort_request, 2250-2315). A finished turn leaves in the step that finished it (_cleanup_finished,
 # 2974-3123). The protocol (the gate's side: cortados_router/local_gate.py Retirer):
 #   * every request that may generate (any method but GET / HEAD / OPTIONS) carries the gate's ticket id
-#     (TICKET_HEADER, "<generation>.<seq>.<rand>", no request data: the gate generation below, the gate's own
-#     strictly increasing counter, 128 random bits); the ASGI middleware (TicketMiddleware, the outermost) refuses one
-#     without a well-formed id of the current generation, or with an id it has seen or one below the generation's
-#     floor, before vllm-mlx reads it, and holds the id in a context variable for the request's task and every task it
-#     starts;
+#     (TICKET_HEADER, "<epoch>.<seq>.<nonce>", no request data: the gate's epoch below, its own strictly increasing
+#     counter, 128 random bits that only make the id unguessable); the ASGI middleware (TicketMiddleware, the
+#     outermost) refuses one without a well-formed id of the current epoch, or with an id it has seen or one below the
+#     epoch's floor, before vllm-mlx reads it, and holds the id in a context variable for the request's task and every
+#     task it starts;
 #   * EngineCore.add_request (engine_core.py 446-510, the one way the text route's requests reach Scheduler.add_request,
 #     awaited in the request's own task; its worker job runs to completion even when cancelled, base.py 195-225) binds
 #     the scheduler request id to that ticket; Scheduler.add_request refuses an id no ticket is bound to, or whose
@@ -1660,12 +1703,13 @@ def install_text(policy: TextPolicy, scheduler_cls: Any, batched_module: Any) ->
 #     the batch generator) or unfinished requests; with no step running (the lock free) the same check runs on query;
 #   * POST RETIRE_PATH {"tickets": [ids]} answers {"retired": [ids], "boot": <this process's id>}: an id is retired when
 #     its HTTP exchange has ended and every request bound to it is gone or never entered the scheduler (it is then
-#     closed: nothing more may bind to it). An id this process never saw is retired when it can never be admitted here:
-#     malformed, of a generation other than the current one, or below the current generation's floor; or, of the
-#     current generation, once it is tombstoned (refused should it still arrive). It never entered this process's
+#     closed: nothing more may bind to it). An id this process never saw is retired, untracked, only when it can never
+#     be admitted here: malformed, of an epoch below the current one, or below the current epoch's floor; of the
+#     current epoch it is tombstoned first (tracked, refused should it still arrive). It never entered this process's
 #     scheduler, and a previous process's rows went with that process (a backend restart clears every retiring
-#     ticket). An id of a generation that is not refused (none is current yet) is never retired: the gate fences on the
-#     new boot id first. Nothing else is retired: a hung step keeps its tickets reserved.
+#     ticket). An unseen id of an epoch above the current one, and any id while no epoch is current, is never retired:
+#     that epoch may still be fenced here and its ticket admitted. Nothing else is retired: a hung step keeps its
+#     tickets reserved.
 # Atomicity (#126 review round 4, P1a). Admission and the "gone" transition exclude each other: Scheduler.add_request
 # (entering, the scheduler's own add, entered) runs under TicketLedger.admit_lock, and so does every safe point from the
 # moment it notes the entry sequence until it has marked what is gone. Each request is numbered as its add completes
@@ -1673,29 +1717,33 @@ def install_text(policy: TextPolicy, scheduler_cls: Any, batched_module: Any) ->
 # gone only a request numbered below it, i.e. one whose add had completed (so it was queued) before the read began. The
 # lock makes the number check redundant; the number keeps it true should any path ever add outside the lock. The retire
 # query takes the step lock and the admit lock without waiting: with either busy it answers from the last safe point.
-# Generations (#126 review round 5, P2a/P2b: no wall clock decides anything here). Each gate process draws a random
-# 128-bit generation at start and numbers its tickets with a counter that only goes up. This process has at most one
-# current generation: the first well-formed ticket it ever opens makes its generation current (a fresh process has no
-# rows anyone could have left), and every fence query makes the asking gate's generation current. A generation that
-# is not current is refused from then on, for open, bind and Scheduler.add_request alike, and a generation that was
-# replaced can never be made current again (a bounded memory of PAST_GENERATIONS; a gate's start is rare).
+# Epochs (#126 review round 6, P2a/P2b: ordered, persistent, no clock, no adoption). Each gate start takes the node's
+# next epoch, a strictly increasing integer kept in a state file (cortados_router/local_gate.py next_epoch), and
+# numbers its tickets with a counter that only goes up. This process has at most one current epoch, and none until a
+# fence arrives: a fresh process refuses every ticket (409) until a gate fences it (the gate re-fences on that 409 and
+# on a new boot id). A fence of epoch E is accepted only when E is at least the current epoch (the highest this process
+# has seen: only a fence sets it, and it never goes down); a lower one is refused and changes nothing, so a delayed old
+# fence never displaces the live gate. Once E is current, a ticket of any other epoch is refused, for open, bind and
+# Scheduler.add_request alike: one below E for good, one above until its gate fences. A restart forgets everything,
+# which is safe: the new process holds no rows, and a delayed old fence reaching it first is superseded by the live
+# gate's higher epoch.
 # The fence (#126 review round 4, P1b). A gate that has just started (or lost track of this process) knows none of the
-# rows a previous gate's turns left here, so it admits no text turn until POST FENCE_PATH {"generation": G, "known":
-# [ids]} answers {"clear": true}: atomically, G is now the only generation admitted, and no request bound to a ticket
-# outside `known` is pending, queued or in the scheduler, and no such ticket's exchange is open. Otherwise:
-# {"clear": false, "unknown": n}; a generation that was replaced: {"clear": false, "refused": true}.
-# Bounded (#126 review round 4, P2b): at most TICKET_MAX ids are tracked. A closed id (and an ended one of a generation
-# no longer current whose requests are all gone: no live gate can ask about it) may be evicted, old generations first,
-# then the current one by counter; the current generation's floor then rises past every evicted counter, and an id
-# below the floor is refused on arrival and, unknown, retired without being tracked: an evicted tombstone can never be
-# replayed. An unknown id that cannot be tracked (every slot an open turn): not retired.
+# rows a previous gate's turns left here, so it admits no text turn until POST FENCE_PATH {"epoch": E, "known": [ids]}
+# answers {"clear": true}: atomically, E is now the only epoch admitted, and no request bound to a ticket outside
+# `known` is pending, queued or in the scheduler, and no such ticket's exchange is open. Otherwise:
+# {"clear": false, "unknown": n}; an epoch below the current one: {"clear": false, "refused": true}.
+# Bounded (#126 review round 4, P2b): at most TICKET_MAX ids are tracked. A closed id (and an ended one of an epoch no
+# longer current whose requests are all gone: no live gate can ask about it) may be evicted, old epochs first, then the
+# current one by counter; the current epoch's floor then rises past every evicted counter, and an id below the floor is
+# refused on arrival and, unknown, retired without being tracked: an evicted tombstone can never be replayed. An
+# unknown id that cannot be tracked (every slot an open turn): not retired.
 TICKET_HEADER = "x-cortados-ticket"
 RETIRE_PATH = "/cortados/retire"
 FENCE_PATH = "/cortados/fence"
 TICKET_REFUSAL = "cortados guard: a request needs a fresh gate ticket"
 TICKET_MAX = 8192                   # ids tracked at once (open, ended, closed and tombstoned): a hard bound
-TICKET_LEN = 32 + 1 + 16 + 1 + 32   # "<generation: 32 hex>.<seq: 16 hex>.<rand: 32 hex>"
-PAST_GENERATIONS = 1024             # replaced generations remembered (never made current again)
+TICKET_LEN = 16 + 1 + 16 + 1 + 32   # "<epoch: 16 hex>.<seq: 16 hex>.<nonce: 32 hex>"
+EPOCH_MAX = (1 << 64) - 1           # epochs are 1 .. EPOCH_MAX (16 hex digits)
 RETIRE_MAX_BODY = 1 << 20
 _HEX = frozenset("0123456789abcdef")
 
@@ -1705,17 +1753,19 @@ def _is_hex(s: str, n: int) -> bool:
 
 
 def ticket_parts(tid: Any) -> tuple | None:
-    """(generation, seq) of a well-formed ticket id (TICKET_HEADER: lower-case hex, fixed widths), or None."""
+    """(epoch, seq) of a well-formed ticket id (TICKET_HEADER: lower-case hex, fixed widths, epoch at least 1), or
+    None."""
     if not isinstance(tid, str) or len(tid) != TICKET_LEN:
         return None
     parts = tid.split(".")
-    if len(parts) != 3 or not (_is_hex(parts[0], 32) and _is_hex(parts[1], 16) and _is_hex(parts[2], 32)):
+    if len(parts) != 3 or not (_is_hex(parts[0], 16) and _is_hex(parts[1], 16) and _is_hex(parts[2], 32)):
         return None
-    return parts[0], int(parts[1], 16)
+    epoch = int(parts[0], 16)
+    return (epoch, int(parts[1], 16)) if epoch >= 1 else None
 
 
-def is_generation(gen: Any) -> bool:
-    return isinstance(gen, str) and _is_hex(gen, 32)
+def is_epoch(epoch: Any) -> bool:
+    return type(epoch) is int and 1 <= epoch <= EPOCH_MAX
 
 
 class TicketLedger:
@@ -1723,10 +1773,9 @@ class TicketLedger:
     `_lock` guards the records; it is touched from the event loop (middleware, EngineCore.add_request, the retire and
     fence queries) and the executor thread (Scheduler.add_request, the step safe point). `admit_lock` makes admission
     and a safe point's read-and-mark atomic (P1a above); lock order: step_lock, admit_lock, _lock. No decision reads a
-    clock (generations above)."""
+    clock (epochs above)."""
 
     def __init__(self):
-        import collections
         import threading
         import uuid
         import weakref
@@ -1737,9 +1786,8 @@ class TicketLedger:
         # scheduler request id -> [ticket id, pending | adding | entered | gone | closed, entry sequence number]
         self._rids: dict = {}
         self._seq = 0                          # the next entry sequence number
-        self.generation: str | None = None     # the one generation admitted (None: none yet; generations above)
-        self._past: Any = collections.deque(maxlen=PAST_GENERATIONS)   # generations replaced: never current again
-        self.floor = 0                         # a current-generation counter below this is never admitted (eviction)
+        self.epoch: int | None = None          # the one epoch admitted (None: no fence yet; epochs above)
+        self.floor = 0                         # a current-epoch counter below this is never admitted (eviction)
         self._schedulers = weakref.WeakSet()
         self.boot = uuid.uuid4().hex
 
@@ -1748,11 +1796,11 @@ class TicketLedger:
         return all(self._rids.get(rid, [None, "gone"])[1] in ("gone", "closed") for rid in rec["rids"])
 
     def _current_locked(self, tid: str) -> bool:
-        return self.generation is not None and tid[:32] == self.generation
+        return self.epoch is not None and int(tid[:16], 16) == self.epoch
 
     def _order_locked(self, tid: str) -> tuple:
-        """Eviction order: generations no longer current first, then the current one by its counter."""
-        return (self._current_locked(tid), int(tid[33:49], 16))
+        """Eviction order: epochs no longer current first, then the current one by its counter."""
+        return (self._current_locked(tid), int(tid[:16], 16), int(tid[17:33], 16))
 
     def _evictable_locked(self, tid: str, rec: dict) -> bool:
         return rec["state"] == "closed" or (rec["state"] == "ended" and not self._current_locked(tid)
@@ -1763,7 +1811,7 @@ class TicketLedger:
             for rid in self._tickets.pop(tid)["rids"]:
                 self._rids.pop(rid, None)
             if self._current_locked(tid):
-                self.floor = max(self.floor, int(tid[33:49], 16) + 1)
+                self.floor = max(self.floor, int(tid[17:33], 16) + 1)
 
     def _room_locked(self) -> bool:
         """True when one more id may be tracked (evicting what may go, oldest first): the bound, on every insert."""
@@ -1772,20 +1820,27 @@ class TicketLedger:
         old = sorted((t for t, rec in self._tickets.items() if self._evictable_locked(t, rec)), key=self._order_locked)
         if not old:
             return False
-        # every id of a generation no longer current (refused on arrival anyway) and at least the oldest quarter
+        # every id of an epoch no longer current (refused on arrival anyway) and at least the oldest quarter
         # (amortised: a flood of tombstones costs O(log n) per id); `old` is sorted, so those ids are its prefix
         n = max(sum(1 for t in old if not self._current_locked(t)), max(1, len(old) // 4))
         self._evict_locked(old[:n])
         return len(self._tickets) < TICKET_MAX
 
-    def _refused_locked(self, tid: str) -> str | None:
-        """Why a well-formed `tid` can never be admitted here, or None (generations above)."""
-        if self.generation is None:
-            return None
-        if tid[:32] != self.generation:
-            return "a ticket of another gate generation (replaced at the fence)"
-        if int(tid[33:49], 16) < self.floor:
-            return "a ticket id below its generation's floor (already retired)"
+    def _never_locked(self, epoch: int, seq: int) -> bool:
+        """True when a ticket (epoch, seq) can never be admitted by this process: its epoch is below the current one,
+        or it is of the current epoch and below its floor (epochs above)."""
+        return self.epoch is not None and (epoch < self.epoch or (epoch == self.epoch and seq < self.floor))
+
+    def _refused_locked(self, epoch: int, seq: int) -> str | None:
+        """Why a ticket (epoch, seq) is not admitted now, or None."""
+        if self.epoch is None:
+            return "no gate epoch fenced yet (the gate fences first)"
+        if epoch < self.epoch:
+            return "a ticket of an older gate epoch (superseded at the fence)"
+        if epoch > self.epoch:
+            return "a ticket of a gate epoch not fenced yet (the gate fences first)"
+        if seq < self.floor:
+            return "a ticket id below its epoch's floor (already retired)"
         return None
 
     # ---- the exchange
@@ -1795,9 +1850,7 @@ class TicketLedger:
         if parts is None:
             return "no well-formed ticket id"
         with self._lock:
-            if self.generation is None and parts[0] not in self._past:
-                self.generation, self.floor = parts[0], 0    # a fresh process: its first gate's generation
-            why = self._refused_locked(tid)
+            why = self._refused_locked(*parts)
             if why is not None:
                 return why
             if tid in self._tickets:
@@ -1819,7 +1872,7 @@ class TicketLedger:
         with self._lock:
             rec = self._tickets.get(tid) if isinstance(tid, str) else None
             if rec is None or rec["state"] == "closed" or not self._current_locked(tid):
-                return "no open gate ticket of the current generation for this request"
+                return "no open gate ticket of the current epoch for this request"
             if rid in self._rids:
                 return "a request id already bound"
             rec["rids"].add(rid)
@@ -1835,7 +1888,7 @@ class TicketLedger:
 
     def entering(self, rid: str) -> bool:
         """Scheduler.add_request is about to queue `rid` (admit_lock held): False (refuse it) unless it is bound to a
-        ticket of the current generation and still pending."""
+        ticket of the current epoch and still pending."""
         with self._lock:
             got = self._rids.get(rid)
             if got is None or got[1] != "pending" or not self._current_locked(got[0]):
@@ -1910,11 +1963,12 @@ class TicketLedger:
                     continue
                 rec = self._tickets.get(tid)
                 if rec is None:
-                    if ticket_parts(tid) is None or self._refused_locked(tid) is not None:
+                    parts = ticket_parts(tid)
+                    if parts is None or self._never_locked(*parts):
                         out.append(tid)                     # never admitted here, and never will be: not tracked
-                    elif self.generation is None:
-                        pass                                # not refused yet: not retired (the gate fences first)
-                    elif self._room_locked():               # tombstone: refused should it still arrive
+                    elif self.epoch is None or parts[0] != self.epoch:
+                        pass                                # its epoch may still be fenced here: never retired
+                    elif self._room_locked():               # the current epoch: tombstone, refused should it arrive
                         self._tickets[tid] = {"state": "closed", "rids": set()}
                         out.append(tid)
                     continue                                # no room: not retired (the gate keeps it reserved)
@@ -1925,20 +1979,19 @@ class TicketLedger:
                     out.append(tid)
         return out
 
-    def fence(self, generation: Any, known: Any) -> dict:
-        """The fence query (FENCE_PATH, module comment above): make `generation` the only one admitted, then say
-        whether any request bound to a ticket outside `known` may still be in the scheduler or reach it."""
-        if not is_generation(generation):
-            raise ValueError("a generation is 32 lower-case hex characters")
+    def fence(self, epoch: Any, known: Any) -> dict:
+        """The fence query (FENCE_PATH, module comment above): make `epoch` the only one admitted, unless it is below
+        the current one (refused: nothing changes), then say whether any request bound to a ticket outside `known` may
+        still be in the scheduler or reach it."""
+        if not is_epoch(epoch):
+            raise ValueError(f"an epoch is an integer from 1 to {EPOCH_MAX}")
         self._fresh_safe_point()
         known = {t for t in known if isinstance(t, str)} if isinstance(known, list) else set()
         with self._lock:
-            if generation in self._past:
-                return {"clear": False, "refused": True, "unknown": 0, "generation": self.generation}
-            if self.generation != generation:
-                if self.generation is not None:
-                    self._past.append(self.generation)
-                self.generation, self.floor = generation, 0
+            if self.epoch is not None and epoch < self.epoch:
+                return {"clear": False, "refused": True, "unknown": 0, "epoch": self.epoch}
+            if self.epoch != epoch:
+                self.epoch, self.floor = epoch, 0
             unknown = 0
             for tid, rec in self._tickets.items():
                 if tid in known:
@@ -1947,7 +2000,7 @@ class TicketLedger:
                     unknown += 1
                 elif rec["state"] == "ended" and not self._current_locked(tid):
                     rec["state"] = "closed"                  # its gate is gone: nothing will ever ask about it
-            return {"clear": unknown == 0, "unknown": unknown, "generation": self.generation}
+            return {"clear": unknown == 0, "unknown": unknown, "epoch": self.epoch}
 
 
 class TicketMiddleware:
@@ -1981,11 +2034,11 @@ class TicketMiddleware:
         except ValueError:
             data = None
         if fence:
-            gen, known = (data.get("generation"), data.get("known")) if isinstance(data, dict) else (None, None)
-            if not is_generation(gen) or not isinstance(known, list):
-                return await self._answer(send, 400, {"detail": 'body must be {"generation": "<32 hex>", "known": '
+            epoch, known = (data.get("epoch"), data.get("known")) if isinstance(data, dict) else (None, None)
+            if not is_epoch(epoch) or not isinstance(known, list):
+                return await self._answer(send, 400, {"detail": 'body must be {"epoch": <1 .. 2**64-1>, "known": '
                                                                 '[ids]}'})
-            return await self._answer(send, 200, {**self.ledger.fence(gen, known), "boot": self.ledger.boot})
+            return await self._answer(send, 200, {**self.ledger.fence(epoch, known), "boot": self.ledger.boot})
         ids = data.get("tickets") if isinstance(data, dict) else None
         if not isinstance(ids, list):
             return await self._answer(send, 400, {"detail": 'body must be {"tickets": [ids]}'})

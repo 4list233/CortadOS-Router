@@ -13,6 +13,7 @@ import collections
 import http.client
 import itertools
 import json
+import os
 import secrets
 import shutil
 import socket
@@ -41,7 +42,8 @@ class GuardState:
     def __init__(self):
         self.lock = threading.Lock()
         self.live: set = set()
-        self.tickets: list = []                  # the ticket header of each POST /v1/messages, in order
+        self.tickets: list = []                  # the ticket header of each POST /v1/messages admitted, in order
+        self.sent: list = []                     # ... of each one sent, refused (409) or not
         self.polls: list = []                    # the ids of each retirement poll
         self.mode = "complete"                   # complete | hold | error | stream
         self.retire_status = 200                 # 503: a guard that cannot answer (hung)
@@ -49,7 +51,8 @@ class GuardState:
         self.arrived = threading.Semaphore(0)
         self.fences: list = []                   # the body of each fence query
         self.fence_status = 200                  # 503: a guard that cannot answer the fence
-        self.generation = None                   # the generation the last fence query made current
+        self.epoch = None                        # the epoch the last fence query made current (None: a fresh guard)
+        self.enforce = False                     # True: refuse a ticket of another epoch, as the real guard does (409)
         self.boot = "b"                          # the guard process (a new value: vllm-mlx restarted)
 
     def release(self, *tickets):
@@ -84,7 +87,9 @@ class FakeGuard(BaseHTTPRequestHandler):
                 return self._json(st.fence_status, {"detail": "busy"})
             with st.lock:                         # live tickets the gate does not know: a previous gate's rows
                 unknown = [t for t in st.live if t not in body["known"]]
-                st.generation = body["generation"]
+                if st.epoch is not None and body["epoch"] < st.epoch:
+                    return self._json(200, {"clear": False, "refused": True, "unknown": 0, "boot": st.boot})
+                st.epoch = body["epoch"]
                 return self._json(200, {"clear": not unknown, "unknown": len(unknown), "boot": st.boot})
         if self.path == local_gate.RETIRE_PATH:
             st.polls.append(list(body["tickets"]))
@@ -95,6 +100,9 @@ class FakeGuard(BaseHTTPRequestHandler):
                                         "boot": st.boot})
         ticket = self.headers.get(local_gate.TICKET_HEADER)
         with st.lock:
+            st.sent.append(ticket)
+            if st.enforce and (st.epoch is None or int(ticket.split(".")[0], 16) != st.epoch):
+                return self._json(409, {"detail": f"{local_gate.TICKET_REFUSAL} (no gate epoch fenced yet)"})
             st.tickets.append(ticket)
             st.live.add(ticket)                   # queued in the scheduler: rows from here until released
         st.arrived.release()
@@ -139,14 +147,21 @@ class RetireGateBase(unittest.TestCase):
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeGuard)
         threading.Thread(target=self.upstream.serve_forever, daemon=True).start()
         self.addCleanup(self._stop, self.upstream)
+        self.epoch_file = Path(self.tmpdir(), "local-gate-epoch")   # the node's epoch file (next_epoch)
         self.gate = self.make_gate(self.upstream.server_port)
         self.url = f"http://127.0.0.1:{self.gate.server_port}"
+
+    def tmpdir(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        return d
 
     def make_gate(self, port):
         gov = FixedGovernor(**self.GOVERNOR) if self.GOVERNOR is not None else None
         gate = local_gate.GateServer(("127.0.0.1", 0), token=TOKEN, upstream=f"http://127.0.0.1:{port}",
                                      read_timeout=self.READ_TIMEOUT, backend={**MLX, "governor": None},
-                                     admission=local_governor.Admission(gov))
+                                     admission=local_governor.Admission(gov), epoch_file=self.epoch_file)
         threading.Thread(target=gate.serve_forever, daemon=True).start()
         self.addCleanup(self._stop, gate)
         return gate
@@ -311,10 +326,13 @@ class GateRetirementTests(RetireGateBase):
         guard = load_guard()
         self.assertEqual(len(set(self.st.tickets)), 3)
         parts = [guard.ticket_parts(t) for t in self.st.tickets]       # the guard's own format check
-        self.assertEqual({p[0] for p in parts}, {self.gate.retirer.generation})
+        self.assertEqual({p[0] for p in parts}, {self.gate.retirer.epoch})
         self.assertEqual(sorted(p[1] for p in parts), [p[1] for p in parts])   # strictly increasing counters
         self.assertEqual(len({p[1] for p in parts}), 3)
-        self.assertEqual((local_gate.TICKET_HEADER, local_gate.RETIRE_PATH), (guard.TICKET_HEADER, guard.RETIRE_PATH))
+        self.assertEqual((local_gate.TICKET_HEADER, local_gate.RETIRE_PATH, local_gate.FENCE_PATH,
+                          local_gate.TICKET_REFUSAL, local_gate.EPOCH_MAX),
+                         (guard.TICKET_HEADER, guard.RETIRE_PATH, guard.FENCE_PATH, guard.TICKET_REFUSAL,
+                          guard.EPOCH_MAX))
 
 
 class UngovernedRetirementTests(RetireGateBase):
@@ -354,36 +372,97 @@ class FenceGateTests(RetireGateBase):
         self.assertEqual(self.st.tickets, [])                           # nothing reached the backend
         self.assertIn("does not know", self.report()["fence"])
         self.assertTrue(self.st.fences)
-        self.assertEqual(self.st.fences[-1], {"generation": gate.retirer.generation, "known": []})
+        self.assertEqual(self.st.fences[-1], {"epoch": gate.retirer.epoch, "known": []})
         self.st.release("old-64k-turn")                                 # its rows leave the scheduler
         self.assertTrue(wait_for(lambda: gate.retirer.fenced() is None))
         self.assertEqual(self.call(msg())[0], 200)
         self.assertIsNone(self.report()["fence"])
 
-    def test_the_fence_lifts_when_the_backend_is_empty_and_tickets_carry_the_fenced_generation(self):
+    def test_the_fence_lifts_when_the_backend_is_empty_and_tickets_carry_the_fenced_epoch(self):
         self.assertEqual(self.call(msg())[0], 200)
-        self.assertEqual(self.st.fences[0], {"generation": self.gate.retirer.generation, "known": []})
+        self.assertEqual(self.st.fences[0], {"epoch": self.gate.retirer.epoch, "known": []})
         self.assertIsNone(self.report()["fence"])
-        self.assertEqual(self.st.tickets[0].split(".")[0], self.st.generation)
+        self.assertEqual(int(self.st.tickets[0].split(".")[0], 16), self.st.epoch)
 
-    def test_round5_a_gate_generation_is_random_and_its_counter_ignores_the_clock(self):
-        gens = {local_gate.Retirer("127.0.0.1", 9, call=lambda p, b: {}, start=False).generation for _ in range(5)}
-        self.assertEqual(len(gens), 5)
-        self.assertTrue(all(len(g) == 32 and int(g, 16) >= 0 for g in gens))
-        r = local_gate.Retirer("127.0.0.1", 9, call=lambda p, b: {}, start=False)
+    def test_round6_a_gate_takes_the_nodes_next_epoch_and_its_counter_ignores_the_clock(self):
+        first = self.gate.retirer.epoch
+        self.assertEqual(self.epoch_file.read_text(), f"{first}\n")     # taken from the node's file, written back
+        second = self.make_gate(self.upstream.server_port).retirer.epoch   # a gate restart: the next one
+        self.assertEqual(second, first + 1)
+        self.assertEqual(self.epoch_file.read_text(), f"{second}\n")
+        r = local_gate.Retirer("127.0.0.1", 9, call=lambda p, b: {}, start=False, epoch=second)
         clock = itertools.cycle([1.8e9, 1.0, 4e9, 0.0, 1.8e9 - 86400, 7e9])       # the wall clock jumping both ways
         with patch.object(local_gate.time, "time", lambda: next(clock)):
             ids = [r.mint() for _ in range(6)]
-        seqs = [int(t.split(".")[1], 16) for t in ids]
-        self.assertEqual(seqs, list(range(6)))
-        self.assertEqual({t.split(".")[0] for t in ids}, {r.generation})
-        self.assertTrue(all(len(t) == 82 for t in ids))
+        guard = load_guard()
+        self.assertEqual([guard.ticket_parts(t) for t in ids], [(second, n) for n in range(6)])
+        self.assertTrue(all(len(t) == guard.TICKET_LEN == 66 for t in ids))
+        self.assertEqual(len({t.split(".")[2] for t in ids}), 6)        # the nonce: unguessable, not an order
+        for bad in (0, -1, 1 << 64, "1", True, 1.0):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                local_gate.Retirer("127.0.0.1", 9, call=lambda p, b: {}, start=False, epoch=bad)
 
-    def test_round5_a_refused_generation_keeps_the_gate_fenced(self):
+    def test_round6_a_refused_epoch_keeps_the_gate_fenced(self):
         answers = collections.deque([{"clear": False, "refused": True, "unknown": 0, "boot": "b"}])
-        r = local_gate.Retirer("127.0.0.1", 9, call=lambda path, body: answers.popleft(), start=False)
-        self.assertIn("refuses this gate's generation", r.fence_once())
-        self.assertIn("refuses this gate's generation", r.fenced())
+        r = local_gate.Retirer("127.0.0.1", 9, call=lambda path, body: answers.popleft(), start=False, epoch=1)
+        self.assertIn("refuses this gate's epoch", r.fence_once())
+        self.assertIn("refuses this gate's epoch", r.fenced())
+
+    def test_round6_the_first_turn_after_a_backend_restart_costs_at_most_one_retry(self):
+        self.st.enforce = True                                          # the real guard's rule (a): fenced first
+        self.assertEqual(self.call(msg())[0], 200)                      # the startup fence, then served
+        self.assertEqual(len(self.st.sent), 1)
+        self.st.release()
+        self.assertTrue(wait_for(lambda: self.adm.inflight == 0))
+        with self.st.lock:                                              # vllm-mlx restarts while the gate is idle
+            self.st.epoch, self.st.boot, self.st.live = None, "b2", set()
+        fences, sent = len(self.st.fences), len(self.st.sent)
+        code, _ = self.call(msg())                                      # one client call...
+        self.assertEqual(code, 200)
+        self.assertEqual(len(self.st.sent) - sent, 2)                   # ...two upstream sends: refused once, then served
+        self.assertEqual(len(self.st.tickets), 2)
+        self.assertGreater(len(self.st.fences), fences)                 # re-fenced in between
+        refused = self.st.sent[sent]
+        self.assertIn(refused, self.st.fences[-1]["known"])             # the refused id stays accounted for
+        self.assertEqual(self.gate.retirer.boot, "b2")
+        self.st.release()
+        self.assertTrue(wait_for(lambda: (self.adm.inflight, self.adm.reserved, self.gate.retirer.pending())
+                                 == (0, 0, [])))
+        sent = len(self.st.sent)
+        self.assertEqual(self.call(msg())[0], 200)                      # steady again: no retry
+        self.assertEqual(len(self.st.sent) - sent, 1)
+
+    def test_round6_a_refused_retry_answers_busy_and_holds_nothing(self):
+        self.st.enforce = True
+        self.assertEqual(self.call(msg())[0], 200)
+        self.st.release()
+        self.assertTrue(wait_for(lambda: self.adm.inflight == 0))
+        with self.st.lock:                                              # a newer gate fenced the guard
+            self.st.epoch = self.gate.retirer.epoch + 1
+        sent = len(self.st.sent)
+        code, raw = self.call(msg())
+        self.assertEqual(code, 529)                                     # busy, not the guard's 409
+        self.assertIn("refuses this gate's epoch", json.loads(raw)[local_gate.GATE_KEY]["fence"])
+        self.assertEqual(len(self.st.sent) - sent, 1)                   # never sent a second time
+        self.assertTrue(wait_for(lambda: (self.adm.inflight, self.adm.reserved) == (0, 0)))
+
+    def test_round6_a_restarted_gate_supersedes_its_predecessor_at_the_guard(self):
+        self.st.enforce = True
+        old = self.gate
+        self.assertEqual(self.call(msg())[0], 200)                      # the old gate fenced and served
+        self.st.release()
+        self.assertTrue(wait_for(lambda: old.admission.inflight == 0))
+        new = self.make_gate(self.upstream.server_port)                 # the restarted gate: a higher epoch
+        self.gate = new
+        self.assertEqual(self.call(msg())[0], 200)
+        self.assertEqual(self.st.epoch, new.retirer.epoch)
+        self.gate = old                                                 # the old gate's turn arrives late
+        code, raw = self.call(msg())
+        self.assertEqual(code, 529)
+        self.assertIn("refuses this gate's epoch", json.loads(raw)[local_gate.GATE_KEY]["fence"])
+        self.assertEqual(self.st.epoch, new.retirer.epoch)              # its fence displaced nothing
+        self.gate = new
+        self.assertEqual(self.call(msg())[0], 200)
 
     def test_a_hung_or_unreachable_guard_keeps_the_fence_up_visibly(self):
         FakeGuard.state = self.st = GuardState()
@@ -435,11 +514,109 @@ class FenceGateTests(RetireGateBase):
         self.assertTrue(wait_for(lambda: (self.adm.inflight, self.adm.retiring) == (0, 0)))
 
 
+class EpochFileTests(unittest.TestCase):
+    """#126 review round 6: each gate start takes the node's next epoch from a small state file, under an exclusive
+    lock, written back durably before it is used; a corrupt file refuses to start and is never reset."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = Path(self.dir, "cfg", "local-gate-epoch")
+
+    def test_round6_a_missing_file_starts_at_1_and_each_start_takes_the_next(self):
+        self.assertEqual([local_gate.next_epoch(self.path) for _ in range(3)], [1, 2, 3])
+        self.assertEqual(self.path.read_text(), "3\n")
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(Path(str(self.path) + ".lock").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(sorted(os.listdir(self.path.parent)), ["local-gate-epoch", "local-gate-epoch.lock"])
+        self.path.write_text("41")                                      # no newline: still one integer
+        self.assertEqual(local_gate.next_epoch(self.path), 42)
+
+    def test_round6_the_epoch_is_written_and_synced_before_it_is_used(self):
+        calls = []
+        real_fsync, real_replace = os.fsync, os.replace
+        with patch.object(local_gate.os, "fsync", lambda fd: calls.append("fsync") or real_fsync(fd)), \
+                patch.object(local_gate.os, "replace", lambda a, b: calls.append("rename") or real_replace(a, b)):
+            self.assertEqual(local_gate.next_epoch(self.path), 1)
+        self.assertEqual(calls, ["fsync", "rename", "fsync"])           # the temp file, the rename, the directory
+
+    def test_round6_concurrent_gate_starts_get_distinct_increasing_epochs(self):
+        import subprocess
+        import sys
+        got, lock = [], threading.Lock()
+
+        def start():
+            e = local_gate.next_epoch(self.path)
+            with lock:
+                got.append(e)
+        threads = [threading.Thread(target=start) for _ in range(24)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(10)
+        # and separate processes, as two gate LaunchAgents would be
+        code = ("import sys; from cortados_router import local_gate; "
+                "print(local_gate.next_epoch(sys.argv[1]))")
+        root = str(Path(__file__).resolve().parent.parent)
+        procs = [subprocess.Popen([sys.executable, "-B", "-c", code, str(self.path)], cwd=root,
+                                  stdout=subprocess.PIPE, text=True) for _ in range(6)]
+        for p in procs:
+            out, _ = p.communicate(timeout=60)
+            self.assertEqual(p.returncode, 0)
+            got.append(int(out))
+        self.assertEqual(sorted(got), list(range(1, 31)))               # distinct, none lost, none reused
+        self.assertEqual(self.path.read_text(), "30\n")
+
+    def test_round6_a_corrupt_epoch_file_refuses_to_start_and_is_never_reset(self):
+        self.path.parent.mkdir(mode=0o700)
+        for raw in (b"", b"\n", b"abc\n", b"-1\n", b"0\n", b"01\n", b"7\n\n", b" 7\n", b"7.0\n", b"\x00",
+                    b"18446744073709551616\n", b"9" * 64):
+            with self.subTest(raw=raw):
+                self.path.write_bytes(raw)
+                with self.assertRaisesRegex(local_gate.GateConfigError, "corrupt"):
+                    local_gate.next_epoch(self.path)
+                self.assertEqual(self.path.read_bytes(), raw)           # left for the owner to inspect
+        self.path.write_bytes(b"18446744073709551615\n")                # the last epoch was used
+        with self.assertRaisesRegex(local_gate.GateConfigError, "used up"):
+            local_gate.next_epoch(self.path)
+        self.path.unlink()
+        target = Path(self.dir, "elsewhere")
+        target.write_text("5\n")
+        os.symlink(target, self.path)                                   # a link: refused, never followed
+        with self.assertRaisesRegex(local_gate.GateConfigError, "not a regular file"):
+            local_gate.next_epoch(self.path)
+        self.assertEqual(target.read_text(), "5\n")
+        self.path.unlink()
+        self.path.mkdir()
+        with self.assertRaisesRegex(local_gate.GateConfigError, "not a regular file"):
+            local_gate.next_epoch(self.path)
+
+    def test_round6_a_gate_with_a_corrupt_epoch_file_does_not_start(self):
+        self.path.parent.mkdir(mode=0o700)
+        self.path.write_text("garbage\n")
+        with patch.object(local_gate, "pro_local_allowed", return_value=(True, "test")):
+            with self.assertRaisesRegex(local_gate.GateConfigError, "corrupt"):
+                local_gate.GateServer(("127.0.0.1", 0), token=TOKEN, upstream="http://127.0.0.1:9",
+                                      backend={**MLX, "governor": None}, epoch_file=self.path)
+        self.assertEqual(self.path.read_text(), "garbage\n")
+        # an Ollama node (no retirement) never reads it
+        gate = local_gate.GateServer(("127.0.0.1", 0), token=TOKEN, upstream="http://127.0.0.1:9",
+                                     epoch_file=self.path)
+        gate.server_close()
+        self.assertIsNone(gate.retirer)
+
+    def test_round6_the_tests_never_touch_the_nodes_epoch_file(self):
+        self.assertNotEqual(os.path.expanduser(local_gate.default_epoch_file()),
+                            os.path.expanduser(local_gate.DEFAULT_EPOCH_FILE))
+
+
 class RetirerUnitTests(unittest.TestCase):
     def test_only_the_ids_asked_and_confirmed_are_released(self):
         adm = local_governor.Admission(FixedGovernor())
         answers = collections.deque()
-        r = local_gate.Retirer("127.0.0.1", 9, call=lambda path, body: answers.popleft(), start=False)
+        r = local_gate.Retirer("127.0.0.1", 9, call=lambda path, body: answers.popleft(), start=False, epoch=1)
         t1 = adm.try_acquire(load=adm.text_load(100, 1))[0]
         t2 = adm.try_acquire(load=adm.text_load(100, 1))[0]
         r.hand_over(t1, "a")
@@ -554,12 +731,15 @@ class HTTPError(Exception):
 
 
 class LedgerBase(unittest.TestCase):
+    FENCED = True                                                       # False: a fresh guard no gate has fenced
+
     def setUp(self):
         self.guard = load_guard()
-        self.gen = secrets.token_hex(16)                               # the gate's generation
+        self.epoch = 5                                                  # the gate's epoch
         self.seq = itertools.count()
         self.ledger = self.guard.TicketLedger()
-        self.assertTrue(self.ledger.fence(self.gen, [])["clear"])       # what a starting gate does first
+        if self.FENCED:
+            self.assertTrue(self.ledger.fence(self.epoch, [])["clear"])  # what a starting gate does first
         # fresh classes per test (install_tickets patches them in place)
         self.Sched = type("Sched", (Sched,), {k: Sched.__dict__[k] for k in ("add_request", "step", "reset")})
         self.Engine = type("Engine", (Engine,), {"add_request": Engine.__dict__["add_request"]})
@@ -571,8 +751,8 @@ class LedgerBase(unittest.TestCase):
         self.calls, self.rids = [], []
         self.mw = cls(self.handler, **kw)
 
-    def tid(self, gen=None):
-        return local_gate.new_ticket_id(gen or self.gen, next(self.seq))
+    def tid(self, epoch=None):
+        return local_gate.new_ticket_id(epoch or self.epoch, next(self.seq))
 
     async def handler(self, scope, receive, send):
         """The server's /v1/messages: the engine's add_request in the request's own task (any other path: a read)."""
@@ -699,26 +879,28 @@ class GuardLedgerTests(LedgerBase):
     def test_a_restart_retires_every_id_it_never_saw_and_refuses_them_after(self):
         old = [self.tid() for _ in range(3)]
         restarted = self.guard.TicketLedger()                             # a new vllm-mlx process
-        self.assertEqual(restarted.retire(old), [])                       # no generation refused yet: not retired
-        self.assertTrue(restarted.fence(self.gen, [])["clear"])           # the gate fences on the new boot id
+        self.assertEqual(restarted.retire(old), [])                       # no epoch fenced yet: not retired
+        self.assertTrue(restarted.fence(self.epoch, [])["clear"])         # the gate fences on the new boot id
         self.assertEqual(restarted.retire(old), old)
         for t in old:
             self.assertIsNotNone(restarted.open(t))                       # tombstoned: never served late
         self.assertIsNone(restarted.open(self.tid()))                     # the gate's next turn is served
-        # a malformed id or one of another generation could never be admitted here: retired, and not tracked
-        other = self.tid(gen=secrets.token_hex(16))
+        # a malformed id or one of an older epoch could never be admitted here: retired, and not tracked
+        other = self.tid(epoch=self.epoch - 1)
         self.assertEqual(restarted.retire(["junk", 7, other]), ["junk", other])
         self.assertEqual(len(restarted._tickets), 4)
         self.assertEqual(self.retire(old[0]), [old[0]])                   # this process never saw it either
         self.assertEqual(self.http(old[0])[0], 409)
 
-    def test_a_fresh_process_serves_its_first_gates_generation_without_a_fence(self):
+    def test_round6_a_fresh_process_admits_no_ticket_until_a_gate_fences_it(self):
         fresh = self.guard.TicketLedger()                                 # restarted while the gate ran on
         t = self.tid()
-        self.assertIsNone(fresh.open(t))                                  # nothing could be left: adopted
-        self.assertEqual(fresh.generation, self.gen)
-        self.assertIsNotNone(fresh.open(self.tid(gen=secrets.token_hex(16))))   # another generation: refused
-        self.assertTrue(fresh.fence(self.gen, [t])["clear"])
+        self.assertIn("no gate epoch fenced", fresh.open(t))              # no first-ticket adoption
+        self.assertIsNone(fresh.epoch)
+        self.assertEqual(fresh.retire([t]), [])                           # nor acknowledged
+        self.assertTrue(fresh.fence(self.epoch, [])["clear"])
+        self.assertIsNone(fresh.open(self.tid()))
+        self.assertIsNotNone(fresh.open(self.tid(epoch=self.epoch + 1)))   # an epoch not fenced: refused
 
     def test_an_open_exchange_is_never_retired(self):
         t = self.tid()
@@ -752,7 +934,8 @@ class GuardLedgerTests(LedgerBase):
     def test_requests_without_a_fresh_ticket_never_reach_vllm_mlx(self):
         good = self.tid()
         for tid in (None, "junk", good.upper(), good[:-1], good + "0", good.replace(".", "-"),
-                    "1800000061000." + "a" * 32, self.tid(gen=secrets.token_hex(16))):
+                    "1800000061000." + "a" * 32, self.tid(epoch=self.epoch - 1), self.tid(epoch=self.epoch + 1),
+                    "0" * 16 + good[16:], "f" * 66):
             with self.subTest(tid):
                 code, body = self.http(tid)
                 self.assertEqual(code, 409)
@@ -865,15 +1048,15 @@ class LedgerAtomicityTests(LedgerBase):
 
     def test_round4_a_fence_query_racing_admission_never_reports_clear(self):
         t = self.tid()
-        q, qout = self.query_paused(lambda: self.ledger.fence(self.gen, []))
+        q, qout = self.query_paused(lambda: self.ledger.fence(self.epoch, []))
         a, _ = self.admit_in_thread(t)
         self.assertTrue(wait_for(lambda: t in self.ledger._tickets))
         self.sched.waiting.resume.set()
         q.join(5)
         a.join(5)
         self.assertFalse(qout["r"]["clear"])                            # the open exchange or its pending request
-        self.assertFalse(self.ledger.fence(self.gen, [])["clear"])      # queued now, from a ticket not known
-        self.assertTrue(self.ledger.fence(self.gen, [t])["clear"])      # known to the gate asking
+        self.assertFalse(self.ledger.fence(self.epoch, [])["clear"])      # queued now, from a ticket not known
+        self.assertTrue(self.ledger.fence(self.epoch, [t])["clear"])      # known to the gate asking
 
     def test_round4_an_entry_numbered_after_a_snapshot_began_is_never_gone_by_it(self):
         # the number check alone (should any add ever run outside the lock): an add completing mid-read
@@ -904,13 +1087,13 @@ class LedgerAtomicityTests(LedgerBase):
 
 
 class LedgerFenceTests(LedgerBase):
-    """#126 review round 4 (P1b), the guard's side, with generations (round 5): FENCE_PATH makes the asking gate's
-    generation the only one admitted and says whether a request of a ticket that gate does not know may still be in
+    """#126 review round 4 (P1b), the guard's side, with epochs (round 6): FENCE_PATH makes the asking gate's
+    epoch the only one admitted and says whether a request of a ticket that gate does not know may still be in
     the scheduler."""
 
-    def fence(self, gen, known=()):
+    def fence(self, epoch, known=()):
         code, raw = self.http(None, path=self.guard.FENCE_PATH,
-                              body=json.dumps({"generation": gen, "known": list(known)}).encode())
+                              body=json.dumps({"epoch": epoch, "known": list(known)}).encode())
         self.assertEqual(code, 200)
         data = json.loads(raw)
         self.assertEqual(data["boot"], self.ledger.boot)
@@ -920,10 +1103,10 @@ class LedgerFenceTests(LedgerBase):
         old = self.tid()
         self.http(old)                                                  # the old gate's 64k turn
         self.sched.step()                                               # running; that gate is gone
-        new = secrets.token_hex(16)                                     # the restarted gate
+        new = self.epoch + 1                                            # the restarted gate
         got = self.fence(new)
-        self.assertEqual((got["clear"], got["unknown"], got["generation"]), (False, 1, new))
-        self.assertEqual(self.http(self.tid())[0], 409)                 # the old generation: refused
+        self.assertEqual((got["clear"], got["unknown"], got["epoch"]), (False, 1, new))
+        self.assertEqual(self.http(self.tid())[0], 409)                 # the old epoch: refused
         self.assertEqual(self.fence(new)["clear"], False)
         self.sched.done.add(self.rids[0])
         self.sched.step()                                               # its rows leave
@@ -934,10 +1117,10 @@ class LedgerFenceTests(LedgerBase):
     def test_an_open_exchange_or_a_queued_request_of_an_unknown_ticket_is_not_clear(self):
         t = self.tid()
         self.assertIsNone(self.ledger.open(t))
-        self.assertFalse(self.fence(self.gen)["clear"])                 # open: it may still bind
-        self.assertTrue(self.fence(self.gen, [t])["clear"])
+        self.assertFalse(self.fence(self.epoch)["clear"])                 # open: it may still bind
+        self.assertTrue(self.fence(self.epoch, [t])["clear"])
         self.ledger.ended(t)
-        self.assertTrue(self.fence(self.gen)["clear"])                  # nothing bound, exchange over
+        self.assertTrue(self.fence(self.epoch)["clear"])                  # nothing bound, exchange over
 
     def test_a_hung_step_keeps_unknown_rows_unclear(self):
         old = self.tid()
@@ -945,7 +1128,7 @@ class LedgerFenceTests(LedgerBase):
         self.sched.step()
         self.sched.done.add(self.rids[0])
         with self.ledger.step_lock:                                     # a step that never returns
-            th = threading.Thread(target=lambda: self.assertFalse(self.ledger.fence(self.gen, [])["clear"]))
+            th = threading.Thread(target=lambda: self.assertFalse(self.ledger.fence(self.epoch, [])["clear"]))
             th.start()
             th.join(5)
             self.assertFalse(th.is_alive())
@@ -953,16 +1136,18 @@ class LedgerFenceTests(LedgerBase):
     def test_the_fence_endpoint_takes_a_bounded_post_only(self):
         path = self.guard.FENCE_PATH
         self.assertEqual(self.http(None, method="GET", path=path)[0], 405)
-        for body in (b"[1]", b'{"generation": "1", "known": []}', b'{"generation": "' + b"a" * 32 + b'"}',
-                     b'{"floor_ms": 1, "known": []}', b'{"generation": "' + b"A" * 32 + b'", "known": []}',
-                     b'{"generation": true, "known": []}'):
+        for body in (b"[1]", b'{"epoch": "1", "known": []}', b'{"epoch": 1}', b'{"floor_ms": 1, "known": []}',
+                     b'{"epoch": 0, "known": []}', b'{"epoch": -3, "known": []}', b'{"epoch": true, "known": []}',
+                     b'{"epoch": 1.0, "known": []}', b'{"epoch": 18446744073709551616, "known": []}',
+                     b'{"generation": "' + b"a" * 32 + b'", "known": []}'):
             self.assertEqual(self.http(None, path=path, body=body)[0], 400, body)
-        big = json.dumps({"generation": self.gen, "known": ["x" * 1000] * 2000}).encode()
+        big = json.dumps({"epoch": self.epoch, "known": ["x" * 1000] * 2000}).encode()
         self.assertEqual(self.http(None, path=path, body=big)[0], 413)
 
 
-class LedgerGenerationTests(LedgerBase):
-    """#126 review round 5 (P2a, P2b): no wall clock decides admission or retirement; generations and counters do."""
+class LedgerEpochTests(LedgerBase):
+    """#126 review rounds 5 and 6: no wall clock decides admission or retirement; ordered gate epochs and counters do.
+    The guard takes an epoch only from a fence, never lowers it, and refuses every other epoch's ticket."""
 
     def test_round5_repro_a_future_dated_ticket_is_never_acknowledged_and_then_admitted(self):
         # the reviewer's id: once the 13-digit-millisecond format, now malformed: retired, and never admitted
@@ -970,32 +1155,32 @@ class LedgerGenerationTests(LedgerBase):
         self.assertEqual(self.ledger.retire([future]), [future])
         self.assertIsNotNone(self.ledger.open(future))
         self.assertIsNotNone(self.ledger.bind(future, "row"))
-        # a well-formed id whose generation is not refused yet (a fresh process): never acknowledged
+        # a well-formed id while no epoch is current (a fresh process): never acknowledged
         fresh = self.guard.TicketLedger()
         t = self.tid()
         self.assertEqual(fresh.retire([t]), [])
         self.assertEqual(fresh.retire([t]), [])
-        self.assertTrue(fresh.fence(self.gen, [])["clear"])
+        self.assertTrue(fresh.fence(self.epoch, [])["clear"])
         self.assertEqual(fresh.retire([t]), [t])                        # tombstoned now
         self.assertIsNotNone(fresh.open(t))
         self.assertIsNotNone(fresh.bind(t, "row"))
 
     def test_round5_repro_a_clock_rollback_cannot_readmit_a_previous_gates_ticket(self):
-        old_gen = self.gen
+        old_epoch = self.epoch
         old = self.tid()                                                # minted by the old gate, never seen here
-        new = secrets.token_hex(16)                                     # the restarted gate, its clock set back
+        new = self.epoch + 1                                            # the restarted gate, its clock set back
         with patch.object(time, "time", lambda: 1_700_000_000.0):
             self.assertTrue(self.ledger.fence(new, [])["clear"])
             self.assertIsNotNone(self.ledger.open(old))
             self.assertIsNotNone(self.ledger.bind(old, "row"))
             self.assertEqual(self.http(old)[0], 409)
             self.assertEqual(self.calls, [])                            # nothing reached vllm-mlx
-            self.assertEqual(self.ledger.retire([old]), [old])          # its generation is refused for good
-            self.assertEqual(self.ledger.fence(old_gen, [])["refused"], True)   # and never current again
-            self.assertEqual(self.ledger.generation, new)
+            self.assertEqual(self.ledger.retire([old]), [old])          # below the current epoch: for good
+            self.assertEqual(self.ledger.fence(old_epoch, [])["refused"], True)   # and never current again
+            self.assertEqual(self.ledger.epoch, new)
 
     def test_round5_clocks_jumping_on_either_side_change_nothing(self):
-        r = local_gate.Retirer("127.0.0.1", 9, call=lambda p, b: {}, start=False, generation=self.gen)
+        r = local_gate.Retirer("127.0.0.1", 9, call=lambda p, b: {}, start=False, epoch=self.epoch)
         r._seq = next(self.seq)
         jumps = itertools.cycle([1.8e9, 0.0, 4.1e9, 1.8e9 - 3600, 2.5e9, 1.0])
         with patch.object(time, "time", lambda: next(jumps)):
@@ -1008,31 +1193,31 @@ class LedgerGenerationTests(LedgerBase):
                 self.assertEqual(self.retire(t), [t])
                 self.assertEqual(self.http(t)[0], 409)                  # retired: refused should it arrive late
 
-    def test_round5_an_old_generation_request_after_the_fence_is_refused_and_never_binds(self):
+    def test_round5_an_old_epoch_request_after_the_fence_is_refused_and_never_binds(self):
         inflight = self.tid()
         self.assertIsNone(self.ledger.open(inflight))                   # the old gate's exchange, not yet bound
-        new = secrets.token_hex(16)
+        new = self.epoch + 1
         self.assertFalse(self.ledger.fence(new, [])["clear"])           # its exchange is still open
-        self.assertIsNotNone(self.ledger.bind(inflight, "late-row"))    # refused: another generation
+        self.assertIsNotNone(self.ledger.bind(inflight, "late-row"))    # refused: an older epoch
         self.assertNotIn("late-row", self.ledger._rids)
         self.ledger.ended(inflight)
         self.assertTrue(self.ledger.fence(new, [])["clear"])
         late = self.tid()                                               # arriving after the fence cleared
         code, body = self.http(late)
         self.assertEqual(code, 409)
-        self.assertIn("another gate generation", json.loads(body)["detail"])
+        self.assertIn("an older gate epoch", json.loads(body)["detail"])
         self.assertEqual(self.calls, [])
         self.assertTrue(self.ledger.fence(new, [])["clear"])
 
-    def test_round5_a_bound_old_generation_request_never_enters_the_scheduler(self):
+    def test_round5_a_bound_old_epoch_request_never_enters_the_scheduler(self):
         t = self.tid()
         self.assertIsNone(self.ledger.open(t))
         self.assertIsNone(self.ledger.bind(t, "r1"))                    # bound before the fence...
-        self.ledger.fence(secrets.token_hex(16), [])
+        self.ledger.fence(self.epoch + 1, [])
         with self.ledger.admit_lock:
             self.assertFalse(self.ledger.entering("r1"))                # ...refused at the scheduler's add
 
-    def test_round5_a_delayed_same_generation_request_after_its_retirement_is_refused(self):
+    def test_round5_a_delayed_same_epoch_request_after_its_retirement_is_refused(self):
         t = self.tid()
         self.assertEqual(self.retire(t), [t])                           # the gate gave up before it arrived
         self.assertEqual(self.http(t)[0], 409)
@@ -1045,10 +1230,128 @@ class LedgerGenerationTests(LedgerBase):
         self.assertEqual(self.retire(u), [u])
         self.assertEqual(self.http(u)[0], 409)                          # served once, retired: never again
 
+    def test_round6_an_older_epoch_is_refused_at_open_bind_and_the_scheduler_and_a_newer_one_until_fenced(self):
+        older, newer = self.tid(epoch=self.epoch - 1), self.tid(epoch=self.epoch + 1)
+        self.assertIn("older gate epoch", self.ledger.open(older))
+        self.assertIn("not fenced yet", self.ledger.open(newer))
+        self.assertEqual(self.ledger.retire([older, newer]), [older])   # the newer one may still be admitted
+        self.assertEqual(self.http(newer)[0], 409)
+        self.assertEqual(self.calls, [])
+        t = self.tid()
+        self.assertIsNone(self.ledger.open(t))
+        self.assertIsNone(self.ledger.bind(t, "r1"))
+        self.assertTrue(self.ledger.fence(self.epoch + 1, [t])["clear"])   # the newer gate fences
+        self.assertIsNotNone(self.ledger.bind(t, "r2"))
+        with self.ledger.admit_lock:
+            self.assertFalse(self.ledger.entering("r1"))
+        self.assertIsNone(self.ledger.open(newer))                      # its ticket is admitted now
+        gone = self.tid(epoch=self.epoch)
+        self.assertEqual(self.ledger.retire([gone]), [gone])            # below the current epoch: untracked
+        self.assertNotIn(gone, self.ledger._tickets)
+
+
+class LedgerFreshEpochTests(LedgerBase):
+    """#126 review round 6 (P2a, P2b), on a guard no gate has fenced yet (a fresh vllm-mlx process)."""
+    FENCED = False
+
+    def test_round6_repro_p2a_an_unseen_ticket_of_an_epoch_that_may_still_be_fenced_is_never_acknowledged(self):
+        a, b = 3, 4                                                     # a stale gate A, the live gate B
+        ta, tb = self.tid(epoch=a), self.tid(epoch=b)
+        self.assertIn("no gate epoch fenced", self.ledger.open(ta))     # no first-ticket adoption
+        self.assertIsNone(self.ledger.epoch)
+        self.assertEqual(self.ledger.retire([tb]), [])                  # nothing current: never acknowledged
+        self.assertTrue(self.ledger.fence(a, [])["clear"])              # the stale gate's (delayed) fence
+        self.assertEqual(self.ledger.retire([tb]), [])                  # above the current epoch: not either
+        self.assertNotIn(tb, self.ledger._tickets)
+        self.assertTrue(self.ledger.fence(b, [tb])["clear"])            # B fences: tb is still B's, reserved
+        self.assertEqual(self.ledger.retire([tb]), [tb])                # tombstoned, then acknowledged
+        self.assertIsNotNone(self.ledger.open(tb))                      # the delayed ticket: refused
+        self.assertIsNotNone(self.ledger.bind(tb, "late"))
+        self.assertEqual(self.http(tb)[0], 409)
+        self.assertEqual(self.calls, [])
+
+    def test_round6_repro_p2b_a_delayed_old_fence_never_displaces_the_live_gate(self):
+        a, b = 3, 4
+        self.assertTrue(self.ledger.fence(b, [])["clear"])
+        got = self.ledger.fence(a, [])                                  # A's fence, delayed
+        self.assertEqual((got["clear"], got.get("refused"), got["epoch"]), (False, True, b))
+        self.assertEqual(self.ledger.epoch, b)                          # nothing changed
+        self.assertTrue(self.ledger.fence(b, [])["clear"])              # B re-fences: accepted, for good
+        self.assertIsNone(self.ledger.open(self.tid(epoch=b)))
+        self.assertIsNotNone(self.ledger.open(self.tid(epoch=a)))
+
+    def test_round6_repro_p2a_through_the_retirer_the_reservation_waits_for_the_live_gates_fence(self):
+        # the reviewer's second repro: the real Retirer against the real ledger, a delayed ticket of the live gate
+        def call(path, body):
+            code, raw = self.http(None, path=path, body=json.dumps(body).encode())
+            self.assertEqual(code, 200)
+            return json.loads(raw)
+        stale = local_gate.Retirer("127.0.0.1", 9, call=call, start=False, epoch=3)
+        live = local_gate.Retirer("127.0.0.1", 9, call=call, start=False, epoch=4)
+        adm = local_governor.Admission(FixedGovernor())
+        res = adm.try_acquire(load=adm.text_load(100, 1))[0]
+        tb = live.mint()                                                # sent; its bytes are delayed
+        live.hand_over(res, tb)
+        self.assertEqual(live.poll_once(), 0)                           # a fresh guard: not acknowledged
+        self.assertIsNone(stale.fence_once())                           # the stale gate fences first
+        self.assertEqual(live.poll_once(), 0)                           # above the current epoch: still held
+        self.assertEqual((adm.inflight, adm.retiring), (1, 1))
+        self.assertIsNone(live.fence_once())                            # the live gate fences
+        stale._raise_fence("fenced: lost contact (test)")                # the stale gate tries again: refused
+        self.assertIn("refuses this gate's epoch", stale.fence_once() or "")
+        self.assertEqual(live.poll_once(), 1)                           # tombstoned: released
+        self.assertEqual((adm.inflight, adm.reserved), (0, 0))
+        self.assertEqual(self.http(tb)[0], 409)                         # the delayed ticket arrives: refused
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.sched.waiting, collections.deque())
+
+    def test_round6_delayed_fences_and_tickets_in_every_order_around_a_guard_restart(self):
+        # an old gate (epoch 3) and the restarted gate (epoch 4); each event once, in every order, with the guard
+        # restarting (a fresh ledger) before any of them; every state is checked against the rules after each event
+        old, new = 3, 4
+        events = ("fence-old", "ticket-old", "fence-new", "ticket-new")
+        for order in itertools.permutations(events):
+            for cut in range(len(order) + 1):
+                with self.subTest(order=order, restart_before=cut):
+                    ledger = self.guard.TicketLedger()
+                    fenced, seen = [], {}
+                    t = {"ticket-old": self.tid(epoch=old), "ticket-new": self.tid(epoch=new)}
+                    for i, ev in enumerate(order):
+                        if i == cut:
+                            ledger, fenced = self.guard.TicketLedger(), []   # vllm-mlx restarts: forgets all
+                        if ev.startswith("fence"):
+                            e = old if ev == "fence-old" else new
+                            got = ledger.fence(e, [])
+                            self.assertEqual(got.get("refused", False), new in fenced and e == old)
+                            if not got.get("refused"):
+                                fenced.append(e)
+                        else:
+                            why = ledger.open(t[ev])
+                            e = old if ev == "ticket-old" else new
+                            current = max(fenced) if fenced else None
+                            self.assertEqual(why is None, current == e, (ev, why, fenced))
+                            if why is None:
+                                ledger.ended(t[ev])
+                            seen[ev] = why is None
+                    current = max(fenced) if fenced else None
+                    self.assertEqual(ledger.epoch, current)
+                    # retirement: an id is acknowledged untracked only when it can never be admitted
+                    for ev, tid in t.items():
+                        e = old if ev == "ticket-old" else new
+                        got = ledger.retire([tid])
+                        if current is None or e > current:
+                            self.assertEqual(got, [], (ev, current))
+                        else:
+                            self.assertEqual(got, [tid], (ev, current))
+                            self.assertIsNotNone(ledger.open(tid))     # and never admitted afterwards
+                    if current == new:
+                        self.assertTrue(ledger.fence(old, [])["refused"])
+                        self.assertEqual(ledger.epoch, new)
+
 
 class LedgerBoundTests(LedgerBase):
     """#126 review round 4 (P2b): at most TICKET_MAX ids are tracked on every insert path, and an evicted tombstone
-    cannot be replayed (the generation's floor rises past every evicted counter)."""
+    cannot be replayed (the epoch's floor rises past every evicted counter)."""
 
     def test_round4_repro_tombstones_stay_within_the_bound_and_are_never_replayed(self):
         cap = self.guard.TICKET_MAX
@@ -1233,7 +1536,8 @@ class ImportOrderTests(VisionGuardBase):
                 finally:
                     shutil.rmtree(path.parent)
                 self.assertEqual(rc, 2, err)
-                self.assertIn(f"{name} resolves to", err)
+                # round 6: the tree check names it first (verify_lm_resolution alone: MlxLmPinTests)
+                self.assertIn(f"mlx_lm/{rel.rsplit('/', 1)[0]} is a package beside {name.rsplit('.', 1)[1]}.py", err)
                 self.assertFalse(self.marker.exists())
 
     def test_round5_cached_bytecode_beside_a_pinned_file_is_never_read(self):
@@ -1266,6 +1570,84 @@ class ImportOrderTests(VisionGuardBase):
         self.assertEqual(rc, 0, err)
         self.assertIn("mlx_lm.tokenizer_utils", sys.modules)             # imported, from its verified source
         self.assertFalse(self.marker.exists(), "cached bytecode ran in place of a pinned source")
+
+    def test_round6_repro_a_sourceless_version_package_never_runs(self):
+        # the reviewer's repro: the release's __init__ runs `from ._version import __version__`, and a pyc-only
+        # mlx_lm/_version/ package wins over the pinned _version.py (sys.pycache_prefix does not stop a sourceless
+        # loader): before, serve returned 0 and the marker ran
+        import importlib.util
+        import marshal
+        import sys
+        lm = Path(self.dir, "mlx_lm")
+        (lm / "__init__.py").write_text('import mlx.nn\nfrom . import convert, utils, tokenizer_utils\n'
+                                        'from ._version import __version__\n')
+        (lm / "_version.py").write_text('__version__ = "0.31.3"\n')
+        pins = {**self.guard.MLX_LM_PINNED_SHA256, "__init__.py": self._sha("mlx_lm", "__init__.py"),
+                "_version.py": self._sha("mlx_lm", "_version.py")}
+        p = patch.object(self.guard, "MLX_LM_PINNED_SHA256", pins)
+        p.start()
+        self.addCleanup(p.stop)
+        self._clean()
+        rc, err = self.run_main(SERVE_TEXT)                              # the clean chain, _version included
+        self.assertEqual(rc, 0, err)
+        self.assertIn("mlx_lm._version", sys.modules)
+        code = compile(f"open({str(self.marker)!r}, 'w').write('ran')\n__version__ = '0.31.3'\n", "_version", "exec")
+        pkg = lm / "_version"
+        pkg.mkdir()
+        (pkg / "__init__.pyc").write_bytes(importlib.util.MAGIC_NUMBER + b"\0" * 12 + marshal.dumps(code))
+        self._clean()
+        import importlib
+        importlib.invalidate_caches()
+        spec = self.guard.find_on_disk("mlx_lm._version", [str(lm)])     # the control: Python would import it
+        self.assertTrue(spec.origin.endswith("__init__.pyc"))
+        spec.loader.exec_module(importlib.util.module_from_spec(spec))
+        self.assertTrue(self.marker.exists(), "the planted package does not run: the test proves nothing")
+        self.marker.unlink()
+        for argv in (SERVE_TEXT, ["--check", "/models/text"]):
+            with self.subTest(argv[0]):
+                self._clean()
+                rc, err = self.run_main(argv)
+                self.assertEqual(rc, 2, err)
+                self.assertIn("mlx_lm/_version is a package beside _version.py", err)
+                self.assertFalse(self.marker.exists(), "the sourceless _version ran")
+                self.assertNotIn("mlx_lm", sys.modules)
+        shutil.rmtree(pkg)
+        self._clean()
+        self.assertEqual(self.run_main(SERVE_TEXT)[0], 0)
+
+    def test_round6_sourceless_bytecode_in_any_verified_tree_is_refused_before_import(self):
+        import sys
+        for rel in ("vllm_mlx/stray.pyc", "vllm_mlx/engine/planted/__init__.pyc", "mlx_lm/models/qwen3_5.pyc",
+                    "mlx/nn/layers/evil.pyc", "mlx/utils.pyc"):
+            for argv in (SERVE_TEXT, ["--check", "/models/text"]):
+                with self.subTest(f"{rel} {argv[0]}"):
+                    self._clean()
+                    path = Path(self.dir, *rel.split("/"))
+                    made = None if path.parent.exists() else path.parent
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b"\0" * 16)
+                    try:
+                        rc, err = self.run_main(argv)
+                    finally:
+                        shutil.rmtree(made) if made is not None else path.unlink()
+                    self.assertEqual(rc, 2, err)
+                    self.assertIn(f"{rel} is sourceless bytecode", err)
+                    self.assertNotIn("mlx_lm", sys.modules)
+                    self.assertNotIn("mlx.nn", sys.modules)
+        self._clean()
+        self.assertEqual(self.run_main(SERVE_TEXT)[0], 0)
+
+    def test_round6_the_mlx_vlm_tree_is_checked_for_sourceless_modules_too(self):
+        vllm, vlm = str(Path(self.dir, "vllm_mlx")), str(Path(self.dir, "mlx_vlm"))
+        self.guard.verify_vision(vllm, vlm, None)
+        planted = Path(vlm, "models", "planted.pyc")
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        planted.write_bytes(b"\0" * 16)
+        with self.assertRaisesRegex(self.guard.GuardError, "mlx_vlm/models/planted.pyc is sourceless bytecode"):
+            self.guard.verify_vision(vllm, vlm, None)
+        self.guard.verify_vision(vllm, vlm, "0.7.12", {}, {})              # the post-import version check reads no tree
+        planted.unlink()
+        self.guard.verify_vision(vllm, vlm, None)
 
     def test_the_released_mlx_nn_init_is_pinned(self):
         # mlx.nn is a regular package in every 0.32.4 wheel (its __init__ imports the layers): pinned by hash, while
