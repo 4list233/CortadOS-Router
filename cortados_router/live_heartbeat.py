@@ -9,7 +9,10 @@ What it reports, all metadata:
   - s1        on the S1 host: the pipeline's flags by their fixed names (data/no-promote, data/no-train-tonight,
               data/nightly.stop, data/sweep-request.json: present or not, never read), the pending candidate's reason (the
               third field of data/pending-candidate, sent only when it is a plain slug like `promotion_held`), and the
-              scorer's /health (up/down, its model name, load time).
+              scorer's /health (up/down, its model name, load time), and the latency guard's state (#116,
+              data/latency-guard.json written by s1/overnight.py: running / paused / idle, a fixed reason slug, the
+              baseline and current p50/p90 in seconds, sample and timeout counts; checked against the provider's own
+              validator, `unknown` when the file is unreadable or invalid, absent when there is no file).
   - orchestrator  on hosts that run the owner's main Claude Code sessions: their own tokens per window, by Office session
               tag (cortados_router/orchestrator_usage.py; never a raw session id, path or text). The transcript scan
               runs at most every `every_s` (default 300 s); between scans the cached summary is sent as it was, with
@@ -80,6 +83,8 @@ S1_FLAG_FILES = (("no-promote", "no-promote"), ("no-train-tonight", "no-train-to
                  ("nightly.stop", "nightly-stop"), ("sweep-request.json", "sweep-requested"))
 PENDING_FILE = "pending-candidate"
 PENDING_MAX_BYTES = 4096     # four short fields; more is not the marker
+GUARD_FILE = "latency-guard.json"   # s1/overnight.GUARD_STATE_NAME
+GUARD_MAX_BYTES = 4096       # one flat object of numbers and slugs
 HEALTH_MAX_BYTES = 4096
 RESERVED_JOBS = ("hardware", "s1")   # legacy(): the blocks folded into jobs for an older provider
 # The transcript scan reads every main-session file touched in the last 7 days: cheap enough every 5 min, wasteful
@@ -281,6 +286,9 @@ def s1_block(cfg: dict[str, Any], fetch: Callable[[str], bytes] | None = None) -
     except OSError:
         pending = "unreadable"
     out: dict[str, Any] = {"health": "unknown", "model": None, "flags": flags, "pending": pending, "loaded_s": None}
+    guard = s1_guard(data)
+    if guard is not None:
+        out["guard"] = guard
     url = cfg.get("health_url") or _s1_health_base()
     if url:
         try:
@@ -296,6 +304,24 @@ def s1_block(cfg: dict[str, Any], fetch: Callable[[str], bytes] | None = None) -
         except Exception:                            # unreachable, refused, not JSON: the scorer is down here
             out["health"] = "down"
     return out
+
+
+def s1_guard(data: Path, now: float | None = None) -> dict[str, Any] | None:
+    """The latency guard's state file as the provider accepts it (live.validate_s1_guard), {"state": "unknown"} when it is
+    there but unreadable, oversized or invalid, None when there is none (no continuous supervisor on this host)."""
+    p = data / GUARD_FILE
+    try:
+        if not p.exists():
+            return None
+        if not p.is_file() or p.stat().st_size > GUARD_MAX_BYTES:
+            return {"state": "unknown"}
+        raw = json.loads(p.read_text(errors="replace"))
+    except (OSError, ValueError, RecursionError):   # RecursionError: 4 KiB of nested brackets is enough
+        return {"state": "unknown"}
+    if isinstance(raw, dict):
+        raw = {k: v for k, v in raw.items() if k != "version"}
+    g, bad = live.validate_s1_guard(raw, time.time() if now is None else now)
+    return g if bad is None else {"state": "unknown"}
 
 
 def _s1_health_base() -> str | None:
@@ -564,6 +590,17 @@ def main(argv: list[str] | None = None, *, run: Callable[..., Any] = subprocess.
             continue
         print(f"live_heartbeat: provider refused the {block} block ({msg or 400}); posting without it", file=sys.stderr)
         body = {k: v for k, v in body.items() if k != block}
+        try:
+            raw = check(body)
+        except ConfigError as exc:
+            print(f"live_heartbeat: {exc}", file=sys.stderr)
+            return 2
+        code, msg = post(url, token, raw, opener)
+    if code == 400 and isinstance(body.get("s1"), dict) and "guard" in body["s1"]:
+        # A provider from before the latency guard (#116): `s1.guard` is an unknown field there. Drop just that field,
+        # so the S1 block, the hardware and the jobs still arrive whole.
+        print(f"live_heartbeat: provider refused the s1 guard field ({msg or 400}); posting without it", file=sys.stderr)
+        body = {**body, "s1": {k: v for k, v in body["s1"].items() if k != "guard"}}
         try:
             raw = check(body)
         except ConfigError as exc:

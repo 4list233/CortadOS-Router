@@ -370,7 +370,8 @@ class SessionFilterTest(unittest.TestCase):
             self.assertNotIn(bad, raw, bad)
         self.assertEqual(set(v), {"version", "generated_at", "session_filter", "overview", "orchestrators", "s1",
                                   "hosts", "work_split"})
-        self.assertEqual(set(v["overview"]), {"s1", "s1_latency_ms", "lowest_subscription", "hosts_with_heartbeat"})
+        self.assertEqual(set(v["overview"]), {"s1", "s1_latency_ms", "s1_guard", "lowest_subscription",
+                                              "hosts_with_heartbeat"})
         self.assertEqual([g["origin"] for g in v["orchestrators"]["items"]], [MINE])
         self.assertEqual(v["orchestrators"]["session_filter"], MINE)
         self.assertEqual(ids(v["orchestrators"]["items"][0]), [ROOT, NESTED, NESTED2, AWAY])

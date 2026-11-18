@@ -716,6 +716,22 @@ function renderSubs(box, s) {
 // The S1 pipeline as its host reports it (live heartbeat `s1`): health, the served model, hold flags, a pending candidate.
 const S1_FLAG_TEXT = {"no-promote": "promotion held", "no-train-tonight": "no training tonight",
   "nightly-stop": "nightly loop stopping", "sweep-requested": "calibration sweep requested"};
+// The S1 latency guard (#116): pauses daytime training/labelling while routed scoring is over baseline + budget.
+const GUARD_REASON_TEXT = {latency: "scorer latency over budget", timeout: "scorer timing out routed calls",
+  refused: "scorer refusing (busy)", memory: "free memory low", no_baseline: "measuring the baseline",
+  forced_release: "released after the longest pause"};
+function secs(v) { return isNum(v) ? v.toFixed(1) + " s" : "timed out"; }
+function guardText(g) {
+  if (!g) return null;
+  if (g.state === "unknown") return "latency guard: state unreadable";
+  const head = g.state === "paused" ? "training paused: " + (GUARD_REASON_TEXT[g.reason] || g.reason || "?")
+    : g.state === "running" ? "training running within budget" + (g.reason === "forced_release" ? " (" + GUARD_REASON_TEXT.forced_release + ")" : "")
+    : "no cycle running";
+  const now = g.samples ? "p50 " + secs(g.p50_s) + " / p90 " + secs(g.p90_s) + " (" + g.samples + " " + (g.source === "probe" ? "probe" : "routed") + ")" : null;
+  const base = isNum(g.baseline_p50_s) ? "baseline " + secs(g.baseline_p50_s) + " / " + secs(g.baseline_p90_s) + " + " + g.budget_s + " s " + (g.budget || "") : "no baseline yet";
+  return join([head, now, base, g.timeouts ? g.timeouts + " timed out" : null, g.pauses_24h ? g.pauses_24h + " pauses in 24 h" : null,
+    g.stale ? "STALE: not updated for " + age(g.age_s) : null]);
+}
 function renderS1(c, x) {
   const box = el("div", "s1box");
   const r = el("div", "job");
@@ -727,6 +743,13 @@ function renderS1(c, x) {
   if (x.pending) add(flags, pill("queued", "candidate: " + x.pending.replace(/_/g, " ")));
   if (!(x.flags || []).length && !x.pending) add(flags, el("span", "sub muted", "no hold flags, no pending candidate"));
   add(box, flags);
+  if (x.guard) {
+    const gr = el("div", "job");
+    add(gr, pill(x.guard.state === "paused" ? "partial" : x.guard.state === "unknown" ? "unknown" : "ok",
+      x.guard.state === "paused" ? "paused" : x.guard.state === "unknown" ? "unknown" : x.guard.state),
+      el("span", "title", "latency guard"), el("span", "js", guardText(x.guard)));
+    add(box, gr);
+  }
   add(c, box);
 }
 function renderHosts(box, s, s1) {
@@ -736,7 +759,7 @@ function renderHosts(box, s, s1) {
   const line = el("div", "s1line");
   add(line, el("span", "title", "S1 scorer"), pill(s1.status === "up" ? "up" : s1.status === "down" ? "down" : "unknown"),
     el("span", "sub", join([isNum(s1.latency_ms) ? s1.latency_ms + " ms" : null, isNum(s1.http_status) ? "HTTP " + s1.http_status : null,
-      s1.status !== "up" ? s1.reason : null])));
+      s1.status !== "up" ? s1.reason : null, s1.guard ? "on " + s1.guard.host + ": " + guardText(s1.guard) : null])));
   // the S1 host's own report (its heartbeat's s1 block): what it serves and the pipeline's hold flags
   (s.items || []).forEach(h => { const x = h.heartbeat && !h.heartbeat.stale && h.heartbeat.s1;
     if (x) add(line, el("span", "sub", join(["on " + h.name + ": " + (x.model || "no model loaded"),
@@ -882,7 +905,9 @@ function renderLive(d) {
   add(ov, tile("Active conversations", isNum(o.active_conversations) ? String(o.active_conversations) : "?",
     isNum(o.working_conversations) ? o.working_conversations + " working now" : "office view unavailable"));
   add(ov, tile("S1 scorer", pill(s1.status === "up" ? "up" : s1.status === "down" ? "down" : "unknown"),
-    s1.status === "up" ? (isNum(s1.latency_ms) ? s1.latency_ms + " ms health check" : "") : (s1.reason || "not reachable"), "small"));
+    join([s1.status === "up" ? (isNum(s1.latency_ms) ? s1.latency_ms + " ms health check" : "") : (s1.reason || "not reachable"),
+      s1.guard && s1.guard.state === "paused" ? "training paused (" + (GUARD_REASON_TEXT[s1.guard.reason] || "guard") + ")" : null]),
+    "small"));
   add(ov, tile("Lowest subscription", low ? pct(low.left_pct) : "–",
     low ? join([low.label || low.lane, low.window]) : "no fresh reading"));
   add(ov, tile("Host heartbeats", (o.hosts_with_heartbeat || 0) + " / " + hosts.length,

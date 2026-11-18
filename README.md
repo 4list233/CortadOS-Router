@@ -213,7 +213,7 @@ The pipeline is in `s1/`, run nightly by `s1/nightly.sh` (or back to back by `s1
 
 An **outcome loop** (`s1/outcome/`) adds a second signal beyond teacher agreement: real routed tasks are run and judged by a frontier model (Fable 5.1), feeding the training set so S1 is graded on outcomes, not only on agreeing with teachers.
 
-`s1/serve.py` serves the promoted adapter at `POST <bind>:8431/score`. The ground truth is always an external frontier teacher and real outcomes, never S1's own output, so the loop does not self-reinforce.
+`s1/serve.py` serves the promoted adapter at `POST <bind>:8431/score`, and its own timing of recent requests at `GET /latency`. In continuous mode the supervisor's **latency guard** (#116, `s1/overnight.py`) reads those timings and pauses training and labelling (every process group in the cycle's tree, the studio gate's trainer included) while routed scoring is more than 1 s above its baseline at p50 or p90, or any call timed out; it resumes after three good readings. Its state is in the live view's `s1.guard` (see `docs/ROUTER-DESIGN.md` §4d.1). The ground truth is always an external frontier teacher and real outcomes, never S1's own output, so the loop does not self-reinforce.
 
 **Not published:** model weights, adapters, training data and teacher labels — built from private conversations. `.gitignore` keeps `s1/data`, `s1/runs`, `s1/current.json` and `tables/s1-endpoints.json` out of the tree.
 
@@ -1155,7 +1155,8 @@ for the client`), elapsed, joined with the Office board for title, session, proj
 known only from heartbeats and routed one-shot calls),
 **routed** (the latest 25 decisions from the Tasks view), **subscriptions** (every lane's % left per window from the
 cached scarcity reading, the same builder and publish pass as the usage view, plus the lowest fresh lane), **s1** (the
-memoised `/health` probe: up/down, latency) and **hosts** (air, studio and pro by default, `CORTADOS_LIVE_HOSTS` to
+memoised `/health` probe: up/down, latency; plus `guard`, the S1 latency guard's state from the S1 host's heartbeat,
+#116) and **hosts** (air, studio and pro by default, `CORTADOS_LIVE_HOSTS` to
 change; each with its hardware sample and its job heartbeat, or `heartbeat_state: "none"`). Every section carries its own
 `as_of`, `status` and `errors`, so a failed source is said in its place and never drawn as an empty success. Never prompt
 or request text, tool arguments, paths, commands, tokens or environment; it opens no vendor CLI. `hosts.provider_host` is

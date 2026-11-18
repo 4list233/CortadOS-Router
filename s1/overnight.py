@@ -9,9 +9,12 @@ gpu_alone under CORTADOS_S1_CONTINUOUS=1); a guard SIGSTOPs the work process gro
     night window CORTADOS_S1_NIGHT_WINDOW (default 01:00-07:00, "off" disables), > baseline + CORTADOS_S1_NIGHT_LATENCY_BUDGET_S
     (default 6.0 s, Forest 2026-11-07), or
   - free memory (vm_stat free+inactive+speculative) < CORTADOS_S1_MIN_FREE_GB (default 8),
-and SIGCONTs it after RESUME_AFTER consecutive good probes. Latency = wall time of a fixed short POST /score probe (serve.py does
-not log per-request latency), at most every CORTADOS_S1_PROBE_S (default 30) s; the baseline is the median of probes taken while
-the tree is paused or no cycle is running.
+and SIGCONTs it after RESUME_AFTER consecutive good readings. Latency (#116) = the scorer's own p50/p90 of its recent /score
+requests (serve.py GET /latency, i.e. what routed calls waited), topped up by a fixed short probe when it is quiet, read at most
+every CORTADOS_S1_PROBE_S (default 30) s; a request or probe past the router's S1 timeout is over every budget. The baseline is
+the median of readings taken while the tree is paused or no cycle is running. A pause stops every process group in the cycle's
+tree (the studio gate runs its trainer in its own group), and every one is continued before any stop. The guard's state goes to
+data/latency-guard.json for the live view. Design: docs/ROUTER-DESIGN.md §4d.1 "The latency guard".
 
 Training only in the night window (Forest 2026-11-08): CORTADOS_S1_TRAIN_ONLY_IN_WINDOW (default "1"; "0" = train any time).
 Labeling and the dataset refresh run all day; the Studio-heavy gated steps (LoRA, MLX preflight, Laya, evaluation) run only
@@ -34,6 +37,7 @@ from datetime import datetime, time, timedelta, timezone
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import json
 import math
@@ -45,6 +49,7 @@ import http.client
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 TORONTO = ZoneInfo("America/Toronto")
@@ -350,12 +355,35 @@ def _probe_failure(e: BaseException) -> str:
     return type(base).__name__ + (f" errno {errno}" if errno is not None else "")
 
 
-def probe_scorer_latency(url: str | None = None, timeout: float = 30.0) -> float | None:
+class ScorerTimedOut(Exception):
+    """The scorer did not answer within the router's own S1 timeout: a routed call would have been degraded. A latency
+    violation (#116), never "unknown": before #116 a timed-out probe read as no reading, so the guard never paused the
+    trainer while 63% of routed decisions timed out."""
+
+
+def router_s1_timeout() -> float:
+    """The router's S1 timeout (core.S1_TIMEOUT_S: CORTADOS_S1_TIMEOUT_S, default 15 s). A scorer slower than this degrades
+    routed calls, so it is also the probe's timeout: the guard waits exactly as long as a routed call does."""
+    return _env_float("CORTADOS_S1_TIMEOUT_S", 15.0, above=0)
+
+
+def _is_timeout(e: BaseException) -> bool:
+    """A socket timeout, raised directly (read) or wrapped in URLError (connect). socket.timeout is TimeoutError from 3.10."""
+    inner = getattr(e, "reason", None) if isinstance(e, urllib.error.URLError) else None
+    base = inner if isinstance(inner, BaseException) else e
+    return isinstance(base, (socket.timeout, TimeoutError))
+
+
+def probe_scorer_latency(url: str | None = None, timeout: float | None = None) -> float | None:
     """Wall seconds for one fixed short /score request; None when the scorer cannot be reached (logged).
-    Raises ScorerRefused on 5xx and ScorerConfigError on 401/403/404 and other 4xx."""
+    Raises ScorerTimedOut past `timeout` (default: the router's S1 timeout), ScorerRefused on 5xx and ScorerConfigError on
+    401/403/404 and other 4xx."""
     url = url or scorer_url()
+    timeout = router_s1_timeout() if timeout is None else timeout
     body = json.dumps({"request": "list the files in this directory", "unit_kind": "background"}).encode()
-    headers = {"Content-Type": "application/json"}
+    # X-Request-Timeout-S: the scorer drops the probe when we have given up (as for a routed call); X-CortadOS-Probe marks
+    # it in the scorer's own latency window.
+    headers = {"Content-Type": "application/json", "X-Request-Timeout-S": f"{timeout:g}", "X-CortadOS-Probe": "1"}
     token = os.environ.get("CORTADOS_S1_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -380,12 +408,105 @@ def probe_scorer_latency(url: str | None = None, timeout: float = 30.0) -> float
     # Before ValueError: ssl.SSLCertVerificationError is both an OSError and a ValueError, and a bad certificate is a
     # transient/remote problem, not a malformed setting.
     except (OSError, http.client.HTTPException) as e:   # reset, RemoteDisconnected, IncompleteRead: an outage, not a setting
+        if _is_timeout(e):   # slower than a routed call waits: back-pressure, not an outage
+            raise ScorerTimedOut(f"scorer probe timed out after {timeout:g}s (the router's S1 timeout)") from None
         print(f"overnight: scorer probe failed ({_probe_failure(e)}); latency unknown this probe", flush=True)
         return None
     except ValueError as e:   # Request()/urlsplit rejected it, e.g. a missing IPv6 bracket; the message can quote the value
         raise ScorerConfigError(f"scorer URL from {scorer_url_source()} is malformed ({type(e).__name__}); "
                                 f"{RESOLVE_HINT}") from None
     return _time.monotonic() - t0
+
+
+class Reading(NamedTuple):
+    """One latency reading: p50/p90 seconds of the /score samples it covers (inf = a sample past the router's timeout or
+    refused busy), how many samples, how many of them timed out, and where they came from ("scorer" = the scorer's own
+    timing of routed calls, GET /latency; "probe" = the guard's own probe only)."""
+    p50: float
+    p90: float
+    n: int
+    timeouts: int
+    source: str
+
+
+def percentile(values: list[float], q: float) -> float:
+    """Nearest-rank percentile (q in 0..100) of a non-empty list; inf values sort last, so a timeout lifts the high end."""
+    xs = sorted(values)
+    k = max(0, min(len(xs) - 1, math.ceil(q / 100.0 * len(xs)) - 1))
+    return xs[k]
+
+
+def reading_of(values: list[float], source: str) -> Reading | None:
+    if not values:
+        return None
+    return Reading(percentile(values, 50), percentile(values, 90), len(values), sum(1 for v in values if math.isinf(v)),
+                   source)
+
+
+def _fmt_s(x: float) -> str:
+    return "timed out" if math.isinf(x) else f"{x:.2f}s"
+
+
+def _fetch_latency(url: str, timeout: float = 5.0) -> dict | None:
+    """GET <scorer>/latency as JSON; None when the scorer predates it (#116: an older serve.py answers every GET with its
+    health, which has no samples) or cannot be reached. /latency is answered by the HTTP thread, never queued behind MLX."""
+    headers = {}
+    token = os.environ.get("CORTADOS_S1_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as r:
+            body = json.loads(r.read(1 << 20))
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+    return body if isinstance(body, dict) and isinstance(body.get("samples"), list) else None
+
+
+class ScorerLatency:
+    """The guard's default latency source (#116): the scorer's OWN timing of its recent /score requests (serve.py
+    GET /latency), i.e. what routed calls actually waited, queueing behind training included. When fewer than
+    `min_samples` requests started since `since` within the last `window_s` (a quiet scorer), one probe tops the reading up;
+    a probe past the router's timeout or refused is an inf sample. A scorer without /latency falls back to the probe alone.
+    Samples are placed on the guard's clock by their age, so no clock is shared with the scorer."""
+
+    def __init__(self, *, url: str | None = None, fetch=_fetch_latency, probe=None, clock=_time.monotonic,
+                 window_s: float | None = None, min_samples: int = 3):
+        self.url, self.fetch, self.clock, self.min_samples = url, fetch, clock, min_samples
+        self.probe = probe or (lambda: probe_scorer_latency(self.url))
+        self.window = _env_float("CORTADOS_S1_GUARD_WINDOW_S", 180.0, minimum=30) if window_s is None else window_s
+
+    def _scorer_samples(self, now: float, since: float | None) -> list[float] | None:
+        url = (self.url or scorer_url())
+        body = self.fetch(url[:-len("/score")] + "/latency" if url.endswith("/score") else url.rstrip("/") + "/latency")
+        if body is None:
+            return None
+        out = []
+        for row in body["samples"]:
+            try:
+                age, sec, outcome = float(row["age_s"]), float(row["s"]), row.get("outcome")
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not (math.isfinite(age) and math.isfinite(sec)) or age < 0 or sec < 0 or age > self.window:
+                continue
+            start = now - age - sec
+            if since is not None and start < since:   # began before the state we are judging (pause, resume, cycle start)
+                continue
+            out.append(math.inf if outcome in ("timeout", "busy") else sec)
+        return out
+
+    def read(self, since: float | None = None) -> Reading | None:
+        now = self.clock()
+        samples = self._scorer_samples(now, since)
+        source = "scorer" if samples is not None else "probe"
+        samples = samples or []
+        if len(samples) < self.min_samples:
+            try:
+                lat = self.probe()
+            except (ScorerTimedOut, ScorerRefused):
+                lat = math.inf
+            if lat is not None:
+                samples.append(lat)
+        return reading_of(samples, source)
 
 
 def parse_vm_stat(out: str) -> float | None:
@@ -410,8 +531,54 @@ def free_memory_gb() -> float | None:
     return gb
 
 
+def _ps_tree() -> str:
+    return subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid="], capture_output=True, text=True, check=True,
+                          timeout=10).stdout
+
+
+def work_groups(root: int, *, ps=_ps_tree, log=lambda m: print(m, flush=True)) -> list[int]:
+    """Every process group in the cycle's tree: the cycle's own group (`root`, its leader) first, then the group of each
+    descendant that leads another one. The studio gate runs each gated step (LoRA, evaluation, the sweep) with
+    start_new_session=True (studio_capacity.run_holding_lock), so a SIGSTOP to the cycle's group alone froze the gate wrapper
+    and left the trainer running (#116). Never this supervisor's own group, nor 0/1. A ps failure answers [root] (logged)."""
+    try:
+        out = ps()
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"overnight: ps failed ({type(e).__name__}); only the cycle's own group can be signalled this time")
+        return [root]
+    kids: dict[int, list[tuple[int, int]]] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 3 or not all(x.lstrip("-").isdigit() for x in parts):
+            continue
+        pid, ppid, pgid = (int(x) for x in parts)
+        kids.setdefault(ppid, []).append((pid, pgid))
+    own = os.getpgrp()
+    groups, seen, todo = [root], {root}, [root]
+    while todo:
+        for pid, pgid in kids.get(todo.pop(), []):
+            if pid in seen:
+                continue
+            seen.add(pid)
+            todo.append(pid)
+            if pgid not in groups and pgid > 1 and pgid != own:
+                groups.append(pgid)
+    return groups
+
+
+# The guard's state file, in s1/data next to the pipeline's flags; live_heartbeat.s1_block reads it by this name.
+GUARD_STATE_NAME = "latency-guard.json"
+
+# Reason slugs of the guard's state file (data/latency-guard.json), the only reasons the live view shows (#116).
+GUARD_REASONS = ("latency", "timeout", "refused", "memory", "no_baseline", "forced_release")
+
+
 class Guard:
-    """Pauses/resumes one process group on scorer latency and free memory. Sources, clock and signaller are injectable."""
+    """Pauses/resumes the cycle's process groups on scorer latency and free memory. Sources, clock and signaller are
+    injectable. Latency (#116): the default source is ScorerLatency (the scorer's own p50/p90 of routed /score calls, a
+    probe when it is quiet); a plain callable returning seconds is one sample (p50 = p90). Over budget when the reading's
+    p50 is above the baseline p50 + budget OR its p90 above the baseline p90 + budget; a sample past the router's S1 timeout
+    is over every budget. The baseline is the median of readings taken with the tree stopped or no cycle running."""
 
     # Hysteresis: resume only after this many consecutive in-budget probes, so one lucky fast probe while the GPU is still
     # contended does not flap the trainer between STOP and CONT every 30 s.
@@ -421,12 +588,24 @@ class Guard:
     # that cannot read anything is no evidence of contention, and holding the trainer on it would stall the cycle forever.
     MAX_UNREADABLE = 10
 
-    def __init__(self, *, latency=probe_scorer_latency, memory=free_memory_gb, clock=_time.monotonic, signaller=None,
+    def __init__(self, *, latency=None, memory=free_memory_gb, clock=_time.monotonic, signaller=None,
                  budget_s: float | None = None, min_free_gb: float | None = None, interval_s: float | None = None,
                  max_pause_s: float | None = None, release_hold_s: float | None = None, log=lambda m: print(m, flush=True),
-                 alerter=None, wall=_local_now, night_window="env", night_budget_s: float | None = None):
+                 alerter=None, wall=_local_now, night_window="env", night_budget_s: float | None = None,
+                 groups=None, state_path: Path | None = None, epoch=_time.time):
+        if latency is None:
+            latency = ScorerLatency(clock=clock)
         self.latency, self.memory, self.clock, self.log = latency, memory, clock, log
+        # An injected signaller without injected groups signals the cycle group alone (tests use fake pids, which must
+        # never be walked through the real ps).
+        self.groups = groups or (work_groups if signaller is None else (lambda pgid: [pgid]))
         self.signaller = signaller or signal_group
+        self.state_path, self.epoch = state_path, epoch
+        self.stopped_groups: list[int] = []   # the groups the last pause stopped (each gets SIGCONT on resume or stop)
+        self.pauses: list[float] = []         # epoch of each pause in the last 24 h (state file)
+        self.reading: Reading | None = None   # the last reading (state file)
+        self.reason: str | None = None        # slug of the current pause (GUARD_REASONS)
+        self.state_failed = False
         self.alerter = alerter or (lambda name, detail: alert(name, detail, log=self.log))
         self.budget = _env_float("CORTADOS_S1_LATENCY_BUDGET_S", 1.0, minimum=0) if budget_s is None else budget_s
         # Night window: read from the environment only when the day budget is (an injected day budget without an injected
@@ -464,12 +643,18 @@ class Guard:
         self.forced_releases = 0   # consecutive forced releases (supervisor lifetime); a normal resume resets it
         self.stuck_alerted = False   # 'cycle result marker cannot be removed' alerted once per supervisor lifetime
         self.stop_seen = False   # the stop flag existed at some poll of the last run_cycle (set there, not by new_cycle)
-        self.baseline_samples: list[float] = []
+        self.baseline_samples: list[float] = []       # baseline p50s
+        self.baseline_p90_samples: list[float] = []   # baseline p90s (absent for a legacy float source: p90 = p50)
         self.last = None
+        self.since = None    # clock time of the last state change: a reading covers only requests that started after it
+        self.in_cycle = False
         self.new_cycle()
 
     def new_cycle(self) -> None:
         """Forget per-cycle state (pause, hysteresis, once-per-cycle config log, forced-release blindness)."""
+        self.since = self.clock()
+        self.stopped_groups = []
+        self.reason = None
         self.paused = False
         self.good = 0
         self.paused_at = None
@@ -489,14 +674,37 @@ class Guard:
     def baseline(self) -> float | None:
         return statistics.median(self.baseline_samples) if self.baseline_samples else None
 
-    def _record_baseline(self, lat: float) -> None:
-        self.baseline_samples = (self.baseline_samples + [lat])[-self.BASELINE_SAMPLES:]
+    @property
+    def baseline_p90(self) -> float | None:
+        if self.baseline_p90_samples:
+            return statistics.median(self.baseline_p90_samples)
+        return self.baseline
+
+    def _record_baseline(self, r: Reading) -> None:
+        if not (math.isfinite(r.p50) and math.isfinite(r.p90)):
+            return   # a timed-out scorer with the tree stopped is not a baseline (it is down or overloaded by routing)
+        self.baseline_samples = (self.baseline_samples + [r.p50])[-self.BASELINE_SAMPLES:]
+        self.baseline_p90_samples = (self.baseline_p90_samples + [r.p90])[-self.BASELINE_SAMPLES:]
 
     def _read_latency(self):
-        """(latency or None, refusal reason or None). Config errors are logged once per cycle, alerted, and read as None."""
+        """(Reading or None, refusal reason or None). Config errors are logged once per cycle, alerted, and read as None.
+        A refusal's kind ("timeout" or "refused") is left in self.refused_kind for the state file's reason slug."""
+        self.refused_kind = None
         try:
-            return self.latency(), None
+            if hasattr(self.latency, "read"):
+                r = self.latency.read(self.since)
+            else:
+                lat = self.latency()
+                r = None if lat is None else Reading(lat, lat, 1, 1 if math.isinf(lat) else 0, "probe")
+            if r is not None:
+                self.reading = r
+            return r, None
+        except ScorerTimedOut as e:
+            self.reading = Reading(math.inf, math.inf, 1, 1, "probe")
+            self.refused_kind = "timeout"
+            return None, str(e)
         except ScorerRefused as e:
+            self.refused_kind = "refused"
             return None, str(e)
         except ScorerConfigError as e:
             self._config_error(str(e))
@@ -525,16 +733,52 @@ class Guard:
         lat, _ = self._read_latency()
         if lat is not None:
             self._record_baseline(lat)
+        self.write_state()
 
-    def _pause(self, pgid: int, why: str) -> None:
-        self.signaller(pgid, signal.SIGSTOP)
+    def _signal_groups(self, groups: list[int], sig: int) -> None:
+        """Signal each group; one that is already gone (or zombie-only) is skipped, never fatal."""
+        for g in groups:
+            try:
+                self.signaller(g, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    def _pause(self, pgid: int, why: str, reason: str = "latency") -> None:
+        # The cycle group first (nightly.sh then starts nothing new), then every gated step's own group (the trainer).
+        self._signal_groups([pgid], signal.SIGSTOP)   # a leader that just exited (or is zombie-only) is no fault here
+        groups = self.groups(pgid)
+        self._signal_groups([g for g in groups if g != pgid], signal.SIGSTOP)
+        self.stopped_groups = list(dict.fromkeys([pgid] + list(groups)))
         self.paused = True
         self.paused_at = self.clock()
+        self.since = self.paused_at
         self.unreadable = 0
-        self.log("overnight: PAUSE work tree: " + why)
+        self.reason = reason
+        now = self.epoch()
+        self.pauses = [t for t in self.pauses if now - t < 86400] + [now]
+        extra = len(self.stopped_groups) - 1
+        self.log("overnight: PAUSE work tree: " + why + (f" (+{extra} gated step group(s) stopped)" if extra else ""))
+        self.write_state()
+
+    def continue_all(self, pgid: int) -> None:
+        """SIGCONT every group a pause stopped and every group in the tree now, the cycle group last (run_cycle sends that
+        one itself, with its zombie handling). Before any TERM: a stopped trainer cannot act on it and would be KILLed
+        at the gate's grace, losing its unsaved steps."""
+        try:
+            now = self.groups(pgid)
+        except Exception:   # never let a ps fault leave the trainer stopped
+            now = []
+        self._signal_groups([g for g in dict.fromkeys(self.stopped_groups + list(now)) if g != pgid], signal.SIGCONT)
+
+    def _continue(self, pgid: int) -> None:
+        self.signaller(pgid, signal.SIGCONT)
+        self.continue_all(pgid)
+        self.stopped_groups = []
+        self.since = self.clock()
 
     def _release(self, pgid: int, why: str) -> None:
-        self.signaller(pgid, signal.SIGCONT)
+        self._continue(pgid)
+        self.reason = "forced_release"
         self.paused = False
         self.good = 0
         self.paused_at = None
@@ -546,12 +790,51 @@ class Guard:
                   f"CORTADOS_S1_RELEASE_HOLD_S {self.release_hold:g}s")
         self.log(f"overnight: !!! FORCED RESUME of work tree: {detail}")
         self.alerter("guard_forced_resume", detail)
+        self.write_state()
+
+    def state(self) -> dict:
+        """The guard's state for the live view (data/latency-guard.json -> live_heartbeat's s1 block). Metadata only: no
+        URL, path, pid or request text; reasons are GUARD_REASONS slugs. Seconds are None when a percentile timed out."""
+        budget, label = self.current_budget()
+        r = self.reading
+        fin = lambda x: round(x, 3) if x is not None and math.isfinite(x) else None
+        now = self.epoch()
+        state = "paused" if self.paused else ("running" if self.in_cycle else "idle")
+        return {"version": 1, "updated_at": round(now, 3), "state": state,
+                "reason": self.reason if self.paused or self.reason == "forced_release" else None,
+                "paused_s": round(self.clock() - self.paused_at, 1) if self.paused and self.paused_at is not None else None,
+                "budget": "night" if label.startswith("night") else "day", "budget_s": budget,
+                "baseline_p50_s": fin(self.baseline), "baseline_p90_s": fin(self.baseline_p90),
+                "p50_s": fin(r.p50) if r else None, "p90_s": fin(r.p90) if r else None,
+                "samples": r.n if r else 0, "timeouts": r.timeouts if r else 0, "source": r.source if r else None,
+                "pauses_24h": sum(1 for t in self.pauses if now - t < 86400)}
+
+    def write_state(self) -> None:
+        """Atomic write of state() to state_path (None: no file, as in tests). A failure is logged once, never fatal."""
+        if self.state_path is None:
+            return
+        try:
+            tmp = self.state_path.with_name(self.state_path.name + ".tmp")
+            tmp.write_text(json.dumps(self.state()) + "\n")
+            os.replace(tmp, self.state_path)
+            self.state_failed = False
+        except OSError as e:
+            if not self.state_failed:
+                self.state_failed = True
+                self.log(f"overnight: cannot write guard state {self.state_path.name} ({type(e).__name__}); "
+                         "the live view shows it stale")
 
     def tick(self, pgid: int) -> None:
         """One guard step for the running work group (rate-limited to one probe per interval)."""
         if self.last is not None and self.clock() - self.last < self.interval:
             return
         self.last = self.clock()
+        try:
+            self._step(pgid)
+        finally:
+            self.write_state()   # every reading, the release hold-off included: the live view marks a silent guard stale
+
+    def _step(self, pgid: int) -> None:
         (lat, refused), mem = self._read_latency(), self.memory()
         if lat is not None:
             self.blind = False
@@ -568,21 +851,39 @@ class Guard:
             if self.clock() < self.hold_until:
                 return   # release hold-off: the tree runs at least as long as it was held, whatever the probes say
             self.hold_until = None
+        self._judge(pgid, lat, refused, mem)
+
+    def _judge(self, pgid: int, lat: Reading | None, refused: str | None, mem: float | None) -> None:
         reasons = [refused] if refused else []
-        base = self.baseline
+        slug = (getattr(self, "refused_kind", None) or "refused") if refused else None
+        base, base90 = self.baseline, self.baseline_p90
         budget, budget_label = self.current_budget()
-        if lat is not None and base is not None and lat > base + budget:
-            reasons.append(f"scorer latency {lat:.2f}s > baseline {base:.2f}s + {budget_label}")
+        if lat is not None and lat.timeouts:
+            # A routed call waiting this long was degraded: over every budget, baseline or not.
+            reasons.append(f"{lat.timeouts} of {lat.n} scorer request(s) past the router's S1 timeout "
+                           f"(p50 {_fmt_s(lat.p50)}, p90 {_fmt_s(lat.p90)}, {lat.source})")
+            slug = slug or "timeout"
+        elif lat is not None and base is not None and (lat.p50 > base + budget or lat.p90 > base90 + budget):
+            reasons.append(f"scorer latency p50 {_fmt_s(lat.p50)} / p90 {_fmt_s(lat.p90)} ({lat.n} {lat.source} sample(s)) "
+                           f"> baseline p50 {base:.2f}s / p90 {base90:.2f}s + {budget_label}")
+            slug = slug or "latency"
         if mem is not None and mem < self.min_free:
             reasons.append(f"free memory {mem:.1f} GB < {self.min_free:g} GB")
+            slug = slug or "memory"
         if reasons:
             self.good = 0
             if not self.paused:
-                self._pause(pgid, "; ".join(reasons) + f" [latency budget in force: {budget_label}]")
+                self._pause(pgid, "; ".join(reasons) + f" [latency budget in force: {budget_label}]", slug)
             return
         if lat is None and base is None and not self.paused and not self.blind:
             # Without a baseline the latency rule cannot be judged: pause once to measure the scorer alone.
-            self._pause(pgid, "no scorer latency baseline yet; measuring it with the tree stopped")
+            self._pause(pgid, "no scorer latency baseline yet; measuring it with the tree stopped", "no_baseline")
+            return
+        if lat is not None and base is None and not self.paused and not self.blind:
+            # A reading but no baseline to judge it by (#116: before, this case let the trainer run unjudged): pause once
+            # to measure the scorer alone.
+            self._pause(pgid, f"no scorer latency baseline yet (p50 {_fmt_s(lat.p50)}, p90 {_fmt_s(lat.p90)} with the tree "
+                        "running); measuring it with the tree stopped", "no_baseline")
             return
         if self.paused:
             if lat is None:
@@ -590,12 +891,14 @@ class Guard:
                 return
             self.good += 1
             if self.good >= self.RESUME_AFTER:
-                self.signaller(pgid, signal.SIGCONT)
+                self._continue(pgid)
                 self.paused = False
                 self.paused_at = None
                 self.good = 0
+                self.reason = None
                 self.forced_releases = 0
-                self.log(f"overnight: RESUME work tree: latency {lat:.2f}s within {budget_label} for {self.RESUME_AFTER} probes"
+                self.log(f"overnight: RESUME work tree: latency p50 {_fmt_s(lat.p50)} / p90 {_fmt_s(lat.p90)} within "
+                         f"{budget_label} for {self.RESUME_AFTER} readings"
                          + (f", free memory {mem:.1f} GB" if mem is not None else ""))
 
 
@@ -763,6 +1066,8 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
                CORTADOS_S1_TRAIN_UNTIL=str(int(deadline.timestamp())) if deadline is not None else "")
     guard.new_cycle()
     child = subprocess.Popen(command, env=env, start_new_session=True)
+    guard.in_cycle = True
+    guard.write_state()
     window_ended = False
     try:
         while child.poll() is None:
@@ -774,6 +1079,7 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
                 print(f"overnight: night window ended at {deadline:%H:%M}; stopping this cycle's training "
                       f"(TERM, {grace_end:g}s grace, then KILL); checkpoints are kept", flush=True)
                 window_ended = True
+                guard.continue_all(child.pid)   # a paused trainer's own group: CONT before the gate TERMs it
                 stop_group_drained(child, grace=grace_end)
                 break
             guard.tick(child.pid)
@@ -781,15 +1087,20 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
         watch_stop()
     except BaseException:
         # launchd stop/restart of com.cortados.s1-continuous (every deploy) arrives here as SIGTERM -> KeyboardInterrupt.
+        guard.continue_all(child.pid)
         stop_group_drained(child, grace=grace)
         raise
     finally:
-        # Never leave a group stopped: the shell can exit while a paused grandchild (the trainer) is still SIGSTOPped.
+        # Never leave a group stopped: the shell can exit while a paused grandchild (the trainer) is still SIGSTOPped, and
+        # a gated step's trainer leads its own group (#116), so every group a pause stopped gets SIGCONT too.
+        guard.in_cycle = False
+        guard.continue_all(child.pid)
         try:
             guard.signaller(child.pid, signal.SIGCONT)
         except PermissionError as e:
             _zombie_only(child, e)   # zombie-only group (leader gone): nothing left to continue; a live leader re-raises
         guard.new_cycle()
+        guard.write_state()
         if pidfile is not None and child.poll() is not None:
             try:
                 if pidfile.read_text().strip() == str(child.pid):
@@ -997,7 +1308,8 @@ def main(argv: list[str]) -> int:
         data = Path(__file__).parent / "data"
         recover_pidfile(data / "nightly.pid")
         # Same PIDFILE/STOPFLAG paths nightly.sh uses (PIDFILE=data/nightly.pid; STOPFLAG=data/nightly.stop, run in s1/).
-        return run_continuous(command, result_file=data / "cycle-result", stopflag=data / "nightly.stop",
+        guard = Guard(state_path=data / GUARD_STATE_NAME)   # #116: the live view's S1 block reads this file
+        return run_continuous(command, guard, result_file=data / "cycle-result", stopflag=data / "nightly.stop",
                               pidfile=data / "nightly.pid", sweep_request=data / "sweep-request.json")
     if argv == ["--check-window"]:
         print(f"seconds left in Toronto overnight window: {seconds_left():.0f}")

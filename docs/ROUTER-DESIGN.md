@@ -335,8 +335,8 @@ or when ≥150 newly labelled requests have accumulated. Serving the promoted mo
 ### 4d.1 Continuous mode (Forest 2026-11-03: no night window)
 `python3 s1/overnight.py --continuous -- /bin/bash s1/nightly.sh` runs `s1/nightly.sh` cycles back to back instead of the 01:30 job, with
 `CORTADOS_NIGHTLY_SUPERVISED=1 CORTADOS_S1_CONTINUOUS=1 CORTADOS_S1_CYCLE_RESULT=<file> TZ=America/Toronto`. In continuous mode the
-live scorer stays loaded during training; the supervisor pauses (SIGSTOP) the cycle's tree when probed scorer latency rises more than
-the budget above baseline, and evaluation is never skipped for a deadline. A cycle writes `worked` (labels added, training ran, an
+live scorer stays loaded during training; the supervisor pauses (SIGSTOP) the cycle's tree when scorer latency rises more than
+the budget above baseline (the latency guard, below), and evaluation is never skipped for a deadline. A cycle writes `worked` (labels added, training ran, an
 evaluation/promotion was attempted) or `quota` (label.py stopped at the Claude headroom floor, `low_headroom`/`unknown_headroom`;
 `quota` wins over `worked`) to the result file, or nothing (idle). Exit codes: 0 normal, 130 stop requested, anything else a failure.
 
@@ -344,13 +344,43 @@ evaluation/promotion was attempted) or `quota` (label.py stopped at the Claude h
 |---|---|---|
 | `CORTADOS_S1_LATENCY_BUDGET_S` | 1.0 | scorer latency allowed above baseline before training is paused |
 | `CORTADOS_S1_MIN_FREE_GB` | 8 | free memory below which training is paused |
-| `CORTADOS_S1_PROBE_S` | 30 | seconds between scorer latency probes |
+| `CORTADOS_S1_PROBE_S` | 30 | seconds between guard readings |
+| `CORTADOS_S1_GUARD_WINDOW_S` | 180 | the guard judges the scorer's own samples of the last this-many seconds (min 30) |
+| `CORTADOS_S1_TIMEOUT_S` | 15 | the router's S1 timeout; also the guard probe's timeout, and a sample past it is over every budget |
 | `CORTADOS_S1_MAX_PAUSE_S` | 1800 | longest pause (min 60); past it the tree is resumed and `guard_forced_resume` alerts |
 | `CORTADOS_S1_RELEASE_HOLD_S` | = max pause | after a forced resume, no re-pause for this long (min 60): training runs at least as long as it was held, so a persistent 503 / low memory gives ~50% running instead of ~1% |
 | `CORTADOS_S1_CYCLE_IDLE_S` | 900 | sleep after an idle cycle (min 60) |
 | `CORTADOS_S1_QUOTA_COOLDOWN_S` | 18000 | sleep after a `quota` cycle (min 60) |
 | `CORTADOS_S1_MIN_LEFT_PCT` | 15 | label.py per-account quota floor, 0-100 (invalid → logged, 15) |
 | `CORTADOS_S1_BENCH_REFRESH_S` | 86400 | benchmark/tiers refresh at most this often (a future-dated stamp counts as due) |
+
+**The latency guard (#116).** On 2026-11-14 daytime LoRA training pushed 104 of 166 routed decisions in an hour to
+`degraded` (S1 timeout) and the guard never paused: (1) its probe's timeout (30 s) read as "no reading", never as
+back-pressure, while routed calls already failed at 15 s; (2) the studio gate runs every gated step (LoRA, evaluation, the
+sweep) in its own session (`studio_capacity.run_holding_lock`), so a SIGSTOP to the cycle's group froze only the gate wrapper,
+never the trainer; (3) a reading with no baseline was never judged. Now:
+- *Measured*: `s1/serve.py` times every `/score` request itself, from "request received" to "reply ready" (the wait behind
+  other requests in its single MLX queue included) and keeps the last 15 min / 512 samples; `GET /latency` returns them as
+  `{age_s, s, outcome, probe}` (timing metadata only; behind the scorer's token when one is set). Outcomes `timeout` (the
+  caller's own timeout passed: that routed call was degraded) and `busy` (503) count as infinitely slow.
+- *Read*: every `CORTADOS_S1_PROBE_S`, `overnight.ScorerLatency` takes the samples of the last `CORTADOS_S1_GUARD_WINDOW_S`
+  that STARTED after the guard's last state change (cycle start, pause, resume), so samples from before a pause never
+  hold it, and their p50 and p90. Fewer than 3 such samples (a quiet scorer): one probe (`X-CortadOS-Probe: 1`) tops the
+  reading up; a probe past `CORTADOS_S1_TIMEOUT_S` or refused is an infinite sample. A scorer without `/latency` (older
+  serve.py) is read by the probe alone.
+- *Baseline*: the median p50 and median p90 of the last 5 readings taken with the tree stopped or no cycle running. With
+  none yet, the first reading of a cycle pauses the tree once to measure it.
+- *Rule*: pause when p50 > baseline p50 + budget, or p90 > baseline p90 + budget, or any sample timed out; budget =
+  `CORTADOS_S1_LATENCY_BUDGET_S` (1.0 s, Forest 2026-11-03) by day, `CORTADOS_S1_NIGHT_LATENCY_BUDGET_S` (6.0 s) inside
+  the night window. Resume after 3 consecutive in-budget readings (hysteresis). Free memory below `CORTADOS_S1_MIN_FREE_GB`
+  pauses as before; `CORTADOS_S1_MAX_PAUSE_S` / `CORTADOS_S1_RELEASE_HOLD_S` still bound a pause.
+- *Throttle*: a pause SIGSTOPs the cycle's group first, then every other process group in its tree (`overnight.work_groups`,
+  from `ps`: the gate's trainer group). Resume, the window-end stop, a supervisor TERM and the end of every cycle SIGCONT
+  every group the pause stopped before any TERM, so a stopped trainer can still checkpoint.
+- *Shown*: the guard writes `s1/data/latency-guard.json` (state running / paused / idle, a reason slug, the budget in force,
+  baseline and current p50/p90, samples, timeouts, pauses in 24 h); the Studio's heartbeat sends it as `s1.guard` and the
+  live view shows it in its `s1` section (`s1.guard`, with host, age and `stale`) and on the dashboard.
+- The labeler's 15% floor (`CORTADOS_S1_MIN_LEFT_PCT`) is a per-account quota floor in label.py; the guard does not change it.
 
 Calibration sweep first (#74). A request in `s1/data/sweep-request.json`
 (`{"candidate": "runs/<c>/adapter", "live": "runs/<l>/adapter", "tilts": [...], "alphas": [...], "scales": [...]}`, scales

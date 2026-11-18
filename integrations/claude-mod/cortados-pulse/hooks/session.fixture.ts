@@ -6,6 +6,7 @@ export default {
   "overview": {
     "s1": "up",
     "s1_latency_ms": 23,
+    "s1_guard": null,
     "lowest_subscription": {
       "lane": "cursor",
       "label": "cursor (shared with Grok Bot)",
@@ -250,7 +251,8 @@ export default {
     "available": true,
     "http_status": 200,
     "latency_ms": 23,
-    "reason": null
+    "reason": null,
+    "guard": null
   },
   "hosts": {
     "as_of": 1800000000.0,

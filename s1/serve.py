@@ -1,6 +1,8 @@
 """CortadOS Router S1 scorer service: the promoted adapter (s1/current.json) loaded once, answering POST /score in ~1 s on this Mac.
   POST /score {"request": str, "unit_kind": "interactive"|"background"} → {"answers", "probs", "confidence", "ms", "model"}
   GET  /health → {"ok", "model", "loaded_s"}
+  GET  /latency → {"window_s", "samples": [{"age_s", "s", "outcome", "probe"}...]}: the scorer's own timing of its recent
+       /score requests (#116), read by the latency guard in overnight.py. Timing metadata only, never request text.
 Reloads when current.json changes (a promotion). Never more than one request at a time (MLX is not thread-safe); the router's own timeout guards the turn.
 Binds 127.0.0.1:8431 by default. Set CORTADOS_S1_BIND to a tailnet IP (or 0.0.0.0) to let other hosts reach it, and CORTADOS_S1_PORT for the port; clients resolve the matching URL through cortados_router.s1_endpoint."""
 from __future__ import annotations
@@ -12,6 +14,7 @@ import sys
 import threading
 import time
 import queue
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -33,6 +36,36 @@ MAX_PENDING = int(os.environ.get("CORTADOS_S1_MAX_PENDING", "32"))              
 REPLY_TIMEOUT_S = float(os.environ.get("CORTADOS_S1_REPLY_TIMEOUT_S", "60"))         # hard ceiling on the client wait; the client's own timeout usually shortens it
 RECV_DEADLINE_S = float(os.environ.get("CORTADOS_S1_RECV_DEADLINE_S", "10"))         # total time allowed to receive the whole request (line + headers + body); a trickle past this is cut
 TOKEN = os.environ.get("CORTADOS_S1_TOKEN") or None                                  # when set, POST /score needs Authorization: Bearer <token>; loopback default leaves it unset
+
+# The latency window (#116): one sample per /score request, timed here from "request fully received" to "reply ready" (or
+# the handler giving up on the worker), so it includes the wait behind other requests in the single MLX queue -- what a routed
+# call actually waits. Bounded by count and age. The overnight.py guard reads it on GET /latency instead of trusting a lone
+# probe: a quiet scorer answering a short probe fast says nothing about the routed calls queued behind training.
+LATENCY_MAX_SAMPLES = 512
+LATENCY_WINDOW_S = 900.0
+# Outcomes: ok (answered), error (scorer raised; still timed), timeout (the handler stopped waiting: the caller's own timeout,
+# so a routed call was degraded), busy (503, backlog full: never queued). The guard reads timeout and busy as over any budget.
+LATENCY_OUTCOMES = ("ok", "error", "timeout", "busy")
+_latency: deque = deque(maxlen=LATENCY_MAX_SAMPLES)
+_latency_lock = threading.Lock()
+
+
+def record_latency(seconds: float, outcome: str, *, probe: bool = False, clock=time.monotonic) -> None:
+    """Keep one /score timing sample: (end time, seconds, outcome, probe). Monotonic clock: ages survive a wall-clock step."""
+    with _latency_lock:
+        _latency.append((clock(), max(0.0, float(seconds)), outcome if outcome in LATENCY_OUTCOMES else "error", bool(probe)))
+
+
+def latency_report(*, clock=time.monotonic) -> dict:
+    """GET /latency: the samples of the last LATENCY_WINDOW_S, newest last, each as its age (seconds since it ended) so the
+    reader needs no shared clock."""
+    now = clock()
+    with _latency_lock:
+        rows = list(_latency)
+    out = [{"age_s": round(now - end, 3), "s": round(sec, 3), "outcome": outcome, "probe": probe}
+           for end, sec, outcome, probe in rows if now - end <= LATENCY_WINDOW_S]
+    return {"window_s": LATENCY_WINDOW_S, "samples": out}
+
 
 # Bounded, so a put_nowait that would exceed MAX_PENDING raises queue.Full and the handler returns 503 atomically -- a
 # qsize() check before a separate put races under ThreadingHTTPServer and lets concurrent handlers overshoot.
@@ -169,6 +202,11 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._recv_done()
+        if self.path.split("?", 1)[0] == "/latency":
+            # Timing metadata only, but behind the same token as /score once one is set (a non-loopback bind).
+            if TOKEN is not None and self.headers.get("Authorization", "") != f"Bearer {TOKEN}":
+                self._send(401, {"error": "unauthorized"}); return
+            self._send(200, latency_report()); return
         self._send(200, {"ok": _state["scorer"] is not None, "model": _state["model"], "loaded_s": _state["loaded_s"]})
 
     def do_POST(self):
@@ -185,10 +223,20 @@ class H(BaseHTTPRequestHandler):
             self._recv_done()                                 # whole request received; stop the deadline before scoring
             body = json.loads(raw or b"{}")
             wait = client_wait(self.headers.get("X-Request-Timeout-S"))
+            probe = self.headers.get("X-CortadOS-Probe") == "1"   # the latency guard's own probe: timed, and marked as such
+            t0 = time.monotonic()
             reply, full = enqueue(body, time.time() + wait)
             if full is not None:                              # bounded backlog full: shed load
+                record_latency(0.0, "busy", probe=probe)
                 self._send(*full); return
-            r = reply.get(timeout=max(wait, 1.0))
+            try:
+                r = reply.get(timeout=max(wait, 1.0))
+            except queue.Empty:                               # the caller's own timeout passed: its routed call is degraded
+                record_latency(time.monotonic() - t0, "timeout", probe=probe)
+                raise
+            # the worker dropped it because the caller's deadline passed while it queued: a timeout, not an error
+            dropped = str(r.get("error") or "").startswith("dropped:")
+            record_latency(time.monotonic() - t0, "timeout" if dropped else ("error" if "error" in r else "ok"), probe=probe)
             self._send(500 if "error" in r else 200, {**r, "model": _state["model"]})
         except Exception as exc:
             self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
