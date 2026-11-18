@@ -135,8 +135,21 @@ CAPACITY_KEYS = ("limit", "inflight", "retiring", "draining", "owner", "pressure
 # This holds on every vllm-mlx node serving a text-only model, governed or not: its guard refuses a generating request
 # without a fresh ticket (409), so the gate and the guard ship together (scripts/install_mlx_backend.sh copies both).
 # integrations/vllm-mlx/cortados_vllm_mlx_guard.py (TicketLedger) is the other side; a test keeps the names equal.
+# The fence (#126 review round 4, P1b). The gate's admissions and retiring tickets live in this process only, and the
+# gate's LaunchAgent restarts it (KeepAlive) while vllm-mlx runs on: rows a previous gate's turns left in the batch
+# are reserved by nobody. So the gate starts fenced: it admits no text turn (529, busy: retry, with the reason in the
+# capacity report's "fence") until the guard answers FENCE_PATH {"floor_ms": <this gate's start>, "known": [every id
+# this gate minted and has not released]} with "clear": no ticket minted before the floor is admitted any more, and
+# no request bound to a ticket outside `known` is pending, queued or in the scheduler (atomic with admission in the
+# guard: TicketLedger.fence). The gate fences itself again whenever it can no longer vouch for the backend's state: a
+# retirement poll or fence query failed (lost contact), or the guard's boot id changed (a new vllm-mlx process: its
+# predecessor's rows went with it, and the new one tombstones and retires every old id, so the fence lifts at once).
+# Chosen over reserving the backend's reported rows at full width: that needs the rows' widths or a worst case per
+# row, and a second reservation path; the fence needs one query and admits nothing it cannot account for.
 TICKET_HEADER = "x-cortados-ticket"
 RETIRE_PATH = "/cortados/retire"
+FENCE_PATH = "/cortados/fence"
+FENCE_STARTING = "fenced: starting, waiting for the backend's guard to confirm no rows of a previous gate remain"
 RETIRE_POLL_S = 0.2                         # between confirmation polls while tickets are retiring
 RETIRE_BACKOFF_S = 2.0                      # the longest wait between polls after a failed one
 RETIRE_TIMEOUT_S = 5.0                      # one poll, end to end (deadline_call)
@@ -487,7 +500,8 @@ class GateServer(ThreadingHTTPServer):
     def report(self, snap: dict) -> dict:
         vision = self.admission.vision
         return {"backend": self.backend["backend"], **{k: snap.get(k) for k in CAPACITY_KEYS},
-                "vision": {k: vision[k] for k in VISION_REPORT_KEYS} if vision else None}
+                "vision": {k: vision[k] for k in VISION_REPORT_KEYS} if vision else None,
+                "fence": self.retirer.fenced() if self.retirer is not None else None}
 
     def process_request(self, request, client_address):
         if self.slots is None:                      # unlimited: no slot to take or give back
@@ -516,37 +530,133 @@ class GateServer(ThreadingHTTPServer):
                 self.slots.release()
 
 
-def new_ticket_id(now: float | None = None) -> str:
-    """A fresh retirement id (TICKET_HEADER): the minting time in unix milliseconds and 128 random bits."""
-    return f"{int((time.time() if now is None else now) * 1000)}.{secrets.token_hex(16)}"
+def new_ticket_id(now: float | None = None, floor_ms: int = 0) -> str:
+    """A fresh retirement id (TICKET_HEADER): the minting time in unix milliseconds (never below `floor_ms`, the
+    gate's start: the guard refuses ids minted before the fence's floor) and 128 random bits."""
+    return f"{max(int((time.time() if now is None else now) * 1000), floor_ms)}.{secrets.token_hex(16)}"
 
 
 class Retirer:
-    """The retiring tickets (TICKET_HEADER / RETIRE_PATH above) and the one thread that asks the guard about them.
-    hand_over(ticket, id) marks the ticket retiring and queues it; a poll POSTs {"tickets": [ids]} to the upstream's
-    RETIRE_PATH and releases exactly the ids the answer lists under "retired". A failed poll (unreachable, an error
-    status, an unreadable answer) releases nothing and backs off up to RETIRE_BACKOFF_S: fail closed. `call` (tests)
-    replaces the HTTP call: call(ids) -> the parsed answer."""
+    """The retiring tickets (TICKET_HEADER / RETIRE_PATH above), the fence (FENCE_PATH above) and the one thread that
+    asks the guard about them. mint() gives a forwarded turn its id (known to the fence until released);
+    hand_over(ticket, id) marks the ticket retiring and queues it; forget(id) drops an id whose turn sent nothing; a
+    poll POSTs {"tickets": [ids]} to the upstream's RETIRE_PATH and releases exactly the ids the answer lists under
+    "retired". A failed poll (unreachable, an error status, an unreadable answer) releases nothing, fences the gate and
+    backs off up to RETIRE_BACKOFF_S: fail closed. `call` (tests) replaces the HTTP call: call(path, body) -> the parsed
+    answer. `start_ms` is the gate's start (the fence's floor)."""
 
     def __init__(self, host: str, port: int, *, connect_timeout: float = CONNECT_TIMEOUT_S,
-                 interval: float = RETIRE_POLL_S, call=None, start: bool = True):
+                 interval: float = RETIRE_POLL_S, call=None, start: bool = True, start_ms: int | None = None):
         self.host, self.port, self.connect_timeout, self.interval = host, port, connect_timeout, interval
         self._call = call or self._http
         self._cv = threading.Condition()
         self._pending: dict[str, local_governor.Ticket] = {}
+        self._minted: set[str] = set()       # ids minted and not yet handed over or forgotten
         self._stopped = False
         self._start = start
         self._thread: threading.Thread | None = None
         self.last_error: str | None = None
+        self.start_ms = int(time.time() * 1000) if start_ms is None else start_ms
+        self._fence: str | None = FENCE_STARTING
+        self._fence_lock = threading.Lock()  # one fence query at a time (the thread or a waiting request)
+        self._fence_gen = 0                  # fence queries started
+        self._fence_failed = float("-inf")   # time.monotonic() when the last one failed
+        self.boot: str | None = None         # the guard process the fence was last lifted against
+        self._kick()
+
+    # ---- the fence
+    def fenced(self) -> str | None:
+        """Why no text turn is admitted now, or None."""
+        with self._cv:
+            return self._fence
+
+    def _raise_fence(self, why: str) -> None:
+        with self._cv:
+            if self._fence is None:
+                logger.warning("local gate %s", why)
+            self._fence = why
+            self._cv.notify_all()
+        self._kick()
+
+    def _seen_boot(self, boot: object) -> None:
+        """A guard answer's boot id: a different one than the fence was lifted against is a new vllm-mlx process."""
+        if not isinstance(boot, str):
+            return
+        with self._cv:
+            changed = self.boot is not None and boot != self.boot
+            if not changed:
+                self.boot = boot
+        if changed:
+            self._raise_fence("fenced: the backend restarted (a new guard process): waiting for it to confirm the "
+                              "fence")
+
+    def fence_once(self, shared: bool = False) -> str | None:
+        """One fence query unless the gate is not fenced (`shared`: nor when another query ran while this one waited
+        for the lock): the fence's reason after it (None: lifted). Never raises: a failed query keeps the fence up,
+        with the failure in its reason."""
+        with self._cv:
+            gen = self._fence_gen
+        with self._fence_lock:
+            with self._cv:
+                if self._fence is None or (shared and self._fence_gen != gen):
+                    return self._fence            # lifted, or a query ran while this one waited: its answer stands
+                self._fence_gen += 1
+                known = sorted(self._minted | set(self._pending))
+            try:
+                answer = self._call(FENCE_PATH, {"floor_ms": self.start_ms, "known": known})
+                if not isinstance(answer, dict) or not isinstance(answer.get("clear"), bool):
+                    raise ValueError("the guard's fence answer has no clear flag")
+            except Exception as exc:              # noqa: BLE001 (any failure keeps the fence up)
+                with self._cv:
+                    self._fence_failed = time.monotonic()
+                    self._fence = f"fenced: the backend's guard did not confirm the fence ({type(exc).__name__})"
+                    return self._fence
+            with self._cv:
+                if not answer["clear"]:
+                    n = answer.get("unknown")
+                    self._fence = (f"fenced: the backend still holds {n if isinstance(n, int) else 'some'} "
+                                   "request(s) of turns this gate does not know (a previous gate's)")
+                    return self._fence
+                self._fence = None
+                self.boot = answer["boot"] if isinstance(answer.get("boot"), str) else None
+                logger.info("local gate fence lifted")
+                return None
+
+    def lift_now(self) -> str | None:
+        """A request found the gate fenced: try the fence now rather than wait for the thread's next try, unless one
+        failed in the last RETIRE_BACKOFF_S (a burst shares a running query: at most two RETIRE_TIMEOUT_S waits).
+        The fence's reason after it, or None."""
+        with self._cv:
+            if self._fence is None:
+                return None
+            if time.monotonic() - self._fence_failed < RETIRE_BACKOFF_S:
+                return self._fence
+        return self.fence_once(shared=True)
+
+    # ---- the ids
+    def mint(self) -> str:
+        tid = new_ticket_id(floor_ms=self.start_ms)
+        with self._cv:
+            self._minted.add(tid)
+        return tid
+
+    def forget(self, ticket_id: str) -> None:
+        with self._cv:
+            self._minted.discard(ticket_id)
 
     def hand_over(self, ticket: local_governor.Ticket, ticket_id: str) -> None:
         ticket.mark_retiring()
         with self._cv:
+            self._minted.discard(ticket_id)
             self._pending[ticket_id] = ticket
+            self._cv.notify_all()
+        self._kick()
+
+    def _kick(self) -> None:
+        with self._cv:
             if self._start and not self._stopped and (self._thread is None or not self._thread.is_alive()):
                 self._thread = threading.Thread(target=self._run, name="gate-retirer", daemon=True)
                 self._thread.start()
-            self._cv.notify_all()
 
     def pending(self) -> list[str]:
         with self._cv:
@@ -557,11 +667,10 @@ class Retirer:
             self._stopped = True
             self._cv.notify_all()
 
-    def _http(self, ids: list[str]) -> object:
+    def _http(self, path: str, body: dict) -> object:
         conn = http.client.HTTPConnection(self.host, self.port)
         try:
-            status, raw = deadline_call(conn, RETIRE_TIMEOUT_S, "POST", RETIRE_PATH,
-                                        body=json.dumps({"tickets": ids}).encode(),
+            status, raw = deadline_call(conn, RETIRE_TIMEOUT_S, "POST", path, body=json.dumps(body).encode(),
                                         headers={"content-type": "application/json"}, max_bytes=RETIRE_MAX_BYTES,
                                         connect_s=min(self.connect_timeout, RETIRE_TIMEOUT_S))
         finally:
@@ -576,10 +685,11 @@ class Retirer:
         ids = self.pending()[:RETIRE_BATCH]
         if not ids:
             return 0
-        answer = self._call(ids)
+        answer = self._call(RETIRE_PATH, {"tickets": ids})
         retired = answer.get("retired") if isinstance(answer, dict) else None
         if not isinstance(retired, list):
             raise ValueError("the guard's answer has no retired list")
+        self._seen_boot(answer.get("boot"))
         asked, done = set(ids), []
         with self._cv:
             for rid in retired:
@@ -593,21 +703,26 @@ class Retirer:
         wait = self.interval
         while True:
             with self._cv:
-                while not self._pending and not self._stopped:
+                while not self._pending and self._fence is None and not self._stopped:
                     self._cv.wait()
                 if self._stopped:
                     return
+                fenced = self._fence is not None
             try:
+                if fenced and self.fence_once() is not None:
+                    raise ValueError(self.fenced() or "fenced")
                 self.poll_once()
                 self.last_error, wait = None, self.interval
             except Exception as exc:                 # noqa: BLE001 (the thread must outlive any one poll)
-                # fail closed: the tickets stay reserved, the node reports them retiring
-                if self.last_error is None:
-                    logger.warning("retirement poll failed (%s): %d tickets stay reserved", type(exc).__name__,
-                                   len(self.pending()))
+                # fail closed: the tickets stay reserved, the node reports them retiring, and the gate is fenced
+                if not fenced:
+                    if self.last_error is None:
+                        logger.warning("retirement poll failed (%s): %d tickets stay reserved", type(exc).__name__,
+                                       len(self.pending()))
+                    self._raise_fence(f"fenced: lost contact with the backend's guard ({type(exc).__name__})")
                 self.last_error, wait = type(exc).__name__, min(RETIRE_BACKOFF_S, wait * 2)
             with self._cv:
-                if self._pending and not self._stopped:
+                if (self._pending or self._fence is not None) and not self._stopped:
                     self._cv.wait(wait)
 
 
@@ -791,6 +906,10 @@ class GateHandler(BaseHTTPRequestHandler):
             allowed, reason = self._node_free()
             if not allowed:
                 return self._error(503, "overloaded_error", reason)
+            if method == "POST" and self.server.retirer is not None:
+                fence = self.server.retirer.lift_now()
+                if fence is not None:        # the fence (FENCE_PATH): nothing admitted it cannot account for
+                    return self._busy({**self.server.admission.snapshot(), "reason": fence})
             if method == "POST":             # admission: only a model turn takes a slot, never the probe
                 adm = self.server.admission
                 images = len(plan) if plan is not None else 0
@@ -811,7 +930,7 @@ class GateHandler(BaseHTTPRequestHandler):
                         return self._unsupported(snap.get("reason") or "the model reads no images")
                     return self._too_large(snap) if snap.get("refused") == "too_large" else self._busy(snap)
                 if self.server.retirer is not None and not images:
-                    ticket_id = new_ticket_id()          # retirement: the guard reports this id's release
+                    ticket_id = self.server.retirer.mint()   # retirement: the guard reports this id's release
             self._forward(method, path, body, ticket_id)
         finally:
             if ticket is not None:
@@ -823,6 +942,8 @@ class GateHandler(BaseHTTPRequestHandler):
                     # However the turn ended (relayed, an upstream error or timeout, the client gone, an exception on
                     # the way out): its slot and bytes are free. Nothing was sent upstream for a retiring turn whose
                     # connect failed. Ticket.release is idempotent.
+                    if ticket_id is not None:
+                        self.server.retirer.forget(ticket_id)
                     ticket.release()
             if lock_fd is not None:
                 os.close(lock_fd)            # releases LOCK_SH

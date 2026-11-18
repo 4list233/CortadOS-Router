@@ -1261,7 +1261,11 @@ mlx-lm's `BatchGenerator` with vllm-mlx's `--prefill-step-size` (default **2,048
 - **Pinned.** mlx-lm 0.31.3 (`MLX_LM_PINNED_SHA256`, from the wheel `mlx_lm-0.31.3-py3-none-any.whl`, sha256
   `758cfddf…83b8`): `generate.py`, `sample_utils.py`, `models/cache.py`, `models/base.py`, `models/qwen3_5.py`,
   `models/qwen3_next.py`, `models/gated_delta.py`, `models/activations.py`, `models/rope_utils.py`,
-  `models/switch_layers.py`, and `__init__.py`, `_version.py`, `models/__init__.py`. The vllm-mlx files are the text
+  `models/switch_layers.py`, and `__init__.py`, `_version.py`, `models/__init__.py`; since #126 review round 4 also
+  the rest of what `import mlx_lm` runs (`convert.py`, `utils.py`, `tokenizer_utils.py`: `__init__` imports convert,
+  generate and utils) and every module loading a tokenizer may import by name (`tool_parsers/*.py`,
+  `chat_templates/*.py`); a file in those two folders that the release lacks is refused, and so is a `config.json`
+  naming a `model_file` (mlx-lm would execute it from the model folder). The vllm-mlx files are the text
   route's existing pins (`scheduler.py`, `engine/batched.py`, `engine_core.py`). The text route now also requires
   `mlx` / `mlx-metal` 0.32.4 (`verify_mlx`, as vision mode does), because the attention fallback and the allocator are
   in the compiled library. And `config.json` must be the verified text geometry (`check_text_model`, `TEXT_DIMS`: the
@@ -1379,9 +1383,55 @@ against 7 tickets and 12.05 GiB reserved. Now, on a vllm-mlx node serving a text
   scheduler. So a backend restart, a new process whose rows are all freed, retires every retiring ticket.
 - **Fail closed**: no confirmation (the guard hung, a step that never returns, the backend unreachable) keeps the ticket
   reserved and the node busy. A connect that failed sent nothing and is released at once.
+- **Atomic with admission** (#126 review round 4, P1a). `Scheduler.add_request` is not under the step lock, so a
+  retire query's snapshot could start, an add could queue a bound request, and the query would then mark it gone while
+  it ran. Now `Scheduler.add_request` (entering, the scheduler's own add, entered) holds the ledger's `admit_lock`, and
+  so does every safe point from noting the entry sequence number to marking what is gone. A request is numbered as its
+  add completes; a safe point may mark gone only a request numbered below the number it noted before reading, i.e. one
+  that was queued before the read began. The lock makes the check redundant; the number keeps it true for any path that
+  ever adds outside the lock. A query takes the step lock and the admit lock without waiting: with either busy it
+  answers from the last safe point.
+- **Bounded** (P2b). The guard tracks at most `TICKET_MAX` (8192) ids on every insert path (arrival and tombstone). At
+  the bound it evicts closed ids, oldest first (every id past the 600 s age, and at least the oldest quarter), and its
+  **floor** rises past every evicted id: an id minted before the floor is refused on arrival and, asked about, retired
+  without being tracked. So an evicted tombstone can never be replayed. Open turns are never evicted; an unknown id
+  that cannot be tracked (every slot an open turn) is not retired, so the gate keeps it reserved.
+
+**The fence** (#126 review round 4, P1b). The gate's admissions and retiring tickets live in its process only, and its
+LaunchAgent restarts it (`KeepAlive`) while vllm-mlx runs on. The reviewer's repro: an old 64k turn survives a gate
+restart, and the fresh gate admits two more 64k turns, 28.8 GiB computed against 25 GiB. So a gate on a vllm-mlx text
+node starts **fenced**:
+
+- it admits no text turn (529 busy, `Retry-After`, the reason in the message and in the capacity report's `fence`)
+  until the guard answers `POST /cortados/fence {"floor_ms": <the gate's start>, "known": [ids this gate minted and has
+  not released]}` with `"clear": true`;
+- the guard, under the same locks as the safe point, raises its floor to `floor_ms` (no ticket minted before the gate
+  started is admitted any more: a request a dead gate sent late cannot slip in afterwards), and answers clear only if no
+  request bound to a ticket outside `known` is pending, queued or in the scheduler and no such exchange is open. It
+  counts a request as present until a safe point has seen it leave, so it errs towards fenced;
+- the gate mints every ticket at or after its own start (a clock that went back cannot mint below the floor);
+- the gate fences itself again whenever it cannot vouch for the backend's state: a retirement poll or a fence query
+  failed (lost contact), or the guard's boot id changed. A changed boot id is a new vllm-mlx process: the old rows went
+  with the old process, and the new process tombstones and retires every old id (the restart path above), so with only
+  this gate's own turns known the fence lifts at once;
+- a hung or unreachable guard keeps the fence up, visibly (`fence`: "the backend's guard did not confirm the fence");
+  the Retirer thread retries with the same back-off, and a request arriving while fenced triggers one query at most
+  every 2 s after a failure (a burst shares the one running).
+
+Chosen over the alternative of reserving the backend's reported rows at full width: that needs a per-row width or a
+worst case per row and a second reservation path in the governor, while the fence needs one query and admits nothing
+it cannot account for. Its cost is a pause after a gate restart while a previous gate's turns finish.
+
+**Before enabling vision**: a vision model's turns are still released at **transport end**. The MLLM scheduler has
+the same deferred-abort shape, so a vision turn's rows can outlive its connection exactly as the text route's did
+before retirement. Vision (#125) must not be enabled on the Pro until its route carries tickets and the retirement
+protocol (the ledger, the safe point after the MLLM scheduler's step, the fence) too. This is not a text-only merge
+blocker (#126 review round 4).
 
 The gate and the guard ship together: an old guard answers 404 there, so every ticket would stay retiring and the node
-busy. A vision model's turns are unchanged (#125): its guard has no ledger and the gate releases them as before. `fit_tokens` / `free_tokens` in the capacity report are computed from
+busy (and an old guard has no fence endpoint, so the gate would stay fenced). A vision model's turns are unchanged
+(#125): its guard has no ledger and the gate releases them as before (see "Before enabling vision" above).
+`fit_tokens` / `free_tokens` in the capacity report are computed from
 the same set formula (`text_room`), so the provider's skip check sees the new room. Short turns are unchanged: their
 old reservation was already at least the computed peak, so it stands byte for byte (eight ~2k-token turns still run
 at once). A vision model's turns, text-only ones included, reserve exactly as in #125 (`text_route` is false there).
@@ -1428,6 +1478,10 @@ and eviction and bounds both. The vision route is unchanged (#125): its MLLM sch
 touched here.
 
 ### Vision: still images on the MLX lane (#125)
+
+> **Before enabling vision** (#126 review round 4): vision turns are still released at transport end; they need the
+> retirement protocol (tickets, the ledger, the safe point, the fence) before vision is turned on. See "Before
+> enabling vision" under the text route's reservation above.
 
 Owner decisions 2026-11-15/16: the Pro's model may read images, served from a separate folder holding the 4-bit language
 weights plus the BF16 vision tower (`~/models/mlx/Qwen3.8-27B-heretic-ara-4bit-vision`, `qwen3_5`,
@@ -1541,8 +1595,13 @@ must resolve to the pinned files. A drifted file, such as `silu` promoting to fl
 is a regular package in every 0.32.4 wheel, so its `nn/__init__.py` is pinned by hash rather than required absent.
 Any mismatch fails closed. **Order** (#126 review round 3, P2b): every one of these checks reads the disk only, and
 all of them run before anything is imported (`_preflight`: vllm-mlx's pinned files, its package `__init__.py` now
-among them; mlx-lm's or mlx-vlm's; mlx's and mlx-metal's), each package located with `importlib.util.find_spec` of
-its top-level name and the dist-info `RECORD`s, neither of which runs package code. Only then are they imported, and
+among them; mlx-lm's or mlx-vlm's; mlx's and mlx-metal's), each package located through `find_without_import` (the
+import system's own finders, asked directly) and the dist-info `RECORD`s, neither of which runs package code. A dotted
+name is never handed to `importlib.util.find_spec`, which imports the parent first (#126 review round 4, P2a: a shadow
+`mlx/__init__.py` earlier on `sys.path` ran before it was refused): `mlx` must resolve as a top-level name to the
+namespace package whose locations include the pinned folder, and `mlx.nn`, `mlx.utils`, `mlx._reprlib_fix`,
+`mlx.__array_api_info` and `mlx.core` are resolved within those locations to the pinned files. Only then are they
+imported, and
 each import is checked to come from the folder verified (and `mlx.core` to be the pinned extension). Before, importing
 vllm-mlx's scheduler pulled in `mlx.core`, `mlx_lm` and `mlx.nn` ahead of their checks, so a line planted in
 `mlx/nn/__init__.py` ran even though startup then refused. The

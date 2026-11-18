@@ -681,6 +681,8 @@ class FakeVllm(BaseHTTPRequestHandler):
         if self.path == local_gate.RETIRE_PATH:     # the guard's retirement answer (#126 round 3): all ended at once
             FakeVllm.retire_polls.append(body["tickets"])
             return self._json(200, {"retired": body["tickets"], "boot": "fake"})
+        if self.path == local_gate.FENCE_PATH:      # the guard's fence answer (#126 round 4): nothing foreign held
+            return self._json(200, {"clear": True, "unknown": 0, "boot": "fake"})
         FakeVllm.seen.append(("POST", self.path, body))
         FakeVllm.tickets.append(self.headers.get(local_gate.TICKET_HEADER))
         if self.path != "/v1/messages":
@@ -768,6 +770,7 @@ MSG = {"model": TAG, "max_tokens": 16, "messages": [{"role": "user", "content": 
 
 class MlxGateRouteTests(MlxGateHarness):
     def test_tags_come_from_v1_models_in_ollama_shape_with_the_capacity_report(self):
+        self.assertTrue(wait_for(lambda: self.gate.retirer.fenced() is None))   # the startup fence lifted (#126 r4)
         code, raw, _ = self.call("/api/tags")
         self.assertEqual(code, 200)
         data = json.loads(raw)
@@ -776,7 +779,8 @@ class MlxGateRouteTests(MlxGateHarness):
                                                  "draining": False, "owner": None,
                                                  "pressure": None, "reason": "no governor", "reserved_bytes": None,
                                                  "free_bytes": None, "fit_tokens": None, "free_tokens": None,
-                                                 "image_inflight": None, "image_limit": None, "vision": None})
+                                                 "image_inflight": None, "image_limit": None, "vision": None,
+                                                 "fence": None})
         self.assertEqual(FakeVllm.seen, [("GET", "/v1/models", None)])
 
     def test_messages_are_relayed_with_thinking_mapped(self):

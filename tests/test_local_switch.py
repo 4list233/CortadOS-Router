@@ -149,7 +149,8 @@ class GateSwitchTests(Home):
                                              "draining": False, "owner": None,
                                              "pressure": None, "reason": "no governor", "reserved_bytes": None,
                                              "free_bytes": None, "fit_tokens": None, "free_tokens": None,
-                                             "image_inflight": None, "image_limit": None, "vision": None}})
+                                             "image_inflight": None, "image_limit": None, "vision": None,
+                                             "fence": None}})
         self.flag.touch()
         code, data = self.call("GET")
         self.assertEqual((data["switch"], data["allowed"], data["reason"]), ("on", False, "local disabled: on battery"))

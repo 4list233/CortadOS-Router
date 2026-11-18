@@ -327,7 +327,12 @@ class MlxLmPinTests(unittest.TestCase):
         self.assertEqual(set(self.guard.MLX_LM_PINNED_SHA256), {
             "__init__.py", "_version.py", "generate.py", "sample_utils.py", "models/__init__.py", "models/cache.py",
             "models/base.py", "models/qwen3_5.py", "models/qwen3_next.py", "models/gated_delta.py",
-            "models/activations.py", "models/rope_utils.py", "models/switch_layers.py"})
+            "models/activations.py", "models/rope_utils.py", "models/switch_layers.py",
+            # #126 review round 4: the rest of `import mlx_lm` and what loading the tokenizer imports by name
+            "convert.py", "utils.py", "tokenizer_utils.py",
+            "chat_templates/__init__.py", "chat_templates/deepseek_v32.py",
+            *(f"tool_parsers/{n}.py" for n in ("__init__", "function_gemma", "gemma4", "glm47", "json_tools", "kimi_k2",
+                                               "longcat", "minimax_m2", "mistral", "pythonic", "qwen3_coder"))})
         self.assertTrue(all(len(v) == 64 and int(v, 16) >= 0 for v in self.guard.MLX_LM_PINNED_SHA256.values()))
         # the empty models/__init__.py is the sha256 of no bytes
         self.assertEqual(self.guard.MLX_LM_PINNED_SHA256["models/__init__.py"], hashlib.sha256(b"").hexdigest())
@@ -851,9 +856,16 @@ class MlxPythonPinTests(VisionGuardBase):
         other.parent.mkdir(parents=True)
         other.write_text("# a shadowing mlx.nn\n")
         spec = type("Spec", (), {"origin": str(other)})
+        top = type("Top", (), {"origin": None, "submodule_search_locations": [str(Path(self.dir, "mlx"))]})
+        core = str(Path(self.dir, "mlx", "core.py"))
         with self.assertRaisesRegex(self.guard.GuardError, "mlx.nn resolves to"):
-            self.guard.verify_mlx(find_spec=lambda name: spec if name == "mlx.nn" else
-                                  type("S", (), {"origin": str(Path(self.dir, "mlx", name[4:] + ".py"))}))
+            self.guard.verify_mlx(find_spec=lambda name, path: top if name == "mlx" else spec if name == "mlx.nn"
+                                  else type("S", (), {"origin": core if name == "mlx.core" else
+                                                      str(Path(self.dir, "mlx", name[4:] + ".py"))}))
+        regular = type("Top", (), {"origin": str(Path(self.tmp, "mlx", "__init__.py")),
+                                   "submodule_search_locations": [str(Path(self.tmp, "mlx"))]})
+        with self.assertRaisesRegex(self.guard.GuardError, "mlx resolves to .*not the released namespace package"):
+            self.guard.verify_mlx(find_spec=lambda name, path: regular)
         with self.assertRaisesRegex(self.guard.GuardError, "no Python file pins"):
             self.guard.verify_mlx(py_pins={})
 

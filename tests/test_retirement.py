@@ -44,6 +44,10 @@ class GuardState:
         self.retire_status = 200                 # 503: a guard that cannot answer (hung)
         self.hold = threading.Event()
         self.arrived = threading.Semaphore(0)
+        self.fences: list = []                   # the body of each fence query
+        self.fence_status = 200                  # 503: a guard that cannot answer the fence
+        self.floor = 0                           # the highest floor_ms a fence query set
+        self.boot = "b"                          # the guard process (a new value: vllm-mlx restarted)
 
     def release(self, *tickets):
         with self.lock:
@@ -71,12 +75,21 @@ class FakeGuard(BaseHTTPRequestHandler):
     def do_POST(self):
         st = FakeGuard.state
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+        if self.path == local_gate.FENCE_PATH:
+            st.fences.append(body)
+            if st.fence_status != 200:
+                return self._json(st.fence_status, {"detail": "busy"})
+            with st.lock:                         # live tickets the gate does not know: a previous gate's rows
+                unknown = [t for t in st.live if t not in body["known"]]
+                st.floor = max(st.floor, body["floor_ms"])
+                return self._json(200, {"clear": not unknown, "unknown": len(unknown), "boot": st.boot})
         if self.path == local_gate.RETIRE_PATH:
             st.polls.append(list(body["tickets"]))
             if st.retire_status != 200:
                 return self._json(st.retire_status, {"detail": "busy"})
             with st.lock:                         # an id it does not hold (or never saw) is retired
-                return self._json(200, {"retired": [t for t in body["tickets"] if t not in st.live], "boot": "b"})
+                return self._json(200, {"retired": [t for t in body["tickets"] if t not in st.live],
+                                        "boot": st.boot})
         ticket = self.headers.get(local_gate.TICKET_HEADER)
         with st.lock:
             st.tickets.append(ticket)
@@ -265,11 +278,26 @@ class GateRetirementTests(RetireGateBase):
         port = dead.getsockname()[1]
         dead.close()
         gate = self.make_gate(port)
-        conn = http.client.HTTPConnection("127.0.0.1", gate.server_port, timeout=10)
-        conn.request("POST", "/v1/messages", body=json.dumps(msg()).encode(),
-                     headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}"})
-        self.assertEqual(conn.getresponse().status, 502)
-        conn.close()
+
+        def post():
+            conn = http.client.HTTPConnection("127.0.0.1", gate.server_port, timeout=10)
+            conn.request("POST", "/v1/messages", body=json.dumps(msg()).encode(),
+                         headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}"})
+            try:
+                r = conn.getresponse()
+                return r.status, json.loads(r.read())
+            finally:
+                conn.close()
+        # #126 round 4: a guard that cannot be reached cannot lift the startup fence: busy, nothing sent
+        code, data = post()
+        self.assertEqual(code, 529)
+        self.assertIn("did not confirm the fence", data[local_gate.GATE_KEY]["fence"])
+        # the backend went away after the fence lifted: the connect fails, nothing was sent, released at once
+        gate.retirer.stop()
+        self.assertTrue(wait_for(lambda: not gate.retirer._thread.is_alive()))
+        with gate.retirer._cv:
+            gate.retirer._fence = None
+        self.assertEqual(post()[0], 502)
         self.assertTrue(wait_for(lambda: gate.admission.inflight == 0))
         self.assertEqual((gate.admission.retiring, gate.retirer.pending()), (0, []))
 
@@ -297,11 +325,99 @@ class UngovernedRetirementTests(RetireGateBase):
         self.assertTrue(wait_for(lambda: self.adm.inflight == 0))
 
 
+class FenceGateTests(RetireGateBase):
+    """#126 review round 4 (P1b): a gate admits no text turn until the guard confirms no row of a turn it does not know
+    remains (FENCE_PATH), at start and whenever it cannot vouch for the backend's state."""
+
+    def foreign(self, *tickets):
+        with self.st.lock:
+            self.st.live.update(tickets)
+
+    def test_round4_repro_a_restarted_gate_admits_nothing_beside_a_previous_gates_rows(self):
+        # the previous gate's 64k turn survives in the batch; the restarted gate knows nothing of it
+        FakeGuard.state = self.st = GuardState()
+        self.foreign("old-64k-turn")
+        gate = self.make_gate(self.upstream.server_port)
+        self.gate, self.url = gate, f"http://127.0.0.1:{gate.server_port}"
+        for _ in range(2):                                              # two more 64k turns: both refused, busy
+            code, raw = self.call(msg(max_tokens=65536))
+            self.assertEqual(code, 529)
+            cap = json.loads(raw)[local_gate.GATE_KEY]
+            self.assertIn("does not know", cap["fence"])
+            self.assertIn("does not know", json.loads(raw)["error"]["message"])
+        self.assertEqual((self.adm.inflight, self.adm.reserved), (0, 0))
+        self.assertEqual(self.st.tickets, [])                           # nothing reached the backend
+        self.assertIn("does not know", self.report()["fence"])
+        self.assertTrue(self.st.fences)
+        self.assertEqual(self.st.fences[-1], {"floor_ms": gate.retirer.start_ms, "known": []})
+        self.st.release("old-64k-turn")                                 # its rows leave the scheduler
+        self.assertTrue(wait_for(lambda: gate.retirer.fenced() is None))
+        self.assertEqual(self.call(msg())[0], 200)
+        self.assertIsNone(self.report()["fence"])
+
+    def test_the_fence_lifts_when_the_backend_is_empty_and_tickets_are_minted_after_its_floor(self):
+        self.assertEqual(self.call(msg())[0], 200)
+        self.assertEqual(self.st.fences[0], {"floor_ms": self.gate.retirer.start_ms, "known": []})
+        self.assertIsNone(self.report()["fence"])
+        self.assertGreaterEqual(int(self.st.tickets[0][:13]), self.gate.retirer.start_ms)
+        # a clock that went back still mints at or after the floor (the guard refuses ids minted before it)
+        self.assertEqual(local_gate.new_ticket_id(now=1.0, floor_ms=5_000_000_000_000)[:13], "5000000000000")
+
+    def test_a_hung_or_unreachable_guard_keeps_the_fence_up_visibly(self):
+        FakeGuard.state = self.st = GuardState()
+        self.st.fence_status = 503                                      # a guard that cannot answer
+        gate = self.make_gate(self.upstream.server_port)
+        self.gate = gate
+        for _ in range(3):
+            code, raw = self.call(msg())
+            self.assertEqual(code, 529)
+            self.assertIn("did not confirm the fence", json.loads(raw)[local_gate.GATE_KEY]["fence"])
+        self.assertEqual(self.st.tickets, [])
+        self.assertTrue(wait_for(lambda: len(self.st.fences) >= 2))     # the thread keeps asking
+        self.upstream.shutdown()                                        # unreachable altogether
+        self.upstream.server_close()
+        time.sleep(0.3)
+        self.assertIn("did not confirm the fence", gate.retirer.fenced())
+        self.assertIn("did not confirm the fence", gate.capacity()["fence"])
+
+    def test_lost_contact_fences_until_the_guard_answers_again(self):
+        self.assertEqual(self.call(msg())[0], 200)                      # retiring: its rows are still live
+        self.st.retire_status = self.st.fence_status = 503
+        self.assertTrue(wait_for(lambda: self.gate.retirer.fenced() is not None))
+        self.assertIn("lost contact", self.report()["fence"] or "")
+        self.assertEqual(self.call(msg())[0], 529)
+        self.assertEqual(self.adm.retiring, 1)                          # still reserved meanwhile
+        self.st.retire_status = self.st.fence_status = 200              # the guard answers: its row is known
+        self.assertTrue(wait_for(lambda: self.gate.retirer.fenced() is None))
+        self.assertEqual(self.call(msg())[0], 200)
+
+    def test_a_guard_restart_fences_again_and_lifts_with_the_turns_this_gate_knows(self):
+        self.assertEqual(self.call(msg())[0], 200)                      # retiring (live in the batch)
+        self.st.mode = "hold"
+        held = threading.Thread(target=self.call, args=(msg(),))
+        held.start()
+        self.addCleanup(held.join, 10)
+        self.assertTrue(self.st.arrived.acquire(timeout=5))
+        self.assertTrue(self.st.arrived.acquire(timeout=5))
+        fences = len(self.st.fences)
+        with self.st.lock:                                              # a new vllm-mlx process, mid-turn
+            self.st.boot = "b2"
+        self.assertTrue(wait_for(lambda: len(self.st.fences) > fences))
+        self.assertTrue(wait_for(lambda: self.gate.retirer.fenced() is None))
+        last = self.st.fences[-1]
+        self.assertIn(self.st.tickets[1], last["known"])                # the in-flight turn is known
+        self.assertEqual(self.gate.retirer.boot, "b2")
+        self.st.hold.set()
+        held.join(10)
+        self.st.release()                                               # the new process holds none of them
+        self.assertTrue(wait_for(lambda: (self.adm.inflight, self.adm.retiring) == (0, 0)))
+
+
 class RetirerUnitTests(unittest.TestCase):
     def test_only_the_ids_asked_and_confirmed_are_released(self):
         adm = local_governor.Admission(FixedGovernor())
         answers = collections.deque()
-        r = local_gate.Retirer("127.0.0.1", 9, call=lambda ids: answers.popleft(), start=False)
+        r = local_gate.Retirer("127.0.0.1", 9, call=lambda path, body: answers.popleft(), start=False)
         t1 = adm.try_acquire(load=adm.text_load(100, 1))[0]
         t2 = adm.try_acquire(load=adm.text_load(100, 1))[0]
         r.hand_over(t1, "a")
@@ -415,7 +531,7 @@ class HTTPError(Exception):
         self.status_code, self.detail = status_code, detail
 
 
-class GuardLedgerTests(unittest.TestCase):
+class LedgerBase(unittest.TestCase):
     def setUp(self):
         self.guard = load_guard()
         self.now = [time.time()]
@@ -466,6 +582,8 @@ class GuardLedgerTests(unittest.TestCase):
         self.assertEqual(data["boot"], self.ledger.boot)
         return data["retired"]
 
+
+class GuardLedgerTests(LedgerBase):
     def test_normal_completion_retires_after_the_step_that_finished_it(self):
         t = self.tid()
         self.assertEqual(self.http(t), (200, b"ok"))
@@ -628,6 +746,218 @@ class GuardLedgerTests(unittest.TestCase):
                                        type("E", (Engine,), {}), App(), HTTPError)
 
 
+class PausingQueue(collections.deque):
+    """A waiting queue whose next read (iteration) pauses until released: a safe point caught mid-snapshot."""
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.pause_next, self.reading, self.resume, self.during = False, threading.Event(), threading.Event(), None
+
+    def __iter__(self):
+        if self.pause_next:
+            self.pause_next = False
+            self.reading.set()
+            if self.during is not None:
+                self.during()                                           # same thread, mid-read
+            else:
+                self.resume.wait(5)
+        return super().__iter__()
+
+
+class LedgerAtomicityTests(LedgerBase):
+    """#126 review round 4 (P1a): admission (enqueue + entered) and a safe point's snapshot + "gone" transition are
+    atomic with each other (TicketLedger.admit_lock), and a request numbered at or after a snapshot's start is never
+    gone by that snapshot (the entry sequence number)."""
+
+    def setUp(self):
+        super().setUp()
+        self.sched.waiting = PausingQueue()
+        self.sched.step()                                               # watched from its first step
+
+    def state(self, tid):
+        with self.ledger._lock:
+            return [self.ledger._rids[r][1] for r in self.ledger._tickets[tid]["rids"]]
+
+    def admit_in_thread(self, t):
+        out = {}
+        th = threading.Thread(target=lambda: out.setdefault("r", self.http(t)))
+        th.start()
+        return th, out
+
+    def query_paused(self, query):
+        """Start `query` in a thread and pause it inside its scheduler read (after it noted the entry number)."""
+        self.sched.waiting.pause_next = True
+        out = {}
+        th = threading.Thread(target=lambda: out.setdefault("r", query()))
+        th.start()
+        self.assertTrue(self.sched.waiting.reading.wait(5))
+        return th, out
+
+    def test_round4_repro_a_retire_query_racing_admission_never_retires_a_running_request(self):
+        t = self.tid()
+        q, qout = self.query_paused(lambda: self.ledger.retire([t]))    # paused after an empty snapshot began
+        a, aout = self.admit_in_thread(t)                               # a bound request is being enqueued
+        self.assertTrue(wait_for(lambda: t in self.ledger._tickets and self.ledger._tickets[t]["rids"]))
+        time.sleep(0.1)
+        self.assertEqual(self.state(t), ["pending"])                    # held at the admission lock, not queued
+        self.sched.waiting.resume.set()
+        q.join(5)
+        a.join(5)
+        self.assertEqual(aout["r"], (200, b"ok"))
+        self.assertEqual(self.state(t), ["entered"])                    # never marked gone
+        self.sched.step()                                               # running: rows in the batch
+        self.assertEqual(self.retire(t), [])                            # the exchange ended; still not retired
+        self.sched.done.add(self.rids[0])
+        self.sched.step()
+        self.assertEqual(self.retire(t), [t])
+
+    def test_round4_a_step_safe_point_racing_admission_never_marks_it_gone(self):
+        t = self.tid()
+        s, _ = self.query_paused(self.sched.step)                       # the executor's post-step safe point
+        a, aout = self.admit_in_thread(t)                               # an inline add on the event loop
+        self.assertTrue(wait_for(lambda: t in self.ledger._tickets and self.ledger._tickets[t]["rids"]))
+        time.sleep(0.1)
+        self.assertEqual(self.state(t), ["pending"])
+        self.sched.waiting.resume.set()
+        s.join(5)
+        a.join(5)
+        self.assertEqual(self.state(t), ["entered"])
+        self.assertEqual(self.retire(t), [])                            # waiting: rows to come
+        self.sched.step()
+        self.assertEqual(self.retire(t), [])
+
+    def test_round4_a_fence_query_racing_admission_never_reports_clear(self):
+        t = self.tid()
+        q, qout = self.query_paused(lambda: self.ledger.fence(1, []))
+        a, _ = self.admit_in_thread(t)
+        self.assertTrue(wait_for(lambda: t in self.ledger._tickets))
+        self.sched.waiting.resume.set()
+        q.join(5)
+        a.join(5)
+        self.assertFalse(qout["r"]["clear"])                            # the open exchange or its pending request
+        self.assertFalse(self.ledger.fence(1, [])["clear"])             # queued now, from a ticket not known
+        self.assertTrue(self.ledger.fence(1, [t])["clear"])             # known to the gate asking
+
+    def test_round4_an_entry_numbered_after_a_snapshot_began_is_never_gone_by_it(self):
+        # the number check alone (should any add ever run outside the lock): an add completing mid-read
+        t = self.tid()
+        self.assertIsNone(self.ledger.open(t))
+        self.assertIsNone(self.ledger.bind(t, "late"))
+
+        def add_mid_read():                                             # RLock: the same thread may re-enter
+            self.assertTrue(self.ledger.entering("late"))
+            self.ledger.entered("late")
+        self.sched.waiting.pause_next, self.sched.waiting.during = True, add_mid_read
+        self.assertTrue(self.ledger.safe_point())
+        self.assertEqual(self.state(t), ["entered"])                    # not in the snapshot, numbered after it
+        self.assertTrue(self.ledger.safe_point())                       # a later one: it is in no queue, gone
+        self.assertEqual(self.state(t), ["gone"])
+
+    def test_round4_a_query_with_admission_running_answers_from_the_last_safe_point(self):
+        t = self.tid()
+        self.http(t)
+        self.sched.step()
+        self.sched.done.add(self.rids[0])
+        self.sched.step()                                               # gone at this step's safe point
+        with self.ledger.admit_lock:                                    # an add in progress elsewhere
+            th = threading.Thread(target=lambda: self.assertEqual(self.ledger.retire([t]), [t]))
+            th.start()
+            th.join(5)                                                  # answered without waiting for it
+            self.assertFalse(th.is_alive())
+
+
+class LedgerFenceTests(LedgerBase):
+    """#126 review round 4 (P1b), the guard's side: FENCE_PATH raises the floor and says whether a request of a ticket
+    the asking gate does not know may still be in the scheduler."""
+
+    def fence(self, floor_ms, known=()):
+        code, raw = self.http(None, path=self.guard.FENCE_PATH,
+                              body=json.dumps({"floor_ms": floor_ms, "known": list(known)}).encode())
+        self.assertEqual(code, 200)
+        data = json.loads(raw)
+        self.assertEqual(data["boot"], self.ledger.boot)
+        return data
+
+    def test_round4_repro_a_previous_gates_running_row_keeps_the_fence_up(self):
+        old = self.tid(age=1.0)
+        self.http(old)                                                  # the old gate's 64k turn
+        self.sched.step()                                               # running; that gate is gone
+        start = int(self.now[0] * 1000)
+        got = self.fence(start)
+        self.assertEqual((got["clear"], got["unknown"]), (False, 1))
+        self.assertEqual(self.http(self.tid(age=2.0))[0], 409)          # minted before the floor: refused
+        self.assertEqual(self.fence(start)["clear"], False)
+        self.sched.done.add(self.rids[0])
+        self.sched.step()                                               # its rows leave
+        self.assertTrue(self.fence(start)["clear"])
+        self.assertEqual(self.ledger._tickets[old]["state"], "closed")   # below the floor: nobody will ask
+        self.assertEqual(self.http(local_gate.new_ticket_id(self.now[0], start))[0], 200)
+
+    def test_an_open_exchange_or_a_queued_request_of_an_unknown_ticket_is_not_clear(self):
+        t = self.tid()
+        self.assertIsNone(self.ledger.open(t))
+        self.assertFalse(self.fence(1)["clear"])                        # open: it may still bind
+        self.assertTrue(self.fence(1, [t])["clear"])
+        self.ledger.ended(t)
+        self.assertTrue(self.fence(1)["clear"])                         # nothing bound, exchange over
+        self.assertEqual(self.fence(5)["floor_ms"], 5)
+        self.assertEqual(self.fence(3)["floor_ms"], 5)                  # the floor never goes down
+
+    def test_a_hung_step_keeps_unknown_rows_unclear(self):
+        old = self.tid()
+        self.http(old)
+        self.sched.step()
+        self.sched.done.add(self.rids[0])
+        with self.ledger.step_lock:                                     # a step that never returns
+            th = threading.Thread(target=lambda: self.assertFalse(self.ledger.fence(1, [])["clear"]))
+            th.start()
+            th.join(5)
+            self.assertFalse(th.is_alive())
+
+    def test_the_fence_endpoint_takes_a_bounded_post_only(self):
+        path = self.guard.FENCE_PATH
+        self.assertEqual(self.http(None, method="GET", path=path)[0], 405)
+        for body in (b"[1]", b'{"floor_ms": "1", "known": []}', b'{"floor_ms": 1}', b'{"floor_ms": true, "known": []}'):
+            self.assertEqual(self.http(None, path=path, body=body)[0], 400, body)
+        big = json.dumps({"floor_ms": 1, "known": ["x" * 1000] * 2000}).encode()
+        self.assertEqual(self.http(None, path=path, body=big)[0], 413)
+
+
+class LedgerBoundTests(LedgerBase):
+    """#126 review round 4 (P2b): at most TICKET_MAX ids are tracked on every insert path, and an evicted tombstone
+    cannot be replayed (the floor rises past every evicted id)."""
+
+    def test_round4_repro_tombstones_stay_within_the_bound_and_are_never_replayed(self):
+        cap = self.guard.TICKET_MAX
+        ids = [self.tid(age=300 - i * 0.03) for i in range(cap + 100)]  # distinct, fresh, increasing
+        self.assertEqual(self.ledger.retire(ids[:cap]), ids[:cap])      # 8192 tombstones
+        for t in ids[cap:]:                                             # 100 more queries of unknown ids
+            self.assertEqual(self.ledger.retire([t]), [t])
+            self.assertLessEqual(len(self.ledger._tickets), cap)
+        self.assertLessEqual(len(self.ledger._tickets), cap)
+        for t in ids[:150] + ids[-3:]:                                  # evicted or still tracked: refused
+            self.assertIsNotNone(self.ledger.open(t))
+        self.assertEqual(self.http(ids[0])[0], 409)
+        self.assertEqual(self.ledger.retire([ids[0]]), [ids[0]])        # below the floor: retired, not tracked
+        self.assertLessEqual(len(self.ledger._tickets), cap)
+
+    def test_open_turns_are_never_evicted_and_an_untrackable_id_is_not_retired(self):
+        with patch.object(self.guard, "TICKET_MAX", 8):
+            live = [self.tid(age=10 - i) for i in range(8)]
+            for t in live:
+                self.assertIsNone(self.ledger.open(t))                  # 8 exchanges open
+            extra = self.tid()
+            self.assertEqual(self.ledger.retire([extra]), [])           # cannot be tombstoned: not retired
+            self.assertEqual(self.ledger.open(extra), "too many tickets tracked")
+            self.assertEqual(len(self.ledger._tickets), 8)
+            self.ledger.ended(live[0])
+            self.assertEqual(self.ledger.retire([live[0]]), [live[0]])  # closed: evictable now
+            self.assertEqual(self.ledger.retire([extra]), [extra])
+            self.assertEqual(len(self.ledger._tickets), 8)
+            self.assertIsNotNone(self.ledger.open(live[0]))             # evicted, below the floor: refused
+            self.assertIsNotNone(self.ledger.open(extra))               # tombstoned: refused
+
+
 # ------------------------------------------------------------------------------------------------ import order (P2b)
 
 
@@ -640,7 +970,8 @@ class ImportOrderTests(VisionGuardBase):
         lm_pins = write_lm(self.dir, self.guard.MLX_LM_PINNED_SHA256)
         # the released import chain: vllm_mlx.scheduler imports mlx_lm, whose __init__ imports mlx.nn (via generate)
         init = Path(self.dir, "mlx_lm", "__init__.py")
-        init.write_text('import mlx.nn\n__version__ = "0.31.3"\n')
+        # round 4: and convert, utils and tokenizer_utils, which __init__ imports too (each pinned)
+        init.write_text('import mlx.nn\nfrom . import convert, utils, tokenizer_utils\n__version__ = "0.31.3"\n')
         lm_pins["__init__.py"] = self._sha("mlx_lm", "__init__.py")
         sched = Path(self.dir, "vllm_mlx", "scheduler.py")
         sched.write_text("import mlx_lm\nimport mlx.core\n" + sched.read_text())
@@ -670,7 +1001,9 @@ class ImportOrderTests(VisionGuardBase):
         import sys
         self.assertIn("mlx.nn", sys.modules)                             # imported, after the checks
         for pkg, rel in (("mlx", "nn/__init__.py"), ("mlx", "nn/layers/activations.py"), ("mlx", "utils.py"),
-                         ("mlx_lm", "__init__.py"), ("mlx_lm", "generate.py"), ("vllm_mlx", "__init__.py"),
+                         ("mlx_lm", "__init__.py"), ("mlx_lm", "generate.py"), ("mlx_lm", "convert.py"),
+                         ("mlx_lm", "utils.py"), ("mlx_lm", "tokenizer_utils.py"),
+                         ("mlx_lm", "tool_parsers/qwen3_coder.py"), ("vllm_mlx", "__init__.py"),
                          ("vllm_mlx", "scheduler.py")):
             for argv in (SERVE_TEXT, ["--check", "/models/text"]):
                 with self.subTest(f"{pkg}/{rel} {argv[0]}"):
@@ -687,6 +1020,56 @@ class ImportOrderTests(VisionGuardBase):
                     self.assertFalse(self.marker.exists(), f"{pkg}/{rel} ran before its pin was checked")
                     self.assertNotIn("mlx.nn", sys.modules)
                     self.assertNotIn("mlx_lm", sys.modules)
+
+    def shadow(self, rel):
+        """A folder earlier on sys.path holding `rel` (e.g. mlx/__init__.py) that writes the marker when run."""
+        import importlib
+        import sys
+        import tempfile
+        root = tempfile.mkdtemp(dir=self.tmp)
+        path = Path(root, *rel.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"open({str(self.marker)!r}, 'w').write('ran')\n")
+        sys.path.insert(0, root)
+        importlib.invalidate_caches()
+        self.addCleanup(lambda: root in sys.path and sys.path.remove(root))
+        self.addCleanup(importlib.invalidate_caches)
+        return root
+
+    def test_round4_repro_a_shadow_mlx_parent_never_runs(self):
+        import sys
+        for rel, why in (("mlx/__init__.py", "mlx resolves to"),          # a regular package shadowing the namespace
+                         ("mlx/nn/__init__.py", "mlx.nn resolves to"),    # an earlier namespace portion's mlx.nn
+                         ("mlx/core.py", "mlx.core resolves to"),         # ... or its mlx.core
+                         ("mlx.py", "mlx resolves to")):                  # a plain module named mlx
+            for argv in (SERVE_TEXT, ["--check", "/models/text"]):
+                with self.subTest(f"{rel} {argv[0]}"):
+                    self._clean()
+                    root = self.shadow(rel)
+                    try:
+                        rc, err = self.run_main(argv)
+                    finally:
+                        sys.path.remove(root)
+                    self.assertEqual(rc, 2, err)
+                    self.assertIn(why, err)
+                    self.assertFalse(self.marker.exists(), f"a shadow {rel} ran before mlx was verified")
+                    self.assertNotIn("mlx", sys.modules)
+        self._clean()
+        self.assertEqual(self.run_main(SERVE_TEXT)[0], 0)                 # the shadow gone: it serves
+
+    def test_round4_an_unreleased_module_in_mlx_lms_by_name_folders_is_refused(self):
+        for folder in ("tool_parsers", "chat_templates"):
+            with self.subTest(folder):
+                self._clean()
+                extra = Path(self.dir, "mlx_lm", folder, "planted.py")
+                extra.write_text(f"open({str(self.marker)!r}, 'w').write('ran')\n")
+                try:
+                    rc, err = self.run_main(SERVE_TEXT)
+                finally:
+                    extra.unlink()
+                self.assertEqual(rc, 2, err)
+                self.assertIn(f"mlx_lm/{folder}/planted.py is not in the 0.31.3 release", err)
+                self.assertFalse(self.marker.exists())
 
     def test_the_released_mlx_nn_init_is_pinned(self):
         # mlx.nn is a regular package in every 0.32.4 wheel (its __init__ imports the layers): pinned by hash, while

@@ -701,9 +701,10 @@ def verify_mlx_files(find: Any = None, pins: dict | None = None, metal_pins: dic
     them, and the mlx.core imported (`core_file`, else mlx.core.__file__) that very file, beside that libmlx.dylib.
     Then mlx's Python side (MLX_PY_PINNED_SHA256, #126 review round 2): every pinned file beside that mlx.core equal
     to the release's bytes, no mlx/__init__.py, and the chain's entry modules (MLX_PY_MODULES) resolving to those
-    files (`find_spec`, importlib.util.find_spec: loads no mlx module code). `find` is importlib.metadata.distribution
-    (tests pass a fake). Disk only (#126 review round 3, P2b): nothing of mlx is imported here. Returns (the mlx wheel
-    tag, the pinned mlx.core file, the pinned libmlx.dylib) for verify_mlx_core."""
+    files (`find_spec`, find_without_import: loads no module code, not even mlx's parent). `find` is
+    importlib.metadata.distribution (tests pass a fake). Disk only (#126 review round 3, P2b): nothing of mlx is
+    imported here. Returns (the mlx wheel tag, the pinned mlx.core file, the pinned libmlx.dylib) for verify_mlx_core.
+    """
     if find is None:
         from importlib import metadata
         find = metadata.distribution
@@ -749,7 +750,7 @@ def verify_mlx_files(find: Any = None, pins: dict | None = None, metal_pins: dic
     # mlx's Python side, checked beside the pinned extension before `import mlx.core` runs mlx._reprlib_fix
     pinned_core = next(iter(mlx_paths.values()))
     verify_mlx_python(os.path.dirname(pinned_core), mlx_tag, MLX_PY_PINNED_SHA256 if py_pins is None else py_pins,
-                      find_spec)
+                      find_spec, pinned_core)
     return mlx_tag, pinned_core, metal_paths["mlx/lib/libmlx.dylib"]
 
 
@@ -767,9 +768,31 @@ def verify_mlx_core(pinned_core: str, pinned_lib: str, core_file: Any = None) ->
         raise GuardError("the imported mlx.core does not sit beside the pinned mlx-metal libmlx.dylib")
 
 
-def verify_mlx_python(mlx_dir: str, tag: str, table: dict, find_spec: Any = None) -> None:
+def find_without_import(fullname: str, path: Any = None) -> Any:
+    """The spec importlib would use for `fullname`, searching `path` (the parent package's search locations; None for
+    a top-level name), WITHOUT importing anything (#126 review round 4, P2a): importlib.util.find_spec("a.b") imports
+    the parent `a` first, so a shadow a/__init__.py earlier on sys.path would run before any check. This asks the same
+    finders the import system asks, in its order (sys.meta_path: the path finder walks sys.path / `path` through the
+    path hooks), and none of them executes module code. A name already imported answers with its module's spec."""
+    mod = sys.modules.get(fullname)
+    if mod is not None:
+        return getattr(mod, "__spec__", None)
+    for finder in sys.meta_path:
+        find = getattr(finder, "find_spec", None)
+        if find is None:
+            continue
+        spec = find(fullname, path, None)
+        if spec is not None:
+            return spec
+    return None
+
+
+def verify_mlx_python(mlx_dir: str, tag: str, table: dict, find_spec: Any = None, core: str | None = None) -> None:
     """GuardError unless mlx's Python files in `mlx_dir` (the pinned mlx.core's folder) are the released 0.32.4's
-    for this wheel tag, mlx is still a namespace package there, and MLX_PY_MODULES import from those files."""
+    for this wheel tag, mlx is still a namespace package there, and MLX_PY_MODULES (and mlx.core: `core`, the pinned
+    extension) resolve to those files. Nothing is imported (#126 review round 4, P2a): `mlx` is resolved as a top-level
+    name, which must be a namespace package whose search locations include `mlx_dir`, and each submodule within those
+    locations (`find_spec(fullname, path)`, find_without_import; tests pass a fake)."""
     if tag not in table:
         raise GuardError(f"mlx {MLX_VERSION}: no Python file pins for wheel tag {tag!r}")
     files = {}
@@ -785,17 +808,30 @@ def verify_mlx_python(mlx_dir: str, tag: str, table: dict, find_spec: Any = None
         files[rel] = os.path.realpath(path)
     if os.path.lexists(os.path.join(mlx_dir, "__init__.py")):
         raise GuardError(f"mlx/__init__.py exists: no released {MLX_VERSION} wheel has one (it would run on import)")
-    if find_spec is None:
-        from importlib.util import find_spec
-    for name in MLX_PY_MODULES:
-        rel = "nn/__init__.py" if name == "nn" else f"{name}.py"
+    find = find_spec or find_without_import
+    try:
+        top = find("mlx", None)
+    except (ImportError, ValueError) as exc:
+        raise GuardError(f"mlx cannot be resolved ({type(exc).__name__})") from None
+    origin = getattr(top, "origin", None)
+    locations = list(getattr(top, "submodule_search_locations", None) or [])
+    if top is None or origin not in (None, "namespace"):
+        raise GuardError(f"mlx resolves to {origin!r}, not the released namespace package (a shadowing mlx would "
+                         "run on import)")
+    if os.path.realpath(mlx_dir) not in {os.path.realpath(str(p)) for p in locations}:
+        raise GuardError(f"mlx's search locations {locations!r} do not include the pinned {mlx_dir!r}")
+    want = {name: files.get("nn/__init__.py" if name == "nn" else f"{name}.py") for name in MLX_PY_MODULES}
+    if core is not None:
+        want["core"] = os.path.realpath(core)
+    for name, pinned in want.items():
         try:
-            spec = find_spec(f"mlx.{name}")
+            spec = find(f"mlx.{name}", locations)
         except (ImportError, ValueError) as exc:
             raise GuardError(f"mlx.{name} cannot be resolved ({type(exc).__name__})") from None
         origin = getattr(spec, "origin", None)
-        if not origin or os.path.realpath(origin) != files.get(rel):
-            raise GuardError(f"mlx.{name} resolves to {origin!r}, not the pinned mlx/{rel}")
+        if not origin or pinned is None or os.path.realpath(origin) != pinned:
+            raise GuardError(f"mlx.{name} resolves to {origin!r}, not the pinned mlx/"
+                             f"{os.path.relpath(pinned, mlx_dir) if pinned else name}")
 
 
 def load_image_check() -> Any:
@@ -1295,7 +1331,29 @@ MLX_LM_PINNED_SHA256 = {
     "models/activations.py": "dbca5bae41ba0a8380a53903c3e98da37c1e15b46383bc2edb5806ba94fafe72",
     "models/rope_utils.py": "9f68c938c040fa111d13f2ed95c70e8261515fb3b54f8a0a474c096baf4e087a",
     "models/switch_layers.py": "073a6a808d5c90bb699a2ecca0e559b06727ae96dbc1f0253e4c7e77e4ee1ef2",
+    # #126 review round 4: the rest of what `import mlx_lm` runs (__init__ imports convert, generate and utils; they
+    # import tokenizer_utils) and what loading the model and its tokenizer imports by name (tokenizer_utils.load:
+    # mlx_lm.tool_parsers.<inferred or named parser>, mlx_lm.chat_templates.<named template>): every such file pinned
+    "convert.py": "dc60df164c2d51ee2f05f5f9f3324bc3a44a59dd2ccddb75dde680e854ce5e9a",
+    "utils.py": "ba0371e9c88d52b34d71271945c2394005fbcb2bfb2ee9f6f82d627a33b72422",
+    "tokenizer_utils.py": "25784bb03c922d0d7832ce6c66a6cd4eb3a4820b6c5a8e583dedb63a018fb56a",
+    "tool_parsers/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tool_parsers/function_gemma.py": "b8531d412cb87d1ceaecd5e2d15b162ff8036e093a4daa9e3f872d005191defc",
+    "tool_parsers/gemma4.py": "8806c0593a9ababb7f8617a2ffcb9c50f19a0cebdf659124691adba6e09c826c",
+    "tool_parsers/glm47.py": "4007036f3b6440aea56cac6cd2f5ab590b9be941dacd630ba9c01e5f67475b66",
+    "tool_parsers/json_tools.py": "398c044ebd6bbb5578131d57817753d70b43803da509c14d12a2591e01d9cdb1",
+    "tool_parsers/kimi_k2.py": "7d02c9fef2b43d18b5b74261e774943d0ad85a05ea50b92764fb1ee821976206",
+    "tool_parsers/longcat.py": "dcf25a84edd35b92b7df8dceef424e12930828159ad315a67dd997d90f2fc531",
+    "tool_parsers/minimax_m2.py": "db2bd5cd0286ca66881bf363612f65c2a42d0d681d8f1a5e9b442f847066e60f",
+    "tool_parsers/mistral.py": "df143d4bcadadb22291b0d634f485c714065d973aae129f0b6ba789e81fc92b0",
+    "tool_parsers/pythonic.py": "14cf949cac8ba3ce7366fa9f692213f300c1103db5642b4c56af67ca8f0ef13d",
+    "tool_parsers/qwen3_coder.py": "32de6d9f7472a1f00a2acfaacaf13e0e0864cfc19adebbff688ac5004b8ecc25",
+    "chat_templates/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "chat_templates/deepseek_v32.py": "4df892725d65d936044d70d365e9a78eb0e10f201059120c7b0b965e66f669b7",
 }
+# mlx-lm's own module directories whose every .py the pins above must cover (a file added there, e.g. a new tool
+# parser a tokenizer could name, is refused: verify_text)
+MLX_LM_PINNED_DIRS = ("tool_parsers", "chat_templates")
 TEXT_FLAGS = {"--text-prefill-tokens": "prefill_tokens", "--buffer-cache-bytes": "buffer_cache_bytes"}
 # The one verified text geometry (local_governor.TEXT_DIMS, the same values): the Pro's Qwen3.8 27B text_config. A key
 # config.json leaves out takes mlx-lm 0.31.3's TextModelArgs default (models/qwen3_5.py 25-70) when that default is the
@@ -1397,6 +1455,8 @@ def check_text_model(model_dir: Any) -> None:
         if isinstance(got, bool) or got != want:
             raise GuardError(f"text route: config.json {key} is {got!r}, but the gate's text reservation was computed "
                              f"for {want} (TEXT_DIMS); a different model needs its own reservation")
+    if "model_file" in cfg:                   # mlx-lm would execute that file from the model folder (utils.load_model)
+        raise GuardError("text route: config.json names a model_file; the text route runs mlx-lm's pinned qwen3_5 only")
     if text.get("num_experts", 0):
         raise GuardError("text route: config.json names experts; the text reservation is for the dense model")
     for where in (text, cfg):
@@ -1420,6 +1480,16 @@ def verify_text(lm_dir: str, lm_version: str | None, pins: dict | None = None) -
             raise GuardError(f"mlx_lm/{rel} unreadable ({type(exc).__name__})") from None
         if got != want:
             raise GuardError(f"mlx_lm/{rel} differs from the {MLX_LM_VERSION} release the guard was written against")
+    table = MLX_LM_PINNED_SHA256 if pins is None else pins
+    for folder in MLX_LM_PINNED_DIRS if table else ():     # {}: the version only (the files were checked before)
+        try:
+            names = sorted(os.listdir(os.path.join(lm_dir, folder)))
+        except OSError:
+            names = []
+        for name in names:
+            if name.endswith((".py", ".pyc", ".so")) and f"{folder}/{name}" not in table:
+                raise GuardError(f"mlx_lm/{folder}/{name} is not in the {MLX_LM_VERSION} release the guard was "
+                                 "written against (a tokenizer could import it by name)")
 
 
 def text_prefill_problem(bg: Any) -> str | None:
@@ -1519,12 +1589,29 @@ def install_text(policy: TextPolicy, scheduler_cls: Any, batched_module: Any) ->
 #     closed: nothing more may bind to it). An id this process never saw is tombstoned (refused should it still arrive)
 #     and retired: it never entered this process's scheduler, and a previous process's rows went with that process (a
 #     backend restart clears every retiring ticket). Nothing else is retired: a hung step keeps its tickets reserved.
+# Atomicity (#126 review round 4, P1a). Admission and the "gone" transition exclude each other: Scheduler.add_request
+# (entering, the scheduler's own add, entered) runs under TicketLedger.admit_lock, and so does every safe point from the
+# moment it notes the entry sequence until it has marked what is gone. Each request is numbered as its add completes
+# (entered: its entry sequence number); a safe point notes the next number before it reads the scheduler and may mark
+# gone only a request numbered below it, i.e. one whose add had completed (so it was queued) before the read began. The
+# lock makes the number check redundant; the number keeps it true should any path ever add outside the lock. The retire
+# query takes the step lock and the admit lock without waiting: with either busy it answers from the last safe point.
+# The fence (#126 review round 4, P1b). A gate that has just started (or lost track of this process) knows none of the
+# rows a previous gate's turns left here, so it admits no text turn until POST FENCE_PATH {"floor_ms": N, "known":
+# [ids]} answers {"clear": true}: from then on no ticket minted before N is admitted (the floor; the gate mints at or
+# after its own start), and, atomically with setting it, no request bound to a ticket outside `known` is pending,
+# queued or in the scheduler, and no such ticket's exchange is open. Otherwise: {"clear": false, "unknown": n}.
+# Bounded (#126 review round 4, P2b): at most TICKET_MAX ids are tracked. A closed id (and an ended one below the floor
+# whose requests are all gone: no live gate can ask about it) may be evicted, oldest first; the floor then rises past
+# every evicted id, and an id below the floor is refused on arrival and, unknown, retired without being tracked: an
+# evicted tombstone can never be replayed. An unknown id that cannot be tracked (every slot an open turn): not retired.
 TICKET_HEADER = "x-cortados-ticket"
 RETIRE_PATH = "/cortados/retire"
+FENCE_PATH = "/cortados/fence"
 TICKET_REFUSAL = "cortados guard: a request needs a fresh gate ticket"
 TICKET_MAX_AGE_S = 600.0            # a ticket older than this on arrival is refused (its gate turn is long given up)
 TICKET_SKEW_S = 60.0                # a ticket minted this far in the future is refused too
-TICKET_MAX = 8192                   # ids tracked at once (open, ended and tombstoned); beyond it new requests are refused
+TICKET_MAX = 8192                   # ids tracked at once (open, ended, closed and tombstoned): a hard bound
 RETIRE_MAX_BODY = 1 << 20
 
 
@@ -1539,10 +1626,16 @@ def _ticket_problem(tid: Any, now: float) -> str | None:
     return None
 
 
+def _ticket_ms(tid: str) -> int:
+    return int(tid[:13])
+
+
 class TicketLedger:
     """The tickets this process has seen and the scheduler requests bound to them (the retirement protocol above).
-    One lock guards it; it is touched from the event loop (middleware, EngineCore.add_request, the retire query) and
-    the executor thread (Scheduler.add_request, the step safe point). `clock` is time.time (tests pass a fake)."""
+    `_lock` guards the records; it is touched from the event loop (middleware, EngineCore.add_request, the retire and
+    fence queries) and the executor thread (Scheduler.add_request, the step safe point). `admit_lock` makes admission
+    and a safe point's read-and-mark atomic (P1a above); lock order: step_lock, admit_lock, _lock. `clock` is
+    time.time (tests pass a fake)."""
 
     def __init__(self, clock: Any = None):
         import threading
@@ -1551,17 +1644,46 @@ class TicketLedger:
         self._clock = clock or __import__("time").time
         self._lock = threading.Lock()
         self.step_lock = threading.RLock()     # held across every Scheduler.step(): its end is the safe point
+        self.admit_lock = threading.RLock()    # Scheduler.add_request, and a safe point's snapshot + transition
         self._tickets: dict = {}               # id -> {"state": open | ended | closed, "rids": set()}
-        self._rids: dict = {}                  # scheduler request id -> [ticket id, pending | adding | entered | gone | closed]
+        # scheduler request id -> [ticket id, pending | adding | entered | gone | closed, entry sequence number]
+        self._rids: dict = {}
+        self._seq = 0                          # the next entry sequence number
+        self.floor_ms = 0                      # an id minted before this is never admitted (fence, eviction)
         self._schedulers = weakref.WeakSet()
         self.boot = uuid.uuid4().hex
 
-    def _prune_locked(self, now: float) -> None:
-        for tid in [t for t, rec in self._tickets.items() if rec["state"] == "closed"
-                    and now - int(t[:13]) / 1000 > 2 * TICKET_MAX_AGE_S]:
+    # ---- the bound (P2b)
+    def _done_locked(self, rec: dict) -> bool:
+        return all(self._rids.get(rid, [None, "gone"])[1] in ("gone", "closed") for rid in rec["rids"])
+
+    def _evictable_locked(self, tid: str, rec: dict) -> bool:
+        return rec["state"] == "closed" or (rec["state"] == "ended" and _ticket_ms(tid) < self.floor_ms
+                                            and self._done_locked(rec))
+
+    def _evict_locked(self, tids: list) -> None:
+        for tid in tids:
             for rid in self._tickets.pop(tid)["rids"]:
                 self._rids.pop(rid, None)
+            self.floor_ms = max(self.floor_ms, _ticket_ms(tid) + 1)
 
+    def _room_locked(self, now: float) -> bool:
+        """True when one more id may be tracked (evicting what may go, oldest first): the bound, on every insert."""
+        if len(self._tickets) < TICKET_MAX:
+            return True
+        old = sorted((t for t, rec in self._tickets.items() if self._evictable_locked(t, rec)), key=_ticket_ms)
+        if not old:
+            return False
+        # every id past the age (refused on arrival anyway) and at least the oldest quarter (amortised: a flood of
+        # tombstones costs O(log n) per id); `old` is sorted, so the stale ids are its prefix
+        n = max(sum(1 for t in old if now - _ticket_ms(t) / 1000 > TICKET_MAX_AGE_S), max(1, len(old) // 4))
+        self._evict_locked(old[:n])
+        return len(self._tickets) < TICKET_MAX
+
+    def _below_floor(self, tid: str) -> bool:
+        return _ticket_ms(tid) < self.floor_ms
+
+    # ---- the exchange
     def open(self, tid: Any) -> str | None:
         """Admit a request carrying `tid`: None, or why it is refused (nothing of it reaches vllm-mlx)."""
         now = self._clock()
@@ -1569,12 +1691,10 @@ class TicketLedger:
         if why is not None:
             return why
         with self._lock:
-            if tid in self._tickets:
-                return "a ticket id already used or retired"
-            if len(self._tickets) >= TICKET_MAX:
-                self._prune_locked(now)
-                if len(self._tickets) >= TICKET_MAX:
-                    return "too many tickets tracked"
+            if tid in self._tickets or self._below_floor(tid):
+                return "a ticket id already used, retired or minted before the gate's fence"
+            if not self._room_locked(now):
+                return "too many tickets tracked"
             self._tickets[tid] = {"state": "open", "rids": set()}
         return None
 
@@ -1594,7 +1714,7 @@ class TicketLedger:
             if rid in self._rids:
                 return "a request id already bound"
             rec["rids"].add(rid)
-            self._rids[rid] = [tid, "pending"]
+            self._rids[rid] = [tid, "pending", None]
         return None
 
     def add_exited(self, rid: str) -> None:
@@ -1605,7 +1725,8 @@ class TicketLedger:
                 got[1] = "closed"
 
     def entering(self, rid: str) -> bool:
-        """Scheduler.add_request is about to queue `rid`: False (refuse it) unless it is bound and still pending."""
+        """Scheduler.add_request is about to queue `rid` (admit_lock held): False (refuse it) unless it is bound and
+        still pending."""
         with self._lock:
             got = self._rids.get(rid)
             if got is None or got[1] != "pending":
@@ -1614,11 +1735,13 @@ class TicketLedger:
             return True
 
     def entered(self, rid: str) -> None:
-        """Scheduler.add_request returned or raised: whether it is queued is the safe point's to say."""
+        """Scheduler.add_request returned or raised (admit_lock held): whether it is queued is the safe point's to
+        say; it is numbered now, so only a safe point that starts after this may find it gone."""
         with self._lock:
             got = self._rids.get(rid)
             if got is not None and got[1] == "adding":
-                got[1] = "entered"
+                got[1], got[2] = "entered", self._seq
+                self._seq += 1
 
     def watch(self, scheduler: Any) -> None:
         with self._lock:
@@ -1636,29 +1759,41 @@ class TicketLedger:
             return None
         return ids
 
-    def safe_point(self) -> None:
-        """At a scheduler safe point (after a step, with the step lock held, or with no step running): every entered
-        request no scheduler holds any more is gone."""
-        live = set()
-        with self._lock:
-            schedulers = list(self._schedulers)
-        for sched in schedulers:
-            ids = self._live_ids(sched)
-            if ids is None:
-                return
-            live |= ids
-        with self._lock:
-            for rid, got in self._rids.items():
-                if got[1] == "entered" and rid not in live:
-                    got[1] = "gone"
+    def safe_point(self, blocking: bool = True) -> bool:
+        """At a scheduler safe point (after a step, with the step lock held, or with no step running): every request
+        that entered before this check began and that no scheduler holds any more is gone. Atomic with admission
+        (admit_lock); `blocking` False: skipped (False) while an admission holds it. True when the check ran."""
+        if not self.admit_lock.acquire(blocking=blocking):
+            return False
+        try:
+            with self._lock:
+                start = self._seq
+                schedulers = list(self._schedulers)
+            live = set()
+            for sched in schedulers:
+                ids = self._live_ids(sched)
+                if ids is None:
+                    return False
+                live |= ids
+            with self._lock:
+                for rid, got in self._rids.items():
+                    if got[1] == "entered" and got[2] is not None and got[2] < start and rid not in live:
+                        got[1] = "gone"
+            return True
+        finally:
+            self.admit_lock.release()
+
+    def _fresh_safe_point(self) -> None:
+        """A query's own safe point when no step and no admission is running (neither lock is waited for)."""
+        if self.step_lock.acquire(blocking=False):
+            try:
+                self.safe_point(blocking=False)
+            finally:
+                self.step_lock.release()
 
     def retire(self, ids: Any) -> list:
         """The retire query (RETIRE_PATH): which of `ids` are retired, closing them (module comment above)."""
-        if self.step_lock.acquire(blocking=False):      # no step running: the scheduler is at rest, check it now
-            try:
-                self.safe_point()
-            finally:
-                self.step_lock.release()
+        self._fresh_safe_point()
         now = self._clock()
         out = []
         with self._lock:
@@ -1667,23 +1802,42 @@ class TicketLedger:
                     continue
                 rec = self._tickets.get(tid)
                 if rec is None:
-                    if _ticket_problem(tid, now) is None:       # tombstone: refused should it still arrive
-                        if len(self._tickets) >= TICKET_MAX:
-                            self._prune_locked(now)
+                    if _ticket_problem(tid, now) is not None or self._below_floor(tid):
+                        out.append(tid)                     # never admitted here, and never will be: not tracked
+                    elif self._room_locked(now):            # tombstone: refused should it still arrive
                         self._tickets[tid] = {"state": "closed", "rids": set()}
-                    out.append(tid)
-                    continue
+                        out.append(tid)
+                    continue                                # no room: not retired (the gate keeps it reserved)
                 if rec["state"] == "open":
                     continue
-                if all(self._rids.get(rid, [None, "gone"])[1] in ("gone", "closed") for rid in rec["rids"]):
+                if self._done_locked(rec):
                     rec["state"] = "closed"
                     out.append(tid)
         return out
 
+    def fence(self, floor_ms: Any, known: Any) -> dict:
+        """The fence query (FENCE_PATH, module comment above): raise the floor to `floor_ms`, then say whether any
+        request bound to a ticket outside `known` may still be in the scheduler or reach it."""
+        self._fresh_safe_point()
+        known = {t for t in known if isinstance(t, str)} if isinstance(known, list) else set()
+        with self._lock:
+            if isinstance(floor_ms, int) and not isinstance(floor_ms, bool) and floor_ms > 0:
+                self.floor_ms = max(self.floor_ms, floor_ms)
+            unknown = 0
+            for tid, rec in self._tickets.items():
+                if tid in known:
+                    continue
+                if rec["state"] == "open" or not self._done_locked(rec):
+                    unknown += 1
+                elif rec["state"] == "ended" and self._below_floor(tid):
+                    rec["state"] = "closed"                  # its gate is gone: nothing will ever ask about it
+            return {"clear": unknown == 0, "unknown": unknown, "floor_ms": self.floor_ms}
+
 
 class TicketMiddleware:
-    """The outermost ASGI layer of the text route's server (install_tickets): RETIRE_PATH is answered here, a request
-    that may generate is refused without a fresh ticket, and an admitted one runs with its ticket in CURRENT_TICKET."""
+    """The outermost ASGI layer of the text route's server (install_tickets): RETIRE_PATH and FENCE_PATH are answered
+    here, a request that may generate is refused without a fresh ticket, and an admitted one runs with its ticket in
+    CURRENT_TICKET."""
 
     def __init__(self, app: Any, ledger: TicketLedger, current: Any):
         self.app, self.ledger, self.current = app, ledger, current
@@ -1695,7 +1849,7 @@ class TicketMiddleware:
                     "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(raw)).encode())]})
         await send({"type": "http.response.body", "body": raw})
 
-    async def _retire(self, receive: Any, send: Any) -> None:
+    async def _query(self, receive: Any, send: Any, fence: bool) -> None:
         import json
         body, more = b"", True
         while more:
@@ -1707,9 +1861,15 @@ class TicketMiddleware:
             if len(body) > RETIRE_MAX_BODY:
                 return await self._answer(send, 413, {"detail": "retire query too large"})
         try:
-            ids = json.loads(body).get("tickets")
-        except (ValueError, AttributeError):
-            ids = None
+            data = json.loads(body)
+        except ValueError:
+            data = None
+        if fence:
+            floor, known = (data.get("floor_ms"), data.get("known")) if isinstance(data, dict) else (None, None)
+            if not isinstance(floor, int) or isinstance(floor, bool) or not isinstance(known, list):
+                return await self._answer(send, 400, {"detail": 'body must be {"floor_ms": N, "known": [ids]}'})
+            return await self._answer(send, 200, {**self.ledger.fence(floor, known), "boot": self.ledger.boot})
+        ids = data.get("tickets") if isinstance(data, dict) else None
         if not isinstance(ids, list):
             return await self._answer(send, 400, {"detail": 'body must be {"tickets": [ids]}'})
         await self._answer(send, 200, {"retired": self.ledger.retire(ids), "boot": self.ledger.boot})
@@ -1718,10 +1878,10 @@ class TicketMiddleware:
         if scope.get("type") != "http":
             return await self.app(scope, receive, send)
         method = scope.get("method")
-        if scope.get("path") == RETIRE_PATH:
+        if scope.get("path") in (RETIRE_PATH, FENCE_PATH):
             if method != "POST":
                 return await self._answer(send, 405, {"detail": "POST only"})
-            return await self._retire(receive, send)
+            return await self._query(receive, send, scope.get("path") == FENCE_PATH)
         if method in ("GET", "HEAD", "OPTIONS"):
             return await self.app(scope, receive, send)
         tid = None
@@ -1774,13 +1934,14 @@ def install_tickets(ledger: TicketLedger, scheduler_cls: Any, engine_core_cls: A
     def scheduler_add_request(self, request):
         rid = request.request_id
         ledger.watch(self)
-        if not ledger.entering(rid):
-            raise http_exception(status_code=409, detail=f"{TICKET_REFUSAL} (request {str(rid)[:12]} is not bound to "
-                                                         "an open gate ticket)")
-        try:
-            return sched_add(self, request)
-        finally:
-            ledger.entered(rid)
+        with ledger.admit_lock:                # queueing and its entry number, atomic with a safe point (P1a)
+            if not ledger.entering(rid):
+                raise http_exception(status_code=409, detail=f"{TICKET_REFUSAL} (request {str(rid)[:12]} is not "
+                                                             "bound to an open gate ticket)")
+            try:
+                return sched_add(self, request)
+            finally:
+                ledger.entered(rid)
 
     @functools.wraps(step)
     def scheduler_step(self, *args, **kwargs):
@@ -1817,15 +1978,15 @@ def _ticket_seams() -> tuple:
 
 
 # Startup order (#126 review round 3, P2b): every check that needs only the disk runs first (_preflight: the pinned
-# files of vllm-mlx, mlx-lm or mlx-vlm, mlx and mlx-metal, located through importlib.util.find_spec of the top-level
-# names and the dist-info RECORDs, neither of which runs package code), and only then is anything of them imported
+# files of vllm-mlx, mlx-lm or mlx-vlm, mlx and mlx-metal, located through find_without_import (the import system's
+# finders, asked directly: no parent package is imported, #126 review round 4 P2a) and the dist-info RECORDs, neither
+# of which runs package code), and only then is anything of them imported
 # (_modules / _text_modules / _vision_modules), each import checked to have come from the folder verified.
 def _locate(name: str) -> str:
-    """The folder a top-level package would be imported from, found without running it (find_spec of a top-level
-    name reads the path finders only)."""
-    import importlib.util
+    """The folder a top-level package would be imported from, found without running it (find_without_import: the
+    import system's finders only)."""
     try:
-        spec = importlib.util.find_spec(name)
+        spec = find_without_import(name)
     except (ImportError, ValueError) as exc:
         raise GuardError(f"{name} cannot be located ({type(exc).__name__})") from None
     if spec is None or not spec.origin or not spec.submodule_search_locations:
