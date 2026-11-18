@@ -87,8 +87,9 @@ Pinned: vllm-mlx 0.6.0 (`vllm_mlx.__version__`) and the sha256 of the files the 
 (PINNED_SHA256: the package __init__.py, scheduler.py, engine_core.py, engine/batched.py, and the engine dispatch
 cli.py, server.py, model_registry.py, engine/__init__.py, engine/base.py, from the PyPI wheel
 vllm_mlx-0.6.0-py3-none-any.whl, sha256 a5e5a52a...f062). Anything else stops startup: a new vllm-mlx needs this
-argument re-read before the node serves it. Every pin (vllm-mlx's, mlx-lm's or mlx-vlm's, mlx's) is checked on disk
-before any of those packages is imported (_preflight, #126 review round 3).
+argument re-read before the node serves it. Every pin (vllm-mlx's, mlx-lm's (on both routes: vllm_mlx.scheduler
+imports it, round 7), mlx-vlm's in vision mode, mlx's) is checked on disk before any of those packages is imported
+(_preflight, #126 review round 3).
 
 Retirement (text route, #126 review round 3): the gate releases a text turn's reservation only when this process
 confirms the turn left the scheduler (TicketLedger, install_tickets, RETIRE_PATH; the comment above TICKET_HEADER).
@@ -2148,7 +2149,7 @@ def _ticket_seams() -> tuple:
 
 
 # Startup order (#126 review round 3, P2b): every check that needs only the disk runs first (_preflight: the pinned
-# files of vllm-mlx, mlx-lm or mlx-vlm, mlx and mlx-metal, located through find_without_import (the import system's
+# files of vllm-mlx, mlx-lm (both routes, round 7), mlx-vlm, mlx and mlx-metal, located through find_without_import (the import system's
 # finders, asked directly: no parent package is imported, #126 review round 4 P2a) and the dist-info RECORDs, neither
 # of which runs package code), and only then is anything of them imported
 # (_modules / _text_modules / _vision_modules), each import checked to have come from the folder verified.
@@ -2179,10 +2180,12 @@ def _text_preflight() -> dict:
 
 
 def _vision_preflight(vllm_dir: str) -> dict:
-    """vllm-mlx's MLLM files, mlx-vlm's pinned files and mlx / mlx-metal's, on disk."""
+    """vllm-mlx's MLLM files, mlx-vlm's pinned files, and mlx-lm's and mlx / mlx-metal's exactly as on the text route
+    (#126 review round 7: vllm_mlx.scheduler, imported on both routes, imports mlx_lm), on disk."""
+    found = _text_preflight()
     vlm = _locate("mlx_vlm")
     verify_vision(vllm_dir, vlm, None)
-    return {"mlx_vlm": vlm, "mlx": verify_mlx_files()}
+    return {**found, "mlx_vlm": vlm}
 
 
 def _preflight(vision: bool) -> dict:
@@ -2207,6 +2210,10 @@ def _text_modules(found: dict):
 def _vision_modules(found: dict):
     """After _preflight: vllm-mlx's MLLM modules, mlx-vlm (from the folder verified, at its version), PIL and the image
     checker, and mlx.core the pinned extension."""
+    lm = sys.modules.get("mlx_lm")                # imported by vllm_mlx.scheduler (_modules): the one verified
+    if lm is not None:
+        _imported_from(lm, found["mlx_lm"], "mlx_lm")
+        verify_text(found["mlx_lm"], getattr(lm, "__version__", "?"), {})
     import mlx_vlm
     _imported_from(mlx_vlm, found["mlx_vlm"], "mlx_vlm")
     verify_vision(found["vllm_mlx"], found["mlx_vlm"], getattr(mlx_vlm, "__version__", "?"), {}, {})

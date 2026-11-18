@@ -26,7 +26,7 @@ from unittest.mock import patch
 
 from cortados_router import local_gate, local_governor
 from tests.test_local_mlx import MLX, SERVED, TAG, TOKEN, FixedGovernor, wait_for
-from tests.test_pro_vision import VisionGuardBase
+from tests.test_pro_vision import VISION_ARGS, VisionGuardBase
 from tests.test_text_prefill import SERVE_TEXT, write_lm
 from tests.test_vllm_mlx_guard import load_guard
 
@@ -1636,6 +1636,69 @@ class ImportOrderTests(VisionGuardBase):
                     self.assertNotIn("mlx.nn", sys.modules)
         self._clean()
         self.assertEqual(self.run_main(SERVE_TEXT)[0], 0)
+
+    def test_round7_sourceless_bytecode_in_each_verified_package_never_runs_in_any_mode(self):
+        # the reviewer's repro: vision's preflight left mlx_lm unverified, and vllm_mlx.scheduler imports it, so a
+        # pyc-only mlx_lm/_version/ package ran on vision `--check` and `serve` (rc 0). Every package each mode imports
+        # is verified on disk first: a sourceless package beside a module of each, in every mode, never runs.
+        import importlib
+        import importlib.util
+        import marshal
+        import sys
+        from vllm_mlx.api import utils
+        model = str(self.models / "vl")
+        utils.MLLM.add(model)
+        lm = Path(self.dir, "mlx_lm")
+        (lm / "__init__.py").write_text('import mlx.nn\nfrom . import convert, utils, tokenizer_utils\n'
+                                        'from ._version import __version__\n')
+        (lm / "_version.py").write_text('__version__ = "0.31.3"\n')
+        pins = {**self.guard.MLX_LM_PINNED_SHA256, "__init__.py": self._sha("mlx_lm", "__init__.py"),
+                "_version.py": self._sha("mlx_lm", "_version.py")}
+        for name, value in (("MLX_LM_PINNED_SHA256", pins), ("_text_preflight", self.real["_text_preflight"])):
+            p = patch.object(self.guard, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        modes = {"text serve": SERVE_TEXT, "text --check": ["--check", "/models/text"],
+                 "vision serve": ["--context-tokens", "131072", *VISION_ARGS, "--", "serve", model,
+                                  "--continuous-batching"],
+                 "vision --check": ["--check", model, *VISION_ARGS]}
+
+        def run(argv):
+            self._clean()
+            if self.marker.exists():
+                self.marker.unlink()                                   # each run judged on its own
+            from vllm_mlx.api import utils as fresh
+            fresh.MLLM.add(model)
+            importlib.invalidate_caches()
+            return self.run_main(argv)
+        for mode in ("text serve", "vision serve"):                    # the clean chain serves in both modes
+            rc, err = run(modes[mode])
+            self.assertEqual(rc, 0, f"{mode}: {err}")
+            self.assertIn("mlx_lm._version", sys.modules)
+        code = compile(f"open({str(self.marker)!r}, 'w').write('ran')\n__version__ = '0.31.3'\n", "planted", "exec")
+        pyc = importlib.util.MAGIC_NUMBER + b"\0" * 12 + marshal.dumps(code)
+        # a module of each verified package that its import chain loads, shadowed by a pyc-only package
+        for pkg, beside in (("vllm_mlx", "scheduler"), ("mlx", "utils"), ("mlx_lm", "_version"),
+                            ("mlx_vlm", "kv_quant")):
+            self.assertTrue(Path(self.dir, pkg, f"{beside}.py").is_file(), f"{pkg}/{beside}.py")
+            planted = Path(self.dir, pkg, beside)
+            planted.mkdir()
+            (planted / "__init__.pyc").write_bytes(pyc)
+            try:
+                for mode, argv in modes.items():
+                    if pkg == "mlx_vlm" and mode.startswith("text"):
+                        continue                                       # the text route never imports mlx-vlm
+                    with self.subTest(f"{pkg}/{beside} {mode}"):
+                        rc, err = run(argv)
+                        self.assertEqual(rc, 2, err)
+                        self.assertIn(f"{pkg}/{beside} is a package beside {beside}.py", err)
+                        self.assertFalse(self.marker.exists(), f"{pkg}/{beside} ran in {mode}")
+                        for name in ("mlx_lm", "mlx_vlm", "mlx.nn", f"{pkg}.{beside}"):
+                            self.assertNotIn(name, sys.modules)
+            finally:
+                shutil.rmtree(planted)
+        for mode in ("text serve", "vision serve"):                    # removed: both serve again
+            self.assertEqual(run(modes[mode])[0], 0, mode)
 
     def test_round6_the_mlx_vlm_tree_is_checked_for_sourceless_modules_too(self):
         vllm, vlm = str(Path(self.dir, "vllm_mlx")), str(Path(self.dir, "mlx_vlm"))

@@ -1116,7 +1116,9 @@ class VisionGuardBase(GuardBase):
         self.mlx_py_pins = self.fake_mlx_python(Path(self.dir), self.guard.MLX_PY_SHA256)
         for name, value in (("VISION_PINNED_SHA256", self.vpins), ("MLX_VLM_PINNED_SHA256", self.mpins),
                             ("MLX_PINNED_RECORD", self.mlx_pins), ("MLX_METAL_PINNED_RECORD", self.metal_pins),
-                            ("MLX_PY_PINNED_SHA256", {FAKE_MLX_TAG: self.mlx_py_pins})):
+                            ("MLX_PY_PINNED_SHA256", {FAKE_MLX_TAG: self.mlx_py_pins}),
+                            # #126 round 7: vision runs the text preflight too; mlx-lm faked here, mlx's checks real
+                            ("_text_preflight", lambda: {"mlx_lm": None, "mlx": self.guard.verify_mlx_files()})):
             p = patch.object(self.guard, name, value)
             p.start()
             self.addCleanup(p.stop)
