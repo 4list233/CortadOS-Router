@@ -103,6 +103,12 @@ EXTRA_ARGS_ALLOWED: dict[str, bool] = {
 }
 
 
+# vllm-mlx 0.6.0's serve flag that turns the prefix cache off (cli.py: enable_prefix_cache = --enable-prefix-cache,
+# default on, and not --disable-prefix-cache; no flag turns it back on). The text route always carries it
+# (text_argv); the guard's PREFIX_CACHE_FLAG is the same string (a test keeps the two equal).
+PREFIX_CACHE_OFF = "--disable-prefix-cache"
+
+
 class BackendConfigError(ValueError):
     pass
 
@@ -393,6 +399,22 @@ def vision_argv(cfg: dict[str, Any]) -> list[str]:
             "--image-dims", dims]
 
 
+def text_argv(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """(the guard's text flags, vllm-mlx's text flags) for a text-only model (#126), ([], []) for a vision model:
+    the guard prefills one sequence at a time in chunks of the governor's text_prefill_chunk_tokens and caps MLX's
+    buffer cache at buffer_cache_bytes (cortados_vllm_mlx_guard.py "Text prefill"), the sizes the gate's text
+    reservation is computed from (local_governor.text_set_bytes). vllm-mlx is given the same prefill (its own
+    --prefill-step-size and --prefill-batch-size); the guard enforces it on every batch generator whatever the flags.
+    And vllm-mlx's prefix cache is off (PREFIX_CACHE_OFF, #126 review round 2): its pool (up to 20% of free RAM) and
+    its insertion snapshots are outside the reservation, so the guard refuses to start the text route with it on."""
+    gov = cfg.get("governor") or local_governor.check_config({}, cfg["model"])
+    if not local_governor.text_route(gov):
+        return [], []
+    chunk = str(gov["text_prefill_chunk_tokens"])
+    return (["--text-prefill-tokens", chunk, "--buffer-cache-bytes", str(gov["buffer_cache_bytes"])],
+            ["--prefill-step-size", chunk, "--prefill-batch-size", "1", PREFIX_CACHE_OFF])
+
+
 def serve_argv(cfg: dict[str, Any]) -> list[str]:
     """The vllm-mlx command line for the configured model (the LaunchAgent's ProgramArguments): vllm-mlx's own
     `serve` arguments, run through the prompt guard with the governor's context_tokens as the prompt cap."""
@@ -404,10 +426,11 @@ def serve_argv(cfg: dict[str, Any]) -> list[str]:
     # many empty-context reservations fit the byte budget), so a request that slipped past the gate could not add more.
     seqs = local_governor.max_seqs(gov)
     paths = install_paths(cfg)
-    argv = [paths["python"], paths["guard"], "--context-tokens", str(gov["context_tokens"]), *vision_argv(cfg), "--",
-            "serve", paths["model"],
+    guard_text, prefill = text_argv(cfg)
+    argv = [paths["python"], paths["guard"], "--context-tokens", str(gov["context_tokens"]), *vision_argv(cfg),
+            *guard_text, "--", "serve", paths["model"],
             "--served-model-name", cfg["served_model"], "--host", s["host"], "--port", str(s["port"]),
-            "--continuous-batching", "--max-num-seqs", str(seqs),
+            "--continuous-batching", "--max-num-seqs", str(seqs), *prefill,
             "--max-tokens", str(s["max_tokens"]), "--max-request-tokens", str(s["max_request_tokens"]),
             "--timeout", str(s["timeout_s"])]
     if s["tool_call_parser"]:

@@ -54,10 +54,24 @@ FAKE = {
                 self.calls += 1
                 return list(text.encode("utf-8"))
 
+        class SchedulerConfig:
+            def __init__(self, enable_prefix_cache=True):
+                self.enable_prefix_cache = enable_prefix_cache
+
         class Scheduler:
-            def __init__(self, tokenizer=None):
+            def __init__(self, model=None, tokenizer=None, config=None):
                 self.tokenizer = tokenizer or ByteTokenizer()
                 self.requests, self.waiting = {}, deque()
+                # 0.6.0 (scheduler.py 1396-1445): the prefix cache exists unless the config turns it off
+                self.config = config or SchedulerConfig()
+                self.prefix_cache = self.block_aware_cache = self.paged_cache_manager = self._ssd_tier = None
+                self.memory_aware_cache = object() if self.config.enable_prefix_cache else None
+                self.running, self.request_id_to_uid = {}, {}
+            def step(self):
+                return None
+            def reset(self):
+                self.waiting.clear()
+                self.requests.clear()
             def add_request(self, request):
                 if request.request_id in self.requests:
                     raise ValueError(f"Request {request.request_id} already exists")
@@ -70,8 +84,41 @@ FAKE = {
                 request.remaining_tokens = request.prompt_token_ids
                 self.requests[request.request_id] = request
                 self.waiting.append(request)
+            def _create_batch_generator(self, sampling_params=None):
+                # 0.6.0 builds mlx-lm's BatchGenerator with --prefill-step-size / --prefill-batch-size (#126)
+                return FakeBatchGenerator(FakeQwen35(), prefill_batch_size=8, prefill_step_size=2048)
+
+        class FakeQwen35:
+            pass
+        FakeQwen35.__module__ = "mlx_lm.models.qwen3_5"
+
+        class FakePromptBatch:
+            def __init__(self, prefill_step_size):
+                self.uids, self.prefill_step_size = [], prefill_step_size
+
+        class FakeBatchGenerator:
+            def __init__(self, model, prefill_batch_size, prefill_step_size):
+                self.model, self.prefill_batch_size, self.prefill_step_size = model, prefill_batch_size, prefill_step_size
+                self._prompt_batch = FakePromptBatch(prefill_step_size)
+                self._generation_batch, self._unprocessed_sequences = [], deque()
+            def _next(self):
+                return [], []
         '''),
-    "vllm_mlx/engine_core.py": "# engine_core\n",
+    # 0.6.0's EngineCore.add_request (engine_core.py 446-510): the id, then Scheduler.add_request (#126 round 3)
+    "vllm_mlx/engine_core.py": textwrap.dedent('''
+        import uuid
+
+        class EngineCore:
+            def __init__(self, scheduler):
+                self.scheduler = scheduler
+            async def add_request(self, prompt, sampling_params=None, request_id=None, images=None, videos=None,
+                                  prefix_boundary=0):
+                from vllm_mlx.request import Request
+                if request_id is None:
+                    request_id = str(uuid.uuid4())
+                self.scheduler.add_request(Request(request_id, prompt, sampling_params))
+                return request_id
+        '''),
     # The engines, as in 0.6.0: BatchedEngine's text route reaches Scheduler.add_request; SimpleEngine never does.
     "vllm_mlx/engine/__init__.py": "from .base import BaseEngine\n",
     "vllm_mlx/engine/base.py": textwrap.dedent('''
@@ -94,9 +141,12 @@ FAKE = {
         from vllm_mlx.request import Request, SamplingParams
         from vllm_mlx.scheduler import Scheduler
 
+        def _resolve_metal_buffer_cache_limit(max_recommended, gpu_memory_utilization):
+            return int(max_recommended * gpu_memory_utilization), "device-scaled"
+
         class BatchedEngine(BaseEngine):
             def __init__(self, model_name, scheduler_config=None):
-                self.model_name, self.scheduler = model_name, Scheduler()
+                self.model_name, self.scheduler = model_name, Scheduler(config=scheduler_config)
             async def start(self):
                 return None
             async def generate(self, prompt, max_tokens=256):
@@ -134,6 +184,14 @@ FAKE = {
         from vllm_mlx.engine.batched import BatchedEngine
         from vllm_mlx.engine.simple import SimpleEngine
         _engine = None
+
+        class _App:
+            """server.app's add_middleware (Starlette: the latest added is the outermost)."""
+            def __init__(self):
+                self.middleware = []
+            def add_middleware(self, cls, **kw):
+                self.middleware.insert(0, (cls, kw))
+        app = _App()
         def load_model(model_name, use_batching=False, scheduler_config=None):
             global _engine
             _engine = BatchedEngine(model_name, scheduler_config) if use_batching else SimpleEngine(model_name)
@@ -160,9 +218,12 @@ FAKE = {
         def main():
             from vllm_mlx import server
             from vllm_mlx.api.utils import resolve_mllm_route
+            from vllm_mlx.scheduler import SchedulerConfig
             CALLS.append(list(sys.argv))
             resolve_mllm_route(sys.argv[2], sys.argv[2])
-            server.load_model(sys.argv[2], use_batching="--continuous-batching" in sys.argv)
+            # 0.6.0 (cli.py 319-328): enable_prefix_cache = --enable-prefix-cache (default on) and not --disable-...
+            config = SchedulerConfig(enable_prefix_cache="--disable-prefix-cache" not in sys.argv)
+            server.load_model(sys.argv[2], use_batching="--continuous-batching" in sys.argv, scheduler_config=config)
         '''),
     "fastapi/__init__.py": textwrap.dedent('''
         class HTTPException(Exception):
@@ -171,9 +232,11 @@ FAKE = {
                 self.status_code, self.detail = status_code, detail
         '''),
 }
-PINNED_FILES = ("scheduler.py", "engine_core.py", "engine/batched.py", "cli.py", "server.py", "model_registry.py",
+PINNED_FILES = ("__init__.py", "scheduler.py", "engine_core.py", "engine/batched.py", "cli.py", "server.py", "model_registry.py",
                 "engine/__init__.py", "engine/base.py")
-SERVE = ["--context-tokens", "131072", "--", "serve", "/models/text", "--continuous-batching"]
+TEXT = ["--text-prefill-tokens", "256", "--buffer-cache-bytes", str(2 ** 30)]   # the text route's prefill bounds (#126)
+SERVE = ["--context-tokens", "131072", *TEXT, "--", "serve", "/models/text", "--continuous-batching",
+         "--disable-prefix-cache"]
 
 
 class GuardBase(unittest.TestCase):
@@ -195,6 +258,19 @@ class GuardBase(unittest.TestCase):
         argv = patch.object(sys, "argv", list(sys.argv))
         argv.start()
         self.addCleanup(argv.stop)
+        # #126: the text route's mlx-lm / mlx pins and config.json check have their own tests (test_text_prefill.py);
+        # here they pass, and the fake vllm-mlx's engine.batched is the module the guard patches
+        self.text_models = []
+        self.real = {name: getattr(self.guard, name) for name in ("_text_preflight", "_text_modules")}
+
+        def text_modules(found):
+            from vllm_mlx.engine import batched
+            return batched
+        for name, fake in (("_text_modules", text_modules), ("check_text_model", self.text_models.append),
+                           ("_text_preflight", lambda: {"mlx_lm": None, "mlx": None})):
+            p = patch.object(self.guard, name, fake)
+            p.start()
+            self.addCleanup(p.stop)
 
     def _unimport(self):
         sys.path.remove(self.dir)
@@ -208,8 +284,15 @@ class GuardBase(unittest.TestCase):
 
     def run_main(self, argv):
         err = io.StringIO()
-        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-            rc = self.guard.main(argv)
+        saved = (sys.dont_write_bytecode, sys.pycache_prefix)          # main() isolates its bytecode (P2c)
+        try:
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = self.guard.main(argv)
+        finally:
+            prefix = sys.pycache_prefix
+            sys.dont_write_bytecode, sys.pycache_prefix = saved
+            if prefix and prefix != saved[1] and os.path.isdir(prefix) and not os.listdir(prefix):
+                os.rmdir(prefix)
         return rc, err.getvalue()
 
     def installed(self, context=131072):
@@ -298,7 +381,8 @@ class GuardStartupTests(GuardBase):
         from vllm_mlx import cli, scheduler, server
         from vllm_mlx.engine.batched import BatchedEngine
         self.assertEqual(rc, 0)
-        self.assertEqual(cli.CALLS, [["vllm-mlx", "serve", "/models/text", "--continuous-batching", "--port", "8000"]])
+        self.assertEqual(cli.CALLS, [["vllm-mlx", "serve", "/models/text", "--continuous-batching",
+                                      "--disable-prefix-cache", "--port", "8000"]])
         self.assertTrue(scheduler.Scheduler.add_request.__cortados_guard__)
         self.assertIs(type(server._engine), BatchedEngine)
         self.assertIn("capped at 131072", err)
@@ -334,7 +418,8 @@ class GuardStartupTests(GuardBase):
         self.assertIn("MLLM route", err)
         self.assertEqual(self.run_main(["--check", "/models/text"])[0], 0)
         with self.assertRaises(SystemExit):                            # and serving it never starts
-            self.run_main(["--context-tokens", "131072", "--", "serve", "/models/vl", "--continuous-batching"])
+            self.run_main(["--context-tokens", "131072", *TEXT, "--", "serve", "/models/vl", "--continuous-batching",
+                           "--disable-prefix-cache"])
 
     def test_bad_command_lines_are_refused(self):
         for argv in ([], ["serve", "/m"], ["--context-tokens", "x", "--", "serve", "/m"],
@@ -363,7 +448,7 @@ class GuardEngineTests(GuardBase):
         self.assertIsNone(server._engine)
 
     def test_serve_without_continuous_batching_is_refused_before_vllm_mlx_starts(self):
-        rc, err = self.run_main(["--context-tokens", "131072", "--", "serve", "/models/text"])
+        rc, err = self.run_main(["--context-tokens", "131072", *TEXT, "--", "serve", "/models/text"])
         self.assertEqual(rc, 2)
         self.assertIn("--continuous-batching", err)
         from vllm_mlx import cli
@@ -412,11 +497,21 @@ class ServeArgvTests(unittest.TestCase):
         c = local_backend.load(str(ROOT / "tables" / "local-backend.example.json"))
         argv = local_backend.serve_argv(c)
         paths = local_backend.install_paths(c)
-        self.assertEqual(argv[:6], [paths["python"], paths["guard"], "--context-tokens",
-                                    str(c["governor"]["context_tokens"]), "--", "serve"])
+        gov = c["governor"]
+        self.assertEqual(argv[:10], [paths["python"], paths["guard"], "--context-tokens", str(gov["context_tokens"]),
+                                     # #126: the text route's prefill bounds, the sizes the gate's reservation uses
+                                     "--text-prefill-tokens", str(gov["text_prefill_chunk_tokens"]),
+                                     "--buffer-cache-bytes", str(gov["buffer_cache_bytes"]), "--", "serve"])
         self.assertTrue(paths["guard"].endswith("/bin/cortados-vllm-mlx-guard.py"))
         self.assertEqual(Path(paths["guard_source"]), GUARD_PATH)
-        self.assertEqual(argv[6], paths["model"])
+        self.assertEqual(argv[10], paths["model"])
+        # vllm-mlx is given the same prefill (the guard enforces it on every batch generator whatever the flags)
+        i = argv.index("--prefill-step-size")
+        self.assertEqual(argv[i:i + 4], ["--prefill-step-size", "256", "--prefill-batch-size", "1"])
+        guard = load_guard()
+        text, rest = guard.parse_text(argv[2:argv.index("--")])
+        self.assertEqual((text.prefill_tokens, text.buffer_cache_bytes, rest),
+                         (256, 2 ** 29, ["--context-tokens", "131072"]))
 
 
 if __name__ == "__main__":

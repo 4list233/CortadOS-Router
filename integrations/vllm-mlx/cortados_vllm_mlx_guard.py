@@ -77,16 +77,22 @@ anything loads), config.json's vision_config exactly VISION_ENCODER_CONFIG (chec
 route resolution) and the loaded tower the same (vision_tower_problem, when MLLMScheduler is built). And the fused
 kernel's implementation is pinned: mlx and mlx-metal 0.32.4, their installed dist-info RECORD entries and the files
 themselves (the mlx.core extension, libmlx.dylib, mlx.metallib) against the released macOS arm64 wheels' RECORDs
-(MLX_PINNED_RECORD / MLX_METAL_PINNED_RECORD, verify_mlx), and the mlx.core actually imported must be that file.
+(MLX_PINNED_RECORD / MLX_METAL_PINNED_RECORD, verify_mlx), and the mlx.core actually imported must be that file;
+mlx's Python files on the models' import chain (mlx.nn, mlx.utils, ...) are pinned beside it (MLX_PY_SHA256).
 Pinned on top: the MLLM files of vllm-mlx 0.6.0 (VISION_PINNED_SHA256) and mlx-vlm 0.7.12 (MLX_VLM_PINNED_SHA256: the
 processor, the model, the vision encoder, the linear attention, the caches and the rest of their import chain;
 docs/LOCAL-RESOURCES.md "Vision" lists them).
 
 Pinned: vllm-mlx 0.6.0 (`vllm_mlx.__version__`) and the sha256 of the files the argument above reads
-(PINNED_SHA256: scheduler.py, engine_core.py, engine/batched.py, and the engine dispatch cli.py, server.py,
-model_registry.py, engine/__init__.py, engine/base.py, from the PyPI wheel
+(PINNED_SHA256: the package __init__.py, scheduler.py, engine_core.py, engine/batched.py, and the engine dispatch
+cli.py, server.py, model_registry.py, engine/__init__.py, engine/base.py, from the PyPI wheel
 vllm_mlx-0.6.0-py3-none-any.whl, sha256 a5e5a52a...f062). Anything else stops startup: a new vllm-mlx needs this
-argument re-read before the node serves it.
+argument re-read before the node serves it. Every pin (vllm-mlx's, mlx-lm's (on both routes: vllm_mlx.scheduler
+imports it, round 7), mlx-vlm's in vision mode, mlx's) is checked on disk before any of those packages is imported
+(_preflight, #126 review round 3).
+
+Retirement (text route, #126 review round 3): the gate releases a text turn's reservation only when this process
+confirms the turn left the scheduler (TicketLedger, install_tickets, RETIRE_PATH; the comment above TICKET_HEADER).
 
 Usage (scripts/install_mlx_backend.sh copies this file to <venv>/bin/cortados-vllm-mlx-guard.py, and the LaunchAgent
 runs it with the venv's python; cortados_router/local_backend.serve_argv builds the line):
@@ -107,6 +113,8 @@ from typing import Any
 
 VLLM_MLX_VERSION = "0.6.0"
 PINNED_SHA256 = {
+    # The package's own __init__ (lazy: it imports nothing) runs on `import vllm_mlx`; checked on disk before it.
+    "__init__.py": "f1a099967fa0c1a7673dadb813751f0adc31abcd94bbf16712e2db3d96687724",
     "scheduler.py": "6fa94c0af2c4d653290a7cdfa8a1bf63c1d54a2017e2b300e7fa8cea3d24b6be",
     "engine_core.py": "f97949899bc26e996060decbb4e17e566edadaf132334e640d4077926beca67c",
     "engine/batched.py": "ec3a3d0e5e0257f1ab91acfe9dcb9b6eb0960097f80c76ceff7a33de37b5de9d",
@@ -136,9 +144,10 @@ class UnguardedEngine(RuntimeError):
     """An engine other than BatchedEngine was about to be built or used (its prompts never reach the cap)."""
 
 
-def verify(package_dir: str, version: str, pins: dict[str, str] | None = None) -> None:
-    """GuardError unless this is the vllm-mlx the guard was written against: the version and every pinned file."""
-    if version != VLLM_MLX_VERSION:
+def verify(package_dir: str, version: str | None, pins: dict[str, str] | None = None) -> None:
+    """GuardError unless this is the vllm-mlx the guard was written against: the version (None: not checked here, the
+    disk-only preflight, whose pinned __init__.py carries it) and every pinned file."""
+    if version is not None and version != VLLM_MLX_VERSION:
         raise GuardError(f"vllm-mlx {version} is not {VLLM_MLX_VERSION}: re-read the guard's argument for it first")
     for rel, want in (PINNED_SHA256 if pins is None else pins).items():
         path = os.path.join(package_dir, *rel.split("/"))
@@ -149,6 +158,41 @@ def verify(package_dir: str, version: str, pins: dict[str, str] | None = None) -
             raise GuardError(f"vllm_mlx/{rel} unreadable ({type(exc).__name__})") from None
         if got != want:
             raise GuardError(f"vllm_mlx/{rel} differs from the 0.6.0 release the guard was written against")
+    if (PINNED_SHA256 if pins is None else pins):          # {}: the version only (the tree was checked before)
+        verify_sources_only(package_dir, "vllm_mlx")
+
+
+def verify_sources_only(root: str, label: str) -> None:
+    """GuardError unless nothing in the package tree `root` can be imported in place of a released source file (#126
+    review round 6, P2c). isolate_bytecode keeps __pycache__ unread, but Python still imports SOURCELESS bytecode: a
+    `.pyc` outside __pycache__ is a module of its own (a `_version/__init__.pyc` package wins over `_version.py`). So:
+    no `.pyc` / `.pyo` anywhere outside __pycache__; no extension module whose name has a `.py` beside it (the
+    extension loader comes first); no package folder (an `__init__` of any importable suffix) beside a `.py` of its
+    name (a package wins over a module). Linked folders are followed, each once. Reads names only."""
+    import importlib.machinery
+    ext = tuple(importlib.machinery.EXTENSION_SUFFIXES)
+    inits = tuple(f"__init__{sfx}" for sfx in importlib.machinery.all_suffixes())
+    seen = set()
+    for folder, dirs, files in os.walk(root, followlinks=True):
+        real = os.path.realpath(folder)
+        if real in seen or os.path.basename(folder) == PYCACHE:
+            dirs[:] = []                                   # a loop, or a cache this process never reads
+            continue
+        seen.add(real)
+        names = set(files)
+        rel = os.path.relpath(folder, root)
+        where = label if rel == "." else f"{label}/{rel.replace(os.sep, '/')}"
+        for name in sorted(files):
+            if name.endswith((".pyc", ".pyo")):
+                raise GuardError(f"{where}/{name} is sourceless bytecode outside __pycache__ (it would be imported "
+                                 "in place of a released source)")
+            for sfx in ext:
+                if name.endswith(sfx) and f"{name[:-len(sfx)]}.py" in names:
+                    raise GuardError(f"{where}/{name} is an extension module beside {name[:-len(sfx)]}.py (it would "
+                                     "be imported in its place)")
+        for d in sorted(dirs):
+            if f"{d}.py" in names and any(os.path.lexists(os.path.join(folder, d, i)) for i in inits):
+                raise GuardError(f"{where}/{d} is a package beside {d}.py (it would be imported in its place)")
 
 
 def prompt_token_ids(tokenizer: Any, prompt: Any) -> list:
@@ -402,6 +446,42 @@ MLX_METAL_PINNED_RECORD = {
         "mlx/lib/mlx.metallib": "sha256=xtej-suDVo9uTLLPSoxzbuKTAlcaSDQ8uaOk0c0-OJM",
     },
 }
+# #126 review round 2 (P2b): mlx's Python side. The models import mlx.nn (whose __init__ imports every module under
+# mlx/nn: the activations, Linear / QuantizedLinear, RMSNorm, Embedding, Module, ...) and mlx.utils, and the mlx.core
+# extension imports mlx._reprlib_fix at init and mlx.__array_api_info on use. Those Python files decide dtypes and
+# shapes the reservation counts (e.g. silu in the activations' dtype), so they are pinned by sha256 against the
+# released 0.32.4 wheels (fetched from PyPI 2026-11-17, each wheel's digest checked against PyPI's): the files are
+# byte-identical in all 27 macOS arm64 wheels, so every tag's row is the one table below. mlx is a namespace package
+# (no mlx/__init__.py in any wheel): a planted one would run on `import mlx.core`, so its absence is checked too, and
+# mlx.nn, mlx.utils, mlx._reprlib_fix and mlx.__array_api_info must resolve to the pinned files (verify_mlx).
+MLX_PY_SHA256 = {
+    "__array_api_info.py": "67bd1bf52f853f2ea96fd6d4f0c64435899f36292290e3d528327a799f863912",
+    "_reprlib_fix.py": "f748ea4f10995bf30ed6ba76ed3539f23c18cdf541031e1c0968dd60dc98f723",
+    "utils.py": "e55d7c63e7b706a0d31728343760f3f98d90e44d34054be4cf076586fdbe1616",
+    "nn/__init__.py": "6d578784bfe696a3ba6eca2a559c87e9fd1ec5eaa5e6d4e199e6e959ebe0a492",
+    "nn/init.py": "c6ef640bf114039d5c6c5f2d0d9e53675c171ba1456beba20278c9cc12922831",
+    "nn/losses.py": "221ce6a2395cddb065049bf66212620945e50a8f592bb131fa1c21b8341d8f31",
+    "nn/utils.py": "a5ab60f6731a7a8d3821b7e44ad96961ef848ae0315090f47a895627ede102a8",
+    "nn/layers/__init__.py": "1eb646e38a87579eb63201100c3f9b038e2466d7fbad509c2f32841bc1f2a007",
+    "nn/layers/activations.py": "244a4acb0f77fac196e3e355dcae0a5195691b7f9f12d6c5aeb243c6cb021ae1",
+    "nn/layers/base.py": "cefa99a579f3c2016b70e15c183ae5e8bbef103ce9a0d89cb3789d9aedb23503",
+    "nn/layers/containers.py": "29ef203c13d9bebb6b8cad6aadb44d1ad495e2bbc19184ca5415b6a505eb36f6",
+    "nn/layers/convolution.py": "dbcffc87c082fedeba9611d6f0028517b1ae3425641ff64164c9882001dfaf1a",
+    "nn/layers/convolution_transpose.py": "b879cc91dc655ded2b5876c4828f93516c2211b72099d72921995224ae4628ec",
+    "nn/layers/distributed.py": "d1166464c6e3bab613881a71e045754d22647e97544a395996c274b2c59eb3c2",
+    "nn/layers/dropout.py": "b5630720b002f7ab16d4c9db3b94102ce5e4f3c301d5574af04e41c9e95e7264",
+    "nn/layers/embedding.py": "b1eb18c3fa00e37741a3a180cb08fbe622da1f729084eb4057396153d7707cab",
+    "nn/layers/linear.py": "20514004a56ecfed5e03d43a7ca618a0f54ff7bca038ec565e3e9af76aa1f639",
+    "nn/layers/normalization.py": "d038fced58d7bf972e80e5ea508c9285e81bd9d523773deb50c5a935b25af9af",
+    "nn/layers/pooling.py": "0b4bf256c9cd70113b4cb7d4dc0738d12d740b139f0c401a8beb72f4b0874538",
+    "nn/layers/positional_encoding.py": "e02215591daa503f99bdd2f6b38c9641fdf381bac36641225da0911a6704ef4c",
+    "nn/layers/quantized.py": "8ca4574a212f14cbec4c446826474583ef0bf1e2cb1630574fd730c77af03b33",
+    "nn/layers/recurrent.py": "553738db5ffede77d4d97a6b431ac82475b99c34902a9a32e05b940a95f34ae7",
+    "nn/layers/transformer.py": "0661d4b2f0e21638d051e6707d700a6a82c659a4f942535f5793a7d25f4ab0c8",
+    "nn/layers/upsample.py": "c50aff4aca3cf11f7b8def94be5f0ecfb386504a89da480fab7f9a6b4a202650",
+}
+MLX_PY_PINNED_SHA256 = {tag: MLX_PY_SHA256 for tag in MLX_PINNED_RECORD}
+MLX_PY_MODULES = ("nn", "utils", "_reprlib_fix", "__array_api_info")   # the chain's entry points under mlx
 
 VISION_MODEL_TYPE = "qwen3_5"
 VISION_ARCHITECTURES = ["Qwen3_5ForConditionalGeneration"]
@@ -613,10 +693,11 @@ def vision_tower_problem(tower: Any, dims: dict) -> str | None:
     return None
 
 
-def verify_vision(vllm_dir: str, vlm_dir: str, vlm_version: str, pins: dict | None = None,
+def verify_vision(vllm_dir: str, vlm_dir: str, vlm_version: str | None, pins: dict | None = None,
                   vlm_pins: dict | None = None) -> None:
-    """GuardError unless vllm-mlx's MLLM files and mlx-vlm are the releases the vision argument was read against."""
-    if vlm_version != MLX_VLM_VERSION:
+    """GuardError unless vllm-mlx's MLLM files and mlx-vlm are the releases the vision argument was read against
+    (vlm_version None: not checked here, the disk-only preflight; its pinned version.py carries it)."""
+    if vlm_version is not None and vlm_version != MLX_VLM_VERSION:
         raise GuardError(f"mlx-vlm {vlm_version} is not {MLX_VLM_VERSION}: re-read the guard's vision argument first")
     for base, name, table in ((vllm_dir, "vllm_mlx", VISION_PINNED_SHA256 if pins is None else pins),
                               (vlm_dir, "mlx_vlm", MLX_VLM_PINNED_SHA256 if vlm_pins is None else vlm_pins)):
@@ -628,6 +709,8 @@ def verify_vision(vllm_dir: str, vlm_dir: str, vlm_version: str, pins: dict | No
                 raise GuardError(f"{name}/{rel} unreadable ({type(exc).__name__})") from None
             if got != want:
                 raise GuardError(f"{name}/{rel} differs from the release the guard's vision argument was read against")
+    if MLX_VLM_PINNED_SHA256 if vlm_pins is None else vlm_pins:    # {}: the version only (checked before)
+        verify_sources_only(vlm_dir, "mlx_vlm")
 
 
 def _record_hash(path: str) -> str:
@@ -641,12 +724,25 @@ def _record_hash(path: str) -> str:
 
 
 def verify_mlx(find: Any = None, core_file: Any = None, pins: dict | None = None,
-               metal_pins: dict | None = None) -> str:
+               metal_pins: dict | None = None, py_pins: dict | None = None, find_spec: Any = None) -> str:
+    """verify_mlx_files, then verify_mlx_core (which imports mlx.core when `core_file` is None): the mlx wheel tag."""
+    tag, core, lib = verify_mlx_files(find, pins, metal_pins, py_pins, find_spec)
+    verify_mlx_core(core, lib, core_file)
+    return tag
+
+
+def verify_mlx_files(find: Any = None, pins: dict | None = None, metal_pins: dict | None = None,
+                     py_pins: dict | None = None, find_spec: Any = None) -> tuple:
     """GuardError unless the installed mlx and mlx-metal are the released 0.32.4 wheels for this platform (module
     docstring; MLX_PINNED_RECORD): the version, one WHEEL tag that has a pinned row, the RECORD entries of the files
     that implement fast.scaled_dot_product_attention's dispatch equal to the release's, those files' bytes equal to
     them, and the mlx.core imported (`core_file`, else mlx.core.__file__) that very file, beside that libmlx.dylib.
-    `find` is importlib.metadata.distribution (tests pass a fake). Returns the mlx wheel tag."""
+    Then mlx's Python side (MLX_PY_PINNED_SHA256, #126 review round 2): every pinned file beside that mlx.core equal
+    to the release's bytes, no mlx/__init__.py, and the chain's entry modules (MLX_PY_MODULES) resolving to those
+    files (`find_spec`, find_without_import: loads no module code, not even mlx's parent). `find` is
+    importlib.metadata.distribution (tests pass a fake). Disk only (#126 review round 3, P2b): nothing of mlx is
+    imported here. Returns (the mlx wheel tag, the pinned mlx.core file, the pinned libmlx.dylib) for verify_mlx_core.
+    """
     if find is None:
         from importlib import metadata
         find = metadata.distribution
@@ -689,16 +785,98 @@ def verify_mlx(find: Any = None, core_file: Any = None, pins: dict | None = None
     (mlx_tag, mlx_paths), (metal_tag, metal_paths) = found["mlx"], found["mlx_metal"]
     if mlx_tag.split("-")[-1] != metal_tag.split("-")[-1]:
         raise GuardError(f"mlx ({mlx_tag}) and mlx-metal ({metal_tag}) are built for different platforms")
+    # mlx's Python side, checked beside the pinned extension before `import mlx.core` runs mlx._reprlib_fix
+    pinned_core = next(iter(mlx_paths.values()))
+    verify_mlx_python(os.path.dirname(pinned_core), mlx_tag, MLX_PY_PINNED_SHA256 if py_pins is None else py_pins,
+                      find_spec, pinned_core)
+    return mlx_tag, pinned_core, metal_paths["mlx/lib/libmlx.dylib"]
+
+
+def verify_mlx_core(pinned_core: str, pinned_lib: str, core_file: Any = None) -> None:
+    """GuardError unless the mlx.core imported (`core_file`, else mlx.core.__file__, importing it: run only after
+    verify_mlx_files) is the pinned extension, beside the pinned libmlx.dylib."""
     if core_file is None:
         import mlx.core
         core_file = getattr(mlx.core, "__file__", None)
     core = os.path.realpath(str(core_file)) if core_file else None
-    if core != next(iter(mlx_paths.values())):
+    if core != pinned_core:
         raise GuardError(f"the imported mlx.core ({core_file}) is not the pinned mlx {MLX_VERSION} extension")
     lib = os.path.realpath(os.path.join(os.path.dirname(core), "lib", "libmlx.dylib"))
-    if lib != metal_paths["mlx/lib/libmlx.dylib"]:
+    if lib != pinned_lib:
         raise GuardError("the imported mlx.core does not sit beside the pinned mlx-metal libmlx.dylib")
-    return mlx_tag
+
+
+def find_without_import(fullname: str, path: Any = None) -> Any:
+    """The spec importlib would use for `fullname`, searching `path` (the parent package's search locations; None for
+    a top-level name), WITHOUT importing anything (#126 review round 4, P2a): importlib.util.find_spec("a.b") imports
+    the parent `a` first, so a shadow a/__init__.py earlier on sys.path would run before any check. This asks the same
+    finders the import system asks, in its order (sys.meta_path: the path finder walks sys.path / `path` through the
+    path hooks), and none of them executes module code. A name already imported answers with its module's spec."""
+    mod = sys.modules.get(fullname)
+    if mod is not None:
+        return getattr(mod, "__spec__", None)
+    return find_on_disk(fullname, path)
+
+
+def find_on_disk(fullname: str, path: Any = None) -> Any:
+    """find_without_import's answer from the finders alone, even when `fullname` is already imported: what an import
+    in a fresh process would load (the disk-first checks run before anything is imported)."""
+    for finder in sys.meta_path:
+        find = getattr(finder, "find_spec", None)
+        if find is None:
+            continue
+        spec = find(fullname, path, None)
+        if spec is not None:
+            return spec
+    return None
+
+
+def verify_mlx_python(mlx_dir: str, tag: str, table: dict, find_spec: Any = None, core: str | None = None) -> None:
+    """GuardError unless mlx's Python files in `mlx_dir` (the pinned mlx.core's folder) are the released 0.32.4's
+    for this wheel tag, mlx is still a namespace package there, and MLX_PY_MODULES (and mlx.core: `core`, the pinned
+    extension) resolve to those files. Nothing is imported (#126 review round 4, P2a): `mlx` is resolved as a top-level
+    name, which must be a namespace package whose search locations include `mlx_dir`, and each submodule within those
+    locations (`find_spec(fullname, path)`, find_without_import; tests pass a fake)."""
+    if tag not in table:
+        raise GuardError(f"mlx {MLX_VERSION}: no Python file pins for wheel tag {tag!r}")
+    files = {}
+    for rel, want in table[tag].items():
+        path = os.path.join(mlx_dir, *rel.split("/"))
+        try:
+            with open(path, "rb") as f:
+                got = hashlib.sha256(f.read()).hexdigest()
+        except OSError as exc:
+            raise GuardError(f"mlx/{rel} unreadable ({type(exc).__name__})") from None
+        if got != want:
+            raise GuardError(f"mlx/{rel} differs from the released {MLX_VERSION} wheel ({tag})")
+        files[rel] = os.path.realpath(path)
+    if os.path.lexists(os.path.join(mlx_dir, "__init__.py")):
+        raise GuardError(f"mlx/__init__.py exists: no released {MLX_VERSION} wheel has one (it would run on import)")
+    verify_sources_only(mlx_dir, "mlx")
+    find = find_spec or find_without_import
+    try:
+        top = find("mlx", None)
+    except (ImportError, ValueError) as exc:
+        raise GuardError(f"mlx cannot be resolved ({type(exc).__name__})") from None
+    origin = getattr(top, "origin", None)
+    locations = list(getattr(top, "submodule_search_locations", None) or [])
+    if top is None or origin not in (None, "namespace"):
+        raise GuardError(f"mlx resolves to {origin!r}, not the released namespace package (a shadowing mlx would "
+                         "run on import)")
+    if os.path.realpath(mlx_dir) not in {os.path.realpath(str(p)) for p in locations}:
+        raise GuardError(f"mlx's search locations {locations!r} do not include the pinned {mlx_dir!r}")
+    want = {name: files.get("nn/__init__.py" if name == "nn" else f"{name}.py") for name in MLX_PY_MODULES}
+    if core is not None:
+        want["core"] = os.path.realpath(core)
+    for name, pinned in want.items():
+        try:
+            spec = find(f"mlx.{name}", locations)
+        except (ImportError, ValueError) as exc:
+            raise GuardError(f"mlx.{name} cannot be resolved ({type(exc).__name__})") from None
+        origin = getattr(spec, "origin", None)
+        if not origin or pinned is None or os.path.realpath(origin) != pinned:
+            raise GuardError(f"mlx.{name} resolves to {origin!r}, not the pinned mlx/"
+                             f"{os.path.relpath(pinned, mlx_dir) if pinned else name}")
 
 
 def load_image_check() -> Any:
@@ -1152,23 +1330,904 @@ def media_prefill(gen: Any, request: Any, cache: Any, step: int, seam: dict) -> 
     return logits
 
 
-def _vision_modules():
-    """vllm-mlx's MLLM modules, mlx-vlm, PIL and the image checker, verified against the vision pins (and mlx /
-    mlx-metal against theirs)."""
-    import vllm_mlx
+# ---------------------------------------------------------------------------------------------------------------------
+# Text prefill (#126; docs/LOCAL-RESOURCES.md "Text prefill"). On the text route, vllm-mlx 0.6.0's Scheduler
+# (scheduler.py 1518-1600, _create_batch_generator) builds mlx-lm 0.31.3's BatchGenerator with vllm-mlx's
+# --prefill-step-size (2,048) and --prefill-batch-size (8). mlx-lm prefills (generate.py 1124-1170,
+# PromptProcessingBatch.prompt) up to prefill_batch_size sequences together, right-padded, against one BatchKVCache, in
+# steps of prefill_step_size tokens, evaluating only the cache state (no prompt position is projected to the
+# vocabulary). Its full attention at head_dim 256 runs MLX 0.32.4's unfused fallback under 1,024 query tokens
+# (scaled_dot_product_attention.cpp use_fallback; fast.cpp's fallback: bf16 scores, a masked copy, the softmax), so one
+# step holds sequences x heads x step x context scores: 8 x 24 x 2,048 x 131,072 x 2 bytes = 96 GiB a buffer at worst.
+# The guard bounds it where the generator is built:
+#   * every BatchGenerator the Scheduler creates prefills ONE sequence at a time (prefill_batch_size 1) in chunks of
+#     at most --text-prefill-tokens (prefill_step_size, and the empty PromptProcessingBatch's own step, which is the
+#     one PromptProcessingBatch.prompt chunks by, since extend() keeps it); a generator without that seam, or a model
+#     other than mlx-lm's qwen3_5, fails the request (fail closed);
+#   * MLX's buffer cache limit is --buffer-cache-bytes (engine/batched.py _resolve_metal_buffer_cache_limit, which
+#     vllm-mlx calls through its module global at engine start; upstream 90% of the GPU's working set): freed KV
+#     copies and score buffers are released rather than kept resident until the next clear. The limit is a recycling
+#     threshold (MLX allocator: free() caches a whole buffer while the cache is under the limit, malloc trims it back),
+#     so the cache holds at most the limit plus one buffer; the gate counts both.
+# Same result: a chunk boundary only splits the prompt into causal attention against the cached keys plus the
+# gated-delta and conv state carried in the cache, the path upstream already takes at 2,048; batching prefills is a
+# scheduling choice (each row's attention is masked to its own tokens). Floating-point results may differ at the
+# rounding level, as between any two chunk sizes (GEMM tiling depends on the chunk's rows); no token is dropped.
+# The gate reserves the result (local_governor.text_set_bytes). Pinned: mlx-lm 0.31.3 (MLX_LM_PINNED_SHA256), the
+# vllm-mlx files above (PINNED_SHA256: scheduler.py, engine/batched.py) and mlx / mlx-metal 0.32.4 (verify_mlx: the
+# fallback and the allocator are in the compiled library).
+MLX_LM_VERSION = "0.31.3"
+# mlx-lm 0.31.3 (PyPI wheel mlx_lm-0.31.3-py3-none-any.whl, sha256 758cfddf...83b8): the batch generator, the caches
+# and mask, the qwen3_5 model and its import chain, and the sampler the decode rows run.
+MLX_LM_PINNED_SHA256 = {
+    "__init__.py": "f9ffa88772d26e537a98aa39ab16488a7a0d13cc1fac5d665376132c94b49608",
+    "_version.py": "f0da9bc5c5c1bf21d576f7aa67b4eda887f1c7f0666746187b493e6831c4af6c",
+    # BatchGenerator, PromptProcessingBatch (prefill steps, cache-state-only eval), GenerationBatch (extend / filter)
+    "generate.py": "270778ad53eaca55a8533d82e6752660fe5d2605c4aa0879b48a50a91f69345f",
+    "sample_utils.py": "c0ce439f8dbf0d4e6d0f37f728a324f3f72878e6a9123df41be520804c596d67",
+    "models/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    # KVCache / BatchKVCache (256-step growth, extend pads to the longest row), ArraysCache (the recurrent state)
+    "models/cache.py": "819ed95dcbf755652363cfdb15a639890447abb534a06dcefd52c7fff5055750",
+    # create_causal_mask, scaled_dot_product_attention -> mx.fast.scaled_dot_product_attention
+    "models/base.py": "61330e1c065739cd712bfeb09d673f33797cde7e613e95bf6d9ebbee9006f373",
+    "models/qwen3_5.py": "f0daa30bba5cb521c8bdfa7093101a544c6a37bbba09bca582288219cb04ae3a",
+    "models/qwen3_next.py": "3c572fe3fbb36721efab4d80d1bb6af11beb4ad1caae18deefc9fc84cbcd9b79",
+    "models/gated_delta.py": "79c8376a51c694b03e54d2f996ced6ea6c8c42868b8571529f97334db165a3e1",
+    "models/activations.py": "dbca5bae41ba0a8380a53903c3e98da37c1e15b46383bc2edb5806ba94fafe72",
+    "models/rope_utils.py": "9f68c938c040fa111d13f2ed95c70e8261515fb3b54f8a0a474c096baf4e087a",
+    "models/switch_layers.py": "073a6a808d5c90bb699a2ecca0e559b06727ae96dbc1f0253e4c7e77e4ee1ef2",
+    # #126 review round 4: the rest of what `import mlx_lm` runs (__init__ imports convert, generate and utils; they
+    # import tokenizer_utils) and what loading the model and its tokenizer imports by name (tokenizer_utils.load:
+    # mlx_lm.tool_parsers.<inferred or named parser>, mlx_lm.chat_templates.<named template>): every such file pinned
+    "convert.py": "dc60df164c2d51ee2f05f5f9f3324bc3a44a59dd2ccddb75dde680e854ce5e9a",
+    "utils.py": "ba0371e9c88d52b34d71271945c2394005fbcb2bfb2ee9f6f82d627a33b72422",
+    "tokenizer_utils.py": "25784bb03c922d0d7832ce6c66a6cd4eb3a4820b6c5a8e583dedb63a018fb56a",
+    "tool_parsers/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tool_parsers/function_gemma.py": "b8531d412cb87d1ceaecd5e2d15b162ff8036e093a4daa9e3f872d005191defc",
+    "tool_parsers/gemma4.py": "8806c0593a9ababb7f8617a2ffcb9c50f19a0cebdf659124691adba6e09c826c",
+    "tool_parsers/glm47.py": "4007036f3b6440aea56cac6cd2f5ab590b9be941dacd630ba9c01e5f67475b66",
+    "tool_parsers/json_tools.py": "398c044ebd6bbb5578131d57817753d70b43803da509c14d12a2591e01d9cdb1",
+    "tool_parsers/kimi_k2.py": "7d02c9fef2b43d18b5b74261e774943d0ad85a05ea50b92764fb1ee821976206",
+    "tool_parsers/longcat.py": "dcf25a84edd35b92b7df8dceef424e12930828159ad315a67dd997d90f2fc531",
+    "tool_parsers/minimax_m2.py": "db2bd5cd0286ca66881bf363612f65c2a42d0d681d8f1a5e9b442f847066e60f",
+    "tool_parsers/mistral.py": "df143d4bcadadb22291b0d634f485c714065d973aae129f0b6ba789e81fc92b0",
+    "tool_parsers/pythonic.py": "14cf949cac8ba3ce7366fa9f692213f300c1103db5642b4c56af67ca8f0ef13d",
+    "tool_parsers/qwen3_coder.py": "32de6d9f7472a1f00a2acfaacaf13e0e0864cfc19adebbff688ac5004b8ecc25",
+    "chat_templates/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "chat_templates/deepseek_v32.py": "4df892725d65d936044d70d365e9a78eb0e10f201059120c7b0b965e66f669b7",
+}
+# mlx-lm's own module directories whose every entry the pins above must cover (#126 review round 5, P2c): a tokenizer
+# imports a module there by name (tokenizer_utils.load), so anything the release does not have is refused (verify_text):
+# a new .py, an extension module of any suffix, a .pth, a subdirectory (a regular or namespace package shadows the
+# pinned module of the same name: FileFinder tries the package first). The one exception is __pycache__, which is never
+# read: the guard serves with its bytecode isolated (isolate_bytecode).
+MLX_LM_PINNED_DIRS = ("tool_parsers", "chat_templates")
+PYCACHE = "__pycache__"
+TEXT_FLAGS = {"--text-prefill-tokens": "prefill_tokens", "--buffer-cache-bytes": "buffer_cache_bytes"}
+# The one verified text geometry (local_governor.TEXT_DIMS, the same values): the Pro's Qwen3.8 27B text_config. A key
+# config.json leaves out takes mlx-lm 0.31.3's TextModelArgs default (models/qwen3_5.py 25-70) when that default is the
+# verified value (full_attention_interval 4, linear_conv_kernel_dim 4), and is refused otherwise.
+TEXT_DIMS = {
+    "hidden_size": 5120, "intermediate_size": 17408, "num_attention_heads": 24, "num_key_value_heads": 4,
+    "head_dim": 256, "linear_num_key_heads": 16, "linear_num_value_heads": 48, "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128, "vocab_size": 248320, "num_hidden_layers": 64, "full_attention_interval": 4,
+    "linear_conv_kernel_dim": 4,
+}
+TEXT_DIMS_DEFAULTS = {"full_attention_interval": 4, "linear_conv_kernel_dim": 4}
+TEXT_ACT_BYTES = 2
+TEXT_MODEL_TYPE = "qwen3_5"
+TEXT_MODEL_MODULES = ("mlx_lm.models.qwen3_5",)
+TEXT_PREFILL_REFUSAL = "cortados guard: the text prefill could not be bounded"
+# The prefix cache (#126 review round 2, P1). vllm-mlx 0.6.0's Scheduler keeps finished prompts' KV in a prefix cache
+# (scheduler.py 1402-1445: MemoryAwarePrefixCache by default, up to 20% of the RAM free at start; the legacy
+# PrefixCacheManager; or the paged BlockAwarePrefixCache), and memory_cache.py commit_prepared (1551-1568) materialises
+# a new snapshot before it evicts, so neither the pool nor its insertion transient is in the gate's text reservation.
+# The text route serves with it OFF: serve's arguments must carry PREFIX_CACHE_FLAG (cli.py: enable_prefix_cache =
+# --enable-prefix-cache and not --disable-prefix-cache; nothing turns it back on), and every Scheduler the engine builds
+# must be given a config with enable_prefix_cache False and end up holding none of PREFIX_CACHE_ATTRS (the runtime
+# proof, install_text). No option re-enables it with a reserved budget: the pool's own accounting estimates an entry's
+# KV from its sliced arrays, while a filtered batch row's slice can keep the whole padded buffer alive, so a fixed
+# --cache-memory-mb is not a bound the gate could reserve without re-reading memory_cache.py's estimate (docs).
+PREFIX_CACHE_FLAG = "--disable-prefix-cache"
+PREFIX_CACHE_REFUSAL = ("cortados guard: the text route serves with vllm-mlx's prefix cache off "
+                        f"({PREFIX_CACHE_FLAG}): its pool is outside the gate's memory reservation")
+PREFIX_CACHE_ATTRS = ("prefix_cache", "memory_aware_cache", "block_aware_cache", "paged_cache_manager", "_ssd_tier")
+
+
+def prefix_cache_problem(config: Any) -> str | None:
+    """Why a Scheduler built with this SchedulerConfig would hold a prefix cache, or None (enable_prefix_cache is
+    False). No config is 0.6.0's default SchedulerConfig(), whose enable_prefix_cache is True."""
+    if config is None:
+        return "no scheduler config (vllm-mlx's default enables the prefix cache)"
+    on = getattr(config, "enable_prefix_cache", True)
+    if on is not False:
+        return f"enable_prefix_cache is {on!r}"
+    return None
+
+
+class TextPolicy:
+    """The text route's prefill bounds (--text-prefill-tokens, --buffer-cache-bytes), positive integers."""
+
+    def __init__(self, prefill_tokens: int, buffer_cache_bytes: int):
+        for name, v in (("--text-prefill-tokens", prefill_tokens), ("--buffer-cache-bytes", buffer_cache_bytes)):
+            if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                raise GuardError(f"{name} must be a positive integer, got {v!r}")
+        self.prefill_tokens, self.buffer_cache_bytes = prefill_tokens, buffer_cache_bytes
+
+
+def parse_text(args: list[str]) -> tuple["TextPolicy | None", list[str]]:
+    """(TextPolicy or None, the other arguments): the text flags, each `--flag N` once; both or neither."""
+    got: dict[str, int] = {}
+    rest: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in TEXT_FLAGS:
+            if a in got or i + 1 >= len(args) or not args[i + 1].isdigit():
+                raise GuardError(f"{a} takes one positive integer, once")
+            got[a] = int(args[i + 1])
+            i += 2
+            continue
+        rest.append(a)
+        i += 1
+    if not got:
+        return None, rest
+    if len(got) != len(TEXT_FLAGS):
+        raise GuardError(f"the text flags go together: {' N '.join(TEXT_FLAGS)} N")
+    return TextPolicy(got["--text-prefill-tokens"], got["--buffer-cache-bytes"]), rest
+
+
+def check_text_model(model_dir: Any) -> None:
+    """GuardError unless config.json (its text_config when it has one, else the top level) is the verified text
+    geometry TEXT_DIMS, dense (no experts), in a dtype no wider than TEXT_ACT_BYTES: the gate's text reservation was
+    computed for it (local_governor.text_set_bytes), so the text route does not start on another model."""
+    import json
+    path = os.path.join(str(model_dir), "config.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise GuardError(f"text route: {path} unreadable ({type(exc).__name__})") from None
+    if not isinstance(cfg, dict):
+        raise GuardError(f"text route: {path} is not an object")
+    # mlx-lm 0.31.3 loads mlx_lm.models.<model_type> (utils._get_classes; no remapping for qwen3_5), whose ModelArgs
+    # reads text_config when there is one and the top level otherwise (models/qwen3_5.py 360-364): the module the
+    # runtime check (TEXT_MODEL_MODULES) expects, caught here at install time rather than on the first request
+    if cfg.get("model_type") != TEXT_MODEL_TYPE:
+        raise GuardError(f"text route: config.json model_type is {cfg.get('model_type')!r}, not {TEXT_MODEL_TYPE!r} "
+                         "(mlx-lm's qwen3_5, the model the text reservation was computed for)")
+    text = cfg["text_config"] if "text_config" in cfg else cfg
+    if not isinstance(text, dict):
+        raise GuardError("text route: config.json text_config is not an object")
+    for key, want in TEXT_DIMS.items():
+        got = text.get(key, TEXT_DIMS_DEFAULTS.get(key))
+        if isinstance(got, bool) or got != want:
+            raise GuardError(f"text route: config.json {key} is {got!r}, but the gate's text reservation was computed "
+                             f"for {want} (TEXT_DIMS); a different model needs its own reservation")
+    if "model_file" in cfg:                   # mlx-lm would execute that file from the model folder (utils.load_model)
+        raise GuardError("text route: config.json names a model_file; the text route runs mlx-lm's pinned qwen3_5 only")
+    if text.get("num_experts", 0):
+        raise GuardError("text route: config.json names experts; the text reservation is for the dense model")
+    for where in (text, cfg):
+        dtype = where.get("dtype", where.get("torch_dtype"))
+        if dtype is not None and (DTYPE_BYTES.get(dtype, 0) == 0 or DTYPE_BYTES[dtype] > TEXT_ACT_BYTES):
+            raise GuardError(f"text route: config.json's dtype {dtype!r} is wider than the {TEXT_ACT_BYTES} bytes "
+                             "the text reservation counts")
+
+
+def verify_text(lm_dir: str, lm_version: str | None, pins: dict | None = None) -> None:
+    """GuardError unless mlx-lm is the 0.31.3 release the text prefill argument was read from, file for file
+    (lm_version None: not checked here, the disk-only preflight; its pinned _version.py carries it)."""
+    if lm_version is not None and lm_version != MLX_LM_VERSION:
+        raise GuardError(f"mlx-lm {lm_version} is not {MLX_LM_VERSION}: re-read the guard's text prefill argument")
+    for rel, want in (MLX_LM_PINNED_SHA256 if pins is None else pins).items():
+        path = os.path.join(lm_dir, *rel.split("/"))
+        try:
+            with open(path, "rb") as f:
+                got = hashlib.sha256(f.read()).hexdigest()
+        except OSError as exc:
+            raise GuardError(f"mlx_lm/{rel} unreadable ({type(exc).__name__})") from None
+        if got != want:
+            raise GuardError(f"mlx_lm/{rel} differs from the {MLX_LM_VERSION} release the guard was written against")
+    table = MLX_LM_PINNED_SHA256 if pins is None else pins
+    if not table:                                          # {}: the version only (the files were checked before)
+        return
+    for folder in MLX_LM_PINNED_DIRS:
+        try:
+            names = sorted(os.listdir(os.path.join(lm_dir, folder)))
+        except OSError as exc:
+            raise GuardError(f"mlx_lm/{folder} unreadable ({type(exc).__name__})") from None
+        for name in names:
+            if f"{folder}/{name}" in table and os.path.isfile(os.path.join(lm_dir, folder, name)):
+                continue
+            if name == PYCACHE and not os.path.islink(os.path.join(lm_dir, folder, name)):
+                if not bytecode_isolated():
+                    raise GuardError(f"mlx_lm/{folder}/{PYCACHE} would be read: the guard runs with its bytecode "
+                                     "isolated (isolate_bytecode)")
+                continue
+            raise GuardError(f"mlx_lm/{folder}/{name} is not in the {MLX_LM_VERSION} release the guard was "
+                             "written against (a tokenizer could import it by name)")
+    verify_sources_only(lm_dir, "mlx_lm")
+    verify_lm_resolution(lm_dir, table)
+
+
+def _lm_module(rel: str) -> str:
+    """mlx_lm's module name for the pinned file `rel` ("models/cache.py" -> mlx_lm.models.cache, "x/__init__.py" ->
+    mlx_lm.x)."""
+    parts = rel[:-len(".py")].split("/")
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(["mlx_lm", *parts])
+
+
+def verify_lm_resolution(lm_dir: str, table: dict, find_spec: Any = None) -> None:
+    """GuardError unless every pinned mlx-lm module resolves, through the finders and without importing anything
+    (find_on_disk), to its pinned file in `lm_dir` (#126 review round 5, P2c): a package, extension module or
+    sourceless bytecode of the same name beside a pinned file would be imported in its place. Every pinned module, none
+    skipped (round 6, P2c: `from ._version import __version__` runs on `import mlx_lm`): mlx_lm itself is resolved
+    within the folder holding `lm_dir`."""
+    import importlib
+    importlib.invalidate_caches()                          # a folder changed since a finder last listed it
+    find = find_spec or find_on_disk
+    for rel in sorted(table, key=lambda r: r.count("/")):
+        if not rel.endswith(".py"):
+            continue
+        name = _lm_module(rel)
+        if "." in name:
+            where = [os.path.join(lm_dir, *name.rsplit(".", 1)[0].split(".")[1:])]
+        else:                                              # mlx_lm itself, within its own folder
+            where = [os.path.dirname(os.path.abspath(lm_dir))]
+        try:
+            spec = find(name, where)
+        except (ImportError, ValueError) as exc:
+            raise GuardError(f"{name} cannot be resolved ({type(exc).__name__})") from None
+        origin = getattr(spec, "origin", None)
+        pinned = os.path.realpath(os.path.join(lm_dir, *rel.split("/")))
+        if not origin or os.path.realpath(origin) != pinned:
+            raise GuardError(f"{name} resolves to {origin!r}, not the pinned mlx_lm/{rel}")
+
+
+def isolate_bytecode() -> str:
+    """No cached bytecode is read or written by this process from here on (#126 review round 5, P2c): Python checks a
+    __pycache__ file against its source's mtime and size only, so one written beside a pinned file could run in its
+    place. sys.pycache_prefix points every cache lookup at a fresh empty directory of this process's own, and nothing
+    is written there (sys.dont_write_bytecode): each verified source is compiled as it is imported. Called first thing
+    in main(), before anything outside the standard library is imported. The directory."""
+    import atexit
+    import tempfile
+    prefix = tempfile.mkdtemp(prefix="cortados-guard-pyc-")
+    sys.dont_write_bytecode = True
+    sys.pycache_prefix = prefix
+    atexit.register(lambda: os.path.isdir(prefix) and not os.listdir(prefix) and os.rmdir(prefix))
+    return prefix
+
+
+def bytecode_isolated() -> bool:
+    """True when this process reads no in-tree __pycache__ (isolate_bytecode ran)."""
+    prefix = getattr(sys, "pycache_prefix", None)
+    return bool(sys.dont_write_bytecode and prefix and os.path.isdir(prefix) and not os.listdir(prefix))
+
+
+def text_prefill_problem(bg: Any) -> str | None:
+    """Why this BatchGenerator lacks the seam enforce_text_prefill sets, or None (mlx-lm 0.31.3's native layout)."""
+    for attr in ("prefill_batch_size", "prefill_step_size", "_prompt_batch", "_generation_batch",
+                 "_unprocessed_sequences", "_next", "model"):
+        if not hasattr(bg, attr):
+            return f"the batch generator has no {attr}"
+    pb = bg._prompt_batch
+    if not hasattr(pb, "prefill_step_size") or not hasattr(pb, "uids") or len(pb.uids) != 0:
+        return "the batch generator's prompt batch is not mlx-lm 0.31.3's empty PromptProcessingBatch"
+    module = type(bg.model).__module__
+    if module not in TEXT_MODEL_MODULES:
+        return f"the served model is {module}.{type(bg.model).__name__}, not mlx-lm's qwen3_5 (TEXT_DIMS)"
+    for name in ("prefill_batch_size", "prefill_step_size"):
+        v = getattr(bg, name)
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            return f"the batch generator's {name} is {v!r}"
+    return None
+
+
+def enforce_text_prefill(bg: Any, chunk: int) -> Any:
+    """One sequence prefills at a time, in chunks of at most `chunk` tokens (module comment above); RuntimeError (the
+    request fails, nothing is prefilled) when the generator is not the layout the argument read."""
+    why = text_prefill_problem(bg)
+    if why is not None:
+        raise RuntimeError(f"{TEXT_PREFILL_REFUSAL} ({why})")
+    bg.prefill_batch_size = 1
+    bg.prefill_step_size = min(bg.prefill_step_size, chunk)
+    bg._prompt_batch.prefill_step_size = min(int(bg._prompt_batch.prefill_step_size), chunk)
+    return bg
+
+
+def install_text(policy: TextPolicy, scheduler_cls: Any, batched_module: Any) -> None:
+    """Patch the text route (before any request exists): every BatchGenerator the Scheduler builds is held to the
+    policy's prefill (enforce_text_prefill), and MLX's buffer cache limit vllm-mlx sets at engine start is the
+    policy's."""
+    original = getattr(scheduler_cls, "_create_batch_generator", None)
+    resolve = getattr(batched_module, "_resolve_metal_buffer_cache_limit", None)
+    sched_init = scheduler_cls.__dict__.get("__init__")
+    if not callable(original) or not callable(resolve) or not callable(sched_init):
+        raise GuardError("text route: Scheduler.__init__, Scheduler._create_batch_generator or engine.batched."
+                         "_resolve_metal_buffer_cache_limit is missing: re-read the guard's text prefill argument")
+    if any(getattr(f, "__cortados_guard__", False) for f in (original, resolve, sched_init)):
+        raise GuardError("the text prefill guard is already installed")
+
+    def scheduler_init(self, *args, **kwargs):
+        # Scheduler(model, tokenizer, config=None) in 0.6.0 (scheduler.py 1357-1362): refuse before any cache is built
+        config = kwargs["config"] if "config" in kwargs else args[2] if len(args) > 2 else None
+        why = prefix_cache_problem(config)
+        if why is not None:
+            raise GuardError(f"{PREFIX_CACHE_REFUSAL} ({why})")
+        sched_init(self, *args, **kwargs)
+        held = [a for a in PREFIX_CACHE_ATTRS if getattr(self, a, None) is not None]
+        if held:
+            raise GuardError(f"{PREFIX_CACHE_REFUSAL} (the scheduler built {', '.join(held)})")
+
+    scheduler_init.__cortados_guard__ = True
+    scheduler_init.__wrapped__ = sched_init
+    scheduler_cls.__init__ = scheduler_init
+
+    def create_batch_generator(self, *args, **kwargs):
+        return enforce_text_prefill(original(self, *args, **kwargs), policy.prefill_tokens)
+
+    create_batch_generator.__cortados_guard__ = True
+    create_batch_generator.__wrapped__ = original
+    scheduler_cls._create_batch_generator = create_batch_generator
+
+    def resolve_metal_buffer_cache_limit(*args, **kwargs):
+        return policy.buffer_cache_bytes, "cortados guard (--buffer-cache-bytes)"
+
+    resolve_metal_buffer_cache_limit.__cortados_guard__ = True
+    resolve_metal_buffer_cache_limit.__wrapped__ = resolve
+    batched_module._resolve_metal_buffer_cache_limit = resolve_metal_buffer_cache_limit
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Retirement (#126 review round 3, P1): the gate keeps a text turn's reservation until this process confirms the turn
+# left the scheduler. Closing the HTTP connection does not end a request here: _disconnect_guard defers the stream's
+# aclose by 0.5 s (server.py 5481-5497) and Scheduler.abort_request only queues the id (scheduler.py 2227-2242) until
+# the executor's next step() processes it (_process_pending_aborts, 3233) and removes its rows from the batch
+# generator (_do_abort_request, 2250-2315). A finished turn leaves in the step that finished it (_cleanup_finished,
+# 2974-3123). The protocol (the gate's side: cortados_router/local_gate.py Retirer):
+#   * every request that may generate (any method but GET / HEAD / OPTIONS) carries the gate's ticket id
+#     (TICKET_HEADER, "<epoch>.<seq>.<nonce>", no request data: the gate's epoch below, its own strictly increasing
+#     counter, 128 random bits that only make the id unguessable); the ASGI middleware (TicketMiddleware, the
+#     outermost) refuses one without a well-formed id of the current epoch, or with an id it has seen or one below the
+#     epoch's floor, before vllm-mlx reads it, and holds the id in a context variable for the request's task and every
+#     task it starts;
+#   * EngineCore.add_request (engine_core.py 446-510, the one way the text route's requests reach Scheduler.add_request,
+#     awaited in the request's own task; its worker job runs to completion even when cancelled, base.py 195-225) binds
+#     the scheduler request id to that ticket; Scheduler.add_request refuses an id no ticket is bound to, or whose
+#     ticket was closed;
+#   * the safe point: after every Scheduler.step() (and reset()), on the executor thread, under the step lock, a bound
+#     request is "gone" once it is in none of the scheduler's waiting queue, running map, request-to-uid map (rows in
+#     the batch generator) or unfinished requests; with no step running (the lock free) the same check runs on query;
+#   * POST RETIRE_PATH {"tickets": [ids]} answers {"retired": [ids], "boot": <this process's id>}: an id is retired when
+#     its HTTP exchange has ended and every request bound to it is gone or never entered the scheduler (it is then
+#     closed: nothing more may bind to it). An id this process never saw is retired, untracked, only when it can never
+#     be admitted here: malformed, of an epoch below the current one, or below the current epoch's floor; of the
+#     current epoch it is tombstoned first (tracked, refused should it still arrive). It never entered this process's
+#     scheduler, and a previous process's rows went with that process (a backend restart clears every retiring
+#     ticket). An unseen id of an epoch above the current one, and any id while no epoch is current, is never retired:
+#     that epoch may still be fenced here and its ticket admitted. Nothing else is retired: a hung step keeps its
+#     tickets reserved.
+# Atomicity (#126 review round 4, P1a). Admission and the "gone" transition exclude each other: Scheduler.add_request
+# (entering, the scheduler's own add, entered) runs under TicketLedger.admit_lock, and so does every safe point from the
+# moment it notes the entry sequence until it has marked what is gone. Each request is numbered as its add completes
+# (entered: its entry sequence number); a safe point notes the next number before it reads the scheduler and may mark
+# gone only a request numbered below it, i.e. one whose add had completed (so it was queued) before the read began. The
+# lock makes the number check redundant; the number keeps it true should any path ever add outside the lock. The retire
+# query takes the step lock and the admit lock without waiting: with either busy it answers from the last safe point.
+# Epochs (#126 review round 6, P2a/P2b: ordered, persistent, no clock, no adoption). Each gate start takes the node's
+# next epoch, a strictly increasing integer kept in a state file (cortados_router/local_gate.py next_epoch), and
+# numbers its tickets with a counter that only goes up. This process has at most one current epoch, and none until a
+# fence arrives: a fresh process refuses every ticket (409) until a gate fences it (the gate re-fences on that 409 and
+# on a new boot id). A fence of epoch E is accepted only when E is at least the current epoch (the highest this process
+# has seen: only a fence sets it, and it never goes down); a lower one is refused and changes nothing, so a delayed old
+# fence never displaces the live gate. Once E is current, a ticket of any other epoch is refused, for open, bind and
+# Scheduler.add_request alike: one below E for good, one above until its gate fences. A restart forgets everything,
+# which is safe: the new process holds no rows, and a delayed old fence reaching it first is superseded by the live
+# gate's higher epoch.
+# The fence (#126 review round 4, P1b). A gate that has just started (or lost track of this process) knows none of the
+# rows a previous gate's turns left here, so it admits no text turn until POST FENCE_PATH {"epoch": E, "known": [ids]}
+# answers {"clear": true}: atomically, E is now the only epoch admitted, and no request bound to a ticket outside
+# `known` is pending, queued or in the scheduler, and no such ticket's exchange is open. Otherwise:
+# {"clear": false, "unknown": n}; an epoch below the current one: {"clear": false, "refused": true}.
+# Bounded (#126 review round 4, P2b): at most TICKET_MAX ids are tracked. A closed id (and an ended one of an epoch no
+# longer current whose requests are all gone: no live gate can ask about it) may be evicted, old epochs first, then the
+# current one by counter; the current epoch's floor then rises past every evicted counter, and an id below the floor is
+# refused on arrival and, unknown, retired without being tracked: an evicted tombstone can never be replayed. An
+# unknown id that cannot be tracked (every slot an open turn): not retired.
+TICKET_HEADER = "x-cortados-ticket"
+RETIRE_PATH = "/cortados/retire"
+FENCE_PATH = "/cortados/fence"
+TICKET_REFUSAL = "cortados guard: a request needs a fresh gate ticket"
+TICKET_MAX = 8192                   # ids tracked at once (open, ended, closed and tombstoned): a hard bound
+TICKET_LEN = 16 + 1 + 16 + 1 + 32   # "<epoch: 16 hex>.<seq: 16 hex>.<nonce: 32 hex>"
+EPOCH_MAX = (1 << 64) - 1           # epochs are 1 .. EPOCH_MAX (16 hex digits)
+RETIRE_MAX_BODY = 1 << 20
+_HEX = frozenset("0123456789abcdef")
+
+
+def _is_hex(s: str, n: int) -> bool:
+    return len(s) == n and all(c in _HEX for c in s)
+
+
+def ticket_parts(tid: Any) -> tuple | None:
+    """(epoch, seq) of a well-formed ticket id (TICKET_HEADER: lower-case hex, fixed widths, epoch at least 1), or
+    None."""
+    if not isinstance(tid, str) or len(tid) != TICKET_LEN:
+        return None
+    parts = tid.split(".")
+    if len(parts) != 3 or not (_is_hex(parts[0], 16) and _is_hex(parts[1], 16) and _is_hex(parts[2], 32)):
+        return None
+    epoch = int(parts[0], 16)
+    return (epoch, int(parts[1], 16)) if epoch >= 1 else None
+
+
+def is_epoch(epoch: Any) -> bool:
+    return type(epoch) is int and 1 <= epoch <= EPOCH_MAX
+
+
+class TicketLedger:
+    """The tickets this process has seen and the scheduler requests bound to them (the retirement protocol above).
+    `_lock` guards the records; it is touched from the event loop (middleware, EngineCore.add_request, the retire and
+    fence queries) and the executor thread (Scheduler.add_request, the step safe point). `admit_lock` makes admission
+    and a safe point's read-and-mark atomic (P1a above); lock order: step_lock, admit_lock, _lock. No decision reads a
+    clock (epochs above)."""
+
+    def __init__(self):
+        import threading
+        import uuid
+        import weakref
+        self._lock = threading.Lock()
+        self.step_lock = threading.RLock()     # held across every Scheduler.step(): its end is the safe point
+        self.admit_lock = threading.RLock()    # Scheduler.add_request, and a safe point's snapshot + transition
+        self._tickets: dict = {}               # id -> {"state": open | ended | closed, "rids": set()}
+        # scheduler request id -> [ticket id, pending | adding | entered | gone | closed, entry sequence number]
+        self._rids: dict = {}
+        self._seq = 0                          # the next entry sequence number
+        self.epoch: int | None = None          # the one epoch admitted (None: no fence yet; epochs above)
+        self.floor = 0                         # a current-epoch counter below this is never admitted (eviction)
+        self._schedulers = weakref.WeakSet()
+        self.boot = uuid.uuid4().hex
+
+    # ---- the bound (P2b)
+    def _done_locked(self, rec: dict) -> bool:
+        return all(self._rids.get(rid, [None, "gone"])[1] in ("gone", "closed") for rid in rec["rids"])
+
+    def _current_locked(self, tid: str) -> bool:
+        return self.epoch is not None and int(tid[:16], 16) == self.epoch
+
+    def _order_locked(self, tid: str) -> tuple:
+        """Eviction order: epochs no longer current first, then the current one by its counter."""
+        return (self._current_locked(tid), int(tid[:16], 16), int(tid[17:33], 16))
+
+    def _evictable_locked(self, tid: str, rec: dict) -> bool:
+        return rec["state"] == "closed" or (rec["state"] == "ended" and not self._current_locked(tid)
+                                            and self._done_locked(rec))
+
+    def _evict_locked(self, tids: list) -> None:
+        for tid in tids:
+            for rid in self._tickets.pop(tid)["rids"]:
+                self._rids.pop(rid, None)
+            if self._current_locked(tid):
+                self.floor = max(self.floor, int(tid[17:33], 16) + 1)
+
+    def _room_locked(self) -> bool:
+        """True when one more id may be tracked (evicting what may go, oldest first): the bound, on every insert."""
+        if len(self._tickets) < TICKET_MAX:
+            return True
+        old = sorted((t for t, rec in self._tickets.items() if self._evictable_locked(t, rec)), key=self._order_locked)
+        if not old:
+            return False
+        # every id of an epoch no longer current (refused on arrival anyway) and at least the oldest quarter
+        # (amortised: a flood of tombstones costs O(log n) per id); `old` is sorted, so those ids are its prefix
+        n = max(sum(1 for t in old if not self._current_locked(t)), max(1, len(old) // 4))
+        self._evict_locked(old[:n])
+        return len(self._tickets) < TICKET_MAX
+
+    def _never_locked(self, epoch: int, seq: int) -> bool:
+        """True when a ticket (epoch, seq) can never be admitted by this process: its epoch is below the current one,
+        or it is of the current epoch and below its floor (epochs above)."""
+        return self.epoch is not None and (epoch < self.epoch or (epoch == self.epoch and seq < self.floor))
+
+    def _refused_locked(self, epoch: int, seq: int) -> str | None:
+        """Why a ticket (epoch, seq) is not admitted now, or None."""
+        if self.epoch is None:
+            return "no gate epoch fenced yet (the gate fences first)"
+        if epoch < self.epoch:
+            return "a ticket of an older gate epoch (superseded at the fence)"
+        if epoch > self.epoch:
+            return "a ticket of a gate epoch not fenced yet (the gate fences first)"
+        if seq < self.floor:
+            return "a ticket id below its epoch's floor (already retired)"
+        return None
+
+    # ---- the exchange
+    def open(self, tid: Any) -> str | None:
+        """Admit a request carrying `tid`: None, or why it is refused (nothing of it reaches vllm-mlx)."""
+        parts = ticket_parts(tid)
+        if parts is None:
+            return "no well-formed ticket id"
+        with self._lock:
+            why = self._refused_locked(*parts)
+            if why is not None:
+                return why
+            if tid in self._tickets:
+                return "a ticket id already used or retired"
+            if not self._room_locked():
+                return "too many tickets tracked"
+            self._tickets[tid] = {"state": "open", "rids": set()}
+        return None
+
+    def ended(self, tid: str) -> None:
+        """The request's HTTP exchange is over (its ASGI call returned or raised)."""
+        with self._lock:
+            rec = self._tickets.get(tid)
+            if rec is not None and rec["state"] == "open":
+                rec["state"] = "ended"
+
+    def bind(self, tid: Any, rid: str) -> str | None:
+        """Bind scheduler request `rid` to ticket `tid` (EngineCore.add_request): None, or why it is refused."""
+        with self._lock:
+            rec = self._tickets.get(tid) if isinstance(tid, str) else None
+            if rec is None or rec["state"] == "closed" or not self._current_locked(tid):
+                return "no open gate ticket of the current epoch for this request"
+            if rid in self._rids:
+                return "a request id already bound"
+            rec["rids"].add(rid)
+            self._rids[rid] = [tid, "pending", None]
+        return None
+
+    def add_exited(self, rid: str) -> None:
+        """EngineCore.add_request returned or raised: a request that never reached Scheduler.add_request never will."""
+        with self._lock:
+            got = self._rids.get(rid)
+            if got is not None and got[1] == "pending":
+                got[1] = "closed"
+
+    def entering(self, rid: str) -> bool:
+        """Scheduler.add_request is about to queue `rid` (admit_lock held): False (refuse it) unless it is bound to a
+        ticket of the current epoch and still pending."""
+        with self._lock:
+            got = self._rids.get(rid)
+            if got is None or got[1] != "pending" or not self._current_locked(got[0]):
+                return False
+            got[1] = "adding"
+            return True
+
+    def entered(self, rid: str) -> None:
+        """Scheduler.add_request returned or raised (admit_lock held): whether it is queued is the safe point's to
+        say; it is numbered now, so only a safe point that starts after this may find it gone."""
+        with self._lock:
+            got = self._rids.get(rid)
+            if got is not None and got[1] == "adding":
+                got[1], got[2] = "entered", self._seq
+                self._seq += 1
+
+    def watch(self, scheduler: Any) -> None:
+        with self._lock:
+            self._schedulers.add(scheduler)
+
+    @staticmethod
+    def _live_ids(scheduler: Any) -> Any:
+        """The request ids `scheduler` still holds (waiting, running, in the batch generator, unfinished), or None
+        when they could not be read consistently (a queue changed while read: nothing is retired then)."""
+        try:
+            ids = {r.request_id for r in tuple(scheduler.waiting)}
+            ids.update(tuple(scheduler.running), tuple(scheduler.request_id_to_uid))
+            ids.update(rid for rid, r in tuple(scheduler.requests.items()) if not r.is_finished())
+        except RuntimeError:
+            return None
+        return ids
+
+    def safe_point(self, blocking: bool = True) -> bool:
+        """At a scheduler safe point (after a step, with the step lock held, or with no step running): every request
+        that entered before this check began and that no scheduler holds any more is gone. Atomic with admission
+        (admit_lock); `blocking` False: skipped (False) while an admission holds it. True when the check ran."""
+        if not self.admit_lock.acquire(blocking=blocking):
+            return False
+        try:
+            with self._lock:
+                start = self._seq
+                schedulers = list(self._schedulers)
+            live = set()
+            for sched in schedulers:
+                ids = self._live_ids(sched)
+                if ids is None:
+                    return False
+                live |= ids
+            with self._lock:
+                for rid, got in self._rids.items():
+                    if got[1] == "entered" and got[2] is not None and got[2] < start and rid not in live:
+                        got[1] = "gone"
+            return True
+        finally:
+            self.admit_lock.release()
+
+    def _fresh_safe_point(self) -> None:
+        """A query's own safe point when no step and no admission is running (neither lock is waited for)."""
+        if self.step_lock.acquire(blocking=False):
+            try:
+                self.safe_point(blocking=False)
+            finally:
+                self.step_lock.release()
+
+    def retire(self, ids: Any) -> list:
+        """The retire query (RETIRE_PATH): which of `ids` are retired, closing them (module comment above)."""
+        self._fresh_safe_point()
+        out = []
+        with self._lock:
+            for tid in ids if isinstance(ids, list) else []:
+                if not isinstance(tid, str) or len(tid) > 2 * TICKET_LEN:
+                    continue
+                rec = self._tickets.get(tid)
+                if rec is None:
+                    parts = ticket_parts(tid)
+                    if parts is None or self._never_locked(*parts):
+                        out.append(tid)                     # never admitted here, and never will be: not tracked
+                    elif self.epoch is None or parts[0] != self.epoch:
+                        pass                                # its epoch may still be fenced here: never retired
+                    elif self._room_locked():               # the current epoch: tombstone, refused should it arrive
+                        self._tickets[tid] = {"state": "closed", "rids": set()}
+                        out.append(tid)
+                    continue                                # no room: not retired (the gate keeps it reserved)
+                if rec["state"] == "open":
+                    continue
+                if self._done_locked(rec):
+                    rec["state"] = "closed"
+                    out.append(tid)
+        return out
+
+    def fence(self, epoch: Any, known: Any) -> dict:
+        """The fence query (FENCE_PATH, module comment above): make `epoch` the only one admitted, unless it is below
+        the current one (refused: nothing changes), then say whether any request bound to a ticket outside `known` may
+        still be in the scheduler or reach it."""
+        if not is_epoch(epoch):
+            raise ValueError(f"an epoch is an integer from 1 to {EPOCH_MAX}")
+        self._fresh_safe_point()
+        known = {t for t in known if isinstance(t, str)} if isinstance(known, list) else set()
+        with self._lock:
+            if self.epoch is not None and epoch < self.epoch:
+                return {"clear": False, "refused": True, "unknown": 0, "epoch": self.epoch}
+            if self.epoch != epoch:
+                self.epoch, self.floor = epoch, 0
+            unknown = 0
+            for tid, rec in self._tickets.items():
+                if tid in known:
+                    continue
+                if rec["state"] == "open" or not self._done_locked(rec):
+                    unknown += 1
+                elif rec["state"] == "ended" and not self._current_locked(tid):
+                    rec["state"] = "closed"                  # its gate is gone: nothing will ever ask about it
+            return {"clear": unknown == 0, "unknown": unknown, "epoch": self.epoch}
+
+
+class TicketMiddleware:
+    """The outermost ASGI layer of the text route's server (install_tickets): RETIRE_PATH and FENCE_PATH are answered
+    here, a request that may generate is refused without a fresh ticket, and an admitted one runs with its ticket in
+    CURRENT_TICKET."""
+
+    def __init__(self, app: Any, ledger: TicketLedger, current: Any):
+        self.app, self.ledger, self.current = app, ledger, current
+
+    async def _answer(self, send: Any, status: int, body: dict) -> None:
+        import json
+        raw = json.dumps(body).encode()
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(raw)).encode())]})
+        await send({"type": "http.response.body", "body": raw})
+
+    async def _query(self, receive: Any, send: Any, fence: bool) -> None:
+        import json
+        body, more = b"", True
+        while more:
+            msg = await receive()
+            if msg.get("type") != "http.request":
+                return
+            body += msg.get("body", b"")
+            more = msg.get("more_body", False)
+            if len(body) > RETIRE_MAX_BODY:
+                return await self._answer(send, 413, {"detail": "retire query too large"})
+        try:
+            data = json.loads(body)
+        except ValueError:
+            data = None
+        if fence:
+            epoch, known = (data.get("epoch"), data.get("known")) if isinstance(data, dict) else (None, None)
+            if not is_epoch(epoch) or not isinstance(known, list):
+                return await self._answer(send, 400, {"detail": 'body must be {"epoch": <1 .. 2**64-1>, "known": '
+                                                                '[ids]}'})
+            return await self._answer(send, 200, {**self.ledger.fence(epoch, known), "boot": self.ledger.boot})
+        ids = data.get("tickets") if isinstance(data, dict) else None
+        if not isinstance(ids, list):
+            return await self._answer(send, 400, {"detail": 'body must be {"tickets": [ids]}'})
+        await self._answer(send, 200, {"retired": self.ledger.retire(ids), "boot": self.ledger.boot})
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+        method = scope.get("method")
+        if scope.get("path") in (RETIRE_PATH, FENCE_PATH):
+            if method != "POST":
+                return await self._answer(send, 405, {"detail": "POST only"})
+            return await self._query(receive, send, scope.get("path") == FENCE_PATH)
+        if method in ("GET", "HEAD", "OPTIONS"):
+            return await self.app(scope, receive, send)
+        tid = None
+        for k, v in scope.get("headers") or []:
+            if k.lower() == TICKET_HEADER.encode():
+                tid = v.decode("latin-1")
+                break
+        why = self.ledger.open(tid)
+        if why is not None:
+            return await self._answer(send, 409, {"detail": f"{TICKET_REFUSAL} ({why})"})
+        token = self.current.set(tid)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.current.reset(token)
+            self.ledger.ended(tid)
+
+
+def install_tickets(ledger: TicketLedger, scheduler_cls: Any, engine_core_cls: Any, app: Any,
+                    http_exception: Any) -> Any:
+    """Install the retirement protocol on the text route (before any request exists): the middleware on `app`,
+    EngineCore.add_request binding each request to its ticket, Scheduler.add_request refusing an unbound one, and
+    the safe point after Scheduler.step() / reset() (a scheduler is watched from its first add_request or step).
+    Returns the context variable holding a request's ticket."""
+    import contextvars
+    import functools
+    import uuid
+    add = engine_core_cls.__dict__.get("add_request")
+    sched_add, step = scheduler_cls.add_request, scheduler_cls.__dict__.get("step")
+    reset = scheduler_cls.__dict__.get("reset")
+    if not all(callable(f) for f in (add, step, reset)) or not hasattr(app, "add_middleware"):
+        raise GuardError("text route: EngineCore.add_request, Scheduler.step / reset or the server app is missing: "
+                         "re-read the guard's retirement argument")
+    if any(getattr(f, "__cortados_ticket__", False) for f in (add, sched_add, step, reset)):
+        raise GuardError("the retirement guard is already installed")
+    current = contextvars.ContextVar("cortados_ticket", default=None)
+
+    @functools.wraps(add)
+    async def add_request(self, prompt, sampling_params=None, request_id=None, *args, **kwargs):
+        rid = request_id if request_id is not None else str(uuid.uuid4())
+        why = ledger.bind(current.get(), rid)
+        if why is not None:
+            raise http_exception(status_code=409, detail=f"{TICKET_REFUSAL} ({why})")
+        try:
+            return await add(self, prompt, sampling_params, rid, *args, **kwargs)
+        finally:
+            ledger.add_exited(rid)
+
+    @functools.wraps(sched_add)
+    def scheduler_add_request(self, request):
+        rid = request.request_id
+        ledger.watch(self)
+        with ledger.admit_lock:                # queueing and its entry number, atomic with a safe point (P1a)
+            if not ledger.entering(rid):
+                raise http_exception(status_code=409, detail=f"{TICKET_REFUSAL} (request {str(rid)[:12]} is not "
+                                                             "bound to an open gate ticket)")
+            try:
+                return sched_add(self, request)
+            finally:
+                ledger.entered(rid)
+
+    @functools.wraps(step)
+    def scheduler_step(self, *args, **kwargs):
+        ledger.watch(self)
+        with ledger.step_lock:
+            try:
+                return step(self, *args, **kwargs)
+            finally:
+                ledger.safe_point()
+
+    @functools.wraps(reset)
+    def scheduler_reset(self, *args, **kwargs):
+        with ledger.step_lock:
+            try:
+                return reset(self, *args, **kwargs)
+            finally:
+                ledger.safe_point()
+
+    for f in (add_request, scheduler_add_request, scheduler_step, scheduler_reset):
+        f.__cortados_ticket__ = True
+    scheduler_add_request.__cortados_guard__ = True
+    engine_core_cls.add_request = add_request
+    scheduler_cls.add_request = scheduler_add_request
+    scheduler_cls.step = scheduler_step
+    scheduler_cls.reset = scheduler_reset
+    app.add_middleware(TicketMiddleware, ledger=ledger, current=current)
+    return current
+
+
+def _ticket_seams() -> tuple:
+    """(EngineCore, the server's FastAPI app) of vllm-mlx 0.6.0, for install_tickets."""
+    from vllm_mlx import engine_core, server
+    return engine_core.EngineCore, server.app
+
+
+# Startup order (#126 review round 3, P2b): every check that needs only the disk runs first (_preflight: the pinned
+# files of vllm-mlx, mlx-lm (both routes, round 7), mlx-vlm, mlx and mlx-metal, located through find_without_import (the import system's
+# finders, asked directly: no parent package is imported, #126 review round 4 P2a) and the dist-info RECORDs, neither
+# of which runs package code), and only then is anything of them imported
+# (_modules / _text_modules / _vision_modules), each import checked to have come from the folder verified.
+def _locate(name: str) -> str:
+    """The folder a top-level package would be imported from, found without running it (find_without_import: the
+    import system's finders only)."""
+    try:
+        spec = find_without_import(name)
+    except (ImportError, ValueError) as exc:
+        raise GuardError(f"{name} cannot be located ({type(exc).__name__})") from None
+    if spec is None or not spec.origin or not spec.submodule_search_locations:
+        raise GuardError(f"{name} is not installed as a regular package")
+    return os.path.dirname(os.path.abspath(spec.origin))
+
+
+def _imported_from(mod: Any, folder: str, name: str) -> None:
+    """GuardError unless the module imported is the package in the folder verified on disk."""
+    got = os.path.dirname(os.path.realpath(str(getattr(mod, "__file__", "") or "")))
+    if got != os.path.realpath(folder):
+        raise GuardError(f"{name} was imported from {got!r}, not the verified {folder!r}")
+
+
+def _text_preflight() -> dict:
+    """mlx-lm's pinned files and mlx / mlx-metal's, on disk."""
+    lm = _locate("mlx_lm")
+    verify_text(lm, None)
+    return {"mlx_lm": lm, "mlx": verify_mlx_files()}
+
+
+def _vision_preflight(vllm_dir: str) -> dict:
+    """vllm-mlx's MLLM files, mlx-vlm's pinned files, and mlx-lm's and mlx / mlx-metal's exactly as on the text route
+    (#126 review round 7: vllm_mlx.scheduler, imported on both routes, imports mlx_lm), on disk."""
+    found = _text_preflight()
+    vlm = _locate("mlx_vlm")
+    verify_vision(vllm_dir, vlm, None)
+    return {**found, "mlx_vlm": vlm}
+
+
+def _preflight(vision: bool) -> dict:
+    """Every disk-only integrity check of the route served, before anything of vllm-mlx, mlx-lm, mlx-vlm or mlx is
+    imported: the folders verified and the pinned mlx.core / libmlx.dylib."""
+    vllm = _locate("vllm_mlx")
+    verify(vllm, None)
+    return {"vllm_mlx": vllm, **(_vision_preflight(vllm) if vision else _text_preflight())}
+
+
+def _text_modules(found: dict):
+    """After _preflight: mlx-lm imported from the folder verified, at its version, mlx.core the pinned extension, and
+    vllm-mlx's engine.batched module."""
+    import mlx_lm
+    _imported_from(mlx_lm, found["mlx_lm"], "mlx_lm")
+    verify_text(found["mlx_lm"], getattr(mlx_lm, "__version__", "?"), {})
+    verify_mlx_core(*found["mlx"][1:])            # the attention fallback and the allocator (mlx / mlx-metal 0.32.4)
+    from vllm_mlx.engine import batched
+    return batched
+
+
+def _vision_modules(found: dict):
+    """After _preflight: vllm-mlx's MLLM modules, mlx-vlm (from the folder verified, at its version), PIL and the image
+    checker, and mlx.core the pinned extension."""
+    lm = sys.modules.get("mlx_lm")                # imported by vllm_mlx.scheduler (_modules): the one verified
+    if lm is not None:
+        _imported_from(lm, found["mlx_lm"], "mlx_lm")
+        verify_text(found["mlx_lm"], getattr(lm, "__version__", "?"), {})
     import mlx_vlm
-    verify_vision(os.path.dirname(os.path.abspath(vllm_mlx.__file__)), os.path.dirname(os.path.abspath(mlx_vlm.__file__)),
-                  getattr(mlx_vlm, "__version__", "?"))
-    verify_mlx()                                  # the fused kernel's implementation (mlx / mlx-metal 0.32.4)
+    _imported_from(mlx_vlm, found["mlx_vlm"], "mlx_vlm")
+    verify_vision(found["vllm_mlx"], found["mlx_vlm"], getattr(mlx_vlm, "__version__", "?"), {}, {})
+    verify_mlx_core(*found["mlx"][1:])            # the fused kernel's implementation (mlx / mlx-metal 0.32.4)
     from vllm_mlx import mllm_batch_generator, vision_embedding_cache
     from vllm_mlx.models import mllm
     return mllm_batch_generator, vision_embedding_cache, mllm, load_image_check()
 
 
-def _modules():
-    """vllm_mlx and fastapi from the venv, verified against the pins."""
+def _modules(found: dict):
+    """After _preflight: vllm_mlx (from the folder verified, at its version) and fastapi from the venv."""
     import vllm_mlx
-    verify(os.path.dirname(os.path.abspath(vllm_mlx.__file__)), getattr(vllm_mlx, "__version__", "?"))
+    _imported_from(vllm_mlx, found["vllm_mlx"], "vllm_mlx")
+    verify(found["vllm_mlx"], getattr(vllm_mlx, "__version__", "?"), {})
     from fastapi import HTTPException
     from vllm_mlx import mllm_scheduler, scheduler
     from vllm_mlx.api import utils as api_utils
@@ -1182,14 +2241,17 @@ def _engines():
 
 
 def _usage(msg: str) -> int:
-    print(f"cortados-vllm-mlx-guard: {msg}\nusage: cortados-vllm-mlx-guard.py --context-tokens N [vision flags] -- serve "
-          "<model> [vllm-mlx args]\n       cortados-vllm-mlx-guard.py --check <model dir> [vision flags]\nvision flags: "
-          "--vision " + " N ".join(VISION_FLAGS) + f" N {DIMS_FLAG} name=N,...", file=sys.stderr)
+    print(f"cortados-vllm-mlx-guard: {msg}\nusage: cortados-vllm-mlx-guard.py --context-tokens N "
+          "(text flags | vision flags) -- serve <model> [vllm-mlx args]\n"
+          "       cortados-vllm-mlx-guard.py --check <model dir> [vision flags]\n"
+          "text flags: " + " N ".join(TEXT_FLAGS) + " N\nvision flags: --vision " + " N ".join(VISION_FLAGS)
+          + f" N {DIMS_FLAG} name=N,...", file=sys.stderr)
     return EXIT_REFUSED
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    isolate_bytecode()                            # before any pinned file is located or imported (P2c)
     if argv[:1] == ["--check"]:
         if len(argv) < 2:
             return _usage("--check takes one model directory")
@@ -1197,11 +2259,15 @@ def main(argv: list[str] | None = None) -> int:
             policy, rest = parse_vision(argv[2:])
             if rest:
                 return _usage("--check takes one model directory and the vision flags")
-            _, _, _, api_utils, _ = _modules()
+            found = _preflight(policy is not None)    # every pin on disk, before any of it is imported (P2b)
+            _, _, _, api_utils, _ = _modules(found)
             check_engines(*_engines())            # the engine refusal would hold on this vllm-mlx (read only)
             if policy is not None:
-                _vision_modules()                 # mlx-vlm's and mlx's versions and the vision pins
+                _vision_modules(found)            # mlx-vlm's and mlx's versions and the vision pins
                 check_vision_model(argv[1], policy.dims)
+            else:
+                _text_modules(found)              # mlx-lm's and mlx's versions and the text prefill pins (#126)
+                check_text_model(argv[1])
             route = api_utils.resolve_mllm_route(argv[1], argv[1])
         except GuardError as exc:
             print(f"cortados-vllm-mlx-guard: {exc}", file=sys.stderr)
@@ -1223,8 +2289,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"cortados-vllm-mlx-guard: {MLLM_REFUSAL}; {argv[1]} resolves to the MLLM route "
                   f"({getattr(route, 'source', '?')})", file=sys.stderr)
             return EXIT_REFUSED
-        print(f"cortados-vllm-mlx-guard: ok (vllm-mlx {VLLM_MLX_VERSION}, pinned files match, only BatchedEngine "
-              "may serve, text route)")
+        print(f"cortados-vllm-mlx-guard: ok (vllm-mlx {VLLM_MLX_VERSION}, mlx-lm {MLX_LM_VERSION} and mlx / mlx-metal "
+              f"{MLX_VERSION}, pinned files match, only BatchedEngine may serve, text route)")
         return 0
     if "--" not in argv:
         return _usage("missing `--` before the vllm-mlx arguments")
@@ -1232,20 +2298,34 @@ def main(argv: list[str] | None = None) -> int:
     own, rest = argv[:cut], argv[cut + 1:]
     try:
         policy, own = parse_vision(own)
+        text, own = parse_text(own)
     except GuardError as exc:
         return _usage(str(exc))
     if len(own) != 2 or own[0] != "--context-tokens" or not own[1].isdigit():
         return _usage("expected --context-tokens N")
-    if rest[:1] != ["serve"]:
-        return _usage("only `serve` is run through the guard")
+    if rest[:1] != ["serve"] or len(rest) < 2:
+        return _usage("only `serve <model>` is run through the guard")
+    if policy is None and text is None:
+        return _usage("the text route needs " + " N ".join(TEXT_FLAGS) + " N (#126: its prefill is bounded)")
+    if policy is not None and text is not None:
+        return _usage("the text flags are for the text route; vision mode bounds its own prefill")
     if BATCHING_FLAG not in rest:
         return _usage(f"{ENGINE_REFUSAL} (`{BATCHING_FLAG}` missing from the serve arguments)")
+    if text is not None and PREFIX_CACHE_FLAG not in rest:
+        return _usage(f"{PREFIX_CACHE_REFUSAL} (`{PREFIX_CACHE_FLAG}` missing from the serve arguments)")
     try:
-        _, scheduler, mllm_scheduler, api_utils, http_exception = _modules()
+        found = _preflight(policy is not None)    # every pin on disk, before any of it is imported (P2b)
+        _, scheduler, mllm_scheduler, api_utils, http_exception = _modules(found)
         if policy is not None:
-            batch_generator, vision_cache, mllm_models, image_check = _vision_modules()
+            batch_generator, vision_cache, mllm_models, image_check = _vision_modules(found)
+        if text is not None:
+            batched = _text_modules(found)
+            check_text_model(rest[1])
         install(int(own[1]), scheduler.Scheduler, mllm_scheduler.MLLMScheduler, api_utils, http_exception,
                 *_engines(), vision=policy)
+        if text is not None:
+            install_text(text, scheduler.Scheduler, batched)
+            install_tickets(TicketLedger(), scheduler.Scheduler, *_ticket_seams(), http_exception)
         if policy is not None:
             import warnings
             from PIL import Image
@@ -1259,7 +2339,9 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_REFUSED
     what = (f"; vision: {policy.max_images} images of at most {policy.image_tokens} tokens, image requests capped at "
             f"{policy.image_context_tokens}, media prefill in chunks of {policy.prefill_tokens} keeping one position's "
-            "logits" if policy is not None else "")
+            "logits" if policy is not None else f"; text prefill one sequence at a time in chunks of at most "
+            f"{text.prefill_tokens}, MLX buffer cache {text.buffer_cache_bytes} bytes, prefix cache off, each turn "
+            f"retired to the gate once it left the scheduler ({RETIRE_PATH})")
     print(f"cortados-vllm-mlx-guard: prompt + max_tokens capped at {own[1]} tokens (vllm-mlx {VLLM_MLX_VERSION})"
           f"{what}", file=sys.stderr)
     from vllm_mlx import cli

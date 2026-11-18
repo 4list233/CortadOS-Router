@@ -21,8 +21,17 @@ is the long form.
   `~/.config/cortados/local-backend.json`: fixed upstream routes, thinking → `chat_template_kwargs` (only
   `enable_thinking` allowed), the vllm-mlx LaunchAgent for `scripts/install_mlx_backend.sh`, run through the prompt
   guard `integrations/vllm-mlx/cortados_vllm_mlx_guard.py`, pinned to vllm-mlx 0.6.0, which refuses a prompt + max_tokens
-  over the context before vllm-mlx schedules it), `local_governor.py` (the gate's admission: a count from owner idle
-  time and memory pressure, and a byte budget each request reserves its KV cache from; over either a retryable 529, never
+  over the context before vllm-mlx schedules it, and on the text route prefills one sequence at a time in 256-token chunks
+  under a capped MLX buffer cache with vllm-mlx's prefix cache off, pinned to mlx-lm 0.31.3 and mlx 0.32.4
+  (its Python files too), #126), `local_governor.py` (the gate's admission: a count from owner idle
+  time and memory pressure, and a byte budget each request reserves its KV cache from (a text-only model's text turns as one
+  set: the padded decode batch and the guard's one-at-a-time 256-token text prefill, drained when a departed
+  turn's kept width withholds room, checked on the governor's own state, #126; a vllm-mlx text turn is released only
+  when the guard's `TicketLedger` confirms it left the scheduler: `local_gate.Retirer`, and a gate admits no text
+  turn until the guard confirms no row of a turn it does not know remains (the fence, `FENCE_PATH`, #126 round 4); each gate start takes the node's next
+  epoch (`next_epoch`, `~/.config/cortados/local-gate-epoch`, flock + fsync, corrupt refuses to start) and the guard
+  admits only the highest epoch fenced (#126 round 6), docs/LOCAL-RESOURCES.md
+  "Retirement"); over either a retryable 529, never
   fitting a non-retryable 413 the provider routes elsewhere; input tokens bounded by the body's bytes as received plus a template allowance, never a backend count; images and documents refused for the text-only model, and for a model entry declaring `vision` (#125) still images
   within its policy, an image slot and the computed media-prefill bytes (`image_prefill_bytes`, the guard prefills
   image prompts in chunks keeping one position's logits) in the same atomic reservation; `image_check.py` reads image

@@ -907,6 +907,13 @@ reserved = tokens × kv_bytes_per_token + per_seq_state_bytes + prefill_margin_b
 admit    iff  count < count limit  and  reserved in flight + reserved ≤ memory_budget_bytes − weights_bytes
 ```
 
+**Since #126 this per-request formula is a floor on the served text-only model, not the reservation.** Its text turns
+are reserved as one set, from the computed peak of the guard's chunked prefill and of the decode batch, which pads
+every request's KV cache to the longest one. That peak is never less than this formula's sum. "Text prefill and the
+text route's reservation (#126)" below has the formula, the numbers and what changed. A vision model's turns (#125)
+still reserve per request, as here. The tables in this section are the per-request numbers: the floor on the text-only
+model, and the reservation on a vision model.
+
 **The input bound** (`local_governor.input_tokens`). A turn's input tokens are bounded from above, never estimated and
 never asked of the backend:
 
@@ -1002,8 +1009,8 @@ for ~20 messages and 40 blocks:
 
 The count limit applies on top: 2 with the owner active, 8 idle (6 for the 6-bit), 1 under warn pressure. So:
 
-- Two full 128k turns still run at once at 4-bit; a third waits (529). This is the same as before, since long turns
-  were already capped.
+- (Before #126.) Two full 128k turns ran at once at 4-bit. On the text-only model a full 128k turn now reserves 24.6
+  GiB alone, and nothing else runs beside it (#126, below).
 - With the owner active, every row admits at least 2 by bytes, so short turns are limited by the count cap first.
 - With the owner idle, bytes limit before the count of 8 except for small turns with small max_tokens. A turn with
   vllm-mlx's default max_tokens (32k, as Claude Code sends) reserves ≥ 4.2 GiB whatever its size.
@@ -1106,11 +1113,17 @@ recurrent; vllm-mlx keeps the KV cache unquantized, fp16):
 | `weights_bytes` | 15 GiB (4-bit); 22.4 GB (6-bit, measured idle) | resident weights |
 | `kv_bytes_per_token` | 65,536 | 16 full-attention layers × K/V × 4 KV heads × head_dim 256 × 2 bytes; 128k tokens = 8 GiB |
 | `per_seq_state_bytes` | 0.15 GiB | the recurrent layers' state per sequence |
-| `prefill_margin_bytes` | 1.5 GiB | prefill activations and allocator slack: the 6-bit copy used 2.3 GB over idle for one ~9k-token request, KV + state explain ~0.7 GiB |
+| `prefill_margin_bytes` | 1.5 GiB | prefill activations and allocator slack: the 6-bit copy used 2.3 GB over idle for one ~9k-token request, KV + state explain ~0.7 GiB. Since #126 the per-request floor on the text-only model (its text turns reserve the computed set peak, "Text prefill" below) |
 | `context_tokens` | 131072 | the Pro block's `context_length` on the provider host; tokens are capped here |
+| `text_prefill_chunk_tokens` | 256 | #126: the guard's text prefill chunk (`--text-prefill-tokens`; upstream 2,048); the score term is linear in it |
+| `text_score_buffers` | 4 | #126: score-sized buffers per chunk (q·kᵀ, masked copy, softmax, one for the allocator); computed, to be measured |
+| `kv_copies` | 2 | #126: the padded decode batch's KV and one replaced copy; at least 2 |
+| `buffer_cache_bytes` | 512 MiB | #126: MLX's buffer cache limit as the guard sets it (`--buffer-cache-bytes`; upstream 90% of the GPU working set); a recycling threshold, so one largest buffer is counted on top |
 
-What that admits, in RESERVED tokens (the bound's, not a turn's real size; "The cost" above maps one to the other;
-owner idle, pressure normal; 25 GiB beside the 4-bit weights, 17.6 GiB beside the 6-bit):
+What the per-request formula admits, in RESERVED tokens (the bound's, not a turn's real size; "The cost" above maps one
+to the other; owner idle, pressure normal; 25 GiB beside the 4-bit weights, 17.6 GiB beside the 6-bit). On the
+text-only model these are superseded by #126's set reservation ("Text prefill", below). Only the short rows still
+stand there, byte for byte:
 
 | Mix | Reserved | 4-bit | 6-bit |
 |---|---|---|---|
@@ -1134,7 +1147,9 @@ Rules on top:
 - Both bounds gate **admission only**: when the owner comes back with 6 running, the limit drops to 2, nothing new is
   admitted until fewer than 2 run, and the 6 finish on their own (never killed). A reservation is released however
   its turn ends: answered, backend error, upstream timeout, backend unreachable, client gone mid-stream, or an
-  exception in the relay (a `Ticket`, released once in the gate's `finally`).
+  exception in the relay (a `Ticket`, released once). On Ollama and on a vision model it is released in the gate's
+  `finally`; on a vllm-mlx text-only model only when the guard confirms the turn left vllm-mlx's scheduler
+  ("Retirement" below), because closing the connection does not end the request there.
 - vllm-mlx's own `--max-num-seqs` is `max_seqs()`: the idle cap, bounded by how many empty-context reservations fit.
 - **`vllm_mlx.extra_args` cannot override what the generator sets.** argparse keeps the last value of a repeated flag
   and expands abbreviations (`--ho` is `--host`), so `["--host", "0.0.0.0", "--max-num-seqs", "64"]` would expose the
@@ -1195,7 +1210,325 @@ S1's route stands ("routes elsewhere"). A turn the gate still refuses:
 
 The refusal fallback (`local_lane.complete`) treats a busy, too-large or text-only refusal as an unavailable node.
 
+### Text prefill and the text route's reservation (#126)
+
+**What the released code does** (vllm-mlx 0.6.0, mlx-lm 0.31.3, MLX 0.32.4; read from the PyPI wheels and MLX's
+v0.32.4 source, never run). On a text-only model, `Scheduler._create_batch_generator` (`scheduler.py` 1518-1600) builds
+mlx-lm's `BatchGenerator` with vllm-mlx's `--prefill-step-size` (default **2,048**, not 1,024 as #126 first said) and
+`--prefill-batch-size` (default 8).
+
+- **Chunking: yes, at 2,048, up to 8 prompts together.** `PromptProcessingBatch.prompt` (`generate.py` 1124-1170)
+  runs the model over at most `prefill_step_size` tokens at a time for every prompt in the prompt batch, right-padded
+  to the longest, against one `BatchKVCache`. Between steps it evaluates the cache state and clears MLX's cache.
+- **Full-vocabulary logits: no.** The prefill evaluates only `[c.state for c in cache]`, so the vocabulary projection
+  of prompt positions is never computed (MLX is lazy). The last prompt token goes to the first decode step, which keeps
+  `logits[:, -1, :]` of a one-token input. Nothing like #125's 27.8 GiB of logits exists on this route.
+- **Attention scores: unfused, per chunk against the whole prompt.** qwen3_5's full-attention layers
+  (`qwen3_next.Qwen3NextAttention`) call `mx.fast.scaled_dot_product_attention` with the batch cache's boolean mask.
+  MLX 0.32.4's `use_fallback` (`scaled_dot_product_attention.cpp` 1390-1462) takes the unfused path for head_dim 256
+  below 1,024 query tokens. Above that it does so too, unless the GPU has neural accelerators or the chunk is the first
+  one. The fallback (`fast.cpp`) builds bfloat16 `q·kᵀ`, a masked copy and a softmax of Hq × chunk × context each.
+  At the upstream step, a buffer is up to **8 × 24 × 2,048 × 131,072 × 2 bytes = 96 GiB** (12 GiB for one prompt). The
+  issue's "6 GiB a buffer" was one prompt at 1,024.
+- **The decode batch pads.** `GenerationBatch.extend` → `BatchKVCache.extend` (`cache.py` 1035-1078) pads every row's
+  KV to the longest row. So n requests beside a 128k one hold n × 128k of KV, not the sum of their lengths. The
+  per-request formula above is not a bound for a mixed set.
+- **KV growth.** `KVCache` / `BatchKVCache` grow by 256 positions by concatenation. A request joining or leaving the
+  batch (`extend`, `filter`) and a finished request's extracted row (`extract`) each build a new copy beside the old
+  one. vllm-mlx sets MLX's buffer cache limit to 90% of the GPU's working set (`engine/batched.py`
+  `_resolve_metal_buffer_cache_limit`), so freed copies stayed resident until the next periodic clear (every ≤ 32
+  scheduler steps).
+- **The gated-delta state.** Per sequence, 48 linear-attention layers × 48 × 128 × 128 float32 (`gated_delta.py` 279)
+  plus the conv state = 0.144 GiB, under `per_seq_state_bytes` (0.15 GiB). It is copied when the batch is reshaped.
+
+**What the guard changes** (`cortados_vllm_mlx_guard.py` "Text prefill"; flags from `local_backend.text_argv`):
+
+- Every `BatchGenerator` the Scheduler builds prefills **one sequence at a time**, in chunks of at most
+  `text_prefill_chunk_tokens` (256): `prefill_batch_size = 1`, `prefill_step_size` and the prompt batch's own step
+  clamped. vllm-mlx also gets `--prefill-step-size 256 --prefill-batch-size 1`, but the runtime clamp is the proof. A
+  generator without that layout, or a model other than mlx-lm's `qwen3_5`, fails the request instead of prefilling it.
+- MLX's buffer cache limit is set to `buffer_cache_bytes` (512 MiB, `--buffer-cache-bytes`). The limit is a
+  recycling threshold, not a hard cap. MLX's allocator (`allocator.cpp` `free`) caches a whole freed buffer whenever
+  the cache is under the limit, and trims back to the limit on the next allocation. So the cache holds at most the
+  limit plus one buffer, and the reservation counts both (`buffer_cache` + `cache_overshoot`). A replaced KV copy or
+  score buffer no longer stays resident until the next periodic clear.
+- **Same outputs.** A chunk boundary only splits the prompt into causal attention against the cached keys plus the
+  gated-delta and conv state carried in the cache. That is the path upstream already takes at 2,048. Not batching
+  prefills is a scheduling choice: each row was already masked to its own tokens. Floating-point results can differ
+  at the rounding level, as between any two chunk sizes, because GEMM tiling depends on the chunk's rows. No token is
+  dropped or reordered. The cost is prefill speed: more, smaller steps, and concurrent prompts prefill one after
+  another. Not measured.
+- **Pinned.** mlx-lm 0.31.3 (`MLX_LM_PINNED_SHA256`, from the wheel `mlx_lm-0.31.3-py3-none-any.whl`, sha256
+  `758cfddf…83b8`): `generate.py`, `sample_utils.py`, `models/cache.py`, `models/base.py`, `models/qwen3_5.py`,
+  `models/qwen3_next.py`, `models/gated_delta.py`, `models/activations.py`, `models/rope_utils.py`,
+  `models/switch_layers.py`, and `__init__.py`, `_version.py`, `models/__init__.py`; since #126 review round 4 also the
+  rest of what `import mlx_lm` runs (`convert.py`, `utils.py`, `tokenizer_utils.py`: `__init__` imports convert,
+  generate and utils) and every module loading a tokenizer may import by name (`tool_parsers/*.py`,
+  `chat_templates/*.py`); any entry in those two folders that the release lacks is refused, and so is a `config.json`
+  naming a `model_file` (mlx-lm would execute it from the model folder). Since #126 review round 5 (P2c) "any entry"
+  means any: a subdirectory (a regular or namespace package named like a pinned module is imported in its place,
+  `FileFinder` tries the package first: the reviewer's `tool_parsers/qwen3_coder/__init__.py`), an extension module of
+  any suffix in `importlib.machinery.all_suffixes()`, a `.pth`, a stray `.pyc`, or a pinned name that is not a regular
+  file. The one exception is `__pycache__` (a real directory, not a link), accepted only while the guard's bytecode is
+  isolated. Every pinned mlx-lm module must also resolve, through the import system's finders and without importing
+  anything (`verify_lm_resolution`), to its pinned file: a `utils/` package beside `utils.py` is refused too. Since
+  #126 review round 6 (P2c) none is skipped: `mlx_lm` itself (resolved within the folder holding it) and `_version`
+  (`__init__` runs `from ._version import __version__`; a pyc-only `_version/` package won over the pinned file and
+  ran). **Sourceless modules** (round 6): `sys.pycache_prefix` keeps `__pycache__` unread but does not stop Python's
+  sourceless loader, so in every verified package tree (vllm-mlx, mlx-lm, mlx-vlm and mlx's Python folder,
+  `verify_sources_only`, before anything is imported) a `.pyc` / `.pyo` outside `__pycache__`, an extension module
+  beside a `.py` of its name, and a package folder (an `__init__` of any importable suffix) beside a `.py` of its name
+  are refused. **Bytecode**:
+  Python accepts a `__pycache__` file whose header carries its source's mtime and size, without reading the source, so a
+  cached file beside a pinned source could run in its place. The guard's `main()` first sets `sys.dont_write_bytecode`
+  and points `sys.pycache_prefix` at a fresh empty directory of its own (`isolate_bytecode`), before anything outside
+  the standard library is located or imported: no in-tree cache is read, every verified source is compiled as it is
+  imported (a slower start, once per backend start). The vllm-mlx files are the text route's existing pins
+  (`scheduler.py`, `engine/batched.py`, `engine_core.py`). The text route now also requires `mlx` / `mlx-metal` 0.32.4
+  (`verify_mlx`, as vision mode does), because the attention fallback and the allocator are in the compiled library. And
+  `config.json` must be the verified text geometry (`check_text_model`, `TEXT_DIMS`: the language dimensions above, 64
+  layers, full attention every 4th, dense, bfloat16). This is checked at `--check` and before `serve`. Any drift stops
+  startup.
+
+**The reservation** (`local_governor.text_set_bytes`). Every text turn on the text-only model joins one set; the
+gate admits it while the set's total fits beside the weights. Notation: n = turns in the set; M = the longest turn's
+tokens (input bound + max_tokens, capped) + 256; P = a turn's prompt bound (its input bound, capped at the context);
+C = min(256, P); a = 2; Hq 24, Hkv 4, D 256, V 248,320; width = 314,112 bytes per token and layer. M also covers
+the widest turn admitted since the set was last empty (a high-water mark, #126 review). When the longest row leaves
+the decode batch, `BatchKVCache.filter` (`cache.py` 1016-1033) gathers the survivors at the old width and slices the
+padding off. The slice is a view, so the wide buffer stays alive until the batch grows, a turn joins, or the batch
+empties. The gate cannot see that moment, so it keeps the width until no text turn runs. For the same reason (review
+round 2), the set's rows × width (n × M, "cells") and its `cache_overshoot` never shrink while any text turn runs.
+filter's gather is lazy: it is evaluated on the survivors' next step, so a batch of eight can outlive seven finished
+tickets. And the buffer the cache overshoots by can be a departed turn's. Both reset when the set drains: an empty
+batch holds nothing, and vllm-mlx clears MLX's cache when requests finish (`scheduler.py` `_cleanup_finished`).
+
+| term | bytes | what it holds |
+| --- | --- | --- |
+| kv | kv_copies (2) × n × M × 65,536 | the decode batch, every row padded to the longest, and one replaced copy |
+| decode | 4 × Hq × n × M × a + n × M | one decode step's attention rows and mask against the padded batch |
+| fixed | n × (2 × per_seq_state_bytes + V × (a + 8)) | each turn's recurrent state and one copy; its decode row's logits and float32 log-probabilities |
+| prefill | max over the set of: 4 × Hq × C × P × a + 2 × C × P + 2 × C × width + 8 × P | ONE prompt's chunk at a time: unfused scores (q·kᵀ, masked copy, softmax, one for the allocator), the boolean mask and its left-padding product, one layer's activations doubled for the allocator, the prompt's ids |
+| buffer_cache | buffer_cache_bytes (512 MiB) | MLX's buffer cache limit as the guard sets it, once while anything runs |
+| cache_overshoot | max(Hq × C × P × a, n × M × Hkv × D × a), P the longest prompt | the one buffer the cache can hold over its limit: a chunk's score buffer, or one layer's K (or V) of the padded batch |
+| **total** | max(sum of the above, the per-request formula summed) | the old reservation stands, byte for byte, wherever it was already at least the computed peak |
+
+width is the larger layer: the MLP's gate, up and product plus the residual, norms and output: 2 × (3 × 17,408 + 4 ×
+5,120). Plus the linear-attention layer: in_proj_qkv, the conv input and output (3 × 10,240), z, the gated-delta
+output, its norm and gated product (4 × 6,144), the normed q and k (2 × 2,048), all bfloat16, and the float32
+precise-swiglu and gate temporaries (4 × (2 × 6,144 + 4 × 48)). The full-attention layer is smaller (2 × (6 × 24 × 256
++ 4 × 4 × 256)).
+
+By term, one turn whose prompt is its whole context (4-bit defaults; `tests/test_text_prefill.py`):
+
+| tokens | scores | mask + chunk + ids | kv | decode + fixed | buffer cache + overshoot | **total** | old formula |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1,024 | 0.05 GiB | 0.15 GiB | 0.16 GiB | 0.30 GiB | 0.51 GiB | **1.71 GiB** (the old formula: computed 1.17) | 1.71 GiB |
+| 32,768 | 1.50 GiB | 0.17 GiB | 4.03 GiB | 0.31 GiB | 0.88 GiB | **6.88 GiB** | 3.65 GiB |
+| 65,536 | 3.00 GiB | 0.18 GiB | 8.03 GiB | 0.31 GiB | 1.25 GiB | **12.78 GiB** | 5.65 GiB |
+| 131,072 | 6.00 GiB | 0.21 GiB | 16.03 GiB | 0.33 GiB | 2.00 GiB | **24.57 GiB** | 9.65 GiB |
+
+**The maximum admitted text prompt.** 4-bit (25 GiB beside 15 GiB of weights): **the whole context**. Any prompt
+with prompt + max_tokens ≤ 131,072 fits, alone (24.57 GiB at the cap, so nothing runs beside a full-context turn). The
+6-bit copy (17.6 GiB beside 22.4 GB): at most **92,338 tokens of context** alone (`fit_tokens` reports 92,337,
+counting the prompt as the whole context). In the gate's input bound, that is 92,337 with max_tokens 1, 89,555 with
+4,096, and 70,077 with Claude Code's 32,768. Anything larger is a
+**413 never-fits** (`x-should-retry: false`), which the provider routes elsewhere. A turn that fits alone but not
+beside what runs now is a retryable **529**, as before.
+
+**What changes for current traffic** (text-only 4-bit, owner idle, count 8; per-turn size from the input bound, which
+counts ~4 body bytes per real token of code):
+
+| input bound + max_tokens | reserved before → now | fit at once before → now |
+| --- | --- | --- |
+| 1,000 + 256 | 1.73 → 1.73 GiB | 8 → 8 (the count) |
+| 8,000 + 512 (~2k real) | 2.17 → 2.49 GiB alone; 8 together reserve exactly the old 17.4 GiB | 8 → 8 |
+| 36,000 + 512 (~9k real) | 3.88 → 7.52 GiB | 6 → 4 |
+| 8,000 + 32,000 (~2k real, Claude Code) | 4.09 → 6.34 GiB | 6 → 4 |
+| 34,000 + 32,000 (~8.5k real, Claude Code) | 5.68 → 11.01 GiB | 4 → 2 |
+| 64,000 + 4,096 | 5.81 → 13.00 GiB | 4 → 2 |
+| ≥ 99k + 32,000 (the cap) | 9.65 → 24.57 GiB | 2 → 1 |
+
+A mixed set pays for its longest row: a short turn beside a 128k one now waits (529) instead of running, because it
+would hold 128k of KV in the padded batch. After a long turn, or a full batch, ends, the turns still running keep
+its width and row count in the reservation until no text turn runs. That is the price of not knowing when the backend
+compacts.
+
+**The drain** (#126 review rounds 2 and 3, P2a). Kept that way alone, the stale width could last forever: overlapping
+short turns keep the set from ever being empty, and the reviewer's repro (a 64k turn, then 100 overlapping replacements
+of a short one) ended with two 100-token turns holding 17.6 GiB and a third refused. So the set **drains** when the
+kept terms (the high-water width and peak rows) withhold room: the most tokens one more turn may hold beside the live
+turns (`text_room`, the report's `free_tokens`) is smaller with them than for the live turns reserved as a fresh set.
+The governor checks this on its own state, at every departure, admission and capacity snapshot (round 3: the
+provider reads `free_tokens` before sending, `local_lane.gate_fit`, and skips a node with no room, so a refusal that
+would start the drain may never come). A text turn refused for bytes only the stale terms take drains the set too.
+While draining, every new text turn is a retryable 529 ("text set draining"), the report says so in `reason` and
+`draining`, and `free_tokens` is 0, so the provider counts the node busy, not too small. When the turns in flight end
+(and are retired) the empty set resets and admission resumes at the fresh size. The wait is bounded by those turns'
+`max_tokens` and the gate's read timeout. Room, not bytes, is the trigger: `text_room` is monotone in the tokens, so
+equal rooms mean the kept terms refuse no request size a fresh set would admit, while their bytes differ after almost
+every overlapping departure (two 20k turns overlapping: 9.0 against 5.6 GiB kept, the same room), which would drain
+for nothing. A turn that would not fit a fresh set either, or a full count, is plain busy and starts no drain.
+
+Why a drain rather than reclaiming when the backend says its batch shrank: the gate cannot see when `filter`'s lazy
+gather is evaluated, when the old wide buffer is dropped, or which freed buffer sits in MLX's cache. A "freed" report
+from the guard would need a safe point in mlx-lm's generation loop where all of that is known, and the released code
+offers none without patching the loop. The drain needs no backend signal: it never shrinks the reservation while a
+turn of the old set runs, so the lazy-free protection holds, and it costs only a short pause in admissions after a
+long turn ends beside short ones. Retirement (below) tells the gate when a request has left the scheduler, which is
+when its ticket may leave the set; it does not say when the batch's lazy buffers go, so the set's kept terms stay.
+
+**Retirement** (#126 review round 3, P1). Closing the upstream connection does not end a request in vllm-mlx 0.6.0:
+`_disconnect_guard` defers the stream generator's close by 0.5 s (`server.py` 5481-5497), and `Scheduler.abort_request`
+only queues the id (`scheduler.py` 2227-2242) until the executor's next `step()` processes it
+(`_process_pending_aborts`, then `_do_abort_request` removes its rows from the batch generator). Releasing a ticket when
+forwarding ended let the reviewer's repro run 8 rows upstream (a timed-out 64k turn and 7 short ones, 31.25 GiB of KV)
+against 7 tickets and 12.05 GiB reserved. Now, on a vllm-mlx node serving a text-only model (governed or not):
+
+- each forwarded turn carries a fresh ticket id (`x-cortados-ticket: <epoch>.<seq>.<nonce>`: 16 hex, 16 hex, 32 hex,
+  no request data; the gate process's epoch, its counter that only goes up, and 128 random bits that only make the id
+  unguessable; epochs below);
+- when forwarding ends the ticket turns **retiring**: it keeps its count slot, its bytes and its place in the text set,
+  and the report counts it under `retiring` (`reason`: "N ended turns await backend release");
+- the gate's `Retirer` thread asks the guard (`POST /cortados/retire {"tickets": [...]}` on the loopback backend, every
+  0.2 s while any ticket retires, backing off to 2 s after a failure) and releases exactly the ids it answers retired;
+- the guard (`TicketLedger`) refuses a generating request (any method but GET / HEAD / OPTIONS) without a fresh, unused
+  ticket (409, before vllm-mlx reads it), binds every scheduler request id to its ticket in `EngineCore.add_request`
+  (the request's own task; a scheduler request bound to no open ticket is refused), and at the **safe point**, the end
+  of every `Scheduler.step()` and `reset()` (or on a query when no step is running), marks a request gone once it is in
+  none of the waiting queue, the running map, the request-to-uid map (rows in the batch generator) or the unfinished
+  requests. A ticket is retired when its HTTP exchange has ended and every request bound to it is gone or never entered
+  the queue; it is then closed, and nothing more may bind to it.
+- An id the guard never saw is retired, untracked, only when it can never be admitted: malformed, of an epoch below
+  the current one, or of the current epoch below its floor; of the current epoch it is tombstoned first (tracked,
+  refused should it still arrive). It never entered this process's scheduler. An unseen id of an epoch above the
+  current one, and any id while no epoch is current (a new process before any fence), is never retired: that epoch
+  may still be fenced and the id admitted. So a backend restart, a new process whose rows are all freed, retires every
+  retiring ticket once the gate has fenced it (the gate fences on the new boot id).
+- **Epochs, no wall clock** (#126 review rounds 5 and 6). Until round 4 an id began with its minting time; round 5
+  replaced the clock with a random 128-bit gate generation, which gave identity but not order: a fresh guard adopted
+  the first ticket's generation, acknowledged another generation's unseen id without recording it, and that
+  generation could still be fenced and its delayed id admitted after its reservation was released (round 6, P2a); and
+  a delayed old fence reaching a fresh guard after the live gate's recorded the live gate as replaced, fencing it out
+  for good (P2b). Now each gate start takes the node's next **epoch**, a strictly increasing integer
+  (`local_gate.next_epoch`, `~/.config/cortados/local-gate-epoch`, overridable with `CORTADOS_LOCAL_GATE_EPOCH_FILE`):
+  under an exclusive `flock` on `<file>.lock` it reads the last epoch (a missing file is 0), adds 1, writes it to a
+  temp file, fsyncs it, renames it over the file and fsyncs the directory, before the epoch is used. Files are 0600,
+  a created directory 0700. A file that is not one decimal integer from 1 to 2^64-1, not a regular file, or a link is
+  refused loudly and the gate does not start; it is never reset (a reset could hand out an epoch the guard already
+  superseded). The guard has **no current epoch until a fence arrives** (no adoption: a fresh process refuses every
+  ticket, 409); a fence of epoch E is accepted only if E is at least the current epoch (the highest this process has
+  seen) and a lower one is refused (`"refused": true`) and changes nothing; once E is current an id of any other epoch
+  is refused on arrival, at `bind` (`EngineCore.add_request`) and at `Scheduler.add_request`: one below E for good,
+  one above E until its gate fences. A guard restart forgets everything, which is safe: the new process holds no rows,
+  and a delayed old fence reaching it first is superseded by the live gate's higher epoch. Replay within an epoch is
+  stopped by the record (open, ended, closed or tombstoned) and, once evicted, by the epoch's counter floor. On the
+  guard's 409 ticket refusal (a backend restart while the gate sat idle, so no poll saw the new boot id) the gate
+  fences again and retries the turn once, under a new id and the same reservation, once the fence lifts: the first
+  turn after a backend restart costs one upstream retry and no client retry; the refused id stays known to the fence,
+  with no reservation of its own, until the guard retires it. A refused retry answers 529 busy.
+- **Fail closed**: no confirmation (the guard hung, a step that never returns, the backend unreachable) keeps the ticket
+  reserved and the node busy. A connect that failed sent nothing and is released at once.
+- **Atomic with admission** (#126 review round 4, P1a). `Scheduler.add_request` is not under the step lock, so a
+  retire query's snapshot could start, an add could queue a bound request, and the query would then mark it gone while
+  it ran. Now `Scheduler.add_request` (entering, the scheduler's own add, entered) holds the ledger's `admit_lock`, and
+  so does every safe point from noting the entry sequence number to marking what is gone. A request is numbered as its
+  add completes; a safe point may mark gone only a request numbered below the number it noted before reading, i.e. one
+  that was queued before the read began. The lock makes the check redundant; the number keeps it true for any path that
+  ever adds outside the lock. A query takes the step lock and the admit lock without waiting: with either busy it
+  answers from the last safe point.
+- **Bounded** (P2b). The guard tracks at most `TICKET_MAX` (8192) ids on every insert path (arrival and tombstone). At
+  the bound it evicts closed ids (and ended ones of an epoch no longer current whose requests are all gone), old
+  epochs first, then the current one by counter (every id of an old epoch, and at least the oldest quarter), and the
+  current epoch's **floor** rises past every evicted counter: an id below the floor is refused on arrival
+  and, asked about, retired without being tracked. So an evicted tombstone can never be replayed. Open turns are never
+  evicted; an unknown id that cannot be tracked (every slot an open turn) is not retired, so the gate keeps it reserved.
+
+**The fence** (#126 review round 4, P1b). The gate's admissions and retiring tickets live in its process only, and its
+LaunchAgent restarts it (`KeepAlive`) while vllm-mlx runs on. The reviewer's repro: an old 64k turn survives a gate
+restart, and the fresh gate admits two more 64k turns, 28.8 GiB computed against 25 GiB. So a gate on a vllm-mlx text
+node starts **fenced**:
+
+- it admits no text turn (529 busy, `Retry-After`, the reason in the message and in the capacity report's `fence`)
+  until the guard answers `POST /cortados/fence {"epoch": <this gate's>, "known": [ids this gate minted and has
+  not released]}` with `"clear": true`;
+- the guard, under the same locks as the safe point, makes that epoch the only one admitted (no id of a previous
+  gate is admitted or bound any more, whatever either clock says: a request a dead gate sent late cannot slip in
+  afterwards), and answers clear only if no request bound to a ticket outside `known` is pending, queued or in the
+  scheduler and no such exchange is open. It counts a request as present until a safe point has seen it leave, so it
+  errs towards fenced. A gate whose epoch is below the guard's (a newer gate fenced it) stays fenced;
+- the gate fences itself again whenever it cannot vouch for the backend's state: a retirement poll or a fence query
+  failed (lost contact), the guard's boot id changed, or the guard refused a turn's ticket (409). A changed boot id is a new vllm-mlx process: the old rows went
+  with the old process, so with only this gate's own turns known the fence lifts at once, and the new process then
+  retires every old id (the restart path above);
+- a hung or unreachable guard keeps the fence up, visibly (`fence`: "the backend's guard did not confirm the fence");
+  the Retirer thread retries with the same back-off, and a request arriving while fenced triggers one query at most
+  every 2 s after a failure (a burst shares the one running).
+
+Chosen over the alternative of reserving the backend's reported rows at full width: that needs a per-row width or a
+worst case per row and a second reservation path in the governor, while the fence needs one query and admits nothing
+it cannot account for. Its cost is a pause after a gate restart while a previous gate's turns finish.
+
+**Before enabling vision**: a vision model's turns are still released at **transport end**. The MLLM scheduler has
+the same deferred-abort shape, so a vision turn's rows can outlive its connection exactly as the text route's did
+before retirement. Vision (#125) must not be enabled on the Pro until its route carries tickets and the retirement
+protocol (the ledger, the safe point after the MLLM scheduler's step, the fence) too. This is not a text-only merge
+blocker (#126 review round 4).
+
+The gate and the guard ship together: an old guard answers 404 there, so every ticket would stay retiring and the node
+busy (and an old guard has no fence endpoint, so the gate would stay fenced). A vision model's turns are unchanged
+(#125): its guard has no ledger and the gate releases them as before (see "Before enabling vision" above).
+`fit_tokens` / `free_tokens` in the capacity report are computed from
+the same set formula (`text_room`), so the provider's skip check sees the new room. Short turns are unchanged: their
+old reservation was already at least the computed peak, so it stands byte for byte (eight ~2k-token turns still run
+at once). A vision model's turns, text-only ones included, reserve exactly as in #125 (`text_route` is false there).
+
+**These are computed bounds, not measurements.** The counts `text_score_buffers` (4) and `kv_copies` (2) are the
+formula's assumptions, like the image prefill's `score_buffers`. The 6-bit copy's 2.3 GB measured over idle for one
+~9k-token request implies fewer live score buffers than 4 (at the old 2,048 step, 4 buffers would be 3.4 GiB alone).
+The acceptance gate is the Pro's peak footprint and `mx.get_peak_memory()` in the hardware test window: one full
+128k turn, a 64k turn beside short ones, and eight short turns. If a measured peak exceeds its reservation, the counts
+or the chunk are corrected before relying on them.
+
+**The prefix cache is off on the text route** (#126 review round 2, P1). vllm-mlx's own prefix cache
+(`MemoryAwarePrefixCache`, on by default, `scheduler.py` 93-99 and 1402-1445) keeps finished prompts' KV as separate
+copies, up to 20% of the RAM available when it starts (`--cache-memory-mb` unset), across requests. That pool was
+outside every reservation: with ~4 GiB in it, a full-context turn's 24.57 GiB plus the pool is ~28.6 GiB beside the
+weights, over the 25 GiB budget. Its insertions are unbounded too: `memory_cache.py` `commit_prepared` (1551-1568)
+materialises a turn's new snapshot before it evicts older entries.
+
+So the text route serves with it off:
+
+- `local_backend.text_argv` gives vllm-mlx `--disable-prefix-cache` (`PREFIX_CACHE_OFF`), so the generated
+  LaunchAgent always carries it. In 0.6.0 (`cli.py` 319-328) `enable_prefix_cache` is `--enable-prefix-cache` (default
+  on) and not `--disable-prefix-cache`, and no flag turns it back on.
+- The guard refuses to start the text route without that exact argument (an abbreviation such as `--disable-prefix`,
+  which argparse would accept, is refused too). At runtime it wraps `Scheduler.__init__`: a Scheduler built with no
+  config (0.6.0's default enables the cache) or `enable_prefix_cache` not False is refused before it builds anything,
+  and one that still ends up holding a `prefix_cache`, `memory_aware_cache`, `block_aware_cache`, `paged_cache_manager`
+  or SSD tier is refused after. Either stops the engine from starting.
+- With no pool, cached earlier turns cannot add to the process's footprint: what runs beside the weights is the
+  reservation.
+
+**The trade-off.** Without the cache, every turn prefills its whole prompt. A multi-turn conversation's next turn
+re-reads the earlier turns instead of reusing their KV, so the **first token comes later on multi-turn
+conversations**, roughly by the prefill time of the history (at 256-token chunks, one prompt at a time). Output tokens
+per second and the answers themselves do not change. The owner is asked to confirm "cache off".
+
+**No "cache on with a reserved budget" option.** The obvious alternative is a fixed `--cache-memory-mb` that the
+governor subtracts from the budget, plus one snapshot's transient. It is left out because it is not sound against the
+released code without a further read: the pool's accounting estimates an entry from its arrays' sizes, while an entry
+cut from a filtered batch row can be a slice that keeps the whole padded buffer alive, so the pool's real footprint
+can exceed its limit. And the room it would cost is large: a full-context turn on the 4-bit model fits only while the
+pool is ≤ 0.43 GiB. If prefix reuse is wanted later, it needs its own issue that reads `memory_cache.py`'s estimate
+and eviction and bounds both. The vision route is unchanged (#125): its MLLM scheduler's text-only prefix cache is not
+touched here.
+
 ### Vision: still images on the MLX lane (#125)
+
+> **Before enabling vision** (#126 review round 4): vision turns are still released at transport end; they need the
+> retirement protocol (tickets, the ledger, the safe point, the fence) before vision is turned on. See "Before
+> enabling vision" under the text route's reservation above.
 
 Owner decisions 2026-11-15/16: the Pro's model may read images, served from a separate folder holding the 4-bit language
 weights plus the BF16 vision tower (`~/models/mlx/Qwen3.8-27B-heretic-ara-4bit-vision`, `qwen3_5`,
@@ -1297,7 +1630,28 @@ dispatches to the fused kernel or an unfused fallback is decided in MLX itself. 
 dist-info's version, its single `WHEEL` tag (which must have a pinned row; mlx's and mlx-metal's macOS tags must agree),
 the `RECORD` entries of the files that implement the dispatch, equal to the released wheels' — `mlx/core.cpython-*-darwin.so`
 (mlx), `mlx/lib/libmlx.dylib` and `mlx/lib/mlx.metallib` (mlx-metal) — and those files' own sha256 equal to them; and the
-`mlx.core` actually imported must be that pinned file, beside that `libmlx.dylib`. Any mismatch fails closed. The
+`mlx.core` actually imported must be that pinned file, beside that `libmlx.dylib`. MLX's Python side is pinned too
+(#126 review round 2, P2b; `MLX_PY_SHA256`): the models import `mlx.nn`, whose `__init__` imports every module under
+`mlx/nn` (activations, `Linear` / `QuantizedLinear`, `RMSNorm`, `Embedding`, `Module`, ...), and `mlx.utils`, and the
+extension imports `mlx._reprlib_fix` and `mlx.__array_api_info`. Those 24 files (`utils.py`, `_reprlib_fix.py`,
+`__array_api_info.py`, `nn/__init__.py`, `nn/init.py`, `nn/losses.py`, `nn/utils.py` and the 16 files of `nn/layers/`)
+must equal the released wheels' bytes beside the pinned `mlx.core`. They are byte-identical in all 27 macOS arm64
+wheels (fetched from PyPI 2026-11-17), so every tag's row is one table. `mlx` must stay a namespace package (no
+`mlx/__init__.py`, which would run on import), and `mlx.nn`, `mlx.utils`, `mlx._reprlib_fix` and `mlx.__array_api_info`
+must resolve to the pinned files. A drifted file, such as `silu` promoting to float32, stops startup. `mlx.nn` itself
+is a regular package in every 0.32.4 wheel, so its `nn/__init__.py` is pinned by hash rather than required absent.
+Any mismatch fails closed. **Order** (#126 review round 3, P2b): every one of these checks reads the disk only, and
+all of them run before anything is imported (`_preflight`: vllm-mlx's pinned files, its package `__init__.py` now
+among them; mlx-lm's or mlx-vlm's; mlx's and mlx-metal's), each package located through `find_without_import` (the
+import system's own finders, asked directly) and the dist-info `RECORD`s, neither of which runs package code. A dotted
+name is never handed to `importlib.util.find_spec`, which imports the parent first (#126 review round 4, P2a: a shadow
+`mlx/__init__.py` earlier on `sys.path` ran before it was refused): `mlx` must resolve as a top-level name to the
+namespace package whose locations include the pinned folder, and `mlx.nn`, `mlx.utils`, `mlx._reprlib_fix`,
+`mlx.__array_api_info` and `mlx.core` are resolved within those locations to the pinned files. Only then are they
+imported, and
+each import is checked to come from the folder verified (and `mlx.core` to be the pinned extension). Before, importing
+vllm-mlx's scheduler pulled in `mlx.core`, `mlx_lm` and `mlx.nn` ahead of their checks, so a line planted in
+`mlx/nn/__init__.py` ran even though startup then refused. The
 expected hashes come from the released PyPI wheels (fetched 2026-11-16; each RECORD hash re-checked against the file
 bytes in its wheel). The Pro's Python and macOS tag could not be read from the build machine, so every macOS arm64
 wheel of 0.32.4 is pinned: CPython 3.10–3.15 and the free-threaded 3.13t–3.15t (27 mlx rows), macOS 14.0 / 15.0 / 26.0
@@ -1400,11 +1754,9 @@ selecting the text entry again.
 **Not covered yet**: images inside tool results (refused, so Claude Code's image reads go elsewhere); GIF; a client whose
 max_tokens leaves no room under the 64k image context (Claude Code's 32k default leaves ~32k for text and images; a
 larger max_tokens is refused by the guard and the turn routed elsewhere); the image reservation's formula, the tower's
-resident size and the concurrency of one are provisional until measured; text-only prompts still prefill through
-vllm-mlx's own chunked text path (1,024-token chunks, last chunk's logits all projected: up to 1,024 x V x 2 = 485 MiB)
-whose unfused attention scores grow with the context (24 x 1,024 x P x 2 bytes per buffer: 6 GiB at 128k) beyond the
-1.5 GiB `prefill_margin_bytes` measured at ~9k tokens: the text reservation's long-context peak is a follow-up, not
-changed here; layer 2's refusal reaches a client as vllm-mlx's generic
+resident size and the concurrency of one are provisional until measured; text-only prompts on a vision model still
+reserve the per-request formula (#126 bounds the text-only model's text route, above; a vision model's text turns go
+through the MLLM route, which #126 did not read); layer 2's refusal reaches a client as vllm-mlx's generic
 generation error (layer 1 refuses everything layer 2 would, so it is a backstop, not a path).
 
 ### Switch the Pro to MLX
@@ -1418,7 +1770,7 @@ Owner steps; nothing here was run by the build. The provider's lane config needs
    `python3 -B -m cortados_router.local_backend --print-config`.
 2. On the Pro: `scripts/install_mlx_backend.sh --dry-run`, then `scripts/install_mlx_backend.sh` (LaunchAgent
    `com.cortados.vllm-mlx` on 127.0.0.1:8000 under the prompt guard, log `~/.cortados/vllm-mlx.log`). Both run the
-   guard's `--check`: it must print `ok (vllm-mlx 0.6.0, pinned files match, text route)`. Wait for `curl -s
+   guard's `--check`: it must print `ok (vllm-mlx 0.6.0, mlx-lm 0.31.3 and mlx / mlx-metal 0.32.4, pinned files match, only BatchedEngine may serve, text route)` (#126: the text route also needs mlx-lm 0.31.3, mlx / mlx-metal 0.32.4 and the verified text geometry in `config.json`). An already-installed LaunchAgent from before #126 runs without the text prefill bounds: reinstall it, then restart the gate. Wait for `curl -s
    http://127.0.0.1:8000/health`; the log's first line names the cap (`prompt + max_tokens capped at 131072 tokens`).
    An already-installed LaunchAgent from before the guard runs vllm-mlx without it: reinstall it before the gate runs
    with this version.

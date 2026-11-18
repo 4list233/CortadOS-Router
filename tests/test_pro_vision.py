@@ -412,12 +412,23 @@ class ImagePrefillReservationTests(unittest.TestCase):
         t.release()
 
     def test_text_only_reservations_are_unchanged(self):
+        # On a vision model every text turn reserves exactly as before #125 (and #126 leaves that route alone). On a
+        # text-only model #126's text route reservation applies: never below the old one, and equal to it where the
+        # old one was already at least the computed peak (a short turn).
         for cfg in (vision_cfg(), local_governor.check_config({})):
             for text, out in ((10, 10), (9000, 4000), (200_000, 32_000)):
                 with self.subTest(text=text, vision=bool(cfg["vision"])):
                     tokens = min(cfg["context_tokens"], text + out)
-                    self.assertEqual(local_governor.request_bytes(cfg, text, out),
-                                     tokens * 65536 + cfg["per_seq_state_bytes"] + cfg["prefill_margin_bytes"])
+                    old = tokens * 65536 + cfg["per_seq_state_bytes"] + cfg["prefill_margin_bytes"]
+                    got = local_governor.request_bytes(cfg, text, out)
+                    if cfg["vision"]:
+                        self.assertEqual(got, old)
+                    else:
+                        want = local_governor.text_set_bytes(cfg, [local_governor.text_load(cfg, text, out)])
+                        self.assertEqual(got, want["total"])
+                        self.assertEqual(got, max(old, want["computed"]))
+                        if text == 10:
+                            self.assertEqual(got, old)
 
     def test_the_guard_checks_the_dimensions_the_formula_uses(self):
         from tests.test_vllm_mlx_guard import load_guard
@@ -1102,8 +1113,12 @@ class VisionGuardBase(GuardBase):
         self.vpins = {rel: self._sha("vllm_mlx", rel) for rel in self.guard.VISION_PINNED_SHA256}
         self.mpins = {rel: self._sha("mlx_vlm", rel) for rel in self.guard.MLX_VLM_PINNED_SHA256}
         self.mlx_pins, self.metal_pins = self.fake_mlx(Path(self.dir))
+        self.mlx_py_pins = self.fake_mlx_python(Path(self.dir), self.guard.MLX_PY_SHA256)
         for name, value in (("VISION_PINNED_SHA256", self.vpins), ("MLX_VLM_PINNED_SHA256", self.mpins),
-                            ("MLX_PINNED_RECORD", self.mlx_pins), ("MLX_METAL_PINNED_RECORD", self.metal_pins)):
+                            ("MLX_PINNED_RECORD", self.mlx_pins), ("MLX_METAL_PINNED_RECORD", self.metal_pins),
+                            ("MLX_PY_PINNED_SHA256", {FAKE_MLX_TAG: self.mlx_py_pins}),
+                            # #126 round 7: vision runs the text preflight too; mlx-lm faked here, mlx's checks real
+                            ("_text_preflight", lambda: {"mlx_lm": None, "mlx": self.guard.verify_mlx_files()})):
             p = patch.object(self.guard, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -1121,7 +1136,8 @@ class VisionGuardBase(GuardBase):
     def fake_mlx(root, version="0.32.4", tag=FAKE_MLX_TAG, metal_tag=FAKE_METAL_TAG):
         """Fake installed mlx and mlx-metal distributions under `root` (dist-info METADATA / WHEEL / RECORD and the
         files they name; mlx.core a plain module), and the pin tables that accept them."""
-        files = {"mlx/__init__.py": "", "mlx/core.py": "# the fake mlx.core extension\n",
+        # mlx is a namespace package, as in every released wheel (no mlx/__init__.py; #126 review round 2)
+        files = {"mlx/core.py": "# the fake mlx.core extension\n",
                  "mlx/lib/libmlx.dylib": "fake libmlx\n", "mlx/lib/mlx.metallib": "fake metallib\n"}
         for rel, text in files.items():
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -1138,6 +1154,17 @@ class VisionGuardBase(GuardBase):
                                          + f"{dist}-{version}.dist-info/RECORD,,\n")
         return ({FAKE_MLX_TAG: ("mlx/core.py", h["mlx/core.py"])},
                 {FAKE_METAL_TAG: {rel: h[rel] for rel in ("mlx/lib/libmlx.dylib", "mlx/lib/mlx.metallib")}})
+
+    @staticmethod
+    def fake_mlx_python(root, names):
+        """mlx's pinned Python files (the names of MLX_PY_SHA256) as fakes under `root`/mlx, and their pins."""
+        pins = {}
+        for rel in names:
+            p = root / "mlx" / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(f"# fake mlx/{rel}\n")
+            pins[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+        return pins
 
     def _sha(self, pkg, rel):
         return hashlib.sha256((Path(self.dir) / pkg / rel).read_bytes()).hexdigest()
@@ -1608,6 +1635,7 @@ class GuardVisionStartupTests(VisionGuardBase):
                 self.assertEqual(rc, 2)
                 self.assertIn(f"{pkg}/{rel} differs", err)
         import sys
+        import mlx_vlm                                    # the drifts above stopped startup before any import (P2b)
         with patch.object(sys.modules["mlx_vlm"], "__version__", "0.7.13"):
             rc, err = self.run_main(self.serve(model))
         self.assertEqual(rc, 2)

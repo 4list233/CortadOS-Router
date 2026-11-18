@@ -145,10 +145,12 @@ class GateSwitchTests(Home):
         self.assertEqual(code, 200)
         self.assertEqual(data, {"switch": "off", "allowed": False, "reason": "local switch off", "power": "battery",
                                 "training": False, "models_loaded": [TAG], "ollama": "up", "backend": "ollama",
-                                "capacity": {"backend": "ollama", "limit": None, "inflight": 0, "owner": None,
+                                "capacity": {"backend": "ollama", "limit": None, "inflight": 0, "retiring": 0,
+                                             "draining": False, "owner": None,
                                              "pressure": None, "reason": "no governor", "reserved_bytes": None,
                                              "free_bytes": None, "fit_tokens": None, "free_tokens": None,
-                                             "image_inflight": None, "image_limit": None, "vision": None}})
+                                             "image_inflight": None, "image_limit": None, "vision": None,
+                                             "fence": None}})
         self.flag.touch()
         code, data = self.call("GET")
         self.assertEqual((data["switch"], data["allowed"], data["reason"]), ("on", False, "local disabled: on battery"))
