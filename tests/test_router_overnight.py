@@ -171,19 +171,19 @@ class Continuous(unittest.TestCase):
         g, sig, t = self.guard([1.0, 2.5, 1.1, 1.0, 1.2])
         g.idle_probe()
         for _ in range(3):
-            t[0] += 30; g.tick(1)
+            t[0] += 30; g.tick(4242)
         self.assertEqual(sig, [signal.SIGSTOP]); self.assertTrue(g.paused)   # 2 good probes: not yet
-        t[0] += 30; g.tick(1)
+        t[0] += 30; g.tick(4242)
         self.assertEqual(sig, [signal.SIGSTOP, signal.SIGCONT]); self.assertFalse(g.paused)
 
     def test_probe_rate_limited(self):
         g, sig, t = self.guard([1.0, 9.0])
-        g.idle_probe(); t[0] += 5; g.tick(1)
+        g.idle_probe(); t[0] += 5; g.tick(4242)
         self.assertEqual(sig, [])
 
     def test_memory_guard(self):
         g, sig, t = self.guard([1.0, 1.0], [4.0])
-        g.idle_probe(); t[0] += 30; g.tick(1)
+        g.idle_probe(); t[0] += 30; g.tick(4242)
         self.assertEqual(sig, [signal.SIGSTOP])
 
     def _loop(self, outcomes, idle_s=900):
@@ -265,11 +265,11 @@ class ReviewFixes(unittest.TestCase):
     def test_unreachable_scorer_pause_released_by_unreadable_count(self):
         g, sig, logs, alerts, t = self.mkguard(lambda: None)
         for _ in range(night.Guard.MAX_UNREADABLE + 1):
-            t[0] += 30; g.tick(1)
+            t[0] += 30; g.tick(4242)
         self.assertEqual(sig, [signal.SIGSTOP, signal.SIGCONT]); self.assertFalse(g.paused)
         self.assertTrue(any('FORCED RESUME' in m for m in logs)); self.assertEqual(alerts[0][0], 'guard_forced_resume')
         for _ in range(5):
-            t[0] += 30; g.tick(1)
+            t[0] += 30; g.tick(4242)
         self.assertEqual(sig, [signal.SIGSTOP, signal.SIGCONT])   # blind after a forced release: no re-pause on no data
 
     def test_pause_released_after_max_pause(self):
@@ -277,7 +277,7 @@ class ReviewFixes(unittest.TestCase):
         g, sig, logs, alerts, t = self.mkguard(lambda: next(lats), max_pause_s=120)
         g.idle_probe()
         for _ in range(5):
-            t[0] += 30; g.tick(1)
+            t[0] += 30; g.tick(4242)
         self.assertEqual(sig[:2], [signal.SIGSTOP, signal.SIGCONT])
         self.assertIn('CORTADOS_S1_MAX_PAUSE_S', alerts[0][1])
 
@@ -407,31 +407,31 @@ class ReviewFixes(unittest.TestCase):
         lats = iter([1.0])
         g, sig, logs, alerts, t = self.mkguard(lambda: next(lats))
         g.idle_probe(); g.latency = refused
-        t[0] += 30; g.tick(1)
+        t[0] += 30; g.tick(4242)
         self.assertEqual(sig, [signal.SIGSTOP]); self.assertTrue(any('HTTP 503' in m for m in logs))
         def bad():
             raise night.ScorerConfigError('HTTP 401')
         g2, sig2, logs2, alerts2, t2 = self.mkguard(lambda: 1.0)
         g2.idle_probe(); g2.latency = bad
         for _ in range(3):
-            t2[0] += 30; g2.tick(1)
+            t2[0] += 30; g2.tick(4242)
         self.assertEqual(sig2, []); self.assertEqual([a[0] for a in alerts2], ['scorer_probe_config'])   # once per cycle
 
 
 class ReviewFixesRound2(unittest.TestCase):
     """Release hold-off, stale-marker idle, backoff clamp, no scorer URL in alerts/logs."""
 
-    def test_persistent_503_still_runs_at_least_40_percent(self):
-        def refused():
-            raise night.ScorerRefused('scorer refused (HTTP 503)')
+    def test_persistent_low_memory_still_runs_at_least_40_percent(self):
+        # Memory is not scoring: at the pause limit low memory is still a forced release with a hold-off, never a stop for
+        # the day (#116 owner 2026-11-18 applies to scoring over budget only).
         sig, alerts, t = [], [], [0.0]
-        g = night.Guard(latency=lambda: 1.0, memory=lambda: 100.0, clock=lambda: t[0], signaller=lambda p, s: sig.append(s),
+        g = night.Guard(latency=lambda: 1.0, memory=lambda: 1.0, clock=lambda: t[0], signaller=lambda p, s: sig.append(s),
                         budget_s=1.0, min_free_gb=8, interval_s=30, max_pause_s=1800, log=lambda m: None,
                         alerter=lambda n, d: alerts.append(d))
-        g.idle_probe(); g.latency = refused
+        g.idle_probe()
         running = 0.0
         while t[0] < 7200:
-            g.tick(1)
+            g.tick(4242)
             if not g.paused:
                 running += 1
             t[0] += 1
@@ -439,6 +439,25 @@ class ReviewFixesRound2(unittest.TestCase):
         self.assertGreaterEqual(len(alerts), 2)
         self.assertIn('forced release #1 in a row', alerts[0]); self.assertIn('forced release #2 in a row', alerts[1])
         self.assertIn('CORTADOS_S1_RELEASE_HOLD_S', alerts[0])
+        self.assertFalse(g.stop_requested)
+
+    def test_persistent_503_at_the_pause_limit_stops_for_the_day_instead_of_releasing(self):
+        # #116 owner 2026-11-18: scoring still over budget when the longest pause ends -> no release-and-re-pause.
+        def refused():
+            raise night.ScorerRefused('scorer refused (HTTP 503)')
+        sig, alerts, t = [], [], [0.0]
+        g = night.Guard(latency=lambda: 1.0, memory=lambda: 100.0, clock=lambda: t[0], signaller=lambda p, s: sig.append(s),
+                        budget_s=1.0, min_free_gb=8, interval_s=30, max_pause_s=1800, log=lambda m: None,
+                        alerter=lambda n, d: alerts.append((n, d)))
+        g.idle_probe(); g.latency = refused
+        while t[0] < 7200:
+            g.tick(4242)
+            t[0] += 1
+        self.assertEqual(sig, [signal.SIGSTOP])          # never released, never re-paused
+        self.assertTrue(g.stop_requested)
+        self.assertEqual([a[0] for a in alerts], ['guard_stopped_for_day'])
+        self.assertEqual(g.state()['state'], 'stopped_for_day')
+        self.assertEqual(g.state()['reason'], 'refused')
 
     def test_release_hold_env_default_and_minimum(self):
         mk = lambda: night.Guard(latency=lambda: 1.0, memory=lambda: 100.0, max_pause_s=900, log=lambda m: None,

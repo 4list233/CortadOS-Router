@@ -347,8 +347,8 @@ evaluation/promotion was attempted) or `quota` (label.py stopped at the Claude h
 | `CORTADOS_S1_PROBE_S` | 30 | seconds between guard readings |
 | `CORTADOS_S1_GUARD_WINDOW_S` | 180 | the guard judges the scorer's own samples of the last this-many seconds (min 30) |
 | `CORTADOS_S1_TIMEOUT_S` | 15 | the router's S1 timeout; also the guard probe's timeout, and a sample past it is over every budget |
-| `CORTADOS_S1_MAX_PAUSE_S` | 1800 | longest pause (min 60); past it the tree is resumed and `guard_forced_resume` alerts |
-| `CORTADOS_S1_RELEASE_HOLD_S` | = max pause | after a forced resume, no re-pause for this long (min 60): training runs at least as long as it was held, so a persistent 503 / low memory gives ~50% running instead of ~1% |
+| `CORTADOS_S1_MAX_PAUSE_S` | 1800 | longest pause (min 60); past it, scoring still over budget stops training for the day (`guard_stopped_for_day`, below), anything else (low memory, an unreadable scorer) resumes the tree and `guard_forced_resume` alerts |
+| `CORTADOS_S1_RELEASE_HOLD_S` | = max pause | after a forced resume (not a day stop), no re-pause for this long (min 60): training runs at least as long as it was held, so a persistent 503 / low memory gives ~50% running instead of ~1% |
 | `CORTADOS_S1_CYCLE_IDLE_S` | 900 | sleep after an idle cycle (min 60) |
 | `CORTADOS_S1_QUOTA_COOLDOWN_S` | 18000 | sleep after a `quota` cycle (min 60) |
 | `CORTADOS_S1_MIN_LEFT_PCT` | 15 | label.py per-account quota floor, 0-100 (invalid → logged, 15) |
@@ -374,11 +374,38 @@ never the trainer; (3) a reading with no baseline was never judged. Now:
   `CORTADOS_S1_LATENCY_BUDGET_S` (1.0 s, Forest 2026-11-03) by day, `CORTADOS_S1_NIGHT_LATENCY_BUDGET_S` (6.0 s) inside
   the night window. Resume after 3 consecutive in-budget readings (hysteresis). Free memory below `CORTADOS_S1_MIN_FREE_GB`
   pauses as before; `CORTADOS_S1_MAX_PAUSE_S` / `CORTADOS_S1_RELEASE_HOLD_S` still bound a pause.
-- *Throttle*: a pause SIGSTOPs the cycle's group first, then every other process group in its tree (`overnight.work_groups`,
-  from `ps`: the gate's trainer group). Resume, the window-end stop, a supervisor TERM and the end of every cycle SIGCONT
-  every group the pause stopped before any TERM, so a stopped trainer can still checkpoint.
-- *Shown*: the guard writes `s1/data/latency-guard.json` (state running / paused / idle, a reason slug, the budget in force,
-  baseline and current p50/p90, samples, timeouts, pauses in 24 h); the Studio's heartbeat sends it as `s1.guard` and the
+- *Throttle*: a pause SIGSTOPs the cycle's group first, then every other process group in its tree (`overnight.discover_groups`,
+  from `ps`: the gate's trainer group) and the trainer group the studio gate recorded (below). Resume, the window-end stop,
+  the day stop, a supervisor TERM and the end of every cycle SIGCONT every group the pause stopped (and every group found
+  now) before any TERM, so a stopped trainer can still checkpoint. Never the supervisor's own group, nor pgid 0/1.
+- *Complete or not* (review round 1): a pause is complete only when `ps` answered (discovery complete), the trainer record
+  could be checked, and every SIGSTOP landed. Otherwise the state says `pause: "incomplete"`, discovery and SIGSTOP are retried
+  at every reading, no reading becomes a baseline, and a paused reading with no baseline never counts toward the resume.
+- *The gate's trainer record* (owner 2026-11-18): `studio_capacity.run_holding_lock` writes
+  `{"pgid", "start", "gate_pid"}` to `CORTADOS_S1_TRAINER_GROUP_FILE` (the supervisor sets `s1/data/trainer-group.json` for
+  every cycle) as soon as the trainer starts, and removes it once the trainer's group is empty (a group that survived its
+  SIGKILL keeps it). `start` is the leader's `ps -o lstart=` (C locale): a group is "still ours" when its leader is alive with
+  that start time, or its leader is gone (a pid is never reused while a group with that id exists, so the group is ours or
+  empty); a live leader with another start time is a reused pgid and is never signalled, and an undecidable one (ps failed,
+  no start recorded) is not signalled on a guess.
+- *Crash recovery* (review round 1): before each SIGSTOP the guard writes the groups it is stopping, with their leaders' start
+  times, to `s1/data/latency-guard-stopped.json` (fsynced); it is removed once they are continued. A restarted supervisor
+  (`recover_stopped_groups`, before `recover_pidfile`) SIGCONTs every recorded group that is still ours, the gate's recorded
+  trainer group, and every group still in the tree under `nightly.pid`, and only then the cycle's root.
+- *Stopped for the day* (owner 2026-11-18): when the longest pause (`CORTADOS_S1_MAX_PAUSE_S`) ends and scoring is still over
+  budget (a timed-out or refused reading, or p50/p90 above baseline + budget, judged against the baseline before that reading
+  joins it), the guard does not release and re-pause. It alerts `guard_stopped_for_day` and the cycle is ended through the
+  ordinary graceful stop (the window-end path: SIGCONT every stopped group, then `stop_group_drained` TERMs the cycle; the
+  gate gives its trainer `TRAINING_STOP_GRACE_SECONDS` to save its checkpoint). No cycle starts again until `until`, by this
+  rule (`overnight.training_resume_at`): the next START of the training window `CORTADOS_S1_NIGHT_WINDOW` (default
+  01:00-07:00 America/Toronto) strictly after the stop, so a stop inside the window waits for the next night
+  (`until_rule: "window_start"`); with the window off or invalid, the next local midnight (`until_rule: "midnight"`). While
+  it waits the supervisor takes an idle reading every `CORTADOS_S1_PROBE_S`, so the state stays fresh; the stop flag still
+  ends it; and a supervisor restart reads the day stop back from the state file (a value more than 2 days ahead is ignored).
+  Low memory or an unreadable scorer at the limit is still the forced release.
+- *Shown*: the guard writes `s1/data/latency-guard.json` (state running / paused / idle / stopped_for_day, a reason slug,
+  `pause` complete / incomplete while paused, `until` and `until_rule` during a day stop, the budget in force, baseline and
+  current p50/p90, samples, timeouts, pauses in 24 h); the Studio's heartbeat sends it as `s1.guard` and the
   live view shows it in its `s1` section (`s1.guard`, with host, age and `stale`) and on the dashboard.
 - The labeler's 15% floor (`CORTADOS_S1_MIN_LEFT_PCT`) is a per-account quota floor in label.py; the guard does not change it.
 

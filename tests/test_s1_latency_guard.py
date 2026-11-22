@@ -476,7 +476,9 @@ class GuardStateFile(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / night.GUARD_STATE_NAME
             clock = Clock(0.0)
-            g = guard(lambda: 9.0, clock=clock, state_path=path, baseline=(4.8, 6.2), release_hold_s=600)
+            # Low memory, not scoring: at the pause limit that is a forced release (scoring over budget stops for the day).
+            g = guard(lambda: 4.8, clock=clock, state_path=path, baseline=(4.8, 6.2), release_hold_s=600)
+            g.memory = lambda: 1.0
             g.max_pause = 60
             g.tick(42)                                  # paused at 0
             clock.t = 61.0
@@ -502,7 +504,7 @@ class LiveView(unittest.TestCase):
     NOW = 1_800_000_000.0
     G = {"state": "paused", "reason": "latency", "updated_at": NOW - 10, "paused_s": 60.0, "budget": "day",
          "budget_s": 1.0, "baseline_p50_s": 4.8, "baseline_p90_s": 6.2, "p50_s": 9.0, "p90_s": None, "samples": 4,
-         "timeouts": 1, "source": "scorer", "pauses_24h": 2}
+         "timeouts": 1, "source": "scorer", "pauses_24h": 2, "pause": "complete", "until": None, "until_rule": None}
 
     def test_a_valid_state_passes(self):
         g, bad = live.validate_s1_guard(self.G, self.NOW)
@@ -586,6 +588,428 @@ class LiveView(unittest.TestCase):
             self.assertIn("refused the s1 guard field", err.getvalue())
             self.assertEqual(["guard" in b["s1"] for b in seen], [True, False])
             self.assertEqual(seen[-1]["s1"]["health"], "up")
+
+
+START = "Sun Nov 22 14:57:48 2026"
+
+
+def discovery(groups, complete=True, starts=None):
+    return night.Discovery(list(groups), complete, dict(starts or {}))
+
+
+class IncompleteDiscovery(unittest.TestCase):
+    """A2 (#116 review round 1): a failed ps is not a complete pause; it is retried and takes no baseline meanwhile."""
+
+    def test_a_ps_failure_is_reported_as_incomplete(self):
+        def boom():
+            raise subprocess.TimeoutExpired("ps", 10)
+        d = night.discover_groups(100, ps=boom, log=lambda m: None)
+        self.assertEqual((d.groups, d.complete), ([100], False))
+
+    def test_discovery_keeps_each_group_leaders_start_time(self):
+        ps = ("  100     1   100 Sun Nov 22 14:57:48 2026\n"
+              "  101   100   100 Sun Nov 22 14:57:49 2026\n"
+              "  200   101   200 Sun Nov  2 09:01:02 2026\n")
+        d = night.discover_groups(100, ps=lambda: ps)
+        self.assertEqual((d.groups, d.complete), ([100, 200], True))
+        self.assertEqual(d.starts, {100: START, 200: "Sun Nov 2 09:01:02 2026"})
+
+    def test_an_incomplete_pause_is_reported_retried_and_never_a_baseline(self):
+        trees = iter([discovery([100], False), discovery([100], False), discovery([100, 200])]
+                     + [discovery([100, 200])] * 10)
+        it = iter([9.0, 5.0, 5.0, 5.0, 5.0])
+        sig = []
+        g = guard(lambda: next(it), sig=sig, groups=lambda pg: next(trees), baseline=(4.8, 6.2))
+        g.tick(100)
+        self.assertTrue(g.paused)
+        self.assertFalse(g.pause_complete)
+        self.assertEqual(g.state()["pause"], "incomplete")
+        g.tick(100)                                      # retry: ps still failing
+        self.assertFalse(g.pause_complete)
+        self.assertEqual(g.baseline_samples, [4.8])      # the 5.0 reading was taken with the trainer maybe running
+        self.assertNotIn((200, signal.SIGSTOP), sig)
+        g.tick(100)                                      # retry: ps works, the trainer group is found and stopped
+        self.assertTrue(g.pause_complete)
+        self.assertIn((200, signal.SIGSTOP), sig)
+        self.assertEqual(g.state()["pause"], "complete")
+        self.assertEqual(g.baseline_samples, [4.8, 5.0])  # from now on the readings are the scorer alone
+
+    def test_no_resume_without_a_baseline_while_the_pause_is_incomplete(self):
+        sig = []
+        g = guard(lambda: 2.0, sig=sig, groups=lambda pg: discovery([pg], False))
+        for _ in range(6):
+            g.tick(100)
+        self.assertTrue(g.paused)
+        self.assertEqual(g.baseline_samples, [])
+        self.assertNotIn((100, signal.SIGCONT), sig)
+
+    def test_a_sigstop_that_did_not_land_keeps_the_pause_incomplete(self):
+        sent = []
+        def signaller(pid, s):
+            if pid == 200 and s == signal.SIGSTOP:
+                raise PermissionError(1, "not permitted")
+            sent.append((pid, s))
+        g = night.Guard(latency=lambda: 9.0, memory=lambda: 100.0, budget_s=1.0, min_free_gb=8, interval_s=0,
+                        max_pause_s=1800, signaller=signaller, groups=lambda pg: [pg, 200], log=lambda m: None,
+                        alerter=lambda n, d: None, night_window=None)
+        g.baseline_samples = [4.8]
+        g.tick(100)
+        self.assertTrue(g.paused)
+        self.assertFalse(g.pause_complete)
+
+
+class CrashRecovery(unittest.TestCase):
+    """A1 (#116 review round 1): the stopped groups are recorded before each SIGSTOP and a restarted supervisor continues
+    every recorded group that is still the one recorded, then every group in the tree, before the cycle's root."""
+
+    def test_every_group_is_recorded_before_it_is_signalled_and_cleared_once_continued(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stopped = Path(tmp) / night.STOPPED_GROUPS_NAME
+            seen = []
+            def signaller(pid, s):
+                recs, ok = night.read_stopped_groups(stopped)
+                seen.append((pid, s, [r["pgid"] for r in recs]))
+            it = iter([night.Reading(9.0, 12.0, 3, 0, "scorer")] + [night.Reading(4.8, 6.2, 3, 0, "scorer")] * 3)
+
+            class Src:
+                def read(self, since):
+                    return next(it)
+            g = night.Guard(latency=Src(), memory=lambda: 100.0, budget_s=1.0, min_free_gb=8, interval_s=0,
+                            max_pause_s=1800, signaller=signaller, log=lambda m: None, alerter=lambda n, d: None,
+                            night_window=None, stopped_path=stopped, leader_start=lambda pid: START,
+                            groups=lambda pg: discovery([pg, 200], starts={pg: START, 200: "Mon Nov 23 01:00:00 2026"}))
+            g.baseline_samples, g.baseline_p90_samples = [4.8], [6.2]
+            g.tick(100)
+            stops = [x for x in seen if x[1] == signal.SIGSTOP]
+            self.assertEqual([x[0] for x in stops], [100, 200])
+            for pid, _, recorded in stops:
+                self.assertIn(pid, recorded)              # on disk before the signal
+            recs, _ = night.read_stopped_groups(stopped)
+            self.assertEqual(recs, [{"pgid": 100, "start": START}, {"pgid": 200, "start": "Mon Nov 23 01:00:00 2026"}])
+            for _ in range(3):
+                g.tick(100)
+            self.assertFalse(g.paused)
+            self.assertFalse(stopped.exists())
+
+    def test_a_restarted_supervisor_continues_every_stopped_group_before_the_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            stopped, trainer, pidfile = d / night.STOPPED_GROUPS_NAME, d / night.TRAINER_GROUP_NAME, d / "nightly.pid"
+            # The first supervisor pauses (cycle 100, gate 150, trainer 200) and is killed: no SIGCONT ever sent.
+            g = guard(lambda: 9.0, groups=lambda pg: discovery([pg, 150, 200], starts={pg: "a", 150: "b", 200: "c"}),
+                      baseline=(4.8, 6.2), stopped_path=stopped, leader_start=lambda pid: {100: "a"}.get(pid))
+            g.tick(100)
+            del g
+            # The gate wrapper (150) crashed too: the trainer (200) left the tree, which now shows another gate (300).
+            trainer.write_text(json.dumps({"version": 1, "pgid": 200, "start": "c", "gate_pid": 150}))
+            pidfile.write_text("100\n")
+            sent = []
+            starts = {100: "a", 150: None, 200: "c", 300: "d"}
+            cont = night.recover_stopped_groups(stopped, trainer, pidfile, signaller=lambda p, s: sent.append((p, s)),
+                                                leader_start=lambda pid: starts.get(pid), alive=lambda pid: True,
+                                                discover=lambda root: discovery([root, 300]), log=lambda m: None)
+            night.recover_pidfile(pidfile, alive=lambda p: True, ps=lambda p: "T",
+                                  signaller=lambda p, s: sent.append((p, s)), log=lambda m: None)
+            self.assertEqual(sorted(cont), [150, 200, 300])
+            self.assertEqual(sent[-1], (100, signal.SIGCONT))   # the root last
+            self.assertEqual(sorted(sent[:-1]), [(150, signal.SIGCONT), (200, signal.SIGCONT), (300, signal.SIGCONT)])
+            self.assertFalse(stopped.exists())
+
+    def test_recovery_signals_only_groups_that_are_still_the_recorded_ones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            stopped = d / night.STOPPED_GROUPS_NAME
+            night._write_json_durable(stopped, {"version": 1, "groups": [
+                {"pgid": 201, "start": "old"},       # pgid reused by another process: never signalled
+                {"pgid": 202, "start": "same"},      # still ours
+                {"pgid": 203, "start": "x"},         # leader gone: the group, if any, is still ours
+                {"pgid": 204, "start": None},        # alive, no start recorded: undecidable
+                {"pgid": 205, "start": "y"},         # ps failed: undecidable
+                {"pgid": os.getpgrp(), "start": "z"},   # this supervisor's own group: never
+                {"pgid": 1, "start": "launchd"}]})
+            def leader_start(pid):
+                if pid == 205:
+                    raise subprocess.TimeoutExpired("ps", 10)
+                return {201: "new", 202: "same", 204: "whatever", os.getpgrp(): "z", 1: "launchd"}.get(pid)
+            sent, logs = [], []
+            night.recover_stopped_groups(stopped, None, d / "no.pid", signaller=lambda p, s: sent.append(p),
+                                         leader_start=leader_start, log=logs.append)
+            self.assertEqual(sent, [202, 203])
+            self.assertTrue(any("201 now belongs to another process" in m for m in logs))
+
+    def test_group_identity_rule(self):
+        self.assertTrue(night.group_is_ours({"pgid": 7, "start": "a"}, leader_start=lambda p: "a"))
+        self.assertTrue(night.group_is_ours({"pgid": 7, "start": "a"}, leader_start=lambda p: None))
+        self.assertFalse(night.group_is_ours({"pgid": 7, "start": "a"}, leader_start=lambda p: "b"))
+        self.assertIsNone(night.group_is_ours({"pgid": 7, "start": None}, leader_start=lambda p: "b"))
+
+    def test_real_ps_start_time_matches_the_gates_own(self):
+        # This test's own child only: the guard's identity check and the gate's record agree on the same process.
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            start = night.proc_start(child.pid)
+            self.assertTrue(start)
+            self.assertEqual(start, cap._proc_start(child.pid))
+            self.assertTrue(night.group_is_ours({"pgid": child.pid, "start": start}))
+        finally:
+            child.kill()
+            child.wait()
+        self.assertIsNone(night.proc_start(child.pid))
+
+
+from cortados_router import studio_capacity as cap  # noqa: E402
+
+
+class TrainerGroupRecord(unittest.TestCase):
+    """C (#116, owner 2026-11-18): the studio gate records its trainer's group; the guard stops and continues it after
+    checking it is still the same group, even when it has left the cycle's tree."""
+
+    def mk(self, trainer_file, starts, sig, **kw):
+        return guard(lambda: 9.0, sig=sig, groups=lambda pg: [pg], baseline=(4.8, 6.2), trainer_file=trainer_file,
+                     leader_start=lambda pid: starts.get(pid), **kw)
+
+    def test_the_recorded_trainer_group_is_paused_and_continued_outside_the_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tf = Path(tmp) / night.TRAINER_GROUP_NAME
+            tf.write_text(json.dumps({"version": 1, "pgid": 500, "start": START, "gate_pid": 499}))
+            sig = []
+            g = self.mk(tf, {500: START}, sig)
+            g.tick(100)
+            self.assertEqual(sig, [(100, signal.SIGSTOP), (500, signal.SIGSTOP)])
+            self.assertTrue(g.pause_complete)
+            sig.clear()
+            g.continue_all(100)
+            self.assertEqual(sig, [(500, signal.SIGCONT)])
+
+    def test_a_record_naming_a_reused_pgid_is_never_signalled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tf = Path(tmp) / night.TRAINER_GROUP_NAME
+            tf.write_text(json.dumps({"version": 1, "pgid": 500, "start": START}))
+            sig = []
+            g = self.mk(tf, {500: "Mon Nov 23 03:00:00 2026"}, sig)
+            g.tick(100)
+            self.assertEqual(sig, [(100, signal.SIGSTOP)])
+            self.assertTrue(g.pause_complete)
+
+    def test_a_record_for_the_supervisors_own_group_is_never_signalled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tf = Path(tmp) / night.TRAINER_GROUP_NAME
+            tf.write_text(json.dumps({"pgid": os.getpgrp(), "start": START}))
+            sig = []
+            g = self.mk(tf, {os.getpgrp(): START}, sig)
+            g.tick(100)
+            self.assertEqual(sig, [(100, signal.SIGSTOP)])
+
+    def test_an_unreadable_record_keeps_the_pause_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tf = Path(tmp) / night.TRAINER_GROUP_NAME
+            tf.write_text("{not json")
+            g = self.mk(tf, {}, [])
+            g.tick(100)
+            self.assertTrue(g.paused)
+            self.assertFalse(g.pause_complete)
+
+    def test_run_cycle_tells_the_cycle_where_the_gate_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            out = d / "env"
+            g = guard(lambda: 4.8, baseline=(4.8, 6.2), trainer_file=d / night.TRAINER_GROUP_NAME)
+            code = "import os,sys; open(sys.argv[1],'w').write(os.environ.get('CORTADOS_S1_TRAINER_GROUP_FILE',''))"
+            with patch("builtins.print"):
+                night.run_cycle([sys.executable, "-c", code, str(out)], g, result_file=d / "r", poll_s=0.05,
+                                sleep=time.sleep)
+            self.assertEqual(out.read_text(), str(d / night.TRAINER_GROUP_NAME))
+
+    def test_the_gate_records_its_trainer_group_and_removes_it_when_the_group_is_gone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = Path(tmp) / "trainer-group.json"
+            seen = []
+            with open(Path(tmp) / "lock", "w") as lock, patch.dict(os.environ, {cap.TRAINER_GROUP_ENV: str(rec)}), \
+                    patch.object(cap, "_proc_start", lambda pid: START):
+                rc = cap.run_holding_lock([sys.executable, "-c", "import time; time.sleep(0.3)"], lock.fileno(),
+                                          after_spawn=lambda child: seen.append((child.pid, json.loads(rec.read_text()))))
+            self.assertEqual(rc, 0)
+            pid, body = seen[0]
+            self.assertEqual((body["pgid"], body["start"], body["gate_pid"]), (pid, START, os.getpid()))
+            self.assertFalse(rec.exists())
+
+    def test_a_group_that_survived_the_stop_keeps_its_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = Path(tmp) / "trainer-group.json"
+            with open(Path(tmp) / "lock", "w") as lock, patch.dict(os.environ, {cap.TRAINER_GROUP_ENV: str(rec)}), \
+                    patch.object(cap, "_proc_start", lambda pid: START), \
+                    patch.object(cap, "_stop_group", lambda child, pgid, grace: (child.wait(), False)[1]):
+                cap.run_holding_lock([sys.executable, "-c", "pass"], lock.fileno())
+            self.assertTrue(rec.exists())
+
+    def test_the_gate_never_removes_another_gates_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = Path(tmp) / "trainer-group.json"
+            rec.write_text(json.dumps({"pgid": 777, "start": START}))
+            with redirect_stderr(io.StringIO()):
+                cap._clear_trainer_group(str(rec), 778)
+            self.assertTrue(rec.exists())
+
+    def test_without_the_variable_the_gate_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {k: v for k, v in os.environ.items() if k != cap.TRAINER_GROUP_ENV}
+            with open(Path(tmp) / "lock", "w") as lock, patch.dict(os.environ, env, clear=True):
+                cap.run_holding_lock([sys.executable, "-c", "pass"], lock.fileno())
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["lock"])
+
+
+TORONTO = night.TORONTO
+
+
+def at(y, mo, d, h, mi=0):
+    return night.datetime(y, mo, d, h, mi, tzinfo=TORONTO)
+
+
+class StopForDay(unittest.TestCase):
+    """B (#116, owner 2026-11-18): still over budget when the longest pause ends -> the trainer is stopped the ordinary
+    graceful way (checkpoint kept) and no cycle starts before the next training-window start."""
+
+    def test_the_resume_rule_is_the_next_training_window_start(self):
+        cases = [(at(2026, 11, 22, 14), "01:00-07:00", at(2026, 11, 23, 1), "window_start"),
+                 (at(2026, 11, 22, 0, 30), "01:00-07:00", at(2026, 11, 22, 1), "window_start"),
+                 (at(2026, 11, 22, 2), "01:00-07:00", at(2026, 11, 23, 1), "window_start"),   # inside: the next night
+                 (at(2026, 11, 22, 14), "", at(2026, 11, 23, 1), "window_start"),              # unset: the default
+                 (at(2026, 11, 22, 14), "off", at(2026, 11, 23, 0), "midnight"),
+                 (at(2026, 11, 22, 14), "nonsense", at(2026, 11, 23, 0), "midnight")]
+        for now, raw, want, slug in cases:
+            until, rule, _ = night.training_resume_at(now, window_raw=raw)
+            self.assertEqual((until.timestamp(), rule), (want.timestamp(), slug), (now, raw))
+
+    def mkday(self, latency, clock, **kw):
+        alerts = []
+        g = guard(latency, clock=clock, baseline=(4.8, 6.2), wall=lambda: at(2026, 11, 22, 14), **kw)
+        g.alerter = lambda n, d: alerts.append(n)
+        g.epoch = lambda: at(2026, 11, 22, 14).timestamp()
+        g.max_pause = 60
+        return g, alerts
+
+    def test_over_budget_at_the_pause_limit_stops_for_the_day(self):
+        sig = []
+        clock = Clock(0.0)
+        with patch.dict(os.environ, {"CORTADOS_S1_NIGHT_WINDOW": "01:00-07:00"}):
+            g, alerts = self.mkday(lambda: 9.0, clock, sig=sig)
+            g.tick(100)
+            clock.t = 61.0
+            g.tick(100)
+        self.assertTrue(g.stop_requested)
+        self.assertEqual(alerts, ["guard_stopped_for_day"])
+        self.assertEqual(sig, [(100, signal.SIGSTOP)])            # no release: run_cycle stops the cycle gracefully
+        st = g.state()
+        self.assertEqual((st["state"], st["reason"], st["until_rule"], st["until"]),
+                         ("stopped_for_day", "latency", "window_start", at(2026, 11, 23, 1).timestamp()))
+        self.assertIsNone(live.validate_s1_guard({k: v for k, v in st.items() if k != "version"}, st["updated_at"])[1])
+        clock.t = 200.0
+        g.tick(100)                                                # stopped: no further pause, release or reading
+        self.assertEqual(sig, [(100, signal.SIGSTOP)])
+
+    def test_within_budget_at_the_pause_limit_is_still_the_forced_release(self):
+        it = iter([9.0] + [None] * 10)
+        sig = []
+        clock = Clock(0.0)
+        g, alerts = self.mkday(lambda: next(it), clock, sig=sig)
+        g.tick(100)
+        clock.t = 61.0
+        g.tick(100)                                                # unreadable at the limit: not evidence of over budget
+        self.assertFalse(g.stop_requested)
+        self.assertEqual(alerts, ["guard_forced_resume"])
+
+    def test_run_cycle_ends_the_cycle_with_the_graceful_stop_so_the_trainer_checkpoints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            ckpt = d / "checkpoint"
+            code = ("import signal, sys, time\n"
+                    "def stop(*a):\n"
+                    "    open(sys.argv[1], 'w').write('saved'); sys.exit(0)\n"
+                    "signal.signal(signal.SIGTERM, stop)\n"
+                    "time.sleep(30)\n")
+            clock = Clock(0.0)
+            g, alerts = self.mkday(lambda: 9.0, clock)
+            def sleep(s):
+                clock.t += 31.0
+                time.sleep(0.02)
+            with patch("builtins.print"):
+                rc, result = night.run_cycle([sys.executable, "-c", code, str(ckpt)], g, result_file=d / "r",
+                                             poll_s=0.05, sleep=sleep, grace_end=10)
+            self.assertEqual((rc, result), (0, "stopped_for_day"))
+            self.assertEqual(ckpt.read_text(), "saved")
+            self.assertTrue(g.day_stop_active())
+            self.assertFalse(g.paused)
+
+    def test_no_cycle_starts_before_the_window_and_the_wait_keeps_the_state_fresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            now = [1_800_000_000.0]
+            g = guard(lambda: 4.8, state_path=d / night.GUARD_STATE_NAME)
+            g.epoch = lambda: now[0]
+            g.interval = 30
+            g.clock = lambda: now[0]
+            g.day_stop_until, g.day_stop_reason, g.day_stop_rule = now[0] + 3600, "latency", "window_start"
+            started, states = [], []
+            def sleep(s):
+                states.append(json.loads((d / night.GUARD_STATE_NAME).read_text())["state"])
+                now[0] += s
+            def fake_cycle(*a, **k):
+                started.append(now[0])
+                return 0, "idle"
+            with patch.object(night, "run_cycle", fake_cycle), patch("builtins.print"):
+                night.run_continuous(["true"], g, result_file=d / "r", idle_s=60, sleep=sleep, cycles=1)
+            self.assertEqual(len(started), 1)
+            self.assertGreaterEqual(started[0], 1_800_000_000.0 + 3600)
+            self.assertEqual(set(states[:-1]), {"stopped_for_day"})
+            self.assertGreater(len(states), 100)                   # one reading per 30 s interval while waiting
+            self.assertIsNone(g.day_stop_until)
+
+    def test_the_stop_flag_ends_the_wait(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            flag = d / "nightly.stop"
+            g = guard(lambda: 4.8)
+            g.epoch = lambda: 1_800_000_000.0
+            g.day_stop_until = 1_800_000_000.0 + 3600
+            flag.write_text("")
+            with patch.object(night, "run_cycle", lambda *a, **k: self.fail("no cycle")), patch("builtins.print"):
+                self.assertFalse(night.wait_out_day_stop(g, sleep=lambda s: None, stopflag=flag))
+
+    def test_a_restarted_supervisor_keeps_the_day_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / night.GUARD_STATE_NAME
+            clock = Clock(0.0)
+            g, _ = self.mkday(lambda: 9.0, clock, state_path=path)
+            with patch.dict(os.environ, {"CORTADOS_S1_NIGHT_WINDOW": "01:00-07:00"}):
+                g.tick(100); clock.t = 61.0; g.tick(100)
+            g2 = guard(lambda: 4.8, state_path=path)
+            g2.epoch = lambda: at(2026, 11, 22, 15).timestamp()
+            g2.load_day_stop()
+            self.assertTrue(g2.day_stop_active())
+            self.assertEqual((g2.day_stop_reason, g2.day_stop_rule), ("latency", "window_start"))
+            # A value further ahead than any real day stop (a hand-edited or corrupt file) is not honoured.
+            st = json.loads(path.read_text())
+            path.write_text(json.dumps({**st, "until": st["until"] + 10 * 86400}))
+            g3 = guard(lambda: 4.8, state_path=path)
+            g3.epoch = g2.epoch
+            g3.load_day_stop()
+            self.assertFalse(g3.day_stop_active())
+
+    def test_the_live_view_accepts_and_shows_the_state(self):
+        now = 1_800_000_000.0
+        st = {"state": "stopped_for_day", "reason": "timeout", "updated_at": now - 5, "until": now + 11 * 3600,
+              "until_rule": "window_start", "budget": "day", "budget_s": 1.0, "samples": 1, "timeouts": 1, "pauses_24h": 1}
+        g, bad = live.validate_s1_guard(st, now)
+        self.assertIsNone(bad)
+        self.assertEqual((g["state"], g["until"], g["until_rule"]), ("stopped_for_day", now + 11 * 3600, "window_start"))
+        for over, field in (({"until": now + 10 * 86400}, ".until"), ({"until_rule": "tomorrow"}, ".until_rule"),
+                            ({"pause": "half"}, ".pause"), ({"until": "soon"}, ".until")):
+            self.assertEqual(live.validate_s1_guard({**st, **over}, now), (None, field))
+        beats = {"studio": {"received_at": now - 30, "ttl_s": 180, "s1": {"guard": {**g, "updated_at": now - 400}}}}
+        self.assertTrue(live.s1_guard_view(beats, now)["stale"])   # a silent supervisor during a day stop is stale
+        html = (REPO / "cortados_router/provider/dashboard.html").read_text()
+        self.assertIn('"stopped_for_day"', html)
+        self.assertIn("training stopped for the day", html)
 
 
 if __name__ == "__main__":

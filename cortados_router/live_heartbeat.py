@@ -10,7 +10,7 @@ What it reports, all metadata:
               data/nightly.stop, data/sweep-request.json: present or not, never read), the pending candidate's reason (the
               third field of data/pending-candidate, sent only when it is a plain slug like `promotion_held`), and the
               scorer's /health (up/down, its model name, load time), and the latency guard's state (#116,
-              data/latency-guard.json written by s1/overnight.py: running / paused / idle, a fixed reason slug, the
+              data/latency-guard.json written by s1/overnight.py: running / paused / idle / stopped_for_day, a fixed reason slug, the
               baseline and current p50/p90 in seconds, sample and timeout counts; checked against the provider's own
               validator, `unknown` when the file is unreadable or invalid, absent when there is no file).
   - orchestrator  on hosts that run the owner's main Claude Code sessions: their own tokens per window, by Office session

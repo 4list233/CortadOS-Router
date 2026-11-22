@@ -179,12 +179,19 @@ S1_HEALTH = ("up", "down", "unknown")
 _HB_S1_KEYS = {"health", "model", "flags", "pending", "loaded_s", "guard"}
 # heartbeat `s1.guard` (#116): the S1 latency guard's state (s1/overnight.py Guard.state, data/latency-guard.json). Fixed
 # states and reason slugs (s1/overnight.GUARD_REASONS), seconds, counts and one timestamp; never a URL, path, pid or text.
-S1_GUARD_STATES = ("running", "paused", "idle", "unknown")
+# stopped_for_day (#116, owner 2026-11-18): scoring was still over budget when the longest pause ended, so training stopped
+# and no cycle starts before `until` (epoch s), set by the rule `until_rule` (s1/overnight.DAY_STOP_RULES).
+S1_GUARD_STATES = ("running", "paused", "idle", "stopped_for_day", "unknown")
+S1_GUARD_PAUSE = ("complete", "incomplete")      # every group of a pause confirmed stopped, or not (#116 review round 1)
+S1_GUARD_UNTIL_RULES = ("window_start", "midnight")
+# A day stop ends at the next training-window start: at most ~25 h ahead (DST included); 2 days bounds a bad value.
+S1_GUARD_UNTIL_AHEAD_MAX = 2 * 86400.0
 S1_GUARD_REASONS = ("latency", "timeout", "refused", "memory", "no_baseline", "forced_release")
 S1_GUARD_SOURCES = ("scorer", "probe")
 _S1_GUARD_SECONDS = ("budget_s", "baseline_p50_s", "baseline_p90_s", "p50_s", "p90_s")
 _S1_GUARD_COUNTS = ("samples", "timeouts", "pauses_24h")
-_HB_S1_GUARD_KEYS = {"state", "reason", "updated_at", "paused_s", "budget", "source"} | set(_S1_GUARD_SECONDS) \
+_HB_S1_GUARD_KEYS = {"state", "reason", "updated_at", "paused_s", "budget", "source", "pause", "until",
+                     "until_rule"} | set(_S1_GUARD_SECONDS) \
     | set(_S1_GUARD_COUNTS)
 S1_GUARD_SECONDS_MAX = 3600.0      # a latency, baseline or budget; the router's own S1 timeout is 15 s
 S1_GUARD_PAUSED_MAX = 7 * 86400.0
@@ -402,7 +409,8 @@ def validate_s1_guard(g: Any, now: float) -> tuple[dict[str, Any] | None, str | 
     if g.get("state") not in S1_GUARD_STATES:
         return None, ".state"
     out: dict[str, Any] = {"state": g["state"]}
-    for k, allowed in (("reason", S1_GUARD_REASONS), ("budget", ("day", "night")), ("source", S1_GUARD_SOURCES)):
+    for k, allowed in (("reason", S1_GUARD_REASONS), ("budget", ("day", "night")), ("source", S1_GUARD_SOURCES),
+                       ("pause", S1_GUARD_PAUSE), ("until_rule", S1_GUARD_UNTIL_RULES)):
         if g.get(k) is not None and g[k] not in allowed:
             return None, "." + k
         out[k] = g.get(k)
@@ -424,6 +432,11 @@ def validate_s1_guard(g: Any, now: float) -> tuple[dict[str, Any] | None, str | 
     if v is not None and not (_num(v) and now - TIME_SKEW_S <= v <= now + SAMPLE_FUTURE_SKEW_S):
         return None, ".updated_at"
     out["updated_at"] = None if v is None else round(float(v), 3)
+    v = g.get("until")
+    # Past values pass (a day stop the sender has not yet cleared); the future is bounded by the longest possible day stop.
+    if v is not None and not (_num(v) and now - S1_GUARD_PAUSED_MAX <= v <= now + S1_GUARD_UNTIL_AHEAD_MAX):
+        return None, ".until"
+    out["until"] = None if v is None else round(float(v), 3)
     return out, None
 
 
@@ -441,7 +454,8 @@ def s1_guard_view(heartbeats: dict[str, dict[str, Any]], now: float) -> dict[str
         return None
     h, g = best
     age = round(max(0.0, now - g["updated_at"]), 1) if _num(g.get("updated_at")) else None
-    stale = g.get("state") in ("running", "paused") and (age is None or age > S1_GUARD_STALE_S)
+    # A day stop writes at every reading while the supervisor waits it out (overnight.wait_out_day_stop): stale when silent.
+    stale = g.get("state") in ("running", "paused", "stopped_for_day") and (age is None or age > S1_GUARD_STALE_S)
     return {**g, "host": h, "age_s": age, "stale": stale}
 
 

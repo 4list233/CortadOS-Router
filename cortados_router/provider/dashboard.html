@@ -724,7 +724,11 @@ function secs(v) { return isNum(v) ? v.toFixed(1) + " s" : "timed out"; }
 function guardText(g) {
   if (!g) return null;
   if (g.state === "unknown") return "latency guard: state unreadable";
-  const head = g.state === "paused" ? "training paused: " + (GUARD_REASON_TEXT[g.reason] || g.reason || "?")
+  const until = isNum(g.until) ? new Date(g.until * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"}) : "?";
+  const head = g.state === "stopped_for_day" ? "training stopped for the day (" + (GUARD_REASON_TEXT[g.reason] || g.reason || "?")
+      + " at the longest pause); no cycle until " + until + (g.until_rule === "window_start" ? " (next training window)" : g.until_rule === "midnight" ? " (midnight)" : "")
+    : g.state === "paused" ? "training paused: " + (GUARD_REASON_TEXT[g.reason] || g.reason || "?")
+      + (g.pause === "incomplete" ? " (not every process group confirmed stopped yet)" : "")
     : g.state === "running" ? "training running within budget" + (g.reason === "forced_release" ? " (" + GUARD_REASON_TEXT.forced_release + ")" : "")
     : "no cycle running";
   const now = g.samples ? "p50 " + secs(g.p50_s) + " / p90 " + secs(g.p90_s) + " (" + g.samples + " " + (g.source === "probe" ? "probe" : "routed") + ")" : null;
@@ -745,8 +749,9 @@ function renderS1(c, x) {
   add(box, flags);
   if (x.guard) {
     const gr = el("div", "job");
-    add(gr, pill(x.guard.state === "paused" ? "partial" : x.guard.state === "unknown" ? "unknown" : "ok",
-      x.guard.state === "paused" ? "paused" : x.guard.state === "unknown" ? "unknown" : x.guard.state),
+    const gs = x.guard.state;
+    add(gr, pill(gs === "paused" || gs === "stopped_for_day" ? "partial" : gs === "unknown" ? "unknown" : "ok",
+      gs === "stopped_for_day" ? "stopped for the day" : gs),
       el("span", "title", "latency guard"), el("span", "js", guardText(x.guard)));
     add(box, gr);
   }
@@ -906,7 +911,8 @@ function renderLive(d) {
     isNum(o.working_conversations) ? o.working_conversations + " working now" : "office view unavailable"));
   add(ov, tile("S1 scorer", pill(s1.status === "up" ? "up" : s1.status === "down" ? "down" : "unknown"),
     join([s1.status === "up" ? (isNum(s1.latency_ms) ? s1.latency_ms + " ms health check" : "") : (s1.reason || "not reachable"),
-      s1.guard && s1.guard.state === "paused" ? "training paused (" + (GUARD_REASON_TEXT[s1.guard.reason] || "guard") + ")" : null]),
+      s1.guard && s1.guard.state === "paused" ? "training paused (" + (GUARD_REASON_TEXT[s1.guard.reason] || "guard") + ")" : null,
+      s1.guard && s1.guard.state === "stopped_for_day" ? "training stopped for the day (" + (GUARD_REASON_TEXT[s1.guard.reason] || "guard") + ")" : null]),
     "small"));
   add(ov, tile("Lowest subscription", low ? pct(low.left_pct) : "–",
     low ? join([low.label || low.lane, low.window]) : "no fresh reading"));
