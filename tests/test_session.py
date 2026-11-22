@@ -125,10 +125,16 @@ class SessionTests(unittest.TestCase):
     def test_boundary_hook_inside_the_project_is_refused(self):
         from pathlib import Path
         checkout = str(Path(session.__file__).resolve().parents[1])
-        with self.assertRaises(session.SessionError):
+        with self.assertRaises(session.SessionError) as cm:
             session.boundary_hook_entry(checkout)
-        with self.assertRaises(session.SessionError):        # child tasks pass --project-dir
+        self.assertEqual(str(cm.exception), session.BOUNDARY_HOOK_INSIDE_PROJECT)
+        with self.assertRaises(session.SessionError) as cm:  # child tasks pass --project-dir
             self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok, "--project-dir", checkout])
+        msg = str(cm.exception)
+        # #128: the message says why (the child may write it; later tasks trust that code) and names both alternatives.
+        for part in ("may write its project folder", "every later task trusts", "`repo` (+ `branch`)",
+                     "worktree under CortadOS/active", "`cwd` outside the router checkout", "notes folder"):
+            self.assertIn(part, msg)
         _, _, cmd = self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok,
                                   "--project-dir", self.tmp.name])
         with open(cmd[cmd.index("--settings") + 1]) as src:

@@ -19,6 +19,7 @@ from unittest import mock
 
 from cortados_router import child_tasks as ct
 from cortados_router import subagent_mcp as m
+from tests.git_isolation import isolate_git
 
 # Cross-language vectors (review 2026-11-13): the Python copies (child_tasks.office_name, subagent_mcp.origin_tag) and
 # cortados-routed-subagents' officeName / sessionTag must agree, or a task's origin and its session's Office floor drift
@@ -367,6 +368,7 @@ class ChildTaskBase(unittest.TestCase):
         self.tmp = os.path.realpath(tempfile.mkdtemp())   # macOS /var is a symlink; the private-dir check refuses symlinks
         self.work = os.path.join(self.tmp, "work")
         os.mkdir(self.work)
+        isolate_git(self)                                 # repo tasks settle real worktrees: no machine git config (#119)
         bin_ = os.path.join(self.tmp, "fake-claude")
         with open(bin_, "w") as f:
             f.write(FAKE.format(py=sys.executable))
@@ -528,10 +530,12 @@ class ChildTaskTests(ChildTaskBase):
         self.assertEqual(stat.S_IMODE(os.stat(ct.tasks_dir()).st_mode), 0o700)
         _, lst = self.call("list_tasks")
         self.assertEqual(lst["tasks"][0]["task_id"], tid)
-        _, only = self.call("list_tasks", ids=[tid, "t00000000000000-00000000"])   # bot gateway: owned ids only
-        self.assertEqual([t["task_id"] for t in only["tasks"]], [tid])
-        _, none = self.call("list_tasks", ids=[])
-        self.assertEqual(none["tasks"], [])
+        # bot gateway: owned ids only. It calls call_child_tool directly; over MCP `ids` is an unknown argument (#120).
+        ids = lambda v: json.loads(m.call_child_tool("list_tasks", {"ids": v}, self.cfg)["content"][0]["text"])
+        self.assertEqual([t["task_id"] for t in ids([tid, "t00000000000000-00000000"])["tasks"]], [tid])
+        self.assertEqual(ids([])["tasks"], [])
+        r, _ = self.call("list_tasks", ids=[tid])
+        self.assertIn("unknown argument 'ids'", r["content"][0]["text"])
 
     # ---- permission modes the child's model really supports (2026-11-02 E2E: haiku + auto denied every write)
     def test_auto_mode_support_follows_the_clis_rule(self):
@@ -1008,6 +1012,17 @@ class ChildTaskTests(ChildTaskBase):
             self.assertIn(needle, r["content"][0]["text"], kw)
         self.assertFalse(os.path.isdir(os.path.join(self.tmp, "tasks")) and os.listdir(os.path.join(self.tmp, "tasks")))
 
+    def test_a_cwd_holding_the_router_checkout_is_refused_naming_the_alternatives(self):
+        # #128: the checkout the launcher runs from is the trust root; the refusal says what to use instead.
+        checkout = os.path.dirname(os.path.dirname(os.path.realpath(ct.__file__)))
+        r, _ = self.call("start_task", task="x", cwd=checkout)
+        self.assertTrue(r.get("isError"))
+        text = r["content"][0]["text"]
+        self.assertIn("cannot prepare the child session", text)
+        for part in ("every later task trusts", "`repo` (+ `branch`)", "`cwd` outside the router checkout"):
+            self.assertIn(part, text)
+        self.assertFalse(os.path.exists(os.path.join(checkout, "fake-argv.json")))
+
     def test_a_cwd_missing_on_the_host_is_refused_naming_the_host(self):
         r, _ = self.call("start_task", task="x", cwd=os.path.join(self.tmp, "nowhere"))
         self.assertIn("does not exist on execution host 'here' (this machine)", r["content"][0]["text"])
@@ -1234,7 +1249,8 @@ class ChildTaskTests(ChildTaskBase):
             json.dump(jobs, f)
         if cmd == "bootstrap" and os.environ.get("FAKE_LAUNCHCTL_HANG"):
             import time
-            time.sleep(30)                                    # the job is loaded, but the answer never comes
+            open(log + ".hanging", "w").close()               # the job is loaded (tests wait for this) ...
+            time.sleep(30)                                    # ... but the answer never comes
     ''')
 
     def _gui_host(self, mode="run"):
@@ -1362,8 +1378,24 @@ class ChildTaskTests(ChildTaskBase):
         self.assertEqual(len(self._launchctl_calls()), 1)
 
     def _hanging_bootstrap(self, mode="run"):
+        # #115: a patched 1 s timeout raced the fake's interpreter start-up: on a loaded machine subprocess.run killed
+        # the fake before it had loaded the job, so no runner started. The timeout now fires only once the fake says
+        # the job is loaded (its ".hanging" marker), which is the state this helper stands for: loaded, no answer.
         self._gui_host(mode=mode)
-        for p in (mock.patch.dict(os.environ, {"FAKE_LAUNCHCTL_HANG": "1"}), mock.patch.object(ct, "LAUNCHCTL_TIMEOUT_S", 1),
+        real_run, marker = subprocess.run, self.launchctl_log + ".hanging"
+
+        def run(cmd, **kw):
+            if cmd[1:2] != ["bootstrap"]:
+                return real_run(cmd, **kw)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                self.assertTrue(_wait_file(marker, timeout=60), "the fake launchctl never loaded the job")
+            finally:
+                proc.kill()
+                proc.communicate()
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+
+        for p in (mock.patch.dict(os.environ, {"FAKE_LAUNCHCTL_HANG": "1"}), mock.patch.object(ct.subprocess, "run", run),
                   mock.patch("traceback.print_exc")):
             p.start()
             self.addCleanup(p.stop)

@@ -99,7 +99,16 @@ The rules now:
 4. **Hook location.** The hook's code lives outside any model-writable path: the mod passes the source inline (`-c`, no
    file on disk), child tasks run `boundary_hook.py` from the router checkout running the launcher. `session.py`
    refuses a checkout inside the child's project folder (`--project-dir`, passed by `child_tasks` when the task has a
-   `cwd`). At run time the hook checks itself: a known call whose recorded project folder holds the hook's interpreter,
+   `cwd`). That refusal is the boundary, not a gap to work around (#128): a child may write its project folder, and a
+   router checkout there holds the launcher (`session.py`, `child_tasks.py`), the MCP server and the hook that every
+   later task trusts. No copy made from that checkout can be trusted either: a fix that installed a private copy of
+   `boundary_hook.py` read its bytes when the launcher loaded, so a child that rewrote the file had the next fresh
+   launcher (a later `--remote` call, say) install the rewritten bytes as its trusted hook (review reproduced an
+   `exit(0)` payload turning a marked out-of-project call into ALLOW), and the same child could rewrite the launcher
+   itself. The error (`session.BOUNDARY_HOOK_INSIDE_PROJECT`, surfaced by `start_task` as "cannot prepare the child
+   session: …") says so and names the alternatives: give `repo` (+ `branch`) for a git worktree under
+   `CortadOS/active/<task_id>` (the task edits its own worktree, never the checkout the launcher runs from), or a
+   `cwd` outside the router checkout, such as a notes folder. At run time the hook checks itself: a known call whose recorded project folder holds the hook's interpreter,
    its file or the file's folder (lexically or real) is **denied**, Bash included.
 5. **Imports.** The hook is stdlib only and imports nothing from the project. Run as a program without `-I` (an older
    settings file), it deletes the first `sys.path` entry (the working directory or its own folder) and empty entries

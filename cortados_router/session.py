@@ -160,6 +160,16 @@ def _inside_project(path: str, project: str | None) -> bool:
     return any(_within(p, r) for p in forms for r in roots)
 
 
+# Why a project folder holding this router checkout is refused, and what to do instead (#128, docs/BOUNDARY-HOOK.md
+# "Hook location"). No copy of the hook made from that checkout can be trusted: the child may rewrite the checkout,
+# and every later launcher, MCP server and hook copy would run its bytes.
+BOUNDARY_HOOK_INSIDE_PROJECT = (
+    "the project folder holds the router checkout this launcher runs from (the boundary hook script lies inside "
+    "it). A child may write its project folder, and that checkout holds the launcher, MCP server and boundary hook "
+    "code every later task trusts, so it cannot be a task's project folder. Instead give `repo` (+ `branch`) for a "
+    "git worktree under CortadOS/active, or a `cwd` outside the router checkout (e.g. a notes folder)")
+
+
 def boundary_hook_python(project: str | None = None, candidates=None) -> str:
     """The absolute interpreter for the boundary hook: the real path of the interpreter running this launcher, else
     SYSTEM_PYTHONS; one inside the project folder is refused (the model may write there). SessionError when none."""
@@ -180,8 +190,7 @@ def boundary_hook_entry(project: str | None = None, python: str | None = None) -
     the project folder is refused. Timeout 30 s, well past the script's own 5 s provider timeout, so the script always
     answers (and fails closed) itself."""
     if _inside_project(str(BOUNDARY_HOOK_FILE), project):
-        raise SessionError("the boundary hook script lies inside the project folder; run the launcher from a router "
-                           "checkout outside it")
+        raise SessionError(BOUNDARY_HOOK_INSIDE_PROJECT)
     python = python or boundary_hook_python(project)
     command = guarded_hook_command(python, shlex.quote(str(BOUNDARY_HOOK_FILE)))
     return {"matcher": BOUNDARY_HOOK_MATCHER, "hooks": [{"type": "command", "command": command, "timeout": 30}]}
