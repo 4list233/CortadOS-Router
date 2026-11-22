@@ -1,14 +1,50 @@
-# CortadOS → Claw3D office adapter (step 2, not deployed)
+# CortadOS → Claw3D office adapter (steps 2–3, not deployed)
 
-New integration: no existing office adapter was found. Node 22+ stdlib only.
-No npm install, Claw3D process, account creation, or Air configuration is part of
-this change. See [PROTOCOL.md](PROTOCOL.md) for the researched protocol and gaps.
+Node 22+ stdlib only. No npm install, Claw3D process, account creation, or Air
+configuration is part of this folder's code; [DEPLOY.md](DEPLOY.md) is the (unrun)
+runbook for the Air. See [PROTOCOL.md](PROTOCOL.md) for the researched Claw3D
+protocol, how it renders people and floors, and the remaining gaps.
+
+| File | What |
+|---|---|
+| `adapter.mjs` | office view → Claw3D gateway frames; sprite choice per person; polling |
+| `bridge.mjs` | the WebSocket gateway Claw3D Studio's proxy connects to (loopback, auth, Origin, read-only) |
+| `sprites.mjs` | original pixel art as text grids, PNG encoder, Claw3D 3D avatar profiles |
+| `build-assets.mjs` | regenerates `assets/` and `assets/preview.png` from the fixture (`--write` / `--check`) |
+| `assets/` | sprites, floor tiles, preview; origin and licence in `assets/NOTICE.md` |
+| `claw3d/avatar-profile-hint.patch` | 6-line Claw3D change so the 3D figures wear the family suits |
+| `DEPLOY.md`, `deploy-air.sh` | Air runbook and script, written and **not run** |
 
 ## Test
 
 ```sh
-node --test integrations/office-claw3d/
+node --test integrations/office-claw3d/                # Node 26 resolves the folder
+node --test integrations/office-claw3d/*.test.mjs      # portable form (Node 22/24)
+node integrations/office-claw3d/build-assets.mjs --check
 ```
+
+## Appearance (issue #77)
+
+![preview](assets/preview.png)
+
+Each person gets a sprite, as metadata only. The published `provider`/`lane` never change:
+
+- **Worker**: by the provider it ran on (`claude`, `codex`/`openai` → codex robot, `grok`/`xai`
+  → dark robot, `local`), else by its lane key (`claude#b`, `codex`, `local-*`). Otherwise
+  it gets the grey `unknown` visitor. A worker's model never chooses its sprite.
+- **Local lane**: the llama (`ollama`) only when the model id is shaped like an Ollama tag
+  (`name:tag`, e.g. `qwen3:27b`) and does not name mlx. Other local models (vllm-mlx's
+  `mlx-community/...`) get the green chip (`local`). Office v1 does not say which backend
+  served a turn, so this is a name-shape rule, not a fact (see PROTOCOL.md gaps).
+- **Orchestrator**: wears a suit, styled by its **model** (office v1 reports no provider or
+  lane for it): `claude-*`/opus/sonnet/haiku/fable → claude, `gpt-*`/`codex*`/`o<N>` → codex,
+  `grok*` → grok, an Ollama tag → ollama, qwen/llama/gemma/mistral/mlx… → local,
+  anything else → unknown. Its published provider stays `null`.
+
+Each agent in `agents.list` carries `identity.avatarUrl` (the sprite as a 128 px PNG data
+URL, which Claw3D's 2D panels show unmodified) and `identity.avatarProfile` (a Claw3D voxel
+figure profile: family colour, a hoodie for workers, Claw3D's own jacket and pants as the
+suit). Stock Claw3D ignores `avatarProfile`; the patch makes it use it.
 
 ## Intended runtime
 
@@ -37,13 +73,33 @@ the last successful snapshot, which may be stale. No prompts, commands, file
 contents, source response bodies, token paths or exception text are logged.
 Metadata stdout still deserves local-only access and should not be publicly logged.
 
-The future WebSocket host MUST bind only 127.0.0.1/::1, enforce local auth and
-Origin allowlisting, and must not advertise writable methods. All methods except
-connect, agents.list, sessions.list and status are rejected. No transport dependency
-is installed: OfficeGateway(send) is the transport interface. A per-client gateway
-accepts request(frame) and update(officeSnapshot). Poll updates fan out to those
-instances. Existing Claw3D UI still needs an extension bridge for office.snapshot,
-floor layout and character hints; skeleton is not a deployable gateway yet.
+The WebSocket host is `bridge.mjs` (stdlib, no `ws` dependency). It binds only
+127.0.0.1/::1 and accepts an upgrade only from a loopback peer, on path `/`, with a
+localhost Host and an allowlisted Origin (default `http://localhost:<port>`, which
+Studio's proxy sends). The first frame must be `connect` carrying the local **bridge
+secret** in `params.auth.token`. That secret is never the office token, and the bridge
+refuses to start if they match. Frames are text only, masked, unfragmented and at most
+64 KiB, with at most 8 clients, a rate cap and a 10 s connect deadline.
+
+```sh
+CORTADOS_OFFICE_TOKEN_FILE=/private/path/office-token \
+CORTADOS_OFFICE_BRIDGE_TOKEN_FILE=/private/path/bridge-token \
+node integrations/office-claw3d/bridge.mjs     # 127.0.0.1:18789; illustrative, not run here
+```
+
+Both token files must be 0600. Optional settings: `CORTADOS_OFFICE_BRIDGE_HOST` (127.0.0.1
+or ::1), `_PORT`, `_ORIGINS` (comma list, `*` refused), `CORTADOS_OFFICE_URL`,
+`CORTADOS_OFFICE_POLL_SECONDS`.
+
+Methods: `connect`, `agents.list`, `sessions.list` and `status` serve the office roster.
+Studio also calls `config.get`, `exec.approvals.get`, `agents.files.get`,
+`sessions.preview`, `chat.history`, `models.list`, `skills.status` and `cron.list` while
+it connects and hydrates. These get FIXED, empty answers: no transcript, file or config
+is served. `config.get` says reload mode `off`, so Studio never tries `config.patch`.
+Every other method (`chat.send`, `*.set`, `*.patch`, `agents.create`, `wake`, …) is
+refused with `READ_ONLY`, and the hello advertises read methods only.
+OfficeGateway(send) stays the transport seam: one gateway per authenticated
+connection, and poll updates fan out through `OfficeHub`.
 
 Stable IDs namespace orchestrators separately from workers, and named workers
 separately from anonymous fingerprints. Duplicate identities reject the snapshot.
@@ -56,5 +112,4 @@ local-policy rationale are documented beside their constants in adapter.mjs.
 Lobby
 records lacking run_id use a best-effort metadata fingerprint + ordinal: v1 hides
 conversation IDs, so reordering anonymous records may recreate their characters.
-Floors with absent orchestrators do not get fabricated people. Appearance art is
-future work; provider families and the orchestrator suit are metadata only.
+Floors with absent orchestrators do not get fabricated people.

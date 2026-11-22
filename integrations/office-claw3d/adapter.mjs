@@ -1,9 +1,9 @@
 import { readFile } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { avatarDataUrl, avatarProfile } from './sprites.mjs';
 
-const families = new Set(['claude', 'codex', 'grok', 'ollama', 'local']);
 const text = value => typeof value === 'string' ? value : null;
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const statuses = new Set(['working', 'idle', 'done', 'error']);
@@ -48,9 +48,48 @@ function validateRecord(record, role, lobby) {
     }
   }
 }
-export function characterFamily(provider) {
-  // Unknown gets a neutral local character, never a guessed vendor identity.
-  return families.has(provider) ? provider : 'local';
+// ---- appearance (issue #77): which sprite a person wears. Appearance only: it never
+// changes the published provider/lane, which stay exactly as office.py reported them.
+// Maps, not object literals: a provider such as "__proto__" must miss, not hit a prototype.
+const PROVIDER_FAMILY = new Map(Object.entries({ claude: 'claude', codex: 'codex', openai: 'codex', grok: 'grok',
+  xai: 'grok', ollama: 'ollama', local: 'local' }));
+const LANE_FAMILY = new Map(Object.entries({ claude: 'claude', 'claude-cli': 'claude', codex: 'codex',
+  'codex-cli': 'codex', grok: 'grok' }));
+// Ollama names a model `name:tag` (qwen3:27b, library/llama3.3:70b-q4_K_M). The vllm-mlx
+// backend serves Hugging Face style ids (mlx-community/...), never with a tag.
+const OLLAMA_TAG = /^[a-z0-9][a-z0-9._-]*(\/[a-z0-9][a-z0-9._-]*)?:[a-z0-9][a-z0-9._-]*$/i;
+
+/** Family of a local-lane model: the llama only for an Ollama-shaped tag, else generic local. */
+function localFamily(model) {
+  const m = text(model) ?? '';
+  return OLLAMA_TAG.test(m) && !/(^|[/._:-])mlx([/._:-]|$)/i.test(m) ? 'ollama' : 'local';
+}
+
+/** Worker sprite: by the provider it ran on, then its lane key; never by a guess. */
+export function characterFamily(provider, lane = null, model = null) {
+  const p = text(provider)?.toLowerCase() ?? null;
+  const l = text(lane)?.toLowerCase() ?? '';
+  const family = PROVIDER_FAMILY.get(p) ?? (p === null ? laneFamily(l) : null);
+  if (family === 'local') return localFamily(model);
+  return family ?? 'unknown';
+}
+function laneFamily(lane) {
+  if (lane.startsWith('local-')) return 'local';
+  const base = lane.split(/[#:/]/, 1)[0];
+  return LANE_FAMILY.get(base) ?? null;
+}
+
+/** Orchestrator sprite: by its MODEL (office v1 reports no provider/lane for it).
+ * Styling only; the published provider stays null. */
+export function modelFamily(model) {
+  const m = (text(model) ?? '').toLowerCase().replace(/^(sub|api)\//, '');
+  if (!m) return 'unknown';
+  if (/^(claude|anthropic)|(^|[-/])(opus|sonnet|haiku|fable)([-.\d]|$)/.test(m)) return 'claude';
+  if (/^(gpt|codex|openai|chatgpt)|^o\d([-.]|$)/.test(m)) return 'codex';
+  if (/^(grok|xai)/.test(m)) return 'grok';
+  if (OLLAMA_TAG.test(m)) return localFamily(m);
+  if (/^(local|mlx|qwen|llama|gemma|mistral|deepseek|phi)/.test(m)) return 'local';
+  return 'unknown';
 }
 
 /** Pure allowlist projection. No source objects are spread into the output. */
@@ -75,13 +114,20 @@ export function mapOffice(view) {
     ids.add(id);
     const status = record.status;
     const name = text(record.title) ?? (role === 'orchestrator' ? 'Orchestrator' : 'Worker');
+    const outfit = role === 'orchestrator' ? 'suit' : 'worker';
+    const family = role === 'orchestrator' ? modelFamily(record.model)
+      : characterFamily(provider, record.lane, record.model);
     agents.push({
-      id, name, identity: { name, emoji: role === 'orchestrator' ? '👔' : '🤖' }, role,
+      id, name, role,
+      // avatarUrl: Claw3D's 2D panels show it as is. avatarProfile: its 3D voxel figure,
+      // read only by a Claw3D carrying claw3d/avatar-profile-hint.patch; stock ignores it.
+      identity: { name, emoji: role === 'orchestrator' ? '👔' : '🤖',
+        avatarUrl: avatarDataUrl(family, outfit), avatarProfile: avatarProfile(family, outfit, id) },
       office: {
         floor: floor.session, project: text(floor.project), device: text(floor.device),
         provider, lane: text(record.lane), model: text(record.model), status,
         tool: text(record.tool), title: text(record.title),
-        characterFamily: characterFamily(provider), outfit: role === 'orchestrator' ? 'suit' : 'worker',
+        characterFamily: family, outfit, sprite: family + (outfit === 'suit' ? '-suit' : ''),
       },
     });
   }
@@ -107,9 +153,27 @@ export function mapOffice(view) {
 const event = (name, payload) => ({ type: 'event', event: name, payload });
 const key = agent => 'agent:' + agent.id + ':main';
 const methods = ['agents.list', 'sessions.list', 'status'];
+// Read methods Claw3D Studio calls while it connects and hydrates the fleet (upstream
+// 51337f7: GatewayClient.connect -> config.get; agentFleetHydration -> exec.approvals.get,
+// agents.files.get, sessions.preview; panels -> chat.history, models.list, skills.status,
+// cron.list). Each answer is FIXED and empty: no transcript, file or config is ever
+// served. config.get reports reload mode "off" so Studio never attempts config.patch.
+const NEUTRAL_READS = {
+  'config.get': () => ({ config: { gateway: { reload: { mode: 'off' } } }, hash: 'cortados-office-readonly', exists: true }),
+  'exec.approvals.get': () => ({ path: '', exists: false, hash: 'cortados-office-readonly',
+    file: { version: 1, defaults: {}, agents: {} } }),
+  'agents.files.get': () => ({ file: { missing: true } }),
+  'sessions.preview': params => ({ ts: 0, previews: (Array.isArray(params?.keys) ? params.keys : [])
+    .filter(k => typeof k === 'string' && k.length <= 256).slice(0, 64).map(key => ({ key, status: 'empty', items: [] })) }),
+  'chat.history': params => ({ sessionKey: typeof params?.sessionKey === 'string' ? params.sessionKey : '', messages: [] }),
+  'models.list': () => ({ models: [] }),
+  'skills.status': () => ({ skills: [] }),
+  'cron.list': () => ({ jobs: [] }),
+};
+export const READ_METHODS = Object.freeze([...methods, ...Object.keys(NEUTRAL_READS)]);
 
 /** Transport seam: send(object) emits a JSON frame to one authenticated client.
- * Future WS host owns localhost bind, Origin/auth checks, frame limits and clients.
+ * The WS host (bridge.mjs) owns localhost bind, Origin/auth checks, frame limits and clients.
  * This class never opens a socket and never forwards a mutation upstream.
  */
 export class OfficeGateway {
@@ -121,8 +185,7 @@ export class OfficeGateway {
     this.runs = new Map();
   }
   challenge() {
-    this.send(event('connect.challenge', { nonce: createHash('sha256')
-      .update(String(Math.random())).digest('hex').slice(0, 16) }));
+    this.send(event('connect.challenge', { nonce: randomBytes(16).toString('hex') }));
   }
   sessions() {
     return this.agents.map(a => ({
@@ -144,7 +207,7 @@ export class OfficeGateway {
       this.connected = true;
       reply({
         type: 'hello-ok', protocol: 3, adapterType: 'cortados-office',
-        features: { methods, events: ['agent', 'presence', 'office.snapshot'] },
+        features: { methods: [...READ_METHODS], events: ['agent', 'presence', 'office.snapshot'] },
         snapshot: { health: { agents: this.agents, defaultAgentId: this.agents[0]?.id ?? null },
           sessionDefaults: { mainKey: 'main' } },
         auth: { role: 'operator', scopes: ['operator.read'] },
@@ -157,6 +220,7 @@ export class OfficeGateway {
       reply({ defaultId: this.agents[0]?.id ?? null, mainKey: 'main', agents: this.agents });
     } else if (frame.method === 'sessions.list') reply({ sessions: this.sessions() });
     else if (frame.method === 'status') reply(this.presence());
+    else if (Object.hasOwn(NEUTRAL_READS, frame.method)) reply(NEUTRAL_READS[frame.method](frame.params));
     else this.send({ type: 'res', id: frame.id, ok: false,
       error: { code: 'READ_ONLY', message: 'Office adapter is read-only' } });
   }
@@ -238,7 +302,7 @@ export async function runPolling({ gateway, intervalMs = 5000, signal, onError =
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   if (!process.argv.includes('--stdio') || !process.env.CORTADOS_OFFICE_TOKEN_FILE) {
-    process.stderr.write('Skeleton only: use --stdio and CORTADOS_OFFICE_TOKEN_FILE; no WebSocket listener implemented\n');
+    process.stderr.write('Diagnostic only: use --stdio and CORTADOS_OFFICE_TOKEN_FILE; the WebSocket host is bridge.mjs\n');
     process.exitCode = 1;
   } else {
     const controller = new AbortController();

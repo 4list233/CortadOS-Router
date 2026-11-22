@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mapOffice, characterFamily, OfficeGateway, pollOffice, runPolling } from './adapter.mjs';
+import { mapOffice, characterFamily, modelFamily, READ_METHODS, OfficeGateway, pollOffice, runPolling } from './adapter.mjs';
 
 const worker = { run_id: 'run-12345678', provider: 'codex', lane: 'codex', model: 'gpt',
   title: 'Review', status: 'working', tool: 'Read' };
@@ -11,12 +11,19 @@ const view = () => ({ version: 1, floors: [{ session: '0123456789abcdef',
   project: 'Router', device: 'pro', orchestrator: { model: 'claude', status: 'idle', tool: null },
   workers: [{ ...worker }] }], lobby: { workers: [] } });
 
-for (const family of ['claude', 'codex', 'grok', 'ollama', 'local']) {
+for (const family of ['claude', 'codex', 'grok', 'ollama']) {
   test('character family ' + family, () => assert.equal(characterFamily(family), family));
 }
 test('unknown provider is neutral, not a vendor guess', () => {
-  assert.equal(characterFamily(null), 'local');
-  assert.equal(characterFamily('other'), 'local');
+  assert.equal(characterFamily(null), 'unknown');
+  assert.equal(characterFamily('other'), 'unknown');
+  assert.equal(characterFamily(null, null, 'claude-opus-5-5'), 'unknown'); // a worker's model never decides
+  assert.equal(characterFamily('other', 'claude#b'), 'unknown');           // a named unknown provider wins over lane
+  for (const odd of ['__proto__', 'constructor', 'toString', 'hasOwnProperty']) {
+    assert.equal(characterFamily(odd), 'unknown', odd);
+    assert.equal(characterFamily(null, odd), 'unknown', odd);
+    assert.equal(characterFamily(null, odd + '#b'), 'unknown', odd);
+  }
 });
 test('floors map orchestrator suit and provider metadata', () => {
   const agents = mapOffice(view());
@@ -70,6 +77,79 @@ test('handshake, lists, sessions, status and mutation rejection', () => {
   }
   gateway.request({ type: 'req', id: 'deny', method: 'chat.send' });
   assert.equal(frames.at(-1).error.code, 'READ_ONLY');
+});
+test('hello advertises read methods only; mutations stay READ_ONLY', () => {
+  const { gateway, frames } = connected();
+  const advertised = frames[0].payload.features.methods;
+  assert.deepEqual(advertised, [...READ_METHODS]);
+  for (const m of advertised) assert.ok(!/\.(send|set|patch|create|update|delete|add|run|remove|reset|abort|resolve)$/.test(m), m);
+  for (const method of ['chat.send', 'config.patch', 'config.set', 'agents.create', 'agents.update', 'agents.delete',
+    'agents.files.set', 'sessions.patch', 'sessions.reset', 'chat.abort', 'exec.approvals.set', 'exec.approval.resolve',
+    'cron.add', 'cron.run', 'cron.remove', 'wake', 'agent.wait', 'toString', '__proto__', 'constructor']) {
+    gateway.request({ type: 'req', id: method, method });
+    assert.equal(frames.at(-1).ok, false, method);
+    assert.equal(frames.at(-1).error.code, 'READ_ONLY', method);
+  }
+});
+test('neutral reads Studio needs are fixed and carry no data', () => {
+  const { gateway, frames } = connected();
+  gateway.update(view());
+  const ask = (method, params = {}) => { gateway.request({ type: 'req', id: method, method, params }); return frames.at(-1); };
+  // reload mode "off": Studio's ensureGatewayReloadModeHotForLocalStudio then never writes config
+  assert.equal(ask('config.get').payload.config.gateway.reload.mode, 'off');
+  assert.deepEqual(ask('exec.approvals.get').payload.file.agents, {});
+  assert.deepEqual(ask('agents.files.get', { agentId: 'x', name: 'IDENTITY.md' }).payload, { file: { missing: true } });
+  const preview = ask('sessions.preview', { keys: ['agent:a:main', 7, 'agent:b:main'] }).payload.previews;
+  assert.deepEqual(preview, [{ key: 'agent:a:main', status: 'empty', items: [] }, { key: 'agent:b:main', status: 'empty', items: [] }]);
+  assert.equal(ask('sessions.preview', { keys: Array(500).fill('k') }).payload.previews.length, 64);
+  assert.deepEqual(ask('chat.history', { sessionKey: 'agent:a:main' }).payload.messages, []);
+  for (const m of ['models.list', 'skills.status', 'cron.list']) {
+    assert.deepEqual(Object.values(ask(m).payload), [[]], m);
+  }
+});
+test('workers wear their provider/lane; the orchestrator wears a suit styled by its model', () => {
+  const input = view();
+  input.floors[0].orchestrator.model = 'claude-opus-5-5';
+  input.floors[0].workers = [
+    { ...worker, run_id: 'w-claude-1', provider: 'claude', lane: 'claude#b', model: 'claude-sonnet-5' },
+    { ...worker, run_id: 'w-codex-01', provider: 'codex', lane: 'codex', model: 'gpt-6.1-sol' },
+    { ...worker, run_id: 'w-ollama-1', provider: 'local', lane: 'local-pro', model: 'qwen3:27b' },
+    { ...worker, run_id: 'w-mlx-0001', provider: 'local', lane: 'local-pro', model: 'mlx-community/Qwen3.8-27B-4bit' },
+    { ...worker, run_id: 'w-mlxtag-1', provider: 'local', lane: 'local-pro', model: 'qwen3-mlx:27b' },
+    { ...worker, run_id: 'w-none-001', provider: null, lane: null, model: 'gpt-6.1' },
+    { ...worker, run_id: 'w-lane-001', provider: null, lane: 'codex', model: null },
+  ];
+  const agents = mapOffice(input);
+  assert.deepEqual(agents.map(a => [a.office.characterFamily, a.office.outfit, a.office.sprite]), [
+    ['claude', 'suit', 'claude-suit'], ['claude', 'worker', 'claude'], ['codex', 'worker', 'codex'],
+    ['ollama', 'worker', 'ollama'], ['local', 'worker', 'local'], ['local', 'worker', 'local'],
+    ['unknown', 'worker', 'unknown'], ['codex', 'worker', 'codex']]);
+  // appearance never rewrites the published provider: the orchestrator's stays null
+  assert.equal(agents[0].office.provider, null);
+  assert.equal(agents[6].office.provider, null);
+  for (const a of agents) {
+    assert.match(a.identity.avatarUrl, /^data:image\/png;base64,[A-Za-z0-9+/=]+$/);
+    assert.equal(a.identity.avatarProfile.seed, a.id);
+    assert.equal(a.identity.avatarProfile.clothing.topStyle, a.role === 'orchestrator' ? 'jacket' : 'hoodie');
+  }
+  assert.equal(agents[1].identity.avatarUrl, agents[0 + 1].identity.avatarUrl);
+  assert.notEqual(agents[0].identity.avatarUrl, agents[1].identity.avatarUrl); // suit differs from worker
+});
+test('orchestrator model families', () => {
+  const cases = { 'claude-opus-5-5': 'claude', 'sub/claude-sonnet-5': 'claude', opus: 'claude', 'fable': 'claude',
+    'gpt-6.1-sol': 'codex', 'codex-mini': 'codex', 'o4-mini': 'codex', 'grok-5': 'grok', 'xai/grok-4': 'grok',
+    'qwen3:27b': 'ollama', 'llama3.3:70b-q4_K_M': 'ollama', 'mlx-community/Qwen3-4bit': 'local', 'qwen3.8-27b': 'local',
+    cortados: 'unknown', '': 'unknown', 'gemini-3': 'unknown', 'kimi-k3': 'unknown' };
+  for (const [model, family] of Object.entries(cases)) assert.equal(modelFamily(model), family, model);
+  assert.equal(modelFamily(null), 'unknown');
+  assert.equal(modelFamily(42), 'unknown');
+});
+test('appearance output is metadata only and the same for the same input', () => {
+  const input = view();
+  input.floors[0].workers[0].prompt = 'SECRET-PROMPT';
+  const a = JSON.stringify(mapOffice(input));
+  assert.ok(!a.includes('SECRET'));
+  assert.equal(JSON.stringify(mapOffice(input)), a);
 });
 test('working lifecycle does not duplicate start, ends on removal', () => {
   const { gateway, frames } = connected();
