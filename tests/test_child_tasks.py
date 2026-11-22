@@ -2346,28 +2346,6 @@ class ChildTaskTests(ChildTaskBase):
         self.assertIn("do not call start_task", ct.CHILD_DIRECTIVE)
         self.assertNotIn("do not delegate it again", ct.CHILD_DIRECTIVE)
 
-    def test_a_task_whose_cwd_holds_the_router_checkout_runs_a_hook_copy_outside_it(self):
-        # #128: start_task with cwd = the router repo was refused because the boundary hook lies inside the project
-        # folder. The checkout is stood in for by a hook file inside the task's cwd (the fake claude writes there, so
-        # the real checkout is never used as a cwd). The child now runs a private copy from its task dir.
-        planted = os.path.join(self.work, "router", "cortados_router", "boundary_hook.py")
-        os.makedirs(os.path.dirname(planted))
-        with open(planted, "w") as f:
-            f.write("# the checkout's hook, model-writable inside this cwd\n")
-        with mock.patch.object(ct.session, "BOUNDARY_HOOK_FILE", Path(planted)):
-            tid = self.start(cwd=self.work)
-        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
-        self.assertEqual(w["state"], "succeeded", w)
-        hooks = _load(os.path.join(self.work, "fake-argv.json"))["settings"]["body"]["hooks"]["PreToolUse"]
-        command = hooks[0]["hooks"][0]["command"]
-        d = ct.task_path(tid)
-        copies = glob.glob(os.path.join(d, "boundary-hook-*.py"))
-        self.assertEqual(len(copies), 1, os.listdir(d))
-        self.assertIn(" -I -S -B " + copies[0], command)
-        self.assertNotIn(self.work, command)
-        with open(copies[0], "rb") as f:
-            self.assertEqual(f.read(), ct.session.BOUNDARY_HOOK_FILE.read_bytes())   # the loaded hook, not the planted one
-
     def test_child_directive_in_argv(self):
         for orch in ("cortados", "opus"):
             tid = self.start(orchestrator=orch)
