@@ -179,11 +179,13 @@ S1_HEALTH = ("up", "down", "unknown")
 _HB_S1_KEYS = {"health", "model", "flags", "pending", "loaded_s", "guard"}
 # heartbeat `s1.guard` (#116): the S1 latency guard's state (s1/overnight.py Guard.state, data/latency-guard.json). Fixed
 # states and reason slugs (s1/overnight.GUARD_REASONS), seconds, counts and one timestamp; never a URL, path, pid or text.
-# stopped_for_day (#116, owner 2026-11-18): scoring was still over budget when the longest pause ended, so training stopped
-# and no cycle starts before `until` (epoch s), set by the rule `until_rule` (s1/overnight.DAY_STOP_RULES).
+# stopped_for_day (#116, owner 2026-11-18/22): scoring was still over budget when the longest pause ended, so training stopped
+# and no training cycle starts before `until` (epoch s), set by the rule `until_rule` (s1/overnight.DAY_STOP_RULES:
+# window_start, retry_1h for a stop inside the training window, midnight); labelling-only cycles run meanwhile, and one the
+# guard pauses shows state "paused" with `until`/`until_rule` still set.
 S1_GUARD_STATES = ("running", "paused", "idle", "stopped_for_day", "unknown")
 S1_GUARD_PAUSE = ("complete", "incomplete")      # every group of a pause confirmed stopped, or not (#116 review round 1)
-S1_GUARD_UNTIL_RULES = ("window_start", "midnight")
+S1_GUARD_UNTIL_RULES = ("window_start", "retry_1h", "midnight")
 # A day stop ends at the next training-window start: at most ~25 h ahead (DST included); 2 days bounds a bad value.
 S1_GUARD_UNTIL_AHEAD_MAX = 2 * 86400.0
 S1_GUARD_REASONS = ("latency", "timeout", "refused", "memory", "no_baseline", "forced_release")
@@ -454,7 +456,8 @@ def s1_guard_view(heartbeats: dict[str, dict[str, Any]], now: float) -> dict[str
         return None
     h, g = best
     age = round(max(0.0, now - g["updated_at"]), 1) if _num(g.get("updated_at")) else None
-    # A day stop writes at every reading while the supervisor waits it out (overnight.wait_out_day_stop): stale when silent.
+    # A day stop writes at every reading, in its labelling cycles and between them (overnight.sleep_between_cycles): stale
+    # when silent.
     stale = g.get("state") in ("running", "paused", "stopped_for_day") and (age is None or age > S1_GUARD_STALE_S)
     return {**g, "host": h, "age_s": age, "stale": stale}
 

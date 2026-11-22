@@ -16,8 +16,11 @@ the median of readings taken while the tree is paused or no cycle is running. A 
 tree (the studio gate runs its trainer in its own group and records it in data/trainer-group.json), each recorded in
 data/latency-guard-stopped.json before its SIGSTOP so a restarted supervisor continues them all (recover_stopped_groups); a
 pause whose process discovery failed is incomplete, retried at every reading and never a baseline. Every group is continued
-before any stop. Still over budget when CORTADOS_S1_MAX_PAUSE_S ends: the cycle is stopped the ordinary graceful way and no
-cycle starts before the next training-window start (training_resume_at, state "stopped_for_day"). The guard's state goes to
+before any stop. Still over budget when CORTADOS_S1_MAX_PAUSE_S ends in a cycle that may train: the cycle is stopped the
+ordinary graceful way and training is held (training_resume_at: 1 h when the stop came inside the training window, else the
+next window start, or midnight without a valid window; state "stopped_for_day"); labelling-only cycles keep running meanwhile
+(CORTADOS_S1_TRAIN_ALLOWED=0) and are paused/released by the normal rules. Every graceful stop also TERMs, then KILLs, the
+trainer group the gate recorded, should its gate have crashed (Guard.stop_trainer_group). The guard's state goes to
 data/latency-guard.json for the live view. Design: docs/ROUTER-DESIGN.md §4d.1 "The latency guard".
 
 Training only in the night window (Forest 2026-11-08): CORTADOS_S1_TRAIN_ONLY_IN_WINDOW (default "1"; "0" = train any time).
@@ -74,10 +77,27 @@ def signal_group(pid: int, sig: int) -> None:
         pass
 
 
+def group_alive(pgid: int) -> bool:
+    """Does process group `pgid` still have a member? EPERM counts as alive (a member we may not signal, or a zombie-only
+    group not yet reaped): 'gone' must be certain before a record is cleared."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 # Grace between any supervisor SIGTERM (window end, deadline, launchd stop/restart) and SIGKILL. Longer than studio_capacity's
 # TRAINING_STOP_GRACE_SECONDS (30 s), so the gate can TERM/KILL its own training group and nightly.sh's EXIT trap can run
 # before this supervisor escalates to KILL (a shorter grace orphans the trainer with the node lock held).
 TRAIN_STOP_GRACE_S = 60.0
+# The checkpoint grace the guard gives a recorded trainer group it TERMs itself (stop_trainer_group, #116 owner 2026-11-22):
+# the same as the gate gives its own trainer, studio_capacity.TRAINING_STOP_GRACE_SECONDS (a test pins the two together).
+TRAINER_STOP_GRACE_S = 30.0
+# After SIGKILL, how long to wait for the trainer group to disappear before keeping its record and alerting.
+TRAINER_KILL_WAIT_S = 5.0
 
 
 def run_bounded(command: list[str], seconds: float, *, grace: float = TRAIN_STOP_GRACE_S, pidfile: Path | None = None) -> int:
@@ -237,16 +257,25 @@ def train_policy(now: datetime, *, window_raw: str | None = None, switch_raw: st
 
 
 # The rule slugs training_resume_at answers with; the state file's `until_rule` and the live view accept only these.
-DAY_STOP_RULES = ("window_start", "midnight")
+DAY_STOP_RULES = ("window_start", "retry_1h", "midnight")
+# A stop INSIDE the training window holds training this long, not until the next night (owner 2026-11-22).
+DAY_STOP_RETRY_IN_WINDOW_S = 3600.0
 
 
 def training_resume_at(now: datetime, *, window_raw: str | None = None, zone=None) -> tuple[datetime, str, str]:
-    """(when training may run again, the rule's slug (DAY_STOP_RULES), the rule in words) after the guard stopped it for the day (#116, owner 2026-11-18: still
-    over budget when the longest pause ends -> no more training today; scoring speed wins over daytime training).
-    Rule: the next START of the training window CORTADOS_S1_NIGHT_WINDOW (default 01:00-07:00 America/Toronto), strictly
-    after `now`, so a stop inside the window also waits for the next night (_next_start: today's start only while `now` is
-    before it). With the window off or invalid there is no training window to wait for, so the stop lasts the rest of the
-    local day: the next local midnight. Aware `now` -> aware result in `zone`."""
+    """(when training may run again, the rule's slug (DAY_STOP_RULES), the rule in words) after the guard stopped it for the
+    day (#116, owner 2026-11-18: still over budget when the longest pause ends -> no more training today; scoring speed
+    wins over daytime training). Rules (owner 2026-11-22):
+      - inside the training window CORTADOS_S1_NIGHT_WINDOW (default 01:00-07:00 America/Toronto): one hour from `now`
+        ("retry_1h"). Reason: the window is the time set aside for training, and its routing traffic is light, so the
+        contention that held the trainer (a burst of routed calls, a one-off job on the Studio) often clears within the
+        night; waiting for the next night would throw away the rest of this one. Cycles may start again after the hour,
+        and the guard still judges them (a second stop inside the window waits another hour).
+      - outside it: the next START of the window ("window_start").
+      - with the window off or invalid there is no training window, so the stop lasts the rest of the local day: the next
+        local midnight ("midnight").
+    Only training is held: labelling-only cycles keep running during the stop (run_cycle). Aware `now` -> aware result in
+    `zone` (the hour is added on absolute time, so a DST change inside it does not stretch or shrink it)."""
     zone = zone or NIGHT_ZONE
     raw = os.environ.get("CORTADOS_S1_NIGHT_WINDOW", "") if window_raw is None else window_raw
     try:
@@ -255,13 +284,17 @@ def training_resume_at(now: datetime, *, window_raw: str | None = None, zone=Non
         window = None
     if window is not None:
         s, e = window
+        if in_night_window(window, now, zone=zone):
+            if now.tzinfo is not None:
+                until = datetime.fromtimestamp(now.timestamp() + DAY_STOP_RETRY_IN_WINDOW_S, zone)
+            else:
+                until = now + timedelta(seconds=DAY_STOP_RETRY_IN_WINDOW_S)
+            return until, "retry_1h", f"1 hour: the stop came inside the training window ({s:%H:%M}-{e:%H:%M} local)"
         return (_next_start(window, now, zone=zone), "window_start",
                 f"next training window start ({s:%H:%M}-{e:%H:%M} local)")
     local = _wall(now, zone)
     return (_at(local.date() + timedelta(days=1), time(0), zone, now.tzinfo is not None), "midnight",
             "next local midnight (no valid training window)")
-
-
 
 
 def _local_now() -> datetime:
@@ -775,6 +808,10 @@ class Guard:
         # and the studio gate's trainer-group file (None: none read). leader_start checks a recorded group's identity.
         self.stopped_path, self.trainer_file = stopped_path, trainer_file
         self.leader_start = leader_start or proc_start
+        self.group_alive = group_alive   # 'does this group still exist' for stop_trainer_group (tests replace it)
+        # Whether the running cycle may train (run_cycle sets it from train_policy and the day stop). A labelling-only cycle
+        # is never stopped for the day: there is no training in it to stop (owner 2026-11-22, item 2).
+        self.cycle_trains = True
         self.stopped_groups: list[int] = []   # the groups the last pause stopped (each gets SIGCONT on resume or stop)
         self.stopped_starts: dict[int, str | None] = {}   # their leaders' start times, as recorded in stopped_path
         self.trainer_unreadable_logged = False
@@ -1058,6 +1095,77 @@ class Guard:
         self._signal_groups([g for g in dict.fromkeys(self.stopped_groups + list(now)) if g != pgid], signal.SIGCONT)
         self._clear_stopped()
 
+    def _clear_trainer_record(self, pgid: int) -> None:
+        """Remove the trainer-group record, only while it still names `pgid` (as the gate does: never another gate's)."""
+        rec, _ = read_group_record(self.trainer_file)
+        if rec is None or rec["pgid"] != pgid:
+            return
+        try:
+            self.trainer_file.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            self.log(f"overnight: cannot remove {self.trainer_file.name} ({type(e).__name__}); its group is gone, so a "
+                     "later check finds nothing to stop")
+
+    def stop_trainer_group(self, grace: float | None = None, *, clock=_time.monotonic, sleep=_time.sleep,
+                           poll_s: float = 0.1, kill_wait_s: float | None = None) -> bool:
+        """Stop the trainer group the studio gate recorded in trainer_file (#116, owner 2026-11-22: the guard must always be
+        able to stop the trainer). run_cycle calls it on every graceful stop (window end, stop for the day, supervisor
+        stop) AFTER the cycle's own group drained: a live gate has stopped its trainer and removed the record by then, so
+        this finds nothing; a gate that crashed left its trainer running in its own group (start_new_session) with the
+        training lock, outside the cycle's group, and the cycle's TERM never reached it. Same identity check as a pause
+        (safe_group: never 0/1 or this supervisor's group; group_is_ours: the leader's start time). SIGCONT, SIGTERM, the
+        gate's checkpoint grace (TRAINER_STOP_GRACE_S), SIGKILL if still alive. The record is cleared only when the group is
+        gone. True when no recorded trainer group is left running, False when one may be (logged and alerted)."""
+        grace = TRAINER_STOP_GRACE_S if grace is None else grace
+        kill_wait_s = TRAINER_KILL_WAIT_S if kill_wait_s is None else kill_wait_s
+        if self.trainer_file is None:
+            return True
+        rec, readable = read_group_record(self.trainer_file)
+        if not readable:
+            self.log(f"overnight: trainer group record {self.trainer_file.name} is unreadable; cannot stop a trainer the "
+                     "gate may have left running")
+            self.alerter("guard_trainer_unknown", f"{self.trainer_file.name} unreadable at a graceful stop")
+            return False
+        if rec is None:
+            return True
+        g = rec["pgid"]
+        if not safe_group(g):
+            self.log(f"overnight: trainer group record names group {g}, which the guard never signals; record kept")
+            return False
+        ours = group_is_ours(rec, leader_start=self.leader_start)
+        if ours is None:
+            self.log(f"overnight: recorded trainer group {g} cannot be verified (ps failed or no start recorded); not "
+                     "signalled, record kept")
+            self.alerter("guard_trainer_unknown", "recorded trainer group cannot be verified at a graceful stop")
+            return False
+        if ours is False or not self.group_alive(g):
+            self._clear_trainer_record(g)   # gone (a reused leader pid means our group no longer exists)
+            return True
+        self.log(f"overnight: trainer group {g} outlived its gate; TERM, {grace:g}s to save its checkpoint, then KILL")
+        for sig in (signal.SIGCONT, signal.SIGTERM):
+            self._signal_groups([g], sig)
+        end = clock() + grace
+        while self.group_alive(g) and clock() < end:
+            sleep(poll_s)
+        if self.group_alive(g):
+            # Re-check the identity before the KILL: the group may have drained and its id been taken in the meantime.
+            if group_is_ours(rec, leader_start=self.leader_start) is not True:
+                self.log(f"overnight: trainer group {g} changed identity during its grace; not killed, record kept")
+                return False
+            self.log(f"overnight: trainer group {g} still running {grace:g}s after TERM; sending KILL")
+            self._signal_groups([g], signal.SIGKILL)
+            end = clock() + kill_wait_s
+            while self.group_alive(g) and clock() < end:
+                sleep(poll_s)
+        if self.group_alive(g):
+            self.log(f"overnight: trainer group {g} still present after KILL; record kept so the guard still finds it")
+            self.alerter("guard_trainer_survived", "a trainer group survived SIGKILL at a graceful stop")
+            return False
+        self._clear_trainer_record(g)
+        return True
+
     def _continue(self, pgid: int) -> None:
         self.signaller(pgid, signal.SIGCONT)
         self.continue_all(pgid)
@@ -1085,25 +1193,30 @@ class Guard:
         return self.day_stop_until is not None and self.epoch() < self.day_stop_until
 
     def _stop_for_day(self, pgid: int, why: str, slug: str) -> None:
-        """Still over budget when the longest pause ends (#116, owner 2026-11-18): no release-and-re-pause. Training stops
-        for the rest of the day: run_cycle ends this cycle through the ordinary graceful stop (SIGCONT every stopped group,
-        then stop_group_drained: TERM, the gate gives its trainer TRAINING_STOP_GRACE_SECONDS to save its checkpoint), and
-        run_continuous starts no cycle before training_resume_at (the next training-window start)."""
+        """Still over budget when the longest pause ends in a cycle that may train (#116, owner 2026-11-18): no
+        release-and-re-pause. Training stops: run_cycle ends this cycle through the ordinary graceful stop (SIGCONT every
+        stopped group, stop_group_drained: TERM, the gate gives its trainer TRAINING_STOP_GRACE_SECONDS to save its
+        checkpoint, then stop_trainer_group for a trainer whose gate is gone), and until training_resume_at (1 h inside the
+        window, else the next window start or midnight) every cycle runs labelling-only (owner 2026-11-22)."""
         until, rule_slug, rule = training_resume_at(self.wall())
         self.day_stop_until = until.timestamp()
         self.day_stop_reason = slug if slug in GUARD_REASONS else "latency"
         self.day_stop_rule = rule_slug
         self.stop_requested = True
-        detail = (f"{why}; training stopped for the day (the trainer saves its checkpoint on the normal stop); no cycle "
-                  f"until {until.strftime('%Y-%m-%d %H:%M %Z').strip()} ({rule})")
+        detail = (f"{why}; training stopped for the day (the trainer saves its checkpoint on the normal stop); no training "
+                  f"until {until.strftime('%Y-%m-%d %H:%M %Z').strip()} ({rule}); labelling-only cycles continue")
         self.log(f"overnight: !!! STOPPED FOR THE DAY: {detail}")
         self.alerter("guard_stopped_for_day", detail)
         self.write_state()
 
     def clear_day_stop(self) -> None:
-        self.log(f"overnight: day stop over (until rule {self.day_stop_rule or 'unknown'}); cycles start again")
+        self.log(f"overnight: day stop over (until rule {self.day_stop_rule or 'unknown'}); cycles may train again")
         self.day_stop_until = self.day_stop_reason = self.day_stop_rule = None
         self.write_state()
+
+    def day_stop_expired(self) -> bool:
+        """A day stop is still recorded but its time has passed (clear_day_stop is due)."""
+        return self.day_stop_until is not None and not self.day_stop_active()
 
     # A day stop read back from the state file further ahead than this is not one the guard wrote (the next window start is
     # at most ~25 h away, DST included): a corrupt or hand-edited file must not stop training for days.
@@ -1118,7 +1231,8 @@ class Guard:
             st = json.loads(self.state_path.read_text())
         except (OSError, ValueError, RecursionError):
             return
-        if not isinstance(st, dict) or st.get("state") != "stopped_for_day":
+        # `until` is written for the whole day stop, also while a labelling cycle in it is paused (state "paused").
+        if not isinstance(st, dict) or st.get("until") is None:
             return
         until, now = st.get("until"), self.epoch()
         if not (isinstance(until, (int, float)) and not isinstance(until, bool) and math.isfinite(until)):
@@ -1128,7 +1242,7 @@ class Guard:
             reason = st.get("reason")
             self.day_stop_reason = reason if reason in GUARD_REASONS else "latency"
             self.day_stop_rule = st.get("until_rule") if st.get("until_rule") in DAY_STOP_RULES else None
-            self.log(f"overnight: training stays stopped for the day (from the guard's state file) for "
+            self.log(f"overnight: training stays stopped (from the guard's state file; labelling continues) for "
                      f"{until - now:.0f}s more")
 
     def _release(self, pgid: int, why: str) -> None:
@@ -1155,20 +1269,27 @@ class Guard:
         fin = lambda x: round(x, 3) if x is not None and math.isfinite(x) else None
         now = self.epoch()
         day_stop = self.day_stop_active()
-        state = ("stopped_for_day" if day_stop else "paused" if self.paused else
+        # A pause shows first: during a day stop labelling cycles still run and the guard pauses them like any cycle
+        # (owner 2026-11-22); `until`/`until_rule` say the day stop holds training meanwhile.
+        # A cycle being stopped for the day (stop_requested) is no longer a pause: its groups are about to be continued.
+        paused = self.paused and not self.stop_requested
+        state = ("paused" if paused else "stopped_for_day" if day_stop else
                  "running" if self.in_cycle else "idle")
-        if day_stop:
+        if paused or (not day_stop and self.reason == "forced_release"):
+            reason = self.reason
+        elif day_stop:
             reason = self.day_stop_reason
         else:
-            reason = self.reason if self.paused or self.reason == "forced_release" else None
+            reason = None
         return {"version": 1, "updated_at": round(now, 3), "state": state, "reason": reason,
                 # #116 review round 1: whether every process group of a pause is confirmed stopped ("incomplete": ps failed
                 # or a SIGSTOP did not land; retried at every reading, and no baseline is taken meanwhile).
-                "pause": ("complete" if self.pause_complete else "incomplete") if self.paused and not day_stop else None,
-                # A day stop (#116, owner 2026-11-18): no cycle before `until` (epoch s), by the rule `until_rule`.
+                "pause": ("complete" if self.pause_complete else "incomplete") if paused else None,
+                # A day stop (#116, owner 2026-11-18/22): no training before `until` (epoch s), by the rule `until_rule`;
+                # labelling-only cycles run meanwhile.
                 "until": round(self.day_stop_until, 3) if day_stop else None,
                 "until_rule": self.day_stop_rule if day_stop else None,
-                "paused_s": round(self.clock() - self.paused_at, 1) if self.paused and self.paused_at is not None else None,
+                "paused_s": round(self.clock() - self.paused_at, 1) if paused and self.paused_at is not None else None,
                 "budget": "night" if label.startswith("night") else "day", "budget_s": budget,
                 "baseline_p50_s": fin(self.baseline), "baseline_p90_s": fin(self.baseline_p90),
                 "p50_s": fin(r.p50) if r else None, "p90_s": fin(r.p90) if r else None,
@@ -1216,8 +1337,12 @@ class Guard:
                 # Judged against the baseline as it stood, before this reading joins it (owner 2026-11-18: still over
                 # budget at the limit -> stop for the day; otherwise the forced release below, as before).
                 over = self._over_budget(lat, refused)
-                if over is not None:
+                if over is not None and self.cycle_trains:
                     return self._stop_for_day(pgid, f"{why} and scoring still over budget ({over})", over)
+                if over is not None:
+                    # A labelling-only cycle (outside the window, or during a day stop): the normal pause rules apply, and
+                    # their end at the limit is the forced release with its hold-off (owner 2026-11-22, item 2).
+                    why += f" and scoring still over budget ({over}); a labelling-only cycle is released, not stopped"
                 return self._release(pgid, why)
             if lat is not None and self.pause_complete:
                 self._record_baseline(lat)   # every group is stopped: this reading is the scorer alone
@@ -1410,11 +1535,13 @@ def _read_result(result_file: Path) -> str:
 
 def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: float = 1.0, grace: float = TRAIN_STOP_GRACE_S,
               sleep=_time.sleep, pidfile: Path | None = None, stopflag: Path | None = None,
-              grace_end: float = TRAIN_STOP_GRACE_S) -> tuple[int, str]:
+              grace_end: float = TRAIN_STOP_GRACE_S, trainer_grace: float | None = None) -> tuple[int, str]:
     """Run one nightly.sh cycle under the guard. Returns (rc, result) with result 'worked', 'quota' or 'idle'.
     guard.stop_seen is set when stopflag existed at any poll of this cycle (and after the child exits), so an operator who
     removes it during the TERM grace (to resume) is still read as a stop, not as a failure. Residual race: a flag created
-    and removed entirely inside one poll_s window is never seen, and that rc 130 is read as an external TERM."""
+    and removed entirely inside one poll_s window is never seen, and that rc 130 is read as an external TERM.
+    During the guard's day stop the cycle is labelling-only (CORTADOS_S1_TRAIN_ALLOWED=0, the same switch the night window
+    uses; owner 2026-11-22). Every graceful stop ends with guard.stop_trainer_group (trainer_grace: its checkpoint grace)."""
     guard.stop_seen = False
     def watch_stop():
         if stopflag is not None and not guard.stop_seen and stopflag.exists():
@@ -1436,6 +1563,14 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
             guard.alerter("cycle_result_stuck", f"cannot remove {result_file.name} ({type(e).__name__}); cycle results may be a "
                           "cycle old: 'worked' is read as idle, 'quota' still cools down")
     allowed, why, deadline = train_policy(guard.wall())
+    if guard.day_stop_active():
+        # Owner 2026-11-22 (#116, item 2): a day stop holds TRAINING only. The cycle still runs, labelling-only, through the
+        # existing switch (nightly.sh skips every gated step, the sweep included, and labels; label.py keeps its 15% per-
+        # account quota floor), and the guard still pauses it like any cycle.
+        until = datetime.fromtimestamp(guard.day_stop_until, NIGHT_ZONE).strftime("%Y-%m-%d %H:%M %Z").strip()
+        allowed, deadline = False, None
+        why = (f"training skipped: stopped for the day by the S1 latency guard until {until} "
+               f"(rule {guard.day_stop_rule or 'unknown'}); labelling only")
     print(f"overnight: {why}", flush=True)
     env = dict(os.environ, CORTADOS_NIGHTLY_SUPERVISED="1", TZ="America/Toronto", CORTADOS_S1_CONTINUOUS="1",
                CORTADOS_S1_CYCLE_RESULT=str(result_file), CORTADOS_S1_TRAIN_ALLOWED="1" if allowed else "0",
@@ -1447,6 +1582,7 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
         # after the gate wrapper crashes (studio_capacity.run_holding_lock).
         env["CORTADOS_S1_TRAINER_GROUP_FILE"] = str(guard.trainer_file)
     guard.new_cycle()
+    guard.cycle_trains = allowed
     child = subprocess.Popen(command, env=env, start_new_session=True)
     guard.in_cycle = True
     guard.write_state()
@@ -1463,6 +1599,7 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
                 window_ended = True
                 guard.continue_all(child.pid)   # a paused trainer's own group: CONT before the gate TERMs it
                 stop_group_drained(child, grace=grace_end)
+                guard.stop_trainer_group(trainer_grace)   # a trainer whose gate crashed is outside the drained group
                 break
             guard.tick(child.pid)
             if guard.stop_requested:
@@ -1473,6 +1610,7 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
                 day_stopped = True
                 guard.continue_all(child.pid)
                 stop_group_drained(child, grace=grace_end)
+                guard.stop_trainer_group(trainer_grace)
                 break
             sleep(poll_s)
         watch_stop()
@@ -1480,11 +1618,16 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
         # launchd stop/restart of com.cortados.s1-continuous (every deploy) arrives here as SIGTERM -> KeyboardInterrupt.
         guard.continue_all(child.pid)
         stop_group_drained(child, grace=grace)
+        try:
+            guard.stop_trainer_group(trainer_grace)
+        except Exception as e:   # never hide the stop that brought us here
+            print(f"overnight: stopping the recorded trainer group failed ({type(e).__name__})", flush=True)
         raise
     finally:
         # Never leave a group stopped: the shell can exit while a paused grandchild (the trainer) is still SIGSTOPped, and
         # a gated step's trainer leads its own group (#116), so every group a pause stopped gets SIGCONT too.
         guard.in_cycle = False
+        guard.cycle_trains = True
         guard.continue_all(child.pid)
         try:
             guard.signaller(child.pid, signal.SIGCONT)
@@ -1723,8 +1866,8 @@ def run_continuous(command: list[str], guard: Guard | None = None, *, result_fil
             print(f"overnight: stop flag {stopflag} present (nightly.sh --stop); not relaunching. Remove it to resume.",
                   flush=True)
             return 0
-        if guard.day_stop_active() and not wait_out_day_stop(guard, sleep=sleep, stopflag=stopflag):
-            return 0
+        if guard.day_stop_expired():
+            guard.clear_day_stop()   # the next cycle may train again (train_policy permitting)
         n += 1
         guard.idle_probe()
         rc, result = run_cycle(command, guard, result_file=result_file, poll_s=poll_s, sleep=sleep, pidfile=pidfile,
@@ -1733,8 +1876,10 @@ def run_continuous(command: list[str], guard: Guard | None = None, *, result_fil
             print(f"overnight: cycle {n} ended rc 130 (stop requested); not relaunching", flush=True)
             return rc   # nightly.sh was stopped by request (--stop): do not relaunch
         if result == "stopped_for_day":
-            # Not a failure: the guard stopped it on purpose. The next loop waits until the day stop ends.
-            print(f"overnight: cycle {n} stopped for the day by the latency guard (rc {rc})", flush=True)
+            # Not a failure: the guard stopped it on purpose. The next cycle starts at once, labelling-only until the day
+            # stop ends (owner 2026-11-22: only training is held).
+            print(f"overnight: cycle {n} stopped for the day by the latency guard (rc {rc}); next cycle at once, "
+                  "labelling only", flush=True)
             _save_failures(result_file, 0)
             failures = 0
             continue
@@ -1748,7 +1893,9 @@ def run_continuous(command: list[str], guard: Guard | None = None, *, result_fil
             print(f"overnight: cycle {n} ended 130 without a stop flag (external TERM); treating as a failure", flush=True)
         delay, failures = next_delay(rc, result, idle_s, failures, quota_s)
         _save_failures(result_file, failures)
-        if sweep_request is not None and delay and sweep_request.exists():
+        # During a day stop no cycle may sweep (the sweep is a gated step), so sweep_delay's "the next cycle only sweeps,
+        # no cooldown needed" would relaunch straight into labelling: the delay stands as computed.
+        if sweep_request is not None and delay and sweep_request.exists() and not guard.day_stop_active():
             delay, note = sweep_delay(delay, rc, result, guard.wall())
             if note:
                 print(f"overnight: {note}", flush=True)
@@ -1756,26 +1903,28 @@ def run_continuous(command: list[str], guard: Guard | None = None, *, result_fil
             result if isinstance(result, str) else ("worked" if result else "idle"), "idle")
         print(f"overnight: cycle {n} ended rc {rc} ({what}); next cycle in {delay:g}s", flush=True)
         if delay:
-            sleep(delay)
+            sleep_between_cycles(guard, delay, sleep=sleep)
     return 0
 
 
-def wait_out_day_stop(guard: Guard, *, sleep=_time.sleep, stopflag: Path | None = None) -> bool:
-    """Start no cycle while the guard's day stop lasts (#116, owner 2026-11-18). Waits in steps of at most the guard's
-    reading interval, with an idle reading each step: the state file stays fresh (a silent guard reads as stale in the live
-    view) and the baseline keeps learning the scorer alone. False when the stop flag appears (nightly.sh --stop)."""
-    print(f"overnight: training stopped for the day; no cycle for {guard.day_stop_until - guard.epoch():.0f}s", flush=True)
-    while guard.day_stop_active():
-        if stopflag is not None and stopflag.exists():
-            print(f"overnight: stop flag {stopflag} present (nightly.sh --stop); not relaunching. Remove it to resume.",
-                  flush=True)
-            return False
-        guard.idle_probe()
-        left = guard.day_stop_until - guard.epoch()
-        # >= 1 s: an interval of 0 (tests) or a clock edge must not spin.
-        sleep(max(1.0, min(guard.interval, left)))
-    guard.clear_day_stop()
-    return True
+def sleep_between_cycles(guard: Guard, delay: float, *, sleep=_time.sleep) -> None:
+    """Sleep `delay` before the next cycle. While the guard's day stop lasts (#116), in steps of at most its reading
+    interval with an idle reading each: the state file stays fresh (a day stop that goes silent reads as stale in the live
+    view) and the baseline keeps learning the scorer alone. The day stop ending mid-sleep is cleared at once; the sleep
+    itself is not shortened (the delay protects the labeler's quota, the failure backoff, or the idle interval)."""
+    if not guard.day_stop_active():
+        sleep(delay)
+        return
+    left = delay
+    while left > 0:
+        if guard.day_stop_expired():
+            guard.clear_day_stop()
+        if guard.day_stop_active():
+            guard.idle_probe()
+        # >= 1 s: an interval of 0 (tests) must not spin.
+        step = min(left, max(1.0, guard.interval))
+        sleep(step)
+        left -= step
 
 
 def scorer_plist() -> Path:

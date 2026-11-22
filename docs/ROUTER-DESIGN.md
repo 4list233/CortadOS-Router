@@ -392,19 +392,38 @@ never the trainer; (3) a reading with no baseline was never judged. Now:
   times, to `s1/data/latency-guard-stopped.json` (fsynced); it is removed once they are continued. A restarted supervisor
   (`recover_stopped_groups`, before `recover_pidfile`) SIGCONTs every recorded group that is still ours, the gate's recorded
   trainer group, and every group still in the tree under `nightly.pid`, and only then the cycle's root.
-- *Stopped for the day* (owner 2026-11-18): when the longest pause (`CORTADOS_S1_MAX_PAUSE_S`) ends and scoring is still over
-  budget (a timed-out or refused reading, or p50/p90 above baseline + budget, judged against the baseline before that reading
-  joins it), the guard does not release and re-pause. It alerts `guard_stopped_for_day` and the cycle is ended through the
-  ordinary graceful stop (the window-end path: SIGCONT every stopped group, then `stop_group_drained` TERMs the cycle; the
-  gate gives its trainer `TRAINING_STOP_GRACE_SECONDS` to save its checkpoint). No cycle starts again until `until`, by this
-  rule (`overnight.training_resume_at`): the next START of the training window `CORTADOS_S1_NIGHT_WINDOW` (default
-  01:00-07:00 America/Toronto) strictly after the stop, so a stop inside the window waits for the next night
-  (`until_rule: "window_start"`); with the window off or invalid, the next local midnight (`until_rule: "midnight"`). While
-  it waits the supervisor takes an idle reading every `CORTADOS_S1_PROBE_S`, so the state stays fresh; the stop flag still
-  ends it; and a supervisor restart reads the day stop back from the state file (a value more than 2 days ahead is ignored).
-  Low memory or an unreadable scorer at the limit is still the forced release.
+- *Stopped for the day* (owner 2026-11-18, refined 2026-11-22): when the longest pause (`CORTADOS_S1_MAX_PAUSE_S`) ends in a
+  cycle that may train and scoring is still over budget (a timed-out or refused reading, or p50/p90 above baseline + budget,
+  judged against the baseline before that reading joins it), the guard does not release and re-pause. It alerts
+  `guard_stopped_for_day` and the cycle is ended through the ordinary graceful stop (the window-end path: SIGCONT every
+  stopped group, then `stop_group_drained` TERMs the cycle; the gate gives its trainer `TRAINING_STOP_GRACE_SECONDS` to save
+  its checkpoint). Training is then held until `until`, by this rule (`overnight.training_resume_at`):
+  - stop INSIDE the training window `CORTADOS_S1_NIGHT_WINDOW` (default 01:00-07:00 America/Toronto): one hour
+    (`until_rule: "retry_1h"`, owner 2026-11-22). The window is the time set aside for training and its routing traffic is
+    light, so the contention often clears within the night; waiting for the next night would lose the rest of this one.
+    After the hour cycles may train again, still under the guard (another stop waits another hour);
+  - stop outside the window: its next START (`until_rule: "window_start"`);
+  - window off or invalid: the next local midnight (`until_rule: "midnight"`).
+
+  Only TRAINING is held (owner 2026-11-22): the next cycle starts at once and every cycle during the stop is labelling-only,
+  through the same switch the night window uses (`CORTADOS_S1_TRAIN_ALLOWED=0`: nightly.sh labels and refreshes the dataset,
+  skips every gated step, the calibration sweep included; label.py's 15% per-account quota floor unchanged). The guard
+  pauses such a cycle like any other; at the pause limit a labelling-only cycle gets the forced release (there is no training
+  in it to stop for the day). While a sweep request is pending, the sweep shortcut in the delay between cycles is off during
+  a day stop (no cycle may sweep then). Between cycles the supervisor takes an idle reading every `CORTADOS_S1_PROBE_S`, so
+  the state stays fresh; a supervisor restart reads the day stop back from the state file (`until`, whatever the state; a
+  value more than 2 days ahead is ignored). Low memory or an unreadable scorer at the limit is still the forced release.
+- *Stopping a trainer whose gate crashed* (owner 2026-11-22: the guard must always be able to stop the trainer): every
+  graceful stop (window end, stop for the day, and a supervisor stop) ends with `Guard.stop_trainer_group`, after the
+  cycle's group has drained. A live gate has stopped its trainer and removed `trainer-group.json` by then, so nothing is
+  left; a crashed gate left its trainer running in its own group, outside the cycle's, holding the training lock. The guard
+  reads the record, checks it as a pause does (never group 0/1 or its own; the leader's start time must match), SIGCONTs and
+  TERMs the group, gives it `TRAINER_STOP_GRACE_S` (30 s, the gate's own checkpoint grace) and KILLs it if still alive
+  (after re-checking its identity). The record is cleared only when the group is gone; an unreadable or unverifiable record,
+  or a group that survives the KILL, keeps the record and alerts (`guard_trainer_unknown`, `guard_trainer_survived`).
 - *Shown*: the guard writes `s1/data/latency-guard.json` (state running / paused / idle / stopped_for_day, a reason slug,
-  `pause` complete / incomplete while paused, `until` and `until_rule` during a day stop, the budget in force, baseline and
+  `pause` complete / incomplete while paused, `until` and `until_rule` during a day stop (also while a labelling cycle in it
+  is paused: state "paused"), the budget in force, baseline and
   current p50/p90, samples, timeouts, pauses in 24 h); the Studio's heartbeat sends it as `s1.guard` and the
   live view shows it in its `s1` section (`s1.guard`, with host, age and `stale`) and on the dashboard.
 - The labeler's 15% floor (`CORTADOS_S1_MIN_LEFT_PCT`) is a per-account quota floor in label.py; the guard does not change it.

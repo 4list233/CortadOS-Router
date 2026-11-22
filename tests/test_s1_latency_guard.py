@@ -858,6 +858,167 @@ class TrainerGroupRecord(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["lock"])
 
 
+class TrainerStopAtGracefulStop(unittest.TestCase):
+    """Item 4 (#116, owner 2026-11-22): the guard must always be able to stop the trainer. A trainer whose gate crashed is
+    outside the cycle's group; every graceful stop TERMs the recorded group (identity checked), gives it the gate's
+    checkpoint grace, KILLs it if still alive, and clears the record only once the group is gone. Fakes: signaller,
+    group_alive, leader_start, clock and sleep; one test runs this test's own processes."""
+
+    def world(self, tmp, *, pgid=500, start=START, honours=("TERM",), starts=None):
+        tf = Path(tmp) / night.TRAINER_GROUP_NAME
+        tf.write_text(json.dumps({"version": 1, "pgid": pgid, "start": start, "gate_pid": 499}))
+        alive, sig, alerts, clock = {pgid}, [], [], Clock(0.0)
+        def signaller(g, s):
+            sig.append((g, s))
+            if (s == signal.SIGTERM and "TERM" in honours) or (s == signal.SIGKILL and "KILL" in honours):
+                alive.discard(g)
+        g = guard(lambda: 4.8, sig=sig, trainer_file=tf,
+                  leader_start=(lambda p: (starts if starts is not None else {pgid: start}).get(p)))
+        g.signaller = signaller
+        g.group_alive = lambda grp: grp in alive
+        g.alerter = lambda n, d: alerts.append(n)
+        def sleep(s):
+            clock.t += s
+        kw = dict(clock=clock, sleep=sleep)
+        return g, tf, sig, alerts, kw, clock
+
+    def test_the_grace_is_the_gates_own_checkpoint_grace(self):
+        self.assertEqual(night.TRAINER_STOP_GRACE_S, cap.TRAINING_STOP_GRACE_SECONDS)
+
+    def test_a_trainer_that_outlived_its_gate_is_termed_and_its_record_cleared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            g, tf, sig, alerts, kw, _ = self.world(tmp)
+            self.assertTrue(g.stop_trainer_group(**kw))
+            self.assertEqual(sig, [(500, signal.SIGCONT), (500, signal.SIGTERM)])
+            self.assertFalse(tf.exists())
+            self.assertEqual(alerts, [])
+
+    def test_a_trainer_ignoring_term_is_killed_after_the_grace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            g, tf, sig, alerts, kw, clock = self.world(tmp, honours=("KILL",))
+            self.assertTrue(g.stop_trainer_group(**kw))
+            self.assertEqual([s for _, s in sig], [signal.SIGCONT, signal.SIGTERM, signal.SIGKILL])
+            self.assertGreaterEqual(clock.t, night.TRAINER_STOP_GRACE_S)   # the whole checkpoint grace first
+            self.assertFalse(tf.exists())
+
+    def test_a_group_surviving_kill_keeps_its_record_and_alerts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            g, tf, sig, alerts, kw, _ = self.world(tmp, honours=())
+            self.assertFalse(g.stop_trainer_group(**kw))
+            self.assertTrue(tf.exists())
+            self.assertEqual(alerts, ["guard_trainer_survived"])
+
+    def test_a_reused_pgid_is_never_signalled_and_its_stale_record_is_cleared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            g, tf, sig, alerts, kw, _ = self.world(tmp, starts={500: "Mon Nov 23 03:00:00 2026"})
+            self.assertTrue(g.stop_trainer_group(**kw))
+            self.assertEqual(sig, [])
+            self.assertFalse(tf.exists())
+
+    def test_an_unverifiable_record_is_not_signalled_and_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            g, tf, sig, alerts, kw, _ = self.world(tmp)
+            def ps_fails(pid):
+                raise subprocess.TimeoutExpired("ps", 10)
+            g.leader_start = ps_fails
+            self.assertFalse(g.stop_trainer_group(**kw))
+            self.assertEqual(sig, [])
+            self.assertTrue(tf.exists())
+            self.assertEqual(alerts, ["guard_trainer_unknown"])
+
+    def test_group_0_1_and_the_supervisors_own_are_never_signalled(self):
+        for bad in (0, 1, os.getpgrp()):
+            with tempfile.TemporaryDirectory() as tmp:
+                g, tf, sig, alerts, kw, _ = self.world(tmp, pgid=bad)
+                self.assertFalse(g.stop_trainer_group(**kw))
+                self.assertEqual(sig, [], bad)
+                self.assertTrue(tf.exists())
+
+    def test_no_record_or_a_gone_group_signals_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            g, tf, sig, alerts, kw, _ = self.world(tmp)
+            g.group_alive = lambda grp: False
+            self.assertTrue(g.stop_trainer_group(**kw))
+            self.assertFalse(tf.exists())
+            self.assertTrue(g.stop_trainer_group(**kw))   # absent now
+            self.assertEqual(sig, [])
+
+    def test_a_record_rewritten_by_another_gate_is_not_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            g, tf, sig, alerts, kw, _ = self.world(tmp)
+            orig = g.signaller
+            def signaller(grp, s):
+                orig(grp, s)
+                if s == signal.SIGTERM:
+                    tf.write_text(json.dumps({"pgid": 600, "start": START}))
+            g.signaller = signaller
+            self.assertTrue(g.stop_trainer_group(**kw))
+            self.assertEqual(json.loads(tf.read_text())["pgid"], 600)
+
+    def _orphan(self, d):
+        """A 'trainer' in its own session, as the gate starts it, whose gate is gone: saves a checkpoint on TERM."""
+        ckpt = d / "checkpoint"
+        code = ("import signal, sys, time\n"
+                "def stop(*a):\n"
+                "    open(sys.argv[1], 'w').write('saved'); sys.exit(0)\n"
+                "signal.signal(signal.SIGTERM, stop)\n"
+                "time.sleep(60)\n")
+        p = subprocess.Popen([sys.executable, "-c", code, str(ckpt)], start_new_session=True)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        # An orphaned trainer is reaped by launchd once it exits; here this test is its parent, so a thread reaps it (an
+        # unreaped zombie would keep its group present to kill(-pgid, 0)).
+        threading.Thread(target=p.wait, daemon=True).start()
+        deadline = time.monotonic() + 10
+        start = None
+        while start is None and time.monotonic() < deadline:
+            start = night.proc_start(p.pid)
+        tf = d / night.TRAINER_GROUP_NAME
+        tf.write_text(json.dumps({"version": 1, "pgid": p.pid, "start": start, "gate_pid": 1}))
+        time.sleep(0.3)   # let it install its TERM handler
+        return p, ckpt, tf
+
+    def _real_guard(self, d, tf, clock):
+        g = guard(lambda: 9.0, clock=clock, baseline=(4.8, 6.2), wall=lambda: at(2026, 11, 22, 14), trainer_file=tf,
+                  groups=lambda pg: [pg])
+        g.signaller = night.signal_group   # real signals, to this test's own processes only
+        g.epoch = lambda: at(2026, 11, 22, 14).timestamp()
+        g.max_pause = 60
+        return g
+
+    def test_stop_for_day_terms_a_trainer_whose_gate_crashed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            p, ckpt, tf = self._orphan(d)
+            clock = Clock(0.0)
+            g = self._real_guard(d, tf, clock)
+            def sleep(s):
+                clock.t += 31.0
+                time.sleep(0.02)
+            with patch("builtins.print"), patch.dict(os.environ, {"CORTADOS_S1_TRAIN_ONLY_IN_WINDOW": "0"}):
+                rc, result = night.run_cycle([sys.executable, "-c", "import time; time.sleep(30)"], g,
+                                             result_file=d / "r", poll_s=0.05, sleep=sleep, grace_end=10, trainer_grace=10)
+            self.assertEqual(result, "stopped_for_day")
+            self.assertEqual(p.wait(timeout=10), 0)
+            self.assertEqual(ckpt.read_text(), "saved")
+            self.assertFalse(tf.exists())
+
+    def test_the_window_end_terms_a_trainer_whose_gate_crashed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            p, ckpt, tf = self._orphan(d)
+            g = self._real_guard(d, tf, Clock(0.0))
+            g.wall = lambda: at(2026, 11, 22, 7, 1)   # the window (01:00-07:00) has ended by the first poll
+            with patch("builtins.print"), patch.object(night, "train_policy",
+                                                       lambda now: (True, "inside", at(2026, 11, 22, 7))):
+                rc, result = night.run_cycle([sys.executable, "-c", "import time; time.sleep(30)"], g,
+                                             result_file=d / "r", poll_s=0.05, sleep=time.sleep, grace_end=10,
+                                             trainer_grace=10)
+            self.assertEqual(result, "window_end")
+            self.assertEqual(p.wait(timeout=10), 0)
+            self.assertEqual(ckpt.read_text(), "saved")
+            self.assertFalse(tf.exists())
+
+
 TORONTO = night.TORONTO
 
 
@@ -872,13 +1033,43 @@ class StopForDay(unittest.TestCase):
     def test_the_resume_rule_is_the_next_training_window_start(self):
         cases = [(at(2026, 11, 22, 14), "01:00-07:00", at(2026, 11, 23, 1), "window_start"),
                  (at(2026, 11, 22, 0, 30), "01:00-07:00", at(2026, 11, 22, 1), "window_start"),
-                 (at(2026, 11, 22, 2), "01:00-07:00", at(2026, 11, 23, 1), "window_start"),   # inside: the next night
+                 (at(2026, 11, 22, 2), "01:00-07:00", at(2026, 11, 22, 3), "retry_1h"),   # inside: 1 h (owner 2026-11-22)
+                 (at(2026, 11, 22, 6, 30), "01:00-07:00", at(2026, 11, 22, 7, 30), "retry_1h"),
+                 (at(2026, 11, 22, 23), "22:00-06:00", at(2026, 11, 23, 0), "retry_1h"),   # a window across midnight
                  (at(2026, 11, 22, 14), "", at(2026, 11, 23, 1), "window_start"),              # unset: the default
                  (at(2026, 11, 22, 14), "off", at(2026, 11, 23, 0), "midnight"),
                  (at(2026, 11, 22, 14), "nonsense", at(2026, 11, 23, 0), "midnight")]
         for now, raw, want, slug in cases:
             until, rule, _ = night.training_resume_at(now, window_raw=raw)
             self.assertEqual((until.timestamp(), rule), (want.timestamp(), slug), (now, raw))
+
+    def test_inside_the_window_the_stop_lasts_one_real_hour_across_a_dst_change(self):
+        # 2026-11-01 01:30 EDT (the first of the two 01:30s): one hour later is 01:30 EST, not 02:30 wall time.
+        now = night.datetime(2026, 11, 1, 1, 30, tzinfo=TORONTO, fold=0)
+        until, rule, words = night.training_resume_at(now, window_raw="01:00-07:00")
+        self.assertEqual((until.timestamp() - now.timestamp(), rule), (3600.0, "retry_1h"))
+        self.assertIn("inside the training window", words)
+        naive = night.datetime(2026, 11, 22, 2)
+        self.assertEqual(night.training_resume_at(naive, window_raw="01:00-07:00")[0], night.datetime(2026, 11, 22, 3))
+
+    def test_a_stop_inside_the_window_records_retry_1h_and_the_live_view_accepts_it(self):
+        clock = Clock(0.0)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"CORTADOS_S1_NIGHT_WINDOW": "01:00-07:00"}):
+            path = Path(tmp) / night.GUARD_STATE_NAME
+            g, alerts = self.mkday(lambda: 9.0, clock, state_path=path)
+            g.wall = lambda: at(2026, 11, 22, 3)
+            g.epoch = lambda: at(2026, 11, 22, 3).timestamp()
+            g.tick(100); clock.t = 61.0; g.tick(100)
+            st = g.state()
+            self.assertEqual((st["state"], st["until_rule"], st["until"]),
+                             ("stopped_for_day", "retry_1h", at(2026, 11, 22, 4).timestamp()))
+            self.assertIsNone(live.validate_s1_guard({k: v for k, v in st.items() if k != "version"}, st["updated_at"])[1])
+            g2 = guard(lambda: 4.8, state_path=path)
+            g2.epoch = lambda: at(2026, 11, 22, 3, 30).timestamp()
+            g2.load_day_stop()
+            self.assertEqual((g2.day_stop_active(), g2.day_stop_rule), (True, "retry_1h"))
+            g2.epoch = lambda: at(2026, 11, 22, 4, 1).timestamp()
+            self.assertTrue(g2.day_stop_expired())   # after the hour, cycles may train again
 
     def mkday(self, latency, clock, **kw):
         alerts = []
@@ -932,7 +1123,8 @@ class StopForDay(unittest.TestCase):
             def sleep(s):
                 clock.t += 31.0
                 time.sleep(0.02)
-            with patch("builtins.print"):
+            # A cycle that may train (at 14:00 only with training allowed any time): a labelling-only one is released.
+            with patch("builtins.print"), patch.dict(os.environ, {"CORTADOS_S1_TRAIN_ONLY_IN_WINDOW": "0"}):
                 rc, result = night.run_cycle([sys.executable, "-c", code, str(ckpt)], g, result_file=d / "r",
                                              poll_s=0.05, sleep=sleep, grace_end=10)
             self.assertEqual((rc, result), (0, "stopped_for_day"))
@@ -940,7 +1132,9 @@ class StopForDay(unittest.TestCase):
             self.assertTrue(g.day_stop_active())
             self.assertFalse(g.paused)
 
-    def test_no_cycle_starts_before_the_window_and_the_wait_keeps_the_state_fresh(self):
+    def test_during_a_day_stop_cycles_keep_running_labelling_only_and_the_state_stays_fresh(self):
+        # Owner 2026-11-22 (item 2): only training is held; cycles start as usual and the sleeps between them keep the
+        # guard's state fresh; the day stop is cleared once its time has passed.
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             now = [1_800_000_000.0]
@@ -954,17 +1148,89 @@ class StopForDay(unittest.TestCase):
                 states.append(json.loads((d / night.GUARD_STATE_NAME).read_text())["state"])
                 now[0] += s
             def fake_cycle(*a, **k):
-                started.append(now[0])
+                started.append((now[0], g.day_stop_active()))
                 return 0, "idle"
             with patch.object(night, "run_cycle", fake_cycle), patch("builtins.print"):
-                night.run_continuous(["true"], g, result_file=d / "r", idle_s=60, sleep=sleep, cycles=1)
-            self.assertEqual(len(started), 1)
-            self.assertGreaterEqual(started[0], 1_800_000_000.0 + 3600)
-            self.assertEqual(set(states[:-1]), {"stopped_for_day"})
-            self.assertGreater(len(states), 100)                   # one reading per 30 s interval while waiting
+                night.run_continuous(["true"], g, result_file=d / "r", idle_s=900, sleep=sleep, cycles=6)
+            self.assertEqual(started[0], (1_800_000_000.0, True))   # no wait: the first cycle starts at once
+            self.assertEqual([a for _, a in started], [True] * 4 + [False] * 2)
+            self.assertEqual(set(states[:4 * 30]), {"stopped_for_day"})   # one reading per 30 s between cycles
             self.assertIsNone(g.day_stop_until)
 
-    def test_the_stop_flag_ends_the_wait(self):
+    def test_run_cycle_during_a_day_stop_is_labelling_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            out = d / "env"
+            g = guard(lambda: 4.8, baseline=(4.8, 6.2))
+            g.epoch = lambda: at(2026, 11, 22, 14).timestamp()
+            g.wall = lambda: at(2026, 11, 22, 14)
+            g.day_stop_until, g.day_stop_reason, g.day_stop_rule = at(2026, 11, 23, 1).timestamp(), "latency", "window_start"
+            code = ("import os,sys; open(sys.argv[1],'w').write(os.environ['CORTADOS_S1_TRAIN_ALLOWED'] + '|' + "
+                    "os.environ['CORTADOS_S1_TRAIN_SKIP_REASON'] + '|' + os.environ['CORTADOS_S1_TRAIN_UNTIL'])")
+            seen = []
+            orig_tick = g.tick
+            g.tick = lambda pgid: (seen.append(g.cycle_trains), orig_tick(pgid))
+            with patch.dict(os.environ, {"CORTADOS_S1_TRAIN_ONLY_IN_WINDOW": "0"}), patch("builtins.print"):
+                night.run_cycle([sys.executable, "-c", code + "; import time; time.sleep(0.2)", str(out)], g,
+                                result_file=d / "r", poll_s=0.02, sleep=time.sleep)
+            allowed, reason, until = out.read_text().split("|")
+            self.assertEqual((allowed, until), ("0", ""))   # training allowed any time, yet held by the day stop
+            self.assertIn("stopped for the day by the S1 latency guard", reason)
+            self.assertIn("labelling only", reason)
+            self.assertIn(False, seen)
+            self.assertTrue(g.cycle_trains)   # reset after the cycle
+
+    def test_a_labelling_only_cycle_over_budget_at_the_limit_is_released_not_stopped(self):
+        sig, clock = [], Clock(0.0)
+        g, alerts = self.mkday(lambda: 9.0, clock, sig=sig)
+        g.cycle_trains = False
+        g.tick(100)
+        clock.t = 61.0
+        g.tick(100)
+        self.assertFalse(g.stop_requested)
+        self.assertIsNone(g.day_stop_until)
+        self.assertEqual(alerts, ["guard_forced_resume"])
+        self.assertEqual(sig, [(100, signal.SIGSTOP), (100, signal.SIGCONT)])
+
+    def test_a_paused_labelling_cycle_during_a_day_stop_shows_paused_and_keeps_the_stop_across_a_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / night.GUARD_STATE_NAME
+            sig, clock = [], Clock(0.0)
+            g, _ = self.mkday(lambda: 9.0, clock, sig=sig, state_path=path)
+            g.day_stop_until, g.day_stop_reason, g.day_stop_rule = at(2026, 11, 23, 1).timestamp(), "timeout", "window_start"
+            g.cycle_trains = False
+            g.in_cycle = True
+            g.tick(100)
+            st = json.loads(path.read_text())
+            self.assertEqual((st["state"], st["reason"], st["pause"], st["until_rule"]),
+                             ("paused", "latency", "complete", "window_start"))
+            self.assertIsNone(live.validate_s1_guard({k: v for k, v in st.items() if k != "version"}, st["updated_at"])[1])
+            g2 = guard(lambda: 4.8, state_path=path)
+            g2.epoch = lambda: at(2026, 11, 22, 15).timestamp()
+            g2.load_day_stop()
+            self.assertTrue(g2.day_stop_active())
+
+    def test_no_sweep_shortcut_during_a_day_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            req = d / "sweep-request.json"
+            req.write_text("{}")
+            now = [at(2026, 11, 22, 3).timestamp()]
+            g = guard(lambda: 4.8)
+            g.epoch = lambda: now[0]
+            g.wall = lambda: at(2026, 11, 22, 3)
+            g.interval = 600
+            g.day_stop_until, g.day_stop_rule = now[0] + 3600, "retry_1h"
+            slept = []
+            def sleep(s):
+                slept.append(s); now[0] += s
+            with patch.object(night, "run_cycle", lambda *a, **k: (0, "quota")), patch("builtins.print"), \
+                    patch.dict(os.environ, {"CORTADOS_S1_NIGHT_WINDOW": "01:00-07:00"}):
+                night.run_continuous(["true"], g, result_file=d / "r", idle_s=60, quota_s=7200, sleep=sleep, cycles=1,
+                                     sweep_request=req)
+            self.assertEqual(sum(slept), 7200)   # the quota cooldown stands: the next cycle labels, it cannot sweep
+
+    def test_the_stop_flag_still_ends_the_loop_during_a_day_stop(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             flag = d / "nightly.stop"
@@ -973,7 +1239,7 @@ class StopForDay(unittest.TestCase):
             g.day_stop_until = 1_800_000_000.0 + 3600
             flag.write_text("")
             with patch.object(night, "run_cycle", lambda *a, **k: self.fail("no cycle")), patch("builtins.print"):
-                self.assertFalse(night.wait_out_day_stop(g, sleep=lambda s: None, stopflag=flag))
+                self.assertEqual(night.run_continuous(["true"], g, result_file=d / "r", idle_s=60, stopflag=flag), 0)
 
     def test_a_restarted_supervisor_keeps_the_day_stop(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1010,6 +1276,9 @@ class StopForDay(unittest.TestCase):
         html = (REPO / "cortados_router/provider/dashboard.html").read_text()
         self.assertIn('"stopped_for_day"', html)
         self.assertIn("training stopped for the day", html)
+        self.assertIn('"retry_1h"', html)
+        self.assertIn("labelling continues", html)
+        self.assertEqual(live.S1_GUARD_UNTIL_RULES, night.DAY_STOP_RULES)
 
 
 if __name__ == "__main__":

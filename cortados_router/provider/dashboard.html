@@ -725,10 +725,14 @@ function guardText(g) {
   if (!g) return null;
   if (g.state === "unknown") return "latency guard: state unreadable";
   const until = isNum(g.until) ? new Date(g.until * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"}) : "?";
+  // A day stop holds training only (owner 2026-11-22): labelling cycles keep running, and the guard may pause one of them.
+  const rule = g.until_rule === "window_start" ? " (next training window)" : g.until_rule === "retry_1h" ? " (1 h retry: stopped inside the training window)"
+    : g.until_rule === "midnight" ? " (midnight)" : "";
+  const dayStop = isNum(g.until) ? "training stopped for the day; no training until " + until + rule + ", labelling continues" : null;
   const head = g.state === "stopped_for_day" ? "training stopped for the day (" + (GUARD_REASON_TEXT[g.reason] || g.reason || "?")
-      + " at the longest pause); no cycle until " + until + (g.until_rule === "window_start" ? " (next training window)" : g.until_rule === "midnight" ? " (midnight)" : "")
-    : g.state === "paused" ? "training paused: " + (GUARD_REASON_TEXT[g.reason] || g.reason || "?")
-      + (g.pause === "incomplete" ? " (not every process group confirmed stopped yet)" : "")
+      + " at the longest pause); no training until " + until + rule + ", labelling continues"
+    : g.state === "paused" ? (dayStop ? "labelling paused: " : "training paused: ") + (GUARD_REASON_TEXT[g.reason] || g.reason || "?")
+      + (g.pause === "incomplete" ? " (not every process group confirmed stopped yet)" : "") + (dayStop ? "; " + dayStop : "")
     : g.state === "running" ? "training running within budget" + (g.reason === "forced_release" ? " (" + GUARD_REASON_TEXT.forced_release + ")" : "")
     : "no cycle running";
   const now = g.samples ? "p50 " + secs(g.p50_s) + " / p90 " + secs(g.p90_s) + " (" + g.samples + " " + (g.source === "probe" ? "probe" : "routed") + ")" : null;
