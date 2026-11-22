@@ -764,8 +764,8 @@ def reveal_model(route: dict | None) -> str | None:
 
 
 def api_reveal_suffix() -> str | None:
-    """` · <pct>% left` of the anthropic-api credit window, for an api/-pinned request that asked to reveal. The
-    upstream response already names the real model; this only adds the %. None when the meter cannot be read."""
+    """` · <pct>% left` of the anthropic-api credit (100 % = the stop line), for an API-lane request that asked to
+    reveal. The upstream response already names the real model; this only adds the %. None when it cannot be read."""
     try:
         from cortados_router import api_credits
         used = float(api_credits.window_numbers(time.time())[0])
@@ -807,6 +807,11 @@ class LocalSession:
 
     def close(self) -> None:
         pass
+
+
+class ApiSession(LocalSession):
+    """A conversation routing moved to the anthropic-api credit lane (routing.prefer_api_credit): relayed statelessly
+    by Handler._relay_api, kept only as its binding to the model and its reply fingerprints, as a LocalSession is."""
 
 
 def _configured_live_hosts() -> set[str]:
@@ -1018,6 +1023,8 @@ class Registry:
         factory = self._factories.get(provider) or self._factories.get(_base_provider(provider))
         if factory is None and route and route.get("local") and provider.startswith(local_lane.LANE_PREFIX):
             factory = LocalSession                  # a local pin: no backend process, only the conversation's binding
+        if factory is None and route and provider == routing.API_PROVIDER and not route.get("local"):
+            factory = ApiSession                    # the API credit lane: relayed per turn, no backend process
         if factory is None:
             raise UnservedProvider(f"routed to provider {provider!r}, which this endpoint has no backend for "
                                    f"(served: {', '.join(sorted(self._factories))})")
@@ -2505,69 +2512,91 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def _serve_api_lane(self, body: dict[str, Any], model: str, wire: Wire) -> None:
-        """Execute a pinned request on the anthropic-api credit lane under admission control: reserve a conservative
-        max cost BEFORE dispatch, proxy to api.anthropic.com, then settle the actual cost (the full reservation if
-        the actual is unknown). Refuse when the credit is spent, and fail closed if accounting is unavailable.
-        Stateless — no session, no S1 (the pin is explicit)."""
+        """An `api/<model>` pin: one stateless turn on the anthropic-api credit lane (_api_turn). No session, no S1."""
+        # A revealing client (the routed-subagents mod) also sees the credit's % left after the real model the upstream
+        # response names; read BEFORE this turn reserves. Without the header nothing about the relay changes.
+        reveal = (api_reveal_suffix() if self._wants_reveal() else None)
+        # Recorded once admitted (it is about to run). The label is the reveal the response carries when one was asked
+        # for; otherwise the model (the meter is not read just for the record).
+        self._api_turn(body, model, wire, reveal=reveal,
+                       admitted=lambda: self._record_run(provider="anthropic-api", model=model,
+                                                         label=model + reveal if reveal else model,
+                                                         tools=bool(body.get("tools"))))
+
+    def _api_turn(self, body: dict[str, Any], model: str, wire: Wire, *, reveal: str | None = None,
+                  echo_model: str | None = None, reply: list | None = None,
+                  commit: Callable[[list], None] | None = None,
+                  admitted: Callable[[], None] | None = None) -> str:
+        """One turn on the anthropic-api credit lane (#114), under the lane's money rules (api_credits): refuse unless
+        the lane is on, reserve the request's UPPER-bound cost under the ledger lock before dispatch (never past the
+        95% stop line, whatever runs concurrently), proxy to api.anthropic.com, then settle the real cost from the
+        response's usage (the full reservation when it is unknown). Fails closed: an unreadable config or ledger
+        refuses. Returns "refused" (answered before anything was sent) or anthropic_proxy.serve's outcome."""
         from cortados_router import api_credits
         from cortados_router.provider import anthropic_proxy
-        if not api_credits.configured_orgs():
-            return self._error(503, "overloaded_error",
-                               "cortados: the anthropic-api lane has no key (set CORTADOS_ANTHROPIC_API_KEY)", wire)
-        bad = api_credits.unbounded_server_tools(body)
-        if bad:                                   # a server tool whose cost we cannot bound/reconcile -> never dispatch
-            return self._error(400, "invalid_request_error",
-                               f"cortados: the anthropic-api credit lane cannot bound the cost of server tool(s) "
-                               f"{', '.join(sorted({anthropic_wire.shown_name(b) for b in bad}))} (billed by server-side time); not permitted on this lane", wire)
-        body = api_credits.enforce_server_tool_caps(body)   # cap metered tools to what we reserve, so admission is a real bound
-        # A revealing client (the routed-subagents mod) also sees the credit window's % left after the real model the
-        # upstream response names; read BEFORE this turn reserves. Without the header nothing about the relay changes.
-        reveal = (api_reveal_suffix() if self._wants_reveal() else None)
+        why = api_credits.key_problem()
+        if why:
+            self._error(503, "overloaded_error", f"cortados: the anthropic-api credit lane is off: {why}", wire)
+            return "refused"
+        body = api_credits.enforce_server_tool_caps(body)   # cap metered tools to what we reserve
+        try:
+            max_cost = api_credits.estimate_max_cost(body, model)
+        except api_credits.Unbounded as exc:            # a cost no reservation can cover: never dispatched
+            self._error(400, "invalid_request_error",
+                        f"cortados: the anthropic-api credit lane cannot bound the cost of this request ({exc}); "
+                        "not permitted on this lane", wire)
+            return "refused"
         now = time.time()
-        max_cost = api_credits.estimate_max_cost(body, model)
         try:
             res_id = api_credits.reserve(max_cost, now)
         except api_credits.LedgerError as exc:
-            logger.error("anthropic-api accounting unavailable, refusing to spend blind: %s", exc)
-            return self._error(503, "overloaded_error",
-                               "cortados: the anthropic-api lane's accounting is unavailable; refusing", wire)
+            logger.error("anthropic-api accounting unavailable, lane off, refusing to spend blind: %s", exc)
+            self._error(503, "overloaded_error",
+                        f"cortados: the anthropic-api credit lane is off: its accounting is unavailable ({exc})", wire)
+            return "refused"
         if res_id is None:
-            return self._error(429, "rate_limit_error",
-                               f"cortados: the anthropic-api credit (${api_credits.total_budget_usd():.0f}) is spent or "
-                               "fully reserved this period; it resets on the billing day", wire)
-        key = api_credits.key_for_reservation(res_id)
-        if not key:
-            # The reservation's org was deconfigured between reserve and dispatch (rare). Release it and refuse
-            # rather than fall back to another org's key, which would misattribute the spend.
+            st = api_credits.state(now)
+            why = st.get("reason") if not st.get("on") else (
+                f"this request's upper-bound cost (${max_cost:.2f}) does not fit under the stop line "
+                f"(${float(st.get('headroom_usd') or 0):.2f} left)")
+            self._error(429, "rate_limit_error", f"cortados: the anthropic-api credit lane refused the request: {why}",
+                        wire)
+            return "refused"
+        key = api_credits.api_key()
+        if not key:                                     # the key went away between the check and the reservation
             api_credits.settle(res_id, 0.0, now)
-            return self._error(503, "overloaded_error",
-                               "cortados: the anthropic-api lane's reserved org is no longer configured", wire)
-        logger.info("anthropic-api lane: reserved $%.2f for %s (committed $%.2f of $%.0f)",
-                    max_cost, routing.shown_pin(model), api_credits.committed(now), api_credits.total_budget_usd())
-        # Recorded once admitted (it is about to run). The label is the reveal the response carries when one was asked
-        # for; otherwise the model (the meter is not read just for the record).
-        self._record_run(provider="anthropic-api", model=model, label=model + reveal if reveal else model,
-                         tools=bool(body.get("tools")))
+            self._error(503, "overloaded_error", "cortados: the anthropic-api credit lane has no key", wire)
+            return "refused"
+        logger.info("anthropic-api lane: reserved $%.4f for %s", max_cost, routing.shown_pin(model))
+        if admitted is not None:
+            try:
+                admitted()
+            except Exception:
+                logger.exception("anthropic-api lane: admission record failed")
         usage: dict[str, Any] = {}
         outcome = "unknown"                       # if serve raises, we do not know what was billed -> conservative
         try:
             usage, outcome = anthropic_proxy.serve(self, body, model, now, key=key,
-                                                   **({"model_suffix": reveal} if reveal else {}))
+                                                   **({"model_suffix": reveal} if reveal else {}),
+                                                   **({"echo_model": echo_model} if echo_model else {}),
+                                                   **({"reply": reply} if reply is not None else {}),
+                                                   **({"commit": commit} if commit is not None else {}))
         except OSError as exc:
-            logger.info("anthropic-api proxy: client left (%s)", exc)
+            logger.info("anthropic-api proxy: client left (%s)", type(exc).__name__)
         except Exception as exc:
             # Any other failure out of serve() (e.g. a response-parse error after the POST was dispatched) leaves the
             # spend genuinely unknown -> keep outcome "unknown" so we settle conservatively rather than crash/undercharge.
-            logger.error("anthropic-api proxy failed after dispatch (settling conservatively): %s", exc)
+            logger.error("anthropic-api proxy failed after dispatch (settling conservatively): %s", type(exc).__name__)
         finally:
+            geo = bool(body.get("inference_geo"))
             if outcome == "rejected":
                 charge = 0.0                       # the API returned an error; nothing was billed
             elif outcome == "completed":
-                charge = api_credits.cost_from_usage(model, usage)   # a terminal response: settle the actual cost
+                charge = api_credits.cost_from_usage(model, usage, geo=geo)   # a terminal response: the actual cost
             else:
                 # unknown (timeout / transport error / mid-stream disconnect): the full reservation, but never below
                 # the cost we already observed on the wire, so a partial-but-expensive turn cannot under-settle.
-                charge = max(max_cost, api_credits.cost_from_usage(model, usage))
+                charge = max(max_cost, api_credits.cost_from_usage(model, usage, geo=geo))
             # Settle, retrying on a transient ledger failure (settle is idempotent, so a retry cannot double-charge).
             settled = False
             for attempt in range(3):
@@ -2578,11 +2607,96 @@ class Handler(BaseHTTPRequestHandler):
                 except api_credits.LedgerError as exc:
                     logger.error("anthropic-api settle attempt %d/3 failed for %s: %s", attempt + 1, res_id, exc)
             if not settled:
-                # The reservation ($%.4f) is retained, so pacing stays safe UNLESS the observed charge exceeded it
-                # (estimate_max_cost is a conservative upper bound, so that is rare); the API's overage-off credit
-                # cap is the authoritative hard backstop in every case.
-                logger.error("anthropic-api settle gave up for %s: reservation $%.4f retained, charge was $%.4f; "
-                             "the API overage-off cap remains the hard backstop", res_id, max_cost, charge)
+                # The reservation stays in the ledger at its full (upper-bound) amount, so the budget still counts it.
+                logger.error("anthropic-api settle gave up for %s: reservation $%.4f retained (charge was $%.4f)",
+                             res_id, max_cost, charge)
+        return outcome
+
+    def _relay_api(self, session: "ApiSession", turn, body: dict[str, Any], *, created: bool, one_shot: bool,
+                   wire: Wire) -> str:
+        """One turn of a conversation routing moved to the API credit lane (routing.prefer_api_credit): relayed
+        statelessly by _api_turn (the client sends the whole history), under the conversation's lock and the same
+        history rules as a local relay (_relay_local): the reply's fingerprint is recorded just before its terminal
+        bytes reach the client, and undone if the turn did not complete. An opening turn that fails drops the
+        conversation. A later turn the lane can no longer take (stop line, expiry, ledger) is refused with the reason;
+        moving the conversation to another lane mid-way is #43's re-route seam, not built here."""
+        reg = self.server.registry
+        route = session.route or {}
+        if not session.lock.acquire(timeout=TURN_TIMEOUT_S):
+            self._error(BUSY_STATUS, "overloaded_error", "cortados: conversation busy; retry once the other request on "
+                        "it has finished", wire)
+            return "refused"
+        try:
+            if not created and reg.get(session.id) is not session:
+                self._error(BUSY_STATUS, "overloaded_error", "cortados: conversation busy: it was rebuilt or closed "
+                            "while this request waited for it; retry", wire)
+                return "refused"
+            if not created and session.history != turn.history:
+                self._error(409, "invalid_request_error", "the conversation moved on while this request waited for "
+                            "it: another request with the same history was served first; send the current history",
+                            wire)
+                return "refused"
+            undo: list = []
+
+            def commit(blocks: list) -> None:
+                undo.append((len(session.history), session.awaiting_tool_result))
+                session.awaiting_tool_result = any(b.get("type") == "tool_use" for b in blocks)
+                session.history.append(anthropic_wire.reply_fingerprint(blocks))
+
+            reveal = (api_reveal_suffix() or "") if self._wants_reveal() else None
+            echo = f"{session.model}{reveal}" if reveal is not None else turn.model
+            reply: list = []
+            t0 = time.time()
+            office_key = self._office_turn_start(session, one_shot=one_shot)
+            outcome = "incomplete"
+
+            def admitted() -> None:
+                if created:
+                    self._record_run(provider=str(route.get("provider") or "anthropic-api"), model=session.model,
+                                     label=session.model, tools=not one_shot)
+            try:
+                outcome = self._api_turn(body, session.model, wire, echo_model=echo, reply=reply, commit=commit,
+                                         admitted=admitted)
+            except Exception as exc:
+                logger.exception("anthropic-api relay failed")
+                outcome = "incomplete"
+                try:
+                    self._error(502, "api_error", f"cortados: API relay failed: {type(exc).__name__}", wire)
+                except Exception:
+                    pass
+            if outcome != "completed" and undo:
+                n, awaiting = undo[0]
+                del session.history[n:]
+                session.awaiting_tool_result = awaiting
+            elif outcome == "completed" and not undo:
+                commit(reply)                       # defensive: a completed turn always committed already
+            session.last_used = time.time()
+            self._office_turn_end(session, office_key, {"turn": (reply, "anthropic-api", None)}
+                                  if outcome == "completed" else {"error": outcome})
+            if outcome == "completed":
+                if route.get("route_id") and not session.route_logged and reg.executed:
+                    try:
+                        reg.executed(route)
+                        session.route_logged = True
+                    except Exception as exc:
+                        logger.warning("anthropic-api lane: route record failed: %s", exc)
+                    else:
+                        if reg.log_outcome:
+                            chars = sum(len(b.get("text", "")) for b in reply
+                                        if isinstance(b, dict) and b.get("type") == "text")
+                            ms = int((time.time() - t0) * 1000)
+
+                            def _log_outcome(route=route, chars=chars, ms=ms):
+                                try:
+                                    reg.log_outcome(route, chars, ms)
+                                except Exception:
+                                    logger.exception("outcome log for route %s failed", route.get("route_id"))
+                            threading.Thread(target=_log_outcome, name="cortados-outcome-log", daemon=True).start()
+            elif created:
+                reg.drop(session)
+        finally:
+            session.lock.release()
+        return outcome
 
     def _open_conversation(self, turn, body: dict[str, Any], wire: Wire, *, one_shot: bool, floor: float | None,
                            scope: str | None, also_exclude: str | None = None):
@@ -3179,6 +3293,9 @@ class Handler(BaseHTTPRequestHandler):
             session = self._open_conversation(turn, body, wire, one_shot=one_shot, floor=floor, scope=scope)
             if session is None:
                 return                                  # refused; the answer is sent
+        if isinstance(session, ApiSession):             # the API credit lane: relayed to the API, never a CLI turn
+            self._relay_api(session, turn, body, created=created, one_shot=one_shot, wire=wire)
+            return
         if isinstance(session, LocalSession):           # a local lane: relayed to its node, never a CLI turn
             if not created and self._local_continuation_refused(session, body, wire):
                 return
@@ -3202,6 +3319,9 @@ class Handler(BaseHTTPRequestHandler):
             session = self._open_conversation(turn, body, wire, one_shot=one_shot, floor=floor, scope=scope,
                                               also_exclude=str((moved.get("model") or {}).get("id") or ""))
             if session is None:
+                return
+            if isinstance(session, ApiSession):
+                self._relay_api(session, turn, body, created=True, one_shot=one_shot, wire=wire)
                 return
             if not isinstance(session, LocalSession):
                 # #124: a request a detector marked now leaves the machine because the node could not take it. The
@@ -3857,8 +3977,9 @@ class ProviderServer(ThreadingHTTPServer):
         """GET /v1/cortados/live (provider/live.py): composes the office board, the tasks and the live slice of the usage
         view, the child-task log (read once, 24 h) and the host heartbeats. Cache-only: no vendor CLI, no ssh. Tests
         replace the inputs it calls (office_view's board, tasks_view, live_usage_view) or this method. `session_view`
-        (GET /v1/cortados/live/session): no other session's task directory is peeked."""
-        from cortados_router import child_tasks, exec_hosts, paths
+        (GET /v1/cortados/live/session): no other session's task directory is peeked, and the API credit section is
+        left out (it is the fleet's, not the session's)."""
+        from cortados_router import api_credits, child_tasks, exec_hosts, paths
         now = time.time()
         state = paths.state_dir()
 
@@ -3884,6 +4005,7 @@ class ProviderServer(ThreadingHTTPServer):
             conversations=registry.live_conversations, ended_conversations=registry.ended_conversations,
             run_tokens=registry.runs.tokens_by_run, run_origins=registry.runs.run_origins,
             stubs_by_id=child_tasks.remote_stubs_by_id, binding_errors=registry.live.errors,
+            api_credit=None if session_view else (lambda: api_credits.state(now)),
             session=session, peek_foreign=not session_view)
 
     def live_usage_view(self, registry: Registry, now: float) -> dict[str, Any]:

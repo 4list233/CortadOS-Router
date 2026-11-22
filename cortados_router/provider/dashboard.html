@@ -713,6 +713,39 @@ function renderSubs(box, s) {
   if (!(s.lanes || []).length) add(P.body, el("div", "empty", s.status === "error" ? "no lane readings (see error above)" : "no lane readings cached"));
   add(box, P.p);
 }
+// The API credit lane (#114, live `api_credit`): on / off and why, dollars used and left under the 95 % stop line, the
+// alert level (50 / 80 / 95 % of the binding budget) and the grant's expiry. Metadata only.
+function money(v) { return isNum(v) ? "$" + v.toFixed(2) : "–"; }
+function renderApiCredit(box, s) {
+  const P = panel("p-api-credit", "API credit", "span-5");
+  P.meta.textContent = "promotional grants · hard stop at 95%";
+  secErrors(P.body, s);
+  const lvl = s.alert_level || 0;
+  const top = el("div", "top");
+  add(top, el("span", "title", s.on ? "lane on" : "lane off"));
+  add(top, pill(s.on ? (lvl >= 80 ? "unknown" : "up") : "down", s.on ? (lvl ? "alert " + lvl + "%" : "on") : "off"));
+  add(top, el("span", "big", isNum(s.pct_used) ? s.pct_used.toFixed(1) + "% used" : "–"));
+  add(P.body, top);
+  if (!s.on && s.reason) add(P.body, el("div", "sub err", s.reason));
+  if (lvl) add(P.body, el("div", "sub " + (lvl >= 80 ? "err" : ""), "alert: " + lvl + "% of the budget is spent or reserved" + (lvl >= 95 ? " (hard stop)" : "")));
+  const g = s.grant;
+  if (g) {
+    add(P.body, el("div", "sub", join(["grant " + money(g.used_usd) + " of " + money(g.amount_usd) + " used",
+      money(g.left_usd) + " left", "stop line " + money(g.stop_line_usd),
+      isNum(g.expires_in_h) ? "expires in " + (g.expires_in_h < 48 ? g.expires_in_h.toFixed(1) + " h" : (g.expires_in_h / 24).toFixed(1) + " days") : null])));
+    const r = el("div", "win"); add(r, el("span", "n", "credit used (100% = the 95% stop line)"));
+    add(r, el("span", "p", pct(isNum(s.pct_used) ? Math.min(100, s.pct_used / 0.95) : null)), meter(isNum(s.pct_used) ? 100 - Math.min(100, s.pct_used / 0.95) : null, false));
+    add(P.body, r);
+  }
+  const m = s.month;
+  if (m) add(P.body, el("div", "sub", join(["this month " + money(m.used_usd) + " of the " + money(m.limit_usd) + " org limit",
+    isNum(s.headroom_usd) ? money(s.headroom_usd) + " left before the stop line" : null,
+    isNum(s.reserved_usd) && s.reserved_usd > 0 ? money(s.reserved_usd) + " reserved in flight" : null])));
+  if (s.expiring_soon) add(P.body, el("div", "sub", "grant expiring within " + s.prefer_within_days + " days: local-eligible work is preferred onto the API"));
+  (s.grants || []).forEach(x => add(P.body, el("div", "sub", join([x.name, money(x.amount_usd),
+    x.expires_at ? "expires " + new Date(x.expires_at * 1000).toLocaleString() : null, x.counting ? "counting" : "not counting"]))));
+  add(box, P.p);
+}
 // The S1 pipeline as its host reports it (live heartbeat `s1`): health, the served model, hold flags, a pending candidate.
 const S1_FLAG_TEXT = {"no-promote": "promotion held", "no-train-tonight": "no training tonight",
   "nightly-stop": "nightly loop stopping", "sweep-requested": "calibration sweep requested"};
@@ -885,6 +918,9 @@ function renderLive(d) {
     s1.status === "up" ? (isNum(s1.latency_ms) ? s1.latency_ms + " ms health check" : "") : (s1.reason || "not reachable"), "small"));
   add(ov, tile("Lowest subscription", low ? pct(low.left_pct) : "–",
     low ? join([low.label || low.lane, low.window]) : "no fresh reading"));
+  if (d.api_credit) { const a = d.api_credit; add(ov, tile("API credit", a.on ? (isNum(a.pct_used) ? a.pct_used.toFixed(0) + "% used" : "on") : "off",
+    a.on ? join([a.alert_level ? "alert " + a.alert_level + "%" : null, a.grant && isNum(a.grant.expires_in_h) ? "expires in " + (a.grant.expires_in_h / 24).toFixed(1) + " d" : null]) : (a.reason || ""),
+    !a.on || a.alert_level >= 80 ? "warn" : null)); }
   add(ov, tile("Host heartbeats", (o.hosts_with_heartbeat || 0) + " / " + hosts.length,
     hosts.filter(h => h.heartbeat_state === "none").map(h => h.name).join(", ") ? "none yet: " + hosts.filter(h => h.heartbeat_state === "none").map(h => h.name).join(", ") : "all reporting"));
   add(box, ov);
@@ -893,6 +929,7 @@ function renderLive(d) {
   renderTasksPanel(panels, ts, now, host, d.conversations);
   renderConversations(panels, d.conversations || {});
   renderSubs(panels, d.subscriptions || {});
+  if (d.api_credit) renderApiCredit(panels, d.api_credit);
   renderRouted(panels, d.routed || {}, now);
   renderWorkSplit(panels, d.work_split || {}, now);
   renderHosts(panels, d.hosts || {}, s1);

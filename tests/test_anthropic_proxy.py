@@ -395,6 +395,56 @@ class TestModelSuffix(unittest.TestCase):
         self.assertEqual(self.run_serve(True)[0], b"".join(self.CHUNKS))
 
 
+class TestRoutedConversation(unittest.TestCase):
+    """#114: a routed conversation on the API lane: the response names the model the client asked for (echo_model),
+    the answer's blocks are rebuilt (reply), and commit runs before the terminal bytes reach the client."""
+    CHUNKS = [
+        b'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-sonnet-5","usage":{"input_tokens":10}}}\n\n',
+        b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hel"}}\n\n',
+        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}\n\n',
+        b'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu_1","name":"Read","input":{}}}\n\n',
+        b'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+
+    def test_stream_echo_reply_and_commit_before_the_terminal_event(self):
+        h = FakeHandler()
+        reply, seen = [], []
+        commit = lambda blocks: seen.append((list(blocks), h.wfile.buf.getvalue()))
+        usage, outcome = ap.serve(h, {"stream": True}, "claude-sonnet-5", 0.0, key="sk", echo_model="cortados",
+                                  reply=reply, commit=commit, urlopen=lambda req, timeout=0: FakeResp(chunks=self.CHUNKS))
+        self.assertEqual(outcome, "completed")
+        self.assertEqual([b.get("type") for b in reply], ["text", "tool_use"])
+        self.assertEqual(reply[0]["text"], "hello")
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn(b"message_stop", seen[0][1])              # committed before the client saw the end
+        raw = h.wfile.buf.getvalue()
+        self.assertIn(b"message_stop", raw)
+        first = json.loads(raw.decode().split("data: ", 1)[1].split("\n", 1)[0])
+        self.assertEqual(first["message"]["model"], "cortados")      # the client's own model name
+
+    def test_nonstream_echo_reply_and_commit(self):
+        msg = {"id": "m", "type": "message", "model": "claude-sonnet-5", "content": [{"type": "text", "text": "hi"}],
+               "usage": {"input_tokens": 3, "output_tokens": 1}}
+        h, reply, seen = FakeHandler(), [], []
+        usage, outcome = ap.serve(h, {}, "claude-sonnet-5", 0.0, key="sk", echo_model="cortados", reply=reply,
+                                  commit=lambda b: seen.append(h.wfile.buf.getvalue()),
+                                  urlopen=lambda req, timeout=0: FakeResp(body=json.dumps(msg).encode()))
+        self.assertEqual((outcome, reply, seen), ("completed", msg["content"], [b""]))
+        self.assertEqual(json.loads(h.wfile.buf.getvalue())["model"], "cortados")
+
+    def test_an_unfinished_stream_never_commits(self):
+        h, reply, seen = FakeHandler(), [], []
+        usage, outcome = ap.serve(h, {"stream": True}, "claude-sonnet-5", 0.0, key="sk", reply=reply,
+                                  commit=seen.append, urlopen=lambda req, timeout=0: FakeResp(chunks=self.CHUNKS[:-1]))
+        self.assertEqual((outcome, seen), ("unknown", []))
+
+    def test_the_key_comes_from_the_provider_environment(self):
+        with mock.patch.dict("os.environ", {"CORTADOS_ANTHROPIC_API_KEY": " sk-env "}):
+            self.assertEqual(ap.api_key(), "sk-env")
+
+
 class TestErrorSanitizing(unittest.TestCase):
     """#117 review round 5: what the proxy shows a client as an error has no raw control character and is capped,
     whether the proxy built it or the API sent it; a successful answer is relayed byte for byte."""

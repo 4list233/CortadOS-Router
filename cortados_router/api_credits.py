@@ -1,21 +1,41 @@
-"""Anthropic API-credit lane: a dollar-metered, admission-controlled monthly window for the router's resource pool.
+"""Anthropic API-credit lane (#114): spend free promotional credit, and only that, never anything that could be billed.
 
-A prepaid API credit (default $200, resets on the billing day) funds a credit lane. This module owns the ACCOUNTING
-for that budget — it does not itself talk to the network. Design points (hardened after a Codex money-path review):
+This module owns the lane's ACCOUNTING; it never talks to the network. The provider (server._api_turn) reserves an
+upper-bound cost here before a request is sent to api.anthropic.com and settles the real cost from the response's
+usage after it.
 
-  * Admission control, not after-the-fact counting. A request reserves a CONSERVATIVE maximum cost under a file
-    lock BEFORE it is dispatched (`reserve`), and settles the actual cost after (`settle`, full reservation if the
-    actual is unknown — e.g. the client disconnected). So concurrent requests cannot all pass the same check and
-    overshoot, and a dropped turn never under-charges.
-  * File-locked, per-period ledger. The meter file holds one sub-ledger per billing period; `fcntl.flock`
-    serializes read-modify-write across the threading HTTP server AND across processes. A late settle lands in its
-    own period, never erasing the new one. Writes use a unique temp file, so two writers cannot collide.
-  * Fail closed. If the ledger cannot be read or written, the operation RAISES — the caller then refuses admission
-    rather than spending blind. A genuinely-absent ledger is fresh (zero), a corrupt one is an error.
-  * Conservative pricing, but the Anthropic API is the AUTHORITATIVE hard cap. With the credit org set to
-    overage-off, the API itself rejects calls past the included credit; this meter is a conservative PACING guard
-    and use-it-or-lose-it signal on top of that. Cache writes are priced at the 1-hour rate and unknown models at
-    the most-expensive tier, so the pacing guard does not under-count.
+Budget (owner, 2026-11-14 and 2026-11-22). The credit is a set of promotional GRANTS, each with an amount and an expiry,
+plus the organisation's monthly spend limit (UTC month). They are configured by the owner in a small JSON file
+(config_path(): ~/.config/cortados/api-credit.json; example tables/api-credit.example.json; never the key):
+
+  * A grant COUNTS from `granted` until EXPIRY_MARGIN_S before `expires` (the longest upstream turn plus margin, so no
+    turn admitted under a grant can still be running when it expires). After the last grant stops counting the lane
+    is off until the owner adds a new grant: credit is never assumed to refill.
+  * Grant budget G = the sum of the counting grants' amounts. Grant use U_G = what the owner saw used outside this
+    ledger (amount - remaining_usd, when a grant states its remaining as of a date) + every dollar this ledger committed
+    (spent + reserved) since the earliest counting grant's start (its remaining_as_of, else its granted time; the whole
+    UTC day, so earlier spend that day is counted too). Spend on a grant that has since expired stays counted: that
+    can only make the remaining smaller, never larger.
+  * Month budget M = the org monthly limit. Month use U_M = this ledger's committed dollars from the last UTC day of the
+    previous month on (a turn reserved just before midnight on the 1st may be billed in the new month).
+  * STOP LINE (hard stop, owner rule): a request is admitted only when, after reserving it, U_G <= 95% of G AND
+    U_M <= 95% of M. headroom = min(0.95 G - U_G, 0.95 M - U_M). headroom <= 0 turns the lane off by itself.
+  * Alerts at 50 / 80 / 95 % of the binding budget: pct_used = max(U_G / G, U_M / M).
+
+Ledger (ledger_path(): $CORTADOS_HOME/api-credit-ledger.json), one entry per UTC day: {"spent_usd", "reserved":
+{reservation id: usd}}. Every read-modify-write is under an exclusive flock, so concurrent requests (threads of the
+HTTP server and other processes) cannot together pass the stop line: each reservation is checked against everything
+already spent and reserved. A reservation is settled exactly once with the real cost (an overrun is recorded, never
+clamped), or kept at its full amount when the cost is unknown. FAIL CLOSED: a missing config, an unreadable / corrupt
+config or ledger, a ledger that cannot be written, a second credit key, and a ledger that no longer holds a grant's
+window all turn the lane off (LedgerError / ConfigError; state() says which).
+
+Per-request cost estimate (estimate_max_cost) is an UPPER bound: every byte of the serialized request counts as one
+input token (a token is never shorter than one byte), plus a template allowance and per-tool allowance, priced at the
+cache-write rate (the dearest input treatment); max_tokens (or the model's 128k ceiling) as output; fast mode, data
+residency and the long-context tier priced in; no cache-read or batch discount assumed. Content whose cost the request
+bytes cannot bound (a server-executed tool, a URL or Files API source, a PDF, an image whose size cannot be read) is
+refused (Unbounded). Settlement prices the real usage the same way (cost_from_usage), so the ledger never under-counts.
 
 Stdlib only.
 """
@@ -23,80 +43,114 @@ from __future__ import annotations
 
 import calendar
 import fcntl
-import hashlib
 import json
 import math
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+KEY_ENV = "CORTADOS_ANTHROPIC_API_KEY"          # the credit key: read from the provider's environment only
+CONFIG_ENV = "CORTADOS_API_CREDIT_CONFIG"       # override of the grants file's path (tests)
+LANE = "anthropic-api"
 
+STOP_FRACTION = 0.95                           # owner 2026-11-14: hard stop at 95% of the budget; a config may lower it
+ALERT_LEVELS = (50, 80, 95)                    # owner 2026-11-14: dashboard alerts
+EXPIRY_MARGIN_S = 3600.0                       # a grant stops counting an hour before it expires (upstream timeout 30 min)
+MONTH_SPILL_DAYS = 1                           # the previous month's last UTC day also counts against this month
+DEFAULT_PREFER_DAYS = 3.0                      # expiry preference window (see prefer_window_s)
+KEEP_DAYS = 400                                # ledger days older than this with nothing reserved are pruned
+LEDGER_VERSION = 2
+
+
+# ------------------------------------------------------------------------------------------------------ pricing
 def _entry(inp: float, out: float) -> dict[str, float]:
     # cache_write at the 1-hour rate (input x2, the higher write rate); cache_read bounded above by input x0.1.
     return {"input": inp, "output": out, "cache_read": round(inp * 0.1, 4), "cache_write": inp * 2}
 
 
-# USD per 1,000,000 tokens (claude-api skill, cached 2026-10-06), priced conservatively.
+# USD per 1,000,000 tokens (claude-api skill, model table cached 2026-11-03), priced conservatively.
 PRICES: dict[str, dict[str, float]] = {
+    "claude-fable-5-2": _entry(8.0, 40.0),
+    "claude-mythos-5-2": _entry(8.0, 40.0),
     "claude-fable-5-1": _entry(10.0, 50.0),
     "claude-fable-5": _entry(10.0, 50.0),
     "claude-mythos-5-1": _entry(10.0, 50.0),
     "claude-opus-5-5": _entry(4.0, 20.0),
     "claude-opus-5": _entry(5.0, 25.0),
     "claude-opus-4-8": _entry(5.0, 25.0),
+    "claude-opus-4-7": _entry(5.0, 25.0),
+    "claude-opus-4-6": _entry(5.0, 25.0),
     "claude-sonnet-5-5": _entry(2.0, 10.0),
     "claude-sonnet-5": _entry(2.0, 10.0),
-    "claude-haiku-5-5": _entry(0.50, 2.50),  # the >100k-token tier, so the guard never under-counts Haiku
+    "claude-sonnet-4-6": _entry(3.0, 15.0),
+    "claude-haiku-5-5": _entry(0.50, 2.50),  # the >100k-token tier, so the guard never under-counts Haiku 5.5
+    "claude-haiku-4-5": _entry(1.0, 5.0),
 }
 DEFAULT_PRICE = _entry(10.0, 50.0)  # unknown model -> most expensive tier
+# Models whose PRICES entry already is their dearest tier (no long-context premium on top).
+FLAT_TIER = frozenset({"claude-haiku-5-5"})
+LONG_CONTEXT_TOKENS = 200_000      # above this many input tokens a long-context tier may apply: priced in
+LONG_INPUT_FACTOR, LONG_OUTPUT_FACTOR = 2.0, 1.5
+FAST_FACTOR = 2.0                  # fast mode: $8/$40 on Opus 5.5 ($4/$20), $16/$80 on Fable 5.2 ($8/$40)
+GEO_FACTOR = 1.1                   # an explicit inference_geo (data residency) is billed at a premium
+MAX_OUTPUT_TOKENS = 128_000        # no max_tokens given: the models' largest output
+TEMPLATE_TOKENS = 4000             # what the API adds that the body does not carry (tool-use system prompt etc.)
+PER_TOOL_TOKENS = 1500             # per declared tool, on top of its schema's own bytes
+IMAGE_PIXELS_PER_TOKEN = 750.0     # Anthropic's vision sizing: tokens ~ width x height / 750 (resizing only lowers it)
+IMAGE_TOKEN_FACTOR, IMAGE_TOKEN_EXTRA = 1.5, 200
+IMAGE_MAX_BYTES = 32 * 1024 * 1024  # the API's whole-request limit
+IMAGE_MAX_PIXELS = 400_000_000
 
 # Per-request charges the API bills for server-side tools ON TOP OF tokens (USD each), priced conservatively.
-# Anthropic bills web search at $10 / 1,000 requests = $0.01 each; the count comes back in usage.server_tool_use.
 SERVER_TOOL_USD: dict[str, float] = {
     "web_search_requests": 0.01,
 }
 DEFAULT_SERVER_TOOL_USES = 20  # a declared web-search tool with no max_uses: reserve AND enforce this many calls
 
-# Server tools the API itself EXECUTES and bills. The credit lane admits a request using one only when it can both
-# BOUND the cost up front and reconcile it from usage afterwards. Keyed by the tool-type prefix, since Anthropic
-# suffixes a date (e.g. "web_search_20250305"). An ordinary client-executed tool is not listed here and is fine.
-#   unbounded -> cost the meter cannot bound in advance from the serialized request -> refuse admission.
-# Every server-EXECUTED tool is currently unbounded: web_search and web_fetch both pull external content into the
-# turn's INPUT tokens (the serialized request cannot bound that, so a reservation can never cover it; the per-request
-# fee is not the issue), and code_execution is billed per server-side container-hour. Ordinary client tools (bridged,
-# executed client-side, no server charge) are NOT listed here and pass. When a server tool's result cost becomes
-# bounded in advance (e.g. an enforced content-token cap reserved up front), move it out of this set.
-_SERVER_TOOL_KIND: dict[str, str] = {
-    "web_search": "unbounded",
-    "web_fetch": "unbounded",
-    "code_execution": "unbounded",
-}
+# Typed tools the CLIENT executes (their cost is only their schema, which the request bytes and PER_TOOL_TOKENS bound).
+# Every other typed tool is executed and billed by the API (web search / fetch pull unbounded content into the turn's
+# input, code execution bills container time, an advisor or MCP toolset runs further calls): refused on this lane.
+CLIENT_TOOL_TYPES = ("custom", "bash_", "text_editor_", "computer_", "memory_", "tool_search_tool_")
+# Top-level request fields whose cost the request bytes cannot bound: refused.
+UNBOUNDED_FIELDS = ("mcp_servers", "container", "thread")
+
+
+class LedgerError(RuntimeError):
+    """The ledger could not be read or written; the caller must fail closed (refuse admission, lane off)."""
+
+
+class ConfigError(LedgerError):
+    """The grants config is missing, unreadable or invalid; the lane is off until the owner fixes it."""
+
+
+class Unbounded(ValueError):
+    """The request carries something whose cost cannot be bounded from its bytes; the message is safe to show."""
 
 
 def unbounded_server_tools(body: dict[str, Any] | None) -> list[str]:
-    """The server-executed tools in `body` whose cost the meter cannot bound and reconcile. A request declaring one
-    must be refused on the credit lane (its spend is unknowable in advance and not recoverable from usage)."""
+    """The typed tools in `body` that the API itself executes and bills (any type not in CLIENT_TOOL_TYPES). A request
+    declaring one is refused on the credit lane: its spend is unknowable in advance and not recoverable from usage."""
     tools = body.get("tools") if isinstance(body, dict) else None
     if not isinstance(tools, list):
         return []
     bad: list[str] = []
     for t in tools:
-        if not isinstance(t, dict):
-            continue
+        if not isinstance(t, dict) or "type" not in t:
+            continue                                   # a client tool: name, description, input_schema
         ttype = str(t.get("type") or "").lower()
-        for prefix, kind in _SERVER_TOOL_KIND.items():
-            if ttype.startswith(prefix) and kind == "unbounded":
-                bad.append(ttype)
+        if ttype and not ttype.startswith(CLIENT_TOOL_TYPES):
+            bad.append(ttype)
+        elif not ttype:
+            bad.append("(empty type)")
     return bad
 
 
 def enforce_server_tool_caps(body: dict[str, Any]) -> dict[str, Any]:
     """Return `body` (a shallow copy if anything changed) with every metered server tool carrying an explicit cap
-    equal to what the meter reserves for it, so the API cannot run more billable calls than were paid for. A
-    web-search tool with no max_uses gets DEFAULT_SERVER_TOOL_USES; a declared max_uses is left as the client set
-    it (the API already enforces it, and the reservation matches)."""
+    equal to what the meter reserves for it. (Every server tool is refused today: unbounded_server_tools; kept so a
+    tool moved out of that set is capped the moment it is.)"""
     if not isinstance(body, dict):
         return body
     tools = body.get("tools")
@@ -120,136 +174,20 @@ def enforce_server_tool_caps(body: dict[str, Any]) -> dict[str, Any]:
     out["tools"] = new_tools
     return out
 
-DEFAULT_BUDGET_USD = 200.0
-
-
-class LedgerError(RuntimeError):
-    """The ledger could not be read or written; the caller must fail closed (refuse admission)."""
-
-
-def _state_dir() -> Path:
-    return Path(os.environ.get("CORTADOS_HOME") or os.environ.get("CORTADOS_HERMES_HOME") or (Path.home() / ".cortados"))
-
-
-def meter_path() -> Path:
-    return _state_dir() / "api-credit-meter.json"
-
-
-def budget_usd() -> float:
-    """The PER-ORG budget: each configured credit org (key) has its own window of this size (default $200). The
-    lane total is this times the number of configured orgs (`total_budget_usd`)."""
-    raw = os.environ.get("CORTADOS_API_CREDIT_BUDGET_USD")
-    try:
-        v = float(raw) if raw not in (None, "") else DEFAULT_BUDGET_USD
-    except (TypeError, ValueError):
-        return DEFAULT_BUDGET_USD
-    return v if v > 0 else DEFAULT_BUDGET_USD
-
-
-# Each credit org is one API key with its own included-credit window. Keys come from CORTADOS_ANTHROPIC_API_KEY
-# (primary), then _API_KEY_2, _3, … (contiguous — the scan stops at the first gap). An org's IDENTITY in the ledger
-# is a short, non-reversible fingerprint of its KEY, never the slot position and never the key value itself (so no
-# secret is written to disk, and spend stays bound to the key that incurred it). Keying by the key's fingerprint
-# means: the same key in two slots is ONE org (one window, not a phantom second allowance); swapping the keys
-# between slots does not move either org's spend; and rotating a key starts a fresh window for the new key (correct —
-# it is a different credit pool), while the old key's recorded spend stays under its own fingerprint. The org's
-# overage-off setting is the authoritative hard cap on real spend; this meter is the pacing/admission guard on top.
-def _org_id(key: str) -> str:
-    """Stable, non-reversible org identity for a key (a truncated SHA-256; not the key, safe to persist)."""
-    return hashlib.sha256((key or "").encode("utf-8")).hexdigest()[:16]
-
-
-def configured_orgs() -> list[tuple[str, str]]:
-    """Ordered (org-id, key) for every DISTINCT configured credit org, in config order (primary first). Admission
-    drains them in this order. A key configured in more than one slot appears once. Empty when no key is set."""
-    raw: list[str] = []
-    primary = (os.environ.get("CORTADOS_ANTHROPIC_API_KEY") or "").strip()
-    if primary:
-        raw.append(primary)
-    i = 2
-    while True:
-        k = (os.environ.get(f"CORTADOS_ANTHROPIC_API_KEY_{i}") or "").strip()
-        if not k:
-            break
-        raw.append(k)
-        i += 1
-    out: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for key in raw:
-        oid = _org_id(key)
-        if oid in seen:            # same key in two slots -> one org, not two allowances
-            continue
-        seen.add(oid)
-        out.append((oid, key))
-    return out
-
-
-def _legacy_owner() -> str:
-    """The org a legacy single-org ledger migrates into: the one configured key's id. A legacy ledger was written by
-    a single-key deployment, so it belongs to that key — but the old format did not record WHICH key, so ownership
-    is only unambiguous while exactly one key is configured. Fail closed otherwise, rather than guess:
-      * no key -> legacy spend can be neither attributed nor safely discarded;
-      * more than one key -> ownership is ambiguous, and guessing (e.g. 'the current primary') would free the real
-        owner's spent window if the keys were ordered differently than when the ledger was written.
-    The natural upgrade path never hits the ambiguous case: ship with the single existing key (the first request
-    migrates the meter to the nested shape), then add the second key — by then the file is no longer legacy."""
-    orgs = configured_orgs()
-    if not orgs:
-        raise LedgerError("cannot read a legacy api-credit ledger with no key configured")
-    if len(orgs) > 1:
-        raise LedgerError("refusing to migrate a legacy api-credit ledger while multiple keys are configured "
-                          "(ambiguous ownership); run once with only the original key to upgrade the meter first")
-    return orgs[0][0]
-
-
-def total_budget_usd() -> float:
-    """The whole lane's budget: per-org budget times the number of DISTINCT configured orgs (two $200 keys = $400)."""
-    return budget_usd() * len(configured_orgs())
-
-
-def _org_of(res_id: str) -> tuple[str | None, str]:
-    """(org-id, period) for a reservation id. New ids are 'orgid|period:hex'. A legacy id (no '|') carries no org —
-    its owner is not knowable from the id, so this returns (None, period) and settle finds it by searching."""
-    prefix = (res_id or "").split(":", 1)[0]
-    if "|" in prefix:
-        oid, period = prefix.split("|", 1)
-        return oid, period
-    return None, prefix
-
-
-def key_for_reservation(res_id: str) -> str | None:
-    """The API key for a NEW-format reservation's org (the only ids reserve() mints and the only ids that reach
-    dispatch), or None if that org's key is no longer configured. Bound to the key's fingerprint, so it returns the
-    SAME key the reservation was debited to regardless of slot order or swaps. A legacy id resolves to None (it is
-    never produced by reserve() and never dispatched; settle, not dispatch, reconciles any such straggler)."""
-    oid, _ = _org_of(res_id)
-    if oid is None:
-        return None
-    for o, key in configured_orgs():
-        if o == oid:
-            return key
-    return None
-
-
-def reset_day() -> int:
-    """Day of the month the included credit renews (the billing day). Default 1; accepts 1..31 (a day past a given
-    month's length is clamped to that month's last day where the boundary is computed)."""
-    raw = os.environ.get("CORTADOS_API_CREDIT_RESET_DAY")
-    try:
-        d = int(raw) if raw not in (None, "") else 1
-    except (TypeError, ValueError):
-        return 1
-    return min(31, max(1, d))
-
 
 def price_for(model: str) -> dict[str, float]:
     m = (model or "").strip().lower()
     if m in PRICES:
         return PRICES[m]
-    for base, p in PRICES.items():
+    for base in sorted(PRICES, key=len, reverse=True):      # longest first: claude-opus-5-5 before claude-opus-5
         if m.startswith(base):
-            return p
+            return PRICES[base]
     return DEFAULT_PRICE
+
+
+def _flat(model: str) -> bool:
+    m = (model or "").strip().lower()
+    return any(m == f or m.startswith(f + "-") for f in FLAT_TIER)
 
 
 def _n(x: Any) -> float:
@@ -260,15 +198,29 @@ def _n(x: Any) -> float:
     return v if math.isfinite(v) and v > 0 else 0.0
 
 
-def cost_usd(model: str, input_tokens: float = 0, output_tokens: float = 0, cache_read_tokens: float = 0, cache_creation_tokens: float = 0) -> float:
+def _factors(model: str, input_total: float, *, fast: bool, geo: bool) -> tuple[float, float]:
+    """(input multiplier, output multiplier) on top of PRICES for one turn."""
+    fi = fo = 1.0
+    if input_total > LONG_CONTEXT_TOKENS and not _flat(model):
+        fi, fo = LONG_INPUT_FACTOR, LONG_OUTPUT_FACTOR
+    if fast:
+        fi, fo = fi * FAST_FACTOR, fo * FAST_FACTOR
+    if geo:
+        fi, fo = fi * GEO_FACTOR, fo * GEO_FACTOR
+    return fi, fo
+
+
+def cost_usd(model: str, input_tokens: float = 0, output_tokens: float = 0, cache_read_tokens: float = 0,
+             cache_creation_tokens: float = 0, *, fast: bool = False, geo: bool = False) -> float:
     p = price_for(model)
-    total = _n(input_tokens) * p["input"] + _n(output_tokens) * p["output"] + _n(cache_read_tokens) * p["cache_read"] + _n(cache_creation_tokens) * p["cache_write"]
+    i, o, cr, cw = _n(input_tokens), _n(output_tokens), _n(cache_read_tokens), _n(cache_creation_tokens)
+    fi, fo = _factors(model, i + cr + cw, fast=fast, geo=geo)
+    total = (i * p["input"] + cr * p["cache_read"] + cw * p["cache_write"]) * fi + o * p["output"] * fo
     return total / 1_000_000.0
 
 
 def server_tool_cost(usage: dict[str, Any] | None) -> float:
-    """Per-request charges the API billed for server-side tools (e.g. web search), read from usage.server_tool_use.
-    These are flat per-call charges on top of tokens, so fast mode's 2x on tokens does not apply to them."""
+    """Per-request charges the API billed for server-side tools (e.g. web search), read from usage.server_tool_use."""
     u = usage if isinstance(usage, dict) else {}
     stu = u.get("server_tool_use")
     if not isinstance(stu, dict):
@@ -276,49 +228,107 @@ def server_tool_cost(usage: dict[str, Any] | None) -> float:
     return sum(SERVER_TOOL_USD.get(k, 0.0) * _n(v) for k, v in stu.items())
 
 
-def cost_from_usage(model: str, usage: dict[str, Any] | None) -> float:
+def cost_from_usage(model: str, usage: dict[str, Any] | None, *, geo: bool = False) -> float:
+    """The cost of a finished turn from its usage block, priced like the estimate (long-context tier, fast mode, data
+    residency, cache writes at the 1-hour rate), so a settled charge is never below the bill."""
     u = usage if isinstance(usage, dict) else {}
-    base = cost_usd(model, u.get("input_tokens", 0), u.get("output_tokens", 0), u.get("cache_read_input_tokens", 0), u.get("cache_creation_input_tokens", 0))
-    if str(u.get("speed") or "").lower() == "fast":
-        base *= 2  # fast mode is billed at 2x (tokens only)
-    return base + server_tool_cost(u)  # server-tool charges are flat per call, added after the fast multiplier
+    fast = str(u.get("speed") or "").lower() == "fast"
+    if not geo and u.get("inference_geo"):
+        geo = str(u.get("inference_geo")).lower() not in ("global", "not_available")
+    base = cost_usd(model, u.get("input_tokens", 0), u.get("output_tokens", 0), u.get("cache_read_input_tokens", 0),
+                    u.get("cache_creation_input_tokens", 0), fast=fast, geo=geo)
+    return base + server_tool_cost(u)
+
+
+def _image_tokens(src: dict[str, Any]) -> int:
+    from cortados_router import image_check
+    try:
+        info, _ = image_check.check_base64(src.get("media_type"), src.get("data"), max_bytes=IMAGE_MAX_BYTES,
+                                           max_pixels=IMAGE_MAX_PIXELS)
+    except image_check.ImageRefused as exc:
+        raise Unbounded(f"an image whose size cannot be bounded ({exc})") from None
+    return int(math.ceil(info["width"] * info["height"] / IMAGE_PIXELS_PER_TOKEN * IMAGE_TOKEN_FACTOR)) + \
+        IMAGE_TOKEN_EXTRA
+
+
+def _bounded(x: Any, extra: list[int]) -> Any:
+    """`x` with every inline image's base64 data blanked (its tokens are appended to `extra` from its pixel size), or
+    Unbounded for any source whose content the request does not carry (a URL, a Files API file, a PDF)."""
+    if isinstance(x, list):
+        return [_bounded(v, extra) for v in x]
+    if not isinstance(x, dict):
+        return x
+    if x.get("type") == "container_upload":
+        raise Unbounded("a container upload")
+    src = x.get("source")
+    out = {k: _bounded(v, extra) for k, v in x.items() if k != "source"}
+    if "source" in x:
+        if not isinstance(src, dict):
+            raise Unbounded("a content source of unknown shape")
+        kind = src.get("type")
+        if kind == "base64":
+            media = str(src.get("media_type") or "")
+            if not media.startswith("image/"):
+                raise Unbounded(f"an inline {media or 'untyped'} document (page images are not bounded by its bytes)")
+            extra.append(_image_tokens(src))
+            out["source"] = {**src, "data": ""}
+        elif kind in ("text", "content"):
+            out["source"] = _bounded(src, extra)
+        else:
+            raise Unbounded(f"a {kind!r} source (its content is not in the request)")
+    return out
 
 
 def estimate_max_cost(body: dict[str, Any], model: str) -> float:
-    """A CONSERVATIVE upper bound on one request's cost, used to reserve credit before dispatch: the prompt bytes as
-    input tokens (deliberately low bytes/token), PLUS the API-added overhead the body doesn't carry (system prompt
-    and the rendered tool schemas), priced at the CACHE-WRITE rate (the most expensive input treatment), plus
-    max_tokens (or the 128k ceiling) at the output rate, doubled for fast mode."""
-    p = price_for(model)
-    raw = json.dumps(body) if isinstance(body, dict) else ""
-    tools = body.get("tools") if isinstance(body, dict) else None
+    """An UPPER bound on one request's cost (see the module doc). Raises Unbounded when no bound exists."""
+    if not isinstance(body, dict):
+        raise Unbounded("the request is not a JSON object")
+    bad = [f for f in UNBOUNDED_FIELDS if body.get(f)]
+    if bad:
+        raise Unbounded(f"request field(s) {', '.join(bad)}")
+    tools = body.get("tools")
+    servers = unbounded_server_tools(body)
+    if servers:
+        raise Unbounded(f"server-executed tool(s) {', '.join(sorted(set(servers)))}")
+    extra: list[int] = []
+    stripped = _bounded(body, extra)
     n_tools = len(tools) if isinstance(tools, list) else 0
-    input_tokens = len(raw.encode()) / 2.0 + 4000 + 1500 * n_tools   # ~2 bytes/token is a conservative upper bound
+    input_tokens = (len(json.dumps(stripped).encode("utf-8")) + sum(extra) + TEMPLATE_TOKENS
+                    + PER_TOOL_TOKENS * n_tools)
     try:
-        max_out = int(body.get("max_tokens") or 0) if isinstance(body, dict) else 0
+        max_out = int(body.get("max_tokens") or 0)
     except (TypeError, ValueError):
         max_out = 0
     if max_out <= 0:
-        max_out = 128000  # no cap given: assume the model's max output
-    in_rate, out_rate = max(p["input"], p["cache_write"]), p["output"]
-    if isinstance(body, dict) and str(body.get("speed") or "").lower() == "fast":
-        in_rate, out_rate = in_rate * 2, out_rate * 2
-    token_cost = (input_tokens * in_rate + max_out * out_rate) / 1_000_000.0
-    return token_cost + _server_tool_allowance(tools)
+        max_out = MAX_OUTPUT_TOKENS
+    fast = str(body.get("speed") or "").lower() == "fast"
+    geo = bool(body.get("inference_geo"))
+    # Server-side fallbacks may run the turn on another model: price the dearest model the request can reach.
+    models = [model]
+    fb = body.get("fallbacks")
+    if fb:
+        items = fb if isinstance(fb, list) else [fb]
+        for it in items:
+            name = it.get("model") if isinstance(it, dict) else it
+            models.append(name if isinstance(name, str) and name.startswith("claude-") else "unknown")
+    worst = 0.0
+    for m in models:
+        p = price_for(m)
+        fi, fo = _factors(m, input_tokens, fast=fast, geo=geo)
+        in_rate = max(p["input"], p["cache_write"]) * fi
+        worst = max(worst, (input_tokens * in_rate + max_out * p["output"] * fo) / 1_000_000.0)
+    return worst + _server_tool_allowance(tools)
 
 
 def _server_tool_allowance(tools: Any) -> float:
-    """Conservative dollar reserve for any server-side tool the request declares (e.g. web search): its max_uses
-    at the per-request rate, or a default call count when no cap is given. Reserved up front so a burst of searches
-    cannot overrun the budget between reservation and settlement."""
+    """Dollar reserve for any declared web-search tool: its max_uses (or DEFAULT_SERVER_TOOL_USES) at $0.01."""
     if not isinstance(tools, list):
         return 0.0
     allow = 0.0
     for t in tools:
         if not isinstance(t, dict):
             continue
-        ttype = str(t.get("type") or "").lower()   # a server tool is identified by `type`, never a client tool's name
-        if "web_search" not in ttype:
+        if "web_search" not in str(t.get("type") or "").lower():   # a server tool is identified by `type`
             continue
         try:
             uses = int(t.get("max_uses") or 0)
@@ -330,116 +340,209 @@ def _server_tool_allowance(tools: Any) -> float:
     return allow
 
 
-# ------------------------------------------------------------------ billing period
-def _effective_reset(year: int, month: int) -> int:
-    """The reset day for a given month, clamped to that month's last day (so a 31st billing day is the 28th/30th in
-    shorter months)."""
-    return min(reset_day(), calendar.monthrange(year, month)[1])
+# ------------------------------------------------------------------------------------------------------- key
+def api_key() -> str:
+    """The credit key, from the provider's environment (KEY_ENV). Never logged, never written, never passed on."""
+    return (os.environ.get(KEY_ENV) or "").strip()
 
 
-def _start_month(now: float) -> tuple[int, int]:
-    dt = datetime.fromtimestamp(now).astimezone()
-    if dt.day >= _effective_reset(dt.year, dt.month):
-        return dt.year, dt.month
-    return (dt.year - 1, 12) if dt.month == 1 else (dt.year, dt.month - 1)
+def key_problem() -> str | None:
+    """Why the configured key cannot be used, or None. A second key (the pre-#114 multi-org slots) is refused: the
+    grants file describes ONE organisation, and spend on a second key would not be counted against its grants."""
+    if not api_key():
+        return f"no API key ({KEY_ENV} is not set in the provider's environment)"
+    if (os.environ.get(KEY_ENV + "_2") or "").strip():
+        return f"a second credit key ({KEY_ENV}_2) is set; the grants file covers one organisation: remove it"
+    return None
 
 
-def period_key(now: float) -> str:
-    """The billing period `now` falls in, labelled 'YYYY-MM' by the month the period starts in."""
-    y, m = _start_month(now)
-    return f"{y:04d}-{m:02d}"
+def configured_orgs() -> list[tuple[str, str]]:
+    """[("org", key)] when the one credit key is usable, else []. (Kept for callers of the pre-#114 interface.)"""
+    return [("org", api_key())] if key_problem() is None else []
 
 
-def period_bounds(now: float) -> tuple[float, float]:
-    """(start_epoch, next_start_epoch) of the billing period containing `now`, on each month's effective reset day."""
-    sy, sm = _start_month(now)
-    ny, nm = (sy + 1, 1) if sm == 12 else (sy, sm + 1)
-    start = datetime(sy, sm, _effective_reset(sy, sm)).astimezone()
-    nxt = datetime(ny, nm, _effective_reset(ny, nm)).astimezone()
-    return start.timestamp(), nxt.timestamp()
+# ------------------------------------------------------------------------------------------------------ config
+def config_path() -> Path:
+    raw = os.environ.get(CONFIG_ENV)
+    return Path(raw).expanduser() if raw else Path.home() / ".config" / "cortados" / "api-credit.json"
 
 
-# ------------------------------------------------------------------ locked per-org, per-period ledger
-# Shape: {"orgs": {"<slot>": {"periods": {"<yyyy-mm>": {"spent_usd": f, "reserved": {rid: f}}}, "pruned_through": s}}}.
-# Each org (key slot) has its own independent set of billing periods and prune cursor, so one org's spend and
-# pruning never touch another's. A legacy single-org file ({"periods": {...}}) is migrated to slot "1" on read.
-def _blank() -> dict[str, Any]:
-    return {"orgs": {}}
+def _when(v: Any, what: str) -> float:
+    """An ISO 8601 time WITH a UTC offset (e.g. 2026-12-02T19:00:00-05:00) as epoch seconds; ConfigError otherwise."""
+    if not isinstance(v, str) or not v.strip():
+        raise ConfigError(f"{what} must be an ISO 8601 time with a UTC offset")
+    s = v.strip()
+    if s.endswith("Z") or s.endswith("z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        raise ConfigError(f"{what} is not an ISO 8601 time: {v[:40]!r}") from None
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        raise ConfigError(f"{what} has no UTC offset (a time without one is ambiguous): {v[:40]!r}")
+    return dt.timestamp()
+
+
+def _money(v: Any, what: str, *, positive: bool) -> float:
+    if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or v < 0 or (positive and v == 0):
+        raise ConfigError(f"{what} must be a {'positive' if positive else 'non-negative'} number of dollars")
+    return float(v)
+
+
+def parse_config(raw: Any) -> dict[str, Any]:
+    """The grants config, validated strictly (any doubt is a ConfigError: the lane stays off)."""
+    if not isinstance(raw, dict):
+        raise ConfigError("the API credit config must be a JSON object")
+    known = {"_comment", "enabled", "grants", "org_monthly_limit_usd", "stop_fraction", "prefer_within_days"}
+    unknown = sorted(k for k in raw if k not in known and not str(k).startswith("_"))
+    if unknown:
+        raise ConfigError(f"unknown config field(s): {', '.join(unknown)}")
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError("enabled must be true or false")
+    limit = _money(raw.get("org_monthly_limit_usd"), "org_monthly_limit_usd", positive=True)
+    stop = raw.get("stop_fraction", STOP_FRACTION)
+    if not isinstance(stop, (int, float)) or isinstance(stop, bool) or not (0 < stop <= STOP_FRACTION):
+        raise ConfigError(f"stop_fraction must be above 0 and at most {STOP_FRACTION} (owner rule: never over 95%)")
+    prefer = raw.get("prefer_within_days", DEFAULT_PREFER_DAYS)
+    if not isinstance(prefer, (int, float)) or isinstance(prefer, bool) or not math.isfinite(prefer) or prefer < 0:
+        raise ConfigError("prefer_within_days must be a non-negative number of days")
+    grants_raw = raw.get("grants")
+    if not isinstance(grants_raw, list):
+        raise ConfigError("grants must be a list")
+    grants = []
+    for i, g in enumerate(grants_raw):
+        if not isinstance(g, dict):
+            raise ConfigError(f"grant {i} must be an object")
+        gknown = {"name", "amount_usd", "granted", "expires", "remaining_usd", "remaining_as_of"}
+        extra = sorted(k for k in g if k not in gknown and not str(k).startswith("_"))
+        if extra:
+            raise ConfigError(f"grant {i}: unknown field(s): {', '.join(extra)}")
+        name = g.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name) > 120:
+            raise ConfigError(f"grant {i}: name must be a non-empty string")
+        amount = _money(g.get("amount_usd"), f"grant {name!r} amount_usd", positive=True)
+        granted = _when(g.get("granted"), f"grant {name!r} granted")
+        expires = _when(g.get("expires"), f"grant {name!r} expires")
+        if expires <= granted:
+            raise ConfigError(f"grant {name!r} expires before it is granted")
+        has_rem, has_asof = "remaining_usd" in g, "remaining_as_of" in g
+        if has_rem != has_asof:
+            raise ConfigError(f"grant {name!r}: remaining_usd and remaining_as_of go together")
+        remaining, since = amount, granted
+        if has_rem:
+            remaining = _money(g["remaining_usd"], f"grant {name!r} remaining_usd", positive=False)
+            if remaining > amount:
+                raise ConfigError(f"grant {name!r}: remaining_usd is more than amount_usd")
+            since = _when(g["remaining_as_of"], f"grant {name!r} remaining_as_of")
+            if since < granted:
+                raise ConfigError(f"grant {name!r}: remaining_as_of is before granted")
+        grants.append({"name": name.strip(), "amount_usd": amount, "granted": granted, "expires": expires,
+                       "used_outside_usd": round(amount - remaining, 6), "counted_from": since})
+    return {"enabled": enabled, "grants": grants, "org_monthly_limit_usd": limit, "stop_fraction": float(stop),
+            "prefer_within_days": float(prefer)}
+
+
+def load_config(path: Path | None = None) -> dict[str, Any]:
+    p = path or config_path()
+    try:
+        text = p.read_text()
+    except FileNotFoundError:
+        raise ConfigError("no API credit config (the owner lists the grants in ~/.config/cortados/api-credit.json)") \
+            from None
+    except OSError as exc:
+        raise ConfigError(f"the API credit config cannot be read ({type(exc).__name__})") from None
+    try:
+        raw = json.loads(text)
+    except ValueError:
+        raise ConfigError("the API credit config is not valid JSON") from None
+    return parse_config(raw)
+
+
+# ------------------------------------------------------------------------------------------------------ ledger
+def _state_dir() -> Path:
+    return Path(os.environ.get("CORTADOS_HOME") or os.environ.get("CORTADOS_HERMES_HOME") or (Path.home() / ".cortados"))
+
+
+def ledger_path() -> Path:
+    return _state_dir() / "api-credit-ledger.json"
+
+
+def _day(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+
+
+def _valid_day(s: Any) -> bool:
+    if not isinstance(s, str) or len(s) != 10:
+        return False
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").strftime("%Y-%m-%d") == s
+    except ValueError:
+        return False
 
 
 def _finite_nonneg(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x >= 0
 
 
+def _blank() -> dict[str, Any]:
+    return {"version": LEDGER_VERSION, "days": {}, "pruned_through": ""}
+
+
 def _validate(data: Any) -> dict[str, Any]:
-    """Strict schema check shared by reads and mutations, normalising the legacy single-org shape to slot '1'. Each
-    org is a dict with a periods map; each period has a finite non-negative spent_usd and a reserved map of finite
-    non-negative amounts. Anything else is a LedgerError (fail closed). Returns the (possibly migrated) data."""
-    if not isinstance(data, dict):
-        raise LedgerError("api-credit ledger is corrupt (unexpected shape)")
-    if "orgs" not in data and isinstance(data.get("periods"), dict):
-        # A prune cursor that is PRESENT but not a string (int, null, …) must fail closed, never be dropped:
-        # dropping it would let an already-pruned period reopen blank and re-admit its spent budget. Absent is fine
-        # (fresh ledger). Checked by key presence, so an explicit JSON null is rejected like any other bad value.
-        if "pruned_through" in data and not isinstance(data["pruned_through"], str):
-            raise LedgerError("api-credit ledger has an invalid prune cursor")
-        legacy: dict[str, Any] = {"periods": data["periods"]}
-        if isinstance(data.get("pruned_through"), str):
-            legacy["pruned_through"] = data["pruned_through"]
-        data = {"orgs": {_legacy_owner(): legacy}}   # the primary key; raises if none is configured
-    if not isinstance(data.get("orgs"), dict):
-        raise LedgerError("api-credit ledger is corrupt (unexpected shape)")
-    for label, od in data["orgs"].items():
-        if not isinstance(od, dict) or not isinstance(od.get("periods"), dict):
-            raise LedgerError(f"api-credit ledger org {label!r} is invalid")
-        if "pruned_through" in od and not isinstance(od["pruned_through"], str):
-            raise LedgerError(f"api-credit ledger org {label!r} has an invalid prune cursor")
-        for period, led in od["periods"].items():
-            if not isinstance(led, dict) or not _finite_nonneg(led.get("spent_usd")) or not isinstance(led.get("reserved"), dict):
-                raise LedgerError(f"api-credit ledger org {label!r} period {period!r} is invalid")
-            for rid, amt in led["reserved"].items():
-                if not _finite_nonneg(amt):
-                    raise LedgerError(f"api-credit ledger reservation {rid!r} is invalid")
+    """Strict schema check for every read: anything unexpected is a LedgerError (fail closed)."""
+    if not isinstance(data, dict) or data.get("version") != LEDGER_VERSION or not isinstance(data.get("days"), dict):
+        raise LedgerError("api-credit ledger is corrupt (unexpected shape or version)")
+    cursor = data.get("pruned_through")
+    if not isinstance(cursor, str) or (cursor and not _valid_day(cursor)):
+        raise LedgerError("api-credit ledger has an invalid prune cursor")
+    for day, led in data["days"].items():
+        if not _valid_day(day) or not isinstance(led, dict) or not _finite_nonneg(led.get("spent_usd")) \
+                or not isinstance(led.get("reserved"), dict):
+            raise LedgerError("api-credit ledger has an invalid day entry")
+        for rid, amt in led["reserved"].items():
+            if not isinstance(rid, str) or not rid.startswith(day + ":") or not _finite_nonneg(amt):
+                raise LedgerError("api-credit ledger has an invalid reservation")
     return data
 
 
-def _org_ledger(data: dict[str, Any], label: str) -> dict[str, Any]:
-    """The per-org sub-ledger ({"periods": ..., "pruned_through": ...}) for a slot, created blank if absent."""
-    od = data.setdefault("orgs", {}).setdefault(label, {"periods": {}})
-    od.setdefault("periods", {})
-    return od
-
-
-def _locked(path: Path, fn: Callable[[dict[str, Any]], Any]) -> Any:
-    """Run fn on the ledger under an exclusive file lock, persisting whatever fn leaves in `data`. Fail closed:
-    any read/parse/write error raises LedgerError so the caller refuses admission instead of spending blind."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _read(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return _blank()
     try:
-        lock = open(path.with_suffix(".lock"), "w")
+        return _validate(json.loads(path.read_text()))
+    except LedgerError:
+        raise
+    except (ValueError, OSError, TypeError, AttributeError) as exc:
+        raise LedgerError(f"api-credit ledger unreadable ({type(exc).__name__})") from None
+
+
+def _locked(path: Path, fn: Callable[[dict[str, Any]], Any], *, write: bool = True) -> Any:
+    """Run fn on the ledger under an exclusive file lock, persisting whatever fn leaves in `data` (atomically: a
+    unique temp file, fsynced, renamed over). Any read/parse/write error is a LedgerError."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock = open(path.with_name(path.name + ".lock"), "a")
     except OSError as exc:
-        raise LedgerError(f"cannot open the api-credit lock: {exc}") from exc
+        raise LedgerError(f"cannot open the api-credit ledger lock ({type(exc).__name__})") from None
     try:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        if path.exists():
-            try:
-                data = _validate(json.loads(path.read_text()))
-            except LedgerError:
-                raise
-            except (ValueError, OSError, TypeError, AttributeError) as exc:
-                raise LedgerError(f"api-credit ledger unreadable: {exc}") from exc
-        else:
-            data = _blank()
+        data = _read(path)
         out = fn(data)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        try:
-            tmp.write_text(json.dumps(data))
-            tmp.replace(path)
-        except OSError as exc:
+        if write:
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
             try:
-                tmp.unlink()
-            except OSError:
-                pass
-            raise LedgerError(f"api-credit ledger write failed: {exc}") from exc
+                with open(tmp, "w") as f:
+                    f.write(json.dumps(data, sort_keys=True))
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+            except OSError as exc:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise LedgerError(f"api-credit ledger write failed ({type(exc).__name__})") from None
         return out
     finally:
         try:
@@ -448,155 +551,241 @@ def _locked(path: Path, fn: Callable[[dict[str, Any]], Any]) -> Any:
             lock.close()
 
 
-def _ledger_for(org: dict[str, Any], period: str) -> dict[str, Any]:
-    """The period ledger within ONE org's sub-ledger, pruning that org's resolved periods. Scoped to the org, so
-    pruning and the prune cursor are per-org and never affect another org's periods."""
-    periods = org.setdefault("periods", {})
-    led = periods.setdefault(period, {"spent_usd": 0.0, "reserved": {}})
-    led.setdefault("spent_usd", 0.0)
-    led.setdefault("reserved", {})
-    # Prune resolved ledgers beyond the two most recent, so the file does not grow without bound. NEVER drop a
-    # period that still holds outstanding reservations: a later settle reads its period from the reservation id, and
-    # a pruned period would be recreated empty, losing the charge. Keep such periods until their reservations settle.
-    # Also always keep the period being fetched: reserve() adds its reservation AFTER this returns, so pruning it
-    # here would detach `led` from the ledger and the reservation (and its later settle) would be lost.
-    keep = set(sorted(periods)[-2:]) | {p for p, l in periods.items() if l.get("reserved")} | {period}
-    pruned = [p for p in list(periods) if p not in keep]
-    for stale in pruned:
-        periods.pop(stale, None)
-    if pruned:
-        # Remember the latest period we have discarded. Its spent balance is gone, so a later reserve must not
-        # reopen it as a blank ledger (which would let a clock rollback / stale timestamp double-spend that month).
-        org["pruned_through"] = max([org.get("pruned_through", "")] + pruned)
-    return led
+def _up(x: float) -> float:
+    """`x` rounded UP to a millionth of a dollar: what the ledger stores is never below what was spent or reserved."""
+    return math.ceil(x * 1_000_000 - 1e-6) / 1_000_000 if x > 0 else 0.0
 
 
-def reserve(max_cost: float, now: float, path: Path | None = None) -> str | None:
-    """Reserve `max_cost` against a configured org's remaining credit for this period, atomically, draining orgs in
-    configured order (org 1 until its window is full, then org 2, …). Returns a reservation id (whose prefix names
-    the org) to settle later, or None if NO org has room (the caller then refuses the request). Raises LedgerError
-    if accounting is unavailable (fail closed). All orgs are tried under one lock, so the choice is atomic."""
-    p = path or meter_path()
-    period = period_key(now)
-    budget = budget_usd()                         # per-org window size
-    cost = max(0.0, float(max_cost))
-    orgs = configured_orgs()
-    lane_budget = budget * len(orgs)              # == total_budget_usd(); the hard aggregate cap
+def _committed(led: dict[str, Any]) -> float:
+    return float(led.get("spent_usd") or 0.0) + sum(float(v) for v in (led.get("reserved") or {}).values())
 
-    def _org_committed(data: dict[str, Any], oid: str) -> float:
-        led = (data.get("orgs", {}).get(oid, {}).get("periods") or {}).get(period) or {}
-        return float(led.get("spent_usd") or 0.0) + sum(float(v) for v in (led.get("reserved") or {}).values())
+
+def _sum_since(data: dict[str, Any], first_day: str) -> float:
+    return sum(_committed(led) for day, led in data["days"].items() if day >= first_day)
+
+
+def _month_first_day(now: float) -> str:
+    dt = datetime.fromtimestamp(now, timezone.utc)
+    start = datetime(dt.year, dt.month, 1, tzinfo=timezone.utc) - timedelta(days=MONTH_SPILL_DAYS)
+    return start.strftime("%Y-%m-%d")
+
+
+def _month_end(now: float) -> float:
+    dt = datetime.fromtimestamp(now, timezone.utc)
+    y, m = (dt.year + 1, 1) if dt.month == 12 else (dt.year, dt.month + 1)
+    return datetime(y, m, 1, tzinfo=timezone.utc).timestamp()
+
+
+def counting(cfg: dict[str, Any], now: float) -> list[dict[str, Any]]:
+    """The grants that count at `now`: granted, and more than EXPIRY_MARGIN_S before their expiry."""
+    return [g for g in cfg["grants"] if g["granted"] <= now < g["expires"] - EXPIRY_MARGIN_S]
+
+
+def _numbers(cfg: dict[str, Any], data: dict[str, Any], now: float) -> dict[str, Any]:
+    """The budget arithmetic of the module doc, on a validated config and ledger. Raises LedgerError when the ledger
+    no longer holds a window it must sum (pruned)."""
+    grants = counting(cfg, now)
+    stop = cfg["stop_fraction"]
+    month_from = _month_first_day(now)
+    cursor = data.get("pruned_through") or ""
+    if cursor and month_from <= cursor:
+        raise LedgerError("the ledger no longer holds this month's days (pruned); refusing")
+    month_used = _sum_since(data, month_from)
+    month_limit = cfg["org_monthly_limit_usd"]
+    out: dict[str, Any] = {
+        "month": {"limit_usd": month_limit, "used_usd": round(month_used, 6),
+                  "stop_line_usd": round(stop * month_limit, 6), "resets_at": _month_end(now)},
+        "grants": [{"name": g["name"], "amount_usd": g["amount_usd"], "expires_at": g["expires"],
+                    "counting": g in grants} for g in cfg["grants"]],
+        "stop_fraction": stop,
+    }
+    if not grants:
+        out.update(grant=None, headroom_usd=0.0, pct_used=None)
+        return out
+    first = min(_day(g["counted_from"]) for g in grants)
+    if cursor and first <= cursor:
+        raise LedgerError("the ledger no longer holds a counting grant's window (pruned); refusing")
+    amount = sum(g["amount_usd"] for g in grants)
+    grant_used = sum(g["used_outside_usd"] for g in grants) + _sum_since(data, first)
+    headroom = min(stop * amount - grant_used, stop * month_limit - month_used)
+    pct = 100.0 * max(grant_used / amount, month_used / month_limit)
+    out.update(grant={"amount_usd": amount, "used_usd": round(grant_used, 6), "stop_line_usd": round(stop * amount, 6),
+                      "left_usd": round(max(0.0, amount - grant_used), 6),
+                      "expires_at": min(g["expires"] for g in grants),
+                      "stops_counting_at": min(g["expires"] for g in grants) - EXPIRY_MARGIN_S,
+                      "granted_at": min(g["granted"] for g in grants)},
+               headroom_usd=round(headroom, 6), pct_used=round(pct, 2))
+    return out
+
+
+def alert_level(pct_used: float | None) -> int:
+    """The highest ALERT_LEVELS threshold reached (0 below 50 %)."""
+    if pct_used is None:
+        return 0
+    return max([lvl for lvl in ALERT_LEVELS if pct_used >= lvl] or [0])
+
+
+def _writable(path: Path) -> bool:
+    d = path.parent
+    if not d.exists():
+        return os.access(d.parent if d.parent.exists() else d, os.W_OK)
+    lock = path.with_name(path.name + ".lock")
+    return os.access(d, os.W_OK) and all(not p.exists() or os.access(p, os.W_OK) for p in (path, lock))
+
+
+def state(now: float, *, path: Path | None = None, config: Path | None = None) -> dict[str, Any]:
+    """The lane's state for the live view, the dashboard and routing: {"on", "reason", ...numbers}. Metadata only
+    (never the key, never a request). Every failure turns the lane off with the reason; this never raises."""
+    p = path or ledger_path()
+    out: dict[str, Any] = {"lane": LANE, "on": False, "reason": None, "alert_level": 0, "pct_used": None,
+                           "headroom_usd": 0.0, "expiring_soon": False, "prefer_within_days": None,
+                           "reserved_usd": None, "open_reservations": None, "as_of": round(now, 3)}
+    why = key_problem()
+    try:
+        cfg = load_config(config)
+    except ConfigError as exc:
+        out["reason"] = str(exc)
+        return out
+    out["prefer_within_days"] = cfg["prefer_within_days"]
+    try:
+        data = _read(p)
+        nums = _numbers(cfg, data, now)
+    except LedgerError as exc:
+        out["reason"] = f"ledger: {exc}"
+        return out
+    out.update(nums)
+    out["reserved_usd"] = round(sum(sum(led["reserved"].values()) for led in data["days"].values()), 6)
+    out["open_reservations"] = sum(len(led["reserved"]) for led in data["days"].values())
+    out["alert_level"] = alert_level(nums.get("pct_used"))
+    grant = nums.get("grant")
+    if grant:
+        out["expiring_soon"] = grant["expires_at"] - now <= cfg["prefer_within_days"] * 86400.0
+    if not cfg["enabled"]:
+        out["reason"] = "turned off in the API credit config (enabled: false)"
+    elif why:
+        out["reason"] = why
+    elif not grant:
+        out["reason"] = ("no counting grant: every configured grant has expired (or is within an hour of expiring) or "
+                         "is not granted yet; the owner adds a new grant to turn the lane on")
+    elif nums["headroom_usd"] <= 0:
+        out["reason"] = (f"hard stop: {round(100 * cfg['stop_fraction'])}% of the budget is spent or reserved "
+                         f"({nums['pct_used']:.1f}% used)")
+    elif not _writable(p):
+        out["reason"] = "the ledger is not writable"
+    else:
+        out["on"] = True
+    return out
+
+
+def lane_on(now: float) -> bool:
+    return bool(state(now)["on"])
+
+
+def reserve(max_cost: float, now: float, path: Path | None = None, *, config: Path | None = None) -> str | None:
+    """Reserve `max_cost` against the credit, atomically with every other reservation: returns a reservation id to
+    settle later, or None when the lane is off or the cost does not fit under the stop line (state() says why).
+    Raises LedgerError (or ConfigError) when accounting is unavailable: the caller refuses (fail closed)."""
+    cost = float(max_cost)
+    if not math.isfinite(cost) or cost < 0:
+        raise LedgerError("refusing a reservation that is not a finite non-negative amount")
+    if key_problem() is not None:
+        return None
+    cfg = load_config(config)
+    if not cfg["enabled"]:
+        return None
+    p = path or ledger_path()
+    today = _day(now)
 
     def fn(data: dict[str, Any]) -> str | None:
-        # Lane-wide prune guard FIRST: if the requested period has been pruned from ANY configured org, that org's
-        # spend for it is gone, so the lane aggregate for the period is understated and cannot be trusted -> refuse
-        # the whole reservation rather than admit another org into a period we can no longer total. The live path
-        # always reserves the CURRENT period (never pruned: pruning keeps the current and two most recent), so only
-        # a clock rollback / stale timestamp reaches here.
-        for oid, _k in orgs:
-            od0 = data.get("orgs", {}).get(oid, {})
-            if period not in (od0.get("periods") or {}) and period <= od0.get("pruned_through", ""):
-                return None
-        # Two gates, both under this lock: the lane AGGREGATE must not exceed the total, AND the chosen org's own
-        # window must not exceed its per-org budget. The aggregate gate matters because a settled OVERRUN on one org
-        # (actual > reserved, recorded un-clamped) can eat the lane's headroom while another org's window still looks
-        # open; without it, the sum of admitted reservations could pass total_budget_usd().
-        lane_committed = sum(_org_committed(data, oid) for oid, _k in orgs)
-        if lane_committed + cost > lane_budget:
-            return None                            # lane total would be exceeded (e.g. an overrun ate the headroom)
-        for oid, _key in orgs:
-            od = _org_ledger(data, oid)
-            led = _ledger_for(od, period)
-            committed = float(led["spent_usd"]) + sum(float(v) for v in led["reserved"].values())
-            if committed + cost > budget:
-                continue                           # this org's window is full -> try the next org
-            rid = f"{oid}|{period}:{uuid.uuid4().hex}"
-            led["reserved"][rid] = round(cost, 6)
-            return rid
-        return None                                # every configured org is full (or there are none)
+        cursor = data.get("pruned_through") or ""
+        if cursor and today <= cursor:          # a clock rollback into pruned days: never reopen them blank
+            raise LedgerError("the clock is inside the ledger's pruned days; refusing")
+        nums = _numbers(cfg, data, now)          # everything spent and reserved, read under this lock
+        if nums.get("grant") is None or cost > nums["headroom_usd"]:
+            return None
+        _prune(data, now)
+        led = data["days"].setdefault(today, {"spent_usd": 0.0, "reserved": {}})
+        rid = f"{today}:{uuid.uuid4().hex}"
+        led["reserved"][rid] = _up(cost)
+        return rid
 
     return _locked(p, fn)
 
 
-def settle(res_id: str, actual_cost: float, now: float | None = None, path: Path | None = None) -> None:
-    """Replace a reservation with the actual spend (recorded in full — an overrun past the reserved max is NOT
-    clamped, so it stays visible). The reservation's own period is read from its id, so a late settle lands in the
-    right period. Idempotent: the charge is recorded only while the reservation is still outstanding, so a retried
-    or duplicated settle cannot double-charge. Raises LedgerError on accounting failure."""
-    p = path or meter_path()
-    oid, period = _org_of(res_id)
-    actual = max(0.0, float(actual_cost))
+def _prune(data: dict[str, Any], now: float) -> None:
+    """Drop days older than KEEP_DAYS that hold no reservation, remembering the latest dropped day."""
+    cutoff = _day(now - KEEP_DAYS * 86400.0)
+    gone = [d for d, led in data["days"].items() if d < cutoff and not led["reserved"]]
+    for d in gone:
+        del data["days"][d]
+    if gone:
+        data["pruned_through"] = max([data.get("pruned_through") or ""] + gone)
 
-    def _apply(led: dict[str, Any]) -> None:
-        led["reserved"].pop(res_id)                                       # release the reservation, exactly once
-        led["spent_usd"] = round(float(led.get("spent_usd") or 0.0) + actual, 6)   # the ACTUAL — overruns not hidden
+
+def settle(res_id: str, actual_cost: float, now: float | None = None, path: Path | None = None) -> None:
+    """Replace a reservation with the actual spend (an overrun past the reserved amount is recorded in full, never
+    clamped). Idempotent: only an outstanding reservation is charged, so a retried settle cannot double-charge.
+    Raises LedgerError on accounting failure (the reservation then stays, at its full amount)."""
+    p = path or ledger_path()
+    day = (res_id or "").split(":", 1)[0]
+    actual = float(actual_cost)
+    if not math.isfinite(actual) or actual < 0:
+        raise LedgerError("refusing to settle a charge that is not a finite non-negative amount")
 
     def fn(data: dict[str, Any]) -> None:
-        if oid is None:
-            # A legacy reservation id carries no org. Find whichever org actually holds it (it was migrated under
-            # the primary configured when the ledger upgraded), so a late settle lands on its true owner regardless
-            # of which key is primary now. Ids are unique, so at most one org matches.
-            for _label, od in data.get("orgs", {}).items():
-                led = (od.get("periods") or {}).get(period)
-                if isinstance(led, dict) and res_id in (led.get("reserved") or {}):
-                    _apply(led)
-                    return
-            return   # not found in any org -> already settled / pruned -> idempotent no-op
-        od = _org_ledger(data, oid)
-        if period not in od.get("periods", {}) and period <= od.get("pruned_through", ""):
-            return   # the period was pruned; any reservation in it is long gone -> nothing to settle, do not reopen it
-        led = _ledger_for(od, period)
-        if res_id not in led["reserved"]:
-            return   # already settled (or never reserved here) -> idempotent no-op, never a second charge
-        _apply(led)
+        led = data["days"].get(day)
+        if not isinstance(led, dict) or res_id not in led["reserved"]:
+            return                               # already settled (or never reserved): a no-op, never a second charge
+        led["reserved"].pop(res_id)
+        led["spent_usd"] = _up(float(led["spent_usd"]) + actual)
 
     _locked(p, fn)
 
 
-def _current(now: float, path: Path | None = None) -> dict[str, float]:
-    """This period's spend and outstanding reservations summed across all configured orgs (the whole lane)."""
-    p = path or meter_path()
-    period = period_key(now)
-    labels = [lbl for lbl, _ in configured_orgs()]
-    try:
-        if not p.exists():
-            return {"spent_usd": 0.0, "reserved": 0.0}
-        data = _validate(json.loads(p.read_text()))
-        spent_total = reserved_total = 0.0
-        for lbl in labels:
-            od = data["orgs"].get(lbl) or {}
-            led = (od.get("periods") or {}).get(period) or {}
-            spent_total += float(led.get("spent_usd") or 0.0)
-            reserved_total += sum(float(v) for v in (led.get("reserved") or {}).values())
-        return {"spent_usd": spent_total, "reserved": reserved_total}
-    except (LedgerError, ValueError, OSError, TypeError, AttributeError):
-        # A read-only view that cannot validate treats the lane as fully committed, so pacing fails safe (the
-        # authoritative admission path, reserve(), raises instead).
-        return {"spent_usd": total_budget_usd(), "reserved": 0.0}
+def window_numbers(now: float, path: Path | None = None) -> tuple[float, float, float]:
+    """(used_pct, reset_at_epoch, window_s) for scarcity.window_view: % of the binding budget used, the soonest
+    counting grant's end as the reset (credit does not refill), the grant's life as the window. Raises LedgerError
+    when the lane cannot be read; a lane with no counting grant reads 100 % used."""
+    st = state(now, path=path)
+    if str(st.get("reason") or "").startswith("ledger:") or st.get("month") is None:
+        raise LedgerError(st.get("reason") or "api credit unavailable")
+    grant = st.get("grant")
+    if not grant:
+        return 100.0, now + 86400.0, 86400.0
+    used = min(100.0, max(0.0, float(st["pct_used"] or 0.0) / st["stop_fraction"]))   # 100 % = the stop line
+    end = grant["stops_counting_at"]
+    return used, end, max(86400.0, end - grant["granted_at"])
 
 
 def spent(now: float, path: Path | None = None) -> float:
-    return _current(now, path)["spent_usd"]
+    st = state(now, path=path)
+    return float((st.get("grant") or {}).get("used_usd") or 0.0)
 
 
-def committed(now: float, path: Path | None = None) -> float:
-    """Spent plus outstanding reservations — what admission and pacing both read against the budget."""
-    c = _current(now, path)
-    return c["spent_usd"] + c["reserved"]
+def budget_usd(now: float | None = None) -> float:
+    """The counting grants' total (0 when none counts or the config cannot be read)."""
+    import time as _t
+    try:
+        cfg = load_config()
+    except ConfigError:
+        return 0.0
+    return sum(g["amount_usd"] for g in counting(cfg, now if now is not None else _t.time()))
 
 
-def remaining(now: float, path: Path | None = None) -> float:
-    return max(0.0, total_budget_usd() - committed(now, path))
+total_budget_usd = budget_usd
 
 
-def over_budget(now: float, path: Path | None = None) -> bool:
-    return committed(now, path) >= total_budget_usd()
+def main(argv: list[str] | None = None) -> int:
+    """`python3 -m cortados_router.api_credits status`: the lane's state as JSON (metadata only, no key, no request)."""
+    import sys
+    import time as _t
+    args = sys.argv[1:] if argv is None else argv
+    if args[:1] != ["status"]:
+        print("usage: python3 -m cortados_router.api_credits status", file=sys.stderr)
+        return 2
+    print(json.dumps(state(_t.time()), indent=1, sort_keys=True))
+    return 0
 
 
-def window_numbers(now: float, path: Path | None = None) -> tuple[float, float, float]:
-    """(used_pct, reset_at_epoch, window_s) for scarcity.window_view — committed dollars over the lane's whole
-    billing window (all configured orgs summed)."""
-    start, nxt = period_bounds(now)
-    b = total_budget_usd()
-    used_pct = min(100.0, 100.0 * committed(now, path) / b) if b else 100.0
-    return used_pct, nxt, nxt - start
+if __name__ == "__main__":
+    raise SystemExit(main())

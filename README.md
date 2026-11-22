@@ -286,7 +286,7 @@ Codex as a client uses `/v1/responses`; its provider config is in `docs/PROVIDER
 | `sub/<claude-model>` (or `sub/opus`, `sub/sonnet`, `sub/haiku`, `sub/fable`; bare `sub` = Opus) | that model on a Claude **subscription** account: the least-scarce configured account whose quota is not spent | skipped |
 | `sub/<codex-model>` (e.g. `sub/gpt-6.1-sol`; any model the tables serve on codex-cli) | that model on the Codex backend (`codex app-server`, the provider's one Codex login), if its lane has capacity | skipped |
 | `sub/<friendly name>` (e.g. `sub/gpt-6.1`, `sub/sonnet-5`, `sub/ollama-27b-q3km`; spaces or dashes) | the one pool model whose name carries every word (see **Friendly model names**); an ambiguous name is refused with its candidates, never guessed | skipped |
-| `api/<claude-model>` (bare `api` = Opus) | that model on the dollar-metered Anthropic **API credit** lane | skipped |
+| `api/<claude-model>` (bare `api` = Opus) | that model on the Anthropic **API credit** lane (promotional credit only, see **API credit lane**) | skipped |
 
 A `sub/` pin still writes a `routes` row (engine `pin`), so a pinned planner's usage is on record next to the routed workers'. Use it for an orchestrating main session whose first message is too thin to score well, with the routed-subagents mod sending the workers through S1. `GET /v1/models` lists `cortados` and every pinnable model as `sub/<id>` (display name e.g. `GPT-6.1 Sol · CortadOS`), derived from the tables, so a model picker can choose the orchestrator. When every Claude subscription account is spent the pin is refused with a pointer to the `api/` pin; it never falls over to API credit on its own.
 
@@ -426,6 +426,67 @@ codex mcp add cortados-route \
 
 No address or token is committed; `.mcp.json` reads both from the environment, and a test (`tests/test_mcp_config.py`)
 fails if a literal value is ever placed there.
+
+## API credit lane (#114)
+
+A pay-per-use Anthropic API lane that can only ever spend **free promotional credit** and can never cause a bill. It
+reuses the earlier `anthropic-api` lane (`cortados_router/api_credits.py` accounting, `provider/anthropic_proxy.py`
+executor, `server.Handler._api_turn`), rebuilt on 2026-11-22 around the owner's grants instead of a monthly refill.
+
+**Budget.** The owner lists the Console's grants in `~/.config/cortados/api-credit.json` on the provider's machine
+(example: `tables/api-credit.example.json`; never the key): each grant's name, `amount_usd`, `granted` and `expires`
+(ISO 8601 with a UTC offset), optionally `remaining_usd` + `remaining_as_of` (what the Console showed left, and when),
+plus `org_monthly_limit_usd`. A grant counts from `granted` until one hour before `expires` (the longest upstream turn
+is 30 min, so nothing admitted under a grant still runs when it expires); after the last grant stops counting the lane
+is off until a new grant is added. Nothing assumes credit refills.
+
+- Grant use U_G = (amount - remaining_usd for grants that state it) + every dollar the ledger committed (spent +
+  reserved) from the earliest counting grant's start day (UTC) on. Grant budget G = the counting grants' amounts.
+- Month use U_M = the ledger's committed dollars from the previous month's last UTC day on (a turn crossing midnight on
+  the 1st). Month budget M = the org monthly limit.
+- **Hard stop at 95 %:** a request is admitted only if, with its reservation, U_G <= 0.95 G and U_M <= 0.95 M.
+  headroom = min(0.95 G - U_G, 0.95 M - U_M); at headroom <= 0 the lane is off by itself. Alerts at 50 / 80 / 95 % of
+  max(U_G / G, U_M / M).
+- Worked example (2026-11-22): one grant "API credit (Ultra)" $200, all remaining, expires 2026-12-02 19:00 EST
+  (= 2026-12-03 00:00 UTC); org limit $200. G = M = $200, both stop lines $190, headroom $190. The grant stops counting
+  2026-12-02 18:00 EST; the expiry preference starts 2026-11-29 19:00 EST. On 2026-12-01 the month resets (U_M from
+  2026-11-30 on) but U_G keeps everything spent since 2026-11-22, so the grant's $190 stays the binding line.
+
+**Money path.** Each turn reserves an UPPER-bound cost before it is sent, under an exclusive `flock` on the ledger
+(`$CORTADOS_HOME/api-credit-ledger.json`, one entry per UTC day), checked against everything already spent and reserved,
+so concurrent requests (server threads or other processes) can never together pass the stop line; then it settles the
+real cost from the response's `usage` (an overrun recorded, never clamped; the full reservation when the cost is
+unknown; zero when the API returned an error). The bound: every byte of the serialized request is one input token, plus
+4,000 template tokens and 1,500 per tool, priced at the 1-hour cache-write rate (2x input); `max_tokens` (128k when
+absent) at the output rate; the long-context tier (input x2, output x1.5 above 200k), fast mode (x2), `inference_geo`
+(x1.1) and the dearest `fallbacks` model priced in; images bounded by their pixel size (width x height / 750 x 1.5 + 200)
+read from their header. Refused as unbounded (400, nothing sent): server-executed tools (web search / fetch, code
+execution, advisor, MCP toolsets), URL / Files API / PDF sources, unreadable or GIF images, `mcp_servers`, `container`,
+`thread`. **Fails closed:** a missing or invalid grants file, an unreadable, corrupt or unwritable ledger, a ledger that no
+longer holds a counting grant's days, and a second key (`CORTADOS_ANTHROPIC_API_KEY_2`, the old multi-org slots) all
+turn the lane off. `python3 -m cortados_router.api_credits status` prints the state (metadata only).
+
+**Where it is used.** An `api/<model>` pin, as before; and, while a counting grant expires within `prefer_within_days`
+(default 3), S1-routed work that a COST rule moved to a local model (R0 `auto_route` or the published index; never a
+sensitive bind, never the client's own `x-cortados-local: prefer`, never a request any sensitivity detector marked) runs
+on the API instead (`routing.prefer_api_credit`), on S1's own Claude choice or else the band's Claude model in the
+routing table. Such a conversation stays on the API (`server.ApiSession`, relayed per turn like a local one); a later turn
+the lane can no longer take (stop line, expiry) is refused with the reason. Otherwise routing is S1 and scarcity as
+always: the lane is never an S1 candidate.
+
+**Key.** `CORTADOS_ANTHROPIC_API_KEY` in the provider's environment, the variable the earlier lane read (on the Air the
+provider LaunchAgent loads its environment from `~/.cortados/provider.env`). Never logged, printed or written; `child_env.NEVER_ENV` /
+`NEVER_PREFIXES` keep it (and any numbered slot) out of every backend CLI's environment even if an allowlist edit named it.
+
+**Seen in** the live view's `api_credit` section and the dashboard's **API credit** panel and overview tile: on / off and
+why, used / left / stop line, the alert level, reservations in flight, the grant's expiry and whether the expiry
+preference is active. Not in the per-session view.
+
+**Deploy (owner, not run here):** on the Air, `mkdir -p ~/.config/cortados && cp tables/api-credit.example.json
+~/.config/cortados/api-credit.json` (check the grant against the Console); make sure `~/.cortados/provider.env` assigns
+`CORTADOS_ANTHROPIC_API_KEY` (and no `_2`); pull and restart the provider; check
+`python3 -B -m cortados_router.api_credits status` (with the provider's environment) reads `"on": true` and the dashboard
+shows the panel. The old `~/.cortados/api-credit-meter.json` is no longer read.
 
 ## Local models (the Pro)
 

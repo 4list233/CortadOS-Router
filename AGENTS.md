@@ -13,6 +13,8 @@ is the long form.
 ## Layout
 - `cortados_router/` — router package. `core.py` resolve/decide (CLI: `table`, `decide`),
   `scarcity.py` quota reading via vendor CLIs (`scarcity_codex.py` parses Codex's `/status`), `unitcost.py`,
+  `api_credits.py` (#114: the API credit lane's grants budget, 95 % stop line, flock'd reserve/settle ledger, upper-bound
+  cost estimate; fails closed; executor `provider/anthropic_proxy.py`, README "API credit lane"),
   `transport.py`, `router_db.py` (router.db reader opener — `mode=rw` + `query_only`, never `mode=ro` in a process that
   also writes it, #99 — and the route-log error counter), `local_resources.py`, `local_gate.py` (token-checked reverse proxy run on a local Ollama node: the
   provider's local lane reaches Ollama only through it; it also serves the node's manual switch at

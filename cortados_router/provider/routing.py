@@ -741,6 +741,7 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
             r = auto_local(core, body, r, client=client, conversation_id=conversation_id, excluded=hit)
         if r.get("local"):
             r = _stamp_sensitivity(r, sensitive)
+            r = prefer_api_credit(core, body, r, client=client, conversation_id=conversation_id, excluded=hit)
         elif sensitive is not None:
             r = _stamp_cloud(r, sensitive, skipped)
     if min_left_pct is not None and not r.get("error"):
@@ -858,6 +859,94 @@ def _log_moved(core, body: dict[str, Any], moved: dict[str, Any], *, client: str
                                                                standalone=not body.get("tools"))[:8000]},
                    moved.get("decision") or {"answers": None, "degraded": False, "engine": "s1", "engine_ms": None},
                    moved["route"])
+
+
+# ------------------------------------------------------------------------------------- API credit expiry preference
+# #114: the pay-per-use Anthropic API lane spends only promotional credit (api_credits). Outside an api/ pin it is used
+# for exactly one thing: when a counting grant expires within prefer_within_days (default 3: about the last tenth of a
+# one-month grant, and long enough that the credit left can still be used at the pace local-eligible work arrives),
+# a request a COST rule moved to a local model (R0 auto_route or the published index; never a sensitive bind, never
+# the client's own x-cortados-local: prefer, never a request any sensitivity detector marked) runs on the API instead,
+# so credit about to be lost does work the Pro would otherwise do. [ESCALATE] the exact rule: #114 says only "credit
+# close to expiring may be preferred over local".
+API_PROVIDER = "anthropic-api"
+API_BIND_REASON = "api_credit_expiry"
+API_PREFER_REASONS = ("auto_route", "index")
+
+
+def api_model(core, r: dict[str, Any]) -> str | None:
+    """The Claude model a route moved to the API runs on: S1's own choice when it was a Claude model (the route the local
+    move replaced, its runner_up), else the Claude model the routing table lists for the band (capable by the table);
+    None when the band lists none."""
+    before = (r.get("route") or {}).get("runner_up") or {}
+    if _base_provider(str(before.get("provider") or "")) in CLAUDE_PROVIDERS and before.get("model"):
+        return str(before["model"])
+    try:
+        rows = core.table()["candidates"].get(r.get("band")) or []
+    except Exception:
+        return None
+    for row in rows:
+        if _base_provider(str(row.get("provider") or "")) in CLAUDE_PROVIDERS and row.get("model"):
+            return str(row["model"])
+    return None
+
+
+def prefer_api_credit(core, body: dict[str, Any], r: dict[str, Any], *, client: str, conversation_id: str,
+                      excluded: Callable[[str], bool] = lambda name: False, now: float | None = None
+                      ) -> dict[str, Any]:
+    """`r` (a route `choose` moved to a local model), or the same decision moved to the API credit lane when all hold:
+    the bind is a COST rule (API_PREFER_REASONS) of a request every sensitivity detector cleared (CLOUD_REROUTE_OK), the
+    shared local admission still admits S1's decision (no outward effect, blast radius 0-1, not degraded), the lane is
+    on and a counting grant expires within its prefer window (api_credits.state), the model (api_model) is not
+    excluded, and this opening turn's upper-bound cost fits under the stop line now. Anything else, or any error,
+    leaves `r` exactly as it was (logged): the preference never blocks routing."""
+    from cortados_router import api_credits
+    try:
+        if not r.get("local") or r.get("pinned") or body.get(NO_LOCAL_KEY) or r.get("degraded"):
+            return r
+        if r.get("bind_reason") not in API_PREFER_REASONS or r.get(CLOUD_REROUTE_OK) is not True:
+            return r
+        ok, why = route_admission(r)
+        if not ok:
+            return r
+        st = api_credits.state(time.time() if now is None else now)
+        if not st.get("on") or not st.get("expiring_soon"):
+            return r
+        model = api_model(core, r)
+        if not model:
+            logger.info("api credit preference: no Claude model for band %s; %s stays local", r.get("band"),
+                        r.get("route_id"))
+            return r
+        if excluded(model):
+            logger.info("api credit preference: %s is excluded; %s stays local", shown_pin(model), r.get("route_id"))
+            return r
+        try:
+            est = api_credits.estimate_max_cost(body, model)
+        except api_credits.Unbounded as exc:
+            logger.info("api credit preference: %s stays local: %s", r.get("route_id"), exc)
+            return r
+        if est > float(st.get("headroom_usd") or 0.0):
+            logger.info("api credit preference: %s stays local: its upper-bound cost $%.2f is over the $%.2f left "
+                        "under the stop line", r.get("route_id"), est, float(st.get("headroom_usd") or 0.0))
+            return r
+    except Exception as exc:                       # never let the preference break routing
+        logger.warning("api credit preference skipped: %s", type(exc).__name__)
+        return r
+    old = r.get("route") or {}
+    days = (float(st["grant"]["expires_at"]) - (time.time() if now is None else now)) / 86400.0
+    rule = (f"api credit expiry preference: a grant expires in {days:.1f} days (within {st['prefer_within_days']:g}); "
+            f"{API_PROVIDER}/{model} instead of {old.get('chosen', {}).get('model')} on {old.get('chosen', {}).get('lane')}")
+    chosen = {"lane": API_PROVIDER, "provider": API_PROVIDER, "model": model, "account": None, "config_dir": None,
+              "reserve": False, "pool": None}
+    route = {**old, "chosen": chosen, "runner_up": old.get("chosen"),
+             "hard_rules": list(old.get("hard_rules") or []) + [rule]}
+    moved = {k: v for k, v in r.items() if k not in ("local", CLOUD_REROUTE_OK, sensitive_notice.DETECTOR_KEY,
+                                                    "context_length")}
+    moved.update(provider=API_PROVIDER, model=model, account=None, config_dir=None, route=route,
+                 bind_reason=API_BIND_REASON)
+    _log_moved(core, body, moved, client=client, conversation_id=conversation_id)
+    logger.info("api credit preference: %s -> %s/%s (band %s)", r.get("route_id"), API_PROVIDER, model, r.get("band"))
+    return moved
 
 
 # ----------------------------------------------------------------------------------------------- local admission
@@ -1727,9 +1816,10 @@ def _now() -> float:
 
 def _floor_exempt(lane: str) -> bool:
     """Lanes with no subscription quota: the client's floor is about subscription headroom only. A local node is named
-    `local` on the S1-routed path and `local-<node>` (local_lane.LANE_PREFIX) on a local pin."""
+    `local` on the S1-routed path and `local-<node>` (local_lane.LANE_PREFIX) on a local pin; the API credit lane
+    (API_PROVIDER) is metered in dollars against its own stop line (api_credits)."""
     base = lane.split("#", 1)[0]
-    return base == "local" or base.startswith(local_lane.LANE_PREFIX)
+    return base == "local" or base.startswith(local_lane.LANE_PREFIX) or base == API_PROVIDER
 
 
 def _bind_codex(cand: dict[str, Any], codex_home: str | None) -> dict[str, Any]:
