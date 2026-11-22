@@ -34,7 +34,7 @@ function validateRecord(record, role, lobby) {
     !Object.hasOwn(record, field) || (record[field] !== null && typeof record[field] !== 'string'))) {
     throw new Error('invalid office record');
   }
-  for (const field of ['provider', 'lane', 'model', 'title', 'tool']) {
+  for (const field of ['provider', 'lane', 'local_backend', 'model', 'title', 'tool']) {
     if (Object.hasOwn(record, field) && record[field] !== null && typeof record[field] !== 'string') {
       throw new Error('invalid office record');
     }
@@ -59,18 +59,28 @@ const LANE_FAMILY = new Map(Object.entries({ claude: 'claude', 'claude-cli': 'cl
 // backend serves Hugging Face style ids (mlx-community/...), never with a tag.
 const OLLAMA_TAG = /^[a-z0-9][a-z0-9._-]*(\/[a-z0-9][a-z0-9._-]*)?:[a-z0-9][a-z0-9._-]*$/i;
 
-/** Family of a local-lane model: the llama only for an Ollama-shaped tag, else generic local. */
-function localFamily(model) {
+// The local node's backend as office.py publishes it (`local_backend`, from the node gate's own report): exact when
+// present. Any other non-empty value is a backend this adapter does not know: a local node, but not Ollama.
+const LOCAL_BACKEND_FAMILY = new Map(Object.entries({ ollama: 'ollama', 'vllm-mlx': 'local' }));
+/** The published backend when it is one office.py names, else null (never echoed as free text). */
+export const knownBackend = backend => LOCAL_BACKEND_FAMILY.has(text(backend)) ? backend : null;
+
+/** Family of a local-lane model: the published backend when there is one; only without it, the llama for an
+ * Ollama-shaped tag (a name-shape guess), else generic local. */
+function localFamily(model, backend = null) {
+  const b = text(backend);
+  if (b) return LOCAL_BACKEND_FAMILY.get(b) ?? 'local';
   const m = text(model) ?? '';
   return OLLAMA_TAG.test(m) && !/(^|[/._:-])mlx([/._:-]|$)/i.test(m) ? 'ollama' : 'local';
 }
 
-/** Worker sprite: by the provider it ran on, then its lane key; never by a guess. */
-export function characterFamily(provider, lane = null, model = null) {
+/** Worker sprite: by the provider it ran on, then its lane key; never by a guess. A local worker's llama-or-chip
+ * comes from `backend` (office.py's local_backend), else from the model id's shape. */
+export function characterFamily(provider, lane = null, model = null, backend = null) {
   const p = text(provider)?.toLowerCase() ?? null;
   const l = text(lane)?.toLowerCase() ?? '';
   const family = PROVIDER_FAMILY.get(p) ?? (p === null ? laneFamily(l) : null);
-  if (family === 'local') return localFamily(model);
+  if (family === 'local') return localFamily(model, backend);
   return family ?? 'unknown';
 }
 function laneFamily(lane) {
@@ -81,7 +91,9 @@ function laneFamily(lane) {
 
 /** Orchestrator sprite: by its MODEL (office v1 reports no provider/lane for it).
  * Styling only; the published provider stays null. */
-export function modelFamily(model) {
+export function modelFamily(model, backend = null) {
+  // a routed local main loop: office.py names its node's backend, which is exact
+  if (text(backend)) return localFamily(model, backend);
   const m = (text(model) ?? '').toLowerCase().replace(/^(sub|api)\//, '');
   if (!m) return 'unknown';
   if (/^(claude|anthropic)|(^|[-/])(opus|sonnet|haiku|fable)([-.\d]|$)/.test(m)) return 'claude';
@@ -115,8 +127,9 @@ export function mapOffice(view) {
     const status = record.status;
     const name = text(record.title) ?? (role === 'orchestrator' ? 'Orchestrator' : 'Worker');
     const outfit = role === 'orchestrator' ? 'suit' : 'worker';
-    const family = role === 'orchestrator' ? modelFamily(record.model)
-      : characterFamily(provider, record.lane, record.model);
+    const backend = knownBackend(record.local_backend);
+    const family = role === 'orchestrator' ? modelFamily(record.model, record.local_backend)
+      : characterFamily(provider, record.lane, record.model, record.local_backend);
     agents.push({
       id, name, role,
       // avatarUrl: Claw3D's 2D panels show it as is. avatarProfile: its 3D voxel figure,
@@ -125,7 +138,7 @@ export function mapOffice(view) {
         avatarUrl: avatarDataUrl(family, outfit), avatarProfile: avatarProfile(family, outfit, id) },
       office: {
         floor: floor.session, project: text(floor.project), device: text(floor.device),
-        provider, lane: text(record.lane), model: text(record.model), status,
+        provider, lane: text(record.lane), localBackend: backend, model: text(record.model), status,
         tool: text(record.tool), title: text(record.title),
         characterFamily: family, outfit, sprite: family + (outfit === 'suit' ? '-suit' : ''),
       },

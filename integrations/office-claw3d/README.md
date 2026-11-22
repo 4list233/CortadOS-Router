@@ -13,7 +13,8 @@ protocol, how it renders people and floors, and the remaining gaps.
 | `build-assets.mjs` | regenerates `assets/` and `assets/preview.png` from the fixture (`--write` / `--check`) |
 | `assets/` | sprites, floor tiles, preview; origin and licence in `assets/NOTICE.md` |
 | `claw3d/avatar-profile-hint.patch` | 6-line Claw3D change so the 3D figures wear the family suits |
-| `DEPLOY.md`, `deploy-air.sh` | Air runbook and script, written and **not run** |
+| `claw3d/studio-login.cjs`, `claw3d/studio-login.patch` | login form for Studio's access cookie (`/cortados-login`) and its 3-line wiring |
+| `DEPLOY.md`, `deploy-air.sh`, `deploy-lib.sh` | Air runbook, script (install / upgrade / tailnet publish) and its pure checks, written and **not run** |
 
 ## Test
 
@@ -32,14 +33,18 @@ Each person gets a sprite, as metadata only. The published `provider`/`lane` nev
 - **Worker**: by the provider it ran on (`claude`, `codex`/`openai` → codex robot, `grok`/`xai`
   → dark robot, `local`), else by its lane key (`claude#b`, `codex`, `local-*`). Otherwise
   it gets the grey `unknown` visitor. A worker's model never chooses its sprite.
-- **Local lane**: the llama (`ollama`) only when the model id is shaped like an Ollama tag
-  (`name:tag`, e.g. `qwen3:27b`) and does not name mlx. Other local models (vllm-mlx's
-  `mlx-community/...`) get the green chip (`local`). Office v1 does not say which backend
-  served a turn, so this is a name-shape rule, not a fact (see PROTOCOL.md gaps).
+- **Local lane**: by the node's backend, which office.py publishes per local worker as
+  `local_backend` (`ollama` → the llama, `vllm-mlx` → the green chip `local`, any other value →
+  `local`). The provider takes it from the node gate's own report. Only when `local_backend` is
+  absent or null (an older provider, or a node whose gate never said) does a name-shape
+  guess apply: the llama for an Ollama-shaped tag (`name:tag`, e.g. `qwen3:27b`) that does not
+  name mlx, else `local`. Each agent's `office.localBackend` holds the published value (known
+  values only, else null).
 - **Orchestrator**: wears a suit, styled by its **model** (office v1 reports no provider or
   lane for it): `claude-*`/opus/sonnet/haiku/fable → claude, `gpt-*`/`codex*`/`o<N>` → codex,
   `grok*` → grok, an Ollama tag → ollama, qwen/llama/gemma/mistral/mlx… → local,
-  anything else → unknown. Its published provider stays `null`.
+  anything else → unknown. A routed local main loop's `local_backend` makes the local/llama
+  choice exact, as for workers. Its published provider stays `null`.
 
 Each agent in `agents.list` carries `identity.avatarUrl` (the sprite as a 128 px PNG data
 URL, which Claw3D's 2D panels show unmodified) and `identity.avatarProfile` (a Claw3D voxel

@@ -146,7 +146,7 @@ async function startBridge(t, options = {}) {
   return { bridge, port, logs };
 }
 
-function fakeStudio(port, headers = {}) {
+function fakeStudio(port, headers = {}, { pipelined = null } = {}) {
   return new Promise((resolve, reject) => {
     const socket = net.connect(port, '127.0.0.1');
     const key = randomBytes(16).toString('base64');
@@ -202,8 +202,10 @@ function fakeStudio(port, headers = {}) {
       deliver();
     });
     socket.on('error', reject);
-    socket.write('GET / HTTP/1.1\r\n' + Object.entries(h).filter(([, v]) => v !== undefined)
-      .map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n\r\n');
+    const request = Buffer.from('GET / HTTP/1.1\r\n' + Object.entries(h).filter(([, v]) => v !== undefined)
+      .map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n\r\n', 'latin1');
+    // `pipelined`: frame bytes sent in the SAME write as the headers (Node passes them as the upgrade's `head`)
+    socket.write(pipelined ? Buffer.concat([request, pipelined]) : request);
   });
 }
 const connect = (c, token = SECRET) => c.send({ type: 'req', id: 'c1', method: 'connect',
@@ -259,6 +261,42 @@ test('e2e: authenticated Studio gets hello, roster with sprites, read-only refus
   assert.deepEqual(snap.payload.agents.map(a => a.office.characterFamily), ['claude', 'ollama', 'codex']);
   c.raw(maskedFrame(9, 'ping'));
   assert.equal((await c.next(f => f.opcode === 10)).payload, 'ping');
+});
+
+const connectFrame = (token = SECRET) => maskedFrame(1, JSON.stringify({ type: 'req', id: 'c1', method: 'connect',
+  params: { minProtocol: 3, maxProtocol: 3, client: { id: 'openclaw-control-ui' }, auth: { token } } }));
+
+test('e2e: a connect frame pipelined with the upgrade headers is served (Node\'s upgrade head)', async t => {
+  const { port, bridge } = await startBridge(t, { connectDeadlineMs: 1500 });
+  bridge.hub.update(view());
+  const c = await fakeStudio(port, {}, { pipelined: connectFrame() });
+  const hello = await c.next(f => f.id === 'c1');
+  assert.equal(hello.ok, true);
+  assert.equal(hello.payload.type, 'hello-ok');
+  // still open after the deadline: authenticated, not timed out
+  await new Promise(r => setTimeout(r, 1700));
+  assert.equal(c.closedWith, null);
+  c.send({ type: 'req', id: 'list', method: 'agents.list', params: {} });
+  assert.equal((await c.next(f => f.id === 'list')).payload.agents.length, 2);
+  // header + connect + a second request, all in one write: both answered, in order
+  const d = await fakeStudio(port, {}, { pipelined: Buffer.concat([connectFrame(),
+    maskedFrame(1, JSON.stringify({ type: 'req', id: 'cfg', method: 'config.get', params: {} }))]) });
+  assert.equal((await d.next(f => f.id === 'c1')).ok, true);
+  assert.equal((await d.next(f => f.id === 'cfg')).ok, true);
+});
+
+test('e2e: a pipelined head gets the same checks as any frame (wrong token, bad frame)', async t => {
+  const { port } = await startBridge(t);
+  const wrong = await fakeStudio(port, {}, { pipelined: connectFrame('wrong-secret-0123456789abcdef') });
+  assert.equal((await wrong.next(f => f.id === 'c1')).error.code, 'UNAUTHORIZED');
+  assert.equal(await wrong.closed(), 1008);
+  const unmasked = await fakeStudio(port, {}, { pipelined: maskedFrame(1, 'x', { mask: false }) });
+  assert.equal(await unmasked.closed(), 1002);
+  // a frame split between the head and the next packet is reassembled
+  const f = connectFrame();
+  const split = await fakeStudio(port, {}, { pipelined: f.subarray(0, 5) });
+  split.raw(f.subarray(5));
+  assert.equal((await split.next(m => m.id === 'c1')).ok, true);
 });
 
 test('e2e: protocol abuse closes the socket with the right code', async t => {

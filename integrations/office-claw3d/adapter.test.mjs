@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mapOffice, characterFamily, modelFamily, READ_METHODS, OfficeGateway, pollOffice, runPolling } from './adapter.mjs';
+import { mapOffice, characterFamily, knownBackend, modelFamily, READ_METHODS, OfficeGateway, pollOffice, runPolling } from './adapter.mjs';
 
 const worker = { run_id: 'run-12345678', provider: 'codex', lane: 'codex', model: 'gpt',
   title: 'Review', status: 'working', tool: 'Read' };
@@ -143,6 +143,45 @@ test('orchestrator model families', () => {
   for (const [model, family] of Object.entries(cases)) assert.equal(modelFamily(model), family, model);
   assert.equal(modelFamily(null), 'unknown');
   assert.equal(modelFamily(42), 'unknown');
+});
+test('local_backend from office.py makes the local sprite exact; the name shape is only the fallback', () => {
+  // the backend wins over the model id's shape, both ways
+  assert.equal(characterFamily('local', 'local-pro', 'mlx-community/Qwen3-4bit', 'ollama'), 'ollama');
+  assert.equal(characterFamily('local', 'local-pro', 'qwen3:27b', 'vllm-mlx'), 'local');
+  assert.equal(characterFamily(null, 'local-studio', 'qwen3:27b', 'vllm-mlx'), 'local');      // lane-keyed local too
+  assert.equal(characterFamily('local', 'local-pro', 'qwen3:27b', 'some-future-backend'), 'local'); // local, not Ollama
+  // absent or null: the name-shape guess, as before
+  assert.equal(characterFamily('local', 'local-pro', 'qwen3:27b', null), 'ollama');
+  assert.equal(characterFamily('local', 'local-pro', 'qwen3:27b'), 'ollama');
+  assert.equal(characterFamily('local', 'local-pro', 'mlx-community/Qwen3-4bit', undefined), 'local');
+  // a backend never makes a cloud worker local
+  assert.equal(characterFamily('claude', 'claude#b', 'claude-sonnet-5', 'ollama'), 'claude');
+  assert.equal(characterFamily('other', null, 'qwen3:27b', 'ollama'), 'unknown');
+  // the orchestrator: exact when its routed local main loop names a backend
+  assert.equal(modelFamily('mlx-community/Qwen3-4bit', 'ollama'), 'ollama');
+  assert.equal(modelFamily('qwen3:27b', 'vllm-mlx'), 'local');
+  assert.equal(modelFamily('qwen3:27b', null), 'ollama');
+  assert.equal(modelFamily('claude-opus-5-5', null), 'claude');
+  assert.equal(knownBackend('ollama'), 'ollama');
+  assert.equal(knownBackend('vllm-mlx'), 'vllm-mlx');
+  for (const odd of ['__proto__', 'constructor', 'Ollama', '', null, 7]) assert.equal(knownBackend(odd), null, String(odd));
+});
+test('mapOffice reads local_backend per record and publishes only known values', () => {
+  const input = view();
+  input.floors[0].orchestrator = { ...input.floors[0].orchestrator, model: 'qwen3:27b', local_backend: 'vllm-mlx' };
+  input.floors[0].workers = [
+    { ...worker, run_id: 'w-exact-ol', provider: 'local', lane: 'local-pro', local_backend: 'ollama',
+      model: 'mlx-community/Qwen3-4bit' },
+    { ...worker, run_id: 'w-exact-ml', provider: 'local', lane: 'local-pro', local_backend: 'vllm-mlx', model: 'qwen3:27b' },
+    { ...worker, run_id: 'w-guess-01', provider: 'local', lane: 'local-pro', local_backend: null, model: 'qwen3:27b' },
+    { ...worker, run_id: 'w-future-1', provider: 'local', lane: 'local-pro', local_backend: 'llama.cpp', model: 'qwen3:27b' },
+  ];
+  const agents = mapOffice(input);
+  assert.deepEqual(agents.map(a => [a.office.characterFamily, a.office.localBackend]), [
+    ['local', 'vllm-mlx'], ['ollama', 'ollama'], ['local', 'vllm-mlx'], ['ollama', null], ['local', null]]);
+  const bad = view();
+  bad.floors[0].workers[0].local_backend = 42;                    // a wrong type is a malformed snapshot
+  assert.throws(() => mapOffice(bad), /invalid office record/);
 });
 test('appearance output is metadata only and the same for the same input', () => {
   const input = view();

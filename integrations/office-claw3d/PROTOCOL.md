@@ -98,6 +98,10 @@ not stock Claw3D protocol. They carry complete roster replacement, floor, device
 project, status, provider, lane, model, tool name, task title and appearance
 (characterFamily, outfit, sprite). Stock Claw3D ignores them; nothing requires them.
 
+Office v1 workers (and a routed orchestrator) carry `local_backend`: `ollama` | `vllm-mlx` for
+a local worker whose node gate reported its backend, else null (additive since #77 round 1; an
+older provider omits it, and the adapter then falls back to the model id's shape).
+
 characterFamily is claude/codex/grok/ollama/local/unknown, and outfit is worker or suit
 (orchestrator). Mapping rules are in README "Appearance". Unknown provider gets the neutral
 `unknown` sprite, with provider kept null. The orchestrator's sprite comes from its
@@ -109,9 +113,6 @@ model name, but its published provider/lane stay null: never inferred.
   floors (sessions) and the lobby share it; each person's floor is in `office.floor`, and
   sessions are not separate rooms. Multi-floor (`docs/office_sys/multi-floor-runtime-architecture.md`
   upstream) is an upstream roadmap item, not a stable API.
-- **Ollama vs other local backends**: office v1 says `provider: local` and the lane key,
-  not the node's backend (`ollama` | `vllm-mlx`). The llama is chosen from the model id's
-  shape. office.py publishing the backend would make it exact.
 - **Grok workers**: office.py's `provider_of` maps only claude-cli, codex-cli and local-*,
   so no worker is `grok` today. The sprite and mapping are ready for when a grok lane exists.
 - **Desk count**: the default Claw3D office has 8 desks and office.py caps 32 workers

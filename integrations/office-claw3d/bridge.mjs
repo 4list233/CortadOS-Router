@@ -148,7 +148,9 @@ export function createBridge({ port = DEFAULT_PORT, origins = defaultOrigins(por
     res.writeHead(426, { 'Content-Type': 'text/plain', Connection: 'close' });
     res.end('WebSocket only\n');
   });
-  server.on('upgrade', (req, socket) => {
+  // `head`: bytes the client sent after the upgrade headers in the same packet (a pipelined connect frame). Node
+  // hands them here, not to the socket's 'data' event, so serveSocket feeds them through the same frame path.
+  server.on('upgrade', (req, socket, head) => {
     const refuse = status => {
       socket.end(`HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
       socket.destroy();
@@ -158,10 +160,10 @@ export function createBridge({ port = DEFAULT_PORT, origins = defaultOrigins(por
     if (clients.size >= MAX_CLIENTS) { log('Office bridge: client limit reached'); return refuse(503); }
     socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
       `Sec-WebSocket-Accept: ${acceptKey(req.headers['sec-websocket-key'])}\r\n\r\n`);
-    serveSocket(socket);
+    serveSocket(socket, head);
   });
 
-  function serveSocket(socket) {
+  function serveSocket(socket, head = null) {
     socket.setNoDelay(true);
     const client = { socket, authed: false, closed: false };
     clients.add(client);
@@ -216,7 +218,7 @@ export function createBridge({ port = DEFAULT_PORT, origins = defaultOrigins(por
     }
 
     let queue = Promise.resolve();
-    socket.on('data', chunk => {
+    function onData(chunk) {
       let parsed;
       try { parsed = reader.push(chunk); } catch (error) { return close(error instanceof CloseError ? error.code : 1002); }
       for (const { opcode, payload } of parsed) {
@@ -233,9 +235,11 @@ export function createBridge({ port = DEFAULT_PORT, origins = defaultOrigins(por
             typeof frame.method !== 'string' || frame.method.length > 64) continue;
         queue = queue.then(() => onRequest(frame)).catch(() => close(1011));
       }
-    });
+    }
+    socket.on('data', onData);
     socket.on('error', () => { client.closed = true; cleanup(); });
     socket.on('close', () => { client.closed = true; cleanup(); });
+    if (head?.length) onData(Buffer.from(head));       // same limits, rate cap and auth as any later chunk
   }
 
   return {
