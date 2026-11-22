@@ -9,7 +9,7 @@ import random
 import sys
 from collections import Counter, defaultdict
 
-from common import DATA, bands_only, core, read_jsonl, read_labels, valid_answers
+from common import DATA, bands_only, core, dumps_jsonl, read_jsonl, read_labels, valid_answers
 from student import messages
 
 
@@ -97,7 +97,7 @@ def main() -> int:
     out = DATA / "sft"
     out.mkdir(exist_ok=True)
     for name, rows in (("train", train), ("valid", valid)):
-        (out / f"{name}.jsonl").write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in rows) + "\n")
+        (out / f"{name}.jsonl").write_text("\n".join(dumps_jsonl(x) for x in rows) + "\n")
     print(f"labelled train-split requests {len(by_id)} · outcomes {o_n} · teacher+outcome bands {dict(bands)} · "
           f"sft train {len(train)} examples ({len(o_train)} from outcomes) · valid {len(valid)}")
     return 0

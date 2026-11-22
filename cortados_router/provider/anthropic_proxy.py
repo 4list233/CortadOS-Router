@@ -83,7 +83,7 @@ def _update_usage_from_sse(usage: dict[str, Any], text: str) -> tuple[bool, bool
     and has_usable_usage() can then reject it, rather than the stale estimate being settled."""
     saw_stop = False
     saw_final_output = False
-    for line in text.splitlines():
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):   # SSE line ends are CR, LF, CRLF only; never U+2028 in a data: JSON
         line = line.strip()
         if not line.startswith("data:"):
             continue

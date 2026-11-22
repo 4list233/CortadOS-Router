@@ -18,7 +18,7 @@ LENGTH_BUCKETS = [(50, "<50"), (200, "50-199"), (800, "200-799")]
 
 def load(path: Path) -> dict[str, dict]:
     rows = {}
-    for n, line in enumerate(path.read_text().splitlines(), 1):
+    for n, line in enumerate(path.read_text().split("\n"), 1):   # "\n" only: splitlines() also cuts at U+2028/U+2029/\x85 inside a JSON string
         if line.strip():
             try:
                 r = json.loads(line)

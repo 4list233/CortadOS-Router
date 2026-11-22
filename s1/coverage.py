@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from common import DATA, read_jsonl, split_of
+from common import DATA, dumps_jsonl, read_jsonl, split_of
 
 STATE = Path(os.environ.get("CORTADOS_HOME") or Path.home() / ".cortados")
 SYNTHETIC_SHARE = 0.35
@@ -77,7 +77,7 @@ def main() -> int:
                 if text in seen or added >= cap:
                     continue
                 rid = "syn." + cat + "." + hashlib.sha1(text.encode()).hexdigest()[:12]
-                f.write(json.dumps({"id": rid, "source": "synthetic-coverage:" + cat, "unit_kind": "interactive", "request": text, "split": split_of(rid)}, ensure_ascii=False) + "\n")
+                f.write(dumps_jsonl({"id": rid, "source": "synthetic-coverage:" + cat, "unit_kind": "interactive", "request": text, "split": split_of(rid)}) + "\n")
                 seen.add(text); added += 1
             print(f"{cat}: total added so far {added} (cap {cap})", flush=True)
     return 0

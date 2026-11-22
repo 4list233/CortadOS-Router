@@ -1043,7 +1043,9 @@ def change_since(hours: float = 24) -> dict[tuple[str, str], float]:
     # vendor probes every 15–30), so the row nearest the target rarely holds every lane (Codex review 2026-10-21).
     target, best = time.time() - hours * 3600, {}
     try:
-        for line in HISTORY.read_text().splitlines():
+        for line in HISTORY.read_text().split("\n"):   # "\n" only: splitlines() also cuts at U+2028/U+2029/\x85 inside a JSON string
+            if not line.strip():
+                continue
             row = json.loads(line)
             for lane, v in (row.get("lanes") or {}).items():
                 if lane not in best or abs(row["ts"] - target) < abs(best[lane][0] - target):

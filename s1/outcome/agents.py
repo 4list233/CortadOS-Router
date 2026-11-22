@@ -238,7 +238,7 @@ def _read_calls(path: str) -> list:
 def _claude_trace(out: str) -> dict:
     tools, final, usage, turns, is_error = collections.Counter(), "", {}, None, None
     revealed = None
-    for line in out.splitlines():
+    for line in out.split("\n"):   # "\n" only: splitlines() also cuts at U+2028/U+2029/\x85 inside a JSON string
         try:
             rec = json.loads(line)
         except ValueError:
@@ -262,7 +262,7 @@ def _claude_trace(out: str) -> dict:
 
 def _codex_trace(out: str) -> dict:
     kinds, final, usage = collections.Counter(), "", {}
-    for line in out.splitlines():
+    for line in out.split("\n"):   # "\n" only: splitlines() also cuts at U+2028/U+2029/\x85 inside a JSON string
         try:
             rec = json.loads(line)
         except ValueError:

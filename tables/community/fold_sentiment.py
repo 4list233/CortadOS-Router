@@ -16,7 +16,7 @@ def fold(max_points: float = 8.0, min_sources: int = 3, window_days: int = 30) -
     claims = []
     p = HERE / "claims.jsonl"
     if p.exists():
-        for line in p.read_text().splitlines():
+        for line in p.read_text().split("\n"):   # "\n" only: splitlines() also cuts at U+2028/U+2029/\x85 inside a JSON string
             try:
                 c = json.loads(line)
                 if time.time() - float(c.get("ts") or 0) <= window_days * 86400 and c.get("family") and c.get("use_case"):

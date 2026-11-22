@@ -711,7 +711,7 @@ def read_session(path: str | os.PathLike) -> Session:
     turn_ts: Optional[str] = None
     source: Optional[str] = None
     text = read_in(SESSIONS_DIR, name)
-    for line in text.splitlines():
+    for line in text.split("\n"):   # "\n" only: splitlines() also cuts at U+2028/U+2029/\x85 inside a JSON string
         line = line.strip()
         if not line:
             continue

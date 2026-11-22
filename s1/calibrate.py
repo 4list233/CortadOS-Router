@@ -438,7 +438,7 @@ class ScoreCache:
                 f.flush()
                 os.fsync(f.fileno())
             data = data[:end]
-        for line in data.decode(errors="replace").splitlines():     # a damaged line is dropped (rescored), never trusted
+        for line in data.decode(errors="replace").split("\n"):     # a damaged line is dropped (rescored), never trusted; "\n" only, as JSONL
             try:
                 o = json.loads(line)
                 self.rows[o["k"]] = o["p"]

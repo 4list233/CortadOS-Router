@@ -562,10 +562,79 @@ PY
         self.assertIn("--resume-adapter-file runs/2026-01-01/", (Path(self.env["HOME"]) / "lora.log").read_text())
 
     def _completed_unevaluated(self, name):
-        """A run whose LoRA finished (final adapters.safetensors) but was never evaluated: the recovery path's, not resumable."""
+        """A run whose LoRA finished but was never evaluated: the recovery path's, not resumable. Finished = mlx_lm logged
+        "Saved final weights" (the adapters.safetensors file alone is written at every checkpoint, so it proves nothing)."""
         run = self._stopped_mid_lora(name)
         (run / "adapter/adapters.safetensors").write_text("final")
+        (run / "nightly.log").write_text("Iter 300: Saved adapter weights to x/adapters.safetensors and x/0000300_adapters.safetensors.\n"
+                                         "Saved final weights to x/adapters.safetensors.\n")
         return run
+
+    def _stopped_after_a_checkpoint(self, name, target="1500", age_s=0):
+        """runs/2026-11-14 as the Studio has it: 100 of 1,500 steps, stopped. mlx_lm's checkpoint at step 100 wrote BOTH
+        0000100_adapters.safetensors and adapters.safetensors; the log has the checkpoint line and no end-of-training line."""
+        run = self._stopped_mid_lora(name, age_s=age_s)
+        (run / "segment-target").write_text(target + "\n")
+        fake_adapter(run / "adapter", "adapters.safetensors")
+        (run / "nightly.log").write_text("Iter 100: Saved adapter weights to x/adapters.safetensors and x/0000100_adapters.safetensors.\n")
+        if age_s:
+            old = _time.time() - age_s
+            for q in (run / "adapter/adapters.safetensors", run / "adapter", run):
+                os.utime(q, (old, old))
+        return run
+
+    def test_a_checkpointed_adapters_file_is_not_finished_training_and_the_run_resumes(self):
+        # Bug 2 (2026-11-22): the per-checkpoint adapters.safetensors made trained_unevaluated_runs adopt a 100/1500-step run as
+        # evaluation_pending, and every night window went to evaluating it. Now it is an unfinished run, resumed from step 100.
+        run = self._stopped_after_a_checkpoint("2026-01-01")
+        out = self._bare(CORTADOS_S1_CONTINUOUS=1, STUB_NEW_LABELS=5)
+        log = (run / "nightly.log").read_text()
+        self.assertEqual(out.returncode, 0, log)
+        self.assertNotIn("recovered runs/2026-01-01", log)
+        self.assertNotIn("pending candidate runs/2026-01-01", log)
+        self.assertIn("continuing the unfinished run runs/2026-01-01", log)
+        lora = (Path(self.env["HOME"]) / "lora.log").read_text()
+        self.assertIn("--resume-adapter-file runs/2026-01-01/adapter/resume_100_adapters.safetensors", lora)
+        self.assertIn("--iters 1400", lora)   # 1500 target - 100 checkpointed
+        self.assertTrue((run / "training-complete").is_file(), "the finished segment is recorded")
+        self.assertTrue((run / "report.json").is_file(), "evaluated only after its training finished")
+
+    def test_a_stale_pending_marker_on_an_unfinished_run_is_dropped_and_the_run_resumes(self):
+        # The Studio's state: data/pending-candidate already names the 100-step run as evaluation_pending.
+        run = self._stopped_after_a_checkpoint("2026-01-01")
+        (self.s1 / "data/pending-candidate").write_text("unknown unknown evaluation_pending runs/2026-01-01\n")
+        out = self._bare(CORTADOS_S1_CONTINUOUS=1, STUB_NEW_LABELS=5)
+        log = (run / "nightly.log").read_text()
+        self.assertEqual(out.returncode, 0, log)
+        self.assertIn("pending candidate runs/2026-01-01 (evaluation_pending) never finished training (100 of 1500 steps checkpointed): "
+                      "marker dropped", log)
+        self.assertNotIn("re-evaluating against the current holdout", log)
+        self.assertIn("--iters 1400", (Path(self.env["HOME"]) / "lora.log").read_text())
+        self.assertTrue((run / "adapter/resume_100_adapters.safetensors").exists())
+
+    def test_finished_runs_are_recovered_by_log_line_marker_or_checkpoint_at_target(self):
+        for how in ("log", "marker", "checkpoint"):
+            with self.subTest(how=how):
+                for q in (self.s1 / "runs", self.s1 / "data/pending-candidate"):
+                    shutil.rmtree(q, True) if q.is_dir() else q.unlink(missing_ok=True)
+                if how == "log":
+                    run = self._completed_unevaluated("2025-12-31")
+                elif how == "marker":
+                    run = self._stopped_after_a_checkpoint("2025-12-31")
+                    (run / "training-complete").write_text("1500\n")
+                else:   # iters-base 200 + checkpoint 100 = the 300-step target: finished even without a log
+                    run = self._stopped_after_a_checkpoint("2025-12-31", target="300")
+                    (run / "iters-base").write_text("200\n")
+                    (run / "nightly.log").unlink()
+                rc, log, _ = self.run_night(STUB_NEW_LABELS=2)
+                self.assertIn("recovered runs/2025-12-31", log)
+                self.assertNotIn("retention: removed checkpoints of unfinished runs/2025-12-31", log)
+                self.assertIn("PROMOTED (retry) runs/2025-12-31", log)
+
+    def test_a_finished_night_records_training_complete(self):
+        rc, log, run = self.run_night(STUB_NEW_LABELS=3)
+        self.assertEqual(rc, 0, log)
+        self.assertTrue((run / "training-complete").is_file(), log)
 
     def test_completed_unevaluated_run_does_not_hide_an_older_interrupted_run(self):
         # Review P2-b: newest_unfinished_run used to return the newer completed run, the carry rejected it, the older interrupted
