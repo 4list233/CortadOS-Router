@@ -1234,7 +1234,8 @@ class ChildTaskTests(ChildTaskBase):
             json.dump(jobs, f)
         if cmd == "bootstrap" and os.environ.get("FAKE_LAUNCHCTL_HANG"):
             import time
-            time.sleep(30)                                    # the job is loaded, but the answer never comes
+            open(log + ".hanging", "w").close()               # the job is loaded (tests wait for this) ...
+            time.sleep(30)                                    # ... but the answer never comes
     ''')
 
     def _gui_host(self, mode="run"):
@@ -1362,8 +1363,24 @@ class ChildTaskTests(ChildTaskBase):
         self.assertEqual(len(self._launchctl_calls()), 1)
 
     def _hanging_bootstrap(self, mode="run"):
+        # #115: a patched 1 s timeout raced the fake's interpreter start-up: on a loaded machine subprocess.run killed
+        # the fake before it had loaded the job, so no runner started. The timeout now fires only once the fake says
+        # the job is loaded (its ".hanging" marker), which is the state this helper stands for: loaded, no answer.
         self._gui_host(mode=mode)
-        for p in (mock.patch.dict(os.environ, {"FAKE_LAUNCHCTL_HANG": "1"}), mock.patch.object(ct, "LAUNCHCTL_TIMEOUT_S", 1),
+        real_run, marker = subprocess.run, self.launchctl_log + ".hanging"
+
+        def run(cmd, **kw):
+            if cmd[1:2] != ["bootstrap"]:
+                return real_run(cmd, **kw)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                self.assertTrue(_wait_file(marker, timeout=60), "the fake launchctl never loaded the job")
+            finally:
+                proc.kill()
+                proc.communicate()
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+
+        for p in (mock.patch.dict(os.environ, {"FAKE_LAUNCHCTL_HANG": "1"}), mock.patch.object(ct.subprocess, "run", run),
                   mock.patch("traceback.print_exc")):
             p.start()
             self.addCleanup(p.stop)
