@@ -619,6 +619,30 @@ def local_switch(provider_url: str, token: str, state: str, node: str | None = N
     return {"content": [{"type": "text", "text": scrub(json.dumps(data, indent=2))}]}
 
 
+# Arguments a tool takes, though its schema does not advertise them, from the MCP boundary. None today: the bot
+# gateway's list_tasks `ids` reaches call_child_tool directly, never through handle().
+UNADVERTISED_ARGS: dict = {}
+# Arguments callers reach for by another tool's name: named in the refusal so the caller fixes the call.
+ARG_HINTS = {("start_task", "model"): "start_task pins its model with `orchestrator`, not `model`"}
+
+
+def unknown_args(name: str, a: dict, tools: list) -> str | None:
+    """#120: the refusal text when `a` holds an argument tool `name` does not declare, else None. A silently ignored
+    argument is worse than a refused call: start_task with `model` ran routed while the caller believed it pinned a
+    reviewer. Checked against the schema advertised in tools/list, so the two never drift."""
+    schema = next((t.get("inputSchema", {}) for t in tools if t.get("name") == name), None)
+    if schema is None:
+        return None
+    known = set(schema.get("properties", {})) | set(UNADVERTISED_ARGS.get(name, ()))
+    extra = sorted(k for k in a if k not in known)
+    if not extra:
+        return None
+    hints = [ARG_HINTS[(name, k)] for k in extra if (name, k) in ARG_HINTS]
+    return (f"{name}: unknown argument{'s' if len(extra) > 1 else ''} {', '.join(repr(k[:60]) for k in extra[:10])}"
+            f"{' (and more)' if len(extra) > 10 else ''}; nothing was run. Valid arguments: "
+            f"{', '.join(sorted(schema.get('properties', {})))}." + "".join(f" Note: {h}." for h in hints))
+
+
 def handle(msg: dict, cfg: dict) -> dict | None:
     """One JSON-RPC message in, one reply message out (None for a notification). Pure, for tests. Validates shapes so a
     malformed request yields a JSON-RPC error instead of crashing the session."""
@@ -645,6 +669,9 @@ def handle(msg: dict, cfg: dict) -> dict | None:
         a = params.get("arguments")
         if not isinstance(a, dict):
             a = {}
+        refused = unknown_args(params.get("name"), a, [TOOL] + _child_tools() + [LOCAL_TOOL])
+        if refused:
+            return {**base, "result": _err(refused)}
         if params.get("name") in _CHILD_NAMES:
             return {**base, "result": call_child_tool(params["name"], a, cfg)}
         if params.get("name") == "local_switch":

@@ -530,10 +530,12 @@ class ChildTaskTests(ChildTaskBase):
         self.assertEqual(stat.S_IMODE(os.stat(ct.tasks_dir()).st_mode), 0o700)
         _, lst = self.call("list_tasks")
         self.assertEqual(lst["tasks"][0]["task_id"], tid)
-        _, only = self.call("list_tasks", ids=[tid, "t00000000000000-00000000"])   # bot gateway: owned ids only
-        self.assertEqual([t["task_id"] for t in only["tasks"]], [tid])
-        _, none = self.call("list_tasks", ids=[])
-        self.assertEqual(none["tasks"], [])
+        # bot gateway: owned ids only. It calls call_child_tool directly; over MCP `ids` is an unknown argument (#120).
+        ids = lambda v: json.loads(m.call_child_tool("list_tasks", {"ids": v}, self.cfg)["content"][0]["text"])
+        self.assertEqual([t["task_id"] for t in ids([tid, "t00000000000000-00000000"])["tasks"]], [tid])
+        self.assertEqual(ids([])["tasks"], [])
+        r, _ = self.call("list_tasks", ids=[tid])
+        self.assertIn("unknown argument 'ids'", r["content"][0]["text"])
 
     # ---- permission modes the child's model really supports (2026-11-02 E2E: haiku + auto denied every write)
     def test_auto_mode_support_follows_the_clis_rule(self):
