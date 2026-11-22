@@ -35,7 +35,9 @@ d: details
 `d` (or the `d: details` button) opens everything else, as described below: the work split and its `w` breakdown, the
 session's tree with sub-sessions and routed subagents, the notes, the fleet's hosts, usage, every lane, the local
 nodes and the devices. The privacy rule is unchanged: the pane reads only its own session's view, plus this machine's
-untagged tasks.
+untagged tasks. It asks for those with this machine's tag (`&machine=`, `machineTag`: a keyed hash of the same 0600
+Office salt the session tag comes from), never with its hostname: only a process that can read this machine's salt can
+name its untagged tasks. Without a readable salt the pane asks for its own session only.
 
 The sections below are the details view.
 

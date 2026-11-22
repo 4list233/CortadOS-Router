@@ -463,6 +463,35 @@ class TasksBlockTest(Base):
         self.assertEqual(set(last), {"host", "ttl_s", "jobs", "hardware", "s1"})   # never the jobs or hardware
         self.assertEqual(len(last["jobs"]), 2)
 
+    def test_a_provider_from_before_origin_machine_gets_the_tasks_without_it(self):
+        """Pulse review round 1: entries carry origin_machine (the untagged group's key). A provider from before it
+        refuses the unknown entry field (400): the block is sent again without the field, never dropped whole, and
+        the jobs stay."""
+        now = time.time()
+        tag = "9" * 16
+        log = [{"ts": now - 30, "event": "started", "task_id": "t20261122100000-00000001", "host": "pro",
+                "title": "Untagged", "origin_device": "pro", "origin_machine": tag},
+               {"ts": now - 20, "event": "started", "task_id": "t20261122100000-00000002", "host": "pro",
+                "title": "Tagged", "origin_session": "a" * 16, "origin_machine": tag}]
+        seen = []
+
+        def opener(req, timeout):
+            body = json.loads(req.data)
+            seen.append(body)
+            if any("origin_machine" in e for e in (body.get("tasks") or {}).get("items") or []):
+                raise urllib.error.HTTPError(req.full_url, 400, "bad", {}, io.BytesIO(
+                    b'{"type": "error", "error": {"message": "cortados: heartbeat field tasks.items[0] is invalid"}}'))
+            return FakeResponse(b"{}")
+        code, _, err = self.main("--config", str(self.config(host="pro")), opener=opener, task_events=lambda: log)
+        self.assertEqual(code, 0, err)
+        self.assertIn("without origin_machine", err)
+        self.assertEqual(len(seen), 2)
+        self.assertEqual({e["origin_machine"] for e in seen[0]["tasks"]["items"]}, {tag})   # this provider's body
+        self.assertIsNone(live.validate_heartbeat(seen[0], time.time())[1])
+        self.assertEqual(sorted(e["title"] for e in seen[1]["tasks"]["items"]), ["Tagged", "Untagged"])
+        self.assertNotIn(tag, json.dumps(seen[1]))
+        self.assertEqual([j["name"] for j in seen[1]["jobs"]], ["s1-scorer", "com.cortados.s1-nightly"])
+
     def test_tasks_config_is_a_switch(self):
         self.assertFalse(hbs.load_config(self.config(tasks=False))["tasks"])
         self.assertTrue(hbs.load_config(self.config())["tasks"])                # absent: on

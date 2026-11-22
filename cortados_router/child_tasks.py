@@ -184,6 +184,10 @@ REMOTE_STUB_MAX_BYTES = 16 * 1024
 # orchestrator. Not a task dir (the name never matches TASK_ID_RE). Written by _write_stub, read by remote_stubs_for,
 # pruned with its stubs by prune().
 ORIGIN_INDEX = "by-origin"
+# Under the tasks root: by-machine/<origin_machine>/<task id> (empty files), one per remote stub that carries NO origin
+# session but this machine's origin_machine tag: the session view's untagged group finds them without listing every task
+# dir (remote_stubs_for_machine). Written by _write_stub, pruned with ORIGIN_INDEX (review round 1 of the pulse branch).
+MACHINE_INDEX = "by-machine"
 WORKSPACE_FILE = "workspace.json"   # in the task dir on the host: the workspaces.prepare()/settle() record
 LAUNCHD_FILE = "launchd.json"       # in the task dir: {"label", "domain", "plist", "booted_out"} for a launchd task
 QUEUED_MARKER = "queued"            # in the task dir while the runner waits for the host's Chrome lock
@@ -719,7 +723,7 @@ def prune(root: str, now: float | None = None, errors: list | None = None, red=N
                 shutil.rmtree(d)
                 removed.append(name)
             elif state == "remote":             # a kept stub from before the index: indexed now (idempotent)
-                _index_origin(root, name, clean_origin_meta(meta.get("origin")).get("origin_session"))
+                _index_stub(root, name, clean_origin_meta(meta.get("origin")))
         except OSError as exc:
             if errors is not None:
                 errors.append(f"{name}: {type(exc).__name__}: {exc}")
@@ -728,16 +732,21 @@ def prune(root: str, now: float | None = None, errors: list | None = None, red=N
 
 
 def _prune_origin_index(root: str, errors: list | None = None) -> None:
-    """Drop origin-index entries whose task dir is gone (pruned above, or removed by hand), then empty origin dirs.
-    O(index entries); runs with prune(), never on a view."""
-    idx = os.path.join(root, ORIGIN_INDEX)
+    """Drop origin-index and machine-index entries whose task dir is gone (pruned above, or removed by hand), then
+    empty origin dirs. O(index entries); runs with prune(), never on a view."""
+    for index in (ORIGIN_INDEX, MACHINE_INDEX):
+        _prune_index(root, index, errors)
+
+
+def _prune_index(root: str, index: str, errors: list | None = None) -> None:
+    idx = os.path.join(root, index)
     try:
         origins = os.listdir(idx)
     except FileNotFoundError:
         return
     except OSError as exc:
         if errors is not None:
-            errors.append(f"{ORIGIN_INDEX}: {type(exc).__name__}")
+            errors.append(f"{index}: {type(exc).__name__}")
         return
     for origin in origins:
         od = os.path.join(idx, origin)
@@ -751,7 +760,7 @@ def _prune_origin_index(root: str, errors: list | None = None) -> None:
                 os.rmdir(od)
         except OSError as exc:
             if errors is not None:
-                errors.append(f"{ORIGIN_INDEX}/{origin}: {type(exc).__name__}")
+                errors.append(f"{index}/{origin}: {type(exc).__name__}")
 
 
 def _remove_settings(d: str) -> list:
@@ -901,7 +910,13 @@ def office_tags(cwd, title=None, session_tag=None) -> dict:
 BOT_ORIGIN = "grokbot"
 ORIGIN_NAMED = (BOT_ORIGIN,)    # origins that are not a session
 ORIGIN_SESSION_RE = re.compile("|".join([SESSION_TAG_RE.pattern] + [re.escape(n) for n in ORIGIN_NAMED]))
-ORIGIN_KEYS = ("origin_session", "origin_project", "origin_device")
+ORIGIN_KEYS = ("origin_session", "origin_project", "origin_device", "origin_machine")
+# origin_machine (pulse review round 1): an opaque keyed hash of the starting machine's Office salt
+# (subagent_mcp.machine_tag), recorded on EVERY task a cortados-route server with the salt starts, tagged or not. It is
+# the capability that opens a machine's untagged tasks in the session view (GET /v1/cortados/live/session
+# ?machine=<tag>): only a process that can read that machine's 0600 salt file can compute it. Never published by any
+# view or tool result; hostnames (origin_device) stay display-only.
+MACHINE_TAG_RE = SESSION_TAG_RE
 OFFICE_NAME_MAX = 64            # cortados-routed-subagents' OFFICE_NAME_MAX
 
 
@@ -922,7 +937,8 @@ def clean_origin(origin) -> dict:
     sess, proj, dev = o.get("session"), o.get("project"), o.get("device")
     ok = lambda v, rule: v if isinstance(v, str) and rule.fullmatch(v) else None
     return {"origin_session": ok(sess, ORIGIN_SESSION_RE),
-            "origin_project": ok(proj, _OFFICE_NAME_RE), "origin_device": ok(dev, _DEVICE_RE)}
+            "origin_project": ok(proj, _OFFICE_NAME_RE), "origin_device": ok(dev, _DEVICE_RE),
+            "origin_machine": ok(o.get("machine"), MACHINE_TAG_RE)}
 
 
 ORIGIN_HEADER = "x-cortados-origin"    # provider/office.ORIGIN_HEADER: the run's orchestrator, as the provider records it
@@ -980,18 +996,27 @@ def _write_stub(root: str, task_id: str, host_name: str, origin: dict | None = N
     if o:
         rec["origin"] = o
     _write_json(os.path.join(d, REMOTE_STUB), rec)
-    _index_origin(root, task_id, o.get("origin_session"))
+    _index_stub(root, task_id, o)
 
 
-def _index_origin(root: str, task_id: str, origin_session) -> None:
+def _index_stub(root: str, task_id: str, o: dict) -> None:
+    """A remote stub's index entry: under its origin session (ORIGIN_INDEX), or, with none, under its origin machine
+    (MACHINE_INDEX): the two lookups the session view makes (remote_stubs_for, remote_stubs_for_machine)."""
+    if o.get("origin_session"):
+        _index_origin(root, task_id, o.get("origin_session"))
+    elif o.get("origin_machine"):
+        _index_origin(root, task_id, o.get("origin_machine"), MACHINE_INDEX, MACHINE_TAG_RE)
+
+
+def _index_origin(root: str, task_id: str, origin_session, index: str = ORIGIN_INDEX, rule=ORIGIN_SESSION_RE) -> None:
     """Record a remote stub under its orchestrator in the origin index (<root>/by-origin/<origin>/<task id>, an empty
     file), so the live session view finds ONE session's stubs without listing every task dir (remote_stubs_for).
     Best effort: the stub itself is the record (the fleet view and status still find it); a failure is logged, never
     a failed start."""
-    if not isinstance(origin_session, str) or not ORIGIN_SESSION_RE.fullmatch(origin_session):
+    if not isinstance(origin_session, str) or not rule.fullmatch(origin_session):
         return
     try:
-        d = os.path.join(root, ORIGIN_INDEX, origin_session)
+        d = os.path.join(root, index, origin_session)
         os.makedirs(d, mode=0o700, exist_ok=True)
         os.close(os.open(os.path.join(d, task_id), os.O_WRONLY | os.O_CREAT, 0o600))
     except OSError as exc:
@@ -1664,7 +1689,7 @@ def clean_origin_meta(rec) -> dict:
     """meta.json's `origin` re-checked (the record is a file): its valid origin_* fields, None ones dropped."""
     r = rec if isinstance(rec, dict) else {}
     o = clean_origin({"session": r.get("origin_session"), "project": r.get("origin_project"),
-                      "device": r.get("origin_device")})
+                      "device": r.get("origin_device"), "machine": r.get("origin_machine")})
     return {k: v for k, v in o.items() if v}
 
 
@@ -2399,6 +2424,32 @@ def remote_stubs_for(origin) -> list:
     return out
 
 
+def remote_stubs_for_machine(machine) -> list:
+    """For GET /v1/cortados/live/session?machine=<tag>: the remote stubs started from here that carry NO origin session
+    and exactly this origin_machine tag, found through the machine index (by-machine/<tag>/) as remote_stubs_for finds
+    a session's: no other stub is read or counted. An entry whose stub is gone, unreadable, carries a session or another
+    machine tag is skipped. Read-only; a missing index (or root) is no stubs."""
+    out = StubList()
+    if not isinstance(machine, str) or not MACHINE_TAG_RE.fullmatch(machine):
+        return out
+    root = tasks_dir()
+    try:
+        names = sorted((x for x in os.listdir(os.path.join(root, MACHINE_INDEX, machine)) if TASK_ID_RE.fullmatch(x)),
+                       reverse=True)
+    except (FileNotFoundError, NotADirectoryError):
+        return out
+    out.truncated = len(names) > REMOTE_STUBS_SCAN
+    for tid in names[:REMOTE_STUBS_SCAN]:
+        try:
+            rec = _stub(os.path.join(root, tid))
+        except Exception:                       # a RecordError, or anything a planted stub makes the read raise
+            continue
+        o = clean_origin_meta(rec.get("origin")) if rec is not None else {}
+        if not o.get("origin_session") and o.get("origin_machine") == machine:
+            out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at"), **o})
+    return out
+
+
 def list_recent(n=20, ids=None) -> list:
     """`ids` (optional): list only these task ids (the bot gateway passes the ids it started, so a client's tasks
     stay listed however many newer tasks the owner has)."""
@@ -2440,6 +2491,8 @@ def list_recent(n=20, ids=None) -> list:
                     row.update(found[row["task_id"]], host=host)
                 else:
                     row["error"] = err or f"not listed by execution host '{host}' (pruned there?)"
+    for row in rows:
+        row.pop("origin_machine", None)         # a capability (ORIGIN_KEYS), never in a tool result
     return rows
 
 

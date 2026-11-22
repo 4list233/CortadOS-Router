@@ -99,9 +99,11 @@ const localHeld = atom({ plugin: 'cortados-pulse', key: 'local' } as const, null
 const wsOpen = atom({ plugin: 'cortados-pulse', key: 'wsOpen' } as const, false as boolean)
 // 0.6.3: everything but the five default lines sits behind `d` (the details), as the work split breakdown sits behind `w`
 const detailsOpen = atom({ plugin: 'cortados-pulse', key: 'detailsOpen' } as const, false as boolean)
-// 0.6.3: this machine's name as cortados-route records it (origin_device), looked up once: the session view is asked
-// for its tasks that carry no session tag too (&device=), so a task started through a server that knew no session
-// (the Claude desktop app's own cortados-route) is still shown, under its own heading
+// 0.6.3: this machine's tag as cortados-route records it (origin_machine: sha256("<salt>:cortados:machine") of the
+// machine's 0600 Office salt), computed once: the session view is asked for its tasks that carry no session tag too
+// (&machine=), so a task started through a server that knew no session (the Claude desktop app's own cortados-route)
+// is still shown, under its own heading. Only a process that reads this machine's salt can name it (review round 1:
+// the hostname was caller-supplied and opened another machine's tasks; it is display only now)
 const machine = atom({ plugin: 'cortados-pulse', key: 'machine' } as const, null as string | null)
 /** #127: GET /v1/cortados/local (provider/local_switch.py): the local nodes as their gates report them. */
 type NodesHeld = { data: PulseLocalView; at: number }
@@ -146,14 +148,28 @@ export async function sessionTag(salt: string, sessionId: string): Promise<strin
   return Array.from(new Uint8Array(buf), (b: number) => b.toString(16).padStart(2, '0')).join('').slice(0, 16)
 }
 
-/** This session's tag, or null with why (said in the pane). Never throws; never keeps the raw session id. */
-export async function identify($: Pick<EngineInterface, 'env' | 'fs' | 'session'>): Promise<Mine> {
-  let salt: string | null = null
+/** The machine's Office salt (32 lowercase hex), or null when the file is missing or holds anything else. */
+export async function readSalt($: Pick<EngineInterface, 'env' | 'fs'>): Promise<string | null> {
   try {
     const path = expandHome(String((await $.env.get('CORTADOS_OFFICE_SALT_FILE')) || OFFICE_SALT_FILE).trim(), await $.env.get('HOME'))
     const v = String(await $.fs.read(path)).trim()
-    if (/^[0-9a-f]{32}$/.test(v)) salt = v
-  } catch { /* said below */ }
+    return /^[0-9a-f]{32}$/.test(v) ? v : null
+  } catch { return null }
+}
+
+/** The machine tag's domain label (subagent_mcp.MACHINE_TAG_LABEL): a session id never holds ":", so no session tag
+ * is ever computed from the same input. */
+export const MACHINE_TAG_LABEL = 'cortados:machine'
+
+/** sha256("<salt>:cortados:machine") as hex, cut to 16: subagent_mcp.machine_tag, the origin_machine of every task this
+ * machine's cortados-route servers start. */
+export async function machineTag(salt: string): Promise<string> {
+  return sessionTag(salt, MACHINE_TAG_LABEL)
+}
+
+/** This session's tag, or null with why (said in the pane). Never throws; never keeps the raw session id. */
+export async function identify($: Pick<EngineInterface, 'env' | 'fs' | 'session'>): Promise<Mine> {
+  const salt = await readSalt($)
   if (!salt) return { tag: null, why: 'session not identified: no ' + OFFICE_SALT_FILE + ' yet (the cortados-route MCP server makes it)' }
   try {
     const id = await $.session.id()
@@ -164,24 +180,16 @@ export async function identify($: Pick<EngineInterface, 'env' | 'fs' | 'session'
   }
 }
 
-/** A device name normalised as cortados-route's child_tasks.office_name(device=True) and cortados-routed-subagents'
- * officeName do it: every run outside [A-Za-z0-9._-] becomes "-", trimmed, cut to 64; null without a letter or digit. */
-export function deviceName(s: unknown): string | null {
-  const t = String(s ?? '').replace(/[^A-Za-z0-9._-]+/g, '-').trim().slice(0, 64)
-  return /[A-Za-z0-9]/.test(t) ? t : null
-}
-
-/** This machine's short host name (`hostname -s`, as the MCP server's socket.gethostname().split(".")[0]) in the
- * device form, held once found; null when it cannot be read (then the untagged group is simply not asked for). */
-export async function machineName($: Pick<EngineInterface, 'process' | 'state'>): Promise<string | null> {
+/** This machine's tag (machineTag of its Office salt), held once computed; null without a salt (then the untagged
+ * group is simply not asked for: tasks of a server without the salt carry no machine tag either). */
+export async function machineKey($: Pick<EngineInterface, 'env' | 'fs' | 'state'>): Promise<string | null> {
   const known = await read($, machine)
   if (known) return known
-  try {
-    const r = await $.process.run(['/bin/hostname', '-s'])
-    const name = r && (r as any).exitCode === 0 ? deviceName(String((r as any).stdout ?? '').trim()) : null
-    if (name) await update($, machine, () => name)
-    return name
-  } catch { return null }                                   // no process access: the group is not asked for
+  const salt = await readSalt($)
+  if (!salt) return null
+  const tag = await machineTag(salt)
+  await update($, machine, () => tag)
+  return tag
 }
 
 /** `~` and `~/...` to $HOME (the only form the config documents; `~user` is left alone). */
@@ -423,8 +431,10 @@ async function pollLiveOnce($: LiveDollar, cfg: Cfg, me: boolean): Promise<void>
 export type SessionRead = { kind: 'held'; data: PulseSessionView; url: string } | { kind: 'absent' }
   | { kind: 'failed'; problem: string; pendingSince: number | null }
 
-export async function readSessionView($: LiveDollar, cfg: Cfg, tag: string, device: string | null = null): Promise<SessionRead> {
-  const f = await fetchView($, cfg, SESSION_PATH + '?session=' + tag + (device ? '&device=' + encodeURIComponent(device) : ''))
+export async function readSessionView($: LiveDollar, cfg: Cfg, tag: string, machineTagged: string | null = null): Promise<SessionRead> {
+  // &machine= only with a tag of the expected form (an older provider ignores the parameter: no untagged group)
+  const m = machineTagged && ORIGIN_TAG.test(machineTagged) ? '&machine=' + machineTagged : ''
+  const f = await fetchView($, cfg, SESSION_PATH + '?session=' + tag + m)
   if (f.ok) {
     const data = f.data as PulseSessionView
     return data.session_filter === tag && data.orchestrators && typeof data.orchestrators === 'object'
@@ -437,7 +447,7 @@ export async function readSessionView($: LiveDollar, cfg: Cfg, tag: string, devi
  * failed (401/403/5xx/network: said, the held subtree stays with its age). False only for a provider without the view
  * (404, or an answer that is not this session's subtree): the pane then falls back to the fleet view. */
 export async function fetchTree($: LiveDollar, cfg: Cfg, tag: string): Promise<boolean> {
-  const r = await readSessionView($, cfg, tag, await machineName($))
+  const r = await readSessionView($, cfg, tag, await machineKey($))
   if (r.kind === 'held') {
     const at = await $.clock.now()
     await update($, tree, () => ({ data: r.data, at, tag, base: r.url }))

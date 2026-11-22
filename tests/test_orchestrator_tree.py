@@ -668,30 +668,90 @@ class SessionEndpointTest(tl.EndpointHarness):
             "model": "cortados", "messages": [{"role": "user", "content": "x"}]})[0], 403)
         self.assertEqual(self.reg.sessions, {})
 
-    # 2026-11-22: ?device= adds the machine's untagged tasks (UntaggedDeviceTest below has the tree's rules)
-    def test_device_adds_the_untagged_group_and_a_bad_one_is_refused(self):
+    # 2026-11-22, review round 1: ?machine=<tag> adds the untagged tasks of the machine whose salt gives that tag
+    # (UntaggedMachineTest below has the tree's rules). The hostname opens nothing.
+    def _untagged_log(self):
         import time
         now = time.time()
         Path(self.home, "child-tasks.jsonl").write_text("".join(json.dumps(e) + "\n" for e in (
             {"ts": now - 30, "event": "started", "task_id": UNTAGGED, "title": "pstack plugin deep-read",
-             "host": "air", "origin_device": "Forests-MacBook-Pro", "prompt": SECRET},
+             "host": "air", "origin_device": "Forests-MacBook-Pro", "origin_machine": MACHINE_A, "prompt": SECRET},
+            # another machine whose display name is the SAME (two Macs both named Forests-MacBook-Pro)
+            {"ts": now - 25, "event": "started", "task_id": UNTAGGED_TWIN, "title": "Twin machine task",
+             "host": "air", "origin_device": "Forests-MacBook-Pro", "origin_machine": MACHINE_B},
             {"ts": now - 20, "event": "started", "task_id": UNTAGGED_ELSE, "title": "Untagged elsewhere",
-             "host": "air", "origin_device": "studio"},
+             "host": "air", "origin_device": "studio", "origin_machine": MACHINE_C},
+            # from before origin_machine: the device only
+            {"ts": now - 15, "event": "started", "task_id": UNTAGGED_OLD, "title": "Older untagged task",
+             "host": "air", "origin_device": "Forests-MacBook-Pro"},
             {"ts": now - 10, "event": "started", "task_id": "t20261111160000-0f0f0f0f", "origin_session": OTHER,
-             "origin_device": "Forests-MacBook-Pro", "title": "Not yours"})))
+             "origin_device": "Forests-MacBook-Pro", "origin_machine": MACHINE_A, "title": "Not yours"})))
+
+    def test_machine_adds_only_that_machines_untagged_group(self):
+        self._untagged_log()
         P = live.SESSION_PATH + "?session=" + MINE
         code, raw, _ = self.request("GET", P, SESSION_TOKEN)
         self.assertEqual(code, 200, raw)
         self.assertEqual(json.loads(raw)["orchestrators"]["items"], [])
-        code, raw, _ = self.request("GET", P + "&device=Forests-MacBook-Pro", SESSION_TOKEN)
+        code, raw, _ = self.request("GET", P + "&machine=" + MACHINE_A, SESSION_TOKEN)
         self.assertEqual(code, 200, raw)
         items = json.loads(raw)["orchestrators"]["items"]
-        self.assertEqual([(g["kind"], [t["task_id"] for t in g["tasks"]]) for g in items], [("untagged", [UNTAGGED])])
-        for bad in (SECRET, OTHER, "Not yours", "Untagged elsewhere"):
+        self.assertEqual([(g["kind"], g["device"], [t["task_id"] for t in g["tasks"]]) for g in items],
+                         [("untagged", "Forests-MacBook-Pro", [UNTAGGED])])
+        for bad in (SECRET, OTHER, "Not yours", "Untagged elsewhere", "Twin machine task", "Older untagged task",
+                    MACHINE_A, MACHINE_B, MACHINE_C, "origin_machine"):
             self.assertNotIn(bad, raw, bad)
-        for q in ("&device=", "&device=a%20b", "&device=pro&device=air"):
+
+    def test_a_foreign_or_guessed_machine_tag_sees_nothing_of_another_machine(self):
+        """Finding 1 (HIGH): the hostname was caller-supplied; now only the salt-derived tag opens a machine's group.
+        The twin with the same display name, a guessed tag and a session tag passed as a machine tag see nothing."""
+        self._untagged_log()
+        P = live.SESSION_PATH + "?session=" + MINE
+        for tag, want in ((MACHINE_B, [UNTAGGED_TWIN]), (MACHINE_C, [UNTAGGED_ELSE]), ("0" * 16, []),
+                          ("f" * 64, []), (MINE, []), (OTHER, [])):
+            code, raw, _ = self.request("GET", P + "&machine=" + tag, SESSION_TOKEN)
+            self.assertEqual(code, 200, (tag, raw))
+            got = [t["task_id"] for g in json.loads(raw)["orchestrators"]["items"] for t in g["tasks"]]
+            self.assertEqual(got, want, tag)
+            if tag != MACHINE_A:
+                for bad in ("pstack plugin deep-read", SECRET):
+                    self.assertNotIn(bad, raw, (tag, bad))
+
+    def test_a_hostname_opens_nothing_and_a_bad_tag_is_refused(self):
+        self._untagged_log()
+        P = live.SESSION_PATH + "?session=" + MINE
+        # ?device= is no longer read: the hostname is display only (an unknown parameter, as any other, is ignored)
+        code, raw, _ = self.request("GET", P + "&device=Forests-MacBook-Pro", SESSION_TOKEN)
+        self.assertEqual(code, 200, raw)
+        self.assertEqual(json.loads(raw)["orchestrators"]["items"], [])
+        for q in ("&machine=", "&machine=Forests-MacBook-Pro", "&machine=" + "a" * 15, "&machine=" + "a" * 65,
+                  "&machine=" + MACHINE_A.upper(), "&machine=%20" + MACHINE_A, "&machine=grokbot",
+                  "&machine=" + MACHINE_A + "&machine=" + MACHINE_B, "&machine=../" + MACHINE_A):
             code, raw, _ = self.request("GET", P + q, SESSION_TOKEN)
             self.assertEqual(code, 400, (q, raw))
+            self.assertNotIn("pstack", raw)
+
+    def test_untagged_remote_stubs_come_from_the_machine_index_only(self):
+        """Stubs written the way start_task writes them: an untagged one with MACHINE_A goes to by-machine/<A>, the
+        twin's to by-machine/<B>, a tagged one to by-origin only. The view with A reads A's index entry only."""
+        mine, twin, tagged = "t20261111080000-00000011", "t20261111080000-00000012", "t20261111080000-00000013"
+        child_tasks._write_stub(self.tasks, mine, "studio", {"origin_device": "pro", "origin_machine": MACHINE_A})
+        child_tasks._write_stub(self.tasks, twin, "studio", {"origin_device": "pro", "origin_machine": MACHINE_B})
+        child_tasks._write_stub(self.tasks, tagged, "studio", {"origin_session": OTHER, "origin_machine": MACHINE_A})
+        self.assertEqual(sorted(os.listdir(Path(self.tasks, child_tasks.MACHINE_INDEX))), sorted([MACHINE_A, MACHINE_B]))
+        self.assertEqual(os.listdir(Path(self.tasks, child_tasks.MACHINE_INDEX, MACHINE_A)), [mine])
+        P = live.SESSION_PATH + "?session=" + MINE + "&machine=" + MACHINE_A
+        code, raw, _ = self.request("GET", P, SESSION_TOKEN)
+        self.assertEqual(code, 200, raw)
+        items = json.loads(raw)["orchestrators"]["items"]
+        self.assertEqual([(g["kind"], [t["task_id"] for t in g["tasks"]]) for g in items], [("untagged", [mine])])
+        for bad in (twin, tagged, MACHINE_A, MACHINE_B):
+            self.assertNotIn(bad, raw, bad)
+        # the owner's fleet view lists every stub, and publishes no machine tag
+        code, raw, _ = self.request("GET", live.LIVE_PATH, tl.TOKEN)
+        self.assertEqual(code, 200, raw)
+        for bad in (MACHINE_A, MACHINE_B, "origin_machine"):
+            self.assertNotIn(bad, raw, bad)
 
     def test_a_routed_run_is_a_sub_session_of_its_task(self):
         import time
@@ -1567,30 +1627,47 @@ class WorkSplitSessionTest(unittest.TestCase):
 
 
 # ================================================================ tasks with no session tag (desktop-app server)
-UNTAGGED = "t20261122152600-6a026c40"       # started on "pro" through a server that knew no session: no origin tag
+UNTAGGED = "t20261122152600-6a026c40"       # started on machine A through a server that knew no session: no origin tag
 UNTAGGED_KID = "t20261122152700-6a026c41"   # nested under UNTAGGED, no origin of its own either
-UNTAGGED_ELSE = "t20261122152800-6a026c42"  # no origin tag, started on another machine
+UNTAGGED_ELSE = "t20261122152800-6a026c42"  # no origin tag, started on another machine (C)
+UNTAGGED_TWIN = "t20261122152900-6a026c43"  # no origin tag, machine B: SAME display name as A
+UNTAGGED_OLD = "t20261122153000-6a026c44"   # no origin tag and no origin_machine (from before review round 1)
+TAGGED_A = "t20261122153100-6a026c45"       # OTHER's, started on machine A: tagged, never untagged
+# the machines' tags, as subagent_mcp.machine_tag computes them from each machine's own salt
+from cortados_router import subagent_mcp as _mcp                     # noqa: E402
+MACHINE_A = _mcp.machine_tag("a" * 32)
+MACHINE_B = _mcp.machine_tag("b" * 32)
+MACHINE_C = _mcp.machine_tag("c" * 32)
 
 
 def untagged_events():
     base = {"cwd": "/Users/someone/secret-project", "chrome": False, "prompt": SECRET}
     return events() + [
-        {"ts": NOW - 90, "event": "started", "task_id": UNTAGGED, **base, "origin_device": "pro", "host": "air",
-         "model": "gpt-6.1", "title": "pstack plugin deep-read"},
-        {"ts": NOW - 80, "event": "started", "task_id": UNTAGGED_KID, **base, "origin_device": "pro", "host": "air",
-         "title": "Its nested step", "parent_task_id": UNTAGGED},
+        {"ts": NOW - 90, "event": "started", "task_id": UNTAGGED, **base, "origin_device": "pro",
+         "origin_machine": MACHINE_A, "host": "air", "model": "gpt-6.1", "title": "pstack plugin deep-read"},
+        {"ts": NOW - 80, "event": "started", "task_id": UNTAGGED_KID, **base, "origin_device": "pro",
+         "origin_machine": MACHINE_A, "host": "air", "title": "Its nested step", "parent_task_id": UNTAGGED},
         {"ts": NOW - 70, "event": "started", "task_id": UNTAGGED_ELSE, **base, "origin_device": "studio",
-         "host": "air", "title": "Untagged elsewhere"},
+         "origin_machine": MACHINE_C, "host": "air", "title": "Untagged elsewhere"},
+        # finding 2: the display names collide ("desk é" and "desk 中" both normalise to "desk-"); the tags do not
+        {"ts": NOW - 65, "event": "started", "task_id": UNTAGGED_TWIN, **base, "origin_device": "pro",
+         "origin_machine": MACHINE_B, "host": "air", "title": "Twin machine task"},
+        {"ts": NOW - 60, "event": "started", "task_id": UNTAGGED_OLD, **base, "origin_device": "pro",
+         "host": "air", "title": "Older untagged task"},
+        {"ts": NOW - 55, "event": "started", "task_id": TAGGED_A, **base, "origin_session": OTHER,
+         "origin_device": "pro", "origin_machine": MACHINE_A, "host": "air", "title": "Tagged on A"},
     ]
 
 
-class UntaggedDeviceTest(unittest.TestCase):
+class UntaggedMachineTest(unittest.TestCase):
     """2026-11-22: tasks started from a Claude desktop-app Code session through the app's own cortados-route server
-    carry no origin tag (origin_device only). A session's view with ?device= shows its machine's untagged tasks as one
-    group of kind "untagged"; never another session's tasks, another machine's, the bot's or a tagged nested task."""
+    carry no origin tag. Review round 1: a session's view with ?machine=<tag> (the keyed hash of the machine's 0600
+    salt) shows the untagged tasks recorded with exactly that tag as one group of kind "untagged"; never another
+    session's tasks, another machine's (whatever its display name), the bot's, a tagged task or an older task with no
+    machine tag."""
 
     def test_the_machines_untagged_tasks_are_their_own_group(self):
-        v = view(MINE, child_events=untagged_events, untagged_device="pro")
+        v = view(MINE, child_events=untagged_events, untagged_machine=MACHINE_A)
         o = v["orchestrators"]
         g = groups(v)
         self.assertEqual(set(g), {MINE, None})
@@ -1599,32 +1676,81 @@ class UntaggedDeviceTest(unittest.TestCase):
         self.assertEqual([t["task_id"] for t in u["tasks"]], [UNTAGGED])
         self.assertEqual(ids(u["tasks"][0]), [UNTAGGED_KID])            # nested under its parent, same group
         self.assertEqual(u["counts"]["running"], 2)
-        self.assertEqual(o["untagged_device"], "pro")
+        self.assertNotIn("untagged_device", o)
         self.assertEqual(g[MINE]["kind"], "session")                     # the session's own group is unchanged
-        raw = json.dumps(v["orchestrators"])
-        for bad in (UNTAGGED_ELSE, "Untagged elsewhere", LEGACY, "Legacy task", BOT, OTHER, THEIRS, SECRET):
+        self.assertEqual(ids(g[MINE]), ids(groups(view(MINE))[MINE]))
+        raw = json.dumps(v)
+        for bad in (UNTAGGED_ELSE, "Untagged elsewhere", UNTAGGED_TWIN, "Twin machine task", UNTAGGED_OLD,
+                    "Older untagged task", TAGGED_A, "Tagged on A", LEGACY, "Legacy task", BOT, OTHER, THEIRS, SECRET,
+                    MACHINE_A, MACHINE_B, MACHINE_C, "origin_machine"):
             self.assertNotIn(bad, raw, bad)
         # the session's group first: an untagged group sorts with the unattributed, after the sessions
         self.assertEqual(o["items"][0]["origin"], MINE)
 
-    def test_without_device_or_without_session_nothing_changes(self):
+    def test_colliding_display_names_never_see_each_others_tasks(self):
+        """Finding 2 (MEDIUM): A and B share the display name "pro"; each tag sees its own task only."""
+        for tag, own, foreign in ((MACHINE_A, UNTAGGED, UNTAGGED_TWIN), (MACHINE_B, UNTAGGED_TWIN, UNTAGGED)):
+            v = view(MINE, child_events=untagged_events, untagged_machine=tag)
+            u = groups(v)[None]
+            self.assertEqual(u["device"], "pro")
+            self.assertEqual([t["task_id"] for t in u["tasks"]], [own])
+            self.assertNotIn(foreign, json.dumps(v))
+        self.assertEqual(child_tasks.office_name("desk é", device=True), child_tasks.office_name("desk 中", device=True))
+        self.assertNotEqual(_mcp.machine_tag("d" * 32), _mcp.machine_tag("e" * 32))
+
+    def test_a_tag_no_task_carries_sees_nothing_and_older_tasks_never_show(self):
+        for tag in ("0" * 16, "f" * 64, MINE, OTHER):
+            v = view(MINE, child_events=untagged_events, untagged_machine=tag)
+            self.assertEqual(set(groups(v)), {MINE}, tag)
+        # an older task (no origin_machine) is never matched, whatever tag is asked
+        for tag in (MACHINE_A, MACHINE_B, MACHINE_C):
+            self.assertNotIn(UNTAGGED_OLD, json.dumps(view(MINE, child_events=untagged_events, untagged_machine=tag)))
+
+    def test_without_machine_or_without_session_nothing_changes(self):
         plain = view(MINE, child_events=untagged_events)
         self.assertEqual(set(groups(plain)), {MINE})
-        self.assertNotIn("untagged_device", plain["orchestrators"])
         self.assertNotIn(UNTAGGED, json.dumps(plain["orchestrators"]))
-        # the fleet view keeps its unattributed group; untagged_device has no effect there
-        fleet = view(None, child_events=untagged_events, untagged_device="pro")
+        # the fleet view keeps its unattributed group (older tasks too); untagged_machine has no effect there, and it
+        # publishes no machine tag anywhere (tasks section, tree, elsewhere)
+        fleet = view(None, child_events=untagged_events, untagged_machine=MACHINE_A)
         self.assertEqual(groups(fleet)[None]["kind"], "unattributed")
-        self.assertIn(UNTAGGED, ids(groups(fleet)[None]))
+        self.assertTrue({UNTAGGED, UNTAGGED_TWIN, UNTAGGED_OLD} <= set(ids(groups(fleet)[None])))
+        raw = json.dumps(fleet)
+        for bad in (MACHINE_A, MACHINE_B, MACHINE_C, "origin_machine"):
+            self.assertNotIn(bad, raw, bad)
 
     def test_a_tag_that_has_no_tasks_still_gets_its_machines_untagged_ones(self):
-        v = view("cccccccccccccccc", child_events=untagged_events, untagged_device="pro")
+        v = view("cccccccccccccccc", child_events=untagged_events, untagged_machine=MACHINE_A)
         self.assertEqual([(g["origin"], g["kind"]) for g in v["orchestrators"]["items"]], [(None, "untagged")])
         sv = live.session_view(v, "cccccccccccccccc")
         self.assertEqual([g["kind"] for g in sv["orchestrators"]["items"]], ["untagged"])
 
-    def test_valid_device(self):
-        for ok in ("pro", "Forests-MacBook-Pro", "air.local"):
-            self.assertEqual(live.valid_device(ok), ok)
-        for bad in ("", "a b", "x" * 65, None, 7, "../etc"):
-            self.assertIsNone(live.valid_device(bad), bad)
+    def test_a_heartbeat_cannot_move_a_task_into_another_machines_group(self):
+        """A host's report is checked against the provider host's own stub: a report claiming another machine tag
+        than the stub's is a conflict (dropped); a report with none (an older host) keeps the stub's tag."""
+        tid_a, tid_b = "t20261122154000-6a026c50", "t20261122154100-6a026c51"
+        stubs = [{"task_id": tid_a, "host": "air", "created_at": NOW - 40, "origin_machine": MACHINE_A},
+                 {"task_id": tid_b, "host": "air", "created_at": NOW - 40, "origin_machine": MACHINE_B}]
+        beats = {"air": {"received_at": NOW - 5, "ttl_s": 900, "jobs": [], "tasks": {"items": [
+            {"task_id": tid_a, "host": "air", "state": "running", "started_at": NOW - 39, "title": "A's own"},
+            {"task_id": tid_b, "host": "air", "state": "running", "started_at": NOW - 39, "title": "Moved to A",
+             "origin_machine": MACHINE_A}], "truncated": False}}}
+        v = view(MINE, child_events=events, remote_stubs=lambda: stubs, heartbeats=lambda: beats,
+                 machine_stubs=lambda tag: child_tasks.StubList(x for x in stubs if x["origin_machine"] == tag),
+                 untagged_machine=MACHINE_A)
+        u = groups(v)[None]
+        self.assertEqual([(t["task_id"], t["title"]) for t in u["tasks"]], [(tid_a, "A's own")])
+        self.assertNotIn("Moved to A", json.dumps(v))
+        vb = view(MINE, child_events=events, remote_stubs=lambda: stubs, heartbeats=lambda: beats,
+                  machine_stubs=lambda tag: child_tasks.StubList(x for x in stubs if x["origin_machine"] == tag),
+                  untagged_machine=MACHINE_B)
+        self.assertEqual([t["task_id"] for t in groups(vb)[None]["tasks"]], [tid_b])   # B's stub, never A's report
+        self.assertNotIn("Moved to A", json.dumps(vb))
+
+    def test_valid_machine(self):
+        for ok in (MACHINE_A, "0" * 16, "f" * 64):
+            self.assertEqual(live.valid_machine(ok), ok)
+        for bad in ("", "pro", "Forests-MacBook-Pro", "a" * 15, "a" * 65, MACHINE_A.upper(), "grokbot", None, 7,
+                    "../" + MACHINE_A, MACHINE_A + "\n"):
+            self.assertIsNone(live.valid_machine(bad), bad)
+        self.assertFalse(hasattr(live, "valid_device"))

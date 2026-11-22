@@ -177,7 +177,7 @@ export interface PulseTreeTask {
 }
 export interface PulseOrchestrator {
   origin?: string | null
-  // 'untagged' (0.6.3): this machine's tasks that carry no session tag, in a session view asked with &device=
+  // 'untagged' (0.6.3): this machine's tasks that carry no session tag, in a session view asked with &machine=
   kind?: 'session' | 'bot' | 'unattributed' | 'untagged' | string
   project?: string | null
   device?: string | null
@@ -201,8 +201,7 @@ export interface PulseSessionView {
   // scope "provider host and heartbeats": the tree also holds the tasks the hosts' heartbeats carry (#118),
   // task_hosts names those hosts
   orchestrators?: PulseLiveSection & { items?: PulseOrchestrator[]; scope?: string; truncated?: boolean;
-    inputs_truncated?: string[]; session_filter?: string; task_hosts?: string[]; conflicts?: number;
-    untagged_device?: string }
+    inputs_truncated?: string[]; session_filter?: string; task_hosts?: string[]; conflicts?: number }
   s1?: PulseLive['s1']
   hosts?: PulseLive['hosts']
   /** #127: this session's own work split row only (provider/work_split.session_split) */
@@ -291,7 +290,7 @@ declare module 'claude-code' {
       aliasErr: { tag: string; problem: string; pendingSince: number | null } | null
       /** 0.6.3: the details (the `d` button): everything but the default view's five lines */
       detailsOpen: boolean
-      /** 0.6.3: this machine's name as cortados-route records origin_device (`hostname -s`), once found */
+      /** 0.6.3: this machine's tag as cortados-route records origin_machine (machineTag of the Office salt), once computed */
       machine: string | null
     }
   }

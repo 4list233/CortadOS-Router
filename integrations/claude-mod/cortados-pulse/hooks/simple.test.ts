@@ -2,8 +2,8 @@
 // machine's tasks that carry no session tag (started through a cortados-route server that knew no session, such as
 // the Claude desktop app's own). Fakes only: no provider, no process is reached.
 import { test, expect, mock } from 'claude-code/testing'
-import { taskRow, taskRows, defaultTaskLines, localModelLine, subsLine, s1Line, deviceName, machineName, fetchTree,
-  sessionTag, FALLBACK, FINISHED_SHOWN, TITLE_MAX, NO_TASKS, UNTAGGED_HEAD } from './register'
+import { taskRow, taskRows, defaultTaskLines, localModelLine, subsLine, s1Line, machineTag, machineKey, fetchTree,
+  sessionTag, FALLBACK, FINISHED_SHOWN, TITLE_MAX, NO_TASKS, UNTAGGED_HEAD, MACHINE_TAG_LABEL } from './register'
 
 const TOKEN = 'sekrit-token-123'
 const MINE = 'aaaaaaaaaaaaaaa1'
@@ -99,44 +99,56 @@ test('S1 in one line: up with the median, down with the reason', () => {
   expect(s1Line(null)).toBe('S1 unknown')
 })
 
-test('this machine is named as cortados-route names origin_device, once', async () => {
-  expect(deviceName('Forests-MacBook-Pro')).toBe('Forests-MacBook-Pro')
-  expect(deviceName('my host!')).toBe('my-host-')
-  expect(deviceName('  ')).toBe(null)
-  const runs: (readonly string[])[] = []
-  const state = new Map<string, unknown>()
-  const $ = {
-    process: { run: async (argv: readonly string[]) => { runs.push(argv); return { exitCode: 0, stdout: 'Forests-MacBook-Pro\n', stderr: '' } } },
-    state: { get: async (r: any) => ({ value: state.get(r.key), version: 0 }),
-      set: async (r: any, v: unknown) => { state.set(r.key, v); return { isSet: true, version: 1 } } },
-  }
-  expect(await machineName($ as any)).toBe('Forests-MacBook-Pro')
-  expect(await machineName($ as any)).toBe('Forests-MacBook-Pro')
-  expect(runs).toEqual([['/bin/hostname', '-s']])                // looked up once
-  const failing = { ...$, process: { run: async () => ({ exitCode: 1, stdout: '', stderr: 'no' }) } }
-  state.clear()
-  expect(await machineName(failing as any)).toBe(null)
-  const throwing = { ...$, process: { run: async () => { throw new Error('no process access') } } }
-  expect(await machineName(throwing as any)).toBe(null)
+// review round 1: the untagged group is opened by this machine's tag (a keyed hash of its 0600 Office salt), never by
+// a hostname: the provider returns only tasks recorded with exactly that tag
+const SALT_V = '0123456789abcdef0123456789abcdef'
+const MACHINE_V = '522d8f041e1bc8d0'   // python3 -c "from cortados_router import subagent_mcp as m; print(m.machine_tag(SALT))"
+
+test('the machine tag is subagent_mcp.machine_tag of the salt, never a session tag', async () => {
+  expect(await machineTag(SALT_V)).toBe(MACHINE_V)
+  expect(MACHINE_TAG_LABEL).toBe('cortados:machine')
+  expect(await machineTag('f'.repeat(32))).not.toBe(MACHINE_V)
+  expect(await sessionTag(SALT_V, 'machine')).not.toBe(MACHINE_V)
 })
 
-test('the session view is asked with &device= when this machine is named, and without it otherwise', async () => {
-  for (const [stdout, code, want] of [['Forests-MacBook-Pro\n', 0, '&device=Forests-MacBook-Pro'], ['', 1, '']] as const) {
+function saltFake(salt: string | null, reads: string[] = []) {
+  const state = new Map<string, unknown>()
+  return {
+    env: { get: async (n: string) => n === 'HOME' ? '/tmp/pulse-home' : n === 'CORTADOS_PROVIDER_URL' ? 'http://air.example:8432' : undefined },
+    fs: { read: async (p: string) => { reads.push(p); if (salt !== null && p === '/tmp/pulse-home/.config/cortados/office-salt') return salt
+      throw new Error('ENOENT') }, stat: async () => { throw new Error('ENOENT') } },
+    process: { run: async () => { throw new Error('the pane runs no process for this') } },
+    state: { get: async (r: any) => ({ value: state.get(r.key), version: 0 }),
+      set: async (r: any, v: unknown) => { state.set(r.key, v); return { isSet: true, version: 1 } } },
+    clock: { now: async () => 1_700_000_000_000, every: () => ({ cancel() {} }), after: () => ({ cancel() {} }) },
+  }
+}
+
+test('this machine\'s tag comes from its salt, once; no salt or a bad salt is no tag', async () => {
+  const reads: string[] = []
+  const $ = saltFake(SALT_V, reads)
+  expect(await machineKey($ as any)).toBe(MACHINE_V)
+  expect(await machineKey($ as any)).toBe(MACHINE_V)
+  expect(reads.length).toBe(1)                                   // computed once, then held
+  expect(await machineKey(saltFake(null) as any)).toBe(null)
+  expect(await machineKey(saltFake('not-a-salt') as any)).toBe(null)
+})
+
+test('the session view is asked with &machine= when the salt is readable, never with a hostname', async () => {
+  for (const [salt, want] of [[SALT_V, '&machine=' + MACHINE_V], [null, '']] as const) {
     const urls: string[] = []
-    const state = new Map<string, unknown>()
-    const $ = {
-      env: { get: async (n: string) => n === 'CORTADOS_PROVIDER_URL' ? 'http://air.example:8432' : undefined },
-      fs: { read: async () => { throw new Error('ENOENT') }, stat: async () => { throw new Error('ENOENT') } },
-      process: { run: async () => ({ exitCode: code, stdout, stderr: '' }) },
-      http: { fetch: async (url: string) => { urls.push(url)
-        return { status: 200, ok: true, headers: {}, text: JSON.stringify({ session_filter: MINE, orchestrators: { status: 'ok', items: [] } }) } } },
-      state: { get: async (r: any) => ({ value: state.get(r.key), version: 0 }),
-        set: async (r: any, v: unknown) => { state.set(r.key, v); return { isSet: true, version: 1 } } },
-      clock: { now: async () => 1_700_000_000_000, every: () => ({ cancel() {} }), after: () => ({ cancel() {} }) },
-    }
+    const $ = { ...saltFake(salt), http: { fetch: async (url: string) => { urls.push(url)
+      return { status: 200, ok: true, headers: {}, text: JSON.stringify({ session_filter: MINE, orchestrators: { status: 'ok', items: [] } }) } } } }
     expect(await fetchTree($ as any, { ...FALLBACK, providerToken: TOKEN }, MINE)).toBe(true)
     expect(urls).toEqual(['http://air.example:8432/v1/cortados/live/session?session=' + MINE + want])
+    expect(urls[0]!.includes('device=')).toBe(false)
+    if (salt) expect(urls[0]!.includes(salt)).toBe(false)        // the salt itself never leaves the machine
   }
+})
+
+test('an older provider that ignores &machine= answers without the untagged group: only the session\'s own tasks', () => {
+  const v = { session_filter: MINE, orchestrators: { status: 'ok', items: [] } } as any
+  expect(defaultTaskLines(v, MINE, 0).map(l => l.text)).toEqual([NO_TASKS])
 })
 
 test('the mounted pane shows this machine\'s untagged tasks when this session has none', { options: { providerUrl: 'http://air.example:8432', providerToken: TOKEN } }, async ($, on) => {
@@ -152,14 +164,12 @@ test('the mounted pane shows this machine\'s untagged tasks when this session ha
     throw new Error('ENOENT')
   })
   on('fs.stat', async () => { throw new Error('ENOENT') })
-  on('process.run', async (_$, e) => ({ value: (e as any).argv?.[0] === '/bin/hostname'
-    ? { exitCode: 0, stdout: 'Forests-MacBook-Pro\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
-    : { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('process.run', async () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   const urls: string[] = []
   on('http.fetch', async (_$, e) => {
     urls.push(e.url)
     const view = { session_filter: tag, overview: { s1: 'up' }, s1: { latency_ms: 9 }, orchestrators: { status: 'ok', errors: [],
-      untagged_device: 'Forests-MacBook-Pro', items: [{ origin: null, kind: 'untagged', device: 'Forests-MacBook-Pro',
+      items: [{ origin: null, kind: 'untagged', device: 'Forests-MacBook-Pro',
         tasks: [{ task_id: 't20261122152600-6a026c4f', title: 'pstack plugin deep-read', host: 'air', model: 'gpt-6.1-sol',
           status: 'running', state: 'running', started_at: 1_799_999_900, elapsed_s: 100 }] }] } }
     const body = e.url.includes('/v1/cortados/live/session') ? view : e.url.endsWith('/v1/cortados/local') ? { nodes: [] } : { subscriptions: {}, readings: {} }
@@ -172,7 +182,9 @@ test('the mounted pane shows this machine\'s untagged tasks when this session ha
   const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
   expect(texts.slice(0, 4)).toEqual(["This session's child tasks", NO_TASKS, UNTAGGED_HEAD + ' (Forests-MacBook-Pro)',
     '● pstack plugin deep-read · air · gpt-6.1-sol · running · 1m 40s'])
-  expect(urls.some(u => u.endsWith('/v1/cortados/live/session?session=' + tag + '&device=Forests-MacBook-Pro'))).toBe(true)
+  const mtag = await machineTag(SALT)
+  expect(urls.some(u => u.endsWith('/v1/cortados/live/session?session=' + tag + '&machine=' + mtag))).toBe(true)
+  expect(urls.some(u => u.includes('device='))).toBe(false)
   expect(texts.join('\n').includes(TOKEN)).toBe(false)
   await ui.unmount()
 })

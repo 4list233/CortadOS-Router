@@ -2225,21 +2225,24 @@ class Handler(BaseHTTPRequestHandler):
             # live:session token reads only a subtree whose tag it already holds (docs/PULSE-PER-SESSION.md).
             if not self._owner_or_session("GET"):
                 return self._refuse_auth()
-            # blank values kept: an empty ?device= is a bad name (400), never silently dropped
+            # blank values kept: an empty ?machine= is a bad tag (400), never silently dropped
             q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)
             sess = q.get("session")
             if not sess or len(sess) != 1 or live.valid_session(sess[0]) is None:
                 return self._error(400, "invalid_request_error",
                                    "cortados: session is required and must be " + live.SESSION_FILTER_RULE)
-            # ?device=<name> (optional): also that machine's tasks that carry no session tag (live.orchestrators_section
-            # untagged_device; a start through a cortados-route server that knew no session, docs/PULSE-PER-SESSION.md
-            # §11). A bad name is a 400, never ignored.
-            dev = q.get("device")
-            if dev is not None and (len(dev) != 1 or live.valid_device(dev[0]) is None):
-                return self._error(400, "invalid_request_error", "cortados: device must be one Office device name")
+            # ?machine=<tag> (optional): also the tasks that carry no session tag and this origin_machine tag
+            # (live.orchestrators_section untagged_machine; a start through a cortados-route server that knew no
+            # session, docs/PULSE-PER-SESSION.md §11). The tag is a keyed hash of the starting machine's 0600 Office
+            # salt, so the caller proves it runs there; a hostname opens nothing (review round 1: ?device= was
+            # caller-supplied and bound to nothing, so any live:session token could read another machine's untagged
+            # tasks). A bad tag is a 400, never ignored; ?device= is no longer read.
+            mach = q.get("machine")
+            if mach is not None and (len(mach) != 1 or live.valid_machine(mach[0]) is None):
+                return self._error(400, "invalid_request_error", "cortados: machine must be " + live.MACHINE_FILTER_RULE)
             try:
                 body = self.server.live_body(self.server.registry, sess[0], session_view=True,
-                                             device=dev[0] if dev else None)
+                                             machine=mach[0] if mach else None)
             except Exception as exc:
                 logger.warning("live: session view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: live view unavailable (see provider log)")
@@ -4029,20 +4032,20 @@ class ProviderServer(ThreadingHTTPServer):
         return local_switch.switch(node, on)
 
     def live_body(self, registry: Registry, session: str | None = None, session_view: bool = False,
-                  device: str | None = None) -> bytes:
+                  machine: str | None = None) -> bytes:
         """The encoded live view, memoised live.MEMO_S with single flight (live.Memo): every dashboard tab and pulse
         pane polling at once costs one collect per view (the fleet, each ?session=). A heartbeat post (the board's
         generation) invalidates it. `session` must already be valid (live.valid_session)."""
         from cortados_router import paths
-        key = (str(paths.state_dir()), id(registry), registry.live.generation, session, session_view, device)
+        key = (str(paths.state_dir()), id(registry), registry.live.generation, session, session_view, machine)
         if session_view:                                # GET /v1/cortados/live/session: that session's subtree only
             return self._live_memo.get(key, lambda: json.dumps(
-                live.session_view(self.live_view(registry, session, session_view=True, device=device), session),
+                live.session_view(self.live_view(registry, session, session_view=True, machine=machine), session),
                 allow_nan=False).encode())
         return self._live_memo.get(key, lambda: json.dumps(self.live_view(registry, session), allow_nan=False).encode())
 
     def live_view(self, registry: Registry, session: str | None = None, session_view: bool = False,
-                  device: str | None = None) -> dict[str, Any]:
+                  machine: str | None = None) -> dict[str, Any]:
         """GET /v1/cortados/live (provider/live.py): composes the office board, the tasks and the live slice of the usage
         view, the child-task log (read once, 24 h) and the host heartbeats. Cache-only: no vendor CLI, no ssh. Tests
         replace the inputs it calls (office_view's board, tasks_view, live_usage_view) or this method. `session_view`
@@ -4075,7 +4078,8 @@ class ProviderServer(ThreadingHTTPServer):
             run_tokens=registry.runs.tokens_by_run, run_origins=registry.runs.run_origins,
             stubs_by_id=child_tasks.remote_stubs_by_id, binding_errors=registry.live.errors,
             api_credit=None if session_view else (lambda: api_credits.state(now)),
-            session=session, peek_foreign=not session_view, untagged_device=device if session_view else None)
+            session=session, peek_foreign=not session_view, untagged_machine=machine if session_view else None,
+            machine_stubs=child_tasks.remote_stubs_for_machine)
 
     def live_usage_view(self, registry: Registry, now: float) -> dict[str, Any]:
         """Lanes, S1 and hardware for the live view (usage.collect_live): the same sources usage_view reads."""

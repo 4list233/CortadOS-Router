@@ -1269,15 +1269,19 @@ tasks first. One limit: the MCP server reads the session id once, at its start, 
 same process keep the session it was started for.
 
 **Tasks with no session tag (2026-11-22).** A `cortados-route` server that knows no session (no
-`CLAUDE_CODE_SESSION_ID`, or no salt) records a task with `origin_device` only. The Claude desktop app runs such a server:
-a `cortados-route` registered in its own `claude_desktop_config.json` is started by the app (cwd `/`, no session id, no
-project folder) and handed to every desktop Code session too, where it shadows the session's own server of the same
-name, so those sessions' tasks carried no tag and their pane said "no task started from this session". The server now
-says so in `start_task`'s result (`origin_note`) and once on stderr at its start. `GET /v1/cortados/live/session` takes
-an optional `&device=<name>` (the Office device rule; a bad one is 400) and then also returns that machine's tasks that
-carry no origin tag at all, as one group of kind `untagged` (never another session's task, the bot's, or another
-machine's); the pulse pane (0.6.3) asks with its own `hostname -s` and lists them under "started on this machine without
-a session tag". Details: `docs/PULSE-PER-SESSION.md` §11.
+`CLAUDE_CODE_SESSION_ID`) records a task with its machine's tag only: `origin_machine`, a keyed hash of the machine's
+0600 Office salt (`sha256("<salt>:cortados:machine")[:16]`), which every task carries, tagged or not. The Claude
+desktop app runs such a server: a `cortados-route` registered in its own `claude_desktop_config.json` is started by the
+app (cwd `/`, no session id, no project folder) and handed to every desktop Code session too, where it shadows the
+session's own server of the same name, so those sessions' tasks carried no tag and their pane said "no task started from
+this session". The server now says so in `start_task`'s result (`origin_note`) and once on stderr at its start.
+`GET /v1/cortados/live/session` takes an optional `&machine=<tag>` (16-64 lowercase hex; a bad one is 400) and then
+also returns the tasks that carry no origin tag and exactly that machine tag, as one group of kind `untagged` (never
+another session's task, the bot's, or another machine's, whatever its display name). Only a process that reads the
+machine's salt can compute the tag; hostnames are display only and open nothing, and no view or tool result publishes
+the tag. The pulse pane (0.6.3) computes it from the salt and lists those tasks under "started on this machine without a
+session tag". Without the salt a task carries no machine tag and no session's pane shows it. Details:
+`docs/PULSE-PER-SESSION.md` §5 and §11.
 
 **The orchestrator tree** (`docs/PULSE-PER-SESSION.md`). The live view's `orchestrators` section is each orchestrating
 main session (its Office tag), Grok Bot and an "Unattributed" group, each with its child tasks (nested by
@@ -1287,7 +1291,7 @@ sub-sessions: the run's provider conversations (`x-cortados-run-id`), open or re
 waiting / done / failed / unknown), phase, model, elapsed and in-memory token totals. The dashboard's Live tab draws it
 as a collapsible tree. `GET /v1/cortados/live/session?session=<tag>` (owner token, `live:read`, or the narrow
 `live:session` scope that opens nothing else) returns ONLY that session's subtree plus S1 and host health, built
-filtered before any cap (with `&device=`, also that machine's untagged tasks, above); the cortados-pulse pane reads only
+filtered before any cap (with `&machine=<tag>`, also that machine's untagged tasks, above); the cortados-pulse pane reads only
 that view once its session is identified.
 
 A host whose jobs the provider cannot see (the Mac Studio's S1 scorer and continuous training) reports them with

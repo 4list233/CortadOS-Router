@@ -1,6 +1,7 @@
 """Child tasks (start_task & co. on the cortados-route MCP server) against a FAKE claude binary: no real claude runs,
 no provider is contacted, and all state lives in a throwaway tasks dir."""
 import glob
+import hashlib
 import json
 import os
 import stat
@@ -1759,28 +1760,59 @@ class ChildTaskTests(ChildTaskBase):
                     self.assertNotIn("origin_session", e)
                     self.assertEqual(e.get("origin_project"), "work")   # the folder and device are facts, still kept
 
-    def test_a_desktop_app_server_records_the_device_only_and_says_why(self):
+    def test_a_desktop_app_server_records_the_machine_tag_and_says_why(self):
         """2026-11-22: the Claude desktop app runs its own cortados-route (claude_desktop_config.json) with cwd / and no
         CLAUDE_CODE_SESSION_ID or CLAUDE_PROJECT_DIR, and hands it to its Code sessions, where it shadows the session's
-        own server. Its tasks carry the device only, exactly as the three tasks of that day did; the result says why."""
+        own server. Review round 1: with the salt present (main() makes it at start, whatever the cwd) its tasks carry
+        no session tag but this machine's origin_machine tag, the only key that opens them in a session view."""
         self._session(self.SALT, "")
         os.environ.pop("CLAUDE_PROJECT_DIR", None)
         here = os.getcwd()
         os.chdir("/")
         self.addCleanup(os.chdir, here)
-        self.assertEqual(m.origin_identity()["session"], None)
-        self.assertEqual(m.origin_identity()["project"], None)         # basename of "/" is no name
-        self.assertTrue(m.origin_identity()["device"])
+        ident = m.origin_identity()
+        self.assertEqual((ident["session"], ident["project"]), (None, None))   # basename of "/" is no name
+        self.assertTrue(ident["device"])
+        self.assertEqual(ident["machine"], m.machine_tag(self.SALT))
+        self.assertRegex(ident["machine"], r"^[0-9a-f]{16}$")
         self.assertIn("CLAUDE_CODE_SESSION_ID is unset or not one", m.untagged_reason())
         r, out = self.call("start_task", task="hello", cwd=self.work)
         self.assertFalse(r.get("isError"), r)
         self.assertIsNone(out["origin_session"])
+        self.assertNotIn("origin_machine", out)                         # a capability: never in a tool result
         self.assertIn("Claude desktop app", out["origin_note"])
         self.assertIn("without a session tag", out["origin_note"])
         self.call("wait_task", task_id=out["task_id"], timeout_s=30)
         meta = _load(os.path.join(ct.task_path(out["task_id"]), "meta.json"))
         self.assertEqual((meta["origin"]["origin_session"], meta["origin"]["origin_project"]), (None, None))
         self.assertTrue(meta["origin"]["origin_device"])
+        self.assertEqual(meta["origin"]["origin_machine"], m.machine_tag(self.SALT))
+        ev = [e for e in _events() if e.get("task_id") == out["task_id"]]
+        self.assertEqual({e.get("origin_machine") for e in ev}, {m.machine_tag(self.SALT)})
+        self.assertNotIn(self.SALT, json.dumps(ev) + json.dumps(meta))
+        # the tool results never carry the tag
+        for name, args in (("task_status", {"task_id": out["task_id"]}), ("list_tasks", {})):
+            r, res = self.call(name, **args)
+            self.assertNotIn("origin_machine", json.dumps(res), name)
+            self.assertNotIn(m.machine_tag(self.SALT), json.dumps(res), name)
+
+    def test_the_main_entry_makes_the_salt_so_a_desktop_server_gets_a_machine_tag(self):
+        """The desktop app's server starts with cwd / and no session id: main() still creates the salt before it
+        serves, so origin_identity() has a machine tag on its first start_task."""
+        path = os.path.join(self.tmp, "fresh", "office-salt")
+        env = {"CORTADOS_OFFICE_SALT_FILE": path, "HOME": self.tmp}
+        self.assertIsNone(m.origin_identity(env)["machine"])
+        salt = m.ensure_office_salt(env)                         # what main() calls first
+        self.assertEqual(m.origin_identity(env)["machine"], m.machine_tag(salt))
+        self.assertIsNone(m.origin_identity(env)["session"])
+
+    def test_the_machine_tag_is_its_own_domain_never_a_session_tag(self):
+        tag = m.machine_tag(self.SALT)
+        self.assertEqual(tag, hashlib.sha256(f"{self.SALT}:cortados:machine".encode()).hexdigest()[:16])
+        self.assertNotEqual(tag, m.origin_tag(self.SALT, "machine"))
+        self.assertIn(":", m.MACHINE_TAG_LABEL)                  # a session id never holds ":", so no session id can
+        self.assertIsNone(m._SESSION_ID_RE.fullmatch(m.MACHINE_TAG_LABEL))     # hash to it
+        self.assertNotEqual(tag, m.machine_tag("f" * 32))         # per machine: each salt its own tag
 
     def test_untagged_reason_names_the_missing_piece_and_a_tagged_start_has_no_note(self):
         self._session()
@@ -1788,17 +1820,33 @@ class ChildTaskTests(ChildTaskBase):
         r, out = self.call("start_task", task="hello", cwd=self.work)
         self.assertNotIn("origin_note", out)
         self.call("wait_task", task_id=out["task_id"], timeout_s=30)
-        os.remove(os.path.join(self.tmp, ".config", "cortados", "office-salt"))
-        self.assertIn("Office salt file", m.untagged_reason())
-        self.assertNotIn(self.SALT, m.untagged_reason())
+        # a tagged task carries the machine tag too (unused by any view: it is tagged)
+        meta = _load(os.path.join(ct.task_path(out["task_id"]), "meta.json"))
+        self.assertEqual(meta["origin"]["origin_machine"], m.machine_tag(self.SALT))
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "bad id;rm"}):
             self.assertIn("CLAUDE_CODE_SESSION_ID is unset or not one", m.untagged_reason())
-        # the bot's tasks have a named origin: no note
+        os.remove(os.path.join(self.tmp, ".config", "cortados", "office-salt"))
+        self.assertIn("Office salt file", m.untagged_reason())
+        self.assertIn("no session's Pulse pane shows it", m.untagged_reason())
+        self.assertNotIn(self.SALT, m.untagged_reason())
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}):
+            self.assertIn("Office salt file", m.untagged_reason())   # no salt: no machine tag either, whatever the id
+        # without the salt nothing opens the task: no session tag and no machine tag are recorded
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}):
+            r, out = self.call("start_task", task="hello", cwd=self.work)
+            self.assertIn("Office salt file", out["origin_note"])
+            self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        meta = _load(os.path.join(ct.task_path(out["task_id"]), "meta.json"))
+        self.assertIsNone(meta.get("origin", {}).get("origin_machine"))
+        self.assertIsNone(meta.get("origin", {}).get("origin_session"))
+        # the bot's tasks have a named origin: no note, and no machine tag
         self._session()
         self.cfg = {**self.cfg, "client": "grokbot"}
         r, out = self.call("start_task", task="hello", cwd=self.work)
         self.assertNotIn("origin_note", out)
         self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        meta = _load(os.path.join(ct.task_path(out["task_id"]), "meta.json"))
+        self.assertIsNone(meta["origin"].get("origin_machine"))
 
     def test_bot_gateway_tasks_originate_from_grokbot(self):
         self._session()
@@ -1810,12 +1858,18 @@ class ChildTaskTests(ChildTaskBase):
         self.assertFalse(any("origin_project" in e for e in ev))
 
     def test_clean_origin_keeps_only_valid_metadata(self):
-        self.assertEqual(ct.clean_origin({"session": "ab" * 8, "project": "My Repo", "device": "studio"}),
-                         {"origin_session": "ab" * 8, "origin_project": "My Repo", "origin_device": "studio"})
-        self.assertEqual(ct.clean_origin({"session": "AB" * 8, "project": "/Users/x/repo", "device": "a b"}),
-                         {"origin_session": None, "origin_project": None, "origin_device": None})
+        self.assertEqual(ct.clean_origin({"session": "ab" * 8, "project": "My Repo", "device": "studio",
+                                          "machine": "cd" * 8}),
+                         {"origin_session": "ab" * 8, "origin_project": "My Repo", "origin_device": "studio",
+                          "origin_machine": "cd" * 8})
+        self.assertEqual(ct.clean_origin({"session": "AB" * 8, "project": "/Users/x/repo", "device": "a b",
+                                          "machine": "CD" * 8}),
+                         {"origin_session": None, "origin_project": None, "origin_device": None, "origin_machine": None})
         self.assertEqual(ct.clean_origin("grokbot"), {"origin_session": None, "origin_project": None,
-                                                      "origin_device": None})
+                                                      "origin_device": None, "origin_machine": None})
+        # the machine tag is a hex tag only: never a named origin, a hostname or a path
+        for bad in ("grokbot", "pro", "a" * 15, "a" * 65, "../" + "a" * 16):
+            self.assertIsNone(ct.clean_origin({"machine": bad})["origin_machine"], bad)
         self.assertEqual(ct.clean_origin({"session": "grokbot"})["origin_session"], "grokbot")
         self.assertEqual(ct.clean_origin({"session": "x" * 300, "project": "p" * 65})["origin_project"], None)
 
@@ -1934,6 +1988,49 @@ class ChildTaskTests(ChildTaskBase):
                          ("air", m.origin_tag(self.SALT, self.SID), "work"))
         with open(os.path.join(ct.tasks_dir(), tid, ct.REMOTE_STUB)) as f:
             self.assertNotIn(self.SID, f.read())
+
+    def test_an_untagged_remote_start_carries_the_machine_tag_to_the_host_and_the_machine_index(self):
+        """Review round 1: the desktop app's server (salt, no session id) starts a task on another host. The stub here
+        records origin_machine and is indexed under by-machine/<tag> (not by-origin); the host's meta and events carry
+        the same tag (--remote passes the origin); no tool result carries it."""
+        self._air()
+        self._session(self.SALT, "")
+        tag = m.machine_tag(self.SALT)
+        r, out = self.call("start_task", task="hello", title="untagged remote")
+        self.assertFalse(r.get("isError"), r)
+        tid = out["task_id"]
+        self.assertIsNone(out["origin_session"])
+        self.assertNotIn(tag, json.dumps(out))
+        self.call("wait_task", task_id=tid, timeout_s=30)
+        root = ct.tasks_dir()
+        self.assertEqual(os.listdir(os.path.join(root, ct.MACHINE_INDEX)), [tag])
+        self.assertEqual(os.listdir(os.path.join(root, ct.MACHINE_INDEX, tag)), [tid])
+        self.assertFalse(os.path.exists(os.path.join(root, ct.ORIGIN_INDEX)))
+        self.assertEqual([s["task_id"] for s in ct.remote_stubs_for_machine(tag)], [tid])
+        for other in (m.machine_tag("f" * 32), "0" * 16, "../x", None, "pro"):
+            self.assertEqual(ct.remote_stubs_for_machine(other), [], other)
+        with open(os.path.join(self.air_home, "state", "child-tasks.jsonl")) as f:
+            ev = [json.loads(x) for x in f]
+        started = next(e for e in ev if e["event"] == "started" and e["task_id"] == tid)
+        self.assertEqual((started.get("origin_session"), started["origin_machine"]), (None, tag))
+        for name, args in (("task_status", {"task_id": tid}), ("list_tasks", {})):
+            _, res = self.call(name, **args)
+            self.assertNotIn(tag, json.dumps(res), name)
+        # the daily prune drops a machine-index entry whose task dir is gone
+        shutil.rmtree(os.path.join(root, tid))
+        ct._prune_origin_index(root)
+        self.assertFalse(os.path.exists(os.path.join(root, ct.MACHINE_INDEX, tag)))
+
+    def test_a_tagged_remote_stub_is_indexed_by_its_session_only(self):
+        self._air()
+        self._session()
+        r, out = self.call("start_task", task="hello", title="tagged remote")
+        self.assertFalse(r.get("isError"), r)
+        self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        root = ct.tasks_dir()
+        self.assertFalse(os.path.exists(os.path.join(root, ct.MACHINE_INDEX)))
+        self.assertEqual(ct.remote_stubs_for_machine(m.machine_tag(self.SALT)), [])
+        self.assertEqual([s["task_id"] for s in ct.remote_stubs_for(m.origin_tag(self.SALT, self.SID))], [out["task_id"]])
 
     # -- nested tasks: parent_task_id links them, and a task without an orchestrator of its own takes its parent's --
 
