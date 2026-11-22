@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shlex
 import stat
 import tempfile
 import time
@@ -122,17 +123,65 @@ class SessionTests(unittest.TestCase):
             with self.subTest(candidates=bad), self.assertRaises(session.SessionError):
                 session.boundary_hook_python(proj, bad)
 
+    def hook_command(self, cmd):
+        with open(cmd[cmd.index("--settings") + 1]) as src:
+            return json.load(src)["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+
     def test_boundary_hook_inside_the_project_is_refused(self):
         from pathlib import Path
         checkout = str(Path(session.__file__).resolve().parents[1])
-        with self.assertRaises(session.SessionError):
+        with self.assertRaises(session.SessionError):       # no private directory to install a copy in
             session.boundary_hook_entry(checkout)
-        with self.assertRaises(session.SessionError):        # child tasks pass --project-dir
-            self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok, "--project-dir", checkout])
         _, _, cmd = self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok,
                                   "--project-dir", self.tmp.name])
-        with open(cmd[cmd.index("--settings") + 1]) as src:
-            self.assertIn(" -I -S -B ", json.load(src)["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
+        self.assertIn(" -I -S -B ", self.hook_command(cmd))
+        self.assertIn(shlex.quote(str(session.BOUNDARY_HOOK_FILE)), self.hook_command(cmd))   # outside: run in place
+
+    def test_a_project_holding_this_checkout_runs_a_private_copy_of_the_hook(self):
+        # #128: start_task with cwd = the router repo. The checkout's hook is model-writable there, so the session runs
+        # a copy, taken from the bytes loaded with the launcher, in the verified private settings directory.
+        from pathlib import Path
+        checkout = str(Path(session.__file__).resolve().parents[1])
+        _, _, cmd = self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok,
+                                  "--project-dir", checkout])
+        command = self.hook_command(cmd)
+        copies = [f for f in os.listdir(self.sdir) if f.startswith("boundary-hook-")]
+        self.assertEqual(len(copies), 1, copies)
+        copy = os.path.join(self.sdir, copies[0])
+        self.assertIn(" -I -S -B " + shlex.quote(copy), command)
+        self.assertNotIn(str(session.BOUNDARY_HOOK_FILE), command)
+        self.assertFalse(copy.startswith(checkout + os.sep))
+        self.assertEqual(stat.S_IMODE(os.stat(copy).st_mode), 0o600)
+        with open(copy, "rb") as f:
+            self.assertEqual(f.read(), session.BOUNDARY_HOOK_FILE.read_bytes())
+        # reused as is; a tampered copy is replaced, never run
+        self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok, "--project-dir", checkout])
+        self.assertEqual([f for f in os.listdir(self.sdir) if f.startswith("boundary-hook-")], copies)
+        with open(copy, "ab") as f:
+            f.write(b"\nraise SystemExit(0)\n")
+        self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok, "--project-dir", checkout])
+        with open(copy, "rb") as f:
+            self.assertEqual(f.read(), session.BOUNDARY_HOOK_FILE.read_bytes())
+
+    def test_the_hook_copy_uses_the_bytes_loaded_with_the_launcher(self):
+        d = os.path.join(self.tmp.name, "priv")
+        os.mkdir(d, 0o700)
+        with mock.patch.object(session, "_BOUNDARY_HOOK_SOURCE", b"# as loaded\n"):
+            path = session.install_hook_copy(d)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"# as loaded\n")
+        with mock.patch.object(session, "_BOUNDARY_HOOK_SOURCE", None), self.assertRaises(session.SessionError):
+            session.install_hook_copy(d)
+
+    def test_a_settings_dir_inside_the_project_still_refuses_the_hook(self):
+        from pathlib import Path
+        checkout = str(Path(session.__file__).resolve().parents[1])
+        inside = os.path.join(checkout, "sessions-dir")
+        self.assertFalse(os.path.exists(inside))
+        with self.assertRaises(session.SessionError) as cm:
+            session.boundary_hook_entry(checkout, hook_dir=inside)
+        self.assertIn("inside the project folder", str(cm.exception))
+        self.assertFalse(os.path.exists(inside))
 
     def test_model_mapping(self):
         self.assertEqual(session.resolve_model("fable"), "sub/claude-fable-5-1")

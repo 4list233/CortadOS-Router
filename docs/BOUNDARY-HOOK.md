@@ -97,9 +97,13 @@ The rules now:
    up on `PATH`; a helper missing at that path only ever moves the decision to the raw check. The hook never runs in
    the project folder.
 4. **Hook location.** The hook's code lives outside any model-writable path: the mod passes the source inline (`-c`, no
-   file on disk), child tasks run `boundary_hook.py` from the router checkout running the launcher. `session.py`
-   refuses a checkout inside the child's project folder (`--project-dir`, passed by `child_tasks` when the task has a
-   `cwd`). At run time the hook checks itself: a known call whose recorded project folder holds the hook's interpreter,
+   file on disk), child tasks run `boundary_hook.py` from the router checkout running the launcher. When that checkout
+   lies inside the child's project folder (`--project-dir`, passed by `child_tasks` when the task has a `cwd`, e.g. a
+   task working on the router repo itself, #128), `session.py` runs a copy instead: `boundary-hook-<sha256[:16]>.py`
+   (0600) in the launcher's verified private 0700 settings directory (a child's task dir), written from the bytes read
+   when the launcher loaded, never from the checkout's file at launch time (a task's model may have rewritten it). A
+   copy that would itself lie inside the project is refused (`SessionError`), as is a checkout inside the project when
+   there is no private directory to copy to. At run time the hook checks itself: a known call whose recorded project folder holds the hook's interpreter,
    its file or the file's folder (lexically or real) is **denied**, Bash included.
 5. **Imports.** The hook is stdlib only and imports nothing from the project. Run as a program without `-I` (an older
    settings file), it deletes the first `sys.path` entry (the working directory or its own folder) and empty entries

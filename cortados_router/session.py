@@ -126,6 +126,13 @@ BOUNDARY_HOOK_MATCHER = "Write|Edit|MultiEdit|NotebookEdit|Bash"
 
 
 BOUNDARY_HOOK_FILE = Path(__file__).resolve().with_name("boundary_hook.py")
+# #128: the hook's bytes as they were when this launcher loaded, for a launch whose project folder holds this checkout
+# (a task with cwd = the router repo). Read once here, never at launch time: a task's model may have rewritten the
+# checkout's boundary_hook.py since, while the launcher's own code is what was loaded with it.
+try:
+    _BOUNDARY_HOOK_SOURCE: bytes | None = BOUNDARY_HOOK_FILE.read_bytes()
+except OSError:
+    _BOUNDARY_HOOK_SOURCE = None
 # Where the hook's interpreter is looked for, in order, after the interpreter running this launcher: absolute paths
 # only, never a PATH lookup (a project's bin/, venv or node_modules/.bin may come first on PATH; docs/BOUNDARY-HOOK.md).
 SYSTEM_PYTHONS = ("/usr/bin/python3",)
@@ -173,17 +180,57 @@ def boundary_hook_python(project: str | None = None, candidates=None) -> str:
                        + ", ".join(map(str, candidates)) + ")")
 
 
-def boundary_hook_entry(project: str | None = None, python: str | None = None) -> dict:
+def install_hook_copy(directory: str, source: bytes | None = None) -> str:
+    """#128: a copy of boundary_hook.py (the bytes loaded with this launcher) in `directory`, the launcher's verified
+    private 0700 settings directory, named by its content hash: `boundary-hook-<sha256[:16]>.py`, mode 0600. An
+    existing file of that name is reused only when it is a regular file of this user, not writable by group or others,
+    holding exactly those bytes; anything else is replaced atomically."""
+    import hashlib
+    source = _BOUNDARY_HOOK_SOURCE if source is None else source
+    if source is None:
+        raise SessionError(f"cannot read the boundary hook script {BOUNDARY_HOOK_FILE}")
+    path = os.path.join(directory, f"boundary-hook-{hashlib.sha256(source).hexdigest()[:16]}.py")
+    try:
+        st = os.lstat(path)
+        if (stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022):
+            with open(path, "rb") as f:
+                if f.read(len(source) + 1) == source:
+                    return path
+    except OSError:
+        pass
+    fd, tmp = tempfile.mkstemp(prefix=".boundary-hook-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(source)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def boundary_hook_entry(project: str | None = None, python: str | None = None, hook_dir: str | None = None) -> dict:
     """The PreToolUse entry running boundary_hook.py: `<absolute python3> -I -S -B <absolute script>` (shell-quoted),
     from / inside the shell guard (guarded_hook_command). No PATH lookup, isolated mode, no site import, fail closed for
     a marked call when the interpreter cannot start (docs/BOUNDARY-HOOK.md "Isolation"). A hook script inside
-    the project folder is refused. Timeout 30 s, well past the script's own 5 s provider timeout, so the script always
-    answers (and fails closed) itself."""
-    if _inside_project(str(BOUNDARY_HOOK_FILE), project):
+    the project folder is refused: the model may write there, so the hook could be its own code. When this checkout
+    lies inside the project and `hook_dir` (the verified private settings directory) is given, the hook runs from a
+    copy there instead (install_hook_copy, #128); a copy that would itself lie inside the project is refused the same
+    way. Timeout 30 s, well past the script's own 5 s provider timeout, so the script always answers (and fails
+    closed) itself."""
+    script = str(BOUNDARY_HOOK_FILE)
+    if _inside_project(script, project) and hook_dir and not _inside_project(hook_dir, project):
+        script = install_hook_copy(hook_dir)
+    if _inside_project(script, project):
         raise SessionError("the boundary hook script lies inside the project folder; run the launcher from a router "
                            "checkout outside it")
     python = python or boundary_hook_python(project)
-    command = guarded_hook_command(python, shlex.quote(str(BOUNDARY_HOOK_FILE)))
+    command = guarded_hook_command(python, shlex.quote(script))
     return {"matcher": BOUNDARY_HOOK_MATCHER, "hooks": [{"type": "command", "command": command, "timeout": 30}]}
 
 
@@ -273,14 +320,15 @@ def build_env(base: dict, provider_url: str, token: str, delegate_budget: int = 
 
 def settings_content(provider_url: str, token: str, delegate_budget: int = 3, gate: bool = True,
                      run_id: str | None = None, office_headers=None, local: str | None = None,
-                     project: str | None = None, eager_tools: bool = False) -> dict:
+                     project: str | None = None, eager_tools: bool = False, hook_dir: str | None = None) -> dict:
     """project: the session's project folder when known (child tasks: --project-dir); the boundary hook's interpreter
-    and script must lie outside it."""
+    and script must lie outside it. hook_dir: the verified private settings directory, where a copy of the hook is
+    installed when this checkout lies inside the project (boundary_hook_entry)."""
     # disableAllHooks false: a user settings file cannot switch the boundary hook off while the header says it runs.
     content = {"env": launcher_env(provider_url, token, delegate_budget, run_id, office_headers, local,
                                    eager_tools=eager_tools),
                "enabledPlugins": {PLUGIN_ID: False}, "disableAllHooks": False}
-    pre = [boundary_hook_entry(project)]         # always: the header in env promises it (no hook, no edits)
+    pre = [boundary_hook_entry(project, hook_dir=hook_dir)]   # always: the header in env promises it (no hook, no edits)
     if gate:
         # Absolute standalone script: hook cwd need not be this checkout; shell-quote paths with spaces.
         command = "python3 -B " + shlex.quote(str(Path(__file__).resolve().with_name("orchestrator_gate.py")))
@@ -335,11 +383,17 @@ def prune_settings(path: str, now: float | None = None) -> None:
             pass
 
 
-def write_settings(directory: str, content: dict, home: str | None = None) -> str:
-    """Write this launch's settings to a new unique file (0600, O_EXCL) inside a verified private 0700 directory."""
+def private_settings_dir(directory: str, home: str | None = None) -> str:
+    """The settings directory, made if missing and verified private (verify_private_dir); its lexical absolute path."""
     d = _lexical(directory)
     os.makedirs(d, mode=0o700, exist_ok=True)
     verify_private_dir(d, os.path.expanduser("~") if home is None else home)
+    return d
+
+
+def write_settings(directory: str, content: dict, home: str | None = None) -> str:
+    """Write this launch's settings to a new unique file (0600, O_EXCL) inside a verified private 0700 directory."""
+    d = private_settings_dir(directory, home)
     prune_settings(d)
     fd, name = tempfile.mkstemp(prefix="session-", suffix=".json", dir=d)
     try:
@@ -465,9 +519,11 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home
     eager = bool(args.eager_tools or mcp_filtered(extra))      # a bounded MCP catalog only (TOOL_SEARCH_OFF)
     check_managed(set(launcher_env(url, token, args.delegate_budget, args.run_id, office, args.local,
                                    eager_tools=eager)), managed_dirs)
-    settings_path = write_settings(args.settings_dir or SETTINGS_DIR,
+    settings_dir = private_settings_dir(args.settings_dir or SETTINGS_DIR, home)
+    settings_path = write_settings(settings_dir,
                                    settings_content(url, token, args.delegate_budget, not args.no_gate, args.run_id,
-                                                    office, args.local, args.project_dir, eager_tools=eager),
+                                                    office, args.local, args.project_dir, eager_tools=eager,
+                                                    hook_dir=settings_dir),
                                    home)
     return (args, build_env(base_env, url, token, args.delegate_budget, args.run_id, office, args.local,
                             eager_tools=eager),
