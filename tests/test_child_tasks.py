@@ -1012,6 +1012,17 @@ class ChildTaskTests(ChildTaskBase):
             self.assertIn(needle, r["content"][0]["text"], kw)
         self.assertFalse(os.path.isdir(os.path.join(self.tmp, "tasks")) and os.listdir(os.path.join(self.tmp, "tasks")))
 
+    def test_a_cwd_holding_the_router_checkout_is_refused_naming_the_alternatives(self):
+        # #128: the checkout the launcher runs from is the trust root; the refusal says what to use instead.
+        checkout = os.path.dirname(os.path.dirname(os.path.realpath(ct.__file__)))
+        r, _ = self.call("start_task", task="x", cwd=checkout)
+        self.assertTrue(r.get("isError"))
+        text = r["content"][0]["text"]
+        self.assertIn("cannot prepare the child session", text)
+        for part in ("every later task trusts", "`repo` (+ `branch`)", "`cwd` outside the router checkout"):
+            self.assertIn(part, text)
+        self.assertFalse(os.path.exists(os.path.join(checkout, "fake-argv.json")))
+
     def test_a_cwd_missing_on_the_host_is_refused_naming_the_host(self):
         r, _ = self.call("start_task", task="x", cwd=os.path.join(self.tmp, "nowhere"))
         self.assertIn("does not exist on execution host 'here' (this machine)", r["content"][0]["text"])
