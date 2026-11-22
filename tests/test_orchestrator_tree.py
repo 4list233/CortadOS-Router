@@ -668,6 +668,31 @@ class SessionEndpointTest(tl.EndpointHarness):
             "model": "cortados", "messages": [{"role": "user", "content": "x"}]})[0], 403)
         self.assertEqual(self.reg.sessions, {})
 
+    # 2026-11-22: ?device= adds the machine's untagged tasks (UntaggedDeviceTest below has the tree's rules)
+    def test_device_adds_the_untagged_group_and_a_bad_one_is_refused(self):
+        import time
+        now = time.time()
+        Path(self.home, "child-tasks.jsonl").write_text("".join(json.dumps(e) + "\n" for e in (
+            {"ts": now - 30, "event": "started", "task_id": UNTAGGED, "title": "pstack plugin deep-read",
+             "host": "air", "origin_device": "Forests-MacBook-Pro", "prompt": SECRET},
+            {"ts": now - 20, "event": "started", "task_id": UNTAGGED_ELSE, "title": "Untagged elsewhere",
+             "host": "air", "origin_device": "studio"},
+            {"ts": now - 10, "event": "started", "task_id": "t20261111160000-0f0f0f0f", "origin_session": OTHER,
+             "origin_device": "Forests-MacBook-Pro", "title": "Not yours"})))
+        P = live.SESSION_PATH + "?session=" + MINE
+        code, raw, _ = self.request("GET", P, SESSION_TOKEN)
+        self.assertEqual(code, 200, raw)
+        self.assertEqual(json.loads(raw)["orchestrators"]["items"], [])
+        code, raw, _ = self.request("GET", P + "&device=Forests-MacBook-Pro", SESSION_TOKEN)
+        self.assertEqual(code, 200, raw)
+        items = json.loads(raw)["orchestrators"]["items"]
+        self.assertEqual([(g["kind"], [t["task_id"] for t in g["tasks"]]) for g in items], [("untagged", [UNTAGGED])])
+        for bad in (SECRET, OTHER, "Not yours", "Untagged elsewhere"):
+            self.assertNotIn(bad, raw, bad)
+        for q in ("&device=", "&device=a%20b", "&device=pro&device=air"):
+            code, raw, _ = self.request("GET", P + q, SESSION_TOKEN)
+            self.assertEqual(code, 400, (q, raw))
+
     def test_a_routed_run_is_a_sub_session_of_its_task(self):
         import time
         tid = "t20261111160000-0a0b0c0d"
@@ -1539,3 +1564,67 @@ class WorkSplitSessionTest(unittest.TestCase):
         raw = json.dumps(split_view()["routed"])
         for bad in ("pending_runs", ROOT, NESTED, FOLLOW):
             self.assertNotIn(bad, raw, bad)
+
+
+# ================================================================ tasks with no session tag (desktop-app server)
+UNTAGGED = "t20261122152600-6a026c40"       # started on "pro" through a server that knew no session: no origin tag
+UNTAGGED_KID = "t20261122152700-6a026c41"   # nested under UNTAGGED, no origin of its own either
+UNTAGGED_ELSE = "t20261122152800-6a026c42"  # no origin tag, started on another machine
+
+
+def untagged_events():
+    base = {"cwd": "/Users/someone/secret-project", "chrome": False, "prompt": SECRET}
+    return events() + [
+        {"ts": NOW - 90, "event": "started", "task_id": UNTAGGED, **base, "origin_device": "pro", "host": "air",
+         "model": "gpt-6.1", "title": "pstack plugin deep-read"},
+        {"ts": NOW - 80, "event": "started", "task_id": UNTAGGED_KID, **base, "origin_device": "pro", "host": "air",
+         "title": "Its nested step", "parent_task_id": UNTAGGED},
+        {"ts": NOW - 70, "event": "started", "task_id": UNTAGGED_ELSE, **base, "origin_device": "studio",
+         "host": "air", "title": "Untagged elsewhere"},
+    ]
+
+
+class UntaggedDeviceTest(unittest.TestCase):
+    """2026-11-22: tasks started from a Claude desktop-app Code session through the app's own cortados-route server
+    carry no origin tag (origin_device only). A session's view with ?device= shows its machine's untagged tasks as one
+    group of kind "untagged"; never another session's tasks, another machine's, the bot's or a tagged nested task."""
+
+    def test_the_machines_untagged_tasks_are_their_own_group(self):
+        v = view(MINE, child_events=untagged_events, untagged_device="pro")
+        o = v["orchestrators"]
+        g = groups(v)
+        self.assertEqual(set(g), {MINE, None})
+        u = g[None]
+        self.assertEqual((u["kind"], u["device"], u["project"]), ("untagged", "pro", None))
+        self.assertEqual([t["task_id"] for t in u["tasks"]], [UNTAGGED])
+        self.assertEqual(ids(u["tasks"][0]), [UNTAGGED_KID])            # nested under its parent, same group
+        self.assertEqual(u["counts"]["running"], 2)
+        self.assertEqual(o["untagged_device"], "pro")
+        self.assertEqual(g[MINE]["kind"], "session")                     # the session's own group is unchanged
+        raw = json.dumps(v["orchestrators"])
+        for bad in (UNTAGGED_ELSE, "Untagged elsewhere", LEGACY, "Legacy task", BOT, OTHER, THEIRS, SECRET):
+            self.assertNotIn(bad, raw, bad)
+        # the session's group first: an untagged group sorts with the unattributed, after the sessions
+        self.assertEqual(o["items"][0]["origin"], MINE)
+
+    def test_without_device_or_without_session_nothing_changes(self):
+        plain = view(MINE, child_events=untagged_events)
+        self.assertEqual(set(groups(plain)), {MINE})
+        self.assertNotIn("untagged_device", plain["orchestrators"])
+        self.assertNotIn(UNTAGGED, json.dumps(plain["orchestrators"]))
+        # the fleet view keeps its unattributed group; untagged_device has no effect there
+        fleet = view(None, child_events=untagged_events, untagged_device="pro")
+        self.assertEqual(groups(fleet)[None]["kind"], "unattributed")
+        self.assertIn(UNTAGGED, ids(groups(fleet)[None]))
+
+    def test_a_tag_that_has_no_tasks_still_gets_its_machines_untagged_ones(self):
+        v = view("cccccccccccccccc", child_events=untagged_events, untagged_device="pro")
+        self.assertEqual([(g["origin"], g["kind"]) for g in v["orchestrators"]["items"]], [(None, "untagged")])
+        sv = live.session_view(v, "cccccccccccccccc")
+        self.assertEqual([g["kind"] for g in sv["orchestrators"]["items"]], ["untagged"])
+
+    def test_valid_device(self):
+        for ok in ("pro", "Forests-MacBook-Pro", "air.local"):
+            self.assertEqual(live.valid_device(ok), ok)
+        for bad in ("", "a b", "x" * 65, None, 7, "../etc"):
+            self.assertIsNone(live.valid_device(bad), bad)

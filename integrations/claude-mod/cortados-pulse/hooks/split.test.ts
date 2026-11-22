@@ -304,7 +304,27 @@ test('the mounted pane: this session\'s work split with its breakdown button, an
     props: { title: 'CortadOS pulse', isFocused: false, bodyColumns: 120, placement: 'dock' } as any })
   let texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
   let all = texts.join('\n')
-  expect(texts[0]).toBe('This session')
+  // 0.6.3: the default view is five things: this session's child tasks one line each (running first, then the last
+  // finished), the local model, the subscriptions' lowest, S1, the dashboard link. Nothing else until `d`.
+  expect(texts).toEqual([
+    "This session's child tasks",
+    '● Nested step · air · claude-haiku-5 · running · 3m 20s',
+    '● Build the tree · air · claude-sonnet-5 · running · 5m 00s',
+    '? task t20261111093000-a0000009 · studio · state on its host',
+    '✓ Deeper step · air · succeeded · 50s',
+    'local pro: on · in use · qwen3.5-27b-mlx-4bit',
+    'subscriptions: lowest cursor (shared with Grok Bot) 70% left (month)',
+    'S1 up · 23 ms (last probe)',
+    'dashboard http://air.example:8432/dashboard',
+  ])
+  for (const hidden of ['work split', 'main loop', 'Usage', 'Local nodes', 'Devices', 'Fleet', 'routed directly'])
+    expect(all.includes(hidden)).toBe(false)
+  await ui.press({ key: 'cortados-pulse-details' })
+  texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  all = texts.join('\n')
+  const d = texts.indexOf('This session in detail')
+  expect(d).toBe(9)
+  texts = texts.slice(d)
   expect(texts[1]).toMatch(/^work split 24h: routed 66% fresh \(1\.4M tok: codex\/gpt-6\.1-sol 0\.8M/)
   expect(all.includes('routed by how')).toBe(false)                    // folded until asked
   expect(all).toMatch(/pro: switch on · allowed · AC/)

@@ -177,7 +177,8 @@ export interface PulseTreeTask {
 }
 export interface PulseOrchestrator {
   origin?: string | null
-  kind?: 'session' | 'bot' | 'unattributed' | string
+  // 'untagged' (0.6.3): this machine's tasks that carry no session tag, in a session view asked with &device=
+  kind?: 'session' | 'bot' | 'unattributed' | 'untagged' | string
   project?: string | null
   device?: string | null
   status?: string
@@ -200,7 +201,8 @@ export interface PulseSessionView {
   // scope "provider host and heartbeats": the tree also holds the tasks the hosts' heartbeats carry (#118),
   // task_hosts names those hosts
   orchestrators?: PulseLiveSection & { items?: PulseOrchestrator[]; scope?: string; truncated?: boolean;
-    inputs_truncated?: string[]; session_filter?: string; task_hosts?: string[]; conflicts?: number }
+    inputs_truncated?: string[]; session_filter?: string; task_hosts?: string[]; conflicts?: number;
+    untagged_device?: string }
   s1?: PulseLive['s1']
   hosts?: PulseLive['hosts']
   /** #127: this session's own work split row only (provider/work_split.session_split) */
@@ -285,6 +287,12 @@ declare module 'claude-code' {
       started: { tag: string; task_id: string; at: number }[]
       /** #127: the session view of the newest such tag that is not this session's own (a /clear or resume) */
       alias: { data: PulseSessionView; at: number; tag: string } | null
+      /** #127: the alias view's last failed read (its problem, and since when a read of it has been outstanding) */
+      aliasErr: { tag: string; problem: string; pendingSince: number | null } | null
+      /** 0.6.3: the details (the `d` button): everything but the default view's five lines */
+      detailsOpen: boolean
+      /** 0.6.3: this machine's name as cortados-route records origin_device (`hostname -s`), once found */
+      machine: string | null
     }
   }
 }

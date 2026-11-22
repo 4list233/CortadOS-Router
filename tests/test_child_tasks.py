@@ -1759,6 +1759,47 @@ class ChildTaskTests(ChildTaskBase):
                     self.assertNotIn("origin_session", e)
                     self.assertEqual(e.get("origin_project"), "work")   # the folder and device are facts, still kept
 
+    def test_a_desktop_app_server_records_the_device_only_and_says_why(self):
+        """2026-11-22: the Claude desktop app runs its own cortados-route (claude_desktop_config.json) with cwd / and no
+        CLAUDE_CODE_SESSION_ID or CLAUDE_PROJECT_DIR, and hands it to its Code sessions, where it shadows the session's
+        own server. Its tasks carry the device only, exactly as the three tasks of that day did; the result says why."""
+        self._session(self.SALT, "")
+        os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        here = os.getcwd()
+        os.chdir("/")
+        self.addCleanup(os.chdir, here)
+        self.assertEqual(m.origin_identity()["session"], None)
+        self.assertEqual(m.origin_identity()["project"], None)         # basename of "/" is no name
+        self.assertTrue(m.origin_identity()["device"])
+        self.assertIn("CLAUDE_CODE_SESSION_ID is unset or not one", m.untagged_reason())
+        r, out = self.call("start_task", task="hello", cwd=self.work)
+        self.assertFalse(r.get("isError"), r)
+        self.assertIsNone(out["origin_session"])
+        self.assertIn("Claude desktop app", out["origin_note"])
+        self.assertIn("without a session tag", out["origin_note"])
+        self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        meta = _load(os.path.join(ct.task_path(out["task_id"]), "meta.json"))
+        self.assertEqual((meta["origin"]["origin_session"], meta["origin"]["origin_project"]), (None, None))
+        self.assertTrue(meta["origin"]["origin_device"])
+
+    def test_untagged_reason_names_the_missing_piece_and_a_tagged_start_has_no_note(self):
+        self._session()
+        self.assertIsNone(m.untagged_reason())
+        r, out = self.call("start_task", task="hello", cwd=self.work)
+        self.assertNotIn("origin_note", out)
+        self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        os.remove(os.path.join(self.tmp, ".config", "cortados", "office-salt"))
+        self.assertIn("Office salt file", m.untagged_reason())
+        self.assertNotIn(self.SALT, m.untagged_reason())
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "bad id;rm"}):
+            self.assertIn("CLAUDE_CODE_SESSION_ID is unset or not one", m.untagged_reason())
+        # the bot's tasks have a named origin: no note
+        self._session()
+        self.cfg = {**self.cfg, "client": "grokbot"}
+        r, out = self.call("start_task", task="hello", cwd=self.work)
+        self.assertNotIn("origin_note", out)
+        self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+
     def test_bot_gateway_tasks_originate_from_grokbot(self):
         self._session()
         self.cfg = {**self.cfg, "client": "grokbot"}

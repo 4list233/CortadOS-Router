@@ -24,6 +24,13 @@ test('the pane draws the lanes from /resources and never the token', { options: 
   for (const f of fetched) expect(f.init.headers.authorization).toBe('Bearer ' + TOKEN)
   const ui = await $.ui.mount({ plugin: 'cortados-pulse', surface: 'terminal', component: 'Pane', requestId: 'cortados-pulse',
     props: { title: 'CortadOS pulse', isFocused: false, bodyColumns: 80, placement: 'dock' } as any })
+  // 0.6.3: the default view: tasks, local model, the subscriptions' lowest and the one that is out, S1, the link
+  const first = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  expect(first.slice(-4)).toEqual(['local model: no local node configured',
+    'subscriptions: lowest claude#b @.claude-acctB 55% left (week) · OUT: claude', 'S1 up · 300 ms median',
+    'dashboard http://air.example:8432/dashboard'])
+  expect(first.includes('Usage')).toBe(false)
+  await ui.press({ key: 'cortados-pulse-details' })
   const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
   const all = texts.join('\n')
   expect(all.includes(TOKEN)).toBe(false)
@@ -36,7 +43,7 @@ test('the pane draws the lanes from /resources and never the token', { options: 
   expect(order).toEqual(['claude', 'claude#b', 'codex'])
   // the Running section comes first, the fleet after the devices, the dashboard link last
   // this session's own tasks first (identified or said why not), then the fleet's Running section
-  expect(texts[0]).toBe('This session')
+  expect(texts[0]).toBe("This session's child tasks")
   const run = texts.indexOf('Running')
   expect(run).toBeGreaterThan(0)
   expect(texts[run + 1]).toBe('1 running · 1 queued · 5 conversations (3 working)')
@@ -44,9 +51,13 @@ test('the pane draws the lanes from /resources and never the token', { options: 
   expect(all).toMatch(/studio: s1-scorer running, s1-continuous running 38%/)
   expect(all).toMatch(/pro: no heartbeat yet/)
   expect(all).toMatch(/S1 up: CortadOS Router S1 .* · promotion held/)
-  expect(texts.indexOf('Running')).toBeLessThan(texts.indexOf('Usage'))
-  expect(texts.indexOf('Devices')).toBeLessThan(texts.indexOf('Fleet'))
-  expect(texts[texts.length - 1]).toBe('dashboard http://air.example:8432/dashboard')
+  // the details: the fleet's Running and Fleet, then usage, every lane, the local nodes, the devices, the snapshot age
+  expect(texts.indexOf('Running')).toBeLessThan(texts.indexOf('Fleet'))
+  expect(texts.indexOf('Fleet')).toBeLessThan(texts.indexOf('Usage'))
+  expect(texts.indexOf('Usage')).toBeLessThan(texts.indexOf('Devices'))
+  expect(texts[texts.length - 1]).toMatch(/^snapshot .* old$/)
+  await ui.press({ key: 'cortados-pulse-details' })                  // and closed again
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(first)
   await ui.unmount()
 })
 
@@ -61,6 +72,7 @@ test('null subscription lanes do not break the pane render', { options: { provid
   await clock.advance(1)
   const ui = await $.ui.mount({ plugin: 'cortados-pulse', surface: 'terminal', component: 'Pane', requestId: 'cortados-pulse',
     props: { title: 'CortadOS pulse', isFocused: false, bodyColumns: 80, placement: 'dock' } as any })
+  await ui.press({ key: 'cortados-pulse-details' })
   const all = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\\n')
   expect(all).toMatch(/none cached/)
   await ui.unmount()
@@ -76,6 +88,7 @@ test('response-derived errors and lane reasons are redacted in the mounted pane'
   await clock.advance(1)
   const ui = await $.ui.mount({ plugin: 'cortados-pulse', surface: 'terminal', component: 'Pane', requestId: 'cortados-pulse',
     props: { title: 'CortadOS pulse', isFocused: false, bodyColumns: 80, placement: 'dock' } as any })
+  await ui.press({ key: 'cortados-pulse-details' })
   const all = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\n')
   expect(all.includes(TOKEN)).toBe(false)
   for (const expected of ['usage: ***', 'subscriptions: ***', 'readings: ***', '  ***', 'unavailable: ***']) expect(all.includes(expected)).toBe(true)
@@ -91,6 +104,7 @@ test('an older provider without the live view still draws the resource pool', { 
   await clock.advance(1)
   const ui = await $.ui.mount({ plugin: 'cortados-pulse', surface: 'terminal', component: 'Pane', requestId: 'cortados-pulse',
     props: { title: 'CortadOS pulse', isFocused: false, bodyColumns: 80, placement: 'dock' } as any })
+  await ui.press({ key: 'cortados-pulse-details' })
   const all = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\n')
   expect(all).toMatch(/this provider has no live view yet/)
   expect(all).toMatch(/routes 5 · degraded 0\/5/)

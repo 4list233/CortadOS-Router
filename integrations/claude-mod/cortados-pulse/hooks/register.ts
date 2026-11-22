@@ -6,6 +6,10 @@
  * cached scarcity with its per-window "% left" (one row per lane and per Claude account), and the online local devices.
  * The last line links the browser dashboard (<provider>/dashboard), which shows the same live view in full.
  *
+ * 0.6.3, the DEFAULT VIEW (owner 2026-11-22: "way too complicated"): this session's child tasks one line each (and this
+ * machine's tasks that carry no session tag, under their own heading), the local Pro model, the subscriptions' lowest
+ * and any that are out, S1, the dashboard link. Everything described below is the DETAILS, behind `d`.
+ *
  * THIS SESSION, at the top: a live tree of this session's own work, flightdeck-style (docs/PULSE-PER-SESSION.md): the
  * start_task children it started, each child's sub-sessions (its routed conversations) under it, nested tasks under
  * their parent, and the subagents this session routed directly; each node with its state glyph, model, phase or tool,
@@ -93,6 +97,12 @@ const localHeld = atom({ plugin: 'cortados-pulse', key: 'local' } as const, null
 
 /** #127: the expanded work split breakdown, toggled by its `w` button. */
 const wsOpen = atom({ plugin: 'cortados-pulse', key: 'wsOpen' } as const, false as boolean)
+// 0.6.3: everything but the five default lines sits behind `d` (the details), as the work split breakdown sits behind `w`
+const detailsOpen = atom({ plugin: 'cortados-pulse', key: 'detailsOpen' } as const, false as boolean)
+// 0.6.3: this machine's name as cortados-route records it (origin_device), looked up once: the session view is asked
+// for its tasks that carry no session tag too (&device=), so a task started through a server that knew no session
+// (the Claude desktop app's own cortados-route) is still shown, under its own heading
+const machine = atom({ plugin: 'cortados-pulse', key: 'machine' } as const, null as string | null)
 /** #127: GET /v1/cortados/local (provider/local_switch.py): the local nodes as their gates report them. */
 type NodesHeld = { data: PulseLocalView; at: number }
 const nodes = atom({ plugin: 'cortados-pulse', key: 'nodes' } as const, null as NodesHeld | null)
@@ -152,6 +162,26 @@ export async function identify($: Pick<EngineInterface, 'env' | 'fs' | 'session'
   } catch {
     return { tag: null, why: 'session not identified: its id could not be read' }
   }
+}
+
+/** A device name normalised as cortados-route's child_tasks.office_name(device=True) and cortados-routed-subagents'
+ * officeName do it: every run outside [A-Za-z0-9._-] becomes "-", trimmed, cut to 64; null without a letter or digit. */
+export function deviceName(s: unknown): string | null {
+  const t = String(s ?? '').replace(/[^A-Za-z0-9._-]+/g, '-').trim().slice(0, 64)
+  return /[A-Za-z0-9]/.test(t) ? t : null
+}
+
+/** This machine's short host name (`hostname -s`, as the MCP server's socket.gethostname().split(".")[0]) in the
+ * device form, held once found; null when it cannot be read (then the untagged group is simply not asked for). */
+export async function machineName($: Pick<EngineInterface, 'process' | 'state'>): Promise<string | null> {
+  const known = await read($, machine)
+  if (known) return known
+  try {
+    const r = await $.process.run(['/bin/hostname', '-s'])
+    const name = r && (r as any).exitCode === 0 ? deviceName(String((r as any).stdout ?? '').trim()) : null
+    if (name) await update($, machine, () => name)
+    return name
+  } catch { return null }                                   // no process access: the group is not asked for
 }
 
 /** `~` and `~/...` to $HOME (the only form the config documents; `~user` is left alone). */
@@ -371,7 +401,7 @@ export async function pollLive($: LiveDollar, cfg: Cfg, me = false): Promise<voi
 
 async function pollLiveOnce($: LiveDollar, cfg: Cfg, me: boolean): Promise<void> {
   // every poll: /clear and resume move the pane to another session id
-  const m = me ? await identify($ as Pick<EngineInterface, 'env' | 'fs' | 'session'>) : null
+  const m = me ? await identify($ as unknown as Pick<EngineInterface, 'env' | 'fs' | 'session'>) : null   // the hooks' $ has session
   if (m) await update($, mine, () => m)
   // this machine's own log first: it draws even when the provider cannot be reached (#118)
   if (m?.tag) await readLocal($, m.tag)
@@ -393,8 +423,8 @@ async function pollLiveOnce($: LiveDollar, cfg: Cfg, me: boolean): Promise<void>
 export type SessionRead = { kind: 'held'; data: PulseSessionView; url: string } | { kind: 'absent' }
   | { kind: 'failed'; problem: string; pendingSince: number | null }
 
-export async function readSessionView($: LiveDollar, cfg: Cfg, tag: string): Promise<SessionRead> {
-  const f = await fetchView($, cfg, SESSION_PATH + '?session=' + tag)
+export async function readSessionView($: LiveDollar, cfg: Cfg, tag: string, device: string | null = null): Promise<SessionRead> {
+  const f = await fetchView($, cfg, SESSION_PATH + '?session=' + tag + (device ? '&device=' + encodeURIComponent(device) : ''))
   if (f.ok) {
     const data = f.data as PulseSessionView
     return data.session_filter === tag && data.orchestrators && typeof data.orchestrators === 'object'
@@ -407,7 +437,7 @@ export async function readSessionView($: LiveDollar, cfg: Cfg, tag: string): Pro
  * failed (401/403/5xx/network: said, the held subtree stays with its age). False only for a provider without the view
  * (404, or an answer that is not this session's subtree): the pane then falls back to the fleet view. */
 export async function fetchTree($: LiveDollar, cfg: Cfg, tag: string): Promise<boolean> {
-  const r = await readSessionView($, cfg, tag)
+  const r = await readSessionView($, cfg, tag, await machineName($))
   if (r.kind === 'held') {
     const at = await $.clock.now()
     await update($, tree, () => ({ data: r.data, at, tag, base: r.url }))
@@ -1161,6 +1191,120 @@ export function laneOrder(lanes: string[]): string[] {
   return [...lanes].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
 }
 
+// ---- the default view (0.6.3; pure, tested) ------------------------------------------------------------------------
+// The owner (2026-11-22): "way too complicated, I don't know if it's right". The default view is five things, top to
+// bottom: this session's child tasks (one line each), the local Pro model, the subscriptions (only the lowest and any
+// that are out), S1, and the dashboard link. Everything else (work split, sub-sessions, usage, every lane's windows,
+// local node details, devices, the hosts' jobs) is behind `d`.
+
+/** How many finished tasks the default view lists under the running ones. */
+export const FINISHED_SHOWN = 3
+/** A title is cut to this many characters so a task stays one line in a 40-60 column pane. */
+export const TITLE_MAX = 40
+export const NO_TASKS = 'no task started from this session in the last 24 h'
+export const UNTAGGED_HEAD = 'started on this machine without a session tag'
+export const UNTAGGED_WHY = '(a cortados-route server that knew no session started them, e.g. the desktop app\'s own; d: details)'
+
+const STATE_WORD: Record<string, string> = { queued: 'waiting', elsewhere: 'state on its host' }
+const isLive = (t: PulseTreeTask) => t.status === 'running' || t.status === 'waiting'
+
+/** One task, one line: glyph, title, host, model, state, elapsed (counting between polls while it runs). */
+export function taskRow(t: PulseTreeTask, since: number): TreeLine {
+  const raw = t.title || ('task ' + (t.task_id ?? '?'))
+  const title = raw.length > TITLE_MAX ? raw.slice(0, TITLE_MAX - 1) + '…' : raw
+  const state = t.state ? (STATE_WORD[t.state] ?? t.state) : (t.status ?? 'unknown')
+  const el = typeof t.elapsed_s === 'number' ? dur(t.elapsed_s + (isLive(t) && t.ended_at == null ? since : 0)) : null
+  return { text: glyph(t.status, t.state) + ' ' + join([title, t.host, t.model, state, el]),
+    attn: t.status === 'failed' || t.status === 'unknown' }
+}
+
+/** Every task of a group, nested ones too, flattened: running and waiting first (newest first), then the last
+ * FINISHED_SHOWN finished (newest first); a "+N more" line for the rest. Deduplicated by task id. */
+export function taskRows(groups: (PulseOrchestrator | undefined)[], since: number): TreeLine[] {
+  const all = new Map<string, PulseTreeTask>()
+  const walk = (ts: PulseTreeTask[] = []) => ts.forEach(t => { all.set(t.task_id ?? String(all.size), t); walk(t.tasks) })
+  let hidden = 0
+  for (const g of groups) { if (g) { walk(g.tasks); hidden += g.tasks_hidden ?? 0 } }
+  const newest = (t: PulseTreeTask) => -(t.ended_at ?? t.started_at ?? 0)
+  const list = [...all.values()]
+  const live = list.filter(isLive).sort((a, b) => -(a.started_at ?? 0) + (b.started_at ?? 0))
+  const done = list.filter(t => !isLive(t)).sort((a, b) => newest(a) - newest(b))
+  const shownLive = live.slice(0, RUNNING_MAX)
+  const out = [...shownLive, ...done.slice(0, FINISHED_SHOWN)].map(t => taskRow(t, since))
+  const more = live.length - shownLive.length + Math.max(0, done.length - FINISHED_SHOWN) + hidden
+  if (more > 0) out.push({ text: '  +' + more + ' more (dashboard)' })
+  return out
+}
+
+/** The default view's task block from the session view: this session's own tasks (and its alias tag's, the tasks it
+ * started under its cortados-route server's tag), then this machine's untagged ones under their own heading. */
+export function defaultTaskLines(v: PulseSessionView, tag: string, since: number, aliasView?: PulseSessionView | null,
+  aliasTagged?: string | null): TreeLine[] {
+  const o = v.orchestrators ?? {}
+  if (o.status === 'error') return [{ text: 'tasks unavailable: ' + errs(o), attn: true }]
+  const items = o.items ?? []
+  const own = items.find(x => x.origin === tag)
+  const al = aliasView && aliasTagged ? (aliasView.orchestrators?.items ?? []).find(x => x.origin === aliasTagged) : undefined
+  const out: TreeLine[] = []
+  if (o.status === 'partial') out.push({ text: 'partial: ' + errs(o), attn: true })
+  const rows = taskRows([own, al], since)
+  out.push(...(rows.length ? rows : [{ text: NO_TASKS }]))
+  const untagged = items.find(x => x.kind === 'untagged')
+  if (untagged && (untagged.tasks ?? []).length) {
+    out.push({ text: UNTAGGED_HEAD + ' (' + (untagged.device ?? 'this machine') + ')' })
+    out.push(...taskRows([untagged], since))
+  }
+  return out
+}
+
+/** The local model in one line: the Pro's node (else the first node), its switch, and why it is or is not allowed. */
+export function localModelLine(v: PulseLocalView | null, problem: string | null, prefer = 'pro'): string {
+  if (!v) return 'local model: ' + (problem ?? 'loading…')
+  const list = v.nodes ?? []
+  const n = list.find(x => x.node === prefer) ?? list[0]
+  if (!n) return 'local model: ' + (v.note || 'no local node configured')
+  const name = 'local ' + (n.node ?? '?')
+  if (!n.reachable) return name + ': unreachable' + (n.error ? ' · ' + n.error : '')
+  const sw = n.switch ?? 'unknown'
+  if (n.allowed === true) return name + ': ' + sw + ' · in use' + (n.models_loaded?.length ? ' · ' + n.models_loaded.join(', ') : '')
+  return name + ': ' + sw + (n.allowed === false ? ' · not used' : ' · allowed unknown') + (n.reason ? ' · ' + n.reason : '')
+}
+
+/** The subscriptions in one line: the lane with the least left (its lowest window) and every lane that is out. */
+export function subsLine(snap: Pulse | null, lowest?: NonNullable<PulseLive['overview']>['lowest_subscription'] | null): string {
+  const subs = snap?.subscriptions ?? {}
+  const readings = snap?.readings ?? {}
+  const lanes = Object.keys(subs).filter(k => k !== 'error' && k !== 'local' && subs[k] !== null && typeof subs[k] === 'object')
+  const out: string[] = []
+  let low: { label: string; left: number; window: string } | null = null
+  for (const lane of laneOrder(lanes)) {
+    const h = subs[lane] as PulseLaneHealth
+    const r = typeof readings[lane] === 'object' ? readings[lane] as PulseReading : undefined
+    const label = laneLabel(lane, r ?? {})
+    if (h.ok === false) { out.push(label); continue }
+    for (const w of r?.windows ?? []) {
+      const left = leftPct(w)
+      // the window's name only ("month", "week"): its parenthesised pool detail is in the details
+      if (left !== null && (low === null || left < low.left)) low = { label, left, window: (w.window || 'window').split(' (')[0] ?? 'window' }
+    }
+  }
+  if (!low && lowest && typeof lowest.left_pct === 'number') {
+    low = { label: lowest.label || lowest.lane || '?', left: lowest.left_pct, window: (lowest.window || 'window').split(' (')[0] ?? 'window' }
+  }
+  const lowText = low ? `lowest ${low.label} ${pct(low.left)} left (${low.window})` : snap ? 'no quota known' : 'loading…'
+  return 'subscriptions: ' + join([lowText, out.length ? 'OUT: ' + out.join(', ') : null])
+}
+
+/** S1 in one line: up or down, and the median scoring latency over the last scored turns (else the last probe's). */
+export function s1Line(live: PulseLive | PulseSessionView | null, usage?: PulseUsage | null): string {
+  const o = live?.overview ?? {}, s1 = live?.s1 ?? {}
+  const median = usage?.s1_latency_ms?.median
+  const lat = typeof median === 'number' ? `${median} ms median` : typeof s1.latency_ms === 'number' ? `${s1.latency_ms} ms (last probe)` : null
+  if (o.s1 === 'up') return join(['S1 up', lat])
+  if (o.s1 === 'down') return join(['S1 DOWN', s1.reason ?? null])
+  return 'S1 unknown'
+}
+
 // ---- hooks -------------------------------------------------------------------------------------------------------
 
 let ticking: Timer | null = null
@@ -1218,6 +1362,8 @@ export const register: Register = (on, options) => {
     const line = (text: string) => Text({ children: text })
     const dim = (text: string) => Text({ dimColor: true, children: text })
     const head = (text: string) => Text({ bold: true, children: text })
+    const row = (l: TreeLine | AliasLine) => l.attn ? Text({ bold: true, children: l.text })
+      : (l as AliasLine).dim ? dim(l.text) : line(l.text)
     const h = await read($, held)
     const problem = await read($, err)
     const lv = await read($, liveHeld)
@@ -1228,6 +1374,7 @@ export const register: Register = (on, options) => {
     const trProblem = await read($, treeErr)
     const loc = await read($, localHeld)
     const open = await read($, wsOpen)
+    const more = await read($, detailsOpen)
     const nv = await read($, nodes)
     const nvProblem = await read($, nodesErr)
     const al = await read($, alias)
@@ -1235,29 +1382,42 @@ export const register: Register = (on, options) => {
     const splitRows = (lines: SplitLine[]) => lines.map(l => l.dim ? dim(l.text) : line(l.text))
     const toggle = Button({ key: 'cortados-pulse-ws', label: open ? 'w: hide the work split breakdown' : 'w: work split breakdown',
       hotkey: 'w', plain: true, dimColor: true, onPress: () => { void update($, wsOpen, v => !v) } })
+    const details = Button({ key: 'cortados-pulse-details', label: more ? 'd: hide details' : 'd: details',
+      hotkey: 'd', plain: true, dimColor: true, onPress: () => { void update($, detailsOpen, v => !v) } })
     const localFor = (tag: string | null | undefined) => loc && tag && loc.tag === tag ? loc.tasks : []
     const nowMs = await $.clock.now()
-    let running: ReturnType<typeof line>[], fleet: ReturnType<typeof line>[], link: ReturnType<typeof line>[]
+    const usage = h?.data.usage ?? null
+    const subsText = (lowest?: NonNullable<PulseLive['overview']>['lowest_subscription'] | null) =>
+      !h && problem ? 'subscriptions: ' + problem : subsLine(h?.data ?? null, lowest)
+    // The default view, top to bottom (0.6.3): this session's child tasks, the local model, the subscriptions, S1, the
+    // dashboard link. `d` opens the rest (`extra`).
+    let top: ReturnType<typeof line>[], extra: ReturnType<typeof line>[], link: ReturnType<typeof line>[]
     if (tr && me?.tag === tr.tag) {
-      // the per-session view: this session's tree and session-free fleet health, nothing of another session
+      // the per-session view: this session's tasks (and this machine's untagged ones), nothing of another session
       const since = (nowMs - tr.at) / 1000
       const merged = mergeLocal(tr.data, localFor(tr.tag), tr.tag, tr.at / 1000)
-      // tasks this session started under another tag (its cortados-route server's, after a /clear): drawn too
-      const aliasRows = aliasLines(al, alErr, tr.tag, nowMs)
-        .map(l => l.attn ? Text({ bold: true, children: l.text }) : l.dim ? dim(l.text) : line(l.text))
-      running = [
-        head('This session'),
+      const alHeld = al && al.tag !== tr.tag && !(alErr?.tag === al.tag && alErr.pendingSince !== null &&
+        nowMs - alErr.pendingSince > STALE_AFTER_MS) ? al : null
+      top = [
+        head("This session's child tasks"),
+        ...defaultTaskLines(merged.view, tr.tag, since, alHeld?.data, alHeld?.tag).map(row),
+        ...(trProblem ? [dim(trProblem + ' · showing ' + age(since) + ' old data')] : []),
+        line(localModelLine(nv?.data ?? null, nvProblem)),
+        line(subsText(tr.data.overview?.lowest_subscription)),
+        line(s1Line(tr.data, usage)),
+      ]
+      link = [dim('dashboard ' + tr.base + '/dashboard')]
+      extra = [
+        head('This session in detail'),
         ...splitRows(workSplitLines(tr.data.work_split, open)),
         ...(tr.data.work_split?.row ? [toggle] : []),
-        ...treeLines(merged.view, tr.tag, since).map(l => l.attn ? Text({ bold: true, children: l.text }) : line(l.text)),
+        ...treeLines(merged.view, tr.tag, since).map(row),
         ...(merged.added ? [dim(LOCAL_NOTE(merged.added))] : []),
         ...(loc?.note && loc.tag === tr.tag ? [dim(loc.note)] : []),
-        ...aliasRows,
-        ...(trProblem ? [dim(trProblem + ' · showing ' + age(since) + ' old data')] : []),
+        ...aliasLines(al, alErr, tr.tag, nowMs).map(row),
         dim(CLEAR_NOTE),
+        head('Fleet'), ...fleetLines(tr.data as PulseLive).map(line),
       ]
-      fleet = [head('Fleet'), ...fleetLines(tr.data as PulseLive).map(line)]
-      link = [dim('dashboard ' + tr.base + '/dashboard')]
     } else {
       // no tag, or a provider from before the per-session view: the fleet view, this session's tasks picked out of it
       const own = ml && me?.tag === ml.tag ? ml : lv
@@ -1265,48 +1425,58 @@ export const register: Register = (on, options) => {
       const shownIds = new Set([...(own?.data.tasks?.running ?? []), ...(own?.data.tasks?.queued ?? []),
         ...(own?.data.tasks?.recent ?? [])].map(x => x.task_id ?? ''))
       const mineLocal = me?.tag && loc ? localLines(localFor(me.tag), me.tag, shownIds, loc.at / 1000, (nowMs - loc.at) / 1000) : []
-      running = [
-        head('This session'),
+      top = [
+        head("This session's child tasks"),
         ...(trProblem ? [dim(trProblem)] : []),
         ...(own ? sessionLines(own.data, me, (nowMs - own.at) / 1000).map(line) : []),
-        ...mineLocal.map(l => l.attn ? Text({ bold: true, children: l.text }) : line(l.text)),
+        ...mineLocal.map(row),
         ...(loc?.note && me?.tag && loc.tag === me.tag ? [dim(loc.note)] : []),
         ...(lv ? [] : [dim(me && !me.tag ? me.why || '' : 'waiting for the live view…')]),
+        ...(lvProblem ? [dim(lvProblem + (lv ? ' · showing ' + age((nowMs - lv.at) / 1000) + ' old data' : ''))] : []),
+        line(localModelLine(nv?.data ?? null, nvProblem)),
+        line(subsText(lv?.data.overview?.lowest_subscription)),
+        line(s1Line(lv?.data ?? null, usage)),
+      ]
+      link = lv ? [dim('dashboard ' + lv.base + '/dashboard')] : []
+      extra = [
         ...(me?.tag ? [dim(CLEAR_NOTE)] : []),
         head('Running'),
         ...(lv ? runningLines(lv.data, (nowMs - lv.at) / 1000).map(line) : lvProblem ? [] : [dim('loading the live view…')]),
-        ...(lvProblem ? [dim(lvProblem + (lv ? ' · showing ' + age((nowMs - lv.at) / 1000) + ' old data' : ''))] : []),
+        ...(lv ? [head('Fleet'), ...fleetLines(lv.data).map(line)] : []),
       ]
-      fleet = lv ? [head('Fleet'), ...fleetLines(lv.data).map(line)] : []
-      link = lv ? [dim('dashboard ' + lv.base + '/dashboard')] : []
     }
-    if (!h) return Box({ flexDirection: 'column', children: [...running, ...fleet, dim(problem || 'loading the resource pool…'), ...link] })
-    const s = h.data
-    const nowS = typeof s.generated_at === 'number' ? s.generated_at + (nowMs - h.at) / 1000 : nowMs / 1000
-    const subs = s.subscriptions ?? {}
-    const readings = s.readings ?? {}
-    const lanes = laneOrder(Object.keys(subs).filter(k => k !== 'error' && subs[k] !== null && typeof subs[k] === 'object'))
-    const subsError = typeof subs.error === 'string' ? subs.error : null
-    const readingsError = typeof readings.error === 'string' ? readings.error : null
-    const rows = [
-      ...running,
-      head('Usage'),
-      ...usageLines(s.usage ?? {}).map(line),
-      head('Subscriptions'),
-      ...(subsError ? [dim('subscriptions: ' + subsError)] : []),
-      ...(readingsError ? [dim('readings: ' + readingsError)] : []),
-      ...(lanes.length === 0 && !subsError ? [dim('none cached')] : []),
-      ...lanes.flatMap(lane => laneLines(lane, subs[lane] as PulseLaneHealth,
-        typeof readings[lane] === 'object' ? readings[lane] as PulseReading : undefined, nowS)).map(line),
-      head('Local nodes'),
-      ...localNodeLines(nv?.data ?? null, nvProblem).map(line),
-      head('Devices'),
-      dim('resource-pool probe (fleet config SSH targets), not the local gate'),
-      ...deviceLines(s.devices ?? { status: 'pending', nodes: [] }).map(line),
-      ...fleet,
-      dim('snapshot ' + age((nowMs - h.at) / 1000) + ' old' + (problem ? ' · ' + problem : '')),
-      ...link,
-    ]
-    return Box({ flexDirection: 'column', children: rows })
+    if (more) {
+      if (h) {
+        const s = h.data
+        const nowS = typeof s.generated_at === 'number' ? s.generated_at + (nowMs - h.at) / 1000 : nowMs / 1000
+        const subs = s.subscriptions ?? {}
+        const readings = s.readings ?? {}
+        const lanes = laneOrder(Object.keys(subs).filter(k => k !== 'error' && subs[k] !== null && typeof subs[k] === 'object'))
+        const subsError = typeof subs.error === 'string' ? subs.error : null
+        const readingsError = typeof readings.error === 'string' ? readings.error : null
+        extra.push(
+          head('Usage'),
+          ...usageLines(s.usage ?? {}).map(line),
+          head('Subscriptions'),
+          ...(subsError ? [dim('subscriptions: ' + subsError)] : []),
+          ...(readingsError ? [dim('readings: ' + readingsError)] : []),
+          ...(lanes.length === 0 && !subsError ? [dim('none cached')] : []),
+          ...lanes.flatMap(lane => laneLines(lane, subs[lane] as PulseLaneHealth,
+            typeof readings[lane] === 'object' ? readings[lane] as PulseReading : undefined, nowS)).map(line),
+        )
+      }
+      extra.push(
+        head('Local nodes'),
+        ...localNodeLines(nv?.data ?? null, nvProblem).map(line),
+      )
+      if (h) extra.push(
+        head('Devices'),
+        dim('resource-pool probe (fleet config SSH targets), not the local gate'),
+        ...deviceLines(h.data.devices ?? { status: 'pending', nodes: [] }).map(line),
+      )
+      extra.push(dim(h ? 'snapshot ' + age((nowMs - h.at) / 1000) + ' old' + (problem ? ' · ' + problem : '')
+        : problem || 'loading the resource pool…'))
+    }
+    return Box({ flexDirection: 'column', children: [...top, ...link, details, ...(more ? extra : [])] })
   })
 }

@@ -1100,7 +1100,7 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
                           session: str | None = None, inputs_truncated: list | None = None,
                           task_hosts: list | None = None, conflicts: int | None = None,
                           run_origins: dict[str, Any] | None = None,
-                          conflicted: Any = frozenset()) -> dict[str, Any]:
+                          conflicted: Any = frozenset(), untagged_device: str | None = None) -> dict[str, Any]:
     """The orchestrator tree: each orchestrating main session (its Office tag), the bot gateway ("grokbot") and an
     unattributed group, each with the child tasks it started in the window (nested under their parent task through
     parent_task_id) and, under each task, its sub-sessions (the run's routed conversations, x-cortados-run-id).
@@ -1121,7 +1121,12 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
     another host or origin; published as a count, never with the ids or what was claimed.
     `run_origins` (run id -> the origin the provider observed on the run's requests): a heartbeat row's run tokens
     join only through it (_task_subs). `conflicted`: run ids that join nothing (conflicted_runs; collect's covers the
-    Office workers too); the runs this function's own inputs show conflicted are added to it."""
+    Office workers too); the runs this function's own inputs show conflicted are added to it.
+    `untagged_device` (with `session` only, valid_device): the tasks of that machine that carry NO origin tag at all
+    (own or through a parent) are built as one more group, kind "untagged", origin None: tasks started through a
+    cortados-route server that knew no session (the Claude desktop app's own server, a missing salt). They belong to
+    no session, so showing them to a session of the machine that started them reveals no other session's work; a
+    task with any origin tag, the bot's included, never enters it (docs/PULSE-PER-SESSION.md §11)."""
     run_tokens = run_tokens if isinstance(run_tokens, dict) else {}
     run_origins = run_origins if isinstance(run_origins, dict) else {}
     conflicted = _UnionRuns(conflicted, conflicted_runs(None, [backend, ended], run_origins))
@@ -1138,7 +1143,8 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
     origin_of: dict[str, Any] = {}
     for r in list(by_id.values()):
         origin, via = _origin_of(by_id, r)
-        if session is not None and origin != session:
+        if session is not None and origin != session and not (
+                untagged_device is not None and origin is None and r.get("origin_device") == untagged_device):
             continue                                # filtered before anything is built or capped
         origin_of[r["task_id"]] = origin
         nodes[r["task_id"]] = _task_node(r, subs.get(r["task_id"], []), run_tokens.get(r["task_id"]), via,
@@ -1210,7 +1216,9 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
             finish(n, counts)
         o = live_orch.get(origin) if origin else None
         g = groups.get(origin) or {}
-        kind = "unattributed" if origin is None else "bot" if origin in child_tasks.ORIGIN_NAMED else "session"
+        # with a session filter the only origin-less group is this machine's untagged tasks (see untagged_device)
+        kind = ("untagged" if session is not None else "unattributed") if origin is None \
+            else "bot" if origin in child_tasks.ORIGIN_NAMED else "session"
         rs = routed.get(origin, []) if origin else []
         newest = max([n.get("ended_at") or n.get("started_at") or 0 for n in top] +
                      [(o or {}).get("last_activity") or 0], default=0)
@@ -1227,7 +1235,7 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
     # active first (a running or waiting task, a working main session), the unattributed group last among equals,
     # then by the newest activity
     out.sort(key=lambda x: (not (x["counts"]["running"] or x["counts"]["waiting"] or x["status"] == "working"),
-                            x["kind"] == "unattributed", -(x["last_activity"] or 0)))
+                            x["kind"] in ("unattributed", "untagged"), -(x["last_activity"] or 0)))
     cut = sorted(set(inputs_truncated or []))
     fields = {"scope": SCOPE if task_hosts is None else TREE_SCOPE, "window_s": int(CHILD_WINDOW_S),
               "items": out[:ORCH_MAX], "truncated": len(out) > ORCH_MAX or bool(cut), "inputs_truncated": cut}
@@ -1237,6 +1245,8 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
         fields["conflicts"] = conflicts
     if session is not None:
         fields["session_filter"] = session
+        if untagged_device is not None:
+            fields["untagged_device"] = untagged_device
     return _section(now, _status(errors, bool(out)), errors, **fields)
 
 
@@ -1247,7 +1257,9 @@ def session_view(snap: dict[str, Any], session: str) -> dict[str, Any]:
     """GET /v1/cortados/live/session?session=<tag>: the pulse pane's view. ONLY that session's orchestrator subtree
     (built filtered, see orchestrators_section) plus fleet health that names no session (S1, the hosts' job
     heartbeats and hardware, the lowest subscription window). No task, conversation, routed call or count of any
-    other session is in it. `snap` must come from collect(session=session)."""
+    other session is in it. `snap` must come from collect(session=session). With `&device=<name>` (collect's
+    untagged_device) the orchestrators also hold that machine's untagged group (kind "untagged": tasks that carry no
+    origin tag at all), never another session's."""
     o = snap.get("overview") or {}
     return {"version": VERSION, "generated_at": snap.get("generated_at"), "session_filter": session,
             "overview": {"s1": o.get("s1"), "s1_latency_ms": o.get("s1_latency_ms"),
@@ -1270,9 +1282,15 @@ def for_session(snap: dict[str, Any], session: str) -> dict[str, Any]:
     c = dict(snap.get("conversations") or {})
     c["items"] = [it for it in c.get("items") or [] if it.get("session") == session]
     o = dict(snap.get("orchestrators") or {})
-    o["items"] = [g for g in o.get("items") or [] if g.get("origin") == session]
+    # the session's own group, and the machine's untagged group when it was asked for (orchestrators_section)
+    o["items"] = [g for g in o.get("items") or [] if g.get("origin") == session or g.get("kind") == "untagged"]
     o["session_filter"] = session
     return {**snap, "session_filter": session, "tasks": t, "conversations": c, "orchestrators": o}
+
+
+def valid_device(v: Any) -> str | None:
+    """A ?device= value (the Office device rule: the name cortados-route records as origin_device), else None."""
+    return v if isinstance(v, str) and office._HEADER_RULES[office.DEVICE_HEADER].fullmatch(v) else None
 
 
 def valid_session(v: Any) -> str | None:
@@ -1689,7 +1707,8 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
             stubs_by_id: Callable[[list[str]], list] | None = None,
             binding_errors: Callable[[], list] | None = None,
             api_credit: Callable[[], dict[str, Any]] | None = None,
-            session: str | None = None, peek_foreign: bool = True) -> dict[str, Any]:
+            session: str | None = None, peek_foreign: bool = True,
+            untagged_device: str | None = None) -> dict[str, Any]:
     """The snapshot. Each input is a callable, run under its own guard: one that raises turns ITS section into
     status "error" with the exception's type (never its text: an OSError carries a path), the rest stand.
     `session` (already valid, valid_session): the ?session= view (for_session), its tasks filtered before the caps.
@@ -1702,7 +1721,9 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     read before any session filtering, so ownership is checked against every stub here in every view (review round 4,
     P2); the records found are compared, never published. `run_origins`: run id -> the origin the provider saw on the
     run's requests (RunRecords.run_origins), the only key a heartbeat task's tokens join on. `binding_errors`: the
-    heartbeat board's bindings-file trouble (HeartbeatBoard.errors), shown in the tree's errors."""
+    heartbeat board's bindings-file trouble (HeartbeatBoard.errors), shown in the tree's errors. `untagged_device`
+    (with `session`, already valid, valid_device): the tree also holds that machine's tasks that carry no origin tag
+    (orchestrators_section)."""
     def guard(source: str, fn: Callable[[], Any], errs: list) -> Any:
         try:
             return fn()
@@ -1820,7 +1841,8 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
                                  task_side + (conv["errors"] if conv["status"] != "ok" else []) + tree_errs + hb_errs,
                                  session, inputs_truncated=cut, task_hosts=task_hosts,
                                  conflicts=hb_conflicts if session is None else None,
-                                 run_origins=r_orig if isinstance(r_orig, dict) else None, conflicted=conflicted)
+                                 run_origins=r_orig if isinstance(r_orig, dict) else None, conflicted=conflicted,
+                                 untagged_device=untagged_device if session is not None else None)
     tv_errs: list = []
     tv = guard("router.db", tasks_view, tv_errs)
     # The work split's child runs whose requests carried no origin are attributed through the provider host's OWN task

@@ -3,6 +3,42 @@
 A mod: a pane beside the chat that shows what CortadOS is running and the resource pool behind it. It reads two of the
 provider's views with the same token: `GET /v1/cortados/live` every 10 seconds and `GET /resources` every 20.
 
+**The default view (0.6.3).** The owner found the pane "way too complicated", so by default it shows five things, top
+to bottom:
+
+```
+This session's child tasks
+● Build the tree · air · claude-sonnet-5 · running · 5m 00s
+◷ Wait for Chrome · pro · claude-sonnet-5 · waiting · 40s
+✓ Deeper step · air · succeeded · 50s
+started on this machine without a session tag (Forests-MacBook-Pro)
+● pstack plugin deep-read · air · gpt-6.1-sol · running · 4m 10s
+local pro: on · in use · qwen3.5-27b-mlx-4bit
+subscriptions: lowest codex 30% left (week) · OUT: claude
+S1 up · 23 ms median
+dashboard http://<provider>:8432/dashboard
+d: details
+```
+
+1. **This session's child tasks**, one line each (title, host, model, state, elapsed, counting while it runs): running
+   and waiting first, then the last three finished, `+N more (dashboard)` for the rest; nested tasks are flattened into
+   the list; failed and unknown ones are bold. Tasks this session started under its cortados-route server's tag (after
+   a `/clear`) are in the same list. Then, under **started on this machine without a session tag**, this machine's
+   tasks that carry no session tag at all: tasks started through a cortados-route server that knew no session, such as
+   the one the Claude desktop app runs from its own MCP config (docs/PULSE-PER-SESSION.md §11).
+2. **The local model**: the `pro` node of `GET /v1/cortados/local` (else the first node): its switch and whether it is
+   in use, or why not.
+3. **The subscriptions**: only the lane with the least left (its lowest window) and every lane that is out.
+4. **S1**: up or down, and its median latency over the last scored turns (else the last probe's).
+5. The **dashboard** link.
+
+`d` (or the `d: details` button) opens everything else, as described below: the work split and its `w` breakdown, the
+session's tree with sub-sessions and routed subagents, the notes, the fleet's hosts, usage, every lane, the local
+nodes and the devices. The privacy rule is unchanged: the pane reads only its own session's view, plus this machine's
+untagged tasks.
+
+The sections below are the details view.
+
 - **This session** (at the top) — a live tree of THIS session's own work, in the style of claude-flightdeck
   (`docs/PULSE-PER-SESSION.md`): a count line (running / waiting / done / failed / unknown) and `! N needs attention`
   when a task failed or its state is unknown; each running or queued `start_task` child opened (title and elapsed time
