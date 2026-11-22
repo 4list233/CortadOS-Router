@@ -15,9 +15,12 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cortados_router import workspaces as ws  # noqa: E402
+from tests.git_isolation import isolate_git  # noqa: E402
 
 GIT_ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
            "GIT_COMMITTER_EMAIL": "t@x", "GIT_TERMINAL_PROMPT": "0", "HOME": tempfile.gettempdir()}
+IDENTITY = {k: GIT_ENV[k] for k in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+                                    "HOME")}
 TID = "t20261108120000-0000000a"
 TID2 = "t20261108120100-0000000b"
 
@@ -30,14 +33,13 @@ class _Base(unittest.TestCase):
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        # The module's own git calls run with os.environ: no global or system git config may reach the fixture (a
-        # user's core.hooksPath or init.templateDir would run hooks that write files into the test worktrees). Hooks
-        # a test installs in the clone's .git/hooks still apply, which is what the no-hook tests rely on.
-        isolate = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
-        env = mock.patch.dict(os.environ, isolate)
-        env.start()
-        self.addCleanup(env.stop)
-        GIT_ENV.update(isolate)
+        # The module's own git calls run with os.environ: no global, system or XDG git config and no inherited GIT_*
+        # variable may reach the fixture (a user's core.hooksPath or init.templateDir would run hooks that write files
+        # into the test worktrees, a global ignore file would make them "ignored content", #119). Hooks a test
+        # installs in the clone's .git/hooks still apply, which is what the no-hook tests rely on.
+        isolate_git(self)
+        GIT_ENV.clear()
+        GIT_ENV.update(os.environ, **IDENTITY)
         # The pauses between quiescence assessments are the module's own seam (ws._sleep), never the shared
         # time.sleep that subprocess polling also uses; no test waits for them in real time.
         self.sleeps = []
@@ -3072,6 +3074,34 @@ class RecoveryRefExpiryTests(_Base):
         want = f"{ws.RECOVERY_REF_PREFIX}{self.day(3)}/{TID}/orig-head"
         self.assertEqual(self.refs(ws.RECOVERY_REF_PREFIX), {want: lost})
         self.assertEqual(ws.preserve_recovery_refs(path, TID, now=self.NOW), 1)    # idempotent across days
+
+
+class GitIsolationTests(_Base):
+    """#119: a machine's git setup (an XDG ignore file, config injected through inherited GIT_* variables) must not
+    reach the fixture. Planted before the fixture runs, as a user's shell or a parent git would leave them."""
+
+    def setUp(self):
+        hostile = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, hostile, ignore_errors=True)
+        os.makedirs(os.path.join(hostile, "git"))
+        with open(os.path.join(hostile, "git", "ignore"), "w") as f:
+            f.write("hook-*.txt\n")
+        hooks = os.path.join(hostile, "hooks")
+        os.mkdir(hooks)
+        with open(os.path.join(hooks, "post-checkout"), "w") as f:
+            f.write('#!/bin/sh\necho ran > "$(git rev-parse --show-toplevel)/hook-machine.txt"\n')
+        os.chmod(os.path.join(hooks, "post-checkout"), 0o755)
+        env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": hostile,
+                                           "GIT_CONFIG_PARAMETERS": f"'core.hookspath'='{hooks}'"})
+        env.start()
+        self.addCleanup(env.stop)
+        super().setUp()
+
+    def test_a_pushed_worktree_archives_whatever_the_machine_git_setup(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        self.assertFalse(os.path.exists(os.path.join(rec["path"], "hook-machine.txt")))
+        settled = ws.settle(rec, self.root)
+        self.assertEqual(settled["state"], "archived", settled)
 
 
 if __name__ == "__main__":

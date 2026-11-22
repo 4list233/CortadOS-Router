@@ -19,6 +19,7 @@ from unittest import mock
 
 from cortados_router import child_tasks as ct
 from cortados_router import subagent_mcp as m
+from tests.git_isolation import isolate_git
 
 # Cross-language vectors (review 2026-11-13): the Python copies (child_tasks.office_name, subagent_mcp.origin_tag) and
 # cortados-routed-subagents' officeName / sessionTag must agree, or a task's origin and its session's Office floor drift
@@ -367,6 +368,7 @@ class ChildTaskBase(unittest.TestCase):
         self.tmp = os.path.realpath(tempfile.mkdtemp())   # macOS /var is a symlink; the private-dir check refuses symlinks
         self.work = os.path.join(self.tmp, "work")
         os.mkdir(self.work)
+        isolate_git(self)                                 # repo tasks settle real worktrees: no machine git config (#119)
         bin_ = os.path.join(self.tmp, "fake-claude")
         with open(bin_, "w") as f:
             f.write(FAKE.format(py=sys.executable))
