@@ -121,10 +121,11 @@ TOO_LARGE_MESSAGE = "local gate: too large for this node's memory"
 # admission; the provider routes the turn elsewhere (local_lane.GATE_UNSUPPORTED).
 UNSUPPORTED_MESSAGE = "local gate: content this node's model cannot read"
 # The capacity report's fields (GateServer.capacity, the 529 and 413 answers). Bytes and tokens are None without a
-# governor: reserved/free bytes of the budget beside the weights, and the most tokens one request may hold alone
-# (fit_tokens) and beside what runs now (free_tokens), which the provider's routing reads.
+# governor: reserved/free bytes of the budget in force beside the weights (budget_bytes: smaller while the owner is
+# active), and the most tokens one request may hold alone (fit_tokens) and beside what runs now (free_tokens), which
+# the provider's routing reads.
 CAPACITY_KEYS = ("limit", "inflight", "retiring", "draining", "owner", "pressure", "reason", "reserved_bytes",
-                 "free_bytes", "fit_tokens", "free_tokens", "image_inflight", "image_limit")
+                 "budget_bytes", "free_bytes", "fit_tokens", "free_tokens", "image_inflight", "image_limit")
 # Retirement (#126 review round 3, P1). On a vllm-mlx node serving a text-only model under a governor, a text turn's
 # ticket is NOT released when forwarding ends: closing the upstream connection does not end the request in vllm-mlx (it
 # defers the stream's close by 0.5 s and queues the scheduler abort until the executor's next step), so its rows may

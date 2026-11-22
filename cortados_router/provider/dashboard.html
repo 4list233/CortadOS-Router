@@ -813,7 +813,8 @@ function renderLocal(d, failure) {
     if (cap && cap.limit !== null && cap.limit !== undefined)
       add(c, el("div", "sub", (n.backend || "backend") + ": " + cap.inflight + " of " + cap.limit + " running" +
         (Number.isInteger(cap.reserved_bytes) && Number.isInteger(cap.free_bytes)
-          ? ", " + gib(cap.reserved_bytes) + " of " + gib(cap.reserved_bytes + cap.free_bytes) + " GiB reserved" : "") +
+          ? ", " + gib(cap.reserved_bytes) + " of " + gib(Number.isInteger(cap.budget_bytes) ? cap.budget_bytes
+              : cap.reserved_bytes + cap.free_bytes) + " GiB reserved" + (cap.owner ? " (owner " + cap.owner + " budget)" : "") : "") +
         (cap.reason ? " (" + cap.reason + ")" : "")));
     const a = n.auto_route;
     add(c, el("div", "sub muted", a ? "auto_route: " + a.model + " for " + (a.bands || []).join(", ") : "auto_route: off (pin-only)"));

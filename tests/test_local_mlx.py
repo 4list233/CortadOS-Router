@@ -236,10 +236,12 @@ class ByteBudgetTests(unittest.TestCase):
         self.assertEqual(local_governor.request_tokens(c, LONG_IN, LONG_MAX), 131072)   # capped at the context
         # the old per-request reservation, now the floor: 8 GiB + state + the 1.5 GiB margin
         self.assertEqual(self.long().legacy, 8 * GIB + int(0.15 * GIB) + int(1.5 * GIB))
-        # the computed peak governs a long turn: two KV copies of 128k (+ a cache step), its prefill chunk's scores
+        # the computed peak governs a long turn: its 128k of KV (+ a cache step) and one layer's replaced copy, its
+        # prefill chunk's scores; above the 11.93 GiB measured for a full turn on the Pro (2026-11-22) and within the
+        # 17.25 GiB owner-active budget
         self.assertEqual(self.a.request_bytes(LONG_IN, LONG_MAX), self.alone(self.long()))
-        self.assertGreater(self.alone(self.long()), 22 * GIB)
-        self.assertLess(self.alone(self.long()), 25 * GIB)                         # but it fits alone
+        self.assertGreater(self.alone(self.long()), int(11.93 * GIB))
+        self.assertLessEqual(self.alone(self.long()), local_governor.available_bytes(c, "active"))
         self.assertEqual(local_governor.request_tokens(c, SHORT_IN, SHORT_MAX), 8512)
         # no max_tokens: the backend's default output is reserved
         self.assertEqual(local_governor.request_tokens(c, 2, None), 2 + 32768)
@@ -251,7 +253,7 @@ class ByteBudgetTests(unittest.TestCase):
         ticket, snap = self.take(self.long())
         self.assertIsNone(ticket)
         self.assertEqual(snap["refused"], "busy")                    # it fits alone: retryable, not too_large
-        self.assertTrue(snap["reason"].startswith("memory budget: 1.1 GiB free, request needs"), snap)
+        self.assertTrue(snap["reason"].startswith("memory budget: 8.6 GiB free, request needs"), snap)
         self.assertEqual((snap["inflight"], snap["limit"]), (1, 8))  # the count had room: the bytes refused it
         self.assertEqual(snap["reserved_bytes"], self.alone(self.long()))
         self.assertEqual(snap["free_bytes"], 25 * GIB - self.alone(self.long()))
@@ -297,11 +299,13 @@ class ByteBudgetTests(unittest.TestCase):
         self.assertIsNone(self.take(self.short())[0])
 
     def test_the_six_bit_copy_refuses_a_full_context_turn_non_retryably(self):
-        six = local_governor.Admission(FixedGovernor(idle_s=3600, idle_cap=6, weights_bytes=int(22.4 * GIB)))
-        ticket, snap = self.take(self.long(six), six)                # 17.6 GiB beside the weights: never fits
+        # while the owner works: 9.85 GiB beside its 22.4 GB of weights (idle, 17.6 GiB, a full turn fits since the
+        # 2026-11-22 KV correction)
+        six = local_governor.Admission(FixedGovernor(idle_s=5, idle_cap=6, weights_bytes=int(22.4 * GIB)))
+        ticket, snap = self.take(self.long(six), six)                # does not fit now: non-retryable
         self.assertEqual((ticket, snap["refused"]), (None, "too_large"))
         self.assertEqual(snap["fit_tokens"], local_governor.text_room(six.governor.cfg, [],
-                                                                      int(40 * GIB - int(22.4 * GIB))))
+                                                                      int(32.25 * GIB) - int(22.4 * GIB)))
         self.assertLess(snap["fit_tokens"], 131072)
         first = self.take(six.text_load(40_000, 32_000), six)[0]     # a 72k-token turn fits alone
         self.assertIsNotNone(first)
@@ -778,7 +782,7 @@ class MlxGateRouteTests(MlxGateHarness):
         self.assertEqual(data["cortados_gate"], {"backend": "vllm-mlx", "limit": None, "inflight": 0, "retiring": 0,
                                                  "draining": False, "owner": None,
                                                  "pressure": None, "reason": "no governor", "reserved_bytes": None,
-                                                 "free_bytes": None, "fit_tokens": None, "free_tokens": None,
+                                                 "budget_bytes": None, "free_bytes": None, "fit_tokens": None, "free_tokens": None,
                                                  "image_inflight": None, "image_limit": None, "vision": None,
                                                  "fence": None})
         self.assertEqual(FakeVllm.seen, [("GET", "/v1/models", None)])
@@ -1424,12 +1428,14 @@ class MlxGateBoundTests(MlxGateHarness):
 
     def test_token_dense_input_is_not_over_admitted(self):
         # an earlier review's case: 100,000 chars of `a!` are 100,000 tokens. The old chars / 3.5 estimate (29,103
-        # tokens) admitted 7 at once. #126: each holds its 100k-token KV twice over plus its prefill chunk's scores
-        # (~19 GiB computed), so one fits in 25 GiB and no more.
+        # tokens) admitted 7 at once. #126: each holds its 100k-token KV (plus one layer's replaced copy, corrected
+        # 2026-11-22) and its prefill chunk's scores (~13 GiB computed), so while the owner works one fits in the
+        # 17.25 GiB active budget and no more (the count, 2, would admit a second).
+        self.governor.set(idle_s=5)
         body = dense_msg()
         held = [self.held(body)]
         self.assertEqual(self.gate.admission.reserved, self.expect(json.dumps(body).encode(), 1024))
-        self.assertLessEqual(self.gate.admission.reserved, 25 * GIB)
+        self.assertLessEqual(self.gate.admission.reserved, 17 * GIB + GIB // 4)
         for _ in range(4):
             code, raw, _ = self.call("/v1/messages", body)
             self.assertEqual(code, 529)
@@ -1506,8 +1512,9 @@ class MlxGateBoundTests(MlxGateHarness):
 
     def test_a_refused_turn_takes_nothing(self):
         # busy on bytes (529) and never fits (413): neither the count slot nor any bytes are held afterwards
+        self.governor.set(idle_s=5)                                      # owner active: count 2, 17.25 GiB
         body = dense_msg()
-        held = [self.held(body)]                                         # ~19 GiB computed of the 25 GiB (#126)
+        held = [self.held(body)]                                         # ~13 GiB computed of the 17.25 GiB
         reserved = self.gate.admission.reserved
         code, raw, _ = self.call("/v1/messages", body)
         self.assertEqual(code, 529)
