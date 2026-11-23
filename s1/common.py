@@ -37,8 +37,30 @@ def split_of(row_id: str) -> str:
     return "holdout" if int(hashlib.sha1(row_id.encode()).hexdigest(), 16) % 100 < 15 else "train"
 
 
+def jsonl_lines(text: str) -> list[str]:
+    """The records of a JSONL text: split on "\n" ONLY (a trailing "\r" is dropped). Never str.splitlines(): it also splits on
+    U+2028/U+2029, \x85, \x0b, \x0c and \x1c-\x1e, and json.dumps(..., ensure_ascii=False) leaves U+2028/U+2029/\x85 raw inside
+    strings, so one such request cut its row in two and every read_jsonl of requests.jsonl raised "Unterminated string" from
+    2026-11-17 (dataset.py failed every cycle and no S1 training ran)."""
+    return [l[:-1] if l.endswith("\r") else l for l in text.split("\n")]
+
+
+# Characters JSON allows raw inside a string (json.dumps(..., ensure_ascii=False) leaves them) that line-splitting tools treat as
+# line ends: str.splitlines() (all three), JavaScript (U+2028/U+2029), many editors. The C0 ones splitlines() also splits on
+# (\x0b, \x0c, \x1c-\x1e) are control characters json.dumps always escapes.
+_LINE_BREAKS = {"\u2028": "\\u2028", "\u2029": "\\u2029", "\x85": "\\u0085"}
+_LINE_BREAK_RE = re.compile("[\u2028\u2029\x85]")
+
+
+def dumps_jsonl(obj, **kw) -> str:
+    """One JSONL record (no newline): json.dumps(ensure_ascii=False) with U+2028, U+2029 and U+0085 written as \\u escapes.
+    These characters can only occur inside JSON strings (they are not JSON whitespace), so the escape decodes to the same value
+    and the line reads back identically with any JSON parser; every other non-ASCII character stays readable UTF-8, as before."""
+    return _LINE_BREAK_RE.sub(lambda m: _LINE_BREAKS[m.group(0)], json.dumps(obj, ensure_ascii=False, **kw))
+
+
 def read_jsonl(path: Path) -> list[dict]:
-    return [json.loads(l) for l in path.read_text().splitlines() if l.strip()] if path.exists() else []
+    return [json.loads(l) for l in jsonl_lines(path.read_text()) if l.strip()] if path.exists() else []
 
 
 # The tag at the head of every s1/label.py teacher message sent through the provider, so s1/dataset.py can tell the labeler's own router

@@ -225,25 +225,54 @@ if [ -z "${CORTADOS_ROUTER_DB_EXTRA+x}" ] && [ -f "$HOME/.cortados/router-air.db
   export CORTADOS_ROUTER_DB_EXTRA="$HOME/.cortados/router-air.db"
 fi
 trained_unevaluated_runs() {   # runs whose training completed but that have no report.json and are not the pending candidate
-  # completion = mlx_lm's final adapters.safetensors ("Saved final weights"): it is written only when a `lora` invocation runs all
-  # its iterations, and a completed segment always goes straight to evaluation, so it means "trained, evaluation owed".
-  # (Warm starts copy to 0000000_adapters.safetensors and checkpoints are 0*_adapters.safetensors, so neither is mistaken for it.)
+  # completion = run_trained (below), never the bare adapters.safetensors: mlx_lm rewrites that file at EVERY checkpoint ("Iter 100:
+  # Saved adapter weights to .../adapters.safetensors and .../0000100_adapters.safetensors"), so it existed in runs/2026-11-14 after
+  # 100 of 1,500 steps; that run was adopted as evaluation_pending and every night window went to evaluating it before any training.
+  # The final file is still required: it is what evaluation grades. A completed segment always goes straight to evaluation, so
+  # "trained, no report" means "evaluation owed".
   local d
   for d in $(ls -td runs/20*/ 2>/dev/null); do
     d=${d%/}
-    [ -f "$d/segment-target" ] && [ -f "$d/adapter/adapters.safetensors" ] && [ ! -f "$d/report.json" ] && echo "$d"
+    [ -f "$d/segment-target" ] && [ -f "$d/adapter/adapters.safetensors" ] && [ ! -f "$d/report.json" ] && run_trained "$d" && echo "$d"
   done
 }
-newest_unfinished_run() {   # most recent run stopped mid-training: a segment began, checkpoints exist, no final adapter, no report
-  # A run with the final adapters.safetensors is trained-but-unevaluated (the pending/recovery path's, see trained_unevaluated_runs),
+newest_unfinished_run() {   # most recent run stopped mid-training: a segment began, checkpoints exist, training not finished, no report
+  # A run whose segment finished (run_trained) is trained-but-unevaluated (the pending/recovery path's, see trained_unevaluated_runs),
   # not resumable. It is skipped HERE, inside the search, so an older interrupted run behind it is still found; rejecting it after
   # the search (as before) returned nothing, the older run was not carried, and the retention pass deleted its checkpoints.
+  # adapters.safetensors does not tell them apart (mlx_lm writes it at every checkpoint), so it neither proves nor rules out anything.
   local d
   for d in $(ls -td runs/20*/ 2>/dev/null); do
     d=${d%/}
-    [ -f "$d/segment-target" ] && [ ! -f "$d/report.json" ] && [ ! -f "$d/adapter/adapters.safetensors" ] \
+    [ -f "$d/segment-target" ] && [ ! -f "$d/report.json" ] && ! run_trained "$d" \
       && compgen -G "$d/adapter/*_adapters.safetensors" >/dev/null && { echo "$d"; return; }
   done
+}
+checkpointed_steps() {   # checkpointed_steps <run>: cumulative steps its checkpoints prove, as the training loop below counts them:
+  # iters-base + the highest NNNNNNN_adapters.safetensors step (mlx_lm restarts its counter at every resume), or a resume_<N> copy's N.
+  local d=$1 f n base best=0
+  base=$(cat "$d/iters-base" 2>/dev/null || echo 0); [[ "$base" =~ ^[0-9]{1,9}$ ]] || base=0
+  for f in "$d"/adapter/0*_adapters.safetensors "$d"/adapter/resume_*_adapters.safetensors; do
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in
+      resume_*) n=$(basename "$f" | sed -nE 's/^resume_([0-9]{1,9})_adapters\.safetensors$/\1/p'); [ -n "$n" ] && n=$((10#$n)) ;;
+      *) n=$(basename "$f" | sed -nE 's/^0*([0-9]{1,9})_adapters\.safetensors$/\1/p'); [ -n "$n" ] && n=$((10#$base + 10#$n)) ;;
+    esac
+    [ -n "$n" ] && [ "$n" -gt "$best" ] && best=$n
+  done
+  echo "$best"
+}
+run_trained() {   # run_trained <run>: true only when its LoRA segment FINISHED. Any one of:
+  #   training-complete: written by this script when the training loop below ends (mlx_lm exited 0 on the whole segment, or the
+  #                      checkpoints already reached the target);
+  #   the run's own log shows mlx_lm's end-of-training line (runs trained before training-complete existed; logs rotate, hence
+  #                      not the only signal);
+  #   the checkpoints reach segment-target (checkpointed_steps).
+  local d=$1 target
+  [ -f "$d/training-complete" ] && return 0
+  [ -f "$d/nightly.log" ] && grep -qF "Saved final weights" "$d/nightly.log" && return 0
+  target=$(cat "$d/segment-target" 2>/dev/null); [[ "$target" =~ ^[0-9]{1,9}$ ]] || return 1
+  [ "$(checkpointed_steps "$d")" -ge "$((10#$target))" ]
 }
 sweep_candidate_run() {   # the run dir of a pending sweep request's candidate (as written, and normalised), or nothing
   [ -f data/sweep-request.json ] || return 0
@@ -300,6 +329,14 @@ echo "=== $(date) nightly start (base $BASE, run $RUN)"
 # it and retrained from step 0, forever). A trained, unevaluated run with no pending marker is adopted as evaluation_pending BEFORE
 # the retention pass. Placeholder fingerprints are fine: evaluation_pending is re-evaluated whatever the fingerprints say.
 # Only the newest is adopted (the marker holds one run); older ones are logged and left to the retention pass.
+# A pending marker on a run that never finished training (the 2026-11-14 run, adopted at 100 of 1,500 steps when the per-checkpoint
+# adapters.safetensors was taken for the final one) is dropped: evaluating or promoting a partial segment is wrong, and the marker made
+# every night spend its window on that evaluation. The run is an unfinished run again: newest_unfinished_run resumes it from its
+# checkpoints (continuous mode carries it across nights); otherwise the retention pass treats it like any other unfinished run.
+if read_pending && [ -f "$p_run/segment-target" ] && [ ! -f "$p_run/report.json" ] && ! run_trained "$p_run"; then
+  echo "pending candidate $p_run ($p_reason) never finished training ($(checkpointed_steps "$p_run") of $(head -c 20 "$p_run/segment-target" | tr -cd '0-9') steps checkpointed): marker dropped; it is an unfinished run again (resumed from its checkpoints when it is the newest), not evaluated"
+  rm -f data/pending-candidate
+fi
 if ! read_pending; then
   [ -e data/pending-candidate ] && echo "data/pending-candidate is invalid ($(head -c 200 data/pending-candidate | tr -d '\000\n')); treated as absent"
   adopt=$(trained_unevaluated_runs | grep -vxF "$RUN" | head -1)
@@ -1031,6 +1068,11 @@ while :; do
   sleep "$retry_s"
   [ -f "$STOPFLAG" ] && { echo "stopped by request; not relaunching"; exit 130; }
 done
+# The segment finished (mlx_lm exited 0 on all remaining steps, or the checkpoints already reached the target): the one durable
+# completion record run_trained trusts first. adapters.safetensors cannot be it: mlx_lm writes that at every checkpoint.
+if ! { echo "$target" > "$RUN/training-complete.tmp" && mv "$RUN/training-complete.tmp" "$RUN/training-complete"; }; then
+  echo "WARNING: could not write $RUN/training-complete; completion falls back to the trainer's log and the checkpoints"
+fi
 # written BEFORE evaluation: a TERM (07:00 deadline, --stop) during evaluate_run must leave the trained run pending, or the next
 # night's retention pass deletes its adapter and retrains from step 0 (2026-11-03). Every verdict below overwrites or removes it.
 # "+N since last training" counts from the last COMPLETED training, so it is recorded here, when training finishes, not after

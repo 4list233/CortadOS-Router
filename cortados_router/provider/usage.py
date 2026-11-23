@@ -248,7 +248,11 @@ def _tail_lines(path: Path) -> tuple[list[str], bool]:
         n = min(size, CHILD_TAIL_BYTES)
         f.seek(size - n)
         data = f.read(n)              # exactly the snapshot's tail: bytes appended after the size check are not read
-    lines = data.decode("utf-8", "replace").splitlines()
+    # "\n" only (and a trailing "\r"), as splitlines() would without its extra breaks: it also cut a record at U+2028/U+2029/\x85
+    lines = data.decode("utf-8", "replace").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    lines = [ln[:-1] if ln.endswith("\r") else ln for ln in lines]
     truncated = size > CHILD_TAIL_BYTES
     if truncated:
         lines = lines[1:]                 # the first line was cut mid-record

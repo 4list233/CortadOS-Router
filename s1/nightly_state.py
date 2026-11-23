@@ -71,7 +71,7 @@ def labels(path: Path) -> int:
     if not path.exists():
         return 0
     keys = set()
-    for n, line in enumerate(path.read_text().splitlines(), 1):
+    for n, line in enumerate(path.read_text().split("\n"), 1):   # "\n" only: splitlines() also cuts at U+2028/U+2029/\x85 inside a JSON string
         if not line.strip():
             continue
         try:
