@@ -903,11 +903,15 @@ TRAINER_GROUP_ENV = "CORTADOS_S1_TRAINER_GROUP_FILE"
 
 def _proc_start(pid):
     """`ps -o lstart=` of pid in the C locale, whitespace-normalised: the leader's start time, which tells this group from
-    a later one that reuses its id (s1/overnight.group_is_ours compares it). None when ps cannot say."""
+    a later one that reuses its id (s1/overnight.group_is_ours compares it). None when ps cannot say: a failure, a timeout,
+    a nonzero exit or an empty answer (#116 review round 5: stdout of a failed ps is never taken as the identity; a None
+    start makes group_is_ours undecidable, so the guard never signals on it)."""
     try:
         p = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True, timeout=10,
                            env=dict(os.environ, LC_ALL="C", LANG="C"))
     except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
         return None
     return " ".join(p.stdout.split()) or None
 

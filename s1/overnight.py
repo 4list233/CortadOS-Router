@@ -600,8 +600,13 @@ _PS_ENV = {"LC_ALL": "C", "LANG": "C"}
 
 
 def _ps_tree() -> str:
-    return subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,lstart="], capture_output=True, text=True, check=True,
-                          timeout=10, env=dict(os.environ, **_PS_ENV)).stdout
+    """`ps -A` rows (pid, ppid, pgid, lstart). A nonzero exit or an empty listing raises (#116 review round 5): ps always
+    lists at least itself, so an empty answer is a failure, never "no processes"."""
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,lstart="], capture_output=True, text=True, check=True,
+                         timeout=10, env=dict(os.environ, **_PS_ENV)).stdout
+    if not out.strip():
+        raise subprocess.CalledProcessError(0, "ps", output=out)
+    return out
 
 
 def _norm_start(text: str | None) -> str | None:
@@ -614,15 +619,31 @@ def _norm_start(text: str | None) -> str | None:
 
 def proc_start(pid: int) -> str | None:
     """The start time (`ps -o lstart=`) of process `pid`, or None when there is no such process. A ps that cannot run (or
-    times out) raises: 'unknown' must never read as 'gone', or a reused pid would be signalled as ours."""
+    times out) raises: 'unknown' must never read as 'gone', or a reused pid would be signalled as ours.
+    #116 review round 5: only exit 1 with no row is 'gone'; exit 0 with no row, or any other exit, is unknown (raises)."""
     p = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True, timeout=10,
                        env=dict(os.environ, **_PS_ENV))
     start = _norm_start(p.stdout)
-    if start:
+    if p.returncode == 0 and start:
         return start
-    if p.returncode in (0, 1):   # BSD/macOS ps: exit 1 and no row for a pid that does not exist
+    if p.returncode == 1 and not start:   # BSD/macOS and procps ps: exit 1 and no row for a pid that does not exist
         return None
-    raise subprocess.CalledProcessError(p.returncode, "ps")
+    raise subprocess.CalledProcessError(p.returncode, "ps", output=p.stdout)
+
+
+# The first letter of a ps `stat` value (BSD/macOS and procps): anything else is unrecognized.
+PS_STATES = frozenset("DIRSTUWXZt")
+
+
+def proc_stat(pid: int) -> str:
+    """`ps -o stat= -p pid`, stripped. #116 review round 5: a nonzero exit or an empty answer raises CalledProcessError
+    (it used to read as "running", and recover_pidfile then forgot a root that may still be SIGSTOPped)."""
+    p = subprocess.run(["ps", "-o", "stat=", "-p", str(int(pid))], capture_output=True, text=True, timeout=10,
+                       env=dict(os.environ, **_PS_ENV))
+    stat = p.stdout.strip()
+    if p.returncode != 0 or not stat:
+        raise subprocess.CalledProcessError(p.returncode, "ps", output=p.stdout)
+    return stat
 
 
 def safe_group(pgid) -> bool:
@@ -672,16 +693,21 @@ def discover_groups(root: int, *, ps=_ps_tree, log=lambda m: print(m, flush=True
         log(f"overnight: ps failed ({type(e).__name__}); the cycle's process groups are not all known this time")
         return Discovery([root], False, {})
     kids: dict[int, list[tuple[int, int]]] = {}
+    rows = 0
     starts: dict[int, str] = {}
     for line in out.splitlines():
         parts = line.split()
         if len(parts) < 3 or not all(x.lstrip("-").isdigit() for x in parts[:3]):
             continue
         pid, ppid, pgid = (int(x) for x in parts[:3])
+        rows += 1
         kids.setdefault(ppid, []).append((pid, pgid))
         start = _norm_start(" ".join(parts[3:]))
         if start:
             starts[pid] = start
+    if not rows:   # #116 review round 5: a listing with no recognizable row is a failed ps, not an empty tree
+        log("overnight: ps listed no recognizable process; the cycle's process groups are not all known this time")
+        return Discovery([root], False, {})
     groups, seen, todo = [root], {root}, [root]
     while todo:
         for pid, pgid in kids.get(todo.pop(), []):
@@ -1601,11 +1627,16 @@ def _live_group_members(pgid: int) -> list[int]:
     """Pids in process group `pgid` that are not zombies, from `ps -A -o pid=,pgid=,stat=`. A ps failure raises: guessing
     "drained" here could leave training running with the node lock held."""
     out = subprocess.run(["ps", "-A", "-o", "pid=,pgid=,stat="], capture_output=True, text=True, check=True, timeout=10).stdout
-    live = []
+    live, rows = [], 0
     for line in out.splitlines():
         parts = line.split()
-        if len(parts) >= 3 and parts[1] == str(pgid) and not parts[2].startswith("Z"):
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].lstrip("-").isdigit():
+            continue
+        rows += 1
+        if parts[1] == str(pgid) and not parts[2].startswith("Z"):
             live.append(int(parts[0]))
+    if not rows:   # #116 review round 5: ps lists at least itself; no recognizable row is a failure, never "drained"
+        raise subprocess.CalledProcessError(0, "ps", output=out)
     return live
 
 
@@ -1838,9 +1869,7 @@ def recover_pidfile(pidfile: Path, *, ps=None, signaller=None, alive=None, log=l
         except PermissionError:
             return True
         return True
-    def _ps(pid):
-        return subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=10).stdout.strip()
-    alive, ps = alive or _alive, ps or _ps
+    alive, ps = alive or _alive, ps or proc_stat
     try:
         raw = pidfile.read_text().strip()
     except FileNotFoundError:
@@ -1864,9 +1893,13 @@ def recover_pidfile(pidfile: Path, *, ps=None, signaller=None, alive=None, log=l
         return
     try:
         stat = ps(pid)
+        if not isinstance(stat, str) or not stat.strip() or stat.strip()[0] not in PS_STATES:
+            # #116 review round 5: an empty or unrecognized status is as unknown as a failed ps, never "running"
+            raise subprocess.CalledProcessError(0, "ps", output=stat)
+        stat = stat.strip()
     except (OSError, subprocess.SubprocessError) as e:
-        log(f"overnight: !!! ps for pid {pid} failed ({type(e).__name__}); cannot tell whether it is stopped; kept as "
-            "unresolved, retried at every guard reading")
+        log(f"overnight: !!! ps for pid {pid} failed or was unrecognized ({type(e).__name__}); cannot tell whether it is "
+            "stopped; kept as unresolved, retried at every guard reading")
         if alerter is not None:
             alerter("guard_recovery_incomplete", "the previous cycle's root status could not be read at startup")
         if stopped_path is not None:

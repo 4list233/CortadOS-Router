@@ -1671,5 +1671,79 @@ class StartupRootRecovery(unittest.TestCase):
             self.assertEqual(night.read_stopped_groups(stopped)[0], [{"pgid": 100, "start": "a"}])
 
 
+FAKE_PS = """#!/bin/sh
+printf '%s' "$FAKE_PS_OUT"
+exit "${FAKE_PS_RC:-0}"
+"""
+
+
+class RealPsWrapperFailures(unittest.TestCase):
+    """#116 review round 5: the status wrapper recover_pidfile runs by default ignored ps's exit status, so a ps that failed
+    with empty stdout while the root was still stopped read as "running" and the durable record was deleted without a
+    SIGCONT. These run the real subprocess wrappers against a fake `ps` executable first on PATH."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        bindir = Path(self._tmp.name) / "bin"
+        bindir.mkdir()
+        (bindir / "ps").write_text(FAKE_PS)
+        (bindir / "ps").chmod(0o755)
+        self.path = f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"
+
+    def _fake_ps(self, rc, out=""):
+        return patch.dict(os.environ, {"PATH": self.path, "FAKE_PS_RC": str(rc), "FAKE_PS_OUT": out})
+
+    def test_a_failed_or_unrecognized_root_status_keeps_the_stopped_root_unresolved(self):
+        for rc, out in ((1, ""), (2, ""), (0, ""), (0, "   \n"), (0, "?"), (0, "garbage"), (1, "T")):
+            with self.subTest(rc=rc, out=out):
+                with self._fake_ps(rc, out):
+                    StartupRootRecovery()._assert_root_kept_and_retried(None)   # None: the real default wrapper
+
+    def test_a_readable_root_status_still_resolves(self):
+        for out, sent_root in (("T\n", True), ("Ss\n", False), ("R+\n", False)):
+            with self.subTest(out=out), tempfile.TemporaryDirectory() as tmp:
+                d = Path(tmp)
+                case = StartupRootRecovery()
+                stopped, pidfile = case._paused_then_killed(d)
+                sent, alerts = [], []
+                with self._fake_ps(0, out):
+                    case._recover(d, stopped, pidfile, None, sent, alerts)
+                self.assertEqual((100, signal.SIGCONT) in sent, sent_root)
+                self.assertFalse(stopped.exists())
+                self.assertEqual(alerts, [])
+
+    def test_proc_start_treats_a_failed_or_empty_ps_as_unknown_never_gone(self):
+        for rc, out in ((0, ""), (2, ""), (0, "  \n")):
+            with self.subTest(rc=rc, out=out), self._fake_ps(rc, out):
+                with self.assertRaises(subprocess.SubprocessError):
+                    night.proc_start(4242)
+                self.assertIsNone(night.group_is_ours({"pgid": 4242, "start": "a"}))
+        with self._fake_ps(1, ""):
+            self.assertIsNone(night.proc_start(4242))          # BSD ps: exit 1, no row = no such process
+        with self._fake_ps(0, "Sun Nov 22 14:57:48 2026\n"):
+            self.assertEqual(night.proc_start(4242), "Sun Nov 22 14:57:48 2026")
+
+    def test_the_gate_never_records_a_failed_ps_answer_as_the_trainer_start(self):
+        for rc, out in ((1, "Sun Nov 22 14:57:48 2026\n"), (2, "junk"), (0, ""), (0, " \n")):
+            with self.subTest(rc=rc, out=out), self._fake_ps(rc, out):
+                self.assertIsNone(cap._proc_start(4242))
+        with self._fake_ps(0, "Sun Nov 22  4:57:48 2026\n"):
+            self.assertEqual(cap._proc_start(4242), "Sun Nov 22 4:57:48 2026")
+
+    def test_an_empty_or_failed_process_listing_is_never_a_complete_discovery(self):
+        for rc, out in ((0, ""), (1, ""), (0, "garbage\n")):
+            with self.subTest(rc=rc, out=out), self._fake_ps(rc, out):
+                d = night.discover_groups(100, log=lambda m: None)
+                self.assertFalse(d.complete)
+                self.assertEqual(d.groups, [100])
+
+    def test_an_empty_or_failed_member_listing_is_never_drained(self):
+        for rc, out in ((0, ""), (1, ""), (0, "garbage\n")):
+            with self.subTest(rc=rc, out=out), self._fake_ps(rc, out):
+                with self.assertRaises(subprocess.SubprocessError):
+                    night._live_group_members(4242)
+
+
 if __name__ == "__main__":
     unittest.main()
