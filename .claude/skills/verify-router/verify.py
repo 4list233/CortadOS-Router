@@ -521,6 +521,40 @@ print(json.dumps({"degraded": bool(d.get("degraded")), "outward": out, "safe": s
 """
 
 
+# S1 busy / timeout (2026-11-22, owner-approved change to the 2026-10-26 retry rule): the router retries S1 only when it
+# was never reached. A fake S1 on a loopback port of the child answers 503 {"busy": true}, or stalls past the client
+# timeout; each must cost exactly ONE request and route degraded to a Codex lane, never Claude (core.resolve's hard
+# rule). Needs no real S1, so it is never BLOCKED. Real provider routing, throwaway home, no CLI started.
+BUSY_SCENARIO = """
+import json, sys, threading, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from cortados_router import core
+from cortados_router.provider import routing
+hits = {"busy": 0, "slow": 0}
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        kind = MODE[0]; hits[kind] += 1
+        if kind == "slow":
+            time.sleep(1.5)
+        data = json.dumps({"error": "busy", "busy": True}).encode()
+        try:
+            self.send_response(503); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+        except OSError:
+            pass
+srv = HTTPServer(("127.0.0.1", 0), H); threading.Thread(target=srv.serve_forever, daemon=True).start()
+core.S1_URL, core.S1_TIMEOUT_S, core.S1_TOKEN = "http://127.0.0.1:%d" % srv.server_address[1], 0.5, None
+MODE = ["busy"]
+def go(kind):
+    MODE[0] = kind
+    body = {"model": "cortados", "messages": [{"role": "user", "content": "rename the variable in utils.py"}]}
+    r = routing.choose(core, body, client="verify", conversation_id="verify-s1-" + kind, claude_bin=sys.executable, codex_bin=sys.executable)
+    return {**{k: r.get(k) for k in ("provider", "model", "band", "degraded")}, "requests": hits[kind]}
+print(json.dumps({"busy": go("busy"), "slow": go("slow")}))
+"""
+
+
 def s1_call_failed(call):
     """One S1 call's own structural record (a decision, a routing result or the continuation wrapper's entry) says it did
     not score: degraded, an engine error or an exception. Never judged from reason text."""
@@ -634,6 +668,15 @@ def main():
         else:
             record("provider routes a scored conversation to a served lane (never openai-codex itself)",
                    "PASS" if served else "FAIL", json.dumps(r))
+
+    p = runner.run(["-c", BUSY_SCENARIO], prefix="verify-router-busy-")
+    try:
+        r = _last_json(p)
+    except (ValueError, IndexError):
+        record("S1 busy or timeout: one request, degraded, never Claude", "FAIL", (p.stderr or p.stdout).strip()[-300:])
+    else:
+        ok = all(x.get("requests") == 1 and x.get("degraded") and x.get("provider") == "codex-cli" for x in r.values())
+        record("S1 busy or timeout: one request, degraded, never Claude", "PASS" if ok else "FAIL", json.dumps(r))
 
     p = runner.run(["-c", PIN_SCENARIO], prefix="verify-router-pin-")
     try:
