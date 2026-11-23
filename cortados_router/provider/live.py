@@ -1540,7 +1540,8 @@ def _worker_items(pairs: list, covered: set[str]) -> list[dict[str, Any]]:
 
 
 _CALL_KEYS = ("ts", "task_id", "session_id", "routing_kind", "band", "lane", "model", "actual_model", "elapsed_ms",
-              "degraded", "s1_reason", "request_chars", "response_chars", "sensitive_cloud")
+              "degraded", "s1_reason", "request_chars", "response_chars", "sensitive_cloud",
+              "s1_ms", "end_to_end_ms", "executed_provider", "executed_model")   # #132
 
 
 _LOG_OPS = ("log_route", "log_execution", "log_outcome", "log_tokens", "log_sensitive_cloud")
@@ -1662,14 +1663,41 @@ def subscriptions_section(u: dict[str, Any], now: float,
     return _section(as_of, _status(errors, bool(lanes)), errors, lanes=lanes, lowest=lowest)
 
 
+_S1_WINDOW_KEYS = ("calls", "degraded", "degraded_pct", "s1_ms_p50", "s1_ms_p90", "degraded_wait_ms_p50")
+
+
+def s1_routing(u: dict[str, Any] | None) -> dict[str, Any]:
+    """#132: S1 as the routes saw it (usage's s1_routes: per 5 and 60 minutes, the share of routed calls S1 did not
+    score and its scoring time), with `status` "warn" when a window with at least min_calls calls has a degraded share
+    above warn_above_pct, "ok" otherwise, "unknown" without a route log. /health alone said "up" on 2026-11-22 while
+    98 % of calls degraded. Numbers only, re-validated."""
+    r = (u or {}).get("s1_routes")
+    if not isinstance(r, dict) or not isinstance(r.get("windows"), list):
+        return {"status": "unknown", "windows": [], "warn_above_pct": None, "warning": None}
+    warn_at = r.get("warn_above_pct") if _num(r.get("warn_above_pct")) else 20.0
+    min_calls = r.get("min_calls") if _num(r.get("min_calls")) else 3
+    wins, hot = [], []
+    for w in r["windows"]:
+        if not isinstance(w, dict) or w.get("window") not in ("5m", "60m"):
+            continue
+        row = {"window": w["window"], **{k: (w.get(k) if _num(w.get(k)) else None) for k in _S1_WINDOW_KEYS}}
+        wins.append(row)
+        if _num(row["calls"]) and row["calls"] >= min_calls and _num(row["degraded_pct"]) and row["degraded_pct"] > warn_at:
+            hot.append(f"{row['degraded_pct']:g}% of {row['calls']:g} calls degraded in {row['window']}")
+    return {"status": "warn" if hot else "ok", "windows": wins, "warn_above_pct": warn_at,
+            "warning": "; ".join(hot) or None}
+
+
 def s1_section(u: dict[str, Any] | None, now: float, errors: list | None = None) -> dict[str, Any]:
     s = (u or {}).get("s1")
+    routing = s1_routing(u)
     if not isinstance(s, dict):
         return _section(now, "unknown", errors or [_err("s1", "not probed")], available=None, http_status=None,
-                        latency_ms=None, reason=None)
+                        latency_ms=None, reason=None, routing=routing)
     errs = [e for e in (u or {}).get("errors") or [] if isinstance(e, dict) and e.get("source") == "s1"]
     return _section(now, "up" if s.get("available") else "down", errs, available=bool(s.get("available")),
-                    http_status=s.get("status"), latency_ms=s.get("latency_ms"), reason=s.get("reason"))
+                    http_status=s.get("status"), latency_ms=s.get("latency_ms"), reason=s.get("reason"),
+                    routing=routing)
 
 
 def _slug(name: Any) -> str | None:
@@ -2020,6 +2048,9 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
         "active_conversations": conv.get("active"), "working_conversations": conv.get("working"),
         "s1": s1["status"], "s1_latency_ms": s1.get("latency_ms"),
         "s1_guard": (s1.get("guard") or {}).get("state"),
+        "s1_routing": (s1.get("routing") or {}).get("status"),
+        "s1_degraded_pct_5m": next((w.get("degraded_pct") for w in (s1.get("routing") or {}).get("windows") or []
+                                    if w.get("window") == "5m"), None),
         "lowest_subscription": subs.get("lowest"),
         "route_log_errors": (rl or {}).get("count"),
         "hosts_with_heartbeat": sum(1 for h in hosts["items"] if h["heartbeat_state"] == "fresh"),

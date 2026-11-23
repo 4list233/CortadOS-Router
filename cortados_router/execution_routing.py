@@ -78,9 +78,20 @@ def scoring_input(prompt, task_context=None, recall=''):
 def select(core, *, prompt, session_id='', face='default', platform='', entrypoint='agent',
            turn_id='', api_request_id='', input_fit=None, task_context=None, recall='',
            current_provider='', current_model='', constraints=None, escalate=None,
-           credential_resolver=None, route_id=None, log_platform=None, supports_accounts=False):
+           credential_resolver=None, route_id=None, log_platform=None, supports_accounts=False,
+           previous=None):
+    """`constraints['workload']` (a host-validated client hint, e.g. 'batch') applies the routing table's
+    `workloads` row: a band cap (core.resolve maximum_band, under the hard rules) and the unit kind, so a batch call is
+    background work (fallback band R1, no face floor). `previous` (band -> {lane, model}, the host's memory of this
+    client's last route per band) is passed to core.resolve for the switching margin."""
     credential_resolver, auth_errors = _credential_policy(credential_resolver)
     unit = 'interactive' if platform in ('discord', 'telegram', 'cli') else 'background'
+    workload = (constraints or {}).get('workload')
+    hint = ((core.table().get('workloads') or {}).get(workload) or {}) if workload else {}
+    if workload and not hint:
+        raise ValueError('Unknown workload hint')
+    if hint.get('unit_kind') in ('interactive', 'background'):
+        unit = hint['unit_kind']
     request, projection = scoring_input(prompt, task_context, recall)
     version = core.S1_CURRENT
     revision = version.stat().st_mtime_ns if version.exists() else None
@@ -141,7 +152,9 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
     while allowed:
         route = core.resolve(decision, unit, input_fit=fit, escalate=escalate,
                              allowed_routes=tuple(sorted(allowed)), execution=True,
-                             minimum_band=(constraints or {}).get('min_band'), accounts_aware=supports_accounts)
+                             minimum_band=(constraints or {}).get('min_band'), accounts_aware=supports_accounts,
+                             **({'maximum_band': hint['max_band']} if hint.get('max_band') else {}),
+                             **({'previous': previous} if previous else {}))
         choice = route.get('chosen')
         if not choice:
             break
@@ -163,7 +176,8 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
                                   'scoring context=' + _json(projection)])
         core.log_route(route_id, {'session_id': session_id, 'platform': log_platform or 'execution-' + (platform or entrypoint),
                        'unit_kind': unit, 'actual_model': None, 'request': str(prompt)[:8000],
-                       'context': recall or None, 'task_context': task_context}, decision, route)
+                       'context': recall or None, 'task_context': task_context,
+                       **({'workload': workload} if workload else {})}, decision, route)
         cap = core.lane_ceiling(choice['lane'], model)
         if provider == 'codex-cli':
             cap = int(core._context_cfg().get('provider_ceiling_tokens', {}).get(provider, 200000))
@@ -173,7 +187,7 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
                 'account': choice.get('account') if supports_accounts else None,
                 'config_dir': choice.get('config_dir') if supports_accounts else None, 'context_length': cap,
                 'route_id': route_id, 'api_request_id': api_request_id, 'degraded': bool(decision.get('degraded')),
-                'band': route['band'], 'projection': projection,
+                'band': route['band'], 'projection': projection, **({'workload': workload} if workload else {}),
                 'decision': decision, 'route': route}
     return {'router': ROUTER, 'error': 'No authenticated, available model fits the assembled request and route constraints. '
             + '; '.join(failures), 'degraded': bool(decision.get('degraded'))}

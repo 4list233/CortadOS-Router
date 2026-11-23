@@ -240,6 +240,47 @@ def _routed(db_path: Path, now: float) -> dict[str, Any]:
         c.close()
 
 
+# #132: S1's health as the routes saw it. /health answers fast while scoring is saturated (2026-11-22: "up" while 98 %
+# of calls degraded), so the live view also reports, per window, the share of routed calls S1 did not score (degraded)
+# and how long scoring took, from the route log. Metadata only: counts and milliseconds.
+S1_ROUTE_WINDOWS = (("5m", 300), ("60m", 3600))
+S1_DEGRADED_WARN_PCT = float(os.environ.get("CORTADOS_S1_DEGRADED_WARN_PCT", "20"))   # warn above this share …
+S1_DEGRADED_MIN_CALLS = 3                                                              # … of at least this many calls
+
+
+def _pctl(xs: list[float], q: float) -> float | None:
+    """Nearest-rank percentile (q in 0..1) of xs; None for no values."""
+    if not xs:
+        return None
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, max(0, math.ceil(q * len(xs)) - 1))]
+
+
+def _s1_routes(db_path: Path, now: float) -> dict[str, Any]:
+    """Per window (S1_ROUTE_WINDOWS): routed calls S1 was asked about (pins and local moves without a score excluded),
+    how many were degraded and their share, S1 time when it answered (median / p90) and the median wait of a degraded
+    call. ts is indexed (routes_ts), so this reads only the last hour's rows."""
+    c = _ro_connect(db_path, router=True)
+    try:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(routes)")}
+        if not {"ts", "degraded", "engine_ms", "engine"} <= cols:
+            return {}                               # a route log without S1 columns (not core's schema): nothing to say
+        rows = c.execute("SELECT ts, degraded, engine_ms FROM routes WHERE ts >= ? AND engine_ms IS NOT NULL "
+                         "AND COALESCE(engine, '') != 'pin'", (now - max(w for _, w in S1_ROUTE_WINDOWS),)).fetchall()
+    finally:
+        c.close()
+    out = []
+    for name, span in S1_ROUTE_WINDOWS:
+        sel = [(bool(d), float(ms)) for ts, d, ms in rows if ts is not None and ts >= now - span]
+        ok = [ms for d, ms in sel if not d]
+        bad = [ms for d, ms in sel if d]
+        out.append({"window": name, "calls": len(sel), "degraded": len(bad),
+                    "degraded_pct": round(100.0 * len(bad) / len(sel), 1) if sel else None,
+                    "s1_ms_p50": _pctl(ok, 0.5), "s1_ms_p90": _pctl(ok, 0.9), "degraded_wait_ms_p50": _pctl(bad, 0.5)})
+    return {"source": "router.db", "warn_above_pct": S1_DEGRADED_WARN_PCT, "min_calls": S1_DEGRADED_MIN_CALLS,
+            "windows": out}
+
+
 def _tail_lines(path: Path) -> tuple[list[str], bool]:
     """The last CHILD_TAIL lines within the last CHILD_TAIL_BYTES of an append-only JSONL log, and whether it was cut."""
     with path.open("rb") as f:
@@ -613,6 +654,8 @@ _LEDGER_ROW = _Obj({"lane": _label, "model": _text, "turns": _number, "input_tok
 # where a failing log shows besides the provider log
 _ROUTE_LOG_ERRORS = _Obj({"count": _number, "lost": _number, "recovered": _number, "last_error_type": _label,
                           "last_error_at": _number, "last_op": _enum("log_route", "log_execution", "log_outcome")})
+_S1_WINDOW = _Obj({"window": _enum("5m", "60m"), "calls": _number, "degraded": _number, "degraded_pct": _number,
+                   "s1_ms_p50": _number, "s1_ms_p90": _number, "degraded_wait_ms_p50": _number})
 _COUNTS = lambda cut: _Map(_text, _number, MAP_MAX, cut, merge=_add)   # noqa: E731
 _VIEW = _Obj({
     "generated_at": _number,
@@ -637,6 +680,8 @@ _VIEW = _Obj({
                   "by_tool": _COUNTS("by_tool_truncated"), "by_outcome": _COUNTS("by_outcome_truncated"),
                   "unparsable_lines": _number, "truncated": _bool}),
     "s1": _Obj({"available": _bool, "status": _number, "latency_ms": _number, "reason": _label}),
+    "s1_routes": _Obj({"source": _enum("router.db"), "warn_above_pct": _number, "min_calls": _number,
+                       "windows": _List(_S1_WINDOW, 2, "s1_windows_truncated")}),
     "hardware": _List(_Obj({"file": _file, "source": _enum("heartbeat", "file"), "age_s": _number, "data": _HW_CARD},
                            source=("hardware", "file")),
                       HW_MAX_FILES, "too_many_files"),
@@ -645,6 +690,7 @@ _VIEW = _Obj({
 _ERROR = _Obj({"source": _source, "error": _label})
 # the section a top-level cut is reported under (a lane or hardware card names itself through its _Obj source)
 _SECTION_SOURCE = {"lanes": "scarcity", "routed": "router.db", "child_tasks": "child-tasks.jsonl", "s1": "s1",
+                   "s1_routes": "router.db",
                    "ledger": "usage.db", "bots": "bot-usage.jsonl",
                    "hardware": "hardware"}
 
@@ -807,6 +853,9 @@ def collect_live(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any
     out["s1"] = guard("s1", lambda: s1_probe(s1_url), {"available": False, "reason": "probe failed"})
     if not isinstance(out["s1"], dict) or not out["s1"].get("available"):
         errors.append({"source": "s1", "error": str(out["s1"].get("reason") if isinstance(out["s1"], dict) else None)})
+    db = state_dir / "router.db"
+    if db.exists():                                 # no route log yet: nothing to report, not an error
+        out["s1_routes"] = guard("router.db", lambda: _s1_routes(db, now), {})
     # Legacy hardware/<host>.json files only, when present: the live view merges each host's heartbeat hardware itself
     # (live.hosts_section) and reports a host without one there, so a missing directory is no error here.
     hw = state_dir / "hardware"
@@ -837,6 +886,7 @@ def _collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], 
     db = state_dir / "router.db"
     if db.exists():
         out["routed"] = guard("router.db", lambda: _routed(db, now), {})
+        out["s1_routes"] = guard("router.db", lambda: _s1_routes(db, now), {})
     else:
         errors.append({"source": "router.db", "error": "absent"})
         out["routed"] = {}

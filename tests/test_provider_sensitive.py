@@ -1082,3 +1082,31 @@ class RefusalFallbackUsableAnswerTests(LocalHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkloadHeaderTests(LocalHarness):
+    """#132: x-cortados-workload on both wires: `batch` is handed to the router; an unknown value is ignored (logged),
+    never refused."""
+
+    def setUp(self):
+        super().setUp()
+        self.seen = []
+        self.reg.router = lambda b, client, **kw: (self.seen.append(kw), {"error": "stop here"})[1]
+
+    def test_messages_wire(self):
+        self.assertEqual(self.status_of(body("hi"), headers={"x-cortados-workload": "Batch"}), 503)
+        self.assertEqual(self.seen, [{"workload": "batch"}])
+
+    def test_responses_wire(self):
+        from tests.test_provider_responses import request, user
+        try:
+            self.post(request(user("hi"), tools=()), path="/v1/responses", headers={"x-cortados-workload": "batch"})
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 503)
+        self.assertEqual(self.seen, [{"workload": "batch"}])
+
+    def test_unknown_value_is_ignored_with_a_log_line(self):
+        with self.assertLogs("cortados.provider.routing", logging.INFO) as cm:
+            self.assertEqual(self.status_of(body("hi"), headers={"x-cortados-workload": "urgent"}), 503)
+        self.assertEqual(self.seen, [{}])                # routed normally, no hint
+        self.assertTrue(any("unknown value" in line for line in cm.output))

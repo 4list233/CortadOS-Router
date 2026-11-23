@@ -469,16 +469,62 @@ def _expand_claude_accounts(cands: list[dict[str, Any]], accounts_aware: bool = 
     return out
 
 
-def _pool_tokens_per_pct(c: dict[str, Any]) -> float | None:
-    """Learned size of the pool this route draws on (tokens per 1 % of its window), from unit-cost.json; None if unknown."""
+# (base lane, pool) -> the vendor's unit-cost key; an account lane (claude#b) gets its own key with the same suffix
+# (claude#b:all), which is what unitcost.learn writes for it (#132).
+_POOL_KEYS = {("claude", "all"): "claude:all", ("claude", "fable"): "claude:fable", ("codex", "all"): "codex:all",
+              ("antigravity", "gemini"): "antigravity:gemini", ("antigravity", "claude-gpt"): "antigravity:claude-gpt",
+              ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}
+
+
+def _pool_keys(lane: str, pool: str) -> tuple[str | None, str | None]:
+    """(this lane's own unit-cost key, the vendor's base key): ('claude#b:all', 'claude:all') for claude#b, both the
+    base key for a bare lane, (None, None) for a pool nobody learns."""
+    base = _POOL_KEYS.get((_base_lane(lane), pool))
+    if base is None:
+        return None, None
+    return (lane + base[base.index(":"):] if "#" in lane else base), base
+
+
+def _pool_size_priors() -> dict[str, float]:
+    """selection.pool_size_prior_tokens_per_pct: per base pool key, the size a LOWER-BOUND learned value may not undercut
+    (tables/routing-table.json `_pool_size_prior` says why). Bad entries are ignored."""
     try:
-        sc = _scarcity_module()
-        lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
-        pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
-        key = {("claude", "all"): "claude:all", ("claude", "fable"): "claude:fable", ("codex", "all"): "codex:all", ("antigravity", "gemini"): "antigravity:gemini",
-               ("antigravity", "claude-gpt"): "antigravity:claude-gpt", ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}.get((_base_lane(c["lane"]), pool))
-        uc = (sc.unit_costs() or {}).get(key or "") or {}
-        return float(uc["tokens_per_pct"]) if uc.get("tokens_per_pct") else None
+        raw = (table().get("selection") or {}).get("pool_size_prior_tokens_per_pct") or {}
+        return {k: float(v) for k, v in raw.items() if not k.startswith("_") and isinstance(v, (int, float)) and v > 0}
+    except Exception:
+        return {}
+
+
+def _pool_size(c: dict[str, Any]) -> dict[str, Any]:
+    """The learned size of the pool this route draws on, from unit-cost.json:
+      tpp      tokens per 1 % of the pool's window, after the prior (None if unknown);
+      rec      the unit-cost record used; own: it is this lane's own record (claude#b:all for claude#b, #132), not the
+               vendor's base record a sibling account falls back to when its own is not learned yet;
+      floored  the learned value was a lower bound below the table's prior, so the prior was used.
+    A learned value flagged `lower_bound` (unitcost.py: the ledger sees only provider-routed tokens, so direct use of
+    the same login moves the % without adding tokens) never makes a pool look smaller than its prior; a value that is
+    not a lower bound, or a pool with no learned value, is left as learned (no prior is invented for an unknown pool)."""
+    sc = _scarcity_module()
+    lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
+    pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
+    own, base = _pool_keys(c["lane"], pool)
+    ucs = sc.unit_costs() or {}
+    rec, is_own = ucs.get(own or "") or {}, True
+    if not rec.get("tokens_per_pct") and base != own:
+        rec, is_own = ucs.get(base or "") or {}, False             # the sibling's own pool is not learned yet: the vendor's size
+    tpp = float(rec["tokens_per_pct"]) if rec.get("tokens_per_pct") else None
+    prior = _pool_size_priors().get(base or "")
+    floored = bool(tpp is not None and rec.get("lower_bound") and prior and prior > tpp)
+    return {"tpp": prior if floored else tpp, "learned": tpp, "rec": rec, "own": is_own, "floored": floored,
+            "reading": lane, "pool": pool}
+
+
+def _pool_tokens_per_pct(c: dict[str, Any]) -> float | None:
+    """Learned size of the pool this route draws on (tokens per 1 % of its window), from unit-cost.json under the lane's
+    OWN key (claude#b:all for account B, falling back to the vendor's claude:all while B's is unlearned), floored by
+    the table's prior for a lower-bound value (_pool_size); None if unknown."""
+    try:
+        return _pool_size(c)["tpp"]
     except Exception:
         return None
 
@@ -486,21 +532,74 @@ def _pool_tokens_per_pct(c: dict[str, Any]) -> float | None:
 def _tokens_left_for(c: dict[str, Any]) -> float | None:
     """Absolute room in the pool this route draws on, from the learned unit cost (None when unknown)."""
     try:
-        sc = _scarcity_module()
-        lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
+        ps = _pool_size(c)
+        lane, rec, tpp = ps["reading"], ps["rec"], ps["tpp"]
         if _reading_for_other_login(lane, c):
             return None                                              # cached reading is for a different login (reorder or default<->named): no capacity credit
-        pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
-        key = {("claude", "all"): "claude:all", ("claude", "fable"): "claude:fable", ("codex", "all"): "codex:all", ("antigravity", "gemini"): "antigravity:gemini",
-               ("antigravity", "claude-gpt"): "antigravity:claude-gpt", ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}.get((_base_lane(c["lane"]), pool))
-        uc = (sc.unit_costs() or {}).get(key or "") or {}
-        if "#" not in c["lane"]:                                     # base/default account: the learned absolute remaining
-            return float(uc["remaining_tokens"]) if uc.get("remaining_tokens") else None
-        # A sibling account shares the base pool-SIZE estimate (tokens_per_pct) but NOT its remaining quota: derive this
-        # account's remaining from its OWN window headroom, or unitcost.learn's bare-lane remaining would be reused for both.
-        tpp = uc.get("tokens_per_pct")
-        headroom = _min_headroom_pct(lane, pool)
+        if ps["own"] and rec.get("remaining_tokens"):
+            # this lane's own learned remaining (scaled up when the size was floored by the prior: same % left, bigger pool)
+            scale = (tpp / ps["learned"]) if ps["floored"] and ps["learned"] else 1.0
+            return float(rec["remaining_tokens"]) * scale
+        if "#" not in c["lane"] and ps["own"]:
+            return None                                              # base lane without a learned remaining: unknown, as before
+        # A sibling account on the vendor's base size estimate (its own is not learned yet), or its own record without
+        # a remaining: this account's remaining from its OWN window headroom, never the base lane's remaining.
+        headroom = _min_headroom_pct(lane, ps["pool"])
         return float(tpp) * float(headroom) if tpp and headroom is not None else None
+    except Exception:
+        return None
+
+
+def window_expected_loss_pct(w: dict[str, Any], fetched_at: float | None, now: float,
+                             burn_pct_per_h: float | None = None) -> float | None:
+    """% of a window's quota expected to be LOST at its reset: headroom minus the use expected until the reset
+    (burn rate × hours to reset), floored at 0 (#132, owner 2026-11-22). The burn rate is the learned recent rate
+    (scarcity.recent_burn_rates) when given, else the window's own pace so far (used % ÷ hours elapsed, the pace
+    window_view projects with). None when the window has no reset time, the reading lacks what the pace needs, or the
+    reset has already passed (the reading is from the previous window)."""
+    reset, used = w.get("reset_epoch"), w.get("used_pct")
+    if reset is None or used is None:
+        return None
+    headroom = max(0.0, 100.0 - float(used))
+    h_left = (float(reset) - now) / 3600.0
+    if h_left <= 0:
+        return None
+    if burn_pct_per_h is None:
+        e, at = w.get("elapsed_pct"), fetched_at
+        if e is None or not at:
+            return None
+        e = float(e) / 100.0
+        left_at_sample = (float(reset) - float(at)) / 3600.0
+        if left_at_sample <= 0:
+            return None
+        if e >= 0.999:
+            return round(headroom, 1)                                # the reset is imminent: what is left is lost
+        window_h = left_at_sample / (1.0 - e)
+        burn_pct_per_h = float(used) / (max(e, 0.05) * window_h)    # window_view's own 5 % floor on the elapsed share
+    return round(max(0.0, headroom - max(0.0, float(burn_pct_per_h)) * h_left), 1)
+
+
+def _expected_loss_pct(c: dict[str, Any], now: float | None = None) -> float | None:
+    """% of this route's pool expected to be lost at its next reset: the smallest across the long windows it draws on
+    (the lane's general windows and its own pool; 5-hour windows renew too fast to lose anything, as in scarcity._roll),
+    since a model can only use what EVERY window it draws on leaves it. None (callers fall back to today's capped
+    scarcity) when any of those windows lacks a reset time, is a carried-forward stale read, or the reading is for
+    another login."""
+    try:
+        sc = _scarcity_module()
+        lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
+        if not lane or _reading_for_other_login(lane, c):
+            return None
+        pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
+        wins = [w for w in (lane.get("windows") or []) if isinstance(w, dict) and w.get("pool", "all") in ("all", pool)
+                and not str(w.get("window", "")).startswith("5-hour")]
+        if not wins or any(w.get("stale") for w in wins):
+            return None
+        now = time.time() if now is None else now
+        burns = sc.recent_burn_rates() if hasattr(sc, "recent_burn_rates") else {}
+        losses = [window_expected_loss_pct(w, lane.get("fetched_at"), now, burns.get((c["lane"], w.get("window"))))
+                  for w in wins]
+        return None if any(x is None for x in losses) else min(losses)
     except Exception:
         return None
 
@@ -714,7 +813,12 @@ def static_scarcity_rank(h: dict[str, Any], demote: float, expiring: float) -> t
 def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_chars: int = 0, sticky: dict[str, Any] | None = None,
             escalate: dict[str, Any] | None = None, input_fit: dict[str, Any] | None = None,
             allowed_routes: tuple[tuple[str, str], ...] | None = None,
-            execution: bool = False, minimum_band: str | None = None, accounts_aware: bool = False) -> dict[str, Any]:
+            execution: bool = False, minimum_band: str | None = None, accounts_aware: bool = False,
+            maximum_band: str | None = None, previous: dict[str, Any] | None = None) -> dict[str, Any]:
+    """`maximum_band` (a client's workload hint, e.g. batch → R1) caps the band from above, mirroring `minimum_band`;
+    the hard rules still win: a request whose blast radius is 3 (an outward effect is floored there) keeps its band,
+    and `minimum_band` is applied after the cap. `previous` maps band → {"lane", "model"} of the client's previous
+    route in that band, held under selection.switch_margin_points."""
     t = table()
     rules: list[str] = []
     if decision["degraded"] or not decision["answers"]:
@@ -737,6 +841,15 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
         v["D"] = D
         v["parts"] = PARTS_TO_COUNT[int(ans.get("parts", 0))]
         band = next((b["band"] for b in t["bands"] if _holds(b["when"], v)), t["fallback"]["interactive"])
+    if maximum_band is not None:
+        if maximum_band not in BAND_ORDER:
+            raise ValueError('Invalid maximum routing band')
+        if BAND_ORDER.index(band) > BAND_ORDER.index(maximum_band):
+            if v is not None and v["blast_radius"] >= 3:
+                rules.append(f"workload cap {maximum_band} not applied: blast radius 3 (outward effect) keeps {band}")
+            else:
+                band = maximum_band
+                rules.append(f"client workload hint caps band at {band}")
     if minimum_band is not None:
         if minimum_band not in BAND_ORDER:
             raise ValueError('Invalid minimum routing band')
@@ -863,8 +976,16 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             # so the deadline discount must not override that immediate limit (Codex review 2026-10-26). Zero outside the
             # expiring zone, so routing elsewhere is unchanged.
             expiring_soon = float(sel.get("expiring_soon_points", 250)) * (exp_of(c) / 100.0) if sc <= 0 else 0.0
+            # Underuse credit (#132, owner 2026-11-22): the capped scarcity sits at −1 for every comfortably underused
+            # pool, so it cannot tell a pool that will lose 90 % at its reset from one that will lose 50 %. When the
+            # pool's reset times are known, the credit is the share expected to be LOST at that reset (headroom minus
+            # the use expected until then, _expected_loss_pct); without them it stays −scarcity, as before.
+            loss = _expected_loss_pct(c) if sc < 0 and ch_of[id(c)].get("scarcity") is not None else None
+            if loss is not None:
+                c["expected_loss_pct"] = loss
+            under = loss / 100.0 if loss is not None else max(-sc, 0.0)
             c["cost"] = round(c["weight"] + sel.get("scarcity_points", 30) * max(sc, 0.0)
-                              - sel.get("expiring_credit_points", 80) * max(-sc, 0.0) - expiring_soon, 1)
+                              - sel.get("expiring_credit_points", 80) * under - expiring_soon, 1)
             # capacity (Forest 2026-09-26): plans are not normalised; among pools with room, the one with the most TOKENS left gets a further credit
             tl = _tokens_left_for(c)
             # the credit needs a FRESH reading: an unknown or failed pool (scarcity None, read as 0 above) earns nothing
@@ -909,6 +1030,20 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
                 keep.append(c)
         cands = keep
         cands.sort(key=lambda c: (0 if c["index"] >= target else 1, c["cost"], -(c.get("tokens_per_s") or 0), tie.index(c["lane"]) if c["lane"] in tie else len(tie), base[id(c)]))
+        # switching margin (#132): costs move by a point or two with every usage reading, which flipped R2 between Opus
+        # and Sol call by call. The client's previous route for this band (`previous`, kept by the host) stays first
+        # while it still qualifies, is available and costs at most switch_margin_points more than the cheapest; with
+        # no previous route among them, the cheapest stands (the sort above is deterministic).
+        margin = float(sel.get("switch_margin_points", 0) or 0)
+        prev = (previous or {}).get(band) if isinstance(previous, dict) else None
+        if margin > 0 and isinstance(prev, dict) and prev.get("model"):
+            best = next((c for c in cands if ok_of(c) and c["index"] >= target), None)
+            held = next((c for c in cands if c["model"] == prev["model"] and c["lane"] == prev.get("lane")
+                         and ok_of(c) and c["index"] >= target), None)
+            if best is not None and held is not None and held is not best and held["cost"] - best["cost"] <= margin:
+                cands.remove(held); cands.insert(0, held)
+                rules.append(f"switching margin: stays on the client's previous {band} route {held['lane']}/{held['model']} "
+                             f"(cost {held['cost']} vs {best['cost']}, within {margin:g})")
         # stickiness: keep the session's current model unless the band rose, the requirement outgrew it, or its pool is spent
         if sticky and sticky.get("model"):
             cur = next((c for c in cands if c["model"] == sticky["model"] and c["lane"] == sticky.get("lane")), None)
@@ -930,9 +1065,17 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
         if D is not None and D >= int(cu.get("min_D", 6)):
             spare = [c for c in cands if c.get("ceiling") and ok_of(c) and sc_of(c) <= float(cu.get("attract_when_scarcity_below", -0.3))]
             if spare:
-                top = min(spare, key=lambda c: c["cost"])
+                # #132 (owner 2026-11-22): rank the underused pools by the share expected to be LOST at each one's reset
+                # (cost breaks ties); the capped scarcity cannot tell pools near −1 apart. Any spare pool without reset
+                # times → today's ranking by cost for all of them.
+                if all(c.get("expected_loss_pct") is not None for c in spare):
+                    top = min(spare, key=lambda c: (-c["expected_loss_pct"], c["cost"]))
+                    why = f"about {top['expected_loss_pct']:g}% of its pool would be lost at the reset"
+                else:
+                    top = min(spare, key=lambda c: c["cost"])
+                    why = f"scarcity {sc_of(top)}"
                 cands.remove(top); cands.insert(0, top)
-                rules.append(f"{top['lane']}/{top['model']} takes it: its pool is underused (scarcity {sc_of(top)}), paid-for frontier capacity is used rather than lost")
+                rules.append(f"{top['lane']}/{top['model']} takes it: its pool is underused ({why}), paid-for frontier capacity is used rather than lost")
         if target != req:
             rules.append(f"no available model reaches {req}: strongest available ({best_avail}) taken")
     else:
@@ -980,7 +1123,8 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             "scarcity": {**{lane: h.get("scarcity") for lane, h in health.items()},
                          **{f"{lane}:{p}": pv.get("scarcity") for lane, h in health.items() for p, pv in (h.get("pools") or {}).items()}},
             "required_index": req, "turn_tokens": need, "input_fit": input_fit, "fit_blocked": bool(cands) and not fitting,
-            "alternatives": [{k: c.get(k) for k in ("lane", "model", "index", "cost")} for c in usable[1:6]] if scored else None,
+            "alternatives": [{k: c.get(k) for k in ("lane", "model", "index", "cost", "weight", "expected_loss_pct")}
+                             for c in usable[1:6]] if scored else None,
             "chosen_window": (ch_of[id(chosen)].get("tightest") if chosen else None), "chosen_pool": (ch_of[id(chosen)].get("pool") if chosen else None)}
 
 
@@ -1009,7 +1153,8 @@ TOKEN_COLUMNS = (("tok_input", "INTEGER"), ("tok_output", "INTEGER"), ("tok_cach
 # #124: a request a sensitivity detector marked, answered in the cloud because the Pro could not take it. JSON of
 # provider/sensitive_notice.record (detector, reason, notice shown or opted out: fixed categories, never text); NULL for
 # every other route. Additive and nullable like the token columns.
-EXTRA_COLUMNS = TOKEN_COLUMNS + (("sensitive_cloud", "TEXT"),)
+# #132: the client's workload hint (x-cortados-workload: "batch"), NULL when none was sent. Metadata only.
+EXTRA_COLUMNS = TOKEN_COLUMNS + (("sensitive_cloud", "TEXT"), ("workload", "TEXT"))
 
 
 def _db() -> sqlite3.Connection:
@@ -1088,6 +1233,8 @@ def log_route(turn_id: str, meta: dict[str, Any], decision: dict[str, Any], r: d
                   "subagents, verifier, hard_rules, table_version, table_error, scarcity, context) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   row)
         c.execute('UPDATE routes SET task_context=? WHERE turn_id=?', (task_context, turn_id))
+        if meta.get("workload"):
+            c.execute('UPDATE routes SET workload=? WHERE turn_id=?', (str(meta["workload"])[:32], turn_id))
     return _write_routes("log_route", write, raise_final=False)
 
 

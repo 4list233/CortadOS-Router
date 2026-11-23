@@ -387,7 +387,8 @@ class DashboardRenderTest(unittest.TestCase):
                           "work_split"})
         self.assertIn("d.work_split", html)
         self.assertEqual(set(usage._VIEW.fields) - {"generated_at"},
-                         {"lanes", "routed", "refusals", "child_tasks", "ledger", "bots", "s1", "hardware", "notes"})
+                         {"lanes", "routed", "refusals", "child_tasks", "ledger", "bots", "s1", "s1_routes", "hardware", "notes"})
+        self.assertIn("d.s1_routes", html)                                      # #132: the Usage tab's S1 card shows it
 
     def test_render_full_view(self):
         out = self.run_page(self.view())

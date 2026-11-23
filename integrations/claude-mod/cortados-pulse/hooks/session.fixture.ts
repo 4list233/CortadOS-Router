@@ -252,7 +252,13 @@ export default {
     "http_status": 200,
     "latency_ms": 23,
     "reason": null,
-    "guard": null
+    "guard": null,
+    "routing": {
+      "status": "unknown",
+      "windows": [],
+      "warn_above_pct": null,
+      "warning": null
+    }
   },
   "hosts": {
     "as_of": 1800000000.0,

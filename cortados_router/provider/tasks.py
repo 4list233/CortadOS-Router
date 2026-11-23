@@ -63,6 +63,8 @@ NOTES = [
 ]
 _ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _BANDS = ("R0", "R1", "R2", "R3", "R4", "pin")
+# core.log_execution's "provider/model": office's model rule plus '#' for an account's provider (claude-cli#b)
+_EXEC_RE = re.compile(r"[A-Za-z0-9._/\[\]:#-]{1,128}")
 # Hard rules leave only as these fixed labels, NEVER as the recorded strings: an escalation reason or a fit
 # failure can embed user text or paths. The prefixes are core.resolve's and routing.choose_pinned's own
 # wording; a rule matching none stays visible as a count. Order matters only for readability.
@@ -210,7 +212,7 @@ def collect(state_dir: Path, now: float | None = None) -> dict[str, Any]:
             has_sens = "sensitive_cloud" in {r[1] for r in conn.execute("PRAGMA table_info(routes)")}
             sens_sql = "substr(sensitive_cloud,1,?) AS sensitive_cloud" if has_sens else "? AS sensitive_cloud"
             rows = conn.execute(
-                "SELECT turn_id, ts, session_id, lane, model, actual_model, band, engine, degraded, turn_ms, "
+                "SELECT turn_id, ts, session_id, lane, model, actual_model, band, engine, degraded, turn_ms, engine_ms, "
                 "request_chars, response_chars, substr(answers,1,?) AS answers, substr(hard_rules,1,?) AS hard_rules, "
                 f"{tok_sql}, {sens_sql} FROM routes ORDER BY ts DESC LIMIT ?",
                 (ANSWERS_MAX, RULES_MAX, SENS_MAX if has_sens else None, ROW_LIMIT + 1),
@@ -231,15 +233,29 @@ def collect(state_dir: Path, now: float | None = None) -> dict[str, Any]:
         row = dict(raw)
         row["task_id"] = office.clean(row.pop("turn_id"), _ID_RE)
         row["session_id"] = office.clean(row["session_id"], _ID_RE)
-        for key in ("model", "actual_model"):
-            row[key] = office.clean(row[key], office._MODEL_RE)
+        row["model"] = office.clean(row["model"], office._MODEL_RE)
+        # the execution record names the account's provider (claude-cli#b/…): '#' allowed here, or every account-B row
+        # read as "not executed" (#132)
+        row["actual_model"] = office.clean(row["actual_model"], _EXEC_RE)
         row["lane"] = office.clean(row["lane"], office._LANE_RE)
         row["band"] = row["band"] if row["band"] in _BANDS else None
         pinned = row.pop("engine") == "pin" or row["band"] == "pin"
         row["degraded"] = bool(row["degraded"])
         row["s1_reason"] = _reason(row, pinned)          # consumes answers and hard_rules
         row["ts"] = _number(row["ts"])
-        row["elapsed_ms"] = _number(row.pop("turn_ms"))
+        # #132: elapsed_ms is the first turn's time (log_outcome), null — never 0 — until it is recorded; a stored 0
+        # can only be a missing measurement. end_to_end_ms adds S1's scoring time (engine_ms: null for a pin, which
+        # S1 never sees, so a pin's end-to-end time is its turn alone).
+        turn = _number(row.pop("turn_ms"))
+        row["elapsed_ms"] = turn if turn else None
+        s1_ms = _number(row.pop("engine_ms"))
+        row["s1_ms"] = None if pinned else s1_ms
+        row["end_to_end_ms"] = (turn + (0 if pinned else (s1_ms or 0))) if turn and (pinned or s1_ms is not None) else None
+        # actual_model is the execution record "provider/model" (core.log_execution), kept as is; its two parts are
+        # also given separately so a report compares the model with `model` directly (#132).
+        prov, _, name = (row["actual_model"] or "").partition("/")
+        row["executed_provider"] = prov if row["actual_model"] and name else None
+        row["executed_model"] = name if row["actual_model"] and name else None
         row["request_chars"] = _number(row["request_chars"])
         row["response_chars"] = _number(row["response_chars"])
         tok = {k: _number(row.pop("tok_" + k)) for k in work_split.TOKEN_FIELDS}

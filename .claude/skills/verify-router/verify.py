@@ -209,6 +209,22 @@ def pin(name):
 print(json.dumps({"one": pin("sub/GPT 6.1"), "many": pin("sub/GPT 6")}))
 """
 
+# Batch workload hint (#132, owner 2026-11-22): `x-cortados-workload: batch` caps the band at R1 and routes the call as
+# background work, but the hard rules win: an outward request stays R3 and a degraded decision never goes to Claude.
+# The real provider routing and the real core.decide on the throwaway home (S1 if up, degraded otherwise).
+WORKLOAD_SCENARIO = """
+import json, sys
+from cortados_router import core
+from cortados_router.provider import routing
+def route(text):
+    body = {"model": "cortados", "messages": [{"role": "user", "content": text}]}
+    r = routing.choose(core, body, client="verify-batch", conversation_id="verify-batch", claude_bin=sys.executable,
+                       codex_bin=sys.executable, workload="batch")
+    return {k: r.get(k) for k in ("provider", "model", "band", "degraded", "workload", "error")}
+print(json.dumps({"easy": route("refactor the parser module and update its tests across the package"),
+                  "outward": route("email the signed invoice to the client and mark it paid")}))
+"""
+
 # Local auto-route on the Pro (#75, 2026-11-13): after S1, a conversation in a band the node lists moves to its local model
 # only while the node is available; on battery / switch off / gate down it keeps S1's route; an outward (R3) request
 # never goes local whatever the config says; a degraded decision never goes local and never to Claude. Runs the real
@@ -751,6 +767,24 @@ def main():
             and not many.get("model")
         record("friendly pin resolves to one model, ambiguity is refused", "PASS" if ok_one and ok_many else "FAIL",
                f"sub/GPT 6.1 -> {one.get('provider')}/{one.get('model')} | sub/GPT 6 -> {(many.get('error') or '')[:120]}")
+
+    p = runner.run(["-c", WORKLOAD_SCENARIO], prefix="verify-router-batch-", timeout=300)
+    try:
+        r = _last_json(p)
+    except (ValueError, IndexError):
+        record("batch hint caps the band at R1", "FAIL", (p.stderr or p.stdout).strip()[-300:])
+    else:
+        easy, out = r["easy"], r["outward"]
+        claude = lambda x: (x.get("provider") or "").split("#")[0] == "claude-cli"
+        ok = easy.get("band") in ("R0", "R1") and easy.get("workload") == "batch" and not easy.get("error") \
+            and not (easy.get("degraded") and claude(easy))
+        record("batch hint caps the band at R1 (degraded: never Claude)", "PASS" if ok else "FAIL", json.dumps(easy))
+        if out.get("degraded"):
+            record("batch hint never lowers an outward request (R3)", "BLOCKED",
+                   unreachable if not up else f"S1 listening at {s1_where} but the decision is degraded")
+        else:
+            record("batch hint never lowers an outward request (R3)", "PASS" if out.get("band") == "R3" else "FAIL",
+                   json.dumps(out))
 
     p = runner.run(["-c", LOCAL_SCENARIO], prefix="verify-router-local-", timeout=300)
     try:

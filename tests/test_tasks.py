@@ -77,7 +77,8 @@ class CollectTest(unittest.TestCase):
         t = v["tasks"][0]
         self.assertEqual(set(t), {"task_id", "ts", "session_id", "lane", "model", "actual_model", "band", "degraded",
                                   "elapsed_ms", "request_chars", "response_chars", "tokens", "tokens_status",
-                                  "routing_kind", "s1_reason", "sensitive_cloud"})
+                                  "routing_kind", "s1_reason", "sensitive_cloud",
+                                  "s1_ms", "end_to_end_ms", "executed_provider", "executed_model"})
         for absent in ("request", "context", "task_context", "engine_error", "answers", "hard_rules", "engine", "features"):
             self.assertNotIn(absent, t)
         self.assertEqual((t["lane"], t["model"], t["actual_model"], t["band"], t["degraded"]),
