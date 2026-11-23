@@ -761,6 +761,11 @@ class SessionEndpointTest(tl.EndpointHarness):
                          "GET /v1/x?session=<redacted>&machine=<redacted> HTTP/1.1")
         self.assertEqual(server.redact_query("GET /v1/x HTTP/1.1"), "GET /v1/x HTTP/1.1")
         self.assertEqual(server.redact_query("/p?a=1&b=&c"), "/p?a=<redacted>&b=<redacted>&c")
+        # the whole value goes, punctuation included (pulse review round 3), as the pane's redactQuery
+        self.assertEqual(server.redact_query("could not read (GET /x?token=abc)SECRET)"),
+                         "could not read (GET /x?token=<redacted>")
+        self.assertEqual(server.redact_query("/x?a=1]S2,S3;S4'S5\"S6&b=x)y#frag"), "/x?a=<redacted>&b=<redacted>#frag")
+        self.assertEqual(server.redact_query("/x?a=v)S1 tail"), "/x?a=<redacted> tail")
 
     def test_machine_tags_compare_in_constant_time(self):
         self.assertTrue(live.same_machine(MACHINE_A, MACHINE_A))

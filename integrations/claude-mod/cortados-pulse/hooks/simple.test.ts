@@ -163,6 +163,11 @@ test('a failed read never shows the machine tag or the session tag: a host error
   expect(redactQuery('GET /x?session=' + MINE + '&machine=' + MACHINE_V + ' HTTP/1.1'))
     .toBe('GET /x?session=<redacted>&machine=<redacted> HTTP/1.1')
   expect(redactQuery('no query here')).toBe('no query here')
+  // the whole value goes, punctuation included (pulse review round 3): nothing after `=` survives before `&`, `#`,
+  // whitespace or the end
+  expect(redactQuery('could not read the provider (GET /x?token=abc)SECRET)')).toBe('could not read the provider (GET /x?token=<redacted>')
+  expect(redactQuery('/x?a=1]S2,S3;S4\'S5"S6&b=x)y#frag')).toBe('/x?a=<redacted>&b=<redacted>#frag')
+  expect(redactQuery('/x?a=v)S1 tail')).toBe('/x?a=<redacted> tail')
 })
 
 test('an older provider that ignores &machine= answers without the untagged group: only the session\'s own tasks', () => {

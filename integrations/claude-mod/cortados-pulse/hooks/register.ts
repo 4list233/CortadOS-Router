@@ -291,7 +291,9 @@ export async function fetchView($: Pick<EngineInterface, 'env' | 'fs' | 'http' |
  * given, and the session view's carries &machine=<tag>, a capability (pulse review round 2): no pane line ever shows a
  * query value, the session tag's included. */
 export function redactQuery(text: string): string {
-  return text.replace(/([?&][^=&\s#]*=)[^&\s#)]*/g, '$1<redacted>')
+  // The whole value, up to the next `&`, `#`, whitespace or the end (the provider's redact_query, pulse review round 3):
+  // punctuation such as `)`, `]`, `,` or a quote can be part of the value, so none of it ends the match.
+  return text.replace(/([?&][^=&\s#]*=)[^&\s#]*/g, '$1<redacted>')
 }
 
 /** Provider reads whose underlying $.http.fetch has not settled yet, by URL. A read counts here until the host's fetch
