@@ -795,7 +795,7 @@ class Guard:
                  max_pause_s: float | None = None, release_hold_s: float | None = None, log=lambda m: print(m, flush=True),
                  alerter=None, wall=_local_now, night_window="env", night_budget_s: float | None = None,
                  groups=None, state_path: Path | None = None, epoch=_time.time, stopped_path: Path | None = None,
-                 trainer_file: Path | None = None, leader_start=None):
+                 trainer_file: Path | None = None, leader_start=None, live_members=None):
         if latency is None:
             latency = ScorerLatency(clock=clock)
         self.latency, self.memory, self.clock, self.log = latency, memory, clock, log
@@ -807,7 +807,14 @@ class Guard:
         # #116 review round 1: where the stopped groups are recorded before each SIGSTOP (None: not recorded, as in tests),
         # and the studio gate's trainer-group file (None: none read). leader_start checks a recorded group's identity.
         self.stopped_path, self.trainer_file = stopped_path, trainer_file
-        self.leader_start = leader_start or proc_start
+        # Same rule for the identity check and the EPERM check (#116 review round 2): an injected signaller means fake pids,
+        # which must never reach the real ps. Uninjected there, a leader reads as gone (the group, if any, is ours) and an
+        # EPERM group as having live members (never 'drained' on a guess).
+        if leader_start is None:
+            leader_start = proc_start if signaller is None else (lambda pid: None)
+        if live_members is None:
+            live_members = _live_group_members if signaller is None else (lambda pgid: [pgid])
+        self.leader_start, self.live_members = leader_start, live_members
         self.group_alive = group_alive   # 'does this group still exist' for stop_trainer_group (tests replace it)
         # Whether the running cycle may train (run_cycle sets it from train_policy and the day stop). A labelling-only cycle
         # is never stopped for the day: there is no training in it to stop (owner 2026-11-22, item 2).
@@ -815,6 +822,12 @@ class Guard:
         self.stopped_groups: list[int] = []   # the groups the last pause stopped (each gets SIGCONT on resume or stop)
         self.stopped_starts: dict[int, str | None] = {}   # their leaders' start times, as recorded in stopped_path
         self.trainer_unreadable_logged = False
+        # #116 review round 2: groups the guard stopped that could not be confirmed continued or gone (EPERM from a live
+        # group, or an identity that cannot be checked), with their leaders' recorded start times. They survive new_cycle(),
+        # stay in stopped_path (so a restart sees them too), show in the state file and are retried at every reading until
+        # each is continued, gone, or found to be another process's group.
+        self.unresolved: dict[int, str | None] = {}
+        self.unresolved_alerted = False
         # Stopped for the day (#116, owner 2026-11-18): epoch until which no cycle starts, the pause's reason slug and the
         # rule that set it. Survives new_cycle() and, through the state file, a supervisor restart (load_day_stop).
         self.day_stop_until: float | None = None
@@ -869,10 +882,17 @@ class Guard:
         self.new_cycle()
 
     def new_cycle(self) -> None:
-        """Forget per-cycle state (pause, hysteresis, once-per-cycle config log, forced-release blindness)."""
+        """Forget per-cycle state (pause, hysteresis, once-per-cycle config log, forced-release blindness). A stopped group
+        never confirmed continued is not forgotten: it moves to the unresolved set, retried at every reading."""
         self.since = self.clock()
+        leftover = [g for g in self.stopped_groups if g not in self.unresolved]
+        for g in leftover:
+            self.unresolved[g] = self.stopped_starts.get(g)
         self.stopped_groups = []
         self.stopped_starts = {}
+        if leftover:
+            self._persist_stopped()
+            self._report_unresolved()
         self.reason = None
         self.paused = False
         self.pause_complete = False   # every relevant group confirmed stopped (discovery complete, every SIGSTOP landed)
@@ -951,6 +971,7 @@ class Guard:
         if self.last is not None and self.clock() - self.last < self.interval:
             return
         self.last = self.clock()
+        self.retry_unresolved()   # #116 review round 2: between cycles too
         lat, _ = self._read_latency()
         if lat is not None:
             self._record_baseline(lat)
@@ -1020,25 +1041,114 @@ class Guard:
         groups = [g for g in groups if safe_group(g)]
         for g in groups:
             if self.stopped_starts.get(g) is None:
-                self.stopped_starts[g] = starts.get(g)
+                # An unresolved group stopped again keeps the start it was first recorded with (its identity).
+                self.stopped_starts[g] = starts.get(g) or self.unresolved.get(g)
         new = [g for g in groups if g not in self.stopped_groups]
         self.stopped_groups = self.stopped_groups + new
-        if self.stopped_path is None or not new:
-            return
-        recs = [{"pgid": g, "start": self.stopped_starts.get(g)} for g in self.stopped_groups]
-        try:
-            _write_json_durable(self.stopped_path, {"version": 1, "groups": recs})
-        except OSError as e:
-            self.log(f"overnight: cannot record stopped groups in {self.stopped_path.name} ({type(e).__name__}); a "
-                     "supervisor crash during this pause relies on the trainer-group file and the tree walk")
+        for g in new:
+            self.unresolved.pop(g, None)   # this pause owns it now and continues it when it ends
+        if new:
+            self._persist_stopped()
 
-    def _clear_stopped(self) -> None:
+    def _persist_stopped(self) -> None:
+        """Write stopped_path: the current pause's groups plus every unresolved one (#116 review round 2: an unresolved
+        group stays recorded until it is continued or gone). Nothing left: the file is removed."""
         if self.stopped_path is None:
             return
+        recs = [{"pgid": g, "start": self.stopped_starts.get(g)} for g in self.stopped_groups]
+        recs += [{"pgid": g, "start": st} for g, st in self.unresolved.items() if g not in self.stopped_groups]
         try:
-            self.stopped_path.unlink(missing_ok=True)
+            if recs:
+                _write_json_durable(self.stopped_path, {"version": 1, "groups": recs})
+            else:
+                self.stopped_path.unlink(missing_ok=True)
         except OSError as e:
-            self.log(f"overnight: cannot remove {self.stopped_path.name} ({type(e).__name__}); a restart will re-check it")
+            self.log(f"overnight: cannot {'record' if recs else 'remove'} stopped groups in {self.stopped_path.name} "
+                     f"({type(e).__name__}); a supervisor restart relies on the trainer-group file and the tree walk")
+
+    def _zombie_group(self, g: int) -> bool:
+        """An EPERM answer for group `g` means drained only when ps shows no live member left (the rule of _zombie_only).
+        A ps failure is not 'drained'."""
+        try:
+            return not self.live_members(g)
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def _continue_group(self, g: int, start: str | None, *, verified: bool = False) -> str:
+        """SIGCONT one group the guard stopped, checking first that it is still the group recorded (#116 review round 2:
+        a group that exited during the pause may have had its id reused). verified: its identity is known right now (in
+        the freshly walked tree, the gate's checked trainer record, or the cycle's unreaped root). Returns 'done'
+        (continued, or gone), 'stale' (the id now names another process's group: never signalled) or 'keep' (identity
+        undecidable, or EPERM with a live member: not confirmed continued)."""
+        if not safe_group(g):
+            return "done"   # never signalled by the guard, so never stopped by it
+        if not verified:
+            ours = group_is_ours({"pgid": g, "start": start}, leader_start=self.leader_start)
+            if ours is False:
+                return "stale"
+            if ours is None:
+                return "keep"
+        try:
+            self.signaller(g, signal.SIGCONT)
+        except ProcessLookupError:
+            return "done"
+        except PermissionError:
+            return "done" if self._zombie_group(g) else "keep"
+        return "done"
+
+    def _settle(self, g: int, outcome: str, start: str | None) -> None:
+        """Record one continuation's outcome: the group leaves the pause's set; 'keep' puts it in the unresolved set."""
+        if g in self.stopped_groups:
+            self.stopped_groups = [x for x in self.stopped_groups if x != g]
+        self.stopped_starts.pop(g, None)
+        if outcome == "keep":
+            if g not in self.unresolved:
+                self.log(f"overnight: process group {g} could not be confirmed continued (EPERM from a live member, or "
+                         "its identity cannot be checked); kept and retried at every reading")
+            self.unresolved[g] = start
+            return
+        if outcome == "stale":
+            self.log(f"overnight: stopped group {g} is gone and its id now belongs to another process; not signalled")
+        self.unresolved.pop(g, None)
+
+    def _report_unresolved(self, name: str = "guard_continue_incomplete") -> None:
+        """Alert once when stopped groups are left unresolved; log once when every one has been resolved."""
+        if self.unresolved and not self.unresolved_alerted:
+            self.unresolved_alerted = True
+            detail = (f"{len(self.unresolved)} process group(s) the guard stopped are not confirmed continued (EPERM from "
+                      "a live member, or an identity ps cannot check); retried at every guard reading")
+            self.log(f"overnight: !!! CONTINUE INCOMPLETE: {detail}")
+            self.alerter(name, detail)
+        elif not self.unresolved and self.unresolved_alerted:
+            self.unresolved_alerted = False
+            self.log("overnight: every process group the guard stopped is now confirmed continued or gone")
+
+    def retry_unresolved(self, pgid: int | None = None) -> None:
+        """Retry every unresolved group (#116 review round 2), at every reading: until each is continued, gone or found
+        stale. pgid: the running cycle's root (our unreaped child, so its identity is certain). A group the current pause
+        stopped again is skipped (_record_stopped took it out of the set)."""
+        if not self.unresolved:
+            return
+        for g, start in list(self.unresolved.items()):
+            if g in self.stopped_groups:
+                continue
+            self._settle(g, self._continue_group(g, start, verified=(g == pgid)), start)
+        self._persist_stopped()
+        self._report_unresolved()
+
+    def load_unresolved(self) -> None:
+        """Startup, after recover_stopped_groups: whatever it could not resolve is still in stopped_path. Those groups
+        become this guard's unresolved set, retried at every reading (the recovery already alerted)."""
+        if self.stopped_path is None:
+            return
+        recs, _ = read_stopped_groups(self.stopped_path)
+        for r in recs:
+            if safe_group(r["pgid"]):
+                self.unresolved.setdefault(r["pgid"], r["start"])
+        if self.unresolved:
+            self.unresolved_alerted = True
+            self.log(f"overnight: {len(self.unresolved)} process group(s) from a previous supervisor are not confirmed "
+                     "continued; retried at every guard reading")
 
     def _pause(self, pgid: int, why: str, reason: str = "latency") -> None:
         # The cycle group first (nightly.sh then starts nothing new), then every gated step's own group (the trainer).
@@ -1085,15 +1195,55 @@ class Guard:
 
     def continue_all(self, pgid: int) -> None:
         """SIGCONT every group a pause stopped, every group in the tree now and the gate's recorded trainer group, the cycle
-        group last (callers send that one themselves, with their zombie handling). Before any TERM: a stopped trainer
-        cannot act on it and would be KILLed at the gate's grace, losing its unsaved steps. Then the stopped-groups record
-        is cleared (the root is covered on restart by recover_pidfile)."""
+        group last (callers send that one themselves: continue_root). Before any TERM: a stopped trainer cannot act on it
+        and would be KILLed at the gate's grace, losing its unsaved steps.
+        #116 review round 2: a remembered group is signalled only when its identity is confirmed (in the tree walked now,
+        or group_is_ours against its recorded start); one found to be another process's group is dropped unsignalled.
+        A group not confirmed continued (identity undecidable, EPERM from a live member) stays in the stopped-groups record
+        as unresolved, alerted, and retried at every reading; the record holds nothing else once this returns."""
         try:
             now, _, _ = self._discover(pgid)
         except Exception:   # never let a ps fault leave the trainer stopped
             now = []
-        self._signal_groups([g for g in dict.fromkeys(self.stopped_groups + list(now)) if g != pgid], signal.SIGCONT)
-        self._clear_stopped()
+        now = [g for g in now if g != pgid]
+        remembered = [g for g in self.stopped_groups if g != pgid]
+        for g in remembered:
+            start = self.stopped_starts.get(g)
+            self._settle(g, self._continue_group(g, start, verified=g in now), start)
+        for g in now:
+            if g in remembered:
+                continue
+            if g in self.unresolved:
+                start = self.unresolved[g]
+                self._settle(g, self._continue_group(g, start, verified=True), start)
+            else:
+                self._signal_groups([g], signal.SIGCONT)   # never stopped by this pause: a best-effort CONT
+        self.retry_unresolved()
+        self._persist_stopped()
+
+    def continue_root(self, pgid: int, child=None) -> bool:
+        """SIGCONT the cycle's own group (#116 review round 2: never the raw signaller, whose EPERM crashed the guard).
+        Same EPERM rule as every cycle-group signal (_zombie_only): drained when no live member is left (with `child`, its
+        leader first gets EPERM_SETTLE_S to become waitable); a live member that refuses leaves the group unresolved,
+        alerted and retried at every reading, never a crash nor a claimed success. True when continued or gone."""
+        start = self.stopped_starts.get(pgid, self.unresolved.get(pgid))
+        try:
+            self.signaller(pgid, signal.SIGCONT)
+            ok = True
+        except ProcessLookupError:
+            ok = True
+        except PermissionError:
+            ok = True
+            if child is not None:
+                try:
+                    child.wait(timeout=EPERM_SETTLE_S)
+                except subprocess.TimeoutExpired:
+                    ok = False   # the leader itself is running and refuses: a genuine failure
+            ok = ok and self._zombie_group(pgid)
+        self._settle(pgid, "done" if ok else "keep", start)
+        self._persist_stopped()
+        self._report_unresolved()
+        return ok
 
     def _clear_trainer_record(self, pgid: int) -> None:
         """Remove the trainer-group record, only while it still names `pgid` (as the gate does: never another gate's)."""
@@ -1167,10 +1317,8 @@ class Guard:
         return True
 
     def _continue(self, pgid: int) -> None:
-        self.signaller(pgid, signal.SIGCONT)
+        self.continue_root(pgid)
         self.continue_all(pgid)
-        self.stopped_groups = []
-        self.stopped_starts = {}
         self.pause_complete = False
         self.since = self.clock()
 
@@ -1294,7 +1442,9 @@ class Guard:
                 "baseline_p50_s": fin(self.baseline), "baseline_p90_s": fin(self.baseline_p90),
                 "p50_s": fin(r.p50) if r else None, "p90_s": fin(r.p90) if r else None,
                 "samples": r.n if r else 0, "timeouts": r.timeouts if r else 0, "source": r.source if r else None,
-                "pauses_24h": sum(1 for t in self.pauses if now - t < 86400)}
+                "pauses_24h": sum(1 for t in self.pauses if now - t < 86400),
+                # #116 review round 2: stopped groups not confirmed continued or gone (retried at every reading).
+                "unresolved_groups": len(self.unresolved)}
 
     def write_state(self) -> None:
         """Atomic write of state() to state_path (None: no file, as in tests). A failure is logged once, never fatal."""
@@ -1319,6 +1469,7 @@ class Guard:
             return
         self.last = self.clock()
         try:
+            self.retry_unresolved(pgid)   # #116 review round 2: until each is continued, gone or another process's
             self._step(pgid)
         finally:
             self.write_state()   # every reading, the release hold-off included: the live view marks a silent guard stale
@@ -1505,6 +1656,18 @@ def stop_group_drained(child, *, grace: float, poll_s: float = DRAIN_POLL_S, clo
     return False
 
 
+def stop_cycle_group(child, guard, *, grace: float) -> None:
+    """stop_group_drained for run_cycle's stop paths, EPERM-safe (#116 review round 2, #131 item 3): a cycle group with a
+    live member that refuses a signal (genuine EPERM, re-raised by _zombie_only) is logged and alerted, never a supervisor
+    crash (launchd would restart it into the same group); the finally's continue_root then keeps it unresolved."""
+    try:
+        stop_group_drained(child, grace=grace)
+    except PermissionError as e:
+        print(f"overnight: !!! cannot stop the cycle's process group {child.pid}: {e.strerror or e} (a live member "
+              "refuses the signal)", flush=True)
+        guard.alerter("guard_stop_incomplete", "the cycle's process group refused a stop signal (EPERM) with live members")
+
+
 def deadline_reached(now: datetime, deadline: datetime) -> bool:
     """now >= deadline as instants. Aware datetimes sharing one ZoneInfo compare by WALL time and ignore fold, so during the
     repeated fall-back hour 01:30 EDT (fold=0) and 01:30 EST (fold=1) compare equal; going through UTC compares real instants.
@@ -1598,7 +1761,7 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
                       f"(TERM, {grace_end:g}s grace, then KILL); checkpoints are kept", flush=True)
                 window_ended = True
                 guard.continue_all(child.pid)   # a paused trainer's own group: CONT before the gate TERMs it
-                stop_group_drained(child, grace=grace_end)
+                stop_cycle_group(child, guard, grace=grace_end)
                 guard.stop_trainer_group(trainer_grace)   # a trainer whose gate crashed is outside the drained group
                 break
             guard.tick(child.pid)
@@ -1609,7 +1772,7 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
                       "grace, then KILL); checkpoints are kept", flush=True)
                 day_stopped = True
                 guard.continue_all(child.pid)
-                stop_group_drained(child, grace=grace_end)
+                stop_cycle_group(child, guard, grace=grace_end)
                 guard.stop_trainer_group(trainer_grace)
                 break
             sleep(poll_s)
@@ -1617,7 +1780,7 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
     except BaseException:
         # launchd stop/restart of com.cortados.s1-continuous (every deploy) arrives here as SIGTERM -> KeyboardInterrupt.
         guard.continue_all(child.pid)
-        stop_group_drained(child, grace=grace)
+        stop_cycle_group(child, guard, grace=grace)
         try:
             guard.stop_trainer_group(trainer_grace)
         except Exception as e:   # never hide the stop that brought us here
@@ -1629,10 +1792,9 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
         guard.in_cycle = False
         guard.cycle_trains = True
         guard.continue_all(child.pid)
-        try:
-            guard.signaller(child.pid, signal.SIGCONT)
-        except PermissionError as e:
-            _zombie_only(child, e)   # zombie-only group (leader gone): nothing left to continue; a live leader re-raises
+        # Zombie-only group (leader gone): nothing left to continue. A live member refusing: unresolved and retried, never
+        # a crash out of this finally (#116 review round 2).
+        guard.continue_root(child.pid, child)
         guard.new_cycle()
         guard.write_state()
         if pidfile is not None and child.poll() is not None:
@@ -1657,10 +1819,14 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
     return child.returncode, result
 
 
-def recover_pidfile(pidfile: Path, *, ps=None, signaller=None, alive=None, log=lambda m: print(m, flush=True)) -> None:
+def recover_pidfile(pidfile: Path, *, ps=None, signaller=None, alive=None, log=lambda m: print(m, flush=True),
+                    stopped_path: Path | None = None, leader_start=None, live_members=None, alerter=None) -> None:
     """Continuous startup: a pidfile left by a supervisor that died mid-pause can name a live, SIGSTOPped nightly.sh, which
-    makes every new cycle exit 'already running' forever. SIGCONT such a group; drop a pidfile whose process is gone."""
+    makes every new cycle exit 'already running' forever. SIGCONT such a group; drop a pidfile whose process is gone.
+    EPERM (#116 review round 2): drained when no live member is left; otherwise logged, alerted and the group added to
+    stopped_path as unresolved, so the guard (load_unresolved) retries it at every reading. Never a crash."""
     signaller = signaller or signal_group
+    live_members = live_members or _live_group_members
     def _alive(pid):
         try:
             os.kill(pid, 0)
@@ -1695,23 +1861,60 @@ def recover_pidfile(pidfile: Path, *, ps=None, signaller=None, alive=None, log=l
         log(f"overnight: ps for pid {pid} failed ({e}); cannot tell whether it is stopped")
         return
     if stat.startswith("T"):
-        signaller(pid, signal.SIGCONT)
+        try:
+            signaller(pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            try:
+                drained = not live_members(pid)
+            except (OSError, subprocess.SubprocessError):
+                drained = False
+            if not drained:
+                log(f"overnight: !!! pid {pid} from {pidfile} is stopped and its group refused SIGCONT (EPERM); kept as "
+                    "unresolved, retried at every guard reading")
+                if alerter is not None:
+                    alerter("guard_recovery_incomplete", "the previous cycle's group refused SIGCONT (EPERM) at startup")
+                if stopped_path is not None:
+                    _add_unresolved(stopped_path, pid, leader_start or proc_start, log)
+                return
         log(f"overnight: pid {pid} from {pidfile} was left stopped (state {stat}); sent SIGCONT to its group so it can finish")
     else:
         log(f"overnight: pid {pid} from {pidfile} is running (state {stat}); nightly.sh will refuse a second run until it ends")
 
 
+def _add_unresolved(stopped_path: Path, pgid: int, leader_start, log) -> None:
+    """Append group `pgid` (with its leader's start, if ps can tell) to the stopped-groups record as unresolved."""
+    recs, _ = read_stopped_groups(stopped_path)
+    if any(r["pgid"] == pgid for r in recs):
+        return
+    try:
+        start = _norm_start(leader_start(pgid))
+    except (OSError, subprocess.SubprocessError):
+        start = None
+    try:
+        _write_json_durable(stopped_path, {"version": 1, "groups": recs + [{"pgid": pgid, "start": start}]})
+    except OSError as e:
+        log(f"overnight: cannot record unresolved group in {stopped_path.name} ({type(e).__name__})")
+
+
 def recover_stopped_groups(stopped_path: Path, trainer_file: Path | None, pidfile: Path, *, signaller=None,
-                           leader_start=None, discover=None, alive=None, log=lambda m: print(m, flush=True)) -> list[int]:
+                           leader_start=None, discover=None, alive=None, log=lambda m: print(m, flush=True),
+                           live_members=None, alerter=None) -> list[int]:
     """Continuous startup, BEFORE recover_pidfile resumes the cycle's root (#116 review round 1): a supervisor killed
     mid-pause forgot which groups it stopped, and recover_pidfile alone continued only nightly.sh's group, leaving the gated
     trainer (its own group) SIGSTOPped forever with the training lock and GPU memory. SIGCONT, in this order of discovery:
     every group in stopped_path that is still the one recorded (group_is_ours), the trainer group the studio gate recorded
     in trainer_file (same check), and every group still in the tree under the pidfile's live root. Never the root itself
-    (recover_pidfile's job, after these), never this process's own group. Returns the groups continued. stopped_path is
-    removed afterwards: whatever it named has now been handled."""
+    (recover_pidfile's job, after these), never this process's own group. Returns the groups continued.
+    #116 review round 2: a group not confirmed continued (its identity undecidable, or EPERM from a live member) is NOT
+    forgotten: stopped_path is rewritten with exactly those groups (removed when there are none), the recovery is logged
+    and alerted as incomplete, and the new guard retries them at every reading (Guard.load_unresolved). A group found to
+    be another process's now is dropped unsignalled."""
     signaller = signaller or signal_group
     discover = discover or discover_groups
+    leader_start = leader_start or proc_start
+    live_members = live_members or _live_group_members
     def _alive(pid):
         try:
             os.kill(pid, 0)
@@ -1729,6 +1932,8 @@ def recover_stopped_groups(stopped_path: Path, trainer_file: Path | None, pidfil
     if root is not None and not alive(root):
         root = None
     targets: list[int] = []
+    starts: dict[int, str | None] = {}
+    kept: list[dict] = []
     recs, ok = read_stopped_groups(stopped_path)
     if not ok:
         log(f"overnight: {stopped_path.name} is unreadable; continuing every group that can still be found")
@@ -1742,30 +1947,59 @@ def recover_stopped_groups(stopped_path: Path, trainer_file: Path | None, pidfil
         g = rec["pgid"]
         if not safe_group(g) or g == root or g in targets:
             continue
+        if any(k["pgid"] == g for k in kept):
+            continue
         ours = group_is_ours(rec, leader_start=leader_start)
         if ours:
             targets.append(g)
+            starts[g] = rec["start"]
         elif ours is False:
             log(f"overnight: recorded group {g} now belongs to another process; not signalled")
         else:
-            log(f"overnight: recorded group {g} cannot be verified (ps failed or no start recorded); not signalled")
+            log(f"overnight: recorded group {g} cannot be verified (ps failed or no start recorded); not signalled, kept "
+                "as unresolved")
+            kept.append({"pgid": g, "start": rec["start"]})
     if root is not None:
         d = discover(root)
-        targets += [g for g in d.groups if g != root and g not in targets and safe_group(g)]
+        for g in d.groups:
+            if g != root and g not in targets and safe_group(g):
+                targets.append(g)
+                starts[g] = d.starts.get(g)
+                kept = [k for k in kept if k["pgid"] != g]   # in the live tree now: its identity is certain
         if not d.complete:
             log("overnight: the cycle's tree could not be walked; only recorded groups were continued")
+    done = []
     for g in targets:
         try:
             signaller(g, signal.SIGCONT)
-        except (ProcessLookupError, PermissionError):
+        except ProcessLookupError:
             pass
-    if targets:
-        log(f"overnight: continued {len(targets)} process group(s) a previous supervisor may have left stopped")
+        except PermissionError:
+            try:
+                drained = not live_members(g)
+            except (OSError, subprocess.SubprocessError):
+                drained = False
+            if not drained:
+                log(f"overnight: group {g} refused SIGCONT (EPERM) with a live member; kept as unresolved")
+                kept.append({"pgid": g, "start": starts.get(g)})
+                continue
+        done.append(g)
+    if done:
+        log(f"overnight: continued {len(done)} process group(s) a previous supervisor may have left stopped")
     try:
-        stopped_path.unlink(missing_ok=True)
+        if kept:
+            _write_json_durable(stopped_path, {"version": 1, "groups": kept})
+        else:
+            stopped_path.unlink(missing_ok=True)
     except OSError as e:
-        log(f"overnight: cannot remove {stopped_path.name} ({type(e).__name__})")
-    return targets
+        log(f"overnight: cannot {'record' if kept else 'remove'} {stopped_path.name} ({type(e).__name__})")
+    if kept or not ok:
+        detail = (f"{len(kept)} process group(s) a previous supervisor stopped are not confirmed continued; retried at "
+                  "every guard reading" if kept else f"{stopped_path.name} was unreadable; only the live tree was continued")
+        log(f"overnight: !!! RECOVERY INCOMPLETE: {detail}")
+        if alerter is not None:
+            alerter("guard_recovery_incomplete", detail)
+    return done
 
 
 # Failure backoff cap. Exit 3 (Claude quota headroom low/unknown) recovers on the accounts' ~5 h usage window, and other failures
@@ -1910,9 +2144,9 @@ def run_continuous(command: list[str], guard: Guard | None = None, *, result_fil
 def sleep_between_cycles(guard: Guard, delay: float, *, sleep=_time.sleep) -> None:
     """Sleep `delay` before the next cycle. While the guard's day stop lasts (#116), in steps of at most its reading
     interval with an idle reading each: the state file stays fresh (a day stop that goes silent reads as stale in the live
-    view) and the baseline keeps learning the scorer alone. The day stop ending mid-sleep is cleared at once; the sleep
-    itself is not shortened (the delay protects the labeler's quota, the failure backoff, or the idle interval)."""
-    if not guard.day_stop_active():
+    view) and the baseline keeps learning the scorer alone. The same steps retry any unresolved stopped group (#116 review
+    round 2). The day stop ending mid-sleep is cleared at once; the sleep itself is not shortened (the delay protects the labeler's quota, the failure backoff, or the idle interval)."""
+    if not guard.day_stop_active() and not guard.unresolved:
         sleep(delay)
         return
     left = delay
@@ -1921,6 +2155,8 @@ def sleep_between_cycles(guard: Guard, delay: float, *, sleep=_time.sleep) -> No
             guard.clear_day_stop()
         if guard.day_stop_active():
             guard.idle_probe()
+        elif guard.unresolved:
+            guard.retry_unresolved()   # #116 review round 2: a stopped group not confirmed continued is retried meanwhile
         # >= 1 s: an interval of 0 (tests) must not spin.
         step = min(left, max(1.0, guard.interval))
         sleep(step)
@@ -1943,12 +2179,13 @@ def main(argv: list[str]) -> int:
         data = Path(__file__).parent / "data"
         # #116 review round 1: every group a previous supervisor may have left stopped (its record, the gate's trainer
         # record, the live tree) is continued BEFORE the cycle's root, so the trainer is never left SIGSTOPped.
-        recover_stopped_groups(data / STOPPED_GROUPS_NAME, data / TRAINER_GROUP_NAME, data / "nightly.pid")
-        recover_pidfile(data / "nightly.pid")
+        recover_stopped_groups(data / STOPPED_GROUPS_NAME, data / TRAINER_GROUP_NAME, data / "nightly.pid", alerter=alert)
+        recover_pidfile(data / "nightly.pid", stopped_path=data / STOPPED_GROUPS_NAME, alerter=alert)
         # Same PIDFILE/STOPFLAG paths nightly.sh uses (PIDFILE=data/nightly.pid; STOPFLAG=data/nightly.stop, run in s1/).
         guard = Guard(state_path=data / GUARD_STATE_NAME,   # #116: the live view's S1 block reads this file
                       stopped_path=data / STOPPED_GROUPS_NAME, trainer_file=data / TRAINER_GROUP_NAME)
         guard.load_day_stop()   # a restart (every deploy) keeps a day stop
+        guard.load_unresolved()   # #116 review round 2: groups the recovery could not confirm continued, retried
         return run_continuous(command, guard, result_file=data / "cycle-result", stopflag=data / "nightly.stop",
                               pidfile=data / "nightly.pid", sweep_request=data / "sweep-request.json")
     if argv == ["--check-window"]:

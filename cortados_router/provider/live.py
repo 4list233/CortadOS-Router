@@ -191,7 +191,9 @@ S1_GUARD_UNTIL_AHEAD_MAX = 2 * 86400.0
 S1_GUARD_REASONS = ("latency", "timeout", "refused", "memory", "no_baseline", "forced_release")
 S1_GUARD_SOURCES = ("scorer", "probe")
 _S1_GUARD_SECONDS = ("budget_s", "baseline_p50_s", "baseline_p90_s", "p50_s", "p90_s")
-_S1_GUARD_COUNTS = ("samples", "timeouts", "pauses_24h")
+# unresolved_groups (#116 review round 2): process groups the guard stopped that are not confirmed continued or gone yet
+# (EPERM from a live member, or an identity ps cannot check); retried at every reading. A count only, never a pid.
+_S1_GUARD_COUNTS = ("samples", "timeouts", "pauses_24h", "unresolved_groups")
 _HB_S1_GUARD_KEYS = {"state", "reason", "updated_at", "paused_s", "budget", "source", "pause", "until",
                      "until_rule"} | set(_S1_GUARD_SECONDS) \
     | set(_S1_GUARD_COUNTS)

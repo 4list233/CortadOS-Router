@@ -392,6 +392,15 @@ never the trainer; (3) a reading with no baseline was never judged. Now:
   times, to `s1/data/latency-guard-stopped.json` (fsynced); it is removed once they are continued. A restarted supervisor
   (`recover_stopped_groups`, before `recover_pidfile`) SIGCONTs every recorded group that is still ours, the gate's recorded
   trainer group, and every group still in the tree under `nightly.pid`, and only then the cycle's root.
+- *Unresolved groups* (review round 2): a stopped group is forgotten only when it is confirmed continued (SIGCONT landed),
+  gone (ESRCH, or EPERM with no live member: the zombie-only rule of `_zombie_only`), or found to be another process's
+  (reused pgid). Every continuation checks identity first: a remembered group is signalled only when it is in the tree
+  walked just now, or `group_is_ours` against its recorded start. A group whose identity cannot be checked, or whose live
+  member refuses SIGCONT with EPERM, the cycle's root included, stays in `latency-guard-stopped.json` as unresolved, is
+  alerted once (`guard_continue_incomplete`; at startup `guard_recovery_incomplete`), counted in the state file
+  (`unresolved_groups`, shown on the dashboard) and retried at every guard reading, between cycles too, until it resolves.
+  No pause, continue or stop path lets an EPERM escape (#131 item 3: `_pause` -> `signal_group` crashed the supervisor);
+  a cycle group whose live member refuses the stop signal is alerted (`guard_stop_incomplete`) instead.
 - *Stopped for the day* (owner 2026-11-18, refined 2026-11-22): when the longest pause (`CORTADOS_S1_MAX_PAUSE_S`) ends in a
   cycle that may train and scoring is still over budget (a timed-out or refused reading, or p50/p90 above baseline + budget,
   judged against the baseline before that reading joins it), the guard does not release and re-pause. It alerts

@@ -738,6 +738,7 @@ function guardText(g) {
   const now = g.samples ? "p50 " + secs(g.p50_s) + " / p90 " + secs(g.p90_s) + " (" + g.samples + " " + (g.source === "probe" ? "probe" : "routed") + ")" : null;
   const base = isNum(g.baseline_p50_s) ? "baseline " + secs(g.baseline_p50_s) + " / " + secs(g.baseline_p90_s) + " + " + g.budget_s + " s " + (g.budget || "") : "no baseline yet";
   return join([head, now, base, g.timeouts ? g.timeouts + " timed out" : null, g.pauses_24h ? g.pauses_24h + " pauses in 24 h" : null,
+    g.unresolved_groups ? g.unresolved_groups + " stopped process group(s) NOT confirmed continued (retried at every reading)" : null,
     g.stale ? "STALE: not updated for " + age(g.age_s) : null]);
 }
 function renderS1(c, x) {
@@ -754,7 +755,7 @@ function renderS1(c, x) {
   if (x.guard) {
     const gr = el("div", "job");
     const gs = x.guard.state;
-    add(gr, pill(gs === "paused" || gs === "stopped_for_day" ? "partial" : gs === "unknown" ? "unknown" : "ok",
+    add(gr, pill(x.guard.unresolved_groups ? "down" : gs === "paused" || gs === "stopped_for_day" ? "partial" : gs === "unknown" ? "unknown" : "ok",
       gs === "stopped_for_day" ? "stopped for the day" : gs),
       el("span", "title", "latency guard"), el("span", "js", guardText(x.guard)));
     add(box, gr);

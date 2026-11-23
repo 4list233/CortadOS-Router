@@ -504,7 +504,8 @@ class LiveView(unittest.TestCase):
     NOW = 1_800_000_000.0
     G = {"state": "paused", "reason": "latency", "updated_at": NOW - 10, "paused_s": 60.0, "budget": "day",
          "budget_s": 1.0, "baseline_p50_s": 4.8, "baseline_p90_s": 6.2, "p50_s": 9.0, "p90_s": None, "samples": 4,
-         "timeouts": 1, "source": "scorer", "pauses_24h": 2, "pause": "complete", "until": None, "until_rule": None}
+         "timeouts": 1, "source": "scorer", "pauses_24h": 2, "pause": "complete", "until": None, "until_rule": None,
+         "unresolved_groups": 0}
 
     def test_a_valid_state_passes(self):
         g, bad = live.validate_s1_guard(self.G, self.NOW)
@@ -1279,6 +1280,302 @@ class StopForDay(unittest.TestCase):
         self.assertIn('"retry_1h"', html)
         self.assertIn("labelling continues", html)
         self.assertEqual(live.S1_GUARD_UNTIL_RULES, night.DAY_STOP_RULES)
+
+
+
+def eperm_signaller(sig, refuse):
+    """A fake signaller recording every signal; (pgid, sig) pairs in `refuse` (a set the test may change) raise EPERM."""
+    def signaller(pid, s):
+        if (pid, s) in refuse or (pid, None) in refuse:
+            raise PermissionError(1, "Operation not permitted")
+        sig.append((pid, s))
+    return signaller
+
+
+class UnresolvedContinuation(unittest.TestCase):
+    """#116 review round 2 (gpt-6.1-sol). Finding 1: a stopped group not confirmed continued (identity undecidable, or EPERM
+    from a live member) is never forgotten: kept in the stopped-groups record, reported (state file + alert) and retried
+    at every reading, at startup recovery and in continue_all alike. Finding 2: continue_all checks a remembered group's
+    identity before SIGCONT. Finding 3: the root's SIGCONT takes the zombie-aware EPERM rule, never a crash. And #131
+    item 3: EPERM is handled on every pause / continue / stop path, the production signal_group included."""
+
+    def paused(self, tmp, sig, refuse, *, live=lambda g: [g], starts=None, trees=None, alerts=None, **kw):
+        stopped = Path(tmp) / night.STOPPED_GROUPS_NAME
+        starts = {100: "a", 200: "c"} if starts is None else starts
+        trees = trees or (lambda pg: discovery([pg, 200], starts={pg: "a", 200: "c"}))
+        alerts = [] if alerts is None else alerts
+        g = guard(lambda: 9.0, sig=sig, groups=trees, baseline=(4.8, 6.2), stopped_path=stopped,
+                  leader_start=lambda pid: starts.get(pid), live_members=live, **kw)
+        g.signaller = eperm_signaller(sig, refuse)
+        g.alerter = lambda n, d: alerts.append(n)
+        g.tick(100)
+        self.assertTrue(g.paused)
+        return g, stopped
+
+    # Finding 1: continue_all and the guard's retry
+    def test_continue_all_keeps_a_group_that_refuses_sigcont_and_retries_it_every_reading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sig, refuse, alerts, logs = [], set(), [], []
+            g, stopped = self.paused(tmp, sig, refuse, alerts=alerts, logs=logs)
+            refuse.add((200, signal.SIGCONT))                      # a live member refuses: EPERM, not zombie-only
+            g.continue_all(100)
+            self.assertEqual(g.unresolved, {200: "c"})
+            self.assertEqual([r["pgid"] for r in night.read_stopped_groups(stopped)[0]], [100, 200])
+            g.continue_root(100)
+            self.assertEqual([r["pgid"] for r in night.read_stopped_groups(stopped)[0]], [200])   # kept durably
+            self.assertEqual(alerts, ["guard_continue_incomplete"])
+            g.new_cycle()                                           # a new cycle does not forget it
+            self.assertEqual(g.state()["unresolved_groups"], 1)
+            g.latency, g.groups = (lambda: 4.8), (lambda pg: [pg])   # the next cycle runs in budget, without group 200
+            g.tick(300)                                             # retried: still refused, alerted only once
+            self.assertEqual(g.unresolved, {200: "c"})
+            self.assertEqual(alerts, ["guard_continue_incomplete"])
+            refuse.clear()
+            sig.clear()
+            g.last = None
+            g.idle_probe()                                          # between cycles too
+            self.assertIn((200, signal.SIGCONT), sig)
+            self.assertEqual(g.unresolved, {})
+            self.assertFalse(stopped.exists())
+            self.assertEqual(g.state()["unresolved_groups"], 0)
+            self.assertIn("now confirmed continued or gone", logs[-1])
+
+    def test_an_eperm_from_a_zombie_only_group_counts_as_gone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sig, refuse = [], set()
+            g, stopped = self.paused(tmp, sig, refuse, live=lambda grp: [])
+            refuse.add((200, signal.SIGCONT))
+            g._continue(100)
+            self.assertEqual(g.unresolved, {})
+            self.assertFalse(stopped.exists())
+
+    def test_sleep_between_cycles_retries_an_unresolved_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sig, refuse = [], {(200, signal.SIGCONT)}
+            g, stopped = self.paused(tmp, sig, refuse)
+            g._continue(100)
+            self.assertEqual(set(g.unresolved), {200})
+            slept = []
+            def sleep(s):
+                slept.append(s)
+                refuse.clear()                                       # the member became signallable meanwhile
+            g.interval = 30
+            night.sleep_between_cycles(g, 120, sleep=sleep)
+            self.assertEqual(g.unresolved, {})
+            self.assertEqual(slept, [30, 30, 30, 30])
+            self.assertFalse(stopped.exists())
+
+    # Finding 1: startup recovery
+    def test_recovery_keeps_an_unverifiable_group_reports_it_and_the_guard_retries_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            stopped = d / night.STOPPED_GROUPS_NAME
+            night._write_json_durable(stopped, {"version": 1, "groups": [{"pgid": 202, "start": "same"},
+                                                                          {"pgid": 205, "start": "y"}]})
+            ps_ok = {"v": False}
+            def leader_start(pid):
+                if pid == 205 and not ps_ok["v"]:
+                    raise subprocess.TimeoutExpired("ps", 10)
+                return {202: "same", 205: "y"}.get(pid)
+            sent, alerts, logs = [], [], []
+            done = night.recover_stopped_groups(stopped, None, d / "no.pid", signaller=lambda p, s: sent.append(p),
+                                                leader_start=leader_start, log=logs.append,
+                                                alerter=lambda n, det: alerts.append(n))
+            self.assertEqual((done, sent), ([202], [202]))
+            self.assertEqual(night.read_stopped_groups(stopped)[0], [{"pgid": 205, "start": "y"}])   # not discarded
+            self.assertEqual(alerts, ["guard_recovery_incomplete"])
+            self.assertTrue(any("RECOVERY INCOMPLETE" in m for m in logs))
+            sig = []
+            g = guard(lambda: 4.8, sig=sig, stopped_path=stopped, leader_start=leader_start, baseline=(4.8, 6.2))
+            g.load_unresolved()
+            self.assertEqual(g.state()["unresolved_groups"], 1)
+            g.tick(100)
+            self.assertEqual(sig, [])                               # still undecidable: not signalled on a guess
+            ps_ok["v"] = True
+            g.tick(100)
+            self.assertEqual(sig, [(205, signal.SIGCONT)])
+            self.assertFalse(stopped.exists())
+
+    def test_recovery_keeps_a_group_that_refuses_sigcont(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            stopped = d / night.STOPPED_GROUPS_NAME
+            night._write_json_durable(stopped, {"version": 1, "groups": [{"pgid": 202, "start": "s"},
+                                                                          {"pgid": 203, "start": "t"}]})
+            def signaller(p, s):
+                raise PermissionError(1, "Operation not permitted")
+            alerts = []
+            done = night.recover_stopped_groups(stopped, None, d / "no.pid", signaller=signaller,
+                                                leader_start=lambda pid: {202: "s", 203: "t"}[pid],
+                                                live_members=lambda g: [g] if g == 202 else [], log=lambda m: None,
+                                                alerter=lambda n, det: alerts.append(n))
+            self.assertEqual(done, [203])                           # 203 was zombie-only: drained
+            self.assertEqual(night.read_stopped_groups(stopped)[0], [{"pgid": 202, "start": "s"}])
+            self.assertEqual(alerts, ["guard_recovery_incomplete"])
+
+    def test_a_clean_recovery_removes_the_record_and_alerts_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            stopped = d / night.STOPPED_GROUPS_NAME
+            night._write_json_durable(stopped, {"version": 1, "groups": [{"pgid": 202, "start": "s"}]})
+            alerts = []
+            night.recover_stopped_groups(stopped, None, d / "no.pid", signaller=lambda p, s: None,
+                                         leader_start=lambda pid: "s", log=lambda m: None,
+                                         alerter=lambda n, det: alerts.append(n))
+            self.assertFalse(stopped.exists())
+            self.assertEqual(alerts, [])
+
+    # Finding 2: identity before SIGCONT
+    def test_continue_all_never_signals_a_remembered_group_whose_id_was_reused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sig, starts, logs = [], {100: "a", 200: "c"}, []
+            trees = iter([discovery([100, 200], starts={100: "a", 200: "c"})] + [discovery([100])] * 10)
+            g, stopped = self.paused(tmp, sig, set(), starts=starts, trees=lambda pg: next(trees), logs=logs)
+            starts[200] = "someone else"                            # the trainer exited; its id now leads another group
+            sig.clear()
+            g._continue(100)
+            self.assertEqual(sig, [(100, signal.SIGCONT)])
+            self.assertEqual(g.unresolved, {})                      # confirmed stale: dropped, not retried
+            self.assertFalse(stopped.exists())
+            self.assertTrue(any("200 is gone and its id now belongs to another process" in m for m in logs))
+
+    def test_continue_all_keeps_a_remembered_group_it_cannot_verify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sig = []
+            trees = iter([discovery([100, 200], starts={100: "a", 200: "c"})] + [discovery([100])] * 10)
+            g, stopped = self.paused(tmp, sig, set(), trees=lambda pg: next(trees))
+            def ps_fails(pid):
+                raise subprocess.TimeoutExpired("ps", 10)
+            g.leader_start = ps_fails
+            sig.clear()
+            g._continue(100)
+            self.assertNotIn((200, signal.SIGCONT), sig)
+            self.assertEqual(g.unresolved, {200: "c"})
+            self.assertEqual(night.read_stopped_groups(stopped)[0], [{"pgid": 200, "start": "c"}])
+
+    def test_a_remembered_group_still_in_the_tree_needs_no_ps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sig = []
+            g, stopped = self.paused(tmp, sig, set())
+            def ps_fails(pid):
+                raise subprocess.TimeoutExpired("ps", 10)
+            g.leader_start = ps_fails                               # the fresh tree walk is the identity proof
+            sig.clear()
+            g._continue(100)
+            self.assertEqual(sig, [(100, signal.SIGCONT), (200, signal.SIGCONT)])
+            self.assertFalse(stopped.exists())
+
+    # Finding 3: the root's SIGCONT
+    def test_a_zombie_only_root_answering_eperm_resumes_without_a_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sig, refuse = [], set()
+            g, stopped = self.paused(tmp, sig, refuse, live=lambda grp: [])
+            refuse.add((100, signal.SIGCONT))
+            g._continue(100)                                        # raised PermissionError before
+            self.assertEqual(g.unresolved, {})
+            self.assertIn((200, signal.SIGCONT), sig)
+            self.assertFalse(stopped.exists())
+
+    def test_a_live_root_refusing_sigcont_is_unresolved_not_a_crash_nor_a_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            it = iter([4.8] * 20)
+            sig, refuse, alerts = [], set(), []
+            g, stopped = self.paused(tmp, sig, refuse, alerts=alerts)
+            g.latency = lambda: next(it)
+            refuse.add((100, signal.SIGCONT))
+            for _ in range(3):
+                g.tick(100)                                         # three good readings: the resume
+            self.assertFalse(g.paused)
+            self.assertEqual(g.unresolved, {100: "a"})
+            self.assertEqual(night.read_stopped_groups(stopped)[0], [{"pgid": 100, "start": "a"}])
+            self.assertEqual(g.state()["unresolved_groups"], 1)
+            self.assertEqual(alerts, ["guard_continue_incomplete"])
+            refuse.clear()
+            g.tick(100)                                             # the running cycle's root: retried, now continued
+            self.assertEqual(g.unresolved, {})
+            self.assertFalse(stopped.exists())
+
+    def test_run_cycle_ends_cleanly_when_the_roots_final_sigcont_is_refused(self):
+        sig, alerts = [], []
+        g = guard(lambda: 4.8, sig=sig, baseline=(4.8, 6.2), live_members=lambda grp: [grp])
+        g.alerter = lambda n, d: alerts.append(n)
+        g.signaller = lambda pid, s: (_ for _ in ()).throw(PermissionError(1, "Operation not permitted"))
+        with tempfile.TemporaryDirectory() as tmp, patch("builtins.print"):
+            rc, _ = night.run_cycle([sys.executable, "-c", "pass"], g, result_file=Path(tmp) / "r", poll_s=0.05,
+                                    sleep=time.sleep)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(g.unresolved), 1)
+        self.assertEqual(alerts, ["guard_continue_incomplete"])
+
+    # #131 item 3: EPERM on every pause / continue / stop path
+    def test_the_production_signaller_eperm_never_crashes_pause_or_resume(self):
+        # signal_group itself handles only ESRCH: this is the call that crashed the Studio's supervisor on 2026-11-22.
+        it = iter([9.0] + [4.8] * 20)
+        alerts = []
+        g = night.Guard(latency=lambda: next(it), memory=lambda: 100.0, budget_s=1.0, min_free_gb=8, interval_s=0,
+                        max_pause_s=1800, signaller=night.signal_group, groups=lambda pg: [pg, 200],
+                        leader_start=lambda pid: None, live_members=lambda grp: [grp], log=lambda m: None,
+                        alerter=lambda n, d: alerts.append(n), night_window=None, clock=Clock())
+        g.baseline_samples, g.baseline_p90_samples = [4.8], [6.2]
+        with patch.object(night.os, "killpg", side_effect=PermissionError(1, "Operation not permitted")):
+            g.tick(100)                                             # _pause -> signal_group: EPERM
+            self.assertTrue(g.paused)
+            self.assertFalse(g.pause_complete)
+            g.tick(100)                                             # _complete_pause retry: EPERM again
+            g.pause_complete = True                                 # (as if it then landed) so the resume can run
+            for _ in range(3):
+                g.tick(100)                                         # _continue -> continue_root + continue_all: EPERM
+        self.assertFalse(g.paused)
+        self.assertEqual(set(g.unresolved), {100, 200})
+        self.assertEqual(alerts, ["guard_continue_incomplete"])
+
+    def test_stop_trainer_group_survives_eperm_on_every_signal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tf = Path(tmp) / night.TRAINER_GROUP_NAME
+            tf.write_text(json.dumps({"version": 1, "pgid": 500, "start": START, "gate_pid": 499}))
+            clock, alerts = Clock(0.0), []
+            g = guard(lambda: 4.8, trainer_file=tf, leader_start=lambda p: START)
+            g.signaller = lambda pid, s: (_ for _ in ()).throw(PermissionError(1, "Operation not permitted"))
+            g.group_alive = lambda grp: True
+            g.alerter = lambda n, d: alerts.append(n)
+            def sleep(s):
+                clock.t += s
+            self.assertFalse(g.stop_trainer_group(clock=clock, sleep=sleep))
+            self.assertTrue(tf.exists())                            # record kept: the guard still finds it
+            self.assertEqual(alerts, ["guard_trainer_survived"])
+
+    def test_the_cycle_stop_survives_a_live_member_refusing_the_signal(self):
+        class Child:
+            pid = 4242
+            returncode = None
+            def wait(self, timeout=None):
+                return 0
+            def poll(self):
+                return None
+        alerts = []
+        g = guard(lambda: 4.8)
+        g.alerter = lambda n, d: alerts.append(n)
+        with patch.object(night.os, "killpg", side_effect=PermissionError(1, "Operation not permitted")), \
+                patch.object(night, "_live_group_members", return_value=[4243]), patch("builtins.print"):
+            night.stop_cycle_group(Child(), g, grace=1.0)           # stop_group_drained re-raised EPERM before
+        self.assertEqual(alerts, ["guard_stop_incomplete"])
+
+    def test_recover_pidfile_survives_eperm_and_records_the_root_as_unresolved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            pidfile, stopped = d / "nightly.pid", d / night.STOPPED_GROUPS_NAME
+            pidfile.write_text("4242\n")
+            alerts = []
+            def signaller(p, s):
+                raise PermissionError(1, "Operation not permitted")
+            night.recover_pidfile(pidfile, alive=lambda p: True, ps=lambda p: "T", signaller=signaller,
+                                  log=lambda m: None, stopped_path=stopped, leader_start=lambda p: START,
+                                  live_members=lambda g: [g], alerter=lambda n, det: alerts.append(n))
+            self.assertEqual(night.read_stopped_groups(stopped)[0], [{"pgid": 4242, "start": START}])
+            self.assertEqual(alerts, ["guard_recovery_incomplete"])
+            g = guard(lambda: 4.8, stopped_path=stopped)
+            g.load_unresolved()
+            self.assertEqual(g.unresolved, {4242: START})
 
 
 if __name__ == "__main__":
