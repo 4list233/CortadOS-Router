@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "_note": "Fixture for the preview and tests: invented metadata in the shape of GET /v1/cortados/office v1. No real session, run or model data.",
+  "floors": [
+    {
+      "session": "a1b2c3d4e5f60718",
+      "project": "CortadOS-Router",
+      "device": "pro",
+      "orchestrator": { "model": "claude-opus-5-5", "status": "working", "tool": "Agent", "last_seen": 1795000000.0, "source": "heartbeat" },
+      "workers": [
+        { "run_id": "t20261122150400-aaaa0001", "kind": "child", "title": "Review PR", "provider": "codex", "lane": "codex", "model": "gpt-6.1-sol", "status": "working", "tool": "Bash", "started_at": 1794999900.0, "ended_at": null },
+        { "run_id": "conv-sonnet-0002", "kind": "subagent", "title": "Draft docs", "provider": "claude", "lane": "claude#b", "model": "claude-sonnet-5", "status": "idle", "tool": null, "started_at": 1794999800.0, "ended_at": null },
+        { "run_id": "conv-ollama-0003", "kind": "subagent", "title": "Summarise log", "provider": "local", "lane": "local-pro", "model": "qwen3:27b", "status": "working", "tool": "Read", "started_at": 1794999950.0, "ended_at": null },
+        { "run_id": "conv-mlx-00000004", "kind": "subagent", "title": "Classify", "provider": "local", "lane": "local-pro", "model": "mlx-community/Qwen3.8-27B-4bit", "status": "done", "tool": null, "started_at": 1794999000.0, "ended_at": 1794999600.0 },
+        { "run_id": "conv-unknown-0005", "kind": "subagent", "title": null, "provider": null, "lane": null, "model": null, "status": "error", "tool": null, "started_at": 1794999700.0, "ended_at": 1794999710.0 }
+      ],
+      "workers_hidden": 0
+    },
+    {
+      "session": "0f1e2d3c4b5a6978",
+      "project": "Grok Bot",
+      "device": "air",
+      "orchestrator": { "model": "grok-5", "status": "idle", "tool": null, "last_seen": 1795000000.0, "source": "heartbeat" },
+      "workers": [
+        { "run_id": "t20261122150400-bbbb0006", "kind": "child", "title": "Fix flaky test", "provider": "codex", "lane": "codex", "model": "gpt-6.1", "status": "working", "tool": "Edit", "started_at": 1794999990.0, "ended_at": null }
+      ],
+      "workers_hidden": 0
+    }
+  ],
+  "lobby": {
+    "workers": [
+      { "run_id": null, "kind": "subagent", "title": null, "provider": "claude", "lane": "claude", "model": "claude-haiku-5", "status": "idle", "tool": null, "started_at": 1794999500.0, "ended_at": null }
+    ],
+    "workers_hidden": 0
+  }
+}

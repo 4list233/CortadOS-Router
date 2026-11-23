@@ -3792,8 +3792,11 @@ class Handler(BaseHTTPRequestHandler):
             route = getattr(session, "route", None) or {}
             rp = str(route.get("provider") or "claude-cli")       # no route: a fixed-model endpoint, the Claude CLI
             lane = rp if rp.startswith(local_lane.LANE_PREFIX) else (_route_lane(route) if route else None)
+            backend = (local_lane.node_backend(rp[len(local_lane.LANE_PREFIX):])
+                       if rp.startswith(local_lane.LANE_PREFIX) else None)
             board.turn_start(key, tags, run_id=run_id or conv, provider=office.provider_of(rp, local_lane.LANE_PREFIX),
-                             lane=lane, model=route.get("model") or getattr(session, "model", None), origin=origin)
+                             lane=lane, model=route.get("model") or getattr(session, "model", None), origin=origin,
+                             backend=backend)
             # Kept on the conversation so an unexpected backend exit (Registry._backend_exited), with no request left
             # to end the turn, can still end this worker on the board. A failure here is reported by the warning below.
             session.office_worker = (key, dict(tags))

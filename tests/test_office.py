@@ -600,5 +600,101 @@ class ChildTaskViewTests(OfficeHarness):
         self.assertEqual(v["errors"], [{"source": "child_tasks", "error": "IsADirectoryError"}])
 
 
+class LocalBackendTests(unittest.TestCase):
+    """#77 fix round: the local node's backend is published per local worker (and a routed local main loop), so the
+    Office's llama means Ollama for a fact, not a guess from the model id's shape. Fakes only: no gate, no node."""
+
+    RID = "t20261122120000-0a1b2c3d"
+
+    def tearDown(self):
+        from cortados_router.provider import local_lane
+        for n in ("pro-test", "studio-test"):
+            local_lane._gate_reports.pop(n, None)
+            local_lane._node_backends.pop(n, None)
+
+    def test_the_vocabulary_is_local_backends_own(self):
+        from cortados_router import local_backend
+        from cortados_router.provider import local_lane
+        self.assertEqual(set(office.LOCAL_BACKENDS), set(local_backend.BACKENDS))
+        self.assertEqual(set(local_lane.NODE_BACKENDS), set(local_backend.BACKENDS))
+
+    def test_a_local_worker_carries_its_backend_and_others_carry_none(self):
+        b = office.OfficeBoard()
+        b.turn_start("r:" + self.RID, {"session": SESSION}, run_id=self.RID, provider="local", lane="local-pro",
+                     model="mlx-community/Qwen3-27B-4bit", backend="vllm-mlx")
+        b.turn_start("r:run-ollama-01", {"session": SESSION}, run_id="run-ollama-01", provider="local",
+                     lane="local-studio", model="qwen3:27b", backend="ollama")
+        b.turn_start("r:run-unknown-1", {"session": SESSION}, run_id="run-unknown-1", provider="local",
+                     lane="local-air", model="qwen3:8b", backend=None)
+        b.turn_start("r:run-claude-01", {"session": SESSION}, run_id="run-claude-01", provider="claude",
+                     lane="claude#b", model="claude-sonnet-5", backend="ollama")    # not local: never published
+        b.turn_start("r:run-junk-0001", {"session": SESSION}, run_id="run-junk-0001", provider="local",
+                     lane="local-pro", model="x", backend="llama.cpp; rm -rf /")    # not in the vocabulary
+        ws = {w["run_id"]: w for w in b.view([])["floors"][0]["workers"]}
+        self.assertEqual(ws[self.RID]["local_backend"], "vllm-mlx")
+        self.assertEqual(ws["run-ollama-01"]["local_backend"], "ollama")
+        self.assertIsNone(ws["run-unknown-1"]["local_backend"])
+        self.assertIsNone(ws["run-claude-01"]["local_backend"])
+        self.assertIsNone(ws["run-junk-0001"]["local_backend"])
+        self.assertNotIn("rm -rf", json.dumps(b.view([], uncapped=True)))
+        # the same run moved to a cloud lane: the old backend does not stick
+        b.turn_start("r:" + self.RID, {"session": SESSION}, run_id=self.RID, provider="codex", lane="codex",
+                     model="gpt-6.1", backend=None)
+        ws = {w["run_id"]: w for w in b.view([], uncapped=True)["workers_all"]}
+        self.assertIsNone(ws[self.RID]["local_backend"])
+
+    def test_a_child_task_worker_from_the_log_has_the_key_as_none(self):
+        now = time.time()
+        v = office.OfficeBoard().view([{"ts": now - 5, "event": "started", "task_id": self.RID, "session": SESSION}],
+                                      now=now)
+        self.assertIsNone(v["floors"][0]["workers"][0]["local_backend"])
+
+    def test_a_routed_local_main_loop_shows_its_backend_on_the_orchestrator(self):
+        b = office.OfficeBoard()
+        b.turn_start("main:" + SESSION, {"session": SESSION}, run_id=None, provider="local", lane="local-studio",
+                     model="qwen3:27b", backend="ollama")
+        orch = b.view([])["floors"][0]["orchestrator"]
+        self.assertEqual((orch["source"], orch["local_backend"]), ("routed", "ollama"))
+        hb, _ = office.validate_heartbeat({"session": SESSION, "status": "working", "model": "qwen3:27b"})
+        b.heartbeat(hb)
+        self.assertEqual(b.view([])["floors"][0]["orchestrator"]["local_backend"], "ollama")
+        hb, _ = office.validate_heartbeat({"session": SESSION, "status": "working", "model": "claude-opus-5-5"})
+        b.heartbeat(hb)                                          # a different model: the backend says nothing of it
+        self.assertIsNone(b.view([])["floors"][0]["orchestrator"]["local_backend"])
+
+    def test_node_backend_is_the_gates_last_word_and_outlives_the_report_ttl(self):
+        from cortados_router.provider import local_lane
+        node = {"node": "pro-test"}
+        self.assertIsNone(local_lane.node_backend("pro-test"))
+        local_lane._note_gate(node, {"limit": 2, "inflight": 0, "backend": "vllm-mlx"})
+        self.assertEqual(local_lane.node_backend("pro-test"), "vllm-mlx")
+        local_lane._note_gate(node, {"limit": 2, "inflight": 0})                        # silent: the last word stays
+        local_lane._note_gate(node, {"limit": 2, "inflight": 0, "backend": "tensorrt"})  # unknown: ignored
+        with mock.patch.object(local_lane.time, "monotonic", return_value=time.monotonic() + 3600):
+            self.assertIsNone(local_lane.gate_report(node))
+            self.assertEqual(local_lane.node_backend("pro-test"), "vllm-mlx")
+        local_lane._note_gate(node, {"limit": 2, "inflight": 0, "backend": "ollama"})
+        self.assertEqual(local_lane.node_backend("pro-test"), "ollama")
+        self.assertIsNone(local_lane.node_backend(None))
+        self.assertIsNone(local_lane.node_backend("studio-test"))
+
+    def test_the_handler_passes_the_routed_nodes_backend_to_the_board(self):
+        from types import SimpleNamespace
+        from cortados_router.provider import local_lane, server
+        local_lane._note_gate({"node": "studio-test"}, {"limit": 1, "inflight": 0, "backend": "ollama"})
+        board = office.OfficeBoard()
+        fake = SimpleNamespace(server=SimpleNamespace(registry=SimpleNamespace(office=board)),
+                               _office_tags={"session": SESSION}, _office_origin=None,
+                               _run_id=lambda: ("run-handler-01", True))
+        local = SimpleNamespace(id="c1", route={"provider": "local-studio-test", "model": "qwen3:27b"}, model=None)
+        self.assertEqual(server.Handler._office_turn_start(fake, local, one_shot=False), "r:run-handler-01")
+        fake._run_id = lambda: ("run-handler-02", True)
+        cloud = SimpleNamespace(id="c2", route={"provider": "claude-cli#b", "model": "claude-sonnet-5"}, model=None)
+        server.Handler._office_turn_start(fake, cloud, one_shot=False)
+        ws = {w["run_id"]: w for w in board.view([])["floors"][0]["workers"]}
+        self.assertEqual((ws["run-handler-01"]["provider"], ws["run-handler-01"]["local_backend"]), ("local", "ollama"))
+        self.assertEqual((ws["run-handler-02"]["provider"], ws["run-handler-02"]["local_backend"]), ("claude", None))
+
+
 if __name__ == "__main__":
     unittest.main()

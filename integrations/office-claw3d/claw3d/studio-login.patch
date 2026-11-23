@@ -1,0 +1,33 @@
+diff --git a/server/index.js b/server/index.js
+index 0dd2769..2aca1f7 100644
+--- a/server/index.js
++++ b/server/index.js
+@@ -3,6 +3,7 @@ const https = require("node:https");
+ const next = require("next");
+ 
+ const { createAccessGate } = require("./access-gate");
++const { createStudioLogin } = require("./cortados-studio-login");
+ const { createGatewayProxy } = require("./gateway-proxy");
+ const { assertPublicHostAllowed, resolveHosts } = require("./network-policy");
+ const { loadUpstreamGatewaySettings } = require("./studio-settings");
+@@ -87,6 +88,7 @@ async function main() {
+   const accessGate = createAccessGate({
+     token: process.env.STUDIO_ACCESS_TOKEN,
+   });
++  const studioLogin = createStudioLogin({ token: process.env.STUDIO_ACCESS_TOKEN });
+ 
+   const proxy = createGatewayProxy({
+     loadUpstreamSettings: async () => {
+@@ -117,10 +119,12 @@ async function main() {
+   const createServer = () =>
+     useHttps
+       ? https.createServer(httpsCert, (req, res) => {
++          if (studioLogin.handle(req, res)) return;
+           if (accessGate.handleHttp(req, res)) return;
+           handle(req, res);
+         })
+       : http.createServer((req, res) => {
++          if (studioLogin.handle(req, res)) return;
+           if (accessGate.handleHttp(req, res)) return;
+           handle(req, res);
+         });
