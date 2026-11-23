@@ -2357,6 +2357,12 @@ class ChildTaskTests(ChildTaskBase):
         self.assertIn("do not call start_task", ct.CHILD_DIRECTIVE)
         self.assertNotIn("do not delegate it again", ct.CHILD_DIRECTIVE)
 
+    def test_child_directive_says_poll_long_background_jobs(self):
+        # #132 item 6 (c): a child that ends its turn while a long background job runs leaves its conversation idle.
+        self.assertIn("Never end a turn while a background job", ct.CHILD_DIRECTIVE)
+        self.assertIn("more than 25 minutes", ct.CHILD_DIRECTIVE)
+        self.assertIn("poll it", ct.CHILD_DIRECTIVE)
+
     def test_child_directive_in_argv(self):
         for orch in ("cortados", "opus"):
             tid = self.start(orchestrator=orch)

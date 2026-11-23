@@ -28,6 +28,22 @@ its own tools; the chosen model only thinks.
   longer: shim HTTP budget + 120 s abort budget + 120 s startup/scheduling slack, preventing CLI-synthesized
   tool errors before backend shutdown. Provider timeout settings support legacy `WANGCAI_*` aliases through
   `compat.getenv()`; resolved values are explicitly passed to the standalone shim.
+- A conversation whose requests carry the `x-cortados-run-id` of a child task that has not ended (no `finished` /
+  `cancelled` event in this host's `child-tasks.jsonl`; a run logged elsewhere counts as running) is reaped only after
+  the effective tool window, not `IDLE_S` (#132 item 6 (b)): its child may sit out a long background job between turns.
+  A child's own maximum run time (3 h by default) bounds what this holds.
+- Recovery after an idle reap (#132 item 6 (a)): the reaper keeps a metadata-only record of each conversation it
+  closes (`ReapedConversation`: scope digest, wire, client name, route, the last reply's fingerprint and the history
+  length, the lineage's rebuild budget; never text) for the effective tool window, at most `RECOVERABLE_MAX` (128,
+  oldest first). A continuation that no live session matches, in the same scope (wire, client name, conversation
+  identity) whose last reply is that record's last reply, is rebuilt through the compaction-rebuild path below on the
+  record's route, counting one rebuild against the lineage's `REBUILD_MAX`; the new backend counts toward
+  `MAX_SESSIONS` like a new conversation, and the record is consumed once it is published. A branch from an earlier
+  reply of a reaped conversation, an identity-less request, another client or identity, another wire, a return past
+  the window, and every conversation closed for any other reason (failed, exited, dropped, rebuilt) stay `no_writer`.
+  The route's eligibility is rechecked as on any continuation (the quota floor, the local continuation re-check, a
+  backend this endpoint no longer serves is a 503); there is no mid-conversation re-route (SEAM #43). Log line:
+  `conversation <old> recovered as <new> after its idle reap <n>s ago (rebuild n of 5; ...)`.
 - `CORTADOS_PROVIDER_MAX_SESSIONS` (128): bound held conversations/processes and their replay memory (at most
   1 MiB of replay per session). New held conversations receive 503 at capacity; existing tool waits are not evicted.
 - `CORTADOS_PROVIDER_TURN_TIMEOUT_S` (1800 s): bounds one backend model turn, not execution of client tools.
@@ -223,7 +239,7 @@ Not yet in P1, each needing a decision or another phase:
   | Refusal | When | Answer | Retryable |
   |---|---|---|---|
   | `no_identity` | a continuation with no conversation identity header and no tool_use id of an exactly matching session | 400 | no |
-  | `no_writer` | no live session of this scope wrote the request's last reply (restart, reap, an edited last reply) | 400 | no |
+  | `no_writer` | no live session of this scope wrote the request's last reply, and no idle-reaped one within the tool window did (restart, a reap past the window, an edited last reply) | 400 | no |
   | `ambiguous` / `ambiguous_writer` | more than one live session of this scope has the exact history / wrote the last reply | 400 | no |
   | the same, while a rebuild in that scope is in flight | its old and new sessions overlap for a moment | 529 | yes |
   | `limit` | the lineage committed `REBUILD_MAX` rebuilds | 400 | no |
