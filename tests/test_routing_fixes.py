@@ -237,6 +237,24 @@ class R2Replay(Base):
         self.assertEqual(r["chosen"]["model"], "gpt-6.1-sol")
 
 
+    def test_pre_fix_inputs_reproduce_the_diagnosis(self):
+        """B sized under A's key, no prior, no reset times: Opus on B 19.6 / −0.94 beats Sol 20.0 / −1.0 by a few points,
+        the rows the 2026-11-22 diagnosis read (−75.6 vs about −72)."""
+        self.the_132_state(with_resets=False)
+        ucs = {k: v for k, v in UCS_132.items() if k != "claude#b:all"}
+        self.fake(core._sc_mod.lanes, ucs, **{"claude": 0.2, "claude#b": -0.94, "codex": -1.0})
+        t = json.loads(json.dumps(core.table())); t["selection"]["pool_size_prior_tokens_per_pct"] = {}
+        # without its own record B falls back to A's size and its remaining from its own headroom: the old lookup
+        with mock.patch.object(core, "table", return_value=t):
+            r = core.resolve(dec(), accounts_aware=True)
+        every = {(c["lane"], c["model"]): c for c in [r["chosen"]] + (r["alternatives"] or [])}
+        opus_b, sol = every[("claude#b", "claude-opus-5-5")], every[("codex", "gpt-6.1-sol")]
+        self.assertEqual((r["chosen"]["lane"], r["chosen"]["model"]), ("claude#b", "claude-opus-5-5"))
+        self.assertEqual((opus_b["weight"], sol["weight"]), (19.6, 20.0))
+        self.assertEqual(opus_b["cost"], -75.6)
+        self.assertLessEqual(sol["cost"] - opus_b["cost"], 4.0)
+
+
 class SwitchingMargin(Base):
     """Item 3: one Claude login, no learned sizes (price-only weights), both pools at the capped −1.0."""
     def test_margin_holds_a_one_point_swing_and_releases_a_big_one(self):
