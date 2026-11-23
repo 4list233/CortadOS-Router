@@ -250,7 +250,9 @@ MANAGED_DIRS = session.MANAGED_SETTINGS_DIRS   # tests point this elsewhere
 CHILD_DIRECTIVE = ("You are a CortadOS CHILD TASK started by an orchestrator. Do the task yourself and completely. You may "
                    "use your own subagents for parts of it (they are routed by S1), but do not call start_task or "
                    "route_task (both are refused inside a child task) or hand the whole task off again. Your final message is returned to the orchestrator: end with a concise "
-                   "report of what you did, what you verified, and anything left undone.")
+                   "report of what you did, what you verified, and anything left undone. Never end a turn while a "
+                   "background job you started will take more than 25 minutes: poll it (check its output every few "
+                   "minutes) until it finishes instead, because an idle conversation can be closed.")
 
 
 # --- chrome: true = LOGIN MODE (Forest's decision, 2026-11-03) ---------------------------------------------------

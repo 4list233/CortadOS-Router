@@ -6,9 +6,10 @@ request whose client compacted or edited that history is served on a REBUILT bac
 a fresh session on the same route, seeded with the client's current history as a transcript; identical concurrent
 rebuilds share one). When no rebuild is possible it fails with a terminal 400 (x-should-retry: false), because the
 retry carries the same history: no conversation identity, no live conversation of the same client wrote its last
-reply, more than one did, the conversation reached REBUILD_MAX, its replayed history does not fit its model, it asks
-for another model, or it was closed because its backend failed (a bounded, time-limited tombstone keyed by the
-conversation itself; both wires share the lookup). A state a moment can change (a rebuild in flight, a turn running)
+reply (nor one the idle reaper closed within the tool-wait limit: ReapedConversation, #132 item 6), more than one did,
+the conversation reached REBUILD_MAX, its replayed history does not fit its model, it asks for another model, or it
+was closed because its backend failed (a bounded, time-limited tombstone keyed by the conversation itself; both wires
+share the lookup). A state a moment can change (a rebuild in flight, a turn running)
 is a retryable 529; docs/PROVIDER-PLAN.md has the table. An exact match is looked up only among the request's own
 scope (wire, client, conversation identity): two clients never share one, and a request without an identity is
 continued only on proof that it is the session's caller (a tool_use id of that session in its history).
@@ -103,6 +104,36 @@ REBUILD_WAIT_S = 60.0
 # of a busy endpoint, and an hour, past which a reap no longer explains a 409.
 CLOSED_RECORD_MAX = 128
 CLOSED_RECORD_TTL_S = 3600.0
+# Conversations the idle reaper closed, kept so their client's return can be rebuilt (Registry.recoverable, #132 item
+# 6): a client that left a conversation idle past IDLE_S (a child waiting on a long background job) and comes back gets
+# it rebuilt through the compaction-rebuild path instead of a terminal no_writer. Only idle reaping leaves one (a
+# failed, exited, dropped or rebuilt conversation never does); each holds metadata only (ReapedConversation: scope
+# digest, wire, client name, route, the LAST reply's fingerprint, the lineage's rebuild budget), never request text.
+# Kept for the tool-wait limit (recover_ttl_s(): effective_tool_wait(IDLE_S, TOOL_WAIT_S), 3 h by default), the
+# longest a client is ever promised to be waited for; bounded by count, the oldest goes first.
+RECOVERABLE_MAX = 128
+# Cap pressure (#132 item 6, review round 1): when opening one more conversation would exceed MAX_SESSIONS, the
+# registry retires the longest-idle conversations that could be recovered (ReapedConversation.eligible, with a rebuild
+# left in their lineage's budget: Registry._recovery_left_locked, review round 2), have no turn
+# running and do not wait on a tool result, into the same recovery records the idle reaper writes, until there is
+# room (Registry._retire_for_room_locked). One idle less than this is never retired: a client between two turns of an
+# active conversation is not made to pay a rebuild.
+PRESSURE_MIN_IDLE_S = 120.0
+# The longest a conversation's x-cortados-run-id earns it the tool-wait idle limit, counted from its first request
+# carrying that id: a child task's own maximum run time (child_tasks.CHILD_MAX_S_DEFAULT, CORTADOS_CHILD_MAX_S). A run
+# this host's log never records ending (a task on another host, or any syntactically valid header) cannot hold a
+# conversation past it; after it the conversation is reaped at the normal IDLE_S.
+try:
+    CHILD_RUN_MAX_S = float(int(getenv("CORTADOS_CHILD_MAX_S") or 3 * 3600))
+    if CHILD_RUN_MAX_S <= 0:
+        raise ValueError
+except ValueError:
+    CHILD_RUN_MAX_S = 3 * 3600.0
+
+
+def recover_ttl_s() -> float:
+    """How long a reaped conversation stays recoverable: read at call time (tests rebind IDLE_S / TOOL_WAIT_S)."""
+    return effective_tool_wait(IDLE_S, TOOL_WAIT_S)
 # Ended run conversations kept for the live view's tree (Registry.ended): a few hundred child sub-sessions is hours of
 # the owner's fan-out; the view shows each for live.SUBSESSION_KEEP_S after it closed.
 ENDED_CONVERSATIONS_MAX = 256
@@ -827,6 +858,16 @@ def _configured_live_hosts() -> set[str]:
     return names
 
 
+def _ended_runs_from_log() -> set:
+    """The run ids this host's child-task log (office.CHILD_EVENT_LOG) records as finished or cancelled within the
+    office's window. A run not in it counts as running: a task on another host, or one whose end was not logged, keeps
+    the tool-wait idle limit, which a child's own maximum run time (3 h by default) bounds anyway."""
+    from cortados_router import paths
+    now = time.time()
+    events = office.read_child_events(paths.state_dir() / office.CHILD_EVENT_LOG, now)
+    return {tid for tid, c in office._children(events, now).items() if c.get("final")}
+
+
 class Registry:
     """`router(body, client[, exclude_model=])` picks the route of a new conversation (routing.choose); without one every conversation
     runs on `model` with the Claude CLI (the P0 behaviour, kept for testing the bridge alone). `executed(route)`
@@ -903,6 +944,13 @@ class Registry:
         # tree shows a child's finished sub-sessions for a while instead of dropping them. Bounded by count; the view
         # applies its own age limit.
         self.ended: "deque[dict[str, Any]]" = deque(maxlen=ENDED_CONVERSATIONS_MAX)
+        # Conversations the idle reaper closed, by closed session id, oldest first (ReapedConversation, #132 item 6):
+        # the rebuild source of a client that comes back to one within recover_ttl_s(). Under self._lock; bounded by
+        # RECOVERABLE_MAX and pruned by age on every lookup and reap.
+        self.recoverable: "OrderedDict[str, ReapedConversation]" = OrderedDict()
+        # ended_runs() -> the run ids (x-cortados-run-id) whose child task this host's child-task log says ended. A
+        # conversation of any other run keeps the tool-wait idle limit (reap, #132 item 6 (b)). Tests swap in a fake.
+        self.ended_runs: Callable[[], set] = _ended_runs_from_log
 
     def claude_config_dir(self, account: str | None) -> str | None:
         """The CLAUDE_CONFIG_DIR for a routed Claude account id, from tables/accounts.json; None (the default login)
@@ -972,11 +1020,65 @@ class Registry:
             self.office.turn_end(key, tags, **kw)
 
     def reserve_opening(self) -> None:
-        """Reserve conversation capacity before routing can reserve any quota."""
-        with self._lock:
-            if len(self.sessions) + self._opening >= MAX_SESSIONS:
-                raise UnservedProvider("held conversation capacity reached; retry after idle conversations expire")
-            self._opening += 1
+        """Reserve conversation capacity before routing can reserve any quota. At the cap, the longest-idle recoverable
+        conversations are retired to make room (_retire_for_room_locked); only when none can be is it a 503."""
+        retired: list = []
+        try:
+            with self._lock:
+                if len(self.sessions) + self._opening >= MAX_SESSIONS:
+                    retired = self._retire_for_room_locked(time.time())
+                if len(self.sessions) + self._opening >= MAX_SESSIONS:
+                    raise UnservedProvider("held conversation capacity reached; retry after idle conversations expire")
+                self._opening += 1
+        finally:
+            self._finish_retired(retired)
+
+    def _retire_for_room_locked(self, now: float) -> list:
+        """Under self._lock, at the cap: retire conversations, longest idle first, until one more fits. A candidate is
+        recoverable (ReapedConversation.eligible: its client can come back and get it rebuilt, and _recovery_left_locked:
+        its lineage still has a rebuild to recover with, or its return would be a terminal RebuildLimit), idle at least
+        PRESSURE_MIN_IDLE_S, not waiting on a tool result, and its turn lock is free (taken here without blocking, so
+        no turn is in flight and none can start: a continuation that loses the race finds the recovery record).
+        Returns the retired sessions with their turn locks still held, for _finish_retired outside the lock."""
+        cands = sorted((s for s in self.sessions.values()
+                        if ReapedConversation.eligible(s) and self._recovery_left_locked(s)
+                        and not getattr(s, "awaiting_tool_result", False)
+                        and now - getattr(s, "last_used", now) >= PRESSURE_MIN_IDLE_S),
+                       key=lambda s: getattr(s, "last_used", now))
+        retired = []
+        for s in cands:
+            if len(self.sessions) + self._opening < MAX_SESSIONS:
+                break
+            lock = getattr(s, "lock", None)
+            if lock is None or not lock.acquire(blocking=False):
+                continue                                # a turn is running on it
+            if getattr(s, "awaiting_tool_result", False) or not self._retire_locked(s, now):
+                lock.release()                          # changed while its lock was free; leave it
+                continue
+            retired.append(s)
+        return retired
+
+    def _recovery_left_locked(self, s) -> bool:
+        """Under self._lock: whether recovering s would get a rebuild (review round 2): rebuilding is on (REBUILD_MAX >
+        0) and its lineage's committed plus pending rebuilds are below REBUILD_MAX. A conversation without one is never
+        retired under pressure: its next continuation would be the terminal 400 "rebuild limit reached" instead."""
+        if REBUILD_MAX <= 0:
+            return False
+        b = getattr(s, "rebuild_budget", None)
+        return b is None or b.used + b.pending < REBUILD_MAX
+
+    def _finish_retired(self, retired: list) -> None:
+        """Outside self._lock: tear down conversations _retire_locked removed (their turn locks held), then release."""
+        for s in retired:
+            try:
+                compaction_prune.shadow_decide_async(str(s.id))   # background thread; no-op unless the store is on
+                logger.warning("closing idle conversation %s under capacity pressure (cap %d; idle %ds; recoverable)",
+                               str(s.id)[:8], MAX_SESSIONS, int(time.time() - getattr(s, "last_used", time.time())))
+                s.close()                               # teardown must not hold the registry lock
+            except Exception as exc:
+                logger.warning("closing a retired conversation failed: %s", type(exc).__name__)
+            finally:
+                s.lock.release()
 
     def release_opening(self) -> None:
         with self._lock:
@@ -1166,15 +1268,24 @@ class Registry:
         Refusals (the table in docs/PROVIDER-PLAN.md): no identity, no writer, and more than one writer are terminal
         (Refused: the retry carries the same history and meets the same live sessions), except more than one writer
         while a rebuild in the scope is in flight (ConversationBusy: its old and new sessions overlap for a moment);
-        REBUILD_MAX 0 keeps the pre-#43 409."""
+        REBUILD_MAX 0 keeps the pre-#43 409.
+        Recovery (#132 item 6): with no live writer, a conversation the idle reaper closed within recover_ttl_s(), in
+        the same scope and wire, whose LAST reply is the request's last reply (_recoverable_writers) is the writer: the
+        client came back to a conversation this endpoint closed only for idleness. It is rebuilt as a compaction
+        (superseded: nothing live to keep) on its kept route and lineage budget. A conversation closed for any other
+        reason (failed, exited, dropped, rebuilt, a boundary refusal) left no record and stays no_writer."""
         if not turn.history:
             return
         anchor = turn.history[-1]
+        reaped = False
         with self._lock:
             cands = [] if scope is None or wire_path is None else [
                 s for s in self.sessions.values()
                 if getattr(s, "scope", None) == scope and getattr(s, "wire_path", None) == wire_path
                 and anchor in s.history]
+            if not cands and scope is not None and wire_path is not None:
+                cands = self._recoverable_writers(scope, wire_path, anchor)
+                reaped = bool(cands)
             inflight = self._rebuild_in_flight(scope, wire_path)
         if REBUILD_MAX <= 0:
             # Rebuilds switched off: the pre-#43 409 (tests use it to pin what find and the replay guard decide alone).
@@ -1206,6 +1317,10 @@ class Registry:
                 logger.warning("rebuild refused: conversation %s reached REBUILD_MAX (%d); terminal",
                                str(s.id)[:8], REBUILD_MAX)
                 raise RebuildLimit(rebuild_limit_message())
+            if reaped:
+                logger.info("conversation %s: the client returned %ds after the idle reaper closed it; recovering "
+                            "it through a rebuild", s.id[:8], int(time.time() - s.closed_at))
+                raise Rebuild(s, superseded=True)
             raise Rebuild(s, superseded=s.history[-1] == anchor)
         logger.warning("refused lost conversation: %s rebuild=refused:%s; terminal", self._lost_diagnostic(turn), code)
         raise Refused(why, code=code)
@@ -1306,9 +1421,18 @@ class Registry:
 
     def _rebuild_gated(self, old, turn, *, superseded: bool, transcript: list, scope: str | None,
                        wire_path: str | None, client: str | None, anchor, rebuilt_for=None):
-        """rebuild()'s work once its in-flight gate is held: reserve, start, publish, retire the old session."""
+        """rebuild()'s work once its in-flight gate is held: reserve, start, publish, retire the old session.
+        `old` may be a ReapedConversation (#132 item 6): there is no live session to take over or close, so the new
+        backend counts as a new conversation against MAX_SESSIONS, and the record is consumed once it is published."""
+        recovered = isinstance(old, ReapedConversation)
         budget = self._budget(old)
         with self._lock:
+            if recovered and (self.recoverable.get(old.id) is not old
+                              or time.time() - old.closed_at > recover_ttl_s()):
+                # Recovered by another request meanwhile (its retry finds the rebuilt session) or just expired (its
+                # retry gets the terminal no_writer): either way this request cannot use the record now.
+                raise ConversationBusy("cortados: conversation busy: this conversation was recovered or expired while "
+                                       "this request was looked up; retry")
             if budget.used >= REBUILD_MAX:
                 raise RebuildLimit(rebuild_limit_message())
             if budget.used + budget.pending >= REBUILD_MAX:
@@ -1317,7 +1441,7 @@ class Registry:
             budget.pending += 1                         # pending; committed below with publication, else given back
         committed = held = False
         try:
-            if superseded:
+            if superseded and not recovered:
                 held = old.lock.acquire(blocking=False)
                 if not held:
                     raise ConversationBusy("cortados: conversation busy: a turn is running on the session this "
@@ -1333,11 +1457,11 @@ class Registry:
             route = getattr(old, "route", None)
             if route and getattr(old, "codex_login", None):
                 route = {**route, "codex_home": old.codex_login}   # the login the conversation already runs on
-            if superseded:
+            if superseded and not recovered:
                 with self._lock:
                     self._opening += 1          # one-for-one replacement: the cap is not re-checked for it
             else:
-                self.reserve_opening()          # a branch is one more conversation: UnservedProvider at the cap
+                self.reserve_opening()          # a branch or a recovery is one more conversation: UnservedProvider
             try:
                 new = self._new(turn, keep=True, route=route, scope=scope, wire_path=wire_path, client=client)
             except BaseException:
@@ -1350,12 +1474,23 @@ class Registry:
             new.route_logged = getattr(old, "route_logged", False)    # the route already ran and was recorded
             if getattr(old, "min_left_pct", None) is not None:
                 new.min_left_pct = old.min_left_pct                   # the tightest client floor carries over
+            if getattr(old, "run_id", None):
+                # the same run's clock (CHILD_RUN_MAX_S): a rebuild or a recovery never restarts it
+                new.run_id, new.run_since = old.run_id, getattr(old, "run_since", None)
             with self._lock:
                 budget.pending -= 1
                 budget.used += 1
                 new.rebuilds = number = budget.used
                 committed = True
             self._publish(new)                  # only now findable: every field above is set
+            if recovered:
+                with self._lock:
+                    if self.recoverable.get(old.id) is old:
+                        del self.recoverable[old.id]    # consumed: the conversation is live again
+                logger.warning("conversation %s recovered as %s after its idle reap %ds ago (rebuild %d of %d; "
+                               "request_len=%d candidate_len=%d)", old.id[:8], str(new.id)[:8],
+                               int(time.time() - old.closed_at), number, REBUILD_MAX, len(turn.history), old.length)
+                return new
             logger.warning("conversation %s rebuilt as %s from the client's rewritten history (%s; rebuild %d of %d; "
                            "request_len=%d candidate_len=%d)", str(old.id)[:8], str(new.id)[:8],
                            "compacted: old session closed" if superseded else "branched: old session kept",
@@ -1590,31 +1725,86 @@ class Registry:
         s.close()
 
     def reap(self, idle_s: float) -> None:
+        """Close conversations idle past their limit: idle_s, or the tool-wait limit (effective_tool_wait) for one
+        that waits on the client's tool results or belongs to a child task still running (#132 item 6 (b): its child may
+        sit out a long background job between turns). A reaped conversation with an identity is kept as a
+        ReapedConversation for recover_ttl_s(), so its client's return is rebuilt rather than refused (item 6 (a))."""
         with self._lock:
             candidates = list(self.sessions.values())
+            self._prune_recoverable_locked(time.time())
+        ended = None                                    # the child-task log, read at most once per pass
         for s in candidates:
             # Own the turn lock through the decision and close: a continuation must not race a stale snapshot.
             if not s.lock.acquire(blocking=False):
                 continue
             try:
-                ttl = effective_tool_wait(idle_s, TOOL_WAIT_S) if getattr(s, "awaiting_tool_result", False) else idle_s
+                awaiting = getattr(s, "awaiting_tool_result", False)
+                run_id = getattr(s, "run_id", None)
+                child = False
+                if run_id and not awaiting and time.time() - s.last_used > idle_s:
+                    if ended is None:
+                        try:
+                            ended = set(self.ended_runs())
+                        except Exception as exc:        # unreadable log: the run counts as running (bounded at 3 h)
+                            logger.warning("reap: child-task log unreadable (%s); runs count as running",
+                                           type(exc).__name__)
+                            ended = set()
+                    # A run the log does not show ended keeps the long limit only within a child's own maximum run
+                    # time since this conversation's first request of it (review round 1: a finished remote task, or
+                    # any valid header, must not hold a conversation for hours).
+                    since = getattr(s, "run_since", None)
+                    child = (run_id not in ended and since is not None
+                             and time.time() - since < CHILD_RUN_MAX_S)
+                ttl = effective_tool_wait(idle_s, TOOL_WAIT_S) if (awaiting or child) else idle_s
                 # Replay refresh and the final stale check/removal share the registry lock.
                 with self._lock:
-                    expired = self.sessions.get(s.id) is s and time.time() - s.last_used > ttl
-                    if expired:
-                        del self.sessions[s.id]
-                        hist = getattr(s, "history", None)
-                        if hist:
-                            self.closed.append((time.time(), "reaped", hist[0], len(hist)))
-                        self._note_ended_locked(s, "reaped")
+                    now = time.time()
+                    expired = (self.sessions.get(s.id) is s and now - s.last_used > ttl
+                               and self._retire_locked(s, now))
                 if expired:
                     compaction_prune.shadow_decide_async(str(s.id))   # background thread; no-op unless the store is on
                 if expired:
-                    logger.info("closing idle conversation %s (awaiting_tool_result=%s, ttl=%ss)",
-                                s.id[:8], getattr(s, "awaiting_tool_result", False), ttl)
+                    logger.info("closing idle conversation %s (awaiting_tool_result=%s, child_run=%s, ttl=%ss)",
+                                s.id[:8], awaiting, child, ttl)
                     s.close()  # teardown must not hold the registry lock
             finally:
                 s.lock.release()
+
+    def _retire_locked(self, s, now: float) -> bool:
+        """Under self._lock, with s's turn lock held: take an idle conversation out of the registry and keep its
+        recovery record (ReapedConversation, bounded by RECOVERABLE_MAX, oldest first). The caller closes the backend
+        outside the lock. False when s is no longer the registered session of its id (nothing done)."""
+        if self.sessions.get(s.id) is not s:
+            return False
+        del self.sessions[s.id]
+        hist = getattr(s, "history", None)
+        if hist:
+            self.closed.append((now, "reaped", hist[0], len(hist)))
+        self._note_ended_locked(s, "reaped")
+        if ReapedConversation.eligible(s):
+            self.recoverable.pop(str(s.id), None)
+            self.recoverable[str(s.id)] = ReapedConversation(s, now)
+            while len(self.recoverable) > RECOVERABLE_MAX:
+                self.recoverable.popitem(last=False)
+        return True
+
+    def _prune_recoverable_locked(self, now: float) -> None:
+        """Under self._lock: drop reaped-conversation records older than recover_ttl_s() (oldest first)."""
+        ttl = recover_ttl_s()
+        while self.recoverable:
+            oldest = next(iter(self.recoverable.values()))
+            if now - oldest.closed_at <= ttl:
+                break
+            self.recoverable.popitem(last=False)
+
+    def _recoverable_writers(self, scope: str, wire_path: str, anchor) -> list:
+        """Under self._lock: the reaped conversations (ReapedConversation) this request returns to: in its scope (the
+        same wire, client name and conversation identity, as for a live writer), opened on its wire, whose LAST reply is
+        the request's last reply, closed within recover_ttl_s(). A reply that is only an earlier one of the reaped
+        conversation (a branch) does not qualify: only the client coming back to where it left is recovered."""
+        self._prune_recoverable_locked(time.time())
+        return [r for r in self.recoverable.values()
+                if r.scope == scope and r.wire_path == wire_path and r.anchor == anchor]
 
 
 def _remember_reply(session, turn, msg_id: str, model: str, result) -> None:
@@ -1649,6 +1839,41 @@ _unkeyed_logged = False                    # Registry.fail has logged a continua
 
 class LostSession(LookupError):
     pass
+
+
+class ReapedConversation:
+    """What Registry.reap keeps of a conversation it closed for idleness (#132 item 6), so the client's return is
+    rebuilt (Registry.rebuild) instead of refused: the rebuild source for _rebuild_or_refuse when no live conversation
+    wrote the request's last reply. Metadata only: the conversation's scope (a digest of wire, client name and
+    conversation identity, Registry.conversation_scope), its wire and client name, its route (what rebuild reuses: the
+    same provider, model, account and frozen Codex login), the fingerprint (a sha256 digest) of its LAST reply and its
+    length, the lineage's RebuildBudget (shared, so recovering counts against REBUILD_MAX), the client's quota floor and
+    the run id. Never the system prompt, tools, messages, tool arguments or replies; __slots__ keeps it that way.
+    `id` is the closed session's id, so log lines can name it."""
+
+    __slots__ = ("id", "scope", "wire_path", "client", "route", "codex_login", "anchor", "length", "rebuild_budget",
+                 "route_logged", "min_left_pct", "was_local", "run_id", "run_since", "closed_at")
+
+    def __init__(self, s, closed_at: float):
+        self.id = str(s.id)
+        self.scope, self.wire_path = getattr(s, "scope", None), getattr(s, "wire_path", None)
+        self.client = getattr(s, "client", None)
+        self.route, self.codex_login = getattr(s, "route", None), getattr(s, "codex_login", None)
+        self.anchor, self.length = s.history[-1], len(s.history)
+        b = getattr(s, "rebuild_budget", None)
+        self.rebuild_budget = b if b is not None else RebuildBudget()
+        self.route_logged = getattr(s, "route_logged", False)
+        self.min_left_pct = getattr(s, "min_left_pct", None)
+        self.was_local = isinstance(s, LocalSession)
+        self.run_id = getattr(s, "run_id", None)
+        self.run_since = getattr(s, "run_since", None)
+        self.closed_at = closed_at
+
+    @staticmethod
+    def eligible(s) -> bool:
+        """Only a conversation a rebuild could ever be matched to: one with a conversation identity (scope), a wire and
+        at least one reply. An identity-less one is never rebuilt (no_identity), so nothing is kept for it."""
+        return bool(getattr(s, "scope", None) and getattr(s, "wire_path", None) and getattr(s, "history", None))
 
 
 class Replay(Exception):
@@ -1750,7 +1975,7 @@ def replay_overflow(session, transcript: list, turn) -> tuple[int, int] | None:
     seed is never sent (the relay re-sends the whole body under its own per-turn fit gate); neither is a route without
     context_length (a fixed-model endpoint: the backend reports an overflow itself)."""
     cap = (getattr(session, "route", None) or {}).get("context_length")
-    if not cap or isinstance(session, LocalSession):
+    if not cap or isinstance(session, LocalSession) or getattr(session, "was_local", False):
         return None
     seed_body = {"system": turn.system, "tools": turn.tools,
                  "messages": [{"role": "user", "content": anthropic_wire.rebuild_content(transcript, turn)}]}
@@ -3408,6 +3633,14 @@ class Handler(BaseHTTPRequestHandler):
                 if why:
                     return self._error(429, "rate_limit_error", f"cortados: {why}", wire,
                                        reason="the conversation's account is below the client's quota floor")
+        try:
+            # The run (x-cortados-run-id, validated in do_POST) this conversation serves: a running child task's
+            # conversation gets the tool-wait idle limit (Registry.reap, #132 item 6 (b)). Bookkeeping only.
+            run_id, valid = self._run_id()
+            if run_id and valid and not one_shot and getattr(session, "run_id", None) != run_id:
+                session.run_id, session.run_since = run_id, time.time()   # bounded by CHILD_RUN_MAX_S from here
+        except Exception:
+            logger.debug("run id not kept on the conversation", exc_info=True)
         msg_id = wire.new_message_id()
         # The model this response names: what the client asked for, unless it asked to see the real route (the
         # routed-subagents mod does; the main session does not and keeps seeing `cortados`).

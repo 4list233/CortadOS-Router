@@ -2071,6 +2071,396 @@ class RebuildTests(RoutedHarness):
         self.assertEqual(self.reg._opening, 0)
 
 
+class ReapedRecoveryTests(RoutedHarness):
+    """#132 item 6: a conversation the idle reaper closed is rebuilt when its own client comes back within the
+    tool-wait limit (a), a running child task's conversation keeps the tool-wait idle limit (b). The fake clock is the
+    conversation's own timestamps (last_used, closed_at) moved back, so no test sleeps."""
+
+    HEADERS = {"X-Claude-Code-Session-Id": "8c0f6a52-recover", "User-Agent": "claude-cli/2.1.304 (external, cli)"}
+
+    def converse(self, *texts, headers=None):
+        history: list = []
+        for t in texts:
+            history.append({"role": "user", "content": t})
+            r = self.post({"tools": [READ_TOOL], "messages": history}, headers=headers)
+            history.append({"role": "assistant", "content": r["content"]})
+        return history
+
+    def idle_reap(self, s, extra_s=1.0):
+        """The fake clock: `s` last used IDLE_S + extra_s ago, then one reaper pass at IDLE_S."""
+        s.last_used = time.time() - server.IDLE_S - extra_s
+        self.reg.reap(server.IDLE_S)
+
+    def terminal(self, body, headers=None):
+        try:
+            self.post(body, headers=headers)
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())["error"]["message"], exc.headers.get("x-should-retry")
+        self.fail("expected an HTTP error")
+
+    def test_a_reaped_conversation_is_rebuilt_when_its_client_returns(self):
+        history = self.converse("hello", "second")
+        (old,) = self.reg.sessions.values()
+        self.idle_reap(old)
+        self.assertEqual(self.reg.sessions, {})
+        self.assertTrue(old._closed)
+        self.assertEqual(list(self.reg.recoverable), [old.id])
+        body = {"tools": [READ_TOOL], "messages": history + [{"role": "user", "content": "third"}]}
+        with self.assertLogs("cortados.provider", "WARNING") as logs:
+            r = self.post(body)
+        self.assertTrue(any("recovered as" in l and "after its idle reap" in l and "rebuild 1 of 5" in l
+                            for l in logs.output), logs.output)
+        seed = r["content"][0]["text"]
+        self.assertTrue(seed.startswith("echo: [cortados relay]"), seed)   # the whole history replayed as the seed
+        self.assertIn("<assistant>\necho: second\n</assistant>", seed)
+        self.assertTrue(seed.endswith("The client's new turn follows. third"), seed)
+        (new,) = self.reg.sessions.values()
+        self.assertIsNot(new, old)
+        self.assertEqual(new.route["route_id"], "r1")                 # the same route: not routed again
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual([e["route_id"] for e in self.executed], ["r1"])   # nor logged again
+        self.assertEqual(new.rebuild_budget.used, 1)
+        self.assertEqual(self.reg.recoverable, {})                     # consumed: the conversation is live again
+        follow = body["messages"] + [{"role": "assistant", "content": r["content"]}, {"role": "user", "content": "x"}]
+        self.assertEqual(self.post({"tools": [READ_TOOL], "messages": follow})["content"],
+                         [{"type": "text", "text": "echo: x"}])
+
+    def test_a_return_beyond_the_window_is_terminal_as_before(self):
+        history = self.converse("hello")
+        (old,) = self.reg.sessions.values()
+        self.idle_reap(old)
+        (rec,) = self.reg.recoverable.values()
+        rec.closed_at -= server.recover_ttl_s()                       # closed just past the tool-wait limit
+        self.assertEqual(server.recover_ttl_s(), server.effective_tool_wait(server.IDLE_S, server.TOOL_WAIT_S))
+        with self.assertLogs("cortados.provider", "WARNING") as logs:
+            code, msg, retry = self.terminal({"tools": [READ_TOOL],
+                                              "messages": history + [{"role": "user", "content": "back"}]})
+        self.assertEqual((code, retry), (server.TERMINAL_STATUS, "false"))
+        self.assertIn("no live conversation of this client wrote its last reply", msg)
+        self.assertTrue(any("rebuild=refused:no_writer" in l for l in logs.output), logs.output)
+        self.assertEqual(self.reg.recoverable, {})                     # pruned by age
+        self.assertEqual(self.reg.sessions, {})
+
+    def test_another_client_identity_or_wire_is_never_rebuilt_from_it(self):
+        history = self.converse("hello")
+        (old,) = self.reg.sessions.values()
+        self.idle_reap(old)
+        body = {"tools": [READ_TOOL], "messages": history + [{"role": "user", "content": "mine now"}]}
+        for other in ({"X-Claude-Code-Session-Id": "another-conversation"}, {"User-Agent": "codex_exec/0.163.0"}):
+            code, msg, _ = self.terminal(body, headers=other)
+            self.assertEqual(code, server.TERMINAL_STATUS, other)
+            self.assertIn("no live conversation of this client wrote its last reply", msg)
+        self.assertEqual(self.reg.sessions, {})
+        (rec,) = self.reg.recoverable.values()                          # untouched by the strangers
+        with self.reg._lock:                                            # another wire: never a writer either
+            self.assertEqual(self.reg._recoverable_writers(rec.scope, "/v1/responses", rec.anchor), [])
+            self.assertEqual(self.reg._recoverable_writers(rec.scope, rec.wire_path, rec.anchor), [rec])
+        self.assertEqual(self.status_of(body), 200)                     # its own client still recovers it
+        # A bad token never reaches the registry at all.
+        self.assertEqual(self.status_of(body, token="nope"), 401)
+
+    def test_a_conversation_closed_for_any_other_reason_stays_terminal(self):
+        def closers(s):
+            return {"dropped": lambda: self.reg.drop(s),
+                    "failed": lambda: self.reg.fail(s, BridgeError("the backend process exited"), None),
+                    "exited": lambda: self.reg._backend_exited(s)}
+        for reason in ("dropped", "failed", "exited"):
+            with self.subTest(reason=reason):
+                history = self.converse(f"hello {reason}")
+                (s,) = self.reg.sessions.values()
+                closers(s)[reason]()
+                self.assertEqual(self.reg.sessions, {})
+                self.assertEqual(self.reg.recoverable, {})
+                with self.assertLogs("cortados.provider", "WARNING"):
+                    code, msg, _ = self.terminal({"tools": [READ_TOOL],
+                                                  "messages": history + [{"role": "user", "content": "back"}]})
+                self.assertEqual(code, server.TERMINAL_STATUS)
+                self.assertEqual(self.reg.sessions, {})
+        # An identity-less conversation is never kept: it could never be rebuilt (no_identity).
+        self.assertFalse(server.ReapedConversation.eligible(types.SimpleNamespace(scope=None, wire_path="/v1/messages",
+                                                                                   history=["fp"])))
+
+    def test_recovery_counts_against_the_rebuild_budget(self):
+        history = self.converse("hello", "second")
+        with mock.patch.object(server, "REBUILD_MAX", 1):
+            compacted = [{"role": "user", "content": "Summary."}] + history[-1:] + [{"role": "user", "content": "3"}]
+            r = self.post({"tools": [READ_TOOL], "messages": compacted})       # the lineage's one rebuild
+            (s,) = self.reg.sessions.values()
+            self.assertEqual(s.rebuild_budget.used, 1)
+            self.idle_reap(s)
+            (rec,) = self.reg.recoverable.values()
+            self.assertIs(rec.rebuild_budget, s.rebuild_budget)               # the record carries the lineage budget
+            back = compacted + [{"role": "assistant", "content": r["content"]}, {"role": "user", "content": "4"}]
+            with self.assertLogs("cortados.provider", "WARNING") as logs:
+                code, msg, retry = self.terminal({"tools": [READ_TOOL], "messages": back})
+        self.assertEqual((code, retry), (server.TERMINAL_STATUS, "false"))
+        self.assertIn("rebuild limit (1 rebuilds)", msg)
+        self.assertTrue(any("reached REBUILD_MAX" in l for l in logs.output), logs.output)
+        self.assertEqual(self.reg.sessions, {})
+
+    def test_a_running_child_tasks_conversation_gets_the_tool_wait_idle_limit(self):
+        run = "t20261122165617-8229e0b8"
+        self.converse("child", headers={"x-cortados-run-id": run})
+        (child,) = self.reg.sessions.values()
+        self.assertEqual(child.run_id, run)
+        self.converse("plain")
+        plain = next(s for s in self.reg.sessions.values() if s is not child)
+        self.assertIsNone(getattr(plain, "run_id", None))
+        self.reg.ended_runs = lambda: set()                             # the run is still going
+        child.last_used = plain.last_used = time.time() - server.IDLE_S - 1
+        self.reg.reap(server.IDLE_S)
+        self.assertEqual(list(self.reg.sessions.values()), [child])     # 30 min idle: only the plain one closes
+        self.assertFalse(child.awaiting_tool_result)
+        child.last_used = time.time() - server.effective_tool_wait(server.IDLE_S, server.TOOL_WAIT_S) - 1
+        self.reg.reap(server.IDLE_S)
+        self.assertEqual(self.reg.sessions, {})                         # past the tool-wait limit it closes too
+        self.assertIn(child.id, self.reg.recoverable)                   # ...and stays recoverable
+
+    def test_an_ended_runs_conversation_gets_the_ordinary_idle_limit(self):
+        run = "t20261122165617-8229e0b8"
+        self.converse("child", headers={"x-cortados-run-id": run})
+        (child,) = self.reg.sessions.values()
+        self.reg.ended_runs = lambda: {run}
+        child.last_used = time.time() - server.IDLE_S - 1
+        self.reg.reap(server.IDLE_S)
+        self.assertEqual(self.reg.sessions, {})
+
+    def test_an_unreadable_child_log_counts_the_run_as_running(self):
+        run = "t20261122165617-8229e0b8"
+        self.converse("child", headers={"x-cortados-run-id": run})
+        (child,) = self.reg.sessions.values()
+
+        def broken():
+            raise OSError("unreadable")
+        self.reg.ended_runs = broken
+        child.last_used = time.time() - server.IDLE_S - 1
+        with self.assertLogs("cortados.provider", "WARNING"):
+            self.reg.reap(server.IDLE_S)
+        self.assertEqual(list(self.reg.sessions.values()), [child])
+
+    def test_ended_runs_are_read_from_the_child_task_log(self):
+        home = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, home, True)
+        now = time.time()
+        with open(os.path.join(home, server.office.CHILD_EVENT_LOG), "w") as f:
+            for rec in ({"ts": now - 60, "event": "started", "task_id": "t20261122000000-aaaaaaaa"},
+                        {"ts": now - 50, "event": "started", "task_id": "t20261122000000-bbbbbbbb"},
+                        {"ts": now - 10, "event": "finished", "status": "failed", "task_id": "t20261122000000-bbbbbbbb"},
+                        {"ts": now - 40, "event": "started", "task_id": "t20261122000000-cccccccc"},
+                        {"ts": now - 5, "event": "cancelled", "task_id": "t20261122000000-cccccccc"}):
+                f.write(json.dumps(rec) + "\n")
+        with mock.patch.dict(os.environ, {"CORTADOS_HOME": home}):
+            self.assertEqual(server._ended_runs_from_log(),
+                             {"t20261122000000-bbbbbbbb", "t20261122000000-cccccccc"})
+
+    def test_the_record_is_bounded_and_holds_no_text(self):
+        secret = "SECRET-PROMPT-TEXT-7f3a"
+        with mock.patch.object(server, "RECOVERABLE_MAX", 2):
+            for i in range(3):
+                self.converse(f"{secret} {i}", headers={"X-Claude-Code-Session-Id": f"conv-{i}"})
+            ids = [s.id for s in sorted(self.reg.sessions.values(), key=lambda s: s.opened_at)]
+            for s in list(self.reg.sessions.values()):
+                s.last_used = time.time() - server.IDLE_S - 1
+            self.reg.reap(server.IDLE_S)
+        self.assertEqual(self.reg.sessions, {})
+        self.assertEqual(len(self.reg.recoverable), 2)
+        for rec in self.reg.recoverable.values():
+            self.assertFalse(hasattr(rec, "__dict__"))                  # __slots__ only: nothing else can be added
+            self.assertFalse(hasattr(rec, "history") or hasattr(rec, "system") or hasattr(rec, "tools"))
+            dump = repr({k: getattr(rec, k) for k in server.ReapedConversation.__slots__})
+            self.assertNotIn(secret, dump)
+            self.assertNotIn("echo:", dump)
+            self.assertRegex(rec.anchor, r"^[0-9a-f]{64}$")             # a digest of the reply, not the reply
+        self.assertTrue(set(self.reg.recoverable) <= set(ids))
+
+    # --- review round 1: cap pressure and the run bound -------------------------------------------------------------
+
+    def fan_out(self, n, run=None, idle_s=None):
+        """n conversations, each its own identity (conv-<i>), the i-th idle for idle_s - i seconds (conv-0 longest);
+        returns [(session, history, headers)] in that order."""
+        idle_s = server.IDLE_S + 600 if idle_s is None else idle_s
+        out = []
+        for i in range(n):
+            h = {"X-Claude-Code-Session-Id": f"conv-{i}", **({"x-cortados-run-id": run} if run else {})}
+            history = self.converse(f"fan {i}", headers=h)
+            (s,) = [x for x in self.reg.sessions.values() if x not in [o[0] for o in out]]
+            out.append((s, history, h))
+        now = time.time()
+        for i, (s, _, _) in enumerate(out):
+            s.last_used = now - idle_s + i
+        return out
+
+    def test_completed_remote_tasks_at_capacity_make_room_and_stay_recoverable(self):
+        run = "t20261122165617-9841f3ab"                                # finished on another host: not in this log
+        self.reg.ended_runs = lambda: set()
+        with mock.patch.object(server, "MAX_SESSIONS", 3):
+            fan = self.fan_out(3, run=run)
+            self.reg.reap(server.IDLE_S)
+            self.assertEqual(len(self.reg.sessions), 3)                 # still within the run's bound: kept
+            with self.assertLogs("cortados.provider", "WARNING") as logs:
+                fresh = self.converse("unrelated", headers={"X-Claude-Code-Session-Id": "newcomer"})
+            self.assertTrue(any("under capacity pressure" in l for l in logs.output), logs.output)
+            self.assertEqual(len(self.reg.sessions), 3)
+            oldest = fan[0][0]
+            self.assertTrue(oldest._closed)
+            self.assertNotIn(oldest.id, self.reg.sessions)
+            self.assertEqual(list(self.reg.recoverable), [oldest.id])
+            self.assertEqual(self.reg._opening, 0)
+            # Its client comes back: recovered (at the cap again, the next-longest idle makes room).
+            _, history, h = fan[0]
+            r = self.post({"tools": [READ_TOOL], "messages": history + [{"role": "user", "content": "back"}]},
+                          headers=h)
+            self.assertTrue(r["content"][0]["text"].startswith("echo: [cortados relay]"))
+            self.assertTrue(fan[1][0]._closed)
+            self.assertEqual(list(self.reg.recoverable), [fan[1][0].id])
+            self.assertEqual(len(self.reg.sessions), 3)
+            self.assertTrue(fresh)
+
+    def test_pressure_never_retires_a_tool_wait_or_a_running_turn(self):
+        with mock.patch.object(server, "MAX_SESSIONS", 2):
+            (waiting, _, _), (busy, _, _) = self.fan_out(2)
+            waiting.awaiting_tool_result = True
+            with busy.lock:
+                code = self.status_of({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "new"}]},
+                                      headers={"X-Claude-Code-Session-Id": "newcomer"})
+            self.assertEqual(code, 503)
+            self.assertEqual(set(self.reg.sessions.values()), {waiting, busy})
+            self.assertFalse(waiting._closed or busy._closed)
+            self.assertEqual(self.reg.recoverable, {})
+            self.assertEqual(self.reg._opening, 0)
+            # With the turn finished, the idle one (not the tool wait) is what makes room.
+            self.converse("new", headers={"X-Claude-Code-Session-Id": "newcomer"})
+            self.assertTrue(busy._closed)
+            self.assertFalse(waiting._closed)
+            self.assertIn(waiting, self.reg.sessions.values())
+
+    def test_pressure_retires_longest_idle_first_and_spares_the_recently_used(self):
+        with mock.patch.object(server, "MAX_SESSIONS", 4):
+            fan = self.fan_out(4)
+            fan[0][0].last_used = time.time() - 5                        # in use a moment ago: never retired
+            for i in range(2):
+                self.converse(f"new {i}", headers={"X-Claude-Code-Session-Id": f"newcomer-{i}"})
+            self.assertEqual(list(self.reg.recoverable), [fan[1][0].id, fan[2][0].id])
+            self.assertFalse(fan[0][0]._closed or fan[3][0]._closed)
+            self.converse("new 2", headers={"X-Claude-Code-Session-Id": "newcomer-2"})
+            self.assertEqual(list(self.reg.recoverable), [fan[1][0].id, fan[2][0].id, fan[3][0].id])
+            # Only fan[0] (recent) and three fresh ones are left: none idle long enough, so the next one is a 503.
+            self.assertEqual(self.status_of({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "x"}]},
+                                            headers={"X-Claude-Code-Session-Id": "newcomer-3"}), 503)
+            self.assertFalse(fan[0][0]._closed)
+
+    def test_an_identityless_conversation_is_never_retired_under_pressure(self):
+        with mock.patch.object(server, "MAX_SESSIONS", 1):
+            (s, _, _), = self.fan_out(1)
+            s.scope = None                                               # could never be recovered: kept
+            self.assertEqual(self.status_of({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "x"}]},
+                                            headers={"X-Claude-Code-Session-Id": "newcomer"}), 503)
+            self.assertFalse(s._closed)
+
+    def test_pressure_records_stay_bounded(self):
+        with mock.patch.object(server, "MAX_SESSIONS", 3), mock.patch.object(server, "RECOVERABLE_MAX", 2):
+            fan = self.fan_out(3)
+            for i in range(3):
+                self.converse(f"new {i}", headers={"X-Claude-Code-Session-Id": f"newcomer-{i}"})
+        self.assertEqual(list(self.reg.recoverable), [fan[1][0].id, fan[2][0].id])   # the oldest record went first
+
+    # --- review round 2: no retirement without a rebuild left; the lookup-then-retire race -------------------------
+
+    def test_pressure_never_retires_a_conversation_whose_rebuild_budget_is_used_up(self):
+        with mock.patch.object(server, "MAX_SESSIONS", 1):
+            (s, history, h), = self.fan_out(1)
+            s.rebuild_budget.used = server.REBUILD_MAX                  # its lineage has no rebuild left
+            self.assertEqual(self.status_of({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "x"}]},
+                                            headers={"X-Claude-Code-Session-Id": "newcomer"}), 503)
+            self.assertFalse(s._closed)
+            self.assertEqual(self.reg.recoverable, {})
+            self.assertEqual(self.reg._opening, 0)
+            # Its own client continues it normally: no rebuild was needed, so no terminal rebuild-limit 400.
+            r = self.post({"tools": [READ_TOOL], "messages": history + [{"role": "user", "content": "on"}]}, headers=h)
+            self.assertEqual(r["content"], [{"type": "text", "text": "echo: on"}])
+            # Pending starts that fill the budget count too; one rebuild left makes it retirable again.
+            s.rebuild_budget.used, s.rebuild_budget.pending = server.REBUILD_MAX - 1, 1
+            s.last_used = time.time() - server.IDLE_S
+            with self.reg._lock:
+                self.assertEqual(self.reg._retire_for_room_locked(time.time()), [])
+                s.rebuild_budget.pending = 0
+                retired = self.reg._retire_for_room_locked(time.time())
+            self.reg._finish_retired(retired)
+            self.assertEqual(retired, [s])
+            self.assertIn(s.id, self.reg.recoverable)
+
+    def test_pressure_never_retires_when_rebuilding_is_switched_off(self):
+        with mock.patch.object(server, "MAX_SESSIONS", 1), mock.patch.object(server, "REBUILD_MAX", 0):
+            (s, history, h), = self.fan_out(1)
+            self.assertEqual(s.rebuild_budget.used, 0)
+            self.assertEqual(self.status_of({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "x"}]},
+                                            headers={"X-Claude-Code-Session-Id": "newcomer"}), 503)
+            self.assertFalse(s._closed)
+            self.assertEqual(self.reg.recoverable, {})
+            r = self.post({"tools": [READ_TOOL], "messages": history + [{"role": "user", "content": "on"}]}, headers=h)
+            self.assertEqual(r["content"], [{"type": "text", "text": "echo: on"}])
+
+    def test_a_request_that_found_a_conversation_just_before_its_retirement_gets_409_and_its_retry_recovers(self):
+        with mock.patch.object(server, "MAX_SESSIONS", 1):
+            (s, history, h), = self.fan_out(1)
+            body = {"tools": [READ_TOOL], "messages": history + [{"role": "user", "content": "back"}]}
+            real_find = self.reg.find
+            fired = []
+
+            def find_then_retire(*a, **kw):
+                found = real_find(*a, **kw)
+                if not fired:                       # once: another opening retires it between lookup and turn lock
+                    fired.append(found)
+                    self.reg.reserve_opening()
+                    self.reg.release_opening()
+                return found
+            with mock.patch.object(self.reg, "find", find_then_retire), \
+                    self.assertLogs("cortados.provider", "WARNING") as logs:
+                code, msg, retry = self.terminal(body, headers=h)
+            self.assertIs(fired[0], s)                                   # the lookup did find the live conversation
+            self.assertEqual(code, 409)
+            self.assertIn("closed while this request waited", msg)
+            self.assertNotEqual(retry, "false")
+            self.assertTrue(any("under capacity pressure" in l for l in logs.output), logs.output)
+            self.assertTrue(s._closed)
+            self.assertEqual(list(self.reg.recoverable), [s.id])
+            self.assertEqual(s.rebuild_budget.used, 0)                   # the stale 409 spent no rebuild
+            r = self.post(body, headers=h)                               # the identical retry: recovered
+            self.assertTrue(r["content"][0]["text"].startswith("echo: [cortados relay]"), r)
+            self.assertTrue(r["content"][0]["text"].endswith("back"))
+            (new,) = self.reg.sessions.values()
+            self.assertIsNot(new, s)
+            self.assertEqual(new.rebuild_budget.used, 1)
+            self.assertEqual(self.reg.recoverable, {})
+            self.assertEqual(self.reg._opening, 0)
+
+    def test_a_run_never_logged_as_ended_keeps_the_long_limit_only_for_a_childs_max_run_time(self):
+        run = "t20261122165617-9841f3ab"
+        self.reg.ended_runs = lambda: set()
+        self.converse("child", headers={"x-cortados-run-id": run})
+        (s,) = self.reg.sessions.values()
+        self.assertIsNotNone(s.run_since)
+        s.last_used = time.time() - server.IDLE_S - 1
+        self.reg.reap(server.IDLE_S)
+        self.assertEqual(list(self.reg.sessions.values()), [s])         # within the bound: kept
+        s.run_since = time.time() - server.CHILD_RUN_MAX_S - 1
+        self.reg.reap(server.IDLE_S)
+        self.assertEqual(self.reg.sessions, {})                         # past it: the normal limit
+        self.assertIn(s.id, self.reg.recoverable)
+        self.assertEqual(self.reg.recoverable[s.id].run_since, s.run_since)
+
+    def test_a_recovered_conversation_keeps_its_runs_clock(self):
+        run = "t20261122165617-9841f3ab"
+        h = {"x-cortados-run-id": run}
+        history = self.converse("child", headers=h)
+        (old,) = self.reg.sessions.values()
+        old.run_since -= 1000
+        self.idle_reap(old, extra_s=server.TOOL_WAIT_S)
+        self.post({"tools": [READ_TOOL], "messages": history + [{"role": "user", "content": "back"}]}, headers=h)
+        (new,) = self.reg.sessions.values()
+        self.assertIsNot(new, old)
+        self.assertEqual((new.run_id, new.run_since), (run, old.run_since))   # the clock is not restarted
+
+
 class RebuildRegistryTests(unittest.TestCase):
     """Registry.find / rebuild under concurrency and isolation (#43 review), with a fake backend factory and hooks at
     the exact points of each race, never sleeps."""
@@ -3383,6 +3773,10 @@ class FailedSessionTombstoneTests(EndpointHarness):
         self.reg.reap(1)
         self.assertEqual((self.reg.sessions, dict(self.reg.tombstones)), ({}, {}))
         follow = history + [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "more"}]
+        # #132 item 6: within the tool-wait limit its client's return is recovered (ReapedRecoveryTests); past it, the
+        # terminal refusal as before, and never a tombstone's failure either way.
+        [rec] = self.reg.recoverable.values()
+        rec.closed_at -= server.recover_ttl_s()
         self.lost({"tools": [READ_TOOL], "messages": follow})
 
     def test_a_request_waiting_on_a_failing_turn_never_reaches_the_dead_backend(self):
