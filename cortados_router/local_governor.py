@@ -30,14 +30,18 @@ input tokens (`input_tokens()`) are an upper bound, never an estimate and never 
   "The input bound"). Code-heavy turns run 3.5-4.5 body bytes per token, so long turns reserve the whole context.
   The cap is enforced by the backend itself: vllm-mlx runs under integrations/vllm-mlx/cortados_vllm_mlx_guard.py,
   which refuses a prompt whose exact token count + max_tokens exceeds context_tokens before it is scheduled.
-and a request is admitted only while the reservations in flight plus its own fit in
-  memory_budget_bytes - weights_bytes.
+and a request is admitted only while the reservations in flight plus its own fit in the budget in force beside the
+weights (available_bytes): memory_budget_bytes - weights_bytes while the owner is idle, active_memory_budget_bytes -
+weights_bytes while the owner is active (the same owner signal as the COUNT; owner decision 2026-11-22, "smaller while
+I work": a 4-bit model gets 17.25 GiB beside its weights while the owner works, 25 GiB while away; a full 128k text
+turn, 17.06 GiB, fits both).
 TEXT ROUTE (#126, a text-only model: text_route): that per-request formula is a floor, not the reservation. Text turns
 are reserved as ONE set (text_set_bytes, Admission.try_acquire's `load`): mlx-lm 0.31.3's decode batch pads every row's
-KV to the longest, so the set holds kv_copies x n x the longest context of KV, plus one prompt's prefill chunk at a time
-(the guard prefills one sequence in chunks of text_prefill_chunk_tokens: unfused scores, mask, activations; no prompt
-logits), each turn's state and decode row, and MLX's buffer cache at its limit plus one buffer; never less than the
-per-request sum, so a short turn reserves exactly what it did (docs/LOCAL-RESOURCES.md "Text prefill").
+KV to the longest, so the set holds n x the longest context of KV (plus one full-attention layer's replaced slice:
+kv_copies), plus one prompt's prefill chunk at a time (the guard prefills one sequence in chunks of
+text_prefill_chunk_tokens: unfused scores, mask, activations; no prompt logits), each turn's state and decode row,
+and MLX's buffer cache at its limit plus one buffer; never less than the per-request sum, so a short turn reserves
+exactly what it did (docs/LOCAL-RESOURCES.md "Text prefill").
 The count slot and the bytes are taken together (Admission.try_acquire). A request a text-only model cannot read
 (non_text_content: an image, a document) is refused by the gate before admission.
 
@@ -55,12 +59,18 @@ Defaults (Qwen3.8 27B, 4-bit): 64 KiB per token (16 full-attention layers x K/V 
 0.15 GiB recurrent state, 1.5 GiB prefill margin: a 128k-token request reserves 9.65 GiB, so two fit beside 15 GiB of
 weights in a 40 GiB budget and a third does not, while eight ~9k-token requests (2.2 GiB each) fit.
 
-A request that could not fit even alone (more than budget - weights with nothing else running) is refused for good
-(`too_large`): retrying cannot help, so the gate answers it non-retryably and the provider routes it elsewhere. Pressure
-stays the safety net: on warn or critical the count caps apply whatever the bytes say.
+A request that could not fit even alone (more than the budget in force - weights with nothing else running) is refused
+(`too_large`): retrying now cannot help, so the gate answers it non-retryably and the provider routes it elsewhere at
+once. While the owner is active that includes a turn that would fit once the owner steps away: it goes to the cloud now
+rather than waiting (a retryable 529 would hold it for as long as the owner keeps working; docs/LOCAL-RESOURCES.md
+"Active budget"). The capacity report's fit_tokens / free_tokens / free_bytes are those of the budget in force, so the
+provider's routing skips the node before sending. Pressure stays the safety net: on warn or critical the count caps
+apply whatever the bytes say.
 
 The bounds gate ADMISSION only: a request already running is never stopped. When the owner comes back with 6 running,
-the limit drops to 2 and nothing new is admitted until fewer than 2 run; the 6 finish on their own. Stdlib only.
+the limit drops to 2 and nothing new is admitted until fewer than 2 run; the 6 finish on their own. The byte budget
+works the same way: a 128k turn admitted while the owner was away keeps its reservation when the owner returns, and
+nothing new is admitted beyond the smaller budget until enough of the running turns end. Stdlib only.
 """
 from __future__ import annotations
 
@@ -96,8 +106,19 @@ DEFAULTS: dict[str, Any] = {
     # and free memory no sooner than letting them end).
     "critical_cap": 0,
     # The memory budget for the backend: 40 GiB of the Pro's 48 GB unified memory, leaving ~8 GB for macOS and the
-    # owner's apps. Requests are admitted while their reservations fit in (budget - weights).
+    # owner's apps. Requests are admitted while their reservations fit in (budget - weights). The budget while the
+    # owner is IDLE (owner away: the full 128k context fits, a 128k text turn reserves 17.06 GiB of the 25 GiB, two
+    # 64k turns fit beside each other).
     "memory_budget_bytes": 40 * GIB,
+    # The budget while the owner is ACTIVE (owner decision 2026-11-22, "smaller while I work", ~17 GiB beside the
+    # weights; "keep 128k while active if physically possible"): 32.25 GiB, i.e. 17.25 GiB beside the 4-bit 27B's
+    # 15 GiB of weights. Hardware test 2026-11-22 on the Pro with the owner's apps open: vllm-mlx hit a Metal
+    # out-of-memory at ~38 GiB of MLX memory (~24 GiB above the weights' 14.73 GiB idle footprint) and swap grew 5 GiB
+    # at a ~31 GB process footprint. One full 130,872-token turn alone then measured 11.93 GiB over idle at peak; the
+    # corrected text reservation of a 128k turn is 17.06 GiB, so 17.25 (not 17.00, which fits 130,617 tokens) is the
+    # smallest quarter-GiB step that serves the whole context while the owner works. Total, like memory_budget_bytes:
+    # heavier weights leave less room beside them.
+    "active_memory_budget_bytes": 32 * GIB + GIB // 4,
     # The model's resident weights (a model entry's weights_bytes overrides it): the 4-bit 27B is 15 GB on disk and
     # in memory.
     "weights_bytes": 15 * GIB,
@@ -136,10 +157,13 @@ DEFAULTS: dict[str, Any] = {
     # Score-sized buffers counted per chunk: MLX's fallback q.k^T, the masked copy, the softmax, and one more for the
     # allocator (the same count as the image prefill's score_buffers).
     "text_score_buffers": 4,
-    # Copies of the batch's KV counted: the live cache and one replaced copy. The cache's growth (256 positions at a
+    # Copies of the batch's KV counted: the live cache, and kv_copies - 1 replaced copies of ONE full-attention layer's
+    # slice of it (2026-11-22 correction; it counted whole copies before). The cache's growth (256 positions at a
     # time), a request joining or leaving the decode batch, and a finished request's extracted row each build a new
-    # copy beside the old one before the old is freed; the guard limits MLX's buffer cache (buffer_cache_bytes, plus
-    # the one buffer it may overshoot by), so a freed copy does not linger.
+    # copy beside the old one before the old is freed, but layer by layer: each layer's cache replaces its own arrays,
+    # and MLX frees the old buffer once its replacement is evaluated. Measured: a 130,872-token turn (512 growths)
+    # peaked 11.93 GiB over idle, under the 16 GiB two whole copies would be. The guard limits MLX's buffer cache
+    # (buffer_cache_bytes, plus the one buffer it may overshoot by), so a freed copy does not linger.
     "kv_copies": 2,
     # MLX's buffer cache limit, set by the guard (--buffer-cache-bytes; upstream vllm-mlx sets it to 90% of the GPU's
     # working set, so freed KV copies and score buffers stayed resident until the next clear). A recycling threshold,
@@ -151,10 +175,12 @@ DEFAULTS: dict[str, Any] = {
 MODEL_KEYS = ("idle_cap", "weights_bytes", "kv_bytes_per_token", "per_seq_state_bytes", "prefill_margin_bytes",
               "context_tokens")
 INT_KEYS = ("active_idle_s", "active_cap", "idle_cap", "warn_cap", "critical_cap", "retry_after_s",
-            "memory_budget_bytes", "weights_bytes", "kv_bytes_per_token", "per_seq_state_bytes",
+            "memory_budget_bytes", "active_memory_budget_bytes", "weights_bytes", "kv_bytes_per_token",
+            "per_seq_state_bytes",
             "prefill_margin_bytes", "context_tokens", "default_max_tokens", "text_prefill_chunk_tokens",
             "text_score_buffers", "kv_copies", "buffer_cache_bytes")
-POSITIVE_KEYS = ("memory_budget_bytes", "weights_bytes", "kv_bytes_per_token", "context_tokens", "default_max_tokens",
+POSITIVE_KEYS = ("memory_budget_bytes", "active_memory_budget_bytes", "weights_bytes", "kv_bytes_per_token",
+                 "context_tokens", "default_max_tokens",
                  "text_prefill_chunk_tokens", "text_score_buffers", "kv_copies", "buffer_cache_bytes")
 FLOAT_KEYS = ("sample_s",)
 # Keys of the count-only governor this replaced: refused by name, so an old config is not run on numbers that no
@@ -341,8 +367,16 @@ def check_config(raw: dict[str, Any] | None, model: dict[str, Any] | None = None
         raise GovernorConfigError(f"governor: unknown_pressure must be one of {', '.join(PRESSURES)}")
     if out["idle_cap"] < 1:
         raise GovernorConfigError("governor: idle_cap must be at least 1")
+    if "active_memory_budget_bytes" not in raw:
+        # not configured: the default, never above the idle budget (a config that only lowered memory_budget_bytes keeps
+        # one budget for both states, as before)
+        out["active_memory_budget_bytes"] = min(out["active_memory_budget_bytes"], out["memory_budget_bytes"])
+    elif out["active_memory_budget_bytes"] > out["memory_budget_bytes"]:
+        raise GovernorConfigError("governor: active_memory_budget_bytes must not exceed memory_budget_bytes (the "
+                                  "owner-active budget is the smaller one; equal turns the distinction off)")
     if out["kv_copies"] < 2:
-        raise GovernorConfigError("governor: kv_copies must be at least 2 (the live KV cache and one replaced copy)")
+        raise GovernorConfigError("governor: kv_copies must be at least 2 (the live KV cache and one layer's replaced "
+                                  "copy)")
     if out["text_prefill_chunk_tokens"] > out["context_tokens"]:
         raise GovernorConfigError("governor: text_prefill_chunk_tokens must not exceed context_tokens")
     # The model's declared image capability (None: text-only), checked against this context.
@@ -350,18 +384,23 @@ def check_config(raw: dict[str, Any] | None, model: dict[str, Any] | None = None
     if out["vision"]:
         # An image_tokens_max (or any policy) whose smallest image turn (one image at image_tokens_max, nothing else)
         # could never be admitted is refused here rather than served as a node that answers every image too_large:
-        # the computed peak, with the encoder's padded widths, must fit the budget beside the weights.
+        # the computed peak, with the encoder's padded widths, must fit the budget beside the weights, the smaller
+        # (owner-active) one: otherwise every image turn is too_large whenever the owner works.
         one = request_bytes(out, 0, 1, images=1)
-        if one > available_bytes(out):
+        if one > available_bytes(out, "active"):
             raise GovernorConfigError(f"vision: one image turn reserves {_gib(one)} GiB, more than the "
-                                      f"{_gib(available_bytes(out))} GiB budget beside the weights; lower "
+                                      f"{_gib(available_bytes(out, 'active'))} GiB owner-active budget beside the "
+                                      "weights; lower "
                                       "image_tokens_max or check the vision dimensions")
     return out
 
 
-def available_bytes(cfg: dict[str, Any]) -> int:
-    """The memory requests may reserve: the budget beside the weights (never negative)."""
-    return max(0, cfg["memory_budget_bytes"] - cfg["weights_bytes"])
+def available_bytes(cfg: dict[str, Any], owner: str | None = None) -> int:
+    """The memory requests may reserve: the budget beside the weights (never negative), for the owner state in force.
+    "active" (also what an unreadable idle time counts as, policy()) is active_memory_budget_bytes; "idle", or None
+    (the most the node may ever reserve: max_seqs, the backend's --max-num-seqs), is memory_budget_bytes."""
+    budget = cfg["active_memory_budget_bytes"] if owner == "active" else cfg["memory_budget_bytes"]
+    return max(0, budget - cfg["weights_bytes"])
 
 
 def tokens_bytes(cfg: dict[str, Any], tokens: int) -> int:
@@ -743,6 +782,18 @@ TEXT_DIMS: dict[str, int] = {
     "linear_conv_kernel_dim": 4, "act_bytes": 2,
 }
 TEXT_KV_STEP = 256                      # KVCache and BatchKVCache grow in steps of 256 positions (cache.py 326, 913)
+# qwen3_5 is hybrid: layer i is full attention when (i + 1) % full_attention_interval == 0 (qwen3_5.py, the layer_types
+# of the Pro's config.json: "full_attention" every 4th of 64), the rest linear attention with fixed-size state. Only the
+# full-attention layers keep per-token KV: 64 / 4 = 16.
+TEXT_FULL_ATTENTION_LAYERS = TEXT_DIMS["num_hidden_layers"] // TEXT_DIMS["full_attention_interval"]
+
+
+def text_kv_bytes_per_token(d: dict[str, int] = TEXT_DIMS) -> int:
+    """Per-token KV of the pinned geometry, unquantized as vllm-mlx keeps it: full-attention layers x (K and V) x KV
+    heads x head_dim x act_bytes = 16 x 2 x 4 x 256 x 2 = 65,536 (DEFAULTS' kv_bytes_per_token; the linear-attention
+    layers' state is per_seq_state_bytes, independent of length)."""
+    return (d["num_hidden_layers"] // d["full_attention_interval"]) * 2 * d["num_key_value_heads"] * d["head_dim"] \
+        * d["act_bytes"]
 
 
 def _text_token_width(d: dict[str, int] = TEXT_DIMS) -> int:
@@ -827,8 +878,10 @@ def text_set_bytes(cfg: dict[str, Any], loads: list, high_water: int = 0,
     those terms never shrink; vllm-mlx clears MLX's cache when requests finish (scheduler.py _cleanup_finished), and an
     empty set holds no batch, so Admission resets them when the set drains. "cells" (n x M as counted) is returned
     for Admission and is not a byte term:
-      kv            kv_copies x n x M x kv_bytes_per_token   the decode batch pads every row to the longest
-                                                             (BatchKVCache.extend), plus one replaced copy
+      kv            n x M x kv_bytes_per_token               the decode batch pads every row to the longest
+                    + (kv_copies - 1) x n x M x kv_bytes_per_token / L   (BatchKVCache.extend), plus a replaced copy
+                                                             of one of the L = 16 full-attention layers (each layer
+                                                             replaces its own arrays; measured 2026-11-22)
       decode        text_score_buffers x Hq x n x M x a + n x M   one decode step's attention rows and mask
       fixed         sum of the loads' fixed bytes (state twice, the decode row's logits)
       prefill       the largest load's text_prefill_bytes: the guard prefills one sequence at a time
@@ -852,7 +905,12 @@ def text_set_bytes(cfg: dict[str, Any], loads: list, high_water: int = 0,
     c = min(cfg["text_prefill_chunk_tokens"], p)
     cells = max(n * m, int(peak[0]))           # rows x row width of KV the batch may hold, as counted
     out = {
-        "kv": cfg["kv_copies"] * cells * cfg["kv_bytes_per_token"],
+        # the padded batch once, plus (kv_copies - 1) replaced copies of ONE full-attention layer's slice of it: the
+        # cache grows, joins, filters and extracts layer by layer (each layer's KVCache concatenates or gathers its own
+        # arrays), and MLX frees a layer's old buffer once its replacement is evaluated, so the whole batch is never
+        # held twice (measured 2026-11-22: a 130,872-token turn peaked 11.93 GiB over idle; two whole copies are 16 GiB)
+        "kv": cells * cfg["kv_bytes_per_token"]
+              + (cfg["kv_copies"] - 1) * -(-cells * cfg["kv_bytes_per_token"] // TEXT_FULL_ATTENTION_LAYERS),
         "decode": cfg["text_score_buffers"] * d["num_attention_heads"] * cells * a + cells,
         "fixed": sum(x.fixed for x in loads),
         "prefill": max(x.prefill for x in loads),
@@ -1026,6 +1084,9 @@ class Admission:
         self._peak = (0, 0)                  # the set's largest (cells, cache_overshoot) since it was last empty
         self._draining = False               # stale width / rows reserved: no new text turn until the set drains
         self.retiring = 0                    # tickets the gate is done with, awaiting the backend's confirmation
+        # The owner state of the latest governor sample seen under the lock: picks the byte budget in force
+        # (available_bytes) where no sample is at hand (a release's drain check). Active until sampled: the smaller.
+        self._owner = "active"
 
     def _report(self, g: dict[str, Any]) -> dict[str, Any]:
         """The state report under the lock: the count sample, in flight, and (governed) the bytes and token room.
@@ -1033,30 +1094,35 @@ class Admission:
         set is draining (its free_tokens is then 0, a retryable busy: admission resumes when the set empties), and the
         reason says so."""
         out = {**g, "inflight": self.inflight, "retiring": self.retiring, "draining": self._draining}
+        self._note_owner(g)
         if self._draining:
             out["reason"] = "text set draining: a departed turn's width is held until the running turns end"
         if self.retiring:
             out["reason"] = f"{out.get('reason') or 'governor'}; {self.retiring} ended turns await backend release"
         if self.governor is None:
-            return {**out, "reserved_bytes": None, "free_bytes": None, "fit_tokens": None, "free_tokens": None,
-                    "image_inflight": None, "image_limit": None}
+            return {**out, "reserved_bytes": None, "budget_bytes": None, "free_bytes": None, "fit_tokens": None,
+                    "free_tokens": None, "image_inflight": None, "image_limit": None}
         cfg = self.governor.cfg
         vision = cfg.get("vision")
         out.update(image_inflight=self.image_inflight if vision else None,
                    image_limit=vision["image_concurrency"] if vision else None)
-        free = max(0, available_bytes(cfg) - self.reserved)
+        avail = available_bytes(cfg, self._owner)        # the budget in force: smaller while the owner is active
+        free = max(0, avail - self.reserved)
         full = g["limit"] is not None and self.inflight >= g["limit"]
         if text_route(cfg):
             # the text route's set reservation: what one more request may hold beside the set in flight (#126)
-            fit = text_room(cfg, [], available_bytes(cfg))
-            room = 0 if full or self._draining else text_room(cfg, self._loads,
-                                                              available_bytes(cfg) - self._summed_bytes(),
+            fit = text_room(cfg, [], avail)
+            room = 0 if full or self._draining else text_room(cfg, self._loads, avail - self._summed_bytes(),
                                                               self._high_water, self._peak)
         else:
-            fit, room = bytes_tokens(cfg, available_bytes(cfg)), 0 if full else bytes_tokens(cfg, free)
-        return {**out, "reserved_bytes": self.reserved, "free_bytes": free,
+            fit, room = bytes_tokens(cfg, avail), 0 if full else bytes_tokens(cfg, free)
+        return {**out, "reserved_bytes": self.reserved, "budget_bytes": avail, "free_bytes": free,
                 # the most tokens one request may hold: alone (ever), and beside what runs now (0 when the count is full)
                 "fit_tokens": fit, "free_tokens": room}
+
+    def _note_owner(self, g: dict[str, Any]) -> None:
+        """Keep the sample's owner state (under the lock): "idle" or "active"; anything else counts as active."""
+        self._owner = "idle" if g.get("owner") == "idle" else "active"
 
     def _set_bytes(self) -> int:
         """The text route's set reservation of the loads in flight (0 when none, or without a governor)."""
@@ -1078,7 +1144,7 @@ class Admission:
         if not self._loads or self.governor is None:
             return False
         cfg = self.governor.cfg
-        budget = available_bytes(cfg) - self._summed_bytes()
+        budget = available_bytes(cfg, self._owner) - self._summed_bytes()
         return text_room(cfg, self._loads, budget, self._high_water, self._peak) < text_room(cfg, self._loads, budget)
 
     def _check_drain_locked(self) -> None:
@@ -1089,10 +1155,14 @@ class Admission:
             self._draining = True
 
     def snapshot(self) -> dict[str, Any]:
-        """{"limit", "inflight", "retiring", "draining", "owner", "pressure", "reason", "reserved_bytes", "free_bytes",
-        "fit_tokens", "free_tokens"}: what the gate reports (bytes and tokens None without a governor)."""
+        """{"limit", "inflight", "retiring", "draining", "owner", "pressure", "reason", "reserved_bytes",
+        "budget_bytes", "free_bytes", "fit_tokens", "free_tokens"}: what the gate reports (bytes and tokens None
+        without a governor).
+        budget_bytes, free_bytes, fit_tokens and free_tokens are those of the budget in force (available_bytes for the
+        sample's owner state): the provider's routing skips the node on them (local_lane.gate_fit)."""
         g = self.governor.current() if self.governor else NO_GOVERNOR
         with self._lock:
+            self._note_owner(g)
             self._check_drain_locked()
             return self._report(g)
 
@@ -1120,7 +1190,9 @@ class Admission:
     def try_acquire(self, reserve: int = 0, image: bool = False,
                     load: TextLoad | None = None) -> tuple[Ticket | None, dict[str, Any]]:
         """(ticket, report) when admitted; (None, report) when not, report["refused"] saying why: "too_large" (more
-        than the whole budget beside the weights: never, even when the count is full too) or "busy" (the count limit,
+        than the whole budget in force beside the weights, alone: not now, even when the count is full too; while the
+        owner is active that is the smaller active budget, so a turn that would fit once the owner is away is sent
+        elsewhere at once rather than retried) or "busy" (the count limit,
         the bytes left now, or for an `image`-bearing request every image slot taken; retryable). The count slot, the
         bytes and the image slot are taken together, atomically. An image-bearing request on a model without a vision
         policy (or without a governor) is "unsupported": the gate checks that first, this only fails closed.
@@ -1137,7 +1209,9 @@ class Admission:
         end (retire: the backend confirms they left its scheduler, local_gate.Retirer), which bounds the wait by
         their max_tokens and the gate's read timeout; the empty set then resets (_release_locked) and admission
         resumes at the fresh size. The reservation never shrinks while a turn of the old set runs, so no buffer that
-        may still be live is ever given away."""
+        may still be live is ever given away.
+        The owner's return (idle -> active) shrinks the budget, never a reservation: the turns in flight keep theirs
+        and run on; a new turn is "busy" while the set in flight leaves it no room in the smaller budget."""
         g = self.governor.current() if self.governor else NO_GOVERNOR
         with self._lock:
             vision = self.vision
@@ -1147,7 +1221,8 @@ class Admission:
                 self.inflight += 1
                 return Ticket(self, 0), self._report(g)
             cfg = self.governor.cfg
-            avail = available_bytes(cfg)
+            self._note_owner(g)
+            avail = available_bytes(cfg, self._owner)       # the budget in force (owner active: the smaller)
             self._check_drain_locked()
             if load is not None:
                 if image or not text_route(cfg):
@@ -1163,7 +1238,10 @@ class Admission:
             refused = None
             if alone > avail:
                 refused = {"refused": "too_large", "reason": f"request needs {_gib(alone)} GiB, more than the "
-                                                             f"{_gib(avail)} GiB budget beside the weights"}
+                                                             f"{_gib(avail)} GiB budget beside the weights"
+                                                             + (" while the owner is active"
+                                                                if self._owner == "active" and
+                                                                avail < available_bytes(cfg) else "")}
                 nbytes = alone
             elif g["limit"] is not None and self.inflight >= g["limit"]:
                 refused = {"refused": "busy"}                       # the sample's reason: owner / pressure
@@ -1174,7 +1252,8 @@ class Admission:
                 refused = {"refused": "busy", "reason": f"text set draining: {len(self._loads)} running turns keep "
                                                         "a departed turn's width; admission resumes when they end"}
             elif after > avail:
-                refused = {"refused": "busy", "reason": f"memory budget: {_gib(avail - self.reserved)} GiB free, "
+                free_now = max(0, avail - self.reserved)        # 0 while the owner's return leaves it over budget
+                refused = {"refused": "busy", "reason": f"memory budget: {_gib(free_now)} GiB free, "
                                                         f"request needs {_gib(nbytes)} GiB"}
                 if load is not None and self._summed_bytes() + text_set_bytes(cfg, [*self._loads, load])["total"] \
                         <= avail:
