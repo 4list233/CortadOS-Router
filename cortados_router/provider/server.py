@@ -113,7 +113,8 @@ CLOSED_RECORD_TTL_S = 3600.0
 # longest a client is ever promised to be waited for; bounded by count, the oldest goes first.
 RECOVERABLE_MAX = 128
 # Cap pressure (#132 item 6, review round 1): when opening one more conversation would exceed MAX_SESSIONS, the
-# registry retires the longest-idle conversations that could be recovered (ReapedConversation.eligible), have no turn
+# registry retires the longest-idle conversations that could be recovered (ReapedConversation.eligible, with a rebuild
+# left in their lineage's budget: Registry._recovery_left_locked, review round 2), have no turn
 # running and do not wait on a tool result, into the same recovery records the idle reaper writes, until there is
 # room (Registry._retire_for_room_locked). One idle less than this is never retired: a client between two turns of an
 # active conversation is not made to pay a rebuild.
@@ -1034,12 +1035,14 @@ class Registry:
 
     def _retire_for_room_locked(self, now: float) -> list:
         """Under self._lock, at the cap: retire conversations, longest idle first, until one more fits. A candidate is
-        recoverable (ReapedConversation.eligible: its client can come back and get it rebuilt), idle at least
+        recoverable (ReapedConversation.eligible: its client can come back and get it rebuilt, and _recovery_left_locked:
+        its lineage still has a rebuild to recover with, or its return would be a terminal RebuildLimit), idle at least
         PRESSURE_MIN_IDLE_S, not waiting on a tool result, and its turn lock is free (taken here without blocking, so
         no turn is in flight and none can start: a continuation that loses the race finds the recovery record).
         Returns the retired sessions with their turn locks still held, for _finish_retired outside the lock."""
         cands = sorted((s for s in self.sessions.values()
-                        if ReapedConversation.eligible(s) and not getattr(s, "awaiting_tool_result", False)
+                        if ReapedConversation.eligible(s) and self._recovery_left_locked(s)
+                        and not getattr(s, "awaiting_tool_result", False)
                         and now - getattr(s, "last_used", now) >= PRESSURE_MIN_IDLE_S),
                        key=lambda s: getattr(s, "last_used", now))
         retired = []
@@ -1054,6 +1057,15 @@ class Registry:
                 continue
             retired.append(s)
         return retired
+
+    def _recovery_left_locked(self, s) -> bool:
+        """Under self._lock: whether recovering s would get a rebuild (review round 2): rebuilding is on (REBUILD_MAX >
+        0) and its lineage's committed plus pending rebuilds are below REBUILD_MAX. A conversation without one is never
+        retired under pressure: its next continuation would be the terminal 400 "rebuild limit reached" instead."""
+        if REBUILD_MAX <= 0:
+            return False
+        b = getattr(s, "rebuild_budget", None)
+        return b is None or b.used + b.pending < REBUILD_MAX
 
     def _finish_retired(self, retired: list) -> None:
         """Outside self._lock: tear down conversations _retire_locked removed (their turn locks held), then release."""

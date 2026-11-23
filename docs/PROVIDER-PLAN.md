@@ -49,10 +49,12 @@ its own tools; the chosen model only thinks.
 - `CORTADOS_PROVIDER_MAX_SESSIONS` (128): bound held conversations/processes and their replay memory (at most
   1 MiB of replay per session). Capacity pressure (#132 item 6, review round 1): when one more conversation (a new
   one, a branch or a recovery) would exceed the cap, the longest-idle conversations that are recoverable (an identity,
-  a wire, a reply), idle at least `PRESSURE_MIN_IDLE_S` (120 s), not waiting on a tool result and with no turn running
+  a wire, a reply, and a rebuild left in the lineage's `REBUILD_MAX` budget: review round 2), idle at least `PRESSURE_MIN_IDLE_S` (120 s), not waiting on a tool result and with no turn running
   are retired into the same recovery records the idle reaper writes, oldest first, until it fits; their clients'
-  returns are rebuilt as above. Only when none qualifies is it a 503. Tool waits, running turns and identity-less
-  conversations are never evicted. Log line: `closing idle conversation <id> under capacity pressure (...)`.
+  returns are rebuilt as above. Only when none qualifies is it a 503. Tool waits, running turns, identity-less
+  conversations and those whose lineage used its rebuilds (or with `REBUILD_MAX` 0) are never evicted: their return
+  would be the terminal rebuild-limit 400. A request that found a conversation just before it was retired gets the
+  closed-while-waiting 409; its identical retry recovers it. Log line: `closing idle conversation <id> under capacity pressure (...)`.
 - `CORTADOS_PROVIDER_TURN_TIMEOUT_S` (1800 s): bounds one backend model turn, not execution of client tools.
   Streaming turns already send Anthropic `ping` SSE events every 10 s. Non-streaming clients must allow the whole
   backend turn in their own read timeout. Socket reads/writes are bounded at 120 s to release stalled connections.

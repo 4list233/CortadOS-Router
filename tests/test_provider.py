@@ -2363,6 +2363,76 @@ class ReapedRecoveryTests(RoutedHarness):
                 self.converse(f"new {i}", headers={"X-Claude-Code-Session-Id": f"newcomer-{i}"})
         self.assertEqual(list(self.reg.recoverable), [fan[1][0].id, fan[2][0].id])   # the oldest record went first
 
+    # --- review round 2: no retirement without a rebuild left; the lookup-then-retire race -------------------------
+
+    def test_pressure_never_retires_a_conversation_whose_rebuild_budget_is_used_up(self):
+        with mock.patch.object(server, "MAX_SESSIONS", 1):
+            (s, history, h), = self.fan_out(1)
+            s.rebuild_budget.used = server.REBUILD_MAX                  # its lineage has no rebuild left
+            self.assertEqual(self.status_of({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "x"}]},
+                                            headers={"X-Claude-Code-Session-Id": "newcomer"}), 503)
+            self.assertFalse(s._closed)
+            self.assertEqual(self.reg.recoverable, {})
+            self.assertEqual(self.reg._opening, 0)
+            # Its own client continues it normally: no rebuild was needed, so no terminal rebuild-limit 400.
+            r = self.post({"tools": [READ_TOOL], "messages": history + [{"role": "user", "content": "on"}]}, headers=h)
+            self.assertEqual(r["content"], [{"type": "text", "text": "echo: on"}])
+            # Pending starts that fill the budget count too; one rebuild left makes it retirable again.
+            s.rebuild_budget.used, s.rebuild_budget.pending = server.REBUILD_MAX - 1, 1
+            s.last_used = time.time() - server.IDLE_S
+            with self.reg._lock:
+                self.assertEqual(self.reg._retire_for_room_locked(time.time()), [])
+                s.rebuild_budget.pending = 0
+                retired = self.reg._retire_for_room_locked(time.time())
+            self.reg._finish_retired(retired)
+            self.assertEqual(retired, [s])
+            self.assertIn(s.id, self.reg.recoverable)
+
+    def test_pressure_never_retires_when_rebuilding_is_switched_off(self):
+        with mock.patch.object(server, "MAX_SESSIONS", 1), mock.patch.object(server, "REBUILD_MAX", 0):
+            (s, history, h), = self.fan_out(1)
+            self.assertEqual(s.rebuild_budget.used, 0)
+            self.assertEqual(self.status_of({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "x"}]},
+                                            headers={"X-Claude-Code-Session-Id": "newcomer"}), 503)
+            self.assertFalse(s._closed)
+            self.assertEqual(self.reg.recoverable, {})
+            r = self.post({"tools": [READ_TOOL], "messages": history + [{"role": "user", "content": "on"}]}, headers=h)
+            self.assertEqual(r["content"], [{"type": "text", "text": "echo: on"}])
+
+    def test_a_request_that_found_a_conversation_just_before_its_retirement_gets_409_and_its_retry_recovers(self):
+        with mock.patch.object(server, "MAX_SESSIONS", 1):
+            (s, history, h), = self.fan_out(1)
+            body = {"tools": [READ_TOOL], "messages": history + [{"role": "user", "content": "back"}]}
+            real_find = self.reg.find
+            fired = []
+
+            def find_then_retire(*a, **kw):
+                found = real_find(*a, **kw)
+                if not fired:                       # once: another opening retires it between lookup and turn lock
+                    fired.append(found)
+                    self.reg.reserve_opening()
+                    self.reg.release_opening()
+                return found
+            with mock.patch.object(self.reg, "find", find_then_retire), \
+                    self.assertLogs("cortados.provider", "WARNING") as logs:
+                code, msg, retry = self.terminal(body, headers=h)
+            self.assertIs(fired[0], s)                                   # the lookup did find the live conversation
+            self.assertEqual(code, 409)
+            self.assertIn("closed while this request waited", msg)
+            self.assertNotEqual(retry, "false")
+            self.assertTrue(any("under capacity pressure" in l for l in logs.output), logs.output)
+            self.assertTrue(s._closed)
+            self.assertEqual(list(self.reg.recoverable), [s.id])
+            self.assertEqual(s.rebuild_budget.used, 0)                   # the stale 409 spent no rebuild
+            r = self.post(body, headers=h)                               # the identical retry: recovered
+            self.assertTrue(r["content"][0]["text"].startswith("echo: [cortados relay]"), r)
+            self.assertTrue(r["content"][0]["text"].endswith("back"))
+            (new,) = self.reg.sessions.values()
+            self.assertIsNot(new, s)
+            self.assertEqual(new.rebuild_budget.used, 1)
+            self.assertEqual(self.reg.recoverable, {})
+            self.assertEqual(self.reg._opening, 0)
+
     def test_a_run_never_logged_as_ended_keeps_the_long_limit_only_for_a_childs_max_run_time(self):
         run = "t20261122165617-9841f3ab"
         self.reg.ended_runs = lambda: set()
