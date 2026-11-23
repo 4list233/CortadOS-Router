@@ -186,7 +186,7 @@
  ],
  "workloads": {
   "batch": {"max_band": "R1", "unit_kind": "background"},
-  "_doc": "#132 (owner 2026-11-22): a client's x-cortados-workload header (provider, both wires). batch caps the band at R1 (core.resolve maximum_band, mirroring min_band) and routes the call as background work (fallback band R1 when S1 is degraded, no face floor). The hard rules win: blast radius 3 (an outward effect is floored there) keeps its band, and a degraded scorer still never defaults to Claude. Unknown values are ignored with a log line."
+  "_doc": "#132 (owner 2026-11-22): a client's x-cortados-workload header (provider, both wires). batch caps the band at R1 (core.resolve maximum_band, mirroring min_band) and the difficulty the requirement and the frontier rules read at the most R1 admits (core.band_max_D: 5), so the selection is R1's, not only the label; a trusted min_band above R1 undoes the cap and routes the call as background work (fallback band R1 when S1 is degraded, no face floor). The hard rules win: blast radius 3 (an outward effect is floored there) keeps its band, and a degraded scorer still never defaults to Claude. Unknown values are ignored with a log line."
  },
  "fallback": {
   "interactive": "R2",
@@ -632,7 +632,7 @@
    "_doc": "when a ceiling model's own pool is underused (scarcity ≤ −0.3: the allowance would otherwise expire unused), it also takes any R3-level task (D ≥ min_D) in every use case: paid-for capacity is used, not lost. Several underused ceiling pools: the one expected to lose the largest share at its reset wins (#132, owner 2026-11-22: rule kept, ranking by loss at reset), cost breaks ties; when any of them has no reset time, the cheapest (the earlier ranking)."
   },
   "switch_margin_points": 3,
-  "_switch_margin": "#132 (owner 2026-11-22): a 1–3 point cost difference is noise from the latest usage reading (R2 flipped between Opus on account B and Sol call by call). The client's previous route in the same band stays first while it qualifies, is available and costs at most this many points more than the cheapest; otherwise the cheapest stands. The host keeps the previous route per client (provider/routing.py remember_route). 0 turns it off.",
+  "_switch_margin": "#132 (owner 2026-11-22): a 1–3 point cost difference is noise from the latest usage reading (R2 flipped between Opus on account B and Sol call by call). The client's previous route in the same band stays first while it qualifies, is available and costs at most this many points more than the cheapest; otherwise the cheapest stands. Held only when the host's admission check (hold_ok: the provider's client floor) passes too. The host keeps the previous route per client (provider/routing.py remember_route). 0 turns it off.",
   "pool_size_prior_tokens_per_pct": {
    "codex:all": 5630000
   },

@@ -810,15 +810,29 @@ def static_scarcity_rank(h: dict[str, Any], demote: float, expiring: float) -> t
     return (0 if exp >= expiring and sc < demote else 1, 1 if sc >= demote else 0)
 
 
+def band_max_D(t: dict[str, Any], band: str) -> int | None:
+    """The highest difficulty a band admits: its own `when` (an `all` holding {"lte": ["D", n]}), else the D of the
+    selection knot whose reference is that band; None when the table says neither."""
+    row = next((b for b in t.get("bands") or [] if b.get("band") == band), None) or {}
+    for cond in (row.get("when") or {}).get("all") or []:
+        if isinstance(cond, dict) and isinstance(cond.get("lte"), list) and cond["lte"][:1] == ["D"]:
+            return int(cond["lte"][1])
+    return next((int(k["D"]) for k in (t.get("selection") or {}).get("knots") or [] if k.get("ref") == band), None)
+
+
 def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_chars: int = 0, sticky: dict[str, Any] | None = None,
             escalate: dict[str, Any] | None = None, input_fit: dict[str, Any] | None = None,
             allowed_routes: tuple[tuple[str, str], ...] | None = None,
             execution: bool = False, minimum_band: str | None = None, accounts_aware: bool = False,
-            maximum_band: str | None = None, previous: dict[str, Any] | None = None) -> dict[str, Any]:
-    """`maximum_band` (a client's workload hint, e.g. batch → R1) caps the band from above, mirroring `minimum_band`;
-    the hard rules still win: a request whose blast radius is 3 (an outward effect is floored there) keeps its band,
-    and `minimum_band` is applied after the cap. `previous` maps band → {"lane", "model"} of the client's previous
-    route in that band, held under selection.switch_margin_points."""
+            maximum_band: str | None = None, previous: dict[str, Any] | None = None,
+            hold_ok: Callable[[dict[str, Any]], bool] | None = None) -> dict[str, Any]:
+    """`maximum_band` (a client's workload hint, e.g. batch → R1) caps the band from above, mirroring `minimum_band`,
+    and caps the difficulty the requirement is computed from at the most that band admits (band_max_D); the hard rules
+    still win: a request whose blast radius is 3 (an outward effect is floored there) keeps its band and difficulty,
+    and a `minimum_band` that raises the band above the cap undoes it. `previous` maps band → {"lane", "model"} of the
+    client's previous route in that band, held under selection.switch_margin_points. `hold_ok` is the host's own
+    admission check (e.g. the provider's quota floor): the margin holds a previous route only when it passes, so
+    stickiness never picks a route the host would then refuse."""
     t = table()
     rules: list[str] = []
     if decision["degraded"] or not decision["answers"]:
@@ -841,6 +855,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
         v["D"] = D
         v["parts"] = PARTS_TO_COUNT[int(ans.get("parts", 0))]
         band = next((b["band"] for b in t["bands"] if _holds(b["when"], v)), t["fallback"]["interactive"])
+    capped = False
     if maximum_band is not None:
         if maximum_band not in BAND_ORDER:
             raise ValueError('Invalid maximum routing band')
@@ -848,7 +863,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             if v is not None and v["blast_radius"] >= 3:
                 rules.append(f"workload cap {maximum_band} not applied: blast radius 3 (outward effect) keeps {band}")
             else:
-                band = maximum_band
+                band, capped = maximum_band, True
                 rules.append(f"client workload hint caps band at {band}")
     if minimum_band is not None:
         if minimum_band not in BAND_ORDER:
@@ -856,6 +871,19 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
         if BAND_ORDER.index(band) < BAND_ORDER.index(minimum_band):
             band = minimum_band
             rules.append(f'trusted capability requirement floors band at {band}')
+            if capped:
+                capped = False                 # the trusted floor wins over the client's cap: the requirement is uncapped
+                rules.append(f"workload cap {maximum_band} not applied: the trusted capability requirement wins")
+    if capped and D is not None:
+        # #132 review round 1: the cap lowers the effective requirement, not only the label. The difficulty counted for
+        # the required index and for the frontier rules (ceiling_work, ceiling_underuse) is capped at the most the
+        # capped band admits, so a capped call is selected exactly like a natural request of that band.
+        d_max = band_max_D(t, band)
+        if d_max is not None and D > d_max:
+            rules.append(f"workload cap: difficulty {D} counted as {d_max}, the most {band} admits "
+                         "(required index and frontier rules)")
+            D = d_max
+            v["D"] = D
     row = next(b for b in t["bands"] if b["band"] == band)
     # candidates: table order, work-kind preference first; then subscription scarcity re-ranks them (never below the band):
     #   spent / refusing lane → skipped · lane burning faster than its window → behind the others · lane whose headroom expires soon → first
@@ -1040,6 +1068,15 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             best = next((c for c in cands if ok_of(c) and c["index"] >= target), None)
             held = next((c for c in cands if c["model"] == prev["model"] and c["lane"] == prev.get("lane")
                          and ok_of(c) and c["index"] >= target), None)
+            if held is not None and held is not best and hold_ok is not None:
+                try:
+                    admitted = bool(hold_ok(held))
+                except Exception:                  # an admission check that cannot answer never lets the margin hold
+                    admitted = False
+                if not admitted:
+                    rules.append(f"switching margin: previous {band} route {held['lane']}/{held['model']} not held "
+                                 "(fails the host's admission check)")
+                    held = None
             if best is not None and held is not None and held is not best and held["cost"] - best["cost"] <= margin:
                 cands.remove(held); cands.insert(0, held)
                 rules.append(f"switching margin: stays on the client's previous {band} route {held['lane']}/{held['model']} "

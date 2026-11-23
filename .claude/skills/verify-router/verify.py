@@ -216,13 +216,20 @@ WORKLOAD_SCENARIO = """
 import json, sys
 from cortados_router import core
 from cortados_router.provider import routing
-def route(text):
+def route(text, workload="batch", cid="verify-batch"):
     body = {"model": "cortados", "messages": [{"role": "user", "content": text}]}
-    r = routing.choose(core, body, client="verify-batch", conversation_id="verify-batch", claude_bin=sys.executable,
-                       codex_bin=sys.executable, workload="batch")
-    return {k: r.get(k) for k in ("provider", "model", "band", "degraded", "workload", "error")}
+    r = routing.choose(core, body, client="verify-batch", conversation_id=cid, claude_bin=sys.executable,
+                       codex_bin=sys.executable, workload=workload)
+    rt = r.get("route") or {}
+    use = ((rt.get("chosen") or {}).get("use_case"))
+    cap = (core.required_index(core.table(), core.model_scores(), use, core.band_max_D(core.table(), "R1"), "R1")
+           if use and core.model_scores() else None)
+    return {**{k: r.get(k) for k in ("provider", "model", "band", "degraded", "workload", "error")},
+            "D": rt.get("D"), "required_index": rt.get("required_index"), "r1_cap_index": cap}
+hard = "design a new consensus protocol for our replicated storage engine, prove its safety, and plan the migration"
 print(json.dumps({"easy": route("refactor the parser module and update its tests across the package"),
-                  "outward": route("email the signed invoice to the client and mark it paid")}))
+                  "outward": route("email the signed invoice to the client and mark it paid"),
+                  "hard_free": route(hard, None, "verify-batch-free"), "hard_batch": route(hard, "batch", "verify-batch-hard")}))
 """
 
 # Local auto-route on the Pro (#75, 2026-11-13): after S1, a conversation in a band the node lists moves to its local model
@@ -785,6 +792,17 @@ def main():
         else:
             record("batch hint never lowers an outward request (R3)", "PASS" if out.get("band") == "R3" else "FAIL",
                    json.dumps(out))
+        # review round 1 (#132): the cap lowers the effective requirement, not only the label. A capped hard request's
+        # difficulty is at most R1's (5) and its required index at most R1's requirement at that difficulty.
+        free, hb = r["hard_free"], r["hard_batch"]
+        name = "batch hint caps the required index with the band (not only the label)"
+        if free.get("degraded") or hb.get("degraded"):
+            record(name, "BLOCKED", unreachable if not up else f"S1 listening at {s1_where} but the decision is degraded")
+        else:
+            ok = (hb.get("band") in ("R0", "R1") and not hb.get("error") and isinstance(hb.get("D"), int) and hb["D"] <= 5
+                  and hb.get("required_index") is not None and hb.get("r1_cap_index") is not None
+                  and hb["required_index"] <= hb["r1_cap_index"])
+            record(name, "PASS" if ok else "FAIL", json.dumps({"free": free, "batch": hb}))
 
     p = runner.run(["-c", LOCAL_SCENARIO], prefix="verify-router-local-", timeout=300)
     try:

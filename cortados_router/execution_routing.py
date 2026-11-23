@@ -79,11 +79,12 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
            turn_id='', api_request_id='', input_fit=None, task_context=None, recall='',
            current_provider='', current_model='', constraints=None, escalate=None,
            credential_resolver=None, route_id=None, log_platform=None, supports_accounts=False,
-           previous=None):
+           previous=None, hold_ok=None):
     """`constraints['workload']` (a host-validated client hint, e.g. 'batch') applies the routing table's
     `workloads` row: a band cap (core.resolve maximum_band, under the hard rules) and the unit kind, so a batch call is
     background work (fallback band R1, no face floor). `previous` (band -> {lane, model}, the host's memory of this
-    client's last route per band) is passed to core.resolve for the switching margin."""
+    client's last route per band) is passed to core.resolve for the switching margin, with `hold_ok` (the host's
+    admission check on a candidate, e.g. its quota floor): the margin holds only a route that passes it."""
     credential_resolver, auth_errors = _credential_policy(credential_resolver)
     unit = 'interactive' if platform in ('discord', 'telegram', 'cli') else 'background'
     workload = (constraints or {}).get('workload')
@@ -154,7 +155,8 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
                              allowed_routes=tuple(sorted(allowed)), execution=True,
                              minimum_band=(constraints or {}).get('min_band'), accounts_aware=supports_accounts,
                              **({'maximum_band': hint['max_band']} if hint.get('max_band') else {}),
-                             **({'previous': previous} if previous else {}))
+                             **({'previous': previous} if previous else {}),
+                             **({'hold_ok': hold_ok} if previous and hold_ok is not None else {}))
         choice = route.get('chosen')
         if not choice:
             break

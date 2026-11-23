@@ -755,13 +755,15 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
     if workload:
         constraints["workload"] = workload      # select applies the table's workloads row (band cap, background)
     previous = previous_routes(client)
+    hold_ok = floor_admits(core, min_left_pct, codex_home) if previous and min_left_pct is not None else None
     r = execution_routing.select(
         _NoClaudeWhenDegraded(core), prompt=request_text(body.get("messages") or [], standalone=not body.get("tools")),
         session_id=conversation_id, platform=PLATFORM, face="provider", entrypoint="provider", input_fit=fit,
         constraints=constraints,
         credential_resolver=_credentials(claude_bin, codex_bin), log_platform=f"provider:{client}",
         supports_accounts=True,   # this endpoint applies the routed account's login (server.Registry → bridge CLAUDE_CONFIG_DIR)
-        **({"previous": previous} if previous else {}))
+        **({"previous": previous} if previous else {}),
+        **({"hold_ok": hold_ok} if hold_ok is not None else {}))
     if not r.get("error"):
         remember_route(client, r)
     if r.get("error") and r.get("degraded"):
@@ -1931,6 +1933,28 @@ def floor_candidate(route: dict[str, Any], codex_home: str | None = None) -> dic
             "codex_home": codex_home,
             # A conversation opened under a floor carries the canonical home its backend runs on: that is its identity.
             **({"codex_login": route["codex_home"]} if route.get("codex_home") else {})}
+
+
+def floor_admits(core, min_left_pct: float, codex_home: str | None = None) -> Callable[[dict[str, Any]], bool]:
+    """The client's quota floor as core.resolve's `hold_ok` (#132 review round 1): the switching margin holds a previous
+    route only when its executing account passes floor.check under x-cortados-min-left-pct, the same check (same
+    candidate shape, same Codex home binding) the chosen route then reserves atomically in choose. One usage reading
+    for the whole decision. A floor-exempt lane (local, API credit) always passes."""
+    readings: list[Any] = []
+
+    def ok(cand: dict[str, Any]) -> bool:
+        lane = cand.get("lane") or ""
+        if not lane:
+            return False
+        if _floor_exempt(lane):
+            return True
+        if not readings:
+            readings.append(core.subscription_readings())
+        c = {"lane": lane, "provider": cand.get("provider"), "account": cand.get("account"),
+             "config_dir": cand.get("config_dir"), "codex_home": codex_home}
+        return floor.check(core, {**c, **_bind_codex(c, codex_home)}, cand.get("model") or "", min_left_pct,
+                           readings[0]) is None
+    return ok
 
 
 def floor_turn(core, route: dict[str, Any] | None, min_left_pct: float, codex_home: str | None = None) -> str | None:

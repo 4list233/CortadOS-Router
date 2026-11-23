@@ -307,6 +307,76 @@ class SwitchingMargin(Base):
         routing.remember_route("claude-cli", {"band": "R2", "route": {}})          # nothing chosen: unchanged
         self.assertEqual(routing.previous_routes("claude-cli")["R2"]["model"], "m")
 
+    def _near_tie(self):
+        """One Claude login, price-only weights, Sol a hair cheaper than Opus: R2 code picks Sol, Opus within the margin."""
+        core._vendor_accounts = lambda *a: [dict(ACCOUNTS[0], account=None, config_dir=None)]
+        self.fake({"claude": {"windows": []}, "codex": {"windows": []}}, {}, claude=-1.0, codex=-1.0)
+        ms = json.loads(json.dumps(MS)); ms["models"][1]["price_1m_blended_usd"] = 7.8
+        core.model_scores = lambda: ms
+
+    def test_margin_never_holds_a_route_the_host_refuses(self):
+        """Review round 1 (P2): stickiness chooses only among candidates eligible on every rule, the host's admission
+        check (hold_ok: the provider's quota floor) included; a check that fails or cannot answer releases the hold."""
+        self._near_tie()
+        prev = {"R2": {"lane": "claude", "model": "claude-opus-5-5"}}
+        seen = []
+        ok = core.resolve(dec(), previous=prev, hold_ok=lambda c: seen.append((c["lane"], c["model"])) or True)
+        self.assertEqual(ok["chosen"]["model"], "claude-opus-5-5")                 # admitted: held as before
+        self.assertEqual(seen, [("claude", "claude-opus-5-5")])                    # asked about the held route only
+        refused = core.resolve(dec(), previous=prev, hold_ok=lambda c: c["lane"] != "claude")
+        self.assertEqual((refused["chosen"]["lane"], refused["chosen"]["model"]), ("codex", "gpt-6.1-sol"))
+        self.assertTrue(any("not held (fails the host's admission check)" in x for x in refused["hard_rules"]))
+        self.assertFalse(any(x.startswith("switching margin: stays") for x in refused["hard_rules"]))
+
+        def boom(c):
+            raise RuntimeError("no reading")
+        self.assertEqual(core.resolve(dec(), previous=prev, hold_ok=boom)["chosen"]["model"], "gpt-6.1-sol")
+        # the cheapest route is never put to the check: hold_ok only gates the margin
+        cheap = core.resolve(dec(), previous={"R2": {"lane": "codex", "model": "gpt-6.1-sol"}}, hold_ok=lambda c: False)
+        self.assertEqual(cheap["chosen"]["model"], "gpt-6.1-sol")
+
+    def test_provider_floor_keeps_the_margin_off_an_ineligible_route(self):
+        """The reviewer's case end to end through routing.choose: a 95 % floor, the client's previous R2 route Claude
+        (90 % left, below the floor) near-tied with Codex (99 % left). Before: the margin kept Claude and the floor then
+        refused the request. Now Codex is chosen and reserved; without a floor the margin still holds Claude."""
+        from cortados_router import execution_routing
+        from cortados_router.provider import floor, routing
+        self._near_tie()
+        routing.forget_routes(); self.addCleanup(routing.forget_routes)
+        left = {"claude": 90.0, "codex": 99.0}
+        why = lambda cand, fl: None if left[cand["lane"].split("#")[0]] >= fl else f"week: {left[cand['lane']]:.0f}% left"
+        checked, reserved = [], []
+
+        def check(core_, cand, model, fl, readings=None, now=None):
+            checked.append((cand["lane"], model)); return why(cand, fl)
+
+        def reserve(core_, cand, model, fl, readings=None, now=None, conv=None, rid=None):
+            reserved.append((cand["lane"], model)); return why(cand, fl)
+        body = {"model": "cortados", "messages": [{"role": "user", "content": "refactor the parser"}]}
+
+        def run(min_left_pct, sid):
+            with mock.patch.object(core, "decide", return_value=dec()), \
+                    mock.patch.object(core, "log_route", return_value=True), \
+                    mock.patch.object(core, "subscription_readings", return_value={}), \
+                    mock.patch.object(floor, "check", check), mock.patch.object(floor, "reserve", reserve), \
+                    mock.patch.object(routing, "_credentials", lambda *a: (lambda **k: None)), \
+                    mock.patch.object(routing, "request_sensitivity", return_value=None), \
+                    mock.patch.object(routing, "sensitive_local", lambda core_, body_, r, **k: r), \
+                    mock.patch.object(routing, "auto_local", lambda core_, body_, r, **k: r):
+                return routing.choose(core, body, client="claude-cli", conversation_id=sid, min_left_pct=min_left_pct)
+        routing.remember_route("claude-cli", {"band": "R2", "route": {"chosen": {"lane": "claude", "model": "claude-opus-5-5"}}})
+        r = run(95.0, "rfix-floor-1")
+        self.assertIsNone(r.get("error")); self.assertFalse(r.get("quota_blocked"))
+        self.assertEqual((r["route"]["chosen"]["lane"], r["model"]), ("codex", "gpt-6.1-sol"))
+        self.assertIn(("claude", "claude-opus-5-5"), checked)                      # the held route was put to the floor
+        self.assertEqual(reserved, [("codex", "gpt-6.1-sol")])                     # the final atomic check still runs
+        self.assertTrue(any("not held" in x for x in r["route"]["hard_rules"]))
+        # control: no floor, the same memory → the margin holds Claude (the margin is what was at stake)
+        routing.remember_route("claude-cli", {"band": "R2", "route": {"chosen": {"lane": "claude", "model": "claude-opus-5-5"}}})
+        checked.clear(); reserved.clear()
+        r = run(None, "rfix-floor-2")
+        self.assertEqual(r["model"], "claude-opus-5-5"); self.assertEqual((checked, reserved), ([], []))
+
 
 class BatchHint(Base):
     """Item 5: x-cortados-workload: batch caps the band at R1 and is background work; the hard rules win."""
@@ -330,6 +400,67 @@ class BatchHint(Base):
         self.assertEqual(core.resolve(dec(), maximum_band="R1", minimum_band="R2")["band"], "R2")
         with self.assertRaises(ValueError):
             core.resolve(dec(), maximum_band="R9")
+
+    def test_cap_lowers_the_effective_requirement_not_only_the_label(self):
+        """Review round 1 (P1/P2): with the #132 state a D9 code request is R3 at index 67.0 and the underused-frontier
+        rule hands it to Astra. Capped at R1 the difficulty counts as 5 (R1's most), the requirement is R1's (36.7) and
+        the frontier rule (min_D 9) does not fire: the cheapest qualifying route, Sol, takes it."""
+        self.the_132_state()
+        d = dec(steps=3, ambiguity=3, novelty=3)                                   # D = 9, blast radius 0
+        free = core.resolve(d, accounts_aware=True)
+        self.assertEqual((free["band"], free["D"], free["required_index"]), ("R3", 9, 67.0))
+        self.assertEqual(free["chosen"]["model"], "gpt-6-astra")
+        capped = core.resolve(d, accounts_aware=True, maximum_band="R1")
+        want = core.required_index(core.table(), MS, "code", 5, "R1")
+        self.assertEqual((capped["band"], capped["D"], capped["required_index"]), ("R1", 5, want))
+        self.assertLess(want, 67.0); self.assertAlmostEqual(want, 36.7)
+        self.assertEqual((capped["chosen"]["lane"], capped["chosen"]["model"]), ("codex", "gpt-6.1-sol"))
+        self.assertFalse(any("takes it: its pool is underused" in x for x in capped["hard_rules"]))
+        self.assertIn("workload cap: difficulty 9 counted as 5, the most R1 admits (required index and frontier rules)",
+                      capped["hard_rules"])
+        # a request already within R1's difficulty is not touched
+        low = core.resolve(dec(steps=1, ambiguity=1, novelty=1), accounts_aware=True, maximum_band="R1")
+        self.assertEqual(low["D"], 3); self.assertFalse(any("counted as" in x for x in low["hard_rules"]))
+
+    def test_the_hard_rules_still_win_over_the_capped_requirement(self):
+        self.the_132_state()
+        # trusted min-band above the cap: the cap is undone entirely (band, difficulty and requirement)
+        for floor_band in ("R2", "R3"):
+            r = core.resolve(dec(steps=3, ambiguity=3, novelty=3), accounts_aware=True, maximum_band="R1",
+                             minimum_band=floor_band)
+            self.assertEqual((r["band"], r["D"], r["required_index"]), (floor_band, 9, 67.0))
+            self.assertEqual(r["chosen"]["model"], "gpt-6-astra")
+            self.assertIn("workload cap R1 not applied: the trusted capability requirement wins", r["hard_rules"])
+        # outward: blast radius floored at 3, band and difficulty kept
+        r = core.resolve(dec(steps=3, ambiguity=3, novelty=3, outward=True), "background", accounts_aware=True,
+                         maximum_band="R1")
+        self.assertEqual((r["band"], r["D"], r["required_index"]), ("R3", 12, core.required_index(core.table(), MS, "code", 12, "R3")))
+        self.assertFalse(any("counted as" in x for x in r["hard_rules"]))
+        # the band-max lookup: R1's own `when`, else the knot naming the band
+        t = core.table()
+        self.assertEqual(core.band_max_D(t, "R1"), 5); self.assertEqual(core.band_max_D(t, "R0"), 2)
+        self.assertEqual(core.band_max_D(t, "R2"), 6); self.assertIsNone(core.band_max_D(t, "R9"))
+
+    def test_select_with_the_hint_routes_on_the_capped_requirement(self):
+        """Through execution_routing.select with a live (non-degraded) S1 decision: the route returned and logged is
+        the capped one: band R1, D 5, R1's requirement, Sol."""
+        from cortados_router import execution_routing
+        self.the_132_state()
+        allowed = [list(p) for p in (("claude-cli", "claude-opus-5-5"), ("claude-cli#b", "claude-opus-5-5"),
+                                     ("openai-codex", "gpt-6.1-sol"), ("openai-codex", "gpt-6-astra"))]
+        out = {}
+        for workload in (None, "batch"):
+            with mock.patch.object(core, "decide", return_value=dec(steps=3, ambiguity=3, novelty=3)), \
+                    mock.patch.object(core, "log_route", return_value=True):
+                out[workload] = execution_routing.select(
+                    core, prompt="rewrite the importer", platform="cli", session_id=f"rfix-batch-{workload}",
+                    constraints={"allowed_routes": allowed, **({"workload": workload} if workload else {})},
+                    credential_resolver=lambda **k: None, supports_accounts=True)
+        self.assertEqual((out[None]["band"], out[None]["model"], out[None]["route"]["required_index"]),
+                         ("R3", "gpt-6-astra", 67.0))
+        b = out["batch"]
+        self.assertEqual((b["band"], b["route"]["D"], b["model"]), ("R1", 5, "gpt-6.1-sol"))
+        self.assertAlmostEqual(b["route"]["required_index"], 36.7)
 
     def test_select_routes_batch_as_background_and_degraded_never_claude(self):
         from cortados_router import execution_routing
