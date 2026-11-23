@@ -441,8 +441,15 @@ hard 30-minute wall-clock cap (`api_credits.MAX_TURN_S`; `CORTADOS_ANTHROPIC_API
 cuts the turn off there whatever the socket does (the wait for the headers, a stalled read, a stream of periodic events),
 and a turn is admitted only when its cap ends at least 30 minutes before the earliest counting grant expires, so nothing
 admitted under a grant still runs when it expires. A turn cut off at the cap keeps its whole reservation: a closed
-connection is no proof the API stopped billing. After the last grant stops counting the lane is off until a new grant is
-added. Nothing assumes credit refills.
+connection is no proof the API stopped billing. The request is sent only through the turn's gate (#114 review round 2):
+the proxy's own HTTPS transport (`anthropic_proxy._dispatch`, stdlib `http.client` on a socket it owns, certificate and
+host verified, no redirect followed) bounds DNS, connect and the TLS handshake by the time left, checks under a lock
+right before every write that the gate is open and the deadline has not passed, and at the deadline shuts the gate and
+aborts the socket, so a lookup or connect that returns late can never send the request. A turn shut before any request
+byte was written settles at zero (it cannot have been billed). The lane connects only directly: with an HTTPS proxy
+configured for api.anthropic.com it refuses before sending. An upstream error body is read for at most 64 KiB and never
+past the deadline (30 s at most), and its response is always closed; the turn stays a zero-cost rejection. After the last
+grant stops counting the lane is off until a new grant is added. Nothing assumes credit refills.
 
 - Grant use U_G = (amount - remaining_usd for grants that state it) + every dollar the ledger committed (spent +
   reserved) from the earliest counting grant's start day (UTC) on. Grant budget G = the counting grants' amounts.

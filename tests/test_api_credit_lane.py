@@ -136,20 +136,21 @@ class LaneHarness(EndpointHarness):
         env.start()
         self.addCleanup(env.stop)
         port = self.api.server_port
-        real_open = urllib.request.build_opener(anthropic_proxy._NoRedirect).open
+        import socket
 
-        class ToFake:
-            """Delivers what the lane would send to https://api.anthropic.com (origin already checked) to the fake."""
-            @staticmethod
-            def open(req, timeout=None):
-                assert req.full_url == "https://api.anthropic.com/v1/messages", req.full_url
-                fwd = urllib.request.Request(f"http://127.0.0.1:{port}/v1/messages", data=req.data,
-                                             headers=dict(req.header_items()), method="POST")
-                return real_open(fwd, timeout=timeout)
+        def resolve(host, p):
+            # The lane's real transport (anthropic_proxy._dispatch: gated connect and send) reaches the fake: only the
+            # pinned origin is ever looked up, and it resolves to the loopback fake.
+            assert (host, p) == ("api.anthropic.com", 443), (host, p)
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
 
-        opener = mock.patch.object(anthropic_proxy, "_OPENER", ToFake)
-        opener.start()
-        self.addCleanup(opener.stop)
+        def plain(sock, host):
+            assert host == "api.anthropic.com", host
+            return sock                                  # the fake speaks plain HTTP
+        for name, fake in (("_resolve", resolve), ("_tls_wrap", plain), ("_proxy_for", lambda host: None)):
+            patch = mock.patch.object(anthropic_proxy, name, fake)
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def tearDown(self):
         self.api.shutdown()
@@ -300,6 +301,34 @@ class PinnedTurnTests(LaneHarness):
         self.assertEqual(reserved, 0)
         self.assertGreaterEqual(spent, est)
         self.assertAlmostEqual(spent, est, places=5)
+
+    def test_a_turn_whose_lookup_outlasts_its_cap_is_never_sent_and_settles_zero(self):
+        # #114 review round 2, finding 1, end to end: the DNS lookup is held past the turn's cap and released after.
+        # The late worker can no longer send (the gate shut at the cap), so the API never sees the request and the
+        # reservation is settled at zero, not kept in full.
+        release, returned = threading.Event(), threading.Event()
+        real = anthropic_proxy._resolve
+
+        def stalled(host, p):
+            release.wait(10)
+            try:
+                return real(host, p)
+            finally:
+                returned.set()
+        with mock.patch.object(anthropic_proxy, "turn_cap_s", return_value=0.3), \
+                mock.patch.object(anthropic_proxy, "_resolve", stalled):
+            code, msg = self.error_of(self.BODY)
+            release.set()
+            self.assertTrue(returned.wait(5))
+            for t in threading.enumerate():
+                if t.name == "cortados-api-open":
+                    t.join(5)
+        self.assertEqual(code, 504)
+        self.assertIn("not dispatched", msg)
+        time.sleep(0.2)
+        self.assertEqual(FakeAPI.seen, [])
+        spent, reserved = self.ledger_totals()
+        self.assertEqual((spent, reserved), (0, 0))
 
     def test_the_reservation_is_taken_for_the_turns_time_cap_and_the_proxy_gets_its_deadline(self):
         seen = {}
