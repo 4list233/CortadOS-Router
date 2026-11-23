@@ -710,7 +710,7 @@ class CrashRecovery(unittest.TestCase):
                                                 leader_start=lambda pid: starts.get(pid), alive=lambda pid: True,
                                                 discover=lambda root: discovery([root, 300]), log=lambda m: None)
             night.recover_pidfile(pidfile, alive=lambda p: True, ps=lambda p: "T",
-                                  signaller=lambda p, s: sent.append((p, s)), log=lambda m: None)
+                                  signaller=lambda p, s: sent.append((p, s)), log=lambda m: None, stopped_path=stopped)
             self.assertEqual(sorted(cont), [150, 200, 300])
             self.assertEqual(sent[-1], (100, signal.SIGCONT))   # the root last
             self.assertEqual(sorted(sent[:-1]), [(150, signal.SIGCONT), (200, signal.SIGCONT), (300, signal.SIGCONT)])
@@ -1576,6 +1576,99 @@ class UnresolvedContinuation(unittest.TestCase):
             g = guard(lambda: 4.8, stopped_path=stopped)
             g.load_unresolved()
             self.assertEqual(g.unresolved, {4242: START})
+
+
+class StartupRootRecovery(unittest.TestCase):
+    """#116 review round 3: recover_stopped_groups deleted the live root's stopped record and left it to recover_pidfile;
+    a failed or timed-out status lookup there then forgot a root that may still be SIGSTOPped, blocking every later cycle."""
+
+    def _paused_then_killed(self, d):
+        stopped, pidfile = d / night.STOPPED_GROUPS_NAME, d / "nightly.pid"
+        g = guard(lambda: 9.0, groups=lambda pg: discovery([pg, 200], starts={pg: "a", 200: "c"}),
+                  baseline=(4.8, 6.2), stopped_path=stopped, leader_start=lambda pid: {100: "a"}.get(pid))
+        g.tick(100)   # the supervisor pauses cycle 100 (and its trainer 200), then dies: no SIGCONT ever sent
+        self.assertTrue(g.paused)
+        pidfile.write_text("100\n")
+        return stopped, pidfile
+
+    def _recover(self, d, stopped, pidfile, ps, sent, alerts):
+        starts = {100: "a", 200: "c"}
+        night.recover_stopped_groups(stopped, None, pidfile, signaller=lambda p, s: sent.append((p, s)),
+                                     leader_start=lambda pid: starts.get(pid), alive=lambda pid: True,
+                                     discover=lambda root: discovery([root, 200]), log=lambda m: None,
+                                     alerter=lambda n, det: alerts.append(n))
+        night.recover_pidfile(pidfile, alive=lambda p: True, ps=ps, signaller=lambda p, s: sent.append((p, s)),
+                              log=lambda m: None, stopped_path=stopped, leader_start=lambda pid: starts.get(pid),
+                              alerter=lambda n, det: alerts.append(n))
+
+    def _assert_root_kept_and_retried(self, ps):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            stopped, pidfile = self._paused_then_killed(d)
+            sent, alerts = [], []
+            self._recover(d, stopped, pidfile, ps, sent, alerts)
+            self.assertEqual(sent, [(200, signal.SIGCONT)])   # the trainer continued; the root's state is unknown
+            self.assertEqual(night.read_stopped_groups(stopped)[0], [{"pgid": 100, "start": "a"}])
+            self.assertEqual(alerts, ["guard_recovery_incomplete"])
+            sig = []
+            g = guard(lambda: 4.8, sig=sig, stopped_path=stopped, leader_start=lambda pid: {100: "a"}.get(pid))
+            g.load_unresolved()
+            self.assertEqual(g.unresolved, {100: "a"})
+            g.retry_unresolved()   # the next guard reading continues the old root
+            self.assertEqual(sig, [(100, signal.SIGCONT)])
+            self.assertEqual(g.unresolved, {})
+            self.assertFalse(stopped.exists())
+
+    def test_a_timed_out_root_status_lookup_keeps_the_root_unresolved(self):
+        def ps(pid):
+            raise subprocess.TimeoutExpired("ps", 10)
+        self._assert_root_kept_and_retried(ps)
+
+    def test_a_failed_root_status_lookup_keeps_the_root_unresolved(self):
+        def ps(pid):
+            raise OSError(5, "Input/output error")
+        self._assert_root_kept_and_retried(ps)
+
+    def test_a_root_with_no_record_is_recorded_when_its_status_cannot_be_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            stopped, pidfile = d / night.STOPPED_GROUPS_NAME, d / "nightly.pid"
+            pidfile.write_text("100\n")
+            alerts = []
+            def ps(pid):
+                raise subprocess.TimeoutExpired("ps", 10)
+            self._recover(d, stopped, pidfile, ps, [], alerts)
+            self.assertEqual(night.read_stopped_groups(stopped)[0], [{"pgid": 100, "start": "a"}])
+            self.assertEqual(alerts, ["guard_recovery_incomplete"])
+
+    def test_the_root_record_is_dropped_once_continued_running_or_gone(self):
+        for ps, alive in (("T", True), ("S", True), ("T", False)):
+            with self.subTest(ps=ps, alive=alive), tempfile.TemporaryDirectory() as tmp:
+                d = Path(tmp)
+                stopped, pidfile = self._paused_then_killed(d)
+                sent, alerts = [], []
+                starts = {100: "a", 200: "c"}
+                night.recover_stopped_groups(stopped, None, pidfile, signaller=lambda p, s: sent.append((p, s)),
+                                             leader_start=lambda pid: starts.get(pid), alive=lambda pid: alive,
+                                             discover=lambda root: discovery([root, 200]), log=lambda m: None,
+                                             alerter=lambda n, det: alerts.append(n))
+                self.assertEqual(alerts, [])   # the root's own record is recover_pidfile's, not an incomplete recovery
+                night.recover_pidfile(pidfile, alive=lambda p: alive, ps=lambda p: ps,
+                                      signaller=lambda p, s: sent.append((p, s)), log=lambda m: None,
+                                      stopped_path=stopped, alerter=lambda n, det: alerts.append(n))
+                self.assertFalse(stopped.exists())
+                self.assertEqual(alerts, [])
+
+    def test_the_root_record_survives_a_crash_between_the_two_recoveries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            stopped, pidfile = self._paused_then_killed(d)
+            starts = {100: "a", 200: "c"}
+            night.recover_stopped_groups(stopped, None, pidfile, signaller=lambda p, s: None,
+                                         leader_start=lambda pid: starts.get(pid), alive=lambda pid: True,
+                                         discover=lambda root: discovery([root, 200]), log=lambda m: None)
+            # recover_pidfile never ran (the supervisor died again): the root is still on record for the next start.
+            self.assertEqual(night.read_stopped_groups(stopped)[0], [{"pgid": 100, "start": "a"}])
 
 
 if __name__ == "__main__":

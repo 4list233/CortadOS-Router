@@ -1824,7 +1824,10 @@ def recover_pidfile(pidfile: Path, *, ps=None, signaller=None, alive=None, log=l
     """Continuous startup: a pidfile left by a supervisor that died mid-pause can name a live, SIGSTOPped nightly.sh, which
     makes every new cycle exit 'already running' forever. SIGCONT such a group; drop a pidfile whose process is gone.
     EPERM (#116 review round 2): drained when no live member is left; otherwise logged, alerted and the group added to
-    stopped_path as unresolved, so the guard (load_unresolved) retries it at every reading. Never a crash."""
+    stopped_path as unresolved, so the guard (load_unresolved) retries it at every reading. Never a crash.
+    #116 review round 3: recover_stopped_groups leaves the root's own record in stopped_path for this function, which drops
+    it only once the root is confirmed continued, running or gone. A status it cannot read (ps failed or timed out) keeps
+    the root as unresolved (recorded if it was not), logged and alerted, so it is never forgotten while it may be stopped."""
     signaller = signaller or signal_group
     live_members = live_members or _live_group_members
     def _alive(pid):
@@ -1851,14 +1854,23 @@ def recover_pidfile(pidfile: Path, *, ps=None, signaller=None, alive=None, log=l
         log(f"overnight: {pidfile} holds {raw!r}, not a pid; removing it")
         pidfile.unlink(missing_ok=True)
         return
+    def _resolved():
+        if stopped_path is not None:
+            _drop_recorded(stopped_path, pid, log)
     if not alive(pid):
         log(f"overnight: stale pidfile {pidfile} (pid {pid} is gone); removing it")
         pidfile.unlink(missing_ok=True)
+        _resolved()
         return
     try:
         stat = ps(pid)
     except (OSError, subprocess.SubprocessError) as e:
-        log(f"overnight: ps for pid {pid} failed ({e}); cannot tell whether it is stopped")
+        log(f"overnight: !!! ps for pid {pid} failed ({type(e).__name__}); cannot tell whether it is stopped; kept as "
+            "unresolved, retried at every guard reading")
+        if alerter is not None:
+            alerter("guard_recovery_incomplete", "the previous cycle's root status could not be read at startup")
+        if stopped_path is not None:
+            _add_unresolved(stopped_path, pid, leader_start or proc_start, log)
         return
     if stat.startswith("T"):
         try:
@@ -1881,6 +1893,23 @@ def recover_pidfile(pidfile: Path, *, ps=None, signaller=None, alive=None, log=l
         log(f"overnight: pid {pid} from {pidfile} was left stopped (state {stat}); sent SIGCONT to its group so it can finish")
     else:
         log(f"overnight: pid {pid} from {pidfile} is running (state {stat}); nightly.sh will refuse a second run until it ends")
+    _resolved()
+
+
+def _drop_recorded(stopped_path: Path, pgid: int, log) -> None:
+    """Remove group `pgid` from the stopped-groups record once it is confirmed continued, running or gone (the file is
+    removed when nothing else is left in it). An unreadable record is left as it is."""
+    recs, ok = read_stopped_groups(stopped_path)
+    if not ok or not any(r["pgid"] == pgid for r in recs):
+        return
+    rest = [r for r in recs if r["pgid"] != pgid]
+    try:
+        if rest:
+            _write_json_durable(stopped_path, {"version": 1, "groups": rest})
+        else:
+            stopped_path.unlink(missing_ok=True)
+    except OSError as e:
+        log(f"overnight: cannot update {stopped_path.name} ({type(e).__name__}); the guard retries group {pgid} harmlessly")
 
 
 def _add_unresolved(stopped_path: Path, pgid: int, leader_start, log) -> None:
@@ -1910,7 +1939,9 @@ def recover_stopped_groups(stopped_path: Path, trainer_file: Path | None, pidfil
     #116 review round 2: a group not confirmed continued (its identity undecidable, or EPERM from a live member) is NOT
     forgotten: stopped_path is rewritten with exactly those groups (removed when there are none), the recovery is logged
     and alerted as incomplete, and the new guard retries them at every reading (Guard.load_unresolved). A group found to
-    be another process's now is dropped unsignalled."""
+    be another process's now is dropped unsignalled.
+    #116 review round 3: the live root's own record is kept in stopped_path (not counted as incomplete here):
+    recover_pidfile, which runs next, drops it only once the root is confirmed continued, running or gone."""
     signaller = signaller or signal_group
     discover = discover or discover_groups
     leader_start = leader_start or proc_start
@@ -1934,6 +1965,7 @@ def recover_stopped_groups(stopped_path: Path, trainer_file: Path | None, pidfil
     targets: list[int] = []
     starts: dict[int, str | None] = {}
     kept: list[dict] = []
+    root_kept: list[dict] = []
     recs, ok = read_stopped_groups(stopped_path)
     if not ok:
         log(f"overnight: {stopped_path.name} is unreadable; continuing every group that can still be found")
@@ -1945,6 +1977,9 @@ def recover_stopped_groups(stopped_path: Path, trainer_file: Path | None, pidfil
             recs.append(tr)
     for rec in recs:
         g = rec["pgid"]
+        if g == root and safe_group(g) and not root_kept:
+            root_kept.append({"pgid": g, "start": rec["start"]})   # recover_pidfile's to resolve
+            continue
         if not safe_group(g) or g == root or g in targets:
             continue
         if any(k["pgid"] == g for k in kept):
@@ -1987,12 +2022,12 @@ def recover_stopped_groups(stopped_path: Path, trainer_file: Path | None, pidfil
     if done:
         log(f"overnight: continued {len(done)} process group(s) a previous supervisor may have left stopped")
     try:
-        if kept:
-            _write_json_durable(stopped_path, {"version": 1, "groups": kept})
+        if kept or root_kept:
+            _write_json_durable(stopped_path, {"version": 1, "groups": kept + root_kept})
         else:
             stopped_path.unlink(missing_ok=True)
     except OSError as e:
-        log(f"overnight: cannot {'record' if kept else 'remove'} {stopped_path.name} ({type(e).__name__})")
+        log(f"overnight: cannot {'record' if kept or root_kept else 'remove'} {stopped_path.name} ({type(e).__name__})")
     if kept or not ok:
         detail = (f"{len(kept)} process group(s) a previous supervisor stopped are not confirmed continued; retried at "
                   "every guard reading" if kept else f"{stopped_path.name} was unreadable; only the live tree was continued")
