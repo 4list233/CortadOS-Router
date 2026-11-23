@@ -112,6 +112,22 @@ CLOSED_RECORD_TTL_S = 3600.0
 # Kept for the tool-wait limit (recover_ttl_s(): effective_tool_wait(IDLE_S, TOOL_WAIT_S), 3 h by default), the
 # longest a client is ever promised to be waited for; bounded by count, the oldest goes first.
 RECOVERABLE_MAX = 128
+# Cap pressure (#132 item 6, review round 1): when opening one more conversation would exceed MAX_SESSIONS, the
+# registry retires the longest-idle conversations that could be recovered (ReapedConversation.eligible), have no turn
+# running and do not wait on a tool result, into the same recovery records the idle reaper writes, until there is
+# room (Registry._retire_for_room_locked). One idle less than this is never retired: a client between two turns of an
+# active conversation is not made to pay a rebuild.
+PRESSURE_MIN_IDLE_S = 120.0
+# The longest a conversation's x-cortados-run-id earns it the tool-wait idle limit, counted from its first request
+# carrying that id: a child task's own maximum run time (child_tasks.CHILD_MAX_S_DEFAULT, CORTADOS_CHILD_MAX_S). A run
+# this host's log never records ending (a task on another host, or any syntactically valid header) cannot hold a
+# conversation past it; after it the conversation is reaped at the normal IDLE_S.
+try:
+    CHILD_RUN_MAX_S = float(int(getenv("CORTADOS_CHILD_MAX_S") or 3 * 3600))
+    if CHILD_RUN_MAX_S <= 0:
+        raise ValueError
+except ValueError:
+    CHILD_RUN_MAX_S = 3 * 3600.0
 
 
 def recover_ttl_s() -> float:
@@ -1003,11 +1019,54 @@ class Registry:
             self.office.turn_end(key, tags, **kw)
 
     def reserve_opening(self) -> None:
-        """Reserve conversation capacity before routing can reserve any quota."""
-        with self._lock:
-            if len(self.sessions) + self._opening >= MAX_SESSIONS:
-                raise UnservedProvider("held conversation capacity reached; retry after idle conversations expire")
-            self._opening += 1
+        """Reserve conversation capacity before routing can reserve any quota. At the cap, the longest-idle recoverable
+        conversations are retired to make room (_retire_for_room_locked); only when none can be is it a 503."""
+        retired: list = []
+        try:
+            with self._lock:
+                if len(self.sessions) + self._opening >= MAX_SESSIONS:
+                    retired = self._retire_for_room_locked(time.time())
+                if len(self.sessions) + self._opening >= MAX_SESSIONS:
+                    raise UnservedProvider("held conversation capacity reached; retry after idle conversations expire")
+                self._opening += 1
+        finally:
+            self._finish_retired(retired)
+
+    def _retire_for_room_locked(self, now: float) -> list:
+        """Under self._lock, at the cap: retire conversations, longest idle first, until one more fits. A candidate is
+        recoverable (ReapedConversation.eligible: its client can come back and get it rebuilt), idle at least
+        PRESSURE_MIN_IDLE_S, not waiting on a tool result, and its turn lock is free (taken here without blocking, so
+        no turn is in flight and none can start: a continuation that loses the race finds the recovery record).
+        Returns the retired sessions with their turn locks still held, for _finish_retired outside the lock."""
+        cands = sorted((s for s in self.sessions.values()
+                        if ReapedConversation.eligible(s) and not getattr(s, "awaiting_tool_result", False)
+                        and now - getattr(s, "last_used", now) >= PRESSURE_MIN_IDLE_S),
+                       key=lambda s: getattr(s, "last_used", now))
+        retired = []
+        for s in cands:
+            if len(self.sessions) + self._opening < MAX_SESSIONS:
+                break
+            lock = getattr(s, "lock", None)
+            if lock is None or not lock.acquire(blocking=False):
+                continue                                # a turn is running on it
+            if getattr(s, "awaiting_tool_result", False) or not self._retire_locked(s, now):
+                lock.release()                          # changed while its lock was free; leave it
+                continue
+            retired.append(s)
+        return retired
+
+    def _finish_retired(self, retired: list) -> None:
+        """Outside self._lock: tear down conversations _retire_locked removed (their turn locks held), then release."""
+        for s in retired:
+            try:
+                compaction_prune.shadow_decide_async(str(s.id))   # background thread; no-op unless the store is on
+                logger.warning("closing idle conversation %s under capacity pressure (cap %d; idle %ds; recoverable)",
+                               str(s.id)[:8], MAX_SESSIONS, int(time.time() - getattr(s, "last_used", time.time())))
+                s.close()                               # teardown must not hold the registry lock
+            except Exception as exc:
+                logger.warning("closing a retired conversation failed: %s", type(exc).__name__)
+            finally:
+                s.lock.release()
 
     def release_opening(self) -> None:
         with self._lock:
@@ -1403,6 +1462,9 @@ class Registry:
             new.route_logged = getattr(old, "route_logged", False)    # the route already ran and was recorded
             if getattr(old, "min_left_pct", None) is not None:
                 new.min_left_pct = old.min_left_pct                   # the tightest client floor carries over
+            if getattr(old, "run_id", None):
+                # the same run's clock (CHILD_RUN_MAX_S): a rebuild or a recovery never restarts it
+                new.run_id, new.run_since = old.run_id, getattr(old, "run_since", None)
             with self._lock:
                 budget.pending -= 1
                 budget.used += 1
@@ -1675,23 +1737,18 @@ class Registry:
                             logger.warning("reap: child-task log unreadable (%s); runs count as running",
                                            type(exc).__name__)
                             ended = set()
-                    child = run_id not in ended
+                    # A run the log does not show ended keeps the long limit only within a child's own maximum run
+                    # time since this conversation's first request of it (review round 1: a finished remote task, or
+                    # any valid header, must not hold a conversation for hours).
+                    since = getattr(s, "run_since", None)
+                    child = (run_id not in ended and since is not None
+                             and time.time() - since < CHILD_RUN_MAX_S)
                 ttl = effective_tool_wait(idle_s, TOOL_WAIT_S) if (awaiting or child) else idle_s
                 # Replay refresh and the final stale check/removal share the registry lock.
                 with self._lock:
                     now = time.time()
-                    expired = self.sessions.get(s.id) is s and now - s.last_used > ttl
-                    if expired:
-                        del self.sessions[s.id]
-                        hist = getattr(s, "history", None)
-                        if hist:
-                            self.closed.append((now, "reaped", hist[0], len(hist)))
-                        self._note_ended_locked(s, "reaped")
-                        if ReapedConversation.eligible(s):
-                            self.recoverable.pop(str(s.id), None)
-                            self.recoverable[str(s.id)] = ReapedConversation(s, now)
-                            while len(self.recoverable) > RECOVERABLE_MAX:
-                                self.recoverable.popitem(last=False)
+                    expired = (self.sessions.get(s.id) is s and now - s.last_used > ttl
+                               and self._retire_locked(s, now))
                 if expired:
                     compaction_prune.shadow_decide_async(str(s.id))   # background thread; no-op unless the store is on
                 if expired:
@@ -1700,6 +1757,24 @@ class Registry:
                     s.close()  # teardown must not hold the registry lock
             finally:
                 s.lock.release()
+
+    def _retire_locked(self, s, now: float) -> bool:
+        """Under self._lock, with s's turn lock held: take an idle conversation out of the registry and keep its
+        recovery record (ReapedConversation, bounded by RECOVERABLE_MAX, oldest first). The caller closes the backend
+        outside the lock. False when s is no longer the registered session of its id (nothing done)."""
+        if self.sessions.get(s.id) is not s:
+            return False
+        del self.sessions[s.id]
+        hist = getattr(s, "history", None)
+        if hist:
+            self.closed.append((now, "reaped", hist[0], len(hist)))
+        self._note_ended_locked(s, "reaped")
+        if ReapedConversation.eligible(s):
+            self.recoverable.pop(str(s.id), None)
+            self.recoverable[str(s.id)] = ReapedConversation(s, now)
+            while len(self.recoverable) > RECOVERABLE_MAX:
+                self.recoverable.popitem(last=False)
+        return True
 
     def _prune_recoverable_locked(self, now: float) -> None:
         """Under self._lock: drop reaped-conversation records older than recover_ttl_s() (oldest first)."""
@@ -1765,7 +1840,7 @@ class ReapedConversation:
     `id` is the closed session's id, so log lines can name it."""
 
     __slots__ = ("id", "scope", "wire_path", "client", "route", "codex_login", "anchor", "length", "rebuild_budget",
-                 "route_logged", "min_left_pct", "was_local", "run_id", "closed_at")
+                 "route_logged", "min_left_pct", "was_local", "run_id", "run_since", "closed_at")
 
     def __init__(self, s, closed_at: float):
         self.id = str(s.id)
@@ -1779,6 +1854,7 @@ class ReapedConversation:
         self.min_left_pct = getattr(s, "min_left_pct", None)
         self.was_local = isinstance(s, LocalSession)
         self.run_id = getattr(s, "run_id", None)
+        self.run_since = getattr(s, "run_since", None)
         self.closed_at = closed_at
 
     @staticmethod
@@ -3549,8 +3625,8 @@ class Handler(BaseHTTPRequestHandler):
             # The run (x-cortados-run-id, validated in do_POST) this conversation serves: a running child task's
             # conversation gets the tool-wait idle limit (Registry.reap, #132 item 6 (b)). Bookkeeping only.
             run_id, valid = self._run_id()
-            if run_id and valid and not one_shot:
-                session.run_id = run_id
+            if run_id and valid and not one_shot and getattr(session, "run_id", None) != run_id:
+                session.run_id, session.run_since = run_id, time.time()   # bounded by CHILD_RUN_MAX_S from here
         except Exception:
             logger.debug("run id not kept on the conversation", exc_info=True)
         msg_id = wire.new_message_id()

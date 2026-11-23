@@ -31,7 +31,9 @@ its own tools; the chosen model only thinks.
 - A conversation whose requests carry the `x-cortados-run-id` of a child task that has not ended (no `finished` /
   `cancelled` event in this host's `child-tasks.jsonl`; a run logged elsewhere counts as running) is reaped only after
   the effective tool window, not `IDLE_S` (#132 item 6 (b)): its child may sit out a long background job between turns.
-  A child's own maximum run time (3 h by default) bounds what this holds.
+  The long limit lasts at most a child's own maximum run time (`CORTADOS_CHILD_MAX_S`, 3 h by default) from the
+  conversation's first request carrying that run id (kept across rebuilds and recoveries); after it, a run this host's
+  log never showed ending (a task finished on another host, or any valid header) is reaped at `IDLE_S` like any other.
 - Recovery after an idle reap (#132 item 6 (a)): the reaper keeps a metadata-only record of each conversation it
   closes (`ReapedConversation`: scope digest, wire, client name, route, the last reply's fingerprint and the history
   length, the lineage's rebuild budget; never text) for the effective tool window, at most `RECOVERABLE_MAX` (128,
@@ -45,7 +47,12 @@ its own tools; the chosen model only thinks.
   backend this endpoint no longer serves is a 503); there is no mid-conversation re-route (SEAM #43). Log line:
   `conversation <old> recovered as <new> after its idle reap <n>s ago (rebuild n of 5; ...)`.
 - `CORTADOS_PROVIDER_MAX_SESSIONS` (128): bound held conversations/processes and their replay memory (at most
-  1 MiB of replay per session). New held conversations receive 503 at capacity; existing tool waits are not evicted.
+  1 MiB of replay per session). Capacity pressure (#132 item 6, review round 1): when one more conversation (a new
+  one, a branch or a recovery) would exceed the cap, the longest-idle conversations that are recoverable (an identity,
+  a wire, a reply), idle at least `PRESSURE_MIN_IDLE_S` (120 s), not waiting on a tool result and with no turn running
+  are retired into the same recovery records the idle reaper writes, oldest first, until it fits; their clients'
+  returns are rebuilt as above. Only when none qualifies is it a 503. Tool waits, running turns and identity-less
+  conversations are never evicted. Log line: `closing idle conversation <id> under capacity pressure (...)`.
 - `CORTADOS_PROVIDER_TURN_TIMEOUT_S` (1800 s): bounds one backend model turn, not execution of client tools.
   Streaming turns already send Anthropic `ping` SSE events every 10 s. Non-streaming clients must allow the whole
   backend turn in their own read timeout. Socket reads/writes are bounded at 120 s to release stalled connections.
