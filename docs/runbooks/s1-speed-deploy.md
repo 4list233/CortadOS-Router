@@ -41,10 +41,13 @@ One JSON line. Go on only with exit 0, which means all of:
   the prefix (`max_prob_diff` 0), i.e. the stored state and its per-request copy change nothing;
 - `full_pass_*` (reported, not gated): the cached path against one full prefill pass, the path the scorer serves with
   the cache off. These differ: on the 4-bit/bf16 model, splitting the prefill at ANY point (256, 284, 512, 568, 569),
-  with no cache involved, moves the first answer's logits by one bf16 step (0.125) and flips answers that sit on a
-  near-tie (2026-11-23: e.g. urgency 0.4994 / 0.4994 full vs 0.3772 / 0.6219 split). That is the 2026-11-22 failure
-  (28/200 requests, `max_prob_diff` 0.535); its size is the scorer's sensitivity to bf16 rounding, which the owner
-  weighs before enabling the cache;
+  with no cache involved, moves the first answer's logits by one bf16 step (0.125), and the difference grows over the
+  twelve answers. That is the 2026-11-22 failure (28/200 requests, `max_prob_diff` 0.535). Measured 2026-11-23 on the
+  same 200 synthetic requests, with no cache: split at 256 vs full 29 requests, split at 300 vs full 32, split at 256
+  vs split at 300 31; cached vs split at the prefix 0 (`max_prob_diff` 0.0). The flipped answers are mostly close
+  calls (e.g. urgency 0.4994 / 0.4994 full vs 0.3772 / 0.6219 split; median top-two margin 0.16) but not all (up to
+  0.67). So about 15 % of requests change an answer under any bf16 rounding change: a property of the scorer, which
+  the cache neither causes nor worsens and which the owner weighs before enabling it;
 - `prefix_reused_tokens` > 0 (the cache was actually used).
 
 Exit 1: do not deploy; paste the JSON into #132. Exit 2: it could not run (no MLX, `current.json` unreadable).
