@@ -589,3 +589,118 @@ test('deploy-air.sh: root checks, daemon state and links go through the tri-stat
   assert.match(lib, /holders="\$\(uid_holders "\$uid"\)" \|\| die /);
   assert.match(lib, /state="\$\(account_state "\$name"\)" \|\| die /);
 });
+
+// ---- fix round 3 -------------------------------------------------------------------------------
+async function fakeBins(t, scripts) {
+  const dir = await mkdtemp(join(tmpdir(), 'office-bin-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  for (const [name, script] of Object.entries(scripts)) {
+    await writeFile(join(dir, name), script); await chmod(join(dir, name), 0o755);
+  }
+  return dir;
+}
+const SUDO_OK = '#!/bin/bash\nexec "$@"\n';
+const SUDO_REFUSED = '#!/bin/bash\necho "sudo: a password is required" >&2\nexit 1\n';
+// a fake lsof answering as the real one does (captured on macOS 26, lsof 4.91): exit 0 with -Fn
+// field lines, exit 1 with no output when nothing listens
+const lsof = (code, out) => `#!/bin/bash\nprintf '%b' ${JSON.stringify(out)}\nexit ${code}\n`;
+const LOOPBACK = 'p501\nf3\nn127.0.0.1:18789\np502\nf21\nn127.0.0.1:3000\nf22\nn[::1]:3000\n';
+
+test('listeners_loopback_only: loopback only from a successful lsof seeing both ports; anything else fails (r3 finding 1)', async t => {
+  const call = async (sudo, lsofScript) =>
+    libCall(await fakeBins(t, { sudo, lsof: lsofScript }), 'listeners_loopback_only', '18789', '3000');
+  assert.equal((await call(SUDO_OK, lsof(0, LOOPBACK))).code, 0);
+  // the review's reproduction: a refused sudo was "no non-loopback listener"
+  let r = await call(SUDO_REFUSED, lsof(0, LOOPBACK));
+  assert.equal(r.code, 1); assert.match(r.out, /cannot list the listeners/);
+  r = await call(SUDO_OK, lsof(1, ''));                                   // nothing listens: lsof's exit 1
+  assert.equal(r.code, 1); assert.match(r.out, /cannot list the listeners/);
+  r = await call(SUDO_OK, lsof(0, ''));
+  assert.equal(r.code, 1); assert.match(r.out, /no listener/);
+  r = await call(SUDO_OK, lsof(0, 'p501\nf3\nn*:18789\np502\nf21\nn127.0.0.1:3000\n'));   // wildcard
+  assert.equal(r.code, 1); assert.match(r.out, /not loopback-only \(\*\)/);
+  r = await call(SUDO_OK, lsof(0, 'p501\nf3\nn100.64.0.7:3000\np502\nf21\nn127.0.0.1:18789\n'));
+  assert.equal(r.code, 1); assert.match(r.out, /not loopback-only/);
+  r = await call(SUDO_OK, lsof(0, 'p502\nf21\nn127.0.0.1:3000\n'));        // the bridge's port unseen
+  assert.equal(r.code, 1); assert.match(r.out, /no listener seen on port 18789/);
+  // the columnar form the old check parsed, or any other shape, is not an answer
+  r = await call(SUDO_OK, lsof(0, 'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nnode 501 x 3u IPv4 0x1 0t0 TCP 127.0.0.1:3000 (LISTEN)\n'));
+  assert.equal(r.code, 1); assert.match(r.out, /answered unexpectedly/);
+  r = await call(SUDO_OK, lsof(0, LOOPBACK + 'n127.0.0.1:9999\n'));
+  assert.equal(r.code, 1); assert.match(r.out, /unexpected port/);
+  r = await call(SUDO_OK, lsof(2, LOOPBACK));                              // an lsof error, output or not
+  assert.equal(r.code, 1);
+});
+
+// office_healthy, cut from deploy-air.sh as written and run with fakes: every other check passes, so
+// the outcome is the listener check's alone
+async function officeHealthy(t, sudo, lsofScript) {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  const m = text.match(/^http_code\(\) \{.*\n^office_healthy\(\) \{[\s\S]*?\n\}\n/m);
+  assert.ok(m, 'office_healthy found');
+  const bin = await fakeBins(t, {
+    sudo, lsof: lsofScript,
+    launchctl: '#!/bin/bash\necho "system/x = {"\necho "\tstate = running"\necho "}"\n',
+    curl: '#!/bin/bash\nfor a; do u="$a"; done\ncase "$u" in *:18789/) printf 426 ;; *:3000/) printf 401 ;; */cortados-login) printf 200 ;; esac\n',
+  });
+  const r = spawnSync('bash', ['-c', `set -euo pipefail; . "$LIB"; BRIDGE_LABEL=b STUDIO_LABEL=s BRIDGE_PORT=18789 STUDIO_PORT=3000
+${m[0]}
+rc=0; why="$(office_healthy)" || rc=$?; echo "rc=$rc $why"`],
+  { env: { PATH: `${bin}:/usr/bin:/bin`, LIB }, encoding: 'utf8' });
+  return r.stdout.trim();
+}
+test('deploy-air.sh office_healthy: a refused sudo lsof fails the health check (rollback), never passes it (r3 finding 1)', async t => {
+  assert.equal(await officeHealthy(t, SUDO_OK, lsof(0, LOOPBACK)), 'rc=0');
+  assert.match(await officeHealthy(t, SUDO_REFUSED, lsof(0, LOOPBACK)), /^rc=1 cannot list the listeners/);
+  assert.match(await officeHealthy(t, SUDO_OK, lsof(1, '')), /^rc=1 /);
+  assert.match(await officeHealthy(t, SUDO_OK, lsof(0, 'p1\nf3\nn*:3000\np2\nf3\nn127.0.0.1:18789\n')), /^rc=1 a listener on port 3000 is not loopback-only/);
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  assert.ok(!/sudo lsof/.test(text), 'lsof runs only in deploy-lib.sh (listeners_loopback_only)');
+  assert.ok(!/\| *grep -q/.test(text), 'no `| grep -q` under pipefail (SIGPIPE reads as failure)');
+});
+
+test('link_target: empty only on confirmed absence; a failed or impossible read is an error (r3 finding 2)', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'office-links-'));
+  t.after(async () => { await chmod(join(dir, 'locked'), 0o755).catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+  const { symlink } = await import('node:fs/promises');
+  await mkdir(join(dir, 'builds', 'old'), { recursive: true });
+  await symlink(join(dir, 'builds', 'old'), join(dir, 'current'));
+  await symlink(join(dir, 'nowhere'), join(dir, 'dangling'));
+  await writeFile(join(dir, 'plain'), 'x');
+  await mkdir(join(dir, 'locked')); await symlink(join(dir, 'builds', 'old'), join(dir, 'locked', 'current'));
+  await chmod(join(dir, 'locked'), 0o000);
+  const none = await fakeBins(t, {});
+  const lt = (p, bin = none) => libCall(bin, 'link_target', p);
+  assert.deepEqual(lt(join(dir, 'current')), { code: 0, out: join(dir, 'builds', 'old') });
+  assert.deepEqual(lt(join(dir, 'dangling')), { code: 0, out: join(dir, 'nowhere') });
+  assert.deepEqual(lt(join(dir, 'absent')), { code: 0, out: '' });                       // fresh install
+  assert.deepEqual(lt(join(dir, 'no', 'such', 'current')), { code: 0, out: '' });        // nor its directory
+  assert.equal(lt(join(dir, 'plain')).code, 1);                                          // not a link
+  assert.equal(lt(join(dir, 'builds')).code, 1);
+  assert.equal(lt(join(dir, 'locked', 'current')).code, 1);                              // unsearchable: not "absent"
+  const broken = await fakeBins(t, { readlink: '#!/bin/bash\necho "readlink: I/O error" >&2\nexit 1\n' });
+  assert.equal(lt(join(dir, 'current'), broken).code, 1);                                // readlink failed
+  const empty = await fakeBins(t, { readlink: '#!/bin/bash\nexit 0\n' });
+  assert.equal(lt(join(dir, 'current'), empty).code, 1);
+});
+
+test('deploy-air.sh: the prune\'s rollback targets and every planning read fail closed (r3 finding 2 + sweep)', async () => {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  assert.ok(!/readlink[^\n]*\|\| true/.test(text), 'no readlink failure read as "no link"');
+  assert.match(text, /CURRENT_BUILD="\$\(link_target "\$ROOT\/claw3d\/current"\)" \\\n  \|\| die /);
+  assert.match(text, /PREVIOUS_ADAPTER="\$\(link_target "\$ROOT\/adapter"\)" \\\n  \|\| die /);
+  assert.match(text, /fs_readlink\(\) \{ link_target "\$1"; \}/);
+  // both are read before the first change (the order test above finds that line)
+  const lines = text.split('\n');
+  const first = lines.findIndex(l => /^step "1\. /.test(l));
+  assert.ok(lines.findIndex(l => /^CURRENT_BUILD=/.test(l)) < first && lines.findIndex(l => /^PREVIOUS_ADAPTER=/.test(l)) < first);
+  // the prune keeps exactly the new and those two
+  assert.match(text, /"\$b" != "\$BUILD" && "\$b" != "\$CURRENT_BUILD"/);
+  assert.match(text, /"\$a" != "\$ADAPTER_DIR" && "\$a" != "\$PREVIOUS_ADAPTER"/);
+  // a failed git status is not a clean checkout
+  assert.ok(!/\[\[ -z "\$\(git /.test(text));
+  assert.match(text, /DIRTY="\$\(git -C "\$REPO" status --porcelain -- integrations\/office-claw3d\)" \|\| die /);
+  // the remaining `|| true`s are the ones the sweep accepted (each feeds a positive match or is display-only)
+  const ors = lines.filter(l => /\|\| true/.test(l)).map(l => l.trim());
+  assert.equal(ors.length, 9, ors.join('\n'));
+});

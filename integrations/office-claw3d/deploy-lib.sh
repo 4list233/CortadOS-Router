@@ -138,6 +138,61 @@ launchd_state() {  # label
   return 2
 }
 
+# A link's target, for a decision that must not guess (the prune's rollback targets, the transaction's
+# undo). Prints the target when PATH is a readable link. Prints nothing (0) ONLY on confirmed absence:
+# neither PATH nor a dangling link is there AND the nearest existing directory above it is searchable
+# (in an unsearchable directory every entry reads as absent). Returns 1 when PATH exists but is not a
+# link, when readlink fails or answers nothing, or when the directory cannot be searched: a failed read
+# is never "absent".
+link_target() {  # path
+  local out d
+  if [[ -L "$1" ]]; then
+    out="$(readlink "$1")" || return 1
+    [[ -n "$out" ]] || return 1
+    printf '%s\n' "$out"; return 0
+  fi
+  [[ ! -e "$1" ]] || return 1
+  d="${1%/*}"
+  while [[ -n "$d" && ! -e "$d" && ! -L "$d" ]]; do d="${d%/*}"; done
+  [[ -n "$d" ]] || d=/
+  [[ -d "$d" && -x "$d" && ! -L "$d" ]] || return 1
+}
+
+# 0 only when `sudo lsof` answered and every TCP listener on the given ports is on 127.0.0.1 or
+# [::1], with at least one on each port (it runs after both answered over loopback, so "none found"
+# means lsof did not see them). Field output captured on macOS 26 (lsof 4.91, run as the owner on its
+# own sockets): exit 0 with lines "p<PID>", "f<FD>", "n<ADDR>:<PORT>" (n127.0.0.1:P, n[::1]:P, n*:P
+# for a wildcard); exit 1 with no output when nothing listens. A refused sudo, any other exit, an
+# empty answer, a line of another shape or a port not asked for fails: an unread listener table is
+# never "loopback only". Prints the reason on failure.
+listeners_loopback_only() {  # port...
+  local out p args=()
+  for p in "$@"; do args+=("-iTCP:$p"); done
+  out="$(sudo lsof -nP "${args[@]}" -sTCP:LISTEN -Fn 2>/dev/null)" \
+    || { echo "cannot list the listeners on $* (sudo lsof failed or found none)"; return 1; }
+  printf '%s\n' "$out" | python3 -I -c '
+import re, sys
+ports, seen = set(sys.argv[1:]), set()
+lines = sys.stdin.read().splitlines()
+if not lines or not any(l.strip() for l in lines):
+    print("lsof listed no listener"); sys.exit(1)
+for l in lines:
+    if re.fullmatch(r"p[0-9]+|f[0-9]+", l):
+        continue
+    m = re.fullmatch(r"n(.+):([0-9]+)", l)
+    if not m:
+        print("lsof answered unexpectedly: %r" % l[:80]); sys.exit(1)
+    host, port = m.groups()
+    if port not in ports:
+        print("lsof listed an unexpected port: %r" % l[:80]); sys.exit(1)
+    if host not in ("127.0.0.1", "[::1]"):
+        print("a listener on port %s is not loopback-only (%s)" % (port, host)); sys.exit(1)
+    seen.add(port)
+missing = sorted(ports - seen)
+if missing:
+    print("no listener seen on port %s" % ", ".join(missing)); sys.exit(1)' "$@"
+}
+
 serve_port_state() {  # port target < `tailscale serve status --json`: free | ours | funnel | other
   python3 -I -c '
 import json, sys

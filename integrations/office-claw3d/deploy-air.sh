@@ -142,7 +142,8 @@ if [[ $MODE != install ]]; then
   if [[ $APPLY -eq 1 ]]; then
     after="$(serve_state "$TS" "$TAILNET_PORT" "http://127.0.0.1:$STUDIO_PORT")" || after="unreadable"
     if [[ "$after" != ours ]]; then
-      "$TS" serve --https="$TAILNET_PORT" off || true
+      "$TS" serve --https="$TAILNET_PORT" off \
+        || die "after serve, port $TAILNET_PORT is '$after', not a tailnet-only proxy to Studio, AND taking it down failed: run --unpublish-tailnet / tailscale serve status now"
       die "after serve, port $TAILNET_PORT is '$after', not a tailnet-only proxy to Studio: taken down again"
     fi
     name="$("$TS" status --json | python3 -I -c 'import json,sys; print((json.load(sys.stdin).get("Self") or {}).get("DNSName","").rstrip("."))')"
@@ -157,8 +158,9 @@ fi
 [[ -f "$HERE/claw3d/avatar-profile-hint.patch" && -f "$HERE/claw3d/studio-login.patch" && -f "$HERE/bridge.mjs" ]] \
   || die "run from a CortadOS-Router checkout"
 xcode-select -p >/dev/null 2>&1 || die "git needs the Xcode command line tools (xcode-select --install)"
-[[ -z "$(git -C "$REPO" status --porcelain -- integrations/office-claw3d)" ]] \
-  || die "integrations/office-claw3d has uncommitted changes: the install is pinned to a commit"
+# captured first: a failed `git status` prints nothing, which must not read as "clean"
+DIRTY="$(git -C "$REPO" status --porcelain -- integrations/office-claw3d)" || die "git status failed: cannot confirm a clean checkout"
+[[ -z "$DIRTY" ]] || die "integrations/office-claw3d has uncommitted changes: the install is pinned to a commit"
 SRC_SHA="$(git -C "$REPO" rev-parse HEAD)"
 BUILD_ID="${CLAW3D_COMMIT:0:12}-${SRC_SHA:0:12}"   # the patches come from this checkout
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$PROVIDER_OFFICE_URL" || true)"
@@ -171,6 +173,9 @@ link_into() {  # path dir: path is absent, or a symlink to an entry of dir
   case "$(readlink "$1")" in "$2"/*) ;; *) die "$1 points outside $2" ;; esac
 }
 UPGRADE=0
+# ROOT's absence (a fresh install) is read as the owner: only where its directory can be searched
+[[ -e "$ROOT" || -L "$ROOT" ]] || link_target "$ROOT" >/dev/null \
+  || die "cannot tell whether $ROOT exists (${ROOT%/*} cannot be searched)"
 if [[ -e "$ROOT" || -L "$ROOT" ]]; then
   UPGRADE=1
   [[ -d "$ROOT" && ! -L "$ROOT" ]] || die "$ROOT is not a plain directory"
@@ -229,8 +234,12 @@ fi
 # The staged adapter copy and Claw3D build for this commit, when an earlier run left them.
 ADAPTER_DIR="$ROOT/adapters/$SRC_SHA"
 BUILD="$ROOT/claw3d/builds/$BUILD_ID"
-CURRENT_BUILD="$(readlink "$ROOT/claw3d/current" 2>/dev/null || true)"     # kept by the prune as the rollback
-PREVIOUS_ADAPTER="$(readlink "$ROOT/adapter" 2>/dev/null || true)"
+# The prune (step 9) keeps these as the rollback. Empty ONLY when confirmed absent (link_target,
+# deploy-lib.sh): a read that failed aborts here, before any change, never "nothing to keep".
+CURRENT_BUILD="$(link_target "$ROOT/claw3d/current")" \
+  || die "cannot read $ROOT/claw3d/current (not a readable link, or its directory cannot be searched): the prune would not know the rollback build"
+PREVIOUS_ADAPTER="$(link_target "$ROOT/adapter")" \
+  || die "cannot read $ROOT/adapter (not a readable link, or its directory cannot be searched): the prune would not know the rollback adapter"
 if [[ -d "$ADAPTER_DIR" ]]; then
   for f in "${ADAPTER_FILES[@]}"; do cmp -s "$HERE/$f" "$ADAPTER_DIR/${f##*/}" || die "$ADAPTER_DIR differs from $SRC_SHA: investigate"; done
 fi
@@ -465,9 +474,7 @@ switch_link() {  # target link [user]: replace `link` atomically (rename over it
   run "${who[@]}" ln -sfn "$1" "$2.new" && run "${who[@]}" mv -fh "$2.new" "$2"
 }
 # The primitives tx_run (deploy-lib.sh) drives. Each returns a code, never exits.
-fs_readlink() {  # the link's target; nothing when absent; 1 when it is there but not a readable link
-  if [[ -L "$1" ]]; then readlink "$1"; elif [[ -e "$1" ]]; then return 1; fi
-}
+fs_readlink() { link_target "$1"; }  # the target; nothing only when confirmed absent; 1 when unreadable
 fs_exists() {  # 0 exists, 1 absent, 2 unknown (sudo or test failed): never exits inside the transaction
   case "$(root_test -e "$1" -o -L "$1")" in yes) return 0 ;; no) return 1 ;; *) return 2 ;; esac
 }
@@ -494,16 +501,17 @@ daemon_stop() {
 }
 http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$1" || true; }
 office_healthy() {  # prints why not, on failure
-  local l
+  local l out
   for l in "$BRIDGE_LABEL" "$STUDIO_LABEL"; do
-    launchctl print "system/$l" 2>/dev/null | grep -q 'state = running' || { echo "$l is not running"; return 1; }
+    # captured whole, then matched: piping into an early-exiting grep could SIGPIPE launchctl (pipefail: a false "down")
+    out="$(launchctl print "system/$l" 2>/dev/null)" && [[ "$out" == *"state = running"* ]] || { echo "$l is not running"; return 1; }
   done
   [[ "$(http_code "http://127.0.0.1:$BRIDGE_PORT/")" == 426 ]] || { echo "the bridge does not answer on 127.0.0.1:$BRIDGE_PORT"; return 1; }
   [[ "$(http_code "http://127.0.0.1:$STUDIO_PORT/")" == 401 ]] || { echo "Studio does not refuse a request without its access cookie"; return 1; }
   [[ "$(http_code "http://127.0.0.1:$STUDIO_PORT/cortados-login")" == 200 ]] || { echo "the login form does not answer"; return 1; }
-  if sudo lsof -nP -iTCP:$BRIDGE_PORT -iTCP:$STUDIO_PORT -sTCP:LISTEN | awk 'NR>1{print $9}' | grep -vqE '^(127\.0\.0\.1|\[::1\]):'; then
-    echo "a listener is not loopback-only"; return 1
-  fi
+  # 0 only on a successful lsof listing loopback listeners on both ports (deploy-lib.sh): a refused
+  # sudo or an unreadable answer fails the health check, so the transaction rolls back
+  listeners_loopback_only "$BRIDGE_PORT" "$STUDIO_PORT" || return 1
 }
 health_check() {  # up to ~60 s for both daemons to come up, then the same checks must hold 10 s later
   [[ $APPLY -eq 1 ]] || { echo "  (dry run) health check: both daemons running, bridge 426, Studio 401 on /, 200 on /cortados-login, loopback only"; return 0; }
