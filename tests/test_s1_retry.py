@@ -1,8 +1,10 @@
-"""decide_s1 retries once on a transient connection error before declaring the scorer degraded. The two live degraded
-causes seen in production were a connection refused (S1 not yet listening) and a RemoteDisconnected (S1 momentarily
-overloaded and dropping the connection); a single quick retry rides both out (Forest 2026-10-26)."""
+"""decide_s1 retries once only when S1 was not reached: connection refused (S1 not yet listening) or reset /
+RemoteDisconnected (closed before any reply, e.g. its connection cap). Since 2026-11-22 (owner-approved) a timeout or any
+HTTP reply, 503 busy included, degrades at once: a retry after a timeout queued a second copy behind the first, which S1
+still scored."""
 import http.client
 import json
+import socket
 import unittest
 import urllib.error
 
@@ -44,7 +46,7 @@ class S1RetryTests(unittest.TestCase):
         return core.decide_s1("do a thing"), calls["n"]
 
     def test_transient_then_success_is_not_degraded(self):
-        res, n = self._run([urllib.error.URLError("[Errno 61] Connection refused"), GOOD])
+        res, n = self._run([urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")), GOOD])  # urlopen wraps the OSError
         self.assertFalse(res["degraded"])
         self.assertEqual(n, 2)                                   # one retry was used
 
@@ -78,8 +80,8 @@ class S1RetryTests(unittest.TestCase):
         self.assertTrue(res["degraded"])
         self.assertEqual(calls["n"], 1)
 
-    def test_retryable_http_error_is_retried_once(self):
-        # a 503 is a transient server state: retry once, then degrade
+    def test_busy_503_degrades_at_once_without_a_retry(self):
+        # S1's busy answer (queue full, or it cannot finish before the deadline): degraded now, no second request
         calls = {"n": 0}
         def fake(req, timeout=None):
             calls["n"] += 1
@@ -87,7 +89,38 @@ class S1RetryTests(unittest.TestCase):
         core.urllib.request.urlopen = fake
         res = core.decide_s1("do a thing")
         self.assertTrue(res["degraded"])
-        self.assertEqual(calls["n"], 2)
+        self.assertIsNone(res["answers"])
+        self.assertTrue(res["error"].startswith("S1 busy"))
+        self.assertEqual(calls["n"], 1)
+
+    def test_no_http_status_is_retried(self):
+        for code in (429, 500, 502, 504):
+            res, n = self._run([urllib.error.HTTPError("http://s1/score", code, "x", {}, None), GOOD])
+            self.assertTrue(res["degraded"], code)
+            self.assertEqual(n, 1, code)
+
+    def test_no_retry_on_timeout(self):
+        # every shape a read or connect timeout takes through urlopen: the request may be queued and scored on S1
+        for exc in (socket.timeout("timed out"), TimeoutError("timed out"),
+                    urllib.error.URLError(socket.timeout("timed out")), urllib.error.URLError(TimeoutError())):
+            res, n = self._run([exc, GOOD])
+            self.assertTrue(res["degraded"], repr(exc))
+            self.assertEqual(n, 1, repr(exc))                    # no second request
+
+    def test_retry_on_refused_and_reset(self):
+        for exc in (ConnectionRefusedError(61, "Connection refused"), urllib.error.URLError(ConnectionRefusedError(61, "refused")),
+                    ConnectionResetError(54, "reset"), urllib.error.URLError(ConnectionResetError(54, "reset")),
+                    http.client.RemoteDisconnected("closed")):
+            res, n = self._run([exc, GOOD])
+            self.assertFalse(res["degraded"], repr(exc))
+            self.assertEqual(n, 2, repr(exc))                    # reached on the retry
+
+    def test_other_connection_errors_are_not_retried(self):
+        for exc in (urllib.error.URLError("[Errno 8] nodename nor servname provided"), OSError(64, "Host is down"),
+                    http.client.IncompleteRead(b"")):
+            res, n = self._run([exc, GOOD])
+            self.assertTrue(res["degraded"], repr(exc))
+            self.assertEqual(n, 1, repr(exc))
 
 
 if __name__ == "__main__":

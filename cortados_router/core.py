@@ -16,6 +16,7 @@ from cortados_router.compat import getenv as _env_get
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 import threading
@@ -165,12 +166,29 @@ def table() -> dict[str, Any]:
 from cortados_router.s1_endpoint import resolve_url as _resolve_s1_url
 S1_URL = _resolve_s1_url()   # explicit CORTADOS_S1_URL, else a named device from the endpoints file, else loopback
 S1_TIMEOUT_S = float(_env_get("CORTADOS_S1_TIMEOUT_S", "15"))
-S1_RETRIES = int(_env_get("CORTADOS_S1_RETRIES", "1"))   # one retry on a transient connection error before degrading (Forest 2026-10-26)
+S1_RETRIES = int(_env_get("CORTADOS_S1_RETRIES", "1"))   # retries when S1 was not reached at all (refused / reset); see _s1_unreached
 S1_RETRY_BACKOFF_S = float(_env_get("CORTADOS_S1_RETRY_BACKOFF_S", "0.3"))
-_S1_RETRYABLE_HTTP = frozenset({429, 500, 502, 503, 504})   # only these HTTP statuses are worth a retry; a 4xx (auth, body too large) is permanent
 S1_TOKEN = _env_get("CORTADOS_S1_TOKEN")   # sent as a bearer when the chosen scorer requires one (a non-loopback bind)
 FAIL_UP_BELOW = float(_env_get("CORTADOS_S1_FAIL_UP", "0.75"))   # Forest 2026-09-24: the right answer over cost   # a feature whose top probability is below this takes the HIGHER of its two most likely levels
 OUTWARD_AT = float(_env_get("CORTADOS_S1_OUTWARD_AT", "0.25"))   # the destructive question is called at a lower probability (Jev: stricter gate for destructive actions)
+
+
+def _s1_unreached(exc: BaseException) -> bool:
+    """True only when the request did not reach a serving S1: the connection was refused, or reset / closed before any
+    reply (http.client.RemoteDisconnected is a ConnectionResetError). Only that case is retried.
+
+    Changed 2026-11-22 (owner-approved) from the 2026-10-26 rule, which also retried timeouts and 429/5xx replies. On
+    the Studio that day S1 ran one serial worker at ~4.2 s per score; a timed-out request stayed in its queue and was
+    still scored while the retry queued a second copy behind it (259 first attempts timed out, 190 failed twice), so a
+    retry on a timeout doubled the load exactly when S1 was saturated. A timeout or any HTTP status (including 503
+    busy, S1's answer when it cannot finish before the deadline) now degrades at once; degraded never defaults to
+    Claude (resolve's hard rule)."""
+    if isinstance(exc, urllib.error.HTTPError):           # S1 answered: whatever the status, it was reached
+        return False
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        return False
+    return isinstance(reason, (ConnectionRefusedError, ConnectionResetError, ConnectionAbortedError))
 
 
 def decide_s1(text: str, unit_kind: str = "interactive", *, task_context=None) -> dict[str, Any] | None:
@@ -193,27 +211,21 @@ def decide_s1(text: str, unit_kind: str = "interactive", *, task_context=None) -
                                      headers=headers, method="POST")
     except Exception as exc:                             # building the request failed: nothing to retry
         return {"answers": None, "degraded": True, "engine": "s1", "engine_ms": int((time.time() - t0) * 1000), "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
-    # One quick retry on a transient connection error: a restarting or momentarily overloaded S1 closes the connection
-    # (Connection refused / RemoteDisconnected), which a single retry rides out before we fall back to degraded (Forest 2026-10-26).
-    _transient = (urllib.error.URLError, http.client.HTTPException, OSError)
+    # Retry only when S1 was never reached (refused / reset: a restarting S1, or its connection cap). Never on a timeout
+    # or an HTTP reply: see _s1_unreached for the 2026-11-22 change to the 2026-10-26 rule.
     d = None
     for _attempt in range(S1_RETRIES + 1):
         try:
             with urllib.request.urlopen(req, timeout=S1_TIMEOUT_S) as r:
                 d = json.loads(r.read())
             break
-        except urllib.error.HTTPError as exc:             # an HTTP status reply: 4xx (auth, body too large) is permanent — only 429/5xx are worth a retry
-            if exc.code in _S1_RETRYABLE_HTTP and _attempt < S1_RETRIES:
+        except Exception as exc:
+            if _s1_unreached(exc) and _attempt < S1_RETRIES:
                 time.sleep(S1_RETRY_BACKOFF_S)
                 continue
-            return {"answers": None, "degraded": True, "engine": "s1", "engine_ms": int((time.time() - t0) * 1000), "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
-        except _transient as exc:                         # a connection-level drop (refused, RemoteDisconnected, timeout): retry once
-            if _attempt < S1_RETRIES:
-                time.sleep(S1_RETRY_BACKOFF_S)
-                continue
-            return {"answers": None, "degraded": True, "engine": "s1", "engine_ms": int((time.time() - t0) * 1000), "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
-        except Exception as exc:                          # a non-transient error (e.g. a malformed body): do not retry
-            return {"answers": None, "degraded": True, "engine": "s1", "engine_ms": int((time.time() - t0) * 1000), "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+            busy = isinstance(exc, urllib.error.HTTPError) and exc.code == 503   # S1 shed it: queue full or no time left
+            return {"answers": None, "degraded": True, "engine": "s1", "engine_ms": int((time.time() - t0) * 1000),
+                    "error": ("S1 busy: " if busy else "") + f"{type(exc).__name__}: {str(exc)[:120]}"}
     if d.get("error") or not d.get("answers"):
         return {"answers": None, "degraded": True, "engine": "s1", "engine_ms": int((time.time() - t0) * 1000), "error": str(d.get("error"))[:200]}
     if digest is not None and d.get('task_context_digest') != digest:
