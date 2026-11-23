@@ -177,7 +177,8 @@ export interface PulseTreeTask {
 }
 export interface PulseOrchestrator {
   origin?: string | null
-  kind?: 'session' | 'bot' | 'unattributed' | string
+  // 'untagged' (0.6.3): this machine's tasks that carry no session tag, in a session view asked with &machine=
+  kind?: 'session' | 'bot' | 'unattributed' | 'untagged' | string
   project?: string | null
   device?: string | null
   status?: string
@@ -285,6 +286,12 @@ declare module 'claude-code' {
       started: { tag: string; task_id: string; at: number }[]
       /** #127: the session view of the newest such tag that is not this session's own (a /clear or resume) */
       alias: { data: PulseSessionView; at: number; tag: string } | null
+      /** #127: the alias view's last failed read (its problem, and since when a read of it has been outstanding) */
+      aliasErr: { tag: string; problem: string; pendingSince: number | null } | null
+      /** 0.6.3: the details (the `d` button): everything but the default view's five lines */
+      detailsOpen: boolean
+      /** 0.6.3: this machine's tag as cortados-route records origin_machine (machineTag of the Office salt), once computed */
+      machine: string | null
     }
   }
 }

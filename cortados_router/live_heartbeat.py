@@ -408,7 +408,7 @@ def tasks_block(host: str, now: float, events: Callable[[], list] | None = None,
         if r.get("phase") in live.HB_TASK_PHASES:
             e["phase"] = r["phase"]
         for k in ("title", "lane", "model", "workspace", "origin_session", "origin_project", "origin_device",
-                  "origin_via", "parent_task_id", "started_at", "ended_at",
+                  "origin_machine", "origin_via", "parent_task_id", "started_at", "ended_at",
                   "session"):   # the child's own Office tag: still sent (older providers compare it); since round 4
                                 # the provider checks and drops it, joining only on what it observed itself
             if r.get(k) is not None:
@@ -585,6 +585,20 @@ def main(argv: list[str] | None = None, *, run: Callable[..., Any] = subprocess.
         code, msg = post(url, token, raw, opener)
     # A provider from before the tasks block (#118) or the work split: that block is an unknown field there. The
     # newest block goes first, so a provider that knows the orchestrator block keeps it.
+    # A provider from before origin_machine (pulse review round 1) refuses an entry carrying it: the tasks block is
+    # sent again without the field before it is dropped whole (those tasks then show in no machine's untagged group).
+    items = (body.get("tasks") or {}).get("items") or []
+    if code == 400 and any("origin_machine" in e for e in items):
+        print(f"live_heartbeat: provider refused the tasks block ({msg or 400}); posting it without origin_machine",
+              file=sys.stderr)
+        body = {**body, "tasks": {**body["tasks"], "items": [{k: v for k, v in e.items() if k != "origin_machine"}
+                                                             for e in items]}}
+        try:
+            raw = check(body)
+        except ConfigError as exc:
+            print(f"live_heartbeat: {exc}", file=sys.stderr)
+            return 2
+        code, msg = post(url, token, raw, opener)
     for block in ("tasks", "orchestrator"):
         if code != 400 or block not in body:
             continue

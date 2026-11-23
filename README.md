@@ -1269,6 +1269,21 @@ tag and whether its main loop is live), Grok Bot and an "Unattributed" group; ea
 tasks first. One limit: the MCP server reads the session id once, at its start, so tasks started after `/clear` in the
 same process keep the session it was started for.
 
+**Tasks with no session tag (2026-11-22).** A `cortados-route` server that knows no session (no
+`CLAUDE_CODE_SESSION_ID`) records a task with its machine's tag only: `origin_machine`, a keyed hash of the machine's
+0600 Office salt (`sha256("<salt>:cortados:machine")[:16]`), which every task carries, tagged or not. The Claude
+desktop app runs such a server: a `cortados-route` registered in its own `claude_desktop_config.json` is started by the
+app (cwd `/`, no session id, no project folder) and handed to every desktop Code session too, where it shadows the
+session's own server of the same name, so those sessions' tasks carried no tag and their pane said "no task started from
+this session". The server now says so in `start_task`'s result (`origin_note`) and once on stderr at its start.
+`GET /v1/cortados/live/session` takes an optional `&machine=<tag>` (16-64 lowercase hex; a bad one is 400) and then
+also returns the tasks that carry no origin tag and exactly that machine tag, as one group of kind `untagged` (never
+another session's task, the bot's, or another machine's, whatever its display name). Only a process that reads the
+machine's salt can compute the tag; hostnames are display only and open nothing, and no view or tool result publishes
+the tag. The pulse pane (0.6.3) computes it from the salt and lists those tasks under "started on this machine without a
+session tag". Without the salt a task carries no machine tag and no session's pane shows it. Details:
+`docs/PULSE-PER-SESSION.md` §5 and §11.
+
 **The orchestrator tree** (`docs/PULSE-PER-SESSION.md`). The live view's `orchestrators` section is each orchestrating
 main session (its Office tag), Grok Bot and an "Unattributed" group, each with its child tasks (nested by
 `parent_task_id`, now on every task event; a task with no origin of its own takes its parent's, `origin_via: "parent"`;
@@ -1277,7 +1292,8 @@ sub-sessions: the run's provider conversations (`x-cortados-run-id`), open or re
 waiting / done / failed / unknown), phase, model, elapsed and in-memory token totals. The dashboard's Live tab draws it
 as a collapsible tree. `GET /v1/cortados/live/session?session=<tag>` (owner token, `live:read`, or the narrow
 `live:session` scope that opens nothing else) returns ONLY that session's subtree plus S1 and host health, built
-filtered before any cap; the cortados-pulse pane (0.5.0) reads only that view once its session is identified.
+filtered before any cap (with `&machine=<tag>`, also that machine's untagged tasks, above); the cortados-pulse pane reads only
+that view once its session is identified.
 
 A host whose jobs the provider cannot see (the Mac Studio's S1 scorer and continuous training) reports them with
 `POST /v1/cortados/live/heartbeat` (owner token, or a write-only `live:heartbeat` client token bound to ONE host: the
@@ -1381,12 +1397,16 @@ Work split panel has a per-session table, and `GET /v1/cortados/live/session` ca
 only (`work_split.row`, selected before every display cap: the routed read keeps every session tag and every
 pending child run, the 100-tag cap applies only to the published routed totals and the 40-row cap only to the fleet
 table, and the heartbeat sender keeps the sessions active in the last 30 min ahead of its 30-row token ranking; and `notes` on what is partial: no native report, a stale heartbeat, unreadable transcripts,
-routed tokens not recorded), which the pulse pane draws as one line plus a `w` breakdown.
+routed tokens not recorded), which the pulse pane draws, under its `d` details, as one line plus a `w` breakdown.
 
 The dashboard's **Live** tab reads it every 5 s while the tab is visible: an overview strip (running tasks, active
 conversations, S1 health, the lowest subscription, host heartbeats), the Tasks panel (running first, elapsed ticking each
 second, then the last 24 h), Conversations, Routed calls, Subscriptions (% left bars per window, stale readings hatched)
 and Hosts (heartbeat jobs, CPU/GPU busy, memory, disk; on the S1 host its served model, hold flags and pending
 candidate, also summarised on the S1 line). Light and dark themes (the system's, or pinned with the Theme button),
-and it fits a phone. The `cortados-pulse` pane shows the same Running section beside the chat and links the page.
+and it fits a phone. The `cortados-pulse` pane (0.6.3) beside the chat shows five things by default: this session's child
+tasks one line each (title, host, model, state, elapsed; running first, then the last three finished, and this machine's
+untagged tasks under their own heading), the local Pro model (on/off and why), the subscriptions (the lowest left and
+any that are out), S1 (up/down and median latency) and the link to this page; `d` opens the rest (work split,
+sub-sessions, usage, every lane, the local nodes, devices, the hosts' jobs).
 A scoped reader token: `python3 -B -m cortados_router.provider.clients add phone --scope live:read --token-file <path>`.

@@ -2094,6 +2094,16 @@ def with_tools_note(results: dict, note: str | None) -> dict:
     return out
 
 
+_QUERY_VALUE_RE = re.compile(r"([?&][^=&\s#]*=)[^&\s#]*")
+
+
+def redact_query(text: str) -> str:
+    """`text` (a request line or path) with every query value replaced by `<redacted>`, the names kept: a query can carry
+    a capability (?machine=, the pulse pane's machine tag) or a session tag, and none of the provider's views needs its
+    values in a log line or an echoed error (pulse review round 2)."""
+    return _QUERY_VALUE_RE.sub(r"\1<redacted>", text) if "?" in text else text
+
+
 class Handler(BaseHTTPRequestHandler):
     server: "ProviderServer"
     _scoped: "clients.Client | None" = None             # the scoped client of the current request (_scope_gate)
@@ -2102,8 +2112,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):                  # route http.server's stderr lines into logging
         # fmt is http.server's own constant; its args (the request line, a path) are client text: each rendered by
-        # log_text, and the record escaped again by the installed SafeFormatter (serve()).
-        logger.debug("%s " + fmt, self.address_string(), *(anthropic_wire.log_text(a, 300) if isinstance(a, str) else a for a in args))
+        # log_text, and the record escaped again by the installed SafeFormatter (serve()). Every query value is
+        # redacted first (redact_query): ?machine= is a capability (the pane's salt-derived machine tag) and ?session=
+        # a session's tag, neither of which an access log may keep (pulse review round 2). Successful and rejected
+        # requests alike: http.server's log_request and log_error both end here.
+        logger.debug("%s " + fmt, self.address_string(),
+                     *(anthropic_wire.log_text(redact_query(a), 300) if isinstance(a, str) else a for a in args))
 
     # ------------------------------------------------------------------ plumbing
     def _credential(self) -> str:
@@ -2450,12 +2464,24 @@ class Handler(BaseHTTPRequestHandler):
             # live:session token reads only a subtree whose tag it already holds (docs/PULSE-PER-SESSION.md).
             if not self._owner_or_session("GET"):
                 return self._refuse_auth()
-            sess = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("session")
+            # blank values kept: an empty ?machine= is a bad tag (400), never silently dropped
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)
+            sess = q.get("session")
             if not sess or len(sess) != 1 or live.valid_session(sess[0]) is None:
                 return self._error(400, "invalid_request_error",
                                    "cortados: session is required and must be " + live.SESSION_FILTER_RULE)
+            # ?machine=<tag> (optional): also the tasks that carry no session tag and this origin_machine tag
+            # (live.orchestrators_section untagged_machine; a start through a cortados-route server that knew no
+            # session, docs/PULSE-PER-SESSION.md §11). The tag is a keyed hash of the starting machine's 0600 Office
+            # salt, so the caller proves it runs there; a hostname opens nothing (review round 1: ?device= was
+            # caller-supplied and bound to nothing, so any live:session token could read another machine's untagged
+            # tasks). A bad tag is a 400, never ignored; ?device= is no longer read.
+            mach = q.get("machine")
+            if mach is not None and (len(mach) != 1 or live.valid_machine(mach[0]) is None):
+                return self._error(400, "invalid_request_error", "cortados: machine must be " + live.MACHINE_FILTER_RULE)
             try:
-                body = self.server.live_body(self.server.registry, sess[0], session_view=True)
+                body = self.server.live_body(self.server.registry, sess[0], session_view=True,
+                                             machine=mach[0] if mach else None)
             except Exception as exc:
                 logger.warning("live: session view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: live view unavailable (see provider log)")
@@ -2546,7 +2572,7 @@ class Handler(BaseHTTPRequestHandler):
             if found is None:
                 return self._error(404, "not_found_error", f"cortados: no routed request recorded for run {run_id}")
             return self._json(200, found)
-        self._error(404, "not_found_error", self.path)
+        self._error(404, "not_found_error", redact_query(self.path))
 
     def do_POST(self):
         self._authed, self._bridge = False, None
@@ -4252,19 +4278,21 @@ class ProviderServer(ThreadingHTTPServer):
         """POST /v1/cortados/local/switch: set a node's switch through its gate (local_switch.switch). Tests replace it."""
         return local_switch.switch(node, on)
 
-    def live_body(self, registry: Registry, session: str | None = None, session_view: bool = False) -> bytes:
+    def live_body(self, registry: Registry, session: str | None = None, session_view: bool = False,
+                  machine: str | None = None) -> bytes:
         """The encoded live view, memoised live.MEMO_S with single flight (live.Memo): every dashboard tab and pulse
         pane polling at once costs one collect per view (the fleet, each ?session=). A heartbeat post (the board's
         generation) invalidates it. `session` must already be valid (live.valid_session)."""
         from cortados_router import paths
-        key = (str(paths.state_dir()), id(registry), registry.live.generation, session, session_view)
+        key = (str(paths.state_dir()), id(registry), registry.live.generation, session, session_view, machine)
         if session_view:                                # GET /v1/cortados/live/session: that session's subtree only
             return self._live_memo.get(key, lambda: json.dumps(
-                live.session_view(self.live_view(registry, session, session_view=True), session),
+                live.session_view(self.live_view(registry, session, session_view=True, machine=machine), session),
                 allow_nan=False).encode())
         return self._live_memo.get(key, lambda: json.dumps(self.live_view(registry, session), allow_nan=False).encode())
 
-    def live_view(self, registry: Registry, session: str | None = None, session_view: bool = False) -> dict[str, Any]:
+    def live_view(self, registry: Registry, session: str | None = None, session_view: bool = False,
+                  machine: str | None = None) -> dict[str, Any]:
         """GET /v1/cortados/live (provider/live.py): composes the office board, the tasks and the live slice of the usage
         view, the child-task log (read once, 24 h) and the host heartbeats. Cache-only: no vendor CLI, no ssh. Tests
         replace the inputs it calls (office_view's board, tasks_view, live_usage_view) or this method. `session_view`
@@ -4297,7 +4325,8 @@ class ProviderServer(ThreadingHTTPServer):
             run_tokens=registry.runs.tokens_by_run, run_origins=registry.runs.run_origins,
             stubs_by_id=child_tasks.remote_stubs_by_id, binding_errors=registry.live.errors,
             api_credit=None if session_view else (lambda: api_credits.state(now)),
-            session=session, peek_foreign=not session_view)
+            session=session, peek_foreign=not session_view, untagged_machine=machine if session_view else None,
+            machine_stubs=child_tasks.remote_stubs_for_machine)
 
     def live_usage_view(self, registry: Registry, now: float) -> dict[str, Any]:
         """Lanes, S1 and hardware for the live view (usage.collect_live): the same sources usage_view reads."""

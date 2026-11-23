@@ -137,7 +137,23 @@ tool name, Office tag) or from fixed vocabularies (status, phase, role).
   and hardware, the lowest subscription window. The response has no tasks section, no conversations, no routed calls,
   no work split and no fleet counts. The hosts section carries no orchestrator block, and a test checks that. A parent
   task that belongs to another orchestrator is never named (`parent_task_id: null, parent_hidden: true`). The
-  unattributed group is never in a session's view.
+  unattributed group is never in a session's view; with `&machine=<tag>` only the tasks that carry no origin tag at all
+  and were recorded with exactly that machine tag are added, as their own `untagged` group (§11).
+- **The machine tag (review round 1 of the 0.6.3 branch).** `origin_machine` = `sha256("<salt>:cortados:machine")[:16]`
+  (`subagent_mcp.machine_tag`, the pane's `machineTag`), from the same 0600 per-machine salt as the session tag. A
+  session id never holds `:`, so no session tag is computed from that input. Every cortados-route server that can read
+  the salt records it on every task it starts, tagged or not (the desktop app's own server too: `main()` makes the
+  salt before it serves). It is the capability for a machine's untagged group: the caller proves it can read that
+  machine's salt, as it proves its session for `?session=`. Hostnames (`origin_device`) are display only and open
+  nothing: the first version took `&device=<hostname>`, which any `live:session` token could name for another machine
+  (`&device=studio`), and display names collide after normalisation (`desk é` and `desk 中` both become `desk-`, and
+  names are cut at 64). The tag is never published: no view, tasks section, tree node or tool result (`task_status`,
+  `list_tasks`, `start_task`) carries it; it travels only in records (`meta.json`, the event log, remote stubs and
+  their `by-machine/<tag>/` index, heartbeat entries). Same limit as the session tag: an execution host that runs a
+  task holds that task's records, so it learns the starting machine's tag, as it learns the session tag. A heartbeat
+  cannot move a task this machine started into another machine's group: its stub's tag wins, and a report naming
+  another tag is a conflict (dropped). Tasks from before the tag, or from a server without the salt, carry none and are
+  in no session's untagged group (the dashboard's fleet view still lists them).
 - The endpoint requires `?session=` (400 without it) and never lists sessions. A tag is 64 bits of salted hash: a
   holder of a `live:session` token can read a subtree only for a tag it already knows, which in practice means it is
   that session or its machine's salt holder. Tags are cosmetic labels inside the owner's trust boundary (as
@@ -187,7 +203,7 @@ tool name, Office tag) or from fixed vocabularies (status, phase, role).
 
 ```
 orchestrators: {as_of, status, errors[], scope: "provider host", window_s, truncated, inputs_truncated[], session_filter?,
-  items: [{origin: <tag> | "grokbot" | null, kind: session | bot | unattributed, project, device,
+  items: [{origin: <tag> | "grokbot" | null, kind: session | bot | unattributed | untagged, project, device,
            status (working / idle / not live; "n/a" for bot and unattributed), model, tool, last_activity,
            counts {running, waiting, done, failed, unknown}, attention,
            tasks: [task], tasks_hidden, routed: [sub-session], routed_hidden}]}
@@ -218,7 +234,7 @@ costs per input: §5.
    their checkout is updated (`git pull` on each exec host).
 3. **The pulse mod (each machine):** installed from the marketplace:
    `/plugin marketplace update cortados-router`, then `/plugin update cortados-pulse@cortados-router` (or `/plugin`
-   → cortados-pulse → Update), then `/reload-plugins`. The version reads 0.6.0 (#127, §10; 0.5.2 was #118, §9). Loaded with `--plugin-dir`: pull the
+   → cortados-pulse → Update), then `/reload-plugins`. The version reads 0.6.3 (§11; 0.6.0 was #127, §10; 0.5.2 was #118, §9). Loaded with `--plugin-dir`: pull the
    checkout and restart Claude Code (or `/reload-plugins`). Nothing to configure. The salt file
    `~/.config/cortados/office-salt` is made by the cortados-route MCP server on first start, as before.
 4. **Optional:** a narrow `live:session` token for panes (§5).
@@ -463,3 +479,102 @@ pull` on every host that runs the heartbeat sender with `--orchestrator` (its bl
 salt on the next scan) and on every machine whose cortados-route MCP server should send route_task's session header
 and return `origin_session` (restart Claude Code there, or `/mcp` reconnect); update the pulse mod to 0.6.0
 (`/plugin marketplace update cortados-router`, `/plugin update cortados-pulse@cortados-router`, `/reload-plugins`).
+
+## 11. Tasks with no session tag, and the simplified pane (pulse 0.6.3, 2026-11-22)
+
+**Symptom.** A Claude desktop-app Code session (project folder `~/code`) started three tasks onto the Air at 15:26
+(`t20261122152600-6a026c4f`, `t20261122152601-0ea2fe26`, `t20261122152612-70a5b772`). Its pane said "no task started
+from this session in the last 24 h". The tasks' `meta.json` on the Air had `origin: {origin_device:
+"Forests-MacBook-Pro", origin_project: null, origin_session: null}`; a task started from a CLI session minutes earlier
+(`t20261122151943-b5c6436d`) had all three.
+
+**Evidence (read-only, on the Pro).**
+
+- The desktop session's own cortados-route server existed and could have tagged the tasks: its process (parent the
+  desktop app's bundled `claude`, started 15:25:16 with the session) had `CLAUDE_CODE_ENTRYPOINT=claude-desktop`,
+  `CLAUDE_PROJECT_DIR=~/code`, cwd `~/code` and `CLAUDE_CODE_SESSION_ID` set, and the machine's salt file was valid (0600).
+  From that environment `origin_identity()` gives `{session: <tag>, project: "code", device: "Forests-MacBook-Pro"}`.
+- The records have `origin_project: null`. `origin_identity()` gives exactly the recorded triple only for a server with
+  no `CLAUDE_PROJECT_DIR`, cwd `/` (`office_name(basename("/"))` is None) and no `CLAUDE_CODE_SESSION_ID`.
+- Two such servers run: started by the desktop app itself (`Claude.app/Contents/Helpers/disclaimer -- /usr/bin/python3
+  .../subagent_mcp.py`, Nov 20 22:02), cwd `/`, none of the three variables set. They come from the desktop app's own
+  MCP config (`~/Library/Application Support/Claude/claude_desktop_config.json`, `mcpServers.cortados-route`, the same
+  script). The session's own server comes from the user-scope registration in `~/.claude.json`, also named
+  `cortados-route`.
+- The desktop app's log (`~/Library/Logs/Claude/main.log`) at 15:25:16, for that session: "Reconciling to 41 total
+  servers", a list that includes `cortados-route`: the app hands its own servers to each Code session it starts (over
+  the SDK channel, `--await-initialize`, not argv). The session's transcript shows the calls as
+  `mcp__cortados-route__start_task`, and each result's `origin_session` was null: the app's copy answered, shadowing
+  the session's own server of the same name.
+- Nothing was lost later: the remote start (`--remote`) and `meta.json` on the Air carry exactly what the requesting
+  server sent (the CLI-started task has all three fields through the same path).
+- The pane identifies its session from `$.session.id()`, the CLI session id the app maps the desktop session to ("Mapping
+  internal session local_… to CLI session …" in the same log), the id the session's own server has. So the pane's tag
+  was right; the tasks simply had none.
+
+**Root cause.** A cortados-route server that is not launched by a Claude Code session cannot know which session calls
+it, and the desktop app gives its Code sessions such a server under the same name as theirs. Nothing in an MCP call
+names the session, so the server cannot recover the tag.
+
+**Fix (code).**
+
+- `subagent_mcp.untagged_reason()`: why a server has no tag (no salt, or no session id). A start_task whose task has no
+  origin carries it as `origin_note`, and the server says it once on stderr at its start (the app's MCP log). Without
+  the salt the task gets no machine tag either, and the note says no session's pane shows it.
+- Every task records `origin_machine` (§5, "The machine tag"): `origin_identity()` adds `machine`, `clean_origin` keeps
+  it (16-64 lowercase hex, `child_tasks.MACHINE_TAG_RE`), and it rides the origin's path: `--remote` args, `meta.json`,
+  every event, the remote stub. An untagged remote stub is indexed under `by-machine/<tag>/` (`MACHINE_INDEX`, pruned
+  with `by-origin/`); `child_tasks.remote_stubs_for_machine(tag)` reads that index only. Heartbeat entries carry it
+  (`live._HB_TASK_KEYS`); a provider from before it refuses the field with a 400, and the sender then posts the tasks
+  block again without it (`live_heartbeat`).
+- `GET /v1/cortados/live/session?session=<tag>&machine=<tag>`: `live.orchestrators_section(untagged_machine=)` builds,
+  besides the session's own group, one group of kind `untagged` from the tasks that carry no origin tag at all, own or
+  through a parent, and whose own `origin_machine` equals the tag. A task with any tag (another session's, the bot's),
+  another machine's, or with no machine tag never enters it. `machine` must be `live.valid_machine` (one value); a bad,
+  empty or repeated one is a 400; a well-formed tag no task carries is simply no group; the memo key includes it.
+  `&device=` is no longer read. The group's `device` is the recorded `origin_device`, for display only. The fleet view
+  is unchanged (these tasks stay in its unattributed group) and publishes no machine tag.
+- The pane computes its machine's tag once from the salt it already reads (`machineKey`, `machineTag`; no process is
+  run) and asks with `&machine=`; without a readable salt it asks nothing more. It draws those tasks under "started on
+  this machine without a session tag (<device>)". An older provider ignores the parameter.
+- The tag is a capability, so it is kept out of logs and error lines (review round 2): `server.redact_query` replaces
+  every query value with `<redacted>` in the access log (`Handler.log_message`, which both answered and refused
+  requests reach) and in the 404 echo; the pane's `redactQuery` does the same to its error lines (a host fetch error can
+  quote the URL), and a non-object answer names the path without its query. Every comparison of a machine tag
+  (`live.same_machine`, `child_tasks.remote_stubs_for_machine`) is `hmac.compare_digest`.
+- Not covered: an untagged task of this machine that ran "here" shows only when this machine's heartbeat reports it
+  (the pane's own-log merge is still by tag).
+
+**[ESCALATE] configuration on the owner's Pro (not changed by this branch).** Remove `mcpServers.cortados-route` from
+`~/Library/Application Support/Claude/claude_desktop_config.json` (or rename that entry, e.g. `cortados-route-app`, if
+the desktop chat needs its own copy), then restart the Claude desktop app. Desktop Code sessions then reach only their
+own user-scope server and their tasks are tagged again. Trade-off to decide: the desktop app's non-Code chat would lose
+(or see renamed) the route tools.
+
+**The simplified pane.** The owner: "way too complicated, I don't know if it's right". The default view has five parts:
+this session's child tasks one line each (`taskRow`: title, host, model, state, elapsed; running first, then the
+last three finished, nested ones flattened, the untagged group after), the local Pro model (`localModelLine`), the
+subscriptions (`subsLine`: the lowest left and any that are out), S1 (`s1Line`: up/down and median latency) and the
+dashboard link. `d` opens the details: the work split and its `w` breakdown, the tree with sub-sessions and routed
+subagents, the alias and local-log notes, the hosts, usage, every lane, the local nodes and the devices. Tests:
+`hooks/simple.test.ts` (each helper, the untagged heading, the machine tag vector shared with Python, `&machine=` and
+never a hostname, the mounted default view), `split.test.ts` and `render.test.ts` (the mounted default and details
+views); Python: `tests/test_orchestrator_tree.py` `UntaggedMachineTest` (own group, colliding display names, foreign
+or guessed tags, older tasks, a heartbeat that claims another machine's tag, no tag published) and
+`SessionEndpointTest.test_machine_adds_only_that_machines_untagged_group`,
+`test_a_foreign_or_guessed_machine_tag_sees_nothing_of_another_machine`,
+`test_a_hostname_opens_nothing_and_a_bad_tag_is_refused`, `test_untagged_remote_stubs_come_from_the_machine_index_only`,
+`test_the_access_log_never_keeps_the_machine_or_session_tag`, `test_redact_query_keeps_names_and_drops_values`,
+`test_machine_tags_compare_in_constant_time`;
+`tests/test_child_tasks.py` `test_a_desktop_app_server_records_the_machine_tag_and_says_why`,
+`test_the_main_entry_makes_the_salt_so_a_desktop_server_gets_a_machine_tag`,
+`test_the_machine_tag_is_its_own_domain_never_a_session_tag`,
+`test_untagged_reason_names_the_missing_piece_and_a_tagged_start_has_no_note`,
+`test_an_untagged_remote_start_carries_the_machine_tag_to_the_host_and_the_machine_index`,
+`test_a_tagged_remote_stub_is_indexed_by_its_session_only`; `tests/test_live_heartbeat.py`
+`test_a_provider_from_before_origin_machine_gets_the_tasks_without_it`.
+
+**Deploy (after review):** merge; `git pull` on the Air and restart the provider for `&machine=` (before or with the
+hosts' heartbeat senders: an older provider refuses `origin_machine` and the sender then drops only that field); restart the desktop app
+(or `/mcp` reconnect) for `origin_note`; update the pulse mod to 0.6.3 (`/plugin marketplace update cortados-router`,
+`/plugin update cortados-pulse@cortados-router`, `/reload-plugins`).

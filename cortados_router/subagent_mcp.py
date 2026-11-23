@@ -330,24 +330,69 @@ def origin_tag(salt: str, session_id: str) -> str:
     return hashlib.sha256(f"{salt}:{session_id}".encode()).hexdigest()[:ORIGIN_TAG_HEX]
 
 
+# The machine tag's domain label (pulse review round 1). The session tag hashes "<salt>:<session id>"; a session id
+# never holds ":" (_SESSION_ID_RE), so "<salt>:cortados:machine" is never the input of any session's tag.
+MACHINE_TAG_LABEL = "cortados:machine"
+
+
+def machine_tag(salt: str) -> str:
+    """This machine's opaque origin_machine tag: sha256("<salt>:cortados:machine") cut like origin_tag (the pulse pane's
+    machineTag). Recorded on every task this server starts; the session view's untagged group is opened by it, so only
+    a process that can read this machine's 0600 salt can ask for this machine's untagged tasks."""
+    return hashlib.sha256(f"{salt}:{MACHINE_TAG_LABEL}".encode()).hexdigest()[:ORIGIN_TAG_HEX]
+
+
 def origin_identity(env=None) -> dict:
-    """{session, project, device} of the session this server serves: session the Office tag (None without a salt or a
-    session id), project the session's folder name, device this machine's short hostname. Metadata only."""
+    """{session, project, device, machine} of the session this server serves: session the Office tag (None without a
+    salt or a session id), project the session's folder name, device this machine's short hostname (display only),
+    machine the salt's machine_tag (None without a salt; set with or without a session id). Metadata only."""
     env = os.environ if env is None else env
     sid = (env.get(SESSION_ID_ENV) or "").strip()
-    salt = read_office_salt(env) if _SESSION_ID_RE.fullmatch(sid) else None
+    salt = read_office_salt(env)
     root = env.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     name = _child_module().office_name                  # the one Python copy of the mod's officeName
-    return {"session": origin_tag(salt, sid) if salt else None,
+    return {"session": origin_tag(salt, sid) if salt and _SESSION_ID_RE.fullmatch(sid) else None,
             "project": name(os.path.basename(os.path.normpath(root))),
-            "device": name(socket.gethostname().split(".")[0], device=True)}
+            "device": name(socket.gethostname().split(".")[0], device=True),
+            "machine": machine_tag(salt) if salt else None}
+
+
+# Why a task can have no session tag, said in start_task's result (`origin_note`) and once on stderr at server start.
+# Reason: on 2026-11-22 three tasks started from a Claude desktop-app Code session were recorded with only their
+# device. The app had passed that session its OWN cortados-route server (registered in claude_desktop_config.json, run
+# by the app with cwd / and no CLAUDE_CODE_SESSION_ID or CLAUDE_PROJECT_DIR), which shadows the session's own
+# server of the same name; the pulse pane then said "no task started from this session". Nothing in the call tells
+# such a server which session asked, so it cannot recover the tag: it says so, and the pane shows these tasks under
+# "started on this machine without a session tag" (provider/live.py `untagged`, docs/PULSE-PER-SESSION.md §11).
+UNTAGGED_NO_SESSION = (
+    "this cortados-route server has no Claude Code session id ({env} is unset or not one): it was started by an app, not by a "
+    "Claude Code session (e.g. a cortados-route registered in the Claude desktop app's own MCP config, which the app "
+    "also hands to its Code sessions and which then shadows the session's own server). The task is recorded with "
+    "this machine's tag only and shows in the Pulse pane of this machine's sessions under \"started on this machine "
+    "without a session tag\".")
+UNTAGGED_NO_SALT = (
+    "the Office salt file ({path}) is missing or unreadable, so neither this session's tag nor this machine's could be "
+    "computed. The task is recorded with this machine's name only, which opens nothing: no session's Pulse pane shows "
+    "it (the dashboard does).")
+
+
+def untagged_reason(env=None):
+    """Why origin_identity() gives no session tag here, as one sentence; None when it gives one. Without the salt the
+    task gets no machine tag either, so it is shown in no session's pane (UNTAGGED_NO_SALT), whatever the session id."""
+    env = os.environ if env is None else env
+    sid = (env.get(SESSION_ID_ENV) or "").strip()
+    if read_office_salt(env) is None:
+        return UNTAGGED_NO_SALT.format(path=office_salt_path(env))
+    if not _SESSION_ID_RE.fullmatch(sid):
+        return UNTAGGED_NO_SESSION.format(env=SESSION_ID_ENV)
+    return None
 
 
 def task_origin(cfg: dict) -> dict:
     """The origin recorded on a start_task: the bot gateway's tasks are the bot's; anything else is this session's."""
     bot = _child_module().BOT_ORIGIN                    # bot_gateway.CLIENT
     if cfg.get("client") == bot:
-        return {"session": bot, "project": None, "device": None}
+        return {"session": bot, "project": None, "device": None, "machine": None}
     return origin_identity()
 
 
@@ -382,6 +427,11 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
                            session_tag=cfg.get("session_tag"), repo=a.get("repo"), branch=a.get("branch"),
                            host=a.get("host"), parent_task_id=a.get("parent_task_id"), local=a.get("local"),
                            origin=task_origin(cfg))
+            if isinstance(out, dict) and out.get("origin_session") is None and cfg.get("client") != \
+                    ct.BOT_ORIGIN and "origin_note" not in out:
+                # a nested task may have inherited its parent's origin (then origin_session is set): only a task that
+                # really has none is explained
+                out["origin_note"] = untagged_reason() or "no session tag was recorded for this task"
         elif name == "task_status":
             out = ct.status(a.get("task_id"), red, cfg.get("url", ""), token)
         elif name == "wait_task":
@@ -782,6 +832,9 @@ def main() -> None:
            # the children it starts share a floor (provider/office.py). Random, not derived from any session id.
            "session_tag": secrets.token_hex(8)}
     ensure_office_salt()                                # the task origin's salt, shared with the mods (task_origin)
+    why = untagged_reason()
+    if why:                                             # said once where the app logs this server's stderr
+        print("cortados-route: tasks started through this server carry no session tag: " + why, file=sys.stderr)
     try:
         cfg["url"] = _resolve_url()
     except ProviderURLError as exc:

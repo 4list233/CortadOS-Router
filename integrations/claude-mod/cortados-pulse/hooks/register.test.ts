@@ -3,7 +3,7 @@ import { FALLBACK, POLL_MS, LIVE_POLL_MS, STALE_AFTER_S, expandHome, resolveProv
   pollLive, age, pct, gib, dur, leftPct, laneLabel, laneLines, usageLines, deviceLines, laneOrder, taskLine, conversationLine,
   runningLines, fleetLines, hwText, identify, sessionLines, sessionTag, OFFICE_SALT_FILE, MINE_RECENT_MAX, CLEAR_NOTE,
   SESSION_PATH, treeLines, tokShort, glyph, fetchTree, parseLocalTasks, mergeLocal, localLines, readLocal, LOCAL_POLL_MS,
-  LOCAL_TAIL_BYTES, LOCAL_NOTE, STALE_HB_PHASE, readLocalLog, LOCAL_SKIP_NOTE, TAIL_BIN } from './register'
+  LOCAL_TAIL_BYTES, LOCAL_NOTE, STALE_HB_PHASE, readLocalLog, LOCAL_SKIP_NOTE, TAIL_BIN, machineTag } from './register'
 import liveFixture from './live.fixture'
 import sessionFixture from './session.fixture'
 
@@ -510,7 +510,8 @@ test('pollLive asks the provider for this session\'s own view, and keeps it only
         text: JSON.stringify(url.includes('?session=') && filtered ? own : fleet) }) }), session: { id: async () => SID } }
     await pollLive($ as any, FALLBACK, true)
     // the per-session view is asked first; these answers are not a subtree (an older provider): the fleet fallback
-    expect($.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live/session?session=' + tag,
+    // with this machine's tag (its salt is readable): its untagged tasks too (review round 1)
+    expect($.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live/session?session=' + tag + '&machine=' + await machineTag(SALT),
       'http://air.example:8432/v1/cortados/live', 'http://air.example:8432/v1/cortados/live?session=' + tag])
     const held = (await ($ as any).state.get({ plugin: 'cortados-pulse', key: 'mineLive' })).value
     if (filtered) {
@@ -620,7 +621,7 @@ test('pollLive with a tag reads only the session view: nothing fleet-wide', asyn
     files: { '/tmp/home/.config/cortados/provider-token': TOKEN, '/tmp/home/.config/cortados/office-salt': salt },
     http: () => ({ status: 200, ok: true, headers: {}, text: JSON.stringify(view) }) }), session: { id: async () => sid } }
   await pollLive($ as any, FALLBACK, true)
-  expect($.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live/session?session=' + tag])
+  expect($.calls.urls).toEqual(['http://air.example:8432/v1/cortados/live/session?session=' + tag + '&machine=' + await machineTag(salt)])
   expect($.calls.inits[0].headers.authorization).toBe('Bearer ' + TOKEN)
   const held = (await ($ as any).state.get({ plugin: 'cortados-pulse', key: 'tree' })).value
   expect([held.tag, held.base]).toEqual([tag, 'http://air.example:8432'])

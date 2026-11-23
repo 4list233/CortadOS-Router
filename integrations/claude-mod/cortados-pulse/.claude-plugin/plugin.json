@@ -1,6 +1,6 @@
 {
   "name": "cortados-pulse",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "A pane beside the chat with a live tree of this session's own CortadOS work (its child tasks, each child's sub-sessions, nested tasks and its directly routed subagents, read from the provider's per-session view), then the router's live resource pool: routes and S1 health, every subscription lane's % left (per Claude account, Codex, Cursor, ...), online devices and model fit, with a link to the browser dashboard.",
   "author": {
     "name": "Forest Li",
