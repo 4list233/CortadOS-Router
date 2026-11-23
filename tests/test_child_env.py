@@ -21,7 +21,9 @@ SECRETS = {"GITHUB_TOKEN": "ghp_x", "GH_TOKEN": "gh_x", "AWS_SECRET_ACCESS_KEY":
            "CORTADOS_PROVIDER_TOKEN": "cortados_x", "SSH_AUTH_SOCK": "/tmp/agent.sock", "OPENAI_API_KEY": "sk-x",
            "ANTHROPIC_API_KEY": "sk-ant-x", "ANTHROPIC_BASE_URL": "http://127.0.0.1:8432",
            "ANTHROPIC_CUSTOM_HEADERS": "x-cortados-run-id: r", "CODEX_API_KEY": "sk-c", "CODEX_ACCESS_TOKEN": "t",
-           "OPENAI_BASE_URL": "http://elsewhere", "CLAUDE_CODE_USE_BEDROCK": "1", "SOME_FUTURE_SECRET": "s"}
+           "OPENAI_BASE_URL": "http://elsewhere", "CLAUDE_CODE_USE_BEDROCK": "1", "SOME_FUTURE_SECRET": "s",
+           # #114: the API credit key (and any numbered slot) is the provider's alone
+           "CORTADOS_ANTHROPIC_API_KEY": "sk-ant-credit-fake", "CORTADOS_ANTHROPIC_API_KEY_2": "sk-ant-credit-fake-2"}
 # Infrastructure every child needs, with the values the provider was started with.
 PASSED = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/Users/x"),
           "HTTP_PROXY": "http://proxy:3128", "http_proxy": "http://proxy:3128",
@@ -51,6 +53,17 @@ class BackendEnvTests(unittest.TestCase):
             self.assertNotIn("KEEP_ME", env, "an unlisted variable never passes, whatever its name")
             for name, value in PASSED.items():
                 self.assertEqual(env.get(name), value, (backend, name))
+
+    def test_the_credit_key_never_passes_even_if_an_allowlist_names_it(self):
+        # #114 defence in depth: NEVER_ENV / NEVER_PREFIXES overrule a future allowlist edit
+        widened = child_env.BASE_ENV | {"CORTADOS_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY", "CORTADOS_PROVIDER_TOKEN"}
+        with mock.patch.object(child_env, "BASE_ENV", widened):
+            for backend in ("codex", "claude"):
+                env = child_env.backend_env(backend, environ={**SECRETS, **PASSED})
+                for name in ("CORTADOS_ANTHROPIC_API_KEY", "CORTADOS_ANTHROPIC_API_KEY_2", "ANTHROPIC_API_KEY",
+                             "CORTADOS_PROVIDER_TOKEN"):
+                    self.assertNotIn(name, env, (backend, name))
+                self.assertNotIn("sk-ant-credit-fake", json.dumps(env))
 
     def test_all_proxy_passes_in_both_cases_credentials_unchanged(self):
         environ = {"ALL_PROXY": "http://u:p@proxy:3128", "all_proxy": "socks5h://u:p@proxy:1080"}

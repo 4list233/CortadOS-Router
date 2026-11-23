@@ -2898,7 +2898,7 @@ class RunRecordTests(RoutedHarness):
         from types import SimpleNamespace
         from cortados_router import api_credits
         from cortados_router.provider.server import Handler, RunRecords
-        rid = api_credits._org_id("sk") + "|2026-11:abc"     # resolves to the test key "sk" (as in test_api_lane)
+        rid = "2026-11-22:abc"                                # a reservation id as api_credits.reserve mints them
         runs = RunRecords()
 
         def serve(headers, body):
@@ -3902,7 +3902,7 @@ class RevealModelTests(unittest.TestCase):
             self.assertEqual(server.api_reveal_suffix(), " · 87% left")
         with mock.patch.object(api_credits, "window_numbers", side_effect=api_credits.LedgerError("down")):
             self.assertIsNone(server.api_reveal_suffix())
-        # a route never draws on the api lane through S1: no lane, so the model alone
+        # a routed API-lane conversation (#114) reveals the model alone: the lane's % is added by the relay itself
         self.assertEqual(server.reveal_model({"provider": "anthropic-api", "model": "claude-opus-5-5"}), "claude-opus-5-5")
 
     def test_no_route_or_a_degraded_one_reveals_nothing(self):

@@ -3,6 +3,8 @@ upstream is a fake opener. serve() does no accounting now — it returns the cap
 import http.client
 import io
 import json
+import threading
+import time
 import unittest
 import urllib.error
 from unittest import mock
@@ -74,9 +76,18 @@ class TestOrigin(unittest.TestCase):
         self.assertEqual(headers["x-api-key"], "sk")
         self.assertEqual(headers["anthropic-beta"], "b1")
 
-    def test_opener_refuses_redirects(self):
-        # the redirect handler returns None, so urllib does not re-send the credentialed request to a new host
-        self.assertIsNone(ap._NoRedirect().redirect_request(None, None, 302, "", {}, "https://evil.example.com"))
+    def test_the_tls_layer_verifies_the_anthropic_certificate_and_name(self):
+        import socket as so
+        import ssl
+        raw = so.socket()
+        try:
+            tls = ap._tls_wrap(raw, ap.ALLOWED_HOST)
+            self.assertIsInstance(tls, ssl.SSLSocket)
+            self.assertEqual(tls.server_hostname, ap.ALLOWED_HOST)
+            self.assertEqual(tls.context.verify_mode, ssl.CERT_REQUIRED)
+            self.assertTrue(tls.context.check_hostname)
+        finally:
+            raw.close()
 
 
 class TestServe(unittest.TestCase):
@@ -395,6 +406,56 @@ class TestModelSuffix(unittest.TestCase):
         self.assertEqual(self.run_serve(True)[0], b"".join(self.CHUNKS))
 
 
+class TestRoutedConversation(unittest.TestCase):
+    """#114: a routed conversation on the API lane: the response names the model the client asked for (echo_model),
+    the answer's blocks are rebuilt (reply), and commit runs before the terminal bytes reach the client."""
+    CHUNKS = [
+        b'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-sonnet-5","usage":{"input_tokens":10}}}\n\n',
+        b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hel"}}\n\n',
+        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}\n\n',
+        b'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu_1","name":"Read","input":{}}}\n\n',
+        b'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+
+    def test_stream_echo_reply_and_commit_before_the_terminal_event(self):
+        h = FakeHandler()
+        reply, seen = [], []
+        commit = lambda blocks: seen.append((list(blocks), h.wfile.buf.getvalue()))
+        usage, outcome = ap.serve(h, {"stream": True}, "claude-sonnet-5", 0.0, key="sk", echo_model="cortados",
+                                  reply=reply, commit=commit, urlopen=lambda req, timeout=0: FakeResp(chunks=self.CHUNKS))
+        self.assertEqual(outcome, "completed")
+        self.assertEqual([b.get("type") for b in reply], ["text", "tool_use"])
+        self.assertEqual(reply[0]["text"], "hello")
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn(b"message_stop", seen[0][1])              # committed before the client saw the end
+        raw = h.wfile.buf.getvalue()
+        self.assertIn(b"message_stop", raw)
+        first = json.loads(raw.decode().split("data: ", 1)[1].split("\n", 1)[0])
+        self.assertEqual(first["message"]["model"], "cortados")      # the client's own model name
+
+    def test_nonstream_echo_reply_and_commit(self):
+        msg = {"id": "m", "type": "message", "model": "claude-sonnet-5", "content": [{"type": "text", "text": "hi"}],
+               "usage": {"input_tokens": 3, "output_tokens": 1}}
+        h, reply, seen = FakeHandler(), [], []
+        usage, outcome = ap.serve(h, {}, "claude-sonnet-5", 0.0, key="sk", echo_model="cortados", reply=reply,
+                                  commit=lambda b: seen.append(h.wfile.buf.getvalue()),
+                                  urlopen=lambda req, timeout=0: FakeResp(body=json.dumps(msg).encode()))
+        self.assertEqual((outcome, reply, seen), ("completed", msg["content"], [b""]))
+        self.assertEqual(json.loads(h.wfile.buf.getvalue())["model"], "cortados")
+
+    def test_an_unfinished_stream_never_commits(self):
+        h, reply, seen = FakeHandler(), [], []
+        usage, outcome = ap.serve(h, {"stream": True}, "claude-sonnet-5", 0.0, key="sk", reply=reply,
+                                  commit=seen.append, urlopen=lambda req, timeout=0: FakeResp(chunks=self.CHUNKS[:-1]))
+        self.assertEqual((outcome, seen), ("unknown", []))
+
+    def test_the_key_comes_from_the_provider_environment(self):
+        with mock.patch.dict("os.environ", {"CORTADOS_ANTHROPIC_API_KEY": " sk-env "}):
+            self.assertEqual(ap.api_key(), "sk-env")
+
+
 class TestErrorSanitizing(unittest.TestCase):
     """#117 review round 5: what the proxy shows a client as an error has no raw control character and is capped,
     whether the proxy built it or the API sent it; a successful answer is relayed byte for byte."""
@@ -460,6 +521,384 @@ class TestErrorSanitizing(unittest.TestCase):
         ap.serve(h, {"model": "cortados", "stream": True}, "claude-opus-5-5", 0.0, key="sk",
                  urlopen=lambda req, timeout=0: FakeResp(chunks=chunks))
         self.assertEqual(h.wfile.buf.getvalue(), b"".join(chunks))
+
+
+class TestTurnCap(unittest.TestCase):
+    """#114 review round 1: a hard wall-clock cap on the whole upstream turn (urllib's timeout bounds each socket
+    operation only), below the grants' expiry margin; a turn cut off there is ABORTED and never relayed past the cap."""
+
+    SSE_START = (b'event: message_start\ndata: {"type": "message_start", "message": {"model": "m", '
+                 b'"usage": {"input_tokens": 10, "output_tokens": 1}}}\n\n')
+    SSE_TEXT = (b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 0, '
+                b'"delta": {"type": "text_delta", "text": "late"}}\n\n')
+    SSE_END = (b'event: message_delta\ndata: {"type": "message_delta", "usage": {"output_tokens": 5}}\n\n'
+               b'event: message_stop\ndata: {"type": "message_stop"}\n\n')
+
+    def test_the_cap_never_exceeds_the_expiry_margin_whatever_is_configured(self):
+        from cortados_router import api_credits
+        for configured in (60.0, 1800.0, 7200.0, 10 ** 9, 0.0, -5.0, float("nan")):
+            with mock.patch.object(ap, "UPSTREAM_TIMEOUT_S", configured):
+                cap = ap.turn_cap_s()
+                self.assertGreater(cap, 0)
+                self.assertLessEqual(cap, api_credits.MAX_TURN_S)
+                self.assertLess(cap, api_credits.EXPIRY_MARGIN_S)
+
+    def test_a_stream_crossing_its_deadline_on_a_fake_clock_is_aborted_and_not_relayed_past_it(self):
+        clock = [1000.0]
+
+        class Ticking(FakeResp):
+            def __iter__(self_inner):
+                yield self.SSE_START                 # at the send
+                clock[0] += 40 * 60                  # the next chunk arrives forty minutes in: past the 30-minute cap
+                yield self.SSE_TEXT
+                yield self.SSE_END
+
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"stream": True}, "claude-opus-5-5", 0, key="sk",
+                                  urlopen=lambda req, timeout=None: Ticking(), deadline=1000.0 + 1800.0,
+                                  clock=lambda: clock[0])
+        self.assertEqual(outcome, ap.ABORTED)
+        out = h.wfile.buf.getvalue()
+        self.assertIn(b"message_start", out)
+        self.assertNotIn(b"late", out)              # nothing past the cap reaches the client
+        self.assertNotIn(b"message_stop", out)
+        self.assertIn(b"time cap", out)              # the client is told the turn was cut off
+
+    def test_a_turn_whose_deadline_has_passed_is_never_sent(self):
+        opened = []
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {}, "claude-opus-5-5", 0, key="sk",
+                                  urlopen=lambda req, timeout=None: opened.append(1), deadline=5.0, clock=lambda: 10.0)
+        self.assertEqual((outcome, opened, h.status), ("rejected", [], 504))
+
+    def test_a_response_that_never_begins_is_cut_off_at_the_cap(self):
+        import threading
+        release = threading.Event()
+
+        def hang(req, timeout=None):
+            release.wait(10)
+            return FakeResp(body=b"{}")
+
+        h = FakeHandler()
+        t0 = __import__("time").monotonic()
+        usage, outcome = ap.serve(h, {}, "claude-opus-5-5", 0, key="sk", urlopen=hang,
+                                  deadline=__import__("time").monotonic() + 0.3)
+        release.set()
+        self.assertEqual(outcome, ap.ABORTED)
+        self.assertEqual(h.status, 504)
+        self.assertLess(__import__("time").monotonic() - t0, 5)
+
+    def test_a_stalled_real_stream_is_cut_off_by_shutting_its_socket(self):
+        # A real loopback upstream, reached through the lane's own gated transport, that sends one event and then
+        # holds the connection open (a periodic-event stream past the cap looks the same to the reader): the cutoff
+        # timer aborts the socket and serve returns ABORTED.
+        import time as tm
+
+        def answer(conn, up):
+            conn.sendall(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n" + self.SSE_START)
+            up.stop.wait(10)
+
+        with Upstream(answer) as up:
+            h = FakeHandler()
+            t0 = tm.monotonic()
+            usage, outcome = ap.serve(h, {"stream": True}, "claude-opus-5-5", 0, key="sk",
+                                      deadline=tm.monotonic() + 0.5)
+        self.assertEqual(outcome, ap.ABORTED)
+        self.assertLess(tm.monotonic() - t0, 5)      # cut at ~0.5 s, not at the 30-minute socket timeout
+        self.assertIn(b"message_start", h.wfile.buf.getvalue())
+
+
+class Upstream:
+    """A loopback stand-in for api.anthropic.com reached through the lane's REAL transport (_dispatch): _resolve points
+    at it, _tls_wrap is the identity (plain TCP), no proxy. Records every connection and every byte it receives;
+    `answer(conn, self)` is called once a whole request has arrived."""
+
+    def __init__(self, answer=None):
+        import socket as so
+        self.srv = so.socket()
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(8)
+        self.srv.settimeout(0.05)
+        self.port = self.srv.getsockname()[1]
+        self.answer, self.received, self.connections = answer, bytearray(), 0
+        self.stop = threading.Event()
+        threading.Thread(target=self._loop, daemon=True).start()
+        so_mod = so
+        self._patches = [
+            mock.patch.object(ap, "_resolve", lambda host, port: [(so_mod.AF_INET, so_mod.SOCK_STREAM, 6, "",
+                                                                   ("127.0.0.1", self.port))]),
+            mock.patch.object(ap, "_tls_wrap", lambda sock, host: sock),
+            mock.patch.object(ap, "_proxy_for", lambda host: None)]
+
+    def __enter__(self):
+        for p in self._patches:
+            p.start()
+        return self
+
+    def __exit__(self, *a):
+        for p in self._patches:
+            p.stop()
+        self.stop.set()
+        self.srv.close()
+        return False
+
+    def _loop(self):
+        import socket as so
+        while not self.stop.is_set():
+            try:
+                c, _ = self.srv.accept()
+            except so.timeout:
+                continue
+            except OSError:
+                return
+            self.connections += 1
+            threading.Thread(target=self._serve, args=(c,), daemon=True).start()
+
+    def _serve(self, c):
+        import socket as so
+        c.settimeout(0.05)
+        buf = b""
+        try:
+            while not self.stop.is_set():
+                try:
+                    chunk = c.recv(65536)
+                except so.timeout:
+                    continue
+                if not chunk:
+                    break
+                buf += chunk
+                self.received += chunk
+                head, sep, rest = buf.partition(b"\r\n\r\n")
+                if sep and self.answer is not None:
+                    n = 0
+                    for line in head.split(b"\r\n"):
+                        if line.lower().startswith(b"content-length:"):
+                            n = int(line.split(b":", 1)[1])
+                    if len(rest) >= n:
+                        self.answer(c, self)
+                        break
+        except OSError:
+            pass
+        finally:
+            c.close()
+
+
+def join_dispatch_threads(timeout=5.0):
+    """Wait for every (possibly abandoned) dispatch thread to finish, so what it did or did not send is final."""
+    for t in threading.enumerate():
+        if t.name in ("cortados-api-open", "cortados-api-error-body"):
+            t.join(timeout)
+
+
+MESSAGE = {"type": "message", "id": "m", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "hi"}],
+           "usage": {"input_tokens": 10, "output_tokens": 5}}
+
+
+def http_answer(status_line, body, extra=b""):
+    def answer(conn, up):
+        conn.sendall(status_line + b"\r\ncontent-type: application/json\r\ncontent-length: "
+                     + str(len(body)).encode() + b"\r\n" + extra + b"\r\n" + body)
+    return answer
+
+
+class TestGatedDispatch(unittest.TestCase):
+    """#114 review round 2, finding 1: once the turn's deadline passes (or it is cancelled) no worker can send the
+    request, however late its DNS lookup, connect or TLS handshake returns; and a request that was never written
+    settles as not billed."""
+
+    def test_a_real_turn_over_the_gated_transport_completes(self):
+        with Upstream(http_answer(b"HTTP/1.1 200 OK", json.dumps(MESSAGE).encode())) as up:
+            h = FakeHandler()
+            usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk-test")
+        self.assertEqual((outcome, usage), ("completed", MESSAGE["usage"]))
+        self.assertEqual(json.loads(h.wfile.buf.getvalue()), MESSAGE)
+        req = bytes(up.received)
+        self.assertTrue(req.startswith(b"POST /v1/messages HTTP/1.1\r\n"))
+        self.assertIn(b"Host: api.anthropic.com\r\n", req)
+        self.assertIn(b"x-api-key: sk-test\r\n", req)
+
+    def test_a_dns_lookup_released_after_the_deadline_never_sends(self):
+        # The review's repro on the real transport: the lookup is held past the deadline and released afterwards.
+        release, returned = threading.Event(), threading.Event()
+        with Upstream(http_answer(b"HTTP/1.1 200 OK", json.dumps(MESSAGE).encode())) as up:
+            real = ap._resolve
+
+            def stalled(host, port):
+                release.wait(10)
+                try:
+                    return real(host, port)
+                finally:
+                    returned.set()
+            with mock.patch.object(ap, "_resolve", stalled):
+                h = FakeHandler()
+                t0 = time.monotonic()
+                usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                          deadline=time.monotonic() + 0.2)
+                elapsed = time.monotonic() - t0
+                release.set()                          # the late lookup now succeeds ...
+                self.assertTrue(returned.wait(5))
+                join_dispatch_threads()
+                time.sleep(0.2)
+        self.assertLess(elapsed, 3)
+        self.assertEqual((outcome, h.status), ("rejected", 504))   # nothing written: nothing billed
+        self.assertIn(b"not dispatched", h.wfile.buf.getvalue())
+        self.assertEqual((up.connections, bytes(up.received)), (0, b""))   # ... and never connects or sends
+
+    def test_a_tls_handshake_released_after_the_deadline_never_sends(self):
+        release, returned = threading.Event(), threading.Event()
+
+        def stalled_tls(sock, host):
+            release.wait(10)
+            returned.set()
+            return sock
+        with Upstream(http_answer(b"HTTP/1.1 200 OK", json.dumps(MESSAGE).encode())) as up, \
+                mock.patch.object(ap, "_tls_wrap", stalled_tls):
+            h = FakeHandler()
+            usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                      deadline=time.monotonic() + 0.2)
+            release.set()
+            self.assertTrue(returned.wait(5))
+            join_dispatch_threads()
+            time.sleep(0.2)
+        self.assertEqual((outcome, h.status), ("rejected", 504))
+        self.assertEqual(up.connections, 1)            # it had connected ...
+        self.assertEqual(bytes(up.received), b"")      # ... and never wrote a byte of the request
+
+    def test_a_clock_past_the_deadline_at_the_first_write_refuses_it(self):
+        # No canceller involved: the gate itself checks the deadline under its lock right before the write.
+        clock = [100.0]
+
+        def slow_tls(sock, host):
+            clock[0] += 60.0                           # the handshake "took" a minute: past the 30 s deadline
+            return sock
+        with Upstream(http_answer(b"HTTP/1.1 200 OK", json.dumps(MESSAGE).encode())) as up, \
+                mock.patch.object(ap, "_tls_wrap", slow_tls):
+            h = FakeHandler()
+            usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                      deadline=130.0, clock=lambda: clock[0])
+            join_dispatch_threads()
+            time.sleep(0.1)
+        self.assertEqual((outcome, h.status), ("rejected", 504))
+        self.assertEqual(bytes(up.received), b"")
+
+    def test_the_gate_admits_no_write_after_it_is_cancelled(self):
+        import socket as so
+        a, b = so.socketpair()
+        try:
+            gate = ap._Gate(float("inf"), time.monotonic)
+            self.assertTrue(gate.attach(a))
+            self.assertTrue(gate.may_write())
+            self.assertTrue(gate.sent)
+            gate.cancel()
+            self.assertFalse(gate.may_write())
+            self.assertFalse(gate.attach(so.socket()))
+            with self.assertRaises(OSError):          # a write that passed the check just before fails on the dead socket
+                a.sendall(b"POST")
+        finally:
+            a.close()
+            b.close()
+        late = ap._Gate(5.0, lambda: 10.0)
+        self.assertFalse(late.may_write())
+        self.assertFalse(late.sent)
+
+    def test_a_connect_failure_before_any_byte_is_not_billed(self):
+        import socket as so
+        dead = so.socket()
+        dead.bind(("127.0.0.1", 0))
+        port = dead.getsockname()[1]
+        dead.close()                                   # nothing listens there: the connect is refused
+        with mock.patch.object(ap, "_resolve", lambda host, p: [(so.AF_INET, so.SOCK_STREAM, 6, "", ("127.0.0.1", port))]), \
+                mock.patch.object(ap, "_proxy_for", lambda host: None):
+            h = FakeHandler()
+            usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk")
+        self.assertEqual((outcome, h.status), ("rejected", 502))
+
+    def test_a_configured_proxy_refuses_before_anything_is_resolved(self):
+        resolved = []
+        with mock.patch.object(ap, "_proxy_for", lambda host: "http://proxy.example:3128"), \
+                mock.patch.object(ap, "_resolve", lambda *a: resolved.append(a)):
+            h = FakeHandler()
+            usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk")
+        self.assertEqual((outcome, h.status, resolved), ("rejected", 502, []))
+        self.assertIn(b"proxy", h.wfile.buf.getvalue())
+
+    def test_a_redirect_is_relayed_as_a_rejection_and_never_followed(self):
+        body = json.dumps({"type": "error", "error": {"type": "api_error", "message": "moved"}}).encode()
+        with Upstream(http_answer(b"HTTP/1.1 302 Found", body, b"location: https://evil.example.com/\r\n")) as up:
+            h = FakeHandler()
+            usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk")
+        self.assertEqual((outcome, h.status, up.connections), ("rejected", 302, 1))
+
+
+class TestErrorBodyBounds(unittest.TestCase):
+    """#114 review round 2, finding 2: an upstream error body is read only until the turn's deadline and only up to
+    ERROR_BODY_MAX bytes, and its response is always closed; the turn stays a rejection."""
+
+    def test_a_stalled_http_error_body_is_cut_off_at_the_deadline(self):
+        # The review's shape: a 20 ms deadline and an error body whose read stalls.
+        release = threading.Event()
+        closed = []
+
+        class Stalling(io.RawIOBase):
+            def readable(self):
+                return True
+
+            def readinto(self, b):
+                release.wait(10)
+                return 0
+
+            def close(self):
+                closed.append(1)
+                super().close()
+        err = urllib.error.HTTPError("u", 400, "Bad", {"content-type": "application/json"}, Stalling())
+        h = FakeHandler()
+        t0 = time.monotonic()
+        try:
+            usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                      urlopen=mock.Mock(side_effect=err), deadline=time.monotonic() + 0.02)
+            elapsed = time.monotonic() - t0
+        finally:
+            release.set()
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual((usage, outcome, h.status), ({}, "rejected", 400))
+        self.assertIn(b"upstream rejected the request", h.wfile.buf.getvalue())
+        self.assertTrue(closed)
+
+    def test_a_dribbling_real_error_body_is_cut_off_at_the_deadline(self):
+        def answer(conn, up):
+            conn.sendall(b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n"
+                         b"content-length: 5000\r\n\r\n")
+            while not up.stop.wait(0.05):              # one byte every 50 ms, never finishing before the deadline
+                try:
+                    conn.sendall(b" ")
+                except OSError:
+                    return
+        with Upstream(answer):
+            h = FakeHandler()
+            t0 = time.monotonic()
+            usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                      deadline=time.monotonic() + 0.3)
+            elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 2)
+        self.assertEqual((outcome, h.status), ("rejected", 400))
+
+    def test_an_oversized_error_body_is_read_only_up_to_its_cap(self):
+        big = json.dumps({"type": "error", "error": {"type": "api_error", "message": "x" * (ap.ERROR_BODY_MAX * 4)}})
+        reads = []
+
+        class Spy(io.BytesIO):
+            def read(self, n=-1):
+                reads.append(n)
+                return super().read(n)
+        fp = Spy(big.encode())
+        err = urllib.error.HTTPError("u", 400, "Bad", {"content-type": "application/json"}, fp)
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=mock.Mock(side_effect=err))
+        self.assertEqual((outcome, h.status), ("rejected", 400))
+        self.assertEqual(reads, [ap.ERROR_BODY_MAX + 1])              # never read past the cap
+        self.assertLess(len(h.wfile.buf.getvalue()), ap.ERROR_BODY_MAX)
+        self.assertTrue(fp.closed)
 
 
 if __name__ == "__main__":

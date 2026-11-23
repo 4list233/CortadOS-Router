@@ -63,8 +63,17 @@ BACKEND_ENV = {
 }
 
 
+# Never inherited, whatever the lists above say (defence in depth, #114): the API credit key spends real promotional
+# credit and is the provider's alone (api_credits.KEY_ENV, any numbered slot); API keys and auth tokens that would bill
+# or redirect a backend. A future allowlist edit that names one of these is overruled here (asserted by tests).
+NEVER_ENV = frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY"})
+NEVER_PREFIXES = ("CORTADOS_ANTHROPIC_API_KEY", "CORTADOS_PROVIDER_TOKEN")
+
+
 def allowed(name: str, backend: str) -> bool:
     """Whether `name` may be inherited by `backend`'s child ("codex" or "claude")."""
+    if name in NEVER_ENV or name.startswith(NEVER_PREFIXES):
+        return False
     return name in BASE_ENV or name.startswith(BASE_PREFIXES) or name in BACKEND_ENV[backend]
 
 

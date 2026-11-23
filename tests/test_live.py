@@ -437,11 +437,12 @@ class CollectTest(unittest.TestCase):
                     "windows": [{"window": "1mo", "pool": "all", "left_pct": left}]}
         u = {"lanes": [lane("anthropic-api", 0.0), lane("antigravity", 5.0), lane("claude", 60.0), lane("codex", 40.0)]}
         self.assertEqual(live.subscriptions_section(u, NOW)["lowest"]["lane"], "anthropic-api")   # no predicate: as before
-        with mock.patch("cortados_router.api_credits.configured_orgs", return_value=[]):
+        # #114: the credit lane counts only while it is on (key, grants, ledger, stop line: api_credits.state)
+        with mock.patch("cortados_router.api_credits.state", return_value={"on": False}):
             s = live.subscriptions_section(u, NOW, live.lane_enabled)
         self.assertEqual(s["lowest"]["lane"], "codex")        # antigravity: context ceiling 0, refused by the fit gate
         self.assertEqual(len(s["lanes"]), 4)                  # still listed, only never the floor
-        with mock.patch("cortados_router.api_credits.configured_orgs", return_value=[("org", "key")]):
+        with mock.patch("cortados_router.api_credits.state", return_value={"on": True}):
             self.assertEqual(live.subscriptions_section(u, NOW, live.lane_enabled)["lowest"]["lane"], "anthropic-api")
         s = live.subscriptions_section(u, NOW, lambda l: (_ for _ in ()).throw(KeyError()) if l == "codex" else True)
         self.assertEqual(s["lowest"]["lane"], "anthropic-api")
