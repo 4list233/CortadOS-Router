@@ -80,7 +80,7 @@ def main(argv=None) -> int:
         cfg = json.loads(Path(a.current).read_text())
         reqs = load_requests(a.requests, a.n)
         t0 = time.time()
-        scorer = Scorer(cfg["base"], cfg["adapter"], cfg.get("temperatures"))
+        scorer = Scorer(cfg["base"], cfg["adapter"], cfg.get("temperatures"), prefix_cache=True)   # the check: on regardless of the env
         load_s = time.time() - t0
     except Exception as exc:
         print(json.dumps({"ok": False, "error": f"could not run: {type(exc).__name__}: {str(exc)[:300]}"}))
