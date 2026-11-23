@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from cortados_router import child_tasks
-from cortados_router.provider import clients, live, work_split
+from cortados_router.provider import clients, live, server, work_split
 from tests import test_live as tl
 
 NOW = tl.NOW
@@ -730,6 +730,45 @@ class SessionEndpointTest(tl.EndpointHarness):
             code, raw, _ = self.request("GET", P + q, SESSION_TOKEN)
             self.assertEqual(code, 400, (q, raw))
             self.assertNotIn("pstack", raw)
+
+    def test_the_access_log_never_keeps_the_machine_or_session_tag(self):
+        """Review round 2 (MEDIUM): ?machine=<tag> is a capability and the request line was logged whole at DEBUG.
+        Every query value is redacted in the access log, for answered, refused and unknown requests alike, and the 404
+        no longer echoes the query."""
+        import logging
+        self._untagged_log()
+        P = live.SESSION_PATH + "?session=" + MINE + "&machine=" + MACHINE_A
+        with self.assertLogs(server.logger, level=logging.DEBUG) as cm:
+            for path, token, want in ((P, SESSION_TOKEN, 200),                       # answered
+                                      (P + "&machine=" + MACHINE_B, SESSION_TOKEN, 400),  # refused: two tags
+                                      (P, "wrong-token", 401),                       # refused: auth
+                                      ("/v1/cortados/nowhere?machine=" + MACHINE_A, SESSION_TOKEN, None)):
+                code, raw, _ = self.request("GET", path, token)
+                if want is not None:
+                    self.assertEqual(code, want, (path, raw))
+                else:
+                    self.assertIn(code, (401, 403, 404), raw)
+                for bad in (MACHINE_A, MACHINE_B):
+                    self.assertNotIn(bad, raw if code != 200 else "", (path, bad))
+        text = "\n".join(cm.output)
+        self.assertIn("machine=<redacted>", text)
+        self.assertIn("session=<redacted>", text)
+        for bad in (MACHINE_A, MACHINE_B, MINE):
+            self.assertNotIn(bad, text, bad)
+
+    def test_redact_query_keeps_names_and_drops_values(self):
+        self.assertEqual(server.redact_query("GET /v1/x?session=" + MINE + "&machine=" + MACHINE_A + " HTTP/1.1"),
+                         "GET /v1/x?session=<redacted>&machine=<redacted> HTTP/1.1")
+        self.assertEqual(server.redact_query("GET /v1/x HTTP/1.1"), "GET /v1/x HTTP/1.1")
+        self.assertEqual(server.redact_query("/p?a=1&b=&c"), "/p?a=<redacted>&b=<redacted>&c")
+
+    def test_machine_tags_compare_in_constant_time(self):
+        self.assertTrue(live.same_machine(MACHINE_A, MACHINE_A))
+        for a, b in ((MACHINE_A, MACHINE_B), (MACHINE_A, None), (None, None), ("", ""), (MACHINE_A, MACHINE_A + "0")):
+            self.assertFalse(live.same_machine(a, b), (a, b))
+        with mock.patch.object(live.hmac, "compare_digest", wraps=live.hmac.compare_digest) as cd:
+            live.same_machine(MACHINE_A, MACHINE_B)
+        cd.assert_called_once()
 
     def test_untagged_remote_stubs_come_from_the_machine_index_only(self):
         """Stubs written the way start_task writes them: an untagged one with MACHINE_A goes to by-machine/<A>, the

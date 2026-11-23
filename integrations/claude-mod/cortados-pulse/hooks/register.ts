@@ -277,14 +277,21 @@ export async function fetchView($: Pick<EngineInterface, 'env' | 'fs' | 'http' |
     }
     if (!r.ok) return { ok: false, status: r.status, problem: 'provider returned HTTP ' + r.status }
     const data = scrubResponse(JSON.parse(r.text), token)
-    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error(path + ' did not return a JSON object')
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error(path.split('?')[0] + ' did not return a JSON object')
     return { ok: true, data, url }
   } catch (e) {
     const why = (e as Error)?.message ?? String(e)
     const since = (e as any)?.pendingSince
-    return { ok: false, problem: scrub('could not read the provider (' + why + ')', token),
+    return { ok: false, problem: redactQuery(scrub('could not read the provider (' + why + ')', token)),
       ...(typeof since === 'number' ? { pendingSince: since } : {}) }
   }
+}
+
+/** `text` with every URL query value replaced by <redacted> (names kept). A host's fetch error can echo the URL it was
+ * given, and the session view's carries &machine=<tag>, a capability (pulse review round 2): no pane line ever shows a
+ * query value, the session tag's included. */
+export function redactQuery(text: string): string {
+  return text.replace(/([?&][^=&\s#]*=)[^&\s#)]*/g, '$1<redacted>')
 }
 
 /** Provider reads whose underlying $.http.fetch has not settled yet, by URL. A read counts here until the host's fetch

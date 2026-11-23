@@ -3,7 +3,7 @@
 // the Claude desktop app's own). Fakes only: no provider, no process is reached.
 import { test, expect, mock } from 'claude-code/testing'
 import { taskRow, taskRows, defaultTaskLines, localModelLine, subsLine, s1Line, machineTag, machineKey, fetchTree,
-  sessionTag, FALLBACK, FINISHED_SHOWN, TITLE_MAX, NO_TASKS, UNTAGGED_HEAD, MACHINE_TAG_LABEL } from './register'
+  sessionTag, readSessionView, redactQuery, FALLBACK, FINISHED_SHOWN, TITLE_MAX, NO_TASKS, UNTAGGED_HEAD, MACHINE_TAG_LABEL } from './register'
 
 const TOKEN = 'sekrit-token-123'
 const MINE = 'aaaaaaaaaaaaaaa1'
@@ -144,6 +144,25 @@ test('the session view is asked with &machine= when the salt is readable, never 
     expect(urls[0]!.includes('device=')).toBe(false)
     if (salt) expect(urls[0]!.includes(salt)).toBe(false)        // the salt itself never leaves the machine
   }
+})
+
+test('a failed read never shows the machine tag or the session tag: a host error echoing the URL is redacted', async () => {
+  // pulse review round 2: &machine=<tag> is a capability; a fetch error that quotes the URL must not put it on screen
+  const echo = { ...saltFake(SALT_V), http: { fetch: async (url: string) => { throw new Error('connect ECONNREFUSED ' + url) } } }
+  const r = await readSessionView(echo as any, { ...FALLBACK, providerToken: TOKEN }, MINE, MACHINE_V)
+  expect(r.kind).toBe('failed')
+  const problem = (r as any).problem as string
+  expect(problem.includes(MACHINE_V)).toBe(false)
+  expect(problem.includes(MINE)).toBe(false)
+  expect(problem).toContain('machine=<redacted>')
+  // an answer that is not a JSON object: the error names the path only, never its query
+  const odd = { ...saltFake(SALT_V), http: { fetch: async () => ({ status: 200, ok: true, headers: {}, text: '[1]' }) } }
+  const r2 = await readSessionView(odd as any, { ...FALLBACK, providerToken: TOKEN }, MINE, MACHINE_V)
+  expect(r2.kind).toBe('failed')
+  expect((r2 as any).problem).toBe('could not read the provider (/v1/cortados/live/session did not return a JSON object)')
+  expect(redactQuery('GET /x?session=' + MINE + '&machine=' + MACHINE_V + ' HTTP/1.1'))
+    .toBe('GET /x?session=<redacted>&machine=<redacted> HTTP/1.1')
+  expect(redactQuery('no query here')).toBe('no query here')
 })
 
 test('an older provider that ignores &machine= answers without the untagged group: only the session\'s own tasks', () => {

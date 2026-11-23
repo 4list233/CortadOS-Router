@@ -537,6 +537,11 @@ names the session, so the server cannot recover the tag.
 - The pane computes its machine's tag once from the salt it already reads (`machineKey`, `machineTag`; no process is
   run) and asks with `&machine=`; without a readable salt it asks nothing more. It draws those tasks under "started on
   this machine without a session tag (<device>)". An older provider ignores the parameter.
+- The tag is a capability, so it is kept out of logs and error lines (review round 2): `server.redact_query` replaces
+  every query value with `<redacted>` in the access log (`Handler.log_message`, which both answered and refused
+  requests reach) and in the 404 echo; the pane's `redactQuery` does the same to its error lines (a host fetch error can
+  quote the URL), and a non-object answer names the path without its query. Every comparison of a machine tag
+  (`live.same_machine`, `child_tasks.remote_stubs_for_machine`) is `hmac.compare_digest`.
 - Not covered: an untagged task of this machine that ran "here" shows only when this machine's heartbeat reports it
   (the pane's own-log merge is still by tag).
 
@@ -558,7 +563,9 @@ views); Python: `tests/test_orchestrator_tree.py` `UntaggedMachineTest` (own gro
 or guessed tags, older tasks, a heartbeat that claims another machine's tag, no tag published) and
 `SessionEndpointTest.test_machine_adds_only_that_machines_untagged_group`,
 `test_a_foreign_or_guessed_machine_tag_sees_nothing_of_another_machine`,
-`test_a_hostname_opens_nothing_and_a_bad_tag_is_refused`, `test_untagged_remote_stubs_come_from_the_machine_index_only`;
+`test_a_hostname_opens_nothing_and_a_bad_tag_is_refused`, `test_untagged_remote_stubs_come_from_the_machine_index_only`,
+`test_the_access_log_never_keeps_the_machine_or_session_tag`, `test_redact_query_keeps_names_and_drops_values`,
+`test_machine_tags_compare_in_constant_time`;
 `tests/test_child_tasks.py` `test_a_desktop_app_server_records_the_machine_tag_and_says_why`,
 `test_the_main_entry_makes_the_salt_so_a_desktop_server_gets_a_machine_tag`,
 `test_the_machine_tag_is_its_own_domain_never_a_session_tag`,

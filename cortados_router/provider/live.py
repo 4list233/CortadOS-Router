@@ -59,6 +59,7 @@ over HEARTBEAT_MAX_BYTES with 413. docs/PROVIDER-PLAN.md ("Live view") has the s
 """
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import math
@@ -676,7 +677,7 @@ def heartbeat_rows(beats: dict[str, dict[str, Any]], now: float, known: dict[str
                     continue                        # this machine's own record could not be read: no claim on a guess
                 if (k.get("host") and k["host"] != h) or \
                         (k.get("origin_session") and e.get("origin_session") != k["origin_session"]) or \
-                        (k.get("stub") and e.get("origin_machine") and e["origin_machine"] != k.get("origin_machine")):
+                        (k.get("stub") and e.get("origin_machine") and not same_machine(e["origin_machine"], k.get("origin_machine"))):
                     # the provider host's own record names another host or origin; or its stub (written here, at the
                     # start) another machine tag than the report claims: a host never moves a task into a machine's
                     # untagged group (a report without the tag, an older host, is no claim: the stub's is kept below)
@@ -1168,7 +1169,7 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
     for r in list(by_id.values()):
         origin, via = _origin_of(by_id, r)
         if session is not None and origin != session and not (
-                untagged_machine is not None and origin is None and r.get("origin_machine") == untagged_machine):
+                untagged_machine is not None and origin is None and same_machine(r.get("origin_machine"), untagged_machine)):
             continue                                # filtered before anything is built or capped
         origin_of[r["task_id"]] = origin
         nodes[r["task_id"]] = _task_node(r, subs.get(r["task_id"], []), run_tokens.get(r["task_id"]), via,
@@ -1313,6 +1314,15 @@ def for_session(snap: dict[str, Any], session: str) -> dict[str, Any]:
 def valid_machine(v: Any) -> str | None:
     """A ?machine= value (child_tasks.MACHINE_TAG_RE: the tag cortados-route records as origin_machine), else None."""
     return v if isinstance(v, str) and child_tasks.MACHINE_TAG_RE.fullmatch(v) else None
+
+
+def same_machine(a: Any, b: Any) -> bool:
+    """Two machine tags are the same tag: both non-empty strings, compared in constant time (hmac.compare_digest). A
+    tag is a capability (it opens a machine's untagged tasks), so no comparison of one may leak its prefix by timing
+    (pulse review round 2, defense in depth)."""
+    if not (isinstance(a, str) and isinstance(b, str) and a and b):
+        return False
+    return hmac.compare_digest(a.encode("utf-8", "surrogatepass"), b.encode("utf-8", "surrogatepass"))
 
 
 def valid_session(v: Any) -> str | None:
@@ -1855,7 +1865,7 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     if session is not None:
         away = [x for x in away if x.get("origin_session") == session or (
             untagged_machine is not None and not x.get("origin_session")
-            and x.get("origin_machine") == untagged_machine)]
+            and same_machine(x.get("origin_machine"), untagged_machine))]
         conv_items = [it for it in conv_items if it.get("session") == session]
     for name, lst in (("task stubs", away), ("conversations", conv_items)):
         if len(lst) > TREE_INPUT_MAX:

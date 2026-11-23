@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import plistlib
@@ -2445,7 +2446,10 @@ def remote_stubs_for_machine(machine) -> list:
         except Exception:                       # a RecordError, or anything a planted stub makes the read raise
             continue
         o = clean_origin_meta(rec.get("origin")) if rec is not None else {}
-        if not o.get("origin_session") and o.get("origin_machine") == machine:
+        # constant-time (pulse review round 2): the tag is a capability
+        om = o.get("origin_machine")
+        if not o.get("origin_session") and isinstance(om, str) and om and \
+                hmac.compare_digest(om.encode("utf-8", "surrogatepass"), machine.encode("utf-8", "surrogatepass")):
             out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at"), **o})
     return out
 

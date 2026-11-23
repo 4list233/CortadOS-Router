@@ -1869,6 +1869,16 @@ def with_tools_note(results: dict, note: str | None) -> dict:
     return out
 
 
+_QUERY_VALUE_RE = re.compile(r"([?&][^=&\s#]*=)[^&\s#]*")
+
+
+def redact_query(text: str) -> str:
+    """`text` (a request line or path) with every query value replaced by `<redacted>`, the names kept: a query can carry
+    a capability (?machine=, the pulse pane's machine tag) or a session tag, and none of the provider's views needs its
+    values in a log line or an echoed error (pulse review round 2)."""
+    return _QUERY_VALUE_RE.sub(r"\1<redacted>", text) if "?" in text else text
+
+
 class Handler(BaseHTTPRequestHandler):
     server: "ProviderServer"
     _scoped: "clients.Client | None" = None             # the scoped client of the current request (_scope_gate)
@@ -1877,8 +1887,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):                  # route http.server's stderr lines into logging
         # fmt is http.server's own constant; its args (the request line, a path) are client text: each rendered by
-        # log_text, and the record escaped again by the installed SafeFormatter (serve()).
-        logger.debug("%s " + fmt, self.address_string(), *(anthropic_wire.log_text(a, 300) if isinstance(a, str) else a for a in args))
+        # log_text, and the record escaped again by the installed SafeFormatter (serve()). Every query value is
+        # redacted first (redact_query): ?machine= is a capability (the pane's salt-derived machine tag) and ?session=
+        # a session's tag, neither of which an access log may keep (pulse review round 2). Successful and rejected
+        # requests alike: http.server's log_request and log_error both end here.
+        logger.debug("%s " + fmt, self.address_string(),
+                     *(anthropic_wire.log_text(redact_query(a), 300) if isinstance(a, str) else a for a in args))
 
     # ------------------------------------------------------------------ plumbing
     def _credential(self) -> str:
@@ -2333,7 +2347,7 @@ class Handler(BaseHTTPRequestHandler):
             if found is None:
                 return self._error(404, "not_found_error", f"cortados: no routed request recorded for run {run_id}")
             return self._json(200, found)
-        self._error(404, "not_found_error", self.path)
+        self._error(404, "not_found_error", redact_query(self.path))
 
     def do_POST(self):
         self._authed, self._bridge = False, None
