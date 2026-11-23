@@ -197,7 +197,12 @@ class Scorer:
             self._prefix_ids[system] = ids
         return ids
 
-    def score(self, request: str, unit_kind: str = "interactive", *, task_context=None, use_prefix: bool = True) -> dict[str, Any]:
+    def score(self, request: str, unit_kind: str = "interactive", *, task_context=None, use_prefix: bool = True,
+              prefill_split: int | None = None) -> dict[str, Any]:
+        """prefill_split (checks only): on the uncached path, prefill prompt[:prefill_split] in its own forward pass on the
+        request's fresh cache, then the rest -- the cached path's exact computation without the stored state or its copy.
+        Splitting the prefill alone changes bf16 rounding (s1/check_prefix_cache.py), so this is the reference the
+        cached path must match bit for bit."""
         mx, t0 = self.mx, time.time()
         msgs = messages(request, unit_kind, task_context=task_context)
         prompt = list(self.tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True))
@@ -216,6 +221,9 @@ class Scorer:
             cache = self._make_cache(self.model)          # reuse off or the prompt does not start with the prefix: full pass
         self.last_stats = {"prompt_tokens": len(prompt), "prefix_tokens": reused, **self.prefixes.stats()}
         feed, done_text, answers, probs = prompt[reused:], "", {}, {}
+        if not reused and prefill_split and 0 < prefill_split < len(prompt):
+            self.model(mx.array([prompt[:prefill_split]]), cache=cache)
+            feed = prompt[prefill_split:]
         n_fed_completion = 0
         for q in QUESTIONS:
             done_text += ("\n" if done_text else "") + f"{q}="
