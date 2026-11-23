@@ -894,6 +894,57 @@ def _stop_group(child, pgid, grace_seconds):
 # Poll interval of the wait loop: how quickly a recorded stop request is acted on while the child runs.
 STOP_POLL_SECONDS = 0.1
 
+# #116 (owner 2026-11-18): where the gate records its trainer's process group for the S1 latency guard (s1/overnight.py
+# sets it for every cycle to s1/data/trainer-group.json). The trainer leads its own group (start_new_session), so a gate
+# wrapper that crashed leaves it outside the cycle's process tree; this record is how the guard still finds, stops and
+# continues it. Unset (a gate run outside the supervisor): no record.
+TRAINER_GROUP_ENV = "CORTADOS_S1_TRAINER_GROUP_FILE"
+
+
+def _proc_start(pid):
+    """`ps -o lstart=` of pid in the C locale, whitespace-normalised: the leader's start time, which tells this group from
+    a later one that reuses its id (s1/overnight.group_is_ours compares it). None when ps cannot say: a failure, a timeout,
+    a nonzero exit or an empty answer (#116 review round 5: stdout of a failed ps is never taken as the identity; a None
+    start makes group_is_ours undecidable, so the guard never signals on it)."""
+    try:
+        p = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True, timeout=10,
+                           env=dict(os.environ, LC_ALL="C", LANG="C"))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    return " ".join(p.stdout.split()) or None
+
+
+def _record_trainer_group(path, pgid, start_of=None):
+    """Write {"pgid", "start", "gate_pid"} to path atomically (tmp + fsync + rename). A failure is reported, never fatal:
+    the guard still finds the trainer through the process tree while this gate lives."""
+    start_of = start_of or _proc_start   # looked up at call time (tests replace it)
+    try:
+        tmp = Path(str(path) + ".tmp")
+        with open(tmp, "w") as f:
+            f.write(json.dumps({"version": 1, "pgid": pgid, "start": start_of(pgid), "gate_pid": os.getpid()}) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        print("studio gate: cannot record the training group for the latency guard (%s)" % type(exc).__name__,
+              file=sys.stderr)
+
+
+def _clear_trainer_group(path, pgid):
+    """Remove the record once the trainer's group is gone, only when it still names this gate's group (a later gate's
+    record is never removed)."""
+    try:
+        with open(path) as f:
+            rec = json.load(f)
+        if isinstance(rec, dict) and rec.get("pgid") == pgid:
+            os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        print("studio gate: cannot clear the training group record (%s)" % type(exc).__name__, file=sys.stderr)
+
 
 def run_holding_lock(argv, lock_fd, grace_seconds=None, stop=None, after_spawn=None):
     """Run argv in its own process group with the node-lock fd passed down; return its exit status
@@ -912,8 +963,11 @@ def run_holding_lock(argv, lock_fd, grace_seconds=None, stop=None, after_spawn=N
     if stop.is_set():
         return stop.exit_code()  # stop arrived before the child: do not start it
     child = None
+    record = os.environ.get(TRAINER_GROUP_ENV) or None
     try:
         child = subprocess.Popen(argv, pass_fds=(lock_fd,), start_new_session=True)
+        if record is not None:
+            _record_trainer_group(record, child.pid)   # before anything else can stop it: the guard must find it
         if after_spawn is not None:
             after_spawn(child)
         while not stop.is_set():
@@ -925,7 +979,10 @@ def run_holding_lock(argv, lock_fd, grace_seconds=None, stop=None, after_spawn=N
     finally:
         if child is not None:
             # pgid == child.pid: start_new_session makes the child lead a new session and group.
-            _stop_group(child, child.pid, grace_seconds)
+            emptied = _stop_group(child, child.pid, grace_seconds)
+            if record is not None and emptied:
+                # Only once the group is empty: a group that survived SIGKILL keeps its record, so the guard still finds it.
+                _clear_trainer_group(record, child.pid)
     # Decided only after the teardown: a stop that arrives during _stop_group (leader already exited 0, a descendant
     # still in its grace) must still report 128 + signum, not the leader's 0.
     if stop.is_set():

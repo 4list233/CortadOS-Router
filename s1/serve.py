@@ -1,6 +1,8 @@
 """CortadOS Router S1 scorer service: the promoted adapter (s1/current.json) loaded once, answering POST /score in ~1 s on this Mac.
   POST /score {"request": str, "unit_kind": "interactive"|"background"} → {"answers", "probs", "confidence", "ms", "model"}
   GET  /health → {"ok", "model", "loaded_s"}
+  GET  /latency → {"window_s", "samples": [{"age_s", "s", "outcome", "probe"}...]}: the scorer's own timing of its recent
+       /score requests (#116), read by the latency guard in overnight.py. Timing metadata only, never request text.
 Reloads when current.json changes (a promotion). Never more than one request at a time (MLX is not thread-safe); the router's own timeout guards the turn.
 Admission sheds only on an actually full (bounded) queue: 503 {"busy": true}. At dequeue the worker drops a job whose
 caller is gone, or whose remaining deadline is shorter than the expected service time while other jobs wait behind it;
@@ -47,6 +49,38 @@ REQUEST_LOG = os.environ.get("CORTADOS_S1_REQUEST_LOG") or None                 
 REQUEST_LOG_BYTES = int(os.environ.get("CORTADOS_S1_REQUEST_LOG_BYTES", str(5 * 1024 * 1024)))
 REQUEST_LOG_BACKUPS = int(os.environ.get("CORTADOS_S1_REQUEST_LOG_BACKUPS", "3"))  # bounded: at most (1 + backups) x bytes on disk
 TOKEN = os.environ.get("CORTADOS_S1_TOKEN") or None                                  # when set, POST /score needs Authorization: Bearer <token>; loopback default leaves it unset
+
+# The latency window (#116): one sample per /score request, timed here from "request fully received" to "reply ready" (or
+# the handler giving up on the worker), so it includes the wait behind other requests in the single MLX queue -- what a routed
+# call actually waits. Bounded by count and age. The overnight.py guard reads it on GET /latency instead of trusting a lone
+# probe: a quiet scorer answering a short probe fast says nothing about the routed calls queued behind training.
+LATENCY_MAX_SAMPLES = 512
+LATENCY_WINDOW_S = 900.0
+# Outcomes: ok (answered), error (scorer raised; still timed), timeout (the handler stopped waiting -- 504, the caller's own
+# timeout -- or the worker dropped the job at dequeue -- 503 {"dropped": true}, it could not be scored before the caller's
+# deadline: either way a routed call was degraded), busy (503, backlog full: never queued). The guard reads timeout and busy
+# as over any budget.
+LATENCY_OUTCOMES = ("ok", "error", "timeout", "busy")
+_latency: deque = deque(maxlen=LATENCY_MAX_SAMPLES)
+_latency_lock = threading.Lock()
+
+
+def record_latency(seconds: float, outcome: str, *, probe: bool = False, clock=time.monotonic) -> None:
+    """Keep one /score timing sample: (end time, seconds, outcome, probe). Monotonic clock: ages survive a wall-clock step."""
+    with _latency_lock:
+        _latency.append((clock(), max(0.0, float(seconds)), outcome if outcome in LATENCY_OUTCOMES else "error", bool(probe)))
+
+
+def latency_report(*, clock=time.monotonic) -> dict:
+    """GET /latency: the samples of the last LATENCY_WINDOW_S, newest last, each as its age (seconds since it ended) so the
+    reader needs no shared clock."""
+    now = clock()
+    with _latency_lock:
+        rows = list(_latency)
+    out = [{"age_s": round(now - end, 3), "s": round(sec, 3), "outcome": outcome, "probe": probe}
+           for end, sec, outcome, probe in rows if now - end <= LATENCY_WINDOW_S]
+    return {"window_s": LATENCY_WINDOW_S, "samples": out}
+
 
 # Bounded, so a put_nowait that would exceed MAX_PENDING raises queue.Full and the handler returns 503 atomically -- a
 # qsize() check before a separate put races under ThreadingHTTPServer and lets concurrent handlers overshoot.
@@ -338,6 +372,11 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._recv_done()
+        if self.path.split("?", 1)[0] == "/latency":
+            # Timing metadata only, but behind the same token as /score once one is set (a non-loopback bind).
+            if TOKEN is not None and self.headers.get("Authorization", "") != f"Bearer {TOKEN}":
+                self._send(401, {"error": "unauthorized"}); return
+            self._send(200, latency_report()); return
         self._send(200, {"ok": _state["scorer"] is not None, "model": _state["model"], "loaded_s": _state["loaded_s"]})
 
     def do_POST(self):
@@ -360,13 +399,17 @@ class H(BaseHTTPRequestHandler):
                    "service_s": None, "expected_s": _service.expected()}
             body = json.loads(raw or b"{}")
             wait = client_wait(self.headers.get("X-Request-Timeout-S"))
+            probe = self.headers.get("X-CortadOS-Probe") == "1"   # the latency guard's own probe: timed, and marked as such
+            t0 = time.monotonic()
             reply, full = enqueue(body, time.time() + wait)
-            if full is not None:                              # backlog full, or it could not finish in time: shed load now
+            if full is not None:                              # backlog full: shed load now, never queued
+                record_latency(0.0, "busy", probe=probe)
                 log_request(outcome="busy", code=full[0], **log); log = None
                 self._send(*full); return
             try:
                 r = reply.get(timeout=max(wait, 1.0))
-            except queue.Empty:
+            except queue.Empty:                               # the caller's own timeout passed: its routed call is degraded
+                record_latency(time.monotonic() - t0, "timeout", probe=probe)
                 log_request(outcome="timeout", code=504, **log); log = None
                 self._send(504, {"error": "timeout: no score before the caller's deadline"}); return
             meta = r.pop("_meta", None) or {}
@@ -374,6 +417,10 @@ class H(BaseHTTPRequestHandler):
                                                   "prefix_slots", "prefix_bytes", "peak_rss_bytes")
                         if k in meta})
             code = 503 if r.get("busy") else 500 if "error" in r else 200
+            # The worker dropped it at dequeue (deadline passed, or too little time left with others waiting): the routed
+            # call is degraded just as on a handler timeout, so the latency window calls it a timeout, never an error.
+            record_latency(time.monotonic() - t0, "timeout" if r.get("dropped") else "busy" if code == 503
+                           else "error" if code == 500 else "ok", probe=probe)
             log_request(outcome="dropped" if r.get("dropped") else "ok" if code == 200 else "error", code=code, **log); log = None
             self._send(code, {**r, "model": _state["model"]})
         except Exception as exc:

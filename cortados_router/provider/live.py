@@ -176,7 +176,34 @@ _HB_HW_KEYS = _HB_PCT + _HB_BYTES + ("load_1m", "chip", "sampled_at")
 # data/nightly.stop, data/sweep-request.json), never a path or a file's contents
 S1_FLAGS = ("no-promote", "no-train-tonight", "nightly-stop", "sweep-requested")
 S1_HEALTH = ("up", "down", "unknown")
-_HB_S1_KEYS = {"health", "model", "flags", "pending", "loaded_s"}
+_HB_S1_KEYS = {"health", "model", "flags", "pending", "loaded_s", "guard"}
+# heartbeat `s1.guard` (#116): the S1 latency guard's state (s1/overnight.py Guard.state, data/latency-guard.json). Fixed
+# states and reason slugs (s1/overnight.GUARD_REASONS), seconds, counts and one timestamp; never a URL, path, pid or text.
+# stopped_for_day (#116, owner 2026-11-18/22): scoring was still over budget when the longest pause ended, so training stopped
+# and no training cycle starts before `until` (epoch s), set by the rule `until_rule` (s1/overnight.DAY_STOP_RULES:
+# window_start, retry_1h for a stop inside the training window, midnight); labelling-only cycles run meanwhile, and one the
+# guard pauses shows state "paused" with `until`/`until_rule` still set.
+S1_GUARD_STATES = ("running", "paused", "idle", "stopped_for_day", "unknown")
+S1_GUARD_PAUSE = ("complete", "incomplete")      # every group of a pause confirmed stopped, or not (#116 review round 1)
+S1_GUARD_UNTIL_RULES = ("window_start", "retry_1h", "midnight")
+# A day stop ends at the next training-window start: at most ~25 h ahead (DST included); 2 days bounds a bad value.
+S1_GUARD_UNTIL_AHEAD_MAX = 2 * 86400.0
+S1_GUARD_REASONS = ("latency", "timeout", "refused", "memory", "no_baseline", "forced_release")
+S1_GUARD_SOURCES = ("scorer", "probe")
+_S1_GUARD_SECONDS = ("budget_s", "baseline_p50_s", "baseline_p90_s", "p50_s", "p90_s")
+# unresolved_groups (#116 review round 2): process groups the guard stopped that are not confirmed continued or gone yet
+# (EPERM from a live member, or an identity ps cannot check); retried at every reading. A count only, never a pid.
+_S1_GUARD_COUNTS = ("samples", "timeouts", "pauses_24h", "unresolved_groups")
+_HB_S1_GUARD_KEYS = {"state", "reason", "updated_at", "paused_s", "budget", "source", "pause", "until",
+                     "until_rule"} | set(_S1_GUARD_SECONDS) \
+    | set(_S1_GUARD_COUNTS)
+S1_GUARD_SECONDS_MAX = 3600.0      # a latency, baseline or budget; the router's own S1 timeout is 15 s
+S1_GUARD_PAUSED_MAX = 7 * 86400.0
+S1_GUARD_COUNT_MAX = 100000
+# A running or paused guard writes its state at every probe (30 s by default); older than this, its supervisor is not
+# ticking (stopped, hung, or killed mid-pause) and the state is shown as stale. An idle guard writes once per cycle, so
+# its age says nothing and it is never stale.
+S1_GUARD_STALE_S = 300.0
 _REASON_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,47}")   # a pending candidate's reason (evaluation_pending, promotion_held)
 _JOB_KEYS = {"name", "state", "summary", "started_at", "finished_at", "next_at", "progress_pct"}
 
@@ -251,7 +278,7 @@ def validate_heartbeat(body: Any, now: float) -> tuple[dict[str, Any] | None, st
             return None, "hardware" + bad
         out["hardware"] = hw
     if body.get("s1") is not None:
-        s1, bad = _validate_s1(body["s1"])
+        s1, bad = _validate_s1(body["s1"], now)
         if bad is not None:
             return None, "s1" + bad
         out["s1"] = s1
@@ -378,7 +405,66 @@ def _validate_hw(hw: Any, now: float) -> tuple[dict[str, Any] | None, str | None
     return out, None
 
 
-def _validate_s1(s1: Any) -> tuple[dict[str, Any] | None, str | None]:
+def validate_s1_guard(g: Any, now: float) -> tuple[dict[str, Any] | None, str | None]:
+    """The S1 latency guard's state (#116), or (None, ".<bad field>"). Every key is present in the result (None when not
+    known); the sender (live_heartbeat) runs the same check on the guard's file."""
+    if not isinstance(g, dict) or set(g) - _HB_S1_GUARD_KEYS:
+        return None, ""
+    if g.get("state") not in S1_GUARD_STATES:
+        return None, ".state"
+    out: dict[str, Any] = {"state": g["state"]}
+    for k, allowed in (("reason", S1_GUARD_REASONS), ("budget", ("day", "night")), ("source", S1_GUARD_SOURCES),
+                       ("pause", S1_GUARD_PAUSE), ("until_rule", S1_GUARD_UNTIL_RULES)):
+        if g.get(k) is not None and g[k] not in allowed:
+            return None, "." + k
+        out[k] = g.get(k)
+    for k in _S1_GUARD_SECONDS:
+        v = g.get(k)
+        if v is not None and not (_num(v) and 0 <= v <= S1_GUARD_SECONDS_MAX):
+            return None, "." + k
+        out[k] = None if v is None else round(float(v), 3)
+    v = g.get("paused_s")
+    if v is not None and not (_num(v) and 0 <= v <= S1_GUARD_PAUSED_MAX):
+        return None, ".paused_s"
+    out["paused_s"] = None if v is None else round(float(v), 1)
+    for k in _S1_GUARD_COUNTS:
+        v = g.get(k, 0)
+        if not (isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= S1_GUARD_COUNT_MAX):
+            return None, "." + k
+        out[k] = v
+    v = g.get("updated_at")
+    if v is not None and not (_num(v) and now - TIME_SKEW_S <= v <= now + SAMPLE_FUTURE_SKEW_S):
+        return None, ".updated_at"
+    out["updated_at"] = None if v is None else round(float(v), 3)
+    v = g.get("until")
+    # Past values pass (a day stop the sender has not yet cleared); the future is bounded by the longest possible day stop.
+    if v is not None and not (_num(v) and now - S1_GUARD_PAUSED_MAX <= v <= now + S1_GUARD_UNTIL_AHEAD_MAX):
+        return None, ".until"
+    out["until"] = None if v is None else round(float(v), 3)
+    return out, None
+
+
+def s1_guard_view(heartbeats: dict[str, dict[str, Any]], now: float) -> dict[str, Any] | None:
+    """The S1 latency guard as the S1 section shows it: the freshest non-stale heartbeat's guard, with its host, its age
+    and `stale` (a running or paused guard not written for S1_GUARD_STALE_S). None when no host reports one."""
+    best = None
+    for h, hb in sorted(heartbeats.items()):
+        g = (hb.get("s1") or {}).get("guard") if not heartbeat_stale(hb, now) else None
+        if not isinstance(g, dict):
+            continue
+        if best is None or (g.get("updated_at") or 0) > (best[1].get("updated_at") or 0):
+            best = (h, g)
+    if best is None:
+        return None
+    h, g = best
+    age = round(max(0.0, now - g["updated_at"]), 1) if _num(g.get("updated_at")) else None
+    # A day stop writes at every reading, in its labelling cycles and between them (overnight.sleep_between_cycles): stale
+    # when silent.
+    stale = g.get("state") in ("running", "paused", "stopped_for_day") and (age is None or age > S1_GUARD_STALE_S)
+    return {**g, "host": h, "age_s": age, "stale": stale}
+
+
+def _validate_s1(s1: Any, now: float | None = None) -> tuple[dict[str, Any] | None, str | None]:
     """A heartbeat's s1 block, or (None, ".<bad field>")."""
     if not isinstance(s1, dict) or set(s1) - _HB_S1_KEYS:
         return None, ""
@@ -403,6 +489,11 @@ def _validate_s1(s1: Any) -> tuple[dict[str, Any] | None, str | None]:
         if not (_num(s1["loaded_s"]) and 0 <= s1["loaded_s"] <= 86400):
             return None, ".loaded_s"
         out["loaded_s"] = round(float(s1["loaded_s"]), 1)
+    if s1.get("guard") is not None:
+        g, bad = validate_s1_guard(s1["guard"], time.time() if now is None else now)
+        if bad is not None:
+            return None, ".guard" + bad
+        out["guard"] = g
     return out, None
 
 
@@ -1250,7 +1341,7 @@ def session_view(snap: dict[str, Any], session: str) -> dict[str, Any]:
     other session is in it. `snap` must come from collect(session=session)."""
     o = snap.get("overview") or {}
     return {"version": VERSION, "generated_at": snap.get("generated_at"), "session_filter": session,
-            "overview": {"s1": o.get("s1"), "s1_latency_ms": o.get("s1_latency_ms"),
+            "overview": {"s1": o.get("s1"), "s1_latency_ms": o.get("s1_latency_ms"), "s1_guard": o.get("s1_guard"),
                          "lowest_subscription": o.get("lowest_subscription"),
                          "hosts_with_heartbeat": o.get("hosts_with_heartbeat")},
             "orchestrators": snap.get("orchestrators"), "s1": snap.get("s1"), "hosts": snap.get("hosts"),
@@ -1844,6 +1935,7 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     u = guard("usage", usage_view, u_errs)
     subs = subscriptions_section(u, now, lane_enabled) if u is not None else _section(now, "error", u_errs, lanes=[], lowest=None)
     s1 = s1_section(u, now, u_errs or None)
+    s1["guard"] = s1_guard_view(beats or {}, now)   # #116: the latency guard as the S1 host reports it
     ex_errs: list = []
     ex = guard("exec-hosts", exec_hosts, ex_errs) if exec_hosts is not None else None
     ex_hosts, ex_default = ex if isinstance(ex, tuple) else ({}, None)
@@ -1862,6 +1954,7 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
         "queued_tasks": counts.get("queued") if tasks["status"] != "error" else None,
         "active_conversations": conv.get("active"), "working_conversations": conv.get("working"),
         "s1": s1["status"], "s1_latency_ms": s1.get("latency_ms"),
+        "s1_guard": (s1.get("guard") or {}).get("state"),
         "lowest_subscription": subs.get("lowest"),
         "route_log_errors": (rl or {}).get("count"),
         "hosts_with_heartbeat": sum(1 for h in hosts["items"] if h["heartbeat_state"] == "fresh"),
