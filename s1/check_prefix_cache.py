@@ -6,8 +6,12 @@ MLX, the base model and the promoted adapter, so it runs on the Studio at deploy
 
 It loads the promoted scorer once (a separate process from the running service; it does not touch it), then
   1. scores N requests with the cache on, sampling this process's current RSS after a short warm-up and at the end;
-  2. scores the same N requests with the cache off (use_prefix=False) on the same model;
-  3. compares the two paths' answers per question and the largest probability difference.
+  2. scores the same N requests with the cache off but the prefill split at the prefix (use_prefix=False,
+     prefill_split=len(prefix)): the cached path's exact computation without the stored state or its copy;
+  3. compares the two paths' answers per question and the largest probability difference: they must be identical;
+  4. scores them once more in one full prefill pass (the pre-cache path) and reports that difference apart
+     (`full_pass_*`, not gated). Splitting a bf16 / 4-bit prefill anywhere moves the logits by about one bf16 step and
+     flips near-ties, cache or no cache (2026-11-23 on the Studio), so the full pass is no exact reference.
 Prints one JSON report (counts and numbers only, never request text) and exits 0 when RSS growth over the cached run is
 within --max-growth-mb and answer mismatches are within --max-mismatch; 1 otherwise; 2 when it could not run.
 
@@ -66,6 +70,24 @@ def current_rss_bytes() -> int:
     return int(out.stdout.strip()) * 1024
 
 
+def scorer_system() -> str:
+    from student import messages
+    return messages("x", "interactive")[0]["content"]
+
+
+def compare(a: list, b: list) -> tuple:
+    """(requests with any differing answer, differing answers, largest probability difference) of two score lists."""
+    requests, answers, max_diff = 0, 0, 0.0
+    for c, u in zip(a, b):
+        diff = [q for q in u["answers"] if c["answers"].get(q) != u["answers"][q]]
+        answers += len(diff)
+        requests += bool(diff)
+        for q, pu in u["probs"].items():
+            for x, y in zip(c["probs"].get(q, []), pu):
+                max_diff = max(max_diff, abs(x - y))
+    return requests, answers, max_diff
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--n", type=int, default=200)
@@ -80,7 +102,7 @@ def main(argv=None) -> int:
         cfg = json.loads(Path(a.current).read_text())
         reqs = load_requests(a.requests, a.n)
         t0 = time.time()
-        scorer = Scorer(cfg["base"], cfg["adapter"], cfg.get("temperatures"))
+        scorer = Scorer(cfg["base"], cfg["adapter"], cfg.get("temperatures"), prefix_cache=True)   # the check: on regardless of the env
         load_s = time.time() - t0
     except Exception as exc:
         print(json.dumps({"ok": False, "error": f"could not run: {type(exc).__name__}: {str(exc)[:300]}"}))
@@ -102,18 +124,16 @@ def main(argv=None) -> int:
     stats = scorer.prefixes.stats()
     reused = scorer.last_stats.get("prefix_tokens", 0)
 
+    split = len(scorer._system_prefix(scorer_system()))
     t0 = time.time()
-    uncached = [scorer.score(r, use_prefix=False) for r in reqs]
+    uncached = [scorer.score(r, use_prefix=False, prefill_split=split) for r in reqs]
     uncached_s = time.time() - t0
+    t0 = time.time()
+    full = [scorer.score(r, use_prefix=False) for r in reqs]
+    full_s = time.time() - t0
 
-    mismatched_requests, mismatched_answers, max_prob_diff = 0, 0, 0.0
-    for c, u in zip(cached, uncached):
-        diff = [q for q in u["answers"] if c["answers"].get(q) != u["answers"][q]]
-        mismatched_answers += len(diff)
-        mismatched_requests += bool(diff)
-        for q, pu in u["probs"].items():
-            for x, y in zip(c["probs"].get(q, []), pu):
-                max_prob_diff = max(max_prob_diff, abs(x - y))
+    mismatched_requests, mismatched_answers, max_prob_diff = compare(cached, uncached)
+    full_requests, full_answers, full_diff = compare(cached, full)
     growth_mb = (rss_end - rss_start) / 2**20
     ok = growth_mb <= a.max_growth_mb and mismatched_requests <= a.max_mismatch and reused > 0
     print(json.dumps({
@@ -125,6 +145,8 @@ def main(argv=None) -> int:
         "cached_mean_ms": round(cached_s / len(reqs) * 1000), "uncached_mean_ms": round(uncached_s / len(reqs) * 1000),
         "mismatched_requests": mismatched_requests, "mismatched_answers": mismatched_answers,
         "max_prob_diff": round(max_prob_diff, 4),
+        "full_pass_mean_ms": round(full_s / len(reqs) * 1000), "full_pass_mismatched_requests": full_requests,
+        "full_pass_mismatched_answers": full_answers, "full_pass_max_prob_diff": round(full_diff, 4),
     }))
     return 0 if ok else 1
 

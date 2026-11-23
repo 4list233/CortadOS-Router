@@ -5,6 +5,13 @@ the system-prompt prefix cache (`student.PrefixCache`), full-queue-only admissio
 the service-time estimate that ages out (`CORTADOS_S1_SERVICE_MAX_AGE_S`, 300 s) and resets on a model load, and one
 metadata-only request-log line per request. Router hosts get the no-retry-on-timeout/busy rule (`cortados_router/core.py`).
 
+**The prefix cache is OFF by default** (`CORTADOS_S1_PREFIX_CACHE` unset; `on` enables it, owner 2026-11-23). With it off
+the scorer scores every request in one full pass, as before s1-speed, and every other change above deploys as is:
+steps 1, 3–5; step 2 is needed only before turning the cache on. The 2026-11-22 check found 28 of 200 requests
+answering differently cached vs uncached; the cause is the split prefill, not the cache (see step 2), and the owner
+decides on enabling it after review. To enable: add `CORTADOS_S1_PREFIX_CACHE=on` to the scorer plist's
+EnvironmentVariables, then restart (step 3).
+
 Unlike a promotion, `serve.py` / `student.py` changes need a scorer restart (the process keeps the old code). Run each
 step on the Studio as the owner; nothing here is run by an agent without the owner's go.
 
@@ -30,8 +37,17 @@ cd ~/cortados-router
 One JSON line. Go on only with exit 0, which means all of:
 - `rss_growth_mb` ≤ 256 over the 200 cached scores (the earlier prefix cache grew ~50 MB per call, ~10 GB here);
   `rss_every_50_mb` should be flat, not a staircase;
-- `mismatched_requests` 0: the cached path gives the same answers as the uncached path on the same model
-  (`max_prob_diff` is reported; a few thousandths are bf16 noise);
+- `mismatched_requests` 0: the cached path gives exactly the answers of the uncached path with the prefill split at
+  the prefix (`max_prob_diff` 0), i.e. the stored state and its per-request copy change nothing;
+- `full_pass_*` (reported, not gated): the cached path against one full prefill pass, the path the scorer serves with
+  the cache off. These differ: on the 4-bit/bf16 model, splitting the prefill at ANY point (256, 284, 512, 568, 569),
+  with no cache involved, moves the first answer's logits by one bf16 step (0.125), and the difference grows over the
+  twelve answers. That is the 2026-11-22 failure (28/200 requests, `max_prob_diff` 0.535). Measured 2026-11-23 on the
+  same 200 synthetic requests, with no cache: split at 256 vs full 29 requests, split at 300 vs full 32, split at 256
+  vs split at 300 31; cached vs split at the prefix 0 (`max_prob_diff` 0.0). The flipped answers are mostly close
+  calls (e.g. urgency 0.4994 / 0.4994 full vs 0.3772 / 0.6219 split; median top-two margin 0.16) but not all (up to
+  0.67). So about 15 % of requests change an answer under any bf16 rounding change: a property of the scorer, which
+  the cache neither causes nor worsens and which the owner weighs before enabling it;
 - `prefix_reused_tokens` > 0 (the cache was actually used).
 
 Exit 1: do not deploy; paste the JSON into #132. Exit 2: it could not run (no MLX, `current.json` unreadable).

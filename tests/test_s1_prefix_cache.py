@@ -5,9 +5,12 @@ real Scorer.score path with a fake model, tokenizer and cache: no MLX.
 The fake cache behaves like mlx_lm's KVCache where aliasing matters: `state = ...` stores the given object as is, and
 the fake model appends to it IN PLACE. A scorer that handed a request the stored arrays (the 2026-09 leak) would grow
 the stored state and change later answers; these tests would see both."""
+import os
 import sys
+import types
 import unittest
 import zlib
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -91,8 +94,21 @@ class FakeTok:
         return self.encode(text)
 
 
-def make_scorer(slots=student.PREFIX_SLOTS, cache_cls=KVCache):
-    model = FakeModel()
+class ChunkSensitiveModel(FakeModel):
+    """Like the real 4-bit/bf16 model on the Studio (2026-11-23): the same tokens prefilled in different chunks round
+    differently. Each stored token carries the length of the forward pass that computed it, and the logits depend on
+    that, so a full single-pass prefill and a prefix-then-rest prefill give different answers."""
+
+    def __call__(self, x, cache):
+        toks = x.v[0]
+        self.processed += len(toks)
+        for c in cache:
+            c.tokens.extend((t, len(toks)) for t in toks)
+        return FakeLogits(cache[0].tokens)
+
+
+def make_scorer(slots=student.PREFIX_SLOTS, cache_cls=KVCache, model_cls=FakeModel):
+    model = model_cls()
     copies = {"n": 0}
 
     def copy_array(a):
@@ -225,6 +241,102 @@ class PrefixCacheTests(unittest.TestCase):
         self.assertEqual(s.last_stats["prefix_tokens"], 0)
         self.assertEqual(cached["probs"], uncached["probs"])
         self.assertEqual(uncached["probs"], cold.score("compare me")["probs"])
+
+
+class PrefixCacheFlagTests(unittest.TestCase):
+    """Off by default (CORTADOS_S1_PREFIX_CACHE=on enables it): the deploy of main must not depend on the cache."""
+
+    def env(self, value=None):
+        e = {k: v for k, v in os.environ.items() if k != student.PREFIX_CACHE_ENV}
+        if value is not None:
+            e[student.PREFIX_CACHE_ENV] = value
+        return mock.patch.dict(os.environ, e, clear=True)
+
+    def test_flag_values(self):
+        for v, on in ((None, False), ("", False), ("off", False), ("1", False), ("true", False), ("on", True), (" ON ", True)):
+            with self.env(v):
+                self.assertIs(student.prefix_cache_enabled(), on, v)
+
+    def test_default_path_never_touches_the_cache(self):
+        with self.env(None):
+            s, model, copies = make_scorer(slots=None)
+        def boom(*a, **k):
+            raise AssertionError("prefix cache touched")
+        s.prefixes.fresh_copy = boom
+        s.prefixes._stored = boom
+        s._system_prefix = boom
+        cold, _, _ = make_scorer(slots=0)
+        for req in ("fix the failing test", "plan a migration"):
+            self.assertEqual(s.score(req)["probs"], cold.score(req)["probs"])
+            self.assertEqual(s.last_stats["prefix_tokens"], 0)
+        self.assertFalse(s.prefixes.enabled)
+        self.assertEqual(s.prefixes.builds, 0)
+        self.assertEqual(s.prefixes.stats(), {"prefix_slots": 0, "prefix_bytes": 0})
+        self.assertEqual(copies["n"], 0)
+
+    def test_on_enables_reuse(self):
+        with self.env("on"):
+            s, _, _ = make_scorer(slots=None)
+        s.score("a request")
+        self.assertEqual(s.last_stats["prefix_tokens"], PREFIX_LEN)
+        self.assertEqual(s.prefixes.builds, 1)
+
+    def test_scorer_init_maps_the_flag_and_the_override(self):
+        # Scorer.__init__ with fake mlx modules: None follows the env, True/False force it (check_prefix_cache.py: True)
+        mx = types.ModuleType("mlx.core")
+        mx.set_cache_limit = lambda n: None
+        mx.array = FakeMx.array
+        mx.eval = lambda *a: None
+        mx.clear_cache = lambda: None
+        mlx = types.ModuleType("mlx"); mlx.core = mx
+        mlx_lm = types.ModuleType("mlx_lm"); mlx_lm.load = lambda base, adapter_path=None: (FakeModel(), FakeTok())
+        models = types.ModuleType("mlx_lm.models"); cache_mod = types.ModuleType("mlx_lm.models.cache")
+        cache_mod.make_prompt_cache = lambda m: [KVCache() for _ in range(m.layers)]
+        mods = {"mlx": mlx, "mlx.core": mx, "mlx_lm": mlx_lm, "mlx_lm.models": models, "mlx_lm.models.cache": cache_mod}
+        with mock.patch.dict(sys.modules, mods):
+            for env, arg, slots in ((None, None, 0), ("on", None, student.PREFIX_SLOTS), (None, True, student.PREFIX_SLOTS),
+                                    ("on", False, 0)):
+                with self.env(env):
+                    s = student.Scorer("base", None, prefix_cache=arg)
+                self.assertEqual(s.prefixes._slots, slots, (env, arg))
+
+
+class ChunkingTests(unittest.TestCase):
+    """Root cause of the 2026-11-22 check failure (28/200 requests differ): not the cache. On the Studio the cached path
+    equals an uncached prefill split at the same point bit for bit, while splitting the uncached prefill anywhere (256,
+    284, 512, 568, 569) moves the first answer's logits by one bf16 step (0.125) and flips near-ties. The check therefore
+    compares the cached path with the split reference (prefill_split), and reports the full-pass difference apart."""
+
+    def test_cached_equals_the_split_reference_and_full_pass_differs(self):
+        s, _, _ = make_scorer(model_cls=ChunkSensitiveModel)
+        for req in ("fix the failing test", "delete the production bucket"):
+            cached = s.score(req)
+            self.assertEqual(s.last_stats["prefix_tokens"], PREFIX_LEN)
+            ref = s.score(req, use_prefix=False, prefill_split=PREFIX_LEN)
+            self.assertEqual(s.last_stats["prefix_tokens"], 0)
+            full = s.score(req, use_prefix=False)
+            self.assertEqual(cached["probs"], ref["probs"], req)
+            self.assertNotEqual(cached["probs"], full["probs"], req)   # chunking alone changes the numbers
+
+    def test_prefill_split_is_ignored_when_the_cache_is_used_or_out_of_range(self):
+        s, _, _ = make_scorer(model_cls=ChunkSensitiveModel)
+        self.assertEqual(s.score("x", prefill_split=PREFIX_LEN)["probs"], s.score("x")["probs"])
+        full = s.score("x", use_prefix=False)["probs"]
+        self.assertEqual(s.score("x", use_prefix=False, prefill_split=0)["probs"], full)
+        self.assertEqual(s.score("x", use_prefix=False, prefill_split=10**6)["probs"], full)
+
+
+    def test_the_check_compares_with_the_split_reference(self):
+        import check_prefix_cache as check
+        s, _, _ = make_scorer(model_cls=ChunkSensitiveModel)
+        reqs = ["fix the failing test", "plan a migration", "write a haiku"]
+        split = len(s._system_prefix(check.scorer_system()))
+        self.assertEqual(split, PREFIX_LEN)
+        cached = [s.score(r) for r in reqs]
+        ref = [s.score(r, use_prefix=False, prefill_split=split) for r in reqs]
+        full = [s.score(r, use_prefix=False) for r in reqs]
+        self.assertEqual(check.compare(cached, ref), (0, 0, 0.0))
+        self.assertGreater(check.compare(cached, full)[2], 0.0)
 
 
 if __name__ == "__main__":

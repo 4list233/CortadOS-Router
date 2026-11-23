@@ -65,6 +65,15 @@ def messages(request: str, unit_kind: str, answers: dict[str, Any] | None = None
 # quantized, arrays/SSM caches) disables reuse and the request is processed in full, exactly as before.
 PREFIX_SAFE_CACHES = frozenset({"KVCache"})
 PREFIX_SLOTS = 2              # one per distinct system prompt: the plain one and the task-context one; bounded
+PREFIX_CACHE_ENV = "CORTADOS_S1_PREFIX_CACHE"   # "on" enables the prefix cache; anything else (default unset): off
+
+
+def prefix_cache_enabled(environ=None) -> bool:
+    """The prefix cache is OFF unless CORTADOS_S1_PREFIX_CACHE=on (owner 2026-11-23): the 2026-11-22 Studio check found
+    cached answers differing from the uncached path (28 of 200 requests), so the scorer serves the uncached path until
+    the owner enables it after review."""
+    import os
+    return str((os.environ if environ is None else environ).get(PREFIX_CACHE_ENV, "")).strip().lower() == "on"
 
 
 class PrefixCache:
@@ -89,6 +98,10 @@ class PrefixCache:
         self._slots = max(0, int(slots))
         self._entries: "OrderedDict[tuple, list]" = OrderedDict()   # prefix token ids -> [per-layer stored state]
         self.builds = 0                                                # prefixes processed (tests: once per prefix)
+
+    @property
+    def enabled(self) -> bool:
+        return self._slots > 0
 
     def _layers_safe(self, cache) -> bool:
         return all(type(c).__name__ in PREFIX_SAFE_CACHES for c in cache)
@@ -139,7 +152,9 @@ def common_prefix(a, b) -> list:
 
 
 class Scorer:
-    def __init__(self, base: str, adapter: str | None = None, temperatures: dict[str, float] | None = None):
+    def __init__(self, base: str, adapter: str | None = None, temperatures: dict[str, float] | None = None, *,
+                 prefix_cache: bool | None = None):
+        """prefix_cache: None reads CORTADOS_S1_PREFIX_CACHE (default off); True/False force it (the deploy check)."""
         import mlx.core as mx
         from mlx_lm import load
         from mlx_lm.models.cache import make_prompt_cache
@@ -148,11 +163,15 @@ class Scorer:
         # mx.array(a) of an mx.array is a new array object: a slice-assignment on it rebinds that object only, never the
         # stored one (KVCache.update_and_fetch writes with `self.keys[...] = ...`). mx.eval materializes the stored prefix.
         self._setup(mx, make_prompt_cache, model, tok, temperatures, copy_array=lambda a: mx.array(a),
-                    materialize=lambda arrays: mx.eval(*arrays))
+                    materialize=lambda arrays: mx.eval(*arrays),
+                    prefix_slots=None if prefix_cache is None else (PREFIX_SLOTS if prefix_cache else 0))
 
     def _setup(self, mx, make_cache, model, tok, temperatures=None, *, copy_array, materialize,
-               prefix_slots: int = PREFIX_SLOTS) -> None:
-        """Everything but the MLX imports and the weight load, so a fake model can drive the real scoring path."""
+               prefix_slots: int | None = None) -> None:
+        """Everything but the MLX imports and the weight load, so a fake model can drive the real scoring path.
+        prefix_slots None: PREFIX_SLOTS when CORTADOS_S1_PREFIX_CACHE=on, else 0 (off: score never touches the cache)."""
+        if prefix_slots is None:
+            prefix_slots = PREFIX_SLOTS if prefix_cache_enabled() else 0
         self.mx, self._make_cache = mx, make_cache
         self.model, self.tok = model, tok
         self.T = temperatures or {}
@@ -178,11 +197,17 @@ class Scorer:
             self._prefix_ids[system] = ids
         return ids
 
-    def score(self, request: str, unit_kind: str = "interactive", *, task_context=None, use_prefix: bool = True) -> dict[str, Any]:
+    def score(self, request: str, unit_kind: str = "interactive", *, task_context=None, use_prefix: bool = True,
+              prefill_split: int | None = None) -> dict[str, Any]:
+        """prefill_split (checks only): on the uncached path, prefill prompt[:prefill_split] in its own forward pass on the
+        request's fresh cache, then the rest -- the cached path's exact computation without the stored state or its copy.
+        Splitting the prefill alone changes bf16 rounding (s1/check_prefix_cache.py), so this is the reference the
+        cached path must match bit for bit."""
         mx, t0 = self.mx, time.time()
         msgs = messages(request, unit_kind, task_context=task_context)
         prompt = list(self.tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True))
-        prefix = self._system_prefix(msgs[0]["content"])
+        use_prefix = use_prefix and self.prefixes.enabled
+        prefix = self._system_prefix(msgs[0]["content"]) if use_prefix else ()
         cache = None
         if use_prefix and prefix and len(prompt) > len(prefix) and tuple(prompt[:len(prefix)]) == prefix:
             try:
@@ -196,6 +221,9 @@ class Scorer:
             cache = self._make_cache(self.model)          # reuse off or the prompt does not start with the prefix: full pass
         self.last_stats = {"prompt_tokens": len(prompt), "prefix_tokens": reused, **self.prefixes.stats()}
         feed, done_text, answers, probs = prompt[reused:], "", {}, {}
+        if not reused and prefill_split and 0 < prefill_split < len(prompt):
+            self.model(mx.array([prompt[:prefill_split]]), cache=cache)
+            feed = prompt[prefill_split:]
         n_fed_completion = 0
         for q in QUESTIONS:
             done_text += ("\n" if done_text else "") + f"{q}="
