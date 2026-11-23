@@ -598,7 +598,7 @@ function renderRouted(box, s, now) {
     const wide = el("div", "wide");
     add(wide, table(routedAll ? calls : calls.slice(0, ROUTED_SHOWN), [
       {h: "when", v: x => ago(x.ts, now)}, {h: "band", v: x => x.band || "–"}, {h: "kind", v: x => x.routing_kind || "–"},
-      {h: "model", v: x => x.model ? x.model + (x.lane ? " (" + x.lane + ")" : "") : (x.lane || "–")}, {h: "elapsed", num: true, v: x => ms(x.elapsed_ms)},
+      {h: "model", v: x => x.model ? x.model + (x.lane ? " (" + x.lane + ")" : "") : (x.lane || "–")}, {h: "elapsed", num: true, v: x => ms(x.elapsed_ms)}, {h: "end to end", num: true, v: x => ms(x.end_to_end_ms)},
       {h: "sensitive in cloud", v: x => sensCloud(x.sensitive_cloud)},
       {h: "S1 reason", cls: "reason", v: x => x.s1_reason || "–"}]));
     add(P.body, wide);
@@ -795,14 +795,29 @@ function renderS1(c, x) {
   }
   add(c, box);
 }
+// #132: S1 as the routes saw it (s1.routing: per 5 / 60 min the degraded share and scoring time). /health alone can say
+// "up" while most calls degrade, so a warn status is drawn as a warning pill wherever S1 is shown.
+function s1RoutingText(s1) {
+  const r = (s1 && s1.routing) || {};
+  return join((r.windows || []).filter(w => isNum(w.calls) && w.calls > 0).map(w =>
+    w.window + ": " + (isNum(w.degraded_pct) ? w.degraded_pct + "% degraded" : "?") + " of " + w.calls +
+    (isNum(w.s1_ms_p50) ? ", S1 " + (w.s1_ms_p50 / 1000).toFixed(1) + " s / p90 " + (isNum(w.s1_ms_p90) ? (w.s1_ms_p90 / 1000).toFixed(1) : "?") + " s" : "")));
+}
+function s1Pill(s1) {
+  const r = (s1 && s1.routing) || {};
+  if (r.status === "warn") return pill("unknown", "degraded");
+  return pill(s1.status === "up" ? "up" : s1.status === "down" ? "down" : "unknown");
+}
 function renderHosts(box, s, s1) {
   const P = panel("p-hosts", "Hosts", "span-12");
   P.meta.textContent = s.provider_host ? "this provider runs on " + s.provider_host : "provider host: not a known host name";
   secErrors(P.body, s);
   const line = el("div", "s1line");
-  add(line, el("span", "title", "S1 scorer"), pill(s1.status === "up" ? "up" : s1.status === "down" ? "down" : "unknown"),
+  add(line, el("span", "title", "S1 scorer"), s1Pill(s1),
     el("span", "sub", join([isNum(s1.latency_ms) ? s1.latency_ms + " ms" : null, isNum(s1.http_status) ? "HTTP " + s1.http_status : null,
-      s1.status !== "up" ? s1.reason : null, s1.guard ? "on " + s1.guard.host + ": " + guardText(s1.guard) : null])));
+      s1.status !== "up" ? s1.reason : null, s1.guard ? "on " + s1.guard.host + ": " + guardText(s1.guard) : null,
+      s1RoutingText(s1) || null])));
+  if (s1.routing && s1.routing.status === "warn") add(line, el("span", "sub err", "warning: " + (s1.routing.warning || "S1 degraded")));
   // the S1 host's own report (its heartbeat's s1 block): what it serves and the pipeline's hold flags
   (s.items || []).forEach(h => { const x = h.heartbeat && !h.heartbeat.stale && h.heartbeat.s1;
     if (x) add(line, el("span", "sub", join(["on " + h.name + ": " + (x.model || "no model loaded"),
@@ -948,8 +963,9 @@ function renderLive(d) {
       : "child-task log unreadable", ts.status === "partial" ? "warn" : null));
   add(ov, tile("Active conversations", isNum(o.active_conversations) ? String(o.active_conversations) : "?",
     isNum(o.working_conversations) ? o.working_conversations + " working now" : "office view unavailable"));
-  add(ov, tile("S1 scorer", pill(s1.status === "up" ? "up" : s1.status === "down" ? "down" : "unknown"),
+  add(ov, tile("S1 scorer", s1Pill(s1),
     join([s1.status === "up" ? (isNum(s1.latency_ms) ? s1.latency_ms + " ms health check" : "") : (s1.reason || "not reachable"),
+      (s1.routing && s1.routing.status === "warn") ? s1.routing.warning : s1RoutingText(s1) || null,
       s1.guard && s1.guard.state === "paused" ? "training paused (" + (GUARD_REASON_TEXT[s1.guard.reason] || "guard") + ")" : null,
       s1.guard && s1.guard.state === "stopped_for_day" ? "training stopped for the day (" + (GUARD_REASON_TEXT[s1.guard.reason] || "guard") + ")" : null]),
     "small"));
@@ -1039,7 +1055,7 @@ function renderTasks(t, failure) {
   add(wide, table(t.tasks || [], [
     {h: "when", v: x => when(x.ts)}, {h: "session", v: x => short(x.session_id)}, {h: "kind", v: x => x.routing_kind || "–"},
     {h: "band", v: x => x.band || "–"}, {h: "lane · model", v: x => (x.lane || "–") + " · " + (x.model || "–")},
-    {h: "ran on", v: x => x.actual_model || "–"}, {h: "elapsed", num: true, v: x => ms(x.elapsed_ms)},
+    {h: "ran on", v: x => x.actual_model || "–"}, {h: "elapsed", num: true, v: x => ms(x.elapsed_ms)}, {h: "end to end", num: true, v: x => ms(x.end_to_end_ms)},
     {h: "req chars", num: true, v: x => tok(x.request_chars)}, {h: "resp chars", num: true, v: x => tok(x.response_chars)},
     {h: "tokens", num: true, v: x => (typeof x.tokens === "number") ? tok(x.tokens) : (x.tokens_status || "not recorded")},
     {h: "sensitive in cloud", v: x => sensCloud(x.sensitive_cloud)},
@@ -1123,6 +1139,12 @@ function render(d) {
   add(s1c, el("div", "big" + (s1.available ? "" : " err"), s1.available ? "up" : "down"));
   if (s1.reason) add(s1c, el("div", "sub err", s1.reason));
   if (typeof s1.latency_ms === "number") add(s1c, el("div", "sub", "latency " + Math.round(s1.latency_ms) + " ms"));
+  // #132: the share of routed calls S1 did not score, per 5 / 60 min, from the route log (a fast /health is not enough)
+  const s1r = d.s1_routes || {};
+  (s1r.windows || []).forEach(w => { if (!isNum(w.calls) || !w.calls) return;
+    const hot = w.calls >= (s1r.min_calls || 3) && isNum(w.degraded_pct) && w.degraded_pct > (isNum(s1r.warn_above_pct) ? s1r.warn_above_pct : 20);
+    add(s1c, el("div", "sub" + (hot ? " err" : ""), w.window + ": " + w.degraded + " of " + w.calls + " degraded (" + w.degraded_pct + "%)" +
+      (isNum(w.s1_ms_p50) ? ", S1 " + ms(w.s1_ms_p50) + " / p90 " + ms(w.s1_ms_p90) : ""))); });
   add(h, s1c);
   add(m, h);
 

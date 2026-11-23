@@ -186,11 +186,14 @@ The hard rules come first and cannot be out-voted (`core.resolve`):
 **Cost.**
 
 ```
-cost = burn weight + 30 × scarcity − 80 × expiring credit − capacity credit
+cost = burn weight + 30 × scarcity − 80 × underuse − capacity credit
 ```
 
-- **Burn weight** is the model's price divided by the learned size of its quota pool (`unitcost.py`).
-- **Scarcity** compares the share of a plan window already used against the share of its time elapsed, read from each vendor CLI's own `/usage` or `/status` screen through a PTY (`scarcity.py`), so no tokens are spent. A pool on pace to overshoot gets more expensive; one about to expire unused gets cheaper; a spent pool is skipped.
+- **Burn weight** is the model's price divided by the learned size of its quota pool (`unitcost.py`), looked up under the lane's own key (`claude#b:all` for account B). The learned size is a lower bound (only provider-routed tokens are counted), so a lower-bound size never goes below the table's `selection.pool_size_prior_tokens_per_pct` (Codex: 5.63 M tokens per 1 %).
+- **Scarcity** compares the share of a plan window already used against the share of its time elapsed, read from each vendor CLI's own `/usage` or `/status` screen through a PTY (`scarcity.py`), so no tokens are spent. A pool on pace to overshoot gets more expensive; a spent pool is skipped.
+- **Underuse** (an underused pool only) is the share of the pool expected to be lost at its next reset: what is left, minus the learned recent burn rate (or the window's own pace) times the hours to the reset. When a reset time is unknown it falls back to −scarcity. The same expected loss ranks the underused frontier pools that may take R3 work (`selection.ceiling_underuse`).
+- **Switching margin.** When the client's previous route in the same band costs at most `selection.switch_margin_points` (3) more than the cheapest one, it stays, so a 1–3 point swing between readings does not move the client from one model to another. It is held only when it also passes the host's own admission check: under a client floor (`x-cortados-min-left-pct`) a previous route below the floor is not held, and the cheapest eligible route is chosen instead of the request being refused.
+- **Batch hint.** A client may send `x-cortados-workload: batch` (both wires). The band is then capped at R1 and the call runs as background work. The cap applies to the requirement too: the difficulty is counted as at most 5 (the most R1 admits), so the required index is R1's and the frontier rules (planning/research at the R4 reference, the underused-frontier rule) do not fire. A trusted minimum band above R1 undoes the cap. An outward or blast-radius-3 request keeps R3, and a degraded scorer still never defaults to Claude. Unknown values are ignored and logged; the hint is recorded in the route row's `workload` column.
 
 **Final gates:** context fit is hard; a vendor's models come from that vendor's own subscription first; sessions stay on their model while it stays near the cheapest choice; agent-facing turns never fall below a minimum general index. `docs/ROUTER-DESIGN.md` is the full design log.
 

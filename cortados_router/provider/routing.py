@@ -72,6 +72,17 @@ CLAUDE_PROVIDERS = ("claude-cli",)
 CLONED_PROVIDERS = {"openai-codex": "codex-cli"}
 # Coding clients are interactive sessions: the router's face floor (selection.interactive_min_general_index) applies.
 PLATFORM = "cli"
+# The x-cortados-workload request header (both wires, #132): a client's own hint that a call is batch work. `batch`
+# applies the routing table's `workloads.batch` row (band capped at R1, treated as background: fallback band R1), under
+# core.resolve's hard rules (an outward request keeps its R3 floor; a degraded scorer still never defaults to Claude).
+# It lowers priority without pinning a model. Any other value is ignored with a log line (workload_hint).
+WORKLOAD_HEADER = "x-cortados-workload"
+WORKLOAD_MODES = ("batch",)
+# The switching margin's memory (#132): per client, the last route chosen in each band, so a 1–3 point cost swing does
+# not flip the next conversation of the same client (core.resolve `previous`). In memory only, bounded.
+_LAST_ROUTES: "OrderedDict[str, dict[str, dict[str, str]]]" = OrderedDict()
+_LAST_ROUTES_MAX = 256
+_last_routes_lock = threading.Lock()
 # Client-injected context, not the request: Claude Code wraps its reminders and environment in these.
 _INJECTED = re.compile(r"<(system-reminder|system-message)>.*?</\1>", re.S)
 
@@ -79,6 +90,45 @@ _INJECTED = re.compile(r"<(system-reminder|system-message)>.*?</\1>", re.S)
 def _base_provider(p: str) -> str:
     """The backend a per-account provider maps to: `claude-cli#b` -> `claude-cli`."""
     return (p or "").split("#", 1)[0]
+
+
+def workload_hint(raw: Any) -> str | None:
+    """The x-cortados-workload header as a mode of WORKLOAD_MODES (case-insensitive), or None: absent, empty or an
+    unknown value, which is ignored (logged, never refused: a hint must not fail a request)."""
+    v = (raw or "").strip().lower() if isinstance(raw, str) else ""
+    if not v:
+        return None
+    if v not in WORKLOAD_MODES:
+        logger.info("%s: unknown value %s ignored", WORKLOAD_HEADER, wire.log_safe(v[:40]))
+        return None
+    return v
+
+
+def previous_routes(client: str) -> dict[str, dict[str, str]] | None:
+    """This client's last route per band (band -> {lane, model}), or None."""
+    with _last_routes_lock:
+        got = _LAST_ROUTES.get(client or "")
+        return {b: dict(v) for b, v in got.items()} if got else None
+
+
+def remember_route(client: str, r: dict[str, Any]) -> None:
+    """Remember the route core.resolve chose for this client in its band (the cloud choice, before any local move)."""
+    chosen = (r.get("route") or {}).get("chosen") or {}
+    band = r.get("band")
+    if not band or not chosen.get("lane") or not chosen.get("model"):
+        return
+    with _last_routes_lock:
+        per = _LAST_ROUTES.pop(client or "", {})
+        per[band] = {"lane": chosen["lane"], "model": chosen["model"]}
+        _LAST_ROUTES[client or ""] = per
+        while len(_LAST_ROUTES) > _LAST_ROUTES_MAX:
+            _LAST_ROUTES.popitem(last=False)
+
+
+def forget_routes() -> None:
+    """Clear the switching margin's memory (tests)."""
+    with _last_routes_lock:
+        _LAST_ROUTES.clear()
 
 
 def served_routes(core) -> tuple[tuple[str, str], ...]:
@@ -630,7 +680,7 @@ def _excluded_route_usable(core, routes, body: dict[str, Any], claude_bin: str, 
 def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, claude_bin: str = "claude",
            codex_bin: str = "codex", exclude_model: str | None = None,
            min_left_pct: float | None = None, codex_home: str | None = None,
-           local: str | None = None) -> dict[str, Any]:
+           local: str | None = None, workload: str | None = None) -> dict[str, Any]:
     """Route a new conversation. Returns execution_routing.select's result: provider, model, route_id, band, … or error.
     A `sub/`-pinned request skips S1 (choose_pinned). `exclude_model` (the x-cortados-exclude-model header, a comma
     list) keeps the conversation off each listed model on every lane, so a review never runs on a model that wrote the
@@ -701,12 +751,21 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
             constraints["excluded_routes"] += [r for r in routes if r not in constraints["excluded_routes"]]
         constraints["notes"] = [f"excluded by client: {names}"]   # select logs it with the route
     fit = request_fit(body)
+    workload = workload_hint(workload)
+    if workload:
+        constraints["workload"] = workload      # select applies the table's workloads row (band cap, background)
+    previous = previous_routes(client)
+    hold_ok = floor_admits(core, min_left_pct, codex_home) if previous and min_left_pct is not None else None
     r = execution_routing.select(
         _NoClaudeWhenDegraded(core), prompt=request_text(body.get("messages") or [], standalone=not body.get("tools")),
         session_id=conversation_id, platform=PLATFORM, face="provider", entrypoint="provider", input_fit=fit,
         constraints=constraints,
         credential_resolver=_credentials(claude_bin, codex_bin), log_platform=f"provider:{client}",
-        supports_accounts=True)   # this endpoint applies the routed account's login (server.Registry → bridge CLAUDE_CONFIG_DIR)
+        supports_accounts=True,   # this endpoint applies the routed account's login (server.Registry → bridge CLAUDE_CONFIG_DIR)
+        **({"previous": previous} if previous else {}),
+        **({"hold_ok": hold_ok} if hold_ok is not None else {}))
+    if not r.get("error"):
+        remember_route(client, r)
     if r.get("error") and r.get("degraded"):
         r["error"] = ("S1 is unavailable, and a degraded scorer never defaults to Claude; no Codex lane survived either "
                       "(codex-cli missing from PATH, or its capacity spent). " + r["error"])
@@ -1874,6 +1933,28 @@ def floor_candidate(route: dict[str, Any], codex_home: str | None = None) -> dic
             "codex_home": codex_home,
             # A conversation opened under a floor carries the canonical home its backend runs on: that is its identity.
             **({"codex_login": route["codex_home"]} if route.get("codex_home") else {})}
+
+
+def floor_admits(core, min_left_pct: float, codex_home: str | None = None) -> Callable[[dict[str, Any]], bool]:
+    """The client's quota floor as core.resolve's `hold_ok` (#132 review round 1): the switching margin holds a previous
+    route only when its executing account passes floor.check under x-cortados-min-left-pct, the same check (same
+    candidate shape, same Codex home binding) the chosen route then reserves atomically in choose. One usage reading
+    for the whole decision. A floor-exempt lane (local, API credit) always passes."""
+    readings: list[Any] = []
+
+    def ok(cand: dict[str, Any]) -> bool:
+        lane = cand.get("lane") or ""
+        if not lane:
+            return False
+        if _floor_exempt(lane):
+            return True
+        if not readings:
+            readings.append(core.subscription_readings())
+        c = {"lane": lane, "provider": cand.get("provider"), "account": cand.get("account"),
+             "config_dir": cand.get("config_dir"), "codex_home": codex_home}
+        return floor.check(core, {**c, **_bind_codex(c, codex_home)}, cand.get("model") or "", min_left_pct,
+                           readings[0]) is None
+    return ok
 
 
 def floor_turn(core, route: dict[str, Any] | None, min_left_pct: float, codex_home: str | None = None) -> str | None:

@@ -209,6 +209,29 @@ def pin(name):
 print(json.dumps({"one": pin("sub/GPT 6.1"), "many": pin("sub/GPT 6")}))
 """
 
+# Batch workload hint (#132, owner 2026-11-22): `x-cortados-workload: batch` caps the band at R1 and routes the call as
+# background work, but the hard rules win: an outward request stays R3 and a degraded decision never goes to Claude.
+# The real provider routing and the real core.decide on the throwaway home (S1 if up, degraded otherwise).
+WORKLOAD_SCENARIO = """
+import json, sys
+from cortados_router import core
+from cortados_router.provider import routing
+def route(text, workload="batch", cid="verify-batch"):
+    body = {"model": "cortados", "messages": [{"role": "user", "content": text}]}
+    r = routing.choose(core, body, client="verify-batch", conversation_id=cid, claude_bin=sys.executable,
+                       codex_bin=sys.executable, workload=workload)
+    rt = r.get("route") or {}
+    use = ((rt.get("chosen") or {}).get("use_case"))
+    cap = (core.required_index(core.table(), core.model_scores(), use, core.band_max_D(core.table(), "R1"), "R1")
+           if use and core.model_scores() else None)
+    return {**{k: r.get(k) for k in ("provider", "model", "band", "degraded", "workload", "error")},
+            "D": rt.get("D"), "required_index": rt.get("required_index"), "r1_cap_index": cap}
+hard = "design a new consensus protocol for our replicated storage engine, prove its safety, and plan the migration"
+print(json.dumps({"easy": route("refactor the parser module and update its tests across the package"),
+                  "outward": route("email the signed invoice to the client and mark it paid"),
+                  "hard_free": route(hard, None, "verify-batch-free"), "hard_batch": route(hard, "batch", "verify-batch-hard")}))
+"""
+
 # Local auto-route on the Pro (#75, 2026-11-13): after S1, a conversation in a band the node lists moves to its local model
 # only while the node is available; on battery / switch off / gate down it keeps S1's route; an outward (R3) request
 # never goes local whatever the config says; a degraded decision never goes local and never to Claude. Runs the real
@@ -751,6 +774,35 @@ def main():
             and not many.get("model")
         record("friendly pin resolves to one model, ambiguity is refused", "PASS" if ok_one and ok_many else "FAIL",
                f"sub/GPT 6.1 -> {one.get('provider')}/{one.get('model')} | sub/GPT 6 -> {(many.get('error') or '')[:120]}")
+
+    p = runner.run(["-c", WORKLOAD_SCENARIO], prefix="verify-router-batch-", timeout=300)
+    try:
+        r = _last_json(p)
+    except (ValueError, IndexError):
+        record("batch hint caps the band at R1", "FAIL", (p.stderr or p.stdout).strip()[-300:])
+    else:
+        easy, out = r["easy"], r["outward"]
+        claude = lambda x: (x.get("provider") or "").split("#")[0] == "claude-cli"
+        ok = easy.get("band") in ("R0", "R1") and easy.get("workload") == "batch" and not easy.get("error") \
+            and not (easy.get("degraded") and claude(easy))
+        record("batch hint caps the band at R1 (degraded: never Claude)", "PASS" if ok else "FAIL", json.dumps(easy))
+        if out.get("degraded"):
+            record("batch hint never lowers an outward request (R3)", "BLOCKED",
+                   unreachable if not up else f"S1 listening at {s1_where} but the decision is degraded")
+        else:
+            record("batch hint never lowers an outward request (R3)", "PASS" if out.get("band") == "R3" else "FAIL",
+                   json.dumps(out))
+        # review round 1 (#132): the cap lowers the effective requirement, not only the label. A capped hard request's
+        # difficulty is at most R1's (5) and its required index at most R1's requirement at that difficulty.
+        free, hb = r["hard_free"], r["hard_batch"]
+        name = "batch hint caps the required index with the band (not only the label)"
+        if free.get("degraded") or hb.get("degraded"):
+            record(name, "BLOCKED", unreachable if not up else f"S1 listening at {s1_where} but the decision is degraded")
+        else:
+            ok = (hb.get("band") in ("R0", "R1") and not hb.get("error") and isinstance(hb.get("D"), int) and hb["D"] <= 5
+                  and hb.get("required_index") is not None and hb.get("r1_cap_index") is not None
+                  and hb["required_index"] <= hb["r1_cap_index"])
+            record(name, "PASS" if ok else "FAIL", json.dumps({"free": free, "batch": hb}))
 
     p = runner.run(["-c", LOCAL_SCENARIO], prefix="verify-router-local-", timeout=300)
     try:

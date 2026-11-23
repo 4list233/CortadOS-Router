@@ -10,6 +10,8 @@ export default {
     "s1": "up",
     "s1_latency_ms": 23,
     "s1_guard": null,
+    "s1_routing": "unknown",
+    "s1_degraded_pct_5m": null,
     "lowest_subscription": {
       "lane": "cursor",
       "label": "cursor (shared with Grok Bot)",
@@ -680,7 +682,11 @@ export default {
         "s1_reason": "S1 decision; band R2; steps=1",
         "request_chars": 900,
         "response_chars": 300,
-        "sensitive_cloud": null
+        "sensitive_cloud": null,
+        "s1_ms": null,
+        "end_to_end_ms": null,
+        "executed_provider": null,
+        "executed_model": null
       },
       {
         "ts": 1799999940.0,
@@ -696,7 +702,11 @@ export default {
         "s1_reason": "S1 decision; band R2; steps=1",
         "request_chars": 900,
         "response_chars": 300,
-        "sensitive_cloud": null
+        "sensitive_cloud": null,
+        "s1_ms": null,
+        "end_to_end_ms": null,
+        "executed_provider": null,
+        "executed_model": null
       },
       {
         "ts": 1799999880.0,
@@ -712,7 +722,11 @@ export default {
         "s1_reason": "S1 decision; band R2; steps=1",
         "request_chars": 900,
         "response_chars": 300,
-        "sensitive_cloud": null
+        "sensitive_cloud": null,
+        "s1_ms": null,
+        "end_to_end_ms": null,
+        "executed_provider": null,
+        "executed_model": null
       }
     ],
     "totals": {
@@ -1063,7 +1077,13 @@ export default {
     "http_status": 200,
     "latency_ms": 23,
     "reason": null,
-    "guard": null
+    "guard": null,
+    "routing": {
+      "status": "unknown",
+      "windows": [],
+      "warn_above_pct": null,
+      "warning": null
+    }
   },
   "hosts": {
     "as_of": 1800000000.0,

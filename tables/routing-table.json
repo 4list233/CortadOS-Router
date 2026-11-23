@@ -1,8 +1,8 @@
 {
  "_doc": "MUTABLE routing table for Cortados. Edit freely: the router reloads this file when its mtime changes, no restart. Models, lanes and order WILL change; the six features and the band conditions come from the 2.0 scale (scale-2.0-reference.json). Validation on load: unknown lane/provider, a Fable/ceiling entry outside R4, or a non-Grok model on the cursor lane = file rejected, last good table kept.",
- "version": 19,
- "updated": "2026-11-13",
- "updated_by": "claude (Forest 2026-11-13, #75: local inventory is the Pro's Ollama models, the Studio runs S1 only; candidates unchanged)",
+ "version": 20,
+ "updated": "2026-11-22",
+ "updated_by": "claude (owner decisions 2026-11-22, #132: switching margin, pool-size prior for lower-bound learned sizes, underuse credit and ceiling_underuse ranked by the share lost at reset, batch workload hint; candidates unchanged)",
  "features": [
   "steps",
   "ambiguity",
@@ -184,6 +184,10 @@
    }
   }
  ],
+ "workloads": {
+  "batch": {"max_band": "R1", "unit_kind": "background"},
+  "_doc": "#132 (owner 2026-11-22): a client's x-cortados-workload header (provider, both wires). batch caps the band at R1 (core.resolve maximum_band, mirroring min_band) and the difficulty the requirement and the frontier rules read at the most R1 admits (core.band_max_D: 5), so the selection is R1's, not only the label; a trusted min_band above R1 undoes the cap and routes the call as background work (fallback band R1 when S1 is degraded, no face floor). The hard rules win: blast radius 3 (an outward effect is floored there) keeps its band, and a degraded scorer still never defaults to Claude. Unknown values are ignored with a log line."
+ },
  "fallback": {
   "interactive": "R2",
   "background": "R1",
@@ -597,7 +601,7 @@
    "cursor"
   ],
   "expiring_credit_points": 80,
-  "_cost": "cost = weight + scarcity_points × max(scarcity,0) − expiring_credit_points × max(−scarcity,0) − capacity credit. weight = BURN: model $/1M ÷ learned pool size (tokens per % of the pool's window), normalised to 100 for the heaviest candidate (Forest 2026-09-29: pools differ ~10× in size, so price alone under-charged Claude). Falls back to price-only for pools without a learned size.",
+  "_cost": "cost = weight + scarcity_points × max(scarcity,0) − expiring_credit_points × underuse − capacity credit. underuse (#132, owner 2026-11-22) = the share of the pool expected to be LOST at its next reset (headroom − learned burn rate × hours to reset, core._expected_loss_pct) when the pool is underused (scarcity < 0) and its reset times are known; else max(−scarcity,0) as before (the capped scarcity sits at −1 for every comfortably underused pool and cannot tell them apart). weight = BURN: model $/1M ÷ learned pool size (tokens per % of the pool's window), normalised to 100 for the heaviest candidate (Forest 2026-09-29: pools differ ~10× in size, so price alone under-charged Claude). Falls back to price-only for pools without a learned size.",
   "r0": "R0 is scored too: requirement 0, so the cheapest route wins; that is local unless a subscription window is about to expire unused.",
   "_local": "Owner 2026-11-13: local models are placed by a published proxy index (tables/local-models.json → model-scores.generated.json local_models), by the provider after this selection (provider/routing.py index_local): a variant whose use-case index clears required_index takes the request unless its node is busy or unavailable, because a local lane spends no quota; never outward, blast-radius-3, R3/R4 or degraded work. This holds also against a window about to expire unused (the r0 note above describes core's own ranking, where no local route is offered).",
   "same_price_band": 20,
@@ -625,8 +629,14 @@
   "ceiling_underuse": {
    "attract_when_scarcity_below": -0.3,
    "min_D": 9,
-   "_doc": "when a ceiling model's own pool is underused (scarcity ≤ −0.3: the allowance would otherwise expire unused), it also takes any R3-level task (D ≥ 6) in every use case: paid-for capacity is used, not lost."
+   "_doc": "when a ceiling model's own pool is underused (scarcity ≤ −0.3: the allowance would otherwise expire unused), it also takes any R3-level task (D ≥ min_D) in every use case: paid-for capacity is used, not lost. Several underused ceiling pools: the one expected to lose the largest share at its reset wins (#132, owner 2026-11-22: rule kept, ranking by loss at reset), cost breaks ties; when any of them has no reset time, the cheapest (the earlier ranking)."
   },
+  "switch_margin_points": 3,
+  "_switch_margin": "#132 (owner 2026-11-22): a 1–3 point cost difference is noise from the latest usage reading (R2 flipped between Opus on account B and Sol call by call). The client's previous route in the same band stays first while it qualifies, is available and costs at most this many points more than the cheapest; otherwise the cheapest stands. Held only when the host's admission check (hold_ok: the provider's client floor) passes too. The host keeps the previous route per client (provider/routing.py remember_route). 0 turns it off.",
+  "pool_size_prior_tokens_per_pct": {
+   "codex:all": 5630000
+  },
+  "_pool_size_prior": "#132 (owner 2026-11-22): unitcost.py learns tokens per 1 % from the provider's own ledger only, so direct use of the same login moves the % without adding tokens and the learned size is a LOWER BOUND (lower_bound=true). On 2026-11-22 that made Codex look like 2.67 M tokens/% against 5.44 M (Claude A) and 4.95 M (Claude B), although Codex's allowance is believed to be several times Claude's. A lower-bound learned size below this prior is raised to it; a learned size above it, or one not flagged as a lower bound, stands. codex:all = 5.63 M: the 563 M tokens/week Codex estimate recorded with the burn weight (core.resolve, Forest 2026-09-29), deliberately not the full ~10× ratio, so it only corrects the undercount and is no Codex preference. Keyed by the vendor's base pool (applies to every account of it).",
   "capacity_credit_points": 20,
   "_capacity": "Forest 2026-09-26: subscriptions are not normalised (Codex > Claude > Gemini > Cursor in absolute allowance). unitcost.py learns tokens-per-percent per pool from our own samples and ledger; among pools with room (scarcity ≤ 0), the route on the pool with the most tokens left gets up to capacity_credit_points off. Re-learned every 6 h and nightly.",
   "interactive_min_general_index": 50,

@@ -1061,6 +1061,70 @@ def change_since(hours: float = 24) -> dict[tuple[str, str], float]:
             for w in v.get("windows") or []}
 
 
+BURN_HOURS = 24.0          # the recent burn rate is learned over this many hours of samples …
+BURN_MIN_SPAN_H = 6.0      # … from at least this span since the window's last reset (a shorter one is noise)
+BURN_TAIL_BYTES = 4 << 20  # only the history's tail is read (the local refresh appends a line a minute)
+_burn_cache: dict[str, Any] = {"key": None, "rates": {}}
+_burn_lock = threading.Lock()
+
+
+def recent_burn_rates(hours: float = BURN_HOURS, now: float | None = None) -> dict[tuple[str, str], float]:
+    """(lane, window name) -> % of that window used per hour over the last `hours` of our own samples
+    (scarcity-history.jsonl), counted only since the window's last reset (used % or elapsed % going down marks one).
+    Used by core._expected_loss_pct to project what an underused pool will still use before its reset (#132).
+    A series spanning less than BURN_MIN_SPAN_H is left out (the caller falls back to the window's pace). Cached on the
+    history's size and mtime; never raises."""
+    try:
+        st = HISTORY.stat()
+    except OSError:
+        return {}
+    now = time.time() if now is None else now
+    key = (st.st_size, st.st_mtime_ns, round(now / 300), hours)   # re-read when the file changes, at most every 5 min otherwise
+    with _burn_lock:
+        if _burn_cache["key"] == key:
+            return dict(_burn_cache["rates"])
+    try:
+        with HISTORY.open("rb") as f:
+            if st.st_size > BURN_TAIL_BYTES:
+                f.seek(st.st_size - BURN_TAIL_BYTES)
+                f.readline()                                       # drop the partial first line
+            lines = f.read().decode("utf-8", "replace").split("\n")   # "\n" only, as every history reader
+    except OSError:
+        return {}
+    since = now - hours * 3600
+    series: dict[tuple[str, str], list[tuple[float, float, float | None]]] = {}
+    for line in lines:
+        try:
+            row = json.loads(line)
+            ts = float(row["ts"])
+        except Exception:
+            continue
+        if ts < since or ts > now:
+            continue
+        for lane, v in (row.get("lanes") or {}).items():
+            for w in (v or {}).get("windows") or []:
+                try:
+                    series.setdefault((lane, str(w[0])), []).append(
+                        (ts, float(w[1]), float(w[2]) if len(w) > 2 and w[2] is not None else None))
+                except (TypeError, ValueError, IndexError):
+                    continue
+    rates: dict[tuple[str, str], float] = {}
+    for k, pts in series.items():
+        pts.sort()
+        start = 0
+        for i in range(1, len(pts)):
+            (_, u0, e0), (_, u1, e1) = pts[i - 1], pts[i]
+            if u1 < u0 - 0.5 or (e0 is not None and e1 is not None and e1 < e0 - 1.0):
+                start = i                                          # the window reset between these two samples
+        seg = pts[start:]
+        span_h = (seg[-1][0] - seg[0][0]) / 3600 if len(seg) > 1 else 0.0
+        if span_h >= BURN_MIN_SPAN_H:
+            rates[k] = max(0.0, seg[-1][1] - seg[0][1]) / span_h
+    with _burn_lock:
+        _burn_cache.update(key=key, rates=rates)
+    return dict(rates)
+
+
 def stance(s: float | None) -> str:
     if s is None:
         return "unknown: routed on price only"
