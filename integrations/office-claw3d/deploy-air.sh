@@ -11,9 +11,12 @@
 #   deploy-air.sh --unpublish-tailnet [--apply]       take that serve down again
 #
 # Order: every check runs BEFORE the first change, so a refused run leaves the machine as it was.
-# Then the new Node, adapter copy and Claw3D build are staged beside the running ones, and only
-# after all of them succeed are the `adapter` and `claw3d/current` links switched (atomic rename)
-# and the daemons restarted. It never prints a token: secrets go file-to-file under umask 077.
+# Then the new Node, adapter copy, Claw3D build, launchers, plists and any new office token are
+# staged beside the running ones. Only after all of them succeed is the release activated, as one
+# transaction (tx_run, deploy-lib.sh): links switched, staged files promoted (the replaced ones kept
+# as .prev), daemons restarted, health checked. A failure anywhere in it rolls everything back and
+# restarts the old daemons; a rotated token's old registration is revoked only after success.
+# It never prints a token: secrets go file-to-file under umask 077.
 set -euo pipefail
 
 # ---- pins (change deliberately, re-verify the hashes) --------------------------------
@@ -34,12 +37,15 @@ STUDIO_PORT=3000
 # (Serve: the provider); --publish-tailnet refuses any port already in `tailscale serve status`.
 TAILNET_PORT=8446
 PROVIDER_OFFICE_URL="http://127.0.0.1:8432/v1/cortados/office"
-CLIENT_NAME="claw3d-office"                # the provider's scoped client (office:read only)
+# The provider's scoped client (office:read only), in one of two slots: a rotation registers the new
+# token in the other slot and revokes the old one only after the new release passed its health check.
+CLIENT_SLOTS=(claw3d-office claw3d-office-b)
 BRIDGE_LABEL="com.cortados.office-bridge"; STUDIO_LABEL="com.cortados.office-studio"
 OFFICE_TOKEN="$BRIDGE_HOME/secrets/office-token"
 BRIDGE_SECRET="$BRIDGE_HOME/secrets/bridge-token"
 GATEWAY_SECRET="$STUDIO_HOME/secrets/gateway-token"
 ACCESS_TOKEN="$STUDIO_HOME/secrets/studio-access-token"
+STAGE="$ROOT/stage"                        # root 0700: launchers, plists and a new token, before activation
 ADAPTER_FILES=(adapter.mjs bridge.mjs sprites.mjs claw3d/avatar-profile-hint.patch claw3d/studio-login.patch
   claw3d/studio-login.cjs)
 
@@ -92,9 +98,10 @@ if [[ $MODE != install ]]; then
   TS="$(command -v tailscale || true)"
   [[ -n "$TS" ]] || TS="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
   [[ -x "$TS" ]] || die "tailscale CLI not found"
-  serve_json() { "$TS" serve status --json 2>/dev/null || echo '{}'; }
-  # What the serve config says about TAILNET_PORT: free | ours | funnel | other.
-  state="$(serve_json | serve_port_state "$TAILNET_PORT" "http://127.0.0.1:$STUDIO_PORT")"
+  # What the serve config says about TAILNET_PORT: free | ours | funnel | other. A failed status
+  # command aborts: an unread config is never taken for a free port (serve_state, deploy-lib.sh).
+  state="$(serve_state "$TS" "$TAILNET_PORT" "http://127.0.0.1:$STUDIO_PORT")" \
+    || die "tailscale serve status failed: cannot verify port $TAILNET_PORT, changing nothing (is tailscaled up and logged in?)"
   if [[ $MODE == unpublish ]]; then
     step "Unpublish Studio from the tailnet (https port $TAILNET_PORT)"
     case "$state" in
@@ -127,7 +134,7 @@ if [[ $MODE != install ]]; then
     run "$TS" serve --bg --https="$TAILNET_PORT" "http://127.0.0.1:$STUDIO_PORT"
   fi
   if [[ $APPLY -eq 1 ]]; then
-    after="$(serve_json | serve_port_state "$TAILNET_PORT" "http://127.0.0.1:$STUDIO_PORT")"
+    after="$(serve_state "$TS" "$TAILNET_PORT" "http://127.0.0.1:$STUDIO_PORT")" || after="unreadable"
     if [[ "$after" != ours ]]; then
       "$TS" serve --https="$TAILNET_PORT" off || true
       die "after serve, port $TAILNET_PORT is '$after', not a tailnet-only proxy to Studio: taken down again"
@@ -162,7 +169,7 @@ if [[ -e "$ROOT" || -L "$ROOT" ]]; then
   UPGRADE=1
   [[ -d "$ROOT" && ! -L "$ROOT" ]] || die "$ROOT is not a plain directory"
   [[ "$(owner_of "$ROOT")" == root:wheel && "$(mode_of "$ROOT")" == 755 ]] || die "$ROOT must be root:wheel 0755"
-  for d in home bin adapters; do
+  for d in home bin adapters stage; do
     [[ ! -e "$ROOT/$d" ]] || [[ "$(owner_of "$ROOT/$d")" == root:wheel && ! -L "$ROOT/$d" ]] || die "$ROOT/$d must be root:wheel"
   done
   for f in "$ROOT/bin/run-bridge.sh" "$ROOT/bin/run-studio.sh"; do
@@ -212,41 +219,62 @@ if [[ "$CURRENT_BUILD" == "$BUILD" && ! -f "$BUILD/.cortados-build-ok" ]]; then
   die "$BUILD is current but has no build marker: investigate"
 fi
 
-# Secrets: kept when present, made when absent. The provider client is explicit.
-REGISTERED="$(PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients list | awk -v n="$CLIENT_NAME:" '$1 == n')"
-if [[ -n "$REGISTERED" && "$REGISTERED" != "$CLIENT_NAME: office:read" ]]; then
-  die "client $CLIENT_NAME is registered with other scopes ($REGISTERED): remove it deliberately first"
-fi
+# An activation that was killed outright (no rollback ran) leaves the previous files as .prev.
+for f in "$ROOT/bin/run-bridge.sh" "$ROOT/bin/run-studio.sh" "/Library/LaunchDaemons/$BRIDGE_LABEL.plist" \
+         "/Library/LaunchDaemons/$STUDIO_LABEL.plist" "$OFFICE_TOKEN"; do
+  if as_root_test -e "$f.prev"; then
+    die "$f.prev exists: an earlier activation was interrupted. It is the previous version: restore it (sudo mv) or delete it, then re-run"
+  fi
+done
+
+# Secrets: kept when present, made when absent. The provider client is explicit, in one slot.
+CLIENTS_LIST="$(PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients list)" || die "cannot list the provider's clients"
+LIVE_SLOT=""
+for s in "${CLIENT_SLOTS[@]}"; do
+  line="$(printf '%s\n' "$CLIENTS_LIST" | awk -v n="$s:" '$1 == n')"
+  [[ -z "$line" ]] && continue
+  [[ "$line" == "$s: office:read" ]] || die "client $s is registered with other scopes ($line): remove it deliberately first"
+  [[ -z "$LIVE_SLOT" ]] || die "both $LIVE_SLOT and $s are registered (an interrupted rotation): remove the one the bridge does not use"
+  LIVE_SLOT="$s"
+done
 HAVE_OFFICE=0; HAVE_BRIDGE_PAIR=0; HAVE_ACCESS=0
 if [[ $UPGRADE -eq 1 ]]; then
   as_root_test -s "$OFFICE_TOKEN" && HAVE_OFFICE=1
   as_root_test -s "$BRIDGE_SECRET" && as_root_test -s "$GATEWAY_SECRET" && HAVE_BRIDGE_PAIR=1
   as_root_test -s "$ACCESS_TOKEN" && HAVE_ACCESS=1
 fi
-if [[ -n "$REGISTERED" ]]; then
-  if [[ $ROTATE -eq 1 ]]; then TOKEN_PLAN=rotate
+NEW_SLOT=""
+if [[ -n "$LIVE_SLOT" ]]; then
+  if [[ $ROTATE -eq 1 ]]; then
+    TOKEN_PLAN=rotate
+    [[ "$LIVE_SLOT" == "${CLIENT_SLOTS[0]}" ]] && NEW_SLOT="${CLIENT_SLOTS[1]}" || NEW_SLOT="${CLIENT_SLOTS[0]}"
   elif [[ $HAVE_OFFICE -eq 1 ]]; then TOKEN_PLAN=keep
-  else die "client $CLIENT_NAME is registered but the bridge has no token file: re-run with --rotate-office-token"
+  else die "client $LIVE_SLOT is registered but the bridge has no token file: re-run with --rotate-office-token"
   fi
 else
-  TOKEN_PLAN=mint      # also when a stale (revoked) token file is there: it is replaced
+  TOKEN_PLAN=mint; NEW_SLOT="${CLIENT_SLOTS[0]}"   # also when a stale (revoked) token file is there: it is replaced
 fi
 
 [[ $UPGRADE -eq 1 ]] && kind=upgrade || kind="fresh install"
 echo "  ok: checkout $SRC_SHA (clean), provider reachable on loopback; $kind"
-echo "  plan: node $NODE_PLAN, build $BUILD_ID, office token $TOKEN_PLAN, bridge secret $([[ $HAVE_BRIDGE_PAIR -eq 1 ]] && echo keep || echo make)," \
+echo "  plan: node $NODE_PLAN, build $BUILD_ID, office token $TOKEN_PLAN${NEW_SLOT:+ (as $NEW_SLOT)}, bridge secret $([[ $HAVE_BRIDGE_PAIR -eq 1 ]] && echo keep || echo make)," \
   "studio access token $([[ $HAVE_ACCESS -eq 1 ]] && echo keep || echo make)"
 for label in "$BRIDGE_LABEL" "$STUDIO_LABEL"; do
-  loaded "$label" && echo "  $label is loaded: it is restarted after the switch" || true
+  loaded "$label" && echo "  $label is loaded: it is restarted after the switch (and again with the old release on a rollback)" || true
 done
 [[ $APPLY -eq 1 ]] || echo "  DRY RUN: nothing below is executed. Re-run with --apply."
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT   # 0700, the owner's
-switch_link() {  # target link [user]: replace `link` atomically (rename over it)
-  local who=(sudo); [[ -n "${3:-}" ]] && who=(sudo -u "$3")
-  run "${who[@]}" ln -sfn "$1" "$2.new"
-  run "${who[@]}" mv -fh "$2.new" "$2"
+TMP="$(mktemp -d)"   # 0700, the owner's
+# A client registered by this run stays only once its release is committed: any other exit revokes it.
+PENDING_CLIENT=""
+on_exit() {
+  if [[ -n "$PENDING_CLIENT" && $APPLY -eq 1 ]]; then
+    PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients remove "$PENDING_CLIENT" >&2 \
+      || echo "deploy-air: could not revoke $PENDING_CLIENT: remove it with clients remove" >&2
+  fi
+  rm -rf "$TMP"
 }
+trap on_exit EXIT
 
 # ---- 1. role users (hidden, no shell, no login) --------------------------------------
 step "1. Role users $BRIDGE_USER (bridge, holds office:read) and $STUDIO_USER (Claw3D Studio)"
@@ -265,6 +293,8 @@ create_user() {  # name uid home plan
 create_user "$BRIDGE_USER" "$BRIDGE_UID" "$BRIDGE_HOME" "$BRIDGE_ACCOUNT"
 create_user "$STUDIO_USER" "$STUDIO_UID" "$STUDIO_HOME" "$STUDIO_ACCOUNT"
 run sudo install -d -o root -g wheel -m 0755 "$ROOT" "$ROOT/home" "$ROOT/bin" "$ROOT/adapters"
+run sudo rm -rf "$STAGE"
+run sudo install -d -o root -g wheel -m 0700 "$STAGE"
 run sudo install -d -o "$BRIDGE_USER" -g staff -m 0700 "$BRIDGE_HOME" "$BRIDGE_HOME/secrets" "$ROOT/log-bridge"
 run sudo install -d -o "$STUDIO_USER" -g staff -m 0700 "$STUDIO_HOME" "$STUDIO_HOME/secrets" "$ROOT/log-studio"
 run sudo install -d -o "$STUDIO_USER" -g staff -m 0755 "$ROOT/claw3d" "$ROOT/claw3d/builds"
@@ -318,11 +348,23 @@ fi
 
 # ---- 5. secrets (never printed, never on argv) ----------------------------------------
 step "5. Secrets: office:read token ($TOKEN_PLAN), bridge secret, Studio access token"
-# 5a. the provider's scoped client token, minted as the owner and handed to the bridge user
+# 5a. the provider's scoped client token, minted as the owner into the free slot, checked against
+#     the provider and STAGED for the bridge user. The running bridge keeps its own token, still
+#     registered, until the new release is committed (step 8); only then is the old slot revoked.
+office_token_ok() {  # token-file: the provider answers 200 to it (the header goes file-to-file, not argv)
+  local code
+  (umask 077; printf 'x-cortados-token: %s\n' "$(cat "$1")" > "$TMP/office-header")
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H @"$TMP/office-header" "$PROVIDER_OFFICE_URL" || true)"
+  rm -P "$TMP/office-header"
+  [[ "$code" == 200 ]]
+}
 if [[ $TOKEN_PLAN != keep ]]; then
-  [[ $TOKEN_PLAN == rotate ]] && run env PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients remove "$CLIENT_NAME"
-  run env PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients add "$CLIENT_NAME" --scope office:read --token-file "$TMP/office-token"
-  run sudo install -S -o "$BRIDGE_USER" -g staff -m 0600 "$TMP/office-token" "$OFFICE_TOKEN"
+  run env PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients add "$NEW_SLOT" --scope office:read --token-file "$TMP/office-token"
+  if [[ $APPLY -eq 1 ]]; then
+    PENDING_CLIENT="$NEW_SLOT"
+    office_token_ok "$TMP/office-token" || die "the provider does not accept the new $NEW_SLOT token: revoked, nothing switched"
+  fi
+  run sudo install -o "$BRIDGE_USER" -g staff -m 0600 "$TMP/office-token" "$STAGE/office-token"
   run rm -P "$TMP/office-token"
 fi
 # 5b. a local secret shared by the bridge and Studio (NOT the office token: Studio may hand its
@@ -342,15 +384,15 @@ if [[ $HAVE_ACCESS -eq 0 ]]; then
   run rm -P "$TMP/access-token"
 fi
 
-# ---- 6. launchers + LaunchDaemons (written in place: they only name stable paths) ------
-step "6. Launchers and LaunchDaemons (system domain, UserName = role user, RunAtLoad, KeepAlive)"
-write_root_file() {  # dest mode <<content: written to a private temp file, then installed (atomic)
-  local tmp; tmp="$TMP/$(basename "$1")"
+# ---- 6. launchers + LaunchDaemons, staged (they only name stable paths) -----------------
+step "6. Stage launchers and LaunchDaemons (system domain, UserName = role user, RunAtLoad, KeepAlive)"
+write_root_file() {  # staged-name mode <<content: written to a private temp file, then installed into $STAGE
+  local tmp; tmp="$TMP/$1"
   cat > "$tmp"
-  printf '  write %s (%s)\n' "$1" "$2"
-  if [[ $APPLY -eq 1 ]]; then sudo install -S -o root -g wheel -m "$2" "$tmp" "$1"; fi
+  printf '  stage %s (%s)\n' "$STAGE/$1" "$2"
+  if [[ $APPLY -eq 1 ]]; then sudo install -o root -g wheel -m "$2" "$tmp" "$STAGE/$1"; fi
 }
-write_root_file "$ROOT/bin/run-bridge.sh" 0755 <<EOF
+write_root_file run-bridge.sh 0755 <<EOF
 #!/bin/bash
 # Runs as $BRIDGE_USER. Token paths only; the bridge reads the files itself.
 export CORTADOS_OFFICE_URL="$PROVIDER_OFFICE_URL"
@@ -361,7 +403,7 @@ export CORTADOS_OFFICE_BRIDGE_PORT=$BRIDGE_PORT
 export CORTADOS_OFFICE_POLL_SECONDS=5
 exec "$NODE" "$ROOT/adapter/bridge.mjs"
 EOF
-write_root_file "$ROOT/bin/run-studio.sh" 0755 <<EOF
+write_root_file run-studio.sh 0755 <<EOF
 #!/bin/bash
 # Runs as $STUDIO_USER. Loopback only. STUDIO_ACCESS_TOKEN is always set: every browser, on the
 # Air or through tailscale serve, logs in at /cortados-login (claw3d/studio-login.cjs).
@@ -393,31 +435,79 @@ plist() {  # label user script logdir
 EOF
 }
 plist "$BRIDGE_LABEL" "$BRIDGE_USER" "$ROOT/bin/run-bridge.sh" "$ROOT/log-bridge" \
-  | write_root_file "/Library/LaunchDaemons/$BRIDGE_LABEL.plist" 0644
+  | write_root_file "$BRIDGE_LABEL.plist" 0644
 plist "$STUDIO_LABEL" "$STUDIO_USER" "$ROOT/bin/run-studio.sh" "$ROOT/log-studio" \
-  | write_root_file "/Library/LaunchDaemons/$STUDIO_LABEL.plist" 0644
+  | write_root_file "$STUDIO_LABEL.plist" 0644
 
-# ---- 7. switch: everything staged above succeeded ---------------------------------------
-step "7. Switch node, adapter and Claw3D to the staged versions (rename over the links)"
-switch_link "$ROOT/node-$NODE_VERSION" "$ROOT/node"
-switch_link "$ADAPTER_DIR" "$ROOT/adapter"
-switch_link "$BUILD" "$ROOT/claw3d/current" "$STUDIO_USER"
-
-# ---- 8. (re)start the daemons: bootstrap, or bootout + bootstrap when already loaded ----
-step "8. Start or restart the daemons"
-restart() {  # label
-  local p="/Library/LaunchDaemons/$1.plist"
-  if loaded "$1"; then
-    run sudo launchctl bootout "system/$1"
-    if [[ $APPLY -eq 1 ]]; then
-      for _ in $(seq 1 20); do loaded "$1" || break; sleep 0.5; done
-      ! loaded "$1" || die "$1 did not stop"
-    fi
-  fi
-  run sudo launchctl bootstrap system "$p"
+# ---- 7. activate, as one transaction: everything staged above succeeded ---------------
+step "7. Activate: switch the links, install the staged files, restart, health check (rollback on any failure)"
+switch_link() {  # target link [user]: replace `link` atomically (rename over it)
+  local who=(sudo); [[ -n "${3:-}" ]] && who=(sudo -u "$3")
+  run "${who[@]}" ln -sfn "$1" "$2.new" && run "${who[@]}" mv -fh "$2.new" "$2"
 }
-restart "$BRIDGE_LABEL"
-restart "$STUDIO_LABEL"
+# The primitives tx_run (deploy-lib.sh) drives. Each returns a code, never exits.
+fs_readlink() { readlink "$1" 2>/dev/null || true; }
+fs_exists() { as_root_test -e "$1" -o -L "$1"; }
+fs_link() { switch_link "$1" "$2" "$3"; }
+fs_rm() { if [[ -n "$2" ]]; then run sudo -u "$2" rm -f "$1"; else run sudo rm -f "$1"; fi; }
+fs_backup() { run sudo cp -p "$1" "$1.prev"; }
+fs_promote() { run sudo cp -p "$1" "$2.next" && run sudo mv -f "$2.next" "$2"; }
+fs_restore() { run sudo mv -f "$1.prev" "$1"; }
+daemon_loaded() { loaded "$1"; }
+daemon_start() { run sudo launchctl bootstrap system "/Library/LaunchDaemons/$1.plist"; }
+daemon_stop() {
+  run sudo launchctl bootout "system/$1" || true      # a daemon that exits meanwhile is not an error
+  [[ $APPLY -eq 1 ]] || return 0
+  for _ in $(seq 1 20); do loaded "$1" || return 0; sleep 0.5; done
+  echo "deploy-air: $1 did not stop" >&2; return 1
+}
+http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$1" || true; }
+office_healthy() {  # prints why not, on failure
+  local l
+  for l in "$BRIDGE_LABEL" "$STUDIO_LABEL"; do
+    launchctl print "system/$l" 2>/dev/null | grep -q 'state = running' || { echo "$l is not running"; return 1; }
+  done
+  [[ "$(http_code "http://127.0.0.1:$BRIDGE_PORT/")" == 426 ]] || { echo "the bridge does not answer on 127.0.0.1:$BRIDGE_PORT"; return 1; }
+  [[ "$(http_code "http://127.0.0.1:$STUDIO_PORT/")" == 401 ]] || { echo "Studio does not refuse a request without its access cookie"; return 1; }
+  [[ "$(http_code "http://127.0.0.1:$STUDIO_PORT/cortados-login")" == 200 ]] || { echo "the login form does not answer"; return 1; }
+  if sudo lsof -nP -iTCP:$BRIDGE_PORT -iTCP:$STUDIO_PORT -sTCP:LISTEN | awk 'NR>1{print $9}' | grep -vqE '^(127\.0\.0\.1|\[::1\]):'; then
+    echo "a listener is not loopback-only"; return 1
+  fi
+}
+health_check() {  # up to ~60 s for both daemons to come up, then the same checks must hold 10 s later
+  [[ $APPLY -eq 1 ]] || { echo "  (dry run) health check: both daemons running, bridge 426, Studio 401 on /, 200 on /cortados-login, loopback only"; return 0; }
+  local why="" i
+  for i in $(seq 1 30); do
+    if why="$(office_healthy)"; then
+      sleep 10
+      why="$(office_healthy)" && { echo "  healthy: both daemons running on loopback, Studio gated (401), login form 200"; return 0; }
+    fi
+    sleep 2
+  done
+  echo "deploy-air: health check: $why" >&2; return 1
+}
+TX_LINKS=("$ROOT/node-$NODE_VERSION|$ROOT/node|" "$ADAPTER_DIR|$ROOT/adapter|" "$BUILD|$ROOT/claw3d/current|$STUDIO_USER")
+TX_FILES=("$STAGE/run-bridge.sh|$ROOT/bin/run-bridge.sh" "$STAGE/run-studio.sh|$ROOT/bin/run-studio.sh"
+  "$STAGE/$BRIDGE_LABEL.plist|/Library/LaunchDaemons/$BRIDGE_LABEL.plist"
+  "$STAGE/$STUDIO_LABEL.plist|/Library/LaunchDaemons/$STUDIO_LABEL.plist")
+[[ $TOKEN_PLAN == keep ]] || TX_FILES+=("$STAGE/office-token|$OFFICE_TOKEN")
+TX_LABELS=("$BRIDGE_LABEL" "$STUDIO_LABEL")
+tx_rc=0; tx_run || tx_rc=$?
+case $tx_rc in
+  0) ;;
+  1) die "activation failed and was rolled back: the previous release runs again${PENDING_CLIENT:+ ($PENDING_CLIENT is revoked)}" ;;
+  *) die "activation failed AND the rollback did not complete (see above): stop both daemons and investigate" ;;
+esac
+
+# ---- 8. commit: the new release is healthy, so the old credential goes --------------------
+step "8. Commit"
+if [[ $TOKEN_PLAN == rotate ]]; then
+  run env PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients remove "$LIVE_SLOT" \
+    || echo "deploy-air: could not revoke $LIVE_SLOT: remove it with clients remove (the bridge uses $NEW_SLOT)" >&2
+fi
+PENDING_CLIENT=""
+run sudo rm -rf "$STAGE"
+if [[ $APPLY -eq 1 ]]; then tail -n 5 "$ROOT/log-bridge/err.log" 2>/dev/null | sed 's/^/  bridge: /' || true; fi
 
 # ---- 9. prune: keep the new and the previous Claw3D build / adapter copy (one rollback) --
 step "9. Prune older builds (kept: current and previous)"
@@ -429,21 +519,6 @@ for a in "$ROOT/adapters"/*; do
 done
 true
 
-# ---- 10. checks -------------------------------------------------------------------------
-step "10. Checks"
-if [[ $APPLY -eq 1 ]]; then
-  sleep 15
-  sudo lsof -nP -iTCP:$BRIDGE_PORT -sTCP:LISTEN | awk 'NR>1{print "  bridge listens on " $9}'
-  sudo lsof -nP -iTCP:$STUDIO_PORT -sTCP:LISTEN | awk 'NR>1{print "  studio listens on " $9}'
-  if sudo lsof -nP -iTCP:$BRIDGE_PORT -iTCP:$STUDIO_PORT -sTCP:LISTEN | awk 'NR>1{print $9}' | grep -vqE '^(127\.0\.0\.1|\[::1\]):'; then
-    die "a listener is not loopback-only: stop both daemons and investigate"
-  fi
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$STUDIO_PORT/" || true)"
-  [[ "$code" == 401 ]] && echo "  Studio refuses requests without its access cookie (401)" || die "Studio answered $code without its access cookie"
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$STUDIO_PORT/cortados-login" || true)"
-  [[ "$code" == 200 ]] && echo "  login form answers on /cortados-login" || die "login form answered $code"
-  tail -n 5 "$ROOT/log-bridge/err.log" 2>/dev/null | sed 's/^/  bridge: /' || true
-fi
 echo
 echo "Open it on the Air: http://127.0.0.1:$STUDIO_PORT/cortados-login (the access token: DEPLOY.md \"Viewing it\")."
 echo "Other devices: $0 --publish-tailnet (a separate step)."

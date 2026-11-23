@@ -133,29 +133,37 @@ test('tailnet port check: our exact tailnet-only proxy is recognised; anything n
   assert.equal(portState(plain), 'other');
 });
 
-test('deploy-air.sh: every check comes before the first change, and the order is stage -> switch -> restart', async () => {
+test('deploy-air.sh: every check comes before the first change, and the order is stage -> activate -> commit -> prune', async () => {
   const lines = (await readFile(join(HERE, 'deploy-air.sh'), 'utf8')).split('\n');
   const at = re => { const i = lines.findIndex(l => re.test(l)); assert.ok(i >= 0, String(re)); return i; };
   const installStart = at(/^# install \/ upgrade$/);
   const plan = at(/echo "  plan: /);
-  const firstChange = lines.findIndex((l, i) => i > installStart && /^\s*(run|as_studio|create_user|switch_link|restart|write_root_file|new_secret) /.test(l));
+  const firstChange = lines.findIndex((l, i) => i > installStart && /^\s*(run|as_studio|create_user|switch_link|tx_run|write_root_file|new_secret) /.test(l));
   assert.ok(firstChange > plan, `first change at line ${firstChange + 1} precedes the plan at ${plan + 1}`);
   // between the install banner and the plan: reads and dies only
   for (let i = installStart; i < plan; i++) {
     const code = lines[i].replace(/^\s*#.*/, '').replace(/"(?:[^"\\]|\\.)*"/g, '""');   // messages are not commands
-    assert.ok(!/(^|[\s;&|(])(run|git clone|npm|sudo (install|mv|rm|ln|dscl|launchctl|tee|chown|chmod))\b/.test(code),
+    assert.ok(!/(^|[\s;&|(])(run|git clone|npm|sudo (install|mv|rm|ln|dscl|launchctl|tee|chown|chmod)|clients (add|remove))\b/.test(code),
       `a change in the preflight: ${lines[i]}`);
   }
   const build = at(/run build && touch \.cortados-build-ok/);
-  const switchAdapter = at(/^switch_link "\$ADAPTER_DIR" "\$ROOT\/adapter"/);
-  const switchStudio = at(/^switch_link "\$BUILD" "\$ROOT\/claw3d\/current"/);
-  const restartBridge = at(/^restart "\$BRIDGE_LABEL"/);
-  assert.ok(build < switchAdapter && switchAdapter < switchStudio && switchStudio < restartBridge);
+  const stageToken = at(/run sudo install -o "\$BRIDGE_USER" -g staff -m 0600 "\$TMP\/office-token" "\$STAGE\/office-token"/);
+  const activate = at(/^tx_rc=0; tx_run \|\| tx_rc=\$\?$/);
+  const revokeOld = at(/clients remove "\$LIVE_SLOT"/);
+  const prune = at(/^step "9\. Prune/);
+  assert.ok(build < activate && stageToken < activate && activate < revokeOld && revokeOld < prune);
+  // the old credential is revoked nowhere else: never before the new release is healthy
+  assert.equal(lines.filter(l => /provider\.clients remove/.test(l)).length, 2);   // the commit, and on_exit's pending (new) slot
+  assert.ok(at(/clients remove "\$PENDING_CLIENT"/) < activate);         // defined in on_exit, which runs at exit only
+  // launchers and plists are staged, never written over the live ones before activation
+  assert.ok(lines.filter(l => /^write_root_file |\| write_root_file /.test(l.trim())).every(l => !/\/(bin|Library)\//.test(l)));
+  for (const f of ['run-bridge.sh', 'run-studio.sh']) assert.ok(lines.some(l => l.includes(`"$STAGE/${f}|$ROOT/bin/${f}"`)), f);
+  assert.ok(lines.some(l => l.includes('[[ $TOKEN_PLAN == keep ]] || TX_FILES+=("$STAGE/office-token|$OFFICE_TOKEN")')));
   // no clone into a fixed, possibly existing directory: only into the per-commit build dir, after clearing a failed one
   const clones = lines.filter(l => /git clone/.test(l));
   assert.deepEqual(clones.map(l => l.trim()), ['as_studio git clone --no-checkout "$CLAW3D_REPO" "$BUILD"']);
-  // a loaded daemon is booted out before it is bootstrapped again
-  assert.ok(at(/run sudo launchctl bootout "system\/\$1"/) < at(/run sudo launchctl bootstrap system "\$p"/));
+  // a loaded daemon is booted out before it is bootstrapped again (tx_restart), and the stop is waited for
+  assert.match(lines.join('\n'), /daemon_stop\(\) \{\n  run sudo launchctl bootout "system\/\$1"/);
 });
 
 test('deploy-air.sh: the tailnet step serves HTTPS to loopback Studio only and never turns funnel on', async () => {
@@ -171,4 +179,140 @@ test('deploy-air.sh: the tailnet step serves HTTPS to loopback Studio only and n
   assert.match(text, /export HOST=127\.0\.0\.1 PORT=\$STUDIO_PORT/);           // Studio itself stays on loopback
   assert.match(text, /export CORTADOS_OFFICE_BRIDGE_HOST=127\.0\.0\.1/);       // and so does the bridge
   assert.match(text, /STUDIO_ACCESS_TOKEN="\\\$\(cat "\$ACCESS_TOKEN"\)"/);   // the gate is on before any publish
+});
+
+// ---- round 2: a failed `tailscale serve status` is never "free" ------------------------------------
+async function fakeTailscale(t, { code = 0, stdout = '' }) {
+  const dir = await mkdtemp(join(tmpdir(), 'office-ts-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, 'out'), stdout);
+  const bin = join(dir, 'tailscale');
+  await writeFile(bin, `#!/bin/bash\n[ "$1 $2 $3" = "serve status --json" ] || { echo "unexpected $*" >&2; exit 99; }\ncat "${join(dir, 'out')}"\necho "fake tailscale failing" >&2\nexit ${code}\n`);
+  await chmod(bin, 0o755);
+  return bin;
+}
+function serveState(bin, port = '8446', target = 'http://127.0.0.1:3000') {
+  const r = spawnSync('bash', ['-c', '. "$LIB"; serve_state "$@"', 'ss', bin, port, target],
+    { env: { PATH: '/usr/bin:/bin', LIB }, encoding: 'utf8' });
+  return { code: r.status, out: r.stdout.trim() };
+}
+
+test('tailnet port check: a failed status command aborts instead of reading as a free port (round-2 finding)', async t => {
+  // tailscaled down / logged out: non-zero exit, nothing on stdout. Before round 2 this became '{}' -> "free".
+  assert.deepEqual(serveState(await fakeTailscale(t, { code: 1 })), { code: 1, out: '' });
+  // a failure is a failure even when the command printed something
+  assert.deepEqual(serveState(await fakeTailscale(t, { code: 1, stdout: '{}' })), { code: 1, out: '' });
+  // an empty config is accepted only from a successful command
+  assert.deepEqual(serveState(await fakeTailscale(t, { code: 0, stdout: '' })), { code: 0, out: 'free' });
+  assert.deepEqual(serveState(await fakeTailscale(t, { code: 0, stdout: '{}\n' })), { code: 0, out: 'free' });
+  assert.deepEqual(serveState(await fakeTailscale(t, { code: 0, stdout: JSON.stringify(AIR) })), { code: 0, out: 'free' });
+  assert.deepEqual(serveState(await fakeTailscale(t, { code: 0, stdout: JSON.stringify(AIR) }), '8444'), { code: 0, out: 'other' });
+});
+
+test('deploy-air.sh: publish and unpublish read the serve config only through serve_state, and die when it fails', async () => {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  assert.ok(!/\|\| echo '\{\}'/.test(text), 'no fallback to an empty config');
+  assert.ok(!/serve status --json/.test(text), 'the status command runs only in deploy-lib.sh');
+  assert.match(text, /state="\$\(serve_state "\$TS" "\$TAILNET_PORT" "http:\/\/127\.0\.0\.1:\$STUDIO_PORT"\)" \\\n\s+\|\| die "tailscale serve status failed/);
+  // the state is computed before either branch uses it
+  assert.ok(text.indexOf('|| die "tailscale serve status failed') < text.indexOf('if [[ $MODE == unpublish ]]'));
+});
+
+// ---- round 2: activation is a transaction, exercised with injected failures ------------------------
+// A fake host in a temp dir: real symlinks and files, daemons as state files recording the release they
+// were started with (link targets + launcher text). FAIL lists steps that fail ONCE; FAIL_ALWAYS every time.
+const TX_HARNESS = join(HERE, 'fixtures', 'tx-harness.sh');
+
+async function txHost(t, { upgrade }) {
+  const D = await mkdtemp(join(tmpdir(), 'office-tx-'));
+  t.after(() => rm(D, { recursive: true, force: true }));
+  for (const d of ['builds/old', 'builds/new', 'adapters/old', 'adapters/new', 'bin', 'stage', 'secrets', 'daemons']) {
+    await mkdir(join(D, d), { recursive: true });
+  }
+  for (const f of ['run-bridge.sh', 'run-studio.sh']) await writeFile(join(D, 'stage', f), `new ${f}\n`);
+  await writeFile(join(D, 'stage', 'token'), 'new-token\n');
+  if (upgrade) {
+    for (const f of ['run-bridge.sh', 'run-studio.sh']) await writeFile(join(D, 'bin', f), `old ${f}\n`);
+    await writeFile(join(D, 'secrets', 'token'), 'old-token\n');
+    const { symlink } = await import('node:fs/promises');
+    await symlink(join(D, 'builds/old'), join(D, 'current'));
+    await symlink(join(D, 'adapters/old'), join(D, 'adapter'));
+    runTx(D, '', '', 'for l in bridge studio; do daemon_start $l; done; : > "$D/log"; exit 0');
+  }
+  return D;
+}
+function runTx(D, fail = '', failAlways = '', prelude = '') {
+  const r = spawnSync('/bin/bash', [TX_HARNESS], {
+    env: { PATH: '/usr/bin:/bin', LIB, FAKE: D, FAIL: fail, FAIL_ALWAYS: failAlways, PRELUDE: prelude }, encoding: 'utf8' });
+  return { status: r.status, out: r.stdout.trim(), err: r.stderr };
+}
+async function snapshot(D) {
+  const { readlink, readdir } = await import('node:fs/promises');
+  const link = async p => { try { return (await readlink(join(D, p))).slice(D.length + 1); } catch { return null; } };
+  const file = async p => { try { return (await readFile(join(D, p), 'utf8')).trim(); } catch { return null; } };
+  const daemons = {};
+  for (const l of await readdir(join(D, 'daemons'))) {
+    daemons[l] = (await file(`daemons/${l}`)).split('\n').map(x => x.startsWith(D) ? x.slice(D.length + 1) : x);
+  }
+  const leftovers = [...await readdir(join(D, 'bin')), ...await readdir(join(D, 'secrets'))].filter(n => /\.(prev|next)$/.test(n));
+  return { current: await link('current'), adapter: await link('adapter'), bridge: await file('bin/run-bridge.sh'),
+    studio: await file('bin/run-studio.sh'), token: await file('secrets/token'), daemons, leftovers };
+}
+const OLD = { current: 'builds/old', adapter: 'adapters/old', bridge: 'old run-bridge.sh', studio: 'old run-studio.sh',
+  token: 'old-token', leftovers: [],
+  daemons: { bridge: ['builds/old', 'adapters/old', 'old run-bridge.sh', 'old-token'],
+    studio: ['builds/old', 'adapters/old', 'old run-studio.sh', 'old-token'] } };
+const NEW = { current: 'builds/new', adapter: 'adapters/new', bridge: 'new run-bridge.sh', studio: 'new run-studio.sh',
+  token: 'new-token', leftovers: [],
+  daemons: { bridge: ['builds/new', 'adapters/new', 'new run-bridge.sh', 'new-token'],
+    studio: ['builds/new', 'adapters/new', 'new run-studio.sh', 'new-token'] } };
+
+test('activation: a healthy upgrade switches everything, restarts both daemons, and drops the .prev copies', async t => {
+  const D = await txHost(t, { upgrade: true });
+  assert.deepEqual(await snapshot(D), OLD);
+  const r = runTx(D);
+  assert.equal(r.out, 'rc=0', r.err);
+  assert.deepEqual(await snapshot(D), NEW);
+  assert.deepEqual((await readFile(join(D, 'log'), 'utf8')).trim().split('\n'),
+    ['stop bridge', 'start bridge', 'stop studio', 'start studio', 'health']);
+});
+
+test('activation: a failure at any step of an upgrade restores links, files, the credential and the old daemons (round-2 finding)', async t => {
+  // The review's case first: the bridge is already restarted on the new release when Studio fails to bootstrap.
+  for (const point of ['start:studio', 'health', 'stop:studio', 'stop:bridge', 'start:bridge', 'link:current', 'link:adapter',
+    'backup:run-studio.sh', 'promote:run-bridge.sh', 'promote:token']) {
+    const D = await txHost(t, { upgrade: true });
+    const r = runTx(D, point);
+    assert.equal(r.out, 'rc=1', `${point}: ${r.err}`);
+    assert.match(r.err, /ROLLBACK/, point);
+    assert.deepEqual(await snapshot(D), OLD, point);
+  }
+});
+
+test('activation: a failed fresh install leaves no links, no installed files and no daemons', async t => {
+  for (const point of ['health', 'start:studio', 'promote:token']) {
+    const D = await txHost(t, { upgrade: false });
+    const r = runTx(D, point);
+    assert.equal(r.out, 'rc=1', `${point}: ${r.err}`);
+    assert.deepEqual(await snapshot(D), { current: null, adapter: null, bridge: null, studio: null, token: null,
+      daemons: {}, leftovers: [] }, point);
+  }
+});
+
+test('activation: TERM during the health check rolls back before exiting', async t => {
+  const D = await txHost(t, { upgrade: true });
+  const r = runTx(D, 'term');
+  assert.equal(r.status, 1); assert.equal(r.out, '');      // exited from the trap, never reached "rc="
+  assert.match(r.err, /ROLLBACK/);
+  assert.deepEqual(await snapshot(D), OLD);
+});
+
+test('activation: a rollback that cannot restart the old daemon reports 2 (investigate), never success', async t => {
+  const D = await txHost(t, { upgrade: true });
+  const r = runTx(D, 'health', 'start:studio');
+  assert.equal(r.out, 'rc=2', r.err);
+  assert.match(r.err, /com|studio did not start again/);
+  const s = await snapshot(D);
+  assert.deepEqual({ ...s, daemons: undefined }, { ...OLD, daemons: undefined });   // files and links restored anyway
+  assert.deepEqual(s.daemons, { bridge: OLD.daemons.bridge });
 });

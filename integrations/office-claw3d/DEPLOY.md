@@ -89,8 +89,11 @@ bridge user. The bridge refuses to start if the two secrets are equal.
 - **An existing install.** `/opt/cortados-office` must be root:wheel 0755 with the layout this
   script makes: `adapter` and `node` links, `claw3d/current` a link into `claw3d/builds/`, homes
   0700 per role user, launchers and plists root-owned. Anything else (a plain directory where a
-  link belongs, a leftover `claw3d/src`) aborts with "unknown layout". The provider client
-  `claw3d-office` must be absent or registered with `office:read` alone.
+  link belongs, a leftover `claw3d/src`) aborts with "unknown layout". The provider client lives
+  in one of two slots, `claw3d-office` or `claw3d-office-b`: at most one may be registered, with
+  `office:read` alone (both registered means an interrupted rotation: remove the one the bridge
+  does not use). A `.prev` file beside a launcher, plist or the office token means an earlier
+  activation was killed before it could roll back: the run stops and names it.
 
 Then:
 
@@ -108,32 +111,46 @@ Then:
    `.cortados-build-ok` marker. A build dir with the marker is reused. One without it (a failed
    earlier run) is deleted and rebuilt. It is never the current one.
 5. **Secrets.** Nothing is printed or passed on argv. Files that are already there are kept.
-   - **office:read token.** When `claw3d-office` is not registered, the owner's
+   - **office:read token.** When no slot is registered, the owner's
      `python3 -B -m cortados_router.provider.clients add claw3d-office --scope office:read --token-file <tmp>`
-     mints it into a new 0600 file and registers only its hash. The script `install`s the file as
-     `_cortados-office` (0600) and removes the temp copy with `rm -P`. When it is registered and
-     the bridge has its file, it is kept. When it is registered but the file is missing, the run
-     stops before any change and asks for `--rotate-office-token`, which removes the registration
-     and mints a new token the same way.
+     mints it into a new 0600 file and registers only its hash. The script checks that the
+     provider answers 200 to it (the header goes through a 0600 file, never argv), then stages it
+     as `_cortados-office` (0600) in `/opt/cortados-office/stage/` and removes the temp copy with
+     `rm -P`. When a slot is registered and the bridge has its file, it is kept. When one is
+     registered but the file is missing, the run stops before any change and asks for
+     `--rotate-office-token`. A rotation mints the new token into the **other** slot the same way;
+     the running bridge's token stays registered and working until the new release is committed
+     (step 8). A token registered by a run that then fails is revoked on exit.
    - **Bridge secret** (bridge + Studio) and **Studio access token** (Studio only): each is
      `openssl rand -hex 32` under `umask 077`, installed 0600 per role user. They are made only
      when missing.
-6. **Launchers and LaunchDaemons.** It writes the root-owned launchers `run-bridge.sh` and
-   `run-studio.sh`. They set paths and ports and read the secret files at start; Studio always
-   gets `STUDIO_ACCESS_TOKEN`. It also writes
-   `/Library/LaunchDaemons/com.cortados.office-{bridge,studio}.plist` (`UserName` = the role user,
-   RunAtLoad, KeepAlive, logs under `/opt/cortados-office/log-*`). Each file is installed with
-   `install -S`, which replaces it by renaming.
-7. **Switch.** Only after steps 2–6 succeed, it repoints `node`, `adapter` and `claw3d/current`
-   to the staged versions (`ln -sfn` to `<link>.new`, then `mv -fh` over the link: a rename).
-8. **Start or restart.** A daemon that is not loaded is bootstrapped. One that is already loaded
-   is booted out, waited for (up to 10 s), then bootstrapped again, so it reads the new plist
-   and links.
-9. **Prune.** It keeps the new build and adapter copy plus the previous ones (one rollback:
-   point the links back and restart), and deletes older ones.
-10. **Checks.** Both listeners must be on loopback only, or the script stops. Studio must answer
-    401 on `/` without the cookie, and 200 on `/cortados-login`. It shows the last lines of the
-    bridge log (fixed messages, never a token).
+6. **Launchers and LaunchDaemons, staged.** It writes the root-owned launchers `run-bridge.sh`
+   and `run-studio.sh` and the plists `com.cortados.office-{bridge,studio}.plist` into
+   `/opt/cortados-office/stage/` (root, 0700), not over the live ones. The launchers set paths and
+   ports and read the secret files at start; Studio always gets `STUDIO_ACCESS_TOKEN`. The plists
+   set `UserName` = the role user, RunAtLoad, KeepAlive, logs under `/opt/cortados-office/log-*`.
+7. **Activate, as one transaction** (`tx_run` in `deploy-lib.sh`). Only after steps 2–6 succeed:
+   - it repoints `node`, `adapter` and `claw3d/current` to the staged versions (`ln -sfn` to
+     `<link>.new`, then `mv -fh` over the link: a rename), remembering each old target;
+   - it installs the staged launchers, plists and any new office token over the live ones (copy to
+     `<file>.next`, then rename), each replaced file first copied to `<file>.prev`;
+   - it restarts the daemons: one not loaded is bootstrapped, one loaded is booted out, waited for
+     (up to 10 s), then bootstrapped again;
+   - **health check**, for up to about 60 s, and again 10 s after it first passes: both daemons
+     `state = running`, the bridge answering on 127.0.0.1:18789, Studio 401 on `/` without the
+     cookie and 200 on `/cortados-login`, both listeners on loopback only.
+
+   **Any failure in it, or INT/TERM/HUP, rolls back:** both daemons are stopped, every step is
+   undone in reverse (each file back from its `.prev`, each link to its old target, anything new
+   removed), and the daemons that were loaded before are bootstrapped again with the previous
+   release and the previous office token, which is still registered. The run then stops with
+   "rolled back", or, if a rollback step itself failed, with "the rollback did not complete" and
+   what failed. Tests inject a failure at each step (`deploy.test.mjs`, `fixtures/tx-harness.sh`).
+8. **Commit.** The `.prev` copies are deleted, and on a rotation the old slot is revoked
+   (`clients remove`); only now is the old credential gone. It shows the last lines of the
+   bridge log (fixed messages, never a token).
+9. **Prune.** It keeps the new build and adapter copy plus the previous ones (one rollback by
+   hand later: point the links back and restart), and deletes older ones.
 
 ## Viewing it
 
@@ -160,7 +177,9 @@ sudo cat /opt/cortados-office/home/studio/secrets/studio-access-token | pbcopy
   certificate. Studio stays bound to 127.0.0.1 and the bridge is never published. Before it
   serves anything, the script checks that Studio answers 401 without the cookie and 200 on the
   login form, so the gate is on. It also checks that 8446 is not already in `tailscale serve status`
-  and that nothing there is funnelled. Afterwards it re-reads the status. If 8446 is not exactly a
+  and that nothing there is funnelled. If `tailscale serve status --json` itself fails (tailscaled
+  down, logged out), it stops and changes nothing: an unread config is never taken for a free port.
+  Only a successful status with empty output counts as an empty config. Afterwards it re-reads the status. If 8446 is not exactly a
   tailnet-only proxy to `127.0.0.1:3000`, it takes the serve down and stops. It prints the
   link:
 
@@ -177,7 +196,16 @@ serves only `/cortados-login`, and only when Studio has a token. It accepts a PO
 its own origin (Origin equal to the request's scheme and Host or X-Forwarded-Host) and only
 form-encoded, with the body capped at 4 KiB. It compares the token in constant time. After 10
 failures in a minute it answers 429. That limit is shared, because through Serve every request
-reaches Studio from loopback; Claw3D's own gate counts the same way. Every other request goes
+reaches Studio from loopback; Claw3D's own gate counts the same way.
+
+**Availability limit (accepted for a single-owner tailnet).** Because the lockout is shared, any
+device on the tailnet can lock every device out of the login form for the lockout period by
+sending wrong tokens (a one-minute window, renewed for as long as the wrong attempts continue).
+It does not let anyone in. This form's limit blocks only new logins; browsers that already hold the
+cookie are judged by Claw3D's own gate, whose shared counter was not checked live against a valid
+cookie during a lockout. The owner accepts this while the tailnet has one
+owner and only their devices; sharing the tailnet or the node with anyone else would need a
+per-device limit (Serve's `Tailscale-User-Login` header) first. Every other request goes
 to Claw3D's stock access gate unchanged.
 
 Not checked live: whether Studio's browser WebSocket (`/api/gateway/ws`) works through Serve's
@@ -193,7 +221,7 @@ is required, which it is. The proxy injects the token from `CLAW3D_GATEWAY_TOKEN
 
 - `sudo lsof -nP -iTCP:18789 -sTCP:LISTEN` shows only `127.0.0.1:18789`.
 - `sudo lsof -nP -iTCP:3000 -sTCP:LISTEN` shows only `127.0.0.1:3000`.
-- `python3 -B -m cortados_router.provider.clients list` shows `claw3d-office  office:read`.
+- `python3 -B -m cortados_router.provider.clients list` shows one of `claw3d-office: office:read` or `claw3d-office-b: office:read` (after a rotation), never both.
 - `/opt/cortados-office/log-bridge/err.log` holds one `Office bridge listening on 127.0.0.1:18789 (read-only)`
   line. Repeated `Office poll failed` lines mean the token or the provider is wrong.
 - In Studio's Office: one person per routed worker and one suited orchestrator per floor, wearing
