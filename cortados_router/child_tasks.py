@@ -102,6 +102,26 @@ AUTO_MODE_EXCEPTIONS = ("claude-haiku-5-5",)
 # How a requested mode appears in the stream's system events (2.1.316, checked 2026-11-02): `manual` is reported as
 # `default` (the others as themselves), so a manual child is not warned about a mode it never left.
 MODE_REPORTED_AS = {"manual": "default"}
+# Explicit modes that, with --permission-prompts none and no `allowed_tools`, leave a child that cannot run WebSearch,
+# WebFetch, Bash or MCP tools: every such call is denied (#140: a research child "succeeded" with all 4 calls denied).
+# start_task refuses them unless allowed_tools pre-approves something. The value is what such a child can still do.
+# `plan` is not here: read-only is what it is asked for. The defaulted NO_AUTO_FALLBACK is not refused (it is reported in
+# permission_mode_note instead): the guard is for a mode the caller chose.
+NEEDS_ALLOWED_TOOLS = {"acceptEdits": "edit files", "manual": "read files", "dontAsk": "read files"}
+SUGGESTED_TOOLS = '["WebSearch","WebFetch","Bash"]'
+
+
+def mode_refusal(permission_mode, tools):
+    """The refusal text for an explicit mode that cannot work unattended with no allowed_tools, or None."""
+    can = NEEDS_ALLOWED_TOOLS.get(permission_mode)
+    if can is None or tools:
+        return None
+    return (f"permission_mode {permission_mode!r} with no allowed_tools is refused: a headless child in this mode can "
+            f"only {can}; every other tool call (WebSearch, WebFetch, Bash, MCP tools) is denied because nobody can "
+            f"approve it. Use permission_mode \"auto\" (the default: leave it unset) or pass allowed_tools "
+            f"(e.g. {SUGGESTED_TOOLS}).")
+
+
 # The mode a defaulted task gets on a model without auto mode: file edits in cwd still go through unattended.
 NO_AUTO_FALLBACK = "acceptEdits"
 # claude.ai connectors are disabled in token-auth sessions (the child authenticates to the provider with a token), so
@@ -620,6 +640,9 @@ def _validate(task, cwd, orchestrator, permission_mode, allowed_tools):
                 raise TaskError(f"invalid allowed_tools entry {quoted(t)}: a printable pattern such as 'Bash(git diff:*)', "
                                 f"no commas, at most {MAX_TOOL_PATTERN} characters")
             tools.append(t.strip())
+    refusal = mode_refusal(permission_mode, tools)
+    if refusal:
+        raise TaskError(refusal)
     return tools
 
 
@@ -2014,6 +2037,13 @@ def _activity(out: dict, o: dict, act, meta: dict) -> list:
     if isinstance(act, dict):
         out["tool_uses"] = act.get("tool_uses") or {}
         out["tool_errors"] = act.get("tool_errors") or 0
+        calls = sum(n for n in out["tool_uses"].values() if isinstance(n, int) and n > 0)
+        denied = len(out.get("permission_denials") or [])
+        if calls and denied >= calls:
+            # #140: the sign that the child did no work at all; first, so a caller reading one warning reads this one
+            warnings.insert(0, f"all {calls} tool calls were denied by the permission mode "
+                               f"({meta.get('permission_mode')!r}): the child did no work through a tool. Use "
+                               "permission_mode 'auto' (the default) or pass allowed_tools")
         if not out["tool_uses"]:
             # A heuristic (found live, 2026-11-02): a routed Codex child "succeeded" saying its filesystem was
             # read-only, with no tool call and no denial; it had believed the relay backend's own sandbox text. Any

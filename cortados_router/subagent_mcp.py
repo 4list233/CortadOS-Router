@@ -180,11 +180,15 @@ CHILD_TOOLS = [
                           "model such as fable, opus, sonnet, gpt-6.1-sol, or a friendly name ('GPT 6.1', 'Sonnet 5', "
                           "'ollama 27b q3km'; an ambiguous name is refused with its candidates): that pins the child's "
                           "MAIN model; the child's subagents are still routed by S1."},
-         "permission_mode": {"type": "string", "enum": _MODES, "description": "auto (default where the model "
-                             "supports it): a safety classifier approves or denies each action (haiku models other "
-                             "than claude-haiku-5-5 have no auto mode: unset, they get acceptEdits; 'auto' is refused); acceptEdits: edits in cwd allowed, other approval-needing "
-                             "tools denied; manual: approval-needing tools denied; dontAsk: only pre-approved tools "
-                             "run; plan: read-only. bypassPermissions is deliberately not offered."},
+         "permission_mode": {"type": "string", "enum": _MODES, "description": "Leave unset (recommended): auto. "
+                             "The child is headless and nobody can approve a prompt, so: auto: a safety classifier "
+                             "approves or denies each action (Bash, web, MCP tools work); haiku models other than "
+                             "claude-haiku-5-5 have no auto mode (unset, they get acceptEdits; 'auto' is refused). "
+                             "acceptEdits: only file edits in cwd, every other approval-needing tool denied. manual: "
+                             "every approval-needing tool denied (read-mostly). dontAsk: only allowed_tools run. plan: "
+                             "read-only planning. acceptEdits, manual and dontAsk are refused with no allowed_tools "
+                             "(such a child could only read or edit files). bypassPermissions is deliberately not "
+                             "offered."},
          "chrome": {"type": "boolean", "description": "Opt-in (default false): LOGIN MODE. The child runs directly on "
                     "the user's claude.ai login (NOT routed by S1; spends the main Claude subscription) so Claude in "
                     "Chrome loads; it acts in the user's real signed-in Chrome in its own tab group. Model: cortados -> "
@@ -196,8 +200,10 @@ CHILD_TOOLS = [
                         "tool schemas are sent up front with every request, and only these servers load (not the "
                         "host's own MCP servers). A selection whose schemas exceed the provider's tool-schema budget "
                         "(~40k tokens of MCP tools) is refused on the child's first request; choose few."},
-         "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional extra tool patterns "
-                           "pre-approved for the child, e.g. ['Bash(npm test:*)', 'Bash(git diff:*)']."},
+         "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional tool patterns "
+                           "pre-approved for the child: they run without approval in any permission_mode, e.g. "
+                           "['WebSearch', 'WebFetch', 'Bash(npm test:*)', 'Bash(git diff:*)']. Not needed with auto; "
+                           "required for acceptEdits, manual and dontAsk."},
          "local": {"type": "string", "enum": list(LOCAL_MODES), "description": "Optional: 'sensitive' marks the "
                    "task as sensitive (red-teaming, a topic cloud models refuse): every request of the child carries "
                    "x-cortados-local: sensitive, so each one runs on the owner's local model when eligible (no effect "

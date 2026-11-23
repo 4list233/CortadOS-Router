@@ -176,6 +176,19 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(r["result"]["serverInfo"]["name"], "cortados-route")
         self.assertIn("tools", r["result"]["capabilities"])
 
+    def test_start_task_schema_explains_modes_and_allowed_tools(self):
+        # #140: each mode in a line, unset (auto) recommended, and what allowed_tools does
+        [start] = [t for t in m.CHILD_TOOLS if t["name"] == "start_task"]
+        props = start["inputSchema"]["properties"]
+        mode = props["permission_mode"]["description"]
+        self.assertTrue(mode.startswith("Leave unset (recommended): auto."), mode)
+        for name in m._MODES:
+            self.assertIn(name + ":", mode)
+        self.assertIn("refused with no allowed_tools", mode)
+        tools = props["allowed_tools"]["description"]
+        self.assertIn("run without approval in any permission_mode", tools)
+        self.assertIn("required for acceptEdits, manual and dontAsk", tools)
+
     def test_tools_list_has_route_task(self):
         r = m.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, self.CFG)
         names = [t["name"] for t in r["result"]["tools"]]

@@ -564,8 +564,57 @@ class ChildTaskTests(ChildTaskBase):
         self.assertIn("'auto' is not available", r["content"][0]["text"])
         self.assertIn("acceptEdits", r["content"][0]["text"])
         self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")))     # nothing started
-        tid = self.start(orchestrator="claude-haiku-4-5-20251001", permission_mode="acceptEdits")   # an explicit
+        tid = self.start(orchestrator="claude-haiku-4-5-20251001", permission_mode="acceptEdits",   # an explicit
+                         allowed_tools=["Bash(git diff:*)"])
         self.call("wait_task", task_id=tid, timeout_s=30)                                         # other mode runs
+
+    # ---- #140: a mode that cannot work unattended without pre-approved tools is refused, nothing started
+    def test_modes_that_need_allowed_tools_are_refused_without_them(self):
+        for mode in ("acceptEdits", "manual", "dontAsk"):
+            for extra in ({}, {"allowed_tools": []}):
+                r, _ = self.call("start_task", task="hi", cwd=self.work, permission_mode=mode, **extra)
+                self.assertTrue(r.get("isError"), (mode, r))
+                text = r["content"][0]["text"]
+                self.assertIn(f"permission_mode '{mode}' with no allowed_tools is refused", text)
+                self.assertIn('Use permission_mode "auto" (the default: leave it unset)', text)
+                self.assertIn('["WebSearch","WebFetch","Bash"]', text)
+        self.assertIn("can only edit files", ct.mode_refusal("acceptEdits", []))
+        self.assertIn("can only read files", ct.mode_refusal("manual", []))
+        self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")))     # nothing started
+        self.assertFalse(os.listdir(ct.tasks_dir()) if os.path.isdir(ct.tasks_dir()) else [])
+
+    def test_modes_that_need_allowed_tools_run_with_them(self):
+        for mode in ("acceptEdits", "manual", "dontAsk"):
+            _, w = self.call("wait_task", task_id=self.start(permission_mode=mode, allowed_tools=["WebSearch"]),
+                             timeout_s=30)
+            self.assertEqual(w["permission_mode"], mode)
+            a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
+            self.assertEqual(a[a.index("--permission-mode") + 1], mode)
+            self.assertIn("WebSearch", a[a.index("--allowedTools") + 1])
+
+    def test_auto_unset_and_plan_need_no_allowed_tools(self):
+        for kw in ({}, {"permission_mode": "auto"}, {"permission_mode": "plan"}):
+            _, w = self.call("wait_task", task_id=self.start(**kw), timeout_s=30)
+            self.assertEqual(w["permission_mode"], kw.get("permission_mode", "auto"))
+        for mode in ("auto", "plan", None):
+            self.assertIsNone(ct.mode_refusal(mode, []))
+
+    def test_all_tool_calls_denied_is_a_top_level_warning(self):
+        warnings = ct._activity({}, {"permission_denials": [{"tool_name": "WebSearch"}, {"tool_name": "Bash"}]},
+                                {"tool_uses": {"WebSearch": 1, "Bash": 1}, "tool_errors": 2},
+                                {"permission_mode": "acceptEdits"})
+        self.assertTrue(warnings[0].startswith("all 2 tool calls were denied by the permission mode ('acceptEdits')"),
+                        warnings)
+        partial = ct._activity({}, {"permission_denials": [{"tool_name": "Bash"}]},
+                               {"tool_uses": {"Read": 3, "Bash": 1}, "tool_errors": 1}, {"permission_mode": "auto"})
+        self.assertFalse([x for x in partial if x.startswith("all ")], partial)
+        none = ct._activity({}, {"permission_denials": []}, {"tool_uses": {}, "tool_errors": 0}, {})
+        self.assertFalse([x for x in none if x.startswith("all ")], none)
+        # end to end through wait_task (the fake's one Write was denied), metadata only
+        os.environ["FAKE_CLAUDE_MODE"] = "stream-denied"
+        _, w = self.call("wait_task", task_id=self.start(), timeout_s=30)
+        self.assertTrue(w["warnings"][0].startswith("all 1 tool calls were denied by the permission mode ('auto')"),
+                        w["warnings"])
 
     def test_a_defaulted_mode_on_a_model_with_auto_is_auto(self):
         r, out = self.call("start_task", task="hi", cwd=self.work, orchestrator="sonnet")
@@ -631,7 +680,7 @@ class ChildTaskTests(ChildTaskBase):
         with open(conn, "w") as f:
             json.dump({"mcpServers": servers}, f)
         os.environ["CORTADOS_CONNECTORS_MCP_CONFIG"] = conn
-        tid = self.start(permission_mode="dontAsk")                 # default: none, even though the file exists
+        tid = self.start(permission_mode="dontAsk", allowed_tools=["Read"])   # default: none, even though the file exists
         self.call("wait_task", task_id=tid, timeout_s=30)
         seen = _load(os.path.join(self.work, "fake-argv.json"))
         self.assertNotIn("--mcp-config", seen["argv"])
@@ -2751,7 +2800,8 @@ class ChildTaskTests(ChildTaskBase):
 
     def test_a_manual_child_is_not_warned_about_its_reported_default_mode(self):
         os.environ["FAKE_CLAUDE_MODE"] = "stream-manual"
-        _, w = self.call("wait_task", task_id=self.start(permission_mode="manual"), timeout_s=30)
+        _, w = self.call("wait_task", task_id=self.start(permission_mode="manual", allowed_tools=["Read"]),
+                         timeout_s=30)
         self.assertEqual(w["effective_permission_mode"], "default")
         self.assertFalse([x for x in w.get("warnings", []) if "permission mode" in x], w)   # only the no-tools one
         self.assertEqual(len(w["warnings"]), 1)

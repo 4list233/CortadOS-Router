@@ -792,7 +792,11 @@ older checkout that does not confirm it adds a warning to the result; `docs/LOCA
 - `permission_mode`: `auto` (default: a safety classifier approves or denies each action, so a child can run Bash and
   tests unattended), `acceptEdits`, `manual`, `dontAsk`, `plan`. The child also gets `--permission-prompts none`, so
   anything that would prompt is denied. `bypassPermissions` is deliberately not offered for unattended runs; widen
-  with `allowed_tools` (e.g. `["Bash(npm test:*)"]`) instead. Not every model has auto mode: Claude Code 2.1.316
+  with `allowed_tools` (e.g. `["Bash(npm test:*)"]`) instead. Leave the mode unset unless there is a reason not to.
+  An explicit `acceptEdits`, `manual` or `dontAsk` with no `allowed_tools` is refused at `start_task`, before anything
+  starts (#140): such a child could only edit (or read) files, and every WebSearch, WebFetch, Bash or MCP call would be
+  denied while the task still ends `succeeded`. Use `auto`, or pre-approve what it needs with `allowed_tools` (e.g.
+  `["WebSearch","WebFetch","Bash"]`); `plan` (read-only on purpose) is not refused. Not every model has auto mode: Claude Code 2.1.316
   drops a session on a haiku model other than `claude-haiku-5-5` to `default` at startup ("does not support auto
   mode"), and a child then gets every approval-needing call denied ("no approval surface"). So with the mode unset
   such a model gets `acceptEdits` (start_task and task_status say so in `permission_mode_note`), and an explicit
@@ -801,7 +805,8 @@ older checkout that does not confirm it adds a warning to the result; `docs/LOCA
   (counts by tool), `tool_errors`, `files_written` (writes whose tool_result came back without an error, matched by
   tool_use id), `write_attempts_unconfirmed` (failed or never answered, with the outcome), `effective_permission_mode`
   (the mode Claude Code actually ran in) and `permission_denials`, plus `warnings` when a "succeeded" child's result is
-  not backed by its actions: denied tool calls, a mode Claude Code left, confirmed writes outside `cwd`, or write
+  not backed by its actions: every tool call denied (`all N tool calls were denied by the permission mode`, listed
+  first), denied tool calls, a mode Claude Code left, confirmed writes outside `cwd`, or write
   attempts that were not confirmed, or no tool call at all (a heuristic: the result's claims are then the model's
   word alone).
 - Log redaction: stdout is redacted structurally first: a legacy single JSON record is parsed whole, otherwise each
