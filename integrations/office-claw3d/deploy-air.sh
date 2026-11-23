@@ -69,11 +69,17 @@ run() {  # print the command; run it only with --apply
   printf '  $ %s\n' "$*"
   if [[ $APPLY -eq 1 ]]; then "$@"; fi
 }
-# die, attr, uid_holders, check_role, serve_port_state: pure checks, tested in deploy.test.mjs
+# die, attr, uid_holders, account_state, check_role, root_test, launchd_state, serve_port_state: pure
+# checks, tested in deploy.test.mjs
 . "$HERE/deploy-lib.sh"
 owner_of() { stat -f '%Su:%Sg' "$1"; }
 mode_of() { stat -f '%Lp' "$1"; }
-as_root_test() { sudo test "$@"; }     # a read: files under the role users' 0700 homes
+# A read as root (files under the role users' 0700 homes): 0 true, 1 false; a check sudo or test could
+# not answer aborts (root_test, deploy-lib.sh), never reads as "absent".
+as_root_test() {
+  local a; a="$(root_test "$@")" || die "cannot check 'test $*' as root (sudo or test failed): refusing to guess"
+  [[ "$a" == yes ]]
+}
 
 # ---- preconditions common to every mode (they only read) -----------------------------
 step "Preconditions ($MODE)"
@@ -172,13 +178,21 @@ if [[ -e "$ROOT" || -L "$ROOT" ]]; then
   for d in home bin adapters stage; do
     [[ ! -e "$ROOT/$d" ]] || [[ "$(owner_of "$ROOT/$d")" == root:wheel && ! -L "$ROOT/$d" ]] || die "$ROOT/$d must be root:wheel"
   done
+  # The existence checks below run as the owner: a directory it cannot search would make every entry
+  # read as absent, so the ones they look into must be searchable (as the install creates them).
+  for d in home bin adapters; do
+    [[ ! -e "$ROOT/$d" ]] || [[ "$(mode_of "$ROOT/$d")" == 755 ]] || die "$ROOT/$d must be 0755"
+  done
   for f in "$ROOT/bin/run-bridge.sh" "$ROOT/bin/run-studio.sh"; do
     [[ ! -e "$f" ]] || [[ "$(owner_of "$f")" == root:wheel && ! -L "$f" ]] || die "$f must be a root:wheel file"
   done
   link_into "$ROOT/adapter" "$ROOT/adapters"
   link_into "$ROOT/node" "$ROOT"
   if [[ -e "$ROOT/claw3d" ]]; then
-    [[ "$(owner_of "$ROOT/claw3d")" == "$STUDIO_USER:staff" && ! -L "$ROOT/claw3d" ]] || die "$ROOT/claw3d must belong to $STUDIO_USER"
+    [[ "$(owner_of "$ROOT/claw3d")" == "$STUDIO_USER:staff" && ! -L "$ROOT/claw3d" && "$(mode_of "$ROOT/claw3d")" == 755 ]] \
+      || die "$ROOT/claw3d must belong to $STUDIO_USER, 0755"
+    [[ ! -e "$ROOT/claw3d/builds" ]] || [[ -d "$ROOT/claw3d/builds" && ! -L "$ROOT/claw3d/builds" && "$(mode_of "$ROOT/claw3d/builds")" == 755 ]] \
+      || die "$ROOT/claw3d/builds must be a 0755 directory"
     link_into "$ROOT/claw3d/current" "$ROOT/claw3d/builds"
     for e in "$ROOT/claw3d"/*; do
       case "${e##*/}" in builds|current|current.new|'*') ;; *) die "unexpected $e (unknown layout): move it aside first" ;; esac
@@ -196,7 +210,12 @@ for label in "$BRIDGE_LABEL" "$STUDIO_LABEL"; do
   p="/Library/LaunchDaemons/$label.plist"
   [[ ! -e "$p" ]] || [[ "$(owner_of "$p")" == root:wheel && "$(mode_of "$p")" == 644 && ! -L "$p" ]] || die "$p must be root:wheel 0644"
 done
-loaded() { launchctl print "system/$1" >/dev/null 2>&1; }
+# 0 loaded, 1 confirmed not loaded; a launchctl answer that is neither aborts (launchd_state, deploy-lib.sh).
+loaded() {
+  local rc=0; launchd_state "$1" || rc=$?
+  [[ $rc == 0 || $rc == 1 ]] || die "cannot tell whether $1 is loaded (launchctl print answered unexpectedly)"
+  return $rc
+}
 
 # Node: reuse the pinned version when it is there and answers with that version.
 NODE_PLAN=install
@@ -446,19 +465,31 @@ switch_link() {  # target link [user]: replace `link` atomically (rename over it
   run "${who[@]}" ln -sfn "$1" "$2.new" && run "${who[@]}" mv -fh "$2.new" "$2"
 }
 # The primitives tx_run (deploy-lib.sh) drives. Each returns a code, never exits.
-fs_readlink() { readlink "$1" 2>/dev/null || true; }
-fs_exists() { as_root_test -e "$1" -o -L "$1"; }
+fs_readlink() {  # the link's target; nothing when absent; 1 when it is there but not a readable link
+  if [[ -L "$1" ]]; then readlink "$1"; elif [[ -e "$1" ]]; then return 1; fi
+}
+fs_exists() {  # 0 exists, 1 absent, 2 unknown (sudo or test failed): never exits inside the transaction
+  case "$(root_test -e "$1" -o -L "$1")" in yes) return 0 ;; no) return 1 ;; *) return 2 ;; esac
+}
 fs_link() { switch_link "$1" "$2" "$3"; }
 fs_rm() { if [[ -n "$2" ]]; then run sudo -u "$2" rm -f "$1"; else run sudo rm -f "$1"; fi; }
 fs_backup() { run sudo cp -p "$1" "$1.prev"; }
 fs_promote() { run sudo cp -p "$1" "$2.next" && run sudo mv -f "$2.next" "$2"; }
 fs_restore() { run sudo mv -f "$1.prev" "$1"; }
-daemon_loaded() { loaded "$1"; }
+daemon_loaded() { launchd_state "$1"; }   # 0 / 1 / 2 unknown: returns, never exits (tx_*)
 daemon_start() { run sudo launchctl bootstrap system "/Library/LaunchDaemons/$1.plist"; }
 daemon_stop() {
   run sudo launchctl bootout "system/$1" || true      # a daemon that exits meanwhile is not an error
   [[ $APPLY -eq 1 ]] || return 0
-  for _ in $(seq 1 20); do loaded "$1" || return 0; sleep 0.5; done
+  local st
+  for _ in $(seq 1 20); do
+    st=0; launchd_state "$1" || st=$?
+    case $st in
+      1) return 0 ;;
+      0) sleep 0.5 ;;
+      *) echo "deploy-air: cannot tell whether $1 stopped" >&2; return 1 ;;
+    esac
+  done
   echo "deploy-air: $1 did not stop" >&2; return 1
 }
 http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$1" || true; }

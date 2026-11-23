@@ -34,13 +34,51 @@ elif len(vals) == 1 and isinstance(vals[0], str) and "\n" not in vals[0]:
     print(vals[0])' "$2" "$3"
 }
 attr() { attr_read "$1" "$2" one; }  # user attribute -> its single value ("" when absent, multi-valued or unreadable)
-uid_holders() { dscl . -list /Users UniqueID | awk -v u="$1" '$2 == u { print $1 }' | sort -u | paste -s -d, -; }
-# Prints "create" (no such account, UID free) or "reuse" (validated); anything else aborts. "reuse" also
-# adopts an account a stopped --apply left behind, when every attribute already matches the spec.
+# The names holding a UID (comma-separated, "" when none), from a SUCCESSFUL `dscl . -list /Users
+# UniqueID` only. Captured on macOS 26: exit 0, one "NAME<spaces>UID" line per account, about 130 of
+# them (the _ system accounts included); a bad node exits 185 "DS Error: -14009 (eDSUnknownNodeName)".
+# Returns 1 when the command fails, prints nothing, or prints any line that is not exactly NAME UID:
+# an unread or unparseable directory is never "the UID is free".
+uid_holders() {  # uid
+  local out
+  out="$(dscl . -list /Users UniqueID 2>/dev/null)" || return 1
+  printf '%s\n' "$out" | python3 -I -c '
+import re, sys
+uid = sys.argv[1]
+lines = sys.stdin.read().splitlines()
+if not lines or not any(l.strip() for l in lines):
+    sys.exit(1)
+held = set()
+for l in lines:
+    m = re.fullmatch(r"(\S+)\s+(-?[0-9]+)", l)
+    if not m:
+        sys.exit(1)
+    if m.group(2) == uid:
+        held.add(m.group(1))
+print(",".join(sorted(held)))' "$1"
+}
+# "present" | "absent" for /Users/NAME; returns 1 on anything else. Absent ONLY on the exact not-found
+# signature captured on macOS 26 (`dscl . -read /Users/nosuchuser_xyz123`): exit 56, stdout empty,
+# stderr exactly "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)". Any other failure (a permission
+# error, directory services down, a changed message) is unknown, never "no such account".
+account_state() {  # name
+  local out err rc=0 errf
+  errf="$(mktemp)" || return 1
+  out="$(dscl . -read "/Users/$1" RecordName 2>"$errf")" || rc=$?
+  err="$(cat "$errf")"; rm -f "$errf"
+  if [[ $rc == 0 ]]; then echo present; return 0; fi
+  if [[ $rc == 56 && -z "$out" && "$err" == "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)" ]]; then
+    echo absent; return 0
+  fi
+  return 1
+}
+# Prints "create" (no such account, confirmed, and the UID free) or "reuse" (validated); anything else
+# aborts. "reuse" also adopts an account a stopped --apply left behind, when every attribute matches.
 check_role() {  # name uid home
-  local name="$1" uid="$2" home="$3" holders authorities
-  holders="$(uid_holders "$uid")"
-  if ! dscl . -read "/Users/$name" >/dev/null 2>&1; then
+  local name="$1" uid="$2" home="$3" holders authorities state
+  holders="$(uid_holders "$uid")" || die "cannot list the accounts' UIDs (dscl . -list /Users UniqueID failed or answered unexpectedly): refusing to plan $name"
+  state="$(account_state "$name")" || die "cannot establish whether $name exists (dscl . -read failed with something other than eDSRecordNotFound): refusing to plan it"
+  if [[ "$state" == absent ]]; then
     [[ -z "$holders" ]] || die "UID $uid is taken by '$holders' (wanted for $name): pick another UID deliberately"
     echo create; return
   fi
@@ -74,6 +112,30 @@ admin_negative() {  # name
   fi
   echo "deploy-air: $1: cannot establish that it is not an admin (dseditgroup exit $rc, unexpected answer)" >&2
   return 1
+}
+
+# `test ARGS` run as root (files under the role users' 0700 homes): prints yes | no, and returns 1
+# (printing nothing) when sudo or test itself failed. `sudo test` alone cannot tell "false" (1) from
+# a refused sudo (also 1), so the answer is the shell's own report: an unanswered check is never "no".
+root_test() {  # test-args...
+  local out
+  out="$(sudo /bin/sh -c 'test "$@"; echo "cortados-test-rc=$?"' sh "$@" 2>/dev/null)" || return 1
+  case "$out" in
+    cortados-test-rc=0) echo yes ;;
+    cortados-test-rc=1) echo no ;;
+    *) return 1 ;;
+  esac
+}
+
+# 0 loaded, 1 confirmed not loaded, 2 unknown, for a system LaunchDaemon. Not loaded ONLY on the
+# answer captured on macOS 26 for an unknown label: exit 113 with stderr holding
+# `Could not find service "LABEL" in domain for system`. Any other failure is unknown, never "stopped".
+launchd_state() {  # label
+  local err rc=0
+  err="$(launchctl print "system/$1" 2>&1 >/dev/null)" || rc=$?
+  [[ $rc == 0 ]] && return 0
+  [[ $rc == 113 && "$err" == *"Could not find service \"$1\" in domain for system"* ]] && return 1
+  return 2
 }
 
 serve_port_state() {  # port target < `tailscale serve status --json`: free | ours | funnel | other
@@ -124,38 +186,53 @@ serve_state() {  # tailscale-binary port target: free | ours | funnel | other; 1
 #
 # The caller sets TX_LINKS ("target|link|user", user may be empty), TX_FILES ("staged|dest"),
 # TX_LABELS (daemons, in start order) and defines the primitives:
-#   fs_readlink LINK      the link's target, or nothing      fs_exists PATH
+#   fs_readlink LINK      the link's target; nothing (0) when absent; 1 when it cannot be read
+#   fs_exists PATH        0 exists, 1 confirmed absent, anything else unknown (fails the step)
 #   fs_link TARGET LINK USER   atomic (rename over)           fs_rm PATH USER
 #   fs_backup DEST        copy DEST to DEST.prev, owner/mode kept
 #   fs_promote STAGED DEST     put STAGED at DEST by rename   fs_restore DEST   DEST.prev back over DEST
-#   daemon_loaded LABEL   daemon_start LABEL   daemon_stop LABEL (returns 1 if it does not stop)
+#   daemon_loaded LABEL   0 loaded, 1 confirmed not loaded, anything else unknown
+#   daemon_start LABEL    daemon_stop LABEL (returns 1 if it does not stop)
 #   health_check          0 when the new release answers as it must
 # bash 3.2 (macOS /bin/bash) with set -u: an empty array is expanded as ${a[@]+"${a[@]}"}.
 TX_UNDO=(); TX_WAS_LOADED=(); TX_PREV=()
 tx_undo() { TX_UNDO+=("$(printf '%q ' "$@")"); }
-tx_begin() {
+tx_begin() {  # 1 when a daemon's state cannot be read (nothing changed yet)
   TX_UNDO=(); TX_WAS_LOADED=(); TX_PREV=()
-  local l
+  local l rc
   for l in ${TX_LABELS[@]+"${TX_LABELS[@]}"}; do
-    if daemon_loaded "$l"; then TX_WAS_LOADED+=("$l"); fi
+    rc=0; daemon_loaded "$l" || rc=$?
+    case $rc in
+      0) TX_WAS_LOADED+=("$l") ;;
+      1) ;;
+      *) echo "deploy-air: cannot tell whether $l is loaded" >&2; return 1 ;;
+    esac
   done
 }
 tx_link() {  # target link user
-  local prev; prev="$(fs_readlink "$2")" || prev=""
+  local prev; prev="$(fs_readlink "$2")" || return 1   # unreadable is not "absent": the undo would delete it
   if [[ -n "$prev" ]]; then tx_undo fs_link "$prev" "$2" "$3"; else tx_undo fs_rm "$2" "$3"; fi
   fs_link "$1" "$2" "$3"
 }
 tx_file() {  # staged dest
-  if fs_exists "$2"; then
+  local e=0; fs_exists "$2" || e=$?
+  if [[ $e == 0 ]]; then
     fs_backup "$2" || return 1
     TX_PREV+=("$2.prev"); tx_undo fs_restore "$2"
-  else
+  elif [[ $e == 1 ]]; then
     tx_undo fs_rm "$2" ""
+  else
+    echo "deploy-air: cannot tell whether $2 exists" >&2; return 1
   fi
   fs_promote "$1" "$2"
 }
 tx_restart() {  # label
-  if daemon_loaded "$1"; then daemon_stop "$1" || return 1; fi
+  local rc=0; daemon_loaded "$1" || rc=$?
+  case $rc in
+    0) daemon_stop "$1" || return 1 ;;
+    1) ;;
+    *) echo "deploy-air: cannot tell whether $1 is loaded" >&2; return 1 ;;
+  esac
   daemon_start "$1"
 }
 tx_activate() {
@@ -174,10 +251,16 @@ tx_activate() {
   health_check || { echo "deploy-air: the new release failed its health check" >&2; return 1; }
 }
 tx_rollback() {  # 0 when every undo step and restart succeeded
-  local rc=0 i l
+  local rc=0 i l s
   echo "deploy-air: ROLLBACK: restoring the previous release" >&2
   for l in ${TX_LABELS[@]+"${TX_LABELS[@]}"}; do
-    if daemon_loaded "$l"; then daemon_stop "$l" || { echo "deploy-air: rollback: $l did not stop" >&2; rc=1; }; fi
+    s=0; daemon_loaded "$l" || s=$?
+    case $s in
+      0) daemon_stop "$l" || { echo "deploy-air: rollback: $l did not stop" >&2; rc=1; } ;;
+      1) ;;
+      *) echo "deploy-air: rollback: cannot tell whether $l is loaded; trying to stop it" >&2
+         daemon_stop "$l" || { echo "deploy-air: rollback: $l did not stop" >&2; rc=1; } ;;
+    esac
   done
   for ((i = ${#TX_UNDO[@]} - 1; i >= 0; i--)); do
     eval "${TX_UNDO[i]}" || { echo "deploy-air: rollback step failed: ${TX_UNDO[i]}" >&2; rc=1; }
@@ -195,7 +278,7 @@ tx_commit() {
 }
 # 0: activated and committed. 1: rolled back cleanly. 2: the rollback itself failed (investigate).
 tx_run() {
-  tx_begin
+  tx_begin || { echo "deploy-air: nothing was changed" >&2; return 1; }
   trap 'tx_rollback; exit 1' INT TERM HUP
   if tx_activate; then
     trap - INT TERM HUP
