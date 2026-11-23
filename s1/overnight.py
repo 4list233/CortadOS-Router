@@ -892,6 +892,8 @@ class Guard:
         self.unresolved: dict[int, str | None] = {}
         # #116 review round 6: the pidfile write time recorded for a group with no recorded start (group_is_ours' evidence).
         self.unresolved_written: dict[int, float] = {}
+        # #116 review round 7: a verified group's leader start read when SIGCONT got EPERM (picked up by _settle).
+        self.eperm_starts: dict[int, str] = {}
         self.unresolved_alerted = False
         # Stopped for the day (#116, owner 2026-11-18): epoch until which no cycle starts, the pause's reason slug and the
         # rule that set it. Survives new_cycle() and, through the state file, a supervisor restart (load_day_stop).
@@ -1159,7 +1161,14 @@ class Guard:
         except ProcessLookupError:
             return "done"
         except PermissionError:
-            return "done" if self._zombie_group(g) else "keep"
+            if self._zombie_group(g):
+                return "done"
+            # #116 review round 7: identity was verified just now; keep that evidence for the retries (the verified start,
+            # else the recorded write time, which _settle leaves in unresolved_written).
+            rec = _verified_rec(g, start, written, self.leader_start)
+            if rec["start"] is not None:
+                self.eperm_starts[g] = rec["start"]
+            return "keep"
         return "done"
 
     def _settle(self, g: int, outcome: str, start: str | None) -> None:
@@ -1167,6 +1176,7 @@ class Guard:
         if g in self.stopped_groups:
             self.stopped_groups = [x for x in self.stopped_groups if x != g]
         self.stopped_starts.pop(g, None)
+        start = self.eperm_starts.pop(g, None) or start
         if outcome == "keep":
             if g not in self.unresolved:
                 self.log(f"overnight: process group {g} could not be confirmed continued (EPERM from a live member, or "
@@ -1311,6 +1321,9 @@ class Guard:
                 except subprocess.TimeoutExpired:
                     ok = False   # the leader itself is running and refuses: a genuine failure
             ok = ok and self._zombie_group(pgid)
+            if not ok and _norm_start(start) is None:
+                # #116 review round 7: our own child, so its identity is certain: keep its start for the retries.
+                start = _verified_rec(pgid, start, None, self.leader_start)["start"]
         self._settle(pgid, "done" if ok else "keep", start)
         self._persist_stopped()
         self._report_unresolved()
@@ -2016,6 +2029,19 @@ def _add_unresolved(stopped_path: Path, pgid: int, leader_start, log, *, written
         log(f"overnight: cannot record unresolved group in {stopped_path.name} ({type(e).__name__})")
 
 
+def _verified_rec(pgid: int, start: str | None, written: float | None, leader_start) -> dict:
+    """The unresolved record of a group whose identity was JUST verified (#116 review round 7: an EPERM after a verified
+    check saved only pgid and start, dropping `written`, so a timestamp-only record turned 'unknown' forever). The verified
+    start is preferred: with no recorded one, the leader's start is read now (a live member keeps the group, so no new
+    process can take its id: a leader alive now is the verified one). Else the recorded write time is kept."""
+    if _norm_start(start) is None:
+        try:
+            start = _norm_start(leader_start(pgid))
+        except (OSError, subprocess.SubprocessError):
+            start = None
+    return _group_rec(pgid, _norm_start(start), _written(written))
+
+
 def recover_stopped_groups(stopped_path: Path, trainer_file: Path | None, pidfile: Path, *, signaller=None,
                            leader_start=None, discover=None, alive=None, log=lambda m: print(m, flush=True),
                            live_members=None, alerter=None) -> list[int]:
@@ -2053,6 +2079,7 @@ def recover_stopped_groups(stopped_path: Path, trainer_file: Path | None, pidfil
         root = None
     targets: list[int] = []
     starts: dict[int, str | None] = {}
+    writtens: dict[int, float | None] = {}   # #116 review round 7: each target's recorded pidfile write time, kept on EPERM
     kept: list[dict] = []
     root_kept: list[dict] = []
     recs, ok = read_stopped_groups(stopped_path)
@@ -2077,6 +2104,7 @@ def recover_stopped_groups(stopped_path: Path, trainer_file: Path | None, pidfil
         if ours:
             targets.append(g)
             starts[g] = rec["start"]
+            writtens[g] = _written(rec.get("written"))
         elif ours is False:
             log(f"overnight: recorded group {g} now belongs to another process; not signalled")
         else:
@@ -2088,7 +2116,9 @@ def recover_stopped_groups(stopped_path: Path, trainer_file: Path | None, pidfil
         for g in d.groups:
             if g != root and g not in targets and safe_group(g):
                 targets.append(g)
-                starts[g] = d.starts.get(g)
+                old = next((k for k in kept if k["pgid"] == g), None)
+                starts[g] = d.starts.get(g) or (old["start"] if old else None)
+                writtens[g] = old.get("written") if old else None
                 kept = [k for k in kept if k["pgid"] != g]   # in the live tree now: its identity is certain
         if not d.complete:
             log("overnight: the cycle's tree could not be walked; only recorded groups were continued")
@@ -2105,7 +2135,7 @@ def recover_stopped_groups(stopped_path: Path, trainer_file: Path | None, pidfil
                 drained = False
             if not drained:
                 log(f"overnight: group {g} refused SIGCONT (EPERM) with a live member; kept as unresolved")
-                kept.append({"pgid": g, "start": starts.get(g)})
+                kept.append(_verified_rec(g, starts.get(g), writtens.get(g), leader_start))
                 continue
         done.append(g)
     if done:

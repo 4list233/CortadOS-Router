@@ -1775,6 +1775,101 @@ class RootIdentityFromPidfile(unittest.TestCase):
         self.assertTrue(night.group_is_ours({"pgid": 100, "start": None, "written": self.WRITTEN},
                                             leader_start=lambda p: None))   # leader gone: as before
 
+class EvidenceKeptOnEperm(unittest.TestCase):
+    """#116 review round 7 (gpt-6.1-sol): a timestamp-only record (start null, `written` set) outside the current pidfile root
+    verified fine, but a SIGCONT answered EPERM with live members saved only pgid and start null, dropping `written`: every
+    later retry answered unknown forever, also once permissions recovered. The verified start is now saved (preferred), else
+    the write time is kept, on every save path."""
+
+    WRITTEN = float(int(time.time()) - 3600)
+
+    def lstart(self, epoch):
+        return time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(epoch))
+
+    def _recover_eperm(self, d, leader):
+        """Group 100 recorded timestamp-only; the old pidfile was removed. SIGCONT answers EPERM with a live member."""
+        stopped, pidfile = d / night.STOPPED_GROUPS_NAME, d / "nightly.pid"
+        stopped.write_text(json.dumps({"version": 1, "groups": [{"pgid": 100, "start": None, "written": self.WRITTEN}]}))
+        def refuse(p, s):
+            raise PermissionError(1, "Operation not permitted")
+        alerts = []
+        done = night.recover_stopped_groups(stopped, None, pidfile, signaller=refuse, leader_start=lambda p: leader,
+                                            alive=lambda pid: False, log=lambda m: None, live_members=lambda g: [101],
+                                            alerter=lambda n, det: alerts.append(n))
+        self.assertEqual(done, [])
+        self.assertEqual(alerts, ["guard_recovery_incomplete"])
+        return stopped
+
+    def _retry_until_continued(self, stopped, leader):
+        sig, perm = [], {"ok": False}
+        def signaller(p, s):
+            if not perm["ok"]:
+                raise PermissionError(1, "Operation not permitted")
+            sig.append((p, s))
+        g = guard(lambda: 4.8, stopped_path=stopped, leader_start=lambda p: leader, live_members=lambda g: [101])
+        g.signaller = signaller
+        g.load_unresolved()
+        g.retry_unresolved()                           # still EPERM: kept, with its evidence
+        self.assertIn(100, g.unresolved)
+        rec = night.read_stopped_groups(stopped)[0][0]
+        self.assertTrue(rec["start"] is not None or rec.get("written") == self.WRITTEN, rec)
+        perm["ok"] = True
+        for _ in range(3):
+            g.retry_unresolved()
+        self.assertEqual(sig, [(100, signal.SIGCONT)])   # exactly once
+        self.assertEqual(g.unresolved, {})
+        self.assertFalse(stopped.exists())
+
+    def test_recovery_eperm_saves_the_verified_start_then_continues_once_permissions_recover(self):
+        st = self.lstart(self.WRITTEN - 60)
+        with tempfile.TemporaryDirectory() as tmp:
+            stopped = self._recover_eperm(Path(tmp), st)
+            self.assertEqual(night.read_stopped_groups(stopped)[0], [{"pgid": 100, "start": st}])
+            self._retry_until_continued(stopped, st)
+
+    def test_recovery_eperm_with_the_leader_gone_keeps_the_write_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stopped = self._recover_eperm(Path(tmp), None)
+            self.assertEqual(night.read_stopped_groups(stopped)[0],
+                             [{"pgid": 100, "start": None, "written": self.WRITTEN}])
+            self._retry_until_continued(stopped, None)
+
+    def test_guard_eperm_on_a_timestamp_only_record_upgrades_it_to_the_verified_start(self):
+        st = self.lstart(self.WRITTEN - 60)
+        with tempfile.TemporaryDirectory() as tmp:
+            stopped = Path(tmp) / night.STOPPED_GROUPS_NAME
+            stopped.write_text(json.dumps({"version": 1, "groups": [{"pgid": 100, "start": None, "written": self.WRITTEN}]}))
+            self._retry_until_continued(stopped, st)
+
+    def test_guard_eperm_keeps_the_evidence_across_a_restart(self):
+        st = self.lstart(self.WRITTEN - 60)
+        with tempfile.TemporaryDirectory() as tmp:
+            stopped = Path(tmp) / night.STOPPED_GROUPS_NAME
+            stopped.write_text(json.dumps({"version": 1, "groups": [{"pgid": 100, "start": None, "written": self.WRITTEN}]}))
+            g = guard(lambda: 4.8, stopped_path=stopped, leader_start=lambda p: st, live_members=lambda g: [101])
+            g.signaller = lambda p, s: (_ for _ in ()).throw(PermissionError(1, "Operation not permitted"))
+            g.load_unresolved()
+            g.retry_unresolved()
+            self.assertEqual(night.read_stopped_groups(stopped)[0], [{"pgid": 100, "start": st}])
+            self._retry_until_continued(stopped, st)      # a new supervisor: verified by the saved start
+
+    def test_a_tree_found_group_keeps_its_recorded_evidence_on_eperm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            stopped, pidfile = d / night.STOPPED_GROUPS_NAME, d / "nightly.pid"
+            pidfile.write_text("50\n")
+            stopped.write_text(json.dumps({"version": 1, "groups": [{"pgid": 100, "start": None, "written": self.WRITTEN}]}))
+            def down(pid):
+                raise OSError(5, "Input/output error")
+            def refuse(p, s):
+                raise PermissionError(1, "Operation not permitted")
+            night.recover_stopped_groups(stopped, None, pidfile, signaller=refuse, leader_start=down,
+                                         alive=lambda pid: True, discover=lambda root: night.Discovery([root, 100], True, {}),
+                                         log=lambda m: None, live_members=lambda g: [101], alerter=lambda n, det: None)
+            self.assertEqual(night.read_stopped_groups(stopped)[0],
+                             [{"pgid": 100, "start": None, "written": self.WRITTEN}])
+
+
 FAKE_PS = """#!/bin/sh
 printf '%s' "$FAKE_PS_OUT"
 exit "${FAKE_PS_RC:-0}"
