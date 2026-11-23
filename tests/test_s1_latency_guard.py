@@ -1671,6 +1671,110 @@ class StartupRootRecovery(unittest.TestCase):
             self.assertEqual(night.read_stopped_groups(stopped)[0], [{"pgid": 100, "start": "a"}])
 
 
+
+class RootIdentityFromPidfile(unittest.TestCase):
+    """#116 review round 6 (gpt-6.1-sol): a stopped root with no identity record whose status and start-time probes both
+    failed at startup was recorded with start null, and group_is_ours then answered unknown for that live leader forever:
+    never continued, its pidfile blocking every later cycle. The pidfile's write time is now recorded as the identity
+    evidence: a leader that started no later than the write is the process the pidfile named; one that started after it
+    is a reused pid and is never signalled."""
+
+    WRITTEN = float(int(time.time()) - 3600)
+
+    def lstart(self, epoch):
+        return time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(epoch))
+
+    def _recover_with_ps_down(self, d):
+        stopped, pidfile = d / night.STOPPED_GROUPS_NAME, d / "nightly.pid"
+        pidfile.write_text("100\n")
+        os.utime(pidfile, (self.WRITTEN, self.WRITTEN))
+        def down(pid):
+            raise subprocess.TimeoutExpired("ps", 10)
+        sent, alerts = [], []
+        night.recover_stopped_groups(stopped, None, pidfile, signaller=lambda p, s: sent.append((p, s)),
+                                     leader_start=down, alive=lambda pid: True,
+                                     discover=lambda root: night.Discovery([root], False, {}), log=lambda m: None,
+                                     alerter=lambda n, det: alerts.append(n))
+        night.recover_pidfile(pidfile, alive=lambda p: True, ps=down, signaller=lambda p, s: sent.append((p, s)),
+                              log=lambda m: None, stopped_path=stopped, leader_start=down,
+                              alerter=lambda n, det: alerts.append(n))
+        self.assertEqual(sent, [])
+        self.assertEqual(alerts, ["guard_recovery_incomplete"])
+        self.assertEqual(night.read_stopped_groups(stopped)[0], [{"pgid": 100, "start": None, "written": self.WRITTEN}])
+        return stopped
+
+    def _guard_after_restart(self, stopped, starts):
+        sig, state = [], {"ps": "down"}
+        def leader_start(pid):
+            if state["ps"] == "down":
+                raise OSError(5, "Input/output error")
+            return starts.get(pid)
+        g = guard(lambda: 4.8, sig=sig, stopped_path=stopped, leader_start=leader_start)
+        g.load_unresolved()
+        return g, sig, state
+
+    def test_transient_ps_failure_then_recovery_continues_the_root_exactly_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stopped = self._recover_with_ps_down(Path(tmp))
+            g, sig, state = self._guard_after_restart(stopped, {100: self.lstart(self.WRITTEN - 120)})
+            g.retry_unresolved()                       # ps still down: kept, not signalled on a guess
+            self.assertEqual(sig, [])
+            self.assertEqual(g.unresolved, {100: None})
+            self.assertEqual(night.read_stopped_groups(stopped)[0][0].get("written"), self.WRITTEN)   # evidence kept
+            state["ps"] = "up"
+            g.retry_unresolved()                       # ps works again: started before the pidfile write -> ours
+            g.retry_unresolved()
+            self.assertEqual(sig, [(100, signal.SIGCONT)])
+            self.assertEqual(g.unresolved, {})
+            self.assertFalse(stopped.exists())
+
+    def test_a_leader_started_in_the_same_second_as_the_pidfile_write_is_ours(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stopped = self._recover_with_ps_down(Path(tmp))
+            g, sig, state = self._guard_after_restart(stopped, {100: self.lstart(self.WRITTEN)})
+            state["ps"] = "up"
+            g.retry_unresolved()
+            self.assertEqual(sig, [(100, signal.SIGCONT)])
+
+    def test_a_reused_pid_started_after_the_pidfile_write_is_never_signalled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stopped = self._recover_with_ps_down(Path(tmp))
+            g, sig, state = self._guard_after_restart(stopped, {100: self.lstart(self.WRITTEN + 5)})
+            state["ps"] = "up"
+            for _ in range(3):
+                g.retry_unresolved()
+            self.assertEqual(sig, [])
+            self.assertEqual(g.unresolved, {})         # another process's now: dropped, never signalled
+            self.assertFalse(stopped.exists())
+
+    def test_the_evidence_survives_a_restart_between_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stopped = self._recover_with_ps_down(Path(tmp))
+            g, sig, _ = self._guard_after_restart(stopped, {})
+            g.retry_unresolved()
+            g2, sig2, state = self._guard_after_restart(stopped, {100: self.lstart(self.WRITTEN - 1)})
+            self.assertEqual(g2.unresolved_written, {100: self.WRITTEN})
+            state["ps"] = "up"
+            g2.retry_unresolved()
+            self.assertEqual(sig + sig2, [(100, signal.SIGCONT)])
+
+    def test_an_existing_null_record_gets_the_write_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            stopped = d / night.STOPPED_GROUPS_NAME
+            stopped.write_text(json.dumps({"version": 1, "groups": [{"pgid": 100, "start": None}]}))
+            self._recover_with_ps_down(d)   # asserts the root record now carries the pidfile's write time
+
+    def test_group_is_ours_without_evidence_or_with_an_unparseable_start_stays_unknown(self):
+        st = self.lstart(self.WRITTEN - 10)
+        self.assertIsNone(night.group_is_ours({"pgid": 100, "start": None}, leader_start=lambda p: st))
+        self.assertIsNone(night.group_is_ours({"pgid": 100, "start": None, "written": self.WRITTEN},
+                                              leader_start=lambda p: "not a date"))
+        self.assertIsNone(night.group_is_ours({"pgid": 100, "start": None, "written": True}, leader_start=lambda p: st))
+        self.assertTrue(night.group_is_ours({"pgid": 100, "start": None, "written": self.WRITTEN}, leader_start=lambda p: st))
+        self.assertTrue(night.group_is_ours({"pgid": 100, "start": None, "written": self.WRITTEN},
+                                            leader_start=lambda p: None))   # leader gone: as before
+
 FAKE_PS = """#!/bin/sh
 printf '%s' "$FAKE_PS_OUT"
 exit "${FAKE_PS_RC:-0}"

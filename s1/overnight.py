@@ -652,6 +652,24 @@ def safe_group(pgid) -> bool:
     return isinstance(pgid, int) and not isinstance(pgid, bool) and pgid > 1 and pgid != os.getpgrp()
 
 
+def _start_epoch(text: str | None) -> float | None:
+    """An lstart value ("Sun Nov 22 22:32:13 2026", local time, ps run with LC_ALL=C) as epoch seconds, or None."""
+    text = _norm_start(text)
+    if text is None:
+        return None
+    try:
+        return _time.mktime(_time.strptime(text, "%a %b %d %H:%M:%S %Y"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _written(value) -> float | None:
+    """A recorded pidfile write time (epoch seconds), or None when absent or not a finite number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
 def group_is_ours(rec: dict, *, leader_start=None) -> bool | None:
     """Is the group in record {"pgid", "start"} (start = its leader's lstart when recorded) still the one recorded?
     True: the leader is alive with the recorded start time, or the leader is gone. A pid is never reused while a process
@@ -668,7 +686,17 @@ def group_is_ours(rec: dict, *, leader_start=None) -> bool | None:
         return True
     want = _norm_start(rec.get("start"))
     if want is None:
-        return None
+        # #116 review round 6: no start was recorded (ps failed when the root was recorded), but the record carries the
+        # write time of the pidfile that named this pid. A process alive now that started no later than that write was
+        # already alive when the pidfile named its pid, and two live processes never share a pid, so it is the process
+        # the pidfile named; a leader that started after the write is a reused pid (False: never signalled).
+        written = _written(rec.get("written"))
+        if written is None:
+            return None
+        began = _start_epoch(now)
+        if began is None:
+            return None
+        return began <= written
     return _norm_start(now) == want
 
 
@@ -771,9 +799,18 @@ def read_stopped_groups(path: Path) -> tuple[list[dict], bool]:
     recs = raw.get("groups") if isinstance(raw, dict) else None
     if not isinstance(recs, list):
         return [], False
-    out = [{"pgid": r["pgid"], "start": _norm_start(r.get("start"))} for r in recs
+    out = [_group_rec(r["pgid"], _norm_start(r.get("start")), _written(r.get("written"))) for r in recs
            if isinstance(r, dict) and isinstance(r.get("pgid"), int) and not isinstance(r.get("pgid"), bool)]
     return out, len(out) == len(recs)
+
+
+def _group_rec(pgid: int, start: str | None, written: float | None = None) -> dict:
+    """One stopped-groups record. "written" (#116 review round 6: the pidfile's write time, group_is_ours' identity
+    evidence for a leader whose start could not be read) only when there is no start and a write time is known."""
+    rec = {"pgid": pgid, "start": start}
+    if start is None and written is not None:
+        rec["written"] = written
+    return rec
 
 
 def _write_json_durable(path: Path, obj) -> None:
@@ -853,6 +890,8 @@ class Guard:
         # stay in stopped_path (so a restart sees them too), show in the state file and are retried at every reading until
         # each is continued, gone, or found to be another process's group.
         self.unresolved: dict[int, str | None] = {}
+        # #116 review round 6: the pidfile write time recorded for a group with no recorded start (group_is_ours' evidence).
+        self.unresolved_written: dict[int, float] = {}
         self.unresolved_alerted = False
         # Stopped for the day (#116, owner 2026-11-18): epoch until which no cycle starts, the pause's reason slug and the
         # rule that set it. Survives new_cycle() and, through the state file, a supervisor restart (load_day_stop).
@@ -1081,8 +1120,9 @@ class Guard:
         group stays recorded until it is continued or gone). Nothing left: the file is removed."""
         if self.stopped_path is None:
             return
-        recs = [{"pgid": g, "start": self.stopped_starts.get(g)} for g in self.stopped_groups]
-        recs += [{"pgid": g, "start": st} for g, st in self.unresolved.items() if g not in self.stopped_groups]
+        w = self.unresolved_written
+        recs = [_group_rec(g, self.stopped_starts.get(g), w.get(g)) for g in self.stopped_groups]
+        recs += [_group_rec(g, st, w.get(g)) for g, st in self.unresolved.items() if g not in self.stopped_groups]
         try:
             if recs:
                 _write_json_durable(self.stopped_path, {"version": 1, "groups": recs})
@@ -1100,7 +1140,7 @@ class Guard:
         except (OSError, subprocess.SubprocessError):
             return False
 
-    def _continue_group(self, g: int, start: str | None, *, verified: bool = False) -> str:
+    def _continue_group(self, g: int, start: str | None, *, verified: bool = False, written: float | None = None) -> str:
         """SIGCONT one group the guard stopped, checking first that it is still the group recorded (#116 review round 2:
         a group that exited during the pause may have had its id reused). verified: its identity is known right now (in
         the freshly walked tree, the gate's checked trainer record, or the cycle's unreaped root). Returns 'done'
@@ -1109,7 +1149,7 @@ class Guard:
         if not safe_group(g):
             return "done"   # never signalled by the guard, so never stopped by it
         if not verified:
-            ours = group_is_ours({"pgid": g, "start": start}, leader_start=self.leader_start)
+            ours = group_is_ours(_group_rec(g, start, written), leader_start=self.leader_start)
             if ours is False:
                 return "stale"
             if ours is None:
@@ -1136,6 +1176,7 @@ class Guard:
         if outcome == "stale":
             self.log(f"overnight: stopped group {g} is gone and its id now belongs to another process; not signalled")
         self.unresolved.pop(g, None)
+        self.unresolved_written.pop(g, None)
 
     def _report_unresolved(self, name: str = "guard_continue_incomplete") -> None:
         """Alert once when stopped groups are left unresolved; log once when every one has been resolved."""
@@ -1158,7 +1199,8 @@ class Guard:
         for g, start in list(self.unresolved.items()):
             if g in self.stopped_groups:
                 continue
-            self._settle(g, self._continue_group(g, start, verified=(g == pgid)), start)
+            self._settle(g, self._continue_group(g, start, verified=(g == pgid),
+                                                 written=self.unresolved_written.get(g)), start)
         self._persist_stopped()
         self._report_unresolved()
 
@@ -1171,6 +1213,8 @@ class Guard:
         for r in recs:
             if safe_group(r["pgid"]):
                 self.unresolved.setdefault(r["pgid"], r["start"])
+                if r.get("written") is not None:
+                    self.unresolved_written.setdefault(r["pgid"], r["written"])
         if self.unresolved:
             self.unresolved_alerted = True
             self.log(f"overnight: {len(self.unresolved)} process group(s) from a previous supervisor are not confirmed "
@@ -1235,7 +1279,8 @@ class Guard:
         remembered = [g for g in self.stopped_groups if g != pgid]
         for g in remembered:
             start = self.stopped_starts.get(g)
-            self._settle(g, self._continue_group(g, start, verified=g in now), start)
+            self._settle(g, self._continue_group(g, start, verified=g in now,
+                                                 written=self.unresolved_written.get(g)), start)
         for g in now:
             if g in remembered:
                 continue
@@ -1871,7 +1916,10 @@ def recover_pidfile(pidfile: Path, *, ps=None, signaller=None, alive=None, log=l
         return True
     alive, ps = alive or _alive, ps or proc_stat
     try:
-        raw = pidfile.read_text().strip()
+        with open(pidfile, "rb") as f:
+            # #116 review round 6: the write time of the content read (fstat of the same open file) is the identity
+            # evidence recorded for a root whose start time cannot be read now (group_is_ours).
+            raw, written = f.read(GROUP_FILE_MAX_BYTES).decode("utf-8", "replace").strip(), os.fstat(f.fileno()).st_mtime
     except FileNotFoundError:
         return
     except OSError as e:
@@ -1903,7 +1951,7 @@ def recover_pidfile(pidfile: Path, *, ps=None, signaller=None, alive=None, log=l
         if alerter is not None:
             alerter("guard_recovery_incomplete", "the previous cycle's root status could not be read at startup")
         if stopped_path is not None:
-            _add_unresolved(stopped_path, pid, leader_start or proc_start, log)
+            _add_unresolved(stopped_path, pid, leader_start or proc_start, log, written=written)
         return
     if stat.startswith("T"):
         try:
@@ -1921,7 +1969,7 @@ def recover_pidfile(pidfile: Path, *, ps=None, signaller=None, alive=None, log=l
                 if alerter is not None:
                     alerter("guard_recovery_incomplete", "the previous cycle's group refused SIGCONT (EPERM) at startup")
                 if stopped_path is not None:
-                    _add_unresolved(stopped_path, pid, leader_start or proc_start, log)
+                    _add_unresolved(stopped_path, pid, leader_start or proc_start, log, written=written)
                 return
         log(f"overnight: pid {pid} from {pidfile} was left stopped (state {stat}); sent SIGCONT to its group so it can finish")
     else:
@@ -1945,17 +1993,25 @@ def _drop_recorded(stopped_path: Path, pgid: int, log) -> None:
         log(f"overnight: cannot update {stopped_path.name} ({type(e).__name__}); the guard retries group {pgid} harmlessly")
 
 
-def _add_unresolved(stopped_path: Path, pgid: int, leader_start, log) -> None:
-    """Append group `pgid` (with its leader's start, if ps can tell) to the stopped-groups record as unresolved."""
+def _add_unresolved(stopped_path: Path, pgid: int, leader_start, log, *, written: float | None = None) -> None:
+    """Append group `pgid` (with its leader's start, if ps can tell) to the stopped-groups record as unresolved.
+    #116 review round 6: when the start cannot be read, `written` (the pidfile's write time) is recorded instead, so the
+    guard can still verify the leader once ps works again (group_is_ours) rather than keeping it unknown forever. An
+    existing record of the group with neither a start nor a write time gets the write time added."""
     recs, _ = read_stopped_groups(stopped_path)
-    if any(r["pgid"] == pgid for r in recs):
-        return
+    old = next((r for r in recs if r["pgid"] == pgid), None)
+    if old is not None:
+        if old["start"] is not None or old.get("written") is not None or _written(written) is None:
+            return
+        recs = [_group_rec(pgid, None, _written(written)) if r is old else r for r in recs]
+    else:
+        try:
+            start = _norm_start(leader_start(pgid))
+        except (OSError, subprocess.SubprocessError):
+            start = None
+        recs = recs + [_group_rec(pgid, start, _written(written))]
     try:
-        start = _norm_start(leader_start(pgid))
-    except (OSError, subprocess.SubprocessError):
-        start = None
-    try:
-        _write_json_durable(stopped_path, {"version": 1, "groups": recs + [{"pgid": pgid, "start": start}]})
+        _write_json_durable(stopped_path, {"version": 1, "groups": recs})
     except OSError as e:
         log(f"overnight: cannot record unresolved group in {stopped_path.name} ({type(e).__name__})")
 
@@ -2011,7 +2067,7 @@ def recover_stopped_groups(stopped_path: Path, trainer_file: Path | None, pidfil
     for rec in recs:
         g = rec["pgid"]
         if g == root and safe_group(g) and not root_kept:
-            root_kept.append({"pgid": g, "start": rec["start"]})   # recover_pidfile's to resolve
+            root_kept.append(_group_rec(g, rec["start"], rec.get("written")))   # recover_pidfile's to resolve
             continue
         if not safe_group(g) or g == root or g in targets:
             continue
@@ -2026,7 +2082,7 @@ def recover_stopped_groups(stopped_path: Path, trainer_file: Path | None, pidfil
         else:
             log(f"overnight: recorded group {g} cannot be verified (ps failed or no start recorded); not signalled, kept "
                 "as unresolved")
-            kept.append({"pgid": g, "start": rec["start"]})
+            kept.append(_group_rec(g, rec["start"], rec.get("written")))
     if root is not None:
         d = discover(root)
         for g in d.groups:
