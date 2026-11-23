@@ -1,16 +1,44 @@
 # Pure checks of deploy-air.sh (sourced; reads only). Tested in deploy.test.mjs with a fake dscl,
 # dseditgroup and tailscale JSON: nothing here creates, changes or starts anything.
-# Needs ROLE_GID and ROLE_SHELL set by the caller.
+# Needs ROLE_GID, ROLE_SHELL and ROLE_REALNAME set by the caller.
 
 die() { echo "deploy-air: $*" >&2; exit 1; }
 
-attr() {  # user attribute -> its single value ("" when absent or multi-valued)
-  dscl . -read "/Users/$1" "$2" 2>/dev/null | awk -v k="$2:" '$1 == k && NF == 2 { print $2; exit }'
+# A user attribute's values, read as a plist and parsed exactly. Not the text form: `dscl . -read
+# /Users/U KEY` exits 0 with "No such key: KEY" on stderr for an absent key (an exit-code test reads
+# every key as present), prints some keys with a prefix (`dsAttrTypeNative:IsHidden: 1`) and a value
+# with spaces on its own indented line (RealName). `dscl -plist` gives a dict of key -> [values], with
+# an absent key simply missing (`<dict/>`). Keys match as given or behind a dsAttrType{Standard,Native}:
+# prefix. Mode "one" prints the value when there is exactly one (nothing otherwise), "count" the number
+# of values (0 when absent). Returns 1 when the record cannot be read or parsed: never "absent".
+attr_read() {  # user attribute one|count
+  local plist
+  plist="$(dscl -plist . -read "/Users/$1" "$2" 2>/dev/null)" || return 1
+  printf '%s\n' "$plist" | python3 -I -c '
+import plistlib, sys
+key, mode = sys.argv[1], sys.argv[2]
+try:
+    doc = plistlib.loads(sys.stdin.buffer.read())
+except Exception:
+    sys.exit(1)
+if not isinstance(doc, dict):
+    sys.exit(1)
+names = {key, "dsAttrTypeStandard:" + key, "dsAttrTypeNative:" + key}
+vals = []
+for k, v in doc.items():
+    if k in names:
+        vals.extend(v if isinstance(v, list) else [v])
+if mode == "count":
+    print(len(vals))
+elif len(vals) == 1 and isinstance(vals[0], str) and "\n" not in vals[0]:
+    print(vals[0])' "$2" "$3"
 }
+attr() { attr_read "$1" "$2" one; }  # user attribute -> its single value ("" when absent, multi-valued or unreadable)
 uid_holders() { dscl . -list /Users UniqueID | awk -v u="$1" '$2 == u { print $1 }' | sort -u | paste -s -d, -; }
-# Prints "create" (no such account, UID free) or "reuse" (validated); anything else aborts.
+# Prints "create" (no such account, UID free) or "reuse" (validated); anything else aborts. "reuse" also
+# adopts an account a stopped --apply left behind, when every attribute already matches the spec.
 check_role() {  # name uid home
-  local name="$1" uid="$2" home="$3" holders
+  local name="$1" uid="$2" home="$3" holders authorities
   holders="$(uid_holders "$uid")"
   if ! dscl . -read "/Users/$name" >/dev/null 2>&1; then
     [[ -z "$holders" ]] || die "UID $uid is taken by '$holders' (wanted for $name): pick another UID deliberately"
@@ -22,10 +50,12 @@ check_role() {  # name uid home
   [[ "$(attr "$name" NFSHomeDirectory)" == "$home" ]] || die "$name: home is not $home"
   [[ "$(attr "$name" UserShell)" == "$ROLE_SHELL" ]] || die "$name: shell is not $ROLE_SHELL (login must stay disabled)"
   [[ "$(attr "$name" Password)" == '*' ]] || die "$name: password is not '*' (login must stay disabled)"
-  if dscl . -read "/Users/$name" AuthenticationAuthority >/dev/null 2>&1; then
-    die "$name has an AuthenticationAuthority (a password or token login): not a role user"
-  fi
+  # Any AuthenticationAuthority value (ShadowHash, Kerberosv5, SecureToken, even an empty one) refuses;
+  # an unreadable record refuses too. Only a key that is really absent passes.
+  authorities="$(attr_read "$name" AuthenticationAuthority count)" || die "$name: cannot read its AuthenticationAuthority"
+  [[ "$authorities" == 0 ]] || die "$name has an AuthenticationAuthority (a password or token login): not a role user"
   [[ "$(attr "$name" IsHidden)" == 1 ]] || die "$name: not hidden"
+  [[ "$(attr "$name" RealName)" == "$ROLE_REALNAME" ]] || die "$name: RealName is not '$ROLE_REALNAME'"
   if dseditgroup -o checkmember -m "$name" admin >/dev/null 2>&1; then die "$name is an admin"; fi
   echo reuse
 }

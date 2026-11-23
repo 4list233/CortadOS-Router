@@ -30,7 +30,7 @@ EXPECTED_HOST="${CORTADOS_OFFICE_EXPECTED_HOST:-Forests-MacBook-Air}"
 ROOT="/opt/cortados-office"
 BRIDGE_USER="_cortados-office"; BRIDGE_UID=480; BRIDGE_HOME="$ROOT/home/bridge"
 STUDIO_USER="_cortados-claw3d"; STUDIO_UID=481; STUDIO_HOME="$ROOT/home/studio"
-ROLE_SHELL="/usr/bin/false"; ROLE_GID=20
+ROLE_SHELL="/usr/bin/false"; ROLE_GID=20; ROLE_REALNAME="CortadOS Office role user"
 BRIDGE_PORT=18789                          # Claw3D's default upstream gateway port
 STUDIO_PORT=3000
 # The tailnet HTTPS port for Studio. The Air already serves 443 (Funnel: /mcp only) and 8444
@@ -285,7 +285,7 @@ create_user() {  # name uid home plan
   run sudo dscl . -create "/Users/$1" PrimaryGroupID "$ROLE_GID"
   run sudo dscl . -create "/Users/$1" UserShell "$ROLE_SHELL"
   run sudo dscl . -create "/Users/$1" NFSHomeDirectory "$3"
-  run sudo dscl . -create "/Users/$1" RealName "CortadOS Office role user"
+  run sudo dscl . -create "/Users/$1" RealName "$ROLE_REALNAME"
   run sudo dscl . -create "/Users/$1" IsHidden 1
   run sudo dscl . -create "/Users/$1" Password '*'
   if [[ $APPLY -eq 1 ]]; then [[ "$(check_role "$1" "$2" "$3")" == reuse ]] || die "$1 was not created as specified"; fi

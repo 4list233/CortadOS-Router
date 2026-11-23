@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>dsAttrTypeNative:IsHidden</key>
+	<array>
+		<string>1</string>
+	</array>
+	<key>dsAttrTypeNative:accountPolicyData</key>
+	<array>
+		<string>&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
+&lt;plist version="1.0"&gt;
+&lt;dict&gt;
+	&lt;key&gt;creationTime&lt;/key&gt;
+	&lt;real&gt;1795452006.0736098&lt;/real&gt;
+&lt;/dict&gt;
+&lt;/plist&gt;
+</string>
+	</array>
+	<key>dsAttrTypeNative:record_daemon_version</key>
+	<array>
+		<string>9670000</string>
+	</array>
+	<key>dsAttrTypeStandard:AppleMetaNodeLocation</key>
+	<array>
+		<string>/Local/Default</string>
+	</array>
+	<key>dsAttrTypeStandard:GeneratedUID</key>
+	<array>
+		<string>562F74F4-74CC-49EE-BFAE-AB964EF496B9</string>
+	</array>
+	<key>dsAttrTypeStandard:NFSHomeDirectory</key>
+	<array>
+		<string>/opt/cortados-office/home/bridge</string>
+	</array>
+	<key>dsAttrTypeStandard:Password</key>
+	<array>
+		<string>*</string>
+	</array>
+	<key>dsAttrTypeStandard:PrimaryGroupID</key>
+	<array>
+		<string>20</string>
+	</array>
+	<key>dsAttrTypeStandard:RealName</key>
+	<array>
+		<string>CortadOS Office role user</string>
+	</array>
+	<key>dsAttrTypeStandard:RecordName</key>
+	<array>
+		<string>_cortados-office</string>
+	</array>
+	<key>dsAttrTypeStandard:RecordType</key>
+	<array>
+		<string>dsRecTypeStandard:Users</string>
+	</array>
+	<key>dsAttrTypeStandard:UniqueID</key>
+	<array>
+		<string>480</string>
+	</array>
+	<key>dsAttrTypeStandard:UserShell</key>
+	<array>
+		<string>/usr/bin/false</string>
+	</array>
+</dict>
+</plist>

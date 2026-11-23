@@ -12,20 +12,54 @@ import { fileURLToPath } from 'node:url';
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const LIB = join(HERE, 'deploy-lib.sh');
 const ROLE = { name: '_cortados-office', uid: '480', home: '/opt/cortados-office/home/bridge' };
+const REALNAME = 'CortadOS Office role user';
+// Keys as real dscl names them (captured on the Air, 2026-11-23): IsHidden is a native attribute.
 const GOOD = { UniqueID: '480', PrimaryGroupID: '20', NFSHomeDirectory: ROLE.home, UserShell: '/usr/bin/false',
-  Password: '*', IsHidden: '1', RealName: 'CortadOS Office role user' };
+  Password: '*', IsHidden: '1', RealName: REALNAME };
+const NATIVE = new Set(['IsHidden']);
+// The record exactly as `dscl -plist . -read /Users/_cortados-office` printed it on the Air after the
+// stopped --apply of 2026-11-23 (every attribute set, no AuthenticationAuthority).
+const HALF_CREATED = join(HERE, 'fixtures', 'dscl-half-created-cortados-office.plist');
 
-const FAKE_DSCL = `#!/bin/bash
-# fake dscl: ". -list /Users UniqueID" and ". -read /Users/NAME [KEY]" over $FAKE/users/NAME files
-shift
-case "$1" in
-  -list) for f in "$FAKE"/users/*; do [ -e "$f" ] || continue
-           echo "$(basename "$f") $(awk -F': ' '$1 == "UniqueID" { print $2 }' "$f")"; done ;;
-  -read) f="$FAKE/users/\${2#/Users/}"
-         [ -f "$f" ] || { echo "DS Error: -14136 (eDSRecordNotFound)" >&2; exit 56; }
-         if [ -n "$3" ]; then grep "^$3:" "$f" || { echo "No such key: $3" >&2; exit 181; }; else cat "$f"; fi ;;
-  *) echo "fake dscl: unexpected $*" >&2; exit 99 ;;
-esac
+// The fake behaves as the real dscl does (macOS 26.6.2): a missing record is DS Error -14136, exit 56;
+// `-plist . -read /Users/U KEY...` prints a plist dict holding only the keys present (`<dict/>` when
+// none), exit 0; the text form prints "No such key: KEY" on stderr and STILL exits 0 (the bug of #77).
+// Users are plist records in $FAKE/users/NAME, keys prefixed as dscl prefixes them.
+const FAKE_DSCL = `#!/usr/bin/env python3
+import os, plistlib, sys
+fake = os.environ["FAKE"]
+argv = sys.argv[1:]
+plist = argv[:1] == ["-plist"]
+if plist:
+    argv = argv[1:]
+def load(name):
+    try:
+        with open(os.path.join(fake, "users", name), "rb") as f:
+            return plistlib.load(f)
+    except FileNotFoundError:
+        sys.stderr.write("<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)\\n"); sys.exit(56)
+def short(k):
+    return k.split(":", 1)[1] if k.startswith("dsAttrType") else k
+if argv[:4] == [".", "-list", "/Users", "UniqueID"] and not plist:
+    for n in sorted(os.listdir(os.path.join(fake, "users"))):
+        for k, v in load(n).items():
+            if short(k) == "UniqueID":
+                print(n, v[0])
+elif argv[:2] == [".", "-read"] and len(argv) >= 3 and argv[2].startswith("/Users/"):
+    if os.path.exists(os.path.join(fake, "fail-plist")) and plist and len(argv) > 3:
+        sys.stderr.write("<dscl_cmd> DS Error: -14987 (eDSPermissionError)\\n"); sys.exit(40)
+    rec, keys = load(argv[2][len("/Users/"):]), argv[3:]
+    got = {k: v for k, v in rec.items() if not keys or short(k) in keys or k in keys}
+    if plist:
+        sys.stdout.buffer.write(plistlib.dumps(got))
+    else:
+        for k, v in got.items():
+            print("%s: %s" % (k, " ".join(v)))
+        for k in keys:
+            if not any(short(g) == k or g == k for g in got):
+                sys.stderr.write("No such key: %s\\n" % k)
+else:
+    sys.stderr.write("fake dscl: unexpected %s\\n" % sys.argv[1:]); sys.exit(99)
 `;
 const FAKE_DSEDITGROUP = `#!/bin/bash
 # fake dseditgroup: "-o checkmember -m NAME admin" -> 0 when NAME is listed in $FAKE/admins
@@ -33,23 +67,41 @@ const FAKE_DSEDITGROUP = `#!/bin/bash
 grep -qx "$4" "$FAKE/admins" 2>/dev/null
 `;
 
-async function fakeHost(t, users, admins = []) {
+const xml = v => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// attrs: short name -> value or [values]; a key already holding a dsAttrType prefix is kept as given
+function plistRecord(attrs) {
+  const body = Object.entries(attrs).map(([k, v]) => {
+    const key = k.startsWith('dsAttrType') ? k : `dsAttrType${NATIVE.has(k) ? 'Native' : 'Standard'}:${k}`;
+    const vals = (Array.isArray(v) ? v : [v]).map(x => `\t\t<string>${xml(x)}</string>`).join('\n');
+    return `\t<key>${xml(key)}</key>\n\t<array>\n${vals}\n\t</array>`;
+  }).join('\n');
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" ` +
+    `"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n${body}\n</dict>\n</plist>\n`;
+}
+
+async function fakeHost(t, users, admins = [], { failPlist = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'office-deploy-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   await mkdir(join(dir, 'bin')); await mkdir(join(dir, 'users'));
   await writeFile(join(dir, 'bin', 'dscl'), FAKE_DSCL); await chmod(join(dir, 'bin', 'dscl'), 0o755);
   await writeFile(join(dir, 'bin', 'dseditgroup'), FAKE_DSEDITGROUP); await chmod(join(dir, 'bin', 'dseditgroup'), 0o755);
   for (const [name, attrs] of Object.entries(users)) {
-    await writeFile(join(dir, 'users', name), Object.entries(attrs).map(([k, v]) => `${k}: ${v}`).join('\n') + '\n');
+    await writeFile(join(dir, 'users', name), typeof attrs === 'string' ? attrs : plistRecord(attrs));
   }
   await writeFile(join(dir, 'admins'), admins.join('\n') + '\n');
+  if (failPlist) await writeFile(join(dir, 'fail-plist'), '');
   return dir;
 }
 function checkRole(dir, { name, uid, home } = ROLE) {
   const r = spawnSync('bash', ['-c', '. "$LIB"; check_role "$@"', 'check', name, uid, home], {
-    env: { PATH: `${join(dir, 'bin')}:/usr/bin:/bin`, FAKE: dir, LIB, ROLE_GID: '20', ROLE_SHELL: '/usr/bin/false' },
+    env: { PATH: `${join(dir, 'bin')}:/usr/bin:/bin`, FAKE: dir, LIB, ROLE_GID: '20', ROLE_SHELL: '/usr/bin/false',
+      ROLE_REALNAME: REALNAME },
     encoding: 'utf8' });
   return { code: r.status, out: r.stdout.trim(), err: r.stderr.trim() };
+}
+function dscl(dir, ...args) {
+  const r = spawnSync(join(dir, 'bin', 'dscl'), args, { env: { PATH: '/usr/bin:/bin', FAKE: dir }, encoding: 'utf8' });
+  return { code: r.status, out: r.stdout, err: r.stderr };
 }
 
 test('role check: a free name and UID is created; an exact role account is reused', async t => {
@@ -81,6 +133,7 @@ test('role check: a reused account must have the home, disabled login and shell 
     [{ Password: '********' }, /password is not '\*'/],
     [{ AuthenticationAuthority: ';ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>' }, /AuthenticationAuthority/],
     [{ IsHidden: '0' }, /not hidden/],
+    [{ RealName: 'Someone' }, /RealName is not/],
     [{ PrimaryGroupID: '80' }, /primary group is not 20/],
   ];
   for (const [patch, why] of cases) {
@@ -92,6 +145,50 @@ test('role check: a reused account must have the home, disabled login and shell 
   assert.match(checkRole(await fakeHost(t, { [ROLE.name]: noShell })).err, /shell is not/);
   const admin = checkRole(await fakeHost(t, { [ROLE.name]: GOOD }, [ROLE.name]));
   assert.equal(admin.code, 1); assert.match(admin.err, /is an admin/);
+});
+
+test('the fake dscl answers as the real one does, including the exit 0 on "No such key" (#77)', async t => {
+  const dir = await fakeHost(t, { [ROLE.name]: await readFile(HALF_CREATED, 'utf8') });
+  // captured on the Air: stdout "", stderr "No such key: AuthenticationAuthority", exit 0
+  assert.deepEqual(dscl(dir, '.', '-read', `/Users/${ROLE.name}`, 'AuthenticationAuthority'),
+    { code: 0, out: '', err: 'No such key: AuthenticationAuthority\n' });
+  const p = dscl(dir, '-plist', '.', '-read', `/Users/${ROLE.name}`, 'AuthenticationAuthority');
+  assert.equal(p.code, 0); assert.match(p.out, /<dict\/>/);
+  assert.equal(dscl(dir, '.', '-read', '/Users/_cortados-claw3d').code, 56);
+});
+
+test('role check: an absent AuthenticationAuthority passes; ShadowHash, Kerberos, SecureToken or an unreadable record refuse (#77)', async t => {
+  // the real half-created record from the Air: every attribute as specified, no authority -> adopted
+  assert.deepEqual(checkRole(await fakeHost(t, { [ROLE.name]: await readFile(HALF_CREATED, 'utf8') })),
+    { code: 0, out: 'reuse', err: '' });
+  const refused = [
+    [';ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2,SRP-RFC5054-4096-SHA512-PBKDF2>'],
+    [';Kerberosv5;;_cortados-office@LKDC:SHA1.0123456789ABCDEF;LKDC:SHA1.0123456789ABCDEF;'],
+    [';ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>', ';SecureToken;', ';Kerberosv5;;x@LKDC:SHA1.00;LKDC:SHA1.00;'],
+    [''],
+  ];
+  for (const aa of refused) {
+    const r = checkRole(await fakeHost(t, { [ROLE.name]: { ...GOOD, AuthenticationAuthority: aa } }));
+    assert.equal(r.code, 1, JSON.stringify(aa)); assert.equal(r.out, '');
+    assert.match(r.err, /has an AuthenticationAuthority/);
+  }
+  const unreadable = checkRole(await fakeHost(t, { [ROLE.name]: GOOD }, [], { failPlist: true }));
+  assert.equal(unreadable.code, 1); assert.equal(unreadable.out, '');
+});
+
+test('role check: a re-run adopts the account a stopped --apply left behind only when it matches (#77)', async t => {
+  // adopted: exactly the spec, written as dscl -create writes it
+  assert.equal(checkRole(await fakeHost(t, { [ROLE.name]: GOOD })).out, 'reuse');
+  // never adopted: a step that did not run (no Password, no IsHidden) or a value that differs
+  const { Password, ...noPassword } = GOOD; const { IsHidden, ...notHidden } = GOOD;
+  for (const [rec, why] of [[noPassword, /password is not/], [notHidden, /not hidden/],
+    [{ ...GOOD, RealName: 'Other' }, /RealName is not/], [{ ...GOOD, UserShell: '/bin/sh' }, /shell is not/]]) {
+    const r = checkRole(await fakeHost(t, { [ROLE.name]: rec }));
+    assert.equal(r.code, 1); assert.equal(r.out, ''); assert.match(r.err, why);
+  }
+  // the second role user, never created, is still "create" next to the adopted first one
+  assert.equal(checkRole(await fakeHost(t, { [ROLE.name]: GOOD }),
+    { name: '_cortados-claw3d', uid: '481', home: '/opt/cortados-office/home/studio' }).out, 'create');
 });
 
 function portState(json, port = '8446', target = 'http://127.0.0.1:3000') {
