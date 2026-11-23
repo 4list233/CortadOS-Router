@@ -1,6 +1,8 @@
 # Test harness for deploy-lib.sh's activation transaction (deploy.test.mjs). Never touches the host:
 # a fake install under $FAKE, with real links and files, and daemons as state files recording the
-# release they were started with. FAIL lists steps that fail once, FAIL_ALWAYS steps that always fail.
+# release they were started with. FAIL lists steps that fail once, FAIL_ALWAYS steps that always fail,
+# UNKNOWN lookups that cannot be answered (loaded:LABEL, exists:NAME, readlink:NAME), as deploy-air.sh's
+# primitives report them: daemon_loaded / fs_exists return 2, fs_readlink returns 1.
 set -euo pipefail
 . "$LIB"
 D="$FAKE"
@@ -9,14 +11,18 @@ fail() {
   [[ ",$FAIL," == *",$1,"* && ! -e "$D/failed-$1" ]] || return 1
   touch "$D/failed-$1"
 }
-fs_readlink() { readlink "$1" 2>/dev/null || true; }
-fs_exists() { [[ -e "$1" || -L "$1" ]]; }
+unknown() { [[ ",${UNKNOWN:-}," == *",$1,"* ]]; }
+fs_readlink() {
+  if unknown "readlink:${1##*/}"; then return 1; fi
+  if [[ -L "$1" ]]; then readlink "$1"; elif [[ -e "$1" ]]; then return 1; fi
+}
+fs_exists() { if unknown "exists:${1##*/}"; then return 2; fi; [[ -e "$1" || -L "$1" ]]; }
 fs_link() { if fail "link:${2##*/}"; then return 1; fi; ln -sfn "$1" "$2"; }
 fs_rm() { rm -f "$1"; }
 fs_backup() { if fail "backup:${1##*/}"; then return 1; fi; cp -p "$1" "$1.prev"; }
 fs_promote() { if fail "promote:${2##*/}"; then return 1; fi; cp -p "$1" "$2.next" && mv -f "$2.next" "$2"; }
 fs_restore() { mv -f "$1.prev" "$1"; }
-daemon_loaded() { [[ -e "$D/daemons/$1" ]]; }
+daemon_loaded() { if unknown "loaded:$1"; then return 2; fi; [[ -e "$D/daemons/$1" ]]; }
 daemon_start() {
   if fail "start:$1"; then return 1; fi
   { readlink "$D/current" || echo none; readlink "$D/adapter" || echo none; cat "$D/bin/run-$1.sh" 2>/dev/null || echo none

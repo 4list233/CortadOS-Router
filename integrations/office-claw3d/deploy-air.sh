@@ -30,7 +30,7 @@ EXPECTED_HOST="${CORTADOS_OFFICE_EXPECTED_HOST:-Forests-MacBook-Air}"
 ROOT="/opt/cortados-office"
 BRIDGE_USER="_cortados-office"; BRIDGE_UID=480; BRIDGE_HOME="$ROOT/home/bridge"
 STUDIO_USER="_cortados-claw3d"; STUDIO_UID=481; STUDIO_HOME="$ROOT/home/studio"
-ROLE_SHELL="/usr/bin/false"; ROLE_GID=20
+ROLE_SHELL="/usr/bin/false"; ROLE_GID=20; ROLE_REALNAME="CortadOS Office role user"
 BRIDGE_PORT=18789                          # Claw3D's default upstream gateway port
 STUDIO_PORT=3000
 # The tailnet HTTPS port for Studio. The Air already serves 443 (Funnel: /mcp only) and 8444
@@ -69,11 +69,17 @@ run() {  # print the command; run it only with --apply
   printf '  $ %s\n' "$*"
   if [[ $APPLY -eq 1 ]]; then "$@"; fi
 }
-# die, attr, uid_holders, check_role, serve_port_state: pure checks, tested in deploy.test.mjs
+# die, attr, uid_holders, account_state, check_role, root_test, launchd_state, serve_port_state: pure
+# checks, tested in deploy.test.mjs
 . "$HERE/deploy-lib.sh"
 owner_of() { stat -f '%Su:%Sg' "$1"; }
 mode_of() { stat -f '%Lp' "$1"; }
-as_root_test() { sudo test "$@"; }     # a read: files under the role users' 0700 homes
+# A read as root (files under the role users' 0700 homes): 0 true, 1 false; a check sudo or test could
+# not answer aborts (root_test, deploy-lib.sh), never reads as "absent".
+as_root_test() {
+  local a; a="$(root_test "$@")" || die "cannot check 'test $*' as root (sudo or test failed): refusing to guess"
+  [[ "$a" == yes ]]
+}
 
 # ---- preconditions common to every mode (they only read) -----------------------------
 step "Preconditions ($MODE)"
@@ -136,7 +142,8 @@ if [[ $MODE != install ]]; then
   if [[ $APPLY -eq 1 ]]; then
     after="$(serve_state "$TS" "$TAILNET_PORT" "http://127.0.0.1:$STUDIO_PORT")" || after="unreadable"
     if [[ "$after" != ours ]]; then
-      "$TS" serve --https="$TAILNET_PORT" off || true
+      "$TS" serve --https="$TAILNET_PORT" off \
+        || die "after serve, port $TAILNET_PORT is '$after', not a tailnet-only proxy to Studio, AND taking it down failed: run --unpublish-tailnet / tailscale serve status now"
       die "after serve, port $TAILNET_PORT is '$after', not a tailnet-only proxy to Studio: taken down again"
     fi
     name="$("$TS" status --json | python3 -I -c 'import json,sys; print((json.load(sys.stdin).get("Self") or {}).get("DNSName","").rstrip("."))')"
@@ -151,8 +158,9 @@ fi
 [[ -f "$HERE/claw3d/avatar-profile-hint.patch" && -f "$HERE/claw3d/studio-login.patch" && -f "$HERE/bridge.mjs" ]] \
   || die "run from a CortadOS-Router checkout"
 xcode-select -p >/dev/null 2>&1 || die "git needs the Xcode command line tools (xcode-select --install)"
-[[ -z "$(git -C "$REPO" status --porcelain -- integrations/office-claw3d)" ]] \
-  || die "integrations/office-claw3d has uncommitted changes: the install is pinned to a commit"
+# captured first: a failed `git status` prints nothing, which must not read as "clean"
+DIRTY="$(git -C "$REPO" status --porcelain -- integrations/office-claw3d)" || die "git status failed: cannot confirm a clean checkout"
+[[ -z "$DIRTY" ]] || die "integrations/office-claw3d has uncommitted changes: the install is pinned to a commit"
 SRC_SHA="$(git -C "$REPO" rev-parse HEAD)"
 BUILD_ID="${CLAW3D_COMMIT:0:12}-${SRC_SHA:0:12}"   # the patches come from this checkout
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$PROVIDER_OFFICE_URL" || true)"
@@ -165,6 +173,9 @@ link_into() {  # path dir: path is absent, or a symlink to an entry of dir
   case "$(readlink "$1")" in "$2"/*) ;; *) die "$1 points outside $2" ;; esac
 }
 UPGRADE=0
+# ROOT's absence (a fresh install) is read as the owner: only where its directory can be searched
+[[ -e "$ROOT" || -L "$ROOT" ]] || link_target "$ROOT" >/dev/null \
+  || die "cannot tell whether $ROOT exists (${ROOT%/*} cannot be searched)"
 if [[ -e "$ROOT" || -L "$ROOT" ]]; then
   UPGRADE=1
   [[ -d "$ROOT" && ! -L "$ROOT" ]] || die "$ROOT is not a plain directory"
@@ -172,13 +183,21 @@ if [[ -e "$ROOT" || -L "$ROOT" ]]; then
   for d in home bin adapters stage; do
     [[ ! -e "$ROOT/$d" ]] || [[ "$(owner_of "$ROOT/$d")" == root:wheel && ! -L "$ROOT/$d" ]] || die "$ROOT/$d must be root:wheel"
   done
+  # The existence checks below run as the owner: a directory it cannot search would make every entry
+  # read as absent, so the ones they look into must be searchable (as the install creates them).
+  for d in home bin adapters; do
+    [[ ! -e "$ROOT/$d" ]] || [[ "$(mode_of "$ROOT/$d")" == 755 ]] || die "$ROOT/$d must be 0755"
+  done
   for f in "$ROOT/bin/run-bridge.sh" "$ROOT/bin/run-studio.sh"; do
     [[ ! -e "$f" ]] || [[ "$(owner_of "$f")" == root:wheel && ! -L "$f" ]] || die "$f must be a root:wheel file"
   done
   link_into "$ROOT/adapter" "$ROOT/adapters"
   link_into "$ROOT/node" "$ROOT"
   if [[ -e "$ROOT/claw3d" ]]; then
-    [[ "$(owner_of "$ROOT/claw3d")" == "$STUDIO_USER:staff" && ! -L "$ROOT/claw3d" ]] || die "$ROOT/claw3d must belong to $STUDIO_USER"
+    [[ "$(owner_of "$ROOT/claw3d")" == "$STUDIO_USER:staff" && ! -L "$ROOT/claw3d" && "$(mode_of "$ROOT/claw3d")" == 755 ]] \
+      || die "$ROOT/claw3d must belong to $STUDIO_USER, 0755"
+    [[ ! -e "$ROOT/claw3d/builds" ]] || [[ -d "$ROOT/claw3d/builds" && ! -L "$ROOT/claw3d/builds" && "$(mode_of "$ROOT/claw3d/builds")" == 755 ]] \
+      || die "$ROOT/claw3d/builds must be a 0755 directory"
     link_into "$ROOT/claw3d/current" "$ROOT/claw3d/builds"
     for e in "$ROOT/claw3d"/*; do
       case "${e##*/}" in builds|current|current.new|'*') ;; *) die "unexpected $e (unknown layout): move it aside first" ;; esac
@@ -196,7 +215,12 @@ for label in "$BRIDGE_LABEL" "$STUDIO_LABEL"; do
   p="/Library/LaunchDaemons/$label.plist"
   [[ ! -e "$p" ]] || [[ "$(owner_of "$p")" == root:wheel && "$(mode_of "$p")" == 644 && ! -L "$p" ]] || die "$p must be root:wheel 0644"
 done
-loaded() { launchctl print "system/$1" >/dev/null 2>&1; }
+# 0 loaded, 1 confirmed not loaded; a launchctl answer that is neither aborts (launchd_state, deploy-lib.sh).
+loaded() {
+  local rc=0; launchd_state "$1" || rc=$?
+  [[ $rc == 0 || $rc == 1 ]] || die "cannot tell whether $1 is loaded (launchctl print answered unexpectedly)"
+  return $rc
+}
 
 # Node: reuse the pinned version when it is there and answers with that version.
 NODE_PLAN=install
@@ -210,8 +234,12 @@ fi
 # The staged adapter copy and Claw3D build for this commit, when an earlier run left them.
 ADAPTER_DIR="$ROOT/adapters/$SRC_SHA"
 BUILD="$ROOT/claw3d/builds/$BUILD_ID"
-CURRENT_BUILD="$(readlink "$ROOT/claw3d/current" 2>/dev/null || true)"     # kept by the prune as the rollback
-PREVIOUS_ADAPTER="$(readlink "$ROOT/adapter" 2>/dev/null || true)"
+# The prune (step 9) keeps these as the rollback. Empty ONLY when confirmed absent (link_target,
+# deploy-lib.sh): a read that failed aborts here, before any change, never "nothing to keep".
+CURRENT_BUILD="$(link_target "$ROOT/claw3d/current")" \
+  || die "cannot read $ROOT/claw3d/current (not a readable link, or its directory cannot be searched): the prune would not know the rollback build"
+PREVIOUS_ADAPTER="$(link_target "$ROOT/adapter")" \
+  || die "cannot read $ROOT/adapter (not a readable link, or its directory cannot be searched): the prune would not know the rollback adapter"
 if [[ -d "$ADAPTER_DIR" ]]; then
   for f in "${ADAPTER_FILES[@]}"; do cmp -s "$HERE/$f" "$ADAPTER_DIR/${f##*/}" || die "$ADAPTER_DIR differs from $SRC_SHA: investigate"; done
 fi
@@ -285,7 +313,7 @@ create_user() {  # name uid home plan
   run sudo dscl . -create "/Users/$1" PrimaryGroupID "$ROLE_GID"
   run sudo dscl . -create "/Users/$1" UserShell "$ROLE_SHELL"
   run sudo dscl . -create "/Users/$1" NFSHomeDirectory "$3"
-  run sudo dscl . -create "/Users/$1" RealName "CortadOS Office role user"
+  run sudo dscl . -create "/Users/$1" RealName "$ROLE_REALNAME"
   run sudo dscl . -create "/Users/$1" IsHidden 1
   run sudo dscl . -create "/Users/$1" Password '*'
   if [[ $APPLY -eq 1 ]]; then [[ "$(check_role "$1" "$2" "$3")" == reuse ]] || die "$1 was not created as specified"; fi
@@ -446,33 +474,44 @@ switch_link() {  # target link [user]: replace `link` atomically (rename over it
   run "${who[@]}" ln -sfn "$1" "$2.new" && run "${who[@]}" mv -fh "$2.new" "$2"
 }
 # The primitives tx_run (deploy-lib.sh) drives. Each returns a code, never exits.
-fs_readlink() { readlink "$1" 2>/dev/null || true; }
-fs_exists() { as_root_test -e "$1" -o -L "$1"; }
+fs_readlink() { link_target "$1"; }  # the target; nothing only when confirmed absent; 1 when unreadable
+fs_exists() {  # 0 exists, 1 absent, 2 unknown (sudo or test failed): never exits inside the transaction
+  case "$(root_test -e "$1" -o -L "$1")" in yes) return 0 ;; no) return 1 ;; *) return 2 ;; esac
+}
 fs_link() { switch_link "$1" "$2" "$3"; }
 fs_rm() { if [[ -n "$2" ]]; then run sudo -u "$2" rm -f "$1"; else run sudo rm -f "$1"; fi; }
 fs_backup() { run sudo cp -p "$1" "$1.prev"; }
 fs_promote() { run sudo cp -p "$1" "$2.next" && run sudo mv -f "$2.next" "$2"; }
 fs_restore() { run sudo mv -f "$1.prev" "$1"; }
-daemon_loaded() { loaded "$1"; }
+daemon_loaded() { launchd_state "$1"; }   # 0 / 1 / 2 unknown: returns, never exits (tx_*)
 daemon_start() { run sudo launchctl bootstrap system "/Library/LaunchDaemons/$1.plist"; }
 daemon_stop() {
   run sudo launchctl bootout "system/$1" || true      # a daemon that exits meanwhile is not an error
   [[ $APPLY -eq 1 ]] || return 0
-  for _ in $(seq 1 20); do loaded "$1" || return 0; sleep 0.5; done
+  local st
+  for _ in $(seq 1 20); do
+    st=0; launchd_state "$1" || st=$?
+    case $st in
+      1) return 0 ;;
+      0) sleep 0.5 ;;
+      *) echo "deploy-air: cannot tell whether $1 stopped" >&2; return 1 ;;
+    esac
+  done
   echo "deploy-air: $1 did not stop" >&2; return 1
 }
 http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$1" || true; }
 office_healthy() {  # prints why not, on failure
-  local l
+  local l out
   for l in "$BRIDGE_LABEL" "$STUDIO_LABEL"; do
-    launchctl print "system/$l" 2>/dev/null | grep -q 'state = running' || { echo "$l is not running"; return 1; }
+    # captured whole, then matched: piping into an early-exiting grep could SIGPIPE launchctl (pipefail: a false "down")
+    out="$(launchctl print "system/$l" 2>/dev/null)" && [[ "$out" == *"state = running"* ]] || { echo "$l is not running"; return 1; }
   done
   [[ "$(http_code "http://127.0.0.1:$BRIDGE_PORT/")" == 426 ]] || { echo "the bridge does not answer on 127.0.0.1:$BRIDGE_PORT"; return 1; }
   [[ "$(http_code "http://127.0.0.1:$STUDIO_PORT/")" == 401 ]] || { echo "Studio does not refuse a request without its access cookie"; return 1; }
   [[ "$(http_code "http://127.0.0.1:$STUDIO_PORT/cortados-login")" == 200 ]] || { echo "the login form does not answer"; return 1; }
-  if sudo lsof -nP -iTCP:$BRIDGE_PORT -iTCP:$STUDIO_PORT -sTCP:LISTEN | awk 'NR>1{print $9}' | grep -vqE '^(127\.0\.0\.1|\[::1\]):'; then
-    echo "a listener is not loopback-only"; return 1
-  fi
+  # 0 only on a successful lsof listing loopback listeners on both ports (deploy-lib.sh): a refused
+  # sudo or an unreadable answer fails the health check, so the transaction rolls back
+  listeners_loopback_only "$BRIDGE_PORT" "$STUDIO_PORT" || return 1
 }
 health_check() {  # up to ~60 s for both daemons to come up, then the same checks must hold 10 s later
   [[ $APPLY -eq 1 ]] || { echo "  (dry run) health check: both daemons running, bridge 426, Studio 401 on /, 200 on /cortados-login, loopback only"; return 0; }

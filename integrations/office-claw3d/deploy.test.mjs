@@ -12,44 +12,118 @@ import { fileURLToPath } from 'node:url';
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const LIB = join(HERE, 'deploy-lib.sh');
 const ROLE = { name: '_cortados-office', uid: '480', home: '/opt/cortados-office/home/bridge' };
+const REALNAME = 'CortadOS Office role user';
+// Keys as real dscl names them (captured on the Air, 2026-11-23): IsHidden is a native attribute.
 const GOOD = { UniqueID: '480', PrimaryGroupID: '20', NFSHomeDirectory: ROLE.home, UserShell: '/usr/bin/false',
-  Password: '*', IsHidden: '1', RealName: 'CortadOS Office role user' };
+  Password: '*', IsHidden: '1', RealName: REALNAME };
+const NATIVE = new Set(['IsHidden']);
+// The record exactly as `dscl -plist . -read /Users/_cortados-office` printed it on the Air after the
+// stopped --apply of 2026-11-23 (every attribute set, no AuthenticationAuthority).
+const HALF_CREATED = join(HERE, 'fixtures', 'dscl-half-created-cortados-office.plist');
 
-const FAKE_DSCL = `#!/bin/bash
-# fake dscl: ". -list /Users UniqueID" and ". -read /Users/NAME [KEY]" over $FAKE/users/NAME files
-shift
-case "$1" in
-  -list) for f in "$FAKE"/users/*; do [ -e "$f" ] || continue
-           echo "$(basename "$f") $(awk -F': ' '$1 == "UniqueID" { print $2 }' "$f")"; done ;;
-  -read) f="$FAKE/users/\${2#/Users/}"
-         [ -f "$f" ] || { echo "DS Error: -14136 (eDSRecordNotFound)" >&2; exit 56; }
-         if [ -n "$3" ]; then grep "^$3:" "$f" || { echo "No such key: $3" >&2; exit 181; }; else cat "$f"; fi ;;
-  *) echo "fake dscl: unexpected $*" >&2; exit 99 ;;
-esac
+// The fake behaves as the real dscl does (macOS 26.6.2): a missing record is DS Error -14136, exit 56;
+// `-plist . -read /Users/U KEY...` prints a plist dict holding only the keys present (`<dict/>` when
+// none), exit 0; the text form prints "No such key: KEY" on stderr and STILL exits 0 (the bug of #77).
+// Users are plist records in $FAKE/users/NAME, keys prefixed as dscl prefixes them.
+const FAKE_DSCL = `#!/usr/bin/env python3
+import os, plistlib, sys
+fake = os.environ["FAKE"]
+argv = sys.argv[1:]
+plist = argv[:1] == ["-plist"]
+if plist:
+    argv = argv[1:]
+def load(name):
+    try:
+        with open(os.path.join(fake, "users", name), "rb") as f:
+            return plistlib.load(f)
+    except FileNotFoundError:
+        sys.stderr.write("<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)\\n"); sys.exit(56)
+def short(k):
+    return k.split(":", 1)[1] if k.startswith("dsAttrType") else k
+def override(name):
+    # $FAKE/NAME, when present, holds "STATUS|STDOUT|STDERR" (a literal backslash-n is a newline) and replaces the answer
+    path = os.path.join(fake, name)
+    if os.path.exists(path):
+        st, out, err = open(path).read().rstrip("\\n").split("|", 2)
+        sys.stdout.write(out.replace("\\\\n", "\\n")); sys.stderr.write(err.replace("\\\\n", "\\n")); sys.exit(int(st))
+if argv[:4] == [".", "-list", "/Users", "UniqueID"] and not plist:
+    override("list-override")
+    # a real directory always holds the system accounts (captured: root 0, daemon 1, the _ accounts)
+    print("daemon                   1")
+    print("root                     0")
+    for n in sorted(os.listdir(os.path.join(fake, "users"))):
+        for k, v in load(n).items():
+            if short(k) == "UniqueID":
+                print(n, v[0])
+elif argv[:2] == [".", "-read"] and len(argv) >= 3 and argv[2].startswith("/Users/"):
+    if os.path.exists(os.path.join(fake, "fail-plist")) and plist and len(argv) > 3:
+        sys.stderr.write("<dscl_cmd> DS Error: -14987 (eDSPermissionError)\\n"); sys.exit(40)
+    if not plist:
+        override("read-override")
+    rec, keys = load(argv[2][len("/Users/"):]), argv[3:]
+    got = {k: v for k, v in rec.items() if not keys or short(k) in keys or k in keys}
+    if plist:
+        sys.stdout.buffer.write(plistlib.dumps(got))
+    else:
+        for k, v in got.items():
+            print("%s: %s" % (k, " ".join(v)))
+        for k in keys:
+            if not any(short(g) == k or g == k for g in got):
+                sys.stderr.write("No such key: %s\\n" % k)
+else:
+    sys.stderr.write("fake dscl: unexpected %s\\n" % sys.argv[1:]); sys.exit(99)
 `;
 const FAKE_DSEDITGROUP = `#!/bin/bash
-# fake dseditgroup: "-o checkmember -m NAME admin" -> 0 when NAME is listed in $FAKE/admins
+# fake dseditgroup, answering as the real one does (captured on the Air, macOS 26):
+# "-o checkmember -m NAME admin" -> exit 0 "yes NAME is a member of admin" when NAME is listed in
+# $FAKE/admins, else exit 67 "no NAME is NOT a member of admin". $FAKE/dsedit-override, when present,
+# holds "STATUS|STDOUT|STDERR" and replaces the answer (failures, unexpected output).
 [ "$1 $2 $3" = "-o checkmember -m" ] || { echo "fake dseditgroup: unexpected $*" >&2; exit 99; }
-grep -qx "$4" "$FAKE/admins" 2>/dev/null
+if [ -f "$FAKE/dsedit-override" ]; then
+  IFS='|' read -r st out err < "$FAKE/dsedit-override"
+  [ -n "$out" ] && echo "$out"; [ -n "$err" ] && echo "$err" >&2; exit "$st"
+fi
+if grep -qx "$4" "$FAKE/admins" 2>/dev/null; then echo "yes $4 is a member of $5"; exit 0; fi
+echo "no $4 is NOT a member of $5"; exit 67
 `;
 
-async function fakeHost(t, users, admins = []) {
+const xml = v => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// attrs: short name -> value or [values]; a key already holding a dsAttrType prefix is kept as given
+function plistRecord(attrs) {
+  const body = Object.entries(attrs).map(([k, v]) => {
+    const key = k.startsWith('dsAttrType') ? k : `dsAttrType${NATIVE.has(k) ? 'Native' : 'Standard'}:${k}`;
+    const vals = (Array.isArray(v) ? v : [v]).map(x => `\t\t<string>${xml(x)}</string>`).join('\n');
+    return `\t<key>${xml(key)}</key>\n\t<array>\n${vals}\n\t</array>`;
+  }).join('\n');
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" ` +
+    `"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n${body}\n</dict>\n</plist>\n`;
+}
+
+async function fakeHost(t, users, admins = [], { failPlist = false, list, read } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'office-deploy-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   await mkdir(join(dir, 'bin')); await mkdir(join(dir, 'users'));
   await writeFile(join(dir, 'bin', 'dscl'), FAKE_DSCL); await chmod(join(dir, 'bin', 'dscl'), 0o755);
   await writeFile(join(dir, 'bin', 'dseditgroup'), FAKE_DSEDITGROUP); await chmod(join(dir, 'bin', 'dseditgroup'), 0o755);
   for (const [name, attrs] of Object.entries(users)) {
-    await writeFile(join(dir, 'users', name), Object.entries(attrs).map(([k, v]) => `${k}: ${v}`).join('\n') + '\n');
+    await writeFile(join(dir, 'users', name), typeof attrs === 'string' ? attrs : plistRecord(attrs));
   }
   await writeFile(join(dir, 'admins'), admins.join('\n') + '\n');
+  if (failPlist) await writeFile(join(dir, 'fail-plist'), '');
+  if (list !== undefined) await writeFile(join(dir, 'list-override'), list + '\n');
+  if (read !== undefined) await writeFile(join(dir, 'read-override'), read + '\n');
   return dir;
 }
 function checkRole(dir, { name, uid, home } = ROLE) {
   const r = spawnSync('bash', ['-c', '. "$LIB"; check_role "$@"', 'check', name, uid, home], {
-    env: { PATH: `${join(dir, 'bin')}:/usr/bin:/bin`, FAKE: dir, LIB, ROLE_GID: '20', ROLE_SHELL: '/usr/bin/false' },
+    env: { PATH: `${join(dir, 'bin')}:/usr/bin:/bin`, FAKE: dir, LIB, ROLE_GID: '20', ROLE_SHELL: '/usr/bin/false',
+      ROLE_REALNAME: REALNAME },
     encoding: 'utf8' });
   return { code: r.status, out: r.stdout.trim(), err: r.stderr.trim() };
+}
+function dscl(dir, ...args) {
+  const r = spawnSync(join(dir, 'bin', 'dscl'), args, { env: { PATH: '/usr/bin:/bin', FAKE: dir }, encoding: 'utf8' });
+  return { code: r.status, out: r.stdout, err: r.stderr };
 }
 
 test('role check: a free name and UID is created; an exact role account is reused', async t => {
@@ -81,6 +155,7 @@ test('role check: a reused account must have the home, disabled login and shell 
     [{ Password: '********' }, /password is not '\*'/],
     [{ AuthenticationAuthority: ';ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>' }, /AuthenticationAuthority/],
     [{ IsHidden: '0' }, /not hidden/],
+    [{ RealName: 'Someone' }, /RealName is not/],
     [{ PrimaryGroupID: '80' }, /primary group is not 20/],
   ];
   for (const [patch, why] of cases) {
@@ -92,6 +167,84 @@ test('role check: a reused account must have the home, disabled login and shell 
   assert.match(checkRole(await fakeHost(t, { [ROLE.name]: noShell })).err, /shell is not/);
   const admin = checkRole(await fakeHost(t, { [ROLE.name]: GOOD }, [ROLE.name]));
   assert.equal(admin.code, 1); assert.match(admin.err, /is an admin/);
+});
+
+test('role check: "not an admin" only on dseditgroup\'s exact confirmed negative (#77 fix round 1)', async t => {
+  const N = ROLE.name;
+  const run = async override => {
+    const dir = await fakeHost(t, { [N]: GOOD });
+    if (override !== undefined) await writeFile(join(dir, 'dsedit-override'), override + '\n');
+    return checkRole(dir);
+  };
+  // captured on the Air: exit 67, stdout "no NAME is NOT a member of admin", stderr empty
+  assert.deepEqual(await run(), { code: 0, out: 'reuse', err: '' });
+  assert.deepEqual(await run(`67|no ${N} is NOT a member of admin|`), { code: 0, out: 'reuse', err: '' });
+  // direct member (captured: exit 0 "yes NAME is a member of admin")
+  let r = await run(`0|yes ${N} is a member of admin|`);
+  assert.equal(r.code, 1); assert.equal(r.out, ''); assert.match(r.err, /is an admin/);
+  // nested member: dseditgroup resolves nested groups and answers the same way (captured: root, a member
+  // of com.apple.access_ssh only through its nested admin group, gets exit 0 "yes root is a member ...")
+  r = checkRole(await fakeHost(t, { [N]: GOOD }, [N]));
+  assert.equal(r.code, 1); assert.match(r.err, /is an admin/);
+  // failures and unexpected answers refuse, never "reuse"
+  for (const o of [
+    '2||dseditgroup: directory services unavailable',      // the reviewer's case
+    '64||Unable to find the user record',                   // captured for an unknown user
+    '1|no ' + N + ' is NOT a member of admin|',             // right text, wrong status
+    '67||',                                                 // right status, no text
+    '67|no someone-else is NOT a member of admin|',         // another user's answer
+    '67|no ' + N + ' is not a member of admin|',            // changed wording
+    '0||',                                                  // success with no answer
+    '0|maybe|',                                             // unexpected output on success
+  ]) {
+    r = await run(o);
+    assert.equal(r.code, 1, o); assert.equal(r.out, '', o);
+    assert.match(r.err, o.startsWith('0|') ? /cannot establish that .* is not an admin/ : /cannot establish/, o);
+  }
+});
+
+test('the fake dscl answers as the real one does, including the exit 0 on "No such key" (#77)', async t => {
+  const dir = await fakeHost(t, { [ROLE.name]: await readFile(HALF_CREATED, 'utf8') });
+  // captured on the Air: stdout "", stderr "No such key: AuthenticationAuthority", exit 0
+  assert.deepEqual(dscl(dir, '.', '-read', `/Users/${ROLE.name}`, 'AuthenticationAuthority'),
+    { code: 0, out: '', err: 'No such key: AuthenticationAuthority\n' });
+  const p = dscl(dir, '-plist', '.', '-read', `/Users/${ROLE.name}`, 'AuthenticationAuthority');
+  assert.equal(p.code, 0); assert.match(p.out, /<dict\/>/);
+  assert.equal(dscl(dir, '.', '-read', '/Users/_cortados-claw3d').code, 56);
+});
+
+test('role check: an absent AuthenticationAuthority passes; ShadowHash, Kerberos, SecureToken or an unreadable record refuse (#77)', async t => {
+  // the real half-created record from the Air: every attribute as specified, no authority -> adopted
+  assert.deepEqual(checkRole(await fakeHost(t, { [ROLE.name]: await readFile(HALF_CREATED, 'utf8') })),
+    { code: 0, out: 'reuse', err: '' });
+  const refused = [
+    [';ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2,SRP-RFC5054-4096-SHA512-PBKDF2>'],
+    [';Kerberosv5;;_cortados-office@LKDC:SHA1.0123456789ABCDEF;LKDC:SHA1.0123456789ABCDEF;'],
+    [';ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>', ';SecureToken;', ';Kerberosv5;;x@LKDC:SHA1.00;LKDC:SHA1.00;'],
+    [''],
+  ];
+  for (const aa of refused) {
+    const r = checkRole(await fakeHost(t, { [ROLE.name]: { ...GOOD, AuthenticationAuthority: aa } }));
+    assert.equal(r.code, 1, JSON.stringify(aa)); assert.equal(r.out, '');
+    assert.match(r.err, /has an AuthenticationAuthority/);
+  }
+  const unreadable = checkRole(await fakeHost(t, { [ROLE.name]: GOOD }, [], { failPlist: true }));
+  assert.equal(unreadable.code, 1); assert.equal(unreadable.out, '');
+});
+
+test('role check: a re-run adopts the account a stopped --apply left behind only when it matches (#77)', async t => {
+  // adopted: exactly the spec, written as dscl -create writes it
+  assert.equal(checkRole(await fakeHost(t, { [ROLE.name]: GOOD })).out, 'reuse');
+  // never adopted: a step that did not run (no Password, no IsHidden) or a value that differs
+  const { Password, ...noPassword } = GOOD; const { IsHidden, ...notHidden } = GOOD;
+  for (const [rec, why] of [[noPassword, /password is not/], [notHidden, /not hidden/],
+    [{ ...GOOD, RealName: 'Other' }, /RealName is not/], [{ ...GOOD, UserShell: '/bin/sh' }, /shell is not/]]) {
+    const r = checkRole(await fakeHost(t, { [ROLE.name]: rec }));
+    assert.equal(r.code, 1); assert.equal(r.out, ''); assert.match(r.err, why);
+  }
+  // the second role user, never created, is still "create" next to the adopted first one
+  assert.equal(checkRole(await fakeHost(t, { [ROLE.name]: GOOD }),
+    { name: '_cortados-claw3d', uid: '481', home: '/opt/cortados-office/home/studio' }).out, 'create');
 });
 
 function portState(json, port = '8446', target = 'http://127.0.0.1:3000') {
@@ -241,9 +394,10 @@ async function txHost(t, { upgrade }) {
   }
   return D;
 }
-function runTx(D, fail = '', failAlways = '', prelude = '') {
+function runTx(D, fail = '', failAlways = '', prelude = '', unknown = '') {
   const r = spawnSync('/bin/bash', [TX_HARNESS], {
-    env: { PATH: '/usr/bin:/bin', LIB, FAKE: D, FAIL: fail, FAIL_ALWAYS: failAlways, PRELUDE: prelude }, encoding: 'utf8' });
+    env: { PATH: '/usr/bin:/bin', LIB, FAKE: D, FAIL: fail, FAIL_ALWAYS: failAlways, PRELUDE: prelude, UNKNOWN: unknown },
+    encoding: 'utf8' });
   return { status: r.status, out: r.stdout.trim(), err: r.stderr };
 }
 async function snapshot(D) {
@@ -315,4 +469,238 @@ test('activation: a rollback that cannot restart the old daemon reports 2 (inves
   const s = await snapshot(D);
   assert.deepEqual({ ...s, daemons: undefined }, { ...OLD, daemons: undefined });   // files and links restored anyway
   assert.deepEqual(s.daemons, { bridge: OLD.daemons.bridge });
+});
+
+// ---- fix round 2 (#77): a lookup that failed is never a safe answer --------------------------------
+// Captured read-only on the Air (macOS 26), 2026-11-23:
+//   dscl . -read /Users/nosuchuser_xyz123        exit 56, stdout "", stderr "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)"
+//   dscl . -list /Users UniqueID                 exit 0, "NAME<spaces>UID" per line (134 lines)
+//   dscl . -list /Nosuch                         exit 185, "<dscl_cmd> DS Error: -14009 (eDSUnknownNodeName)"
+//   launchctl print system/com.nosuch.xyz        exit 113, stderr 'Bad request.\nCould not find service "com.nosuch.xyz" in domain for system'
+const NOT_FOUND = '56||<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)';
+
+test('role check: create only on a confirmed not-found and a successfully read, free UID (fix round 2)', async t => {
+  // the confirmed not-found signature, explicitly: create
+  assert.deepEqual(checkRole(await fakeHost(t, {}, [], { read: NOT_FOUND })), { code: 0, out: 'create', err: '' });
+  // UID taken by another user, the name confirmed absent: refused
+  let r = checkRole(await fakeHost(t, { someone: GOOD }, [], { read: NOT_FOUND }));
+  assert.equal(r.code, 1); assert.equal(r.out, ''); assert.match(r.err, /UID 480 is taken by 'someone'/);
+  // the UID list fails or answers unexpectedly: refused, never "UID free"
+  for (const list of [
+    '2||DS Error: directory services unavailable',               // the reviewer's case
+    '185||<dscl_cmd> DS Error: -14009 (eDSUnknownNodeName)',      // captured for a bad node
+    '0||',                                                        // success, but no accounts at all
+    '0|root 0\\nsomeone|',                                        // a line without a UID
+    '0|root 0\\nsomeone 480 481|',                                // more than NAME UID
+    '0|<dict/>|',                                                 // another format entirely
+  ]) {
+    r = checkRole(await fakeHost(t, {}, [], { list }));
+    assert.equal(r.code, 1, list); assert.equal(r.out, '', list);
+    assert.match(r.err, /cannot list the accounts' UIDs/, list);
+  }
+  // the account read fails with anything but the exact not-found signature: refused, never "absent"
+  for (const read of [
+    '2||DS Error: directory services unavailable',                // the reviewer's case
+    '40||<dscl_cmd> DS Error: -14987 (eDSPermissionError)',
+    '56||',                                                        // right status, no message
+    '56||<dscl_cmd> DS Error: -14136 (eDSRecordNotFound) extra',   // changed message
+    '56|RecordName: x|<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)',   // output on stdout too
+    '1||<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)',          // right message, wrong status
+  ]) {
+    r = checkRole(await fakeHost(t, {}, [], { read }));
+    assert.equal(r.code, 1, read); assert.equal(r.out, '', read);
+    assert.match(r.err, /cannot establish whether _cortados-office exists/, read);
+  }
+});
+
+test('the fake dscl\'s not-found matches the captured one, and its overrides answer as given', async t => {
+  const dir = await fakeHost(t, {});
+  assert.deepEqual(dscl(dir, '.', '-read', '/Users/nosuchuser_xyz123'),
+    { code: 56, out: '', err: '<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)\n' });
+  const o = await fakeHost(t, {}, [], { list: '2||boom' });
+  assert.deepEqual(dscl(o, '.', '-list', '/Users', 'UniqueID'), { code: 2, out: '', err: 'boom' });
+});
+
+async function fakeBin(t, name, script) {
+  const dir = await mkdtemp(join(tmpdir(), 'office-bin-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, name), script); await chmod(join(dir, name), 0o755);
+  return dir;
+}
+function libCall(binDir, call, ...args) {
+  const r = spawnSync('bash', ['-c', `. "$LIB"; ${call} "$@"`, 'x', ...args],
+    { env: { PATH: `${binDir}:/usr/bin:/bin`, LIB }, encoding: 'utf8' });
+  return { code: r.status, out: r.stdout.trim() };
+}
+
+test('root_test: yes / no only from test\'s own answer; a refused sudo or a test error is unknown (fix round 2)', async t => {
+  // a fake sudo that runs the command (as the owner) — the real test semantics
+  const ok = await fakeBin(t, 'sudo', '#!/bin/bash\nexec "$@"\n');
+  assert.deepEqual(libCall(ok, 'root_test', '-e', '/bin/sh'), { code: 0, out: 'yes' });
+  assert.deepEqual(libCall(ok, 'root_test', '-e', '/nonexistent/x'), { code: 0, out: 'no' });
+  assert.deepEqual(libCall(ok, 'root_test', '-e', '/x', '-o'), { code: 1, out: '' });          // test's own error (2)
+  // sudo refused (no password / not allowed): exit 1, the same status as "false" from a bare `sudo test`
+  const refused = await fakeBin(t, 'sudo', '#!/bin/bash\necho "sudo: a password is required" >&2\nexit 1\n');
+  assert.deepEqual(libCall(refused, 'root_test', '-e', '/nonexistent/x'), { code: 1, out: '' });
+  const odd = await fakeBin(t, 'sudo', '#!/bin/bash\necho maybe\n');
+  assert.deepEqual(libCall(odd, 'root_test', '-e', '/bin/sh'), { code: 1, out: '' });
+});
+
+test('launchd_state: not loaded only on launchctl\'s captured "Could not find service" (fix round 2)', async t => {
+  const L = 'com.cortados.office-bridge';
+  const fake = (code, err) => fakeBin(t, 'launchctl',
+    `#!/bin/bash\n[ "$1" = print ] || exit 99\nprintf '%s' ${JSON.stringify(err)} >&2\nexit ${code}\n`);
+  const st = dir => libCall(dir, 'launchd_state', L).code;
+  assert.equal(st(await fake(0, '')), 0);
+  assert.equal(st(await fake(113, `Bad request.\nCould not find service "${L}" in domain for system\n`)), 1);
+  assert.equal(st(await fake(113, `Bad request.\nCould not find service "other.label" in domain for system\n`)), 2);
+  assert.equal(st(await fake(113, '')), 2);
+  assert.equal(st(await fake(1, `Could not find service "${L}" in domain for system\n`)), 2);
+  assert.equal(st(await fake(5, 'Input/output error\n')), 2);
+});
+
+test('activation: a daemon or file whose state cannot be read stops the transaction, never reads as absent (fix round 2)', async t => {
+  // before anything changes: nothing changed, the old release keeps running
+  let D = await txHost(t, { upgrade: true });
+  let r = runTx(D, '', '', '', 'loaded:studio');
+  assert.equal(r.out, 'rc=1', r.err); assert.match(r.err, /cannot tell whether studio is loaded/);
+  assert.deepEqual(await snapshot(D), OLD);
+  assert.equal((await readFile(join(D, 'log'), 'utf8')).trim(), '');
+  // an installed file that cannot be checked is never "absent" (whose undo would delete it): rolled back
+  D = await txHost(t, { upgrade: true });
+  r = runTx(D, '', '', '', 'exists:token');
+  assert.equal(r.out, 'rc=1', r.err); assert.match(r.err, /cannot tell whether .*token exists/);
+  assert.deepEqual(await snapshot(D), OLD);
+  // a link that cannot be read is never "absent" (whose undo would remove it): rolled back, link kept
+  D = await txHost(t, { upgrade: true });
+  r = runTx(D, '', '', '', 'readlink:adapter');
+  assert.equal(r.out, 'rc=1', r.err); assert.match(r.err, /switching .*adapter failed/);
+  assert.deepEqual(await snapshot(D), OLD);
+});
+
+test('deploy-air.sh: root checks, daemon state and links go through the tri-state helpers (fix round 2)', async () => {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  assert.ok(!/sudo test /.test(text), 'no bare `sudo test` (a refused sudo reads as false)');
+  assert.ok(!/launchctl print "system\/\$1" >\/dev\/null 2>&1/.test(text), 'no exit-code-only launchctl print');
+  assert.ok(!/fs_readlink\(\) \{ readlink "\$1" 2>\/dev\/null \|\| true; \}/.test(text), 'no readlink failure read as absent');
+  assert.match(text, /as_root_test\(\) \{\n  local a; a="\$\(root_test "\$@"\)" \|\| die /);
+  assert.match(text, /daemon_loaded\(\) \{ launchd_state "\$1"; \}/);
+  const lib = await readFile(LIB, 'utf8');
+  assert.match(lib, /holders="\$\(uid_holders "\$uid"\)" \|\| die /);
+  assert.match(lib, /state="\$\(account_state "\$name"\)" \|\| die /);
+});
+
+// ---- fix round 3 -------------------------------------------------------------------------------
+async function fakeBins(t, scripts) {
+  const dir = await mkdtemp(join(tmpdir(), 'office-bin-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  for (const [name, script] of Object.entries(scripts)) {
+    await writeFile(join(dir, name), script); await chmod(join(dir, name), 0o755);
+  }
+  return dir;
+}
+const SUDO_OK = '#!/bin/bash\nexec "$@"\n';
+const SUDO_REFUSED = '#!/bin/bash\necho "sudo: a password is required" >&2\nexit 1\n';
+// a fake lsof answering as the real one does (captured on macOS 26, lsof 4.91): exit 0 with -Fn
+// field lines, exit 1 with no output when nothing listens
+const lsof = (code, out) => `#!/bin/bash\nprintf '%b' ${JSON.stringify(out)}\nexit ${code}\n`;
+const LOOPBACK = 'p501\nf3\nn127.0.0.1:18789\np502\nf21\nn127.0.0.1:3000\nf22\nn[::1]:3000\n';
+
+test('listeners_loopback_only: loopback only from a successful lsof seeing both ports; anything else fails (r3 finding 1)', async t => {
+  const call = async (sudo, lsofScript) =>
+    libCall(await fakeBins(t, { sudo, lsof: lsofScript }), 'listeners_loopback_only', '18789', '3000');
+  assert.equal((await call(SUDO_OK, lsof(0, LOOPBACK))).code, 0);
+  // the review's reproduction: a refused sudo was "no non-loopback listener"
+  let r = await call(SUDO_REFUSED, lsof(0, LOOPBACK));
+  assert.equal(r.code, 1); assert.match(r.out, /cannot list the listeners/);
+  r = await call(SUDO_OK, lsof(1, ''));                                   // nothing listens: lsof's exit 1
+  assert.equal(r.code, 1); assert.match(r.out, /cannot list the listeners/);
+  r = await call(SUDO_OK, lsof(0, ''));
+  assert.equal(r.code, 1); assert.match(r.out, /no listener/);
+  r = await call(SUDO_OK, lsof(0, 'p501\nf3\nn*:18789\np502\nf21\nn127.0.0.1:3000\n'));   // wildcard
+  assert.equal(r.code, 1); assert.match(r.out, /not loopback-only \(\*\)/);
+  r = await call(SUDO_OK, lsof(0, 'p501\nf3\nn100.64.0.7:3000\np502\nf21\nn127.0.0.1:18789\n'));
+  assert.equal(r.code, 1); assert.match(r.out, /not loopback-only/);
+  r = await call(SUDO_OK, lsof(0, 'p502\nf21\nn127.0.0.1:3000\n'));        // the bridge's port unseen
+  assert.equal(r.code, 1); assert.match(r.out, /no listener seen on port 18789/);
+  // the columnar form the old check parsed, or any other shape, is not an answer
+  r = await call(SUDO_OK, lsof(0, 'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nnode 501 x 3u IPv4 0x1 0t0 TCP 127.0.0.1:3000 (LISTEN)\n'));
+  assert.equal(r.code, 1); assert.match(r.out, /answered unexpectedly/);
+  r = await call(SUDO_OK, lsof(0, LOOPBACK + 'n127.0.0.1:9999\n'));
+  assert.equal(r.code, 1); assert.match(r.out, /unexpected port/);
+  r = await call(SUDO_OK, lsof(2, LOOPBACK));                              // an lsof error, output or not
+  assert.equal(r.code, 1);
+});
+
+// office_healthy, cut from deploy-air.sh as written and run with fakes: every other check passes, so
+// the outcome is the listener check's alone
+async function officeHealthy(t, sudo, lsofScript) {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  const m = text.match(/^http_code\(\) \{.*\n^office_healthy\(\) \{[\s\S]*?\n\}\n/m);
+  assert.ok(m, 'office_healthy found');
+  const bin = await fakeBins(t, {
+    sudo, lsof: lsofScript,
+    launchctl: '#!/bin/bash\necho "system/x = {"\necho "\tstate = running"\necho "}"\n',
+    curl: '#!/bin/bash\nfor a; do u="$a"; done\ncase "$u" in *:18789/) printf 426 ;; *:3000/) printf 401 ;; */cortados-login) printf 200 ;; esac\n',
+  });
+  const r = spawnSync('bash', ['-c', `set -euo pipefail; . "$LIB"; BRIDGE_LABEL=b STUDIO_LABEL=s BRIDGE_PORT=18789 STUDIO_PORT=3000
+${m[0]}
+rc=0; why="$(office_healthy)" || rc=$?; echo "rc=$rc $why"`],
+  { env: { PATH: `${bin}:/usr/bin:/bin`, LIB }, encoding: 'utf8' });
+  return r.stdout.trim();
+}
+test('deploy-air.sh office_healthy: a refused sudo lsof fails the health check (rollback), never passes it (r3 finding 1)', async t => {
+  assert.equal(await officeHealthy(t, SUDO_OK, lsof(0, LOOPBACK)), 'rc=0');
+  assert.match(await officeHealthy(t, SUDO_REFUSED, lsof(0, LOOPBACK)), /^rc=1 cannot list the listeners/);
+  assert.match(await officeHealthy(t, SUDO_OK, lsof(1, '')), /^rc=1 /);
+  assert.match(await officeHealthy(t, SUDO_OK, lsof(0, 'p1\nf3\nn*:3000\np2\nf3\nn127.0.0.1:18789\n')), /^rc=1 a listener on port 3000 is not loopback-only/);
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  assert.ok(!/sudo lsof/.test(text), 'lsof runs only in deploy-lib.sh (listeners_loopback_only)');
+  assert.ok(!/\| *grep -q/.test(text), 'no `| grep -q` under pipefail (SIGPIPE reads as failure)');
+});
+
+test('link_target: empty only on confirmed absence; a failed or impossible read is an error (r3 finding 2)', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'office-links-'));
+  t.after(async () => { await chmod(join(dir, 'locked'), 0o755).catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+  const { symlink } = await import('node:fs/promises');
+  await mkdir(join(dir, 'builds', 'old'), { recursive: true });
+  await symlink(join(dir, 'builds', 'old'), join(dir, 'current'));
+  await symlink(join(dir, 'nowhere'), join(dir, 'dangling'));
+  await writeFile(join(dir, 'plain'), 'x');
+  await mkdir(join(dir, 'locked')); await symlink(join(dir, 'builds', 'old'), join(dir, 'locked', 'current'));
+  await chmod(join(dir, 'locked'), 0o000);
+  const none = await fakeBins(t, {});
+  const lt = (p, bin = none) => libCall(bin, 'link_target', p);
+  assert.deepEqual(lt(join(dir, 'current')), { code: 0, out: join(dir, 'builds', 'old') });
+  assert.deepEqual(lt(join(dir, 'dangling')), { code: 0, out: join(dir, 'nowhere') });
+  assert.deepEqual(lt(join(dir, 'absent')), { code: 0, out: '' });                       // fresh install
+  assert.deepEqual(lt(join(dir, 'no', 'such', 'current')), { code: 0, out: '' });        // nor its directory
+  assert.equal(lt(join(dir, 'plain')).code, 1);                                          // not a link
+  assert.equal(lt(join(dir, 'builds')).code, 1);
+  assert.equal(lt(join(dir, 'locked', 'current')).code, 1);                              // unsearchable: not "absent"
+  const broken = await fakeBins(t, { readlink: '#!/bin/bash\necho "readlink: I/O error" >&2\nexit 1\n' });
+  assert.equal(lt(join(dir, 'current'), broken).code, 1);                                // readlink failed
+  const empty = await fakeBins(t, { readlink: '#!/bin/bash\nexit 0\n' });
+  assert.equal(lt(join(dir, 'current'), empty).code, 1);
+});
+
+test('deploy-air.sh: the prune\'s rollback targets and every planning read fail closed (r3 finding 2 + sweep)', async () => {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  assert.ok(!/readlink[^\n]*\|\| true/.test(text), 'no readlink failure read as "no link"');
+  assert.match(text, /CURRENT_BUILD="\$\(link_target "\$ROOT\/claw3d\/current"\)" \\\n  \|\| die /);
+  assert.match(text, /PREVIOUS_ADAPTER="\$\(link_target "\$ROOT\/adapter"\)" \\\n  \|\| die /);
+  assert.match(text, /fs_readlink\(\) \{ link_target "\$1"; \}/);
+  // both are read before the first change (the order test above finds that line)
+  const lines = text.split('\n');
+  const first = lines.findIndex(l => /^step "1\. /.test(l));
+  assert.ok(lines.findIndex(l => /^CURRENT_BUILD=/.test(l)) < first && lines.findIndex(l => /^PREVIOUS_ADAPTER=/.test(l)) < first);
+  // the prune keeps exactly the new and those two
+  assert.match(text, /"\$b" != "\$BUILD" && "\$b" != "\$CURRENT_BUILD"/);
+  assert.match(text, /"\$a" != "\$ADAPTER_DIR" && "\$a" != "\$PREVIOUS_ADAPTER"/);
+  // a failed git status is not a clean checkout
+  assert.ok(!/\[\[ -z "\$\(git /.test(text));
+  assert.match(text, /DIRTY="\$\(git -C "\$REPO" status --porcelain -- integrations\/office-claw3d\)" \|\| die /);
+  // the remaining `|| true`s are the ones the sweep accepted (each feeds a positive match or is display-only)
+  const ors = lines.filter(l => /\|\| true/.test(l)).map(l => l.trim());
+  assert.equal(ors.length, 9, ors.join('\n'));
 });

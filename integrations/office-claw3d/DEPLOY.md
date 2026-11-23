@@ -86,6 +86,15 @@ bridge user. The bridge refuses to start if the two secrets are equal.
   `/opt/cortados-office/home/`, shell `/usr/bin/false`, password `*`, no `AuthenticationAuthority`
   (no password or token login), hidden, not an admin. Anything else aborts and names the
   attribute. (The checks are `check_role` in `deploy-lib.sh`, tested with a fake `dscl`.)
+- **A failed lookup is never a safe answer.** An account counts as missing only on `dscl`'s exact
+  not-found answer (exit 56, `DS Error: -14136 (eDSRecordNotFound)`), and a UID as free only from a
+  successful, fully parsed `dscl . -list /Users UniqueID`; root file checks (`root_test`) answer only
+  from `test` itself, never a refused `sudo`; a daemon is "not loaded" only on `launchctl`'s
+  `Could not find service` (exit 113); the rollback build and adapter the prune keeps are read with
+  `link_target` (empty only when confirmed absent in a searchable directory); the health check's
+  "loopback only" needs a successful `sudo lsof` seeing a loopback listener on each port
+  (`listeners_loopback_only`). Anything else aborts before any change, or fails (and rolls back) the
+  activation step that needed it.
 - **An existing install.** `/opt/cortados-office` must be root:wheel 0755 with the layout this
   script makes: `adapter` and `node` links, `claw3d/current` a link into `claw3d/builds/`, homes
   0700 per role user, launchers and plists root-owned. Anything else (a plain directory where a
