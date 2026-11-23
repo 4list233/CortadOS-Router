@@ -147,7 +147,7 @@ class GateSwitchTests(Home):
                                 "training": False, "models_loaded": [TAG], "ollama": "up", "backend": "ollama",
                                 "capacity": {"backend": "ollama", "limit": None, "inflight": 0, "retiring": 0,
                                              "draining": False, "owner": None,
-                                             "pressure": None, "reason": "no governor", "reserved_bytes": None,
+                                             "pressure": None, "reason": "no governor", "reserved_bytes": None, "budget_bytes": None,
                                              "free_bytes": None, "fit_tokens": None, "free_tokens": None,
                                              "image_inflight": None, "image_limit": None, "vision": None,
                                              "fence": None}})
@@ -278,7 +278,7 @@ class ProviderSwitchTests(EndpointHarness):
                                           "power": "battery", "training": False, "ollama": "up",
                                           "models_loaded": [TAG], "backend": "ollama",
                                           "capacity": {"limit": None, "inflight": 0, "owner": None, "pressure": None,
-                                                       "reason": "no governor", "reserved_bytes": None,
+                                                       "reason": "no governor", "reserved_bytes": None, "budget_bytes": None,
                                                        "free_bytes": None, "fit_tokens": None,
                                                        "free_tokens": None}}])
         raw = json.dumps(data)
@@ -357,12 +357,12 @@ class ProviderSwitchTests(EndpointHarness):
                 "ollama": "<b>", "models_loaded": ["ok:latest", "bad\nname", 7], "token": TOKEN,
                 "backend": "<script>", "capacity": {"limit": True, "inflight": -1, "owner": "away", "pressure": "high",
                                                    "reason": "y" * 500, "extra": TOKEN, "reserved_bytes": -5,
-                                                   "free_bytes": "lots", "fit_tokens": 2 ** 60, "free_tokens": 1.5}}
+                                                   "budget_bytes": -1, "free_bytes": "lots", "fit_tokens": 2 ** 60, "free_tokens": 1.5}}
         self.assertEqual(local_switch._clean(evil),
                          {"switch": "unknown", "allowed": None, "reason": None, "power": "unknown", "training": None,
                           "ollama": "unknown", "models_loaded": ["ok:latest"], "backend": "unknown",
                           "capacity": {"limit": None, "inflight": None, "owner": None, "pressure": None,
-                                       "reason": None, "reserved_bytes": None, "free_bytes": None, "fit_tokens": None,
+                                       "reason": None, "reserved_bytes": None, "budget_bytes": None, "free_bytes": None, "fit_tokens": None,
                                        "free_tokens": None}})
         self.assertIsNone(local_switch._clean({"capacity": "full"})["capacity"])
 

@@ -1,0 +1,35 @@
+diff --git a/src/features/agents/operations/agentFleetHydrationDerivation.ts b/src/features/agents/operations/agentFleetHydrationDerivation.ts
+index 3b33144..a664bc1 100644
+--- a/src/features/agents/operations/agentFleetHydrationDerivation.ts
++++ b/src/features/agents/operations/agentFleetHydrationDerivation.ts
+@@ -1,5 +1,8 @@
+ import { buildAgentMainSessionKey } from "@/lib/gateway/GatewayClient";
+-import { createDefaultAgentAvatarProfile } from "@/lib/avatars/profile";
++import {
++  createDefaultAgentAvatarProfile,
++  normalizeAgentAvatarProfile,
++} from "@/lib/avatars/profile";
+ import { resolveConfiguredModelKey, type GatewayModelPolicySnapshot } from "@/lib/gateway/models";
+ import {
+   resolveAgentAvatarProfile,
+@@ -30,6 +33,8 @@ type AgentsListResult = {
+       emoji?: string;
+       avatar?: string;
+       avatarUrl?: string;
++      // CortadOS Office: a gateway-suggested 3D figure (normalized; a saved Studio profile wins).
++      avatarProfile?: unknown;
+     };
+   }>;
+ };
+@@ -221,7 +226,10 @@ export const deriveHydrateAgentFleetResult = (
+       input.settings && gatewayKey ? resolveAgentAvatarProfile(input.settings, gatewayKey, agent.id) : null;
+     const persistedSeed =
+       input.settings && gatewayKey ? resolveAgentAvatarSeed(input.settings, gatewayKey, agent.id) : null;
+-    const avatarProfile = persistedProfile ?? defaultAvatarProfile;
++    const gatewayAvatarProfile = agent.identity?.avatarProfile
++      ? normalizeAgentAvatarProfile(agent.identity.avatarProfile, agent.id)
++      : null;
++    const avatarProfile = persistedProfile ?? gatewayAvatarProfile ?? defaultAvatarProfile;
+     const avatarSeed = persistedSeed ?? avatarProfile.seed ?? agent.id;
+     const avatarUrl = resolveAgentAvatarUrl(agent);
+     const name = resolveAgentName(agent);

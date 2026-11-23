@@ -83,7 +83,7 @@ def learn(days: int = 14) -> dict:
     series: dict[str, list[tuple[float, float]]] = defaultdict(list)
     hist = STATE / "scarcity-history.jsonl"
     # A fresh home has no history until the first sample's append, which runs after this learn: no data, not an error.
-    for line in (hist.read_text().splitlines() if hist.exists() else []):
+    for line in (hist.read_text().split("\n") if hist.exists() else []):   # "\n" only: splitlines() also cuts at U+2028/U+2029/\x85 inside a JSON string
         try:
             r = json.loads(line)
         except Exception:

@@ -344,9 +344,9 @@ def main(argv: list[str] | None = None) -> int:
     rows_p = sweep_path.parent / "sweep" / a.expect / "holdout-rows.jsonl"
     try:
         sweep = json.loads(sweep_path.read_text())
-        rows = [json.loads(x) for x in rows_p.read_text().splitlines() if x.strip()]
+        rows = [json.loads(x) for x in rows_p.read_text().split("\n") if x.strip()]   # "\n" only: splitlines() also cuts at U+2028/U+2029/\x85 inside a JSON string
         reqs = {}
-        for x in Path(a.requests).read_text().splitlines():
+        for x in Path(a.requests).read_text().split("\n"):   # "\n" only: splitlines() also cuts at U+2028/U+2029/\x85 inside a JSON string
             if x.strip():
                 o = json.loads(x)
                 reqs[o["id"]] = o

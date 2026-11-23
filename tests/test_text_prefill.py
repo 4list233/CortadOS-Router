@@ -45,7 +45,8 @@ def prefill_terms(p: int, chunk: int = 256) -> dict:
 
 def set_terms(tokens: list, prompts: list, high_water: int = 0) -> dict:
     n, m, p = len(tokens), max(max(tokens), high_water) + 256, max(prompts)
-    out = {"kv": 2 * n * m * KV_PER_TOKEN, "decode": 4 * HQ * n * m * A + n * m,
+    # the padded batch once plus one full-attention layer's replaced slice of it (2026-11-22 correction)
+    out = {"kv": n * m * KV_PER_TOKEN + n * m * KV_PER_TOKEN // 16, "decode": 4 * HQ * n * m * A + n * m,
            "fixed": n * (2 * STATE + V * (A + 8)),
            "prefill": max(sum(prefill_terms(p).values()) for p in prompts), "buffer_cache": GIB // 2,
            # one largest buffer over MLX's cache limit: a chunk's scores, or one layer's K of the padded batch
@@ -84,7 +85,7 @@ class TextReservationByTermTests(unittest.TestCase):
     def test_the_numbers_the_docs_give(self):
         gib = {p: round(local_governor.text_set_bytes(self.cfg, [local_governor._text_load(self.cfg, p, p)])["total"]
                         / GIB, 2) for p in (1024, 32768, 65536, 131072)}
-        self.assertEqual(gib, {1024: 1.71, 32768: 6.88, 65536: 12.78, 131072: 24.57})
+        self.assertEqual(gib, {1024: 1.71, 32768: 4.99, 65536: 9.01, 131072: 17.06})
         scores = {p: local_governor.text_prefill_bytes(self.cfg, p)["scores"] / GIB for p in (32768, 131072)}
         self.assertEqual(scores, {32768: 1.5, 131072: 6.0})        # 4 buffers of 24 x 256 x P x 2 bytes
         # upstream's 2,048-token step would be 8 times that: 48 GiB of scores at 128k
@@ -123,13 +124,13 @@ class TextReservationByTermTests(unittest.TestCase):
         long, short = (local_governor._text_load(self.cfg, 131072, 131072),
                        local_governor._text_load(self.cfg, 2048, 2048))
         both = local_governor.text_set_bytes(self.cfg, [long, short])
-        self.assertEqual(both["kv"], 2 * 2 * (131072 + 256) * KV_PER_TOKEN)   # the short row is 128k wide too
+        self.assertEqual(both["kv"], 2 * (131072 + 256) * KV_PER_TOKEN * 17 // 16)  # the short row is 128k wide too
         self.assertEqual(both["prefill"], long.prefill)                       # one prefill at a time
         self.assertEqual(both["buffer_cache"], GIB // 2)                      # once per node
         self.assertEqual(both["cache_overshoot"], HQ * 256 * 131072 * A)      # the long prompt's score buffer
         self.assertEqual(local_governor.text_set_bytes(self.cfg, []), dict.fromkeys(both, 0))
         self.assertEqual(local_governor.text_set_bytes(self.cfg, [short], 131072)["kv"],
-                         2 * (131072 + 256) * KV_PER_TOKEN)                # a departed long row's width
+                         (131072 + 256) * KV_PER_TOKEN * 17 // 16)         # a departed long row's width
 
     def test_config_keys(self):
         for bad in ({"kv_copies": 1}, {"kv_copies": 0}, {"text_score_buffers": 0}, {"buffer_cache_bytes": 0},
@@ -182,14 +183,21 @@ class TextAdmissionTests(unittest.TestCase):
         self.assertIsNotNone(self.a.try_acquire(load=self.a.text_load(100, 16))[0])
 
     def test_a_full_context_prompt_is_refused_413_where_it_cannot_fit(self):
-        six = local_governor.Admission(FixedGovernor(model={"weights_bytes": int(22.4 * GIB), "idle_cap": 6}))
-        ticket, snap = six.try_acquire(load=six.text_load(131072, 1))
-        self.assertEqual((ticket, snap["refused"]), (None, "too_large"))   # never fits: non-retryable at the gate
-        self.assertEqual(six.inflight, 0)
-        self.assertEqual(snap["fit_tokens"], 92337)                   # the most the 6-bit copy admits, alone
-        self.assertIsNotNone(six.try_acquire(load=six.text_load(92337, 1))[0])   # 92,337 + 1 out
-        six = local_governor.Admission(FixedGovernor(model={"weights_bytes": int(22.4 * GIB), "idle_cap": 6}))
-        self.assertEqual(six.try_acquire(load=six.text_load(92338, 1))[1]["refused"], "too_large")
+        # the 6-bit copy (22.4 GB of weights) while the owner works: 9.85 GiB beside the weights (since the 2026-11-22
+        # KV correction a full-context turn, 17.06 GiB, fits its 17.6 GiB idle budget)
+        def six():
+            return local_governor.Admission(FixedGovernor(idle_s=0.0,
+                                                          model={"weights_bytes": int(22.4 * GIB), "idle_cap": 6}))
+        a = six()
+        ticket, snap = a.try_acquire(load=a.text_load(131072, 1))
+        self.assertEqual((ticket, snap["refused"]), (None, "too_large"))   # does not fit now: non-retryable
+        self.assertEqual(a.inflight, 0)
+        self.assertEqual(snap["fit_tokens"], 72361)                   # the most the 6-bit copy admits, alone
+        self.assertIsNotNone(a.try_acquire(load=a.text_load(72361, 1))[0])   # 72,361 + 1 out
+        a = six()
+        self.assertEqual(a.try_acquire(load=a.text_load(72362, 1))[1]["refused"], "too_large")
+        idle = local_governor.Admission(FixedGovernor(model={"weights_bytes": int(22.4 * GIB), "idle_cap": 6}))
+        self.assertIsNotNone(idle.try_acquire(load=idle.text_load(131071, 1))[0])
 
     def test_one_load_admitted_twice_is_released_once_each(self):
         load = self.a.text_load(2000, 512)
@@ -712,18 +720,20 @@ class TextSetDrainTests(unittest.TestCase):
         return local_governor.text_room(self.cfg, loads, local_governor.available_bytes(self.cfg))
 
     def test_round3_repro_the_preflight_cannot_keep_the_stale_width_forever(self):
-        # the reviewer's repro: a departed 64k width kept by two short turns, 100 rounds of "the provider's preflight
+        # the reviewer's repro: a departed 64k width kept by two short turns (100k since the 2026-11-22 KV
+        # correction, which counts one layer's replaced copy, not the batch's: at 64k three rows now fit the 25 GiB
+        # either way), 100 rounds of "the provider's preflight
         # skips a third, one short turn finishes, its replacement is admitted". Before: never draining, the
         # high-water 64,001, 17.6 GiB held, free_tokens 0 forever. Now the governor drains on its own state
         tokens = local_governor.request_tokens(self.cfg, 100, 1)
-        t_long, _ = self.a.try_acquire(load=self.a.text_load(64000, 1))
+        t_long, _ = self.a.try_acquire(load=self.a.text_load(100000, 1))
         live = [self.short()[0]]
         t_long.release()
-        # one short turn beside the kept width withholds no room yet (a second row at 64k fits either way)
+        # one short turn beside the kept width withholds no room yet (a second row at 100k fits either way)
         self.assertFalse(self.a.snapshot()["draining"])
         live.append(self.short()[0])
         self.assertTrue(all(live))
-        # two do: a third row at the kept 64k width fits nowhere, while a fresh set has room. The governor drains on
+        # two do: a third row at the kept 100k width fits nowhere, while a fresh set has room. The governor drains on
         # its own state, without any refused POST
         self.assertTrue(self.a._draining)
         recovered = None
@@ -733,7 +743,7 @@ class TextSetDrainTests(unittest.TestCase):
                 t, snap = self.short()
                 self.assertIsNotNone(t, snap.get("reason"))
                 live.append(t)
-                if not self.a._draining and self.a._high_water < 64000:
+                if not self.a._draining and self.a._high_water < 100000:
                     recovered = step
                     break
             else:
@@ -754,14 +764,14 @@ class TextSetDrainTests(unittest.TestCase):
 
     def test_round2_repro_a_refused_turn_still_drains_the_set(self):
         # the direct-admission path (a turn the preflight let through, refused for the stale bytes alone)
-        t_long, _ = self.a.try_acquire(load=self.a.text_load(64000, 1))
+        t_long, _ = self.a.try_acquire(load=self.a.text_load(100000, 1))
         live, _ = self.short()
         t_long.release()
         second, _ = self.short()
         self.assertIsNotNone(second)
         self.a._draining = False                                       # as if the governor had not looked yet
         third, snap = self.short()
-        self.assertEqual((third, snap["refused"], self.a._high_water), (None, "busy", 64001))
+        self.assertEqual((third, snap["refused"], self.a._high_water), (None, "busy", 100001))
         self.assertIn("draining", snap["reason"])
         self.assertTrue(self.a._draining)
         self.assertEqual(snap["free_tokens"], 0)                       # the provider sees no room while draining
@@ -778,9 +788,9 @@ class TextSetDrainTests(unittest.TestCase):
         self.assertEqual(self.a.reserved, local_governor.text_set_bytes(self.cfg, [t.load for t in tickets])["total"])
 
     def test_the_departed_width_stays_reserved_while_its_set_runs(self):
-        # the lazy-free protection: no byte of the departed 64k row is given back while a turn that may share its
+        # the lazy-free protection: no byte of the departed 100k row is given back while a turn that may share its
         # batch runs, drain or no drain
-        long, short = self.a.text_load(64000, 1), self.a.text_load(100, 1)
+        long, short = self.a.text_load(100000, 1), self.a.text_load(100, 1)
         t_long, t_short = self.a.try_acquire(load=long)[0], self.a.try_acquire(load=short)[0]
         t_long.release()
         t2 = self.short()[0]
@@ -815,7 +825,7 @@ class TextSetDrainTests(unittest.TestCase):
             tb = nxt
             self.assertFalse(self.a.snapshot()["draining"])
         # a turn too big for the live set even at its fresh size is plain busy: draining would not admit it
-        big, snap = self.a.try_acquire(load=self.a.text_load(120_000, 4096))
+        big, snap = self.a.try_acquire(load=self.a.text_load(126_000, 4096))
         self.assertEqual((big, snap["refused"]), (None, "busy"))
         self.assertNotIn("draining", snap["reason"])
         self.assertFalse(self.a._draining)
@@ -888,8 +898,9 @@ class PrefixCacheOffTests(GuardBase):
         return copy.__init__
 
     def test_round2_repro_cache_occupancy_cannot_change_the_bound(self):
-        # the reviewer's numbers: a full-context turn reserves 24.57 of 25 GiB, and a 4 GiB prefix pool beside it
-        # would make 28.57. With the cache off there is no pool: the served engine's scheduler holds none, so what
+        # the reviewer's numbers: a full-context turn reserved 24.57 of 25 GiB, and a 4 GiB prefix pool beside it
+        # would make 28.57. Since the 2026-11-22 KV correction it reserves 17.06, and the pool would still put it
+        # over the 17.25 GiB owner-active budget. With the cache off there is no pool: the served engine's scheduler holds none, so what
         # the process holds beyond the weights is the reservation, whatever earlier turns were cached
         rc, err = self.run_main(SERVE_TEXT)
         self.assertEqual(rc, 0, err)
@@ -901,10 +912,10 @@ class PrefixCacheOffTests(GuardBase):
             self.assertIsNone(getattr(sched, attr), attr)
         cfg = local_governor.check_config({})
         full = local_governor.text_set_bytes(cfg, [local_governor.text_load(cfg, 131071, 1)])["total"]
-        self.assertAlmostEqual(full / GIB, 24.57, places=2)
+        self.assertAlmostEqual(full / GIB, 17.06, places=2)
         pool = 0                                                       # no prefix cache: nothing to occupy
-        self.assertLessEqual(full + pool, local_governor.available_bytes(cfg))
-        self.assertGreater(full + 4 * GIB, local_governor.available_bytes(cfg))   # why the pool had to go
+        self.assertLessEqual(full + pool, local_governor.available_bytes(cfg, "active"))
+        self.assertGreater(full + 4 * GIB, local_governor.available_bytes(cfg, "active"))   # why the pool had to go
 
 
 class MlxPythonPinTests(VisionGuardBase):

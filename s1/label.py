@@ -41,7 +41,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from common import DATA, LABELER_MARKER, QUESTIONS, REPO, core, is_claude_teacher, read_jsonl, read_labels, valid_answers
+from common import DATA, LABELER_MARKER, QUESTIONS, REPO, core, dumps_jsonl, is_claude_teacher, read_jsonl, read_labels, valid_answers
 from cortados_router.subagent_mcp import resolve_provider_url, ProviderURLError
 
 STATE = Path.home() / ".cortados"
@@ -360,12 +360,12 @@ def work(job: tuple[str, int, list[dict]]) -> int:
                 continue
             if ONLY:
                 if all(q in a for q in ONLY) and valid_answers({**DEFAULTS, **{q: a[q] for q in ONLY}}):
-                    f.write(json.dumps({"id": batch[a["i"]]["id"], "teacher": model, "sample": sample, "ts": int(time.time()), "override": True,
-                                        "answers": {q: a[q] for q in ONLY}}, ensure_ascii=False) + "\n")
+                    f.write(dumps_jsonl({"id": batch[a["i"]]["id"], "teacher": model, "sample": sample, "ts": int(time.time()), "override": True,
+                                        "answers": {q: a[q] for q in ONLY}}) + "\n")
                     good += 1
             elif valid_answers(a):
-                f.write(json.dumps({"id": batch[a["i"]]["id"], "teacher": model, "sample": sample, "ts": int(time.time()),
-                                    "answers": {q: a[q] for q in QUESTIONS}}, ensure_ascii=False) + "\n")
+                f.write(dumps_jsonl({"id": batch[a["i"]]["id"], "teacher": model, "sample": sample, "ts": int(time.time()),
+                                    "answers": {q: a[q] for q in QUESTIONS}}) + "\n")
                 good += 1
     # Headroom was already checked in call_teacher, before parsing.
     if BACKEND != "cli":                                   # the provider meters its own routed requests per account; recording here would double-count

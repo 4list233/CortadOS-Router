@@ -7,8 +7,7 @@ from unittest import mock
 from cortados_router import api_credits
 from cortados_router.provider.server import Handler
 
-# A realistic reservation id for the test key "sk": its org fingerprint, so key_for_reservation() resolves to "sk".
-RID = api_credits._org_id("sk") + "|2026-11:abc"
+RID = "2026-11-22:abc"     # a reservation id as api_credits.reserve mints them (UTC day : random)
 
 
 class TestApiPin(unittest.TestCase):
@@ -26,7 +25,7 @@ class TestServeApiLane(unittest.TestCase):
         if headers is not None:
             h.headers = headers
         h.errors = []
-        h._error = lambda code, kind, msg, w: h.errors.append((code, msg))
+        h._error = lambda code, kind, msg, w, **kw: h.errors.append((code, msg))
         return h
 
     def test_refuses_without_a_key(self):
@@ -35,6 +34,7 @@ class TestServeApiLane(unittest.TestCase):
             os.environ.pop("CORTADOS_ANTHROPIC_API_KEY", None)
             h._serve_api_lane({"model": "api"}, "claude-opus-5-5", None)
         self.assertEqual(h.errors[0][0], 503)
+        self.assertIn("no API key", h.errors[0][1])
 
     def test_refuses_when_reservation_rejected(self):
         h = self._handler()
@@ -67,25 +67,25 @@ class TestServeApiLane(unittest.TestCase):
 
     def test_unknown_outcome_never_settles_below_observed_cost(self):
         h = self._handler()
-        usage = {"input_tokens": 1_000_000, "output_tokens": 0}   # opus-5-5 input -> $4 already observed on the wire
+        usage = {"input_tokens": 100_000, "output_tokens": 0}   # opus-5-5 input -> $0.40 already observed on the wire
         with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk"}), \
              mock.patch("cortados_router.api_credits.reserve", return_value=RID), \
-             mock.patch("cortados_router.api_credits.estimate_max_cost", return_value=1.0), \
+             mock.patch("cortados_router.api_credits.estimate_max_cost", return_value=0.1), \
              mock.patch("cortados_router.provider.anthropic_proxy.serve", return_value=(usage, "unknown")), \
              mock.patch("cortados_router.api_credits.settle") as settle:
             h._serve_api_lane({"model": "api/claude-opus-5-5"}, "claude-opus-5-5", None)
-            self.assertAlmostEqual(settle.call_args[0][1], 4.0, places=4)   # max(reservation 1.0, observed 4.0)
+            self.assertAlmostEqual(settle.call_args[0][1], 0.4, places=4)   # max(reservation 0.1, observed 0.4)
 
     def test_completed_turn_settles_the_actual_cost(self):
         h = self._handler()
-        usage = {"input_tokens": 1_000_000, "output_tokens": 0}  # opus-5-5 input -> $4
+        usage = {"input_tokens": 100_000, "output_tokens": 0}  # opus-5-5 input -> $0.40
         with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk"}), \
              mock.patch("cortados_router.api_credits.reserve", return_value=RID), \
              mock.patch("cortados_router.provider.anthropic_proxy.serve", return_value=(usage, "completed")), \
              mock.patch("cortados_router.api_credits.settle") as settle:
             h._serve_api_lane({"model": "api/claude-opus-5-5"}, "claude-opus-5-5", None)
             settle.assert_called_once()
-            self.assertAlmostEqual(settle.call_args[0][1], 4.0, places=4)
+            self.assertAlmostEqual(settle.call_args[0][1], 0.4, places=4)
         self.assertEqual(h.errors, [])
 
     def test_unknown_outcome_settles_the_full_reservation(self):
@@ -107,20 +107,38 @@ class TestServeApiLane(unittest.TestCase):
             h._serve_api_lane({"model": "api/claude-opus-5-5"}, "claude-opus-5-5", None)
             self.assertEqual(settle.call_args[0][1], 0.0)   # the API rejected it; nothing billed
 
-    def test_reserved_org_deconfigured_releases_and_refuses(self):
-        # reserve succeeded against an org whose key is no longer configured (res_id org != any configured key):
-        # release the reservation (settle 0) and refuse, never dispatch with a different org's key.
+    def test_an_unbounded_request_is_refused_before_any_reservation(self):
         h = self._handler()
-        orphan = api_credits._org_id("sk-GONE") + "|2026-11:abc"
+        img = {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
         with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk"}), \
-             mock.patch("cortados_router.api_credits.reserve", return_value=orphan), \
-             mock.patch("cortados_router.provider.anthropic_proxy.serve") as served, \
-             mock.patch("cortados_router.api_credits.settle") as settle:
-            h._serve_api_lane({"model": "api/claude-opus-5-5"}, "claude-opus-5-5", None)
-            served.assert_not_called()                      # never dispatched with the wrong key
-            self.assertEqual(settle.call_args[0][1], 0.0)   # reservation released
-        self.assertEqual(h.errors[0][0], 503)
+             mock.patch("cortados_router.api_credits.reserve") as reserve, \
+             mock.patch("cortados_router.provider.anthropic_proxy.serve") as served:
+            h._serve_api_lane({"model": "api", "messages": [{"role": "user", "content": [img]}]}, "claude-opus-5-5",
+                              None)
+            reserve.assert_not_called()
+            served.assert_not_called()
+        self.assertEqual(h.errors[0][0], 400)
+        self.assertIn("cannot bound", h.errors[0][1])
 
+    def test_a_second_key_turns_the_lane_off(self):
+        h = self._handler()
+        with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk", "CORTADOS_ANTHROPIC_API_KEY_2": "sk2"}), \
+             mock.patch("cortados_router.api_credits.reserve") as reserve, \
+             mock.patch("cortados_router.provider.anthropic_proxy.serve") as served:
+            h._serve_api_lane({"model": "api"}, "claude-opus-5-5", None)
+            reserve.assert_not_called()
+            served.assert_not_called()
+        self.assertEqual(h.errors[0][0], 503)
+        self.assertNotIn("sk2", h.errors[0][1])
+
+    def test_the_proxy_gets_the_key_and_never_the_error_text(self):
+        h = self._handler()
+        with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk-credit"}), \
+             mock.patch("cortados_router.api_credits.reserve", return_value=RID), \
+             mock.patch("cortados_router.provider.anthropic_proxy.serve", return_value=({}, "rejected")) as served, \
+             mock.patch("cortados_router.api_credits.settle"):
+            h._serve_api_lane({"model": "api/claude-opus-5-5"}, "claude-opus-5-5", None)
+            self.assertEqual(served.call_args.kwargs["key"], "sk-credit")
 
 
 class TestApiLaneReveal(unittest.TestCase):

@@ -601,6 +601,11 @@ def node_error_reroutes(reroute: bool, auto_routed: bool, bind_reason: Any, clou
 GATE_REPORT_TTL_S = 10.0
 BUSY_RETRY_AFTER_S = 5                     # when a 529 from the gate carries no usable Retry-After
 _gate_reports: dict[str, tuple[float, dict[str, Any]]] = {}
+# node id -> the backend its gate last reported (local_backend.BACKENDS), kept past GATE_REPORT_TTL_S: a gate serves one
+# backend for its whole life, so the last word stays true until the next report says otherwise. Read by the Office
+# view only (node_backend), never by routing or admission.
+_node_backends: dict[str, str] = {}
+NODE_BACKENDS = ("ollama", "vllm-mlx")    # local_backend.BACKENDS (a test keeps the two equal)
 
 
 def _note_gate(node: dict[str, Any], report: Any) -> None:
@@ -619,6 +624,14 @@ def _note_gate(node: dict[str, Any], report: Any) -> None:
     room = {k: v for k, v in room.items() if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 2 ** 53}
     with _inflight_lock:
         _gate_reports[node["node"]] = (time.monotonic(), {"limit": limit, "inflight": inflight, **words, **room})
+        if words.get("backend") in NODE_BACKENDS:
+            _node_backends[node["node"]] = words["backend"]
+
+
+def node_backend(node_id: str | None) -> str | None:
+    """The backend (`ollama` | `vllm-mlx`) node `node_id`'s gate last reported, or None when it never said."""
+    with _inflight_lock:
+        return _node_backends.get(node_id) if node_id else None
 
 
 def gate_report(node: dict[str, Any]) -> dict[str, Any] | None:

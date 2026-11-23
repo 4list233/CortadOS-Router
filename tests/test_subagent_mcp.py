@@ -193,6 +193,39 @@ class ProtocolTests(unittest.TestCase):
         r = m.handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "nope"}}, self.CFG)
         self.assertTrue(r["result"]["isError"])
 
+    def call(self, name, **args):
+        return m.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                         "params": {"name": name, "arguments": args}}, self.CFG)["result"]
+
+    def test_start_task_with_model_is_refused_and_points_to_orchestrator(self):
+        # #120: `model` used to be ignored, so a call meant to pin a reviewer ran routed.
+        with unittest.mock.patch.object(m, "call_child_tool", side_effect=AssertionError("must not run")):
+            r = self.call("start_task", task="review", model="gpt-6.1-sol")
+        text = r["content"][0]["text"]
+        self.assertTrue(r["isError"])
+        self.assertIn("unknown argument 'model'", text)
+        self.assertIn("nothing was run", text)
+        self.assertIn("orchestrator", text)
+        self.assertIn("Valid arguments: allowed_tools, branch,", text)
+
+    def test_every_tool_refuses_an_unknown_argument_and_names_it(self):
+        tools = m.handle({"jsonrpc": "2.0", "id": 6, "method": "tools/list"}, self.CFG)["result"]["tools"]
+        with unittest.mock.patch.object(m, "call_child_tool", side_effect=AssertionError("must not run")), \
+                unittest.mock.patch.object(m, "route_task", side_effect=AssertionError("must not run")), \
+                unittest.mock.patch.object(m, "local_switch", side_effect=AssertionError("must not run")):
+            for t in tools:
+                with self.subTest(tool=t["name"]):
+                    r = self.call(t["name"], bogus_arg=1, zzz=2)
+                    self.assertTrue(r["isError"])
+                    self.assertIn(f"{t['name']}: unknown arguments 'bogus_arg', 'zzz'", r["content"][0]["text"])
+
+    def test_declared_arguments_still_pass(self):
+        seen = []
+        with unittest.mock.patch.object(m, "route_task", side_effect=lambda *a, **k: seen.append(k) or {"content": []}):
+            r = self.call("route_task", task="t", context="c", max_tokens=5, model="opus", local="prefer")
+        self.assertNotIn("isError", r)
+        self.assertEqual(seen, [{"model": "opus", "local": "prefer"}])
+
 
 if __name__ == "__main__":
     unittest.main()

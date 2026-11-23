@@ -13,7 +13,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from common import DATA, LABELER_MARKER, OUTCOME_MARKER, clean_request, read_jsonl, split_of
+from common import DATA, LABELER_MARKER, OUTCOME_MARKER, clean_request, dumps_jsonl, read_jsonl, split_of
 
 SHEET = Path(__file__).resolve().parent / "sources/labeling-sheet.csv"
 ROUTER_DB = Path.home() / ".cortados/router.db"
@@ -109,7 +109,7 @@ def main() -> None:
             if r["id"] in have or not r["request"] or len(r["request"]) < 2 or r["request"] in seen_text or r["request"] == "<url>":
                 continue
             r["split"] = split_of(r["id"])
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            f.write(dumps_jsonl(r) + "\n")   # U+2028/U+2029/U+0085 escaped (common.dumps_jsonl)
             have.add(r["id"]); seen_text.add(r["request"]); added += 1
     rows = read_jsonl(out)
     print(f"requests.jsonl: +{added} new, {len(rows)} total, holdout {sum(r['split'] == 'holdout' for r in rows)}, by source "

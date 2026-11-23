@@ -108,25 +108,70 @@ class ScorerTimingWindow(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code
 
-    def test_a_request_the_handler_gives_up_on_is_a_timeout_and_a_full_backlog_is_busy(self):
+    def _worker(self, **kw):
+        """One worker thread running serve.run_job (main's real drop/score path) with a fake load and score."""
+        def loop():
+            while True:
+                serve.run_job(serve._jobs.get(), load=lambda: None, **kw)
+        threading.Thread(target=loop, daemon=True).start()
+
+    # The three non-ok /score paths of main's handler (S1 speed, f7cc37d), each read by the guard as over every budget.
+
+    def test_a_full_backlog_answers_503_busy_and_is_recorded_busy(self):
+        url = self._server()
+        serve._jobs = queue.Queue(maxsize=1)
+        serve._jobs.put_nowait(({}, queue.Queue(), None, time.time()))   # no worker: the one slot stays taken
+        self.assertEqual(self._post(url, {"X-CortadOS-Probe": "1"}), 503)
+        rows = serve.latency_report()["samples"]
+        self.assertEqual([(r["outcome"], r["probe"], r["s"]) for r in rows], [("busy", True, 0.0)])
+
+    def test_a_job_the_worker_dropped_answers_503_and_is_recorded_timeout(self):
+        url = self._server()
+        serve._jobs = queue.Queue(maxsize=4)
+        self._saved_service = serve._service
+        self.addCleanup(setattr, serve, "_service", self._saved_service)
+        serve._service = serve.ServiceTimes(floor=100.0)   # expected 100 s > the caller's 5 s, with a job waiting behind it
+        self._worker(score=lambda b: self.fail("a dropped job must not be scored"), waiting=1)
+        req = urllib.request.Request(url + "/score", data=b'{"request": "x"}', headers={"X-Request-Timeout-S": "5"})
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=10)
+        self.assertEqual(cm.exception.code, 503)
+        got = json.loads(cm.exception.read())
+        self.assertEqual((got.get("busy"), got.get("dropped")), (True, True))
+        self.assertEqual([r["outcome"] for r in serve.latency_report()["samples"]], ["timeout"])   # degraded, not busy/error
+
+    def test_a_request_the_handler_gives_up_on_answers_504_and_is_recorded_timeout(self):
         url = self._server()
         serve._jobs = queue.Queue(maxsize=1)           # no worker: a queued job is never answered
-        self.assertEqual(self._post(url, {"X-Request-Timeout-S": "0.2", "X-CortadOS-Probe": "1"}), 500)
-        self.assertEqual(self._post(url, {}), 503)     # the unanswered job still fills the one slot
+        self.assertEqual(self._post(url, {"X-Request-Timeout-S": "0.2", "X-CortadOS-Probe": "1"}), 504)
         rows = serve.latency_report()["samples"]
-        self.assertEqual([(r["outcome"], r["probe"]) for r in rows], [("timeout", True), ("busy", False)])
+        self.assertEqual([(r["outcome"], r["probe"]) for r in rows], [("timeout", True)])
         self.assertGreaterEqual(rows[0]["s"], 0.9)     # the handler waits at least 1 s (client_wait floor)
 
-    def test_a_job_the_worker_dropped_past_its_deadline_is_a_timeout(self):
+    def test_a_scored_request_is_recorded_ok_with_its_service_latency(self):
         url = self._server()
         serve._jobs = queue.Queue(maxsize=4)
 
-        def worker():                                  # answers as serve.worker does for an expired job
-            body, reply, deadline = serve._jobs.get()
-            reply.put({"error": "dropped: client deadline passed before scoring"})
-        threading.Thread(target=worker, daemon=True).start()
-        self.assertEqual(self._post(url, {"X-Request-Timeout-S": "5"}), 500)
-        self.assertEqual([r["outcome"] for r in serve.latency_report()["samples"]], ["timeout"])
+        def score(body):
+            time.sleep(0.2)
+            return {"answers": {}, "probs": {}, "confidence": 1.0, "ms": 200}
+        self._worker(score=score)
+        self.assertEqual(self._post(url, {"X-Request-Timeout-S": "5"}), 200)
+        rows = serve.latency_report()["samples"]
+        self.assertEqual([(r["outcome"], r["probe"]) for r in rows], [("ok", False)])
+        self.assertGreaterEqual(rows[0]["s"], 0.2)
+
+    def test_latency_samples_of_all_three_shed_paths_read_as_infinite_timeouts_in_the_guard(self):
+        # busy (full queue), timeout (dropped) and timeout (504) as GET /latency reports them: the guard's p90 is inf and
+        # every one counts as a timeout, so any of them pauses training (docs/ROUTER-DESIGN.md §4d.1).
+        for outcome in ("busy", "timeout", "timeout"):
+            serve.record_latency(0.5, outcome)
+        serve.record_latency(0.4, "ok")
+        body = serve.latency_report()
+        reader = night.ScorerLatency(url="http://scorer.test:8431/score", window_s=600, probe=lambda: self.fail("no probe"),
+                                     fetch=lambda u: body, clock=lambda: 1000.0)
+        got = reader.read(None)
+        self.assertEqual((got.n, got.timeouts, got.p90), (4, 3, math.inf))
 
     def test_latency_endpoint_needs_the_token_once_one_is_set(self):
         url = self._server()

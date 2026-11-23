@@ -65,7 +65,7 @@ def _repair_tail(p: Path) -> None:
 
 
 def append(name: str, row: dict) -> None:
-    line = json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+    line = common.dumps_jsonl(row, sort_keys=True) + "\n"
     with _write:
         _repair_tail(path(name))
         with path(name).open("a") as f:

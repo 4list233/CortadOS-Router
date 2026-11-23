@@ -144,7 +144,7 @@ def _usage_int(v: Any) -> int | None:
 def _events(stdout: str) -> list[dict[str, Any]]:
     """The JSON objects of a stream-json run, one per line; lines that are not JSON objects are skipped."""
     out = []
-    for line in (stdout or "").splitlines():
+    for line in (stdout or "").split("\n"):   # "\n" only: splitlines() also cuts at U+2028/U+2029/\x85 inside a JSON string
         line = line.strip()
         if not line:
             continue

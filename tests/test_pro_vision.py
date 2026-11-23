@@ -496,8 +496,8 @@ class EncoderAttentionReservationTests(unittest.TestCase):
         with self.assertRaisesRegex(local_governor.GovernorConfigError, "one image turn reserves"):
             local_governor.check_config({"memory_budget_bytes": 20 * GIB},
                                         {"vision": {"image_tokens_max": 32768, "image_context_tokens": 65536}})
-        # the same override fits a budget that holds its computed peak
-        cfg = local_governor.check_config({"memory_budget_bytes": 64 * GIB},
+        # the same override fits a budget that holds its computed peak (owner active too: the check uses the smaller)
+        cfg = local_governor.check_config({"memory_budget_bytes": 64 * GIB, "active_memory_budget_bytes": 64 * GIB},
                                           {"vision": {"image_tokens_max": 32768, "image_context_tokens": 65536}})
         self.assertLessEqual(local_governor.request_bytes(cfg, 0, 1, images=1), local_governor.available_bytes(cfg))
 

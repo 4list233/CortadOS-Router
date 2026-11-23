@@ -6,7 +6,8 @@ main session, known from its heartbeats or, when the main loop itself routes, fr
 `claude --model cortados`) waits in the LOBBY.
 
 Owner decisions (2026-11-04): floors only for sessions that route through CortadOS; metadata only. A floor carries
-project name, device, model, lane, status, the current tool NAME and the routed task title (<= 80 chars). Never prompt
+project name, device, model, lane, a local worker's node backend (`local_backend`: ollama | vllm-mlx, from the node
+gate's own report, #77), status, the current tool NAME and the routed task title (<= 80 chars). Never prompt
 text, tool arguments or results, file contents, command text, paths, account names or tokens. Everything here is built
 from fields this module validates itself (strict charsets and length caps); nothing from a request body is ever kept.
 
@@ -80,6 +81,10 @@ _RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")       # server._RUN_ID_RE
 ORCHESTRATOR_STATUSES = ("working", "idle", "ended")   # what a heartbeat may say; `ended` removes it
 WORKER_STATUSES = ("working", "idle", "error", "done")
 PROVIDERS = ("claude", "codex", "local")
+# Which backend serves a local node (local_backend.BACKENDS, a test keeps the two equal), as the node's gate last
+# reported it (local_lane.node_backend). Published per local worker as `local_backend` so the Office can tell an Ollama
+# node from a vllm-mlx one (#77); None for every non-local worker and for a node whose gate never said.
+LOCAL_BACKENDS = ("ollama", "vllm-mlx")
 
 # ---- lifetimes: each one says why it is that long ----
 # A heartbeat saying `working` is refreshed on every tool call (throttled to one per 30 s when nothing changes), so one
@@ -208,15 +213,19 @@ class OfficeBoard:
         return None
 
     def turn_start(self, key: str | None, tags: dict[str, str], *, run_id: str | None, provider: str | None,
-                   lane: str | None, model: str | None, now: float | None = None, origin: str | None = None) -> None:
+                   lane: str | None, model: str | None, now: float | None = None, origin: str | None = None,
+                   backend: str | None = None) -> None:
         """`origin`: the request's x-cortados-origin (read_origin), recorded on a run's worker as the provider saw it:
-        the first one seen, ORIGIN_CONFLICT once a request of the run names another (note_origin)."""
+        the first one seen, ORIGIN_CONFLICT once a request of the run names another (note_origin). `backend`: the local
+        node's backend (one of LOCAL_BACKENDS) for a local route; kept only when the provider is `local`."""
         if not key:
             return
         now = time.time() if now is None else now
         with self._lock:
             self._floor_locked(tags, now)
-            fields = {"provider": provider if provider in PROVIDERS else None, "lane": clean(lane, _LANE_RE),
+            provider = provider if provider in PROVIDERS else None
+            fields = {"provider": provider, "lane": clean(lane, _LANE_RE),
+                      "local_backend": backend if provider == "local" and backend in LOCAL_BACKENDS else None,
                       "model": clean(model, _MODEL_RE), "status": "working", "tool": None, "updated": now,
                       "ended_at": None}
             if key.startswith("main:"):
@@ -478,11 +487,16 @@ def _orchestrator(hb: dict[str, Any] | None, main: dict[str, Any] | None) -> dic
     """The floor's orchestrator: its heartbeat (status and tool as the mod saw them), else its own routed requests when
     the main loop routes; None when neither is known (a floor whose session runs no mod)."""
     if hb:
-        return {"model": hb.get("model") or (main or {}).get("model"), "status": hb.get("status"),
-                "tool": hb.get("tool"), "last_seen": _ts(hb.get("seen")), "source": "heartbeat"}
+        model = hb.get("model") or (main or {}).get("model")
+        # the routed main loop's backend only describes the model it served
+        backend = (main or {}).get("local_backend") if model == (main or {}).get("model") else None
+        return {"model": model, "status": hb.get("status"),
+                "tool": hb.get("tool"), "last_seen": _ts(hb.get("seen")), "source": "heartbeat",
+                "local_backend": backend}
     if main:
         return {"model": main.get("model"), "status": "idle" if main.get("status") == "done" else main.get("status"),
-                "tool": main.get("tool"), "last_seen": _ts(main.get("updated")), "source": "routed"}
+                "tool": main.get("tool"), "last_seen": _ts(main.get("updated")), "source": "routed",
+                "local_backend": main.get("local_backend")}
     return None
 
 
@@ -496,7 +510,8 @@ def note_origin(prev: str | None, seen: str | None) -> str | None:
 
 def _pub_worker(w: dict[str, Any]) -> dict[str, Any]:
     return {"run_id": w.get("run_id"), "kind": w.get("kind") or "subagent", "title": w.get("title"),
-            "provider": w.get("provider"), "lane": w.get("lane"), "model": w.get("model"), "status": w.get("status"),
+            "provider": w.get("provider"), "lane": w.get("lane"), "local_backend": w.get("local_backend"),
+            "model": w.get("model"), "status": w.get("status"),
             "tool": w.get("tool"), "started_at": _ts(w.get("started_at")), "ended_at": _ts(w.get("ended_at"))}
 
 

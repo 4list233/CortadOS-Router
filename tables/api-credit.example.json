@@ -1,0 +1,16 @@
+{
+ "_comment": "Copy to ~/.config/cortados/api-credit.json on the provider's machine (#114). Lists the Anthropic API promotional credit grants exactly as the Console shows them, plus the organisation's monthly spend limit. Never the key (the key stays in the provider's environment, CORTADOS_ANTHROPIC_API_KEY). Times are ISO 8601 WITH a UTC offset. remaining_usd + remaining_as_of: what the Console showed left, and when; spend this ledger records from that UTC day on is subtracted. After the last grant expires the lane is off until a new grant is added here. stop_fraction may only be lowered (owner rule: hard stop at 95%). prefer_within_days: S1-routed local-eligible work goes to the API while a grant expires within this many days.",
+ "enabled": true,
+ "org_monthly_limit_usd": 200,
+ "prefer_within_days": 3,
+ "grants": [
+  {
+   "name": "API credit (Ultra)",
+   "amount_usd": 200,
+   "granted": "2026-10-30T00:00:00-04:00",
+   "expires": "2026-12-02T19:00:00-05:00",
+   "remaining_usd": 200,
+   "remaining_as_of": "2026-11-22T00:00:00-05:00"
+  }
+ ]
+}

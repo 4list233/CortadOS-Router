@@ -362,7 +362,9 @@ never the trainer; (3) a reading with no baseline was never judged. Now:
 - *Measured*: `s1/serve.py` times every `/score` request itself, from "request received" to "reply ready" (the wait behind
   other requests in its single MLX queue included) and keeps the last 15 min / 512 samples; `GET /latency` returns them as
   `{age_s, s, outcome, probe}` (timing metadata only; behind the scorer's token when one is set). Outcomes `timeout` (the
-  caller's own timeout passed: that routed call was degraded) and `busy` (503) count as infinitely slow.
+  handler's wait for the caller's own timeout passed, 504, or the worker dropped the job at dequeue because it could not be
+  scored before that deadline, 503 `{"dropped": true}`: either way that routed call was degraded) and `busy` (503, the
+  bounded queue full: never queued) count as infinitely slow.
 - *Read*: every `CORTADOS_S1_PROBE_S`, `overnight.ScorerLatency` takes the samples of the last `CORTADOS_S1_GUARD_WINDOW_S`
   that STARTED after the guard's last state change (cycle start, pause, resume), so samples from before a pause never
   hold it, and their p50 and p90. Fewer than 3 such samples (a quiet scorer): one probe (`X-CortadOS-Probe: 1`) tops the

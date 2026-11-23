@@ -20,7 +20,10 @@
 # Writes ~/Library/LaunchAgents/com.cortados.vllm-mlx.plist and loads it with launchctl bootstrap gui/<uid>
 # (booting out a previous copy first). Logs to ~/.cortados/vllm-mlx.log. It does NOT touch Ollama or the gate: the
 # switch (unload Ollama's 27B, set the gate's backend, restart the gate) is in docs/LOCAL-RESOURCES.md "MLX backend".
-# Test seams: CORTADOS_LAUNCHCTL (the launchctl binary), HOME.
+# Reloading waits for launchd to release the old job (up to 10 s, polling `launchctl print`) and retries a bootstrap
+# that fails with launchd's transient "5: Input/output error" (3 tries, #130).
+# Test seams: CORTADOS_LAUNCHCTL (the launchctl binary), HOME, CORTADOS_LAUNCHD_POLL_S (the pause between polls and
+# retries, default 0.5 s; the bounds are counted in polls, so a shorter pause never waits longer).
 set -euo pipefail
 
 LABEL="com.cortados.vllm-mlx"
@@ -31,6 +34,10 @@ CONFIG="${CORTADOS_LOCAL_BACKEND_CONFIG:-$HOME/.config/cortados/local-backend.js
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/.cortados"
 DRY=0; UNINSTALL=0
+POLL_S="${CORTADOS_LAUNCHD_POLL_S:-0.5}"
+GONE_POLLS=20            # x 0.5 s = 10 s for launchd to release a booted-out job
+BOOTSTRAP_TRIES=3
+LAUNCHCTL_IO_ERROR=5     # launchctl's exit status for "Input/output error"
 
 die() { echo "install_mlx_backend: $*" >&2; exit 2; }
 
@@ -95,8 +102,31 @@ install -m 0644 "$IMGCHK_SRC" "$IMGCHK.tmp" && mv "$IMGCHK.tmp" "$IMGCHK"
 install -m 0644 "$GUARD_SRC" "$GUARD.tmp" && mv "$GUARD.tmp" "$GUARD"
 printf '%s\n' "$PLIST_XML" > "$PLIST.tmp" && mv "$PLIST.tmp" "$PLIST"
 chmod 644 "$PLIST"
-"$LAUNCHCTL" bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
-"$LAUNCHCTL" bootstrap "gui/$(id -u)" "$PLIST"
+TARGET="gui/$(id -u)/$LABEL"
+"$LAUNCHCTL" bootout "$TARGET" >/dev/null 2>&1 || true
+# #130: bootout returns before launchd has released the job (the old vllm-mlx may still be exiting), and a bootstrap
+# of the same label in that window fails with "5: Input/output error". Wait, bounded, until `launchctl print` no
+# longer finds it; if it is still there, try anyway: the retries below cover a release that lands late.
+polls=0
+while "$LAUNCHCTL" print "$TARGET" >/dev/null 2>&1; do
+  if [ "$polls" -ge "$GONE_POLLS" ]; then
+    echo "install_mlx_backend: $TARGET is still loaded after bootout; bootstrapping anyway" >&2
+    break
+  fi
+  polls=$((polls + 1)); sleep "$POLL_S"
+done
+# Retry only error 5, the release race; any other failure is launchd's definite answer and stops here.
+try=1
+while :; do
+  rc=0; out="$("$LAUNCHCTL" bootstrap "gui/$(id -u)" "$PLIST" 2>&1)" || rc=$?
+  [ "$rc" = 0 ] && break
+  if [ "$rc" != "$LAUNCHCTL_IO_ERROR" ] || [ "$try" -ge "$BOOTSTRAP_TRIES" ]; then
+    die "launchctl bootstrap gui/$(id -u) $PLIST failed (exit $rc, try $try of $BOOTSTRAP_TRIES): $out"
+  fi
+  echo "install_mlx_backend: launchctl bootstrap exited $rc ($out); launchd may still be releasing the old job," \
+       "retrying ($((try + 1)) of $BOOTSTRAP_TRIES)" >&2
+  try=$((try + 1)); sleep "$POLL_S"; sleep "$POLL_S"
+done
 PORT="$(printf '%s' "$RESOLVED" | "$PYTHON" -I -c 'import json,sys; print(json.load(sys.stdin)["serve"]["port"])')"
 cat <<EOF
 install_mlx_backend: loaded $LABEL (log: $LOG_DIR/vllm-mlx.log). The model takes a minute to load; check with

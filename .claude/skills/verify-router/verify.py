@@ -241,6 +241,67 @@ print(json.dumps({"up": route(easy), "battery": route(easy, "node pro: local gat
                   "outward": route("email the signed invoice to the client and mark it paid")}))
 """
 
+# API credit lane (#114, 2026-11-22): S1-routed work a COST rule moved to local goes to the API credit lane only while a
+# grant expires within prefer_within_days (3), the lane is on (key, grants file, ledger, under the 95 % stop line) and the
+# request is low-risk; outward or degraded work never does, and a request already past the stop line stays local. Runs
+# the real routing.choose tail (sensitive_local, auto_local, the preference) and the real api_credits on a throwaway
+# home, a throwaway grants file and a fake key; S1's select is replaced by a fixed S1-shaped route, the node probe is
+# faked (no Ollama, no socket) and nothing is sent anywhere.
+API_CREDIT_SCENARIO = """
+import json, os, sys, tempfile, time
+from datetime import datetime, timezone
+from cortados_router import api_credits, core, execution_routing
+from cortados_router.provider import local_lane, routing
+d = tempfile.mkdtemp()
+cfg = os.path.join(d, "resources.json")
+json.dump({"nodes": [{"id": "pro", "ollama": {"base_url": "http://127.0.0.1:9",
+           "auto_route": {"model": "verify-local", "bands": ["R0", "R1", "R2"]},
+           "models": [{"id": "verify/local:tag", "alias": "verify-local", "context_length": 65536}]}}]}, open(cfg, "w"))
+os.environ[local_lane.CONFIG_ENV] = cfg
+os.environ["CORTADOS_API_CREDIT_CONFIG"] = credit = os.path.join(d, "api-credit.json")
+os.environ["CORTADOS_ANTHROPIC_API_KEY"] = "verify-fake-key"
+local_lane.probe = lambda node: {"verify/local:tag"}
+core.log_route = lambda *a, **k: True
+iso = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()
+def grant(days, amount=200):
+    json.dump({"org_monthly_limit_usd": 200, "prefer_within_days": 3, "grants": [{"name": "verify",
+               "amount_usd": amount, "granted": iso(time.time() - 20 * 86400), "expires": iso(time.time() + days * 86400)}]},
+              open(credit, "w"))
+def route(band="R2", outward=False, degraded=False, **extra):
+    routing._auto_down.clear()
+    br = 3 if outward else 0
+    r = {"router": "verify", "provider": "codex-cli", "model": "gpt-5.6-terra", "band": band, "route_id": "verify:api",
+         "degraded": degraded, "decision": {"answers": {"outward": outward, "blast_radius": br}, "degraded": degraded},
+         "route": {"band": band, "chosen": {"lane": "codex", "provider": "codex-cli", "model": "gpt-5.6-terra"}}}
+    execution_routing.select = lambda *a, **k: dict(r)
+    body = {"model": "cortados", "max_tokens": 256, "messages": [{"role": "user", "content": "rename a variable"}],
+            **extra}
+    out = routing.choose(core, body, client="verify", conversation_id="verify-api", claude_bin=sys.executable,
+                         codex_bin=sys.executable)
+    return [out.get("provider"), out.get("model"), out.get("bind_reason")]
+grant(2)
+res = {"expiring": route(), "expiring_r1": route("R1"), "outward": route("R3", outward=True),
+       "degraded": route(degraded=True),
+       "fallbacks": route(fallbacks=[{"model": "claude-opus-5", "max_tokens": 128000, "speed": "fast"}])}
+# #114 review round 1: every continuation of such a conversation passes the gate before it is forwarded.
+cbody = {"model": "cortados", "messages": [{"role": "user", "content": "rename a variable"}]}
+ok_check = lambda b, r: (True, "admitted")
+out_check = lambda b, r: (False, "outward effect (S1 outward=true): never local")
+gate = lambda **kw: routing.api_continuation_admission(cbody, {"route_id": "verify:api", "band": "R2"}, **kw)[0]
+res["cont"] = {"clean": gate(local=None, recheck=ok_check), "sensitive": gate(local="sensitive", recheck=ok_check),
+               "prefer": gate(local="prefer", recheck=ok_check), "outward": gate(local=None, recheck=out_check),
+               "no_check": gate(local=None, recheck=None)}
+grant(20)
+res["not_expiring"] = route()
+res["cont"]["not_expiring"] = gate(local=None, recheck=ok_check)
+grant(2, amount=1)
+api_credits.reserve(0.95, time.time())       # $0.95 of a $1 grant committed: the 95 % stop line
+res["past_stop"] = route()
+st = api_credits.state(time.time())
+res["stop_state"] = [st["on"], (st["reason"] or "")[:40]]
+print(json.dumps(res))
+"""
+
 # Local models in selection by a published proxy index (local-published-index, owner 2026-11-13): the REAL generated
 # scores (tables/model-scores.generated.json → local_models) place Qwen27b_heretic like a cloud model. Two parts:
 #  * S1-free (always runs): the real index_local on S1-shaped routes with the real generated indexes: a requirement the
@@ -521,6 +582,40 @@ print(json.dumps({"degraded": bool(d.get("degraded")), "outward": out, "safe": s
 """
 
 
+# S1 busy / timeout (2026-11-22, owner-approved change to the 2026-10-26 retry rule): the router retries S1 only when it
+# was never reached. A fake S1 on a loopback port of the child answers 503 {"busy": true}, or stalls past the client
+# timeout; each must cost exactly ONE request and route degraded to a Codex lane, never Claude (core.resolve's hard
+# rule). Needs no real S1, so it is never BLOCKED. Real provider routing, throwaway home, no CLI started.
+BUSY_SCENARIO = """
+import json, sys, threading, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from cortados_router import core
+from cortados_router.provider import routing
+hits = {"busy": 0, "slow": 0}
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        kind = MODE[0]; hits[kind] += 1
+        if kind == "slow":
+            time.sleep(1.5)
+        data = json.dumps({"error": "busy", "busy": True}).encode()
+        try:
+            self.send_response(503); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+        except OSError:
+            pass
+srv = HTTPServer(("127.0.0.1", 0), H); threading.Thread(target=srv.serve_forever, daemon=True).start()
+core.S1_URL, core.S1_TIMEOUT_S, core.S1_TOKEN = "http://127.0.0.1:%d" % srv.server_address[1], 0.5, None
+MODE = ["busy"]
+def go(kind):
+    MODE[0] = kind
+    body = {"model": "cortados", "messages": [{"role": "user", "content": "rename the variable in utils.py"}]}
+    r = routing.choose(core, body, client="verify", conversation_id="verify-s1-" + kind, claude_bin=sys.executable, codex_bin=sys.executable)
+    return {**{k: r.get(k) for k in ("provider", "model", "band", "degraded")}, "requests": hits[kind]}
+print(json.dumps({"busy": go("busy"), "slow": go("slow")}))
+"""
+
+
 def s1_call_failed(call):
     """One S1 call's own structural record (a decision, a routing result or the continuation wrapper's entry) says it did
     not score: degraded, an engine error or an exception. Never judged from reason text."""
@@ -635,6 +730,15 @@ def main():
             record("provider routes a scored conversation to a served lane (never openai-codex itself)",
                    "PASS" if served else "FAIL", json.dumps(r))
 
+    p = runner.run(["-c", BUSY_SCENARIO], prefix="verify-router-busy-")
+    try:
+        r = _last_json(p)
+    except (ValueError, IndexError):
+        record("S1 busy or timeout: one request, degraded, never Claude", "FAIL", (p.stderr or p.stdout).strip()[-300:])
+    else:
+        ok = all(x.get("requests") == 1 and x.get("degraded") and x.get("provider") == "codex-cli" for x in r.values())
+        record("S1 busy or timeout: one request, degraded, never Claude", "PASS" if ok else "FAIL", json.dumps(r))
+
     p = runner.run(["-c", PIN_SCENARIO], prefix="verify-router-pin-")
     try:
         r = _last_json(p)
@@ -715,6 +819,28 @@ def main():
                    "PASS" if ok else "FAIL",
                    f"keyword+prefer -> {kp.get('provider')} bind {kp.get('bind_reason')} cloud_ok {kp.get('cloud_ok')} | "
                    f"prefer -> {pf.get('provider')} bind {pf.get('bind_reason')} cloud_ok {pf.get('cloud_ok')}")
+
+    p = runner.run(["-c", API_CREDIT_SCENARIO], prefix="verify-router-api-credit-", timeout=300)
+    try:
+        r = _last_json(p)
+    except (ValueError, IndexError):
+        record("expiring API credit takes cost-bound local work, nothing else (S1-free)", "FAIL",
+               (p.stderr or p.stdout).strip()[-300:])
+    else:
+        api = lambda x: x[0] == "anthropic-api" and x[2] == "api_credit_expiry"
+        ok = (api(r["expiring"]) and r["expiring"][1] == "claude-sonnet-5" and api(r["expiring_r1"])
+              and r["not_expiring"][0] == "local-pro" and r["past_stop"][0] == "local-pro"
+              and r["outward"][0] == "codex-cli" and r["degraded"][0] == "codex-cli" and r["stop_state"][0] is False
+              and r["fallbacks"][0] == "local-pro")
+        record("expiring API credit takes cost-bound local work, nothing else (S1-free)", "PASS" if ok else "FAIL",
+               f"grant in 2 d: R2 -> {r['expiring'][:2]}, R1 -> {r['expiring_r1'][:2]} | in 20 d -> {r['not_expiring'][:2]} | "
+               f"past the stop line -> {r['past_stop'][:2]} ({r['stop_state'][1]}) | outward -> {r['outward'][:2]} | "
+               f"degraded -> {r['degraded'][:2]} | with fallbacks -> {r['fallbacks'][:2]}")
+        c = r["cont"]
+        ok = c == {"clean": True, "sensitive": False, "prefer": False, "outward": False, "no_check": False,
+                   "not_expiring": False}
+        record("API credit continuations re-pass the gate before forwarding (S1-free)", "PASS" if ok else "FAIL",
+               " | ".join(f"{k} -> {'forward' if v else 'refuse'}" for k, v in c.items()))
 
     p = runner.run(["-c", INDEX_SCENARIO], prefix="verify-router-index-", timeout=300)
     try:

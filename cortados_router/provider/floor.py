@@ -172,7 +172,7 @@ def _reserved(rows: list[dict], reading: dict) -> dict:
 def _rows(path) -> list[dict]:
     rows = []
     if path.exists():
-        for line in path.read_text().splitlines():
+        for line in path.read_text().split("\n"):   # "\n" only: splitlines() also cuts at U+2028/U+2029/\x85 inside a JSON string
             try:
                 row = json.loads(line)
             except ValueError:

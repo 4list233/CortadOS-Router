@@ -791,13 +791,18 @@ def finish(lane: str, rec: dict[str, Any]) -> dict[str, Any]:
 
 
 def _anthropic_api() -> dict[str, Any]:
-    """The API-credit lane: a dollar-metered 1-month window, read cheaply from the local meter (no PTY, no quota
-    spent). Reuses window_view so its pacing (use-it-or-lose-it, cap at spent) matches every other lane."""
+    """The API-credit lane (#114): dollars of promotional grants, read cheaply from the local ledger and the owner's
+    grants file (no PTY, no network, no quota spent). Its one window runs from the grant to the point it stops counting
+    (credit does not refill), 100 % used = the 95 % stop line; reuses window_view so its use-it-or-lose-it pacing matches
+    every other lane."""
     from cortados_router import api_credits
     now = time.time()
     used_pct, reset_at, window_s = api_credits.window_numbers(now)
-    return {"source": "self-metered (api credits)", "budget_usd": api_credits.total_budget_usd(),
-            "spent_usd": round(api_credits.spent(now), 4), "windows": [window_view("1mo", used_pct, reset_at, window_s, now)]}
+    st = api_credits.state(now)
+    return {"source": "self-metered (api credit grants)", "budget_usd": api_credits.budget_usd(now),
+            "spent_usd": round(float((st.get("grant") or {}).get("used_usd") or 0.0), 4),
+            "lane_on": bool(st.get("on")), "off_reason": st.get("reason"),
+            "windows": [window_view("grant", used_pct, reset_at, window_s, now)]}
 
 
 SAMPLERS = {"claude": _claude, "antigravity": _antigravity, "codex": _codex, "cursor": _cursor, "local": _local,
@@ -1043,7 +1048,9 @@ def change_since(hours: float = 24) -> dict[tuple[str, str], float]:
     # vendor probes every 15–30), so the row nearest the target rarely holds every lane (Codex review 2026-10-21).
     target, best = time.time() - hours * 3600, {}
     try:
-        for line in HISTORY.read_text().splitlines():
+        for line in HISTORY.read_text().split("\n"):   # "\n" only: splitlines() also cuts at U+2028/U+2029/\x85 inside a JSON string
+            if not line.strip():
+                continue
             row = json.loads(line)
             for lane, v in (row.get("lanes") or {}).items():
                 if lane not in best or abs(row["ts"] - target) < abs(best[lane][0] - target):

@@ -904,8 +904,13 @@ benchmark prompts, and real Claude Code turns of 30k–130k tokens hold four to 
 ```
 tokens   = min(input tokens + max_tokens, context_tokens)
 reserved = tokens × kv_bytes_per_token + per_seq_state_bytes + prefill_margin_bytes
-admit    iff  count < count limit  and  reserved in flight + reserved ≤ memory_budget_bytes − weights_bytes
+admit    iff  count < count limit  and  reserved in flight + reserved ≤ budget in force − weights_bytes
+budget in force = active_memory_budget_bytes (owner active)  |  memory_budget_bytes (owner idle)
 ```
+
+The budget follows the same owner signal as the count ("Active budget" below): 17.25 GiB beside the 4-bit weights
+while the owner works, 25 GiB while away. A full 128k text turn (17.06 GiB since the 2026-11-22 KV correction) fits
+either way.
 
 **Since #126 this per-request formula is a floor on the served text-only model, not the reservation.** Its text turns
 are reserved as one set, from the computed peak of the guard's chunked prefill and of the decode batch, which pads
@@ -1019,6 +1024,59 @@ This is concurrency given up for a bound that holds by construction. The provide
 (`local_lane.request_tokens`, characters / 3.5) is unchanged. It only decides whether to try the node, and the gate's
 refusal handles the rest.
 
+### Active budget: smaller while the owner works (2026-11-22)
+
+**Why.** The hardware test on 2026-11-22 (report on the owner's Pro: `CortadOS-Router-notes/hwtest-20261122/REPORT.md`)
+ran with the owner's apps open. vllm-mlx hit a Metal out-of-memory at ~38 GiB of MLX memory, ~24 GiB above the 4-bit
+27B's weights (14.73 GiB idle footprint), and swap grew 5 GiB at a ~31 GB process footprint. The byte budget was 25 GiB
+beside the weights (`free_bytes` 26,843,545,600), and one full 128k text turn reserved 24.57 GiB, right at that edge.
+Eight short turns measured 3.33 GiB at peak against 14.32 GiB reserved, so short traffic was never the problem. A later
+measurement on the same day (one full 130,872-token turn alone: **11.93 GiB** over idle) showed that 24.57 GiB was an
+overcount, and the KV term was corrected ("Measured against the hardware" in "Text prefill" below): a full 128k turn
+now reserves **17.06 GiB**.
+
+**Owner decision 2026-11-22, "smaller while I work".** While the owner is **active** (the governor's existing signal:
+keyboard/mouse idle under `active_idle_s`, 600 s; an unreadable idle time counts active), requests reserve against
+`active_memory_budget_bytes` (32.25 GiB: 17.25 GiB beside the 4-bit weights). While the owner is **idle**, against
+`memory_budget_bytes` (40 GiB: 25 GiB). The owner asked for ~17 GiB and for every request to keep the full 128k
+context while active if physically possible. The measured peak of a full turn is 11.93 GiB, so it is. Its corrected
+reservation is 17.06 GiB: at exactly 17.00 GiB the most one turn may hold is 130,617 tokens, 455 short of the context.
+17.25 GiB is the smallest quarter-GiB step that serves the whole context. Both are totals, like the old single budget,
+so heavier weights leave less room beside them: the 6-bit entry (22.4 GB) gets ~9.85 GiB while the owner works
+(72,361 tokens) and 17.6 GiB while away (the whole context), and the vision entry (16.5 GiB of weights) 15.75 GiB, so
+its largest image turn (5 images at the 64k image context, 15.9 GiB) goes to the cloud while the owner works and is
+served when the owner is away. The config check that one image turn fits uses the active (smaller) budget.
+
+What fits alone (text-only; "Text prefill" has the formula):
+
+| Weights | Owner | Beside the weights | `fit_tokens` | 64k turn (9.01 GiB) | 128k turn (17.06 GiB) |
+|---|---|---|---|---|---|
+| 4-bit | active | 17.25 GiB | 131,072 | fits (two at once) | fits (nothing beside it) |
+| 4-bit | idle | 25 GiB | 131,072 | fits (four at once) | fits (nothing beside it) |
+| 6-bit | active | 9.85 GiB | 72,361 | fits | too large: 413, routed elsewhere |
+| 6-bit | idle | 17.6 GiB | 131,072 | fits | fits |
+
+**Transitions.** The budget is chosen per governor sample (`sample_s`, 5 s), from the same `owner` the count uses.
+
+- idle → active never revokes a running turn: its reservation stays, the gate does not touch it, and it runs to the
+  end. Every new turn that does not fit the smaller budget beside what still runs is a retryable `529` (memory budget:
+  0.0 GiB free), and the report says `free_bytes` 0 and `free_tokens` 0, so the provider skips the node for new
+  conversations until enough of the running turns end. This is the count rule's "stop admitting beyond the active
+  count, let running replies finish", applied to the bytes. It is not a drain: the set in flight keeps its width as
+  usual and the turns that fit are admitted as soon as room frees.
+- active → idle widens the room at once (the next sample), for the turns running and the ones to come.
+
+**413, not 529, for "fits only when the owner is away".** While the owner works, a turn over the active budget alone is
+`too_large`: a non-retryable `413` (`x-should-retry: false`), and the capacity report's `fit_tokens` is the active one,
+so the provider's skip check (`local_lane.gate_fit`) already routes such a turn elsewhere before sending, and an opening
+turn the gate still refuses is re-routed at once (`local_lane.TOO_LARGE`). The retryable 529 would be wrong here: it
+means "room frees when a running turn ends", but this room frees only when the owner steps away for 10 minutes, which
+may be hours. The client would retry every 5 s (Claude Code gives up after its retries) and the request would wait
+instead of going to the cloud. On the 4-bit default no turn is in this case any more (the whole context fits the
+active budget). On the 6-bit copy it costs this: a **continuation** of a conversation already bound to the Pro that
+grows past ~72k tokens while the owner works gets the terminal 413 a too-large continuation always got ("start a new conversation,
+compact, or exclude the model"); it is not resumed on the Pro when the owner leaves.
+
 ### The backend's prompt cap (vllm-mlx runs under a guard)
 
 The reservation is capped at `context_tokens` (131,072): the KV cache of a sequence no longer than that is all the
@@ -1109,15 +1167,16 @@ recurrent; vllm-mlx keeps the KV cache unquantized, fp16):
 
 | Setting | Default | Why |
 |---|---|---|
-| `memory_budget_bytes` | 40 GiB | of the Pro's 48 GB, leaving ~8 GB for macOS and the owner's apps |
+| `memory_budget_bytes` | 40 GiB | of the Pro's 48 GB, leaving ~8 GB for macOS and the owner's apps; the budget while the owner is **idle** (25 GiB beside the 4-bit weights: a full 128k text turn fits) |
+| `active_memory_budget_bytes` | 32.25 GiB | the budget while the owner is **active** (17.25 GiB beside the 4-bit weights, the smallest quarter-GiB step at which a full 128k turn's corrected 17.06 GiB fits; owner decision 2026-11-22 "~17 GiB, keep 128k if physically possible", "Active budget" below); absent: min(32.25 GiB, `memory_budget_bytes`); never above it |
 | `weights_bytes` | 15 GiB (4-bit); 22.4 GB (6-bit, measured idle) | resident weights |
-| `kv_bytes_per_token` | 65,536 | 16 full-attention layers × K/V × 4 KV heads × head_dim 256 × 2 bytes; 128k tokens = 8 GiB |
+| `kv_bytes_per_token` | 65,536 | 16 full-attention layers × K/V × 4 KV heads × head_dim 256 × 2 bytes; 128k tokens = 8 GiB. Only qwen3_5's full-attention layers (every `full_attention_interval` = 4th of 64, `layer_types` in config.json) keep per-token KV; the 48 linear-attention layers keep fixed-size state (`per_seq_state_bytes`). `local_governor.text_kv_bytes_per_token()` derives it from the pinned `TEXT_DIMS` |
 | `per_seq_state_bytes` | 0.15 GiB | the recurrent layers' state per sequence |
 | `prefill_margin_bytes` | 1.5 GiB | prefill activations and allocator slack: the 6-bit copy used 2.3 GB over idle for one ~9k-token request, KV + state explain ~0.7 GiB. Since #126 the per-request floor on the text-only model (its text turns reserve the computed set peak, "Text prefill" below) |
 | `context_tokens` | 131072 | the Pro block's `context_length` on the provider host; tokens are capped here |
 | `text_prefill_chunk_tokens` | 256 | #126: the guard's text prefill chunk (`--text-prefill-tokens`; upstream 2,048); the score term is linear in it |
 | `text_score_buffers` | 4 | #126: score-sized buffers per chunk (q·kᵀ, masked copy, softmax, one for the allocator); computed, to be measured |
-| `kv_copies` | 2 | #126: the padded decode batch's KV and one replaced copy; at least 2 |
+| `kv_copies` | 2 | #126, corrected 2026-11-22: the padded decode batch's KV once, plus `kv_copies` − 1 replaced copies of one full-attention layer's slice of it (1/16); at least 2 |
 | `buffer_cache_bytes` | 512 MiB | #126: MLX's buffer cache limit as the guard sets it (`--buffer-cache-bytes`; upstream 90% of the GPU working set); a recycling threshold, so one largest buffer is counted on top |
 
 What the per-request formula admits, in RESERVED tokens (the bound's, not a turn's real size; "The cost" above maps one
@@ -1141,11 +1200,14 @@ Rules on top:
 
 - **A single turn is always admitted when nothing runs and it fits alone** (and the count allows one: under critical
   pressure nothing is admitted).
-- **A turn that could never fit** (its reservation exceeds `memory_budget_bytes − weights_bytes` even with nothing
-  else running) is refused for good, not left to an endless 529 loop: see Enforcement.
+- **A turn that cannot fit now even alone** (its reservation exceeds the budget in force − `weights_bytes` with
+  nothing else running) is refused non-retryably, not left to an endless 529 loop: see Enforcement. While the owner is
+  active that includes a turn that would fit the idle budget ("Active budget" below).
 - **Pressure stays the safety net**: on warn or critical the count caps apply even when the bytes fit.
 - Both bounds gate **admission only**: when the owner comes back with 6 running, the limit drops to 2, nothing new is
-  admitted until fewer than 2 run, and the 6 finish on their own (never killed). A reservation is released however
+  admitted until fewer than 2 run, and the 6 finish on their own (never killed). The byte budget shrinks the same way:
+  three 64k turns admitted while the owner was away keep their 18.17 GiB when the owner returns to a 17.25 GiB
+  budget, and every new turn is a retryable 529 until enough of the running ones end. A reservation is released however
   its turn ends: answered, backend error, upstream timeout, backend unreachable, client gone mid-stream, or an
   exception in the relay (a `Ticket`, released once). On Ollama and on a vision model it is released in the gate's
   `finally`; on a vllm-mlx text-only model only when the guard confirms the turn left vllm-mlx's scheduler
@@ -1177,10 +1239,11 @@ turn is refused:
   `x-should-retry: false`, before admission.
 
 Both carry the capacity report. The gate reports `{"backend", "limit", "inflight", "owner", "pressure", "reason",
-"reserved_bytes", "free_bytes", "fit_tokens", "free_tokens"}` read-only as `cortados_gate` in every `GET /api/tags`
+"reserved_bytes", "budget_bytes", "free_bytes", "fit_tokens", "free_tokens"}` read-only as `cortados_gate` in every `GET /api/tags`
 answer and as `capacity` in the switch status (provider `GET /v1/cortados/local`; the dashboard's Local models card
-shows "vllm-mlx: n of limit running, R of B GiB reserved (reason)"). `free_bytes` is the budget beside the weights
-minus the reservations; `fit_tokens` is the most context one turn may hold alone, `free_tokens` beside what runs now
+shows "vllm-mlx: n of limit running, R of B GiB reserved (owner active|idle budget) (reason)"). `budget_bytes` is the
+budget in force beside the weights (smaller while the owner is active), `free_bytes` that budget minus the reservations
+(0 while the reservations exceed it after the owner's return); `fit_tokens` is the most context one turn may hold alone, `free_tokens` beside what runs now
 (0 when the count is full). Bytes and tokens are null without a governor.
 
 The provider (`local_lane.gate_busy`, `local_lane.gate_fit`) keeps the latest report per node for 10 s and ESTIMATES a
@@ -1305,7 +1368,7 @@ batch holds nothing, and vllm-mlx clears MLX's cache when requests finish (`sche
 
 | term | bytes | what it holds |
 | --- | --- | --- |
-| kv | kv_copies (2) × n × M × 65,536 | the decode batch, every row padded to the longest, and one replaced copy |
+| kv | n × M × 65,536 + (kv_copies − 1) × n × M × 65,536 / 16 | the decode batch, every row padded to the longest, and one replaced copy of one of the 16 full-attention layers' slices (corrected 2026-11-22: it was kv_copies whole copies) |
 | decode | 4 × Hq × n × M × a + n × M | one decode step's attention rows and mask against the padded batch |
 | fixed | n × (2 × per_seq_state_bytes + V × (a + 8)) | each turn's recurrent state and one copy; its decode row's logits and float32 log-probabilities |
 | prefill | max over the set of: 4 × Hq × C × P × a + 2 × C × P + 2 × C × width + 8 × P | ONE prompt's chunk at a time: unfused scores (q·kᵀ, masked copy, softmax, one for the allocator), the boolean mask and its left-padding product, one layer's activations doubled for the allocator, the prompt's ids |
@@ -1323,31 +1386,32 @@ By term, one turn whose prompt is its whole context (4-bit defaults; `tests/test
 
 | tokens | scores | mask + chunk + ids | kv | decode + fixed | buffer cache + overshoot | **total** | old formula |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1,024 | 0.05 GiB | 0.15 GiB | 0.16 GiB | 0.30 GiB | 0.51 GiB | **1.71 GiB** (the old formula: computed 1.17) | 1.71 GiB |
-| 32,768 | 1.50 GiB | 0.17 GiB | 4.03 GiB | 0.31 GiB | 0.88 GiB | **6.88 GiB** | 3.65 GiB |
-| 65,536 | 3.00 GiB | 0.18 GiB | 8.03 GiB | 0.31 GiB | 1.25 GiB | **12.78 GiB** | 5.65 GiB |
-| 131,072 | 6.00 GiB | 0.21 GiB | 16.03 GiB | 0.33 GiB | 2.00 GiB | **24.57 GiB** | 9.65 GiB |
+| 1,024 | 0.05 GiB | 0.15 GiB | 0.08 GiB | 0.30 GiB | 0.51 GiB | **1.71 GiB** (the old formula: computed 1.09) | 1.71 GiB |
+| 32,768 | 1.50 GiB | 0.17 GiB | 2.14 GiB | 0.31 GiB | 0.88 GiB | **4.99 GiB** (#126 as merged: 6.88) | 3.65 GiB |
+| 65,536 | 3.00 GiB | 0.18 GiB | 4.27 GiB | 0.31 GiB | 1.25 GiB | **9.01 GiB** (12.78) | 5.65 GiB |
+| 131,072 | 6.00 GiB | 0.21 GiB | 8.52 GiB | 0.33 GiB | 2.00 GiB | **17.06 GiB** (24.57) | 9.65 GiB |
 
-**The maximum admitted text prompt.** 4-bit (25 GiB beside 15 GiB of weights): **the whole context**. Any prompt
-with prompt + max_tokens ≤ 131,072 fits, alone (24.57 GiB at the cap, so nothing runs beside a full-context turn). The
-6-bit copy (17.6 GiB beside 22.4 GB): at most **92,338 tokens of context** alone (`fit_tokens` reports 92,337,
-counting the prompt as the whole context). In the gate's input bound, that is 92,337 with max_tokens 1, 89,555 with
-4,096, and 70,077 with Claude Code's 32,768. Anything larger is a
+**The maximum admitted text prompt.** 4-bit, owner idle (25 GiB beside 15 GiB of weights) or active (17.25 GiB):
+**the whole context**. Any prompt with prompt + max_tokens ≤ 131,072 fits, alone (17.06 GiB at the cap, so nothing
+runs beside a full-context turn: the padded batch would make a second row 128k wide too). The 6-bit copy: the whole
+context while the owner is away (17.6 GiB beside 22.4 GB); while the owner works (9.85 GiB) at most **72,362 tokens
+of context** alone (`fit_tokens` reports 72,361, counting the prompt as the whole context). In the gate's input
+bound, that is 72,361 with max_tokens 1, 70,191 with 4,096, and 54,999 with Claude Code's 32,768. Anything larger is a
 **413 never-fits** (`x-should-retry: false`), which the provider routes elsewhere. A turn that fits alone but not
 beside what runs now is a retryable **529**, as before.
 
 **What changes for current traffic** (text-only 4-bit, owner idle, count 8; per-turn size from the input bound, which
-counts ~4 body bytes per real token of code):
+counts ~4 body bytes per real token of code). Before #126 → #126 as merged → since the 2026-11-22 KV correction:
 
-| input bound + max_tokens | reserved before → now | fit at once before → now |
+| input bound + max_tokens | reserved alone | fit at once (idle) |
 | --- | --- | --- |
-| 1,000 + 256 | 1.73 → 1.73 GiB | 8 → 8 (the count) |
-| 8,000 + 512 (~2k real) | 2.17 → 2.49 GiB alone; 8 together reserve exactly the old 17.4 GiB | 8 → 8 |
-| 36,000 + 512 (~9k real) | 3.88 → 7.52 GiB | 6 → 4 |
-| 8,000 + 32,000 (~2k real, Claude Code) | 4.09 → 6.34 GiB | 6 → 4 |
-| 34,000 + 32,000 (~8.5k real, Claude Code) | 5.68 → 11.01 GiB | 4 → 2 |
-| 64,000 + 4,096 | 5.81 → 13.00 GiB | 4 → 2 |
-| ≥ 99k + 32,000 (the cap) | 9.65 → 24.57 GiB | 2 → 1 |
+| 1,000 + 256 | 1.73 → 1.73 → 1.73 GiB | 8 → 8 → 8 (the count) |
+| 8,000 + 512 (~2k real) | 2.17 → 2.49 → 2.17 GiB; 8 together reserve exactly the old 17.4 GiB | 8 → 8 → 8 |
+| 36,000 + 512 (~9k real) | 3.88 → 7.52 → 5.42 GiB | 6 → 4 → 6 |
+| 8,000 + 32,000 (~2k real, Claude Code) | 4.09 → 6.34 → 4.09 GiB | 6 → 4 → 6 |
+| 34,000 + 32,000 (~8.5k real, Claude Code) | 5.68 → 11.01 → 7.22 GiB | 4 → 2 → 4 |
+| 64,000 + 4,096 | 5.81 → 13.00 → 9.09 GiB | 4 → 2 → 4 |
+| 99,000 + 32,000 (the cap) | 9.65 → 24.57 → 15.20 GiB | 2 → 1 → 2 |
 
 A mixed set pays for its longest row: a short turn beside a 128k one now waits (529) instead of running, because it
 would hold 128k of KV in the padded batch. After a long turn, or a full batch, ends, the turns still running keep
@@ -1483,18 +1547,46 @@ the same set formula (`text_room`), so the provider's skip check sees the new ro
 old reservation was already at least the computed peak, so it stands byte for byte (eight ~2k-token turns still run
 at once). A vision model's turns, text-only ones included, reserve exactly as in #125 (`text_route` is false there).
 
-**These are computed bounds, not measurements.** The counts `text_score_buffers` (4) and `kv_copies` (2) are the
-formula's assumptions, like the image prefill's `score_buffers`. The 6-bit copy's 2.3 GB measured over idle for one
-~9k-token request implies fewer live score buffers than 4 (at the old 2,048 step, 4 buffers would be 3.4 GiB alone).
-The acceptance gate is the Pro's peak footprint and `mx.get_peak_memory()` in the hardware test window: one full
-128k turn, a 64k turn beside short ones, and eight short turns. If a measured peak exceeds its reservation, the counts
-or the chunk are corrected before relying on them.
+**Measured against the hardware (2026-11-22).** These were computed bounds until the hardware test on the owner's
+Pro (4-bit Qwen3.8 27B, vllm-mlx 0.6.0 under the guard, 256-token text prefill, prefix cache off). Two cases are now
+measured. "Over idle" is the process footprint (including the kernel's recorded peak) above the idle footprint with
+the weights loaded:
+
+| case | measured peak over idle | `mx.get_peak_memory()` over idle | reserved (#126 as merged) | reserved (corrected) |
+| --- | --- | --- | --- | --- |
+| one full turn alone, 130,872 tokens | **11.93 GiB** | 10.59 GiB | 24.54 GiB | **17.06 GiB** (5.13 GiB, 43 %, above the measured peak) |
+| eight short ~2k turns at once | **3.33 GiB** | — | 14.32 GiB | 14.32 GiB (unchanged: the per-request floor) |
+
+**What the full turn shows: the KV term counted the batch twice.** The per-token KV was right: 65,536 bytes, from
+the 16 full-attention layers only (`TEXT_FULL_ATTENTION_LAYERS` = `num_hidden_layers` 64 / `full_attention_interval`
+4; the 48 linear-attention layers keep fixed-size state, `per_seq_state_bytes`), so 8 GiB at 128k. But the kv term
+was `kv_copies` (2) × the whole padded batch, 16.03 GiB, and alone that is above the measured 11.93 GiB. A turn's KV
+is 8 GiB of it, the rest (3.9 GiB) the prefill chunk, state and cache. So the whole batch was never held twice.
+That fits how the replacements happen: the cache grows by 256 positions (512 times in that turn), joins, filters and
+extracts **one layer at a time**. Each layer's `KVCache` concatenates or gathers its own arrays, and MLX returns the
+old buffer once its replacement is evaluated. The term is now the padded batch once plus `kv_copies` − 1 replaced
+copies of one layer's slice: n × M × 65,536 × (1 + 1/16). At 128k that is 8.52 GiB instead of 16.03 GiB.
+
+**The margin that remains** at 128k (17.06 reserved against 11.93 measured, 5.13 GiB) is in the other terms, which
+are kept as they were: four score buffers of the last chunk (6 GiB; the measurement leaves room for about two of
+them live at once beside the KV), the buffer cache plus one overshooting score buffer (2 GiB), and a whole layer's
+replaced slice. It covers MLX batching several layers' replacements into one command buffer before their old buffers
+return: up to ten layers' worth fits in it. The decode padding term is kept (measured to be real: a short row beside
+a long one is held at the long one's width).
+
+**The short turns** stay reserved at the per-request floor (`prefill_margin_bytes`, 1.5 GiB each): eight ~2k turns
+reserve 14.3 GiB for a measured 3.33 GiB. That floor is not the text formula's to change here. Lowering it for the
+text route is a separate decision (it would let more short turns run while the owner works).
+
+The cases not yet measured are a 64k turn beside short ones and the 6-bit copy. If a measured peak ever exceeds its
+reservation, the counts or the chunk are corrected before relying on them.
 
 **The prefix cache is off on the text route** (#126 review round 2, P1). vllm-mlx's own prefix cache
 (`MemoryAwarePrefixCache`, on by default, `scheduler.py` 93-99 and 1402-1445) keeps finished prompts' KV as separate
 copies, up to 20% of the RAM available when it starts (`--cache-memory-mb` unset), across requests. That pool was
 outside every reservation: with ~4 GiB in it, a full-context turn's 24.57 GiB plus the pool is ~28.6 GiB beside the
-weights, over the 25 GiB budget. Its insertions are unbounded too: `memory_cache.py` `commit_prepared` (1551-1568)
+weights, over the 25 GiB budget (since the 2026-11-22 KV correction: 17.06 + 4 = 21.06 GiB, over the 17.25 GiB
+owner-active budget). Its insertions are unbounded too: `memory_cache.py` `commit_prepared` (1551-1568)
 materialises a turn's new snapshot before it evicts older entries.
 
 So the text route serves with it off:

@@ -1526,7 +1526,8 @@ def _general(w: dict[str, Any]) -> bool:
 
 def lane_enabled(lane: Any) -> bool:
     """Whether the router can send work to `lane` at all, by the checks routing itself makes: the anthropic-api credit
-    lane only with a configured key (the provider refuses every api/ pin without one: server._serve_api_lane), any lane
+    lane only while it is on (key, grants, ledger, stop line: api_credits.state; the provider refuses every API turn
+    otherwise: server._api_turn), any lane
     only with a context ceiling above 0 (core.resolve's fit gate refuses every turn on a 0 ceiling: antigravity's
     containment). A disabled lane's reading (no key: 0 % of a $0 budget) never stands for the fleet's floor."""
     from cortados_router import api_credits, core
@@ -1534,8 +1535,36 @@ def lane_enabled(lane: Any) -> bool:
         return False
     base = lane.split("#", 1)[0]
     if base == "anthropic-api":
-        return bool(api_credits.configured_orgs())
+        return bool(api_credits.state(time.time()).get("on"))
     return core.lane_ceiling(lane) > 0
+
+
+def api_credit_section(st: dict[str, Any] | None, now: float, errors: list | None = None) -> dict[str, Any]:
+    """The API credit lane (#114) from api_credits.state: on / off and why, dollars used / left under the 95 % stop line,
+    the binding budget's % used, the alert level (50 / 80 / 95), the soonest counting grant's expiry and whether the
+    expiry preference is active. Metadata only: never the key, the config path or a request."""
+    errs = list(errors or [])
+    if not isinstance(st, dict):
+        return _section(now, "error", errs or [_err("api credit", "unavailable")], on=False, reason=None,
+                        alert_level=0)
+    grant = st.get("grant") if isinstance(st.get("grant"), dict) else None
+    month = st.get("month") if isinstance(st.get("month"), dict) else None
+    exp = grant.get("expires_at") if grant else None
+    return _section(now, "ok", errs, on=bool(st.get("on")), reason=st.get("reason"),
+                    alert_level=st.get("alert_level") or 0, pct_used=_r(st.get("pct_used")),
+                    headroom_usd=_r(st.get("headroom_usd"), 2), reserved_usd=_r(st.get("reserved_usd"), 2),
+                    open_reservations=st.get("open_reservations"),
+                    grant=({"amount_usd": _r(grant.get("amount_usd"), 2), "used_usd": _r(grant.get("used_usd"), 2),
+                            "left_usd": _r(grant.get("left_usd"), 2), "stop_line_usd": _r(grant.get("stop_line_usd"), 2),
+                            "expires_at": exp, "expires_in_h": round((exp - now) / 3600, 1) if _num(exp) else None}
+                           if grant else None),
+                    month=({"limit_usd": _r(month.get("limit_usd"), 2), "used_usd": _r(month.get("used_usd"), 2),
+                            "stop_line_usd": _r(month.get("stop_line_usd"), 2), "resets_at": month.get("resets_at")}
+                           if month else None),
+                    grants=[{"name": g.get("name"), "amount_usd": _r(g.get("amount_usd"), 2),
+                             "expires_at": g.get("expires_at"), "counting": bool(g.get("counting"))}
+                            for g in (st.get("grants") or []) if isinstance(g, dict)],
+                    expiring_soon=bool(st.get("expiring_soon")), prefer_within_days=st.get("prefer_within_days"))
 
 
 def subscriptions_section(u: dict[str, Any], now: float,
@@ -1750,6 +1779,7 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
             run_origins: Callable[[], dict[str, Any]] | None = None,
             stubs_by_id: Callable[[list[str]], list] | None = None,
             binding_errors: Callable[[], list] | None = None,
+            api_credit: Callable[[], dict[str, Any]] | None = None,
             session: str | None = None, peek_foreign: bool = True) -> dict[str, Any]:
     """The snapshot. Each input is a callable, run under its own guard: one that raises turns ITS section into
     status "error" with the exception's type (never its text: an OSError carries a path), the rest stand.
@@ -1916,6 +1946,8 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
     if split_totals is None and isinstance(tv, dict):
         split_totals = tv.get("token_totals")
     ws = work_split.section(split_totals, beats, now, tv_errs if tv is None else None, session=session)
+    ac_errs: list = []
+    ac = api_credit_section(guard("api credit", api_credit, ac_errs), now, ac_errs) if api_credit is not None else None
     counts = tasks.get("counts") or {}
     overview = {
         "running_tasks": counts.get("running") if tasks["status"] != "error" else None,
@@ -1930,9 +1962,13 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
         "orchestrators": sum(1 for g in orch["items"] if g["kind"] != "unattributed"),
         "routed_token_pct_24h": ((ws.get("overall") or {}).get("24h") or {}).get("routed_pct"),
     }
+    if ac is not None:                              # #114: only where the section is published (not the session view)
+        overview["api_credit_alert"] = ac.get("alert_level")
     snap = {"version": VERSION, "generated_at": round(now, 3), "overview": overview, "tasks": tasks,
             "conversations": conv, "orchestrators": orch, "routed": routed, "subscriptions": subs, "s1": s1,
             "hosts": hosts, "work_split": ws}
+    if ac is not None:
+        snap["api_credit"] = ac
     return for_session(snap, session) if session is not None else snap
 
 
