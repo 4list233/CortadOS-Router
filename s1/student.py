@@ -70,14 +70,18 @@ PREFIX_SLOTS = 2              # one per distinct system prompt: the plain one an
 class PrefixCache:
     """The processed state of the fixed system-prompt prefix, per system prompt, for one loaded model.
 
-    The leak of 2026-09 (~50 MB per call, after which the cache was dropped) came from aliasing: requests ran on the
-    stored cache objects themselves, so each request's tokens were written into, and grew, the shared state. Here the
-    stored state is never handed to a request. `build` processes the prefix once on a cache of its own, keeps each
-    layer's arrays trimmed to exactly the prefix length and materialized, and `fresh_copy` gives every request a NEW
-    cache object whose arrays are copies (`copy_array`) of the stored ones: what a request appends lands in its own
-    arrays (and, with the stored length exactly full, the first append re-allocates anyway). Memory is bounded: at most
-    PREFIX_SLOTS prefixes (LRU), and the whole object belongs to one Scorer, so a model reload (a new Scorer)
-    drops it with the old model."""
+    History: an earlier prefix cache (before this repository's first commit, 2026-10-13) deep-copied the stored prefix
+    per request and still grew memory ~50 MB per call, so it was removed. Its cause was never established: the deep copy
+    rules out plain aliasing of the stored state, and whether the 256 MB MLX buffer-cache cap (set_cache_limit, for the
+    22 GB growth of 2026-09-26) would have contained it is unknown. So this design is not proven leak-free by argument; it is made observable
+    instead: `stats()` (slots, bytes) and peak RSS go on every serve request-log line, and `s1/check_prefix_cache.py`
+    measures RSS over 200 cached scores on the Studio before a deploy.
+
+    The stored state is never handed to a request. The prefix is processed once on a cache of its own, each layer's
+    arrays are kept trimmed to exactly the prefix length and materialized, and `fresh_copy` gives every request a NEW
+    cache object whose arrays are copies (`copy_array`) of the stored ones. Stored memory is bounded: at most
+    PREFIX_SLOTS prefixes (LRU), and the whole object belongs to one Scorer, so a model reload (a new Scorer) drops it
+    with the old model."""
 
     def __init__(self, model, make_cache, copy_array, materialize, slots: int = PREFIX_SLOTS):
         from collections import OrderedDict
@@ -106,6 +110,11 @@ class PrefixCache:
         while len(self._entries) > self._slots:
             self._entries.popitem(last=False)
         return stored
+
+    def stats(self) -> dict:
+        """Slots in use and the stored arrays' bytes (nbytes; 0 for arrays that do not report it)."""
+        nbytes = sum(int(getattr(a, "nbytes", 0) or 0) for layers in self._entries.values() for layer in layers for a in layer)
+        return {"prefix_slots": len(self._entries), "prefix_bytes": nbytes}
 
     def fresh_copy(self, prefix: tuple, to_array):
         """A new cache holding a private copy of `prefix`'s processed state, or None when reuse is off for this model."""
@@ -169,13 +178,13 @@ class Scorer:
             self._prefix_ids[system] = ids
         return ids
 
-    def score(self, request: str, unit_kind: str = "interactive", *, task_context=None) -> dict[str, Any]:
+    def score(self, request: str, unit_kind: str = "interactive", *, task_context=None, use_prefix: bool = True) -> dict[str, Any]:
         mx, t0 = self.mx, time.time()
         msgs = messages(request, unit_kind, task_context=task_context)
         prompt = list(self.tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True))
         prefix = self._system_prefix(msgs[0]["content"])
         cache = None
-        if prefix and len(prompt) > len(prefix) and tuple(prompt[:len(prefix)]) == prefix:
+        if use_prefix and prefix and len(prompt) > len(prefix) and tuple(prompt[:len(prefix)]) == prefix:
             try:
                 cache = self.prefixes.fresh_copy(prefix, mx.array)   # this request's own copy of the processed system prompt
             except Exception as exc:                      # reuse is an optimisation: on any failure turn it off, score in full
@@ -185,7 +194,7 @@ class Scorer:
         reused = len(prefix) if cache is not None else 0
         if cache is None:
             cache = self._make_cache(self.model)          # reuse off or the prompt does not start with the prefix: full pass
-        self.last_stats = {"prompt_tokens": len(prompt), "prefix_tokens": reused}
+        self.last_stats = {"prompt_tokens": len(prompt), "prefix_tokens": reused, **self.prefixes.stats()}
         feed, done_text, answers, probs = prompt[reused:], "", {}, {}
         n_fed_completion = 0
         for q in QUESTIONS:

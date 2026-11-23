@@ -204,5 +204,28 @@ class PrefixCacheTests(unittest.TestCase):
         self.assertEqual(s.last_stats["prefix_tokens"], 0)
         self.assertEqual(s.score("another")["probs"], cold.score("another")["probs"])   # stays off, still correct
 
+    def test_stats_report_slots_and_bytes_on_every_score(self):
+        class Sized(list):
+            @property
+            def nbytes(self):
+                return 2 * len(self)                      # e.g. 2 bytes per element
+        s, _, _ = make_scorer()
+        s.prefixes._copy = lambda a: Sized(a)
+        self.assertEqual(s.prefixes.stats(), {"prefix_slots": 0, "prefix_bytes": 0})
+        s.score("a request")
+        self.assertEqual(s.last_stats["prefix_slots"], 1)
+        self.assertEqual(s.last_stats["prefix_bytes"], 2 * PREFIX_LEN * s.model.layers)
+
+    def test_use_prefix_false_runs_the_uncached_path(self):
+        # the opt-in deploy check (s1/check_prefix_cache.py) compares both paths on one loaded model
+        s, model, _ = make_scorer()
+        cold, _, _ = make_scorer(slots=0)
+        cached = s.score("compare me")
+        uncached = s.score("compare me", use_prefix=False)
+        self.assertEqual(s.last_stats["prefix_tokens"], 0)
+        self.assertEqual(cached["probs"], uncached["probs"])
+        self.assertEqual(uncached["probs"], cold.score("compare me")["probs"])
+
+
 if __name__ == "__main__":
     unittest.main()
