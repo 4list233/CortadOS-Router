@@ -514,3 +514,108 @@ class TestErrorSanitizing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTurnCap(unittest.TestCase):
+    """#114 review round 1: a hard wall-clock cap on the whole upstream turn (urllib's timeout bounds each socket
+    operation only), below the grants' expiry margin; a turn cut off there is ABORTED and never relayed past the cap."""
+
+    SSE_START = (b'event: message_start\ndata: {"type": "message_start", "message": {"model": "m", '
+                 b'"usage": {"input_tokens": 10, "output_tokens": 1}}}\n\n')
+    SSE_TEXT = (b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 0, '
+                b'"delta": {"type": "text_delta", "text": "late"}}\n\n')
+    SSE_END = (b'event: message_delta\ndata: {"type": "message_delta", "usage": {"output_tokens": 5}}\n\n'
+               b'event: message_stop\ndata: {"type": "message_stop"}\n\n')
+
+    def test_the_cap_never_exceeds_the_expiry_margin_whatever_is_configured(self):
+        from cortados_router import api_credits
+        for configured in (60.0, 1800.0, 7200.0, 10 ** 9, 0.0, -5.0, float("nan")):
+            with mock.patch.object(ap, "UPSTREAM_TIMEOUT_S", configured):
+                cap = ap.turn_cap_s()
+                self.assertGreater(cap, 0)
+                self.assertLessEqual(cap, api_credits.MAX_TURN_S)
+                self.assertLess(cap, api_credits.EXPIRY_MARGIN_S)
+
+    def test_a_stream_crossing_its_deadline_on_a_fake_clock_is_aborted_and_not_relayed_past_it(self):
+        clock = [1000.0]
+
+        class Ticking(FakeResp):
+            def __iter__(self_inner):
+                yield self.SSE_START                 # at the send
+                clock[0] += 40 * 60                  # the next chunk arrives forty minutes in: past the 30-minute cap
+                yield self.SSE_TEXT
+                yield self.SSE_END
+
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"stream": True}, "claude-opus-5-5", 0, key="sk",
+                                  urlopen=lambda req, timeout=None: Ticking(), deadline=1000.0 + 1800.0,
+                                  clock=lambda: clock[0])
+        self.assertEqual(outcome, ap.ABORTED)
+        out = h.wfile.buf.getvalue()
+        self.assertIn(b"message_start", out)
+        self.assertNotIn(b"late", out)              # nothing past the cap reaches the client
+        self.assertNotIn(b"message_stop", out)
+        self.assertIn(b"time cap", out)              # the client is told the turn was cut off
+
+    def test_a_turn_whose_deadline_has_passed_is_never_sent(self):
+        opened = []
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {}, "claude-opus-5-5", 0, key="sk",
+                                  urlopen=lambda req, timeout=None: opened.append(1), deadline=5.0, clock=lambda: 10.0)
+        self.assertEqual((outcome, opened, h.status), ("rejected", [], 504))
+
+    def test_a_response_that_never_begins_is_cut_off_at_the_cap(self):
+        import threading
+        release = threading.Event()
+
+        def hang(req, timeout=None):
+            release.wait(10)
+            return FakeResp(body=b"{}")
+
+        h = FakeHandler()
+        t0 = __import__("time").monotonic()
+        usage, outcome = ap.serve(h, {}, "claude-opus-5-5", 0, key="sk", urlopen=hang,
+                                  deadline=__import__("time").monotonic() + 0.3)
+        release.set()
+        self.assertEqual(outcome, ap.ABORTED)
+        self.assertEqual(h.status, 504)
+        self.assertLess(__import__("time").monotonic() - t0, 5)
+
+    def test_a_stalled_real_stream_is_cut_off_by_shutting_its_socket(self):
+        # A real loopback upstream that sends one event and then holds the connection open (a periodic-event stream
+        # past the cap looks the same to the reader): the cutoff timer shuts the socket down and serve returns ABORTED.
+        import socket as so
+        import threading
+        import time as tm
+        import urllib.request
+        srv = so.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        stop = threading.Event()
+
+        def upstream():
+            c, _ = srv.accept()
+            c.recv(65536)
+            c.sendall(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n" + self.SSE_START)
+            stop.wait(10)
+            c.close()
+
+        threading.Thread(target=upstream, daemon=True).start()
+        port = srv.getsockname()[1]
+
+        def open_fn(req, timeout=None):
+            fwd = urllib.request.Request(f"http://127.0.0.1:{port}/v1/messages", data=req.data,
+                                         headers=dict(req.header_items()), method="POST")
+            return urllib.request.build_opener(ap._NoRedirect).open(fwd, timeout=timeout)
+
+        h = FakeHandler()
+        t0 = tm.monotonic()
+        try:
+            usage, outcome = ap.serve(h, {"stream": True}, "claude-opus-5-5", 0, key="sk", urlopen=open_fn,
+                                      deadline=tm.monotonic() + 0.5)
+        finally:
+            stop.set()
+            srv.close()
+        self.assertEqual(outcome, ap.ABORTED)
+        self.assertLess(tm.monotonic() - t0, 5)      # cut at ~0.5 s, not at the 30-minute socket timeout
+        self.assertIn(b"message_start", h.wfile.buf.getvalue())

@@ -93,6 +93,28 @@ class TestPricing(unittest.TestCase):
         self.assertEqual(ac.cost_usd("claude-haiku-5-5", input_tokens=-5), 0.0)
         self.assertEqual(ac.cost_usd("claude-haiku-5-5", input_tokens=float("inf")), 0.0)
 
+    def test_iterations_are_settled_each_at_its_own_model_and_never_below_the_top_level(self):
+        # #114 review round 1: a multi-attempt turn reports usage.iterations; each billed attempt is priced at its own
+        # model (never below the requested one) and speed, and the charge is the larger of their sum and the top level.
+        top = {"input_tokens": 1000, "output_tokens": 100}
+        its = [{"model": "claude-sonnet-5", "input_tokens": 1000, "output_tokens": 50},
+               {"model": "claude-opus-5", "input_tokens": 1000, "output_tokens": 100, "speed": "fast"}]
+        got = ac.cost_from_usage("claude-sonnet-5", {**top, "iterations": its})
+        want = (1000 * 2 + 50 * 10) / 1e6 + (1000 * 5 * 2 + 100 * 25 * 2) / 1e6
+        self.assertAlmostEqual(got, want)
+        # a cheaper model named by an iteration is priced at the requested (dearer) one
+        cheap = [{"model": "claude-haiku-4-5", "input_tokens": 1000, "output_tokens": 100}]
+        self.assertAlmostEqual(ac.cost_from_usage("claude-opus-5", {**top, "iterations": cheap}),
+                               (1000 * 5 + 100 * 25) / 1e6)
+        # an iteration naming no model (unexpected: fallbacks are refused) is priced at the dearest tier
+        anon = [{"input_tokens": 1000, "output_tokens": 100}]
+        self.assertAlmostEqual(ac.cost_from_usage("claude-sonnet-5", {**top, "iterations": anon}),
+                               (1000 * 10 + 100 * 50) / 1e6)
+        # iterations summing below the top level never lower the charge
+        small = [{"model": "claude-sonnet-5", "input_tokens": 1, "output_tokens": 1}]
+        self.assertAlmostEqual(ac.cost_from_usage("claude-sonnet-5", {**top, "iterations": small}),
+                               ac.cost_from_usage("claude-sonnet-5", top))
+
     def test_server_tool_charges_are_counted(self):
         usage = {"input_tokens": 1_000, "output_tokens": 0, "server_tool_use": {"web_search_requests": 10}}
         self.assertAlmostEqual(ac.cost_from_usage("claude-opus-5-5", usage), 0.004 + 0.10, places=6)
@@ -130,11 +152,14 @@ class TestEstimateIsAnUpperBound(unittest.TestCase):
         n = len(json.dumps(big).encode()) + ac.TEMPLATE_TOKENS
         self.assertAlmostEqual(ac.estimate_max_cost(big, "claude-opus-5-5"), (n * 16.0 + 1000 * 30.0) / 1e6)
 
-    def test_fallbacks_are_priced_at_the_dearest_model(self):
-        b = self.body(fallbacks=[{"model": "claude-opus-5"}])
-        self.assertGreater(ac.estimate_max_cost(b, "claude-opus-5-5"), ac.estimate_max_cost(self.body(), "claude-opus-5-5"))
-        self.assertEqual(ac.estimate_max_cost(self.body(fallbacks="default"), "claude-sonnet-5-5"),
-                         ac.estimate_max_cost(self.body(fallbacks="default"), "unknown"))   # unknown -> dearest
+    def test_a_request_carrying_fallbacks_is_refused_whatever_its_value(self):
+        # #114 review round 1, the review's repro: Fable 5.2 at max_tokens=1 with an Opus 5 fallback allowing 128k fast
+        # output reserved $0.067656 although the fallback alone permits $6.40. Any `fallbacks` is now refused outright.
+        repro = self.body(max_tokens=1, fallbacks=[{"model": "claude-opus-5", "max_tokens": 128_000, "speed": "fast"}])
+        for fb in (repro, self.body(fallbacks="default"), self.body(fallbacks=[]), self.body(fallbacks=None)):
+            with self.assertRaises(ac.Unbounded) as cm:
+                ac.estimate_max_cost(fb, "claude-fable-5-2")
+            self.assertIn("fallbacks", str(cm.exception))
 
     def test_images_are_bounded_by_their_pixels_not_their_base64(self):
         img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": png(1000, 1000)}}
@@ -208,6 +233,19 @@ class TestConfig(Base):
         st = self.state(ts("2027-01-15T12:00:00-05:00"))
         self.assertTrue(st["on"], st["reason"])
         self.assertEqual(st["grant"]["stop_line_usd"], 47.5)
+
+    def test_a_turn_is_admitted_only_if_its_time_cap_ends_before_the_grant_expires(self):
+        # #114 review round 1: the hard turn cap is below the expiry margin, and reserve() refuses a turn whose cap
+        # would end inside the slack before the earliest counting grant expires.
+        self.assertLess(ac.MAX_TURN_S, ac.EXPIRY_MARGIN_S)
+        expires = ts("2026-12-02T19:00:00-05:00")
+        last = expires - ac.EXPIRY_MARGIN_S - 1          # the grant still counts, with the default cap it fits exactly
+        self.assertIsNotNone(ac.reserve(0.01, last, self.ledger))
+        self.assertIsNone(ac.reserve(0.01, last, self.ledger, duration_s=ac.MAX_TURN_S + 2))   # would end too late
+        self.assertIsNone(ac.reserve(0.01, expires - ac.EXPIRY_MARGIN_S + 1, self.ledger))      # stopped counting
+        for bad in (0, -1, float("inf"), float("nan")):
+            with self.assertRaises(ac.LedgerError):
+                ac.reserve(0.01, NOW, self.ledger, duration_s=bad)
 
     def test_a_grant_not_yet_granted_does_not_count(self):
         self.write_config({**CONFIG, "grants": [{**GRANT, "granted": "2026-11-25T00:00:00-05:00",

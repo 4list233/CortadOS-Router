@@ -14,8 +14,12 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
 import math
 import os
+import socket
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +32,90 @@ API_BASE = os.environ.get("CORTADOS_ANTHROPIC_API_BASE", "https://api.anthropic.
 API_VERSION = os.environ.get("CORTADOS_ANTHROPIC_API_VERSION", "2023-06-01")
 UPSTREAM_TIMEOUT_S = float(os.environ.get("CORTADOS_ANTHROPIC_API_TIMEOUT_S", "1800"))
 ALLOWED_HOST = "api.anthropic.com"
+ABORTED = "aborted"     # serve outcome: the turn hit its hard wall-clock cap and was cut off (settled in full)
+logger = logging.getLogger("cortados.provider.anthropic_proxy")
+
+
+def turn_cap_s() -> float:
+    """The hard WALL-CLOCK cap of one upstream turn (#114 review round 1): the configured timeout, never above
+    api_credits.MAX_TURN_S (which is below the grants' expiry margin), never non-positive. urllib's timeout bounds each
+    socket operation only; serve() enforces this one on the whole turn."""
+    from cortados_router import api_credits
+    t = UPSTREAM_TIMEOUT_S
+    if not math.isfinite(t) or t <= 0:
+        t = api_credits.MAX_TURN_S
+    return min(t, api_credits.MAX_TURN_S)
+
+
+def _socket_of(resp: Any) -> Any:
+    """The socket under a urllib/http.client response, or None (a fake response in tests has none)."""
+    fp = getattr(resp, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    return sock if isinstance(sock, socket.socket) else None
+
+
+class _Cutoff:
+    """Aborts a response at the turn's deadline even while a read is blocked: a timer that shuts the socket down (which
+    wakes a blocked recv) and closes the response. `fired` says it did."""
+
+    def __init__(self, resp: Any, delay_s: float):
+        self.resp, self.fired = resp, False
+        self._timer = threading.Timer(max(0.0, delay_s), self._fire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _fire(self) -> None:
+        self.fired = True
+        sock = _socket_of(self.resp)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)   # wakes a blocked read with EOF; the reader's thread closes resp
+            except OSError:
+                pass
+            return
+        try:
+            self.resp.close()                     # no socket to shut down (not a urllib response): close it instead
+        except Exception:
+            pass
+
+    def cancel(self) -> None:
+        self._timer.cancel()
+
+
+def _open_within(open_fn: Callable[..., Any], req: Any, per_op: float, remaining: float) -> tuple[Any, bool]:
+    """open_fn(req) bounded by `remaining` seconds of wall clock: (response, False), or (None, True) when the deadline
+    passed first (the call keeps running on its own thread; whatever it returns later is closed there). An exception
+    from open_fn is raised here as it was."""
+    box: dict[str, Any] = {}
+    done = threading.Event()
+    abandoned = threading.Event()
+
+    def run() -> None:
+        try:
+            box["resp"] = open_fn(req, timeout=per_op)
+        except BaseException as exc:      # noqa: BLE001 - re-raised on the caller's thread
+            box["exc"] = exc
+        done.set()
+        if abandoned.is_set() and "resp" in box:
+            try:
+                box["resp"].close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=run, name="cortados-api-open", daemon=True)
+    t.start()
+    if not done.wait(max(0.0, remaining)):
+        abandoned.set()
+        if done.is_set() and "resp" in box:   # it finished in between: close it, the turn is over all the same
+            try:
+                box["resp"].close()
+            except Exception:
+                pass
+        return None, True
+    if "exc" in box:
+        raise box["exc"]
+    return box["resp"], False
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -239,12 +327,19 @@ def upstream_error_payload(code: int, payload: bytes) -> bytes:
 
 def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: str | None = None,
           urlopen: Callable[..., Any] | None = None, model_suffix: str | None = None, echo_model: str | None = None,
-          reply: list | None = None, commit: Callable[[list], None] | None = None) -> tuple[dict[str, Any], str]:
+          reply: list | None = None, commit: Callable[[list], None] | None = None,
+          deadline: float | None = None, clock: Callable[[], float] = time.monotonic) -> tuple[dict[str, Any], str]:
     """Proxy one turn to the real API and relay the response to the client. Returns (usage, outcome):
       * ("completed"): a terminal response was received — settle the actual cost from `usage`.
       * ("rejected"):  the API returned an HTTP error — it was not billed, settle zero.
       * ("unknown"):   the turn did not terminate for us (timeout, transport error, or a mid-stream disconnect) —
                        the spend is unknown, so the caller settles the FULL reservation (conservative).
+      * ("aborted"):   the turn reached its hard wall-clock cap and was cut off (ABORTED). Closing the connection is no
+                       proof the API stopped generating or billing, so the caller settles the FULL reservation too.
+    The cap: `deadline` (on `clock`, time.monotonic by default; the caller passes the one its reservation was admitted
+    for), else turn_cap_s() from the send. It is enforced on the whole turn: the wait for the response headers runs on a
+    helper thread joined until the deadline, every read is bounded by the time left, a timer shuts the socket down at
+    the deadline (a stalled read wakes), and the stream is checked against `clock` after every chunk.
     Usage is parsed before each client write, so a disconnect cannot lose it. `model_suffix` (a revealing client
     only) is appended to the success response's `model`; usage and billing always read the upstream bytes as sent.
     A routed conversation (server._relay_api) also passes `echo_model` (the model name the client asked for, which the
@@ -269,8 +364,21 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         return {}, "rejected"
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     streaming = bool(body.get("stream"))
+    cap = turn_cap_s()
+    start = clock()
+    end = start + cap if deadline is None else min(float(deadline), start + cap)
+    left = end - start
+    if left <= 0:
+        _send_error(handler, 504, "api_error", "cortados: the API credit lane's time cap for this turn had passed; "
+                    "request not dispatched")
+        return {}, "rejected"            # nothing was sent: nothing billed
     try:
-        resp = open_fn(req, timeout=UPSTREAM_TIMEOUT_S)
+        resp, late = _open_within(open_fn, req, min(cap, left), left)
+        if late:
+            logger.warning("anthropic-api turn cut off at its %.0f s cap before the response began", left)
+            _send_error(handler, 504, "api_error", "cortados: the API turn reached its time cap before it answered; "
+                        "it was cut off (its reservation is kept in full)")
+            return {}, ABORTED
     except urllib.error.HTTPError as exc:
         # The API REJECTED the turn: nothing is billed, regardless of whether we can read or relay the error body.
         # Its body is relayed with the error message escaped and capped, the other fields as sent (#117 review round 5).
@@ -281,6 +389,10 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         _send_raw_error(handler, exc.code, "application/json", payload)
         return {}, "rejected"
     except (urllib.error.URLError, OSError) as exc:
+        if clock() >= end:                 # the per-operation timeout is the time left: this IS the cap
+            _send_error(handler, 504, "api_error", "cortados: the API turn reached its time cap before it answered; "
+                        "it was cut off (its reservation is kept in full)")
+            return {}, ABORTED
         _send_error(handler, 502, "api_error", f"cortados: upstream API unreachable: {exc}")
         return {}, "unknown"   # dispatch may have reached the API; settle conservatively
     except Exception as exc:
@@ -290,12 +402,22 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         _send_error(handler, 502, "api_error", "cortados: upstream response could not be read")
         return {}, "unknown"
 
+    cutoff = _Cutoff(resp, end - clock())
     try:
         if not streaming:
             try:
                 raw = resp.read()
-            except (OSError, http.client.HTTPException):
+            except (OSError, http.client.HTTPException, ValueError, AttributeError):
+                if cutoff.fired or clock() >= end:      # the cutoff, or the read timeout set to the time left
+                    _send_error(handler, 504, "api_error", "cortados: the API turn reached its time cap and was cut "
+                                "off (its reservation is kept in full)")
+                    return {}, ABORTED
                 return {}, "unknown"   # the turn may have been billed, but we have no usable response -> conservative
+            if cutoff.fired or clock() > end:
+                # Read past the cap: what arrived may be cut short by the shutdown; never relayed as an answer.
+                _send_error(handler, 504, "api_error", "cortados: the API turn reached its time cap and was cut off "
+                            "(its reservation is kept in full)")
+                return {}, ABORTED
             try:
                 parsed: Any = json.loads(raw)
             except ValueError:
@@ -340,8 +462,12 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         final_output = False
         revealed = not (model_suffix or echo_model)
         committed = False
+        aborted = False
         try:
             for chunk in resp:
+                if cutoff.fired or clock() > end:
+                    aborted = True                        # the chunk arrived past the cap: not relayed, not counted
+                    break
                 text = chunk.decode("utf-8", "replace")
                 saw_stop, saw_final = _update_usage_from_sse(usage, text, reply)
                 completed = completed or saw_stop        # a PARSED message_stop event
@@ -356,14 +482,25 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
                     handler.wfile.flush()
                 except OSError:
                     break  # client gone: stop relaying; the billing outcome is decided by what we already parsed
-        except (OSError, http.client.HTTPException):
-            pass   # an upstream read failed mid-stream; keep whatever usage/terminal state we already captured
+        except (OSError, http.client.HTTPException, ValueError, AttributeError):
+            pass   # an upstream read failed mid-stream (or the cutoff closed it under the read); keep whatever usage/terminal state we already captured
+        if (aborted or cutoff.fired or clock() >= end) and not completed:
+            logger.warning("anthropic-api stream cut off at its %.0f s cap", left)
+            err = {"type": "error", "error": {"type": "api_error", "message": "cortados: the API turn reached its time "
+                                              "cap and was cut off"}}
+            try:
+                handler.wfile.write(f"event: error\ndata: {json.dumps(err)}\n\n".encode())
+                handler.wfile.flush()
+            except OSError:
+                pass
+            return usage, ABORTED
         # "completed" only when the terminal event was parsed, the real final output count arrived (not just the
         # message_start estimate), AND the merged usage is usable. Otherwise the cost is not reliably known, so the
         # turn stays "unknown" and keeps the conservative reservation. A parsed terminal event means the full turn
         # was received and billed regardless of a later client/upstream failure.
         return usage, ("completed" if completed and final_output and has_usable_usage(usage) else "unknown")
     finally:
+        cutoff.cancel()
         try:
             resp.close()
         except Exception:

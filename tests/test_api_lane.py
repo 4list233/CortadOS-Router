@@ -25,7 +25,7 @@ class TestServeApiLane(unittest.TestCase):
         if headers is not None:
             h.headers = headers
         h.errors = []
-        h._error = lambda code, kind, msg, w: h.errors.append((code, msg))
+        h._error = lambda code, kind, msg, w, **kw: h.errors.append((code, msg))
         return h
 
     def test_refuses_without_a_key(self):

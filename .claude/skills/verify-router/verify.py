@@ -267,22 +267,33 @@ def grant(days, amount=200):
     json.dump({"org_monthly_limit_usd": 200, "prefer_within_days": 3, "grants": [{"name": "verify",
                "amount_usd": amount, "granted": iso(time.time() - 20 * 86400), "expires": iso(time.time() + days * 86400)}]},
               open(credit, "w"))
-def route(band="R2", outward=False, degraded=False):
+def route(band="R2", outward=False, degraded=False, **extra):
     routing._auto_down.clear()
     br = 3 if outward else 0
     r = {"router": "verify", "provider": "codex-cli", "model": "gpt-5.6-terra", "band": band, "route_id": "verify:api",
          "degraded": degraded, "decision": {"answers": {"outward": outward, "blast_radius": br}, "degraded": degraded},
          "route": {"band": band, "chosen": {"lane": "codex", "provider": "codex-cli", "model": "gpt-5.6-terra"}}}
     execution_routing.select = lambda *a, **k: dict(r)
-    body = {"model": "cortados", "max_tokens": 256, "messages": [{"role": "user", "content": "rename a variable"}]}
+    body = {"model": "cortados", "max_tokens": 256, "messages": [{"role": "user", "content": "rename a variable"}],
+            **extra}
     out = routing.choose(core, body, client="verify", conversation_id="verify-api", claude_bin=sys.executable,
                          codex_bin=sys.executable)
     return [out.get("provider"), out.get("model"), out.get("bind_reason")]
 grant(2)
 res = {"expiring": route(), "expiring_r1": route("R1"), "outward": route("R3", outward=True),
-       "degraded": route(degraded=True)}
+       "degraded": route(degraded=True),
+       "fallbacks": route(fallbacks=[{"model": "claude-opus-5", "max_tokens": 128000, "speed": "fast"}])}
+# #114 review round 1: every continuation of such a conversation passes the gate before it is forwarded.
+cbody = {"model": "cortados", "messages": [{"role": "user", "content": "rename a variable"}]}
+ok_check = lambda b, r: (True, "admitted")
+out_check = lambda b, r: (False, "outward effect (S1 outward=true): never local")
+gate = lambda **kw: routing.api_continuation_admission(cbody, {"route_id": "verify:api", "band": "R2"}, **kw)[0]
+res["cont"] = {"clean": gate(local=None, recheck=ok_check), "sensitive": gate(local="sensitive", recheck=ok_check),
+               "prefer": gate(local="prefer", recheck=ok_check), "outward": gate(local=None, recheck=out_check),
+               "no_check": gate(local=None, recheck=None)}
 grant(20)
 res["not_expiring"] = route()
+res["cont"]["not_expiring"] = gate(local=None, recheck=ok_check)
 grant(2, amount=1)
 api_credits.reserve(0.95, time.time())       # $0.95 of a $1 grant committed: the 95 % stop line
 res["past_stop"] = route()
@@ -776,11 +787,17 @@ def main():
         api = lambda x: x[0] == "anthropic-api" and x[2] == "api_credit_expiry"
         ok = (api(r["expiring"]) and r["expiring"][1] == "claude-sonnet-5" and api(r["expiring_r1"])
               and r["not_expiring"][0] == "local-pro" and r["past_stop"][0] == "local-pro"
-              and r["outward"][0] == "codex-cli" and r["degraded"][0] == "codex-cli" and r["stop_state"][0] is False)
+              and r["outward"][0] == "codex-cli" and r["degraded"][0] == "codex-cli" and r["stop_state"][0] is False
+              and r["fallbacks"][0] == "local-pro")
         record("expiring API credit takes cost-bound local work, nothing else (S1-free)", "PASS" if ok else "FAIL",
                f"grant in 2 d: R2 -> {r['expiring'][:2]}, R1 -> {r['expiring_r1'][:2]} | in 20 d -> {r['not_expiring'][:2]} | "
                f"past the stop line -> {r['past_stop'][:2]} ({r['stop_state'][1]}) | outward -> {r['outward'][:2]} | "
-               f"degraded -> {r['degraded'][:2]}")
+               f"degraded -> {r['degraded'][:2]} | with fallbacks -> {r['fallbacks'][:2]}")
+        c = r["cont"]
+        ok = c == {"clean": True, "sensitive": False, "prefer": False, "outward": False, "no_check": False,
+                   "not_expiring": False}
+        record("API credit continuations re-pass the gate before forwarding (S1-free)", "PASS" if ok else "FAIL",
+               " | ".join(f"{k} -> {'forward' if v else 'refuse'}" for k, v in c.items()))
 
     p = runner.run(["-c", INDEX_SCENARIO], prefix="verify-router-index-", timeout=300)
     try:

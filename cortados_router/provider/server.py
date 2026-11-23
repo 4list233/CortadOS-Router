@@ -2128,11 +2128,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(raw)
 
-    def _error(self, code: int, kind: str, message: str, w: Wire = wire, *, reason: str | None = None) -> None:
+    def _error(self, code: int, kind: str, message: str, w: Wire = wire, *, reason: str | None = None,
+               headers: dict[str, str] | None = None) -> None:
         """Answer an error in the wire's shape. `message` goes to the client only; the log line and the run record get
-        the fixed `reason` of _note_refusal."""
+        the fixed `reason` of _note_refusal. `headers` are added to the answer (e.g. x-should-retry: false)."""
         self._note_refusal(code, kind, reason=reason)
-        self._json(code, w.error_json(kind, message))
+        if headers:
+            self._json(code, w.error_json(kind, message), headers=headers)
+        else:
+            self._json(code, w.error_json(kind, message))
 
     def _note_refusal(self, code: int, kind: str, *, reason: str | None = None) -> None:
         """The ONE place a refusal is logged and recorded, for every failure path (JSON errors, SSE errors, the local
@@ -2542,13 +2546,18 @@ class Handler(BaseHTTPRequestHandler):
         try:
             max_cost = api_credits.estimate_max_cost(body, model)
         except api_credits.Unbounded as exc:            # a cost no reservation can cover: never dispatched
-            self._error(400, "invalid_request_error",
-                        f"cortados: the anthropic-api credit lane cannot bound the cost of this request ({exc}); "
-                        "not permitted on this lane", wire)
+            # Non-retryable: the same request can never be bounded (a routed request never gets here with it:
+            # routing.prefer_api_credit runs the same estimate and leaves such a request where it was).
+            self._error(400, "invalid_request_error", f"cortados: the anthropic-api credit lane cannot bound the cost "
+                        f"of this request ({exc}); not permitted on this lane", wire, headers={"x-should-retry": "false"})
             return "refused"
         now = time.time()
+        cap = anthropic_proxy.turn_cap_s()
+        # The turn's hard wall-clock deadline, measured from BEFORE the reservation (so never later than cap after the
+        # send): the reservation admits only a turn that ends by then well before its grant expires.
+        deadline = time.monotonic() + cap
         try:
-            res_id = api_credits.reserve(max_cost, now)
+            res_id = api_credits.reserve(max_cost, now, duration_s=cap)
         except api_credits.LedgerError as exc:
             logger.error("anthropic-api accounting unavailable, lane off, refusing to spend blind: %s", exc)
             self._error(503, "overloaded_error",
@@ -2556,9 +2565,14 @@ class Handler(BaseHTTPRequestHandler):
             return "refused"
         if res_id is None:
             st = api_credits.state(now)
-            why = st.get("reason") if not st.get("on") else (
-                f"this request's upper-bound cost (${max_cost:.2f}) does not fit under the stop line "
-                f"(${float(st.get('headroom_usd') or 0):.2f} left)")
+            if not st.get("on"):
+                why = st.get("reason")
+            elif max_cost > float(st.get("headroom_usd") or 0):
+                why = (f"this request's upper-bound cost (${max_cost:.2f}) does not fit under the stop line "
+                       f"(${float(st.get('headroom_usd') or 0):.2f} left)")
+            else:
+                why = (f"a turn started now could still run (its {cap / 60:.0f}-minute time cap) when the credit grant "
+                       "stops counting")
             self._error(429, "rate_limit_error", f"cortados: the anthropic-api credit lane refused the request: {why}",
                         wire)
             return "refused"
@@ -2580,7 +2594,8 @@ class Handler(BaseHTTPRequestHandler):
                                                    **({"model_suffix": reveal} if reveal else {}),
                                                    **({"echo_model": echo_model} if echo_model else {}),
                                                    **({"reply": reply} if reply is not None else {}),
-                                                   **({"commit": commit} if commit is not None else {}))
+                                                   **({"commit": commit} if commit is not None else {}),
+                                                   deadline=deadline)
         except OSError as exc:
             logger.info("anthropic-api proxy: client left (%s)", type(exc).__name__)
         except Exception as exc:
@@ -2594,8 +2609,9 @@ class Handler(BaseHTTPRequestHandler):
             elif outcome == "completed":
                 charge = api_credits.cost_from_usage(model, usage, geo=geo)   # a terminal response: the actual cost
             else:
-                # unknown (timeout / transport error / mid-stream disconnect): the full reservation, but never below
-                # the cost we already observed on the wire, so a partial-but-expensive turn cannot under-settle.
+                # unknown (timeout / transport error / mid-stream disconnect) or aborted at the time cap (a closed
+                # connection is no proof billing stopped): the full reservation, but never below the cost we already
+                # observed on the wire, so a partial-but-expensive turn cannot under-settle.
                 charge = max(max_cost, api_credits.cost_from_usage(model, usage, geo=geo))
             # Settle, retrying on a transient ledger failure (settle is idempotent, so a retry cannot double-charge).
             settled = False
@@ -2910,6 +2926,43 @@ class Handler(BaseHTTPRequestHandler):
             "outside it (or could not be checked), so it needs a cloud model; it was not sent. Start a new "
             "conversation (it is routed again) or pin a cloud model with sub/<model>."),
             headers={"x-should-retry": "false"})
+        return True
+
+    def _api_continuation_refused(self, session: "ApiSession", body: dict[str, Any], wire: Wire) -> bool:
+        """The continuation gate of a conversation the API credit expiry preference moved to the API (#114 review round
+        1), run on EVERY later turn before anything is forwarded. The opening turn was moved only because it was
+        local-eligible COST work that every sensitivity detector cleared, under an expiring grant
+        (routing.prefer_api_credit); a later turn is forwarded only while all of that still holds
+        (routing.api_continuation_admission): no x-cortados-local header (sensitive, or the client's own prefer for
+        local), no sensitivity detector marking the turn, S1 admitting it under the local gate (no outward effect, blast
+        radius 0-1, not degraded: Registry.local_recheck, the local continuation's own check), and the lane still on
+        with a grant inside its prefer window. Not admitted, the turn is refused with a terminal 400 before anything was
+        sent (the conversation is untouched; a new conversation is routed again). Moving it mid-way is #43's seam.
+        Logs the route id and a metadata reason only. Returns True when it answered (refused)."""
+        route = getattr(session, "route", None) or {}
+        rid = route.get("route_id")
+        local, valid = _local_header(self.headers)
+        if not valid:
+            ok, why = False, "the x-cortados-local header is malformed"
+        else:
+            try:
+                ok, why = routing.api_continuation_admission(wire.routing_body(body), route, local=local,
+                                                             recheck=self.server.registry.local_recheck)
+            except Exception as exc:                    # a checker bug fails closed
+                logger.exception("api credit continuation gate failed for %s", rid)
+                ok, why = False, f"the gate failed ({type(exc).__name__})"
+        if ok is True:
+            logger.info("api credit continuation admitted for %s: %s", rid, why)
+            return False
+        logger.warning("api credit continuation refused for %s: %s", rid, why)
+        self._note_refusal(400, "invalid_request_error",
+                           reason="a turn of an API-credit conversation failed its continuation gate")
+        self._json(400, wire.error_json(
+            "invalid_request_error",
+            "cortados: this conversation was moved to the API credit lane because its opening turn was local-eligible "
+            "work no detector marked sensitive, under credit about to expire; this turn no longer qualifies "
+            f"({why}), so it was not sent. Start a new conversation (it is routed again) or pin a model with "
+            "sub/<model>."), headers={"x-should-retry": "false"})
         return True
 
     def _refusal_fallback(self, session, turn, body: dict[str, Any], result, *, created: bool, one_shot: bool,
@@ -3294,6 +3347,8 @@ class Handler(BaseHTTPRequestHandler):
             if session is None:
                 return                                  # refused; the answer is sent
         if isinstance(session, ApiSession):             # the API credit lane: relayed to the API, never a CLI turn
+            if not created and self._api_continuation_refused(session, body, wire):
+                return
             self._relay_api(session, turn, body, created=created, one_shot=one_shot, wire=wire)
             return
         if isinstance(session, LocalSession):           # a local lane: relayed to its node, never a CLI turn

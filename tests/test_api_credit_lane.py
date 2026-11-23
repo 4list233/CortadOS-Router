@@ -107,14 +107,25 @@ class FakeAPI(BaseHTTPRequestHandler):
         cls.usage = {"input_tokens": 1000, "output_tokens": 100}
 
 
+class BurstServer(ThreadingHTTPServer):
+    request_queue_size = 128
+    daemon_threads = True
+
+
 class LaneHarness(EndpointHarness):
     TOOLS = [{"name": "Read", "description": "read", "input_schema": {"type": "object"}}]
     HEADERS = {"X-Claude-Code-Session-Id": "api-credit-lane-test"}
 
     def setUp(self):
+        # A burst of concurrent clients (the concurrency test sends 16 at once) must never overflow a listen backlog:
+        # socketserver's default of 5 resets connections under load (#114 review round 1, finding 4). Both servers
+        # listen with room for every request a test sends.
+        backlog = mock.patch.object(server.ProviderServer, "request_queue_size", 128)
+        backlog.start()
+        self.addCleanup(backlog.stop)
         super().setUp()
         FakeAPI.reset()
-        self.api = ThreadingHTTPServer(("127.0.0.1", 0), FakeAPI)
+        self.api = BurstServer(("127.0.0.1", 0), FakeAPI)
         threading.Thread(target=self.api.serve_forever, daemon=True).start()
         self.home = Path(tempfile.mkdtemp(prefix="cortados-api-credit-"))
         self.cfg = self.home / "api-credit.json"
@@ -228,12 +239,17 @@ class PinnedTurnTests(LaneHarness):
         FakeAPI.gate = threading.Event()
         codes: list = []
 
+        start = threading.Barrier(16)
+
         def one():
+            start.wait(10)                                  # all 16 connect at the same moment
             try:
                 self.post(body)
                 codes.append(200)
             except urllib.error.HTTPError as e:
                 codes.append(e.code)
+            except Exception as e:                          # a transport failure is a result too, never a lost one
+                codes.append(type(e).__name__)
 
         threads = [threading.Thread(target=one) for _ in range(16)]
         for t in threads:
@@ -244,11 +260,62 @@ class PinnedTurnTests(LaneHarness):
         FakeAPI.gate.set()
         for t in threads:
             t.join(15)
-        self.assertEqual(sorted(codes), [200] * fits + [429] * (16 - fits))
+        self.assertFalse([t for t in threads if t.is_alive()])
+        self.assertEqual(sorted(codes, key=str), [200] * fits + [429] * (16 - fits))
         self.assertEqual(len(FakeAPI.seen), fits)
         spent, reserved = self.ledger_totals()
         self.assertEqual(reserved, 0)
         self.assertLessEqual(spent, 0.95 * amount)
+
+
+    def test_a_request_carrying_fallbacks_is_refused_for_good_and_never_sent(self):
+        # #114 review round 1, finding 1 (the review's repro): Fable 5.2 at max_tokens=1 with an Opus 5 fallback
+        # allowing 128k fast output. Refused before any reservation, non-retryable.
+        body = {**self.BODY, "model": "api/claude-fable-5-2", "max_tokens": 1,
+                "fallbacks": [{"model": "claude-opus-5", "max_tokens": 128_000, "speed": "fast"}]}
+        req = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(body).encode(), method="POST",
+                                     headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
+                                              **self.HEADERS})
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=30)
+        self.assertEqual(cm.exception.code, 400)
+        self.assertEqual(cm.exception.headers.get("x-should-retry"), "false")
+        self.assertIn("fallbacks", json.loads(cm.exception.read())["error"]["message"])
+        self.assertEqual(FakeAPI.seen, [])
+        self.assertFalse(self.ledger.exists())                  # nothing was ever reserved
+
+    def test_a_turn_cut_off_at_its_time_cap_keeps_its_whole_reservation(self):
+        # #114 review round 1, finding 3: the upstream never answers; the turn is cut at its cap (shrunk here) and the
+        # reservation is settled in full, since a closed connection is no proof the API stopped billing.
+        FakeAPI.gate = threading.Event()
+        self.addCleanup(FakeAPI.gate.set)
+        est = api_credits.estimate_max_cost(self.BODY, "claude-sonnet-5")
+        with mock.patch.object(anthropic_proxy, "turn_cap_s", return_value=0.5):
+            t0 = time.monotonic()
+            code, msg = self.error_of(self.BODY)
+        self.assertEqual(code, 504)
+        self.assertIn("time cap", msg)
+        self.assertLess(time.monotonic() - t0, 10)
+        spent, reserved = self.ledger_totals()
+        self.assertEqual(reserved, 0)
+        self.assertGreaterEqual(spent, est)
+        self.assertAlmostEqual(spent, est, places=5)
+
+    def test_the_reservation_is_taken_for_the_turns_time_cap_and_the_proxy_gets_its_deadline(self):
+        seen = {}
+        real_reserve, real_serve = api_credits.reserve, anthropic_proxy.serve
+
+        def reserve(cost, now, *a, **kw):
+            seen["duration_s"] = kw.get("duration_s")
+            return real_reserve(cost, now, *a, **kw)
+
+        def serve(*a, **kw):
+            seen["left"] = kw["deadline"] - time.monotonic()
+            return real_serve(*a, **kw)
+        with mock.patch.object(api_credits, "reserve", reserve), mock.patch.object(anthropic_proxy, "serve", serve):
+            self.post(self.BODY)
+        self.assertEqual(seen["duration_s"], anthropic_proxy.turn_cap_s())
+        self.assertLessEqual(seen["left"], anthropic_proxy.turn_cap_s())
 
 
 class RoutedConversationTests(LaneHarness):
@@ -269,6 +336,15 @@ class RoutedConversationTests(LaneHarness):
                                          "model": "claude-sonnet-5"}}}
         self.reg.router = router
         self.reg.executed = lambda route: self.executed.append(route["route_id"])
+        # The preference only exists for an expiring grant: two days left, inside the 3-day window.
+        self.write_config(config(2))
+        self.rechecks: list = []
+        self.recheck_answer = (True, "no outward effect (blast_radius 0, band R2)")
+
+        def recheck(body, route):
+            self.rechecks.append(route.get("route_id"))
+            return self.recheck_answer
+        self.reg.local_recheck = recheck
 
     def opener(self, stream=False):
         return {"model": "cortados", "max_tokens": 200, "tools": self.TOOLS, "stream": stream,
@@ -314,13 +390,72 @@ class RoutedConversationTests(LaneHarness):
     def test_a_continuation_past_the_stop_line_is_refused_and_nothing_is_sent(self):
         first = self.opener()
         got = self.post(first)
-        self.write_config(config(20, amount=0.001))          # now over the stop line
+        self.write_config(config(2, amount=0.001))           # now over the stop line
         code, msg = self.error_of(self.follow(first, got["content"]))
-        self.assertEqual(code, 429)
+        self.assertEqual(code, 400)
         self.assertIn("hard stop", msg)
         self.assertEqual(len(FakeAPI.seen), 1)
         (session,) = self.reg.sessions.values()
         self.assertEqual(len(session.history), 1)            # the conversation is where it was
+
+    # #114 review round 1, finding 2: every continuation passes the gate BEFORE anything is forwarded.
+    def refused_continuation(self, headers=None):
+        first = self.opener()
+        got = self.post(first)
+        follow = self.follow(first, got["content"])
+        req = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(follow).encode(), method="POST",
+                                     headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
+                                              **self.HEADERS, **(headers or {})})
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=30)
+        self.assertEqual(cm.exception.code, 400)
+        self.assertEqual(cm.exception.headers.get("x-should-retry"), "false")
+        msg = json.loads(cm.exception.read())["error"]["message"]
+        self.assertEqual(len(FakeAPI.seen), 1)                # only the opening turn ever reached the API
+        (session,) = self.reg.sessions.values()
+        self.assertEqual(len(session.history), 1)             # untouched: the same history may continue later
+        return msg, follow
+
+    def test_a_continuation_marked_sensitive_is_refused_before_it_is_sent(self):
+        # The review's case: the opening was cleared, the next turn carries x-cortados-local: sensitive.
+        msg, _ = self.refused_continuation({"x-cortados-local": "sensitive"})
+        self.assertIn("sensitive", msg)
+
+    def test_a_continuation_asking_for_local_is_refused(self):
+        msg, _ = self.refused_continuation({"x-cortados-local": "prefer"})
+        self.assertIn("prefer", msg)
+
+    def test_a_continuation_a_detector_marks_is_refused(self):
+        with mock.patch.object(routing, "request_sensitivity", return_value="keyword"):
+            msg, _ = self.refused_continuation()
+        self.assertIn("sensitivity detector", msg)
+
+    def test_a_continuation_with_an_outward_effect_is_refused(self):
+        self.recheck_answer = (False, "outward effect (S1 outward=true): never local")
+        msg, _ = self.refused_continuation()
+        self.assertIn("outward", msg)
+        self.assertEqual(len(self.rechecks), 1)                # S1 rescored the continuation (the opening was routed)
+
+    def test_a_continuation_after_the_grant_left_its_preference_window_is_refused(self):
+        first = self.opener()
+        got = self.post(first)
+        self.write_config(config(20))                          # a new grant: nothing about to expire any more
+        code, msg = self.error_of(self.follow(first, got["content"]))
+        self.assertEqual(code, 400)
+        self.assertIn("preference window", msg)
+        self.assertEqual(len(FakeAPI.seen), 1)
+
+    def test_a_continuation_without_a_recheck_fails_closed(self):
+        self.reg.local_recheck = None
+        msg, _ = self.refused_continuation()
+        self.assertIn("re-check", msg)
+
+    def test_an_admitted_continuation_was_rescored_first(self):
+        first = self.opener()
+        got = self.post(first)
+        self.post(self.follow(first, got["content"]))
+        self.assertEqual(len(FakeAPI.seen), 2)
+        self.assertEqual(self.rechecks, [self.routed[0]])
 
 
 class FakeCore:
@@ -395,6 +530,8 @@ class PreferenceRuleTests(unittest.TestCase):
             self.assertEqual(core.logged, [])
         r = local_route()
         self.assertIs(self.prefer(r, excluded=lambda m: m == "claude-sonnet-5")[0], r)
+        # server-side fallbacks (#114 review round 1): never moved, the request stays local
+        self.assertIs(self.prefer(r, body={**BODY, "fallbacks": [{"model": "claude-opus-5"}]})[0], r)
         img = {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}}
         self.assertIs(self.prefer(r, body={**BODY, "messages": [{"role": "user", "content": [img]}]})[0], r)
         with mock.patch("cortados_router.api_credits.state", side_effect=RuntimeError("x")):

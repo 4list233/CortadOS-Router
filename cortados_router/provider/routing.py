@@ -949,6 +949,38 @@ def prefer_api_credit(core, body: dict[str, Any], r: dict[str, Any], *, client: 
     return moved
 
 
+def api_continuation_admission(body: dict[str, Any], route: dict[str, Any] | None, *, local: str | None,
+                               recheck: Callable[[dict, dict], tuple[bool, str]] | None,
+                               now: float | None = None) -> tuple[bool, str]:
+    """The continuation gate of a conversation prefer_api_credit moved to the API (#114 review round 1): (admitted,
+    metadata reason), run by server.Handler._api_continuation_refused on EVERY later turn before it is forwarded. The
+    opening's eligibility must still hold for this turn: no x-cortados-local mode (`sensitive` marks it for the Pro,
+    `prefer` is the client asking for local), a wire the local relay serves (no NO_LOCAL_KEY), no sensitivity detector
+    marking it (request_sensitivity; doubt counts), the lane on with a counting grant inside its prefer window
+    (api_credits.state), and S1 admitting this turn under the local gate (`recheck`: continuation_admission, no outward
+    effect, blast radius 0-1, not degraded). Fails closed on anything else, including no `recheck`."""
+    from cortados_router import api_credits
+    route = route if isinstance(route, dict) else {}
+    if local is not None:
+        return False, f"{LOCAL_HEADER}: {local} (the turn asks for a local model)"
+    if body.get(NO_LOCAL_KEY):
+        return False, "the turn came on a wire the local relay does not serve"
+    sensitive = request_sensitivity(body, route, None)
+    if sensitive is not None:
+        return False, f"a sensitivity detector marked the turn ({sensitive_notice.detector(sensitive)})"
+    st = api_credits.state(time.time() if now is None else now)
+    if not st.get("on"):
+        return False, f"the API credit lane is off: {st.get('reason')}"
+    if not st.get("expiring_soon"):
+        return False, "no counting grant expires within the preference window any more"
+    if recheck is None:
+        return False, "this endpoint has no continuation re-check"
+    ok, why = recheck(body, route)
+    if ok is not True:
+        return False, f"S1 did not admit the turn for local-eligible work: {why}"
+    return True, why
+
+
 # ----------------------------------------------------------------------------------------------- local admission
 # The S1 blast_radius levels that mean "no effect outside this machine" (core.ANCHORS["blast_radius"]): 0 "words only,
 # nothing changes" and 1 "a bounded reversible workspace change". 2 ("a broad or difficult-to-reverse system change")

@@ -8,8 +8,10 @@ Budget (owner, 2026-11-14 and 2026-11-22). The credit is a set of promotional GR
 plus the organisation's monthly spend limit (UTC month). They are configured by the owner in a small JSON file
 (config_path(): ~/.config/cortados/api-credit.json; example tables/api-credit.example.json; never the key):
 
-  * A grant COUNTS from `granted` until EXPIRY_MARGIN_S before `expires` (the longest upstream turn plus margin, so no
-    turn admitted under a grant can still be running when it expires). After the last grant stops counting the lane
+  * A grant COUNTS from `granted` until EXPIRY_MARGIN_S before `expires`. Every upstream turn has a hard wall-clock
+    cap MAX_TURN_S < EXPIRY_MARGIN_S (anthropic_proxy aborts it there and the reservation is then kept in full), and
+    reserve() admits a turn only when its cap ends EXPIRY_SLACK_S before the earliest counting grant expires, so no
+    turn admitted under a grant can still be running when it expires. After the last grant stops counting the lane
     is off until the owner adds a new grant: credit is never assumed to refill.
   * Grant budget G = the sum of the counting grants' amounts. Grant use U_G = what the owner saw used outside this
     ledger (amount - remaining_usd, when a grant states its remaining as of a date) + every dollar this ledger committed
@@ -33,7 +35,8 @@ window all turn the lane off (LedgerError / ConfigError; state() says which).
 Per-request cost estimate (estimate_max_cost) is an UPPER bound: every byte of the serialized request counts as one
 input token (a token is never shorter than one byte), plus a template allowance and per-tool allowance, priced at the
 cache-write rate (the dearest input treatment); max_tokens (or the model's 128k ceiling) as output; fast mode, data
-residency and the long-context tier priced in; no cache-read or batch discount assumed. Content whose cost the request
+residency and the long-context tier priced in; no cache-read or batch discount assumed. A request carrying server-side
+`fallbacks` is refused (REFUSED_FIELDS), so one reservation covers one model's one attempt. Content whose cost the request
 bytes cannot bound (a server-executed tool, a URL or Files API source, a PDF, an image whose size cannot be read) is
 refused (Unbounded). Settlement prices the real usage the same way (cost_from_usage), so the ledger never under-counts.
 
@@ -57,7 +60,12 @@ LANE = "anthropic-api"
 
 STOP_FRACTION = 0.95                           # owner 2026-11-14: hard stop at 95% of the budget; a config may lower it
 ALERT_LEVELS = (50, 80, 95)                    # owner 2026-11-14: dashboard alerts
-EXPIRY_MARGIN_S = 3600.0                       # a grant stops counting an hour before it expires (upstream timeout 30 min)
+EXPIRY_MARGIN_S = 3600.0                       # a grant stops counting an hour before it expires
+# #114 review round 1: the hard WALL-CLOCK cap of one upstream turn (anthropic_proxy aborts the turn there, whatever the
+# socket does), strictly below the margin, so a turn admitted while its grant counts has ended before the grant expires.
+MAX_TURN_S = 1800.0
+EXPIRY_SLACK_S = EXPIRY_MARGIN_S - MAX_TURN_S  # what is left between a capped turn's end and the grant's expiry
+assert 0 < MAX_TURN_S < EXPIRY_MARGIN_S
 MONTH_SPILL_DAYS = 1                           # the previous month's last UTC day also counts against this month
 DEFAULT_PREFER_DAYS = 3.0                      # expiry preference window (see prefer_window_s)
 KEEP_DAYS = 400                                # ledger days older than this with nothing reserved are pruned
@@ -115,6 +123,10 @@ DEFAULT_SERVER_TOOL_USES = 20  # a declared web-search tool with no max_uses: re
 CLIENT_TOOL_TYPES = ("custom", "bash_", "text_editor_", "computer_", "memory_", "tool_search_tool_")
 # Top-level request fields whose cost the request bytes cannot bound: refused.
 UNBOUNDED_FIELDS = ("mcp_servers", "container", "thread")
+# Top-level fields refused whenever PRESENT (any value, empty or null included). `fallbacks` (server-side fallback models,
+# #114 review round 1): every attempt is billed, each fallback may carry its own max_tokens and speed, and the bill comes
+# back as usage.iterations; one reservation cannot bound that, so a request carrying it is never sent on this lane.
+REFUSED_FIELDS = ("fallbacks",)
 
 
 class LedgerError(RuntimeError):
@@ -228,15 +240,49 @@ def server_tool_cost(usage: dict[str, Any] | None) -> float:
     return sum(SERVER_TOOL_USD.get(k, 0.0) * _n(v) for k, v in stu.items())
 
 
-def cost_from_usage(model: str, usage: dict[str, Any] | None, *, geo: bool = False) -> float:
-    """The cost of a finished turn from its usage block, priced like the estimate (long-context tier, fast mode, data
-    residency, cache writes at the 1-hour rate), so a settled charge is never below the bill."""
-    u = usage if isinstance(usage, dict) else {}
-    fast = str(u.get("speed") or "").lower() == "fast"
+def _usage_geo(u: dict[str, Any], geo: bool) -> bool:
     if not geo and u.get("inference_geo"):
         geo = str(u.get("inference_geo")).lower() not in ("global", "not_available")
-    base = cost_usd(model, u.get("input_tokens", 0), u.get("output_tokens", 0), u.get("cache_read_input_tokens", 0),
-                    u.get("cache_creation_input_tokens", 0), fast=fast, geo=geo)
+    return geo
+
+
+def _block_cost(model: str, u: dict[str, Any], *, geo: bool, fast: bool = False) -> float:
+    fast = fast or str(u.get("speed") or "").lower() == "fast"
+    return cost_usd(model, u.get("input_tokens", 0), u.get("output_tokens", 0), u.get("cache_read_input_tokens", 0),
+                    u.get("cache_creation_input_tokens", 0), fast=fast, geo=_usage_geo(u, geo))
+
+
+def _iteration_model(it: dict[str, Any], model: str) -> str:
+    """The model an iteration is priced at: the dearer of the one it names and the requested one; an iteration naming no
+    model (or not a Claude model) is priced at DEFAULT_PRICE, the dearest tier (iterations are unexpected on this lane:
+    `fallbacks` is refused, so doubt is priced up, never down)."""
+    named = it.get("model")
+    if not isinstance(named, str) or not named.strip().lower().startswith("claude-"):
+        return "unknown"
+    pn, pm = price_for(named), price_for(model)
+    return named if (pn["input"], pn["output"]) >= (pm["input"], pm["output"]) else model
+
+
+def cost_from_usage(model: str, usage: dict[str, Any] | None, *, geo: bool = False) -> float:
+    """The cost of a finished turn from its usage block, priced like the estimate (long-context tier, fast mode, data
+    residency, cache writes at the 1-hour rate), so a settled charge is never below the bill.
+
+    usage.iterations (#114 review round 1): when the API reports billed iterations (server-side fallbacks, compaction or
+    any other multi-attempt turn), each is priced at its own model's rates (_iteration_model: never below the requested
+    model, an unnamed model at the dearest tier) and its own speed, and the charge is the LARGER of their sum and the
+    top-level usage priced at the requested model, so whichever of the two the API meant as the bill is covered."""
+    u = usage if isinstance(usage, dict) else {}
+    base = _block_cost(model, u, geo=geo)
+    its = u.get("iterations")
+    if isinstance(its, list) and its:
+        top_fast = str(u.get("speed") or "").lower() == "fast"
+        total = 0.0
+        for it in its:
+            if not isinstance(it, dict):
+                continue
+            total += _block_cost(_iteration_model(it, model), it, geo=geo or _usage_geo(u, False), fast=top_fast) \
+                + server_tool_cost(it)
+        base = max(base, total)
     return base + server_tool_cost(u)
 
 
@@ -286,6 +332,10 @@ def estimate_max_cost(body: dict[str, Any], model: str) -> float:
     bad = [f for f in UNBOUNDED_FIELDS if body.get(f)]
     if bad:
         raise Unbounded(f"request field(s) {', '.join(bad)}")
+    refused = [f for f in REFUSED_FIELDS if f in body]
+    if refused:
+        raise Unbounded(f"request field(s) {', '.join(refused)} (server-side fallbacks bill every attempt, each with its "
+                        "own model, max_tokens and speed; the credit lane sends one model per request)")
     tools = body.get("tools")
     servers = unbounded_server_tools(body)
     if servers:
@@ -303,21 +353,10 @@ def estimate_max_cost(body: dict[str, Any], model: str) -> float:
         max_out = MAX_OUTPUT_TOKENS
     fast = str(body.get("speed") or "").lower() == "fast"
     geo = bool(body.get("inference_geo"))
-    # Server-side fallbacks may run the turn on another model: price the dearest model the request can reach.
-    models = [model]
-    fb = body.get("fallbacks")
-    if fb:
-        items = fb if isinstance(fb, list) else [fb]
-        for it in items:
-            name = it.get("model") if isinstance(it, dict) else it
-            models.append(name if isinstance(name, str) and name.startswith("claude-") else "unknown")
-    worst = 0.0
-    for m in models:
-        p = price_for(m)
-        fi, fo = _factors(m, input_tokens, fast=fast, geo=geo)
-        in_rate = max(p["input"], p["cache_write"]) * fi
-        worst = max(worst, (input_tokens * in_rate + max_out * p["output"] * fo) / 1_000_000.0)
-    return worst + _server_tool_allowance(tools)
+    p = price_for(model)
+    fi, fo = _factors(model, input_tokens, fast=fast, geo=geo)
+    in_rate = max(p["input"], p["cache_write"]) * fi
+    return (input_tokens * in_rate + max_out * p["output"] * fo) / 1_000_000.0 + _server_tool_allowance(tools)
 
 
 def _server_tool_allowance(tools: Any) -> float:
@@ -681,13 +720,26 @@ def lane_on(now: float) -> bool:
     return bool(state(now)["on"])
 
 
-def reserve(max_cost: float, now: float, path: Path | None = None, *, config: Path | None = None) -> str | None:
+def turn_fits_before_expiry(cfg: dict[str, Any], now: float, duration_s: float) -> bool:
+    """True when a turn started at `now` and cut off at `duration_s` (its hard wall-clock cap) ends at least
+    EXPIRY_SLACK_S before the EARLIEST expiry of the grants counting at `now` (the spend may be billed against any of
+    them). False when no grant counts."""
+    grants = counting(cfg, now)
+    return bool(grants) and now + duration_s <= min(g["expires"] for g in grants) - EXPIRY_SLACK_S
+
+
+def reserve(max_cost: float, now: float, path: Path | None = None, *, config: Path | None = None,
+            duration_s: float = MAX_TURN_S) -> str | None:
     """Reserve `max_cost` against the credit, atomically with every other reservation: returns a reservation id to
-    settle later, or None when the lane is off or the cost does not fit under the stop line (state() says why).
+    settle later, or None when the lane is off, the cost does not fit under the stop line (state() says why), or the
+    turn's hard time cap `duration_s` would end after the grants' cutoff (turn_fits_before_expiry).
     Raises LedgerError (or ConfigError) when accounting is unavailable: the caller refuses (fail closed)."""
     cost = float(max_cost)
     if not math.isfinite(cost) or cost < 0:
         raise LedgerError("refusing a reservation that is not a finite non-negative amount")
+    dur = float(duration_s)
+    if not math.isfinite(dur) or dur <= 0:
+        raise LedgerError("refusing a reservation without a finite positive time cap")
     if key_problem() is not None:
         return None
     cfg = load_config(config)
@@ -701,7 +753,7 @@ def reserve(max_cost: float, now: float, path: Path | None = None, *, config: Pa
         if cursor and today <= cursor:          # a clock rollback into pruned days: never reopen them blank
             raise LedgerError("the clock is inside the ledger's pruned days; refusing")
         nums = _numbers(cfg, data, now)          # everything spent and reserved, read under this lock
-        if nums.get("grant") is None or cost > nums["headroom_usd"]:
+        if nums.get("grant") is None or cost > nums["headroom_usd"] or not turn_fits_before_expiry(cfg, now, dur):
             return None
         _prune(data, now)
         led = data["days"].setdefault(today, {"spent_usd": 0.0, "reserved": {}})

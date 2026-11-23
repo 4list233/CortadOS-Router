@@ -436,9 +436,13 @@ executor, `server.Handler._api_turn`), rebuilt on 2026-11-22 around the owner's 
 **Budget.** The owner lists the Console's grants in `~/.config/cortados/api-credit.json` on the provider's machine
 (example: `tables/api-credit.example.json`; never the key): each grant's name, `amount_usd`, `granted` and `expires`
 (ISO 8601 with a UTC offset), optionally `remaining_usd` + `remaining_as_of` (what the Console showed left, and when),
-plus `org_monthly_limit_usd`. A grant counts from `granted` until one hour before `expires` (the longest upstream turn
-is 30 min, so nothing admitted under a grant still runs when it expires); after the last grant stops counting the lane
-is off until a new grant is added. Nothing assumes credit refills.
+plus `org_monthly_limit_usd`. A grant counts from `granted` until one hour before `expires`. Every upstream turn has a
+hard 30-minute wall-clock cap (`api_credits.MAX_TURN_S`; `CORTADOS_ANTHROPIC_API_TIMEOUT_S` may only lower it): the proxy
+cuts the turn off there whatever the socket does (the wait for the headers, a stalled read, a stream of periodic events),
+and a turn is admitted only when its cap ends at least 30 minutes before the earliest counting grant expires, so nothing
+admitted under a grant still runs when it expires. A turn cut off at the cap keeps its whole reservation: a closed
+connection is no proof the API stopped billing. After the last grant stops counting the lane is off until a new grant is
+added. Nothing assumes credit refills.
 
 - Grant use U_G = (amount - remaining_usd for grants that state it) + every dollar the ledger committed (spent +
   reserved) from the earliest counting grant's start day (UTC) on. Grant budget G = the counting grants' amounts.
@@ -456,13 +460,16 @@ is off until a new grant is added. Nothing assumes credit refills.
 (`$CORTADOS_HOME/api-credit-ledger.json`, one entry per UTC day), checked against everything already spent and reserved,
 so concurrent requests (server threads or other processes) can never together pass the stop line; then it settles the
 real cost from the response's `usage` (an overrun recorded, never clamped; the full reservation when the cost is
-unknown; zero when the API returned an error). The bound: every byte of the serialized request is one input token, plus
+unknown or the turn was cut off at its cap; zero when the API returned an error; `usage.iterations`, when present, each
+priced at its own model, never below the requested one, an unnamed model at the dearest tier, and the larger of their
+sum and the top-level usage settled). The bound: every byte of the serialized request is one input token, plus
 4,000 template tokens and 1,500 per tool, priced at the 1-hour cache-write rate (2x input); `max_tokens` (128k when
 absent) at the output rate; the long-context tier (input x2, output x1.5 above 200k), fast mode (x2), `inference_geo`
-(x1.1) and the dearest `fallbacks` model priced in; images bounded by their pixel size (width x height / 750 x 1.5 + 200)
+(x1.1) priced in; images bounded by their pixel size (width x height / 750 x 1.5 + 200)
 read from their header. Refused as unbounded (400, nothing sent): server-executed tools (web search / fetch, code
 execution, advisor, MCP toolsets), URL / Files API / PDF sources, unreadable or GIF images, `mcp_servers`, `container`,
-`thread`. **Fails closed:** a missing or invalid grants file, an unreadable, corrupt or unwritable ledger, a ledger that no
+`thread`, and any request carrying `fallbacks` (every server-side attempt is billed, each with its own model, `max_tokens`
+and speed; non-retryable 400 on a pin, and a routed request carrying it is never moved to the lane). **Fails closed:** a missing or invalid grants file, an unreadable, corrupt or unwritable ledger, a ledger that no
 longer holds a counting grant's days, and a second key (`CORTADOS_ANTHROPIC_API_KEY_2`, the old multi-org slots) all
 turn the lane off. `python3 -m cortados_router.api_credits status` prints the state (metadata only).
 
@@ -470,8 +477,11 @@ turn the lane off. `python3 -m cortados_router.api_credits status` prints the st
 (default 3), S1-routed work that a COST rule moved to a local model (R0 `auto_route` or the published index; never a
 sensitive bind, never the client's own `x-cortados-local: prefer`, never a request any sensitivity detector marked) runs
 on the API instead (`routing.prefer_api_credit`), on S1's own Claude choice or else the band's Claude model in the
-routing table. Such a conversation stays on the API (`server.ApiSession`, relayed per turn like a local one); a later turn
-the lane can no longer take (stop line, expiry) is refused with the reason. Otherwise routing is S1 and scarcity as
+routing table. Such a conversation stays on the API (`server.ApiSession`, relayed per turn like a local one), and EVERY
+later turn passes a continuation gate before anything is sent (`routing.api_continuation_admission`): no
+`x-cortados-local` header, no sensitivity detector marking it, S1 admitting it under the local gate (no outward effect,
+blast radius 0-1, not degraded), the lane on and a grant still inside its preference window. A turn that fails it is
+refused (terminal 400, nothing sent, the conversation untouched); moving it to another lane mid-way is #43's seam. Otherwise routing is S1 and scarcity as
 always: the lane is never an S1 candidate.
 
 **Key.** `CORTADOS_ANTHROPIC_API_KEY` in the provider's environment, the variable the earlier lane read (on the Air the
