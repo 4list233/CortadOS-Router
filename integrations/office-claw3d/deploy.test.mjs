@@ -62,9 +62,17 @@ else:
     sys.stderr.write("fake dscl: unexpected %s\\n" % sys.argv[1:]); sys.exit(99)
 `;
 const FAKE_DSEDITGROUP = `#!/bin/bash
-# fake dseditgroup: "-o checkmember -m NAME admin" -> 0 when NAME is listed in $FAKE/admins
+# fake dseditgroup, answering as the real one does (captured on the Air, macOS 26):
+# "-o checkmember -m NAME admin" -> exit 0 "yes NAME is a member of admin" when NAME is listed in
+# $FAKE/admins, else exit 67 "no NAME is NOT a member of admin". $FAKE/dsedit-override, when present,
+# holds "STATUS|STDOUT|STDERR" and replaces the answer (failures, unexpected output).
 [ "$1 $2 $3" = "-o checkmember -m" ] || { echo "fake dseditgroup: unexpected $*" >&2; exit 99; }
-grep -qx "$4" "$FAKE/admins" 2>/dev/null
+if [ -f "$FAKE/dsedit-override" ]; then
+  IFS='|' read -r st out err < "$FAKE/dsedit-override"
+  [ -n "$out" ] && echo "$out"; [ -n "$err" ] && echo "$err" >&2; exit "$st"
+fi
+if grep -qx "$4" "$FAKE/admins" 2>/dev/null; then echo "yes $4 is a member of $5"; exit 0; fi
+echo "no $4 is NOT a member of $5"; exit 67
 `;
 
 const xml = v => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -145,6 +153,40 @@ test('role check: a reused account must have the home, disabled login and shell 
   assert.match(checkRole(await fakeHost(t, { [ROLE.name]: noShell })).err, /shell is not/);
   const admin = checkRole(await fakeHost(t, { [ROLE.name]: GOOD }, [ROLE.name]));
   assert.equal(admin.code, 1); assert.match(admin.err, /is an admin/);
+});
+
+test('role check: "not an admin" only on dseditgroup\'s exact confirmed negative (#77 fix round 1)', async t => {
+  const N = ROLE.name;
+  const run = async override => {
+    const dir = await fakeHost(t, { [N]: GOOD });
+    if (override !== undefined) await writeFile(join(dir, 'dsedit-override'), override + '\n');
+    return checkRole(dir);
+  };
+  // captured on the Air: exit 67, stdout "no NAME is NOT a member of admin", stderr empty
+  assert.deepEqual(await run(), { code: 0, out: 'reuse', err: '' });
+  assert.deepEqual(await run(`67|no ${N} is NOT a member of admin|`), { code: 0, out: 'reuse', err: '' });
+  // direct member (captured: exit 0 "yes NAME is a member of admin")
+  let r = await run(`0|yes ${N} is a member of admin|`);
+  assert.equal(r.code, 1); assert.equal(r.out, ''); assert.match(r.err, /is an admin/);
+  // nested member: dseditgroup resolves nested groups and answers the same way (captured: root, a member
+  // of com.apple.access_ssh only through its nested admin group, gets exit 0 "yes root is a member ...")
+  r = checkRole(await fakeHost(t, { [N]: GOOD }, [N]));
+  assert.equal(r.code, 1); assert.match(r.err, /is an admin/);
+  // failures and unexpected answers refuse, never "reuse"
+  for (const o of [
+    '2||dseditgroup: directory services unavailable',      // the reviewer's case
+    '64||Unable to find the user record',                   // captured for an unknown user
+    '1|no ' + N + ' is NOT a member of admin|',             // right text, wrong status
+    '67||',                                                 // right status, no text
+    '67|no someone-else is NOT a member of admin|',         // another user's answer
+    '67|no ' + N + ' is not a member of admin|',            // changed wording
+    '0||',                                                  // success with no answer
+    '0|maybe|',                                             // unexpected output on success
+  ]) {
+    r = await run(o);
+    assert.equal(r.code, 1, o); assert.equal(r.out, '', o);
+    assert.match(r.err, o.startsWith('0|') ? /cannot establish that .* is not an admin/ : /cannot establish/, o);
+  }
 });
 
 test('the fake dscl answers as the real one does, including the exit 0 on "No such key" (#77)', async t => {

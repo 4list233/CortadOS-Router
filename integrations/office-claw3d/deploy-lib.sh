@@ -56,8 +56,24 @@ check_role() {  # name uid home
   [[ "$authorities" == 0 ]] || die "$name has an AuthenticationAuthority (a password or token login): not a role user"
   [[ "$(attr "$name" IsHidden)" == 1 ]] || die "$name: not hidden"
   [[ "$(attr "$name" RealName)" == "$ROLE_REALNAME" ]] || die "$name: RealName is not '$ROLE_REALNAME'"
-  if dseditgroup -o checkmember -m "$name" admin >/dev/null 2>&1; then die "$name is an admin"; fi
+  admin_negative "$name" || exit 1
   echo reuse
+}
+
+# 0 only on dseditgroup's exact confirmed negative: exit 67 with stdout "no NAME is NOT a member of
+# admin" (captured on macOS 26: a member, also through a nested group, is exit 0 "yes NAME is a member
+# of admin"; an unknown user exit 64 with "Unable to find the user record" on stderr). Any other exit
+# status or output -- a member, a directory-services failure, an unexpected format -- refuses: a lookup
+# that failed never reads as "not an admin".
+admin_negative() {  # name
+  local out rc=0
+  out="$(dseditgroup -o checkmember -m "$1" admin 2>/dev/null)" || rc=$?
+  if [[ $rc == 67 && "$out" == "no $1 is NOT a member of admin" ]]; then return 0; fi
+  if [[ $rc == 0 && "$out" == "yes $1 is a member of admin" ]]; then
+    echo "deploy-air: $1 is an admin" >&2; return 1
+  fi
+  echo "deploy-air: $1: cannot establish that it is not an admin (dseditgroup exit $rc, unexpected answer)" >&2
+  return 1
 }
 
 serve_port_state() {  # port target < `tailscale serve status --json`: free | ours | funnel | other
