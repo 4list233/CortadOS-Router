@@ -38,7 +38,10 @@ each refusal a fixed reason (REFUSALS, so the provider may repeat it to a client
   6. the switch again (the samples above may have taken a moment: never admit after the owner turned it off).
 
 Every unreadable input is a refusal, never "free" (no silent fallback). Samples (power, sessions, the activity files,
-memory, GPU) are re-read at most every sample_s; the switch is read on every call. In-flight turns are never stopped when
+memory) are re-read at most every sample_s; the switch is read on every call. The GPU decision is made on every call
+(fix round 2): own_gpu_skip_max_s is checked each time, and an nvidia-smi reading is reused for sample_s only while no
+turn of the gate's own has started or ended since it was taken, so the first check after a turn ends takes a fresh
+reading, waiting out what is left of own_gpu_settle_s first. In-flight turns are never stopped when
 a game starts: the gate only stops admitting (a running turn is bounded by the gate's read timeout and its max_tokens; at
 ~30 tok/s a 4K-token answer is about two minutes). To free the GPU at once, the PC's toggle script's `off -FreeGpu` also
 asks Strata to unload the model (scripts/windows/cortados-serving.ps1).
@@ -269,6 +272,7 @@ class WindowsIdlePolicy:
         self._own_ended = float("-inf")       # when the last one ended (a reading waits own_gpu_settle_s after it)
         self._own_epoch = 0                   # bumped on every start and end: a reading spanning one is mixed
         self._gpu_quiet_at = float("-inf")    # the last reading under the threshold taken while the gate was quiet
+        self._gpu_reading: tuple[float, int, int | None] | None = None   # (when, own epoch, util) of the last quiet one
 
     @property
     def api(self):
@@ -353,14 +357,21 @@ class WindowsIdlePolicy:
         with self._lock:
             own, ended, epoch = self._own, self._own_ended, self._own_epoch
         if own == 0:
+            got = self._gpu_reading
+            if got is not None and got[1] == epoch and 0 <= self._clock() - got[0] < self.cfg["sample_s"]:
+                # the same quiet stretch (no turn started or ended since), within sample_s: no new nvidia-smi run
+                return GPU_UNKNOWN if got[2] is None else GPU_BUSY if got[2] >= top else None
             wait = self.cfg["own_gpu_settle_s"] - (self._clock() - ended)
             if wait > 0:
                 self._sleep(wait)                 # the gate's own last decoding leaves the reading
             util = gpu_utilization(self.cfg, self._run)
+            with self._lock:
+                quiet = self._own == 0 and self._own_epoch == epoch
+                if quiet:
+                    self._gpu_reading = (self._clock(), epoch, util)
             if util is None:
                 return GPU_UNKNOWN
             with self._lock:
-                quiet = self._own == 0 and self._own_epoch == epoch
                 if quiet:
                     # a busy reading also withdraws the last good one: a call during a turn never leans on it
                     self._gpu_quiet_at = self._clock() if util < top else float("-inf")
@@ -373,9 +384,10 @@ class WindowsIdlePolicy:
             return None
         return GPU_UNKNOWN
 
-    def _sampled(self) -> tuple[str | None, dict[str, Any]]:
-        """(the first refusal among power, owner, memory and GPU, or None; the words for the status), re-read at most
-        every sample_s."""
+    def _inputs(self) -> tuple[str | None, dict[str, Any]]:
+        """(the first refusal among power, owner and memory, or None; the words for the status), re-read at most every
+        sample_s. The GPU is not in this cache: its answer depends on the gate's own turns starting and ending and on
+        own_gpu_skip_max_s, so _gpu decides on every check (fix round 2: a cached GPU answer outlived both)."""
         with self._lock:
             got = self._sample
         now = self._clock()
@@ -383,18 +395,23 @@ class WindowsIdlePolicy:
             return got[1], got[2]
         why, power = self._power()
         owner_why, owner = self._owner()
-        why = why or owner_why or self._memory() or self._gpu()
+        why = why or owner_why or self._memory()
         words = {"power": power, "activity": owner}
         with self._lock:
             self._sample = (self._clock(), why, words)
         return why, words
+
+    def _sampled(self) -> str | None:
+        """The first refusal among power, owner, memory and GPU, or None."""
+        why, _ = self._inputs()
+        return why or self._gpu()
 
     def allowed(self) -> tuple[bool, str]:
         """(allowed, reason): the decision for one new turn (module docstring)."""
         why = self._switch()
         if why:
             return False, why
-        why, _ = self._sampled()
+        why = self._sampled()
         if why:
             return False, why
         why = self._switch()                  # never admit after the owner turned it off during the samples
@@ -406,7 +423,7 @@ class WindowsIdlePolicy:
         """The switch status the gate answers (local_gate.GateHandler.switch_status): the same fields as
         local_resources.local_switch_status, plus `activity` (away | idle | active | unknown)."""
         allowed, reason = self.allowed()
-        _, words = self._sampled()
+        _, words = self._inputs()
         try:
             switch = "on" if self._switch_on() else "off"
         except OSError:

@@ -736,6 +736,60 @@ class OwnGpuTests(PolicyBase):
         self.assertEqual(p.allowed(), (False, node_policy.GPU_UNKNOWN))                 # no quiet reading yet
 
 
+class GpuLifecycleTests(PolicyBase):
+    """Reviewer finding (fix round 2): a cached GPU decision outlived the gate's own turns starting and ending and
+    own_gpu_skip_max_s. The GPU is now decided on every check; a reading is reused only within one quiet stretch."""
+
+    def setUp(self):
+        super().setUp()
+        self.api.sessions = []
+
+    def test_an_unknown_during_a_long_turn_does_not_outlive_the_turn(self):
+        p = self.policy()
+        self.assertTrue(p.allowed()[0])                                                 # quiet reading at t=0
+        p.forward_started()                                                             # a long turn of its own
+        self.clock[0] += 61.0
+        self.assertEqual(p.allowed(), (False, node_policy.GPU_UNKNOWN))                 # past own_gpu_skip_max_s
+        p.forward_ended()
+        self.gpu[0] = "3\n"
+        n = len(self.smi_calls)
+        self.assertTrue(p.allowed()[0])                                                 # the next turn: fresh reading
+        self.assertEqual(len(self.smi_calls), n + 1)
+        self.assertAlmostEqual(sum(self.slept), 1.5)                                    # after the settle
+
+    def test_the_skip_limit_is_enforced_on_every_check(self):
+        p = self.policy()
+        self.assertTrue(p.allowed()[0])                                                 # quiet reading at t=0
+        p.forward_started()
+        self.clock[0] += 59.0
+        self.assertTrue(p.allowed()[0])                                                 # within own_gpu_skip_max_s
+        self.clock[0] += 2.0                                                            # t=61, within sample_s of 59
+        self.assertEqual(p.allowed(), (False, node_policy.GPU_UNKNOWN))
+
+    def test_back_to_back_turns_on_a_quiet_gpu_are_admitted_after_the_settle(self):
+        p = self.policy()
+        for _ in range(2):
+            self.assertTrue(p.allowed()[0])
+            p.forward_started()
+            self.gpu[0] = "97\n"                                                       # its own decoding
+            self.clock[0] += 5.0
+            p.forward_ended()
+            self.gpu[0] = "4\n"                                                        # the card quiet again
+            self.clock[0] += 0.2                                                        # next turn 0.2 s later
+        self.assertTrue(p.allowed()[0])
+        self.assertEqual(len(self.smi_calls), 3)                                        # one fresh reading per turn
+        self.assertAlmostEqual(sum(self.slept), 2 * 1.3)                                # each waited out the settle
+
+    def test_a_reading_is_reused_within_one_quiet_stretch(self):
+        p = self.policy()
+        self.assertTrue(p.allowed()[0])
+        self.clock[0] += 3.0                                                            # past sample_s: inputs re-read
+        self.assertTrue(p.allowed()[0])
+        self.assertEqual(len(self.smi_calls), 2)
+        self.assertTrue(p.allowed()[0])                                                 # within sample_s: reused
+        self.assertEqual(len(self.smi_calls), 2)
+
+
 class SessionBindingTests(PolicyBase):
     """Reviewer finding 2 (fix round 1): each active session needs its own fresh record, bound to its id, user and
     logon time."""
