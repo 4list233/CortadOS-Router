@@ -546,16 +546,55 @@ class ChildTaskTests(ChildTaskBase):
         for model in ("sub/claude-haiku-4-5-20251001", "claude-haiku-4-5", "sub/CLAUDE-HAIKU-4-5"):
             self.assertFalse(ct.auto_mode_supported(model), model)
 
-    def test_a_defaulted_mode_on_a_model_without_auto_is_accept_edits_and_says_why(self):
-        r, out = self.call("start_task", task="hi", cwd=self.work, orchestrator="claude-haiku-4-5-20251001")
+    def test_a_defaulted_mode_on_a_model_without_auto_is_accept_edits_with_allowed_tools_and_says_why(self):
+        r, out = self.call("start_task", task="hi", cwd=self.work, orchestrator="claude-haiku-4-5-20251001",
+                           allowed_tools=["WebSearch"])
         self.assertFalse(r.get("isError"), r)
         self.assertEqual(out["permission_mode"], "acceptEdits")
         self.assertIn("has no auto mode", out["permission_mode_note"])
         _, w = self.call("wait_task", task_id=out["task_id"], timeout_s=30)
         a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
         self.assertEqual(a[a.index("--permission-mode") + 1], "acceptEdits")
+        self.assertIn("WebSearch", a[a.index("--allowedTools") + 1])
         self.assertEqual(w["permission_mode"], "acceptEdits")
         self.assertIn("has no auto mode", w["permission_mode_note"])
+
+    # ---- #140 follow-up (owner 2026-11-23): unset mode + no-auto model + no allowed_tools is refused, not defaulted
+    def test_a_defaulted_mode_on_a_model_without_auto_and_no_allowed_tools_is_refused(self):
+        for extra in ({}, {"allowed_tools": []}):
+            r, _ = self.call("start_task", task="hi", cwd=self.work, orchestrator="claude-haiku-4-5-20251001", **extra)
+            self.assertTrue(r.get("isError"), (extra, r))
+            text = r["content"][0]["text"]
+            self.assertIn("sub/claude-haiku-4-5-20251001 has no auto mode", text)       # names the model
+            self.assertIn("pin a model with auto mode (e.g. claude-haiku-5-5", text)    # (a)
+            self.assertIn('"plan" for read-only work', text)                             # (b)
+            self.assertIn('pass allowed_tools (e.g. ["WebSearch","WebFetch","Bash"])', text)   # (c)
+        self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")))     # nothing started
+        self.assertFalse(os.listdir(ct.tasks_dir()) if os.path.isdir(ct.tasks_dir()) else [])
+        with self.assertRaises(ct.TaskError):
+            ct.resolve_permission_mode(None, "claude-haiku-4-5-20251001")            # tools omitted: refused too
+        # an explicit plan on the same model still runs: read-only is what it is asked for
+        _, w = self.call("wait_task", task_id=self.start(orchestrator="claude-haiku-4-5-20251001",
+                                                         permission_mode="plan"), timeout_s=30)
+        self.assertEqual(w["permission_mode"], "plan")
+
+    def test_a_defaulted_mode_on_haiku_5_5_and_cortados_is_auto(self):
+        for orch in ("claude-haiku-5-5", "cortados"):
+            r, out = self.call("start_task", task="hi", cwd=self.work, orchestrator=orch)
+            self.assertFalse(r.get("isError"), (orch, r))
+            self.assertEqual(out["permission_mode"], "auto", orch)
+            self.assertIsNone(out.get("permission_mode_note"), orch)
+            _, w = self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+            a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
+            self.assertEqual(a[a.index("--permission-mode") + 1], "auto", orch)
+        self.assertEqual(ct.resolve_permission_mode(None, "cortados"), ("auto", None))
+        self.assertEqual(ct.resolve_permission_mode(None, "cortados", ["WebSearch"]), ("auto", None))
+
+    def test_a_defaulted_mode_on_a_model_without_auto_is_refused_before_the_round_trip(self):
+        self._air(transport=lambda a, s, t: self.fail("no round trip expected"))
+        r, _ = self.call("start_task", task="x", orchestrator="claude-haiku-4-5-20251001")
+        self.assertTrue(r.get("isError"), r)
+        self.assertIn("has no auto mode", r["content"][0]["text"])
 
     def test_explicit_auto_on_a_model_without_auto_is_refused(self):
         r, _ = self.call("start_task", task="hi", cwd=self.work, orchestrator="claude-haiku-4-5-20251001",
@@ -3053,8 +3092,11 @@ class ChildTaskTests(ChildTaskBase):
             self.assertIn("only run Claude models", r["content"][0]["text"])
         r, _ = self.call("start_task", task="x", cwd=self.work, chrome=True, connectors=["a"])
         self.assertIn("connectors are not used with chrome", r["content"][0]["text"])
+        r, _ = self.call("start_task", task="x", cwd=self.work, chrome=True,       # a login child is headless too:
+                         orchestrator="claude-haiku-4-5-20251001")                  # no allowed_tools, refused
+        self.assertIn("claude-haiku-4-5-20251001 has no auto mode", r["content"][0]["text"])
         r, out = self.call("start_task", task="x", cwd=self.work, chrome=True,
-                           orchestrator="claude-haiku-4-5-20251001")
+                           orchestrator="claude-haiku-4-5-20251001", allowed_tools=["WebSearch"])
         self.assertEqual(out["permission_mode"], "acceptEdits")
         self.call("wait_task", task_id=out["task_id"], timeout_s=30)
 
