@@ -546,10 +546,25 @@ test('root_test: yes / no only from test\'s own answer; a refused sudo or a test
   assert.deepEqual(libCall(odd, 'root_test', '-e', '/bin/sh'), { code: 1, out: '' });
 });
 
+// a fake sudo that runs the command as the caller, and one that refuses (no password / not allowed)
+const SUDO_OK = '#!/bin/bash\nexec "$@"\n';
+const SUDO_REFUSED = '#!/bin/bash\necho "sudo: a password is required" >&2\nexit 1\n';
+// A fake sudo that runs the command "as root" (FAKE_ROOT=1), and a fake launchctl blind to the system
+// domain unless run as root, as the real one is: on the Air (macOS 26, 2026-11-23) the owner's
+// `launchctl print system/com.apple.mDNSResponder` exits 113 "Could not find service" while it runs.
+const SUDO_ROOT = '#!/bin/bash\nexport FAKE_ROOT=1\nexec "$@"\n';
+const launchctlAsRoot = (code, out) => `#!/bin/bash
+[ "$1" = print ] || exit 99
+if [ "\${FAKE_ROOT:-}" != 1 ]; then
+  printf 'Bad request.\\nCould not find service "%s" in domain for system\\n' "\${2#system/}" >&2; exit 113
+fi
+printf '%s' ${JSON.stringify(out)} >&2
+exit ${code}
+`;
+
 test('launchd_state: not loaded only on launchctl\'s captured "Could not find service" (fix round 2)', async t => {
   const L = 'com.cortados.office-bridge';
-  const fake = (code, err) => fakeBin(t, 'launchctl',
-    `#!/bin/bash\n[ "$1" = print ] || exit 99\nprintf '%s' ${JSON.stringify(err)} >&2\nexit ${code}\n`);
+  const fake = (code, err) => fakeBins(t, { sudo: SUDO_ROOT, launchctl: launchctlAsRoot(code, err) });
   const st = dir => libCall(dir, 'launchd_state', L).code;
   assert.equal(st(await fake(0, '')), 0);
   assert.equal(st(await fake(113, `Bad request.\nCould not find service "${L}" in domain for system\n`)), 1);
@@ -557,6 +572,46 @@ test('launchd_state: not loaded only on launchctl\'s captured "Could not find se
   assert.equal(st(await fake(113, '')), 2);
   assert.equal(st(await fake(1, `Could not find service "${L}" in domain for system\n`)), 2);
   assert.equal(st(await fake(5, 'Input/output error\n')), 2);
+});
+
+test('launchd_state / launchd_running read the system domain as root; a refused sudo is unknown, never "not loaded" (#77 launchd-sudo)', async t => {
+  const L = 'com.cortados.office-bridge';
+  const RUNNING = `${'system/' + L} = {\n\tstate = running\n}\n`;
+  // launchd answers "loaded and running" only to root
+  const lc = `#!/bin/bash
+[ "$1" = print ] || exit 99
+if [ "\${FAKE_ROOT:-}" != 1 ]; then
+  printf 'Bad request.\\nCould not find service "%s" in domain for system\\n' "\${2#system/}" >&2; exit 113
+fi
+printf '%s' ${JSON.stringify(RUNNING)}
+`;
+  const root = await fakeBins(t, { sudo: SUDO_ROOT, launchctl: lc });
+  assert.equal(libCall(root, 'launchd_state', L).code, 0);         // the Air's bug: this read 1 (not loaded)
+  assert.equal(libCall(root, 'launchd_running', L).code, 0);
+  // a sudo that runs the command WITHOUT root (as the old code did): launchctl's blind answer
+  const notRoot = await fakeBins(t, { sudo: SUDO_OK, launchctl: lc });
+  assert.equal(libCall(notRoot, 'launchd_state', L).code, 1);
+  assert.equal(libCall(notRoot, 'launchd_running', L).code, 1);
+  // sudo refused: unknown (2), never the "confirmed not loaded" that would skip a stop or a restart
+  const refused = await fakeBins(t, { sudo: SUDO_REFUSED, launchctl: lc });
+  assert.equal(libCall(refused, 'launchd_state', L).code, 2);
+  assert.equal(libCall(refused, 'launchd_running', L).code, 1);
+  // a refused sudo that even prints launchctl's not-found text and exits 113 is still not an answer
+  const mimic = await fakeBins(t, { launchctl: lc,
+    sudo: `#!/bin/bash\nprintf 'Could not find service "${L}" in domain for system\\n'\nexit 113\n` });
+  assert.equal(libCall(mimic, 'launchd_state', L).code, 2);
+  // a sudo that answers something else (no rc line from the shell) is unknown too
+  const odd = await fakeBins(t, { launchctl: lc, sudo: '#!/bin/bash\necho "state = running"\n' });
+  assert.equal(libCall(odd, 'launchd_state', L).code, 2);
+  assert.equal(libCall(odd, 'launchd_running', L).code, 1);
+  // loaded but not running (e.g. waiting on KeepAlive's throttle) is not healthy
+  const waiting = await fakeBins(t, { sudo: SUDO_ROOT, launchctl: lc.replace('state = running', 'state = waiting') });
+  assert.equal(libCall(waiting, 'launchd_state', L).code, 0);
+  assert.equal(libCall(waiting, 'launchd_running', L).code, 1);
+  // a running state printed with a failing exit is not "running"
+  const failed = await fakeBins(t, { sudo: SUDO_ROOT, launchctl: lc + 'exit 5\n' });
+  assert.equal(libCall(failed, 'launchd_running', L).code, 1);
+  assert.equal(libCall(failed, 'launchd_state', L).code, 2);
 });
 
 test('activation: a daemon or file whose state cannot be read stops the transaction, never reads as absent (fix round 2)', async t => {
@@ -599,8 +654,6 @@ async function fakeBins(t, scripts) {
   }
   return dir;
 }
-const SUDO_OK = '#!/bin/bash\nexec "$@"\n';
-const SUDO_REFUSED = '#!/bin/bash\necho "sudo: a password is required" >&2\nexit 1\n';
 // a fake lsof answering as the real one does (captured on macOS 26, lsof 4.91): exit 0 with -Fn
 // field lines, exit 1 with no output when nothing listens
 const lsof = (code, out) => `#!/bin/bash\nprintf '%b' ${JSON.stringify(out)}\nexit ${code}\n`;
@@ -640,7 +693,8 @@ async function officeHealthy(t, sudo, lsofScript) {
   assert.ok(m, 'office_healthy found');
   const bin = await fakeBins(t, {
     sudo, lsof: lsofScript,
-    launchctl: '#!/bin/bash\necho "system/x = {"\necho "\tstate = running"\necho "}"\n',
+    launchctl: '#!/bin/bash\n[ "${FAKE_ROOT:-}" = 1 ] || { echo "Could not find service" >&2; exit 113; }\n'
+      + 'echo "system/x = {"\necho "\tstate = running"\necho "}"\n',
     curl: '#!/bin/bash\nfor a; do u="$a"; done\ncase "$u" in *:18789/) printf 426 ;; *:3000/) printf 401 ;; */cortados-login) printf 200 ;; esac\n',
   });
   const r = spawnSync('bash', ['-c', `set -euo pipefail; . "$LIB"; BRIDGE_LABEL=b STUDIO_LABEL=s BRIDGE_PORT=18789 STUDIO_PORT=3000
@@ -650,10 +704,14 @@ rc=0; why="$(office_healthy)" || rc=$?; echo "rc=$rc $why"`],
   return r.stdout.trim();
 }
 test('deploy-air.sh office_healthy: a refused sudo lsof fails the health check (rollback), never passes it (r3 finding 1)', async t => {
-  assert.equal(await officeHealthy(t, SUDO_OK, lsof(0, LOOPBACK)), 'rc=0');
-  assert.match(await officeHealthy(t, SUDO_REFUSED, lsof(0, LOOPBACK)), /^rc=1 cannot list the listeners/);
-  assert.match(await officeHealthy(t, SUDO_OK, lsof(1, '')), /^rc=1 /);
-  assert.match(await officeHealthy(t, SUDO_OK, lsof(0, 'p1\nf3\nn*:3000\np2\nf3\nn127.0.0.1:18789\n')), /^rc=1 a listener on port 3000 is not loopback-only/);
+  assert.equal(await officeHealthy(t, SUDO_ROOT, lsof(0, LOOPBACK)), 'rc=0');
+  // a refused sudo now fails at the first root read, the daemon state: never a pass
+  assert.match(await officeHealthy(t, SUDO_REFUSED, lsof(0, LOOPBACK)), /^rc=1 b is not running/);
+  assert.match(await officeHealthy(t, SUDO_ROOT, lsof(1, '')), /^rc=1 /);
+  assert.match(await officeHealthy(t, SUDO_ROOT, lsof(0, 'p1\nf3\nn*:3000\np2\nf3\nn127.0.0.1:18789\n')), /^rc=1 a listener on port 3000 is not loopback-only/);
+  // a refused sudo for lsof alone (launchctl answered as root) still fails the check
+  const lsofRefused = '#!/bin/bash\nif [ "$1" = lsof ]; then echo "sudo: a password is required" >&2; exit 1; fi\nexport FAKE_ROOT=1\nexec "$@"\n';
+  assert.match(await officeHealthy(t, lsofRefused, lsof(0, LOOPBACK)), /^rc=1 cannot list the listeners/);
   const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
   assert.ok(!/sudo lsof/.test(text), 'lsof runs only in deploy-lib.sh (listeners_loopback_only)');
   assert.ok(!/\| *grep -q/.test(text), 'no `| grep -q` under pipefail (SIGPIPE reads as failure)');
@@ -703,4 +761,40 @@ test('deploy-air.sh: the prune\'s rollback targets and every planning read fail 
   // the remaining `|| true`s are the ones the sweep accepted (each feeds a positive match or is display-only)
   const ors = lines.filter(l => /\|\| true/.test(l)).map(l => l.trim());
   assert.equal(ors.length, 9, ors.join('\n'));
+});
+
+// ---- #77 launchd-sudo: role-user commands never inherit the owner's cwd ---------------------------
+// On the Air the owner ran the script from ~/office-deploy-20261123; step 4's `git clone` as
+// _cortados-claw3d died: "Unable to read current working directory: Permission denied".
+test('deploy-air.sh: every role-user command runs from /, whatever the caller\'s cwd (#77 launchd-sudo)', async t => {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  const lines = text.split('\n');
+  const cdRoot = lines.findIndex(l => l === 'cd /');
+  assert.ok(cdRoot > 0, 'a top-level `cd /`');
+  assert.ok(lines.findIndex(l => /^REPO=/.test(l)) < cdRoot && lines.findIndex(l => /^HERE=/.test(l)) < cdRoot,
+    'HERE and REPO are resolved to absolute paths before the cd');
+  lines.forEach((l, i) => { if (/sudo -u|as_studio/.test(l) && !/^\s*#/.test(l)) assert.ok(i > cdRoot, `before the cd: ${l}`); });
+  assert.ok(!/^\s*cd [^/"]/m.test(text), 'no relative cd');
+
+  // Behaviour: the script's prologue up to the `cd /`, then as_studio and switch_link as written, run
+  // from a directory the caller can enter but not read; the fake sudo records the cwd it starts in.
+  const W = await mkdtemp(join(tmpdir(), 'office-cwd-'));
+  const cwd = join(W, 'owner-home');
+  await mkdir(cwd); await chmod(cwd, 0o100);
+  t.after(async () => { await chmod(cwd, 0o700); await rm(W, { recursive: true, force: true }); });
+  const bin = await fakeBins(t, { sudo: `#!/bin/bash\necho "$(pwd -P) $*" >> ${JSON.stringify(join(W, 'sudo.log'))}\n` });
+  const prologue = lines.slice(0, cdRoot + 1).join('\n');
+  const asStudio = text.match(/^as_studio\(\) \{[\s\S]*?; \}\n/m);
+  const switchLink = text.match(/^switch_link\(\) \{[\s\S]*?\n\}\n/m);
+  assert.ok(asStudio && switchLink, 'as_studio and switch_link found');
+  const r = spawnSync('/bin/bash', ['-c', `${prologue}
+APPLY=1; run() { "$@"; }
+${asStudio[0]}${switchLink[0]}
+as_studio git clone --no-checkout x y
+switch_link /a /b "$STUDIO_USER"
+echo done`, join(HERE, 'deploy-air.sh')], { cwd, env: { PATH: `${bin}:/usr/bin:/bin` }, encoding: 'utf8' });
+  assert.equal(r.stdout.trim(), 'done', r.stderr);
+  const log = (await readFile(join(W, 'sudo.log'), 'utf8')).trim().split('\n');
+  assert.equal(log.length, 3);
+  for (const l of log) assert.match(l, /^\/ -u _cortados-claw3d /, l);
 });

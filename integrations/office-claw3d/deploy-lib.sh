@@ -127,15 +127,44 @@ root_test() {  # test-args...
   esac
 }
 
-# 0 loaded, 1 confirmed not loaded, 2 unknown, for a system LaunchDaemon. Not loaded ONLY on the
-# answer captured on macOS 26 for an unknown label: exit 113 with stderr holding
-# `Could not find service "LABEL" in domain for system`. Any other failure is unknown, never "stopped".
+# `launchctl print system/LABEL` run AS ROOT: prints launchctl's output (stdout and stderr) and then a
+# last line `cortados-launchctl-rc=N`, launchctl's own exit status (on a line of its own even when
+# launchctl's output does not end in a newline). Returns 1, printing nothing, when
+# sudo or the shell failed. Root, because a non-root caller is blind to the system domain: on the Air
+# (macOS 26, 2026-11-23) `launchctl print system/com.apple.mDNSResponder` as the owner exits 113 with
+# "Could not find service" while that service runs, so the first --apply read its freshly started
+# daemons as down, failed the health check and rolled back. The rc comes from the shell, as in
+# root_test: a refused sudo exits 1 like launchctl can, so sudo's own status is never launchctl's
+# answer. Plain `sudo` (it may prompt), as root_test and listeners_loopback_only do: the owner runs
+# the script interactively. The whole output is captured before any match: piping launchctl into an
+# early-exiting reader could SIGPIPE it (under pipefail, a false failure).
+launchd_print() {  # label
+  local out nl=$'\n' re='^cortados-launchctl-rc=[0-9]+$'
+  out="$(sudo /bin/sh -c 'launchctl print "system/$1" 2>&1; printf "\ncortados-launchctl-rc=%s\n" "$?"' sh "$1" 2>/dev/null)" \
+    || return 1
+  [[ "${out##*$nl}" =~ $re ]] || return 1   # $nl: $'\n' is literal inside "${...}"
+  printf '%s\n' "$out"
+}
+
+# 0 loaded, 1 confirmed not loaded, 2 unknown, for a system LaunchDaemon, read as root (launchd_print).
+# Not loaded ONLY on the answer captured on macOS 26 for an unknown label: exit 113 with
+# `Could not find service "LABEL" in domain for system`. Any other answer, and a refused or failed
+# sudo, is unknown, never "stopped".
 launchd_state() {  # label
-  local err rc=0
-  err="$(launchctl print "system/$1" 2>&1 >/dev/null)" || rc=$?
+  local out rc
+  out="$(launchd_print "$1")" || return 2
+  rc="${out##*cortados-launchctl-rc=}"
   [[ $rc == 0 ]] && return 0
-  [[ $rc == 113 && "$err" == *"Could not find service \"$1\" in domain for system"* ]] && return 1
+  [[ $rc == 113 && "$out" == *"Could not find service \"$1\" in domain for system"* ]] && return 1
   return 2
+}
+
+# 0 when launchd says, read as root, that the daemon's process is running (`state = running`); 1 for
+# anything else, including an unanswered read. The health check's per-daemon test.
+launchd_running() {  # label
+  local out nl=$'\n'
+  out="$(launchd_print "$1")" || return 1
+  [[ "${out##*$nl}" == cortados-launchctl-rc=0 && "$out" == *"state = running"* ]]
 }
 
 # A link's target, for a decision that must not guess (the prune's rollback targets, the transaction's

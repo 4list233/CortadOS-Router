@@ -15,8 +15,12 @@ integrations/office-claw3d/deploy-air.sh --publish-tailnet --apply
 integrations/office-claw3d/deploy-air.sh --unpublish-tailnet --apply
 ```
 
-The dry run may ask for sudo once: on an existing install it checks, read-only (`sudo test`), which
-secret files are already in the role users' 0700 homes.
+The dry run may ask for sudo once: it reads, as root, whether the two LaunchDaemons are loaded
+(`sudo launchctl print system/...`: as the owner, `launchctl print` cannot see the system domain and
+answers "Could not find service" even for a running daemon) and, on an existing install, which secret
+files are already in the role users' 0700 homes (`sudo test`). The script works from `/` (it `cd`s
+there after resolving its own path), so the role users' commands never start in a directory they
+cannot read, such as the owner's home.
 
 ## What runs, as whom
 
@@ -90,7 +94,8 @@ bridge user. The bridge refuses to start if the two secrets are equal.
   not-found answer (exit 56, `DS Error: -14136 (eDSRecordNotFound)`), and a UID as free only from a
   successful, fully parsed `dscl . -list /Users UniqueID`; root file checks (`root_test`) answer only
   from `test` itself, never a refused `sudo`; a daemon is "not loaded" only on `launchctl`'s
-  `Could not find service` (exit 113); the rollback build and adapter the prune keeps are read with
+  `Could not find service` (exit 113), read as root (`launchd_state` / `launchd_running`; a refused
+  `sudo` is "unknown", never "not loaded"); the rollback build and adapter the prune keeps are read with
   `link_target` (empty only when confirmed absent in a searchable directory); the health check's
   "loopback only" needs a successful `sudo lsof` seeing a loopback listener on each port
   (`listeners_loopback_only`). Anything else aborts before any change, or fails (and rolls back) the
