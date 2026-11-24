@@ -3259,6 +3259,32 @@ def _current_redactor(red=None) -> "Redactor":
     return Redactor([t for t in toks if len(t) >= MIN_TOKEN_LEN])
 
 
+def provider_redactor(extra=()) -> "Redactor":
+    """Public: the run export's known-credential Redactor for another append-only record kept on this host (the
+    provider's Codex transcripts, provider/transcripts.py): this process's credentials (launch env, the host's token
+    env and file) plus `extra` (e.g. the provider's own owner token). Tokens shorter than MIN_TOKEN_LEN are not
+    provider tokens and are left out, as _current_redactor does."""
+    return _current_redactor(redact.Redactor([t for t in extra if t]))
+
+
+def redact_for_export(red: "Redactor", value, limit=None, *, prose: bool = False):
+    """Public: the run export's redaction of one decoded value, for other records kept for Grounds (#91's rules, one
+    implementation): redact_record (every known credential, structurally; JSON-looking text that does not decode is
+    WITHHELD, fail closed), then _Cap (well-known secret shapes scrubbed, each text capped at `limit`, default
+    EXPORT_TEXT_CHARS). Returns (value, withheld, scrubbed counts by type, truncated count).
+    prose: `value` is a free-form message text, which may well start with `[`, `{` or `"`: redacted structurally when
+    it decodes, else as TEXT (every credential at every ESCAPE_DEPTH escaping), as redact_record treats the result
+    prose, instead of being withheld whole."""
+    if prose and isinstance(value, str):
+        cleaned, withheld = red.deep_count(value)
+        if withheld:
+            cleaned, withheld = _text_result(red, value)
+    else:
+        cleaned, withheld = redact_record(red, value)
+    cap = _Cap(limit)
+    return cap.tree(cleaned), withheld, dict(cap.scrubbed), cap.truncated
+
+
 def _runner_router_run(meta: dict, task_id: str) -> dict:
     """The provider's run record, fetched by the runner with its own launch env (the provider forgets it on restart,
     so it is taken while the run is fresh). A login-mode task never went through the provider."""

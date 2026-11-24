@@ -1051,6 +1051,53 @@ claude mcp add -s user cortados-route \
 
 Either registration serves every tool of the server: `route_task`, the child-task tools above and `local_switch`.
 
+## Transcripts kept
+
+Every routed conversation is kept on the provider's machine, as training data for Grounds and future S1 work. Local
+files only: CortadOS never syncs or uploads them, and nothing in this repo deletes them.
+
+| Backend | Where | Written by | Format | Deleted |
+| - | - | - | - | - |
+| Codex (`codex-cli` routes) | `$CORTADOS_HOME/transcripts/codex/<UTC day the conversation opened>/<conversation id>.jsonl` | the provider (`cortados_router/provider/transcripts.py`), one line per turn | first line: the conversation header with `"schema": "cortados.codex-transcript/1"` (route, model, lane, band, account, opened time, system prompt, tool names); then `{"kind": "turn", "n", "started_at", "ended_at", "route", "run_id", "session", "client", "rebuilt", "user", "tool_results", "assistant", "stop", "usage", "redaction"}` | never by CortadOS |
+| Claude (`claude-cli` routes, the bridge) | `<CLAUDE_CONFIG_DIR of the routed account>/projects/<scratch-dir path>/<session>.jsonl` | Claude Code itself (the headless CLI the bridge runs; its scratch dir is deleted, the transcript is not) | Claude Code's own session transcript | by Claude Code's retention sweep, see below |
+| Child tasks | `$CORTADOS_HOME/exports/task-runs.jsonl` | the child runner (see "Task run export") | `cortados.task-run/1` | never by CortadOS |
+
+**Codex transcripts.** The Codex backend keeps its app-server threads `ephemeral` on purpose: a persistent thread in
+`CODEX_HOME` could be picked up by Codex's own memories / resume features and carry one conversation's context into
+another, and it would sit in a vendor-owned layout. So the provider writes its own record from what it already holds:
+the client's new content and tool results, and the reply as delivered (text and tool calls), appended after each turn.
+- Directories 0700, files 0600, append-only, opened through the compaction store's anchored primitives (no symlink, FIFO
+  or hard link is ever written through).
+- Secrets: every text goes through the run export's redaction (`child_tasks.redact_for_export`: the provider's own token
+  and this host's credentials, structurally and fail-closed; message prose that does not decode is redacted as text;
+  then well-known secret shapes are scrubbed). Each turn records what was withheld, scrubbed or cut (`redaction`).
+  Inline images and files are replaced by their size; each text is capped at 200,000 characters (marked).
+- It never fails or slows a request: the turn is serialized and queued for a background writer (the compaction store's
+  bounded queue). A lost write (a full queue, an I/O error, a guard below) is logged and counted in the route-log error
+  counter (`router_db`, op `transcript`), never raised.
+- Guards: `CORTADOS_TRANSCRIPT_FILE_MAX_MB` (default 256) stops one conversation's file, with one `"kind": "stopped"`
+  line, so a looping conversation cannot fill the disk; `CORTADOS_TRANSCRIPT_MIN_FREE_GB` (default 5) stops all writing
+  while the volume has less free space, so transcripts give way before router.db and the backends do.
+- A turn is written once: each conversation remembers the last turn it queued (its history length) and the writer the
+  last one it wrote per file, so a retried request (served from the stored reply) or a repeated offer adds nothing.
+- Switch: `CORTADOS_TRANSCRIPTS=0` (or `off`, `false`, `no`) turns it off; it is on by default.
+- A rebuilt conversation (compaction, recovery) gets its own file, whose header names the one it was `rebuilt_from`.
+
+**Claude bridge transcripts: can they be seen from another machine?** Per Claude Code's docs (code.claude.com/docs:
+"Explore the .claude directory", "Application data"; "Data usage", "Data retention"), a CLI session's transcript is a
+plaintext file under the config dir's `projects/` on the machine that ran it; `--resume` / `--continue` read those local
+files, and the docs describe no sync of them to claude.ai or another device for a local session. The exceptions the
+docs name do not apply to the bridge: a Remote Control session's transcript is stored on Anthropic's servers while
+connected (to sync across devices), and cloud sessions live on Anthropic's side; the bridge runs neither. Not verified:
+whether a future Claude Code version adds such a sync; the provider-side copy Anthropic keeps of the API traffic under
+the account's data-retention terms (30 days, or 5 years with model-improvement on), which is not shown as a session on
+another machine but is not a local file either.
+
+**Claude bridge transcripts are deleted after 30 days by default.** Claude Code's retention sweep deletes
+`projects/<project>/<session>.jsonl` once it is older than `cleanupPeriodDays` (default 30, minimum 1; documented under
+"Cleaned up automatically"). To keep them, set `cleanupPeriodDays` high in each routed account's
+`<CLAUDE_CONFIG_DIR>/settings.json`, or copy them out before then. This repo does not change those settings.
+
 ## Bot gateway on the Air
 
 `integrations/bot-gateway/install.sh` runs the bot gateway (`cortados_router/bot_gateway.py`: the full task surface

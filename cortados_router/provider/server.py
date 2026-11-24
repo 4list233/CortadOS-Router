@@ -63,6 +63,7 @@ from cortados_router.provider import (anthropic_wire, clients, dashboard_auth, e
                                       work_split)
 from cortados_router.provider.bridge import BridgeError, BridgeSession, ToolWaitExpired, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
+from cortados_router.provider import transcripts
 from cortados_router.provider.timeouts import IDLE_S, TOOL_WAIT_S, TURN_TIMEOUT_S, effective_tool_wait
 
 DEFAULT_PORT = 8432                                     # next to S1's 8431
@@ -1471,6 +1472,7 @@ class Registry:
             new.rebuild_seed = None if isinstance(new, LocalSession) else transcript   # local: the relay is stateless
             new.rebuild_budget = budget
             new.rebuilt_for = rebuilt_for       # (gate key, new turn's fingerprint): rebuild()'s twin check
+            new.transcript_parent = old.id      # the Codex transcript names the conversation it was rebuilt from
             new.route_logged = getattr(old, "route_logged", False)    # the route already ran and was recorded
             if getattr(old, "min_left_pct", None) is not None:
                 new.min_left_pct = old.min_left_pct                   # the tightest client floor carries over
@@ -3784,6 +3786,11 @@ class Handler(BaseHTTPRequestHandler):
                 # turn's new user content / tool results and the backend's reply are both known. It only reads them
                 # and enqueues for the store's background writer; it never raises or blocks (failures are counted).
                 self._compaction_record(cur, turn, outcome["turn"][0], wire)
+                # Codex transcripts (transcripts.py): the provider's own record of a Codex-backed turn, queued for a
+                # background writer before the reply's fingerprint joins history (its length is the turn index, so a
+                # turn is never queued twice). Never raises or blocks the turn.
+                self._transcript_record(cur, turn, shown_blocks, outcome["turn"], wire, started=_turn_t0,
+                                        rebuilt=seed is not None, one_shot=one_shot)
                 if not moved:                           # a local answer spends no subscription: nothing to learn
                     self._log_turn_tokens(session, outcome["turn"][2])
                     try:
@@ -4119,6 +4126,25 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:   # never interrupts the turn; counted like any store scheduling failure
             compaction_store.STORE._count("schedule_failures",
                                           f"turn not handed to the store: {type(exc).__name__}: {exc}")
+
+    def _transcript_record(self, session, turn, blocks, result, w: Wire, *, started: float, rebuilt: bool,
+                           one_shot: bool) -> None:
+        """Queue a Codex-backed turn for the local transcript (transcripts.py). Only Codex sessions (codex_login is
+        set for every one): the Claude CLI keeps its own transcripts. Never raises; failures are counted there."""
+        try:
+            if not getattr(session, "codex_login", None) or not transcripts.enabled():
+                return
+            rid, rid_ok = self._run_id()
+            meta = {"run_id": rid if rid_ok else None,
+                    "session": office.clean(self.headers.get(office.SESSION_HEADER),
+                                            office._HEADER_RULES[office.SESSION_HEADER]),
+                    "client": self._client()}
+            transcripts.record_turn(session, tokens=(self.server.registry.token,), user_content=turn.content,
+                                    tool_results=turn.tool_results, assistant_blocks=blocks, stop=result[1],
+                                    usage=result[2], started_at=started, meta=meta, rebuilt=rebuilt,
+                                    one_shot=one_shot, wire="responses" if w is RESPONSES else "messages")
+        except Exception as exc:
+            transcripts.WRITER._count("schedule_failures", f"transcript turn not handed over: {type(exc).__name__}")
 
     def _log_turn_tokens(self, session, usage) -> None:
         """Add this backend turn's tokens to its route's router.db row with the orchestrator's session tag (work split:

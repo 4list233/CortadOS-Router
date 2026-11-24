@@ -13,3 +13,8 @@ os.environ["CORTADOS_API_CREDIT_CONFIG"] = os.path.join(tempfile.mkdtemp(prefix=
                                                         "api-credit.json")
 for _name in [n for n in os.environ if n.startswith("CORTADOS_ANTHROPIC_API_KEY")]:
     del os.environ[_name]
+
+# Codex transcripts (cortados_router/provider/transcripts.py) are on by default in production and would be written
+# under $CORTADOS_HOME, which defaults to the owner's real ~/.cortados. Off for the suite; tests/test_transcripts.py
+# turns them on per test with a throwaway CORTADOS_HOME.
+os.environ["CORTADOS_TRANSCRIPTS"] = "0"
