@@ -22,8 +22,7 @@
 import http from 'node:http';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
-import { pathToFileURL } from 'node:url';
-import { OfficeGateway, mapOffice, runPolling } from './adapter.mjs';
+import { OfficeGateway, isMainModule, mapOffice, runPolling } from './adapter.mjs';
 
 export const LOOPBACK_BIND = Object.freeze(['127.0.0.1', '::1']);
 const LOOPBACK_PEERS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
@@ -265,7 +264,8 @@ export async function checkSecrets(officeTokenFile, bridgeTokenFile) {
   if (sameSecret(office, bridge)) throw new Error('bridge secret must differ from the office token');
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Real-path comparison: see isMainModule in adapter.mjs (the deploy starts the bridge via a symlink).
+if (isMainModule(import.meta.url)) {
   const env = process.env;
   const port = Number(env.CORTADOS_OFFICE_BRIDGE_PORT ?? DEFAULT_PORT);
   const host = env.CORTADOS_OFFICE_BRIDGE_HOST ?? '127.0.0.1';

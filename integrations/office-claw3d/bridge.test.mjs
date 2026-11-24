@@ -328,3 +328,31 @@ test('e2e: plain HTTP gets 426 and no data', async t => {
   assert.equal(res.status, 426);
   assert.equal(await res.text(), 'WebSocket only\n');
 });
+
+// Regression (#77): the deploy starts `$ROOT/adapter/bridge.mjs` where `adapter` is a symlink to
+// adapters/<commit>. Node resolves the main module's symlinks, so a URL-vs-argv[1] entry check skipped
+// the main block (exit 0, no output) and launchd kept restarting the bridge. Run each entry through a
+// symlinked directory with an empty env and require its main block's own refusal.
+test('entry checks run the main block when started through a symlinked directory', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { copyFile, mkdir, symlink } = await import('node:fs/promises');
+  const { fileURLToPath } = await import('node:url');
+  const here = fileURLToPath(new URL('.', import.meta.url));
+  const dir = await mkdtemp(join(tmpdir(), 'office-entry-'));
+  try {
+    const real = join(dir, 'adapters', 'commit');
+    await mkdir(real, { recursive: true });
+    for (const f of ['adapter.mjs', 'bridge.mjs', 'sprites.mjs']) await copyFile(join(here, f), join(real, f));
+    await symlink(real, join(dir, 'adapter'));
+    const run = (script, ...args) => spawnSync(process.execPath, [join(dir, 'adapter', script), ...args],
+      { cwd: dir, env: {}, encoding: 'utf8', timeout: 20000 });
+    const bridge = run('bridge.mjs');
+    assert.match(bridge.stderr, /Office bridge stopped: token files not configured/);
+    assert.equal(bridge.status, 1);
+    const adapter = run('adapter.mjs');
+    assert.match(adapter.stderr, /Diagnostic only/);
+    assert.equal(adapter.status, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
