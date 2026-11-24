@@ -86,6 +86,72 @@ test('X-Forwarded-Host is an accepted authority (Serve may rewrite Host)', () =>
   assert.equal(res.status, 303);
 });
 
+// What a browser puts in the Origin header of a form POST, per the Fetch standard's "append a
+// request Origin header" (non-GET, no CORS): the request's referrer policy comes from the page's
+// Referrer-Policy header (the last token the browser knows wins; none means the default,
+// strict-origin-when-cross-origin). Curl with a hand-set Origin skips this rule, which is how a
+// no-referrer page that 403'd every real browser login got past the earlier tests (#77).
+const KNOWN_POLICIES = new Set(['no-referrer', 'no-referrer-when-downgrade', 'same-origin', 'origin',
+  'strict-origin', 'origin-when-cross-origin', 'strict-origin-when-cross-origin', 'unsafe-url']);
+function browserPostOrigin(referrerPolicyHeader, pageUrl, actionUrl) {
+  const tokens = String(referrerPolicyHeader ?? '').split(',').map(t => t.trim().toLowerCase())
+    .filter(t => KNOWN_POLICIES.has(t));
+  const policy = tokens.at(-1) ?? 'strict-origin-when-cross-origin';
+  const from = new URL(pageUrl), to = new URL(actionUrl, pageUrl);
+  switch (policy) {
+    case 'no-referrer': return 'null';
+    case 'no-referrer-when-downgrade': case 'strict-origin': case 'strict-origin-when-cross-origin':
+      return from.protocol === 'https:' && to.protocol !== 'https:' ? 'null' : from.origin;
+    case 'same-origin': return from.origin === to.origin ? from.origin : 'null';
+    default: return from.origin;
+  }
+}
+
+test('the spec rule as encoded: a no-referrer page makes the browser send Origin: null', () => {
+  const url = 'https://' + TAILNET + LOGIN_PATH;
+  assert.equal(browserPostOrigin('no-referrer', url, LOGIN_PATH), 'null');
+  assert.equal(browserPostOrigin('same-origin, no-referrer', url, LOGIN_PATH), 'null');
+  assert.equal(browserPostOrigin('same-origin', url, LOGIN_PATH), 'https://' + TAILNET);
+  assert.equal(browserPostOrigin('same-origin', url, 'https://elsewhere.example/'), 'null');
+  assert.equal(browserPostOrigin(undefined, url, LOGIN_PATH), 'https://' + TAILNET);
+});
+
+test('a real browser can log in: every login page lets its same-origin form POST carry its Origin', () => {
+  const login = createStudioLogin({ token: TOKEN });
+  const sites = [
+    { url: 'https://' + TAILNET + LOGIN_PATH, headers: o => viaServe({ origin: o }) },
+    { url: 'http://127.0.0.1:3000' + LOGIN_PATH,
+      headers: o => ({ host: '127.0.0.1:3000', origin: o, 'content-type': 'application/x-www-form-urlencoded' }) },
+  ];
+  for (const site of sites) {
+    // The page the browser holds when it submits: the form itself, or a page re-shown after a refusal.
+    const shown = fakeRes();
+    login.handle(fakeReq({ method: 'GET' }), shown);
+    const refused = post(login, 'token=wrong-guess', site.headers(new URL(site.url).origin)).res;
+    assert.equal(refused.status, 401);
+    for (const pageRes of [shown, refused]) {
+      const action = /<form method="post" action="([^"]+)"/.exec(pageRes.body)[1];
+      const origin = browserPostOrigin(pageRes.headers['Referrer-Policy'], site.url, action);
+      assert.notEqual(origin, 'null', `Referrer-Policy ${pageRes.headers['Referrer-Policy']} on ${site.url}`);
+      const { res } = post(login, 'token=' + TOKEN, site.headers(origin));
+      assert.equal(res.status, 303, site.url);
+    }
+    // And the policy still gives other origins nothing: a POST from this page to another origin
+    // would carry Origin: null (and no Referer).
+    assert.equal(browserPostOrigin(shown.headers['Referrer-Policy'], site.url, 'https://elsewhere.example/'), 'null');
+  }
+});
+
+test('Origin: null (a no-referrer or sandboxed page) is still refused, even with the right token', () => {
+  const login = createStudioLogin({ token: TOKEN });
+  for (const headers of [viaServe({ origin: 'null' }),
+    { host: '127.0.0.1:3000', origin: 'null', 'content-type': 'application/x-www-form-urlencoded' }]) {
+    const { res } = post(login, 'token=' + TOKEN, headers);
+    assert.equal(res.status, 403);
+    assert.equal(res.headers['Set-Cookie'], undefined);
+  }
+});
+
 test('cross-origin, missing Origin, scheme mismatch and non-form posts are refused before reading the body', () => {
   const login = createStudioLogin({ token: TOKEN });
   const cases = [
