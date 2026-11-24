@@ -695,3 +695,31 @@ The 2026-11-23 audit (#143) found every S1-routed call of a 400-call sample goin
 - **Underuse split.** `selection.underuse_split`: when the cheapest qualifying route is on a pool expected to lose ≥ 5 % at its reset, the qualifying underused pools (grouped by the window that binds them) share the call in proportion to their expected lost tokens, picked by `core.split_pick(conversation id)`; `ceiling_underuse` shares among the spare frontier pools the same way. `select` passes the conversation id (`split_key`) and the host's admission check (`hold_ok`, now always when the client sent a floor). The switching margin does not override a split.
 
 Replay of the audit week's 6,530 S1-routed calls on the copied Air state (before → after): Codex 100 % → 57 %, Claude B 0 % → 39 %, Astra 8.7 % → 22.8 %, API 0 % → 3.4 %, Claude A 0 → 0, Fable 0 → 0 (Opus on B is cheaper on the same all-models week; see the handback of #143).
+
+## 13. Band window (owner 2026-11-23: a routed orchestrator, "Opus-equivalent: smart, but not R3")
+
+`core.resolve(band_window=(lo, hi))` clamps the band S1 picks into `[lo, hi]`. It reuses the batch cap's two steps
+rather than adding a third path. Above `hi`, the band is capped and the difficulty counts as `core.band_max_D(hi)`
+(R2: 6). Below `lo`, the band is floored, as with `minimum_band`, and that band's required index applies. Inputs:
+
+- the provider's `x-cortados-band` header (both wires), or an Anthropic-wire model named `cortados@<window>`; the two
+  must agree, and an invalid window is a 400;
+- `python3 -m cortados_router.session --orchestrator cortados [--orchestrator-band R2|R1-R2|any]`. The default is
+  R2, and the window rides only on the main loop's `--model` (README "Whole session on the router" says why);
+- `execution_routing.select(constraints={'band_window': (lo, hi)})` for in-process hosts.
+
+Precedence, strongest first. None of the hard rules in section 5 changed.
+
+1. **Hard rules.** Blast radius 3 (an outward effect is floored there) keeps its band over `hi`. The routes row then
+   records `band window R2 overridden: blast radius 3 (outward effect) keeps R3`. A degraded scorer still never
+   defaults to Claude (`_NoClaudeWhenDegraded` filters the routes; the window moves only the band). The sensitive and
+   local rules (`sensitive_local`, `auto_local`) run after `select`, on the windowed band, unchanged.
+2. **Trusted capability floor** (`minimum_band`, e.g. vision escalation R3) over `hi`. It is recorded as
+   `band window … overridden: the trusted capability requirement floors band at R3`.
+3. **The window.** With the batch cap, the cap applies first and the window's `lo` may lift it. The difficulty stays
+   capped while the band is still below S1's own band.
+4. **S1's band** (or the fallback band when degraded).
+
+Recorded in `routes.band_window` (the label, `R2` or `R1-R2`) and in `hard_rules` as `band window …` rules. The Tasks
+view shows them as `band window R2` / `band window R2 overridden` / `band window difficulty cap`.
+

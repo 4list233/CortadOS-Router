@@ -2990,12 +2990,19 @@ class Handler(BaseHTTPRequestHandler):
             if not valid:
                 return self._error(400, "invalid_request_error", _LOCAL_BAD, wire)
             workload = routing.workload_hint(self.headers.get(routing.WORKLOAD_HEADER))   # unknown: logged, ignored
+            # The band window: x-cortados-band, or the main loop's `cortados@<window>` model (routing.BAND_HEADER).
+            # Only an owner-token request reaches here (do_POST's _authorized), the trust of every routing header.
+            window, bad = routing.band_window(self.headers.get(routing.BAND_HEADER), body.get("model"))
+            if bad:
+                return self._error(400, "invalid_request_error", f"cortados: {bad}", wire,
+                                   reason="the band window is invalid")
             try:
                 route_fn = reg.router if one_shot else reg.route_new
                 route = route_fn(wire.routing_body(body), self._client(),
                                  **({"exclude_model": exclude} if exclude else {}),
                                  **({"local": local} if local else {}),
                                  **({"workload": workload} if workload else {}),
+                                 **({"band_window": window} if window else {}),
                                  **({"min_left_pct": floor} if floor is not None else {}))
             except Exception as exc:                # scorer, tables or route log failed: a dependency, not the client
                 logger.exception("routing failed")
@@ -4380,10 +4387,10 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
         from cortados_router import core                  # loads the tables and the live scarcity reader
         from cortados_router.provider import routing
 
-        def router(body, client, exclude_model=None, min_left_pct=None, local=None, workload=None):
+        def router(body, client, exclude_model=None, min_left_pct=None, local=None, workload=None, band_window=None):
             return routing.choose(core, body, client=client, conversation_id=uuid.uuid4().hex, claude_bin=claude_bin,
                                   codex_bin=codex_bin, exclude_model=exclude_model, min_left_pct=min_left_pct,
-                                  codex_home=codex_home, local=local, workload=workload)
+                                  codex_home=codex_home, local=local, workload=workload, band_window=band_window)
 
         def executed(route):
             core.log_execution(route["route_id"], route["provider"], route["model"])

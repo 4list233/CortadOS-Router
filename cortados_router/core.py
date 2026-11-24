@@ -969,6 +969,29 @@ def underuse_split(cands: list[dict[str, Any]], key: str, eligible: Callable[[di
     return (best[g], lost) if g else None
 
 
+def check_band_window(window: Any) -> tuple[str, str]:
+    """A band window (lo, hi) as resolve takes it: two bands of BAND_ORDER, lo not above hi; ValueError otherwise."""
+    if (not isinstance(window, (tuple, list)) or len(window) != 2 or any(b not in BAND_ORDER for b in window)
+            or BAND_ORDER.index(window[0]) > BAND_ORDER.index(window[1])):
+        raise ValueError('Invalid routing band window')
+    return window[0], window[1]
+
+
+def parse_band_window(raw: Any) -> tuple[str, str] | None:
+    """A band window as clients write it: `R2` (exactly R2) or `R1-R2` (lo-hi), case-insensitive; `any` is no window
+    (None). ValueError for anything else, so a typo never silently routes unwindowed."""
+    text = raw.strip().upper() if isinstance(raw, str) else ""
+    if text == "ANY":
+        return None
+    lo, sep, hi = text.partition("-")
+    return check_band_window((lo, hi if sep else lo))
+
+
+def band_window_label(lo: str, hi: str) -> str:
+    """`R2` for an exact window, `R1-R2` for a range: the one spelling of a window in rules, logs and headers."""
+    return lo if lo == hi else f"{lo}-{hi}"
+
+
 def band_max_D(t: dict[str, Any], band: str) -> int | None:
     """The highest difficulty a band admits: its own `when` (an `all` holding {"lte": ["D", n]}), else the D of the
     selection knot whose reference is that band; None when the table says neither."""
@@ -984,7 +1007,8 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             allowed_routes: tuple[tuple[str, str], ...] | None = None,
             execution: bool = False, minimum_band: str | None = None, accounts_aware: bool = False,
             maximum_band: str | None = None, previous: dict[str, Any] | None = None,
-            hold_ok: Callable[[dict[str, Any]], bool] | None = None, split_key: str | None = None) -> dict[str, Any]:
+            hold_ok: Callable[[dict[str, Any]], bool] | None = None, split_key: str | None = None,
+            band_window: tuple[str, str] | None = None) -> dict[str, Any]:
     """`maximum_band` (a client's workload hint, e.g. batch → R1) caps the band from above, mirroring `minimum_band`,
     and caps the difficulty the requirement is computed from at the most that band admits (band_max_D); the hard rules
     still win: a request whose blast radius is 3 (an outward effect is floored there) keeps its band and difficulty,
@@ -994,7 +1018,13 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
     stickiness never picks a route the host would then refuse; the underuse split and ceiling_underuse never take a
     route that fails it either (#143). `split_key` (the conversation's id, #143) seeds selection.underuse_split; None
     keeps the cheapest route. An API credit lane pair in `allowed_routes` (the host opting in, #143) adds that lane's
-    Claude candidates (scored_candidates api_lane)."""
+    Claude candidates (scored_candidates api_lane).
+    `band_window` (lo, hi): a trusted client's band window (the provider's x-cortados-band header or a `cortados@<window>`
+    model name, e.g. the whole-session launcher's routed main loop at R2). S1's band is clamped into it through the
+    same two steps: above `hi` it is capped like the workload cap (difficulty counted at the most `hi` admits), below
+    `lo` it is floored like the trusted capability floor. The hard rules still win: blast radius 3 (an outward effect)
+    keeps its band over `hi`, a trusted `minimum_band` above `hi` wins, and a degraded scorer keeps its no-Claude rule
+    (the window moves only the band). Every step and every override is a `band window …` rule on the routes row."""
     t = table()
     rules: list[str] = []
     if decision["degraded"] or not decision["answers"]:
@@ -1018,6 +1048,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
         v["parts"] = PARTS_TO_COUNT[int(ans.get("parts", 0))]
         band = next((b["band"] for b in t["bands"] if _holds(b["when"], v)), t["fallback"]["interactive"])
     capped = False
+    s1_band = band                             # S1's own band (or the fallback), before any cap or floor
     if maximum_band is not None:
         if maximum_band not in BAND_ORDER:
             raise ValueError('Invalid maximum routing band')
@@ -1027,23 +1058,47 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             else:
                 band, capped = maximum_band, True
                 rules.append(f"client workload hint caps band at {band}")
+    win = None
+    if band_window is not None:
+        lo, hi = check_band_window(band_window)
+        win = band_window_label(lo, hi)
+        natural = band                         # the band the window receives (after a workload cap)
+        # The window's max: the workload cap's step (capped → the difficulty is counted at the most `hi` admits below),
+        # under the same hard rule: blast radius 3 (an outward effect is floored there) keeps its band.
+        if BAND_ORDER.index(band) > BAND_ORDER.index(hi):
+            if v is not None and v["blast_radius"] >= 3:
+                rules.append(f"band window {win} overridden: blast radius 3 (outward effect) keeps {band}")
+            else:
+                band, capped = hi, True
+                rules.append(f"band window {win}: band {natural} lowered to {band}")
+        # The window's min: a floor, as the trusted capability floor. A workload cap it lifts the band over still caps
+        # the difficulty while the band stays below S1's own (the window's max still holds).
+        if BAND_ORDER.index(band) < BAND_ORDER.index(lo):
+            before, band = band, lo
+            rules.append(f"band window {win}: band {before} raised to {band}")
+            capped = capped and BAND_ORDER.index(band) < BAND_ORDER.index(s1_band)
+        if band == natural:
+            rules.append(f"band window {win}: band {band} within the window")
     if minimum_band is not None:
         if minimum_band not in BAND_ORDER:
             raise ValueError('Invalid minimum routing band')
         if BAND_ORDER.index(band) < BAND_ORDER.index(minimum_band):
             band = minimum_band
             rules.append(f'trusted capability requirement floors band at {band}')
+            if win is not None and BAND_ORDER.index(band) > BAND_ORDER.index(band_window[1]):
+                rules.append(f"band window {win} overridden: the trusted capability requirement floors band at {band}")
             if capped:
                 capped = False                 # the trusted floor wins over the client's cap: the requirement is uncapped
-                rules.append(f"workload cap {maximum_band} not applied: the trusted capability requirement wins")
+                if maximum_band is not None:
+                    rules.append(f"workload cap {maximum_band} not applied: the trusted capability requirement wins")
     if capped and D is not None:
         # #132 review round 1: the cap lowers the effective requirement, not only the label. The difficulty counted for
         # the required index and for the frontier rules (ceiling_work, ceiling_underuse) is capped at the most the
         # capped band admits, so a capped call is selected exactly like a natural request of that band.
         d_max = band_max_D(t, band)
         if d_max is not None and D > d_max:
-            rules.append(f"workload cap: difficulty {D} counted as {d_max}, the most {band} admits "
-                         "(required index and frontier rules)")
+            rules.append(f"{'band window' if win is not None and maximum_band is None else 'workload cap'}: "
+                         f"difficulty {D} counted as {d_max}, the most {band} admits (required index and frontier rules)")
             D = d_max
             v["D"] = D
     row = next(b for b in t["bands"] if b["band"] == band)
@@ -1442,7 +1497,9 @@ TOKEN_COLUMNS = (("tok_input", "INTEGER"), ("tok_output", "INTEGER"), ("tok_cach
 # provider/sensitive_notice.record (detector, reason, notice shown or opted out: fixed categories, never text); NULL for
 # every other route. Additive and nullable like the token columns.
 # #132: the client's workload hint (x-cortados-workload: "batch"), NULL when none was sent. Metadata only.
-EXTRA_COLUMNS = TOKEN_COLUMNS + (("sensitive_cloud", "TEXT"), ("workload", "TEXT"))
+# The client's band window (x-cortados-band, or the routed main loop's `cortados@<window>` model) as band_window_label
+# writes it, NULL when none was given. Metadata only: the hard_rules column says what it did.
+EXTRA_COLUMNS = TOKEN_COLUMNS + (("sensitive_cloud", "TEXT"), ("workload", "TEXT"), ("band_window", "TEXT"))
 
 
 def _db() -> sqlite3.Connection:
@@ -1523,6 +1580,8 @@ def log_route(turn_id: str, meta: dict[str, Any], decision: dict[str, Any], r: d
         c.execute('UPDATE routes SET task_context=? WHERE turn_id=?', (task_context, turn_id))
         if meta.get("workload"):
             c.execute('UPDATE routes SET workload=? WHERE turn_id=?', (str(meta["workload"])[:32], turn_id))
+        if meta.get("band_window"):
+            c.execute('UPDATE routes SET band_window=? WHERE turn_id=?', (str(meta["band_window"])[:8], turn_id))
     return _write_routes("log_route", write, raise_final=False)
 
 

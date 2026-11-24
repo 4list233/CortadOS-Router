@@ -1,7 +1,8 @@
 """Run a whole Claude Code session on the cortados provider.
 
     python3 -m cortados_router.session [--orchestrator fable|opus|sonnet|<model id>|cortados]
-        [--provider-url URL] [--token-file PATH] [--no-delegate-directive] [--print-env] [-- <claude args>]
+        [--orchestrator-band R2|R1-R2|any] [--provider-url URL] [--token-file PATH] [--no-delegate-directive]
+        [--print-env] [-- <claude args>]
 
 The main loop (the orchestrator) is pinned to a subscription model (`sub/<id>`, no S1) and delegates through the
 cortados-route MCP tools (start_task / route_task); its own Agent calls are refused by the gate (orchestrator_gate.py).
@@ -22,6 +23,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from cortados_router import core
 from cortados_router.provider import routing
 from cortados_router.subagent_mcp import resolve_provider_url, ProviderURLError
 
@@ -67,8 +69,34 @@ REFUSED_ARGS = ("--settings", "--setting-sources", "--model")
 MANAGED_SETTINGS_DIRS = ("/Library/Application Support/ClaudeCode", "/etc/claude-code")
 
 
+# The routed main loop's band window (--orchestrator cortados): S1 still routes it and scarcity picks the cheapest
+# capable model, but inside this window (owner 2026-11-23: by default exactly R2, "Opus-equivalent: smart, but not
+# R3"). It rides on the main loop's model name, `cortados@R2` (routing.BAND_MODEL_PREFIX): Claude Code sends --model on
+# main-loop requests only (checked with Claude Code 2.1.330 against a capture server, 2026-11-23: main loop
+# `cortados@R1-R2`, its general-purpose subagent `cortados`), so subagents (CLAUDE_CODE_SUBAGENT_MODEL) and side calls
+# (ANTHROPIC_SMALL_FAST_MODEL) stay unwindowed. `any` turns it off (plain `cortados`, S1 routes freely).
+DEFAULT_ORCHESTRATOR_BAND = "R2"
+
+
 class SessionError(Exception):
     pass
+
+
+def windowed_model(model: str, band: str | None) -> str:
+    """The main loop's model with its band window: `cortados` + R2 → `cortados@R2`. A routed (`cortados`) main loop
+    gets DEFAULT_ORCHESTRATOR_BAND when `band` is None; `any` leaves it unwindowed. A pinned model is not routed, so a
+    window there is refused rather than silently dropped."""
+    if model != "cortados":
+        if band is not None and band.strip().lower() != "any":
+            raise SessionError("--orchestrator-band applies only to the routed orchestrator (--orchestrator cortados); "
+                               f"{model} is a pinned model")
+        return model
+    try:
+        window = core.parse_band_window(DEFAULT_ORCHESTRATOR_BAND if band is None else band)
+    except ValueError:
+        raise SessionError(f"--orchestrator-band {band!r} is not a band window: a band R0-R4 (R2), a range (R1-R2), "
+                           "or any") from None
+    return routing.BAND_MODEL_PREFIX + core.band_window_label(*window) if window else model
 
 
 def resolve_model(name: str) -> str:
@@ -435,6 +463,9 @@ def parse(argv: list):
         argv, extra = argv[:i], argv[i + 1 :]
     ap = argparse.ArgumentParser(prog="python3 -m cortados_router.session", description=__doc__.split("\n")[0])
     ap.add_argument("--orchestrator", default=DEFAULT_ORCHESTRATOR)
+    ap.add_argument("--orchestrator-band", default=None,
+                    help=f"band window of a routed main loop: R2, R1-R2 or any (default {DEFAULT_ORCHESTRATOR_BAND} "
+                         "with --orchestrator cortados); subagents and side calls are not windowed")
     ap.add_argument("--provider-url")
     ap.add_argument("--token-file", default=DEFAULT_TOKEN_FILE)
     ap.add_argument("--no-delegate-directive", action="store_true")
@@ -463,7 +494,7 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home
         url = resolve_provider_url({**base_env, **({"CORTADOS_PROVIDER_URL": args.provider_url} if args.provider_url else {})})
     except ProviderURLError as exc:
         raise SessionError(str(exc)) from None
-    model = resolve_model(args.orchestrator)
+    model = windowed_model(resolve_model(args.orchestrator), args.orchestrator_band)
     token = read_token(args.token_file)
     directive = None
     if not args.no_delegate_directive:

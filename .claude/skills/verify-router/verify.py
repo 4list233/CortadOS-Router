@@ -232,6 +232,29 @@ print(json.dumps({"easy": route("refactor the parser module and update its tests
                   "hard_free": route(hard, None, "verify-batch-free"), "hard_batch": route(hard, "batch", "verify-batch-hard")}))
 """
 
+# Band window (owner 2026-11-23): the whole-session launcher's routed main loop is `cortados@R2`; S1's band is clamped
+# into R2 (raised from R0/R1, lowered from R3) except where a hard rule wins (an outward request stays R3, recorded as an
+# override; a degraded decision never goes to Claude). A subagent's plain `cortados` is not windowed. Real provider
+# routing and the real core.decide on the throwaway home (S1 if up, degraded otherwise).
+BAND_WINDOW_SCENARIO = """
+import json, sys
+from cortados_router import core
+from cortados_router.provider import routing
+def route(text, model="cortados@R2", cid="verify-window"):
+    body = {"model": model, "messages": [{"role": "user", "content": text}]}
+    window, bad = routing.band_window(None, model)
+    r = routing.choose(core, body, client="verify-window", conversation_id=cid, claude_bin=sys.executable,
+                       codex_bin=sys.executable, **({"band_window": window} if window else {}))
+    rt = r.get("route") or {}
+    return {**{k: r.get(k) for k in ("provider", "model", "band", "degraded", "band_window", "error")},
+            "D": rt.get("D"), "window_rules": [x for x in rt.get("hard_rules") or [] if x.startswith("band window")]}
+hard = "design a new consensus protocol for our replicated storage engine, prove its safety, and plan the migration"
+print(json.dumps({"easy": route("rename the variable x to count in utils.py"),
+                  "outward": route("email the signed invoice to the client and mark it paid", cid="verify-window-out"),
+                  "hard": route(hard, cid="verify-window-hard"),
+                  "subagent": route("rename the variable x to count in utils.py", "cortados", "verify-window-sub")}))
+"""
+
 # Local auto-route on the Pro (#75, 2026-11-13): after S1, a conversation in a band the node lists moves to its local model
 # only while the node is available; on battery / switch off / gate down it keeps S1's route; an outward (R3) request
 # never goes local whatever the config says; a degraded decision never goes local and never to Claude. Runs the real
@@ -854,6 +877,29 @@ def main():
                   and hb.get("required_index") is not None and hb.get("r1_cap_index") is not None
                   and hb["required_index"] <= hb["r1_cap_index"])
             record(name, "PASS" if ok else "FAIL", json.dumps({"free": free, "batch": hb}))
+
+    p = runner.run(["-c", BAND_WINDOW_SCENARIO], prefix="verify-router-window-", timeout=300)
+    try:
+        r = _last_json(p)
+    except (ValueError, IndexError):
+        record("band window R2 clamps the routed main loop", "FAIL", (p.stderr or p.stdout).strip()[-300:])
+    else:
+        easy, out, hard, sub = r["easy"], r["outward"], r["hard"], r["subagent"]
+        claude = lambda x: (x.get("provider") or "").split("#")[0] == "claude-cli"
+        ok = easy.get("band") == "R2" and easy.get("band_window") == "R2" and not easy.get("error") \
+            and not (easy.get("degraded") and claude(easy)) and easy.get("window_rules")
+        record("band window R2 raises/keeps the main loop at R2 (degraded: never Claude)", "PASS" if ok else "FAIL",
+               json.dumps(easy))
+        ok = not sub.get("band_window") and not sub.get("window_rules") and not sub.get("error")
+        record("a subagent's plain cortados is not windowed", "PASS" if ok else "FAIL", json.dumps(sub))
+        if out.get("degraded") or hard.get("degraded"):
+            why = unreachable if not up else f"S1 listening at {s1_where} but the decision is degraded"
+            record("band window: outward stays R3 over the max; a hard request is lowered to R2", "BLOCKED", why)
+        else:
+            ok_out = out.get("band") == "R3" and any("overridden: blast radius 3" in x for x in out.get("window_rules") or [])
+            ok_hard = hard.get("band") == "R2" and isinstance(hard.get("D"), int) and hard["D"] <= 8
+            record("band window: outward stays R3 over the max; a hard request is lowered to R2",
+                   "PASS" if ok_out and ok_hard else "FAIL", json.dumps({"outward": out, "hard": hard}))
 
     p = runner.run(["-c", LOCAL_SCENARIO], prefix="verify-router-local-", timeout=300)
     try:
