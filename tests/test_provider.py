@@ -1776,7 +1776,10 @@ class RebuildTests(RoutedHarness):
         self.assertIn("rebuild limit (1 rebuilds)", msg)
         self.assertIn("start a new conversation", msg)
         self.assertTrue(any("reached REBUILD_MAX" in l for l in logs.output), logs.output)
-        self.assertFalse(any("409" in l for l in logs.output), logs.output)
+        # No 409 status diagnostic ("409 lost conversation: ...", "... (409)"); a bare "409" anywhere in the log
+        # also matched a random conversation id holding those digits (a flake).
+        msgs = [l.split(":", 2)[2] for l in logs.output]
+        self.assertFalse(any(m.startswith("409 ") or "(409)" in m for m in msgs), logs.output)
         self.assertEqual(len(self.reg.sessions), 1)                    # the live session is untouched
 
     def test_the_rebuild_limit_on_a_streaming_request_is_a_terminal_sse_error(self):
