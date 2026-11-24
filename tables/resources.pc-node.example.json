@@ -1,0 +1,17 @@
+{
+  "_comment": "The PC node (#145, option A: the owner's Windows gaming PC as a model server, not an execution host). Add this node to the provider host's git-ignored tables/resources.json, beside the Pro (tables/resources.example.json). Kept in its own file so the fleet example stays as it is. Addresses and the token path come from the env vars named below, set in the provider's LaunchAgent; never commit them. Runbook: docs/runbooks/PC-RTX3060-ENROLLMENT.md, section 12.",
+  "max_age_s": 120,
+  "nodes": [
+    {"id": "pc", "role": "worker", "target": null, "pool_eligible": false,
+     "inventory": {"gpu": "RTX 3060", "vram_gib": 12, "host_ram_gib": 32, "memory_scope": "system"},
+     "_comment": "target null: not sampled over ssh (WSL is gone, and the fleet sampler does not gate the local lane); the probe through its gate is its health check. The gate serves only while the owner is away from the PC and the manual switch is on (node_policy windows-idle on the PC); local_switch with node \"pc\" flips the switch.",
+     "ollama": {"_comment": "The block name is historical: a gate-fronted Anthropic node. Pin-only (owner 2026-11-24): auto_route and index_route false, so S1 never auto-picks it until the owner sets a proxy-index deduction (tables/local-models.json, index_proxies.not_mapped). The model is configuration: models[].id must equal served_model_name in the PC's local-backend.json (tables/local-backend.strata.example.json) and context_length must not exceed its context_tokens. max_inflight 1: Strata runs one request at a time on 12 GB. read_timeout_s 600: a first turn after Strata's idle unload waits ~195 s for the load. The token file is unique to this node, never the Pro's.",
+                "base_url_env": "CORTADOS_LOCAL_PC_GATE_URL", "token_file_env": "CORTADOS_LOCAL_PC_GATE_TOKEN_FILE",
+                "label": "PC", "auto_route": false, "index_route": false, "max_inflight": 1,
+                "probe_timeout_s": 2, "connect_timeout_s": 3, "read_timeout_s": 600,
+                "models": [
+                  {"id": "Qwen3.6-35B-A3B", "alias": "qwen36-35b", "name": "Qwen3.6 35B-A3B (UD-Q4_K_XL, RTX 3060)", "context_length": 49152, "thinking": "off-unless-asked"}
+                ]}}
+  ],
+  "deployments": []
+}

@@ -32,6 +32,12 @@ Ollama has no authentication, so it listens on 127.0.0.1 only and this gate is t
     through local_resources.set_local_switch, the toggle CLI's own code. It answers while the switch is off or on
     battery (it is how the owner sees and changes the state); inference keeps its refusal.
 
+On Windows (the PC node, #145; docs/LOCAL-RESOURCES.md "PC node (Strata)") the gate runs on Python 3.12 through
+gate_platform.py (file lock, token-file ACL, no-follow, directory fsync), with the Strata backend and the windows-idle
+node policy (node_policy.py: switch, AC, no full-screen app in a signed-in session, GPU not busy) in place of the Pro's
+pro_local_allowed, and with the S1-training node lock off (--no-studio-gate: the PC runs no S1 training, and that
+lock is fcntl-only). On macOS everything below is unchanged.
+
 Run:   python3 -m cortados_router.local_gate --listen <tailscale-ip>
 Check: python3 -m cortados_router.local_gate --listen <tailscale-ip> --print-config
 Env equivalents: CORTADOS_LOCAL_GATE_LISTEN, CORTADOS_LOCAL_GATE_PORT, CORTADOS_LOCAL_GATE_UPSTREAM,
@@ -42,7 +48,6 @@ request holds LOCK_SH on that file from before it reaches Ollama until its respo
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hmac
 import ipaddress
 import http.client
@@ -61,10 +66,18 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from cortados_router import http_body, local_backend, local_governor, local_resources
+from cortados_router import gate_platform, http_body, local_backend, local_governor, local_resources, node_policy
 from cortados_router.local_resources import pro_local_allowed
-from cortados_router.studio_capacity import (gate_dir as default_studio_gate_dir, live_intents,
-                                             open_node_lock, verify_node_lock)
+
+if gate_platform.WINDOWS:
+    # No fcntl on Windows, so neither the S1-training node lock (studio_capacity is fcntl-based) nor its handshake:
+    # a Windows gate must run with --no-studio-gate (main refuses to start otherwise), and nothing below calls these.
+    fcntl = None
+    default_studio_gate_dir = live_intents = open_node_lock = verify_node_lock = None
+else:
+    import fcntl
+    from cortados_router.studio_capacity import (gate_dir as default_studio_gate_dir, live_intents,
+                                                 open_node_lock, verify_node_lock)
 
 logger = logging.getLogger("cortados.local_gate")
 
@@ -392,7 +405,8 @@ def training_hold(gate_dir: str | os.PathLike | None, now: float | None = None) 
 
 def read_token(path: str | os.PathLike) -> str:
     """The token in `path`, refusing a file that is missing, not a regular file, readable or writable by group or
-    others (the token is the only thing between the tailnet and the node's models), or too short."""
+    others (the token is the only thing between the tailnet and the node's models), or too short. On Windows "group
+    or others" is the file's DACL (gate_platform.token_file_problem)."""
     p = Path(os.path.expanduser(str(path)))
     try:
         st = p.stat()
@@ -400,9 +414,9 @@ def read_token(path: str | os.PathLike) -> str:
         raise GateConfigError(f"token file {p} missing or unreadable ({exc.strerror}); create it with mode 0600") from exc
     if not stat.S_ISREG(st.st_mode):
         raise GateConfigError(f"token file {p} is not a regular file")
-    if st.st_mode & 0o077:
-        raise GateConfigError(f"token file {p} has mode {stat.S_IMODE(st.st_mode):04o}; group/other access must be "
-                              "none (chmod 600)")
+    why = gate_platform.token_file_problem(p, st)     # POSIX: the mode; Windows: the owner and DACL
+    if why is not None:
+        raise GateConfigError(f"token file {p} {why}")
     try:
         token = p.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeDecodeError) as exc:
@@ -470,7 +484,7 @@ class GateServer(ThreadingHTTPServer):
                  header_deadline: float = HEADER_DEADLINE_S, body_deadline: float = BODY_DEADLINE_S,
                  drain_deadline: float = DRAIN_DEADLINE_S, studio_gate_dir: str | os.PathLike | None = None,
                  backend: dict | None = None, admission: local_governor.Admission | None = None,
-                 epoch: int | None = None, epoch_file: str | os.PathLike | None = None):
+                 epoch: int | None = None, epoch_file: str | os.PathLike | None = None, policy=None):
         check_max_connections(max_connections)
         check_limits(max_body=max_body, connect_timeout=connect_timeout,
                      read_timeout=read_timeout, idle_timeout=idle_timeout, header_deadline=header_deadline,
@@ -494,6 +508,8 @@ class GateServer(ThreadingHTTPServer):
         if self.backend["backend"] not in local_backend.BACKENDS:
             raise GateConfigError(f"unknown backend {self.backend['backend']!r}")
         self.admission = admission if admission is not None else local_governor.Admission(None)
+        # The node policy (node_policy.build: the PC's windows-idle), or None: the Pro's pro_local_allowed, as before.
+        self.policy = policy
         # Retirement (RETIRE_PATH): a vllm-mlx node serving a text-only model, whose guard serves the text route with
         # the ticket ledger installed and confirms each release (a vision model's guard has no ledger: #125 unchanged).
         gov = self.admission.governor
@@ -554,11 +570,7 @@ def default_epoch_file() -> str:
 
 
 def _fsync_dir(path: str) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    gate_platform.fsync_dir(path)                     # skipped on Windows (gate_platform docstring)
 
 
 def next_epoch(path: str | os.PathLike | None = None) -> int:
@@ -571,17 +583,22 @@ def next_epoch(path: str | os.PathLike | None = None) -> int:
     p = os.path.abspath(os.path.expanduser(str(path if path is not None else default_epoch_file())))
     folder = os.path.dirname(p)
     os.makedirs(folder, mode=0o700, exist_ok=True)
-    lock = os.open(p + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    if gate_platform.WINDOWS:
+        _refuse_link(p + ".lock")                     # no O_NOFOLLOW there: the lock file is checked before it is opened
+    lock = os.open(p + ".lock", os.O_RDWR | os.O_CREAT | gate_platform.NOFOLLOW, 0o600)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            gate_platform.lock_file(lock)             # POSIX: flock(LOCK_EX), as before; Windows: msvcrt.locking
+        except gate_platform.LockTimeout as exc:
+            raise GateConfigError(f"gate epoch file {p}: {exc}") from None
         try:
             st = os.lstat(p)
         except FileNotFoundError:
             last = 0
         else:
-            if not stat.S_ISREG(st.st_mode):
+            if not stat.S_ISREG(st.st_mode) or gate_platform.is_link(st):
                 raise GateConfigError(f"gate epoch file {p} is not a regular file: refusing to start (fix it by hand)")
-            fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(p, os.O_RDONLY | gate_platform.NOFOLLOW)
             try:
                 raw = os.read(fd, 64)
             finally:
@@ -596,7 +613,9 @@ def next_epoch(path: str | os.PathLike | None = None) -> int:
             raise GateConfigError(f"gate epoch file {p}: the epochs are used up")
         epoch = last + 1
         tmp = f"{p}.tmp.{os.getpid()}"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        if gate_platform.WINDOWS:
+            _refuse_link(tmp)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | gate_platform.NOFOLLOW, 0o600)
         try:
             os.write(fd, f"{epoch}\n".encode())
             os.fsync(fd)
@@ -607,6 +626,18 @@ def next_epoch(path: str | os.PathLike | None = None) -> int:
         return epoch
     finally:
         os.close(lock)                         # releases the flock
+
+
+def _refuse_link(path: str) -> None:
+    """Windows has no O_NOFOLLOW: refuse a symlink or junction at `path` before it is opened (a missing path is fine).
+    A link planted between this check and the open is the residual race; the gate's config folder belongs to the
+    gate's own account."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if gate_platform.is_link(st):
+        raise GateConfigError(f"{path} is a link: refusing to start (fix it by hand)")
 
 
 def new_ticket_id(epoch: int, seq: int) -> str:
@@ -909,9 +940,10 @@ class GateHandler(BaseHTTPRequestHandler):
         return True
 
     def _node_free(self) -> tuple[bool, str]:
-        """pro_local_allowed (AC power + local switch; applies on every node running the gate, not only the Pro),
-        then the S1 training hold."""
-        allowed, reason = pro_local_allowed()
+        """pro_local_allowed (AC power + local switch; applies on every node running the gate, not only the Pro) or,
+        on a node with a node policy (the PC), that policy's decision; then the S1 training hold."""
+        policy = self.server.policy
+        allowed, reason = policy.allowed() if policy is not None else pro_local_allowed()
         if not allowed:
             return allowed, reason
         hold = training_hold(self.server.studio_gate_dir)
@@ -1155,7 +1187,8 @@ class GateHandler(BaseHTTPRequestHandler):
     def switch_status(self) -> dict:
         """The switch status: local_resources.local_switch_status, the S1 training hold (a yes/no, no detail), and the
         models Ollama has loaded."""
-        out = local_resources.local_switch_status()
+        policy = self.server.policy
+        out = policy.status() if policy is not None else local_resources.local_switch_status()
         out["training"] = training_hold(self.server.studio_gate_dir) is not None
         # "ollama" is the backend's reachability (the key predates the vllm-mlx backend; `backend` names which).
         out["models_loaded"], out["ollama"] = self._loaded_models()
@@ -1165,7 +1198,8 @@ class GateHandler(BaseHTTPRequestHandler):
 
     def _loaded_models(self) -> tuple[list[str] | None, str]:
         """(names, "up") from the backend on loopback (Ollama's GET /api/ps; vllm-mlx's GET /v1/models, its one
-        resident model), or (None, "unreachable" | "unreadable"). Names only: sizes, digests and expiry times stay on
+        resident model; Strata's GET /v1/models, the served name while it is not unloaded), or (None, "unreachable" |
+        "unreadable"). Names only: sizes, digests and expiry times stay on
         the node."""
         backend = self.server.backend["backend"]
         conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port)
@@ -1176,6 +1210,9 @@ class GateHandler(BaseHTTPRequestHandler):
                                             connect_s=min(self.server.connect_timeout, PS_CONNECT_S))
             except (OSError, http.client.HTTPException):
                 return None, "unreachable"
+            if backend == "strata":
+                names = local_backend.strata_loaded(self.server.backend, raw) if status == 200 else None
+                return (names, "up") if names is not None else (None, "unreadable")
             data = (local_backend.models_to_tags(raw) if backend == "vllm-mlx" else None) if status == 200 else None
             if data is None and status == 200 and backend == "ollama":
                 try:
@@ -1194,7 +1231,18 @@ class GateHandler(BaseHTTPRequestHandler):
     def _forward(self, method: str, path: str, body: bytes | None, ticket_id: str | None = None,
                  may_retry: bool = False):
         """Relay the turn upstream and the answer back. `may_retry`: a guard's ticket refusal (409 TICKET_REFUSAL) is
-        not relayed; REFUSED_TICKET is returned instead (nothing was written to the client), for one retry."""
+        not relayed; REFUSED_TICKET is returned instead (nothing was written to the client), for one retry. A model
+        turn on a node with a policy is counted as the gate's own GPU use while it runs (node_policy, "Own GPU use")."""
+        policy = self.server.policy if method == "POST" else None
+        if policy is None:
+            return self._relay(method, path, body, ticket_id, may_retry)
+        policy.forward_started()
+        try:
+            return self._relay(method, path, body, ticket_id, may_retry)
+        finally:
+            policy.forward_ended()
+
+    def _relay(self, method: str, path: str, body: bytes | None, ticket_id: str | None, may_retry: bool):
         backend = self.server.backend["backend"]
         name = "Ollama" if backend == "ollama" else backend
         up_method, up_path = local_backend.UPSTREAM[backend][(method, path)]
@@ -1223,6 +1271,11 @@ class GateHandler(BaseHTTPRequestHandler):
                     return self._tags(data, backend, ctype)
                 if may_retry and resp.status == 409 and TICKET_REFUSAL.encode() in data:
                     return REFUSED_TICKET
+                if backend == "strata" and resp.status in local_backend.STRATA_BUSY_STATUSES:
+                    # Strata's "GPU in use by another program" (503) or queue timeout (429): not now, so the gate's
+                    # retryable busy answer, which the provider routes elsewhere (local_backend docstring)
+                    why = "GPU in use by another program" if resp.status == 503 else "queue timed out"
+                    return self._busy({**self.server.admission.snapshot(), "reason": f"strata: {why}"})
                 if resp.status != 200 and backend != "ollama":
                     guarded = local_backend.guard_refusal(resp.status, data)
                     if guarded is not None:          # the backend's prompt guard: never fits, like the gate's own 413
@@ -1251,7 +1304,11 @@ class GateHandler(BaseHTTPRequestHandler):
     def _tags(self, data: bytes, backend: str, ctype: str) -> None:
         """A successful GET /api/tags: the backend's model list in Ollama's shape, with the capacity report added under
         GATE_KEY (Ollama clients ignore unknown keys). An answer that is not a JSON object is relayed unchanged."""
-        if backend == "vllm-mlx":
+        if backend == "strata":
+            tags = local_backend.strata_tags(self.server.backend, data)
+            if tags is None:
+                return self._error(502, "api_error", f"{backend} answered /v1/models with an unreadable list")
+        elif backend == "vllm-mlx":
             tags = local_backend.models_to_tags(data)
             if tags is None:
                 return self._error(502, "api_error", f"{backend} answered /v1/models with an unreadable list")
@@ -1275,6 +1332,33 @@ def _max_tokens(body: bytes | None):
     return data.get("max_tokens") if isinstance(data, dict) else None
 
 
+def check_platform(backend: dict, no_studio_gate: bool, windows: bool | None = None) -> None:
+    """Refuse a setup the platform cannot honour (GateConfigError): on Windows the S1-training lock does not exist
+    (--no-studio-gate must say so explicitly) and the Pro's AC-power policy reads pmset, which would refuse every
+    request there, so the backend config must name a node_policy. A node_policy on macOS is refused too: its probes are
+    Windows calls."""
+    windows = gate_platform.WINDOWS if windows is None else windows
+    if windows and not no_studio_gate:
+        raise GateConfigError("on Windows the S1-training node lock is not available: pass --no-studio-gate (or "
+                              "CORTADOS_LOCAL_GATE_NO_STUDIO_GATE=1); the PC runs no S1 training")
+    if windows and not backend.get("node_policy"):
+        raise GateConfigError("on Windows the backend config needs a node_policy (kind windows-idle): the Pro's "
+                              "power check reads pmset and would refuse every request")
+    if not windows and backend.get("node_policy"):
+        raise GateConfigError("node_policy windows-idle runs on Windows only (its owner and power probes are Windows "
+                              "calls)")
+
+
+def admission_for(backend: dict, governor) -> local_governor.Admission:
+    """The gate's admission: the governor's (an MLX node), a fixed count (Strata: max_inflight, its KV cache is
+    allocated at load), or unlimited (Ollama, as before)."""
+    if backend.get("backend") == "strata":
+        n = backend["max_inflight"]
+        return local_governor.Admission(None, count_limit=n,
+                                        count_reason=f"strata: {n} at a time (KV cache allocated at load)")
+    return local_governor.Admission(governor)
+
+
 def _settings(argv=None) -> argparse.Namespace:
     env = os.environ.get
     ap = argparse.ArgumentParser(prog="python3 -m cortados_router.local_gate", description=__doc__.split("\n")[0])
@@ -1283,9 +1367,14 @@ def _settings(argv=None) -> argparse.Namespace:
     ap.add_argument("--port", type=int, default=int(env("CORTADOS_LOCAL_GATE_PORT") or DEFAULT_PORT))
     ap.add_argument("--upstream", default=env("CORTADOS_LOCAL_GATE_UPSTREAM") or DEFAULT_UPSTREAM)
     ap.add_argument("--token-file", default=env("CORTADOS_LOCAL_GATE_TOKEN_FILE") or DEFAULT_TOKEN_FILE)
-    ap.add_argument("--studio-gate-dir", default=env("CORTADOS_LOCAL_GATE_STUDIO_GATE_DIR") or str(default_studio_gate_dir()),
+    ap.add_argument("--studio-gate-dir", default=env("CORTADOS_LOCAL_GATE_STUDIO_GATE_DIR") or
+                    (str(default_studio_gate_dir()) if default_studio_gate_dir is not None else ""),
                     help="S1 training handshake dir; a live intent there refuses requests with 503 "
                          "(default $CORTADOS_HOME/studio-gate)")
+    ap.add_argument("--no-studio-gate", action="store_true",
+                    default=env("CORTADOS_LOCAL_GATE_NO_STUDIO_GATE") == "1",
+                    help="no S1-training node lock: a node that never trains S1 (required on Windows, where the "
+                         "lock does not exist; an empty --studio-gate-dir is NOT this, it means the default)")
     ap.add_argument("--backend-config", default=env(local_backend.CONFIG_ENV) or None,
                     help="the node's backend config (ollama | vllm-mlx, governor); default "
                          f"{local_backend.DEFAULT_CONFIG} when it exists, else Ollama with no governor")
@@ -1314,27 +1403,34 @@ def main(argv=None) -> int:
             backend = local_backend.load(a.backend_config, explicit=a.backend_config is not None)
         except local_backend.BackendConfigError as exc:
             raise GateConfigError(str(exc)) from None
+        check_platform(backend, a.no_studio_gate)
     except GateConfigError as exc:
         print(f"local_gate: {exc}", file=sys.stderr)
         return 2
+    if a.no_studio_gate:
+        a.studio_gate_dir = None
     upstream = backend["upstream"] or a.upstream
     read_timeout = backend["read_timeout_s"] or a.read_timeout       # the backend config's, when it sets one
     governor = local_governor.Governor(backend["governor"]) if backend["governor"] else None
+    policy = node_policy.build(backend.get("node_policy"))
     if a.print_config:
         print(json.dumps({"listen": f"{listen}:{a.port}", "upstream": upstream, "token_file": a.token_file,
                           "backend": backend["backend"], "backend_config": backend["path"],
                           "served_model": backend["served_model"], "governor": backend["governor"],
-                          "token": f"ok ({len(token)} chars, mode 0600)", "routes": sorted(f"{m} {p}" for m, p in ROUTES),
+                          "token": f"ok ({len(token)} chars, " + ("ACL owner-only)" if gate_platform.WINDOWS
+                                                                  else "mode 0600)"), "routes": sorted(f"{m} {p}" for m, p in ROUTES),
                           "switch_endpoint": f"GET/POST {SWITCH_PATH}",
                           "max_body_bytes": a.max_body_bytes, "max_connections": a.max_connections or "unlimited",
                           "connect_timeout_s": a.connect_timeout, "read_timeout_s": read_timeout,
-                          "studio_gate_dir": a.studio_gate_dir}, indent=1))
+                          "studio_gate_dir": a.studio_gate_dir,
+                          "node_policy": backend.get("node_policy"), "max_inflight": backend.get("max_inflight")},
+                         indent=1))
         return 0
     try:
         srv = GateServer((listen, a.port), token=token, upstream=upstream, max_body=a.max_body_bytes,
                          max_connections=a.max_connections, connect_timeout=a.connect_timeout,
                          read_timeout=read_timeout, studio_gate_dir=a.studio_gate_dir, backend=backend,
-                         admission=local_governor.Admission(governor))
+                         admission=admission_for(backend, governor), policy=policy)
     except (GateConfigError, OSError) as exc:
         print(f"local_gate: cannot start: {exc}", file=sys.stderr)
         return 2

@@ -1,0 +1,37 @@
+{
+ "_comment": "The PC node's gate backend (#145, docs/LOCAL-RESOURCES.md \"PC node (Strata)\", docs/runbooks/PC-RTX3060-ENROLLMENT.md). Copy to ~/.config/cortados/local-backend.json ON THE PC (scripts/windows/install_pc_node.ps1 does it). Strata serves on 127.0.0.1:8080 only; the gate is the one door from the tailnet. The model is configuration (owner 2026-11-24: not final): another model is another strata.models entry, and strata.model names the one Strata serves. served_model_name must equal Strata's `aliases` entry for the model AND the id the provider's config gives it (tables/resources.example.json, the pc node).",
+ "backend": "strata",
+ "upstream": "http://127.0.0.1:8080",
+ "read_timeout_s": 600,
+ "_read_timeout_s": "The gate's wait for each upstream read. A first turn after Strata's idle unload waits ~195 s for the load before the first byte; 600 s covers that and a long non-streamed answer at ~30 tok/s. Set the pc block's read_timeout_s on the provider host to the same.",
+ "strata": {
+  "_comment": "max_inflight: Strata's --parallel is 1 on a 12 GB card, so the gate admits one turn at a time and answers a second with its retryable 529. context_tokens: the --max-context Strata was started with (Strata allocates the KV cache for it at load: the VRAM budget is spent there, so there is no per-request byte governor). upstream_ids: the names Strata's /v1/models may list for this model (default: served_model_name).",
+  "model": "qwen36-35b-a3b-q4",
+  "max_inflight": 1,
+  "models": {
+   "qwen36-35b-a3b-q4": {
+    "served_model_name": "Qwen3.6-35B-A3B",
+    "name": "Qwen3.6 35B-A3B (UD-Q4_K_XL, RTX 3060)",
+    "quant": "UD-Q4_K_XL",
+    "context_tokens": 49152,
+    "_context_tokens": "48K: measured 2026-11-23/24 at 30.8 tok/s decode, 0.54 s TTFT, 11.6 of 12.0 GiB VRAM. 63,488 is the most that fits at Q4 on 12 GB and was not benchmarked; 128K does not fit.",
+    "upstream_ids": ["Qwen3.6-35B-A3B"]
+   }
+  }
+ },
+ "node_policy": {
+  "_comment": "Serve by default (owner 2026-11-24, changed the same day): refused only while the switch is off (the 'serving OFF (game)' shortcut or local_switch), a full-screen app or game runs in a signed-in session, or other programs use the GPU at or over gpu_busy_pct. Keyboard and mouse input alone do not stop it (idle_after_s null; a number of seconds turns that rule back on). Missing or stale full-screen or GPU telemetry refuses. Each threshold's reason is in cortados_router/node_policy.py. activity_file: the base name of the per-session files the activity writer (task CortadOS-Activity) writes every 5 s in each signed-in session (<stem>.s<session id>.json); ~ is the account's profile.",
+  "kind": "windows-idle",
+  "activity_file": "~/.config/cortados/pc-activity.json",
+  "idle_after_s": null,
+  "activity_stale_s": 20,
+  "fullscreen_blocks": true,
+  "gpu_busy_pct": 40,
+  "own_gpu_settle_s": 1.5,
+  "own_gpu_skip_max_s": 60,
+  "nvidia_smi": "nvidia-smi",
+  "max_memory_load_pct": null,
+  "_max_memory_load_pct": "Off: with the model loaded Strata keeps ~19 GiB of experts in host RAM and free RAM measured 0.4 GiB (~99 % load), so any threshold would refuse all the time. Measure the PC's normal load first, then set one.",
+  "require_ac": true
+ }
+}

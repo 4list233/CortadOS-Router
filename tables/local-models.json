@@ -19,7 +19,8 @@
       "_doc": "Pin-only until their published base model is identified with certainty in scores.csv (do not guess: a wrong base model would route real work on a borrowed score).",
       "Huihui_Qwen_9b": "'Huihui Qwythos 9B': a community fine-tune whose base is not stated in its name; scores.csv has qwen3-5-9b, qwen3.5-9B and qwen3-8b, but no Qwen3.8 9B, and which (if any) it derives from is not known",
       "Huihui_Qwen3.8": "'Huihui Qwen3.8 Abliterated (17 GB)': the size suggests the 27B, but the parameter count and whether it is the reasoning or instruct build are not stated",
-      "Phi_4": "'Phi-4 Heretic (Q4_K_M, 9.1 GB)': 9.1 GB fits a 14B at Q4_K_M, which is phi-4 but also phi-4-reasoning (not in scores.csv); scores.csv's phi-4 is a candidate, not a certainty"
+      "Phi_4": "'Phi-4 Heretic (Q4_K_M, 9.1 GB)': 9.1 GB fits a 14B at Q4_K_M, which is phi-4 but also phi-4-reasoning (not in scores.csv); scores.csv's phi-4 is a candidate, not a certainty",
+      "Qwen3.6-35B-A3B": "'Qwen3.6 35B-A3B (UD-Q4_K_XL)' on the PC node (#145): its published base models are qwen3-6-35b-a3b and qwen3-6-35b-a3b-non-reasoning, but the deduction for this quant is the owner's call and the PC's model is not final (owner 2026-11-24); pin-only until both are set"
     }
   }
 }

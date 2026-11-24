@@ -605,7 +605,7 @@ _gate_reports: dict[str, tuple[float, dict[str, Any]]] = {}
 # backend for its whole life, so the last word stays true until the next report says otherwise. Read by the Office
 # view only (node_backend), never by routing or admission.
 _node_backends: dict[str, str] = {}
-NODE_BACKENDS = ("ollama", "vllm-mlx")    # local_backend.BACKENDS (a test keeps the two equal)
+NODE_BACKENDS = ("ollama", "vllm-mlx", "strata")    # local_backend.BACKENDS (a test keeps the two equal)
 
 
 def _note_gate(node: dict[str, Any], report: Any) -> None:
@@ -841,7 +841,14 @@ def _prefix(base_url: str) -> str:
 
 PRO_LOCAL_REFUSALS = {"local gate: local switch off", "local gate: local disabled: on battery",
                       "local gate: local disabled: unknown power source",
-                      "local gate: local disabled: power check failed"}
+                      "local gate: local disabled: power check failed",
+                      # the PC node's serving policy (node_policy.REFUSALS; a test keeps the two in step, #145)
+                      "local gate: local disabled: owner active", "local gate: local disabled: owner activity unknown",
+                      "local gate: local disabled: full-screen app running",
+                      "local gate: local disabled: GPU busy with another program",
+                      "local gate: local disabled: GPU state unknown", "local gate: local disabled: memory load high",
+                      "local gate: local disabled: memory state unknown",
+                      "local gate: local disabled: switch unreadable"}
 
 GATE_REFUSED = ("local gate on node {node} refused the provider token (401): the provider's token file does not "
                 "match the gate's")

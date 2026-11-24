@@ -84,7 +84,7 @@ PROVIDERS = ("claude", "codex", "local")
 # Which backend serves a local node (local_backend.BACKENDS, a test keeps the two equal), as the node's gate last
 # reported it (local_lane.node_backend). Published per local worker as `local_backend` so the Office can tell an Ollama
 # node from a vllm-mlx one (#77); None for every non-local worker and for a node whose gate never said.
-LOCAL_BACKENDS = ("ollama", "vllm-mlx")
+LOCAL_BACKENDS = ("ollama", "vllm-mlx", "strata")
 
 # ---- lifetimes: each one says why it is that long ----
 # A heartbeat saying `working` is refreshed on every tool call (throttled to one per 30 s when nothing changes), so one
