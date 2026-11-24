@@ -457,7 +457,7 @@ test('activation: a failed fresh install leaves no links, no installed files and
 test('activation: TERM during the health check rolls back before exiting', async t => {
   const D = await txHost(t, { upgrade: true });
   const r = runTx(D, 'term');
-  assert.equal(r.status, 1); assert.equal(r.out, '');      // exited from the trap, never reached "rc="
+  assert.equal(r.status, 143); assert.equal(r.out, '');      // exited from the trap, never reached "rc="
   assert.match(r.err, /ROLLBACK/);
   assert.deepEqual(await snapshot(D), OLD);
 });
@@ -1497,6 +1497,137 @@ test('wipe_rm and on_exit: secrets are overwritten and removed on every exit; a 
   assert.ok(used.has('studio-settings.json') && used.has('bridge-token'));
   for (const n of used) assert.ok(names.includes(n), `$TMP/${n} is not registered in SECRET_TMP`);
   assert.ok(text.indexOf('SECRET_TMP=(') < text.indexOf('trap on_exit EXIT'));
-  assert.match(text, /on_exit\(\) \{[\s\S]*?wipe_rm "\$\{SECRET_TMP\[@\]\/#\/\$TMP\/\}"[\s\S]*?rm -rf "\$TMP"\n\}/);
+  assert.match(text, /cleanup\(\) \{[\s\S]*?wipe_rm "\$\{SECRET_TMP\[@\]\/#\/\$TMP\/\}"[\s\S]*?rm -rf "\$TMP"\n  fi\n\}/);
   assert.ok(!/\brm -P\b/.test(text.replace(/^\s*#.*$/gm, '')), 'no rm -P left (a no-op on macOS)');
+});
+
+// ---- #77 fix round 3: a signal (INT/TERM/HUP) wipes the secrets and revokes the pending client ----
+// Reason: bash does not run the EXIT trap when an untrapped signal kills it. These send REAL signals to
+// /bin/bash running deploy-air.sh's own cleanup block (cut from the script's text, so the test runs
+// what ships) and a fake step that blocks until signalled.
+function cleanupBlock() {
+  const text = readFileSync(join(HERE, 'deploy-air.sh'), 'utf8');
+  const a = text.indexOf('\n', text.indexOf('\n[[ $APPLY -eq 1 ]] || echo "  DRY RUN') + 1) + 1;   // the top-level one
+  const b = text.indexOf('# ---- 1. role users');
+  assert.ok(a > 0 && b > a, 'cleanup block found');
+  return text.slice(a, b);
+}
+// A stand-in for `python3 -m cortados_router.provider.clients`: logs its arguments.
+async function fakeRepo(W) {
+  const p = join(W, 'repo', 'cortados_router', 'provider');
+  await mkdir(p, { recursive: true });
+  await writeFile(join(W, 'repo', 'cortados_router', '__init__.py'), '');
+  await writeFile(join(p, '__init__.py'), '');
+  await writeFile(join(p, 'clients.py'),
+    'import os, sys\nopen(os.environ["W"] + "/clients.log", "a").write(" ".join(sys.argv[1:]) + "\\n")\n');
+  return join(W, 'repo');
+}
+async function untilExists(path, ms = 10000) {
+  const end = Date.now() + ms;
+  while (!existsSync(path)) {
+    if (Date.now() > end) throw new Error(`${path} never appeared`);
+    await new Promise(r => setTimeout(r, 25));
+  }
+}
+function spawnSignalled(cmd, args, env, readyPath, signals) {
+  return new Promise((resolveP, reject) => {
+    const c = spawn(cmd, args, { env });
+    let stdout = '', stderr = '';
+    c.stdout.on('data', d => { stdout += d; }); c.stderr.on('data', d => { stderr += d; });
+    c.on('close', (status, signal) => resolveP({ status, signal, stdout, stderr }));
+    untilExists(readyPath).then(async () => {
+      for (const s of signals) { c.kill(s); await new Promise(r => setTimeout(r, 50)); }
+    }, e => { c.kill('SIGKILL'); reject(e); });
+  });
+}
+const SIGNALS = [['SIGTERM', 143], ['SIGINT', 130], ['SIGHUP', 129]];
+
+test('deploy-air.sh: a signal during the secrets steps wipes every secret in TMP and revokes the pending client (#77 fix round 3)', async t => {
+  const block = cleanupBlock();
+  for (const [sig, code] of SIGNALS) {
+    // a second signal during the cleanup must neither re-run nor cut it short
+    for (const signals of [[sig], [sig, sig, 'SIGTERM']]) {
+      const W = await mkdtemp(join(tmpdir(), 'office-sig-'));
+      t.after(() => rm(W, { recursive: true, force: true }));
+      const repo = await fakeRepo(W);
+      const script = `set -euo pipefail
+. "$LIB"
+APPLY=1; REPO=${JSON.stringify(repo)}
+${block}
+echo "$TMP" > "$W/tmpdir"
+(umask 077; echo office-secret > "$TMP/office-token"; echo settings-secret > "$TMP/studio-settings.json")
+PENDING_CLIENT=office-b
+: > "$W/ready"
+while :; do sleep 0.1; done
+`;
+      const r = await spawnSignalled('/bin/bash', ['-c', script], { PATH: '/usr/bin:/bin', LIB, W }, join(W, 'ready'), signals);
+      const label = `${signals.join('+')}: ${r.stderr}`;
+      const tmp = readFileSync(join(W, 'tmpdir'), 'utf8').trim();
+      t.after(() => rm(tmp, { recursive: true, force: true }));
+      assert.equal(r.status, code, label);
+      assert.ok(!existsSync(tmp), `TMP and its secrets are gone (${label})`);
+      assert.equal(readFileSync(join(W, 'clients.log'), 'utf8'), 'remove office-b\n', label);   // once
+    }
+  }
+});
+
+test('activation: a real signal during activation rolls back, then wipes TMP and revokes the pending client (#77 fix round 3)', async t => {
+  const block = cleanupBlock();
+  for (const [sig, code] of SIGNALS) {
+    const D = await txHost(t, { upgrade: true });
+    const repo = await fakeRepo(D);
+    const prelude = `APPLY=1; REPO=${JSON.stringify(repo)}
+${block}
+echo "$TMP" > "$D/tmpdir"; (umask 077; echo office-secret > "$TMP/office-token"); PENDING_CLIENT=office-b`;
+    const r = await spawnSignalled('/bin/bash', [TX_HARNESS],
+      { PATH: '/usr/bin:/bin', LIB, FAKE: D, FAIL: 'block', FAIL_ALWAYS: '', PRELUDE: prelude, UNKNOWN: '', W: D },
+      join(D, 'blocking'), [sig, sig]);
+    const tmp = readFileSync(join(D, 'tmpdir'), 'utf8').trim();
+    t.after(() => rm(tmp, { recursive: true, force: true }));
+    assert.equal(r.status, code, `${sig}: ${r.stderr}`);
+    assert.equal(r.stdout.trim(), '', sig);           // exited from the handler, never reached "rc="
+    assert.match(r.stderr, /ROLLBACK/, sig);
+    assert.equal((r.stderr.match(/ROLLBACK/g) || []).length, 1, `${sig}: the rollback ran once`);
+    assert.deepEqual(await snapshot(D), OLD, sig);
+    assert.ok(!existsSync(tmp), sig);
+    assert.equal(readFileSync(join(D, 'clients.log'), 'utf8'), 'remove office-b\n', sig);
+  }
+});
+
+test('activation: a signal during the rollback of a failed activation waits for it to finish, then exits 128+signal (#77 fix round 3)', async t => {
+  const D = await txHost(t, { upgrade: true });
+  const repo = await fakeRepo(D);
+  const prelude = `APPLY=1; REPO=${JSON.stringify(repo)}
+${cleanupBlock()}
+echo "$TMP" > "$D/tmpdir"; (umask 077; echo office-secret > "$TMP/office-token"); PENDING_CLIENT=office-b
+eval "orig_$(declare -f tx_rollback)"
+tx_rollback() { kill -TERM $$; kill -TERM $$; orig_tx_rollback; }`;
+  const r = spawnSync('/bin/bash', [TX_HARNESS],
+    { env: { PATH: '/usr/bin:/bin', LIB, FAKE: D, FAIL: 'health', FAIL_ALWAYS: '', PRELUDE: prelude, UNKNOWN: '', W: D }, encoding: 'utf8' });
+  const tmp = readFileSync(join(D, 'tmpdir'), 'utf8').trim();
+  t.after(() => rm(tmp, { recursive: true, force: true }));
+  assert.equal(r.status, 143, r.stderr);
+  assert.equal(r.stdout.trim(), '');
+  assert.deepEqual(await snapshot(D), OLD);
+  assert.ok(!existsSync(tmp));
+  assert.equal(readFileSync(join(D, 'clients.log'), 'utf8'), 'remove office-b\n');
+});
+
+test('activation: after a committed activation the script\'s own signal handlers are back, never cleared (#77 fix round 3)', async t => {
+  const D = await txHost(t, { upgrade: true });
+  const repo = await fakeRepo(D);
+  // a signal in step 8, after tx_run: the pending client is still set until the commit clears it
+  const prelude = `APPLY=1; REPO=${JSON.stringify(repo)}
+${cleanupBlock()}
+echo "$TMP" > "$D/tmpdir"; (umask 077; echo office-secret > "$TMP/office-token"); PENDING_CLIENT=office-b
+eval "orig_$(declare -f tx_commit)"
+tx_commit() { orig_tx_commit; kill -TERM $$; }`;
+  const r = spawnSync('/bin/bash', [TX_HARNESS],
+    { env: { PATH: '/usr/bin:/bin', LIB, FAKE: D, FAIL: '', FAIL_ALWAYS: '', PRELUDE: prelude, UNKNOWN: '', W: D }, encoding: 'utf8' });
+  const tmp = readFileSync(join(D, 'tmpdir'), 'utf8').trim();
+  t.after(() => rm(tmp, { recursive: true, force: true }));
+  assert.equal(r.status, 143, r.stderr);
+  assert.deepEqual(await snapshot(D), NEW);   // committed: no rollback
+  assert.ok(!existsSync(tmp));
+  assert.equal(readFileSync(join(D, 'clients.log'), 'utf8'), 'remove office-b\n');
 });

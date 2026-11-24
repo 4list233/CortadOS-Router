@@ -344,22 +344,39 @@ for label in "$BRIDGE_LABEL" "$STUDIO_LABEL"; do
 done
 [[ $APPLY -eq 1 ]] || echo "  DRY RUN: nothing below is executed. Re-run with --apply."
 
-TMP="$(mktemp -d)"   # 0700, the owner's
-# Every file in TMP that ever holds a secret, registered here, before any of them is made: on_exit
-# wipes them (wipe_rm, deploy-lib.sh) on every exit, a die, a failed step or a signal (bash runs the
-# EXIT trap on INT/TERM too), not only on the success path (#77 fix round 2).
+# Every file in TMP that ever holds a secret, registered here, before any of them is made: cleanup
+# wipes them (wipe_rm, deploy-lib.sh) on every exit, a die, a failed step or a signal, not only on
+# the success path (#77 fix round 2).
 SECRET_TMP=(office-token office-header bridge-token access-token studio-settings.json studio-settings.old)
 # A client registered by this run stays only once its release is committed: any other exit revokes it.
 PENDING_CLIENT=""
-on_exit() {
+TMP=""
+CLEANED=0
+cleanup() {  # runs once; a signal arriving while it runs is ignored, so it is never cut short
+  trap '' INT TERM HUP
+  [[ $CLEANED -eq 0 ]] || return 0
+  CLEANED=1
   if [[ -n "$PENDING_CLIENT" && $APPLY -eq 1 ]]; then
     PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients remove "$PENDING_CLIENT" >&2 \
       || echo "deploy-air: could not revoke $PENDING_CLIENT: remove it with clients remove" >&2
   fi
-  wipe_rm "${SECRET_TMP[@]/#/$TMP/}" || echo "deploy-air: could not remove every secret from $TMP: remove it now" >&2
-  rm -rf "$TMP"
+  if [[ -n "$TMP" ]]; then
+    wipe_rm "${SECRET_TMP[@]/#/$TMP/}" || echo "deploy-air: could not remove every secret from $TMP: remove it now" >&2
+    rm -rf "$TMP"
+  fi
 }
+on_exit() { cleanup; }
+# Reason (#77 fix round 3): bash does NOT run the EXIT trap when an untrapped SIGTERM/SIGINT/SIGHUP
+# kills it (reproduced with /bin/bash: exit 143, nothing wiped), so each signal has its own handler:
+# the same cleanup, then exit 128+signal (which also runs EXIT; cleanup runs only once). Installed
+# before TMP exists. During activation tx_run (deploy-lib.sh) replaces them with its rollback handlers
+# (a trap replacement is atomic: there is no moment without a handler) and puts these back after.
+on_signal() { cleanup; exit $((128 + $1)); }
 trap on_exit EXIT
+trap 'on_signal 2' INT
+trap 'on_signal 15' TERM
+trap 'on_signal 1' HUP
+TMP="$(mktemp -d)"   # 0700, the owner's
 
 # ---- 1. role users (hidden, no shell, no login) --------------------------------------
 step "1. Role users $BRIDGE_USER (bridge, holds office:read) and $STUDIO_USER (Claw3D Studio)"
@@ -483,7 +500,7 @@ fi
 #     studio-settings.py's stdin -> a 0600 file in the owner's 0700 TMP: never argv, never printed.
 #     Each file is read as its own role user, not root (no privilege for a link swapped in later).
 #     Exit codes, not die, inside: the caller dies once, with the reason. Both TMP files are wiped
-#     whenever stage_studio_settings returns, failed or not (and by on_exit if the run is killed).
+#     whenever stage_studio_settings returns, failed or not (and by cleanup if the run is killed or signalled).
 build_studio_settings() {  # 0 built and staged; 1 failed (reason on stderr). Leaves its TMP files.
   local ex
   (umask 077; : > "$TMP/studio-settings.old") || return 1

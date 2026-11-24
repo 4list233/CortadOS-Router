@@ -388,14 +388,33 @@ tx_commit() {
   TX_UNDO=(); TX_PREV=()
 }
 # 0: activated and committed. 1: rolled back cleanly. 2: the rollback itself failed (investigate).
+# INT/TERM/HUP during activation roll back, then exit 128+signal (the caller's EXIT trap still runs).
+# Handlers (#77 fix round 3): each `trap` replaces the one before atomically, so a signal always meets
+# either the caller's handler or the rollback's, never neither; the caller's are put back afterwards
+# (`trap -p`), never cleared. While a rollback runs, a further signal is only recorded (TX_SIG) and
+# acted on once the rollback is done: it never re-enters or cuts short the rollback.
+TX_SIG=""
+tx_on_signal() {  # signal-number
+  trap 'TX_SIG=2' INT; trap 'TX_SIG=15' TERM; trap 'TX_SIG=1' HUP
+  tx_rollback || echo "deploy-air: the rollback did not complete (see above): stop both daemons and investigate" >&2
+  exit $((128 + $1))
+}
 tx_run() {
+  local saved; saved="$(trap -p INT TERM HUP)"
+  tx_restore_traps() { if [[ -n "$saved" ]]; then eval "$saved"; else trap - INT TERM HUP; fi; }
   tx_begin || { echo "deploy-air: nothing was changed" >&2; return 1; }
-  trap 'tx_rollback; exit 1' INT TERM HUP
+  trap 'tx_on_signal 2' INT; trap 'tx_on_signal 15' TERM; trap 'tx_on_signal 1' HUP
   if tx_activate; then
-    trap - INT TERM HUP
+    tx_restore_traps
     tx_commit; return 0
   fi
-  trap - INT TERM HUP
-  if tx_rollback; then return 1; fi
-  return 2
+  TX_SIG=""
+  trap 'TX_SIG=2' INT; trap 'TX_SIG=15' TERM; trap 'TX_SIG=1' HUP
+  local rc=1; tx_rollback || rc=2
+  tx_restore_traps
+  if [[ -n "$TX_SIG" ]]; then
+    [[ $rc -eq 1 ]] || echo "deploy-air: the rollback did not complete (see above): stop both daemons and investigate" >&2
+    exit $((128 + TX_SIG))   # the caller's EXIT trap does its cleanup, as its signal handler would
+  fi
+  return $rc
 }
