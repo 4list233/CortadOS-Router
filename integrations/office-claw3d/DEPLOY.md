@@ -208,7 +208,9 @@ sudo cat /opt/cortados-office/home/studio/secrets/studio-access-token | pbcopy
 What the login form does (`claw3d/studio-login.cjs`, tests in `studio-login.test.mjs`): it
 serves only `/cortados-login`, and only when Studio has a token. It accepts a POST only from
 its own origin (Origin equal to the request's scheme and Host or X-Forwarded-Host) and only
-form-encoded, with the body capped at 4 KiB. It compares the token in constant time. After 10
+form-encoded, with the body capped at 4 KiB. Its pages send `Referrer-Policy: same-origin`, so a
+browser's form POST carries the page's real Origin (a `no-referrer` page would make it send
+`Origin: null`, which is refused). It compares the token in constant time. After 10
 failures in a minute it answers 429. That limit is shared, because through Serve every request
 reaches Studio from loopback; Claw3D's own gate counts the same way.
 
@@ -236,6 +238,27 @@ is required, which it is. The proxy injects the token from `CLAW3D_GATEWAY_TOKEN
 - `sudo lsof -nP -iTCP:18789 -sTCP:LISTEN` shows only `127.0.0.1:18789`.
 - `sudo lsof -nP -iTCP:3000 -sTCP:LISTEN` shows only `127.0.0.1:3000`.
 - `python3 -B -m cortados_router.provider.clients list` shows one of `claw3d-office: office:read` or `claw3d-office-b: office:read` (after a rotation), never both.
+- The login form works for a real browser, not only for curl. A browser does not let a page pick
+  its POST's Origin: it derives it from the page's `Referrer-Policy`, and a `no-referrer` page makes
+  every form POST carry `Origin: null`, which the form refuses with 403 "Log in from this page."
+  (#77: the first install served `no-referrer` and passed every curl check). So check the header,
+  then post the way a browser would. None of these needs the token:
+
+  ```sh
+  curl -sI http://127.0.0.1:3000/cortados-login | grep -i '^referrer-policy'
+  # must print: Referrer-Policy: same-origin      (no-referrer here = no browser can log in)
+  curl -s -o /dev/null -w '%{http_code}\n' -X POST -H 'Origin: http://127.0.0.1:3000' \
+    -H 'Content-Type: application/x-www-form-urlencoded' --data 'token=not-the-token' \
+    http://127.0.0.1:3000/cortados-login
+  # must print 401: the same-origin Origin a same-origin page sends passes, the token is checked
+  curl -s -o /dev/null -w '%{http_code}\n' -X POST -H 'Origin: null' \
+    -H 'Content-Type: application/x-www-form-urlencoded' --data 'token=not-the-token' \
+    http://127.0.0.1:3000/cortados-login
+  # must print 403: Origin: null stays refused (CSRF check)
+  ```
+
+  After `--publish-tailnet`, repeat the header check on `https://<air>.ts.net:8446/cortados-login`,
+  then log in once from a real browser: that is the only end-to-end check.
 - `/opt/cortados-office/log-bridge/err.log` holds one `Office bridge listening on 127.0.0.1:18789 (read-only)`
   line. Repeated `Office poll failed` lines mean the token or the provider is wrong.
 - In Studio's Office: one person per routed worker and one suited orchestrator per floor, wearing

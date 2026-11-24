@@ -14,6 +14,8 @@
 //   - only GET/HEAD/POST on exactly /cortados-login; every other path passes through untouched;
 //   - POST must be same-origin (Origin equal to the request's own scheme and Host, or the
 //     X-Forwarded-Host/-Proto Tailscale Serve sets) and form-encoded, body capped at 4 KiB;
+//   - every page it serves has Referrer-Policy: same-origin, so a real browser's form POST carries
+//     its Origin (a no-referrer page makes the browser send `Origin: null`, refused above);
 //   - constant-time compare; 10 failures a minute -> 429 for everyone (all traffic reaches
 //     Studio from loopback, so per-IP limits cannot tell devices apart);
 //   - the cookie is HttpOnly, SameSite=Strict, Path=/, 30 days, Secure when the request came
@@ -68,7 +70,11 @@ function createStudioLogin({ token, now = Date.now } = {}) {
   const send = (res, status, body, extra = {}) => {
     res.writeHead(status, {
       'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY',
-      'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff',
+      // same-origin, never no-referrer: a browser serializes the Origin of a non-GET request from
+      // a no-referrer page as `null` (Fetch, "append a request Origin header"), so the form's own
+      // POST would fail the Origin check below with 403. same-origin keeps the real Origin on this
+      // same-origin POST and still sends no referrer to any other origin. `Origin: null` stays refused.
+      'Referrer-Policy': 'same-origin', 'X-Content-Type-Options': 'nosniff',
       'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
       ...extra,
     });
