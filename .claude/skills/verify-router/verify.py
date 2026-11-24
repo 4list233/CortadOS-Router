@@ -264,9 +264,10 @@ print(json.dumps({"up": route(easy), "battery": route(easy, "node pro: local gat
                   "outward": route("email the signed invoice to the client and mark it paid")}))
 """
 
-# API credit lane (#114, 2026-11-22): S1-routed work a COST rule moved to local goes to the API credit lane only while a
-# grant expires within prefer_within_days (3), the lane is on (key, grants file, ledger, under the 95 % stop line) and the
-# request is low-risk; outward or degraded work never does, and a request already past the stop line stays local. Runs
+# API credit lane (#114, 2026-11-22): S1-routed work a COST rule moved to local went to the API credit lane while a
+# grant expired within prefer_within_days (3). Table v22's selection.api_pacing retires that rule (scarcity v2 §9 step
+# 4): the same work now stays local, outward or degraded work never reaches the API, and a request past the stop line
+# stays local. The continuation gate of conversations already bound to the lane is unchanged. Runs
 # the real routing.choose tail (sensitive_local, auto_local, the preference) and the real api_credits on a throwaway
 # home, a throwaway grants file and a fake key; S1's select is replaced by a fixed S1-shaped route, the node probe is
 # faked (no Ollama, no socket) and nothing is sent anywhere.
@@ -625,7 +626,13 @@ def w(name, used, h_left, life_h=168.0, pool="all"):
 def lane(windows, s, **kw):
     return {"fetched_at": now, "tried_at": now, "error": None, "windows": windows, "scarcity": s, "refusing": False,
             "pools": {}, **kw}
-grant = w("grant", 0.0, 211.0, 720.0); del grant["pool"]
+# Table v22 (selection.api_pacing): the grant's share of a split follows its pace to expiry, learned from the history.
+# Lagging: 20 % used with 211 h left (needs 0.38 %/h) while absorbing 0.2 %/h over the last 12 h.
+grant = w("grant", 20.0, 211.0, 720.0); del grant["pool"]
+core.STATE.mkdir(parents=True, exist_ok=True)
+with open(core.STATE / "scarcity-history.jsonl", "w") as fh:
+    for ago, used in ((12.0, 17.6), (0.0, 20.0)):
+        fh.write(json.dumps({"ts": now - ago * 3600, "lanes": {"anthropic-api": {"windows": [["grant", used, 70.0]]}}}) + "\\n")
 lanes = {"claude": lane([w("week (all models)", 36.0, 31.7), w("week (Fable)", 4.0, 31.7, pool="fable")], -0.84,
                         pools={"fable": {"scarcity": -1.0, "spent": False, "expiring_pct": 0, "tightest": {}}}),
          "codex": lane([w("week", 18.0, 36.4)], -1.0),
@@ -650,7 +657,13 @@ light = dec(2, 1, 1, 1)
 split = collections.Counter(go(light, f"verify-{i}")[0] for i in range(300))
 same = len({tuple(go(light, "verify-7")) for _ in range(5)}) == 1
 outward_api = sum(go(dec(2, 1, 1, 1, outward=True), f"verify-o{i}")[0] == "anthropic-api" for i in range(100))
-print(json.dumps({"split": split, "same_key_same_route": same, "no_key": go(light), "outward_api": outward_api,
+# Ahead of its pace: absorbing 1 %/h (forecast past the stop line), it takes no share of the split.
+with open(core.STATE / "scarcity-history.jsonl", "w") as fh:
+    for ago, used in ((12.0, 8.0), (0.0, 20.0)):
+        fh.write(json.dumps({"ts": now - ago * 3600, "lanes": {"anthropic-api": {"windows": [["grant", used, 70.0]]}}}) + "\\n")
+core._scarcity_module()._burn_cache["key"] = None      # re-read the history now (its cache keys on size and mtime)
+ahead = collections.Counter(go(light, f"verify-{i}")[0] for i in range(300))
+print(json.dumps({"split": split, "ahead": ahead, "same_key_same_route": same, "no_key": go(light), "outward_api": outward_api,
                   "planning_d7": go(dec(3, 2, 2, 0, "planning"), allowed=served),
                   "code_d9": go(dec(3, 2, 2, 2, "code"), allowed=served)}))
 """
@@ -927,15 +940,19 @@ def main():
     try:
         r = _last_json(p)
     except (ValueError, IndexError):
-        record("expiring API credit takes cost-bound local work, nothing else (S1-free)", "FAIL",
+        record("3-day API expiry preference retired by pacing (v22); outward/degraded never API (S1-free)", "FAIL",
                (p.stderr or p.stdout).strip()[-300:])
     else:
-        api = lambda x: x[0] == "anthropic-api" and x[2] == "api_credit_expiry"
-        ok = (api(r["expiring"]) and r["expiring"][1] == "claude-sonnet-5" and api(r["expiring_r1"])
+        # Table v22 (scarcity v2 §9 step 4): selection.api_pacing retires the 3-day expiry preference; the grant is
+        # paced as a scored pool in core.resolve instead (the API pacing scenario below). Cost-bound local work stays
+        # local even with a grant expiring in 2 days; outward and degraded work never reach the API either way.
+        stays = lambda x: x[0] == "local-pro" and x[2] != "api_credit_expiry"
+        ok = (stays(r["expiring"]) and stays(r["expiring_r1"])
               and r["not_expiring"][0] == "local-pro" and r["past_stop"][0] == "local-pro"
               and r["outward"][0] == "codex-cli" and r["degraded"][0] == "codex-cli" and r["stop_state"][0] is False
               and r["fallbacks"][0] == "local-pro")
-        record("expiring API credit takes cost-bound local work, nothing else (S1-free)", "PASS" if ok else "FAIL",
+        record("3-day API expiry preference retired by pacing (v22); outward/degraded never API (S1-free)",
+               "PASS" if ok else "FAIL",
                f"grant in 2 d: R2 -> {r['expiring'][:2]}, R1 -> {r['expiring_r1'][:2]} | in 20 d -> {r['not_expiring'][:2]} | "
                f"past the stop line -> {r['past_stop'][:2]} ({r['stop_state'][1]}) | outward -> {r['outward'][:2]} | "
                f"degraded -> {r['degraded'][:2]} | with fallbacks -> {r['fallbacks'][:2]}")
@@ -1031,15 +1048,20 @@ def main():
     try:
         r = _last_json(p)
     except (ValueError, IndexError):
-        record("#143 underused pools split, API lane competes, frontier for hard work (S1-free)", "FAIL",
+        record("#143 underused pools split, API grant paced (v22), frontier for hard work (S1-free)", "FAIL",
                (p.stderr or p.stdout).strip()[-300:])
     else:
         sp = r["split"]
-        ok = (sp.get("codex", 0) > 0 and sp.get("claude", 0) > 0 and 0 < sp.get("anthropic-api", 0) < 60
+        ah = r["ahead"]
+        # v22 pacing: lagging its pace the grant takes more than half of the split (needed / (needed + actual) ≈ 0.66
+        # of the conversations it qualifies for), the subscriptions still share the rest; ahead of its pace, none.
+        ok = (sp.get("codex", 0) > 0 and sp.get("claude", 0) > 0 and 120 < sp.get("anthropic-api", 0) < 270
+              and ah.get("anthropic-api", 0) == 0 and ah.get("codex", 0) > 0 and ah.get("claude", 0) > 0
               and r["same_key_same_route"] and r["outward_api"] == 0 and r["planning_d7"][2] is True
               and r["code_d9"][2] is True and r["code_d9"][5] >= 78.5)
-        record("#143 underused pools split, API lane competes, frontier for hard work (S1-free)", "PASS" if ok else "FAIL",
-               f"R1 split over 300 keys {dict(sp)} | same key same route {r['same_key_same_route']} | no key (the "
+        record("#143 underused pools split, API grant paced (v22), frontier for hard work (S1-free)", "PASS" if ok else "FAIL",
+               f"R1 split over 300 keys, grant lagging its pace {dict(sp)}, ahead of it {dict(ah)} | same key same route "
+               f"{r['same_key_same_route']} | no key (the "
                f"cheapest; the provider always passes one) -> {r['no_key'][:2]} | outward on the API {r['outward_api']}/100 | planning D7 -> {r['planning_d7'][:3]} | "
                f"code D9 -> {r['code_d9'][:3]} needs {r['code_d9'][5]}")
 

@@ -5,6 +5,7 @@ model scores, throwaway homes; no vendor CLI, no network, no live state."""
 from __future__ import annotations
 
 import collections
+import copy
 import importlib.util
 import json
 import os
@@ -52,6 +53,9 @@ class FakeSc:
     def recent_burn_rates(self, *a, **k):
         return dict(self.burns)
 
+    def reading_freshness(self, lane, v, *a, **k):
+        return True, False                         # every fake reading is fresh and its last try succeeded
+
 
 def health(**lanes):
     return {l: {"ok": True, "why": None, "scarcity": s, "expiring_pct": 0, "tightest": {}, "pools": {}}
@@ -95,15 +99,31 @@ def dec(steps=3, ambiguity=1, novelty=1, blast=1, outward=False, work_kind="code
     return {"answers": a, "degraded": degraded, "engine": "test", "engine_ms": 1}
 
 
+def table_with_pacing(on: bool) -> dict:
+    """The checked-in routing table with selection.api_pacing (scarcity v2 §9 step 4, table v22) set on or off."""
+    t = copy.deepcopy(_TABLE)
+    t["selection"]["api_pacing"] = {**t["selection"]["api_pacing"], "enabled": on}
+    return t
+
+
+_TABLE = core.table()
+TABLE_PACING_OFF = table_with_pacing(False)
+
+
 class Base(unittest.TestCase):
+    # These are #143's (table v21's) route tests: they run with the API pacing flag off, which must route exactly as
+    # v21 did (tests/test_api_pacing.py covers the flag on, and checks off == v21 decision for decision).
+    TABLE = TABLE_PACING_OFF
+
     def setUp(self):
-        self._keep = (core._sc_mod, core.model_scores, core.lane_health, core._vendor_accounts)
+        self._keep = (core._sc_mod, core.model_scores, core.lane_health, core._vendor_accounts, core.table)
         core.model_scores = lambda: MS
         core._vendor_accounts = lambda *a: [dict(x) for x in ACCOUNTS]
+        core.table = lambda: self.TABLE
         self.now = time.time()
 
     def tearDown(self):
-        core._sc_mod, core.model_scores, core.lane_health, core._vendor_accounts = self._keep
+        core._sc_mod, core.model_scores, core.lane_health, core._vendor_accounts, core.table = self._keep
 
     def audit_state(self, api_used=0.0, api_h_left=211.0, ucs=UCS, burns=None, **override):
         """2026-11-23 23:37: A scarce (0.9, 25 % used of a fresh week), B 36 % used resetting in 31.7 h, Codex 18 % used

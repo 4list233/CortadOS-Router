@@ -640,18 +640,32 @@ def window_expected_loss_pct(w: dict[str, Any], fetched_at: float | None, now: f
     if h_left <= 0:
         return None
     if burn_pct_per_h is None:
-        e, at = w.get("elapsed_pct"), fetched_at
-        if e is None or not at:
+        burn_pct_per_h = _window_pace_pct_per_h(w, fetched_at)
+        if burn_pct_per_h is None:
             return None
-        e = float(e) / 100.0
-        left_at_sample = (float(reset) - float(at)) / 3600.0
-        if left_at_sample <= 0:
-            return None
-        if e >= 0.999:
+        if burn_pct_per_h == IMMINENT:
             return round(headroom, 1)                                # the reset is imminent: what is left is lost
-        window_h = left_at_sample / (1.0 - e)
-        burn_pct_per_h = float(used) / (max(e, 0.05) * window_h)    # window_view's own 5 % floor on the elapsed share
     return round(max(0.0, headroom - max(0.0, float(burn_pct_per_h)) * h_left), 1)
+
+
+IMMINENT = float("inf")   # _window_pace_pct_per_h: the window is (almost) over at the sample, so it has no pace left
+
+
+def _window_pace_pct_per_h(w: dict[str, Any], fetched_at: float | None) -> float | None:
+    """A window's own pace so far, % per hour (used % ÷ hours elapsed, with window_view's 5 % floor on the elapsed
+    share): the burn rate window_expected_loss_pct and api_pace fall back to when no learned recent rate exists.
+    IMMINENT when the window was at least 99.9 % elapsed at the sample; None when the reading lacks what it needs."""
+    reset, used, e = w.get("reset_epoch"), w.get("used_pct"), w.get("elapsed_pct")
+    if reset is None or used is None or e is None or not fetched_at:
+        return None
+    e = float(e) / 100.0
+    left_at_sample = (float(reset) - float(fetched_at)) / 3600.0
+    if left_at_sample <= 0:
+        return None
+    if e >= 0.999:
+        return IMMINENT
+    window_h = left_at_sample / (1.0 - e)
+    return float(used) / (max(e, 0.05) * window_h)
 
 
 def _expected_loss_pct(c: dict[str, Any], now: float | None = None) -> float | None:
@@ -677,6 +691,64 @@ def _expected_loss_pct(c: dict[str, Any], now: float | None = None) -> float | N
         return None if any(x is None for x in losses) else min(losses)
     except Exception:
         return None
+
+
+def api_pacing_cfg(t: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """selection.api_pacing when it is on (table v22), else None: the flag of the API grant's spend-down pacing."""
+    t = table() if t is None else t
+    cfg = (t.get("selection") or {}).get("api_pacing")
+    return cfg if isinstance(cfg, dict) and cfg.get("enabled") is True else None
+
+
+def api_pace(now: float | None = None) -> dict[str, Any] | None:
+    """The API credit grant's ONE standardized "percent used" and its pace to expiry (scarcity v2 §9 step 4, owner
+    2026-11-24: the grant is "just like another subscription", ranked only by its percent used against its pace).
+      used_pct      100 × dollars spent ÷ the stop line's dollars (the reading's own % : api_credits.window_numbers
+                    makes 100 % the stop line, $190 of a $200 grant);
+      hours_left    hours until the grant stops counting (the window's reset: an hour before the expiry);
+      needed_pct_h  the pace that reaches the stop line exactly then: (100 − used) ÷ hours_left;
+      actual_pct_h  what it is absorbing now: the learned recent burn (scarcity.recent_burn_rates), else the window's
+                    own pace so far, the same two sources a subscription's expected loss uses;
+      forecast_pct  used + actual × hours_left (capped at 100), the % it is forecast to have used at expiry;
+      share         needed ÷ (needed + actual): the grant's share of an underuse split it takes part in (underuse_split).
+                    Lagging its pace (actual < needed) it draws more than half, ahead of it less, and 1 while it has
+                    absorbed nothing at all. Expiry pressure is the 1 ÷ hours_left in `needed`.
+    None (the grant takes no paced share) when the reading is missing, stale, failed or carries no grant window;
+    {"error": <exception name>} when computing it failed (resolve names both in the decision's rules). A grant past its
+    stop line or its last counting hour has share 0: it is never paced into more work."""
+    try:
+        sc = _scarcity_module()
+        lane = (sc.current().get("lanes") or {}).get(API_LANE) or {}
+        if not lane:
+            return None
+        fresh, failed = sc.reading_freshness(API_LANE, lane)
+        if not fresh or failed:
+            return None
+        w = next((x for x in (lane.get("windows") or []) if isinstance(x, dict) and x.get("pool", "all") == "all"
+                  and x.get("reset_epoch") is not None and x.get("used_pct") is not None and not x.get("stale")), None)
+        if w is None:
+            return None
+        now = time.time() if now is None else now
+        used = min(100.0, max(0.0, float(w["used_pct"])))
+        h_left = (float(w["reset_epoch"]) - now) / 3600.0
+        out = {"used_pct": round(used, 2), "hours_left": round(h_left, 2), "window": w.get("window")}
+        if h_left <= 0 or used >= 100.0:
+            return {**out, "needed_pct_h": 0.0, "actual_pct_h": None, "forecast_pct": used, "share": 0.0}
+        needed = (100.0 - used) / h_left
+        burns = sc.recent_burn_rates() if hasattr(sc, "recent_burn_rates") else {}
+        actual = burns.get((API_LANE, w.get("window")))
+        if actual is None:
+            actual = _window_pace_pct_per_h(w, lane.get("fetched_at"))
+            if actual is None:
+                return None
+            if actual == IMMINENT:
+                actual = 0.0                                      # no pace left in the window: only the need counts
+        actual = max(0.0, float(actual))
+        return {**out, "needed_pct_h": round(needed, 4), "actual_pct_h": round(actual, 4),
+                "forecast_pct": round(min(100.0, used + actual * h_left), 1),
+                "share": round(needed / (needed + actual), 4)}
+    except Exception as exc:                       # never breaks routing; resolve records it in the decision's rules
+        return {"error": type(exc).__name__}
 
 
 def _min_headroom_pct(lane: dict[str, Any], pool: str) -> float | None:
@@ -946,15 +1018,29 @@ def _expected_lost_tokens(c: dict[str, Any]) -> float | None:
 
 
 def underuse_split(cands: list[dict[str, Any]], key: str, eligible: Callable[[dict[str, Any]], bool],
-                   min_loss_pct: float) -> tuple[dict[str, Any], dict[str, float]] | None:
+                   min_loss_pct: float, api_share: float | None = None
+                   ) -> tuple[dict[str, Any], dict[str, float]] | None:
     """#143: (the route picked for this conversation, {quota group: expected lost tokens}) when at least two underused
     quota groups take part, else None. `cands` is in preference order (cheapest first); each group is represented by
     its first eligible route, weighted by the quota it is expected to lose at its reset (_expected_lost_tokens). A
-    group takes part only when its route is `eligible`, expected to lose at least `min_loss_pct` % and of known size."""
+    group takes part only when its route is `eligible`, expected to lose at least `min_loss_pct` % and of known size.
+    `api_share` (selection.api_pacing on: api_pace's share) paces the API credit grant: when it takes part, its weight
+    is set so that it gets exactly that share of the split and the subscription groups share the rest in their own
+    proportions (their equalization among themselves is unchanged). None keeps v21's weighting."""
     best: dict[str, dict[str, Any]] = {}
     lost: dict[str, float] = {}
     for c in cands:
-        if not eligible(c) or c.get("expected_loss_pct") is None or float(c["expected_loss_pct"]) < min_loss_pct:
+        loss = c.get("expected_loss_pct")
+        if not eligible(c) or loss is None:
+            continue
+        if api_share is not None and _base_lane(c["lane"]) == API_LANE:
+            # Paced, the grant takes part while it lags its stop line at all (forecast below 100 %): min_loss_pct
+            # keeps a subscription's last points as margin for a noisy % and forecast, but the grant's 100 % already
+            # IS its margin (the stop line, 95 % of the grant) and every turn is reserved at its upper-bound cost
+            # before it is sent. Both together would stop it at 95 % of the stop line ($180.50 of $190).
+            if float(loss) <= 0.0:
+                continue
+        elif float(loss) < min_loss_pct:
             continue
         g = _quota_group(c)
         if g in best:
@@ -965,6 +1051,21 @@ def underuse_split(cands: list[dict[str, Any]], key: str, eligible: Callable[[di
         best[g], lost[g] = c, tokens
     if len(best) < 2:
         return None
+    if api_share is not None:
+        api = [g for g in best if _base_lane(best[g]["lane"]) == API_LANE]
+        others = sum(v for g, v in lost.items() if g not in api)
+        if api and others > 0:
+            s = min(1.0, max(0.0, float(api_share)))
+            for g in api:                          # one grant group in practice; split its share evenly otherwise
+                lost[g] = (others * s / (1.0 - s) / len(api)) if s < 1.0 else float("inf")
+            if s >= 1.0:                           # absorbed nothing yet: the grant takes the split
+                g = api[0] if len(api) == 1 else split_pick(key, [(x, 1.0) for x in api])
+                return (best[g], {x: (1.0 if x in api else 0.0) for x in lost})
+            if s <= 0.0:
+                for g in api:
+                    lost.pop(g)
+                if len(lost) < 2:
+                    return None
     g = split_pick(key, list(lost.items()))
     return (best[g], lost) if g else None
 
@@ -1147,6 +1248,44 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
     if scored:
         sel = t["selection"]
         tie = sel.get("lane_tiebreak", [])
+        # Scarcity v2 §9 step 4 (selection.api_pacing, table v22; owner 2026-11-24): the API credit grant is ranked
+        # like any other pool, by its percent used against its pace to expiry (api_pace). It keeps the same models,
+        # bands, gates and cost terms as a subscription; its v21 "free until it lapses" weight discount is gone, and
+        # its share of an underuse split is its pace share instead of its expected lost tokens (unit-mismatched:
+        # list-price tokens of a $190 grant against subscription ledger tokens). Off: v21 exactly.
+        pacing = api_pacing_cfg(t) if any(c["lane"] == API_LANE for c in cands) else None
+        pace = api_pace() if pacing is not None else None
+        if pacing is not None and (pace is None or "error" in pace):
+            # No paced share without a fresh grant reading (its expected loss is unknown too, so it takes no part in a
+            # split); said here, so a decision never hides why the grant was left out.
+            rules.append("api pacing: " + (f"failed ({pace['error']})" if pace else "no fresh grant reading") +
+                         "; the grant takes no paced share")
+            pace = None
+        api_share = pace["share"] if pace is not None else None
+        if pace is not None:
+            # The grant's scarcity is its pace to expiry, not window_view's linear-life pace: window_view calls a
+            # refilling window comfortable at 70 % projected use, but the grant never refills and its 100 % is already
+            # the stop line, so it is underused exactly while it is forecast to end below that line:
+            # −(100 − forecast) / 100, in [−1, 0]. Only the ranking signal changes; a spent or refusing grant stays
+            # unavailable (ok), and its expected loss is the same 100 − forecast (_expected_loss_pct).
+            # Past the stop line or the last counting hour the grant takes nothing (#114's money rules, fail closed in
+            # the ranking too: the provider also stops offering the lane and api_credits.reserve refuses the turn).
+            done = pace["used_pct"] >= 100.0 or pace["hours_left"] <= 0
+            for c in cands:
+                if c["lane"] != API_LANE:
+                    continue
+                if done:
+                    ch_of[id(c)] = {**ch_of[id(c)], "ok": False,
+                                    "why": "API credit grant past its stop line or its last counting hour"}
+                elif ch_of[id(c)].get("scarcity") is not None:
+                    ch_of[id(c)] = {**ch_of[id(c)], "scarcity": round(-(100.0 - pace["forecast_pct"]) / 100.0, 2)}
+            if done:
+                rules.append(f"api pacing: grant {pace['used_pct']:g}% of its stop line used, {pace['hours_left']:g} h "
+                             "to its last counting hour: it takes no work")
+            else:
+                rules.append(f"api pacing: grant {pace['used_pct']:g}% of its stop line used, {pace['hours_left']:g} h "
+                             f"to expiry; needs {pace['needed_pct_h']:g}%/h, absorbing {pace['actual_pct_h']:g}%/h "
+                             f"(forecast {pace['forecast_pct']:g}% at expiry) -> {100 * pace['share']:.0f}% of a split")
         best_avail = max((c["index"] for c in cands if ok_of(c)), default=0)
         target = req if any(ok_of(c) and c["index"] >= req for c in cands) else best_avail       # nothing qualifies → strongest available
         for c in cands:
@@ -1187,7 +1326,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             loss = _expected_loss_pct(c) if sc < 0 and ch_of[id(c)].get("scarcity") is not None else None
             if loss is not None:
                 c["expected_loss_pct"] = loss
-            if c["lane"] == API_LANE and loss is not None:
+            if c["lane"] == API_LANE and loss is not None and pacing is None:
                 # #143 (owner 2026-11-23): the grant's dollars are "free until the grant lapses". Only the share of
                 # this spend the grant would NOT otherwise lose costs anything, so the weight is scaled by
                 # (1 − expected loss): ~0 while the forecast says most of the grant lapses unspent, rising as it is
@@ -1286,7 +1425,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             first = next((c for c in cands if qualifies(c)), None)
             min_loss = float(us.get("min_loss_pct", 0) or 0)
             if first is not None and first.get("expected_loss_pct") is not None and float(first["expected_loss_pct"]) >= min_loss:
-                split = underuse_split(cands, split_key, qualifies, min_loss)
+                split = underuse_split(cands, split_key, qualifies, min_loss, api_share)
             if split:
                 pick, lost = split
                 total = sum(lost.values())
@@ -1350,7 +1489,8 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
                 if split_key and us.get("enabled") and all(c.get("expected_loss_pct") is not None for c in spare):
                     in_spare = {id(c) for c in spare}
                     shared = underuse_split(sorted(spare, key=lambda c: c["cost"]), split_key,
-                                            lambda c: id(c) in in_spare, float(us.get("min_loss_pct", 0) or 0))
+                                            lambda c: id(c) in in_spare, float(us.get("min_loss_pct", 0) or 0),
+                                            api_share)
                 if shared:
                     top, lost = shared
                     total = sum(lost.values())

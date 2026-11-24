@@ -49,7 +49,7 @@
    ],
    "usage_source": "self-metered: cortados_router/api_credits.py; grants and the org monthly limit from ~/.config/cortados/api-credit.json (example tables/api-credit.example.json), spend in $CORTADOS_HOME/api-credit-ledger.json",
    "spend_down": true,
-   "note": "The one DOLLAR-denominated lane (scarcity is subscription units elsewhere). Spends only promotional credit: hard stop at 95% of the counting grants and of the org monthly limit, upper-bound reservations under a file lock, fail closed. Reached by an api/<model> pin, or by S1-routed local-eligible work while a grant expires within prefer_within_days (routing.prefer_api_credit). Prices in api_credits.py (claude-api skill, model table cached 2026-11-03)."
+   "note": "The one DOLLAR-denominated lane (scarcity is subscription units elsewhere). Spends only promotional credit: hard stop at 95% of the counting grants and of the org monthly limit, upper-bound reservations under a file lock, fail closed. Reached by an api/<model> pin, as a scored candidate paced to its stop line (routing table v22 selection.api_pacing, core.api_pace), or, only with that flag off, by S1-routed local-eligible work while a grant expires within prefer_within_days (routing.prefer_api_credit). Prices in api_credits.py (claude-api skill, model table cached 2026-11-03)."
   }
  },
  "policy": {
