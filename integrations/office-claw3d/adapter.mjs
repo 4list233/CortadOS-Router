@@ -1,6 +1,8 @@
 import { readFile } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { avatarDataUrl, avatarProfile } from './sprites.mjs';
 
@@ -313,7 +315,29 @@ export async function runPolling({ gateway, intervalMs = 5000, signal, onError =
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+/**
+ * True when the module at `moduleUrl` is the script node was started with. Shared by adapter.mjs,
+ * bridge.mjs and build-assets.mjs (all of which already import this file, so no new file to deploy).
+ * Node resolves symlinks for the main module (and /var -> /private/var on macOS), so its import.meta.url
+ * is the real path while process.argv[1] stays the path as given. The deploy runs the bridge through
+ * the `adapter` symlink (/opt/cortados-office/adapter -> adapters/<commit>), so a plain URL comparison
+ * silently skipped the main block there (exit 0, no output, launchd restart loop). Compare real paths.
+ * A realpath error never silently skips the main block: it falls back to the plain path comparison
+ * and, if that does not match either, says so on stderr.
+ */
+export function isMainModule(moduleUrl, argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  const modulePath = fileURLToPath(moduleUrl);
+  try {
+    return realpathSync(argv1) === realpathSync(modulePath);
+  } catch (error) {
+    if (resolve(argv1) === modulePath) return true;
+    process.stderr.write(`entry check: cannot resolve the start script (${error?.code ?? 'error'}); not run as main\n`);
+    return false;
+  }
+}
+
+if (isMainModule(import.meta.url)) {
   if (!process.argv.includes('--stdio') || !process.env.CORTADOS_OFFICE_TOKEN_FILE) {
     process.stderr.write('Diagnostic only: use --stdio and CORTADOS_OFFICE_TOKEN_FILE; the WebSocket host is bridge.mjs\n');
     process.exitCode = 1;

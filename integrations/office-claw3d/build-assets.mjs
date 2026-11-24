@@ -5,8 +5,8 @@
 // through the real adapter mapping, so it shows exactly the sprites the gateway sends.
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { mapOffice } from './adapter.mjs';
+import { fileURLToPath } from 'node:url';
+import { isMainModule, mapOffice } from './adapter.mjs';
 import { Canvas, FAMILIES, OUTFITS, SIZE, TILE_NAMES, drawText, spritePixels, spritePng, textWidth,
   tilePixels, tilePng } from './sprites.mjs';
 
@@ -102,7 +102,8 @@ export function buildAssets() {
   return files;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Real-path comparison: see isMainModule in adapter.mjs (the deploy starts the bridge via a symlink).
+if (isMainModule(import.meta.url)) {
   const files = buildAssets();
   if (process.argv.includes('--write')) {
     for (const [rel, buf] of files) {
