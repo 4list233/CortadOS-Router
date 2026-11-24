@@ -32,9 +32,11 @@ BRIDGE_USER="_cortados-office"; BRIDGE_UID=480; BRIDGE_HOME="$ROOT/home/bridge"
 STUDIO_USER="_cortados-claw3d"; STUDIO_UID=481; STUDIO_HOME="$ROOT/home/studio"
 ROLE_SHELL="/usr/bin/false"; ROLE_GID=20; ROLE_REALNAME="CortadOS Office role user"
 BRIDGE_PORT=18789                          # Claw3D's default upstream gateway port
-# Studio's upstream is the loopback bridge, named by this one host. CLAW3D_GATEWAY_URL and Claw3D's
-# UPSTREAM_ALLOWLIST (compared with `new URL(url).hostname`) are both built from it, so they cannot
-# drift. `localhost`: the bridge allows the Origin Studio's proxy derives from it (bridge.mjs).
+# Studio's upstream is the loopback bridge, named by this one host. The URL in Studio's settings file
+# (below) and Claw3D's UPSTREAM_ALLOWLIST (compared with `new URL(url).hostname`) are both built from
+# it, so they cannot drift. `localhost`: the bridge allows the Origin Studio's proxy derives from it
+# (bridge.mjs). The allowlist names a hostname only (Claw3D compares no port); the port is pinned by
+# the settings file's URL.
 GATEWAY_HOST=localhost
 GATEWAY_URL="ws://$GATEWAY_HOST:$BRIDGE_PORT"
 STUDIO_PORT=3000
@@ -48,8 +50,21 @@ CLIENT_SLOTS=(claw3d-office claw3d-office-b)
 BRIDGE_LABEL="com.cortados.office-bridge"; STUDIO_LABEL="com.cortados.office-studio"
 OFFICE_TOKEN="$BRIDGE_HOME/secrets/office-token"
 BRIDGE_SECRET="$BRIDGE_HOME/secrets/bridge-token"
+# Only read by launchers before #77 fix round 1 (as CLAW3D_GATEWAY_TOKEN, which Claw3D's proxy ignores): no
+# longer created or used; an existing one is left for a rollback to the previous launcher (step 5b).
 GATEWAY_SECRET="$STUDIO_HOME/secrets/gateway-token"
 ACCESS_TOKEN="$STUDIO_HOME/secrets/studio-access-token"
+# Claw3D's state dir, set explicitly in run-studio.sh (OPENCLAW_STATE_DIR) so the path does not hang
+# on launchd's HOME. It is the same path Claw3D defaults to for this user (<home>/.openclaw), so state
+# an earlier release wrote there is kept. Claw3D 51337f7's gateway proxy reads its upstream ONLY from
+# <stateDir>/claw3d/settings.json {gateway:{url,token,adapterType}} (server/studio-settings.js
+# loadUpstreamGatewaySettings), never from CLAW3D_GATEWAY_URL/_TOKEN: without this file it falls
+# back to ws://localhost:18789 with no token and refuses every connect (studio.gateway_token_missing).
+STUDIO_STATE="$STUDIO_HOME/.openclaw"
+STUDIO_SETTINGS="$STUDIO_STATE/claw3d/settings.json"
+# The health check's first pass must start within this many seconds of the restart (a check that is
+# running then finishes on its own timeouts, at most about 21 s), and then hold 10 s later.
+HEALTH_DEADLINE_S=60
 STAGE="$ROOT/stage"                        # root 0700: launchers, plists and a new token, before activation
 ADAPTER_FILES=(adapter.mjs bridge.mjs sprites.mjs claw3d/avatar-profile-hint.patch claw3d/studio-login.patch
   claw3d/studio-login.cjs)
@@ -136,6 +151,8 @@ if [[ $MODE != install ]]; then
   as_root_test -s "$ACCESS_TOKEN" || die "Studio has no access token file: re-run the install first"
   grep -q 'STUDIO_ACCESS_TOKEN' "$ROOT/bin/run-studio.sh" || die "the installed launcher predates the access token: re-run the install"
   grep -q 'UPSTREAM_ALLOWLIST' "$ROOT/bin/run-studio.sh" || die "the installed launcher predates the upstream allowlist (the Office cannot reach its bridge): re-run the install"
+  grep -q 'OPENCLAW_STATE_DIR' "$ROOT/bin/run-studio.sh" || die "the installed launcher predates Studio's gateway settings file (the Office cannot reach its bridge): re-run the install"
+  as_root_test -s "$STUDIO_SETTINGS" || die "Studio has no gateway settings file ($STUDIO_SETTINGS): re-run the install"
   # The gate must already be on, on loopback, before anything is published: / refuses without the
   # cookie and the login form answers.
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$STUDIO_PORT/" || true)"
@@ -260,9 +277,14 @@ if [[ "$CURRENT_BUILD" == "$BUILD" && ! -f "$BUILD/.cortados-build-ok" ]]; then
   die "$BUILD is current but has no build marker: investigate"
 fi
 
+# Studio's state dir and settings file are written as root (install -d, a read of the old file, cp/mv
+# in the transaction): none of them may be a link the Studio user planted, or root would follow it.
+for f in "$STUDIO_STATE" "$STUDIO_STATE/claw3d" "$STUDIO_SETTINGS"; do
+  if as_root_test -L "$f"; then die "$f is a symbolic link: refusing to write through it (move it aside first)"; fi
+done
 # An activation that was killed outright (no rollback ran) leaves the previous files as .prev.
 for f in "$ROOT/bin/run-bridge.sh" "$ROOT/bin/run-studio.sh" "/Library/LaunchDaemons/$BRIDGE_LABEL.plist" \
-         "/Library/LaunchDaemons/$STUDIO_LABEL.plist" "$OFFICE_TOKEN"; do
+         "/Library/LaunchDaemons/$STUDIO_LABEL.plist" "$OFFICE_TOKEN" "$STUDIO_SETTINGS"; do
   if as_root_test -e "$f.prev"; then
     die "$f.prev exists: an earlier activation was interrupted. It is the previous version: restore it (sudo mv) or delete it, then re-run"
   fi
@@ -278,10 +300,10 @@ for s in "${CLIENT_SLOTS[@]}"; do
   [[ -z "$LIVE_SLOT" ]] || die "both $LIVE_SLOT and $s are registered (an interrupted rotation): remove the one the bridge does not use"
   LIVE_SLOT="$s"
 done
-HAVE_OFFICE=0; HAVE_BRIDGE_PAIR=0; HAVE_ACCESS=0
+HAVE_OFFICE=0; HAVE_BRIDGE_SECRET=0; HAVE_ACCESS=0
 if [[ $UPGRADE -eq 1 ]]; then
   as_root_test -s "$OFFICE_TOKEN" && HAVE_OFFICE=1
-  as_root_test -s "$BRIDGE_SECRET" && as_root_test -s "$GATEWAY_SECRET" && HAVE_BRIDGE_PAIR=1
+  as_root_test -s "$BRIDGE_SECRET" && HAVE_BRIDGE_SECRET=1
   as_root_test -s "$ACCESS_TOKEN" && HAVE_ACCESS=1
 fi
 NEW_SLOT=""
@@ -298,8 +320,8 @@ fi
 
 [[ $UPGRADE -eq 1 ]] && kind=upgrade || kind="fresh install"
 echo "  ok: checkout $SRC_SHA (clean), provider reachable on loopback; $kind"
-echo "  plan: node $NODE_PLAN, build $BUILD_ID, office token $TOKEN_PLAN${NEW_SLOT:+ (as $NEW_SLOT)}, bridge secret $([[ $HAVE_BRIDGE_PAIR -eq 1 ]] && echo keep || echo make)," \
-  "studio access token $([[ $HAVE_ACCESS -eq 1 ]] && echo keep || echo make)"
+echo "  plan: node $NODE_PLAN, build $BUILD_ID, office token $TOKEN_PLAN${NEW_SLOT:+ (as $NEW_SLOT)}, bridge secret $([[ $HAVE_BRIDGE_SECRET -eq 1 ]] && echo keep || echo make)," \
+  "studio access token $([[ $HAVE_ACCESS -eq 1 ]] && echo keep || echo make), studio gateway settings rewritten from the bridge secret"
 for label in "$BRIDGE_LABEL" "$STUDIO_LABEL"; do
   loaded "$label" && echo "  $label is loaded: it is restarted after the switch (and again with the old release on a rollback)" || true
 done
@@ -337,7 +359,8 @@ run sudo install -d -o root -g wheel -m 0755 "$ROOT" "$ROOT/home" "$ROOT/bin" "$
 run sudo rm -rf "$STAGE"
 run sudo install -d -o root -g wheel -m 0700 "$STAGE"
 run sudo install -d -o "$BRIDGE_USER" -g staff -m 0700 "$BRIDGE_HOME" "$BRIDGE_HOME/secrets" "$ROOT/log-bridge"
-run sudo install -d -o "$STUDIO_USER" -g staff -m 0700 "$STUDIO_HOME" "$STUDIO_HOME/secrets" "$ROOT/log-studio"
+run sudo install -d -o "$STUDIO_USER" -g staff -m 0700 "$STUDIO_HOME" "$STUDIO_HOME/secrets" "$ROOT/log-studio" \
+  "$STUDIO_STATE" "$STUDIO_STATE/claw3d"
 run sudo install -d -o "$STUDIO_USER" -g staff -m 0755 "$ROOT/claw3d" "$ROOT/claw3d/builds"
 
 # ---- 2. Node (pinned tarball, hash-checked, private to /opt/cortados-office) ---------
@@ -388,7 +411,7 @@ else
 fi
 
 # ---- 5. secrets (never printed, never on argv) ----------------------------------------
-step "5. Secrets: office:read token ($TOKEN_PLAN), bridge secret, Studio access token"
+step "5. Secrets: office:read token ($TOKEN_PLAN), bridge secret, Studio access token, Studio gateway settings"
 # 5a. the provider's scoped client token, minted as the owner into the free slot, checked against
 #     the provider and STAGED for the bridge user. The running bridge keeps its own token, still
 #     registered, until the new release is committed (step 8); only then is the old slot revoked.
@@ -409,12 +432,14 @@ if [[ $TOKEN_PLAN != keep ]]; then
   run rm -P "$TMP/office-token"
 fi
 # 5b. a local secret shared by the bridge and Studio (NOT the office token: Studio may hand its
-#     upstream token to the browser, so it only ever opens this read-only bridge)
+#     upstream token to the browser, so it only ever opens this read-only bridge). The bridge checks
+#     BRIDGE_SECRET; Studio's copy is the token in its settings file (5d). An older install's
+#     $GATEWAY_SECRET is left in place, unused by this release: the previous launcher, which a
+#     rollback restores, still reads it at start.
 new_secret() { if [[ $APPLY -eq 1 ]]; then (umask 077; openssl rand -hex 32 > "$1"); fi; }
-if [[ $HAVE_BRIDGE_PAIR -eq 0 ]]; then
+if [[ $HAVE_BRIDGE_SECRET -eq 0 ]]; then
   new_secret "$TMP/bridge-token"
   run sudo install -S -o "$BRIDGE_USER" -g staff -m 0600 "$TMP/bridge-token" "$BRIDGE_SECRET"
-  run sudo install -S -o "$STUDIO_USER" -g staff -m 0600 "$TMP/bridge-token" "$GATEWAY_SECRET"
   run rm -P "$TMP/bridge-token"
 fi
 # 5c. Studio's own access token: its access gate is always on, loopback included, so publishing
@@ -424,6 +449,30 @@ if [[ $HAVE_ACCESS -eq 0 ]]; then
   run sudo install -S -o "$STUDIO_USER" -g staff -m 0600 "$TMP/access-token" "$ACCESS_TOKEN"
   run rm -P "$TMP/access-token"
 fi
+# 5d. Studio's gateway settings, the only place Claw3D's proxy takes its upstream from (see
+#     STUDIO_SETTINGS above): url = GATEWAY_URL, token = the bridge secret, adapterType openclaw.
+#     Rewritten on every run from BRIDGE_SECRET (idempotent; a rotated secret follows), keeping the
+#     installed file's other keys (Studio's own UI state). STAGED here and installed by the
+#     transaction (step 7), so a rollback puts the previous file back. The token goes file -> pipe ->
+#     studio-settings.py's stdin -> a 0600 file in the owner's 0700 TMP: never argv, never printed.
+#     Each file is read as its own role user, not root (no privilege for a link swapped in later).
+#     Exit codes, not die, inside: the caller dies once, with the reason.
+stage_studio_settings() {  # 0 staged; 1 failed (reason on stderr)
+  local ex
+  (umask 077; : > "$TMP/studio-settings.old") || return 1
+  ex="$(root_test -e "$STUDIO_SETTINGS")" || { echo "cannot check whether $STUDIO_SETTINGS exists" >&2; return 1; }
+  if [[ "$ex" == yes ]]; then
+    sudo -u "$STUDIO_USER" cat "$STUDIO_SETTINGS" > "$TMP/studio-settings.old" \
+      || { echo "cannot read $STUDIO_SETTINGS as $STUDIO_USER" >&2; return 1; }
+  fi
+  (set -o pipefail; umask 077; sudo -u "$BRIDGE_USER" cat "$BRIDGE_SECRET" \
+    | python3 -I "$HERE/studio-settings.py" --url "$GATEWAY_URL" --existing "$TMP/studio-settings.old" \
+    > "$TMP/studio-settings.json") || { echo "cannot build the settings from $BRIDGE_SECRET" >&2; return 1; }
+  sudo install -o "$STUDIO_USER" -g staff -m 0600 "$TMP/studio-settings.json" "$STAGE/studio-settings.json" || return 1
+  rm -P "$TMP/studio-settings.json" "$TMP/studio-settings.old"
+}
+printf '  stage %s (%s, 0600: gateway %s + the bridge secret) -> %s\n' "$STAGE/studio-settings.json" "$STUDIO_USER" "$GATEWAY_URL" "$STUDIO_SETTINGS"
+if [[ $APPLY -eq 1 ]]; then stage_studio_settings || die "cannot stage Studio's gateway settings (see above): nothing switched"; fi
 
 # ---- 6. launchers + LaunchDaemons, staged (they only name stable paths) -----------------
 step "6. Stage launchers and LaunchDaemons (system domain, UserName = role user, RunAtLoad, KeepAlive)"
@@ -450,15 +499,17 @@ write_root_file run-studio.sh 0755 <<EOF
 # Air or through tailscale serve, logs in at /cortados-login (claw3d/studio-login.cjs).
 set -euo pipefail
 export HOST=127.0.0.1 PORT=$STUDIO_PORT NODE_ENV=production NEXT_TELEMETRY_DISABLED=1
-export CLAW3D_GATEWAY_URL="$GATEWAY_URL"
+# Claw3D's state dir: its gateway proxy takes the upstream URL and token ONLY from
+# \$OPENCLAW_STATE_DIR/claw3d/settings.json (deploy-air.sh writes it: $GATEWAY_URL + the bridge
+# secret). No CLAW3D_GATEWAY_URL/_TOKEN here: Claw3D 51337f7's proxy ignores them (#77).
+export OPENCLAW_STATE_DIR="$STUDIO_STATE"
 # Claw3D 51337f7 (server/gateway-proxy.js isUpstreamAllowed) refuses EVERY upstream when NODE_ENV is
 # production and this is empty ("studio.gateway_url_blocked": the Office stays "CONNECTING", #77).
-# Exactly the gateway URL's hostname: only the loopback bridge is allowed, nothing else.
+# The settings URL's hostname, nothing else. Claw3D compares hostnames only, so this allows any port
+# on localhost; the settings file pins the bridge's port.
 export UPSTREAM_ALLOWLIST="$GATEWAY_HOST"
-export CLAW3D_GATEWAY_ADAPTER_TYPE=openclaw
-CLAW3D_GATEWAY_TOKEN="\$(cat "$GATEWAY_SECRET")"
 STUDIO_ACCESS_TOKEN="\$(cat "$ACCESS_TOKEN")"
-export CLAW3D_GATEWAY_TOKEN STUDIO_ACCESS_TOKEN
+export STUDIO_ACCESS_TOKEN
 cd "$ROOT/claw3d/current"
 exec "$NODE" server/index.js
 EOF
@@ -540,23 +591,28 @@ office_healthy() {  # prints why not, on failure
   # sudo or an unreadable answer fails the health check, so the transaction rolls back
   listeners_loopback_only "$BRIDGE_PORT" "$STUDIO_PORT" || return 1
 }
-health_check() {  # up to ~60 s for both daemons to come up, then the same checks must hold 10 s later
+# Bounded by an overall deadline, not a try count (reason: 30 tries of a check that can take ~21 s
+# each, the probe's 5 s and three 5 s curls, could run ~210 s with no output). No new attempt starts
+# after HEALTH_DEADLINE_S; one already running finishes on its own timeouts. A pass is confirmed by a
+# second full check 10 s later. Worst case: ~60 + 21 + 10 + 21 s, about 2 minutes.
+health_check() {
   [[ $APPLY -eq 1 ]] || { echo "  (dry run) health check: both daemons running, bridge 426, Studio 401 on /, 200 on /cortados-login, a connect through Studio's proxy answered by the bridge, loopback only"; return 0; }
-  local why="" i
-  for i in $(seq 1 30); do
+  local why="not checked" deadline=$((SECONDS + HEALTH_DEADLINE_S))
+  while (( SECONDS < deadline )); do
     if why="$(office_healthy)"; then
       sleep 10
       why="$(office_healthy)" && { echo "  healthy: both daemons running on loopback, Studio gated (401), login form 200, gateway connect ok"; return 0; }
     fi
     sleep 2
   done
-  echo "deploy-air: health check: $why" >&2; return 1
+  echo "deploy-air: health check (deadline ${HEALTH_DEADLINE_S} s): $why" >&2; return 1
 }
 TX_LINKS=("$ROOT/node-$NODE_VERSION|$ROOT/node|" "$ADAPTER_DIR|$ROOT/adapter|" "$BUILD|$ROOT/claw3d/current|$STUDIO_USER")
 TX_FILES=("$STAGE/run-bridge.sh|$ROOT/bin/run-bridge.sh" "$STAGE/run-studio.sh|$ROOT/bin/run-studio.sh"
   "$STAGE/$BRIDGE_LABEL.plist|/Library/LaunchDaemons/$BRIDGE_LABEL.plist"
   "$STAGE/$STUDIO_LABEL.plist|/Library/LaunchDaemons/$STUDIO_LABEL.plist")
 [[ $TOKEN_PLAN == keep ]] || TX_FILES+=("$STAGE/office-token|$OFFICE_TOKEN")
+TX_FILES+=("$STAGE/studio-settings.json|$STUDIO_SETTINGS")   # always: rewritten every run (5d)
 TX_LABELS=("$BRIDGE_LABEL" "$STUDIO_LABEL")
 tx_rc=0; tx_run || tx_rc=$?
 case $tx_rc in

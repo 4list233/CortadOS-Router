@@ -46,8 +46,11 @@ with assistant content. **Do not synthesize chat text** for metadata-only office
   react-three-fiber for the 3D office, and Phaser for the 2D builder. It needs npm and a
   `next build`.
 - **How a gateway feeds it**: the browser talks only to Studio (`/api/gateway/ws`). Studio's
-  server (`server/gateway-proxy.js`) opens a second WebSocket to the configured upstream
-  (`CLAW3D_GATEWAY_URL`, default `ws://localhost:18789`). It sends `Origin:` derived from that
+  server (`server/gateway-proxy.js`) opens a second WebSocket to the configured upstream: the
+  `gateway` entry of `<state dir>/claw3d/settings.json` (`server/studio-settings.js`; default
+  `ws://localhost:18789` with no token). The proxy does not read `CLAW3D_GATEWAY_URL` /
+  `CLAW3D_GATEWAY_TOKEN`; those only seed Studio's settings page when the file is missing (#77
+  fix round 1, which is why deploy-air.sh writes the file). It sends `Origin:` derived from that
   URL (127.0.0.1/::1 → `http://localhost:<port>`) and injects its configured token into
   `connect.params.auth.token`. That token may also reach the browser (Claw3D README), so it
   must never be a provider credential. Hello `adapterType` values Studio does not know are

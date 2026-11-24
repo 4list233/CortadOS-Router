@@ -5,8 +5,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, rm, chmod } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
@@ -690,11 +691,11 @@ test('listeners_loopback_only: loopback only from a successful lsof seeing both 
 // gateway proxy on a free loopback port (fakeStudioProxy); the lsof answers name it where they say 3000.
 // Async (spawn, not spawnSync): the fake proxy answers from this process's event loop.
 const ACCESS = 'a'.repeat(64);                    // the fake studio-access-token's content
-async function officeHealthy(t, sudo, lsofScript, proxy = 'ok') {
+async function officeHealthy(t, sudo, lsofScript, proxy = 'ok', claw3d = null) {
   const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
   const m = text.match(/^http_code\(\) \{.*\n^office_healthy\(\) \{[\s\S]*?\n\}\n/m);
   assert.ok(m, 'office_healthy found');
-  const studio = await fakeStudioProxy(t, proxy);
+  const studio = await fakeStudioProxy(t, proxy, claw3d);
   const bin = await fakeBins(t, {
     sudo, lsof: lsofScript.replaceAll(':3000', `:${studio.port}`),
     launchctl: '#!/bin/bash\n[ "${FAKE_ROOT:-}" = 1 ] || { echo "Could not find service" >&2; exit 113; }\n'
@@ -724,8 +725,13 @@ function spawnAsync(cmd, args, env) {
 //   blocked  what the Air answered on 2026-11-24: studio.gateway_url_blocked, then close 1011
 //   rejected the bridge refused the injected token (UNAUTHORIZED), then the upstream closed
 //   silent   the connect is never answered (the probe's deadline decides)
+//   claw3d   decided as the real Studio decides (#77 fix round 1), per connection: the upstream from
+//            a line-for-line port of Claw3D 51337f7's loadUpstreamGatewaySettings (claw3dSettings
+//            below) with `claw3d.env` as Studio's environment, then gateway-proxy.js's checks in its
+//            order (claw3dAnswer). The upstream is "the bridge" only at ws://localhost|127.0.0.1:<bridgePort>,
+//            and it says hello only to `claw3d.bridgeToken`, as bridge.mjs does.
 // It records each connect frame it got, to check the probe sends no credential of its own.
-async function fakeStudioProxy(t, mode) {
+async function fakeStudioProxy(t, mode, claw3d = null) {
   const { createServer } = await import('node:http');
   const { FrameReader, encodeFrame, acceptKey } = await import('./bridge.mjs');
   const connects = [];
@@ -739,7 +745,9 @@ async function fakeStudioProxy(t, mode) {
       `Sec-WebSocket-Accept: ${acceptKey(req.headers['sec-websocket-key'])}\r\n\r\n`);
     const send = f => socket.write(encodeFrame(1, JSON.stringify(f)));
     const close = code => { const b = Buffer.alloc(2); b.writeUInt16BE(code); socket.write(encodeFrame(8, b)); socket.end(); };
-    if (mode !== 'blocked') send({ type: 'event', event: 'connect.challenge', payload: { nonce: 'n' } });
+    // startUpstream runs per browser connection: the settings file is read now, not at server start
+    const setup = mode === 'claw3d' ? claw3dSetup(claw3d) : null;
+    if (mode === 'claw3d' ? !setup.error : mode !== 'blocked') send({ type: 'event', event: 'connect.challenge', payload: { nonce: 'n' } });
     const reader = new FrameReader();
     socket.on('error', () => {});
     socket.on('data', chunk => {
@@ -749,7 +757,11 @@ async function fakeStudioProxy(t, mode) {
         const f = JSON.parse(payload.toString('utf8'));
         if (f.method !== 'connect') continue;
         connects.push(f);
-        if (mode === 'ok') send({ type: 'res', id: f.id, ok: true, payload: { type: 'hello-ok', protocol: 3 } });
+        if (mode === 'claw3d') {
+          const a = claw3dAnswer(setup, f, claw3d);
+          if (a.ok) send({ type: 'res', id: f.id, ok: true, payload: { type: 'hello-ok', protocol: 3 } });
+          else { send({ type: 'res', id: f.id, ok: false, error: { code: a.code, message: a.code } }); close(a.close); }
+        } else if (mode === 'ok') send({ type: 'res', id: f.id, ok: true, payload: { type: 'hello-ok', protocol: 3 } });
         else if (mode === 'blocked') {
           send({ type: 'res', id: f.id, ok: false, error: { code: 'studio.gateway_url_blocked',
             message: 'Upstream gateway URL is not in the allowed hosts list.' } });
@@ -764,6 +776,98 @@ async function fakeStudioProxy(t, mode) {
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   t.after(() => { server.closeAllConnections?.(); server.close(); });
   return { port: server.address().port, connects };
+}
+// Claw3D 51337f7 (github.com/iamlukethedev/Claw3D, the commit deploy-air.sh pins), modelled line for
+// line, not loaded: server/studio-settings.js, the only place its gateway proxy takes its upstream from
+// (server/index.js 91-95 passes loadUpstreamGatewaySettings(process.env) to createGatewayProxy).
+//   resolveUserPath 8-16, resolveDefaultHomeDir 18-26, resolveStateDir 28-47: OPENCLAW_STATE_DIR,
+//     MOLTBOT_STATE_DIR, CLAWDBOT_STATE_DIR, else <home>/.openclaw (or an existing .clawdbot/.moltbot);
+//   resolveStudioSettingsPath 49-51: <stateDir>/claw3d/settings.json;
+//   readOpenclawGatewayDefaults 64-83: <stateDir>/openclaw.json gateway.auth.token + gateway.port;
+//   loadUpstreamGatewaySettings 85-112: the file's gateway {url, token, adapterType}; no token and an
+//     openclaw adapter -> openclaw.json's; else url || DEFAULT_GATEWAY_URL (ws://localhost:18789), token.
+// It reads no CLAW3D_GATEWAY_URL / CLAW3D_GATEWAY_TOKEN: the reason deploy-air.sh writes the file.
+// Not loaded from upstream source on purpose: tests run no third-party code. Re-check these lines
+// when CLAW3D_COMMIT moves.
+const claw3dSettings = () => {
+  const resolveUserPath = input => {
+    const trimmed = String(input ?? '').trim();
+    if (!trimmed) return trimmed;
+    return resolvePath(trimmed.startsWith('~') ? trimmed.replace(/^~(?=$|[\\/])/, homedir()) : trimmed);
+  };
+  const resolveStateDir = env => {
+    const override = env.OPENCLAW_STATE_DIR?.trim() || env.MOLTBOT_STATE_DIR?.trim() || env.CLAWDBOT_STATE_DIR?.trim();
+    if (override) return resolveUserPath(override);
+    const home = existsSync(homedir()) ? homedir() : tmpdir();
+    const dirs = ['.openclaw', '.clawdbot', '.moltbot'].map(d => join(home, d));
+    return dirs.find(d => existsSync(d)) ?? dirs[0];
+  };
+  const resolveStudioSettingsPath = env => join(resolveStateDir(env), 'claw3d', 'settings.json');
+  const readJsonFile = p => (existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : null);
+  const isRecord = v => Boolean(v && typeof v === 'object');
+  const readOpenclawGatewayDefaults = env => {
+    try {
+      const parsed = readJsonFile(join(resolveStateDir(env), 'openclaw.json'));
+      if (!isRecord(parsed)) return null;
+      const gateway = isRecord(parsed.gateway) ? parsed.gateway : null;
+      if (!gateway) return null;
+      const auth = isRecord(gateway.auth) ? gateway.auth : null;
+      const token = typeof auth?.token === 'string' ? auth.token.trim() : '';
+      const port = typeof gateway.port === 'number' && Number.isFinite(gateway.port) ? gateway.port : null;
+      if (!token) return null;
+      const url = port ? `ws://localhost:${port}` : '';
+      return url ? { url, token, adapterType: 'openclaw' } : null;
+    } catch { return null; }
+  };
+  const loadUpstreamGatewaySettings = env => {
+    const settingsPath = resolveStudioSettingsPath(env);
+    const parsed = readJsonFile(settingsPath);          // a malformed file throws, as in Claw3D
+    const gateway = parsed && typeof parsed === 'object' ? parsed.gateway : null;
+    const url = typeof gateway?.url === 'string' ? gateway.url.trim() : '';
+    const token = typeof gateway?.token === 'string' ? gateway.token.trim() : '';
+    const adapterType = typeof gateway?.adapterType === 'string' && gateway.adapterType.trim() ? gateway.adapterType.trim() : 'openclaw';
+    if (!token && adapterType === 'openclaw') {
+      const defaults = readOpenclawGatewayDefaults(env);
+      if (defaults) return { url: url || defaults.url, token: defaults.token, adapterType, settingsPath };
+    }
+    return { url: url || 'ws://localhost:18789', token, adapterType, settingsPath };
+  };
+  return { resolveStateDir, resolveStudioSettingsPath, loadUpstreamGatewaySettings };
+};
+// gateway-proxy.js 71-108 (isUpstreamAllowed), with Studio's env passed in instead of process.env
+function claw3dUpstreamAllowed(url, env) {
+  const allowlist = (env.UPSTREAM_ALLOWLIST || '').trim();
+  if (!allowlist) return env.NODE_ENV !== 'production';
+  try {
+    const allowed = allowlist.split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
+    return allowed.includes(new URL(url).hostname.toLowerCase());
+  } catch { return false; }
+}
+// gateway-proxy.js 288-330 (startUpstream): the settings, then url_missing, url_blocked, url_invalid
+function claw3dSetup({ env }) {
+  let settings;
+  try { settings = claw3dSettings().loadUpstreamGatewaySettings(env); } catch { return { error: 'studio.settings_load_failed' }; }
+  const url = typeof settings?.url === 'string' ? settings.url.trim() : '';
+  const token = typeof settings?.token === 'string' ? settings.token.trim() : '';
+  const adapterType = typeof settings?.adapterType === 'string' && settings.adapterType.trim()
+    ? settings.adapterType.trim().toLowerCase() : 'openclaw';
+  if (!url) return { error: 'studio.gateway_url_missing' };
+  if (!claw3dUpstreamAllowed(url, env)) return { error: 'studio.gateway_url_blocked' };
+  try { new URL(url); } catch { return { error: 'studio.gateway_url_invalid' }; }
+  return { url, token, adapterType };
+}
+// A setup error is sent as the connect's answer, then close 1011 (sendConnectError); else
+// forwardConnectFrame 230-243: an openclaw upstream with no token and no browser credential is
+// studio.gateway_token_missing; otherwise the token is injected and the upstream answers.
+function claw3dAnswer(setup, frame, { bridgeToken, bridgePort = 18789 }) {
+  if (setup.error) return { code: setup.error, close: 1011 };
+  const auth = frame.params?.auth ?? {};
+  const browserHasAuth = [auth.token, auth.password, auth.deviceToken].some(v => typeof v === 'string' && v.trim());
+  if (setup.adapterType === 'openclaw' && !setup.token && !browserHasAuth) return { code: 'studio.gateway_token_missing', close: 1011 };
+  const u = new URL(setup.url);
+  if (!['localhost', '127.0.0.1'].includes(u.hostname) || Number(u.port) !== bridgePort) return { code: 'studio.upstream_error', close: 1011 };
+  const sent = browserHasAuth ? auth.token : setup.token;
+  return sent === bridgeToken ? { ok: true } : { code: 'UNAUTHORIZED', close: 1008 };
 }
 test('deploy-air.sh office_healthy: a refused sudo lsof fails the health check (rollback), never passes it (r3 finding 1)', async t => {
   assert.equal(await officeHealthy(t, SUDO_ROOT, lsof(0, LOOPBACK)), 'rc=0');
@@ -780,29 +884,169 @@ test('deploy-air.sh office_healthy: a refused sudo lsof fails the health check (
 });
 
 // ---- #77 upstream allowlist: the Office could not reach its bridge while every check passed ----------
-test('run-studio.sh: UPSTREAM_ALLOWLIST is exactly the gateway URL\'s hostname (#77 upstream allowlist)', async () => {
+// deploy-air.sh's pins as it sets them, with ROOT moved under `root` (every Studio path hangs off it)
+async function deployPins(root) {
   const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  const pins = text.split('\n').filter(l => /^(STUDIO_USER|BRIDGE_USER|BRIDGE_PORT|STUDIO_PORT|GATEWAY_HOST|GATEWAY_URL|GATEWAY_SECRET|BRIDGE_SECRET|ACCESS_TOKEN|STUDIO_STATE|STUDIO_SETTINGS|HEALTH_DEADLINE_S)=/.test(l));
+  return { text, sh: `ROOT=${JSON.stringify(root)}\n${pins.join('\n')}` };
+}
+// run-studio.sh rendered by bash from deploy-air.sh's own heredoc, then RUN with NODE = a stub printing
+// its environment: the output is exactly the environment Studio starts with. Returns it with the pins.
+async function studioLauncher(t, root) {
+  const { text, sh } = await deployPins(root);
   const heredoc = text.match(/^write_root_file run-studio\.sh 0755 <<EOF\n([\s\S]*?)\nEOF\n/m);
   assert.ok(heredoc, 'run-studio.sh heredoc found');
-  // the pins the launcher names, as deploy-air.sh sets them, then the heredoc rendered by bash itself
-  const pins = text.split('\n').filter(l => /^(ROOT|STUDIO_USER|BRIDGE_PORT|STUDIO_PORT|GATEWAY_HOST|GATEWAY_URL|GATEWAY_SECRET|ACCESS_TOKEN)=/.test(l));
-  const r = spawnSync('bash', ['-c', `set -euo pipefail\n${pins.join('\n')}\nNODE=/x/node\ncat <<EOF\n${heredoc[1]}\nEOF\n`],
+  const node = join(root, 'node-env');
+  await writeFile(node, '#!/bin/bash\nexec /usr/bin/env\n'); await chmod(node, 0o755);
+  const r = spawnSync('bash', ['-c', `set -euo pipefail\n${sh}\nNODE=${JSON.stringify(node)}
+cat <<EOF\n${heredoc[1]}\nEOF\nprintf '%s\\n' "$STUDIO_STATE" "$STUDIO_SETTINGS" "$GATEWAY_URL" "$ACCESS_TOKEN" "$BRIDGE_SECRET" >&2`],
     { env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
-  const launcher = r.stdout;
-  const url = launcher.match(/^export CLAW3D_GATEWAY_URL="([^"]*)"$/m)?.[1];
-  const allow = launcher.match(/^export UPSTREAM_ALLOWLIST="([^"]*)"$/m)?.[1];
-  assert.equal(url, 'ws://localhost:18789');
-  assert.match(launcher, /NODE_ENV=production/);   // the reason the allowlist is needed: production refuses an empty one
+  const [stateDir, settingsPath, gatewayUrl, accessToken, bridgeSecret] = r.stderr.trim().split('\n');
+  await mkdir(join(root, 'claw3d', 'current'), { recursive: true });
+  await mkdir(join(accessToken, '..'), { recursive: true });
+  await writeFile(accessToken, ACCESS + '\n');
+  const file = join(root, 'run-studio.sh');
+  await writeFile(file, r.stdout); await chmod(file, 0o755);
+  const run = spawnSync('/bin/bash', [file], { env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stderr);
+  const env = Object.fromEntries(run.stdout.trim().split('\n').map(l => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+  return { launcher: r.stdout, env, stateDir, settingsPath, gatewayUrl, bridgeSecret };
+}
+// studio-settings.py as deploy-air.sh runs it: the token on stdin, never argv
+function buildSettings(token, url, existing = '') {
+  const args = ['-I', join(HERE, 'studio-settings.py'), '--url', url];
+  if (existing) args.push('--existing', existing);
+  return spawnSync('python3', args, { input: token + '\n', encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
+}
+const BRIDGE_TOKEN = 'c'.repeat(64);              // the fake bridge-token's content
+
+test('run-studio.sh: Studio\'s state dir is pinned, the allowlist is the settings URL\'s hostname, no dead CLAW3D_GATEWAY_* (#77 fix round 1)', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'office-launcher-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const L = await studioLauncher(t, root);
+  // Claw3D's resolver (modelled) lands on the file deploy-air.sh writes, from the launcher's environment
+  assert.equal(L.env.OPENCLAW_STATE_DIR, L.stateDir);
+  assert.equal(claw3dSettings().resolveStudioSettingsPath(L.env), L.settingsPath);
+  assert.equal(L.settingsPath, join(root, 'home', 'studio', '.openclaw', 'claw3d', 'settings.json'));
+  // Claw3D 51337f7's proxy reads no CLAW3D_GATEWAY_*: none is exported, so none can mislead
+  assert.deepEqual(Object.keys(L.env).filter(k => k.startsWith('CLAW3D_GATEWAY')), []);
+  assert.ok(!/CLAW3D_GATEWAY_TOKEN=|cat "[^"]*gateway-token"/.test(L.launcher), 'the launcher reads no gateway token');
+  assert.equal(L.env.NODE_ENV, 'production');   // the reason the allowlist is needed: production refuses an empty one
   // Claw3D compares each comma-separated entry with new URL(upstream).hostname
-  assert.equal(allow, new URL(url).hostname);
-  assert.ok(!allow.includes(','), 'only the loopback bridge is allowed');
+  assert.equal(L.env.UPSTREAM_ALLOWLIST, new URL(L.gatewayUrl).hostname);
+  assert.equal(L.gatewayUrl, 'ws://localhost:18789');
+  assert.equal(L.env.STUDIO_ACCESS_TOKEN, ACCESS);
   // both come from the one pin, so they cannot drift
-  assert.match(text, /^export CLAW3D_GATEWAY_URL="\$GATEWAY_URL"$/m);
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
   assert.match(text, /^export UPSTREAM_ALLOWLIST="\$GATEWAY_HOST"$/m);
   assert.match(text, /^GATEWAY_URL="ws:\/\/\$GATEWAY_HOST:\$BRIDGE_PORT"$/m);
-  // publishing refuses an installed launcher from before the allowlist
+  assert.ok(!/exactly the loopback bridge|only the loopback bridge is allowed/i.test(text), 'the allowlist names a hostname, not a port');
+  // publishing refuses an installed launcher or state from before the allowlist or the settings file
   assert.match(text, /grep -q 'UPSTREAM_ALLOWLIST' "\$ROOT\/bin\/run-studio\.sh" \|\| die /);
+  assert.match(text, /grep -q 'OPENCLAW_STATE_DIR' "\$ROOT\/bin\/run-studio\.sh" \|\| die /);
+  assert.match(text, /as_root_test -s "\$STUDIO_SETTINGS" \|\| die /);
+});
+
+test('studio-settings.py: Claw3D\'s loader reads back the URL and the bridge token; UI state kept; junk refused; the token never printed (#77 fix round 1)', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'office-settings-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const env = { OPENCLAW_STATE_DIR: join(dir, 'state') };
+  const path = join(dir, 'state', 'claw3d', 'settings.json');
+  await mkdir(join(path, '..'), { recursive: true });
+  const r = buildSettings(BRIDGE_TOKEN, 'ws://localhost:18789');
+  assert.equal(r.status, 0, r.stderr);
+  await writeFile(path, r.stdout);
+  const got = claw3dSettings().loadUpstreamGatewaySettings(env);
+  assert.deepEqual({ url: got.url, token: got.token, adapterType: got.adapterType },
+    { url: 'ws://localhost:18789', token: BRIDGE_TOKEN, adapterType: 'openclaw' });
+  // without the file Claw3D falls back to the default URL with NO token: the live Air's state
+  await rm(path);
+  assert.deepEqual(claw3dSettings().loadUpstreamGatewaySettings(env).token, '');
+  // an upgrade over a file Studio's UI wrote: its state is kept, the whole gateway entry replaced
+  const old = join(dir, 'old.json');
+  await writeFile(old, JSON.stringify({ version: 1, avatars: { a: { hue: 3 } }, activeFloorId: 'f2',
+    gateway: { url: 'ws://elsewhere:1', token: 'stale-token-0000000', adapterType: 'hermes', profiles: { hermes: { url: 'ws://x:2', token: '' } } } }));
+  const up = buildSettings(BRIDGE_TOKEN, 'ws://localhost:18789', old);
+  assert.equal(up.status, 0, up.stderr);
+  assert.deepEqual(JSON.parse(up.stdout), { version: 1, avatars: { a: { hue: 3 } }, activeFloorId: 'f2',
+    gateway: { url: 'ws://localhost:18789', token: BRIDGE_TOKEN, adapterType: 'openclaw' } });
+  // an empty existing copy (a fresh install) is no file at all
+  await writeFile(old, '');
+  assert.equal(buildSettings(BRIDGE_TOKEN, 'ws://localhost:18789', old).stdout, r.stdout);
+  // refused, never overwritten blind, and no value in any message
+  for (const content of ['[1]', '{not json', '"x"']) {
+    await writeFile(old, content);
+    const bad = buildSettings(BRIDGE_TOKEN, 'ws://localhost:18789', old);
+    assert.equal(bad.status, 2, content); assert.equal(bad.stdout, '');
+    assert.ok(!bad.stderr.includes(BRIDGE_TOKEN));
+  }
+  for (const [token, url] of [['', 'ws://localhost:18789'], ['short', 'ws://localhost:18789'], ['x y'.repeat(8), 'ws://localhost:18789'],
+    [BRIDGE_TOKEN, 'http://localhost:18789'], [BRIDGE_TOKEN, 'ws://localhost']]) {
+    const bad = buildSettings(token, url);
+    assert.equal(bad.status, 1, `${token} ${url}`); assert.equal(bad.stdout, '');
+    assert.ok(!bad.stderr.includes(BRIDGE_TOKEN));
+  }
+});
+
+test('deploy-air.sh stage_studio_settings: stages the bridge token for Studio, 0600, reading each file as its owner, never on argv (#77 fix round 1)', async t => {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  const fn = text.match(/^stage_studio_settings\(\) \{[\s\S]*?\n\}\n/m);
+  assert.ok(fn, 'stage_studio_settings found');
+  const root = await mkdtemp(join(tmpdir(), 'office-stage-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { sh } = await deployPins(root);
+  const [bridgeSecret, settingsPath] = spawnSync('bash', ['-c', `${sh}\nprintf '%s\\n' "$BRIDGE_SECRET" "$STUDIO_SETTINGS"`],
+    { encoding: 'utf8' }).stdout.trim().split('\n');
+  await mkdir(join(bridgeSecret, '..'), { recursive: true });
+  await writeFile(bridgeSecret, BRIDGE_TOKEN + '\n');
+  for (const d of ['stage', 'tmp']) await mkdir(join(root, d));
+  // sudo as root would: -u USER is logged (who read what), install's -o/-g dropped (not root here)
+  const bin = await fakeBins(t, { sudo: `#!/bin/bash
+if [ "$1" = -u ]; then echo "$2 \${@: -1}" >> "$SUDO_LOG"; shift 2; fi
+if [ "$1" = install ]; then shift; a=(); while [ $# -gt 0 ]; do case "$1" in -o|-g) shift 2 ;; *) a+=("$1"); shift ;; esac; done; exec /usr/bin/install "\${a[@]}"; fi
+exec "$@"
+` });
+  const run = () => spawnSync('bash', ['-c', `set -euo pipefail; . "$LIB"; ${sh}
+HERE=${JSON.stringify(HERE.replace(/\/$/, ''))} TMP=${JSON.stringify(join(root, 'tmp'))} STAGE=${JSON.stringify(join(root, 'stage'))}
+${fn[0]}
+rc=0; stage_studio_settings || rc=$?; echo "rc=$rc"`], { env: { PATH: `${bin}:/usr/bin:/bin`, LIB, SUDO_LOG: join(root, 'sudo.log') }, encoding: 'utf8' });
+  const staged = join(root, 'stage', 'studio-settings.json');
+  const { stat, readdir } = await import('node:fs/promises');
+  // a fresh install: no settings yet
+  let r = run();
+  assert.equal(r.stdout.trim(), 'rc=0', r.stderr);
+  assert.ok(!r.stdout.includes(BRIDGE_TOKEN) && !r.stderr.includes(BRIDGE_TOKEN), 'the token is never printed');
+  assert.equal((await stat(staged)).mode & 0o777, 0o600);
+  assert.deepEqual(await readdir(join(root, 'tmp')), [], 'nothing left in TMP');
+  await mkdir(join(settingsPath, '..'), { recursive: true });
+  await writeFile(settingsPath, await readFile(staged));   // what the transaction installs
+  const got = claw3dSettings().loadUpstreamGatewaySettings({ OPENCLAW_STATE_DIR: join(settingsPath, '..', '..') });
+  assert.deepEqual([got.url, got.token, got.adapterType], ['ws://localhost:18789', BRIDGE_TOKEN, 'openclaw']);
+  // an upgrade: Studio's UI state in the installed file survives, the gateway entry is rewritten
+  await writeFile(settingsPath, JSON.stringify({ version: 1, avatars: { z: 1 }, gateway: { url: 'ws://localhost:1', token: 'old-old-old-old-old' } }));
+  r = run();
+  assert.equal(r.stdout.trim(), 'rc=0', r.stderr);
+  assert.deepEqual(JSON.parse(await readFile(staged, 'utf8')),
+    { version: 1, avatars: { z: 1 }, gateway: { url: 'ws://localhost:18789', token: BRIDGE_TOKEN, adapterType: 'openclaw' } });
+  // each secret read as its own role user, never as root
+  assert.deepEqual((await readFile(join(root, 'sudo.log'), 'utf8')).trim().split('\n'),
+    [`_cortados-office ${bridgeSecret}`, `_cortados-claw3d ${settingsPath}`, `_cortados-office ${bridgeSecret}`]);
+  // a bridge secret that cannot be read fails (pipefail), never stages a tokenless file
+  await rm(staged); await rm(bridgeSecret);
+  r = run();
+  assert.equal(r.stdout.trim(), 'rc=1');
+  assert.match(r.stderr, /cannot build the settings/);
+  await assert.rejects(stat(staged));
+  // the token reaches studio-settings.py on stdin only; the result is staged, then installed by the transaction
+  assert.match(fn[0], /sudo -u "\$BRIDGE_USER" cat "\$BRIDGE_SECRET" \\\n\s+\| python3 -I "\$HERE\/studio-settings\.py" --url "\$GATEWAY_URL" --existing /);
+  assert.match(text, /^TX_FILES\+=\("\$STAGE\/studio-settings\.json\|\$STUDIO_SETTINGS"\)/m);
+  assert.match(text, /if \[\[ \$APPLY -eq 1 \]\]; then stage_studio_settings \|\| die /);
+  assert.ok(text.indexOf('then stage_studio_settings ||') < text.indexOf('tx_rc=0; tx_run'));
+  // an interrupted activation's .prev is caught, and no link is written through as root
+  assert.match(text, /"\$OFFICE_TOKEN" "\$STUDIO_SETTINGS"; do/);
+  assert.match(text, /for f in "\$STUDIO_STATE" "\$STUDIO_STATE\/claw3d" "\$STUDIO_SETTINGS"; do\n  if as_root_test -L "\$f"; then die /);
+  assert.match(text, /"\$STUDIO_STATE" "\$STUDIO_STATE\/claw3d"\n/);   // created 0700, the Studio user's (step 1)
 });
 
 test('deploy-air.sh office_healthy: a connect through Studio\'s proxy must reach the bridge (#77 upstream allowlist)', async t => {
@@ -869,6 +1113,107 @@ health_check() { local why; why="$(office_healthy)" || { echo "health check: $wh
       assert.deepEqual(await snapshot(D), NEW);
     }
   }
+});
+
+test('deploy-air.sh office_healthy against Studio\'s real settings logic: no settings file is gateway_token_missing, never a pass (#77 fix round 1)', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'office-e2e-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const L = await studioLauncher(t, root);
+  const claw3d = { env: L.env, bridgeToken: BRIDGE_TOKEN };
+  const fail = code => `rc=1 Studio's gateway proxy does not reach the bridge (connect refused: ${code})`;
+  // what the Air would have answered next once the allowlist was fixed: Claw3D falls back to the
+  // default URL with no token (it ignores CLAW3D_GATEWAY_TOKEN)
+  assert.equal(await officeHealthy(t, SUDO_ROOT, lsof(0, LOOPBACK), 'claw3d', claw3d), fail('studio.gateway_token_missing'));
+  // the settings file deploy-air.sh provisions: the bridge's hello
+  await mkdir(join(L.settingsPath, '..'), { recursive: true });
+  await writeFile(L.settingsPath, buildSettings(BRIDGE_TOKEN, L.gatewayUrl).stdout);
+  assert.equal(await officeHealthy(t, SUDO_ROOT, lsof(0, LOOPBACK), 'claw3d', claw3d), 'rc=0');
+  // the launcher before 70fdedb (no allowlist): blocked, as seen live on 2026-11-24
+  const noAllow = { ...L.env }; delete noAllow.UPSTREAM_ALLOWLIST;
+  assert.equal(await officeHealthy(t, SUDO_ROOT, lsof(0, LOOPBACK), 'claw3d', { ...claw3d, env: noAllow }), fail('studio.gateway_url_blocked'));
+  // a stale token (the bridge secret rotated, the settings not rewritten): the bridge refuses it
+  await writeFile(L.settingsPath, buildSettings('d'.repeat(64), L.gatewayUrl).stdout);
+  assert.equal(await officeHealthy(t, SUDO_ROOT, lsof(0, LOOPBACK), 'claw3d', claw3d), fail('UNAUTHORIZED'));
+  // the allowlist names a hostname, not a port: another localhost port passes it, and only the
+  // settings URL keeps Studio on the bridge (nothing answers there, so the check fails)
+  await writeFile(L.settingsPath, buildSettings(BRIDGE_TOKEN, 'ws://localhost:9').stdout);
+  assert.equal(await officeHealthy(t, SUDO_ROOT, lsof(0, LOOPBACK), 'claw3d', claw3d), fail('studio.upstream_error'));
+});
+
+test('activation: a deploy without Studio\'s settings file fails the probe and rolls back; the settings file is rolled back with the release (#77 fix round 1)', async t => {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  const m = text.match(/^http_code\(\) \{.*\n^office_healthy\(\) \{[\s\S]*?\n\}\n/m);
+  const good = buildSettings(BRIDGE_TOKEN, 'ws://localhost:18789').stdout;
+  const oldFile = JSON.stringify({ version: 1, avatars: { kept: true }, gateway: { url: 'ws://localhost:18789', token: BRIDGE_TOKEN, adapterType: 'openclaw' } });
+  const cases = [
+    // 70fdedb's deploy: no settings file staged or installed
+    { name: 'no settings file', staged: null, installed: null, rc: 'rc=1', code: 'studio.gateway_token_missing' },
+    { name: 'fresh settings', staged: good, installed: null, rc: 'rc=0' },
+    { name: 'upgrade, settings with a token the bridge refuses', staged: buildSettings('e'.repeat(64), 'ws://localhost:18789').stdout,
+      installed: oldFile, rc: 'rc=1', code: 'UNAUTHORIZED' },
+    { name: 'upgrade', staged: good, installed: oldFile, rc: 'rc=0' },
+  ];
+  for (const c of cases) {
+    const D = await txHost(t, { upgrade: true });
+    const L = await studioLauncher(t, D);
+    await mkdir(join(L.settingsPath, '..'), { recursive: true });
+    if (c.installed) await writeFile(L.settingsPath, c.installed);
+    if (c.staged) await writeFile(join(D, 'stage', 'studio-settings.json'), c.staged);
+    const studio = await fakeStudioProxy(t, 'claw3d', { env: L.env, bridgeToken: BRIDGE_TOKEN });
+    const bin = await fakeBins(t, {
+      sudo: SUDO_ROOT, lsof: lsof(0, LOOPBACK.replaceAll(':3000', `:${studio.port}`)),
+      launchctl: '#!/bin/bash\n[ "${FAKE_ROOT:-}" = 1 ] || exit 113\necho "\tstate = running"\n',
+      curl: '#!/bin/bash\nfor a; do u="$a"; done\ncase "$u" in */cortados-login) printf 200 ;; *:18789/) printf 426 ;; */) printf 401 ;; esac\n',
+    });
+    const tokenFile = join(bin, 'studio-access-token');
+    await writeFile(tokenFile, ACCESS + '\n'); await chmod(tokenFile, 0o600);
+    // deploy-air.sh's own TX_FILES entry for the settings file, when this deploy stages one
+    const prelude = `BRIDGE_LABEL=b STUDIO_LABEL=s BRIDGE_PORT=18789 STUDIO_PORT=${studio.port}
+NODE=${JSON.stringify(process.execPath)} HERE=${JSON.stringify(HERE.replace(/\/$/, ''))} ACCESS_TOKEN=${JSON.stringify(tokenFile)}
+${c.staged ? `TX_FILES+=(${JSON.stringify(`${D}/stage/studio-settings.json|${L.settingsPath}`)})` : ''}
+${m[0]}
+health_check() { local why; why="$(office_healthy)" || { echo "health check: $why" >&2; return 1; }; echo health >> "$D/log"; }`;
+    const r = await spawnAsync('/bin/bash', [TX_HARNESS],
+      { PATH: `${bin}:/usr/bin:/bin`, LIB, FAKE: D, FAIL: '', FAIL_ALWAYS: '', PRELUDE: prelude, UNKNOWN: '' });
+    assert.equal(r.stdout.trim(), c.rc, `${c.name}: ${r.stderr}`);
+    const settings = await readFile(L.settingsPath, 'utf8').catch(() => null);
+    if (c.rc === 'rc=1') {
+      assert.match(r.stderr, new RegExp(`health check: Studio's gateway proxy does not reach the bridge \\(connect refused: ${c.code.replaceAll('.', '\\.')}\\)`), c.name);
+      assert.match(r.stderr, /ROLLBACK/, c.name);
+      assert.deepEqual(await snapshot(D), OLD, c.name);
+      assert.equal(settings, c.installed, `${c.name}: the previous settings file is back (or none)`);
+    } else {
+      assert.deepEqual(await snapshot(D), NEW, c.name);
+      assert.equal(settings, c.staged, c.name);
+    }
+    const { readdir } = await import('node:fs/promises');
+    assert.deepEqual((await readdir(join(L.settingsPath, '..'))).filter(n => /\.(prev|next)$/.test(n)), [], `${c.name}: no leftovers`);
+  }
+});
+
+test('deploy-air.sh health_check: an overall deadline bounds it, whatever each check costs; a pass is confirmed 10 s later (#77 fix round 1)', async t => {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  assert.match(text, /^HEALTH_DEADLINE_S=60$/m);
+  const fn = text.match(/^health_check\(\) \{[\s\S]*?\n\}\n/m);
+  assert.ok(fn, 'health_check found');
+  const dir = await mkdtemp(join(tmpdir(), 'office-health-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const log = join(dir, 'log');
+  const run = body => spawnSync('bash', ['-c', `set -euo pipefail; APPLY=1 HEALTH_DEADLINE_S=2 LOG=${JSON.stringify(log)}\n${body}\n${fn[0]}
+rc=0; health_check || rc=$?; echo "rc=$rc"`], { env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' });
+  // a check that always fails slowly: given up at the deadline, not after a fixed number of tries
+  const t0 = Date.now();
+  let r = run('office_healthy() { echo try >> "$LOG"; sleep 1; echo "the probe timed out"; return 1; }');
+  const took = Date.now() - t0;
+  assert.equal(r.stdout.trim(), 'rc=1');
+  assert.match(r.stderr, /health check \(deadline 2 s\): the probe timed out/);
+  assert.ok(took < 7000, `took ${took} ms`);
+  assert.ok((await readFile(log, 'utf8')).trim().split('\n').length <= 2);
+  // a healthy release: checked, 10 s, checked again
+  await rm(log);
+  r = run('office_healthy() { echo check >> "$LOG"; }\nsleep() { echo "sleep $1" >> "$LOG"; }');
+  assert.equal(r.stdout.trim().split('\n').pop(), 'rc=0', r.stderr);
+  assert.deepEqual((await readFile(log, 'utf8')).trim().split('\n'), ['check', 'sleep 10', 'check']);
 });
 
 test('link_target: empty only on confirmed absence; a failed or impossible read is an error (r3 finding 2)', async t => {
