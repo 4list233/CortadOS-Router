@@ -51,6 +51,13 @@ ADAPTER_FILES=(adapter.mjs bridge.mjs sprites.mjs claw3d/avatar-profile-hint.pat
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
+# Every later step runs from /, once, here (not a `(cd / && ...)` per call): a command run as a role
+# user (sudo -u, e.g. as_studio's clone, switch_link, fs_rm, the prune) inherits the caller's cwd,
+# and the role users cannot read the owner's home. Run from ~/office-deploy-..., step 4's clone died
+# with "Unable to read current working directory: Permission denied" (the Air, 2026-11-23). One `cd`
+# also covers any role-user call added later. Every path below is absolute (HERE and REPO are
+# resolved above, TMP comes from mktemp -d); $0 is only echoed.
+cd /
 APPLY=0; MODE=install; ROTATE=0
 usage() { echo "usage: $0 [--apply] [--rotate-office-token] | --publish-tailnet [--apply] | --unpublish-tailnet [--apply]" >&2; exit 2; }
 for arg in "$@"; do
@@ -501,10 +508,11 @@ daemon_stop() {
 }
 http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$1" || true; }
 office_healthy() {  # prints why not, on failure
-  local l out
+  local l
   for l in "$BRIDGE_LABEL" "$STUDIO_LABEL"; do
-    # captured whole, then matched: piping into an early-exiting grep could SIGPIPE launchctl (pipefail: a false "down")
-    out="$(launchctl print "system/$l" 2>/dev/null)" && [[ "$out" == *"state = running"* ]] || { echo "$l is not running"; return 1; }
+    # read as root and captured whole, then matched (launchd_running, deploy-lib.sh): the owner cannot
+    # see the system domain, and piping into an early-exiting grep could SIGPIPE launchctl
+    launchd_running "$l" || { echo "$l is not running"; return 1; }
   done
   [[ "$(http_code "http://127.0.0.1:$BRIDGE_PORT/")" == 426 ]] || { echo "the bridge does not answer on 127.0.0.1:$BRIDGE_PORT"; return 1; }
   [[ "$(http_code "http://127.0.0.1:$STUDIO_PORT/")" == 401 ]] || { echo "Studio does not refuse a request without its access cookie"; return 1; }
