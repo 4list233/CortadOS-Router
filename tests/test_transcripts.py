@@ -277,6 +277,63 @@ class RedactionTests(Base):
                           "token_count": 3})
 
 
+    # -- transcript review round 2 (gpt-6.1-sol): each scenario failed on c88055b.
+    def test_credential_keys_inside_double_and_triple_encoded_json_are_scrubbed(self):
+        secret = "opaque_value_not_known_to_host"
+        obj = {"x-api-key": secret, "max_tokens": 5, "input_tokens": 7, "cache_creation_input_tokens": 9,
+               "token_count": 3, "password_policy": "strict"}
+        double, triple = json.dumps(json.dumps(obj)), json.dumps(json.dumps(json.dumps(obj)))
+        s = self.session()
+        self.turn(s, tool_results={"d": {"content": [{"type": "text", "text": double}]},
+                                   "t": {"content": triple},
+                                   "n": {"content": [], "structuredContent": {"body": double}}})
+        self.raw_has_no(s, secret)
+        _, t0 = self.lines(s)
+        by_id = {r["tool_use_id"]: r for r in t0["tool_results"]}
+        kept = {k: v for k, v in obj.items() if k != "x-api-key"}
+        want = dict(kept, **{"x-api-key": "[scrubbed:authorization]"})
+        self.assertEqual(json.loads(json.loads(by_id["d"]["content"][0]["text"])), want)
+        self.assertEqual(json.loads(json.loads(json.loads(by_id["t"]["content"]))), want)
+        self.assertEqual(json.loads(json.loads(by_id["n"]["structuredContent"]["body"])), want)
+        self.assertEqual(t0["redaction"]["withheld"], 0)
+        # The run export's path scrubs the same input.
+        red = transcripts.child_tasks.provider_redactor(())
+        out, withheld, _, _ = transcripts.child_tasks.redact_for_export(red, double)
+        self.assertNotIn(secret, out)
+        self.assertEqual((json.loads(json.loads(out)), withheld), (want, 0))
+
+    def test_json_encoded_past_the_layer_limit_is_withheld(self):
+        secret = "opaque_value_not_known_to_host"
+        deep = {"x-api-key": secret}
+        layers = getattr(transcripts.child_tasks, "KEYED_STRING_LAYERS", 4)   # getattr: the test also runs on c88055b
+        for _ in range(layers + 2):                     # layers + 1 string literals around the object: one too many
+            deep = json.dumps(deep)
+        s = self.session()
+        self.turn(s, tool_results={"c": {"content": [{"type": "text", "text": deep}]}})
+        self.raw_has_no(s, secret)
+        _, t0 = self.lines(s)
+        self.assertEqual(t0["tool_results"][0]["content"][0]["text"], WITHHELD)
+        self.assertEqual(t0["redaction"]["withheld"], 1)
+        # A quoted plain string is not JSON in disguise: kept as it is.
+        s2 = self.session(sid="quoted-ok-" + "0" * 22)
+        quoted = json.dumps(json.dumps(json.dumps("just text")))
+        self.turn(s2, tool_results={"c": {"content": [{"type": "text", "text": quoted}]}})
+        _, t1 = self.lines(s2)
+        self.assertEqual(t1["tool_results"][0]["content"][0]["text"], quoted)
+        self.assertEqual(t1["redaction"]["withheld"], 0)
+
+    def test_escape_scanning_is_linear_in_long_backslash_runs(self):
+        import time
+        red = transcripts.child_tasks.provider_redactor((TOKEN,))
+        for text in ("\\" * (1 << 20), "\\" * (1 << 20) + "u12", "a\\" * (1 << 19)):
+            t = time.monotonic()
+            self.assertFalse(red.encoded_hit(text))
+            # Generous: about 0.02 s here; on c88055b 128k backslashes took 7 s and 1 MB would take minutes.
+            self.assertLess(time.monotonic() - t, 1.0)
+        # Escaped spellings are still found.
+        self.assertTrue(red.encoded_hit("x " + "".join("\\\\u%04x" % ord(c) for c in TOKEN)))
+        self.assertTrue(red.encoded_hit("".join("\\x%02x" % ord(c) for c in TOKEN)))
+
 class GuardTests(Base):
     def test_past_the_file_cap_one_stopped_line_then_nothing_and_every_turn_is_counted(self):
         os.environ["CORTADOS_TRANSCRIPT_FILE_MAX_MB"] = str(3000 / (1024 * 1024))    # ~3000 bytes

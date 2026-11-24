@@ -31,8 +31,12 @@ ESCAPE_DEPTH = 8
 # Why 16: a base64 fragment shorter than this could turn up by chance in ordinary text and withhold it; a provider
 # token's fragment is far longer (a 32-character token leaves 40 stable characters at any alignment).
 BASE64_MIN_FRAGMENT = 16
-_UNI_ESC = re.compile(r"\\+u([0-9a-fA-F]{4})")
-_HEX_ESC = re.compile(r"\\+x([0-9a-fA-F]{2})")
+# The lookbehind lets a match start only at the first backslash of a run, so each run is scanned once: unanchored,
+# `\\+u` retried at every backslash of a long run that is not followed by `u`, quadratic in the run's length (128k
+# backslashes took 7 s; transcript review round 2). The leftmost match starts at the run's first backslash anyway, so
+# what is matched is unchanged.
+_UNI_ESC = re.compile(r"(?<!\\)\\+u([0-9a-fA-F]{4})")
+_HEX_ESC = re.compile(r"(?<!\\)\\+x([0-9a-fA-F]{2})")
 _ANY_ESC = re.compile(r"\\+(.)", re.S)
 
 

@@ -212,8 +212,9 @@ class Writer(cstore.Store):
 
         # Then the export's shape scrub and text cap ONCE over each whole record, so a credential-named key (an
         # `x-api-key` inside a tool's structuredContent) is seen with its value at every depth.
-        header, h_scrubbed, h_truncated = child_tasks.cap_for_export(clean(job["header"]), TEXT_LIMIT)
-        turn, scrubbed, truncated = child_tasks.cap_for_export(clean(job["turn"]), TEXT_LIMIT)
+        header, h_scrubbed, h_truncated, h_withheld = child_tasks.cap_for_export(clean(job["header"]), TEXT_LIMIT)
+        turn, scrubbed, truncated, t_withheld = child_tasks.cap_for_export(clean(job["turn"]), TEXT_LIMIT)
+        withheld += h_withheld + t_withheld
         for k, c in h_scrubbed.items():
             scrubbed[k] = scrubbed.get(k, 0) + c
         truncated += h_truncated

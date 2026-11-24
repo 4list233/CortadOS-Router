@@ -1074,8 +1074,8 @@ the client's new content and tool results, and the reply as delivered (text and 
   text still holding a known credential in an encoded spelling (`\uXXXX` or other escapes, percent-encoding, base64)
   is withheld; then, once over the whole header and the whole turn so every key keeps its context, well-known secret
   shapes are scrubbed and every value under a credential-named key (Authorization, `x-api-key`, `api_key`, `*token`,
-  `*secret`, `password`, `cookie`, `credentials`, ... at any depth, JSON text inside a string included) is scrubbed
-  whole). Each turn records what was withheld, scrubbed or cut (`redaction`).
+  `*secret`, `password`, `cookie`, `credentials`, ... at any depth, JSON text inside a string included, also when
+  encoded again as a JSON string literal up to four layers; deeper is withheld) is scrubbed whole). Each turn records what was withheld, scrubbed or cut (`redaction`).
   Inline images and files are replaced by their size; each text is capped at 200,000 characters (marked).
 - It never fails or slows a request: the turn is serialized and queued for a background writer (the compaction store's
   bounded queue). A lost write (a full queue, an I/O error, a guard below) is logged and counted in the route-log error

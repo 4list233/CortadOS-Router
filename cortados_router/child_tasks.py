@@ -2663,6 +2663,10 @@ EXPORT_SCHEMA = "cortados.task-run/1"
 EXPORT_ENV = "CORTADOS_TASK_EXPORT"         # a file path; unset: paths.state_dir()/EXPORT_FILE
 EXPORT_FILE = os.path.join("exports", "task-runs.jsonl")
 PARENT_ENV = "CORTADOS_PARENT_TASK_ID"      # set by a launching session that is itself a task (start_task arg wins)
+# JSON string-literal layers the credential-key scrub unwinds (json.dumps of json.dumps of an object is one): real
+# tool output nests JSON text in a string once or twice; four leaves room, and a deeper chain is withheld rather than
+# passed through unscrubbed (transcript review round 2).
+KEYED_STRING_LAYERS = 4
 EXPORT_TEXT_CHARS = 32_000                  # per text field (prompt, a tool input string, a tool result, the result)
 EXPORT_MAX_EVENTS = 2_000                   # per record; later events are counted in events_dropped, not written
 EXPORT_LOCK_WAIT_S = 30                     # an export lock held longer than this is a stuck writer: fail, retry later
@@ -2791,6 +2795,7 @@ class _Cap:
         self.limit = EXPORT_TEXT_CHARS if limit is None else limit
         self.truncated = 0
         self.scrubbed = {}
+        self.withheld = 0                       # values _keyed_json could not walk safely, replaced by WITHHELD
 
     def _mark(self, kind: str) -> str:
         self.scrubbed[kind] = self.scrubbed.get(kind, 0) + 1
@@ -2861,17 +2866,39 @@ class _Cap:
             return v if all(out[k] is x for k, x in v.items()) else out
         return v
 
-    def _keyed_json(self, s: str) -> str:
-        """JSON object or array text with credential-keyed values scrubbed (re-encoded only when one was); other
-        text, or JSON that does not decode or is too deep to walk, unchanged (the shape scrub still runs on it)."""
-        if s.lstrip()[:1] not in ("{", "["):
+    def _withhold(self) -> str:
+        """redact.WITHHELD itself (callers test identity), counted."""
+        self.withheld += 1
+        return redact.WITHHELD
+
+    def _keyed_json(self, s: str, layers: int = 0) -> str:
+        """JSON object or array text with credential-keyed values scrubbed (re-encoded only when one was). A JSON
+        string literal (JSON text encoded again, e.g. json.dumps(json.dumps(obj))) is decoded and treated the same way,
+        up to KEYED_STRING_LAYERS layers, and re-encoded when its content changed; past that, a literal still holding
+        JSON-looking text is WITHHELD (fail closed), as is JSON too deep to decode or walk. Other text, or text that does
+        not decode, is unchanged (the shape scrub still runs on it)."""
+        if s.lstrip()[:1] not in ("{", "[", '"'):
             return s
         try:
             obj = json.loads(s)
+        except ValueError:
+            return s
+        except RecursionError:
+            return self._withhold()
+        try:
+            if isinstance(obj, str):
+                if layers >= KEYED_STRING_LAYERS:
+                    return self._withhold() if obj.lstrip()[:1] in ("{", "[", '"') else s
+                inner = self._keyed_json(obj, layers + 1)
+                if inner is redact.WITHHELD:
+                    return inner                # the whole chain is withheld, not a quoted marker inside it
+                return s if inner is obj else json.dumps(inner)
+            if not isinstance(obj, (dict, list)):
+                return s
             walked = self._keyed_walk(obj)
             return s if walked is obj else json.dumps(walked)
-        except (ValueError, RecursionError):
-            return s
+        except RecursionError:
+            return self._withhold()
 
     def scrub_tree(self, v, key=None, kind=None):
         kind = kind or _credential_key_kind(key)
@@ -3131,7 +3158,8 @@ def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_r
             **({"withheld_fields": withheld_fields} if withheld_fields else {}),
             "prompt": prompt, "events": events, "event_counts": counts,
             **({"events_dropped": dropped} if dropped else {}),
-            "redact_unparsed_lines": unparsed, "withheld": unparsed + extra, "truncated": cap.truncated,
+            "redact_unparsed_lines": unparsed, "withheld": unparsed + extra + cap.withheld,
+            "truncated": cap.truncated,
             "scrubbed": dict(sorted(cap.scrubbed.items()))}
 
 
@@ -3330,8 +3358,8 @@ def redact_for_export(red: "Redactor", value, limit=None, *, prose: bool = False
     it decodes, else as TEXT (every credential at every ESCAPE_DEPTH escaping), as redact_record treats the result
     prose, instead of being withheld whole."""
     cleaned, withheld = redact_known(red, value, prose=prose)
-    out, scrubbed, truncated = cap_for_export(cleaned, limit)
-    return out, withheld, scrubbed, truncated
+    out, scrubbed, truncated, cap_withheld = cap_for_export(cleaned, limit)
+    return out, withheld + cap_withheld, scrubbed, truncated
 
 
 def redact_known(red: "Redactor", value, *, prose: bool = False):
@@ -3347,9 +3375,11 @@ def redact_known(red: "Redactor", value, *, prose: bool = False):
 
 
 def cap_for_export(value, limit=None):
-    """Public: redact_for_export's second half, for already-redacted values: (value, scrubbed counts, truncated)."""
+    """Public: redact_for_export's second half, for already-redacted values: (value, scrubbed counts, truncated,
+    withheld). withheld counts JSON text the credential-key scrub could not walk safely (too many string-literal
+    layers, too deep), replaced by WITHHELD."""
     cap = _Cap(limit)
-    return cap.tree(value), dict(cap.scrubbed), cap.truncated
+    return cap.tree(value), dict(cap.scrubbed), cap.truncated, cap.withheld
 
 
 def _runner_router_run(meta: dict, task_id: str) -> dict:
