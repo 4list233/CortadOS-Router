@@ -46,13 +46,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_CLIENTS_FILE = "~/.config/cortados/clients.json"
 CLIENTS_ENV = "CORTADOS_PROVIDER_CLIENTS"
 OFFICE_PATH = "/v1/cortados/office"
+OFFICE_TREE_PATH = "/v1/cortados/office/tree"         # provider/live.py OFFICE_TREE_PATH (a test keeps the two equal)
 LIVE_PATH = "/v1/cortados/live"                       # provider/live.py LIVE_PATH (a test keeps the two equal)
 LIVE_HEARTBEAT_PATH = "/v1/cortados/live/heartbeat"   # provider/live.py HEARTBEAT_PATH
 LIVE_SESSION_PATH = "/v1/cortados/live/session"       # provider/live.py SESSION_PATH
 # Scope -> the (method, path) pairs it opens. Exact paths only (no prefixes): a prefix would open whatever is added
 # under it later. A new reader gets a new scope here, reviewed, never a wildcard.
 SCOPES: dict[str, frozenset[tuple[str, str]]] = {
-    "office:read": frozenset({("GET", OFFICE_PATH)}),
+    # the Office view and its rooms (the orchestrator tree as Office metadata, live.office_tree; #77 E3): the Claw3D
+    # bridge's one token never gains live:read's subscriptions, hosts and routing rows
+    "office:read": frozenset({("GET", OFFICE_PATH), ("GET", OFFICE_TREE_PATH)}),
     # the live snapshot (dashboard, pulse pane): read-only metadata, like the office view
     "live:read": frozenset({("GET", LIVE_PATH), ("GET", LIVE_SESSION_PATH)}),
     # one session's own tree only (the pulse pane): the endpoint always needs ?session=<tag> and lists no other session,

@@ -532,6 +532,8 @@ def endpoint_id(path: str | None) -> str:
         return "runs"
     if p == clients.OFFICE_PATH:
         return "office"
+    if p == clients.OFFICE_TREE_PATH:
+        return "office_tree"
     if p == OFFICE_HEARTBEAT_PATH:
         return "office_heartbeat"
     if p == live.LIVE_PATH:
@@ -1716,6 +1718,13 @@ class Registry:
             "opened_at": getattr(s, "opened_at", None), "last_used": getattr(s, "last_used", None),
             "busy": bool(lock is not None and hasattr(lock, "locked") and lock.locked()),
             "awaiting_tool": bool(getattr(s, "awaiting_tool_result", False)),
+            # the wire the conversation was opened on (/v1/messages = Claude Code, /v1/responses = Codex): the Office
+            # tree's orchestrator family for a routed main loop (live.WIRE_CLIENT, #77 E7). The path is one of WIRES'
+            # fixed keys, never client text.
+            "wire": getattr(s, "wire_path", None) if getattr(s, "wire_path", None) in WIRES else None,
+            # a local route's node backend as its gate last reported it (the Office's llama-or-chip, #77)
+            "local_backend": (local_lane.node_backend(rp[len(local_lane.LANE_PREFIX):])
+                              if rp.startswith(local_lane.LANE_PREFIX) else None),
             "tokens": dict(tok) if isinstance(tok, dict) else None}
 
     def drop(self, s, reason: str = "dropped") -> None:
@@ -2442,6 +2451,21 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 logger.warning("office: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: office view unavailable (see provider log)")
+            return self._json(200, body, headers=VIEW_HEADERS)
+        if self.path.split("?")[0] == clients.OFFICE_TREE_PATH:
+            # The Office's rooms (#77): the orchestrator tree, allowlisted to Office metadata (live.office_tree: no
+            # tokens, no request text, no other live section). The owner token, office:read or a dashboard session;
+            # never live:read's whole snapshot for the bridge (#77 E3). No query: the tree is the fleet's, as the
+            # office view is, and a filter here would be a second session view to keep private.
+            if not self._owner_or_session("GET"):
+                return self._refuse_auth()
+            if "?" in self.path:
+                return self._error(400, "invalid_request_error", "cortados: the office tree takes no query")
+            try:
+                body = self.server.office_tree_body(self.server.registry)
+            except Exception as exc:
+                logger.warning("office: tree failed: %s", type(exc).__name__)
+                return self._error(500, "api_error", "cortados: office tree unavailable (see provider log)")
             return self._json(200, body, headers=VIEW_HEADERS)
         if self.path.split("?")[0] == live.LIVE_PATH:
             # Owner token, a scoped token with live:read, or a dashboard session. Metadata only (provider/live.py).
@@ -4292,6 +4316,15 @@ class ProviderServer(ThreadingHTTPServer):
                 live.session_view(self.live_view(registry, session, session_view=True, machine=machine), session),
                 allow_nan=False).encode())
         return self._live_memo.get(key, lambda: json.dumps(self.live_view(registry, session), allow_nan=False).encode())
+
+    def office_tree_body(self, registry: Registry) -> bytes:
+        """GET /v1/cortados/office/tree: the fleet's orchestrator tree as the Office may see it (live.office_tree), from
+        the same collect as the live view and memoised with it (live.Memo, MEMO_S): the bridge's 5 s poll adds at most
+        one collect per 2 s, shared with the dashboard."""
+        from cortados_router import paths
+        key = (str(paths.state_dir()), id(registry), registry.live.generation, "office-tree")
+        return self._live_memo.get(key, lambda: json.dumps(live.office_tree(self.live_view(registry)),
+                                                           allow_nan=False).encode())
 
     def live_view(self, registry: Registry, session: str | None = None, session_view: bool = False,
                   machine: str | None = None) -> dict[str, Any]:

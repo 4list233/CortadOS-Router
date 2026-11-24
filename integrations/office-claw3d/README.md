@@ -7,7 +7,7 @@ protocol, how it renders people and floors, and the remaining gaps.
 
 | File | What |
 |---|---|
-| `adapter.mjs` | office view → Claw3D gateway frames; sprite choice per person; polling |
+| `adapter.mjs` | the provider's orchestrator tree (`GET /v1/cortados/office/tree`) → Claw3D gateway frames, one room per orchestrator (`mapTree`); sprite choice per person; polling |
 | `bridge.mjs` | the WebSocket gateway Claw3D Studio's proxy connects to (loopback, auth, Origin, read-only) |
 | `sprites.mjs` | original pixel art as text grids, PNG encoder, Claw3D 3D avatar profiles |
 | `build-assets.mjs` | regenerates `assets/` and `assets/preview.png` from the fixture (`--write` / `--check`) |
@@ -16,6 +16,7 @@ protocol, how it renders people and floors, and the remaining gaps.
 | `claw3d/studio-login.cjs`, `claw3d/studio-login.patch` | login form for Studio's access cookie (`/cortados-login`) and its 3-line wiring |
 | `gateway-check.mjs` | deploy-air.sh's end-to-end health probe: a `connect` through Studio's own proxy must get the bridge's hello |
 | `studio-settings.py` | builds Studio's gateway settings file (`<state dir>/claw3d/settings.json`: the bridge URL and secret), the only upstream config Claw3D's proxy reads |
+| `claw3d/cortados-rooms.patch`, `claw3d/cortadosRooms.ts` | rooms per orchestrator: the floor's 8 rooms x 6 desks and the desk allocation (the patch adds the `.ts` file and a 22-line hook; [FLOORS-DESIGN.md](FLOORS-DESIGN.md) §8) |
 | `DEPLOY.md`, `deploy-air.sh`, `deploy-lib.sh` | Air runbook, script (install / upgrade / tailnet publish) and its pure checks, written and **not run** |
 
 ## Test
@@ -23,8 +24,23 @@ protocol, how it renders people and floors, and the remaining gaps.
 ```sh
 node --test integrations/office-claw3d/                # Node 26 resolves the folder
 node --test integrations/office-claw3d/*.test.mjs      # portable form (Node 22/24)
+# rooms.test.mjs runs the Claw3D allocator (claw3d/cortadosRooms.ts) under Node's type stripping
+# (module.stripTypeScriptTypes, Node >= 22.13); on older Node those tests are skipped and say why.
 node integrations/office-claw3d/build-assets.mjs --check
 ```
+
+## Rooms (issue #77)
+
+One room per orchestrating session on the one CortadOS floor ([FLOORS-DESIGN.md](FLOORS-DESIGN.md), decisions of
+2026-11-24 in §7). The bridge polls `GET /v1/cortados/office/tree` (the provider's orchestrator tree, office:read,
+metadata only) and draws, per room: the orchestrator in a suit at the head desk; its running, waiting or unknown child
+tasks at the team desks, each followed by its live helpers (routed sub-sessions) and its nested tasks; the
+orchestrator's own routed helpers. A finished task leaves its desk and sits at a report desk beside the orchestrator for
+10 minutes with the subtitle `done · <model>`, `failed · <model>` or `cancelled · <model>` (the last two in error
+status), then leaves; a finished helper just leaves. The Grok Bot has a room; the unattributed room comes last and only
+while someone in it is active. 8 rooms x 6 team desks; past that, people walk the floor unseated (Claw3D's behaviour
+for anyone without a desk). Rooms and seats are sticky while their people stay. With any other gateway connected,
+Studio is unchanged.
 
 ## Appearance (issue #77)
 
@@ -42,11 +58,14 @@ Each person gets a sprite, as metadata only. The published `provider`/`lane` nev
   guess apply: the llama for an Ollama-shaped tag (`name:tag`, e.g. `qwen3:27b`) that does not
   name mlx, else `local`. Each agent's `office.localBackend` holds the published value (known
   values only, else null).
-- **Orchestrator**: wears a suit, styled by its **model** (office v1 reports no provider or
-  lane for it): `claude-*`/opus/sonnet/haiku/fable → claude, `gpt-*`/`codex*`/`o<N>` → codex,
-  `grok*` → grok, an Ollama tag → ollama, qwen/llama/gemma/mistral/mlx… → local,
-  anything else → unknown. A routed local main loop's `local_backend` makes the local/llama
-  choice exact, as for workers. Its published provider stays `null`.
+- **Orchestrator**: wears a suit, styled by its **harness**, first source that applies (E7):
+  the bot origin (`grokbot` → grok); the provider's `client` for the session (the routed main
+  loop's wire: `/v1/messages` → Claude Code → claude, `/v1/responses` → Codex → codex; else the
+  session heartbeat's optional `client`; `antigravity` → the neutral unknown suit until it has a
+  lane); otherwise a guess from its **model**: `claude-*`/opus/sonnet/haiku/fable → claude,
+  `gpt-*`/`codex*`/`o<N>` → codex, `grok*` → grok, an Ollama tag → ollama,
+  qwen/llama/gemma/mistral/mlx… → local, anything else → unknown. `office.familySource` says which
+  (`bot | wire | heartbeat | model-guess`). Its published provider stays `null`.
 
 Each agent in `agents.list` carries `identity.avatarUrl` (the sprite as a 128 px PNG data
 URL, which Claw3D's 2D panels show unmodified) and `identity.avatarProfile` (a Claw3D voxel
@@ -74,9 +93,10 @@ node integrations/office-claw3d/adapter.mjs --stdio
 
 This command is illustrative, **not run during development**. Poll interval 1–3600
 seconds (default 5); ten-second request timeout, sequential polls, SIGINT/SIGTERM
-cancellation. Remote providers require HTTPS, redirects are refused. Only GET of
-the exact office endpoint is possible. Failures emit fixed diagnostics, retaining
-the last successful snapshot, which may be stale. No prompts, commands, file
+cancellation. Remote providers require HTTPS, redirects are refused. `CORTADOS_OFFICE_URL`
+names the office endpoint; the only request is a GET of the tree beside it
+(`/v1/cortados/office/tree`). Failures emit the fixed diagnostic `Office tree unavailable;
+last successful roster retained (may be stale)`; there is no fallback to the flat office view. No prompts, commands, file
 contents, source response bodies, token paths or exception text are logged.
 Metadata stdout still deserves local-only access and should not be publicly logged.
 
@@ -108,11 +128,12 @@ refused with `READ_ONLY`, and the hello advertises read methods only.
 OfficeGateway(send) stays the transport seam: one gateway per authenticated
 connection, and poll updates fan out through `OfficeHub`.
 
-Stable IDs namespace orchestrators separately from workers, and named workers
-separately from anonymous fingerprints. Duplicate identities reject the snapshot.
-Nested records require a recognized status and typed projection metadata (nullable
-strings, not arrays/objects); workers require run_id (nullable only in the lobby).
-Malformed snapshots leave the previous roster and lifecycle state untouched.
+Stable IDs carry the room (`office-<session tag | grokbot | unattributed>-orchestrator`,
+`-task-<task id>`, `-sub-<task id>-<ref>`, `-routed-<ref>`). Duplicate identities reject the
+tree. Nested records require a recognized status, a valid id and typed metadata (nullable
+strings, not arrays/objects). A malformed tree leaves the previous roster and lifecycle state
+untouched. (`mapOffice`, the flat view's projection, is still exported and tested; the bridge
+no longer draws from it.)
 The exported polling API reports fixed, credential-safe diagnostics to stderr by
 default; callers may supply an onError function. Operational limits and their
 local-policy rationale are documented beside their constants in adapter.mjs.

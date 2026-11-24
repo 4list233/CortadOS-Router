@@ -3,13 +3,27 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mapOffice, characterFamily, knownBackend, modelFamily, READ_METHODS, OfficeGateway, pollOffice, runPolling } from './adapter.mjs';
+import { mapOffice, characterFamily, knownBackend, modelFamily, READ_METHODS, OfficeGateway, pollOffice, pollTree,
+  runPolling } from './adapter.mjs';
 
 const worker = { run_id: 'run-12345678', provider: 'codex', lane: 'codex', model: 'gpt',
   title: 'Review', status: 'working', tool: 'Read' };
 const view = () => ({ version: 1, floors: [{ session: '0123456789abcdef',
   project: 'Router', device: 'pro', orchestrator: { model: 'claude', status: 'idle', tool: null },
   workers: [{ ...worker }] }], lobby: { workers: [] } });
+
+// The same office in the shape the gateway now reads (GET /v1/cortados/office/tree, live.office_tree).
+const NOW = 1_800_000_000;
+const task = { task_id: 't20261124100000-a0000001', title: 'Review', state: 'running', status: 'running', phase: null,
+  tool: 'Read', host: 'air', provider: 'codex', lane: 'codex', local_backend: null, model: 'gpt',
+  started_at: NOW - 60, ended_at: null, elapsed_s: 60, parent_task_id: null, origin_via: null, sub_sessions_hidden: 0,
+  sub_sessions: [], tasks: [] };
+const tree = () => ({ version: 1, generated_at: NOW, orchestrators: { as_of: NOW, status: 'ok', errors: [],
+  window_s: 86400, truncated: false, items: [{ origin: '0123456789abcdef', kind: 'session', project: 'Router',
+    device: 'pro', status: 'idle', model: 'claude', tool: null, client: null, client_source: null,
+    last_activity: NOW, counts: {}, attention: 0, tasks_hidden: 0, routed_hidden: 0,
+    tasks: [structuredClone(task)], routed: [] }] } });
+const emptyTree = () => ({ ...tree(), orchestrators: { ...tree().orchestrators, items: [] } });
 
 for (const family of ['claude', 'codex', 'grok', 'ollama']) {
   test('character family ' + family, () => assert.equal(characterFamily(family), family));
@@ -70,7 +84,7 @@ function connected() {
 test('handshake, lists, sessions, status and mutation rejection', () => {
   const { gateway, frames } = connected();
   assert.equal(frames[0].payload.protocol, 3);
-  gateway.update(view());
+  gateway.update(tree());
   for (const method of ['agents.list', 'sessions.list', 'status']) {
     gateway.request({ type: 'req', id: method, method });
     assert.equal(frames.at(-1).ok, true);
@@ -93,7 +107,7 @@ test('hello advertises read methods only; mutations stay READ_ONLY', () => {
 });
 test('neutral reads Studio needs are fixed and carry no data', () => {
   const { gateway, frames } = connected();
-  gateway.update(view());
+  gateway.update(tree());
   const ask = (method, params = {}) => { gateway.request({ type: 'req', id: method, method, params }); return frames.at(-1); };
   // reload mode "off": Studio's ensureGatewayReloadModeHotForLocalStudio then never writes config
   assert.equal(ask('config.get').payload.config.gateway.reload.mode, 'off');
@@ -192,19 +206,20 @@ test('appearance output is metadata only and the same for the same input', () =>
 });
 test('working lifecycle does not duplicate start, ends on removal', () => {
   const { gateway, frames } = connected();
-  gateway.update(view());
-  gateway.update(view());
+  gateway.update(tree());
+  gateway.update(tree());
   const lifecycle = () => frames.filter(f => f.event === 'agent' && f.payload.stream === 'lifecycle');
   assert.equal(lifecycle().length, 1);
   assert.equal(lifecycle()[0].payload.data.phase, 'start');
-  gateway.update({ version: 1, floors: [], lobby: { workers: [] } });
+  gateway.update(emptyTree());
   assert.equal(lifecycle().at(-1).payload.data.phase, 'end');
   assert.deepEqual(frames.at(-1).payload.agents, []);
 });
 test('error terminal event and invalid snapshot retains good state', () => {
   const { gateway, frames } = connected();
-  gateway.update(view());
-  const input = view(); input.floors[0].workers[0].status = 'error';
+  gateway.update(tree());
+  const input = tree();
+  Object.assign(input.orchestrators.items[0].tasks[0], { state: 'failed', status: 'failed', ended_at: NOW - 5 });
   gateway.update(input);
   assert.ok(frames.some(f => f.event === 'agent' && f.payload.data.phase === 'error'));
   assert.throws(() => gateway.update({}));
@@ -236,12 +251,24 @@ test('poll uses file credential, exact GET, no redirects; rereads rotation', asy
     await assert.rejects(pollOffice({ ...options, url: 'http://example.com/v1/cortados/office' }));
     await assert.rejects(pollOffice({ ...options, url: 'https://example.com/v1/messages' }));
     await assert.rejects(pollOffice({ ...options, fetchImpl: async () => ({ ok: false }) }), /office request failed/);
+    // the tree: the exact path beside the configured office URL, same token, same rules
+    let asked = null;
+    await pollTree({ ...options, fetchImpl: async (url, init) => {
+      asked = url.href; assert.equal(init.redirect, 'error');
+      return { ok: true, json: async () => tree() };
+    } });
+    assert.equal(asked, 'http://127.0.0.1:8432/v1/cortados/office/tree');
+    for (const url of ['http://127.0.0.1:8432/v1/cortados/office/tree', 'http://127.0.0.1:8432/v1/cortados/office?x=1',
+      'http://example.com/v1/cortados/office', 'http://127.0.0.1:8432/v1/cortados/live']) {
+      await assert.rejects(pollTree({ ...options, url }), /office URL/, url);
+    }
+    await assert.rejects(pollOffice({ ...options, path: '/v1/cortados/live' }), /office URL/);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
-test('orchestrator-named worker has independent roster, session and lifecycle IDs', () => {
-  const input = view();
-  input.floors[0].orchestrator.status = 'working';
-  input.floors[0].workers[0].run_id = 'orchestrator';
+test('a task named like the orchestrator has independent roster, session and lifecycle IDs', () => {
+  const input = tree();
+  input.orchestrators.items[0].status = 'working';
+  input.orchestrators.items[0].tasks[0].task_id = 'orchestrator';
   const { gateway, frames } = connected();
   gateway.update(input);
   assert.equal(new Set(gateway.agents.map(a => a.id)).size, 2);
@@ -253,31 +280,27 @@ test('orchestrator-named worker has independent roster, session and lifecycle ID
 });
 
 test('nested malformed records retain all previous state and emit nothing', () => {
-  const badRecords = [[], {}, null, false, { ...worker, status: 'unknown' },
-    { ...worker, status: null }, { ...worker, provider: [] }, { ...worker, model: {} },
-    { ...worker, run_id: '' }, { ...worker, run_id: 123 }, { ...worker, started_at: 'yesterday' }];
-  for (const field of Object.keys(worker)) {
-    const missing = { ...worker }; delete missing[field]; badRecords.push(missing);
-  }
-  const main = view().floors[0].orchestrator;
-  const badMains = [[], {}, false, { ...main, status: 'unknown' },
-    { ...main, model: {} }, { ...main, tool: [] }, { ...main, last_seen: 'yesterday' }];
-  for (const field of ['status', 'model', 'tool']) {
-    const missing = { ...main }; delete missing[field]; badMains.push(missing);
-  }
-  for (const target of ['worker', 'orchestrator', 'lobby']) {
-    for (const bad of target === 'orchestrator' ? badMains : badRecords) {
+  const badTasks = [[], {}, null, false, { ...task, status: 'unknown-state' }, { ...task, status: null },
+    { ...task, provider: [] }, { ...task, model: {} }, { ...task, task_id: '' }, { ...task, task_id: 'short' },
+    { ...task, task_id: 123 }, { ...task, ended_at: 'yesterday' }, { ...task, sub_sessions: null },
+    { ...task, tasks: {} }, { ...task, sub_sessions: [{ ref: 'c-0000000000aa', status: 'running', model: [] }] },
+    { ...task, sub_sessions: [{ ref: '../x', status: 'running' }] }];
+  const group = tree().orchestrators.items[0];
+  const badGroups = [[], false, { ...group, kind: 'session', origin: 'lobby' }, { ...group, kind: 'bot', origin: 'x' },
+    { ...group, kind: 'unattributed', origin: '0123456789abcdef' }, { ...group, model: {} }, { ...group, tasks: null },
+    { ...group, routed: [{ ref: 'r', status: 'running' }] }, { ...group, client: 7 }];
+  for (const target of ['task', 'group']) {
+    for (const bad of target === 'group' ? badGroups : badTasks) {
       const { gateway, frames } = connected();
-      gateway.update(view());
+      gateway.update(tree());
       const previous = gateway.agents;
       const runs = [...gateway.runs];
       const generation = gateway.generation;
       const count = frames.length;
-      const input = view();
-      if (target === 'worker') input.floors[0].workers = [bad];
-      else if (target === 'orchestrator') input.floors[0].orchestrator = bad;
-      else input.lobby.workers = [bad];
-      assert.throws(() => gateway.update(input), /invalid office/);
+      const input = tree();
+      if (target === 'task') input.orchestrators.items[0].tasks = [bad];
+      else input.orchestrators.items = [bad];
+      assert.throws(() => gateway.update(input), /invalid office tree|duplicate/, JSON.stringify(bad));
       assert.equal(gateway.agents, previous);
       assert.deepEqual([...gateway.runs], runs);
       assert.equal(gateway.generation, generation);
@@ -356,30 +379,31 @@ test('default reporter exposes failed polls safely and loop recovers', async t =
     const tokenFile = join(dir, 'token');
     await writeFile(tokenFile, 'test-token-1234567890');
     const gateway = new OfficeGateway(() => {});
-    gateway.update(view());
+    gateway.update(tree());
     const previous = gateway.agents;
     let calls = 0;
     await runPolling({ gateway, intervalMs: 1000, signal: controller.signal,
       url: 'http://localhost/v1/cortados/office', tokenFile,
-      fetchImpl: async () => {
+      fetchImpl: async url => {
         calls++;
+        assert.equal(url.pathname, '/v1/cortados/office/tree');   // the rooms, never the flat view as a fallback
         assert.equal(gateway.agents, previous);
-        if (calls === 1) return { ok: false }; // authentication/HTTP failure
+        if (calls === 1) return { ok: false }; // authentication/HTTP failure (an older provider: 404)
         if (calls === 2) throw new Error('SECRET token path URL'); // network failure
         if (calls === 3) return { ok: true, json: async () => {
-          const bad = view(); bad.floors[0].workers = [{}]; return bad;
+          const bad = tree(); bad.orchestrators.items[0].tasks = [{}]; return bad;
         } };
         controller.abort();
-        const recovered = view(); recovered.floors[0].workers[0].status = 'done';
+        const recovered = tree(); recovered.orchestrators.items[0].tasks[0].status = 'waiting';
         return { ok: true, json: async () => recovered };
       } });
     assert.equal(calls, 4);
     assert.equal(diagnostics.length, 3);
     for (const message of diagnostics) {
-      assert.equal(message, 'Office poll failed; last successful snapshot retained (may be stale)\n');
+      assert.equal(message, 'Office tree unavailable; last successful roster retained (may be stale)\n');
       assert.ok(!message.includes('SECRET'));
     }
-    assert.equal(gateway.agents[1].office.status, 'done');
+    assert.equal(gateway.agents[1].office.status, 'idle');
     assert.notEqual(gateway.agents, previous);
   } finally { controller.abort(); await rm(dir, { recursive: true, force: true }); }
 });

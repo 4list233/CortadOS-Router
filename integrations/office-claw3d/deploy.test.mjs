@@ -1703,3 +1703,17 @@ test('clients_cli: the clients module is $REPO\'s, whatever the working director
   assert.ok(!existsSync(join(W, 'decoy.log')), 'a decoy clients module was imported');
   assert.equal(fakeLog(W), 'list a\n');
 });
+
+test('deploy-air.sh: every Claw3D patch is shipped, required and applied with its --check refusal (#77 rooms)', async () => {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  const shipped = text.match(/^ADAPTER_FILES=\(([^)]*)\)/m)[1].split(/\s+/).filter(Boolean);
+  const loop = text.match(/^\s*for p in ([^;]+); do\n\s*as_studio git -C "\$BUILD" apply --check "\$ADAPTER_DIR\/\$p"\n\s*as_studio git -C "\$BUILD" apply "\$ADAPTER_DIR\/\$p"/m);
+  assert.ok(loop, 'the apply loop checks each patch before applying it');
+  const applied = loop[1].trim().split(/\s+/);
+  for (const patch of ['avatar-profile-hint.patch', 'studio-login.patch', 'cortados-rooms.patch']) {
+    assert.ok(shipped.includes('claw3d/' + patch), patch + ' is in ADAPTER_FILES');
+    assert.ok(applied.includes(patch), patch + ' is applied');
+    assert.ok(text.includes('-f "$HERE/claw3d/' + patch + '"'), patch + ' is required before anything changes');
+  }
+  assert.deepEqual(applied.sort(), shipped.filter(f => f.endsWith('.patch')).map(f => f.slice('claw3d/'.length)).sort());
+});

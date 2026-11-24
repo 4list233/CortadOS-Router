@@ -11,10 +11,15 @@ import { CloseError, FrameReader, MAX_FRAME_BYTES, OfficeHub, acceptKey, checkSe
   createBridge, defaultOrigins, encodeFrame, readSecret, sameSecret } from './bridge.mjs';
 
 const SECRET = 'bridge-secret-0123456789abcdef';
-const view = () => ({ version: 1, floors: [{ session: '0123456789abcdef', project: 'Router', device: 'pro',
-  orchestrator: { model: 'claude-opus-5-5', status: 'working', tool: null },
-  workers: [{ run_id: 'run-12345678', provider: 'local', lane: 'local-pro', model: 'qwen3:27b',
-    title: 'Summarise', status: 'working', tool: 'Read' }] }], lobby: { workers: [] } });
+// one room: an orchestrator and its running task (the shape of GET /v1/cortados/office/tree)
+const taskNode = (id, over = {}) => ({ task_id: id, title: 'Summarise', state: 'running', status: 'running', phase: null,
+  tool: 'Read', host: 'air', provider: 'local', lane: 'local-pro', local_backend: null, model: 'qwen3:27b',
+  started_at: 1, ended_at: null, elapsed_s: 1, parent_task_id: null, origin_via: null, sub_sessions_hidden: 0,
+  sub_sessions: [], tasks: [], ...over });
+const view = () => ({ version: 1, generated_at: 1_800_000_000, orchestrators: { status: 'ok', errors: [], items: [{
+  origin: '0123456789abcdef', kind: 'session', project: 'Router', device: 'pro', status: 'working',
+  model: 'claude-opus-5-5', tool: null, client: null, client_source: null,
+  tasks: [taskNode('t20261124100000-a0000001')], routed: [] }] } });
 
 function maskedFrame(opcode, payload, { fin = true, mask = true, rsv = 0 } = {}) {
   const body = Buffer.from(payload);
@@ -253,8 +258,8 @@ test('e2e: authenticated Studio gets hello, roster with sprites, read-only refus
   assert.equal((await c.next(f => f.id === 'm')).error.code, 'READ_ONLY');
   // a poll lands: presence (Studio's Office screen reloads its roster on it) and the extension snapshot
   const next = view();
-  next.floors[0].workers.push({ run_id: 'run-codex-999', provider: 'codex', lane: 'codex', model: 'gpt-6.1',
-    title: 'Review', status: 'working', tool: 'Bash' });
+  next.orchestrators.items[0].tasks.push(taskNode('t20261124100100-a0000002', { provider: 'codex', lane: 'codex',
+    model: 'gpt-6.1', title: 'Review', tool: 'Bash' }));
   bridge.hub.update(next);
   await c.next(f => f.event === 'presence');
   const snap = await c.next(f => f.event === 'office.snapshot');

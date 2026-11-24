@@ -97,9 +97,12 @@ with assistant content. **Do not synthesize chat text** for metadata-only office
 ## Explicit extensions / remaining integration
 
 office.snapshot {agents} and each agent's office metadata are CortadOS extensions,
-not stock Claw3D protocol. They carry complete roster replacement, floor, device,
-project, status, provider, lane, model, tool name, task title and appearance
-(characterFamily, outfit, sprite). Stock Claw3D ignores them; nothing requires them.
+not stock Claw3D protocol. They carry complete roster replacement, room (group, groupLabel,
+room index, kind, parent, depth), device, project, status, task status, whether a finished
+task is reporting back (returning, returnUntil), provider, lane, model, tool name, task title
+and appearance (characterFamily, familySource, outfit, sprite). Stock Claw3D ignores them;
+nothing requires them. The roster itself comes from `GET /v1/cortados/office/tree` (#77
+rooms; FLOORS-DESIGN.md §8).
 
 Office v1 workers (and a routed orchestrator) carry `local_backend`: `ollama` | `vllm-mlx` for
 a local worker whose node gate reported its backend, else null (additive since #77 round 1; an
@@ -107,18 +110,24 @@ older provider omits it, and the adapter then falls back to the model id's shape
 
 characterFamily is claude/codex/grok/ollama/local/unknown, and outfit is worker or suit
 (orchestrator). Mapping rules are in README "Appearance". Unknown provider gets the neutral
-`unknown` sprite, with provider kept null. The orchestrator's sprite comes from its
-model name, but its published provider/lane stay null: never inferred.
+`unknown` sprite, with provider kept null. The orchestrator's suit comes from the bot origin,
+the provider's `client` (the routed main loop's wire, else the heartbeat's claim) or, failing
+those, a guess from its model name (`familySource` says which); its published provider/lane
+stay null: never inferred.
 
 ## Gaps (open)
 
-- **CortadOS floors vs Claw3D floors**: Claw3D shows one office per gateway. All CortadOS
-  floors (sessions) and the lobby share it; each person's floor is in `office.floor`, and
-  sessions are not separate rooms. Multi-floor (`docs/office_sys/multi-floor-runtime-architecture.md`
-  upstream) is an upstream roadmap item, not a stable API.
+- **Floors → rooms (built, #77)**: Claw3D shows one office per gateway, and its floors are a
+  compiled list keyed by adapter type (FLOORS-DESIGN.md §3). CortadOS draws one ROOM per
+  orchestrating session on that one floor with `claw3d/cortados-rooms.patch` (8 rooms x 6
+  desks, sticky desk allocation, off unless this bridge is the gateway). Real floors per
+  orchestrator remain out of scope (owner decision E1); the allocator is where a later "spill
+  to another floor" would go. The flat view's lobby is not drawn (FLOORS-DESIGN.md E9).
 - **Grok workers**: office.py's `provider_of` maps only claude-cli, codex-cli and local-*,
   so no worker is `grok` today. The sprite and mapping are ready for when a grok lane exists.
-- **Desk count**: the default Claw3D office has 8 desks and office.py caps 32 workers
-  per floor. Extra people stand in Claw3D's own overflow behaviour (not checked live).
-- **Not verified live**: no Claw3D instance has run against the bridge. The method set
-  and payload shapes come from reading 51337f7's source, and the patch is not compiled.
+- **Desk count**: 8 rooms x (1 head + 2 report + 6 team) desks. Extra people get no desk and
+  walk the floor, Claw3D's own behaviour for an unassigned agent (FLOORS-DESIGN.md §8.3
+  "Overflow"; not checked live).
+- **Not verified live**: no patched Claw3D Studio has run against the bridge. The rooms patch
+  applies with the other two on 51337f7 and type-checks (`tsc --noEmit`); lint, `next build`
+  and a live Studio are the deploy's own build and the design's step 4.
