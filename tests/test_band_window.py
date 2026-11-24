@@ -329,6 +329,98 @@ class ContinuationTests(unittest.TestCase):
         self.assertEqual(self.send_with(body, {routing.BAND_HEADER: "R1"})[0], 200)
 
 
+class ForkTests(unittest.TestCase):
+    """Review of 151de01 (P2): a forked subagent shares its windowed parent's history and identity, so find matches the
+    parent; it must open its own conversation in its own window (Handler._fork_parent), never be refused as a changed
+    window. The same agent changing its window is still refused (ContinuationTests)."""
+
+    SUB = "You are a forked subagent."
+    setUp = ContinuationTests.setUp
+    tearDown, request, post, error_of, send_with, continuation = (
+        _CODEX.tearDown, _CODEX.request, _CODEX.post, _CODEX.error_of, _CODEX.send_with, _CODEX.continuation)
+
+    def parent_and_fork(self, fork_model, **fork):
+        body = self.continuation("cortados@R2", "cortados@R2")          # the parent opened in R2, answered a tool_use
+        return body, dict(body, model=fork_model, **fork)
+
+    def test_a_plain_cortados_fork_of_an_r2_parent_is_routed_on_its_own(self):
+        _, fork = self.parent_and_fork("cortados", system=self.SUB)
+        self.assertTrue(self.post(fork)["content"])                       # 200, answered by its own backend
+        self.assertEqual(self.routed, [R2, None])                         # routed again, without a window (S1's band)
+        parent, child = sorted(self.reg.sessions.values(), key=lambda s: s.opened_at)
+        self.assertIsNone(child.route[provider_server.ASKED_WINDOW_KEY])
+        self.assertEqual(parent.route[provider_server.ASKED_WINDOW_KEY], "R2")
+        self.assertEqual(len(parent.history), 1)                          # the parent is untouched
+
+    def test_a_fork_with_other_tools_and_another_window_is_its_own_conversation(self):
+        tools = [dict(test_provider_codex.READ_TOOL, name="Grep")]
+        _, fork = self.parent_and_fork("cortados@R3", tools=tools)
+        self.post(fork)
+        self.assertEqual(self.routed, [R2, ("R3", "R3")])
+        self.assertEqual(sorted(s.route[provider_server.ASKED_WINDOW_KEY] for s in self.reg.sessions.values()),
+                         ["R2", "R3"])
+
+    def test_the_same_agent_changing_its_window_is_still_refused(self):
+        _, same = self.parent_and_fork("cortados")                        # same system prompt and tools: a continuation
+        code, msg = self.error_of(same)
+        self.assertEqual(code, provider_server.TERMINAL_STATUS)
+        self.assertIn("band window is fixed per conversation", msg)
+        self.assertEqual((self.routed, len(self.reg.sessions)), ([R2], 1))
+
+    def test_a_fork_after_its_parent_moved_on_is_not_served_on_the_parents_route(self):
+        # The parent answered again, so the fork's history is a branch of it (find raises Rebuild: needs an identity,
+        # as Claude Code's session id): still its own route, and the parent's backend is kept, never rebuilt from.
+        ident = {"x-claude-code-session-id": "s-fork"}
+        history = [{"role": "user", "content": "please use tool"}]
+        code, r1 = self.send_with({"model": "cortados@R2", "tools": [test_provider_codex.READ_TOOL],
+                                   "messages": history}, ident)
+        history += [{"role": "assistant", "content": r1["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": r1["content"][-1]["id"],
+                                                  "content": "hello"}]}]
+        parent_body = {"model": "cortados@R2", "tools": [test_provider_codex.READ_TOOL], "messages": history}
+        self.assertEqual(self.send_with(parent_body, ident)[0], 200)      # the parent moves on
+        # The fork's own turn (its directive), not the parent's answered one: that would be a retry (Replay).
+        fork_msgs = history[:-1] + [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": r1["content"][-1]["id"], "content": "forked"}]}]
+        code, _ = self.send_with(dict(parent_body, model="cortados", system=self.SUB, messages=fork_msgs), ident)
+        self.assertEqual(code, 200)
+        self.assertEqual((self.routed, len(self.reg.sessions)), ([R2, None], 2))
+        parent, child = sorted(self.reg.sessions.values(), key=lambda s: s.opened_at)
+        self.assertEqual((parent.route[provider_server.ASKED_WINDOW_KEY], len(parent.history)), ("R2", 2))
+        self.assertIsNone(child.route[provider_server.ASKED_WINDOW_KEY])
+        self.assertFalse(getattr(child, "rebuilds", 0))                    # its own conversation, not a parent rebuild
+
+    def test_a_fork_continues_on_its_own_route_and_the_parent_on_its_own(self):
+        parent_body, fork = self.parent_and_fork("cortados", system=self.SUB)
+        r = self.post(fork)
+        use = r["content"][-1]                                            # the fake asks for the tool again
+        fork_next = dict(fork, messages=fork["messages"] + [
+            {"role": "assistant", "content": r["content"]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"], "content": "again"}]}])
+        self.post(fork_next)                                              # the fork's own continuation
+        self.assertEqual(self.routed, [R2, None])                         # not routed again, not refused
+        self.assertEqual(self.post(parent_body)["content"],               # the parent's continuation: the parent
+                         [{"type": "text", "text": "tool said: hello"}])
+        self.assertEqual((self.routed, len(self.reg.sessions)), ([R2, None], 2))
+        parent, child = sorted(self.reg.sessions.values(), key=lambda s: s.opened_at)
+        self.assertEqual((len(parent.history), len(child.history)), (2, 3))
+
+
+class SameWindowTests(unittest.TestCase):
+    """Registry.find's preference: of sessions holding one history (a fork beside its parent before either answers),
+    those opened in the request's window; else all, so the ambiguity is decided as before."""
+
+    def test_preference(self):
+        S = lambda w: type("S", (), {"route": {provider_server.ASKED_WINDOW_KEY: w}})()
+        parent, fork = S("R2"), S(None)
+        pick = provider_server._same_window
+        self.assertEqual(pick([parent, fork], "R2"), [parent])
+        self.assertEqual(pick([parent, fork], None), [fork])
+        self.assertEqual(pick([parent, fork], "R3"), [parent, fork])
+        self.assertEqual(pick([parent, fork], provider_server.ANY_WINDOW), [parent, fork])
+        self.assertEqual(pick([parent], None), [parent])
+
+
 del _CODEX
 
 

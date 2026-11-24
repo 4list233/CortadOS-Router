@@ -368,7 +368,11 @@ What runs where:
   is refused with a 400, on every request, continuations included. The window is fixed per conversation, like its
   route: a continuation that asks for another window (changed, added or dropped) is refused as terminal (400,
   `x-should-retry: false`) and is never re-routed or served on the old route. Start a new conversation to change it
-  (in Claude Code, `/clear` after `/model`).
+  (in Claude Code, `/clear` after `/model`). A forked subagent is not such a continuation: it inherits the main loop's
+  history and session id but sends its own system prompt or tools, so a request that matches a conversation, asks
+  for another window and differs in either opens its own conversation, seeded with the inherited history and routed
+  in its own window (a plain `cortados` subagent: S1's band); the parent is untouched. A fork that sends the parent's
+  exact system prompt and tools cannot be told from the parent and is refused like it.
 - **Native subagents:** `CLAUDE_CODE_SUBAGENT_MODEL=cortados` (+ `_FORCE`, and the workflow variant), so S1 routes
   each one. They are Claude Code's own subagents, so they keep every tool, MCP included; the provider bridges the tool
   calls back to this Claude Code, which runs them locally. Caveat: what `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` does is
