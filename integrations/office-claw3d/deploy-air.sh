@@ -32,6 +32,11 @@ BRIDGE_USER="_cortados-office"; BRIDGE_UID=480; BRIDGE_HOME="$ROOT/home/bridge"
 STUDIO_USER="_cortados-claw3d"; STUDIO_UID=481; STUDIO_HOME="$ROOT/home/studio"
 ROLE_SHELL="/usr/bin/false"; ROLE_GID=20; ROLE_REALNAME="CortadOS Office role user"
 BRIDGE_PORT=18789                          # Claw3D's default upstream gateway port
+# Studio's upstream is the loopback bridge, named by this one host. CLAW3D_GATEWAY_URL and Claw3D's
+# UPSTREAM_ALLOWLIST (compared with `new URL(url).hostname`) are both built from it, so they cannot
+# drift. `localhost`: the bridge allows the Origin Studio's proxy derives from it (bridge.mjs).
+GATEWAY_HOST=localhost
+GATEWAY_URL="ws://$GATEWAY_HOST:$BRIDGE_PORT"
 STUDIO_PORT=3000
 # The tailnet HTTPS port for Studio. The Air already serves 443 (Funnel: /mcp only) and 8444
 # (Serve: the provider); --publish-tailnet refuses any port already in `tailscale serve status`.
@@ -130,6 +135,7 @@ if [[ $MODE != install ]]; then
   [[ -f "$ROOT/bin/run-studio.sh" ]] || die "install first (no $ROOT/bin/run-studio.sh)"
   as_root_test -s "$ACCESS_TOKEN" || die "Studio has no access token file: re-run the install first"
   grep -q 'STUDIO_ACCESS_TOKEN' "$ROOT/bin/run-studio.sh" || die "the installed launcher predates the access token: re-run the install"
+  grep -q 'UPSTREAM_ALLOWLIST' "$ROOT/bin/run-studio.sh" || die "the installed launcher predates the upstream allowlist (the Office cannot reach its bridge): re-run the install"
   # The gate must already be on, on loopback, before anything is published: / refuses without the
   # cookie and the login form answers.
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$STUDIO_PORT/" || true)"
@@ -444,7 +450,11 @@ write_root_file run-studio.sh 0755 <<EOF
 # Air or through tailscale serve, logs in at /cortados-login (claw3d/studio-login.cjs).
 set -euo pipefail
 export HOST=127.0.0.1 PORT=$STUDIO_PORT NODE_ENV=production NEXT_TELEMETRY_DISABLED=1
-export CLAW3D_GATEWAY_URL="ws://localhost:$BRIDGE_PORT"
+export CLAW3D_GATEWAY_URL="$GATEWAY_URL"
+# Claw3D 51337f7 (server/gateway-proxy.js isUpstreamAllowed) refuses EVERY upstream when NODE_ENV is
+# production and this is empty ("studio.gateway_url_blocked": the Office stays "CONNECTING", #77).
+# Exactly the gateway URL's hostname: only the loopback bridge is allowed, nothing else.
+export UPSTREAM_ALLOWLIST="$GATEWAY_HOST"
 export CLAW3D_GATEWAY_ADAPTER_TYPE=openclaw
 CLAW3D_GATEWAY_TOKEN="\$(cat "$GATEWAY_SECRET")"
 STUDIO_ACCESS_TOKEN="\$(cat "$ACCESS_TOKEN")"
@@ -517,17 +527,26 @@ office_healthy() {  # prints why not, on failure
   [[ "$(http_code "http://127.0.0.1:$BRIDGE_PORT/")" == 426 ]] || { echo "the bridge does not answer on 127.0.0.1:$BRIDGE_PORT"; return 1; }
   [[ "$(http_code "http://127.0.0.1:$STUDIO_PORT/")" == 401 ]] || { echo "Studio does not refuse a request without its access cookie"; return 1; }
   [[ "$(http_code "http://127.0.0.1:$STUDIO_PORT/cortados-login")" == 200 ]] || { echo "the login form does not answer"; return 1; }
+  # End to end, as the browser does: through Studio's own proxy (/api/gateway/ws, behind its access
+  # gate) an OpenClaw `connect`, which the proxy forwards with its gateway token; only the bridge's
+  # ok:true hello passes (gateway-check.mjs). Reason: on 2026-11-24 every check above passed while
+  # the proxy refused its upstream (studio.gateway_url_blocked) and the Office showed 0 agents.
+  # The access token goes file -> pipe -> stdin, read as root: never printed, never on a command
+  # line. Fails closed: a refused sudo (pipefail), a refusal, a close or the 5 s deadline all fail.
+  local gw
+  gw="$(sudo cat "$ACCESS_TOKEN" 2>/dev/null | "$NODE" "$HERE/gateway-check.mjs" --port "$STUDIO_PORT" --timeout-ms 5000 2>/dev/null)" \
+    && [[ "$gw" == ok ]] || { echo "Studio's gateway proxy does not reach the bridge (${gw:-no answer})"; return 1; }
   # 0 only on a successful lsof listing loopback listeners on both ports (deploy-lib.sh): a refused
   # sudo or an unreadable answer fails the health check, so the transaction rolls back
   listeners_loopback_only "$BRIDGE_PORT" "$STUDIO_PORT" || return 1
 }
 health_check() {  # up to ~60 s for both daemons to come up, then the same checks must hold 10 s later
-  [[ $APPLY -eq 1 ]] || { echo "  (dry run) health check: both daemons running, bridge 426, Studio 401 on /, 200 on /cortados-login, loopback only"; return 0; }
+  [[ $APPLY -eq 1 ]] || { echo "  (dry run) health check: both daemons running, bridge 426, Studio 401 on /, 200 on /cortados-login, a connect through Studio's proxy answered by the bridge, loopback only"; return 0; }
   local why="" i
   for i in $(seq 1 30); do
     if why="$(office_healthy)"; then
       sleep 10
-      why="$(office_healthy)" && { echo "  healthy: both daemons running on loopback, Studio gated (401), login form 200"; return 0; }
+      why="$(office_healthy)" && { echo "  healthy: both daemons running on loopback, Studio gated (401), login form 200, gateway connect ok"; return 0; }
     fi
     sleep 2
   done

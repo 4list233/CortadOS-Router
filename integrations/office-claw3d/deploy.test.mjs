@@ -3,7 +3,7 @@
 // script's own text is checked for the order "every check, then the first change".
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, rm, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -686,35 +686,189 @@ test('listeners_loopback_only: loopback only from a successful lsof seeing both 
 });
 
 // office_healthy, cut from deploy-air.sh as written and run with fakes: every other check passes, so
-// the outcome is the listener check's alone
-async function officeHealthy(t, sudo, lsofScript) {
+// the outcome is the listener check's alone (or, with `proxy`, the gateway check's). Studio is a fake
+// gateway proxy on a free loopback port (fakeStudioProxy); the lsof answers name it where they say 3000.
+// Async (spawn, not spawnSync): the fake proxy answers from this process's event loop.
+const ACCESS = 'a'.repeat(64);                    // the fake studio-access-token's content
+async function officeHealthy(t, sudo, lsofScript, proxy = 'ok') {
   const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
   const m = text.match(/^http_code\(\) \{.*\n^office_healthy\(\) \{[\s\S]*?\n\}\n/m);
   assert.ok(m, 'office_healthy found');
+  const studio = await fakeStudioProxy(t, proxy);
   const bin = await fakeBins(t, {
-    sudo, lsof: lsofScript,
+    sudo, lsof: lsofScript.replaceAll(':3000', `:${studio.port}`),
     launchctl: '#!/bin/bash\n[ "${FAKE_ROOT:-}" = 1 ] || { echo "Could not find service" >&2; exit 113; }\n'
       + 'echo "system/x = {"\necho "\tstate = running"\necho "}"\n',
-    curl: '#!/bin/bash\nfor a; do u="$a"; done\ncase "$u" in *:18789/) printf 426 ;; *:3000/) printf 401 ;; */cortados-login) printf 200 ;; esac\n',
+    curl: '#!/bin/bash\nfor a; do u="$a"; done\ncase "$u" in */cortados-login) printf 200 ;; *:18789/) printf 426 ;; */) printf 401 ;; esac\n',
   });
-  const r = spawnSync('bash', ['-c', `set -euo pipefail; . "$LIB"; BRIDGE_LABEL=b STUDIO_LABEL=s BRIDGE_PORT=18789 STUDIO_PORT=3000
+  const tokenFile = join(bin, 'studio-access-token');
+  await writeFile(tokenFile, ACCESS + '\n'); await chmod(tokenFile, 0o600);
+  const r = await spawnAsync('bash', ['-c', `set -euo pipefail; . "$LIB"; BRIDGE_LABEL=b STUDIO_LABEL=s BRIDGE_PORT=18789 STUDIO_PORT=${studio.port}
+NODE=${JSON.stringify(process.execPath)} HERE=${JSON.stringify(HERE.replace(/\/$/, ''))} ACCESS_TOKEN=${JSON.stringify(tokenFile)}
 ${m[0]}
-rc=0; why="$(office_healthy)" || rc=$?; echo "rc=$rc $why"`],
-  { env: { PATH: `${bin}:/usr/bin:/bin`, LIB }, encoding: 'utf8' });
+rc=0; why="$(office_healthy)" || rc=$?; echo "rc=$rc $why"`], { PATH: `${bin}:/usr/bin:/bin`, LIB });
+  assert.ok(!r.stdout.includes(ACCESS) && !r.stderr.includes(ACCESS), 'the access token is never printed');
   return r.stdout.trim();
+}
+function spawnAsync(cmd, args, env) {
+  return new Promise(resolve => {
+    const c = spawn(cmd, args, { env });
+    let stdout = '', stderr = '';
+    c.stdout.on('data', d => { stdout += d; }); c.stderr.on('data', d => { stderr += d; });
+    c.on('close', status => resolve({ status, stdout, stderr }));
+  });
+}
+// A stand-in for Claw3D 51337f7's Studio on its gateway path: the access gate's cookie check on the
+// upgrade (401 without it), then server/gateway-proxy.js's answers to a browser `connect`:
+//   ok       the bridge's hello (the proxy injected the gateway token and forwarded the connect)
+//   blocked  what the Air answered on 2026-11-24: studio.gateway_url_blocked, then close 1011
+//   rejected the bridge refused the injected token (UNAUTHORIZED), then the upstream closed
+//   silent   the connect is never answered (the probe's deadline decides)
+// It records each connect frame it got, to check the probe sends no credential of its own.
+async function fakeStudioProxy(t, mode) {
+  const { createServer } = await import('node:http');
+  const { FrameReader, encodeFrame, acceptKey } = await import('./bridge.mjs');
+  const connects = [];
+  const server = createServer((req, res) => { res.writeHead(404); res.end(); });
+  server.on('upgrade', (req, socket) => {
+    const cookie = String(req.headers.cookie ?? '');
+    if (req.url !== '/api/gateway/ws' || !cookie.split(';').some(c => c.trim() === `studio_access=${ACCESS}`)) {
+      socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); return;
+    }
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
+      `Sec-WebSocket-Accept: ${acceptKey(req.headers['sec-websocket-key'])}\r\n\r\n`);
+    const send = f => socket.write(encodeFrame(1, JSON.stringify(f)));
+    const close = code => { const b = Buffer.alloc(2); b.writeUInt16BE(code); socket.write(encodeFrame(8, b)); socket.end(); };
+    if (mode !== 'blocked') send({ type: 'event', event: 'connect.challenge', payload: { nonce: 'n' } });
+    const reader = new FrameReader();
+    socket.on('error', () => {});
+    socket.on('data', chunk => {
+      let frames; try { frames = reader.push(chunk); } catch { socket.destroy(); return; }
+      for (const { opcode, payload } of frames) {
+        if (opcode !== 1) { socket.end(); return; }
+        const f = JSON.parse(payload.toString('utf8'));
+        if (f.method !== 'connect') continue;
+        connects.push(f);
+        if (mode === 'ok') send({ type: 'res', id: f.id, ok: true, payload: { type: 'hello-ok', protocol: 3 } });
+        else if (mode === 'blocked') {
+          send({ type: 'res', id: f.id, ok: false, error: { code: 'studio.gateway_url_blocked',
+            message: 'Upstream gateway URL is not in the allowed hosts list.' } });
+          close(1011);
+        } else if (mode === 'rejected') {
+          send({ type: 'res', id: f.id, ok: false, error: { code: 'UNAUTHORIZED', message: 'Bridge authentication failed' } });
+          close(1012);
+        }
+      }
+    });
+  });
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  t.after(() => { server.closeAllConnections?.(); server.close(); });
+  return { port: server.address().port, connects };
 }
 test('deploy-air.sh office_healthy: a refused sudo lsof fails the health check (rollback), never passes it (r3 finding 1)', async t => {
   assert.equal(await officeHealthy(t, SUDO_ROOT, lsof(0, LOOPBACK)), 'rc=0');
   // a refused sudo now fails at the first root read, the daemon state: never a pass
   assert.match(await officeHealthy(t, SUDO_REFUSED, lsof(0, LOOPBACK)), /^rc=1 b is not running/);
   assert.match(await officeHealthy(t, SUDO_ROOT, lsof(1, '')), /^rc=1 /);
-  assert.match(await officeHealthy(t, SUDO_ROOT, lsof(0, 'p1\nf3\nn*:3000\np2\nf3\nn127.0.0.1:18789\n')), /^rc=1 a listener on port 3000 is not loopback-only/);
+  assert.match(await officeHealthy(t, SUDO_ROOT, lsof(0, 'p1\nf3\nn*:3000\np2\nf3\nn127.0.0.1:18789\n')), /^rc=1 a listener on port \d+ is not loopback-only/);
   // a refused sudo for lsof alone (launchctl answered as root) still fails the check
   const lsofRefused = '#!/bin/bash\nif [ "$1" = lsof ]; then echo "sudo: a password is required" >&2; exit 1; fi\nexport FAKE_ROOT=1\nexec "$@"\n';
   assert.match(await officeHealthy(t, lsofRefused, lsof(0, LOOPBACK)), /^rc=1 cannot list the listeners/);
   const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
   assert.ok(!/sudo lsof/.test(text), 'lsof runs only in deploy-lib.sh (listeners_loopback_only)');
   assert.ok(!/\| *grep -q/.test(text), 'no `| grep -q` under pipefail (SIGPIPE reads as failure)');
+});
+
+// ---- #77 upstream allowlist: the Office could not reach its bridge while every check passed ----------
+test('run-studio.sh: UPSTREAM_ALLOWLIST is exactly the gateway URL\'s hostname (#77 upstream allowlist)', async () => {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  const heredoc = text.match(/^write_root_file run-studio\.sh 0755 <<EOF\n([\s\S]*?)\nEOF\n/m);
+  assert.ok(heredoc, 'run-studio.sh heredoc found');
+  // the pins the launcher names, as deploy-air.sh sets them, then the heredoc rendered by bash itself
+  const pins = text.split('\n').filter(l => /^(ROOT|STUDIO_USER|BRIDGE_PORT|STUDIO_PORT|GATEWAY_HOST|GATEWAY_URL|GATEWAY_SECRET|ACCESS_TOKEN)=/.test(l));
+  const r = spawnSync('bash', ['-c', `set -euo pipefail\n${pins.join('\n')}\nNODE=/x/node\ncat <<EOF\n${heredoc[1]}\nEOF\n`],
+    { env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  const launcher = r.stdout;
+  const url = launcher.match(/^export CLAW3D_GATEWAY_URL="([^"]*)"$/m)?.[1];
+  const allow = launcher.match(/^export UPSTREAM_ALLOWLIST="([^"]*)"$/m)?.[1];
+  assert.equal(url, 'ws://localhost:18789');
+  assert.match(launcher, /NODE_ENV=production/);   // the reason the allowlist is needed: production refuses an empty one
+  // Claw3D compares each comma-separated entry with new URL(upstream).hostname
+  assert.equal(allow, new URL(url).hostname);
+  assert.ok(!allow.includes(','), 'only the loopback bridge is allowed');
+  // both come from the one pin, so they cannot drift
+  assert.match(text, /^export CLAW3D_GATEWAY_URL="\$GATEWAY_URL"$/m);
+  assert.match(text, /^export UPSTREAM_ALLOWLIST="\$GATEWAY_HOST"$/m);
+  assert.match(text, /^GATEWAY_URL="ws:\/\/\$GATEWAY_HOST:\$BRIDGE_PORT"$/m);
+  // publishing refuses an installed launcher from before the allowlist
+  assert.match(text, /grep -q 'UPSTREAM_ALLOWLIST' "\$ROOT\/bin\/run-studio\.sh" \|\| die /);
+});
+
+test('deploy-air.sh office_healthy: a connect through Studio\'s proxy must reach the bridge (#77 upstream allowlist)', async t => {
+  assert.equal(await officeHealthy(t, SUDO_ROOT, lsof(0, LOOPBACK), 'ok'), 'rc=0');
+  // what the Air answered on 2026-11-24 while every other check passed
+  assert.equal(await officeHealthy(t, SUDO_ROOT, lsof(0, LOOPBACK), 'blocked'),
+    "rc=1 Studio's gateway proxy does not reach the bridge (connect refused: studio.gateway_url_blocked)");
+  assert.match(await officeHealthy(t, SUDO_ROOT, lsof(0, LOOPBACK), 'rejected'), /^rc=1 .*connect refused: UNAUTHORIZED\)$/);
+  // the access token cannot be read (a refused sudo for cat alone): fails, never skips the check
+  const catRefused = '#!/bin/bash\nif [ "$1" = cat ]; then echo "sudo: a password is required" >&2; exit 1; fi\nexport FAKE_ROOT=1\nexec "$@"\n';
+  assert.match(await officeHealthy(t, catRefused, lsof(0, LOOPBACK), 'ok'), /^rc=1 Studio's gateway proxy does not reach the bridge \(/);
+  // the token reaches the probe on stdin only: never as an argument
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  assert.match(text, /gw="\$\(sudo cat "\$ACCESS_TOKEN" 2>\/dev\/null \| "\$NODE" "\$HERE\/gateway-check\.mjs" --port "\$STUDIO_PORT" --timeout-ms 5000 2>\/dev\/null\)"/);
+});
+
+test('gateway-check.mjs: ok only on the bridge\'s hello; a refused upgrade, silence or no Studio fails (#77 upstream allowlist)', async t => {
+  const { probe } = await import('./gateway-check.mjs');
+  const studio = await fakeStudioProxy(t, 'ok');
+  assert.equal(await probe({ port: studio.port, token: ACCESS }), 'ok');
+  // the probe sends no credential of its own: Studio's proxy injects its gateway token, as for a browser
+  assert.equal(studio.connects.length, 1);
+  assert.equal(studio.connects[0].params?.auth, undefined);
+  assert.equal(await probe({ port: studio.port, token: 'b'.repeat(64) }), 'gateway upgrade refused (HTTP 401)');
+  assert.equal(await probe({ port: studio.port, token: '' }), 'no usable access token on stdin');
+  assert.equal(await probe({ port: studio.port, token: 'bad token; x=y' }), 'no usable access token on stdin');
+  const silent = await fakeStudioProxy(t, 'silent');
+  assert.equal(await probe({ port: silent.port, token: ACCESS, timeoutMs: 300 }), 'no answer within 300 ms');
+  const blocked = await fakeStudioProxy(t, 'blocked');
+  assert.equal(await probe({ port: blocked.port, token: ACCESS }), 'connect refused: studio.gateway_url_blocked');
+  // nothing listening
+  const { createServer } = await import('node:net');
+  const s = createServer(); await new Promise(r => s.listen(0, '127.0.0.1', r));
+  const free = s.address().port; await new Promise(r => s.close(r));
+  assert.equal(await probe({ port: free, token: ACCESS }), 'cannot reach Studio');
+});
+
+test('activation: Studio\'s proxy answering studio.gateway_url_blocked fails the health check and rolls back (#77 upstream allowlist)', async t => {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  const m = text.match(/^http_code\(\) \{.*\n^office_healthy\(\) \{[\s\S]*?\n\}\n/m);
+  for (const [mode, rc] of [['blocked', 'rc=1'], ['ok', 'rc=0']]) {
+    const D = await txHost(t, { upgrade: true });
+    const studio = await fakeStudioProxy(t, mode);
+    const bin = await fakeBins(t, {
+      sudo: SUDO_ROOT, lsof: lsof(0, LOOPBACK.replaceAll(':3000', `:${studio.port}`)),
+      launchctl: '#!/bin/bash\n[ "${FAKE_ROOT:-}" = 1 ] || exit 113\necho "\tstate = running"\n',
+      curl: '#!/bin/bash\nfor a; do u="$a"; done\ncase "$u" in */cortados-login) printf 200 ;; *:18789/) printf 426 ;; */) printf 401 ;; esac\n',
+    });
+    const tokenFile = join(bin, 'studio-access-token');
+    await writeFile(tokenFile, ACCESS + '\n'); await chmod(tokenFile, 0o600);
+    // the harness's fake health_check replaced by deploy-air.sh's own office_healthy, once
+    const prelude = `BRIDGE_LABEL=b STUDIO_LABEL=s BRIDGE_PORT=18789 STUDIO_PORT=${studio.port}
+NODE=${JSON.stringify(process.execPath)} HERE=${JSON.stringify(HERE.replace(/\/$/, ''))} ACCESS_TOKEN=${JSON.stringify(tokenFile)}
+${m[0]}
+health_check() { local why; why="$(office_healthy)" || { echo "health check: $why" >&2; return 1; }; echo health >> "$D/log"; }`;
+    const r = await spawnAsync('/bin/bash', [TX_HARNESS],
+      { PATH: `${bin}:/usr/bin:/bin`, LIB, FAKE: D, FAIL: '', FAIL_ALWAYS: '', PRELUDE: prelude, UNKNOWN: '' });
+    assert.equal(r.stdout.trim(), rc, r.stderr);
+    if (mode === 'blocked') {
+      assert.match(r.stderr, /health check: Studio's gateway proxy does not reach the bridge \(connect refused: studio\.gateway_url_blocked\)/);
+      assert.match(r.stderr, /ROLLBACK/);
+      assert.deepEqual(await snapshot(D), OLD);
+    } else {
+      assert.deepEqual(await snapshot(D), NEW);
+    }
+  }
 });
 
 test('link_target: empty only on confirmed absence; a failed or impossible read is an error (r3 finding 2)', async t => {

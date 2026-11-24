@@ -141,7 +141,12 @@ Then:
 6. **Launchers and LaunchDaemons, staged.** It writes the root-owned launchers `run-bridge.sh`
    and `run-studio.sh` and the plists `com.cortados.office-{bridge,studio}.plist` into
    `/opt/cortados-office/stage/` (root, 0700), not over the live ones. The launchers set paths and
-   ports and read the secret files at start; Studio always gets `STUDIO_ACCESS_TOKEN`. The plists
+   ports and read the secret files at start; Studio always gets `STUDIO_ACCESS_TOKEN`. Studio also
+   gets `UPSTREAM_ALLOWLIST=localhost`, exactly the hostname of its `CLAW3D_GATEWAY_URL`
+   (`ws://localhost:18789`, both built from one `GATEWAY_HOST` pin): Claw3D 51337f7 refuses **every**
+   upstream when `NODE_ENV=production` and the allowlist is empty, so without it the browser's
+   `connect` gets `studio.gateway_url_blocked` and the Office stays "CONNECTING" with 0 agents (#77,
+   seen live on 2026-11-24). Only the loopback bridge is allowed. The plists
    set `UserName` = the role user, RunAtLoad, KeepAlive, logs under `/opt/cortados-office/log-*`.
 7. **Activate, as one transaction** (`tx_run` in `deploy-lib.sh`). Only after steps 2–6 succeed:
    - it repoints `node`, `adapter` and `claw3d/current` to the staged versions (`ln -sfn` to
@@ -152,7 +157,14 @@ Then:
      (up to 10 s), then bootstrapped again;
    - **health check**, for up to about 60 s, and again 10 s after it first passes: both daemons
      `state = running`, the bridge answering on 127.0.0.1:18789, Studio 401 on `/` without the
-     cookie and 200 on `/cortados-login`, both listeners on loopback only.
+     cookie and 200 on `/cortados-login`, a `connect` through Studio's own proxy answered by the
+     bridge, both listeners on loopback only. The connect is end to end, as a browser does it
+     (`gateway-check.mjs`): a WebSocket to `127.0.0.1:3000/api/gateway/ws` with the `studio_access`
+     cookie, then an OpenClaw `connect` without credentials; Studio's proxy injects its gateway token
+     and forwards it, and only the bridge's `ok:true` hello passes. The access token is read as root
+     and piped to the probe's stdin (never printed, never on a command line). Any error, refusal,
+     close or its 5 s deadline fails the check and the release rolls back. Reason: the first live
+     install passed every other check while Studio refused its upstream.
 
    **Any failure in it, or INT/TERM/HUP, rolls back:** both daemons are stopped, every step is
    undone in reverse (each file back from its `.prev`, each link to its old target, anything new
@@ -231,7 +243,8 @@ Not checked live: whether Studio's browser WebSocket (`/api/gateway/ws`) works t
 In Studio, the backend shows as the URL `ws://localhost:18789` with adapter type `openclaw`.
 Studio treats any adapter type it does not know as `openclaw`. The bridge reports
 `cortados-office` in its hello, and Studio's proxy only uses the type to decide whether a token
-is required, which it is. The proxy injects the token from `CLAW3D_GATEWAY_TOKEN` into `connect`.
+is required, which it is. The proxy injects the token from `CLAW3D_GATEWAY_TOKEN` into `connect`. It opens
+that upstream only because `UPSTREAM_ALLOWLIST` names its host (`localhost`, see step 6).
 
 ## Checks after install
 
@@ -259,6 +272,11 @@ is required, which it is. The proxy injects the token from `CLAW3D_GATEWAY_TOKEN
 
   After `--publish-tailnet`, repeat the header check on `https://<air>.ts.net:8446/cortados-login`,
   then log in once from a real browser: that is the only end-to-end check.
+- The Office reaches its data (no token needed beyond the login): after logging in, the page
+  header's gateway status must leave "CONNECTING" within a few seconds and show it connected.
+  "OPENCLAW • CONNECTING" that stays, with 0 agents, means Studio's proxy cannot reach the bridge:
+  check that `/opt/cortados-office/bin/run-studio.sh` exports `UPSTREAM_ALLOWLIST=localhost`, and
+  look in `/opt/cortados-office/log-studio/err.log` for `[gateway-proxy] refusing upstream`.
 - `/opt/cortados-office/log-bridge/err.log` holds one `Office bridge listening on 127.0.0.1:18789 (read-only)`
   line. Repeated `Office poll failed` lines mean the token or the provider is wrong.
 - In Studio's Office: one person per routed worker and one suited orchestrator per floor, wearing
