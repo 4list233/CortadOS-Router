@@ -42,7 +42,7 @@ browser on the Air ──http://127.0.0.1:3000──▶ Claw3D Studio     (user 
 |---|---|---|---|
 | provider (already running) | owner | 127.0.0.1:8432 | owner token, `clients.json` (hashes only) |
 | office bridge (`bridge.mjs`) | `_cortados-office` (UID 480, hidden, no shell) | 127.0.0.1:18789 only | office:read token (0600), bridge secret (0600) |
-| Claw3D Studio (pinned, patched) | `_cortados-claw3d` (UID 481, hidden, no shell) | 127.0.0.1:3000 only | bridge secret (0600), Studio access token (0600) |
+| Claw3D Studio (pinned, patched) | `_cortados-claw3d` (UID 481, hidden, no shell) | 127.0.0.1:3000 only | bridge secret (in its gateway settings file, 0600), Studio access token (0600) |
 | `tailscale serve` (optional) | the Tailscale app | `https://<air>.ts.net:8446`, tailnet only | nothing |
 
 Two users, not one. Studio is a large npm application, and its README says it may load the
@@ -61,9 +61,11 @@ bridge user. The bridge refuses to start if the two secrets are equal.
   `ws`, and others). This is the only npm use in the whole integration, confined to
   `/opt/cortados-office/claw3d/builds/<id>`. It is the [ESCALATE] in the report, because it pulls a large
   third-party dependency tree onto the Air.
-- **`npm run build`** (Next.js production build). The runtime gateway settings come from
-  `CLAW3D_GATEWAY_URL` / `CLAW3D_GATEWAY_TOKEN` / `CLAW3D_GATEWAY_ADAPTER_TYPE` at start, so no
-  rebuild is needed when they change.
+- **`npm run build`** (Next.js production build). The gateway settings are read at run time,
+  per connection, from Studio's settings file (step 5, "Studio's gateway settings"), so no rebuild
+  is needed when they change. Not from `CLAW3D_GATEWAY_URL` / `CLAW3D_GATEWAY_TOKEN`: Claw3D
+  51337f7's gateway proxy never reads them (they only seed its settings page when the file is
+  missing), so the launcher no longer sets them (#77 fix round 1).
 - **The 6-line patch** `claw3d/avatar-profile-hint.patch`, applied before the build. Without
   it, Studio still shows the pixel sprites in its 2D panels (`identity.avatarUrl` is stock).
   The 3D voxel people, however, get Claw3D's seed-random looks instead of the per-provider
@@ -112,7 +114,19 @@ bridge user. The bridge refuses to start if the two secrets are equal.
 Then:
 
 1. **Role users.** `dscl` creates any that are missing (hidden, shell `/usr/bin/false`,
-   password `*`), then re-runs the same check on the result.
+   password `*`), then re-runs the same check on the result. Root makes the homes and log dirs (in
+   root-owned `/opt/cortados-office` and `home/`); the directories *inside* a role user's own
+   directories (`secrets/`, Studio's `.openclaw/claw3d/`, `claw3d/builds/`) are made **as that user**.
+
+   **Root never writes inside a role user's directory** (#77 fix round 2). The user owns it, so it
+   can replace any path component there with a symbolic link at any moment, after every check this
+   script makes; a write as root would then land wherever the link points (the review showed it with
+   `settings.json.next` planted as a link to a root-owned file). So every write there, in every step,
+   the transaction and its rollback included, runs as the owning role user (`sudo -u`): the content
+   goes on stdin into a new file `mktemp` creates beside the destination, which is then renamed over
+   it. A link the user planted can only reach what that user could write anyway. Root still reads
+   (staged files from its own 0700 `stage/`, existence checks) but writes only in root-owned
+   directories: `/opt/cortados-office`, `bin/`, `adapters/`, `stage/`, `node-*`, `/Library/LaunchDaemons`.
 2. **Node.** Kept when `/opt/cortados-office/node-v24.22.3` answers with that version. Otherwise
    it downloads the pinned tarball, checks its SHA-256, and extracts it root-owned into a
    `.partial` directory that is renamed into place.
@@ -129,30 +143,76 @@ Then:
      `python3 -B -m cortados_router.provider.clients add claw3d-office --scope office:read --token-file <tmp>`
      mints it into a new 0600 file and registers only its hash. The script checks that the
      provider answers 200 to it (the header goes through a 0600 file, never argv), then stages it
-     as `_cortados-office` (0600) in `/opt/cortados-office/stage/` and removes the temp copy with
-     `rm -P`. When a slot is registered and the bridge has its file, it is kept. When one is
+     in `/opt/cortados-office/stage/` and removes the temp copy (`wipe_rm`: overwritten with zeros,
+     then unlinked; macOS `rm -P` "has no effect", and on APFS the overwrite is best effort, so what
+     counts is the unlink). Every temp file that ever holds a secret is registered before it is made
+     (`SECRET_TMP`) and wiped on every exit, a failure or a signal included, not only on success. When a slot is registered and the bridge has its file, it is kept. When one is
      registered but the file is missing, the run stops before any change and asks for
      `--rotate-office-token`. A rotation mints the new token into the **other** slot the same way;
      the running bridge's token stays registered and working until the new release is committed
      (step 8). A token registered by a run that then fails is revoked on exit.
-   - **Bridge secret** (bridge + Studio) and **Studio access token** (Studio only): each is
-     `openssl rand -hex 32` under `umask 077`, installed 0600 per role user. They are made only
-     when missing.
+   - **Bridge secret** (the bridge's `secrets/bridge-token`, the file it checks through
+     `CORTADOS_OFFICE_BRIDGE_TOKEN_FILE`) and **Studio access token** (Studio only): each is
+     `openssl rand -hex 32` under `umask 077`, written 0600 by its role user into its own
+     `secrets/` (never by root). They are made only
+     when missing. Studio's copy of the bridge secret is its settings file (next item). An older
+     install's `home/studio/secrets/gateway-token` is no longer read or made; it is left in place
+     because the previous launcher, which a rollback restores, still reads it at start.
+   - **Studio's gateway settings**, `/opt/cortados-office/home/studio/.openclaw/claw3d/settings.json`.
+     This is the only place Claw3D 51337f7's gateway proxy takes its upstream from
+     (`server/studio-settings.js` `loadUpstreamGatewaySettings`: `<state dir>/claw3d/settings.json`,
+     then `openclaw.json`, then `ws://localhost:18789` with **no token**). Without it every
+     `connect` is refused with `studio.gateway_token_missing`. The launcher sets the state dir
+     explicitly (`OPENCLAW_STATE_DIR=/opt/cortados-office/home/studio/.openclaw`, the same path
+     Claw3D would default to for this user), so the path does not depend on launchd's `HOME`.
+     Contents: `{"version": 1, "gateway": {"url": "ws://localhost:18789", "token": <bridge secret>,
+     "adapterType": "openclaw"}}`. On every run it is rebuilt from the bridge secret by
+     `studio-settings.py`: the secret is read as `_cortados-office` and piped to its stdin (never
+     argv, never printed); an existing file is read as `_cortados-claw3d` and its other keys
+     (Studio's own UI state: avatars, floors, desks) are kept, only `gateway` is replaced; a file
+     that is not a JSON object stops the run before any change. The result is written 0600 in the
+     owner's private temp dir, staged 0600 in root's `stage/`, and installed by the transaction
+     (step 7) **as `_cortados-claw3d`**, so a rollback restores the previous file. The state dir and
+     its `claw3d/` are `_cortados-claw3d` 0700. The run stops if either, or the file, is a symbolic
+     link (an unknown layout); that check is not what keeps root safe, the user-only writes are.
 6. **Launchers and LaunchDaemons, staged.** It writes the root-owned launchers `run-bridge.sh`
    and `run-studio.sh` and the plists `com.cortados.office-{bridge,studio}.plist` into
    `/opt/cortados-office/stage/` (root, 0700), not over the live ones. The launchers set paths and
-   ports and read the secret files at start; Studio always gets `STUDIO_ACCESS_TOKEN`. The plists
+   ports and read the secret files at start; Studio always gets `STUDIO_ACCESS_TOKEN` and
+   `OPENCLAW_STATE_DIR` (its settings file, step 5). Studio also gets `UPSTREAM_ALLOWLIST=localhost`,
+   the hostname of the settings file's URL (`ws://localhost:18789`, both built from one
+   `GATEWAY_HOST` pin): Claw3D 51337f7 refuses **every** upstream when `NODE_ENV=production` and the
+   allowlist is empty, so without it the browser's `connect` gets `studio.gateway_url_blocked` and
+   the Office stays "CONNECTING" with 0 agents (#77, seen live on 2026-11-24). The allowlist names a
+   hostname only: Claw3D compares no port, so it allows any port on `localhost`. The port, and so the
+   bridge, is pinned by the settings file's URL. The plists
    set `UserName` = the role user, RunAtLoad, KeepAlive, logs under `/opt/cortados-office/log-*`.
 7. **Activate, as one transaction** (`tx_run` in `deploy-lib.sh`). Only after steps 2–6 succeed:
    - it repoints `node`, `adapter` and `claw3d/current` to the staged versions (`ln -sfn` to
      `<link>.new`, then `mv -fh` over the link: a rename), remembering each old target;
-   - it installs the staged launchers, plists and any new office token over the live ones (copy to
-     `<file>.next`, then rename), each replaced file first copied to `<file>.prev`;
+   - it installs the staged launchers, plists, Studio's settings file and any new office token over
+     the live ones, each replaced file first copied to `<file>.prev`. Launchers and plists (root's
+     directories): root copies to `<file>.next`, then renames. The office token and Studio's settings
+     (role users' directories): as the owning role user, from root's `stage/` on stdin into a new
+     `mktemp` file, then renamed; the `.prev` copy, its restore on a rollback and its removal at the
+     commit are done as that user too;
    - it restarts the daemons: one not loaded is bootstrapped, one loaded is booted out, waited for
      (up to 10 s), then bootstrapped again;
-   - **health check**, for up to about 60 s, and again 10 s after it first passes: both daemons
+   - **health check**: no new attempt starts more than 60 s after the restart (an overall deadline,
+     `HEALTH_DEADLINE_S`, not a count of tries); one already running finishes on its own timeouts
+     (at most about 21 s: three 5 s curls and the 5 s probe). A pass must hold again 10 s later.
+     Worst case about 2 minutes before the rollback. The checks: both daemons
      `state = running`, the bridge answering on 127.0.0.1:18789, Studio 401 on `/` without the
-     cookie and 200 on `/cortados-login`, both listeners on loopback only.
+     cookie and 200 on `/cortados-login`, a `connect` through Studio's own proxy answered by the
+     bridge, both listeners on loopback only. The connect is end to end, as a browser does it
+     (`gateway-check.mjs`): a WebSocket to `127.0.0.1:3000/api/gateway/ws` with the `studio_access`
+     cookie, then an OpenClaw `connect` without credentials; Studio's proxy injects the token from
+     its settings file and forwards it, and only the bridge's `ok:true` hello passes (a missing
+     settings file fails as `studio.gateway_token_missing`, a stale token as `UNAUTHORIZED`). The access token is read as
+     `_cortados-claw3d` (as root, a link Studio planted there would send a root-readable file to
+     Studio's own port) and piped to the probe's stdin (never printed, never on a command line). Any error, refusal,
+     close or its 5 s deadline fails the check and the release rolls back. Reason: the first live
+     install passed every other check while Studio refused its upstream.
 
    **Any failure in it, or INT/TERM/HUP, rolls back:** both daemons are stopped, every step is
    undone in reverse (each file back from its `.prev`, each link to its old target, anything new
@@ -231,7 +291,11 @@ Not checked live: whether Studio's browser WebSocket (`/api/gateway/ws`) works t
 In Studio, the backend shows as the URL `ws://localhost:18789` with adapter type `openclaw`.
 Studio treats any adapter type it does not know as `openclaw`. The bridge reports
 `cortados-office` in its hello, and Studio's proxy only uses the type to decide whether a token
-is required, which it is. The proxy injects the token from `CLAW3D_GATEWAY_TOKEN` into `connect`.
+is required, which it is. The proxy injects the token from its settings file (step 5) into
+`connect`. It opens that upstream only because `UPSTREAM_ALLOWLIST` names its host (`localhost`, see
+step 6). Studio's settings page can change the gateway URL in that file (it is behind the access
+gate); the allowlist then still keeps it on `localhost`, and the next `deploy-air.sh --apply`
+rewrites the gateway entry back to the bridge.
 
 ## Checks after install
 
@@ -259,6 +323,30 @@ is required, which it is. The proxy injects the token from `CLAW3D_GATEWAY_TOKEN
 
   After `--publish-tailnet`, repeat the header check on `https://<air>.ts.net:8446/cortados-login`,
   then log in once from a real browser: that is the only end-to-end check.
+- The Office reaches its data (no token needed beyond the login): after logging in, the page
+  header's gateway status must leave "CONNECTING" within a few seconds and show it connected.
+  "OPENCLAW • CONNECTING" that stays, with 0 agents, means Studio's proxy cannot reach the bridge:
+  check that `/opt/cortados-office/bin/run-studio.sh` exports `UPSTREAM_ALLOWLIST=localhost` and
+  `OPENCLAW_STATE_DIR`, and look in `/opt/cortados-office/log-studio/err.log` for
+  `[gateway-proxy] refusing upstream`.
+- Studio's gateway settings file is in place, private, and names the bridge (prints no token; run
+  from `/`, since the role users cannot read your home):
+
+  ```sh
+  cd /
+  sudo stat -f '%Su %Lp %N' /opt/cortados-office/home/studio/.openclaw \
+    /opt/cortados-office/home/studio/.openclaw/claw3d \
+    /opt/cortados-office/home/studio/.openclaw/claw3d/settings.json
+  # must print _cortados-claw3d 700, _cortados-claw3d 700, _cortados-claw3d 600
+  sudo -u _cortados-claw3d python3 -I -c 'import json,sys; g=json.load(open(sys.argv[1]))["gateway"]; \
+    print(g["url"], g["adapterType"], "token set" if g.get("token") else "NO TOKEN")' \
+    /opt/cortados-office/home/studio/.openclaw/claw3d/settings.json
+  # must print: ws://localhost:18789 openclaw token set
+  cmp -s <(sudo -u _cortados-office cat /opt/cortados-office/home/bridge/secrets/bridge-token) \
+    <(sudo -u _cortados-claw3d python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["gateway"]["token"])' \
+      /opt/cortados-office/home/studio/.openclaw/claw3d/settings.json) && echo same || echo DIFFERENT
+  # must print same: Studio sends the token the bridge checks (DIFFERENT = re-run deploy-air.sh --apply)
+  ```
 - `/opt/cortados-office/log-bridge/err.log` holds one `Office bridge listening on 127.0.0.1:18789 (read-only)`
   line. Repeated `Office poll failed` lines mean the token or the provider is wrong.
 - In Studio's Office: one person per routed worker and one suited orchestrator per floor, wearing
@@ -278,7 +366,9 @@ lifecycle scripts by itself.
 
 Re-run `deploy-air.sh --apply` from a checkout at the new commit. It validates the existing
 install, stages the new adapter copy and Claw3D build beside the running ones, and switches only
-when they are complete. Secrets and the provider client are kept. If the build fails, the running
+when they are complete. Secrets and the provider client are kept. Studio's gateway settings file is
+rewritten from the bridge secret (its other keys kept), so an upgrade also repairs an install from
+before #77 fix round 1, which had none. If the build fails, the running
 Office is untouched; the next run deletes the failed build dir and tries again.
 
 To move Claw3D itself, change `CLAW3D_COMMIT` and re-check both patches against the new commit:

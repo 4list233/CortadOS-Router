@@ -14,6 +14,8 @@ protocol, how it renders people and floors, and the remaining gaps.
 | `assets/` | sprites, floor tiles, preview; origin and licence in `assets/NOTICE.md` |
 | `claw3d/avatar-profile-hint.patch` | 6-line Claw3D change so the 3D figures wear the family suits |
 | `claw3d/studio-login.cjs`, `claw3d/studio-login.patch` | login form for Studio's access cookie (`/cortados-login`) and its 3-line wiring |
+| `gateway-check.mjs` | deploy-air.sh's end-to-end health probe: a `connect` through Studio's own proxy must get the bridge's hello |
+| `studio-settings.py` | builds Studio's gateway settings file (`<state dir>/claw3d/settings.json`: the bridge URL and secret), the only upstream config Claw3D's proxy reads |
 | `DEPLOY.md`, `deploy-air.sh`, `deploy-lib.sh` | Air runbook, script (install / upgrade / tailnet publish) and its pure checks, written and **not run** |
 
 ## Test

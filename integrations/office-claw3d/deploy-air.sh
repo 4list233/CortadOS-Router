@@ -32,6 +32,13 @@ BRIDGE_USER="_cortados-office"; BRIDGE_UID=480; BRIDGE_HOME="$ROOT/home/bridge"
 STUDIO_USER="_cortados-claw3d"; STUDIO_UID=481; STUDIO_HOME="$ROOT/home/studio"
 ROLE_SHELL="/usr/bin/false"; ROLE_GID=20; ROLE_REALNAME="CortadOS Office role user"
 BRIDGE_PORT=18789                          # Claw3D's default upstream gateway port
+# Studio's upstream is the loopback bridge, named by this one host. The URL in Studio's settings file
+# (below) and Claw3D's UPSTREAM_ALLOWLIST (compared with `new URL(url).hostname`) are both built from
+# it, so they cannot drift. `localhost`: the bridge allows the Origin Studio's proxy derives from it
+# (bridge.mjs). The allowlist names a hostname only (Claw3D compares no port); the port is pinned by
+# the settings file's URL.
+GATEWAY_HOST=localhost
+GATEWAY_URL="ws://$GATEWAY_HOST:$BRIDGE_PORT"
 STUDIO_PORT=3000
 # The tailnet HTTPS port for Studio. The Air already serves 443 (Funnel: /mcp only) and 8444
 # (Serve: the provider); --publish-tailnet refuses any port already in `tailscale serve status`.
@@ -43,8 +50,21 @@ CLIENT_SLOTS=(claw3d-office claw3d-office-b)
 BRIDGE_LABEL="com.cortados.office-bridge"; STUDIO_LABEL="com.cortados.office-studio"
 OFFICE_TOKEN="$BRIDGE_HOME/secrets/office-token"
 BRIDGE_SECRET="$BRIDGE_HOME/secrets/bridge-token"
+# Only read by launchers before #77 fix round 1 (as CLAW3D_GATEWAY_TOKEN, which Claw3D's proxy ignores): no
+# longer created or used; an existing one is left for a rollback to the previous launcher (step 5b).
 GATEWAY_SECRET="$STUDIO_HOME/secrets/gateway-token"
 ACCESS_TOKEN="$STUDIO_HOME/secrets/studio-access-token"
+# Claw3D's state dir, set explicitly in run-studio.sh (OPENCLAW_STATE_DIR) so the path does not hang
+# on launchd's HOME. It is the same path Claw3D defaults to for this user (<home>/.openclaw), so state
+# an earlier release wrote there is kept. Claw3D 51337f7's gateway proxy reads its upstream ONLY from
+# <stateDir>/claw3d/settings.json {gateway:{url,token,adapterType}} (server/studio-settings.js
+# loadUpstreamGatewaySettings), never from CLAW3D_GATEWAY_URL/_TOKEN: without this file it falls
+# back to ws://localhost:18789 with no token and refuses every connect (studio.gateway_token_missing).
+STUDIO_STATE="$STUDIO_HOME/.openclaw"
+STUDIO_SETTINGS="$STUDIO_STATE/claw3d/settings.json"
+# The health check's first pass must start within this many seconds of the restart (a check that is
+# running then finishes on its own timeouts, at most about 21 s), and then hold 10 s later.
+HEALTH_DEADLINE_S=60
 STAGE="$ROOT/stage"                        # root 0700: launchers, plists and a new token, before activation
 ADAPTER_FILES=(adapter.mjs bridge.mjs sprites.mjs claw3d/avatar-profile-hint.patch claw3d/studio-login.patch
   claw3d/studio-login.cjs)
@@ -87,6 +107,22 @@ as_root_test() {
   local a; a="$(root_test "$@")" || die "cannot check 'test $*' as root (sudo or test failed): refusing to guess"
   [[ "$a" == yes ]]
 }
+# Root never writes inside a directory a role user owns (#77 fix round 2). Such a user can swap any
+# path component there for a link at any moment, after every check, so a write as root through it
+# could overwrite any file on the machine (shown by the review with settings.json.next planted as a
+# link to a root-owned file). Every write there is done AS the owning role user instead: a link it
+# planted then reaches only what it could write anyway. Root still reads the staged content from its
+# own 0700 STAGE and passes it on stdin.
+# role_write: stdin -> DEST, written as USER, 0600 (umask), through a new file mktemp creates
+# exclusively beside DEST (never an existing name, never a link), then renamed over DEST; the temp
+# file is removed if the copy or the rename fails.
+role_write() {  # user dest < content
+  sudo -u "$1" /bin/sh -c 'umask 077; t="$(mktemp "$1.next.XXXXXX")" || exit 1
+if cat > "$t" && mv -f "$t" "$1"; then exit 0; fi
+rm -f "$t"; exit 1' role-write "$2"
+}
+role_write_from() { role_write "$1" "$3" < "$2"; }        # user source dest (source readable by the caller)
+promote_as() { sudo cat "$2" | role_write "$1" "$3"; }    # user staged dest (staged: root's STAGE)
 
 # ---- preconditions common to every mode (they only read) -----------------------------
 step "Preconditions ($MODE)"
@@ -130,6 +166,9 @@ if [[ $MODE != install ]]; then
   [[ -f "$ROOT/bin/run-studio.sh" ]] || die "install first (no $ROOT/bin/run-studio.sh)"
   as_root_test -s "$ACCESS_TOKEN" || die "Studio has no access token file: re-run the install first"
   grep -q 'STUDIO_ACCESS_TOKEN' "$ROOT/bin/run-studio.sh" || die "the installed launcher predates the access token: re-run the install"
+  grep -q 'UPSTREAM_ALLOWLIST' "$ROOT/bin/run-studio.sh" || die "the installed launcher predates the upstream allowlist (the Office cannot reach its bridge): re-run the install"
+  grep -q 'OPENCLAW_STATE_DIR' "$ROOT/bin/run-studio.sh" || die "the installed launcher predates Studio's gateway settings file (the Office cannot reach its bridge): re-run the install"
+  as_root_test -s "$STUDIO_SETTINGS" || die "Studio has no gateway settings file ($STUDIO_SETTINGS): re-run the install"
   # The gate must already be on, on loopback, before anything is published: / refuses without the
   # cookie and the login form answers.
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$STUDIO_PORT/" || true)"
@@ -254,16 +293,22 @@ if [[ "$CURRENT_BUILD" == "$BUILD" && ! -f "$BUILD/.cortados-build-ok" ]]; then
   die "$BUILD is current but has no build marker: investigate"
 fi
 
+# Studio's state dir and settings file: a link here is an unknown layout, so the run stops before any
+# change. This is NOT what keeps root safe (the Studio user can plant a link after this check): root
+# never writes there, every write is done as $STUDIO_USER (role_write, fs_* below, #77 fix round 2).
+for f in "$STUDIO_STATE" "$STUDIO_STATE/claw3d" "$STUDIO_SETTINGS"; do
+  if as_root_test -L "$f"; then die "$f is a symbolic link: refusing to write through it (move it aside first)"; fi
+done
 # An activation that was killed outright (no rollback ran) leaves the previous files as .prev.
 for f in "$ROOT/bin/run-bridge.sh" "$ROOT/bin/run-studio.sh" "/Library/LaunchDaemons/$BRIDGE_LABEL.plist" \
-         "/Library/LaunchDaemons/$STUDIO_LABEL.plist" "$OFFICE_TOKEN"; do
+         "/Library/LaunchDaemons/$STUDIO_LABEL.plist" "$OFFICE_TOKEN" "$STUDIO_SETTINGS"; do
   if as_root_test -e "$f.prev"; then
     die "$f.prev exists: an earlier activation was interrupted. It is the previous version: restore it (sudo mv) or delete it, then re-run"
   fi
 done
 
 # Secrets: kept when present, made when absent. The provider client is explicit, in one slot.
-CLIENTS_LIST="$(PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients list)" || die "cannot list the provider's clients"
+CLIENTS_LIST="$(clients_cli list)" || die "cannot list the provider's clients"
 LIVE_SLOT=""
 for s in "${CLIENT_SLOTS[@]}"; do
   line="$(printf '%s\n' "$CLIENTS_LIST" | awk -v n="$s:" '$1 == n')"
@@ -272,10 +317,10 @@ for s in "${CLIENT_SLOTS[@]}"; do
   [[ -z "$LIVE_SLOT" ]] || die "both $LIVE_SLOT and $s are registered (an interrupted rotation): remove the one the bridge does not use"
   LIVE_SLOT="$s"
 done
-HAVE_OFFICE=0; HAVE_BRIDGE_PAIR=0; HAVE_ACCESS=0
+HAVE_OFFICE=0; HAVE_BRIDGE_SECRET=0; HAVE_ACCESS=0
 if [[ $UPGRADE -eq 1 ]]; then
   as_root_test -s "$OFFICE_TOKEN" && HAVE_OFFICE=1
-  as_root_test -s "$BRIDGE_SECRET" && as_root_test -s "$GATEWAY_SECRET" && HAVE_BRIDGE_PAIR=1
+  as_root_test -s "$BRIDGE_SECRET" && HAVE_BRIDGE_SECRET=1
   as_root_test -s "$ACCESS_TOKEN" && HAVE_ACCESS=1
 fi
 NEW_SLOT=""
@@ -292,24 +337,60 @@ fi
 
 [[ $UPGRADE -eq 1 ]] && kind=upgrade || kind="fresh install"
 echo "  ok: checkout $SRC_SHA (clean), provider reachable on loopback; $kind"
-echo "  plan: node $NODE_PLAN, build $BUILD_ID, office token $TOKEN_PLAN${NEW_SLOT:+ (as $NEW_SLOT)}, bridge secret $([[ $HAVE_BRIDGE_PAIR -eq 1 ]] && echo keep || echo make)," \
-  "studio access token $([[ $HAVE_ACCESS -eq 1 ]] && echo keep || echo make)"
+echo "  plan: node $NODE_PLAN, build $BUILD_ID, office token $TOKEN_PLAN${NEW_SLOT:+ (as $NEW_SLOT)}, bridge secret $([[ $HAVE_BRIDGE_SECRET -eq 1 ]] && echo keep || echo make)," \
+  "studio access token $([[ $HAVE_ACCESS -eq 1 ]] && echo keep || echo make), studio gateway settings rewritten from the bridge secret"
 for label in "$BRIDGE_LABEL" "$STUDIO_LABEL"; do
   loaded "$label" && echo "  $label is loaded: it is restarted after the switch (and again with the old release on a rollback)" || true
 done
 [[ $APPLY -eq 1 ]] || echo "  DRY RUN: nothing below is executed. Re-run with --apply."
 
-TMP="$(mktemp -d)"   # 0700, the owner's
+# Every file in TMP that ever holds a secret, registered here, before any of them is made: cleanup
+# wipes them (wipe_rm, deploy-lib.sh) on every exit, a die, a failed step or a signal, not only on
+# the success path (#77 fix round 2).
+SECRET_TMP=(office-token office-header bridge-token access-token studio-settings.json studio-settings.old)
 # A client registered by this run stays only once its release is committed: any other exit revokes it.
 PENDING_CLIENT=""
-on_exit() {
+# After the commit, the client the old release used (a rotation): no daemon uses it any more, so an
+# exit before step 8 has revoked it revokes it. Never both set: tx_on_commit moves one to the other.
+RETIRED_CLIENT=""
+TMP=""
+CLEANED=0
+cleanup() {  # runs once; a signal arriving while it runs is ignored, so it is never cut short
+  trap '' INT TERM HUP
+  [[ $CLEANED -eq 0 ]] || return 0
+  CLEANED=1
   if [[ -n "$PENDING_CLIENT" && $APPLY -eq 1 ]]; then
-    PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients remove "$PENDING_CLIENT" >&2 \
+    clients_cli remove "$PENDING_CLIENT" >&2 \
       || echo "deploy-air: could not revoke $PENDING_CLIENT: remove it with clients remove" >&2
   fi
-  rm -rf "$TMP"
+  if [[ -n "$RETIRED_CLIENT" && $APPLY -eq 1 ]]; then
+    clients_cli remove "$RETIRED_CLIENT" >&2 \
+      || echo "deploy-air: could not revoke the old $RETIRED_CLIENT (the bridge uses the new one): check clients list" >&2
+  fi
+  if [[ -n "$TMP" ]]; then
+    wipe_rm "${SECRET_TMP[@]/#/$TMP/}" || echo "deploy-air: could not remove every secret from $TMP: remove it now" >&2
+    rm -rf "$TMP"
+  fi
 }
+on_exit() { cleanup; }
+# Called by tx_run (deploy-lib.sh) at the commit point, with INT/TERM/HUP deferred, so the two moves
+# are one step to a signal (#77 fix round 4). From here the new client is the live one: no handler
+# may revoke it. The old slot, when rotated, is no daemon's any more: an exit before step 8 revokes it.
+tx_on_commit() {
+  if [[ -n "$PENDING_CLIENT" && ${TOKEN_PLAN:-} == rotate ]]; then RETIRED_CLIENT="$LIVE_SLOT"; fi
+  PENDING_CLIENT=""
+}
+# Reason (#77 fix round 3): bash does NOT run the EXIT trap when an untrapped SIGTERM/SIGINT/SIGHUP
+# kills it (reproduced with /bin/bash: exit 143, nothing wiped), so each signal has its own handler:
+# the same cleanup, then exit 128+signal (which also runs EXIT; cleanup runs only once). Installed
+# before TMP exists. During activation tx_run (deploy-lib.sh) replaces them with its rollback handlers
+# (a trap replacement is atomic: there is no moment without a handler) and puts these back after.
+on_signal() { cleanup; exit $((128 + $1)); }
 trap on_exit EXIT
+trap 'on_signal 2' INT
+trap 'on_signal 15' TERM
+trap 'on_signal 1' HUP
+TMP="$(mktemp -d)"   # 0700, the owner's
 
 # ---- 1. role users (hidden, no shell, no login) --------------------------------------
 step "1. Role users $BRIDGE_USER (bridge, holds office:read) and $STUDIO_USER (Claw3D Studio)"
@@ -330,9 +411,14 @@ create_user "$STUDIO_USER" "$STUDIO_UID" "$STUDIO_HOME" "$STUDIO_ACCOUNT"
 run sudo install -d -o root -g wheel -m 0755 "$ROOT" "$ROOT/home" "$ROOT/bin" "$ROOT/adapters"
 run sudo rm -rf "$STAGE"
 run sudo install -d -o root -g wheel -m 0700 "$STAGE"
-run sudo install -d -o "$BRIDGE_USER" -g staff -m 0700 "$BRIDGE_HOME" "$BRIDGE_HOME/secrets" "$ROOT/log-bridge"
-run sudo install -d -o "$STUDIO_USER" -g staff -m 0700 "$STUDIO_HOME" "$STUDIO_HOME/secrets" "$ROOT/log-studio"
-run sudo install -d -o "$STUDIO_USER" -g staff -m 0755 "$ROOT/claw3d" "$ROOT/claw3d/builds"
+# As root only in root-owned $ROOT and $ROOT/home; inside a role user's own directory, as that user
+# (install -d as root would chown/chmod through a link the user planted there).
+run sudo install -d -o "$BRIDGE_USER" -g staff -m 0700 "$BRIDGE_HOME" "$ROOT/log-bridge"
+run sudo install -d -o "$STUDIO_USER" -g staff -m 0700 "$STUDIO_HOME" "$ROOT/log-studio"
+run sudo install -d -o "$STUDIO_USER" -g staff -m 0755 "$ROOT/claw3d"
+run sudo -u "$BRIDGE_USER" install -d -m 0700 "$BRIDGE_HOME/secrets"
+run sudo -u "$STUDIO_USER" install -d -m 0755 "$ROOT/claw3d/builds"
+run sudo -u "$STUDIO_USER" install -d -m 0700 "$STUDIO_HOME/secrets" "$STUDIO_STATE" "$STUDIO_STATE/claw3d"
 
 # ---- 2. Node (pinned tarball, hash-checked, private to /opt/cortados-office) ---------
 step "2. Node $NODE_VERSION in $ROOT/node (no Homebrew, nothing on the system PATH): $NODE_PLAN"
@@ -382,7 +468,7 @@ else
 fi
 
 # ---- 5. secrets (never printed, never on argv) ----------------------------------------
-step "5. Secrets: office:read token ($TOKEN_PLAN), bridge secret, Studio access token"
+step "5. Secrets: office:read token ($TOKEN_PLAN), bridge secret, Studio access token, Studio gateway settings"
 # 5a. the provider's scoped client token, minted as the owner into the free slot, checked against
 #     the provider and STAGED for the bridge user. The running bridge keeps its own token, still
 #     registered, until the new release is committed (step 8); only then is the old slot revoked.
@@ -390,34 +476,67 @@ office_token_ok() {  # token-file: the provider answers 200 to it (the header go
   local code
   (umask 077; printf 'x-cortados-token: %s\n' "$(cat "$1")" > "$TMP/office-header")
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H @"$TMP/office-header" "$PROVIDER_OFFICE_URL" || true)"
-  rm -P "$TMP/office-header"
+  wipe_rm "$TMP/office-header"
   [[ "$code" == 200 ]]
 }
 if [[ $TOKEN_PLAN != keep ]]; then
-  run env PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients add "$NEW_SLOT" --scope office:read --token-file "$TMP/office-token"
+  run clients_cli add "$NEW_SLOT" --scope office:read --token-file "$TMP/office-token"
   if [[ $APPLY -eq 1 ]]; then
     PENDING_CLIENT="$NEW_SLOT"
     office_token_ok "$TMP/office-token" || die "the provider does not accept the new $NEW_SLOT token: revoked, nothing switched"
   fi
   run sudo install -o "$BRIDGE_USER" -g staff -m 0600 "$TMP/office-token" "$STAGE/office-token"
-  run rm -P "$TMP/office-token"
+  run wipe_rm "$TMP/office-token"
 fi
 # 5b. a local secret shared by the bridge and Studio (NOT the office token: Studio may hand its
-#     upstream token to the browser, so it only ever opens this read-only bridge)
+#     upstream token to the browser, so it only ever opens this read-only bridge). The bridge checks
+#     BRIDGE_SECRET; Studio's copy is the token in its settings file (5d). An older install's
+#     $GATEWAY_SECRET is left in place, unused by this release: the previous launcher, which a
+#     rollback restores, still reads it at start.
 new_secret() { if [[ $APPLY -eq 1 ]]; then (umask 077; openssl rand -hex 32 > "$1"); fi; }
-if [[ $HAVE_BRIDGE_PAIR -eq 0 ]]; then
+if [[ $HAVE_BRIDGE_SECRET -eq 0 ]]; then
   new_secret "$TMP/bridge-token"
-  run sudo install -S -o "$BRIDGE_USER" -g staff -m 0600 "$TMP/bridge-token" "$BRIDGE_SECRET"
-  run sudo install -S -o "$STUDIO_USER" -g staff -m 0600 "$TMP/bridge-token" "$GATEWAY_SECRET"
-  run rm -P "$TMP/bridge-token"
+  run role_write_from "$BRIDGE_USER" "$TMP/bridge-token" "$BRIDGE_SECRET"   # its own secrets dir: as the user
+  run wipe_rm "$TMP/bridge-token"
 fi
 # 5c. Studio's own access token: its access gate is always on, loopback included, so publishing
 #     on the tailnet never exposes an open Studio. The owner reads it once (DEPLOY.md "Viewing it").
 if [[ $HAVE_ACCESS -eq 0 ]]; then
   new_secret "$TMP/access-token"
-  run sudo install -S -o "$STUDIO_USER" -g staff -m 0600 "$TMP/access-token" "$ACCESS_TOKEN"
-  run rm -P "$TMP/access-token"
+  run role_write_from "$STUDIO_USER" "$TMP/access-token" "$ACCESS_TOKEN"
+  run wipe_rm "$TMP/access-token"
 fi
+# 5d. Studio's gateway settings, the only place Claw3D's proxy takes its upstream from (see
+#     STUDIO_SETTINGS above): url = GATEWAY_URL, token = the bridge secret, adapterType openclaw.
+#     Rewritten on every run from BRIDGE_SECRET (idempotent; a rotated secret follows), keeping the
+#     installed file's other keys (Studio's own UI state). STAGED here and installed by the
+#     transaction (step 7), so a rollback puts the previous file back. The token goes file -> pipe ->
+#     studio-settings.py's stdin -> a 0600 file in the owner's 0700 TMP: never argv, never printed.
+#     Each file is read as its own role user, not root (no privilege for a link swapped in later).
+#     Exit codes, not die, inside: the caller dies once, with the reason. Both TMP files are wiped
+#     whenever stage_studio_settings returns, failed or not (and by cleanup if the run is killed or signalled).
+build_studio_settings() {  # 0 built and staged; 1 failed (reason on stderr). Leaves its TMP files.
+  local ex
+  (umask 077; : > "$TMP/studio-settings.old") || return 1
+  ex="$(root_test -e "$STUDIO_SETTINGS")" || { echo "cannot check whether $STUDIO_SETTINGS exists" >&2; return 1; }
+  if [[ "$ex" == yes ]]; then
+    sudo -u "$STUDIO_USER" cat "$STUDIO_SETTINGS" > "$TMP/studio-settings.old" \
+      || { echo "cannot read $STUDIO_SETTINGS as $STUDIO_USER" >&2; return 1; }
+  fi
+  (set -o pipefail; umask 077; sudo -u "$BRIDGE_USER" cat "$BRIDGE_SECRET" \
+    | python3 -I "$HERE/studio-settings.py" --url "$GATEWAY_URL" --existing "$TMP/studio-settings.old" \
+    > "$TMP/studio-settings.json") || { echo "cannot build the settings from $BRIDGE_SECRET" >&2; return 1; }
+  sudo install -o "$STUDIO_USER" -g staff -m 0600 "$TMP/studio-settings.json" "$STAGE/studio-settings.json" \
+    || { echo "cannot stage $STAGE/studio-settings.json" >&2; return 1; }
+}
+stage_studio_settings() {  # 0 staged; 1 failed (reason on stderr). No token-bearing TMP file outlives it.
+  local rc=0
+  build_studio_settings || rc=$?
+  wipe_rm "$TMP/studio-settings.json" "$TMP/studio-settings.old" || { echo "cannot remove the settings from $TMP" >&2; rc=1; }
+  return $rc
+}
+printf '  stage %s (%s, 0600: gateway %s + the bridge secret) -> %s\n' "$STAGE/studio-settings.json" "$STUDIO_USER" "$GATEWAY_URL" "$STUDIO_SETTINGS"
+if [[ $APPLY -eq 1 ]]; then stage_studio_settings || die "cannot stage Studio's gateway settings (see above): nothing switched"; fi
 
 # ---- 6. launchers + LaunchDaemons, staged (they only name stable paths) -----------------
 step "6. Stage launchers and LaunchDaemons (system domain, UserName = role user, RunAtLoad, KeepAlive)"
@@ -444,11 +563,17 @@ write_root_file run-studio.sh 0755 <<EOF
 # Air or through tailscale serve, logs in at /cortados-login (claw3d/studio-login.cjs).
 set -euo pipefail
 export HOST=127.0.0.1 PORT=$STUDIO_PORT NODE_ENV=production NEXT_TELEMETRY_DISABLED=1
-export CLAW3D_GATEWAY_URL="ws://localhost:$BRIDGE_PORT"
-export CLAW3D_GATEWAY_ADAPTER_TYPE=openclaw
-CLAW3D_GATEWAY_TOKEN="\$(cat "$GATEWAY_SECRET")"
+# Claw3D's state dir: its gateway proxy takes the upstream URL and token ONLY from
+# \$OPENCLAW_STATE_DIR/claw3d/settings.json (deploy-air.sh writes it: $GATEWAY_URL + the bridge
+# secret). No CLAW3D_GATEWAY_URL/_TOKEN here: Claw3D 51337f7's proxy ignores them (#77).
+export OPENCLAW_STATE_DIR="$STUDIO_STATE"
+# Claw3D 51337f7 (server/gateway-proxy.js isUpstreamAllowed) refuses EVERY upstream when NODE_ENV is
+# production and this is empty ("studio.gateway_url_blocked": the Office stays "CONNECTING", #77).
+# The settings URL's hostname, nothing else. Claw3D compares hostnames only, so this allows any port
+# on localhost; the settings file pins the bridge's port.
+export UPSTREAM_ALLOWLIST="$GATEWAY_HOST"
 STUDIO_ACCESS_TOKEN="\$(cat "$ACCESS_TOKEN")"
-export CLAW3D_GATEWAY_TOKEN STUDIO_ACCESS_TOKEN
+export STUDIO_ACCESS_TOKEN
 cd "$ROOT/claw3d/current"
 exec "$NODE" server/index.js
 EOF
@@ -486,10 +611,18 @@ fs_exists() {  # 0 exists, 1 absent, 2 unknown (sudo or test failed): never exit
   case "$(root_test -e "$1" -o -L "$1")" in yes) return 0 ;; no) return 1 ;; *) return 2 ;; esac
 }
 fs_link() { switch_link "$1" "$2" "$3"; }
-fs_rm() { if [[ -n "$2" ]]; then run sudo -u "$2" rm -f "$1"; else run sudo rm -f "$1"; fi; }
-fs_backup() { run sudo cp -p "$1" "$1.prev"; }
-fs_promote() { run sudo cp -p "$1" "$2.next" && run sudo mv -f "$2.next" "$2"; }
-fs_restore() { run sudo mv -f "$1.prev" "$1"; }
+# USER set (a role user's directory): every write AS that user, never root (role_write, above). Empty:
+# root, only for root-owned directories ($ROOT/bin, /Library/LaunchDaemons).
+fs_rm() { if [[ -n "${2:-}" ]]; then run sudo -u "$2" rm -f "$1"; else run sudo rm -f "$1"; fi; }
+fs_backup() {  # dest user: a .prev left there (planted after the preflight) is replaced, never written through
+  if [[ -n "${2:-}" ]]; then run sudo -u "$2" /bin/sh -c 'rm -f "$1.prev" && cp -p "$1" "$1.prev"' fs-backup "$1"
+  else run sudo cp -p "$1" "$1.prev"; fi
+}
+fs_promote() {  # staged dest user
+  if [[ -n "${3:-}" ]]; then run promote_as "$3" "$1" "$2"
+  else run sudo cp -p "$1" "$2.next" && run sudo mv -f "$2.next" "$2"; fi
+}
+fs_restore() { if [[ -n "${2:-}" ]]; then run sudo -u "$2" mv -f "$1.prev" "$1"; else run sudo mv -f "$1.prev" "$1"; fi; }
 daemon_loaded() { launchd_state "$1"; }   # 0 / 1 / 2 unknown: returns, never exits (tx_*)
 daemon_start() { run sudo launchctl bootstrap system "/Library/LaunchDaemons/$1.plist"; }
 daemon_stop() {
@@ -517,27 +650,45 @@ office_healthy() {  # prints why not, on failure
   [[ "$(http_code "http://127.0.0.1:$BRIDGE_PORT/")" == 426 ]] || { echo "the bridge does not answer on 127.0.0.1:$BRIDGE_PORT"; return 1; }
   [[ "$(http_code "http://127.0.0.1:$STUDIO_PORT/")" == 401 ]] || { echo "Studio does not refuse a request without its access cookie"; return 1; }
   [[ "$(http_code "http://127.0.0.1:$STUDIO_PORT/cortados-login")" == 200 ]] || { echo "the login form does not answer"; return 1; }
+  # End to end, as the browser does: through Studio's own proxy (/api/gateway/ws, behind its access
+  # gate) an OpenClaw `connect`, which the proxy forwards with its gateway token; only the bridge's
+  # ok:true hello passes (gateway-check.mjs). Reason: on 2026-11-24 every check above passed while
+  # the proxy refused its upstream (studio.gateway_url_blocked) and the Office showed 0 agents.
+  # The access token goes file -> pipe -> stdin: never printed, never on a command line. Read as
+  # $STUDIO_USER, not root: the path is in Studio's home and the probe sends what it reads to Studio's
+  # port, so as root a link planted there would hand Studio any root-readable file (#77 fix round 2).
+  # Fails closed: a refused sudo (pipefail), a refusal, a close or the 5 s deadline all fail.
+  local gw
+  gw="$(sudo -u "$STUDIO_USER" cat "$ACCESS_TOKEN" 2>/dev/null | "$NODE" "$HERE/gateway-check.mjs" --port "$STUDIO_PORT" --timeout-ms 5000 2>/dev/null)" \
+    && [[ "$gw" == ok ]] || { echo "Studio's gateway proxy does not reach the bridge (${gw:-no answer})"; return 1; }
   # 0 only on a successful lsof listing loopback listeners on both ports (deploy-lib.sh): a refused
   # sudo or an unreadable answer fails the health check, so the transaction rolls back
   listeners_loopback_only "$BRIDGE_PORT" "$STUDIO_PORT" || return 1
 }
-health_check() {  # up to ~60 s for both daemons to come up, then the same checks must hold 10 s later
-  [[ $APPLY -eq 1 ]] || { echo "  (dry run) health check: both daemons running, bridge 426, Studio 401 on /, 200 on /cortados-login, loopback only"; return 0; }
-  local why="" i
-  for i in $(seq 1 30); do
+# Bounded by an overall deadline, not a try count (reason: 30 tries of a check that can take ~21 s
+# each, the probe's 5 s and three 5 s curls, could run ~210 s with no output). No new attempt starts
+# after HEALTH_DEADLINE_S; one already running finishes on its own timeouts. A pass is confirmed by a
+# second full check 10 s later. Worst case: ~60 + 21 + 10 + 21 s, about 2 minutes.
+health_check() {
+  [[ $APPLY -eq 1 ]] || { echo "  (dry run) health check: both daemons running, bridge 426, Studio 401 on /, 200 on /cortados-login, a connect through Studio's proxy answered by the bridge, loopback only"; return 0; }
+  local why="not checked" deadline=$((SECONDS + HEALTH_DEADLINE_S))
+  while (( SECONDS < deadline )); do
     if why="$(office_healthy)"; then
       sleep 10
-      why="$(office_healthy)" && { echo "  healthy: both daemons running on loopback, Studio gated (401), login form 200"; return 0; }
+      why="$(office_healthy)" && { echo "  healthy: both daemons running on loopback, Studio gated (401), login form 200, gateway connect ok"; return 0; }
     fi
     sleep 2
   done
-  echo "deploy-air: health check: $why" >&2; return 1
+  echo "deploy-air: health check (deadline ${HEALTH_DEADLINE_S} s): $why" >&2; return 1
 }
 TX_LINKS=("$ROOT/node-$NODE_VERSION|$ROOT/node|" "$ADAPTER_DIR|$ROOT/adapter|" "$BUILD|$ROOT/claw3d/current|$STUDIO_USER")
 TX_FILES=("$STAGE/run-bridge.sh|$ROOT/bin/run-bridge.sh" "$STAGE/run-studio.sh|$ROOT/bin/run-studio.sh"
   "$STAGE/$BRIDGE_LABEL.plist|/Library/LaunchDaemons/$BRIDGE_LABEL.plist"
   "$STAGE/$STUDIO_LABEL.plist|/Library/LaunchDaemons/$STUDIO_LABEL.plist")
-[[ $TOKEN_PLAN == keep ]] || TX_FILES+=("$STAGE/office-token|$OFFICE_TOKEN")
+# The third field: the role user owning the destination's directory, who does every write there
+# (fs_*, #77 fix round 2). The launchers and plists live in root-owned directories: root.
+[[ $TOKEN_PLAN == keep ]] || TX_FILES+=("$STAGE/office-token|$OFFICE_TOKEN|$BRIDGE_USER")
+TX_FILES+=("$STAGE/studio-settings.json|$STUDIO_SETTINGS|$STUDIO_USER")   # always: rewritten every run (5d)
 TX_LABELS=("$BRIDGE_LABEL" "$STUDIO_LABEL")
 tx_rc=0; tx_run || tx_rc=$?
 case $tx_rc in
@@ -549,10 +700,10 @@ esac
 # ---- 8. commit: the new release is healthy, so the old credential goes --------------------
 step "8. Commit"
 if [[ $TOKEN_PLAN == rotate ]]; then
-  run env PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients remove "$LIVE_SLOT" \
+  run clients_cli remove "$LIVE_SLOT" \
     || echo "deploy-air: could not revoke $LIVE_SLOT: remove it with clients remove (the bridge uses $NEW_SLOT)" >&2
 fi
-PENDING_CLIENT=""
+RETIRED_CLIENT=""   # PENDING_CLIENT was cleared at the commit point (tx_on_commit)
 run sudo rm -rf "$STAGE"
 if [[ $APPLY -eq 1 ]]; then tail -n 5 "$ROOT/log-bridge/err.log" 2>/dev/null | sed 's/^/  bridge: /' || true; fi
 

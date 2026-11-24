@@ -32,6 +32,7 @@ daemon_start() {
 daemon_stop() { if fail "stop:$1"; then return 1; fi; rm -f "$D/daemons/$1"; echo "stop $1" >> "$D/log"; }
 health_check() {
   if fail term; then kill -TERM $$; fi
+  if fail block; then : > "$D/blocking"; while :; do sleep 0.1; done; fi   # until a signal (deploy.test.mjs)
   if fail health; then return 1; fi
   echo health >> "$D/log"
 }
