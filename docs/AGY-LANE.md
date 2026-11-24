@@ -9,14 +9,33 @@ False and `core.resolve`'s fit gate refuses every agy route. The provider serves
 
 | Piece | Where | What |
 |---|---|---|
-| Isolation (one owner) | `cortados_router/agy_isolation.py` | Environment allowlist for every agy process (`HOME`, `USER`, `LOGNAME`, `TMPDIR`, `LANG`, `LC_*`, fixed `PATH`; `TERM` from the PTY). A `GEMINI_*` / `GOOGLE_*` / `AGY_*` / `CLOUDSDK_*` name in the router's shared env file (`$CORTADOS_HOME/env`) is a hard failure (`forbidden-env`); in the process environment it is dropped. Other vendors' variables are dropped, never fatal (that file serves their lanes too). The binary is a configured absolute path, never searched on PATH. A settings guard reads `~/.gemini/antigravity-cli/settings.json` (never writes it) and refuses MCP servers, `always-proceed` / `proceed-in-sandbox`, an API key or ADC; an unreadable file is refused (fail closed). |
+| Isolation (one owner) | `cortados_router/agy_isolation.py` | Environment allowlist for every agy process (`HOME`, `USER`, `LOGNAME`, `TMPDIR`, `LANG`, `LC_*`, fixed `PATH`; `TERM` from the PTY). A `GEMINI_*` / `GOOGLE_*` / `AGY_*` / `CLOUDSDK_*` name in the router's shared env file (`$CORTADOS_HOME/env`) is a hard failure (`forbidden-env`); in the process environment it is dropped. Other vendors' variables are dropped, never fatal (that file serves their lanes too). The binary is a configured absolute path, never searched on PATH. A settings guard reads `~/.gemini/antigravity-cli/settings.json` (never writes it) against an **allowlist** schema (below). One launch path: `agy_isolation.prepare` runs all of this before every agy process (the probe and `agy models`). |
 | Binary | provider `--agy-bin <absolute path>` (or `CORTADOS_AGY_BIN`) | Unset: the lane is **not configured** and never sampled (no PTY opened); the views say "not configured", not FAILED. |
 | Honest failures | `scarcity.tui_capture`, `scarcity._antigravity` | `binary-missing` (with `searched`), `exec-failed` (the child could not exec, or exited at once with no output; all lanes now raise on an exec failure instead of returning an empty screen), `not-logged-in`, `first-run-pending`, `forbidden-env`, `settings-refused`. |
-| Deny-all | `tui_capture(refuse=...)` | Enter is sent only for the existing workspace-trust prompt. A sign-in or first-run screen (before or after trust) closes the CLI at once with nothing typed. |
+| Deny-all | `tui_capture(refuse=...)` | Enter is sent only for the existing workspace-trust prompt. The refusal patterns are checked on every read and before every write, at every stage (boot, after trust, after `/usage`, while paging): a sign-in or first-run screen closes the CLI at once, and the error says truly what had been typed by then ("nothing was typed" only when nothing was). |
+| Pager | `scarcity._agy_next_page`, `parse_agy_usage`, `agy_usage_gaps` | agy 1.5.16 shows `/usage` in a scrollable pager ("(1–17 of 30 lines)", ↑/↓, pgdown, ctrl+end Bottom). The probe presses ↓ (navigation only, never text) until every group is read, the footer shows the last line, or a press stops moving the view. Each painted view is parsed on its own (a window counts only under a group header shown above it in the same view) and views are merged per group and window. A reading needs both pools (`gemini`, `claude-gpt`), each with its week and five-hour window, and the pager read to its end; anything less is `partial-reading` ("quota screen read only in part"), an error, never a healthy reading. ↓ rather than pgdown / ctrl+end: stepping one line shows every group that fits in a view whole in some view; a page jump can land with a group's header just above the top. |
 | Views | `usage._one_lane` / `live.subscriptions_section` (`state`), `core.subscription_readings` (`state`), `dashboard.html`, the cortados-pulse pane | The lane's state in words: "not configured", "not installed", "could not start", "not logged in", "first-run setup pending", "refused: …". The pane prints it in place of "last sample FAILED". |
 | Pools | `scarcity.agy_pool`, `unitcost._pool_of` | By `inventory.antigravity.models`, not a "gemini" substring. Unknown model: `pool_for` raises `UnknownAgyModel`; unit-cost learning charges it to no pool. |
-| Tables | `tables/inventory/agy.txt`, `routing-table.json` v21 `inventory.antigravity` | The 27 models agy 1.5.16 lists on the Air (2026-11-24). `gemini` pool: Gemini 4 Neon / Carbon / Argon / Hydrogen (Low … XHigh), the three Orchestrator pairings, Gemini 3.8 Flash (until 2026-11-30). `claude-gpt` pool: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B. R1's `Gemini 3.7 Flash (Medium)` was **removed** (no longer listed; a replacement is a band ruling, below). |
-| Inventory script | `bin/refresh-inventory.sh` | Runs only `$CORTADOS_AGY_BIN`, on the same allowlisted env; turns agy 1.5.16's space-padded columns into the tab format `build_tiers.py` reads. |
+| Tables | `tables/inventory/agy.txt`, `routing-table.json` v23 `inventory.antigravity` (rebased on #143's v21; v22 is the scarcity-v2-api-pacing branch's) | The 27 models agy 1.5.16 lists on the Air (2026-11-24). `gemini` pool: Gemini 4 Neon / Carbon / Argon / Hydrogen (Low … XHigh), the three Orchestrator pairings, Gemini 3.8 Flash (until 2026-11-30). `claude-gpt` pool: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B. R1's `Gemini 3.7 Flash (Medium)` was **removed** (no longer listed; a replacement is a band ruling, below). |
+| Inventory script | `bin/refresh-inventory.sh` | Never starts agy itself: it calls `python3 -B -m cortados_router.agy_isolation models` (`run_models` → `prepare`: absolute `CORTADOS_AGY_BIN` only, never PATH; allowlisted env; env-file ban; settings guard; an empty per-run folder) and turns agy 1.5.16's space-padded columns into the tab format `build_tiers.py` reads. Refused or not configured: exit 2, the reason on stderr, `agy.txt` left as it is. |
+
+### Settings guard: the allowlist (`agy_isolation.SETTINGS_SCHEMA`)
+
+The file must be a JSON object holding only these keys; anything else is refused (`settings-refused`), and so is a
+missing or unreadable file (fail closed: without the file the auth mode is unknown).
+
+| Key | Allowed | Why |
+|---|---|---|
+| `security.auth.selectedType` | **required**, exactly `"oauth-personal"` | The subscription login ("Login with Google"). Recorded 2026-11-24 from the owner's signed-in `~/.gemini/settings.json` on the Pro (the Gemini CLI file agy's settings descend from). `gemini-api-key` / `api-key`, `vertex-ai`, `compute-default-credentials` / `cloud-shell` / `adc` bill outside the Google AI Pro subscription and are named in the refusal. |
+| `ui.theme` (string), `ui.showStatusInTitle`, `ui.showMemoryUsage`, `ui.hideBanner`, `ui.hideTips`, `ui.footer.hideContextPercentage` (booleans) | as typed | Display only: how the screen is drawn, never what agy runs or how it bills. |
+| `ide.enabled` | `false` only | IDE integration on connects agy to an IDE companion server that can add tools; off is the absence of it. |
+| `ide.hasSeenNudge`, `hasSeenIdeIntegrationNudge` (booleans) | as typed | "Has seen the hint" flags. |
+
+Refused by name: `mcpServers` / `mcp`, `tools` (auto-accept, allowed tools), `approvalMode`, `autoAccept`, `yolo`; every
+other unknown key (`general.*`, `security.folderTrust`, ...) as "unknown setting". Values outside the known auth modes
+are never echoed (one may be a credential). **Owner check on the Air:** the guard's key names come from the Gemini CLI
+file on the Pro, not yet from agy 1.5.16's own file. If the lane says "refused: unsafe agy settings", send the key names
+of `~/.gemini/antigravity-cli/settings.json` (values may be redacted) and the schema is widened per key, with a reason.
 
 ### Saved conversations
 agy saves every interactive session: on start it prints "Resume with -c (or command below): agy --conversation=<uuid>".
@@ -31,7 +50,8 @@ The `/usage` parser and the refusal patterns are written against the format the 
 not a captured agy 1.5.16 screen. Fixture: `tests/fixtures/agy-usage-provisional.txt`. To confirm them, the owner sends
 (scrubbed of the account email; the plan name may stay):
 
-1. The full `/usage` screen in agy 1.5.16: every group header line (e.g. `GEMINI MODELS`), the "Models within this group"
+1. The full `/usage` screen in agy 1.5.16, scrubbed, as pasted (the round-1 fixture `tests/fixtures/agy-usage-pager.txt`
+   is reconstructed from the description of that screen: two groups, 30 lines, a 17-line view; replace it with the paste): every group header line (e.g. `GEMINI MODELS`), the "Models within this group"
    line, each "Weekly / Five Hour Limit Remaining NN.NN%" line and the "Refreshes in …" / "Quota available" lines, exactly
    as printed, plus which rendering mode was chosen (Alt-Screen or Inline).
 2. What a logged-out `agy` prints at start (the sign-in screen), if it can be seen without signing out the real login
@@ -59,7 +79,11 @@ agy 1.5.16 is installed at `~/.local/bin/agy` and signed in (Google AI Pro). The
    protocol first, (iii) accept agy's own permission mode as the boundary (weaker than the Codex rule; needs an explicit ruling).
 2. **Lifting the ceiling-0 containment.** Needs the 180,000-byte input guard and exact-session fit accounting, verified,
    and a re-measure of agy's USER_INPUT truncation (~192,000 bytes in 2026-10) on 1.5.16.
-3. **Band placement** of Gemini 4 Neon / Carbon / Argon / Hydrogen (and their effort levels), and what, if anything,
+3. **Pools (owner decision 2026-11-24, the PR B direction; nothing is routed yet):** each agy quota group is its own pool
+   (`gemini`; `claude-gpt`, the Claude and GPT models). A model served through agy sits in the same band as the same model
+   reached elsewhere (agy's Claude Opus 5.5 in Opus 5.5's band), and scarcity alone separates the routes: the agy pool's
+   own windows against the other lane's.
+   **Band placement** of Gemini 4 Neon / Carbon / Argon / Hydrogen (and their effort levels), and what, if anything,
    replaces R1's removed `Gemini 3.7 Flash (Medium)`. Gemini 3.8 Flash ends 2026-11-30. The nightly scoring
    (`tables/benchmarks`) has no Gemini 4 rows yet; vendor numbers are Google's claims.
 4. **The third-party pool.** Antigravity offers Claude Opus 5.5 and Sonnet 5.5 (and GPT-OSS 120B) on a quota pool

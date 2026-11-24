@@ -40,7 +40,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 STATE = Path(_env_get("CORTADOS_HOME") or _env_get("CORTADOS_HERMES_HOME") or Path.home() / ".cortados")
@@ -139,23 +139,37 @@ class ProbeExecFailed(RuntimeError):
     kind = "exec-failed"
 
 
-class ProbeRefused(RuntimeError):
-    """The boot screen asked for something the probe never answers (a login, a first-run choice). Nothing was typed."""
+class ProbePartialReading(RuntimeError):
+    """The quota screen was read, but not all of it (a pager not paged to its end, a group without its windows)."""
+    kind = "partial-reading"
 
-    def __init__(self, kind: str, stage: str):
-        super().__init__(f"probe refused at {stage}: the CLI is waiting for {kind}; nothing was typed")
+
+class ProbeRefused(RuntimeError):
+    """The CLI showed a screen the probe never answers (a login, a first-run choice). The probe stopped at once, before
+    its next write; `typed` is what it had sent before the screen appeared (named keys, never terminal replies)."""
+
+    def __init__(self, kind: str, stage: str, typed: list[str] | tuple[str, ...] = ()):
+        did = ("nothing was typed" if not typed
+               else "stopped at once; typed before it appeared: " + ", ".join(typed))
+        super().__init__(f"probe refused at {stage}: the CLI is waiting for {kind}; {did}")
         self.kind = kind
+        self.stage = stage
+        self.typed = list(typed)
 
 
 def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], boot_s: float = 12, run_s: float = 20, ready: str | None = None,
                 nudge: tuple[str, str, bytes, int, float] | None = None, diagnostics: dict | None = None,
-                refuse: tuple[tuple[str, str], ...] = (), inherit_path: bool = True) -> str:
+                refuse: tuple[tuple[str, str], ...] = (), inherit_path: bool = True,
+                page: Callable[[str], tuple[bytes, str] | None] | None = None, page_max: int = 40) -> str:
     """Open the CLI in a PTY, accept a folder-trust prompt for our own empty probe folder if shown, type `command`, return the screen text.
 
-    Deny-all: Enter is only ever sent for that trust prompt. `refuse` is ((kind, regex), ...): when a boot screen matches
-    one (checked before the trust prompt and again after it), ProbeRefused(kind) is raised at once, before anything is
-    typed, and the CLI is closed. An exec failure raises ProbeExecFailed instead of returning an empty screen.
-    inherit_path=False runs argv[0] as given (an absolute path), never searched on PATH."""
+    Deny-all: Enter is only ever sent for that trust prompt. `refuse` is ((kind, regex), ...): the screen is checked on
+    every read and again before every write (#144 review: a sign-in screen that appeared only after `command` used to
+    receive the retry's typing); on a match ProbeRefused(kind) is raised at once and the CLI is closed. Its message says
+    truly what had been typed by then. An exec failure raises ProbeExecFailed instead of returning an empty screen.
+    inherit_path=False runs argv[0] as given (an absolute path), never searched on PATH.
+    `page(text)` reads a scrollable answer: called with the answer so far, it returns (key, name) to press next (a
+    navigation key, never text) or None when done; at most `page_max` presses."""
     PROBE_DIR.mkdir(parents=True, exist_ok=True)
     my_dir = PROBE_DIR / f"p{os.getpid()}-{int(time.time() * 1000) % 100000}"     # per-probe folder: the reaper kills by cwd and must never hit another probe
     my_dir.mkdir(exist_ok=True)
@@ -180,6 +194,23 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     buf = b""
     eof = False
     stage, startup_chars, ready_seen = "boot", 0, False
+    typed: list[str] = []          # what the probe sent, by name, for a truthful refusal message
+
+    def refused(where: str) -> None:
+        if EXEC_FAILED_MARK in buf:
+            raise ProbeExecFailed(f"{Path(argv[0]).name} could not be started: "
+                                  + buf.split(EXEC_FAILED_MARK, 1)[1].split(b"\n", 1)[0].decode("ascii", "replace")[:60])
+        if refuse:
+            shown = _plain(buf)
+            for kind, pattern in refuse:
+                if re.search(pattern, shown, re.I):
+                    raise ProbeRefused(kind, where, typed)
+
+    def send(data: bytes, name: str) -> None:
+        """Every keystroke the probe types goes through here: the screen is checked first (deny-all)."""
+        refused(stage)
+        os.write(fd, data)
+        typed.append(name)
 
     def pump(max_s: float, quiet_s: float = 1.5, until: str | None = None, mark: int = 0) -> None:
         """Read until the screen goes quiet, or (with `until`) until that text is on screen and has had a moment to finish painting."""
@@ -198,6 +229,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                     return
                 buf += d
                 last = time.time()
+                refused(stage)                               # stop the moment a refused screen is painted, mid-pump
                 if b"\x1b[>c" in d or b"\x1b[>0c" in d:      # terminal identity queries some TUIs block on
                     os.write(fd, b"\x1b[>0;276;0c")
                 if b"\x1b[c" in d:
@@ -212,15 +244,6 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             elif len(buf) > mark and time.time() - last > quiet_s:
                 return
     mark = 0
-
-    def refused(where: str) -> None:
-        if EXEC_FAILED_MARK in buf:
-            raise ProbeExecFailed(f"{Path(argv[0]).name} could not be started: "
-                                  + buf.split(EXEC_FAILED_MARK, 1)[1].split(b"\n", 1)[0].decode("ascii", "replace")[:60])
-        shown = _plain(buf)
-        for kind, pattern in refuse:
-            if re.search(pattern, shown, re.I):
-                raise ProbeRefused(kind, where)
     try:
         pump(boot_s, until=ready)
         startup_chars = len(_plain(buf))
@@ -231,7 +254,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             return ""
         if re.search(r"trust (this|the contents)|Trust this workspace", _plain(buf), re.I):
             stage = "trust"
-            os.write(fd, b"\r")
+            send(b"\r", "Enter (workspace trust)")
             pump(boot_s, until=ready, mark=len(buf))
             startup_chars = len(_plain(buf))
             ready_seen = bool(ready and re.search(ready, _plain(buf)))
@@ -241,18 +264,30 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 return ""
         mark = len(buf)
         stage = "command"
-        os.write(fd, command.encode())
+        send(command.encode(), repr(command))
         pump(3, quiet_s=1.0, mark=mark)
-        os.write(fd, b"\r")
+        send(b"\r", "Enter")
         pump(run_s, until=done, mark=mark)
         if not eof and not re.search(done, _plain(buf[mark:])):      # some screens answer "refreshing, ask again": ask once more
             stage = "retry"
-            os.write(fd, b"\x1b")
+            send(b"\x1b", "Esc")
             time.sleep(3)
-            os.write(fd, command.encode())
+            pump(0.5, quiet_s=0.3, mark=len(buf))        # read (and check) what arrived while waiting
+            send(command.encode(), repr(command))
             pump(3, quiet_s=1.0, mark=len(buf))
-            os.write(fd, b"\r")
+            send(b"\r", "Enter")
             pump(run_s, until=done, mark=mark)
+        if page and not eof:
+            stage = "page"
+            for _ in range(page_max):
+                step = page(_plain(buf[mark:]))
+                if not step:
+                    break
+                mark2 = len(buf)
+                send(step[0], step[1])
+                pump(4, quiet_s=0.6, mark=mark2)
+                if eof or len(buf) == mark2:      # gone, or the key changed nothing on screen: stop pressing
+                    break
         if nudge:                                        # (want, blocked_by, key, max_presses, wait_s): e.g. press r while a panel says "rate limited"
             want, blocked, key, presses, wait_s = nudge
             for _ in range(presses):
@@ -262,7 +297,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 time.sleep(wait_s)
                 mark2 = len(buf)
                 try:
-                    os.write(fd, key)
+                    send(key, repr(key))
                 except OSError:
                     break  # child already exited; use what we captured instead of crashing
                 pump(8, until=want, mark=mark2)
@@ -318,19 +353,78 @@ def parse_claude_usage(text: str) -> list[dict[str, Any]]:
     return wins
 
 
+# agy 1.5.16's /usage answer is a scrollable pager: a footer "(1–17 of 30 lines)" under each painted view, ↑/↓, pgdown,
+# ctrl+end. Each painted view is parsed on its own, so a window is only ever attributed to a group header shown above
+# it in the same view (a view that starts below a header holds orphan windows, which are ignored).
+AGY_PAGER = re.compile(r"\(\s*(\d+)\s*[–—-]\s*(\d+)\s+of\s+(\d+)\s+lines?\s*\)")
+AGY_WINDOW_KINDS = ("week", "5-hour")
+
+
+def _agy_views(text: str) -> list[str]:
+    """The painted views of the /usage pager, in order: the text up to and including each footer; without a footer the
+    whole text is one view."""
+    views, start = [], 0
+    for m in AGY_PAGER.finditer(text):
+        views.append(text[start:m.end()])
+        start = m.end()
+    tail = text[start:]
+    if tail.strip() or not views:
+        views.append(tail)
+    return views
+
+
 def parse_agy_usage(text: str) -> dict[str, list[dict[str, Any]]]:
-    groups: dict[str, list[dict[str, Any]]] = {}
-    # Group headers: "GEMINI MODELS", "CLAUDE AND GPT MODELS" (2026-10 screen); "THIRD-PARTY MODELS" and the like allowed
-    parts = re.split(r"([A-Z][A-Z0-9 &/-]{2,40} MODELS) (?=Models within)", re.sub(r"\s+", " ", text))
-    for title, chunk in zip(parts[1::2], parts[2::2]):
-        wins = []
-        for m in re.finditer(r"(Weekly|Five Hour) Limit Remaining\D{0,200}?(\d{1,3}(?:\.\d+)?)\s*%\s*(Refreshes in ([0-9dhm ]+)|Quota available)?", chunk):
-            secs = sum(int(n) * {"d": 86400, "h": 3600, "m": 60}[u] for n, u in re.findall(r"(\d+)\s*([dhm])", m.group(4) or ""))
-            wins.append(window_view("week" if m.group(1) == "Weekly" else "5-hour", 100.0 - float(m.group(2)),
-                                    time.time() + secs if secs else None, D7 if m.group(1) == "Weekly" else H5))
-        if wins and title.strip().lower() not in groups:
-            groups[title.strip().lower()] = wins[:2]
-    return groups
+    """{group title (lower case): [week, 5-hour] windows found}. Views are merged per group and window kind, the first
+    reading of each kind kept (a repaint shows the same numbers): a first page that shows only part of a group no longer
+    hides the rest of it on a later page (#144 review round 1)."""
+    found: dict[str, dict[str, dict[str, Any]]] = {}
+    for view in _agy_views(text):
+        # Group headers: "GEMINI MODELS", "CLAUDE AND GPT MODELS" (2026-10 and 1.5.16 screens); "THIRD-PARTY MODELS" allowed
+        parts = re.split(r"([A-Z][A-Z0-9 &/-]{2,40} MODELS) (?=Models within)", re.sub(r"\s+", " ", view))
+        for title, chunk in zip(parts[1::2], parts[2::2]):
+            got = found.setdefault(title.strip().lower(), {})
+            for m in re.finditer(r"(Weekly|Five Hour) Limit Remaining\D{0,200}?(\d{1,3}(?:\.\d+)?)\s*%\s*(Refreshes in ([0-9dhm ]+)|Quota available)?", chunk):
+                kind = "week" if m.group(1) == "Weekly" else "5-hour"
+                if kind in got:
+                    continue
+                secs = sum(int(n) * {"d": 86400, "h": 3600, "m": 60}[u] for n, u in re.findall(r"(\d+)\s*([dhm])", m.group(4) or ""))
+                got[kind] = window_view(kind, 100.0 - float(m.group(2)), time.time() + secs if secs else None,
+                                        D7 if kind == "week" else H5)
+    return {t: [w[k] for k in AGY_WINDOW_KINDS if k in w] for t, w in found.items() if w}
+
+
+def agy_usage_gaps(text: str) -> list[str]:
+    """What a /usage answer still lacks before it is a full quota reading; [] = complete. Every expected pool
+    (AGY_EXPECTED_POOLS) and every group shown needs its week and its 5-hour window, and a pager must have been read to
+    its last line. A partial reading is an error, never a healthy reading (#144 review round 1)."""
+    groups = parse_agy_usage(text)
+    gaps = []
+    by_pool = {_agy_pool_of_group(t): t for t in groups}
+    for pool in AGY_EXPECTED_POOLS:
+        if pool not in by_pool:
+            gaps.append(f"no {pool} group")
+    for title, wins in groups.items():
+        have = {w["window"] for w in wins}
+        gaps += [f"{title}: no {k} window" for k in AGY_WINDOW_KINDS if k not in have]
+    pages = list(AGY_PAGER.finditer(text))
+    if pages and int(pages[-1].group(2)) < int(pages[-1].group(3)):
+        gaps.append(f"pager not read to the end (last view {pages[-1].group(1)}-{pages[-1].group(2)} of {pages[-1].group(3)})")
+    return gaps
+
+
+def _agy_next_page(text: str) -> tuple[bytes, str] | None:
+    """The /usage pager's next key: ↓ (one line, read-only navigation) until the reading is complete or the footer shows
+    the last line. One line at a time, not pgdown or ctrl+end: a group is attributed only from a view that shows its
+    header above its windows, and stepping by one line shows every group that fits in a view whole in some view (a
+    page jump can land with a header just above the top). No footer: not a pager, nothing to press."""
+    pages = list(AGY_PAGER.finditer(text))
+    if not pages or not agy_usage_gaps(text):
+        return None
+    if int(pages[-1].group(2)) >= int(pages[-1].group(3)):
+        return None
+    if len(pages) >= 2 and pages[-1].group(1, 2) == pages[-2].group(1, 2):
+        return None                    # the last press did not move the view: stop (the reading stays partial)
+    return b"\x1b[B", "Down"
 
 
 def _env_file_vars() -> dict[str, str]:
@@ -495,7 +589,10 @@ AGY_REFUSE = (
                       r"|not (?:signed|logged) in|please (?:sign|log) in|login required"),
     ("first-run-pending", r"color scheme|colou?r theme|rendering mode|alt-screen"),
 )
-AGY_DONE = r"Limit Remaining[\s\S]*Limit Remaining"
+AGY_DONE = r"Limit Remaining[\s\S]*Limit Remaining"     # the answer is on screen; complete only by agy_usage_gaps
+# The quota groups agy 1.5.16 shows on Google AI Pro (owner's screen, 2026-11-24): GEMINI MODELS and CLAUDE AND GPT
+# MODELS. A reading without either is partial.
+AGY_EXPECTED_POOLS = ("gemini", "claude-gpt")
 # Human words for a lane's state, by scarcity error_kind / record state: what the live view, the dashboard and the pulse
 # pane print instead of "FAILED" when the cause is known (#144).
 LANE_STATE_TEXT = {
@@ -506,6 +603,7 @@ LANE_STATE_TEXT = {
     "first-run-pending": "first-run setup pending",
     "forbidden-env": "refused: API key or ADC variable configured",
     "settings-refused": "refused: unsafe agy settings",
+    "partial-reading": "quota screen read only in part",
 }
 
 
@@ -532,21 +630,22 @@ def _antigravity() -> dict[str, Any]:
     allowlisted env (a Google-family variable in the env file: refused), the settings guard, and a deny-all PTY run."""
     from cortados_router import agy_isolation as iso
     env_file = _env_file_vars()
-    binary = iso.resolve_binary(_env_get("CORTADOS_AGY_BIN") or env_file.get("CORTADOS_AGY_BIN"))
-    env = iso.child_env(os.environ, env_file)
-    iso.check_settings(env["HOME"])
+    binary, env = iso.prepare(_env_get("CORTADOS_AGY_BIN") or env_file.get("CORTADOS_AGY_BIN"), os.environ, env_file)
     diag: dict = {}
-    text = tui_capture([binary], "/usage", AGY_DONE, env, refuse=AGY_REFUSE, inherit_path=False, diagnostics=diag)
+    # A refused screen at any point (boot, after trust, after /usage, while paging) raises ProbeRefused from inside the
+    # capture, before the probe's next keystroke.
+    text = tui_capture([binary], "/usage", AGY_DONE, env, refuse=AGY_REFUSE, inherit_path=False, diagnostics=diag,
+                       page=_agy_next_page)
     if not text.strip():
         if diag.get("eof") and diag.get("stage") in {"boot", "trust"}:
             raise ProbeExecFailed(f"agy exited at {diag.get('stage')} with no usable output")
         raise RuntimeError("agy /usage screen empty (stage=" + str(diag.get("stage")) + ")")
-    for kind, pattern in AGY_REFUSE:          # a login or setup screen that appeared only after /usage was typed
-        if re.search(pattern, text, re.I) and not parse_agy_usage(text):
-            raise ProbeRefused(kind, "command")
     groups = parse_agy_usage(text)
     if not groups:
         raise RuntimeError("no quota groups on the /usage screen: " + text[-200:].replace("\n", " "))
+    gaps = agy_usage_gaps(text)
+    if gaps:
+        raise ProbePartialReading("agy /usage read only in part: " + "; ".join(gaps))
     wins = []
     for g, ws in groups.items():
         pool = _agy_pool_of_group(g)

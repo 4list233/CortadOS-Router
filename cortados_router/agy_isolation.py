@@ -3,7 +3,7 @@
 Today the only agy process is the quota probe (scarcity._antigravity: `/usage` in a PTY). A future served backend (#144
 PR B, [ESCALATE]) must start agy through the same functions, so the rules cannot drift between the two.
 
-Three rules, each with its reason:
+The rules, each with its reason:
   1. Environment ALLOWLIST (`child_env`): agy gets HOME, USER, LOGNAME, TMPDIR, LANG / LC_* and a fixed PATH; TERM is
      set by the PTY capture. Nothing else reaches it. Reason: `GEMINI_API_KEY` / `GOOGLE_GEMINI_BASE_URL` switch agy to
      API-key billing or another endpoint, `AGY_ADC_AUTH=true` to Application Default Credentials billing; all three
@@ -15,11 +15,13 @@ Three rules, each with its reason:
      their own lanes (CLAUDE_CONFIG_DIR, CODEX_HOME, ...): they are dropped by the allowlist, not fatal.
   3. A configured ABSOLUTE binary (`resolve_binary`): `--agy-bin` on the provider, or CORTADOS_AGY_BIN. PATH never
      chooses. Unset, the lane is "not configured" and is never sampled (no PTY is opened).
-  4. SETTINGS GUARD (`check_settings`): agy's own settings file is read (never written) before any start; a file that
-     configures MCP servers, an auto-approving tool mode, or an API-key / ADC login is refused. PROVISIONAL: the key
-     names of agy 1.5.16's settings.json have not been captured yet, so the guard matches the documented VALUES
-     (`always-proceed`, `proceed-in-sandbox`) and key names by family (mcp*, *api*key*, adc) at any depth, and a file it
-     cannot parse is refused (fail closed). Tighten it to the exact keys once the file is captured on the Air.
+  4. SETTINGS GUARD (`check_settings`): agy's own settings file is read (never written) before any start and must match
+     an ALLOWLIST schema (`SETTINGS_SCHEMA`): a JSON object, only listed keys, the auth mode the subscription login
+     (`SUBSCRIPTION_AUTH`). Anything else is refused: a non-object, an unknown key anywhere (MCP servers, tool /
+     approval modes included), an API-key / Vertex / ADC auth mode, a missing or unreadable file (fail closed).
+  5. ONE LAUNCH PATH (`prepare`): rules 1-4 run, in that order, before every agy process: the quota probe
+     (scarcity._antigravity) and `agy models` (`run_models`, the CLI `python3 -B -m cortados_router.agy_isolation models`
+     that bin/refresh-inventory.sh calls).
 
 What isolation does NOT cover (recorded for PR B): agy saves every interactive session as a conversation ("Resume with
 -c ... agy --conversation=<uuid>" on start). The CLI reference (antigravity.google/docs/cli/reference, 2026-11-24) has
@@ -58,7 +60,6 @@ FORBIDDEN_PREFIXES = {
 OTHER_VENDOR_PREFIXES = ("ANTHROPIC_", "OPENAI_", "CODEX_", "CLAUDE_", "CURSOR_", "CORTADOS_")
 
 SETTINGS_RELPATH = ".gemini/antigravity-cli/settings.json"
-AUTO_APPROVE_VALUES = ("always-proceed", "proceed-in-sandbox")    # documented tool permission modes that run tools unasked
 SETTINGS_MAX_BYTES = 1 << 20                                      # a settings file is a few KB; more is not one
 
 
@@ -132,38 +133,86 @@ def resolve_binary(configured: str | None) -> str:
     return path
 
 
-def _walk(node: Any, key: str = ""):
-    """Yield (key, value) for every scalar in a JSON tree; the key is the nearest dict key."""
-    if isinstance(node, dict):
+# --------------------------------------------------------------------------------------------- settings guard (ALLOWLIST)
+# agy's settings.json is validated against this schema, never scanned for bad words (#144 review round 1: the earlier
+# blacklist accepted `[]`, `{"security":{"auth":{"selectedType":"api-key"}}}` and any unknown security setting).
+# A leaf is a type (bool / str: any value of that type) or a tuple of the allowed values. Everything not listed is refused.
+#
+# The auth mode is REQUIRED and must be the subscription login. "oauth-personal" is the value the owner's signed-in
+# Google login writes ("Login with Google"; read 2026-11-24 from the owner's ~/.gemini/settings.json on the Pro, the
+# Gemini CLI file agy's settings descend from: security.auth.selectedType). Every other mode bills elsewhere:
+# "gemini-api-key" / "api-key" (API-key billing), "vertex-ai" (a Cloud project), "compute-default-credentials" /
+# "cloud-shell" / ADC (Application Default Credentials, Cloud billing). If agy 1.5.16 on the Air writes a different key or
+# value, the lane says "refused: unsafe agy settings" with the reason, and this schema is updated to the captured file.
+SUBSCRIPTION_AUTH = "oauth-personal"
+BILLING_AUTH_MODES = ("gemini-api-key", "api-key", "vertex-ai", "compute-default-credentials", "cloud-shell", "adc")
+_DISPLAY_ONLY = "display only: changes how the screen is drawn, never what agy runs or how it bills"
+SETTINGS_SCHEMA: dict[str, Any] = {
+    "security": {"auth": {"selectedType": (SUBSCRIPTION_AUTH,)}},
+    # Allowed outside security, each provably harmless (the reason per key):
+    "ui": {
+        "theme": str,                         # the first-run color scheme; _DISPLAY_ONLY
+        "showStatusInTitle": bool,            # _DISPLAY_ONLY (terminal title)
+        "showMemoryUsage": bool,              # _DISPLAY_ONLY
+        "hideBanner": bool,                   # _DISPLAY_ONLY
+        "hideTips": bool,                     # _DISPLAY_ONLY
+        "footer": {"hideContextPercentage": bool},   # _DISPLAY_ONLY
+    },
+    "ide": {
+        "enabled": (False,),                  # IDE integration OFF only: when on, agy connects to an IDE companion server
+                                              # that can add tools and diffs; off is the absence of that connection
+        "hasSeenNudge": bool,                 # a "has seen the IDE hint" flag; no effect on what runs
+    },
+    "hasSeenIdeIntegrationNudge": bool,       # the same flag at the older top-level name
+}
+REQUIRED_SETTINGS = (("security", "auth", "selectedType"),)
+# Named in the refusal so the owner sees why, not just "unknown key" (all are refused by the allowlist anyway).
+_NAMED_REFUSALS = {
+    "mcpservers": "MCP servers are configured (they give agy tools the router never reviewed)",
+    "mcp": "MCP settings are configured",
+    "tools": "tool settings are configured (auto-approve / allowed tools)",
+    "approvalmode": "an approval mode is configured (auto-approve runs tools without review)",
+    "autoaccept": "auto-accept is configured (runs tools without review)",
+    "yolo": "yolo mode is configured (runs every tool without review)",
+}
+
+
+def _settings_problems(node: Any, schema: Any, path: str, out: list[str]) -> None:
+    if isinstance(schema, dict):
+        if not isinstance(node, dict):
+            out.append(f"{path or 'the file'} is not a JSON object")
+            return
         for k, v in node.items():
-            yield from _walk(v, str(k))
-            if isinstance(v, (dict, list)):
-                yield str(k), v
-    elif isinstance(node, list):
-        for v in node:
-            yield from _walk(v, key)
-    else:
-        yield key, node
-
-
-def _risky_key(key: str) -> str | None:
-    k = key.lower().replace("_", "").replace("-", "")
-    if k.startswith("mcp"):
-        return "MCP servers are configured"
-    if "apikey" in k:
-        return "an API key is configured"
-    if k in ("adc", "adcauth", "useadc") or "applicationdefaultcredentials" in k:
-        return "Application Default Credentials are configured"
-    return None
+            where = f"{path}.{k}" if path else str(k)
+            if k not in schema:
+                named = _NAMED_REFUSALS.get(str(k).lower().replace("_", "").replace("-", ""))
+                out.append(f"{where}: {named}" if named else f"unknown setting {where!r}")
+                continue
+            _settings_problems(v, schema[k], where, out)
+        return
+    if isinstance(schema, tuple):
+        if not any(node is ok or (type(node) is type(ok) and node == ok) for ok in schema):
+            if path == "security.auth.selectedType":
+                if isinstance(node, str) and node.strip().lower() in BILLING_AUTH_MODES:
+                    out.append(f"{path} is {node.strip().lower()!r}, which bills outside the Google AI Pro subscription")
+                else:
+                    out.append(f"{path} is not the subscription login {SUBSCRIPTION_AUTH!r}")
+            else:
+                out.append(f"{path} has a value outside {list(schema)!r}")
+        return
+    if type(node) is not schema:            # bool is not int, str is str: no coercion
+        out.append(f"{path} is not a {schema.__name__}")
 
 
 def check_settings(home: str | os.PathLike) -> None:
-    """Refuse (SettingsRefused) when agy's settings would let it act on its own or bill elsewhere. Read-only. A missing
-    file passes (agy's defaults: request-review, subscription login). See the module docstring: PROVISIONAL matching."""
+    """Refuse (SettingsRefused) unless agy's settings file matches SETTINGS_SCHEMA exactly: a JSON object, only listed keys,
+    the subscription login as the auth mode. Read-only. A missing or unreadable file is refused (fail closed): without
+    the file the auth mode is unknown, and an unknown auth mode is not proven to be the subscription."""
     p = Path(home) / SETTINGS_RELPATH
     try:
         if not p.exists():
-            return
+            raise SettingsRefused(f"agy settings file {SETTINGS_RELPATH} missing: the auth mode is unknown; sign in with "
+                                  f"Google once (it records security.auth.selectedType = {SUBSCRIPTION_AUTH!r})")
         if p.stat().st_size > SETTINGS_MAX_BYTES:
             raise SettingsRefused(f"agy settings file is over {SETTINGS_MAX_BYTES} bytes; not read")
         data = json.loads(p.read_text())
@@ -172,11 +221,71 @@ def check_settings(home: str | os.PathLike) -> None:
     except (OSError, ValueError) as exc:
         raise SettingsRefused(f"agy settings file unreadable ({type(exc).__name__}); refused, fail closed")
     problems: list[str] = []
-    for key, value in _walk(data):
-        why = _risky_key(key)
-        if why and value not in (None, False, "", [], {}):
-            problems.append(why)
-        if isinstance(value, str) and value.strip().lower() in AUTO_APPROVE_VALUES:
-            problems.append(f"tool permission mode {value.strip().lower()!r} runs tools without review")
+    _settings_problems(data, SETTINGS_SCHEMA, "", problems)
+    if isinstance(data, dict):
+        for req in REQUIRED_SETTINGS:
+            node = data
+            for k in req:
+                node = node.get(k) if isinstance(node, dict) else None
+            if node is None:
+                problems.append(f"{'.'.join(req)} missing (must be {SUBSCRIPTION_AUTH!r}, the subscription login)")
     if problems:
+        # key paths and fixed words only: a value that is not a known auth mode is never echoed (it may be a credential)
         raise SettingsRefused("agy settings refused: " + "; ".join(sorted(set(problems))))
+
+
+# --------------------------------------------------------------------------------------------- the one launch path
+def prepare(configured: str | None, environ: Mapping[str, str], env_file: Mapping[str, str] | None = None) -> tuple[str, dict[str, str]]:
+    """Every agy process the router starts goes through here first (the /usage probe and `agy models`): the configured
+    absolute binary, the allowlisted env (Google-family names in the env file: ForbiddenEnv), the settings guard.
+    Returns (binary, env); raises an AgyLaneError before anything is started."""
+    binary = resolve_binary(configured)
+    env = child_env(environ, env_file)
+    check_settings(env["HOME"])
+    return binary, env
+
+
+def run_models(configured: str | None, environ: Mapping[str, str], env_file: Mapping[str, str] | None = None,
+               timeout_s: float = 60) -> str:
+    """`agy models` through prepare(): stdout as text. Run by absolute path with execve semantics (no PATH search), in an
+    empty per-run folder, stdin closed. Raises AgyLaneError on a refusal, RuntimeError on a failed run."""
+    import shutil
+    import subprocess
+    import tempfile
+    binary, env = prepare(configured, environ, env_file)
+    work = tempfile.mkdtemp(prefix="cortados-agy-models-")
+    try:
+        r = subprocess.run([binary, "models"], cwd=work, env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                           timeout=timeout_s, executable=binary)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"agy models exited {r.returncode}")
+    return r.stdout.decode("utf-8", "replace")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI: `python3 -B -m cortados_router.agy_isolation models` prints `agy models` (bin/refresh-inventory.sh). The binary
+    is CORTADOS_AGY_BIN (absolute; never searched), the env file the router's ($CORTADOS_HOME/env). Exit 0 printed, 2 refused
+    or not configured (the reason on stderr), 1 the run failed."""
+    import sys
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args != ["models"]:
+        print("usage: python3 -B -m cortados_router.agy_isolation models", file=sys.stderr)
+        return 2
+    from cortados_router import scarcity
+    env_file = scarcity._env_file_vars()
+    configured = os.environ.get("CORTADOS_AGY_BIN") or env_file.get("CORTADOS_AGY_BIN")
+    try:
+        sys.stdout.write(run_models(configured, os.environ, env_file))
+    except AgyLaneError as exc:
+        print(f"agy: {exc.kind}: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"agy: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

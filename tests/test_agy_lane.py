@@ -23,6 +23,21 @@ from cortados_router.provider import live, usage
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "agy-usage-provisional.txt"
+# The /usage answer as agy 1.5.16's 30-line pager holds it: GEMINI MODELS and CLAUDE AND GPT MODELS, each with a weekly
+# window, a "Refreshes in"/"Quota available" line and a five-hour window. The pager shows 17 lines at a time with a
+# "(1–17 of 30 lines)" footer, so its first page (lines 1-17) holds Gemini's two windows and only the Claude/GPT weekly
+# one: the case where two "Limit Remaining" lines used to count as a full reading (#144 review round 1). RECONSTRUCTED
+# from the owner's description of the screen (layout, groups, footer, keys), not a byte copy: the owner's paste was not
+# available to the fix round; replace it with the scrubbed paste when it arrives (docs/AGY-LANE.md).
+PAGER_FIXTURE = ROOT / "tests" / "fixtures" / "agy-usage-pager.txt"
+PAGE_H = 17
+
+
+def pager_view(lines: list[str], top: int) -> str:
+    """One painted view of the pager: clear, the visible lines, the footer agy prints under them."""
+    n = len(lines)
+    return ("\x1b[2J\x1b[H" + "\n".join(lines[top:top + PAGE_H])
+            + f"\n({top + 1}\u2013{min(top + PAGE_H, n)} of {n} lines)  \u2191/\u2193 scroll \u00b7 pgdown page \u00b7 ctrl+end Bottom\n")
 
 # A fake agy: dumps the NAMES of its environment, records every byte typed into it, prints its boot screen, and answers
 # "/usage<Enter>" with the usage screen (MODE "usage") or a trust prompt's Enter with the screen after it.
@@ -38,6 +53,12 @@ except Exception:
     pass
 def out(s):
     os.write(1, s.replace("\n", "\r\n").encode())
+H = 17
+def view(top):
+    L = SCREENS["pager"]
+    return ("\x1b[2J\x1b[H" + "\n".join(L[top:top + H])
+            + "\n(%d\u2013%d of %d lines)  \u2191/\u2193 scroll \u00b7 pgdown page \u00b7 ctrl+end Bottom\n" % (top + 1, min(top + H, len(L)), len(L)))
+top = 0
 out(SCREENS["boot"])
 got = b""
 while True:
@@ -54,6 +75,15 @@ while True:
         out(SCREENS["after_trust"])
     if "usage" in SCREENS and got.endswith(b"/usage\r"):
         out(SCREENS["usage"])
+    if "on_command_text" in SCREENS and got.endswith(b"/usage"):
+        out(SCREENS["on_command_text"])
+    if "pager" in SCREENS:
+        if got.endswith(b"/usage\r"):
+            top = 0
+            out(view(top))
+        elif d == b"\x1b[B" and not SCREENS.get("frozen"):
+            top = min(top + 1, max(len(SCREENS["pager"]) - H, 0))
+            out(view(top))
 '''
 
 BANNER = "Antigravity CLI 1.5.16\n(Google AI Pro) Gemini 4 Neon (High)\nResume with -c (or command below): agy --conversation=00000000-0000-0000-0000-000000000000\n> "
@@ -79,6 +109,13 @@ class AgyBase(unittest.TestCase):
                         "PATH": "/somewhere/else", "GEMINI_API_KEY": "gk-secret", "GOOGLE_GEMINI_BASE_URL": "http://x.invalid",
                         "AGY_ADC_AUTH": "true", "OPENAI_API_KEY": "sk-o", "ANTHROPIC_API_KEY": "sk-a",
                         "CORTADOS_PROVIDER_TOKEN": "tok", "SSH_AUTH_SOCK": "/tmp/agent", "GITHUB_TOKEN": "gh"}
+
+        self.write_settings({"security": {"auth": {"selectedType": iso.SUBSCRIPTION_AUTH}}})
+
+    def write_settings(self, data) -> None:
+        p = self.home / iso.SETTINGS_RELPATH
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data))
 
     def fake(self, screens: dict) -> tuple[str, Path]:
         log = self.tmp / "agy-log"
@@ -214,12 +251,75 @@ class ProbeHonesty(AgyBase):
 
     def test_unsafe_settings_refuse_before_any_start(self):
         binary, _ = self.fake({"boot": BANNER})
-        s = self.home / iso.SETTINGS_RELPATH
-        s.parent.mkdir(parents=True)
-        s.write_text(json.dumps({"tools": {"permissionMode": "always-proceed"}}))
-        with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
-            with self.assertRaises(iso.SettingsRefused):
+        for bad in ({"tools": {"permissionMode": "always-proceed"}}, [],
+                    {"security": {"auth": {"selectedType": "api-key"}}}):
+            with self.subTest(bad=bad):
+                self.write_settings(bad)
+                with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+                    with self.assertRaises(iso.SettingsRefused):
+                        sc._antigravity()
+
+    # ---- #144 review round 1, finding 3: a login screen that appears only after /usage gets no more input
+    def test_login_screen_after_usage_stops_typing_at_once_and_says_what_was_typed(self):
+        binary, log = self.fake({"boot": BANNER, "usage": LOGGED_OUT})
+        with self.env(binary):
+            with self.assertRaises(sc.ProbeRefused) as cm:
                 sc._antigravity()
+        self.assertEqual(cm.exception.kind, "not-logged-in")
+        self.assertEqual(self.keys(log), b"/usage\r")              # no Esc, no second /usage (the old retry typed both)
+        self.assertEqual(cm.exception.typed, ["'/usage'", "Enter"])
+        self.assertNotIn("nothing was typed", str(cm.exception))
+        self.assertIn("typed before it appeared: '/usage', Enter", str(cm.exception))
+
+    def test_refusal_is_checked_before_every_write(self):
+        # the sign-in screen is painted as soon as "/usage" arrives, before the probe's Enter: the Enter is never sent
+        binary, log = self.fake({"boot": BANNER, "on_command_text": LOGGED_OUT})
+        with self.env(binary):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertEqual(self.keys(log), b"/usage")
+        self.assertEqual(cm.exception.typed, ["'/usage'"])
+
+    # ---- #144 review round 1, finding 4: the /usage pager is read to its end, a partial reading is an error
+    def test_first_page_alone_is_not_a_full_reading(self):
+        lines = PAGER_FIXTURE.read_text().splitlines()
+        first = pager_view(lines, 0)
+        self.assertIn("(1\u201317 of 30 lines)", first)
+        g = sc.parse_agy_usage(first)
+        self.assertEqual([w["window"] for w in g["gemini models"]], ["week", "5-hour"])
+        self.assertEqual([w["window"] for w in g["claude and gpt models"]], ["week"])
+        gaps = sc.agy_usage_gaps(first)
+        self.assertIn("claude and gpt models: no 5-hour window", gaps)
+        self.assertTrue(any(x.startswith("pager not read to the end") for x in gaps), gaps)
+        self.assertEqual(sc._agy_next_page(first), (b"\x1b[B", "Down"))
+
+    def test_pager_is_paged_with_navigation_keys_until_every_group_is_read(self):
+        lines = PAGER_FIXTURE.read_text().splitlines()
+        self.assertEqual(len(lines), 30)
+        binary, log = self.fake({"boot": BANNER, "pager": lines})
+        with self.env(binary):
+            rec = sc._antigravity()
+        keys = self.keys(log)
+        self.assertTrue(keys.startswith(b"/usage\r"))
+        self.assertEqual(set(keys[len(b"/usage\r"):].split(b"\x1b[B")), {b""})   # only Down after /usage: no text
+        self.assertGreaterEqual(keys.count(b"\x1b[B"), 1)
+        got = {(w["window"], w["pool"]): w["used_pct"] for w in rec["windows"]}
+        self.assertEqual(got, {("week (gemini)", "gemini"): 12.5, ("5-hour (gemini)", "gemini"): 36.0,
+                               ("week (claude-gpt)", "claude-gpt"): 0.0, ("5-hour (claude-gpt)", "claude-gpt"): 42.0})
+
+    def test_pager_that_does_not_move_is_a_partial_reading_error(self):
+        lines = PAGER_FIXTURE.read_text().splitlines()
+        binary, log = self.fake({"boot": BANNER, "pager": lines, "frozen": True})
+        with self.env(binary):
+            with self.assertRaises(sc.ProbePartialReading) as cm:
+                sc._antigravity()
+        self.assertIn("claude and gpt models: no 5-hour window", str(cm.exception))
+        rec = sc._failed_record("antigravity", None, cm.exception)
+        self.assertEqual((rec["error_kind"], sc.lane_state(rec)), ("partial-reading", "quota screen read only in part"))
+
+    def test_a_missing_group_is_a_partial_reading(self):
+        only_gemini = "\n".join(PAGER_FIXTURE.read_text().splitlines()[:12])
+        self.assertEqual(sc.agy_usage_gaps(only_gemini), ["no claude-gpt group"])
 
 
 class Isolation(unittest.TestCase):
@@ -247,24 +347,6 @@ class Isolation(unittest.TestCase):
             iso.resolve_binary("/definitely/not/here/agy")
         self.assertEqual(cm.exception.searched, ["/definitely/not/here/agy"])
         self.assertEqual(iso.resolve_binary(sys.executable), sys.executable)
-
-    def test_settings_guard(self):
-        with tempfile.TemporaryDirectory() as h:
-            iso.check_settings(h)                                     # no file: agy's defaults
-            p = Path(h) / iso.SETTINGS_RELPATH
-            p.parent.mkdir(parents=True)
-            for bad in ({"mcpServers": {"x": {"command": "y"}}}, {"permissions": {"mode": "always-proceed"}},
-                        {"mode": "proceed-in-sandbox"}, {"auth": {"apiKey": "k"}}, {"useAdc": True}):
-                with self.subTest(bad=bad):
-                    p.write_text(json.dumps(bad))
-                    with self.assertRaises(iso.SettingsRefused):
-                        iso.check_settings(h)
-            p.write_text("{not json")
-            with self.assertRaisesRegex(iso.SettingsRefused, "fail closed"):
-                iso.check_settings(h)
-            p.write_text(json.dumps({"theme": "dark", "renderingMode": "alt-screen", "mcpServers": {},
-                                     "permissions": {"mode": "request-review"}}))
-            iso.check_settings(h)                                     # benign settings pass
 
 
 class ParserAndPools(unittest.TestCase):
