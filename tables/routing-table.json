@@ -1,8 +1,8 @@
 {
  "_doc": "MUTABLE routing table for Cortados. Edit freely: the router reloads this file when its mtime changes, no restart. Models, lanes and order WILL change; the six features and the band conditions come from the 2.0 scale (scale-2.0-reference.json). Validation on load: unknown lane/provider, a Fable/ceiling entry outside R4, or a non-Grok model on the cursor lane = file rejected, last good table kept.",
- "version": 21,
+ "version": 22,
  "updated": "2026-11-24",
- "updated_by": "claude (owner decisions 2026-11-23, #143: API credit lane competes as a scored candidate, R4/best knots at D 9/10, ceiling_underuse from D 8, ceiling_work requires a frontier model for hard planning/research/code, Fable pool size from the all-models week, Sol 6.1 an R3 reference, underused pools split in proportion to the quota each would lose; candidates unchanged)",
+ "updated_by": "claude (owner decisions 2026-11-24, scarcity v2 §9 step 4: the API credit grant is paced to its stop line by its percent used against its pace to expiry, selection.api_pacing; the 3-day expiry preference retired while it is on; everything else as v21)",
  "features": [
   "steps",
   "ambiguity",
@@ -639,6 +639,10 @@
    "attract_when_scarcity_below": -0.3,
    "min_D": 8,
    "_doc": "when a ceiling model's own pool is underused (scarcity ≤ −0.3: the allowance would otherwise expire unused), it also takes any R3-level task (D ≥ min_D) in every use case: paid-for capacity is used, not lost. Several underused ceiling pools: the one expected to lose the largest share at its reset wins (#132, owner 2026-11-22: rule kept, ranking by loss at reset), cost breaks ties; when any of them has no reset time, the cheapest (the earlier ranking). #143 (owner 2026-11-23): min_D 9 -> 8, because S1's compressed top puts most hard work at D 8-9; and with a conversation key (underuse_split) the spare ceiling pools share the work in proportion to the quota each would lose instead of the top one taking all of it. Routes failing the host's admission check (hold_ok: the client's quota floor) are never taken by this rule."
+  },
+  "api_pacing": {
+   "enabled": true,
+   "_doc": "Scarcity v2 §9 step 4 (owner 2026-11-24: the API credit grant is 'just like another subscription'; same models, same bands, 'just scarcity for a factor of percent used'). On: the grant's one standardized percent used is dollars spent / the stop line's dollars ($190 of a $200 grant; the scarcity reading's own %), and its pace is the rate that reaches the stop line exactly at its last counting hour, (100 - used) / hours left (core.api_pace). Its v21 'free until the grant lapses' weight discount is gone: it pays the same burn weight and cost terms as any pool. Among the underused pools of an underuse split (same gates: qualifying, available, the host's admission check, expected to lose at least min_loss_pct), its share is needed / (needed + actual pace), actual being its learned recent burn (else its window's pace so far): lagging its pace it draws more than half, ahead of it less, 1 while it has absorbed nothing; the subscription pools share the rest in their own v21 proportions. Expiry pressure is the 1 / hours left in the needed pace. The provider's 3-day expiry preference (routing.prefer_api_credit, api-credit.json prefer_within_days) is retired while this is on. Unchanged: the 95 % stop line, upper-bound reservations, the org monthly limit, the expiry cut-off, and the refusal of sensitive, local-only, outward, blast radius above 1 and degraded-scorer work. Off: routing exactly as table v21."
   },
   "underuse_split": {
    "enabled": true,

@@ -606,7 +606,9 @@ Each runs the full suite and the verify-router evidence block.
    - *Accept:* the suite plus new tests: hard rules (outward → R3, degraded → never Claude; the existing verify-router
      checks), the client floor respected, the same conversation id → same pool, and v21 when off. The replay shows
      "v2 no drain" numbers within ±3 points.
-4. **API spend-down pacing.** This is the time-critical piece. The grant is paced to its stop line (§3.1 step 1);
+4. **API spend-down pacing.** *Built 2026-11-24 as the narrow change (branch `scarcity-v2-api-pacing`, routing table v22
+   `selection.api_pacing`; README "Paced to its stop line"): the grant's pace feeds v21's terms, with no special weight.*
+   This is the time-critical piece. The grant is paced to its stop line (§3.1 step 1);
    `prefer_api_credit`'s 3-day rule is retired. It could ship before 3 as a narrow change: an API weight computed from
    `r_api` inside v21's cost. [ESCALATE 5]
    - *Accept:* verify-router's API checks unchanged (sensitive, outward, degraded refused; stop line); the replay

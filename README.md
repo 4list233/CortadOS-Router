@@ -485,7 +485,8 @@ and speed; non-retryable 400 on a pin, and a routed request carrying it is never
 longer holds a counting grant's days, and a second key (`CORTADOS_ANTHROPIC_API_KEY_2`, the old multi-org slots) all
 turn the lane off. `python3 -m cortados_router.api_credits status` prints the state (metadata only).
 
-**Where it is used.** An `api/<model>` pin, as before; and, while a counting grant expires within `prefer_within_days`
+**Where it is used.** An `api/<model>` pin, as before; as a paced scored candidate (below, table v22); and, only while
+`selection.api_pacing` is off (table v21 behaviour), while a counting grant expires within `prefer_within_days`
 (default 3), S1-routed work that a COST rule moved to a local model (R0 `auto_route` or the published index; never a
 sensitive bind, never the client's own `x-cortados-local: prefer`, never a request any sensitivity detector marked) runs
 on the API instead (`routing.prefer_api_credit`), on S1's own Claude choice or else the band's Claude model in the
@@ -506,6 +507,22 @@ never the weights' normalising reference) times the share of the grant NOT expec
 bound `api_credit_scored`; its later turns pass the same continuation gate without the expiry window. How much it takes
 is set by the underuse split below, in proportion to the grant's expected lost dollars (a few % of routed calls on the
 audit week).
+
+**Paced to its stop line (table v22, scarcity v2 §9 step 4, owner 2026-11-24).** With `selection.api_pacing.enabled`
+the grant is ranked like any other pool, by one standardized percent used against its pace to expiry (`core.api_pace`):
+used = dollars spent ÷ the stop line's dollars (the reading's own %, $190 of a $200 grant); the pace it needs is
+(100 − used) ÷ hours to its last counting hour; what it absorbs now is its learned recent burn (else its window's pace so
+far), the same sources a subscription's forecast uses. The same models in the same bands compete under the same gates
+and cost terms; the v21 "free until the grant lapses" weight discount is gone. Its scarcity is its pace to expiry,
+−(100 − forecast) ÷ 100, and its share of an underuse split is needed ÷ (needed + actual): lagging its pace it draws more
+than half of the conversations it qualifies for, ahead of it none (its forecast reaches the stop line, so it expects to
+lose nothing), and the subscriptions share the rest in their own proportions. It takes part while it lags its stop line
+at all (a subscription needs `min_loss_pct`; the grant's 100 % already is its 5 % margin). Expiry pressure is the
+1 ÷ hours in the needed pace. Past the stop line or its last counting hour it takes nothing. The 3-day expiry preference
+(`routing.prefer_api_credit`) is retired while the flag is on; `prefer_within_days` stays a valid config field, unused.
+Every money rule above is unchanged. Off: exactly table v21 (`tests/test_api_pacing.py` compares the two decision for
+decision). Replay (`scripts/scarcity_v2_replay.py --policy before`, the audit's copy, 11-23 23:40 → 12-02 18:00):
+the grant reaches $189.56 against $37.52 with the flag off.
 
 **Key.** `CORTADOS_ANTHROPIC_API_KEY` in the provider's environment, the variable the earlier lane read (on the Air the
 provider LaunchAgent loads its environment from `~/.cortados/provider.env`). Never logged, printed or written; `child_env.NEVER_ENV` /

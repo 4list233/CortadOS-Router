@@ -956,7 +956,9 @@ def _log_moved(core, body: dict[str, Any], moved: dict[str, Any], *, client: str
 # a request a COST rule moved to a local model (R0 auto_route or the published index; never a sensitive bind, never
 # the client's own x-cortados-local: prefer, never a request any sensitivity detector marked) runs on the API instead,
 # so credit about to be lost does work the Pro would otherwise do. [ESCALATE] the exact rule: #114 says only "credit
-# close to expiring may be preferred over local".
+# close to expiring may be preferred over local". Retired while selection.api_pacing is on (table v22, owner
+# 2026-11-24): the grant is then paced to its stop line from day one as a scored pool (core.api_pace), not only in its
+# last days and not only on local-bound work.
 API_PROVIDER = "anthropic-api"
 API_BIND_REASON = "api_credit_expiry"
 API_PREFER_REASONS = ("auto_route", "index")
@@ -1018,6 +1020,20 @@ def api_model(core, r: dict[str, Any]) -> str | None:
     return None
 
 
+def api_pacing_on(core) -> bool:
+    """selection.api_pacing is on in the routing table (scarcity v2 §9 step 4, table v22): the API credit grant is paced
+    to its stop line as a scored pool in core.resolve, and the 3-day expiry preference below is retired. A core without
+    the flag's reader (an older core, a test double) is v21: off."""
+    reader = getattr(core, "api_pacing_cfg", None)
+    if reader is None:
+        return False
+    try:
+        return reader() is not None
+    except Exception as exc:                       # the table cannot be read: v21's rule stays, and the log says why
+        logger.warning("api pacing flag unreadable (%s); the expiry preference stays as in v21", type(exc).__name__)
+        return False
+
+
 def prefer_api_credit(core, body: dict[str, Any], r: dict[str, Any], *, client: str, conversation_id: str,
                       excluded: Callable[[str], bool] = lambda name: False, now: float | None = None
                       ) -> dict[str, Any]:
@@ -1031,6 +1047,8 @@ def prefer_api_credit(core, body: dict[str, Any], r: dict[str, Any], *, client: 
     try:
         if not r.get("local") or r.get("pinned") or body.get(NO_LOCAL_KEY) or r.get("degraded"):
             return r
+        if api_pacing_on(core):
+            return r                               # retired by the grant's pacing (selection.api_pacing, table v22)
         if r.get("bind_reason") not in API_PREFER_REASONS or r.get(CLOUD_REROUTE_OK) is not True:
             return r
         ok, why = route_admission(r)

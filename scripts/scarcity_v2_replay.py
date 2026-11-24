@@ -131,6 +131,7 @@ class Sim:
         self.k = {"claude": a.k_claude, "claude#b": a.k_claude, "codex": a.k_codex,
                   "anthropic-api": self.stop_usd / 100.0}
         self.trace = []
+        self.api_path = []
         self.ctrl = {}
 
     # ------------------------------------------------------------ quota accounting
@@ -213,6 +214,10 @@ class Sim:
             lanes[lane] = sc.finish(lane, rec)
         api = self.st["anthropic-api"]
         gw = sc.window_view("grant", api["used"], self.grant_end, self.grant_window_s, now)
+        if self.a.api_history:
+            # the live sampler writes the grant's window into scarcity-history.jsonl like any lane (every 5 min), so
+            # recent_burn_rates learns its burn; --no-api-history reproduces the design doc's runs, which left it out
+            self.hist[("anthropic-api", "grant")].append((now, api["used"]))
         lanes["anthropic-api"] = sc.finish("anthropic-api", {
             "windows": [gw], "fetched_at": now, "tried_at": now, "error": None, "stop_line_usd": self.stop_usd,
             "budget_usd": self.stop_usd / 0.95, "spent_usd": api["spent"], "lane_on": self.api_on()})
@@ -222,6 +227,8 @@ class Sim:
                 v["fetched_at"] = v["tried_at"] = now
             lanes[lane] = v
         self.reading = {"fetched_at": now, "lanes": lanes}
+        if int(now) % (6 * 3600) < TICK:                               # the grant's spend path, every policy
+            self.api_path.append((time.strftime("%m-%d %H:%M", time.localtime(now)), round(api["spent"], 2)))
         self.control()
 
     def api_on(self):
@@ -379,6 +386,8 @@ def main():
     ap.add_argument("--drain-line-sd", type=float, default=99.0, help="drain line of a spend-down pool (%% of its stop line)")
     ap.add_argument("--drain-horizon-sd-h", type=float, default=96.0)
     ap.add_argument("--no-spend-down", dest="spend_down", action="store_false")
+    ap.add_argument("--no-api-history", dest="api_history", action="store_false",
+                    help="leave the grant's window out of the simulated history (the design doc's 2026-11-24 runs)")
     ap.add_argument("--gap", type=float, nargs=2, default=(1795212516.0, 1795377471.0),
                     help="epochs of a hole in the copied route log to fill from two days earlier; --gap 0 0 for none")
     ap.add_argument("--prior-flex", type=float, default=20.0)
@@ -498,6 +507,7 @@ def main():
         "drain_hours": {p: round(v, 1) for p, v in sim.drain_hours.items()},
         "mix": [{"band": b, "pool": p, "model": m, "calls": n} for (b, p, m), n in sorted(sim.mix.items(), key=str)],
         "trace": sim.trace,
+        "api_path": sim.api_path,
     }
     json.dump(result, open(a.out, "w"), indent=1)
     print(f"{a.policy}: {len(stream)} calls in {result['elapsed_s']} s -> {a.out}", file=sys.stderr)
