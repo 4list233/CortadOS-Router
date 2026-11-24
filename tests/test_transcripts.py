@@ -21,6 +21,7 @@ from tests.provider_fakes import setUpModule, tearDownModule  # noqa: F401  (FAK
 FAKE_CODEX = Path(__file__).with_name("fixtures") / "fake_codex_app_server.py"
 FAKE_CLAUDE = Path(__file__).with_name("fixtures") / "fake_claude_cli.py"
 TOKEN = "transcript-test-owner-token-0123456789"
+WITHHELD = "[withheld: content could not be safely redacted]"
 READ_TOOL = {"name": "Read", "description": "Read a file", "input_schema": {
     "type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}
 ROUTE = {"provider": "codex-cli", "model": "gpt-test", "band": "R2", "route_id": "r-tx-1",
@@ -162,15 +163,118 @@ class RedactionTests(Base):
         _, t0 = self.lines(s)
         self.assertEqual(t0["user"][0]["text"], "[1] see {not json ***")
         self.assertEqual(json.loads(t0["assistant"][0]["text"]), {"k": "***"})
-        self.assertEqual(t0["tool_results"][0]["content"][0]["text"], "{broken ***")
-        self.assertEqual(t0["redaction"]["withheld"], 0)
+        # A tool's output is not prose: JSON-looking text that does not decode is withheld (fail closed), as in the
+        # run export, never redacted as text (transcript review round 1).
+        self.assertEqual(t0["tool_results"][0]["content"][0]["text"], WITHHELD)
+        self.assertEqual(t0["redaction"]["withheld"], 1)
 
     def test_the_one_canonical_redactor_is_used(self):
         s = self.session()
-        with mock.patch.object(transcripts.child_tasks, "redact_for_export",
-                               wraps=transcripts.child_tasks.redact_for_export) as spy:
+        ct = transcripts.child_tasks
+        with mock.patch.object(ct, "redact_known", wraps=ct.redact_known) as known, \
+                mock.patch.object(ct, "cap_for_export", wraps=ct.cap_for_export) as cap:
             self.turn(s)
-        self.assertGreaterEqual(spy.call_count, 2)                   # the header and the turn
+        self.assertGreaterEqual(known.call_count, 2)
+        self.assertEqual(cap.call_count, 2)                          # once over the header, once over the whole turn
+
+    # -- transcript review round 1 (gpt-6.1-sol): both scenarios failed on a5a2a3c.
+    def raw_has_no(self, s, *secrets):
+        raw = self.path(s).read_text()
+        for x in secrets:
+            self.assertNotIn(x, raw)
+            self.assertNotIn(json.dumps(x)[1:-1], raw)
+
+    def test_malformed_json_tool_output_with_a_unicode_escaped_token_is_withheld(self):
+        escaped = "".join("\\u%04x" % ord(c) for c in TOKEN)
+        malformed = '{"auth": "' + escaped + '", "more": '              # does not decode
+        self.assertEqual(json.loads('"' + escaped + '"'), TOKEN)    # the token is recoverable from it
+        s = self.session()
+        self.turn(s, tool_results={"c1": {"content": [{"type": "text", "text": malformed}]},
+                                   "c2": {"content": malformed},
+                                   "c3": {"content": [{"type": "input_text", "text": malformed}]}})
+        raw = self.path(s).read_text()
+        self.assertNotIn(escaped, raw)
+        self.assertNotIn(escaped.replace("\\", "\\\\"), raw)
+        _, t0 = self.lines(s)
+        by_id = {r["tool_use_id"]: r for r in t0["tool_results"]}
+        self.assertEqual(by_id["c1"]["content"][0]["text"], WITHHELD)
+        self.assertEqual(by_id["c2"]["content"], WITHHELD)
+        self.assertEqual(by_id["c3"]["content"][0]["text"], WITHHELD)
+        self.assertEqual(t0["redaction"]["withheld"], 3)
+        # The run export's strict path withholds the same input: one rule for both records.
+        red = transcripts.child_tasks.provider_redactor((TOKEN,))
+        self.assertEqual(transcripts.child_tasks.redact_for_export(red, malformed)[:2], (WITHHELD, 1))
+
+    def test_tool_output_blocks_inside_message_content_are_never_prose(self):
+        s = self.session()
+        self.turn(s, user_content=[{"type": "tool_result", "tool_use_id": "x",
+                                    "content": [{"type": "text", "text": "{oops " + TOKEN}]},
+                                   {"type": "function_call_output", "call_id": "y", "output": "[1, " + TOKEN}])
+        _, t0 = self.lines(s)
+        self.assertEqual(t0["user"][0]["content"][0]["text"], WITHHELD)
+        self.assertEqual(t0["user"][1]["output"], WITHHELD)
+        self.raw_has_no(s, TOKEN)
+
+    def test_a_known_credential_in_an_encoded_spelling_is_withheld_even_in_prose(self):
+        import base64
+        import urllib.parse
+        uni = "".join("\\u%04x" % ord(c) for c in TOKEN)
+        pct = "".join("%%%02X" % ord(c) for c in TOKEN)
+        encoded = {"unicode": f"[note] token {uni} here", "unicode_malformed": "{oops " + uni,
+                   "percent": f"https://x/?t={pct}", "percent_twice": "https://x/?t=" + urllib.parse.quote(pct),
+                   "base64": "creds " + base64.b64encode(("u:" + TOKEN).encode()).decode(),
+                   "base64_url": "c=" + base64.urlsafe_b64encode(("ab" + TOKEN + "z").encode()).decode()}
+        for name, text in encoded.items():
+            with self.subTest(name):
+                s = self.session(sid=f"{name:x<32}"[:32].replace("_", "-"))
+                self.turn(s, text, tool_results={"c1": {"content": [{"type": "text", "text": text}]}},
+                          assistant_blocks=[{"type": "text", "text": text}])
+                _, t0 = self.lines(s)
+                self.assertEqual(t0["user"][0]["text"], WITHHELD)
+                self.assertEqual(t0["assistant"][0]["text"], WITHHELD)
+                self.assertEqual(t0["tool_results"][0]["content"][0]["text"], WITHHELD)
+                raw = self.path(s).read_text()
+                self.assertNotIn(text, raw)
+                for word in text.replace("=", " ").split():
+                    if len(word) >= 20:                              # the encoded payload, in any part
+                        self.assertNotIn(word, raw)
+        s = self.session(sid="ordinary-" + "0" * 23)
+        plain = "100% done; path C:\\temp\\x and dGhpcyBpcyBub3QgYSB0b2tlbg=="
+        self.turn(s, plain)
+        self.assertEqual(self.lines(s)[1]["user"][0]["text"], plain)  # no known credential: untouched
+
+    def test_credential_named_keys_are_scrubbed_at_every_depth_and_in_lists(self):
+        secret = "opaque-service-secret-0123456789"
+        keys = ["x-api-key", "X-Api-Key", "api_key", "apiKey", "api-key", "Authorization", "proxy-authorization",
+                "token", "access_token", "refreshToken", "id-token", "password", "Passwd", "client_secret",
+                "Cookie", "set-cookie", "private_key", "credentials", "auth"]
+        s = self.session()
+        results, inputs = {}, []
+        for i, k in enumerate(keys):
+            # depth 1, 2 and 4, a list of values, and JSON text holding the key
+            results[f"a{i}"] = {"content": [], "structuredContent": {k: secret}}
+            results[f"b{i}"] = {"content": [{"type": "text", "text": "ok"}],
+                                "structuredContent": {"outer": {"mid": [{"inner": {k: secret}}]}}}
+            results[f"c{i}"] = {"content": [{"type": "text", "text": json.dumps({"headers": {k: secret}})}]}
+            results[f"d{i}"] = {"content": [], "structuredContent": {k: [secret, {"v": secret}]}}
+            inputs.append({"type": "tool_use", "id": f"u{i}", "name": "Fetch",
+                           "input": {"url": "https://x", "headers": [{k: secret}]}})
+        self.turn(s, tool_results=results, assistant_blocks=inputs,
+                  user_content=[{"type": "text", "text": "hi"}, {"type": "x", "meta": {"deep": {keys[0]: secret}}}])
+        self.raw_has_no(s, secret)
+        _, t0 = self.lines(s)
+        by_id = {r["tool_use_id"]: r for r in t0["tool_results"]}
+        self.assertEqual(by_id["a0"]["structuredContent"], {"x-api-key": "[scrubbed:authorization]"})
+        self.assertEqual(by_id["a7"]["structuredContent"], {"token": "[scrubbed:credential]"})
+        self.assertEqual(json.loads(by_id["c11"]["content"][0]["text"]), {"headers": {"password": "[scrubbed:credential]"}})
+        self.assertGreaterEqual(sum(t0["redaction"]["scrubbed"].values()), 6 * len(keys))
+        # Ordinary keys ending alike, and numbers under credential-like keys, are left alone.
+        s2 = self.session(sid="keys-ok-" + "0" * 24)
+        self.turn(s2, tool_results={"c": {"content": [], "structuredContent": {
+            "token_type": "Bearer", "tokenizer": "bpe", "author": "me", "max_tokens": 5, "token_count": 3}}})
+        self.assertEqual(self.lines(s2)[1]["tool_results"][0]["structuredContent"],
+                         {"token_type": "Bearer", "tokenizer": "bpe", "author": "me", "max_tokens": 5,
+                          "token_count": 3})
 
 
 class GuardTests(Base):

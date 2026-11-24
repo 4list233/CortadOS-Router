@@ -1068,9 +1068,14 @@ another, and it would sit in a vendor-owned layout. So the provider writes its o
 the client's new content and tool results, and the reply as delivered (text and tool calls), appended after each turn.
 - Directories 0700, files 0600, append-only, opened through the compaction store's anchored primitives (no symlink, FIFO
   or hard link is ever written through).
-- Secrets: every text goes through the run export's redaction (`child_tasks.redact_for_export`: the provider's own token
-  and this host's credentials, structurally and fail-closed; message prose that does not decode is redacted as text;
-  then well-known secret shapes are scrubbed). Each turn records what was withheld, scrubbed or cut (`redaction`).
+- Secrets: every text goes through the run export's redaction (`child_tasks.redact_known`, then `cap_for_export`: the
+  provider's own token and this host's credentials, structurally and fail-closed; message prose that does not decode is
+  redacted as text; a tool's output never counts as prose, so JSON-looking tool output that does not decode is withheld;
+  text still holding a known credential in an encoded spelling (`\uXXXX` or other escapes, percent-encoding, base64)
+  is withheld; then, once over the whole header and the whole turn so every key keeps its context, well-known secret
+  shapes are scrubbed and every value under a credential-named key (Authorization, `x-api-key`, `api_key`, `*token`,
+  `*secret`, `password`, `cookie`, `credentials`, ... at any depth, JSON text inside a string included) is scrubbed
+  whole). Each turn records what was withheld, scrubbed or cut (`redaction`).
   Inline images and files are replaced by their size; each text is capped at 200,000 characters (marked).
 - It never fails or slows a request: the turn is serialized and queued for a background writer (the compaction store's
   bounded queue). A lost write (a full queue, an I/O error, a guard below) is logged and counted in the route-log error

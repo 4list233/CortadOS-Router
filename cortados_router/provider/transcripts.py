@@ -70,6 +70,9 @@ MEDIA_INLINE_MAX = 256
 SEEN_FILES_MAX = 4096
 # Header / turn fields holding free-form prose rather than structured data.
 PROSE_KEYS = ("system", "note")
+# Block types holding a tool's output inside message content (Anthropic, Responses): redacted whole and strictly, never
+# as prose, like the turn's `tool_results`.
+TOOL_OUTPUT_TYPES = ("tool_result", "function_call_output", "custom_tool_call_output", "mcp_tool_call_output")
 _ID_OK = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _MEDIA_TYPES = ("image", "document", "input_image", "input_file", "inputImage")
 _MEDIA_KEYS = ("data", "image_url", "imageUrl", "file_data", "url")
@@ -177,35 +180,43 @@ class Writer(cstore.Store):
             return
         job = json.loads(payload)
         red = child_tasks.provider_redactor(job.get("tokens") or ())
-        withheld = truncated = 0
-        scrubbed: dict[str, int] = {}
+        withheld = 0
 
-        def one(v, prose=False):
-            nonlocal withheld, truncated
-            out, w, s, t = child_tasks.redact_for_export(red, v, TEXT_LIMIT, prose=prose)
-            withheld, truncated = withheld + w, truncated + t
-            for k, c in s.items():
-                scrubbed[k] = scrubbed.get(k, 0) + c
+        def known(v, prose=False):
+            nonlocal withheld
+            out, w = child_tasks.redact_known(red, v, prose=prose)
+            withheld += w
             return out
 
         def clean(v, key=None):
-            # Message prose (a text block's text, the system prompt) may start with `[` or `{` and is redacted as
-            # prose; everything else (tool inputs, ids, metadata) structurally, fail closed.
+            # Known credentials first, per part: message prose (a text block's text, the system prompt) may start with
+            # `[` or `{` and is redacted as prose; everything else (tool inputs, ids, metadata) structurally, fail closed.
+            # A tool's output is never prose: it is redacted whole and structurally (JSON-looking text that does not
+            # decode is withheld, as the run export does; transcript review round 1).
             if isinstance(v, list):
                 return [clean(x) for x in v]
             if isinstance(v, dict):
+                if v.get("type") in TOOL_OUTPUT_TYPES:
+                    return known(v)
                 if v.get("type") in ("text", "input_text", "output_text") and isinstance(v.get("text"), str):
-                    rest = one({k: x for k, x in v.items() if k != "text"})
+                    rest = known({k: x for k, x in v.items() if k != "text"})
                     if isinstance(rest, dict) and "text" not in rest:
-                        rest["text"] = one(v["text"], prose=True)
+                        rest["text"] = known(v["text"], prose=True)
                         return rest
-                    return one(v)
-                return {one(str(k), prose=True): clean(x, k) for k, x in v.items()}
+                    return known(v)
+                return {known(str(k), prose=True): (known(x) if k == "tool_results" else clean(x, k))
+                        for k, x in v.items()}
             if isinstance(v, str) and key in PROSE_KEYS:
-                return one(v, prose=True)
-            return one(v)
+                return known(v, prose=True)
+            return known(v)
 
-        header, turn = clean(job["header"]), clean(job["turn"])
+        # Then the export's shape scrub and text cap ONCE over each whole record, so a credential-named key (an
+        # `x-api-key` inside a tool's structuredContent) is seen with its value at every depth.
+        header, h_scrubbed, h_truncated = child_tasks.cap_for_export(clean(job["header"]), TEXT_LIMIT)
+        turn, scrubbed, truncated = child_tasks.cap_for_export(clean(job["turn"]), TEXT_LIMIT)
+        for k, c in h_scrubbed.items():
+            scrubbed[k] = scrubbed.get(k, 0) + c
+        truncated += h_truncated
         if isinstance(turn, dict):
             turn["redaction"] = {"withheld": withheld, "scrubbed": scrubbed, "truncated": truncated}
         turn_line = json.dumps(turn, ensure_ascii=True) + "\n"
