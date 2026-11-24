@@ -1,5 +1,5 @@
 """The PC node (#145, option A): the local gate on Windows through its platform seam (gate_platform.py), the `strata`
-backend (local_backend.py), the owner-away policy (node_policy.py), the serving toggle and the provider's handling of a
+backend (local_backend.py), the serving policy (node_policy.py), the serving toggle and the provider's handling of a
 second node that is down. Everything Windows-specific runs here on macOS through the seam with fakes: no ctypes call,
 no msvcrt, no PowerShell, nothing on the PC. In-thread fake Strata on loopback only."""
 import json
@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TOKEN = "b" * 64
 SERVED = "Qwen3.6-35B-A3B"
 USER_SID = "S-1-5-21-1000-2000-3000-1001"
+OWNER_SESSION = {"id": 1, "user": "PC\\owner", "logon": 134_000_000_000_000_000}
 EXAMPLE = ROOT / "tables" / "local-backend.strata.example.json"
 PC_EXAMPLE = ROOT / "tables" / "resources.pc-node.example.json"
 
@@ -60,8 +61,10 @@ class FakeMsvcrt:
 class FakeWinApi:
     """gate_platform.WinApi's methods, answered from fields. An Exception value is raised (the call failed)."""
 
-    def __init__(self, sessions=1, ac=1, memory=50, owner=USER_SID, aces=None, idle=0.0, quns=5):
-        self.sessions, self.ac, self.memory, self.owner, self.idle, self.quns = sessions, ac, memory, owner, idle, quns
+    def __init__(self, sessions=None, ac=1, memory=50, owner=USER_SID, aces=None, idle=0.0, quns=5, current=None):
+        self.sessions = [dict(OWNER_SESSION)] if sessions is None else sessions
+        self.ac, self.memory, self.owner, self.idle, self.quns = ac, memory, owner, idle, quns
+        self.current = dict(OWNER_SESSION) if current is None else current
         self.aces = [(0, 0, USER_SID), (0, 0, gate_platform.SID_SYSTEM),
                      (0, 0, gate_platform.SID_ADMINISTRATORS)] if aces is None else aces
         self.calls = []
@@ -86,8 +89,11 @@ class FakeWinApi:
     def memory_load_pct(self):
         return self._get("memory_load_pct", self.memory)
 
-    def active_user_sessions(self):
-        return self._get("active_user_sessions", self.sessions)
+    def active_sessions(self):
+        return self._get("active_sessions", self.sessions)
+
+    def current_session(self):
+        return self._get("current_session", self.current)
 
     def input_idle_s(self):
         return self._get("input_idle_s", self.idle)
@@ -289,7 +295,9 @@ class StrataConfigTests(unittest.TestCase):
         self.assertEqual(c["model"]["quant"], "UD-Q4_K_XL")
         self.assertIsNone(c["governor"])
         self.assertEqual(c["node_policy"]["kind"], "windows-idle")
-        self.assertEqual(c["node_policy"]["idle_after_s"], 300.0)
+        self.assertIsNone(c["node_policy"]["idle_after_s"])                 # input alone never stops it (owner 2026-11-24)
+        self.assertTrue(c["node_policy"]["fullscreen_blocks"])
+        self.assertEqual(c["node_policy"]["gpu_busy_pct"], 40)
         self.assertNotIn("Coder", EXAMPLE.read_text())                       # the 125B is left out (owner 2026-11-24)
 
     def test_the_model_is_config_another_entry_is_selected_by_name(self):
@@ -314,6 +322,8 @@ class StrataConfigTests(unittest.TestCase):
         bad(lambda r: r.update(upstream="http://10.0.0.5:8080"), "loopback")
         bad(lambda r: r["node_policy"].update(gpu_busy_pct=0), "gpu_busy_pct")
         bad(lambda r: r["node_policy"].update(idle_after_s=-1), "idle_after_s")
+        bad(lambda r: r["node_policy"].update(own_gpu_grace_s=10), "unknown key")       # replaced in fix round 1
+        bad(lambda r: r["node_policy"].update(own_gpu_skip_max_s=0), "own_gpu_skip_max_s")
         bad(lambda r: r["node_policy"].update(activity_stale_s=6), "activity_stale_s")
         bad(lambda r: r["node_policy"].update(kind="mac"), "kind")
         bad(lambda r: r["node_policy"].update(extra=1), "unknown key")
@@ -516,7 +526,7 @@ class StrataGateTests(StrataGateHarness):
         self.assertEqual(self.call(local_gate.SWITCH_PATH)[1]["models_loaded"], [])
 
 
-# ---------------------------------------------------------------- the owner-away policy
+# ---------------------------------------------------------------- the serving policy (windows-idle)
 class PolicyBase(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -527,6 +537,7 @@ class PolicyBase(unittest.TestCase):
         self.wall = [1_800_000_000.0]
         self.gpu = ["5\n"]
         self.smi_calls = []
+        self.slept = []
 
     def run_smi(self, argv, **kw):
         self.smi_calls.append(argv)
@@ -539,49 +550,71 @@ class PolicyBase(unittest.TestCase):
             stdout = out
         return R()
 
+    def sleep(self, s):
+        self.slept.append(s)
+        self.clock[0] += s
+
     def policy(self, **cfg):
         raw = {"kind": "windows-idle", "activity_file": self.activity, **cfg}
         return node_policy.WindowsIdlePolicy(node_policy.check_config(raw), api=self.api, run=self.run_smi,
                                              clock=lambda: self.clock[0], wall=lambda: self.wall[0],
-                                             switch_on=lambda: self.switch[0])
+                                             switch_on=lambda: self.switch[0], sleep=self.sleep)
 
-    def write(self, idle_s, fullscreen="none", age=1.0):
-        Path(self.activity).write_text(json.dumps({"v": 1, "at": self.wall[0] - age, "idle_s": idle_s,
-                                                   "fullscreen": fullscreen}))
+    def write(self, idle_s=0.0, fullscreen="none", age=1.0, session=None, path_id=None):
+        session = dict(OWNER_SESSION) if session is None else session
+        path = node_policy.session_activity_path(self.activity, session["id"] if path_id is None else path_id)
+        Path(path).write_text(json.dumps({"v": 2, "at": self.wall[0] - age, "session": session, "idle_s": idle_s,
+                                          "fullscreen": fullscreen}))
 
 
 class IdlePolicyTests(PolicyBase):
     def test_owner_signed_out_is_away_and_serves(self):
-        self.api.sessions = 0
+        self.api.sessions = []
         self.assertEqual(self.policy().allowed(), (True, node_policy.ALLOWED))
 
-    def test_owner_idle_long_enough_serves_active_refuses(self):
-        self.write(idle_s=301)
-        self.assertEqual(self.policy().allowed(), (True, node_policy.ALLOWED))
+    def test_default_serves_while_the_owner_types_with_no_full_screen_app(self):
+        # owner 2026-11-24 (fix round 1): input alone does not stop serving; only the toggle, full screen or the GPU
+        self.write(idle_s=0.4)
+        p = self.policy()
+        self.assertEqual(p.allowed(), (True, node_policy.ALLOWED))
+        self.assertEqual(p.status()["activity"], "present")
+
+    def test_the_input_rule_is_an_option_off_by_default(self):
         self.write(idle_s=12)
-        self.assertEqual(self.policy().allowed(), (False, node_policy.OWNER_ACTIVE))
+        self.assertEqual(self.policy(idle_after_s=300).allowed(), (False, node_policy.OWNER_ACTIVE))
+        self.write(idle_s=301)
+        self.assertEqual(self.policy(idle_after_s=300).allowed(), (True, node_policy.ALLOWED))
+        self.assertEqual(self.policy(idle_after_s=300).status()["activity"], "idle")
 
-    def test_a_full_screen_game_refuses_even_when_input_is_idle(self):
+    def test_a_full_screen_game_refuses(self):
         for quns_word in ("busy", "d3d", "presentation"):
             self.write(idle_s=3600, fullscreen=quns_word)
-            self.assertEqual(self.policy().allowed(), (False, node_policy.FULLSCREEN))
+            p = self.policy()
+            self.assertEqual(p.allowed(), (False, node_policy.FULLSCREEN))
+            self.assertEqual(p.status()["activity"], "fullscreen")
         self.write(idle_s=3600, fullscreen="unknown")
         self.assertEqual(self.policy().allowed(), (False, node_policy.OWNER_UNKNOWN))
 
     def test_missing_stale_or_garbled_activity_is_unknown_never_free(self):
         p = self.policy()
         self.assertEqual(p.allowed(), (False, node_policy.OWNER_UNKNOWN))               # no writer running
-        self.write(idle_s=3600, age=21)
+        self.write(age=21)
         self.assertEqual(self.policy().allowed(), (False, node_policy.OWNER_UNKNOWN))   # stale
-        self.write(idle_s=3600, age=-60)
+        self.write(age=-60)
         self.assertEqual(self.policy().allowed(), (False, node_policy.OWNER_UNKNOWN))   # from the future
-        Path(self.activity).write_text("{not json")
+        Path(node_policy.session_activity_path(self.activity, 1)).write_text("{not json")
+        self.assertEqual(self.policy().allowed(), (False, node_policy.OWNER_UNKNOWN))
+        # a version-1 record (no session identity) is never accepted
+        Path(node_policy.session_activity_path(self.activity, 1)).write_text(json.dumps(
+            {"v": 1, "at": self.wall[0], "idle_s": 900, "fullscreen": "none"}))
         self.assertEqual(self.policy().allowed(), (False, node_policy.OWNER_UNKNOWN))
         self.api.sessions = OSError(5, "denied")
         self.assertEqual(self.policy().allowed(), (False, node_policy.OWNER_UNKNOWN))   # sessions unreadable
+        self.api.sessions = [{"id": 1}]
+        self.assertEqual(self.policy().allowed(), (False, node_policy.OWNER_UNKNOWN))   # malformed identity
 
     def test_switch_off_and_power(self):
-        self.api.sessions = 0
+        self.api.sessions = []
         self.switch[0] = False
         self.assertEqual(self.policy().allowed(), (False, node_policy.SWITCH_OFF))
         self.switch[0] = True
@@ -593,22 +626,22 @@ class IdlePolicyTests(PolicyBase):
         self.assertTrue(self.policy(require_ac=False).allowed()[0])
 
     def test_the_switch_is_read_on_every_call_the_samples_are_cached(self):
-        self.api.sessions = 0
+        self.api.sessions = []
         p = self.policy()
         self.assertTrue(p.allowed()[0])
         self.assertTrue(p.allowed()[0])
-        self.assertEqual(self.api.calls.count("active_user_sessions"), 1)               # within sample_s
+        self.assertEqual(self.api.calls.count("active_sessions"), 1)                    # within sample_s
         self.switch[0] = False
         self.assertEqual(p.allowed(), (False, node_policy.SWITCH_OFF))                  # at once
         self.switch[0] = True
-        self.api.sessions = 1
-        self.write(idle_s=1)
+        self.api.sessions = [dict(OWNER_SESSION)]
+        self.write(fullscreen="d3d")
         self.assertTrue(p.allowed()[0])                                                 # still the cached sample
         self.clock[0] += 3.0
-        self.assertEqual(p.allowed(), (False, node_policy.OWNER_ACTIVE))                # re-sampled
+        self.assertEqual(p.allowed(), (False, node_policy.FULLSCREEN))                  # re-sampled
 
     def test_another_program_using_the_gpu_refuses(self):
-        self.api.sessions = 0
+        self.api.sessions = []
         self.gpu[0] = "85\n"
         self.assertEqual(self.policy().allowed(), (False, node_policy.GPU_BUSY))
         self.assertEqual(self.smi_calls[0][1:3], ["-i", "0"])
@@ -618,21 +651,8 @@ class IdlePolicyTests(PolicyBase):
         self.gpu[0] = "85\n"
         self.assertTrue(self.policy(gpu_busy_pct=None).allowed()[0])                     # check turned off
 
-    def test_the_gates_own_decoding_is_not_another_program(self):
-        self.api.sessions = 0
-        self.gpu[0] = "97\n"
-        p = self.policy()
-        p.forward_started()
-        self.assertTrue(p.allowed()[0])                                                 # own turn running
-        p.forward_ended()
-        self.clock[0] += 3.0
-        self.assertTrue(p.allowed()[0])                                                 # within own_gpu_grace_s
-        self.clock[0] += 10.0
-        self.assertEqual(p.allowed(), (False, node_policy.GPU_BUSY))                    # someone else now
-        self.assertEqual(len(self.smi_calls), 1)
-
     def test_memory_load_only_when_configured(self):
-        self.api.sessions, self.api.memory = 0, 99
+        self.api.sessions, self.api.memory = [], 99
         self.assertTrue(self.policy().allowed()[0])                                     # default off (docstring)
         self.assertEqual(self.policy(max_memory_load_pct=95).allowed(), (False, node_policy.MEMORY_HIGH))
         self.api.memory = OSError(1, "x")
@@ -642,10 +662,108 @@ class IdlePolicyTests(PolicyBase):
         self.write(idle_s=4000)
         st = self.policy().status()
         self.assertEqual(st, {"switch": "on", "allowed": True, "reason": node_policy.ALLOWED, "power": "ac",
-                              "activity": "idle"})
+                              "activity": "present"})
+        self.assertLessEqual({"away", "present", "idle", "active", "fullscreen", "unknown"}, local_switch.ACTIVITY)
 
     def test_every_refusal_is_one_the_provider_may_repeat(self):
         self.assertTrue({"local gate: " + r for r in node_policy.REFUSALS} <= local_lane.PRO_LOCAL_REFUSALS)
+
+
+class OwnGpuTests(PolicyBase):
+    """Reviewer finding 1 (fix round 1): the GPU check could stay off forever, because every forwarded turn's end
+    renewed a grace period. Now a reading is taken whenever the gate is quiet (own_gpu_settle_s after its last turn),
+    and a turn of its own in flight leans on the last quiet reading for at most own_gpu_skip_max_s."""
+
+    def setUp(self):
+        super().setUp()
+        self.api.sessions = []
+
+    def test_back_to_back_short_turns_never_hide_another_programs_load(self):
+        # the reviewer's repro: a conversation's turns arrive under 10 s apart, and a game takes the card meanwhile
+        p = self.policy()
+        admitted = 0
+        for i in range(13):
+            if p.allowed()[0]:
+                admitted += 1
+                p.forward_started()
+                if i == 0:
+                    self.gpu[0] = "99\n"                                                # the game starts mid-turn
+                self.clock[0] += 3.0
+                p.forward_ended()
+            self.clock[0] += 4.0
+        self.assertEqual(admitted, 1)                                                   # only the turn before the game
+        self.assertEqual(p.allowed(), (False, node_policy.GPU_BUSY))
+        p.forward_started()                                                             # a call during a turn
+        self.clock[0] += 3.0
+        self.assertEqual(p.allowed(), (False, node_policy.GPU_UNKNOWN))                 # the busy reading stands
+
+    def test_failed_attempts_do_not_extend_the_skip(self):
+        p = self.policy()
+        self.assertTrue(p.allowed()[0])                                                 # quiet reading at t=100
+        self.gpu[0] = "99\n"
+        p.forward_started()                                                             # a long turn of its own
+        for _ in range(30):                                                             # attempts end and restart
+            p.forward_started()
+            p.forward_ended()
+            self.clock[0] += 3.0
+        self.assertEqual(p.allowed(), (False, node_policy.GPU_UNKNOWN))                 # 90 s > own_gpu_skip_max_s
+
+    def test_the_gates_own_decoding_is_not_another_program(self):
+        p = self.policy()
+        self.assertTrue(p.allowed()[0])                                                 # quiet reading, 5 %
+        n = len(self.smi_calls)
+        self.gpu[0] = "97\n"                                                            # Strata decoding
+        p.forward_started()
+        self.clock[0] += 20.0
+        self.assertTrue(p.allowed()[0])                                                 # own turn: no reading taken
+        self.assertEqual(len(self.smi_calls), n)
+        self.clock[0] += 3.0                                                            # past sample_s
+        p.forward_ended()
+        self.gpu[0] = "3\n"                                                             # Strata done: card quiet
+        self.clock[0] += 0.5
+        self.assertTrue(p.allowed()[0])                                                 # next turn 0.5 s later
+        self.assertEqual(len(self.smi_calls), n + 1)
+        self.assertAlmostEqual(sum(self.slept), 1.0)                                    # waited out the settle time
+
+    def test_a_reading_mixed_with_an_own_turn_start_is_not_trusted(self):
+        p = self.policy()
+        self.gpu[0] = "99\n"
+
+        def smi(argv, **kw):                                                            # a turn starts mid-reading
+            p.forward_started()
+            return self.run_smi(argv, **kw)
+        p._run = smi
+        self.assertEqual(p.allowed(), (False, node_policy.GPU_UNKNOWN))                 # no quiet reading yet
+
+
+class SessionBindingTests(PolicyBase):
+    """Reviewer finding 2 (fix round 1): each active session needs its own fresh record, bound to its id, user and
+    logon time."""
+
+    def test_a_record_of_another_session_never_covers_an_active_one(self):
+        other = {"id": 2, "user": "PC\\owner", "logon": OWNER_SESSION["logon"] + 1}
+        self.write(session=other)                                                       # disconnected session's writer
+        self.assertEqual(self.policy().allowed(), (False, node_policy.OWNER_UNKNOWN))
+        self.write(session=other, path_id=1)                                            # even in session 1's file
+        self.assertEqual(self.policy().allowed(), (False, node_policy.OWNER_UNKNOWN))
+        self.write()
+        self.assertTrue(self.policy().allowed()[0])
+
+    def test_an_earlier_logon_that_reused_the_session_id_is_refused(self):
+        self.write(session=dict(OWNER_SESSION, logon=OWNER_SESSION["logon"] - 10_000_000))
+        self.assertEqual(self.policy().allowed(), (False, node_policy.OWNER_UNKNOWN))
+        self.write(session=dict(OWNER_SESSION, user="PC\\guest"))
+        self.assertEqual(self.policy().allowed(), (False, node_policy.OWNER_UNKNOWN))
+
+    def test_every_active_session_must_be_covered(self):
+        second = {"id": 3, "user": "PC\\guest", "logon": 7}
+        self.api.sessions = [dict(OWNER_SESSION), second]
+        self.write()
+        self.assertEqual(self.policy().allowed(), (False, node_policy.OWNER_UNKNOWN))   # the guest has no writer
+        self.write(session=second, fullscreen="d3d")
+        self.assertEqual(self.policy().allowed(), (False, node_policy.FULLSCREEN))      # the guest is gaming
+        self.write(session=second)
+        self.assertTrue(self.policy().allowed()[0])
 
 
 class ActivityWriterTests(PolicyBase):
@@ -653,35 +771,42 @@ class ActivityWriterTests(PolicyBase):
         api = FakeWinApi(idle=412.37, quns=3)
         rc = node_policy.run_writer(self.activity, api=api, once=True, wall=lambda: self.wall[0])
         self.assertEqual(rc, 0)
-        self.assertEqual(node_policy.read_activity(self.activity, self.wall[0], 20),
+        path = node_policy.session_activity_path(self.activity, OWNER_SESSION["id"])
+        self.assertTrue(path.endswith("activity.s1.json"))
+        self.assertEqual(node_policy.read_activity(path, self.wall[0], 20, OWNER_SESSION),
                          {"idle_s": 412.4, "fullscreen": "d3d"})
-        self.assertTrue(Path(self.activity).read_bytes().isascii())
+        self.assertEqual(json.loads(Path(path).read_text())["session"], OWNER_SESSION)
+        self.assertTrue(Path(path).read_bytes().isascii())
+        self.assertFalse(os.path.exists(self.activity))                                 # never the shared base name
 
-    def test_a_failed_idle_read_writes_nothing_and_fails(self):
-        logged = []
-        rc = node_policy.run_writer(self.activity, api=FakeWinApi(idle=OSError(5, "x")), once=True, log=logged.append)
-        self.assertEqual(rc, 1)
-        self.assertFalse(os.path.exists(self.activity))
-        self.assertTrue(logged)
+    def test_a_failed_idle_or_identity_read_writes_nothing_and_fails(self):
+        for api in (FakeWinApi(idle=OSError(5, "x")), FakeWinApi(current=OSError(5, "x")),
+                    FakeWinApi(current={"id": 1})):
+            logged = []
+            rc = node_policy.run_writer(self.activity, api=api, once=True, log=logged.append)
+            self.assertEqual(rc, 1)
+            self.assertEqual(os.listdir(self.dir), [])
+            self.assertTrue(logged)
 
     def test_a_failed_fullscreen_read_is_written_as_unknown(self):
         node_policy.run_writer(self.activity, api=FakeWinApi(idle=900, quns=OSError(1, "x")), once=True,
                                wall=lambda: self.wall[0])
-        self.assertEqual(node_policy.read_activity(self.activity, self.wall[0], 20)["fullscreen"], "unknown")
+        path = node_policy.session_activity_path(self.activity, 1)
+        self.assertEqual(node_policy.read_activity(path, self.wall[0], 20, OWNER_SESSION)["fullscreen"], "unknown")
 
     def test_the_writer_refuses_to_run_off_windows(self):
         self.assertEqual(node_policy.main(["activity", "--out", self.activity]), 2)
 
 
 class IdleRefusalGateTests(StrataGateHarness):
-    """The gate with the real windows-idle policy (fake Windows inputs): it refuses with the fixed reason while the
-    owner is active, the provider's probe repeats that reason, and a turn already running finishes."""
+    """The gate with the real windows-idle policy (fake Windows inputs): it refuses with the fixed reason while a
+    full-screen app runs, the provider's probe repeats that reason, and a turn already running finishes."""
     POLICY = True
 
     def make_policy(self):
         self.pdir = tempfile.mkdtemp()
         self.activity = os.path.join(self.pdir, "activity.json")
-        self.api = FakeWinApi(sessions=1)
+        self.api = FakeWinApi()
         self.wall = [time.time()]
         self.clock = [0.0]
         local_resources.set_local_switch(True)
@@ -689,42 +814,43 @@ class IdleRefusalGateTests(StrataGateHarness):
         return node_policy.WindowsIdlePolicy(node_policy.check_config(raw), api=self.api, clock=lambda: self.clock[0],
                                              wall=lambda: self.wall[0])
 
-    def owner(self, idle_s):
-        Path(self.activity).write_text(json.dumps({"v": 1, "at": self.wall[0], "idle_s": idle_s, "fullscreen": "none"}))
+    def owner(self, fullscreen):
+        Path(node_policy.session_activity_path(self.activity, OWNER_SESSION["id"])).write_text(json.dumps(
+            {"v": 2, "at": self.wall[0], "session": OWNER_SESSION, "idle_s": 0.2, "fullscreen": fullscreen}))
         self.clock[0] += 10.0                                    # past sample_s: the next call re-reads
 
-    def test_owner_active_refuses_new_turns_and_the_probe(self):
-        self.owner(5)
+    def test_a_full_screen_game_refuses_new_turns_and_the_probe(self):
+        self.owner("d3d")
         code, data, _ = self.call("/v1/messages", self.MSG)
-        self.assertEqual((code, data["error"]["message"]), (503, "local gate: " + node_policy.OWNER_ACTIVE))
+        self.assertEqual((code, data["error"]["message"]), (503, "local gate: " + node_policy.FULLSCREEN))
         self.assertEqual(self.call("/api/tags")[0], 503)
         self.assertEqual(FakeStrata.paths, [])
         node = {"node": "pc", "base_url": self.url, "token": TOKEN, "probe_timeout_s": 2}
         with self.assertRaises(local_lane.LocalUnavailable) as cm:
             local_lane.probe(node)
-        self.assertIn("owner active", str(cm.exception))         # a fixed reason, repeated to the client
-        self.owner(900)
+        self.assertIn("full-screen app running", str(cm.exception))         # a fixed reason, repeated to the client
+        self.owner("none")
         self.assertEqual(self.call("/v1/messages", self.MSG)[0], 200)
 
-    def test_a_running_turn_finishes_when_the_owner_comes_back(self):
-        self.owner(900)
+    def test_a_running_turn_finishes_when_a_game_starts(self):
+        self.owner("none")
         FakeStrata.hold, FakeStrata.entered = threading.Event(), threading.Semaphore(0)
         first = {}
         t = threading.Thread(target=lambda: first.update(r=self.call("/v1/messages", self.MSG)), daemon=True)
         t.start()
         self.assertTrue(FakeStrata.entered.acquire(timeout=5))
-        self.owner(2)                                              # the owner is back mid-turn
+        self.owner("d3d")                                          # a game starts mid-turn
         FakeStrata.hold.set()
         t.join(5)
         self.assertEqual(first["r"][0], 200)                       # finished, not cut off
         self.assertEqual(self.call("/v1/messages", self.MSG)[0], 503)   # nothing new admitted
 
     def test_the_toggle_turns_serving_off_and_on_through_the_gate(self):
-        self.owner(900)
+        self.owner("none")
         code, st, _ = self.call(local_gate.SWITCH_PATH, {"on": False}, method="POST")
         self.assertEqual((code, st["switch"], st["allowed"], st["reason"]),
                          (200, "off", False, node_policy.SWITCH_OFF))
-        self.assertEqual(st["activity"], "idle")
+        self.assertEqual(st["activity"], "present")
         self.assertEqual(self.call("/v1/messages", self.MSG)[0], 503)
         self.assertFalse(local_resources.local_switch_path().exists())
         code, st, _ = self.call(local_gate.SWITCH_PATH, {"on": True}, method="POST")
@@ -732,7 +858,7 @@ class IdleRefusalGateTests(StrataGateHarness):
         self.assertEqual(self.call("/v1/messages", self.MSG)[0], 200)
 
     def test_the_provider_local_switch_tool_flips_the_pc_by_node_name(self):
-        self.owner(900)
+        self.owner("none")
         tok = Path(self.pdir) / "pc-token"
         tok.write_text(TOKEN)
         os.chmod(tok, 0o600)
@@ -743,7 +869,7 @@ class IdleRefusalGateTests(StrataGateHarness):
                                      "CORTADOS_LOCAL_PC_GATE_TOKEN_FILE": str(tok)}):
             row = local_switch.switch("PC", False, config_path=str(cfgp))
             self.assertEqual((row["node"], row["switch"], row["allowed"], row["backend"], row["activity"]),
-                             ("pc", "off", False, "strata", "idle"))
+                             ("pc", "off", False, "strata", "present"))
             self.assertEqual(row["reason"], node_policy.SWITCH_OFF)
             row = local_switch.switch("pc", True, config_path=str(cfgp))
             self.assertEqual((row["switch"], row["allowed"], row["models_loaded"]), ("on", True, [SERVED]))
@@ -909,6 +1035,29 @@ class WindowsScriptTests(unittest.TestCase):
             if any(c in line for c in changing) and not line.lstrip().startswith(("#", "function")):
                 opener = next((lines[j] for j in range(i, -1, -1) if lines[j].lstrip().startswith("Step ")), "")
                 self.assertTrue(opener, f"line {i}: {line.strip()} is not inside a Step block")
+
+    def test_installer_refuses_a_non_ascii_profile_before_any_change(self):
+        """Reviewer finding 3 (fix round 1): Write-Ascii stores a non-ASCII character as '?', so a profile path with one
+        would be written as another path. The check covers %USERPROFILE% and runs before the first Step outside -Remove."""
+        import re
+        text = (ROOT / "scripts" / "windows" / "install_pc_node.ps1").read_text()
+        lines = text.splitlines()
+        checks = text.split("$PathChecks = @(", 1)[1].split("\n)\n", 1)[0]
+        for name in ("$env:USERPROFILE", "$Repo", "$Python", "$PSScriptRoot"):
+            self.assertIn(name, checks)
+        check_at = next(i for i, l in enumerate(lines) if l.startswith("foreach ($pc in $PathChecks)"))
+        self.assertIn("Test-Ascii $pc[1]", lines[check_at + 1])
+        self.assertIn("throw", lines[check_at + 2])
+        remove_end = next(i for i, l in enumerate(lines) if l.startswith("if ($Remove)"))
+        remove_end = next(i for i in range(remove_end, len(lines)) if lines[i] == "}")
+        first_step = next(i for i in range(remove_end + 1, len(lines)) if re.match(r"^\s*Step ", lines[i]))
+        self.assertLess(check_at, first_step)
+        # the same rule as Test-Ascii (printable ASCII only), simulated
+        def test_ascii(t):
+            return all(32 <= ord(c) <= 126 for c in t)
+        self.assertIn("-gt 126 -or [int]$c -lt 32", text)
+        self.assertTrue(test_ascii("C:\\Users\\owner"))
+        self.assertFalse(test_ascii("C:\\Users\\Ren\u00e9"))
 
     def test_scripts_name_no_address_user_or_key(self):
         import re

@@ -4,7 +4,8 @@
   switch endpoint (/cortados/local-switch), the same switch the provider's local_switch tool flips with node "pc".
 
 .DESCRIPTION
-  on        serving allowed again (it still waits until the owner is away: node_policy windows-idle)
+  on        serving allowed again (still refused while a full-screen app runs or another program uses the GPU:
+            node_policy windows-idle)
   off       no new turns are admitted; a turn already running finishes
   status    the switch, whether the gate would serve now and why, and the owner state
   -FreeGpu  with off: also ask Strata on loopback to unload its model now, so a game gets the VRAM at once (Strata's

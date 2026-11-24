@@ -250,36 +250,68 @@ class WinApi:
             raise self._fail("GlobalMemoryStatusEx")
         return int(m.dwMemoryLoad)
 
-    def active_user_sessions(self) -> int:
-        """How many sessions are WTSActive with a signed-in user (the console or a remote desktop; a locked session is
-        still active, a disconnected one is not). Works from session 0, where the gate's startup task runs."""
+    def session_identity(self, session_id: int) -> dict | None:
+        """{"id", "user" ("DOMAIN\\name"), "logon" (the session's logon time, FILETIME ticks)} of one session, or None
+        when no user is signed in to it. node_policy binds each activity record to this triple: the writer stamps its own
+        session's (current_session), the gate compares it with each active session's (active_sessions). Both sides read
+        it through this one call, so they agree; the logon time tells a new logon from an earlier one that reused the
+        session id. WTSSessionInfo answers for any session from session 0."""
+        ct, wt = self.ct, self.wt
+        wtsapi32 = ct.WinDLL("wtsapi32", use_last_error=True)
+
+        class WTSINFOW(ct.Structure):
+            # wtsapi32.h: WINSTATIONNAME_LENGTH 32, DOMAIN_LENGTH 17, USERNAME_LENGTH 20 (+1); LARGE_INTEGER times.
+            _fields_ = [("State", ct.c_int), ("SessionId", wt.DWORD), ("IncomingBytes", wt.DWORD),
+                        ("OutgoingBytes", wt.DWORD), ("IncomingFrames", wt.DWORD), ("OutgoingFrames", wt.DWORD),
+                        ("IncomingCompressedBytes", wt.DWORD), ("OutgoingCompressedBytes", wt.DWORD),
+                        ("WinStationName", wt.WCHAR * 32), ("Domain", wt.WCHAR * 17), ("UserName", wt.WCHAR * 21),
+                        ("ConnectTime", ct.c_longlong), ("DisconnectTime", ct.c_longlong),
+                        ("LastInputTime", ct.c_longlong), ("LogonTime", ct.c_longlong), ("CurrentTime", ct.c_longlong)]
+
+        WTSSessionInfo = 24
+        buf, size = ct.c_void_p(), wt.DWORD()
+        if not wtsapi32.WTSQuerySessionInformationW(None, wt.DWORD(session_id), WTSSessionInfo, ct.byref(buf),
+                                                    ct.byref(size)):
+            raise self._fail("WTSQuerySessionInformationW")
+        try:
+            if not buf.value or size.value < ct.sizeof(WTSINFOW):
+                raise OSError(0, "WTSQuerySessionInformationW returned a short WTSINFOW")
+            info = ct.cast(buf, ct.POINTER(WTSINFOW)).contents
+            if not info.UserName:
+                return None
+            return {"id": int(session_id), "user": f"{info.Domain}\\{info.UserName}", "logon": int(info.LogonTime)}
+        finally:
+            wtsapi32.WTSFreeMemory(buf)
+
+    def active_sessions(self) -> list:
+        """session_identity of every session that is WTSActive with a signed-in user (the console or a remote desktop;
+        a locked session is still active, a disconnected one is not). Works from session 0, where the gate runs."""
         ct, wt = self.ct, self.wt
         wtsapi32 = ct.WinDLL("wtsapi32", use_last_error=True)
 
         class WTS_SESSION_INFOW(ct.Structure):
             _fields_ = [("SessionId", wt.DWORD), ("pWinStationName", wt.LPWSTR), ("State", ct.c_int)]
 
-        WTSActive, WTSUserName = 0, 5
+        WTSActive = 0
         info, count = ct.POINTER(WTS_SESSION_INFOW)(), wt.DWORD()
         if not wtsapi32.WTSEnumerateSessionsW(None, 0, 1, ct.byref(info), ct.byref(count)):
             raise self._fail("WTSEnumerateSessionsW")
         try:
-            n = 0
-            for i in range(count.value):
-                if info[i].State != WTSActive:
-                    continue
-                buf, size = wt.LPWSTR(), wt.DWORD()
-                if not wtsapi32.WTSQuerySessionInformationW(None, info[i].SessionId, WTSUserName, ct.byref(buf),
-                                                            ct.byref(size)):
-                    raise self._fail("WTSQuerySessionInformationW")
-                try:
-                    if buf.value:
-                        n += 1
-                finally:
-                    wtsapi32.WTSFreeMemory(buf)
-            return n
+            ids = [int(info[i].SessionId) for i in range(count.value) if info[i].State == WTSActive]
         finally:
             wtsapi32.WTSFreeMemory(info)
+        return [s for s in (self.session_identity(i) for i in ids) if s is not None]
+
+    def current_session(self) -> dict:
+        """session_identity of this process's own session (the activity writer's). OSError when it has no user."""
+        ct, wt = self.ct, self.wt
+        sid = wt.DWORD()
+        if not self.kernel32.ProcessIdToSessionId(self.kernel32.GetCurrentProcessId(), ct.byref(sid)):
+            raise self._fail("ProcessIdToSessionId")
+        got = self.session_identity(int(sid.value))
+        if got is None:
+            raise OSError(0, "this process's session has no signed-in user")
+        return got
 
     def input_idle_s(self) -> float:
         """Seconds since the last keyboard or mouse input IN THIS PROCESS'S SESSION (GetLastInputInfo is per session:

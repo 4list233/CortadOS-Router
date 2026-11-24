@@ -1,42 +1,67 @@
-"""When a local node that is someone's everyday machine may serve: the PC node's "owner away" policy (#145, owner
-decision 2026-11-24: the gaming PC serves ONLY while the owner is not using it, plus a manual toggle).
+"""When a local node that is someone's everyday machine may serve: the PC node's policy (#145).
+
+Owner decisions. 2026-11-24 (first): serve only while the owner is not using the PC, plus a manual toggle. Changed the
+same day (2026-11-24, fix round 1): the PC is on and idle nearly all the time and the owner games 3-4 times a week for
+1-2 h, so the default is to SERVE unless the toggle is off, a full-screen app or game runs in a signed-in session, or
+other programs use the GPU. Recent keyboard or mouse input alone no longer stops serving (idle_after_s is off by
+default and stays available as an option).
 
 The Pro's gate decides with local_resources.pro_local_allowed (manual switch + AC power). A gate whose backend config
 has a `node_policy` section of kind `windows-idle` decides with WindowsIdlePolicy.allowed() instead, in this order,
 each refusal a fixed reason (REFUSALS, so the provider may repeat it to a client: local_lane.PRO_LOCAL_REFUSALS):
 
   1. the manual switch: the same flag file as on the Pro (local_resources.local_switch_path, set through the gate's
-     /cortados/local-switch by the provider's local_switch tool or the PC's own toggle script). Off: "local switch off".
+     /cortados/local-switch by the provider's local_switch tool or the PC's own toggle script, whose "serving OFF
+     (game)" shortcut is the owner's way to stop it). Off: "local switch off".
   2. AC power (GetSystemPowerStatus), as on the Pro; `require_ac: false` for a desktop that reports "unknown".
-  3. the owner. Signed-in sessions are counted from session 0 (WTSEnumerateSessions). None active (signed out, or a
-     disconnected remote desktop): the owner is away. One or more: the activity file written by the activity writer
-     (run in the owner's session at logon, `python -m cortados_router.node_policy activity`) must be fresh and say
-     input idle >= idle_after_s and no full-screen app. Stale, missing or unreadable: unknown, refused.
+  3. the signed-in sessions. Every session that is active with a user (WTSEnumerateSessions from session 0) must be
+     covered by a fresh activity record bound to THAT session: written by the activity writer running in it (at logon,
+     `python -m cortados_router.node_policy activity`), into its own file (session_activity_path), stamped with the
+     session's id, user and logon time (gate_platform.WinApi.session_identity), which the gate compares with what it
+     reads for the session. A missing, stale, malformed or mismatched record (another session's, or an earlier logon's
+     that reused the session id) is unknown: refused. A record saying a full-screen app holds the display refuses
+     ("full-screen app running"); one that could not read it ("unknown") refuses too. No session active (signed out, a
+     disconnected remote desktop): nothing can be full-screen, so this check passes. Optional (off by default):
+     idle_after_s refuses while input in any active session is more recent than that ("owner active").
      Why a writer: GetLastInputInfo and SHQueryUserNotificationState answer for the CALLER's session only, and the gate
      runs in session 0 (a startup task, so it is up with nobody signed in), where they would always say "idle".
-  4. the GPU: nvidia-smi's utilization.gpu at or over gpu_busy_pct means another program (a game, a render, a video
-     export) is using the card. Skipped while this gate has a turn in flight and for own_gpu_grace_s after the last one
-     ended: the gate's own decoding is the GPU load then, and refusing a conversation's next turn for it would break the
-     conversation (an auto-routed conversation stays bound to its node).
-  5. memory load (GlobalMemoryStatusEx), only when max_memory_load_pct is set (default off: with the 35B loaded,
+  4. memory load (GlobalMemoryStatusEx), only when max_memory_load_pct is set (default off: with the 35B loaded,
      Strata keeps ~19 GiB of experts in host RAM and measured free RAM was 0.4 GiB, ~99 % load, so a threshold would
      refuse all the time until the owner measures what is normal).
+  5. the GPU: nvidia-smi's utilization.gpu at or over gpu_busy_pct means another program (a game, a render, a video
+     export) is using the card. The gate's own decoding must not count as another program, and the gate cannot
+     attribute utilization per process (see "Own GPU use" below), so a reading is taken only while the gate is quiet:
+     no turn of its own in flight, and own_gpu_settle_s since the last one ended (the check waits out the rest of that
+     time). While a turn of its own runs, the last such reading under the threshold stands, for at most
+     own_gpu_skip_max_s; past that the state is unknown (refused) until a quiet reading. Turns ending never extend
+     that window: only a fresh reading does.
   6. the switch again (the samples above may have taken a moment: never admit after the owner turned it off).
 
-Every unreadable input is a refusal, never "free" (no silent fallback). Samples (power, sessions, the activity file,
-memory) are re-read at most every sample_s; the switch is read on every call. In-flight turns are never stopped when the
-owner comes back: the gate only stops admitting (a running turn is bounded by the gate's read timeout and its
-max_tokens; at ~30 tok/s a 4K-token answer is about two minutes). To free the GPU at once, the PC's toggle script's
-`off -FreeGpu` also asks Strata to unload the model (scripts/windows/cortados-serving.ps1).
+Every unreadable input is a refusal, never "free" (no silent fallback). Samples (power, sessions, the activity files,
+memory, GPU) are re-read at most every sample_s; the switch is read on every call. In-flight turns are never stopped when
+a game starts: the gate only stops admitting (a running turn is bounded by the gate's read timeout and its max_tokens; at
+~30 tok/s a 4K-token answer is about two minutes). To free the GPU at once, the PC's toggle script's `off -FreeGpu` also
+asks Strata to unload the model (scripts/windows/cortados-serving.ps1).
+
+Own GPU use (reviewer finding, fix round 1). The first version skipped the GPU check for own_gpu_grace_s after each
+forwarded turn ended, and every ending renewed it, so turns under 10 s apart were admitted forever even with another
+program saturating the card. Excluding Strata's own share per process was considered and not chosen: nvidia-smi's
+per-process query (--query-compute-apps) reports memory, not utilization, and its per-process utilization monitor
+(pmon) is not reliably available under the WDDM driver this desktop card runs; Windows' "GPU Engine" performance
+counters do give per-process utilization, but need Strata's PID (it is started by a separate task) and a PDH ctypes
+binding that cannot be exercised before the PC deploy. Measuring only while the gate is quiet gives the same answer for
+the case that matters (a conversation's next turn arrives seconds after the last ended) with no new Windows code.
 
 Thresholds (each with its reason; owner may change them in the node's local-backend.json):
-  idle_after_s 300        5 minutes without keyboard or mouse input. Shorter, a pause in a game or a long read would
-                          start serving under the owner; longer wastes the evening. A model load takes ~195 s, so
-                          serving starts about 8 minutes after the owner stops.
+  idle_after_s null       off (owner 2026-11-24): input alone does not stop serving. A number (seconds) turns the old
+                          "no input for N seconds" rule back on.
   activity_stale_s 20     the writer writes every 5 s; four missed writes mean it stopped (crash, logoff mid-write).
   gpu_busy_pct 40         desktop compositing, an animated wallpaper and video decode stay well under 40 % of an RTX
                           3060; a game or a render runs far above it.
-  own_gpu_grace_s 10      utilization.gpu averages over up to a second, and a client sends its next turn within seconds.
+  own_gpu_settle_s 1.5    utilization.gpu covers the last 1/6 s to 1 s (nvidia-smi documents the sample period), so
+                          1.5 s after the gate's last turn ended its own decoding is out of the reading.
+  own_gpu_skip_max_s 60   the longest a quiet reading stands while the gate's own turn runs: a status or probe call
+                          during a long turn is answered from it; after a minute it says unknown rather than guess.
   sample_s 3              power and activity changes stop new admissions within seconds, without a subprocess or
                           file read per request (the same as the Pro's POWER_CACHE_S).
   nvidia_smi_timeout_s 2  nvidia-smi answers in well under a second; 2 s keeps the switch status within the
@@ -60,12 +85,13 @@ from cortados_router import gate_platform, local_resources
 KIND_WINDOWS_IDLE = "windows-idle"
 KINDS = (KIND_WINDOWS_IDLE,)
 DEFAULTS: dict[str, Any] = {
-    "idle_after_s": 300.0,
+    "idle_after_s": None,                # off (owner 2026-11-24, module docstring); seconds to turn it on
     "activity_file": None,               # required: an absolute path the writer and the gate share
     "activity_stale_s": 20.0,
     "fullscreen_blocks": True,
     "gpu_busy_pct": 40,
-    "own_gpu_grace_s": 10.0,
+    "own_gpu_settle_s": 1.5,
+    "own_gpu_skip_max_s": 60.0,
     "nvidia_smi": "nvidia-smi",
     "nvidia_smi_timeout_s": 2.0,
     "gpu_index": 0,
@@ -73,14 +99,17 @@ DEFAULTS: dict[str, Any] = {
     "require_ac": True,
     "sample_s": 3.0,
 }
-NUMBER_KEYS = ("idle_after_s", "activity_stale_s", "own_gpu_grace_s", "nvidia_smi_timeout_s", "sample_s")
+NUMBER_KEYS = ("activity_stale_s", "own_gpu_settle_s", "own_gpu_skip_max_s", "nvidia_smi_timeout_s", "sample_s")
+OPTIONAL_NUMBER_KEYS = ("idle_after_s",)
 # The writer's interval: activity_stale_s must leave room for at least a few missed writes.
 WRITE_INTERVAL_S = 5.0
 # A clock step between the writer and the gate (the same machine, so only an NTP correction): an activity file
 # timestamped this far in the future is still accepted; further is unreadable (a broken clock must not keep it fresh).
 FUTURE_SKEW_S = 5.0
 ACTIVITY_MAX_BYTES = 4096
-ACTIVITY_VERSION = 1
+# 2: the record names its session (fix round 1, reviewer finding: version 1 records had no session identity).
+ACTIVITY_VERSION = 2
+SESSION_USER_MAX = 64
 
 # The fixed refusal reasons (step numbers from the module docstring). The provider repeats only these
 # (local_lane.PRO_LOCAL_REFUSALS; a test keeps the sets in step).
@@ -98,7 +127,7 @@ MEMORY_UNKNOWN = "local disabled: memory state unknown"
 SWITCH_UNREADABLE = "local disabled: switch unreadable"
 REFUSALS = frozenset({SWITCH_OFF, ON_BATTERY, POWER_UNKNOWN, POWER_FAILED, OWNER_ACTIVE, OWNER_UNKNOWN, FULLSCREEN,
                       GPU_BUSY, GPU_UNKNOWN, MEMORY_HIGH, MEMORY_UNKNOWN, SWITCH_UNREADABLE})
-ALLOWED = "local enabled: owner away + manual switch on"
+ALLOWED = "local enabled: manual switch on, no full-screen app, GPU free"
 # SHQueryUserNotificationState values that mean a full-screen app holds the display: QUNS_BUSY (2, full-screen or
 # borderless full-screen app), QUNS_RUNNING_D3D_FULL_SCREEN (3), QUNS_PRESENTATION_MODE (4).
 FULLSCREEN_STATES = {2: "busy", 3: "d3d", 4: "presentation"}
@@ -130,6 +159,13 @@ def check_config(raw: Any) -> dict[str, Any] | None:
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
             raise PolicyConfigError(f"node_policy.{key} must be a positive number of seconds, got {v!r}")
         out[key] = float(v)
+    for key in OPTIONAL_NUMBER_KEYS:
+        v = out[key]
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+            raise PolicyConfigError(f"node_policy.{key} must be a positive number of seconds, or null (off), got {v!r}")
+        out[key] = float(v)
     af = out["activity_file"]
     if not isinstance(af, str) or not af.strip():
         raise PolicyConfigError("node_policy.activity_file must name the file the activity writer keeps fresh")
@@ -153,8 +189,26 @@ def check_config(raw: Any) -> dict[str, Any] | None:
     return out
 
 
-def read_activity(path: str, now: float, stale_s: float) -> dict[str, Any] | None:
-    """The activity file's {"idle_s", "fullscreen"} when it is fresh and well formed, else None (unknown)."""
+def session_ok(sess: Any) -> bool:
+    """A well-formed session identity: {"id": int >= 0, "user": printable, "logon": int} (WinApi.session_identity)."""
+    if not isinstance(sess, dict) or set(sess) != {"id", "user", "logon"}:
+        return False
+    sid, user, logon = sess["id"], sess["user"], sess["logon"]
+    return (not isinstance(sid, bool) and isinstance(sid, int) and sid >= 0
+            and isinstance(user, str) and 0 < len(user) <= SESSION_USER_MAX and user.isprintable()
+            and not isinstance(logon, bool) and isinstance(logon, int))
+
+
+def session_activity_path(base: str, session_id: int) -> str:
+    """The activity file of one session: `<base stem>.s<id><ext>` beside the configured activity_file. One file per
+    session, so a writer can only ever speak for its own session (two writers never race on one file)."""
+    root, ext = os.path.splitext(base)
+    return f"{root}.s{int(session_id)}{ext or '.json'}"
+
+
+def read_activity(path: str, now: float, stale_s: float, session: dict[str, Any]) -> dict[str, Any] | None:
+    """The activity file's {"idle_s", "fullscreen"} when it is fresh, well formed and bound to `session` (the same id,
+    user and logon time), else None (unknown)."""
     try:
         with open(path, "rb") as f:
             raw = f.read(ACTIVITY_MAX_BYTES + 1)
@@ -167,6 +221,8 @@ def read_activity(path: str, now: float, stale_s: float) -> dict[str, Any] | Non
     except (ValueError, RecursionError):
         return None
     if not isinstance(data, dict) or data.get("v") != ACTIVITY_VERSION:
+        return None
+    if not session_ok(data.get("session")) or data["session"] != session:
         return None
     at, idle, fs = data.get("at"), data.get("idle_s"), data.get("fullscreen")
     for v in (at, idle):
@@ -202,15 +258,17 @@ class WindowsIdlePolicy:
 
     def __init__(self, cfg: dict[str, Any], *, api=None, run: Callable = subprocess.run,
                  clock: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time,
-                 switch_on: Callable[[], bool] | None = None):
+                 switch_on: Callable[[], bool] | None = None, sleep: Callable[[float], None] = time.sleep):
         self.cfg = cfg
         self._api = api
-        self._run, self._clock, self._wall = run, clock, wall
+        self._run, self._clock, self._wall, self._sleep = run, clock, wall, sleep
         self._switch_on = switch_on or (lambda: local_resources.local_switch_path().is_file())
         self._lock = threading.Lock()
         self._sample: tuple[float, str | None, dict[str, Any]] | None = None
         self._own = 0                         # this gate's turns in flight (forward_started / forward_ended)
-        self._own_until = float("-inf")       # the GPU check is skipped until then (own_gpu_grace_s)
+        self._own_ended = float("-inf")       # when the last one ended (a reading waits own_gpu_settle_s after it)
+        self._own_epoch = 0                   # bumped on every start and end: a reading spanning one is mixed
+        self._gpu_quiet_at = float("-inf")    # the last reading under the threshold taken while the gate was quiet
 
     @property
     def api(self):
@@ -222,15 +280,15 @@ class WindowsIdlePolicy:
     def forward_started(self) -> None:
         with self._lock:
             self._own += 1
+            self._own_epoch += 1
 
     def forward_ended(self) -> None:
+        """A turn ended (answered, failed or cut off). It never extends how long the GPU check may be skipped: only a
+        fresh quiet reading does (module docstring, "Own GPU use")."""
         with self._lock:
             self._own = max(0, self._own - 1)
-            self._own_until = self._clock() + self.cfg["own_gpu_grace_s"]
-
-    def _own_gpu(self) -> bool:
-        with self._lock:
-            return self._own > 0 or self._clock() < self._own_until
+            self._own_epoch += 1
+            self._own_ended = self._clock()
 
     # ---- the inputs
     def _switch(self) -> str | None:
@@ -250,23 +308,31 @@ class WindowsIdlePolicy:
         return {"ac": None, "battery": ON_BATTERY}.get(power, POWER_UNKNOWN), power
 
     def _owner(self) -> tuple[str | None, str]:
-        """(refusal or None, the owner word: away | idle | active | unknown)."""
+        """(refusal or None, the owner word: away | present | idle | active | fullscreen | unknown). Every active
+        session must be covered by its own fresh, bound activity record (module docstring, step 3)."""
         try:
-            sessions = self.api.active_user_sessions()
+            sessions = self.api.active_sessions()
         except OSError:
             return OWNER_UNKNOWN, "unknown"
-        if sessions == 0:
-            return None, "away"
-        act = read_activity(self.cfg["activity_file"], self._wall(), self.cfg["activity_stale_s"])
-        if act is None:
+        if not isinstance(sessions, list) or not all(session_ok(x) for x in sessions):
             return OWNER_UNKNOWN, "unknown"
-        if act["idle_s"] < self.cfg["idle_after_s"]:
-            return OWNER_ACTIVE, "active"
+        if not sessions:
+            return None, "away"
+        now = self._wall()
+        acts = [read_activity(session_activity_path(self.cfg["activity_file"], x["id"]), now,
+                              self.cfg["activity_stale_s"], x) for x in sessions]
+        if any(a is None for a in acts):
+            return OWNER_UNKNOWN, "unknown"
         if self.cfg["fullscreen_blocks"]:
-            if act["fullscreen"] == "unknown":
+            if any(a["fullscreen"] == "unknown" for a in acts):
                 return OWNER_UNKNOWN, "unknown"
-            if act["fullscreen"] != "none":
-                return FULLSCREEN, "active"
+            if any(a["fullscreen"] != "none" for a in acts):
+                return FULLSCREEN, "fullscreen"
+        idle_after = self.cfg["idle_after_s"]
+        if idle_after is None:
+            return None, "present"
+        if any(a["idle_s"] < idle_after for a in acts):
+            return OWNER_ACTIVE, "active"
         return None, "idle"
 
     def _memory(self) -> str | None:
@@ -280,17 +346,36 @@ class WindowsIdlePolicy:
         return MEMORY_HIGH if load > top else None
 
     def _gpu(self) -> str | None:
+        """Another program's GPU use (module docstring, step 5 and "Own GPU use")."""
         top = self.cfg["gpu_busy_pct"]
-        if top is None or self._own_gpu():
+        if top is None:
             return None
-        util = gpu_utilization(self.cfg, self._run)
-        if util is None:
-            return GPU_UNKNOWN
-        return GPU_BUSY if util >= top else None
+        with self._lock:
+            own, ended, epoch = self._own, self._own_ended, self._own_epoch
+        if own == 0:
+            wait = self.cfg["own_gpu_settle_s"] - (self._clock() - ended)
+            if wait > 0:
+                self._sleep(wait)                 # the gate's own last decoding leaves the reading
+            util = gpu_utilization(self.cfg, self._run)
+            if util is None:
+                return GPU_UNKNOWN
+            with self._lock:
+                quiet = self._own == 0 and self._own_epoch == epoch
+                if quiet:
+                    # a busy reading also withdraws the last good one: a call during a turn never leans on it
+                    self._gpu_quiet_at = self._clock() if util < top else float("-inf")
+            if quiet:
+                return GPU_BUSY if util >= top else None
+            # a turn of the gate's own started or ended during the reading: it may be in it; fall through
+        with self._lock:
+            quiet_at = self._gpu_quiet_at
+        if 0 <= self._clock() - quiet_at < self.cfg["own_gpu_skip_max_s"]:
+            return None
+        return GPU_UNKNOWN
 
     def _sampled(self) -> tuple[str | None, dict[str, Any]]:
         """(the first refusal among power, owner, memory and GPU, or None; the words for the status), re-read at most
-        every sample_s. The GPU part is re-read each time this gate's own use has just ended (own_gpu)."""
+        every sample_s."""
         with self._lock:
             got = self._sample
         now = self._clock()
@@ -341,15 +426,19 @@ def build(cfg: dict[str, Any] | None, **seams):
 
 # ---- the activity writer (runs in the owner's interactive session; scripts/windows/install_pc_node.ps1)
 def activity_sample(api, wall: Callable[[], float] = time.time) -> dict[str, Any]:
-    """One activity record: the input idle time and the full-screen state of THIS session. A failed fullscreen read is
-    written as "unknown" (the gate refuses on it); a failed idle read raises OSError (nothing is written, the file
-    goes stale and the gate refuses)."""
+    """One activity record of THIS session: its identity (WinApi.current_session), the input idle time and the
+    full-screen state. A failed fullscreen read is written as "unknown" (the gate refuses on it); a failed identity or
+    idle read raises OSError (nothing is written, the file goes stale and the gate refuses)."""
+    session = api.current_session()
+    if not session_ok(session):
+        raise OSError(0, "the session identity is malformed")
     idle = api.input_idle_s()
     try:
         fs = FULLSCREEN_STATES.get(api.notification_state(), "none")
     except OSError:
         fs = "unknown"
-    return {"v": ACTIVITY_VERSION, "at": wall(), "idle_s": round(float(idle), 1), "fullscreen": fs}
+    return {"v": ACTIVITY_VERSION, "at": wall(), "session": session, "idle_s": round(float(idle), 1),
+            "fullscreen": fs}
 
 
 def write_activity(path: str, record: dict[str, Any]) -> None:
@@ -367,13 +456,15 @@ def write_activity(path: str, record: dict[str, Any]) -> None:
 def run_writer(path: str, *, api=None, once: bool = False, interval: float = WRITE_INTERVAL_S,
                sleep: Callable[[float], None] = time.sleep, wall: Callable[[], float] = time.time,
                log=None) -> int:
-    """The writer loop: one record every `interval` seconds. A failed sample or write is logged and retried next
-    time; the file then goes stale and the gate refuses (fail closed). `once`: one record, exit 0 / 1."""
+    """The writer loop: one record every `interval` seconds, into this session's own file
+    (session_activity_path(path, id)). A failed sample or write is logged and retried next time; the file then goes
+    stale and the gate refuses (fail closed). `once`: one record, exit 0 / 1."""
     api = api or gate_platform.WinApi()
     log = log or (lambda m: print(m, file=sys.stderr, flush=True))
     while True:
         try:
-            write_activity(path, activity_sample(api, wall))
+            record = activity_sample(api, wall)
+            write_activity(session_activity_path(path, record["session"]["id"]), record)
             ok = True
         except OSError as exc:
             log(f"node_policy activity: sample or write failed ({type(exc).__name__}); the gate will see the file "
@@ -388,7 +479,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m cortados_router.node_policy", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     w = sub.add_parser("activity", help="write the owner-activity file (run in the owner's session at logon)")
-    w.add_argument("--out", required=True, help="the activity file (the node_policy.activity_file of the gate)")
+    w.add_argument("--out", required=True, help="the gate's node_policy.activity_file; the writer adds its session id")
     w.add_argument("--once", action="store_true", help="write one record and exit (acceptance check)")
     s = sub.add_parser("status", help="print the policy decision now, from the gate's backend config")
     s.add_argument("--backend-config", default=None, help="the gate's local-backend.json")

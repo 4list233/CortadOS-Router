@@ -20,14 +20,15 @@
   }
  },
  "node_policy": {
-  "_comment": "Serve only while the owner is not using the PC (owner 2026-11-24). Each threshold's reason is in cortados_router/node_policy.py. activity_file: written every 5 s by the activity writer in the owner's session (task CortadOS-Activity); ~ is the account's profile.",
+  "_comment": "Serve by default (owner 2026-11-24, changed the same day): refused only while the switch is off (the 'serving OFF (game)' shortcut or local_switch), a full-screen app or game runs in a signed-in session, or other programs use the GPU at or over gpu_busy_pct. Keyboard and mouse input alone do not stop it (idle_after_s null; a number of seconds turns that rule back on). Missing or stale full-screen or GPU telemetry refuses. Each threshold's reason is in cortados_router/node_policy.py. activity_file: the base name of the per-session files the activity writer (task CortadOS-Activity) writes every 5 s in each signed-in session (<stem>.s<session id>.json); ~ is the account's profile.",
   "kind": "windows-idle",
   "activity_file": "~/.config/cortados/pc-activity.json",
-  "idle_after_s": 300,
+  "idle_after_s": null,
   "activity_stale_s": 20,
   "fullscreen_blocks": true,
   "gpu_busy_pct": 40,
-  "own_gpu_grace_s": 10,
+  "own_gpu_settle_s": 1.5,
+  "own_gpu_skip_max_s": 60,
   "nvidia_smi": "nvidia-smi",
   "max_memory_load_pct": null,
   "_max_memory_load_pct": "Off: with the model loaded Strata keeps ~19 GiB of experts in host RAM and free RAM measured 0.4 GiB (~99 % load), so any threshold would refuse all the time. Measure the PC's normal load first, then set one.",

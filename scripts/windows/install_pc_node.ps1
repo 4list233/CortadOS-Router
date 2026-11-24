@@ -12,9 +12,10 @@
                        25 times. Runs the keepalive launcher for -StrataExe with -StrataArgs.
     CortadOS-Gate      at startup + 60 s (Tailscale must have its address first; the gate also refuses 0.0.0.0), S4U,
                        runs the keepalive launcher for the gate on -ListenIp, --no-studio-gate.
-    CortadOS-Activity  at logon of this account, interactive, pythonw (no window): writes the activity file every 5 s
-                       (input idle time and full-screen state of the owner's session, which the gate in session 0
-                       cannot read itself).
+    CortadOS-Activity  at logon of this account, interactive, pythonw (no window): writes this session's activity file
+                       every 5 s (pc-activity.s<session id>.json: the session's id, user and logon time, its full-screen
+                       state and input idle time, which the gate in session 0 cannot read itself). Serving stops while a
+                       full-screen app runs; a signed-in session of ANOTHER account has no writer and stops it too.
   Keepalive launchers restart their process 30 s after it exits, because Task Scheduler's restart-on-failure does not
   fire on a non-zero exit code. Logs go to %USERPROFILE%\.config\cortados\pc-node\logs.
 
@@ -64,9 +65,19 @@ function Write-Ascii([string]$Path, [string]$Text) {
 }
 
 function Test-Ascii([string]$Text) {
-  foreach ($c in $Text.ToCharArray()) { if ([int]$c -gt 126) { return $false } }
+  foreach ($c in $Text.ToCharArray()) { if ([int]$c -gt 126 -or [int]$c -lt 32) { return $false } }
   return $true
 }
+
+# Paths the launchers, pc-node.json and the task arguments carry. Write-Ascii replaces a non-ASCII character with '?',
+# which would silently name another path (the gate would then not find its config or token), so a profile, repo, python
+# or script folder with one is refused here, before any change, rather than written lossily (#145 review).
+$PathChecks = @(
+  @('%USERPROFILE% (the config, token and log folders derive from it)', $env:USERPROFILE),
+  @('-Repo', $Repo),
+  @('-Python', $Python),
+  @("this script's folder (the desktop shortcuts point at it)", $PSScriptRoot)
+)
 
 if ($Remove) {
   foreach ($t in $Tasks) {
@@ -78,6 +89,13 @@ if ($Remove) {
 }
 
 # ---- checks before anything changes
+foreach ($pc in $PathChecks) {
+  if (-not (Test-Ascii $pc[1])) {
+    throw ("The path in " + $pc[0] + " contains non-ASCII characters. This installer writes its launchers and " +
+      "pc-node.json as ASCII, so the path would be stored wrongly. Nothing was changed. Install from an account " +
+      "and folders whose paths are ASCII only.")
+  }
+}
 if (-not (Test-Path $Python)) { throw "Python not found at the path given with -Python" }
 if (-not (Test-Path $Pythonw)) { throw "pythonw.exe not found next to the given python.exe" }
 if (-not (Test-Path (Join-Path $Repo 'cortados_router\local_gate.py'))) { throw "-Repo is not a CortadOS-Router checkout" }
@@ -92,7 +110,6 @@ if (-not $StrataExe) {
 } elseif (-not (Test-Ascii ($StrataExe + $StrataArgs))) {
   throw '-StrataExe and -StrataArgs must be ASCII (the launcher file is written as ASCII)'
 }
-if (-not (Test-Ascii $Repo) -or -not (Test-Ascii $Python)) { throw 'the repo and python paths must be ASCII' }
 
 # ---- folders, token, configs
 Step "create $NodeDir and $LogDir" {

@@ -11,14 +11,19 @@ section 10.
 These replace section 10's items 1, 2, 5 and 6.
 
 1. **Option A only**: the PC is a model server, not an execution host.
-2. **When it serves**: only while the owner is not using the PC, plus a simple toggle to switch serving off when he
-   starts a game and back on. The toggle is the existing per-node local switch (the gate's `/cortados/local-switch`),
-   flipped on the PC by two desktop shortcuts (`scripts/windows/cortados-serving.ps1`) or from any session by the
-   `local_switch` tool with node `pc`. Idle is input idle time (GetLastInputInfo, read in the owner's session) and no
-   full-screen app or heavy GPU use by another program. Thresholds and reasons: docs/LOCAL-RESOURCES.md "PC node
-   (Strata)" and `cortados_router/node_policy.py` (300 s without input; 40 % GPU; activity file stale after 20 s).
-   When the owner comes back the gate refuses new turns with a fixed 503 reason the provider routes around; a turn
-   already running finishes (`off -FreeGpu` also asks Strata to unload at once).
+2. **When it serves** (revised 2026-11-24, fix round 1; the first decision the same day was "only while the owner is
+   not using the PC", 300 s without input): the PC is on and idle nearly all the time and the owner games 3–4 times a
+   week for 1–2 h, so it **serves by default** and stops only while
+   - (a) the toggle is off: the existing per-node local switch (the gate's `/cortados/local-switch`), flipped on the PC
+     by the desktop shortcuts **CortadOS serving OFF (game)** / **ON** (`scripts/windows/cortados-serving.ps1`) or from
+     any session by the `local_switch` tool with node `pc`;
+   - (b) a full-screen app or game runs in a signed-in session (SHQueryUserNotificationState, read in that session by
+     its activity writer and bound to the session's id, user and logon time);
+   - (c) other programs use the GPU at or over 40 % (nvidia-smi, read while the gate's own turns are not running).
+   Keyboard and mouse input alone do not stop it (`idle_after_s` is off; setting it brings the old rule back). Missing
+   or stale full-screen or GPU telemetry refuses. Thresholds and reasons: docs/LOCAL-RESOURCES.md "PC node (Strata)"
+   and `cortados_router/node_policy.py`. When serving stops the gate refuses new turns with a fixed 503 reason the
+   provider routes around; a turn already running finishes (`off -FreeGpu` also asks Strata to unload at once).
 3. **The Qwen3.8 Coder 125B is left out** entirely.
 4. **Administrator access is acceptable**: the tasks run as the owner's administrator account; no dedicated non-admin
    account.
@@ -340,7 +345,7 @@ Nothing new is needed on the provider. The Pro's path already covers it:
 - **Asleep or off the tailnet**: the probe connect fails within `connect_timeout_s` (3 s). The node is marked down for
   30 s, so the index route skips it (logged `local index route: … not taken …`), and S1's cloud route stands. A pin
   gets a 503 that names the node. A first conversation after the PC sleeps pays up to ~3 s once per 30 s window.
-- **Switch off / owner active / VRAM taken**: the gate answers the probe 503 (switch, activity policy) or relays
+- **Switch off / full-screen app / GPU busy / VRAM taken**: the gate answers the probe 503 (switch, activity policy) or relays
   Strata's refusal as a retryable 529. Either way the request goes to another lane.
 - **Busy**: `max_inflight: 1`, as above.
 - **Mid-conversation**: an auto-routed conversation stays bound to the node and fails with the routed-conversation 503
@@ -495,7 +500,8 @@ mode.
 ## 10. `[ESCALATE]` decisions for the owner
 
 1. ~~**Which option**~~: decided 2026-11-24, A only (section 0).
-2. ~~**When the PC may serve**~~: decided 2026-11-24, owner-idle only plus a toggle (section 0). Still open:
+2. ~~**When the PC may serve**~~: decided 2026-11-24, serve by default unless the toggle is off, a full-screen app runs
+   or another program uses the GPU (section 0; revised the same day from owner-idle only). Still open:
    Strata's `idle_unload_s` (fast first answer vs a free GPU for games; suggested ~600).
 3. **Context for the 35B**: 48K (measured, recommended) or up to 63,488.
 4. **Proxy-index deduction** for Qwen3.6-35B-A3B UD-Q4_K_XL (suggested −5%), whether to add the non-thinking
@@ -569,8 +575,9 @@ icacls $env:USERPROFILE\.config\cortados\local-gate-token        # only the acco
 <py> -B -m cortados_router.local_gate --listen <pc-ts-ip> --backend-config $env:USERPROFILE\.config\cortados\local-backend.json --token-file $env:USERPROFILE\.config\cortados\local-gate-token --no-studio-gate --print-config
                                                                  # token "ok (64 chars, ACL owner-only)", backend strata
 <py> -B -m cortados_router.node_policy status --backend-config $env:USERPROFILE\.config\cortados\local-backend.json
-                                                                 # {"switch": ..., "allowed": ..., "activity": "active"} while typing
-Get-Content $env:USERPROFILE\.config\cortados\pc-activity.json   # "at" within the last 5 s
+                                                                 # {"switch": ..., "allowed": true, "activity": "present"} while typing
+Get-Content $env:USERPROFILE\.config\cortados\pc-activity.s*.json   # one file per signed-in session: "at" within the
+                                                                 # last 5 s, "session" names this session (id, user, logon)
 nvidia-smi -i 0 --query-gpu=utilization.gpu --format=csv,noheader,nounits   # one number
 ```
 
@@ -578,7 +585,7 @@ Then reboot, do not sign in, wait 5 minutes, and from the Air (token as a header
 
 ```sh
 H=$(mktemp); chmod 600 "$H"; printf 'Authorization: Bearer %s\n' "$(cat ~/.config/cortados/pc-gate-token)" > "$H"
-curl -s -o /dev/null -w '%{http_code}\n' -H @"$H" http://<pc-ts-ip>:11435/api/tags          # 200 (owner away)
+curl -s -o /dev/null -w '%{http_code}\n' -H @"$H" http://<pc-ts-ip>:11435/api/tags          # 200 (serving: switch on, no full-screen app, GPU free)
 curl -s -o /dev/null -w '%{http_code}\n'            http://<pc-ts-ip>:11435/api/tags          # 401
 curl -s -o /dev/null -w '%{http_code}\n' -H @"$H" -X POST http://<pc-ts-ip>:11435/v1/unload  # 404 (not forwarded)
 curl -s -H @"$H" http://<pc-ts-ip>:11435/cortados/local-switch                               # "activity": "away"
@@ -588,9 +595,10 @@ rm -f "$H"
 The token reaches the Air by hand over the owner's own channel (never printed in a terminal another session reads); on
 the Air it is a 0600 file.
 
-**Step 4 (owner, PC): idle and the toggle.** Sign in and type: `/cortados/local-switch` says `"allowed": false`,
-`"reason": "local disabled: owner active"`. Leave the PC for 5 minutes: `"allowed": true`. Start a full-screen game and
-leave it idle: `full-screen app running`. Double-click **CortadOS serving OFF (game)**: `switch: off`, and Strata's model
+**Step 4 (owner, PC): full screen, GPU and the toggle.** Sign in and type: `/cortados/local-switch` says
+`"allowed": true`, `"activity": "present"` (input alone does not stop serving). Start a full-screen game:
+`"allowed": false`, `full-screen app running`; a windowed GPU-heavy program: `GPU busy with another program`. Stop the
+activity writer (end the `CortadOS-Activity` task): within 20 s `owner activity unknown`; start it again. Double-click **CortadOS serving OFF (game)**: `switch: off`, and Strata's model
 is unloaded (`nvidia-smi` memory drops). Note what Strata's `/v1/unload` did to a turn in flight (not verified).
 Double-click **CortadOS serving ON**: `switch: on`.
 
@@ -603,8 +611,8 @@ the Air's `tables/resources.json`; set `CORTADOS_LOCAL_PC_GATE_URL=http://<pc-ts
 sqlite3 -readonly ~/.cortados/router.db "select lane, provider, model from routes order by rowid desc limit 3"   # local-pc
 ```
 
-**Step 6 (owner, PC/Air): offline and busy behaviour.** Sign in and type on the PC (or put it to sleep), then pin again:
-a 503 naming node `pc` and the fixed reason (`owner active`) or "did not answer /api/tags" (asleep); an S1-routed
+**Step 6 (owner, PC/Air): offline and busy behaviour.** Start a full-screen game on the PC (or put it to sleep), then
+pin again: a 503 naming node `pc` and the fixed reason (`full-screen app running`) or "did not answer /api/tags" (asleep); an S1-routed
 conversation is unaffected (the PC is pin-only, so nothing is skipped yet). Within 30 s of a failed probe the provider
 does not probe the PC again (`routing.AUTO_DOWN_S`).
 
@@ -614,8 +622,8 @@ deduction is set. Until then the node stays pin-only.
 ### What remains for the deploy
 
 - Steps 0 and 2 to 6 above (PC and Air; nothing was run).
-- Not verified on the PC: the ctypes calls (`gate_platform.WinApi`: ACL read, WTS sessions, GetLastInputInfo,
-  SHQueryUserNotificationState) are exercised only through fakes; step 3's acceptance runs them for real. The field
+- Not verified on the PC: the ctypes calls (`gate_platform.WinApi`: ACL read, WTS sessions and WTSSessionInfo's logon
+  time, ProcessIdToSessionId, GetLastInputInfo, SHQueryUserNotificationState) are exercised only through fakes; step 3's acceptance runs them for real. The field
   Strata uses for an idle-unloaded model, Strata's `/v1/unload` with a turn in flight, and whether `GetSystemPowerStatus`
   reports AC on this desktop (if it reports unknown, set `"require_ac": false`).
 - Open `[ESCALATE]` items: section 10's 3 (context, 48K shipped), 4 (deduction, for step 7), 7 (Tailscale ACLs), 8

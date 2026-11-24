@@ -32,9 +32,9 @@ GATE_MAX_BYTES = 65536
 SWITCH_MAX_BODY = 1024
 SWITCH_BODY_DEADLINE_S = 5.0
 POWER = {"ac", "battery", "unknown"}
-OLLAMA = {"up", "unreachable", "unreadable"}
+OLLAMA = {"up", "unreachable", "unreadable"}       # the backend's reachability (the key predates vllm-mlx)
 # The PC node's owner state (node_policy.WindowsIdlePolicy.status, #145); the Pro's gate sends none.
-ACTIVITY = {"away", "idle", "active", "unknown"}       # the backend's reachability (the key predates vllm-mlx)
+ACTIVITY = {"away", "present", "idle", "active", "fullscreen", "unknown"}
 BACKENDS = {"ollama", "vllm-mlx", "strata"}
 REASON_MAX = 200
 MODEL_MAX = 200
@@ -71,7 +71,7 @@ def _clean(data: Any) -> dict[str, Any]:
             "models_loaded": models,
             "backend": d.get("backend") if d.get("backend") in BACKENDS else "unknown",
             "capacity": _capacity(d.get("capacity")),
-            # only a node with an owner-away policy sends it (the PC); a missing or unknown word is left out
+            # only a node with a node_policy (windows-idle) sends it (the PC); a missing or unknown word is left out
             **({"activity": d["activity"]} if d.get("activity") in ACTIVITY else {})}
 
 

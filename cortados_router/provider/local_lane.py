@@ -842,7 +842,7 @@ def _prefix(base_url: str) -> str:
 PRO_LOCAL_REFUSALS = {"local gate: local switch off", "local gate: local disabled: on battery",
                       "local gate: local disabled: unknown power source",
                       "local gate: local disabled: power check failed",
-                      # the PC node's owner-away policy (node_policy.REFUSALS; a test keeps the two in step, #145)
+                      # the PC node's serving policy (node_policy.REFUSALS; a test keeps the two in step, #145)
                       "local gate: local disabled: owner active", "local gate: local disabled: owner activity unknown",
                       "local gate: local disabled: full-screen app running",
                       "local gate: local disabled: GPU busy with another program",

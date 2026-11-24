@@ -34,7 +34,7 @@ Ollama has no authentication, so it listens on 127.0.0.1 only and this gate is t
 
 On Windows (the PC node, #145; docs/LOCAL-RESOURCES.md "PC node (Strata)") the gate runs on Python 3.12 through
 gate_platform.py (file lock, token-file ACL, no-follow, directory fsync), with the Strata backend and the windows-idle
-node policy (node_policy.py: switch, AC, owner away, no full-screen app, GPU not busy) in place of the Pro's
+node policy (node_policy.py: switch, AC, no full-screen app in a signed-in session, GPU not busy) in place of the Pro's
 pro_local_allowed, and with the S1-training node lock off (--no-studio-gate: the PC runs no S1 training, and that
 lock is fcntl-only). On macOS everything below is unchanged.
 
@@ -1232,7 +1232,7 @@ class GateHandler(BaseHTTPRequestHandler):
                  may_retry: bool = False):
         """Relay the turn upstream and the answer back. `may_retry`: a guard's ticket refusal (409 TICKET_REFUSAL) is
         not relayed; REFUSED_TICKET is returned instead (nothing was written to the client), for one retry. A model
-        turn on a node with a policy is counted as the gate's own GPU use while it runs (node_policy own_gpu_grace_s)."""
+        turn on a node with a policy is counted as the gate's own GPU use while it runs (node_policy, "Own GPU use")."""
         policy = self.server.policy if method == "POST" else None
         if policy is None:
             return self._relay(method, path, body, ticket_id, may_retry)

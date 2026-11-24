@@ -1890,7 +1890,9 @@ With the gate on vllm-mlx the Pro serves only the MLX model: the Ollama-only pin
 
 Option A of `docs/runbooks/PC-RTX3060-ENROLLMENT.md` (owner decisions 2026-11-24): the owner's Windows PC (RTX 3060
 12 GB, 32 GB RAM) is a second local model node, `pc`, beside the Pro. It is a model server only, never an execution
-host. It serves **only while the owner is not using it**, and the owner can switch it off when he starts a game.
+host. It **serves by default** (owner decision 2026-11-24, revised the same day: the PC is on and idle nearly all the
+time and he games 3–4 times a week for 1–2 h) and stops only while the toggle is off, a full-screen app or game runs in
+a signed-in session, or other programs use the GPU. Keyboard and mouse input alone do not stop it.
 
 ### Shape
 
@@ -1928,18 +1930,29 @@ fixed reason the provider may repeat (`node_policy.REFUSALS`, kept in step with 
 | --- | --- | --- |
 | manual switch (same flag file as the Pro) | `local switch off` | the owner's toggle |
 | AC power (GetSystemPowerStatus) | `on battery` / `unknown power source` / `power check failed` | `require_ac: false` for a desktop that reports unknown |
-| signed-in sessions (WTSEnumerateSessions, from session 0) | `owner activity unknown` when unreadable | none active (signed out, disconnected remote desktop) = away |
-| activity file, when a session is active | `owner active` / `full-screen app running` / `owner activity unknown` | `idle_after_s` 300: shorter would serve under a paused game; the writer writes every 5 s and `activity_stale_s` 20 allows four misses |
-| GPU (nvidia-smi `utilization.gpu`) | `GPU busy with another program` / `GPU state unknown` | `gpu_busy_pct` 40: compositing, an animated wallpaper and video decode stay well under it; skipped while the gate's own turn runs and `own_gpu_grace_s` 10 after |
+| signed-in sessions (WTSEnumerateSessions, from session 0) | `owner activity unknown` when unreadable | none active (signed out, disconnected remote desktop): nothing can be full-screen, passes |
+| each active session's own activity record | `full-screen app running` / `owner activity unknown` (missing, stale, malformed, another session's or an earlier logon's) / `owner active` (only with the option on) | the record names its session (id, user, logon time) and must match; the writer writes every 5 s and `activity_stale_s` 20 allows four misses; `idle_after_s` null (off, owner 2026-11-24): a number turns "no input for N s" back on |
+| GPU (nvidia-smi `utilization.gpu`) | `GPU busy with another program` / `GPU state unknown` | `gpu_busy_pct` 40: compositing, an animated wallpaper and video decode stay well under it. Read only while the gate is quiet (`own_gpu_settle_s` 1.5 after its last turn; the check waits that out); while its own turn runs the last quiet reading stands for at most `own_gpu_skip_max_s` 60, then unknown |
 | memory load (GlobalMemoryStatusEx) | `memory load high` | off by default: with the model loaded free RAM measured ~0.4 GiB (~99 %) |
 
 Why an activity writer: `GetLastInputInfo` and `SHQueryUserNotificationState` answer for the caller's session only,
 and the gate runs in session 0 (a startup task, up with nobody signed in), where they would always say idle. So
 `python -m cortados_router.node_policy activity --out <file>` runs at logon in the owner's session (task
-`CortadOS-Activity`, pythonw) and writes `{"v", "at", "idle_s", "fullscreen"}` every 5 s; stale, missing or malformed
-means unknown, which refuses. Every unreadable input refuses; nothing unknown counts as free.
+`CortadOS-Activity`, pythonw) and writes `{"v": 2, "at", "session": {"id", "user", "logon"}, "idle_s", "fullscreen"}`
+every 5 s into that session's own file, `<stem>.s<session id>.json` beside `activity_file`. The gate reads, for each
+active session, that session's file and accepts it only if the identity matches what it reads for the session itself
+(`gate_platform.WinApi.session_identity`, the same call on both sides; the logon time tells a new logon from an earlier
+one that reused the id). So a disconnected session's writer cannot speak for another session, and a session of another
+account (no writer) refuses. Stale, missing, malformed or mismatched means unknown, which refuses. Every unreadable
+input refuses; nothing unknown counts as free.
 
-When the owner comes back mid-turn, the running turn finishes (bounded by the read timeout and its `max_tokens`; about
+Why the GPU is read only while the gate is quiet (fix round 1): the first version skipped the check for 10 s after each
+of its own turns and every turn renewed it, so turns under 10 s apart were admitted forever even with a game saturating
+the card. Per-process attribution was not chosen: nvidia-smi gives per-process memory, not utilization, and its
+per-process monitor is not reliably available under WDDM; Windows' GPU Engine counters would need Strata's PID and new
+PDH code that cannot be exercised before the deploy (`node_policy.py`, "Own GPU use").
+
+When a game starts mid-turn, the running turn finishes (bounded by the read timeout and its `max_tokens`; about
 two minutes for 4K tokens at ~30 tok/s) and nothing new is admitted: cutting it off would break a conversation bound to
 the node. To give a game the VRAM at once, the toggle's `off -FreeGpu` also asks Strata to unload.
 
@@ -1951,7 +1964,8 @@ The PC's switch is the gate's `/cortados/local-switch`, as on the Pro, so all of
   `scripts/windows/install_pc_node.ps1`), or `scripts/windows/cortados-serving.ps1 on|off|status [-FreeGpu]`; it reads
   the gate address and token path from `%USERPROFILE%\.config\cortados\pc-node\pc-node.json` and never prints the token;
 - from any session: the `local_switch` MCP tool or `/cortados-local` with node `pc`; the status carries `activity`
-  (`away` / `idle` / `active` / `unknown`) besides the usual fields.
+  (`away` / `present` / `fullscreen` / `unknown`, and `idle` / `active` with the input option on) besides the usual
+  fields.
 
 ### Down, asleep or busy
 
