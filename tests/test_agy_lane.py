@@ -363,6 +363,58 @@ class ProbeHonesty(AgyBase):
         for text in (rec["error"], err.getvalue()):
             self.assertNotIn("example.com", text); self.assertNotIn("owner.private", text)
 
+    # ---- #144 review round 4: an unrecognised group's title never reaches an error, the state, a log or the record
+    PRIVATE_GROUP = ("PRIVATE CUSTOMER ACME MODELS\nModels within this group: Acme Secret Model 7\n"
+                     "Weekly Limit Remaining [ █████      ] 50.00%\nRefreshes in 1h 0m\n")
+
+    def assert_no_private(self, *texts):
+        for text in texts:
+            low = text.lower()
+            for word in ("private", "customer", "acme", "secret"):
+                self.assertNotIn(word, low)
+
+    def sample_with(self, screen: str) -> tuple[dict, str]:
+        binary, _ = self.fake({"boot": BANNER, "usage": screen})
+        err = io.StringIO()
+        with self.env(binary), confirmed_tier(), mock.patch.object(sc, "_learn_unit_costs", lambda: None), \
+                redirect_stderr(err):
+            sc.sample(force=True, only=["antigravity"])
+        state = sc.CACHE.read_text()
+        history = sc.HISTORY.read_text() if sc.HISTORY.exists() else ""
+        self.assert_no_private(state, history, err.getvalue())
+        return json.loads(state)["lanes"]["antigravity"], err.getvalue()
+
+    def test_unknown_group_title_never_reaches_a_partial_reading_error(self):
+        screen = "Plan: Google AI Pro\n" + FIXTURE.read_text() + self.PRIVATE_GROUP
+        binary, _ = self.fake({"boot": BANNER, "usage": screen})
+        with self.env(binary):
+            with self.assertRaises(sc.ProbePartialReading) as cm:
+                sc._antigravity()
+        self.assertIn("unknown-group-1: no 5-hour window", str(cm.exception))
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rec = sc._failed_record("antigravity", None, cm.exception)
+        self.assert_no_private(str(cm.exception), json.dumps(rec), err.getvalue())
+        lane, stderr = self.sample_with(screen)
+        self.assertEqual(lane["error_kind"], "partial-reading")
+        self.assertIn("unknown-group-1: no 5-hour window", lane["error"])
+        self.assertIn("unknown-group-1", stderr)
+
+    def test_unknown_groups_are_kept_under_fixed_labels_only(self):
+        second = self.PRIVATE_GROUP.replace("PRIVATE CUSTOMER ACME", "SECRET ACME TWO")
+        full = lambda g: g + "Five Hour Limit Remaining [ █████      ] 50.00%\nRefreshes in 1h 0m\n"
+        screen = "Plan: Google AI Pro\n" + FIXTURE.read_text() + full(self.PRIVATE_GROUP) + full(second)
+        binary, _ = self.fake({"boot": BANNER, "usage": screen})
+        with self.env(binary), confirmed_tier():
+            rec = sc._antigravity()
+        self.assert_no_private(json.dumps(rec))
+        self.assertEqual({w["pool"] for w in rec["windows"]},
+                         {"gemini", "claude-gpt", "unknown-group-1", "unknown-group-2"})
+        self.assertIn("week (unknown-group-1)", {w["window"] for w in rec["windows"]})
+        lane, _ = self.sample_with(screen)
+        self.assertFalse(lane.get("error"), lane.get("error"))
+        self.assertIn("5-hour (unknown-group-2)", {w["window"] for w in lane["windows"]})
+
     # ---- #144 round 2: agy stores no auth mode; the subscription is proven from its screen (provisional: refusing)
     def test_full_reading_is_refused_while_the_tier_pattern_is_provisional(self):
         binary, _ = self.fake({"boot": BANNER, "usage": "Plan: Google AI Pro\n" + FIXTURE.read_text()})
@@ -493,6 +545,9 @@ class ParserAndPools(unittest.TestCase):
         self.assertEqual(sc._agy_pool_of_group("third-party models"), "claude-gpt")
         self.assertEqual(sc._agy_pool_of_group("claude and gpt models"), "claude-gpt")
         self.assertEqual(sc._agy_pool_of_group("gemini models"), "gemini")
+        self.assertIsNone(sc._agy_pool_of_group("private customer acme models"))
+        self.assertEqual(sc.agy_group_labels(["x models", "gemini models", "y models"]),
+                         {"x models": "unknown-group-1", "gemini models": "gemini", "y models": "unknown-group-2"})
 
     def test_pools_by_inventory(self):
         for m in ("gemini-4-neon-high", "Gemini 4 Carbon (Low)", "gemini-4-argon-medium", "Gemini 4 Hydrogen (XHigh)",

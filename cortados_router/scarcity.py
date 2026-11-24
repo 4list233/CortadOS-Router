@@ -409,14 +409,14 @@ def agy_usage_gaps(text: str) -> list[str]:
     its last line. A partial reading is an error, never a healthy reading (#144 review round 1)."""
     groups = parse_agy_usage(text)
     gaps = []
-    by_pool = {_agy_pool_of_group(t): t for t in groups}
+    labels = agy_group_labels(groups)
     for pool in AGY_EXPECTED_POOLS:
-        if pool not in by_pool:
+        if pool not in labels.values():
             gaps.append(f"no {pool} group")
     for title, wins in groups.items():
         have = {w["window"] for w in wins}
-        # the pool name, not the title as shown: a gap goes into the error, the state and stderr (#144 round 3)
-        gaps += [f"{_agy_pool_of_group(title)}: no {k} window" for k in AGY_WINDOW_KINDS if k not in have]
+        # the fixed label, never the title as shown: a gap goes into the error, the state and stderr (#144 rounds 3-4)
+        gaps += [f"{labels[title]}: no {k} window" for k in AGY_WINDOW_KINDS if k not in have]
     pages = list(AGY_PAGER.finditer(text))
     if pages and int(pages[-1].group(2)) < int(pages[-1].group(3)):
         gaps.append(f"pager not read to the end (last view {pages[-1].group(1)}-{pages[-1].group(2)} of {pages[-1].group(3)})")
@@ -628,13 +628,29 @@ def lane_state(v: dict[str, Any] | None) -> str | None:
     return LANE_STATE_TEXT.get(v.get("error_kind")) if v.get("error") else None
 
 
-def _agy_pool_of_group(title: str) -> str:
+def _agy_pool_of_group(title: str) -> str | None:
+    """The fixed pool name of a known quota group, else None. Never derived from the title's text (#144 round 4)."""
     g = title.lower()
     if "gemini" in g:
         return "gemini"
     if re.search(r"claude|gpt|third|partner", g):
         return "claude-gpt"       # Pro's "paid-tier third-party models" (Claude Opus / Sonnet 5.5, GPT-OSS 120B on 2026-11-24)
-    return re.sub(r"[^a-z0-9]+", "-", g.replace("models", "")).strip("-")
+    return None
+
+
+def agy_group_labels(titles) -> dict[str, str]:
+    """{title as shown: label} for every quota group. A known group keeps its fixed pool name (gemini, claude-gpt); any
+    other gets "unknown-group-N" by order of first appearance. A label is never built from screen text: a slug of a title
+    such as "PRIVATE CUSTOMER ACME MODELS" reached the error, the state and stderr (#144 review round 4)."""
+    labels: dict[str, str] = {}
+    n = 0
+    for title in titles:
+        pool = _agy_pool_of_group(title)
+        if pool is None:
+            n += 1
+            pool = f"unknown-group-{n}"
+        labels[title] = pool
+    return labels
 
 
 def _antigravity() -> dict[str, Any]:
@@ -668,8 +684,9 @@ def _antigravity() -> dict[str, Any]:
     # last, so a screen problem above is reported as itself. PROVISIONAL tier pattern: refuses until confirmed [ESCALATE].
     tier = iso.check_subscription(text)
     wins = []
+    labels = agy_group_labels(groups)     # unknown groups kept under fixed labels only (#144 round 4)
     for g, ws in groups.items():
-        pool = _agy_pool_of_group(g)
+        pool = labels[g]
         wins += [{**w, "window": f"{w['window']} ({pool})", "pool": pool} for w in ws]
     return {"source": "agy /usage (pty)", "windows": wins, "binary": binary, "tier": tier}
 
