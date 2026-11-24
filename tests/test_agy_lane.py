@@ -44,7 +44,7 @@ def pager_view(lines: list[str], top: int) -> str:
 FAKE = r'''#!{py}
 import os, tty
 LOG = {log!r}
-SCREENS = {screens!r}
+SCREENS = {screens!a}    # ASCII escapes: Python 3.9's tokenizer can misread a long line of multibyte text
 with open(LOG + ".env", "w") as f:
     f.write("\n".join(sorted(os.environ)))
 try:
@@ -92,6 +92,11 @@ FIRST_RUN = "Welcome to Antigravity CLI\nColor scheme: Dark / Solarized Dark / S
 TRUST = "Do you trust the contents of this folder?\nTrust this workspace [Y/n]\n"
 
 
+def confirmed_tier():
+    """As if the owner's capture had confirmed the tier line (TIER_PATTERN_CONFIRMED is False until then)."""
+    return mock.patch.object(iso, "TIER_PATTERN_CONFIRMED", True)
+
+
 class AgyBase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -110,7 +115,8 @@ class AgyBase(unittest.TestCase):
                         "AGY_ADC_AUTH": "true", "OPENAI_API_KEY": "sk-o", "ANTHROPIC_API_KEY": "sk-a",
                         "CORTADOS_PROVIDER_TOKEN": "tok", "SSH_AUTH_SOCK": "/tmp/agent", "GITHUB_TOKEN": "gh"}
 
-        self.write_settings({"security": {"auth": {"selectedType": iso.SUBSCRIPTION_AUTH}}})
+        # agy 1.5.16's real shape (placeholder paths); no config.json / mcp_config.json is allowed too
+        self.write_settings({"trustedWorkspaces": ["/Users/example/projects/alpha", "/Users/example/projects/beta"]})
 
     def write_settings(self, data) -> None:
         p = self.home / iso.SETTINGS_RELPATH
@@ -223,9 +229,10 @@ class ProbeHonesty(AgyBase):
         self.assertEqual(self.keys(log), b"\r")       # one Enter for the trust prompt; /usage never typed
 
     def test_usage_screen_is_read_through_the_isolated_env(self):
-        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
-        with self.env(binary):
+        binary, log = self.fake({"boot": BANNER, "usage": "Plan: Google AI Pro\n" + FIXTURE.read_text()})
+        with self.env(binary), confirmed_tier():
             rec = sc._antigravity()
+        self.assertEqual(rec["tier"], "AI Pro")
         self.assertEqual(rec["binary"], binary)
         self.assertEqual(sorted((w["window"], w["pool"]) for w in rec["windows"]),
                          [("5-hour (claude-gpt)", "claude-gpt"), ("5-hour (gemini)", "gemini"),
@@ -252,12 +259,59 @@ class ProbeHonesty(AgyBase):
     def test_unsafe_settings_refuse_before_any_start(self):
         binary, _ = self.fake({"boot": BANNER})
         for bad in ({"tools": {"permissionMode": "always-proceed"}}, [],
-                    {"security": {"auth": {"selectedType": "api-key"}}}):
+                    {"security": {"auth": {"selectedType": "api-key"}}}, {"trustedWorkspaces": "x", "mcpServers": {}}):
             with self.subTest(bad=bad):
                 self.write_settings(bad)
                 with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
                     with self.assertRaises(iso.SettingsRefused):
                         sc._antigravity()
+
+    def test_missing_settings_is_first_run_pending_before_any_start(self):
+        binary, _ = self.fake({"boot": BANNER})
+        (self.home / iso.SETTINGS_RELPATH).unlink()
+        with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises(iso.FirstRunPending) as cm:
+                sc._antigravity()
+        rec = sc._failed_record("antigravity", None, cm.exception)
+        self.assertEqual((rec["error_kind"], sc.lane_state(rec)), ("first-run-pending", "first-run setup pending"))
+
+    def test_mcp_server_in_mcp_config_refuses_before_any_start(self):
+        binary, _ = self.fake({"boot": BANNER})
+        p = self.home / iso.MCP_CONFIG_RELPATH
+        p.parent.mkdir(parents=True)
+        p.write_text(json.dumps({"mcpServers": {"x": {"command": "y"}}}))
+        with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaisesRegex(iso.SettingsRefused, "MCP servers"):
+                sc._antigravity()
+
+    # ---- #144 round 2: agy stores no auth mode; the subscription is proven from its screen (provisional: refusing)
+    def test_full_reading_is_refused_while_the_tier_pattern_is_provisional(self):
+        binary, _ = self.fake({"boot": BANNER, "usage": "Plan: Google AI Pro\n" + FIXTURE.read_text()})
+        with self.env(binary):
+            with self.assertRaisesRegex(iso.SubscriptionUnproven, "PROVISIONAL") as cm:
+                sc._antigravity()
+        self.assertEqual(sc._failed_record("antigravity", None, cm.exception)["error_kind"], "subscription-unproven")
+
+    def test_api_key_screen_is_refused_even_with_a_tier(self):
+        binary, _ = self.fake({"boot": BANNER, "usage": "Plan: Google AI Pro \u00b7 API key\n" + FIXTURE.read_text()})
+        with self.env(binary), confirmed_tier():
+            with self.assertRaisesRegex(iso.SubscriptionUnproven, "non-subscription"):
+                sc._antigravity()
+
+    def test_no_tier_on_screen_is_refused(self):
+        binary, _ = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})         # the tier is read from /usage
+        with self.env(binary), confirmed_tier():
+            with self.assertRaisesRegex(iso.SubscriptionUnproven, "no personal"):
+                sc._antigravity()
+
+    def test_account_email_never_reaches_an_error(self):
+        binary, _ = self.fake({"boot": BANNER, "usage": "Models & Quota\nAccount: owner.private@example.com\nnothing here\n"
+                                                         "Limit Remaining x Limit Remaining y\n"})
+        with self.env(binary):
+            with self.assertRaises(Exception) as cm:
+                sc._antigravity()
+        rec = sc._failed_record("antigravity", None, cm.exception)
+        self.assertNotIn("owner.private", rec["error"])
 
     # ---- #144 review round 1, finding 3: a login screen that appears only after /usage gets no more input
     def test_login_screen_after_usage_stops_typing_at_once_and_says_what_was_typed(self):
@@ -297,7 +351,7 @@ class ProbeHonesty(AgyBase):
         lines = PAGER_FIXTURE.read_text().splitlines()
         self.assertEqual(len(lines), 30)
         binary, log = self.fake({"boot": BANNER, "pager": lines})
-        with self.env(binary):
+        with self.env(binary), confirmed_tier():
             rec = sc._antigravity()
         keys = self.keys(log)
         self.assertTrue(keys.startswith(b"/usage\r"))

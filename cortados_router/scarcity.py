@@ -603,6 +603,7 @@ LANE_STATE_TEXT = {
     "first-run-pending": "first-run setup pending",
     "forbidden-env": "refused: API key or ADC variable configured",
     "settings-refused": "refused: unsafe agy settings",
+    "subscription-unproven": "refused: subscription login not proven",
     "partial-reading": "quota screen read only in part",
 }
 
@@ -642,15 +643,19 @@ def _antigravity() -> dict[str, Any]:
         raise RuntimeError("agy /usage screen empty (stage=" + str(diag.get("stage")) + ")")
     groups = parse_agy_usage(text)
     if not groups:
-        raise RuntimeError("no quota groups on the /usage screen: " + text[-200:].replace("\n", " "))
+        # the screen's tail may hold the Account: line: its email is dropped before anything is recorded
+        raise RuntimeError("no quota groups on the /usage screen: " + iso.scrub_account(text[-200:]).replace("\n", " "))
     gaps = agy_usage_gaps(text)
     if gaps:
         raise ProbePartialReading("agy /usage read only in part: " + "; ".join(gaps))
+    # agy stores no auth mode in its settings (#144 round 2): the personal subscription is proven from its own screen,
+    # last, so a screen problem above is reported as itself. PROVISIONAL tier pattern: refuses until confirmed [ESCALATE].
+    tier = iso.check_subscription(text)
     wins = []
     for g, ws in groups.items():
         pool = _agy_pool_of_group(g)
         wins += [{**w, "window": f"{w['window']} ({pool})", "pool": pool} for w in ws]
-    return {"source": "agy /usage (pty)", "windows": wins, "binary": binary}
+    return {"source": "agy /usage (pty)", "windows": wins, "binary": binary, "tier": tier}
 
 
 def _load_codex_screen():

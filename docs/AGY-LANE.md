@@ -9,9 +9,9 @@ False and `core.resolve`'s fit gate refuses every agy route. The provider serves
 
 | Piece | Where | What |
 |---|---|---|
-| Isolation (one owner) | `cortados_router/agy_isolation.py` | Environment allowlist for every agy process (`HOME`, `USER`, `LOGNAME`, `TMPDIR`, `LANG`, `LC_*`, fixed `PATH`; `TERM` from the PTY). A `GEMINI_*` / `GOOGLE_*` / `AGY_*` / `CLOUDSDK_*` name in the router's shared env file (`$CORTADOS_HOME/env`) is a hard failure (`forbidden-env`); in the process environment it is dropped. Other vendors' variables are dropped, never fatal (that file serves their lanes too). The binary is a configured absolute path, never searched on PATH. A settings guard reads `~/.gemini/antigravity-cli/settings.json` (never writes it) against an **allowlist** schema (below). One launch path: `agy_isolation.prepare` runs all of this before every agy process (the probe and `agy models`). |
+| Isolation (one owner) | `cortados_router/agy_isolation.py` | Environment allowlist for every agy process (`HOME`, `USER`, `LOGNAME`, `TMPDIR`, `LANG`, `LC_*`, fixed `PATH`; `TERM` from the PTY). A `GEMINI_*` / `GOOGLE_*` / `AGY_*` / `CLOUDSDK_*` name in the router's shared env file (`$CORTADOS_HOME/env`) is a hard failure (`forbidden-env`); in the process environment it is dropped. Other vendors' variables are dropped, never fatal (that file serves their lanes too). The binary is a configured absolute path, never searched on PATH. A settings guard reads agy's real config files (never writes them) against **allowlist** schemas (below); a subscription proof reads agy's own `/usage` screen (below). One launch path: `agy_isolation.prepare` runs all of this before every agy process (the probe and `agy models`). |
 | Binary | provider `--agy-bin <absolute path>` (or `CORTADOS_AGY_BIN`) | Unset: the lane is **not configured** and never sampled (no PTY opened); the views say "not configured", not FAILED. |
-| Honest failures | `scarcity.tui_capture`, `scarcity._antigravity` | `binary-missing` (with `searched`), `exec-failed` (the child could not exec, or exited at once with no output; all lanes now raise on an exec failure instead of returning an empty screen), `not-logged-in`, `first-run-pending`, `forbidden-env`, `settings-refused`. |
+| Honest failures | `scarcity.tui_capture`, `scarcity._antigravity` | `binary-missing` (with `searched`), `exec-failed` (the child could not exec, or exited at once with no output; all lanes now raise on an exec failure instead of returning an empty screen), `not-logged-in`, `first-run-pending` (a first-run screen, or no `antigravity-cli/settings.json` yet), `forbidden-env`, `settings-refused`, `subscription-unproven`. |
 | Deny-all | `tui_capture(refuse=...)` | Enter is sent only for the existing workspace-trust prompt. The refusal patterns are checked on every read and before every write, at every stage (boot, after trust, after `/usage`, while paging): a sign-in or first-run screen closes the CLI at once, and the error says truly what had been typed by then ("nothing was typed" only when nothing was). |
 | Pager | `scarcity._agy_next_page`, `parse_agy_usage`, `agy_usage_gaps` | agy 1.5.16 shows `/usage` in a scrollable pager ("(1–17 of 30 lines)", ↑/↓, pgdown, ctrl+end Bottom). The probe presses ↓ (navigation only, never text) until every group is read, the footer shows the last line, or a press stops moving the view. Each painted view is parsed on its own (a window counts only under a group header shown above it in the same view) and views are merged per group and window. A reading needs both pools (`gemini`, `claude-gpt`), each with its week and five-hour window, and the pager read to its end; anything less is `partial-reading` ("quota screen read only in part"), an error, never a healthy reading. ↓ rather than pgdown / ctrl+end: stepping one line shows every group that fits in a view whole in some view; a page jump can land with a group's header just above the top. |
 | Views | `usage._one_lane` / `live.subscriptions_section` (`state`), `core.subscription_readings` (`state`), `dashboard.html`, the cortados-pulse pane | The lane's state in words: "not configured", "not installed", "could not start", "not logged in", "first-run setup pending", "refused: …". The pane prints it in place of "last sample FAILED". |
@@ -19,23 +19,41 @@ False and `core.resolve`'s fit gate refuses every agy route. The provider serves
 | Tables | `tables/inventory/agy.txt`, `routing-table.json` v23 `inventory.antigravity` (rebased on #143's v21; v22 is the scarcity-v2-api-pacing branch's) | The 27 models agy 1.5.16 lists on the Air (2026-11-24). `gemini` pool: Gemini 4 Neon / Carbon / Argon / Hydrogen (Low … XHigh), the three Orchestrator pairings, Gemini 3.8 Flash (until 2026-11-30). `claude-gpt` pool: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B. R1's `Gemini 3.7 Flash (Medium)` was **removed** (no longer listed; a replacement is a band ruling, below). |
 | Inventory script | `bin/refresh-inventory.sh` | Never starts agy itself: it calls `python3 -B -m cortados_router.agy_isolation models` (`run_models` → `prepare`: absolute `CORTADOS_AGY_BIN` only, never PATH; allowlisted env; env-file ban; settings guard; an empty per-run folder) and turns agy 1.5.16's space-padded columns into the tab format `build_tiers.py` reads. Refused or not configured: exit 2, the reason on stderr, `agy.txt` left as it is. |
 
-### Settings guard: the allowlist (`agy_isolation.SETTINGS_SCHEMA`)
+### Settings guard: the allowlists (`agy_isolation.check_settings`)
 
-The file must be a JSON object holding only these keys; anything else is refused (`settings-refused`), and so is a
-missing or unreadable file (fail closed: without the file the auth mode is unknown).
+Round 2 (2026-11-24): the shapes are agy 1.5.16's **real files on the Air** (key names and types read, values not
+printed). agy stores **no auth mode** in its settings; round 1 required `security.auth.selectedType = "oauth-personal"`,
+guessed from the Gemini CLI's file on the Pro, and would have refused the owner's correct install. That requirement is
+gone; the subscription login is proven from the screen instead (next section).
 
-| Key | Allowed | Why |
+| File (under `~`) | Allowed | Why |
 |---|---|---|
-| `security.auth.selectedType` | **required**, exactly `"oauth-personal"` | The subscription login ("Login with Google"). Recorded 2026-11-24 from the owner's signed-in `~/.gemini/settings.json` on the Pro (the Gemini CLI file agy's settings descend from). `gemini-api-key` / `api-key`, `vertex-ai`, `compute-default-credentials` / `cloud-shell` / `adc` bill outside the Google AI Pro subscription and are named in the refusal. |
-| `ui.theme` (string), `ui.showStatusInTitle`, `ui.showMemoryUsage`, `ui.hideBanner`, `ui.hideTips`, `ui.footer.hideContextPercentage` (booleans) | as typed | Display only: how the screen is drawn, never what agy runs or how it bills. |
-| `ide.enabled` | `false` only | IDE integration on connects agy to an IDE companion server that can add tools; off is the absence of it. |
-| `ide.hasSeenNudge`, `hasSeenIdeIntegrationNudge` (booleans) | as typed | "Has seen the hint" flags. |
+| `.gemini/antigravity-cli/settings.json` | a JSON object with only `trustedWorkspaces` (a list of strings). **Missing: `first-run-pending`** ("first-run setup pending"), not "unsafe": agy writes it on its first run. | The folders the owner trusted. Trust only skips agy's own prompt for a folder; it grants no tool and changes no billing (the probe runs in a fresh per-run folder anyway). |
+| `.gemini/config/config.json` | missing, or a JSON object with only `plugins.swarm.enabled` (a boolean) | Swarm is agy's built-in multi-agent plugin (on in the owner's install). It adds no outside tool or billing path, but **one request can fan out to several agents and so multiplies quota use**: PR B must account for it before routing. Any other plugin or key is refused. |
+| `.gemini/config/mcp_config.json` | missing, empty (0 bytes or whitespace: agy 1.5.16 leaves it empty), `{}` or `{"mcpServers": {}}` | An MCP server gives agy tools the router never reviewed: any server entry is refused. Other content, and anything unparsable, is refused. |
+| `.gemini/settings.json` (the **Gemini CLI's** file; absent on the Air) | absent; or a JSON object whose auth mode (`security.auth.selectedType`, or the older top-level `selectedAuthType`), where set, is `"oauth-personal"`, and with no `mcpServers` | agy may read it. `gemini-api-key` / `api-key`, `vertex-ai`, `compute-default-credentials` / `cloud-shell` / `adc` bill outside the Google AI Pro subscription and are named in the refusal; any other value is refused without being echoed. Its other keys are the Gemini CLI's business. |
 
-Refused by name: `mcpServers` / `mcp`, `tools` (auto-accept, allowed tools), `approvalMode`, `autoAccept`, `yolo`; every
-other unknown key (`general.*`, `security.folderTrust`, ...) as "unknown setting". Values outside the known auth modes
-are never echoed (one may be a credential). **Owner check on the Air:** the guard's key names come from the Gemini CLI
-file on the Pro, not yet from agy 1.5.16's own file. If the lane says "refused: unsafe agy settings", send the key names
-of `~/.gemini/antigravity-cli/settings.json` (values may be redacted) and the schema is widened per key, with a reason.
+Everywhere: an unparsable non-empty file, a non-object and an unknown key are refused (`settings-refused`, fail closed);
+`mcpServers`, `tools`, `approvalMode`, `autoAccept`, `yolo`, `security` are refused by name. Values are never echoed
+(a value may be a credential or a private path). The env bans (`GEMINI_*`, `GOOGLE_*`, `AGY_*`, `CLOUDSDK_*` in the
+router's env file) are unchanged.
+
+### Subscription proof (`agy_isolation.check_subscription`) [ESCALATE]
+
+With no auth mode in settings, the probe proves the login from what agy itself shows on the `/usage` answer (the
+"Models & Quota" box: an "Account:" line and the tier / plan text). Read-only evidence; the account email is matched and
+dropped (`scrub_account`) before anything is checked, stored or echoed, including the "no quota groups" error's screen tail.
+
+- Refused (`subscription-unproven`, "refused: subscription login not proven"): the screen names an API key, Vertex,
+  enterprise, pay-as-you-go, Application Default Credentials / ADC, a Cloud project, a billing account or Code Assist
+  (even next to a tier), or shows no personal tier.
+- Accepted: a personal Google AI tier, `AI Pro` / `Google AI Pro` (and `AI Ultra`, also a personal tier); recorded as
+  the reading's `tier`.
+- **[ESCALATE] PROVISIONAL:** no captured agy 1.5.16 screen with the tier line is in this repository (both fixtures are
+  reconstructed), so `TIER_PATTERN` (`(Google )?AI (Pro|Ultra)`) is a guess at its wording. `TIER_PATTERN_CONFIRMED` is
+  `False`, and while it is the lane **refuses every reading** even when the pattern matches, so the agy quota is not
+  shown until confirmed. To confirm: the owner sends the `/usage` box's tier / plan line exactly as printed (email
+  scrubbed; the tier may stay); pin `TIER_PATTERN` to it, add the paste as a fixture and set the flag `True`.
 
 ### Saved conversations
 agy saves every interactive session: on start it prints "Resume with -c (or command below): agy --conversation=<uuid>".
@@ -57,8 +75,8 @@ not a captured agy 1.5.16 screen. Fixture: `tests/fixtures/agy-usage-provisional
 2. What a logged-out `agy` prints at start (the sign-in screen), if it can be seen without signing out the real login
    (e.g. on another macOS user); otherwise say so and the pattern stays provisional.
 3. The first-run screens' wording (color scheme, rendering mode), if they were noted.
-4. `~/.gemini/antigravity-cli/settings.json` key names (values may be redacted), so the settings guard can match exact
-   keys instead of key families.
+4. ~~`~/.gemini/antigravity-cli/settings.json` key names~~: done 2026-11-24 (round 2 allowlists). Still needed: the
+   `/usage` box's tier / plan line exactly as printed, for the subscription proof above.
 
 ## Owner steps on the Air (updated 2026-11-24)
 
@@ -70,6 +88,8 @@ agy 1.5.16 is installed at `~/.local/bin/agy` and signed in (Google AI Pro). The
 2. Make sure `~/.cortados/env` holds no `GEMINI_*`, `GOOGLE_*`, `AGY_*` or `CLOUDSDK_*` line (the lane refuses to run).
 3. After the next 30-minute sample, the live view / pulse pane shows the Gemini and third-party quota, or the named
    reason it could not ("not logged in", "first-run setup pending", …).
+   **Until the tier line is confirmed** (Subscription proof, [ESCALATE]) it shows "refused: subscription login not
+   proven": expected, and the cue to send the `/usage` box's tier / plan line.
 
 ## Open for the routing PR (B) [ESCALATE]
 

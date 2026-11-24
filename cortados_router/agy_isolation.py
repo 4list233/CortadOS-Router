@@ -15,10 +15,13 @@ The rules, each with its reason:
      their own lanes (CLAUDE_CONFIG_DIR, CODEX_HOME, ...): they are dropped by the allowlist, not fatal.
   3. A configured ABSOLUTE binary (`resolve_binary`): `--agy-bin` on the provider, or CORTADOS_AGY_BIN. PATH never
      chooses. Unset, the lane is "not configured" and is never sampled (no PTY is opened).
-  4. SETTINGS GUARD (`check_settings`): agy's own settings file is read (never written) before any start and must match
-     an ALLOWLIST schema (`SETTINGS_SCHEMA`): a JSON object, only listed keys, the auth mode the subscription login
-     (`SUBSCRIPTION_AUTH`). Anything else is refused: a non-object, an unknown key anywhere (MCP servers, tool /
-     approval modes included), an API-key / Vertex / ADC auth mode, a missing or unreadable file (fail closed).
+  4. SETTINGS GUARD (`check_settings`): the files agy 1.5.16 reads its configuration from are read (never written)
+     before any start and must match ALLOWLIST schemas: antigravity-cli/settings.json (`trustedWorkspaces` only; missing
+     = first run pending), config/config.json (`plugins.swarm.enabled` only), config/mcp_config.json (no MCP server),
+     and the Gemini CLI's settings.json if present (no API-key / Vertex / ADC auth mode, no MCP server). A non-object,
+     an unknown key anywhere, an unparsable non-empty file: refused (fail closed).
+  4b. SUBSCRIPTION PROOF (`check_subscription`): agy stores no auth mode, so the probe proves the personal Google AI
+     subscription from agy's own screen (tier line; never the account email). PROVISIONAL pattern, refusing [ESCALATE].
   5. ONE LAUNCH PATH (`prepare`): rules 1-4 run, in that order, before every agy process: the quota probe
      (scarcity._antigravity) and `agy models` (`run_models`, the CLI `python3 -B -m cortados_router.agy_isolation models`
      that bin/refresh-inventory.sh calls).
@@ -32,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -134,38 +138,35 @@ def resolve_binary(configured: str | None) -> str:
 
 
 # --------------------------------------------------------------------------------------------- settings guard (ALLOWLIST)
-# agy's settings.json is validated against this schema, never scanned for bad words (#144 review round 1: the earlier
-# blacklist accepted `[]`, `{"security":{"auth":{"selectedType":"api-key"}}}` and any unknown security setting).
-# A leaf is a type (bool / str: any value of that type) or a tuple of the allowed values. Everything not listed is refused.
+# agy's files are validated against allowlist schemas, never scanned for bad words (#144 review round 1: the earlier
+# blacklist accepted `[]` and any unknown setting). A leaf is a type (bool / str: any value of that type), a tuple of the
+# allowed values, or `[type]` (a list whose every item is that type). Everything not listed is refused.
 #
-# The auth mode is REQUIRED and must be the subscription login. "oauth-personal" is the value the owner's signed-in
-# Google login writes ("Login with Google"; read 2026-11-24 from the owner's ~/.gemini/settings.json on the Pro, the
-# Gemini CLI file agy's settings descend from: security.auth.selectedType). Every other mode bills elsewhere:
-# "gemini-api-key" / "api-key" (API-key billing), "vertex-ai" (a Cloud project), "compute-default-credentials" /
-# "cloud-shell" / ADC (Application Default Credentials, Cloud billing). If agy 1.5.16 on the Air writes a different key or
-# value, the lane says "refused: unsafe agy settings" with the reason, and this schema is updated to the captured file.
-SUBSCRIPTION_AUTH = "oauth-personal"
-BILLING_AUTH_MODES = ("gemini-api-key", "api-key", "vertex-ai", "compute-default-credentials", "cloud-shell", "adc")
+# Round 2 (2026-11-24): the shapes are agy 1.5.16's real files, read on the Air (key names and types only, values not
+# printed). agy stores NO auth mode in its settings (round 1 required `security.auth.selectedType`, guessed from the
+# Gemini CLI's file on the Pro, and would have refused the owner's real install). The subscription login is proven from
+# what agy shows instead (`check_subscription`, below).
 _DISPLAY_ONLY = "display only: changes how the screen is drawn, never what agy runs or how it bills"
-SETTINGS_SCHEMA: dict[str, Any] = {
-    "security": {"auth": {"selectedType": (SUBSCRIPTION_AUTH,)}},
-    # Allowed outside security, each provably harmless (the reason per key):
-    "ui": {
-        "theme": str,                         # the first-run color scheme; _DISPLAY_ONLY
-        "showStatusInTitle": bool,            # _DISPLAY_ONLY (terminal title)
-        "showMemoryUsage": bool,              # _DISPLAY_ONLY
-        "hideBanner": bool,                   # _DISPLAY_ONLY
-        "hideTips": bool,                     # _DISPLAY_ONLY
-        "footer": {"hideContextPercentage": bool},   # _DISPLAY_ONLY
-    },
-    "ide": {
-        "enabled": (False,),                  # IDE integration OFF only: when on, agy connects to an IDE companion server
-                                              # that can add tools and diffs; off is the absence of that connection
-        "hasSeenNudge": bool,                 # a "has seen the IDE hint" flag; no effect on what runs
-    },
-    "hasSeenIdeIntegrationNudge": bool,       # the same flag at the older top-level name
+# ~/.gemini/antigravity-cli/settings.json. MISSING = agy's first run is pending (FirstRunPending, not "unsafe").
+AGY_SETTINGS_SCHEMA: dict[str, Any] = {
+    # the folders the owner answered "trust" for; trust only skips agy's own prompt for that folder (the probe runs in a
+    # fresh per-run folder, so it never relies on this list), it grants no tool and changes no billing
+    "trustedWorkspaces": [str],
 }
-REQUIRED_SETTINGS = (("security", "auth", "selectedType"),)
+# ~/.gemini/config/config.json. Missing is fine: no plugin is configured.
+CONFIG_RELPATH = ".gemini/config/config.json"
+CONFIG_SCHEMA: dict[str, Any] = {
+    # Swarm is agy's built-in multi-agent plugin (on by default in 1.5.16). It adds no outside tool and no billing path,
+    # but one request can fan out to several agents: it MULTIPLIES quota use (docs/AGY-LANE.md). Allowed on or off.
+    "plugins": {"swarm": {"enabled": bool}},
+}
+# ~/.gemini/config/mcp_config.json: no MCP server may be configured. agy 1.5.16 leaves it as an EMPTY file (0 bytes).
+MCP_CONFIG_RELPATH = ".gemini/config/mcp_config.json"
+# ~/.gemini/settings.json is the GEMINI CLI's file, absent on the Air; agy may read it, so when it exists its auth mode
+# must be the Google login and it may configure no MCP server. Its other keys are the Gemini CLI's business.
+GEMINI_CLI_SETTINGS_RELPATH = ".gemini/settings.json"
+SUBSCRIPTION_AUTH = "oauth-personal"              # the Gemini CLI's "Login with Google" (read on the Pro, 2026-11-24)
+BILLING_AUTH_MODES = ("gemini-api-key", "api-key", "vertex-ai", "compute-default-credentials", "cloud-shell", "adc")
 # Named in the refusal so the owner sees why, not just "unknown key" (all are refused by the allowlist anyway).
 _NAMED_REFUSALS = {
     "mcpservers": "MCP servers are configured (they give agy tools the router never reviewed)",
@@ -174,7 +175,19 @@ _NAMED_REFUSALS = {
     "approvalmode": "an approval mode is configured (auto-approve runs tools without review)",
     "autoaccept": "auto-accept is configured (runs tools without review)",
     "yolo": "yolo mode is configured (runs every tool without review)",
+    "security": "security settings are configured (agy 1.5.16 writes none; an auth mode there may bill elsewhere)",
 }
+
+
+class FirstRunPending(AgyLaneError):
+    """agy's own settings file does not exist yet: agy has never finished its first run on this account."""
+    kind = "first-run-pending"
+
+
+class SubscriptionUnproven(AgyLaneError):
+    """agy's screen does not prove the Google AI subscription login (an API key / Vertex / enterprise screen, no tier
+    shown, or the tier pattern not yet confirmed against a real capture)."""
+    kind = "subscription-unproven"
 
 
 def _settings_problems(node: Any, schema: Any, path: str, out: list[str]) -> None:
@@ -190,48 +203,151 @@ def _settings_problems(node: Any, schema: Any, path: str, out: list[str]) -> Non
                 continue
             _settings_problems(v, schema[k], where, out)
         return
+    if isinstance(schema, list):
+        if not isinstance(node, list):
+            out.append(f"{path} is not a list")
+        elif any(type(x) is not schema[0] for x in node):
+            out.append(f"{path} holds an item that is not a {schema[0].__name__}")
+        return
     if isinstance(schema, tuple):
         if not any(node is ok or (type(node) is type(ok) and node == ok) for ok in schema):
-            if path == "security.auth.selectedType":
-                if isinstance(node, str) and node.strip().lower() in BILLING_AUTH_MODES:
-                    out.append(f"{path} is {node.strip().lower()!r}, which bills outside the Google AI Pro subscription")
-                else:
-                    out.append(f"{path} is not the subscription login {SUBSCRIPTION_AUTH!r}")
-            else:
-                out.append(f"{path} has a value outside {list(schema)!r}")
+            out.append(f"{path} has a value outside {list(schema)!r}")
         return
     if type(node) is not schema:            # bool is not int, str is str: no coercion
         out.append(f"{path} is not a {schema.__name__}")
 
 
-def check_settings(home: str | os.PathLike) -> None:
-    """Refuse (SettingsRefused) unless agy's settings file matches SETTINGS_SCHEMA exactly: a JSON object, only listed keys,
-    the subscription login as the auth mode. Read-only. A missing or unreadable file is refused (fail closed): without
-    the file the auth mode is unknown, and an unknown auth mode is not proven to be the subscription."""
-    p = Path(home) / SETTINGS_RELPATH
+def _read(p: Path, label: str) -> tuple[bool, str]:
+    """(exists, text) of one file, read-only. Over the size cap or unreadable: SettingsRefused (fail closed)."""
     try:
         if not p.exists():
-            raise SettingsRefused(f"agy settings file {SETTINGS_RELPATH} missing: the auth mode is unknown; sign in with "
-                                  f"Google once (it records security.auth.selectedType = {SUBSCRIPTION_AUTH!r})")
+            return False, ""
         if p.stat().st_size > SETTINGS_MAX_BYTES:
-            raise SettingsRefused(f"agy settings file is over {SETTINGS_MAX_BYTES} bytes; not read")
-        data = json.loads(p.read_text())
+            raise SettingsRefused(f"{label} is over {SETTINGS_MAX_BYTES} bytes; not read")
+        return True, p.read_text()
     except SettingsRefused:
         raise
     except (OSError, ValueError) as exc:
-        raise SettingsRefused(f"agy settings file unreadable ({type(exc).__name__}); refused, fail closed")
+        raise SettingsRefused(f"{label} unreadable ({type(exc).__name__}); refused, fail closed")
+
+
+def _json(text: str, label: str) -> Any:
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        raise SettingsRefused(f"{label} is not JSON ({type(exc).__name__}); refused, fail closed")
+
+
+def _check_schema(data: Any, schema: dict[str, Any], label: str) -> None:
     problems: list[str] = []
-    _settings_problems(data, SETTINGS_SCHEMA, "", problems)
-    if isinstance(data, dict):
-        for req in REQUIRED_SETTINGS:
-            node = data
-            for k in req:
-                node = node.get(k) if isinstance(node, dict) else None
-            if node is None:
-                problems.append(f"{'.'.join(req)} missing (must be {SUBSCRIPTION_AUTH!r}, the subscription login)")
+    _settings_problems(data, schema, "", problems)
     if problems:
-        # key paths and fixed words only: a value that is not a known auth mode is never echoed (it may be a credential)
-        raise SettingsRefused("agy settings refused: " + "; ".join(sorted(set(problems))))
+        # key paths and fixed words only: a value is never echoed (it may be a credential or a private path)
+        raise SettingsRefused(f"{label} refused: " + "; ".join(sorted(set(problems))))
+
+
+def _check_mcp_config(home: Path) -> None:
+    """Allowed only missing, empty (0 bytes or whitespace), `{}` or `{"mcpServers": {}}`: no server entry at all."""
+    label = MCP_CONFIG_RELPATH
+    exists, text = _read(home / label, label)
+    if not exists or not text.strip():
+        return
+    data = _json(text, label)
+    if data == {} or (isinstance(data, dict) and set(data) == {"mcpServers"} and data["mcpServers"] == {}):
+        return
+    if isinstance(data, dict) and isinstance(data.get("mcpServers"), dict) and data["mcpServers"]:
+        raise SettingsRefused(f"{label} refused: MCP servers are configured (they give agy tools the router never reviewed)")
+    raise SettingsRefused(f"{label} refused: only an empty file, {{}} or {{\"mcpServers\": {{}}}} is allowed")
+
+
+def _check_gemini_cli_settings(home: Path) -> None:
+    """The Gemini CLI's ~/.gemini/settings.json, if it exists (agy may read it): a JSON object whose auth mode, where one
+    is set, is the Google login, with no MCP server. Absent is fine (the Air has none)."""
+    label = GEMINI_CLI_SETTINGS_RELPATH
+    exists, text = _read(home / label, label)
+    if not exists:
+        return
+    data = _json(text, label) if text.strip() else {}
+    if not isinstance(data, dict):
+        raise SettingsRefused(f"{label} refused: the file is not a JSON object")
+    problems = []
+    sec = data.get("security")
+    auth = sec.get("auth") if isinstance(sec, dict) else None
+    # current Gemini CLI: security.auth.selectedType; older ones: top-level selectedAuthType
+    for where, mode in (("security.auth.selectedType", auth.get("selectedType") if isinstance(auth, dict) else None),
+                        ("selectedAuthType", data.get("selectedAuthType"))):
+        if mode is None or mode == SUBSCRIPTION_AUTH:
+            continue
+        if isinstance(mode, str) and mode.strip().lower() in BILLING_AUTH_MODES:
+            problems.append(f"{where} is {mode.strip().lower()!r}, which bills outside the Google AI Pro subscription")
+        else:
+            problems.append(f"{where} is not the Google login {SUBSCRIPTION_AUTH!r}")   # the value is never echoed
+    if (sec is not None and not isinstance(sec, dict)) or (auth is not None and not isinstance(auth, dict)):
+        problems.append("security / security.auth is not a JSON object")
+    if data.get("mcpServers"):
+        problems.append("mcpServers: MCP servers are configured (they give agy tools the router never reviewed)")
+    if problems:
+        raise SettingsRefused(f"{label} refused: " + "; ".join(sorted(set(problems))))
+
+
+def check_settings(home: str | os.PathLike) -> None:
+    """Read-only checks of every file agy 1.5.16 reads its configuration from, before any agy process starts:
+    antigravity-cli/settings.json (AGY_SETTINGS_SCHEMA; missing: FirstRunPending), config/config.json (CONFIG_SCHEMA;
+    missing is fine), config/mcp_config.json (no server) and, if present, the Gemini CLI's settings.json (no billing auth
+    mode, no MCP server). Unparsable non-empty files, non-objects and unknown keys are refused (SettingsRefused)."""
+    home = Path(home)
+    exists, text = _read(home / SETTINGS_RELPATH, SETTINGS_RELPATH)
+    if not exists:
+        raise FirstRunPending(f"{SETTINGS_RELPATH} does not exist: agy's first run is pending (start agy once by hand)")
+    _check_schema(_json(text, SETTINGS_RELPATH), AGY_SETTINGS_SCHEMA, SETTINGS_RELPATH)
+    exists, text = _read(home / CONFIG_RELPATH, CONFIG_RELPATH)
+    if exists:
+        _check_schema(_json(text, CONFIG_RELPATH), CONFIG_SCHEMA, CONFIG_RELPATH)
+    _check_mcp_config(home)
+    _check_gemini_cli_settings(home)
+
+
+# --------------------------------------------------------------------------------------------- subscription login proof
+# agy's settings hold no auth mode, so the Google AI subscription login is proven from what agy itself SHOWS: the /usage
+# box ("Models & Quota", an "Account:" line, the tier / plan text) and its banner. Read-only evidence; the account email
+# is matched and dropped (`scrub_account`), never stored, logged or echoed.
+#
+# [ESCALATE] PROVISIONAL: no captured agy 1.5.16 screen with the tier line exists in this repository (the fixtures are
+# reconstructed). TIER_PATTERN is a guess at its wording, so TIER_PATTERN_CONFIRMED stays False and the lane REFUSES
+# ("subscription-unproven") even when the pattern matches, until the owner's scrubbed /usage paste confirms the line
+# (docs/AGY-LANE.md). Then pin TIER_PATTERN to it and set the flag True.
+TIER_PATTERN_CONFIRMED = False
+# Personal Google AI subscription tiers only. Ultra is a personal tier too (same login, same billing path).
+TIER_PATTERN = re.compile(r"\b(?:Google\s+)?AI\s+(Pro|Ultra)\b", re.I)
+# Any of these on agy's screen means the session bills outside a personal subscription: refused even with a tier shown.
+NON_SUBSCRIPTION = re.compile(
+    r"\bapi[\s_-]?key\b|\bvertex\b|\benterprise\b|pay[\s-]*as[\s-]*you[\s-]*go|application default credentials"
+    r"|\bADC\b|cloud project|billing account|code assist", re.I)
+EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def scrub_account(text: str) -> str:
+    """The screen with every email address (the Account: line's included) replaced by `<account>`."""
+    return EMAIL.sub("<account>", text)
+
+
+def check_subscription(screen: str) -> str:
+    """The personal tier agy's screen shows ("AI Pro" / "AI Ultra"), or SubscriptionUnproven. Refused when the screen
+    names an API key / Vertex / enterprise / pay-as-you-go / Cloud billing, shows no tier, or while the tier pattern is
+    provisional (TIER_PATTERN_CONFIRMED False). Messages hold fixed words and the tier only, never screen text."""
+    text = scrub_account(screen)
+    bad = NON_SUBSCRIPTION.search(text)
+    if bad:
+        raise SubscriptionUnproven("agy's screen names a non-subscription login or billing "
+                                   f"({re.sub(r'[^a-z ]', ' ', bad.group(0).lower()).strip()!r}); refused")
+    m = TIER_PATTERN.search(text)
+    if not m:
+        raise SubscriptionUnproven("agy's screen shows no personal Google AI subscription tier; refused")
+    tier = f"AI {m.group(1).title()}"
+    if not TIER_PATTERN_CONFIRMED:
+        raise SubscriptionUnproven(f"tier line {tier!r} matched a PROVISIONAL pattern, not yet confirmed against a "
+                                   "captured agy 1.5.16 screen; refused until confirmed [ESCALATE]")
+    return tier
 
 
 # --------------------------------------------------------------------------------------------- the one launch path

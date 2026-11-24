@@ -21,14 +21,9 @@ from cortados_router import agy_isolation as iso
 from cortados_router import scarcity as sc
 
 ROOT = Path(__file__).resolve().parents[1]
-GOOD = {"security": {"auth": {"selectedType": "oauth-personal"}}}
-# The owner's signed-in settings (keys of ~/.gemini/settings.json on the Pro, 2026-11-24) minus the keys that are not
-# provably harmless (ide.enabled true, general.*, output.*): what the guard must accept.
-OWNER_LIKE = {"security": {"auth": {"selectedType": "oauth-personal"}},
-              "ide": {"hasSeenNudge": True, "enabled": False},
-              "ui": {"showStatusInTitle": True, "showMemoryUsage": True, "footer": {"hideContextPercentage": False},
-                     "theme": "Default Dark"},
-              "hasSeenIdeIntegrationNudge": True}
+# agy 1.5.16's real shapes (read on the Air 2026-11-24, key names and types only). The workspace paths are placeholders.
+GOOD = {"trustedWorkspaces": ["/Users/example/projects/alpha", "/Users/example/projects/beta"]}
+CONFIG = {"plugins": {"swarm": {"enabled": True}}}
 
 
 class SettingsAllowlist(unittest.TestCase):
@@ -37,75 +32,145 @@ class SettingsAllowlist(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.home, True)
         self.p = self.home / iso.SETTINGS_RELPATH
         self.p.parent.mkdir(parents=True)
+        self.cfg = self.home / iso.CONFIG_RELPATH
+        self.mcp = self.home / iso.MCP_CONFIG_RELPATH
+        self.gem = self.home / iso.GEMINI_CLI_SETTINGS_RELPATH
+        self.cfg.parent.mkdir(parents=True)
+        # the Air's install exactly: settings, config with swarm, an EMPTY mcp_config, no Gemini CLI settings.json
+        self.p.write_text(json.dumps(GOOD))
+        self.cfg.write_text(json.dumps(CONFIG))
+        self.mcp.write_text("")
 
-    def check(self, data):
-        self.p.write_text(data if isinstance(data, str) else json.dumps(data))
+    @staticmethod
+    def put(path: Path, data) -> None:
+        path.write_text(data if isinstance(data, str) else json.dumps(data))
+
+    def check(self, data=None, path=None):
+        if data is not None:
+            self.put(path or self.p, data)
         iso.check_settings(self.home)
 
-    def refused(self, data, why: str = ""):
+    def refused(self, data, why: str = "", path=None):
         with self.assertRaises(iso.SettingsRefused) as cm:
-            self.check(data)
+            self.check(data, path)
         if why:
             self.assertRegex(str(cm.exception), why)
         return str(cm.exception)
 
-    def test_subscription_login_is_the_recorded_value(self):
-        self.assertEqual(iso.SUBSCRIPTION_AUTH, "oauth-personal")
+    def test_the_real_install_passes(self):
+        self.check()
+        self.assertEqual(self.mcp.stat().st_size, 0)
+        self.assertFalse(self.gem.exists())
+        self.check({"trustedWorkspaces": []})
+        self.check({})
+        self.check({"plugins": {"swarm": {"enabled": False}}}, self.cfg)
+        self.check({}, self.cfg)
+        self.cfg.unlink(); self.check()                                    # no config.json: no plugin configured
+        self.mcp.unlink(); self.check()                                    # no mcp_config.json: no server
 
-    def test_accepts_only_known_keys_with_the_subscription_login(self):
-        self.check(GOOD)
-        self.check(OWNER_LIKE)
-
-    def test_reviewer_cases_are_refused(self):
-        self.refused([], "not a JSON object")
-        self.refused({"security": {"auth": {"selectedType": "api-key"}}}, "bills outside")
-        self.refused({"security": {"auth": {"selectedType": "oauth-personal", "useExternal": True}}},
-                     "unknown setting 'security.auth.useExternal'")
-        self.refused({"security": {"auth": {"selectedType": "oauth-personal"}, "folderTrust": {"enabled": False}}},
-                     "unknown setting 'security.folderTrust'")
-
-    def test_every_billing_mode_is_refused(self):
-        for mode in ("gemini-api-key", "vertex-ai", "compute-default-credentials", "cloud-shell", "adc", "API-KEY"):
-            with self.subTest(mode=mode):
-                self.refused({"security": {"auth": {"selectedType": mode}}}, "bills outside")
-
-    def test_auth_mode_is_required(self):
-        self.refused({}, r"security\.auth\.selectedType missing")
-        self.refused({"ui": {"theme": "x"}}, r"security\.auth\.selectedType missing")
-        self.refused({"security": {"auth": {}}}, r"security\.auth\.selectedType missing")
-        self.refused({"security": {"auth": {"selectedType": 1}}}, "not the subscription login")
-        self.refused({"security": {"auth": {"selectedType": None}}}, "not the subscription login|missing")
-
-    def test_a_secret_like_auth_value_is_not_echoed(self):
-        msg = self.refused({"security": {"auth": {"selectedType": "AIzaSySECRETVALUE"}}})
-        self.assertNotIn("AIzaSySECRETVALUE", msg)
-
-    def test_missing_and_unreadable_files_are_refused(self):
-        self.assertFalse(self.p.exists())
-        with self.assertRaisesRegex(iso.SettingsRefused, "missing"):
+    def test_missing_agy_settings_is_first_run_pending_not_unsafe(self):
+        self.p.unlink()
+        with self.assertRaises(iso.FirstRunPending) as cm:
             iso.check_settings(self.home)
-        self.refused("{not json", "fail closed")
-        self.refused("null", "not a JSON object")
-        self.refused('"oauth-personal"', "not a JSON object")
+        self.assertNotIsInstance(cm.exception, iso.SettingsRefused)
+        self.assertEqual(cm.exception.kind, "first-run-pending")
+        self.assertEqual(sc.lane_state(sc._failed_record("antigravity", None, cm.exception)), "first-run setup pending")
 
-    def test_mcp_and_auto_approve_are_refused(self):
+    def test_agy_settings_allowlist(self):
+        self.refused([], "not a JSON object")
+        self.refused("null", "not a JSON object")
+        self.refused("{not json", "fail closed")
+        self.refused("", "fail closed")                                    # settings.json empty is not the real shape
+        self.refused({"trustedWorkspaces": "/Users/example"}, "trustedWorkspaces is not a list")
+        self.refused({"trustedWorkspaces": ["/a", 1]}, "holds an item that is not a str")
+        self.refused({**GOOD, "renderingMode": "alt-screen"}, "unknown setting 'renderingMode'")
+        self.refused({**GOOD, "security": {"auth": {"selectedType": "oauth-personal"}}}, "security settings")
         for extra, why in (({"mcpServers": {"x": {"command": "y"}}}, "MCP servers"),
-                           ({"mcpServers": {}}, "MCP servers"),
                            ({"tools": {"autoAccept": True}}, "tool settings"),
-                           ({"general": {"approvalMode": "yolo"}}, "unknown setting 'general'"),
                            ({"approvalMode": "always-proceed"}, "approval mode"),
-                           ({"yolo": True}, "yolo"),
-                           ({"permissions": {"mode": "proceed-in-sandbox"}}, "unknown setting 'permissions'")):
+                           ({"yolo": True}, "yolo")):
             with self.subTest(extra=extra):
                 self.refused({**GOOD, **extra}, why)
 
-    def test_unknown_keys_anywhere_are_refused_and_types_are_strict(self):
-        self.refused({**GOOD, "renderingMode": "alt-screen"}, "unknown setting 'renderingMode'")
-        self.refused({**GOOD, "ui": {"theme": "dark", "customThemes": {}}}, "unknown setting 'ui.customThemes'")
-        self.refused({**GOOD, "ide": {"enabled": True}}, r"ide\.enabled has a value outside")
-        self.refused({**GOOD, "ide": {"enabled": 0}}, r"ide\.enabled has a value outside")      # 0 is not False
-        self.refused({**GOOD, "ui": {"showMemoryUsage": "yes"}}, r"ui\.showMemoryUsage is not a bool")
-        self.refused({**GOOD, "ui": []}, r"ui is not a JSON object")
+    def test_config_allowlist_refuses_unknown_plugins_and_keys(self):
+        self.refused({"plugins": {"swarm": {"enabled": True}, "browser": {"enabled": True}}}, "unknown setting 'plugins.browser'",
+                     self.cfg)
+        self.refused({"plugins": {"swarm": {"enabled": True, "maxAgents": 8}}}, "unknown setting 'plugins.swarm.maxAgents'",
+                     self.cfg)
+        self.refused({"plugins": {"swarm": {"enabled": "yes"}}}, r"plugins\.swarm\.enabled is not a bool", self.cfg)
+        self.refused({"plugins": {"swarm": {"enabled": 1}}}, r"plugins\.swarm\.enabled is not a bool", self.cfg)
+        self.refused({**CONFIG, "mcpServers": {"x": {}}}, "MCP servers", self.cfg)
+        self.refused([], "not a JSON object", self.cfg)
+        self.refused("{garbage", "fail closed", self.cfg)
+
+    def test_mcp_config_empty_shapes_pass(self):
+        for ok in ("", "   \n\t", "{}", '{"mcpServers": {}}', ' { "mcpServers" : { } } '):
+            with self.subTest(ok=ok):
+                self.check(ok, self.mcp)
+
+    def test_mcp_config_with_a_server_or_garbage_is_refused(self):
+        self.refused({"mcpServers": {"fs": {"command": "npx", "args": ["x"]}}}, "MCP servers are configured", self.mcp)
+        self.refused("not json at all", "fail closed", self.mcp)
+        self.refused("[]", "only an empty file", self.mcp)
+        self.refused("null", "only an empty file", self.mcp)
+        self.refused({"mcpServers": []}, "only an empty file", self.mcp)
+        self.refused({"mcpServers": {}, "other": 1}, "only an empty file", self.mcp)
+
+    def test_gemini_cli_settings_billing_modes_are_refused(self):
+        for mode in ("gemini-api-key", "api-key", "vertex-ai", "compute-default-credentials", "cloud-shell", "adc", "API-KEY"):
+            with self.subTest(mode=mode):
+                self.refused({"security": {"auth": {"selectedType": mode}}}, "bills outside", self.gem)
+                self.refused({"selectedAuthType": mode}, "bills outside", self.gem)       # the older top-level key
+        self.refused({"mcpServers": {"x": {"command": "y"}}}, "MCP servers", self.gem)
+        self.refused("{garbage", "fail closed", self.gem)
+        self.refused([], "not a JSON object", self.gem)
+
+    def test_gemini_cli_settings_login_passes_and_unknown_modes_are_not_echoed(self):
+        self.check({"security": {"auth": {"selectedType": "oauth-personal"}}, "ui": {"theme": "x"}, "general": {}}, self.gem)
+        self.check({}, self.gem)
+        msg = self.refused({"security": {"auth": {"selectedType": "AIzaSySECRETVALUE"}}}, "not the Google login", self.gem)
+        self.assertNotIn("AIzaSySECRETVALUE", msg)
+
+    def test_values_are_never_echoed(self):
+        msg = self.refused({"trustedWorkspaces": ["/Users/private-name/x", 3]})
+        self.assertNotIn("private-name", msg)
+
+
+class SubscriptionProof(unittest.TestCase):
+    USAGE = ("╭ Models & Quota ╮\nAccount: someone.private@example.com\nPlan: Google AI Pro\n"
+             "GEMINI MODELS\nWeekly Limit Remaining 87.50%\n")
+
+    def confirmed(self):
+        return mock.patch.object(iso, "TIER_PATTERN_CONFIRMED", True)
+
+    def test_provisional_pattern_keeps_the_lane_refusing(self):
+        self.assertFalse(iso.TIER_PATTERN_CONFIRMED)
+        with self.assertRaisesRegex(iso.SubscriptionUnproven, r"PROVISIONAL.*\[ESCALATE\]") as cm:
+            iso.check_subscription(self.USAGE)
+        self.assertEqual(cm.exception.kind, "subscription-unproven")
+        self.assertNotIn("someone.private", str(cm.exception))
+        self.assertEqual(sc.lane_state(sc._failed_record("antigravity", None, cm.exception)),
+                         "refused: subscription login not proven")
+
+    def test_personal_tiers_pass_once_confirmed(self):
+        with self.confirmed():
+            self.assertEqual(iso.check_subscription(self.USAGE), "AI Pro")
+            self.assertEqual(iso.check_subscription("(Google AI Pro) Gemini 4 Neon (High)"), "AI Pro")
+            self.assertEqual(iso.check_subscription("Plan: AI Ultra"), "AI Ultra")
+
+    def test_non_subscription_screens_are_refused(self):
+        with self.confirmed():
+            for screen in ("Plan: Google AI Pro\nAuth: API key", "Plan: Google AI Pro\nVertex AI project my-proj",
+                           "Gemini Code Assist Enterprise", "Plan: Pay-as-you-go", "Pay as you go billing",
+                           "Using Application Default Credentials", "Account: x@y.com\nGEMINI MODELS",
+                           "Plan: Free", ""):
+                with self.subTest(screen=screen), self.assertRaises(iso.SubscriptionUnproven) as cm:
+                    iso.check_subscription(screen)
+                self.assertNotIn("x@y.com", str(cm.exception))
+                self.assertNotIn("my-proj", str(cm.exception))
+
+    def test_account_email_is_scrubbed(self):
+        self.assertEqual(iso.scrub_account("Account: a.b+c@mail.example.co.uk |"), "Account: <account> |")
 
 
 FAKE_AGY = r'''#!{py}
@@ -156,8 +221,12 @@ class OneLaunchPath(unittest.TestCase):
         with mock.patch("subprocess.run", side_effect=AssertionError("must not run")):
             with self.assertRaises(iso.ForbiddenEnv):
                 iso.run_models(str(self.bin), self.environ, {"GOOGLE_API_KEY": "x"})
-            (self.home / iso.SETTINGS_RELPATH).write_text(json.dumps({"security": {"auth": {"selectedType": "api-key"}}}))
+            (self.home / iso.MCP_CONFIG_RELPATH).parent.mkdir(parents=True)
+            (self.home / iso.MCP_CONFIG_RELPATH).write_text(json.dumps({"mcpServers": {"x": {"command": "y"}}}))
             with self.assertRaises(iso.SettingsRefused):
+                iso.run_models(str(self.bin), self.environ, {})
+            (self.home / iso.SETTINGS_RELPATH).unlink()
+            with self.assertRaises(iso.FirstRunPending):
                 iso.run_models(str(self.bin), self.environ, {})
             with self.assertRaises(iso.LaneNotConfigured):
                 iso.run_models(None, self.environ, {})
