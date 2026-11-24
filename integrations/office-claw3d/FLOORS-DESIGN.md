@@ -199,6 +199,8 @@ land; `sprites.mjs` gains a gemini figure (E7). *Acceptance:* the existing sprit
 | E5 | **No hover patch.** The nameplate's second line (the model; for a finished task its end state and model) is enough. | |
 | E6 | **8 rooms x 6 desks.** Past that, Claw3D's own behaviour for an unseated person ("Overflow" below). | `cortadosRooms.ts` |
 | E7 | **Main sessions wear our existing orchestrator suits** (`sprites.mjs`, the avatar profile patch; nothing new drawn). The family, first that applies: (1) the bot origin; (2) the routed main loop's endpoint (`/v1/messages` = Claude Code, `/v1/responses` = Codex); (3) an optional heartbeat `client`; (4) the model-name guess, marked as a guess. Antigravity/Gemini: the neutral `unknown` suit until a lane exists. | `live.py`, `office.py`, `adapter.mjs` `orchestratorFamily` |
+| E9 | **Work with no orchestrator and no task** (one-off routed questions, the S1 outcome loop) sits in a **"No orchestrator" room**. | `live.office_tree` `lobby`, `mapTree` |
+| E10 | **"It should all be from Claude"**: the cortados-routed-subagents mod's heartbeat says `client: "claude-code"`, so a Claude Code main session whose own loop is not routed wears the Claude Code suit. | the mod's `officeSend` (0.4.2) |
 | E8 | **A finished child task goes back to its orchestrator**: it leaves its desk and sits at a report desk beside the orchestrator's for 10 minutes, then disappears; failed or cancelled the same, showing the error status. **A finished helper just disappears.** **The unattributed room** is drawn, as the last room, only while it has active people. | `mapTree`, `cortadosRooms.ts` |
 
 **TODO (E7): Antigravity / Gemini.** `office.CLIENTS` already accepts `antigravity` in a heartbeat, and the adapter maps it
@@ -215,6 +217,13 @@ to the neutral `unknown` suit. When an Antigravity (Gemini) lane exists: add it 
   to the live tree later never reaches the Office token unreviewed. Left out: `tokens`, `workspace`, `browser`,
   `parent_hidden`, the session filter, `conflicts`, `task_hosts`, `inputs_truncated`, and every other live section
   (subscriptions, hosts, routed calls, work split). A failed source stays visible as the section's `status`/`errors`.
+- **`lobby`** (E9): the snapshot's conversations section's items with no Office session tag, of kind `conversation` or
+  `subagent`, whose run is no task of the tree (a child's own conversations are its sub-sessions), allowlisted
+  (`_TREE_LOBBY_KEYS`: kind, title, tool, provider, lane, model, started_at, elapsed_s; plus `ref` and the sub-session
+  `status` running/waiting), with the conversations section's own `status`/`errors` and `truncated` (that section keeps
+  64 items, working first). The smaller of the two options: the tree endpoint already has the snapshot, so the bridge
+  keeps one poll and one consistent picture; polling the office view as well would have added a second request, a
+  second failure mode and two clocks.
 - Served by `server.py` behind the owner token, a dashboard session or a client token with **`office:read`**, which now
   opens exactly `GET /v1/cortados/office` and `GET /v1/cortados/office/tree`. `live:read` does not open it, and
   `office:read` still gets 403 on `/v1/cortados/live` and `/live/session`. A query string is a 400 (the tree is the
@@ -236,7 +245,11 @@ to the neutral `unknown` suit. When an Antigravity (Gemini) lane exists: add it 
   `CORTADOS_OFFICE_URL`, same token, same rules). If the tree fails or is malformed the last good roster stays and the
   fixed diagnostic is `Office tree unavailable; last successful roster retained (may be stale)`. It never falls back
   to the flat office view: an older provider without the endpoint shows the last roster (empty at first) and that
-  line, every poll.
+  line, every poll. **An unavailable tree is a failed poll too** (review round 1: an HTTP 200 carrying
+  `{status: "error", items: []}` replaced 13 people with none): `orchestrators` (or `lobby`) with status `error`, no
+  status, or `partial` with any error but one task directory's own (`task_dir`; that task is still in the tree, and one
+  unreadable directory may last for days, so freezing the floor on it would hide every other change). An older
+  provider's tree without `lobby` is accepted and draws no lobby room.
 - Rooms in the tree's order (active first), the unattributed room last. In each room, depth first: the orchestrator,
   then each task, its live helpers, its nested tasks, then the orchestrator's own routed helpers (`route_task`, the
   routed-subagents mod).
@@ -259,18 +272,25 @@ to the neutral `unknown` suit. When an Antigravity (Gemini) lane exists: add it 
 - Each agent's `office` extension adds `group`, `groupLabel`, `room`, `kind` (orchestrator / task / helper), `parent`,
   `depth`, `taskStatus`, `returning`, `returnUntil` and `familySource` (`bot | wire | heartbeat | model-guess`) to the
   existing fields. The published `provider` of an orchestrator stays null.
-- **Not drawn any more**: lobby workers of the flat view (plain conversations and the outcome loop: work with no
-  orchestrator and no task). See E9 below.
+- **The "No orchestrator" room** (E9): each running or waiting `lobby` item is a person (`office-lobby-routed-<ref>`,
+  kind helper, nobody heading the room), drawn after the unattributed room while anyone is in it. A bot origin named
+  `lobby` is refused, so the key is never two rooms.
 - Tests: `rooms.test.mjs` (grouping, ids, order, stability, nameplate, return and expiry, the error event, helpers,
   the unattributed room, family sources), plus the existing adapter and bridge tests moved to the tree.
 
 ### 8.3 Claw3D: `claw3d/cortados-rooms.patch`
 
 - New file `src/features/retro-office/core/cortadosRooms.ts` (kept here as `claw3d/cortadosRooms.ts`; a test checks
-  the patch embeds it byte for byte) and a 22-line hook in `RetroOffice3D.tsx`:
-  1. `buildInitialFurnitureLayout`: a saved CortadOS layout is used as is (the stock migrations would add the gym,
-     ping-pong table and so on back into it);
-  2. while the gate is on and the layout is not ours, the layout becomes `buildCortadosRoomsLayout()`;
+  the patch embeds it byte for byte) and a 40-line hook in `RetroOffice3D.tsx`:
+  1. **the rooms' own storage** (review round 1): while the switch is on, the furniture is read and saved under its own
+     namespace (`cortadosLayoutNamespace`: `cortados-rooms`, or `<namespace>:cortados-rooms`), through upstream's own
+     namespace switch (`furnitureLayoutSource`) and save effect; `buildInitialFurnitureLayout` gives that namespace the
+     saved rooms, else a fresh floor, and never runs the stock migrations on it (they would add the gym, ping-pong
+     table and so on). The owner's stock layout is never written, so switching off shows it exactly as it was, and a
+     desk assigned by hand (Studio's settings, per gateway by desk uid, which the patch never touches) applies again
+     as soon as its desk is back. The switch is sticky (`cortadosLayoutOn`): no gateway or an empty roster keeps it
+     as it was, so a reconnect never flips the floor;
+  2. while the switch is on and the layout is not ours (a Reset), the layout becomes `buildCortadosRoomsLayout()`;
   3. `assignedDeskIndexByAgentId` starts from `allocateCortadosDesks(...)`, and the manual assignments are applied
      over it (a desk or person placed by hand always wins);
   4. the tick gets the allocator's holds merged into `deskHoldByAgentId`, so a seated person stays at the desk while
@@ -278,8 +298,9 @@ to the neutral `unknown` suit. When an Antigravity (Gemini) lane exists: add it 
   5. an `error` person who is held at a CortadOS desk still walks there (stock freezes an errored agent where it
      stands), so a failed task can report back; its status stays `error` for the nameplate and marker.
 - **The gate**: Studio normalises the hello's `adapterType` (`cortados-office`) to `openclaw`, so the patch cannot key
-  on it. It is on only while the gateway status is `connected` and every local agent (`remote:` ones aside) carries the
-  bridge's id grammar. A stock gateway's agents never match, so nothing changes for it.
+  on it. It turns on when the gateway status is `connected` and every local agent (`remote:` ones aside) carries the
+  bridge's id grammar, and off when a connected gateway lists any other local agent; otherwise it stays as it was. A
+  stock gateway's agents never match, so it gets the stock office and the stock layout back.
 - **Layout** (1800 x 720, the local office canvas): 4 x 2 rooms of 430 x 340, each walled on three sides and open to
   the middle corridor (a wall there would close the corridor: a wall's navigation padding is 15 px on a 25 px grid).
   Per room: the head desk in the middle of the top row with a report desk on each side, and 6 team desks in two rows
@@ -311,14 +332,13 @@ to the neutral `unknown` suit. When an Antigravity (Gemini) lane exists: add it 
 2. **Redeploy the office** (`deploy-air.sh` upgrade): the new adapter files, and a Studio rebuild, because
    `cortados-rooms.patch` is a new patch in its list (the build marker is per commit pair, so it rebuilds).
 3. The existing `office:read` client token keeps working: the scope now also opens the tree. Nothing to mint.
-4. In the browser: the first time the gate turns on, the floor's saved layout is replaced by the rooms (desk
-   assignments made by hand to stock desks no longer point at a desk and are ignored).
+4. In the browser: nothing is lost. The rooms keep their own saved layout (`<key>:cortados-rooms` in localStorage);
+   the stock layout and hand-assigned desks are untouched and come back when a stock gateway connects.
+5. **Order: provider before the mod.** cortados-routed-subagents 0.4.2 sends `client` in its heartbeat (E10); a
+   provider older than this branch refuses that field (400), so the session's floor would lose its heartbeats until
+   the provider is restarted on this branch.
 
-### 8.5 New [ESCALATE]
+### 8.5 [ESCALATE] decided
 
-- **E9. Lobby workers.** The flat view's lobby (plain routed conversations and the outcome loop: no orchestrator, no
-  task) is not in the provider's tree, so the rooms no longer draw it. Draw it as people in the unattributed room
-  (the bridge would poll the office view as well), or leave it out (as built)?
-- **E10. The mod's `client`.** The cortados-routed-subagents mod could send `client: "claude-code"` in its heartbeat,
-  so a Claude Code session whose main loop does not route gets its suit from the heartbeat instead of a model guess. A
-  mod release; not done here.
+- **E9** and **E10** were decided by the owner on 2026-11-24 (table in §7) and are built: the tree's `lobby` and the
+  "No orchestrator" room; the mod's `client: "claude-code"` (0.4.2, in the repository; not released).

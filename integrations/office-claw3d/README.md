@@ -16,7 +16,7 @@ protocol, how it renders people and floors, and the remaining gaps.
 | `claw3d/studio-login.cjs`, `claw3d/studio-login.patch` | login form for Studio's access cookie (`/cortados-login`) and its 3-line wiring |
 | `gateway-check.mjs` | deploy-air.sh's end-to-end health probe: a `connect` through Studio's own proxy must get the bridge's hello |
 | `studio-settings.py` | builds Studio's gateway settings file (`<state dir>/claw3d/settings.json`: the bridge URL and secret), the only upstream config Claw3D's proxy reads |
-| `claw3d/cortados-rooms.patch`, `claw3d/cortadosRooms.ts` | rooms per orchestrator: the floor's 8 rooms x 6 desks and the desk allocation (the patch adds the `.ts` file and a 22-line hook; [FLOORS-DESIGN.md](FLOORS-DESIGN.md) §8) |
+| `claw3d/cortados-rooms.patch`, `claw3d/cortadosRooms.ts` | rooms per orchestrator: the floor's 8 rooms x 6 desks and the desk allocation (the patch adds the `.ts` file and a 40-line hook; [FLOORS-DESIGN.md](FLOORS-DESIGN.md) §8) |
 | `DEPLOY.md`, `deploy-air.sh`, `deploy-lib.sh` | Air runbook, script (install / upgrade / tailnet publish) and its pure checks, written and **not run** |
 
 ## Test
@@ -96,7 +96,9 @@ seconds (default 5); ten-second request timeout, sequential polls, SIGINT/SIGTER
 cancellation. Remote providers require HTTPS, redirects are refused. `CORTADOS_OFFICE_URL`
 names the office endpoint; the only request is a GET of the tree beside it
 (`/v1/cortados/office/tree`). Failures emit the fixed diagnostic `Office tree unavailable;
-last successful roster retained (may be stale)`; there is no fallback to the flat office view. No prompts, commands, file
+last successful roster retained (may be stale)`; there is no fallback to the flat office view. A tree
+that answers but says it is unavailable (its `orchestrators` or `lobby` status `error`, or `partial`
+with any error other than one task directory's own `task_dir`) is a failure too: the roster stays. No prompts, commands, file
 contents, source response bodies, token paths or exception text are logged.
 Metadata stdout still deserves local-only access and should not be publicly logged.
 
@@ -129,7 +131,8 @@ OfficeGateway(send) stays the transport seam: one gateway per authenticated
 connection, and poll updates fan out through `OfficeHub`.
 
 Stable IDs carry the room (`office-<session tag | grokbot | unattributed>-orchestrator`,
-`-task-<task id>`, `-sub-<task id>-<ref>`, `-routed-<ref>`). Duplicate identities reject the
+`-task-<task id>`, `-sub-<task id>-<ref>`, `-routed-<ref>`; the "No orchestrator" room's people are
+`office-lobby-routed-<ref>`). Duplicate identities reject the
 tree. Nested records require a recognized status, a valid id and typed metadata (nullable
 strings, not arrays/objects). A malformed tree leaves the previous roster and lifecycle state
 untouched. (`mapOffice`, the flat view's projection, is still exported and tested; the bridge

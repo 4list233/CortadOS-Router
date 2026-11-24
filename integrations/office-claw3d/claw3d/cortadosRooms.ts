@@ -1,8 +1,9 @@
 // CortadOS rooms for Claw3D (issue #77, integrations/office-claw3d/FLOORS-DESIGN.md in CortadOS-Router).
 // One room (a pod of desks) per orchestrator on the one office floor: the orchestrator at the head desk, its child
 // tasks and their helpers at the team desks, a finished task at a report desk beside the head desk.
-// Active only while the CortadOS office bridge feeds this Studio (cortadosRoomsActive); every other gateway, and every
-// desk a person assigned by hand, is left exactly as stock Claw3D has it.
+// Active only while the CortadOS office bridge feeds this Studio (cortadosRoomsActive); every other gateway, the stock
+// layout (the rooms are saved under their own namespace) and every desk a person assigned by hand are left exactly as
+// stock Claw3D has them.
 // Self-contained at runtime (type-only imports): the CortadOS repo unit-tests this file under Node's type stripping.
 import type { FurnitureItem } from "@/features/retro-office/core/types";
 
@@ -59,9 +60,28 @@ export function buildCortadosRoomsLayout(): FurnitureItem[] {
   return items;
 }
 
-/** Whether a layout is the CortadOS floor (it holds the fixed _uid scheme): the stock migrations then leave it alone. */
+/** Whether a layout is the CortadOS floor (it holds the fixed _uid scheme). */
 export const isCortadosLayout = (items: FurnitureItem[] | null | undefined): boolean =>
   Array.isArray(items) && items.some((item) => typeof item?._uid === "string" && item._uid.startsWith(CORTADOS_UID_PREFIX));
+
+// ---- the rooms' own storage (CortadOS #77 review round 1) ----
+// Claw3D saves the furniture under its storageNamespace (persistence.ts: the key itself for "default", else
+// "<key>:<namespace>"), 300 ms after any change. While the rooms are on, the layout is read and saved under a
+// namespace of its own, so the owner's stock layout is never written: switching the rooms off shows it exactly as it
+// was. Desks assigned by hand are Studio's settings, kept per gateway by desk uid and never touched here: a stock
+// desk's assignment applies again as soon as that desk is back on the floor.
+const LAYOUT_NAMESPACE = "cortados-rooms";
+
+export const cortadosLayoutNamespace = (storageNamespace: string): string =>
+  storageNamespace === "default" ? LAYOUT_NAMESPACE : `${storageNamespace}:${LAYOUT_NAMESPACE}`;
+
+export const isCortadosLayoutNamespace = (namespace: string): boolean =>
+  namespace === LAYOUT_NAMESPACE || namespace.endsWith(`:${LAYOUT_NAMESPACE}`);
+
+/** The rooms' initial layout from what their namespace holds: the saved floor, else a fresh one. The stock
+ * migrations (gym, QA lab, jukebox...) never run on it. */
+export const cortadosInitialLayout = (saved: FurnitureItem[] | null): FurnitureItem[] =>
+  isCortadosLayout(saved) ? (saved as FurnitureItem[]) : buildCortadosRoomsLayout();
 
 // ---- who belongs where: the bridge's agent id grammar (adapter.mjs agentId) ----
 // office-<group>-orchestrator | -task-<task id> | -sub-<task id>-<ref> | -routed-<ref>. A group is a session tag
@@ -89,6 +109,18 @@ export function cortadosRoomsActive(agents: Array<{ id: string }>, gatewayStatus
   if (gatewayStatus !== "connected") return false;
   const local = agents.filter((agent) => !agent.id.startsWith("remote:"));
   return local.length > 0 && local.every((agent) => isCortadosAgentId(agent.id));
+}
+
+/** The layout switch, sticky: while a gateway is connected and lists local agents it is cortadosRoomsActive; with no
+ * gateway or nobody on it (a reconnect, a quiet fleet) it keeps its last value, so the floor does not flip between
+ * the rooms and the stock office on every reconnect. */
+export function cortadosLayoutOn(
+  previous: boolean,
+  agents: Array<{ id: string }>,
+  gatewayStatus: string | undefined,
+): boolean {
+  if (gatewayStatus !== "connected" || !agents.some((agent) => !agent.id.startsWith("remote:"))) return previous;
+  return cortadosRoomsActive(agents, gatewayStatus);
 }
 
 // ---- desk allocation: sticky, so a room and a seat never move while their people stay ----

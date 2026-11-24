@@ -24,6 +24,8 @@ OFFICE_TOKEN = "office-token-for-tree-tests-01"
 LIVE_TOKEN = "live-reader-token-tree-tests-1"
 BOT_RUNNING = "t20261111095000-c0000002"     # the bot's running task: its room has someone in it
 LOOSE = "t20261111095500-d0000002"           # no origin, running: the unattributed room
+LOBBY_ASK = "c-000000000012"                 # E9: a one-off routed question, no orchestrator, no task
+LOBBY_LOOP = "outcome-loop-0001"             # E9: the S1 outcome loop's routed call, no task
 FIXTURE = Path(__file__).resolve().parents[1] / "integrations/office-claw3d/fixtures/sample-tree.json"
 
 
@@ -39,7 +41,15 @@ def events():
 def backend(wire_other="/v1/responses"):
     """ot.backend() with the wire each conversation was opened on: OTHER's routed main loop came in on /v1/responses
     (a Codex harness running a Claude model: the suit follows the harness, E7)."""
-    out = ot.backend()
+    out = ot.backend() + [
+        # E9's lobby: a one-off routed question (no session tag, no run id) and the outcome loop's call (a run id that
+        # is no task); and LOOSE's own conversation (untagged, but its run is a task of the tree: never the lobby)
+        {"key": "c:" + LOBBY_ASK, "ref": LOBBY_ASK, "provider": "claude", "lane": "claude#a", "model": "claude-haiku-5",
+         "opened_at": NOW - 20, "last_used": NOW - 2, "busy": True, "awaiting_tool": False, "title": "Quick question"},
+        {"key": "r:" + LOBBY_LOOP, "ref": "c-000000000013", "provider": "codex", "lane": "codex",
+         "model": "gpt-6.1-mini", "opened_at": NOW - 15, "last_used": NOW - 3, "busy": False, "awaiting_tool": False},
+        {"key": "r:" + LOOSE, "ref": "c-000000000014", "provider": "claude", "lane": "claude#a",
+         "model": "claude-haiku-5", "opened_at": NOW - 70, "last_used": NOW - 1, "busy": True, "awaiting_tool": False}]
     for c in out:
         c["wire"] = wire_other if c["key"] == "main:" + ot.OTHER else "/v1/messages"
     return out
@@ -81,7 +91,10 @@ class TreeShape(unittest.TestCase):
     def test_metadata_only_allowlist(self):
         t = sample_tree()
         raw = json.dumps(t)
-        self.assertEqual(set(t), {"version", "generated_at", "orchestrators"})
+        self.assertEqual(set(t), {"version", "generated_at", "orchestrators", "lobby"})
+        self.assertEqual(set(t["lobby"]), {"as_of", "status", "errors", "truncated", "items"})
+        for r in t["lobby"]["items"]:
+            self.assertEqual(set(r), set(live._TREE_LOBBY_KEYS) | {"ref", "status"})
         for banned in ("tokens", "workspace", "browser", "parent_hidden", "session_filter", "conflicts",
                        "task_hosts", "inputs_truncated", "subscriptions", "hosts", "routed_calls", "work_split",
                        "origin_machine", "_origin", "cwd", "prompt"):
@@ -113,6 +126,25 @@ class TreeShape(unittest.TestCase):
         self.assertIn(ot.FOLLOW, [n["task_id"] for n in g[ot.OTHER]["tasks"]])   # its own origin: OTHER's room
         self.assertEqual([r["ref"] for r in g[ot.MINE]["routed"]], ["mine-sub-00001"])
         self.assertIn(LOOSE, [n["task_id"] for n in g[None]["tasks"]])
+
+    def test_the_lobby_holds_work_with_no_orchestrator_and_no_task(self):
+        """#77 E9: untagged routed work that is no task's (a one-off question, the outcome loop) is the lobby; a task's
+        own untagged conversation is its sub-session, never the lobby; a tagged session's routed helper is its room."""
+        lobby = sample_tree()["lobby"]
+        self.assertEqual(lobby["status"], "ok")
+        self.assertEqual(sorted(r["ref"] for r in lobby["items"]), sorted([LOBBY_ASK, LOBBY_LOOP]))
+        r = {x["ref"]: x for x in lobby["items"]}
+        self.assertEqual((r[LOBBY_ASK]["kind"], r[LOBBY_ASK]["status"], r[LOBBY_ASK]["title"]),
+                         ("conversation", "running", "Quick question"))
+        self.assertEqual((r[LOBBY_LOOP]["kind"], r[LOBBY_LOOP]["status"]), ("subagent", "waiting"))
+        # a session view never has a lobby: the tree endpoint is the fleet's only
+        self.assertEqual(live._tree_lobby({"status": "ok", "items": [
+            {"kind": "subagent", "session": ot.MINE, "run_id": "mine-sub-00001", "status": "working"}]}, [])["items"], [])
+        # a failed conversations source is the lobby's error, said, never "nobody"
+        failed = live.office_tree({"conversations": {"status": "error", "items": [],
+                                                     "errors": [{"source": "conversations", "error": "OSError"}]}})
+        self.assertEqual((failed["lobby"]["status"], failed["lobby"]["errors"]),
+                         ("error", [{"source": "conversations", "error": "OSError"}]))
 
     def test_a_failed_source_stays_visible(self):
         t = live.office_tree({"orchestrators": {"status": "partial", "items": [],
@@ -218,7 +250,10 @@ class TreeEndpoint(EndpointHarness):
         code, raw = self.request(live.OFFICE_TREE_PATH, OFFICE_TOKEN)
         self.assertEqual(code, 200, raw)
         t = json.loads(raw)
-        self.assertEqual(set(t), {"version", "generated_at", "orchestrators"})
+        self.assertEqual(set(t), {"version", "generated_at", "orchestrators", "lobby"})
+        self.assertEqual(set(t["lobby"]), {"as_of", "status", "errors", "truncated", "items"})
+        for r in t["lobby"]["items"]:
+            self.assertEqual(set(r), set(live._TREE_LOBBY_KEYS) | {"ref", "status"})
         self.assertNotIn("tokens", keys_everywhere(t))
         self.assertEqual(self.request(live.OFFICE_TREE_PATH, TOKEN)[0], 200)            # the owner
         self.assertEqual(self.request("/v1/cortados/office", OFFICE_TOKEN)[0], 200)     # unchanged

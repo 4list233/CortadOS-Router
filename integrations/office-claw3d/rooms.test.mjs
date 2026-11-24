@@ -8,7 +8,7 @@ import * as nodeModule from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { mapTree, orchestratorFamily, OfficeGateway, RETURN_KEEP_S, RETURN_LABEL, RETURN_SEPARATOR } from './adapter.mjs';
+import { mapTree, orchestratorFamily, OfficeGateway, runPolling, RETURN_KEEP_S, RETURN_LABEL, RETURN_SEPARATOR } from './adapter.mjs';
 
 const HERE = new URL('.', import.meta.url);
 const SAMPLE = JSON.parse(await readFile(new URL('fixtures/sample-tree.json', HERE), 'utf8'));
@@ -35,11 +35,11 @@ if (typeof strip === 'function') {
 const needsTs = { skip: rooms ? false : 'Node without module.stripTypeScriptTypes (needs >= 22.13): allocator untested here' };
 
 // ---- mapTree: grouping, ids, order ----
-test('one room per orchestrator, the unattributed room last, ids carry the room', () => {
+test('one room per orchestrator, the unattributed room then the no-orchestrator room last, ids carry the room', () => {
   const agents = mapTree(sample());
   const groups = [...new Set(agents.map(a => a.office.group))];
-  assert.deepEqual(groups, [MINE, OTHER, 'grokbot', 'unattributed']);
-  assert.deepEqual([...new Set(agents.map(a => a.office.room))], [0, 1, 2, 3]);
+  assert.deepEqual(groups, [MINE, OTHER, 'grokbot', 'unattributed', 'lobby']);
+  assert.deepEqual([...new Set(agents.map(a => a.office.room))], [0, 1, 2, 3, 4]);
   for (const a of agents) {
     assert.ok(a.id.startsWith('office-' + a.office.group + '-'), a.id);
     assert.match(a.id, /^office-([0-9a-f]{16,64}|[a-z]{2,15})-(orchestrator|task-|sub-|routed-)/);
@@ -144,7 +144,78 @@ test('the unattributed room: no orchestrator to report to, shown only while some
   const active = withTask({ state: 'running', status: 'running', ended_at: null }, null);
   const people = mapTree(active).filter(a => a.office.group === 'unattributed');
   assert.deepEqual(people.map(a => a.office.kind), ['task']);
-  assert.equal(mapTree(active).at(-1).office.group, 'unattributed');
+  const groups = mapTree(active).map(a => a.office.group).filter(g => g !== 'lobby');
+  assert.equal(groups.at(-1), 'unattributed');   // last but the no-orchestrator room (E9)
+});
+
+// ---- E9: the no-orchestrator room (the tree's lobby: one-off routed questions, the outcome loop) ----
+const LOBBY_ASK = 'c-000000000012';
+const LOBBY_LOOP = 'outcome-loop-0001';
+test('E9: routed work with no orchestrator and no task sits in the "No orchestrator" room, last, nobody heading it', () => {
+  const agents = mapTree(sample());
+  const lobby = agents.filter(a => a.office.group === 'lobby');
+  assert.deepEqual(lobby.map(a => a.id), ['office-lobby-routed-' + LOBBY_ASK, 'office-lobby-routed-' + LOBBY_LOOP]);
+  assert.ok(agents.slice(-lobby.length).every(a => a.office.group === 'lobby'), 'the last room');
+  const [ask, loop] = lobby;
+  assert.deepEqual([ask.name, ask.role, ask.office.status, ask.office.kind, ask.office.groupLabel, ask.office.parent],
+    ['Quick question', 'claude-haiku-5', 'working', 'helper', 'No orchestrator', null]);
+  assert.deepEqual([loop.name, loop.office.status, loop.office.characterFamily], ['Helper', 'idle', 'codex']);
+  // the loose task's own untagged conversation is its sub-session, never a lobby person
+  assert.ok(!lobby.some(a => a.id.includes('t20261111095500-d0000002')));
+  // the patch seats them: every lobby id is in the Claw3D allocator's grammar
+  if (rooms) for (const a of lobby) assert.ok(rooms.isCortadosAgentId(a.id), a.id);
+});
+
+test('E9: the room is drawn only while someone is in it; an older provider without a lobby draws none', () => {
+  const t = sample();
+  t.lobby.items = t.lobby.items.map(r => ({ ...r, status: 'done' }));
+  assert.ok(!mapTree(t).some(a => a.office.group === 'lobby'));
+  delete t.lobby;
+  assert.ok(!mapTree(t).some(a => a.office.group === 'lobby'));
+  const bad = sample(); bad.lobby.items.push({ ref: 'bad ref!', status: 'running' });
+  assert.throws(() => mapTree(bad), /lobby/);
+  // a bot origin named like the room is refused, never a second "lobby" room
+  const clash = sample(); clash.orchestrators.items.find(g => g.kind === 'bot').origin = 'lobby';
+  assert.throws(() => mapTree(clash), /group/);
+});
+
+// ---- review round 1, P2: an unavailable tree keeps the last roster ----
+test('an errored or unavailable tree is a failed poll: the gateway keeps its last roster and says so', async () => {
+  const sent = [];
+  const gateway = new OfficeGateway(f => sent.push(f));
+  gateway.request({ type: 'req', id: '1', method: 'connect' });
+  gateway.update(sample());
+  const before = gateway.agents.map(a => a.id);
+  assert.ok(before.length > 10);
+  sent.length = 0;
+  const unavailable = [
+    t => { t.orchestrators = { ...t.orchestrators, status: 'error', items: [],
+      errors: [{ source: 'child-tasks.jsonl', error: 'PermissionError' }] }; },          // the review's case
+    t => { t.orchestrators.status = 'partial'; t.orchestrators.errors = [{ source: 'heartbeats', error: 'OSError' }]; },
+    t => { t.orchestrators.status = 'partial'; t.orchestrators.errors = []; },          // partial with nothing named
+    t => { delete t.orchestrators.status; },
+    t => { t.lobby.status = 'error'; t.lobby.errors = [{ source: 'conversations', error: 'OSError' }]; },
+  ];
+  for (const breakIt of unavailable) {
+    const t = sample(); breakIt(t);
+    assert.throws(() => mapTree(t), /unavailable/);
+    assert.throws(() => gateway.update(t));
+    assert.deepEqual(gateway.agents.map(a => a.id), before);
+  }
+  assert.deepEqual(sent, [], 'no event: Claw3D still shows the last roster');
+  // one task directory that could not be peeked is that task's own trouble: the tree still updates
+  const one = sample();
+  one.orchestrators.status = 'partial';
+  one.orchestrators.errors = [{ source: 'task_dir', error: 'PermissionError' }];
+  assert.deepEqual(mapTree(one).map(a => a.id), before);
+  // through the poll loop: the fixed diagnostic, the roster untouched
+  const messages = [];
+  const ac = new AbortController();
+  const t = sample(); t.orchestrators = { ...t.orchestrators, status: 'error', items: [] };
+  await runPolling({ gateway, intervalMs: 1000, signal: ac.signal, poll: async () => t,
+    onError: m => { messages.push(m); ac.abort(); } });
+  assert.deepEqual(messages, ['Office tree unavailable; last successful roster retained (may be stale)']);
+  assert.deepEqual(gateway.agents.map(a => a.id), before);
 });
 
 test('a session room shows while its orchestrator is live or anyone is in it', () => {
@@ -222,7 +293,9 @@ test('the patch file embeds claw3d/cortadosRooms.ts byte for byte and stays a sm
   assert.equal(added.join('\n') + '\n', TS_SOURCE);
   const hook = parts.find(p => p.startsWith('a/src/features/retro-office/RetroOffice3D.tsx'));
   const changed = hook.split('\n').filter(l => /^[+-](?![+-])/.test(l));
-  assert.ok(changed.length <= 30, 'RetroOffice3D.tsx hook is ' + changed.length + ' changed lines');
+  // 45: the 22-line hook plus the rooms' own storage namespace (review round 1), which renames upstream's own
+  // storageNamespace in its five furniture-source and save lines (10 changed lines)
+  assert.ok(changed.length <= 45, 'RetroOffice3D.tsx hook is ' + changed.length + ' changed lines');
   assert.equal(parts.length, 2);
 });
 
@@ -333,4 +406,99 @@ test('off unless the CortadOS bridge is the connected gateway', needsTs, () => {
   assert.equal(rooms.cortadosRoomsActive(ours, undefined), false);
   assert.equal(rooms.cortadosRoomsActive([...ours, { id: 'main' }], 'connected'), false);
   assert.equal(rooms.cortadosRoomsActive([], 'connected'), false);
+});
+
+// ---- review round 1, P1: the rooms never destroy the owner's layout or hand-assigned desks ----
+// A model of the patched RetroOffice3D's furniture lifecycle over Claw3D 51337f7's persistence.ts (the storage key
+// itself for "default", else "<key>:<namespace>"; an empty list loads as nothing), driving the module's own helpers:
+// the namespace follows the sticky switch, the initial layout comes from that namespace, every change is saved there.
+const STORAGE_KEY = 'claw3d-office-furniture';
+function office(storage, storageNamespace = 'default') {
+  const keyOf = ns => ns === 'default' ? STORAGE_KEY : STORAGE_KEY + ':' + ns;
+  const load = ns => { const raw = storage.get(keyOf(ns)); const v = raw ? JSON.parse(raw) : null;
+    return Array.isArray(v) && v.length ? v : null; };
+  const save = (items, ns) => storage.set(keyOf(ns), JSON.stringify(items));
+  const stockDefault = [{ _uid: 'desk_stock_1', type: 'desk_cubicle', x: 100, y: 100 }];
+  const build = ns => rooms.isCortadosLayoutNamespace(ns) ? rooms.cortadosInitialLayout(load(ns)) : (load(ns) ?? stockDefault);
+  const st = { on: false, ns: storageNamespace, furniture: build(storageNamespace) };
+  return {
+    st,
+    render(agents, gatewayStatus) {           // one render + commit of the patched component
+      st.on = rooms.cortadosLayoutOn(st.on, agents, gatewayStatus);
+      const ns = st.on ? rooms.cortadosLayoutNamespace(storageNamespace) : storageNamespace;
+      if (ns !== st.ns) { st.ns = ns; st.furniture = build(ns); }
+      if (st.on && !rooms.isCortadosLayout(st.furniture)) st.furniture = rooms.buildCortadosRoomsLayout();
+      save(st.furniture, st.ns);                // the 300 ms save effect
+      return st.furniture;
+    },
+    edit(fn) { st.furniture = fn(st.furniture); save(st.furniture, st.ns); },
+  };
+}
+
+test('the rooms keep their own layout: stock layout and hand-assigned desks survive on -> off -> on (review round 1)', needsTs, () => {
+  for (const storageNamespace of ['default', 'floor-2']) {
+    const storage = new Map();
+    const stockKey = storageNamespace === 'default' ? STORAGE_KEY : STORAGE_KEY + ':' + storageNamespace;
+    // the owner's own stock office, with a desk they placed and a person they assigned to it by hand (Studio keeps
+    // assignments per gateway by desk uid: OfficeScreen deskAssignmentByDeskUid)
+    const ownLayout = [{ _uid: 'desk_mine', type: 'desk_cubicle', x: 300, y: 200 }, { _uid: 'plant_1', type: 'plant', x: 50, y: 50 }];
+    storage.set(stockKey, JSON.stringify(ownLayout));
+    const manual = { desk_mine: 'main' };
+    const stockAgents = [{ id: 'main' }];
+    const ours = agentsOf(sample());
+    const o = office(storage, storageNamespace);
+    assert.deepEqual(o.render(stockAgents, 'connected'), ownLayout, 'a stock gateway: the stock layout');
+    // on: the rooms, from their own namespace; the stock key is not written
+    let floor = o.render(ours, 'connected');
+    assert.ok(rooms.isCortadosLayout(floor));
+    assert.deepEqual(JSON.parse(storage.get(stockKey)), ownLayout, 'the stock layout is never overwritten');
+    // a hand assignment in the rooms: a CortadOS desk given by hand to one task
+    const task = ours.find(a => a.id.includes('-task-')).id;
+    manual.cortados_r0_desk5 = task;
+    let seat = rooms.allocateCortadosDesks(ours, deskItemsOf(floor), manual, rooms.createCortadosRoomState());
+    assert.ok(!(task in seat.desks), 'placed by hand: Studio seats it, not the allocator');
+    // and an edit to the rooms' floor (a plant), saved under the rooms' namespace
+    o.edit(f => [...f, { _uid: 'plant_rooms', type: 'plant', x: 900, y: 360 }]);
+    const roomsSaved = storage.get(STORAGE_KEY + ':' + rooms.cortadosLayoutNamespace(storageNamespace));
+    // off: a reconnect or a quiet bridge changes nothing; a stock gateway brings the owner's layout back exactly
+    assert.ok(rooms.isCortadosLayout(o.render(ours, 'connecting')), 'a reconnect does not flip the floor');
+    assert.ok(rooms.isCortadosLayout(o.render([], 'connected')), 'a quiet bridge does not flip the floor');
+    floor = o.render(stockAgents, 'connected');
+    assert.deepEqual(floor, ownLayout);
+    assert.equal(deskItemsOf(floor).find(d => manual[d._uid])._uid, 'desk_mine', 'the hand-assigned desk is back');
+    // on again: the rooms exactly as left, the hand-assigned CortadOS desk still that task's
+    floor = o.render(ours, 'connected');
+    assert.equal(JSON.stringify(floor), roomsSaved);
+    assert.ok(floor.some(i => i._uid === 'plant_rooms'));
+    seat = rooms.allocateCortadosDesks(ours, deskItemsOf(floor), manual, rooms.createCortadosRoomState());
+    assert.ok(!(task in seat.desks));
+    assert.ok(!Object.values(seat.desks).includes(deskItemsOf(floor).findIndex(d => d._uid === 'cortados_r0_desk5')));
+    assert.deepEqual(JSON.parse(storage.get(stockKey)), ownLayout);
+    assert.deepEqual(manual, { desk_mine: 'main', cortados_r0_desk5: task });
+  }
+});
+
+test('the patch reads and saves the furniture under the switched namespace only', async () => {
+  const patch = await readFile(new URL('claw3d/cortados-rooms.patch', HERE), 'utf8');
+  const hook = patch.split(/^diff --git /m).find(p => p.startsWith('a/src/features/retro-office/RetroOffice3D.tsx'));
+  const added = hook.split('\n').filter(l => l.startsWith('+')).join('\n');
+  const removed = hook.split('\n').filter(l => l.startsWith('-')).join('\n');
+  assert.match(added, /saveFurniture\(furniture, layoutNamespace\)/);
+  assert.match(removed, /saveFurniture\(furniture, storageNamespace\)/);
+  assert.equal((added.match(/buildInitialFurnitureLayout\(layoutNamespace, layoutPreset\)/g) || []).length, 2);
+  assert.equal((removed.match(/buildInitialFurnitureLayout\(storageNamespace, layoutPreset\)/g) || []).length, 2);
+  assert.match(added, /cortados\.cortadosLayoutOn\(cortadosOn, agents, gatewayStatus\)/);
+});
+
+test('the layout switch is sticky across reconnects and quiet rosters', needsTs, () => {
+  const ours = [{ id: 'office-' + MINE + '-orchestrator' }];
+  assert.equal(rooms.cortadosLayoutOn(false, ours, 'connected'), true);
+  assert.equal(rooms.cortadosLayoutOn(true, ours, 'disconnected'), true);
+  assert.equal(rooms.cortadosLayoutOn(true, [], 'connected'), true);
+  assert.equal(rooms.cortadosLayoutOn(true, [{ id: 'remote:x' }], 'connected'), true);
+  assert.equal(rooms.cortadosLayoutOn(true, [{ id: 'main' }], 'connected'), false);
+  assert.equal(rooms.cortadosLayoutOn(false, [], 'connected'), false);
+  assert.equal(rooms.cortadosLayoutNamespace('default'), 'cortados-rooms');
+  assert.equal(rooms.cortadosLayoutNamespace('floor-2'), 'floor-2:cortados-rooms');
+  assert.ok(rooms.isCortadosLayoutNamespace('floor-2:cortados-rooms') && !rooms.isCortadosLayoutNamespace('default'));
 });

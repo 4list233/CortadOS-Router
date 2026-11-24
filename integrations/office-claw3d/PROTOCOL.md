@@ -122,7 +122,8 @@ stay null: never inferred.
   orchestrating session on that one floor with `claw3d/cortados-rooms.patch` (8 rooms x 6
   desks, sticky desk allocation, off unless this bridge is the gateway). Real floors per
   orchestrator remain out of scope (owner decision E1); the allocator is where a later "spill
-  to another floor" would go. The flat view's lobby is not drawn (FLOORS-DESIGN.md E9).
+  to another floor" would go. Routed work with no orchestrator and no task (the tree's `lobby`) is
+  the "No orchestrator" room, drawn last while someone is in it (FLOORS-DESIGN.md E9).
 - **Grok workers**: office.py's `provider_of` maps only claude-cli, codex-cli and local-*,
   so no worker is `grok` today. The sprite and mapping are ready for when a grok lane exists.
 - **Desk count**: 8 rooms x (1 head + 2 report + 6 team) desks. Extra people get no desk and

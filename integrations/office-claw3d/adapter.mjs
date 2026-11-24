@@ -189,6 +189,10 @@ const CLIENT_FAMILY = new Map(Object.entries({ 'claude-code': 'claude', codex: '
   antigravity: 'unknown' }));
 const CLIENT_SOURCES = new Set(['wire', 'heartbeat']);
 const NAME_MAX = 64;
+// The room of routed work with no orchestrator and no task (E9). A bot origin of the same name is refused (groupKey),
+// so the key can never be two rooms.
+const LOBBY_KEY = 'lobby';
+const LOBBY_LABEL = 'No orchestrator';
 
 const shortText = (value, max = NAME_MAX) => {
   const s = text(value);
@@ -220,9 +224,20 @@ function groupKey(group) {
   if (group.kind === 'unattributed' && group.origin === null) return 'unattributed';
   if (group.kind === 'session' && typeof group.origin === 'string' && GROUP_RE.test(group.origin)) return group.origin;
   if (group.kind === 'bot' && typeof group.origin === 'string' && NAMED_ORIGIN_RE.test(group.origin) &&
-      group.origin !== 'unattributed') return group.origin;
+      group.origin !== 'unattributed' && group.origin !== LOBBY_KEY) return group.origin;
   if (group.kind === 'untagged') return null;
   throw new Error('invalid office tree group');
+}
+
+/** Whether a tree section (orchestrators, lobby) may replace the roster: status "ok", or "partial" when every error is
+ * one task directory's own (source "task_dir": live.tasks_section; that task is still in the tree, its directory just
+ * could not be peeked). Any other error is a whole source (the child-task log, the board, the conversations, the
+ * heartbeats) whose people would vanish from the floor, so the section is unavailable and the poll fails. Reason: a
+ * single unreadable task directory may last for days; freezing the floor on it would hide every other change. */
+function treeUsable(section) {
+  if (section.status === 'ok') return true;
+  if (section.status !== 'partial' || !Array.isArray(section.errors) || section.errors.length === 0) return false;
+  return section.errors.every(e => object(e) && e.source === 'task_dir');
 }
 
 /**
@@ -236,12 +251,21 @@ function groupKey(group) {
  * "done · model" (status idle) or "failed · model" / "cancelled · model" (status error). A finished helper is not
  * shown. The unattributed room has no orchestrator: its finished tasks leave at once, and the room is drawn only while
  * someone in it is active. A session room is drawn while its orchestrator is live (working/idle) or anyone is in it.
+ * The tree's `lobby` (E9: routed work with no orchestrator and no task) is the "No orchestrator" room, after the
+ * unattributed one, drawn while one of its items is running or waiting. A tree whose orchestrators or lobby section is
+ * unavailable (treeUsable) throws, as a malformed one does: the caller keeps the last roster.
  *
  * Pure: the same tree gives the same agents (time is the tree's own generated_at, the provider's clock).
  */
 export function mapTree(tree) {
   if (!object(tree) || tree.version !== 1 || !finite(tree.generated_at) || !object(tree.orchestrators) ||
       !Array.isArray(tree.orchestrators.items)) throw new Error('invalid office tree');
+  // An unavailable tree is a failed poll, never an empty floor (#77 review round 1: an HTTP 200 carrying
+  // {status: "error", items: []} replaced 13 people with none): the last roster stays.
+  if (!treeUsable(tree.orchestrators)) throw new Error('office tree unavailable');
+  const lobby = tree.lobby === undefined ? null : tree.lobby;   // an older provider sends no lobby (E9)
+  if (lobby !== null && (!object(lobby) || !Array.isArray(lobby.items))) throw new Error('invalid office tree lobby');
+  if (lobby !== null && !treeUsable(lobby)) throw new Error('office tree unavailable');
   const now = tree.generated_at;
   const rooms = [];
   const ids = new Set();
@@ -336,7 +360,31 @@ export function mapTree(tree) {
       rooms.push({ key, people: room });
     }
   }
-  rooms.sort((a, b) => (a.key === 'unattributed') - (b.key === 'unattributed'));   // stable: tree order otherwise
+  // E9 (owner, 2026-11-24): routed work with no orchestrator and no task (one-off routed questions, the S1 outcome
+  // loop) sits in the "No orchestrator" room, drawn last and only while someone is in it. Nobody heads it.
+  if (lobby !== null) {
+    const room = [];
+    for (const r of lobby.items) {
+      if (!object(r) || typeof r.ref !== 'string' || !ID_RE.test(r.ref) || !SUB_STATUSES.has(r.status)) {
+        throw new Error('invalid office tree lobby');
+      }
+      checkStrings(r, ['kind', 'title', 'tool', 'provider', 'lane', 'local_backend', 'model'], 'lobby');
+      if (r.status !== 'running' && r.status !== 'waiting') continue;
+      const id = 'office-' + LOBBY_KEY + '-routed-' + r.ref;
+      if (ids.has(id)) throw new Error('duplicate office identity');
+      if (++people > TREE_PEOPLE_MAX) throw new Error('invalid office tree');
+      ids.add(id);
+      room.push({ id, kind: 'helper', parent: null, depth: 1, group: LOBBY_KEY, groupLabel: LOBBY_LABEL,
+        project: null, device: null, name: shortText(r.title) ?? (r.kind === 'conversation' ? 'Conversation' : 'Helper'),
+        role: shortText(r.model) ?? 'routed', status: r.status === 'running' ? 'working' : 'idle', taskStatus: r.status,
+        returning: false, provider: text(r.provider), lane: text(r.lane), localBackend: knownBackend(r.local_backend),
+        model: text(r.model), tool: text(r.tool), title: text(r.title),
+        family: characterFamily(r.provider, r.lane, r.model, r.local_backend), outfit: 'worker' });
+    }
+    if (room.length) rooms.push({ key: LOBBY_KEY, people: room });
+  }
+  const last = key => (key === 'unattributed') + 2 * (key === LOBBY_KEY);
+  rooms.sort((a, b) => last(a.key) - last(b.key));   // stable: tree order otherwise
   return rooms.flatMap((room, index) => room.people.map(p => toAgent(p, index)));
 }
 

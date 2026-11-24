@@ -389,7 +389,21 @@
       "parent_task_id": null,
       "origin_via": null,
       "sub_sessions_hidden": 0,
-      "sub_sessions": [],
+      "sub_sessions": [
+       {
+        "ref": "c-000000000014",
+        "role": "main",
+        "status": "running",
+        "phase": "model turn",
+        "provider": "claude",
+        "lane": "claude#a",
+        "local_backend": null,
+        "model": "claude-haiku-5",
+        "started_at": 1799999930.0,
+        "ended_at": null,
+        "elapsed_s": 70.0
+       }
+      ],
       "tasks": []
      },
      {
@@ -457,6 +471,38 @@
      }
     ],
     "routed": []
+   }
+  ]
+ },
+ "lobby": {
+  "as_of": 1800000000.0,
+  "status": "ok",
+  "errors": [],
+  "truncated": false,
+  "items": [
+   {
+    "kind": "conversation",
+    "title": "Quick question",
+    "tool": null,
+    "provider": "claude",
+    "lane": "claude#a",
+    "model": "claude-haiku-5",
+    "started_at": 1799999980.0,
+    "elapsed_s": 20.0,
+    "ref": "c-000000000012",
+    "status": "running"
+   },
+   {
+    "kind": "subagent",
+    "title": null,
+    "tool": null,
+    "provider": "codex",
+    "lane": "codex",
+    "model": "gpt-6.1-mini",
+    "started_at": 1799999985.0,
+    "elapsed_s": 15.0,
+    "ref": "outcome-loop-0001",
+    "status": "waiting"
    }
   ]
  }

@@ -1,5 +1,5 @@
 diff --git a/src/features/retro-office/RetroOffice3D.tsx b/src/features/retro-office/RetroOffice3D.tsx
-index a0714eb..d8d879a 100644
+index a0714eb..cb7e257 100644
 --- a/src/features/retro-office/RetroOffice3D.tsx
 +++ b/src/features/retro-office/RetroOffice3D.tsx
 @@ -222,6 +222,8 @@ import {
@@ -25,18 +25,53 @@ index a0714eb..d8d879a 100644
    layoutPreset: OfficeLayoutPreset,
  ): FurnitureItem[] =>
 -  ensureOfficeKanbanBoard(
-+  cortados.isCortadosLayout(loadFurniture(storageNamespace))
-+    ? (loadFurniture(storageNamespace) as FurnitureItem[])
++  cortados.isCortadosLayoutNamespace(storageNamespace)
++    ? cortados.cortadosInitialLayout(loadFurniture(storageNamespace))
 +    : ensureOfficeKanbanBoard(
      ensureOfficeJukebox(
        ensureOfficeQaLab(
          ensureOfficeGymRoom(
-@@ -2769,15 +2773,23 @@ export function RetroOffice3D({
+@@ -2498,8 +2502,13 @@ export function RetroOffice3D({
+     Boolean,
+   );
+ 
++  const [cortadosOn, setCortadosOn] = useState(false);
++  const cortadosActive = cortados.cortadosLayoutOn(cortadosOn, agents, gatewayStatus);
++  if (cortadosActive !== cortadosOn) setCortadosOn(cortadosActive);
++  // the rooms' layout is read and saved under its own namespace: the stock layout is never overwritten
++  const layoutNamespace = cortadosActive ? cortados.cortadosLayoutNamespace(storageNamespace) : storageNamespace;
+   const [furniture, setFurniture] = useState<FurnitureItem[]>(() =>
+-    buildInitialFurnitureLayout(storageNamespace, layoutPreset).filter(
++    buildInitialFurnitureLayout(layoutNamespace, layoutPreset).filter(
+       (item) => !isRetiredPingPongLamp(item),
+     ),
+   );
+@@ -2559,16 +2568,16 @@ export function RetroOffice3D({
+   const [deskActionUid, setDeskActionUid] = useState<string | null>(null);
+   const [deskAssignPickerOpen, setDeskAssignPickerOpen] = useState(false);
+   const [furnitureLayoutSource, setFurnitureLayoutSource] = useState({
+-    storageNamespace,
++    storageNamespace: layoutNamespace,
+     layoutPreset,
+   });
+   if (
+-    furnitureLayoutSource.storageNamespace !== storageNamespace ||
++    furnitureLayoutSource.storageNamespace !== layoutNamespace ||
+     furnitureLayoutSource.layoutPreset !== layoutPreset
+   ) {
+-    setFurnitureLayoutSource({ storageNamespace, layoutPreset });
++    setFurnitureLayoutSource({ storageNamespace: layoutNamespace, layoutPreset });
+     setFurniture(
+-      buildInitialFurnitureLayout(storageNamespace, layoutPreset).filter(
++      buildInitialFurnitureLayout(layoutNamespace, layoutPreset).filter(
+         (item) => !isRetiredPingPongLamp(item),
+       ),
+     );
+@@ -2769,15 +2778,22 @@ export function RetroOffice3D({
      [furniture],
    );
    const deskLocations = useMemo(() => getDeskLocations(furniture), [furniture]);
 +  const cortadosState = useRef(cortados.createCortadosRoomState());
-+  const cortadosActive = cortados.cortadosRoomsActive(agents, gatewayStatus);
 +  useEffect(() => {
 +    if (cortadosActive && !cortados.isCortadosLayout(furniture)) setFurniture(cortados.buildCortadosRoomsLayout());
 +  }, [cortadosActive, furniture]);
@@ -57,7 +92,7 @@ index a0714eb..d8d879a 100644
    const janitorCleaningStops = useMemo(
      () => getJanitorCleaningStops(furniture),
      [furniture],
-@@ -2857,7 +2869,7 @@ export function RetroOffice3D({
+@@ -2857,7 +2873,7 @@ export function RetroOffice3D({
      meetingSeatLocations,
      furnitureRef,
      lastSeenByAgentId,
@@ -66,17 +101,33 @@ index a0714eb..d8d879a 100644
      resolvedDanceUntilByAgentId,
      resolvedGymHoldByAgentId,
      resolvedSmsBoothHoldByAgentId,
+@@ -3151,12 +3167,12 @@ export function RetroOffice3D({
+ 
+   useEffect(() => {
+     const timeoutId = window.setTimeout(() => {
+-      saveFurniture(furniture, storageNamespace);
++      saveFurniture(furniture, layoutNamespace);
+     }, 300);
+     return () => {
+       window.clearTimeout(timeoutId);
+     };
+-  }, [furniture, storageNamespace]);
++  }, [furniture, layoutNamespace]);
+ 
+   useEffect(() => {
+     if (readOnly || storageNamespace !== "default") return;
 diff --git a/src/features/retro-office/core/cortadosRooms.ts b/src/features/retro-office/core/cortadosRooms.ts
 new file mode 100644
-index 0000000..adbcbe7
+index 0000000..ce2a2b0
 --- /dev/null
 +++ b/src/features/retro-office/core/cortadosRooms.ts
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,219 @@
 +// CortadOS rooms for Claw3D (issue #77, integrations/office-claw3d/FLOORS-DESIGN.md in CortadOS-Router).
 +// One room (a pod of desks) per orchestrator on the one office floor: the orchestrator at the head desk, its child
 +// tasks and their helpers at the team desks, a finished task at a report desk beside the head desk.
-+// Active only while the CortadOS office bridge feeds this Studio (cortadosRoomsActive); every other gateway, and every
-+// desk a person assigned by hand, is left exactly as stock Claw3D has it.
++// Active only while the CortadOS office bridge feeds this Studio (cortadosRoomsActive); every other gateway, the stock
++// layout (the rooms are saved under their own namespace) and every desk a person assigned by hand are left exactly as
++// stock Claw3D has them.
 +// Self-contained at runtime (type-only imports): the CortadOS repo unit-tests this file under Node's type stripping.
 +import type { FurnitureItem } from "@/features/retro-office/core/types";
 +
@@ -133,9 +184,28 @@ index 0000000..adbcbe7
 +  return items;
 +}
 +
-+/** Whether a layout is the CortadOS floor (it holds the fixed _uid scheme): the stock migrations then leave it alone. */
++/** Whether a layout is the CortadOS floor (it holds the fixed _uid scheme). */
 +export const isCortadosLayout = (items: FurnitureItem[] | null | undefined): boolean =>
 +  Array.isArray(items) && items.some((item) => typeof item?._uid === "string" && item._uid.startsWith(CORTADOS_UID_PREFIX));
++
++// ---- the rooms' own storage (CortadOS #77 review round 1) ----
++// Claw3D saves the furniture under its storageNamespace (persistence.ts: the key itself for "default", else
++// "<key>:<namespace>"), 300 ms after any change. While the rooms are on, the layout is read and saved under a
++// namespace of its own, so the owner's stock layout is never written: switching the rooms off shows it exactly as it
++// was. Desks assigned by hand are Studio's settings, kept per gateway by desk uid and never touched here: a stock
++// desk's assignment applies again as soon as that desk is back on the floor.
++const LAYOUT_NAMESPACE = "cortados-rooms";
++
++export const cortadosLayoutNamespace = (storageNamespace: string): string =>
++  storageNamespace === "default" ? LAYOUT_NAMESPACE : `${storageNamespace}:${LAYOUT_NAMESPACE}`;
++
++export const isCortadosLayoutNamespace = (namespace: string): boolean =>
++  namespace === LAYOUT_NAMESPACE || namespace.endsWith(`:${LAYOUT_NAMESPACE}`);
++
++/** The rooms' initial layout from what their namespace holds: the saved floor, else a fresh one. The stock
++ * migrations (gym, QA lab, jukebox...) never run on it. */
++export const cortadosInitialLayout = (saved: FurnitureItem[] | null): FurnitureItem[] =>
++  isCortadosLayout(saved) ? (saved as FurnitureItem[]) : buildCortadosRoomsLayout();
 +
 +// ---- who belongs where: the bridge's agent id grammar (adapter.mjs agentId) ----
 +// office-<group>-orchestrator | -task-<task id> | -sub-<task id>-<ref> | -routed-<ref>. A group is a session tag
@@ -163,6 +233,18 @@ index 0000000..adbcbe7
 +  if (gatewayStatus !== "connected") return false;
 +  const local = agents.filter((agent) => !agent.id.startsWith("remote:"));
 +  return local.length > 0 && local.every((agent) => isCortadosAgentId(agent.id));
++}
++
++/** The layout switch, sticky: while a gateway is connected and lists local agents it is cortadosRoomsActive; with no
++ * gateway or nobody on it (a reconnect, a quiet fleet) it keeps its last value, so the floor does not flip between
++ * the rooms and the stock office on every reconnect. */
++export function cortadosLayoutOn(
++  previous: boolean,
++  agents: Array<{ id: string }>,
++  gatewayStatus: string | undefined,
++): boolean {
++  if (gatewayStatus !== "connected" || !agents.some((agent) => !agent.id.startsWith("remote:"))) return previous;
++  return cortadosRoomsActive(agents, gatewayStatus);
 +}
 +
 +// ---- desk allocation: sticky, so a room and a seat never move while their people stay ----

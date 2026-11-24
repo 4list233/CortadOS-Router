@@ -1394,6 +1394,7 @@ _TREE_TASK_KEYS = ("task_id", "title", "state", "status", "phase", "tool", "host
                    "model", "started_at", "ended_at", "elapsed_s", "parent_task_id", "origin_via", "sub_sessions_hidden")
 _TREE_SUB_KEYS = ("ref", "role", "status", "phase", "provider", "lane", "local_backend", "model", "started_at",
                   "ended_at", "elapsed_s")
+_TREE_LOBBY_KEYS = ("kind", "title", "tool", "provider", "lane", "model", "started_at", "elapsed_s")
 _TREE_ROUTED_KEYS = ("ref", "role", "title", "status", "phase", "tool", "provider", "lane", "model", "started_at",
                      "elapsed_s")
 
@@ -1425,7 +1426,39 @@ def office_tree(snap: dict[str, Any]) -> dict[str, Any]:
     errors = [{"source": e.get("source"), "error": e.get("error")} for e in o.get("errors") or [] if isinstance(e, dict)]
     return {"version": VERSION, "generated_at": snap.get("generated_at"),
             "orchestrators": {"as_of": o.get("as_of"), "status": o.get("status") or "error", "errors": errors,
-                              "window_s": o.get("window_s"), "truncated": bool(o.get("truncated")), "items": items}}
+                              "window_s": o.get("window_s"), "truncated": bool(o.get("truncated")), "items": items},
+            "lobby": _tree_lobby(snap.get("conversations") or {}, items)}
+
+
+def _tree_lobby(conv: dict[str, Any], groups: list[dict[str, Any]]) -> dict[str, Any]:
+    """The tree's lobby (#77 E9, owner 2026-11-24): routed work with no orchestrator and no task (one-off routed
+    questions, the S1 outcome loop), from the snapshot's conversations section: items with no Office session tag, of
+    kind conversation or subagent, whose run is no task of the tree (a child's own conversations are its
+    sub-sessions). Allowlisted (_TREE_LOBBY_KEYS); the status in the tree's sub-session vocabulary. The section is
+    capped (CONVERSATIONS_MAX, working first), so `truncated` says when the cap may have cut lobby work."""
+    tasks: set[str] = set()
+
+    def walk(n: dict[str, Any]) -> None:
+        tasks.add(n.get("task_id"))
+        for k in n.get("tasks") or []:
+            walk(k)
+
+    for g in groups:
+        for n in g.get("tasks") or []:
+            walk(n)
+    out = []
+    for it in conv.get("items") or []:
+        if not isinstance(it, dict) or it.get("session") or it.get("kind") not in ("conversation", "subagent"):
+            continue
+        ref = office.clean(it.get("run_id"), office._RUN_ID_RE)
+        if ref is None or ref in tasks:
+            continue
+        out.append({**_pick(it, _TREE_LOBBY_KEYS), "ref": ref,
+                    "status": "running" if it.get("status") == "working" else "waiting"})
+    errors = [{"source": e.get("source"), "error": e.get("error")} for e in conv.get("errors") or []
+              if isinstance(e, dict)]
+    return {"as_of": conv.get("as_of"), "status": conv.get("status") or "error", "errors": errors,
+            "truncated": bool(conv.get("hidden")), "items": out}
 
 
 def session_view(snap: dict[str, Any], session: str) -> dict[str, Any]:
