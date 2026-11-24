@@ -230,6 +230,30 @@ class FrontierReachable(Base):
         self.assertFalse(r["chosen"]["ceiling"])
         self.assertTrue(any("no frontier model available" in x for x in r["hard_rules"]))
 
+    def test_frontier_enforcement_uses_only_admissible_frontier_routes(self):
+        # Review round 1 (gpt-6.1-sol): the client's quota floor refuses both Claude accounts and admits Codex. Astra
+        # qualifies, so the frontier rule applies; the cheaper but refused Claude B Opus must not be chosen (the host
+        # would answer quota_blocked), Astra must.
+        self.audit_state()
+        d = dec(steps=3, ambiguity=2, novelty=2, blast=0, work_kind="planning")       # D=7 planning
+        no_claude = lambda c: not c["lane"].startswith("claude")
+        r = self.resolve(d, allowed=SERVED, hold_ok=no_claude)
+        self.assertEqual((r["chosen"]["lane"], r["chosen"]["model"]), ("codex", "gpt-6-astra"), r["chosen"])
+        self.assertTrue(any("needs a frontier (ceiling) model" in x for x in r["hard_rules"]))
+        refused = {(s["lane"], s["model"]) for s in r["skipped"] if "fails the host's admission check" in s["why"]}
+        self.assertIn(("claude#b", "claude-opus-5-5"), refused)
+        self.assertIn(("claude", "claude-opus-5-5"), refused)
+
+    def test_no_admissible_frontier_route_falls_back_to_the_index_rule(self):
+        # Every frontier route is refused by the host (Claude by its floor, Astra too): the rule does not apply and the
+        # normal non-frontier choice (Sol on Codex) stands, never a refused frontier route.
+        self.audit_state()
+        d = dec(steps=3, ambiguity=2, novelty=2, blast=0, work_kind="planning")       # D=7 planning
+        ok = lambda c: not c["lane"].startswith("claude") and c["model"] != "gpt-6-astra"
+        r = self.resolve(d, allowed=SERVED, hold_ok=ok)
+        self.assertEqual((r["chosen"]["lane"], r["chosen"]["model"]), ("codex", "gpt-6.1-sol"), r["chosen"])
+        self.assertTrue(any("no frontier model available" in x for x in r["hard_rules"]))
+
     def test_routine_d8_code_is_not_forced_onto_the_frontier(self):
         # steps 3, ambiguity 1, novelty 1, blast 3 (outward floor) = D 8: no frontier requirement; Sol 6.1 clears R3
         self.audit_state(**{"codex": 0.1, "claude#b": 0.1})                            # no spare frontier pool

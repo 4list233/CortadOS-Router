@@ -1247,11 +1247,22 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             # #143: hard planning/research/code needs a frontier (ceiling) model, not merely the R4 reference index,
             # which gpt-6.1-sol clears. Only while a frontier route is available, qualifies and passes the host's check:
             # a spent frontier never blocks routing (the index rule alone applies then).
-            if any(c.get("ceiling") and ok_of(c) and c["index"] >= target and admits(c) for c in cands):
+            # Review round 1 (gpt-6.1-sol): the rule enforces only the ADMISSIBLE frontier routes. A frontier route the
+            # host refuses (its quota floor) is withdrawn with the non-frontier ones; otherwise a cheaper refused one
+            # (Claude B Opus under the floor) was chosen and the host answered quota_blocked although Astra was free.
+            admissible = [c for c in cands if c.get("ceiling") and ok_of(c) and c["index"] >= target and admits(c)]
+            if admissible:
+                keep_ids = {id(c) for c in admissible}
                 for c in cands:
-                    if not c.get("ceiling") and ok_of(c):
-                        ch_of[id(c)] = {**ch_of[id(c)], "ok": False,
-                                        "why": f"ceiling_work: {scored[0]['use_case']} at D={D} needs a frontier model"}
+                    if id(c) in keep_ids or not ok_of(c):
+                        continue
+                    if not c.get("ceiling"):
+                        why = f"ceiling_work: {scored[0]['use_case']} at D={D} needs a frontier model"
+                    elif c["index"] >= target:
+                        why = "ceiling_work: frontier route fails the host's admission check"
+                    else:
+                        continue                   # a frontier route below the target: sorted after the qualifying ones
+                    ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": why}
                 rules.append(f"ceiling_work: {scored[0]['use_case']} at D={D} needs a frontier (ceiling) model")
             else:
                 rules.append(f"ceiling_work: no frontier model available for {scored[0]['use_case']} at D={D}; "
