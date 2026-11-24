@@ -802,8 +802,11 @@ older checkout that does not confirm it adds a warning to the result; `docs/LOCA
   `["WebSearch","WebFetch","Bash"]`); `plan` (read-only on purpose) is not refused. Not every model has auto mode: Claude Code 2.1.316
   drops a session on a haiku model other than `claude-haiku-5-5` to `default` at startup ("does not support auto
   mode"), and a child then gets every approval-needing call denied ("no approval surface"). So with the mode unset
-  such a model gets `acceptEdits` (start_task and task_status say so in `permission_mode_note`), and an explicit
-  `auto` on it is refused at `start_task`.
+  such a model gets `acceptEdits` only when `allowed_tools` are given (start_task and task_status say so in
+  `permission_mode_note`); with no `allowed_tools` the task is refused at `start_task` (owner decision 2026-11-23: the
+  same dead end #140 refuses), naming the model and the three ways out: pin a model with auto mode (e.g.
+  `claude-haiku-5-5`), set `permission_mode` explicitly (`plan` for read-only work), or pass `allowed_tools`. An
+  explicit `auto` on such a model is refused at `start_task`.
 - What the child really did: the child prints `--output-format stream-json`, and `task_status` reports `tool_uses`
   (counts by tool), `tool_errors`, `files_written` (writes whose tool_result came back without an error, matched by
   tool_use id), `write_attempts_unconfirmed` (failed or never answered, with the outcome), `effective_permission_mode`

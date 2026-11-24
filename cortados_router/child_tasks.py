@@ -105,8 +105,8 @@ MODE_REPORTED_AS = {"manual": "default"}
 # Explicit modes that, with --permission-prompts none and no `allowed_tools`, leave a child that cannot run WebSearch,
 # WebFetch, Bash or MCP tools: every such call is denied (#140: a research child "succeeded" with all 4 calls denied).
 # start_task refuses them unless allowed_tools pre-approves something. The value is what such a child can still do.
-# `plan` is not here: read-only is what it is asked for. The defaulted NO_AUTO_FALLBACK is not refused (it is reported in
-# permission_mode_note instead): the guard is for a mode the caller chose.
+# `plan` is not here: read-only is what it is asked for. A defaulted NO_AUTO_FALLBACK with no allowed_tools is refused too,
+# by resolve_permission_mode (no_auto_refusal), since it is the same dead end the caller did not even choose.
 NEEDS_ALLOWED_TOOLS = {"acceptEdits": "edit files", "manual": "read files", "dontAsk": "read files"}
 SUGGESTED_TOOLS = '["WebSearch","WebFetch","Bash"]'
 
@@ -122,8 +122,24 @@ def mode_refusal(permission_mode, tools):
             f"(e.g. {SUGGESTED_TOOLS}).")
 
 
-# The mode a defaulted task gets on a model without auto mode: file edits in cwd still go through unattended.
+# The mode a defaulted task gets on a model without auto mode, when allowed_tools are given: file edits in cwd and the
+# pre-approved tools still go through unattended. With no allowed_tools the defaulted task is refused (no_auto_refusal).
 NO_AUTO_FALLBACK = "acceptEdits"
+
+
+def no_auto_refusal(model):
+    """The refusal text for a task with permission_mode unset on a model without auto mode and no allowed_tools.
+    Reason (owner decision 2026-11-23, follow-up to #140): the fallback would be NO_AUTO_FALLBACK with nothing
+    pre-approved, the same dead end #140 refuses when chosen explicitly: every WebSearch, WebFetch, Bash or MCP call is
+    denied while the task still ends `succeeded`. A caller who left the mode unset expects auto, so refuse, do not warn."""
+    return (f"{model} has no auto mode in Claude Code, and with permission_mode unset and no allowed_tools this headless "
+            f"child would fall back to {NO_AUTO_FALLBACK} and could only edit files: every other tool call (WebSearch, "
+            "WebFetch, Bash, MCP tools) would be denied because nobody can approve it. Refused; do one of: "
+            "(a) pin a model with auto mode (e.g. claude-haiku-5-5, or any non-haiku model); "
+            "(b) set permission_mode explicitly (\"plan\" for read-only work; acceptEdits, manual and dontAsk still need "
+            f"allowed_tools); (c) pass allowed_tools (e.g. {SUGGESTED_TOOLS}).")
+
+
 # claude.ai connectors are disabled in token-auth sessions (the child authenticates to the provider with a token), so
 # the servers behind the user's connectors are loaded directly from this MCP config file when it exists.
 CONNECTORS_CONFIG = "~/.config/cortados/connectors.mcp.json"
@@ -598,17 +614,22 @@ def auto_mode_supported(model: str) -> bool:
     return "haiku" not in name or any(name == e or name.startswith(e + "-") for e in AUTO_MODE_EXCEPTIONS)
 
 
-def resolve_permission_mode(permission_mode, orchestrator):
-    """(mode, note) for the child. Unset means auto where the child's model supports it, else NO_AUTO_FALLBACK, and the
-    note says why (returned by start_task and kept in meta). An explicit `auto` on a model without auto mode is
-    refused: the child would silently run in `default` and be denied every action that needs approval."""
+def resolve_permission_mode(permission_mode, orchestrator, tools=None):
+    """(mode, note) for the child. Unset means auto where the child's model supports it; on a model without auto mode it
+    is NO_AUTO_FALLBACK when `tools` (the validated allowed_tools) pre-approve something, and the note says why
+    (returned by start_task and kept in meta), else refused (no_auto_refusal). An explicit `auto` on a model without
+    auto mode is refused: the child would silently run in `default` and be denied every action that needs approval."""
     model = pin_model(orchestrator)
     if permission_mode is None:
         if auto_mode_supported(model):
             return DEFAULT_PERMISSION_MODE, None
+        if not tools:
+            # Refused, not defaulted: NO_AUTO_FALLBACK with nothing pre-approved can only edit files (see no_auto_refusal).
+            raise TaskError(no_auto_refusal(model))
+        # With allowed_tools the fallback works as #140 allows an explicit acceptEdits + allowed_tools: say so in the note.
         return NO_AUTO_FALLBACK, (f"{model} has no auto mode in Claude Code, so this task runs in {NO_AUTO_FALLBACK}: "
-                                  "file edits in cwd go through; other actions that need approval (Bash that changes "
-                                  "files, network) are denied. Pass allowed_tools to widen, or pick another model.")
+                                  "file edits in cwd and the allowed_tools go through; other actions that need approval "
+                                  "are denied. Pick a model with auto mode (e.g. claude-haiku-5-5) for more.")
     if permission_mode == "auto" and not auto_mode_supported(model):
         raise TaskError(f"permission_mode 'auto' is not available for {model}: Claude Code drops a session on this model "
                         "out of auto mode, and an unattended child would then be denied every action that needs "
@@ -1129,8 +1150,10 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
         # Cheap refusals first (the same checks the host makes), so a bad request never costs an ssh round trip.
         office_tags(None, title, session_tag)
         _workspace_request("t00000000000000-00000000", cwd, repo, branch, target)
+        # The mode refusals too (explicit auto, or unset, on a model without auto mode): the host would refuse the same
+        # request, so refusing here spares the ssh round trip. The host still resolves the mode itself.
+        resolve_permission_mode(permission_mode, login_model(orchestrator) if chrome else orchestrator, tools)
         if chrome:
-            login_model(orchestrator)
             if not target.gui:
                 raise TaskError(f"chrome tasks on execution host {target.describe()} need `gui: true` in its entry: a "
                                 "chrome child must start inside the desktop session (an ssh session cannot read the "
@@ -1216,7 +1239,7 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
             raise TaskError("connectors are not used with chrome: true (login mode loads the user's claude.ai "
                             "connectors through the login itself); omit connectors")
         check_login_settings(cwd)               # the project files are checked by the runner once the cwd exists
-    permission_mode, mode_note = resolve_permission_mode(permission_mode, login or orchestrator)
+    permission_mode, mode_note = resolve_permission_mode(permission_mode, login or orchestrator, tools)
     selected = select_connectors(None if chrome else connectors)
     if not provider_url and not chrome:
         try:
