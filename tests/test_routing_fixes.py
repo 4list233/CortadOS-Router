@@ -220,7 +220,9 @@ class R2Replay(Base):
     reset, the corrected inputs decide it by a clear margin."""
     def test_corrected_inputs_decide_r2(self):
         self.the_132_state()
-        r = core.resolve(dec(), accounts_aware=True)                    # D=8 code → R2, needs 61.3: Sol 66.2 clears it
+        # D=7 code → R2, needs 58.5: Sol 66.2 clears it. (Was D=8 at 61.3; since #143 the R3 knot is at D 8, so D=8
+        # needs this fake catalogue's R3 reference 67.0, and ceiling_underuse starts at D 8.)
+        r = core.resolve(dec(novelty=2), accounts_aware=True)
         self.assertEqual(r["band"], "R2")
         every = {(c["lane"], c["model"]): c for c in [r["chosen"]] + (r["alternatives"] or [])}
         opus_b, sol = every[("claude#b", "claude-opus-5-5")], every[("codex", "gpt-6.1-sol")]
@@ -233,7 +235,7 @@ class R2Replay(Base):
         self.assertEqual((r["chosen"]["lane"], r["chosen"]["model"]), ("codex", "gpt-6.1-sol"))
         self.assertGreater(opus_b["cost"] - sol["cost"], float(core.table()["selection"]["switch_margin_points"]))
         # no flap: a client whose previous R2 route was Opus on B moves (the gap is beyond the margin)
-        r = core.resolve(dec(), accounts_aware=True, previous={"R2": {"lane": "claude#b", "model": "claude-opus-5-5"}})
+        r = core.resolve(dec(novelty=2), accounts_aware=True, previous={"R2": {"lane": "claude#b", "model": "claude-opus-5-5"}})
         self.assertEqual(r["chosen"]["model"], "gpt-6.1-sol")
 
 
@@ -256,7 +258,8 @@ class R2Replay(Base):
 
 
 class SwitchingMargin(Base):
-    """Item 3: one Claude login, no learned sizes (price-only weights), both pools at the capped −1.0."""
+    """Item 3: one Claude login, no learned sizes (price-only weights), both pools at the capped −1.0. R2 requests at
+    D=7 (#143 moved the R3 knot to D 8, where this fake catalogue's 67.0 R3 code reference would rule Sol out)."""
     def test_margin_holds_a_one_point_swing_and_releases_a_big_one(self):
         core._vendor_accounts = lambda *a: [dict(ACCOUNTS[0], account=None, config_dir=None)]
         self.fake({"claude": {"windows": []}, "codex": {"windows": []}}, {}, claude=-1.0, codex=-1.0)
@@ -264,26 +267,26 @@ class SwitchingMargin(Base):
         ms = json.loads(json.dumps(MS))
         ms["models"][1]["price_1m_blended_usd"] = 7.8                                # Sol a hair cheaper than Opus
         core.model_scores = lambda: ms
-        r = core.resolve(dec())
+        r = core.resolve(dec(novelty=2))
         self.assertEqual(r["chosen"]["model"], "gpt-6.1-sol")
         c = {x["model"]: x["cost"] for x in [r["chosen"]] + r["alternatives"]}
         self.assertLessEqual(c["claude-opus-5-5"] - c["gpt-6.1-sol"], 3.0)         # a 1–3 point swing
-        held = core.resolve(dec(), previous={"R2": {"lane": "claude", "model": "claude-opus-5-5"}})
+        held = core.resolve(dec(novelty=2), previous={"R2": {"lane": "claude", "model": "claude-opus-5-5"}})
         self.assertEqual(held["chosen"]["model"], "claude-opus-5-5")               # within 3 points: stays
         self.assertTrue(any("switching margin" in x for x in held["hard_rules"]))
         # a previous route of another band, or on another lane, is not held
-        self.assertEqual(core.resolve(dec(), previous={"R3": {"lane": "claude", "model": "claude-opus-5-5"}})["chosen"]["model"],
+        self.assertEqual(core.resolve(dec(novelty=2), previous={"R3": {"lane": "claude", "model": "claude-opus-5-5"}})["chosen"]["model"],
                          "gpt-6.1-sol")
-        self.assertEqual(core.resolve(dec(), previous={"R2": {"lane": "claude#b", "model": "claude-opus-5-5"}})["chosen"]["model"],
+        self.assertEqual(core.resolve(dec(novelty=2), previous={"R2": {"lane": "claude#b", "model": "claude-opus-5-5"}})["chosen"]["model"],
                          "gpt-6.1-sol")
         ms["models"][1]["price_1m_blended_usd"] = 4.0                                # a real gap
-        moved = core.resolve(dec(), previous={"R2": {"lane": "claude", "model": "claude-opus-5-5"}})
+        moved = core.resolve(dec(novelty=2), previous={"R2": {"lane": "claude", "model": "claude-opus-5-5"}})
         self.assertEqual(moved["chosen"]["model"], "gpt-6.1-sol")
         # an unavailable previous route is never held
         core.lane_health = lambda: {**health(codex=-1.0), "claude": {"ok": False, "why": "spent", "scarcity": 1.0,
                                                                      "expiring_pct": 0, "tightest": {}, "pools": {}}}
         ms["models"][1]["price_1m_blended_usd"] = 7.8
-        self.assertEqual(core.resolve(dec(), previous={"R2": {"lane": "claude", "model": "claude-opus-5-5"}})["chosen"]["model"],
+        self.assertEqual(core.resolve(dec(novelty=2), previous={"R2": {"lane": "claude", "model": "claude-opus-5-5"}})["chosen"]["model"],
                          "gpt-6.1-sol")
 
     def test_margin_off_at_zero(self):
@@ -293,7 +296,7 @@ class SwitchingMargin(Base):
         core.model_scores = lambda: ms
         t = json.loads(json.dumps(core.table())); t["selection"]["switch_margin_points"] = 0
         with mock.patch.object(core, "table", return_value=t):
-            r = core.resolve(dec(), previous={"R2": {"lane": "claude", "model": "claude-opus-5-5"}})
+            r = core.resolve(dec(novelty=2), previous={"R2": {"lane": "claude", "model": "claude-opus-5-5"}})
         self.assertEqual(r["chosen"]["model"], "gpt-6.1-sol")
 
     def test_provider_remembers_the_last_route_per_client_and_band(self):
@@ -320,19 +323,19 @@ class SwitchingMargin(Base):
         self._near_tie()
         prev = {"R2": {"lane": "claude", "model": "claude-opus-5-5"}}
         seen = []
-        ok = core.resolve(dec(), previous=prev, hold_ok=lambda c: seen.append((c["lane"], c["model"])) or True)
+        ok = core.resolve(dec(novelty=2), previous=prev, hold_ok=lambda c: seen.append((c["lane"], c["model"])) or True)
         self.assertEqual(ok["chosen"]["model"], "claude-opus-5-5")                 # admitted: held as before
         self.assertEqual(seen, [("claude", "claude-opus-5-5")])                    # asked about the held route only
-        refused = core.resolve(dec(), previous=prev, hold_ok=lambda c: c["lane"] != "claude")
+        refused = core.resolve(dec(novelty=2), previous=prev, hold_ok=lambda c: c["lane"] != "claude")
         self.assertEqual((refused["chosen"]["lane"], refused["chosen"]["model"]), ("codex", "gpt-6.1-sol"))
         self.assertTrue(any("not held (fails the host's admission check)" in x for x in refused["hard_rules"]))
         self.assertFalse(any(x.startswith("switching margin: stays") for x in refused["hard_rules"]))
 
         def boom(c):
             raise RuntimeError("no reading")
-        self.assertEqual(core.resolve(dec(), previous=prev, hold_ok=boom)["chosen"]["model"], "gpt-6.1-sol")
+        self.assertEqual(core.resolve(dec(novelty=2), previous=prev, hold_ok=boom)["chosen"]["model"], "gpt-6.1-sol")
         # the cheapest route is never put to the check: hold_ok only gates the margin
-        cheap = core.resolve(dec(), previous={"R2": {"lane": "codex", "model": "gpt-6.1-sol"}}, hold_ok=lambda c: False)
+        cheap = core.resolve(dec(novelty=2), previous={"R2": {"lane": "codex", "model": "gpt-6.1-sol"}}, hold_ok=lambda c: False)
         self.assertEqual(cheap["chosen"]["model"], "gpt-6.1-sol")
 
     def test_provider_floor_keeps_the_margin_off_an_ineligible_route(self):
@@ -355,7 +358,7 @@ class SwitchingMargin(Base):
         body = {"model": "cortados", "messages": [{"role": "user", "content": "refactor the parser"}]}
 
         def run(min_left_pct, sid):
-            with mock.patch.object(core, "decide", return_value=dec()), \
+            with mock.patch.object(core, "decide", return_value=dec(novelty=2)), \
                     mock.patch.object(core, "log_route", return_value=True), \
                     mock.patch.object(core, "subscription_readings", return_value={}), \
                     mock.patch.object(floor, "check", check), mock.patch.object(floor, "reserve", reserve), \
@@ -383,6 +386,11 @@ class BatchHint(Base):
     def setUp(self):
         super().setUp()
         self.fake({}, {}, claude=0.0, codex=0.0)
+        # The subject is the cap, not #143's underuse split: with a conversation key (select passes the session) the
+        # split would share these calls between Codex and account B, so it is off here (its own tests: UnderuseSplit).
+        t = json.loads(json.dumps(core.table())); t["selection"]["underuse_split"]["enabled"] = False
+        patcher = mock.patch.object(core, "table", return_value=t)
+        patcher.start(); self.addCleanup(patcher.stop)
 
     def test_cap_lowers_r2_and_r3(self):
         self.assertEqual(core.resolve(dec(), maximum_band="R1")["band"], "R1")
@@ -402,18 +410,18 @@ class BatchHint(Base):
             core.resolve(dec(), maximum_band="R9")
 
     def test_cap_lowers_the_effective_requirement_not_only_the_label(self):
-        """Review round 1 (P1/P2): with the #132 state a D9 code request is R3 at index 67.0 and the underused-frontier
-        rule hands it to Astra. Capped at R1 the difficulty counts as 5 (R1's most), the requirement is R1's (36.7) and
+        """Review round 1 (P1/P2): with the #132 state a D9 code request is R3 at the R4 reference (95.0 in this fake
+        catalogue; #143 put the R4 knot at D 9) and the underused-frontier rule hands it to Astra. Capped at R1 the difficulty counts as 5 (R1's most), the requirement is R1's (36.7) and
         the frontier rule (min_D 9) does not fire: the cheapest qualifying route, Sol, takes it."""
         self.the_132_state()
         d = dec(steps=3, ambiguity=3, novelty=3)                                   # D = 9, blast radius 0
         free = core.resolve(d, accounts_aware=True)
-        self.assertEqual((free["band"], free["D"], free["required_index"]), ("R3", 9, 67.0))
+        self.assertEqual((free["band"], free["D"], free["required_index"]), ("R3", 9, 95.0))
         self.assertEqual(free["chosen"]["model"], "gpt-6-astra")
         capped = core.resolve(d, accounts_aware=True, maximum_band="R1")
         want = core.required_index(core.table(), MS, "code", 5, "R1")
         self.assertEqual((capped["band"], capped["D"], capped["required_index"]), ("R1", 5, want))
-        self.assertLess(want, 67.0); self.assertAlmostEqual(want, 36.7)
+        self.assertLess(want, 95.0); self.assertAlmostEqual(want, 36.7)
         self.assertEqual((capped["chosen"]["lane"], capped["chosen"]["model"]), ("codex", "gpt-6.1-sol"))
         self.assertFalse(any("takes it: its pool is underused" in x for x in capped["hard_rules"]))
         self.assertIn("workload cap: difficulty 9 counted as 5, the most R1 admits (required index and frontier rules)",
@@ -428,7 +436,7 @@ class BatchHint(Base):
         for floor_band in ("R2", "R3"):
             r = core.resolve(dec(steps=3, ambiguity=3, novelty=3), accounts_aware=True, maximum_band="R1",
                              minimum_band=floor_band)
-            self.assertEqual((r["band"], r["D"], r["required_index"]), (floor_band, 9, 67.0))
+            self.assertEqual((r["band"], r["D"], r["required_index"]), (floor_band, 9, 95.0))
             self.assertEqual(r["chosen"]["model"], "gpt-6-astra")
             self.assertIn("workload cap R1 not applied: the trusted capability requirement wins", r["hard_rules"])
         # outward: blast radius floored at 3, band and difficulty kept
@@ -457,7 +465,7 @@ class BatchHint(Base):
                     constraints={"allowed_routes": allowed, **({"workload": workload} if workload else {})},
                     credential_resolver=lambda **k: None, supports_accounts=True)
         self.assertEqual((out[None]["band"], out[None]["model"], out[None]["route"]["required_index"]),
-                         ("R3", "gpt-6-astra", 67.0))
+                         ("R3", "gpt-6-astra", 95.0))
         b = out["batch"]
         self.assertEqual((b["band"], b["route"]["D"], b["model"]), ("R1", 5, "gpt-6.1-sol"))
         self.assertAlmostEqual(b["route"]["required_index"], 36.7)

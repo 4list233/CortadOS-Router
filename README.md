@@ -191,7 +191,9 @@ cost = burn weight + 30 × scarcity − 80 × underuse − capacity credit
 
 - **Burn weight** is the model's price divided by the learned size of its quota pool (`unitcost.py`), looked up under the lane's own key (`claude#b:all` for account B). The learned size is a lower bound (only provider-routed tokens are counted), so a lower-bound size never goes below the table's `selection.pool_size_prior_tokens_per_pct` (Codex: 5.63 M tokens per 1 %).
 - **Scarcity** compares the share of a plan window already used against the share of its time elapsed, read from each vendor CLI's own `/usage` or `/status` screen through a PTY (`scarcity.py`), so no tokens are spent. A pool on pace to overshoot gets more expensive; a spent pool is skipped.
-- **Underuse** (an underused pool only) is the share of the pool expected to be lost at its next reset: what is left, minus the learned recent burn rate (or the window's own pace) times the hours to the reset. When a reset time is unknown it falls back to −scarcity. The same expected loss ranks the underused frontier pools that may take R3 work (`selection.ceiling_underuse`).
+- **Underuse** (an underused pool only) is the share of the pool expected to be lost at its next reset: what is left, minus the learned recent burn rate (or the window's own pace) times the hours to the reset. When a reset time is unknown it falls back to −scarcity. The same expected loss ranks the underused frontier pools that may take R3 work (`selection.ceiling_underuse`, from D 8).
+- **Underuse split (#143).** When the cheapest qualifying route is on a pool expected to lose quota at its reset, every underused pool with a qualifying route takes part, weighted by the quota it is expected to lose (expected loss % × its size in tokens), and one is picked by a hash of the conversation id (`core.split_pick`): the same conversation always lands on the same pool, and the pools share the work instead of the largest credit taking all of it. The underused frontier pools share hard work the same way. A route the host's admission check refuses (the client floor) takes no part; the switching margin does not override a split.
+- **Frontier for hard work (#143).** The R4 and best knots are at D 9 and 10 (S1 never answers above 10). Planning and research at D ≥ 7, and code at D ≥ 9, need a frontier (ceiling) model while one is available (`selection.ceiling_work.require_frontier`). Fable is sized by the window that binds it: it also draws on the all-models week (`selection.pool_size_from_pool`).
 - **Switching margin.** When the client's previous route in the same band costs at most `selection.switch_margin_points` (3) more than the cheapest one, it stays, so a 1–3 point swing between readings does not move the client from one model to another. It is held only when it also passes the host's own admission check: under a client floor (`x-cortados-min-left-pct`) a previous route below the floor is not held, and the cheapest eligible route is chosen instead of the request being refused.
 - **Batch hint.** A client may send `x-cortados-workload: batch` (both wires). The band is then capped at R1 and the call runs as background work. The cap applies to the requirement too: the difficulty is counted as at most 5 (the most R1 admits), so the required index is R1's and the frontier rules (planning/research at the R4 reference, the underused-frontier rule) do not fire. A trusted minimum band above R1 undoes the cap. An outward or blast-radius-3 request keeps R3, and a degraded scorer still never defaults to Claude. Unknown values are ignored and logged; the hint is recorded in the route row's `workload` column.
 
@@ -491,8 +493,19 @@ routing table. Such a conversation stays on the API (`server.ApiSession`, relaye
 later turn passes a continuation gate before anything is sent (`routing.api_continuation_admission`): no
 `x-cortados-local` header, no sensitivity detector marking it, S1 admitting it under the local gate (no outward effect,
 blast radius 0-1, not degraded), the lane on and a grant still inside its preference window. A turn that fails it is
-refused (terminal 400, nothing sent, the conversation untouched); moving it to another lane mid-way is #43's seam. Otherwise routing is S1 and scarcity as
-always: the lane is never an S1 candidate.
+refused (terminal 400, nothing sent, the conversation untouched); moving it to another lane mid-way is #43's seam.
+
+**A scored candidate too (#143, owner 2026-11-23).** Whenever the lane is on (a counting grant, budget left above the
+stop line, more than an hour before expiry), `routing.choose` offers its Claude models to `core.resolve` as
+`anthropic-api` pairs for a request the lane may take (`routing.api_lane_pairs`): no `x-cortados-local` header, on
+`/v1/messages`, every sensitivity detector cleared it, not a pin, and the opening turn's upper-bound cost fits under the
+stop line for that model. `core.api_lane_refusal` adds S1's side: never a degraded scorer, an outward effect or a blast
+radius above 1 (`selection.api_credit_lane.max_blast_radius`), the same rule every later turn is re-checked with. Its
+weight is "free until the grant lapses": the burn of the grant's dollars (stop-line dollars per % at the model's price,
+never the weights' normalising reference) times the share of the grant NOT expected to lapse. A conversation it wins is
+bound `api_credit_scored`; its later turns pass the same continuation gate without the expiry window. How much it takes
+is set by the underuse split below, in proportion to the grant's expected lost dollars (a few % of routed calls on the
+audit week).
 
 **Key.** `CORTADOS_ANTHROPIC_API_KEY` in the provider's environment, the variable the earlier lane read (on the Air the
 provider LaunchAgent loads its environment from `~/.cortados/provider.env`). Never logged, printed or written; `child_env.NEVER_ENV` /

@@ -112,8 +112,9 @@ class ScoredSelection(unittest.TestCase):
             core._tokens_left_for = keep
     def test_requirement_is_continuous_in_difficulty(self):
         t = core.table()
+        # #143: the R3 knot is at D 8 (R4 at 9, best at 10), so 6 -> 8 rises continuously from the R2 to the R3 reference
         r = [core.required_index(t, self.MS, "code", D, "R2") for D in (6, 7, 8)]
-        self.assertEqual(r[0], 50); self.assertTrue(r[0] < r[1] < r[2] < 80)
+        self.assertEqual(r[0], 50); self.assertTrue(r[0] < r[1] < r[2]); self.assertEqual(r[2], 80)
     def test_least_overqualified_model_that_clears_the_bar(self):
         r = core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"))            # D=6 → needs 50
         self.assertEqual((r["chosen"]["model"], r["required_index"]), ("mid", 50.0))
@@ -196,10 +197,17 @@ class ScoredSelection(unittest.TestCase):
         # Trigger is selection.ceiling_underuse.min_D in tables/routing-table.json. It was D>=6 (Forest 2026-09-25, CortadOS 2fbf4ff9) and is
         # D>=9 since CortadOS dc029601 ("router: Astra only for D>=9 when Codex is underused (was 6) ... simple turns were staying on Astra");
         # ROUTER-DESIGN §9 records that this test still asserted D=6. Same intent, at the documented boundary.
-        self.assertNotEqual(core.resolve(dec(steps=3, ambiguity=3, novelty=3, work_kind="code"))["chosen"]["model"], "top")    # D=9 code, no underuse → price ladder
+        # #143 (owner 2026-11-23): min_D 8, because S1's compressed top puts most hard work at D 8-9.
+        self.assertNotEqual(core.resolve(dec(steps=3, ambiguity=3, novelty=2, work_kind="code"))["chosen"]["model"], "top")    # D=8 code, no underuse → price ladder
         core.lane_health = lambda: {"claude": {"ok": True, "why": None, "scarcity": -0.6, "expiring_pct": 0, "tightest": {}, "pools": {}}}
-        self.assertEqual(core.resolve(dec(steps=3, ambiguity=3, novelty=3, work_kind="code"))["chosen"]["model"], "top")       # D=9 code, claude pool underused → top
-        self.assertNotEqual(core.resolve(dec(steps=3, ambiguity=3, novelty=2, work_kind="code"))["chosen"]["model"], "top")    # D=8, underused → not (below min_D 9)
+        self.assertEqual(core.resolve(dec(steps=3, ambiguity=3, novelty=2, work_kind="code"))["chosen"]["model"], "top")       # D=8 code, claude pool underused → top
+        self.assertNotEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=2, work_kind="code"))["chosen"]["model"], "top")    # D=7, underused → not (below min_D 8)
+
+    def test_the_frontier_wins_by_score_from_d9(self):
+        # #143: the R4 knot is at D 9 and best at D 10 (were 11 and 12, which S1 never produced): at D 9 only a model at the
+        # R4 reference qualifies, so the frontier model wins by score with no underuse at all.
+        r = core.resolve(dec(steps=3, ambiguity=3, novelty=3, work_kind="code"))                                            # D=9
+        self.assertEqual((r["chosen"]["model"], r["required_index"]), ("top", 95.0))
 
     def test_face_turns_have_a_floor_but_background_does_not(self):
         r = core.resolve(dec(), "interactive")                                    # R0 face turn: "small" (12) is below the floor → not chosen

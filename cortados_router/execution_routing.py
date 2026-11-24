@@ -84,7 +84,8 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
     `workloads` row: a band cap (core.resolve maximum_band, under the hard rules) and the unit kind, so a batch call is
     background work (fallback band R1, no face floor). `previous` (band -> {lane, model}, the host's memory of this
     client's last route per band) is passed to core.resolve for the switching margin, with `hold_ok` (the host's
-    admission check on a candidate, e.g. its quota floor): the margin holds only a route that passes it."""
+    admission check on a candidate, e.g. its quota floor): the margin holds only a route that passes it, and the
+    underuse split and frontier rules never take one that fails it (#143). `session_id` seeds the underuse split."""
     credential_resolver, auth_errors = _credential_policy(credential_resolver)
     unit = 'interactive' if platform in ('discord', 'telegram', 'cli') else 'background'
     workload = (constraints or {}).get('workload')
@@ -135,6 +136,11 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
                    and (not constraints.get('model') or m == constraints['model'])}
     limits = (constraints or {}).get('allowed_routes')
     if limits is not None:
+        # #143: the API credit lane runs the Claude models; it is in the universe only for a host that lists its pairs
+        # itself (the provider, which meters it), never offered to one that does not.
+        api = getattr(core, 'API_LANE', None)
+        if api:
+            allowed |= {(api, m) for p, m in allowed if p.split('#', 1)[0] == 'claude-cli'}
         if not isinstance(limits, (tuple, list)) or any(
                 not isinstance(p, (tuple, list)) or len(p) != 2 or
                 any(not isinstance(x, str) or not x for x in p) for p in limits):
@@ -156,7 +162,10 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
                              minimum_band=(constraints or {}).get('min_band'), accounts_aware=supports_accounts,
                              **({'maximum_band': hint['max_band']} if hint.get('max_band') else {}),
                              **({'previous': previous} if previous else {}),
-                             **({'hold_ok': hold_ok} if previous and hold_ok is not None else {}))
+                             # #143: the host's admission check also bounds the underuse split and the frontier rules
+                             **({'hold_ok': hold_ok} if hold_ok is not None else {}),
+                             # #143: the conversation seeds the underuse split, so it stays on one pool
+                             **({'split_key': session_id} if session_id else {}))
         choice = route.get('chosen')
         if not choice:
             break

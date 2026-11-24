@@ -1,5 +1,5 @@
 {
- "generated": "2026-11-13 21:09",
+ "generated": "2026-11-24 10:00",
  "scale": "index 100 = best published model on that use case (any vendor, reachable or not); from public benchmarks only",
  "use_cases": {
   "code": "building and fixing software in a repo: product modules, scripts, migrations, tests",
@@ -34,7 +34,7 @@
   },
   "R3": {
    "general": 79.6,
-   "code": 67.0,
+   "code": 66.2,
    "ops": 76.8,
    "research": 72.5,
    "planning": 76.1,
