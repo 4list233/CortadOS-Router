@@ -129,9 +129,33 @@ def _boot_failure_kind(text: str) -> str:
     return "unknown"
 
 
+# Written by the forked child to the PTY when exec fails, so the parent can tell "the CLI never started" from "the CLI
+# started and printed nothing" (#144: a missing agy read as an empty screen and was reported as a parser failure).
+EXEC_FAILED_MARK = b"\n[cortados-probe] exec failed: "
+
+
+class ProbeExecFailed(RuntimeError):
+    """The probe's CLI could not be started (exec failed, or it exited at once with no output)."""
+    kind = "exec-failed"
+
+
+class ProbeRefused(RuntimeError):
+    """The boot screen asked for something the probe never answers (a login, a first-run choice). Nothing was typed."""
+
+    def __init__(self, kind: str, stage: str):
+        super().__init__(f"probe refused at {stage}: the CLI is waiting for {kind}; nothing was typed")
+        self.kind = kind
+
+
 def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], boot_s: float = 12, run_s: float = 20, ready: str | None = None,
-                nudge: tuple[str, str, bytes, int, float] | None = None, diagnostics: dict | None = None) -> str:
-    """Open the CLI in a PTY, accept a folder-trust prompt for our own empty probe folder if shown, type `command`, return the screen text."""
+                nudge: tuple[str, str, bytes, int, float] | None = None, diagnostics: dict | None = None,
+                refuse: tuple[tuple[str, str], ...] = (), inherit_path: bool = True) -> str:
+    """Open the CLI in a PTY, accept a folder-trust prompt for our own empty probe folder if shown, type `command`, return the screen text.
+
+    Deny-all: Enter is only ever sent for that trust prompt. `refuse` is ((kind, regex), ...): when a boot screen matches
+    one (checked before the trust prompt and again after it), ProbeRefused(kind) is raised at once, before anything is
+    typed, and the CLI is closed. An exec failure raises ProbeExecFailed instead of returning an empty screen.
+    inherit_path=False runs argv[0] as given (an absolute path), never searched on PATH."""
     PROBE_DIR.mkdir(parents=True, exist_ok=True)
     my_dir = PROBE_DIR / f"p{os.getpid()}-{int(time.time() * 1000) % 100000}"     # per-probe folder: the reaper kills by cwd and must never hit another probe
     my_dir.mkdir(exist_ok=True)
@@ -139,7 +163,16 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     if pid == 0:
         try:
             os.chdir(my_dir)
-            os.execvpe(argv[0], argv, {**env, "TERM": "xterm-256color"})
+            child_env = {**env, "TERM": "xterm-256color"}
+            if inherit_path:
+                os.execvpe(argv[0], argv, child_env)
+            else:
+                os.execve(argv[0], argv, child_env)
+        except BaseException as exc:
+            try:
+                os.write(1, EXEC_FAILED_MARK + type(exc).__name__.encode() + b"\n")
+            except BaseException:
+                pass
         finally:
             os._exit(127)    # exec failed (e.g. missing binary): never let the forked copy run the sampler's code
     _reaper.track(pid, fd, my_dir, PROBE_DIR)
@@ -179,10 +212,20 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             elif len(buf) > mark and time.time() - last > quiet_s:
                 return
     mark = 0
+
+    def refused(where: str) -> None:
+        if EXEC_FAILED_MARK in buf:
+            raise ProbeExecFailed(f"{Path(argv[0]).name} could not be started: "
+                                  + buf.split(EXEC_FAILED_MARK, 1)[1].split(b"\n", 1)[0].decode("ascii", "replace")[:60])
+        shown = _plain(buf)
+        for kind, pattern in refuse:
+            if re.search(pattern, shown, re.I):
+                raise ProbeRefused(kind, where)
     try:
         pump(boot_s, until=ready)
         startup_chars = len(_plain(buf))
         ready_seen = bool(ready and re.search(ready, _plain(buf)))
+        refused("boot")
         if eof:
             mark = len(buf)
             return ""
@@ -192,6 +235,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             pump(boot_s, until=ready, mark=len(buf))
             startup_chars = len(_plain(buf))
             ready_seen = bool(ready and re.search(ready, _plain(buf)))
+            refused("trust")
             if eof:
                 mark = len(buf)
                 return ""
@@ -276,7 +320,8 @@ def parse_claude_usage(text: str) -> list[dict[str, Any]]:
 
 def parse_agy_usage(text: str) -> dict[str, list[dict[str, Any]]]:
     groups: dict[str, list[dict[str, Any]]] = {}
-    parts = re.split(r"([A-Z][A-Z ]{3,40} MODELS) (?=Models within)", re.sub(r"\s+", " ", text))
+    # Group headers: "GEMINI MODELS", "CLAUDE AND GPT MODELS" (2026-10 screen); "THIRD-PARTY MODELS" and the like allowed
+    parts = re.split(r"([A-Z][A-Z0-9 &/-]{2,40} MODELS) (?=Models within)", re.sub(r"\s+", " ", text))
     for title, chunk in zip(parts[1::2], parts[2::2]):
         wins = []
         for m in re.finditer(r"(Weekly|Five Hour) Limit Remaining\D{0,200}?(\d{1,3}(?:\.\d+)?)\s*%\s*(Refreshes in ([0-9dhm ]+)|Quota available)?", chunk):
@@ -288,14 +333,22 @@ def parse_agy_usage(text: str) -> dict[str, list[dict[str, Any]]]:
     return groups
 
 
-def _cli_env() -> dict[str, str]:
-    env = dict(os.environ)
+def _env_file_vars() -> dict[str, str]:
+    """The router's shared env file ($CORTADOS_HOME/env, KEY=value lines) applied to every vendor CLI probe."""
+    out: dict[str, str] = {}
     f = STATE / "env"
     if f.exists():
         for line in f.read_text().splitlines():
             if "=" in line and not line.lstrip().startswith("#"):
                 k, v = line.strip().split("=", 1)
-                env[k] = v.strip().strip('"')
+                out[k] = v.strip().strip('"')
+    return out
+
+
+def _cli_env() -> dict[str, str]:
+    """The env of the claude / codex / cursor probes: the whole process env plus the env file. Never used for agy, which
+    runs on agy_isolation.child_env's allowlist (#144)."""
+    env = {**os.environ, **_env_file_vars()}
     env["PATH"] = f"{Path.home()}/.local/bin:/opt/homebrew/bin:" + env.get("PATH", "")
     return env
 
@@ -433,16 +486,72 @@ def _claude(prev: dict[str, Any] | None = None, config_dir: str | None = None) -
     return {**out, "windows": wins}
 
 
+# Boot screens the agy probe never answers (deny-all, #144): it closes the CLI at once and records the kind. PROVISIONAL
+# wording: the first-run prompts are from Google's getting-started page ("Color scheme", "Rendering mode: Alt-Screen or
+# Inline"); the sign-in screen is the documented flow (a browser sign-in, or over SSH an authorization URL and a code to
+# paste back). Pin both to captured screens once the owner sends them.
+AGY_REFUSE = (
+    ("not-logged-in", r"accounts\.google\.com|sign in with google|authori[sz]ation (?:url|code)|paste (?:the|your) (?:authori[sz]ation )?code"
+                      r"|not (?:signed|logged) in|please (?:sign|log) in|login required"),
+    ("first-run-pending", r"color scheme|colou?r theme|rendering mode|alt-screen"),
+)
+AGY_DONE = r"Limit Remaining[\s\S]*Limit Remaining"
+# Human words for a lane's state, by scarcity error_kind / record state: what the live view, the dashboard and the pulse
+# pane print instead of "FAILED" when the cause is known (#144).
+LANE_STATE_TEXT = {
+    "not-configured": "not configured",
+    "binary-missing": "not installed",
+    "exec-failed": "could not start",
+    "not-logged-in": "not logged in",
+    "first-run-pending": "first-run setup pending",
+    "forbidden-env": "refused: API key or ADC variable configured",
+    "settings-refused": "refused: unsafe agy settings",
+}
+
+
+def lane_state(v: dict[str, Any] | None) -> str | None:
+    """The human state of a cached lane record when its cause is known (LANE_STATE_TEXT), else None."""
+    if not isinstance(v, dict):
+        return None
+    if v.get("state") in LANE_STATE_TEXT:
+        return LANE_STATE_TEXT[v["state"]]
+    return LANE_STATE_TEXT.get(v.get("error_kind")) if v.get("error") else None
+
+
+def _agy_pool_of_group(title: str) -> str:
+    g = title.lower()
+    if "gemini" in g:
+        return "gemini"
+    if re.search(r"claude|gpt|third|partner", g):
+        return "claude-gpt"       # Pro's "paid-tier third-party models" (Claude Opus / Sonnet 5.5, GPT-OSS 120B on 2026-11-24)
+    return re.sub(r"[^a-z0-9]+", "-", g.replace("models", "")).strip("-")
+
+
 def _antigravity() -> dict[str, Any]:
-    text = tui_capture(["agy"], "/usage", r"Limit Remaining[\s\S]*Limit Remaining", _cli_env())
+    """agy /usage through the isolation of agy_isolation (#144): a configured absolute binary (unset: not sampled), an
+    allowlisted env (a Google-family variable in the env file: refused), the settings guard, and a deny-all PTY run."""
+    from cortados_router import agy_isolation as iso
+    env_file = _env_file_vars()
+    binary = iso.resolve_binary(_env_get("CORTADOS_AGY_BIN") or env_file.get("CORTADOS_AGY_BIN"))
+    env = iso.child_env(os.environ, env_file)
+    iso.check_settings(env["HOME"])
+    diag: dict = {}
+    text = tui_capture([binary], "/usage", AGY_DONE, env, refuse=AGY_REFUSE, inherit_path=False, diagnostics=diag)
+    if not text.strip():
+        if diag.get("eof") and diag.get("stage") in {"boot", "trust"}:
+            raise ProbeExecFailed(f"agy exited at {diag.get('stage')} with no usable output")
+        raise RuntimeError("agy /usage screen empty (stage=" + str(diag.get("stage")) + ")")
+    for kind, pattern in AGY_REFUSE:          # a login or setup screen that appeared only after /usage was typed
+        if re.search(pattern, text, re.I) and not parse_agy_usage(text):
+            raise ProbeRefused(kind, "command")
     groups = parse_agy_usage(text)
     if not groups:
         raise RuntimeError("no quota groups on the /usage screen: " + text[-200:].replace("\n", " "))
     wins = []
     for g, ws in groups.items():
-        pool = "gemini" if "gemini" in g else "claude-gpt" if "claude" in g or "gpt" in g else re.sub(r"[^a-z0-9]+", "-", g.replace("models", "")).strip("-")
+        pool = _agy_pool_of_group(g)
         wins += [{**w, "window": f"{w['window']} ({pool})", "pool": pool} for w in ws]
-    return {"source": "agy /usage (pty)", "windows": wins}
+    return {"source": "agy /usage (pty)", "windows": wins, "binary": binary}
 
 
 def _load_codex_screen():
@@ -608,8 +717,12 @@ def _failed_record(lane: str, old: dict[str, Any] | None, exc: BaseException) ->
     by every sampler path so a failure looks the same, and is as visible, wherever it happened."""
     old = old or {}
     err = f"{type(exc).__name__}: {str(exc)[:200]}"
-    kind = failure_kind(err)
+    # a probe that knows its cause names it (#144: binary-missing, exec-failed, not-logged-in, ...); else the slug
+    own = getattr(exc, "kind", None)
+    kind = own if isinstance(own, str) and own else failure_kind(err)
     rec = {**old, "tried_at": time.time(), "error": err, "error_kind": kind}
+    rec.pop("state", None)            # a "not configured" record is not carried into a failure: the failure is the state now
+    rec.pop("note", None)
     # The full list of places looked, beyond the 200-char summary above; dropped when this failure carries none, so a
     # stale list from an earlier failure never describes a different one.
     # The same for the binary a probe ran and the discovery problems met on the way (a malformed manifest that fell
@@ -759,11 +872,44 @@ def pool_for(lane: str, model: str, pools: list[str]) -> str | None:
     if lane == "cursor":
         return "cursor-models" if re.search(r"grok|composer|^auto$|^default$|vega", m) else "other-models"
     if lane == "antigravity":
-        return "gemini" if "gemini" in m else "claude-gpt"
+        return agy_pool(model)
     if lane == "claude" and "fable" in m:
         return "fable"                                   # Forest 2026-10-25: Fable is separately metered; true even when the per-model panel is rate-limited so no pool is observed this read
     hits = [p for p in pools if p not in ("all", "info") and all(tok in m for tok in p.split("-") if tok)]
     return max(hits, key=len) if hits else None
+
+
+class UnknownAgyModel(ValueError):
+    """A model the antigravity inventory does not list: its pool is unknown, and no pool is assumed for it."""
+
+
+def _agy_inventory() -> dict[str, str]:
+    """{lower-cased id or display name: pool} from routing-table.json inventory.antigravity.models, cached by mtime."""
+    from cortados_router.paths import tables_dir
+    p = tables_dir() / "routing-table.json"
+    key = (str(p), p.stat().st_mtime_ns)
+    if _AGY_INV.get("key") != key:
+        models = (json.loads(p.read_text()).get("inventory") or {}).get("antigravity", {}).get("models") or {}
+        idx = {}
+        for pool, rows in models.items():
+            for r in rows or []:
+                for k in (r.get("id"), r.get("name")):
+                    if isinstance(k, str) and k.strip():
+                        idx[k.strip().lower()] = pool
+        _AGY_INV.update(key=key, idx=idx)
+    return _AGY_INV["idx"]
+
+
+_AGY_INV: dict[str, Any] = {}
+
+
+def agy_pool(model: str) -> str:
+    """The antigravity pool of `model` (id or display name, as `agy models` lists them) by the inventory, not by a
+    substring (#144: a model whose id lacks "gemini" would have been charged to the wrong pool). Unknown: raises."""
+    pool = _agy_inventory().get((model or "").strip().lower())
+    if pool is None:
+        raise UnknownAgyModel(f"{model!r} is not in inventory.antigravity (tables/routing-table.json)")
+    return pool
 
 
 def _roll(wins: list[dict[str, Any]]) -> dict[str, Any]:
@@ -806,6 +952,11 @@ def _anthropic_api() -> dict[str, Any]:
             "spent_usd": round(float((st.get("grant") or {}).get("used_usd") or 0.0), 4),
             "lane_on": bool(st.get("on")), "off_reason": st.get("reason"),
             "windows": [window_view("grant", used_pct, reset_at, window_s, now)]}
+
+
+def _lane_not_configured() -> type:
+    from cortados_router.agy_isolation import LaneNotConfigured
+    return LaneNotConfigured
 
 
 SAMPLERS = {"claude": _claude, "antigravity": _antigravity, "codex": _codex, "cursor": _cursor, "local": _local,
@@ -907,6 +1058,12 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
             try:
                 rec = plan[lane](lanes.get(lane), claude_dir[lane]) if lane in claude_dir else plan[lane]()
                 results[lane] = {**(finish(lane, rec) if lane != "local" else rec), "fetched_at": time.time(), "tried_at": time.time(), "error": None, "error_kind": None}
+            except _lane_not_configured() as exc:
+                # Not a failure and not a reading (#144): no CLI was opened. No windows, no fetched_at (never fresh), so
+                # nothing routes on it, and the views say "not configured" instead of "FAILED".
+                results[lane] = {"state": "not-configured", "note": str(exc)[:200], "windows": [], "pools": {},
+                                 "scarcity": None, "refusing": False, "fetched_at": None, "tried_at": time.time(),
+                                 "error": None, "error_kind": None}
             except Exception as exc:      # keep the last good reading, say so
                 results[lane] = _failed_record(lane, lanes.get(lane), exc)
                 if lane == "claude":
@@ -943,7 +1100,7 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
         if results:
             with HISTORY.open("a") as h:
                 h.write(json.dumps({"ts": now, "lanes": {l: {"scarcity": v.get("scarcity"), "windows": [[w["window"], w["used_pct"], w["elapsed_pct"]] for w in v.get("windows") or []]}
-                                                        for l, v in results.items() if not v.get("error")}}) + "\n")
+                                                        for l, v in results.items() if not v.get("error") and not v.get("state")}}) + "\n")
         return out
 
 

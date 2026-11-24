@@ -923,6 +923,7 @@ export default {
         "left_pct": null,
         "stale": true,
         "error": "ValueError",
+        "state": null,
         "sample_age_s": null,
         "shared_with": [],
         "pools": {},
@@ -935,6 +936,7 @@ export default {
         "left_pct": 80.0,
         "stale": false,
         "error": null,
+        "state": null,
         "sample_age_s": 60.0,
         "shared_with": [],
         "pools": {},
@@ -969,6 +971,7 @@ export default {
         "left_pct": 50.0,
         "stale": false,
         "error": "no_usage_lines",
+        "state": null,
         "sample_age_s": 60.0,
         "shared_with": [],
         "pools": {},
@@ -989,6 +992,7 @@ export default {
         "left_pct": 10.0,
         "stale": true,
         "error": null,
+        "state": null,
         "sample_age_s": 25200.0,
         "shared_with": [],
         "pools": {},
@@ -1009,6 +1013,7 @@ export default {
         "left_pct": 90.0,
         "stale": false,
         "error": "parse",
+        "state": null,
         "sample_age_s": 60.0,
         "shared_with": [],
         "pools": {},
@@ -1029,6 +1034,7 @@ export default {
         "left_pct": 70.0,
         "stale": false,
         "error": null,
+        "state": null,
         "sample_age_s": 60.0,
         "shared_with": [
           "Grok Bot"
@@ -1077,13 +1083,13 @@ export default {
     "http_status": 200,
     "latency_ms": 23,
     "reason": null,
-    "guard": null,
     "routing": {
       "status": "unknown",
       "windows": [],
       "warn_above_pct": null,
       "warning": null
-    }
+    },
+    "guard": null
   },
   "hosts": {
     "as_of": 1800000000.0,

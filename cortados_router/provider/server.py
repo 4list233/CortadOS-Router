@@ -4432,9 +4432,17 @@ def main(argv=None) -> None:
     ap.add_argument("--codex-home", default=getenv("CORTADOS_PROVIDER_CODEX_HOME"),
                     help="a dedicated, logged-in CODEX_HOME for the Codex backend (env CORTADOS_PROVIDER_CODEX_HOME); "
                          "unset, the backend runs on the user's real Codex home")
+    ap.add_argument("--agy-bin", default=None,
+                    help="absolute path of the Antigravity CLI the quota sampler opens for `/usage` (#144; env "
+                         "CORTADOS_AGY_BIN). Unset, the antigravity lane is 'not configured' and never sampled. No agy "
+                         "backend is served")
     ap.add_argument("--fixed-model", default=getenv("CORTADOS_PROVIDER_FIXED_MODEL"),
                     help="skip routing and run every conversation on this Claude CLI model (bridge testing)")
     a = ap.parse_args(argv)
+    if a.agy_bin:
+        # the in-process quota sampler (scarcity._antigravity) reads it from here; a relative path is reported by the
+        # sampler as binary-missing, never resolved on PATH (agy_isolation.resolve_binary)
+        os.environ["CORTADOS_AGY_BIN"] = a.agy_bin
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     token = getenv("CORTADOS_PROVIDER_TOKEN")
     if not token:

@@ -694,8 +694,12 @@ function renderSubs(box, s) {
     const d = el("div", "lane");
     const top = el("div", "top");
     add(top, el("span", "title", l.label || l.lane));
-    if (l.stale) add(top, pill("unknown", "stale"));
-    if (l.error) add(top, pill("error", l.error));
+    // #144: a known state ("not installed", "not logged in", "not configured") replaces the bare stale / error pills
+    if (l.state) add(top, pill(l.error ? "error" : "unknown", l.state));
+    else {
+      if (l.stale) add(top, pill("unknown", "stale"));
+      if (l.error) add(top, pill("error", l.error));
+    }
     add(top, el("span", "big", pct(l.left_pct)));
     add(d, top);
     add(d, el("div", "sub", join([l.account ? "account " + l.account : null,
@@ -1089,7 +1093,8 @@ function render(d) {
         (w.resets_at ? " · resets " + w.resets_at : "") + (w.stale ? " (stale)" : ""))); });
     Object.entries(l.pools || {}).forEach(([p, v]) => add(c, el("div", "sub", "pool " + p + ": " + pct(v) + " left")));
     add(c, el("div", "sub", "sample " + age(l.sample_age_s) + " old" + (l.stale ? " (stale)" : "")));
-    if (l.error) add(c, el("div", "sub err", "error: " + l.error));
+    if (l.state) add(c, el("div", "sub err", l.state));
+    else if (l.error) add(c, el("div", "sub err", "error: " + l.error));
     errors.filter(e => e && e.source === "scarcity/" + l.lane).forEach(e => add(c, el("div", "sub err", errText(e))));
     add(lanes, c);
   });

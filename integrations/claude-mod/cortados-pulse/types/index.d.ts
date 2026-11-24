@@ -53,6 +53,8 @@ export interface PulseWindow {
 export interface PulseReading {
   fetched_at?: number | null
   failed?: boolean
+  /** #144: the lane's known state in words (core.subscription_readings: scarcity.lane_state), e.g. "not installed" */
+  state?: string | null
   windows?: PulseWindow[]
   config_dir?: string | null
   login?: string | null

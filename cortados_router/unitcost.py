@@ -69,7 +69,12 @@ def _pool_of(runtime: str, model: str) -> str | None:
     if runtime == "codex":
         return "codex:all"
     if runtime == "agy":
-        return "antigravity:gemini" if "gemini" in m else "antigravity:claude-gpt"
+        # by the inventory, not a substring (#144); a model it does not list is charged to no pool (None), never a default
+        from cortados_router import scarcity
+        try:
+            return "antigravity:" + scarcity.agy_pool(model)
+        except scarcity.UnknownAgyModel:
+            return None
     if runtime == "cursor":
         return "cursor:cursor-models" if any(k in m for k in ("grok", "composer", "auto")) else "cursor:other-models"
     return None

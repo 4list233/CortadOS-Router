@@ -12,7 +12,9 @@ is the long form.
 
 ## Layout
 - `cortados_router/` — router package. `core.py` resolve/decide (CLI: `table`, `decide`),
-  `scarcity.py` quota reading via vendor CLIs (`scarcity_codex.py` parses Codex's `/status`), `unitcost.py`,
+  `scarcity.py` quota reading via vendor CLIs (`scarcity_codex.py` parses Codex's `/status`; the agy probe runs through
+  `agy_isolation.py`: allowlisted env, configured absolute binary, settings guard, deny-all; quota only, not routed,
+  docs/AGY-LANE.md, #144), `unitcost.py`,
   `api_credits.py` (#114: the API credit lane's grants budget, 95 % stop line, flock'd reserve/settle ledger, upper-bound
   cost estimate; fails closed; executor `provider/anthropic_proxy.py`, README "API credit lane"),
   `transport.py`, `router_db.py` (router.db reader opener — `mode=rw` + `query_only`, never `mode=ro` in a process that
