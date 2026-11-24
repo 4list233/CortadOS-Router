@@ -107,6 +107,22 @@ as_root_test() {
   local a; a="$(root_test "$@")" || die "cannot check 'test $*' as root (sudo or test failed): refusing to guess"
   [[ "$a" == yes ]]
 }
+# Root never writes inside a directory a role user owns (#77 fix round 2). Such a user can swap any
+# path component there for a link at any moment, after every check, so a write as root through it
+# could overwrite any file on the machine (shown by the review with settings.json.next planted as a
+# link to a root-owned file). Every write there is done AS the owning role user instead: a link it
+# planted then reaches only what it could write anyway. Root still reads the staged content from its
+# own 0700 STAGE and passes it on stdin.
+# role_write: stdin -> DEST, written as USER, 0600 (umask), through a new file mktemp creates
+# exclusively beside DEST (never an existing name, never a link), then renamed over DEST; the temp
+# file is removed if the copy or the rename fails.
+role_write() {  # user dest < content
+  sudo -u "$1" /bin/sh -c 'umask 077; t="$(mktemp "$1.next.XXXXXX")" || exit 1
+if cat > "$t" && mv -f "$t" "$1"; then exit 0; fi
+rm -f "$t"; exit 1' role-write "$2"
+}
+role_write_from() { role_write "$1" "$3" < "$2"; }        # user source dest (source readable by the caller)
+promote_as() { sudo cat "$2" | role_write "$1" "$3"; }    # user staged dest (staged: root's STAGE)
 
 # ---- preconditions common to every mode (they only read) -----------------------------
 step "Preconditions ($MODE)"
@@ -277,8 +293,9 @@ if [[ "$CURRENT_BUILD" == "$BUILD" && ! -f "$BUILD/.cortados-build-ok" ]]; then
   die "$BUILD is current but has no build marker: investigate"
 fi
 
-# Studio's state dir and settings file are written as root (install -d, a read of the old file, cp/mv
-# in the transaction): none of them may be a link the Studio user planted, or root would follow it.
+# Studio's state dir and settings file: a link here is an unknown layout, so the run stops before any
+# change. This is NOT what keeps root safe (the Studio user can plant a link after this check): root
+# never writes there, every write is done as $STUDIO_USER (role_write, fs_* below, #77 fix round 2).
 for f in "$STUDIO_STATE" "$STUDIO_STATE/claw3d" "$STUDIO_SETTINGS"; do
   if as_root_test -L "$f"; then die "$f is a symbolic link: refusing to write through it (move it aside first)"; fi
 done
@@ -328,6 +345,10 @@ done
 [[ $APPLY -eq 1 ]] || echo "  DRY RUN: nothing below is executed. Re-run with --apply."
 
 TMP="$(mktemp -d)"   # 0700, the owner's
+# Every file in TMP that ever holds a secret, registered here, before any of them is made: on_exit
+# wipes them (wipe_rm, deploy-lib.sh) on every exit, a die, a failed step or a signal (bash runs the
+# EXIT trap on INT/TERM too), not only on the success path (#77 fix round 2).
+SECRET_TMP=(office-token office-header bridge-token access-token studio-settings.json studio-settings.old)
 # A client registered by this run stays only once its release is committed: any other exit revokes it.
 PENDING_CLIENT=""
 on_exit() {
@@ -335,6 +356,7 @@ on_exit() {
     PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients remove "$PENDING_CLIENT" >&2 \
       || echo "deploy-air: could not revoke $PENDING_CLIENT: remove it with clients remove" >&2
   fi
+  wipe_rm "${SECRET_TMP[@]/#/$TMP/}" || echo "deploy-air: could not remove every secret from $TMP: remove it now" >&2
   rm -rf "$TMP"
 }
 trap on_exit EXIT
@@ -358,10 +380,14 @@ create_user "$STUDIO_USER" "$STUDIO_UID" "$STUDIO_HOME" "$STUDIO_ACCOUNT"
 run sudo install -d -o root -g wheel -m 0755 "$ROOT" "$ROOT/home" "$ROOT/bin" "$ROOT/adapters"
 run sudo rm -rf "$STAGE"
 run sudo install -d -o root -g wheel -m 0700 "$STAGE"
-run sudo install -d -o "$BRIDGE_USER" -g staff -m 0700 "$BRIDGE_HOME" "$BRIDGE_HOME/secrets" "$ROOT/log-bridge"
-run sudo install -d -o "$STUDIO_USER" -g staff -m 0700 "$STUDIO_HOME" "$STUDIO_HOME/secrets" "$ROOT/log-studio" \
-  "$STUDIO_STATE" "$STUDIO_STATE/claw3d"
-run sudo install -d -o "$STUDIO_USER" -g staff -m 0755 "$ROOT/claw3d" "$ROOT/claw3d/builds"
+# As root only in root-owned $ROOT and $ROOT/home; inside a role user's own directory, as that user
+# (install -d as root would chown/chmod through a link the user planted there).
+run sudo install -d -o "$BRIDGE_USER" -g staff -m 0700 "$BRIDGE_HOME" "$ROOT/log-bridge"
+run sudo install -d -o "$STUDIO_USER" -g staff -m 0700 "$STUDIO_HOME" "$ROOT/log-studio"
+run sudo install -d -o "$STUDIO_USER" -g staff -m 0755 "$ROOT/claw3d"
+run sudo -u "$BRIDGE_USER" install -d -m 0700 "$BRIDGE_HOME/secrets"
+run sudo -u "$STUDIO_USER" install -d -m 0755 "$ROOT/claw3d/builds"
+run sudo -u "$STUDIO_USER" install -d -m 0700 "$STUDIO_HOME/secrets" "$STUDIO_STATE" "$STUDIO_STATE/claw3d"
 
 # ---- 2. Node (pinned tarball, hash-checked, private to /opt/cortados-office) ---------
 step "2. Node $NODE_VERSION in $ROOT/node (no Homebrew, nothing on the system PATH): $NODE_PLAN"
@@ -419,7 +445,7 @@ office_token_ok() {  # token-file: the provider answers 200 to it (the header go
   local code
   (umask 077; printf 'x-cortados-token: %s\n' "$(cat "$1")" > "$TMP/office-header")
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H @"$TMP/office-header" "$PROVIDER_OFFICE_URL" || true)"
-  rm -P "$TMP/office-header"
+  wipe_rm "$TMP/office-header"
   [[ "$code" == 200 ]]
 }
 if [[ $TOKEN_PLAN != keep ]]; then
@@ -429,7 +455,7 @@ if [[ $TOKEN_PLAN != keep ]]; then
     office_token_ok "$TMP/office-token" || die "the provider does not accept the new $NEW_SLOT token: revoked, nothing switched"
   fi
   run sudo install -o "$BRIDGE_USER" -g staff -m 0600 "$TMP/office-token" "$STAGE/office-token"
-  run rm -P "$TMP/office-token"
+  run wipe_rm "$TMP/office-token"
 fi
 # 5b. a local secret shared by the bridge and Studio (NOT the office token: Studio may hand its
 #     upstream token to the browser, so it only ever opens this read-only bridge). The bridge checks
@@ -439,15 +465,15 @@ fi
 new_secret() { if [[ $APPLY -eq 1 ]]; then (umask 077; openssl rand -hex 32 > "$1"); fi; }
 if [[ $HAVE_BRIDGE_SECRET -eq 0 ]]; then
   new_secret "$TMP/bridge-token"
-  run sudo install -S -o "$BRIDGE_USER" -g staff -m 0600 "$TMP/bridge-token" "$BRIDGE_SECRET"
-  run rm -P "$TMP/bridge-token"
+  run role_write_from "$BRIDGE_USER" "$TMP/bridge-token" "$BRIDGE_SECRET"   # its own secrets dir: as the user
+  run wipe_rm "$TMP/bridge-token"
 fi
 # 5c. Studio's own access token: its access gate is always on, loopback included, so publishing
 #     on the tailnet never exposes an open Studio. The owner reads it once (DEPLOY.md "Viewing it").
 if [[ $HAVE_ACCESS -eq 0 ]]; then
   new_secret "$TMP/access-token"
-  run sudo install -S -o "$STUDIO_USER" -g staff -m 0600 "$TMP/access-token" "$ACCESS_TOKEN"
-  run rm -P "$TMP/access-token"
+  run role_write_from "$STUDIO_USER" "$TMP/access-token" "$ACCESS_TOKEN"
+  run wipe_rm "$TMP/access-token"
 fi
 # 5d. Studio's gateway settings, the only place Claw3D's proxy takes its upstream from (see
 #     STUDIO_SETTINGS above): url = GATEWAY_URL, token = the bridge secret, adapterType openclaw.
@@ -456,8 +482,9 @@ fi
 #     transaction (step 7), so a rollback puts the previous file back. The token goes file -> pipe ->
 #     studio-settings.py's stdin -> a 0600 file in the owner's 0700 TMP: never argv, never printed.
 #     Each file is read as its own role user, not root (no privilege for a link swapped in later).
-#     Exit codes, not die, inside: the caller dies once, with the reason.
-stage_studio_settings() {  # 0 staged; 1 failed (reason on stderr)
+#     Exit codes, not die, inside: the caller dies once, with the reason. Both TMP files are wiped
+#     whenever stage_studio_settings returns, failed or not (and by on_exit if the run is killed).
+build_studio_settings() {  # 0 built and staged; 1 failed (reason on stderr). Leaves its TMP files.
   local ex
   (umask 077; : > "$TMP/studio-settings.old") || return 1
   ex="$(root_test -e "$STUDIO_SETTINGS")" || { echo "cannot check whether $STUDIO_SETTINGS exists" >&2; return 1; }
@@ -468,8 +495,14 @@ stage_studio_settings() {  # 0 staged; 1 failed (reason on stderr)
   (set -o pipefail; umask 077; sudo -u "$BRIDGE_USER" cat "$BRIDGE_SECRET" \
     | python3 -I "$HERE/studio-settings.py" --url "$GATEWAY_URL" --existing "$TMP/studio-settings.old" \
     > "$TMP/studio-settings.json") || { echo "cannot build the settings from $BRIDGE_SECRET" >&2; return 1; }
-  sudo install -o "$STUDIO_USER" -g staff -m 0600 "$TMP/studio-settings.json" "$STAGE/studio-settings.json" || return 1
-  rm -P "$TMP/studio-settings.json" "$TMP/studio-settings.old"
+  sudo install -o "$STUDIO_USER" -g staff -m 0600 "$TMP/studio-settings.json" "$STAGE/studio-settings.json" \
+    || { echo "cannot stage $STAGE/studio-settings.json" >&2; return 1; }
+}
+stage_studio_settings() {  # 0 staged; 1 failed (reason on stderr). No token-bearing TMP file outlives it.
+  local rc=0
+  build_studio_settings || rc=$?
+  wipe_rm "$TMP/studio-settings.json" "$TMP/studio-settings.old" || { echo "cannot remove the settings from $TMP" >&2; rc=1; }
+  return $rc
 }
 printf '  stage %s (%s, 0600: gateway %s + the bridge secret) -> %s\n' "$STAGE/studio-settings.json" "$STUDIO_USER" "$GATEWAY_URL" "$STUDIO_SETTINGS"
 if [[ $APPLY -eq 1 ]]; then stage_studio_settings || die "cannot stage Studio's gateway settings (see above): nothing switched"; fi
@@ -547,10 +580,18 @@ fs_exists() {  # 0 exists, 1 absent, 2 unknown (sudo or test failed): never exit
   case "$(root_test -e "$1" -o -L "$1")" in yes) return 0 ;; no) return 1 ;; *) return 2 ;; esac
 }
 fs_link() { switch_link "$1" "$2" "$3"; }
-fs_rm() { if [[ -n "$2" ]]; then run sudo -u "$2" rm -f "$1"; else run sudo rm -f "$1"; fi; }
-fs_backup() { run sudo cp -p "$1" "$1.prev"; }
-fs_promote() { run sudo cp -p "$1" "$2.next" && run sudo mv -f "$2.next" "$2"; }
-fs_restore() { run sudo mv -f "$1.prev" "$1"; }
+# USER set (a role user's directory): every write AS that user, never root (role_write, above). Empty:
+# root, only for root-owned directories ($ROOT/bin, /Library/LaunchDaemons).
+fs_rm() { if [[ -n "${2:-}" ]]; then run sudo -u "$2" rm -f "$1"; else run sudo rm -f "$1"; fi; }
+fs_backup() {  # dest user: a .prev left there (planted after the preflight) is replaced, never written through
+  if [[ -n "${2:-}" ]]; then run sudo -u "$2" /bin/sh -c 'rm -f "$1.prev" && cp -p "$1" "$1.prev"' fs-backup "$1"
+  else run sudo cp -p "$1" "$1.prev"; fi
+}
+fs_promote() {  # staged dest user
+  if [[ -n "${3:-}" ]]; then run promote_as "$3" "$1" "$2"
+  else run sudo cp -p "$1" "$2.next" && run sudo mv -f "$2.next" "$2"; fi
+}
+fs_restore() { if [[ -n "${2:-}" ]]; then run sudo -u "$2" mv -f "$1.prev" "$1"; else run sudo mv -f "$1.prev" "$1"; fi; }
 daemon_loaded() { launchd_state "$1"; }   # 0 / 1 / 2 unknown: returns, never exits (tx_*)
 daemon_start() { run sudo launchctl bootstrap system "/Library/LaunchDaemons/$1.plist"; }
 daemon_stop() {
@@ -582,10 +623,12 @@ office_healthy() {  # prints why not, on failure
   # gate) an OpenClaw `connect`, which the proxy forwards with its gateway token; only the bridge's
   # ok:true hello passes (gateway-check.mjs). Reason: on 2026-11-24 every check above passed while
   # the proxy refused its upstream (studio.gateway_url_blocked) and the Office showed 0 agents.
-  # The access token goes file -> pipe -> stdin, read as root: never printed, never on a command
-  # line. Fails closed: a refused sudo (pipefail), a refusal, a close or the 5 s deadline all fail.
+  # The access token goes file -> pipe -> stdin: never printed, never on a command line. Read as
+  # $STUDIO_USER, not root: the path is in Studio's home and the probe sends what it reads to Studio's
+  # port, so as root a link planted there would hand Studio any root-readable file (#77 fix round 2).
+  # Fails closed: a refused sudo (pipefail), a refusal, a close or the 5 s deadline all fail.
   local gw
-  gw="$(sudo cat "$ACCESS_TOKEN" 2>/dev/null | "$NODE" "$HERE/gateway-check.mjs" --port "$STUDIO_PORT" --timeout-ms 5000 2>/dev/null)" \
+  gw="$(sudo -u "$STUDIO_USER" cat "$ACCESS_TOKEN" 2>/dev/null | "$NODE" "$HERE/gateway-check.mjs" --port "$STUDIO_PORT" --timeout-ms 5000 2>/dev/null)" \
     && [[ "$gw" == ok ]] || { echo "Studio's gateway proxy does not reach the bridge (${gw:-no answer})"; return 1; }
   # 0 only on a successful lsof listing loopback listeners on both ports (deploy-lib.sh): a refused
   # sudo or an unreadable answer fails the health check, so the transaction rolls back
@@ -611,8 +654,10 @@ TX_LINKS=("$ROOT/node-$NODE_VERSION|$ROOT/node|" "$ADAPTER_DIR|$ROOT/adapter|" "
 TX_FILES=("$STAGE/run-bridge.sh|$ROOT/bin/run-bridge.sh" "$STAGE/run-studio.sh|$ROOT/bin/run-studio.sh"
   "$STAGE/$BRIDGE_LABEL.plist|/Library/LaunchDaemons/$BRIDGE_LABEL.plist"
   "$STAGE/$STUDIO_LABEL.plist|/Library/LaunchDaemons/$STUDIO_LABEL.plist")
-[[ $TOKEN_PLAN == keep ]] || TX_FILES+=("$STAGE/office-token|$OFFICE_TOKEN")
-TX_FILES+=("$STAGE/studio-settings.json|$STUDIO_SETTINGS")   # always: rewritten every run (5d)
+# The third field: the role user owning the destination's directory, who does every write there
+# (fs_*, #77 fix round 2). The launchers and plists live in root-owned directories: root.
+[[ $TOKEN_PLAN == keep ]] || TX_FILES+=("$STAGE/office-token|$OFFICE_TOKEN|$BRIDGE_USER")
+TX_FILES+=("$STAGE/studio-settings.json|$STUDIO_SETTINGS|$STUDIO_USER")   # always: rewritten every run (5d)
 TX_LABELS=("$BRIDGE_LABEL" "$STUDIO_LABEL")
 tx_rc=0; tx_run || tx_rc=$?
 case $tx_rc in

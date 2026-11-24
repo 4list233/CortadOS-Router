@@ -312,7 +312,7 @@ test('deploy-air.sh: every check comes before the first change, and the order is
   // launchers and plists are staged, never written over the live ones before activation
   assert.ok(lines.filter(l => /^write_root_file |\| write_root_file /.test(l.trim())).every(l => !/\/(bin|Library)\//.test(l)));
   for (const f of ['run-bridge.sh', 'run-studio.sh']) assert.ok(lines.some(l => l.includes(`"$STAGE/${f}|$ROOT/bin/${f}"`)), f);
-  assert.ok(lines.some(l => l.includes('[[ $TOKEN_PLAN == keep ]] || TX_FILES+=("$STAGE/office-token|$OFFICE_TOKEN")')));
+  assert.ok(lines.some(l => l.includes('[[ $TOKEN_PLAN == keep ]] || TX_FILES+=("$STAGE/office-token|$OFFICE_TOKEN|$BRIDGE_USER")')));
   // no clone into a fixed, possibly existing directory: only into the per-commit build dir, after clearing a failed one
   const clones = lines.filter(l => /git clone/.test(l));
   assert.deepEqual(clones.map(l => l.trim()), ['as_studio git clone --no-checkout "$CLAW3D_REPO" "$BUILD"']);
@@ -553,7 +553,8 @@ const SUDO_REFUSED = '#!/bin/bash\necho "sudo: a password is required" >&2\nexit
 // A fake sudo that runs the command "as root" (FAKE_ROOT=1), and a fake launchctl blind to the system
 // domain unless run as root, as the real one is: on the Air (macOS 26, 2026-11-23) the owner's
 // `launchctl print system/com.apple.mDNSResponder` exits 113 "Could not find service" while it runs.
-const SUDO_ROOT = '#!/bin/bash\nexport FAKE_ROOT=1\nexec "$@"\n';
+// sudo as the fake root; `sudo -u USER` runs the command as the test user, without FAKE_ROOT
+const SUDO_ROOT = '#!/bin/bash\nif [ "$1" = -u ]; then shift 2; else export FAKE_ROOT=1; fi\nexec "$@"\n';
 const launchctlAsRoot = (code, out) => `#!/bin/bash
 [ "$1" = print ] || exit 99
 if [ "\${FAKE_ROOT:-}" != 1 ]; then
@@ -704,7 +705,7 @@ async function officeHealthy(t, sudo, lsofScript, proxy = 'ok', claw3d = null) {
   });
   const tokenFile = join(bin, 'studio-access-token');
   await writeFile(tokenFile, ACCESS + '\n'); await chmod(tokenFile, 0o600);
-  const r = await spawnAsync('bash', ['-c', `set -euo pipefail; . "$LIB"; BRIDGE_LABEL=b STUDIO_LABEL=s BRIDGE_PORT=18789 STUDIO_PORT=${studio.port}
+  const r = await spawnAsync('bash', ['-c', `set -euo pipefail; . "$LIB"; BRIDGE_LABEL=b STUDIO_LABEL=s STUDIO_USER=_cortados-claw3d BRIDGE_PORT=18789 STUDIO_PORT=${studio.port}
 NODE=${JSON.stringify(process.execPath)} HERE=${JSON.stringify(HERE.replace(/\/$/, ''))} ACCESS_TOKEN=${JSON.stringify(tokenFile)}
 ${m[0]}
 rc=0; why="$(office_healthy)" || rc=$?; echo "rc=$rc $why"`], { PATH: `${bin}:/usr/bin:/bin`, LIB });
@@ -876,7 +877,7 @@ test('deploy-air.sh office_healthy: a refused sudo lsof fails the health check (
   assert.match(await officeHealthy(t, SUDO_ROOT, lsof(1, '')), /^rc=1 /);
   assert.match(await officeHealthy(t, SUDO_ROOT, lsof(0, 'p1\nf3\nn*:3000\np2\nf3\nn127.0.0.1:18789\n')), /^rc=1 a listener on port \d+ is not loopback-only/);
   // a refused sudo for lsof alone (launchctl answered as root) still fails the check
-  const lsofRefused = '#!/bin/bash\nif [ "$1" = lsof ]; then echo "sudo: a password is required" >&2; exit 1; fi\nexport FAKE_ROOT=1\nexec "$@"\n';
+  const lsofRefused = '#!/bin/bash\nif [ "$1" = -u ]; then shift 2; fi\nif [ "$1" = lsof ]; then echo "sudo: a password is required" >&2; exit 1; fi\nexport FAKE_ROOT=1\nexec "$@"\n';
   assert.match(await officeHealthy(t, lsofRefused, lsof(0, LOOPBACK)), /^rc=1 cannot list the listeners/);
   const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
   assert.ok(!/sudo lsof/.test(text), 'lsof runs only in deploy-lib.sh (listeners_loopback_only)');
@@ -991,7 +992,7 @@ test('studio-settings.py: Claw3D\'s loader reads back the URL and the bridge tok
 
 test('deploy-air.sh stage_studio_settings: stages the bridge token for Studio, 0600, reading each file as its owner, never on argv (#77 fix round 1)', async t => {
   const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
-  const fn = text.match(/^stage_studio_settings\(\) \{[\s\S]*?\n\}\n/m);
+  const fn = text.match(/^build_studio_settings\(\) \{[\s\S]*?\n\}\nstage_studio_settings\(\) \{[\s\S]*?\n\}\n/m);
   assert.ok(fn, 'stage_studio_settings found');
   const root = await mkdtemp(join(tmpdir(), 'office-stage-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -1040,7 +1041,7 @@ rc=0; stage_studio_settings || rc=$?; echo "rc=$rc"`], { env: { PATH: `${bin}:/u
   await assert.rejects(stat(staged));
   // the token reaches studio-settings.py on stdin only; the result is staged, then installed by the transaction
   assert.match(fn[0], /sudo -u "\$BRIDGE_USER" cat "\$BRIDGE_SECRET" \\\n\s+\| python3 -I "\$HERE\/studio-settings\.py" --url "\$GATEWAY_URL" --existing /);
-  assert.match(text, /^TX_FILES\+=\("\$STAGE\/studio-settings\.json\|\$STUDIO_SETTINGS"\)/m);
+  assert.match(text, /^TX_FILES\+=\("\$STAGE\/studio-settings\.json\|\$STUDIO_SETTINGS\|\$STUDIO_USER"\)/m);
   assert.match(text, /if \[\[ \$APPLY -eq 1 \]\]; then stage_studio_settings \|\| die /);
   assert.ok(text.indexOf('then stage_studio_settings ||') < text.indexOf('tx_rc=0; tx_run'));
   // an interrupted activation's .prev is caught, and no link is written through as root
@@ -1056,11 +1057,11 @@ test('deploy-air.sh office_healthy: a connect through Studio\'s proxy must reach
     "rc=1 Studio's gateway proxy does not reach the bridge (connect refused: studio.gateway_url_blocked)");
   assert.match(await officeHealthy(t, SUDO_ROOT, lsof(0, LOOPBACK), 'rejected'), /^rc=1 .*connect refused: UNAUTHORIZED\)$/);
   // the access token cannot be read (a refused sudo for cat alone): fails, never skips the check
-  const catRefused = '#!/bin/bash\nif [ "$1" = cat ]; then echo "sudo: a password is required" >&2; exit 1; fi\nexport FAKE_ROOT=1\nexec "$@"\n';
+  const catRefused = '#!/bin/bash\nif [ "$1" = -u ]; then shift 2; fi\nif [ "$1" = cat ]; then echo "sudo: a password is required" >&2; exit 1; fi\nexport FAKE_ROOT=1\nexec "$@"\n';
   assert.match(await officeHealthy(t, catRefused, lsof(0, LOOPBACK), 'ok'), /^rc=1 Studio's gateway proxy does not reach the bridge \(/);
   // the token reaches the probe on stdin only: never as an argument
   const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
-  assert.match(text, /gw="\$\(sudo cat "\$ACCESS_TOKEN" 2>\/dev\/null \| "\$NODE" "\$HERE\/gateway-check\.mjs" --port "\$STUDIO_PORT" --timeout-ms 5000 2>\/dev\/null\)"/);
+  assert.match(text, /gw="\$\(sudo -u "\$STUDIO_USER" cat "\$ACCESS_TOKEN" 2>\/dev\/null \| "\$NODE" "\$HERE\/gateway-check\.mjs" --port "\$STUDIO_PORT" --timeout-ms 5000 2>\/dev\/null\)"/);
 });
 
 test('gateway-check.mjs: ok only on the bridge\'s hello; a refused upgrade, silence or no Studio fails (#77 upstream allowlist)', async t => {
@@ -1098,7 +1099,7 @@ test('activation: Studio\'s proxy answering studio.gateway_url_blocked fails the
     const tokenFile = join(bin, 'studio-access-token');
     await writeFile(tokenFile, ACCESS + '\n'); await chmod(tokenFile, 0o600);
     // the harness's fake health_check replaced by deploy-air.sh's own office_healthy, once
-    const prelude = `BRIDGE_LABEL=b STUDIO_LABEL=s BRIDGE_PORT=18789 STUDIO_PORT=${studio.port}
+    const prelude = `BRIDGE_LABEL=b STUDIO_LABEL=s STUDIO_USER=_cortados-claw3d BRIDGE_PORT=18789 STUDIO_PORT=${studio.port}
 NODE=${JSON.stringify(process.execPath)} HERE=${JSON.stringify(HERE.replace(/\/$/, ''))} ACCESS_TOKEN=${JSON.stringify(tokenFile)}
 ${m[0]}
 health_check() { local why; why="$(office_healthy)" || { echo "health check: $why" >&2; return 1; }; echo health >> "$D/log"; }`;
@@ -1168,7 +1169,7 @@ test('activation: a deploy without Studio\'s settings file fails the probe and r
     const tokenFile = join(bin, 'studio-access-token');
     await writeFile(tokenFile, ACCESS + '\n'); await chmod(tokenFile, 0o600);
     // deploy-air.sh's own TX_FILES entry for the settings file, when this deploy stages one
-    const prelude = `BRIDGE_LABEL=b STUDIO_LABEL=s BRIDGE_PORT=18789 STUDIO_PORT=${studio.port}
+    const prelude = `BRIDGE_LABEL=b STUDIO_LABEL=s STUDIO_USER=_cortados-claw3d BRIDGE_PORT=18789 STUDIO_PORT=${studio.port}
 NODE=${JSON.stringify(process.execPath)} HERE=${JSON.stringify(HERE.replace(/\/$/, ''))} ACCESS_TOKEN=${JSON.stringify(tokenFile)}
 ${c.staged ? `TX_FILES+=(${JSON.stringify(`${D}/stage/studio-settings.json|${L.settingsPath}`)})` : ''}
 ${m[0]}
@@ -1296,4 +1297,206 @@ echo done`, join(HERE, 'deploy-air.sh')], { cwd, env: { PATH: `${bin}:/usr/bin:/
   const log = (await readFile(join(W, 'sudo.log'), 'utf8')).trim().split('\n');
   assert.equal(log.length, 3);
   for (const l of log) assert.match(l, /^\/ -u _cortados-claw3d /, l);
+});
+
+// ---- #77 fix round 2: root never writes through a path a role user controls ---------------------
+// The role user is modelled by the fake sudo: `sudo -u USER cmd` runs cmd under macOS sandbox-exec with
+// every write below PROTECTED denied, as a role user may not write root's files; plain `sudo cmd` (root)
+// runs unconfined. A planted link therefore reaches the sentinel only when root follows it.
+async function roleHost(t) {
+  const { realpath, symlink } = await import('node:fs/promises');
+  const W = await realpath(await mkdtemp(join(tmpdir(), 'office-role-')));   // the sandbox matches real paths
+  t.after(() => rm(W, { recursive: true, force: true }));
+  const { text, sh } = await deployPins(W);
+  const settings = spawnSync('bash', ['-c', `${sh}\nprintf '%s' "$STUDIO_SETTINGS"`], { encoding: 'utf8' }).stdout;
+  const P = join(W, 'root-owned');   // stands for any root-owned directory, e.g. /etc
+  await mkdir(P); await mkdir(join(W, 'stage')); await mkdir(join(settings, '..'), { recursive: true });
+  await writeFile(join(P, 'secret'), 'root-only\n');
+  await writeFile(join(P, 'settings.json'), 'root settings\n');
+  await writeFile(join(W, 'stage', 'studio-settings.json'), '{"new": true}\n');
+  await writeFile(settings, '{"old": true}\n'); await chmod(settings, 0o640);
+  const bin = await fakeBins(t, { sudo: `#!/bin/bash
+if [ "$1" = -u ]; then u="$2"; shift 2; echo "$u $*" >> "$SUDO_LOG"
+  exec /usr/bin/sandbox-exec -p "(version 1)(allow default)(deny file-write* (subpath \\"$PROTECTED\\"))" "$@"; fi
+echo "root $*" >> "$SUDO_LOG"; exec "$@"
+` });
+  // deploy-air.sh's own primitives and its own TX_FILES entry for the settings file
+  const role = text.match(/^role_write\(\) \{[\s\S]*?^promote_as\(\).*\n/m)?.[0] ?? '';   // absent before round 2
+  const fs = text.match(/^fs_readlink\(\)[\s\S]*?(?=^daemon_loaded\(\))/m);
+  const entry = text.match(/^TX_FILES\+=\("\$STAGE\/studio-settings\.json[^\n]*/m);
+  assert.ok(fs && entry, 'fs_* primitives and the settings TX_FILES entry found');
+  const snap = async () => {
+    const { readdir, lstat, readlink } = await import('node:fs/promises');
+    const out = {};
+    for (const n of (await readdir(P)).sort()) out[n] = await readFile(join(P, n), 'utf8');
+    const dir = join(settings, '..'); const st = {};
+    for (const n of (await readdir(dir)).sort()) {
+      const l = await lstat(join(dir, n));
+      st[n] = l.isSymbolicLink() ? `-> ${await readlink(join(dir, n))}` : `${(l.mode & 0o777).toString(8)} ${await readFile(join(dir, n), 'utf8')}`;
+    }
+    return { protectedDir: out, studioDir: st };
+  };
+  const tx = (mutate, health = 'return 0') => spawnSync('/bin/bash', ['-c', `set -euo pipefail; . "$LIB"; ${sh}
+STAGE=${JSON.stringify(join(W, 'stage'))}; APPLY=1; run() { "$@"; }
+${role}${fs[0]}
+daemon_loaded() { return 1; }; daemon_start() { :; }; daemon_stop() { :; }; health_check() { ${health}; }
+TX_LINKS=(); TX_LABELS=(); TX_FILES=()
+${entry[0]}
+${mutate}
+rc=0; tx_run || rc=$?; echo "rc=$rc"`], { env: { PATH: `${bin}:/usr/bin:/bin`, LIB, PROTECTED: P, SUDO_LOG: join(W, 'sudo.log') },
+    encoding: 'utf8' });
+  return { W, P, settings, snap, tx, symlink };
+}
+
+test('activation as the Studio user: a planted settings.json.next / .prev link never lets root write outside the file (#77 fix round 2)', async t => {
+  // the review's reproduction: links planted after the preflight, pointing at a root-owned file
+  for (const health of ['return 0', 'return 1']) {
+    const H = await roleHost(t);
+    const before = await H.snap();
+    const r = H.tx(`ln -s ${JSON.stringify(join(H.P, 'secret'))} "$STUDIO_SETTINGS.next"
+ln -s ${JSON.stringify(join(H.P, 'secret'))} "$STUDIO_SETTINGS.prev"`, health);
+    const after = await H.snap();
+    assert.deepEqual(after.protectedDir, before.protectedDir, `${health}: nothing outside the intended file is written`);
+    if (health === 'return 0') {
+      assert.equal(r.stdout.trim(), 'rc=0', r.stderr);
+      assert.equal(after.studioDir['settings.json'], '600 {"new": true}\n');
+    } else {
+      // a failed release: the previous settings come back exactly, content and mode
+      assert.equal(r.stdout.trim(), 'rc=1', r.stderr);
+      assert.equal(after.studioDir['settings.json'], before.studioDir['settings.json']);
+    }
+    assert.ok(!('settings.json.prev' in after.studioDir), `${health}: .prev dropped`);
+    assert.deepEqual(Object.keys(after.studioDir).filter(n => /\.next\.\w+$/.test(n)), [], `${health}: no temp file left`);
+    // root only read: its STAGE (cat) and existence checks (test); every write went through sudo -u
+    const rootCmds = readFileSync(join(H.W, 'sudo.log'), 'utf8').trim().split('\n').filter(l => l.startsWith('root '));
+    for (const l of rootCmds) assert.match(l, /^root (cat \S+\/stage\/studio-settings\.json|\/bin\/sh -c test )/, l);
+  }
+});
+
+test('activation as the Studio user: claw3d/ swapped for a link to a root-owned directory after the preflight is never written (#77 fix round 2)', async t => {
+  const H = await roleHost(t);
+  const before = await H.snap();
+  const r = H.tx(`d="$(dirname "$STUDIO_SETTINGS")"; mv "$d" "$d.moved"; ln -s ${JSON.stringify(H.P)} "$d"`);
+  assert.equal(r.stdout.trim(), 'rc=1', r.stderr);   // the Studio user may not write there: refused, rolled back
+  assert.match(r.stderr, /installing .*settings\.json failed/);
+  const { readdir } = await import('node:fs/promises');
+  const after = {};
+  for (const n of (await readdir(H.P)).sort()) after[n] = await readFile(join(H.P, n), 'utf8');
+  assert.deepEqual(after, before.protectedDir, 'the root-owned directory is untouched: no .prev, no .next, no new settings');
+  // the real settings file, moved aside by the swap, is untouched too
+  assert.equal(await readFile(join(H.settings, '..') + '.moved/settings.json', 'utf8'), '{"old": true}\n');
+});
+
+test('deploy-air.sh: no root write inside a role user\'s directory; secrets there are written as the user (#77 fix round 2)', async () => {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  const roleOwned = /\$(BRIDGE_HOME|STUDIO_HOME)\/|\$STUDIO_STATE|\$STUDIO_SETTINGS|\$ROOT\/claw3d\/|\$BRIDGE_SECRET|\$ACCESS_TOKEN|\$OFFICE_TOKEN/;
+  for (const l of text.split('\n')) {
+    if (/^\s*#/.test(l)) continue;
+    const m = l.match(/\bsudo (install|cp|mv|rm|tee|ln|chown|chmod|tar)\b(.*)/);
+    if (m) assert.ok(!roleOwned.test(m[2]), `root writes into a role user's directory: ${l.trim()}`);
+  }
+  // every TX_FILES entry whose destination lies in a role user's directory names that user
+  const entries = [...text.matchAll(/TX_FILES\+?=\(([\s\S]*?)\)/g)].flatMap(m => [...m[1].matchAll(/"([^"]*)"/g)].map(x => x[1]));
+  for (const e of entries) {
+    const [, dest, user = ''] = e.split('|');
+    if (roleOwned.test(dest)) assert.match(user, /^\$(BRIDGE|STUDIO)_USER$/, e);
+    else assert.equal(user, '', e);
+  }
+  assert.match(text, /run role_write_from "\$BRIDGE_USER" "\$TMP\/bridge-token" "\$BRIDGE_SECRET"/);
+  assert.match(text, /run role_write_from "\$STUDIO_USER" "\$TMP\/access-token" "\$ACCESS_TOKEN"/);
+  assert.match(text, /run sudo -u "\$STUDIO_USER" install -d -m 0700 "\$STUDIO_HOME\/secrets" "\$STUDIO_STATE" "\$STUDIO_STATE\/claw3d"\n/);
+});
+
+test('role_write: written as the user, 0600, by an exclusive temp file and a rename; a failure leaves no temp file (#77 fix round 2)', async t => {
+  const H = await roleHost(t);
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  const role = text.match(/^role_write\(\) \{[\s\S]*?^promote_as\(\).*\n/m);
+  assert.ok(role, 'role_write found');
+  const dest = join(H.W, 'home', 'bridge', 'secrets', 'bridge-token');
+  await mkdir(join(dest, '..'), { recursive: true });
+  await H.symlink(join(H.P, 'secret'), dest + '.next');   // a stale or planted .next is never used
+  // only `sudo -u` is allowed here: a root write fails the call outright
+  const bin = await fakeBins(t, { sudo: `#!/bin/bash
+[ "$1" = -u ] || { echo "root write" >&2; exit 97; }
+shift 2; exec /usr/bin/sandbox-exec -p "(version 1)(allow default)(deny file-write* (subpath \\"$PROTECTED\\"))" "$@"
+` });
+  const run = (d, src) => spawnSync('/bin/bash', ['-c', `set -euo pipefail\n${role[0]}\nrc=0; role_write_from u "$SRC" "$DEST" || rc=$?; echo "rc=$rc"`],
+    { env: { PATH: `${bin}:/usr/bin:/bin`, SRC: src, DEST: d, PROTECTED: H.P }, encoding: 'utf8' });
+  const src = join(H.W, 'token'); await writeFile(src, 'f'.repeat(64) + '\n');
+  let r = run(dest, src);
+  assert.equal(r.stdout.trim(), 'rc=0', r.stderr);
+  const { stat, readdir } = await import('node:fs/promises');
+  assert.equal(await readFile(dest, 'utf8'), 'f'.repeat(64) + '\n');
+  assert.equal((await stat(dest)).mode & 0o777, 0o600);
+  assert.equal(await readFile(join(H.P, 'secret'), 'utf8'), 'root-only\n');
+  assert.deepEqual((await readdir(join(dest, '..'))).sort(), ['bridge-token', 'bridge-token.next']);   // the planted link, untouched
+  // a destination the user may not write (here: inside the root-owned directory): fails, no temp file anywhere
+  r = run(join(H.P, 'secret'), src);
+  assert.equal(r.stdout.trim(), 'rc=1');
+  assert.deepEqual((await readdir(H.P)).sort(), ['secret', 'settings.json']);
+  assert.equal(await readFile(join(H.P, 'secret'), 'utf8'), 'root-only\n');
+  // a source that cannot be read: fails before anything is created, and the temp file is removed
+  r = run(dest + '-2', join(H.W, 'no-such-file'));
+  assert.equal(r.stdout.trim(), 'rc=1');
+  assert.deepEqual((await readdir(join(dest, '..'))).sort(), ['bridge-token', 'bridge-token.next']);
+});
+
+test('stage_studio_settings: a failed stage leaves no token-bearing file in TMP (#77 fix round 2)', async t => {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  // round 2 splits it in two (the steps, then the wipe); 1bde7eb has the one function
+  const fn = text.match(/^(?:build_studio_settings\(\) \{[\s\S]*?\n\}\n)?stage_studio_settings\(\) \{[\s\S]*?\n\}\n/m);
+  assert.ok(fn, 'stage_studio_settings found');
+  const root = await mkdtemp(join(tmpdir(), 'office-stagefail-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { sh } = await deployPins(root);
+  const [bridgeSecret, settingsPath] = spawnSync('bash', ['-c', `${sh}\nprintf '%s\\n' "$BRIDGE_SECRET" "$STUDIO_SETTINGS"`],
+    { encoding: 'utf8' }).stdout.trim().split('\n');
+  await mkdir(join(bridgeSecret, '..'), { recursive: true }); await writeFile(bridgeSecret, BRIDGE_TOKEN + '\n');
+  await mkdir(join(settingsPath, '..'), { recursive: true }); await writeFile(settingsPath, '{"version": 1, "avatars": {}}\n');
+  for (const d of ['stage', 'tmp']) await mkdir(join(root, d));
+  // the staging install into root's STAGE fails (a refused sudo, a full disk): both TMP files held the token
+  const bin = await fakeBins(t, { sudo: `#!/bin/bash
+if [ "$1" = -u ]; then shift 2; fi
+if [ "$1" = install ]; then echo "install: disk full" >&2; exit 1; fi
+exec "$@"
+` });
+  const r = spawnSync('bash', ['-c', `set -euo pipefail; . "$LIB"; ${sh}
+HERE=${JSON.stringify(HERE.replace(/\/$/, ''))} TMP=${JSON.stringify(join(root, 'tmp'))} STAGE=${JSON.stringify(join(root, 'stage'))}
+${fn[0]}
+rc=0; stage_studio_settings || rc=$?; echo "rc=$rc"`], { env: { PATH: `${bin}:/usr/bin:/bin`, LIB }, encoding: 'utf8' });
+  assert.equal(r.stdout.trim(), 'rc=1', r.stderr);
+  const { readdir } = await import('node:fs/promises');
+  assert.deepEqual(await readdir(join(root, 'tmp')), [], 'no token-bearing file left in TMP');
+  assert.deepEqual(await readdir(join(root, 'stage')), []);
+  assert.ok(!r.stderr.includes(BRIDGE_TOKEN));
+});
+
+test('wipe_rm and on_exit: secrets are overwritten and removed on every exit; a link is removed, never written through (#77 fix round 2)', async t => {
+  const { symlink, readdir } = await import('node:fs/promises');
+  const W = await mkdtemp(join(tmpdir(), 'office-wipe-'));
+  t.after(() => rm(W, { recursive: true, force: true }));
+  await writeFile(join(W, 'a'), 'secret-a\n'); await writeFile(join(W, 'empty'), '');
+  await writeFile(join(W, 'target'), 'keep me\n'); await symlink(join(W, 'target'), join(W, 'link'));
+  const r = spawnSync('bash', ['-c', `. "$LIB"; rc=0; wipe_rm "$W/a" "$W/empty" "$W/link" "$W/absent" || rc=$?; echo "rc=$rc"`],
+    { env: { PATH: '/usr/bin:/bin', LIB, W }, encoding: 'utf8' });
+  assert.equal(r.stdout.trim(), 'rc=0', r.stderr);
+  assert.deepEqual((await readdir(W)).sort(), ['target']);
+  assert.equal(await readFile(join(W, 'target'), 'utf8'), 'keep me\n');
+  // the overwrite happens before the unlink: a second hard link shows the zeroed content
+  await writeFile(join(W, 'b'), 'secret-b\n');
+  const { link } = await import('node:fs/promises'); await link(join(W, 'b'), join(W, 'b-witness'));
+  spawnSync('bash', ['-c', '. "$LIB"; wipe_rm "$W/b"'], { env: { PATH: '/usr/bin:/bin', LIB, W } });
+  assert.equal(await readFile(join(W, 'b-witness'), 'utf8'), '\0'.repeat(9));
+  // on_exit: every secret file deploy-air.sh makes in TMP is registered, and wiped before TMP goes
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  const reg = text.match(/^SECRET_TMP=\(([^)]*)\)/m);
+  assert.ok(reg, 'SECRET_TMP registered');
+  const names = reg[1].trim().split(/\s+/);
+  // every literal name under $TMP ($TMP/$NODE_TARBALL, the public Node tarball, is not literal)
+  const used = new Set([...text.matchAll(/\$TMP\/([\w.-]+)/g)].map(m => m[1]));
+  assert.ok(used.has('studio-settings.json') && used.has('bridge-token'));
+  for (const n of used) assert.ok(names.includes(n), `$TMP/${n} is not registered in SECRET_TMP`);
+  assert.ok(text.indexOf('SECRET_TMP=(') < text.indexOf('trap on_exit EXIT'));
+  assert.match(text, /on_exit\(\) \{[\s\S]*?wipe_rm "\$\{SECRET_TMP\[@\]\/#\/\$TMP\/\}"[\s\S]*?rm -rf "\$TMP"\n\}/);
+  assert.ok(!/\brm -P\b/.test(text.replace(/^\s*#.*$/gm, '')), 'no rm -P left (a no-op on macOS)');
 });

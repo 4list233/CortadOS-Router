@@ -114,7 +114,19 @@ bridge user. The bridge refuses to start if the two secrets are equal.
 Then:
 
 1. **Role users.** `dscl` creates any that are missing (hidden, shell `/usr/bin/false`,
-   password `*`), then re-runs the same check on the result.
+   password `*`), then re-runs the same check on the result. Root makes the homes and log dirs (in
+   root-owned `/opt/cortados-office` and `home/`); the directories *inside* a role user's own
+   directories (`secrets/`, Studio's `.openclaw/claw3d/`, `claw3d/builds/`) are made **as that user**.
+
+   **Root never writes inside a role user's directory** (#77 fix round 2). The user owns it, so it
+   can replace any path component there with a symbolic link at any moment, after every check this
+   script makes; a write as root would then land wherever the link points (the review showed it with
+   `settings.json.next` planted as a link to a root-owned file). So every write there, in every step,
+   the transaction and its rollback included, runs as the owning role user (`sudo -u`): the content
+   goes on stdin into a new file `mktemp` creates beside the destination, which is then renamed over
+   it. A link the user planted can only reach what that user could write anyway. Root still reads
+   (staged files from its own 0700 `stage/`, existence checks) but writes only in root-owned
+   directories: `/opt/cortados-office`, `bin/`, `adapters/`, `stage/`, `node-*`, `/Library/LaunchDaemons`.
 2. **Node.** Kept when `/opt/cortados-office/node-v24.22.3` answers with that version. Otherwise
    it downloads the pinned tarball, checks its SHA-256, and extracts it root-owned into a
    `.partial` directory that is renamed into place.
@@ -131,15 +143,18 @@ Then:
      `python3 -B -m cortados_router.provider.clients add claw3d-office --scope office:read --token-file <tmp>`
      mints it into a new 0600 file and registers only its hash. The script checks that the
      provider answers 200 to it (the header goes through a 0600 file, never argv), then stages it
-     as `_cortados-office` (0600) in `/opt/cortados-office/stage/` and removes the temp copy with
-     `rm -P`. When a slot is registered and the bridge has its file, it is kept. When one is
+     in `/opt/cortados-office/stage/` and removes the temp copy (`wipe_rm`: overwritten with zeros,
+     then unlinked; macOS `rm -P` "has no effect", and on APFS the overwrite is best effort, so what
+     counts is the unlink). Every temp file that ever holds a secret is registered before it is made
+     (`SECRET_TMP`) and wiped on every exit, a failure or a signal included, not only on success. When a slot is registered and the bridge has its file, it is kept. When one is
      registered but the file is missing, the run stops before any change and asks for
      `--rotate-office-token`. A rotation mints the new token into the **other** slot the same way;
      the running bridge's token stays registered and working until the new release is committed
      (step 8). A token registered by a run that then fails is revoked on exit.
    - **Bridge secret** (the bridge's `secrets/bridge-token`, the file it checks through
      `CORTADOS_OFFICE_BRIDGE_TOKEN_FILE`) and **Studio access token** (Studio only): each is
-     `openssl rand -hex 32` under `umask 077`, installed 0600 per role user. They are made only
+     `openssl rand -hex 32` under `umask 077`, written 0600 by its role user into its own
+     `secrets/` (never by root). They are made only
      when missing. Studio's copy of the bridge secret is its settings file (next item). An older
      install's `home/studio/secrets/gateway-token` is no longer read or made; it is left in place
      because the previous launcher, which a rollback restores, still reads it at start.
@@ -156,10 +171,10 @@ Then:
      argv, never printed); an existing file is read as `_cortados-claw3d` and its other keys
      (Studio's own UI state: avatars, floors, desks) are kept, only `gateway` is replaced; a file
      that is not a JSON object stops the run before any change. The result is written 0600 in the
-     owner's private temp dir, staged as `_cortados-claw3d` 0600 in `stage/`, and installed by the
-     transaction (step 7) like the launchers, so a rollback restores the previous file. The state
-     dir and its `claw3d/` are `_cortados-claw3d` 0700. The run refuses if either, or the file, is
-     a symbolic link (root would write through it).
+     owner's private temp dir, staged 0600 in root's `stage/`, and installed by the transaction
+     (step 7) **as `_cortados-claw3d`**, so a rollback restores the previous file. The state dir and
+     its `claw3d/` are `_cortados-claw3d` 0700. The run stops if either, or the file, is a symbolic
+     link (an unknown layout); that check is not what keeps root safe, the user-only writes are.
 6. **Launchers and LaunchDaemons, staged.** It writes the root-owned launchers `run-bridge.sh`
    and `run-studio.sh` and the plists `com.cortados.office-{bridge,studio}.plist` into
    `/opt/cortados-office/stage/` (root, 0700), not over the live ones. The launchers set paths and
@@ -176,8 +191,11 @@ Then:
    - it repoints `node`, `adapter` and `claw3d/current` to the staged versions (`ln -sfn` to
      `<link>.new`, then `mv -fh` over the link: a rename), remembering each old target;
    - it installs the staged launchers, plists, Studio's settings file and any new office token over
-     the live ones (copy to
-     `<file>.next`, then rename), each replaced file first copied to `<file>.prev`;
+     the live ones, each replaced file first copied to `<file>.prev`. Launchers and plists (root's
+     directories): root copies to `<file>.next`, then renames. The office token and Studio's settings
+     (role users' directories): as the owning role user, from root's `stage/` on stdin into a new
+     `mktemp` file, then renamed; the `.prev` copy, its restore on a rollback and its removal at the
+     commit are done as that user too;
    - it restarts the daemons: one not loaded is bootstrapped, one loaded is booted out, waited for
      (up to 10 s), then bootstrapped again;
    - **health check**: no new attempt starts more than 60 s after the restart (an overall deadline,
@@ -190,8 +208,9 @@ Then:
      (`gateway-check.mjs`): a WebSocket to `127.0.0.1:3000/api/gateway/ws` with the `studio_access`
      cookie, then an OpenClaw `connect` without credentials; Studio's proxy injects the token from
      its settings file and forwards it, and only the bridge's `ok:true` hello passes (a missing
-     settings file fails as `studio.gateway_token_missing`, a stale token as `UNAUTHORIZED`). The access token is read as root
-     and piped to the probe's stdin (never printed, never on a command line). Any error, refusal,
+     settings file fails as `studio.gateway_token_missing`, a stale token as `UNAUTHORIZED`). The access token is read as
+     `_cortados-claw3d` (as root, a link Studio planted there would send a root-readable file to
+     Studio's own port) and piped to the probe's stdin (never printed, never on a command line). Any error, refusal,
      close or its 5 s deadline fails the check and the release rolls back. Reason: the first live
      install passed every other check while Studio refused its upstream.
 

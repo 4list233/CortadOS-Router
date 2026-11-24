@@ -260,6 +260,27 @@ serve_state() {  # tailscale-binary port target: free | ours | funnel | other; 1
   printf '%s\n' "$json" | serve_port_state "$2" "$3"
 }
 
+# Remove files that held a secret: each regular file is overwritten with zeros, then unlinked; a link
+# is unlinked (never written through); an absent path is fine. 1 if any could not be removed.
+# Reason: macOS rm -P "has no effect" (rm(1), macOS 26), so the earlier `rm -P` calls only unlinked.
+# On APFS (copy-on-write, SSD) the overwrite is best effort; what this guarantees is the unlink.
+wipe_rm() {  # path...
+  local f n rc=0
+  for f in "$@"; do
+    if [[ -L "$f" ]]; then rm -f "$f" || rc=1; continue; fi
+    if [[ -f "$f" ]]; then
+      n="$(stat -f %z "$f" 2>/dev/null)" || n=0
+      if [[ "$n" =~ ^[0-9]+$ && $n -gt 0 ]]; then
+        dd if=/dev/zero of="$f" bs="$n" count=1 conv=notrunc 2>/dev/null || rc=1
+      fi
+      rm -f "$f" || rc=1
+    elif [[ -e "$f" ]]; then
+      echo "deploy-air: $f is not a file: not removed" >&2; rc=1
+    fi
+  done
+  return $rc
+}
+
 # ---- activation transaction (deploy-air.sh steps 7-8) ---------------------------------------------
 # Everything is staged before it runs; this switches the links, promotes the staged files (launchers,
 # plists, a new office token), restarts the daemons and runs the health check. Any failure, or INT/
@@ -268,13 +289,16 @@ serve_state() {  # tailscale-binary port target: free | ours | funnel | other; 1
 # daemons that were loaded before are bootstrapped again. Only tx_commit, after the health check,
 # drops the `.prev` copies. Steps return codes and never exit, so a failure always reaches the rollback.
 #
-# The caller sets TX_LINKS ("target|link|user", user may be empty), TX_FILES ("staged|dest"),
-# TX_LABELS (daemons, in start order) and defines the primitives:
+# The caller sets TX_LINKS ("target|link|user"), TX_FILES ("staged|dest|user"), TX_LABELS (daemons,
+# in start order) and defines the primitives. USER, when set, is the role user owning the directory
+# the link or file lives in: every write there (the file, its .next and .prev, the undo, the commit's
+# removal of .prev) is done AS that user, never as root (#77 fix round 2: root must not write through
+# a path component a role user controls). Empty: root, for root-owned directories only.
 #   fs_readlink LINK      the link's target; nothing (0) when absent; 1 when it cannot be read
 #   fs_exists PATH        0 exists, 1 confirmed absent, anything else unknown (fails the step)
 #   fs_link TARGET LINK USER   atomic (rename over)           fs_rm PATH USER
-#   fs_backup DEST        copy DEST to DEST.prev, owner/mode kept
-#   fs_promote STAGED DEST     put STAGED at DEST by rename   fs_restore DEST   DEST.prev back over DEST
+#   fs_backup DEST USER   copy DEST to DEST.prev, mode kept
+#   fs_promote STAGED DEST USER   put STAGED at DEST by rename   fs_restore DEST USER   DEST.prev back over DEST
 #   daemon_loaded LABEL   0 loaded, 1 confirmed not loaded, anything else unknown
 #   daemon_start LABEL    daemon_stop LABEL (returns 1 if it does not stop)
 #   health_check          0 when the new release answers as it must
@@ -298,17 +322,17 @@ tx_link() {  # target link user
   if [[ -n "$prev" ]]; then tx_undo fs_link "$prev" "$2" "$3"; else tx_undo fs_rm "$2" "$3"; fi
   fs_link "$1" "$2" "$3"
 }
-tx_file() {  # staged dest
+tx_file() {  # staged dest user
   local e=0; fs_exists "$2" || e=$?
   if [[ $e == 0 ]]; then
-    fs_backup "$2" || return 1
-    TX_PREV+=("$2.prev"); tx_undo fs_restore "$2"
+    fs_backup "$2" "$3" || return 1
+    TX_PREV+=("$2.prev|$3"); tx_undo fs_restore "$2" "$3"
   elif [[ $e == 1 ]]; then
-    tx_undo fs_rm "$2" ""
+    tx_undo fs_rm "$2" "$3"
   else
     echo "deploy-air: cannot tell whether $2 exists" >&2; return 1
   fi
-  fs_promote "$1" "$2"
+  fs_promote "$1" "$2" "$3"
 }
 tx_restart() {  # label
   local rc=0; daemon_loaded "$1" || rc=$?
@@ -326,8 +350,8 @@ tx_activate() {
     tx_link "$t" "$l" "$u" || { echo "deploy-air: switching $l failed" >&2; return 1; }
   done
   for e in ${TX_FILES[@]+"${TX_FILES[@]}"}; do
-    IFS='|' read -r t l <<<"$e"
-    tx_file "$t" "$l" || { echo "deploy-air: installing $l failed" >&2; return 1; }
+    IFS='|' read -r t l u <<<"$e"
+    tx_file "$t" "$l" "$u" || { echo "deploy-air: installing $l failed" >&2; return 1; }
   done
   for l in ${TX_LABELS[@]+"${TX_LABELS[@]}"}; do
     tx_restart "$l" || { echo "deploy-air: (re)starting $l failed" >&2; return 1; }
@@ -356,8 +380,11 @@ tx_rollback() {  # 0 when every undo step and restart succeeded
   return $rc
 }
 tx_commit() {
-  local p
-  for p in ${TX_PREV[@]+"${TX_PREV[@]}"}; do fs_rm "$p" "" || echo "deploy-air: could not remove $p (harmless)" >&2; done
+  local e p u
+  for e in ${TX_PREV[@]+"${TX_PREV[@]}"}; do
+    IFS='|' read -r p u <<<"$e"
+    fs_rm "$p" "$u" || echo "deploy-air: could not remove $p (harmless)" >&2
+  done
   TX_UNDO=(); TX_PREV=()
 }
 # 0: activated and committed. 1: rolled back cleanly. 2: the rollback itself failed (investigate).
