@@ -8,6 +8,8 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -17,6 +19,7 @@ os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp(prefix="cortados-band-wi
 
 from cortados_router import child_tasks, core, execution_routing, session
 from cortados_router.provider import clients, routing, tasks
+from cortados_router.provider.bridge import BridgeError
 from tests.test_provider import TOKEN, EndpointHarness
 from tests.provider_fakes import setUpModule, tearDownModule  # noqa: F401  (FAKE_* reach the fake CLIs, #106)
 from tests import test_provider_codex, test_session
@@ -418,6 +421,69 @@ class ContinuationTests(unittest.TestCase):
         self.assertEqual(len(self.reg.sessions), 2)
         self.assertEqual(sorted(bool(s.route.get("pinned")) for s in self.reg.sessions.values()), [False, True])
         self.assertEqual(len(self.by_window("R2").history), 1)
+
+
+    def test_concurrent_identical_window_changes_open_one_conversation(self):
+        # Review round 4 (1ff9b69, server.py:3708), P2: two overlapping identical R2 -> R3 requests were both told Fork
+        # and each opened a backend (windows R2, R3, R3); the next retry was a terminal 400 for two live conversations.
+        # Now the second waits on the fork's join gate, looks up again and joins the first's conversation.
+        body, _ = self.opened("cortados@R2")
+        changed = dict(body, model="cortados@R3")
+        real_new, entered, release, starts, out = self.reg._new, threading.Event(), threading.Event(), [], {}
+
+        def slow_new(*a, **kw):                                          # the first R3 backend is starting
+            starts.append(1)
+            if len(starts) == 1:
+                entered.set()
+                release.wait(10)
+            return real_new(*a, **kw)
+
+        with mock.patch.object(self.reg, "_new", side_effect=slow_new):
+            a = threading.Thread(target=lambda: out.update(a=self.send_with(changed, self.IDENT)))
+            a.start()
+            self.assertTrue(entered.wait(10))
+            b = threading.Thread(target=lambda: out.update(b=self.send_with(changed, self.IDENT)))
+            b.start()
+            deadline = time.time() + 10                                  # B on A's gate (fixed) or opening (1ff9b69)
+            while not (any(g[1] == 2 for g in self.reg._rebuilding.values()) or len(starts) > 1):
+                self.assertLess(time.time(), deadline, "the second request never reached the gate")
+                time.sleep(0.01)
+            release.set()
+            a.join(30)
+            b.join(30)
+        self.assertEqual(len(starts), 1, out)                             # one R3 backend, not two
+        self.assertEqual(self.windows(), ["R2", "R3"])
+        self.assertEqual(self.routed, [R2, ("R3", "R3")])
+        self.assertEqual(self.reg._rebuilding, {})
+        served = next(r for code, r in out.values() if code == 200)
+        # Both are served: one answered, the other joined its conversation (a stale 409 when it met the finished turn on
+        # the turn lock, or the replay of that answer) ...
+        for code, r in out.values():
+            self.assertTrue((code, r) == (200, served) or code == 409, out)
+        self.assertEqual(self.ok(changed), served)                         # ... and its retry is the replay, never a 400
+        follow = dict(changed, messages=changed["messages"] + [
+            {"role": "assistant", "content": served["content"]},
+            {"role": "user", "content": [{"type": "text", "text": "and then?"}]}])
+        self.ok(follow)                                                   # the R3 conversation continues unambiguously
+        self.assertEqual(self.windows(), ["R2", "R3"])
+
+    def test_another_windows_conversation_never_hides_a_failure_or_resurrects_it(self):
+        # Review round 4 (1ff9b69, server.py:1691), P2: R3 advanced from the inherited history; R2 then failed and left
+        # its tombstone. R2's retry had its failure suppressed by R3's live session (it extends the history), was forked
+        # from R3 into a fresh R2 backend and answered 200. A failure is suppressed only by its own window's session.
+        body, _ = self.opened("cortados@R2")
+        self.ok(dict(body, model="cortados@R3"))                          # R3 advances from the inherited history
+        r2 = self.by_window("R2")
+        with mock.patch.object(r2, "run_turn", side_effect=BridgeError("codex backend: the turn failed")):
+            with self.assertLogs("cortados.provider", "WARNING"):
+                self.assertEqual(self.send_with(body, self.IDENT)[0], 502)   # R2 fails: dropped, tombstoned
+        self.assertEqual(self.windows(), ["R3"])
+        code, err = self.send_with(body, self.IDENT)                      # R2's retry
+        self.assertEqual(code, 400, err)                                  # the failure, terminal
+        self.assertIn("failed at", err["message"])
+        self.assertEqual(self.windows(), ["R3"])                          # no resurrected R2 backend
+        self.assertEqual(self.routed, [R2, ("R3", "R3")])                 # never routed again
+        self.assertEqual(len(self.by_window("R3").history), 2)           # R3 untouched
 
 
 class ForkTests(ContinuationTests):

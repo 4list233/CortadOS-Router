@@ -369,7 +369,10 @@ What runs where:
   is part of a conversation's identity: a request is matched to, retried (replayed) from or rebuilt from only a
   conversation opened under the same window (`R2` and `R2-R2` are one window; no window is its own). A request whose
   history belongs to a conversation of another window opens a new conversation under its own window, seeded with the
-  history it carries; that other conversation is untouched. This covers a forked subagent (it inherits the main loop's
+  history it carries; that other conversation is untouched. Identical requests that open such a conversation at the
+  same time open it once: the later one waits for the first and joins it (a stale 409 whose retry is the replay, as
+  for a rebuild). A failure belongs to its window too: a conversation of another window never hides it, so a
+  failed conversation's retry gets the terminal error, never a fresh backend forked from the other window. This covers a forked subagent (it inherits the main loop's
   history and session id, but sends plain `cortados`: routed in S1's band) and a main loop whose window changed (in
   Claude Code, `/model cortados@R3`): the change simply re-routes from the next turn, at the cost of the backend
   session's prompt cache. No `/clear` is needed. A `sub/` pin is outside windows: a pinned conversation continues
