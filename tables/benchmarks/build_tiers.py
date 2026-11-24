@@ -9,7 +9,9 @@ Method (all knobs live in routing-table.json → "tiering"):
     skill (code, agentic, reasoning, chat).
  3. Bands: the floor of a band is the midpoint between the abilities of the reference models of that band and the band below. The references
     are the models the 2.0 table already ruled into each band (haiku / sonnet / opus / fable class), so "R3" keeps meaning "Opus-class or better"
-    while WHICH models are Opus-class is decided by the numbers, and changes when the numbers change.
+    while WHICH models are Opus-class is decided by the numbers, and changes when the numbers change. A band's reference INDEX per use
+    case is the lowest of its references' indexes, so adding a reference can only lower a band's bar (#143: gpt-6.1-sol joined R3 so its
+    code index 66.2 is the R3 code bar, not gpt-5.6-sol's 67.0; routing-table.json `tiering._band_references` says why).
  4. Reach: a ranked family becomes candidates only through subscriptions that can actually run it (tables/inventory/*).
  Families with no public score stay unranked (never routed by this file); Cursor-branded Grok borrows plain Grok's score, flagged proxy.
  5. Local models (tables/local-models.json → index_proxies): a model on the owner's Ollama node has no published scores of its own, so each

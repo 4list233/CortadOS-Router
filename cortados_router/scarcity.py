@@ -800,6 +800,9 @@ def _anthropic_api() -> dict[str, Any]:
     used_pct, reset_at, window_s = api_credits.window_numbers(now)
     st = api_credits.state(now)
     return {"source": "self-metered (api credit grants)", "budget_usd": api_credits.budget_usd(now),
+            # #143: the dollars the window's 100 % stands for (the stop line), which core sizes the lane by when it
+            # competes as a scored candidate; None when no grant counts.
+            "stop_line_usd": (st.get("grant") or {}).get("stop_line_usd"),
             "spent_usd": round(float((st.get("grant") or {}).get("used_usd") or 0.0), 4),
             "lane_on": bool(st.get("on")), "off_reason": st.get("reason"),
             "windows": [window_view("grant", used_pct, reset_at, window_s, now)]}
@@ -1154,7 +1157,10 @@ POOL_KEY = {("claude", "week (all models)"): "claude:all", ("claude", "week (fab
 
 
 def tokens_left(lane: str, window: str, used_pct: float) -> float | None:
-    uc = unit_costs().get(POOL_KEY.get((lane.split("#", 1)[0], window), ""))   # account lanes (claude#b) share the base pool-size key
+    # account lanes (claude#b) share the base pool-size key; the window name is matched without case (#143: the usage
+    # screen says "week (Fable)", the key "week (fable)")
+    key = next((v for (l, w), v in POOL_KEY.items() if l == lane.split("#", 1)[0] and w.lower() == (window or "").lower()), "")
+    uc = unit_costs().get(key)
     return (100 - used_pct) * uc["tokens_per_pct"] if uc and uc.get("tokens_per_pct") else None
 
 

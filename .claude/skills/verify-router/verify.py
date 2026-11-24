@@ -310,13 +310,17 @@ res = {"expiring": route(), "expiring_r1": route("R1"), "outward": route("R3", o
 cbody = {"model": "cortados", "messages": [{"role": "user", "content": "rename a variable"}]}
 ok_check = lambda b, r: (True, "admitted")
 out_check = lambda b, r: (False, "outward effect (S1 outward=true): never local")
-gate = lambda **kw: routing.api_continuation_admission(cbody, {"route_id": "verify:api", "band": "R2"}, **kw)[0]
+gate = lambda bind=routing.API_BIND_REASON, **kw: routing.api_continuation_admission(
+    cbody, {"route_id": "verify:api", "band": "R2", "bind_reason": bind}, **kw)[0]
 res["cont"] = {"clean": gate(local=None, recheck=ok_check), "sensitive": gate(local="sensitive", recheck=ok_check),
                "prefer": gate(local="prefer", recheck=ok_check), "outward": gate(local=None, recheck=out_check),
-               "no_check": gate(local=None, recheck=None)}
+               "no_check": gate(local=None, recheck=None), "unbound": gate(bind="auto_route", local=None, recheck=ok_check)}
 grant(20)
 res["not_expiring"] = route()
 res["cont"]["not_expiring"] = gate(local=None, recheck=ok_check)
+# #143: a conversation the lane won as a scored candidate needs the lane on, not an expiring grant; outward still refused
+res["cont"]["scored_not_expiring"] = gate(bind=routing.API_SCORED_REASON, local=None, recheck=ok_check)
+res["cont"]["scored_outward"] = gate(bind=routing.API_SCORED_REASON, local=None, recheck=out_check)
 grant(2, amount=1)
 api_credits.reserve(0.95, time.time())       # $0.95 of a $1 grant committed: the 95 % stop line
 res["past_stop"] = route()
@@ -605,6 +609,53 @@ print(json.dumps({"degraded": bool(d.get("degraded")), "outward": out, "safe": s
 """
 
 
+# #143 (owner 2026-11-23), S1-free: the REAL core.resolve on readings written into the child's throwaway home, shaped like
+# the audit's 2026-11-23 state (Claude B-like and Codex pools forecast to lose quota at their resets, the API grant
+# unspent with 211 h left): (1) the API credit lane competes when the host lists its pairs and takes a small share, never
+# an outward request; (2) hard planning (D 7) goes to a frontier model, D 9 code requires the R4 reference; (3) R1 work
+# is split across the underused pools by conversation key, the same key always landing on the same route.
+UNDERUSE_143_SCENARIO = """
+import collections, json, time
+from cortados_router import core
+from cortados_router.provider import routing
+now = time.time()
+def w(name, used, h_left, life_h=168.0, pool="all"):
+    return {"window": name, "pool": pool, "used_pct": used, "headroom_pct": 100.0 - used, "scarcity": -1.0,
+            "elapsed_pct": round(100 * (1 - h_left / life_h), 1), "reset_epoch": now + h_left * 3600, "expiring_pct": 0}
+def lane(windows, s, **kw):
+    return {"fetched_at": now, "tried_at": now, "error": None, "windows": windows, "scarcity": s, "refusing": False,
+            "pools": {}, **kw}
+grant = w("grant", 0.0, 211.0, 720.0); del grant["pool"]
+lanes = {"claude": lane([w("week (all models)", 36.0, 31.7), w("week (Fable)", 4.0, 31.7, pool="fable")], -0.84,
+                        pools={"fable": {"scarcity": -1.0, "spent": False, "expiring_pct": 0, "tightest": {}}}),
+         "codex": lane([w("week", 18.0, 36.4)], -1.0),
+         "anthropic-api": lane([grant], -1.0, budget_usd=200.0, stop_line_usd=190.0)}
+core.STATE.mkdir(parents=True, exist_ok=True)
+json.dump({"fetched_at": now, "lanes": lanes}, open(core.STATE / "scarcity.json", "w"))
+json.dump({"pools": {"claude:all": {"tokens_per_pct": 5610803, "remaining_tokens": 359091392, "lower_bound": True},
+                     "codex:all": {"tokens_per_pct": 3882299, "remaining_tokens": 318348518, "lower_bound": True}}},
+          open(core.STATE / "unit-cost.json", "w"))
+served = routing.served_routes(core)
+api = tuple(sorted(set(served) | {("anthropic-api", m) for p, m in served if p.startswith("claude-cli")}))
+def dec(steps, amb, nov, blast, kind="code", outward=False):
+    return {"degraded": False, "answers": {"steps": steps, "ambiguity": amb, "blast_radius": blast, "context_size": 0,
+            "novelty": nov, "parallelizability": 0, "outward": outward, "work_kind": kind, "urgency": "now",
+            "needs_clarification": False, "parts": 0, "diversity": False}}
+def go(d, key=None, allowed=api):
+    r = core.resolve(d, "interactive", input_fit={"input_tokens": 40000}, allowed_routes=allowed, execution=True,
+                     accounts_aware=True, **({"split_key": key} if key else {}))
+    c = r["chosen"] or {}
+    return [c.get("lane"), c.get("model"), bool(c.get("ceiling")), r["band"], r["D"], r["required_index"]]
+light = dec(2, 1, 1, 1)
+split = collections.Counter(go(light, f"verify-{i}")[0] for i in range(300))
+same = len({tuple(go(light, "verify-7")) for _ in range(5)}) == 1
+outward_api = sum(go(dec(2, 1, 1, 1, outward=True), f"verify-o{i}")[0] == "anthropic-api" for i in range(100))
+print(json.dumps({"split": split, "same_key_same_route": same, "no_key": go(light), "outward_api": outward_api,
+                  "planning_d7": go(dec(3, 2, 2, 0, "planning"), allowed=served),
+                  "code_d9": go(dec(3, 2, 2, 2, "code"), allowed=served)}))
+"""
+
+
 # S1 busy / timeout (2026-11-22, owner-approved change to the 2026-10-26 retry rule): the router retries S1 only when it
 # was never reached. A fake S1 on a loopback port of the child answers 503 {"busy": true}, or stalls past the client
 # timeout; each must cost exactly ONE request and route degraded to a Codex lane, never Claude (core.resolve's hard
@@ -890,7 +941,7 @@ def main():
                f"degraded -> {r['degraded'][:2]} | with fallbacks -> {r['fallbacks'][:2]}")
         c = r["cont"]
         ok = c == {"clean": True, "sensitive": False, "prefer": False, "outward": False, "no_check": False,
-                   "not_expiring": False}
+                   "unbound": False, "not_expiring": False, "scored_not_expiring": True, "scored_outward": False}
         record("API credit continuations re-pass the gate before forwarding (S1-free)", "PASS" if ok else "FAIL",
                " | ".join(f"{k} -> {'forward' if v else 'refuse'}" for k, v in c.items()))
 
@@ -975,6 +1026,47 @@ def main():
                f"{rt['flag_up'][0]} | sse {r['sse']} stop {r['sse_stop']} | responses {r['responses']} | "
                f"history exact-only {r['fingerprint']} | rebuild replays as sent {r['rebuild']} | notice-only distinct "
                f"{r['distinct']} | \"{r['text']}\"")
+
+    p = runner.run(["-c", UNDERUSE_143_SCENARIO], prefix="verify-router-underuse-", timeout=300)
+    try:
+        r = _last_json(p)
+    except (ValueError, IndexError):
+        record("#143 underused pools split, API lane competes, frontier for hard work (S1-free)", "FAIL",
+               (p.stderr or p.stdout).strip()[-300:])
+    else:
+        sp = r["split"]
+        ok = (sp.get("codex", 0) > 0 and sp.get("claude", 0) > 0 and 0 < sp.get("anthropic-api", 0) < 60
+              and r["same_key_same_route"] and r["outward_api"] == 0 and r["planning_d7"][2] is True
+              and r["code_d9"][2] is True and r["code_d9"][5] >= 78.5)
+        record("#143 underused pools split, API lane competes, frontier for hard work (S1-free)", "PASS" if ok else "FAIL",
+               f"R1 split over 300 keys {dict(sp)} | same key same route {r['same_key_same_route']} | no key (the "
+               f"cheapest; the provider always passes one) -> {r['no_key'][:2]} | outward on the API {r['outward_api']}/100 | planning D7 -> {r['planning_d7'][:3]} | "
+               f"code D9 -> {r['code_d9'][:3]} needs {r['code_d9'][5]}")
+
+    # #143 through S1: whatever S1 answers for a hard design request, a frontier model takes it whenever ceiling_work
+    # applies to S1's work_kind and D (planning/research D>=7, code D>=9); BLOCKED while S1 is down.
+    if up:
+        code, j, tail = decide("design the architecture for a new multi-region replication layer: weigh three consistency "
+                               "models, plan the migration of the existing data and its failure modes, and recommend one")
+        if j is None:
+            record("hard planning/research/code reaches a frontier model (S1)", "FAIL", tail)
+        elif (j.get("decision") or {}).get("degraded"):
+            record("hard planning/research/code reaches a frontier model (S1)", "BLOCKED",
+                   f"S1 listening at {s1_where} but the decision is degraded")
+        else:
+            route = j["route"]
+            cw = json.loads((REPO / "tables/routing-table.json").read_text())["selection"]["ceiling_work"]
+            kind, D = (route.get("answers") or {}).get("work_kind"), route.get("D")
+            applies = kind in cw["use_cases"] and D is not None and D >= int(
+                (cw.get("min_D_by_use_case") or {}).get(kind, cw["min_D"]))
+            frontier = bool((route.get("chosen") or {}).get("ceiling"))
+            record("hard planning/research/code reaches a frontier model (S1)",
+                   ("PASS" if frontier else "FAIL") if applies else "PASS",
+                   f"work_kind={kind} D={D} band={route.get('band')} -> {(route.get('chosen') or {}).get('lane')}/"
+                   f"{(route.get('chosen') or {}).get('model')} frontier={frontier}"
+                   + ("" if applies else " (ceiling_work not triggered by these answers: nothing to require)"))
+    else:
+        record("hard planning/research/code reaches a frontier model (S1)", "BLOCKED", unreachable)
 
     p = runner.run(["-c", CONTINUATION_SCENARIO], prefix="verify-router-continuation-", timeout=300)
     try:

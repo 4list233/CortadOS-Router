@@ -1,8 +1,8 @@
 {
  "_doc": "MUTABLE routing table for Cortados. Edit freely: the router reloads this file when its mtime changes, no restart. Models, lanes and order WILL change; the six features and the band conditions come from the 2.0 scale (scale-2.0-reference.json). Validation on load: unknown lane/provider, a Fable/ceiling entry outside R4, or a non-Grok model on the cursor lane = file rejected, last good table kept.",
- "version": 20,
- "updated": "2026-11-22",
- "updated_by": "claude (owner decisions 2026-11-22, #132: switching margin, pool-size prior for lower-bound learned sizes, underuse credit and ceiling_underuse ranked by the share lost at reset, batch workload hint; candidates unchanged)",
+ "version": 21,
+ "updated": "2026-11-24",
+ "updated_by": "claude (owner decisions 2026-11-23, #143: API credit lane competes as a scored candidate, R4/best knots at D 9/10, ceiling_underuse from D 8, ceiling_work requires a frontier model for hard planning/research/code, Fable pool size from the all-models week, Sol 6.1 an R3 reference, underused pools split in proportion to the quota each would lose; candidates unchanged)",
  "features": [
   "steps",
   "ambiguity",
@@ -554,13 +554,15 @@
    ],
    "R3": [
     "claude-opus-5",
-    "gpt-5.6-sol"
+    "gpt-5.6-sol",
+    "gpt-6.1-sol"
    ],
    "R4": [
     "claude-fable-5-1",
     "gpt-6-astra"
    ]
   },
+  "_band_references": "A band's reference index per use case is the LOWER of its reference models' indexes (build_tiers.py refs_index); its tier floor is the lowest reference ability. R3 + gpt-6.1-sol (owner 2026-11-23, #143): the R3 code reference was 67.0, exactly gpt-5.6-sol's code index, so gpt-6.1-sol (66.2 code, $4/1M against $8, 90.1 general against 79.6) missed R3 code by 0.8 and R3 code paid for the older, twice-as-expensive model. 0.8 points is inside the fit's noise (a ridge-shrunk logit fit, rounded to 0.1, with community nudges of several points). Adding gpt-6.1-sol changes only the R3 code reference (67.0 -> 66.2): it is above the other references on every other use case, and its overall ability is above gpt-5.6-sol's, so the R3 tier floor (the lowest reference ability) is unchanged.",
   "ridge": 1.5,
   "min_benchmarks": 3,
   "max_candidates_per_band": 6,
@@ -580,18 +582,19 @@
     "ref": "R2"
    },
    {
-    "D": 9,
+    "D": 8,
     "ref": "R3"
    },
    {
-    "D": 11,
+    "D": 9,
     "ref": "R4"
    },
    {
-    "D": 12,
+    "D": 10,
     "ref": "best"
    }
   ],
+  "_knots": "#143 (owner 2026-11-23): S1 compresses the top of the scale (it never answered 3 on ambiguity, novelty or blast radius in a week of 3,044 code and planning calls), so D was at most 9, or 10 with the outward floor, and the old R4 (D 11) and best (D 12) knots never fired. R4 now at D 9 and best at D 10, where S1's hardest answers land; R3 moves to D 8 because knots must rise strictly. D 8 now requires the R3 reference (was two thirds of the way from R2 to R3): that is the Opus-class bar gpt-6.1-sol clears on every use case.",
   "scarcity_points": 30,
   "lane_tiebreak": [
    "local",
@@ -614,28 +617,50 @@
    "_doc": "Forest 2026-09-23: native subscription first; Cursor and Antigravity's Claude/GPT pool are secondary for these vendors' models and only qualify when the native pool is spent (ok=False). Cursor is primary for Grok, Composer, Kimi, GLM, Muse and anything without a native lane here."
   },
   "ceiling_by_score": true,
-  "_ceiling": "Forest 2026-09-23: Fable 5.1 and GPT-6 Astra WIN BY SCORE (supersedes G112 escalation-only). The requirement reaches their index at D≥11 (a hard, high-novelty, high-ambiguity task) and any use case where only they clear the bar; their price ($20/1M Fable) keeps them off easy work. Thinking/strategy work: see the specialization file (tables/community-sentiment.json) once the nightly rating exists.",
+  "_ceiling": "Forest 2026-09-23: Fable 5.1 and GPT-6 Astra WIN BY SCORE (supersedes G112 escalation-only). The requirement reaches their index at D≥9 (#143: was D≥11, which S1 never produced; a hard, high-novelty, high-ambiguity task) and any use case where only they clear the bar; their price ($20/1M Fable) keeps them off easy work. Thinking/strategy work: see the specialization file (tables/community-sentiment.json) once the nightly rating exists.",
   "sticky_slack_points": 15,
   "_sticky": "a session keeps its model only while that model is within sticky_slack_points of the cheapest qualifying route; scarcity or price changes move it. Browser/desktop sessions are pinned (budgets.json stickiness) until their pool is spent.",
   "ceiling_work": {
    "use_cases": [
     "planning",
-    "research"
+    "research",
+    "code"
    ],
    "min_D": 7,
+   "min_D_by_use_case": {
+    "code": 9
+   },
    "require": "R4",
+   "require_frontier": true,
+   "_frontier": "#143 (owner 2026-11-23): the R4 reference index alone did not keep this work on the frontier: gpt-6.1-sol clears it for planning (88.8 >= 87.4) and research (92.9 >= 85.9), so frontier models won 0 of 515 such calls in a week. require_frontier: only ceiling models (model-scores `ceiling`: Opus 5.5, Fable 5.1, Astra) qualify for it while one is available; when every frontier route is spent or refused, the index rule alone applies again (a spent frontier never blocks routing). Code joins at D >= 9 (min_D_by_use_case), not 7: D 8 code is mostly the outward floor's routine edit-and-push work (951 of 1,516 R3 calls in the audit week reached R3 only through that floor).",
    "_doc": "Forest 2026-09-25: Fable and Astra are what the expensive subscriptions are FOR: strategic decisions and insight. Planning and research work of at least moderate difficulty (D ≥ 5) requires the R4 reference index for that use case, so only the ceiling models clear it (Astra 100/100 on planning/research, Fable 91/90). min_D 7 (Forest 2026-09-29): an outward turn already carries blast_radius 3, so D ≥ 5 caught ordinary replies tagged planning; real strategic asks (ambiguity/novelty) clear 7. Everything else keeps the price ladder, where open and mid models take what they can. Their pools' underuse credit then decides how much of the rest they attract."
   },
   "ceiling_underuse": {
    "attract_when_scarcity_below": -0.3,
-   "min_D": 9,
-   "_doc": "when a ceiling model's own pool is underused (scarcity ≤ −0.3: the allowance would otherwise expire unused), it also takes any R3-level task (D ≥ min_D) in every use case: paid-for capacity is used, not lost. Several underused ceiling pools: the one expected to lose the largest share at its reset wins (#132, owner 2026-11-22: rule kept, ranking by loss at reset), cost breaks ties; when any of them has no reset time, the cheapest (the earlier ranking)."
+   "min_D": 8,
+   "_doc": "when a ceiling model's own pool is underused (scarcity ≤ −0.3: the allowance would otherwise expire unused), it also takes any R3-level task (D ≥ min_D) in every use case: paid-for capacity is used, not lost. Several underused ceiling pools: the one expected to lose the largest share at its reset wins (#132, owner 2026-11-22: rule kept, ranking by loss at reset), cost breaks ties; when any of them has no reset time, the cheapest (the earlier ranking). #143 (owner 2026-11-23): min_D 9 -> 8, because S1's compressed top puts most hard work at D 8-9; and with a conversation key (underuse_split) the spare ceiling pools share the work in proportion to the quota each would lose instead of the top one taking all of it. Routes failing the host's admission check (hold_ok: the client's quota floor) are never taken by this rule."
+  },
+  "underuse_split": {
+   "enabled": true,
+   "min_loss_pct": 5,
+   "_doc": "#143 (owner 2026-11-23): among underused pools, selection was winner-takes-all: whichever pool had the largest underuse credit took every qualifying call until the readings moved (a 400-call sample of the audit week went 400/0 to Codex while Claude B was forecast to lose about half its week). When the cheapest qualifying route is on a pool expected to lose quota at its reset, every underused pool with a qualifying route takes part: each pool's cheapest qualifying route, weighted by the quota that pool is expected to lose (expected loss % × its capacity in tokens, core._expected_lost_tokens), and one is picked by a deterministic hash of the conversation key (core.split_pick), so a conversation always lands on the same pool for the same readings and a re-routed conversation does not flap. Pools are grouped by the window that binds them (Fable on account B shares B's all-models week with Opus on B, so B's lost quota is counted once). Takes part only: available, qualifying (index >= the requirement, and a frontier model where ceiling_work requires one), passing the host's admission check (hold_ok: the client's quota floor), with a known pool size, and expected to lose at least min_loss_pct % (a pool about to be used up is not fed work it cannot absorb). A split decision is final for the switching margin: the margin exists for cost noise, and a split picks by the conversation key on purpose. No conversation key (core.decide, Hermes without a session) -> the cheapest, as before."
+  },
+  "api_credit_lane": {
+   "max_blast_radius": 1,
+   "_doc": "#143 (owner 2026-11-23): the anthropic-api credit lane (#114) is a scored candidate for normal work whenever its grant has budget left above the stop line; the provider (provider/routing.py api_lane_pairs) offers its Claude models only to a request every sensitivity detector cleared, with no x-cortados-local header, on /v1/messages, whose upper-bound cost fits under the stop line, so the lane never takes sensitive or local-only work (owner 2026-11-14). Here core refuses it for a degraded scorer (a degraded scorer never defaults to Claude), an outward effect, or S1's blast radius above max_blast_radius: the continuation gate re-checks every later turn with that same rule (no outward effect, blast radius 0-1: routing.local_admission, #114), so a conversation it could not continue is never opened on it. Its weight is 'free until the grant lapses': its burn (model $ per token ÷ the grant's dollars per %) times the share of the grant NOT expected to lapse, (1 − expected loss), so while the forecast says the grant would lapse unspent its dollars cost nothing, and the cost falls as expiry nears with credit left. The burn of this pool is never the weights' normalising reference (a $190 pool would otherwise dwarf every subscription's weight)."
   },
   "switch_margin_points": 3,
   "_switch_margin": "#132 (owner 2026-11-22): a 1–3 point cost difference is noise from the latest usage reading (R2 flipped between Opus on account B and Sol call by call). The client's previous route in the same band stays first while it qualifies, is available and costs at most this many points more than the cheapest; otherwise the cheapest stands. Held only when the host's admission check (hold_ok: the provider's client floor) passes too. The host keeps the previous route per client (provider/routing.py remember_route). 0 turns it off.",
   "pool_size_prior_tokens_per_pct": {
    "codex:all": 5630000
   },
+  "pool_size_from_pool": {
+   "claude:fable": {
+    "of": "all",
+    "ratio": 0.5
+   }
+  },
+  "_pool_size_from_pool": "#143 (owner 2026-11-23): Fable had no pool size (unitcost.py's window map said 'week (fable)' while the usage screen says 'week (Fable)', so claude:fable was never learned) and fell back to a price-only weight of 177.8 with no capacity credit. Does Fable use also draw on the all-models week? The audit's scarcity history says yes: every Fable-week move of 3 points or more (25 of them) came with an all-models move of about half its size (sum 330 Fable points against 210 all-models points in the same intervals), while the all-models week moved without the Fable week in 242 intervals (270 points). So Fable draws both weeks, other models only the all-models week, and 1 % of the Fable week is about 0.5 % of the all-models week. A Fable route is therefore sized by the window that binds it (core._pool_size, the same min-headroom rule as _min_headroom_pct and _expected_loss_pct): the account's all-models week while that has less headroom (true on both accounts today), else its Fable week. The Fable week's size is the learned claude:fable when it is not a lower bound below this estimate, else ratio × the same account's all-models size (0.5, from the history above).",
   "_pool_size_prior": "#132 (owner 2026-11-22): unitcost.py learns tokens per 1 % from the provider's own ledger only, so direct use of the same login moves the % without adding tokens and the learned size is a LOWER BOUND (lower_bound=true). On 2026-11-22 that made Codex look like 2.67 M tokens/% against 5.44 M (Claude A) and 4.95 M (Claude B), although Codex's allowance is believed to be several times Claude's. A lower-bound learned size below this prior is raised to it; a learned size above it, or one not flagged as a lower bound, stands. codex:all = 5.63 M: the 563 M tokens/week Codex estimate recorded with the burn weight (core.resolve, Forest 2026-09-29), deliberately not the full ~10× ratio, so it only corrects the undercount and is no Codex preference. Keyed by the vendor's base pool (applies to every account of it).",
   "capacity_credit_points": 20,
   "_capacity": "Forest 2026-09-26: subscriptions are not normalised (Codex > Claude > Gemini > Cursor in absolute allowance). unitcost.py learns tokens-per-percent per pool from our own samples and ledger; among pools with room (scarcity ≤ 0), the route on the pool with the most tokens left gets up to capacity_credit_points off. Re-learned every 6 h and nightly.",

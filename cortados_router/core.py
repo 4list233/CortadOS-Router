@@ -333,13 +333,16 @@ def required_index(t: dict[str, Any], ms: dict[str, Any], use_case: str, D: int 
         return 0.0                                        # reflex: anything qualifies, the cheapest route wins (normally local)
     floor = val(band) if band in refs and band != "R4" else 0.0
     cw = (t.get("selection") or {}).get("ceiling_work") or {}
-    if by_score and use_case in (cw.get("use_cases") or []) and D is not None and D >= int(cw.get("min_D", 5)):
+    if by_score and ceiling_work_applies(cw, use_case, D):
         floor = max(floor, val(cw.get("require", "R4")))  # insight work goes to the frontier (Forest 2026-09-25)
     return round(min(max(req, floor), best), 1)
 
 
-def scored_candidates(t: dict[str, Any], band: str, use_case: str | None, accounts_aware: bool = False) -> list[dict[str, Any]] | None:
-    """Every reachable model × every subscription that can run it, with its index for this use case. No band lists."""
+def scored_candidates(t: dict[str, Any], band: str, use_case: str | None, accounts_aware: bool = False,
+                      api_lane: bool = False) -> list[dict[str, Any]] | None:
+    """Every reachable model × every subscription that can run it, with its index for this use case. No band lists.
+    `api_lane` (#143): also each Claude model on the API credit lane (API_LANE), offered only when the host lists its
+    pairs in allowed_routes (resolve decides; provider/routing.api_lane_pairs chooses which models)."""
     ms = model_scores()
     if (t.get("tiering") or {}).get("mode") != "scores" or not ms:
         return None
@@ -353,6 +356,11 @@ def scored_candidates(t: dict[str, Any], band: str, use_case: str | None, accoun
                 continue
             out.append({"lane": r["lane"], "provider": r["provider"], "model": r["model"], "family": m["family"], "index": m["index"].get(u, m["index"]["general"]),
                         "general": m["index"]["general"], "price": m.get("price_1m_blended_usd"), "tokens_per_s": m.get("tokens_per_s"), "ceiling": m["ceiling"], "use_case": u, "tier": "scored", **({"pool": r["pool"]} if r.get("pool") else {}), **({"proxy": True} if m.get("proxy") else {})})
+    if api_lane:
+        # The same Claude models on Anthropic's pay-per-use API, spending only promotional credit (#114). One pool (the
+        # grant's dollars), no accounts, no separately metered Fable week: so no `pool` and never account-expanded.
+        out += [dict(c, lane=API_LANE, provider=API_LANE) for c in out
+                if c["lane"] == "claude" and c["provider"] == "claude-cli"]
     # One candidate per configured Claude account (Option A, lane-per-account); single default login leaves this unchanged.
     return _expand_claude_accounts(out, accounts_aware) or None
 
@@ -495,6 +503,51 @@ def _pool_size_priors() -> dict[str, float]:
         return {}
 
 
+def _pool_size_derivations() -> dict[str, dict[str, Any]]:
+    """selection.pool_size_from_pool: per base pool key, {"of": <pool of the same lane>, "ratio": r} for a pool that
+    ALSO draws on `of` (#143: Fable draws on the all-models week too; tables/routing-table.json `_pool_size_from_pool`
+    has the evidence). Bad entries are ignored."""
+    try:
+        raw = (table().get("selection") or {}).get("pool_size_from_pool") or {}
+        return {k: {"of": str(v["of"]), "ratio": float(v["ratio"])} for k, v in raw.items()
+                if not k.startswith("_") and isinstance(v, dict) and isinstance(v.get("of"), str)
+                and isinstance(v.get("ratio"), (int, float)) and not isinstance(v.get("ratio"), bool) and v["ratio"] > 0}
+    except Exception:
+        return {}
+
+
+def _binding_pool(reading: dict[str, Any], pool: str, of: str) -> str:
+    """Of two pools a route draws on at once, the one whose windows leave it less headroom (`of` on a tie or when
+    `pool` has no window in the reading): the same "as scarce as the tightest window" rule as _min_headroom_pct."""
+    def least(p: str) -> float | None:
+        return min((float(w["headroom_pct"]) for w in (reading.get("windows") or [])
+                    if isinstance(w, dict) and w.get("pool", "all") == p and w.get("headroom_pct") is not None),
+                   default=None)
+    h_pool, h_of = least(pool), least(of)
+    if h_pool is None or (h_of is not None and h_of <= h_pool):
+        return of
+    return pool
+
+
+API_LANE = "anthropic-api"   # #114 / #143: the pay-per-use Anthropic API lane, spending only promotional credit
+
+
+def _api_pool_size(c: dict[str, Any], reading: dict[str, Any]) -> dict[str, Any]:
+    """#143: the API credit lane's size as _pool_size gives it, in tokens of THIS model per 1 % of the grant. The
+    reading's 100 % is the stop line (api_credits.window_numbers), so 1 % = the stop line's dollars / 100, bought at the
+    model's blended $/1M (the same price the subscription burn uses). The stop line is the reading's own
+    `stop_line_usd`; a reading written before it carried one gives only the grant total, so the module's default stop
+    fraction applies to it. No price or no budget: size unknown (None), like any unlearned pool."""
+    from cortados_router import api_credits
+    stop = reading.get("stop_line_usd")
+    if stop is None and reading.get("budget_usd") is not None:
+        stop = float(reading["budget_usd"]) * api_credits.STOP_FRACTION
+    price = c.get("price")
+    tpp = (float(stop) / 100.0) / (float(price) / 1e6) if stop and price else None
+    return {"tpp": tpp, "learned": None, "rec": {}, "own": True, "floored": False, "reading": reading, "pool": "all",
+            "api": True}
+
+
 def _pool_size(c: dict[str, Any]) -> dict[str, Any]:
     """The learned size of the pool this route draws on, from unit-cost.json:
       tpp      tokens per 1 % of the pool's window, after the prior (None if unknown);
@@ -503,17 +556,34 @@ def _pool_size(c: dict[str, Any]) -> dict[str, Any]:
       floored  the learned value was a lower bound below the table's prior, so the prior was used.
     A learned value flagged `lower_bound` (unitcost.py: the ledger sees only provider-routed tokens, so direct use of
     the same login moves the % without adding tokens) never makes a pool look smaller than its prior; a value that is
-    not a lower bound, or a pool with no learned value, is left as learned (no prior is invented for an unknown pool)."""
+    not a lower bound, or a pool with no learned value, is left as learned (no prior is invented for an unknown pool).
+    #143: a pool that also draws on another pool of its lane (selection.pool_size_from_pool: Fable also draws on the
+    all-models week) is sized by whichever of the two binds it (_binding_pool), with `bound_by` naming it; when its own
+    window binds, a missing or lower-bound learned size is raised to ratio × the other pool's size. The API credit lane
+    is sized in dollars (_api_pool_size)."""
     sc = _scarcity_module()
     lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
+    if _base_lane(c["lane"]) == API_LANE:
+        return _api_pool_size(c, lane)
     pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
     own, base = _pool_keys(c["lane"], pool)
+    derived = _pool_size_derivations().get(base or "") if pool != "all" else None
+    if derived and pool != derived["of"] and _binding_pool(lane, pool, derived["of"]) == derived["of"]:
+        return {**_pool_size({**c, "pool": derived["of"]}), "pool": pool, "bound_by": derived["of"]}
     ucs = sc.unit_costs() or {}
     rec, is_own = ucs.get(own or "") or {}, True
     if not rec.get("tokens_per_pct") and base != own:
         rec, is_own = ucs.get(base or "") or {}, False             # the sibling's own pool is not learned yet: the vendor's size
     tpp = float(rec["tokens_per_pct"]) if rec.get("tokens_per_pct") else None
     prior = _pool_size_priors().get(base or "")
+    if derived and pool != derived["of"]:
+        of_size = _pool_size({**c, "pool": derived["of"]})["tpp"]
+        estimate = derived["ratio"] * of_size if of_size else None
+        if estimate and (tpp is None or (rec.get("lower_bound") and estimate > tpp)):
+            prior = max(prior or 0.0, estimate)
+            if tpp is None:                                         # nothing learned: the estimate is the size
+                return {"tpp": estimate, "learned": None, "rec": rec, "own": is_own, "floored": True,
+                        "reading": lane, "pool": pool}
     floored = bool(tpp is not None and rec.get("lower_bound") and prior and prior > tpp)
     return {"tpp": prior if floored else tpp, "learned": tpp, "rec": rec, "own": is_own, "floored": floored,
             "reading": lane, "pool": pool}
@@ -536,6 +606,11 @@ def _tokens_left_for(c: dict[str, Any]) -> float | None:
         lane, rec, tpp = ps["reading"], ps["rec"], ps["tpp"]
         if _reading_for_other_login(lane, c):
             return None                                              # cached reading is for a different login (reorder or default<->named): no capacity credit
+        if ps.get("api") or (ps["floored"] and ps["learned"] is None):
+            # #143: a size that is not learned from this pool's own record (the API grant's dollars, or a Fable week
+            # estimated from the all-models week): its room is that size times the window headroom it reads now.
+            headroom = _min_headroom_pct(lane, ps["pool"])
+            return float(tpp) * float(headroom) if tpp and headroom is not None else None
         if ps["own"] and rec.get("remaining_tokens"):
             # this lane's own learned remaining (scaled up when the size was floored by the prior: same % left, bigger pool)
             scale = (tpp / ps["learned"]) if ps["floored"] and ps["learned"] else 1.0
@@ -810,6 +885,90 @@ def static_scarcity_rank(h: dict[str, Any], demote: float, expiring: float) -> t
     return (0 if exp >= expiring and sc < demote else 1, 1 if sc >= demote else 0)
 
 
+def ceiling_work_applies(cw: dict[str, Any], use_case: str | None, D: int | None) -> bool:
+    """selection.ceiling_work holds for this use case at this difficulty: the use case is listed and D reaches its
+    min_D (min_D_by_use_case for that use case, else min_D; #143 adds code at D >= 9)."""
+    if D is None or use_case not in (cw.get("use_cases") or []):
+        return False
+    by_uc = cw.get("min_D_by_use_case") if isinstance(cw.get("min_D_by_use_case"), dict) else {}
+    return D >= int(by_uc.get(use_case, cw.get("min_D", 5)))
+
+
+def api_lane_refusal(decision: dict[str, Any], cfg: dict[str, Any]) -> str | None:
+    """Why the API credit lane may not open this conversation (#143), or None. The continuation gate re-checks every
+    later turn with routing.local_admission (no outward effect, blast radius 0-1, scorer not degraded, #114), so the
+    opening is held to the same rule: a conversation is never opened where its next turn would be refused. Judged on
+    S1's raw answers (not resolve's outward floor), exact types only, as local_admission does."""
+    if decision.get("degraded") is not False or not isinstance(decision.get("answers"), dict):
+        return "API credit lane: a degraded scorer never defaults to Claude"
+    ans = decision["answers"]
+    if ans.get("outward") is not False:
+        return "API credit lane: never for an outward effect"
+    br, most = ans.get("blast_radius"), int(cfg.get("max_blast_radius", 1))
+    if type(br) is not int or not 0 <= br <= most:
+        return f"API credit lane: blast radius above {most} (its continuations would be refused)"
+    return None
+
+
+def split_pick(key: str, weights: list[tuple[str, float]]) -> str | None:
+    """#143: one of `weights`' keys, chosen with probability proportional to its weight by a hash of `key` alone, so the
+    same conversation key always gets the same answer for the same weights, and a small change of the weights moves only
+    the keys that sit near a boundary. Deterministic (sha256, groups in sorted order); None when no weight is positive."""
+    import hashlib
+    live = sorted((k, float(w)) for k, w in weights if w and w > 0)
+    total = sum(w for _, w in live)
+    if not live or total <= 0:
+        return None
+    u = int.from_bytes(hashlib.sha256(str(key).encode()).digest()[:8], "big") / 2.0 ** 64
+    acc = 0.0
+    for k, w in live:
+        acc += w / total
+        if u < acc:
+            return k
+    return live[-1][0]
+
+
+def _quota_group(c: dict[str, Any]) -> str:
+    """The quota a route spends, for the underuse split: its lane and the pool that binds it (Fable on account B is
+    bound by B's all-models week today, so it is the same quota as Opus on B and is counted once)."""
+    try:
+        ps = _pool_size(c)
+        return f"{c['lane']}:{ps.get('bound_by') or ps.get('pool') or 'all'}"
+    except Exception:
+        return f"{c['lane']}:{c.get('pool') or 'all'}"
+
+
+def _expected_lost_tokens(c: dict[str, Any]) -> float | None:
+    """Tokens of this route's quota expected to be lost at its reset: expected loss % × the pool's size per %. None
+    when either is unknown (such a pool cannot be weighed against the others)."""
+    loss, tpp = c.get("expected_loss_pct"), _pool_tokens_per_pct(c)
+    return float(loss) * float(tpp) if loss is not None and tpp else None
+
+
+def underuse_split(cands: list[dict[str, Any]], key: str, eligible: Callable[[dict[str, Any]], bool],
+                   min_loss_pct: float) -> tuple[dict[str, Any], dict[str, float]] | None:
+    """#143: (the route picked for this conversation, {quota group: expected lost tokens}) when at least two underused
+    quota groups take part, else None. `cands` is in preference order (cheapest first); each group is represented by
+    its first eligible route, weighted by the quota it is expected to lose at its reset (_expected_lost_tokens). A
+    group takes part only when its route is `eligible`, expected to lose at least `min_loss_pct` % and of known size."""
+    best: dict[str, dict[str, Any]] = {}
+    lost: dict[str, float] = {}
+    for c in cands:
+        if not eligible(c) or c.get("expected_loss_pct") is None or float(c["expected_loss_pct"]) < min_loss_pct:
+            continue
+        g = _quota_group(c)
+        if g in best:
+            continue
+        tokens = _expected_lost_tokens(c)
+        if not tokens:
+            continue
+        best[g], lost[g] = c, tokens
+    if len(best) < 2:
+        return None
+    g = split_pick(key, list(lost.items()))
+    return (best[g], lost) if g else None
+
+
 def band_max_D(t: dict[str, Any], band: str) -> int | None:
     """The highest difficulty a band admits: its own `when` (an `all` holding {"lte": ["D", n]}), else the D of the
     selection knot whose reference is that band; None when the table says neither."""
@@ -825,14 +984,17 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             allowed_routes: tuple[tuple[str, str], ...] | None = None,
             execution: bool = False, minimum_band: str | None = None, accounts_aware: bool = False,
             maximum_band: str | None = None, previous: dict[str, Any] | None = None,
-            hold_ok: Callable[[dict[str, Any]], bool] | None = None) -> dict[str, Any]:
+            hold_ok: Callable[[dict[str, Any]], bool] | None = None, split_key: str | None = None) -> dict[str, Any]:
     """`maximum_band` (a client's workload hint, e.g. batch → R1) caps the band from above, mirroring `minimum_band`,
     and caps the difficulty the requirement is computed from at the most that band admits (band_max_D); the hard rules
     still win: a request whose blast radius is 3 (an outward effect is floored there) keeps its band and difficulty,
     and a `minimum_band` that raises the band above the cap undoes it. `previous` maps band → {"lane", "model"} of the
     client's previous route in that band, held under selection.switch_margin_points. `hold_ok` is the host's own
     admission check (e.g. the provider's quota floor): the margin holds a previous route only when it passes, so
-    stickiness never picks a route the host would then refuse."""
+    stickiness never picks a route the host would then refuse; the underuse split and ceiling_underuse never take a
+    route that fails it either (#143). `split_key` (the conversation's id, #143) seeds selection.underuse_split; None
+    keeps the cheapest route. An API credit lane pair in `allowed_routes` (the host opting in, #143) adds that lane's
+    Claude candidates (scored_candidates api_lane)."""
     t = table()
     rules: list[str] = []
     if decision["degraded"] or not decision["answers"]:
@@ -890,7 +1052,10 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
     health, pol = lane_health(), _policy()
     demote, expiring = static_thresholds(pol)
     pref = (t.get("work_kind_preference") or {}).get(ans.get("work_kind") or "", [])
-    scored = scored_candidates(t, band, ans.get("work_kind"), accounts_aware)
+    # #143: the API credit lane is offered only by a host that lists its pairs (it must be able to run and meter it).
+    api_lane = isinstance(allowed_routes, tuple) and any(isinstance(p, tuple) and p[:1] == (API_LANE,)
+                                                         for p in allowed_routes)
+    scored = scored_candidates(t, band, ans.get("work_kind"), accounts_aware, **({"api_lane": True} if api_lane else {}))
     # The static band list carries no account metadata; expand it too, so a missing/unreadable score catalog still binds
     # the routed Claude account (identity is never lost on the fallback path).
     cands = scored if scored else _expand_claude_accounts([dict(c) for c in t["candidates"].get(band, [])], accounts_aware)
@@ -931,6 +1096,12 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
         req = required_index(t, model_scores(), scored[0]["use_case"], D, band)
         rules.append(f"needs index ≥ {req} for {scored[0]['use_case']} (D={D}, {band}); {sum(c['index'] >= req for c in scored)} of {len(scored)} reachable model routes qualify")
     ch_of = {id(c): candidate_health(c, health) for c in cands}
+    api_cfg = (t.get("selection") or {}).get("api_credit_lane") or {}
+    for c in cands:
+        if c["lane"] == API_LANE:
+            why = api_lane_refusal(decision, api_cfg)
+            if why:
+                ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": why}
     # Fit is a hard eligibility gate, before quality fallback or scarcity ranks
     # candidates, including unscored/degraded selection. Never rescue a route
     # which would lose input just because every candidate failed the gate.
@@ -988,10 +1159,15 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             # consumes. Pools differ ~10× in size (Claude ≈ 53 M of our tokens per week, Codex ≈ 563 M), so weight = model price ÷ pool size,
             # normalised so the heaviest candidate = 100. Price alone (the old weight) is used only for pools whose size is not yet learned.
             c["burn"] = (c["price"] / (_pool_tokens_per_pct(c) / 1e6)) if c.get("price") and _pool_tokens_per_pct(c) else None
-        burn_ref = max([x["burn"] for x in cands if x.get("burn")] + [0.0])
+        # #143: the API credit lane's burn is never the normalising reference: its pool is a $190 grant, ~20× smaller
+        # than a subscription week in tokens, so it would shrink every subscription's weight; its own weight is capped
+        # at 100 (the heaviest subscription route) before its use-it-or-lose-it discount below.
+        burn_ref = max([x["burn"] for x in cands if x.get("burn") and x["lane"] != API_LANE] + [0.0])
         price_ref = max([x["price"] for x in cands if x.get("price") and not x.get("ceiling")] + [1.0])
         for c in cands:
-            if c.get("burn") is not None and burn_ref:
+            if c.get("burn") is not None and burn_ref and c["lane"] == API_LANE:
+                c["weight"] = round(min(100.0, 100.0 * c["burn"] / burn_ref), 1)
+            elif c.get("burn") is not None and burn_ref:
                 c["weight"] = round(100.0 * c["burn"] / burn_ref, 1)
             else:
                 c["weight"] = round(100.0 * c["price"] / price_ref, 1) if c.get("price") else (0.0 if c["lane"] == "local" else c["general"])
@@ -1011,6 +1187,12 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             loss = _expected_loss_pct(c) if sc < 0 and ch_of[id(c)].get("scarcity") is not None else None
             if loss is not None:
                 c["expected_loss_pct"] = loss
+            if c["lane"] == API_LANE and loss is not None:
+                # #143 (owner 2026-11-23): the grant's dollars are "free until the grant lapses". Only the share of
+                # this spend the grant would NOT otherwise lose costs anything, so the weight is scaled by
+                # (1 − expected loss): ~0 while the forecast says most of the grant lapses unspent, rising as it is
+                # spent faster, falling again as the expiry nears with credit left. Unknown loss: no discount.
+                c["weight"] = round(c["weight"] * (1.0 - min(100.0, max(0.0, float(loss))) / 100.0), 1)
             under = loss / 100.0 if loss is not None else max(-sc, 0.0)
             c["cost"] = round(c["weight"] + sel.get("scarcity_points", 30) * max(sc, 0.0)
                               - sel.get("expiring_credit_points", 80) * under - expiring_soon, 1)
@@ -1036,7 +1218,8 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
         # Compare the base lane so a second same-vendor account (claude#b) is NOT treated as a cross-vendor secondary of claude.
         for c in cands:
             native = native_lane_for(c.get("family") or c["model"])
-            c["secondary"] = bool(native) and _base_lane(c["lane"]) != native
+            # #143: the API credit lane is Anthropic's own API, not another vendor's copy: never a secondary source.
+            c["secondary"] = bool(native) and _base_lane(c["lane"]) != native and c["lane"] != API_LANE
         for c in cands:
             if c.get("secondary"):
                 # native-first holds only while an ELIGIBLE native candidate for the same model is available (any
@@ -1049,6 +1232,30 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
                        and (k.get("family") or k["model"]) == fam and ok_of(k) for k in cands):
                     ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"secondary source; {native} still has {fam}"}
         apply_reserve()      # the expiring-credit term still steers usage onto whichever account's credit is about to reset
+
+        def admits(c: dict[str, Any]) -> bool:
+            # the host's own admission check (the client's quota floor): a rule that moves a route to the front may
+            # only move one the host would then run (#132 for the margin, #143 for the split and the frontier rules)
+            if hold_ok is None:
+                return True
+            try:
+                return bool(hold_ok(c))
+            except Exception:                      # an admission check that cannot answer admits nothing
+                return False
+        cw = sel.get("ceiling_work") or {}
+        if cw.get("require_frontier") and ceiling_work_applies(cw, scored[0]["use_case"], D):
+            # #143: hard planning/research/code needs a frontier (ceiling) model, not merely the R4 reference index,
+            # which gpt-6.1-sol clears. Only while a frontier route is available, qualifies and passes the host's check:
+            # a spent frontier never blocks routing (the index rule alone applies then).
+            if any(c.get("ceiling") and ok_of(c) and c["index"] >= target and admits(c) for c in cands):
+                for c in cands:
+                    if not c.get("ceiling") and ok_of(c):
+                        ch_of[id(c)] = {**ch_of[id(c)], "ok": False,
+                                        "why": f"ceiling_work: {scored[0]['use_case']} at D={D} needs a frontier model"}
+                rules.append(f"ceiling_work: {scored[0]['use_case']} at D={D} needs a frontier (ceiling) model")
+            else:
+                rules.append(f"ceiling_work: no frontier model available for {scored[0]['use_case']} at D={D}; "
+                             "the index rule alone applies")
         keep = []
         for c in sorted(cands, key=lambda c: -c["index"]):          # same lane+pool and same price class (±25 % when priced) → keep the strongest only
             same = lambda k: (abs(k["price"] - c["price"]) <= 0.25 * max(k["price"], c["price"]) if k.get("price") and c.get("price")
@@ -1058,13 +1265,33 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
                 keep.append(c)
         cands = keep
         cands.sort(key=lambda c: (0 if c["index"] >= target else 1, c["cost"], -(c.get("tokens_per_s") or 0), tie.index(c["lane"]) if c["lane"] in tie else len(tie), base[id(c)]))
+        # underuse split (#143, selection.underuse_split): when the cheapest qualifying route is on a pool expected to
+        # lose quota at its reset, the underused pools with a qualifying route share the work in proportion to the quota
+        # each would lose, picked by the conversation key (deterministic), instead of the largest credit taking all.
+        us = sel.get("underuse_split") or {}
+        split = None
+        if split_key and us.get("enabled"):
+            qualifies = lambda c: ok_of(c) and c["index"] >= target and admits(c)
+            first = next((c for c in cands if qualifies(c)), None)
+            min_loss = float(us.get("min_loss_pct", 0) or 0)
+            if first is not None and first.get("expected_loss_pct") is not None and float(first["expected_loss_pct"]) >= min_loss:
+                split = underuse_split(cands, split_key, qualifies, min_loss)
+            if split:
+                pick, lost = split
+                total = sum(lost.values())
+                cands.remove(pick); cands.insert(0, pick)
+                rules.append(f"underuse split: {pick['lane']}/{pick['model']} for this conversation; pools share it by the "
+                             "quota each would lose at its reset (" + ", ".join(
+                                 f"{g} {100.0 * v / total:.0f}%" for g, v in sorted(lost.items())) + ")")
         # switching margin (#132): costs move by a point or two with every usage reading, which flipped R2 between Opus
         # and Sol call by call. The client's previous route for this band (`previous`, kept by the host) stays first
         # while it still qualifies, is available and costs at most switch_margin_points more than the cheapest; with
-        # no previous route among them, the cheapest stands (the sort above is deterministic).
+        # no previous route among them, the cheapest stands (the sort above is deterministic). Not after an underuse
+        # split (#143): the margin is for cost noise, and the split picks by the conversation key on purpose; holding the
+        # client's previous route would undo the split for every route within the margin.
         margin = float(sel.get("switch_margin_points", 0) or 0)
         prev = (previous or {}).get(band) if isinstance(previous, dict) else None
-        if margin > 0 and isinstance(prev, dict) and prev.get("model"):
+        if margin > 0 and not split and isinstance(prev, dict) and prev.get("model"):
             best = next((c for c in cands if ok_of(c) and c["index"] >= target), None)
             held = next((c for c in cands if c["model"] == prev["model"] and c["lane"] == prev.get("lane")
                          and ok_of(c) and c["index"] >= target), None)
@@ -1100,12 +1327,25 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
                 rules.append(f"session moves off {cur['lane']}/{cur['model']}: " + ("pool spent" if not ok_of(cur) else "band rose" if band_rose else "outgrown" if cur["index"] < target else f"cost {cur['cost']} vs best {best_cost}"))
         cu = sel.get("ceiling_underuse") or {}
         if D is not None and D >= int(cu.get("min_D", 6)):
-            spare = [c for c in cands if c.get("ceiling") and ok_of(c) and sc_of(c) <= float(cu.get("attract_when_scarcity_below", -0.3))]
+            # #143: never a route the host's admission check (the client's quota floor) refuses.
+            spare = [c for c in cands if c.get("ceiling") and ok_of(c) and sc_of(c) <= float(cu.get("attract_when_scarcity_below", -0.3))
+                     and admits(c)]
             if spare:
                 # #132 (owner 2026-11-22): rank the underused pools by the share expected to be LOST at each one's reset
                 # (cost breaks ties); the capped scarcity cannot tell pools near −1 apart. Any spare pool without reset
-                # times → today's ranking by cost for all of them.
-                if all(c.get("expected_loss_pct") is not None for c in spare):
+                # times → today's ranking by cost for all of them. #143: with a conversation key the spare pools share
+                # the work in proportion to the quota each would lose (underuse_split, cheapest route per pool).
+                shared = None
+                if split_key and us.get("enabled") and all(c.get("expected_loss_pct") is not None for c in spare):
+                    in_spare = {id(c) for c in spare}
+                    shared = underuse_split(sorted(spare, key=lambda c: c["cost"]), split_key,
+                                            lambda c: id(c) in in_spare, float(us.get("min_loss_pct", 0) or 0))
+                if shared:
+                    top, lost = shared
+                    total = sum(lost.values())
+                    why = ("spare frontier pools share it by the quota each would lose: " +
+                           ", ".join(f"{g} {100.0 * v / total:.0f}%" for g, v in sorted(lost.items())))
+                elif all(c.get("expected_loss_pct") is not None for c in spare):
                     top = min(spare, key=lambda c: (-c["expected_loss_pct"], c["cost"]))
                     why = f"about {top['expected_loss_pct']:g}% of its pool would be lost at the reset"
                 else:

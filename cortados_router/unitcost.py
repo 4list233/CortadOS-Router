@@ -51,9 +51,11 @@ def pool_of(runtime: str, model: str, lane: str | None = None) -> str | None:
 
 
 def window_pool(lane: str, window: str) -> str | None:
-    """Pool for a scarcity-history window of `lane` (claude, claude#b, codex …): WINDOW_POOL on the base lane, account kept."""
+    """Pool for a scarcity-history window of `lane` (claude, claude#b, codex …): WINDOW_POOL on the base lane, account kept.
+    The window name is matched without case (#143: the map said "week (fable)" while the usage screen, and so the
+    history, says "week (Fable)", so claude:fable was never learned)."""
     base = lane.split("#", 1)[0]
-    p = WINDOW_POOL.get((base, window))
+    p = _WINDOW_POOL_CI.get((base, (window or "").lower()))
     if p is None:
         return None
     vendor, _, rest = p.partition(":")
@@ -76,6 +78,7 @@ def _pool_of(runtime: str, model: str) -> str | None:
 WINDOW_POOL = {("claude", "week (all models)"): "claude:all", ("claude", "week (fable)"): "claude:fable", ("codex", "week"): "codex:all",
                ("antigravity", "week (gemini)"): "antigravity:gemini", ("antigravity", "week (claude-gpt)"): "antigravity:claude-gpt",
                ("cursor", "month (Cursor models: Grok, Composer, Auto)"): "cursor:cursor-models", ("cursor", "month (other models: Claude, GPT, Gemini …)"): "cursor:other-models"}
+_WINDOW_POOL_CI = {(lane, window.lower()): pool for (lane, window), pool in WINDOW_POOL.items()}
 
 
 def learn(days: int = 14) -> dict:

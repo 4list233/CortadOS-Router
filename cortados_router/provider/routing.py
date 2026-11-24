@@ -173,7 +173,9 @@ class _NoClaudeWhenDegraded:
 
     def resolve(self, decision, *args, allowed_routes=None, **kw):
         if decision.get("degraded") or not decision.get("answers"):
-            allowed_routes = tuple(p for p in (allowed_routes or ()) if _base_provider(p[0]) not in CLAUDE_PROVIDERS)
+            # the API credit lane runs Claude models too (#143): withheld exactly like the Claude CLI
+            allowed_routes = tuple(p for p in (allowed_routes or ())
+                                   if _base_provider(p[0]) not in CLAUDE_PROVIDERS and p[0] != API_PROVIDER)
         return self._core.resolve(decision, *args, allowed_routes=allowed_routes, **kw)
 
 
@@ -184,6 +186,13 @@ def _credentials(claude_bin: str, codex_bin: str) -> Callable[..., None]:
 
     def check(*, requested: str, target_model: str) -> None:
         base = _base_provider(requested)        # a per-account provider (claude-cli#b) shares the base binary/login check
+        if base == API_PROVIDER:
+            # #143: the API credit lane needs its key (api_credits.key_problem names what is wrong, never the key)
+            from cortados_router import api_credits
+            why = api_credits.key_problem()
+            if why:
+                raise execution_routing.CredentialsUnavailable(f"{requested}: {why}")
+            return
         if base not in SERVED_PROVIDERS:
             raise execution_routing.CredentialsUnavailable(f"{requested} is not served by this endpoint")
         if not shutil.which(binaries[base]):
@@ -734,6 +743,9 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
                              "(x-cortados-exclude-model)"}
         return r
     constraints: dict[str, Any] = {"allowed_routes": list(served_routes(core))}
+    # #143: the API credit lane competes as a scored candidate for a request it may take (api_lane_pairs). Added before
+    # the exclusions below, so x-cortados-exclude-model keeps a review off a model on this lane too.
+    constraints["allowed_routes"] += api_lane_pairs(core, body, constraints["allowed_routes"], local=local)
     if excluded_models:
         constraints["excluded_routes"] = []
         for item in items:
@@ -755,15 +767,32 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
     if workload:
         constraints["workload"] = workload      # select applies the table's workloads row (band cap, background)
     previous = previous_routes(client)
-    hold_ok = floor_admits(core, min_left_pct, codex_home) if previous and min_left_pct is not None else None
-    r = execution_routing.select(
-        _NoClaudeWhenDegraded(core), prompt=request_text(body.get("messages") or [], standalone=not body.get("tools")),
-        session_id=conversation_id, platform=PLATFORM, face="provider", entrypoint="provider", input_fit=fit,
-        constraints=constraints,
-        credential_resolver=_credentials(claude_bin, codex_bin), log_platform=f"provider:{client}",
-        supports_accounts=True,   # this endpoint applies the routed account's login (server.Registry → bridge CLAUDE_CONFIG_DIR)
-        **({"previous": previous} if previous else {}),
-        **({"hold_ok": hold_ok} if hold_ok is not None else {}))
+    # The client's floor bounds the switching margin (#132) and, since #143, the underuse split and the frontier
+    # rules, so it is passed whenever the client sent one, not only with a previous route.
+    hold_ok = floor_admits(core, min_left_pct, codex_home) if min_left_pct is not None else None
+
+    def select(**extra) -> dict[str, Any]:
+        return execution_routing.select(
+            _NoClaudeWhenDegraded(core), prompt=request_text(body.get("messages") or [], standalone=not body.get("tools")),
+            session_id=conversation_id, platform=PLATFORM, face="provider", entrypoint="provider", input_fit=fit,
+            constraints=constraints,
+            credential_resolver=_credentials(claude_bin, codex_bin), log_platform=f"provider:{client}",
+            supports_accounts=True,   # this endpoint applies the routed account's login (server.Registry → bridge CLAUDE_CONFIG_DIR)
+            **({"previous": previous} if previous else {}),
+            **({"hold_ok": hold_ok} if hold_ok is not None else {}), **extra)
+    r = select()
+    if not r.get("error") and r.get("provider") == API_PROVIDER:
+        why = request_sensitivity(body, r, local)
+        if why is not None:
+            # Defence in depth (#143): api_lane_pairs cleared the request before S1 answered; a detector that needs S1's
+            # answers (the planned S1 signal) is asked here, and a marked request never stays on the API lane. Routed
+            # again without the lane, under the same route id (the routes row is replaced, not duplicated).
+            logger.info("api credit lane: %s marked by %s after routing; routed again without the lane",
+                        r.get("route_id"), sensitive_notice.detector(why))
+            constraints["allowed_routes"] = [p for p in constraints["allowed_routes"] if p[0] != API_PROVIDER]
+            r = select(route_id=r.get("route_id"))
+        else:
+            r = {**r, "bind_reason": API_SCORED_REASON}
     if not r.get("error"):
         remember_route(client, r)
     if r.get("error") and r.get("degraded"):
@@ -931,6 +960,45 @@ def _log_moved(core, body: dict[str, Any], moved: dict[str, Any], *, client: str
 API_PROVIDER = "anthropic-api"
 API_BIND_REASON = "api_credit_expiry"
 API_PREFER_REASONS = ("auto_route", "index")
+# #143 (owner 2026-11-23): the lane also competes as a scored candidate in core.resolve for normal work, whenever its
+# grant has budget above the stop line (no expiry window). A conversation it wins carries this bind reason; every later
+# turn passes api_continuation_admission like an expiry-preference conversation, without the expiry window.
+API_SCORED_REASON = "api_credit_scored"
+API_BIND_REASONS = (API_BIND_REASON, API_SCORED_REASON)
+
+
+def api_lane_pairs(core, body: dict[str, Any], served, *, local: str | None,
+                   now: float | None = None) -> list[tuple[str, str]]:
+    """The API credit lane's (provider, model) pairs routing may offer core.resolve for this request (#143), or []. The
+    lane never takes sensitive or local-only work (owner 2026-11-14): no x-cortados-local header (`sensitive` marks the
+    request for the Pro, `prefer` is the client asking for local), a wire the API relay serves (no NO_LOCAL_KEY: the
+    relay speaks Messages), and every sensitivity detector that can answer before S1 cleared it (request_sensitivity;
+    doubt counts; choose re-asks with S1's answers). The lane must be on (api_credits.state: key, config, a counting
+    grant more than an hour from expiry, budget left above the stop line, a writable ledger), and each Claude model is
+    offered only when this opening turn's upper-bound cost (estimate_max_cost; `fallbacks` and unbounded content are
+    refused there) fits under the stop line now. What S1 must say (no outward effect, blast radius 0-1, not degraded)
+    is core.api_lane_refusal's. Any error: [] (the lane is never offered on doubt; routing goes on without it)."""
+    from cortados_router import api_credits
+    try:
+        if local is not None or body.get(NO_LOCAL_KEY) or sub_pin(body):
+            return []
+        if request_sensitivity(body, {}, None) is not None:
+            return []
+        st = api_credits.state(time.time() if now is None else now)
+        if not st.get("on"):
+            return []
+        headroom = float(st.get("headroom_usd") or 0.0)
+        out: list[tuple[str, str]] = []
+        for model in sorted({m for p, m in served if _base_provider(p) in CLAUDE_PROVIDERS}):
+            try:
+                if api_credits.estimate_max_cost(body, model) <= headroom:
+                    out.append((API_PROVIDER, model))
+            except api_credits.Unbounded:
+                return []                          # the request's own content is unbounded: no model can take it
+        return out
+    except Exception as exc:
+        logger.warning("api credit lane not offered: %s", type(exc).__name__)
+        return []
 
 
 def api_model(core, r: dict[str, Any]) -> str | None:
@@ -1011,13 +1079,15 @@ def prefer_api_credit(core, body: dict[str, Any], r: dict[str, Any], *, client: 
 def api_continuation_admission(body: dict[str, Any], route: dict[str, Any] | None, *, local: str | None,
                                recheck: Callable[[dict, dict], tuple[bool, str]] | None,
                                now: float | None = None) -> tuple[bool, str]:
-    """The continuation gate of a conversation prefer_api_credit moved to the API (#114 review round 1): (admitted,
-    metadata reason), run by server.Handler._api_continuation_refused on EVERY later turn before it is forwarded. The
-    opening's eligibility must still hold for this turn: no x-cortados-local mode (`sensitive` marks it for the Pro,
-    `prefer` is the client asking for local), a wire the local relay serves (no NO_LOCAL_KEY), no sensitivity detector
-    marking it (request_sensitivity; doubt counts), the lane on with a counting grant inside its prefer window
-    (api_credits.state), and S1 admitting this turn under the local gate (`recheck`: continuation_admission, no outward
-    effect, blast radius 0-1, not degraded). Fails closed on anything else, including no `recheck`."""
+    """The continuation gate of a conversation routing bound to the API credit lane: moved there by prefer_api_credit
+    (#114 review round 1) or won there as a scored candidate (API_SCORED_REASON, #143). (admitted, metadata reason),
+    run by server.Handler._api_continuation_refused on EVERY later turn before it is forwarded. The opening's
+    eligibility must still hold for this turn: no x-cortados-local mode (`sensitive` marks it for the Pro, `prefer` is
+    the client asking for local), a wire the local relay serves (no NO_LOCAL_KEY), no sensitivity detector marking it
+    (request_sensitivity; doubt counts), the lane on (api_credits.state: budget above the stop line, more than an hour
+    before expiry), for an expiry-preference conversation a counting grant still inside its prefer window, and S1
+    admitting this turn under the local gate (`recheck`: continuation_admission, no outward effect, blast radius 0-1,
+    not degraded). Fails closed on anything else, including no `recheck` or a route bound by another rule."""
     from cortados_router import api_credits
     route = route if isinstance(route, dict) else {}
     if local is not None:
@@ -1030,7 +1100,12 @@ def api_continuation_admission(body: dict[str, Any], route: dict[str, Any] | Non
     st = api_credits.state(time.time() if now is None else now)
     if not st.get("on"):
         return False, f"the API credit lane is off: {st.get('reason')}"
-    if not st.get("expiring_soon"):
+    # A conversation the lane won as a scored candidate (#143) needs only the lane on (budget above the stop line);
+    # one the expiry preference moved there keeps that preference's window. Any other bind is not this lane's.
+    bind = route.get("bind_reason")
+    if bind not in API_BIND_REASONS:
+        return False, "the conversation was not bound to the API credit lane by routing"
+    if bind == API_BIND_REASON and not st.get("expiring_soon"):
         return False, "no counting grant expires within the preference window any more"
     if recheck is None:
         return False, "this endpoint has no continuation re-check"

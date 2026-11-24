@@ -3212,8 +3212,8 @@ class Handler(BaseHTTPRequestHandler):
                            reason="a turn of an API-credit conversation failed its continuation gate")
         self._json(400, wire.error_json(
             "invalid_request_error",
-            "cortados: this conversation was moved to the API credit lane because its opening turn was local-eligible "
-            "work no detector marked sensitive, under credit about to expire; this turn no longer qualifies "
+            "cortados: this conversation runs on the API credit lane because its opening turn had no outward effect "
+            "and no detector marked it sensitive, while the credit had budget left; this turn no longer qualifies "
             f"({why}), so it was not sent. Start a new conversation (it is routed again) or pin a model with "
             "sub/<model>."), headers={"x-should-retry": "false"})
         return True

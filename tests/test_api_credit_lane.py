@@ -487,6 +487,32 @@ class RoutedConversationTests(LaneHarness):
         self.assertEqual(self.rechecks, [self.routed[0]])
 
 
+class ScoredConversationTests(RoutedConversationTests):
+    """#143: a conversation the lane WON as a scored candidate (bind API_SCORED_REASON) runs and continues on the API
+    with no grant about to expire; every continuation still passes the gate (lane on, no detector, S1 re-check)."""
+
+    def setUp(self):
+        super().setUp()
+        inner = self.reg.router
+
+        def router(body, client, **kw):
+            return {**inner(body, client, **kw), "bind_reason": routing.API_SCORED_REASON}
+        self.reg.router = router
+        self.write_config(config(20))                            # 20 days left: far outside the preference window
+
+    def test_a_routed_conversation_runs_on_the_api_and_continues_there(self):
+        super().test_a_routed_conversation_runs_on_the_api_and_continues_there()
+        self.assertEqual(len(self.rechecks), 1)                  # the continuation was re-scored first
+
+    def test_a_continuation_after_the_grant_left_its_preference_window_is_refused(self):
+        # Not this bind's rule: a scored conversation needs the lane on, not a grant about to expire. It continues.
+        first = self.opener()
+        got = self.post(first)
+        self.write_config(config(25))
+        self.post(self.follow(first, got["content"]))
+        self.assertEqual(len(FakeAPI.seen), 2)
+
+
 class FakeCore:
     def __init__(self):
         self.logged: list = []
