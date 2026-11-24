@@ -83,7 +83,7 @@ class SettingsAllowlist(unittest.TestCase):
         self.refused("", "fail closed")                                    # settings.json empty is not the real shape
         self.refused({"trustedWorkspaces": "/Users/example"}, "trustedWorkspaces is not a list")
         self.refused({"trustedWorkspaces": ["/a", 1]}, "holds an item that is not a str")
-        self.refused({**GOOD, "renderingMode": "alt-screen"}, "unknown setting 'renderingMode'")
+        self.refused({**GOOD, "renderingMode": "alt-screen"}, r"1 unknown setting\(s\) at the top level")
         self.refused({**GOOD, "security": {"auth": {"selectedType": "oauth-personal"}}}, "security settings")
         for extra, why in (({"mcpServers": {"x": {"command": "y"}}}, "MCP servers"),
                            ({"tools": {"autoAccept": True}}, "tool settings"),
@@ -92,10 +92,29 @@ class SettingsAllowlist(unittest.TestCase):
             with self.subTest(extra=extra):
                 self.refused({**GOOD, **extra}, why)
 
+    def test_unknown_keys_are_counted_never_echoed(self):
+        """#144 round 3: an email used as a setting key reached the error, the state and stderr."""
+        for path, data in ((self.p, {**GOOD, "someone.private@example.com": 1, "PRIVATE-MARKER-7f3": 2}),
+                           (self.cfg, {"plugins": {"swarm": {"enabled": True}, "someone.private@example.com": {}}})):
+            with self.subTest(path=path.name):
+                msg = self.refused(data, r"unknown setting\(s\)", path)
+                self.assertNotIn("someone.private", msg); self.assertNotIn("example.com", msg)
+                self.assertNotIn("PRIVATE-MARKER", msg)
+                rec = sc._failed_record("antigravity", None, iso.SettingsRefused(msg))
+                self.assertNotIn("example.com", rec["error"])
+                self.put(path, GOOD if path == self.p else CONFIG)
+        msg = self.refused({**GOOD, "someone.private@example.com": 1, "renderingMode": 2}, r"2 unknown setting\(s\)")
+        self.assertNotIn("example.com", msg)
+
+    def test_forbidden_env_names_echo_only_safe_names(self):
+        msg = str(iso.ForbiddenEnv(["GEMINI_API_KEY", "GEMINI_someone@example.com"]))
+        self.assertIn("GEMINI_API_KEY", msg); self.assertIn("1 other name(s) not shown", msg)
+        self.assertNotIn("example.com", msg)
+
     def test_config_allowlist_refuses_unknown_plugins_and_keys(self):
-        self.refused({"plugins": {"swarm": {"enabled": True}, "browser": {"enabled": True}}}, "unknown setting 'plugins.browser'",
+        self.refused({"plugins": {"swarm": {"enabled": True}, "browser": {"enabled": True}}}, r"1 unknown setting\(s\) under 'plugins'",
                      self.cfg)
-        self.refused({"plugins": {"swarm": {"enabled": True, "maxAgents": 8}}}, "unknown setting 'plugins.swarm.maxAgents'",
+        self.refused({"plugins": {"swarm": {"enabled": True, "maxAgents": 8}}}, r"1 unknown setting\(s\) under 'plugins.swarm'",
                      self.cfg)
         self.refused({"plugins": {"swarm": {"enabled": "yes"}}}, r"plugins\.swarm\.enabled is not a bool", self.cfg)
         self.refused({"plugins": {"swarm": {"enabled": 1}}}, r"plugins\.swarm\.enabled is not a bool", self.cfg)
@@ -200,11 +219,13 @@ class OneLaunchPath(unittest.TestCase):
                         "GEMINI_API_KEY": "gk", "AGY_ADC_AUTH": "true", "ANTHROPIC_API_KEY": "a"}
 
     def test_run_models_is_isolated(self):
-        out = iso.run_models(str(self.bin), self.environ, {})
+        work = self.tmp / "probe-parent"
+        out = iso.run_models(str(self.bin), self.environ, {}, workdir=work)
         self.assertIn("gemini-4-neon-high", out)
         argv, cwd, *names = self.log.read_text().split("\n")
         self.assertEqual(argv, "['models']")
         self.assertNotEqual(Path(cwd).resolve(), ROOT.resolve())
+        self.assertEqual(Path(cwd).resolve().parent, work.resolve())        # a fresh folder in the fixed parent
         self.assertFalse(Path(cwd).exists())                            # its per-run folder is removed
         for n in ("GEMINI_API_KEY", "AGY_ADC_AUTH", "ANTHROPIC_API_KEY"):
             self.assertNotIn(n, names)
@@ -267,3 +288,88 @@ class OneLaunchPath(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DotenvGuard(unittest.TestCase):
+    """#144 round 3: a dotenv file the Gemini CLI family loads could restore what the env allowlist stripped. Every
+    candidate is read before any agy start (the probe's tests are in test_agy_lane.DotenvGuardProbe)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = self.tmp / "home"
+        (self.home / iso.SETTINGS_RELPATH).parent.mkdir(parents=True)
+        (self.home / iso.SETTINGS_RELPATH).write_text(json.dumps(GOOD))
+        self.work = self.tmp / "state" / "usage-probe"
+        self.log = self.tmp / "ran"
+        self.bin = self.tmp / "bin" / "agy"
+        self.bin.parent.mkdir()
+        self.bin.write_text(FAKE_AGY.format(py=sys.executable, log=str(self.log)))
+        self.bin.chmod(0o755)
+        self.environ = {"HOME": str(self.home), "USER": "t", "PATH": "/usr/bin:/bin"}
+
+    def put(self, where: Path, text: str) -> Path:
+        where.parent.mkdir(parents=True, exist_ok=True)
+        where.write_text(text)
+        self.addCleanup(lambda: where.exists() and where.unlink())
+        return where
+
+    def models(self):
+        return iso.run_models(str(self.bin), self.environ, {}, workdir=self.work)
+
+    def test_every_banned_prefix_refuses_agy_models(self):
+        for name in ("GEMINI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_GEMINI_BASE_URL", "AGY_ADC_AUTH",
+                     "CLOUDSDK_CORE_PROJECT"):
+            for line in (f"{name}=secret-value-42", f"export {name}='secret-value-42'", f"{name.lower()}=secret-value-42"):
+                with self.subTest(line=line):
+                    self.put(self.home / ".gemini" / ".env", "# mine\nHARMLESS=1\n" + line + "\n")
+                    with mock.patch("subprocess.run", side_effect=AssertionError("must not run")):
+                        with self.assertRaises(iso.ForbiddenEnv) as cm:
+                            self.models()
+                    self.assertNotIn("secret-value-42", str(cm.exception))
+                    self.assertIn("~/.gemini/.env", str(cm.exception))
+                    self.assertEqual(cm.exception.kind, "forbidden-env")
+        self.assertFalse(self.log.exists())
+
+    def test_every_dotenv_location_is_checked(self):
+        for where in (self.home / ".env", self.home / ".gemini" / ".env", self.work / ".env",
+                      self.work / ".gemini" / ".env", self.tmp / "state" / ".env", self.tmp / ".gemini" / ".env"):
+            with self.subTest(where=str(where.relative_to(self.tmp))):
+                self.put(where, "GEMINI_API_KEY=k\n")
+                with mock.patch("subprocess.run", side_effect=AssertionError("must not run")):
+                    with self.assertRaises(iso.ForbiddenEnv):
+                        self.models()
+                where.unlink()
+
+    def test_the_per_run_folder_itself_is_checked_before_the_start(self):
+        real_mkdtemp = tempfile.mkdtemp
+
+        def planted(*a, **k):
+            d = real_mkdtemp(*a, **k)
+            Path(d, ".env").write_text("GOOGLE_API_KEY=k\n")
+            return d
+        with mock.patch("tempfile.mkdtemp", planted), mock.patch("subprocess.run", side_effect=AssertionError("must not run")):
+            with self.assertRaises(iso.ForbiddenEnv):
+                self.models()
+        self.assertEqual(list(self.work.iterdir()), [])                   # the per-run folder is removed
+
+    def test_a_harmless_dotenv_passes(self):
+        self.put(self.home / ".gemini" / ".env", "# notes\n\nexport EDITOR=vim\nDEBUG: 1\nNAME=\"a # b\"\nOPENAI_API_KEY=x\n")
+        self.put(self.home / ".env", "LANG=en_US.UTF-8\n")
+        iso.check_dotenv(self.home, self.work)
+        self.assertIn("gemini-4-neon-high", self.models())
+
+    def test_an_unparsable_dotenv_is_refused(self):
+        for text in ("this is not an assignment\n", "OK=1\nGEMINI_API_KEY=\"line one\nline two\"\n",
+                     "KEY='never closed\n", "=novalue\n"):
+            with self.subTest(text=text):
+                self.put(self.home / ".gemini" / ".env", text)
+                with mock.patch("subprocess.run", side_effect=AssertionError("must not run")):
+                    with self.assertRaisesRegex(iso.SettingsRefused, "not a parsable dotenv file") as cm:
+                        self.models()
+                for word in ("assignment", "line one", "never closed", "novalue"):
+                    self.assertNotIn(word + "\n", str(cm.exception))
+                self.assertNotIn("never closed", str(cm.exception)); self.assertNotIn("line two", str(cm.exception))
+        (self.home / ".gemini" / ".env").write_bytes(b"\xff\xfe\x00bad")
+        with self.assertRaisesRegex(iso.SettingsRefused, "unreadable"):
+            self.models()

@@ -160,7 +160,8 @@ class ProbeRefused(RuntimeError):
 def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], boot_s: float = 12, run_s: float = 20, ready: str | None = None,
                 nudge: tuple[str, str, bytes, int, float] | None = None, diagnostics: dict | None = None,
                 refuse: tuple[tuple[str, str], ...] = (), inherit_path: bool = True,
-                page: Callable[[str], tuple[bytes, str] | None] | None = None, page_max: int = 40) -> str:
+                page: Callable[[str], tuple[bytes, str] | None] | None = None, page_max: int = 40,
+                cwd_check: Callable[[Path], None] | None = None) -> str:
     """Open the CLI in a PTY, accept a folder-trust prompt for our own empty probe folder if shown, type `command`, return the screen text.
 
     Deny-all: Enter is only ever sent for that trust prompt. `refuse` is ((kind, regex), ...): the screen is checked on
@@ -169,10 +170,19 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     truly what had been typed by then. An exec failure raises ProbeExecFailed instead of returning an empty screen.
     inherit_path=False runs argv[0] as given (an absolute path), never searched on PATH.
     `page(text)` reads a scrollable answer: called with the answer so far, it returns (key, name) to press next (a
-    navigation key, never text) or None when done; at most `page_max` presses."""
+    navigation key, never text) or None when done; at most `page_max` presses.
+    `cwd_check(folder)` runs on the per-probe folder after it is made and before the fork; raising refuses the start
+    (the agy lane's dotenv guard, #144 round 3)."""
     PROBE_DIR.mkdir(parents=True, exist_ok=True)
     my_dir = PROBE_DIR / f"p{os.getpid()}-{int(time.time() * 1000) % 100000}"     # per-probe folder: the reaper kills by cwd and must never hit another probe
     my_dir.mkdir(exist_ok=True)
+    if cwd_check is not None:
+        try:
+            cwd_check(my_dir)
+        except BaseException:
+            import shutil
+            shutil.rmtree(my_dir, ignore_errors=True)
+            raise
     pid, fd = pty.fork()
     if pid == 0:
         try:
@@ -405,7 +415,8 @@ def agy_usage_gaps(text: str) -> list[str]:
             gaps.append(f"no {pool} group")
     for title, wins in groups.items():
         have = {w["window"] for w in wins}
-        gaps += [f"{title}: no {k} window" for k in AGY_WINDOW_KINDS if k not in have]
+        # the pool name, not the title as shown: a gap goes into the error, the state and stderr (#144 round 3)
+        gaps += [f"{_agy_pool_of_group(title)}: no {k} window" for k in AGY_WINDOW_KINDS if k not in have]
     pages = list(AGY_PAGER.finditer(text))
     if pages and int(pages[-1].group(2)) < int(pages[-1].group(3)):
         gaps.append(f"pager not read to the end (last view {pages[-1].group(1)}-{pages[-1].group(2)} of {pages[-1].group(3)})")
@@ -631,20 +642,25 @@ def _antigravity() -> dict[str, Any]:
     allowlisted env (a Google-family variable in the env file: refused), the settings guard, and a deny-all PTY run."""
     from cortados_router import agy_isolation as iso
     env_file = _env_file_vars()
-    binary, env = iso.prepare(_env_get("CORTADOS_AGY_BIN") or env_file.get("CORTADOS_AGY_BIN"), os.environ, env_file)
+    # the probe runs in a fresh folder under PROBE_DIR: the dotenv guard checks PROBE_DIR's walk now and the folder itself
+    # (cwd_check) just before the fork (#144 round 3)
+    binary, env = iso.prepare(_env_get("CORTADOS_AGY_BIN") or env_file.get("CORTADOS_AGY_BIN"), os.environ, env_file,
+                              workdir=PROBE_DIR)
     diag: dict = {}
     # A refused screen at any point (boot, after trust, after /usage, while paging) raises ProbeRefused from inside the
     # capture, before the probe's next keystroke.
     text = tui_capture([binary], "/usage", AGY_DONE, env, refuse=AGY_REFUSE, inherit_path=False, diagnostics=diag,
-                       page=_agy_next_page)
+                       page=_agy_next_page, cwd_check=lambda d: iso.check_dotenv(env["HOME"], d))
     if not text.strip():
         if diag.get("eof") and diag.get("stage") in {"boot", "trust"}:
             raise ProbeExecFailed(f"agy exited at {diag.get('stage')} with no usable output")
         raise RuntimeError("agy /usage screen empty (stage=" + str(diag.get("stage")) + ")")
     groups = parse_agy_usage(text)
     if not groups:
-        # the screen's tail may hold the Account: line: its email is dropped before anything is recorded
-        raise RuntimeError("no quota groups on the /usage screen: " + iso.scrub_account(text[-200:]).replace("\n", " "))
+        # a fixed diagnostic: never screen text (#144 round 3: a private line survived the email scrub into the record and
+        # stderr). Counts only.
+        raise RuntimeError(f"no quota groups on the /usage screen: {len(text.splitlines())} lines, "
+                           f"{len(AGY_PAGER.findall(text))} pager footers read")
     gaps = agy_usage_gaps(text)
     if gaps:
         raise ProbePartialReading("agy /usage read only in part: " + "; ".join(gaps))

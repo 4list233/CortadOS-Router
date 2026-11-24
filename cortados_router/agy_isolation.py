@@ -20,9 +20,16 @@ The rules, each with its reason:
      = first run pending), config/config.json (`plugins.swarm.enabled` only), config/mcp_config.json (no MCP server),
      and the Gemini CLI's settings.json if present (no API-key / Vertex / ADC auth mode, no MCP server). A non-object,
      an unknown key anywhere, an unparsable non-empty file: refused (fail closed).
+  4a. DOTENV GUARD (`check_dotenv`, #144 round 3): the Gemini CLI family loads a `.env` file into its own process
+     environment AFTER we built it: the first of `<dir>/.gemini/.env`, `<dir>/.env` walking up from its working
+     directory, then `~/.gemini/.env`, `~/.env`. A `GEMINI_API_KEY` or `GOOGLE_APPLICATION_CREDENTIALS` there would
+     restore exactly what rule 1 stripped. Every one of those files that exists (not only the first: which one agy reads
+     is not documented) is read before any start; a Google-family name (FORBIDDEN_PREFIXES) or an unparsable file is
+     refused (`forbidden-env`). The launch folder is a fixed parent we own plus an empty per-run folder, so the walk is
+     the same on every run.
   4b. SUBSCRIPTION PROOF (`check_subscription`): agy stores no auth mode, so the probe proves the personal Google AI
      subscription from agy's own screen (tier line; never the account email). PROVISIONAL pattern, refusing [ESCALATE].
-  5. ONE LAUNCH PATH (`prepare`): rules 1-4 run, in that order, before every agy process: the quota probe
+  5. ONE LAUNCH PATH (`prepare`): rules 1-4a run, in that order, before every agy process: the quota probe
      (scarcity._antigravity) and `agy models` (`run_models`, the CLI `python3 -B -m cortados_router.agy_isolation models`
      that bin/refresh-inventory.sh calls).
 
@@ -85,14 +92,30 @@ class ProbeBinaryMissing(AgyLaneError):
         self.searched = list(searched)
 
 
+# A name is echoed in an error only when it looks like a variable / setting name (#144 round 3: an email used as a key
+# reached the error, the state and stderr). Anything else is counted, never shown.
+SAFE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,40}$")
+
+
+def safe_names(names) -> str:
+    """The names that match SAFE_NAME, sorted, plus a count of the others: what an error may say about names."""
+    names = list(names)
+    shown = sorted({n for n in names if isinstance(n, str) and SAFE_NAME.match(n)})
+    hidden = len(names) - sum(1 for n in names if isinstance(n, str) and SAFE_NAME.match(n))
+    parts = ", ".join(shown)
+    if hidden:
+        parts += (", " if parts else "") + f"{hidden} other name(s) not shown"
+    return parts
+
+
 class ForbiddenEnv(AgyLaneError):
     kind = "forbidden-env"
 
-    def __init__(self, names: list[str]):
-        # names only, never values: a value here is a credential
-        super().__init__("forbidden variables configured for the agy lane in the router's env file: "
-                         + ", ".join(sorted(names)) + " (remove them; they bill outside the subscription)")
-        self.names = sorted(names)
+    def __init__(self, names: list[str], where: str = "the router's env file"):
+        # names only (safe ones; others counted), never values: a value here is a credential
+        super().__init__(f"forbidden variables configured for the agy lane in {where}: "
+                         + safe_names(names) + " (remove them; they bill outside the subscription)")
+        self.names = sorted(n for n in names if SAFE_NAME.match(n))
 
 
 class SettingsRefused(AgyLaneError):
@@ -195,13 +218,20 @@ def _settings_problems(node: Any, schema: Any, path: str, out: list[str]) -> Non
         if not isinstance(node, dict):
             out.append(f"{path or 'the file'} is not a JSON object")
             return
+        unknown = 0
         for k, v in node.items():
-            where = f"{path}.{k}" if path else str(k)
             if k not in schema:
-                named = _NAMED_REFUSALS.get(str(k).lower().replace("_", "").replace("-", ""))
-                out.append(f"{where}: {named}" if named else f"unknown setting {where!r}")
+                canon = str(k).lower().replace("_", "").replace("-", "")
+                named = _NAMED_REFUSALS.get(canon)
+                if named:       # the canonical name, never the key as written
+                    out.append(f"{f'{path}.{canon}' if path else canon}: {named}")
+                else:
+                    unknown += 1
                 continue
-            _settings_problems(v, schema[k], where, out)
+            _settings_problems(v, schema[k], f"{path}.{k}" if path else str(k), out)
+        if unknown:
+            # counted, never echoed (#144 round 3: an email used as a key was echoed); `path` holds schema keys only
+            out.append(f"{unknown} unknown setting(s) " + (f"under {path!r}" if path else "at the top level"))
         return
     if isinstance(schema, list):
         if not isinstance(node, list):
@@ -307,6 +337,96 @@ def check_settings(home: str | os.PathLike) -> None:
     _check_gemini_cli_settings(home)
 
 
+# --------------------------------------------------------------------------------------------- dotenv guard (#144 round 3)
+# The Gemini CLI family's dotenv search: from the working directory up to the root, `<dir>/.gemini/.env` then
+# `<dir>/.env`; then `~/.gemini/.env`, `~/.env`. It loads the first one found into its process environment, after our
+# allowlist was applied. Every existing candidate is checked (which file agy 1.5.16 reads is not documented).
+DOTENV_NAMES = (".gemini/.env", ".env")
+# One assignment per line as the dotenv parser takes it: optional `export`, a name, `=` (or `: `), a value. A quoted
+# value must close on its line: a multi-line value could carry a name we never saw, so it is refused as unparsable.
+_DOTENV_LINE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*(?:=|:\s)\s*(.*)$")
+
+
+def dotenv_candidates(home: str | os.PathLike, workdir: str | os.PathLike) -> list[Path]:
+    """Every dotenv file an agy started in `workdir` (or a fresh folder inside it) may load, existing or not, in search
+    order. Both the path as given and its real path are walked (macOS: /var is /private/var)."""
+    out: list[Path] = []
+    starts = []
+    for d in (os.path.abspath(workdir), os.path.realpath(workdir)):
+        if d not in starts:
+            starts.append(d)
+    for start in starts:
+        d = Path(start)
+        while True:
+            out += [d / n for n in DOTENV_NAMES]
+            if d.parent == d:
+                break
+            d = d.parent
+    for h in (os.path.abspath(home), os.path.realpath(home)):
+        out += [Path(h) / n for n in DOTENV_NAMES]
+    seen, uniq = set(), []
+    for p in out:
+        if str(p) not in seen:
+            seen.add(str(p))
+            uniq.append(p)
+    return uniq
+
+
+def dotenv_names(text: str) -> list[str]:
+    """The variable names a dotenv file defines. ValueError (with a line number only) when a line is not a comment, a
+    blank or one complete assignment."""
+    names = []
+    for i, raw in enumerate(text.lstrip("\ufeff").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _DOTENV_LINE.match(line)
+        if not m:
+            raise ValueError(f"line {i} is not an assignment")
+        value = m.group(2).strip()
+        if value[:1] in ("'", '"', "`"):
+            q = value[0]
+            body = value[1:]
+            close = re.search(r"(?<!\\)" + re.escape(q), body)
+            if not close:
+                raise ValueError(f"line {i} opens a quoted value that does not close on the line")
+        names.append(m.group(1))
+    return names
+
+
+def _dotenv_label(p: Path, home: str | os.PathLike) -> str:
+    for h in (os.path.abspath(home), os.path.realpath(home)):
+        try:
+            return "~/" + str(p.relative_to(h))
+        except ValueError:
+            continue
+    return str(p)
+
+
+def check_dotenv(home: str | os.PathLike, workdir: str | os.PathLike) -> None:
+    """Refuse when any dotenv file an agy started in `workdir` may load defines a Google-family variable (ForbiddenEnv),
+    or cannot be read or parsed (SettingsRefused, fail closed). Values are never read into a message; names only when SAFE_NAME."""
+    for p in dotenv_candidates(home, workdir):
+        label = _dotenv_label(p, home)
+        try:
+            if not (p.exists() or p.is_symlink()):
+                continue
+            if p.stat().st_size > SETTINGS_MAX_BYTES:
+                raise SettingsRefused(f"{label} is over {SETTINGS_MAX_BYTES} bytes; not read, refused (fail closed)")
+            text = p.read_text()
+        except SettingsRefused:
+            raise
+        except (OSError, ValueError) as exc:
+            raise SettingsRefused(f"{label} unreadable ({type(exc).__name__}); refused, fail closed")
+        try:
+            names = dotenv_names(text)
+        except ValueError as exc:      # the message holds a line number only, never the line
+            raise SettingsRefused(f"{label} is not a parsable dotenv file ({exc}); refused, fail closed")
+        bad = [n for n in names if forbidden(n.upper())]
+        if bad:
+            raise ForbiddenEnv(bad, label)
+
+
 # --------------------------------------------------------------------------------------------- subscription login proof
 # agy's settings hold no auth mode, so the Google AI subscription login is proven from what agy itself SHOWS: the /usage
 # box ("Models & Quota", an "Account:" line, the tier / plan text) and its banner. Read-only evidence; the account email
@@ -351,26 +471,38 @@ def check_subscription(screen: str) -> str:
 
 
 # --------------------------------------------------------------------------------------------- the one launch path
-def prepare(configured: str | None, environ: Mapping[str, str], env_file: Mapping[str, str] | None = None) -> tuple[str, dict[str, str]]:
+def prepare(configured: str | None, environ: Mapping[str, str], env_file: Mapping[str, str] | None = None, *,
+            workdir: str | os.PathLike) -> tuple[str, dict[str, str]]:
     """Every agy process the router starts goes through here first (the /usage probe and `agy models`): the configured
-    absolute binary, the allowlisted env (Google-family names in the env file: ForbiddenEnv), the settings guard.
-    Returns (binary, env); raises an AgyLaneError before anything is started."""
+    absolute binary, the allowlisted env (Google-family names in the env file: ForbiddenEnv), the settings guard, the
+    dotenv guard for `workdir` (the fixed parent the per-run folder is made in). The caller checks the per-run folder
+    itself again with check_dotenv just before the start. Returns (binary, env); raises an AgyLaneError before
+    anything is started."""
     binary = resolve_binary(configured)
     env = child_env(environ, env_file)
     check_settings(env["HOME"])
+    check_dotenv(env["HOME"], workdir)
     return binary, env
 
 
 def run_models(configured: str | None, environ: Mapping[str, str], env_file: Mapping[str, str] | None = None,
-               timeout_s: float = 60) -> str:
+               timeout_s: float = 60, workdir: str | os.PathLike | None = None) -> str:
     """`agy models` through prepare(): stdout as text. Run by absolute path with execve semantics (no PATH search), in an
-    empty per-run folder, stdin closed. Raises AgyLaneError on a refusal, RuntimeError on a failed run."""
+    empty per-run folder inside `workdir` (default: the router's own `$CORTADOS_HOME/usage-probe`, the probe's fixed
+    parent, so the dotenv walk is the same as the probe's and never the caller's cwd), stdin closed. Raises AgyLaneError
+    on a refusal, RuntimeError on a failed run."""
     import shutil
     import subprocess
     import tempfile
-    binary, env = prepare(configured, environ, env_file)
-    work = tempfile.mkdtemp(prefix="cortados-agy-models-")
+    if workdir is None:
+        from cortados_router import scarcity
+        workdir = Path(scarcity.STATE) / "usage-probe"
+    binary, env = prepare(configured, environ, env_file, workdir=workdir)
+    Path(workdir).mkdir(parents=True, exist_ok=True)
+    # "agy-models-*", not "p*": the probe reaper's stale sweep only touches p* folders
+    work = tempfile.mkdtemp(prefix="agy-models-", dir=str(workdir))
     try:
+        check_dotenv(env["HOME"], work)          # the per-run folder itself (fresh and empty; checked, not assumed)
         r = subprocess.run([binary, "models"], cwd=work, env=env, stdin=subprocess.DEVNULL, capture_output=True,
                            timeout=timeout_s, executable=binary)
     finally:

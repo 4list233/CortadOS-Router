@@ -9,7 +9,7 @@ False and `core.resolve`'s fit gate refuses every agy route. The provider serves
 
 | Piece | Where | What |
 |---|---|---|
-| Isolation (one owner) | `cortados_router/agy_isolation.py` | Environment allowlist for every agy process (`HOME`, `USER`, `LOGNAME`, `TMPDIR`, `LANG`, `LC_*`, fixed `PATH`; `TERM` from the PTY). A `GEMINI_*` / `GOOGLE_*` / `AGY_*` / `CLOUDSDK_*` name in the router's shared env file (`$CORTADOS_HOME/env`) is a hard failure (`forbidden-env`); in the process environment it is dropped. Other vendors' variables are dropped, never fatal (that file serves their lanes too). The binary is a configured absolute path, never searched on PATH. A settings guard reads agy's real config files (never writes them) against **allowlist** schemas (below); a subscription proof reads agy's own `/usage` screen (below). One launch path: `agy_isolation.prepare` runs all of this before every agy process (the probe and `agy models`). |
+| Isolation (one owner) | `cortados_router/agy_isolation.py` | Dotenv guard (round 3, below). Environment allowlist for every agy process (`HOME`, `USER`, `LOGNAME`, `TMPDIR`, `LANG`, `LC_*`, fixed `PATH`; `TERM` from the PTY). A `GEMINI_*` / `GOOGLE_*` / `AGY_*` / `CLOUDSDK_*` name in the router's shared env file (`$CORTADOS_HOME/env`) is a hard failure (`forbidden-env`); in the process environment it is dropped. Other vendors' variables are dropped, never fatal (that file serves their lanes too). The binary is a configured absolute path, never searched on PATH. A settings guard reads agy's real config files (never writes them) against **allowlist** schemas (below); a subscription proof reads agy's own `/usage` screen (below). One launch path: `agy_isolation.prepare` runs all of this before every agy process (the probe and `agy models`). |
 | Binary | provider `--agy-bin <absolute path>` (or `CORTADOS_AGY_BIN`) | Unset: the lane is **not configured** and never sampled (no PTY opened); the views say "not configured", not FAILED. |
 | Honest failures | `scarcity.tui_capture`, `scarcity._antigravity` | `binary-missing` (with `searched`), `exec-failed` (the child could not exec, or exited at once with no output; all lanes now raise on an exec failure instead of returning an empty screen), `not-logged-in`, `first-run-pending` (a first-run screen, or no `antigravity-cli/settings.json` yet), `forbidden-env`, `settings-refused`, `subscription-unproven`. |
 | Deny-all | `tui_capture(refuse=...)` | Enter is sent only for the existing workspace-trust prompt. The refusal patterns are checked on every read and before every write, at every stage (boot, after trust, after `/usage`, while paging): a sign-in or first-run screen closes the CLI at once, and the error says truly what had been typed by then ("nothing was typed" only when nothing was). |
@@ -38,11 +38,36 @@ Everywhere: an unparsable non-empty file, a non-object and an unknown key are re
 (a value may be a credential or a private path). The env bans (`GEMINI_*`, `GOOGLE_*`, `AGY_*`, `CLOUDSDK_*` in the
 router's env file) are unchanged.
 
+### Dotenv guard (`agy_isolation.check_dotenv`, round 3)
+
+The Gemini CLI family loads a `.env` file into its own process environment **after** the router built it, which could
+restore what the env allowlist stripped (`GEMINI_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`, ...). Its search: from the
+working directory up to `/`, `<dir>/.gemini/.env` then `<dir>/.env`; then `~/.gemini/.env`, `~/.env`. Which of these
+agy 1.5.16 reads is not documented, so **every** one that exists is read before any agy start (probe and `agy models`):
+
+- A `GEMINI_*`, `GOOGLE_*`, `AGY_*` or `CLOUDSDK_*` name (any case, with or without `export`): `forbidden-env`.
+- An unreadable or unparsable file (a line that is not a comment, a blank or one `NAME=value` / `NAME: value`
+  assignment, or a quoted value not closed on its line): `settings-refused`, fail closed.
+- Values are never read into a message; the error names the file and the variable names.
+
+The launch folder is fixed: the probe's fresh `p<pid>-<ms>` folder and `agy models`' fresh `agy-models-*` folder are both
+made in `$CORTADOS_HOME/usage-probe` (before round 3 `agy models` ran in a system temp folder). `prepare` checks that
+parent's walk; the per-run folder itself is checked again just before the start.
+
+### Private text in errors, state and logs (round 3)
+
+An error goes into the lane's record (`scarcity.json`), stderr and the views, so it holds fixed words only: unknown
+setting keys are **counted** ("2 unknown setting(s) under 'plugins'"; the path shown holds schema keys only); names in
+`forbidden-env` errors are shown only when they look like a variable name (`^[A-Za-z][A-Za-z0-9_.-]{0,40}$`), others
+counted; a partial reading names pools (`claude-gpt: no 5-hour window`), not the group title as shown; the "no quota
+groups" error gives line and footer counts.
+
 ### Subscription proof (`agy_isolation.check_subscription`) [ESCALATE]
 
 With no auth mode in settings, the probe proves the login from what agy itself shows on the `/usage` answer (the
 "Models & Quota" box: an "Account:" line and the tier / plan text). Read-only evidence; the account email is matched and
-dropped (`scrub_account`) before anything is checked, stored or echoed, including the "no quota groups" error's screen tail.
+dropped (`scrub_account`) before anything is checked. No error ever carries screen text (round 3: the "no quota
+groups" error used to carry the screen's tail, and a private line survived the email scrub); it reports counts only.
 
 - Refused (`subscription-unproven`, "refused: subscription login not proven"): the screen names an API key, Vertex,
   enterprise, pay-as-you-go, Application Default Credentials / ADC, a Cloud project, a billing account or Code Assist

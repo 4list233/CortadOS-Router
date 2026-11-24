@@ -4,6 +4,7 @@ Fake agy CLIs only (small scripts run in a real PTY by scarcity.tui_capture); no
 State is a throwaway directory; the module's STATE / CACHE / HISTORY / PROBE_DIR are patched to it.
 """
 from __future__ import annotations
+import io
 import json
 import os
 import shutil
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -284,6 +286,83 @@ class ProbeHonesty(AgyBase):
             with self.assertRaisesRegex(iso.SettingsRefused, "MCP servers"):
                 sc._antigravity()
 
+    # ---- #144 round 3: dotenv files and private text
+    def test_dotenv_with_a_banned_prefix_refuses_the_probe_before_any_start(self):
+        binary, log = self.fake({"boot": BANNER})
+        for name in ("GEMINI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "AGY_ADC_AUTH", "CLOUDSDK_CONFIG"):
+            for where in (self.home / ".gemini" / ".env", self.home / ".env", sc.PROBE_DIR / ".env"):
+                with self.subTest(name=name, where=where.name):
+                    where.parent.mkdir(parents=True, exist_ok=True)
+                    where.write_text(f"{name}=secret-value-42\n")
+                    with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+                        with self.assertRaises(iso.ForbiddenEnv) as cm:
+                            sc._antigravity()
+                    rec = sc._failed_record("antigravity", None, cm.exception)
+                    self.assertEqual(rec["error_kind"], "forbidden-env")
+                    self.assertNotIn("secret-value-42", rec["error"])
+                    where.unlink()
+        self.assertEqual(self.keys(log), b"")
+
+    def test_dotenv_planted_in_the_probe_folder_refuses_before_the_fork(self):
+        binary, _ = self.fake({"boot": BANNER})
+        real = iso.check_dotenv
+
+        def plant_then_check(home, workdir):
+            if Path(workdir).name.startswith("p"):              # the per-probe folder (PROBE_DIR is "usage-probe")
+                Path(workdir, ".env").write_text("GEMINI_API_KEY=k\n")
+            return real(home, workdir)
+        with self.env(binary), mock.patch.object(iso, "check_dotenv", plant_then_check), \
+                mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises(iso.ForbiddenEnv):
+                sc._antigravity()
+        self.assertEqual([p.name for p in sc.PROBE_DIR.iterdir()], [])   # the refused folder is removed
+
+    def test_unparsable_dotenv_refuses_the_probe(self):
+        binary, _ = self.fake({"boot": BANNER})
+        p = self.home / ".gemini" / ".env"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("GEMINI_API_KEY=\"secret\nmore\"\n")
+        with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises(iso.SettingsRefused) as cm:
+                sc._antigravity()
+        self.assertNotIn("secret", str(cm.exception))
+
+    def test_harmless_dotenv_lets_the_probe_run(self):
+        p = self.home / ".gemini" / ".env"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("EDITOR=vim\n")
+        iso.check_dotenv(self.home, sc.PROBE_DIR)
+        binary, log = self.fake({"boot": BANNER, "usage": "Plan: Google AI Pro\n" + FIXTURE.read_text()})
+        with self.env(binary), confirmed_tier():
+            rec = sc._antigravity()
+        self.assertEqual(rec["tier"], "AI Pro")
+
+    def test_no_groups_error_holds_no_screen_text(self):
+        marker = "PRIVATE-MARKER-9c1e"
+        screen = (f"Models & Quota\nAccount: {marker} owner@example.com\nNote: {marker}\n"
+                  "Limit Remaining ?? Limit Remaining ??\n")
+        binary, _ = self.fake({"boot": BANNER, "usage": screen})
+        with self.env(binary):
+            with self.assertRaisesRegex(RuntimeError, "no quota groups") as cm:
+                sc._antigravity()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rec = sc._failed_record("antigravity", None, cm.exception)
+        for text in (str(cm.exception), rec["error"], err.getvalue(), json.dumps(rec)):
+            self.assertNotIn(marker, text); self.assertNotIn("example.com", text); self.assertNotIn("Account", text)
+
+    def test_unknown_setting_key_is_not_echoed_into_the_record(self):
+        binary, _ = self.fake({"boot": BANNER})
+        self.write_settings({"trustedWorkspaces": [], "owner.private@example.com": True})
+        with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises(iso.SettingsRefused) as cm:
+                sc._antigravity()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rec = sc._failed_record("antigravity", None, cm.exception)
+        for text in (rec["error"], err.getvalue()):
+            self.assertNotIn("example.com", text); self.assertNotIn("owner.private", text)
+
     # ---- #144 round 2: agy stores no auth mode; the subscription is proven from its screen (provisional: refusing)
     def test_full_reading_is_refused_while_the_tier_pattern_is_provisional(self):
         binary, _ = self.fake({"boot": BANNER, "usage": "Plan: Google AI Pro\n" + FIXTURE.read_text()})
@@ -343,7 +422,7 @@ class ProbeHonesty(AgyBase):
         self.assertEqual([w["window"] for w in g["gemini models"]], ["week", "5-hour"])
         self.assertEqual([w["window"] for w in g["claude and gpt models"]], ["week"])
         gaps = sc.agy_usage_gaps(first)
-        self.assertIn("claude and gpt models: no 5-hour window", gaps)
+        self.assertIn("claude-gpt: no 5-hour window", gaps)
         self.assertTrue(any(x.startswith("pager not read to the end") for x in gaps), gaps)
         self.assertEqual(sc._agy_next_page(first), (b"\x1b[B", "Down"))
 
@@ -367,7 +446,7 @@ class ProbeHonesty(AgyBase):
         with self.env(binary):
             with self.assertRaises(sc.ProbePartialReading) as cm:
                 sc._antigravity()
-        self.assertIn("claude and gpt models: no 5-hour window", str(cm.exception))
+        self.assertIn("claude-gpt: no 5-hour window", str(cm.exception))
         rec = sc._failed_record("antigravity", None, cm.exception)
         self.assertEqual((rec["error_kind"], sc.lane_state(rec)), ("partial-reading", "quota screen read only in part"))
 
