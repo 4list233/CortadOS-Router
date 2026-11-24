@@ -118,6 +118,15 @@ def workload_hint(raw: Any) -> str | None:
     return v
 
 
+def band_model_window(model: Any) -> str | None:
+    """The `<window>` text of a `cortados@<window>` model name (as written, unvalidated: parse_band_window checks it),
+    or None for any other name. THE one reading of that spelling: band_window takes the window from it, and
+    orchestrator_usage counts a model it matches as routed (the provider echoes the suffixed name into the client's
+    transcript, so a windowed main loop's tokens must not also count as the owner's direct orchestrator usage)."""
+    m = model.strip() if isinstance(model, str) else ""
+    return m[len(BAND_MODEL_PREFIX):] if m.casefold().startswith(BAND_MODEL_PREFIX) else None
+
+
 def band_window(header: Any, model: Any) -> tuple[tuple[str, str] | None, str | None]:
     """(window, error) of a request: from the BAND_HEADER value and the body's model (`cortados@<window>`). (None,
     None) when neither names one (or `any`); an error string for an invalid window, or for header and model naming two
@@ -128,9 +137,9 @@ def band_window(header: Any, model: Any) -> tuple[tuple[str, str] | None, str | 
     raw = header.strip() if isinstance(header, str) else ""
     if raw:
         sources.append((BAND_HEADER, raw))
-    m = model.strip() if isinstance(model, str) else ""
-    if m.casefold().startswith(BAND_MODEL_PREFIX):
-        sources.append((f"model {BAND_MODEL_PREFIX}…", m[len(BAND_MODEL_PREFIX):]))
+    from_model = band_model_window(model)
+    if from_model is not None:
+        sources.append((f"model {BAND_MODEL_PREFIX}…", from_model))
     for where, text in sources:
         try:
             found.append(core.parse_band_window(text))

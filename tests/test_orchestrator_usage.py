@@ -76,6 +76,29 @@ class ScanTest(unittest.TestCase):
         self.assertIsNone(work_split.validate_block(s, NOW, live.TIME_SKEW_S)[1])
         self.assertIsNone(live.validate_heartbeat({"host": "air", "jobs": [], "orchestrator": s}, NOW)[1])
 
+    def test_a_windowed_main_loop_counts_as_routed_not_as_orchestrator(self):
+        # Review of b1d3075 (P2): the provider echoes `cortados@<window>` (session.py --orchestrator-band), so a
+        # windowed main loop's transcript tokens are routed tokens, never also the owner's direct usage.
+        self.write(f"-Users-o-code-X/{MAIN}.jsonl", [
+            line(MAIN, "m1", NOW - 60, inp=1, out=2, cwd="/Users/o/code/X"),
+            line(MAIN, "m2", NOW - 60, inp=100, out=10, cwd="/Users/o/code/X", model="cortados@R2"),
+            line(MAIN, "m3", NOW - 60, inp=100, out=10, cwd="/Users/o/code/X", model="cortados@R1-R2"),
+            line(MAIN, "m4", NOW - 60, inp=100, out=10, cwd="/Users/o/code/X", model="Cortados@any"),
+        ])
+        s = self.scan()
+        self.assertEqual(s["totals"]["24h"], {"input": 1, "output": 2, "cache_read": 0, "cache_write": 0, "sessions": 1})
+        self.assertEqual(s["excluded"]["routed_model_entries"], 3)
+
+    def test_routed_model_names_share_the_providers_parser(self):
+        from cortados_router.provider import routing
+        for name in ("cortados", "cortados@R2", "cortados@R1-R2", "sub/gpt-6.1-sol", "api/claude-haiku-5"):
+            self.assertTrue(ou._routed_model(name), name)
+        for name in ("claude-opus-5", "cortados-v2", "xcortados@R2", "<synthetic>"):
+            self.assertFalse(ou._routed_model(name), name)
+        # one reading of the spelling: whatever the provider takes a window from is routed here
+        with mock.patch.object(routing, "band_model_window", return_value=None):
+            self.assertFalse(ou._routed_model("cortados@R2"))
+
     def test_session_tag_matches_the_mod(self):
         # register.ts sessionTag: sha256(`${salt}:${sessionId}`).hex.slice(0, 16)
         import hashlib

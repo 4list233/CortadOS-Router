@@ -442,6 +442,12 @@ _EXCLUDE_MODEL_BAD = "cortados: x-cortados-exclude-model is not a model id"
 EXCLUDE_MODEL_MAX = 8
 
 
+def _window_label(window: tuple[str, str] | None) -> str | None:
+    """A validated band window's one spelling (core.band_window_label: `R2`, `R1-R2`), or None for no window."""
+    from cortados_router import core
+    return core.band_window_label(*window) if window else None
+
+
 def _exclude_model_header(headers) -> tuple[str | None, bool]:
     """The x-cortados-exclude-model header: (its items, stripped and comma-joined, or None when absent/empty, valid).
     Empty items are ignored; each item must be a model id, and more than EXCLUDE_MODEL_MAX items is invalid."""
@@ -1958,6 +1964,11 @@ class FailedSession(LostSession):
 REBUILD_LIMIT_REASON = "the conversation reached its rebuild limit (terminal)"
 REBUILD_TOO_LARGE_REASON = "the rebuilt history does not fit the conversation's model (terminal)"
 MODEL_CHANGE_REASON = "the continuation asks for another model than its conversation runs (terminal)"
+WINDOW_CHANGE_REASON = "the continuation asks for another band window than its conversation was routed in (terminal)"
+# The band window a conversation was opened with (routing.band_window's label, or None), kept in its route so every
+# continuation is checked against it (Handler._window_change). Its own key: the route's `band_window` comes from select
+# and a later rule (a local bind) may rewrite the route without it.
+ASKED_WINDOW_KEY = "asked_band_window"
 # Refused.code -> the fixed record reason (_note_refusal); never request-derived text.
 REFUSED_REASONS = {
     "no_identity": "the continuation carries no conversation identity (terminal)",
@@ -2966,10 +2977,11 @@ class Handler(BaseHTTPRequestHandler):
         return outcome
 
     def _open_conversation(self, turn, body: dict[str, Any], wire: Wire, *, one_shot: bool, floor: float | None,
-                           scope: str | None, also_exclude: str | None = None):
+                           scope: str | None, window: tuple[str, str] | None = None, also_exclude: str | None = None):
         """Route and open a new conversation (or a one-shot) for `turn`: the session, or None when the request was
-        refused (the answer is sent). `also_exclude`: a model to keep the route off on top of the client's
-        x-cortados-exclude-model (a local model whose node cannot hold the request: the caller's re-route)."""
+        refused (the answer is sent). `window`: the request's band window, already validated by _messages.
+        `also_exclude`: a model to keep the route off on top of the client's x-cortados-exclude-model (a local model
+        whose node cannot hold the request: the caller's re-route)."""
         reg = self.server.registry
         route = None
         if floor is not None and not reg.router:
@@ -2990,12 +3002,6 @@ class Handler(BaseHTTPRequestHandler):
             if not valid:
                 return self._error(400, "invalid_request_error", _LOCAL_BAD, wire)
             workload = routing.workload_hint(self.headers.get(routing.WORKLOAD_HEADER))   # unknown: logged, ignored
-            # The band window: x-cortados-band, or the main loop's `cortados@<window>` model (routing.BAND_HEADER).
-            # Only an owner-token request reaches here (do_POST's _authorized), the trust of every routing header.
-            window, bad = routing.band_window(self.headers.get(routing.BAND_HEADER), body.get("model"))
-            if bad:
-                return self._error(400, "invalid_request_error", f"cortados: {bad}", wire,
-                                   reason="the band window is invalid")
             try:
                 route_fn = reg.router if one_shot else reg.route_new
                 route = route_fn(wire.routing_body(body), self._client(),
@@ -3023,6 +3029,8 @@ class Handler(BaseHTTPRequestHandler):
                                    reason="no route is available")
             logger.info("route %s: %s/%s band %s%s", route["route_id"], route["provider"], route["model"],
                         route["band"], " (S1 degraded)" if route.get("degraded") else "")
+            # Kept for every continuation's check (_window_change); None when the request asked for no window.
+            route = dict(route, **{ASKED_WINDOW_KEY: _window_label(window)})
         try:
             return reg.new(turn, keep=not one_shot, route=route, scope=scope,
                            wire_path=self.path.split("?")[0], admitted=bool(reg.router and not one_shot),
@@ -3297,6 +3305,9 @@ class Handler(BaseHTTPRequestHandler):
             if not why_out:
                 why_out.append("no_answer")
             return None
+        # routing._moved builds a new route without the opener's own keys: the window the conversation was opened with
+        # must survive the move, or every later continuation would be refused as a changed window (_window_change).
+        moved = {**moved, ASKED_WINDOW_KEY: (route or {}).get(ASKED_WINDOW_KEY)}
         if one_shot:
             session.route = moved                       # a throwaway backend: nothing to rebind; the record is local
             return session, got["turn"]
@@ -3521,6 +3532,17 @@ class Handler(BaseHTTPRequestHandler):
             floor, floor_valid = _min_left_header(self.headers)
             if not floor_valid:
                 return self._error(400, "invalid_request_error", _MIN_LEFT_BAD, wire)
+            # The band window (x-cortados-band, or the main loop's `cortados@<window>` model; routing.BAND_HEADER), read
+            # on EVERY request, before the session lookup or a replay: an invalid one is refused on a continuation
+            # exactly as on an opening turn (review of b1d3075: a continuation once ran, and echoed the model, under
+            # `cortados@NOT-A-BAND`). A fixed-model endpoint does not route, so it reads no routing header, as before.
+            # Only an owner-token request reaches here (do_POST's _authorized), the trust of every routing header.
+            window = None
+            if reg.router:
+                window, bad = routing.band_window(self.headers.get(routing.BAND_HEADER), body.get("model"))
+                if bad:
+                    return self._error(400, "invalid_request_error", f"cortados: {bad}", wire,
+                                       reason="the band window is invalid")
             turn = wire.parse_request(body)
             server_tools = anthropic_wire.server_tool_names(body) if wire is ANTHROPIC else []
             if server_tools and not turn.tools:
@@ -3591,19 +3613,19 @@ class Handler(BaseHTTPRequestHandler):
         except ConversationBusy as exc:                 # a rebuild in this scope is starting: the retry sees it done
             return self._error(BUSY_STATUS, "overloaded_error", str(exc), wire)
         except Replay as rp:
-            return self._serve_replay(rp, turn, body, wire)
+            return self._serve_replay(rp, turn, body, wire, window)
         except LostSession as exc:
             return self._error(409, "invalid_request_error", str(exc), wire)
         if rebuild is not None:
-            session = self._rebuild(rebuild, turn, body, wire, scope)
+            session = self._rebuild(rebuild, turn, body, wire, scope, window)
             if session is None:
                 return                                  # refused; the answer is sent
-        changed = self._model_change(session, body) if session is not None else None
-        if changed:
-            return self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
+        if session is not None and self._fixed_route_refused(session, turn, body, wire, window):
+            return
         created = session is None                       # this request opens the conversation (or is a one-shot)
         if session is None:
-            session = self._open_conversation(turn, body, wire, one_shot=one_shot, floor=floor, scope=scope)
+            session = self._open_conversation(turn, body, wire, one_shot=one_shot, floor=floor, scope=scope,
+                                              window=window)
             if session is None:
                 return                                  # refused; the answer is sent
         if isinstance(session, ApiSession):             # the API credit lane: relayed to the API, never a CLI turn
@@ -3632,6 +3654,7 @@ class Handler(BaseHTTPRequestHandler):
                        else "answered the opening turn with an HTTP 5xx before any byte reached the client")
             bound = session.route or {}
             session = self._open_conversation(turn, body, wire, one_shot=one_shot, floor=floor, scope=scope,
+                                              window=window,
                                               also_exclude=str((moved.get("model") or {}).get("id") or ""))
             if session is None:
                 return
@@ -3969,13 +3992,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(TERMINAL_STATUS, wire.error_json(TERMINAL_ERROR, message), headers={"x-should-retry": "false"})
 
-    def _serve_replay(self, rp: "Replay", turn, body: dict[str, Any], wire: Wire) -> None:
+    def _serve_replay(self, rp: "Replay", turn, body: dict[str, Any], wire: Wire,
+                      window: tuple[str, str] | None = None) -> None:
         """Answer a retry of an answered turn with the stored reply (Registry.find, or rebuild()'s identical twin).
         A retry that also changes the sub/ pin gets the same refusal as any continuation that does: the stored
-        answer came from the conversation's own model, which the request no longer asks for."""
-        changed = self._model_change(rp.session, body)
-        if changed:
-            return self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
+        answer came from the conversation's own model, which the request no longer asks for (and likewise a changed
+        band window: _window_change)."""
+        if self._fixed_route_refused(rp.session, turn, body, wire, window):
+            return
         _, _, msg_id, model, blocks, stop, usage = rp.last
         if turn.stream:
             try:
@@ -3995,14 +4019,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         return self._json(200, wire.message_json(msg_id, model, blocks, stop, usage), session=rp.session)
 
-    def _rebuild(self, rb: "Rebuild", turn, body: dict[str, Any], wire: Wire, scope: str | None):
+    def _rebuild(self, rb: "Rebuild", turn, body: dict[str, Any], wire: Wire, scope: str | None,
+                 window: tuple[str, str] | None = None):
         """Serve a continuation whose client rewrote the history on a rebuilt backend (Registry.rebuild); the new
         session, or None once a refusal has been answered. The conversation's model is fixed (a changed sub/ pin is
         refused exactly as on any continuation); a refusal to rebuild names its reason."""
         reg = self.server.registry
-        changed = self._model_change(rb.session, body)
-        if changed:
-            self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
+        if self._fixed_route_refused(rb.session, turn, body, wire, window):
             return None
         try:
             transcript = anthropic_wire.rebuild_transcript(wire.history_messages(body))
@@ -4026,7 +4049,7 @@ class Handler(BaseHTTPRequestHandler):
         except Refused as exc:                          # the limit, committed by a concurrent rebuild
             self._terminal(turn, wire, str(exc), reason=REFUSED_REASONS.get(exc.code, REBUILD_LIMIT_REASON))
         except Replay as rp:                            # an identical request rebuilt it and was answered first
-            self._serve_replay(rp, turn, body, wire)
+            self._serve_replay(rp, turn, body, wire, window)
         except LostSession as exc:                      # ...and its answer was not kept: a stale continuation
             self._error(409, "invalid_request_error", str(exc), wire)
         except ConversationBusy as exc:
@@ -4188,6 +4211,41 @@ class Handler(BaseHTTPRequestHandler):
             return (self.headers.get(REVEAL_HEADER) or "").strip().lower() in ("1", "true", "yes", "on")
         except Exception:
             return False
+
+    def _fixed_route_refused(self, session, turn, body: dict[str, Any], wire: Wire,
+                             window: tuple[str, str] | None) -> bool:
+        """True once a continuation that asks for another model (_model_change) or another band window
+        (_window_change) than its conversation has been refused (terminal; the answer is sent)."""
+        changed = self._model_change(session, body)
+        if changed:
+            self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
+            return True
+        changed = self._window_change(session, window)
+        if changed:
+            self._terminal(turn, wire, changed, reason=WINDOW_CHANGE_REASON)
+            return True
+        return False
+
+    @staticmethod
+    def _window_change(session, window: tuple[str, str] | None) -> str | None:
+        """Why a continuation must be refused for asking for another band window than its conversation was routed in,
+        or None. Chosen behaviour: REFUSE (terminal), never re-route and never keep the old route silently. The window
+        only acts when S1 picks the route, and that happens once, when the conversation opens: the running backend
+        cannot change model without losing its session and prompt cache, the same reason a changed sub/ pin is refused
+        (_model_change). The switching margin and sticky lanes (routing.previous_routes) act between conversations,
+        never inside one. Serving on the old route would answer a request under a window it did not ask for (e.g. R3
+        spend after the person narrowed it to R2) while echoing the new name. Adding, dropping or changing the window
+        all count; `R2` and `R2-R2` are one window. Not checked on a pinned conversation (a pin ignores the window
+        when it opens, routing.choose) or one without a router (a fixed-model endpoint reads no routing header)."""
+        r = getattr(session, "route", None)
+        if not r or r.get("pinned"):
+            return None
+        had, asks = r.get(ASKED_WINDOW_KEY), _window_label(window)
+        if had == asks:
+            return None
+        shown = lambda w: f"band window {w}" if w else "no band window"
+        return (f"cortados: the band window is fixed per conversation: this one was routed with {shown(had)}, and this "
+                f"request asks for {shown(asks)}; start a new conversation to change it")
 
     @staticmethod
     def _model_change(session, body: dict[str, Any]) -> str | None:

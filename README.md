@@ -365,7 +365,10 @@ What runs where:
   `band window R2`, or `band window R2 overridden` when a hard rule won. Child tasks launch with
   `--orchestrator-band any` and keep free routing. A `sub/` pin ignores the window. Other clients can send the same
   window as the `x-cortados-band` header (both wires; owner token only, like every routing header). An invalid window
-  is refused with a 400.
+  is refused with a 400, on every request, continuations included. The window is fixed per conversation, like its
+  route: a continuation that asks for another window (changed, added or dropped) is refused as terminal (400,
+  `x-should-retry: false`) and is never re-routed or served on the old route. Start a new conversation to change it
+  (in Claude Code, `/clear` after `/model`).
 - **Native subagents:** `CLAUDE_CODE_SUBAGENT_MODEL=cortados` (+ `_FORCE`, and the workflow variant), so S1 routes
   each one. They are Claude Code's own subagents, so they keep every tool, MCP included; the provider bridges the tool
   calls back to this Claude Code, which runs them locally. Caveat: what `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` does is

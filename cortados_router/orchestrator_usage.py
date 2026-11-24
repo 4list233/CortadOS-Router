@@ -69,7 +69,7 @@ from typing import Any, Iterable
 
 if __package__ in (None, ""):                       # run as a file: make the package importable
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from cortados_router.provider import bridge as _bridge, search_lane as _search_lane  # noqa: E402
+from cortados_router.provider import bridge as _bridge, routing as _routing, search_lane as _search_lane  # noqa: E402
 
 VERSION = 2                                     # 2: shared salt, session_alt, salt_source, per-session models (#127)
 DEFAULT_PROJECTS = "~/.claude/projects"
@@ -224,7 +224,10 @@ def _count(v: Any) -> int:
 
 
 def _routed_model(model: str) -> bool:
-    return model in ROUTED_MODELS or model.startswith(ROUTED_PREFIXES)
+    # `cortados@<window>` (a windowed whole-session main loop) is the provider's model too: the provider echoes the
+    # suffixed name, so without this its tokens would count twice, here and as routed tokens (review of b1d3075).
+    return (model in ROUTED_MODELS or model.startswith(ROUTED_PREFIXES)
+            or _routing.band_model_window(model) is not None)
 
 
 def scan(projects_dir: str | os.PathLike = DEFAULT_PROJECTS, *, now: float | None = None,

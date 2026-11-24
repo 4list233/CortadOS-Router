@@ -19,7 +19,8 @@ from cortados_router import child_tasks, core, execution_routing, session
 from cortados_router.provider import clients, routing, tasks
 from tests.test_provider import TOKEN, EndpointHarness
 from tests.provider_fakes import setUpModule, tearDownModule  # noqa: F401  (FAKE_* reach the fake CLIs, #106)
-from tests import test_session
+from tests import test_provider_codex, test_session
+from cortados_router.provider import server as provider_server
 from tests.test_routing_fixes import ACCOUNTS, MS, UCS_132, FakeSc, dec, health, week
 
 R2 = ("R2", "R2")
@@ -265,6 +266,70 @@ class EndpointTests(EndpointHarness):
         except urllib.error.HTTPError as e:
             self.assertEqual(e.code, 503)
         self.assertEqual(self.seen[0][1], {"band_window": R2})
+
+
+_CODEX = test_provider_codex.CodexEndpointTests   # deleted below: a module-level TestCase would be collected here
+
+
+class ContinuationTests(unittest.TestCase):
+    """Review of b1d3075 (P2): the window is read on every request. An invalid one is refused on a continuation as on
+    an opening turn; a changed one is refused (terminal), never served on the old route (server Handler._window_change).
+    The real endpoint over the fake codex app-server; the router is a stub returning a codex route."""
+
+    # the codex endpoint harness, without inheriting (and so re-running) its tests
+    tearDown, request, post, error_of, send_with, continuation = (
+        _CODEX.tearDown, _CODEX.request, _CODEX.post, _CODEX.error_of, _CODEX.send_with, _CODEX.continuation)
+
+    def setUp(self):
+        test_provider_codex.CodexEndpointTests.setUp(self)
+        self.routed = []
+
+        def router(body, client, **kw):            # as routing.choose: a pin ignores the window, S1 routes in it
+            self.routed.append(kw.get("band_window"))
+            pin, w = routing.sub_pin(body), kw.get("band_window")
+            if pin:
+                return dict(test_provider_codex.CODEX_ROUTE, model=pin, band="pin", pinned=True)
+            return dict(test_provider_codex.CODEX_ROUTE, **({"band_window": core.band_window_label(*w)} if w else {}))
+        self.reg.router = router
+
+    def test_an_invalid_window_on_a_continuation_is_refused(self):
+        body = self.continuation("cortados@R2", "cortados@NOT-A-BAND")
+        code, msg = self.error_of(body)
+        self.assertEqual(code, 400); self.assertIn("not a band window", msg)
+        self.assertEqual(self.routed, [R2])                    # the opening turn only; the continuation never ran
+        [session] = self.reg.sessions.values()                 # the conversation is kept: a valid retry continues it
+        self.assertEqual(self.post(dict(body, model="cortados@R2"))["content"],
+                         [{"type": "text", "text": "tool said: hello"}])
+
+    def test_the_same_window_continues(self):
+        body = self.continuation("cortados@R2", "cortados@r2-R2")   # another spelling of the same window
+        self.assertEqual(self.post(body)["content"], [{"type": "text", "text": "tool said: hello"}])
+        self.assertEqual(self.routed, [R2])
+
+    def test_a_changed_window_is_refused_not_rerouted(self):
+        for first, then in (("cortados@R2", "cortados@R1-R2"), ("cortados@R2", "cortados"), ("cortados", "cortados@R2")):
+            with self.subTest(first=first, then=then):
+                self.routed.clear()
+                for s in list(self.reg.sessions.values()):
+                    self.reg.drop(s)
+                code, msg = self.error_of(self.continuation(first, then))
+                self.assertEqual(code, provider_server.TERMINAL_STATUS)   # terminal: the retry asks the same
+                self.assertIn("band window is fixed per conversation", msg)
+                self.assertEqual(len(self.routed), 1)                    # never re-routed
+
+    def test_a_changed_header_window_is_refused_too(self):
+        body = self.continuation("cortados@R2", "cortados")
+        code, err = self.send_with(body, {routing.BAND_HEADER: "R3"})
+        self.assertEqual(code, provider_server.TERMINAL_STATUS)
+        self.assertIn("this request asks for band window R3", err["message"])
+        self.assertEqual(self.send_with(body, {routing.BAND_HEADER: "R2"})[0], 200)   # the header naming the same one
+
+    def test_a_pinned_conversation_ignores_the_window(self):
+        body = self.continuation("sub/opus", "sub/opus")
+        self.assertEqual(self.send_with(body, {routing.BAND_HEADER: "R1"})[0], 200)
+
+
+del _CODEX
 
 
 class LauncherTests(test_session.SessionTests):
