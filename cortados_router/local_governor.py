@@ -1073,8 +1073,15 @@ class Admission:
     gate answers at once, a retryable 529 when the node is full now, a non-retryable refusal when the request could
     never fit (`too_large`)."""
 
-    def __init__(self, governor: Governor | None):
+    def __init__(self, governor: Governor | None, count_limit: int | None = None, count_reason: str | None = None):
+        # count_limit (no governor only): a fixed COUNT and no byte budget, for a backend that allocates its whole
+        # context at load (Strata on the PC node, #145: local_backend "admission"). None: unlimited, as before.
+        if count_limit is not None and (governor is not None or isinstance(count_limit, bool)
+                                        or not isinstance(count_limit, int) or count_limit < 1):
+            raise ValueError("count_limit is a positive integer, and only without a governor")
         self.governor = governor
+        self._fixed = None if count_limit is None else {"limit": count_limit, "owner": None, "pressure": None,
+                                                        "reason": count_reason or f"at most {count_limit} at once"}
         self._lock = threading.Lock()
         self.inflight = 0
         self.reserved = 0                    # bytes held by the admitted requests in flight
@@ -1160,7 +1167,7 @@ class Admission:
         without a governor).
         budget_bytes, free_bytes, fit_tokens and free_tokens are those of the budget in force (available_bytes for the
         sample's owner state): the provider's routing skips the node on them (local_lane.gate_fit)."""
-        g = self.governor.current() if self.governor else NO_GOVERNOR
+        g = self.governor.current() if self.governor else (self._fixed or NO_GOVERNOR)
         with self._lock:
             self._note_owner(g)
             self._check_drain_locked()
@@ -1212,12 +1219,14 @@ class Admission:
         may still be live is ever given away.
         The owner's return (idle -> active) shrinks the budget, never a reservation: the turns in flight keep theirs
         and run on; a new turn is "busy" while the set in flight leaves it no room in the smaller budget."""
-        g = self.governor.current() if self.governor else NO_GOVERNOR
+        g = self.governor.current() if self.governor else (self._fixed or NO_GOVERNOR)
         with self._lock:
             vision = self.vision
             if image and vision is None:
                 return None, {**self._report(g), "refused": "unsupported", "reason": "the model reads no images"}
             if self.governor is None:
+                if g["limit"] is not None and self.inflight >= g["limit"]:
+                    return None, {**self._report(g), "refused": "busy"}
                 self.inflight += 1
                 return Ticket(self, 0), self._report(g)
             cfg = self.governor.cfg

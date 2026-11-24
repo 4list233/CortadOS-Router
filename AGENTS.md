@@ -48,7 +48,7 @@ is the long form.
   `boundary_hook.py` (the client-side PreToolUse boundary hook of local-routed turns: asks the provider's
   `/v1/cortados/boundary/check` about each write/Bash tool_use and resolves paths with realpath on the client; installed
   by `session.py` in every child and embedded in the routed-subagents mod; docs/BOUNDARY-HOOK.md),
-  `exec_hosts.py` (which machine a child runs on: `~/.config/cortados/exec-hosts.json`, ssh transport), `workspaces.py`
+  `gate_platform.py` (the local gate's macOS/Windows seam: file lock, no-follow, directory fsync, token-file mode or ACL; WinApi is its only ctypes code, faked in tests, #145), `node_policy.py` (the PC node's owner-away policy, kind `windows-idle`: switch, AC, signed-in sessions, the owner's activity file written by its `activity` writer in the owner's session, nvidia-smi GPU use; fixed refusal reasons; docs/LOCAL-RESOURCES.md "PC node (Strata)"; the gate's `strata` backend is in `local_backend.py`; Windows install and toggle scripts in `scripts/windows/`), `exec_hosts.py` (which machine a child runs on: `~/.config/cortados/exec-hosts.json`, ssh transport), `workspaces.py`
   (per-task repo worktrees / folders under `<root>/active`, archive-or-held settling, index.jsonl, archive-only cleanup).
 - `cortados_router/provider/` — the `cortados` model endpoint (design and status: `docs/PROVIDER-PLAN.md`).
   `server.py` HTTP endpoint, `Registry` of conversations and the `Wire` seam; `anthropic_wire.py` (Claude Code,

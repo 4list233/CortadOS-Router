@@ -1,7 +1,31 @@
 # PC (RTX 3060) enrollment: options and recommendation
 
-Status: **design only** (2026-11-24, branch `pc-rtx3060-enrollment`). No router code, router config or PC setting was
-changed to write it. Every `[ESCALATE]` below is the owner's decision; nothing here is done without it.
+Status: **option A built, not deployed** (2026-11-24, branch `pc-model-server`; design written on
+`pc-rtx3060-enrollment`). The code, tests, example configs and the PC's install script are in the repo; nothing was run
+on the PC, the Air or the live config. The owner's decisions of 2026-11-24 are in section 0; the deploy steps, each with
+its acceptance check, are in section 12 (they replace section 9 for option A). The remaining `[ESCALATE]` items are in
+section 10.
+
+## 0. Owner decisions (2026-11-24)
+
+These replace section 10's items 1, 2, 5 and 6.
+
+1. **Option A only**: the PC is a model server, not an execution host.
+2. **When it serves**: only while the owner is not using the PC, plus a simple toggle to switch serving off when he
+   starts a game and back on. The toggle is the existing per-node local switch (the gate's `/cortados/local-switch`),
+   flipped on the PC by two desktop shortcuts (`scripts/windows/cortados-serving.ps1`) or from any session by the
+   `local_switch` tool with node `pc`. Idle is input idle time (GetLastInputInfo, read in the owner's session) and no
+   full-screen app or heavy GPU use by another program. Thresholds and reasons: docs/LOCAL-RESOURCES.md "PC node
+   (Strata)" and `cortados_router/node_policy.py` (300 s without input; 40 % GPU; activity file stale after 20 s).
+   When the owner comes back the gate refuses new turns with a fixed 503 reason the provider routes around; a turn
+   already running finishes (`off -FreeGpu` also asks Strata to unload at once).
+3. **The Qwen3.8 Coder 125B is left out** entirely.
+4. **Administrator access is acceptable**: the tasks run as the owner's administrator account; no dedicated non-admin
+   account.
+5. **The model is not final** (a separate task compares Qwen3.6-35B-A3B Q4 with newer models), so the model id, context
+   limit and capability entry are configuration: `tables/local-backend.strata.example.json` (PC) and
+   `tables/resources.pc-node.example.json` (provider host). The shipped default is Qwen3.6-35B-A3B UD-Q4_K_XL at 48K,
+   pin-only (no proxy index: `tables/local-models.json` `index_proxies.not_mapped`).
 
 Placeholders. The repository is public, so this doc names no address, account or key path:
 
@@ -470,15 +494,14 @@ mode.
 
 ## 10. `[ESCALATE]` decisions for the owner
 
-1. **Which option**: A only (recommended), B, or C.
-2. **When the PC may serve**: always, owner-idle only (recommended, with the VRAM guard), or a schedule. Also
-   `idle_unload_s` (fast first answer vs a free GPU for games).
+1. ~~**Which option**~~: decided 2026-11-24, A only (section 0).
+2. ~~**When the PC may serve**~~: decided 2026-11-24, owner-idle only plus a toggle (section 0). Still open:
+   Strata's `idle_unload_s` (fast first answer vs a free GPU for games; suggested ~600).
 3. **Context for the 35B**: 48K (measured, recommended) or up to 63,488.
 4. **Proxy-index deduction** for Qwen3.6-35B-A3B UD-Q4_K_XL (suggested −5%), whether to add the non-thinking
    variant, and which bands once on (start R0).
-5. **The Coder IQ1_M**: leave it out (recommended), pin-only, or a scheduled batch window.
-6. **Accounts and keys**: a dedicated non-admin Windows account for the gate (and any B), with its own key. The
-   current administrator key stays the owner's own.
+5. ~~**The Coder IQ1_M**~~: decided 2026-11-24, left out.
+6. ~~**Accounts and keys**~~: decided 2026-11-24, the administrator account is acceptable.
 7. **Tailscale ACLs** restricting who reaches the PC's gate and ssh (and the Pro's gate). The tailnet has a shared
    device from another user.
 8. **Effect profile for PC-routed turns**: the strict (no shell) profile at first, or the same cost profile as the
@@ -497,3 +520,105 @@ mode.
   between ssh calls; Strata's `/v1/messages` with real Claude Code bodies (step 2 checks one tool call, not a session);
   load speed of a Task Scheduler start on this PC.
 - Line numbers are from `main` at `69d4e2c`.
+
+## 12. Deploy option A (as built on `pc-model-server`), with an acceptance check per step
+
+Nothing here has been run. Each step is the owner's to run or approve; steps on the PC are by hand (the auto-mode
+classifier refuses an agent registering scheduled tasks there). Placeholders as at the top of this doc; `<repo>` is the
+CortadOS-Router checkout on the PC (a clone of this branch once merged).
+
+**Step 0 (owner, PC): power, Tailscale, Windows Update.** As section 9 step 0: `powercfg /change standby-timeout-ac 0`,
+`powercfg /change hibernate-timeout-ac 0`, Tailscale "run unattended", Windows Update active hours.
+
+```sh
+ssh <pc> "powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE" | grep -i "AC Power Setting Index"   # 0x00000000
+```
+
+**Step 1 (code): done on this branch.** Gate port (`gate_platform.py`), `strata` backend, `node_policy.py`, provider
+lists, example configs, install and toggle scripts, `tests/test_pc_node.py`.
+
+```sh
+python3 -B -m unittest tests.test_pc_node                       # OK
+python3 -B -m unittest discover -s tests -t .                   # OK (full suite)
+```
+
+**Step 2 (owner, PC): Strata on loopback with the alias and 48K.** In Strata's config: `aliases` maps
+`Qwen3.6-35B-A3B` to the UD-Q4_K_XL model, `anthropic_thinking: "on_request"`, `--parallel 1`, max context 49152,
+`min_free_vram_mib` (so it answers 503 instead of loading while a game holds the card) and `idle_unload_s` (open item 2).
+Start it by hand once and note the exact executable and arguments (they become `-StrataExe` / `-StrataArgs`). Then
+section 9 step 2's three checks (model listed, a tool call through `/v1/messages`, listening on 127.0.0.1 only), and:
+
+```sh
+ssh <pc> "curl.exe -s http://127.0.0.1:8080/v1/models"     # the id the gate expects (upstream_ids) is listed;
+                                                            # note the field Strata sets after idle unload (the gate
+                                                            # reads "unloaded": true; adjust if Strata names it otherwise)
+```
+
+**Step 3 (owner, PC): install, dry run first.** From `<repo>` in an administrator PowerShell:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\install_pc_node.ps1 -Python <py> -ListenIp <pc-ts-ip> -StrataExe <strata.exe> -StrataArgs '<arguments from step 2>'
+# read the plan (every line "[dry-run] would: ..."), then the same command with -Apply
+```
+
+Acceptance (on the PC):
+
+```powershell
+Get-ScheduledTask CortadOS-Strata, CortadOS-Gate, CortadOS-Activity | Select TaskName, State   # all three, Ready/Running
+icacls $env:USERPROFILE\.config\cortados\local-gate-token        # only the account (R), SYSTEM (F), Administrators (F)
+<py> -B -m cortados_router.local_gate --listen <pc-ts-ip> --backend-config $env:USERPROFILE\.config\cortados\local-backend.json --token-file $env:USERPROFILE\.config\cortados\local-gate-token --no-studio-gate --print-config
+                                                                 # token "ok (64 chars, ACL owner-only)", backend strata
+<py> -B -m cortados_router.node_policy status --backend-config $env:USERPROFILE\.config\cortados\local-backend.json
+                                                                 # {"switch": ..., "allowed": ..., "activity": "active"} while typing
+Get-Content $env:USERPROFILE\.config\cortados\pc-activity.json   # "at" within the last 5 s
+nvidia-smi -i 0 --query-gpu=utilization.gpu --format=csv,noheader,nounits   # one number
+```
+
+Then reboot, do not sign in, wait 5 minutes, and from the Air (token as a header file, never in argv):
+
+```sh
+H=$(mktemp); chmod 600 "$H"; printf 'Authorization: Bearer %s\n' "$(cat ~/.config/cortados/pc-gate-token)" > "$H"
+curl -s -o /dev/null -w '%{http_code}\n' -H @"$H" http://<pc-ts-ip>:11435/api/tags          # 200 (owner away)
+curl -s -o /dev/null -w '%{http_code}\n'            http://<pc-ts-ip>:11435/api/tags          # 401
+curl -s -o /dev/null -w '%{http_code}\n' -H @"$H" -X POST http://<pc-ts-ip>:11435/v1/unload  # 404 (not forwarded)
+curl -s -H @"$H" http://<pc-ts-ip>:11435/cortados/local-switch                               # "activity": "away"
+rm -f "$H"
+```
+
+The token reaches the Air by hand over the owner's own channel (never printed in a terminal another session reads); on
+the Air it is a 0600 file.
+
+**Step 4 (owner, PC): idle and the toggle.** Sign in and type: `/cortados/local-switch` says `"allowed": false`,
+`"reason": "local disabled: owner active"`. Leave the PC for 5 minutes: `"allowed": true`. Start a full-screen game and
+leave it idle: `full-screen app running`. Double-click **CortadOS serving OFF (game)**: `switch: off`, and Strata's model
+is unloaded (`nvidia-smi` memory drops). Note what Strata's `/v1/unload` did to a turn in flight (not verified).
+Double-click **CortadOS serving ON**: `switch: on`.
+
+**Step 5 (owner, Air): register the node pin-only.** Copy the `pc` node of `tables/resources.pc-node.example.json` into
+the Air's `tables/resources.json`; set `CORTADOS_LOCAL_PC_GATE_URL=http://<pc-ts-ip>:11435` and
+`CORTADOS_LOCAL_PC_GATE_TOKEN_FILE` in the provider's LaunchAgent; restart the provider. Then, with the PC idle:
+
+```sh
+# from any session: route_task with model "sub/qwen36-35b" answers; local_switch status lists node pc, backend strata
+sqlite3 -readonly ~/.cortados/router.db "select lane, provider, model from routes order by rowid desc limit 3"   # local-pc
+```
+
+**Step 6 (owner, PC/Air): offline and busy behaviour.** Sign in and type on the PC (or put it to sleep), then pin again:
+a 503 naming node `pc` and the fixed reason (`owner active`) or "did not answer /api/tags" (asleep); an S1-routed
+conversation is unaffected (the PC is pin-only, so nothing is skipped yet). Within 30 s of a failed probe the provider
+does not probe the PC again (`routing.AUTO_DOWN_S`).
+
+**Step 7 (later, owner): selection by proxy index**, as section 9 step 6, once the model choice is final and the
+deduction is set. Until then the node stays pin-only.
+
+### What remains for the deploy
+
+- Steps 0 and 2 to 6 above (PC and Air; nothing was run).
+- Not verified on the PC: the ctypes calls (`gate_platform.WinApi`: ACL read, WTS sessions, GetLastInputInfo,
+  SHQueryUserNotificationState) are exercised only through fakes; step 3's acceptance runs them for real. The field
+  Strata uses for an idle-unloaded model, Strata's `/v1/unload` with a turn in flight, and whether `GetSystemPowerStatus`
+  reports AC on this desktop (if it reports unknown, set `"require_ac": false`).
+- Open `[ESCALATE]` items: section 10's 3 (context, 48K shipped), 4 (deduction, for step 7), 7 (Tailscale ACLs), 8
+  (effect profile for PC-routed turns; moot while pin-only, since a pin is relayed as the client sent it), 9, 10 and 12,
+  plus Strata's `idle_unload_s`.
+

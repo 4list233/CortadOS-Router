@@ -1,5 +1,6 @@
-"""Which model server the local gate fronts on its node, and how: `ollama` (today's) or `vllm-mlx` (an MLX
-continuous-batching server, docs/LOCAL-RESOURCES.md "MLX backend"). Read by the gate (local_gate.py) at startup and
+"""Which model server the local gate fronts on its node, and how: `ollama` (today's), `vllm-mlx` (an MLX
+continuous-batching server, docs/LOCAL-RESOURCES.md "MLX backend") or `strata` (Strata on the Windows PC node, #145,
+docs/LOCAL-RESOURCES.md "PC node (Strata)"). Read by the gate (local_gate.py) at startup and
 by scripts/install_mlx_backend.sh (through this module's CLI) to build the vllm-mlx LaunchAgent. Stdlib only.
 
 Config: a JSON file on the node, default ~/.config/cortados/local-backend.json (CORTADOS_LOCAL_BACKEND_CONFIG or the
@@ -11,10 +12,12 @@ source: server.create_anthropic_message, api/anthropic_adapter.py): text, tool_u
 (message_start … content_block_delta incl. input_json_delta and thinking_delta … message_stop), stop reasons and usage.
 So the provider's lane relays turns unchanged and the gate adapts only what differs, per backend:
 
-  client route (unchanged)   ollama upstream      vllm-mlx upstream
-  GET  /api/tags             GET /api/tags        GET /v1/models, answered in /api/tags shape (models_to_tags)
-  POST /v1/messages          POST /v1/messages    POST /v1/messages, body adapted (adapt_messages_body)
-  switch status models       GET /api/ps          GET /v1/models
+  client route (unchanged)   ollama upstream      vllm-mlx upstream                  strata upstream
+  GET  /api/tags             GET /api/tags        GET /v1/models, answered in        GET /v1/models, answered as the
+                                                  /api/tags shape (models_to_tags)   served name (strata_tags)
+  POST /v1/messages          POST /v1/messages    POST /v1/messages, body adapted    POST /v1/messages, model checked
+                                                  (adapt_messages_body)              and set (adapt_messages_body)
+  switch status models       GET /api/ps          GET /v1/models                     GET /v1/models (loaded ones)
 
 The adaptation lives in the gate, not the provider's lane, because only the gate knows its node's backend: the lane
 stays one Anthropic relay for every node, the gate's client-facing route set (ROUTES) does not grow, and the upstream
@@ -28,6 +31,27 @@ route each backend may receive is a fixed table here (UPSTREAM). What it changes
     `name:latest` the same, as for Ollama) and is sent with the exact served name; another model is a clean 404 here,
     never silently served by the MLX model.
   * errors: FastAPI answers {"detail": ...}; the gate rewraps a non-Anthropic error body in Anthropic's error shape.
+
+Strata (0.2.20, github.com/Niko1221/Strata) also serves the Anthropic Messages API itself (stream + tools), so the same
+relay holds. What differs:
+  * model: Strata serves ANY model name it is sent with its one loaded model ("any other name is still served"), so the
+    gate enforces the name: the request must name strata.models.<key>.served_model_name (Strata's `aliases` entry, the
+    id the provider's config gives the model), is sent with it, and another name is a clean 404, as for vllm-mlx.
+  * thinking: passed through. Strata is started with "anthropic_thinking": "on_request", which maps a request without
+    `thinking` to thinking off (what Claude Code's short helper calls need).
+  * the model list: /v1/models lists the loaded model under the name Strata gives it, with an `unloaded` flag after its
+    idle unload. The gate answers /api/tags with the served name only when one of the entry's `upstream_ids` (default:
+    the served name) is listed, so the provider's probe sees exactly the configured id or nothing; `loaded` says whether
+    a first turn will pay the ~3 minute load.
+  * busy: Strata answers 503 "the GPU is in use by another program" (its min_free_vram_mib guard) and 429 when its
+    queue times out. Both mean "not now": the gate answers its retryable 529 (STRATA_BUSY_STATUSES), which the provider
+    routes elsewhere.
+  * admission: Strata allocates the KV cache for its whole --max-context when it loads the model, so the 12 GB of VRAM
+    is spent once at load (Strata's min_free_vram_mib guards that), not per request: the MLX governor's per-request byte
+    budget does not apply and a `governor` section is refused. The gate's admission is a count, strata.max_inflight
+    (default 1: Strata's --parallel is 1 on a 12 GB card), and a request whose max_tokens alone reaches the model's
+    context_tokens is refused as never fitting (413). The prompt's own fit is Strata's to check (it counts tokens
+    exactly; a byte bound here would refuse every Claude Code turn at 48K).
 """
 from __future__ import annotations
 
@@ -40,18 +64,26 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
-from cortados_router import local_governor
+from cortados_router import local_governor, node_policy
 
-BACKENDS = ("ollama", "vllm-mlx")
+BACKENDS = ("ollama", "vllm-mlx", "strata")
 DEFAULT_CONFIG = "~/.config/cortados/local-backend.json"
 CONFIG_ENV = "CORTADOS_LOCAL_BACKEND_CONFIG"
 # The upstream request each client route becomes, per backend. Nothing outside this table reaches a backend.
 UPSTREAM = {
     "ollama": {("GET", "/api/tags"): ("GET", "/api/tags"), ("POST", "/v1/messages"): ("POST", "/v1/messages")},
     "vllm-mlx": {("GET", "/api/tags"): ("GET", "/v1/models"), ("POST", "/v1/messages"): ("POST", "/v1/messages")},
+    "strata": {("GET", "/api/tags"): ("GET", "/v1/models"), ("POST", "/v1/messages"): ("POST", "/v1/messages")},
 }
 # The switch status's "models loaded" source.
-LOADED = {"ollama": "/api/ps", "vllm-mlx": "/v1/models"}
+LOADED = {"ollama": "/api/ps", "vllm-mlx": "/v1/models", "strata": "/v1/models"}
+# Strata's "not now" answers (module docstring): the gate turns them into its retryable 529.
+STRATA_BUSY_STATUSES = (429, 503)
+# Strata on loopback: its own default port (`strata launch`); the gate is the only door from the tailnet.
+STRATA_DEFAULT_UPSTREAM = "http://127.0.0.1:8080"
+# strata.max_inflight default: Strata's --parallel on a 12 GB card ("fit to your card" picks 1 there).
+STRATA_MAX_INFLIGHT = 1
+STRATA_MODEL_KEYS = ("served_model_name", "context_tokens", "upstream_ids", "name", "quant", "gguf")
 LAUNCH_LABEL = "com.cortados.vllm-mlx"
 # The prompt guard: its source in this checkout, and its name in the venv's bin/ (install_mlx_backend.sh copies it).
 GUARD_SOURCE = Path(__file__).resolve().parent.parent / "integrations" / "vllm-mlx" / "cortados_vllm_mlx_guard.py"
@@ -191,7 +223,7 @@ def load(path: str | None = None, *, explicit: bool = False) -> dict[str, Any]:
         if explicit:
             raise BackendConfigError(f"backend config {p} not found")
         return {"backend": "ollama", "upstream": None, "served_model": None, "model": None, "serve": None,
-                "governor": None, "read_timeout_s": None, "path": None}
+                "governor": None, "read_timeout_s": None, "node_policy": None, "max_inflight": None, "path": None}
     try:
         with open(p, encoding="utf-8") as f:
             raw = json.load(f)
@@ -206,7 +238,8 @@ def check(raw: Any, path: str | None = None) -> dict[str, Any]:
     backend = raw.get("backend", "ollama")
     if backend not in BACKENDS:
         raise BackendConfigError(f"backend must be one of {', '.join(BACKENDS)}, got {backend!r}")
-    out: dict[str, Any] = {"backend": backend, "served_model": None, "model": None, "serve": None, "path": path}
+    out: dict[str, Any] = {"backend": backend, "served_model": None, "model": None, "serve": None,
+                           "max_inflight": None, "path": path}
     model = None
     if backend == "vllm-mlx":
         section = raw.get("vllm_mlx")
@@ -240,10 +273,13 @@ def check(raw: Any, path: str | None = None) -> dict[str, Any]:
         extra = check_extra_args(section.get("extra_args", []))
         out.update(served_model=model["served_model_name"].strip(), model={"key": name, **model}, serve=serve,
                    venv=venv, extra_args=extra)
+    if backend == "strata":
+        out.update(_check_strata(raw))
+        model = out["model"]
     # Ollama without an `upstream` key: None, so the gate keeps its own --upstream (today's setting). vllm-mlx: the
-    # address it is served on, from vllm_mlx.serve, unless `upstream` says otherwise.
+    # address it is served on, from vllm_mlx.serve, unless `upstream` says otherwise. Strata: its loopback default.
     upstream = raw.get("upstream") or (f"http://{_host_for_url(out['serve']['host'])}:{out['serve']['port']}"
-                                       if out["serve"] else None)
+                                       if out["serve"] else STRATA_DEFAULT_UPSTREAM if backend == "strata" else None)
     if upstream is not None:
         u = urllib.parse.urlparse(upstream)
         if u.scheme != "http" or u.hostname not in ("127.0.0.1", "::1", "localhost"):
@@ -259,6 +295,13 @@ def check(raw: Any, path: str | None = None) -> dict[str, Any]:
     gov = raw.get("governor")
     if gov is not None and not isinstance(gov, dict):
         raise BackendConfigError("governor must be an object or absent")
+    if gov is not None and backend == "strata":
+        raise BackendConfigError("backend strata takes no `governor`: Strata allocates the KV cache for its whole "
+                                 "context at load, so admission is strata.max_inflight (module docstring)")
+    try:
+        out["node_policy"] = node_policy.check_config(raw.get("node_policy"))
+    except node_policy.PolicyConfigError as exc:
+        raise BackendConfigError(str(exc)) from None
     if gov is not None and out["serve"] and "default_max_tokens" not in gov:
         # A request naming no max_tokens gets vllm-mlx's own default, so the governor reserves for that.
         gov = {**gov, "default_max_tokens": out["serve"]["max_tokens"]}
@@ -275,6 +318,72 @@ def check(raw: Any, path: str | None = None) -> dict[str, Any]:
 
 def _host_for_url(host: str) -> str:
     return f"[{host}]" if ":" in host else host
+
+
+def _check_strata(raw: dict[str, Any]) -> dict[str, Any]:
+    """The `strata` section: {"model": "<key>", "models": {"<key>": {served_model_name, context_tokens, upstream_ids?,
+    name?, quant?, gguf?}}, "max_inflight"?}. The model is configuration, not code (owner 2026-11-24: the PC's model is
+    not final): another model is another entry and `model` names the one Strata serves."""
+    section = raw.get("strata")
+    if not isinstance(section, dict):
+        raise BackendConfigError("backend strata needs a `strata` object")
+    models, name = section.get("models"), section.get("model")
+    if not isinstance(models, dict) or not isinstance(name, str) or name not in models:
+        raise BackendConfigError("strata.model must name an entry of strata.models (the model is config)")
+    m = models[name]
+    if not isinstance(m, dict):
+        raise BackendConfigError(f"strata.models.{name} must be an object")
+    for key in m:
+        if not key.startswith("_") and key not in STRATA_MODEL_KEYS:
+            raise BackendConfigError(f"strata.models.{name}: unknown key {key!r}")
+    served = m.get("served_model_name")
+    if not isinstance(served, str) or not served.strip():
+        raise BackendConfigError(f"strata.models.{name}.served_model_name must be a non-empty string (Strata's alias "
+                                 "for the model, the id the provider's config gives it)")
+    ctx = m.get("context_tokens")
+    if isinstance(ctx, bool) or not isinstance(ctx, int) or ctx <= 0:
+        raise BackendConfigError(f"strata.models.{name}.context_tokens must be a positive integer (the --max-context "
+                                 "Strata was started with)")
+    ids = m.get("upstream_ids", [served.strip()])
+    if not isinstance(ids, list) or not ids or not all(isinstance(i, str) and i.strip() for i in ids):
+        raise BackendConfigError(f"strata.models.{name}.upstream_ids must be a non-empty list of model names")
+    n = section.get("max_inflight", STRATA_MAX_INFLIGHT)
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise BackendConfigError("strata.max_inflight must be a positive integer")
+    for key in section:
+        if not key.startswith("_") and key not in ("model", "models", "max_inflight"):
+            raise BackendConfigError(f"strata: unknown key {key!r}")
+    return {"served_model": served.strip(), "max_inflight": n,
+            "model": {"key": name, **m, "served_model_name": served.strip(), "context_tokens": ctx,
+                      "upstream_ids": [i.strip() for i in ids]}}
+
+
+def strata_tags(cfg: dict[str, Any], raw: bytes) -> dict[str, Any] | None:
+    """Strata's GET /v1/models as Ollama's /api/tags, naming ONLY the served model (module docstring): {"models":
+    [{"name": served, "model": served, "loaded": bool}]} when one of its upstream_ids is listed, {"models": []} when
+    none is, None when the answer is not a model list."""
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None
+    want = {_normal(i) for i in cfg["model"]["upstream_ids"]}
+    hit = [m for m in items if isinstance(m, dict) and isinstance(m.get("id"), str) and _normal(m["id"]) in want]
+    if not hit:
+        return {"models": []}
+    served = cfg["served_model"]
+    loaded = not any(m.get("unloaded") is True for m in hit)
+    return {"models": [{"name": served, "model": served, "loaded": loaded}]}
+
+
+def strata_loaded(cfg: dict[str, Any], raw: bytes) -> list[str] | None:
+    """The switch status's loaded models on a Strata node: the served name when it is listed and not unloaded."""
+    tags = strata_tags(cfg, raw)
+    if tags is None:
+        return None
+    return [m["name"] for m in tags["models"] if m.get("loaded")]
 
 
 def _normal(name: str) -> str:
@@ -296,8 +405,10 @@ class Refusal(Exception):
 
 def adapt_messages_body(cfg: dict[str, Any], raw: bytes) -> bytes:
     """POST /v1/messages as the backend gets it (module docstring). Ollama: the bytes unchanged. vllm-mlx: model checked
-    and set to the served name, thinking mapped to chat_template_kwargs.enable_thinking. Refusal on a bad request."""
-    if cfg["backend"] != "vllm-mlx":
+    and set to the served name, thinking mapped to chat_template_kwargs.enable_thinking. Strata: model checked and set
+    to the served name, max_tokens checked against the context, everything else passed through. Refusal on a bad
+    request."""
+    if cfg["backend"] not in ("vllm-mlx", "strata"):
         return raw
     try:
         body = json.loads(raw)
@@ -311,6 +422,16 @@ def adapt_messages_body(cfg: dict[str, Any], raw: bytes) -> bytes:
     if not isinstance(body.get("model"), str) or _normal(body["model"]) != _normal(served):
         raise Refusal(404, "not_found_error", "model not served by this node's backend")
     body["model"] = served
+    if cfg["backend"] == "strata":
+        mt = body.get("max_tokens")
+        ctx = cfg["model"]["context_tokens"]
+        if isinstance(mt, int) and not isinstance(mt, bool) and mt >= ctx:
+            raise Refusal(413, "request_too_large", f"max_tokens {mt} leaves no room for a prompt in this node's "
+                                                    f"{ctx}-token context")
+        try:
+            return json.dumps(body).encode()
+        except RecursionError:
+            raise Refusal(400, "invalid_request_error", TOO_DEEP) from None
     thinking = body.get("thinking")
     kwargs = body.get("chat_template_kwargs")
     kwargs = {} if kwargs is None else kwargs
@@ -364,6 +485,9 @@ def anthropic_error(status: int, raw: bytes, backend: str) -> bytes:
     if isinstance(data, dict) and data.get("type") == "error" and isinstance(data.get("error"), dict):
         return raw
     detail = data.get("detail") if isinstance(data, dict) else None
+    if detail is None and isinstance(data, dict) and isinstance(data.get("error"), dict) \
+            and isinstance(data["error"].get("message"), str):
+        detail = data["error"]["message"]          # an OpenAI-shaped error ({"error": {"message": ...}}): Strata's
     text = detail if isinstance(detail, str) else json.dumps(detail) if detail is not None else \
         raw[:300].decode("utf-8", "replace")
     kind = {400: "invalid_request_error", 404: "not_found_error", 413: "request_too_large",

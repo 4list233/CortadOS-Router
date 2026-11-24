@@ -1886,6 +1886,91 @@ With the gate on vllm-mlx the Pro serves only the MLX model: the Ollama-only pin
    Ollama loads its 27B again on the next request.
 3. On the Air: `max_inflight` back to 1 (Ollama runs one 27B request at a time) and `read_timeout_s` as before.
 
+## PC node (Strata on the Windows gaming PC, #145)
+
+Option A of `docs/runbooks/PC-RTX3060-ENROLLMENT.md` (owner decisions 2026-11-24): the owner's Windows PC (RTX 3060
+12 GB, 32 GB RAM) is a second local model node, `pc`, beside the Pro. It is a model server only, never an execution
+host. It serves **only while the owner is not using it**, and the owner can switch it off when he starts a game.
+
+### Shape
+
+```
+provider (Air) --tailnet--> local gate on the PC (<pc-ts-ip>:11435, Python 3.12) --loopback--> Strata (127.0.0.1:8080)
+```
+
+- The gate is the same `local_gate.py` as the Pro's, run on Windows through `cortados_router/gate_platform.py`, the one
+  seam for what differs: `msvcrt.locking` for the epoch file's lock, no `O_NOFOLLOW` (a reparse point is refused from
+  `lstat` first), no directory fsync, and the token file's owner and DACL in place of its mode (`icacls`: read for the
+  gate's account, full for SYSTEM and Administrators, inheritance removed; anything granting Everyone, Users,
+  Authenticated Users or another account is refused). The S1-training node lock is fcntl-only and the PC trains
+  nothing, so the gate runs with `--no-studio-gate` (required on Windows: the gate refuses to start without it). On
+  macOS each seam call does exactly what the gate did before.
+- Backend `strata` (`local_backend.py`; example `tables/local-backend.strata.example.json`): the same two forwarded
+  routes; `/api/tags` answered from Strata's `/v1/models` as the configured served name only; the model name enforced
+  (Strata serves any name it is sent); `thinking` passed through (Strata started with `anthropic_thinking:
+  on_request`); Strata's 503 "GPU in use" and 429 queue timeout turned into the gate's retryable 529. Strata allocates
+  the KV cache for its whole context at load, so there is no per-request byte governor: admission is a count,
+  `strata.max_inflight` (1), and `max_tokens` at or over the context is refused as never fitting. Strata's control
+  endpoints (`/load`, `/unload`, `/v1/vram`, `/slots`, `/mcp`) are never forwarded.
+- **The model is configuration, not code** (the choice is not final): `strata.models.<key>` on the PC (served name,
+  `context_tokens`, `upstream_ids`) and the `pc` node's `models[]` on the provider host
+  (`tables/resources.pc-node.example.json`: id, alias, `context_length`). The shipped default is Qwen3.6-35B-A3B
+  UD-Q4_K_XL at 48K (measured 30.8 tok/s), pin-only: `auto_route` and `index_route` false, and no proxy-index variant
+  (`tables/local-models.json` → `index_proxies.not_mapped` says why), so S1 never picks it until the owner sets a
+  deduction (runbook step 6). The Qwen3.8 Coder 125B is left out.
+
+### When the PC serves (`node_policy.py`, kind `windows-idle`)
+
+A gate whose backend config has a `node_policy` decides with it instead of `pro_local_allowed`. In order, each refusal a
+fixed reason the provider may repeat (`node_policy.REFUSALS`, kept in step with `local_lane.PRO_LOCAL_REFUSALS`):
+
+| check | refused with | threshold and reason |
+| --- | --- | --- |
+| manual switch (same flag file as the Pro) | `local switch off` | the owner's toggle |
+| AC power (GetSystemPowerStatus) | `on battery` / `unknown power source` / `power check failed` | `require_ac: false` for a desktop that reports unknown |
+| signed-in sessions (WTSEnumerateSessions, from session 0) | `owner activity unknown` when unreadable | none active (signed out, disconnected remote desktop) = away |
+| activity file, when a session is active | `owner active` / `full-screen app running` / `owner activity unknown` | `idle_after_s` 300: shorter would serve under a paused game; the writer writes every 5 s and `activity_stale_s` 20 allows four misses |
+| GPU (nvidia-smi `utilization.gpu`) | `GPU busy with another program` / `GPU state unknown` | `gpu_busy_pct` 40: compositing, an animated wallpaper and video decode stay well under it; skipped while the gate's own turn runs and `own_gpu_grace_s` 10 after |
+| memory load (GlobalMemoryStatusEx) | `memory load high` | off by default: with the model loaded free RAM measured ~0.4 GiB (~99 %) |
+
+Why an activity writer: `GetLastInputInfo` and `SHQueryUserNotificationState` answer for the caller's session only,
+and the gate runs in session 0 (a startup task, up with nobody signed in), where they would always say idle. So
+`python -m cortados_router.node_policy activity --out <file>` runs at logon in the owner's session (task
+`CortadOS-Activity`, pythonw) and writes `{"v", "at", "idle_s", "fullscreen"}` every 5 s; stale, missing or malformed
+means unknown, which refuses. Every unreadable input refuses; nothing unknown counts as free.
+
+When the owner comes back mid-turn, the running turn finishes (bounded by the read timeout and its `max_tokens`; about
+two minutes for 4K tokens at ~30 tok/s) and nothing new is admitted: cutting it off would break a conversation bound to
+the node. To give a game the VRAM at once, the toggle's `off -FreeGpu` also asks Strata to unload.
+
+### The toggle
+
+The PC's switch is the gate's `/cortados/local-switch`, as on the Pro, so all of these flip the same flag:
+
+- on the PC: the desktop shortcuts **CortadOS serving ON** / **CortadOS serving OFF (game)** (installed by
+  `scripts/windows/install_pc_node.ps1`), or `scripts/windows/cortados-serving.ps1 on|off|status [-FreeGpu]`; it reads
+  the gate address and token path from `%USERPROFILE%\.config\cortados\pc-node\pc-node.json` and never prints the token;
+- from any session: the `local_switch` MCP tool or `/cortados-local` with node `pc`; the status carries `activity`
+  (`away` / `idle` / `active` / `unknown`) besides the usual fields.
+
+### Down, asleep or busy
+
+Nothing new on the provider: the PC's probe is the same `GET /api/tags` through its gate. A PC that is asleep or off the
+tailnet fails the probe within `connect_timeout_s`; the node is marked down for `routing.AUTO_DOWN_S` (30 s) and skipped
+without another probe, S1's route (or another node) stands, and a pin gets a 503 naming the node. A refusing policy is a
+503 with its fixed reason; Strata's own refusals are the retryable 529; a second turn while one runs is "busy"
+(`max_inflight` 1). Tests: `tests/test_pc_node.py`.
+
+### Keeping it up (`scripts/windows/install_pc_node.ps1`)
+
+Dry run by default (`-Apply` makes the changes, `-Remove` takes them away). It registers `CortadOS-Strata` and
+`CortadOS-Gate` as startup tasks (S4U: no stored password, run with nobody signed in; highest privileges; priority
+Normal, because the default priority throttled Strata's expert loads ~25x; the gate 60 s after boot so Tailscale has its
+address) whose launchers restart the process 30 s after it exits, and `CortadOS-Activity` at logon. It creates the token
+file with its ACL, copies the example backend config if none exists, adds a firewall rule for the gate's port from the
+tailnet range only, and the two desktop shortcuts. PowerShell 5.1 safe (ASCII only). Deploy steps and acceptance checks:
+the runbook, section 12.
+
 ## What this setup does not claim
 
 The home machines are not verified until their SSH targets are configured and
