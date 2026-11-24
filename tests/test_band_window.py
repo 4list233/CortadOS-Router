@@ -272,9 +272,13 @@ _CODEX = test_provider_codex.CodexEndpointTests   # deleted below: a module-leve
 
 
 class ContinuationTests(unittest.TestCase):
-    """Review of b1d3075 (P2): the window is read on every request. An invalid one is refused on a continuation as on
-    an opening turn; a changed one is refused (terminal), never served on the old route (server Handler._window_change).
-    The real endpoint over the fake codex app-server; the router is a stub returning a codex route."""
+    """The window on continuations (round 3 of the band window review, owner 2026-11-24). An invalid one is refused on
+    every request, before any lookup. A valid one is part of the conversation's identity (server._in_window): a request
+    is matched only to a conversation opened in its own window; another window opens a new conversation from the
+    history it carries, and the conversation it came from is untouched. The real endpoint over the fake codex
+    app-server; the router is a stub returning a codex route."""
+
+    IDENT = {"x-claude-code-session-id": "s-band-window"}
 
     # the codex endpoint harness, without inheriting (and so re-running) its tests
     tearDown, request, post, error_of, send_with, continuation = (
@@ -292,6 +296,38 @@ class ContinuationTests(unittest.TestCase):
             return dict(test_provider_codex.CODEX_ROUTE, **({"band_window": core.band_window_label(*w)} if w else {}))
         self.reg.router = router
 
+    def ok(self, body, headers=None):
+        code, got = self.send_with(body, dict(self.IDENT, **(headers or {})))
+        self.assertEqual(code, 200, got)
+        return got
+
+    def opened(self, model):
+        """A conversation opened in `model`'s window under the Claude Code session id, its first turn answered with a
+        tool_use: (the next turn's body, answering it), the opening body."""
+        first = {"model": model, "tools": [test_provider_codex.READ_TOOL],
+                 "messages": [{"role": "user", "content": "please use tool"}]}
+        r1 = self.ok(first)
+        use = r1["content"][-1]
+        nxt = dict(first, messages=first["messages"] + [
+            {"role": "assistant", "content": r1["content"]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"], "content": "hello"}]}])
+        return nxt, first
+
+    def windows(self):
+        return sorted((s.route or {}).get(provider_server.ASKED_WINDOW_KEY) or "none"
+                      for s in self.reg.sessions.values())
+
+    def by_window(self, label):
+        [s] = [s for s in self.reg.sessions.values()
+               if (s.route or {}).get(provider_server.ASKED_WINDOW_KEY) == label]
+        return s
+
+    def test_an_invalid_window_is_refused_on_opening(self):
+        code, msg = self.error_of({"model": "cortados@NOT-A-BAND", "tools": [test_provider_codex.READ_TOOL],
+                                   "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(code, 400); self.assertIn("not a band window", msg)
+        self.assertEqual((self.routed, len(self.reg.sessions)), ([], 0))
+
     def test_an_invalid_window_on_a_continuation_is_refused(self):
         body = self.continuation("cortados@R2", "cortados@NOT-A-BAND")
         code, msg = self.error_of(body)
@@ -300,125 +336,178 @@ class ContinuationTests(unittest.TestCase):
         [session] = self.reg.sessions.values()                 # the conversation is kept: a valid retry continues it
         self.assertEqual(self.post(dict(body, model="cortados@R2"))["content"],
                          [{"type": "text", "text": "tool said: hello"}])
+        self.assertEqual((self.routed, len(self.reg.sessions)), ([R2], 1))
 
-    def test_the_same_window_continues(self):
+    def test_an_invalid_header_window_on_a_continuation_is_refused(self):
+        body, _ = self.opened("cortados@R2")
+        code, err = self.send_with(body, dict(self.IDENT, **{routing.BAND_HEADER: "R9"}))
+        self.assertEqual(code, 400); self.assertIn("not a band window", err["message"])
+        self.assertEqual((self.routed, len(self.reg.sessions)), ([R2], 1))
+
+    def test_equivalent_spellings_are_one_window(self):
         body = self.continuation("cortados@R2", "cortados@r2-R2")   # another spelling of the same window
         self.assertEqual(self.post(body)["content"], [{"type": "text", "text": "tool said: hello"}])
-        self.assertEqual(self.routed, [R2])
+        self.assertEqual((self.routed, len(self.reg.sessions)), ([R2], 1))
 
-    def test_a_changed_window_is_refused_not_rerouted(self):
-        for first, then in (("cortados@R2", "cortados@R1-R2"), ("cortados@R2", "cortados"), ("cortados", "cortados@R2")):
-            with self.subTest(first=first, then=then):
-                self.routed.clear()
+    def test_the_header_and_the_model_name_spell_one_window(self):
+        body, _ = self.opened("cortados@R2-R2")
+        self.ok(dict(body, model="cortados"), {routing.BAND_HEADER: "r2"})
+        self.assertEqual((self.routed, len(self.reg.sessions)), ([R2], 1))
+
+    def test_a_same_window_continuation_with_a_reloaded_system_prompt_stays_in_its_conversation(self):
+        # Reviewer P2 (3beeb7b, server.py:4293): the system prompt or tool set is no sign of a fork. A main loop that
+        # reloads its system prompt, or loads a deferred tool, in the SAME window is its own continuation.
+        body, _ = self.opened("cortados@R2")
+        self.ok(dict(body, system="A reloaded system prompt."))
+        self.assertEqual((self.routed, len(self.reg.sessions)), ([R2], 1))
+
+    def test_a_same_window_continuation_with_a_newly_loaded_tool_stays_in_its_conversation(self):
+        body, _ = self.opened("cortados@R2")
+        self.ok(dict(body, tools=body["tools"] + [dict(test_provider_codex.READ_TOOL, name="mcp__x__deferred")]))
+        self.assertEqual((self.routed, len(self.reg.sessions)), ([R2], 1))
+
+    def test_a_main_loop_window_change_opens_a_new_conversation_from_the_inherited_history(self):
+        # Reviewer P2 (3beeb7b, server.py:4293): on 3beeb7b the same change was refused (terminal) or, with a reloaded
+        # system prompt or a new tool, opened a fork. Now every shape of it is one thing: a new conversation.
+        for extra in ({}, {"system": "A reloaded system prompt."},
+                      {"tools": [test_provider_codex.READ_TOOL, dict(test_provider_codex.READ_TOOL, name="Grep")]}):
+            with self.subTest(extra=sorted(extra)):
                 for s in list(self.reg.sessions.values()):
                     self.reg.drop(s)
-                code, msg = self.error_of(self.continuation(first, then))
-                self.assertEqual(code, provider_server.TERMINAL_STATUS)   # terminal: the retry asks the same
-                self.assertIn("band window is fixed per conversation", msg)
-                self.assertEqual(len(self.routed), 1)                    # never re-routed
+                self.routed.clear()
+                body, _ = self.opened("cortados@R2")
+                changed = dict(body, model="cortados@R3", **extra)
+                self.ok(changed)                                         # 200: re-routed, never refused
+                self.assertEqual(self.routed, [R2, ("R3", "R3")])
+                self.assertEqual(self.windows(), ["R2", "R3"])
+                parent, child = self.by_window("R2"), self.by_window("R3")
+                self.assertEqual(len(parent.history), 1)                 # the parent is untouched
+                self.assertFalse(getattr(child, "rebuilds", 0))          # its own conversation, not a parent rebuild
 
-    def test_a_changed_header_window_is_refused_too(self):
-        body = self.continuation("cortados@R2", "cortados")
-        code, err = self.send_with(body, {routing.BAND_HEADER: "R3"})
-        self.assertEqual(code, provider_server.TERMINAL_STATUS)
-        self.assertIn("this request asks for band window R3", err["message"])
-        self.assertEqual(self.send_with(body, {routing.BAND_HEADER: "R2"})[0], 200)   # the header naming the same one
+    def test_after_a_window_change_both_conversations_continue_independently(self):
+        body, _ = self.opened("cortados@R2")
+        r3 = self.ok(dict(body, model="cortados@R3"))                    # the R3 conversation answers
+        self.assertEqual(self.ok(body)["content"], [{"type": "text", "text": "tool said: hello"}])   # R2 continues
+        self.assertEqual(self.routed, [R2, ("R3", "R3")])
+        r3_next = dict(body, model="cortados@R3", messages=body["messages"] + [
+            {"role": "assistant", "content": r3["content"]},
+            {"role": "user", "content": [{"type": "text", "text": "and then?"}]}])
+        self.ok(r3_next)                                                 # R3's own continuation: not routed again
+        self.assertEqual((self.routed, self.windows()), ([R2, ("R3", "R3")], ["R2", "R3"]))
+        self.assertEqual((len(self.by_window("R2").history), len(self.by_window("R3").history)), (2, 3))
+
+    def test_a_window_dropped_and_added_opens_new_conversations(self):
+        for first, then, want in (("cortados@R2", "cortados", None), ("cortados", "cortados@R2", R2),
+                                  ("cortados@R2", "cortados@R1-R2", ("R1", "R2"))):
+            with self.subTest(first=first, then=then):
+                for s in list(self.reg.sessions.values()):
+                    self.reg.drop(s)
+                self.routed.clear()
+                body, _ = self.opened(first)
+                self.ok(dict(body, model=then))
+                self.assertEqual((len(self.routed), self.routed[-1], len(self.reg.sessions)), (2, want, 2))
 
     def test_a_pinned_conversation_ignores_the_window(self):
         body = self.continuation("sub/opus", "sub/opus")
         self.assertEqual(self.send_with(body, {routing.BAND_HEADER: "R1"})[0], 200)
+        self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_a_pin_under_a_windowed_parent_opens_its_own_pinned_conversation(self):
+        body, _ = self.opened("cortados@R2")
+        self.ok(dict(body, model="sub/opus"))
+        self.assertEqual(len(self.reg.sessions), 2)
+        self.assertEqual(sorted(bool(s.route.get("pinned")) for s in self.reg.sessions.values()), [False, True])
+        self.assertEqual(len(self.by_window("R2").history), 1)
 
 
-class ForkTests(unittest.TestCase):
-    """Review of 151de01 (P2): a forked subagent shares its windowed parent's history and identity, so find matches the
-    parent; it must open its own conversation in its own window (Handler._fork_parent), never be refused as a changed
-    window. The same agent changing its window is still refused (ContinuationTests)."""
+class ForkTests(ContinuationTests):
+    """Forked subagents of a windowed main loop: they inherit its history and session id and send plain `cortados`, so
+    they are requests in another window: each opens its own conversation from the inherited history."""
 
     SUB = "You are a forked subagent."
-    setUp = ContinuationTests.setUp
-    tearDown, request, post, error_of, send_with, continuation = (
-        _CODEX.tearDown, _CODEX.request, _CODEX.post, _CODEX.error_of, _CODEX.send_with, _CODEX.continuation)
 
-    def parent_and_fork(self, fork_model, **fork):
-        body = self.continuation("cortados@R2", "cortados@R2")          # the parent opened in R2, answered a tool_use
-        return body, dict(body, model=fork_model, **fork)
+    # ContinuationTests' own tests must not run twice through the subclass.
+    locals().update({n: None for n in list(vars(ContinuationTests)) if n.startswith("test_")})
 
     def test_a_plain_cortados_fork_of_an_r2_parent_is_routed_on_its_own(self):
-        _, fork = self.parent_and_fork("cortados", system=self.SUB)
-        self.assertTrue(self.post(fork)["content"])                       # 200, answered by its own backend
+        body, _ = self.opened("cortados@R2")
+        self.assertTrue(self.ok(dict(body, model="cortados", system=self.SUB))["content"])
         self.assertEqual(self.routed, [R2, None])                         # routed again, without a window (S1's band)
-        parent, child = sorted(self.reg.sessions.values(), key=lambda s: s.opened_at)
-        self.assertIsNone(child.route[provider_server.ASKED_WINDOW_KEY])
-        self.assertEqual(parent.route[provider_server.ASKED_WINDOW_KEY], "R2")
-        self.assertEqual(len(parent.history), 1)                          # the parent is untouched
+        self.assertEqual(self.windows(), ["R2", "none"])
+        self.assertEqual(len(self.by_window("R2").history), 1)            # the parent is untouched
 
-    def test_a_fork_with_other_tools_and_another_window_is_its_own_conversation(self):
-        tools = [dict(test_provider_codex.READ_TOOL, name="Grep")]
-        _, fork = self.parent_and_fork("cortados@R3", tools=tools)
-        self.post(fork)
-        self.assertEqual(self.routed, [R2, ("R3", "R3")])
-        self.assertEqual(sorted(s.route[provider_server.ASKED_WINDOW_KEY] for s in self.reg.sessions.values()),
-                         ["R2", "R3"])
+    def test_an_identity_less_fork_is_its_own_conversation_too(self):
+        body = self.continuation("cortados@R2", "cortados")               # no session id: matched on tool-id proof
+        self.assertTrue(self.post(dict(body, system=self.SUB))["content"])
+        self.assertEqual((self.routed, self.windows()), ([R2, None], ["R2", "none"]))
 
-    def test_the_same_agent_changing_its_window_is_still_refused(self):
-        _, same = self.parent_and_fork("cortados")                        # same system prompt and tools: a continuation
-        code, msg = self.error_of(same)
-        self.assertEqual(code, provider_server.TERMINAL_STATUS)
-        self.assertIn("band window is fixed per conversation", msg)
-        self.assertEqual((self.routed, len(self.reg.sessions)), ([R2], 1))
+    def test_a_fork_of_a_parent_that_already_answered_that_request_is_not_replayed_or_refused(self):
+        # Reviewer P2 (3beeb7b, server.py:3599): the parent answered the inherited request, so find raised Replay
+        # (its fingerprint excludes system and tools) before the fork was detected, and the fork got the parent's
+        # changed-window 400. The replay is looked up only in the request's own window now.
+        body, _ = self.opened("cortados@R2")
+        answered = self.ok(body)                                          # the parent answers this exact request
+        self.assertEqual(self.ok(body), answered)                         # its own retry: replayed, as before
+        self.assertEqual(self.routed, [R2])
+        fork = self.ok(dict(body, model="cortados", system=self.SUB))     # the fork: same history and user turn
+        self.assertEqual(self.routed, [R2, None])                         # its own route, its own backend
+        self.assertEqual(self.windows(), ["R2", "none"])
+        self.assertTrue(fork["content"])
+        self.assertEqual(len(self.by_window("R2").history), 2)            # the parent: as it was
 
     def test_a_fork_after_its_parent_moved_on_is_not_served_on_the_parents_route(self):
-        # The parent answered again, so the fork's history is a branch of it (find raises Rebuild: needs an identity,
-        # as Claude Code's session id): still its own route, and the parent's backend is kept, never rebuilt from.
-        ident = {"x-claude-code-session-id": "s-fork"}
-        history = [{"role": "user", "content": "please use tool"}]
-        code, r1 = self.send_with({"model": "cortados@R2", "tools": [test_provider_codex.READ_TOOL],
-                                   "messages": history}, ident)
-        history += [{"role": "assistant", "content": r1["content"]},
-                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": r1["content"][-1]["id"],
-                                                  "content": "hello"}]}]
-        parent_body = {"model": "cortados@R2", "tools": [test_provider_codex.READ_TOOL], "messages": history}
-        self.assertEqual(self.send_with(parent_body, ident)[0], 200)      # the parent moves on
-        # The fork's own turn (its directive), not the parent's answered one: that would be a retry (Replay).
-        fork_msgs = history[:-1] + [{"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": r1["content"][-1]["id"], "content": "forked"}]}]
-        code, _ = self.send_with(dict(parent_body, model="cortados", system=self.SUB, messages=fork_msgs), ident)
-        self.assertEqual(code, 200)
-        self.assertEqual((self.routed, len(self.reg.sessions)), ([R2, None], 2))
-        parent, child = sorted(self.reg.sessions.values(), key=lambda s: s.opened_at)
-        self.assertEqual((parent.route[provider_server.ASKED_WINDOW_KEY], len(parent.history)), ("R2", 2))
-        self.assertIsNone(child.route[provider_server.ASKED_WINDOW_KEY])
+        # The parent answered again, so the fork's history is a branch of it (a rebuild for its own window): its own
+        # route, and the parent's backend is kept, never rebuilt from.
+        body, _ = self.opened("cortados@R2")
+        self.ok(body)                                                     # the parent moves on
+        msgs = body["messages"][:-1] + [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": body["messages"][-1]["content"][0]["tool_use_id"],
+             "content": "forked"}]}]
+        self.ok(dict(body, model="cortados", system=self.SUB, messages=msgs))
+        self.assertEqual((self.routed, self.windows()), ([R2, None], ["R2", "none"]))
+        parent, child = self.by_window("R2"), self.by_window(None)
+        self.assertEqual(len(parent.history), 2)
         self.assertFalse(getattr(child, "rebuilds", 0))                    # its own conversation, not a parent rebuild
 
     def test_a_fork_continues_on_its_own_route_and_the_parent_on_its_own(self):
-        parent_body, fork = self.parent_and_fork("cortados", system=self.SUB)
-        r = self.post(fork)
-        use = r["content"][-1]                                            # the fake asks for the tool again
+        body, _ = self.opened("cortados@R2")
+        fork = dict(body, model="cortados", system=self.SUB)
+        r = self.ok(fork)
         fork_next = dict(fork, messages=fork["messages"] + [
             {"role": "assistant", "content": r["content"]},
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"], "content": "again"}]}])
-        self.post(fork_next)                                              # the fork's own continuation
+            {"role": "user", "content": [{"type": "text", "text": "again"}]}])
+        self.ok(fork_next)                                                # the fork's own continuation
         self.assertEqual(self.routed, [R2, None])                         # not routed again, not refused
-        self.assertEqual(self.post(parent_body)["content"],               # the parent's continuation: the parent
-                         [{"type": "text", "text": "tool said: hello"}])
-        self.assertEqual((self.routed, len(self.reg.sessions)), ([R2, None], 2))
-        parent, child = sorted(self.reg.sessions.values(), key=lambda s: s.opened_at)
-        self.assertEqual((len(parent.history), len(child.history)), (2, 3))
+        self.assertEqual(self.ok(body)["content"], [{"type": "text", "text": "tool said: hello"}])   # the parent's
+        self.assertEqual((self.routed, self.windows()), ([R2, None], ["R2", "none"]))
+        self.assertEqual((len(self.by_window("R2").history), len(self.by_window(None).history)), (2, 3))
+
+    def test_a_fork_of_a_fork(self):
+        body, _ = self.opened("cortados@R2")
+        fork = dict(body, model="cortados", system=self.SUB)
+        r = self.ok(fork)
+        grandchild = dict(fork, model="cortados@R3", system="A fork of the fork.", messages=fork["messages"] + [
+            {"role": "assistant", "content": r["content"]},
+            {"role": "user", "content": [{"type": "text", "text": "deeper"}]}])
+        self.ok(grandchild)
+        self.assertEqual(self.routed, [R2, None, ("R3", "R3")])
+        self.assertEqual(self.windows(), ["R2", "R3", "none"])
+        self.assertEqual((len(self.by_window("R2").history), len(self.by_window(None).history)), (1, 2))
 
 
-class SameWindowTests(unittest.TestCase):
-    """Registry.find's preference: of sessions holding one history (a fork beside its parent before either answers),
-    those opened in the request's window; else all, so the ambiguity is decided as before."""
+class InWindowTests(unittest.TestCase):
+    """server._in_window: a conversation is in its own window only; a pinned one in every window."""
 
-    def test_preference(self):
-        S = lambda w: type("S", (), {"route": {provider_server.ASKED_WINDOW_KEY: w}})()
-        parent, fork = S("R2"), S(None)
-        pick = provider_server._same_window
-        self.assertEqual(pick([parent, fork], "R2"), [parent])
-        self.assertEqual(pick([parent, fork], None), [fork])
-        self.assertEqual(pick([parent, fork], "R3"), [parent, fork])
-        self.assertEqual(pick([parent, fork], provider_server.ANY_WINDOW), [parent, fork])
-        self.assertEqual(pick([parent], None), [parent])
+    def test_membership(self):
+        S = lambda w, **r: type("S", (), {"route": {provider_server.ASKED_WINDOW_KEY: w, **r}})()
+        inw = provider_server._in_window
+        self.assertTrue(inw(S("R2"), "R2"))
+        self.assertFalse(inw(S("R2"), None))
+        self.assertFalse(inw(S(None), "R2"))
+        self.assertTrue(inw(S(None), None))
+        self.assertTrue(inw(S("R2"), provider_server.ANY_WINDOW))
+        self.assertTrue(inw(S(None, pinned=True), "R3"))
+        self.assertTrue(inw(type("S", (), {"route": None})(), None))     # a fixed-model endpoint: no route, no window
 
 
 del _CODEX
@@ -433,9 +522,9 @@ class LauncherTests(test_session.SessionTests):
             settings = json.load(f)
         return env, cmd, settings
 
-    def test_routed_orchestrator_defaults_to_r2(self):
+    def test_routed_orchestrator_defaults_to_r4(self):
         env, cmd, settings = self.run_prepare("--orchestrator", "cortados")
-        self.assertEqual(cmd[1:3], ["--model", "cortados@R2"])
+        self.assertEqual(cmd[1:3], ["--model", "cortados@R4"])   # owner 2026-11-24: the Opus 5.5 / Sol 6.1 band
         for e in (env, settings["env"]):
             self.assertEqual(e["CLAUDE_CODE_SUBAGENT_MODEL"], "cortados")            # subagents unwindowed
             self.assertEqual(e["CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL"], "cortados")
@@ -466,7 +555,7 @@ class LauncherTests(test_session.SessionTests):
         rc, out, err = self.run_main("--provider-url", "http://r.example", "--token-file", self.tok,
                                      "--orchestrator", "cortados", "--print-env")
         self.assertEqual(rc, 0, err)
-        self.assertIn("--model cortados@R2", out)
+        self.assertIn("--model cortados@R4", out)
 
     def test_child_tasks_keep_free_routing(self):
         import inspect

@@ -1008,12 +1008,13 @@ class RefusalBoundContinuationTests(ContinuationRecheckBase):
 
     def test_a_windowed_conversation_keeps_its_window_across_the_refusal_bind(self):
         # Review of b1d3075: routing._moved builds a new route; the window the conversation opened with goes with it,
-        # so its next turn (same `cortados@<window>`) is not refused as a changed window (server._window_change).
+        # so its next turn (same `cortados@<window>`) still matches it (server._in_window), never a new conversation.
         first, got = self.open(text="please refuse", model="cortados@R3")
         (s,) = self.reg.sessions.values()
         self.assertEqual(s.route.get(server.ASKED_WINDOW_KEY), "R3")
         self.post(self.follow(first, got, "and the next file"))
         self.assertEqual(len(self.node_posts()), 2)
+        self.assertEqual(list(self.reg.sessions.values()), [s])
 
 
 class ExplicitPinNotRescoredTests(ContinuationRecheckBase):

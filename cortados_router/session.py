@@ -1,7 +1,7 @@
 """Run a whole Claude Code session on the cortados provider.
 
     python3 -m cortados_router.session [--orchestrator fable|opus|sonnet|<model id>|cortados]
-        [--orchestrator-band R2|R1-R2|any] [--provider-url URL] [--token-file PATH] [--no-delegate-directive]
+        [--orchestrator-band R4|R3-R4|any] [--provider-url URL] [--token-file PATH] [--no-delegate-directive]
         [--print-env] [-- <claude args>]
 
 The main loop (the orchestrator) is pinned to a subscription model (`sub/<id>`, no S1) and delegates through the
@@ -70,12 +70,12 @@ MANAGED_SETTINGS_DIRS = ("/Library/Application Support/ClaudeCode", "/etc/claude
 
 
 # The routed main loop's band window (--orchestrator cortados): S1 still routes it and scarcity picks the cheapest
-# capable model, but inside this window (owner 2026-11-23: by default exactly R2, "Opus-equivalent: smart, but not
-# R3"). It rides on the main loop's model name, `cortados@R2` (routing.BAND_MODEL_PREFIX): Claude Code sends --model on
+# capable model, but inside this window (owner 2026-11-24: by default exactly R4, the Opus 5.5 / Sol 6.1 band; it was R2
+# from 2026-11-23). It rides on the main loop's model name, `cortados@R4` (routing.BAND_MODEL_PREFIX): Claude Code sends --model on
 # main-loop requests only (checked with Claude Code 2.1.330 against a capture server, 2026-11-23: main loop
 # `cortados@R1-R2`, its general-purpose subagent `cortados`), so subagents (CLAUDE_CODE_SUBAGENT_MODEL) and side calls
 # (ANTHROPIC_SMALL_FAST_MODEL) stay unwindowed. `any` turns it off (plain `cortados`, S1 routes freely).
-DEFAULT_ORCHESTRATOR_BAND = "R2"
+DEFAULT_ORCHESTRATOR_BAND = "R4"
 
 
 class SessionError(Exception):
@@ -83,7 +83,7 @@ class SessionError(Exception):
 
 
 def windowed_model(model: str, band: str | None) -> str:
-    """The main loop's model with its band window: `cortados` + R2 → `cortados@R2`. A routed (`cortados`) main loop
+    """The main loop's model with its band window: `cortados` + R4 → `cortados@R4`. A routed (`cortados`) main loop
     gets DEFAULT_ORCHESTRATOR_BAND when `band` is None; `any` leaves it unwindowed. A pinned model is not routed, so a
     window there is refused rather than silently dropped."""
     if model != "cortados":
@@ -464,7 +464,7 @@ def parse(argv: list):
     ap = argparse.ArgumentParser(prog="python3 -m cortados_router.session", description=__doc__.split("\n")[0])
     ap.add_argument("--orchestrator", default=DEFAULT_ORCHESTRATOR)
     ap.add_argument("--orchestrator-band", default=None,
-                    help=f"band window of a routed main loop: R2, R1-R2 or any (default {DEFAULT_ORCHESTRATOR_BAND} "
+                    help=f"band window of a routed main loop: R4, R3-R4 or any (default {DEFAULT_ORCHESTRATOR_BAND} "
                          "with --orchestrator cortados); subagents and side calls are not windowed")
     ap.add_argument("--provider-url")
     ap.add_argument("--token-file", default=DEFAULT_TOKEN_FILE)

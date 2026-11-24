@@ -347,9 +347,9 @@ What runs where:
   provider's own `sub/` alias table (`routing.SUB_ALIASES`): `opus` = `claude-opus-5-5`, `sonnet` = `claude-sonnet-5`,
   `haiku` = `claude-haiku-4-5-20251001`; any other Claude id gets `sub/` prepended. No S1. `--orchestrator cortados` lets S1 route the main loop too.
 - **Routed main loop in a band window:** `--orchestrator cortados` routes the main loop through S1 and scarcity (the
-  cheapest capable model wins) but only inside a band window, by default exactly **R2** (`--orchestrator-band R2`;
+  cheapest capable model wins) but only inside a band window, by default exactly **R4**, the Opus 5.5 / Sol 6.1 band (`--orchestrator-band R4`;
   a range such as `R1-R2` or `R2-R3` also works; `any` turns the window off). The window is carried in the main
-  loop's model name, `--model cortados@R2`. Claude Code sends that name only on main-loop requests. Subagents are
+  loop's model name, `--model cortados@R4`. Claude Code sends that name only on main-loop requests. Subagents are
   forced to `cortados` and side calls are pinned to haiku, so neither is windowed. (Checked with Claude Code 2.1.330
   against a capture server, 2026-11-23: the main loop sent `cortados@R1-R2` and its subagent sent `cortados`.) A header
   in `ANTHROPIC_CUSTOM_HEADERS` would have reached subagents too, so the launcher does not send one.
@@ -365,14 +365,15 @@ What runs where:
   `band window R2`, or `band window R2 overridden` when a hard rule won. Child tasks launch with
   `--orchestrator-band any` and keep free routing. A `sub/` pin ignores the window. Other clients can send the same
   window as the `x-cortados-band` header (both wires; owner token only, like every routing header). An invalid window
-  is refused with a 400, on every request, continuations included. The window is fixed per conversation, like its
-  route: a continuation that asks for another window (changed, added or dropped) is refused as terminal (400,
-  `x-should-retry: false`) and is never re-routed or served on the old route. Start a new conversation to change it
-  (in Claude Code, `/clear` after `/model`). A forked subagent is not such a continuation: it inherits the main loop's
-  history and session id but sends its own system prompt or tools, so a request that matches a conversation, asks
-  for another window and differs in either opens its own conversation, seeded with the inherited history and routed
-  in its own window (a plain `cortados` subagent: S1's band); the parent is untouched. A fork that sends the parent's
-  exact system prompt and tools cannot be told from the parent and is refused like it.
+  is refused with a 400, on every request, continuations included, before any conversation is looked up. The window
+  is part of a conversation's identity: a request is matched to, retried (replayed) from or rebuilt from only a
+  conversation opened under the same window (`R2` and `R2-R2` are one window; no window is its own). A request whose
+  history belongs to a conversation of another window opens a new conversation under its own window, seeded with the
+  history it carries; that other conversation is untouched. This covers a forked subagent (it inherits the main loop's
+  history and session id, but sends plain `cortados`: routed in S1's band) and a main loop whose window changed (in
+  Claude Code, `/model cortados@R3`): the change simply re-routes from the next turn, at the cost of the backend
+  session's prompt cache. No `/clear` is needed. A `sub/` pin is outside windows: a pinned conversation continues
+  whatever window a request names, and a pin under a windowed main loop opens its own pinned conversation.
 - **Native subagents:** `CLAUDE_CODE_SUBAGENT_MODEL=cortados` (+ `_FORCE`, and the workflow variant), so S1 routes
   each one. They are Claude Code's own subagents, so they keep every tool, MCP included; the provider bridges the tool
   calls back to this Claude Code, which runs them locally. Caveat: what `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` does is

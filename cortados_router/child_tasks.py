@@ -1523,7 +1523,7 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
         meta, env, cmd = _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe,
                                         login, office, workspace, ws_root, host_name, launchd)
         return meta, env, cmd
-    # `--orchestrator-band any`: a child's main loop keeps S1's free routing (the launcher's default R2 window is for
+    # `--orchestrator-band any`: a child's main loop keeps S1's free routing (the launcher's default R4 window is for
     # the owner's own routed session; windowing child tasks would be a separate decision).
     launch = ["--orchestrator", orchestrator, "--orchestrator-band", "any", "--provider-url", provider_url,
               "--settings-dir", d, "--run-id", task_id]
