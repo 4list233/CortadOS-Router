@@ -308,7 +308,7 @@ for f in "$ROOT/bin/run-bridge.sh" "$ROOT/bin/run-studio.sh" "/Library/LaunchDae
 done
 
 # Secrets: kept when present, made when absent. The provider client is explicit, in one slot.
-CLIENTS_LIST="$(PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients list)" || die "cannot list the provider's clients"
+CLIENTS_LIST="$(clients_cli list)" || die "cannot list the provider's clients"
 LIVE_SLOT=""
 for s in "${CLIENT_SLOTS[@]}"; do
   line="$(printf '%s\n' "$CLIENTS_LIST" | awk -v n="$s:" '$1 == n')"
@@ -350,6 +350,9 @@ done
 SECRET_TMP=(office-token office-header bridge-token access-token studio-settings.json studio-settings.old)
 # A client registered by this run stays only once its release is committed: any other exit revokes it.
 PENDING_CLIENT=""
+# After the commit, the client the old release used (a rotation): no daemon uses it any more, so an
+# exit before step 8 has revoked it revokes it. Never both set: tx_on_commit moves one to the other.
+RETIRED_CLIENT=""
 TMP=""
 CLEANED=0
 cleanup() {  # runs once; a signal arriving while it runs is ignored, so it is never cut short
@@ -357,8 +360,12 @@ cleanup() {  # runs once; a signal arriving while it runs is ignored, so it is n
   [[ $CLEANED -eq 0 ]] || return 0
   CLEANED=1
   if [[ -n "$PENDING_CLIENT" && $APPLY -eq 1 ]]; then
-    PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients remove "$PENDING_CLIENT" >&2 \
+    clients_cli remove "$PENDING_CLIENT" >&2 \
       || echo "deploy-air: could not revoke $PENDING_CLIENT: remove it with clients remove" >&2
+  fi
+  if [[ -n "$RETIRED_CLIENT" && $APPLY -eq 1 ]]; then
+    clients_cli remove "$RETIRED_CLIENT" >&2 \
+      || echo "deploy-air: could not revoke the old $RETIRED_CLIENT (the bridge uses the new one): check clients list" >&2
   fi
   if [[ -n "$TMP" ]]; then
     wipe_rm "${SECRET_TMP[@]/#/$TMP/}" || echo "deploy-air: could not remove every secret from $TMP: remove it now" >&2
@@ -366,6 +373,13 @@ cleanup() {  # runs once; a signal arriving while it runs is ignored, so it is n
   fi
 }
 on_exit() { cleanup; }
+# Called by tx_run (deploy-lib.sh) at the commit point, with INT/TERM/HUP deferred, so the two moves
+# are one step to a signal (#77 fix round 4). From here the new client is the live one: no handler
+# may revoke it. The old slot, when rotated, is no daemon's any more: an exit before step 8 revokes it.
+tx_on_commit() {
+  if [[ -n "$PENDING_CLIENT" && ${TOKEN_PLAN:-} == rotate ]]; then RETIRED_CLIENT="$LIVE_SLOT"; fi
+  PENDING_CLIENT=""
+}
 # Reason (#77 fix round 3): bash does NOT run the EXIT trap when an untrapped SIGTERM/SIGINT/SIGHUP
 # kills it (reproduced with /bin/bash: exit 143, nothing wiped), so each signal has its own handler:
 # the same cleanup, then exit 128+signal (which also runs EXIT; cleanup runs only once). Installed
@@ -466,7 +480,7 @@ office_token_ok() {  # token-file: the provider answers 200 to it (the header go
   [[ "$code" == 200 ]]
 }
 if [[ $TOKEN_PLAN != keep ]]; then
-  run env PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients add "$NEW_SLOT" --scope office:read --token-file "$TMP/office-token"
+  run clients_cli add "$NEW_SLOT" --scope office:read --token-file "$TMP/office-token"
   if [[ $APPLY -eq 1 ]]; then
     PENDING_CLIENT="$NEW_SLOT"
     office_token_ok "$TMP/office-token" || die "the provider does not accept the new $NEW_SLOT token: revoked, nothing switched"
@@ -686,10 +700,10 @@ esac
 # ---- 8. commit: the new release is healthy, so the old credential goes --------------------
 step "8. Commit"
 if [[ $TOKEN_PLAN == rotate ]]; then
-  run env PYTHONPATH="$REPO" python3 -B -m cortados_router.provider.clients remove "$LIVE_SLOT" \
+  run clients_cli remove "$LIVE_SLOT" \
     || echo "deploy-air: could not revoke $LIVE_SLOT: remove it with clients remove (the bridge uses $NEW_SLOT)" >&2
 fi
-PENDING_CLIENT=""
+RETIRED_CLIENT=""   # PENDING_CLIENT was cleared at the commit point (tx_on_commit)
 run sudo rm -rf "$STAGE"
 if [[ $APPLY -eq 1 ]]; then tail -n 5 "$ROOT/log-bridge/err.log" 2>/dev/null | sed 's/^/  bridge: /' || true; fi
 

@@ -387,6 +387,15 @@ tx_commit() {
   done
   TX_UNDO=(); TX_PREV=()
 }
+# The provider's clients CLI, always the copy in $REPO and nothing else (#77 fix round 4). Reason:
+# `python3 -m` searches the working directory first and PYTHONPATH next, so run from inside another
+# checkout (or with a stray PYTHONPATH or user site-packages) it imported a different
+# cortados_router, and in the tests the REAL one, which writes ~/.config/cortados/clients.json.
+# Here the working directory IS $REPO, -E ignores PYTHONPATH/PYTHONHOME, -s the user site-packages.
+# (Not -I: that drops the working directory too, and Python 3.9 on the Air has no -P.)
+clients_cli() {  # args...
+  (cd "$REPO" && exec python3 -B -E -s -m cortados_router.provider.clients "$@")
+}
 # 0: activated and committed. 1: rolled back cleanly. 2: the rollback itself failed (investigate).
 # INT/TERM/HUP during activation roll back, then exit 128+signal (the caller's EXIT trap still runs).
 # Handlers (#77 fix round 3): each `trap` replaces the one before atomically, so a signal always meets
@@ -405,8 +414,19 @@ tx_run() {
   tx_begin || { echo "deploy-air: nothing was changed" >&2; return 1; }
   trap 'tx_on_signal 2' INT; trap 'tx_on_signal 15' TERM; trap 'tx_on_signal 1' HUP
   if tx_activate; then
+    # The commit point (#77 fix round 4). A signal before this swap still rolls back, and the caller's
+    # handler then revokes what belongs to the new release, consistently: the old release runs again.
+    # From here on a signal is only recorded: the caller's hook tx_on_commit (deploy-air.sh: the new
+    # client becomes live, the old one is marked for retirement) and tx_commit (the .prev removal: a
+    # .prev left behind makes the next run refuse) run whole, the caller's handlers come back, and only
+    # then is a recorded signal acted on. So a late signal can never revoke the live credential.
+    TX_SIG=""
+    trap 'TX_SIG=2' INT; trap 'TX_SIG=15' TERM; trap 'TX_SIG=1' HUP
+    if declare -F tx_on_commit >/dev/null; then tx_on_commit; fi
+    tx_commit
     tx_restore_traps
-    tx_commit; return 0
+    if [[ -n "$TX_SIG" ]]; then exit $((128 + TX_SIG)); fi   # the caller's EXIT trap does its cleanup
+    return 0
   fi
   TX_SIG=""
   trap 'TX_SIG=2' INT; trap 'TX_SIG=15' TERM; trap 'TX_SIG=1' HUP

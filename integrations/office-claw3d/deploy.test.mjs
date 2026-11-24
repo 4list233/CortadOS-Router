@@ -297,18 +297,22 @@ test('deploy-air.sh: every check comes before the first change, and the order is
   // between the install banner and the plan: reads and dies only
   for (let i = installStart; i < plan; i++) {
     const code = lines[i].replace(/^\s*#.*/, '').replace(/"(?:[^"\\]|\\.)*"/g, '""');   // messages are not commands
-    assert.ok(!/(^|[\s;&|(])(run|git clone|npm|sudo (install|mv|rm|ln|dscl|launchctl|tee|chown|chmod)|clients (add|remove))\b/.test(code),
+    assert.ok(!/(^|[\s;&|(])(run|git clone|npm|sudo (install|mv|rm|ln|dscl|launchctl|tee|chown|chmod)|clients(_cli)? (add|remove))\b/.test(code),
       `a change in the preflight: ${lines[i]}`);
   }
   const build = at(/run build && touch \.cortados-build-ok/);
   const stageToken = at(/run sudo install -o "\$BRIDGE_USER" -g staff -m 0600 "\$TMP\/office-token" "\$STAGE\/office-token"/);
   const activate = at(/^tx_rc=0; tx_run \|\| tx_rc=\$\?$/);
-  const revokeOld = at(/clients remove "\$LIVE_SLOT"/);
+  const revokeOld = at(/clients_cli remove "\$LIVE_SLOT"/);
   const prune = at(/^step "9\. Prune/);
   assert.ok(build < activate && stageToken < activate && activate < revokeOld && revokeOld < prune);
   // the old credential is revoked nowhere else: never before the new release is healthy
-  assert.equal(lines.filter(l => /provider\.clients remove/.test(l)).length, 2);   // the commit, and on_exit's pending (new) slot
-  assert.ok(at(/clients remove "\$PENDING_CLIENT"/) < activate);         // defined in on_exit, which runs at exit only
+  // the commit's, and cleanup's pending (new, before the commit) and retired (old, after it) slots
+  assert.equal(lines.filter(l => /clients_cli remove/.test(l)).length, 3);
+  assert.ok(at(/clients_cli remove "\$PENDING_CLIENT"/) < activate);     // defined in cleanup, which runs at exit only
+  assert.ok(at(/clients_cli remove "\$RETIRED_CLIENT"/) < activate);
+  // every call of the clients module goes through clients_cli (deploy-lib.sh: cwd $REPO, -E -s), #77 fix round 4
+  assert.ok(!lines.some(l => /provider\.clients|PYTHONPATH/.test(l.replace(/^\s*#.*/, ''))), 'clients module called directly');
   // launchers and plists are staged, never written over the live ones before activation
   assert.ok(lines.filter(l => /^write_root_file |\| write_root_file /.test(l.trim())).every(l => !/\/(bin|Library)\//.test(l)));
   for (const f of ['run-bridge.sh', 'run-studio.sh']) assert.ok(lines.some(l => l.includes(`"$STAGE/${f}|$ROOT/bin/${f}"`)), f);
@@ -1513,6 +1517,12 @@ function cleanupBlock() {
   return text.slice(a, b);
 }
 // A stand-in for `python3 -m cortados_router.provider.clients`: logs its arguments.
+// Reason (#77 fix round 4): the round-3 tests ran with the repository as their working directory, so
+// `python3 -m` imported the REAL clients module (which writes ~/.config/cortados/clients.json) and
+// never this fake. Now three guards: clients_cli runs in $REPO with -E -s (deploy-lib.sh); each
+// subprocess runs with its cwd in the temp dir and a throwaway CORTADOS_HOME and
+// CORTADOS_PROVIDER_CLIENTS; and fakeLog fails unless the fake wrote its log and nothing wrote that
+// clients file.
 async function fakeRepo(W) {
   const p = join(W, 'repo', 'cortados_router', 'provider');
   await mkdir(p, { recursive: true });
@@ -1522,6 +1532,14 @@ async function fakeRepo(W) {
     'import os, sys\nopen(os.environ["W"] + "/clients.log", "a").write(" ".join(sys.argv[1:]) + "\\n")\n');
   return join(W, 'repo');
 }
+function isolatedEnv(W, env) {
+  return { ...env, CORTADOS_HOME: join(W, 'cortados-home'), CORTADOS_PROVIDER_CLIENTS: join(W, 'clients.json') };
+}
+function fakeLog(W) {  // the fake's log; fails loudly when the fake was not the module called
+  assert.ok(!existsSync(join(W, 'clients.json')), 'a real clients module wrote the throwaway clients file');
+  assert.ok(existsSync(join(W, 'clients.log')), 'the fake clients module was never called');
+  return readFileSync(join(W, 'clients.log'), 'utf8');
+}
 async function untilExists(path, ms = 10000) {
   const end = Date.now() + ms;
   while (!existsSync(path)) {
@@ -1529,9 +1547,9 @@ async function untilExists(path, ms = 10000) {
     await new Promise(r => setTimeout(r, 25));
   }
 }
-function spawnSignalled(cmd, args, env, readyPath, signals) {
+function spawnSignalled(cmd, args, env, readyPath, signals, cwd) {
   return new Promise((resolveP, reject) => {
-    const c = spawn(cmd, args, { env });
+    const c = spawn(cmd, args, { env, cwd });
     let stdout = '', stderr = '';
     c.stdout.on('data', d => { stdout += d; }); c.stderr.on('data', d => { stderr += d; });
     c.on('close', (status, signal) => resolveP({ status, signal, stdout, stderr }));
@@ -1560,13 +1578,14 @@ PENDING_CLIENT=office-b
 : > "$W/ready"
 while :; do sleep 0.1; done
 `;
-      const r = await spawnSignalled('/bin/bash', ['-c', script], { PATH: '/usr/bin:/bin', LIB, W }, join(W, 'ready'), signals);
+      const r = await spawnSignalled('/bin/bash', ['-c', script], isolatedEnv(W, { PATH: '/usr/bin:/bin', LIB, W }),
+        join(W, 'ready'), signals, repo);
       const label = `${signals.join('+')}: ${r.stderr}`;
       const tmp = readFileSync(join(W, 'tmpdir'), 'utf8').trim();
       t.after(() => rm(tmp, { recursive: true, force: true }));
       assert.equal(r.status, code, label);
       assert.ok(!existsSync(tmp), `TMP and its secrets are gone (${label})`);
-      assert.equal(readFileSync(join(W, 'clients.log'), 'utf8'), 'remove office-b\n', label);   // once
+      assert.equal(fakeLog(W), 'remove office-b\n', label);   // once
     }
   }
 });
@@ -1580,8 +1599,8 @@ test('activation: a real signal during activation rolls back, then wipes TMP and
 ${block}
 echo "$TMP" > "$D/tmpdir"; (umask 077; echo office-secret > "$TMP/office-token"); PENDING_CLIENT=office-b`;
     const r = await spawnSignalled('/bin/bash', [TX_HARNESS],
-      { PATH: '/usr/bin:/bin', LIB, FAKE: D, FAIL: 'block', FAIL_ALWAYS: '', PRELUDE: prelude, UNKNOWN: '', W: D },
-      join(D, 'blocking'), [sig, sig]);
+      isolatedEnv(D, { PATH: '/usr/bin:/bin', LIB, FAKE: D, FAIL: 'block', FAIL_ALWAYS: '', PRELUDE: prelude, UNKNOWN: '', W: D }),
+      join(D, 'blocking'), [sig, sig], repo);
     const tmp = readFileSync(join(D, 'tmpdir'), 'utf8').trim();
     t.after(() => rm(tmp, { recursive: true, force: true }));
     assert.equal(r.status, code, `${sig}: ${r.stderr}`);
@@ -1590,7 +1609,7 @@ echo "$TMP" > "$D/tmpdir"; (umask 077; echo office-secret > "$TMP/office-token")
     assert.equal((r.stderr.match(/ROLLBACK/g) || []).length, 1, `${sig}: the rollback ran once`);
     assert.deepEqual(await snapshot(D), OLD, sig);
     assert.ok(!existsSync(tmp), sig);
-    assert.equal(readFileSync(join(D, 'clients.log'), 'utf8'), 'remove office-b\n', sig);
+    assert.equal(fakeLog(D), 'remove office-b\n', sig);
   }
 });
 
@@ -1602,32 +1621,85 @@ ${cleanupBlock()}
 echo "$TMP" > "$D/tmpdir"; (umask 077; echo office-secret > "$TMP/office-token"); PENDING_CLIENT=office-b
 eval "orig_$(declare -f tx_rollback)"
 tx_rollback() { kill -TERM $$; kill -TERM $$; orig_tx_rollback; }`;
-  const r = spawnSync('/bin/bash', [TX_HARNESS],
-    { env: { PATH: '/usr/bin:/bin', LIB, FAKE: D, FAIL: 'health', FAIL_ALWAYS: '', PRELUDE: prelude, UNKNOWN: '', W: D }, encoding: 'utf8' });
+  const r = spawnSync('/bin/bash', [TX_HARNESS], { cwd: repo, encoding: 'utf8',
+    env: isolatedEnv(D, { PATH: '/usr/bin:/bin', LIB, FAKE: D, FAIL: 'health', FAIL_ALWAYS: '', PRELUDE: prelude, UNKNOWN: '', W: D }) });
   const tmp = readFileSync(join(D, 'tmpdir'), 'utf8').trim();
   t.after(() => rm(tmp, { recursive: true, force: true }));
   assert.equal(r.status, 143, r.stderr);
   assert.equal(r.stdout.trim(), '');
   assert.deepEqual(await snapshot(D), OLD);
   assert.ok(!existsSync(tmp));
-  assert.equal(readFileSync(join(D, 'clients.log'), 'utf8'), 'remove office-b\n');
+  assert.equal(fakeLog(D), 'remove office-b\n');
 });
 
-test('activation: after a committed activation the script\'s own signal handlers are back, never cleared (#77 fix round 3)', async t => {
+// ---- #77 fix round 4: the commit point. After it no signal revokes the live (new) client ----------
+// A rotation registers office-b beside the running office-a. Before the commit a signal revokes
+// office-b (above); from the commit point office-b is live and only office-a, no daemon's any more,
+// may go. A signal after the commit therefore revokes office-a (when step 8 has not yet) and wipes
+// TMP; never office-b, so at least the live credential always stays valid.
+async function committedRun(t, wrap, { rotate = true } = {}) {
   const D = await txHost(t, { upgrade: true });
   const repo = await fakeRepo(D);
-  // a signal in step 8, after tx_run: the pending client is still set until the commit clears it
-  const prelude = `APPLY=1; REPO=${JSON.stringify(repo)}
+  const prelude = `APPLY=1; REPO=${JSON.stringify(repo)}; TOKEN_PLAN=${rotate ? 'rotate' : 'mint'}; LIVE_SLOT=${rotate ? 'office-a' : ''}
 ${cleanupBlock()}
 echo "$TMP" > "$D/tmpdir"; (umask 077; echo office-secret > "$TMP/office-token"); PENDING_CLIENT=office-b
-eval "orig_$(declare -f tx_commit)"
-tx_commit() { orig_tx_commit; kill -TERM $$; }`;
-  const r = spawnSync('/bin/bash', [TX_HARNESS],
-    { env: { PATH: '/usr/bin:/bin', LIB, FAKE: D, FAIL: '', FAIL_ALWAYS: '', PRELUDE: prelude, UNKNOWN: '', W: D }, encoding: 'utf8' });
+${wrap}`;
+  const r = spawnSync('/bin/bash', [TX_HARNESS], { cwd: repo, encoding: 'utf8',
+    env: isolatedEnv(D, { PATH: '/usr/bin:/bin', LIB, FAKE: D, FAIL: '', FAIL_ALWAYS: '', PRELUDE: prelude, UNKNOWN: '', W: D }) });
   const tmp = readFileSync(join(D, 'tmpdir'), 'utf8').trim();
   t.after(() => rm(tmp, { recursive: true, force: true }));
+  return { D, r, tmp };
+}
+
+test('activation: a signal after the commit (step 8) revokes only the old client, never the live new one (#77 fix round 4)', async t => {
+  // tx_run has returned 0: the script's own handlers are back (never cleared) and the commit point is past
+  const { D, r, tmp } = await committedRun(t, `eval "orig_$(declare -f tx_run)"
+tx_run() { orig_tx_run; kill -TERM $$; }`);
   assert.equal(r.status, 143, r.stderr);
-  assert.deepEqual(await snapshot(D), NEW);   // committed: no rollback
+  assert.equal(r.stdout.trim(), '');
+  assert.doesNotMatch(r.stderr, /ROLLBACK/);
+  assert.deepEqual(await snapshot(D), NEW);   // committed: no rollback, no .prev left
   assert.ok(!existsSync(tmp));
-  assert.equal(readFileSync(join(D, 'clients.log'), 'utf8'), 'remove office-b\n');
+  assert.equal(fakeLog(D), 'remove office-a\n');   // office-b, which the bridge now uses, stays
+});
+
+test('activation: a signal at the commit point is held until the commit is whole, then acted on (#77 fix round 4)', async t => {
+  for (const at of ['tx_on_commit', 'tx_commit']) {
+    const { D, r, tmp } = await committedRun(t, `eval "orig_$(declare -f ${at})"
+${at}() { kill -TERM $$; kill -INT $$; orig_${at}; }`);
+    assert.equal(r.status, 128 + 2, `${at}: ${r.stderr}`);   // the last signal recorded
+    assert.equal(r.stdout.trim(), '', at);
+    assert.doesNotMatch(r.stderr, /ROLLBACK/, at);
+    assert.deepEqual(await snapshot(D), NEW, at);   // the .prev files are gone too: the next run is not refused
+    assert.ok(!existsSync(tmp), at);
+    assert.equal(fakeLog(D), 'remove office-a\n', at);
+  }
+});
+
+test('activation: without a rotation a signal after the commit revokes nothing (#77 fix round 4)', async t => {
+  const { D, r, tmp } = await committedRun(t, `eval "orig_$(declare -f tx_run)"
+tx_run() { orig_tx_run; kill -TERM $$; }`, { rotate: false });
+  assert.equal(r.status, 143, r.stderr);
+  assert.deepEqual(await snapshot(D), NEW);
+  assert.ok(!existsSync(tmp));
+  assert.ok(!existsSync(join(D, 'clients.log')), 'no client revoked');
+  assert.ok(!existsSync(join(D, 'clients.json')));
+});
+
+test('clients_cli: the clients module is $REPO\'s, whatever the working directory, PYTHONPATH or user site (#77 fix round 4)', async t => {
+  const W = await mkdtemp(join(tmpdir(), 'office-cli-'));
+  t.after(() => rm(W, { recursive: true, force: true }));
+  const repo = await fakeRepo(W);
+  // a decoy cortados_router in the working directory, on PYTHONPATH and as the user site: none may load
+  const decoy = join(W, 'decoy');
+  for (const d of [join(decoy, 'cortados_router', 'provider')]) await mkdir(d, { recursive: true });
+  await writeFile(join(decoy, 'cortados_router', '__init__.py'), '');
+  await writeFile(join(decoy, 'cortados_router', 'provider', '__init__.py'), '');
+  await writeFile(join(decoy, 'cortados_router', 'provider', 'clients.py'),
+    'import os\nopen(os.environ["W"] + "/decoy.log", "a").write("decoy\\n")\n');
+  const r = spawnSync('/bin/bash', ['-c', '. "$LIB"; REPO="$1"; clients_cli list a', 'x', repo], { cwd: decoy, encoding: 'utf8',
+    env: isolatedEnv(W, { PATH: '/usr/bin:/bin', LIB, W, PYTHONPATH: decoy, PYTHONUSERBASE: decoy }) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!existsSync(join(W, 'decoy.log')), 'a decoy clients module was imported');
+  assert.equal(fakeLog(W), 'list a\n');
 });
