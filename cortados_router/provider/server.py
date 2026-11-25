@@ -1906,6 +1906,20 @@ class Registry:
         return [r for r in self.recoverable.values()
                 if r.scope == scope and r.wire_path == wire_path and r.anchor == anchor]
 
+    def pick_as_opened(self, key: str | None) -> "routing.Pick | None":
+        """Fix round 1, finding 4: the identity (routing.kept_pick of its label) of the conversations, live or reaped and
+        recoverable, opened with route pick `key` (routing.pick_request_key, kept in their route under ASKED_PICK_KEY),
+        or None when none was, or when conversations opened under that same spelling carry different labels (which
+        one the client continues cannot be told). Only the label is returned: Registry.find then matches, as for any
+        request, within the request's own scope."""
+        if not key:
+            return None
+        with self._lock:
+            self._prune_recoverable_locked(time.time())
+            labels = {(c.route or {}).get(ASKED_WINDOW_KEY) for c in list(self.sessions.values())
+                      + list(self.recoverable.values()) if (getattr(c, "route", None) or {}).get(ASKED_PICK_KEY) == key}
+        return routing.kept_pick(next(iter(labels))) if len(labels) == 1 else None
+
 
 def _remember_reply(session, turn, msg_id: str, model: str, result) -> None:
     """Keep the session's last response for one replay (Replay), replacing the previous one: only the last answered
@@ -2074,6 +2088,11 @@ MODEL_CHANGE_REASON = "the continuation asks for another model than its conversa
 # it (_in_window). The key keeps its name: a window-only pick stores exactly what the band window stored. Its
 # own key: the route's `band_window` comes from select and a later rule (a local bind) may rewrite the route without it.
 ASKED_WINDOW_KEY = "asked_band_window"
+# The route pick as the opening request wrote it (routing.pick_request_key), kept beside the label for an explicit model
+# set: the label was resolved against the catalogue of that moment, and is the identity for the conversation's life.
+# A continuation whose pick no longer resolves (a selected model left the served catalogue) finds the label by this key
+# (Registry.pick_as_opened); only opening or forking validates the pick against the catalogue now (fix round 1, 4).
+ASKED_PICK_KEY = "asked_pick_text"
 # Refused.code -> the fixed record reason (_note_refusal); never request-derived text.
 REFUSED_REASONS = {
     "no_identity": "the continuation carries no conversation identity (terminal)",
@@ -3159,6 +3178,10 @@ class Handler(BaseHTTPRequestHandler):
             # The conversation's route pick (its window-only form is the band window's label), part of its identity
             # (_in_window); None when the request asked for none. What it asked for, also when E3 escalated the route.
             route = dict(route, **{ASKED_WINDOW_KEY: _pick_label(pick)})
+            if pick is not None and pick.models and not pick.local:
+                # Its spelling too, so a continuation still finds it after a table change (ASKED_PICK_KEY).
+                route[ASKED_PICK_KEY] = routing.pick_request_key(
+                    self.headers.get(routing.PICK_HEADER), self.headers.get(routing.BAND_HEADER), body.get("model"))
         try:
             return reg.new(turn, keep=not one_shot, route=route, scope=scope,
                            wire_path=self.path.split("?")[0], admitted=bool(reg.router and not one_shot),
@@ -3435,7 +3458,8 @@ class Handler(BaseHTTPRequestHandler):
             return None
         # routing._moved builds a new route without the opener's own keys: the window the conversation was opened with
         # must survive the move, or every later continuation would miss it (_in_window) and open a new conversation.
-        moved = {**moved, ASKED_WINDOW_KEY: (route or {}).get(ASKED_WINDOW_KEY)}
+        moved = {**moved, ASKED_WINDOW_KEY: (route or {}).get(ASKED_WINDOW_KEY),
+                 **({ASKED_PICK_KEY: route[ASKED_PICK_KEY]} if (route or {}).get(ASKED_PICK_KEY) else {})}
         if one_shot:
             session.route = moved                       # a throwaway backend: nothing to rebind; the record is local
             return session, got["turn"]
@@ -3689,6 +3713,7 @@ class Handler(BaseHTTPRequestHandler):
             # `cortados@NOT-A-BAND`). A fixed-model endpoint does not route, so it reads no routing header, as before.
             # Only an owner-token request reaches here (do_POST's _authorized), the trust of every routing header.
             pick = None
+            pick_unresolved = None            # why the pick is invalid NOW, when it is kept as a conversation's identity
             if reg.router:
                 # The route pick (x-cortados-pick, or the main loop's `cortados@<window>[:<models>]`) with the band
                 # window, read together: a window-only pick IS the band window, label and all.
@@ -3702,8 +3727,17 @@ class Handler(BaseHTTPRequestHandler):
                                        f"cortados: the route pick could not be resolved: {type(exc).__name__}", wire,
                                        reason="routing failed")
                 if bad:
-                    return self._error(400, "invalid_request_error", f"cortados: {bad}", wire,
-                                       reason="the band window or route pick is invalid")
+                    # Fix round 1, finding 4: a pick that once resolved (a conversation was opened with exactly this
+                    # spelling) keeps that identity; only opening or forking validates it against the catalogue now,
+                    # so a table change that drops a selected model does not break a running conversation.
+                    pick = reg.pick_as_opened(routing.pick_request_key(
+                        self.headers.get(routing.PICK_HEADER), self.headers.get(routing.BAND_HEADER), body.get("model")))
+                    if pick is None:
+                        return self._error(400, "invalid_request_error", f"cortados: {bad}", wire,
+                                           reason="the band window or route pick is invalid")
+                    pick_unresolved = bad
+                    logger.info("route pick %s no longer resolves against the served catalogue; a continuation of a "
+                                "conversation opened under it is served, an opening or fork is refused", pick.label)
             turn = wire.parse_request(body)
             server_tools = anthropic_wire.server_tool_names(body) if wire is ANTHROPIC else []
             if server_tools and not turn.tools:
@@ -3807,6 +3841,11 @@ class Handler(BaseHTTPRequestHandler):
                 return                                  # refused; the answer is sent
         if session is not None and self._fixed_route_refused(session, turn, body, wire, pick):
             return
+        if session is None and pick_unresolved:
+            # A new conversation, a one-shot or a fork under a pick that no longer resolves: validated now, as any
+            # opening is (fix round 1, finding 4), so the client gets the same 400 an unknown model always gets.
+            return self._error(400, "invalid_request_error", f"cortados: {pick_unresolved}", wire,
+                               reason="the band window or route pick is invalid")
         seed = None
         if fork_of is not None:
             try:

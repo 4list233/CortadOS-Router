@@ -1,6 +1,6 @@
 # Orchestrator route picker (design; steps 0–3 built)
 
-Status (2026-11-24, branch `orchestrator-route-picker`): step 0 (the spike, §3.1 and §1.3) is done; steps 1–3 (parser,
+Status (2026-11-25, branch `orchestrator-route-picker`, review fix round 1 applied): step 0 (the spike, §3.1 and §1.3) is done; steps 1–3 (parser,
 selection, identity) are built to the owner's §8 answers (§8.1): `routing.route_pick` / `resolve_pick` / `Pick`,
 `routing.choose(route_pick=…)` with `pick_shortfall` (E3), `pick_refusal` (E2) and `pick_notice`, and the server's
 identity on the pick label; tests in `tests/test_route_pick.py`. Steps 4–9 are not built. Sections below that say
@@ -385,7 +385,10 @@ Rules on top of the grammar:
   for a 400) and `routing.route_pick` (the three sources together). The model-name and header sources are capped at
   128 printable characters; the label can be longer (friendly names expand to ids) and is never cut.
 - An invalid pick is refused with a 400 on every request, continuations included, before any conversation lookup,
-  as an invalid window is today (`server.py:3662-3672`).
+  as an invalid window is today (`server.py:3662-3672`), with one exception (fix round 1, finding 4): a pick that
+  is invalid only because it no longer resolves against the served catalogue, and that an existing conversation was
+  opened with in exactly this spelling, keeps that conversation's identity (§3.4). The pick is not re-resolved for
+  every turn; it is validated against the current catalogue only when a conversation opens or forks.
 
 ### 3.3 Header
 
@@ -406,6 +409,16 @@ carrying both `x-cortados-band` and a pick with a different window is a 400.
 - `R3:*` is identified by the label, not by the set it resolved to: a nightly table rebuild that changes which models
   clear R3 does not fork a running conversation (the conversation's route is already chosen, `server.py:3115`). The
   resolved set is recorded in the route row (§6).
+- **The identity is fixed when the conversation opens** (fix round 1, finding 4; the reviewer reproduced it: an
+  Opus+Sol pick whose unused Opus member left the catalogue made the running Codex-backed conversation's next request a
+  400). An explicit-set pick's spelling as written (`routing.pick_request_key`: the pick header, band header and
+  `cortados@` model, trimmed and casefolded) is kept on the route as `asked_pick_text` (`server.ASKED_PICK_KEY`) beside
+  the label. A later request whose pick no longer resolves looks the label up by that key
+  (`Registry.pick_as_opened`: live and recoverable reaped conversations; one label, or none). It is then matched
+  under that label like any request, so continuations, replays and rebuilds of that conversation are served. When it
+  would open a conversation, a one-shot or a fork, it gets the 400 an unknown model always gets. A spelling that
+  resolves today keeps today's resolution. If the catalogue changes what an alias means (`opus` → a newer id), the
+  request carries a new label and forks, as any pick change does.
 - A `sub/` pin stays outside picks, as it is outside windows (`server.py:468`).
 
 ---
@@ -441,8 +454,8 @@ as an exclusion that empties the pool is today (`routing.py:808-813`).
 |---|---|
 | Outward / blast radius 3 floors the band (`core.py:1140-1142`, `:1171-1173`) | Still floors the band, so the required index is the floored band's. The pick still limits the models. If no selected model reaches that index, the conversation **escalates** (E3, §4.3). |
 | Degraded scorer never defaults to Claude (`routing.py:212-226`) | Unchanged and not overridable. A Claude-only pick while S1 is degraded has no candidate: refused (503) with a message naming the pick and the rule. A pick with a Codex member runs on it. The launcher warns at pick time when a pick is Claude-only. |
-| Sensitive → local (`routing.py:876-881`, `sensitive_local`) | Runs after select as today and **wins over the pick** (E5: it exists so that sensitive work stays on the owner's machine); recorded as `route pick … overridden: sensitive`. |
-| Cost moves to local (`auto_local`, `index_local`: `routing.py:882`, `:1452`, `:1631`) | **Skipped** for a cloud pick, escalated or not: they move work off the selected models for cost, which is exactly what a pick forbids. Recorded on every pick's row as `route pick: local cost routes not taken`. |
+| Sensitive → local (`routing.py:876-881`, `sensitive_local`) | Runs after select as today and **wins over the pick** (E5: it exists so that sensitive work stays on the owner's machine); recorded as `route pick … overridden: sensitive`. Only the sensitivity detectors (the `sensitive` flag, keywords, the S1 signal) move a pick's turn: see the next row for `prefer`. It also wins over an exhausted selection: it is asked before an E2 refusal is final (§4.4). |
+| Cost moves to local (`auto_local`, `index_local`: `routing.py:882`, `:1452`, `:1631`) | **Skipped** for a cloud pick, escalated or not: they move work off the selected models for cost, which is exactly what a pick forbids. Recorded on every pick's row as `route pick: local cost routes not taken`. So is the client's `x-cortados-local: prefer` (fix round 1, finding 1): `sensitive_local` handles it, but it is a cost preference, not sensitivity. Under a restricted pick it is not passed to the sensitive rule, and the row says `route pick: x-cortados-local: prefer not taken (a cost preference)`. |
 | API credit lane (`routing.py:1025`, `core.py:971-985`) | A selected Claude model includes its API-lane pair when the lane would be offered anyway (E4); its own refusals (degraded, outward, blast radius > 1, stop line) still apply. Not offered to an escalation (§4.3). |
 | Frontier rule (`core.py:1442-1465`) | Applies within the set. A turn the rule covers under a pick with no frontier model **escalates** (E3, §4.3, category `frontier`). |
 | Switching margin memory (`routing.remember_route`) | A pick's route (restricted or escalated) is not remembered: the margin holds a client's free choices against cost noise, and the client name is shared by the main loop and its subagents. |
@@ -465,7 +478,9 @@ frontier rule wants Opus 5.5 / Fable / Astra).
 2. **Shortfall, judged on capability alone**, from `model-scores.generated.json`, never from availability:
    - `index`: the required index is above every selected model's index for the turn's use case;
    - `frontier`: `selection.ceiling_work` requires a frontier model for this use case and D (`require_frontier`,
-     `core.ceiling_work_applies`) and no selected model is a ceiling model.
+     `core.ceiling_work_applies`), and no selected model is a ceiling model that also reaches the required index.
+     One model must meet both requirements (fix round 1, finding 2). Under `R3:gpt-6-astra+gpt-7-nova` at code D 9,
+     Astra is frontier but scores 78.5 and Nova scores 96 but is not frontier, so the pick escalates.
    No required index (a degraded scorer, unscored candidates) or no selected model in the scores: no shortfall. An
    escalation must rest on a number.
 3. On a shortfall the conversation is routed again, under the same route id (one routes row), with every served pair
@@ -512,6 +527,13 @@ Resolve then has no usable candidate and execution is refused (`core.py:1570-157
   models the owner excluded.
 - **C. Ask.** The provider cannot ask mid-request; in practice this is A with the widening instructions, plus the
   launcher/`/route` showing live state before the pick.
+
+**E5 before E2** (fix round 1, finding 3). Before an E2 refusal is final, the sensitive rule is asked
+(`routing._pick_refused_sensitive`), using the refused select's own decision (`execution_routing.select` now returns
+its `decision` with `last_route`). A sensitive-marked turn whose selected routes are all spent goes to the owner's
+machine, as it would with room. The row records `route pick: no selected route usable now (E2); the sensitive rule
+asked first (E5)` and `route pick … overridden: sensitive`. Nothing is written when the move does not happen, and the
+refusal below stands.
 
 **Decided (E2, owner 2026-11-24): A.** Built as `routing.pick_refusal`: each selected route (every account and lane
 the pick allowed, after exclusions) is named with its reason, from the same primitives routing uses (credentials,
@@ -678,6 +700,11 @@ notice; an exhausted capable selection refuses and does not escalate; escalation
 | E10 | Default. Keep both `R3` and `R3:*`. | `R3` is today's window, label and identity unchanged; `R3:*` is a list. |
 
 New from step 0: **E11** (below).
+
+Review of d2b45da (gpt-6.1-sol, fix round 1): E11 is acceptable as documented. The launcher's warning for a `haiku`
+pick stays planned for the launcher step (step 6), and is not built here. Leaving the API credit lane out of an E3
+escalation (§4.3) is acceptable too. The four findings fixed in that round are noted where they apply: `prefer` under
+a pick (§4.2), one model for both requirements (§4.3), E5 before E2 (§4.4), and the identity fixed at open (§3.4).
 
 ### 8.2 The questions as asked
 

@@ -630,7 +630,85 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual((len(self.routed), len(self.reg.sessions)), (1, 1))
 
 
+    def test_a_table_change_never_breaks_a_running_conversation(self):
+        # Fix round 1, finding 4 (gpt-6.1-sol on d2b45da): the pick is resolved when the conversation opens; a selected
+        # model leaving the served catalogue later does not refuse its continuations, only new openings and forks.
+        body, _ = self.opened(f"cortados@R3:{OPUS}+{SOL}")
+        real = routing.pinnable_models
+        with mock.patch.object(routing, "pinnable_models", lambda c: [p for p in real(c) if p[1] != OPUS]):
+            self.assertEqual(routing.route_pick(core, None, None, f"cortados@R3:{OPUS}+{SOL}")[0], None)  # unresolvable
+            self.ok(body)                                                    # the continuation runs on its route
+            self.assertEqual((self.routed, len(self.reg.sessions)), ([f"R3:{OPUS}+{SOL}"], 1))
+            fresh = {"model": f"cortados@R3:{OPUS}+{SOL}", "tools": [test_provider_codex.READ_TOOL],
+                     "messages": [{"role": "user", "content": "a new conversation"}]}
+            code, err = self.send_with(fresh, dict(self.IDENT, **{"x-claude-code-session-id": "s-other"}))
+            self.assertEqual(code, 400, err)                                # an opening is validated now
+            self.assertIn("not a model this endpoint serves", err["message"])
+            code, err = self.send_with(dict(body, model=f"cortados@R3:{OPUS}"), self.IDENT)
+            self.assertEqual(code, 400, err)                                # never opened under it: refused as before
+        self.assertEqual((self.routed, len(self.reg.sessions)), ([f"R3:{OPUS}+{SOL}"], 1))
+
+
 del _CODEX
+
+
+# ------------------------------------------------------------------------------- fix round 1 (gpt-6.1-sol on d2b45da)
+TAG = LOCAL_NODE["models"][0]["id"]
+
+
+class FixRound1Tests(SelectionTests):
+    """Findings 1-3 of the adversarial review of d2b45da, on the real routing.choose and sensitive_local with a fake
+    local node (probe and gate faked; nothing is contacted)."""
+
+    locals().update({n: None for n in list(vars(SelectionTests)) if n.startswith("test_")})
+
+    def setUp(self):
+        super().setUp()
+        self.local_nodes = [{**LOCAL_NODE, "sensitive": {"model": LOCAL_NODE["models"][0], "refusal_fallback": False}}]
+        for name, fake in (("probe", lambda node: {TAG}), ("gate_busy", lambda node: None)):
+            p = mock.patch.object(local_lane, name, fake)
+            p.start(); self.addCleanup(p.stop)
+        routing._auto_down.clear()
+        self.addCleanup(routing._auto_down.clear)
+
+    def test_a_local_preference_does_not_move_a_pick_off_its_models(self):
+        # finding 1: `prefer` is a cost preference, not sensitivity: under a pick it moves nothing
+        r = self.choose(f"R3:{OPUS}", local="prefer")
+        self.assertNotIn("local", r)
+        self.assertEqual(r["model"], OPUS)
+        self.assertNotIn(routing.PICK_ESCALATED_KEY, r)
+        self.assertIn("route pick: x-cortados-local: prefer not taken (a cost preference)", self.rules())
+        self.assertFalse(any("overridden: sensitive" in x for x in self.rules()))
+        r = self.choose(f"R3:{OPUS}", local="sensitive")                 # genuine sensitivity still wins (E5)
+        self.assertEqual((r["provider"], r["model"]), ("local-pro", TAG))
+        self.assertIn(f"route pick R3:{OPUS} overridden: sensitive", self.rules())
+
+    def test_one_selected_model_must_meet_both_the_index_and_the_frontier_rule(self):
+        # finding 2: Astra is frontier but 78.5 on code, Nova 96 but not frontier; a code turn at D 9 needs a frontier
+        # model of 95: neither is one, so the pick escalates (to Opus, the only such model)
+        r = self.choose(f"R3:{ASTRA}+{NOVA}", d=dec(steps=3, ambiguity=3, novelty=3))
+        esc = r.get(routing.PICK_ESCALATED_KEY)
+        self.assertIsNotNone(esc, r.get("model"))
+        self.assertEqual((esc["reason"], esc["required"]), ("frontier", 95.0))
+        self.assertEqual(r["model"], OPUS)
+        self.assertTrue(any(x.startswith("route pick escalated: no selected model reaches the frontier requirement")
+                            and "strongest selected frontier model has 78.5" in x for x in self.rules()))
+
+    def test_the_sensitive_rule_wins_over_an_exhausted_selection(self):
+        # finding 3: every selected route spent; a sensitive-marked turn goes local (E5) rather than an E2 refusal
+        self.health["claude"] = row("claude", ok=False)
+        self.health["claude#b"] = row("claude#b", ok=False)
+        r = self.choose(f"R3:{OPUS}", local="sensitive")
+        self.assertNotIn("error", r)
+        self.assertEqual((r["provider"], r["model"]), ("local-pro", TAG))
+        self.assertIn(f"route pick R3:{OPUS} overridden: sensitive", self.rules())
+        self.assertIn("route pick: no selected route usable now (E2); the sensitive rule asked first (E5)",
+                      self.rules())
+        self.assertEqual(len({rid for rid, *_ in self.logged}), 1)
+        self.logged.clear()
+        r = self.choose(f"R3:{OPUS}")                                     # not sensitive: E2 refuses as before
+        self.assertTrue(r["pick_refused"] and r["quota_blocked"])
+        self.assertEqual(self.logged, [])
 
 
 class EndpointStatusTests(Catalogue):

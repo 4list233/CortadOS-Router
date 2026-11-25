@@ -213,6 +213,7 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
     # `last_route`: core.resolve's last answer (band, D, required index, skipped routes and why), or None when no
     # candidate was ever offered. A host that restricted the candidates (the provider's route pick) reads it to tell a
     # requirement no allowed model meets from allowed models that are all spent, and to name each refusal reason.
+    # `decision`: S1's answer, so such a host can still ask its sensitive rule (E5) before a refusal is final.
     return {'router': ROUTER, 'error': 'No authenticated, available model fits the assembled request and route constraints. '
             + '; '.join(failures), 'degraded': bool(decision.get('degraded')), 'last_route': route,
-            'failures': list(failures)}
+            'failures': list(failures), 'decision': decision}

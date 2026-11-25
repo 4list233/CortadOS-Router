@@ -335,6 +335,33 @@ def route_pick(core, header: Any, band_header: Any, model: Any) -> tuple["Pick |
     return pick, None
 
 
+def pick_request_key(header: Any, band_header: Any, model: Any) -> str | None:
+    """The route pick as the request wrote it (PICK_HEADER, BAND_HEADER and the `cortados@<pick>` model, trimmed and
+    casefolded), as one key, or None when none is given. Fix round 1, finding 4: a conversation keeps the key it was
+    opened with, so a continuation whose pick no longer resolves against the served catalogue (a model removed by a
+    table change) still finds its conversation by the identity it was opened under (Registry.pick_as_opened)."""
+    parts = [x.strip().casefold() if isinstance(x, str) else "" for x in (header, band_header)]
+    parts.append((band_model_window(model) or "").strip().casefold())
+    return json.dumps(parts) if any(parts) else None
+
+
+def kept_pick(label: Any) -> "Pick | None":
+    """The Pick of an explicit-set label a conversation was opened under (`R3:a+b`, `any:a`), rebuilt from the label
+    alone (no catalogue): the identity of an existing conversation whose pick no longer resolves (pick_request_key).
+    None for anything else: a window-only or `*` pick resolves without the catalogue, and a local pick is refused."""
+    from cortados_router import core
+    if not isinstance(label, str):
+        return None
+    head, sep, tail = label.partition(":")
+    if not sep or not tail or tail == "*" or head == "local":
+        return None
+    try:
+        window = core.parse_band_window(head)
+    except ValueError:
+        return None
+    return Pick(window, tuple(tail.split("+")), label=label)
+
+
 def pick_label(pick: "Pick | None") -> str | None:
     """The conversation identity of a pick (its label), None for none."""
     return pick.label if pick is not None else None
@@ -521,9 +548,34 @@ def pick_shortfall(core, models: tuple[str, ...], route: dict[str, Any] | None) 
         return "index", f"no selected model reaches {req:g} ({u}; the strongest selected has {best:g})"
     cw = (core.table().get("selection") or {}).get("ceiling_work") or {}
     D = route.get("D")
-    if cw.get("require_frontier") and core.ceiling_work_applies(cw, u, D) and not any(c for _, c in got):
-        return "frontier", f"no selected model reaches the frontier requirement ({u} at D={D} needs a frontier model)"
+    # Fix round 1, finding 2 (gpt-6.1-sol on d2b45da): ONE selected model must meet both requirements. A frontier model
+    # below the index and a non-frontier model above it together are not a model that can serve the turn.
+    if cw.get("require_frontier") and core.ceiling_work_applies(cw, u, D) and not any(c for i, c in got if i >= req):
+        frontier = [i for i, c in got if c]
+        return "frontier", (f"no selected model reaches the frontier requirement ({u} at D={D} needs a frontier model"
+                            + (f" with index {req:g}; the strongest selected frontier model has {max(frontier):g})"
+                               if frontier else ")"))
     return None
+
+
+def _pick_refused_sensitive(core, body: dict[str, Any], r: dict[str, Any], notes: list[str], *, client: str,
+                            conversation_id: str, excluded: Callable[[str], bool], local: str | None
+                            ) -> dict[str, Any] | None:
+    """E5 before E2 (fix round 1, finding 3): the refused select's decision (`r`, execution_routing.select's error
+    result: its `decision` and `last_route`) moved to a node's sensitive model by sensitive_local, or None when the
+    sensitive rule does not take it (no trigger, not admitted, no node) or the decision cannot be read. No cloud route
+    was chosen, so no routes row exists yet: sensitive_local writes one only for a move that happens."""
+    last, decision = r.get("last_route"), r.get("decision")
+    if not isinstance(last, dict) or not last.get("band") or not isinstance(decision, dict):
+        return None
+    base = {"router": r.get("router", execution_routing.ROUTER), "provider": "route-pick", "model": "refused",
+            "route_id": "execution:provider:call:" + uuid.uuid4().hex[:12], "degraded": bool(r.get("degraded")),
+            "band": last["band"], "decision": decision,
+            "route": {**last, "hard_rules": list(last.get("hard_rules") or []) + list(r.get("failures") or []) + notes
+                      + ["route pick: no selected route usable now (E2); the sensitive rule asked first (E5)"]}}
+    moved = sensitive_local(core, body, base, client=client, conversation_id=conversation_id, excluded=excluded,
+                            local=local)
+    return moved if moved.get("local") else None
 
 
 def previous_routes(client: str) -> dict[str, dict[str, str]] | None:
@@ -1230,7 +1282,13 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
                        # cost moves to a local node (auto_local, index_local) would move the main loop off the
                        # selected models for cost, which is what a pick forbids (doc §4.2); the sensitive rule still wins
                        "route pick: local cost routes not taken"]
+        if local == "prefer":
+            # Fix round 1, finding 1: `x-cortados-local: prefer` is the client's COST preference, not sensitivity; under
+            # a restricted pick it moves nothing (doc §4.2). The sensitivity detectors (flag, keyword, S1) still win (E5).
+            base_notes.append("route pick: x-cortados-local: prefer not taken (a cost preference)")
         constraints["notes"] = base_notes
+    # The `local` header as the sensitive rule reads it: under a restricted pick only sensitivity moves a turn local.
+    sensitive_local_header = None if restrict and local == "prefer" else local
     fit = request_fit(body)
     workload = workload_hint(workload)
     if workload:
@@ -1269,10 +1327,17 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
             if not r.get("error"):
                 r = {**r, PICK_ESCALATED_KEY: {"label": route_pick.label, "reason": short[0], "required": req}}
         elif r.get("error"):
-            # E2 (owner 2026-11-24): the selected models could meet the turn but none is usable now. Refused, naming
-            # each route and why; never served on a model the owner did not pick.
-            return pick_refusal(core, route_pick, live_pairs, r, body, claude_bin=claude_bin, codex_bin=codex_bin,
-                                min_left_pct=min_left_pct, codex_home=codex_home)
+            # E5 before E2 (fix round 1, finding 3): a request a sensitivity detector marks goes to the owner's machine
+            # whatever the pick, so the sensitive rule is asked before the refusal is final, on the decision the
+            # refused select made (no cloud route is chosen; nothing is written unless the move happens).
+            moved = _pick_refused_sensitive(core, body, r, base_notes, client=client, conversation_id=conversation_id,
+                                            excluded=hit, local=sensitive_local_header)
+            if moved is None:
+                # E2 (owner 2026-11-24): the selected models could meet the turn but none is usable now. Refused,
+                # naming each route and why; never served on a model the owner did not pick.
+                return pick_refusal(core, route_pick, live_pairs, r, body, claude_bin=claude_bin, codex_bin=codex_bin,
+                                    min_left_pct=min_left_pct, codex_home=codex_home)
+            r = moved
     if not r.get("error") and r.get("provider") == API_PROVIDER:
         why = request_sensitivity(body, r, local)
         if why is not None:
@@ -1317,8 +1382,9 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
         # never inferred from which rule moved the request, and it wins over the cost preference.
         sensitive = request_sensitivity(body, r, local)
         skipped: list[str] = []                    # why sensitive_local did not take it, as reason categories
-        r = sensitive_local(core, body, r, client=client, conversation_id=conversation_id, excluded=hit, local=local,
-                            why_out=skipped)
+        if not r.get("local"):                     # already moved: a pick's E2 path asked the sensitive rule itself
+            r = sensitive_local(core, body, r, client=client, conversation_id=conversation_id, excluded=hit,
+                                local=sensitive_local_header, why_out=skipped)
         if restrict and r.get("local"):
             # E5 (owner 2026-11-24): the sensitive rule wins over the pick; said on the routes row sensitive_local wrote.
             r = {**r, "route": {**(r.get("route") or {}), "hard_rules": list((r.get("route") or {}).get("hard_rules")
