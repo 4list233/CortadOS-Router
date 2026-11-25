@@ -19,6 +19,8 @@ protocol, how it renders people and floors, and the remaining gaps.
 | `gateway-check.mjs` | deploy-air.sh's end-to-end health probe: a plain `connect` and a browser-shaped one (signed device block, no token) through Studio's own proxy must each get the bridge's hello |
 | `studio-settings.py` | builds Studio's gateway settings file (`<state dir>/claw3d/settings.json`: the bridge URL and secret), the only upstream config Claw3D's proxy reads |
 | `claw3d/cortados-rooms.patch`, `claw3d/cortadosRooms.ts` | rooms per orchestrator: the floor's 8 rooms x 6 desks and the desk allocation (the patch adds the `.ts` file and a 40-line hook; [FLOORS-DESIGN.md](FLOORS-DESIGN.md) §8) |
+| `claw3d/cortados-brand.patch` | brands the Office as the CortadOS router (title, floor card, connection badge), removes the flag poles and hides the OpenClaw controls the read-only bridge cannot serve, the chat composer included ([OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md) part A) |
+| `claw3d/office-mode.patch`, `claw3d/office-mode.cjs` | "office mode": Studio's server answers only the Office's own routes and methods and 403 to the rest (`PUT /api/studio`, remote office, runtime, voice, every write), so the cookie opens a read-only view ([OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md) A.5) |
 | `DEPLOY.md`, `deploy-air.sh`, `deploy-lib.sh` | Air runbook, script (install / upgrade / tailnet publish) and its pure checks, written and **not run** |
 
 ## Test
@@ -42,7 +44,13 @@ orchestrator's own routed helpers. A finished task leaves its desk and sits at a
 status), then leaves; a finished helper just leaves. The Grok Bot has a room; the unattributed room comes last and only
 while someone in it is active. 8 rooms x 6 team desks; past that, people walk the floor unseated (Claw3D's behaviour
 for anyone without a desk). Rooms and seats are sticky while their people stay. With any other gateway connected,
-Studio is unchanged.
+the stock layout comes back; the brand patch (below) is not switched, since this Studio build serves only the bridge.
+
+Each nameplate's second line ends with where the person runs (`claude-opus-5 · Pro`): a task's exec host, an
+orchestrator's session host (its device matched to a known host name by the provider: `live.orchestrator_hosts`, the
+tree's group `host`), a helper's task or session host. No badge when no known name matches; a raw hostname is never
+shown, and the group's raw `device` is not in `agents.list` at all. Branding, the removed props, the hidden controls and the design of what comes next (orchestrator names, server
+room, steering) are in [OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md).
 
 ## Appearance (issue #77)
 

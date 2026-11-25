@@ -1,6 +1,7 @@
 # Office floors per orchestrator: design (issue #77)
 
-Status: **built on branch `office-rooms`, not deployed** (2026-11-24). The owner decided the [ESCALATE] list on
+Status: **built on branch `office-rooms`, not deployed** (2026-11-24). The brand, the host badge and the next design steps (orchestrator
+names, personalisation, a server room, steering) are in [OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md) (2026-11-25). The owner decided the [ESCALATE] list on
 2026-11-24 (section 7); section 8 says what was built, how each decision shows, and what deploying needs. Sections 1-6
 are the original design, kept as written, except where section 7 overrides them. Claw3D evidence comes from a read-only clone of `github.com/iamlukethedev/Claw3D` at
 `51337f7f250459af61a7cf92b7b0015d59faed5c` (the commit `deploy-air.sh` pins). Paths below are relative to that

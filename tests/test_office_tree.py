@@ -155,6 +155,40 @@ class TreeShape(unittest.TestCase):
         self.assertEqual(live.office_tree({})["orchestrators"]["status"], "error")   # no section is not "ok"
 
 
+class HostBadge(unittest.TestCase):
+    """The Office's host badge (#77 brand): each orchestrator group carries `host`, the KNOWN host name its session's
+    device belongs to (exec-hosts.json names and `hostnames`), never the raw device hostname; a task's `host` is its
+    exec host, as before."""
+
+    def test_the_tree_carries_each_rooms_host(self):
+        g = {x["origin"]: x for x in sample_tree()["orchestrators"]["items"]}
+        self.assertEqual((g[ot.MINE]["host"], g[ot.OTHER]["host"]), ("pro", "studio"))
+        self.assertIsNone(g["grokbot"]["host"])                 # no device: no badge, never a guess
+        self.assertIsNone(g[None]["host"])
+        self.assertEqual(next(n for n in g["grokbot"]["tasks"] if n["task_id"] == BOT_RUNNING)["host"], "air")
+
+    def test_only_a_known_name_is_published(self):
+        aliases = live.host_aliases(["air", "pro", "studio"], {"air": ["forests-macbook-air"], "lab": ["box-7"]})
+        items = [{"device": "forests-macbook-air"}, {"device": "forests-mac-studio"}, {"device": "box-7"},
+                 {"device": "johns-imac-2"}, {"device": None}, {"device": ["pro"]}, {}]
+        live.orchestrator_hosts(items, aliases)
+        self.assertEqual([i["host"] for i in items], ["air", "studio", "lab", None, None, None, None])
+        # the provider's own hostname matching no name is the provider host's known name, when there is one
+        mine = [{"device": "owners-laptop"}]
+        live.orchestrator_hosts(mine, aliases, self_host="owners-laptop", me="pro")
+        self.assertEqual(mine[0]["host"], "pro")
+        live.orchestrator_hosts(mine, aliases, self_host="owners-laptop", me=None)
+        self.assertIsNone(mine[0]["host"])
+
+    def test_collect_sets_host_from_exec_hosts_aliases(self):
+        # "pro" is now only a hostname alias of an exec host named laptop; studio stays known through its heartbeat
+        t = live.office_tree(tree_view(host_names=["laptop"],
+                                       exec_hosts=lambda: ({"laptop": ["pro"], "air": ["forests-macbook-air"]}, "air")))
+        hosts = {x["origin"]: x["host"] for x in t["orchestrators"]["items"]}
+        self.assertEqual(hosts[ot.MINE], "laptop")
+        self.assertEqual(hosts[ot.OTHER], "studio")
+
+
 class FamilySources(unittest.TestCase):
     """#77 E7: first source that applies, published as client_source: bot, wire, heartbeat; else none (the adapter
     guesses from the model and says so)."""

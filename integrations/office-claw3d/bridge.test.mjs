@@ -254,6 +254,9 @@ test('e2e: authenticated Studio gets hello, roster with sprites, read-only refus
   const agents = (await c.next(f => f.id === 'list')).payload.agents;
   assert.deepEqual(agents.map(a => a.office.sprite), ['claude-suit', 'ollama']);
   assert.ok(agents.every(a => a.identity.avatarUrl.startsWith('data:image/png;base64,')));
+  // the group's raw device ('pro' here; a real one can be '<owner>-macbook-pro') never reaches the browser
+  assert.ok(agents.every(a => !('device' in a.office)), 'no office.device in agents.list');
+  assert.ok(!JSON.stringify(agents).includes('"device"'));
   c.send({ type: 'req', id: 'm', method: 'chat.send', params: { message: 'hi' } });
   assert.equal((await c.next(f => f.id === 'm')).error.code, 'READ_ONLY');
   // a poll lands: presence (Studio's Office screen reloads its roster on it) and the extension snapshot

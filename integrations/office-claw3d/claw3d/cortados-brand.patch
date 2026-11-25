@@ -1,0 +1,281 @@
+diff --git a/src/features/office/components/OfficeFloorNav.tsx b/src/features/office/components/OfficeFloorNav.tsx
+index 8c9bbf8..e977218 100644
+--- a/src/features/office/components/OfficeFloorNav.tsx
++++ b/src/features/office/components/OfficeFloorNav.tsx
+@@ -13,6 +13,7 @@ import {
+ } from "@/lib/office/floors";
+ import type { FloorRosterState } from "@/lib/office/floorRoster";
+ 
++const CORTADOS_BUILDING_DIRECTORY = false;
+ const DIRECTORY_COLLAPSED_STORAGE_KEY = "claw3d.officeFloorNav.directoryCollapsed";
+ 
+ type OfficeFloorNavProps = {
+@@ -25,7 +26,7 @@ type OfficeFloorNavProps = {
+ 
+ const PROVIDER_LABEL: Record<FloorProvider, string> = {
+   demo: "Demo",
+-  openclaw: "OpenClaw",
++  openclaw: "Router", // CortadOS (cortados-brand.patch): the CortadOS bridge speaks the openclaw protocol
+   hermes: "Hermes",
+   paperclip: "Paperclip",
+   custom: "Custom",
+@@ -141,6 +142,8 @@ export function OfficeFloorNav({
+ 
+   return (
+     <aside className="pointer-events-none fixed left-4 top-24 z-40 flex w-[240px] max-w-[calc(100vw-2rem)] flex-col gap-3">
++      {/* CortadOS (cortados-brand.patch): no building directory, the CortadOS floor is the only one */}
++      {CORTADOS_BUILDING_DIRECTORY ? (
+       <section className="pointer-events-auto rounded-2xl border border-amber-400/20 bg-black/78 p-3 shadow-2xl backdrop-blur">
+         <button
+           type="button"
+@@ -210,6 +213,7 @@ export function OfficeFloorNav({
+           </div>
+         ) : null}
+       </section>
++      ) : null}
+ 
+       <section className="pointer-events-auto rounded-2xl border border-white/10 bg-black/68 px-3 py-2 shadow-xl backdrop-blur">
+         <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-white/45">
+diff --git a/src/features/office/screens/OfficeScreen.tsx b/src/features/office/screens/OfficeScreen.tsx
+index 195922b..ea59813 100644
+--- a/src/features/office/screens/OfficeScreen.tsx
++++ b/src/features/office/screens/OfficeScreen.tsx
+@@ -266,6 +266,12 @@ const MAX_OPENCLAW_AGENT_OUTPUT_LINES = 12;
+ const OFFICE_DANCE_MS = 60_000;
+ const GATEWAY_LOADING_OVERLAY_DELAY_MS = 1_200;
+ const GATEWAY_CONNECT_OVERLAY_DELAY_MS = 1_500;
++// CortadOS (CortadOS-Router claw3d/cortados-brand.patch): the CortadOS bridge is read-only (office:read) and answers
++// no chat, agent, skill, cron or usage method, so the OpenClaw controls are hidden: the HQ sidebar (inbox, history,
++// kanban, playbooks, analytics, marketplace, add agent, build company), the chat dock and its composer (model picker,
++// attach, mic, send, new session, remote handoff), the agent editor, add/delete agent, push-to-talk, the Claw3D
++// onboarding wizard and the agent event console (shown upstream whenever DEBUG is unset).
++const CORTADOS_OPENCLAW_UI = false;
+ 
+ const getLatestUserRequestForAgent = (
+   agent: AgentState,
+@@ -4117,7 +4123,7 @@ export function OfficeScreen({
+     stop: stopMainVoiceRecording,
+     clearError: clearMainVoiceError,
+   } = useVoiceRecorder({
+-    enabled: status === "connected" && Boolean(mainAgent),
++    enabled: CORTADOS_OPENCLAW_UI && status === "connected" && Boolean(mainAgent),
+     onVoiceSend: async (payload) => {
+       if (!mainAgent) {
+         throw new Error("Main agent not found.");
+@@ -4813,13 +4819,13 @@ export function OfficeScreen({
+           onAgentChatSelect={(agentId) => {
+             handleOpenAgentChat(agentId);
+           }}
+-          onAddAgent={handleOpenCreateAgentWizard}
+-          onAgentEdit={(agentId) => {
++          onAddAgent={CORTADOS_OPENCLAW_UI ? handleOpenCreateAgentWizard : undefined}
++          onAgentEdit={CORTADOS_OPENCLAW_UI ? (agentId) => {
+             openAgentEditor(agentId, "avatar");
+-          }}
+-          onAgentDelete={(agentId) => {
++          } : undefined}
++          onAgentDelete={CORTADOS_OPENCLAW_UI ? (agentId) => {
+             void handleDeleteAgent(agentId);
+-          }}
++          } : undefined}
+           onDeskAssignmentChange={handleDeskAssignmentChange}
+           onDeskAssignmentsReset={handleDeskAssignmentsReset}
+           onGithubReviewDismiss={() => {
+@@ -4964,6 +4970,7 @@ export function OfficeScreen({
+                 <p className="mt-1 text-sm text-amber-50">{emptyFleetMessage}</p>
+               </div>
+               <div className="flex shrink-0 items-center gap-2">
++                {CORTADOS_OPENCLAW_UI ? (<>
+                 <button
+                   type="button"
+                   className="ui-btn-secondary px-3 py-2 text-xs font-semibold tracking-[0.05em] text-foreground"
+@@ -4982,6 +4989,7 @@ export function OfficeScreen({
+                 >
+                   Build Company
+                 </button>
++                </>) : null}
+                 <button
+                   type="button"
+                   className="ui-btn-secondary px-3 py-2 text-xs font-semibold tracking-[0.05em] text-foreground"
+@@ -5008,7 +5016,8 @@ export function OfficeScreen({
+         </div>
+       ) : null}
+ 
+-      {!debugEnabled ? (
++      {/* CortadOS (cortados-brand.patch): HQ sidebar hidden */}
++      {!debugEnabled && CORTADOS_OPENCLAW_UI ? (
+         <HQSidebar
+           open={sidebarOpen}
+           activeTab={activeSidebarTab}
+@@ -5106,7 +5115,7 @@ export function OfficeScreen({
+         }}
+       />
+ 
+-      {showOnboardingWizard ? (
++      {showOnboardingWizard && CORTADOS_OPENCLAW_UI ? (
+         <OnboardingWizard
+           key={companyCreatedSignal > 0 ? `onboarding-company-created-${companyCreatedSignal}` : "onboarding-default"}
+           gatewayConnected={status === "connected"}
+@@ -5133,7 +5142,7 @@ export function OfficeScreen({
+         />
+       ) : null}
+ 
+-      {showOpenClawConsole ? (
++      {showOpenClawConsole && CORTADOS_OPENCLAW_UI ? (
+         <section className="pointer-events-auto fixed bottom-3 left-3 z-30 flex w-[520px] max-w-[calc(100vw-1.5rem)] flex-col overflow-hidden rounded border border-cyan-500/25 bg-black/78 shadow-2xl backdrop-blur">
+           <div className="flex items-center justify-between border-b border-cyan-500/15 px-3 py-2 font-mono text-[11px] uppercase tracking-[0.18em] text-cyan-200/80">
+             <span>Agent Event Console</span>
+@@ -5347,10 +5356,10 @@ export function OfficeScreen({
+ 
+       <div
+         className={`fixed bottom-3 z-30 flex flex-col items-end gap-2 ${sidebarOpen ? "right-84" : "right-3"} ${
+-          debugEnabled ? "hidden" : ""
++          debugEnabled || !CORTADOS_OPENCLAW_UI ? "hidden" : ""
+         }`}
+       >
+-        {chatOpen && (
++        {chatOpen && CORTADOS_OPENCLAW_UI && (
+           <div
+             className="flex overflow-hidden rounded border border-white/10 bg-[#0e0a04] shadow-2xl"
+             style={{
+diff --git a/src/features/retro-office/RetroOffice3D.tsx b/src/features/retro-office/RetroOffice3D.tsx
+index cb7e257..0e02580 100644
+--- a/src/features/retro-office/RetroOffice3D.tsx
++++ b/src/features/retro-office/RetroOffice3D.tsx
+@@ -225,6 +225,10 @@ import type { OfficeCleaningCue } from "@/lib/office/janitorReset";
+ // CortadOS rooms (CortadOS-Router claw3d/cortados-rooms.patch): off unless the CortadOS bridge is the gateway
+ import * as cortados from "@/features/retro-office/core/cortadosRooms";
+ 
++// CortadOS (cortados-brand.patch): Studio settings (gateway, title, remote office, voice replies) and the layout
++// editor do nothing for the read-only CortadOS bridge; hidden.
++const CORTADOS_OFFICE_CONTROLS = false;
++
+ type OfficeDeskMonitorMap = Record<string, OfficeDeskMonitor>;
+ type RenderAgentUiSnapshot = Pick<RenderAgent, "state" | "status">;
+ type FeedEvent = {
+@@ -2267,7 +2271,7 @@ export function RetroOffice3D({
+   githubSkill = null,
+   taskManagerEnabled = false,
+   soundclawEnabled = false,
+-  officeTitle = "Luke Headquarters",
++  officeTitle = "CortadOS Router",
+   officeTitleLoaded = false,
+   remoteOfficeEnabled = false,
+   remoteOfficeSourceKind = "presence_endpoint",
+@@ -7009,9 +7013,10 @@ export function RetroOffice3D({
+                   ? "border-amber-400/25 bg-amber-500/10 text-amber-100"
+                   : "border-rose-400/25 bg-rose-500/10 text-rose-100"
+             }`}
+-            title={`Runtime: ${activeAdapterType} (${gatewayStatus})`}
++            title={`CortadOS router (${gatewayStatus})`}
+           >
+-            {activeAdapterType} • {gatewayStatus}
++            {/* CortadOS (cortados-brand.patch) */}
++            router • {gatewayStatus}
+           </div>
+           {/* New Idea 7: Heatmap toggle. */}
+           <button
+@@ -7028,7 +7033,8 @@ export function RetroOffice3D({
+           >
+             <Maximize size={12} />
+           </button>
+-          {/* Edit office toggle. */}
++          {/* Edit office toggle. CortadOS (cortados-brand.patch): hidden, the rooms layout is fixed */}
++          {CORTADOS_OFFICE_CONTROLS ? (<>
+           <button
+             onClick={toggleEdit}
+             title={editMode ? "Done editing" : "Edit office"}
+@@ -7047,6 +7053,7 @@ export function RetroOffice3D({
+           >
+             <Settings2 size={12} />
+           </button>
++          </>) : null}
+           {editMode && (
+             <>
+               {drag.kind === "placing" && (
+diff --git a/src/features/retro-office/scene/environment.tsx b/src/features/retro-office/scene/environment.tsx
+index 65cdee9..8698b12 100644
+--- a/src/features/retro-office/scene/environment.tsx
++++ b/src/features/retro-office/scene/environment.tsx
+@@ -20,6 +20,8 @@ import {
+ } from "@/features/retro-office/core/district";
+ import { toWorld } from "@/features/retro-office/core/geometry";
+ 
++const CORTADOS_FLAGS = false;
++
+ function FramedPicture({
+   position,
+   rotY = 0,
+@@ -711,17 +713,22 @@ export const WallPictures = memo(function WallPictures({
+ 
+   return (
+     <group>
+-      <OfficeFlagPole
+-        position={localFlagPolePosition}
+-        rotY={0.32}
+-        art={<UsaFlagArt />}
+-      />
+-      {showRemoteOffice ? (
+-        <OfficeFlagPole
+-          position={remoteFlagPolePosition}
+-          rotY={0.32}
+-          art={<BrazilFlagArt />}
+-        />
++      {/* CortadOS (cortados-brand.patch): no national flags in the CortadOS office */}
++      {CORTADOS_FLAGS ? (
++        <>
++          <OfficeFlagPole
++            position={localFlagPolePosition}
++            rotY={0.32}
++            art={<UsaFlagArt />}
++          />
++          {showRemoteOffice ? (
++            <OfficeFlagPole
++              position={remoteFlagPolePosition}
++              rotY={0.32}
++              art={<BrazilFlagArt />}
++            />
++          ) : null}
++        </>
+       ) : null}
+ 
+       <FramedPicture
+diff --git a/src/lib/office/floors.ts b/src/lib/office/floors.ts
+index fa27d3e..d74e9b1 100644
+--- a/src/lib/office/floors.ts
++++ b/src/lib/office/floors.ts
+@@ -47,8 +47,8 @@ export const OFFICE_FLOORS: readonly FloorDefinition[] = [
+   },
+   {
+     id: "openclaw-ground",
+-    label: "OpenClaw Floor",
+-    shortLabel: "OpenClaw",
++    label: "CortadOS Floor", // CortadOS (cortados-brand.patch)
++    shortLabel: "CortadOS",
+     provider: "openclaw",
+     kind: "runtime",
+     zone: "building",
+diff --git a/src/lib/studio/settings.ts b/src/lib/studio/settings.ts
+index 60c3504..1b14267 100644
+--- a/src/lib/studio/settings.ts
++++ b/src/lib/studio/settings.ts
+@@ -542,7 +542,9 @@ const normalizeTaskBoardPreference = (
+   };
+ };
+ 
+-const DEFAULT_OFFICE_TITLE = "Luke Headquarters";
++// CortadOS (claw3d/cortados-brand.patch): the Office is the CortadOS router's; the upstream default title is read as unset
++const DEFAULT_OFFICE_TITLE = "CortadOS Router";
++const UPSTREAM_OFFICE_TITLE = "Luke Headquarters";
+ const DEFAULT_REMOTE_OFFICE_LABEL = "Remote Office";
+ const DEFAULT_REMOTE_OFFICE_SOURCE_KIND = "presence_endpoint" as const;
+ 
+@@ -551,7 +553,7 @@ const normalizeOfficeTitle = (
+   fallback: string = DEFAULT_OFFICE_TITLE
+ ) => {
+   const title = coerceString(value);
+-  return (title || fallback).slice(0, 48);
++  return (title && title !== UPSTREAM_OFFICE_TITLE ? title : fallback).slice(0, 48);
+ };
+ 
+ const normalizeRemoteOfficeLabel = (

@@ -8,7 +8,8 @@ import * as nodeModule from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { mapTree, orchestratorFamily, OfficeGateway, runPolling, RETURN_KEEP_S, RETURN_LABEL, RETURN_SEPARATOR } from './adapter.mjs';
+import { mapTree, orchestratorFamily, OfficeGateway, runPolling, RETURN_KEEP_S, RETURN_LABEL, RETURN_SEPARATOR,
+  hostName, hostLabel } from './adapter.mjs';
 
 const HERE = new URL('.', import.meta.url);
 const SAMPLE = JSON.parse(await readFile(new URL('fixtures/sample-tree.json', HERE), 'utf8'));
@@ -83,14 +84,64 @@ test('the nameplate is title over model; metadata only', () => {
   const agents = mapTree(sample());
   const root = agents.find(a => a.id === `office-${MINE}-task-${ROOT}`);
   assert.equal(root.name, 'Build the tree');
-  assert.equal(root.role, 'claude-sonnet-5');
+  assert.equal(root.role, 'claude-sonnet-5 · Air');            // the host badge: where it runs (#77 brand)
   const orch = agents.find(a => a.id === `office-${OTHER}-orchestrator`);
   assert.equal(orch.name, 'Grounds');
-  assert.equal(orch.role, 'claude-opus-5');
+  assert.equal(orch.role, 'claude-opus-5 · Studio');
   const raw = JSON.stringify(agents);
   for (const banned of ['tokens', 'cache_read', '/Users/', 'SECRET', 'secret-project', 'workspace']) {
     assert.ok(!raw.includes(banned), banned);
   }
+});
+
+// ---- the host badge (#77 brand) ----
+test('each person shows where it runs: task host, the session host for orchestrators and their helpers', () => {
+  const by = Object.fromEntries(mapTree(sample()).map(a => [a.id, a]));
+  const host = id => by[id].office.host;
+  assert.equal(host(`office-${MINE}-orchestrator`), 'pro');
+  assert.equal(by[`office-${MINE}-orchestrator`].role.endsWith(RETURN_SEPARATOR + 'Pro'), true);
+  assert.equal(host(`office-${MINE}-task-${ROOT}`), 'air');                       // its exec host, not the session's
+  assert.equal(host(`office-${MINE}-sub-${ROOT}-c-00000000000b`), 'air');         // a task's helper: the task's host
+  assert.equal(host(`office-${MINE}-routed-mine-sub-00001`), 'pro');              // the session's own helper
+  assert.ok(by[`office-${MINE}-routed-mine-sub-00001`].role.endsWith(RETURN_SEPARATOR + 'Pro'));
+  // no host known: no badge, the subtitle is as before
+  const bot = by['office-grokbot-orchestrator'];
+  assert.equal(bot.office.host, null);
+  assert.ok(!bot.role.includes(RETURN_SEPARATOR), bot.role);
+  for (const a of mapTree(sample()).filter(x => x.office.group === 'lobby')) assert.equal(a.office.host, null);
+});
+
+test('a raw device never reaches the browser: no office.device, only the matched host (review fix round 1)', () => {
+  const tree = sample();
+  const raw = 'forest-li-macbook-pro';
+  for (const g of tree.orchestrators.items) g.device = raw;
+  const agents = mapTree(tree);
+  assert.ok(agents.length > 0);
+  for (const a of agents) assert.ok(!('device' in a.office), a.id);
+  assert.ok(!JSON.stringify(agents).includes(raw), 'the raw hostname appears nowhere in agents.list');
+  assert.ok(agents.some(a => a.office.host !== null), 'the known host name is still published');
+});
+
+test('a host that is not a host slug is no badge, never shown as given', () => {
+  for (const bad of ['Forests-MacBook-Pro', '192.0.2.4', '/Users/x', 'a'.repeat(33), '', 7, null, undefined]) {
+    assert.equal(hostName(bad), null, String(bad));
+  }
+  for (const bad of ['Forests-MacBook-Pro', '192.0.2.4', '/Users/x', '', null]) {
+    const t = sample();
+    t.orchestrators.items[0].tasks[0].host = bad;
+    t.orchestrators.items[0].host = bad;
+    const agents = mapTree(t);
+    const a = agents.find(x => x.id === `office-${MINE}-task-${ROOT}`);
+    assert.equal(a.role, 'claude-sonnet-5', String(bad));
+    assert.equal(a.office.host, null);
+    assert.ok(!agents.find(x => x.id === `office-${MINE}-orchestrator`).role.includes(RETURN_SEPARATOR));
+    if (bad) assert.ok(!JSON.stringify(agents.map(x => x.role)).includes(bad), bad);
+  }
+  assert.deepEqual(['air', 'pro', 'studio', 'pc-1'].map(hostLabel), ['Air', 'Pro', 'Studio', 'Pc-1']);
+  // a non-string host is a malformed tree: the roster stays (the poll fails), as for every other field
+  const t = sample();
+  t.orchestrators.items[0].host = ['air'];
+  assert.throws(() => mapTree(t), /invalid office tree group/);
 });
 
 // ---- E8: finished work ----
@@ -114,7 +165,7 @@ test('a finished task reports back beside its orchestrator for RETURN_KEEP_S, th
         .filter(x => x.office.group === MINE);
       const t = a.find(x => x.id === finishedId(MINE));
       assert.ok(t, `${state} ${age}s after its end`);
-      assert.equal(t.role, label + RETURN_SEPARATOR + 'gpt-6.1');
+      assert.equal(t.role, label + RETURN_SEPARATOR + 'gpt-6.1' + RETURN_SEPARATOR + 'Air');   // the fixture task's host
       assert.equal(t.office.status, state === 'succeeded' ? 'idle' : 'error');   // failed and cancelled show the error
       assert.equal(t.office.returning, true);
       assert.equal(t.office.parent, `office-${MINE}-orchestrator`);

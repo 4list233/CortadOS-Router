@@ -1406,7 +1406,7 @@ SESSION_PATH = "/v1/cortados/live/session"
 # token counts), workspace and browser (task internals the floor does not draw), parent_hidden, the session filter,
 # conflicts, task_hosts and inputs_truncated (fleet diagnostics, the dashboard's). Every value kept is already
 # re-validated by the live view (office.clean rules, fixed vocabularies, numbers): no request text, path or argument.
-_TREE_GROUP_KEYS = ("origin", "kind", "project", "device", "status", "model", "pick", "tool", "client", "client_source",
+_TREE_GROUP_KEYS = ("origin", "kind", "project", "device", "host", "status", "model", "pick", "tool", "client", "client_source",
                     "last_activity", "counts", "attention", "tasks_hidden", "routed_hidden")
 _TREE_TASK_KEYS = ("task_id", "title", "state", "status", "phase", "tool", "host", "provider", "lane", "local_backend",
                    "model", "started_at", "ended_at", "elapsed_s", "parent_task_id", "origin_via", "sub_sessions_hidden")
@@ -1850,6 +1850,32 @@ def _match(short: str | None, aliases: dict[str, set[str]]) -> str | None:
     return hits[0] if len(hits) == 1 else None
 
 
+def host_aliases(names: list[str], exec_hosts: dict[str, list[str]] | None,
+                 heartbeats: dict[str, Any] | None = None) -> dict[str, set[str]]:
+    """Known host name -> its hostname aliases (exec-hosts.json `hostnames`), every name of `names`, of exec-hosts.json
+    and of a heartbeat included: the one map _match reads, for the hosts section and the orchestrators' `host`."""
+    aliases: dict[str, set[str]] = {n: set() for n in names}
+    for n, al in (exec_hosts or {}).items():
+        aliases.setdefault(n, set()).update(a.lower() for a in al if isinstance(a, str))
+    for h in heartbeats or {}:
+        aliases.setdefault(h, set())
+    return aliases
+
+
+def orchestrator_hosts(items: list[dict[str, Any]], aliases: dict[str, set[str]], self_host: str | None = None,
+                       me: str | None = None) -> None:
+    """Sets each orchestrator group's `host`: the KNOWN host name (air, pro, studio) its session's device belongs to,
+    else None (#77 Office host badge). Only a known name, never the raw device hostname, which can carry the owner's
+    name (as for the hosts section). `me` is the provider host's known name, for a device that is the provider's own
+    hostname but matches no name."""
+    for g in items:
+        dev = g.get("device") if isinstance(g.get("device"), str) else None
+        name = _match(dev, aliases)
+        if name is None and dev and self_host and me and dev.lower() == self_host.lower():
+            name = me
+        g["host"] = name
+
+
 _HW_PICK = ("cpu_busy_pct", "gpu_busy_pct", "mem_available_bytes", "mem_total_bytes", "chip")
 
 
@@ -1897,11 +1923,7 @@ def hosts_section(u: dict[str, Any] | None, heartbeats: dict[str, dict[str, Any]
     hardware card whose hostname is the provider's own is then shown under that name. A host's hardware is the
     freshest of its sample card (hardware/<host>.json) and its fresh heartbeat's `hardware` block."""
     errors = list(errors or [])
-    aliases: dict[str, set[str]] = {n: set() for n in names}
-    for n, al in (exec_hosts or {}).items():
-        aliases.setdefault(n, set()).update(a.lower() for a in al if isinstance(a, str))
-    for h in heartbeats:
-        aliases.setdefault(h, set())
+    aliases = host_aliases(names, exec_hosts, heartbeats)
     items: dict[str, dict[str, Any]] = {}
 
     def item(name: str) -> dict[str, Any]:
@@ -2159,6 +2181,8 @@ def collect(*, now: float, child_events: Callable[[], list[dict[str, Any]]],
                           exec_hosts=ex_hosts, exec_default=ex_default, self_host=self_host, now=now,
                           errors=hb_errs + ex_errs + (u_errs if u is None else []),
                           self_name=self_name if self_name is not None else _slug(os.environ.get(SELF_ENV)))
+    orchestrator_hosts(orch["items"], host_aliases(host_names if host_names is not None else known_hosts(), ex_hosts,
+                                                   beats), self_host, hosts.get("provider_host"))
     if split_totals is None and isinstance(tv, dict):
         split_totals = tv.get("token_totals")
     ws = work_split.section(split_totals, beats, now, tv_errs if tv is None else None, session=session)

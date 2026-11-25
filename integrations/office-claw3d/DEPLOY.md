@@ -91,6 +91,19 @@ bridge user. The bridge refuses to start if the two secrets are equal.
   bridge refuses the connect (UNAUTHORIZED, 1008) and the Office shows "Gateway closed (1012):
   upstream closed". Seen on the Air on 2026-11-25; the deploy's check had passed because its
   connect carried no device block.
+- **Brand** `claw3d/cortados-brand.patch` (sixth; made on top of the five before it): the header reads
+  "CORTADOS ROUTER", the floor card "CortadOS Floor", the badge "ROUTER • CONNECTED"; the US and Brazil flag poles are
+  gone; the OpenClaw controls the read-only bridge cannot serve are hidden (HQ sidebar, marketplace, analytics, add
+  agent, the chat dock and composer, agent editor, push-to-talk, Studio settings and layout editor, the building
+  directory, onboarding and the event console). The list, with what each did upstream, is in
+  [OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md) A.3.
+- **Office mode** `claw3d/office-mode.patch` (applied after the brand patch; `server/index.js` and one line of
+  `src/lib/gateway/GatewayClient.ts`) and the module it loads, `claw3d/office-mode.cjs`, copied in as
+  `server/cortados-office-mode.js`: Studio's server serves only the Office's own routes (its pages and static files,
+  five GET API routes, the gateway socket) and answers 403 to everything else, `PUT /api/studio` included, so a
+  logged-in browser cannot change the settings, reach a remote gateway, call the runtime or voice routes, or write
+  Studio's state. Hiding the controls (brand patch) did not stop the routes being called (review, 2026-11-25). The
+  list with a reason per route: [OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md) A.5.
 - **The provider running on the Air** at 127.0.0.1:8432 (checked first: it must answer 401
   without a token).
 - About 1 GB of disk for Node, `node_modules` and the build, twice during an upgrade (the
@@ -146,12 +159,13 @@ Then:
 2. **Node.** Kept when `/opt/cortados-office/node-v24.22.3` answers with that version. Otherwise
    it downloads the pinned tarball, checks its SHA-256, and extracts it root-owned into a
    `.partial` directory that is renamed into place.
-3. **Adapter, staged.** Copies `adapter.mjs`, `bridge.mjs`, `sprites.mjs` and the five patches plus
-   `studio-login.cjs`, root-owned and read-only, to `/opt/cortados-office/adapters/<commit>/`. The
+3. **Adapter, staged.** Copies `adapter.mjs`, `bridge.mjs`, `sprites.mjs` and the seven patches plus
+   `studio-login.cjs` and `office-mode.cjs`, root-owned and read-only, to `/opt/cortados-office/adapters/<commit>/`. The
    running bridge still uses the old copy.
 4. **Claw3D, staged.** Builds into `claw3d/builds/<claw3d commit>-<checkout commit>/` as
-   `_cortados-claw3d`: clone, check out the pinned commit, `git apply --check` and apply the five
-   patches (avatar-profile-hint, studio-login, cortados-rooms, system-fonts, proxy-auth), copy the login module, `npm ci --ignore-scripts && npm run build`, then write a
+   `_cortados-claw3d`: clone, check out the pinned commit, `git apply --check` and apply the seven
+   patches (avatar-profile-hint, studio-login, cortados-rooms, system-fonts, proxy-auth, cortados-brand, office-mode),
+   copy the login and office-mode modules, `npm ci --ignore-scripts && npm run build`, then write a
    `.cortados-build-ok` marker. A build dir with the marker is reused. One without it (a failed
    earlier run) is deleted and rebuilt. It is never the current one.
 5. **Secrets.** Nothing is printed or passed on argv. Files that are already there are kept.
@@ -347,7 +361,7 @@ rewrites the gateway entry back to the bridge.
   then log in once from a real browser: that is the only end-to-end check.
 - The Office reaches its data (no token needed beyond the login): after logging in, the page
   header's gateway status must leave "CONNECTING" within a few seconds and show it connected.
-  "OPENCLAW • CONNECTING" that stays, with 0 agents, means Studio's proxy cannot reach the bridge:
+  "ROUTER • CONNECTING" (before cortados-brand.patch: "OPENCLAW • CONNECTING") that stays, with 0 agents, means Studio's proxy cannot reach the bridge:
   check that `/opt/cortados-office/bin/run-studio.sh` exports `UPSTREAM_ALLOWLIST=localhost` and
   `OPENCLAW_STATE_DIR`, and look in `/opt/cortados-office/log-studio/err.log` for
   `[gateway-proxy] refusing upstream`.
@@ -398,7 +412,9 @@ To move Claw3D itself, change `CLAW3D_COMMIT` and re-check every patch against t
 `src/features/agents/operations/agentFleetHydrationDerivation.ts`, the login patch
 `server/index.js` and the proxy-auth patch `server/gateway-proxy.js` (re-check there that the
 browser's connect still reaches `forwardConnectFrame` and that its device block is still the field
-the stock code treats as auth). Also re-check the gaps listed in PROTOCOL.md first.
+the stock code treats as auth). For office mode, re-take the route list: load the Office against a
+bridge, record every request, and compare `src/app/api/**/route.ts` with `office-mode.test.mjs`'s table
+(its checkout test fails on any new route or method). Also re-check the gaps listed in PROTOCOL.md first.
 
 Rollback: point `/opt/cortados-office/adapter` and `/opt/cortados-office/claw3d/current` back at
 the previous entries in `adapters/` and `claw3d/builds/` (kept by the prune), then

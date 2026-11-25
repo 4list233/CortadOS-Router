@@ -139,7 +139,8 @@ export function mapOffice(view) {
       identity: { name, emoji: role === 'orchestrator' ? '👔' : '🤖',
         avatarUrl: avatarDataUrl(family, outfit), avatarProfile: avatarProfile(family, outfit, id) },
       office: {
-        floor: floor.session, project: text(floor.project), device: text(floor.device),
+        // No `device`: a raw hostname can carry the owner's name and never reaches the browser (#77 fix round 1).
+        floor: floor.session, project: text(floor.project),
         provider, lane: text(record.lane), localBackend: backend, model: text(record.model), status,
         tool: text(record.tool), title: text(record.title),
         characterFamily: family, outfit, sprite: family + (outfit === 'suit' ? '-suit' : ''),
@@ -194,6 +195,14 @@ const NAME_MAX = 64;
 const LOBBY_KEY = 'lobby';
 const LOBBY_LABEL = 'No orchestrator';
 
+// The host badge (#77 brand): where a person runs, as the provider's KNOWN host name (exec-hosts.json: air, pro, studio),
+// shown at the end of the nameplate subtitle ("claude-opus-5 · Air"). A task's own exec host; an orchestrator's from
+// its session's device (live.orchestrator_hosts); a helper runs where its task or session does; the lobby has none.
+// Anything that is not a host slug (exec_hosts.HOST_NAME_RE) is no badge, never shown as given.
+const HOST_RE = /^[a-z][a-z0-9-]{0,31}$/;
+export const hostName = value => (typeof value === 'string' && HOST_RE.test(value) ? value : null);
+export const hostLabel = host => (host === null ? null : host[0].toUpperCase() + host.slice(1));
+const withHost = (role, host) => (host === null ? role : role + RETURN_SEPARATOR + hostLabel(host));
 const shortText = (value, max = NAME_MAX) => {
   const s = text(value);
   return s === null ? null : (s.length > max ? s.slice(0, max - 1) + '…' : s);
@@ -272,7 +281,7 @@ export function mapTree(tree) {
   let people = 0;
   for (const g of tree.orchestrators.items) {
     if (!object(g)) throw new Error('invalid office tree group');
-    checkStrings(g, ['project', 'device', 'status', 'model', 'tool', 'client', 'client_source'], 'group');
+    checkStrings(g, ['project', 'device', 'host', 'status', 'model', 'tool', 'client', 'client_source'], 'group');
     if (!Array.isArray(g.tasks) || !Array.isArray(g.routed)) throw new Error('invalid office tree group');
     const key = groupKey(g);
     if (key === null) continue;
@@ -286,12 +295,13 @@ export function mapTree(tree) {
       ids.add(person.id);
       room.push(person);
     };
-    const base = (id, kind, parent, depth) => ({ id, kind, parent, depth, group: key, groupLabel: label,
-      project: text(g.project), device: text(g.device) });
+    const groupHost = hostName(g.host);
+    const base = (id, kind, parent, depth, host = groupHost) => ({ id, kind, parent, depth, group: key,
+      groupLabel: label, project: text(g.project), host });
     if (orchestratorId) {
       const { family, source } = orchestratorFamily(g);
       push({ ...base(orchestratorId, 'orchestrator', null, 0), name: label,
-        role: shortText(g.model) ?? (g.kind === 'bot' ? 'bot gateway' : 'orchestrator'),
+        role: withHost(shortText(g.model) ?? (g.kind === 'bot' ? 'bot gateway' : 'orchestrator'), groupHost),
         status: g.status === 'working' ? 'working' : 'idle', taskStatus: null, returning: false,
         family, familySource: source, outfit: 'suit', provider: null, lane: null, localBackend: null,
         model: text(g.model), tool: text(g.tool), title: null, client: CLIENT_FAMILY.has(text(g.client)) ? g.client : null });
@@ -308,7 +318,8 @@ export function mapTree(tree) {
       const parent = depth === 0 ? orchestratorId : 'office-' + key + '-task-' + n.parent_task_id;
       const finished = n.status === 'done' || n.status === 'failed';
       const model = shortText(n.model);
-      const common = { ...base(id, 'task', parent, depth + 1), name: shortText(n.title) ?? 'Task ' + n.task_id.slice(-8),
+      const taskHost = hostName(n.host);
+      const common = { ...base(id, 'task', parent, depth + 1, taskHost), name: shortText(n.title) ?? 'Task ' + n.task_id.slice(-8),
         taskStatus: n.status, provider: text(n.provider), lane: text(n.lane), localBackend: knownBackend(n.local_backend),
         model: text(n.model), tool: text(n.tool), title: text(n.title),
         family: characterFamily(n.provider, n.lane, n.model, n.local_backend), outfit: 'worker' };
@@ -317,12 +328,13 @@ export function mapTree(tree) {
         const end = finite(n.ended_at) ? n.ended_at : null;
         const state = Object.hasOwn(RETURN_LABEL, n.state) ? n.state : (n.status === 'failed' ? 'failed' : 'succeeded');
         if (orchestratorId && end !== null && now - end <= RETURN_KEEP_S) {
-          push({ ...common, parent: orchestratorId, role: RETURN_LABEL[state] + RETURN_SEPARATOR + (model ?? 'model unknown'),
+          push({ ...common, parent: orchestratorId,
+            role: withHost(RETURN_LABEL[state] + RETURN_SEPARATOR + (model ?? 'model unknown'), taskHost),
             status: state === 'succeeded' ? 'idle' : 'error', returning: true, returnUntil: end + RETURN_KEEP_S,
             tool: null });
         }
       } else {
-        push({ ...common, role: model ?? (n.status === 'unknown' ? 'state unknown' : 'model pending'),
+        push({ ...common, role: withHost(model ?? (n.status === 'unknown' ? 'state unknown' : 'model pending'), taskHost),
           status: n.status === 'running' ? 'working' : 'idle', returning: false });
         for (const s of n.sub_sessions) {
           if (!object(s) || typeof s.ref !== 'string' || !ID_RE.test(s.ref) || !SUB_STATUSES.has(s.status)) {
@@ -331,8 +343,9 @@ export function mapTree(tree) {
           checkStrings(s, ['role', 'phase', 'provider', 'lane', 'local_backend', 'model'], 'helper');
           // the task's own main loop is the task figure; a finished helper just leaves (E8)
           if (s.role === 'main' || (s.status !== 'running' && s.status !== 'waiting')) continue;
-          push({ ...base('office-' + key + '-sub-' + n.task_id + '-' + s.ref, 'helper', id, depth + 2),
-            name: 'Helper · ' + (shortText(n.title, 48) ?? n.task_id.slice(-8)), role: shortText(s.model) ?? 'helper',
+          push({ ...base('office-' + key + '-sub-' + n.task_id + '-' + s.ref, 'helper', id, depth + 2, taskHost),
+            name: 'Helper · ' + (shortText(n.title, 48) ?? n.task_id.slice(-8)),
+            role: withHost(shortText(s.model) ?? 'helper', taskHost),
             status: s.status === 'running' ? 'working' : 'idle', taskStatus: s.status, returning: false,
             provider: text(s.provider), lane: text(s.lane), localBackend: knownBackend(s.local_backend),
             model: text(s.model), tool: null, title: text(n.title),
@@ -349,7 +362,7 @@ export function mapTree(tree) {
       checkStrings(r, ['title', 'phase', 'tool', 'provider', 'lane', 'model'], 'helper');
       if (r.status !== 'running' && r.status !== 'waiting') continue;
       push({ ...base('office-' + key + '-routed-' + r.ref, 'helper', orchestratorId, 1),
-        name: shortText(r.title) ?? 'Helper', role: shortText(r.model) ?? 'helper',
+        name: shortText(r.title) ?? 'Helper', role: withHost(shortText(r.model) ?? 'helper', groupHost),
         status: r.status === 'running' ? 'working' : 'idle', taskStatus: r.status, returning: false,
         provider: text(r.provider), lane: text(r.lane), localBackend: null, model: text(r.model), tool: text(r.tool),
         title: text(r.title), family: characterFamily(r.provider, r.lane, r.model), outfit: 'worker' });
@@ -375,7 +388,7 @@ export function mapTree(tree) {
       if (++people > TREE_PEOPLE_MAX) throw new Error('invalid office tree');
       ids.add(id);
       room.push({ id, kind: 'helper', parent: null, depth: 1, group: LOBBY_KEY, groupLabel: LOBBY_LABEL,
-        project: null, device: null, name: shortText(r.title) ?? (r.kind === 'conversation' ? 'Conversation' : 'Helper'),
+        project: null, host: null, name: shortText(r.title) ?? (r.kind === 'conversation' ? 'Conversation' : 'Helper'),
         role: shortText(r.model) ?? 'routed', status: r.status === 'running' ? 'working' : 'idle', taskStatus: r.status,
         returning: false, provider: text(r.provider), lane: text(r.lane), localBackend: knownBackend(r.local_backend),
         model: text(r.model), tool: text(r.tool), title: text(r.title),
@@ -398,7 +411,7 @@ function toAgent(p, roomIndex) {
       avatarProfile: avatarProfile(p.family, p.outfit, p.id) },
     office: {
       floor: p.group, group: p.group, groupLabel: p.groupLabel, room: roomIndex, kind: p.kind, parent: p.parent,
-      depth: p.depth, project: p.project, device: p.device, provider: p.provider, lane: p.lane,
+      depth: p.depth, project: p.project, host: p.host, provider: p.provider, lane: p.lane,
       localBackend: p.localBackend, model: p.model, status: p.status, taskStatus: p.taskStatus,
       returning: p.returning, returnUntil: p.returnUntil ?? null, tool: p.tool, title: p.title,
       characterFamily: p.family, familySource: p.familySource ?? null, outfit: p.outfit,

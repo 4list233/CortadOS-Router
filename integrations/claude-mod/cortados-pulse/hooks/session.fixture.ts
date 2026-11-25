@@ -252,7 +252,8 @@ export default {
             "tokens": null
           }
         ],
-        "routed_hidden": 0
+        "routed_hidden": 0,
+        "host": "pro"
       }
     ],
     "truncated": false,

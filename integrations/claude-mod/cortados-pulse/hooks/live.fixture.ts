@@ -525,7 +525,8 @@ export default {
             }
           }
         ],
-        "routed_hidden": 0
+        "routed_hidden": 0,
+        "host": "pro"
       },
       {
         "origin": null,
@@ -630,7 +631,8 @@ export default {
         ],
         "tasks_hidden": 0,
         "routed": [],
-        "routed_hidden": 0
+        "routed_hidden": 0,
+        "host": null
       },
       {
         "origin": "grokbot",
@@ -683,7 +685,8 @@ export default {
         ],
         "tasks_hidden": 0,
         "routed": [],
-        "routed_hidden": 0
+        "routed_hidden": 0,
+        "host": null
       }
     ],
     "truncated": false,

@@ -1802,13 +1802,20 @@ test('clients_cli: the clients module is $REPO\'s, whatever the working director
   assert.equal(fakeLog(W), 'list a\n');
 });
 
+// The Claw3D patches in the order deploy-air.sh applies them: each one is made against 51337f7 with every earlier one
+// applied (cortados-brand.patch touches RetroOffice3D.tsx after cortados-rooms.patch).
+const DEPLOY_ORDER = ['avatar-profile-hint.patch', 'studio-login.patch', 'cortados-rooms.patch', 'system-fonts.patch',
+  'proxy-auth.patch', 'cortados-brand.patch', 'office-mode.patch'];
+const CLAW3D_COMMIT = '51337f7f250459af61a7cf92b7b0015d59faed5c';
+
 test('deploy-air.sh: every Claw3D patch is shipped, required and applied with its --check refusal (#77 rooms)', async () => {
   const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
   const shipped = text.match(/^ADAPTER_FILES=\(([^)]*)\)/m)[1].split(/\s+/).filter(Boolean);
   const loop = text.match(/^\s*for p in ([^;]+); do\n\s*as_studio git -C "\$BUILD" apply --check "\$ADAPTER_DIR\/\$p"\n\s*as_studio git -C "\$BUILD" apply "\$ADAPTER_DIR\/\$p"/m);
   assert.ok(loop, 'the apply loop checks each patch before applying it');
-  const applied = loop[1].trim().split(/\s+/);
-  for (const patch of ['avatar-profile-hint.patch', 'studio-login.patch', 'cortados-rooms.patch', 'system-fonts.patch', 'proxy-auth.patch']) {
+  const applied = loop[1].trim().split(/\s+/).filter(w => w !== '\\');
+  assert.deepEqual([...applied], DEPLOY_ORDER, 'applied in the order the patches were made against');
+  for (const patch of DEPLOY_ORDER) {
     assert.ok(shipped.includes('claw3d/' + patch), patch + ' is in ADAPTER_FILES');
     assert.ok(applied.includes(patch), patch + ' is applied');
     assert.ok(text.includes('-f "$HERE/claw3d/' + patch + '"'), patch + ' is required before anything changes');
@@ -1829,4 +1836,88 @@ test('system-fonts.patch: Claw3D is built without next/font/google, so no Google
     assert.match(added, new RegExp('^\\+\\s*' + v + ': .*(sans-serif|monospace);$', 'm'), v + ' keeps a generic fallback');
   }
   assert.match(added, /<body className="antialiased">/, 'the body no longer reads the next/font variables');
+});
+
+// ---- cortados-brand.patch (#77 brand, 2026-11-25) ----
+const addedLines = patch => patch.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++')).map(l => l.slice(1));
+// the patch's new side, hunk by hunk: context and added lines (a gate and the line it gates may be in either)
+const newSide = patch => patch.split('\n').filter(l => (l.startsWith('+') && !l.startsWith('+++')) || l.startsWith(' '))
+  .map(l => l.slice(1));
+const removedLines = patch => patch.split('\n').filter(l => l.startsWith('-') && !l.startsWith('---')).map(l => l.slice(1));
+
+test('cortados-brand.patch: the CortadOS router brand, no flags, the OpenClaw controls hidden', async () => {
+  const patch = await readFile(join(HERE, 'claw3d', 'cortados-brand.patch'), 'utf8');
+  const files = [...patch.matchAll(/^\+\+\+ b\/(.+)$/gm)].map(m => m[1]).sort();
+  assert.deepEqual(files, ['src/features/office/components/OfficeFloorNav.tsx', 'src/features/office/screens/OfficeScreen.tsx',
+    'src/features/retro-office/RetroOffice3D.tsx', 'src/features/retro-office/scene/environment.tsx',
+    'src/lib/office/floors.ts', 'src/lib/studio/settings.ts']);
+  const added = addedLines(patch).join('\n');
+  const after = newSide(patch).join('\n');
+  const removed = removedLines(patch).join('\n');
+  // the header title, the floor card, the connection badge (every gateway status: connected, connecting, ...)
+  assert.match(added, /^const DEFAULT_OFFICE_TITLE = "CortadOS Router";$/m);
+  assert.match(added, /title !== UPSTREAM_OFFICE_TITLE \? title : fallback/, 'a saved upstream default reads as unset');
+  assert.match(removed, /officeTitle = "Luke Headquarters",/);
+  assert.match(added, /officeTitle = "CortadOS Router",/);
+  assert.match(added, /label: "CortadOS Floor"/);
+  assert.match(added, /shortLabel: "CortadOS",/);
+  assert.match(added, /^  openclaw: "Router",/m);
+  assert.match(removed, /\{activeAdapterType\} • \{gatewayStatus\}/);
+  assert.match(added, /^\s*router • \{gatewayStatus\}$/m);
+  assert.match(added, /^const UPSTREAM_OFFICE_TITLE = "Luke Headquarters";$/m);   // only to recognise it
+  assert.doesNotMatch(added.split('\n').filter(l => !/^\s*(\/\/|\{\/\*)|^const UPSTREAM_OFFICE_TITLE/.test(l)).join('\n'),
+    /(?<![A-Za-z])OpenClaw(?![A-Za-z])|Headquarters|https?:\/\//, 'no OpenClaw brand string and nothing fetched is added');
+  // the onboarding wizard and the event console (upstream shows it whenever DEBUG is unset) are hidden too
+  assert.match(after, /\{showOnboardingWizard && CORTADOS_OPENCLAW_UI \? \(/);
+  assert.match(after, /\{showOpenClawConsole && CORTADOS_OPENCLAW_UI \? \(/);
+  // the US (and remote office's Brazil) flag poles: behind a constant that is false
+  assert.match(added, /^const CORTADOS_FLAGS = false;$/m);
+  assert.match(after, /\{CORTADOS_FLAGS \? \(\n\s*<>\n\s*<OfficeFlagPole\n[^]*?art=\{<UsaFlagArt \/>\}[^]*?art=\{<BrazilFlagArt \/>\}/);
+  // the OpenClaw controls: one constant, false, gating each
+  assert.match(added, /^const CORTADOS_OPENCLAW_UI = false;$/m);
+  assert.match(added, /^const CORTADOS_OFFICE_CONTROLS = false;$/m);
+  assert.match(added, /^const CORTADOS_BUILDING_DIRECTORY = false;$/m);
+  for (const gate of [
+    /!debugEnabled && CORTADOS_OPENCLAW_UI \? \(\n\s*<HQSidebar/,                       // OPEN HQ, MARKETPLACE, ANALYTICS
+    /debugEnabled \|\| !CORTADOS_OPENCLAW_UI \? "hidden" : ""/,                       // the CHAT dock
+    /\{chatOpen && CORTADOS_OPENCLAW_UI && \(/,                                        // its composer
+    /onAddAgent=\{CORTADOS_OPENCLAW_UI \? handleOpenCreateAgentWizard : undefined\}/,  // ADD
+    /onAgentEdit=\{CORTADOS_OPENCLAW_UI \?/, /onAgentDelete=\{CORTADOS_OPENCLAW_UI \?/,
+    /enabled: CORTADOS_OPENCLAW_UI && status === "connected"/,                       // push-to-talk
+    /\{CORTADOS_OPENCLAW_UI \? \(<>\n\s*<button/,                                     // Add Agent / Build Company
+    /\{CORTADOS_OFFICE_CONTROLS \? \(<>\n\s*<button\n\s*onClick=\{toggleEdit\}/,       // edit office + settings
+    /\{CORTADOS_BUILDING_DIRECTORY \? \(\n\s*<section/,                                 // BUILDING DIRECTORY
+  ]) assert.match(after, gate);
+});
+
+test('every Claw3D patch applies cleanly, in deploy order, to Claw3D 51337f7 (CORTADOS_CLAW3D_CHECKOUT)', async t => {
+  // Needs a local Claw3D clone holding the pinned commit (no network in tests): e.g.
+  //   git clone https://github.com/iamlukethedev/Claw3D.git /tmp/claw3d && CORTADOS_CLAW3D_CHECKOUT=/tmp/claw3d node --test ...
+  const checkout = process.env.CORTADOS_CLAW3D_CHECKOUT;
+  if (!checkout) return t.skip('CORTADOS_CLAW3D_CHECKOUT is not set: no Claw3D 51337f7 checkout to apply the patches to');
+  const has = spawnSync('git', ['-C', checkout, 'cat-file', '-e', CLAW3D_COMMIT + '^{commit}']);
+  assert.equal(has.status, 0, 'the checkout holds Claw3D ' + CLAW3D_COMMIT);
+  const dir = await mkdtemp(join(tmpdir(), 'claw3d-patches-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const tree = spawnSync('sh', ['-c', 'git -C "$1" archive "$2" | tar -x -C "$3"', 'sh', checkout, CLAW3D_COMMIT, dir]);
+  assert.equal(tree.status, 0, String(tree.stderr));
+  for (const p of DEPLOY_ORDER) {
+    for (const args of [['apply', '--check'], ['apply']]) {
+      const r = spawnSync('git', [...args, join(HERE, 'claw3d', p)], { cwd: dir });
+      assert.equal(r.status, 0, `git ${args.join(' ')} ${p}: ${r.stderr}`);
+    }
+  }
+  const src = f => readFileSync(join(dir, f), 'utf8');
+  assert.match(src('src/lib/studio/settings.ts'), /DEFAULT_OFFICE_TITLE = "CortadOS Router"/);
+  assert.match(src('src/lib/office/floors.ts'), /label: "CortadOS Floor"/);
+  assert.doesNotMatch(src('src/lib/office/floors.ts'), /"OpenClaw Floor"/);
+  assert.match(src('src/features/retro-office/RetroOffice3D.tsx'), /router • \{gatewayStatus\}/);
+  assert.doesNotMatch(src('src/features/retro-office/RetroOffice3D.tsx'), /\{activeAdapterType\} • \{gatewayStatus\}/);
+  // the flag poles are rendered only inside the CORTADOS_FLAGS block
+  const env = src('src/features/retro-office/scene/environment.tsx');
+  const block = env.slice(env.indexOf('{CORTADOS_FLAGS ? ('), env.indexOf(') : null}', env.indexOf('{CORTADOS_FLAGS ? (')));
+  assert.equal((env.match(/<OfficeFlagPole\b/g) || []).length, 2);
+  assert.equal((block.match(/<OfficeFlagPole\b/g) || []).length, 2);
+  // the rooms patch's file is there too: the brand patch was made on top of it
+  assert.ok(existsSync(join(dir, 'src/features/retro-office/core/cortadosRooms.ts')));
 });

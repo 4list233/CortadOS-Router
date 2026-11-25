@@ -1,0 +1,59 @@
+diff --git a/server/index.js b/server/index.js
+index 2aca1f7..093b6cf 100644
+--- a/server/index.js
++++ b/server/index.js
+@@ -4,6 +4,7 @@ const next = require("next");
+ 
+ const { createAccessGate } = require("./access-gate");
+ const { createStudioLogin } = require("./cortados-studio-login");
++const { createOfficeMode } = require("./cortados-office-mode");
+ const { createGatewayProxy } = require("./gateway-proxy");
+ const { assertPublicHostAllowed, resolveHosts } = require("./network-policy");
+ const { loadUpstreamGatewaySettings } = require("./studio-settings");
+@@ -89,6 +90,8 @@ async function main() {
+     token: process.env.STUDIO_ACCESS_TOKEN,
+   });
+   const studioLogin = createStudioLogin({ token: process.env.STUDIO_ACCESS_TOKEN });
++  // CortadOS office mode (#77): read-only allowlist of routes and methods, 403 for the rest.
++  const officeMode = createOfficeMode();
+ 
+   const proxy = createGatewayProxy({
+     loadUpstreamSettings: async () => {
+@@ -107,6 +110,7 @@ async function main() {
+   await app.prepare();
+   const handleUpgrade = app.getUpgradeHandler();
+   const handleServerUpgrade = (req, socket, head) => {
++    if (officeMode.handleUpgrade(req, socket)) return;
+     if (resolvePathname(req.url) === "/api/gateway/ws") {
+       proxy.handleUpgrade(req, socket, head);
+       return;
+@@ -121,11 +125,13 @@ async function main() {
+       ? https.createServer(httpsCert, (req, res) => {
+           if (studioLogin.handle(req, res)) return;
+           if (accessGate.handleHttp(req, res)) return;
++          if (officeMode.handleHttp(req, res)) return;
+           handle(req, res);
+         })
+       : http.createServer((req, res) => {
+           if (studioLogin.handle(req, res)) return;
+           if (accessGate.handleHttp(req, res)) return;
++          if (officeMode.handleHttp(req, res)) return;
+           handle(req, res);
+         });
+ 
+diff --git a/src/lib/gateway/GatewayClient.ts b/src/lib/gateway/GatewayClient.ts
+index 1b643b6..dfb91c1 100644
+--- a/src/lib/gateway/GatewayClient.ts
++++ b/src/lib/gateway/GatewayClient.ts
+@@ -918,7 +918,10 @@ export const useGatewayConnection = (
+       return;
+     }
+     try {
+-      await settingsCoordinator.flushPending();
++      // CortadOS office mode (#77): Studio's settings are pinned and PUT /api/studio is refused (403), so
++      // a pending UI-state save fails. The upstream comes from the server's own settings, never from this
++      // save, so connect anyway (the coordinator already logs the refused save).
++      await settingsCoordinator.flushPending().catch(() => undefined);
+       const maxAttempts = resolveInitialGatewayConnectAttemptCount(
+         selectedAdapterType,
+         hasConnectedOnceRef.current
