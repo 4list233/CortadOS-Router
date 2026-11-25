@@ -255,6 +255,35 @@ print(json.dumps({"easy": route("rename the variable x to count in utils.py"),
                   "subagent": route("rename the variable x to count in utils.py", "cortados", "verify-window-sub")}))
 """
 
+# Route pick (docs/ORCHESTRATOR-ROUTE-PICKER.md, owner 2026-11-24): the main loop's `cortados@R3:<models>` restricts the
+# route to the selected models on every account and lane; a turn whose requirement exceeds every selected model escalates
+# (E3) to normal routing, recorded on the route, and a subagent's plain `cortados` carries no pick. Real provider routing
+# and the real core.decide on the throwaway home (S1 if up, degraded otherwise).
+ROUTE_PICK_SCENARIO = """
+import json, sys
+from cortados_router import core
+from cortados_router.provider import routing
+def route(text, model, cid):
+    body = {"model": model, "messages": [{"role": "user", "content": text}]}
+    pick, bad = routing.route_pick(core, None, None, model)
+    if bad:
+        return {"error": bad}
+    r = routing.choose(core, body, client="verify-pick", conversation_id=cid, claude_bin=sys.executable,
+                       codex_bin=sys.executable, **({"band_window": pick.window} if pick and pick.window else {}),
+                       **({"route_pick": pick} if pick and pick.restricts else {}))
+    rt = r.get("route") or {}
+    esc = r.get(routing.PICK_ESCALATED_KEY)
+    short = routing.pick_shortfall(core, pick.models, rt) if pick and pick.models and rt else None
+    return {**{k: r.get(k) for k in ("provider", "model", "band", "degraded", "error")}, "label": pick.label if pick else None,
+            "escalated": esc, "shortfall": list(short) if short else None, "D": rt.get("D"),
+            "required_index": rt.get("required_index"),
+            "pick_rules": [x for x in rt.get("hard_rules") or [] if x.startswith("route pick")]}
+hard = "design a new consensus protocol for our replicated storage engine, prove its safety, and plan the migration"
+print(json.dumps({"easy": route("rename the variable x to count in utils.py", "cortados@R3:gpt-6.1-sol+opus", "verify-pick"),
+                  "hard": route(hard, "cortados@R3:gpt-6.1-sol", "verify-pick-hard"),
+                  "subagent": route("rename the variable x to count in utils.py", "cortados", "verify-pick-sub")}))
+"""
+
 # Local auto-route on the Pro (#75, 2026-11-13): after S1, a conversation in a band the node lists moves to its local model
 # only while the node is available; on battery / switch off / gate down it keeps S1's route; an outward (R3) request
 # never goes local whatever the config says; a degraded decision never goes local and never to Claude. Runs the real
@@ -913,6 +942,37 @@ def main():
             ok_hard = hard.get("band") == "R2" and isinstance(hard.get("D"), int) and hard["D"] <= 8
             record("band window: outward stays R3 over the max; a hard request is lowered to R2",
                    "PASS" if ok_out and ok_hard else "FAIL", json.dumps({"outward": out, "hard": hard}))
+
+    p = runner.run(["-c", ROUTE_PICK_SCENARIO], prefix="verify-router-pick-", timeout=300)
+    try:
+        r = _last_json(p)
+    except (ValueError, IndexError):
+        record("route pick R3:<models> keeps the main loop on the selected models", "FAIL",
+               (p.stderr or p.stdout).strip()[-300:])
+    else:
+        easy, hard, sub = r["easy"], r["hard"], r["subagent"]
+        picked = ("gpt-6.1-sol", "claude-opus-5-5")
+        claude = lambda x: (x.get("provider") or "").split("#")[0] == "claude-cli"
+        # the easy turn: Opus 5.5 clears every index and is a frontier model, so this pick never escalates
+        ok = (easy.get("label") == "R3:claude-opus-5-5+gpt-6.1-sol" and easy.get("model") in picked
+              and not easy.get("escalated") and not easy.get("error") and not (easy.get("degraded") and claude(easy))
+              and any(x.startswith("route pick R3:claude-opus-5-5+gpt-6.1-sol: 2 models") for x in easy["pick_rules"]))
+        record("route pick R3:<models> keeps the main loop on the selected models", "PASS" if ok else "FAIL",
+               json.dumps(easy))
+        ok = sub.get("label") is None and not sub.get("pick_rules") and not sub.get("error")
+        record("a subagent's plain cortados carries no route pick", "PASS" if ok else "FAIL", json.dumps(sub))
+        name = "route pick: a turn beyond every selected model escalates (E3), recorded; otherwise it stays"
+        if hard.get("degraded"):
+            record(name, "BLOCKED", unreachable if not up else f"S1 listening at {s1_where} but the decision is degraded")
+        else:
+            esc = hard.get("escalated")
+            # consistent both ways: escalated exactly when the shortfall holds for the decision, and then off the pick
+            ok = not hard.get("error") and bool(esc) == bool(hard.get("shortfall")) and (
+                (esc and hard.get("model") != "gpt-6.1-sol" and esc.get("reason") == hard["shortfall"][0]
+                 and any(x.startswith("route pick escalated: ") for x in hard["pick_rules"]))
+                or (not esc and hard.get("model") == "gpt-6.1-sol"))
+            record(name + (" (escalated)" if esc else " (S1 judged it within Sol 6.1: not escalated)"),
+                   "PASS" if ok else "FAIL", json.dumps(hard))
 
     p = runner.run(["-c", LOCAL_SCENARIO], prefix="verify-router-local-", timeout=300)
     try:

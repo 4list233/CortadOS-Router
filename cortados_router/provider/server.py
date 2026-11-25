@@ -2069,9 +2069,10 @@ class FailedSession(LostSession):
 REBUILD_LIMIT_REASON = "the conversation reached its rebuild limit (terminal)"
 REBUILD_TOO_LARGE_REASON = "the rebuilt history does not fit the conversation's model (terminal)"
 MODEL_CHANGE_REASON = "the continuation asks for another model than its conversation runs (terminal)"
-# The band window a conversation was opened with (routing.band_window's label, or None), kept in its route: it is part of
-# the conversation's identity, so only requests in the same window match it (_in_window). Its own key: the route's `band_window` comes from select
-# and a later rule (a local bind) may rewrite the route without it.
+# The route pick a conversation was opened with (routing.Pick.label: a window-only pick is the band window's own label,
+# `R2`; or None), kept in its route: it is part of the conversation's identity, so only requests with the same pick match
+# it (_in_window). The key keeps its name: a window-only pick stores exactly what the band window stored. Its
+# own key: the route's `band_window` comes from select and a later rule (a local bind) may rewrite the route without it.
 ASKED_WINDOW_KEY = "asked_band_window"
 # Refused.code -> the fixed record reason (_note_refusal); never request-derived text.
 REFUSED_REASONS = {
