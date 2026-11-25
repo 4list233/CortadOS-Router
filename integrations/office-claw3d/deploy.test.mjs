@@ -1728,10 +1728,25 @@ test('deploy-air.sh: every Claw3D patch is shipped, required and applied with it
   const loop = text.match(/^\s*for p in ([^;]+); do\n\s*as_studio git -C "\$BUILD" apply --check "\$ADAPTER_DIR\/\$p"\n\s*as_studio git -C "\$BUILD" apply "\$ADAPTER_DIR\/\$p"/m);
   assert.ok(loop, 'the apply loop checks each patch before applying it');
   const applied = loop[1].trim().split(/\s+/);
-  for (const patch of ['avatar-profile-hint.patch', 'studio-login.patch', 'cortados-rooms.patch']) {
+  for (const patch of ['avatar-profile-hint.patch', 'studio-login.patch', 'cortados-rooms.patch', 'system-fonts.patch']) {
     assert.ok(shipped.includes('claw3d/' + patch), patch + ' is in ADAPTER_FILES');
     assert.ok(applied.includes(patch), patch + ' is applied');
     assert.ok(text.includes('-f "$HERE/claw3d/' + patch + '"'), patch + ' is required before anything changes');
   }
   assert.deepEqual(applied.sort(), shipped.filter(f => f.endsWith('.patch')).map(f => f.slice('claw3d/'.length)).sort());
+});
+
+test('system-fonts.patch: Claw3D is built without next/font/google, so no Google Fonts fetch (#77 font fix)', async () => {
+  const patch = await readFile(join(HERE, 'claw3d', 'system-fonts.patch'), 'utf8');
+  const files = [...patch.matchAll(/^\+\+\+ b\/(.+)$/gm)].map(m => m[1]).sort();
+  assert.deepEqual(files, ['src/app/globals.css', 'src/app/layout.tsx'], 'touches only the layout and its stylesheet');
+  const added = patch.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++')).join('\n');
+  const removed = patch.split('\n').filter(l => l.startsWith('-') && !l.startsWith('---')).join('\n');
+  assert.match(removed, /from "next\/font\/google"/, 'the next/font/google import is removed');
+  const code = added.split('\n').filter(l => !/^\+\s*\/\//.test(l)).join('\n');
+  assert.doesNotMatch(code, /next\/font|fonts\.googleapis|fonts\.gstatic|https?:\/\//, 'nothing fetched at build or run time');
+  for (const v of ['--font-display', '--font-sans', '--font-mono']) {
+    assert.match(added, new RegExp('^\\+\\s*' + v + ': .*(sans-serif|monospace);$', 'm'), v + ' keeps a generic fallback');
+  }
+  assert.match(added, /<body className="antialiased">/, 'the body no longer reads the next/font variables');
 });

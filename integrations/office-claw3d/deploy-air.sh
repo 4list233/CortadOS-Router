@@ -67,7 +67,7 @@ STUDIO_SETTINGS="$STUDIO_STATE/claw3d/settings.json"
 HEALTH_DEADLINE_S=60
 STAGE="$ROOT/stage"                        # root 0700: launchers, plists and a new token, before activation
 ADAPTER_FILES=(adapter.mjs bridge.mjs sprites.mjs claw3d/avatar-profile-hint.patch claw3d/studio-login.patch
-  claw3d/studio-login.cjs claw3d/cortados-rooms.patch)
+  claw3d/studio-login.cjs claw3d/cortados-rooms.patch claw3d/system-fonts.patch)
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
@@ -202,7 +202,7 @@ fi
 # install / upgrade
 # ======================================================================================
 [[ -f "$HERE/claw3d/avatar-profile-hint.patch" && -f "$HERE/claw3d/studio-login.patch" \
-  && -f "$HERE/claw3d/cortados-rooms.patch" && -f "$HERE/bridge.mjs" ]] \
+  && -f "$HERE/claw3d/cortados-rooms.patch" && -f "$HERE/claw3d/system-fonts.patch" && -f "$HERE/bridge.mjs" ]] \
   || die "run from a CortadOS-Router checkout"
 xcode-select -p >/dev/null 2>&1 || die "git needs the Xcode command line tools (xcode-select --install)"
 # captured first: a failed `git status` prints nothing, which must not read as "clean"
@@ -447,7 +447,9 @@ else
   run sudo mv "$ADAPTER_DIR.partial" "$ADAPTER_DIR"
 fi
 
-# ---- 4. build Claw3D beside the running one (pinned commit + both patches) ------------
+# ---- 4. build Claw3D beside the running one (pinned commit + the patches) -------------
+# system-fonts.patch drops next/font/google: the build fetches nothing from Google Fonts, whose
+# /l/font?kit=..&skey=.. answers break next/font under Turbopack (and webpack), 2026-11-24.
 step "4. Claw3D $CLAW3D_COMMIT -> $BUILD (build as $STUDIO_USER; switched in only after it succeeds)"
 as_studio() { run sudo -u "$STUDIO_USER" -H env HOME="$STUDIO_HOME" PATH="$ROOT/node-$NODE_VERSION/bin:/usr/bin:/bin" \
   NEXT_TELEMETRY_DISABLED=1 npm_config_fund=false npm_config_audit=false "$@"; }
@@ -458,7 +460,7 @@ else
   [[ ! -e "$BUILD" ]] || run sudo -u "$STUDIO_USER" rm -rf "$BUILD"
   as_studio git clone --no-checkout "$CLAW3D_REPO" "$BUILD"
   as_studio git -C "$BUILD" checkout --detach "$CLAW3D_COMMIT"
-  for p in avatar-profile-hint.patch studio-login.patch cortados-rooms.patch; do
+  for p in avatar-profile-hint.patch studio-login.patch cortados-rooms.patch system-fonts.patch; do
     as_studio git -C "$BUILD" apply --check "$ADAPTER_DIR/$p"
     as_studio git -C "$BUILD" apply "$ADAPTER_DIR/$p"
   done

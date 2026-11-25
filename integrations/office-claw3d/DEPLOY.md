@@ -70,6 +70,13 @@ bridge user. The bridge refuses to start if the two secrets are equal.
   it, Studio still shows the pixel sprites in its 2D panels (`identity.avatarUrl` is stock).
   The 3D voxel people, however, get Claw3D's seed-random looks instead of the per-provider
   suits.
+- **System fonts** `claw3d/system-fonts.patch` (`src/app/layout.tsx`, `src/app/globals.css`):
+  drops `next/font/google`, so the build fetches nothing from Google Fonts and does not depend on
+  its answers. On 2026-11-24 Google began answering some requests with
+  `fonts.gstatic.com/l/font?kit=..&skey=..&v=..` font URLs. Next 16.1.7's `next/font` cannot handle
+  them: Turbopack fails with "next/font/google queries have exactly one entry", and `next build --webpack`
+  fails too. Studio uses the same families when they are installed locally, otherwise
+  the system UI, monospace and condensed fonts named in `globals.css`.
 - **The login wiring** `claw3d/studio-login.patch` (3 added lines in `server/index.js`) and the
   module it loads, `claw3d/studio-login.cjs`, copied in as `server/cortados-studio-login.js`.
   Claw3D's access gate only checks a `studio_access` cookie and ships no way to set it; this adds
@@ -130,12 +137,12 @@ Then:
 2. **Node.** Kept when `/opt/cortados-office/node-v24.22.3` answers with that version. Otherwise
    it downloads the pinned tarball, checks its SHA-256, and extracts it root-owned into a
    `.partial` directory that is renamed into place.
-3. **Adapter, staged.** Copies `adapter.mjs`, `bridge.mjs`, `sprites.mjs` and the two patches plus
+3. **Adapter, staged.** Copies `adapter.mjs`, `bridge.mjs`, `sprites.mjs` and the four patches plus
    `studio-login.cjs`, root-owned and read-only, to `/opt/cortados-office/adapters/<commit>/`. The
    running bridge still uses the old copy.
 4. **Claw3D, staged.** Builds into `claw3d/builds/<claw3d commit>-<checkout commit>/` as
-   `_cortados-claw3d`: clone, check out the pinned commit, `git apply --check` and apply both
-   patches, copy the login module, `npm ci --ignore-scripts && npm run build`, then write a
+   `_cortados-claw3d`: clone, check out the pinned commit, `git apply --check` and apply the four
+   patches (avatar-profile-hint, studio-login, cortados-rooms, system-fonts), copy the login module, `npm ci --ignore-scripts && npm run build`, then write a
    `.cortados-build-ok` marker. A build dir with the marker is reused. One without it (a failed
    earlier run) is deleted and rebuilt. It is never the current one.
 5. **Secrets.** Nothing is printed or passed on argv. Files that are already there are kept.
