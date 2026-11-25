@@ -571,7 +571,11 @@ today (`docs/LOCAL-RESOURCES.md:187-189`). §5 covers whether this is wise.
 Built in step 8 as `routing.choose_local_pick`: the probe, `local_lane.lists`, `local_lane.busy` and `gate_busy`, the
 model's context and `gate_fit`; a bare `local` tries every local pin in config order; `x-cortados-exclude-model` skips a
 model. None can: refused with each model, its node and why, and the widening line (503 with `pick_refused`; 413 when
-every one is too large). The row is a pin row (engine and band `pin`) with `route_pick`, the rule `route pick <label>
+every one is too large). Preference and identity differ (fix round 1, review localorch3 P3): the launcher keeps the
+order typed (`--route local:qwen-35b+qwen-27b`) or selected in the menu, duplicates dropped, so the first choice is
+tried first; the provider's `Pick.models` keeps that order for selection, while the conversation's identity label
+(`Pick.label`, the routes row's `route_pick`) sorts the ids, so `local:a+b` and `local:b+a` are one pick for
+continuation and views and differ only in which model is tried first. The row is a pin row (engine and band `pin`) with `route_pick`, the rule `route pick <label>
 (orchestrator profile): <pin> on node <node>`, `boundary profile: <profile>` and each skipped model's reason.
 
 ### 4.6 Subagents and child tasks
@@ -646,20 +650,41 @@ The proposal above, with these choices where it was silent (the stricter option 
 
 - **The profile** (`effect_boundary.PROFILE_TOOLS["orchestrator"]`, exact): `Read`, `Glob`, `Grep`, `LS`,
   `NotebookRead`; `TodoWrite`, `ExitPlanMode`, `AskUserQuestion`; the six `mcp__cortados-route__*` tools (exact names:
-  any other server or spelling is not delegation); `Bash` only as start_task's `watch_command` (`WATCH_COMMAND_RE`, the
-  same shape as the mod's `TASK_WATCH_RE`: nothing chained but `; echo "exit $?"`), with `BashOutput` / `KillShell` /
-  `KillBash` for that background job. Refused: every file write, every other shell command, Agent / Task, WebFetch /
-  WebSearch and typed server tools, every other MCP tool, Skill / SlashCommand / ToolSearch, and any unknown name (an
+  any other server or spelling is not delegation); `Bash` only as the exact `watch_command` start_task
+  hands back (fix round 1, review localorch3 P1: the earlier shape pattern accepted any program whose path ended in
+  `python3` or `cortados_router/child_tasks.py`). The program part is compared,
+  not matched: `child_tasks.watch_prefix` (the `env CORTADOS_TASKS_DIR=… CORTADOS_EXEC_HOSTS_FILE=…` settings when set,
+  the interpreter's real path, `-B`, the checkout's resolved `child_tasks.py`, shell-quoted), the one source
+  `watch_command` itself is built from; then ` --watch`, task ids in the strict format (at least one) and only
+  `--stall` / `--timeout` / `--interval` with an integer, single spaces, nothing else (no `; echo`, no other flag). The
+  provider compares against its own process's prefix; the client hook against the prefix the launcher computed for the
+  delegation MCP server it configures (same interpreter, checkout and settings), passed to the hook as `--watch-prefix`
+  in the private settings file. When the provider and that server do not run the same interpreter and checkout, both
+  sides refuse the watcher and `task_status` / `wait_task` remain; a session not launched with a local pick (switched
+  to one with `/model`), and the mod, have no prefix, so no watcher. No `BashOutput` / `KillShell` / `KillBash`
+  (review localorch3 P2): their job ids cannot be tied to the watcher reliably (the id exists only after the Bash call
+  ran, on the client), and after a switch to a local pick they would reach the jobs the cloud model started; the
+  watcher's exit wakes the session and `task_status` / `wait_task` read the result. Refused: every file write, every
+  other shell command, Agent / Task, WebFetch / WebSearch and typed server tools, every other MCP tool, Skill / SlashCommand / ToolSearch, and any unknown name (an
   allowlist: unknown fails closed). §5 named no reads beyond Read/Grep/Glob; `LS` and `NotebookRead` are the same
   local reads the existing profiles allow.
 - **Both sides.** Provider: the node is offered only the profile's tools, and a reply calling anything else is blocked
   (a terminal 400 saying the main loop "reads, plans and delegates only"). Client: the launcher's hook now has matcher
   `*` and checks every provider-marked call against the record's `tools`, the watcher shape and start_task's refused
   inputs (docs/BOUNDARY-HOOK.md "The local orchestrator"). Unmarked calls of other tools return at once, unasked.
+  Only in a session launched with a local pick (fix round 1: `*` starts the hook on every Read, about 158 ms each in
+  the reviewer's measurement); cloud picks, the default orchestrator and child tasks keep `Write|Edit|MultiEdit|
+  NotebookEdit|Bash`, as does the mod. A session switched to a local pick mid-way has the narrow hook: the provider's
+  check of every marked call stands alone for the other tools, and there is no watcher.
 - **[ESCALATE] E13** (new): §5 item 2 leaves "may a local orchestrator start tasks with outward effects at all" to the
   owner. Built: `start_task` with `chrome` (the owner's signed-in browser) or `connectors` (mail, chat, drive servers in
   the child) is refused on both sides; every other start_task (repo, host, permission mode, local) is allowed, and the
   child keeps its own guards (auto mode's classifier). Lift the refusal, or refuse more (e.g. `host: here`)?
+  Known, accepted scope (the reviewer's note, fix round 1; the owner is told): this refusal is narrow, not a guarantee
+  of no outward effects. The other start_task arguments can authorise work elsewhere: `host`, `cwd`, `repo` and the
+  task text place, clone and fetch; `orchestrator` picks a cloud model; and `allowed_tools` pre-approves tools in the
+  child, so shell and network work there need not pass the child's auto-mode classifier. That is how delegation
+  normally works, and the local orchestrator gets it as any orchestrator does.
 - **[ESCALATE] E14** (new): E5 (the sensitive rule wins) and E8 (plan and delegate only) meet on a sensitive turn of a
   local pick. The sensitive profile would allow file writes; delegation would send the sensitive text to a cloud
   model. Built: the stricter intersection, `orchestrator-sensitive`: read and plan only, no delegation, no shell, on the

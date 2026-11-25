@@ -31,8 +31,9 @@ pick runs the main loop of a Claude Code session on a local model, opt-in, under
 automatic move but it is fenced like one (local_lane.serve: `fenced`):
   orchestrator            plan and delegate only: read (Read, Glob, Grep, LS, NotebookRead), plan (TodoWrite,
                           ExitPlanMode, AskUserQuestion), delegate through exactly the cortados-route MCP tools
-                          (DELEGATION_TOOLS), and one shell shape: start_task's watch_command (WATCH_COMMAND_RE), with
-                          BashOutput / KillShell for that background watcher. No file write, no other shell command, no
+                          (DELEGATION_TOOLS), and one shell command: start_task's exact watch_command (is_watch_command:
+                          this install's interpreter and child_tasks.py, ids, --stall/--timeout/--interval). No
+                          BashOutput / KillShell / KillBash, no file write, no other shell command, no
                           Agent / Task, no web, no other MCP tool, nothing unknown. start_task may not ask for Chrome
                           or connectors (DELEGATE_REFUSED_INPUTS: [ESCALATE] E13 in the design doc, the stricter option).
   orchestrator-sensitive  the same, for a turn a sensitivity detector marks (E5: the sensitive rule wins): no shell and
@@ -150,39 +151,46 @@ START_TASK_TOOL = "mcp__%s__start_task" % DELEGATION_SERVER
 DELEGATE_REFUSED_INPUTS = ("chrome", "connectors")
 ORCHESTRATOR_READ_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead",
                                      "TodoWrite", "ExitPlanMode", "AskUserQuestion"})
-# The watcher's shell: Bash (only WATCH_COMMAND_RE), and BashOutput / KillShell / KillBash for its background job.
-ORCHESTRATOR_SHELL = BASH_FAMILY
+# The watcher's shell: Bash, only as start_task's exact watch_command (is_watch_command). Not BashOutput / KillShell /
+# KillBash (review localorch3 P2): their shell / job ids cannot be tied to the watcher reliably (the id exists only after
+# the Bash call ran, on the client), and after a session switched to a local pick they would reach the jobs the cloud
+# model started. The watcher's exit already wakes the session; task_status / wait_task read the result.
+ORCHESTRATOR_SHELL = frozenset({"Bash"})
 PROFILE_TOOLS = {SENSITIVE: LOCAL_TOOL_ALLOWLIST - BASH_FAMILY, COST: LOCAL_TOOL_ALLOWLIST,
                  ORCHESTRATOR: ORCHESTRATOR_READ_TOOLS | DELEGATION_TOOLS | ORCHESTRATOR_SHELL,
                  ORCHESTRATOR_SENSITIVE: ORCHESTRATOR_READ_TOOLS}
 
-# child_tasks.watch_command's shape (the background watcher AGENTS.md has the orchestrator run after every start_task),
-# the same shape as the routed-subagents mod's TASK_WATCH_RE (hooks/register.ts) and the same pattern as
-# boundary_hook.WATCH_COMMAND_RE (tests/test_local_orchestrator.py keeps the two equal): [env] [CORTADOS_TASKS_DIR=… CORTADOS_EXEC_HOSTS_FILE=…] <a python3> [-B]
-# <…/cortados_router/child_tasks.py> --watch <task id>… [--timeout|--interval|--stall <seconds>]…, optionally
-# `; echo "exit $?"`. Spaces and tabs only: no newline, other command, pipe, redirect, substitution or variable. The
-# only shell a local orchestrator has; it only polls task_status.
-_W_PLAIN = r"[A-Za-z0-9_./~+@%:,-]"
-_W_TASK_ID = r"t[0-9]{14}-[0-9a-f]{8}"
-_W_FLAG = r"--(?:timeout|interval|stall)[ \t]+[0-9]+(?:\.[0-9]+)?"
+# A local orchestrator's one shell command: start_task's watch_command, EXACTLY as child_tasks.watch_command builds it.
+# Review localorch3 P1: a shape pattern accepted any path ending in python3 or cortados_router/child_tasks.py (a
+# substituted program under /tmp, bare python3 found on PATH, env overrides), i.e. arbitrary code. So the program part
+# is not matched but compared: the command must start with the exact prefix child_tasks.watch_prefix builds (this
+# process's interpreter real path, this checkout's child_tasks.py, the WATCH_ENV_VARS set here), then WATCH_TAIL_RE:
+# ` --watch`, then task ids (the strict id format, at least one) and only the options a watcher uses (--stall,
+# --timeout, --interval with an integer), single spaces, nothing else (no `; echo`, no other flag, no redirection).
+# The client hook (boundary_hook.WATCH_TAIL_RE, the same pattern: tests/test_local_orchestrator.py keeps them equal)
+# compares against the prefix of the MCP server its launcher configured (session.py). Both sides build the prefix with
+# child_tasks.watch_prefix, so they agree when the provider and the session's delegation server run the same
+# interpreter and checkout (the usual install); otherwise each refuses the watcher and task_status / wait_task remain.
+WATCH_TAIL_RE = re.compile(
+    r" --watch(?: --(?:stall|timeout|interval) [0-9]{1,7})* t[0-9]{14}-[0-9a-f]{8}"
+    r"(?: (?:t[0-9]{14}-[0-9a-f]{8}|--(?:stall|timeout|interval) [0-9]{1,7})){0,63}")
 
 
-def _w_path_to(tail: str) -> str:
-    return r"(?:'(?:[^']*/)?%s'|(?:%s*/)?%s)" % (tail, _W_PLAIN, tail)
+def expected_watch_prefix() -> str:
+    """The watcher program this provider accepts: child_tasks.watch_prefix() of this process (the same source
+    start_task's watch_command uses), never anything read from the request."""
+    from cortados_router import child_tasks          # deferred: the provider imports this module early
+    return child_tasks.watch_prefix()
 
 
-WATCH_COMMAND_RE = re.compile(
-    r"[ \t]*(?:env[ \t]+)?"
-    + r"(?:CORTADOS_(?:TASKS_DIR|EXEC_HOSTS_FILE)=(?:'[^']*'|%s+)[ \t]+)*" % _W_PLAIN
-    + _w_path_to(r"python3(?:\.[0-9]+)?") + r"(?:[ \t]+-B)?[ \t]+"
-    + _w_path_to(r"cortados_router/child_tasks\.py") + r"[ \t]+--watch"
-    + r"(?:[ \t]+%s)*[ \t]+%s(?:[ \t]+(?:%s|%s))*" % (_W_FLAG, _W_TASK_ID, _W_TASK_ID, _W_FLAG)
-    + r"""(?:[ \t]*;[ \t]*echo[ \t]+(?:"exit \$\?"|exit[ \t]+\$\?))?[ \t]*""")
-
-
-def is_watch_command(command: Any) -> bool:
-    """Whether a Bash command is exactly start_task's watch_command shape (WATCH_COMMAND_RE, fullmatch)."""
-    return isinstance(command, str) and bool(WATCH_COMMAND_RE.fullmatch(command))
+def is_watch_command(command: Any, prefix: str | None = None) -> bool:
+    """Whether a Bash command is exactly a watch_command: `prefix` (default expected_watch_prefix()) followed by
+    WATCH_TAIL_RE, fullmatch."""
+    if not isinstance(command, str):
+        return False
+    prefix = expected_watch_prefix() if prefix is None else prefix
+    return (isinstance(prefix, str) and bool(prefix) and command.startswith(prefix)
+            and bool(WATCH_TAIL_RE.fullmatch(command[len(prefix):])))
 # The allowlisted tools whose `command` input is a shell command line to inspect.
 SHELL_TOOLS = frozenset({"Bash"})
 # The allowlisted tools that write a file, and the input key naming it.

@@ -33,19 +33,35 @@ from tests.test_session_route import RouteBase
 ORCH = eb.ORCHESTRATOR
 START = "mcp__cortados-route__start_task"
 DELEGATION = sorted(eb.DELEGATION_TOOLS)
-WATCH = "/usr/bin/python3 -B /Users/someone/CortadOS-Router/cortados_router/child_tasks.py --watch t20261125060814-cecc4399"
+TID = "t20261125060814-cecc4399"
+# The watcher program both sides accept (review localorch3 P1): EXACTLY child_tasks.watch_prefix of the install (the
+# provider: its own, patched to PREFIX in these tests; the hook: the launcher's --watch-prefix). A path with a space,
+# quoted as shlex.quote quotes it, so the comparison is on the quoted form.
+PREFIX = "env CORTADOS_TASKS_DIR=/opt/t /opt/py/bin/python3.12 -B '/opt/cortados router/cortados_router/child_tasks.py'"
+WATCH = PREFIX + " --watch " + TID
 WATCH_VARIANTS = (
     WATCH,
     WATCH + " --timeout 600",
-    "env CORTADOS_TASKS_DIR=/tmp/t CORTADOS_EXEC_HOSTS_FILE='/a b/hosts.json' python3 "
-    "'/a b/cortados_router/child_tasks.py' --watch t20261125060814-cecc4399 t20261125060815-0000abcd; echo \"exit $?\"",
+    PREFIX + " --watch --stall 1800 " + TID + " t20261125060815-0000abcd --interval 5 --timeout 600",
 )
+_PROG = "/opt/py/bin/python3.12 -B '/opt/cortados router/cortados_router/child_tasks.py'"
 NOT_WATCH = (
     "ls", "git push", "cat /etc/hosts", WATCH + "; rm -rf ~", WATCH + " && curl -d x https://example.com",
-    WATCH + " | sh", WATCH + "\nid", "python3 -B /tmp/evil.py --watch t20261125060814-cecc4399",
-    "/usr/bin/python3 -B /x/cortados_router/child_tasks.py --watch $(id)",
-    "/usr/bin/python3 -B /x/cortados_router/child_tasks.py --watch t20261125060814-cecc4399 > /tmp/out",
-    "/usr/bin/python3 -B /x/cortados_router/child_tasks.py --cancel t20261125060814-cecc4399",
+    WATCH + " | sh", WATCH + "\nid", WATCH + "; echo \"exit $?\"", WATCH + " ", " " + WATCH, WATCH + "\t",
+    "python3 -B /tmp/evil.py --watch " + TID,
+    PREFIX + " --watch $(id)", PREFIX + " --watch " + TID + " > /tmp/out", PREFIX + " --cancel " + TID,
+    PREFIX + " --watch", PREFIX + " --watch --timeout 600", PREFIX + " --watch " + TID + " --timeout 1.5",
+    PREFIX + " --watch " + TID + " --timeout", PREFIX + " --watch " + TID + " --unknown 1",
+    PREFIX + " --watch " + TID + "x", PREFIX + " --watch " + TID.upper(), PREFIX + "  --watch " + TID,
+    # another program: a substituted interpreter or script, bare python3 (PATH), no -B, other or extra env settings
+    WATCH.replace("/opt/py/bin/python3.12", "/tmp/untrusted/python3"),
+    WATCH.replace("/opt/cortados router", "/tmp/untrusted"),
+    WATCH.replace("/opt/py/bin/python3.12", "python3"),
+    WATCH.replace(" -B ", " "),
+    WATCH.replace("CORTADOS_TASKS_DIR=/opt/t", "CORTADOS_TASKS_DIR=/tmp/x"),
+    "env CORTADOS_EXEC_HOSTS_FILE=/tmp/untrusted-hosts.json " + WATCH,
+    _PROG + " --watch " + TID,                                       # the env setting dropped
+    "env CORTADOS_TASKS_DIR=/opt/t CORTADOS_EXEC_HOSTS_FILE=/tmp/h.json " + _PROG + " --watch " + TID,
 )
 # What a Claude Code main loop declares, by class: read, plan, delegate, the watcher's shell, and everything refused.
 READ_PLAN = ["Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite", "ExitPlanMode", "AskUserQuestion"]
@@ -65,7 +81,8 @@ def tool(name, **extra):
 
 
 def every_tool():
-    names = READ_PLAN + DELEGATION + ["Bash", "BashOutput", "KillShell"] + [n for v in REFUSED.values() for n in v]
+    names = READ_PLAN + DELEGATION + ["Bash", "BashOutput", "KillShell", "KillBash"] + [n for v in REFUSED.values()
+                                                                                    for n in v]
     return [tool(n) for n in names]
 
 
@@ -76,8 +93,8 @@ def call(name, inp, cid="toolu_node_own"):
 class ProfileTests(unittest.TestCase):
 
     def test_the_allowlist_is_exact(self):
-        self.assertEqual(eb.PROFILE_TOOLS[ORCH], frozenset(READ_PLAN) | frozenset(DELEGATION) |
-                         {"Bash", "BashOutput", "KillShell", "KillBash"})
+        # Bash only as the watcher; no background-job tools (review localorch3 P2)
+        self.assertEqual(eb.PROFILE_TOOLS[ORCH], frozenset(READ_PLAN) | frozenset(DELEGATION) | {"Bash"})
         self.assertEqual(eb.DELEGATION_TOOLS, frozenset(f"mcp__cortados-route__{t}" for t in (
             "start_task", "route_task", "task_status", "wait_task", "list_tasks", "cancel_task")))
         # E5: a sensitive turn of a local pick reads and plans only: no delegation (it leaves the machine), no shell
@@ -123,17 +140,41 @@ class ProfileTests(unittest.TestCase):
 
     def test_the_shell_is_the_task_watcher_only(self):
         b = eb.Boundary(eb.PICK_LOCAL_REASON, None, hook=True)
-        for cmd in WATCH_VARIANTS:
-            self.assertIsNone(b.blocked_call("Bash", {"command": cmd, "run_in_background": True}), cmd)
-        for cmd in NOT_WATCH + (None, 3):
-            self.assertEqual(b.blocked_call("Bash", {"command": cmd}), "bash-not-watch", cmd)
-        self.assertEqual(b.blocked_call("Bash", "ls"), "bash-not-watch")
-        self.assertIsNone(b.blocked_call("BashOutput", {"bash_id": "b1"}))
+        with mock.patch.object(eb, "expected_watch_prefix", return_value=PREFIX):
+            for cmd in WATCH_VARIANTS:
+                self.assertIsNone(b.blocked_call("Bash", {"command": cmd, "run_in_background": True}), cmd)
+            for cmd in NOT_WATCH + (None, 3):
+                with self.subTest(cmd=cmd):
+                    self.assertEqual(b.blocked_call("Bash", {"command": cmd}), "bash-not-watch")
+            self.assertEqual(b.blocked_call("Bash", "ls"), "bash-not-watch")
+        # review localorch3 P2: no background-job control, whatever the job id
+        for name in ("BashOutput", "KillShell", "KillBash"):
+            self.assertEqual(b.blocked_call(name, {"bash_id": "b1", "shell_id": "b1"}), "tool-not-allowed", name)
+
+    def test_the_provider_accepts_exactly_its_own_watch_command(self):
+        # review localorch3 P1: the program is this install's (child_tasks.watch_prefix), never one named by the call
+        from cortados_router import child_tasks
+        for env in ({}, {"CORTADOS_TASKS_DIR": "/opt/t", "CORTADOS_EXEC_HOSTS_FILE": "/opt/h b.json"}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, {"CORTADOS_TASKS_DIR": "",
+                                                                     "CORTADOS_EXEC_HOSTS_FILE": "", **env}):
+                self.assertEqual(eb.expected_watch_prefix(), child_tasks.watch_prefix())
+                cmd = child_tasks.watch_command(TID)
+                self.assertTrue(eb.is_watch_command(cmd), cmd)
+                self.assertTrue(eb.is_watch_command(cmd + " t20261125060815-0000abcd --stall 1800"))
+                argv = cmd.split(" ")
+                self.assertTrue(os.path.isabs(child_tasks.shlex.split(cmd)[-3]))
+                for bad in (cmd.replace(argv[argv.index("-B") - 1], "/tmp/untrusted/python3"),
+                            cmd.replace(argv[argv.index("-B") - 1], "python3"),
+                            cmd.replace("cortados_router/child_tasks.py", "x/cortados_router/child_tasks.py"),
+                            "env CORTADOS_EXEC_HOSTS_FILE=/tmp/h.json " + cmd, cmd + " --unknown 1"):
+                    self.assertFalse(eb.is_watch_command(bad), bad)
+        self.assertFalse(eb.is_watch_command(WATCH, ""))             # no prefix: nothing is the watcher
 
     def test_without_the_hook_there_is_no_shell(self):
         b = eb.Boundary(eb.PICK_LOCAL_REASON, None, hook=False)
         self.assertEqual(b.blocked_call("Bash", {"command": WATCH}), "tool-not-allowed")
         self.assertEqual(b.blocked_call("BashOutput", {}), "tool-not-allowed")
+        self.assertEqual(b.blocked_call("KillShell", {}), "tool-not-allowed")
         self.assertIsNone(b.blocked_call(START, {"task": "x"}))     # delegation stays: it needs no client check
         out, dropped = b.tools_for_node({"tools": every_tool()})
         self.assertNotIn("Bash", [t["name"] for t in out["tools"]])
@@ -150,7 +191,7 @@ class ProfileTests(unittest.TestCase):
                 "tool_choice": {"type": "tool", "name": "Write"}}
         out, dropped = eb.Boundary(eb.PICK_LOCAL_REASON, None, hook=True).tools_for_node(body)
         self.assertEqual(sorted(t["name"] for t in out["tools"]),
-                         sorted(READ_PLAN + DELEGATION + ["Bash", "BashOutput", "KillShell"]))
+                         sorted(READ_PLAN + DELEGATION + ["Bash"]))
         self.assertNotIn("tool_choice", out)                       # it named a dropped tool
         self.assertIn("Read", dropped)                             # the typed server tool, whatever its name
         for names in REFUSED.values():
@@ -168,16 +209,18 @@ class ProfileTests(unittest.TestCase):
         ans = eb.check_answer(led.record("c", "Bash", eb.COST, None), led)        # unchanged for cost
         self.assertEqual((ans["bash"], ans["bash_watch"], ans["delegate_refused"]), (True, False, []))
 
-    def test_the_watch_pattern_is_one_on_both_sides(self):
-        self.assertEqual(hook.WATCH_COMMAND_RE.pattern, eb.WATCH_COMMAND_RE.pattern)
+    def test_the_watch_check_is_one_on_both_sides(self):
+        self.assertEqual(hook.WATCH_TAIL_RE.pattern, eb.WATCH_TAIL_RE.pattern)
         self.assertEqual(hook.START_TASK_TOOL, eb.START_TASK_TOOL)
+        self.assertEqual(hook.JOB_TOOLS, eb.BASH_FAMILY - eb.ORCHESTRATOR_SHELL)
         for cmd in WATCH_VARIANTS:
-            self.assertTrue(hook.WATCH_COMMAND_RE.fullmatch(cmd), cmd)
-        for cmd in NOT_WATCH:
-            self.assertIsNone(hook.WATCH_COMMAND_RE.fullmatch(cmd), cmd)
-        # the command start_task really hands back has the shape
-        from cortados_router import child_tasks
-        self.assertTrue(eb.is_watch_command(child_tasks.watch_command("t20261125060814-cecc4399")))
+            self.assertTrue(hook.is_watch_command(cmd, PREFIX), cmd)
+            self.assertTrue(eb.is_watch_command(cmd, PREFIX), cmd)
+        for cmd in NOT_WATCH + (None,):
+            self.assertFalse(hook.is_watch_command(cmd, PREFIX), cmd)
+            self.assertFalse(eb.is_watch_command(cmd, PREFIX), cmd)
+        for none in (None, ""):
+            self.assertFalse(hook.is_watch_command(WATCH, none))     # a hook without the launcher's prefix: never
 
     def test_the_blocked_message_says_plan_and_delegate(self):
         self.assertIn("plans and delegates only", eb.blocked_message(ORCH))
@@ -191,6 +234,14 @@ class HookTests(HookBase):
 
     def answer(self, name, profile=ORCH):
         FakeCheck.answers[MARKED] = record(profile, self.project, tool=name)
+
+    def run_hook(self, tool, tool_input, tid=MARKED, argv=("--watch-prefix", PREFIX)):
+        """The hook as a local-pick session runs it: with the launcher's --watch-prefix (session.boundary_hook_entry)."""
+        err = io.StringIO()
+        event = {"session_id": "s", "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": tool_input,
+                 "tool_use_id": tid, "cwd": self.project}
+        code = hook.main(stdin=io.StringIO(json.dumps(event)), stderr=err, argv=list(argv))
+        return code, err.getvalue()
 
     def test_every_refused_class_is_denied_on_the_client(self):
         for cls, names in REFUSED.items():
@@ -227,7 +278,11 @@ class HookTests(HookBase):
         for cmd in WATCH_VARIANTS:
             self.assertAllowed(self.run_hook("Bash", {"command": cmd, "run_in_background": True}))
         for cmd in NOT_WATCH:
-            self.assertDenied(self.run_hook("Bash", {"command": cmd}), "watch_command")
+            with self.subTest(cmd=cmd):
+                self.assertDenied(self.run_hook("Bash", {"command": cmd}), "exact watch_command")
+        # review localorch3 P1: no launcher prefix (a session not launched with a local pick, the mod): no watcher
+        for argv in ((), ("--watch-prefix", ""), ("--watch-prefix",)):
+            self.assertDenied(self.run_hook("Bash", {"command": WATCH}, argv=argv), "not launched with a local pick")
         self.answer("Bash", eb.ORCHESTRATOR_SENSITIVE)
         self.assertDenied(self.run_hook("Bash", {"command": WATCH}), "no shell")
 
@@ -243,9 +298,31 @@ class HookTests(HookBase):
         self.assertAllowed(self.run_hook("WebFetch", {"url": "https://example.com"}, tid="toolu_01CloudModelOwnId"))
         self.assertEqual(FakeCheck.asked, [])
 
-    def test_the_session_installs_the_hook_for_every_tool(self):
+    def test_background_job_tools_are_denied_whatever_the_id(self):
+        # review localorch3 P2: even a record naming them (an older provider's profile listed them)
+        for name in ("BashOutput", "KillShell", "KillBash"):
+            ans = record(ORCH, self.project, tool=name)
+            ans["tools"] = sorted(set(ans["tools"]) | {name})
+            FakeCheck.answers[MARKED] = ans
+            self.assertDenied(self.run_hook(name, {"bash_id": "b1", "shell_id": "b1"}), "background jobs")
+            self.answer(name)
+            self.assertDenied(self.run_hook(name, {"bash_id": "b1"}), "not allowed")
+        ans = record(eb.COST, self.project, tool="KillShell")           # unchanged for the cost profile
+        FakeCheck.answers[MARKED] = ans
+        self.assertAllowed(self.run_hook("KillShell", {"shell_id": "b1"}))
+
+    def test_the_hook_matcher_is_every_tool_only_for_a_local_pick(self):
+        # review localorch3 (speed): `*` starts the hook on every Read; only a local-pick session needs it
         entry = session.boundary_hook_entry(None, "/usr/bin/python3")
+        self.assertEqual(entry["matcher"], "Write|Edit|MultiEdit|NotebookEdit|Bash")
+        self.assertNotIn("--watch-prefix", entry["hooks"][0]["command"])
+        entry = session.boundary_hook_entry(None, "/usr/bin/python3", local_pick=True, watch_prefix=PREFIX)
         self.assertEqual(entry["matcher"], "*")
+        cmd = entry["hooks"][0]["command"]
+        inner = cmd[len(session.BOUNDARY_HOOK_GUARD_HEAD):-len(session.BOUNDARY_HOOK_GUARD_TAIL)]
+        argv = __import__("shlex").split(inner)
+        self.assertEqual(argv[-2:], ["--watch-prefix", PREFIX])
+        self.assertEqual(hook.watch_prefix_from(argv[5:]), PREFIX)
 
 
 # ------------------------------------------------------------------------------------------- selection (routing)
@@ -453,7 +530,7 @@ class EndToEndTests(LocalHarness):
                     "tool_use"
                 status, raw = self.raw(self.body(text=f"plan {uuid.uuid4().hex}", stream=stream))
                 self.assertEqual(status, 200, raw)
-                self.assertEqual(self.offered(), sorted(READ_PLAN + DELEGATION + ["Bash", "BashOutput", "KillShell"]))
+                self.assertEqual(self.offered(), sorted(READ_PLAN + DELEGATION + ["Bash"]))
                 self.assertNotIn("toolu_node_own", raw)
                 tid = [x for x in __import__("re").findall(r'"id": ?"(toolu_cxb_[0-9a-f]{24})"', raw)][0]
                 ans = self.check(tid)
@@ -474,9 +551,16 @@ class EndToEndTests(LocalHarness):
                 self.assertNotIn("tool_use", raw)
 
     def test_the_watcher_passes_and_text_answers_pass(self):
-        FakeOllama.reply = [call("Bash", {"command": WATCH, "run_in_background": True})], "tool_use"
+        from cortados_router import child_tasks
+        FakeOllama.reply = [call("Bash", {"command": child_tasks.watch_command(TID), "run_in_background": True})], \
+            "tool_use"
         status, raw = self.raw(self.body(text=f"plan {uuid.uuid4().hex}"))
         self.assertEqual(status, 200, raw)
+        # review localorch3 P1: another program in the watcher's shape is refused end to end
+        FakeOllama.reply = [call("Bash", {"command": "/tmp/untrusted/python3 -B /tmp/untrusted/cortados_router/"
+                                                     "child_tasks.py --watch " + TID})], "tool_use"
+        status, raw = self.raw(self.body(text=f"plan {uuid.uuid4().hex}"))
+        self.assertEqual(status, 400, raw)
         FakeOllama.reply = [{"type": "text", "text": "here is the plan"}], "end_turn"
         status, raw = self.raw(self.body(text=f"plan {uuid.uuid4().hex}"))
         self.assertEqual(status, 200, raw)
@@ -576,7 +660,9 @@ class LauncherTests(RouteBase):
     def test_route_local_launches_with_the_note_and_only_the_delegation_server(self):
         for flag, model in (("local", "cortados@local"), ("local:QWEN-27B", "cortados@local:qwen-27b"),
                             ("local:qwen3.6-35b-a3b:q4".replace(":q4", ""), None),
-                            ("local:qwen-35b+qwen-27b", "cortados@local:qwen-27b+qwen-35b")):
+                            # review localorch3 P3: the typed order is the preference order, kept (not sorted)
+                            ("local:qwen-35b+qwen-27b", "cortados@local:qwen-35b+qwen-27b"),
+                            ("local:qwen-27b+QWEN-35B+qwen-27b", "cortados@local:qwen-27b+qwen-35b")):
             with self.subTest(flag=flag):
                 if model is None:
                     with self.assertRaisesRegex(session.SessionError, "not a local model"):
@@ -601,6 +687,42 @@ class LauncherTests(RouteBase):
                 self.assertNotIn(SECRET, json.dumps(cfg))                 # the token file's path, never the token
                 self.assertEqual(env.get("ENABLE_TOOL_SEARCH"), "false")  # delegation tools declared up front
 
+    def hook_entry(self, cmd):
+        with open(cmd[cmd.index("--settings") + 1]) as f:
+            return json.load(f)["hooks"]["PreToolUse"][0]
+
+    def test_the_generated_hook_per_case(self):
+        # review localorch3: matcher `*` and the watcher prefix only for a local pick; cloud picks, the default
+        # orchestrator and child tasks keep the file-writer + Bash matcher, without a watcher prefix
+        import shlex
+        from cortados_router import child_tasks
+        for env in ({}, {"CORTADOS_TASKS_DIR": "/opt/t b", "CORTADOS_EXEC_HOSTS_FILE": "/opt/h.json"}):
+            with self.subTest(env=env):
+                self.base = {k: v for k, v in self.base.items() if k not in child_tasks.WATCH_ENV_VARS}
+                self.base.update(env)
+                _a, _e, cmd, _ = self.argv("--route", "local:qwen-27b")
+                entry = self.hook_entry(cmd)
+                self.assertEqual(entry["matcher"], "*")
+                full = entry["hooks"][0]["command"]
+                argv = shlex.split(full[len(session.BOUNDARY_HOOK_GUARD_HEAD):-len(session.BOUNDARY_HOOK_GUARD_TAIL)])
+                prefix = hook.watch_prefix_from(argv)
+                # the prefix is what the configured delegation server's start_task will hand back
+                with open(cmd[cmd.index("--mcp-config") + 1]) as f:
+                    srv = json.load(f)["mcpServers"]["cortados-route"]
+                self.assertEqual(srv["command"], os.path.realpath(__import__("sys").executable))
+                self.assertEqual({k: srv["env"][k] for k in child_tasks.WATCH_ENV_VARS if k in srv["env"]}, env)
+                with mock.patch.dict(os.environ, {k: env.get(k, "") for k in child_tasks.WATCH_ENV_VARS}):
+                    self.assertEqual(prefix, child_tasks.watch_prefix())
+                    self.assertTrue(hook.is_watch_command(child_tasks.watch_command(TID), prefix))
+                self.assertEqual(os.path.dirname(shlex.split(prefix)[-1]), os.path.dirname(srv["args"][-1]))
+        for argv in (("--route", "R3"), ("--orchestrator", "cortados", "--orchestrator-band", "any",
+                                         "--run-id", TID, "--no-delegate-directive", "--no-gate"), ()):
+            with self.subTest(argv=argv):
+                _a, _e, cmd, _ = self.argv(*argv, answers="6\n")
+                entry = self.hook_entry(cmd)
+                self.assertEqual(entry["matcher"], "Write|Edit|MultiEdit|NotebookEdit|Bash")
+                self.assertNotIn("--watch-prefix", entry["hooks"][0]["command"])
+
     def test_the_owners_own_mcp_set_is_kept(self):
         _a, env, cmd, _ = self.argv("--route", "local", "--", "--strict-mcp-config", "--mcp-config", "/x.json")
         self.assertEqual(cmd.count("--strict-mcp-config"), 1)
@@ -612,12 +734,20 @@ class LauncherTests(RouteBase):
         self.assertNotIn("ENABLE_TOOL_SEARCH", env)
 
     def test_the_menu_picks_local_models(self):
-        _a, _e, cmd, out = self.argv(answers="5\n2\n1\n\n")
+        _a, _e, cmd, out = self.argv(answers="5\n1\n2\n\n")
         self.assertEqual(cmd[cmd.index("--model") + 1], "cortados@local:qwen-27b+qwen-35b")
         self.assertIn("  [ ] 1 qwen-27b on Pro: available", out)
         self.assertIn("  [ ] 2 qwen-35b on PC: switch off", out)
         self.assertIn(session.LOCAL_PICK_NOTE, out)
         self.assertEqual(session.load_pick(self.home), "local:qwen-27b+qwen-35b")
+        # review localorch3 P3: the order the models are selected in is the preference order
+        os.remove(session.pick_file(self.home))                          # nothing pre-selected
+        _a, _e, cmd, out = self.argv(answers="5\n2\n1\n\n")
+        self.assertEqual(cmd[cmd.index("--model") + 1], "cortados@local:qwen-35b+qwen-27b")
+        self.assertEqual(session.load_pick(self.home), "local:qwen-35b+qwen-27b")
+        _a, _e, cmd, out = self.argv(answers="5\n\n")                 # the saved order comes back pre-selected
+        self.assertIn("  [x] 2 qwen-35b on PC: switch off", out)
+        self.assertEqual(cmd[cmd.index("--model") + 1], "cortados@local:qwen-35b+qwen-27b")
         _a, _e, cmd, out = self.argv(answers="5\na\n")
         self.assertEqual(cmd[cmd.index("--model") + 1], "cortados@local")
         _a, _e, cmd, out = self.argv(answers="5\n\nb\n6\n")

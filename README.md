@@ -379,9 +379,10 @@ R3 models (general index ≥ 79.6; state from cached readings, no vendor CLI ope
   fits the request; if none can, the request is refused naming each model, its node and why, with the widening line,
   and nothing runs on any other model, local or cloud. Every turn is fenced on both sides: the provider offers the
   model only Read / Glob / Grep / LS / NotebookRead, TodoWrite / ExitPlanMode / AskUserQuestion, the six
-  `mcp__cortados-route__*` tools and Bash for start_task's `watch_command` alone (plus BashOutput / KillShell), and
+  `mcp__cortados-route__*` tools and Bash for start_task's exact `watch_command` alone (this install's interpreter and
+  `child_tasks.py`, task ids, `--stall` / `--timeout` / `--interval`; no BashOutput / KillShell), and
   blocks a reply calling anything else (edits, other shell commands, Agent, web, other MCP tools, unknown names); the
-  client hook (matcher `*` since this step) checks every provider-marked call against the same profile. `start_task`
+  client hook (matcher `*` in a session launched with a local pick) checks every provider-marked call against the same profile. `start_task`
   with `chrome` or `connectors` is refused ([ESCALATE] E13). A turn a sensitivity detector marks (the
   `x-cortados-local: sensitive` flag, a keyword) keeps the local model but loses delegation and the shell (E5). Without
   the hook header the shell is not offered. The launcher prints "local orchestrator: plan and delegate only …" and

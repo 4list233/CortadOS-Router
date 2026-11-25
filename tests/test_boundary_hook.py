@@ -599,7 +599,9 @@ class SharedSourceTests(unittest.TestCase):
         self.assertEqual(hook.WRITE_KEYS, eb.WRITE_TOOLS)
         self.assertEqual(hook.HOOK_TOOLS, eb.HOOK_TOOLS)
         self.assertEqual(session.BOUNDARY_HOOK_HEADER, eb.HOOK_HEADER)
-        self.assertEqual(session.BOUNDARY_HOOK_MATCHER, "*")         # every tool (step 8); decide() narrows it
+        # the file writers and Bash; every tool only in a local-pick session (review localorch3: ~158 ms per Read)
+        self.assertEqual(set(session.BOUNDARY_HOOK_MATCHER.split("|")), set(hook.HOOK_TOOLS))
+        self.assertEqual(session.BOUNDARY_HOOK_MATCHER_LOCAL, "*")
         from cortados_router.provider import server
         self.assertEqual(hook.CHECK_PATH, server.BOUNDARY_CHECK_PATH)
 
