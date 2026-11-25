@@ -28,8 +28,8 @@ collected at the end with a recommended default each.
 
 - The launcher routes the main loop through S1 only with `--orchestrator cortados`; the window rides on the main loop's
   model name, `--model cortados@<window>` (`cortados_router/session.py:85-102`, `build_argv` at `session.py:443-447`).
-  On main the default window is `R4` (`session.py:78`); branch `band-window-r3-default` (commit `4717cde`) changes it
-  to `R3`.
+  The default window was `R4` at `60febb6`; main's default is `R3` since `9c76d14` (branch `band-window-r3-default`,
+  commit `4717cde`), which this branch is rebased on.
 - Why R3: R4 has no index floor of its own (`core.py:334`: `floor = val(band) if band in refs and band != "R4"`), so
   an R4 window required only the D-interpolated index and let easy turns fall to Haiku-class models (`4717cde`'s
   message and its `docs/ROUTER-DESIGN.md` §13 hunk). R3 is a **minimum index, not a list**: every model whose index
