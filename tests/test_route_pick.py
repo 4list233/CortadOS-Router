@@ -442,8 +442,11 @@ class EscalationTests(SelectionTests):
     def test_tasks_view_labels(self):
         self.assertEqual(tasks._rule_label("route pick escalated: no selected model reaches 95 (code; …)"),
                          "route pick escalated")
-        self.assertEqual(tasks._rule_label(f"route pick R3:{OPUS}+{SOL}: 2 models, 4 routes"), "route pick")
-        self.assertEqual(tasks._rule_label("route pick R4:*: 2 models, 3 routes (a, b)"), "route pick")
+        # Step 5: without table ids (no `ids`) a label's models are withheld; with them the label is shown
+        self.assertEqual(tasks._rule_label(f"route pick R3:{OPUS}+{SOL}: 2 models, 4 routes"), "route pick (2 models)")
+        self.assertEqual(tasks._rule_label(f"route pick R3:{OPUS}+{SOL}: 2 models, 4 routes", frozenset({OPUS, SOL})),
+                         f"route pick R3:{OPUS}+{SOL} (2 models)")
+        self.assertEqual(tasks._rule_label("route pick R4:*: 2 models, 3 routes (a, b)"), "route pick R4:* (2 models)")
         self.assertEqual(tasks._rule_label(f"route pick R3:{SOL} overridden: sensitive"), "route pick overridden")
         self.assertEqual(tasks._rule_label("route pick: local cost routes not taken"),
                          "route pick: local cost route not taken")

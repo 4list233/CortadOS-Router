@@ -15,6 +15,7 @@
     "device": "pro",
     "status": "working",
     "model": "claude-opus-5",
+    "pick": null,
     "tool": "mcp__cortados-route__start_task",
     "client": null,
     "client_source": null,
@@ -58,6 +59,7 @@
         "lane": "claude#b",
         "local_backend": null,
         "model": "claude-sonnet-5",
+        "pick": null,
         "started_at": 1799999710.0,
         "ended_at": null,
         "elapsed_s": 290.0
@@ -71,6 +73,7 @@
         "lane": "codex",
         "local_backend": null,
         "model": "gpt-6.1",
+        "pick": null,
         "started_at": 1799999940.0,
         "ended_at": null,
         "elapsed_s": 60.0
@@ -84,6 +87,7 @@
         "lane": "local-studio",
         "local_backend": null,
         "model": "qwen3-30b",
+        "pick": null,
         "started_at": 1799999800.0,
         "ended_at": 1799999890.0,
         "elapsed_s": 90.0
@@ -118,6 +122,7 @@
           "lane": "claude#a",
           "local_backend": null,
           "model": "claude-haiku-5",
+          "pick": null,
           "started_at": 1799999810.0,
           "ended_at": null,
           "elapsed_s": 190.0
@@ -194,6 +199,7 @@
     "device": "studio",
     "status": "working",
     "model": "claude-opus-5",
+    "pick": null,
     "tool": null,
     "client": "codex",
     "client_source": "wire",
@@ -258,6 +264,7 @@
         "lane": null,
         "local_backend": null,
         "model": null,
+        "pick": null,
         "started_at": 1799996100.0,
         "ended_at": 1799996999.0,
         "elapsed_s": 899.0
@@ -289,6 +296,7 @@
     "device": null,
     "status": "n/a",
     "model": null,
+    "pick": null,
     "tool": null,
     "client": "grok",
     "client_source": "bot",
@@ -356,6 +364,7 @@
     "device": null,
     "status": "n/a",
     "model": null,
+    "pick": null,
     "tool": null,
     "client": null,
     "client_source": null,
@@ -399,6 +408,7 @@
         "lane": "claude#a",
         "local_backend": null,
         "model": "claude-haiku-5",
+        "pick": null,
         "started_at": 1799999930.0,
         "ended_at": null,
         "elapsed_s": 70.0

@@ -1,8 +1,12 @@
 """Run a whole Claude Code session on the cortados provider.
 
-    python3 -m cortados_router.session [--orchestrator fable|opus|sonnet|<model id>|cortados]
-        [--orchestrator-band R3|R3-R4|any] [--provider-url URL] [--token-file PATH] [--no-delegate-directive]
-        [--print-env] [-- <claude args>]
+    python3 -m cortados_router.session [--route R3:opus+sol|R4:*|R3|any|last] [--no-route-prompt]
+        [--orchestrator fable|opus|sonnet|<model id>|cortados] [--orchestrator-band R3|R3-R4|any]
+        [--provider-url URL] [--token-file PATH] [--no-delegate-directive] [--print-env] [-- <claude args>]
+
+On a terminal with no route flag it first shows the route menu (docs/ORCHESTRATOR-ROUTE-PICKER.md §1.2): a band, any,
+or a pin, then the band's models from the provider's cached readings; Enter keeps the last pick (first time: today's
+default, the pinned orchestrator below). --route picks without the menu; --no-route-prompt skips it.
 
 The main loop (the orchestrator) is pinned to a subscription model (`sub/<id>`, no S1) and delegates through the
 cortados-route MCP tools (start_task / route_task); its own Agent calls are refused by the gate (orchestrator_gate.py).
@@ -459,16 +463,395 @@ def format_env(env: dict, base: dict) -> str:
     return "\n".join(f"{k}={shown[k]}" for k in sorted(shown))
 
 
+# ------------------------------------------------------------------------------------ route picker (step 6)
+# The owner picks the main loop's route at launch (docs/ORCHESTRATOR-ROUTE-PICKER.md §1.2; E1, owner 2026-11-24: the
+# menu on every TTY launch, the first-time Enter is today's behaviour until a pick is saved). The pick rides on the
+# main loop's model name, `cortados@<label>` (routing.BAND_MODEL_PREFIX), the provider resolves and enforces it; the
+# launcher only offers the list and writes canonical table ids. No prompt without a TTY, under --print-env, or for child
+# tasks (they pass --orchestrator-band any and --run-id), nor when any route flag was given.
+ROUTE_PICK_FILE = "~/.config/cortados/route-pick.json"
+ROUTE_PICK_MAX_BYTES = 4096
+ROUTE_OPTIONS_PATH = "/v1/cortados/route-options"   # provider/route_options.PATH (a test keeps them equal)
+ROUTE_OPTIONS_TIMEOUT_S = 2.0      # the menu must not hang a launch on a sleeping provider: offline menu after this
+ROUTE_PROMPT_TRIES = 8             # invalid answers per question before the launch is refused (never an endless loop)
+# Friendly names the launcher resolves itself, before the provider's list. SUB_ALIASES are the provider's own; `sol` is
+# the launcher's spelling of the owner's `R3:opus+sol` (design §1.2, §7 step 6): on the provider `sol` is ambiguous
+# (gpt-5.6-sol, gpt-6-sol, gpt-6.1-sol), so it is pinned here to the R3 reference Sol. [ESCALATE] E12: whether `sol`
+# should follow the newest Sol, or become a provider alias (it would then also pin `sub/sol`).
+PICK_ALIASES = {**routing.SUB_ALIASES, "sol": "gpt-6.1-sol"}
+PIN_PREFIX = routing.SUB_PREFIX
+_PIN_RE = re.compile(r"sub/[a-z0-9][a-z0-9._-]{0,63}")
+LOCAL_PICK_NOTE = "local orchestrator: coming in the next step (plan-and-delegate profile)"
+
+
+class RouteOptionsUnavailable(Exception):
+    """The provider's route options could not be read (unreachable, refused, unreadable): the menu goes offline."""
+
+
+def fetch_route_options(url: str, token: str, band: str, timeout: float = ROUTE_OPTIONS_TIMEOUT_S) -> dict:
+    """GET <provider>/v1/cortados/route-options?band=<band> with the owner token, within `timeout` seconds."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url.rstrip("/") + ROUTE_OPTIONS_PATH + "?band=" + band,
+                                 headers={"authorization": "Bearer " + token})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read(1 << 20).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RouteOptionsUnavailable(f"the provider answered HTTP {exc.code}") from None
+    except (OSError, ValueError) as exc:
+        raise RouteOptionsUnavailable(f"provider unreachable ({type(exc).__name__})") from None
+    if not isinstance(data, dict):
+        raise RouteOptionsUnavailable("the provider sent an unreadable answer")
+    return data
+
+
+def served_ids(view: dict | None) -> list[str] | None:
+    """Every served model id an options view names (its band's list and the served models below it), or None."""
+    cloud = (view or {}).get("cloud")
+    if not isinstance(cloud, dict):
+        return None
+    ids = [m.get("id") for m in (cloud.get("models") or []) + (cloud.get("below_band") or []) if isinstance(m, dict)]
+    return sorted({i for i in ids if isinstance(i, str) and i})
+
+
+def resolve_pick_name(name: str, served: list[str] | None) -> str:
+    """One model name of a pick as a served table id: PICK_ALIASES, then an exact id (release date optional), then
+    the friendly words (every word of the name a word of exactly one id, routing.name_tokens). Offline (`served`
+    None) a name that is no alias goes as typed, lower-cased: the provider checks it on the first request."""
+    key = name.strip().casefold()
+    if key in PICK_ALIASES:
+        return PICK_ALIASES[key]
+    if served is None:
+        return key
+    exact = [m for m in served if routing.model_key(m) == routing.model_key(key)]
+    if len(exact) == 1:
+        return exact[0]
+    words = routing.name_tokens(key)
+    hits = sorted({m for m in served if words and all(w in routing.name_tokens(m) for w in words)})
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        raise SessionError(f"route pick: {name} is ambiguous: it could be {', '.join(hits)}; name one of them")
+    raise SessionError(f"route pick: {name} is not a model the provider serves; name one of: {', '.join(served)}")
+
+
+def canonical_route(text: str, served: list[str] | None = None) -> str:
+    """A --route value (the pick grammar of docs/ORCHESTRATOR-ROUTE-PICKER.md §3.2 without `cortados@`) as the
+    launcher writes it: `any`, a window label (`R3`), `<window>:*`, or `<window>:<ids sorted, joined by +>`. Local picks
+    are refused here (they stay refused by the provider until step 8)."""
+    try:
+        window, kind, names = routing.parse_pick(text)
+    except routing.PickError as exc:
+        raise SessionError(f"--route {str(text)[:40]!r}: {exc}") from None
+    if kind == "local":
+        raise SessionError(f"--route: {LOCAL_PICK_NOTE}; a local main loop is not available yet (pin one local "
+                           "model with --orchestrator <alias>, or pick cloud models)")
+    wlabel = core.band_window_label(*window) if window else None
+    if kind == "window":
+        return wlabel or "any"
+    if kind == "star":
+        return f"{wlabel}:*"
+    ids = sorted({resolve_pick_name(n, served) for n in names})
+    return check_route(f"{wlabel or 'any'}:{'+'.join(ids)}", "--route")
+
+
+def check_route(value: str, where: str) -> str:
+    """`value` (a canonical pick label) if the provider's own parser takes it, else SessionError. Reason: resolving
+    friendly names to table ids can lengthen a pick past routing.PIN_NAME_MAX (`R1:fable+…+sol`, 79 typed characters,
+    becomes 130), and the menu can select more than routing.PICK_MAX_MODELS models; either would be refused by the
+    provider, or crash route_notes, after the pick was saved. Checked with routing.parse_pick, the server's grammar and
+    limits, never a copy of them."""
+    try:
+        routing.parse_pick(value)
+    except routing.PickError as exc:
+        raise SessionError(f"{where}: {exc}") from None
+    return value
+
+
+def route_model(value: str) -> str:
+    """The main loop's --model for a saved or canonical route value: `sub/<id>` (a pin), `cortados` (any), or
+    `cortados@<label>`."""
+    if value.startswith(PIN_PREFIX):
+        return value
+    return "cortados" if value == "any" else routing.BAND_MODEL_PREFIX + value
+
+
+def route_notes(model: str) -> list[str]:
+    """The lines the launcher prints at start for a picked route: the route, the exact /model lines that widen it, the
+    E11 Haiku warning (accepted by the owner and the reviewer, doc §8) and the degraded-scorer note for a Claude-only
+    pick (doc §4.2)."""
+    if not model.startswith(routing.BAND_MODEL_PREFIX):
+        return ["main loop: " + ("free S1 routing (cortados)" if model == "cortados" else model + " (pinned, no S1)")]
+    label = model[len(routing.BAND_MODEL_PREFIX):]
+    window, kind, names = routing.parse_pick(label)
+    w = core.band_window_label(*window) if window else None
+    lines = ["main loop: " + model]
+    if kind == "window":
+        lines.append(f"widen mid-session: /model cortados@{w}:* (only the models clearing {w}'s reference) or "
+                     "/model cortados (free routing)")
+    else:
+        lines.append("widen mid-session: " + routing.pick_widen(routing.Pick(window, names, star=kind == "star",
+                                                                               label=label)).replace("`", ""))
+    if "haiku" in model.casefold():
+        lines.append("warning: this pick names a Haiku-family model, so Claude Code drives the main loop like a Haiku "
+                     "client (fewer betas: no effort, inline tools or mid-conversation tool changes)")
+    if kind == "set" and names and all(n.startswith("claude-") for n in names):
+        lines.append("note: a Claude-only pick has no route while S1 is degraded (a degraded scorer never defaults "
+                     "to Claude)")
+    return lines
+
+
+def pick_file(home: str | None = None) -> str:
+    return (os.path.join(home, ".config", "cortados", "route-pick.json") if home is not None
+            else os.path.expanduser(ROUTE_PICK_FILE))
+
+
+def _valid_saved(value) -> bool:
+    return isinstance(value, str) and (value == "any" or bool(_PIN_RE.fullmatch(value))
+                                       or bool(routing.view_pick_label(value)))
+
+
+def load_pick(home: str | None = None) -> str | None:
+    """The last pick saved by an interactive launch, or None (none saved). The file must be a regular 0600 file of
+    this user in a directory that passes the settings-dir rules (verify_private_dir); anything else is a
+    SessionError the caller reports, never read."""
+    path = pick_file(home)
+    d = os.path.dirname(path)
+    if not os.path.lexists(path):
+        return None
+    verify_private_dir(d, os.path.expanduser("~") if home is None else home)
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise SessionError(f"cannot read the saved route pick {path}: {exc.strerror}") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+            raise SessionError(f"the saved route pick {path} is not a private 0600 file of this user; not read")
+        raw = os.read(fd, ROUTE_PICK_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8")) if len(raw) <= ROUTE_PICK_MAX_BYTES else None
+    except ValueError:
+        data = None
+    value = data.get("pick") if isinstance(data, dict) else None
+    if not _valid_saved(value):
+        raise SessionError(f"the saved route pick {path} is unreadable; pick again (it is replaced on the next pick)")
+    return value
+
+
+def save_pick(value: str, home: str | None = None, now: float | None = None) -> str:
+    """Remember an interactive pick: route-pick.json, 0600, written to a new file and renamed over the old one, in a
+    0700 directory checked by the settings-dir rules (no symlinked component, owned by this user)."""
+    if not _valid_saved(value):
+        raise SessionError(f"route pick {value!r} is not one the launcher writes")
+    path = pick_file(home)
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    verify_private_dir(d, os.path.expanduser("~") if home is None else home)
+    fd, tmp = tempfile.mkstemp(prefix=".route-pick-", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            json.dump({"pick": value, "saved_at": round(time.time() if now is None else now, 3)}, f)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _route_text(r: dict) -> str:
+    """One route of the menu: `claude A 62% left`, `codex spent`, `API credit $142 left`, `claude B` (unread)."""
+    if r.get("provider") == routing.API_PROVIDER:
+        usd = r.get("left_usd")
+        return "API credit" + (f" ${usd:.0f} left" if isinstance(usd, (int, float)) else "")
+    lane = str(r.get("lane") or r.get("provider") or "?")
+    who = lane.split("#", 1)[0] + (" " + str(r["account"]) if r.get("account") else "")
+    st = r.get("state")
+    if st == "ok" and isinstance(r.get("left_pct"), (int, float)):
+        return f"{who} {r['left_pct']:.0f}% left"
+    return f"{who} {st}" if st in ("spent", "refusing") else who
+
+
+class RoutePrompt:
+    """The interactive menu (doc §1.2), on injected streams. `fetch(band)` returns an options view or raises
+    RouteOptionsUnavailable; `saved` is the last saved pick (or None: Enter keeps today's default)."""
+
+    def __init__(self, inp, out, fetch, saved: str | None, default_model: str):
+        self.inp, self.out, self.fetch, self.saved, self.default_model = inp, out, fetch, saved, default_model
+        self.offline: str | None = None          # why the provider's list is not available, once known
+        self.views: dict[str, dict] = {}
+
+    def say(self, line: str = "") -> None:
+        self.out.write(line + "\n")
+        self.out.flush()
+
+    def ask(self, prompt: str = "> ") -> str:
+        self.out.write(prompt)
+        self.out.flush()
+        line = self.inp.readline()
+        if line == "":
+            raise SessionError("route prompt closed (end of input): no route picked, nothing launched")
+        return line.strip()
+
+    def view(self, band: str) -> dict | None:
+        if self.offline is not None:
+            return None
+        if band not in self.views:
+            try:
+                self.views[band] = self.fetch(band)
+            except RouteOptionsUnavailable as exc:
+                self.offline = str(exc)
+                self.say(f"CortadOS: {self.offline}; offline menu: the band choices, the last pick and typed model "
+                         "names (checked by the provider on the first request)")
+                return None
+        return self.views[band]
+
+    def run(self) -> str | None:
+        """The picked route value (route_model takes it), or None for today's default (first-time Enter)."""
+        enter = (f"Enter = last: {self.saved}" if self.saved else f"Enter = today's default: {self.default_model}")
+        for _ in range(ROUTE_PROMPT_TRIES):
+            self.say(f"CortadOS: route for this session's main loop        [{enter}]")
+            self.say("  1 R1   2 R2   3 R3   4 R4   5 local   6 any (S1 routes freely)   7 pin one model")
+            got = self.ask().casefold()
+            if got == "":
+                return self.saved
+            if got in ("1", "2", "3", "4"):
+                value = self.band("R" + got)
+                if value is not None:
+                    return value
+            elif got == "5":
+                self.local()
+            elif got == "6":
+                return "any"
+            elif got == "7":
+                value = self.pin()
+                if value is not None:
+                    return value
+            else:
+                self.say("choose 1-7, or Enter")
+        raise SessionError("route prompt: no route picked after several tries; nothing launched")
+
+    def band(self, band: str) -> str | None:
+        v = self.view(band)
+        cloud = (v or {}).get("cloud")
+        if not isinstance(cloud, dict) or not cloud.get("models"):
+            if v is not None:
+                self.say(f"{band}: the provider lists no model (" + ", ".join(
+                    str(e.get("source")) for e in v.get("errors") or [] if isinstance(e, dict)) + ")")
+            return self.band_offline(band)
+        models = [m for m in cloud["models"] if isinstance(m, dict) and isinstance(m.get("id"), str)]
+        pre = set()
+        if self.saved and self.saved.startswith(band + ":") and not self.saved.endswith(":*"):
+            pre = set(self.saved.split(":", 1)[1].split("+"))
+        chosen = [m["id"] in pre for m in models]
+        ref = (cloud.get("reference") or {}).get("general")
+        width = max(len(str(m.get("name") or m["id"])) for m in models)
+        for _ in range(ROUTE_PROMPT_TRIES):
+            self.say(f"{band} models (general index ≥ {ref}; state from cached readings, no vendor CLI opened)")
+            for i, m in enumerate(models):
+                flags = [f for f, on in (("frontier", m.get("ceiling")),
+                                         ("short of " + ", ".join(m.get("short_of") or []), m.get("short_of")),
+                                         ("below the face floor", m.get("below_face_floor"))) if on]
+                routes = " · ".join(_route_text(r) for r in m.get("routes") or [] if isinstance(r, dict))
+                self.say(f"  [{'x' if chosen[i] else ' '}] {i + 1} {str(m.get('name') or m['id']).ljust(width)}  "
+                         f"{routes}" + (f"   {', '.join(flags)}" if flags else ""))
+            self.say(f"  a = any capable {band} model     b = band only (the {band} window)")
+            self.say("  numbers toggle, Enter accepts")
+            got = self.ask().casefold()
+            if got == "a":
+                return f"{band}:*"
+            if got == "b":
+                return band
+            if got == "":
+                ids = sorted(m["id"] for m, on in zip(models, chosen) if on)
+                if not ids:
+                    self.say("select at least one model, or a / b")
+                    continue
+                try:
+                    return check_route(f"{band}:{'+'.join(ids)}", "route pick")
+                except SessionError as exc:          # too many models, or too long: say so and ask again
+                    self.say(f"{exc}; deselect some models, or a / b")
+                    continue
+            nums = got.replace(",", " ").split()
+            if all(n.isdigit() and 1 <= int(n) <= len(models) for n in nums):
+                for n in nums:
+                    chosen[int(n) - 1] = not chosen[int(n) - 1]
+            else:
+                self.say(f"numbers 1-{len(models)}, a, b, or Enter")
+        raise SessionError("route prompt: no route picked after several tries; nothing launched")
+
+    def band_offline(self, band: str) -> str | None:
+        for _ in range(ROUTE_PROMPT_TRIES):
+            self.say(f"{band}: type model names joined by + (opus+gpt-6.1-sol), a = any capable {band} model, "
+                     f"b = band only")
+            got = self.ask()
+            if got.casefold() == "a":
+                return f"{band}:*"
+            if got.casefold() == "b":
+                return band
+            if got:
+                try:
+                    return canonical_route(f"{band}:{got}", None)
+                except SessionError as exc:
+                    self.say(str(exc))
+        raise SessionError("route prompt: no route picked after several tries; nothing launched")
+
+    def local(self) -> None:
+        v = self.view("local")
+        loc = (v or {}).get("local") or {}
+        for m in loc.get("models") or []:
+            if isinstance(m, dict):
+                self.say(f"  {m.get('id')} on {m.get('node_label') or m.get('node')}: {m.get('state')}")
+        if loc.get("error"):
+            self.say("  " + str(loc["error"]))
+        self.say(LOCAL_PICK_NOTE)
+
+    def pin(self) -> str | None:
+        served = served_ids(self.view("R0"))
+        for _ in range(ROUTE_PROMPT_TRIES):
+            got = self.ask("model to pin (opus, gpt-6.1-sol, …; Enter = back): ")
+            if got == "":
+                return None
+            try:
+                return PIN_PREFIX + resolve_pick_name(got, served)
+            except SessionError as exc:
+                self.say(str(exc))
+        return None
+
+
+def _tty(stream) -> bool:
+    try:
+        return bool(stream is not None and stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
 def parse(argv: list):
     extra: list = []
     if "--" in argv:
         i = argv.index("--")
         argv, extra = argv[:i], argv[i + 1 :]
     ap = argparse.ArgumentParser(prog="python3 -m cortados_router.session", description=__doc__.split("\n")[0])
-    ap.add_argument("--orchestrator", default=DEFAULT_ORCHESTRATOR)
+    ap.add_argument("--orchestrator", default=None, help=f"pin the main loop (default {DEFAULT_ORCHESTRATOR})")
     ap.add_argument("--orchestrator-band", default=None,
                     help=f"band window of a routed main loop: R3, R2-R3 or any (default {DEFAULT_ORCHESTRATOR_BAND} "
                          "with --orchestrator cortados); subagents and side calls are not windowed")
+    ap.add_argument("--route", default=None,
+                    help="the main loop's route pick: R3:opus+sol, R4:*, R3, any, or last (the last saved pick); "
+                         "refused with --orchestrator / --orchestrator-band")
+    ap.add_argument("--no-route-prompt", action="store_true", help="never show the route menu (today's default)")
     ap.add_argument("--provider-url")
     ap.add_argument("--token-file", default=DEFAULT_TOKEN_FILE)
     ap.add_argument("--no-delegate-directive", action="store_true")
@@ -488,7 +871,53 @@ def parse(argv: list):
     return ap.parse_args(argv), extra
 
 
-def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home: str | None = None):
+def pick_route(args, url: str, token: str, *, home: str | None, stdin, out, fetch=None) -> str | None:
+    """The main loop's route value from --route or the interactive menu (route_model turns it into --model), or None
+    for the --orchestrator / --orchestrator-band path. Saves an interactive pick (save_pick)."""
+    explicit = args.orchestrator is not None or args.orchestrator_band is not None   # prepare refused it with --route
+    fetch = fetch or (lambda band: fetch_route_options(url, token, band))
+    if args.route is not None:
+        if args.route.strip().casefold() == "last":
+            saved = load_pick(home)
+            if saved is None:
+                raise SessionError("--route last: no route pick has been saved yet (pick one at an interactive launch)")
+            return saved
+        served = None
+        try:
+            _w, kind, names = routing.parse_pick(args.route)
+        except routing.PickError:
+            kind, names = None, ()               # canonical_route says what is wrong with it
+        if kind == "set" and any(n.casefold() not in PICK_ALIASES for n in names):
+            try:                                 # the provider's list resolves the friendly names (R0: every model)
+                served = served_ids(fetch("R0"))
+            except RouteOptionsUnavailable:
+                served = None                    # offline: aliases and ids as typed; the provider checks them
+        return canonical_route(args.route, served)
+    if (explicit or args.no_route_prompt or args.print_env or args.run_id or args.project_dir or args.eager_tools
+            or not (_tty(stdin) and _tty(out))):
+        return None
+    err_saved = None
+    try:
+        saved = load_pick(home)
+    except SessionError as exc:
+        saved, err_saved = None, str(exc)
+    if err_saved:
+        out.write(f"cortados session: {err_saved}\n")
+    value = RoutePrompt(stdin, out, fetch, saved, resolve_model(DEFAULT_ORCHESTRATOR)).run()
+    if value is not None and value != saved:
+        try:
+            save_pick(value, home)
+        except (OSError, SessionError) as exc:   # the launch goes on; the pick is not remembered, and that is said
+            out.write(f"cortados session: the pick was not saved: {getattr(exc, 'strerror', None) or exc}\n")
+    if value is not None:
+        out.write("→ claude --model " + route_model(value) + "\n")
+    return value
+
+
+def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home: str | None = None,
+            stdin=None, out=None, fetch=None):
+    """`stdin` / `out`: the route menu's streams (no menu unless both are TTYs); `fetch(band)`: the route options
+    reader (default: GET /v1/cortados/route-options on the provider, ROUTE_OPTIONS_TIMEOUT_S)."""
     args, extra = parse(argv)
     check_passthrough(extra)
     if args.delegate_budget < 0:
@@ -497,8 +926,17 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home
         url = resolve_provider_url({**base_env, **({"CORTADOS_PROVIDER_URL": args.provider_url} if args.provider_url else {})})
     except ProviderURLError as exc:
         raise SessionError(str(exc)) from None
-    model = windowed_model(resolve_model(args.orchestrator), args.orchestrator_band)
+    if args.route is not None and (args.orchestrator is not None or args.orchestrator_band is not None):
+        raise SessionError("--route cannot be combined with --orchestrator or --orchestrator-band: it already names "
+                           "the main loop's route")
     token = read_token(args.token_file)
+    route = pick_route(args, url, token, home=home, stdin=stdin, out=out, fetch=fetch)
+    if route is not None:
+        model = route_model(route)
+        args.route_notes = route_notes(model)
+    else:
+        model = windowed_model(resolve_model(args.orchestrator or DEFAULT_ORCHESTRATOR), args.orchestrator_band)
+        args.route_notes = []
     directive = None
     if not args.no_delegate_directive:
         directive = DIRECTIVE_FILE.read_text(encoding="utf-8").strip()
@@ -518,10 +956,11 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home
 
 
 def main(argv=None, base_env=None, out=sys.stdout, err=sys.stderr, managed_dirs=MANAGED_SETTINGS_DIRS,
-         home=None) -> int:
+         home=None, stdin=None, fetch=None) -> int:
     base = dict(os.environ if base_env is None else base_env)
     try:
-        args, env, cmd = prepare(list(sys.argv[1:] if argv is None else argv), base, managed_dirs, home)
+        args, env, cmd = prepare(list(sys.argv[1:] if argv is None else argv), base, managed_dirs, home,
+                                 stdin=sys.stdin if stdin is None else stdin, out=out, fetch=fetch)
     except SessionError as exc:
         print(f"cortados session: {exc}", file=err)
         return 2
@@ -529,6 +968,8 @@ def main(argv=None, base_env=None, out=sys.stdout, err=sys.stderr, managed_dirs=
         print(format_env(env, base), file=out)
         print("argv: " + " ".join(repr(a) if " " in a else a for a in cmd), file=out)
         return 0
+    for line in args.route_notes:
+        print(f"cortados session: {line}", file=err)
     os.execvpe(cmd[0], cmd, env)
     return 1  # unreachable
 

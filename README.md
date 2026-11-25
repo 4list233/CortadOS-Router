@@ -340,8 +340,54 @@ Legacy `WANGCAI_*` names still work and log a deprecation warning.
 
 ```sh
 export CORTADOS_PROVIDER_URL=http://<provider-host>:<port>   # token in ~/.config/cortados/provider-token
-python3 -m cortados_router.session                           # --orchestrator fable|opus|sonnet|haiku|<model id>|cortados
+python3 -m cortados_router.session                           # on a terminal: the route menu first (below)
+python3 -m cortados_router.session --route R3:opus+sol       # pick without the menu; --route last, --no-route-prompt
+python3 -m cortados_router.session --orchestrator opus       # the older flags: --orchestrator, --orchestrator-band
 ```
+
+**Route picker (routed main loop).** On a terminal with no route flag, the launcher asks first
+(docs/ORCHESTRATOR-ROUTE-PICKER.md §1.2):
+
+```
+CortadOS: route for this session's main loop        [Enter = last: R3:claude-opus-5-5+gpt-6.1-sol]
+  1 R1   2 R2   3 R3   4 R4   5 local   6 any (S1 routes freely)   7 pin one model
+> 3
+R3 models (general index ≥ 79.6; state from cached readings, no vendor CLI opened)
+  [ ] 1 GPT-6 Astra       codex 71% left   frontier
+  [x] 2 Claude Opus 5.5   claude A 62% left · claude B 40% left · API credit $142 left   frontier
+  [ ] 3 Claude Fable 5.1  claude A 12% left · claude B spent   frontier
+  [x] 4 GPT-6.1 Sol       codex 71% left   short of code
+  …
+  a = any capable R3 model     b = band only (the R3 window)
+  numbers toggle, Enter accepts
+```
+
+- The list is the provider's `GET /v1/cortados/route-options?band=R3` (owner token or a dashboard session): every
+  served model whose general index clears the band's reference, with each account and lane and its quota left from the
+  scarcity cache. It never opens a vendor CLI (`core.lane_health(refresh=False)`; a stale reading shows no number).
+  Cursor- and Antigravity-only models are left out and counted. `band=local` lists the local pins with their node's
+  state from its gate. The launcher waits 2 s for the list; past that (or on any error) it says so and offers an
+  offline menu: the bands, the last pick and typed model names, which the provider checks on the first request.
+- What a choice becomes: models → `--model cortados@R3:claude-opus-5-5+gpt-6.1-sol` (scarcity picks among only those
+  models, on every account and lane that serves them; a turn none of them can carry escalates, E3, and a selection
+  that is all spent is refused, E2); `a` → `cortados@R3:*`; `b` → `cortados@R3` (the band window above); `6` →
+  `cortados`; `7` → `sub/<id>`. Local picks are listed but not offered yet: "local orchestrator: coming in the next
+  step (plan-and-delegate profile)"; the provider refuses them until that step.
+- `--route <pick>` takes the same grammar without `cortados@` (`R3:opus+sol`, `R4:*`, `R3`, `any`), `--route last`
+  the saved pick. Friendly names become table ids before they reach the wire: the provider's own aliases (`opus`,
+  `sonnet`, `haiku`, `fable`), `sol` = `gpt-6.1-sol` (a launcher alias: on the provider `sol` is ambiguous), then the
+  words of one served id (`gpt-6.1`). `--route` with `--orchestrator` or `--orchestrator-band` is refused.
+- The last interactive pick is kept in `~/.config/cortados/route-pick.json` (0600, in a 0700 directory checked like the
+  sessions directory). Enter keeps it; with none saved, Enter is the pinned default below. No menu without a TTY,
+  with `--print-env`, `--no-route-prompt`, `--orchestrator` / `--orchestrator-band`, or for a child task.
+- At start the launcher prints the route and the exact `/model` lines that widen it
+  (`/model cortados@R3:*` or `/model cortados@R3`), a note for a Claude-only pick (no route while S1 is degraded),
+  and a warning when the pick names a Haiku model: Claude Code then drives the main loop like a Haiku client (E11).
+- The routes row records the pick in its `route_pick` column. The Tasks view labels its rules
+  `route pick R3:… (2 models)`, `route pick escalated` and `route pick … overridden`, showing a label's ids only when
+  they are table ids. The live view gives each conversation and the orchestrator tree its `pick` (the session view and
+  the pulse pane: `pick_route`, e.g. `R3:…: Claude Opus 5.5 · claude#b`). The Office desk shows it as a badge, and the
+  dashboard's Live tab has a Route options card.
 
 What runs where:
 

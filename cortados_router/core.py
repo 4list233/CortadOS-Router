@@ -1641,7 +1641,11 @@ TOKEN_COLUMNS = (("tok_input", "INTEGER"), ("tok_output", "INTEGER"), ("tok_cach
 # #132: the client's workload hint (x-cortados-workload: "batch"), NULL when none was sent. Metadata only.
 # The client's band window (x-cortados-band, or the routed main loop's `cortados@<window>` model) as band_window_label
 # writes it, NULL when none was given. Metadata only: the hard_rules column says what it did.
-EXTRA_COLUMNS = TOKEN_COLUMNS + (("sensitive_cloud", "TEXT"), ("workload", "TEXT"), ("band_window", "TEXT"))
+# The route pick that restricted the conversation's models (provider/routing.Pick.label: `R3:*`,
+# `R3:claude-opus-5-5+gpt-6.1-sol`, `any:<ids>`; band names and table ids only), NULL for a window-only pick (that is
+# band_window) and for no pick. Never cut: a cut label could name another pick (docs/ORCHESTRATOR-ROUTE-PICKER.md §6).
+EXTRA_COLUMNS = TOKEN_COLUMNS + (("sensitive_cloud", "TEXT"), ("workload", "TEXT"), ("band_window", "TEXT"),
+                                 ("route_pick", "TEXT"))
 
 
 def _db() -> sqlite3.Connection:
@@ -1725,6 +1729,18 @@ def log_route(turn_id: str, meta: dict[str, Any], decision: dict[str, Any], r: d
         if meta.get("band_window"):
             c.execute('UPDATE routes SET band_window=? WHERE turn_id=?', (str(meta["band_window"])[:8], turn_id))
     return _write_routes("log_route", write, raise_final=False)
+
+
+ROUTE_PICK_MAX = 600        # 8 ids of up to 64 characters, their `+` and a window: longer is not a label
+
+
+def log_route_pick(turn_id: str, label: str) -> bool:
+    """Record the route pick a routes row was chosen under (routing.choose, once its route is final: escalation and a
+    sensitive move rewrite the row first). Never raises sqlite3.Error (as log_route): False when not written."""
+    if not isinstance(label, str) or not label or len(label) > ROUTE_PICK_MAX or not label.isprintable():
+        return False
+    return _write_routes("log_route_pick", lambda c: c.execute("UPDATE routes SET route_pick=? WHERE turn_id=?",
+                                                               (label, turn_id)), raise_final=False)
 
 
 def log_execution(route_id: str, provider: str, model: str) -> None:

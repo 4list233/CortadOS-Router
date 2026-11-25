@@ -397,7 +397,37 @@ PICK_ESCALATED_KEY = "pick_escalated"
 PICK_NOTICE_REASONS = {"index": "the turn needs a higher index than any selected model has",
                        "frontier": "the turn needs a frontier model and none is selected"}
 PICK_NOTICE_PREFIX = "⚠ CortadOS: route pick "
+# A route pick's canonical label (Pick.label: band names and table/pin ids only, never client text). THE rule every view
+# re-checks a label against (view_pick_label: tasks, live, the Office desk); at most PICK_MAX_MODELS ids.
 _PICK_LABEL_RE = re.compile(r"(?:any|local|R[0-4](?:-R[0-4])?)(?::(?:\*|[a-z0-9._-]{1,64}(?:\+[a-z0-9._-]{1,64}){0,7}))?")
+
+
+def table_model_ids(core) -> frozenset[str]:
+    """Every model id the tables name (model-scores families' reach rows and the routing table's candidates, plus the
+    served ids), casefolded: what a pick label's ids are checked against before a view shows them (view_pick_label).
+    The local pin ids too, when the local config reads (a broken one adds none: a local label then shows as `local`)."""
+    ids = {str(r.get("model")).casefold() for m in (core.model_scores() or {}).get("models") or []
+           for r in m.get("reach") or []}
+    ids |= {str(r.get("model")).casefold() for b in core.table()["candidates"].values() for r in b}
+    ids |= {m.casefold() for _, m in served_routes(core)}
+    try:
+        ids |= {local_lane.pin_id(m).casefold() for _, m in local_lane.pins()}
+    except local_lane.LocalConfigError:
+        pass
+    return frozenset(ids)
+
+
+def view_pick_label(label: Any, ids: "frozenset[str] | None" = None) -> str | None:
+    """A pick label as a view may show it: the canonical shape (office.PICK_LABEL_RE) and, with `ids`
+    (table_model_ids), every id a table id; else None. Labels come only from band names and table ids, never from a
+    request (doc §6: a value read back from router.db is re-checked, not trusted)."""
+    if not isinstance(label, str) or not _PICK_LABEL_RE.fullmatch(label):
+        return None
+    if ids is not None:
+        _head, sep, tail = label.partition(":")
+        if sep and tail != "*" and not all(x in ids for x in tail.split("+")):
+            return None
+    return label
 
 
 def pick_notice(escalated: Any, model: Any) -> dict[str, Any] | None:
@@ -1398,6 +1428,10 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
             r = prefer_api_credit(core, body, r, client=client, conversation_id=conversation_id, excluded=hit)
         elif sensitive is not None:
             r = _stamp_cloud(r, sensitive, skipped)
+    if restrict and not r.get("error") and r.get("route_id"):
+        # The routes row records the pick its route was chosen under (doc §6), after every rewrite of the row above
+        # (escalation, a sensitive move). A failed write is counted in router_db and never fails the request.
+        core.log_route_pick(r["route_id"], route_pick.label)
     if min_left_pct is not None and not r.get("error"):
         # The routed path's floor check runs on the account select chose (execution_routing ranks inside select); a
         # chosen account below the client's floor is refused like a spent one, never swapped for an unscored sibling.

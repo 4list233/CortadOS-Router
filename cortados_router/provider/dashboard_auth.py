@@ -118,8 +118,11 @@ LIVE_PATH, USAGE_PATH, TASKS_PATH, OFFICE_PATH = ("/v1/cortados/live", "/v1/cort
                                                   "/v1/cortados/office")
 # The local-model switch's view and POST (provider/local_switch.py owns the paths). The POST needs csrf_ok too.
 LOCAL_PATH, LOCAL_SWITCH_PATH = _local_switch.VIEW_PATH, _local_switch.SWITCH_PATH
+# The route picker's options view (provider/route_options.py; the Live tab's card): read-only metadata, like the others.
+ROUTE_OPTIONS_PATH = "/v1/cortados/route-options"
 SESSION_SCOPES: dict[str, frozenset[tuple[str, str]]] = {
-    "dashboard:read": frozenset({("GET", LIVE_PATH), ("GET", USAGE_PATH), ("GET", TASKS_PATH), ("GET", OFFICE_PATH)}),
+    "dashboard:read": frozenset({("GET", LIVE_PATH), ("GET", USAGE_PATH), ("GET", TASKS_PATH), ("GET", OFFICE_PATH),
+                                 ("GET", ROUTE_OPTIONS_PATH)}),
     "local:switch": frozenset({("GET", LOCAL_PATH), ("POST", LOCAL_SWITCH_PATH)}),
 }
 DEFAULT_SESSION_SCOPES = frozenset(SESSION_SCOPES)

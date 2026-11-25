@@ -225,6 +225,9 @@ const LIVE_EVERY = 5000, EVERY = 30000, ROUTED_SHOWN = 10;
 // The Local models card (/v1/cortados/local, provider/local_switch.py) asks each node's gate, so it is polled every
 // LOCAL_EVERY on the Live tab, not on every 5 s live poll, and at once after a switch.
 const LOCAL_URL = "/v1/cortados/local", LOCAL_SWITCH_URL = "/v1/cortados/local/switch", LOCAL_EVERY = 30000;
+// The route picker's options (/v1/cortados/route-options, docs/ORCHESTRATOR-ROUTE-PICKER.md §2): cached readings only,
+// polled with the Local models card (LOCAL_EVERY) and at once when another band is chosen.
+const ROUTE_URL = "/v1/cortados/route-options?band=";
 const $ = (id) => document.getElementById(id);
 // Auth mode, set by the server in the cortados-auth meta tag. "session": a password is set and this page was served to
 // a logged-in browser; every view is fetched with the HttpOnly session cookie (credentials: same-origin, no token) and
@@ -472,7 +475,7 @@ function orchMeta(g) {
   if (g.kind === "unattributed") return "tasks with no orchestrator recorded (from before task origins, or no session tag)";
   if (g.kind === "bot") return "bot gateway";
   return join([g.device ? "on " + g.device : null, "session " + String(g.origin || "").slice(0, 8),
-    g.model, g.tool ? "tool " + g.tool : null]);
+    g.pick_route ? "route pick " + g.pick_route : g.model, g.tool ? "tool " + g.tool : null]);
 }
 function counts(c) {
   c = c || {};
@@ -913,6 +916,51 @@ function renderLocal(d, failure) {
   });
   add(localP.body, grid);
 }
+// ---------------------------------------------------------------- Route options card (Live tab)
+const routeP = panel("p-route", "Route options", "span-12");
+let routeAt = 0, routeBusy = false, routeBand = "R3";
+function routeText(r) {
+  const who = r.provider === "anthropic-api" ? "API credit"
+    : (r.account ? String(r.lane || r.provider).split("#")[0] + " " + r.account : (r.lane || r.provider));
+  if (r.provider === "anthropic-api") return who + (isNum(r.left_usd) ? " $" + r.left_usd.toFixed(0) + " left" : "");
+  if (r.state === "ok") return who + " " + pct(r.left_pct) + " left";
+  return who + " " + (r.state || "unread");
+}
+function renderRoute(d, failure) {
+  routeP.body.replaceChildren();
+  routeP.meta.textContent = "models a route pick can name · cached readings, no vendor CLI opened";
+  const bar = el("div", "sub");
+  ["R1", "R2", "R3", "R4"].forEach(b => {
+    const x = el("button", b === routeBand ? "on" : null, b); x.type = "button";
+    x.addEventListener("click", () => { routeBand = b; refreshRoute(SESSION ? "" : getTok(), true); });
+    add(bar, x);
+  });
+  add(routeP.body, bar);
+  if (failure) { add(routeP.body, el("div", "secerr err", "route options unavailable: " + failure)); return; }
+  if (!d) return;
+  (d.errors || []).forEach(e => add(routeP.body, el("div", "secerr err", errText(e))));
+  const c = d.cloud;
+  if (!c) return;
+  add(routeP.body, el("div", "sub", d.band + " models (general index ≥ " + c.reference.general + ")"));
+  add(routeP.body, table(c.models || [], [
+    {h: "model", v: m => m.name + (m.ceiling ? " · frontier" : "") + (m.below_face_floor ? " · below the face floor" : "")},
+    {h: "id", v: m => m.id}, {h: "general", num: true, v: m => (m.index || {}).general},
+    {h: "short of", v: m => (m.short_of || []).join(", ") || "–"},
+    {h: "accounts and lanes", cls: "reason", v: m => (m.routes || []).map(routeText).join(" · ")}]));
+  if (c.not_served && c.not_served.count)
+    add(routeP.body, el("div", "sub muted", c.not_served.count + " model" + (c.not_served.count === 1 ? "" : "s") + " left out: " + c.not_served.why));
+  add(routeP.body, el("div", "sub muted", "pick at launch: python3 -m cortados_router.session (or --route " + d.band + ":<ids>)"));
+}
+async function refreshRoute(t, force) {
+  if (routeBusy || (!force && Date.now() - routeAt < LOCAL_EVERY)) return;
+  routeBusy = true; routeAt = Date.now();
+  try {
+    const res = await get(ROUTE_URL + routeBand, t);
+    if (!res.ok) return renderRoute(null, "error " + res.status);
+    renderRoute(await res.json());
+  } catch (e) { renderRoute(null, "fetch failed: " + (e && e.message ? e.message : e)); }
+  finally { routeBusy = false; }
+}
 async function refreshLocal(t, force) {
   if (localBusy || (!force && Date.now() - localAt < LOCAL_EVERY)) return;
   localBusy = true; localAt = Date.now();
@@ -991,6 +1039,7 @@ function renderLive(d) {
   renderWorkSplit(panels, d.work_split || {}, now);
   renderHosts(panels, d.hosts || {}, s1);
   add(panels, localP.p);
+  add(panels, routeP.p);
   add(box, panels);
   lastOk = new Date();
   const st = $("status"); st.className = o.errors ? "err" : "";
@@ -1010,7 +1059,8 @@ function table(rows, cols, maxOf) {
   rows.forEach(r => { const tr = el("tr"); cols.forEach(c => {
     if (c.bar) { const td = el("td", "barcell"); const b = el("div", "bar"); const f = el("div"); f.style.width = (100 * (Number(c.bar(r)) || 0) / max) + "%"; add(tr, add(td, add(b, f))); }
     else if (c.node) add(tr, add(el("td"), c.node(r)));
-    else { const td = el("td", c.cls || (c.num ? "num" : null), c.v(r)); if (c.cls === "clip" || c.cls === "reason") td.title = td.textContent; add(tr, td); }
+    else { const td = el("td", c.cls || (c.num ? "num" : null), c.v(r)); if (c.cls === "clip" || c.cls === "reason") td.title = td.textContent;
+      if (c.title && c.title(r)) td.title = c.title(r); add(tr, td); }
   }); add(t, tr); });
   return t;
 }
@@ -1058,7 +1108,8 @@ function renderTasks(t, failure) {
   const wide = el("div", "wide");
   add(wide, table(t.tasks || [], [
     {h: "when", v: x => when(x.ts)}, {h: "session", v: x => short(x.session_id)}, {h: "kind", v: x => x.routing_kind || "–"},
-    {h: "band", v: x => x.band || "–"}, {h: "lane · model", v: x => (x.lane || "–") + " · " + (x.model || "–")},
+    {h: "band", v: x => (x.band || "–") + (x.pick ? " · pick" : ""), title: x => x.pick ? "route pick " + x.pick : null},
+    {h: "lane · model", v: x => (x.lane || "–") + " · " + (x.model || "–")},
     {h: "ran on", v: x => x.actual_model || "–"}, {h: "elapsed", num: true, v: x => ms(x.elapsed_ms)}, {h: "end to end", num: true, v: x => ms(x.end_to_end_ms)},
     {h: "req chars", num: true, v: x => tok(x.request_chars)}, {h: "resp chars", num: true, v: x => tok(x.response_chars)},
     {h: "tokens", num: true, v: x => (typeof x.tokens === "number") ? tok(x.tokens) : (x.tokens_status || "not recorded")},
@@ -1203,6 +1254,7 @@ function stopTimers() {
 function showLogin(msg) {
   stopTimers();
   localAt = 0; localNote = null; localP.body.replaceChildren();   // another token must not see the last one's answer
+  routeAt = 0; routeP.body.replaceChildren();
   $("main").hidden = true; $("live").hidden = true; $("tabs").hidden = true; $("logout").hidden = true; $("login").hidden = false;
   $("status").textContent = msg || ""; $("tok").value = ""; $("tok").focus();
 }
@@ -1248,6 +1300,7 @@ async function pollLiveOnce(t) {
     renderLive(await res.json());
   } catch (e) { return failed("fetch failed: " + (e && e.message ? e.message : e)); }
   await refreshLocal(t, false);
+  await refreshRoute(t, false);
 }
 // The tasks view is fetched after a good usage render, with the same token. Its failure never hides the usage view and
 // never forgets the token (a 401 here with a token the usage view just accepted is reported, not acted on).

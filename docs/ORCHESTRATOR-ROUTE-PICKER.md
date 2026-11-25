@@ -1,9 +1,13 @@
-# Orchestrator route picker (design; steps 0–3 built)
+# Orchestrator route picker (design; steps 0–6 built)
 
-Status (2026-11-25, branch `orchestrator-route-picker`, review fix round 1 applied): step 0 (the spike, §3.1 and §1.3) is done; steps 1–3 (parser,
-selection, identity) are built to the owner's §8 answers (§8.1): `routing.route_pick` / `resolve_pick` / `Pick`,
-`routing.choose(route_pick=…)` with `pick_shortfall` (E3), `pick_refusal` (E2) and `pick_notice`, and the server's
-identity on the pick label; tests in `tests/test_route_pick.py`. Steps 4–9 are not built. Sections below that say
+Status (2026-11-25): step 0 (the spike, §3.1 and §1.3) is done; steps 1–3 (parser, selection, identity; branch
+`orchestrator-route-picker`, review fix rounds 1–2 applied) are built to the owner's §8 answers (§8.1):
+`routing.route_pick` / `resolve_pick` / `Pick`, `routing.choose(route_pick=…)` with `pick_shortfall` (E3),
+`pick_refusal` (E2) and `pick_notice`, and the server's identity on the pick label; tests in `tests/test_route_pick.py`.
+Steps 4–6 (branch `route-picker-launcher`) are built: the options view `provider/route_options.py`
+(`tests/test_route_options.py`), the `route_pick` column, labels and view fields (`tests/test_route_pick_views.py`), and
+the launcher's menu and flags in `session.py` (`tests/test_session_route.py`); what was built where it differs from
+the text below is in §7 "Built on 2026-11-25". Steps 7–9 are not built. Sections below that say
 "recommended" or "[ESCALATE]" were written before §8.1; where they differ, §8.1 and §4.3–4.4 hold.
 
 Owner request, 2026-11-24 (condensed): whenever a new Claude Code session starts, let me pick the route of the
@@ -684,6 +688,28 @@ pick refused before lookup, concurrent identical forks open once, failures and r
 E3 tests (an index and a frontier shortfall under `R3:gpt-6.1-sol`-style picks escalate, are recorded and carry the
 notice; an exhausted capable selection refuses and does not escalate; escalation leaves the API lane out).
 
+Built on 2026-11-25 (steps 4–6), with these choices where the text above left room:
+
+- **Step 4.** A cloud band's view carries only the cloud section; `band=local` carries only the local section. The
+  local section asks every node's gate (up to `local_switch.GATE_TIMEOUT_S` each), and the launcher waits 2 s for a
+  band's list. The local state comes from the gate rows of `GET /v1/cortados/local` (switch, power, allowed); the
+  `/api/tags` probe is not run. Served models below the band's reference are listed apart (`below_band`), so the
+  launcher can resolve a name outside the band's list (§3.2 allows it). The dashboard session scope
+  (`dashboard:read`) covers the view, for the Live tab's card.
+- **Step 5.** `route_pick` holds the label of a pick that restricts the models (`R3:*`, `R3:<ids>`, `any:<ids>`); a
+  window-only pick stays in `band_window`. It is written last (`core.log_route_pick`, after escalation and a sensitive
+  move have rewritten the row) and never cut (the cap is `core.ROUTE_PICK_MAX`, 600: 8 ids of 64 characters). The Tasks
+  labels are `route pick <label> (<n> models)`, `route pick <label> overridden`, `route pick escalated`; the label's
+  ids are shown only when every one is a table id (`routing.table_model_ids`), else `route pick (<n> models)`. The live
+  view's tree group carries `pick` and `pick_route`, and the Office tree allowlist adds `pick` (group and sub-session).
+- **Step 6.** In the menu, Enter with no model selected asks again (it never guesses a set); `5 local` shows the local
+  list and the step-8 note, then returns to the menu; `--route local…` is refused by the launcher with the same note.
+  An end of input or eight invalid answers end the launch without starting Claude Code. `--route` asks the provider
+  for its list only when a name is not a launcher alias. **[ESCALATE] E12** (new): `sol` is ambiguous on the provider
+  (`gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol`), so the launcher pins it to `gpt-6.1-sol` (the R3 reference Sol named in
+  the owner's `R3:opus+sol`). Should `sol` instead follow the newest served Sol, or become a provider alias (it would
+  then also pin `sub/sol`)?
+
 ---
 
 ## 8. [ESCALATE] questions for the owner
@@ -692,7 +718,7 @@ notice; an exhausted capable selection refuses and does not escalate; escalation
 
 | # | decision | built in steps 1–3 as |
 |---|---|---|
-| E1 | Default. The prompt shows on every TTY launch; the first-time Enter is today's behaviour until a pick is saved. | Launcher step 6 (not in this PR). |
+| E1 | Default. The prompt shows on every TTY launch; the first-time Enter is today's behaviour until a pick is saved. | Launcher step 6: `session.RoutePrompt`, `route-pick.json`. |
 | E2 | Default (A). Refuse clearly: name each selected route and why it was skipped, the earliest reset, and the widening `/model` line. 429 for quota, 413 for fit, 503 only for a failed dependency. Never silently use a model the owner did not pick in this case. | `routing.pick_refusal` (§4.4). |
 | E3 | **Changed from the recommendation.** When a turn's required index (an outward floor, the frontier rule, a high D) exceeds every selected model, the route **escalates** to the model the router would choose without the pick (the cheapest capable by normal routing, within the hard rules), at conversation open or fork. Recorded (`route pick escalated: …` rule on the routes row, Tasks label) and told to the client in a short notice, as `sensitive_notice` does. Escalation is about capability; exhaustion of capable selected models still refuses per E2. | `routing.pick_shortfall` + the escalation in `routing.choose`, `routing.pick_notice`, `Handler._pick_escalation_notice` (§4.3). |
 | E4 | Default. A selected Claude model may run on the API credit lane. | The lane's pairs of a selected model stay in the allowlist (§4.1); not in an escalation (§4.3). |
