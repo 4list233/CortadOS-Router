@@ -168,7 +168,15 @@ class SubscriptionProof(unittest.TestCase):
     def test_banner_tier_passes(self):
         self.assertEqual(iso.check_subscription(self.BANNER, self.USAGE), "AI Pro")
         self.assertEqual(iso.check_subscription("a@b.co (Google AI Ultra)"), "AI Ultra")
-        self.assertEqual(iso.check_subscription("a@b.co\n(Google AI Pro)"), "AI Pro")       # wrapped line
+        self.assertEqual(iso.check_subscription("a@b.co \t(Google AI Pro)\r\n"), "AI Pro")  # CRLF after the tier
+
+    def test_tier_must_sit_on_the_account_line(self):
+        for banner in ("a@b.co\n(Google AI Pro)", "a@b.co\n\n(Google AI Pro)", "a@b.co\r\n(Google AI Pro)",
+                       "a@b.co\r\n\r\n(Google AI Pro)\r\n", "a@b.co" + " " * 80 + "\n" + " " * 80 + "(Google AI Pro)",
+                       "a@b.co (Google\nAI Pro)", "a@b.co (Google AI\r\nPro)"):
+            with self.subTest(banner=banner), self.assertRaisesRegex(iso.SubscriptionUnproven, "no personal") as cm:
+                iso.check_subscription(banner, self.USAGE)
+            self.assertNotIn("a@b.co", str(cm.exception))
 
     def test_tier_is_read_from_the_banner_only(self):
         with self.assertRaisesRegex(iso.SubscriptionUnproven, "no personal"):

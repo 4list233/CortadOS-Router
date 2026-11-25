@@ -439,8 +439,9 @@ def check_dotenv(home: str | os.PathLike, workdir: str | os.PathLike) -> None:
 TIER_PATTERN_CONFIRMED = True
 # The banner's account line, after the scrub: `<account> (Google AI Pro)`. Personal Google AI subscription tiers only;
 # Ultra is a personal tier too (same login, same billing path). Any other parenthesised text (a free / enterprise tier, no
-# tier at all) does not match and refuses.
-TIER_PATTERN = re.compile(r"<account>\s*\(\s*Google\s+AI\s+(Pro|Ultra)\s*\)", re.I)
+# tier at all) does not match and refuses. Horizontal whitespace only (`[ \t]`, never `\s`, which matches newlines): the tier
+# must sit on the account line itself; a tier on a later line, LF or CRLF, is not this account's tier and refuses.
+TIER_PATTERN = re.compile(r"<account>[ \t]*\([ \t]*Google[ \t]+AI[ \t]+(Pro|Ultra)[ \t]*\)", re.I)
 # Any of these on agy's screen means the session bills outside a personal subscription: refused even with a tier shown.
 NON_SUBSCRIPTION = re.compile(
     r"\bapi[\s_-]?key\b|\bvertex\b|\benterprise\b|pay[\s-]*as[\s-]*you[\s-]*go|application default credentials"
