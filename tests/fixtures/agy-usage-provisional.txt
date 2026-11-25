@@ -1,0 +1,16 @@
+# provisional fixture (#144 PR A): written from the screen format the 2026-10 probe parsed, with the Gemini 4 group
+# names Google's plans page gives. Not captured from agy 1.5.16 yet; replace it with the scrubbed real /usage screen.
+Antigravity CLI 1.5.16
+Model quota usage
+GEMINI MODELS
+Models within this group: Gemini 4 Neon, Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, Gemini 3.8 Flash
+Weekly Limit Remaining [ █████████  ] 87.50%
+Refreshes in 4d 6h 12m
+Five Hour Limit Remaining [ ███████    ] 64.00%
+Refreshes in 2h 5m
+THIRD-PARTY MODELS
+Models within this group: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B
+Weekly Limit Remaining [ ██████████ ] 100.00%
+Quota available
+Five Hour Limit Remaining [ ██████████ ] 100.00%
+Quota available

@@ -54,13 +54,13 @@ Candidate order per band (`canary-lane-order.json`, authority G153/G154/G155.2):
 | band | 1st | 2nd |
 |---|---|---|
 | R0 | local `qwen3-14b-nothink` (Forest 2026-09-19: the 8B hallucinates; was `qwen3:8b` in 2.0) | — |
-| R1 | cursor `latest-grok` | antigravity `Gemini 3.7 Flash (Medium)` |
+| R1 | cursor `latest-grok` | — (antigravity `Gemini 3.7 Flash (Medium)` removed 2026-11-24, #144: gone from `agy models`; replacement is a band ruling, docs/AGY-LANE.md) |
 | R2 | claude `claude-sonnet-5` | codex `gpt-5.6-terra` |
 | R3 | claude `claude-opus-5` | codex `gpt-5.6-sol` |
 | R4 | claude `claude-fable-5-1` | codex `gpt-6-astra` (Forest 2026-09-19: R4 may now be the GPT ceiling as well as Fable; 2.0 had Fable 5 only and no substitute) |
 
-Full lane registry: local (`qwen3:8b`), cursor (`latest-grok`, `auto`), antigravity (`Gemini 3.7 Flash (Medium)`,
-`Gemini 3.1 Pro (High)`), claude (haiku-4-5 / sonnet-5 / opus-5 / fable-5), codex (`gpt-5.3-codex-spark`, `gpt-5.6-luna`,
+Full lane registry: local (`qwen3:8b`), cursor (`latest-grok`, `auto`), antigravity (quota only, not routed: ceiling 0; see
+docs/AGY-LANE.md), claude (haiku-4-5 / sonnet-5 / opus-5 / fable-5), codex (`gpt-5.3-codex-spark`, `gpt-5.6-luna`,
 `gpt-5.6-terra`, `gpt-5.6-sol`). No DeepSeek or Copilot lane exists.
 
 ### The one real measurement (BATTERY 2026-09-02, 77 live calls, Cursor excluded: keychain)
@@ -234,7 +234,7 @@ Forest's ruling, paraphrased: budget is not money but the percentage of the subs
 | claude | `claude` → `/usage` | "Current session N% used · Resets 12pm", "Current week (all models) N% used · Resets Sep 21 at 3pm" (+ per-model weeks when shown) | 5 h, 7 d |
 | codex | `codex` → `/status` | "Weekly limit: N% left (resets 11:35 on 23 Sep)" (+ 5h limit when shown); answers "run /status again" once, so one retry | 5 h, 7 d |
 | cursor | `cursor-agent` → `/usage` | "Included N% used", "Auto N%", "API N%", "Resets Oct 10" | month |
-| antigravity | `agy` → `/usage` | per model group: Weekly / Five Hour "Limit Remaining N%", "Refreshes in 35h 32m". Our lane = Gemini group; a separate **Claude + GPT group** exists on the plan, untouched | 5 h, 7 d |
+| antigravity | configured `agy` (absolute, `--agy-bin`) → `/usage`, deny-all, allowlisted env (docs/AGY-LANE.md) | per model group: Weekly / Five Hour "Limit Remaining N%", "Refreshes in 35h 32m". Our lane = the shared Gemini group; a separate **third-party group** (Claude Opus/Sonnet 5.5, GPT-OSS 120B) exists on the plan, untouched. Known failures are named: not configured, not installed, could not start, not logged in, first-run setup pending | 5 h, 7 d |
 | local | `vm_stat` + `ollama ps` | free memory vs resident model (2.0 RAM gate ×1.5 when cold) | none |
 
 Every window becomes the same record: `used_pct`, `elapsed_pct`, `projected_pct_at_reset = used / elapsed`, `headroom_pct`,
@@ -268,20 +268,21 @@ draws on (the lane's general windows + its own pool). `scarcity.pool_for(lane, m
 | claude | 5-hour session, week (all models) | `fable` = "Current week (Fable)" (any other per-model week the screen shows becomes a pool by name) | Fable 5.1 ← `fable`; Opus/Sonnet/Haiku ← general only |
 | codex | week (+5-hour when shown) | any `<model> limit:` line on `/status` becomes a pool | today the screen shows only the general week: no separately limited model (no Spark) on this account; models: gpt-6-astra, gpt-reserve, gpt-5.6-sol/terra/luna, gpt-5.5 |
 | cursor | none | `cursor-models` (screen line "Auto": Cursor Grok, Grok, Composer, Auto) · `other-models` (screen line "API": Claude, GPT, Gemini, Kimi, GLM, Muse Spark) | overflow of `cursor-models` spills into `other-models`, so a spent first pool inherits the second's score; "Included" is the blend, info only |
-| antigravity | none | `gemini` · `claude-gpt` (Claude Sonnet/Opus 4.6, GPT-OSS 120B) | lane default = `gemini` |
+| antigravity | none | `gemini` (Gemini 4 Neon/Carbon/Argon/Hydrogen, Orchestrators, 3.8 Flash) · `claude-gpt` (Claude Opus/Sonnet 5.5, GPT-OSS 120B) | lane default = `gemini`; a model's pool is looked up in `inventory.antigravity`, an unlisted model has none (#144) |
 
 Claude's per-model weeks load from a vendor panel that rate-limits ("r to retry"): the probe presses `r` twice at most, and when the panel
 stays closed the last per-model reading is carried (marked stale) until its own reset passes. 2026-09-21 it was seeded once from Forest's
 claude.ai screenshot (Fable 95%, resets 15:00).
 
 **Model inventory** (`routing-table.json` v3 → `inventory`, full id lists in `tables/inventory/`, refreshed by `bin/refresh-inventory.sh`):
-claude 4 · codex 7 · cursor 231 ids in about 50 families · antigravity 14 · local 7. Listing a model does not place it in a band.
+claude 4 · codex 7 · cursor 231 ids in about 50 families · antigravity 27 (agy 1.5.16, 2026-11-24) · local 7. Listing a model does not place it in a band.
 Placed today, as same-model fallbacks on a second subscription only (no invented tiers): R2 `cursor/claude-sonnet-5-thinking-high`,
 `cursor/gpt-5.6-terra-medium`; R3 `cursor/claude-opus-5-thinking-high`, `cursor/gpt-5.6-sol-high` (all pool `other-models`).
 The Cursor lane now accepts Grok/auto **or an exact id Cursor lists** (`policy_cursor.allow_other_models`; supersedes the 2.0 Grok-only rule
 for this system). Cursor's Fable ids are flagged NO ZDR by Cursor: refused by the runner and the table validator.
-Unplaced and waiting for a benchmark or a ruling: Composer 2.5, Grok 4.7, Gemini 3.8/3.1 Pro (Cursor and Antigravity), Kimi K3, GLM 5.2,
-Muse Spark 1.3, GPT-5.6 Luna, GPT-5.5, Antigravity's Claude 4.6 + GPT-OSS group, local qwen3.5:27b.
+Unplaced and waiting for a benchmark or a ruling: Composer 2.5, Grok 4.7, Gemini 3.8/3.1 Pro (Cursor), Gemini 4 Neon / Carbon / Argon /
+Hydrogen and 3.8 Flash (Antigravity), Kimi K3, GLM 5.2, Muse Spark 1.3, GPT-5.6 Luna, GPT-5.5, Antigravity's Claude 5.5 + GPT-OSS group,
+local qwen3.5:27b.
 
 Still open: unit cost per lane and model (Δ% used / Δ ledger tokens from the history series) so the router can price a task before running it;
 policy numbers are first guesses (Q-scarcity below); live mode must also re-read a lane right after any refusal.

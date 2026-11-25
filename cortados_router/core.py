@@ -860,6 +860,8 @@ def subscription_readings() -> dict[str, dict[str, Any]]:
             continue
         _, failed = sc.reading_freshness(lane, v)
         out[lane] = {"fetched_at": v.get("fetched_at"), "failed": failed,
+                     # #144: the known cause in words ("not installed", "not logged in", "not configured"), else None
+                     "state": sc.lane_state(v),
                      "windows": [{k: w.get(k) for k in ("window", "pool", "used_pct", "headroom_pct", "reset_epoch", "stale")}
                                  for w in (v.get("windows") or []) if isinstance(w, dict)]}
         if "config_dir" in v:

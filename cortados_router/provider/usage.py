@@ -119,6 +119,11 @@ def _num(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
+def _lane_state(v: dict[str, Any]) -> str | None:
+    from cortados_router import scarcity
+    return scarcity.lane_state(v)
+
+
 def _one_lane(lane: str, v: dict[str, Any], now: float, freshness: Callable | None,
               configured: dict[str, str | None] | None = None) -> dict[str, Any]:
     fetched = float(v.get("fetched_at") or 0)
@@ -157,6 +162,9 @@ def _one_lane(lane: str, v: dict[str, Any], now: float, freshness: Callable | No
              "left_pct": min(lefts) if lefts else None, "windows": wins, "pools": pools,
              "sample_age_s": round(now - fetched, 1) if fetched else None,
              "stale": not fresh or failed,
+             # #144: the lane's known state in words ("not installed", "not logged in", "not configured"); None when
+             # the cause is unknown or the lane is healthy. scarcity's own fixed sentences, never screen text.
+             "state": _lane_state(v),
              # error_kind is scarcity's sanitised classification; the raw error can carry vendor screen text
              "error": err}
     # A positional Claude lane key (claude#<i>) can point at a different login after accounts.json is reordered: core's one
@@ -638,7 +646,7 @@ _WINDOW = _Obj({"window": _text, "pool": _text, "used_pct": _number, "headroom_p
 _LANE = _Obj({"lane": _label, "label": _label, "account": _label, "left_pct": _number,
               "windows": _List(_WINDOW, WINDOWS_MAX, "windows_truncated"),
               "pools": _Map(_text, _number, POOLS_MAX, "pools_truncated", merge=_min),
-              "sample_age_s": _number, "stale": _bool, "error": _label,
+              "sample_age_s": _number, "stale": _bool, "error": _label, "state": _label,
               "shared_with": _List(_label, SHARED_MAX, "shared_with_truncated")}, source=("scarcity", "lane"))
 _HW_CARD = _Obj({**{k: _Hw(_text if k in ("host", "os", "chip") else _number) for k in _HW_KEYS},
                  "load_avg": _Hw(_List(_number, LOAD_AVG_LEN, "load_avg_truncated")),

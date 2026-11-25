@@ -1740,6 +1740,7 @@ def subscriptions_section(u: dict[str, Any], now: float,
                          "resets_in_h": hours if _num(hours) else None, "stale": bool(w.get("stale"))})
         lanes.append({"lane": l.get("lane"), "label": l.get("label"), "account": l.get("account"),
                       "left_pct": l.get("left_pct"), "stale": bool(l.get("stale")), "error": l.get("error"),
+                      "state": l.get("state"),
                       "sample_age_s": l.get("sample_age_s"), "shared_with": l.get("shared_with") or [],
                       "pools": l.get("pools") or {}, "windows": wins})
     lowest = None

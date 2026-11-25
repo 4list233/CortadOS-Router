@@ -1,0 +1,30 @@
+Model quota usage
+Plan: Google AI Pro
+
+GEMINI MODELS
+Models within this group: Gemini 4 Neon, Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, Gemini 3.8 Flash
+
+Weekly Limit Remaining [ █████████  ] 87.50%
+Refreshes in 4d 6h 12m
+
+Five Hour Limit Remaining [ ███████    ] 64.00%
+Refreshes in 2h 5m
+
+
+CLAUDE AND GPT MODELS
+Models within this group: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B
+
+Weekly Limit Remaining [ ██████████ ] 100.00%
+Quota available
+
+Five Hour Limit Remaining [ ██████     ] 58.00%
+Refreshes in 3h 10m
+
+
+Quota is shared by every model within a group.
+Weekly and five-hour windows refresh on their own schedules.
+
+
+
+Use /model to switch models.
+Press Esc to close.

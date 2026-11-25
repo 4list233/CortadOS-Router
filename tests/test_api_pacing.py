@@ -41,7 +41,8 @@ class PacingBase(Base):
 
 class Table(unittest.TestCase):
     def test_v22_ships_the_flag_on(self):
-        self.assertEqual(_TABLE["version"], 22)
+        # v22 introduced the flag; later tables (v23: #144 PR A) keep it, so pin the floor, not the exact number
+        self.assertGreaterEqual(_TABLE["version"], 22)
         self.assertIs(_TABLE["selection"]["api_pacing"]["enabled"], True)
         core.validate_table(_TABLE)
 

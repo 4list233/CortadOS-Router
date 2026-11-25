@@ -366,7 +366,7 @@ class UsageScreens(unittest.TestCase):
         g = self.sc.parse_agy_usage("GEMINI MODELS Models within this group: Gemini Flash Weekly Limit Remaining [ ███ ] 99.03% Refreshes in 35h 32m Five Hour Limit Remaining [ ██ ] 98.02% Refreshes in 4h 25m "
                                     "CLAUDE AND GPT MODELS Models within this group: Claude Opus Weekly Limit Remaining [ ███ ] 100.00% Quota available Five Hour Limit Remaining [ ███ ] 100.00% Quota available")
         self.assertEqual(sorted(g), ["claude and gpt models", "gemini models"]); self.assertEqual(g["gemini models"][0]["used_pct"], 1.0)
-        self.assertEqual(self.sc.pool_for("antigravity", "Gemini 3.7 Flash (Medium)", []), "gemini"); self.assertEqual(self.sc.pool_for("antigravity", "claude-opus-5", []), "claude-gpt"); self.assertEqual(g["gemini models"][0]["resets_in_h"], 35.5)
+        self.assertEqual(self.sc.pool_for("antigravity", "Gemini 4 Neon (High)", []), "gemini"); self.assertEqual(self.sc.pool_for("antigravity", "claude-opus-5-5-high", []), "claude-gpt"); self.assertEqual(g["gemini models"][0]["resets_in_h"], 35.5)
 
 
 if __name__ == "__main__":

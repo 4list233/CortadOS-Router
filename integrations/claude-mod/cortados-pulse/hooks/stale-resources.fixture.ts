@@ -17,6 +17,7 @@ export default {
     "codex": {
       "fetched_at": 1699974800,
       "failed": true,
+      "state": null,
       "windows": [
         {
           "window": "week",

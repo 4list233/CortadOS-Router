@@ -25,7 +25,7 @@
     "5h",
     "7d"
    ],
-   "usage_source": "agy /usage (Gemini group; a separate Claude+GPT group exists, unused)",
+   "usage_source": "agy /usage (pty, deny-all, allowlisted env; #144): the shared Gemini group and the third-party group (Claude Opus/Sonnet 5.5, GPT-OSS 120B), each 5-hour + week. Sampled only when an agy binary is configured (provider --agy-bin, or CORTADOS_AGY_BIN)",
    "unit_cost_pct_per_mtok": null
   },
   "cursor": {

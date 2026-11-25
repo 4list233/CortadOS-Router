@@ -228,6 +228,18 @@ test('poll redacts all response strings and keys before storage and rendering', 
     codex: { ok: false, why: '***' } }, readings: { error: '***' }, devices: { status: 'unavailable', error: '***' } })
 })
 
+test('a known lane state is said in words, never as FAILED (#144)', () => {
+  const now = 1700000000
+  expect(laneLines('antigravity', {}, { fetched_at: now - 60, failed: true, state: 'not installed', windows: [] }, now))
+    .toEqual(['antigravity: quota unknown · not installed · sample 60 s old'])
+  expect(laneLines('antigravity', {}, { failed: true, state: 'not logged in', windows: [] }, now))
+    .toEqual(['antigravity: quota unknown · not logged in'])
+  expect(laneLines('antigravity', {}, { fetched_at: null, failed: false, state: 'not configured', windows: [] }, now))
+    .toEqual(['antigravity: quota unknown · not configured'])
+  expect(laneLines('codex', {}, { failed: true, state: null, windows: [] }, now))
+    .toEqual(['codex: quota unknown · last sample FAILED'])
+})
+
 test('lane samples retain age, failure, stale windows and spent reasons', () => {
   const now = 1700000000
   expect(laneLines('codex', { ok: true, scarcity: 0.05 }, { fetched_at: now - 4000, failed: true, windows: [] }, now))

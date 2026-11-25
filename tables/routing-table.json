@@ -1,8 +1,8 @@
 {
  "_doc": "MUTABLE routing table for Cortados. Edit freely: the router reloads this file when its mtime changes, no restart. Models, lanes and order WILL change; the six features and the band conditions come from the 2.0 scale (scale-2.0-reference.json). Validation on load: unknown lane/provider, a Fable/ceiling entry outside R4, or a non-Grok model on the cursor lane = file rejected, last good table kept.",
- "version": 22,
+ "version": 23,
  "updated": "2026-11-24",
- "updated_by": "claude (owner decisions 2026-11-24, scarcity v2 §9 step 4: the API credit grant is paced to its stop line by its percent used against its pace to expiry, selection.api_pacing; the 3-day expiry preference retired while it is on; everything else as v21)",
+ "updated_by": "claude (v23 = v22 + #144 PR A. v22: owner decisions 2026-11-24, scarcity v2 §9 step 4: the API credit grant is paced to its stop line by its percent used against its pace to expiry, selection.api_pacing; the 3-day expiry preference retired while it is on. v21 (#143) kept: owner decisions 2026-11-23, API credit lane competes as a scored candidate, R4/best knots at D 9/10, ceiling_underuse from D 8, ceiling_work requires a frontier model for hard planning/research/code, Fable pool size from the all-models week, Sol 6.1 an R3 reference, underused pools split in proportion to the quota each would lose. #144 PR A: R1's dead antigravity candidate Gemini 3.7 Flash (Medium) removed (no longer listed by agy 1.5.16) and inventory.antigravity refreshed from agy models on the Air 2026-11-24; no agy model placed in a band, ceiling_tokens.antigravity stays 0)",
  "features": [
   "steps",
   "ambiguity",
@@ -225,13 +225,6 @@
     "model": "cursor-grok-4.6-medium-fast",
     "tier": "W-fast",
     "pool": "cursor-models"
-   },
-   {
-    "lane": "antigravity",
-    "provider": "agy-cli",
-    "model": "Gemini 3.7 Flash (Medium)",
-    "tier": "W-fast",
-    "pool": "gemini"
    },
    {
     "lane": "claude",
@@ -457,13 +450,82 @@
   },
   "antigravity": {
    "plan": "Google AI Pro",
-   "source": "agy models",
+   "source": "agy models (agy 1.5.16 on the Air, 2026-11-24; tables/inventory/agy.txt)",
    "pools": {
-    "gemini": "Gemini Flash + Pro: 5-hour + week",
-    "claude-gpt": "Claude Sonnet/Opus 4.6 + GPT-OSS: separate 5-hour + week, untouched so far"
+    "gemini": "the shared Gemini quota: Gemini 4 Neon / Carbon / Argon / Hydrogen, the Orchestrator pairings and Gemini 3.8 Flash (until 2026-11-30): 5-hour + week",
+    "claude-gpt": "Pro's paid-tier third-party models: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B. A quota pool separate from the Gemini one and from the claude lane's own subscription (#144: a later routing PR may use it for Opus / Sonnet, [ESCALATE])"
    },
+   "note": "Inventory only (#144 PR A): no Gemini 4 model is placed in a band, and ceiling_tokens.antigravity stays 0 (tables/budgets.json containment).",
    "models": {
     "gemini": [
+     {
+      "id": "gemini-4-neon-high",
+      "name": "Gemini 4 Neon (High)"
+     },
+     {
+      "id": "gemini-4-neon-xhigh",
+      "name": "Gemini 4 Neon (XHigh)"
+     },
+     {
+      "id": "gemini-4-neon-medium",
+      "name": "Gemini 4 Neon (Medium)"
+     },
+     {
+      "id": "gemini-4-neon-low",
+      "name": "Gemini 4 Neon (Low)"
+     },
+     {
+      "id": "gemini-4-carbon-medium",
+      "name": "Gemini 4 Carbon (Medium)"
+     },
+     {
+      "id": "gemini-4-carbon-high",
+      "name": "Gemini 4 Carbon (High)"
+     },
+     {
+      "id": "gemini-4-carbon-low",
+      "name": "Gemini 4 Carbon (Low)"
+     },
+     {
+      "id": "gemini-4-argon-medium",
+      "name": "Gemini 4 Argon (Medium)"
+     },
+     {
+      "id": "gemini-4-argon-high",
+      "name": "Gemini 4 Argon (High)"
+     },
+     {
+      "id": "gemini-4-argon-low",
+      "name": "Gemini 4 Argon (Low)"
+     },
+     {
+      "id": "gemini-4-hydrogen-high",
+      "name": "Gemini 4 Hydrogen (High)"
+     },
+     {
+      "id": "gemini-4-hydrogen-xhigh",
+      "name": "Gemini 4 Hydrogen (XHigh)"
+     },
+     {
+      "id": "gemini-4-hydrogen-medium",
+      "name": "Gemini 4 Hydrogen (Medium)"
+     },
+     {
+      "id": "gemini-4-hydrogen-low",
+      "name": "Gemini 4 Hydrogen (Low)"
+     },
+     {
+      "id": "gemini-pro-orchestrator-neon",
+      "name": "Orchestrator (Neon)"
+     },
+     {
+      "id": "gemini-pro-orchestrator",
+      "name": "Orchestrator (Carbon)"
+     },
+     {
+      "id": "gemini-pro-orchestrator-argon",
+      "name": "Orchestrator (Argon)"
+     },
      {
       "id": "gemini-3.8-flash-high",
       "name": "Gemini 3.8 Flash (High)"
@@ -475,48 +537,32 @@
      {
       "id": "gemini-3.8-flash-low",
       "name": "Gemini 3.8 Flash (Low)"
-     },
-     {
-      "id": "gemini-3.7-flash-high",
-      "name": "Gemini 3.7 Flash (High)"
-     },
-     {
-      "id": "gemini-3.7-flash-medium",
-      "name": "Gemini 3.7 Flash (Medium)"
-     },
-     {
-      "id": "gemini-3.7-flash-low",
-      "name": "Gemini 3.7 Flash (Low)"
-     },
-     {
-      "id": "gemini-3.6-flash-high",
-      "name": "Gemini 3.6 Flash (High)"
-     },
-     {
-      "id": "gemini-3.6-flash-medium",
-      "name": "Gemini 3.6 Flash (Medium)"
-     },
-     {
-      "id": "gemini-3.6-flash-low",
-      "name": "Gemini 3.6 Flash (Low)"
-     },
-     {
-      "id": "gemini-3.1-pro-high",
-      "name": "Gemini 3.1 Pro (High)"
-     },
-     {
-      "id": "gemini-3.1-pro-low",
-      "name": "Gemini 3.1 Pro (Low)"
      }
     ],
     "claude-gpt": [
      {
-      "id": "claude-sonnet-4-6",
-      "name": "Claude Sonnet 4.6 (Thinking)"
+      "id": "claude-opus-5-5-low",
+      "name": "Claude Opus 5.5 (Low)"
      },
      {
-      "id": "claude-opus-4-6-thinking",
-      "name": "Claude Opus 4.6 (Thinking)"
+      "id": "claude-opus-5-5-medium",
+      "name": "Claude Opus 5.5 (Medium)"
+     },
+     {
+      "id": "claude-opus-5-5-high",
+      "name": "Claude Opus 5.5 (High)"
+     },
+     {
+      "id": "claude-sonnet-5-5-low",
+      "name": "Claude Sonnet 5.5 (Low)"
+     },
+     {
+      "id": "claude-sonnet-5-5-medium",
+      "name": "Claude Sonnet 5.5 (Medium)"
+     },
+     {
+      "id": "claude-sonnet-5-5-high",
+      "name": "Claude Sonnet 5.5 (High)"
      },
      {
       "id": "gpt-oss-120b-medium",

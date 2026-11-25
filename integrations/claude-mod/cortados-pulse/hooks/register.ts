@@ -559,7 +559,9 @@ export function laneLines(lane: string, health: PulseLaneHealth | null | undefin
   if (known) bits.push('scarcity ' + health.scarcity!.toFixed(2))
   if (typeof health.expiring_pct === 'number' && health.expiring_pct > 0) bits.push('expiring ' + Math.round(health.expiring_pct) + '%')
   if (reading) {
-    if (reading.failed) bits.push('last sample FAILED')
+    // #144: a known cause is said in words ("not installed", "not logged in", "not configured"), never as FAILED
+    if (typeof reading.state === 'string' && reading.state) bits.push(reading.state)
+    else if (reading.failed) bits.push('last sample FAILED')
     if (typeof reading.fetched_at === 'number') {
       const s = nowS - reading.fetched_at
       bits.push('sample ' + age(s) + ' old' + (s > STALE_AFTER_S ? ' (stale)' : ''))
