@@ -115,6 +115,8 @@ def _json(value: Any, kind: type) -> tuple[Any, str]:
 # view shows "band window R2" / "band window R2 overridden". The difficulty step ("band window: difficulty …") has its
 # own fixed label.
 _WINDOW_RULE = re.compile(r"band window (R[0-4](?:-R[0-4])?)( overridden)?[: ]")
+# A route pick rule names the pick's label (band names and table ids, routing.Pick) before its colon.
+_PICK_RULE = re.compile(r"route pick (?:any|local|R[0-4](?:-R[0-4])?)(?::(?:\*|[a-z0-9._+-]{1,600}))?(?: overridden)?: ")
 
 
 def _rule_label(rule: Any) -> str | None:
@@ -125,6 +127,16 @@ def _rule_label(rule: Any) -> str | None:
         return "band window " + m.group(1) + (" overridden" if m.group(2) else "")
     if rule.startswith("band window: difficulty "):
         return "band window difficulty cap"
+    if rule.startswith("route pick"):
+        # routing.choose's route pick rules (docs/ORCHESTRATOR-ROUTE-PICKER.md): fixed labels only; the pick's own
+        # label and the reasons stay on the row.
+        if rule.startswith("route pick escalated: "):
+            return "route pick escalated"
+        if rule.startswith("route pick: local cost routes not taken"):
+            return "route pick: local cost route not taken"
+        if _PICK_RULE.match(rule):
+            return "route pick overridden" if rule.endswith(" overridden: sensitive") else "route pick"
+        return None
     for prefix, label in _RULES:
         if rule.startswith(prefix):
             return label

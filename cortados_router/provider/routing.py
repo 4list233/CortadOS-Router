@@ -151,6 +151,381 @@ def band_window(header: Any, model: Any) -> tuple[tuple[str, str] | None, str | 
     return (found[0] if found else None), None
 
 
+# ------------------------------------------------------------------------------------------------ the route pick
+# The orchestrator route picker (docs/ORCHESTRATOR-ROUTE-PICKER.md, owner decisions §8 of 2026-11-24): a band window
+# plus a set of models the main loop may run on. Spelled `<window>[:<models>]` after `cortados@` in the main loop's
+# model name, or as the x-cortados-pick header (both wires); `<models>` is `*` (every served model that clears the
+# window's reference, resolved when the conversation opens) or model names joined by `+`. `local[:<models>]` parses and
+# validates (E8) but is refused until the `orchestrator` boundary profile exists (step 8). A window-only pick (`R3`) is
+# exactly today's band window: same parser, same label, same identity.
+# Separators: `:` and `+` reach the provider unchanged on the main loop's --model, and a subagent still sends plain
+# `cortados` (spike of 2026-11-24 with Claude Code 2.1.330, doc §3.1 "Spike"), so no fallback spelling is needed.
+# Same trust as the band window: only an owner-token request reaches routing.
+PICK_HEADER = "x-cortados-pick"
+PICK_MAX_MODELS = 8                 # a picker list, not a catalogue: beyond this the person means `*`
+_PICK_MODEL = re.compile(r"[A-Za-z0-9._-]{1,64}")
+# E8 (owner 2026-11-24): a local orchestrator is opt-in under the `orchestrator` boundary profile, built after this
+# step. Until then a local pick is parsed and validated, and refused with this text (a 400: retrying cannot help).
+LOCAL_PICKS_REFUSED = ("local orchestrator picks are not enabled yet: they wait for the `orchestrator` boundary profile "
+                       "(plan and delegate only; docs/ORCHESTRATOR-ROUTE-PICKER.md step 8). Pin one local model with "
+                       "sub/<model>, or pick cloud models")
+
+
+class PickError(ValueError):
+    """A route pick that cannot be served as written: the client's to fix (400)."""
+
+
+class Pick:
+    """A validated route pick. `window` (lo, hi) or None (`any`); `models` the served model ids (cloud) or local pin ids
+    (local) in the order given, deduplicated; `star` for `*`; `local` for a local pick; `label` the canonical spelling,
+    built only from band names and table/pin ids (never client text), which is the conversation's identity:
+    `R3` (a window-only pick keeps today's window label), `R3:claude-opus-5-5+gpt-6.1-sol` (ids sorted), `R4:*`,
+    `any:gpt-6.1-sol`, `local`, `local:<ids>`."""
+
+    __slots__ = ("window", "models", "star", "local", "label")
+
+    def __init__(self, window, models=(), star=False, local=False, label=""):
+        self.window, self.models, self.star, self.local, self.label = (
+            tuple(window) if window else None, tuple(models), bool(star), bool(local), label)
+
+    @property
+    def restricts(self) -> bool:
+        """More than a window: a model set (explicit, `*`) or a local pick."""
+        return bool(self.models or self.star or self.local)
+
+    def __eq__(self, other):
+        return isinstance(other, Pick) and self.label == other.label
+
+    def __hash__(self):
+        return hash(self.label)
+
+    def __repr__(self):
+        return f"Pick({self.label!r})"
+
+
+def parse_pick(text: Any) -> tuple[tuple[str, str] | None, str, tuple[str, ...]]:
+    """The grammar of a pick (doc §3.2), no resolution: (window, kind, names), kind one of `window`, `set`, `star`,
+    `local`. PickError for anything else."""
+    from cortados_router import core
+    raw = text.strip() if isinstance(text, str) else ""
+    if not raw or len(raw) > PIN_NAME_MAX or not raw.isprintable():
+        raise PickError(f"{wire.log_safe(raw[:16])} is not a band window or route pick (at most {PIN_NAME_MAX} "
+                        "printable characters)")
+    head, sep, tail = raw.partition(":")
+    if head.strip().casefold() == "local":
+        if not sep:
+            return None, "local", ()
+        if tail.strip() == "*":
+            raise PickError("local:* is not a pick: name the local models (local:<model>[+<model>…]) or use `local`")
+        return None, "local", _pick_names(tail)
+    try:
+        window = core.parse_band_window(head)
+    except ValueError:
+        raise PickError(f"{wire.log_safe(head[:16])} is not a band window (a band R0–R4, a range like R1-R2, or "
+                        "`any`), so this is no route pick either") from None
+    if not sep:
+        return window, "window", ()
+    if tail.strip() == "*":
+        if window is None:
+            raise PickError("any:* is every model with no window: that is plain `cortados`")
+        return window, "star", ()
+    return window, "set", _pick_names(tail)
+
+
+def _pick_names(tail: str) -> tuple[str, ...]:
+    names = tuple(n.strip() for n in tail.split("+"))
+    if len(names) > PICK_MAX_MODELS:
+        raise PickError(f"a route pick names at most {PICK_MAX_MODELS} models ({len(names)} given); use `*` for every "
+                        "capable model of the band")
+    for n in names:
+        if not _PICK_MODEL.fullmatch(n):
+            raise PickError(f"{wire.log_safe(n[:16]) or 'an empty name'} is not a model name (letters, digits, `.`, "
+                            "`-`, `_`; models joined by `+`)")
+    return names
+
+
+def _pick_cloud_model(core, name: str) -> str:
+    """A cloud pick's model name as the served model id (resolve_pin: exact id or reach id, release date optional, a
+    SUB_ALIASES key, then the friendly words), or PickError."""
+    served = [m for _, m in pinnable_models(core)]
+    try:
+        got = resolve_pin(core, name)
+    except AmbiguousPin as exc:
+        raise PickError(f"{name} is ambiguous: it could be {', '.join(exc.candidates)}; name one of them") from None
+    if got in served:
+        return got
+    if got and _is_local(got):
+        raise PickError(f"{name} is a local model: a pick is either cloud models or local models (mixed picks are "
+                        "refused, E6)")
+    raise PickError(f"{name} is not a model this endpoint serves; name one of: {', '.join(served)}")
+
+
+def _pick_local_model(core, name: str) -> str:
+    """A local pick's model name as its local pin id, or PickError (a broken local config is said as such)."""
+    try:
+        pins = local_pins(core)
+    except local_lane.LocalConfigError as exc:
+        raise PickError(misconfigured(name, exc)) from None
+    try:
+        got = resolve_pin(core, name)
+    except AmbiguousPin as exc:
+        raise PickError(f"{name} is ambiguous: it could be {', '.join(exc.candidates)}; name one of them") from None
+    ids = [local_lane.pin_id(m) for _, m in pins]
+    if got in ids:
+        return got
+    if got:
+        raise PickError(f"{name} is a cloud model: a pick is either cloud models or local models (mixed picks are "
+                        "refused, E6)")
+    raise PickError(f"{name} is not a local model of any configured node; name one of: {', '.join(ids) or 'none'}")
+
+
+def resolve_pick(core, text: Any) -> "Pick | None":
+    """A pick as written (after `cortados@`, or the header's value) resolved to a Pick, None for no pick (`any`).
+    PickError when it cannot be served as written."""
+    window, kind, names = parse_pick(text)
+    wlabel = core.band_window_label(*window) if window else None
+    if kind == "window":
+        return Pick(window, label=wlabel) if window else None
+    if kind == "star":
+        return Pick(window, star=True, label=f"{wlabel}:*")
+    resolve = _pick_local_model if kind == "local" else _pick_cloud_model
+    ids: list[str] = []
+    for n in names:
+        got = resolve(core, n)
+        if got not in ids:                      # `opus+claude-opus-5-5` is one model
+            ids.append(got)
+    if kind == "local":
+        return Pick(None, ids, local=True, label="local" + (":" + "+".join(sorted(ids)) if ids else ""))
+    return Pick(window, ids, label=f"{wlabel or 'any'}:{'+'.join(sorted(ids))}")
+
+
+def route_pick(core, header: Any, band_header: Any, model: Any) -> tuple["Pick | None", str | None]:
+    """(pick, error) of a request: from PICK_HEADER, BAND_HEADER and the body's model (`cortados@<pick>`). THE reading
+    of all three (the band window's band_window stays for its callers and reads the same window). (None, None) when none
+    names a pick or window (or `any`); an error string (a 400) for an invalid one, or for two sources that disagree:
+    the pick header and the model must name the same canonical pick, and a band header must name the pick's window."""
+    picks: list[Pick | None] = []
+    sources = []
+    raw = header.strip() if isinstance(header, str) else ""
+    if raw:
+        sources.append((PICK_HEADER, raw))
+    from_model = band_model_window(model)
+    if from_model is not None:
+        sources.append((f"model {BAND_MODEL_PREFIX}…", from_model))
+    for where, text in sources:
+        try:
+            picks.append(resolve_pick(core, text))
+        except PickError as exc:
+            return None, f"{where}: {exc}"
+    if len(picks) == 2 and picks[0] != picks[1]:
+        return None, f"{PICK_HEADER} and the model name ask for different route picks"
+    pick = picks[0] if picks else None
+    braw = band_header.strip() if isinstance(band_header, str) else ""
+    if braw:
+        try:
+            bw = core.parse_band_window(braw)
+        except ValueError:
+            return None, (f"{BAND_HEADER}: {wire.log_safe(braw[:16])} is not a band window "
+                          "(a band R0–R4, a range like R1-R2, or `any`)")
+        if not sources:
+            return (Pick(bw, label=core.band_window_label(*bw)) if bw else None), None
+        if bw != (pick.window if pick else None):
+            what = "model name" if from_model is not None and not raw else "route pick"
+            return None, f"{BAND_HEADER} and the {what} ask for different band windows"
+    return pick, None
+
+
+def pick_label(pick: "Pick | None") -> str | None:
+    """The conversation identity of a pick (its label), None for none."""
+    return pick.label if pick is not None else None
+
+
+def pick_star_models(core, window: tuple[str, str]) -> tuple[str, ...]:
+    """`<window>:*` resolved now: every served model whose general index clears the reference of the window's lower
+    band (R0: every served model, R0's requirement is 0), from model-scores.generated.json. A range `R2-R3:*` is every
+    model capable of its lower band; turns the set cannot meet escalate (E3)."""
+    ms = core.model_scores() or {}
+    refs = ms.get("reference_index") or {}
+    lo = window[0]
+    raw_ref = 0.0 if lo == "R0" else (refs.get(lo) or {}).get("general")
+    if not isinstance(raw_ref, (int, float)):
+        return ()                               # the scores cannot say: the caller refuses (a dependency, never a guess)
+    ref = float(raw_ref)
+    served = {model_key(m): m for _, m in pinnable_models(core)}
+    out = set()
+    for m in ms.get("models") or []:
+        if float((m.get("index") or {}).get("general", -1)) < ref:
+            continue
+        for r in m.get("reach") or []:
+            if model_key(r.get("model")) in served:
+                out.add(served[model_key(r["model"])])
+    return tuple(sorted(out))
+
+
+# The route key choose sets on a conversation a route pick escalated (E3): {"label", "reason" ("index" | "frontier"),
+# "required"}. The server reads it on the opening turn to lead the reply with pick_notice's short notice.
+PICK_ESCALATED_KEY = "pick_escalated"
+# What the client is told (pick_notice): fixed words around the pick's label (band names and table ids only, Pick)
+# and the routed model's id (a table id). The reason is one of these two categories, never free text.
+PICK_NOTICE_REASONS = {"index": "the turn needs a higher index than any selected model has",
+                       "frontier": "the turn needs a frontier model and none is selected"}
+PICK_NOTICE_PREFIX = "⚠ CortadOS: route pick "
+_PICK_LABEL_RE = re.compile(r"(?:any|local|R[0-4](?:-R[0-4])?)(?::(?:\*|[a-z0-9._-]{1,64}(?:\+[a-z0-9._-]{1,64}){0,7}))?")
+
+
+def pick_notice(escalated: Any, model: Any) -> dict[str, Any] | None:
+    """The leading text block of an escalated conversation's opening reply (E3), or None when `escalated` is not a
+    PICK_ESCALATED_KEY value this module wrote. Shown like sensitive_notice's: its own block, kept in history as sent."""
+    if not isinstance(escalated, dict):
+        return None
+    label, why = escalated.get("label"), escalated.get("reason")
+    if not isinstance(label, str) or not _PICK_LABEL_RE.fullmatch(label) or why not in PICK_NOTICE_REASONS:
+        return None
+    shown = model if isinstance(model, str) and re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", model) else "a stronger model"
+    return {"type": "text", "text": f"{PICK_NOTICE_PREFIX}{label} escalated: {PICK_NOTICE_REASONS[why]}, so this "
+                                    f"conversation runs on {shown}."}
+
+
+def _pair_lane(core, provider: str, model: str, row_of: dict, accounts: dict) -> dict[str, Any] | None:
+    """A served (provider, model) pair as a core candidate (lane, account, pool), as _excluded_route_usable builds it."""
+    if provider == API_PROVIDER:
+        return {"lane": getattr(core, "API_LANE", API_PROVIDER), "provider": provider, "model": model}
+    row = row_of.get((_base_provider(provider), model)) or {}
+    acct = accounts.get(provider) if _base_provider(provider) == "claude-cli" else None
+    lane = acct["lane"] if acct else row.get("lane")
+    if not lane:
+        return None
+    return {"lane": lane, "provider": provider, "model": model, **({"pool": row["pool"]} if row.get("pool") else {}),
+            **({k: acct[k] for k in ("account", "config_dir", "reserve")} if acct else {})}
+
+
+def _when(w: dict[str, Any]) -> tuple[float, str] | None:
+    epoch = w.get("reset_epoch")
+    if isinstance(epoch, (int, float)) and epoch > 0:
+        return float(epoch), time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(epoch))
+    at = w.get("resets_at")
+    return (float("inf"), str(at)[:40]) if at else None
+
+
+def pick_widen(pick: "Pick") -> str:
+    """The exact `/model` line(s) that widen a pick (E2's refusal and the launcher's hint)."""
+    from cortados_router import core
+    if pick.window is None:
+        return "`/model cortados` (free routing)"
+    w = core.band_window_label(*pick.window)
+    if pick.star:
+        return f"`/model cortados@{w}` (the band window)"
+    return f"`/model cortados@{w}:*` (any capable {w} model) or `/model cortados@{w}` (the band window)"
+
+
+def pick_refusal(core, pick: "Pick", pairs: list, r: dict[str, Any], body: dict[str, Any], *,
+                 claude_bin: str, codex_bin: str, min_left_pct: float | None, codex_home: str | None) -> dict[str, Any]:
+    """E2 (owner 2026-11-24, option A): every selected model could meet the turn but no selected route can take it now.
+    Refused, never moved to a model the owner did not pick: each route named with why it was skipped, the earliest
+    reset, and the exact widening line. 429 (quota_blocked) when every route is spent or under the client's floor (or
+    too large), 413 (fit_blocked) when every route is too large, 503 otherwise: a dependency failed (S1 degraded, a
+    binary or key missing, a reading that cannot be trusted)."""
+    label, widen = pick.label, pick_widen(pick)
+    if r.get("degraded"):
+        claude_only = all(_base_provider(p) in CLAUDE_PROVIDERS or p == API_PROVIDER for p, _m in pairs)
+        return {"router": execution_routing.ROUTER, "degraded": True, "pick_refused": True,
+                "error": f"route pick {label}: S1 is unavailable, and a degraded scorer never defaults to Claude; "
+                         + ("every selected model is a Claude model" if claude_only else
+                            "no selected Codex route survived (codex-cli missing from PATH, or its capacity spent)")
+                         + f". Retry once S1 is back, or widen: {widen}"}
+    try:
+        rows = [x for m in (core.model_scores() or {}).get("models", []) for x in m.get("reach", [])]
+        rows += [x for band in core.table()["candidates"].values() for x in band]
+        row_of: dict[tuple[str, str], dict[str, Any]] = {}
+        for x in rows:
+            row_of.setdefault((CLONED_PROVIDERS.get(x["provider"], x["provider"]), x["model"]), x)
+        accounts = {a["provider"]: a for a in core._vendor_accounts("claude", "claude", "claude-cli")}
+        health = core.lane_health()
+        readings = core.subscription_readings() if min_left_pct is not None else None
+    except Exception as exc:                       # the refusal must still be a refusal, never a crash
+        logger.warning("route pick %s: route states unreadable: %s", label, type(exc).__name__)
+        return {"router": execution_routing.ROUTER, "pick_refused": True,
+                "error": f"route pick {label}: no selected route can take this conversation now, and their states "
+                         f"could not be read; nothing was run on a model outside the pick. Widen it: {widen}"}
+    skipped = {(s.get("lane"), s.get("model")): s.get("why") for s in ((r.get("last_route") or {}).get("skipped") or [])}
+    check = _credentials(claude_bin, codex_bin)
+    need = int(request_fit(body)["input_tokens"])
+    pairs = sorted({tuple(x) for x in pairs})
+    parts, kinds, resets = [], [], []
+    for p, m in pairs:
+        c = _pair_lane(core, p, m, row_of, accounts)
+        kind, why = "dependency", "lane unknown to the tables"
+        if c is not None:
+            try:
+                check(requested=p, target_model=m)
+            except execution_routing.CredentialsUnavailable as exc:
+                kind, why = "dependency", str(exc)
+            else:
+                h = core.candidate_health(c, health)
+                cap = (int(core._context_cfg().get("provider_ceiling_tokens", {}).get("codex-cli", 200000))
+                       if _base_provider(p) == "codex-cli" else core.lane_ceiling(c["lane"], m))
+                floor_why = None
+                if min_left_pct is not None and h.get("ok", True):
+                    floor_why = floor.check(core, {**c, "codex_home": codex_home}, m, min_left_pct, readings)
+                if need > cap:
+                    kind, why = "fit", f"request ≈{need // 1000}k tokens exceeds its {cap // 1000}k ceiling"
+                elif not h.get("ok", True):
+                    stale = str(h.get("why") or "").startswith("stale cross-account")
+                    kind, why = ("dependency" if stale else "quota"), h.get("why") or "capacity spent"
+                    got = _when(h.get("tightest") or {})
+                    if got and not stale:
+                        resets.append(got)
+                elif floor_why:
+                    kind, why = "quota", floor_why
+                else:
+                    kind, why = "rule", skipped.get((c["lane"], m)) or "not chosen by the router for this turn"
+        kinds.append(kind)
+        parts.append(f"{p}/{m} ({why})")
+    status = {}
+    if kinds and all(k == "fit" for k in kinds):
+        status = {"fit_blocked": True}
+    elif kinds and all(k in ("quota", "fit") for k in kinds):
+        status = {"quota_blocked": True}
+    earliest = f" Earliest reset: {min(resets)[1]}." if resets else ""
+    logger.info("route pick %s refused (E2): %s", label, "; ".join(parts))
+    return {"router": execution_routing.ROUTER, "pick_refused": True, **status,
+            "error": f"route pick {label}: no selected route can take this conversation now: {'; '.join(parts)}."
+                     f"{earliest} Nothing was run on a model outside the pick. Widen it: {widen}"}
+
+
+def pick_shortfall(core, models: tuple[str, ...], route: dict[str, Any] | None) -> tuple[str, str] | None:
+    """E3 (owner 2026-11-24): whether the turn's requirement exceeds EVERY selected model, judged on capability alone
+    (the model-scores index and frontier flag), never on availability: (category, text) or None.
+      index     the required index core.resolve computed (outward floor, band, D) is above every selected model's index
+                for the turn's use case;
+      frontier  selection.ceiling_work requires a frontier model for this use case and difficulty, and no selected
+                model is one.
+    Unknown (no required index: a degraded scorer or unscored candidates; or no selected model in the scores) is None:
+    an escalation must rest on a number. Exhaustion of selected models that are capable is not a shortfall: E2 refuses."""
+    if not isinstance(route, dict) or route.get("required_index") is None:
+        return None
+    req = float(route["required_index"])
+    ms = core.model_scores() or {}
+    ans = route.get("answers") or {}
+    u = ans.get("work_kind") if ans.get("work_kind") in (ms.get("use_cases") or {}) else "general"
+    keys = {model_key(m) for m in models}
+    got = []
+    for m in ms.get("models") or []:
+        if any(model_key(r.get("model")) in keys for r in m.get("reach") or []):
+            idx = m.get("index") or {}
+            got.append((float(idx.get(u, idx.get("general", 0.0))), bool(m.get("ceiling"))))
+    if not got:
+        return None
+    best = max(i for i, _ in got)
+    if best < req:
+        return "index", f"no selected model reaches {req:g} ({u}; the strongest selected has {best:g})"
+    cw = (core.table().get("selection") or {}).get("ceiling_work") or {}
+    D = route.get("D")
+    if cw.get("require_frontier") and core.ceiling_work_applies(cw, u, D) and not any(c for _, c in got):
+        return "frontier", f"no selected model reaches the frontier requirement ({u} at D={D} needs a frontier model)"
+    return None
+
+
 def previous_routes(client: str) -> dict[str, dict[str, str]] | None:
     """This client's last route per band (band -> {lane, model}), or None."""
     with _last_routes_lock:
@@ -737,9 +1112,12 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
            codex_bin: str = "codex", exclude_model: str | None = None,
            min_left_pct: float | None = None, codex_home: str | None = None,
            local: str | None = None, workload: str | None = None,
-           band_window: tuple[str, str] | None = None) -> dict[str, Any]:
+           band_window: tuple[str, str] | None = None, route_pick: "Pick | None" = None) -> dict[str, Any]:
     """Route a new conversation. `band_window` (lo, hi; see BAND_HEADER, already validated by the caller) clamps S1's
-    band; a pin ignores it. Returns execution_routing.select's result: provider, model, route_id, band, … or error.
+    band; a pin ignores it. `route_pick` (a Pick from route_pick(), validated): its window is the band window, and a
+    model set restricts the candidates to the selected models on every account and lane that serves them (_pick_route:
+    E3 escalation, E2 refusals; docs/ORCHESTRATOR-ROUTE-PICKER.md). A pin ignores it too.
+    Returns execution_routing.select's result: provider, model, route_id, band, … or error.
     A `sub/`-pinned request skips S1 (choose_pinned). `exclude_model` (the x-cortados-exclude-model header, a comma
     list) keeps the conversation off each listed model on every lane, so a review never runs on a model that wrote the
     code. `local` (the x-cortados-local header: LOCAL_MODES) marks the request for a node's sensitive model
@@ -747,7 +1125,12 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
     if local is not None and local not in LOCAL_MODES:
         return {"router": execution_routing.ROUTER, "client_error": True,
                 "error": f"{LOCAL_HEADER}: must be one of {', '.join(LOCAL_MODES)}"}
-    items = [i.strip() for i in (exclude_model or "").split(",") if i.strip()]
+    if route_pick is not None:
+        if band_window is not None and tuple(band_window) != route_pick.window:
+            return {"router": execution_routing.ROUTER, "client_error": True,
+                    "error": f"route pick {route_pick.label} and the band window ask for different windows"}
+        band_window = route_pick.window           # one window: the pick's (route_pick() checked the band header)
+    items =[i.strip() for i in (exclude_model or "").split(",") if i.strip()]
     excluded_models: list[str] = []
     for item in items:
         m = normalize_model(item)
@@ -779,7 +1162,9 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
             return {"router": execution_routing.ROUTER, "client_error": True, "error": str(exc)}
         if local:
             logger.info("%s: %s ignored: the request pins sub/%s", LOCAL_HEADER, local, pinned)
-        if band_window:
+        if route_pick is not None:
+            logger.info("route pick %s ignored: the request pins sub/%s", route_pick.label, pinned)
+        elif band_window:
             logger.info("band window %s ignored: the request pins sub/%s", "-".join(band_window), pinned)
         if hit(pinned):
             return {"router": execution_routing.ROUTER, "client_error": True,
@@ -813,6 +1198,39 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
                                  "the review could not be kept off it"}
             constraints["excluded_routes"] += [r for r in routes if r not in constraints["excluded_routes"]]
         constraints["notes"] = [f"excluded by client: {names}"]   # select logs it with the route
+    restrict = route_pick is not None and route_pick.restricts
+    full_allowed = list(constraints["allowed_routes"])
+    pick_models: tuple[str, ...] = ()
+    base_notes = list(constraints.get("notes") or [])
+    if restrict:
+        if route_pick.local:                      # E8: parsed and validated, not served until step 8
+            return {"router": execution_routing.ROUTER, "client_error": True,
+                    "error": f"route pick {route_pick.label}: {LOCAL_PICKS_REFUSED}"}
+        pick_models = pick_star_models(core, route_pick.window) if route_pick.star else route_pick.models
+        if not pick_models:
+            # `*` with unreadable model scores: a dependency failed (503), never a guess at which models clear the band
+            return {"router": execution_routing.ROUTER,
+                    "error": f"route pick {route_pick.label}: the model scores cannot be read, so `*` cannot be "
+                             "resolved; retry later, or name the models"}
+        keys = {model_key(m) for m in pick_models}
+        pairs = [p for p in full_allowed if model_key(p[1]) in keys]
+        excluded_pairs = {tuple(p) for p in constraints.get("excluded_routes") or []}
+        if not [p for p in pairs if tuple(p) not in excluded_pairs]:
+            # The selection names no route this endpoint can run (all excluded, or unserved since the pick was
+            # parsed): the client's to change, as an exclusion that empties the pool (400).
+            return {"router": execution_routing.ROUTER, "client_error": True,
+                    "error": f"route pick {route_pick.label}: no route serves {', '.join(pick_models)}"
+                             + (f" (the client excluded {names} via x-cortados-exclude-model)" if excluded_models else
+                                "")}
+        constraints["allowed_routes"] = pairs
+        live_pairs = [p for p in pairs if tuple(p) not in excluded_pairs]
+        base_notes += [f"route pick {route_pick.label}: {len(pick_models)} model{'s' if len(pick_models) != 1 else ''}"
+                       f", {len(live_pairs)} route{'s' if len(live_pairs) != 1 else ''}"
+                       + (f" ({', '.join(pick_models)})" if route_pick.star else ""),
+                       # cost moves to a local node (auto_local, index_local) would move the main loop off the
+                       # selected models for cost, which is what a pick forbids (doc §4.2); the sensitive rule still wins
+                       "route pick: local cost routes not taken"]
+        constraints["notes"] = base_notes
     fit = request_fit(body)
     workload = workload_hint(workload)
     if workload:
@@ -834,6 +1252,27 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
             **({"previous": previous} if previous else {}),
             **({"hold_ok": hold_ok} if hold_ok is not None else {}), **extra)
     r = select()
+    if restrict:
+        short = pick_shortfall(core, pick_models, r.get("last_route") if r.get("error") else r.get("route"))
+        if short:
+            # E3 (owner 2026-11-24): the turn needs more than every selected model can give (capability, judged on the
+            # index and the frontier flag, never on availability), so the conversation escalates to the route normal
+            # routing chooses without the model set: the same window, S1 answer and hard rules, every served model.
+            # Decided here, at conversation open or fork, like every route. The API credit lane is left out of the
+            # escalation: its relay passes the vendor's bytes through unchanged, so the escalation notice the owner
+            # asked for could not lead its reply.
+            req = ((r.get("last_route") if r.get("error") else r.get("route")) or {}).get("required_index")
+            logger.info("route pick %s escalated: %s", route_pick.label, short[1])
+            constraints["allowed_routes"] = [p for p in full_allowed if p[0] != API_PROVIDER]
+            constraints["notes"] = base_notes + [f"route pick escalated: {short[1]}"]
+            r = select(**({"route_id": r["route_id"]} if r.get("route_id") else {}))
+            if not r.get("error"):
+                r = {**r, PICK_ESCALATED_KEY: {"label": route_pick.label, "reason": short[0], "required": req}}
+        elif r.get("error"):
+            # E2 (owner 2026-11-24): the selected models could meet the turn but none is usable now. Refused, naming
+            # each route and why; never served on a model the owner did not pick.
+            return pick_refusal(core, route_pick, live_pairs, r, body, claude_bin=claude_bin, codex_bin=codex_bin,
+                                min_left_pct=min_left_pct, codex_home=codex_home)
     if not r.get("error") and r.get("provider") == API_PROVIDER:
         why = request_sensitivity(body, r, local)
         if why is not None:
@@ -846,7 +1285,9 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
             r = select(route_id=r.get("route_id"))
         else:
             r = {**r, "bind_reason": API_SCORED_REASON}
-    if not r.get("error"):
+    if not r.get("error") and not restrict:
+        # Not a pick's route: the switching margin remembers free choices (cost noise); a route the pick restricted or
+        # escalated would hold the client's later unrestricted conversations (its subagents) on it.
         remember_route(client, r)
     if r.get("error") and r.get("degraded"):
         r["error"] = ("S1 is unavailable, and a degraded scorer never defaults to Claude; no Codex lane survived either "
@@ -878,7 +1319,13 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
         skipped: list[str] = []                    # why sensitive_local did not take it, as reason categories
         r = sensitive_local(core, body, r, client=client, conversation_id=conversation_id, excluded=hit, local=local,
                             why_out=skipped)
-        if not r.get("local"):
+        if restrict and r.get("local"):
+            # E5 (owner 2026-11-24): the sensitive rule wins over the pick; said on the routes row sensitive_local wrote.
+            r = {**r, "route": {**(r.get("route") or {}), "hard_rules": list((r.get("route") or {}).get("hard_rules")
+                                                                             or []) +
+                                [f"route pick {route_pick.label} overridden: sensitive"]}}
+            _log_moved(core, body, r, client=client, conversation_id=conversation_id)
+        if not r.get("local") and not restrict:
             r = auto_local(core, body, r, client=client, conversation_id=conversation_id, excluded=hit)
         if r.get("local"):
             r = _stamp_sensitivity(r, sensitive)
