@@ -26,8 +26,22 @@ conversation), BIND_PROFILES maps it:
              pyproject.toml / Makefile allowed (normal coding targets).
 An unknown or missing reason gets the strictest profile (sensitive): fail closed.
 
+The local orchestrator (docs/ORCHESTRATOR-ROUTE-PICKER.md §5, step 8; E8, owner 2026-11-24): a `local[:<models>]` route
+pick runs the main loop of a Claude Code session on a local model, opt-in, under its own profiles. It is not an
+automatic move but it is fenced like one (local_lane.serve: `fenced`):
+  orchestrator            plan and delegate only: read (Read, Glob, Grep, LS, NotebookRead), plan (TodoWrite,
+                          ExitPlanMode, AskUserQuestion), delegate through exactly the cortados-route MCP tools
+                          (DELEGATION_TOOLS), and one shell shape: start_task's watch_command (WATCH_COMMAND_RE), with
+                          BashOutput / KillShell for that background watcher. No file write, no other shell command, no
+                          Agent / Task, no web, no other MCP tool, nothing unknown. start_task may not ask for Chrome
+                          or connectors (DELEGATE_REFUSED_INPUTS: [ESCALATE] E13 in the design doc, the stricter option).
+  orchestrator-sensitive  the same, for a turn a sensitivity detector marks (E5: the sensitive rule wins): no shell and
+                          no delegation (a delegated task leaves the machine), so read and plan only.
+Without the client hook (HOOK_HEADER) an orchestrator turn also loses the shell (the watcher): the hook is the client's
+half of the check, and no shell is the stricter choice.
+
 An explicit `sub/<local model>` pin is the client's own choice: it never passes here (local_lane.serve's auto_routed
-is False for a pin).
+is False for a pin, and a pin carries no orchestrator bind reason).
 
 The project folder (project_dir) is read from the request's `system` prompt only: Claude Code states its working
 directory there ("Primary working directory: <path>", older versions "Working directory: <path>"). Only `system` is
@@ -75,6 +89,13 @@ logger = logging.getLogger("cortados.provider.effect_boundary")
 # Profiles. A profile names the tools a turn may declare and call, and how strict the path rules are.
 SENSITIVE = "sensitive"
 COST = "cost"
+ORCHESTRATOR = "orchestrator"                       # a local route pick's main loop: plan and delegate only
+ORCHESTRATOR_SENSITIVE = "orchestrator-sensitive"   # the same turn marked sensitive (E5): read and plan only
+ORCHESTRATOR_PROFILES = frozenset({ORCHESTRATOR, ORCHESTRATOR_SENSITIVE})
+# The bind reasons of a local route pick (routing.choose_local_pick). Not an automatic move, so not in the comment
+# above, but fenced the same way (local_lane.serve `fenced`).
+PICK_LOCAL_REASON = "route_pick_local"
+PICK_LOCAL_SENSITIVE_REASON = "route_pick_local_sensitive"
 # WHICH automatic rule bound the conversation to a local lane (routing._moved's `bind_reason`) -> its profile.
 BIND_PROFILES: dict[str, str] = {
     "sensitive_flag": SENSITIVE,     # x-cortados-local: sensitive
@@ -83,7 +104,16 @@ BIND_PROFILES: dict[str, str] = {
     "prefer": COST,                  # x-cortados-local: prefer: local because it is cheaper (owner decision 2026-11-14)
     "auto_route": COST,              # R0 auto_route: local because it is cheaper, not because it is sensitive
     "index": COST,                   # the published-score index route (routing._move_to_local)
+    PICK_LOCAL_REASON: ORCHESTRATOR,                       # a local route pick (E8): the owner's opt-in
+    PICK_LOCAL_SENSITIVE_REASON: ORCHESTRATOR_SENSITIVE,   # ... whose turn a sensitivity detector marks (E5)
 }
+ORCHESTRATOR_REASONS = frozenset({PICK_LOCAL_REASON, PICK_LOCAL_SENSITIVE_REASON})
+
+
+def fenced(auto_routed: bool, reason: Any) -> bool:
+    """Whether a local turn passes the boundary: every automatic move, and every turn of a local route pick (its bind
+    reason is an orchestrator one). A plain `sub/` pin does not."""
+    return bool(auto_routed) or (isinstance(reason, str) and reason in ORCHESTRATOR_REASONS)
 
 
 def profile_for(reason: Any) -> str:
@@ -107,12 +137,63 @@ LOCAL_TOOL_ALLOWLIST = frozenset({
     "Edit", "MultiEdit", "Write", "NotebookEdit",
     "TodoWrite", "ExitPlanMode",
 }) | BASH_FAMILY
-PROFILE_TOOLS = {SENSITIVE: LOCAL_TOOL_ALLOWLIST - BASH_FAMILY, COST: LOCAL_TOOL_ALLOWLIST}
+# The local orchestrator (module docstring). Exact names: Claude Code names an MCP tool mcp__<server>__<tool>, and the
+# router's server is `cortados-route` (.mcp.json, README "Delegating whole tasks"); any other server, or another
+# spelling, is not a delegation tool and is dropped.
+DELEGATION_SERVER = "cortados-route"
+DELEGATION_TOOLS = frozenset("mcp__%s__%s" % (DELEGATION_SERVER, t) for t in (
+    "start_task", "route_task", "task_status", "wait_task", "list_tasks", "cancel_task"))
+START_TASK_TOOL = "mcp__%s__start_task" % DELEGATION_SERVER
+# start_task inputs a local orchestrator may not set (truthy): `chrome` drives the owner's real signed-in browser and
+# `connectors` loads mail / chat / drive servers into the child. [ESCALATE] E13 (doc §5): §5 leaves "may a local
+# orchestrator start tasks with outward effects" to the owner; refusing these two is the stricter option until he says.
+DELEGATE_REFUSED_INPUTS = ("chrome", "connectors")
+ORCHESTRATOR_READ_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead",
+                                     "TodoWrite", "ExitPlanMode", "AskUserQuestion"})
+# The watcher's shell: Bash (only WATCH_COMMAND_RE), and BashOutput / KillShell / KillBash for its background job.
+ORCHESTRATOR_SHELL = BASH_FAMILY
+PROFILE_TOOLS = {SENSITIVE: LOCAL_TOOL_ALLOWLIST - BASH_FAMILY, COST: LOCAL_TOOL_ALLOWLIST,
+                 ORCHESTRATOR: ORCHESTRATOR_READ_TOOLS | DELEGATION_TOOLS | ORCHESTRATOR_SHELL,
+                 ORCHESTRATOR_SENSITIVE: ORCHESTRATOR_READ_TOOLS}
+
+# child_tasks.watch_command's shape (the background watcher AGENTS.md has the orchestrator run after every start_task),
+# the same shape as the routed-subagents mod's TASK_WATCH_RE (hooks/register.ts) and the same pattern as
+# boundary_hook.WATCH_COMMAND_RE (tests/test_local_orchestrator.py keeps the two equal): [env] [CORTADOS_TASKS_DIR=… CORTADOS_EXEC_HOSTS_FILE=…] <a python3> [-B]
+# <…/cortados_router/child_tasks.py> --watch <task id>… [--timeout|--interval|--stall <seconds>]…, optionally
+# `; echo "exit $?"`. Spaces and tabs only: no newline, other command, pipe, redirect, substitution or variable. The
+# only shell a local orchestrator has; it only polls task_status.
+_W_PLAIN = r"[A-Za-z0-9_./~+@%:,-]"
+_W_TASK_ID = r"t[0-9]{14}-[0-9a-f]{8}"
+_W_FLAG = r"--(?:timeout|interval|stall)[ \t]+[0-9]+(?:\.[0-9]+)?"
+
+
+def _w_path_to(tail: str) -> str:
+    return r"(?:'(?:[^']*/)?%s'|(?:%s*/)?%s)" % (tail, _W_PLAIN, tail)
+
+
+WATCH_COMMAND_RE = re.compile(
+    r"[ \t]*(?:env[ \t]+)?"
+    + r"(?:CORTADOS_(?:TASKS_DIR|EXEC_HOSTS_FILE)=(?:'[^']*'|%s+)[ \t]+)*" % _W_PLAIN
+    + _w_path_to(r"python3(?:\.[0-9]+)?") + r"(?:[ \t]+-B)?[ \t]+"
+    + _w_path_to(r"cortados_router/child_tasks\.py") + r"[ \t]+--watch"
+    + r"(?:[ \t]+%s)*[ \t]+%s(?:[ \t]+(?:%s|%s))*" % (_W_FLAG, _W_TASK_ID, _W_TASK_ID, _W_FLAG)
+    + r"""(?:[ \t]*;[ \t]*echo[ \t]+(?:"exit \$\?"|exit[ \t]+\$\?))?[ \t]*""")
+
+
+def is_watch_command(command: Any) -> bool:
+    """Whether a Bash command is exactly start_task's watch_command shape (WATCH_COMMAND_RE, fullmatch)."""
+    return isinstance(command, str) and bool(WATCH_COMMAND_RE.fullmatch(command))
 # The allowlisted tools whose `command` input is a shell command line to inspect.
 SHELL_TOOLS = frozenset({"Bash"})
 # The allowlisted tools that write a file, and the input key naming it.
 WRITE_TOOLS = {"Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path"}
 
+# A local orchestrator's blocked reply (a tool off its profile, any shell command but the watcher, a refused start_task
+# input): it plans and delegates only.
+ORCHESTRATOR_BLOCKED_MESSAGE = ("cortados: this session's main loop is a local orchestrator (route pick local, the "
+                                "orchestrator profile): it reads, plans and delegates only (start_task / route_task), "
+                                "so the action it proposed was not sent to your tools. Ask it to delegate the work, or "
+                                "switch the main loop to a cloud pick (/model cortados@R3).")
 BLOCKED_MESSAGE = ("cortados: the local model proposed an action with an outward effect; run this turn on a cloud "
                    "model (start a new conversation, which is routed again, or pin a cloud model with sub/<model>). "
                    "Nothing was sent to your tools.")
@@ -392,10 +473,29 @@ def project_dir(body: dict[str, Any]) -> str | None:
     return None if _NOT_PROJECTS.fullmatch(norm) else norm
 
 
+def blocked_delegation(name: str, tool_input: Any) -> str | None:
+    """Why a delegation call of a local orchestrator is refused (a rule id), or None: start_task may not set the
+    DELEGATE_REFUSED_INPUTS, and its input must be an object (the only one judged by its input)."""
+    if name != START_TASK_TOOL:
+        return None
+    if not isinstance(tool_input, dict):
+        return "delegate-malformed"
+    for key in DELEGATE_REFUSED_INPUTS:
+        if tool_input.get(key):
+            return "delegate-" + key
+    return None
+
+
 def blocked_call(name: Any, tool_input: Any, profile: str = SENSITIVE, project: str | None = None) -> str | None:
     """Why a tool call the local model emitted must not reach the client under `profile` (a rule id), or None."""
     if not isinstance(name, str) or name not in PROFILE_TOOLS.get(profile, PROFILE_TOOLS[SENSITIVE]):
         return "tool-not-allowed"
+    if profile in ORCHESTRATOR_PROFILES:
+        # Plan and delegate only: the one shell shape, the delegation inputs; no write tool is in these profiles.
+        if name in SHELL_TOOLS:
+            command = tool_input.get("command") if isinstance(tool_input, dict) else None
+            return None if is_watch_command(command) else "bash-not-watch"
+        return blocked_delegation(name, tool_input)
     if name in SHELL_TOOLS:
         if not isinstance(tool_input, dict):
             return "bash-malformed"
@@ -501,6 +601,13 @@ class BoundaryLedger:
 LEDGER = BoundaryLedger()
 
 
+def profile_tools(profile: str, hook: bool = True) -> frozenset:
+    """The tools a turn under `profile` may call: PROFILE_TOOLS (an unknown profile: SENSITIVE's), less the shell for an
+    orchestrator turn whose client runs no hook (Boundary)."""
+    tools = PROFILE_TOOLS.get(profile, PROFILE_TOOLS[SENSITIVE])
+    return tools - BASH_FAMILY if profile in ORCHESTRATOR_PROFILES and not hook else tools
+
+
 def protected_rules(profile: str) -> dict[str, Any]:
     """PROTECTED_PATHS as the hook applies them under `profile` (the build files only on non-COST profiles)."""
     return {"root_dotfiles": True,
@@ -518,8 +625,16 @@ def check_answer(tool_use_id: Any, ledger: BoundaryLedger | None = None) -> dict
     if rec is None:
         return {"known": False, "marked": is_marked(tool_use_id)}
     profile = rec["profile"]
+    orch = profile in ORCHESTRATOR_PROFILES
+    # `tools`: the profile's tool names, which the hook checks the call against (any tool: its matcher is `*`).
+    # `bash_watch`: Bash only in start_task's watch_command shape (orchestrator); `bash` stays False there, so an older
+    # hook that knows only `bash` denies every orchestrator shell call. `delegate_refused`: start_task inputs refused.
     return {"known": True, "marked": True, "tool": rec["tool"], "profile": profile, "project": rec["project"],
-            "write_tools": dict(WRITE_TOOLS), "bash": profile == COST, "protected": protected_rules(profile),
+            "write_tools": {} if orch else dict(WRITE_TOOLS), "bash": profile == COST,
+            "bash_watch": orch and "Bash" in PROFILE_TOOLS[profile],
+            "tools": sorted(PROFILE_TOOLS.get(profile, PROFILE_TOOLS[SENSITIVE])),
+            "delegate_refused": list(DELEGATE_REFUSED_INPUTS) if orch else [],
+            "protected": protected_rules(profile),
             "expires_in": max(0, int(rec["expires"] - (ledger or LEDGER).clock()))}
 
 
@@ -538,7 +653,9 @@ class Boundary:
         self.project = project
         self.hook = hook is True
         self.read_only = self.profile == SENSITIVE and not self.hook
-        self.tools = PROFILE_TOOLS[self.profile] - (frozenset(WRITE_TOOLS) if self.read_only else frozenset())
+        # An orchestrator turn without the hook loses its shell (the watcher): profile_tools.
+        self.tools = profile_tools(self.profile, self.hook) - (frozenset(WRITE_TOOLS) if self.read_only else
+                                                                frozenset())
         self.conversation = conversation if isinstance(conversation, str) else None
         self.ledger = ledger or LEDGER
 
@@ -550,17 +667,20 @@ class Boundary:
             logger.warning("effect boundary: bind reason %r unknown; the %s profile applies", b.reason, SENSITIVE)
         if b.read_only:
             logger.info("effect boundary: no %s on a %s turn: read-only", HOOK_HEADER, SENSITIVE)
+        elif b.profile in ORCHESTRATOR_PROFILES and not b.hook:
+            logger.info("effect boundary: no %s on an %s turn: no shell", HOOK_HEADER, b.profile)
         return b
 
     def tools_for_node(self, body: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         out, dropped = tools_for_node(body, self.profile)
-        if self.read_only and isinstance(out.get("tools"), list):
-            kept = [t for t in out["tools"] if t.get("name") not in WRITE_TOOLS]
+        cut = (frozenset(WRITE_TOOLS) if self.read_only else frozenset()) | (PROFILE_TOOLS[self.profile] - self.tools)
+        if cut and isinstance(out.get("tools"), list):
+            kept = [t for t in out["tools"] if t.get("name") not in cut]
             if len(kept) != len(out["tools"]):
-                dropped = dropped + [t["name"] for t in out["tools"] if t.get("name") in WRITE_TOOLS]
+                dropped = dropped + [t["name"] for t in out["tools"] if t.get("name") in cut]
                 out = dict(out, tools=kept)
                 choice = out.get("tool_choice")
-                if isinstance(choice, dict) and (choice.get("type") == "tool" and choice.get("name") in WRITE_TOOLS
+                if isinstance(choice, dict) and (choice.get("type") == "tool" and choice.get("name") in cut
                                                  or choice.get("type") == "any" and not kept):
                     out.pop("tool_choice")
         return out, dropped
@@ -613,6 +733,11 @@ def blocked_reply(blocks: Any, boundary: Boundary | None = None) -> tuple[str, s
         if hit:
             return hit
     return None
+
+
+def blocked_message(profile: Any) -> str:
+    """The text a blocked reply is answered with under `profile`."""
+    return ORCHESTRATOR_BLOCKED_MESSAGE if profile in ORCHESTRATOR_PROFILES else BLOCKED_MESSAGE
 
 
 def log_blocked(rule: str, tool: str, where: str) -> None:

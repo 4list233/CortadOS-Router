@@ -1062,12 +1062,13 @@ def _judge_event(ev: dict[str, Any], call: "effect_boundary.StreamedCall | None"
     return None
 
 
-def _blocked(handler, hit: tuple[str, str], *, stream_started: bool = False) -> str:
+def _blocked(handler, hit: tuple[str, str], *, stream_started: bool = False, profile: Any = None) -> str:
     """Answer a reply the effect boundary blocked (serve's "blocked" outcome): logged as rule and tool name only;
-    a terminal 400 when nothing was written yet, else an `error` event ending the stream."""
+    a terminal 400 when nothing was written yet, else an `error` event ending the stream. `profile`: the turn's
+    (effect_boundary.blocked_message words a local orchestrator's refusal as such)."""
     effect_boundary.log_blocked(*hit, where="local relay")
     _refused(handler, 400, "invalid_request_error", "the local model proposed an action with an outward effect")
-    err = _error("invalid_request_error", effect_boundary.BLOCKED_MESSAGE)
+    err = _error("invalid_request_error", effect_boundary.blocked_message(profile))
     if not stream_started:
         _send_json(handler, 400, err, headers={"x-should-retry": "false"})
         return "blocked"
@@ -1148,8 +1149,9 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
     the server routes the opening turn elsewhere; otherwise it is relayed as before. Only an answer whose status line
     came back before anything was written moves: a stream that breaks after its first byte stays "incomplete"."""
     reply = [] if reply is None else reply
+    # Every automatic move, and every turn of a local route pick (the orchestrator profiles, E8): effect_boundary.fenced.
     fence = (effect_boundary.Boundary.for_turn(bind_reason, body, hook=hook, conversation=conversation)
-             if auto_routed else None)
+             if effect_boundary.fenced(auto_routed, bind_reason) else None)
     boundary = fence is not None
     if fence:
         body, dropped = fence.tools_for_node(body)
@@ -1289,7 +1291,7 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
                 return "incomplete"
             hit = fence.blocked_reply(msg.get("content")) if fence and isinstance(msg, dict) else None
             if hit:
-                return _blocked(handler, hit)
+                return _blocked(handler, hit, profile=fence.profile)
             if fence and isinstance(msg, dict):
                 fence.mark_blocks(msg.get("content"))
             if isinstance(msg, dict) and msg.get("type") == "message":
@@ -1392,7 +1394,7 @@ def _serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str,
         except (OSError, http.client.HTTPException):
             pass                                                 # the node stalled past read_timeout_s or dropped
         if blocked:
-            return _blocked(handler, blocked, stream_started=started)
+            return _blocked(handler, blocked, stream_started=started, profile=getattr(fence, "profile", None))
         if boundary:
             if call is not None:                                 # a tool-call block the node never closed: not sent
                 done = False

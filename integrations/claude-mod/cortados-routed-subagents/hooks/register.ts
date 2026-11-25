@@ -870,7 +870,8 @@ export const BOUNDARY_HOOK_PY = String.raw`#!/usr/bin/env python3
 When the CortadOS provider routes a turn automatically to a local model, its effect boundary limits what the model's
 tool calls may do (cortados_router/provider/effect_boundary.py). The tools run here, on the client, which is often not
 the provider's machine: a symlink that exists only here (/repo/escape -> /outside) is invisible to the provider. This
-hook closes that gap. For each Write, Edit, MultiEdit, NotebookEdit and Bash call it:
+hook closes that gap. For each Write, Edit, MultiEdit, NotebookEdit and Bash call, and for every call of any tool
+whose id the provider minted (session.py installs it with matcher "*"), it:
 
   1. asks the provider about the call's tool_use id (POST <provider>/v1/cortados/boundary/check, the provider token,
      metadata only: the id);
@@ -879,7 +880,11 @@ hook closes that gap. For each Write, Edit, MultiEdit, NotebookEdit and Bash cal
      os.path.realpath HERE and denied unless it lies strictly inside the realpath of the project folder the provider
      assumed, and off the protected paths the provider names;
   4. fails CLOSED for a boundary call: an id starting with MARK_PREFIX (minted only by the provider's boundary) is
-     denied on any error (provider unreachable, a bad answer, an expired or unknown record, a crash of this script).
+     denied on any error (provider unreachable, a bad answer, an expired or unknown record, a crash of this script);
+  5. a known call of a tool off the record's profile (its tools list) is denied; on a local orchestrator's profile (the
+     route pick "local", plan and delegate only) Bash is allowed only as start_task's watch_command (WATCH_COMMAND_RE,
+     the provider's effect_boundary pattern) and start_task may not ask for the inputs the provider names
+     (delegate_refused: chrome, connectors).
 
 A denial is exit 2 with the reason on stderr (Claude Code blocks the call and shows the reason to the model).
 
@@ -906,6 +911,7 @@ if __name__ == "__main__" and not sys.flags.isolated:   # an install without -I:
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
@@ -915,6 +921,25 @@ TIMEOUT_S = 5.0
 WRITE_KEYS = {"Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path"}
 HOOK_TOOLS = frozenset(WRITE_KEYS) | {"Bash"}
 MAX_ANSWER = 65536
+START_TASK_TOOL = "mcp__cortados-route__start_task"
+# start_task's watch_command, the one shell command of a local orchestrator: effect_boundary.WATCH_COMMAND_RE's pattern
+# (tests/test_local_orchestrator.py keeps the two equal).
+_W_PLAIN = r"[A-Za-z0-9_./~+@%:,-]"
+_W_TASK_ID = r"t[0-9]{14}-[0-9a-f]{8}"
+_W_FLAG = r"--(?:timeout|interval|stall)[ \t]+[0-9]+(?:\.[0-9]+)?"
+
+
+def _w_path_to(tail):
+    return r"(?:'(?:[^']*/)?%s'|(?:%s*/)?%s)" % (tail, _W_PLAIN, tail)
+
+
+WATCH_COMMAND_RE = re.compile(
+    r"[ \t]*(?:env[ \t]+)?"
+    + r"(?:CORTADOS_(?:TASKS_DIR|EXEC_HOSTS_FILE)=(?:'[^']*'|%s+)[ \t]+)*" % _W_PLAIN
+    + _w_path_to(r"python3(?:\.[0-9]+)?") + r"(?:[ \t]+-B)?[ \t]+"
+    + _w_path_to(r"cortados_router/child_tasks\.py") + r"[ \t]+--watch"
+    + r"(?:[ \t]+%s)*[ \t]+%s(?:[ \t]+(?:%s|%s))*" % (_W_FLAG, _W_TASK_ID, _W_TASK_ID, _W_FLAG)
+    + r"""(?:[ \t]*;[ \t]*echo[ \t]+(?:"exit \$\?"|exit[ \t]+\$\?))?[ \t]*""")
 
 
 class Denied(Exception):
@@ -1023,10 +1048,10 @@ def check_self(project) -> None:
 def decide(event: dict) -> None:
     """Raise Denied when the call must not run; return when it may."""
     tool = event.get("tool_name")
-    if tool not in HOOK_TOOLS:
-        return
     tid = event.get("tool_use_id")
     marked = isinstance(tid, str) and tid.startswith(MARK_PREFIX)
+    if tool not in HOOK_TOOLS and not marked:
+        return                                           # nothing the boundary minted: no question to ask
     if not isinstance(tid, str) or not tid:
         if marked:
             raise Denied("no tool_use id")
@@ -1043,12 +1068,30 @@ def decide(event: dict) -> None:
         return
     if answer.get("tool") != tool:
         raise Denied("the call does not match the provider's record of it")
+    tools = answer.get("tools")
+    if tools is not None and (not isinstance(tools, list) or tool not in tools):
+        raise Denied("%s is not allowed on this local-routed turn's profile (%s)"
+                     % ("no shell: Bash" if tool == "Bash" else "the tool", answer.get("profile")))
+    inp = event.get("tool_input")
+    if tool not in HOOK_TOOLS:
+        if tool == START_TASK_TOOL:
+            refused = answer.get("delegate_refused") or []
+            if not isinstance(inp, dict) or not isinstance(refused, list):
+                raise Denied("the delegation call cannot be checked")
+            for key in refused:
+                if isinstance(key, str) and inp.get(key):
+                    raise Denied("a local orchestrator may not start a task with %s" % key)
+        return
     check_self(answer.get("project"))
     if tool == "Bash":
-        if answer.get("bash") is not True:
-            raise Denied("no shell on a sensitive local-routed turn")
-        return
-    inp = event.get("tool_input")
+        if answer.get("bash") is True:
+            return
+        if answer.get("bash_watch") is True:
+            command = inp.get("command") if isinstance(inp, dict) else None
+            if isinstance(command, str) and WATCH_COMMAND_RE.fullmatch(command):
+                return
+            raise Denied("a local orchestrator runs no shell command but start_task's watch_command")
+        raise Denied("no shell on a sensitive local-routed turn")
     key = (answer.get("write_tools") or {}).get(tool) or WRITE_KEYS[tool]
     check_write(inp.get(key) if isinstance(inp, dict) else None, answer.get("project"), answer.get("protected"))
 

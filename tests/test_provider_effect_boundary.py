@@ -88,7 +88,10 @@ class AllowlistUnitTests(unittest.TestCase):
         # Review of 0961c80 (gpt-6.1-sol, finding 1): `prefer` is a COST route (owner decision 2026-11-14), not SENSITIVE.
         self.assertEqual({r: eb.profile_for(r) for r in eb.BIND_PROFILES},
                          {"sensitive_flag": eb.SENSITIVE, "keyword": eb.SENSITIVE, "refusal": eb.SENSITIVE,
-                          "prefer": eb.COST, "auto_route": eb.COST, "index": eb.COST})
+                          "prefer": eb.COST, "auto_route": eb.COST, "index": eb.COST,
+                          # step 8 of the route picker: a local route pick's main loop (E8, E5)
+                          "route_pick_local": eb.ORCHESTRATOR,
+                          "route_pick_local_sensitive": eb.ORCHESTRATOR_SENSITIVE})
         self.assertEqual(eb.profile_for("prefer"), eb.COST)
         self.assertIn("Bash", eb.Boundary("prefer", PROJECT).tools)
         for unknown in (None, "", "index-typo", 3, "s1"):                  # fail closed: the strictest profile
