@@ -136,11 +136,15 @@ def _inside(path: str, folder: Path) -> bool:
 
 
 def reap(pid: int, fd: int, probe_dir: Path | None, my_dir: Path | None = None) -> None:
-    """Kill the probe CLI and EVERY descendant, then anything left with cwd in the probe folder (not when probe_dir is None:
-    the agy probe's shared fixed folder). 2026-09-26: the old killpg left 437 orphaned
-    claude/agy/cursor/codex helpers (load 63, gateway liveness kills). Order matters on macOS: close the PTY master before waiting."""
+    """Kill the probe CLI and EVERY descendant, then anything left with cwd in the probe folder. 2026-09-26: the old killpg
+    left 437 orphaned claude/agy/cursor/codex helpers (load 63, gateway liveness kills). Order matters on macOS: close the
+    PTY master before waiting.
+    probe_dir None (the agy probe's shared fixed folder, #144 fix rounds 6-7): only the spawned child and its own process
+    group (pty.fork made it a session leader, so its pgid is its pid) are signalled, while the child is still unreaped,
+    so neither id can have been reused. No descendant scan (a scanned pid can be reused before the kill) and no kill by
+    cwd. A helper that left the group and stays in the folder makes the next sample skip `probe_folder_busy`."""
     untrack(pid)
-    tree = descendants(pid)
+    tree = descendants(pid) if probe_dir is not None else []
     for sig in (signal.SIGTERM, signal.SIGKILL):
         for p in [pid, *tree]:
             try:

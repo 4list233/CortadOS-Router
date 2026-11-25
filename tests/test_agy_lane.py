@@ -485,6 +485,54 @@ class ProbeHonesty(AgyBase):
         hist = sc.HISTORY.read_text().splitlines() if sc.HISTORY.exists() else []
         self.assertTrue(all("antigravity" not in json.loads(h)["lanes"] for h in hist))
 
+    def test_skip_is_published_with_its_since_time_and_goes_stale(self):
+        old = {"windows": [{"window": "week (gemini)", "pool": "gemini", "used_pct": 1.0}], "tried_at": 1.0,
+               "fetched_at": time.time(), "error": None}
+        sc.CACHE.write_text(json.dumps({"fetched_at": 0, "lanes": {"antigravity": old}}))
+
+        def busy():
+            raise sc.ProbeSkipped("agy probe skipped: 1 process(es) open", kind="probe_folder_busy")
+        sinces = []
+        for _ in range(2):
+            with mock.patch.dict(sc.SAMPLERS, {"antigravity": busy}), \
+                    mock.patch.object(sc._reaper, "sweep_stale", return_value=None), \
+                    mock.patch.object(sc, "_learn_unit_costs", lambda: None), redirect_stderr(io.StringIO()):
+                sc._sample_locked(force=True, only=["antigravity"])
+            lane = json.loads(sc.CACHE.read_text())["lanes"]["antigravity"]
+            sinces.append(lane["last_skip"]["since"])
+        self.assertEqual(sinces[0], sinces[1])                       # since the first skip of the run, not the latest
+        self.assertEqual(lane["fetched_at"], old["fetched_at"])      # the retained reading is not a new sample
+        self.assertEqual(sc.lane_state(lane), "skipped: a process is open in the probe folder")
+        self.assertEqual(sc.current_skip(lane), {"reason": "probe_folder_busy", "since": sinces[0]})
+        now = sinces[0] + 1
+        self.assertEqual(sc.reading_freshness("antigravity", lane, now=now), (True, False))
+        entry = usage._one_lane("antigravity", lane, now, sc.reading_freshness)
+        self.assertEqual((entry["state"], entry["skip"], entry["stale"]),
+                         ("skipped: a process is open in the probe folder",
+                          {"reason": "probe_folder_busy", "since": sinces[0]}, False))
+        # past SKIP_STALE_INTERVALS sample intervals the retained reading is stale, with the skip as its state
+        later = sinces[0] + sc.SKIP_STALE_INTERVALS * sc.MIN_INTERVAL["antigravity"] + 1
+        self.assertEqual(sc.reading_freshness("antigravity", lane, now=later), (False, False))
+        entry = usage._one_lane("antigravity", lane, later, sc.reading_freshness)
+        self.assertEqual((entry["stale"], entry["skip"]["reason"], entry["error"]), (True, "probe_folder_busy", None))
+        published = usage._publish({"lanes": [entry]}, [])
+        self.assertEqual(published["lanes"][0]["skip"], {"reason": "probe_folder_busy", "since": sinces[0]})
+        # a skip reason outside the fixed codes is never published as text
+        self.assertIsNone(sc.current_skip({"last_skip": {"reason": "anything else", "since": 1.0}}))
+
+    def test_a_later_failure_or_reading_ends_the_skip(self):
+        lane = {"windows": [], "fetched_at": 5.0, "tried_at": 5.0, "error": None,
+                "last_skip": {"reason": "probe_busy", "at": 9.0, "since": 6.0}}
+        rec = sc._failed_record("antigravity", lane, RuntimeError("boom"))
+        self.assertNotIn("last_skip", rec)
+        self.assertIsNone(sc.current_skip(rec))
+
+    def test_usage_view_skip_codes_match_scarcity(self):
+        allowed = usage._LANE.fields["skip"].fields["reason"]
+        self.assertEqual([k for k in sc.SKIP_KINDS if allowed(k) == k], list(sc.SKIP_KINDS))
+        self.assertIsNone(allowed("other"))
+        self.assertTrue(all(k in sc.LANE_STATE_TEXT for k in sc.SKIP_KINDS))
+
     def test_non_empty_folder_is_refused_before_agy_starts(self):
         binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
         _, workspace, _ = sc.agy_probe_paths()
@@ -566,15 +614,55 @@ class ProbeHonesty(AgyBase):
         self.assertIsNone(proc.poll())       # still running: never killed
         self.assertEqual(self.keys(log), b"")
 
-    def test_recorded_probe_child_still_alive_is_killed(self):
+    def test_recorded_probe_child_still_alive_skips_and_kills_nothing(self):
+        # #144 fix round 7: the next run never kills by a recorded pid (it can be reused between check and kill)
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
         root, _, _ = self.make_folder()
         proc = self.sleeper(self.tmp)        # the dead sampler's child, outside the folder (its cwd is not the proof)
         uid, start = sc._reaper.process_identity(proc.pid)
         self.write_record(root, {"pid": proc.pid, "uid": uid, "start": start})
-        with sc.agy_probe_workspace():
-            pass
-        self.assertEqual(proc.wait(timeout=5), -9)
+        with self.env(binary), mock.patch.object(sc.os, "kill", side_effect=AssertionError("must not kill")), \
+                mock.patch.object(sc.os, "killpg", side_effect=AssertionError("must not kill")), \
+                mock.patch.object(sc._reaper.os, "kill", side_effect=AssertionError("must not kill")), \
+                mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises(sc.ProbeSkipped) as cm:
+                sc._antigravity()
+        self.assertEqual(cm.exception.kind, "probe_leftover_running")
+        self.assertIn("probe_leftover_running", sc.SKIP_KINDS)
+        time.sleep(0.3)
+        self.assertIsNone(proc.poll())                                   # still running
+        self.assertTrue((root / sc.AGY_PROBE_CHILD_RECORD).exists())     # kept: the next run checks again
+        self.assertEqual(self.keys(log), b"")
+
+    def test_record_not_matching_a_live_process_is_dropped_and_the_sample_runs(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        root, _, _ = self.make_folder()
+        proc = self.sleeper(self.tmp)
+        uid, start = sc._reaper.process_identity(proc.pid)
+        proc.kill(); proc.wait()
+        self.write_record(root, {"pid": proc.pid, "uid": uid, "start": start})      # gone
+        with self.env(binary):
+            self.assertEqual(sc._antigravity()["tier"], "AI Pro")
         self.assertFalse((root / sc.AGY_PROBE_CHILD_RECORD).exists())
+
+    def test_end_of_probe_cleanup_signals_only_the_spawned_group(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        spawned, kills, groups = [], [], []
+        real_kill, real_killpg = os.kill, os.killpg
+
+        def kill(p, sig):
+            kills.append(p); return real_kill(p, sig)
+
+        def killpg(p, sig):
+            groups.append(p); return real_killpg(p, sig)
+        with self.env(binary), mock.patch.object(sc.agy_probe_workspace, "record_child",
+                                                 lambda ws, pid: spawned.append(pid)), \
+                mock.patch.object(sc._reaper, "descendants", side_effect=AssertionError("no descendant scan")), \
+                mock.patch.object(sc._reaper.os, "kill", kill), mock.patch.object(sc._reaper.os, "killpg", killpg):
+            sc._antigravity()
+        [pid] = spawned
+        self.assertEqual(set(kills), {pid})
+        self.assertEqual(set(groups), {pid})          # pty.fork: the child leads its own group
 
     def test_recycled_pid_is_not_killed(self):
         root, _, _ = self.make_folder()

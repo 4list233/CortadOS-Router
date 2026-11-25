@@ -27,11 +27,11 @@ from cortados_router import agy_isolation as _agy_iso
 import fcntl
 import json
 import logging
+import math
 import os
 import pty
 import re
 import select
-import signal
 import sqlite3
 import struct
 import subprocess
@@ -194,8 +194,9 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     `workdir`: run in this existing folder, as is (the agy lane's fixed, locked, trusted probe folder; the caller owns
     it and its lock). Unset: a fresh per-probe folder under PROBE_DIR, removed afterwards. `workdir_fd`: the caller's
     verified open fd of that folder; the child fchdirs into it rather than resolving the path again (#144 fix round 6).
-    With `workdir`, the end-of-probe cleanup kills the CLI and its descendants only, never other processes by cwd: the
-    folder is shared with the owner's own agy (the one-time trust step).
+    With `workdir`, the end-of-probe cleanup signals only the CLI it spawned and that CLI's own process group, never a
+    scanned pid and never other processes by cwd: the folder is shared with the owner's own agy (the one-time trust
+    step; probe_reaper.reap).
     `on_spawn(pid)` runs right after the fork (the agy lane records its child's pid and start time); `on_reaped(pid)`
     after the child was reaped.
     `page(text)` reads a scrollable answer: called with the answer so far, it returns (key, name) to press next (a
@@ -787,8 +788,29 @@ LANE_STATE_TEXT = {
     "probe_folder_unsafe": "refused: probe folder not private",
     "probe_busy": "skipped: another probe holds the probe folder",
     "probe_folder_busy": "skipped: a process is open in the probe folder",
+    "probe_leftover_running": "skipped: a previous probe's agy is still running",
     "probe_folder_unchecked": "refused: open processes in the probe folder could not be listed",
 }
+
+
+# The skip reasons a sample can end with (ProbeSkipped.kind): the lane keeps its last reading, and the skip is published
+# (lane_state, the usage view's `skip`) with the time the current run of skips began (#144 fix round 7: a shell left in
+# the probe folder used to suppress sampling with nothing shown).
+SKIP_KINDS = ("probe_busy", "probe_folder_busy", "probe_leftover_running")
+# Skipping for longer than this many of the lane's sample intervals marks its retained reading stale (reading_freshness).
+SKIP_STALE_INTERVALS = 2
+
+
+def current_skip(v: dict[str, Any] | None) -> dict[str, Any] | None:
+    """{"reason": a SKIP_KINDS code, "since": epoch} of a lane whose latest try was skipped, else None. A fresh reading
+    or a failure replaces the record's `last_skip`, so its presence means the skip is current."""
+    sk = v.get("last_skip") if isinstance(v, dict) else None
+    if not isinstance(sk, dict) or sk.get("reason") not in SKIP_KINDS:
+        return None
+    since = sk.get("since", sk.get("at"))
+    if isinstance(since, bool) or not isinstance(since, (int, float)) or not math.isfinite(since):
+        return None
+    return {"reason": sk["reason"], "since": float(since)}
 
 
 def lane_state(v: dict[str, Any] | None) -> str | None:
@@ -797,7 +819,10 @@ def lane_state(v: dict[str, Any] | None) -> str | None:
         return None
     if v.get("state") in LANE_STATE_TEXT:
         return LANE_STATE_TEXT[v["state"]]
-    return LANE_STATE_TEXT.get(v.get("error_kind")) if v.get("error") else None
+    if v.get("error"):
+        return LANE_STATE_TEXT.get(v.get("error_kind"))
+    sk = current_skip(v)
+    return LANE_STATE_TEXT[sk["reason"]] if sk else None
 
 
 def _agy_pool_of_group(title: str) -> str | None:
@@ -850,7 +875,8 @@ class ProbeFolderRefused(RuntimeError):
 
 class ProbeSkipped(RuntimeError):
     """This sample is skipped (not a failure; the last reading stays): another probe holds the fixed folder's lock
-    (`probe_busy`), or a process has its cwd in the folder (`probe_folder_busy`, #144 fix round 6)."""
+    (`probe_busy`), a process has its cwd in the folder (`probe_folder_busy`, #144 fix round 6), or the previous run's
+    recorded probe child still runs (`probe_leftover_running`, #144 fix round 7). One of SKIP_KINDS."""
     kind = "probe_busy"
 
     def __init__(self, message: str, kind: str | None = None):
@@ -866,9 +892,10 @@ def agy_probe_paths() -> tuple[Path, Path, Path]:
 
 
 # The probe's own child, recorded inside agy-probe (opened by its dir fd) as {"pid", "uid", "start"} while it runs, so a
-# sampler that died mid-probe leaves a record the next run can act on. The next run kills ONLY a process matching that
-# exact pid AND start time AND uid (#144 fix round 6: killing by cwd would have hit the owner's own agy during the
-# one-time trust step, and a recycled pid is never the probe's).
+# sampler that died mid-probe leaves a record the next run can see. The next run kills NOTHING (#144 fix round 7: a
+# pid checked once and killed later can be reused in between, and ps's start time is to the second): while a process
+# matches the record's pid, uid and start time it skips its sample (`probe_leftover_running`), published in the lane's
+# state; otherwise it drops the record and goes on.
 AGY_PROBE_CHILD_RECORD = "probe-child"
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
 _MAX_SYMLINK_HOPS = 40
@@ -980,9 +1007,9 @@ def _open_private_child(parent_fd: int, name: str, label: Path) -> int:
 
 class agy_probe_workspace:
     """Context manager: open and check the fixed folder by fd (_open_state_dir, _open_private_child), take its exclusive
-    lock (opened relative to the agy-probe fd; at most AGY_PROBE_LOCK_WAIT_S, else ProbeSkipped `probe_busy`), kill the
-    previous run's recorded child if it still runs (exact pid + start time + uid only), skip the sample
-    (`probe_folder_busy`) if any process has its cwd in the folder, require it empty (ProbeFolderRefused
+    lock (opened relative to the agy-probe fd; at most AGY_PROBE_LOCK_WAIT_S, else ProbeSkipped `probe_busy`), skip the
+    sample if the previous run's recorded child still runs (`probe_leftover_running`; nothing is killed) or any process
+    has its cwd in the folder (`probe_folder_busy`), require it empty (ProbeFolderRefused
     `probe_folder_not_clean`), yield the folder's path; `workspace_fd` is the verified folder the child fchdirs into.
     Release the lock and close every fd on exit. Nothing here starts agy."""
 
@@ -1030,7 +1057,7 @@ class agy_probe_workspace:
                     if time.monotonic() >= deadline:
                         raise ProbeSkipped(f"agy probe skipped: another probe held {lock} for {self.wait_s:g} s")
                     time.sleep(0.2)
-            self._kill_recorded_child()
+            self._check_recorded_child()
             try:
                 busy = _reaper.cwd_pids_in(workspace)
             except Exception as exc:
@@ -1081,23 +1108,16 @@ class agy_probe_workspace:
             pass
         return {}                      # unreadable: names no process; removed below
 
-    def _kill_recorded_child(self) -> None:
-        """Kill the previous run's probe child (and its descendants) only while a process still matches the record's
-        pid, start time and uid; then drop the record. A process that cannot be identified keeps the record."""
+    def _check_recorded_child(self) -> None:
+        """While a process still matches the previous run's record (pid, uid and start time) skip this sample
+        (`probe_leftover_running`) and kill nothing; a record naming no live match is dropped. ps failing raises (the
+        record stays)."""
         rec = self._read_record()
         if rec is None:
             return
-        if rec:
-            ident = _reaper.process_identity(rec["pid"])         # raises if ps could not run: the record stays
-            if ident is not None and ident == (rec["uid"], rec["start"]) and rec["uid"] == os.geteuid():
-                for p in [*_reaper.descendants(rec["pid"]), rec["pid"]]:
-                    try:
-                        os.kill(p, signal.SIGKILL)
-                    except OSError:
-                        pass
-                deadline = time.monotonic() + 3.0
-                while time.monotonic() < deadline and _reaper.process_identity(rec["pid"]) == ident:
-                    time.sleep(0.1)
+        if rec and _reaper.process_identity(rec["pid"]) == (rec["uid"], rec["start"]):
+            raise ProbeSkipped(f"agy probe skipped: the previous probe's agy (pid {rec['pid']}) still runs; "
+                               "agy was not started", kind="probe_leftover_running")
         self.clear_child()
 
     def record_child(self, pid: int) -> None:
@@ -1342,6 +1362,7 @@ def _failed_record(lane: str, old: dict[str, Any] | None, exc: BaseException) ->
     kind = own if isinstance(own, str) and own else failure_kind(err)
     rec = {**old, "tried_at": time.time(), "error": err, "error_kind": kind}
     rec.pop("state", None)            # a "not configured" record is not carried into a failure: the failure is the state now
+    rec.pop("last_skip", None)        # nor a skip
     rec.pop("note", None)
     # The full list of places looked, beyond the 200-char summary above; dropped when this failure carries none, so a
     # stale list from an earlier failure never describes a different one.
@@ -1692,7 +1713,12 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
                                  "scarcity": None, "refusing": False, "fetched_at": None, "tried_at": time.time(),
                                  "error": None, "error_kind": None}
             except ProbeSkipped as exc:   # not a failure: the last reading stays, the next sample tries again
-                results[lane] = {**(lanes.get(lane) or {}), "last_skip": {"reason": exc.kind, "at": time.time()}}
+                old = lanes.get(lane) or {}
+                at = time.time()
+                prev_skip = current_skip(old)
+                # `since`: when this run of skips for the same reason began (published, and the stale rule's clock)
+                since = prev_skip["since"] if prev_skip and prev_skip["reason"] == exc.kind else at
+                results[lane] = {**old, "last_skip": {"reason": exc.kind, "at": at, "since": since}}
                 skipped.add(lane)         # the old reading is not a new sample: kept out of the history below
                 try:
                     print(f"cortados scarcity: {lane} sample skipped ({exc.kind}): {exc}", file=sys.stderr, flush=True)
@@ -1810,6 +1836,11 @@ def reading_freshness(lane: str, v: dict[str, Any], max_reading_age_s: int = 6 *
     # lane stale in the routing view at once; the reading stays on disk for diagnostics (Codex adversarial review
     # 2026-10-21: a refused screen had kept a 15-minute-old reading "fresh" for up to six hours).
     failed = bool(v.get("error")) and float(v.get("tried_at") or 0) > float(v.get("fetched_at") or 0)
+    # Skipped for longer than SKIP_STALE_INTERVALS sample intervals (#144 fix round 7): the retained reading is stale,
+    # with the skip's reason as its state (lane_state), not a failure.
+    sk = current_skip(v)
+    if sk and now - sk["since"] > SKIP_STALE_INTERVALS * (MIN_INTERVAL.get(lane) or MIN_INTERVAL.get(lane.split("#", 1)[0], 900)):
+        fresh = False
     return fresh and not failed, failed
 
 
