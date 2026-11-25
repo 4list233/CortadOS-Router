@@ -190,6 +190,12 @@ CHILD_TOOLS = [
                              "read-only planning. acceptEdits, manual and dontAsk are refused with no allowed_tools "
                              "(such a child could only read or edit files). bypassPermissions is deliberately not "
                              "offered."},
+         "delegate": {"type": "boolean", "description": "Opt-in (default false), main session only: make the child "
+                      "a SUB-ORCHESTRATOR that plans the task, starts its own worker tasks (one more layer: its "
+                      "workers can never start tasks), verifies them and reports with every worker's id and state. "
+                      "It gets start_task/route_task and the other task tools; cancelling it cancels its workers. "
+                      "Use it for a big task that splits into several independent pieces. Refused from inside a "
+                      "child task and with chrome: true."},
          "chrome": {"type": "boolean", "description": "Opt-in (default false): LOGIN MODE. The child runs directly on "
                     "the user's claude.ai login (NOT routed by S1; spends the main Claude subscription) so Claude in "
                     "Chrome loads; it acts in the user's real signed-in Chrome in its own tab group. Model: cortados -> "
@@ -433,7 +439,7 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
                            a.get("connectors"), client=cfg.get("client"), title=a.get("title"),
                            session_tag=cfg.get("session_tag"), repo=a.get("repo"), branch=a.get("branch"),
                            host=a.get("host"), parent_task_id=a.get("parent_task_id"), local=a.get("local"),
-                           origin=task_origin(cfg))
+                           origin=task_origin(cfg), delegate=a.get("delegate", False))
             if isinstance(out, dict) and out.get("origin_session") is None and cfg.get("client") != \
                     ct.BOT_ORIGIN and "origin_note" not in out:
                 # a nested task may have inherited its parent's origin (then origin_session is set): only a task that
@@ -512,6 +518,17 @@ def _rpc_error(base: dict, code: int, message: str) -> dict:
 VIA_HEADER = "x-cortados-via"                       # provider/office.VIA_HEADER (a test keeps the two equal)
 
 
+def _sub_orchestrator() -> bool:
+    """Inside a child task, route_task is allowed only to a sub-orchestrator (start_task's `delegate: true`), decided as
+    start_task decides depth: by the caller's record on this host (child_tasks.caller_identity: the nearest child-task
+    runner among this process's ancestors), never by an env var. Anything that cannot be decided is a refusal."""
+    try:
+        ident = _child_module().caller_identity()
+    except Exception:
+        return False
+    return bool(ident and ident.get("delegate") and ident.get("depth") == 1)
+
+
 def route_task_office_headers(client=None, env=None) -> dict:
     """The work split's attribution of a route_task call (#127): x-cortados-session = this session's Office tag (the same
     tag start_task records as a task's origin and the pulse pane computes: origin_tag of the machine's shared salt and
@@ -537,7 +554,7 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
     # token (a real one is a long random string) is refused instead of sent, so the scrub never has to choose between
     # leaking a short credential and mangling ordinary words that happen to contain it.
     scrub = lambda s: s.replace(token, "***") if token else s
-    if os.environ.get(NESTED_ENV):
+    if os.environ.get(NESTED_ENV) and not _sub_orchestrator():
         return _err("route_task is not available inside a CortadOS child task: do the work yourself")
     if not (provider_url and token):
         return _err("cortados route_task is not configured: set CORTADOS_PROVIDER_URL and CORTADOS_PROVIDER_TOKEN")

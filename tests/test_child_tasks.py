@@ -360,6 +360,10 @@ class InstalledClaudeTests(unittest.TestCase):
         self.assertIn("--permission-prompts", out)
 
 
+REMOTE_WRAPPER = ("import sys; sys.path.insert(0, sys.argv[1]); from cortados_router import child_tasks as ct; "
+                  "ct.ANCESTRY_SCOPE = 'tasks_dir'; sys.exit(ct.serve_remote())")
+
+
 class ChildTaskBase(unittest.TestCase):
     """Fixtures shared by the child-task suites (this file and tests/test_task_watch.py): a fake claude binary, a
     throwaway tasks dir / CORTADOS_HOME / hosts file, a local host 'here' and (via _air) a remote host 'air' whose
@@ -480,7 +484,9 @@ class ChildTaskBase(unittest.TestCase):
             env = {**os.environ, "HOME": self.air_home, "CORTADOS_TASKS_DIR": os.path.join(self.air_home, "tasks"),
                    "CORTADOS_HOME": os.path.join(self.air_home, "state"), "CORTADOS_EXEC_HOSTS_FILE": air_hosts,
                    "CORTADOS_PROVIDER_TOKEN": "", "CORTADOS_PROVIDER_TOKEN_FILE": "", "CORTADOS_PROVIDER_URL": ""}
-            p = subprocess.run([sys.executable, "-B", str(Path(ct.__file__)), "--remote"], input=stdin,
+            # --remote as the module's own CLI does it, with the suite's ancestry scope (tests/__init__.py): a suite run
+            # inside a real child task must not see that task's runner as the caller of the host's start
+            p = subprocess.run([sys.executable, "-B", "-c", REMOTE_WRAPPER, str(ct.REPO_ROOT)], input=stdin,
                                capture_output=True, env=env, timeout=timeout)
             return p.returncode, p.stdout, p.stderr
         t = mock.patch.object(ct.exec_hosts, "TRANSPORT", transport or run_remote)
@@ -3961,7 +3967,13 @@ class StartTaskErrorTextTests(ChildTaskBase):
         self.assertNotIn("_meta", r)
 
     def test_a_failure_during_the_spawn_is_ambiguous(self):
-        with mock.patch.object(ct.subprocess, "Popen", side_effect=ValueError("secret-record-content")):
+        real = subprocess.Popen
+
+        def popen(argv, *a, **kw):
+            if argv and argv[0] == ct.PS:               # the caller's depth check (ps) runs before the spawn: real
+                return real(argv, *a, **kw)
+            raise ValueError("secret-record-content")
+        with mock.patch.object(ct.subprocess, "Popen", side_effect=popen):
             r, _ = self.call("start_task", task="x", cwd=self.work)
         text = self._text(r)
         self.assertIn("unexpected ValueError", text)

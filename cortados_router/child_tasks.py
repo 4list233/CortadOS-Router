@@ -42,6 +42,7 @@ Stdlib only.
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import hmac
@@ -281,7 +282,7 @@ def wait_max_s(env=None) -> float:
     return v
 
 
-NESTED_ENV = "CORTADOS_CHILD_TASK"  # set in every child: a child may not start children (runaway quota fan-out)
+NESTED_ENV = "CORTADOS_CHILD_TASK"  # set in every child (a claim: depth itself comes from caller_identity, not from this)
 # Claude Code refuses to start inside another Claude Code session when it sees this; the child is a fresh session.
 STRIP_ENV = ("CLAUDECODE",)
 MANAGED_DIRS = session.MANAGED_SETTINGS_DIRS   # tests point this elsewhere
@@ -294,6 +295,54 @@ CHILD_DIRECTIVE = ("You are a CortadOS CHILD TASK started by an orchestrator. Do
                    "report of what you did, what you verified, and anything left undone. Never end a turn while a "
                    "background job you started will take more than 25 minutes: poll it (check its output every few "
                    "minutes) until it finishes instead, because an idle conversation can be closed.")
+
+
+# --- nested child tasks: one more layer (owner decision 2026-11-25, docs/NESTED-TASKS.md) ---------------------------
+# Depth: the main session is 0, a child it starts is 1, a child a depth-1 SUB-ORCHESTRATOR starts is 2 (a worker).
+# Only a depth-0 caller may start a sub-orchestrator (`delegate: true`); only a sub-orchestrator may start tasks from
+# inside a child; workers never start. The caller's depth is NOT read from an env var a child could unset: it is the
+# record of the nearest child-task RUNNER among the caller's process ancestors on this host (caller_identity), so the
+# MCP server a child launches, any script it runs and any edited copy of either all resolve to that child's record.
+MAX_DEPTH = 2
+TASK_ID_ENV = "CORTADOS_TASK_ID"            # set in every child: its own task id (a claim, checked; see caller_identity)
+TASK_DEPTH_ENV = "CORTADOS_TASK_DEPTH"      # informational only: never read to decide anything
+TASK_DELEGATE_ENV = "CORTADOS_TASK_DELEGATE"   # informational only (1 in a sub-orchestrator)
+CLAIM_ENVS = (NESTED_ENV, TASK_ID_ENV)      # either one set says "I am inside a child task"
+CHILDREN_DIR = "children"                   # in a sub-orchestrator's task dir: one empty file per child it started
+CHILDREN_LOCK = "children.lock"             # held while a child is started, and by cancel() while it marks the parent
+CHILDREN_LOCK_WAIT_S = 120                  # longer than one remote start's ssh call; a stuck holder is reported, not waited on
+CHILDREN_MAX = 500                          # children read per parent: bounded (status, cancel, the runner's report)
+# A sub-orchestrator blocks in the FOREGROUND on its children: the watcher with this timeout fits under the Bash tool's
+# 10-minute limit (600000 ms), and exit 3 means "still running, run it again" (SUB_ORCHESTRATOR_DIRECTIVE).
+SUB_WAIT_TIMEOUT_S = 540
+# Matches the runner's own command line, as _start (spawn: `--run <d> --lock-fd N`) and _launch_launchd (`--run <d>`)
+# write it. Any tasks root: the root in the command line is the runner's own, not an env var of the caller.
+RUNNER_CMD_RE = re.compile(r"child_tasks\.py --run (/.*/(t\d{14}-[0-9a-f]{8}))(?: --lock-fd \d+)?$")
+# Which runner ancestors count: "any" (production: wherever the runner's tasks root is) or "tasks_dir" (only runners under
+# this process's tasks_dir(); tests/__init__.py sets it, so a suite run INSIDE a real child task does not see its own
+# runner as the caller of every in-process start). A module attribute, never an env var: an env var would be the very
+# forgery this guard exists to stop; code that patches this module in its own process can already run claude directly.
+ANCESTRY_SCOPE = "any"
+
+SUB_ORCHESTRATOR_DIRECTIVE = (
+    "You are a CortadOS SUB-ORCHESTRATOR: a child task the owner's main session started with delegate: true (depth 1 "
+    "of 2). Your job is to plan, delegate, verify and report: break the task into self-contained pieces, start each "
+    "with mcp__cortados-route__start_task (route_task for a text-only answer), check every result against its "
+    "acceptance check, re-delegate or fix what is wrong, and report. Act directly only for trivial steps (reading files "
+    "to plan, a one-line fix, merging your workers' branches). Your children are WORKERS: they cannot start tasks, "
+    "chrome: true is refused for them, delegate: true is refused, and parent_task_id is set to your task id for you. "
+    "They run on your host unless you name another (host 'here' is your host). Put everything a worker needs in its "
+    "task text: it does not see your conversation. "
+    "WORKSPACES: give each worker `repo` and either no `branch` (it gets task/<its id>) or a new branch name of its "
+    "own; never the branch you hold (refused while you have it checked out). When they are done, fetch and merge "
+    "their branches into yours yourself, then run the tests. "
+    "WAITING: you run headless, so do not rely on background-command notifications. After starting workers, block in "
+    "the FOREGROUND: run the `wait_command` from start_task's result (put every running worker's id in ONE command) "
+    "with the Bash tool's timeout set to 600000 ms. Exit 3 means some are still running: run it again. Exit 0, 1 or 2 "
+    "means every listed task ended (or could not be watched): read each one's task_status. Never end your turn while "
+    "a worker you started is still running, unless your final report says so explicitly and names its task id. "
+    "Your final message is returned to the main session: end with what was done and by which worker (task id and "
+    "final state of EVERY child you started), what you verified, and anything left undone.")
 
 
 # --- chrome: true = LOGIN MODE (Forest's decision, 2026-11-03) ---------------------------------------------------
@@ -879,7 +928,9 @@ def route_server_entry(provider_url: str, token_file=None) -> dict:
     """cortados-route as a connector child's strict MCP config carries it: the absolute path of subagent_mcp.py and the
     interpreter on THIS host (the execution host: _prepare runs there), with the env the README's registration gives it
     (CORTADOS_PROVIDER_URL, CORTADOS_CHILD_CLAUDE_BIN when set) plus the token FILE when one was given (never a token)
-    and NESTED_ENV, so start_task and route_task are refused even if the child's own env were not inherited."""
+    and NESTED_ENV. Whether its start_task / route_task may run is decided by the caller's task record
+    (caller_identity: the runner above the server), not by this env: refused in a plain child or a worker, allowed in a
+    sub-orchestrator (docs/NESTED-TASKS.md)."""
     env = {NESTED_ENV: "1"}
     if provider_url:
         env["CORTADOS_PROVIDER_URL"] = provider_url
@@ -1033,12 +1084,15 @@ def _remote(host_name: str, op: str, args: dict, timeout_s=None) -> dict:
     return out
 
 
-def _write_stub(root: str, task_id: str, host_name: str, origin: dict | None = None) -> None:
+def _write_stub(root: str, task_id: str, host_name: str, origin: dict | None = None, parent_task_id=None) -> None:
     """The local record of a task running on execution host `host_name` (status, wait and cancel go there), with the
-    orchestrator that started it (clean_origin fields, metadata only) so the live view attributes it here too."""
+    orchestrator that started it (clean_origin fields, metadata only) so the live view attributes it here too, and its
+    parent task when it has one."""
     d = os.path.join(root, task_id)
     os.mkdir(d, 0o700)
     rec = {"host": host_name, "created_at": time.time()}
+    if isinstance(parent_task_id, str) and TASK_ID_RE.fullmatch(parent_task_id):
+        rec["parent_task_id"] = parent_task_id
     o = {k: v for k, v in (origin or {}).items() if v}
     if o:
         rec["origin"] = o
@@ -1106,6 +1160,194 @@ def start(*args, **kwargs) -> dict:
         raise StartFailed(type(exc).__name__, _start_where(), progress["launched"], progress["task_id"]) from None
 
 
+def _process_table():
+    """{pid: (ppid, command)} of every process (one `ps` call), or raises TaskError: an unreadable table never reads as
+    "no runner above me" (that would make any caller depth 0)."""
+    try:
+        r = subprocess.run([PS, "-axww", "-o", "pid=,ppid=,command="], capture_output=True, text=True,
+                           timeout=PS_TIMEOUT_S, errors="replace")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TaskError(f"cannot tell whether the caller runs inside a child task (ps failed: {type(exc).__name__}); "
+                        "start_task refused, try again") from None
+    if r.returncode != 0:
+        raise TaskError(f"cannot tell whether the caller runs inside a child task (ps exited {r.returncode}); "
+                        "start_task refused, try again")
+    table = {}
+    for line in r.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) == 3 else "")
+    return table
+
+
+def _ancestor_run_dir(pid=None, table=None):
+    """The task dir of the NEAREST child-task runner among `pid`'s ancestors (this process by default), or None. The
+    runner's command line names its dir (RUNNER_CMD_RE); with ANCESTRY_SCOPE "tasks_dir" only runners under this
+    process's tasks_dir() count."""
+    table = _process_table() if table is None else table
+    cur, seen = os.getpid() if pid is None else pid, set()
+    root = tasks_dir()
+    while cur and cur > 1 and cur not in seen and len(seen) < 256:
+        seen.add(cur)
+        ppid, cmd = table.get(cur, (0, ""))
+        m = RUNNER_CMD_RE.search(cmd.rstrip())
+        if m and (ANCESTRY_SCOPE != "tasks_dir" or os.path.dirname(m.group(1)) == root):
+            return m.group(1)
+        cur = ppid
+    return None
+
+
+def _identity_of(d: str) -> dict:
+    """A task's nesting record from its meta.json (a task from before nesting existed is depth 1, no delegate)."""
+    meta = _read_json(os.path.join(d, "meta.json")) or {}
+    depth = meta.get("depth")
+    depth = depth if isinstance(depth, int) and 1 <= depth <= MAX_DEPTH else 1
+    return {"task_id": os.path.basename(d), "dir": d, "depth": depth,
+            "delegate": meta.get("delegate") is True and depth == 1, "host": meta.get("host")}
+
+
+def caller_identity():
+    """None when the caller is not inside a child task (depth 0), else {task_id, dir, depth, delegate, host}: the record
+    of the nearest child-task runner among this process's ancestors. Why not an env var: a child can unset any env var,
+    or start an edited copy of the cortados-route server, but it cannot change which runner it was started under.
+    A process that SAYS it is in a child task (CORTADOS_CHILD_TASK or CORTADOS_TASK_ID set) without a runner among its
+    ancestors (it detached) gets its claimed task's record if that task is running here, else is refused: never
+    depth 0. Residual (docs/NESTED-TASKS.md): a child that both detaches from its process tree and scrubs its
+    environment runs its own code as the owner, which could equally run `claude` itself; that is outside this guard."""
+    d = _ancestor_run_dir()
+    if d is not None:
+        if not os.path.isdir(d):
+            raise TaskError(f"the child task this caller runs in ({os.path.basename(d)}) has no record on this host; "
+                            "start_task refused")
+        return _identity_of(d)
+    if not any(os.environ.get(k) for k in CLAIM_ENVS):
+        return None
+    claim = os.environ.get(TASK_ID_ENV) or ""
+    if TASK_ID_RE.fullmatch(claim):
+        cd = os.path.join(tasks_dir(), claim)
+        if os.path.isdir(cd) and _lock_held(cd):
+            return _identity_of(cd)
+    raise TaskError("start_task is not available here: this process says it runs inside a child task "
+                    f"({'/'.join(CLAIM_ENVS)} set) but no running child task on this host is its ancestor; workers "
+                    "never start tasks, and a sub-orchestrator starts them from its own session")
+
+
+def _refuse_depth(msg: str, **fields):
+    """A depth refusal: counted (a `refused` event, reason depth_limit, in child-tasks.jsonl), then raised."""
+    log_event("refused", reason="depth_limit", **{k: v for k, v in fields.items() if v is not None})
+    raise TaskError(msg)
+
+
+def check_depth(caller, delegate, chrome, requested_depth=None) -> int:
+    """The new task's depth, or a TaskError naming the rule. `caller`: caller_identity(). `requested_depth`: what a
+    requesting execution host computed for a --remote start (it can see the caller's process tree; this host cannot);
+    the deeper of the two wins."""
+    if not isinstance(delegate, bool):
+        raise TaskError("delegate must be true or false")
+    depth = 1 if caller is None else caller["depth"] + 1
+    if requested_depth is not None:
+        if not (isinstance(requested_depth, int) and 1 <= requested_depth <= MAX_DEPTH + 1):
+            raise TaskError(f"depth must be 1..{MAX_DEPTH} (sent by the requesting execution host)")
+        depth = max(depth, requested_depth)
+    who = caller["task_id"] if caller else None
+    if caller is not None and caller["depth"] >= MAX_DEPTH:
+        _refuse_depth(f"start_task refused: this is a worker task (depth {caller['depth']}, started by a "
+                      "sub-orchestrator); workers never start tasks. Do the work yourself and report.",
+                      caller_task_id=who, caller_depth=caller["depth"])
+    if caller is not None and not caller["delegate"]:
+        _refuse_depth("start_task refused: this child task was not started with delegate: true, so it may not start "
+                      "tasks (children may not start children unless the main session made them a sub-orchestrator). "
+                      "Do the work yourself and report.", caller_task_id=who, caller_depth=caller["depth"])
+    if depth > MAX_DEPTH:
+        _refuse_depth(f"start_task refused: the new task would be at depth {depth}; at most {MAX_DEPTH} levels "
+                      "(main session, sub-orchestrator, workers)", caller_task_id=who, depth=depth)
+    if delegate and depth != 1:
+        _refuse_depth("delegate: true refused: only the main session may start a sub-orchestrator; a "
+                      "sub-orchestrator's children are workers (one layer of nesting only)", caller_task_id=who,
+                      depth=depth)
+    if depth > 1 and chrome:
+        _refuse_depth("chrome: true refused from a sub-orchestrator: Chrome serves one client per machine and browser "
+                      "tasks are the owner's to start; ask the main session for it in your report",
+                      caller_task_id=who, depth=depth)
+    if delegate and chrome:
+        raise TaskError("delegate: true is not used with chrome: true (a sub-orchestrator plans and delegates; a "
+                        "login-mode session would hold the host's Chrome lock the whole time)")
+    return depth
+
+
+@contextlib.contextmanager
+def _children_guard(caller):
+    """Held around a sub-orchestrator's start: its children lock, and a refusal once cancel() has marked it (the
+    `cancelled` marker, written under the same lock). So a cancel either sees every child a start recorded, or the
+    start sees the marker and starts nothing: no grandchild escapes a cancel cascade."""
+    if caller is None:
+        yield
+        return
+    d = caller["dir"]
+    fd = os.open(os.path.join(d, CHILDREN_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            _flock_wait(fd, CHILDREN_LOCK_WAIT_S)
+        except TimeoutError:
+            raise TaskError(f"start_task refused: task {caller['task_id']}'s children lock is busy (a cancel or "
+                            "another start holds it); try again") from None
+        if os.path.exists(os.path.join(d, "cancelled")):
+            raise TaskError(f"start_task refused: task {caller['task_id']} is being cancelled")
+        yield
+    finally:
+        os.close(fd)
+
+
+def _record_child(caller, child_id: str) -> None:
+    """<parent dir>/children/<child id>: the parent's list of the children it started (cancel cascade, status, the
+    runner's report). Written under _children_guard; a failure fails the start (an unrecorded child would escape a
+    cancel), so callers write it before the spawn where they can."""
+    if caller is None:
+        return
+    cd = os.path.join(caller["dir"], CHILDREN_DIR)
+    os.makedirs(cd, mode=0o700, exist_ok=True)
+    os.close(os.open(os.path.join(cd, child_id), os.O_WRONLY | os.O_CREAT, 0o600))
+
+
+def _unrecord_child(caller, child_id: str) -> None:
+    """Undo _record_child for a start that was rolled back completely (nothing runs)."""
+    if caller is None:
+        return
+    try:
+        os.unlink(os.path.join(caller["dir"], CHILDREN_DIR, child_id))
+    except FileNotFoundError:
+        pass
+
+
+def _nesting_fields(out: dict, task_id: str, depth: int, delegate: bool, caller) -> None:
+    """start()'s result: the new task's depth, whether it is a sub-orchestrator, and inside a sub-orchestrator its
+    parent and the foreground wait command (SUB_ORCHESTRATOR_DIRECTIVE)."""
+    out["depth"] = depth
+    if delegate:
+        out["delegate"] = True
+    if caller is not None:
+        out["parent_task_id"] = caller["task_id"]
+        out["wait_command"] = wait_command(task_id)
+        out["wait_note"] = (f"run wait_command in the FOREGROUND (Bash timeout 600000 ms); exit 3 after "
+                            f"{SUB_WAIT_TIMEOUT_S} s means still running: run it again. Several ids in one command: "
+                            "append them after the first id.")
+
+
+def children_of(d: str) -> list:
+    """The ids of the children task dir `d` started (sorted, bounded by CHILDREN_MAX)."""
+    try:
+        names = os.listdir(os.path.join(d, CHILDREN_DIR))
+    except FileNotFoundError:
+        return []
+    return sorted(n for n in names if TASK_ID_RE.fullmatch(n))[:CHILDREN_MAX]
+
+
+def wait_command(task_id: str) -> str:
+    """The FOREGROUND form of watch_command for a sub-orchestrator: exits 3 after SUB_WAIT_TIMEOUT_S, under the Bash
+    tool's 10-minute limit, so it is run again until it exits 0/1/2."""
+    return f"{watch_command(task_id)} --timeout {SUB_WAIT_TIMEOUT_S}"
+
+
 def _start_where() -> str:
     return (f"execution host {exec_hosts.short_hostname()}" if _REMOTE_SERVING
             else f"the cortados-route server on {exec_hosts.short_hostname()}")
@@ -1114,7 +1356,37 @@ def _start_where() -> str:
 def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=None, allowed_tools=None,
            provider_url="", token_file=None, chrome=False, red=None, connectors=None, client=None,
            title=None, session_tag=None, repo=None, branch=None, host=None, parent_task_id=None, local=None,
-           origin=None) -> dict:
+           origin=None, delegate=False, depth=None) -> dict:
+    """Nesting (docs/NESTED-TASKS.md), then _start_task. `delegate` (only from depth 0) makes the new task a
+    sub-orchestrator; `depth` is sent only by a requesting execution host (--remote). Inside a sub-orchestrator the
+    parent, the default host ('here': the sub-orchestrator's own) and the origin (the parent's, so the task stays in
+    the main session's tree) are set here, and the whole start runs under its children guard."""
+    caller = caller_identity()
+    new_depth = check_depth(caller, delegate, chrome is True, depth)
+    if caller is not None:
+        if parent_task_id not in (None, "", caller["task_id"]):
+            raise TaskError(f"parent_task_id is set for you inside a sub-orchestrator (your own task id, "
+                            f"{caller['task_id']}); omit it")
+        parent_task_id = caller["task_id"]
+        origin = None
+        if host is None:
+            host = "here"
+    with _children_guard(caller):
+        return _start_task(progress, task, cwd, orchestrator, permission_mode, allowed_tools, provider_url, token_file,
+                           chrome, red, connectors, client, title, session_tag, repo, branch, host, parent_task_id,
+                           local, origin, delegate, new_depth, caller)
+
+
+def _origin_arg(o: dict):
+    """clean_origin's output back in its input shape (a --remote start's `origin` argument), or None when empty."""
+    arg = {"session": o.get("origin_session"), "project": o.get("origin_project"), "device": o.get("origin_device"),
+           "machine": o.get("origin_machine")}
+    return arg if any(arg.values()) else None
+
+
+def _start_task(progress, task, cwd, orchestrator, permission_mode, allowed_tools, provider_url, token_file, chrome,
+                red, connectors, client, title, session_tag, repo, branch, host, parent_task_id, local, origin,
+                delegate, depth, caller) -> dict:
     """`client` (optional, e.g. "grokbot" from the bot gateway) is recorded in meta.json and every event line, so usage
     can be attributed to the caller. `red` carries the launch credentials (env token and token file's token as they are now). `permission_mode`
     None picks auto where the model supports it (resolve_permission_mode). `title` (<= 80 chars) and `session_tag`
@@ -1126,9 +1398,6 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
     child carry x-cortados-local (the provider's sensitive-request routing); login mode (chrome) is not routed, so the
     two are refused together. `origin` ({session, project, device}, subagent_mcp.task_origin) names the main session
     that started it: meta.json's `origin` and every event's origin_* fields (clean_origin)."""
-    if os.environ.get(NESTED_ENV):
-        raise TaskError("start_task is not available inside a child task: children may not start children "
-                        "(unbounded fan-out would spend subscription quota unattended)")
     tools = _validate(task, cwd, orchestrator, permission_mode, allowed_tools)
     parent_id, parent_note = resolve_parent(parent_task_id)
     if not isinstance(chrome, bool):
@@ -1164,13 +1433,18 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
         start_red = _start_redactor(red)
         _refuse_credentials(start_red, {"cwd": cwd, "repo": repo, "branch": branch, "orchestrator": orchestrator,
                                         "allowed_tools": tools, "session": session_tag})
+        if caller is not None:
+            # the host does not know the parent: send it the parent's origin, so the task joins the main session's tree
+            origin = _origin_arg(parent_origin(root, parent_id))
         args = {"task": start_red.text(task), "cwd": cwd, "orchestrator": orchestrator,
                 "permission_mode": permission_mode, "allowed_tools": allowed_tools, "chrome": chrome,
                 "connectors": connectors, "client": start_red.text(str(client)) if client else client,
                 "title": start_red.text(title) if isinstance(title, str) else title,
                 "session_tag": session_tag, "repo": repo, "branch": branch,
                 "parent_task_id": parent_id,   # resolved here: the host's own env does not know this session
-                "origin": origin, **({"local": local} if local else {})}
+                "origin": origin, **({"local": local} if local else {}),
+                # the caller's depth is known HERE (its process tree); the host records it and refuses what it forbids
+                "depth": depth, **({"delegate": True} if delegate else {})}
         progress["launched"] = "maybe"         # from here the request may reach the host and launch a child
         stub_origin = clean_origin(origin)
         if stub_origin["origin_session"] is None and parent_id:
@@ -1180,7 +1454,8 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
         except StartFailed as exc:
             if exc.launched == "yes":
                 try:                            # the host has the task: make it trackable here, as a success would
-                    _write_stub(root, exc.task_id, target.name, stub_origin)
+                    _write_stub(root, exc.task_id, target.name, stub_origin, parent_id)
+                    _record_child(caller, exc.task_id)
                 except Exception:
                     raise StartFailed(exc.exc_type, exc.where, "maybe") from None
             raise
@@ -1197,7 +1472,8 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
         progress.update(launched="yes", task_id=tid)
         d = os.path.join(root, tid)
         try:
-            _write_stub(root, tid, target.name, stub_origin)
+            _write_stub(root, tid, target.name, stub_origin, parent_id)
+            _record_child(caller, tid)          # under the children guard: a cancel cascade reaches it
         except BaseException as exc:
             shutil.rmtree(d, ignore_errors=True)
             try:
@@ -1209,8 +1485,16 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
                             "the remote task was cancelled") from None
         out["host"] = target.name
         out["watch_command"] = watch_command(tid)   # THIS machine's command (the host's own, if any, is not ours)
+        host_depth, host_delegate = out.get("depth"), out.get("delegate", False)   # what the HOST recorded
+        _nesting_fields(out, tid, depth, delegate, caller)
         # the origin recorded for the task, as this machine recorded it in the stub (the pulse pane follows it, #127)
         out["origin_session"] = stub_origin.get("origin_session")
+        if host_depth != depth or host_delegate != delegate:
+            # An execution host on an older checkout ignores depth/delegate: the task runs as a plain child there.
+            out.setdefault("warnings", []).append(
+                f"execution host {target.describe()} did not confirm depth {depth}"
+                + (" or delegate: true (it runs as a plain child task there and cannot start workers)" if delegate else "")
+                + " (an older cortados-router checkout there?). Update the checkout on that host.")
         if local and out.get("local") != local:
             # An execution host on an older checkout ignores the option it does not know: say so, never imply it held.
             out.setdefault("warnings", []).append(
@@ -1267,6 +1551,12 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
     launch_warning = CONNECTORS_NO_GUI_WARNING if (selected and not target.gui) else None
     d = os.path.join(root, task_id)
     os.mkdir(d, 0o700)
+    try:
+        _record_child(caller, task_id)          # before the spawn, under the children guard (cancel cascade)
+    except OSError as exc:
+        shutil.rmtree(d, ignore_errors=True)
+        raise TaskError(f"could not record the child in its parent's task dir ({type(exc).__name__}); not started"
+                        ) from None
     lock_fd = None
     if not launchd:
         # The runner's liveness IS this lock. It is taken before anything about the task is published (so no reader
@@ -1293,7 +1583,7 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
                                   start_red,
                                   chrome, max_s, exe, selected, login, office,
                                   workspace=ws_spec, ws_root=target.root, host_name=target.name, launchd=launchd,
-                                  local=local, origin_tag=org["origin_session"])
+                                  local=local, origin_tag=org["origin_session"], depth=depth, delegate=delegate)
         # Again with the child's launch env known: its credentials are the ones the export is checked against.
         launch_red = _start_redactor(red, env)
         _refuse_credentials(launch_red, caller_fields)
@@ -1356,6 +1646,7 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
             progress.update(launched="yes", task_id=task_id)
             raise StartFailed("ChildStopUnconfirmed", _start_where(), "yes", task_id) from None
         shutil.rmtree(d, ignore_errors=True)
+        _unrecord_child(caller, task_id)
         if isinstance(exc, OSError):
             raise TaskError(f"could not start the child task ({type(exc).__name__}: {exc})") from None
         raise
@@ -1382,6 +1673,7 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
             if not _launchd_gone(d):
                 raise StartFailed("LaunchdBootoutFailed", _start_where(), "yes", task_id) from None
         shutil.rmtree(d, ignore_errors=True)
+        _unrecord_child(caller, task_id)
         raise TaskError(f"child task bookkeeping failed after spawn; the task was stopped ({type(exc).__name__})"
                         ) from None
     if runner is not None:
@@ -1392,6 +1684,7 @@ def _start(progress, task, cwd=None, orchestrator="cortados", permission_mode=No
            # that called start_task reads it from this result, so a task recorded under the tag the cortados-route
            # server started with (before a /clear or a resume) is still found by that session (#127)
            "origin_session": org["origin_session"]}
+    _nesting_fields(out, task_id, depth, delegate, caller)
     if ws_spec is not None:
         out["workspace"] = {"kind": ws_spec["kind"], "path": os.path.join(target.root, "active", task_id),
                             **({"repo": ws_spec["name"], "branch": ws_spec.get("branch") or workspaces.TASK_BRANCH_PREFIX + task_id}
@@ -1515,13 +1808,15 @@ def _run_spec(cwd, max_s, meta, workspace=None, ws_root=None, launchd=False, chr
 
 def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file, red, chrome, max_s,
              exe, selected=None, login=None, office=None, workspace=None, ws_root=None, host_name=None, launchd=False,
-             local=None, origin_tag=None):
+             local=None, origin_tag=None, depth=1, delegate=False):
     """Everything before the spawn: settings, prompt, cmd.json, meta.json. Returns (meta, env, cmd). `origin_tag`: the
-    task's orchestrator (clean_origin's origin_session), sent as x-cortados-origin on the child's routed requests."""
+    task's orchestrator (clean_origin's origin_session), sent as x-cortados-origin on the child's routed requests.
+    `depth` / `delegate` (check_depth): recorded in meta.json, the record caller_identity reads; a sub-orchestrator gets
+    SUB_ORCHESTRATOR_DIRECTIVE and the cortados-route server."""
     os.chmod(d, 0o700)                          # mkdir's mode is masked by umask; the launcher verifies exactly 0700
     if login:
         meta, env, cmd = _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe,
-                                        login, office, workspace, ws_root, host_name, launchd)
+                                        login, office, workspace, ws_root, host_name, launchd, depth)
         return meta, env, cmd
     # `--orchestrator-band any`: a child's main loop keeps S1's free routing (the launcher's default R3 window is for
     # the owner's own routed session; windowing child tasks would be a separate decision).
@@ -1568,19 +1863,30 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
         # --strict-mcp-config (#117): only the selected connectors load, not also the execution host's own Claude Code
         # MCP servers (user, project and plugin ones), which would add schemas the selection never chose. The one
         # exception is cortados-route, added back explicitly (round 4): its local_switch tool IS allowed inside a child
-        # (subagent_mcp.py docstring); its start_task and route_task stay refused there (NESTED_ENV), as in any child.
+        # (subagent_mcp.py docstring); its start_task and route_task follow the caller's depth record (caller_identity).
         extra += ["--strict-mcp-config", "--mcp-config", conn]
     else:
         conn_note = ("no connectors selected; the child has the user's Claude Code MCP servers only (bounded by the "
                      "provider's tool-schema budget)\n")
+        if delegate:
+            # A sub-orchestrator must have cortados-route whatever the host's own MCP config holds: added to (not
+            # instead of) the host's servers. Its start_task decides by the process tree (caller_identity), not by
+            # this entry's env.
+            conn = os.path.join(d, "session-connectors.json")
+            with open(os.open(conn, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as f:
+                json.dump({"mcpServers": {ROUTE_SERVER: route_server_entry(provider_url, token_file)}}, f)
+            extra += ["--mcp-config", conn]
+            conn_note = ("no connectors selected; the sub-orchestrator has the user's Claude Code MCP servers plus "
+                         "cortados-route\n")
     base = {k: v for k, v in os.environ.items() if k not in STRIP_ENV}
     try:
         _args, env, cmd = session.prepare(launch + ["--"] + extra, base, MANAGED_DIRS)
     except session.SessionError as exc:
         raise TaskError(f"cannot prepare the child session: {exc}") from None
     cmd[0] = exe
-    _add_child_directive(cmd)
+    _add_child_directive(cmd, SUB_ORCHESTRATOR_DIRECTIVE if delegate else CHILD_DIRECTIVE)
     env[NESTED_ENV] = "1"
+    _set_task_env(env, task_id, depth, delegate)
     # Fingerprints (sha256, never the secrets) of the credentials this child runs with: if the runner dies before it
     # redacts the logs, they may be shown later only when today's credentials provably cover all of these.
     launch_fps = credential_fingerprints(launch_tokens(env))
@@ -1595,7 +1901,7 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
             "allowed_tools": tools, "task_chars": len(task), "task_preview": red.text(task.strip())[:200],   # redact, THEN slice
             "started_at": time.time(), "connectors": sorted(selected) if selected else [],
             "chrome": chrome, "max_s": max_s, "runner_pid": None, "cred_fingerprints": launch_fps,
-            "host": host_name, "launch": "launchd" if launchd else "spawn",
+            "host": host_name, "launch": "launchd" if launchd else "spawn", "depth": depth, "delegate": bool(delegate),
             "workspace": {"kind": workspace["kind"], "repo": workspace.get("name"), "branch": workspace.get("branch")} if workspace else None,
             # argv carries only the model, settings path and flags; the token lives in the 0600 settings file and env.
             "argv": cmd[1:], **({"office": office} if office else {})}
@@ -1652,7 +1958,7 @@ def _load_runner_env(spec: dict) -> None:
 
 
 def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe, model, office=None,
-                   workspace=None, ws_root=None, host_name=None, launchd=False):
+                   workspace=None, ws_root=None, host_name=None, launchd=False, depth=1):
     """chrome: true. No launcher, no --settings provider file, no provider env: claude on the user's own login."""
     cmd = [exe, "--model", model, "-p", "--output-format", "stream-json", "--verbose", "--permission-mode",
            permission_mode, "--permission-prompts", "none"]
@@ -1668,6 +1974,7 @@ def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, 
             "--append-system-prompt", CHILD_DIRECTIVE + "\n\n" + CHROME_DIRECTIVE]
     env = login_env(os.environ)
     env[NESTED_ENV] = "1"
+    _set_task_env(env, task_id, depth, False)
     launch_fps = credential_fingerprints(launch_tokens(env))   # the allowlist admits none, so this is []
     with open(os.open(os.path.join(d, "prompt.txt"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w",
               encoding="utf-8") as f:
@@ -1677,14 +1984,25 @@ def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, 
             "started_at": time.time(), "connectors": [], "chrome": True, "lane": LOGIN_LANE, "model": model,
             # Login-mode children never route through CortadOS, so carry no Office identity into lifecycle events.
             "max_s": max_s, "runner_pid": None, "cred_fingerprints": launch_fps, "argv": cmd[1:],
-            "host": host_name, "launch": "launchd" if launchd else "spawn",
+            "host": host_name, "launch": "launchd" if launchd else "spawn", "depth": depth, "delegate": False,
             "workspace": {"kind": workspace["kind"], "repo": workspace.get("name"), "branch": workspace.get("branch")} if workspace else None}
     _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, **_run_spec(cwd, max_s, meta, workspace, ws_root, launchd, True)})
     _write_json(os.path.join(d, "meta.json"), meta)
     return meta, env, cmd
 
 
-def _add_child_directive(cmd: list) -> None:
+def _set_task_env(env: dict, task_id: str, depth: int, delegate: bool) -> None:
+    """The child's own id (TASK_ID_ENV: a claim caller_identity checks against this host's records) and, for reading
+    only, its depth and sub-orchestrator flag. Nothing decides on these: the process tree does."""
+    env[TASK_ID_ENV] = task_id
+    env[TASK_DEPTH_ENV] = str(depth)
+    if delegate:
+        env[TASK_DELEGATE_ENV] = "1"
+    else:
+        env.pop(TASK_DELEGATE_ENV, None)        # never inherited from a sub-orchestrator by its workers
+
+
+def _add_child_directive(cmd: list, directive: str = CHILD_DIRECTIVE) -> None:
     """Append CHILD_DIRECTIVE to the system prompt, LAST. Order: claude's own prompt, then CLAUDE.md, then the
     --append-system-prompt text; within that text a pinned orchestrator's whole-session directive comes first and the
     child directive after it, so the child directive is the final word. One flag only: the launcher's value is
@@ -1692,9 +2010,9 @@ def _add_child_directive(cmd: list) -> None:
     not documented)."""
     if "--append-system-prompt" in cmd:
         i = cmd.index("--append-system-prompt") + 1
-        cmd[i] = cmd[i] + "\n\n" + CHILD_DIRECTIVE
+        cmd[i] = cmd[i] + "\n\n" + directive
     else:
-        cmd += ["--append-system-prompt", CHILD_DIRECTIVE]
+        cmd += ["--append-system-prompt", directive]
 
 
 def _event_fields(meta: dict) -> dict:
@@ -1969,6 +2287,16 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
         out["phase"] = "queued: waiting for the host's Chrome (one browser task at a time)"
     if state == "running":
         out["last_output_at"] = _last_output_at(d)    # progress signal for --watch (None until the child has written)
+    if meta.get("depth"):
+        out["depth"] = meta["depth"]
+    if meta.get("delegate"):
+        out["delegate"] = True
+    if meta.get("parent_task_id"):
+        out["parent_task_id"] = meta["parent_task_id"]
+    kids = children_of(d)
+    if kids:
+        # ids while it runs; with states once the runner recorded its end-of-run report (_children_report)
+        out["children"] = (res or {}).get("children") or [{"task_id": k} for k in kids]
     if res is not None:
         o = res.get("output") or {}
         out["exit_code"] = res.get("exit_code")
@@ -1991,7 +2319,8 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
                 if k in o:
                     out[k] = o[k]
         warnings = ([meta["launch_warning"]] if meta.get("launch_warning") else []) + \
-            _activity(out, o, res.get("activity"), meta)
+            _activity(out, o, res.get("activity"), meta) + \
+            ([res["children_warning"]] if isinstance(res.get("children_warning"), str) else [])
         if warnings:
             out["warnings"] = warnings
         if res.get("output_error"):
@@ -2574,12 +2903,55 @@ def list_recent(n=20, ids=None) -> list:
 
 
 def cancel(task_id) -> dict:
+    """Cancel a task and, for a sub-orchestrator, every child it started (the cascade runs on the sub-orchestrator's
+    host, where its children list is: a remote task's own host does it). Order: the parent is marked cancelled under
+    its children lock (no new child starts after that), signalled, then each recorded child is cancelled; a finished
+    sub-orchestrator's still-running children are cancelled too."""
     d = task_path(task_id)
     state, meta, _ = _state(d)
     if state == "remote":
         out = _remote(meta["host"], "cancel", {"task_id": task_id})
         out["host"] = meta["host"]
         return out
+    out = _cancel_local(d, task_id, state, meta)
+    kids = children_of(d)
+    if kids:
+        out["children"] = [_cancel_child(k) for k in kids]
+    return out
+
+
+def _cancel_child(task_id: str) -> dict:
+    """One row of a cancel cascade: what cancel() said for the child, or why it could not."""
+    try:
+        r = cancel(task_id)
+    except TaskError as exc:
+        return {"task_id": task_id, "cancelled": False, "error": str(exc)}
+    row = {"task_id": task_id, "state": r.get("state"), "cancelled": bool(r.get("cancelled"))}
+    for k in ("host", "reason", "children"):
+        if r.get(k):
+            row[k] = r[k]
+    return row
+
+
+def _mark_cancelled(d: str) -> str | None:
+    """The `cancelled` marker, written under the task's children lock (_children_guard): a start inside this task
+    either finished recording its child before, or sees the marker and starts nothing. Returns a note when the lock
+    could not be had in time (the marker is written anyway: a stuck holder must not block a cancel)."""
+    note = None
+    fd = os.open(os.path.join(d, CHILDREN_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            _flock_wait(fd, CHILDREN_LOCK_WAIT_S)
+        except TimeoutError:
+            note = (f"the children lock was busy for {CHILDREN_LOCK_WAIT_S} s; marked cancelled without it (a child "
+                    "started at this moment may be missing from the cascade: check list_tasks)")
+        open(os.path.join(d, "cancelled"), "w").close()
+    finally:
+        os.close(fd)
+    return note
+
+
+def _cancel_local(d: str, task_id: str, state: str, meta: dict) -> dict:
     if state != "running":
         return {"task_id": task_id, "state": state, "cancelled": False, "reason": f"task is already {state}"}
     pid = meta.get("runner_pid")
@@ -2589,7 +2961,7 @@ def cancel(task_id) -> dict:
         if meta.get("launch") == "launchd":
             # The desktop-session runner has not taken its lock yet (launchd has not started it, or it is between exec
             # and flock): the marker makes it exit before any spawn, and the job is unloaded so it does not start.
-            open(os.path.join(d, "cancelled"), "w").close()
+            _mark_cancelled(d)
             note = _launchd_bootout(d)
             err = log_event("cancelled", **_event_fields(meta))
             out = {"task_id": task_id, "state": "cancelling", "cancelled": True, "note": f"runner not started yet; {note}"}
@@ -2598,7 +2970,7 @@ def cancel(task_id) -> dict:
             return out
         return {"task_id": task_id, "state": state, "cancelled": False,
                 "reason": "the recorded pid is not this task's runner; refusing to signal it"}
-    open(os.path.join(d, "cancelled"), "w").close()
+    lock_note = _mark_cancelled(d)
     try:
         os.kill(pid, signal.SIGTERM)            # the runner stops claude's own process group (SIGTERM, then SIGKILL)
     except ProcessLookupError:
@@ -2607,7 +2979,41 @@ def cancel(task_id) -> dict:
     out = {"task_id": task_id, "state": "cancelling", "cancelled": True}
     if err:
         out["event_log_error"] = err
+    if lock_note:
+        out["note"] = lock_note
     return out
+
+
+def _children_report(d: str, result: dict) -> None:
+    """A sub-orchestrator's end: every child it started, with its state now (one list call per host), into result.json.
+    Children still running that its final text does not name are a warning on the task (status `warnings`, the
+    watcher's count): its instructions say never to finish while a child runs unless the report says so explicitly.
+    Never changes the task's state; a failure to read the children is recorded, not raised."""
+    kids = children_of(d)
+    if not kids:
+        return
+    try:
+        rows = list_recent(len(kids), kids)
+    except Exception as exc:                    # the result stands; the report says why it is missing
+        result["children_error"] = f"could not read the children's states: {type(exc).__name__}"
+        result["children"] = [{"task_id": k, "state": "unknown"} for k in kids]
+        rows = None
+    if rows is not None:
+        found = {r.get("task_id"): r for r in rows if isinstance(r, dict)}
+        result["children"] = [{"task_id": k, "state": (found.get(k) or {}).get("state") or "unknown",
+                               **({"host": found[k]["host"]} if (found.get(k) or {}).get("host") else {})}
+                              for k in kids]
+    running = [c["task_id"] for c in result["children"] if c["state"] not in TERMINAL_STATES]
+    if not running:
+        return
+    result["children_running"] = running
+    out = result.get("output")
+    text = out.get("result") if isinstance(out, dict) and isinstance(out.get("result"), str) else ""
+    unnamed = [k for k in running if k not in text]
+    if unnamed:
+        result["children_warning"] = (f"the sub-orchestrator ended with {len(running)} child task(s) not finished "
+                                      f"({', '.join(running)}), and its report does not name "
+                                      f"{', '.join(unnamed)}; check them (task_status) or cancel them (cancel_task)")
 
 
 def _workspace_record(d: str, task_id: str):
@@ -4095,6 +4501,8 @@ def _run(d: str, lock_fd=None) -> int:
     except RecordError:
         meta = {}
     router_run = _runner_router_run(meta, os.path.basename(d))
+    if meta.get("delegate"):
+        _children_report(d, result)
     if not result.get("error"):
         # #97: a child whose last request failed at the API. The result record says so (is_error), or its text IS the
         # error (Claude Code's "API Error: ...", with is_error false in some versions), or the provider's record shows
@@ -4208,7 +4616,8 @@ def serve_remote(stdin=None, stdout=None) -> int:
                         args.get("chrome", False), red, args.get("connectors"), client=args.get("client"),
                         title=args.get("title"), session_tag=args.get("session_tag"), repo=args.get("repo"),
                         branch=args.get("branch"), host=host.name, parent_task_id=args.get("parent_task_id"),
-                        local=args.get("local"), origin=args.get("origin"))
+                        local=args.get("local"), origin=args.get("origin"), delegate=args.get("delegate", False),
+                        depth=args.get("depth"))
         elif op == "status":
             out = status(args.get("task_id"), red, url, token)
         elif op == "wait":

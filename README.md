@@ -514,8 +514,9 @@ Point a whole tool at `cortados` to route everything, or keep your main session 
 sub-tasks it chooses to hand off. The repo ships a project MCP server, `cortados-route` (`.mcp.json`), exposing one tool,
 `route_task(task, context?, max_tokens?)`: it sends a self-contained sub-task to the provider, S1 scores it, the cheapest
 capable model runs it, and the text comes back. The main session keeps its own model and login.
-`route_task` is refused inside a child task (`CORTADOS_CHILD_TASK` set): children may not route, as they may not start
-children (the child's directive says so too).
+`route_task` is refused inside a child task: children may not route, as they may not start children (the child's
+directive says so too). The one exception is a sub-orchestrator (`start_task` with `delegate: true`, see **Nested
+tasks** below), decided by the caller's task record, not by an env var.
 The same server also serves `local_switch(state, node?)` (see **Flipping the switch from anywhere**, under Local
 models), which is allowed in child tasks.
 
@@ -750,7 +751,8 @@ launched through `cortados_router.session`, so the provider env, the `sub/<model
 are exactly those of a `cortados` session, with every tool and MCP server Claude Code has there. Only the result comes
 back; the calling orchestrator verifies it.
 
-Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_mode?, allowed_tools?, chrome?, connectors?, local?)` returns a `task_id` at once
+Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_mode?, allowed_tools?, chrome?, connectors?, local?, delegate?)` returns a `task_id` at once
+(`delegate: true`: a sub-orchestrator, see **Nested tasks** below)
 (`local: "sensitive"` or `"prefer"`: every request of the child carries `x-cortados-local`, so each runs on the owner's
 local sensitive model when eligible; refused with `chrome: true`, whose login mode is not routed; a remote host on an
 older checkout that does not confirm it adds a warning to the result; `docs/LOCAL-RESOURCES.md`, "Sensitive requests");
@@ -1088,6 +1090,35 @@ run, 512 runs) and forgotten on a provider restart. Each lifecycle event (`start
 and duration, `cancelled`) is also appended as one JSON line to `$CORTADOS_HOME/child-tasks.jsonl` (default
 `~/.cortados`): task id, cwd, orchestrator, permission mode, chrome flag, status and timings; never the prompt or a
 secret.
+
+### Nested tasks: sub-orchestrators (one more layer)
+
+Owner decision 2026-11-25; design, threat model and open decisions in `docs/NESTED-TASKS.md`. Depth: the main session
+is 0, a child task is 1, a child of a sub-orchestrator (a *worker*) is 2; there is no depth 3.
+
+- `start_task(..., delegate: true)` (main session only) starts a SUB-ORCHESTRATOR: it gets the sub-orchestrator
+  directive (plan, delegate, verify, report; act directly only for trivial steps) instead of the child directive, and
+  the cortados-route server, so its start_task / task_status / wait_task / list_tasks / cancel_task and route_task
+  work. A child without `delegate` behaves exactly as before.
+- Refused, with the rule named, and counted as a `refused` event (`reason: depth_limit`) in `child-tasks.jsonl`: any
+  start from a worker; any start from a child started without `delegate`; `delegate: true` from a sub-orchestrator;
+  `chrome: true` from a sub-orchestrator (Chrome is one client per machine and owner-only); `delegate` with `chrome`.
+- Depth is enforced on the host the call reaches, from its own records, never from an env var: the caller's depth is
+  the `meta.json` of the nearest child-task runner among its process ancestors (`child_tasks.caller_identity`).
+  Unsetting `CORTADOS_CHILD_TASK`, an edited copy of the cortados-route server or its config change nothing; a process
+  claiming to be in a child with no runner above it is refused; a failed `ps` is a refusal, not depth 0. Over ssh the
+  requesting host sends the depth it computed and the host keeps the deeper of that and its own check.
+- Inside a sub-orchestrator: `parent_task_id` is its own id (set for it), `host` defaults to its own host (`here` is
+  its host), its workers carry the main session's origin (the live view and the Office nest them under it).
+- Waiting: a headless child may end when its turn ends, so a sub-orchestrator does not rely on background-command
+  notifications. Its start_task result carries `wait_command` (`watch_command` + `--timeout 540`), which it runs in
+  the FOREGROUND under the Bash tool's 600000 ms limit, again while it exits 3.
+- Lifecycle: `cancel_task` on a sub-orchestrator marks it cancelled under its children lock (its start_task refuses
+  from then on), stops it, then cancels every worker it started (on their hosts) and lists them in `children`; this
+  also works after the sub-orchestrator itself ended. At its end the runner records every worker's state
+  (`task_status.children`); workers still running that its report does not name are a warning.
+- Workspaces: unchanged. A sub-orchestrator gives each worker `repo` with no `branch` (it gets `task/<id>`) or a new
+  branch, never its own (refused while it holds it), then merges their branches into its own itself.
 
 ### Task run export (Grounds capture)
 

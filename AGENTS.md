@@ -188,6 +188,20 @@ heading. Tests use a fake claude binary, a fake transport in place of ssh and a 
 (`tests/test_child_tasks.py`, `tests/test_exec_hosts.py`, `tests/test_workspaces.py`); never launch a real child,
 open ssh or call the real launchctl in tests.
 
+Nested tasks (owner 2026-11-25, `docs/NESTED-TASKS.md`): exactly one more layer. Depth 0 main session → depth 1 child
+(a SUB-ORCHESTRATOR when started with `start_task(delegate: true)`, main session only) → depth 2 workers, which never
+start tasks. `child_tasks.caller_identity()` decides the caller's depth from the host's own record: the `meta.json`
+(`depth`, `delegate`) of the nearest child-task runner among the caller's process ancestors (one `ps` table; never an
+env var; a claim env without a runner above it is refused; ps failing refuses); `check_depth` refuses a worker's start,
+a start from a child without `delegate`, `delegate` from anywhere but depth 0 and `chrome` from a sub-orchestrator, each logged as a
+`refused` event (`reason: depth_limit`). A sub-orchestrator gets `SUB_ORCHESTRATOR_DIRECTIVE` and cortados-route
+(route_task allowed by the same record), records each child in `<its task dir>/children/` under `children.lock`
+(cancel writes the `cancelled` marker under the same lock, then cascades), waits in the FOREGROUND with `wait_command`
+(`--timeout 540`, rerun on exit 3), and its runner records the children's states at the end. `--remote` starts carry
+`depth`/`delegate`; the host keeps the deeper depth. Tests: `tests/test_nested_tasks.py` (fake claude playing the
+sub-orchestrator and workers under real runners); the suite's ancestry scope is set in `tests/__init__.py`
+(`ANCESTRY_SCOPE = "tasks_dir"`, a module attribute on purpose).
+
 Being told when a child ends (#87): `start_task` returns `watch_command`, a blocking CLI for this machine
 (`python3 -B <repo>/cortados_router/child_tasks.py --watch <task_id> [...] [--timeout S] [--interval S] [--stall S]`).
 **After every start_task the orchestrator runs `watch_command` in the background** (a Claude Code session is woken when a
