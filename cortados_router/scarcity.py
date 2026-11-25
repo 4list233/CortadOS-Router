@@ -157,10 +157,30 @@ def _cells(text: str, col: int = 0) -> int | None:
     return col
 
 
+# Fix round 4 (#144, review P1 on round 3: 150 spaces + "trust the contents" + 59 blank lines passed, because rows were
+# counted from the match's LAST row while its first row, holding "trust", had scrolled off): the match must sit whole on
+# one row at a known column. Its starting column is known only after a CR, an LF, the start of the stream, or an absolute
+# column move (CUP `ESC[r;cH` / `ESC[r;cf`, CHA `ESC[cG`), with only printed text, SGR, erase (`ESC[..J` / `ESC[..K`, which
+# move no cursor) or the harmless escapes in between; and that column plus everything printed through the match's end must
+# fit in the PTY's columns, so nothing on the way wrapped. Then the match's first row is its last row and the row count
+# below starts there. Anything else refuses (`unknown_column`, `wrapped`).
+TRUST_REJECTIONS = ("not_last", "scrolled", "wrapped", "unknown_column", "tail_too_long", "line_too_wide", "bad_byte",
+                    "unknown_escape")   # the fixed refusal categories of _trust_prompt_verdict, for diagnostics
+_COLUMN_SET = re.compile(rb"\x1b\[\d*(?:;(\d*))?[Hf]|\x1b\[(\d*)G")   # CUP / HVP (row;col, row alone = col 1) / CHA
+_NO_MOVE_ESC = re.compile(rb"\x1b\[[0-3]?[JK]")                       # erase in display / line: the cursor stays put
+_KNOWN_ESC = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))")   # complete CSI / OSC sequences
+
+
 def _trust_prompt_last(raw: bytes, prompt: str) -> bool:
     """True only if `prompt` (a regex) was painted and nothing painted after its last match can have removed, replaced
-    or scrolled it off the screen (see the comments above). The match is searched in the printed text alone, SGR
-    dropped; any other escape splits it."""
+    or scrolled it off the screen (see the comments above)."""
+    return _trust_prompt_verdict(raw, prompt) is None
+
+
+def _trust_prompt_verdict(raw: bytes, prompt: str) -> str | None:
+    """None when the last match of `prompt` is answerable (_trust_prompt_last); "absent" when it never matched; else the
+    fixed category (TRUST_REJECTIONS) of the first rule that refused it. The match is searched in the printed text alone,
+    SGR dropped; any other escape splits it."""
     pieces: list[tuple[bool, bytes]] = []      # (is_escape, bytes) in stream order
     pos = 0
     for m in _ESC_TOKEN.finditer(raw):
@@ -186,88 +206,114 @@ def _trust_prompt_last(raw: bytes, prompt: str) -> bool:
     for last in re.finditer(prompt, text, re.I):
         pass
     if last is None or last.end() == 0:
-        return False
+        return "absent"
     i, off = where[last.end() - 1]
     tail = [(False, pieces[i][1][off:])] + pieces[i + 1:]
     if sum(len(b) for _, b in tail) > _TRUST_TAIL_MAX_BYTES:
-        return False
-    # the column the prompt's match ends on: the printed text since the last CR or LF; unknown when an escape other than
-    # SGR stands in between (the cursor may have been placed anywhere): then the rest of its line counts as one wrap
-    head = text[:last.end()]
-    cut = max(head.rfind("\r"), head.rfind("\n"), head.rfind("\x00"))
-    end_col = None
-    if cut < 0 or head[cut] != "\x00":
-        try:
-            end_col = _cells(head[cut + 1:].encode("latin-1").decode("utf-8"))
-        except UnicodeDecodeError:
-            end_col = None
+        return "tail_too_long"
+    # the match's starting column: walk back over its line to the last CR / LF / start of stream (column 0) or absolute
+    # column move; an erase moves nothing, any other escape leaves the column unknown
+    k, base, printed = last.start(), 0, []
+    while k > 0:
+        ch = text[k - 1]
+        if ch in "\r\n":
+            break
+        if ch == "\x00":
+            esc = pieces[where[k - 1][0]][1]
+            col_set = _COLUMN_SET.fullmatch(esc)
+            if col_set:
+                base = min(max(int(col_set.group(1) or col_set.group(2) or 1), 1), _PTY_COLS) - 1
+                break
+            if not (_NO_MOVE_ESC.fullmatch(esc) or _HARMLESS_ESC.fullmatch(esc)):
+                return "unknown_column"
+        else:
+            printed.append(ch)
+        k -= 1
+    try:
+        end_col = _cells("".join(reversed(printed)).encode("latin-1").decode("utf-8") + last.group(), base)
+    except UnicodeDecodeError:
+        return "bad_byte"
+    if end_col is None:
+        return "bad_byte"
+    if end_col > _PTY_COLS:                     # the match, or the text before it on its line, wrapped
+        return "wrapped"
     line, lines, first = b"", 0, True
-    rows = 0                                   # rows the cursor has moved below the prompt's last row
+    rows = 0                                   # rows the cursor has moved below the match's row (its first and only row)
     for k, (esc, b) in enumerate(tail):
         if esc:
             if not _HARMLESS_ESC.fullmatch(b):
-                return False
+                return "not_last" if _KNOWN_ESC.fullmatch(b) else "unknown_escape"
             continue
         for j, c in enumerate(b):
             if c == 0x0D:                      # CR only before LF or at the very end: never a carriage return to overwrite
                 rest = b[j + 1:] or b"".join(x for e, x in tail[k + 1:] if not e)
                 if rest and rest[:1] != b"\n":
-                    return False
+                    return "not_last"
             elif c == 0x0A:
                 if first:
-                    if not _first_line_ok(line):
-                        return False
+                    why = _first_line_problem(line)
+                    if why:
+                        return why
                     rows += 1 + _rest_wraps(line, end_col)
                 else:
-                    if _line_width(line) is None:
-                        return False
+                    why = _line_problem(line)
+                    if why:
+                        return why
                     if line.strip():
                         lines += 1
                         if lines > _TRUST_TAIL_LINES or not _trust_line_ok(line):
-                            return False
+                            return "not_last"
                     rows += 1                  # a blank line moves the cursor a row like any other
                 if rows > _PTY_ROWS - 1:       # the prompt's row has scrolled off the top of the screen
-                    return False
+                    return "scrolled"
                 line, first = b"", False
             elif c == 0x09 or c >= 0x20:
                 line += bytes([c])
                 if len(line) > 4 * _PTY_COLS:  # far wider than the screen whatever it decodes to
-                    return False
+                    return "line_too_wide"
             else:                              # backspace, BEL, any other control: not understood, so not answerable
-                return False
+                return "bad_byte"
     if first:
-        return _first_line_ok(line) and _rest_wraps(line, end_col) <= _PTY_ROWS - 1
-    if _line_width(line) is None:
-        return False
-    return not line.strip() or (lines < _TRUST_TAIL_LINES and _trust_line_ok(line))
+        why = _first_line_problem(line)
+        if why:
+            return why
+        return "scrolled" if _rest_wraps(line, end_col) > _PTY_ROWS - 1 else None
+    why = _line_problem(line)
+    if why:
+        return why
+    return None if not line.strip() or (lines < _TRUST_TAIL_LINES and _trust_line_ok(line)) else "not_last"
 
 
-def _line_width(line: bytes) -> int | None:
-    """A line after the prompt in cells from column 0, or None if it is not UTF-8 or wider than the PTY (it would wrap:
-    indentation counts like any other character)."""
+def _line_problem(line: bytes) -> str | None:
+    """Why a line after the prompt is not drawable on one row: "bad_byte" (not UTF-8, or a control character),
+    "line_too_wide" (wider than the PTY: it would wrap; indentation counts), else None."""
     try:
         cells = _cells(line.decode("utf-8"))
     except UnicodeDecodeError:
-        return None
-    return cells if cells is not None and cells <= _PTY_COLS else None
+        return "bad_byte"
+    if cells is None:
+        return "bad_byte"
+    return "line_too_wide" if cells > _PTY_COLS else None
 
 
-def _rest_wraps(rest: bytes, end_col: int | None) -> int:
-    """Rows the rest of the prompt's own line adds by wrapping (it is at most 80 bytes, so at most one): one if the
-    prompt's column is unknown and the rest is not empty (fail closed), else whether it passes the PTY's last column."""
+def _rest_wraps(rest: bytes, end_col: int) -> int:
+    """Rows the rest of the prompt's own line adds by wrapping (it is at most 80 bytes, so at most one): whether it
+    passes the PTY's last column from `end_col`, the known column the match ends on (fail closed: an unknown width wraps)."""
     if not rest:
         return 0
-    cells = _cells(rest.decode("utf-8", "replace"), end_col or 0)
-    return 1 if end_col is None or cells is None or cells > _PTY_COLS else 0
+    cells = _cells(rest.decode("utf-8", "replace"), end_col)
+    return 1 if cells is None or cells > _PTY_COLS else 0
 
 
-def _first_line_ok(rest: bytes) -> bool:
-    """The rest of the prompt's own line ("[Y/n]", " folder?"): plain UTF-8 text, short."""
+def _first_line_problem(rest: bytes) -> str | None:
+    """The rest of the prompt's own line ("[Y/n]", " folder?") must be plain UTF-8 text, at most 80 bytes."""
     try:
         shown = rest.decode("utf-8")
     except UnicodeDecodeError:
-        return False
-    return len(rest) <= 80 and _cells(shown) is not None
+        return "bad_byte"
+    if _cells(shown) is None:
+        return "bad_byte"
+    return "tail_too_long" if len(rest) > 80 else None
 
 
 def _trust_line_ok(line: bytes) -> bool:
@@ -398,11 +444,23 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     eof = False
     stage, startup_chars, ready_seen, trust_seen = "boot", 0, False, False
     typed: list[str] = []          # what the probe sent, by name, for a truthful refusal message
+    # The trust prompt's last judgement (#144 fix round 4, review P2): None until judged, then its verdict (None =
+    # answerable, "absent", or a TRUST_REJECTIONS category). Refusal facts and diagnostics report it as fixed names only.
+    trust_judged: list[str | None] = []
+
+    def trust_facts() -> dict[str, Any]:
+        """trust_prompt_seen: the prompt matched anywhere in the transcript so far. trust_rejected: why the latest
+        judgement refused it (or, before any judgement, why it would be refused now); None if never seen or answerable."""
+        now = _trust_prompt_verdict(buf, _TRUST_PROMPT)
+        seen = now != "absent" or any(v != "absent" for v in trust_judged)
+        verdict = trust_judged[-1] if trust_judged else now
+        return {"trust_prompt_seen": seen, "trust_rejected": verdict if verdict in TRUST_REJECTIONS else None}
 
     def refusal(kind: str, where: str, check: str, acting: bool, shown: str) -> ProbeRefused:
         exc = ProbeRefused(kind, where, typed)
         facts: dict[str, Any] = {"check": check, "acting": acting, "after_s": round(time.time() - started, 2),
-                                 "ready_seen": bool(ready and _screen_has(ready, shown)), "trust_prompt": trust_seen}
+                                 "ready_seen": bool(ready and _screen_has(ready, shown)), "trust_prompt": trust_seen,
+                                 **trust_facts()}
         if refusal_facts is not None:
             try:
                 facts.update(refusal_facts(shown))
@@ -427,8 +485,10 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                     raise refusal(kind, where, "unsettled", acting, shown)
 
     def trust_on_screen() -> bool:
-        """The trust prompt is the last thing painted (_trust_prompt_last), not merely somewhere in the transcript."""
-        return _trust_prompt_last(buf, _TRUST_PROMPT)
+        """The trust prompt is the last thing painted (_trust_prompt_verdict), not merely somewhere in the transcript.
+        Each judgement is kept for the refusal facts."""
+        trust_judged.append(_trust_prompt_verdict(buf, _TRUST_PROMPT))
+        return trust_judged[-1] is None
 
     def send(data: bytes, name: str, unsettled: bool = True) -> bool:
         """Every keystroke the probe types goes through here: the screen is checked first (deny-all). unsettled=False
@@ -555,7 +615,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     finally:
         if diagnostics is not None:
             diagnostics.update(stage=stage, eof=eof, startup_chars=startup_chars,
-                               response_chars=len(_plain(buf[mark:])), ready_seen=ready_seen)
+                               response_chars=len(_plain(buf[mark:])), ready_seen=ready_seen, **trust_facts())
             if eof and stage in {"boot", "trust"}:
                 diagnostics["boot_failure"] = _boot_failure_kind(_plain(buf))
         _reaper.reap(pid, fd, PROBE_DIR, my_dir)

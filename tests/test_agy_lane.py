@@ -517,8 +517,11 @@ class ProbeHonesty(AgyBase):
         # counts as one wrap (fail closed)
         self.assertTrue(last(b" " * 120 + prompt + b"\r\n" * 58))
         self.assertFalse(last(b" " * 140 + prompt + b"\r\n" * 58))
-        self.assertFalse(last(b"\x1b[5;40H" + prompt + b"\r\n" * 58))
-        self.assertTrue(last(b"\x1b[5;40H" + prompt + b"\r\n" * 57))
+        # (fix round 4: an absolute column move gives a known column, so the prompt row counts as any other; a relative
+        # move leaves the column unknown and refuses outright)
+        self.assertTrue(last(b"\x1b[5;40H" + prompt + b"\r\n" * 58))
+        self.assertFalse(last(b"\x1b[5;40H" + prompt + b"\r\n" * 59))
+        self.assertFalse(last(b"\x1b[2C" + prompt))
         # more than 1 KB after the prompt, even of harmless colour codes, is another screen
         self.assertTrue(last(prompt + b"\x1b[0m" * 200))
         self.assertFalse(last(prompt + b"\x1b[0m" * 300))
@@ -600,6 +603,131 @@ class ProbeHonesty(AgyBase):
             with self.assertRaises(sc.ProbeRefused) as cm:
                 sc._antigravity()
         self.assertIs(cm.exception.facts["trust_prompt"], False)
+
+    # ---- #144 fix round 4 (review P1 on round 3): rows were counted from the match's LAST row, so a match that wrapped
+    # over two rows passed with its first row ("trust") scrolled off. The match must now sit whole on one row at a known
+    # column, and the rows below are counted from that row.
+    def test_trust_prompt_that_wraps_is_refused(self):
+        verdict = lambda raw: sc._trust_prompt_verdict(raw, sc._TRUST_PROMPT)
+        repro = b" " * 150 + b"trust the contents" + b"\r\n" * 59               # the review's reproduction
+        self.assertFalse(sc._trust_prompt_last(repro, sc._TRUST_PROMPT))
+        self.assertEqual(verdict(repro), "wrapped")
+        self.assertEqual(verdict(b" " * 150 + b"trust the contents"), "wrapped")  # wraps even with nothing after it
+        self.assertEqual(verdict(b"x" * 170 + b"\r\n" + b"trust the contents"), None)   # a wrapped line BEFORE: fine
+        self.assertEqual(verdict(b"x" * 170 + b"trust the contents"), "wrapped")  # text before it on its line wrapped
+        self.assertEqual(verdict(b"\x1b[1;150Htrust the contents"), "wrapped")     # a known column too far right
+        self.assertIsNone(verdict(b" " * 142 + b"trust the contents"))             # ends exactly on column 160
+        self.assertIsNone(verdict(b"\x1b[5H" + b" " * 142 + b"trust the contents"))  # a row alone: column 1
+        self.assertIsNone(verdict(b"\x1b[5;20H" + b" " * 123 + b"trust the contents"))
+        self.assertEqual(verdict(b"\x1b[5;20H" + b" " * 124 + b"trust the contents"), "wrapped")
+        self.assertEqual(verdict(b" " * 143 + b"trust the contents"), "wrapped")
+        for move in (b"\x1b[3C", b"\x1b[2A", b"\x1b[s", b"\x1b7"):                  # relative / saved: column unknown
+            with self.subTest(move=move):
+                self.assertEqual(verdict(move + b"trust the contents"), "unknown_column")
+        for known in (b"\x1b[H", b"\x1b[5;1H", b"\x1b[1G", b"\x1b[G", b"\r\x1b[2K", b"\x1b[2J\x1b[H\x1b[J\x1b[0m"):
+            with self.subTest(known=known):
+                self.assertIsNone(verdict(b"junk " + known + b"trust the contents"))
+
+    def test_trust_prompt_rows_are_counted_from_its_own_row(self):
+        last = lambda raw: sc._trust_prompt_last(raw, sc._TRUST_PROMPT)
+        one_row = b" " * 100 + b"Trust this workspace [Y/n]"
+        # the cursor may move 59 rows below the prompt's row: then the prompt is on the top visible row
+        self.assertTrue(last(one_row + b"\r\n" * 59))
+        self.assertFalse(last(one_row + b"\r\n" * 60))
+        # the rest of the prompt's own line wraps onto a second row: that row counts
+        wraps = b" " * 130 + b"Trust this workspace [Y/n] proceed?"
+        self.assertTrue(last(wraps + b"\r\n" * 58))
+        self.assertEqual(sc._trust_prompt_verdict(wraps + b"\r\n" * 59, sc._TRUST_PROMPT), "scrolled")
+
+    def test_trust_prompt_verdict_categories(self):
+        verdict = lambda raw: sc._trust_prompt_verdict(raw, sc._TRUST_PROMPT)
+        prompt = b"Trust this workspace [Y/n]\r\n"
+        cases = {
+            "absent": b"no prompt here\r\n",
+            "not_last": prompt + b"Loading workspace\r\n",
+            "scrolled": prompt + b"\r\n" * 59,
+            "wrapped": b" " * 155 + prompt,               # the match is "Trust this": 10 cells
+            "unknown_column": b"\x1b[4C" + prompt,
+            "tail_too_long": prompt + b"\x1b[0m" * 300,
+            "line_too_wide": prompt + b" " * 700,
+            "bad_byte": prompt + b"\x08",
+            "unknown_escape": prompt + b"\x1b7",
+        }
+        self.assertEqual(set(cases) - {"absent"}, set(sc.TRUST_REJECTIONS))
+        for want, raw in cases.items():
+            with self.subTest(want=want):
+                self.assertEqual(verdict(raw), want)
+        self.assertEqual(verdict(prompt + b"\x1b[2K"), "not_last")          # an erase: a known escape that removes it
+        self.assertEqual(verdict(prompt + b" " * 170 + b"\r\n"), "line_too_wide")
+        self.assertEqual(verdict(b"Trust this workspace [Y/n]\xff\r\n"), "bad_byte")
+        self.assertIsNone(verdict(prompt + b"> 1. Yes, proceed\r\n"))
+
+    def test_wrapped_trust_prompt_gets_no_keystroke_and_says_why(self):
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [" " * 150 + "trust the contents\n" + "\n" * 59],
+                                 "after_trust": BANNER, "usage": FIXTURE.read_text()})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("not-logged-in", [], b""))
+        f = cm.exception.facts
+        self.assertEqual((f["trust_prompt"], f["trust_prompt_seen"], f["trust_rejected"]), (False, True, "wrapped"))
+        rec = sc._failed_record("antigravity", None, cm.exception)          # what the scarcity cache keeps for the lane
+        self.assertEqual((rec["refusal"]["trust_prompt_seen"], rec["refusal"]["trust_rejected"]), (True, "wrapped"))
+
+    def test_one_row_trust_prompt_at_a_known_column_gets_exactly_one_enter(self):
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": ["\x1b[12;30H" + TRUST], "after_trust": BANNER,
+                                 "usage": FIXTURE.read_text()})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            rec = sc._antigravity()
+        self.assertEqual(rec["tier"], "AI Pro")
+        self.assertEqual(self.keys(log), b"\r/usage\r")
+
+    # ---- #144 fix round 4 (review P2): a refusal says whether a trust prompt was painted at all and, if it was, which
+    # rule refused it, by fixed category; set on every refusal path, mid-read ones included.
+    def test_refusal_facts_without_a_trust_prompt(self):
+        binary, log = self.fake({"boot": SIGNING_IN})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        f = cm.exception.facts
+        self.assertEqual((f["trust_prompt_seen"], f["trust_rejected"]), (False, None))
+
+    def test_refusal_facts_name_each_rejection_end_to_end(self):
+        for want, later in (("not_last", [TRUST, "Loading workspace\n"]),
+                            ("scrolled", [TRUST + "\n" * 70]),
+                            ("unknown_escape", [TRUST, "\x1b7"]),
+                            ("line_too_wide", [TRUST + " " * 200 + "> 1. Yes\n"])):
+            binary, log = self.fake({"boot": SIGNING_IN, "boot_later": later, "after_trust": BANNER,
+                                     "usage": FIXTURE.read_text()})
+            with self.subTest(want=want), self.env(binary), \
+                    mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+                with self.assertRaises(sc.ProbeRefused) as cm:
+                    sc._antigravity()
+                self.assertEqual(self.keys(log), b"")
+                f = cm.exception.facts
+                self.assertEqual((f["trust_prompt_seen"], f["trust_rejected"]), (True, want))
+                self.assertNotIn("Trust", json.dumps(f))
+
+    def test_mid_read_refusal_after_a_trust_prompt_reports_it(self):
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST, LOGGED_OUT]})
+        with self.env(binary):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        f = cm.exception.facts
+        self.assertEqual((cm.exception.kind, f["check"], f["acting"], self.keys(log)), ("not-logged-in", "refuse", False, b""))
+        self.assertEqual((f["trust_prompt_seen"], f["trust_rejected"]), (True, "not_last"))
+        flat = json.dumps(sc._failed_record("antigravity", None, cm.exception)["refusal"])
+        self.assertNotIn("accounts.google.com", flat)       # rule names only, never screen text
+        self.assertNotIn("Sign in", flat)
+
+    def test_refusal_after_the_trust_answer_reports_it_answered(self):
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST], "after_trust": LOGGED_OUT})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        f = cm.exception.facts
+        self.assertEqual(self.keys(log), b"\r")
+        self.assertEqual((f["trust_prompt"], f["trust_prompt_seen"], f["trust_rejected"]), (True, True, None))
 
     def test_usage_screen_is_read_through_the_isolated_env(self):
         binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
