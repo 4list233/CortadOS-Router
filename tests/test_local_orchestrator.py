@@ -754,6 +754,40 @@ class LauncherTests(RouteBase):
         self.assertIn("select at least one model, or a / b", out)
         self.assertEqual(cmd[cmd.index("--model") + 1], "cortados")
 
+    def test_the_menu_reprompts_an_oversized_local_pick(self):
+        # review localorch4 P2: the local menu checks the pick like the cloud menu (check_route) and asks again,
+        # never returning a pick the provider refuses (it used to crash launch with an uncaught PickError)
+        nine = [{"id": f"m{i}", "tag": f"m{i}:q4", "node": "pro", "node_label": "Pro", "state": "available"}
+                for i in range(1, 10)]
+        self.views["local"] = {"local": {"status": "ok", "models": nine}}
+        _a, _e, cmd, out = self.argv(answers="5\n1 2 3 4 5 6 7 8 9\n\n9\n\n")
+        self.assertIn("route pick: a route pick names at most 8 models (9 given)", out)
+        self.assertIn("deselect some models, or a / b", out)
+        self.assertEqual(cmd[cmd.index("--model") + 1], "cortados@local:m1+m2+m3+m4+m5+m6+m7+m8")
+        long_ids = ["a" * 64, "b" * 64]
+        self.views["local"] = {"local": {"status": "ok", "models": [
+            {"id": i, "tag": i, "node": "pro", "node_label": "Pro", "state": "available"} for i in long_ids]}}
+        os.remove(session.pick_file(self.home))
+        _a, _e, cmd, out = self.argv(answers="5\n1 2\n\n2\n\n")
+        self.assertIn("deselect some models, or a / b", out)
+        self.assertEqual(cmd[cmd.index("--model") + 1], "cortados@local:" + "a" * 64)
+
+    def test_route_local_oversized_exits_2(self):
+        from tests.test_session_route import TTY
+        self.views["local"] = {"local": {"status": "ok", "models": [
+            {"id": i, "tag": i, "node": "pro", "node_label": "Pro", "state": "available"} for i in ("a" * 64, "b" * 64)]}}
+        for route in ("local:" + "a" * 64 + "+" + "b" * 64, "local:" + "+".join(f"m{i}" for i in range(1, 10))):
+            with self.subTest(route=route[:20]):
+                err = io.StringIO()
+                with mock.patch.object(os, "execvpe") as ex:
+                    rc = session.main(["--settings-dir", self.sdir, "--provider-url", "http://r.example",
+                                       "--token-file", self.tok, "--route", route], base_env=self.base, out=TTY(),
+                                      err=err, managed_dirs=(self.managed,), home=self.home, stdin=TTY(""),
+                                      fetch=self.fetch)
+                self.assertEqual(rc, 2, err.getvalue())
+                self.assertIn("cortados session:", err.getvalue())
+                ex.assert_not_called()
+
     def test_the_menu_offline_takes_typed_names(self):
         self.offline = True
         _a, _e, cmd, _ = self.argv(answers="5\nqwen-27b\n")

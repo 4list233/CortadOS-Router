@@ -905,10 +905,14 @@ class RoutePrompt:
             if got == "b":
                 return None
             if got == "":
-                if order:
-                    return "local:" + "+".join(order)
-                self.say("select at least one model, or a / b")
-                continue
+                if not order:
+                    self.say("select at least one model, or a / b")
+                    continue
+                try:                                 # review localorch4 P2: the same limits as the cloud menu
+                    return check_route("local:" + "+".join(order), "route pick")
+                except SessionError as exc:          # too many models, or too long: say so and ask again
+                    self.say(f"{exc}; deselect some models, or a / b")
+                    continue
             nums = got.replace(",", " ").split()
             if all(n.isdigit() and 1 <= int(n) <= len(models) for n in nums):
                 for n in nums:
