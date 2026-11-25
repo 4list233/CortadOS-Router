@@ -1906,18 +1906,35 @@ class Registry:
         return [r for r in self.recoverable.values()
                 if r.scope == scope and r.wire_path == wire_path and r.anchor == anchor]
 
-    def pick_as_opened(self, key: str | None) -> "routing.Pick | None":
-        """Fix round 1, finding 4: the identity (routing.kept_pick of its label) of the conversations, live or reaped and
-        recoverable, opened with route pick `key` (routing.pick_request_key, kept in their route under ASKED_PICK_KEY),
-        or None when none was, or when conversations opened under that same spelling carry different labels (which
-        one the client continues cannot be told). Only the label is returned: Registry.find then matches, as for any
-        request, within the request's own scope."""
-        if not key:
+    def pick_as_opened(self, key: str | None, turn: anthropic_wire.ClientTurn, scope: str | None,
+                       wire_path: str | None, client: str | None = None) -> "routing.Pick | None":
+        """Fix round 1, finding 4: the identity (routing.kept_pick of its label) of the conversation this request could
+        continue, opened with route pick `key` (routing.pick_request_key, kept in its route under ASKED_PICK_KEY); None
+        when there is none, or when such conversations carry different labels (which one the client continues cannot
+        be told: the caller keeps the 400).
+        Fix round 2 (gpt-6.1-sol on 7879224): only the conversations the request could legitimately continue count,
+        never the whole registry. Those are the ones find could hand it: opened in its scope (wire, client name and
+        conversation identity; identity-less: identity-less ones of the same client name) and on its wire, whose
+        history holds the request's last reply: a live session that wrote it (exact match, replay or rebuild
+        writer) or a reaped, recoverable one whose last reply it is. Otherwise an unrelated scope that opened the
+        same alias under another catalogue mapping made a uniquely identified continuation ambiguous (a 400).
+        Registry.find then matches under the returned label exactly as for any request."""
+        if not key or not turn.history or wire_path is None:
             return None
+        anchor = turn.history[-1]
+
+        def mine(c) -> bool:
+            if getattr(c, "wire_path", None) != wire_path or getattr(c, "scope", None) != scope:
+                return False
+            return scope is not None or getattr(c, "client", None) == client
+
         with self._lock:
             self._prune_recoverable_locked(time.time())
-            labels = {(c.route or {}).get(ASKED_WINDOW_KEY) for c in list(self.sessions.values())
-                      + list(self.recoverable.values()) if (getattr(c, "route", None) or {}).get(ASKED_PICK_KEY) == key}
+            cands = [s for s in self.sessions.values() if mine(s) and anchor in s.history]
+            if scope is not None:
+                cands += [r for r in self.recoverable.values() if mine(r) and r.anchor == anchor]
+            labels = {(c.route or {}).get(ASKED_WINDOW_KEY) for c in cands
+                      if (getattr(c, "route", None) or {}).get(ASKED_PICK_KEY) == key}
         return routing.kept_pick(next(iter(labels))) if len(labels) == 1 else None
 
 
@@ -3726,19 +3743,26 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(503, "overloaded_error",
                                        f"cortados: the route pick could not be resolved: {type(exc).__name__}", wire,
                                        reason="routing failed")
-                if bad:
-                    # Fix round 1, finding 4: a pick that once resolved (a conversation was opened with exactly this
-                    # spelling) keeps that identity; only opening or forking validates it against the catalogue now,
-                    # so a table change that drops a selected model does not break a running conversation.
-                    pick = reg.pick_as_opened(routing.pick_request_key(
-                        self.headers.get(routing.PICK_HEADER), self.headers.get(routing.BAND_HEADER), body.get("model")))
-                    if pick is None:
-                        return self._error(400, "invalid_request_error", f"cortados: {bad}", wire,
-                                           reason="the band window or route pick is invalid")
-                    pick_unresolved = bad
-                    logger.info("route pick %s no longer resolves against the served catalogue; a continuation of a "
-                                "conversation opened under it is served, an opening or fork is refused", pick.label)
+                pick_unresolved = bad
             turn = wire.parse_request(body)
+            if pick_unresolved:
+                # Fix round 1, finding 4: a pick that once resolved (a conversation was opened with exactly this
+                # spelling) keeps that identity; only opening or forking validates it against the catalogue now,
+                # so a table change that drops a selected model does not break a running conversation. Fix round 2:
+                # looked up only among the conversations this request could continue (its scope, wire and history),
+                # so another client's or identity's conversation never makes it ambiguous.
+                wire_path = self.path.split("?")[0]
+                pick = reg.pick_as_opened(
+                    routing.pick_request_key(self.headers.get(routing.PICK_HEADER),
+                                             self.headers.get(routing.BAND_HEADER), body.get("model")),
+                    turn, reg.conversation_scope(wire_path=wire_path, client=self._client(),
+                                                 identity=self._conversation_identity()),
+                    wire_path, client=self._client())
+                if pick is None:
+                    return self._error(400, "invalid_request_error", f"cortados: {pick_unresolved}", wire,
+                                       reason="the band window or route pick is invalid")
+                logger.info("route pick %s no longer resolves against the served catalogue; a continuation of a "
+                            "conversation opened under it is served, an opening or fork is refused", pick.label)
             server_tools = anthropic_wire.server_tool_names(body) if wire is ANTHROPIC else []
             if server_tools and not turn.tools:
                 # A request whose only tools are server tools (Claude Code's WebSearch makes exactly such a call) asks

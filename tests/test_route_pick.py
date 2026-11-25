@@ -18,7 +18,7 @@ from unittest import mock
 os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp(prefix="cortados-route-pick-"))
 
 from cortados_router import core, execution_routing
-from cortados_router.provider import local_lane, routing, tasks
+from cortados_router.provider import anthropic_wire, local_lane, routing, tasks
 from cortados_router.provider import server as provider_server
 from cortados_router.provider.bridge import BridgeError
 from tests import test_provider_codex
@@ -647,6 +647,80 @@ class IdentityTests(unittest.TestCase):
             code, err = self.send_with(dict(body, model=f"cortados@R3:{OPUS}"), self.IDENT)
             self.assertEqual(code, 400, err)                                # never opened under it: refused as before
         self.assertEqual((self.routed, len(self.reg.sessions)), ([f"R3:{OPUS}+{SOL}"], 1))
+
+    # Fix round 2 (gpt-6.1-sol on 7879224): the kept pick is looked up only among the conversations the request could
+    # continue (its scope, wire and history), never across the whole registry.
+    OTHER = {"x-claude-code-session-id": "s-route-pick-other"}
+
+    def opened_in(self, model, headers):
+        first = {"model": model, "tools": [test_provider_codex.READ_TOOL],
+                 "messages": [{"role": "user", "content": "please use tool"}]}
+        r1 = self.ok(first, headers)
+        use = r1["content"][-1]
+        return dict(first, messages=first["messages"] + [
+            {"role": "assistant", "content": r1["content"]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"], "content": "hello"}]}])
+
+    def remapped_then_gone(self):
+        """`opus` meant Opus, then Sonnet (a catalogue change), then nothing (both left the served catalogue)."""
+        real = routing.pinnable_models
+        return (mock.patch.dict(routing.SUB_ALIASES, {"opus": SONNET}),
+                mock.patch.object(routing, "pinnable_models",
+                                  lambda c: [p for p in real(c) if p[1] not in (OPUS, SONNET)]))
+
+    def test_another_scope_under_the_same_alias_never_makes_a_continuation_ambiguous(self):
+        # The reviewer's reproduction: scope A opened `opus+sol` as Opus, scope B as Sonnet; once `opus` resolves to
+        # nothing, A's continuation was a 400 (two labels registry-wide) until B's conversation was dropped.
+        model = f"cortados@R3:opus+{SOL}"
+        a = self.opened_in(model, {})
+        remap, gone = self.remapped_then_gone()
+        with remap:
+            b = self.opened_in(model, self.OTHER)
+        self.assertEqual(self.labels(), [f"R3:{OPUS}+{SOL}", f"R3:{SONNET}+{SOL}"])
+        with remap, gone:
+            self.assertEqual(routing.route_pick(core, None, None, model)[0], None)     # unresolvable now
+            self.ok(a)                                                                # A continues its own
+            self.ok(b, self.OTHER)                                                    # and B its own
+        self.assertEqual(len(self.reg.sessions), 2)
+        self.assertEqual(len(self.routed), 2)                                         # nothing re-routed or forked
+        self.assertEqual([len(s.history) for s in self.reg.sessions.values()], [2, 2])
+
+    def test_two_labels_within_one_scope_are_still_ambiguous(self):
+        # Within the caller's own scope the history is held by two conversations opened under one spelling with
+        # different labels (the alias changed, the continuation forked): which one it continues cannot be told.
+        model = f"cortados@R3:opus+{SOL}"
+        body = self.opened_in(model, {})
+        remap, gone = self.remapped_then_gone()
+        with remap:
+            self.ok(body)                                                             # a fork under the new label
+        self.assertEqual(self.labels(), [f"R3:{OPUS}+{SOL}", f"R3:{SONNET}+{SOL}"])
+        with remap, gone:
+            code, err = self.send_with(body, self.IDENT)
+        self.assertEqual(code, 400, err)
+        self.assertIn("not a model this endpoint serves", err["message"])
+        self.assertEqual(len(self.reg.sessions), 2)
+
+    def test_a_kept_pick_is_never_borrowed_from_another_scope(self):
+        # Only scope B opened under the spelling; a request in scope A carrying B's very history gets the 400, and the
+        # lookup itself finds nothing for A.
+        model = f"cortados@R3:{OPUS}+{SOL}"
+        b = self.opened_in(model, self.OTHER)
+        real = routing.pinnable_models
+        with mock.patch.object(routing, "pinnable_models", lambda c: [p for p in real(c) if p[1] != OPUS]):
+            code, err = self.send_with(b, self.IDENT)
+            self.assertEqual(code, 400, err)
+            self.assertIn("not a model this endpoint serves", err["message"])
+            turn = anthropic_wire.parse_request(b)
+            key = routing.pick_request_key(None, None, model)
+            [opened] = self.reg.sessions.values()
+            mine = self.reg.conversation_scope(wire_path=opened.wire_path, client=opened.client,
+                                               identity="x-claude-code-session-id=s-route-pick")
+            self.assertNotEqual(mine, opened.scope)
+            self.assertIsNone(self.reg.pick_as_opened(key, turn, mine, opened.wire_path, client=opened.client))
+            self.assertEqual(self.reg.pick_as_opened(key, turn, opened.scope, opened.wire_path,
+                                                     client=opened.client).label, f"R3:{OPUS}+{SOL}")
+            self.ok(b, self.OTHER)                                                    # B's own continuation runs
+        self.assertEqual((len(self.routed), len(self.reg.sessions)), (1, 1))
 
 
 del _CODEX

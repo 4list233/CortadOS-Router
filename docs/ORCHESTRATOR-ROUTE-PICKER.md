@@ -414,7 +414,11 @@ carrying both `x-cortados-band` and a pick with a different window is a 400.
   400). An explicit-set pick's spelling as written (`routing.pick_request_key`: the pick header, band header and
   `cortados@` model, trimmed and casefolded) is kept on the route as `asked_pick_text` (`server.ASKED_PICK_KEY`) beside
   the label. A later request whose pick no longer resolves looks the label up by that key
-  (`Registry.pick_as_opened`: live and recoverable reaped conversations; one label, or none). It is then matched
+  (`Registry.pick_as_opened`; one label, or none). Only the conversations the request could continue count (fix round
+  2, gpt-6.1-sol on 7879224: a registry-wide lookup let an unrelated scope that opened the same alias under another
+  catalogue mapping turn a uniquely identified continuation into a 400). Those are the ones in its scope (wire, client
+  name, conversation identity) and on its wire whose history holds its last reply: live writers, or recoverable reaped
+  conversations whose last reply it is. Two labels within that set are still ambiguous (400). It is then matched
   under that label like any request, so continuations, replays and rebuilds of that conversation are served. When it
   would open a conversation, a one-shot or a fork, it gets the 400 an unknown model always gets. A spelling that
   resolves today keeps today's resolution. If the catalogue changes what an alias means (`opus` → a newer id), the
