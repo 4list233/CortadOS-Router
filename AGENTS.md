@@ -84,6 +84,9 @@ is the long form.
   heartbeats' orchestrator tokens into the live view's `work_split` section and the dashboard's Work split panel, also
   per main session on provider-observed keys only (`routes.office_origin/office_run/office_via`; the session view and
   the pulse pane get the asking session's row only: README "Per-session work split", #127).
+  `route_options.py` builds `GET /v1/cortados/route-options?band=R3|local` (the route picker's list: served models
+  clearing a band's reference, per account and lane, from cached readings only, never a vendor CLI; the launcher's menu
+  in `session.py` and the dashboard read it; docs/ORCHESTRATOR-ROUTE-PICKER.md §2).
   `usage.py` builds `GET /v1/cortados/usage` and `tasks.py` builds
   `GET /v1/cortados/tasks` (the latest 200 `routes` rows as metadata: model, band, S1 reason by category, elapsed, % routed
   per session; never the request text; tokens per routed conversation since the work split, `not recorded` before), both behind the owner token and both read by
