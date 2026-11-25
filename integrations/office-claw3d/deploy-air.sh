@@ -67,7 +67,7 @@ STUDIO_SETTINGS="$STUDIO_STATE/claw3d/settings.json"
 HEALTH_DEADLINE_S=60
 STAGE="$ROOT/stage"                        # root 0700: launchers, plists and a new token, before activation
 ADAPTER_FILES=(adapter.mjs bridge.mjs sprites.mjs claw3d/avatar-profile-hint.patch claw3d/studio-login.patch
-  claw3d/studio-login.cjs claw3d/cortados-rooms.patch claw3d/system-fonts.patch)
+  claw3d/studio-login.cjs claw3d/cortados-rooms.patch claw3d/system-fonts.patch claw3d/proxy-auth.patch)
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
@@ -202,7 +202,8 @@ fi
 # install / upgrade
 # ======================================================================================
 [[ -f "$HERE/claw3d/avatar-profile-hint.patch" && -f "$HERE/claw3d/studio-login.patch" \
-  && -f "$HERE/claw3d/cortados-rooms.patch" && -f "$HERE/claw3d/system-fonts.patch" && -f "$HERE/bridge.mjs" ]] \
+  && -f "$HERE/claw3d/cortados-rooms.patch" && -f "$HERE/claw3d/system-fonts.patch" \
+  && -f "$HERE/claw3d/proxy-auth.patch" && -f "$HERE/bridge.mjs" ]] \
   || die "run from a CortadOS-Router checkout"
 xcode-select -p >/dev/null 2>&1 || die "git needs the Xcode command line tools (xcode-select --install)"
 # captured first: a failed `git status` prints nothing, which must not read as "clean"
@@ -450,6 +451,9 @@ fi
 # ---- 4. build Claw3D beside the running one (pinned commit + the patches) -------------
 # system-fonts.patch drops next/font/google: the build fetches nothing from Google Fonts, whose
 # /l/font?kit=..&skey=.. answers break next/font under Turbopack (and webpack), 2026-11-24.
+# proxy-auth.patch makes Studio's gateway proxy always send its configured token to the bridge and
+# drop the browser's device block and credentials: over HTTPS the stock proxy took the browser's
+# signed device block as its auth, sent no token, and the bridge refused (1012 in the Office), 2026-11-25.
 step "4. Claw3D $CLAW3D_COMMIT -> $BUILD (build as $STUDIO_USER; switched in only after it succeeds)"
 as_studio() { run sudo -u "$STUDIO_USER" -H env HOME="$STUDIO_HOME" PATH="$ROOT/node-$NODE_VERSION/bin:/usr/bin:/bin" \
   NEXT_TELEMETRY_DISABLED=1 npm_config_fund=false npm_config_audit=false "$@"; }
@@ -460,7 +464,7 @@ else
   [[ ! -e "$BUILD" ]] || run sudo -u "$STUDIO_USER" rm -rf "$BUILD"
   as_studio git clone --no-checkout "$CLAW3D_REPO" "$BUILD"
   as_studio git -C "$BUILD" checkout --detach "$CLAW3D_COMMIT"
-  for p in avatar-profile-hint.patch studio-login.patch cortados-rooms.patch system-fonts.patch; do
+  for p in avatar-profile-hint.patch studio-login.patch cortados-rooms.patch system-fonts.patch proxy-auth.patch; do
     as_studio git -C "$BUILD" apply --check "$ADAPTER_DIR/$p"
     as_studio git -C "$BUILD" apply "$ADAPTER_DIR/$p"
   done
@@ -655,7 +659,8 @@ office_healthy() {  # prints why not, on failure
   [[ "$(http_code "http://127.0.0.1:$STUDIO_PORT/cortados-login")" == 200 ]] || { echo "the login form does not answer"; return 1; }
   # End to end, as the browser does: through Studio's own proxy (/api/gateway/ws, behind its access
   # gate) an OpenClaw `connect`, which the proxy forwards with its gateway token; only the bridge's
-  # ok:true hello passes (gateway-check.mjs). Reason: on 2026-11-24 every check above passed while
+  # ok:true hello passes (gateway-check.mjs). It also sends a connect shaped like the browser's over
+  # HTTPS (a signed device block, no token), which only a proxy with proxy-auth.patch gets through. Reason: on 2026-11-24 every check above passed while
   # the proxy refused its upstream (studio.gateway_url_blocked) and the Office showed 0 agents.
   # The access token goes file -> pipe -> stdin: never printed, never on a command line. Read as
   # $STUDIO_USER, not root: the path is in Studio's home and the probe sends what it reads to Studio's

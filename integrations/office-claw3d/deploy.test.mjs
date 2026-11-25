@@ -734,7 +734,9 @@ function spawnAsync(cmd, args, env) {
 //            a line-for-line port of Claw3D 51337f7's loadUpstreamGatewaySettings (claw3dSettings
 //            below) with `claw3d.env` as Studio's environment, then gateway-proxy.js's checks in its
 //            order (claw3dAnswer). The upstream is "the bridge" only at ws://localhost|127.0.0.1:<bridgePort>,
-//            and it says hello only to `claw3d.bridgeToken`, as bridge.mjs does.
+//            and it says hello only to `claw3d.bridgeToken`, as bridge.mjs does. `claw3d.patched`
+//            (default true: Studio as deploy-air.sh builds it) models claw3d/proxy-auth.patch;
+//            false models the stock proxy, which takes a browser's signed device block as its auth.
 // It records each connect frame it got, to check the probe sends no credential of its own.
 async function fakeStudioProxy(t, mode, claw3d = null) {
   const { createServer } = await import('node:http');
@@ -861,13 +863,26 @@ function claw3dSetup({ env }) {
   try { new URL(url); } catch { return { error: 'studio.gateway_url_invalid' }; }
   return { url, token, adapterType };
 }
+// gateway-proxy.js 149-167 (hasCompleteDeviceAuth): id, publicKey, signature, nonce non-empty, signedAt >= 0
+function claw3dCompleteDevice(params) {
+  const d = params?.device;
+  if (!d || typeof d !== 'object') return false;
+  const full = v => typeof v === 'string' && v.trim().length > 0;
+  return full(d.id) && full(d.publicKey) && full(d.signature) && full(d.nonce) && Number.isFinite(d.signedAt) && d.signedAt >= 0;
+}
 // A setup error is sent as the connect's answer, then close 1011 (sendConnectError); else
 // forwardConnectFrame 230-243: an openclaw upstream with no token and no browser credential is
-// studio.gateway_token_missing; otherwise the token is injected and the upstream answers.
-function claw3dAnswer(setup, frame, { bridgeToken, bridgePort = 18789 }) {
+// studio.gateway_token_missing; otherwise the token is injected and the upstream answers. A browser
+// credential (token, password, deviceToken, or a complete device block) is forwarded as it is, with
+// no token injected. Patched (claw3d/proxy-auth.patch): params.device and params.auth are dropped
+// first, so the browser never has a credential and the configured token is always the one sent.
+function claw3dAnswer(setup, frame, { bridgeToken, bridgePort = 18789, patched = true }) {
   if (setup.error) return { code: setup.error, close: 1011 };
-  const auth = frame.params?.auth ?? {};
-  const browserHasAuth = [auth.token, auth.password, auth.deviceToken].some(v => typeof v === 'string' && v.trim());
+  const params = { ...(frame.params ?? {}) };
+  if (patched) { delete params.device; delete params.auth; }
+  const auth = params.auth ?? {};
+  const browserHasAuth = [auth.token, auth.password, auth.deviceToken].some(v => typeof v === 'string' && v.trim())
+    || claw3dCompleteDevice(params);
   if (setup.adapterType === 'openclaw' && !setup.token && !browserHasAuth) return { code: 'studio.gateway_token_missing', close: 1011 };
   const u = new URL(setup.url);
   if (!['localhost', '127.0.0.1'].includes(u.hostname) || Number(u.port) !== bridgePort) return { code: 'studio.upstream_error', close: 1011 };
@@ -1087,6 +1102,71 @@ test('gateway-check.mjs: ok only on the bridge\'s hello; a refused upgrade, sile
   const s = createServer(); await new Promise(r => s.listen(0, '127.0.0.1', r));
   const free = s.address().port; await new Promise(r => s.close(r));
   assert.equal(await probe({ port: free, token: ACCESS }), 'cannot reach Studio');
+});
+
+test('gateway-check.mjs check(): a plain connect, then one shaped like the browser over HTTPS (signed device block, no token) (#77 proxy-auth)', async t => {
+  const { check, probe, browserConnectParams } = await import('./gateway-check.mjs');
+  const { createPublicKey, createHash, verify } = await import('node:crypto');
+  const studio = await fakeStudioProxy(t, 'ok');
+  assert.equal(await check({ port: studio.port, token: ACCESS }), 'ok');
+  assert.equal(studio.connects.length, 2);
+  assert.equal(studio.connects[0].params?.device, undefined);
+  const p = studio.connects[1].params;
+  // what the stock proxy takes for the browser's own auth: complete, and no credential of the probe's
+  assert.equal(p.auth, undefined);
+  assert.ok(claw3dCompleteDevice(p), 'a complete device block');
+  assert.equal(p.device.nonce, 'n', 'signed over the challenge nonce the upstream sent');
+  // shaped as GatewayBrowserClient builds it: id = sha256(raw public key), a valid v2 Ed25519 signature
+  const raw = Buffer.from(p.device.publicKey, 'base64url');
+  assert.equal(p.device.id, createHash('sha256').update(raw).digest('hex'));
+  const key = createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: p.device.publicKey }, format: 'jwk' });
+  const payload = ['v2', p.device.id, 'openclaw-control-ui', 'webchat', 'operator', p.scopes.join(','), String(p.device.signedAt), '', 'n'].join('|');
+  assert.ok(verify(null, Buffer.from(payload), key, Buffer.from(p.device.signature, 'base64url')));
+  assert.deepEqual([p.client.id, p.client.mode, p.role], ['openclaw-control-ui', 'webchat', 'operator']);
+  assert.notEqual(browserConnectParams('n').device.id, p.device.id, 'a fresh identity each time');
+  // the plain connect's failure is reported as it is, and the second connect is not tried
+  const blocked = await fakeStudioProxy(t, 'blocked');
+  assert.equal(await check({ port: blocked.port, token: ACCESS }), 'connect refused: studio.gateway_url_blocked');
+  assert.equal(blocked.connects.length, 1);
+  // one deadline for both connects
+  const silent = await fakeStudioProxy(t, 'silent');
+  const t0 = Date.now();
+  assert.equal(await check({ port: silent.port, token: ACCESS, timeoutMs: 300 }), 'no answer within 300 ms');
+  assert.ok(Date.now() - t0 < 1500);
+  // an unknown shape is refused, never sent
+  assert.equal(await probe({ port: studio.port, token: ACCESS, shape: 'nope' }), 'unknown connect shape');
+});
+
+test('proxy-auth.patch: the check fails on the stock Claw3D proxy (the Air on 2026-11-25) and passes on the patched one (#77 proxy-auth)', async t => {
+  const { check } = await import('./gateway-check.mjs');
+  const root = await mkdtemp(join(tmpdir(), 'office-proxy-auth-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const L = await studioLauncher(t, root);
+  await mkdir(join(L.settingsPath, '..'), { recursive: true });
+  await writeFile(L.settingsPath, buildSettings(BRIDGE_TOKEN, L.gatewayUrl).stdout);
+  const stock = await fakeStudioProxy(t, 'claw3d', { env: L.env, bridgeToken: BRIDGE_TOKEN, patched: false });
+  assert.equal(await check({ port: stock.port, token: ACCESS }),
+    'browser-shaped connect (signed device, no token): connect refused: UNAUTHORIZED');
+  const patched = await fakeStudioProxy(t, 'claw3d', { env: L.env, bridgeToken: BRIDGE_TOKEN, patched: true });
+  assert.equal(await check({ port: patched.port, token: ACCESS }), 'ok');
+  // the configured token replaces anything the browser sent, a token typed into the page included
+  const setup = claw3dSetup({ env: L.env });
+  const device = stock.connects[1].params.device;
+  for (const params of [{ device }, { device, auth: { token: 'typed-in-the-page-0000' } }, { auth: { password: 'x'.repeat(20) } }, {}]) {
+    assert.deepEqual(claw3dAnswer(setup, { params }, { bridgeToken: BRIDGE_TOKEN }), { ok: true }, JSON.stringify(Object.keys(params)));
+  }
+  assert.equal(claw3dAnswer(setup, { params: { device, auth: { token: 'typed-in-the-page-0000' } } }, { bridgeToken: BRIDGE_TOKEN, patched: false }).code, 'UNAUTHORIZED');
+  // without a configured token the patched proxy refuses: it never forwards a browser credential instead
+  assert.equal(claw3dAnswer({ ...setup, token: '' }, { params: { auth: { token: BRIDGE_TOKEN } } }, { bridgeToken: BRIDGE_TOKEN }).code, 'studio.gateway_token_missing');
+  // and the model above is the patch: it changes forwardConnectFrame only, and drops exactly these two
+  const patch = await readFile(join(HERE, 'claw3d', 'proxy-auth.patch'), 'utf8');
+  assert.deepEqual([...patch.matchAll(/^\+\+\+ b\/(.+)$/gm)].map(m => m[1]), ['server/gateway-proxy.js']);
+  assert.match(patch, /^index 388bba0\.\./m, 'made against gateway-proxy.js as of Claw3D 51337f7');
+  const added = patch.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++') && !/^\+\s*\/\//.test(l)).map(l => l.slice(1).trim());
+  assert.deepEqual(added, ['const forwardConnectFrame = (browserFrame) => {',
+    'const params = isObject(browserFrame.params) ? { ...browserFrame.params } : {};',
+    'delete params.device;', 'delete params.auth;', 'const frame = { ...browserFrame, params };']);
+  assert.deepEqual(patch.split('\n').filter(l => l.startsWith('-') && !l.startsWith('---')), ['-    const forwardConnectFrame = (frame) => {']);
 });
 
 test('activation: Studio\'s proxy answering studio.gateway_url_blocked fails the health check and rolls back (#77 upstream allowlist)', async t => {
@@ -1728,7 +1808,7 @@ test('deploy-air.sh: every Claw3D patch is shipped, required and applied with it
   const loop = text.match(/^\s*for p in ([^;]+); do\n\s*as_studio git -C "\$BUILD" apply --check "\$ADAPTER_DIR\/\$p"\n\s*as_studio git -C "\$BUILD" apply "\$ADAPTER_DIR\/\$p"/m);
   assert.ok(loop, 'the apply loop checks each patch before applying it');
   const applied = loop[1].trim().split(/\s+/);
-  for (const patch of ['avatar-profile-hint.patch', 'studio-login.patch', 'cortados-rooms.patch', 'system-fonts.patch']) {
+  for (const patch of ['avatar-profile-hint.patch', 'studio-login.patch', 'cortados-rooms.patch', 'system-fonts.patch', 'proxy-auth.patch']) {
     assert.ok(shipped.includes('claw3d/' + patch), patch + ' is in ADAPTER_FILES');
     assert.ok(applied.includes(patch), patch + ' is applied');
     assert.ok(text.includes('-f "$HERE/claw3d/' + patch + '"'), patch + ' is required before anything changes');

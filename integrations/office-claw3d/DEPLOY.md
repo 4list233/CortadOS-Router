@@ -82,6 +82,15 @@ bridge user. The bridge refuses to start if the two secrets are equal.
   Claw3D's access gate only checks a `studio_access` cookie and ships no way to set it; this adds
   a password form at `/cortados-login` that sets it (details under "Viewing it"). Not
   owner-approved yet: [ESCALATE] in the round-1 report.
+- **Proxy auth** `claw3d/proxy-auth.patch` (`server/gateway-proxy.js`, `forwardConnectFrame`): the
+  proxy drops the browser's `params.device` and `params.auth` and always sends the token from its
+  settings file, replacing anything the browser sent (a token typed into the page's "Upstream token"
+  field included). The upstream is always our bridge, which accepts only that token. Reason: over
+  HTTPS (a secure context) Claw3D's browser client adds a signed `device` block to its `connect`;
+  the stock proxy takes a complete device block as the browser's own auth and injects no token, the
+  bridge refuses the connect (UNAUTHORIZED, 1008) and the Office shows "Gateway closed (1012):
+  upstream closed". Seen on the Air on 2026-11-25; the deploy's check had passed because its
+  connect carried no device block.
 - **The provider running on the Air** at 127.0.0.1:8432 (checked first: it must answer 401
   without a token).
 - About 1 GB of disk for Node, `node_modules` and the build, twice during an upgrade (the
@@ -137,12 +146,12 @@ Then:
 2. **Node.** Kept when `/opt/cortados-office/node-v24.22.3` answers with that version. Otherwise
    it downloads the pinned tarball, checks its SHA-256, and extracts it root-owned into a
    `.partial` directory that is renamed into place.
-3. **Adapter, staged.** Copies `adapter.mjs`, `bridge.mjs`, `sprites.mjs` and the four patches plus
+3. **Adapter, staged.** Copies `adapter.mjs`, `bridge.mjs`, `sprites.mjs` and the five patches plus
    `studio-login.cjs`, root-owned and read-only, to `/opt/cortados-office/adapters/<commit>/`. The
    running bridge still uses the old copy.
 4. **Claw3D, staged.** Builds into `claw3d/builds/<claw3d commit>-<checkout commit>/` as
-   `_cortados-claw3d`: clone, check out the pinned commit, `git apply --check` and apply the four
-   patches (avatar-profile-hint, studio-login, cortados-rooms, system-fonts), copy the login module, `npm ci --ignore-scripts && npm run build`, then write a
+   `_cortados-claw3d`: clone, check out the pinned commit, `git apply --check` and apply the five
+   patches (avatar-profile-hint, studio-login, cortados-rooms, system-fonts, proxy-auth), copy the login module, `npm ci --ignore-scripts && npm run build`, then write a
    `.cortados-build-ok` marker. A build dir with the marker is reused. One without it (a failed
    earlier run) is deleted and rebuilt. It is never the current one.
 5. **Secrets.** Nothing is printed or passed on argv. Files that are already there are kept.
@@ -215,7 +224,11 @@ Then:
      (`gateway-check.mjs`): a WebSocket to `127.0.0.1:3000/api/gateway/ws` with the `studio_access`
      cookie, then an OpenClaw `connect` without credentials; Studio's proxy injects the token from
      its settings file and forwards it, and only the bridge's `ok:true` hello passes (a missing
-     settings file fails as `studio.gateway_token_missing`, a stale token as `UNAUTHORIZED`). The access token is read as
+     settings file fails as `studio.gateway_token_missing`, a stale token as `UNAUTHORIZED`). On a
+     second socket, within the same 5 s, it sends a `connect` shaped like the browser's over HTTPS: a
+     complete Ed25519-signed `device` block over the bridge's challenge nonce and no token. Only a
+     proxy with `proxy-auth.patch` gets it to the bridge's hello; the stock proxy fails it as
+     `browser-shaped connect (signed device, no token): connect refused: UNAUTHORIZED`. The access token is read as
      `_cortados-claw3d` (as root, a link Studio planted there would send a root-readable file to
      Studio's own port) and piped to the probe's stdin (never printed, never on a command line). Any error, refusal,
      close or its 5 s deadline fails the check and the release rolls back. Reason: the first live
@@ -291,9 +304,11 @@ owner and only their devices; sharing the tailnet or the node with anyone else w
 per-device limit (Serve's `Tailscale-User-Login` header) first. Every other request goes
 to Claw3D's stock access gate unchanged.
 
-Not checked live: whether Studio's browser WebSocket (`/api/gateway/ws`) works through Serve's
-`wss://` (the cookie is sent same-origin, and Claw3D's proxy checks only the cookie, in
-`verifyClient`).
+The browser's `connect` over HTTPS is covered by the deploy's check: `gateway-check.mjs` sends one
+shaped like it (signed device block, no token) at every install and upgrade, and the release rolls
+back if the bridge does not answer it (it did not before `proxy-auth.patch`, 2026-11-25). The check
+runs on loopback, so Serve's `wss://` transport itself is still not checked by it (the cookie is sent
+same-origin, and Claw3D's proxy checks only the cookie, in `verifyClient`).
 
 In Studio, the backend shows as the URL `ws://localhost:18789` with adapter type `openclaw`.
 Studio treats any adapter type it does not know as `openclaw`. The bridge reports
@@ -378,10 +393,12 @@ rewritten from the bridge secret (its other keys kept), so an upgrade also repai
 before #77 fix round 1, which had none. If the build fails, the running
 Office is untouched; the next run deletes the failed build dir and tries again.
 
-To move Claw3D itself, change `CLAW3D_COMMIT` and re-check both patches against the new commit:
+To move Claw3D itself, change `CLAW3D_COMMIT` and re-check every patch against the new commit:
 `git apply --check`. The avatar patch touches
-`src/features/agents/operations/agentFleetHydrationDerivation.ts` and the login patch touches
-`server/index.js`. Also re-check the gaps listed in PROTOCOL.md first.
+`src/features/agents/operations/agentFleetHydrationDerivation.ts`, the login patch
+`server/index.js` and the proxy-auth patch `server/gateway-proxy.js` (re-check there that the
+browser's connect still reaches `forwardConnectFrame` and that its device block is still the field
+the stock code treats as auth). Also re-check the gaps listed in PROTOCOL.md first.
 
 Rollback: point `/opt/cortados-office/adapter` and `/opt/cortados-office/claw3d/current` back at
 the previous entries in `adapters/` and `claw3d/builds/` (kept by the prune), then
