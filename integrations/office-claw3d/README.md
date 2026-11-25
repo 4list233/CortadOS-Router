@@ -20,6 +20,7 @@ protocol, how it renders people and floors, and the remaining gaps.
 | `studio-settings.py` | builds Studio's gateway settings file (`<state dir>/claw3d/settings.json`: the bridge URL and secret), the only upstream config Claw3D's proxy reads |
 | `claw3d/cortados-rooms.patch`, `claw3d/cortadosRooms.ts` | rooms per orchestrator: the floor's 8 rooms x 6 desks and the desk allocation (the patch adds the `.ts` file and a 40-line hook; [FLOORS-DESIGN.md](FLOORS-DESIGN.md) §8) |
 | `claw3d/cortados-brand.patch` | brands the Office as the CortadOS router (title, floor card, connection badge), removes the flag poles and hides the OpenClaw controls the read-only bridge cannot serve, the chat composer included ([OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md) part A) |
+| `claw3d/office-mode.patch`, `claw3d/office-mode.cjs` | "office mode": Studio's server answers only the Office's own routes and methods and 403 to the rest (`PUT /api/studio`, remote office, runtime, voice, every write), so the cookie opens a read-only view ([OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md) A.5) |
 | `DEPLOY.md`, `deploy-air.sh`, `deploy-lib.sh` | Air runbook, script (install / upgrade / tailnet publish) and its pure checks, written and **not run** |
 
 ## Test
@@ -48,7 +49,7 @@ the stock layout comes back; the brand patch (below) is not switched, since this
 Each nameplate's second line ends with where the person runs (`claude-opus-5 · Pro`): a task's exec host, an
 orchestrator's session host (its device matched to a known host name by the provider: `live.orchestrator_hosts`, the
 tree's group `host`), a helper's task or session host. No badge when no known name matches; a raw hostname is never
-shown. Branding, the removed props, the hidden controls and the design of what comes next (orchestrator names, server
+shown, and the group's raw `device` is not in `agents.list` at all. Branding, the removed props, the hidden controls and the design of what comes next (orchestrator names, server
 room, steering) are in [OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md).
 
 ## Appearance (issue #77)

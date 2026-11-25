@@ -60,6 +60,8 @@ agents). This Studio build exists only for the CortadOS bridge: its settings fil
 pin it there. The rooms patch's promise "with any other gateway connected, Studio is unchanged" now covers the layout
 only.
 
+Hiding a control does not stop a logged-in browser calling the route behind it: Studio's server enforces that, A.5.
+
 ### A.4 Host badge
 
 Each person shows where it runs, at the end of the nameplate's second line: `claude-opus-5 · Pro`,
@@ -79,9 +81,59 @@ no name gives no badge; the raw hostname is never used as the badge (it can carr
 the hosts section). The adapter shows a host only when it is a host slug (`/^[a-z][a-z0-9-]{0,31}$/`), never an IP,
 a path or a mixed-case hostname. No new scope: the tree stays under `office:read`.
 
-Note, existing behaviour, not changed here: the tree also carries each group's raw `device` (a short hostname such as
-`<owner>-macbook-pro`), and the adapter forwards it as `office.device` in `agents.list` to Studio's browser, which
-does not display it. Now that `host` exists it could be dropped: [ESCALATE] B5.
+The tree also carries each group's raw `device` (a short hostname such as `<owner>-macbook-pro`). The adapter no
+longer forwards it: `agents.list` has no `office.device` (review fix round 1, 2026-11-25; `rooms.test.mjs`,
+`bridge.test.mjs`). Only `host`, the matched known name, reaches the browser. The tree itself still carries `device`
+under `office:read` (the bridge's token only); dropping it from `_TREE_GROUP_KEYS` is B5.
+
+### A.5 Studio's server is read-only (`claw3d/office-mode.patch`, `claw3d/office-mode.cjs`)
+
+Review of this branch (P1, 2026-11-25): hiding controls did not make Studio read-only. Anyone holding the Studio cookie
+could still call Studio's own API directly: `PUT /api/studio` (rewrite the settings file the gateway proxy takes its
+upstream from, or turn on a remote office with its own gateway and token), `POST /api/office/remote-message` and
+`/remote-handoff` (connect straight to a configured remote gateway with `NodeGatewayClient`, outside the proxy and its
+`UPSTREAM_ALLOWLIST`), `POST /api/runtime/custom` (forwards requests to allowed hosts, any localhost port included), the
+voice routes, and a dozen routes that write Studio's local state.
+
+"Office mode" is a check in Studio's custom server (`server/index.js`), after the login form and the stock access gate
+(an unauthenticated request still gets the gate's 401), before Next. It lets through only a request whose method and
+exact raw path (nothing decoded or normalised) are on its list, and answers 403 to everything else, unknown routes
+included. Upgrades: only `/api/gateway/ws`, before Next's upgrade handler. It has no switch: this build serves only
+the bridge. The list was taken by loading the Office in headless Chrome against a local bridge and recording every
+request (2026-11-25):
+
+| Route | Methods | Why |
+|---|---|---|
+| `/cortados-login` | GET, HEAD, POST | the login form (answered before the check; listed so the order cannot lock anyone out) |
+| `/` | GET, HEAD | the start page; it only redirects to `/office` |
+| `/office` | GET, HEAD | the Office page |
+| `/favicon.ico` | GET, HEAD | the tab icon |
+| `/_next/static/…` | GET, HEAD | the built JavaScript, CSS and media (safe characters only, no `..`) |
+| `/office-assets/…` | GET, HEAD | the 3D models and backgrounds (same rule) |
+| `/api/health` | GET, HEAD | liveness for deploy-air.sh |
+| `/api/studio` | GET, HEAD | settings as the page boots; sanitized upstream, the gateway token is never in it |
+| `/api/task-store` | GET, HEAD | the Office polls the task board (Studio's own local file, which nothing can write now) |
+| `/api/office/standup/config` | GET, HEAD | read while the Office hydrates |
+| `/api/office/standup/meeting` | GET, HEAD | read while the Office hydrates |
+| `/api/gateway/ws` (upgrade) | WebSocket | Studio's gateway proxy, still behind the access gate's cookie check |
+
+Everything else is 403: every other method on those paths (`PUT /api/studio` included: settings are pinned), every
+other API route (the remote office, runtime, voice, upload, layout, publish, standup writes, task-store writes,
+agent-state, skills; and the GETs the Office does not use, such as `path-suggestions`, `gateway/media`,
+`browser-preview`, `github`, `presence`), the other pages (`/agents`, `/office/builder`, `/spotify/callback`), Next's
+image optimizer and server actions, and any other upgrade (the dev server's HMR socket included).
+
+The page itself saves UI state with `PUT /api/studio` and awaited that save before connecting, so a refused save
+stopped the Office from connecting. The patch's second hunk (`src/lib/gateway/GatewayClient.ts`, one line) lets
+`connect()` go on when the save fails; the upstream comes from the server's own settings, never from that save. The
+refused saves show as console errors in the browser; nothing else changes.
+
+The upstream cannot be chosen by the browser: the proxy reads it only from `<state dir>/claw3d/settings.json` (or
+`openclaw.json` in the same state dir, or the default), never from the connect frame or the URL; the three routes
+that write that file (`PUT /api/studio`, `PUT /api/office/standup/config`, `POST /api/office/standup/run`) are
+refused; `UPSTREAM_ALLOWLIST=localhost` still applies; and proxy-auth.patch still replaces the browser's credentials
+with the configured token. Tests: `office-mode.test.mjs` (the list against every route Claw3D 51337f7 serves, read
+from the checkout when `CORTADOS_CLAW3D_CHECKOUT` is set; a real server wired as the patch wires it; the patch).
 
 ## B. Design (not built)
 
@@ -174,7 +226,10 @@ also opens subscriptions, routed-call rows and the work split).
   them directly.
 - The Office path is read-only by design: the browser talks to Studio (user `_cortados-claw3d`), Studio's proxy to the
   bridge with a bridge secret that opens only the read-only bridge, the bridge to the provider with an `office:read`
-  token that opens two GETs. No write exists anywhere on that path.
+  token that opens two GETs. Studio's own API is held read-only by office mode (A.5): only the Office's GET routes
+  and the gateway socket are served, every write route (settings, remote office, runtime, voice, uploads, layout,
+  standup, task board) is refused with 403, and the proxy's upstream is pinned to the bridge. Nothing a browser
+  sends on that path can change Studio's state or reach an agent.
 
 **Options.**
 
@@ -205,8 +260,8 @@ hook never runs a note as a command, and the tree flag.
 - **B4. Steering.** An owner-only `steer_task` MCP tool delivered by a PostToolUse hook at tool boundaries
   (recommended), stream-json input, or cancel + restart only? Confirm that no steering path will ever start from the
   Office (browser).
-- **B5. Raw `device` in the Office.** The tree still publishes each group's raw short hostname (`device`), and the
-  adapter forwards it to Studio's browser in `agents.list` (not displayed). Drop it from the adapter output (and later
-  from `_TREE_GROUP_KEYS`) now that `host` carries the known name?
+- **B5. Raw `device` in the tree.** The adapter no longer forwards it to the browser (A.4, review fix round 1). The
+  provider's tree still publishes each group's raw short hostname (`device`) to the bridge under `office:read`: drop
+  it from `_TREE_GROUP_KEYS` too, now that `host` carries the known name?
 - **B6. Onboarding and event console.** Both are hidden unconditionally. Keep them hidden, or bring the event console
   back behind an explicit `DEBUG=1` on the Studio launcher (it shows only the bridge's metadata events)?

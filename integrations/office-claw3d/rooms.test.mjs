@@ -111,6 +111,17 @@ test('each person shows where it runs: task host, the session host for orchestra
   for (const a of mapTree(sample()).filter(x => x.office.group === 'lobby')) assert.equal(a.office.host, null);
 });
 
+test('a raw device never reaches the browser: no office.device, only the matched host (review fix round 1)', () => {
+  const tree = sample();
+  const raw = 'forest-li-macbook-pro';
+  for (const g of tree.orchestrators.items) g.device = raw;
+  const agents = mapTree(tree);
+  assert.ok(agents.length > 0);
+  for (const a of agents) assert.ok(!('device' in a.office), a.id);
+  assert.ok(!JSON.stringify(agents).includes(raw), 'the raw hostname appears nowhere in agents.list');
+  assert.ok(agents.some(a => a.office.host !== null), 'the known host name is still published');
+});
+
 test('a host that is not a host slug is no badge, never shown as given', () => {
   for (const bad of ['Forests-MacBook-Pro', '192.0.2.4', '/Users/x', 'a'.repeat(33), '', 7, null, undefined]) {
     assert.equal(hostName(bad), null, String(bad));

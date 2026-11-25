@@ -68,7 +68,7 @@ HEALTH_DEADLINE_S=60
 STAGE="$ROOT/stage"                        # root 0700: launchers, plists and a new token, before activation
 ADAPTER_FILES=(adapter.mjs bridge.mjs sprites.mjs claw3d/avatar-profile-hint.patch claw3d/studio-login.patch
   claw3d/studio-login.cjs claw3d/cortados-rooms.patch claw3d/system-fonts.patch claw3d/proxy-auth.patch
-  claw3d/cortados-brand.patch)
+  claw3d/cortados-brand.patch claw3d/office-mode.patch claw3d/office-mode.cjs)
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
@@ -204,7 +204,8 @@ fi
 # ======================================================================================
 [[ -f "$HERE/claw3d/avatar-profile-hint.patch" && -f "$HERE/claw3d/studio-login.patch" \
   && -f "$HERE/claw3d/cortados-rooms.patch" && -f "$HERE/claw3d/system-fonts.patch" \
-  && -f "$HERE/claw3d/proxy-auth.patch" && -f "$HERE/claw3d/cortados-brand.patch" && -f "$HERE/bridge.mjs" ]] \
+  && -f "$HERE/claw3d/proxy-auth.patch" && -f "$HERE/claw3d/cortados-brand.patch" \
+  && -f "$HERE/claw3d/office-mode.patch" && -f "$HERE/claw3d/office-mode.cjs" && -f "$HERE/bridge.mjs" ]] \
   || die "run from a CortadOS-Router checkout"
 xcode-select -p >/dev/null 2>&1 || die "git needs the Xcode command line tools (xcode-select --install)"
 # captured first: a failed `git status` prints nothing, which must not read as "clean"
@@ -457,6 +458,9 @@ fi
 # signed device block as its auth, sent no token, and the bridge refused (1012 in the Office), 2026-11-25.
 # cortados-brand.patch brands the Office as the CortadOS router, removes the flag poles and hides the OpenClaw
 # controls the read-only bridge cannot serve (the chat composer included), 2026-11-25.
+# office-mode.patch + office-mode.cjs make Studio's server read-only: an allowlist of routes and methods, 403 for the
+# rest (PUT /api/studio, the remote-office, runtime and voice routes...): hiding controls did not stop a logged-in
+# browser calling them (review of #77 brand, 2026-11-25).
 step "4. Claw3D $CLAW3D_COMMIT -> $BUILD (build as $STUDIO_USER; switched in only after it succeeds)"
 as_studio() { run sudo -u "$STUDIO_USER" -H env HOME="$STUDIO_HOME" PATH="$ROOT/node-$NODE_VERSION/bin:/usr/bin:/bin" \
   NEXT_TELEMETRY_DISABLED=1 npm_config_fund=false npm_config_audit=false "$@"; }
@@ -468,11 +472,12 @@ else
   as_studio git clone --no-checkout "$CLAW3D_REPO" "$BUILD"
   as_studio git -C "$BUILD" checkout --detach "$CLAW3D_COMMIT"
   for p in avatar-profile-hint.patch studio-login.patch cortados-rooms.patch system-fonts.patch proxy-auth.patch \
-      cortados-brand.patch; do
+      cortados-brand.patch office-mode.patch; do
     as_studio git -C "$BUILD" apply --check "$ADAPTER_DIR/$p"
     as_studio git -C "$BUILD" apply "$ADAPTER_DIR/$p"
   done
   as_studio install -m 0644 "$ADAPTER_DIR/studio-login.cjs" "$BUILD/server/cortados-studio-login.js"
+  as_studio install -m 0644 "$ADAPTER_DIR/office-mode.cjs" "$BUILD/server/cortados-office-mode.js"
   # Lockfile install. Lifecycle scripts are off; if the build then fails for a missing
   # native binary, see DEPLOY.md "If npm run build fails" (an owner decision, not automatic).
   as_studio bash -c "cd '$BUILD' && '$NPM' ci --ignore-scripts && '$NPM' run build && touch .cortados-build-ok"

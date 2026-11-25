@@ -1805,7 +1805,7 @@ test('clients_cli: the clients module is $REPO\'s, whatever the working director
 // The Claw3D patches in the order deploy-air.sh applies them: each one is made against 51337f7 with every earlier one
 // applied (cortados-brand.patch touches RetroOffice3D.tsx after cortados-rooms.patch).
 const DEPLOY_ORDER = ['avatar-profile-hint.patch', 'studio-login.patch', 'cortados-rooms.patch', 'system-fonts.patch',
-  'proxy-auth.patch', 'cortados-brand.patch'];
+  'proxy-auth.patch', 'cortados-brand.patch', 'office-mode.patch'];
 const CLAW3D_COMMIT = '51337f7f250459af61a7cf92b7b0015d59faed5c';
 
 test('deploy-air.sh: every Claw3D patch is shipped, required and applied with its --check refusal (#77 rooms)', async () => {

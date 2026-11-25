@@ -139,7 +139,8 @@ export function mapOffice(view) {
       identity: { name, emoji: role === 'orchestrator' ? '👔' : '🤖',
         avatarUrl: avatarDataUrl(family, outfit), avatarProfile: avatarProfile(family, outfit, id) },
       office: {
-        floor: floor.session, project: text(floor.project), device: text(floor.device),
+        // No `device`: a raw hostname can carry the owner's name and never reaches the browser (#77 fix round 1).
+        floor: floor.session, project: text(floor.project),
         provider, lane: text(record.lane), localBackend: backend, model: text(record.model), status,
         tool: text(record.tool), title: text(record.title),
         characterFamily: family, outfit, sprite: family + (outfit === 'suit' ? '-suit' : ''),
@@ -296,7 +297,7 @@ export function mapTree(tree) {
     };
     const groupHost = hostName(g.host);
     const base = (id, kind, parent, depth, host = groupHost) => ({ id, kind, parent, depth, group: key,
-      groupLabel: label, project: text(g.project), device: text(g.device), host });
+      groupLabel: label, project: text(g.project), host });
     if (orchestratorId) {
       const { family, source } = orchestratorFamily(g);
       push({ ...base(orchestratorId, 'orchestrator', null, 0), name: label,
@@ -387,7 +388,7 @@ export function mapTree(tree) {
       if (++people > TREE_PEOPLE_MAX) throw new Error('invalid office tree');
       ids.add(id);
       room.push({ id, kind: 'helper', parent: null, depth: 1, group: LOBBY_KEY, groupLabel: LOBBY_LABEL,
-        project: null, device: null, host: null, name: shortText(r.title) ?? (r.kind === 'conversation' ? 'Conversation' : 'Helper'),
+        project: null, host: null, name: shortText(r.title) ?? (r.kind === 'conversation' ? 'Conversation' : 'Helper'),
         role: shortText(r.model) ?? 'routed', status: r.status === 'running' ? 'working' : 'idle', taskStatus: r.status,
         returning: false, provider: text(r.provider), lane: text(r.lane), localBackend: knownBackend(r.local_backend),
         model: text(r.model), tool: text(r.tool), title: text(r.title),
@@ -410,7 +411,7 @@ function toAgent(p, roomIndex) {
       avatarProfile: avatarProfile(p.family, p.outfit, p.id) },
     office: {
       floor: p.group, group: p.group, groupLabel: p.groupLabel, room: roomIndex, kind: p.kind, parent: p.parent,
-      depth: p.depth, project: p.project, device: p.device, host: p.host, provider: p.provider, lane: p.lane,
+      depth: p.depth, project: p.project, host: p.host, provider: p.provider, lane: p.lane,
       localBackend: p.localBackend, model: p.model, status: p.status, taskStatus: p.taskStatus,
       returning: p.returning, returnUntil: p.returnUntil ?? null, tool: p.tool, title: p.title,
       characterFamily: p.family, familySource: p.familySource ?? null, outfit: p.outfit,

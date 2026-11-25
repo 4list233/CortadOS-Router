@@ -28,6 +28,12 @@ const emptyTree = () => ({ ...tree(), orchestrators: { ...tree().orchestrators, 
 for (const family of ['claude', 'codex', 'grok', 'ollama']) {
   test('character family ' + family, () => assert.equal(characterFamily(family), family));
 }
+test('mapOffice (the flat projection) publishes no raw device either', () => {
+  const agents = mapOffice(view());
+  assert.ok(agents.length > 0);
+  for (const a of agents) assert.ok(!('device' in a.office), a.id);
+});
+
 test('unknown provider is neutral, not a vendor guess', () => {
   assert.equal(characterFamily(null), 'unknown');
   assert.equal(characterFamily('other'), 'unknown');
