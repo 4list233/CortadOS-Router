@@ -288,6 +288,50 @@ class ProbeHonesty(AgyBase):
         self.assertFalse(sc._agy_unsettled(BANNER))
         self.assertTrue(sc._agy_unsettled(BANNER + "You are not signed in.\n"))    # a notice AFTER the banner is unsettled
 
+    # ---- #144, the 06:41 sample on the Air: agy's log shows the keyring token loaded and refreshed and "authenticated
+    # successfully" 0.5 s in, yet the probe refused "not-logged-in" at boot 3.6 s in. A refusal now carries fixed-name
+    # facts (which rule, which check, counts and order of notices / account lines) so the next sample says which.
+    def test_sign_in_rules_join_to_the_same_refuse_pattern(self):
+        self.assertEqual(sc.AGY_REFUSE[0][1],
+                         r"accounts\.google\.com|sign in with google|authori[sz]ation (?:url|code)|paste (?:the|your) (?:authori[sz]ation )?code"
+                         r"|" + sc._AGY_NOT_SIGNED_IN + r"(?![.\s]*\S?\s*signing in)(?![.\s]*$)"
+                         r"|please (?:sign|log) in|login required")
+
+    def test_notice_repainted_after_the_banner_is_refused_with_facts_and_nothing_typed(self):
+        repaint = "\x1b[2J\x1b[HWelcome to the Antigravity CLI. You are currently not signed in.\n> \n"
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [BANNER, repaint], "usage": FIXTURE.read_text()})
+        with self.env(binary):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertEqual((cm.exception.kind, self.keys(log), cm.exception.typed), ("not-logged-in", b"", []))
+        f = cm.exception.facts
+        self.assertEqual((f["check"], f["acting"], f["rules"]), ("refuse", False, ["not-signed-in-notice"]))
+        self.assertEqual((f["notices"], f["signing_in"], f["account_lines"]), (2, 1, 1))
+        self.assertTrue(f["account_line_before_last_notice"])
+        self.assertFalse(f["account_line_after_last_notice"])
+        self.assertTrue(f["ready_seen"])
+        rec = sc._failed_record("antigravity", None, cm.exception)
+        self.assertEqual(rec["refusal"], f)
+        self.assertEqual(rec["error"], "ProbeRefused: probe refused at boot: the CLI is waiting for not-logged-in; "
+                                       "nothing was typed")           # the error and its kind are unchanged
+        flat = json.dumps(rec)
+        self.assertNotIn("@", flat)
+        self.assertNotIn("Welcome", flat)
+
+    def test_unsettled_refusal_at_the_end_of_boot_names_its_check(self):
+        binary, log = self.fake({"boot": SIGNING_IN})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        f = cm.exception.facts
+        self.assertEqual((f["check"], f["acting"], f["ready_seen"], f["rules"]), ("unsettled", True, False, []))
+        self.assertEqual((f["notices"], f["signing_in"], f["account_lines"]), (1, 1, 0))
+        self.assertGreaterEqual(f["after_s"], 3)
+
+    def test_a_failure_without_facts_drops_an_old_refusal(self):
+        rec = sc._failed_record("antigravity", {"refusal": {"check": "refuse"}}, RuntimeError("x"))
+        self.assertNotIn("refusal", rec)
+
     def test_signed_out_screen_is_refused_promptly(self):
         binary, log = self.fake({"boot": LOGGED_OUT, "usage": FIXTURE.read_text()})
         t0 = time.time()
