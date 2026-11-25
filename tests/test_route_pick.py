@@ -337,13 +337,19 @@ class SelectionTests(Catalogue):
         r = self.choose(f"R3:{OPUS}+{ASTRA}", exclude_model=OPUS)
         self.assertEqual(r["model"], ASTRA)
 
-    def test_local_picks_are_refused_until_step_8(self):
+    def test_local_picks_are_served_since_step_8(self):
+        # Step 8 (E8): served by routing.choose_local_pick under the orchestrator profile; the detail is in
+        # tests/test_local_orchestrator.py. A node that does not answer is refused, never a cloud model.
         self.local_nodes = [LOCAL_NODE]
-        for text in ("local", "local:qwen-27b"):
-            with self.subTest(text=text):
-                r = self.choose(text)
-                self.assertTrue(r["client_error"])
-                self.assertIn("not enabled yet", r["error"])
+        with mock.patch.object(local_lane, "probe", lambda node: {"qwen3.8-27b-heretic:q4"}):
+            for text in ("local", "local:qwen-27b"):
+                with self.subTest(text=text):
+                    r = self.choose(text)
+                    self.assertEqual((r["model"], r["bind_reason"]), ("qwen3.8-27b-heretic:q4", "route_pick_local"))
+        with mock.patch.object(local_lane, "probe", side_effect=local_lane.LocalUnavailable("node pro: down")):
+            r = self.choose("local")
+        self.assertTrue(r["pick_refused"])
+        self.assertNotIn("model", r)
 
     def test_cost_moves_to_local_are_skipped_and_the_sensitive_rule_still_wins(self):
         with mock.patch.object(routing, "auto_local", side_effect=AssertionError("auto_local under a pick")):

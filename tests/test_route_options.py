@@ -160,8 +160,8 @@ class LocalSectionTests(OptionsBase):
         self.assertNotIn("cloud", v)
         loc = v["local"]
         self.assertEqual(loc["status"], "ok")
-        self.assertFalse(loc["enabled"])
-        self.assertEqual(loc["note"], "local orchestrator: coming in the next step (plan-and-delegate profile)")
+        self.assertTrue(loc["enabled"])            # step 8: served under the orchestrator profile
+        self.assertEqual(loc["note"], "local orchestrator: plan and delegate only (orchestrator profile)")
         self.assertEqual(loc["models"], [{"id": "qwen-27b", "tag": "qwen3.8-27b-heretic:q4", "name": "Qwen 27B",
                                           "node": "pro", "node_label": "Pro", "context_length": 131072,
                                           "index": {"off": 16.7}, "state": "switch off", "loaded": True}])

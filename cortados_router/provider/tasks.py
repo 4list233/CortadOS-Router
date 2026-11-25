@@ -70,6 +70,9 @@ _EXEC_RE = re.compile(r"[A-Za-z0-9._/\[\]:#-]{1,128}")
 # wording; a rule matching none stays visible as a count. Order matters only for readability.
 _RULES = (
     ("pinned by the client:", "client pin"),
+    # routing.choose_local_pick: the effect boundary profile every turn of a local route pick runs under (step 8)
+    ("boundary profile: orchestrator-sensitive", "boundary profile orchestrator-sensitive"),
+    ("boundary profile: orchestrator", "boundary profile orchestrator"),
     ("engine degraded → fallback band", "degraded scorer fallback"),
     ("scorer unavailable →", "scorer unavailable fallback"),
     ("outward effect → blast_radius floored at 3", "outward-effect blast-radius floor"),
@@ -121,6 +124,13 @@ _PICK_RULE = re.compile(r"route pick ((?:any|local|R[0-4](?:-R[0-4])?)(?::(?:\*|
                         r"( overridden)?: (?:(\d{1,2}) models?, )?")
 
 
+# routing.choose_local_pick's rule: `route pick local[:<pin ids>] (orchestrator profile): <pin> on node <node>`.
+_LOCAL_PICK_RULE = re.compile(r"route pick local(?::[A-Za-z0-9._+-]{1,600})? \(orchestrator profile\): ")
+# its other rules: `route pick local…: marked sensitive by <detector> (E5): …` and `… <pin> on node <n> skipped: …`
+_LOCAL_PICK_NOTE_RULE = re.compile(r"route pick local(?::[A-Za-z0-9._+-]{1,600})?: (?:marked sensitive by |"
+                                   r"[A-Za-z0-9._:-]{1,128} on node [A-Za-z0-9._?-]{1,64} skipped: )")
+
+
 def _rule_label(rule: Any, ids: "frozenset[str] | None" = None) -> str | None:
     if not isinstance(rule, str):
         return None
@@ -136,6 +146,13 @@ def _rule_label(rule: Any, ids: "frozenset[str] | None" = None) -> str | None:
             return "route pick escalated"
         if rule.startswith("route pick: local cost routes not taken"):
             return "route pick: local cost route not taken"
+        if _LOCAL_PICK_RULE.match(rule):
+            # routing.choose_local_pick (step 8): a local orchestrator, plan and delegate only. Fixed words: the pin
+            # ids (provider config, not table ids) stay on the row.
+            return "route pick local (orchestrator profile)"
+        if _LOCAL_PICK_NOTE_RULE.match(rule):
+            return ("route pick local: sensitive, read and plan only" if " marked sensitive by " in rule else
+                    "route pick local: model skipped")
         m = _PICK_RULE.match(rule)
         if m:
             # The label is shown only when it is one (routing.view_pick_label) and its every id is a table id (`ids`,

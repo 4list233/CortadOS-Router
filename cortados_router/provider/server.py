@@ -465,7 +465,13 @@ def _in_window(s, window: Any) -> bool:
     if window is ANY_WINDOW:
         return True
     r = getattr(s, "route", None) or {}
-    return bool(r.get("pinned")) or r.get(ASKED_WINDOW_KEY) == window
+    return _any_window(r) or r.get(ASKED_WINDOW_KEY) == window
+
+
+def _any_window(route: dict) -> bool:
+    """A sub/ pin is in every window. A local route pick's route is `pinned` too (routing.choose_local_pick), but it is
+    a pick: it belongs to its own label only, so a request of another pick or window never continues it (step 8)."""
+    return bool(route.get("pinned")) and not route.get(routing.PICK_LOCAL_KEY)
 
 
 def _exclude_model_header(headers) -> tuple[str | None, bool]:
@@ -1437,7 +1443,7 @@ class Registry:
             n = len(turn.history)
             # Only `old`'s own window joins (_in_window): a conversation of another window is never this one.
             r = getattr(old, "route", None) or {}
-            win = ANY_WINDOW if r.get("pinned") else r.get(ASKED_WINDOW_KEY)
+            win = ANY_WINDOW if _any_window(r) else r.get(ASKED_WINDOW_KEY)
             with self._lock:
                 joined = self._exact(turn.history, scope, wire_path, client, win)
                 # Review round 3, P1: an identical request may have rebuilt AND finished its first turn while this
@@ -3290,10 +3296,18 @@ class Handler(BaseHTTPRequestHandler):
                 session.awaiting_tool_result = any(b.get("type") == "tool_use" for b in blocks)
                 session.history.append(anthropic_wire.reply_fingerprint(blocks))
 
+            bind_reason = route.get("bind_reason")
+            if route.get(routing.PICK_LOCAL_KEY):
+                # A local route pick (step 8): the profile is decided per turn, so a later turn a sensitivity detector
+                # marks is read-and-plan only (E5), whatever the opener was. A malformed x-cortados-local header
+                # counts as the flag: the stricter choice.
+                local_hdr, valid = _local_header(self.headers)
+                bind_reason, _detector = routing.pick_local_reason(wire.routing_body(body),
+                                                                   local_hdr if valid else "sensitive")
             try:
                 outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model,
                                            reply=reply, auto_routed=not route.get("pinned"),
-                                           bind_reason=route.get("bind_reason"), hook=self._boundary_hook(),
+                                           bind_reason=bind_reason, hook=self._boundary_hook(),
                                            conversation=str(session.id), reroute=reroute,
                                            commit=commit,
                                            # cleared by every sensitivity detector when routed (#122 round 2)
