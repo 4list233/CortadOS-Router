@@ -131,11 +131,36 @@ _TRUST_OPTION_LINE = re.compile(          # the prompt's own option and hint lin
     r"(?:[\s,.!:;/·()-]|$)(?!.*(?:sign|log\s?in|account|auth|google|consent|access|load|wait|connect))"
     r"[^\n]{0,60}", re.I)
 _TRUST_TAIL_LINES = 6        # option and hint lines allowed after the prompt; more is another screen
+# The probe's PTY (tui_capture sets it with TIOCSWINSZ) and the bounds of what may follow the prompt (#144 fix round 3,
+# review P1: 70 blank lines, or 10,000 spaces before an option line, scrolled the prompt off the 60-row screen yet left it
+# "last"). Rows are modelled as the PTY would: every LF moves the cursor down one row (blank lines count), a line wider
+# than the PTY wraps (indentation counts), and the prompt's row stays on screen only while the cursor has moved at most
+# rows - 1 below it (whatever row it started on: a scroll of k rows needs the cursor k rows past the bottom).
+_PTY_ROWS, _PTY_COLS = 60, 160
+_TRUST_TAIL_MAX_BYTES = 1024  # everything after the prompt, escapes included; more is another screen
+
+
+def _cells(text: str, col: int = 0) -> int | None:
+    """The column the cursor reaches printing `text` from `col` without wrapping, or None for a character whose width
+    the probe does not know (a control character): fail closed. Tabs go to the next stop of 8, East Asian wide and full
+    width characters take 2 cells, combining marks none."""
+    import unicodedata
+    for ch in text:
+        if ch == "\t":
+            col += 8 - col % 8
+        elif unicodedata.category(ch) in ("Cc", "Cf", "Cs", "Co", "Cn"):
+            return None
+        elif unicodedata.combining(ch):
+            continue
+        else:
+            col += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return col
 
 
 def _trust_prompt_last(raw: bytes, prompt: str) -> bool:
-    """True only if `prompt` (a regex) was painted and nothing painted after its last match can have removed or replaced
-    it (see the comment above). The match is searched in the printed text alone, SGR dropped; any other escape splits it."""
+    """True only if `prompt` (a regex) was painted and nothing painted after its last match can have removed, replaced
+    or scrolled it off the screen (see the comments above). The match is searched in the printed text alone, SGR
+    dropped; any other escape splits it."""
     pieces: list[tuple[bool, bytes]] = []      # (is_escape, bytes) in stream order
     pos = 0
     for m in _ESC_TOKEN.finditer(raw):
@@ -164,7 +189,20 @@ def _trust_prompt_last(raw: bytes, prompt: str) -> bool:
         return False
     i, off = where[last.end() - 1]
     tail = [(False, pieces[i][1][off:])] + pieces[i + 1:]
+    if sum(len(b) for _, b in tail) > _TRUST_TAIL_MAX_BYTES:
+        return False
+    # the column the prompt's match ends on: the printed text since the last CR or LF; unknown when an escape other than
+    # SGR stands in between (the cursor may have been placed anywhere): then the rest of its line counts as one wrap
+    head = text[:last.end()]
+    cut = max(head.rfind("\r"), head.rfind("\n"), head.rfind("\x00"))
+    end_col = None
+    if cut < 0 or head[cut] != "\x00":
+        try:
+            end_col = _cells(head[cut + 1:].encode("latin-1").decode("utf-8"))
+        except UnicodeDecodeError:
+            end_col = None
     line, lines, first = b"", 0, True
+    rows = 0                                   # rows the cursor has moved below the prompt's last row
     for k, (esc, b) in enumerate(tail):
         if esc:
             if not _HARMLESS_ESC.fullmatch(b):
@@ -176,25 +214,60 @@ def _trust_prompt_last(raw: bytes, prompt: str) -> bool:
                 if rest and rest[:1] != b"\n":
                     return False
             elif c == 0x0A:
-                if not first and line.strip():
-                    lines += 1
-                    if lines > _TRUST_TAIL_LINES or not _trust_line_ok(line):
+                if first:
+                    if not _first_line_ok(line):
                         return False
-                elif first and not _first_line_ok(line):
+                    rows += 1 + _rest_wraps(line, end_col)
+                else:
+                    if _line_width(line) is None:
+                        return False
+                    if line.strip():
+                        lines += 1
+                        if lines > _TRUST_TAIL_LINES or not _trust_line_ok(line):
+                            return False
+                    rows += 1                  # a blank line moves the cursor a row like any other
+                if rows > _PTY_ROWS - 1:       # the prompt's row has scrolled off the top of the screen
                     return False
                 line, first = b"", False
             elif c == 0x09 or c >= 0x20:
                 line += bytes([c])
+                if len(line) > 4 * _PTY_COLS:  # far wider than the screen whatever it decodes to
+                    return False
             else:                              # backspace, BEL, any other control: not understood, so not answerable
                 return False
     if first:
-        return _first_line_ok(line)
+        return _first_line_ok(line) and _rest_wraps(line, end_col) <= _PTY_ROWS - 1
+    if _line_width(line) is None:
+        return False
     return not line.strip() or (lines < _TRUST_TAIL_LINES and _trust_line_ok(line))
 
 
+def _line_width(line: bytes) -> int | None:
+    """A line after the prompt in cells from column 0, or None if it is not UTF-8 or wider than the PTY (it would wrap:
+    indentation counts like any other character)."""
+    try:
+        cells = _cells(line.decode("utf-8"))
+    except UnicodeDecodeError:
+        return None
+    return cells if cells is not None and cells <= _PTY_COLS else None
+
+
+def _rest_wraps(rest: bytes, end_col: int | None) -> int:
+    """Rows the rest of the prompt's own line adds by wrapping (it is at most 80 bytes, so at most one): one if the
+    prompt's column is unknown and the rest is not empty (fail closed), else whether it passes the PTY's last column."""
+    if not rest:
+        return 0
+    cells = _cells(rest.decode("utf-8", "replace"), end_col or 0)
+    return 1 if end_col is None or cells is None or cells > _PTY_COLS else 0
+
+
 def _first_line_ok(rest: bytes) -> bool:
-    """The rest of the prompt's own line ("[Y/n]", " folder?"): plain text, short."""
-    return len(rest) <= 80
+    """The rest of the prompt's own line ("[Y/n]", " folder?"): plain UTF-8 text, short."""
+    try:
+        shown = rest.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return len(rest) <= 80 and _cells(shown) is not None
 
 
 def _trust_line_ok(line: bytes) -> bool:
@@ -281,7 +354,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     of the boot / trust stage and before every write), never mid-read: for a transient screen that may still resolve
     while the CLI paints (agy's "not signed in" notice while it signs in from the keyring, #144).
     The trust prompt counts only while it is the LAST thing painted (`_trust_prompt_last`: after it only SGR, cursor
-    show/hide, terminal queries, whitespace and its own option lines), checked when the boot read ends and again in the
+    show/hide, terminal queries, whitespace and its own option lines, within the PTY's rows and columns and 1 KB), checked when the boot read ends and again in the
     write path itself: a prompt erased or replaced (by an account picker, or by anything at all) gets no Enter, and
     every check applies. The read after the answer gets what is left of the one boot_s window.
     `ready` and each `refuse_unsettled` test are a regex or a predicate on the plain screen text (_screen_has).
@@ -320,7 +393,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
         finally:
             os._exit(127)    # exec failed (e.g. missing binary): never let the forked copy run the sampler's code
     _reaper.track(pid, fd, my_dir, PROBE_DIR)
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 60, 160, 0, 0))
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", _PTY_ROWS, _PTY_COLS, 0, 0))
     buf = b""
     eof = False
     stage, startup_chars, ready_seen, trust_seen = "boot", 0, False, False
@@ -402,12 +475,18 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             elif len(buf) > mark and time.time() - last > quiet_s:
                 return
     mark = 0
-    boot_end = time.time() + boot_s      # one boot window for the read before AND after the trust answer
+    # One boot window for the read before AND after the trust answer, started when the CLI first paints: its own
+    # start-up (a cold binary, an interpreter on a loaded machine) is waited for separately, up to boot_s, so it never
+    # eats the window in which its screens are judged (#144 fix round 3: a fake agy that started 3 s late was read as an
+    # empty screen). Nothing painted within boot_s: an empty window, as before. Deny-all is unchanged by when it starts.
+    boot_end = time.time() + boot_s
 
     def boot_left() -> float:
         return max(0.0, boot_end - time.time())
     try:
-        pump(boot_s, until=ready)
+        first_paint, _, _ = select.select([fd], [], [], boot_s)
+        boot_end = time.time() + (boot_s if first_paint else 0.0)
+        pump(boot_left(), until=ready)
         startup_chars = len(_plain(buf))
         ready_seen = bool(ready and _screen_has(ready, _plain(buf)))
         trust_seen = trust_on_screen()               # the prompt as the last thing painted; an erased one is not answered
@@ -784,6 +863,10 @@ _AGY_SIGN_IN_RULES = (
     # after a cleared trust prompt matched no pattern and got the trust Enter)
     ("account-picker", r"choose (?:an? |your )?account|select (?:an? |your )?account|use another account"),
     ("consent", r"wants to access your google account|(?:grant|allow) (?:access|permission)|\bconsent\b"),
+    # agy 1.5.16 signed out, as drawn to a headless child on the Air (2026-11-25, described, email-free): the notice, a
+    # "Signing in..." spinner, then a bare-CR overwrite to "Select login method:" / "> 1. Google OAuth" / "2. Use a Google
+    # Cloud project" / "↑/↓ Navigate · enter Select". Refused mid-read: no answer to it is ever typed (#144 fix round 3)
+    ("login-method-picker", r"select (?:a |your )?log\s?in method|google oauth|use a google cloud project"),
 )
 AGY_REFUSE = (
     ("not-logged-in", "|".join(rule for _, rule in _AGY_SIGN_IN_RULES)),

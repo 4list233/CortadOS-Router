@@ -62,6 +62,7 @@ def view(top):
     return ("\x1b[2J\x1b[H" + "\n".join(L[top:top + H])
             + "\n(%d\u2013%d of %d lines)  \u2191/\u2193 scroll \u00b7 pgdown page \u00b7 ctrl+end Bottom\n" % (top + 1, min(top + H, len(L)), len(L)))
 top = 0
+time.sleep(SCREENS.get("start_delay", 0))    # a slow start-up: nothing painted yet
 out(SCREENS["boot"])
 for step in SCREENS.get("boot_later", []):    # painted later, as agy does while it signs in
     time.sleep(0.6)
@@ -308,7 +309,8 @@ class ProbeHonesty(AgyBase):
                          r"|" + sc._AGY_NOT_SIGNED_IN + r"(?![.\s]*\S?\s*signing in)(?![.\s]*$)"
                          r"|please (?:sign|log) in|login required"
                          r"|choose (?:an? |your )?account|select (?:an? |your )?account|use another account"
-                         r"|wants to access your google account|(?:grant|allow) (?:access|permission)|\bconsent\b")
+                         r"|wants to access your google account|(?:grant|allow) (?:access|permission)|\bconsent\b"
+                         r"|select (?:a |your )?log\s?in method|google oauth|use a google cloud project")
 
     def test_notice_repainted_after_the_banner_is_refused_with_facts_and_nothing_typed(self):
         repaint = "\x1b[2J\x1b[HWelcome to the Antigravity CLI. You are currently not signed in.\n> \n"
@@ -490,6 +492,81 @@ class ProbeHonesty(AgyBase):
                       b"\r\nLoading workspace\r\n", b"\r\nChoose an account\r\n", b"\r\nNo account; sign in\r\n"):
             with self.subTest(after=after):
                 self.assertFalse(last(b"Trust this workspace [Y/n]" + after))
+
+    # ---- #144 fix round 3 (review P1, round-2 re-review): blank lines and indentation were unbounded, so a prompt pushed
+    # off the 60-row PTY by 70 blank lines, or followed by an option line indented 10,000 spaces, still got the Enter.
+    # The rows after the prompt are now counted as the PTY would (every LF a row, lines no wider than the PTY) and the
+    # bytes after it capped.
+    def test_trust_prompt_scrolled_or_pushed_off_the_screen_is_not_last(self):
+        last = lambda raw: sc._trust_prompt_last(raw, sc._TRUST_PROMPT)
+        prompt = b"Trust this workspace [Y/n]\r\n"
+        self.assertFalse(last(prompt + b"\r\n" * 70 + b"> 1. Yes, proceed\r\n"))        # the review's case
+        self.assertFalse(last(prompt + b" " * 10000 + b"> 1. Yes, proceed\r\n"))        # the review's case
+        self.assertFalse(last(prompt + b" " * 10000))                                   # unterminated too
+        # the boundary: the cursor may move rows - 1 = 59 rows below the prompt's row, not 60
+        self.assertTrue(last(prompt + b"\r\n" * 58))
+        self.assertFalse(last(prompt + b"\r\n" * 59))
+        self.assertTrue(last(prompt + b"\r\n" * 57 + b"> 1. Yes, proceed\r\n"))
+        self.assertFalse(last(prompt + b"\r\n" * 58 + b"> 1. Yes, proceed\r\n"))
+        # a line wider than the PTY wraps: refused, whether the width is indentation, text or wide characters
+        self.assertTrue(last(prompt + b" " * 140 + b"> 1. Yes, proceed\r\n"))
+        self.assertFalse(last(prompt + b" " * 150 + b"> 1. Yes, proceed\r\n"))
+        self.assertFalse(last(prompt + b"\t" * 20 + b"> 1. Yes\r\n"))
+        self.assertFalse(last(prompt + b"> 1. Yes " + "一".encode() * 76 + b"\r\n"))
+        # the prompt's own line: its remainder wraps when it passes the last column; after an unknown cursor move it
+        # counts as one wrap (fail closed)
+        self.assertTrue(last(b" " * 120 + prompt + b"\r\n" * 58))
+        self.assertFalse(last(b" " * 140 + prompt + b"\r\n" * 58))
+        self.assertFalse(last(b"\x1b[5;40H" + prompt + b"\r\n" * 58))
+        self.assertTrue(last(b"\x1b[5;40H" + prompt + b"\r\n" * 57))
+        # more than 1 KB after the prompt, even of harmless colour codes, is another screen
+        self.assertTrue(last(prompt + b"\x1b[0m" * 200))
+        self.assertFalse(last(prompt + b"\x1b[0m" * 300))
+        # a C1 control or invalid UTF-8 on a line after it is not understood
+        self.assertFalse(last(prompt + "\u0085".encode() + b"\r\n"))
+        self.assertFalse(last(b"Trust this workspace [Y/n]\xff\r\n"))
+
+    def test_trust_prompt_pushed_off_the_screen_gets_no_keystroke(self):
+        for tail in ("\n" * 70 + "> 1. Yes, proceed\n", " " * 10000 + "> 1. Yes, proceed\n"):
+            binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST + tail], "after_trust": BANNER,
+                                     "usage": FIXTURE.read_text()})
+            with self.subTest(tail=tail[:3]), self.env(binary), \
+                    mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+                with self.assertRaises(sc.ProbeRefused) as cm:
+                    sc._antigravity()
+                self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("not-logged-in", [], b""))
+                self.assertIs(cm.exception.facts["trust_prompt"], False)
+
+    def test_slow_start_up_does_not_eat_the_boot_window(self):
+        # the boot window starts when the CLI first paints: a 2.5 s start-up under a 3 s window still reads the trust
+        # prompt painted 0.6 s after the notice, and the banner after the answer
+        binary, log = self.fake({"start_delay": 2.5, "boot": SIGNING_IN, "boot_later": [TRUST], "after_trust": BANNER,
+                                 "usage": FIXTURE.read_text()})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            rec = sc._antigravity()
+        self.assertEqual(rec["tier"], "AI Pro")
+        self.assertEqual(self.keys(log), b"\r/usage\r")
+
+    # agy 1.5.16 signed out, drawn to a headless child on the Air (2026-11-25; described, no email): alternate screen,
+    # logo, the notice, a "Signing in..." spinner, then a bare CR overwriting it with the login-method picker.
+    LOGIN_METHOD = ("\x1b[?1049h\x1b[H\x1b[2J  ▄▀▀▄ ANTIGRAVITY\n\n" + SIGNING_IN.rstrip("\n"),
+                    "\r\x1b[2KSelect login method:\n\n\x1b[36m> 1. Google OAuth\x1b[0m\n  2. Use a Google Cloud project\n\n"
+                    "↑/↓ Navigate · enter Select\n")
+
+    def test_login_method_picker_is_refused_mid_read_and_nothing_is_typed(self):
+        boot, picker = self.LOGIN_METHOD
+        binary, log = self.fake({"boot": boot, "boot_later": [picker], "usage": FIXTURE.read_text()})
+        t0 = time.time()
+        with self.env(binary):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertLess(time.time() - t0, 6)             # refused on sight, not at the end of the 12 s boot window
+        self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("not-logged-in", [], b""))
+        self.assertEqual((cm.exception.facts["check"], cm.exception.facts["acting"]), ("refuse", False))
+        self.assertIn("login-method-picker", cm.exception.facts["rules"])
+        for screen in ("Select login method:", "> 1. Google OAuth", "2. Use a Google Cloud project"):
+            with self.subTest(screen=screen):
+                self.assertTrue(re.search(sc.AGY_REFUSE[0][1], screen, re.I))
 
     def test_trust_answer_read_shares_one_boot_window(self):
         # trust shown, nothing after the answer: the probe gives up within boot_s overall, not boot_s again after Enter
