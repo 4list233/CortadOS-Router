@@ -114,214 +114,11 @@ def _plain(raw: bytes) -> str:
     return re.sub(r"[ \t]+", " ", raw.decode("utf-8", "replace"))
 
 
-# The trust prompt's Enter (#144 fix round 2, review P1): the prompt is answerable only while it is the LAST thing the CLI
-# painted. Round 1 looked at the text since the last full redraw, but a line-by-line erase (cursor up + erase line) or
-# cursor home + SGR + erase-below removed the visible prompt and left it counted, so the Enter reached whatever screen
-# came next. Now: after the end of the last trust-prompt match, only bytes that cannot remove or replace it may follow.
-# Every other byte, escape sequence (erase, cursor move, scroll, alt-screen, reset, title, anything not understood,
-# an unfinished one) or line of text waits until the full prompt is painted again. Fail closed: a missed probe costs one
-# sample, a stray Enter answers a screen nobody read.
-_ESC_TOKEN = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[^\[\]])?")
-_HARMLESS_ESC = re.compile(rb"\x1b\[[0-9;:]*m"            # SGR colour / weight: changes no character on screen
-                           rb"|\x1b\[\?25[hl]"             # cursor show / hide
-                           rb"|\x1b\[>?0?c|\x1b\[6n")      # terminal identity and cursor-position queries: paint nothing
-_TRUST_OPTION_LINE = re.compile(          # the prompt's own option and hint lines, e.g. "> 1. Yes, proceed", "Enter to confirm"
-    r"\s*(?:[>❯›▸•*-]\s*)?(?:\[?\d\]?[.):]?\s*)?"
-    r"(?:yes|no|y/n|\[y/n\]|exit|quit|cancel|(?:do not|don'?t) trust|trust|(?:press |use )?(?:enter|esc|↑|↓))"
-    r"(?:[\s,.!:;/·()-]|$)(?!.*(?:sign|log\s?in|account|auth|google|consent|access|load|wait|connect))"
-    r"[^\n]{0,60}", re.I)
-_TRUST_TAIL_LINES = 6        # option and hint lines allowed after the prompt; more is another screen
-# The probe's PTY (tui_capture sets it with TIOCSWINSZ) and the bounds of what may follow the prompt (#144 fix round 3,
-# review P1: 70 blank lines, or 10,000 spaces before an option line, scrolled the prompt off the 60-row screen yet left it
-# "last"). Rows are modelled as the PTY would: every LF moves the cursor down one row (blank lines count), a line wider
-# than the PTY wraps (indentation counts), and the prompt's row stays on screen only while the cursor has moved at most
-# rows - 1 below it (whatever row it started on: a scroll of k rows needs the cursor k rows past the bottom).
+# The probe's PTY size (tui_capture sets it with TIOCSWINSZ).
 _PTY_ROWS, _PTY_COLS = 60, 160
-_TRUST_TAIL_MAX_BYTES = 1024  # everything after the prompt, escapes included; more is another screen
-
-
-def _cells(text: str, col: int = 0) -> int | None:
-    """The column the cursor reaches printing `text` from `col` without wrapping, or None for a character whose width
-    the probe does not know (a control character): fail closed. Tabs go to the next stop of 8, East Asian wide and full
-    width characters take 2 cells, combining marks none."""
-    import unicodedata
-    for ch in text:
-        if ch == "\t":
-            col += 8 - col % 8
-        elif unicodedata.category(ch) in ("Cc", "Cf", "Cs", "Co", "Cn"):
-            return None
-        elif unicodedata.combining(ch):
-            continue
-        else:
-            col += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
-    return col
-
-
-# Fix round 4 (#144, review P1 on round 3: 150 spaces + "trust the contents" + 59 blank lines passed, because rows were
-# counted from the match's LAST row while its first row, holding "trust", had scrolled off): the match must sit whole on
-# one row at a known column. Its starting column is known only after a CR, an LF, the start of the stream, or an absolute
-# column move (CUP `ESC[r;cH` / `ESC[r;cf`, CHA `ESC[cG`), with only printed text, SGR, erase (`ESC[..J` / `ESC[..K`, which
-# move no cursor) or the harmless escapes in between; and that column plus everything printed through the match's end must
-# fit in the PTY's columns, so nothing on the way wrapped. Then the match's first row is its last row and the row count
-# below starts there. Anything else refuses (`unknown_column`, `wrapped`).
-TRUST_REJECTIONS = ("not_last", "scrolled", "wrapped", "unknown_column", "tail_too_long", "line_too_wide", "bad_byte",
-                    "unknown_escape")   # the fixed refusal categories of _trust_prompt_verdict, for diagnostics
-_COLUMN_SET = re.compile(rb"\x1b\[\d*(?:;(\d*))?[Hf]|\x1b\[(\d*)G")   # CUP / HVP (row;col, row alone = col 1) / CHA
-_NO_MOVE_ESC = re.compile(rb"\x1b\[[0-3]?[JK]")                       # erase in display / line: the cursor stays put
-_KNOWN_ESC = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))")   # complete CSI / OSC sequences
-
-
-def _trust_prompt_last(raw: bytes, prompt: str) -> bool:
-    """True only if `prompt` (a regex) was painted and nothing painted after its last match can have removed, replaced
-    or scrolled it off the screen (see the comments above)."""
-    return _trust_prompt_verdict(raw, prompt) is None
-
-
-def _trust_prompt_verdict(raw: bytes, prompt: str) -> str | None:
-    """None when the last match of `prompt` is answerable (_trust_prompt_last); "absent" when it never matched; else the
-    fixed category (TRUST_REJECTIONS) of the first rule that refused it. The match is searched in the printed text alone,
-    SGR dropped; any other escape splits it."""
-    pieces: list[tuple[bool, bytes]] = []      # (is_escape, bytes) in stream order
-    pos = 0
-    for m in _ESC_TOKEN.finditer(raw):
-        if m.start() > pos:
-            pieces.append((False, raw[pos:m.start()]))
-        pieces.append((True, m.group()))
-        pos = m.end()
-    if pos < len(raw):
-        pieces.append((False, raw[pos:]))
-    flat: list[str] = []
-    where: list[tuple[int, int]] = []          # flat char -> (piece index, byte offset after it within the piece)
-    for i, (esc, b) in enumerate(pieces):
-        if esc:
-            if not re.fullmatch(rb"\x1b\[[0-9;:]*m", b):
-                flat.append("\x00")
-                where.append((i, len(b)))
-            continue
-        for j in range(len(b)):
-            flat.append(chr(b[j]))             # bytes as latin-1 chars: the prompt is ASCII, offsets stay byte offsets
-            where.append((i, j + 1))
-    text = "".join(flat)
-    last = None
-    for last in re.finditer(prompt, text, re.I):
-        pass
-    if last is None or last.end() == 0:
-        return "absent"
-    i, off = where[last.end() - 1]
-    tail = [(False, pieces[i][1][off:])] + pieces[i + 1:]
-    if sum(len(b) for _, b in tail) > _TRUST_TAIL_MAX_BYTES:
-        return "tail_too_long"
-    # the match's starting column: walk back over its line to the last CR / LF / start of stream (column 0) or absolute
-    # column move; an erase moves nothing, any other escape leaves the column unknown
-    k, base, printed = last.start(), 0, []
-    while k > 0:
-        ch = text[k - 1]
-        if ch in "\r\n":
-            break
-        if ch == "\x00":
-            esc = pieces[where[k - 1][0]][1]
-            col_set = _COLUMN_SET.fullmatch(esc)
-            if col_set:
-                base = min(max(int(col_set.group(1) or col_set.group(2) or 1), 1), _PTY_COLS) - 1
-                break
-            if not (_NO_MOVE_ESC.fullmatch(esc) or _HARMLESS_ESC.fullmatch(esc)):
-                return "unknown_column"
-        else:
-            printed.append(ch)
-        k -= 1
-    try:
-        end_col = _cells("".join(reversed(printed)).encode("latin-1").decode("utf-8") + last.group(), base)
-    except UnicodeDecodeError:
-        return "bad_byte"
-    if end_col is None:
-        return "bad_byte"
-    if end_col > _PTY_COLS:                     # the match, or the text before it on its line, wrapped
-        return "wrapped"
-    line, lines, first = b"", 0, True
-    rows = 0                                   # rows the cursor has moved below the match's row (its first and only row)
-    for k, (esc, b) in enumerate(tail):
-        if esc:
-            if not _HARMLESS_ESC.fullmatch(b):
-                return "not_last" if _KNOWN_ESC.fullmatch(b) else "unknown_escape"
-            continue
-        for j, c in enumerate(b):
-            if c == 0x0D:                      # CR only before LF or at the very end: never a carriage return to overwrite
-                rest = b[j + 1:] or b"".join(x for e, x in tail[k + 1:] if not e)
-                if rest and rest[:1] != b"\n":
-                    return "not_last"
-            elif c == 0x0A:
-                if first:
-                    why = _first_line_problem(line)
-                    if why:
-                        return why
-                    rows += 1 + _rest_wraps(line, end_col)
-                else:
-                    why = _line_problem(line)
-                    if why:
-                        return why
-                    if line.strip():
-                        lines += 1
-                        if lines > _TRUST_TAIL_LINES or not _trust_line_ok(line):
-                            return "not_last"
-                    rows += 1                  # a blank line moves the cursor a row like any other
-                if rows > _PTY_ROWS - 1:       # the prompt's row has scrolled off the top of the screen
-                    return "scrolled"
-                line, first = b"", False
-            elif c == 0x09 or c >= 0x20:
-                line += bytes([c])
-                if len(line) > 4 * _PTY_COLS:  # far wider than the screen whatever it decodes to
-                    return "line_too_wide"
-            else:                              # backspace, BEL, any other control: not understood, so not answerable
-                return "bad_byte"
-    if first:
-        why = _first_line_problem(line)
-        if why:
-            return why
-        return "scrolled" if _rest_wraps(line, end_col) > _PTY_ROWS - 1 else None
-    why = _line_problem(line)
-    if why:
-        return why
-    return None if not line.strip() or (lines < _TRUST_TAIL_LINES and _trust_line_ok(line)) else "not_last"
-
-
-def _line_problem(line: bytes) -> str | None:
-    """Why a line after the prompt is not drawable on one row: "bad_byte" (not UTF-8, or a control character),
-    "line_too_wide" (wider than the PTY: it would wrap; indentation counts), else None."""
-    try:
-        cells = _cells(line.decode("utf-8"))
-    except UnicodeDecodeError:
-        return "bad_byte"
-    if cells is None:
-        return "bad_byte"
-    return "line_too_wide" if cells > _PTY_COLS else None
-
-
-def _rest_wraps(rest: bytes, end_col: int) -> int:
-    """Rows the rest of the prompt's own line adds by wrapping (it is at most 80 bytes, so at most one): whether it
-    passes the PTY's last column from `end_col`, the known column the match ends on (fail closed: an unknown width wraps)."""
-    if not rest:
-        return 0
-    cells = _cells(rest.decode("utf-8", "replace"), end_col)
-    return 1 if cells is None or cells > _PTY_COLS else 0
-
-
-def _first_line_problem(rest: bytes) -> str | None:
-    """The rest of the prompt's own line ("[Y/n]", " folder?") must be plain UTF-8 text, at most 80 bytes."""
-    try:
-        shown = rest.decode("utf-8")
-    except UnicodeDecodeError:
-        return "bad_byte"
-    if _cells(shown) is None:
-        return "bad_byte"
-    return "tail_too_long" if len(rest) > 80 else None
-
-
-def _trust_line_ok(line: bytes) -> bool:
-    try:
-        shown = line.decode("utf-8")
-    except UnicodeDecodeError:
-        return False
-    return bool(_TRUST_OPTION_LINE.fullmatch(shown))
+# The workspace-trust prompt as tui_capture detects it. answer_trust=True (claude / codex / cursor, unchanged from main)
+# sends one Enter for it; the agy lane never answers it (#144 fix round 5): it refuses `workspace_not_trusted` instead.
+_TRUST_PROMPT = r"trust (this|the contents)|Trust this workspace"
 
 
 def _boot_failure_kind(text: str) -> str:
@@ -382,44 +179,47 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 cwd_check: Callable[[Path], None] | None = None, on_boot: Callable[[str], None] | None = None,
                 refuse_unsettled: tuple[tuple[str, str | Callable[[str], bool]], ...] = (),
                 refusal_facts: Callable[[str], dict[str, Any]] | None = None,
-                ready_after_trust: str | Callable[[str], bool] | None = None) -> str:
-    """Open the CLI in a PTY, accept a folder-trust prompt for our own empty probe folder if shown, type `command`, return the screen text.
+                answer_trust: bool = True, workdir: Path | None = None) -> str:
+    """Open the CLI in a PTY, accept a folder-trust prompt for our own empty probe folder if shown (answer_trust), type
+    `command`, return the screen text.
 
-    Deny-all: Enter is only ever sent for that trust prompt. `refuse` is ((kind, regex), ...): the screen is checked on
-    every read and again before every write (#144 review: a sign-in screen that appeared only after `command` used to
-    receive the retry's typing); on a match ProbeRefused(kind) is raised at once and the CLI is closed. Its message says
-    truly what had been typed by then. An exec failure raises ProbeExecFailed instead of returning an empty screen.
-    inherit_path=False runs argv[0] as given (an absolute path), never searched on PATH.
+    Deny-all: with answer_trust (claude / codex / cursor, as on main) Enter is sent for the trust prompt and for nothing
+    else; answer_trust=False (the agy lane, #144 fix round 5) sends no keystroke at all before `command`: a trust prompt
+    still on the screen when the boot read ends refuses `workspace_not_trusted`. `refuse` is ((kind, regex), ...): the
+    screen is checked on every read and again before every write (#144 review: a sign-in screen that appeared only after
+    `command` used to receive the retry's typing); on a match ProbeRefused(kind) is raised at once and the CLI is closed.
+    Its message says truly what had been typed by then. An exec failure raises ProbeExecFailed instead of returning an
+    empty screen. inherit_path=False runs argv[0] as given (an absolute path), never searched on PATH.
+    `workdir`: run in this existing folder, as is (the agy lane's fixed, locked, trusted probe folder; the caller owns
+    it and its lock). Unset: a fresh per-probe folder under PROBE_DIR, removed afterwards.
     `page(text)` reads a scrollable answer: called with the answer so far, it returns (key, name) to press next (a
     navigation key, never text) or None when done; at most `page_max` presses.
-    `cwd_check(folder)` runs on the per-probe folder after it is made and before the fork; raising refuses the start
-    (the agy lane's dotenv guard, #144 round 3).
-    `on_boot(text)` gets the start-up screen (banner, trust prompt) once, just before `command` is typed: what the
-    returned text (the answer only) does not hold (the agy lane reads its subscription tier there, #144).
+    `cwd_check(folder)` runs on the probe folder before the fork; raising refuses the start (the agy lane's dotenv
+    guard, #144 round 3).
+    `on_boot(text)` gets the start-up screen (banner) once, just before `command` is typed: what the returned text (the
+    answer only) does not hold (the agy lane reads its subscription tier there, #144). It may raise to refuse.
     `refuse_unsettled` is ((kind, regex), ...) like `refuse`, but checked only when the probe is about to act (at the end
     of the boot / trust stage and before every write), never mid-read: for a transient screen that may still resolve
     while the CLI paints (agy's "not signed in" notice while it signs in from the keyring, #144).
-    The trust prompt counts only while it is the LAST thing painted (`_trust_prompt_last`: after it only SGR, cursor
-    show/hide, terminal queries, whitespace and its own option lines, within the PTY's rows and columns and 1 KB), checked when the boot read ends and again in the
-    write path itself: a prompt erased or replaced (by an account picker, or by anything at all) gets no Enter, and
-    every check applies. The read after the answer gets what is left of the one boot_s window.
     `ready` and each `refuse_unsettled` test are a regex or a predicate on the plain screen text (_screen_has).
-    `on_boot` may raise to refuse: it runs before the first keystroke of `command`.
-    The trust prompt's Enter is checked against `refuse` only, not `refuse_unsettled`: the prompt is not a sign-in screen,
-    and a CLI may paint it before it has finished signing in (agy 1.5.16 on the Air, 2026-11-25: notice, spinner, trust
-    prompt, and only then the banner). After the answer the read goes on until `ready_after_trust` (default `ready`)
-    is painted, within boot_s, and `refuse_unsettled` applies before the first keystroke of `command` as always.
+    The boot window starts when the CLI first paints (its own start-up is waited for separately, up to boot_s); the read
+    after a trust answer gets what is left of that one window.
     A ProbeRefused carries `facts`: fixed names and numbers only (which check, mid-read or about to act, ready seen,
-    seconds since start), plus `refusal_facts(screen)` when given; never screen text."""
-    PROBE_DIR.mkdir(parents=True, exist_ok=True)
-    my_dir = PROBE_DIR / f"p{os.getpid()}-{int(time.time() * 1000) % 100000}"     # per-probe folder: the reaper kills by cwd and must never hit another probe
-    my_dir.mkdir(exist_ok=True)
+    seconds since start, trust_prompt_seen), plus `refusal_facts(screen)` when given; never screen text."""
+    if workdir is None:
+        PROBE_DIR.mkdir(parents=True, exist_ok=True)
+        my_dir = PROBE_DIR / f"p{os.getpid()}-{int(time.time() * 1000) % 100000}"     # per-probe folder: the reaper kills by cwd and must never hit another probe
+        my_dir.mkdir(exist_ok=True)
+        reap_root, own_dir = PROBE_DIR, True
+    else:
+        my_dir, reap_root, own_dir = Path(workdir), Path(workdir).parent, False
     if cwd_check is not None:
         try:
             cwd_check(my_dir)
         except BaseException:
-            import shutil
-            shutil.rmtree(my_dir, ignore_errors=True)
+            if own_dir:
+                import shutil
+                shutil.rmtree(my_dir, ignore_errors=True)
             raise
     started = time.time()
     pid, fd = pty.fork()
@@ -438,29 +238,23 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 pass
         finally:
             os._exit(127)    # exec failed (e.g. missing binary): never let the forked copy run the sampler's code
-    _reaper.track(pid, fd, my_dir, PROBE_DIR)
+    _reaper.track(pid, fd, my_dir, reap_root)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", _PTY_ROWS, _PTY_COLS, 0, 0))
     buf = b""
     eof = False
-    stage, startup_chars, ready_seen, trust_seen = "boot", 0, False, False
+    stage, startup_chars, ready_seen = "boot", 0, False
     typed: list[str] = []          # what the probe sent, by name, for a truthful refusal message
-    # The trust prompt's last judgement (#144 fix round 4, review P2): None until judged, then its verdict (None =
-    # answerable, "absent", or a TRUST_REJECTIONS category). Refusal facts and diagnostics report it as fixed names only.
-    trust_judged: list[str | None] = []
 
-    def trust_facts() -> dict[str, Any]:
-        """trust_prompt_seen: the prompt matched anywhere in the transcript so far. trust_rejected: why the latest
-        judgement refused it (or, before any judgement, why it would be refused now); None if never seen or answerable."""
-        now = _trust_prompt_verdict(buf, _TRUST_PROMPT)
-        seen = now != "absent" or any(v != "absent" for v in trust_judged)
-        verdict = trust_judged[-1] if trust_judged else now
-        return {"trust_prompt_seen": seen, "trust_rejected": verdict if verdict in TRUST_REJECTIONS else None}
+    def trust_seen() -> bool:
+        """The trust prompt was painted anywhere in the transcript so far (detection only: a diagnostic, and the agy
+        lane's refusal; never a licence to type)."""
+        return bool(re.search(_TRUST_PROMPT, _plain(buf), re.I))
 
     def refusal(kind: str, where: str, check: str, acting: bool, shown: str) -> ProbeRefused:
         exc = ProbeRefused(kind, where, typed)
         facts: dict[str, Any] = {"check": check, "acting": acting, "after_s": round(time.time() - started, 2),
-                                 "ready_seen": bool(ready and _screen_has(ready, shown)), "trust_prompt": trust_seen,
-                                 **trust_facts()}
+                                 "ready_seen": bool(ready and _screen_has(ready, shown)),
+                                 "trust_prompt_seen": trust_seen()}
         if refusal_facts is not None:
             try:
                 facts.update(refusal_facts(shown))
@@ -483,25 +277,15 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             for kind, pattern in refuse_unsettled:
                 if _screen_has(pattern, shown, re.I):
                     raise refusal(kind, where, "unsettled", acting, shown)
+        if acting and not answer_trust and trust_seen():
+            # no keystroke ever answers it: the owner trusts the fixed probe folder once by hand (docs/AGY-LANE.md)
+            raise refusal("workspace_not_trusted", where, "trust", acting, _plain(buf))
 
-    def trust_on_screen() -> bool:
-        """The trust prompt is the last thing painted (_trust_prompt_verdict), not merely somewhere in the transcript.
-        Each judgement is kept for the refusal facts."""
-        trust_judged.append(_trust_prompt_verdict(buf, _TRUST_PROMPT))
-        return trust_judged[-1] is None
-
-    def send(data: bytes, name: str, unsettled: bool = True) -> bool:
-        """Every keystroke the probe types goes through here: the screen is checked first (deny-all). unsettled=False
-        only for the workspace-trust answer, and only while the trust prompt is the last thing painted: `refuse` still
-        applies; `refuse_unsettled` waits for the next keystroke. If the prompt is no longer last, every check applies
-        and the answer is NOT written (returns False): it was meant for that prompt and nothing else."""
-        if not unsettled and not trust_on_screen():
-            refused(stage, acting=True)
-            return False
-        refused(stage, acting=unsettled)
+    def send(data: bytes, name: str) -> None:
+        """Every keystroke the probe types goes through here: the screen is checked first (deny-all)."""
+        refused(stage, acting=True)
         os.write(fd, data)
         typed.append(name)
-        return True
 
     def pump(max_s: float, quiet_s: float = 1.5, until: str | Callable[[str], bool] | None = None, mark: int = 0) -> None:
         """Read until the screen goes quiet, or (with `until`) until that text is on screen and has had a moment to finish painting."""
@@ -535,7 +319,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             elif len(buf) > mark and time.time() - last > quiet_s:
                 return
     mark = 0
-    # One boot window for the read before AND after the trust answer, started when the CLI first paints: its own
+    # One boot window for the read before AND after a trust answer, started when the CLI first paints: its own
     # start-up (a cold binary, an interpreter on a loaded machine) is waited for separately, up to boot_s, so it never
     # eats the window in which its screens are judged (#144 fix round 3: a fake agy that started 3 s late was read as an
     # empty screen). Nothing painted within boot_s: an empty window, as before. Deny-all is unchanged by when it starts.
@@ -549,19 +333,14 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
         pump(boot_left(), until=ready)
         startup_chars = len(_plain(buf))
         ready_seen = bool(ready and _screen_has(ready, _plain(buf)))
-        trust_seen = trust_on_screen()               # the prompt as the last thing painted; an erased one is not answered
-        refused("boot", acting=not trust_seen)        # a trust prompt is answered first; unsettled is judged after it
+        refused("boot")                               # answer_trust=False: a trust prompt refuses here, nothing typed
         if eof:
             mark = len(buf)
             return ""
-        if trust_seen:
+        if answer_trust and trust_seen():
             stage = "trust"
-            if not send(b"\r", "Enter (workspace trust)", unsettled=False):   # no longer last: no Enter, full checks
-                trust_seen = False
-            if ready_after_trust is not None and _screen_has(ready_after_trust, _plain(buf)):
-                pump(boot_left(), mark=len(buf))        # already painted before the prompt: read until quiet
-            else:
-                pump(boot_left(), until=ready_after_trust or ready, mark=len(buf))
+            send(b"\r", "Enter (workspace trust)")
+            pump(boot_left(), until=ready, mark=len(buf))
             startup_chars = len(_plain(buf))
             ready_seen = bool(ready and _screen_has(ready, _plain(buf)))
             refused("trust")
@@ -615,17 +394,17 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     finally:
         if diagnostics is not None:
             diagnostics.update(stage=stage, eof=eof, startup_chars=startup_chars,
-                               response_chars=len(_plain(buf[mark:])), ready_seen=ready_seen, **trust_facts())
+                               response_chars=len(_plain(buf[mark:])), ready_seen=ready_seen,
+                               trust_prompt_seen=trust_seen())
             if eof and stage in {"boot", "trust"}:
                 diagnostics["boot_failure"] = _boot_failure_kind(_plain(buf))
-        _reaper.reap(pid, fd, PROBE_DIR, my_dir)
-        try:
-            os.rmdir(my_dir)
-        except OSError:
-            pass
+        _reaper.reap(pid, fd, reap_root, my_dir)
+        if own_dir:
+            try:
+                os.rmdir(my_dir)
+            except OSError:
+                pass
 
-
-_TRUST_PROMPT = r"trust (this|the contents)|Trust this workspace"     # the one prompt tui_capture answers (Enter)
 
 
 def parse_reset(text: str, tz: str | None, now: datetime | None = None) -> float | None:
@@ -931,6 +710,8 @@ _AGY_SIGN_IN_RULES = (
 AGY_REFUSE = (
     ("not-logged-in", "|".join(rule for _, rule in _AGY_SIGN_IN_RULES)),
     ("first-run-pending", r"color scheme|colou?r theme|rendering mode|alt-screen"),
+    # the fixed probe folder is not trusted in agy yet: refused mid-read, never answered (#144 fix round 5)
+    ("workspace_not_trusted", _TRUST_PROMPT),
 )
 
 
@@ -965,13 +746,8 @@ def agy_refusal_facts(shown: str) -> dict[str, Any]:
 
 
 def AGY_BOOT_READY(shown: str) -> bool:
-    """The boot read stops once the banner's account line (signed in) or the trust prompt is painted, else after boot_s."""
-    return _agy_iso.banner_tier(shown) is not None or bool(re.search(r"trust (?:this|the contents)", shown, re.I))
-
-
-def AGY_SIGNED_IN(shown: str) -> bool:
-    """After the trust answer the read waits for the banner's account line only: agy 1.5.16 paints the trust prompt
-    while it is still signing in, before the banner (Air, 2026-11-25 10:12, #144)."""
+    """The boot read stops once the banner's account line (signed in) is painted, else after boot_s. A trust prompt
+    does not end it early: it is refused (`workspace_not_trusted`) at the end of the read, with nothing typed."""
     return _agy_iso.banner_tier(shown) is not None
 
 
@@ -991,6 +767,10 @@ LANE_STATE_TEXT = {
     "settings-refused": "refused: unsafe agy settings",
     "subscription-unproven": "refused: subscription login not proven",
     "partial-reading": "quota screen read only in part",
+    "workspace_not_trusted": "refused: probe folder not trusted in agy (one-time owner step, docs/AGY-LANE.md)",
+    "probe_folder_not_clean": "refused: probe folder not empty",
+    "probe_folder_unsafe": "refused: probe folder not private",
+    "probe_busy": "skipped: another probe holds the probe folder",
 }
 
 
@@ -1028,29 +808,172 @@ def agy_group_labels(titles) -> dict[str, str]:
     return labels
 
 
+# ---------------------------------------------------------------- the agy probe's fixed folder (#144 fix round 5)
+# Rounds 1-4 opened agy in a NEW folder each run, so agy always showed its workspace-trust prompt, and tried to press
+# Enter on it only while it was provably still on the screen. Each review found another terminal trick (scroll regions,
+# a bare LF in raw mode) that hid the prompt yet passed: a correct check needs a full terminal emulator. Now agy runs in
+# ONE fixed folder that the owner trusts in agy once by hand (docs/AGY-LANE.md, "One-time owner step"); a trust prompt
+# there means the folder is not trusted, and the probe refuses it with no keystroke (`workspace_not_trusted`). This code
+# never writes agy's own settings or trust list.
+AGY_PROBE_LOCK_WAIT_S = 10.0       # a second probe waits this long for the folder, then skips its sample (probe_busy)
+# What agy leaves in the folder it runs in. Not known for agy 1.5.16 (nothing in its docs or the captured runs says it
+# writes there), so nothing is allowed: anything found refuses `probe_folder_not_clean` before agy starts. If a real run
+# shows agy writing a fixed name there, add exactly that name here, with the date and version it was seen on.
+AGY_WORKSPACE_LEFTOVERS: frozenset[str] = frozenset()
+
+
+class ProbeFolderRefused(RuntimeError):
+    """The agy probe's fixed folder is not safe (`probe_folder_unsafe`) or not empty (`probe_folder_not_clean`); agy was
+    not started."""
+
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
+
+
+class ProbeSkipped(RuntimeError):
+    """Another probe holds the fixed folder's lock: this sample is skipped (not a failure; the last reading stays)."""
+    kind = "probe_busy"
+
+
+def agy_probe_paths() -> tuple[Path, Path, Path]:
+    """(root, workspace, lock): `$CORTADOS_HOME/agy-probe`, its `workspace` (the folder agy runs in) and `lock`."""
+    root = STATE / "agy-probe"
+    return root, root / "workspace", root / "lock"
+
+
+def _check_no_symlinked_ancestor(path: Path) -> None:
+    """Every component of `path` is a real directory, never a symlink, except one owned by root (macOS's own /var and
+    /tmp links: only root can change them, and root owns the machine anyway). A user-owned link anywhere on the way
+    could point the probe, and the owner's one-time trust, at a different folder."""
+    import stat as _stat
+    p = Path(os.path.abspath(path))
+    cur = Path(p.anchor)
+    for part in p.parts[1:]:
+        cur = cur / part
+        st = os.lstat(cur)
+        if _stat.S_ISLNK(st.st_mode):
+            if st.st_uid != 0:
+                raise ProbeFolderRefused("probe_folder_unsafe", f"agy probe folder refused: {cur} is a symlink")
+        elif not _stat.S_ISDIR(st.st_mode):
+            raise ProbeFolderRefused("probe_folder_unsafe", f"agy probe folder refused: {cur} is not a directory")
+
+
+def _check_private_dir(path: Path, mode_mask: int) -> None:
+    """A real directory (lstat: not a symlink) owned by this user with none of `mode_mask`'s permission bits."""
+    import stat as _stat
+    st = os.lstat(path)
+    if not _stat.S_ISDIR(st.st_mode):
+        raise ProbeFolderRefused("probe_folder_unsafe", f"agy probe folder refused: {path} is not a real directory")
+    if st.st_uid != os.geteuid():
+        raise ProbeFolderRefused("probe_folder_unsafe", f"agy probe folder refused: {path} is not owned by this user")
+    if st.st_mode & mode_mask:
+        raise ProbeFolderRefused("probe_folder_unsafe",
+                                 f"agy probe folder refused: {path} has mode {oct(st.st_mode & 0o777)}")
+
+
+def _make_private_dir(path: Path) -> None:
+    """mkdir 0700 if missing (chmod after: mkdir's mode is masked by the umask); an existing one is checked, never fixed."""
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        return
+    os.chmod(path, 0o700)
+
+
+def _kill_leftovers(root: Path, workspace: Path) -> int:
+    """Kill agy helpers still running in the folder (orphans of a sampler that died mid-probe). Called under the lock,
+    so no live probe is in there."""
+    killed = 0
+    for p in _reaper.probe_cwd_pids(root, workspace):
+        if p == os.getpid():
+            continue
+        try:
+            os.kill(p, signal.SIGKILL)
+            killed += 1
+        except OSError:
+            pass
+    return killed
+
+
+class agy_probe_workspace:
+    """Context manager: make and check the fixed folder, take its exclusive lock (at most AGY_PROBE_LOCK_WAIT_S, else
+    ProbeSkipped), kill leftovers, require it empty (ProbeFolderRefused `probe_folder_not_clean`), yield the folder;
+    release the lock on exit. Nothing here starts agy."""
+
+    def __init__(self, wait_s: float | None = None):
+        self.wait_s = AGY_PROBE_LOCK_WAIT_S if wait_s is None else wait_s
+        self.fd: int | None = None
+
+    def __enter__(self) -> Path:
+        root, workspace, lock = agy_probe_paths()
+        STATE.mkdir(parents=True, exist_ok=True)
+        _make_private_dir(root)
+        _make_private_dir(workspace)
+        _check_no_symlinked_ancestor(workspace)
+        _check_private_dir(STATE, 0o022)          # others can't rename agy-probe away
+        _check_private_dir(root, 0o077)
+        _check_private_dir(workspace, 0o077)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
+        try:
+            import stat as _stat
+            st = os.fstat(fd)
+            if not _stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+                raise ProbeFolderRefused("probe_folder_unsafe", "agy probe lock refused: not a regular file of this user")
+            deadline = time.monotonic() + self.wait_s
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise ProbeSkipped(f"agy probe skipped: another probe held {lock} for {self.wait_s:g} s")
+                    time.sleep(0.2)
+            _kill_leftovers(root, workspace)
+            entries = [e for e in os.listdir(workspace) if e not in AGY_WORKSPACE_LEFTOVERS]
+            if entries:
+                # a count only: names in the folder are not ours to echo into records
+                raise ProbeFolderRefused("probe_folder_not_clean",
+                                         f"agy probe folder not empty: {len(entries)} entries in {workspace}; "
+                                         "agy was not started")
+        except BaseException:
+            os.close(fd)
+            raise
+        self.fd = fd
+        return workspace
+
+    def __exit__(self, *exc) -> None:
+        if self.fd is not None:
+            os.close(self.fd)                       # closing drops the flock
+            self.fd = None
+
+
 def _antigravity() -> dict[str, Any]:
     """agy /usage through the isolation of agy_isolation (#144): a configured absolute binary (unset: not sampled), an
     allowlisted env (a Google-family variable in the env file: refused), the settings guard, and a deny-all PTY run."""
     from cortados_router import agy_isolation as iso
     env_file = _env_file_vars()
-    # the probe runs in a fresh folder under PROBE_DIR: the dotenv guard checks PROBE_DIR's walk now and the folder itself
+    _, workspace, _ = agy_probe_paths()
+    # the probe runs in ONE fixed folder (#144 fix round 5): the dotenv guard checks its walk now and the folder itself
     # (cwd_check) just before the fork (#144 round 3)
     binary, env = iso.prepare(_env_get("CORTADOS_AGY_BIN") or env_file.get("CORTADOS_AGY_BIN"), os.environ, env_file,
-                              workdir=PROBE_DIR)
+                              workdir=workspace)
     diag: dict = {}
     boot: list[str] = []          # the start-up banner, in memory only: the tier is read from it below, never stored
 
     def proven_boot(shown: str) -> None:
         # the subscription is proven from the banner BEFORE "/usage" is typed (#144 fix round 1): a screen without the
-        # banner's account line (a "Choose account" picker, a sign-in prompt) gets no keystroke at all
+        # banner's account line (a "Choose account" picker, a sign-in prompt, a trust prompt) gets no keystroke at all
         boot.append(shown)
         iso.check_subscription(shown)
-    # A refused screen at any point (boot, after trust, after /usage, while paging) raises ProbeRefused from inside the
-    # capture, before the probe's next keystroke.
-    text = tui_capture([binary], "/usage", AGY_DONE, env, refuse=AGY_REFUSE, refuse_unsettled=AGY_UNSETTLED,
-                       ready=AGY_BOOT_READY, ready_after_trust=AGY_SIGNED_IN, inherit_path=False, diagnostics=diag,
-                       page=_agy_next_page, cwd_check=lambda d: iso.check_dotenv(env["HOME"], d), on_boot=proven_boot,
-                       refusal_facts=agy_refusal_facts)
+    # A refused screen at any point (boot, after /usage, while paging) raises ProbeRefused from inside the capture,
+    # before the probe's next keystroke. Before the banner's account line is proven nothing at all is typed: a trust
+    # prompt refuses `workspace_not_trusted` (answer_trust=False), never answered.
+    with agy_probe_workspace() as folder:
+        text = tui_capture([binary], "/usage", AGY_DONE, env, refuse=AGY_REFUSE, refuse_unsettled=AGY_UNSETTLED,
+                           ready=AGY_BOOT_READY, inherit_path=False, diagnostics=diag, page=_agy_next_page,
+                           cwd_check=lambda d: iso.check_dotenv(env["HOME"], d), on_boot=proven_boot,
+                           refusal_facts=agy_refusal_facts, answer_trust=False, workdir=folder)
     if not text.strip():
         if diag.get("eof") and diag.get("stage") in {"boot", "trust"}:
             raise ProbeExecFailed(f"agy exited at {diag.get('stage')} with no usable output")
@@ -1581,6 +1504,7 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
             return not only or lane in only or _base(lane) in only
         due = [l for l in plan if _wanted(l) and (force or now - float((lanes.get(l) or {}).get("tried_at") or 0) >= _interval(l))]
         results: dict[str, Any] = {}
+        skipped: set[str] = set()
 
         def run(lane: str) -> None:
             try:
@@ -1592,6 +1516,13 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
                 results[lane] = {"state": "not-configured", "note": str(exc)[:200], "windows": [], "pools": {},
                                  "scarcity": None, "refusing": False, "fetched_at": None, "tried_at": time.time(),
                                  "error": None, "error_kind": None}
+            except ProbeSkipped as exc:   # not a failure: the last reading stays, the next sample tries again
+                results[lane] = {**(lanes.get(lane) or {}), "last_skip": {"reason": exc.kind, "at": time.time()}}
+                skipped.add(lane)         # the old reading is not a new sample: kept out of the history below
+                try:
+                    print(f"cortados scarcity: {lane} sample skipped ({exc.kind}): {exc}", file=sys.stderr, flush=True)
+                except (OSError, ValueError):
+                    pass
             except Exception as exc:      # keep the last good reading, say so
                 results[lane] = _failed_record(lane, lanes.get(lane), exc)
                 if lane == "claude":
@@ -1628,7 +1559,8 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
         if results:
             with HISTORY.open("a") as h:
                 h.write(json.dumps({"ts": now, "lanes": {l: {"scarcity": v.get("scarcity"), "windows": [[w["window"], w["used_pct"], w["elapsed_pct"]] for w in v.get("windows") or []]}
-                                                        for l, v in results.items() if not v.get("error") and not v.get("state")}}) + "\n")
+                                                        for l, v in results.items() if not v.get("error") and not v.get("state")
+                                                        and l not in skipped}}) + "\n")
         return out
 
 

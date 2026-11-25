@@ -50,6 +50,8 @@ LOG = {log!r}
 SCREENS = {screens!a}    # ASCII escapes: Python 3.9's tokenizer can misread a long line of multibyte text
 with open(LOG + ".env", "w") as f:
     f.write("\n".join(sorted(os.environ)))
+with open(LOG + ".cwd", "w") as f:
+    f.write(os.path.realpath(os.getcwd()))
 try:
     tty.setraw(0)
 except Exception:
@@ -66,7 +68,10 @@ time.sleep(SCREENS.get("start_delay", 0))    # a slow start-up: nothing painted 
 out(SCREENS["boot"])
 for step in SCREENS.get("boot_later", []):    # painted later, as agy does while it signs in
     time.sleep(0.6)
-    out(step)
+    if step.startswith("RAW:"):              # bytes as given: a bare LF stays a bare LF
+        os.write(1, step[4:].encode())
+    else:
+        out(step)
 got = b""
 while True:
     try:
@@ -78,6 +83,8 @@ while True:
     got += d
     with open(LOG + ".keys", "wb") as f:
         f.write(got)
+    with open(LOG + ".times", "a") as f:
+        f.write("%f %r\n" % (time.time(), d))
     if "after_trust" in SCREENS and got == b"\r":
         out(SCREENS["after_trust"])
     if "usage" in SCREENS and got.endswith(b"/usage\r"):
@@ -289,8 +296,10 @@ class ProbeHonesty(AgyBase):
                        "Antigravity CLI wants to access your Google Account\n", "Grant access to continue\n"):
             with self.subTest(screen=screen):
                 self.assertTrue(any(re.search(p, screen, re.I) for _, p in sc.AGY_REFUSE))
-        for benign in (BANNER, FIXTURE.read_text(), TRUST):
+        for benign in (BANNER, FIXTURE.read_text()):
             self.assertFalse(any(re.search(p, benign, re.I) for _, p in sc.AGY_REFUSE))
+        # the trust prompt matches the workspace_not_trusted rule and no other (#144 fix round 5)
+        self.assertEqual([k for k, p in sc.AGY_REFUSE if re.search(p, TRUST, re.I)], ["workspace_not_trusted"])
 
     def test_bare_email_is_not_boot_ready_or_settled_but_the_banner_is(self):
         self.assertFalse(sc.AGY_BOOT_READY("Choose account: test@example.invalid"))
@@ -368,187 +377,205 @@ class ProbeHonesty(AgyBase):
         self.assertEqual(cm.exception.kind, "first-run-pending")
         self.assertEqual(self.keys(log), b"")
 
-    def test_only_the_trust_prompt_is_answered(self):
-        binary, log = self.fake({"boot": TRUST, "after_trust": LOGGED_OUT})
+    # ---- #144 fix round 5: agy runs in ONE fixed folder the owner trusts once by hand. Before the banner's account line
+    # is proven the probe types NOTHING: a trust prompt means the folder is not trusted and refuses
+    # `workspace_not_trusted` with zero keystrokes. Rounds 1-4's "is the prompt still on screen" geometry is gone.
+    def test_trust_prompt_before_the_account_line_gets_no_keystroke(self):
+        for screens in ({"boot": TRUST}, {"boot": SIGNING_IN, "boot_later": [TRUST]},
+                        {"boot": "\x1b[12;30H" + TRUST}):
+            binary, log = self.fake({**screens, "after_trust": BANNER, "usage": FIXTURE.read_text()})
+            with self.subTest(screens=screens), self.env(binary), \
+                    mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+                with self.assertRaises(sc.ProbeRefused) as cm:
+                    sc._antigravity()
+                self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("workspace_not_trusted", [], b""))
+                self.assertIs(cm.exception.facts["trust_prompt_seen"], True)
+                self.assertIn("nothing was typed", str(cm.exception))
+                rec = sc._failed_record("antigravity", None, cm.exception)
+                self.assertEqual(rec["error_kind"], "workspace_not_trusted")
+                self.assertIn("not trusted", sc.lane_state(rec))
+                self.assertIs(rec["refusal"]["trust_prompt_seen"], True)
+                self.assertNotIn("Trust", json.dumps(rec["refusal"]))
+
+    def test_trust_prompt_after_the_banner_is_refused_too(self):
+        binary, log = self.fake({"boot": BANNER, "boot_later": [TRUST], "usage": FIXTURE.read_text()})
         with self.env(binary):
             with self.assertRaises(sc.ProbeRefused) as cm:
                 sc._antigravity()
-        self.assertEqual(cm.exception.kind, "not-logged-in")
-        self.assertEqual(self.keys(log), b"\r")       # one Enter for the trust prompt; /usage never typed
+        self.assertEqual((cm.exception.kind, self.keys(log)), ("workspace_not_trusted", b""))
 
-    # ---- #144, the 10:12 sample on the Air: agy signed in from the keyring 0.86 s in, but painted the trust prompt for
-    # the fresh per-run probe folder before its banner. The boot read ended on the prompt (ready) with the notice still
-    # unsettled, and AGY_UNSETTLED refused before the trust answer. The answer is now judged by `refuse` alone.
-    def test_trust_prompt_painted_while_signing_in_is_answered_then_the_banner_is_read(self):
-        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST], "after_trust": BANNER,
-                                 "usage": FIXTURE.read_text()})
-        with self.env(binary):
-            rec = sc._antigravity()
-        self.assertEqual(rec["tier"], "AI Pro")
-        self.assertEqual(self.keys(log), b"\r/usage\r")
-
-    def test_trust_prompt_then_a_sign_in_screen_gets_only_the_trust_answer(self):
-        for after in (LOGGED_OUT, "\x1b[2J\x1b[HYou are currently not signed in.\n ⣷ Signing in...\n"):
-            binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST], "after_trust": after,
+    def test_review_reproductions_get_no_keystroke(self):
+        # round-4 review: a DECSTBM scroll region then CUP and newlines, and a bare LF in raw mode, hid the prompt yet
+        # passed the geometry check. With no keystroke before the account line, both are refused, nothing typed.
+        for later in ([TRUST, "RAW:\x1b[1;2r\x1b[2;1H" + "\n" * 5 + "Loading\n"],
+                      ["RAW:Trust this workspace [Y/n]\n\n\n"],
+                      ["RAW:\x1b[1;2r\x1b[60;1H\n\n" + "Do you trust the contents of this folder?\r\n", BANNER]):
+            binary, log = self.fake({"boot": SIGNING_IN, "boot_later": later, "after_trust": BANNER,
                                      "usage": FIXTURE.read_text()})
-            with self.subTest(after=after[:20]), self.env(binary), \
+            with self.subTest(later=later), self.env(binary), \
                     mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
                 with self.assertRaises(sc.ProbeRefused) as cm:
                     sc._antigravity()
-                self.assertEqual(cm.exception.kind, "not-logged-in")
-                self.assertEqual(self.keys(log), b"\r")
-                self.assertEqual(cm.exception.typed, ["Enter (workspace trust)"])
-                self.assertTrue(cm.exception.facts["trust_prompt"])
+                self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("workspace_not_trusted", [], b""))
 
-    # ---- #144 fix round (review P1): the trust prompt counts only on the CURRENT screen. A prompt painted and then cleared
-    # away (agy repainting into an account picker, say) must not let the trust Enter through.
-    def test_signing_in_trust_then_cleared_into_an_account_picker_gets_no_keystroke(self):
-        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST, "\x1b[2J\x1b[H" + self.PICKER],
-                                 "after_trust": BANNER, "usage": FIXTURE.read_text()})
+    def test_trust_prompt_with_a_sign_in_screen_gets_no_keystroke(self):
+        binary, log = self.fake({"boot": LOGGED_OUT + TRUST, "after_trust": BANNER, "usage": FIXTURE.read_text()})
+        with self.env(binary):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertEqual((cm.exception.kind, self.keys(log), cm.exception.typed), ("not-logged-in", b"", []))
+
+    def test_unsettled_without_a_trust_prompt_records_none(self):
+        binary, log = self.fake({"boot": SIGNING_IN})
         with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
             with self.assertRaises(sc.ProbeRefused) as cm:
                 sc._antigravity()
-        self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("not-logged-in", [], b""))
+        self.assertIs(cm.exception.facts["trust_prompt_seen"], False)
+        self.assertNotIn("trust_rejected", cm.exception.facts)
 
-    def test_trust_cleared_into_an_unknown_screen_gets_no_keystroke(self):
-        # no refusal rule matches the new screen: only the current-screen check stops the Enter
-        for clear in ("\x1b[2J\x1b[H", "\x1b[H\x1b[J", "\x1b[?1049h", "\x1bc"):
-            binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST, clear + "Loading workspace\n"],
-                                     "after_trust": BANNER, "usage": FIXTURE.read_text()})
-            with self.subTest(clear=repr(clear)), self.env(binary), \
-                    mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
-                with self.assertRaises(sc.ProbeRefused) as cm:
-                    sc._antigravity()
-                self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("not-logged-in", [], b""))
-                self.assertIs(cm.exception.facts["trust_prompt"], False)
-
-    def test_trust_prompt_alone_on_the_current_screen_gets_exactly_one_enter(self):
-        binary, log = self.fake({"boot": SIGNING_IN + "\x1b[2J\x1b[H" + TRUST, "after_trust": BANNER,
-                                 "usage": FIXTURE.read_text()})
+    def test_normal_path_runs_in_the_fixed_folder(self):
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [BANNER], "usage": FIXTURE.read_text()})
         with self.env(binary):
             rec = sc._antigravity()
+        root, workspace, lock = sc.agy_probe_paths()
+        self.assertEqual((root, workspace, lock), (sc.STATE / "agy-probe", sc.STATE / "agy-probe" / "workspace",
+                                                    sc.STATE / "agy-probe" / "lock"))
         self.assertEqual(rec["tier"], "AI Pro")
-        self.assertEqual(self.keys(log), b"\r/usage\r")      # one trust Enter, then the normal /usage path
+        self.assertEqual(self.keys(log), b"/usage\r")
+        self.assertEqual(Path(str(log) + ".cwd").read_text(), os.path.realpath(workspace))
+        self.assertEqual((workspace.stat().st_mode & 0o777, root.stat().st_mode & 0o777), (0o700, 0o700))
+        self.assertEqual(list(workspace.iterdir()), [])          # kept, empty, for the next run
+        self.assertFalse(sc.PROBE_DIR.exists() and any(sc.PROBE_DIR.iterdir()))
+        with self.env(binary):                                   # the same folder again: the lock was released
+            self.assertEqual(sc._antigravity()["tier"], "AI Pro")
 
-    # ---- #144 fix round 2 (review P1, re-review): a redraw the round-1 "current screen" did not cut (line-by-line erase,
-    # cursor home + SGR + erase-below) removed the visible prompt but left it counted. The prompt is now answerable only
-    # while it is the LAST thing agy painted: after it, only SGR colour, cursor show/hide, terminal queries, whitespace
-    # and the prompt's own option lines; anything else waits for the prompt to be painted again.
-    LINE_ERASE = "\x1b[1A\x1b[2K\x1b[1A\x1b[2K\r\x1b[K"       # cursor up + erase line, per line, as an Ink-style TUI clears
-
-    def _no_keystroke_after(self, cleared: str) -> None:
-        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST, cleared + "Loading workspace\n"],
-                                 "after_trust": BANNER, "usage": FIXTURE.read_text()})
-        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
-            with self.assertRaises(sc.ProbeRefused) as cm:
+    def test_lock_held_skips_the_sample_and_starts_no_agy(self):
+        import fcntl
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        root, workspace, lock = sc.agy_probe_paths()
+        root.mkdir(mode=0o700); os.chmod(root, 0o700)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        t0 = time.time()
+        with self.env(binary), mock.patch.object(sc, "AGY_PROBE_LOCK_WAIT_S", 0.5), \
+                mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises(sc.ProbeSkipped) as cm:
                 sc._antigravity()
-        self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("not-logged-in", [], b""))
-        self.assertIs(cm.exception.facts["trust_prompt"], False)
-
-    def test_trust_erased_line_by_line_into_loading_gets_no_keystroke(self):
-        self._no_keystroke_after(self.LINE_ERASE)
-
-    def test_trust_erased_by_home_sgr_erase_below_into_loading_gets_no_keystroke(self):
-        self._no_keystroke_after("\x1b[H\x1b[0m\x1b[J")
-
-    def test_unknown_escape_after_trust_gets_no_keystroke(self):
-        for tail in ("\x1b[5S", "\x1b[?2026h", "\x1b[3;1r", "\x1b7", "\x1b[", "\x08", "\rLoading"):
-            with self.subTest(tail=repr(tail)):
-                self.assertFalse(sc._trust_prompt_last((TRUST + tail).replace("\n", "\r\n").encode(), sc._TRUST_PROMPT))
-        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST, "\x1b[5S"],
-                                 "after_trust": BANNER, "usage": FIXTURE.read_text()})
-        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
-            with self.assertRaises(sc.ProbeRefused):
-                sc._antigravity()
+        self.assertLess(time.time() - t0, 5)
+        self.assertEqual(cm.exception.kind, "probe_busy")
         self.assertEqual(self.keys(log), b"")
 
-    def test_trust_followed_only_by_colour_and_whitespace_gets_exactly_one_enter(self):
-        tail = "\x1b[0m\x1b[?25l  \n\x1b[38;5;244m\x1b[0m\x1b[?25h\n"
-        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST + tail], "after_trust": BANNER,
-                                 "usage": FIXTURE.read_text()})
-        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
-            rec = sc._antigravity()
-        self.assertEqual(rec["tier"], "AI Pro")
-        self.assertEqual(self.keys(log), b"\r/usage\r")
+    def test_skipped_sample_keeps_the_last_reading_out_of_the_history(self):
+        old = {"windows": [{"window": "week (gemini)", "pool": "gemini", "used_pct": 1.0}], "tried_at": 1.0,
+               "fetched_at": 1.0, "error": None}
+        sc.CACHE.write_text(json.dumps({"fetched_at": 0, "lanes": {"antigravity": old}}))
 
-    def test_trust_erased_then_repainted_gets_exactly_one_enter(self):
-        binary, log = self.fake({"boot": SIGNING_IN,
-                                 "boot_later": [TRUST, self.LINE_ERASE + "Loading workspace\n", "\x1b[H\x1b[J" + TRUST],
-                                 "after_trust": BANNER, "usage": FIXTURE.read_text()})
-        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
-            rec = sc._antigravity()
-        self.assertEqual(rec["tier"], "AI Pro")
-        self.assertEqual(self.keys(log), b"\r/usage\r")
+        def busy():
+            raise sc.ProbeSkipped("agy probe skipped: another probe held the lock")
+        with mock.patch.dict(sc.SAMPLERS, {"antigravity": busy}), \
+                mock.patch.object(sc._reaper, "sweep_stale", return_value=None), \
+                mock.patch.object(sc, "_learn_unit_costs", lambda: None), redirect_stderr(io.StringIO()) as err:
+            sc._sample_locked(force=True, only=["antigravity"])
+        lane = json.loads(sc.CACHE.read_text())["lanes"]["antigravity"]
+        self.assertEqual((lane["windows"], lane["fetched_at"], lane["last_skip"]["reason"]),
+                         (old["windows"], 1.0, "probe_busy"))
+        self.assertFalse(lane.get("error"))
+        self.assertIn("skipped (probe_busy)", err.getvalue())
+        hist = sc.HISTORY.read_text().splitlines() if sc.HISTORY.exists() else []
+        self.assertTrue(all("antigravity" not in json.loads(h)["lanes"] for h in hist))
 
-    def test_trust_prompt_last_rule(self):
-        last = lambda raw: sc._trust_prompt_last(raw, sc._TRUST_PROMPT)
-        self.assertTrue(last(b"Do you trust the contents of this folder?\r\nTrust this workspace [Y/n]\r\n"))
-        self.assertTrue(last(b"\x1b[1mTrust\x1b[0m this workspace?\r\n\x1b[36m> 1. Yes, proceed\x1b[0m\r\n"
-                             b"  2. No, exit\r\n\r\n  Enter to confirm \xc2\xb7 Esc to exit\r\n\x1b[6n"))
-        self.assertTrue(last(b"Loading\x1b[2J\x1b[HTrust this workspace [Y/n]"))          # a clear BEFORE it is fine
-        self.assertFalse(last(b"no prompt here\r\n"))
-        for after in (b"\x1b[2K", b"\x1b[K", b"\x1b[0J", b"\x1b[J", b"\x1b[2J", b"\x1b[H", b"\x1b[1;1f", b"\x1b[3A",
-                      b"\x1b[B", b"\x1b[2C", b"\x1b[D", b"\x1b[?1049h", b"\x1bc", b"\x1b]0;t\x07", b"\rX", b"\x1bM",
-                      b"\r\nLoading workspace\r\n", b"\r\nChoose an account\r\n", b"\r\nNo account; sign in\r\n"):
-            with self.subTest(after=after):
-                self.assertFalse(last(b"Trust this workspace [Y/n]" + after))
+    def test_non_empty_folder_is_refused_before_agy_starts(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        _, workspace, _ = sc.agy_probe_paths()
+        workspace.mkdir(parents=True, mode=0o700); os.chmod(workspace.parent, 0o700); os.chmod(workspace, 0o700)
+        for leftover in ("notes.txt", ".agents"):
+            (workspace / leftover).mkdir() if leftover.startswith(".") else (workspace / leftover).write_text("x")
+        with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises(sc.ProbeFolderRefused) as cm:
+                sc._antigravity()
+        rec = sc._failed_record("antigravity", None, cm.exception)
+        self.assertEqual((rec["error_kind"], sc.lane_state(rec)), ("probe_folder_not_clean", "refused: probe folder not empty"))
+        self.assertIn("2 entries", str(cm.exception))
+        self.assertNotIn("notes", str(cm.exception))             # a count only, never the names
+        self.assertEqual(sc.AGY_WORKSPACE_LEFTOVERS, frozenset())
 
-    # ---- #144 fix round 3 (review P1, round-2 re-review): blank lines and indentation were unbounded, so a prompt pushed
-    # off the 60-row PTY by 70 blank lines, or followed by an option line indented 10,000 spaces, still got the Enter.
-    # The rows after the prompt are now counted as the PTY would (every LF a row, lines no wider than the PTY) and the
-    # bytes after it capped.
-    def test_trust_prompt_scrolled_or_pushed_off_the_screen_is_not_last(self):
-        last = lambda raw: sc._trust_prompt_last(raw, sc._TRUST_PROMPT)
-        prompt = b"Trust this workspace [Y/n]\r\n"
-        self.assertFalse(last(prompt + b"\r\n" * 70 + b"> 1. Yes, proceed\r\n"))        # the review's case
-        self.assertFalse(last(prompt + b" " * 10000 + b"> 1. Yes, proceed\r\n"))        # the review's case
-        self.assertFalse(last(prompt + b" " * 10000))                                   # unterminated too
-        # the boundary: the cursor may move rows - 1 = 59 rows below the prompt's row, not 60
-        self.assertTrue(last(prompt + b"\r\n" * 58))
-        self.assertFalse(last(prompt + b"\r\n" * 59))
-        self.assertTrue(last(prompt + b"\r\n" * 57 + b"> 1. Yes, proceed\r\n"))
-        self.assertFalse(last(prompt + b"\r\n" * 58 + b"> 1. Yes, proceed\r\n"))
-        # a line wider than the PTY wraps: refused, whether the width is indentation, text or wide characters
-        self.assertTrue(last(prompt + b" " * 140 + b"> 1. Yes, proceed\r\n"))
-        self.assertFalse(last(prompt + b" " * 150 + b"> 1. Yes, proceed\r\n"))
-        self.assertFalse(last(prompt + b"\t" * 20 + b"> 1. Yes\r\n"))
-        self.assertFalse(last(prompt + b"> 1. Yes " + "一".encode() * 76 + b"\r\n"))
-        # the prompt's own line: its remainder wraps when it passes the last column; after an unknown cursor move it
-        # counts as one wrap (fail closed)
-        self.assertTrue(last(b" " * 120 + prompt + b"\r\n" * 58))
-        self.assertFalse(last(b" " * 140 + prompt + b"\r\n" * 58))
-        # (fix round 4: an absolute column move gives a known column, so the prompt row counts as any other; a relative
-        # move leaves the column unknown and refuses outright)
-        self.assertTrue(last(b"\x1b[5;40H" + prompt + b"\r\n" * 58))
-        self.assertFalse(last(b"\x1b[5;40H" + prompt + b"\r\n" * 59))
-        self.assertFalse(last(b"\x1b[2C" + prompt))
-        # more than 1 KB after the prompt, even of harmless colour codes, is another screen
-        self.assertTrue(last(prompt + b"\x1b[0m" * 200))
-        self.assertFalse(last(prompt + b"\x1b[0m" * 300))
-        # a C1 control or invalid UTF-8 on a line after it is not understood
-        self.assertFalse(last(prompt + "\u0085".encode() + b"\r\n"))
-        self.assertFalse(last(b"Trust this workspace [Y/n]\xff\r\n"))
+    def test_folder_with_a_symlinked_ancestor_is_refused(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        real = self.tmp / "elsewhere"
+        real.mkdir(mode=0o700)
+        for link_at in ("state", "agy-probe", "workspace"):
+            with self.subTest(link_at=link_at):
+                state = self.tmp / f"s-{link_at}"
+                if link_at == "state":
+                    state.symlink_to(real)
+                else:
+                    state.mkdir()
+                    if link_at == "agy-probe":
+                        (state / "agy-probe").symlink_to(real)
+                    else:
+                        (state / "agy-probe").mkdir(mode=0o700)
+                        (state / "agy-probe" / "workspace").symlink_to(real)
+                with self.env(binary), mock.patch.object(sc, "STATE", state), \
+                        mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+                    with self.assertRaises(sc.ProbeFolderRefused) as cm:
+                        sc._antigravity()
+                self.assertEqual(cm.exception.kind, "probe_folder_unsafe")
 
-    def test_trust_prompt_pushed_off_the_screen_gets_no_keystroke(self):
-        for tail in ("\n" * 70 + "> 1. Yes, proceed\n", " " * 10000 + "> 1. Yes, proceed\n"):
-            binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST + tail], "after_trust": BANNER,
-                                     "usage": FIXTURE.read_text()})
-            with self.subTest(tail=tail[:3]), self.env(binary), \
-                    mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
-                with self.assertRaises(sc.ProbeRefused) as cm:
-                    sc._antigravity()
-                self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("not-logged-in", [], b""))
-                self.assertIs(cm.exception.facts["trust_prompt"], False)
+    def test_folder_open_to_others_is_refused_and_not_fixed(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        _, workspace, _ = sc.agy_probe_paths()
+        workspace.mkdir(parents=True)
+        os.chmod(workspace.parent, 0o700); os.chmod(workspace, 0o755)
+        with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises(sc.ProbeFolderRefused) as cm:
+                sc._antigravity()
+        self.assertEqual(cm.exception.kind, "probe_folder_unsafe")
+        self.assertEqual(workspace.stat().st_mode & 0o777, 0o755)
+
+    def test_leftovers_in_the_folder_are_killed_under_the_lock(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        root, workspace, lock = sc.agy_probe_paths()
+        seen = []
+        real = sc._reaper.probe_cwd_pids
+
+        def spy(probe_dir, only_dir=None):
+            import fcntl
+            probe = os.open(lock, os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):       # the probe holds the lock while it looks
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+            seen.append((Path(probe_dir), Path(only_dir) if only_dir else None))
+            return real(probe_dir, only_dir)
+        with self.env(binary), mock.patch.object(sc._reaper, "probe_cwd_pids", spy):
+            sc._antigravity()
+        self.assertIn((root, workspace), seen)
 
     def test_slow_start_up_does_not_eat_the_boot_window(self):
-        # the boot window starts when the CLI first paints: a 2.5 s start-up under a 3 s window still reads the trust
-        # prompt painted 0.6 s after the notice, and the banner after the answer
-        binary, log = self.fake({"start_delay": 2.5, "boot": SIGNING_IN, "boot_later": [TRUST], "after_trust": BANNER,
+        # the boot window starts when the CLI first paints: a 2.5 s start-up under a 3 s window still reads the banner
+        # painted 0.6 s after the notice
+        binary, log = self.fake({"start_delay": 2.5, "boot": SIGNING_IN, "boot_later": [BANNER],
                                  "usage": FIXTURE.read_text()})
         with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
             rec = sc._antigravity()
         self.assertEqual(rec["tier"], "AI Pro")
-        self.assertEqual(self.keys(log), b"\r/usage\r")
+        self.assertEqual(self.keys(log), b"/usage\r")
+
+    def test_other_clis_trust_answer_read_shares_one_boot_window(self):
+        # claude / codex / cursor still answer their trust prompt (answer_trust, as on main); the read after the answer
+        # gets what is left of the one boot window, not a fresh one
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST]})
+        sc.tui_capture([binary], "/usage", "never", {"HOME": str(self.home), "PATH": "/usr/bin:/bin"}, boot_s=3,
+                       run_s=0.5, inherit_path=False)
+        reads = [line.split(" ", 1) for line in Path(str(log) + ".times").read_text().splitlines()]
+        self.assertEqual(reads[0][1], "b'\\r'")
+        enter_at = float(reads[0][0])
+        usage_at = next(float(t) for t, d in reads[1:] if "/" in d)
+        # the boot read (trust painted 0.6 s in, then 1.5 s quiet) used ~2.1 s of the 3 s window, so /usage follows the
+        # Enter within ~0.9 s; a fresh window would wait the full 3 s
+        self.assertLess(usage_at - enter_at, 2.0)
 
     # agy 1.5.16 signed out, drawn to a headless child on the Air (2026-11-25; described, no email): alternate screen,
     # logo, the notice, a "Signing in..." spinner, then a bare CR overwriting it with the login-method picker.
@@ -570,164 +597,6 @@ class ProbeHonesty(AgyBase):
         for screen in ("Select login method:", "> 1. Google OAuth", "2. Use a Google Cloud project"):
             with self.subTest(screen=screen):
                 self.assertTrue(re.search(sc.AGY_REFUSE[0][1], screen, re.I))
-
-    def test_trust_answer_read_shares_one_boot_window(self):
-        # trust shown, nothing after the answer: the probe gives up within boot_s overall, not boot_s again after Enter
-        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST]})
-        reaped: list[float] = []
-        real_reap = sc._reaper.reap
-
-        def timed_reap(*a, **k):
-            reaped.append(time.time())
-            return real_reap(*a, **k)
-        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)), \
-                mock.patch.object(sc._reaper, "reap", timed_reap):
-            with self.assertRaises(sc.ProbeRefused):
-                sc._antigravity()
-        self.assertEqual(self.keys(log), b"\r")
-        # from the Enter (the fake's key log) to the end of the read (the reaper's start, which then waits 1.5 s on its
-        # own), so a slow fake start-up cannot flake it: the boot read used ~2.1 s of the 3 s window and leaves under
-        # 1 s; a fresh window would be the full 3 s
-        self.assertLess(reaped[0] - Path(str(log) + ".keys").stat().st_mtime, 2.0)
-
-    def test_trust_prompt_with_a_sign_in_screen_gets_no_keystroke(self):
-        binary, log = self.fake({"boot": LOGGED_OUT + TRUST, "after_trust": BANNER, "usage": FIXTURE.read_text()})
-        with self.env(binary):
-            with self.assertRaises(sc.ProbeRefused) as cm:
-                sc._antigravity()
-        self.assertEqual((cm.exception.kind, self.keys(log), cm.exception.typed), ("not-logged-in", b"", []))
-
-    def test_unsettled_without_a_trust_prompt_records_none(self):
-        binary, log = self.fake({"boot": SIGNING_IN})
-        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
-            with self.assertRaises(sc.ProbeRefused) as cm:
-                sc._antigravity()
-        self.assertIs(cm.exception.facts["trust_prompt"], False)
-
-    # ---- #144 fix round 4 (review P1 on round 3): rows were counted from the match's LAST row, so a match that wrapped
-    # over two rows passed with its first row ("trust") scrolled off. The match must now sit whole on one row at a known
-    # column, and the rows below are counted from that row.
-    def test_trust_prompt_that_wraps_is_refused(self):
-        verdict = lambda raw: sc._trust_prompt_verdict(raw, sc._TRUST_PROMPT)
-        repro = b" " * 150 + b"trust the contents" + b"\r\n" * 59               # the review's reproduction
-        self.assertFalse(sc._trust_prompt_last(repro, sc._TRUST_PROMPT))
-        self.assertEqual(verdict(repro), "wrapped")
-        self.assertEqual(verdict(b" " * 150 + b"trust the contents"), "wrapped")  # wraps even with nothing after it
-        self.assertEqual(verdict(b"x" * 170 + b"\r\n" + b"trust the contents"), None)   # a wrapped line BEFORE: fine
-        self.assertEqual(verdict(b"x" * 170 + b"trust the contents"), "wrapped")  # text before it on its line wrapped
-        self.assertEqual(verdict(b"\x1b[1;150Htrust the contents"), "wrapped")     # a known column too far right
-        self.assertIsNone(verdict(b" " * 142 + b"trust the contents"))             # ends exactly on column 160
-        self.assertIsNone(verdict(b"\x1b[5H" + b" " * 142 + b"trust the contents"))  # a row alone: column 1
-        self.assertIsNone(verdict(b"\x1b[5;20H" + b" " * 123 + b"trust the contents"))
-        self.assertEqual(verdict(b"\x1b[5;20H" + b" " * 124 + b"trust the contents"), "wrapped")
-        self.assertEqual(verdict(b" " * 143 + b"trust the contents"), "wrapped")
-        for move in (b"\x1b[3C", b"\x1b[2A", b"\x1b[s", b"\x1b7"):                  # relative / saved: column unknown
-            with self.subTest(move=move):
-                self.assertEqual(verdict(move + b"trust the contents"), "unknown_column")
-        for known in (b"\x1b[H", b"\x1b[5;1H", b"\x1b[1G", b"\x1b[G", b"\r\x1b[2K", b"\x1b[2J\x1b[H\x1b[J\x1b[0m"):
-            with self.subTest(known=known):
-                self.assertIsNone(verdict(b"junk " + known + b"trust the contents"))
-
-    def test_trust_prompt_rows_are_counted_from_its_own_row(self):
-        last = lambda raw: sc._trust_prompt_last(raw, sc._TRUST_PROMPT)
-        one_row = b" " * 100 + b"Trust this workspace [Y/n]"
-        # the cursor may move 59 rows below the prompt's row: then the prompt is on the top visible row
-        self.assertTrue(last(one_row + b"\r\n" * 59))
-        self.assertFalse(last(one_row + b"\r\n" * 60))
-        # the rest of the prompt's own line wraps onto a second row: that row counts
-        wraps = b" " * 130 + b"Trust this workspace [Y/n] proceed?"
-        self.assertTrue(last(wraps + b"\r\n" * 58))
-        self.assertEqual(sc._trust_prompt_verdict(wraps + b"\r\n" * 59, sc._TRUST_PROMPT), "scrolled")
-
-    def test_trust_prompt_verdict_categories(self):
-        verdict = lambda raw: sc._trust_prompt_verdict(raw, sc._TRUST_PROMPT)
-        prompt = b"Trust this workspace [Y/n]\r\n"
-        cases = {
-            "absent": b"no prompt here\r\n",
-            "not_last": prompt + b"Loading workspace\r\n",
-            "scrolled": prompt + b"\r\n" * 59,
-            "wrapped": b" " * 155 + prompt,               # the match is "Trust this": 10 cells
-            "unknown_column": b"\x1b[4C" + prompt,
-            "tail_too_long": prompt + b"\x1b[0m" * 300,
-            "line_too_wide": prompt + b" " * 700,
-            "bad_byte": prompt + b"\x08",
-            "unknown_escape": prompt + b"\x1b7",
-        }
-        self.assertEqual(set(cases) - {"absent"}, set(sc.TRUST_REJECTIONS))
-        for want, raw in cases.items():
-            with self.subTest(want=want):
-                self.assertEqual(verdict(raw), want)
-        self.assertEqual(verdict(prompt + b"\x1b[2K"), "not_last")          # an erase: a known escape that removes it
-        self.assertEqual(verdict(prompt + b" " * 170 + b"\r\n"), "line_too_wide")
-        self.assertEqual(verdict(b"Trust this workspace [Y/n]\xff\r\n"), "bad_byte")
-        self.assertIsNone(verdict(prompt + b"> 1. Yes, proceed\r\n"))
-
-    def test_wrapped_trust_prompt_gets_no_keystroke_and_says_why(self):
-        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [" " * 150 + "trust the contents\n" + "\n" * 59],
-                                 "after_trust": BANNER, "usage": FIXTURE.read_text()})
-        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
-            with self.assertRaises(sc.ProbeRefused) as cm:
-                sc._antigravity()
-        self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("not-logged-in", [], b""))
-        f = cm.exception.facts
-        self.assertEqual((f["trust_prompt"], f["trust_prompt_seen"], f["trust_rejected"]), (False, True, "wrapped"))
-        rec = sc._failed_record("antigravity", None, cm.exception)          # what the scarcity cache keeps for the lane
-        self.assertEqual((rec["refusal"]["trust_prompt_seen"], rec["refusal"]["trust_rejected"]), (True, "wrapped"))
-
-    def test_one_row_trust_prompt_at_a_known_column_gets_exactly_one_enter(self):
-        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": ["\x1b[12;30H" + TRUST], "after_trust": BANNER,
-                                 "usage": FIXTURE.read_text()})
-        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
-            rec = sc._antigravity()
-        self.assertEqual(rec["tier"], "AI Pro")
-        self.assertEqual(self.keys(log), b"\r/usage\r")
-
-    # ---- #144 fix round 4 (review P2): a refusal says whether a trust prompt was painted at all and, if it was, which
-    # rule refused it, by fixed category; set on every refusal path, mid-read ones included.
-    def test_refusal_facts_without_a_trust_prompt(self):
-        binary, log = self.fake({"boot": SIGNING_IN})
-        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
-            with self.assertRaises(sc.ProbeRefused) as cm:
-                sc._antigravity()
-        f = cm.exception.facts
-        self.assertEqual((f["trust_prompt_seen"], f["trust_rejected"]), (False, None))
-
-    def test_refusal_facts_name_each_rejection_end_to_end(self):
-        for want, later in (("not_last", [TRUST, "Loading workspace\n"]),
-                            ("scrolled", [TRUST + "\n" * 70]),
-                            ("unknown_escape", [TRUST, "\x1b7"]),
-                            ("line_too_wide", [TRUST + " " * 200 + "> 1. Yes\n"])):
-            binary, log = self.fake({"boot": SIGNING_IN, "boot_later": later, "after_trust": BANNER,
-                                     "usage": FIXTURE.read_text()})
-            with self.subTest(want=want), self.env(binary), \
-                    mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
-                with self.assertRaises(sc.ProbeRefused) as cm:
-                    sc._antigravity()
-                self.assertEqual(self.keys(log), b"")
-                f = cm.exception.facts
-                self.assertEqual((f["trust_prompt_seen"], f["trust_rejected"]), (True, want))
-                self.assertNotIn("Trust", json.dumps(f))
-
-    def test_mid_read_refusal_after_a_trust_prompt_reports_it(self):
-        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST, LOGGED_OUT]})
-        with self.env(binary):
-            with self.assertRaises(sc.ProbeRefused) as cm:
-                sc._antigravity()
-        f = cm.exception.facts
-        self.assertEqual((cm.exception.kind, f["check"], f["acting"], self.keys(log)), ("not-logged-in", "refuse", False, b""))
-        self.assertEqual((f["trust_prompt_seen"], f["trust_rejected"]), (True, "not_last"))
-        flat = json.dumps(sc._failed_record("antigravity", None, cm.exception)["refusal"])
-        self.assertNotIn("accounts.google.com", flat)       # rule names only, never screen text
-        self.assertNotIn("Sign in", flat)
-
-    def test_refusal_after_the_trust_answer_reports_it_answered(self):
-        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST], "after_trust": LOGGED_OUT})
-        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
-            with self.assertRaises(sc.ProbeRefused) as cm:
-                sc._antigravity()
-        f = cm.exception.facts
-        self.assertEqual(self.keys(log), b"\r")
-        self.assertEqual((f["trust_prompt"], f["trust_prompt_seen"], f["trust_rejected"]), (True, True, None))
 
     def test_usage_screen_is_read_through_the_isolated_env(self):
         binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
@@ -789,7 +658,7 @@ class ProbeHonesty(AgyBase):
     def test_dotenv_with_a_banned_prefix_refuses_the_probe_before_any_start(self):
         binary, log = self.fake({"boot": BANNER})
         for name in ("GEMINI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "AGY_ADC_AUTH", "CLOUDSDK_CONFIG"):
-            for where in (self.home / ".gemini" / ".env", self.home / ".env", sc.PROBE_DIR / ".env"):
+            for where in (self.home / ".gemini" / ".env", self.home / ".env", sc.agy_probe_paths()[0] / ".env"):
                 with self.subTest(name=name, where=where.name):
                     where.parent.mkdir(parents=True, exist_ok=True)
                     where.write_text(f"{name}=secret-value-42\n")
@@ -807,14 +676,19 @@ class ProbeHonesty(AgyBase):
         real = iso.check_dotenv
 
         def plant_then_check(home, workdir):
-            if Path(workdir).name.startswith("p"):              # the per-probe folder (PROBE_DIR is "usage-probe")
+            if Path(workdir).name == "workspace" and Path(workdir).is_dir():   # the fixed folder, just before the fork
                 Path(workdir, ".env").write_text("GEMINI_API_KEY=k\n")
             return real(home, workdir)
         with self.env(binary), mock.patch.object(iso, "check_dotenv", plant_then_check), \
                 mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
             with self.assertRaises(iso.ForbiddenEnv):
                 sc._antigravity()
-        self.assertEqual([p.name for p in sc.PROBE_DIR.iterdir()], [])   # the refused folder is removed
+        # the owner's trusted folder is never emptied by code: the planted file stays, and the next probe refuses it
+        _, workspace, _ = sc.agy_probe_paths()
+        self.assertEqual([p.name for p in workspace.iterdir()], [".env"])
+        with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises((iso.ForbiddenEnv, sc.ProbeFolderRefused)):
+                sc._antigravity()
 
     def test_unparsable_dotenv_refuses_the_probe(self):
         binary, _ = self.fake({"boot": BANNER})
@@ -830,7 +704,7 @@ class ProbeHonesty(AgyBase):
         p = self.home / ".gemini" / ".env"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("EDITOR=vim\n")
-        iso.check_dotenv(self.home, sc.PROBE_DIR)
+        iso.check_dotenv(self.home, sc.agy_probe_paths()[1])
         binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
         with self.env(binary):
             rec = sc._antigravity()
