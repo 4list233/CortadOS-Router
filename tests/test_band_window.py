@@ -588,15 +588,25 @@ class LauncherTests(test_session.SessionTests):
             settings = json.load(f)
         return env, cmd, settings
 
-    def test_routed_orchestrator_defaults_to_r4(self):
+    def test_routed_orchestrator_defaults_to_r3(self):
         env, cmd, settings = self.run_prepare("--orchestrator", "cortados")
-        self.assertEqual(cmd[1:3], ["--model", "cortados@R4"])   # owner 2026-11-24: the Opus 5.5 / Sol 6.1 band
+        self.assertEqual(cmd[1:3], ["--model", "cortados@R3"])   # owner 2026-11-24: the Opus 5.5 / Sol 6.1 band
         for e in (env, settings["env"]):
             self.assertEqual(e["CLAUDE_CODE_SUBAGENT_MODEL"], "cortados")            # subagents unwindowed
             self.assertEqual(e["CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL"], "cortados")
             self.assertEqual(e["ANTHROPIC_SMALL_FAST_MODEL"], session.SMALL_FAST_MODEL)
             self.assertNotIn("x-cortados-band", e["ANTHROPIC_CUSTOM_HEADERS"])       # would reach subagents too
         self.assertNotIn("cortados@", json.dumps(settings))
+
+    def test_default_band_is_the_opus_sol_band(self):
+        # 2026-11-24: the default was R4, documented as "the Opus 5.5 / Sol 6.1 band", but R4 is the Fable / Astra band
+        # and has no index floor of its own (core.required_index), so easy main-loop turns fell to Haiku-class models.
+        refs = core.table()["tiering"]["band_references"]
+        band = session.DEFAULT_ORCHESTRATOR_BAND
+        self.assertIn("gpt-6.1-sol", refs[band])
+        self.assertIn("claude-opus-5", refs[band])
+        self.assertNotIn("claude-fable-5-1", refs[band])
+        self.assertNotIn("gpt-6-astra", refs[band])
 
     def test_explicit_window_and_any(self):
         self.assertEqual(self.run_prepare("--orchestrator", "cortados", "--orchestrator-band", "r1-r3")[1][2],
@@ -621,7 +631,7 @@ class LauncherTests(test_session.SessionTests):
         rc, out, err = self.run_main("--provider-url", "http://r.example", "--token-file", self.tok,
                                      "--orchestrator", "cortados", "--print-env")
         self.assertEqual(rc, 0, err)
-        self.assertIn("--model cortados@R4", out)
+        self.assertIn("--model cortados@R3", out)
 
     def test_child_tasks_keep_free_routing(self):
         import inspect
