@@ -9,7 +9,7 @@ False and `core.resolve`'s fit gate refuses every agy route. The provider serves
 
 | Piece | Where | What |
 |---|---|---|
-| Isolation (one owner) | `cortados_router/agy_isolation.py` | Dotenv guard (round 3, below). Environment allowlist for every agy process (`HOME`, `USER`, `LOGNAME`, `TMPDIR`, `LANG`, `LC_*`, fixed `PATH`; `TERM` from the PTY). A `GEMINI_*` / `GOOGLE_*` / `AGY_*` / `CLOUDSDK_*` name in the router's shared env file (`$CORTADOS_HOME/env`) is a hard failure (`forbidden-env`); in the process environment it is dropped. Other vendors' variables are dropped, never fatal (that file serves their lanes too). The binary is a configured absolute path, never searched on PATH. A settings guard reads agy's real config files (never writes them) against **allowlist** schemas (below); a subscription proof reads agy's own `/usage` screen (below). One launch path: `agy_isolation.prepare` runs all of this before every agy process (the probe and `agy models`). |
+| Isolation (one owner) | `cortados_router/agy_isolation.py` | Dotenv guard (round 3, below). Environment allowlist for every agy process (`HOME`, `USER`, `LOGNAME`, `TMPDIR`, `LANG`, `LC_*`, fixed `PATH`; `TERM` from the PTY). A `GEMINI_*` / `GOOGLE_*` / `AGY_*` / `CLOUDSDK_*` name in the router's shared env file (`$CORTADOS_HOME/env`) is a hard failure (`forbidden-env`); in the process environment it is dropped. Other vendors' variables are dropped, never fatal (that file serves their lanes too). The binary is a configured absolute path, never searched on PATH. A settings guard reads agy's real config files (never writes them) against **allowlist** schemas (below); a subscription proof reads the tier from agy's own start-up banner (below). One launch path: `agy_isolation.prepare` runs all of this before every agy process (the probe and `agy models`). |
 | Binary | provider `--agy-bin <absolute path>` (or `CORTADOS_AGY_BIN`) | Unset: the lane is **not configured** and never sampled (no PTY opened); the views say "not configured", not FAILED. |
 | Honest failures | `scarcity.tui_capture`, `scarcity._antigravity` | `binary-missing` (with `searched`), `exec-failed` (the child could not exec, or exited at once with no output; all lanes now raise on an exec failure instead of returning an empty screen), `not-logged-in`, `first-run-pending` (a first-run screen, or no `antigravity-cli/settings.json` yet), `forbidden-env`, `settings-refused`, `subscription-unproven`. |
 | Deny-all | `tui_capture(refuse=...)` | Enter is sent only for the existing workspace-trust prompt. The refusal patterns are checked on every read and before every write, at every stage (boot, after trust, after `/usage`, while paging): a sign-in or first-run screen closes the CLI at once, and the error says truly what had been typed by then ("nothing was typed" only when nothing was). |
@@ -62,23 +62,35 @@ setting keys are **counted** ("2 unknown setting(s) under 'plugins'"; the path s
 counted; a partial reading names pools (`claude-gpt: no 5-hour window`), not the group title as shown; the "no quota
 groups" error gives line and footer counts.
 
-### Subscription proof (`agy_isolation.check_subscription`) [ESCALATE]
+### Subscription proof (`agy_isolation.check_subscription`)
 
-With no auth mode in settings, the probe proves the login from what agy itself shows on the `/usage` answer (the
-"Models & Quota" box: an "Account:" line and the tier / plan text). Read-only evidence; the account email is matched and
-dropped (`scrub_account`) before anything is checked. No error ever carries screen text (round 3: the "no quota
-groups" error used to carry the screen's tail, and a private line survived the email scrub); it reports counts only.
+With no auth mode in settings, the probe proves the login from what agy itself shows. The tier is read from the
+**start-up banner** agy prints when it launches, which the probe already sees in the PTY before it types `/usage`
+(`scarcity.tui_capture`'s `on_boot`; the banner text is kept in memory for this check only). Its account line is
+`<email> (Google AI Pro)`:
 
-- Refused (`subscription-unproven`, "refused: subscription login not proven"): the screen names an API key, Vertex,
-  enterprise, pay-as-you-go, Application Default Credentials / ADC, a Cloud project, a billing account or Code Assist
-  (even next to a tier), or shows no personal tier.
-- Accepted: a personal Google AI tier, `AI Pro` / `Google AI Pro` (and `AI Ultra`, also a personal tier); recorded as
-  the reading's `tier`.
-- **[ESCALATE] PROVISIONAL:** no captured agy 1.5.16 screen with the tier line is in this repository (both fixtures are
-  reconstructed), so `TIER_PATTERN` (`(Google )?AI (Pro|Ultra)`) is a guess at its wording. `TIER_PATTERN_CONFIRMED` is
-  `False`, and while it is the lane **refuses every reading** even when the pattern matches, so the agy quota is not
-  shown until confirmed. To confirm: the owner sends the `/usage` box's tier / plan line exactly as printed (email
-  scrubbed; the tier may stay); pin `TIER_PATTERN` to it, add the paste as a fixture and set the flag `True`.
+```
+                  Antigravity CLI 1.5.16
+                  user@example.com (Google AI Pro)
+                  Gemini 4 Neon (High)
+                  ~/.cortados/usage-probe
+```
+
+The `/usage` "Models & Quota" box holds only an `Account: <email>` line, no tier. Fixture:
+`tests/fixtures/agy-banner.txt` (email scrubbed). Read-only evidence; the account email is matched and dropped
+(`scrub_account`) before anything is checked, and is never stored, logged or echoed. No error ever carries screen text
+(round 3: the "no quota groups" error used to carry the screen's tail, and a private line survived the email scrub); it
+reports counts only.
+
+- Accepted: the parenthesised personal tier right after the account on the banner, `Google AI Pro` or `Google AI Ultra`
+  (`TIER_PATTERN`: `<account> (Google AI (Pro|Ultra))` after the scrub); recorded as the reading's `tier` (`AI Pro` /
+  `AI Ultra`).
+- Refused (`subscription-unproven`, "refused: subscription login not proven"): the banner or the `/usage` answer names an
+  API key, Vertex, enterprise, pay-as-you-go, Application Default Credentials / ADC, a Cloud project, a billing account or
+  Code Assist (even next to a tier); or the banner shows no tier, or any other one (`Google AI Plus`, `Free`, …), or a
+  tier not on the account line.
+- Confirmed against the owner's agy 1.5.16 screens on 2026-11-24 (`TIER_PATTERN_CONFIRMED = True`). If a later agy changes
+  the banner, set the flag `False` (the lane refuses again) until the pattern is pinned to the new line.
 
 ### Saved conversations
 agy saves every interactive session: on start it prints "Resume with -c (or command below): agy --conversation=<uuid>".
@@ -100,8 +112,8 @@ not a captured agy 1.5.16 screen. Fixture: `tests/fixtures/agy-usage-provisional
 2. What a logged-out `agy` prints at start (the sign-in screen), if it can be seen without signing out the real login
    (e.g. on another macOS user); otherwise say so and the pattern stays provisional.
 3. The first-run screens' wording (color scheme, rendering mode), if they were noted.
-4. ~~`~/.gemini/antigravity-cli/settings.json` key names~~: done 2026-11-24 (round 2 allowlists). Still needed: the
-   `/usage` box's tier / plan line exactly as printed, for the subscription proof above.
+4. ~~`~/.gemini/antigravity-cli/settings.json` key names~~: done 2026-11-24 (round 2 allowlists).
+5. ~~The tier line~~: done 2026-11-24. It is on the start-up banner, not in the `/usage` box (Subscription proof above).
 
 ## Owner steps on the Air (updated 2026-11-24)
 
@@ -113,8 +125,8 @@ agy 1.5.16 is installed at `~/.local/bin/agy` and signed in (Google AI Pro). The
 2. Make sure `~/.cortados/env` holds no `GEMINI_*`, `GOOGLE_*`, `AGY_*` or `CLOUDSDK_*` line (the lane refuses to run).
 3. After the next 30-minute sample, the live view / pulse pane shows the Gemini and third-party quota, or the named
    reason it could not ("not logged in", "first-run setup pending", …).
-   **Until the tier line is confirmed** (Subscription proof, [ESCALATE]) it shows "refused: subscription login not
-   proven": expected, and the cue to send the `/usage` box's tier / plan line.
+   "refused: subscription login not proven" means the start-up banner showed no `(Google AI Pro)` / `(Google AI Ultra)`
+   after the account, or a non-subscription login (Subscription proof above).
 
 ## Open for the routing PR (B) [ESCALATE]
 

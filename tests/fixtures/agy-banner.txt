@@ -1,0 +1,4 @@
+                  Antigravity CLI 1.5.16
+                  user@example.com (Google AI Pro)
+                  Gemini 4 Neon (High)
+                  ~/.cortados/usage-probe

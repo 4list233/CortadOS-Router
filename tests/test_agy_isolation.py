@@ -156,40 +156,58 @@ class SettingsAllowlist(unittest.TestCase):
 
 
 class SubscriptionProof(unittest.TestCase):
-    USAGE = ("╭ Models & Quota ╮\nAccount: someone.private@example.com\nPlan: Google AI Pro\n"
-             "GEMINI MODELS\nWeekly Limit Remaining 87.50%\n")
+    # agy 1.5.16 (owner's screens, 2026-11-24): the tier is on the start-up banner's account line; the /usage box has
+    # only "Account: <email>"
+    BANNER = (ROOT / "tests" / "fixtures" / "agy-banner.txt").read_text().replace("user@example.com",
+                                                                                  "someone.private@example.com")
+    USAGE = "\u2514 Models & Quota\n\n  Account: someone.private@example.com\n\nGEMINI MODELS\nWeekly Limit Remaining 87.50%\n"
 
-    def confirmed(self):
-        return mock.patch.object(iso, "TIER_PATTERN_CONFIRMED", True)
+    def test_tier_pattern_is_confirmed(self):
+        self.assertTrue(iso.TIER_PATTERN_CONFIRMED)
 
-    def test_provisional_pattern_keeps_the_lane_refusing(self):
-        self.assertFalse(iso.TIER_PATTERN_CONFIRMED)
-        with self.assertRaisesRegex(iso.SubscriptionUnproven, r"PROVISIONAL.*\[ESCALATE\]") as cm:
-            iso.check_subscription(self.USAGE)
+    def test_banner_tier_passes(self):
+        self.assertEqual(iso.check_subscription(self.BANNER, self.USAGE), "AI Pro")
+        self.assertEqual(iso.check_subscription("a@b.co (Google AI Ultra)"), "AI Ultra")
+        self.assertEqual(iso.check_subscription("a@b.co\n(Google AI Pro)"), "AI Pro")       # wrapped line
+
+    def test_tier_is_read_from_the_banner_only(self):
+        with self.assertRaisesRegex(iso.SubscriptionUnproven, "no personal"):
+            iso.check_subscription("Antigravity CLI 1.5.16\n", "a@b.co (Google AI Pro)\n" + self.USAGE)
+
+    def test_unconfirmed_pattern_refuses(self):
+        with mock.patch.object(iso, "TIER_PATTERN_CONFIRMED", False), \
+                self.assertRaisesRegex(iso.SubscriptionUnproven, "not confirmed") as cm:
+            iso.check_subscription(self.BANNER, self.USAGE)
         self.assertEqual(cm.exception.kind, "subscription-unproven")
         self.assertNotIn("someone.private", str(cm.exception))
         self.assertEqual(sc.lane_state(sc._failed_record("antigravity", None, cm.exception)),
                          "refused: subscription login not proven")
 
-    def test_personal_tiers_pass_once_confirmed(self):
-        with self.confirmed():
-            self.assertEqual(iso.check_subscription(self.USAGE), "AI Pro")
-            self.assertEqual(iso.check_subscription("(Google AI Pro) Gemini 4 Neon (High)"), "AI Pro")
-            self.assertEqual(iso.check_subscription("Plan: AI Ultra"), "AI Ultra")
+    def test_no_or_unknown_tier_is_refused(self):
+        for banner in ("Antigravity CLI 1.5.16\nx@y.com\nGemini 4 Neon (High)", "x@y.com (Google AI Plus)",
+                       "x@y.com (Free)", "x@y.com (Google One)", "(Google AI Pro) Gemini 4 Neon (High)",
+                       "Plan: Google AI Pro", ""):
+            with self.subTest(banner=banner), self.assertRaisesRegex(iso.SubscriptionUnproven, "no personal") as cm:
+                iso.check_subscription(banner, self.USAGE)
+            self.assertNotIn("x@y.com", str(cm.exception))
+            self.assertNotIn("someone.private", str(cm.exception))
 
     def test_non_subscription_screens_are_refused(self):
-        with self.confirmed():
-            for screen in ("Plan: Google AI Pro\nAuth: API key", "Plan: Google AI Pro\nVertex AI project my-proj",
-                           "Gemini Code Assist Enterprise", "Plan: Pay-as-you-go", "Pay as you go billing",
-                           "Using Application Default Credentials", "Account: x@y.com\nGEMINI MODELS",
-                           "Plan: Free", ""):
-                with self.subTest(screen=screen), self.assertRaises(iso.SubscriptionUnproven) as cm:
-                    iso.check_subscription(screen)
-                self.assertNotIn("x@y.com", str(cm.exception))
-                self.assertNotIn("my-proj", str(cm.exception))
+        for banner, usage in (("x@y.com (Google AI Pro)\nAuth: API key", ""),
+                              ("x@y.com (Google AI Pro)", "Vertex AI project my-proj"),
+                              ("x@y.com (Google AI Pro)", "Gemini Code Assist Enterprise"),
+                              ("x@y.com (Google AI Pro)", "Plan: Pay-as-you-go"),
+                              ("x@y.com (Google AI Pro)", "Pay as you go billing"),
+                              ("x@y.com (Google AI Pro)", "Using Application Default Credentials")):
+            with self.subTest(banner=banner, usage=usage), \
+                    self.assertRaisesRegex(iso.SubscriptionUnproven, "non-subscription") as cm:
+                iso.check_subscription(banner, usage)
+            self.assertNotIn("x@y.com", str(cm.exception))
+            self.assertNotIn("my-proj", str(cm.exception))
 
     def test_account_email_is_scrubbed(self):
         self.assertEqual(iso.scrub_account("Account: a.b+c@mail.example.co.uk |"), "Account: <account> |")
+        self.assertEqual(iso.scrub_account("user@example.com (Google AI Pro)"), "<account> (Google AI Pro)")
 
 
 FAKE_AGY = r'''#!{py}

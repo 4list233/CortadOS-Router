@@ -88,15 +88,14 @@ while True:
             out(view(top))
 '''
 
-BANNER = "Antigravity CLI 1.5.16\n(Google AI Pro) Gemini 4 Neon (High)\nResume with -c (or command below): agy --conversation=00000000-0000-0000-0000-000000000000\n> "
+# agy 1.5.16's start-up banner as printed on the owner's screen (2026-11-24; email scrubbed to user@example.com): the
+# subscription tier is on its account line, `<email> (Google AI Pro)`, not in the /usage box.
+BANNER_FIXTURE = ROOT / "tests" / "fixtures" / "agy-banner.txt"
+BANNER = (BANNER_FIXTURE.read_text()
+          + "Resume with -c (or command below): agy --conversation=00000000-0000-0000-0000-000000000000\n> ")
 LOGGED_OUT = "Antigravity CLI 1.5.16\nSign in with Google to continue.\nOpen https://accounts.google.com/o/oauth2/auth?x=1 in your browser\n"
 FIRST_RUN = "Welcome to Antigravity CLI\nColor scheme: Dark / Solarized Dark / Solarized Light / Terminal default\n"
 TRUST = "Do you trust the contents of this folder?\nTrust this workspace [Y/n]\n"
-
-
-def confirmed_tier():
-    """As if the owner's capture had confirmed the tier line (TIER_PATTERN_CONFIRMED is False until then)."""
-    return mock.patch.object(iso, "TIER_PATTERN_CONFIRMED", True)
 
 
 class AgyBase(unittest.TestCase):
@@ -231,8 +230,8 @@ class ProbeHonesty(AgyBase):
         self.assertEqual(self.keys(log), b"\r")       # one Enter for the trust prompt; /usage never typed
 
     def test_usage_screen_is_read_through_the_isolated_env(self):
-        binary, log = self.fake({"boot": BANNER, "usage": "Plan: Google AI Pro\n" + FIXTURE.read_text()})
-        with self.env(binary), confirmed_tier():
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        with self.env(binary):
             rec = sc._antigravity()
         self.assertEqual(rec["tier"], "AI Pro")
         self.assertEqual(rec["binary"], binary)
@@ -332,8 +331,8 @@ class ProbeHonesty(AgyBase):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("EDITOR=vim\n")
         iso.check_dotenv(self.home, sc.PROBE_DIR)
-        binary, log = self.fake({"boot": BANNER, "usage": "Plan: Google AI Pro\n" + FIXTURE.read_text()})
-        with self.env(binary), confirmed_tier():
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        with self.env(binary):
             rec = sc._antigravity()
         self.assertEqual(rec["tier"], "AI Pro")
 
@@ -373,10 +372,10 @@ class ProbeHonesty(AgyBase):
             for word in ("private", "customer", "acme", "secret"):
                 self.assertNotIn(word, low)
 
-    def sample_with(self, screen: str) -> tuple[dict, str]:
-        binary, _ = self.fake({"boot": BANNER, "usage": screen})
+    def sample_with(self, screen: str, boot: str = BANNER) -> tuple[dict, str]:
+        binary, _ = self.fake({"boot": boot, "usage": screen})
         err = io.StringIO()
-        with self.env(binary), confirmed_tier(), mock.patch.object(sc, "_learn_unit_costs", lambda: None), \
+        with self.env(binary), mock.patch.object(sc, "_learn_unit_costs", lambda: None), \
                 redirect_stderr(err):
             sc.sample(force=True, only=["antigravity"])
         state = sc.CACHE.read_text()
@@ -385,7 +384,7 @@ class ProbeHonesty(AgyBase):
         return json.loads(state)["lanes"]["antigravity"], err.getvalue()
 
     def test_unknown_group_title_never_reaches_a_partial_reading_error(self):
-        screen = "Plan: Google AI Pro\n" + FIXTURE.read_text() + self.PRIVATE_GROUP
+        screen = FIXTURE.read_text() + self.PRIVATE_GROUP
         binary, _ = self.fake({"boot": BANNER, "usage": screen})
         with self.env(binary):
             with self.assertRaises(sc.ProbePartialReading) as cm:
@@ -403,9 +402,9 @@ class ProbeHonesty(AgyBase):
     def test_unknown_groups_are_kept_under_fixed_labels_only(self):
         second = self.PRIVATE_GROUP.replace("PRIVATE CUSTOMER ACME", "SECRET ACME TWO")
         full = lambda g: g + "Five Hour Limit Remaining [ █████      ] 50.00%\nRefreshes in 1h 0m\n"
-        screen = "Plan: Google AI Pro\n" + FIXTURE.read_text() + full(self.PRIVATE_GROUP) + full(second)
+        screen = FIXTURE.read_text() + full(self.PRIVATE_GROUP) + full(second)
         binary, _ = self.fake({"boot": BANNER, "usage": screen})
-        with self.env(binary), confirmed_tier():
+        with self.env(binary):
             rec = sc._antigravity()
         self.assert_no_private(json.dumps(rec))
         self.assertEqual({w["pool"] for w in rec["windows"]},
@@ -415,34 +414,59 @@ class ProbeHonesty(AgyBase):
         self.assertFalse(lane.get("error"), lane.get("error"))
         self.assertIn("5-hour (unknown-group-2)", {w["window"] for w in lane["windows"]})
 
-    # ---- #144 round 2: agy stores no auth mode; the subscription is proven from its screen (provisional: refusing)
-    def test_full_reading_is_refused_while_the_tier_pattern_is_provisional(self):
-        binary, _ = self.fake({"boot": BANNER, "usage": "Plan: Google AI Pro\n" + FIXTURE.read_text()})
+    # ---- #144: agy stores no auth mode; the subscription tier is read from its start-up banner (confirmed 2026-11-24)
+    def test_banner_tier_passes(self):
+        binary, _ = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})       # the /usage box shows no tier
         with self.env(binary):
-            with self.assertRaisesRegex(iso.SubscriptionUnproven, "PROVISIONAL") as cm:
+            self.assertEqual(sc._antigravity()["tier"], "AI Pro")
+
+    def test_unconfirmed_pattern_still_refuses(self):
+        binary, _ = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        with self.env(binary), mock.patch.object(iso, "TIER_PATTERN_CONFIRMED", False):
+            with self.assertRaisesRegex(iso.SubscriptionUnproven, "not confirmed") as cm:
                 sc._antigravity()
         self.assertEqual(sc._failed_record("antigravity", None, cm.exception)["error_kind"], "subscription-unproven")
 
     def test_api_key_screen_is_refused_even_with_a_tier(self):
-        binary, _ = self.fake({"boot": BANNER, "usage": "Plan: Google AI Pro \u00b7 API key\n" + FIXTURE.read_text()})
-        with self.env(binary), confirmed_tier():
+        binary, _ = self.fake({"boot": BANNER, "usage": "Auth \u00b7 API key\n" + FIXTURE.read_text()})
+        with self.env(binary):
             with self.assertRaisesRegex(iso.SubscriptionUnproven, "non-subscription"):
                 sc._antigravity()
 
-    def test_no_tier_on_screen_is_refused(self):
-        binary, _ = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})         # the tier is read from /usage
-        with self.env(binary), confirmed_tier():
-            with self.assertRaisesRegex(iso.SubscriptionUnproven, "no personal"):
-                sc._antigravity()
+    def test_banner_without_a_personal_tier_is_refused(self):
+        for line in ("user@example.com", "user@example.com (Google AI Plus)", "user@example.com (Free)",
+                     "Google AI Pro"):                       # no tier, unknown tiers, a tier not on the account line
+            boot = BANNER.replace("user@example.com (Google AI Pro)", line)
+            binary, _ = self.fake({"boot": boot, "usage": "Account: user@example.com\n" + FIXTURE.read_text()})
+            with self.subTest(line=line), self.env(binary):
+                with self.assertRaisesRegex(iso.SubscriptionUnproven, "no personal") as cm:
+                    sc._antigravity()
+                self.assertEqual(sc.lane_state(sc._failed_record("antigravity", None, cm.exception)),
+                                 "refused: subscription login not proven")
 
-    def test_account_email_never_reaches_an_error(self):
-        binary, _ = self.fake({"boot": BANNER, "usage": "Models & Quota\nAccount: owner.private@example.com\nnothing here\n"
-                                                         "Limit Remaining x Limit Remaining y\n"})
+    def test_account_email_never_reaches_the_record_state_or_errors(self):
+        private = "owner.private@example.com"
+        usage = f"Models & Quota\nAccount: {private}\n" + FIXTURE.read_text()
+        binary, _ = self.fake({"boot": BANNER.replace("user@example.com", private), "usage": usage})
         with self.env(binary):
-            with self.assertRaises(Exception) as cm:
-                sc._antigravity()
-        rec = sc._failed_record("antigravity", None, cm.exception)
-        self.assertNotIn("owner.private", rec["error"])
+            rec = sc._antigravity()                                      # a passing reading
+        self.assertEqual(rec["tier"], "AI Pro")
+        self.assertNotIn("owner.private", json.dumps(rec))
+        lane, stderr = self.sample_with(usage, boot=BANNER.replace("user@example.com", private))
+        self.assertNotIn("owner.private", json.dumps(lane) + stderr)
+        for state_file in self.state.glob("*"):
+            if state_file.is_file():
+                self.assertNotIn("owner.private", state_file.read_text(errors="replace"), state_file.name)
+        for boot in (BANNER.replace("user@example.com (Google AI Pro)", private),          # refused: no tier
+                     BANNER.replace("user@example.com", private)):
+            binary, _ = self.fake({"boot": boot, "usage": f"Models & Quota\nAccount: {private}\nnothing here\n"
+                                                          "Limit Remaining x Limit Remaining y\n"})
+            with self.env(binary):
+                with self.assertRaises(Exception) as cm:
+                    sc._antigravity()
+            rec = sc._failed_record("antigravity", None, cm.exception)
+            self.assertNotIn("owner.private", rec["error"])
+            self.assertNotIn("owner.private", str(cm.exception))
 
     # ---- #144 review round 1, finding 3: a login screen that appears only after /usage gets no more input
     def test_login_screen_after_usage_stops_typing_at_once_and_says_what_was_typed(self):
@@ -482,7 +506,7 @@ class ProbeHonesty(AgyBase):
         lines = PAGER_FIXTURE.read_text().splitlines()
         self.assertEqual(len(lines), 30)
         binary, log = self.fake({"boot": BANNER, "pager": lines})
-        with self.env(binary), confirmed_tier():
+        with self.env(binary):
             rec = sc._antigravity()
         keys = self.keys(log)
         self.assertTrue(keys.startswith(b"/usage\r"))
