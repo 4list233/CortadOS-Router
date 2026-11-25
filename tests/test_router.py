@@ -363,6 +363,13 @@ class UsageScreens(unittest.TestCase):
                 self.sc.parse_codex_status(head + " Weekly limit: [█]\n60%\nleft (resets 1:30 AM)", now=at(2026, 10, 31, 23, 0))
             with self.assertRaisesRegex(ValueError, "DST skips on 2026-03-08"):
                 self.sc.parse_codex_status(head + " Weekly limit: [█]\n60%\nleft (resets 2:30 AM)", now=at(2026, 3, 8, 1, 0))
+            # fix round 1 (gpt-6.1-sol): at 01:45 the skipped 2:30 is still ahead, though its earliest normalised reading
+            # (01:30 EST) is already past; it was taken as 2026-03-09 02:30
+            with self.assertRaisesRegex(ValueError, "DST skips on 2026-03-08"):
+                self.sc.parse_codex_status(head + " Weekly limit: [█]\n60%\nleft (resets 2:30 AM)", now=at(2026, 3, 8, 1, 45))
+            # once the clock is past the gap, the next occurrence is tomorrow's, read normally
+            w = self.sc.parse_codex_status(head + " Weekly limit: [█]\n60%\nleft (resets 2:30 AM)", now=at(2026, 3, 8, 3, 10))
+            self.assertEqual(w[0]["resets_at"], "2026-03-09 02:30")
             with self.assertRaisesRegex(ValueError, "unreadable reset text"):          # unparsable text still fails closed
                 self.sc.parse_codex_status(head + " Weekly limit: [█]\n60%\nleft (resets 11:41 AM tomorrow)", now=at(2026, 11, 25, 9, 0))
         finally:

@@ -81,12 +81,18 @@ def reset_time(when: str | None, span: str, left: int, now: float) -> float | No
                 continue
             found.add(ts)
         readings += [(ts, (y, mo, d)) for ts in found]
-        if skipped and not found:                                   # the gap's earliest reading: a gap begun before now is past
+        if skipped and not found:                                   # a wall-clock time the calendar skips on that date
             gaps.append((min(skipped), (y, mo, d)))
     candidates = sorted(r for r in readings if r[0] - now >= -SLACK_S)
     # A skipped time still ahead of the clock (no slack: a reset just painted is a real time) is the next occurrence of
-    # that wall-clock time, and the screen cannot mean it: refuse rather than pick the day after.
-    ahead_gaps = sorted(g for g in gaps if g[0] > now and (not candidates or g[0] < candidates[0][0]))
+    # that wall-clock time, and the screen cannot mean it: refuse rather than pick the day after. "Ahead" compares the
+    # wall-clock readings themselves: a nonexistent time has no instant of its own, and its normalised timestamps fall
+    # either side of the gap (fix round 1, gpt-6.1-sol: at 2026-03-08 01:45 in Toronto, "2:30 AM" normalises to 01:30
+    # EST, already past, and was read as 2026-03-09 02:30). Other dates' readings are a day or more away, so the
+    # normalised timestamp still orders a gap against them.
+    wall_now = today.replace(microsecond=0)
+    ahead_gaps = sorted(g for g in gaps if datetime(*g[1], hour, minute) > wall_now
+                        and (not candidates or g[0] < candidates[0][0]))
     if ahead_gaps:
         y, mo, d = ahead_gaps[0][1]
         raise ValueError(f"reset text {when!r} falls in the hour DST skips on {y:04d}-{mo:02d}-{d:02d}; refusing to guess")
