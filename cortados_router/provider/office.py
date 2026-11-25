@@ -15,7 +15,9 @@ Inputs, all in memory except the child-task log:
   - routed requests (server.Handler._messages / _relay_local): turn start and end per worker, the route's provider,
     model and lane, and the NAMES of the tool_use blocks the backend hands the client;
   - $CORTADOS_HOME/child-tasks.jsonl (child_tasks.log_event): started / finished / cancelled, with title and tag;
-  - heartbeats (POST /v1/cortados/office/heartbeat) from the cortados-routed-subagents mod, for the orchestrator.
+  - heartbeats (POST /v1/cortados/office/heartbeat) from the cortados-routed-subagents mod, for the orchestrator
+    ({session, status, project?, device?, model?, tool?, client?}; `client` is one of CLIENTS, the session's harness,
+    which the Office tree uses for the orchestrator's suit when the provider did not observe it itself, #77 E7).
 
 The session tags and titles are client-asserted, inside the owner token's trust boundary (like x-cortados-run-id):
 cosmetic, never authorizing anything. A malformed tag header is DROPPED and counted (dropped_headers in the view); a
@@ -85,6 +87,10 @@ PROVIDERS = ("claude", "codex", "local")
 # reported it (local_lane.node_backend). Published per local worker as `local_backend` so the Office can tell an Ollama
 # node from a vllm-mlx one (#77); None for every non-local worker and for a node whose gate never said.
 LOCAL_BACKENDS = ("ollama", "vllm-mlx", "strata")
+# Which harness an orchestrating main session runs in, as its own heartbeat may say (optional `client`, #77 E7): a fixed
+# vocabulary, so a heartbeat can never put free text on the Office floor. The Office tree prefers what the provider
+# observes itself (the bot origin, the routed main loop's wire) over this claim (live.orchestrators_section).
+CLIENTS = ("claude-code", "codex", "grok", "antigravity")
 
 # ---- lifetimes: each one says why it is that long ----
 # A heartbeat saying `working` is refreshed on every tool call (throttled to one per 30 s when nothing changes), so one
@@ -400,7 +406,7 @@ def validate_heartbeat(body: Any) -> tuple[dict[str, Any] | None, str | None]:
     malformed: it is this endpoint's own request, and a 400 tells the mod its sender is broken."""
     if not isinstance(body, dict):
         return None, "body"
-    unknown = sorted(set(body) - {"session", "project", "device", "model", "status", "tool"})
+    unknown = sorted(set(body) - {"session", "project", "device", "model", "status", "tool", "client"})
     if unknown:
         return None, "(unknown field)"           # the key itself is not echoed: it is client text
     out: dict[str, Any] = {}
@@ -412,6 +418,10 @@ def validate_heartbeat(body: Any) -> tuple[dict[str, Any] | None, str | None]:
     if status not in ORCHESTRATOR_STATUSES:
         return None, "status"
     out["status"] = status
+    client = body.get("client")
+    if client is not None and client != "" and client not in CLIENTS:
+        return None, "client"                    # the value is not echoed: it is client text
+    out["client"] = client or None
     for field, rule in (("project", _HEADER_RULES[PROJECT_HEADER]), ("device", _HEADER_RULES[DEVICE_HEADER]),
                         ("model", _MODEL_RE), ("tool", _TOOL_RE)):
         raw = body.get(field)
@@ -492,11 +502,11 @@ def _orchestrator(hb: dict[str, Any] | None, main: dict[str, Any] | None) -> dic
         backend = (main or {}).get("local_backend") if model == (main or {}).get("model") else None
         return {"model": model, "status": hb.get("status"),
                 "tool": hb.get("tool"), "last_seen": _ts(hb.get("seen")), "source": "heartbeat",
-                "local_backend": backend}
+                "local_backend": backend, "client": hb.get("client") if hb.get("client") in CLIENTS else None}
     if main:
         return {"model": main.get("model"), "status": "idle" if main.get("status") == "done" else main.get("status"),
                 "tool": main.get("tool"), "last_seen": _ts(main.get("updated")), "source": "routed",
-                "local_backend": main.get("local_backend")}
+                "local_backend": main.get("local_backend"), "client": None}
     return None
 
 

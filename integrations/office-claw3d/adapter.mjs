@@ -165,6 +165,248 @@ export function mapOffice(view) {
   return agents;
 }
 
+// ---- rooms (issue #77, FLOORS-DESIGN.md): one room per orchestrator, read from GET /v1/cortados/office/tree ----
+// A finished child task stands at a report desk beside its orchestrator for this long, then leaves the office (owner
+// decision E8, 2026-11-24). 10 min is the Office view's own keep time for finished work (office.py WORKER_KEEP_S): a
+// glance at the floor still shows what just finished or failed, and a busy room's two report desks free up again.
+export const RETURN_KEEP_S = 600;
+// The nameplate subtitle of a finished task: its end state, then its model. claw3d/cortadosRooms.ts recognises exactly
+// these prefixes (CORTADOS_RETURN_SUBTITLE) and seats the task at a report desk; a test keeps the two equal.
+export const RETURN_LABEL = Object.freeze({ succeeded: 'done', failed: 'failed', cancelled: 'cancelled' });
+export const RETURN_SEPARATOR = ' · ';
+// The provider tree's caps (live.py NEST_MAX 4, ORCH_MAX 32, ORCH_TASKS_MAX 20, SUBSESSIONS_MAX 8, ORCH_ROUTED_MAX 8)
+// bound it; these looser ones only stop a malformed body from recursing or growing without limit.
+const TREE_DEPTH_MAX = 8;
+const TREE_PEOPLE_MAX = 2048;
+const GROUP_RE = /^[0-9a-f]{16,64}$/;          // a session's Office tag (office.py header rule)
+const NAMED_ORIGIN_RE = /^[a-z]{2,15}$/;       // a named origin (child_tasks.ORIGIN_NAMED: grokbot): never a tag
+const ID_RE = /^[A-Za-z0-9_-]{8,64}$/;         // task ids and sub-session refs (office._RUN_ID_RE)
+const TASK_STATUSES = new Set(['running', 'waiting', 'done', 'failed', 'unknown']);
+const SUB_STATUSES = new Set(['running', 'waiting', 'done', 'failed']);
+// The harness of an orchestrator (provider live.WIRE_CLIENT / office.CLIENTS) -> its suit. Antigravity has no lane yet:
+// the neutral `unknown` suit until it does (E7; TODO in FLOORS-DESIGN.md).
+const CLIENT_FAMILY = new Map(Object.entries({ 'claude-code': 'claude', codex: 'codex', grok: 'grok',
+  antigravity: 'unknown' }));
+const CLIENT_SOURCES = new Set(['wire', 'heartbeat']);
+const NAME_MAX = 64;
+// The room of routed work with no orchestrator and no task (E9). A bot origin of the same name is refused (groupKey),
+// so the key can never be two rooms.
+const LOBBY_KEY = 'lobby';
+const LOBBY_LABEL = 'No orchestrator';
+
+const shortText = (value, max = NAME_MAX) => {
+  const s = text(value);
+  return s === null ? null : (s.length > max ? s.slice(0, max - 1) + '…' : s);
+};
+const finite = value => typeof value === 'number' && Number.isFinite(value);
+
+function checkStrings(node, fields, what) {
+  for (const field of fields) {
+    if (Object.hasOwn(node, field) && node[field] !== null && typeof node[field] !== 'string') {
+      throw new Error('invalid office tree ' + what);
+    }
+  }
+}
+
+/** Orchestrator suit and where it came from (E7), first that applies: the bot origin; the provider's `client` (the
+ * routed main loop's wire, else the session heartbeat's claim); else a guess from the model, marked `model-guess`. */
+export function orchestratorFamily(group) {
+  if (group.kind === 'bot') return { family: 'grok', source: 'bot' };
+  if (CLIENT_FAMILY.has(text(group.client)) && CLIENT_SOURCES.has(group.client_source)) {
+    return { family: CLIENT_FAMILY.get(group.client), source: group.client_source };
+  }
+  return { family: modelFamily(group.model), source: 'model-guess' };
+}
+
+/** The room's key in every id: the session tag, the named origin, or "unattributed". null: not a room of the fleet
+ * tree (an "untagged" group exists only in a session's own view). */
+function groupKey(group) {
+  if (group.kind === 'unattributed' && group.origin === null) return 'unattributed';
+  if (group.kind === 'session' && typeof group.origin === 'string' && GROUP_RE.test(group.origin)) return group.origin;
+  if (group.kind === 'bot' && typeof group.origin === 'string' && NAMED_ORIGIN_RE.test(group.origin) &&
+      group.origin !== 'unattributed' && group.origin !== LOBBY_KEY) return group.origin;
+  if (group.kind === 'untagged') return null;
+  throw new Error('invalid office tree group');
+}
+
+/** Whether a tree section (orchestrators, lobby) may replace the roster: status "ok", or "partial" when every error is
+ * one task directory's own (source "task_dir": live.tasks_section; that task is still in the tree, its directory just
+ * could not be peeked). Any other error is a whole source (the child-task log, the board, the conversations, the
+ * heartbeats) whose people would vanish from the floor, so the section is unavailable and the poll fails. Reason: a
+ * single unreadable task directory may last for days; freezing the floor on it would hide every other change. */
+function treeUsable(section) {
+  if (section.status === 'ok') return true;
+  if (section.status !== 'partial' || !Array.isArray(section.errors) || section.errors.length === 0) return false;
+  return section.errors.every(e => object(e) && e.source === 'task_dir');
+}
+
+/**
+ * The provider's orchestrator tree -> Claw3D agents, one room per orchestrator, in agents.list order: rooms in the
+ * tree's order (active first) with the unattributed room last; in each room the orchestrator, then each task
+ * depth-first (a task, its live helpers, then its nested tasks), then the orchestrator's own routed helpers.
+ *
+ * Who is shown (E4, E8): every task that is running, waiting or unknown, at a team desk; each LIVE helper (a running
+ * or waiting sub-session other than the task's own main loop, which the task figure already is) beside its task; a
+ * finished task for RETURN_KEEP_S after it ended, at a report desk beside its orchestrator, its subtitle
+ * "done · model" (status idle) or "failed · model" / "cancelled · model" (status error). A finished helper is not
+ * shown. The unattributed room has no orchestrator: its finished tasks leave at once, and the room is drawn only while
+ * someone in it is active. A session room is drawn while its orchestrator is live (working/idle) or anyone is in it.
+ * The tree's `lobby` (E9: routed work with no orchestrator and no task) is the "No orchestrator" room, after the
+ * unattributed one, drawn while one of its items is running or waiting. A tree whose orchestrators or lobby section is
+ * unavailable (treeUsable) throws, as a malformed one does: the caller keeps the last roster.
+ *
+ * Pure: the same tree gives the same agents (time is the tree's own generated_at, the provider's clock).
+ */
+export function mapTree(tree) {
+  if (!object(tree) || tree.version !== 1 || !finite(tree.generated_at) || !object(tree.orchestrators) ||
+      !Array.isArray(tree.orchestrators.items)) throw new Error('invalid office tree');
+  // An unavailable tree is a failed poll, never an empty floor (#77 review round 1: an HTTP 200 carrying
+  // {status: "error", items: []} replaced 13 people with none): the last roster stays.
+  if (!treeUsable(tree.orchestrators)) throw new Error('office tree unavailable');
+  const lobby = tree.lobby === undefined ? null : tree.lobby;   // an older provider sends no lobby (E9)
+  if (lobby !== null && (!object(lobby) || !Array.isArray(lobby.items))) throw new Error('invalid office tree lobby');
+  if (lobby !== null && !treeUsable(lobby)) throw new Error('office tree unavailable');
+  const now = tree.generated_at;
+  const rooms = [];
+  const ids = new Set();
+  let people = 0;
+  for (const g of tree.orchestrators.items) {
+    if (!object(g)) throw new Error('invalid office tree group');
+    checkStrings(g, ['project', 'device', 'status', 'model', 'tool', 'client', 'client_source'], 'group');
+    if (!Array.isArray(g.tasks) || !Array.isArray(g.routed)) throw new Error('invalid office tree group');
+    const key = groupKey(g);
+    if (key === null) continue;
+    const label = key === 'unattributed' ? 'Unattributed' : g.kind === 'bot' ? 'Grok Bot'
+      : shortText(g.project) ?? 'Orchestrator';
+    const room = [];
+    const orchestratorId = key === 'unattributed' ? null : 'office-' + key + '-orchestrator';
+    const push = person => {
+      if (ids.has(person.id)) throw new Error('duplicate office identity');
+      if (++people > TREE_PEOPLE_MAX) throw new Error('invalid office tree');
+      ids.add(person.id);
+      room.push(person);
+    };
+    const base = (id, kind, parent, depth) => ({ id, kind, parent, depth, group: key, groupLabel: label,
+      project: text(g.project), device: text(g.device) });
+    if (orchestratorId) {
+      const { family, source } = orchestratorFamily(g);
+      push({ ...base(orchestratorId, 'orchestrator', null, 0), name: label,
+        role: shortText(g.model) ?? (g.kind === 'bot' ? 'bot gateway' : 'orchestrator'),
+        status: g.status === 'working' ? 'working' : 'idle', taskStatus: null, returning: false,
+        family, familySource: source, outfit: 'suit', provider: null, lane: null, localBackend: null,
+        model: text(g.model), tool: text(g.tool), title: null, client: CLIENT_FAMILY.has(text(g.client)) ? g.client : null });
+    }
+    const visit = (n, depth) => {
+      if (depth > TREE_DEPTH_MAX || !object(n) || typeof n.task_id !== 'string' || !ID_RE.test(n.task_id) ||
+          !TASK_STATUSES.has(n.status) || !Array.isArray(n.sub_sessions) || !Array.isArray(n.tasks) ||
+          (n.ended_at !== null && n.ended_at !== undefined && !finite(n.ended_at))) {
+        throw new Error('invalid office tree task');
+      }
+      checkStrings(n, ['title', 'state', 'phase', 'tool', 'host', 'provider', 'lane', 'local_backend', 'model',
+        'parent_task_id'], 'task');
+      const id = 'office-' + key + '-task-' + n.task_id;
+      const parent = depth === 0 ? orchestratorId : 'office-' + key + '-task-' + n.parent_task_id;
+      const finished = n.status === 'done' || n.status === 'failed';
+      const model = shortText(n.model);
+      const common = { ...base(id, 'task', parent, depth + 1), name: shortText(n.title) ?? 'Task ' + n.task_id.slice(-8),
+        taskStatus: n.status, provider: text(n.provider), lane: text(n.lane), localBackend: knownBackend(n.local_backend),
+        model: text(n.model), tool: text(n.tool), title: text(n.title),
+        family: characterFamily(n.provider, n.lane, n.model, n.local_backend), outfit: 'worker' };
+      if (finished) {
+        // back to its orchestrator for RETURN_KEEP_S, then gone; no orchestrator (unattributed): gone at once
+        const end = finite(n.ended_at) ? n.ended_at : null;
+        const state = Object.hasOwn(RETURN_LABEL, n.state) ? n.state : (n.status === 'failed' ? 'failed' : 'succeeded');
+        if (orchestratorId && end !== null && now - end <= RETURN_KEEP_S) {
+          push({ ...common, parent: orchestratorId, role: RETURN_LABEL[state] + RETURN_SEPARATOR + (model ?? 'model unknown'),
+            status: state === 'succeeded' ? 'idle' : 'error', returning: true, returnUntil: end + RETURN_KEEP_S,
+            tool: null });
+        }
+      } else {
+        push({ ...common, role: model ?? (n.status === 'unknown' ? 'state unknown' : 'model pending'),
+          status: n.status === 'running' ? 'working' : 'idle', returning: false });
+        for (const s of n.sub_sessions) {
+          if (!object(s) || typeof s.ref !== 'string' || !ID_RE.test(s.ref) || !SUB_STATUSES.has(s.status)) {
+            throw new Error('invalid office tree helper');
+          }
+          checkStrings(s, ['role', 'phase', 'provider', 'lane', 'local_backend', 'model'], 'helper');
+          // the task's own main loop is the task figure; a finished helper just leaves (E8)
+          if (s.role === 'main' || (s.status !== 'running' && s.status !== 'waiting')) continue;
+          push({ ...base('office-' + key + '-sub-' + n.task_id + '-' + s.ref, 'helper', id, depth + 2),
+            name: 'Helper · ' + (shortText(n.title, 48) ?? n.task_id.slice(-8)), role: shortText(s.model) ?? 'helper',
+            status: s.status === 'running' ? 'working' : 'idle', taskStatus: s.status, returning: false,
+            provider: text(s.provider), lane: text(s.lane), localBackend: knownBackend(s.local_backend),
+            model: text(s.model), tool: null, title: text(n.title),
+            family: characterFamily(s.provider, s.lane, s.model, s.local_backend), outfit: 'worker' });
+        }
+      }
+      for (const k of n.tasks) visit(k, depth + 1);
+    };
+    for (const n of g.tasks) visit(n, 0);
+    for (const r of g.routed) {
+      if (!object(r) || typeof r.ref !== 'string' || !ID_RE.test(r.ref) || !SUB_STATUSES.has(r.status)) {
+        throw new Error('invalid office tree helper');
+      }
+      checkStrings(r, ['title', 'phase', 'tool', 'provider', 'lane', 'model'], 'helper');
+      if (r.status !== 'running' && r.status !== 'waiting') continue;
+      push({ ...base('office-' + key + '-routed-' + r.ref, 'helper', orchestratorId, 1),
+        name: shortText(r.title) ?? 'Helper', role: shortText(r.model) ?? 'helper',
+        status: r.status === 'running' ? 'working' : 'idle', taskStatus: r.status, returning: false,
+        provider: text(r.provider), lane: text(r.lane), localBackend: null, model: text(r.model), tool: text(r.tool),
+        title: text(r.title), family: characterFamily(r.provider, r.lane, r.model), outfit: 'worker' });
+    }
+    const someoneElse = room.some(p => p.kind !== 'orchestrator');
+    const live = g.status === 'working' || g.status === 'idle';
+    if (key === 'unattributed' ? room.some(p => !p.returning) : (someoneElse || live)) {
+      rooms.push({ key, people: room });
+    }
+  }
+  // E9 (owner, 2026-11-24): routed work with no orchestrator and no task (one-off routed questions, the S1 outcome
+  // loop) sits in the "No orchestrator" room, drawn last and only while someone is in it. Nobody heads it.
+  if (lobby !== null) {
+    const room = [];
+    for (const r of lobby.items) {
+      if (!object(r) || typeof r.ref !== 'string' || !ID_RE.test(r.ref) || !SUB_STATUSES.has(r.status)) {
+        throw new Error('invalid office tree lobby');
+      }
+      checkStrings(r, ['kind', 'title', 'tool', 'provider', 'lane', 'local_backend', 'model'], 'lobby');
+      if (r.status !== 'running' && r.status !== 'waiting') continue;
+      const id = 'office-' + LOBBY_KEY + '-routed-' + r.ref;
+      if (ids.has(id)) throw new Error('duplicate office identity');
+      if (++people > TREE_PEOPLE_MAX) throw new Error('invalid office tree');
+      ids.add(id);
+      room.push({ id, kind: 'helper', parent: null, depth: 1, group: LOBBY_KEY, groupLabel: LOBBY_LABEL,
+        project: null, device: null, name: shortText(r.title) ?? (r.kind === 'conversation' ? 'Conversation' : 'Helper'),
+        role: shortText(r.model) ?? 'routed', status: r.status === 'running' ? 'working' : 'idle', taskStatus: r.status,
+        returning: false, provider: text(r.provider), lane: text(r.lane), localBackend: knownBackend(r.local_backend),
+        model: text(r.model), tool: text(r.tool), title: text(r.title),
+        family: characterFamily(r.provider, r.lane, r.model, r.local_backend), outfit: 'worker' });
+    }
+    if (room.length) rooms.push({ key: LOBBY_KEY, people: room });
+  }
+  const last = key => (key === 'unattributed') + 2 * (key === LOBBY_KEY);
+  rooms.sort((a, b) => last(a.key) - last(b.key));   // stable: tree order otherwise
+  return rooms.flatMap((room, index) => room.people.map(p => toAgent(p, index)));
+}
+
+/** One person as a Claw3D agent: the stock fields Studio reads (name; role = the nameplate subtitle, E5) and the
+ * CortadOS `office` extension. Allowlisted: nothing of the tree is spread into the output. */
+function toAgent(p, roomIndex) {
+  const emoji = p.kind === 'orchestrator' ? '👔' : p.kind === 'helper' ? '🛠️' : '🤖';
+  return {
+    id: p.id, name: p.name, role: p.role,
+    identity: { name: p.name, emoji, avatarUrl: avatarDataUrl(p.family, p.outfit),
+      avatarProfile: avatarProfile(p.family, p.outfit, p.id) },
+    office: {
+      floor: p.group, group: p.group, groupLabel: p.groupLabel, room: roomIndex, kind: p.kind, parent: p.parent,
+      depth: p.depth, project: p.project, device: p.device, provider: p.provider, lane: p.lane,
+      localBackend: p.localBackend, model: p.model, status: p.status, taskStatus: p.taskStatus,
+      returning: p.returning, returnUntil: p.returnUntil ?? null, tool: p.tool, title: p.title,
+      characterFamily: p.family, familySource: p.familySource ?? null, outfit: p.outfit,
+      sprite: p.family + (p.outfit === 'suit' ? '-suit' : ''),
+    },
+  };
+}
+
 const event = (name, payload) => ({ type: 'event', event: name, payload });
 const key = agent => 'agent:' + agent.id + ':main';
 const methods = ['agents.list', 'sessions.list', 'status'];
@@ -198,6 +440,7 @@ export class OfficeGateway {
     this.connected = false;
     this.generation = 0;
     this.runs = new Map();
+    this.errored = new Set();   // agents whose error Claw3D has been told (a run ended in error, or start + error)
   }
   challenge() {
     this.send(event('connect.challenge', { nonce: randomBytes(16).toString('hex') }));
@@ -239,8 +482,9 @@ export class OfficeGateway {
     else this.send({ type: 'res', id: frame.id, ok: false,
       error: { code: 'READ_ONLY', message: 'Office adapter is read-only' } });
   }
-  update(view) {
-    const next = mapOffice(view); // validate before replacing the last good state
+  /** One poll's tree (GET /v1/cortados/office/tree): mapTree validates it before the last good roster is replaced. */
+  update(tree) {
+    const next = mapTree(tree); // validate before replacing the last good state
     const old = new Map(this.agents.map(a => [a.id, a]));
     this.agents = next;
     if (!this.connected) return;
@@ -263,27 +507,44 @@ export class OfficeGateway {
       } else if (this.runs.has(a.id)) {
         lifecycle(a, a.office.status === 'error' ? 'error' : 'end', this.runs.get(a.id));
         this.runs.delete(a.id);
+        if (a.office.status === 'error') this.errored.add(a.id);
+      } else if (a.office.status === 'error' && !this.errored.has(a.id)) {
+        // an error this gateway never saw running (a failed task first seen as it reports back, or a bridge that
+        // restarted): Claw3D shows an error only after a run's error event, so the run is opened and failed at once
+        const runId = a.id + ':' + (++this.generation);
+        lifecycle(a, 'start', runId);
+        lifecycle(a, 'error', runId);
+        this.errored.add(a.id);
       }
+      if (a.office.status !== 'error') this.errored.delete(a.id);
     }
     for (const [id, a] of old) {
-      if (!next.some(n => n.id === id) && this.runs.has(id)) {
-        lifecycle(a, 'end', this.runs.get(id));
-        this.runs.delete(id);
+      if (!next.some(n => n.id === id)) {
+        this.errored.delete(id);
+        if (this.runs.has(id)) {
+          lifecycle(a, 'end', this.runs.get(id));
+          this.runs.delete(id);
+        }
       }
     }
     this.send(event('presence', this.presence()));
-    // Extension for floor/appearance/status and roster removal; stock UI may ignore.
+    // Extension for room/appearance/status and roster removal; stock UI may ignore.
     this.send(event('office.snapshot', { agents: next }));
   }
 }
 
-/** Only GET the exact office endpoint. Reject redirects to avoid credential forwarding. */
-export async function pollOffice({ url, tokenFile, fetchImpl = fetch, signal }) {
-  const endpoint = new URL(url);
+const OFFICE_PATH = '/v1/cortados/office';
+export const TREE_PATH = '/v1/cortados/office/tree';
+/** Only GET the exact office endpoint (or, with `path`, the tree beside it). Reject redirects to avoid credential
+ * forwarding. */
+export async function pollOffice({ url, tokenFile, fetchImpl = fetch, signal, path = OFFICE_PATH }) {
+  let endpoint = new URL(url);
   if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password ||
-      endpoint.pathname !== '/v1/cortados/office' || endpoint.search || endpoint.hash) {
+      endpoint.pathname !== OFFICE_PATH || endpoint.search || endpoint.hash ||
+      ![OFFICE_PATH, TREE_PATH].includes(path)) {
     throw new Error('invalid office URL');
   }
+  endpoint = new URL(path, endpoint);
   if (endpoint.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(endpoint.hostname)) {
     throw new Error('remote office URL requires HTTPS');
   }
@@ -298,17 +559,28 @@ export async function pollOffice({ url, tokenFile, fetchImpl = fetch, signal }) 
   return response.json();
 }
 
-export async function runPolling({ gateway, intervalMs = 5000, signal, onError = reportPollError, ...options }) {
+/** GET the office's rooms: the exact tree endpoint beside the configured office URL (CORTADOS_OFFICE_URL names
+ * /v1/cortados/office, as the deploy's token check does; the tree is /v1/cortados/office/tree on the same provider,
+ * under the same office:read token). Same rules as pollOffice: no redirects, HTTPS off loopback, token from its file. */
+export async function pollTree({ url, ...options }) {
+  const endpoint = new URL(url);
+  if (endpoint.pathname !== '/v1/cortados/office' || endpoint.search || endpoint.hash) throw new Error('invalid office URL');
+  return pollOffice({ ...options, url, path: TREE_PATH });
+}
+
+export async function runPolling({ gateway, intervalMs = 5000, signal, onError = reportPollError, poll = pollTree,
+  ...options }) {
   if (typeof onError !== 'function') throw new Error('error reporter must be a function');
   if (!Number.isFinite(intervalMs) || intervalMs < POLL_MIN_MS || intervalMs > POLL_MAX_MS) {
     throw new Error('poll interval must be 1..3600 seconds');
   }
   while (!signal?.aborted) {
-    try { gateway.update(await pollOffice({ ...options, signal })); }
+    try { gateway.update(await poll({ ...options, signal })); }
     catch {
       if (signal?.aborted) break;
-      // Never log exceptions: fetch/read errors may contain URLs, paths or tokens.
-      onError('Office poll failed; last successful snapshot retained (may be stale)');
+      // Never log exceptions: fetch/read errors may contain URLs, paths or tokens. Never fall back to the flat
+      // office view either (FLOORS-DESIGN.md): the rooms stay as last drawn, and this says so.
+      onError('Office tree unavailable; last successful roster retained (may be stale)');
     }
     try { await delay(intervalMs, undefined, { signal }); }
     catch (error) { if (!signal?.aborted) throw error; }

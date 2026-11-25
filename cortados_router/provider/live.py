@@ -78,6 +78,10 @@ logger = logging.getLogger("cortados.provider.live")
 
 VERSION = 1
 LIVE_PATH = "/v1/cortados/live"
+OFFICE_TREE_PATH = "/v1/cortados/office/tree"   # clients.OFFICE_TREE_PATH: the Office's rooms (office_tree, #77)
+# The harness a routed main loop runs in, from the wire its conversation was opened on (server.WIRES' keys): observed by
+# the provider, so it outranks a heartbeat's own `client` claim (#77 E7, orchestrators_section).
+WIRE_CLIENT = {"/v1/messages": "claude-code", "/v1/responses": "codex"}
 HEARTBEAT_PATH = "/v1/cortados/live/heartbeat"
 # ---- the window and caps, each with its reason ----
 # The dashboard's "recent" is the owner's day: what finished in the last 24 h.
@@ -1134,6 +1138,7 @@ def _sub_node(c: dict[str, Any], now: float) -> dict[str, Any] | None:
     return {"ref": ref, "role": "subagent", "status": status, "phase": phase,
             "provider": c.get("provider") if c.get("provider") in office.PROVIDERS else None,
             "lane": office.clean(c.get("lane"), office._LANE_RE), "model": office.clean(c.get("model"), office._MODEL_RE),
+            "local_backend": c.get("local_backend") if c.get("local_backend") in office.LOCAL_BACKENDS else None,
             "started_at": _r(opened, 3), "ended_at": _r(closed, 3), "last_activity": _r(c.get("last_used"), 3),
             "elapsed_s": _r(max(0.0, (closed if closed is not None else now) - opened)) if opened is not None else None,
             "tokens": work_split.pub_tokens(c.get("tokens"))}
@@ -1192,6 +1197,9 @@ def _task_node(r: dict[str, Any], subs: list[dict[str, Any]], tokens: Any, via: 
     return {"task_id": r.get("task_id"), "title": r.get("title"), "state": st, "status": _TASK_STATUS.get(st, "unknown"),
             "phase": r.get("phase"), "tool": r.get("tool"), "host": r.get("host"), "provider": r.get("provider"),
             "lane": r.get("lane") or main.get("lane"), "model": r.get("model") or main.get("model"),
+            # the node backend of the task's main loop, only when that loop served the model shown (#77)
+            "local_backend": main.get("local_backend") if (r.get("model") or main.get("model")) == main.get("model")
+            else None,
             "started_at": r.get("started_at"),
             "ended_at": r.get("ended_at"), "elapsed_s": r.get("elapsed_s"), "workspace": r.get("workspace"),
             "browser": bool(r.get("browser")), "parent_task_id": r.get("parent_task_id"), "parent_hidden": False,
@@ -1336,6 +1344,14 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
         kind = ("untagged" if session is not None else "unattributed") if origin is None \
             else "bot" if origin in child_tasks.ORIGIN_NAMED else "session"
         rs = routed.get(origin, []) if origin else []
+        # the orchestrator's harness, first source that applies (#77 E7): the bot origin, the routed main loop's wire,
+        # the session heartbeat's `client`; else None (the Office then guesses from the model and says so)
+        if kind == "bot":
+            client, client_source = "grok", "bot"
+        else:
+            client, client_source = (o or {}).get("client"), (o or {}).get("client_source")
+            if client not in office.CLIENTS or client_source not in ("wire", "heartbeat"):
+                client, client_source = None, None
         newest = max([n.get("ended_at") or n.get("started_at") or 0 for n in top] +
                      [(o or {}).get("last_activity") or 0], default=0)
         out.append({
@@ -1343,6 +1359,7 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
             "project": g.get("project") or (o or {}).get("project"), "device": g.get("device") or (o or {}).get("device"),
             "status": (o or {}).get("status") or ("n/a" if kind != "session" else "not live"),
             "model": (o or {}).get("model"), "tool": (o or {}).get("tool"),
+            "client": client, "client_source": client_source,
             "last_activity": _r(newest, 3) if newest else None,
             "counts": {k: counts.get(k, 0) for k in ("running", "waiting", "done", "failed", "unknown")},
             "attention": counts.get("_attention", 0),
@@ -1365,6 +1382,83 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
 
 
 SESSION_PATH = "/v1/cortados/live/session"
+
+# GET /v1/cortados/office/tree (#77): the orchestrator tree as the Office may see it. An ALLOWLIST per node, so a field
+# added to the live tree later never reaches the office:read token unreviewed. Left out on purpose: tokens (E3: no
+# token counts), workspace and browser (task internals the floor does not draw), parent_hidden, the session filter,
+# conflicts, task_hosts and inputs_truncated (fleet diagnostics, the dashboard's). Every value kept is already
+# re-validated by the live view (office.clean rules, fixed vocabularies, numbers): no request text, path or argument.
+_TREE_GROUP_KEYS = ("origin", "kind", "project", "device", "status", "model", "tool", "client", "client_source",
+                    "last_activity", "counts", "attention", "tasks_hidden", "routed_hidden")
+_TREE_TASK_KEYS = ("task_id", "title", "state", "status", "phase", "tool", "host", "provider", "lane", "local_backend",
+                   "model", "started_at", "ended_at", "elapsed_s", "parent_task_id", "origin_via", "sub_sessions_hidden")
+_TREE_SUB_KEYS = ("ref", "role", "status", "phase", "provider", "lane", "local_backend", "model", "started_at",
+                  "ended_at", "elapsed_s")
+_TREE_LOBBY_KEYS = ("kind", "title", "tool", "provider", "lane", "model", "started_at", "elapsed_s")
+_TREE_ROUTED_KEYS = ("ref", "role", "title", "status", "phase", "tool", "provider", "lane", "model", "started_at",
+                     "elapsed_s")
+
+
+def _pick(d: Any, keys: tuple) -> dict[str, Any]:
+    return {k: d.get(k) for k in keys} if isinstance(d, dict) else {}
+
+
+def _tree_task(n: dict[str, Any]) -> dict[str, Any]:
+    out = _pick(n, _TREE_TASK_KEYS)
+    out["sub_sessions"] = [_pick(x, _TREE_SUB_KEYS) for x in n.get("sub_sessions") or [] if isinstance(x, dict)]
+    out["tasks"] = [_tree_task(k) for k in n.get("tasks") or [] if isinstance(k, dict)]
+    return out
+
+
+def office_tree(snap: dict[str, Any]) -> dict[str, Any]:
+    """GET /v1/cortados/office/tree: the fleet's orchestrators section of a collect() snapshot, allowlisted per node
+    (the _TREE_*_KEYS above). The Claw3D bridge draws one room per item (integrations/office-claw3d/FLOORS-DESIGN.md).
+    A failed collect source stays visible: the section's status and errors ({source, error class}) are kept."""
+    o = snap.get("orchestrators") or {}
+    items = []
+    for g in o.get("items") or []:
+        if not isinstance(g, dict):
+            continue
+        out = _pick(g, _TREE_GROUP_KEYS)
+        out["tasks"] = [_tree_task(n) for n in g.get("tasks") or [] if isinstance(n, dict)]
+        out["routed"] = [_pick(x, _TREE_ROUTED_KEYS) for x in g.get("routed") or [] if isinstance(x, dict)]
+        items.append(out)
+    errors = [{"source": e.get("source"), "error": e.get("error")} for e in o.get("errors") or [] if isinstance(e, dict)]
+    return {"version": VERSION, "generated_at": snap.get("generated_at"),
+            "orchestrators": {"as_of": o.get("as_of"), "status": o.get("status") or "error", "errors": errors,
+                              "window_s": o.get("window_s"), "truncated": bool(o.get("truncated")), "items": items},
+            "lobby": _tree_lobby(snap.get("conversations") or {}, items)}
+
+
+def _tree_lobby(conv: dict[str, Any], groups: list[dict[str, Any]]) -> dict[str, Any]:
+    """The tree's lobby (#77 E9, owner 2026-11-24): routed work with no orchestrator and no task (one-off routed
+    questions, the S1 outcome loop), from the snapshot's conversations section: items with no Office session tag, of
+    kind conversation or subagent, whose run is no task of the tree (a child's own conversations are its
+    sub-sessions). Allowlisted (_TREE_LOBBY_KEYS); the status in the tree's sub-session vocabulary. The section is
+    capped (CONVERSATIONS_MAX, working first), so `truncated` says when the cap may have cut lobby work."""
+    tasks: set[str] = set()
+
+    def walk(n: dict[str, Any]) -> None:
+        tasks.add(n.get("task_id"))
+        for k in n.get("tasks") or []:
+            walk(k)
+
+    for g in groups:
+        for n in g.get("tasks") or []:
+            walk(n)
+    out = []
+    for it in conv.get("items") or []:
+        if not isinstance(it, dict) or it.get("session") or it.get("kind") not in ("conversation", "subagent"):
+            continue
+        ref = office.clean(it.get("run_id"), office._RUN_ID_RE)
+        if ref is None or ref in tasks:
+            continue
+        out.append({**_pick(it, _TREE_LOBBY_KEYS), "ref": ref,
+                    "status": "running" if it.get("status") == "working" else "waiting"})
+    errors = [{"source": e.get("source"), "error": e.get("error")} for e in conv.get("errors") or []
+              if isinstance(e, dict)]
+    return {"as_of": conv.get("as_of"), "status": conv.get("status") or "error", "errors": errors,
+            "truncated": bool(conv.get("hidden")), "items": out}
 
 
 def session_view(snap: dict[str, Any], session: str) -> dict[str, Any]:
@@ -1450,7 +1544,8 @@ def _backend_items(backend: list, view: dict[str, Any], now: float) -> tuple[lis
             floor = floors[ident]
             covered.add("main:" + ident)
             o = floor.get("orchestrator") or {}
-            w = {"tool": o.get("tool"), "status": o.get("status")}   # the main loop's tool, as the floor knows it
+            w = {"tool": o.get("tool"), "status": o.get("status"),   # the main loop's tool, as the floor knows it
+                 "client": o.get("client") if o.get("client") in office.CLIENTS else None}
         if kind_of == "main":
             kind = "orchestrator"
         elif kind_of == "r":
@@ -1477,6 +1572,11 @@ def _backend_items(backend: list, view: dict[str, Any], now: float) -> tuple[lis
             "title": w.get("title") or office.clean(c.get("title"), office._HEADER_RULES[office.TITLE_HEADER]),
             "started_at": _r(opened, 3),
             "last_activity": _r(c.get("last_used"), 3), "tokens": work_split.pub_tokens(c.get("tokens"))})
+        if kind == "orchestrator":
+            # the harness: the wire the provider saw this main loop on, else the session's heartbeat claim (#77 E7)
+            client = WIRE_CLIENT.get(c.get("wire"))
+            items[-1]["client"] = client or w.get("client")
+            items[-1]["client_source"] = "wire" if client else ("heartbeat" if w.get("client") else None)
     return items, covered
 
 
@@ -1517,7 +1617,10 @@ def _floor_orchestrators(view: dict[str, Any], covered: set[str]) -> list[dict[s
                           "project": f.get("project"), "device": f.get("device"), "provider": None, "lane": None,
                           "model": o.get("model"), "status": o.get("status"), "tool": o.get("tool"), "phase": None,
                           "source": o.get("source"), "title": None, "started_at": f.get("since"),
-                          "last_activity": o.get("last_seen")})
+                          "last_activity": o.get("last_seen"),
+                          # the session's own heartbeat claim (office.CLIENTS), the tree's third family source (#77 E7)
+                          "client": o.get("client") if o.get("client") in office.CLIENTS else None,
+                          "client_source": "heartbeat" if o.get("client") in office.CLIENTS else None})
     return items
 
 

@@ -22,7 +22,7 @@
 import http from 'node:http';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
-import { OfficeGateway, isMainModule, mapOffice, runPolling } from './adapter.mjs';
+import { OfficeGateway, isMainModule, mapTree, runPolling } from './adapter.mjs';
 
 export const LOOPBACK_BIND = Object.freeze(['127.0.0.1', '::1']);
 const LOOPBACK_PEERS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
@@ -125,11 +125,11 @@ export const sameSecret = (a, b) => typeof a === 'string' && typeof b === 'strin
 /** Fan-out target for runPolling: validates once, then updates every connected gateway. */
 export class OfficeHub {
   constructor() { this.gateways = new Set(); this.last = null; }
-  update(view) {
-    mapOffice(view);                       // throws on a malformed snapshot: nothing changes
-    this.last = view;
+  update(tree) {
+    mapTree(tree);                         // throws on a malformed tree: nothing changes
+    this.last = tree;
     for (const g of this.gateways) {
-      try { g.update(view); } catch { /* one client's failure never stops the others */ }
+      try { g.update(tree); } catch { /* one client's failure never stops the others */ }
     }
   }
 }

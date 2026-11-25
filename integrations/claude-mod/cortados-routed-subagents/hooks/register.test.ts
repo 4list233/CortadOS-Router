@@ -1543,7 +1543,8 @@ test('heartbeats: tool names on the main loop, throttled, idle on turn end, ende
   const b = h.beats[0]
   expect(b.init.method).toBe('POST')
   expect(b.init.headers['x-api-key']).toBe('tok')
-  expect(b.body).toEqual({ session: await sessionTag(h.store[OFFICE_SALT_KEY] as string, 'raw-session-id-123'), project: 'CortadOS-Router', device: 'pro', model: 'claude-opus-5-5', status: 'working', tool: 'Bash' })
+  expect(b.body).toEqual({ session: await sessionTag(h.store[OFFICE_SALT_KEY] as string, 'raw-session-id-123'), project: 'CortadOS-Router', device: 'pro', model: 'claude-opus-5-5', status: 'working', tool: 'Bash', client: 'claude-code' })
+  expect(b.body.client).toBe('claude-code')   // #77 E10: the harness, from office.CLIENTS (the Claude Code suit)
   expect(JSON.stringify(h.beats)).not.toContain('/secret/path')
   // a change within OFFICE_BEAT_MIN_MS is held back; after it, sent
   await tool(h.$, { tool: 'Read', file_path: '/x' }, next)

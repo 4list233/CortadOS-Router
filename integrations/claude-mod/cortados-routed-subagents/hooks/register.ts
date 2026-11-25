@@ -2301,8 +2301,10 @@ async function officeSend($: any, cfg: Cfg, office: OfficeState, { status, tool 
       // Model is optional metadata: send the lifecycle state with null instead of inventing a model or losing it.
       model = null
     }
+    // client: this mod runs only inside Claude Code, so the main session's harness is Claude Code (the Office's
+    // suit when its own main loop is not routed; #77 E10, owner 2026-11-24: "it should all be from Claude").
     const body = JSON.stringify({ session: id.session, project: id.project, device: id.device, model, status,
-                                  tool: tool && validToolName(tool) ? tool : null })
+                                  tool: tool && validToolName(tool) ? tool : null, client: 'claude-code' })
     const url = providerUrl + '/v1/cortados/office/heartbeat'
     timer = setTimeout(() => officeReport($, office, 'heartbeat', new Error('timeout')), OFFICE_BEAT_TIMEOUT_MS)
     const res: any = await $.http.fetch(url, { method: 'POST', body,

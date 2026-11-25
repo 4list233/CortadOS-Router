@@ -1697,9 +1697,41 @@ test('clients_cli: the clients module is $REPO\'s, whatever the working director
   await writeFile(join(decoy, 'cortados_router', 'provider', '__init__.py'), '');
   await writeFile(join(decoy, 'cortados_router', 'provider', 'clients.py'),
     'import os\nopen(os.environ["W"] + "/decoy.log", "a").write("decoy\\n")\n');
+  // The user-site decoy is a startup file in the user-site directory Python itself resolves (allowlist review, Low:
+  // the decoy package sat beside PYTHONUSERBASE, not in its lib/python/site-packages, so removing -s still passed).
+  // usercustomize.py there runs at every start that enables the user site. HOME is throwaway too; and note that
+  // site.py reads PYTHONUSERBASE from os.environ, so -E does not ignore it (checked on macOS's python3 3.9).
+  // Removing -s from clients_cli fails this test.
+  const home = join(W, 'home');
+  const env = isolatedEnv(W, { PATH: '/usr/bin:/bin', LIB, W, HOME: home, PYTHONPATH: decoy, PYTHONUSERBASE: decoy });
+  const userSite = spawnSync('python3', ['-E', '-c', 'import site; print(site.getusersitepackages())'],
+    { cwd: W, env, encoding: 'utf8' }).stdout.trim();
+  assert.ok(userSite.startsWith(W + '/'), 'the user site lies in the throwaway directory: ' + userSite);
+  await mkdir(userSite, { recursive: true });
+  await writeFile(join(userSite, 'usercustomize.py'),
+    'import os\nopen(os.environ["W"] + "/decoy.log", "a").write("user site\\n")\n');
+  // the control: the same interpreter and flags without -s DO run the decoy, so the decoy is real
+  const control = spawnSync('python3', ['-B', '-E', '-c', 'pass'], { cwd: W, env, encoding: 'utf8' });
+  assert.equal(control.status, 0, control.stderr);
+  assert.equal(readFileSync(join(W, 'decoy.log'), 'utf8'), 'user site\n', 'the user-site decoy runs without -s');
+  await rm(join(W, 'decoy.log'));
   const r = spawnSync('/bin/bash', ['-c', '. "$LIB"; REPO="$1"; clients_cli list a', 'x', repo], { cwd: decoy, encoding: 'utf8',
-    env: isolatedEnv(W, { PATH: '/usr/bin:/bin', LIB, W, PYTHONPATH: decoy, PYTHONUSERBASE: decoy }) });
+    env });
   assert.equal(r.status, 0, r.stderr);
-  assert.ok(!existsSync(join(W, 'decoy.log')), 'a decoy clients module was imported');
+  assert.ok(!existsSync(join(W, 'decoy.log')), 'a decoy (working directory, PYTHONPATH or user site) was loaded');
   assert.equal(fakeLog(W), 'list a\n');
+});
+
+test('deploy-air.sh: every Claw3D patch is shipped, required and applied with its --check refusal (#77 rooms)', async () => {
+  const text = await readFile(join(HERE, 'deploy-air.sh'), 'utf8');
+  const shipped = text.match(/^ADAPTER_FILES=\(([^)]*)\)/m)[1].split(/\s+/).filter(Boolean);
+  const loop = text.match(/^\s*for p in ([^;]+); do\n\s*as_studio git -C "\$BUILD" apply --check "\$ADAPTER_DIR\/\$p"\n\s*as_studio git -C "\$BUILD" apply "\$ADAPTER_DIR\/\$p"/m);
+  assert.ok(loop, 'the apply loop checks each patch before applying it');
+  const applied = loop[1].trim().split(/\s+/);
+  for (const patch of ['avatar-profile-hint.patch', 'studio-login.patch', 'cortados-rooms.patch']) {
+    assert.ok(shipped.includes('claw3d/' + patch), patch + ' is in ADAPTER_FILES');
+    assert.ok(applied.includes(patch), patch + ' is applied');
+    assert.ok(text.includes('-f "$HERE/claw3d/' + patch + '"'), patch + ' is required before anything changes');
+  }
+  assert.deepEqual(applied.sort(), shipped.filter(f => f.endsWith('.patch')).map(f => f.slice('claw3d/'.length)).sort());
 });
