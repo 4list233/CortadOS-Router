@@ -22,6 +22,7 @@ if _compat_root not in _compat_sys.path:
     _compat_sys.path.insert(0, _compat_root)
 
 from cortados_router.compat import getenv as _env_get
+from cortados_router import agy_isolation as _agy_iso
 
 import fcntl
 import json
@@ -157,11 +158,18 @@ class ProbeRefused(RuntimeError):
         self.typed = list(typed)
 
 
-def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], boot_s: float = 12, run_s: float = 20, ready: str | None = None,
+def _screen_has(test: str | Callable[[str], bool], shown: str, flags: int = 0) -> bool:
+    """A screen test: a regex searched in `shown`, or a predicate called with it (agy's account-line proof, #144)."""
+    return bool(test(shown)) if callable(test) else bool(re.search(test, shown, flags))
+
+
+def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], boot_s: float = 12, run_s: float = 20,
+                ready: str | Callable[[str], bool] | None = None,
                 nudge: tuple[str, str, bytes, int, float] | None = None, diagnostics: dict | None = None,
                 refuse: tuple[tuple[str, str], ...] = (), inherit_path: bool = True,
                 page: Callable[[str], tuple[bytes, str] | None] | None = None, page_max: int = 40,
-                cwd_check: Callable[[Path], None] | None = None, on_boot: Callable[[str], None] | None = None) -> str:
+                cwd_check: Callable[[Path], None] | None = None, on_boot: Callable[[str], None] | None = None,
+                refuse_unsettled: tuple[tuple[str, str | Callable[[str], bool]], ...] = ()) -> str:
     """Open the CLI in a PTY, accept a folder-trust prompt for our own empty probe folder if shown, type `command`, return the screen text.
 
     Deny-all: Enter is only ever sent for that trust prompt. `refuse` is ((kind, regex), ...): the screen is checked on
@@ -174,7 +182,12 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     `cwd_check(folder)` runs on the per-probe folder after it is made and before the fork; raising refuses the start
     (the agy lane's dotenv guard, #144 round 3).
     `on_boot(text)` gets the start-up screen (banner, trust prompt) once, just before `command` is typed: what the
-    returned text (the answer only) does not hold (the agy lane reads its subscription tier there, #144)."""
+    returned text (the answer only) does not hold (the agy lane reads its subscription tier there, #144).
+    `refuse_unsettled` is ((kind, regex), ...) like `refuse`, but checked only when the probe is about to act (at the end
+    of the boot / trust stage and before every write), never mid-read: for a transient screen that may still resolve
+    while the CLI paints (agy's "not signed in" notice while it signs in from the keyring, #144).
+    `ready` and each `refuse_unsettled` test are a regex or a predicate on the plain screen text (_screen_has).
+    `on_boot` may raise to refuse: it runs before the first keystroke of `command`."""
     PROBE_DIR.mkdir(parents=True, exist_ok=True)
     my_dir = PROBE_DIR / f"p{os.getpid()}-{int(time.time() * 1000) % 100000}"     # per-probe folder: the reaper kills by cwd and must never hit another probe
     my_dir.mkdir(exist_ok=True)
@@ -208,7 +221,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     stage, startup_chars, ready_seen = "boot", 0, False
     typed: list[str] = []          # what the probe sent, by name, for a truthful refusal message
 
-    def refused(where: str) -> None:
+    def refused(where: str, acting: bool = True) -> None:
         if EXEC_FAILED_MARK in buf:
             raise ProbeExecFailed(f"{Path(argv[0]).name} could not be started: "
                                   + buf.split(EXEC_FAILED_MARK, 1)[1].split(b"\n", 1)[0].decode("ascii", "replace")[:60])
@@ -217,6 +230,11 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             for kind, pattern in refuse:
                 if re.search(pattern, shown, re.I):
                     raise ProbeRefused(kind, where, typed)
+        if acting and refuse_unsettled:
+            shown = _plain(buf)
+            for kind, pattern in refuse_unsettled:
+                if _screen_has(pattern, shown, re.I):
+                    raise ProbeRefused(kind, where, typed)
 
     def send(data: bytes, name: str) -> None:
         """Every keystroke the probe types goes through here: the screen is checked first (deny-all)."""
@@ -224,7 +242,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
         os.write(fd, data)
         typed.append(name)
 
-    def pump(max_s: float, quiet_s: float = 1.5, until: str | None = None, mark: int = 0) -> None:
+    def pump(max_s: float, quiet_s: float = 1.5, until: str | Callable[[str], bool] | None = None, mark: int = 0) -> None:
         """Read until the screen goes quiet, or (with `until`) until that text is on screen and has had a moment to finish painting."""
         nonlocal buf, eof
         end, last, hit = time.time() + max_s, time.time(), 0.0
@@ -241,7 +259,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                     return
                 buf += d
                 last = time.time()
-                refused(stage)                               # stop the moment a refused screen is painted, mid-pump
+                refused(stage, acting=False)                 # stop the moment a refused screen is painted, mid-pump
                 if b"\x1b[>c" in d or b"\x1b[>0c" in d:      # terminal identity queries some TUIs block on
                     os.write(fd, b"\x1b[>0;276;0c")
                 if b"\x1b[c" in d:
@@ -249,7 +267,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 if b"\x1b[6n" in d:
                     os.write(fd, b"\x1b[1;1R")
             if until:
-                if not hit and len(buf) > mark and re.search(until, _plain(buf[mark:])):
+                if not hit and len(buf) > mark and _screen_has(until, _plain(buf[mark:])):
                     hit = time.time()
                 if hit and time.time() - hit > 1.5:
                     return
@@ -259,7 +277,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     try:
         pump(boot_s, until=ready)
         startup_chars = len(_plain(buf))
-        ready_seen = bool(ready and re.search(ready, _plain(buf)))
+        ready_seen = bool(ready and _screen_has(ready, _plain(buf)))
         refused("boot")
         if eof:
             mark = len(buf)
@@ -269,7 +287,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             send(b"\r", "Enter (workspace trust)")
             pump(boot_s, until=ready, mark=len(buf))
             startup_chars = len(_plain(buf))
-            ready_seen = bool(ready and re.search(ready, _plain(buf)))
+            ready_seen = bool(ready and _screen_has(ready, _plain(buf)))
             refused("trust")
             if eof:
                 mark = len(buf)
@@ -599,11 +617,43 @@ def _claude(prev: dict[str, Any] | None = None, config_dir: str | None = None) -
 # wording: the first-run prompts are from Google's getting-started page ("Color scheme", "Rendering mode: Alt-Screen or
 # Inline"); the sign-in screen is the documented flow (a browser sign-in, or over SSH an authorization URL and a code to
 # paste back). Pin both to captured screens once the owner sends them.
+#
+# agy 1.5.16 SIGNED IN still paints, while it loads and refreshes its keyring token, a transient start-up notice
+# (captured on the Air 2026-11-25 under the probe's env, email-free):
+#     Welcome to the Antigravity CLI. You are currently not signed in.
+#     ⣷ Signing in...
+# then the banner with the account line `<email> (Google AI Pro)`. Refusing on that notice mid-read closed agy ~0.4 s
+# before its token refresh finished, so a signed-in agy always read "not logged in" (#144). The notice is therefore not
+# refused while agy says it is signing in or nothing follows it yet; AGY_UNSETTLED refuses it when the probe is about to
+# act (end of boot, before any keystroke) and no account line has appeared after it. Deny-all holds: nothing is typed
+# past an unresolved "not signed in".
+#
+# "Account line" is the banner's `<email> (Google AI Pro|Ultra)` on one line, proven by agy_isolation.banner_tier, the
+# same function the tier check uses: a bare email elsewhere (a "Choose account: x@y" picker, a sign-in prompt) neither
+# ends the boot read nor clears the notice (#144 fix round 1: a picker's email let the probe type "/usage" into it).
+_AGY_NOT_SIGNED_IN = r"not (?:signed|logged) in"
 AGY_REFUSE = (
     ("not-logged-in", r"accounts\.google\.com|sign in with google|authori[sz]ation (?:url|code)|paste (?:the|your) (?:authori[sz]ation )?code"
-                      r"|not (?:signed|logged) in|please (?:sign|log) in|login required"),
+                      r"|" + _AGY_NOT_SIGNED_IN + r"(?![.\s]*\S?\s*signing in)(?![.\s]*$)"
+                      r"|please (?:sign|log) in|login required"),
     ("first-run-pending", r"color scheme|colou?r theme|rendering mode|alt-screen"),
 )
+
+
+def _agy_unsettled(shown: str) -> bool:
+    """True while the last "not signed in" notice on screen has no banner account line after it."""
+    hits = list(re.finditer(_AGY_NOT_SIGNED_IN, shown, re.I))
+    return bool(hits) and _agy_iso.banner_tier(shown[hits[-1].end():]) is None
+
+
+AGY_UNSETTLED = (("not-logged-in", _agy_unsettled),)
+
+
+def AGY_BOOT_READY(shown: str) -> bool:
+    """The boot read stops once the banner's account line (signed in) or the trust prompt is painted, else after boot_s."""
+    return _agy_iso.banner_tier(shown) is not None or bool(re.search(r"trust (?:this|the contents)", shown, re.I))
+
+
 AGY_DONE = r"Limit Remaining[\s\S]*Limit Remaining"     # the answer is on screen; complete only by agy_usage_gaps
 # The quota groups agy 1.5.16 shows on Google AI Pro (owner's screen, 2026-11-24): GEMINI MODELS and CLAUDE AND GPT
 # MODELS. A reading without either is partial.
@@ -668,10 +718,17 @@ def _antigravity() -> dict[str, Any]:
                               workdir=PROBE_DIR)
     diag: dict = {}
     boot: list[str] = []          # the start-up banner, in memory only: the tier is read from it below, never stored
+
+    def proven_boot(shown: str) -> None:
+        # the subscription is proven from the banner BEFORE "/usage" is typed (#144 fix round 1): a screen without the
+        # banner's account line (a "Choose account" picker, a sign-in prompt) gets no keystroke at all
+        boot.append(shown)
+        iso.check_subscription(shown)
     # A refused screen at any point (boot, after trust, after /usage, while paging) raises ProbeRefused from inside the
     # capture, before the probe's next keystroke.
-    text = tui_capture([binary], "/usage", AGY_DONE, env, refuse=AGY_REFUSE, inherit_path=False, diagnostics=diag,
-                       page=_agy_next_page, cwd_check=lambda d: iso.check_dotenv(env["HOME"], d), on_boot=boot.append)
+    text = tui_capture([binary], "/usage", AGY_DONE, env, refuse=AGY_REFUSE, refuse_unsettled=AGY_UNSETTLED,
+                       ready=AGY_BOOT_READY, inherit_path=False, diagnostics=diag,
+                       page=_agy_next_page, cwd_check=lambda d: iso.check_dotenv(env["HOME"], d), on_boot=proven_boot)
     if not text.strip():
         if diag.get("eof") and diag.get("stage") in {"boot", "trust"}:
             raise ProbeExecFailed(f"agy exited at {diag.get('stage')} with no usable output")
@@ -685,8 +742,8 @@ def _antigravity() -> dict[str, Any]:
     gaps = agy_usage_gaps(text)
     if gaps:
         raise ProbePartialReading("agy /usage read only in part: " + "; ".join(gaps))
-    # agy stores no auth mode in its settings (#144 round 2): the personal subscription is proven from its own screen,
-    # last, so a screen problem above is reported as itself. The tier is on the start-up banner (`<email> (Google AI
+    # agy stores no auth mode in its settings (#144 round 2): the personal subscription is proven from its own screen:
+    # from the banner before any keystroke (proven_boot) and again here, last, with the /usage answer, so a screen problem above is reported as itself. The tier is on the start-up banner (`<email> (Google AI
     # Pro)`), not in the /usage box; both are checked for a non-subscription login.
     tier = iso.check_subscription("\n".join(boot), text)
     wins = []
