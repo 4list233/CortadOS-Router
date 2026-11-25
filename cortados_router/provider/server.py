@@ -60,8 +60,8 @@ from cortados_router.compat import getenv
 from cortados_router.safe_text import install_log_sanitizer
 from cortados_router.compaction import prune as compaction_prune, store as compaction_store
 from cortados_router.provider import (anthropic_wire, clients, dashboard_auth, effect_boundary, live, local_lane,
-                                      local_switch, office, responses_wire, routing, search_lane, sensitive_notice,
-                                      work_split)
+                                      local_switch, office, responses_wire, route_options, routing, search_lane,
+                                      sensitive_notice, work_split)
 from cortados_router.provider.bridge import BridgeError, BridgeSession, ToolWaitExpired, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
 from cortados_router.provider import transcripts
@@ -2704,6 +2704,23 @@ class Handler(BaseHTTPRequestHandler):
                 logger.warning("local: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: local view unavailable (see provider log)")
             return self._json(200, view, headers=VIEW_HEADERS)
+        if self.path.split("?")[0] == route_options.PATH:
+            # The route picker's options (docs/ORCHESTRATOR-ROUTE-PICKER.md §2): the owner token or a dashboard
+            # session. Cached readings only; a cloud band never asks the local gates, band=local only them.
+            if not self._owner_or_session("GET"):
+                return self._refuse_auth()
+            try:
+                band = route_options.parse_band(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query,
+                                                                      keep_blank_values=True))
+            except route_options.BandError as exc:
+                return self._error(400, "invalid_request_error", f"cortados: {exc}")
+            try:
+                view = self.server.route_options_view(band)
+                body = json.dumps(view, allow_nan=False).encode()
+            except Exception as exc:
+                logger.warning("route options: view failed: %s", type(exc).__name__)
+                return self._error(500, "api_error", "cortados: route options unavailable (see provider log)")
+            return self._json(200, body, headers=VIEW_HEADERS)
         if self.path.split("?")[0] == "/v1/cortados/tasks":
             if not self._owner_or_session("GET"):        # the owner token or a dashboard session
                 return self._refuse_auth()
@@ -4611,6 +4628,11 @@ class ProviderServer(ThreadingHTTPServer):
         """GET /v1/cortados/local (provider/local_switch.py): each local node's switch, asked through its gate. Tests
         replace it, or point CORTADOS_LOCAL_RESOURCES_CONFIG at a fake gate."""
         return local_switch.view()
+
+    def route_options_view(self, band: str) -> dict[str, Any]:
+        """GET /v1/cortados/route-options (provider/route_options.py). Tests replace it or the core it reads."""
+        from cortados_router import core
+        return route_options.collect(core, band, local_view=self.local_view)
 
     def local_switch(self, node: Any, on: Any) -> dict[str, Any]:
         """POST /v1/cortados/local/switch: set a node's switch through its gate (local_switch.switch). Tests replace it."""
